@@ -133,7 +133,7 @@ PYDATA
     check "a served API route still reports 503 with no model" \
         "$(is "$(code -X POST "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{}')" 503)"
     check "the boot banner prints the page URL once" \
-        "$(is "$(grep -c "chat in your browser: http://127.0.0.1:$PORT/" "$LOG")" 1)"
+        "$(is "$(grep -c "chat in your browser: http://127.0.0.1:$PORT/chat" "$LOG")" 1)"
 else
     check "boot" 0
 fi
@@ -211,7 +211,7 @@ if command -v node >/dev/null 2>&1; then
         check "tests/test_webui_dashboard.cjs passes and names its pass" \
             "$([ "$dash_rc" -eq 0 ] && echo "$dash_out" | grep -q 'Web UI dashboard: passed' && echo 1 || echo 0)"
     fi
-    for t in admin_ui shell; do
+    for t in admin_ui shell chat; do
         out="$(node "tests/test_webui_$t.cjs" 2>&1)"; rc=$?
         if echo "$out" | grep -q 'skipped'; then
             echo "  SKIP tests/test_webui_$t.cjs ($(echo "$out" | grep 'skipped' | head -1))"

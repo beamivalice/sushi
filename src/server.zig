@@ -1437,7 +1437,7 @@ pub fn serve(
         log.info("  POST /tokenize\n", .{});
         log.info("  POST /detokenize\n\n", .{});
         var chat_url_buf: [96]u8 = undefined;
-        log.info("chat in your browser: {s}\n\n", .{chatPageUrl(&chat_url_buf, host, listen_port)});
+        log.info("chat in your browser: {s}chat\n\n", .{chatPageUrl(&chat_url_buf, host, listen_port)});
     }
 
     // Print system metrics once at startup

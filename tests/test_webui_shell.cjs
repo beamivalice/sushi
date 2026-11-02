@@ -20,7 +20,7 @@ const html = fs.readFileSync('src/webui/index.html', 'utf8');
 const ORIGIN = 'http://sushi.test';
 const PHONE = { width: 390, height: 844 };
 
-function makeServer({ metrics = 200, loaded = true, down = false } = {}) {
+function makeServer({ metrics = 200, loaded = true, down = false, apiKey = null } = {}) {
   const calls = [];
   const state = { loaded };
   const json = (body, status = 200) => ({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -28,6 +28,7 @@ function makeServer({ metrics = 200, loaded = true, down = false } = {}) {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
     if (/^\/(chat|dashboard|models|settings)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
     calls.push({ path: p, method: request.method() });
+    if (apiKey && request.headers().authorization !== `Bearer ${apiKey}`) return route.fulfill(json({ error: { message: 'bad key' } }, 401));
     if (down) return route.abort();
     switch (p) {
       case '/v1/models': return route.fulfill(json({ data: [{ id: 'Chat-A', state: state.loaded ? 'ready' : 'unloaded', loaded: state.loaded, capabilities: ['chat'], context_length: 8192, bytes_on_disk: 2 ** 30, input_modalities: ['text'] }] }));
@@ -44,13 +45,17 @@ function makeServer({ metrics = 200, loaded = true, down = false } = {}) {
   return { handle, calls, state };
 }
 
-async function open(browser, server, urlPath, { viewport = { width: 1440, height: 900 }, mode = 'compact', scheme = 'dark', clock = false } = {}) {
+async function open(browser, server, urlPath, { viewport = { width: 1440, height: 900 }, mode = 'compact', scheme = 'dark', clock = false, storage = {} } = {}) {
   const context = await browser.newContext({ viewport, colorScheme: scheme });
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   await page.route(`${ORIGIN}/**`, server.handle);
-  await page.addInitScript((m) => { try { localStorage.setItem('sushi-ui-mode', m); } catch { /* storage off */ } }, mode);
+  await page.addInitScript(([m, seed]) => {
+    if (sessionStorage.getItem('__seeded')) return;
+    sessionStorage.setItem('__seeded', '1');
+    try { localStorage.setItem('sushi-ui-mode', m); for (const [k, v] of Object.entries(seed)) localStorage.setItem(k, v); } catch { /* storage off */ }
+  }, [mode, storage]);
   if (clock) await page.clock.install();
   await page.goto(`${ORIGIN}${urlPath}`);
   return { page, context, errors };
@@ -208,6 +213,118 @@ async function main() {
       assert.equal(server.calls.filter((c) => c.path === '/v1/load-model').length, 1);
       await page.waitForFunction(() => !document.querySelector('#modelStatus button'));
       await context.close();
+    }
+
+    {
+      // The landing view is the Dashboard, and the top bar lists Dashboard, Chat, Models, Settings.
+      const { page, context } = await open(browser, makeServer(), '/');
+      await page.waitForSelector('#dashPanel:not([hidden])');
+      assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page', 'the root shows the Dashboard');
+      assert.equal(await page.evaluate(() => document.getElementById('chatPanel').inert), true);
+      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings']);
+      await page.click('#navChat');
+      assert.equal(new URL(page.url()).pathname, '/chat');
+      await page.goBack();
+      assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page', 'Back from the chat returns to the Dashboard');
+      await context.close();
+      const phone = await open(browser, makeServer(), '/', { viewport: PHONE });
+      assert.deepEqual(await phone.page.$$eval('#viewNav a', (links) => links.filter((a) => a.offsetParent).map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings'], 'same order on a phone');
+      await phone.context.close();
+    }
+
+    {
+      // With --api-key and no stored key, the overlay owns the keyboard: nothing typed or tabbed reaches the page behind it.
+      const { page, context } = await open(browser, makeServer({ apiKey: 'sekret' }), '/chat');
+      await page.waitForSelector('#keyOverlay:not([hidden])');
+      await page.waitForTimeout(500);
+      assert.equal(await page.evaluate(() => document.activeElement.id), 'keyInput', 'the key box has the cursor');
+      await page.keyboard.type('sek');
+      assert.equal(await page.inputValue('#promptInput'), '', 'nothing typed lands in the chat prompt');
+      assert.equal(await page.inputValue('#keyInput'), 'sek');
+      for (let i = 0; i < 8; i++) {
+        await page.keyboard.press('Tab');
+        assert.equal(await page.evaluate(() => !!document.activeElement.closest('#appShell')), false, 'Tab stays out of the page behind the overlay');
+      }
+      await page.fill('#keyInput', 'sekret');
+      await page.keyboard.press('Enter');
+      await page.waitForSelector('#keyOverlay', { state: 'hidden' });
+      await page.waitForFunction(() => document.getElementById('modelSelect').options.length === 1);
+      assert.equal(await page.evaluate(() => document.getElementById('appShell').inert), false, 'the page works again after unlocking');
+      await context.close();
+    }
+
+    {
+      // The ⋯ menu carries Forget the API key when a key is stored.
+      const { page, context } = await open(browser, makeServer({ apiKey: 'sekret' }), '/chat', { viewport: PHONE, storage: { 'sushi-api-key': 'sekret' } });
+      await page.waitForSelector('#modelSelect option', { state: 'attached' });
+      await page.click('#moreButton');
+      const forget = page.locator('#moreMenu button', { hasText: 'Forget' });
+      assert.equal(await forget.count(), 1, 'the menu offers Forget the API key');
+      await forget.click();
+      await page.waitForSelector('#keyOverlay:not([hidden])');
+      assert.equal(await page.evaluate(() => localStorage.getItem('sushi-api-key')), null, 'the stored key is gone');
+      await context.close();
+      const open2 = await open(browser, makeServer(), '/chat', { viewport: PHONE });
+      await open2.page.click('#moreButton');
+      assert.equal(await open2.page.locator('#moreMenu button', { hasText: 'Forget' }).isVisible(), false, 'no key, nothing to forget');
+      await open2.context.close();
+    }
+
+    {
+      // Only the current tab is marked current; the others carry no aria-current at all.
+      const { page, context } = await open(browser, makeServer(), '/chat');
+      await page.click('#navDashboard');
+      assert.equal(await page.evaluate(() => document.getElementById('navChat').hasAttribute('aria-current')), false);
+      assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page');
+      await context.close();
+    }
+
+    {
+      // Phone drawers: closed means out of the tab order and the accessibility tree, and Escape gives focus back.
+      const chat = { id: 'a', title: 'First', updated: Date.now(), messages: [{ role: 'user', content: 'hi' }] };
+      const { page, context } = await open(browser, makeServer(), '/chat', { viewport: PHONE, storage: { 'sushi-chats': JSON.stringify([chat]) } });
+      await page.waitForSelector('#modelSelect option', { state: 'attached' });
+      await page.waitForTimeout(400);
+      const reachable = await page.evaluate(() => [...document.querySelectorAll('#chatSidebar, #chatRightbar')].flatMap((drawer) => [...drawer.querySelectorAll('button, input, select, textarea, summary, [tabindex="0"]')].filter((n) => n.checkVisibility({ visibilityProperty: true })).map((n) => n.id || n.className)));
+      assert.deepEqual(reachable, [], 'a closed drawer has no focusable control');
+      await page.click('#sidebarToggle');
+      await page.waitForTimeout(300);
+      await page.keyboard.press('Escape');
+      assert.equal(await page.evaluate(() => document.activeElement.id), 'sidebarToggle', 'Escape returns focus to the button that opened the drawer');
+      await page.click('#sidebarToggle');
+      await page.waitForTimeout(300);
+      await page.hover('.conv-item');
+      await page.click('[aria-label="Rename conversation"]');
+      await page.keyboard.press('Escape');
+      assert.equal(await page.evaluate(() => document.getElementById('chatPanel').classList.contains('left-open')), true, 'Escape while renaming only ends the rename');
+      assert.equal(await page.$('.conv-item input'), null);
+      await context.close();
+    }
+
+    {
+      // The top bar fits a 320 px phone.
+      const { page, context } = await open(browser, makeServer(), '/chat', { viewport: { width: 320, height: 640 } });
+      await page.waitForSelector('#modelSelect option', { state: 'attached' });
+      await page.waitForTimeout(300);
+      const fit = await page.evaluate(() => ({ doc: document.documentElement.scrollWidth, more: document.getElementById('moreButton').getBoundingClientRect().right }));
+      assert.ok(fit.doc <= 320 && fit.more <= 320, `top bar fits 320 px (${JSON.stringify(fit)})`);
+      await context.close();
+    }
+
+    {
+      // The composer row, Tools on, between the 881 px layout and wide: nothing past the end of the row, no clipped chip.
+      for (const width of [881, 900, 960]) {
+        const { page, context } = await open(browser, makeServer(), '/chat', { viewport: { width, height: 800 } });
+        await page.waitForSelector('#modelSelect option', { state: 'attached' });
+        await page.click('#toolsButton');
+        const fit = await page.evaluate(() => {
+          const row = document.querySelector('.composer-row'), edge = row.getBoundingClientRect().right;
+          const parts = [...row.querySelectorAll('.chip-toggle, #sendButton')].filter((n) => n.offsetParent);
+          return { spill: parts.filter((n) => n.getBoundingClientRect().right > edge + 0.5).map((n) => n.id), clipped: parts.filter((n) => n.scrollWidth > n.clientWidth).map((n) => n.id) };
+        });
+        assert.deepEqual(fit, { spill: [], clipped: [] }, `composer row at ${width} px`);
+        await context.close();
+      }
     }
     console.log('Web UI shell: passed');
   } finally {

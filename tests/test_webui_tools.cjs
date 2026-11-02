@@ -83,7 +83,7 @@ const streaming = vm.createContext({
 vm.runInContext(script.slice(start, end), streaming);
 const sseStart = script.indexOf('function readSsePayloads(');
 vm.runInContext(script.slice(sseStart, script.indexOf('\n/*', sseStart)), streaming);
-const streamStart = script.indexOf('async function streamReply(');
+const streamStart = script.indexOf('function interrupted(');
 vm.runInContext(script.slice(streamStart, script.indexOf('function setChatBusy(', streamStart)), streaming);
 (async () => {
   for (const finish of ['tool_calls', 'length']) {
@@ -171,3 +171,42 @@ vm.runInContext(script.slice(editStart, script.indexOf('let folderSelection', ed
   assert.equal(editNodes.editButton.disabled, true, 'fixed while a reply runs');
   console.log('Web UI edit chip: per-chat state, folder reset, --edit default passed');
 })().catch((error) => { console.error(error); process.exit(1); });
+
+/* A reply that breaks keeps what was shown; the stream parser takes CRLF; an image that is gone is never an empty message. */
+const broken = vm.createContext({
+  $: () => ({ value: '' }), TextDecoder, Uint8Array, performance,
+  refreshPrefixCache() {}, renderTranscript() {}, replyMeta: () => null,
+  perfMon: { begin() {}, finish() {}, delta() {} },
+  createStreamingView: () => ({ text: '', reasoning: '', schedule() {}, finalize() {} }),
+});
+vm.runInContext(script.slice(start, end), broken);
+vm.runInContext(script.slice(sseStart, script.indexOf('\n/*', sseStart)), broken);
+vm.runInContext(script.slice(script.indexOf('function interrupted('), script.indexOf('function setChatBusy(')), broken);
+vm.runInContext(script.slice(loopStart, script.indexOf('async function runTurn(', loopStart)), broken);
+(async () => {
+  const seen = [];
+  broken.readSsePayloads('data: a\r\n\r\ndata: b\r\n\r\ndata: par', (payload) => seen.push(payload));
+  assert.deepEqual(seen, ['a', 'b'], 'CRLF-separated events parse');
+  assert.equal(broken.readSsePayloads('data: a\r\n\r\ndata: par', () => {}), 'data: par');
+
+  const body = (text) => { const bytes = Buffer.from(text); let done = false; return { getReader: () => ({ read: async () => done ? { done: true } : (done = true, { done: false, value: bytes }) }) }; };
+  broken.api = async () => ({ ok: true, headers: new Headers(), body: body(`data: ${JSON.stringify({ choices: [{ delta: { content: 'abc' } }] })}\n\n`) });
+  const realView = broken.createStreamingView;
+  broken.createStreamingView = () => { const view = realView(); view.text = ''; return view; };
+  await assert.rejects(broken.streamReply('test', [], { aborted: false }, null), (error) => {
+    assert.match(error.message, /closed before/);
+    assert.deepEqual({ ...error.partial }, { text: 'abc', reasoning: '' }, 'the words already shown ride the error');
+    return true;
+  }, 'a stream that ends without a finish reason is an interrupted reply');
+
+  const messages = [{ role: 'user', content: 'q' }];
+  broken.streamReply = async () => { throw Object.assign(new Error('Metal OOM'), { partial: { text: 'half an answer', reasoning: 'thought' } }); };
+  await assert.rejects(broken.runResearchTurn('test', messages, { aborted: false }, undefined, false), /Metal OOM/);
+  assert.equal(messages.length, 2);
+  assert.deepEqual({ role: messages[1].role, content: messages[1].content, reasoning: messages[1].reasoning, meta: messages[1].meta }, { role: 'assistant', content: 'half an answer', reasoning: 'thought', meta: 'interrupted' });
+
+  const onWire = broken.wireMessages([{ role: 'user', content: '', droppedImages: 1 }, { role: 'user', content: 'what is it?', droppedImages: 2 }]);
+  assert.ok(onWire.every((m) => m.content.trim()), 'no empty user message');
+  assert.match(onWire[1].content, /what is it\?\n\[2 attached images are no longer available\]/);
+  console.log('Web UI interrupted replies, CRLF events and dropped images: passed');
+})().catch((error) => { console.error(error); process.exitCode = 1; });

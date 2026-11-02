@@ -105,7 +105,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .conv-item.selected .c-title { color: var(--accent); font-weight: 600; }
 .conv-item .c-sub { font-size: var(--fs-sm); color: var(--text-3); }
 .conv-item .c-actions { display: none; gap: 2px; flex: none; }
-.conv-item:hover .c-actions, .conv-item.selected .c-actions { display: inline-flex; }
+.conv-item:hover .c-actions, .conv-item.selected .c-actions, .conv-item:focus-within .c-actions { display: inline-flex; }
 .conv-item .c-actions .icon-btn { width: 26px; height: 26px; border-radius: var(--r-sm); }
 .conv-item .c-actions .icon-btn svg { width: 14px; height: 14px; }
 .conv-item input { padding: 4px 8px; font-size: var(--fs-md); border-radius: var(--r-sm); }
@@ -168,7 +168,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .code-block pre code { background: none; border: 0; padding: 0; font-size: inherit; }
 .svg-preview { display: none; padding: 12px 14px; border-top: 1px solid var(--border); background: var(--surface-2); text-align: center; }
 .svg-preview.open { display: block; }
-.svg-preview img { max-width: 100%; height: auto; background: var(--surface); }
+.svg-preview img { max-width: 100%; height: auto; background: #fff; border-radius: var(--r-sm); }
 .table-wrap { overflow-x: auto; margin: 0 0 12px; border: 1px solid var(--border); border-radius: var(--r-lg); }
 .content table { border-collapse: collapse; width: 100%; font-size: var(--fs-md); }
 .content th, .content td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); }
@@ -186,7 +186,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .attach-chip .attach-remove { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border: 0; border-radius: var(--r-pill); background: color-mix(in srgb, var(--surface) 80%, black); color: var(--text); cursor: pointer; display: grid; place-items: center; }
 .msg-media { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; justify-content: flex-end; }
 .msg-thumb { max-width: 220px; max-height: 160px; border-radius: var(--r-md); border: 1px solid var(--border); object-fit: cover; }
-.composer-row { display: flex; align-items: center; gap: 6px; }
+.composer-row { display: flex; align-items: center; gap: 6px; container: composer / inline-size; }
 .chip-toggle { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-3); border-radius: var(--r-pill); padding: 4px 12px; font-size: var(--fs-sm); font-weight: 550; cursor: pointer; max-width: 320px; min-width: 0; }
 #directoryButton { max-width: 150px; }
 #folderPicker { width: min(560px, calc(100vw - 32px)); max-height: 80vh; padding: 24px; border: 1px solid var(--border); border-radius: var(--r-xl); background: var(--surface); color: var(--text); box-shadow: var(--shadow-pop); }
@@ -256,20 +256,23 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
     z-index: 40;
     box-shadow: var(--shadow-pop);
     transform: translateX(-105%);
-    transition: transform .2s ease;
+    visibility: hidden;
+    transition: transform .2s ease, visibility 0s linear .2s;
     width: min(300px, 84vw);
   }
-  #chatPanel.left-open #chatSidebar { transform: translateX(0); }
+  #chatPanel.left-open #chatSidebar { transform: translateX(0); visibility: visible; transition-delay: 0s; }
   #chatRightbar {
     position: absolute;
     inset: 0 0 0 auto;
     z-index: 40;
     box-shadow: var(--shadow-pop);
     transform: translateX(105%);
-    transition: transform .2s ease;
+    visibility: hidden;
+    transition: transform .2s ease, visibility 0s linear .2s;
     width: min(320px, 88vw);
   }
-  #chatPanel.right-open #chatRightbar { transform: translateX(0); }
+  #chatPanel.right-open #chatRightbar { transform: translateX(0); visibility: visible; transition-delay: 0s; }
+  #toastHost { bottom: auto; top: calc(var(--topbar-h) + 8px); }
   .chip-toggle { max-width: 180px; }
   #editButton { padding: 4px 9px; }
   .drawer-head { display: flex; align-items: center; justify-content: space-between; height: 44px; padding: 0 var(--s2) 0 var(--s4); border-bottom: 1px solid var(--border); font-weight: 650; flex: none; }
@@ -499,7 +502,12 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   #appTopbar { gap: var(--s2); padding: 0 var(--s2) 0 var(--s3); }
   #serverDot { padding: 0 6px; }
 }
-@media (max-width: 560px) {
+@media (max-width: 360px) {
+  #viewNav a { padding: 3px; }
+  #appTopbar { gap: var(--s1); }
+}
+/* Keyed to the composer's own width: beside the side panels a wide window still leaves a narrow row. */
+@container composer (max-width: 560px) {
   #directoryName, #toolsName, #editName { display: none; }
   #directoryButton, #toolsButton, #editButton { padding: 4px 9px; }
   #composerModelLabel { flex: 1 1 auto; min-width: 0; max-width: none; }
@@ -561,8 +569,8 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <span class="ver num" id="brandVersion"></span>
   </div>
   <nav id="viewNav" aria-label="Views">
-    <a id="navChat" href="/chat" aria-current="page">Chat</a>
-    <a id="navDashboard" href="/dashboard">Dashboard</a>
+    <a id="navDashboard" href="/dashboard" aria-current="page">Dashboard</a>
+    <a id="navChat" href="/chat">Chat</a>
     <a id="navModels" href="/models">Models</a>
     <a id="navSettings" href="/settings">Settings</a>
   </nav>
@@ -576,6 +584,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <div id="moreMenu" popover>
     <div class="kvrow"><span>View</span><div class="seg" id="modeToggleMenu" role="group" aria-label="View"><button type="button" data-mode="compact" aria-pressed="true">Compact</button><button type="button" data-mode="advanced" aria-pressed="false">Advanced</button></div></div>
     <div class="kvrow"><span>Theme</span><div class="seg" id="themeMenu" role="group" aria-label="Theme"><button type="button" data-theme-mode="system">System</button><button type="button" data-theme-mode="day">Light</button><button type="button" data-theme-mode="night">Dark</button></div></div>
+    <button class="btn sm" id="forgetKeyMenu" type="button" hidden>Forget the API key</button>
   </div>
 </header>
 <div id="updateBanner" role="status" hidden>
@@ -913,6 +922,7 @@ async function copyText(text, message = "Copied to clipboard") {
   }
 }
 function toast(message, tone = "ok") {
+  if ([...$("toastHost").children].some((shown) => shown.textContent === message)) return;
   const node = el("div", `toast ${tone}`);
   node.appendChild(icon(tone === "err" ? "x" : "check", 15));
   node.appendChild(document.createTextNode(message));
@@ -923,6 +933,7 @@ function toast(message, tone = "ok") {
     setTimeout(() => node.remove(), 260);
   };
   if (tone !== "err") return setTimeout(drop, 2400);
+  setTimeout(drop, 8000);
   node.setAttribute("role", "alert");
   const close = el("button", "icon-btn");
   close.setAttribute("aria-label", "Dismiss");
@@ -1003,6 +1014,8 @@ function showKeyOverlay(error) {
   const overlay = $("keyOverlay");
   if (!overlay.hidden) return;
   overlay.hidden = false;
+  // The overlay is modal: the page behind it takes no keystrokes and has no tab stops.
+  $("appShell").inert = true;
   $("keyInput").focus();
 }
 $("keyForm").addEventListener("submit", async (event) => {
@@ -1013,16 +1026,23 @@ $("keyForm").addEventListener("submit", async (event) => {
   dropStore("sushi-api-key");
   writeStore("sushi-api-key", key, !$("keyRemember").checked);
   $("keyOverlay").hidden = true;
-  $("forgetKeyButton").hidden = false;
+  $("appShell").inert = false;
+  renderForgetKey();
   window.sushiAdmin?.refresh();
   await refreshModels();
   loadVersion();
 });
-$("forgetKeyButton").onclick = () => {
-  dropStore("sushi-api-key");
-  apiKey = "";
-  window.location.reload();
-};
+for (const button of [$("forgetKeyButton"), $("forgetKeyMenu")]) {
+  button.onclick = () => {
+    dropStore("sushi-api-key");
+    apiKey = "";
+    window.location.reload();
+  };
+}
+function renderForgetKey() {
+  $("forgetKeyButton").hidden = !apiKey;
+  $("forgetKeyMenu").hidden = !apiKey;
+}
 
 const postJson = (path, body) => apiJson(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
@@ -1059,7 +1079,7 @@ const modelStore = {
   schedule() {
     clearTimeout(this.timer);
     if (document.hidden) return;
-    const wait = this.busy() ? 2000 : this.view === "dashboard" || this.view === "models" ? 5000 : 30000;
+    const wait = this.busy() ? 2000 : this.online === false ? 4000 : this.view === "dashboard" || this.view === "models" ? 5000 : 30000;
     this.timer = setTimeout(() => { if (chatAbort && this.view === "chat") this.schedule(); else this.refresh(); }, wait);
   },
   setView(view) { this.view = view; this.schedule(); },
@@ -1139,18 +1159,23 @@ function inlineNodes(text) {
   const fragment = document.createDocumentFragment();
   // Code spans become placeholders first, so emphasis can wrap them (**`x`**).
   const codes = [];
-  const masked = String(text ?? "").replace(/`([^`\n]+)`/g, (_, code) => `${codes.push(code) - 1}`);
+  const masked = String(text ?? "")
+    .replace(/`([^`\n]+)`/g, (_, code) => `${codes.push(code) - 1}`)
+    .replace(/\\([\\*_\[\]()#+\-.!|>~])/g, (_, mark) => `${codes.push({ literal: mark }) - 1}`);
   inlineStyled(masked, fragment, codes);
   return fragment;
 }
 function inlineText(text, host, codes) {
   text.split(/(\d+)/).forEach((part, index) => {
-    if (index % 2 === 1) host.appendChild(el("code", null, codes[Number(part)]));
+    if (index % 2 === 1) {
+      const code = codes[Number(part)];
+      host.appendChild(typeof code === "string" ? el("code", null, code) : document.createTextNode(code.literal));
+    }
     else if (part) host.appendChild(document.createTextNode(part));
   });
 }
 function inlineStyled(text, host, codes) {
-  const linkRe = /(!?)\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g;
+  const linkRe = /(!?)\[([^\]]*)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/g;
   let cursor = 0;
   let match;
   while ((match = linkRe.exec(text)) !== null) {
@@ -1246,7 +1271,24 @@ function tableCells(line) {
   if (!trimmed.includes("|")) return null;
   const bounded = trimmed.startsWith("|") && trimmed.endsWith("|");
   const source = bounded ? trimmed.slice(1, -1) : trimmed;
-  const cells = source.split("|").map((cell) => cell.trim());
+  // A pipe splits a cell unless it sits in a code span or is written \|.
+  const cells = [];
+  let cell = "";
+  let inCode = false;
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i];
+    if (char === "\\" && source[i + 1] === "|") {
+      cell += "|";
+      i += 1;
+    } else if (char === "|" && !inCode) {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      if (char === "`") inCode = !inCode;
+      cell += char;
+    }
+  }
+  cells.push(cell.trim());
   return cells.length >= 2 ? cells : null;
 }
 function isTableSeparator(line) {
@@ -1293,22 +1335,31 @@ function codeBlockNode(lang, code) {
   if (preview) block.appendChild(preview);
   return block;
 }
+// A fence opens with three or more backticks or tildes and an optional info string; it closes on the same mark, at least as long.
+const FENCE_OPEN = /^(\s*)(`{3,}|~{3,})\s*([^\s`]*)[^`]*$/;
+function readFence(lines, start, open) {
+  const [, indent, marks, lang] = open;
+  const closer = new RegExp(`^\\s*\\${marks[0]}{${marks.length},}\\s*$`);
+  const strip = new RegExp(`^\\s{0,${indent.length}}`);
+  const code = [];
+  let index = start + 1;
+  while (index < lines.length && !closer.test(lines[index])) {
+    code.push(lines[index].replace(strip, ""));
+    index += 1;
+  }
+  return { node: codeBlockNode(lang, code.join("\n")), next: index + 1 };
+}
 function renderMarkdown(text) {
   const fragment = document.createDocumentFragment();
   const lines = String(text ?? "").split("\n");
   let index = 0;
   while (index < lines.length) {
     const line = lines[index];
-    const fence = line.match(/^\s*```(\S*)\s*$/);
+    const fence = line.match(FENCE_OPEN);
     if (fence) {
-      const code = [];
-      index += 1;
-      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
-        code.push(lines[index]);
-        index += 1;
-      }
-      index += 1;
-      fragment.appendChild(codeBlockNode(fence[1], code.join("\n")));
+      const block = readFence(lines, index, fence);
+      fragment.appendChild(block.node);
+      index = block.next;
       continue;
     }
     const heading = line.match(/^(#{1,6})\s+(.*)$/);
@@ -1382,6 +1433,13 @@ function renderMarkdown(text) {
         const nested = [];
         while (index + 1 < lines.length) {
           const next = lines[index + 1];
+          const nestedFence = /^\s{2,}/.test(next) ? next.match(FENCE_OPEN) : null;
+          if (nestedFence) {
+            const block = readFence(lines, index + 1, nestedFence);
+            item.appendChild(block.node);
+            index = block.next - 1;
+            continue;
+          }
           const nestedMatch = next.match(/^\s{2,}([-*+]|\d+[.)])\s+(.*)$/);
           if (nestedMatch) {
             nested.push(nestedMatch[2]);
@@ -1419,7 +1477,7 @@ function renderMarkdown(text) {
     while (
       index < lines.length &&
       lines[index].trim() &&
-      !/^\s*```/.test(lines[index]) &&
+      !FENCE_OPEN.test(lines[index]) &&
       !/^#{1,6}\s/.test(lines[index]) &&
       !/^>\s?/.test(lines[index]) &&
       !lines[index].match(/^(\s*)([-*+]|\d+[.)])\s+/) &&
@@ -1443,6 +1501,7 @@ function renderMarkdown(text) {
    SSE helper
    ------------------------------------------------------------ */
 function readSsePayloads(buffer, onPayload) {
+  buffer = buffer.replace(/\r\n/g, "\n");
   let cursor = 0;
   while (true) {
     const boundary = buffer.indexOf("\n\n", cursor);
@@ -1637,7 +1696,7 @@ modelStore.subscribe(() => {
 });
 function renderModelOptions() {
   const select = $("modelSelect");
-  const current = select.value || readStore("sushi-model");
+  const stored = readStore("sushi-model"), shown = select.value;
   // Rebuild only when the set changed, so a poll does not snap an open dropdown shut.
   const signature = modelCatalog.map((model) => `${model.id}${model.loaded ? "*" : ""}`).join("|");
   if (select.dataset.signature !== signature) {
@@ -1650,7 +1709,7 @@ function renderModelOptions() {
     }
   }
   const ids = modelCatalog.map((model) => model.id);
-  select.value = (current && ids.includes(current) && current) || ids[0] || "";
+  select.value = [stored, shown].find((id) => id && ids.includes(id)) || ids[0] || "";
   renderEffortOptions();
   renderModelStatus();
 }
@@ -1693,8 +1752,10 @@ function renderModelStatus() {
   const vision = modelSeesImages(model);
   $("attachButton").hidden = !vision;
   if (!vision && pendingImages.length) {
+    const count = pendingImages.length;
     pendingImages = [];
     renderComposerAttachments();
+    toast(`${count} attached image${count === 1 ? " was" : "s were"} removed: ${model ? model.id : "this model"} does not accept images`, "err");
   }
   const host = $("modelStatus");
   host.textContent = "";
@@ -1702,10 +1763,12 @@ function renderModelStatus() {
     host.appendChild(el("span", "badge flag", "no chat model found"));
     return;
   }
-  host.appendChild(el("span", `badge ${model.loaded ? "ok" : ""}`, model.loaded ? "loaded" : "loads on first message"));
-  if (!model.loaded) {
+  const ready = model.state ? model.state === "ready" : Boolean(model.loaded);
+  const label = { ready: "loaded", loading: "loading…", evicting: "unloading…", error: "failed to load" }[model.state] ?? (ready ? "loaded" : "loads on first message");
+  host.appendChild(el("span", `badge ${ready ? "ok" : model.state === "error" ? "flag" : ""}`, label));
+  if (!ready && model.state !== "loading" && model.state !== "evicting") {
     const busy = modelStore.pending.has(model.id);
-    const load = el("button", "btn sm", busy ? "Loading…" : "Load now");
+    const load = el("button", "btn sm", busy ? "Loading…" : model.state === "error" ? "Retry load" : "Load now");
     load.type = "button";
     load.disabled = busy;
     if (busy) load.setAttribute("aria-busy", "true");
@@ -1747,22 +1810,71 @@ let renamingChatId = null;
 let pendingDeleteChatId = null;
 let pendingImages = [];
 
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+// Saved history is untrusted: anything of the wrong shape is dropped or coerced so one bad chat cannot stop the page.
+function sanitizeMessage(message) {
+  if (!isRecord(message) || !["user", "assistant", "tool"].includes(message.role)) return null;
+  const clean = { ...message, content: typeof message.content === "string" ? message.content : typeof message.content === "number" ? String(message.content) : "" };
+  if (Array.isArray(message.tool_calls)) clean.tool_calls = message.tool_calls.filter(isRecord);
+  else delete clean.tool_calls;
+  if (Array.isArray(message.images)) clean.images = message.images.filter((url) => typeof url === "string");
+  else delete clean.images;
+  if (typeof clean.reasoning !== "string") delete clean.reasoning;
+  return clean;
+}
+function sanitizeChat(chat) {
+  if (!isRecord(chat) || !Array.isArray(chat.messages)) return null;
+  return {
+    ...chat,
+    id: typeof chat.id === "string" && chat.id ? chat.id : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+    title: typeof chat.title === "string" ? chat.title : "",
+    updated: Number.isFinite(chat.updated) ? chat.updated : 0,
+    messages: chat.messages.map(sanitizeMessage).filter(Boolean),
+  };
+}
 function loadChats() {
   try {
     const parsed = JSON.parse(readStore(CHATS_KEY) ?? "[]");
-    return Array.isArray(parsed) ? parsed.filter((chat) => chat && Array.isArray(chat.messages)) : [];
+    return Array.isArray(parsed) ? parsed.map(sanitizeChat).filter(Boolean) : [];
   } catch {
     return [];
   }
 }
+// This tab's own deletions: another tab's older copy must not bring them back when the lists are merged.
+const deletedChatIds = new Set();
+let storageFullShown = false;
 function saveChats() {
+  // Another tab may have saved since this one loaded: its conversations stay, this tab's win on a shared id.
+  const mine = new Set(chats.map((chat) => chat.id));
+  const theirs = loadChats().filter((chat) => !mine.has(chat.id) && !deletedChatIds.has(chat.id));
+  const merged = [...chats, ...theirs].sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0)).slice(0, MAX_SAVED_CHATS);
   // Images stay in memory only: a few photos would fill the browser's small storage quota.
-  const slim = chats.slice(0, MAX_SAVED_CHATS).map((chat) => ({
+  const slim = merged.map((chat) => ({
     ...chat,
     messages: chat.messages.map(({ images, ...rest }) => (images?.length ? { ...rest, droppedImages: images.length } : rest)),
   }));
-  writeStore(CHATS_KEY, JSON.stringify(slim));
+  // A full store drops the oldest conversations from what is kept, never the newest.
+  let kept = slim;
+  while (kept && !writeStore(CHATS_KEY, JSON.stringify(kept))) kept = kept.length > 1 ? kept.slice(0, -1) : null;
+  if (kept === slim) storageFullShown = false;
+  else if (!storageFullShown) {
+    storageFullShown = true;
+    toast(kept ? "Browser storage is full: the oldest conversations will not be kept after a reload." : "Browser storage is full: this conversation will not be kept after a reload.", "err");
+  }
 }
+// Another tab saved: take its list, keeping this tab's own conversation while its reply is streaming.
+window.addEventListener("storage", (event) => {
+  if (event.key !== CHATS_KEY || event.storageArea !== localStorage) return;
+  const loaded = loadChats().filter((chat) => !deletedChatIds.has(chat.id));
+  const live = chatAbort ? currentChat : null;
+  const viewed = currentChat;
+  chats = live ? [live, ...loaded.filter((chat) => chat.id !== live.id)] : loaded;
+  if (!live && viewed) currentChat = chats.find((chat) => chat.id === viewed.id) ?? null;
+  if (renamingChatId === null) renderConversationList();
+  if (!live && viewed) renderTranscript();
+});
 function touchChat(chat) {
   chat.updated = Date.now();
   chats = [chat, ...chats.filter((entry) => entry !== chat)];
@@ -1793,21 +1905,23 @@ function renderConversationList() {
       input.type = "text";
       input.value = chatTitle(chat);
       input.onclick = (event) => event.stopPropagation();
-      input.onkeydown = (event) => {
-        if (event.key === "Enter") {
-          chat.title = input.value.trim();
-          renamingChatId = null;
-          saveChats();
-          renderConversationList();
-        } else if (event.key === "Escape") {
-          renamingChatId = null;
-          renderConversationList();
-        }
-      };
-      input.onblur = () => {
+      let settled = false;
+      const settle = (save) => {
+        if (settled) return;
+        settled = true;
+        if (save) chat.title = input.value.trim();
         renamingChatId = null;
+        if (save) saveChats();
         renderConversationList();
       };
+      input.onkeydown = (event) => {
+        if (event.key === "Enter") settle(true);
+        else if (event.key === "Escape") {
+          event.stopPropagation();
+          settle(false);
+        }
+      };
+      input.onblur = () => settle(true);
       body.appendChild(input);
       item.appendChild(body);
       host.appendChild(item);
@@ -1858,7 +1972,9 @@ function renderConversationList() {
     item.appendChild(actions);
     item.onclick = () => openChat(chat.id);
     item.onkeydown = (event) => {
-      if (event.key === "Enter") openChat(chat.id);
+      if (event.target !== item || (event.key !== "Enter" && event.key !== " ")) return;
+      event.preventDefault();
+      openChat(chat.id);
     };
     host.appendChild(item);
   }
@@ -1874,6 +1990,7 @@ function openChat(id) {
 }
 function deleteChat(id) {
   pendingDeleteChatId = null;
+  deletedChatIds.add(id);
   if (currentChat?.id === id) newChat();
   chats = chats.filter((chat) => chat.id !== id);
   saveChats();
@@ -2282,7 +2399,9 @@ function wireMessages(history) {
     if (message.role === "user") {
       const images = message.images ?? [];
       if (!images.length) {
-        out.push({ role: "user", content: message.content });
+        // Images are not kept across a reload; the model is told, instead of getting an empty message.
+        const gone = message.droppedImages ? `[${message.droppedImages === 1 ? "an attached image is" : `${message.droppedImages} attached images are`} no longer available]` : "";
+        out.push({ role: "user", content: [message.content, gone].filter(Boolean).join("\n") });
         continue;
       }
       const parts = images.map((url) => ({ type: "image_url", image_url: { url } }));
@@ -2375,6 +2494,11 @@ function replyMeta(usage, timings, finishReason, aborted, clientRate, effortNoti
   if (typeof effortNotice === "string" && effortNotice) parts.push(effortNotice);
   return parts.join(" · ") || null;
 }
+// A reply that breaks off keeps what already reached the screen, so the turn can save it.
+function interrupted(error, view) {
+  if (view.text || view.reasoning) error.partial = { text: view.text, reasoning: view.reasoning };
+  return error;
+}
 async function streamReply(model, history, signal, tools = null) {
   const view = createStreamingView();
   perfMon.begin();
@@ -2384,6 +2508,7 @@ async function streamReply(model, history, signal, tools = null) {
   let effortNotice = null;
   let finishReason = null;
   let streamError = null;
+  let completed = false;
   let firstAt = 0;
   let deltas = 0;
   try {
@@ -2410,7 +2535,10 @@ async function streamReply(model, history, signal, tools = null) {
       done = chunk.done;
       buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !done });
       buffer = readSsePayloads(buffer, (payload) => {
-        if (payload === "[DONE]") return;
+        if (payload === "[DONE]") {
+          completed = true;
+          return;
+        }
         let json;
         try {
           json = JSON.parse(payload);
@@ -2426,7 +2554,10 @@ async function streamReply(model, history, signal, tools = null) {
         if (typeof json.effort_notice === "string" && json.effort_notice) effortNotice = json.effort_notice;
         const choice = json.choices?.[0];
         if (!choice) return;
-        if (choice.finish_reason) finishReason = choice.finish_reason;
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
+          completed = true;
+        }
         const delta = choice.delta ?? {};
         for (const part of delta.tool_calls ?? []) {
           if (!Number.isInteger(part.index) || part.index < 0 || part.index >= 64) throw new Error("Invalid tool call index");
@@ -2449,13 +2580,14 @@ async function streamReply(model, history, signal, tools = null) {
     if (!(signal.aborted && error.name === "AbortError")) {
       view.finalize();
       perfMon.finish(null, null);
-      throw error;
+      throw interrupted(error, view);
     }
   }
   perfMon.finish(usage, timings);
   refreshPrefixCache();
   view.finalize();
-  if (streamError) throw new Error(streamError);
+  if (!streamError && !completed && !signal.aborted) streamError = "The connection closed before the reply was finished";
+  if (streamError) throw interrupted(new Error(streamError), view);
   const seconds = firstAt ? (performance.now() - firstAt) / 1000 : 0;
   const clientRate = deltas > 1 && seconds > 0.05 ? deltas / seconds : 0;
   return {
@@ -2478,10 +2610,19 @@ async function runResearchTurn(model, messages, signal, tools, vision, directory
   for (let round = 0; round <= 8; round++) {
     if (signal.aborted) return;
     const final = round === 8 && tools?.length;
-    const result = await streamReply(model, final ? [...messages, nudge] : messages, signal, round < 8 ? tools : null);
+    let result;
+    try {
+      result = await streamReply(model, final ? [...messages, nudge] : messages, signal, round < 8 ? tools : null);
+    } catch (error) {
+      if (error.partial) messages.push({ role: "assistant", content: error.partial.text, reasoning: error.partial.reasoning || null, meta: "interrupted" });
+      throw error;
+    }
     const calls = result.tool_calls ?? [];
-    if (calls.length && (!tools?.length || round === 8)) throw new Error("Unexpected tool call with tools disabled");
-    if (calls.some((call) => !call.id || !call.function?.name)) throw new Error("Incomplete tool call");
+    const unusable = calls.length && (!tools?.length || round === 8) ? "Unexpected tool call with tools disabled" : calls.some((call) => !call.id || !call.function?.name) ? "Incomplete tool call" : "";
+    if (unusable) {
+      if (result.text || result.reasoning) messages.push({ role: "assistant", content: result.text, reasoning: result.reasoning || null, meta: "interrupted" });
+      throw new Error(unusable);
+    }
     if (result.text || result.reasoning || calls.length) {
       messages.push({ role: "assistant", content: result.text, reasoning: result.reasoning || null, meta: result.meta,
         ...(calls.length ? { tool_calls: calls } : {}) });
@@ -2528,14 +2669,12 @@ async function runTurn(chat) {
     if (chatAbort.signal.aborted) toast("Stopped", "ok");
   } catch (error) {
     if (chatAbort.signal.aborted) toast("Stopped", "ok");
-    else {
-      lastTurnError = String(error.message ?? error).slice(0, 300);
-      toast("The reply failed", "err");
-    }
+    else lastTurnError = String(error.message ?? error).slice(0, 300);
   } finally {
+    if (chatAbort.signal.aborted && chat.messages.at(-1)?.role === "user") lastTurnError = "Stopped before the reply started.";
     chatAbort = null;
     setChatBusy(false);
-    touchChat(chat);
+    if (!deletedChatIds.has(chat.id)) touchChat(chat);
     if (chat === currentChat) renderTranscript();
     refreshModels();
   }
@@ -2552,6 +2691,7 @@ async function sendChat(text) {
   pendingImages = [];
   renderComposerAttachments();
   currentChat.messages.push({ role: "user", content, images });
+  touchChat(currentChat);
   await runTurn(currentChat);
 }
 async function regenerateLast() {
@@ -2559,6 +2699,11 @@ async function regenerateLast() {
   const messages = currentChat.messages;
   const lastUser = messages.map((message) => message.role).lastIndexOf("user");
   if (lastUser === -1) return;
+  if (messages[lastUser].droppedImages && !messages[lastUser].toolImages && !messages[lastUser].images?.length) {
+    toast("The image of that message was not kept after a reload. Attach it and send it again.", "err");
+    return;
+  }
+  refreshModels();
   messages.splice(lastUser + 1);
   await runTurn(currentChat);
 }
@@ -2574,11 +2719,19 @@ function autosizePrompt() {
 $("sendButton").onclick = () => {
   const text = $("promptInput").value;
   if ((!text.trim() && !pendingImages.length) || chatAbort) return;
+  if (!$("modelSelect").value) {
+    toast("No chat model is available yet", "err");
+    return;
+  }
   $("promptInput").value = "";
   autosizePrompt();
+  $("promptInput").focus();
   sendChat(text);
 };
-$("stopButton").onclick = () => chatAbort?.abort();
+$("stopButton").onclick = () => {
+  chatAbort?.abort();
+  $("promptInput").focus();
+};
 $("attachButton").onclick = () => $("attachInput").click();
 $("attachInput").addEventListener("change", (event) => {
   addComposerFiles(event.target.files ?? []).catch(() => toast("Could not read that file", "err"));
@@ -2606,7 +2759,9 @@ $("promptInput").addEventListener("keydown", (event) => {
 });
 $("promptInput").addEventListener("input", autosizePrompt);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeChatDrawersOnMobile();
+  if (event.key !== "Escape" || event.defaultPrevented || !isMobileViewport() || document.querySelector("dialog[open]")) return;
+  if ($("appMain").dataset.view !== "chat") return;
+  for (const side of Object.keys(chatAsideSides)) if ($("chatPanel").classList.contains(chatAsideSides[side].class)) setChatAside(side, false);
 });
 
 /* ------------------------------------------------------------
@@ -2618,14 +2773,19 @@ async function init() {
   setupThemeMode();
   loadChatOptions();
   applyChatAsideDefaults();
-  $("forgetKeyButton").hidden = !apiKey;
-  renderConversationList();
-  renderTranscript();
+  renderForgetKey();
+  // One damaged saved chat must not keep the models from loading.
+  try {
+    renderConversationList();
+    renderTranscript();
+  } catch (error) {
+    console.error(error);
+  }
   await refreshModels();
   loadEditDefault();
   loadVersion();
   setInterval(() => { if (!document.hidden) loadVersion(); }, 300_000);
-  $("promptInput").focus();
+  if ($("keyOverlay").hidden && location.pathname === "/chat") $("promptInput").focus();
 }
 init();
 </script>
@@ -4235,7 +4395,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard', models: '/models', settings: '/settings' };
   const NAV_ID = { chat: 'navChat', dashboard: 'navDashboard', models: 'navModels', settings: 'navSettings' };
-  const viewOf = p => Object.keys(VIEW_PATH).find(v => VIEW_PATH[v] === p) ?? 'chat';
+  // The root is the Dashboard: it is where a visit to the server starts; the chat lives at /chat.
+  const viewOf = p => Object.keys(VIEW_PATH).find(v => VIEW_PATH[v] === p) ?? 'dashboard';
   const chatTitle = document.title;
   let panelScroll = 0, chatFocus = null, switching = false;
   // The nav link takes focus when clicked, so the chat's last focused element is tracked as it moves.
@@ -4257,7 +4418,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     // inert (with the CSS visibility rule) keeps the hidden chat out of tab order and the accessibility tree.
     chatPanel.inert = !chat;
     document.getElementById('appMain').dataset.view = view;
-    for (const v of Object.keys(NAV_ID)) document.getElementById(NAV_ID[v]).setAttribute('aria-current', v === view ? 'page' : 'false');
+    for (const v of Object.keys(NAV_ID)) {
+      const link = document.getElementById(NAV_ID[v]);
+      if (v === view) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
+    }
     document.title = chat ? chatTitle : 'sushi · ' + view;
     modelStore.setView(view);
     window.sushiAdmin?.show(view);

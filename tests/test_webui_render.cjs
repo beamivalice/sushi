@@ -63,6 +63,23 @@ const checks = async function () {
     const bad = inlineNodes('![Bad](javascript:alert%281%29)');
     assert(!bad.querySelector('img'), 'unsafe image URL accepted');
   });
+  await test('Markdown fences: info strings, longer and tilde marks, fences in list items', () => {
+    const host = el('div');
+    host.appendChild(renderMarkdown('``` python\nprint(1)\n```\n\n```js title="a.js"\nx\n```\n\n````md\n```js\ny\n```\n````\n\n~~~\nt\n~~~\n\n1. step\n   ```sh\n   ls\n   ```\n2. next\n\nAfter'));
+    document.getElementById('examples').appendChild(host);
+    const blocks = [...host.querySelectorAll('.code-block')].map((b) => `${b.querySelector('.cb-head span').textContent}:${b.querySelector('pre').textContent}`);
+    assert(JSON.stringify(blocks) === JSON.stringify(['python:print(1)', 'js:x', 'md:```js\ny\n```', 'code:t', 'sh:ls']), `blocks were ${JSON.stringify(blocks)}`);
+    assert(host.querySelectorAll(':scope > ol > li').length === 2, 'the list lost an item');
+    assert(host.lastElementChild.textContent === 'After', 'text after the fences was swallowed');
+  });
+  await test('Markdown inline: a paren in a link, a pipe in a code span, an escaped star', () => {
+    const host = el('div');
+    host.appendChild(renderMarkdown('[Foo](https://en.wikipedia.org/wiki/Foo_(bar)) \\* x\n\n| a | b |\n|---|---|\n| `x|y` | 2 |'));
+    document.getElementById('examples').appendChild(host);
+    assert(host.querySelector('a').href.endsWith('Foo_(bar)'), 'link cut at the parenthesis');
+    assert(host.querySelector('p').textContent.endsWith(' * x') && !host.querySelector('em'), 'escaped star');
+    assert([...host.querySelectorAll('td')].map((c) => c.textContent).join('/') === 'x|y/2', 'code span split the cell');
+  });
   document.title = failures ? `${failures} FAILED` : 'All renderer checks passed';
   results.prepend(el('h2', null, document.title));
 };

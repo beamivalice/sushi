@@ -381,11 +381,11 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
   `--api-key` like the other two. Guards: `tests/test_webui.sh`, the `chat page:` and `dashboard page:` tests.
-- A **Chat | Dashboard | Models | Settings** navigator in the top bar switches the views of that one page in place (`history.pushState`,
+- The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings** navigator in the top bar switches the views of that one page in place (`history.pushState`,
   `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
   conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
-- **One reader of `/v1/models`**: `modelStore` (main script) polls it (30 s on Chat, 5 s on Dashboard and Models, 2 s
-  while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only
+- **One reader of `/v1/models`**: `modelStore` (main script) polls it (30 s on Chat, 5 s on Dashboard and Models, 4 s
+  while the server is unreachable, 2 s while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only
   when the answer changed; no timer runs while the tab is hidden, and loads and unloads go through its `act`. There is
   no separate `/health` poll. `confirmAction` is the one confirmation dialog (destructive buttons name the bytes they free).
 - The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
@@ -446,12 +446,21 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `reasoning_budget_tokens`.
 - Under `--api-key` the page is served without the key (it holds no data), asks for it on the first 401 and sends it as
   a Bearer token. Its fetches use `credentials: "omit"`: the 401's Basic challenge would otherwise open the browser's
-  own login dialog.
+  own login dialog. The key overlay is modal (`#appShell` is `inert` behind it, the key box has the focus); Forget the
+  API key is in the phone `⋯` menu and in Settings › About.
 - Conversations live in the browser's `localStorage` (every access guarded); attached images stay in memory only, as a
-  few photos would fill the storage quota.
+  few photos would fill the storage quota. Saved history is sanitised on load (a damaged chat or message is dropped or
+  coerced, never fatal). Tabs share one list: a save merges the stored list by id (this tab's deletions stay deleted)
+  and the `storage` event reloads it. A full store warns once and keeps the newest conversations. A new conversation is
+  saved and listed when its first message is sent. A reply that breaks off (cut socket, an SSE `error`, a close
+  without `finish_reason` or `[DONE]`) keeps the words already shown as an assistant message marked `interrupted` and
+  shows Retry; Stop before the first token shows Retry too. Retry or Regenerate on a turn whose images did not survive
+  a reload is refused with a toast, and such a message goes on the wire with a note in place of the images, never empty.
+- The chat shows a model by its `state`: `loading` and `evicting` get a badge and no button, `error` gets Retry load.
+  Error toasts leave after 8 s and a message already on screen is not shown twice.
 - `/props` gives the version and the update banner: shown while `update.available`, its button POSTs `/v1/update`,
   polls `/health` until the server has gone down and come back, reloads, and reports the new version or `update.error`.
-- Startup prints `chat in your browser: <url>` once (`chatPageUrl`: a `0.0.0.0` bind shows as `127.0.0.1`); `sushi run`
+- Startup prints `chat in your browser: <url>/chat` once (`chatPageUrl`: a `0.0.0.0` bind shows as `127.0.0.1`); `sushi run`
   prints it under its banner, since its log is quieted to warn.
 
 ## Self-update (`POST /v1/update`, `/props.update`)

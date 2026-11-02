@@ -1758,7 +1758,7 @@ pub fn writeReadyBanner(w: *std.Io.Writer, vision: bool, port: u16, state: []con
     try w.writeAll("\n>>> chat is live — /bye to exit, /tool on for web search and file tools, /edit on to let the model write files there");
     try w.writeAll(if (vision) ", /image <path> to show an image\n" else "\n");
     try w.print(">>> {s} (shown before each prompt); /cd <folder> moves the folder the file tools{s} read\n", .{ state, if (vision) " and relative /image paths" else "" });
-    try w.print(">>> chat in your browser: http://127.0.0.1:{d}/\n", .{port});
+    try w.print(">>> chat in your browser: http://127.0.0.1:{d}/chat\n", .{port});
 }
 
 /// The REPL's line for a newer release found by the daily check; nothing without one.
@@ -2548,7 +2548,7 @@ test "cli: the ready banner shows the folder, the tools state, /cd and the brows
         var w: std.Io.Writer = .fixed(&buf);
         try writeReadyBanner(&w, vision, 18800, "~/project · tools off");
         const text = w.buffered();
-        try testing.expect(std.mem.indexOf(u8, text, "chat in your browser: http://127.0.0.1:18800/\n") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "chat in your browser: http://127.0.0.1:18800/chat\n") != null);
         try testing.expect(std.mem.indexOf(u8, text, "/tool on") != null);
         try testing.expect(std.mem.indexOf(u8, text, "~/project · tools off") != null);
         try testing.expect(std.mem.indexOf(u8, text, "/cd <folder>") != null);
