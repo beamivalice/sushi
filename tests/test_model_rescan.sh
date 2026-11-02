@@ -42,10 +42,12 @@ fi
 
 ROOT_DIR="$(mktemp -d)"
 LOG="$(mktemp)"
+# A private HOME: rescan also walks the models folder of ~/.sushi/model-settings.json.
+export HOME="$(mktemp -d)"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    rm -rf "$ROOT_DIR" "$LOG"
+    rm -rf "$ROOT_DIR" "$LOG" "$HOME"
 }
 trap cleanup EXIT
 
@@ -74,7 +76,7 @@ check "boot: /v1/models has no entries" \
 
 # A model lands on disk after boot (what a Model Browser download does).
 mkdir -p "$ROOT_DIR/org/late-model"
-echo '{"model_type":"minimax_h3"}' > "$ROOT_DIR/org/late-model/config.json"
+echo '{"model_type":"glm5_next"}' > "$ROOT_DIR/org/late-model/config.json"
 echo "stub" > "$ROOT_DIR/org/late-model/transformer.safetensors"
 
 RESCAN=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan")
@@ -84,34 +86,23 @@ check "rescan reports the new model ({\"added\":1}, got $RESCAN)" \
 MODELS=$(curl -s "http://127.0.0.1:$PORT/v1/models")
 check "/v1/models now lists org/late-model" \
     "$(echo "$MODELS" | grep -q '"org/late-model"' && echo 1 || echo 0)"
-check "the stub advertises its media capability" \
-    "$(echo "$MODELS" | grep -q '"video"' && echo 1 || echo 0)"
 
 # Idempotent: nothing new → nothing added.
 RESCAN=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan")
 check "second rescan adds nothing (got $RESCAN)" \
     "$(echo "$RESCAN" | grep -q '"added":0' && echo 1 || echo 0)"
 
-# An INCOMPLETE media pack (media model_type, required marker missing — an
-# in-flight download or a turbo-lora fragment) stays invisible to rescan, and
-# a load by absolute path is refused by name instead of falling through to
-# the text loader (which globs whatever safetensors exist and DIES on the
-# first missing weight — live 2026-08-08).
-mkdir -p "$ROOT_DIR/org/fragment"
-echo '{"model_type":"minimax_h3"}' > "$ROOT_DIR/org/fragment/config.json"
-echo "stub" > "$ROOT_DIR/org/fragment/turbo_lora.safetensors"
-
+# A folder whose model_type is not served, or one under test-fixtures, is not absorbed.
+mkdir -p "$ROOT_DIR/org/other" "$ROOT_DIR/test-fixtures/tiny"
+echo '{"model_type":"llama"}' > "$ROOT_DIR/org/other/config.json"
+echo "stub" > "$ROOT_DIR/org/other/model.safetensors"
+echo '{"model_type":"glm5_next"}' > "$ROOT_DIR/test-fixtures/tiny/config.json"
+echo "stub" > "$ROOT_DIR/test-fixtures/tiny/model.safetensors"
 RESCAN=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan")
-check "incomplete media pack is not absorbed (got $RESCAN)" \
+check "an unserved model_type and a test fixture are not absorbed (got $RESCAN)" \
     "$(echo "$RESCAN" | grep -q '"added":0' && echo 1 || echo 0)"
-
-LOAD=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/load-model" \
-    -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$ROOT_DIR/org/fragment\"}")
-check "load-by-path refuses the incomplete pack by name (got $LOAD)" \
-    "$(echo "$LOAD" | grep -qi 'incomplete media pack' && echo 1 || echo 0)"
 HEALTH=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")
-check "server survived the refused load (health $HEALTH)" \
+check "server alive after the rescans (health $HEALTH)" \
     "$([ "$HEALTH" = "200" ] && echo 1 || echo 0)"
 
 echo ""

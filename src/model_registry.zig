@@ -857,10 +857,15 @@ pub const ModelRegistry = struct {
     /// number of stubs added. A `--model`-only server with no
     /// settings-file models directory rescans nothing.
     pub fn rescan(self: *ModelRegistry) !u32 {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        return self.rescanWithSettings(model_settings.defaultPath(&path_buf));
+    }
+
+    /// `rescan` reading the settings file at `settings_path`.
+    pub fn rescanWithSettings(self: *ModelRegistry, settings_path: []const u8) !u32 {
         const boot_roots = if (self.discovery) |d| d.roots else &.{};
         // The settings file's models directory joins the boot roots, so a changed one is found without a restart.
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var file = model_settings.load(self.allocator, self.io, model_settings.defaultPath(&path_buf));
+        var file = model_settings.load(self.allocator, self.io, settings_path);
         defer file.deinit();
         var with_file: [9][]const u8 = undefined;
         const roots = rootsWithFileDir(&with_file, boot_roots, model_settings.launch_locks.models_dir.set, model_settings.server(&file).models_dir);
@@ -2167,6 +2172,9 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     chat2.config = null;
 }
 
+/// Rescan tests never read the user's own settings file, whose models folder would join the roots.
+const no_settings = "/nonexistent/sushi-test/model-settings.json";
+
 test "ModelRegistry: rescan roots: the settings file's models directory is walked even on a --model-only server" {
     var buf: [9][]const u8 = undefined;
     const only_file = rootsWithFileDir(&buf, &.{}, false, "/models");
@@ -2204,12 +2212,12 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     try tmp.dir.writeFile(io, .{ .sub_path = "org/second/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "org/second/model.safetensors", .data = "0123" });
 
-    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    try testing.expectEqual(@as(u32, 1), try reg.rescanWithSettings(no_settings));
     const stub = reg.peek("org/second") orelse return error.TestExpectedResult;
     try testing.expectEqualStrings("mimo_v2", stub.arch_hint);
     try testing.expectEqual(LoadState.unloaded, stub.state);
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
-    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expectEqual(@as(u32, 0), try reg.rescanWithSettings(no_settings));
     try testing.expect(reg.peek("org/first") != null);
 }
 
@@ -2231,7 +2239,7 @@ test "ModelRegistry: rescan under a models root never absorbs test-fixtures or d
     try model_discovery.writePackStub(io, tmp.dir, ".hidden/y");
     try model_discovery.writePackStub(io, tmp.dir, "org/second");
 
-    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    try testing.expectEqual(@as(u32, 1), try reg.rescanWithSettings(no_settings));
     try testing.expect(reg.peek("org/second") != null);
     try testing.expect(reg.peek("x") == null);
     try testing.expect(reg.peek("y") == null);
@@ -2273,7 +2281,7 @@ test "upstream bugfix: ModelRegistry: rescan clears a failed load so the complet
     // The download finishes after the failed load.
     try tmp.dir.writeFile(io, .{ .sub_path = "org/broken/model.safetensors", .data = "01234567" });
 
-    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expectEqual(@as(u32, 0), try reg.rescanWithSettings(no_settings));
     try testing.expectEqual(LoadState.unloaded, broken.state);
     try testing.expectEqual(@as(?[]const u8, null), broken.error_name);
     try testing.expectEqual(@as(?u64, 8), broken.bytes_on_disk);
