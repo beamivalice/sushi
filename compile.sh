@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Compile the local checkout (including uncommitted changes) to zig-out/bin/sushi.
+# Compile the local checkout (including uncommitted changes) to zig-out/bin/sushi and zig-out/bin/sushibar;
+# zig build compiles the two in parallel.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,4 +12,4 @@ if [ ! -x .zig-toolchain/zig ]; then
 fi
 
 .zig-toolchain/zig build -Doptimize=ReleaseFast --prefix "$REPO_ROOT/zig-out" "$@"
-echo "Built $REPO_ROOT/zig-out/bin/sushi"
+echo "Built $REPO_ROOT/zig-out/bin/sushi and $REPO_ROOT/zig-out/bin/sushibar"
