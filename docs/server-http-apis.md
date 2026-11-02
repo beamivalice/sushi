@@ -68,6 +68,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   default (undefined: every turn's thinking kept). Off renders only the latest user turn's thinking.
 - `tool_choice` reads every surface's wire shape; `required`/`any` and a named function are enforced at decode, a
   named function the request does not declare is a 400 ([server-tool-calling](server-tool-calling.md#tool_choice)).
+- `/v1/models` `bytes_on_disk` is the bytes the pack reads, symlinked shards included; `bytes_linked` (0 when none) is the part
+  that comes through symlinks to files outside the pack folder (a symlink inside it counts as the pack's own), so disk use is
+  `bytes_on_disk - bytes_linked`. The Models tab details show it as "linked from elsewhere".
 - `/v1/models` rows carry `context_length` + `max_model_len` at TOP level. Context-overflow 400s name BOTH counts.
 - A prompt that tokenizes to zero tokens is a 400 `invalid_request_error` and never reaches generate: completions
   refuse it after tokenizing, `Scheduler.submit` refuses it for every surface (`error.EmptyPrompt`), and

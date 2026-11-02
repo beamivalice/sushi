@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The Models tab no longer overstates disk use**: `/v1/models` adds `bytes_linked`, the part of a pack's size that comes through symlinks to files outside its folder (the DeepSeek STQ Engram shards), and a model's details say "N GiB linked from elsewhere" beside its size.
 - **`sushi serve --model` answers right away**: the web page, dashboard, settings and the status routes work while the model loads, `/v1/models` lists it as loading, `/health` answers 503 `loading` until it is ready, and a chat sent meanwhile is answered once the load finishes; a load that fails still ends the server with its error.
 - **The Models list no longer shows the repo's test fixtures**: a folder named `test-fixtures` (and any dot folder) inside a models folder is skipped by discovery and rescan, while `--model-dir` pointed straight at such a folder still lists what is in it.
 - **The web page opens on the Dashboard**: the tabs read Dashboard, Chat, Models, Settings, `/chat` opens the chat, and the startup banner and `sushi run` print that address.

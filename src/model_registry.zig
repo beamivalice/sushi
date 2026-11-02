@@ -194,6 +194,8 @@ pub const LoadedModel = struct {
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,
+    /// Part of `bytes_on_disk` read through symlinks to files outside the pack folder.
+    bytes_linked: u64 = 0,
     /// `model_type` peeked from config.json at discovery time (allocator-
     /// owned dupe; empty when unknown). Lets /v1/models advertise
     /// arch-derived capabilities while the entry is still an `.unloaded` stub.
@@ -543,6 +545,7 @@ pub const ModelStatus = struct {
     loaded: bool,
     bytes_resident: u64,
     bytes_on_disk: ?u64,
+    bytes_linked: u64 = 0,
     last_used_ns: i64,
     state: []const u8,
     error_name: ?[]const u8,
@@ -680,7 +683,8 @@ pub const ModelRegistry = struct {
         if (discovery) |d| {
             errdefer self.deinitInternal();
             for (d.models) |m| {
-                _ = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+                const stub = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+                stub.bytes_linked = m.bytes_linked;
             }
         }
 
@@ -795,6 +799,7 @@ pub const ModelRegistry = struct {
         // Re-check under the lock — another conn thread may have raced us.
         if (self.entries.get(base)) |existing| return existing.id;
         const stub = try self.registerStubWithMeta(base, trimmed, probe.bytes_on_disk, probe.model_type, streaming_index_complete);
+        stub.bytes_linked = probe.bytes_linked;
         return stub.id;
     }
 
@@ -880,11 +885,13 @@ pub const ModelRegistry = struct {
                 if (e.state == .error_state and std.mem.eql(u8, e.path, m.path)) {
                     self.markUnloadedLocked(e);
                     e.bytes_on_disk = m.bytes_on_disk;
+                    e.bytes_linked = m.bytes_linked;
                 }
                 continue;
             }
             if (self.peekByPathLocked(m.path) != null) continue;
-            _ = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+            const stub = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+            stub.bytes_linked = m.bytes_linked;
             added += 1;
         }
         return added;
@@ -1423,6 +1430,7 @@ pub const ModelRegistry = struct {
                 .loaded = entry.state == .ready,
                 .bytes_resident = entry.bytes_resident,
                 .bytes_on_disk = entry.bytes_on_disk,
+                .bytes_linked = entry.bytes_linked,
                 .last_used_ns = entry.last_used_ns,
                 .state = ModelStatus.stateName(entry.state),
                 .error_name = entry.error_name,
@@ -2362,6 +2370,31 @@ test "upstream bugfix: ModelRegistry: rescan clears a failed load so the complet
     try testing.expectEqual(LoadState.loading, fine.state);
     try testing.expectEqual(LoadState.error_state, moved.state);
     try testing.expectEqual(@as(?u64, 4), fine.bytes_on_disk);
+    try testing.expectEqual(@as(u64, 0), broken.bytes_linked);
+}
+
+test "discovered bytes_linked reaches the registry entry and its snapshot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/x.safetensors", .data = "01234567" });
+    try tmp.dir.createDirPath(io, "org/linked");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/linked/config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/linked/own.safetensors", .data = "0123" });
+    try tmp.dir.symLink(io, "../../elsewhere/x.safetensors", "org/linked/x.safetensors", .{});
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    const e = reg.peek("org/linked") orelse return error.TestExpectedResult;
+    try testing.expectEqual(@as(?u64, 12), e.bytes_on_disk);
+    try testing.expectEqual(@as(u64, 8), e.bytes_linked);
+    const snap = try reg.snapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expectEqual(@as(u64, 8), snap[0].bytes_linked);
 }
 
 
