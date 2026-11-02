@@ -161,7 +161,7 @@ their matrix: `tests/CLAUDE.md`.
   Test the behaviour or state the rule in a comment.
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
-- `zig build test` sometimes fails a FIRST run and is green on a direct re-run (Metal contention, benign, unpinned).
+- A first `zig build test` run sometimes fails and a re-run is green (Metal contention, benign).
 
 ## Releases & benchmarking
 
@@ -267,7 +267,7 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Never slot a GPU job into a bench's cooldown idle: the next server starts throttled.
 - Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
 - **The box is macOS, with no `setsid` binary.** To detach a long job, run `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`
-  and record `$!`. Plain `nohup … &` stays in the tool's session, which harness cleanup kills.
+  and record `$!`; plain `nohup … &` dies with the tool's session.
   - Write the END marker from an EXIT trap, and end every wait loop when that PID is gone.
 - Confirm the load lines (`[kv-cache]`, `[mtp]`, engagement lines) show the intended arm.
 - KLD is 16 prompts x 512 tokens scored to the first EOS (GLM: the 4x512 native teacher, code 2x512 reported apart);

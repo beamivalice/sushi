@@ -1,5 +1,6 @@
 #!/bin/bash
 # sushi-test: tier=host
+. "$(dirname "$0")/private_cache.sh"
 # `sushi bench --model`: the bench in this process on a tiny DeepSeek fixture with a byte-level tokenizer made here.
 # A rung subset and a short decode run through the serve path with no listener; a repeat of the 4k prompt restores
 # from the prefix cache and the table reports it. The tiny fixture is ${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny
