@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_text = @import("json_text.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -519,7 +520,9 @@ pub fn handleAnthropicMessages(
     }
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
-    const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
+    const model_name_raw = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
+    const model_name = try json_text.innerAlloc(allocator, model_name_raw);
+    defer allocator.free(model_name);
 
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
     const kv_quant_override = parseKvQuantOverride(root);

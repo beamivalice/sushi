@@ -19,6 +19,7 @@
 const std = @import("std");
 const slot_admission = @import("slot_admission.zig");
 const write_stats = @import("disk_write_stats.zig");
+const request_log = @import("request_log.zig");
 
 // ---------------------------------------------------------------------------
 // Histogram bounds (comptime constants shared by Metrics.init)
@@ -52,6 +53,9 @@ pub const Outcome = enum { success, cancelled, failed };
 /// All instrumented metrics for one sushi instance.
 /// Zero-allocation after init; every field is a lock-free primitive.
 pub const Metrics = struct {
+    /// The last `request_log.capacity` finished requests, for `/metrics.json?since=`.
+    finished: request_log.Ring(request_log.capacity) = .{},
+
     // Latency histograms (observe in nanoseconds; rendered as seconds)
     ttft_ns: Histogram(10), // time to first token
     e2e_latency_ns: Histogram(10), // end-to-end request latency

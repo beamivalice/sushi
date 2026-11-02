@@ -161,6 +161,12 @@ pub fn acceptanceFlagName(mode: mtp_acceptance.Mode) []const u8 {
     };
 }
 
+/// The acceptance flag as typed, value included; null when neither was given.
+pub fn acceptanceFlagText(buf: []u8, typical: ?[]const u8, tokenv3: ?[]const u8) ?[]const u8 {
+    const flag = if (typical != null) "--mtp-typical" else if (tokenv3 != null) "--mtp-tokenv3" else return null;
+    return std.fmt.bufPrint(buf, "{s} {s}", .{ flag, typical orelse tokenv3.? }) catch null;
+}
+
 pub const Override = struct {
     ctx_size: ?u32 = null,
     kv_quant: ?kv_quant.KVQuantConfig = null,
@@ -735,6 +741,16 @@ test "model_settings: a launch lock keeps a long path whole" {
     l.pin("{s}", .{@as([]const u8, &long)});
     try std.testing.expect(l.set);
     try std.testing.expectEqualStrings(&long, l.text());
+}
+
+test "model_settings: the acceptance lock text is the flag as typed, never a placeholder" {
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("--mtp-typical 0.3", acceptanceFlagText(&b, "0.3", null).?);
+    try std.testing.expectEqualStrings("--mtp-tokenv3 0.5", acceptanceFlagText(&b, null, "0.5").?);
+    try std.testing.expect(acceptanceFlagText(&b, null, null) == null);
+    var l: Lock = .{};
+    l.pin("{s}", .{acceptanceFlagText(&b, null, "0.5").?});
+    try std.testing.expectEqualStrings("--mtp-tokenv3 0.5", l.text());
 }
 
 test "model_settings: sizeText reads back in the flag's own syntax, sub-GB sizes included" {

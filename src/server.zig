@@ -71,6 +71,7 @@ const request_policy = @import("request_policy.zig");
 const models_api = @import("models_api.zig");
 const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const metrics_history = @import("metrics_history.zig");
+const json_text = @import("json_text.zig");
 const settings_api = @import("settings_api.zig");
 const logprobs = @import("logprobs.zig");
 /// Global flag set by signal handler for graceful shutdown.
@@ -1670,7 +1671,11 @@ pub fn handleConnection(
             var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
             var history: std.Io.Writer.Allocating = .init(allocator);
             defer history.deinit();
-            if (metrics_history.sinceParam(raw_path)) |since| try metrics_history.process.writeSince(stream.io, since, &history.writer);
+            if (metrics_history.sinceParam(raw_path)) |since| {
+                try metrics_history.process.writeSince(stream.io, since, &history.writer);
+                try history.writer.writeAll(",");
+                try m.finished.writeSince(stream.io, since, &history.writer);
+            }
             try instr.renderJsonWith(m, liveSessions(registry, &sessions), if (history.written().len > 0) history.written() else null, &out.writer);
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
@@ -7144,9 +7149,9 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
     defer allocator.free(drafter_path_json);
 
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
+        \\{{"model":{{"id":{f},"object":"model","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
     , .{
-        model_id,
+        json_text.Str{ .s = model_id },
         bytes_resident,
         bytes_on_disk_str,
         if (drafter_loaded) "true" else "false",
@@ -7250,8 +7255,8 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
 
     const id_for_body = if (requested_id.len > 0) requested_id else "sushi";
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":false,"state":"unloaded"}}}}
-    , .{id_for_body});
+        \\{{"model":{{"id":{f},"object":"model","loaded":false,"state":"unloaded"}}}}
+    , .{json_text.Str{ .s = id_for_body }});
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -7708,10 +7713,12 @@ pub fn handleChatCompletions(
     }
 
     // Parse model name from request (use for response, fallback to config)
-    const model_name = if (root.get("model")) |v|
+    const model_name_raw = if (root.get("model")) |v|
         (if (v == .string) v.string else config.model_type)
     else
         config.model_type;
+    const model_name = try json_text.innerAlloc(allocator, model_name_raw);
+    defer allocator.free(model_name);
 
     // Track allocations from response_format injection so we can free them
     var rf_allocs = std.ArrayList([]const u8).empty;

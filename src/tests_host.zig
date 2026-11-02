@@ -27,6 +27,8 @@ test {
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");
     _ = @import("metrics_history.zig");
+    _ = @import("request_log.zig");
+    _ = @import("json_text.zig");
     _ = @import("mtp_acceptance.zig");
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("mtp_group_cost.zig");

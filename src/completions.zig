@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_text = @import("json_text.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
@@ -237,10 +238,12 @@ pub fn handleCompletions(
         }
     }
 
-    const model_name = if (root.get("model")) |v|
+    const model_name_raw = if (root.get("model")) |v|
         (if (v == .string) v.string else config.model_type)
     else
         config.model_type;
+    const model_name = try json_text.innerAlloc(allocator, model_name_raw);
+    defer allocator.free(model_name);
 
     const include_usage = if (root.get("stream_options")) |so| blk: {
         if (so != .object) break :blk false;

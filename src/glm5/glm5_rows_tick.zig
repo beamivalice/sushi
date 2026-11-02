@@ -330,7 +330,12 @@ fn glmRowsSettle(ops: anytype, allocator: std.mem.Allocator, batch: *[]*Slot, gr
 
 test "outcome: a real Slot's fields satisfy the recorder, and a cancelled GLM slot counts once" {
     var m = metrics_mod.Metrics.init();
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.id = "org/glm";
     var slot: Slot = undefined;
+    slot.io = std.testing.io;
+    slot.model = &model;
+    slot.request_id = 0;
     slot.metrics_recorded = false;
     slot.finished = false;
     slot.error_code = null;

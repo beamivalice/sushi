@@ -33,8 +33,15 @@ pub fn Ring(comptime cap: usize) type {
         /// Next write position.
         head: usize = 0,
         len: usize = 0,
-        /// Time of the first sample, which is when the sampler (and so the server) started; 0 before any.
+        /// When the process started (`markStarted`); the first sample's time where nothing marked it; 0 before any.
         started_ms: i64 = 0,
+
+        /// Unlike the sampler, which starts with the first enable, this runs at process start.
+        pub fn markStarted(self: *Self, io: std.Io, t_ms: i64) void {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+            self.started_ms = t_ms;
+        }
 
         pub fn push(self: *Self, io: std.Io, s: Sample) void {
             self.mu.lockUncancelable(io);
@@ -135,6 +142,15 @@ test "metrics history: started_ms is the first sample's time and survives the ri
     const parsed = try rendered(&ring, 0);
     defer parsed.deinit();
     try testing.expectEqual(@as(i64, 1000), parsed.value.object.get("history").?.object.get("started_ms").?.integer);
+}
+
+test "metrics history: started_ms is the process start, not the late first sample of a server that enabled metrics at runtime" {
+    var ring: Ring(4) = .{};
+    ring.markStarted(testing.io, 500);
+    ring.push(testing.io, sample(90_000));
+    const parsed = try rendered(&ring, 0);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 500), parsed.value.object.get("history").?.object.get("started_ms").?.integer);
 }
 
 test "metrics history: the ring is a fixed size however long it runs" {

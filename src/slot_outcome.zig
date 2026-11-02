@@ -3,6 +3,8 @@ const mlx = @import("mlx.zig");
 const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const metrics_mod = @import("metrics.zig");
+const request_log = @import("request_log.zig");
+const io_util = @import("io_util.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -225,11 +227,32 @@ fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
     return .cancelled;
 }
 
+/// The `/metrics.json` request-log row of a slot that ended, read before the connection thread can free it.
+fn logFinished(m: *metrics_mod.Metrics, slot: anytype, end: request_log.End) void {
+    var e: request_log.Entry = .{
+        .request_id = slot.request_id,
+        .t_ms = io_util.nowMs(slot.io),
+        .prompt_tokens = slot.prompt_tokens -| slot.cached_tokens,
+        .cached_tokens = slot.cached_tokens,
+        .generated_tokens = slot.completion_tokens,
+        .prefill_ns = slot.prefill_ns,
+        .decode_ns = slot.decode_ns,
+        .end = end,
+    };
+    e.setModel(slot.model.id);
+    m.finished.push(slot.io, e);
+}
+
 /// Count a slot's outcome once; the first path to reach the slot wins.
 fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) void {
     const m = metrics orelse return;
     if (slot.metrics_recorded) return;
     slot.metrics_recorded = true;
+    logFinished(m, slot, switch (outcome) {
+        .success => .ok,
+        .cancelled => .cancelled,
+        .failed => .@"error",
+    });
     m.recordRequest(
         outcome,
         slot.first_token_ns,
@@ -249,6 +272,7 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     if (slot.error_code) |name| if (std.mem.eql(u8, name, "PrefillDoesNotFit") or std.mem.eql(u8, name, "MediaRefused")) {
         slot.metrics_recorded = true;
         m.recordRejected();
+        logFinished(m, slot, .rejected);
         return;
     };
     recordSlotEnd(m, slot, cleanupOutcome(slot));
@@ -350,6 +374,9 @@ test "a finish over a latched MLX failure ends the request as an ERROR, never a 
 }
 
 const OutcomeStub = struct {
+    io: std.Io = testing.io,
+    request_id: u64 = 7,
+    model: struct { id: []const u8 = "org/m" } = .{},
     finished: bool = false,
     error_code: ?[]const u8 = null,
     finish_reason: []const u8 = "",
@@ -494,6 +521,83 @@ test "outcome: a request ended by its own stop sequence is a success, a disconne
     stop_then_error.fail("MlxFailure");
     recordSlotCleanup(&m, &stop_then_error);
     try expectOutcomes(&m, 1, 1, 1, 0);
+}
+
+fn expectLogged(m: *metrics_mod.Metrics, expected: []const struct { request_id: u64, outcome: []const u8 }) !void {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{");
+    try m.finished.writeSince(testing.io, 0, &out.writer);
+    try out.writer.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("requests").?.array.items;
+    try testing.expectEqual(expected.len, rows.len);
+    for (expected, rows) |want, row| {
+        try testing.expectEqual(@as(i64, @intCast(want.request_id)), row.object.get("request_id").?.integer);
+        try testing.expectEqualStrings(want.outcome, row.object.get("outcome").?.string);
+    }
+}
+
+test "request log: a finished request is logged once with its split of computed and restored prompt tokens" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{ .cached_tokens = 30 };
+    s.finish(&m, "stop");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectLogged(&m, &.{.{ .request_id = 7, .outcome = "ok" }});
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{");
+    try m.finished.writeSince(testing.io, 0, &out.writer);
+    try out.writer.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const row = parsed.value.object.get("requests").?.array.items[0].object;
+    try testing.expectEqualStrings("org/m", row.get("model").?.string);
+    try testing.expectEqual(@as(i64, 70), row.get("prompt_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 30), row.get("cached_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 10), row.get("generated_tokens").?.integer);
+    try testing.expectEqual(@as(f64, 0.004), row.get("prefill_seconds").?.float);
+    try testing.expectEqual(@as(f64, 0.02), row.get("decode_seconds").?.float);
+}
+
+test "request log: a disconnect, an error and a refusal each log once under their own outcome" {
+    var m = metrics_mod.Metrics.init();
+    var gone = OutcomeStub{ .request_id = 1 };
+    gone.complete();
+    recordSlotCleanup(&m, &gone);
+    var failed = OutcomeStub{ .request_id = 2 };
+    failed.fail("MlxFailure");
+    failed.complete();
+    recordSlotCleanup(&m, &failed);
+    recordSlotCleanup(&m, &failed);
+    var refused = OutcomeStub{ .request_id = 3 };
+    refused.fail("PrefillDoesNotFit");
+    refused.complete();
+    recordSlotCleanup(&m, &refused);
+    var latched = OutcomeStub{ .request_id = 4 };
+    recordSlotEnd(&m, &latched, finishOutcome("stop", "OutOfMemory"));
+    try expectLogged(&m, &.{
+        .{ .request_id = 1, .outcome = "cancelled" },
+        .{ .request_id = 2, .outcome = "error" },
+        .{ .request_id = 3, .outcome = "rejected" },
+        .{ .request_id = 4, .outcome = "error" },
+    });
+}
+
+test "request log: a restored share larger than the prompt never wraps the computed count" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{ .prompt_tokens = 5, .cached_tokens = 9 };
+    s.finish(&m, "stop");
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{");
+    try m.finished.writeSince(testing.io, 0, &out.writer);
+    try out.writer.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 0), parsed.value.object.get("requests").?.array.items[0].object.get("prompt_tokens").?.integer);
 }
 
 test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not cut" {

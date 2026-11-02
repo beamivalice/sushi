@@ -24,6 +24,7 @@ const mtp_plan = @import("mtp_plan.zig");
 const nowSecs = io_util.nowSecs;
 const testing = std.testing;
 const server = @import("server.zig");
+const json_text = @import("json_text.zig");
 const http_conn = @import("http_conn.zig");
 const request_policy = @import("request_policy.zig");
 const Conn = http_conn.Conn;
@@ -357,9 +358,9 @@ pub fn renderModelEntry(
         );
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{s}","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{f},"object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":{f},"engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{f},"context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
-            model_id,
+            json_text.Str{ .s = model_id },
             nowSecs(io),
             entry.bytes_resident,
             bytes_on_disk_str,
@@ -374,12 +375,12 @@ pub fn renderModelEntry(
             caps.items,
             efforts_part,
             mods.items,
-            config.model_type,
+            json_text.Str{ .s = config.model_type },
             "mlx",
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
-            quantization,
+            json_text.Str{ .s = quantization },
             ctx_str,
             config.max_position_embeddings,
             if (config.isMoe()) "true" else "false",
@@ -410,12 +411,10 @@ pub fn renderModelEntry(
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
     const err_part: []const u8 = if (entry.error_name) |name| blk: {
-        // Inline escape to avoid double allocation; the names we emit
-        // never contain quotes/backslashes (they're @errorName output).
         break :blk try std.fmt.allocPrint(
             allocator,
-            ",\"error\":\"{s}\"",
-            .{name},
+            ",\"error\":{f}",
+            .{json_text.Str{ .s = name }},
         );
     } else &[_]u8{};
     defer if (err_part.len > 0) allocator.free(err_part);
@@ -491,9 +490,7 @@ pub fn renderModelEntry(
         "";
 
     const arch_part: []const u8 = if (entry.arch_hint.len > 0) blk: {
-        // arch_hint comes from config.json's model_type via discovery — the
-        // supported-type allowlist guarantees no JSON metacharacters.
-        break :blk try std.fmt.allocPrint(allocator, "\"architecture\":\"{s}\",", .{entry.arch_hint});
+        break :blk try std.fmt.allocPrint(allocator, "\"architecture\":{f},", .{json_text.Str{ .s = entry.arch_hint }});
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
@@ -518,11 +515,11 @@ pub fn renderModelEntry(
             .expert_quant_rate = sm.expert_quant_rate orelse .{ .n = 64 },
         });
         defer allocator.free(quantization);
-        break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":\"{s}\",\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},\"mtp_available\":{s},", .{
+        break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":{f},\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},\"mtp_available\":{s},", .{
             sm.vocab_size,
             sm.hidden_size,
             sm.num_hidden_layers,
-            quantization,
+            json_text.Str{ .s = quantization },
             sm.max_position_embeddings,
             sm.max_position_embeddings,
             if (sm.is_moe) "true" else "false",
@@ -532,8 +529,8 @@ pub fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"sushi","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, streaming_part, err_part, top_ctx_part, caps_part, efforts_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":{f},"object":"model","created":0,"owned_by":"sushi","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ json_text.Str{ .s = entry.id }, state_str, bytes_on_disk_str, streaming_part, err_part, top_ctx_part, caps_part, efforts_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 pub fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {
@@ -642,9 +639,9 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d},"owned_bytes":{d}}}{s}}}
+        \\{{"default_generation_settings":{{"model":{f},"n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d},"owned_bytes":{d}}}{s}}}
     , .{
-        config.model_type,              ctx_str,
+        json_text.Str{ .s = config.model_type }, ctx_str,
         config.vocab_size,              config.hidden_size,
         config.num_hidden_layers,       config.num_attention_heads,
         config.num_key_value_heads,     config.head_dim,
@@ -774,6 +771,10 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     };
 }
 
+fn js(s: []const u8) json_text.Str {
+    return .{ .s = s };
+}
+
 /// The /props "settings" object: leading-comma fragment spliced before the props root close.
 pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
     var param_buf: [32]u8 = undefined;
@@ -782,24 +783,24 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    var vision_buf: [160]u8 = undefined;
-    const vision = try std.fmt.bufPrint(&vision_buf, "{{\"loaded\":{},\"source\":\"{s}\",\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, st.vision.source, st.vision.tower_bytes, st.vision.encode_bytes });
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
-        build_options.version,                      st.engine,
-        st.kv_quant,                                st.kv_cache.label(),
-        st.kv_cache.sourceName(),
+    const vision = try std.fmt.allocPrint(allocator, "{{\"loaded\":{},\"source\":{f},\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, json_text.Str{ .s = st.vision.source }, st.vision.tower_bytes, st.vision.encode_bytes });
+    defer allocator.free(vision);
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"acceptance_source\":{f},\"acceptance\":{f},\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":{f},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
+        js(build_options.version),                          js(st.engine),
+        js(st.kv_quant),                                    js(st.kv_cache.label()),
+        js(st.kv_cache.sourceName()),
         st.prefill_chunk,
-        st.mtp_loaded,                              st.mtp_default_on,
-        st.mtp_choice.sourceName(),                 st.mtp_acceptance_source,
-        mtp_acceptance_mod.name(st.mtp_acceptance), param,
+        st.mtp_loaded,                                      st.mtp_default_on,
+        js(st.mtp_choice.sourceName()),                     js(st.mtp_acceptance_source),
+        js(mtp_acceptance_mod.name(st.mtp_acceptance)),     param,
         st.mtp_acceptance_applies,
-        st.mtp_greedy_tail.value,                   model_settings.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail"),
-        st.mtp_depth,                               st.mtp_adaptive,
-        st.max_mtp_ctx,                             st.drafter,
-        st.max_concurrent,                          st.prefill_decode_share,
-        st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
-        st.prefix_cache_disk_bytes,                 st.prefix_cache_disk_used_bytes,
-        st.prefix_cache_disk_written_bytes,         st.prefix_cache_disk_entries,
+        st.mtp_greedy_tail.value,                           js(model_settings.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail")),
+        st.mtp_depth,                                       st.mtp_adaptive,
+        st.max_mtp_ctx,                                     js(st.drafter),
+        st.max_concurrent,                                  st.prefill_decode_share,
+        st.prefix_cache_ram_enabled,                        st.prefix_cache_mem_bytes,
+        st.prefix_cache_disk_bytes,                         st.prefix_cache_disk_used_bytes,
+        st.prefix_cache_disk_written_bytes,                 st.prefix_cache_disk_entries,
         vision,
     });
 }
@@ -1183,6 +1184,85 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
         defer t.allocator.free(stub);
         try t.expect(std.mem.indexOf(u8, stub, c.want) != null);
     }
+}
+
+test "/v1/models rows stay valid JSON for a model id and error name with a quote, a backslash and a control character" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    const hostile = "q\"b\\c\x01d";
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = t.allocator,
+        .id = hostile,
+        .path = path,
+        .bytes_on_disk = 0,
+        .arch_hint = "qwen4_exp",
+        .config = &cfg,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = &chat_cfg,
+        .vision_encoder = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .ready,
+        .error_name = null,
+    };
+    const loaded = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(loaded);
+    const row = try std.json.parseFromSlice(std.json.Value, t.allocator, loaded, .{});
+    defer row.deinit();
+    try t.expectEqualStrings(hostile, row.value.object.get("id").?.string);
+
+    entry.state = .error_state;
+    entry.config = null;
+    entry.chat_config = null;
+    entry.error_name = "bad\"name\\\n";
+    const stub = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(stub);
+    const stub_row = try std.json.parseFromSlice(std.json.Value, t.allocator, stub, .{});
+    defer stub_row.deinit();
+    try t.expectEqualStrings(hostile, stub_row.value.object.get("id").?.string);
+    try t.expectEqualStrings("bad\"name\\\n", stub_row.value.object.get("error").?.string);
+}
+
+test "/props stays valid JSON when a settings label carries a quote, a backslash and a control character" {
+    const t = std.testing;
+    const hostile = "--x \"a\\b\x01\"";
+    const json = try settingsPropsJson(t.allocator, .{
+        .engine = "mlx",
+        .kv_quant = "8",
+        .prefill_chunk = 1,
+        .mtp_loaded = false,
+        .mtp_default_on = false,
+        .mtp_acceptance = .exact,
+        .mtp_acceptance_source = hostile,
+        .mtp_depth = 0,
+        .mtp_adaptive = false,
+        .max_mtp_ctx = 0,
+        .drafter = "none",
+        .max_concurrent = 1,
+        .prefix_cache_mem_bytes = 0,
+        .prefix_cache_disk_bytes = 0,
+        .vision = .{ .source = hostile },
+    });
+    defer t.allocator.free(json);
+    const doc = try std.fmt.allocPrint(t.allocator, "{{{s}}}", .{json[1..]});
+    defer t.allocator.free(doc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, doc, .{});
+    defer parsed.deinit();
+    const settings = parsed.value.object.get("settings").?.object;
+    try t.expectEqualStrings(hostile, settings.get("mtp").?.object.get("acceptance_source").?.string);
+    try t.expectEqualStrings(hostile, settings.get("vision").?.object.get("source").?.string);
 }
 
 fn testQuantizationModelRow(k: ?u8, expected: []const u8, loaded: bool) !void {

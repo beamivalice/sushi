@@ -35,6 +35,7 @@ const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
+const metrics_history = @import("metrics_history.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const parent_watch = @import("parent_watch.zig");
@@ -413,6 +414,7 @@ fn printUsage(io: std.Io) void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
+    metrics_history.process.markStarted(io, io_util.nowMs(io));
 
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
     // above every subcommand branch — a per-serve-path call is how
@@ -1008,7 +1010,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     generate_mod.mtp_acceptance_explicit = mtp_typical_raw != null or mtp_tokenv3_raw != null;
+    var acceptance_flag_buf: [128]u8 = undefined;
     pinLaunchFlags(.{
+        .mtp_acceptance_flag = model_settings_mod.acceptanceFlagText(&acceptance_flag_buf, mtp_typical_raw, mtp_tokenv3_raw),
         .ctx_size = ctx_size,
         .kv_quant = if (kv_quant_explicit) kv_quant_config.wireName() else null,
         .mtp = if (mtp_explicit) enable_mtp else null,
@@ -1807,13 +1811,13 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
-fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8 }) void {
+fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8 }) void {
     const locks = &model_settings_mod.launch_locks;
     if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
     if (given.mtp) |m| locks.modelMut("mtp").pin("{s}", .{if (m) "on" else "off"});
-    if (generate_mod.mtp_acceptance_explicit) locks.modelMut("mtp_acceptance").pin("set", .{});
-    if (generate_mod.mtp_greedy_tail_explicit) locks.modelMut("mtp_greedy_tail").pin("set", .{});
+    if (given.mtp_acceptance_flag) |f| locks.modelMut("mtp_acceptance").pin("{s}", .{f});
+    if (generate_mod.mtp_greedy_tail_explicit) locks.modelMut("mtp_greedy_tail").pin("--mtp-greedy-tail", .{});
     if (ssd_budget_bytes != 0) locks.modelMut("ssd_budget_gb").pin("{d}", .{ssd_budget_bytes >> 30});
     if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
