@@ -108,6 +108,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Discovery (`src/model_discovery.zig` / `src/model_registry.zig`): two-level org/name, multi-root, streaming stubs,
   multi-model registry. **`--model-dir` is REPEATABLE** (`discoverModelsMany` merges roots FIRST-WINS). One path never
   registers under TWO ids (`registry.peekByPath`).
+- **Discovery never lists a dot folder or a folder named `test-fixtures` BELOW a root**, at either depth (`skipsBelowRoot`;
+  one debug line per skipped fixtures folder). The repo's tiny test models live in `${SUSHI_MODELS_DIR}/test-fixtures/<name>`
+  and are not packs to serve. A root the user NAMES is always scanned (`--model-dir .../test-fixtures` lists them), and
+  `--model <path>` never goes through discovery; rescan shares the rule.
 - **The auto `--max-resident-mem` (80% of the GPU working-set limit) bounds CO-RESIDENCE only**: a cold load evicts
   every other model first, and one that then loads alone is the load preflight's call (`mem_cap_binds_alone`); an
   explicit `--max-resident-mem` binds a sole model too. Before this the 2.3bpw MiMo pack could not cold-load through

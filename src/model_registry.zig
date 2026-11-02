@@ -2213,6 +2213,30 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     try testing.expect(reg.peek("org/first") != null);
 }
 
+test "ModelRegistry: rescan under a models root never absorbs test-fixtures or dot folders" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try tmp.dir.createDirPath(io, "org/first");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+
+    try model_discovery.writePackStub(io, tmp.dir, "test-fixtures/x");
+    try model_discovery.writePackStub(io, tmp.dir, ".hidden/y");
+    try model_discovery.writePackStub(io, tmp.dir, "org/second");
+
+    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    try testing.expect(reg.peek("org/second") != null);
+    try testing.expect(reg.peek("x") == null);
+    try testing.expect(reg.peek("y") == null);
+}
+
 test "upstream bugfix: ModelRegistry: rescan clears a failed load so the completed dir can load again" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
