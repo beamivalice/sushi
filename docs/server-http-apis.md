@@ -247,7 +247,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - A request reader waits at most `REQUEST_READ_LIMIT_MS` (30 s) between bytes and for its whole head, then drops the connection without a reply, so a silent or dripping client never holds its thread; a `Content-Length` sums into the size check with saturating arithmetic, so a wrapping value is a 413 instead of a small allocation.
 - A schema `pattern` repeat count is at most 1000 and its NFA at most 32768 states (`regex.zig`); past either, `compile` fails with `InvalidPattern`.
 - Metrics are ON by default (`--no-metrics` is the opt-out; `--metrics` is accepted and does nothing); TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`. Cost with metrics on: per request a handful of relaxed atomic adds at `finishSlot`; per decode tick one atomic store (`inflight_generated_tokens`) and the live-session rows (`publishLiveKvResidency`: one clock read and a ~200 B row copy per decoding slot, under the `queue_mu` hold the cull already takes); per prefill chunk one atomic store and the same row publish; every 2 s the sampler thread (two MLX allocator counter reads, two syscalls, one brief `queue_mu` hold, one ring push). Nothing runs per token. With `--no-metrics` none of it runs.
-- **History ring**: the sampler also pushes one sample per 2 s tick (the token gauges only move once per tick) into `metrics_history.process`, a fixed ring of 1800 samples (one hour, 56 B each, about 100 KB static, no allocation). `GET /metrics.json?since=<unix ms>` adds `"history":{interval_ms,capacity,fields,samples:[[t_ms,gen_tokens,prefill_tokens,running,waiting,prefilling,batched,gpu_pct,memory_mb,mlx_active,mlx_cache],...]}` with the samples newer than `since` (`since=0` is everything kept); without `since` the feed is unchanged. The dashboard backfills from it when it was in the background and plots by `t_ms`, so a hidden tab leaves no gap and a real gap (server down) is drawn as one.
+- **History ring**: the sampler also pushes one sample per 2 s tick (the token gauges only move once per tick) into `metrics_history.process`, a fixed ring of 1800 samples (one hour, 56 B each, about 100 KB static, no allocation). `GET /metrics.json?since=<unix ms>` adds `"history":{interval_ms,capacity,started_ms,fields,samples:[[t_ms,gen_tokens,prefill_tokens,running,waiting,prefilling,batched,gpu_pct,memory_mb,mlx_active,mlx_cache],...]}` with the samples newer than `since` (`since=0` is everything kept); `started_ms` is the first sample's time, which the page reads as the server's start for its uptime; without `since` the feed is unchanged. The dashboard backfills from it when it was in the background and plots by `t_ms`, so a hidden tab leaves no gap and a real gap (server down) is drawn as one.
 - **Metrics at runtime**: `POST /metrics/enable` turns the same core on in a server booted with `--no-metrics` (200
   `{"metrics":true,"already_enabled":false}`, and `true` on every later call: idempotent; any other method is a 405). There is
   no off switch. It sits behind the `--api-key` gate like the other mutating routes and refuses a foreign `Origin` (403, same
@@ -291,6 +291,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - `/props` `template_fallbacks` counts renders where a `<|im_end|>` model's own chat template raised and ChatML
   answered (other models refuse with 500 `chat template unusable`, uncounted) ([server-tool-calling](server-tool-calling.md#templates)); the count is process-wide, and it is zero when
   every prompt is the checkpoint's own.
+- `/props` `memory.total_bytes` = the machine's physical RAM (`hw.memsize`), the ceiling the Compact view's Memory tile and chart measure against.
 - `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
   each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.
 
@@ -358,6 +359,13 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   samples (`historyRates`), and plots at the server's `t_ms`. A tab in the background does not poll, and on return the next
   poll fills the whole interval in; two samples more than 7 s apart (the server was down, or the ring was cut) are drawn as a
   gap, never joined. Without a `history` key (an older server) the page falls back to client-time points.
+- The **Compact view** shows a status strip (model, Idle/Busy, uptime from `history.started_ms`), five tiles and three charts.
+  Prefill and decode are separate charts with their own scales. A request's prefill speed is its computed prompt tokens over
+  the prefill time the server spent on it, taken from the `prefill_tokens_total` and `prefill_time_seconds` deltas between
+  two polls (one dot per finished request; the tile shows the latest, or the mean since start until one is seen). Decode is
+  the history's rate with idle samples drawn as gaps; the tile reads live while generating, else the last request's rate.
+  The Advanced view's Decode and Prefill tiles and its prefill, decode and memory charts are the same functions (`speedTiles`,
+  `eventChart`, the shared chart options), so both views read the same.
 - The dashboard's **Prefix cache writes** card (the last card) shows the `prefix_cache_writes` totals: bytes written since
   the server started, the rate between the last two polls (`-` on the first poll and across a restart), bytes written per
   byte now on disk (the sum of every ready model's `/props` `disk_used_bytes`, refreshed every 15 s), one row per kind and

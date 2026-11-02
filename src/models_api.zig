@@ -642,7 +642,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d},"owned_bytes":{d}}}{s}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d},"owned_bytes":{d}}}{s}}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -651,7 +651,7 @@ fn renderPropsBody(
         config.quant_bits,              config.quant_group_size,
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
-        safe_ctx,                       cache_mem,
+        metrics.getTotalMemBytes(),     safe_ctx,                       cache_mem,
         kv_cache_mem,                   model_mod.ownedBytesTotal(),
         extra_json,
     });
@@ -843,8 +843,8 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     const update_json = try update_mod.propsJson(allocator);
     defer allocator.free(update_json);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}}}
-    , .{ active_mem, peak_mem, available_mem, slot_admission.MAX_BATCH_GROUP, update_json });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}}}
+    , .{ active_mem, peak_mem, available_mem, metrics.getTotalMemBytes(), slot_admission.MAX_BATCH_GROUP, update_json });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -1071,6 +1071,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     try testing.expect(std.mem.indexOf(u8, body, "\"peak_bytes\":5678") != null); // Swift fetchProps
     try testing.expect(std.mem.indexOf(u8, body, "\"available_bytes\":9000000000") != null); // Swift fetchProps (Free RAM line)
     try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"total_bytes\":") != null); // the web page's memory ceiling
     // #110: the panel showed 19.6 GB (active) while the process held 81 GB.
     // The missing 61 GB was MLX's reclaimable buffer pool, which nothing we
     // expose reported — so the bug was invisible from every surface.

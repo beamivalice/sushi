@@ -39,8 +39,8 @@ function installStubs(config) {
     stub.calls.push({ path: url.pathname, search: url.search, auth: headers.get('authorization'), method: init.method ?? 'GET' });
     switch (url.pathname) {
       case '/health': return json({ status: 'ok' });
-      case '/v1/models': return json({ data: [{ id: 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
-      case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: { disk_bytes: 20 * 2 ** 30, disk_used_bytes: 2 * 2 ** 30, disk_written_bytes: 4 * 2 ** 30, disk_entries: 3 } }, memory: { available_bytes: 5e9 }, batching: { supported: true, max_group: 4 }, default_generation_settings: { n_ctx: 8192 } });
+      case '/v1/models': return json({ data: [{ id: stub.modelId ?? 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
+      case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: { disk_bytes: 20 * 2 ** 30, disk_used_bytes: 2 * 2 ** 30, disk_written_bytes: 4 * 2 ** 30, disk_entries: 3 } }, memory: { available_bytes: 5e9, total_bytes: 128 * 2 ** 30 }, batching: { supported: true, max_group: 4 }, default_generation_settings: { n_ctx: 8192 } });
       case '/v1/tools': return json({ edit_default: false });
       case '/metrics/enable':
         if (stub.enableStatus !== 200) return json({ error: { message: 'refused' } }, stub.enableStatus);
@@ -48,6 +48,23 @@ function installStubs(config) {
         return json({ metrics: true, already_enabled: false });
       case '/metrics.json':
         if (stub.metricsStatus !== 200) return json({ error: { message: 'metrics off' } }, stub.metricsStatus);
+        if (stub.compact) {
+          // A decoding (or idle) server whose fourth poll sees one 12,000-token prefill finish after 10 s of prefilling.
+          const polls = stub.polls = (stub.polls ?? 0) + 1, now = Date.now(), origin = stub.origin ??= now, done = polls >= 4 ? 1 : 0;
+          const since = Number(url.searchParams.get('since') || 0);
+          const samples = [];
+          for (let k = -39; origin + 2000 * k <= now; k++) {
+            const t = origin + 2000 * k, live = stub.compact === 'decode' && k >= -10;
+            samples.push([t, live ? 100 * (k + 10) : 0, 0, +live, 0, 0, 0, 60, 106787, 113 * 2 ** 30, 2 ** 28]);
+          }
+          const hist = (count, sum) => ({ count, sum, bounds: [1], bucket_counts: [count, count] });
+          return json({
+            counters: { prefill_tokens_total: 40000 + 12000 * done, generation_tokens_total: 9000 },
+            gauges: { requests_running: stub.compact === 'decode' ? 1 : 0, requests_waiting: 0, memory_mb: 106787, mlx_active_bytes: 113 * 2 ** 30, mlx_cache_bytes: 2 ** 28 },
+            histograms: { prefill_time_seconds: hist(15 + done, 60 + 10 * done), decode_time_seconds: hist(15, 180) }, sessions: [],
+            history: { interval_ms: 2000, capacity: 1800, started_ms: now - 3 * 3600e3 - 12 * 60e3, samples: samples.filter((r) => r[0] > since) },
+          });
+        }
         if (stub.history) {
           const since = Number(url.searchParams.get('since') || 0), t0 = Date.now() - 20000;
           const fields = ['t_ms', 'gen_tokens', 'prefill_tokens', 'running', 'waiting', 'prefilling', 'batched', 'gpu_pct', 'memory_mb', 'mlx_active', 'mlx_cache'];
@@ -384,7 +401,7 @@ async function main() {
     }
 
     {
-      const { page, errors, context } = await openPage(browser, '/dashboard', { prefillStep: 800 });
+      const { page, errors, context } = await openPage(browser, '/dashboard', { compact: 'decode' });
       const axisTop = (id) => page.evaluate((canvas) => Math.max(0, ...(window.__axis[canvas] ?? []).filter((t) => /^\d+(\.\d+)?k?$/.test(t)).map((t) => parseFloat(t) * (t.endsWith('k') ? 1000 : 1))), id);
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       const cards = await page.evaluate(() => [...document.querySelectorAll('#dashPanel .charts.adv .card')].map((card) => ({ title: card.querySelector('h2').firstChild.textContent, legends: card.querySelectorAll('.legend').length, canvas: card.querySelector('canvas').id })));
@@ -392,8 +409,12 @@ async function main() {
       assert.deepEqual(cards.slice(0, 2).map((card) => card.legends), [0, 0], 'a single series needs no legend');
       assert.equal(new Set(cards.map((card) => card.canvas)).size, cards.length, 'every card draws on its own canvas');
       assert.equal(await page.evaluate(() => /\bgeneration\b/i.test(document.getElementById('dashPanel').textContent)), false, 'the dashboard says decode, not generation');
-      await page.waitForFunction((ids) => ids.every((id) => (window.__axis[id] ?? []).length > 5), cards.slice(0, 2).map((card) => card.canvas), { timeout: 15000 });
-      await page.waitForFunction((id) => (window.__axis[id] ?? []).some((t) => /^\d+(\.\d+)?k?$/.test(t) && parseFloat(t) >= 100), cards[0].canvas, { timeout: 15000 });
+      // The Advanced view draws prefill and decode the way the Compact view does: one dot per finished request, decode on its own scale.
+      assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#dashPanel .charts.adv .card .sub')].map((e) => e.textContent).slice(0, 2)), ['one point per finished request', 'while generating']);
+      await page.waitForFunction((id) => (window.__axis[id] ?? []).includes('2k'), cards[0].canvas, { timeout: 15000 });
+      await page.waitForFunction((id) => (window.__axis[id] ?? []).length > 5, cards[1].canvas, { timeout: 15000 });
+      const axis = await page.evaluate(() => window.__axis.dashCMem ?? []);
+      assert.ok(axis.some((t) => /GiB machine memory/.test(t)), `the memory chart marks the machine's memory (${axis})`);
       const pre = await axisTop(cards[0].canvas), dec = await axisTop(cards[1].canvas);
       assert.ok(dec > 0 && dec * 4 <= pre, `each chart scales to its own series (prefill top ${pre}, decode top ${dec})`);
       assert.deepEqual(errors, []);
@@ -414,16 +435,77 @@ async function main() {
       const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'compact' });
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       const visible = (sel) => page.evaluate((s) => { const n = document.querySelector(s); return !!n && n.getClientRects().length > 0; }, sel);
-      assert.equal(await visible('#dashCmGen'), true, 'the compact tiles show');
-      assert.equal(await visible('#dashCSpd'), true, 'and the speed chart');
+      assert.equal(await visible('#dashCmDec'), true, 'the compact tiles show');
+      assert.equal(await visible('#dashCCpre') && await visible('#dashCCdec'), true, 'and the prefill and decode charts');
       assert.equal(await visible('#dashSessions'), false, 'the sessions table is an Advanced detail');
       assert.equal(await visible('#dashCReq'), false, 'so are the request and GPU charts');
       assert.equal(await page.textContent('#modeToggle'), 'Advanced view');
       await page.click('#modeToggle');
       assert.equal(await page.evaluate(() => document.body.dataset.mode), 'advanced');
       assert.equal(await visible('#dashSessions'), true);
-      assert.equal(await visible('#dashCmGen'), false);
+      assert.equal(await visible('#dashCmDec'), false);
       assert.equal(await page.evaluate(() => localStorage.getItem('sushi-ui-mode')), 'advanced', 'the choice is remembered');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    for (const compact of ['decode', 'idle']) {
+      // The Compact view: a one-line status strip, five equal tiles, and prefill and decode on charts of their own.
+      const name = 'DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw-with-a-name-longer-than-any-strip-could-hold-on-one-line';
+      const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'compact', compact, modelId: `org/${name}` });
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+      await page.waitForFunction(() => document.getElementById('dashCmUp').textContent.startsWith('up 3h'), null, { timeout: 15000 });
+      await page.waitForFunction(() => document.getElementById('dashCmState').textContent !== 'Connecting', null, { timeout: 15000 });
+      const box = (sel) => page.evaluate((s) => { const r = document.querySelector(s).getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.x), y: Math.round(r.y) }; }, sel);
+      const text = (id) => page.evaluate((i) => document.getElementById(i).innerText.replace(/\s+/g, ' ').trim(), id);
+
+      const strip = await box('.cm-strip');
+      assert.ok(strip.h < 70, `a long model name does not grow the strip (${strip.h} px)`);
+      assert.equal(await page.getAttribute('#dashCmModel', 'title'), name, 'the full name rides the title');
+      assert.equal(await page.evaluate(() => getComputedStyle(document.getElementById('dashCmModel')).textOverflow), 'ellipsis');
+      assert.equal(await text('dashCmState'), compact === 'decode' ? 'Busy' : 'Idle');
+
+      const tiles = await page.evaluate(() => [...document.querySelectorAll('.tiles-cmp .tile')].map((t) => { const r = t.getBoundingClientRect(); return { h: Math.round(r.height), y: Math.round(r.y) }; }));
+      assert.equal(tiles.length, 5);
+      assert.equal(new Set(tiles.map((t) => t.h)).size, 1, `the tiles are one height (${tiles.map((t) => t.h)})`);
+      assert.equal(new Set(tiles.map((t) => t.y)).size, 1, 'on one row at 1440 px');
+      assert.ok(tiles[0].h < 160, `and compact (${tiles[0].h} px)`);
+
+      const pre = await box('#dashCCpre'), dec = await box('#dashCCdec');
+      assert.deepEqual([pre.w, pre.h], [dec.w, dec.h], 'the prefill and decode charts are the same size');
+      assert.ok(Math.abs(pre.y - dec.y) < 2 && dec.x > pre.x, 'side by side on a wide screen');
+      assert.equal(await page.evaluate(() => !!document.getElementById('dashCSpd')), false, 'no chart mixes the two speeds');
+
+      // Decode: live from the history while generating; idle falls back to the since-start mean, labelled as such.
+      assert.equal(await text('dashCmDec'), '50.0 tok/s');
+      assert.equal(await text('dashCmDecS'), compact === 'decode' ? 'live' : 'average since start');
+      // Prefill is a per-request speed, never an instantaneous 0: the mean until a request is seen to finish (40,000 tokens
+      // in 60 s), then that request's own (12,000 tokens in 10 s).
+      assert.notEqual(await text('dashCmPre'), '0 tok/s');
+      assert.match(await text('dashCmPre'), /^667 tok\/s$/);
+      await page.waitForFunction(() => /^1,200 tok\/s$/.test(document.getElementById('dashCmPre').innerText.trim()), null, { timeout: 15000 });
+      assert.match(await text('dashCmPreS'), /last request, .*12,000 tokens/);
+      await page.waitForFunction(() => (window.__axis.dashCCpre ?? []).includes('2k'), null, { timeout: 5000 });
+      assert.deepEqual(await page.evaluate(() => (window.__axis.dashCCpre ?? []).filter((t) => /request finished/.test(t))), [], 'the prefill chart plots the finished request');
+
+      assert.match(await text('dashCmMem'), /^104\.3 \/ 128 GiB$/);
+      assert.ok(await page.evaluate(() => parseFloat(document.getElementById('dashCmMemBar').style.width)) > 80, 'the memory bar is used over the machine total');
+      assert.match(await text('dashCmSsd'), /^2\.00 GiB \/ 20\.00 GiB$/);
+      assert.match(await text('dashCmReq'), compact === 'decode' ? /^1 running$/ : /^0 running$/);
+      const axis = await page.evaluate(() => window.__axis.dashCMemc ?? []);
+      assert.ok(axis.includes('128') && !axis.includes('200'), `the memory axis ends at the machine's memory (${axis})`);
+      assert.ok(axis.some((t) => /128 GiB machine memory/.test(t)), 'and the ceiling is labelled');
+
+      // Narrow: decode and prefill share the first row, the rest stack; the strip still one line, nothing wider than the screen.
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.waitForTimeout(300);
+      const narrow = await page.evaluate(() => ({ strip: document.querySelector('.cm-strip').getBoundingClientRect().height, wide: document.getElementById('dashPanel').scrollWidth - document.getElementById('dashPanel').clientWidth,
+        tiles: new Set([...document.querySelectorAll('.tiles-cmp .tile')].map((t) => Math.round(t.getBoundingClientRect().x))).size,
+        firstRow: [...document.querySelectorAll('.tiles-cmp .tile')].filter((t, _, all) => Math.round(t.getBoundingClientRect().y) === Math.round(all[0].getBoundingClientRect().y)).length,
+        charts: [...document.querySelectorAll('.charts-cmp .card')].map((c) => Math.round(c.getBoundingClientRect().x)) }));
+      assert.ok(narrow.strip < 70 && narrow.wide <= 0 && narrow.tiles === 2 && narrow.firstRow === 2, `390 px stacks without overflow (${JSON.stringify(narrow)})`);
+      assert.equal(new Set(narrow.charts).size, 1, 'the charts stack');
       assert.deepEqual(errors, []);
       await context.close();
     }

@@ -689,9 +689,6 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 #appMain[data-view="models"] #chatPanel { visibility: hidden; pointer-events: none; }
 body[data-mode="compact"] .adv { display: none !important; }
 body[data-mode="advanced"] .cmp { display: none !important; }
-#dashPanel .tiles-cmp { grid-template-columns: repeat(2, 1fr); }
-@media (min-width: 900px) { #dashPanel .tiles-cmp { grid-template-columns: repeat(3, 1fr); } }
-#dashPanel .tiles-cmp .tile .v { font-size: 30px; overflow-wrap: anywhere; }
 #modeToggle { font-size: 12.5px; }
 .adminPanel { position: absolute; inset: 0; overflow: auto; background: var(--bg); color: var(--text); font-size: 13px; }
 .adminPanel[hidden] { display: none; }
@@ -734,16 +731,17 @@ body[data-mode="advanced"] .cmp { display: none !important; }
 @media (prefers-color-scheme: dark) {
   :root[data-theme="system"] #dashPanel { --d-c1: #ff8a4c; --d-c2: #5aa9f0; --d-c3: #63c27a; --d-c4: #a08bf5; --d-ok: #63c27a; --d-warn: #ffa94d; --d-bad: #ff6b6b; }
 }
+#dashPanel { --d-pad: max(20px, calc((100% - 1400px) / 2 + 20px)); }
 #dashPanel .d-head { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
-  padding: 12px 20px; border-bottom: 1px solid var(--d-line); background: var(--d-panel); position: sticky; top: 0; z-index: 2; }
+  padding: 12px var(--d-pad); border-bottom: 1px solid var(--d-line); background: var(--d-panel); position: sticky; top: 0; z-index: 2; }
 #dashPanel h1 { font-size: 17px; display: flex; align-items: center; gap: 8px; }
 #dashPanel .d-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--d-muted); }
 #dashPanel .d-dot.ok { background: var(--d-ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--d-ok) 25%, transparent); }
 #dashPanel .d-dot.bad { background: var(--d-bad); }
-#dashPanel .d-statusrow { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding-right: 20px; }
+#dashPanel .d-statusrow { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 0 var(--d-pad); }
 #dashPanel .d-statusrow button { margin-top: 8px; }
 #dashPanel .d-statusrow button[hidden] { display: none; }
-#dashStatus { font-size: 13px; color: var(--d-muted); padding: 8px 20px 0; min-height: 22px; }
+#dashStatus { font-size: 13px; color: var(--d-muted); padding: 8px 0 0; min-height: 22px; }
 #dashStatus.err { color: var(--d-bad); }
 #dashPanel .d-main { padding: 12px 20px 28px; display: grid; gap: 14px; max-width: 1400px; margin: 0 auto; }
 #dashPanel select { width: auto; font: inherit; color: var(--d-ink); border: 1px solid var(--d-line); font-size: inherit; padding: 5px 28px 5px 8px; border-radius: 6px; border-color: var(--d-line); background-color: var(--d-bg); }
@@ -800,6 +798,34 @@ body[data-mode="advanced"] .cmp { display: none !important; }
 #dashPanel .tile .k { font-size: 12px; color: var(--d-muted); text-transform: uppercase; letter-spacing: .5px; }
 #dashPanel .tile .v { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
 #dashPanel .tile .s { font-size: 12px; color: var(--d-muted); font-variant-numeric: tabular-nums; }
+/* Compact view: a status strip, equal-height tiles and charts that share one content width. */
+#dashPanel .cm-strip { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 10px 16px; background: var(--d-panel);
+  border: 1px solid var(--d-line); border-radius: 10px; }
+#dashPanel .cm-name { margin: 0; font-size: 16px; font-weight: 650; min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#dashPanel .cm-up { margin-left: auto; color: var(--d-muted); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+#dashPanel .pill { display: inline-flex; align-items: center; gap: 6px; flex: none; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  color: var(--d-muted); background: var(--d-grid); }
+#dashPanel .pill::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+#dashPanel .pill.idle { color: var(--d-ok); background: color-mix(in srgb, var(--d-ok) 14%, transparent); }
+#dashPanel .pill.busy { color: var(--d-c2); background: color-mix(in srgb, var(--d-c2) 16%, transparent); }
+#dashPanel .pill.busy::before { animation: cm-pulse 1.4s ease-in-out infinite; }
+@keyframes cm-pulse { 50% { opacity: .35; } }
+#dashPanel .tiles-cmp { grid-template-columns: 1fr 1fr; }
+@media (max-width: 559px) { #dashPanel .tiles-cmp .tile:nth-child(n+3) { grid-column: span 2; } }
+@media (min-width: 560px) { #dashPanel .tiles-cmp { grid-template-columns: repeat(6, 1fr); } #dashPanel .tiles-cmp .tile { grid-column: span 2; } #dashPanel .tiles-cmp .tile:nth-child(n+4) { grid-column: span 3; } }
+@media (min-width: 1100px) { #dashPanel .tiles-cmp { grid-template-columns: repeat(5, 1fr); } #dashPanel .tiles-cmp .tile, #dashPanel .tiles-cmp .tile:nth-child(n+4) { grid-column: auto; } }
+#dashPanel .tiles-cmp .tile { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 14px 16px; }
+#dashPanel .tiles-cmp .tile .v { font-size: 28px; line-height: 1.15; }
+#dashPanel .tile .v small { font-size: 13px; font-weight: 500; color: var(--d-muted); }
+#dashPanel .tiles-cmp .tile .s { overflow-wrap: anywhere; }
+#dashPanel .tile .s.live { color: var(--d-ok); font-weight: 600; }
+#dashPanel .tiles-cmp .meterbar { height: 6px; margin-top: auto; border-radius: 3px; background: var(--d-grid); overflow: hidden; }
+#dashPanel .tiles-cmp .meterbar > span { display: block; height: 100%; border-radius: 3px; background: var(--d-c2); }
+#dashPanel .charts-cmp { display: grid; grid-template-columns: 1fr; gap: 12px; }
+@media (min-width: 900px) { #dashPanel .charts-cmp { grid-template-columns: 1fr 1fr; } #dashPanel .charts-cmp .wide { grid-column: 1 / -1; } }
+#dashPanel .charts-cmp canvas { height: 210px; }
+#dashPanel .card h2 .sub { font-weight: 400; color: var(--d-muted); font-size: 12px; }
+#dashPanel .legend i.dash { height: 0; width: 14px; border-top: 2px dashed var(--d-warn); background: none; }
 #dashPanel .charts,
 #dashPanel .row2 { display: grid; grid-template-columns: 1fr; gap: 12px; }
 @media (min-width: 900px) {
@@ -1037,22 +1063,27 @@ body[data-mode="advanced"] .cmp { display: none !important; }
     <button id="dashEnableMetrics" type="button" hidden>Enable metrics</button>
   </div>
   <div class="d-main">
-  <section class="cmp tiles tiles-cmp">
-    <div class="tile"><div class="k">Model</div><div class="v" id="dashCmModel">-</div><div class="s" id="dashCmModelS">&nbsp;</div></div>
-    <div class="tile"><div class="k">Decode</div><div class="v" id="dashCmGen">-</div><div class="s">tokens per second</div></div>
-    <div class="tile"><div class="k">Prefill</div><div class="v" id="dashCmPre">-</div><div class="s">tokens per second</div></div>
-    <div class="tile"><div class="k">Memory</div><div class="v" id="dashCmMem">-</div><div class="s" id="dashCmMemS">&nbsp;</div></div>
-    <div class="tile"><div class="k">SSD cache</div><div class="v" id="dashCmSsd">-</div><div class="s" id="dashCmSsdS">&nbsp;</div></div>
-    <div class="tile"><div class="k">Requests</div><div class="v" id="dashCmReq">-</div><div class="s">running / waiting</div></div>
+  <section class="cmp cm-strip">
+    <span class="pill" id="dashCmState">Not loaded</span>
+    <h2 class="cm-name" id="dashCmModel">-</h2>
+    <span class="cm-up" id="dashCmUp"></span>
   </section>
-  <section class="cmp charts">
-    <div class="card"><h2>Speed (tok/s)<span class="legend"><span><i style="background:var(--d-c1)"></i>decode</span><span><i style="background:var(--d-c2)"></i>prefill</span></span></h2><canvas id="dashCSpd"></canvas></div>
-    <div class="card"><h2>Memory (GiB)</h2><canvas id="dashCMemc"></canvas></div>
+  <section class="cmp tiles tiles-cmp">
+    <div class="tile"><div class="k">Decode</div><div class="v" id="dashCmDec">-</div><div class="s" id="dashCmDecS">&nbsp;</div></div>
+    <div class="tile"><div class="k">Prefill</div><div class="v" id="dashCmPre">-</div><div class="s" id="dashCmPreS">&nbsp;</div></div>
+    <div class="tile"><div class="k">Memory</div><div class="v" id="dashCmMem">-</div><div class="meterbar"><span id="dashCmMemBar" style="width:0"></span></div><div class="s" id="dashCmMemS">&nbsp;</div></div>
+    <div class="tile"><div class="k">SSD cache</div><div class="v" id="dashCmSsd">-</div><div class="meterbar"><span id="dashCmSsdBar" style="width:0"></span></div><div class="s" id="dashCmSsdS">&nbsp;</div></div>
+    <div class="tile"><div class="k">Requests</div><div class="v" id="dashCmReq">-</div><div class="s" id="dashCmReqS">&nbsp;</div></div>
+  </section>
+  <section class="cmp charts-cmp">
+    <div class="card"><h2>Prefill (tok/s)<span class="sub">one point per finished request</span></h2><canvas id="dashCCpre"></canvas></div>
+    <div class="card"><h2>Decode (tok/s)<span class="sub" id="dashCmDecSub">while generating</span></h2><canvas id="dashCCdec"></canvas></div>
+    <div class="card wide"><h2>Memory (GiB)<span class="legend"><span><i style="background:var(--d-c4)"></i>in use by sushi</span><span style="color:var(--d-muted)"><i class="dash"></i><span id="dashCmCeilL">machine memory</span></span></span></h2><canvas id="dashCMemc"></canvas></div>
   </section>
 
   <section class="adv tiles">
-    <div class="tile"><div class="k">Decode</div><div class="v" id="dashTGen">-</div><div class="s">tok/s</div></div>
-    <div class="tile"><div class="k">Prefill</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">tok/s</div></div>
+    <div class="tile"><div class="k">Decode</div><div class="v" id="dashTGen">-</div><div class="s" id="dashTGenS">&nbsp;</div></div>
+    <div class="tile"><div class="k">Prefill</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">&nbsp;</div></div>
     <div class="tile"><div class="k">Requests</div><div class="v" id="dashTReq">-</div><div class="s" id="dashTReqS">running / waiting</div></div>
     <div class="tile"><div class="k">GPU</div><div class="v" id="dashTGpu">-</div><div class="s">utilization</div></div>
     <div class="tile" data-tile="mem"><span class="info tile-i" aria-hidden="true">i</span><div class="k">Memory</div><div class="v" id="dashTMem">-</div><div class="s" id="dashTMemS">process footprint</div></div>
@@ -1083,11 +1114,11 @@ body[data-mode="advanced"] .cmp { display: none !important; }
   </section>
 
   <section class="charts adv">
-    <div class="card"><h2>Prefill (tok/s)</h2><canvas id="dashCPre"></canvas></div>
-    <div class="card"><h2>Decode (tok/s)</h2><canvas id="dashCDec"></canvas></div>
+    <div class="card"><h2>Prefill (tok/s)<span class="sub">one point per finished request</span></h2><canvas id="dashCPre"></canvas></div>
+    <div class="card"><h2>Decode (tok/s)<span class="sub">while generating</span></h2><canvas id="dashCDec"></canvas></div>
     <div class="card"><h2>Requests<span class="legend"><span><i style="background:var(--d-c1)"></i>running</span><span><i style="background:var(--d-c2)"></i>prefilling</span><span><i style="background:var(--d-c3)"></i>waiting</span><span><i style="background:var(--d-c4)"></i>batched</span></span></h2><canvas id="dashCReq"></canvas></div>
     <div class="card"><h2>GPU utilization (%)<span class="legend"><span><i style="background:var(--d-c3)"></i>gpu</span></span></h2><canvas id="dashCGpu"></canvas></div>
-    <div class="card"><h2>Memory (GiB)<span class="legend"><span><i style="background:var(--d-c1)"></i>footprint</span><span><i style="background:var(--d-c2)"></i>MLX active</span><span><i style="background:var(--d-c4)"></i>MLX cache</span></span></h2><canvas id="dashCMem"></canvas></div>
+    <div class="card"><h2>Memory (GiB)<span class="legend"><span><i style="background:var(--d-c1)"></i>footprint</span><span><i style="background:var(--d-c2)"></i>MLX active</span><span><i style="background:var(--d-c4)"></i>MLX cache</span><span style="color:var(--d-muted)"><i class="dash"></i>machine memory</span></span></h2><canvas id="dashCMem"></canvas></div>
   </section>
 
 
@@ -3168,6 +3199,9 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
   const restarts = []; // times the server was seen restarting, drawn on the charts
   const series = { t: [], gen: [], pre: [], run: [], wait: [], pref: [], batch: [], gpu: [], mem: [], act: [], cache: [] };
   const lastGen = new Map(); // request_id -> {gen, t}
+  const finished = []; // {t, rate, tokens}: the prefill speed of requests that finished, drawn as the Compact prefill chart
+  const lastReq = { pre: null, dec: null }; // {rate, tokens, at} of the latest finished request, from the counters
+  let lastHists = null, startedMs = 0, modelsKnown = false;
   // The server keeps the history (one sample per sampler tick); the page asks for what it has not seen, so a tab that
   // was in the background fills in on return and every point is plotted at the server's own time.
   let lastHistT = 0, histPrev = null, lastRates = { gen: 0, pre: 0 };
@@ -3277,8 +3311,21 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
   function trim(now) {
     const cut = now - (+$('window').value) * 1000;
     while (restarts.length && restarts[0] < now - 3600000) restarts.shift();
+    while (finished.length && finished[0].t < cut) finished.shift();
     while (series.t.length && series.t[0] < cut) for (const k in series) series[k].shift();
   }
+
+  // Speed of the requests that finished between two polls, from the counter and histogram deltas: tokens divided by
+  // the time the server spent on them. Null when none finished, or too few tokens for a rate to mean anything.
+  function requestRates(pc, ph, c, h) {
+    const one = (tok, hist, min) => {
+      const n = (c[tok] || 0) - (pc[tok] || 0), secs = (h[hist]?.sum || 0) - (ph[hist]?.sum || 0), done = (h[hist]?.count || 0) - (ph[hist]?.count || 0);
+      return done > 0 && n >= min && secs > 0 ? { rate: n / secs, tokens: n } : null;
+    };
+    return { pre: one('prefill_tokens_total', 'prefill_time_seconds', 32), dec: one('generation_tokens_total', 'decode_time_seconds', 8) };
+  }
+  // Mean speed since the server started, shown until a request has finished while the page was watching.
+  const meanRate = (c, h, tok, hist) => h[hist]?.sum > 0 && c[tok] > 0 ? { rate: c[tok] / h[hist].sum, tokens: c[tok], avg: true } : null;
 
   function update(d) {
     const now = Date.now(), c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
@@ -3287,7 +3334,9 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
       restarts.push(now); prev = null; histPrev = null; lastGen.clear(); propsAt = 0;
       restartNote = 'Server restarted at ' + new Date(now).toLocaleTimeString();
     }
-    lastCounters = c;
+    const fin = lastCounters && lastHists ? requestRates(lastCounters, lastHists, c, h) : {};
+    lastCounters = c; lastHists = h;
+    if (d.history?.started_ms) startedMs = d.history.started_ms;
     // Sushi refreshes these token gauges only every ~2 s (its sampler thread), so between
     // two fast polls the value often hasn't moved yet. Measure the rate between actual
     // changes instead of between polls, and only call it 0 once nothing moved for a while.
@@ -3317,6 +3366,9 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
       push('act', gib(g.mlx_active_bytes || 0)); push('cache', gib(g.mlx_cache_bytes || 0));
       trim(now);
     }
+    const at = series.t.length ? series.t[series.t.length - 1] : now;
+    if (fin.pre) { finished.push({ t: at, ...fin.pre }); lastReq.pre = { ...fin.pre, at: now }; }
+    if (fin.dec) lastReq.dec = { ...fin.dec, at: now };
     let onDisk = 0;
     for (const p of modelProps.values()) if (p && typeof p === 'object') onDisk += p.settings?.prefix_cache?.disk_used_bytes || 0;
     const writes = prefixWrites(d.prefix_cache_writes, prevWrites, now, onDisk);
@@ -3328,9 +3380,7 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
   function render({ d, now, gen, pre, writes }) {
     const c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
 
-    $('t-gen').textContent = fmt(gen, 1);
-    $('t-pre').textContent = fmt(pre, 0);
-    $('t-pre-s').textContent = g.prefill_tokens_expected ? `${compact(g.prefill_tokens_live)} / ${compact(g.prefill_tokens_expected)} tokens` : 'tok/s';
+    speedTiles({ d, now, gen, pre }, 't-gen', 't-pre');
     $('t-req').textContent = `${g.requests_running || 0} / ${g.requests_waiting || 0}`;
     $('t-req-s').textContent = g.batched_group_size > 1 ? `running / waiting, ${g.batched_group_size} batched` : 'running / waiting';
     $('t-gpu').textContent = fmtInt(g.gpu_utilization_pct) + '%';
@@ -3502,22 +3552,68 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
     refreshPhaseTip();
   }
 
-  // The Compact view's tiles: what is loaded, speed, memory, SSD cache and load.
+  const ago = ms => { const s = Math.max(0, Math.round(ms / 1000)); return s < 5 ? 'just now' : s < 60 ? s + ' s ago' : s < 3600 ? Math.floor(s / 60) + ' min ago' : Math.floor(s / 3600) + ' h ago'; };
+  const upFor = ms => { const m = Math.floor(ms / 60000), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`; };
+  // The tile value with its unit beside it, built as nodes so no markup is parsed.
+  function setValue(el, value, unit) {
+    el.textContent = value;
+    if (unit) { const u = document.createElement('small'); u.textContent = ' ' + unit; el.append(u); }
+  }
+  // The memory the Memory chart and tile measure against: the machine's, or what sushi can reach on a server that does not say.
+  function memCeiling() {
+    if (serverInfo.total) return { gib: gib(serverInfo.total), machine: true };
+    const used = (lastData?.d.gauges?.memory_mb || 0) / 1024;
+    return serverInfo.free != null ? { gib: used + gib(serverInfo.free), machine: false } : null;
+  }
+
+  // Decode and Prefill tiles, shared by both views: live while running, else the last request's rate, else the mean since start.
+  function speedTiles({ d, now, gen, pre }, decId, preId) {
+    const c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
+    const since = r => 'last request, ' + ago(now - r.at);
+    const dec = gen > 0 ? { rate: gen, live: true } : lastReq.dec || meanRate(c, h, 'generation_tokens_total', 'decode_time_seconds');
+    setValue($(decId), dec ? fmt(dec.rate, 1) : '-', dec ? 'tok/s' : '');
+    $(decId + '-s').textContent = !dec ? 'nothing generated yet' : dec.live ? 'live' : dec.avg ? 'average since start' : since(dec);
+    $(decId + '-s').className = 's' + (dec?.live ? ' live' : '');
+    const livePre = (g.requests_prefilling || 0) > 0 && pre > 0;
+    const last = lastReq.pre || meanRate(c, h, 'prefill_tokens_total', 'prefill_time_seconds');
+    setValue($(preId), livePre ? fmt(pre, 0) : last ? fmt(last.rate, 0) : '-', livePre || last ? 'tok/s' : '');
+    $(preId + '-s').textContent = livePre ? (g.prefill_tokens_expected ? `live, ${compact(g.prefill_tokens_live)} / ${compact(g.prefill_tokens_expected)} tokens` : 'live')
+      : !last ? 'nothing prefilled yet' : last.avg ? 'average since start' : `${since(last)}, ${fmtInt(last.tokens)} tokens`;
+    $(preId + '-s').className = 's' + (livePre ? ' live' : '');
+  }
+
+  // The Compact view: status strip, tiles.
   function renderCompact() {
     if (!lastData) return;
-    const { d, gen, pre } = lastData, g = d.gauges || {};
+    const { d, now, gen, pre } = lastData, g = d.gauges || {}, c = d.counters || {}, h = d.histograms || {};
     const ready = modelList.filter(m => m.state === 'ready').map(m => shortName(m.id));
-    $('cm-model').textContent = ready.length ? ready.join(', ') : 'none loaded';
-    $('cm-model-s').textContent = ready.length ? 'loaded' : 'a request loads one';
-    $('cm-gen').textContent = fmt(gen, 1);
-    $('cm-pre').textContent = fmt(pre, 0);
-    $('cm-mem').textContent = fmt((g.memory_mb || 0) / 1024, 1) + ' GiB';
+    const busy = (g.requests_running || 0) + (g.requests_waiting || 0) > 0;
+    const [state, cls] = !modelsKnown ? ['Connecting', ''] : modelList.some(m => m.state === 'loading') ? ['Loading', 'busy']
+      : !ready.length ? ['Not loaded', ''] : busy ? ['Busy', 'busy'] : ['Idle', 'idle'];
+    $('cm-state').textContent = state; $('cm-state').className = 'pill ' + cls;
+    $('cm-model').textContent = ready.length ? ready[0] + (ready.length > 1 ? ` +${ready.length - 1}` : '') : modelsKnown ? 'No model loaded' : '-';
+    $('cm-model').title = ready.join('\n');
+    $('cm-up').textContent = startedMs ? 'up ' + upFor((lastHistT || now) - startedMs) : '';
+
+    speedTiles(lastData, 'cm-dec', 'cm-pre');
+
+    const used = (g.memory_mb || 0) / 1024, ceil = memCeiling();
+    setValue($('cm-mem'), fmt(used, 1) + (ceil ? ' / ' + fmt(ceil.gib, 0) : ''), 'GiB');
+    $('cm-mem-bar').style.width = (ceil ? Math.min(100, 100 * used / ceil.gib) : 0) + '%';
     $('cm-mem-s').textContent = serverInfo.free != null ? bytes(serverInfo.free) + ' available' : 'in use by sushi';
-    let used = 0, cap = 0;
-    for (const p of modelProps.values()) if (p && typeof p === 'object') { used += p.settings?.prefix_cache?.disk_used_bytes || 0; cap = Math.max(cap, p.settings?.prefix_cache?.disk_bytes || 0); }
-    $('cm-ssd').textContent = cap ? bytes(used) : 'off';
-    $('cm-ssd-s').textContent = cap ? 'of ' + bytes(cap) + ' assigned' : 'SSD prefix cache is off';
-    $('cm-req').textContent = `${g.requests_running || 0} / ${g.requests_waiting || 0}`;
+
+    let ssd = 0, cap = 0, entries = 0;
+    for (const p of modelProps.values()) if (p && typeof p === 'object') {
+      const pc = p.settings?.prefix_cache || {};
+      ssd += pc.disk_used_bytes || 0; cap = Math.max(cap, pc.disk_bytes || 0); entries += pc.disk_entries || 0;
+    }
+    setValue($('cm-ssd'), cap ? bytes(ssd) : 'off', cap ? '/ ' + bytes(cap) : '');
+    $('cm-ssd-bar').style.width = (cap ? Math.min(100, 100 * ssd / cap) : 0) + '%';
+    $('cm-ssd-s').textContent = cap ? `${fmtInt(entries)} ${entries === 1 ? 'entry' : 'entries'}` : 'SSD prefix cache is off';
+
+    setValue($('cm-req'), String(g.requests_running || 0), 'running');
+    $('cm-req-s').textContent = `${g.requests_waiting || 0} waiting` + (g.requests_prefilling ? ', prefilling' : '');
+    $('cm-ceil-l').textContent = ceil ? (ceil.machine ? 'machine memory' : 'available to sushi') : 'ceiling unknown';
   }
 
   const css = n => getComputedStyle($('panel')).getPropertyValue(n).trim();
@@ -3525,15 +3621,13 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
   const hover = {}; // canvas id -> mouse x/y in CSS px while the pointer is over it
   const charts = {}; // canvas id -> last draw geometry, for hit-testing
 
-  function chart(id, lines, opts = {}) {
+  // Sizes the canvas and draws the grid, axis labels and restart markers; returns what a chart needs to plot on it.
+  function frame(id, max, opts) {
     const cv = $(id), dpr = window.devicePixelRatio || 1, w = cv.clientWidth, hgt = cv.clientHeight;
     if (cv.width !== w * dpr || cv.height !== hgt * dpr) { cv.width = w * dpr; cv.height = hgt * dpr; }
     const ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, hgt);
-    const t = series.t, n = t.length, padL = 40, padR = 6, padT = 6, padB = 18;
+    const t = series.t, n = t.length, padL = 40, padR = 8, padT = 8, padB = 18;
     const win = (+$('window').value) * 1000, tEnd = n ? t[n - 1] : Date.now(), tStart = tEnd - win;
-    let max = opts.max || 0;
-    if (!opts.max) for (const [k] of lines) for (const v of series[k]) if (v > max) max = v;
-    max = niceMax(max || 1);
     const X = tm => padL + (w - padL - padR) * (tm - tStart) / win, Y = v => padT + (hgt - padT - padB) * (1 - v / max);
     ctx.font = '11px ui-sans-serif, system-ui, sans-serif'; ctx.fillStyle = css('--d-muted'); ctx.strokeStyle = css('--d-grid'); ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
@@ -3551,34 +3645,83 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
       ctx.fillStyle = css('--d-warn'); ctx.textAlign = x > w - 60 ? 'right' : 'left'; ctx.textBaseline = 'top';
       ctx.fillText('restart', x + (x > w - 60 ? -4 : 4), padT); ctx.fillStyle = css('--d-muted');
     }
+    return { cv, ctx, w, hgt, padL, padR, padT, padB, X, Y };
+  }
 
-    // Nearest sample to the pointer, and the line closest to it vertically.
+  function emptyNote(f, text) {
+    f.ctx.fillStyle = css('--d-muted'); f.ctx.textAlign = 'center'; f.ctx.textBaseline = 'middle';
+    f.ctx.fillText(text, (f.padL + f.w - f.padR) / 2, (f.padT + f.hgt - f.padB) / 2);
+  }
+
+  // Runs of consecutive samples to draw as one line; with `skipZero` a sample at 0 ends the run (idle is a gap, not a floor).
+  function runsOf(s, skipZero) {
+    const t = series.t, n = t.length, runs = [], ok = i => !skipZero || s[i] > 0;
+    for (let a = 0; a < n;) {
+      if (!ok(a)) { a++; continue; }
+      let b = a; while (b + 1 < n && ok(b + 1) && t[b + 1] - t[b] <= GAP_MS) b++;
+      runs.push([a, b]); a = b + 1;
+    }
+    return runs;
+  }
+
+  // opts: max (+ exact: use it as the axis top), dec, smooth (3-sample mean within a run), gapZero (idle samples are gaps),
+  // ceiling (+ ceilingLabel: a dashed line), empty (text shown when nothing is drawn), extra (tooltip rows).
+  function chart(id, lines, opts = {}) {
+    const t = series.t, n = t.length;
+    const runs = {}, data = {};
+    for (const [k] of lines) {
+      const s = series[k]; runs[k] = runsOf(s, opts.gapZero); data[k] = s;
+      if (opts.smooth) {
+        data[k] = s.slice();
+        for (const [a, b] of runs[k]) for (let i = a; i <= b; i++) { const lo = Math.max(a, i - 1), hi = Math.min(b, i + 1); let sum = 0; for (let j = lo; j <= hi; j++) sum += s[j]; data[k][i] = sum / (hi - lo + 1); }
+      }
+    }
+    let max = opts.exact ? opts.max : opts.max || 0;
+    if (!opts.max || opts.exact) for (const [k] of lines) for (const v of data[k]) if (v > max) max = v;
+    if (!opts.exact) max = niceMax(max || (opts.empty ? 100 : 1));
+    const f = frame(id, max, opts), { cv, ctx, w, hgt, padL, padR, padT, padB, X, Y } = f;
+    if (opts.ceiling) {
+      ctx.save(); ctx.strokeStyle = css('--d-warn'); ctx.fillStyle = css('--d-warn'); ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+      const y = Math.round(Y(opts.ceiling)) + .5;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke(); ctx.restore();
+      ctx.fillStyle = css('--d-warn'); ctx.textAlign = 'right'; ctx.textBaseline = 'top'; ctx.fillText(opts.ceilingLabel || '', w - padR - 4, y + 4);
+    }
+    if (opts.empty && lines.every(([k]) => !runs[k].length)) emptyNote(f, opts.empty);
+
+    // Nearest drawn sample to the pointer, and the line closest to it vertically.
     const hv = hover[id];
     let hi = -1, near = null;
     if (hv && n && hv.x >= padL - 4) {
       let best = Infinity;
-      for (let i = 0; i < n; i++) { const dx = Math.abs(X(t[i]) - hv.x); if (dx < best) { best = dx; hi = i; } }
+      for (let i = 0; i < n; i++) {
+        if (opts.gapZero && !lines.some(([k]) => series[k][i] > 0)) continue;
+        const dx = Math.abs(X(t[i]) - hv.x); if (dx < best) { best = dx; hi = i; }
+      }
       if (best > 24) hi = -1;
-      if (hi >= 0) { let bd = Infinity; for (const [k] of lines) { const d = Math.abs(Y(series[k][hi]) - hv.y); if (d < bd) { bd = d; near = k; } } }
+      if (hi >= 0) { let bd = Infinity; for (const [k] of lines) { const d = Math.abs(Y(data[k][hi]) - hv.y); if (d < bd) { bd = d; near = k; } } }
     }
 
     for (const [k, color, fill] of lines) {
-      const s = series[k]; if (!n) continue;
-      if (fill) { // one fill per run of samples; a gap is not bridged
+      const s = data[k]; if (!n) continue;
+      if (fill) { // one fill per run; a gap is not bridged
         ctx.save(); ctx.globalAlpha = .12; ctx.fillStyle = css(color);
-        for (let a = 0; a < n;) {
-          let b = a; while (b + 1 < n && t[b + 1] - t[b] <= GAP_MS) b++;
+        for (const [a, b] of runs[k]) {
+          if (a === b) continue;
           ctx.beginPath(); ctx.moveTo(X(t[a]), Y(0));
           for (let i = a; i <= b; i++) ctx.lineTo(X(t[i]), Y(s[i]));
-          ctx.lineTo(X(t[b]), Y(0)); ctx.closePath(); ctx.fill(); a = b + 1;
+          ctx.lineTo(X(t[b]), Y(0)); ctx.closePath(); ctx.fill();
         }
         ctx.restore();
       }
-      ctx.beginPath();
-      for (let i = 0; i < n; i++) { const x = X(t[i]), y = Y(s[i]); i && t[i] - t[i - 1] <= GAP_MS ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
       ctx.save();
       if (near && near !== k) ctx.globalAlpha = .45;
-      ctx.strokeStyle = css(color); ctx.lineWidth = near === k ? 3 : 2; ctx.lineJoin = 'round'; ctx.stroke();
+      ctx.strokeStyle = ctx.fillStyle = css(color); ctx.lineWidth = near === k ? 3 : 2; ctx.lineJoin = 'round';
+      for (const [a, b] of runs[k]) {
+        if (a === b) { ctx.beginPath(); ctx.arc(X(t[a]), Y(s[a]), 2.5, 0, 2 * Math.PI); ctx.fill(); continue; }
+        ctx.beginPath();
+        for (let i = a; i <= b; i++) i === a ? ctx.moveTo(X(t[i]), Y(s[i])) : ctx.lineTo(X(t[i]), Y(s[i]));
+        ctx.stroke();
+      }
       ctx.restore();
     }
 
@@ -3587,11 +3730,33 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
       ctx.strokeStyle = css('--d-muted'); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
       ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, hgt - padB); ctx.stroke(); ctx.setLineDash([]);
       for (const [k, color] of lines) {
-        ctx.beginPath(); ctx.arc(x, Y(series[k][hi]), near === k ? 4.5 : 3, 0, 2 * Math.PI);
+        ctx.beginPath(); ctx.arc(x, Y(data[k][hi]), near === k ? 4.5 : 3, 0, 2 * Math.PI);
         ctx.fillStyle = css(color); ctx.fill(); ctx.strokeStyle = css('--d-panel'); ctx.lineWidth = 1.5; ctx.stroke();
       }
-      showTip(cv, x, hv.y, t[hi], lines, hi, near, opts);
+      showTip(cv, x, hv.y, t[hi], lines, hi, near, { ...opts, data });
     } else if (tipOwner === cv.id) hideTip();
+  }
+
+  // One dot (on a stem) per finished request, at the time it finished and the speed it prefilled at.
+  function eventChart(id, evs, color) {
+    const f = frame(id, niceMax(Math.max(evs.length ? 1 : 100, ...evs.map(e => e.rate))), {}), { cv, ctx, X, Y } = f;
+    if (!evs.length) { emptyNote(f, 'No request finished in this window yet'); if (tipOwner === cv.id) hideTip(); return; }
+    const hv = hover[id];
+    let near = -1, best = 24;
+    if (hv) evs.forEach((e, i) => { const dx = Math.abs(X(e.t) - hv.x); if (dx < best) { best = dx; near = i; } });
+    evs.forEach((e, i) => {
+      const x = Math.round(X(e.t)) + .5, y = Y(e.rate);
+      ctx.save(); ctx.strokeStyle = css(color); ctx.globalAlpha = .35; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x, Y(0)); ctx.lineTo(x, y); ctx.stroke(); ctx.restore();
+      ctx.beginPath(); ctx.arc(x, y, i === near ? 6 : 4.5, 0, 2 * Math.PI);
+      ctx.fillStyle = css(color); ctx.fill(); ctx.strokeStyle = css('--d-panel'); ctx.lineWidth = 1.5; ctx.stroke();
+    });
+    if (near < 0) { if (tipOwner === cv.id) hideTip(); return; }
+    const e = evs[near], r = cv.getBoundingClientRect();
+    placeTip(r.left + X(e.t), r.top + hv.y, `<div class="t">${new Date(e.t).toLocaleTimeString()}</div>
+      <div class="r near" style="grid-template-columns:1fr auto"><span>Prefill</span><b>${fmtInt(e.rate)} tok/s</b></div>
+      <div class="r near" style="grid-template-columns:1fr auto"><span>Prompt tokens computed</span><b>${fmtInt(e.tokens)}</b></div>
+      <div class="h">The speed of one request: its computed prompt tokens divided by the time spent prefilling. Tokens restored from the prefix cache are not counted.</div>`, cv.id);
   }
 
   const tip = document.createElement('div'); tip.id = 'dashTip'; $('panel').appendChild(tip);
@@ -3599,7 +3764,7 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
   function showTip(cv, x, y, tm, lines, i, near, opts) {
     const ago = Math.round((series.t[series.t.length - 1] - tm) / 1000);
     const rows = [...lines].reverse().map(([k, color]) => {
-      const meta = LABELS[k], v = series[k][i];
+      const meta = LABELS[k], v = (opts.data?.[k] ?? series[k])[i];
       return `<div class="r${near === k ? ' near' : ''}"><i style="background:var(${color})"></i><span>${meta.name}</span><b>${meta.fmt(v)}</b></div>`;
     }).join('');
     const extra = (opts.extra ? opts.extra() : []).map(([k, v]) => `<div class="r"><i></i><span>${k}</span><b>${v}</b></div>`).join('');
@@ -3634,7 +3799,7 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
     cache: { name: 'MLX cache', fmt: gb, help: 'Freed buffers MLX keeps for reuse. Held by the process but not in use; a steady climb here explains footprint growth.' },
   };
 
-  for (const id of ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem', 'c-spd', 'c-memc']) {
+  for (const id of ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem', 'c-cpre', 'c-cdec', 'c-memc']) {
     const cv = $(id);
     cv.addEventListener('pointermove', e => { const r = cv.getBoundingClientRect(); hover[id] = { x: e.clientX - r.left, y: e.clientY - r.top }; drawAll(); });
     cv.addEventListener('pointerleave', () => { delete hover[id]; hideTip(); drawAll(); });
@@ -3645,16 +3810,20 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
 
   function drawAll() {
     if (!dashActive) return;
-    if (document.body.dataset.mode === 'compact') {
-      chart('c-spd', [['pre', '--d-c2'], ['gen', '--d-c1', true]]);
-      chart('c-memc', [['mem', '--d-c1', true]], { dec: 1 });
+    const ceil = memCeiling(), compact = document.body.dataset.mode === 'compact';
+    const memOpts = ceil ? { max: ceil.gib, exact: true, dec: ceil.gib % 4 ? 1 : 0, ceiling: ceil.gib, ceilingLabel: `${fmt(ceil.gib, 0)} GiB ${ceil.machine ? 'machine memory' : 'available to sushi'}` } : { dec: 1 };
+    const decOpts = { smooth: true, gapZero: true, empty: 'No decode in this window' };
+    if (compact) {
+      eventChart('c-cpre', finished, '--d-c2');
+      chart('c-cdec', [['gen', '--d-c1', true]], decOpts);
+      chart('c-memc', [['mem', '--d-c4', true]], memOpts);
       return;
     }
-    chart('c-pre', [['pre', '--d-c2', true]]);
-    chart('c-dec', [['gen', '--d-c1', true]]);
+    eventChart('c-pre', finished, '--d-c2');
+    chart('c-dec', [['gen', '--d-c1', true]], decOpts);
     chart('c-req', [['wait', '--d-c3'], ['pref', '--d-c2'], ['batch', '--d-c4'], ['run', '--d-c1']]);
     chart('c-gpu', [['gpu', '--d-c3', true]], { max: 100 });
-    chart('c-mem', [['cache', '--d-c4'], ['act', '--d-c2'], ['mem', '--d-c1', true]], { dec: 1, extra: () => serverInfo.peak ? [['MLX peak (since start)', bytes(serverInfo.peak)]] : [] });
+    chart('c-mem', [['cache', '--d-c4'], ['act', '--d-c2'], ['mem', '--d-c1', true]], { ...memOpts, extra: () => serverInfo.peak ? [['MLX peak (since start)', bytes(serverInfo.peak)]] : [] });
   }
   window.addEventListener('resize', drawAll);
   matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', drawAll);
@@ -3679,7 +3848,7 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
     try {
       const r = await api('/v1/models');
       if (!r.ok) throw new Error('HTTP ' + r.status);
-      modelList = (await r.json()).data || [];
+      modelList = (await r.json()).data || []; modelsKnown = true;
       const ready = modelList.filter(m => m.state === 'ready');
       for (const id of modelProps.keys()) if (!ready.some(m => m.id === id)) modelProps.delete(id);
       for (const m of ready) if (!modelProps.has(m.id)) modelProps.set(m.id, 'pending');
@@ -3709,7 +3878,7 @@ function uiModeLabel(mode) { return mode === "compact" ? "Advanced view" : "Comp
     const ver = st.version || p.update?.current;
     setHtml($('ver'), (ver ? ` v${esc(ver)}` : '') + (p.update?.available
       ? ` <span class="badge" title="${esc(p.update.command || 'brew upgrade sushi')}">Update ${esc(p.update.latest || '')} available</span>` : ''));
-    serverInfo = { free: mem.available_bytes, peak: mem.peak_bytes, disk: pc.disk_bytes ? pc : null };
+    serverInfo = { free: mem.available_bytes, peak: mem.peak_bytes, total: mem.total_bytes, disk: pc.disk_bytes ? pc : null };
     renderCompact();
     if (serverInfo.free != null) $('t-mem-s').textContent = bytes(serverInfo.free) + ' free';
     drawAll();

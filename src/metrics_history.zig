@@ -33,10 +33,13 @@ pub fn Ring(comptime cap: usize) type {
         /// Next write position.
         head: usize = 0,
         len: usize = 0,
+        /// Time of the first sample, which is when the sampler (and so the server) started; 0 before any.
+        started_ms: i64 = 0,
 
         pub fn push(self: *Self, io: std.Io, s: Sample) void {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
+            if (self.started_ms == 0) self.started_ms = s.t_ms;
             self.buf[self.head] = s;
             self.head = (self.head + 1) % cap;
             self.len = @min(self.len + 1, cap);
@@ -51,7 +54,7 @@ pub fn Ring(comptime cap: usize) type {
         pub fn writeSince(self: *Self, io: std.Io, since_ms: i64, w: *std.Io.Writer) !void {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
-            try w.print("\"history\":{{\"interval_ms\":{d},\"capacity\":{d},\"fields\":[\"t_ms\",\"gen_tokens\",\"prefill_tokens\",\"running\",\"waiting\",\"prefilling\",\"batched\",\"gpu_pct\",\"memory_mb\",\"mlx_active\",\"mlx_cache\"],\"samples\":[", .{ interval_ms, cap });
+            try w.print("\"history\":{{\"interval_ms\":{d},\"capacity\":{d},\"started_ms\":{d},\"fields\":[\"t_ms\",\"gen_tokens\",\"prefill_tokens\",\"running\",\"waiting\",\"prefilling\",\"batched\",\"gpu_pct\",\"memory_mb\",\"mlx_active\",\"mlx_cache\"],\"samples\":[", .{ interval_ms, cap, self.started_ms });
             var first = true;
             for (0..self.len) |i| {
                 const s = self.at(i);
@@ -124,6 +127,14 @@ test "metrics history: since returns only later samples, an empty ring and a fut
     const future = try rendered(&ring, 9000);
     defer future.deinit();
     try testing.expectEqual(@as(usize, 0), future.value.object.get("history").?.object.get("samples").?.array.items.len);
+}
+
+test "metrics history: started_ms is the first sample's time and survives the ring wrapping" {
+    var ring: Ring(2) = .{};
+    for (1..5) |i| ring.push(testing.io, sample(@as(i64, @intCast(i)) * 1000));
+    const parsed = try rendered(&ring, 0);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 1000), parsed.value.object.get("history").?.object.get("started_ms").?.integer);
 }
 
 test "metrics history: the ring is a fixed size however long it runs" {
