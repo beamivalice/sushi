@@ -15,6 +15,8 @@
 #  6. GET /v1/settings: a long --model-dir and a sub-GB --prefix-cache-disk read back whole as the flag text; a hand-edited
 #     trailing-slash model key is the one an edit changes; kv_quant is stored under its choice name; a symlinked settings
 #     file is written through; each model lists the keys that apply to it and loaded_with (null while unloaded).
+#  6b. Each model lists `limits` (disabled keys with a reason, a narrowed kv_quant, a context bound) and POST refuses
+#     a value the model cannot honour with a 400 naming the key; a removal and a value already in the file pass.
 #  7. With the tiny DeepSeek fixture (GPU lock): a cache size changed after boot reaches the next load, effective_bytes
 #     reports the tier in force, and the file's models_dir on a --model-only server rescans.
 #
@@ -158,13 +160,13 @@ check "nothing is set: every key is default" "$(echo "$S" | jq '[.models[0].sett
 check "an unknown key is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"temperature":1}}' | jq -r '.error.type')" unknown_setting)"
 check "a bad value is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"ssd_prefetch":101}}' | jq -r '.error.type')" invalid_setting)"
 check "an unknown model is a 404" "$(is "$(code -X POST "$BASE/v1/settings" -d '{"model":"nope","set":{"mtp":true}}')" 404)"
-check "saving a model key is ok" "$(post /v1/settings '{"model":"alpha","set":{"kv_quant":"4","mtp":false}}' | jq '.ok')"
+check "saving a model key is ok" "$(post /v1/settings '{"model":"alpha","set":{"kv_quant":"4","think_penalty":2}}' | jq '.ok')"
 S="$(get /v1/settings)"
 check "the model key reads back with source file" \
-    "$(echo "$S" | jq '.models[0].settings | (.kv_quant.file == "4") and (.kv_quant.source == "file") and (.mtp.file == false)')"
+    "$(echo "$S" | jq '.models[0].settings | (.kv_quant.file == "4") and (.kv_quant.source == "file") and (.think_penalty.file == 2)')"
 check "the file holds the model's path as the key" "$(jq -e --arg p "$MODELS/alpha" '.[$p].kv_quant == "4"' "$WORK/home/.sushi/model-settings.json" >/dev/null && echo 1 || echo 0)"
-post /v1/settings '{"model":"alpha","set":{"kv_quant":null,"mtp":null}}' >/dev/null
-check "null removes the keys" "$(get /v1/settings | jq '.models[0].settings | (.kv_quant.file == null) and (.mtp.source == "default")')"
+post /v1/settings '{"model":"alpha","set":{"kv_quant":null,"think_penalty":null}}' >/dev/null
+check "null removes the keys" "$(get /v1/settings | jq '.models[0].settings | (.kv_quant.file == null) and (.think_penalty.source == "default")')"
 check "the SSD cache size is saved" "$(post /v1/settings '{"server":{"prefix_cache_disk_gb":7}}' | jq '.ok')"
 check "and read back" "$(get /v1/settings | jq '.server.prefix_cache_disk_gb | (.file == 7) and (.source == "file")')"
 check "a models_dir that is not a folder is refused" "$(is "$(post /v1/settings "{\"server\":{\"models_dir\":\"$WORK/missing\"}}" | jq -r .error.type)" invalid_setting)"
@@ -191,6 +193,30 @@ S="$(get /v1/settings)"
 check "a long --model-dir reads back whole" "$(is "$(echo "$S" | jq -r .server.models_dir.flag)" "$LONG")"
 check "a sub-GB --prefix-cache-disk reads back with its unit and the effective bytes" \
     "$(echo "$S" | jq '.server.prefix_cache_disk_gb | (.flag == "512MB") and (.locked) and (.effective_bytes == 536870912)')"
+
+echo "[3c/4] per-model limits: what a model cannot honour is not offered and is refused with its reason"
+LIM="$WORK/limit-models"
+mk_model "$LIM" glm glm5_next
+mk_model "$LIM" ds deepseek_v41
+mk_model "$LIM" qw qwen4_exp
+boot --model-dir "$LIM" || { echo "[fail] boot"; exit 1; }
+S="$(get /v1/settings)"
+lim() { echo "$S" | jq -r --arg id "$1" ".models[] | select(.id == \$id) | .limits$2"; }
+check "GLM offers kv_quant off, 6 and 8 only" "$(is "$(lim glm '.kv_quant.choices | join(",")')" "off,6,8")"
+check "GLM has no MTP: mtp and its tail keys are disabled with a reason" \
+    "$(echo "$S" | jq '.models[] | select(.id == "glm") | [.limits.mtp, .limits.mtp_acceptance, .limits.mtp_greedy_tail] | all(.disabled and (.why | length > 0))')"
+check "DeepSeek keeps no KV cache: kv_quant is disabled and absent from keys" \
+    "$(echo "$S" | jq '.models[] | select(.id == "ds") | .limits.kv_quant.disabled and (.keys | index("kv_quant") == null)')"
+check "a pack without STQ experts has no expert prefetcher" "$(is "$(lim ds '.ssd_prefetch.disabled')" true)"
+check "a pack with no MTP head disables mtp" "$(is "$(lim qw '.mtp.disabled')" true)"
+check "GLM refuses kv_quant 4 with a 400 naming it" "$(post /v1/settings '{"model":"glm","set":{"kv_quant":"4"}}' | jq '(.error.type == "invalid_setting") and (.error.message | contains("kv_quant"))')"
+check "GLM takes kv_quant 6" "$(post /v1/settings '{"model":"glm","set":{"kv_quant":"6"}}' | jq '.ok')"
+check "GLM refuses mtp true" "$(is "$(post /v1/settings '{"model":"glm","set":{"mtp":true}}' | jq -r .error.type)" invalid_setting)"
+check "DeepSeek refuses any kv_quant" "$(is "$(post /v1/settings '{"model":"ds","set":{"kv_quant":"8"}}' | jq -r .error.type)" invalid_setting)"
+check "a removal is always accepted" "$(post /v1/settings '{"model":"glm","set":{"mtp":null,"kv_quant":null}}' | jq '.ok')"
+printf '{"%s":{"kv_quant":"4","mtp":true}}' "$LIM/glm" > "$WORK/home/.sushi/model-settings.json"
+check "a value already in the file is still reported, not refused" \
+    "$(get /v1/settings | jq '.models[] | select(.id == "glm") | .settings.kv_quant.file == "4"')"
 
 echo "[4/4] --api-key --api-key-strict"
 boot --api-key sekret --api-key-strict || { echo "[fail] boot"; exit 1; }
@@ -252,7 +278,7 @@ PY
     check "the boot log names the file as the source of the size" "$(grep -q 'Allocating 2.0 GB SSD for the prefix cache (model-settings.json)' "$LOG" && echo 1 || echo 0)"
     check "effective_bytes is the running tier's cap and running_tiers names it" "$(get /v1/settings | jq '.server.prefix_cache_disk_gb | (.effective_bytes == 2147483648) and (.running_tiers[0].model == "tiny") and (.running_tiers[0].cap_bytes == 2147483648)')"
     check "the loaded model reports the keys that apply and what it loaded with" \
-        "$(get /v1/settings | jq '.models[] | select(.id == "tiny") | (.loaded_with != null) and (.keys | index("kv_quant") == null) and (.keys | index("ssd_prefetch") != null)')"
+        "$(get /v1/settings | jq '.models[] | select(.id == "tiny") | (.loaded_with != null) and (.keys | index("kv_quant") == null) and (.keys | index("ssd_prefetch") == null) and (.limits.ssd_prefetch.disabled) and (.limits.kv_quant.disabled)')"
     S="$(get /v1/props 2>/dev/null)"
     P="$(get /props)"
     check "/props does not report the file's acceptance as applying on DeepSeek" "$(echo "$P" | jq '.settings.mtp.acceptance_applies == false')"

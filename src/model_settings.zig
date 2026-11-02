@@ -357,19 +357,137 @@ pub fn findKey(specs: []const KeySpec, name: []const u8) ?KeySpec {
     return null;
 }
 
-/// What decides which keys a model honours; the loader's own gates read the same answers.
-pub const Fit = struct { arch: []const u8, streams_experts: bool, has_vision: bool };
+/// What decides which keys and values a model honours; the loader's own gates read the same answers. The fields past
+/// `has_vision` default to "not ruled out", so a caller that cannot read one never hides a key.
+pub const Fit = struct {
+    arch: []const u8,
+    streams_experts: bool,
+    has_vision: bool,
+    /// The arch runs a speculative head at all.
+    serves_mtp: bool = true,
+    /// The pack ships that head.
+    mtp_head: bool = true,
+    /// The pack cannot load without streaming its experts.
+    streaming_required: bool = false,
+    /// The head survives a streamed load.
+    head_streams: bool = true,
+    /// The pack's experts are STQ, the only stream with an expert prefetcher.
+    stq_experts: bool = true,
+    /// The cache stores only what the MLA latent holds (`KVQuantConfig.glmLatentBits`).
+    latent_kv: bool = false,
+    /// The model's context window; 0 = unknown.
+    context_cap: u32 = 0,
+    template_preserves_thinking: bool = true,
+    template_thinks: bool = true,
+};
 
 /// The arch with an expert prefetcher and no KV cache or MTP tail: its drafts accept by the exact rule only.
 pub const prefetch_arch = "deepseek_v41";
 
+/// Why the loader ignores `key` for this model, as a sentence for the person editing; null when it takes effect.
+pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
+    const eql = std.mem.eql;
+    const special = eql(u8, fit.arch, prefetch_arch);
+    if (eql(u8, key, "ssd_budget_gb")) return if (fit.streams_experts) null else "This model does not stream its experts from SSD.";
+    if (eql(u8, key, "ssd_prefetch")) {
+        if (!special) return "This model has no expert prefetcher.";
+        return if (fit.stq_experts) null else "This pack has no STQ experts, so there is no expert prefetcher.";
+    }
+    if (eql(u8, key, "vision")) return if (fit.has_vision) null else "This checkpoint has no vision tower.";
+    if (eql(u8, key, "kv_quant")) return if (special) "This model keeps no KV cache to quantize." else null;
+    if (eql(u8, key, "mtp")) {
+        if (!fit.serves_mtp) return "This model serves without a speculative head.";
+        if (!fit.mtp_head) return "This pack ships no MTP head.";
+        if (fit.streaming_required and !fit.head_streams) return "This pack streams its experts, and its MTP head cannot run while they stream.";
+        return null;
+    }
+    if (eql(u8, key, "mtp_acceptance") or eql(u8, key, "mtp_greedy_tail")) {
+        if (special) return "Drafts are accepted by the exact rule only, with no MTP tail.";
+        return unavailable("mtp", fit);
+    }
+    if (eql(u8, key, "preserve_thinking")) return if (fit.template_preserves_thinking) null else "This model's chat template has no preserve-thinking switch.";
+    if (eql(u8, key, "think_penalty")) return if (fit.template_thinks) null else "This model's chat template has no thinking span to penalise.";
+    return null;
+}
+
 pub fn applies(key: []const u8, fit: Fit) bool {
-    const special = std.mem.eql(u8, fit.arch, prefetch_arch);
-    if (std.mem.eql(u8, key, "ssd_budget_gb")) return fit.streams_experts;
-    if (std.mem.eql(u8, key, "ssd_prefetch")) return special;
-    if (std.mem.eql(u8, key, "vision")) return fit.has_vision;
-    if (std.mem.eql(u8, key, "kv_quant") or std.mem.eql(u8, key, "mtp_acceptance") or std.mem.eql(u8, key, "mtp_greedy_tail")) return !special;
-    return true;
+    return unavailable(key, fit) == null;
+}
+
+/// A pack that does not require streaming is started streaming by `ssd_budget_gb`, which drops a head that cannot stream.
+fn budgetDropsHead(fit: Fit) bool {
+    return fit.streams_experts and !fit.streaming_required and !fit.head_streams;
+}
+
+/// Whether the model's cache stores `choice` of `key`.
+pub fn choiceAllowed(key: []const u8, choice: []const u8, fit: Fit) bool {
+    if (!fit.latent_kv or !std.mem.eql(u8, key, "kv_quant")) return true;
+    const stored = kv_quant.KVQuantConfig.fromJsonValue(.{ .string = choice }) orelse return false;
+    return stored.glmLatentBits() != null;
+}
+
+pub const Limit = struct {
+    /// The key does nothing for this model.
+    disabled: bool = false,
+    /// The largest value the model takes; 0 = no bound.
+    max: u32 = 0,
+    /// Takes effect only while `mtp` is not false (unset counts as on).
+    requires_mtp: bool = false,
+    /// Takes effect only while none of these keys is set.
+    unset: []const []const u8 = &.{},
+    why: []const u8 = "",
+
+    pub fn isEmpty(self: Limit) bool {
+        return !self.disabled and self.max == 0 and !self.requires_mtp and self.unset.len == 0;
+    }
+};
+
+const unset_budget = [_][]const u8{"ssd_budget_gb"};
+
+/// What the settings page may offer for `key` on this model, besides the choices `choiceAllowed` keeps.
+pub fn limit(key: []const u8, fit: Fit) Limit {
+    const eql = std.mem.eql;
+    if (unavailable(key, fit)) |why| return .{ .disabled = true, .why = why };
+    var l: Limit = .{};
+    const tail = eql(u8, key, "mtp_acceptance") or eql(u8, key, "mtp_greedy_tail");
+    if ((tail or eql(u8, key, "mtp")) and budgetDropsHead(fit)) {
+        l.unset = &unset_budget;
+        l.why = "An SSD budget makes this model stream its experts, and its MTP head cannot run while they stream.";
+    }
+    if (tail) {
+        l.requires_mtp = true;
+        if (l.why.len == 0) l.why = "Used only while MTP is on.";
+    }
+    if (eql(u8, key, "ctx_size")) l.max = fit.context_cap;
+    return l;
+}
+
+pub fn maxWhy(buf: []u8, max: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "This model's context window is {d} tokens.", .{max}) catch "Above this model's context window.";
+}
+
+pub const Refusal = struct { key: []const u8, why: []const u8 };
+
+/// The first of `edits` the model cannot honour, judged against the settings the file would hold after them. Only what an
+/// edit sets is judged: a removal is always allowed, and a value already in the file stays.
+pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u8) ?Refusal {
+    for (edits) |e| {
+        const v = e.value orelse continue;
+        const lim = limit(e.key, fit);
+        if (lim.disabled) return .{ .key = e.key, .why = lim.why };
+        if (v == .string and !choiceAllowed(e.key, v.string, fit)) return .{ .key = e.key, .why = "This model's cache cannot store that width." };
+        if (lim.max > 0 and v == .integer and v.integer > lim.max) return .{ .key = e.key, .why = maxWhy(buf, lim.max) };
+        if (lim.requires_mtp) if (stateOf(existing, edits, "mtp")) |m| if (m == .bool and !m.bool) return .{ .key = e.key, .why = "Used only while MTP is on." };
+        for (lim.unset) |other| if (stateOf(existing, edits, other) != null) return .{ .key = e.key, .why = lim.why };
+    }
+    return null;
+}
+
+/// A key's value once `edits` land on `existing`; null = unset.
+fn stateOf(existing: ?std.json.ObjectMap, edits: []const Edit, key: []const u8) ?std.json.Value {
+    for (edits) |e| if (std.mem.eql(u8, e.key, key)) return e.value;
+    if (existing) |o| if (o.get(key)) |v| return if (v == .null) null else v;
+    return null;
 }
 
 /// The one stored spelling of a value, for a key that has several (`kv_quant`: 0, 16, "16" and "off" are one choice).
@@ -589,7 +707,7 @@ test "model_settings: applies: a key shows only for a model the loader would hon
     for ([_][]const u8{ "kv_quant", "mtp_acceptance", "mtp_greedy_tail" }) |k| try t.expect(!applies(k, dsv));
     for ([_][]const u8{ "ssd_budget_gb", "ssd_prefetch", "vision", "mtp", "ctx_size", "preserve_thinking", "think_penalty" }) |k| try t.expect(applies(k, dsv));
 
-    const resident: Fit = .{ .arch = "glm5_next", .streams_experts = false, .has_vision = false };
+    const resident: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false };
     for ([_][]const u8{ "ssd_budget_gb", "ssd_prefetch", "vision" }) |k| try t.expect(!applies(k, resident));
     for ([_][]const u8{ "kv_quant", "mtp", "mtp_acceptance", "mtp_greedy_tail", "ctx_size" }) |k| try t.expect(applies(k, resident));
 
@@ -886,4 +1004,70 @@ test "model_settings: writeEdits keeps what it does not touch, round-trips throu
 
     try tmp.dir.writeFile(io, .{ .sub_path = "sub/model-settings.json", .data = "[1,2" });
     try t.expectError(error.MalformedSettingsFile, writeEdits(t.allocator, io, path, "/m/a", &.{.{ .key = "mtp", .value = .{ .bool = true } }}));
+}
+
+test "model_settings: limits: each arch and pack variant is offered only what the loader honours" {
+    const t = std.testing;
+    const latent: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false, .context_cap = 4096 };
+    try t.expect(choiceAllowed("kv_quant", "off", latent));
+    try t.expect(choiceAllowed("kv_quant", "6", latent));
+    try t.expect(choiceAllowed("kv_quant", "8", latent));
+    try t.expect(!choiceAllowed("kv_quant", "4", latent));
+    try t.expect(choiceAllowed("kv_quant", "4", .{ .arch = "a", .streams_experts = false, .has_vision = false }));
+    for ([_][]const u8{ "mtp", "mtp_acceptance", "mtp_greedy_tail" }) |k| {
+        try t.expect(!applies(k, latent));
+        try t.expect(limit(k, latent).disabled);
+        try t.expect(limit(k, latent).why.len > 0);
+    }
+    try t.expectEqual(@as(u32, 4096), limit("ctx_size", latent).max);
+
+    const headless: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .mtp_head = false };
+    for ([_][]const u8{ "mtp", "mtp_acceptance", "mtp_greedy_tail" }) |k| try t.expect(!applies(k, headless));
+
+    const dsv: Fit = .{ .arch = prefetch_arch, .streams_experts = true, .has_vision = true, .streaming_required = true, .stq_experts = false };
+    try t.expect(!applies("ssd_prefetch", dsv));
+    try t.expect(applies("mtp", dsv));
+    try t.expect(applies("ssd_prefetch", .{ .arch = prefetch_arch, .streams_experts = true, .has_vision = true }));
+
+    const dropped: Fit = .{ .arch = "a", .streams_experts = true, .has_vision = false, .head_streams = false };
+    try t.expectEqualStrings("ssd_budget_gb", limit("mtp", dropped).unset[0]);
+    try t.expectEqual(@as(usize, 1), limit("mtp_acceptance", dropped).unset.len);
+    try t.expect(limit("mtp_acceptance", dropped).requires_mtp);
+    try t.expect(!limit("mtp", dropped).requires_mtp);
+    try t.expect(limit("mtp", .{ .arch = "a", .streams_experts = true, .has_vision = false }).isEmpty());
+
+    var forced = dropped;
+    forced.streaming_required = true;
+    for ([_][]const u8{ "mtp", "mtp_acceptance", "mtp_greedy_tail" }) |k| try t.expect(!applies(k, forced));
+
+    const plain: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .template_preserves_thinking = false, .template_thinks = false };
+    try t.expect(!applies("preserve_thinking", plain));
+    try t.expect(!applies("think_penalty", plain));
+}
+
+test "model_settings: refuseEdits: a value or pair the model cannot honour is refused, a removal or a kept file value never" {
+    const t = std.testing;
+    var buf: [128]u8 = undefined;
+    const latent: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false, .context_cap = 4096 };
+    try t.expectEqualStrings("kv_quant", refuseEdits(latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "4" } }}, &buf).?.key);
+    try t.expect(refuseEdits(latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "6" } }}, &buf) == null);
+    try t.expectEqualStrings("mtp", refuseEdits(latent, null, &.{.{ .key = "mtp", .value = .{ .bool = true } }}, &buf).?.key);
+    try t.expect(refuseEdits(latent, null, &.{ .{ .key = "mtp", .value = null }, .{ .key = "mtp_acceptance", .value = null } }, &buf) == null);
+    const over = refuseEdits(latent, null, &.{.{ .key = "ctx_size", .value = .{ .integer = 4097 } }}, &buf).?;
+    try t.expect(std.mem.indexOf(u8, over.why, "4096") != null);
+    try t.expect(refuseEdits(latent, null, &.{.{ .key = "ctx_size", .value = .{ .integer = 4096 } }}, &buf) == null);
+
+    const dropped: Fit = .{ .arch = "a", .streams_experts = true, .has_vision = false, .head_streams = false };
+    var file = try parse(t.allocator, "{\"/m\":{\"mtp\":false,\"ssd_budget_gb\":40}}");
+    defer file.deinit();
+    const held = modelObject(&file, "/m");
+    const accept = Edit{ .key = "mtp_acceptance", .value = .{ .string = "typical" } };
+    try t.expectEqualStrings("mtp_acceptance", refuseEdits(dropped, held, &.{accept}, &buf).?.key);
+    try t.expectEqualStrings("mtp_acceptance", refuseEdits(dropped, null, &.{ accept, .{ .key = "mtp", .value = .{ .bool = false } } }, &buf).?.key);
+    try t.expect(refuseEdits(dropped, held, &.{.{ .key = "ssd_budget_gb", .value = .{ .integer = 50 } }}, &buf) == null);
+    try t.expectEqualStrings("mtp", refuseEdits(dropped, held, &.{.{ .key = "mtp", .value = .{ .bool = true } }}, &buf).?.key);
+    try t.expect(refuseEdits(dropped, held, &.{ .{ .key = "mtp", .value = .{ .bool = true } }, .{ .key = "ssd_budget_gb", .value = null } }, &buf) == null);
+    const resident: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false };
+    try t.expect(refuseEdits(resident, held, &.{accept}, &buf) != null);
+    try t.expect(refuseEdits(resident, null, &.{accept}, &buf) == null);
 }

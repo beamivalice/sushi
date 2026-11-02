@@ -6035,12 +6035,24 @@ pub fn archFlagRefusal(config: *const model_mod.ModelConfig, use: LaunchFlagUse)
 
 /// The facts `model_settings.applies` decides a key's reach from, so the settings API and the loader's ignored-key lines agree.
 pub fn settingsFit(config: *const model_mod.ModelConfig) model_settings.Fit {
-    return .{ .arch = config.model_type, .streams_experts = config.supportsExpertStreaming(), .has_vision = config.has_vision };
+    const latent = config.isGlm5();
+    return .{
+        .arch = config.model_type,
+        .streams_experts = config.supportsExpertStreaming(),
+        .has_vision = config.has_vision,
+        .serves_mtp = !latent,
+        .streaming_required = config.expertStreamingRequired(),
+        .head_streams = expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), config.expert_layout),
+        .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false,
+        .latent_kv = latent,
+        .context_cap = config.contextCap(),
+    };
 }
 
 /// A model-settings.json `ssd_prefetch` on an arch with no expert prefetcher is ignored with this one line, as `kv_quant` is.
+/// A pack of the arch that has one but streams no STQ experts says so at its own load (`dsv41_serving`).
 pub fn settingsSsdPrefetchIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (model_settings.applies("ssd_prefetch", settingsFit(config)) or config.ssd_prefetch_override == null) return null;
+    if (config.isDsv41() or model_settings.applies("ssd_prefetch", settingsFit(config)) or config.ssd_prefetch_override == null) return null;
     return "model-settings.json ssd_prefetch is ignored: this model has no expert prefetcher";
 }
 
@@ -6051,11 +6063,15 @@ pub fn settingsKvQuantIgnoredLine(config: *const model_mod.ModelConfig) ?[]const
     return "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 }
 
-/// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` on deepseek_v41 is ignored with this one line, as `kv_quant` is.
+/// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` where no MTP head runs is ignored with this one line, as `kv_quant` is.
 pub fn settingsMtpIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
     if (model_settings.applies("mtp_acceptance", settingsFit(config))) return null;
     const acceptance = config.mtp_acceptance_override != null;
     const tail = config.mtp_greedy_tail_override != null;
+    if (!config.isDsv41()) {
+        if (acceptance or tail) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored: this load runs no MTP head";
+        return null;
+    }
     if (acceptance and tail) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only, with no MTP tail)";
     if (acceptance) return "model-settings.json mtp_acceptance is ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only)";
     if (tail) return "model-settings.json mtp_greedy_tail is ignored on deepseek_v41 (DSpark has no MTP tail)";
@@ -12215,6 +12231,27 @@ test "deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail wi
     qwen4.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
     qwen4.mtp_greedy_tail_override = true;
     try t.expect(settingsMtpIgnoredLine(&qwen4) == null);
+
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    try t.expect(settingsMtpIgnoredLine(&glm) == null);
+    glm.mtp_greedy_tail_override = true;
+    try t.expect(std.mem.indexOf(u8, settingsMtpIgnoredLine(&glm).?, "mtp_greedy_tail are ignored: this load runs no MTP head") != null);
+}
+
+test "settingsFit: a latent-cache arch stores only the latent widths and serves no MTP head; the cap is the model's window" {
+    const t = std.testing;
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next", .max_position_embeddings = 131072 };
+    const fit = settingsFit(&glm);
+    try t.expect(fit.latent_kv and !fit.serves_mtp);
+    try t.expectEqual(@as(u32, 131072), fit.context_cap);
+    try t.expect(!model_settings.choiceAllowed("kv_quant", "4", fit));
+    try t.expect(model_settings.choiceAllowed("kv_quant", "6", fit));
+    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    try t.expect(!settingsFit(&qwen4).latent_kv and settingsFit(&qwen4).serves_mtp);
+    // A DSpark pack without STQ experts has no prefetcher, and says so at its own load.
+    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .ssd_prefetch_override = 30 };
+    try t.expect(!model_settings.applies("ssd_prefetch", settingsFit(&dsv41)));
+    try t.expect(settingsSsdPrefetchIgnoredLine(&dsv41) == null);
 }
 
 test "--ssd-prefetch is refused where there is no expert prefetcher, before the weights load, and its model setting is ignored there" {

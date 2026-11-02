@@ -680,6 +680,8 @@ pub const StubMeta = struct {
     hidden_size: u32 = 0,
     num_hidden_layers: u32 = 0,
     max_position_embeddings: u32 = 0,
+    /// The window `ModelConfig.contextCap` derives once loaded (YaRN-scaled where the checkpoint is); 0 = unread.
+    context_cap: u32 = 0,
     quant_bits: u32 = 0,
     expert_quant_rate: ?expert_quant.expert_exl3.Rate = null,
     /// The pack carries an `expert_quant` block: its routed experts are already
@@ -828,6 +830,9 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
 
     var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
+    if (@import("model.zig").parseConfigFromJson(allocator, bytes)) |cfg| {
+        meta.context_cap = cfg.contextCap();
+    } else |_| {}
     if (dir.openFile(io, "generation_config.json", .{})) |gen| {
         defer gen.close(io);
         var gbuf: [4096]u8 = undefined;

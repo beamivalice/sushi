@@ -141,6 +141,16 @@ pub const Message = struct {
     reasoning_content: ?[]const u8 = null,
 };
 
+/// Only a template that names `preserve_thinking` is handed the switch; `--preserve-thinking` and the per-model key do nothing elsewhere.
+pub fn templateTakesPreserveThinking(chat_template: []const u8) bool {
+    return std.mem.indexOf(u8, chat_template, "preserve_thinking") != null;
+}
+
+/// A template with a thinking span: the `think_penalty` needs its closing marker to arm.
+pub fn templateHasThinkSpan(chat_template: []const u8) bool {
+    return std.mem.indexOf(u8, chat_template, "</think>") != null;
+}
+
 /// Chat template configuration loaded from tokenizer_config.json.
 pub const ChatConfig = struct {
     chat_template: []const u8,
@@ -1286,7 +1296,7 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     }
 
     if (chat_config.preserve_thinking) |keep| {
-        if (std.mem.indexOf(u8, chat_config.chat_template, "preserve_thinking") != null) {
+        if (templateTakesPreserveThinking(chat_config.chat_template)) {
             try buf.appendSlice(allocator, if (keep) ",\"preserve_thinking\":true" else ",\"preserve_thinking\":false");
         }
     }

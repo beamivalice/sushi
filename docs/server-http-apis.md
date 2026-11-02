@@ -332,6 +332,17 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
   null while the model is not loaded and otherwise `{key: value|null}` for every key: the file value the load stamped
   (null: the file had none then), in the shape of `settings.<key>.file`, so a page tells "saved differs from loaded".
+  Each row also carries `limits`, an object holding an entry only for a key the model constrains (`model_settings.limit`, read
+  from the same `Fit` the loader's gates use): `disabled: true` (the loader ignores the key; every key missing from `keys` has
+  one), `choices` (the subset a choice key takes: GLM's `kv_quant` is `off|6|8`, the widths its MLA latent stores), `max`
+  (`ctx_size`: the model's context window, YaRN-aware), `requires: {"mtp": true}` (`mtp_acceptance`, `mtp_greedy_tail`: read
+  only while `mtp` is not false, unset counting as on) and `unset: ["ssd_budget_gb"]` (a key the pack ignores while an SSD
+  budget makes it stream, because its MTP head cannot run then), each with a one-sentence `why`. A POST for a model refuses
+  with a 400 `invalid_setting` naming the key and the reason a non-null value of a disabled key, a choice or integer outside
+  its limit, and a set key whose `requires`/`unset` fails against the file plus the request; removing a key and any value
+  already in the file pass, and the loader still never refuses a load over the file. Not in `limits`: bounds that need the
+  machine's memory or the pack's weight bill (the smallest `ssd_budget_gb`, a tower beside a small budget, the memory-safe
+  `ctx_size`); the load refuses those by name.
   `kv_quant` is a choice name (`off`, `4`, `6`, `8`) wherever it is read or written; a request may say `0`, `16`, `"16"` or `"off"`
   and the file stores `"off"`. Unknown keys are a 400 `unknown_setting`, a bad value a 400 `invalid_setting`, a `models_dir` that is not a readable
   folder a 400, an unknown model a 404, a settings file that is not a JSON object a 409; every key is checked before anything

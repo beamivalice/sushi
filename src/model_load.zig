@@ -184,6 +184,10 @@ pub fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
 pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
+    if (config.isGlm5()) if (o.kv_quant) |k| if (k.glmLatentBits() == null) {
+        config.kv_quant_override = null;
+        log.warn("[model-settings] kv_quant {s} ignored: the MLA latent is stored at off, 6 or 8 bits\n", .{k.wireName()});
+    };
     config.mtp_override = o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
@@ -247,6 +251,15 @@ pub fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config:
     const layout = expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer) catch return false;
     if (config.isDsv41() and !@import("dsv41/dsv41_source.zig").shipsDspark(io, allocator, model_dir)) return false;
     return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), layout);
+}
+
+/// Does the pack in `model_dir` ship the head its arch drafts with: Flash-Next's MTP head, MiMo's heads, DeepSeek's DSpark stages?
+pub fn packShipsMtpHead(io: std.Io, allocator: std.mem.Allocator, model_type: []const u8, model_dir: []const u8) bool {
+    const probe = ModelConfig{ .model_type = model_type };
+    if (probe.isQwen4()) return model_discovery.readStubMeta(io, allocator, model_dir).has_mtp;
+    if (probe.isMimo()) return (model_mod.mimoMtpResidentBytes(io, allocator, model_dir) catch 0) > 0;
+    if (probe.isDsv41()) return @import("dsv41/dsv41_source.zig").shipsDspark(io, allocator, model_dir);
+    return false;
 }
 
 /// An engine-default MTP under expert streaming resolves off (`expert_stream.mtpUnderStreaming`):
@@ -328,6 +341,17 @@ test "an explicit launch flag outranks model-settings.json for MTP, acceptance, 
     try testing.expectEqual(model_settings.Source.flag, flagged.greedy_tail.source);
     try testing.expectEqualStrings("kv4", flagged.kv.label());
     try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
+}
+
+test "a model-settings kv_quant the MLA latent cannot store is dropped at stamping, never a refused load" {
+    var glm = ModelConfig{ .model_type = "glm5_next" };
+    applyModelSettings(&glm, .{ .kv_quant = transformer_mod.KVQuantConfig.affine(4) });
+    try testing.expect(glm.kv_quant_override == null);
+    applyModelSettings(&glm, .{ .kv_quant = transformer_mod.KVQuantConfig.affine(6) });
+    try testing.expectEqual(@as(u8, 6), glm.kv_quant_override.?.bits);
+    var qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    applyModelSettings(&qwen, .{ .kv_quant = transformer_mod.KVQuantConfig.affine(4) });
+    try testing.expectEqual(@as(u8, 4), qwen.kv_quant_override.?.bits);
 }
 
 test "an explicit --mtp keeps the head on a streamed load, or refuses when it cannot" {
@@ -1988,7 +2012,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
     }
-    if (std.mem.indexOf(u8, params.chat_config.chat_template, "preserve_thinking") != null) {
+    if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config.chat_template)) {
         const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", model_settings.sourceLabel(keep.source, "--preserve-thinking") });
     }

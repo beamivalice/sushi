@@ -11,6 +11,10 @@ const server = @import("server.zig");
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
 const model_mod = @import("model.zig");
+const model_load = @import("model_load.zig");
+const models_api = @import("models_api.zig");
+const expert_stream = @import("expert_stream.zig");
+const chat = @import("chat.zig");
 
 const Edit = model_settings.Edit;
 
@@ -22,8 +26,10 @@ pub const ModelRow = struct {
     path: []const u8,
     state: []const u8,
     bytes: ?u64,
-    /// What the key gates read (`model_settings.applies`).
+    /// What the key gates and value limits read (`model_settings.limit`).
     fit: model_settings.Fit = .{ .arch = "", .streams_experts = false, .has_vision = false },
+    /// A stub's discovery found every shard its expert index names.
+    index_complete: bool = false,
     /// The file values a ready model's load stamped; null for a model that is not loaded.
     loaded: ?model_settings.Override = null,
     tier: ?TierView = null,
@@ -94,6 +100,46 @@ fn writeKey(w: *std.Io.Writer, spec: model_settings.KeySpec, file_value: ?std.js
     try w.writeAll(",\"flag\":");
     if (pinned) try writeJson(w, lock.?.text()) else try w.writeAll("null");
     try w.print(",\"source\":\"{s}\",\"locked\":{}}}", .{ if (pinned) "flag" else if (valid) "file" else "default", pinned });
+}
+
+/// What a model's keys may be set to, for every key with a constraint: `disabled` (the key does nothing), `choices` (the
+/// subset it stores), `max`, `requires` (another key's value it needs) and `unset` (keys that must stay unset), each with a `why`.
+fn writeLimits(w: *std.Io.Writer, fit: model_settings.Fit) !void {
+    try w.writeAll("{");
+    var first = true;
+    for (model_settings.model_keys) |k| {
+        const l = model_settings.limit(k.name, fit);
+        var kept: [8][]const u8 = undefined;
+        var n_kept: usize = 0;
+        for (k.choices) |c| if (model_settings.choiceAllowed(k.name, c, fit) and n_kept < kept.len) {
+            kept[n_kept] = c;
+            n_kept += 1;
+        };
+        const narrowed = k.choices.len > 0 and n_kept < k.choices.len;
+        if (l.isEmpty() and !narrowed) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("\"{s}\":{{", .{k.name});
+        if (l.disabled) try w.writeAll("\"disabled\":true,");
+        if (narrowed) {
+            try w.writeAll("\"choices\":");
+            try writeJson(w, kept[0..n_kept]);
+            try w.writeAll(",");
+        }
+        if (l.max > 0) try w.print("\"max\":{d},", .{l.max});
+        if (l.requires_mtp) try w.writeAll("\"requires\":{\"mtp\":true},");
+        if (l.unset.len > 0) {
+            try w.writeAll("\"unset\":");
+            try writeJson(w, l.unset);
+            try w.writeAll(",");
+        }
+        var buf: [96]u8 = undefined;
+        const why = if (l.why.len > 0) l.why else if (l.max > 0) model_settings.maxWhy(&buf, l.max) else "This model's cache stores only these widths.";
+        try w.writeAll("\"why\":");
+        try writeJson(w, why);
+        try w.writeAll("}");
+    }
+    try w.writeAll("}");
 }
 
 pub fn render(
@@ -171,7 +217,9 @@ pub fn render(
             first_key = false;
             try writeJson(w, k.name);
         };
-        try w.writeAll("],\"loaded_with\":");
+        try w.writeAll("],\"limits\":");
+        try writeLimits(w, row.fit);
+        try w.writeAll(",\"loaded_with\":");
         if (row.loaded) |o| {
             try w.writeAll("{");
             for (model_settings.model_keys, 0..) |k, ki| {
@@ -268,37 +316,66 @@ fn stateName(s: model_registry_mod.LoadState) []const u8 {
 }
 
 /// What an unloaded model's config.json says, read without the registry lock.
-fn stubFit(io: std.Io, allocator: std.mem.Allocator, arch: []const u8, path: []const u8) model_settings.Fit {
-    const sm = model_discovery.readStubMeta(io, allocator, path);
+fn stubFit(io: std.Io, allocator: std.mem.Allocator, row: *const ModelRow) model_settings.Fit {
+    const arch = row.fit.arch;
+    const sm = model_discovery.readStubMeta(io, allocator, row.path);
     const geometry = sm.found and sm.hidden_size > 0 and sm.num_hidden_layers > 0 and sm.num_experts > 0 and
         sm.num_experts_per_tok > 0 and sm.moe_intermediate_size > 0;
-    return .{ .arch = arch, .streams_experts = geometry and expert_quant.isExpertStreamingArch(arch), .has_vision = sm.has_vision };
+    const probe = model_mod.ModelConfig{ .model_type = arch };
+    const latent = probe.isGlm5();
+    const layout: expert_quant.Layout = if (sm.quantized_experts) .exl3_k4 else .mxfp4_w123;
+    return .{
+        .arch = arch,
+        .streams_experts = geometry and expert_quant.isExpertStreamingArch(arch),
+        .has_vision = sm.has_vision,
+        .serves_mtp = !latent,
+        .streaming_required = probe.isDsv41() or models_api.streamingRequiredMarker(arch, sm.quant_bits, sm.quantized_experts, geometry, row.index_complete),
+        .head_streams = expert_stream.streamedMtpHeadSupported(probe.isQwen4(), probe.isDsv41(), layout),
+        .stq_experts = sm.quantized_experts,
+        .latent_kv = latent,
+        .context_cap = sm.context_cap,
+    };
+}
+
+/// The facts only the pack's files hold, read for a loaded model as for a stub: its head, and for a stub its chat template.
+fn readPackFacts(io: std.Io, allocator: std.mem.Allocator, row: *ModelRow) void {
+    if (row.loaded == null) row.fit = stubFit(io, allocator, row);
+    row.fit.mtp_head = model_load.packShipsMtpHead(io, allocator, row.fit.arch, row.path);
+    if (row.loaded != null) return;
+    var chat_config = chat.loadChatConfig(io, allocator, row.path) catch return;
+    defer chat_config.deinit();
+    row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(chat_config.chat_template);
+    row.fit.template_thinks = chat.templateHasThinkSpan(chat_config.chat_template);
+}
+
+/// An entry's row from what the registry holds; the caller holds its lock.
+fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
+    var row: ModelRow = .{ .id = e.id, .path = e.path, .state = stateName(e.state), .bytes = e.bytes_on_disk, .index_complete = e.streaming_index_complete };
+    row.fit.arch = e.arch_hint;
+    if (e.state == .ready and e.config != null) {
+        const c = e.config.?;
+        row.fit = server.settingsFit(c);
+        row.loaded = loadedWith(c);
+        if (e.chat_config) |cc| {
+            row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(cc.chat_template);
+            row.fit.template_thinks = chat.templateHasThinkSpan(cc.chat_template);
+        }
+        const snap = e.disk_stats.snapshot();
+        if (snap.namespace != 0) row.tier = .{ .cap_bytes = snap.budget, .used_bytes = snap.used };
+    }
+    return row;
 }
 
 fn collectRows(allocator: std.mem.Allocator, registry: *model_registry_mod.ModelRegistry) ![]ModelRow {
     var rows = std.ArrayList(ModelRow).empty;
     errdefer rows.deinit(allocator);
-    var stubs = std.ArrayList(usize).empty;
-    defer stubs.deinit(allocator);
     {
         registry.mutex.lockUncancelable(registry.io);
         defer registry.mutex.unlock(registry.io);
         var it = registry.entries.valueIterator();
-        while (it.next()) |p| {
-            const e = p.*;
-            var row: ModelRow = .{ .id = e.id, .path = e.path, .state = stateName(e.state), .bytes = e.bytes_on_disk };
-            row.fit.arch = e.arch_hint;
-            if (e.state == .ready and e.config != null) {
-                const c = e.config.?;
-                row.fit = server.settingsFit(c);
-                row.loaded = loadedWith(c);
-                const snap = e.disk_stats.snapshot();
-                if (snap.namespace != 0) row.tier = .{ .cap_bytes = snap.budget, .used_bytes = snap.used };
-            } else try stubs.append(allocator, rows.items.len);
-            try rows.append(allocator, row);
-        }
+        while (it.next()) |p| try rows.append(allocator, heldRow(p.*));
     }
-    for (stubs.items) |i| rows.items[i].fit = stubFit(registry.io, allocator, rows.items[i].fit.arch, rows.items[i].path);
+    for (rows.items) |*row| readPackFacts(registry.io, allocator, row);
     std.mem.sort(ModelRow, rows.items, {}, struct {
         fn lt(_: void, a: ModelRow, b: ModelRow) bool {
             return std.mem.lessThan(u8, a.id, b.id);
@@ -337,6 +414,13 @@ fn dirReadable(io: std.Io, path: []const u8) bool {
     return true;
 }
 
+/// The 400 text for the first edit this model cannot honour, or null.
+fn refusalMessage(arena: std.mem.Allocator, fit: model_settings.Fit, existing: ?std.json.ObjectMap, edits: []const Edit) ?[]const u8 {
+    var why_buf: [128]u8 = undefined;
+    const r = model_settings.refuseEdits(fit, existing, edits, &why_buf) orelse return null;
+    return std.fmt.allocPrint(arena, "\"{s}\" cannot be set for this model: {s}", .{ r.key, r.why }) catch "a setting this model cannot honour";
+}
+
 pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
     const sch = server.global_scheduler orelse {
         try server.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
@@ -361,6 +445,8 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             return;
         }
     };
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = model_settings.defaultPath(&path_buf);
     var model_path: []const u8 = "";
     var model_loaded = false;
     if (plan.model_id) |id| {
@@ -371,12 +457,20 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         model_path = entry.path;
         sch.registry.mutex.lockUncancelable(sch.io);
         model_loaded = entry.state == .ready;
+        var row = heldRow(entry);
         sch.registry.mutex.unlock(sch.io);
+        if (plan.model_edits.len > 0) {
+            readPackFacts(stream.io, allocator, &row);
+            var held = model_settings.load(allocator, stream.io, path);
+            defer held.deinit();
+            if (refusalMessage(arena, row.fit, model_settings.modelObject(&held, model_path), plan.model_edits)) |message| {
+                try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
+                return;
+            }
+        }
     }
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var message_buf: [160]u8 = undefined;
-    const path = model_settings.defaultPath(&path_buf);
     const write = struct {
         fn run(a: std.mem.Allocator, io: std.Io, p: []const u8, section: []const u8, edits: []const Edit) !void {
             if (edits.len > 0) try model_settings.writeEdits(a, io, p, section, edits);
@@ -555,6 +649,60 @@ test "settings api: render names the keys a model honours, what a loaded model l
     const b = root.get("models").?.array.items[1].object;
     try testing.expect(b.get("loaded_with").? == .null);
     for (b.get("keys").?.array.items) |k| try testing.expect(!std.mem.startsWith(u8, k.string, "ssd_"));
+}
+
+test "settings api: each model lists the limits its arch and pack put on its keys, and nothing for a key it does not constrain" {
+    var file = try model_settings.parse(testing.allocator, "{}");
+    defer file.deinit();
+    const locks: model_settings.LaunchLocks = .{};
+    const rows = [_]ModelRow{
+        .{ .id = "latent", .path = "/m/a", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false, .context_cap = 131072 } },
+        .{ .id = "dropped", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "b", .streams_experts = true, .has_vision = false, .head_streams = false } },
+        .{ .id = "plain", .path = "/m/c", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "c", .streams_experts = true, .has_vision = true } },
+        .{ .id = "bare", .path = "/m/d", .state = "unloaded", .bytes = 5, .fit = .{ .arch = model_settings.prefetch_arch, .streams_experts = true, .has_vision = true, .template_preserves_thinking = false } },
+    };
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const models = parsed.value.object.get("models").?.array.items;
+
+    const latent = models[0].object.get("limits").?.object;
+    const kv = latent.get("kv_quant").?.object;
+    try testing.expectEqual(@as(usize, 3), kv.get("choices").?.array.items.len);
+    try testing.expectEqualStrings("6", kv.get("choices").?.array.items[1].string);
+    try testing.expect(latent.get("mtp").?.object.get("disabled").?.bool);
+    try testing.expect(latent.get("mtp_acceptance").?.object.get("disabled").?.bool);
+    try testing.expect(latent.get("mtp").?.object.get("why").?.string.len > 0);
+    try testing.expectEqual(@as(i64, 131072), latent.get("ctx_size").?.object.get("max").?.integer);
+
+    const dropped = models[1].object.get("limits").?.object;
+    try testing.expectEqualStrings("ssd_budget_gb", dropped.get("mtp").?.object.get("unset").?.array.items[0].string);
+    try testing.expect(dropped.get("mtp_greedy_tail").?.object.get("requires").?.object.get("mtp").?.bool);
+    try testing.expect(dropped.get("kv_quant") == null);
+
+    const plain = models[2].object.get("limits").?.object;
+    for ([_][]const u8{ "kv_quant", "mtp", "ctx_size", "ssd_budget_gb", "vision", "preserve_thinking", "think_penalty" }) |k| try testing.expect(plain.get(k) == null);
+    try testing.expect(plain.get("ssd_prefetch").?.object.get("disabled").?.bool);
+    try testing.expect(plain.get("mtp_acceptance").?.object.get("unset") == null);
+
+    const bare = models[3].object.get("limits").?.object;
+    try testing.expect(bare.get("kv_quant").?.object.get("disabled").?.bool);
+    try testing.expect(bare.get("preserve_thinking").?.object.get("disabled").?.bool);
+    try testing.expect(bare.get("ssd_prefetch") == null);
+}
+
+test "settings api: a save the model cannot honour is refused with its reason, a removal never" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const latent: model_settings.Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false };
+    const four = refusalMessage(arena, latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "4" } }}).?;
+    try testing.expect(std.mem.indexOf(u8, four, "\"kv_quant\"") != null);
+    try testing.expect(refusalMessage(arena, latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "off" } }}) == null);
+    const mtp = refusalMessage(arena, latent, null, &.{.{ .key = "mtp", .value = .{ .bool = false } }}).?;
+    try testing.expect(std.mem.indexOf(u8, mtp, "speculative head") != null);
+    try testing.expect(refusalMessage(arena, latent, null, &.{.{ .key = "mtp", .value = null }}) == null);
 }
 
 test "settings api: render reports the file's value, the pinning flag and the winner per key" {
