@@ -367,7 +367,12 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   for the reload prompt) and `limits` (per key: `disabled`, `choices`, `max`, `requires`, `unset`, each with a `why`
   the page shows on the row; a key outside `keys` with a `disabled` limit shows greyed in Advanced), `kv_quant` as
   `off|4|6|8`, `server.*.flag` as the flag's own text, `server.prefix_cache_disk_gb.ask_bytes`, and `POST
-  /v1/prefix-cache/clear {"scope":"namespace","id":...}`. Guards: `tests/test_prefix_cache_admin.sh`,
+  /v1/prefix-cache/clear {"scope":"namespace","id":...}`. A `flag` is printed as the server sends it: a text starting with `--`
+  (`--mtp-tokenv3 0.5`) is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
+  choice shows the choice the spelling names, else "Launch flag". `server.prefix_cache_disk_gb.default_bytes` (the size an unset
+  key resolves to) is optional: the page names "Use default (N GiB)" with it, or from `ask_bytes` while the key is unset, and
+  otherwise says "Use default". The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
+  `/metrics.json` read, which is 503 while metrics are off). Guards: `tests/test_prefix_cache_admin.sh`,
   `node tests/test_webui_admin.cjs` (pure functions), `node tests/test_webui_admin_ui.cjs` (the tabs against a stub).
 
 ## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`)

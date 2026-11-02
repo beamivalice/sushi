@@ -353,6 +353,7 @@ dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2);
 .set .ctl .row-in { display: flex; align-items: center; gap: var(--s2); }
 .set .ctl .hint { font-size: var(--fs-xs); color: var(--text-3); }
 .set .ctl .bad { font-size: var(--fs-xs); color: var(--err); }
+.set .ctl .warn { font-size: var(--fs-xs); color: var(--warn); }
 .set .ctl input[aria-invalid="true"] { border-color: var(--err); }
 .set.locked .ctl input { background: var(--surface-2); color: var(--text-2); }
 .tri { display: grid; grid-template-columns: repeat(3, 1fr); padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
@@ -395,6 +396,8 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 .savebar[hidden] { display: none; }
 .savebar .msg { flex: 1; font-weight: 600; }
 .stale-view { opacity: .55; }
+.md.none { grid-template-columns: 1fr; }
+.md.none .detail { display: none; }
 @media (max-width: 1023px) {
   .md { grid-template-columns: 1fr; }
   .md.detail-open .list, .md:not(.detail-open) .detail { display: none; }
@@ -788,7 +791,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <div id="cacheSet"></div>
       </div>
       <div class="tablewrap"><table class="tbl">
-        <thead><tr><th>Model</th><th class="n">Size</th><th>Last used</th><th></th></tr></thead>
+        <thead><tr><th>Model</th><th class="n">Size</th><th>Last used</th><th class="n adv">Entries</th><th class="adv">ID</th><th class="n adv">Tier use</th><th class="n adv">Written</th><th class="n adv">Write rate</th><th></th></tr></thead>
         <tbody id="cacheRows"></tbody>
       </table></div>
       <div class="card-b"><div class="bulk">
@@ -830,7 +833,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <button class="btn" id="folderChoose" type="button" disabled>Use this folder</button>
   </div>
 </dialog>
-<dialog id="confirmDialog" class="confirm" aria-labelledby="cdTitle">
+<dialog id="confirmDialog" class="confirm" aria-labelledby="cdTitle" aria-describedby="cdBody">
   <h2 id="cdTitle"></h2>
   <p id="cdBody"></p>
   <div class="kv" id="cdRows"></div>
@@ -948,7 +951,11 @@ function confirmAction({ title, body = "", rows = [], confirm = "Confirm", cance
 }
 $("cdOk").onclick = () => $("confirmDialog").close("ok");
 $("cdCancel").onclick = () => $("confirmDialog").close("cancel");
-$("confirmDialog").addEventListener("click", (event) => { if (event.target === event.currentTarget) event.currentTarget.close("cancel"); });
+$("confirmDialog").addEventListener("click", (event) => {
+  const box = event.currentTarget.getBoundingClientRect();
+  const outside = event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom;
+  if (event.target === event.currentTarget && outside) event.currentTarget.close("cancel");
+});
 
 /* Browser storage can throw (private windows, blocked site data), so every access is guarded. */
 function readStore(key) {
@@ -2628,7 +2635,8 @@ function adminBytes(n) {
   n = Number(n) || 0;
   const g = n / 1024 ** 3;
   if (g >= 0.9995) return `${g.toFixed(g >= 99.95 ? 0 : g >= 9.995 ? 1 : 2)} GiB`;
-  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(0)} MiB`;
+  const m = n / 1024 ** 2;
+  if (m >= 1) return `${m.toFixed(m >= 99.95 ? 0 : m >= 9.995 ? 1 : 2)} MiB`;
   return `${Math.round(n / 1024)} KiB`;
 }
 function adminTokens(n) {
@@ -2672,10 +2680,14 @@ function adminChanges(specs, settings, texts, badInput = {}) {
     if (settings[spec.name]?.locked || !(spec.name in texts)) continue;
     const parsed = adminControlValue(spec, texts[spec.name], badInput[spec.name]);
     if (!parsed.ok) return { set: {}, bad: spec.name };
-    const file = adminFileText(settings[spec.name]?.file);
-    if (parsed.value === null ? file !== "" : String(parsed.value) !== file) set[spec.name] = parsed.value;
+    if (!adminSameAsFile(parsed, settings[spec.name]?.file)) set[spec.name] = parsed.value;
   }
   return { set, bad: null };
+}
+// A parsed control against the file's value: "065536" is the saved 65536.
+function adminSameAsFile(parsed, file) {
+  const saved = adminFileText(file);
+  return parsed.value === null ? saved === "" : String(parsed.value) === saved;
 }
 // The server's message, or one short line; never a page of HTML.
 function adminErrorText(e) {
@@ -2737,7 +2749,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     ctx_size: ["Context size", "Tokens of context the model serves. Empty: the server sizes it to memory.", "--ctx-size"],
     kv_quant: ["KV cache precision", "Bits per value in the KV cache. 8-bit is the default for most packs; 16-bit (off) is exact and twice the size.", "--kv-quant"],
     mtp: ["Multi-token prediction", "Drafts tokens with the model's own head, for faster replies. Default: on where the pack has one.", "--mtp"],
-    mtp_acceptance: ["MTP acceptance", "How a drafted token is accepted. Exact keeps output identical to plain decoding.", "--mtp-typical"],
+    mtp_acceptance: ["MTP acceptance", "How a drafted token is accepted. Exact keeps output identical to plain decoding.", ""],
     mtp_greedy_tail: ["MTP greedy tail", "Accept the last drafted token greedily.", "--mtp-greedy-tail"],
     ssd_budget_gb: ["SSD expert budget (GiB)", "Memory the streamed experts may use, in GiB. More memory, fewer SSD reads.", "--ssd-budget-gb"],
     ssd_prefetch: ["SSD prefetch (%)", "Share of the SSD's read rate the expert prefetch may use. 0 turns prefetch off.", "--ssd-prefetch"],
@@ -2748,12 +2760,20 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb"];
   const KV_LABEL = { off: "16-bit (off)", 4: "4-bit", 6: "6-bit", 8: "8-bit" };
   const choiceLabel = (key, v) => (key === "kv_quant" ? KV_LABEL[v] : null) ?? v;
-  const isOff = (flag) => flag === "off" || flag === "false";
-  const flagText = (key, flag) => key === "mtp" || key === "vision" ? KEY[key][2].replace("--", isOff(flag) ? "--no-" : "--") : key === "mtp_greedy_tail" ? KEY[key][2] : `${KEY[key][2]} ${flag}`;
-  const flagShown = (spec, flag) => spec.type === "choice" ? choiceLabel(spec.name, adminFileText(flag)) : String(flag);
+  const isOff = (flag) => flag === "off" || flag === "false" || /^--no-/.test(flag);
+  // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
+  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk" }[key] ?? "";
+  const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : key === "mtp_greedy_tail" ? flagName(key) : flagName(key) ? `${flagName(key)} ${flag}` : "";
+  const flagHelp = (key, flag) => { const text = flagText(key, flag); return `Set by ${text ? `${text} at launch` : "a launch flag"}. Start sushi without the flag to change it here.`; };
+  const flagShown = (spec, flag) => {
+    if (spec.type !== "choice") return String(flag);
+    const text = adminFileText(flag), hit = spec.choices.includes(text) ? text : spec.choices.find((c) => text.split(/[\s=-]+/).includes(c));
+    return hit ? choiceLabel(spec.name, hit) : "Launch flag";
+  };
 
   const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
-    sel: null, form: null, per: new Map(), cacheText: null, dirText: null, timer: null, tbody: "" };
+    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, timer: null, retry: null, tbody: "",
+    busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
   // One fetch per kind: an older answer is dropped, an unchanged one returns undefined.
@@ -2779,22 +2799,34 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const wide = () => window.matchMedia("(min-width: 1024px)").matches;
   const hashId = () => { try { return decodeURIComponent(location.hash.slice(1)); } catch { return ""; } };
 
+  // The write rate of each namespace's tier, from the cumulative `written_bytes` of two polls. A gap, a restarted tier or a
+  // reset view shows no rate rather than one built across it.
+  function sampleWrites(c, now) {
+    const prev = A.wsample;
+    if (prev && now - prev.t < 2000) return;
+    const cur = new Map(c.namespaces.filter((n) => n.tier).map((n) => [n.id, n.tier.written_bytes]));
+    A.rates = new Map();
+    if (prev && now - prev.t < 60_000) for (const [id, bytes] of cur) if (prev.cur.has(id) && bytes >= prev.cur.get(id)) A.rates.set(id, (bytes - prev.cur.get(id)) / ((now - prev.t) / 1000));
+    A.wsample = { t: now, cur };
+  }
   async function refresh() {
     if (A.view !== "models" && A.view !== "settings") return;
     const wantCache = A.view === "settings" || selLoaded();
+    clearTimeout(A.retry);
     try {
       const [s, c] = await Promise.all([pull("settings", "/v1/settings"), wantCache ? pull("cache", "/v1/prefix-cache") : undefined]);
       A.error = null;
       if (s) A.settings = s;
       if (c) A.cache = c;
-    } catch (e) { A.error = adminErrorText(e); }
+      if (wantCache && c !== null && A.cache) sampleWrites(A.cache, Date.now());
+    } catch (e) { A.error = adminErrorText(e); A.retry = setTimeout(refresh, 4000); }
     renderAll();
   }
   function alertIn(node, message, retry) {
     if ((node.dataset.msg ?? "") === (message ?? "")) return;
     node.dataset.msg = message ?? "";
     node.hidden = !message;
-    if (message) node.replaceChildren(h("span", { text: message }), retry ? h("button", { class: "btn sm", type: "button", text: "Retry", onclick: refresh }) : null);
+    if (message) node.replaceChildren(h("span", { text: message }), ...(retry ? [h("button", { class: "btn sm", type: "button", text: "Retry", onclick: refresh })] : []));
   }
 
   // limits[key]: { choices, max, requires: {key: bool}, unset: [keys], disabled, why }, present only for a constrained key.
@@ -2829,7 +2861,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   const isDirty = (id) => !!id && dirtyKeys(id).length > 0;
   // True when the saved file differs from what the loaded model started with.
-  const needsReload = (m) => m.state === "ready" && !!m.loaded_with && specsOf(m).some((spec) => !m.settings[spec.name]?.locked && adminFileText(m.loaded_with[spec.name]) !== adminFileText(m.settings[spec.name]?.file));
+  // A file value the loader drops (a key the model lacks, a choice it cannot store) is never stamped on a load.
+  const dropped = (m, key) => { const lim = m.limits?.[key], file = adminFileText(m.settings[key]?.file); return !!lim?.disabled || (!!lim?.choices && file !== "" && !lim.choices.includes(file)); };
+  const needsReload = (m) => m.state === "ready" && !!m.loaded_with && specsOf(m).some((spec) => !m.settings[spec.name]?.locked && !dropped(m, spec.name) && adminFileText(m.loaded_with[spec.name]) !== adminFileText(m.settings[spec.name]?.file));
+  const rootsInUse = (d) => [...new Set([...d.boot_roots, ...(!d.locked && d.file ? [d.file] : [])])];
   const savedCount = (m) => specsOf(m).filter((spec) => m.settings[spec.name]?.file != null).length;
 
   const dotOf = (m) => modelStore.pending.has(m.id) || m.state === "loading" ? "busy" : { ready: "ok", error: "err" }[m.state] ?? "off";
@@ -2842,27 +2877,40 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     return [m.bytes_on_disk ? adminBytes(m.bytes_on_disk) : "", phrase].filter(Boolean).join(" · ");
   }
   function renderList(rows) {
-    const list = q("modelsList"), filter = q("modelsFilter").value.trim().toLowerCase();
+    const list = q("modelsList");
     setHidden(q("modelsFilterBox"), rows.length <= 6);
+    if (rows.length <= 6 && q("modelsFilter").value) q("modelsFilter").value = "";
+    const filter = q("modelsFilter").value.trim().toLowerCase();
     q("modelsFilter").placeholder = `Filter ${rows.length} models`;
     const shown = rows.filter((m) => !filter || m.id.toLowerCase().includes(filter)).sort((a, b) => a.id.localeCompare(b.id));
     const live = shown.filter(isLoaded), both = live.length && live.length < shown.length;
     const state = (m) => [m.id, dotOf(m), metaOf(m), m.id === A.sel, isDirty(m.id), m.state, modelStore.pending.has(m.id)];
-    const roots = (A.settings?.server.models_dir.boot_roots ?? []).join(", ") || "the models folder";
+    const roots = rootsInUse(A.settings?.server.models_dir ?? { boot_roots: [] }).join(", ") || "the models folder";
     const item = (m) => {
       const canLoad = (m.state === "unloaded" || m.state === "error") && !modelStore.pending.has(m.id);
-      return h("div", { class: "row", role: "option", tabindex: "0", "data-id": m.id, "aria-selected": String(m.id === A.sel), onclick: () => trySelect(m.id), onkeydown: (e) => { if (e.key === "Enter" && e.target === e.currentTarget) trySelect(m.id); } },
+      return h("div", { class: "row", role: "option", tabindex: "0", "data-id": m.id, "aria-selected": String(m.id === A.sel), onclick: () => trySelect(m.id), onkeydown: (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) { e.preventDefault(); trySelect(m.id); } } },
         h("span", { class: `dot ${dotOf(m)}` }), h("div", { class: "main" }, h("div", { class: "name", text: m.id }), h("div", { class: `meta${m.state === "error" && !modelStore.pending.has(m.id) ? " err" : ""}`, text: metaOf(m) })),
         isDirty(m.id) ? h("span", { class: "edit-dot", title: "Unsaved changes" }) : null,
         canLoad ? h("button", { class: "btn sm", type: "button", text: "Load", onclick: (e) => { e.stopPropagation(); modelStore.act(m.id, "load"); } }) : null);
     };
     const group = (t) => h("div", { class: "group-l", text: t });
-    const focused = document.activeElement?.closest?.("#modelsList .row")?.dataset.id;
+    const at = document.activeElement, held = list.contains(at) ? { id: at.closest(".row")?.dataset.id, button: at.tagName === "BUTTON" } : null;
     fill(list, JSON.stringify([shown.map(state), both, rows.length, roots]), () => shown.length
       ? [...(both ? [group("Loaded")] : []), ...live.map(item), ...(both ? [group("On disk")] : []), ...shown.filter((m) => !live.includes(m)).map(item)]
-      : [h("div", { class: "empty" }, h("span", { text: rows.length ? "No model matches the filter." : `No models in ${roots}. Put a pack folder there, or change the folder in Settings.` }), " ", h("button", { class: "btn sm", type: "button", text: "Rescan", onclick: rescan }))]);
-    if (focused) list.querySelector(`[data-id="${CSS.escape(focused)}"]`)?.focus();
+      : [h("div", { class: "empty" }, h("span", { text: rows.length ? "No model matches the filter." : `No models in ${roots}. Put a pack folder there, or change the folder in Settings.` }),
+        ...(rows.length ? [] : [" ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
+    if (held?.id && !list.contains(document.activeElement)) {
+      const r = list.querySelector(`[data-id="${CSS.escape(held.id)}"]`);
+      ((held.button ? r?.querySelector("button") : null) ?? r)?.focus();
+    }
   }
+  q("modelsList").addEventListener("keydown", (e) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+    const rows = [...q("modelsList").querySelectorAll(".row")], at = rows.indexOf(e.target.closest(".row"));
+    if (at < 0) return;
+    e.preventDefault();
+    rows[e.key === "Home" ? 0 : e.key === "End" ? rows.length - 1 : Math.max(0, Math.min(rows.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)))].focus();
+  });
 
   async function leaveOk() {
     const cur = A.sel;
@@ -2878,22 +2926,48 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     renderAll();
     if (selLoaded() && !A.cache) refresh();
   }
+  // With no model in the URL a wide screen opens one, and keeps it: a load elsewhere never moves it under an edit.
   function selectionNow(rows) {
     const want = hashId();
     if (want) return rows.some((m) => m.id === want) ? want : null;
-    return wide() && rows.length ? (rows.find((m) => m.state === "ready") ?? rows.slice().sort((a, b) => a.id.localeCompare(b.id))[0]).id : null;
+    if (!wide() || !rows.length) return null;
+    if (!rows.some((m) => m.id === A.auto)) A.auto = (rows.find((m) => m.state === "ready") ?? rows.slice().sort((a, b) => a.id.localeCompare(b.id))[0]).id;
+    return A.auto;
   }
+  // Back, Forward and a typed hash. Until the leave prompt is answered the old model stays on screen.
   async function onNav() {
-    if (A.view !== "models") return;
-    if (A.sel && hashId() !== A.sel && isDirty(A.sel) && !(await leaveOk())) { history.pushState(null, "", `/models#${encodeURIComponent(A.sel)}`); return; }
+    if (A.view !== "models" || A.leaving || !location.pathname.startsWith("/models")) return;
+    A.auto = null;
+    if (A.sel && selectionNow(rowsOf()) !== A.sel && isDirty(A.sel)) {
+      A.leaving = true;
+      const ok = await leaveOk();
+      A.leaving = false;
+      if (!ok) history.replaceState(null, "", `/models#${encodeURIComponent(A.sel)}`);
+    }
     renderAll();
     if (selLoaded() && !A.cache) refresh();
   }
   window.addEventListener("popstate", onNav);
   window.addEventListener("hashchange", onNav);
   window.addEventListener("beforeunload", (e) => { if ([...A.per.keys()].some(isDirty)) e.preventDefault(); });
+  // Leaving the Models tab by the top bar asks first when the open model has unsaved edits.
+  document.addEventListener("click", async (e) => {
+    const link = e.target.closest?.("#navChat, #navDashboard, #navSettings, #serverDot");
+    if (!link || A.passNav || A.view !== "models" || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || !isDirty(A.sel)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (!(await leaveOk())) return;
+    A.passNav = true;
+    link.click();
+    A.passNav = false;
+  }, true);
   q("modelsFilter").addEventListener("input", () => renderModels());
-  q("modelsBack").addEventListener("click", async () => { if (!(await leaveOk())) return; history.pushState(null, "", "/models"); renderAll(); });
+  async function backToList() {
+    if (!(await leaveOk())) return;
+    history.pushState(null, "", "/models");
+    renderAll();
+  }
+  q("modelsBack").addEventListener("click", backToList);
   q("modelsRescan").addEventListener("click", rescan);
   async function rescan(event) {
     const btn = event?.currentTarget?.tagName === "BUTTON" ? event.currentTarget : q("modelsRescan");
@@ -2908,17 +2982,23 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   function renderModels() {
     if (!A.settings && !modelStore.list.length) return;
-    const rows = rowsOf(), sel = selectionNow(rows);
+    const rows = rowsOf(), sel = A.leaving ? A.sel : selectionNow(rows);
     if (sel !== A.sel) { A.sel = sel; A.form = null; }
-    setText(q("modelsDir"), (A.settings?.server.models_dir.boot_roots ?? []).join(", "));
-    const hasHash = !!hashId(), phoneDetail = hasHash && !wide();
+    setText(q("modelsDir"), A.settings ? rootsInUse(A.settings.server.models_dir).join(", ") : "");
+    const hasHash = A.leaving ? !!A.sel : !!hashId(), phoneDetail = hasHash && !wide();
     q("modelsMd").classList.toggle("detail-open", hasHash);
+    q("modelsMd").classList.toggle("none", !rows.length);
     setHidden(q("modelsBack"), !phoneDetail);
     setHidden(q("modelsRescan"), phoneDetail);
     setText(q("modelsTitle"), phoneDetail && A.sel ? A.sel : "Models");
     renderList(rows);
     const m = rows.find((x) => x.id === A.sel);
-    if (!m) { if (A.form) { A.form = null; q("modelsDetail").replaceChildren(); } return; }
+    if (!m) {
+      A.form = null;
+      const gone = A.leaving ? "" : hashId();
+      fill(q("modelsDetail"), `gone:${gone}`, () => gone ? [h("div", { class: "empty" }, h("span", { text: `Model ${gone} was not found.` }), " ", h("button", { class: "btn sm", type: "button", text: "Back to Models", onclick: backToList }))] : []);
+      return;
+    }
     if (!A.form || A.form.id !== m.id) buildDetail(m);
     patchDetail(m);
   }
@@ -2926,7 +3006,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function badges(node, st, applies) {
     const live = /at once/.test(applies || ""), sig = `${st.locked}|${st.file != null}|${applies}`;
     fill(node, sig, () => [h("span", { class: `badge ${st.locked ? "flag" : st.file != null ? "saved" : ""}` }, ...(st.locked ? [icon("lock", 11), "Launch flag"] : [st.file != null ? "Saved" : "Default"])),
-      ...(applies ? [h("span", { class: `badge ${live ? "live" : ""}`, text: live ? "Applies now" : "On next load" })] : [])]);
+      ...(applies && !st.locked ? [h("span", { class: `badge ${live ? "live" : ""}`, text: live ? "Applies now" : "On next load" })] : [])]);
   }
   function setRow(key, label, forId) {
     const badge = h("span", { class: "badges" }), help = h("div", { class: "help" }), ctl = h("div", { class: "ctl" }), hint = h("div", { class: "hint" }), bad = h("div", { class: "bad", role: "alert" });
@@ -2974,7 +3054,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       patchDetail(m);
     };
     S.control = control(spec, onChange);
-    S.ctl.append(S.control.node, S.hint, S.bad);
+    S.remove = h("button", { class: "btn sm", type: "button", text: "Remove saved value", hidden: true, onclick: () => removeSaved(F, key) });
+    S.ctl.append(S.control.node, S.hint, S.bad, S.remove);
     return S;
   }
   function patchSet(F, S, m) {
@@ -2985,8 +3066,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     S.control.lock(locked || !!why, locked ? s.flag ?? "" : undefined);
     S.control.allow?.(lim?.choices);
     if (!locked && !(key in P.texts) && !S.control.focused()) { const want = adminFileText(s.file); if (S.control.get() !== want) S.control.set(want); }
-    setText(S.help, locked ? `Set by ${flagText(key, s.flag)} at launch. Start sushi without the flag to change it here.` : why || KEY[key][1]);
-    const text = S.control.get(), saved = adminFileText(s.file), changed = !locked && !why && key in P.texts && text !== saved;
+    setText(S.help, locked ? flagHelp(key, s.flag) : why || KEY[key][1]);
+    setHidden(S.remove, locked || !why || s.file == null);
+    const text = S.control.get(), saved = adminFileText(s.file), parsed = adminControlValue(S.spec, text);
+    const changed = !locked && !why && key in P.texts && !(parsed.ok && adminSameAsFile(parsed, s.file));
     S.row.classList.toggle("dirty", changed || !!(P.errors[key] && !why));
     const cut = lim?.choices && S.spec.choices?.filter((c) => !lim.choices.includes(c)).map((c) => choiceLabel(key, c));
     let hint = key === "ctx_size" && text && !P.errors[key] ? `${adminTokens(Number(text))} tokens` : cut?.length ? `${cut.join(", ")} not available for this model${lim.why ? `: ${lim.why}` : "."}` : "";
@@ -3011,6 +3094,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     F.save = h("button", { class: "btn sm primary", type: "button", text: "Save", onclick: () => saveModel(F) });
     F.savebar = h("div", { class: "savebar", hidden: true }, F.saveMsg, F.discard, F.save);
     const lead = h("div", { class: "lead", text: "Saved in model-settings.json. They apply the next time this model loads; a launch flag outranks the file." });
+    delete q("modelsDetail").dataset.sig;
     q("modelsDetail").replaceChildren(h("div", { class: "d-head" }, h("div", { class: "grow" }, F.name, F.facts), F.actions), F.alert,
       h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.callout, F.saveErr, F.rows), F.cacheSect, F.savebar);
   }
@@ -3031,13 +3115,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const words = pend ? (pend === "unload" ? "Unloading…" : "Loading…") : { ready: "Loaded", loading: "Loading…", error: "Load failed" }[m.state] ?? "Not loaded";
     const facts = [m.bytes_on_disk && `${adminBytes(m.bytes_on_disk)} on disk`, m.state === "ready" && m.bytes_resident && `${adminBytes(m.bytes_resident)} in memory`,
       m.context_length && `${adminTokens(m.context_length)} max context`, (m.input_modalities ?? []).includes("image") && "sees images", streamsExperts(m) ? "streams experts" : m.streaming && "can stream experts"].filter(Boolean);
-    fill(F.facts, [dotOf(m), words, ...facts].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map((t) => h("span", { text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
+    fill(F.facts, [dotOf(m), words, ...facts, m.path].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map((t) => h("span", { text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
     fill(F.actions, `${m.state}|${pend ?? ""}`, () => {
       const btn = (text, kind, cls = "", busy = false) => h("button", { class: `btn sm ${cls}`, type: "button", text, disabled: busy, "aria-busy": busy ? "true" : null, onclick: () => actOn(F.id, kind) });
       return pend ? [btn(pend === "unload" ? "Unloading…" : pend === "reload" ? "Reloading…" : "Loading…", "", "primary", true)]
         : m.state === "ready" ? [btn("Reload", "reload"), btn("Unload", "unload")] : m.state === "loading" ? [btn("Loading…", "", "primary", true)] : [btn("Load", "load", "primary")];
     });
-    alertIn(F.alert, !pend && failed ? `Load failed: ${failed}` : !pend && m.state === "error" ? "The last load failed." : "");
+    alertIn(F.alert, !pend && failed && m.state !== "ready" ? `Load failed: ${failed}` : !pend && m.state === "error" ? "The last load failed." : "");
     alertIn(F.saveErr, P.saveError ? `Couldn't save: ${P.saveError}` : "");
     setHidden(F.callout, !needsReload(m));
     const sig = specsOf(m).map((s) => `${s.name}${s.max}`).join();
@@ -3050,8 +3134,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     F.save.disabled = Object.entries(P.errors).some(([k, e]) => e && !whyDisabled(m, k)) || F.save.getAttribute("aria-busy") === "true";
     if (F.more) {
       const changed = F.moreList.filter((s) => keys.includes(s.name)).length, saved = F.moreList.filter((s) => m.settings[s.name]?.file != null).length;
-      setText(F.moreSum, `More settings (${F.moreList.length})${changed ? ` · ${changed} changed` : saved ? ` · ${saved} saved` : ""}`);
-      const open = P.moreOpen ?? modeNow() === "advanced";
+      const invalid = F.moreList.filter((s) => P.errors[s.name] && !whyDisabled(m, s.name)).length;
+      setText(F.moreSum, `More settings (${F.moreList.length})${invalid ? ` · ${invalid} invalid` : changed ? ` · ${changed} changed` : saved ? ` · ${saved} saved` : ""}`);
+      const open = invalid > 0 || (P.moreOpen ?? modeNow() === "advanced");
       if (F.more.open !== open) { F.moreProg = true; F.more.open = open; setTimeout(() => { F.moreProg = false; }); }
     }
     renderList(rowsOf());
@@ -3061,12 +3146,36 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const line = ns ? `${adminBytes(ns.bytes)} · ${ns.entries} ${ns.entries === 1 ? "entry" : "entries"} · last used ${adminAgo(ns.newest_mtime, Date.now())}` : A.cache ? "Nothing cached yet." : "…";
       fill(F.cacheKv, line, () => kvRows([["Size", line]]));
       setHidden(F.cacheBtn, !ns);
-      if (ns) setText(F.cacheBtn, `Clear this model's cache (${adminBytes(ns.bytes)})…`);
+      if (ns) {
+        const mine = A.busy.has(JSON.stringify(reqModel(m.id)));
+        setText(F.cacheBtn, mine ? "Clearing…" : `Clear this model's cache (${adminBytes(ns.bytes)})…`);
+        F.cacheBtn.disabled = A.busy.size > 0;
+        if (mine) F.cacheBtn.setAttribute("aria-busy", "true"); else F.cacheBtn.removeAttribute("aria-busy");
+      }
     }
   }
   async function actOn(id, kind) {
     if (kind === "unload" && chatAbort && $("modelSelect").value === id && !(await confirmAction({ title: `Unload ${id}?`, body: "The reply being written will stop.", confirm: "Unload" }))) return;
     await modelStore.act(id, kind);
+    await refresh();
+  }
+  // The page's copy of the file follows a save at once, so the form is clean before the next poll.
+  function noteSaved(F, set) {
+    const row = A.settings.models.find((x) => x.id === F.id);
+    for (const [k, v] of Object.entries(set)) {
+      delete per(F.id).texts[k];
+      if (row) row.settings[k] = { ...row.settings[k], file: v, source: v === null ? "default" : "file" };
+    }
+  }
+  async function removeSaved(F, key) {
+    await withBusy(F.sets.get(key).remove, "Removing…", async () => {
+      try {
+        await postJson("/v1/settings", { model: F.id, set: { [key]: null } });
+        noteSaved(F, { [key]: null });
+        delete per(F.id).errors[key];
+        toast(`Removed the saved ${KEY[key][0].toLowerCase()}.`);
+      } catch (e) { failToast("Remove", e); }
+    });
     await refresh();
   }
   async function saveModel(F) {
@@ -3075,11 +3184,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     await withBusy(F.save, "Saving…", async () => {
       try {
         const r = await postJson("/v1/settings", { model: F.id, set });
-        const row = A.settings.models.find((x) => x.id === F.id);
-        for (const [k, v] of Object.entries(set)) {
-          delete P.texts[k];
-          if (row) row.settings[k] = { ...row.settings[k], file: v, source: v === null ? "default" : "file" };
-        }
+        noteSaved(F, set);
         P.saveError = "";
         toast(r.model_loaded ? `Saved. Reload ${F.id} to use them.` : `Saved. Applies the next time ${F.id} loads.`);
       } catch (e) {
@@ -3092,22 +3197,25 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     await refresh();
   }
 
-  async function clearCache({ title, body, bytes, kept, req, btn }) {
+  // One clear at a time: every clear control stays off from the confirmation until the refreshed bytes are on screen.
+  async function clearCache({ title, body, bytes, kept, req }) {
+    if (A.busy.size) return;
     const rows = [["Frees", adminBytes(bytes)], ...(kept ? [["Kept", kept]] : [])];
-    if (!(await confirmAction({ title, body, rows, confirm: `Clear ${adminBytes(bytes)}` }))) return;
-    await withBusy(btn ?? h("button"), "Clearing…", async () => {
-      try {
-        const r = await postJson("/v1/prefix-cache/clear", req);
-        const parts = [`Freed ${adminBytes(r.freed_bytes ?? r.stale_freed_bytes)}.`];
-        if (r.busy_models?.length) parts.push(`Busy, not cleared: ${r.busy_models.join(", ")}.`);
-        if (r.skipped_live_namespaces) parts.push(`${r.skipped_live_namespaces} in use by another server, kept.`);
-        toast(parts.join(" "));
-      } catch (e) { failToast("Clear", e); }
-    });
-    await refresh();
+    if (!(await confirmAction({ title, body, rows, confirm: `Clear ${adminBytes(bytes)}` })) || A.busy.size) return;
+    A.busy.add(JSON.stringify(req));
+    renderAll();
+    try {
+      const r = await postJson("/v1/prefix-cache/clear", req);
+      const parts = [`Freed ${adminBytes(r.freed_bytes ?? r.stale_freed_bytes)}.`];
+      if (r.busy_models?.length) parts.push(`Busy, not cleared: ${r.busy_models.join(", ")}.`);
+      if (r.skipped_live_namespaces) parts.push(`${r.skipped_live_namespaces} in use by another server, kept.`);
+      toast(parts.join(" "));
+    } catch (e) { failToast("Clear", e); }
+    try { await refresh(); } finally { A.busy.clear(); renderAll(); }
   }
+  const reqModel = (id) => ({ scope: "model", model: id });
   const clearModel = (id) => clearCache({ title: `Clear ${id}'s cache?`, body: "Deletes this model's saved conversations. Follow-up replies re-read their prompts in full until it rebuilds.",
-    bytes: (A.cache?.namespaces ?? []).find((n) => n.model === id)?.bytes ?? 0, req: { scope: "model", model: id }, btn: A.form?.cacheBtn });
+    bytes: (A.cache?.namespaces ?? []).find((n) => n.model === id)?.bytes ?? 0, req: reqModel(id) });
   const clearNamespace = (n) => clearCache({ title: "Clear this cache?", body: "Deletes a cache no loaded model uses. It cannot be restored.", bytes: n.bytes, req: { scope: "namespace", id: n.id } });
   const staleBytes = (c) => c.namespaces.filter((n) => !n.model && !n.held_by_other_process).reduce((a, n) => a + n.bytes, 0);
   const allBytes = (c) => c.namespaces.filter((n) => !n.held_by_other_process).reduce((a, n) => a + n.bytes, 0);
@@ -3120,7 +3228,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       body: all ? `Deletes every cache${loaded.length ? `, including ${loaded.join(", ")}'s` : ""}. Replies re-read their prompts in full until they rebuild.` : "Deletes the caches no loaded model uses. A model rebuilds its cache as you chat; these cannot be restored.",
       bytes: all ? allBytes(c) : staleBytes(c),
       kept: [...(all ? [] : loaded.map((id) => `${id} (loaded)`)), ...(other ? [`${other} in use by another server`] : [])].join(", "),
-      req: { scope }, btn: q(all ? "clearAll" : "clearStale"),
+      req: { scope },
     });
   }
   q("clearStale").addEventListener("click", () => clearScope("stale"));
@@ -3129,11 +3237,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const GB_SPEC = { type: "int", min: 0, max: 1048576 };
   // The two server settings reuse the setting row: assigned space and the models folder.
   const cacheRow = setRow("prefix_cache_disk_gb", "Assigned space", "cacheGb"), dirRow = setRow("models_dir", "Models folder", "dirPath");
-  const cacheIn = h("input", { id: "cacheGb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default", "aria-label": "Assigned SSD prefix cache space in GiB", oninput: () => { A.cacheText = cacheIn.value; renderSettings(); } });
+  const enterTo = (button) => (e) => { if (e.key === "Enter") { e.preventDefault(); if (!button.disabled) button.click(); } };
+  const cacheIn = h("input", { id: "cacheGb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default", "aria-label": "Assigned SSD prefix cache space in GiB", oninput: () => { A.cacheText = cacheIn.value; renderSettings(); }, onkeydown: (e) => enterTo(cacheSave)(e) });
+  const cacheUnit = h("span", { class: "muted", text: "GiB" }), cacheWarn = h("div", { class: "warn", role: "status", hidden: true });
   const cacheSave = h("button", { class: "btn sm primary", id: "cacheSave", type: "button", text: "Save", onclick: saveCache });
   const cacheDefault = h("button", { class: "btn sm", id: "cacheDefault", type: "button", text: "Use default", onclick: () => saveServer("prefix_cache_disk_gb", null, "Back to the default size.", cacheDefault, "Resetting…") });
-  cacheRow.ctl.append(h("div", { class: "row-in" }, cacheIn, h("span", { class: "muted", text: "GiB" })), h("div", { class: "row-in" }, cacheSave, cacheDefault), cacheRow.bad);
-  const dirIn = h("input", { id: "dirPath", type: "text", autocomplete: "off", "aria-label": "Models folder", placeholder: "/absolute/path/to/models", oninput: () => { A.dirText = dirIn.value; setText(dirRow.bad, ""); } });
+  cacheRow.ctl.append(h("div", { class: "row-in" }, cacheIn, cacheUnit), h("div", { class: "row-in" }, cacheSave, cacheDefault), cacheRow.bad, cacheWarn);
+  const dirIn = h("input", { id: "dirPath", type: "text", autocomplete: "off", "aria-label": "Models folder", placeholder: "/absolute/path/to/models", oninput: () => { A.dirText = dirIn.value; setText(dirRow.bad, ""); }, onkeydown: (e) => enterTo(dirSave)(e) });
   const dirSave = h("button", { class: "btn sm primary", id: "dirSave", type: "button", text: "Save and rescan", onclick: () => {
     if (!dirIn.value.trim().startsWith("/")) return setText(dirRow.bad, "Enter an absolute folder path.");
     saveServer("models_dir", dirIn.value.trim(), "Saved. Rescanning the folder.", dirSave, "Saving…");
@@ -3143,9 +3253,15 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   q("cacheSet").replaceWith(cacheRow.row);
   q("dirSet").replaceWith(dirRow.row);
 
+  // The server's own words for when a server setting takes effect ("saved; applies at the next model load").
+  const sentence = (note) => `${note[0].toUpperCase()}${note.slice(1)}.`;
   async function saveServer(key, value, text, btn, label) {
     await withBusy(btn, label, async () => {
-      try { await postJson("/v1/settings", { server: { [key]: value } }); toast(text); A.cacheText = A.dirText = null; } catch (e) { failToast("Save", e); }
+      try {
+        const r = await postJson("/v1/settings", { server: { [key]: value } });
+        toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
+        if (key === "models_dir") A.dirText = null; else A.cacheText = null;
+      } catch (e) { failToast("Save", e); }
     });
     await Promise.all([refresh(), key === "models_dir" ? modelStore.refresh() : null]);
   }
@@ -3153,7 +3269,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const v = adminControlValue(GB_SPEC, cacheIn.value);
     if (!v.ok || v.value === null) return;
     if (v.value === 0 && !(await confirmAction({ title: "Turn the SSD prefix cache off?", body: "Takes effect at the next model load; existing caches stay on disk until cleared.", confirm: "Turn off" }))) return;
-    saveServer("prefix_cache_disk_gb", v.value, `Saved. The cache now has ${v.value} GiB.`, cacheSave, "Saving…");
+    saveServer("prefix_cache_disk_gb", v.value, "Saved.", cacheSave, "Saving…");
   }
   function renderSettings() {
     const s = A.settings, c = A.cache;
@@ -3166,62 +3282,84 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setText(q("aboutVersion"), q("brandVersion").textContent || "-");
   }
   function renderCache(c, gb) {
-    const cap = gb.effective_bytes, used = c.total_bytes, busy = (b) => b.getAttribute("aria-busy") === "true";
+    const cap = gb.effective_bytes, used = c.total_bytes, busy = (b) => b.getAttribute("aria-busy") === "true", clearing = A.busy.size > 0;
     setText(q("cacheUsage"), `${adminBytes(used)} of ${adminBytes(cap)} assigned`);
     setText(q("cacheFree"), c.volume ? `${adminBytes(c.volume.free_bytes)} free on disk` : "");
     const pct = cap > 0 ? Math.min(100, (100 * used) / cap) : 0;
     q("cacheBar").style.width = `${pct}%`;
     q("cacheMeter").setAttribute("aria-valuenow", String(Math.round(pct)));
-    fill(q("cacheKv"), c.root, () => kvRows([["Cache folder", c.root]], ["Cache folder"]));
-    badges(cacheRow.badge, gb, gb.applies);
+    const rate = A.rates.size ? [...A.rates.values()].reduce((a, b) => a + b, 0) : null;
+    const kv = [["Cache folder", c.root], ["Write rate", rate === null ? "-" : rate ? `${adminBytes(rate)}/s` : "idle"]];
+    fill(q("cacheKv"), JSON.stringify(kv), () => kvRows(kv, ["Cache folder"]));
     const locked = !!gb.locked, file = adminFileText(gb.file);
-    if (A.cacheText === null && document.activeElement !== cacheIn) cacheIn.value = file;
-    cacheIn.placeholder = String(Math.round(gb.ask_bytes / GiB));
-    setText(cacheRow.help, locked ? `Set by --prefix-cache-disk ${gb.flag} at launch. Start sushi without the flag to change it here.` : "Space the cache may use on the SSD. A smaller size drops the oldest entries at once; 0 turns the cache off at the next model load.");
+    badges(cacheRow.badge, gb, gb.file === 0 && !locked ? "at the next load" : gb.applies);
+    // A pinned size shows the flag as typed; the box is a draft only while it differs from what the page would show.
+    const shown = locked ? adminFileText(gb.flag) || adminBytes(cap) : file;
+    if (A.cacheText === shown) A.cacheText = null;
+    if ((locked || A.cacheText === null) && cacheIn.value !== shown) cacheIn.value = shown;
+    cacheIn.placeholder = String(+(gb.ask_bytes / GiB).toFixed(2));
+    setHidden(cacheUnit, locked);
+    setText(cacheRow.help, locked ? flagHelp("prefix_cache_disk_gb", gb.flag) : "Space the cache may use on the SSD. A smaller size drops the oldest entries at once; 0 turns the cache off at the next model load.");
     const text = cacheIn.value.trim(), parsed = adminControlValue(GB_SPEC, text), dirty = !locked && text !== file;
     cacheIn.disabled = locked;
     cacheSave.disabled = locked || !dirty || !parsed.ok || parsed.value === null || busy(cacheSave);
     cacheDefault.disabled = locked || gb.file == null || busy(cacheDefault);
+    const standard = gb.default_bytes ?? (gb.file == null && !locked ? gb.ask_bytes : null);
+    if (!busy(cacheDefault)) setText(cacheDefault, standard ? `Use default (${+(standard / GiB).toFixed(2)} GiB)` : "Use default");
     setText(cacheRow.bad, dirty && text && !parsed.ok ? "Enter a whole number of GiB (0 turns the cache off)." : "");
     cacheIn.setAttribute("aria-invalid", String(!!cacheRow.bad.textContent));
+    const want = dirty && parsed.ok && parsed.value !== null ? parsed.value * GiB : cap, room = c.volume ? c.volume.free_bytes + used : Infinity;
+    setText(cacheWarn, want > room ? `More than this disk has free (${adminBytes(room)}, counting this cache's own use).` : "");
+    setHidden(cacheWarn, want <= room);
     // The table is rebuilt only when the answer or the loaded set changed.
-    const sig = A.texts.cache + rowsOf().filter((m) => m.state === "ready").map((m) => m.id);
+    const sig = A.texts.cache + rowsOf().filter((m) => m.state === "ready").map((m) => m.id) + [...A.busy] + JSON.stringify([...A.rates]);
     if (A.tbody !== sig) {
       A.tbody = sig;
       const now = Date.now(), td = (text, cls, extra) => h("td", { class: cls, text, ...extra });
-      const clear = (fn) => h("button", { class: "btn sm danger", type: "button", text: "Clear…", onclick: fn });
-      const act = (n) => n.model ? clear(() => clearModel(n.model)) : n.held_by_other_process ? h("span", { class: "muted", text: "kept: in use" })
-        : clear(() => clearNamespace(n));
+      const clear = (fn, req) => { const mine = A.busy.has(JSON.stringify(req)); return h("button", { class: "btn sm danger", type: "button", text: mine ? "Clearing…" : "Clear…", disabled: clearing, "aria-busy": mine ? "true" : null, onclick: fn }); };
+      const act = (n) => n.model ? clear(() => clearModel(n.model), reqModel(n.model)) : n.held_by_other_process ? h("span", { class: "muted", text: "kept: in use" })
+        : clear(() => clearNamespace(n), { scope: "namespace", id: n.id });
+      const perSec = (n) => { const r = A.rates.get(n.id); return r === undefined ? "-" : r ? `${adminBytes(r)}/s` : "idle"; };
       q("cacheRows").replaceChildren(...(c.namespaces.length ? c.namespaces.map((n) => h("tr", {},
         h("td", { class: "wrap" }, h("span", { class: `dot ${n.model ? "ok" : "off"}`, style: "display:inline-block;margin-right:6px" }), n.model || (n.held_by_other_process ? "Other sushi server" : "Stale")),
-        td(adminBytes(n.bytes), "n"), td(adminAgo(n.newest_mtime, now)), h("td", { class: "n" }, act(n))))
-        : [h("tr", {}, h("td", { colspan: 4, class: "muted", text: "Nothing cached yet. Caches appear after a loaded model answers." }))]));
+        td(adminBytes(n.bytes), "n"), td(adminAgo(n.newest_mtime, now)), td(String(n.entries), "n adv"), td(n.id.slice(0, 8), "adv mono", { title: n.id }),
+        td(n.tier ? `${adminBytes(n.tier.used_bytes)} / ${adminBytes(n.tier.cap_bytes)}` : "-", "n adv"), td(n.tier ? adminBytes(n.tier.written_bytes) : "-", "n adv"), td(perSec(n), "n adv"),
+        h("td", { class: "n" }, act(n))))
+        : [h("tr", {}, h("td", { colspan: 9, class: "muted", text: "Nothing cached yet. Caches appear after a loaded model answers." }))]));
     }
-    for (const [id, bytes, label] of [["clearStale", staleBytes(c), "Clear stale caches"], ["clearAll", allBytes(c), "Clear all caches"]]) {
-      if (!busy(q(id))) setText(q(id), `${label} (${adminBytes(bytes)})…`);
-      q(id).disabled = bytes === 0 || busy(q(id));
+    for (const [id, bytes, label, scope] of [["clearStale", staleBytes(c), "Clear stale caches", "stale"], ["clearAll", allBytes(c), "Clear all caches", "all"]]) {
+      const mine = A.busy.has(JSON.stringify({ scope }));
+      setText(q(id), mine ? "Clearing…" : `${label} (${adminBytes(bytes)})…`);
+      q(id).disabled = bytes === 0 || clearing;
+      if (mine) q(id).setAttribute("aria-busy", "true"); else q(id).removeAttribute("aria-busy");
     }
   }
   function renderDir(d) {
     badges(dirRow.badge, d, d.applies);
     dirRow.ctl.replaceChildren(...(d.locked ? [] : [...dirCtl, dirRow.bad]));
     if (!d.locked) {
-      if (A.dirText === null && document.activeElement !== dirIn) dirIn.value = d.file || "";
+      if (A.dirText === (d.file || "")) A.dirText = null;
+      if (A.dirText === null && dirIn.value !== (d.file || "")) dirIn.value = d.file || "";
       dirIn.placeholder = d.default;
     }
     setText(dirRow.help, d.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : "Where sushi looks for packs. Saving rescans at once. Packs from `sushi pull` still land in ~/.sushi/models.");
-    const kv = [["In use", d.boot_roots.join(", ") || "(none)"], ["Default", d.default]];
+    const kv = [["In use", rootsInUse(d).join(", ") || "(none)"], ["Default", d.default]];
     fill(q("dirKv"), JSON.stringify(kv), () => kvRows(kv, ["In use", "Default"]));
   }
 
   function renderAll() {
+    // A failure message belongs to the failed attempt; once the model is up or loading it is history.
+    for (const m of modelStore.list) if (m.state === "ready" || m.state === "loading") modelStore.failed.delete(m.id);
     const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : A.error ? `Couldn't load: ${A.error}` : "";
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
     for (const id of ["modelsMd", "cacheCard", "dirCard", "aboutCard"]) q(id).classList.toggle("stale-view", !!msg && !!A.settings);
     if (A.view === "models") renderModels(); else if (A.view === "settings") renderSettings();
   }
-  modelStore.subscribe(renderAll);
+  modelStore.subscribe(() => {
+    if (modelStore.online && A.error) refresh();
+    renderAll();
+  });
   window.addEventListener("sushi-mode", () => { if (A.view === "models" || A.view === "settings") renderAll(); });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
@@ -3232,8 +3370,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       q("modelsPanel").hidden = view !== "models";
       q("settingsPanel").hidden = view !== "settings";
       clearInterval(A.timer);
+      clearTimeout(A.retry);
       A.timer = null;
+      A.wsample = null;
+      A.rates = new Map();
       if (view !== "models" && view !== "settings") return;
+      if (view === "models" && !hashId() && A.sel && wide()) history.replaceState(null, "", `/models#${encodeURIComponent(A.sel)}`);
       renderAll();
       refresh();
       A.timer = setInterval(() => { if (!document.hidden) refresh(); }, view === "settings" ? 10000 : 15000);

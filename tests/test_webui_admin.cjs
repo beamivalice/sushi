@@ -55,6 +55,8 @@ assert.deepEqual(changes({ mtp: 'true', ssd_prefetch: '', think_penalty: '5', kv
 assert.deepEqual(changes({ ssd_prefetch: '900' }), { set: {}, bad: 'ssd_prefetch' });
 assert.equal(page.adminBytes(1023.8 * 1024 ** 2), '1.00 GiB', 'no "1024 MiB"');
 assert.equal(page.adminBytes(110 * GiB), '110 GiB');
+assert.equal(page.adminBytes(1.72 * 1024 ** 2), '1.72 MiB', 'MiB keeps its decimals');
+assert.equal(page.adminBytes(12.5 * 1024 ** 2), '12.5 MiB');
 assert.equal(page.adminTokens(131072), '128k');
 assert.equal(page.adminTokens(1048576), '1M');
 assert.equal(page.adminTokens(1000), '1000');
@@ -74,6 +76,9 @@ assert.deepEqual(changesKv({ mtp: 'true', kv_quant: 'off' }), { set: { mtp: true
 assert.equal(page.adminControlValue(int, '', true).ok, false);
 assert.deepEqual(changesKv({ ssd_prefetch: '' }, { ssd_prefetch: true }), { set: {}, bad: 'ssd_prefetch' });
 assert.deepEqual(changesKv({ ssd_prefetch: '' }), { set: { ssd_prefetch: null }, bad: null }, 'a truly empty box still removes the key');
+// "065536" is the saved 65536, not a change.
+const ctxSpec = { name: 'ctx_size', type: 'int', min: 1, max: 4294967295 };
+assert.deepEqual(JSON.parse(JSON.stringify(page.adminChanges([ctxSpec], { ctx_size: { file: 65536 } }, { ctx_size: '065536' }))), { set: {}, bad: null });
 
 // Error text: the server's message, or a short line; never a page of HTML.
 assert.equal(page.adminErrorText(new Error('400 {"error":{"message":"models_dir is not a folder"}}')), 'models_dir is not a folder');

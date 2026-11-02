@@ -33,7 +33,7 @@ function makeServer(opts = {}) {
   const calls = [];
   const gates = {};
   const state = {
-    failSettings: 0, loadDelay: null, settingsDelay: [], loadFails: false,
+    failSettings: 0, loadDelay: null, settingsDelay: [], loadFails: false, down: false, hooks: {},
     models: [
       { id: 'Qwen-A', state: 'ready', bytes_on_disk: 38 * GiB, bytes_resident: 40 * GiB, context_length: 262144, input_modalities: ['text', 'image'], keys: [...BASE_KEYS, 'vision'], settings: allKeys({ ctx_size: keyState({ file: 65536, source: 'file' }), kv_quant: keyState({ flag: '8', source: 'flag', locked: true }) }) },
       { id: 'GLM-B', state: 'unloaded', bytes_on_disk: 61 * GiB, context_length: 131072, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys({ kv_quant: keyState({ file: 'off', source: 'file' }) }) },
@@ -70,6 +70,9 @@ function makeServer(opts = {}) {
     if (/^\/(chat|dashboard|models|settings)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
     const body = method === 'POST' ? JSON.parse(request.postData() || '{}') : null;
     calls.push({ path: p, method, body, auth: request.headers().authorization });
+    if (state.down) return route.abort('failed');
+    const hook = state.hooks[p];
+    if (hook) { const answer = await hook(body, method); if (answer) return route.fulfill(answer); }
     switch (p) {
       case '/v1/models': return route.fulfill(json(modelsBody()));
       case '/v1/settings':
@@ -77,8 +80,9 @@ function makeServer(opts = {}) {
           const m = state.models.find((x) => x.id === body.model);
           if (opts.limits && body.set && 'think_penalty' in body.set) return route.fulfill(json({ error: { message: 'think_penalty is not supported by this model' } }, 400));
           for (const [k, v] of Object.entries(body.set ?? {})) if (m) m.settings[k] = keyState({ file: v, source: v === null ? 'default' : 'file' });
-          for (const [k, v] of Object.entries(body.server ?? {})) { state.server[k] = { ...state.server[k], file: v, source: v === null ? 'default' : 'file' }; if (k === 'prefix_cache_disk_gb') state.server[k].effective_bytes = (v ?? 20) * GiB; }
-          return route.fulfill(json({ applied: Object.fromEntries(Object.keys(body.set ?? body.server ?? {}).map((k) => [k, 'saved'])), model_loaded: m?.state === 'ready' }));
+          for (const [k, v] of Object.entries(body.server ?? {})) { state.server[k] = { ...state.server[k], file: v, source: v === null ? 'default' : 'file' }; if (k === 'prefix_cache_disk_gb') state.server[k].effective_bytes = state.server[k].ask_bytes = (v ?? 20) * GiB; }
+          const cacheNote = body.server?.prefix_cache_disk_gb ? 'applied to the running tiers' : 'saved; applies at the next model load';
+          return route.fulfill(json({ applied: Object.fromEntries(Object.keys(body.set ?? body.server ?? {}).map((k) => [k, k === 'prefix_cache_disk_gb' ? cacheNote : 'saved'])), model_loaded: m?.state === 'ready' }));
         }
         if (state.failSettings > 0) { state.failSettings -= 1; return route.fulfill({ status: 500, contentType: 'text/html', body: '<html><body><h1>Bad gateway</h1></body></html>' }); }
         { const answer = json(settingsBody()); if (state.settingsDelay.length) await state.settingsDelay.shift(); return route.fulfill(answer); }
@@ -501,6 +505,391 @@ async function main() {
       assert.deepEqual(errors, []);
       await context.close();
     }
+    const failures = [];
+    const phone = { width: 390, height: 844 };
+    // One bug, one scenario: a failure is recorded and the next scenario still runs.
+    const scenario = async (name, cfg, fn) => {
+      const server = makeServer(cfg.serverOpts);
+      cfg.setup?.(server);
+      let context;
+      try {
+        const o = await open(browser, server, cfg.path, cfg.open);
+        context = o.context;
+        await fn({ page: o.page, server, errors: o.errors });
+        assert.deepEqual(o.errors, [], 'page errors');
+      } catch (error) { failures.push(`${name}: ${String(error.message).split('\n').slice(0, 3).join(' ')}`); } finally { await context?.close(); }
+    };
+    const dialogOpen = (page) => page.evaluate(() => document.getElementById('confirmDialog').open);
+    const plainModel = (id) => ({ id, state: 'unloaded', bytes_on_disk: 10 * GiB, context_length: 131072, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys() });
+
+    await scenario('hash change with unsaved edits: Keep editing holds the model', { path: '/models#Qwen-A' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.evaluate(() => { location.hash = '#GLM-B'; });
+      await page.waitForFunction(() => document.getElementById('confirmDialog').open);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Qwen-A', 'the form stays while the prompt is open');
+      const length = await page.evaluate(() => history.length);
+      await page.click('#confirmDialog >> text=Keep editing');
+      await settle(page);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Qwen-A');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+      assert.equal(await page.evaluate(() => location.hash), '#Qwen-A');
+      assert.equal(await page.evaluate(() => history.length), length, 'no extra history entry');
+    });
+    await scenario('Back with unsaved edits: Keep editing, then Discard', { path: '/models#GLM-B', open: { clock: false } }, async ({ page }) => {
+      await page.waitForSelector('.list [data-id="Qwen-A"]');
+      await page.click('.list [data-id="Qwen-A"]');
+      await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Qwen-A');
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.goBack();
+      await page.waitForFunction(() => document.getElementById('confirmDialog').open);
+      await page.click('#confirmDialog >> text=Keep editing');
+      await page.waitForTimeout(200);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Qwen-A');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+      assert.equal(await page.evaluate(() => location.hash), '#Qwen-A');
+      await page.click('.list [data-id="GLM-B"]');
+      await page.click('#confirmDialog button:text-is("Discard")');
+      await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'GLM-B');
+      assert.equal(await page.evaluate(() => location.hash), '#GLM-B');
+    });
+    await scenario('a vanished model leaves no live detail', { path: '/models#GLM-B' }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      server.state.models = server.state.models.filter((m) => m.id !== 'GLM-B');
+      await settle(page, 16_000);
+      await settle(page, 16_000);
+      assert.equal(await page.locator('#modelsDetail .set').count(), 0, 'no editable form for a model that is gone');
+      assert.equal(await page.locator('#modelsDetail .d-actions').count(), 0, 'and no Load button');
+      assert.match(await page.textContent('#modelsDetail'), /not (found|in the list)/i);
+    });
+    await scenario('an unknown model on a phone is not a blank screen', { path: '/models#Nope', open: { viewport: phone } }, async ({ page }) => {
+      await page.waitForSelector('#modelsMd');
+      await settle(page);
+      assert.match(await page.innerText('#modelsDetail'), /not (found|in the list)/i);
+      assert.equal(await page.isVisible('#modelsDetail'), true);
+      await page.click('#modelsDetail >> text=Back to Models');
+      assert.equal(await page.evaluate(() => location.hash), '');
+      assert.equal(await page.isVisible('#modelsList'), true);
+    });
+    await scenario('alerts never print null', { path: '/models#Qwen-A' }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      server.state.failSettings = 1;
+      await settle(page, 16_000);
+      assert.doesNotMatch(await page.innerText('#modelsAlert'), /null/);
+      assert.equal(await page.locator('#modelsAlert button:text-is("Retry")').count(), 1);
+      server.state.hooks['/v1/settings'] = async (body, method) => (method === 'POST' ? { status: 500, contentType: 'text/html', body: '<html>boom</html>' } : null);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('.savebar button:text-is("Save")');
+      await settle(page, 500);
+      const text = await page.innerText('#modelsDetail .alert.err:not([hidden])');
+      assert.match(text, /Couldn't save/);
+      assert.doesNotMatch(text, /null/);
+    });
+    await scenario('a Load failed message goes when the model is loaded elsewhere', { path: '/models#GLM-B', setup: (s) => { s.state.loadFails = true; } }, async ({ page, server }) => {
+      await page.waitForSelector('.d-actions button');
+      await page.click('.d-actions >> text=Load');
+      await page.waitForSelector('.detail .alert.err:not([hidden])');
+      server.state.loadFails = false;
+      Object.assign(server.state.models.find((m) => m.id === 'GLM-B'), { state: 'ready', bytes_resident: 61 * GiB });
+      await settle(page, 6000);
+      assert.equal(await page.isVisible('.detail .alert.err'), false, 'a loaded model shows no failure');
+      assert.doesNotMatch(await page.textContent('.list [data-id="GLM-B"]'), /failed/i);
+    });
+    await scenario('a flag-pinned assigned space shows the flag, not the file', { path: '/settings', setup: (s) => {
+      Object.assign(s.state.server.prefix_cache_disk_gb, { file: 100, flag: '512MB', source: 'flag', locked: true, effective_bytes: 512 * 2 ** 20, ask_bytes: 512 * 2 ** 20 });
+      Object.assign(s.state.server.models_dir, { flag: '/models', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector('#cacheGb');
+      assert.equal(await page.inputValue('#cacheGb'), '512MB');
+      assert.equal(await page.isDisabled('#cacheGb'), true);
+      assert.match(await page.textContent('#cacheUsage'), /of 512 MiB/);
+      assert.match(await page.textContent('#cacheCard'), /--prefix-cache-disk 512MB/);
+      assert.match(await page.textContent('#cacheCard'), /Launch flag/);
+      assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"]'), /Applies now/, 'a pinned size does not apply now');
+      assert.doesNotMatch(await page.textContent('#dirCard'), /Applies now/);
+    });
+    await scenario('a flag that pins MTP acceptance prints its own spelling', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[0].settings.mtp_acceptance = keyState({ flag: '--mtp-tokenv3 0.5', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector(row('mtp_acceptance'));
+      const text = await page.textContent(row('mtp_acceptance'));
+      assert.match(text, /--mtp-tokenv3 0\.5/);
+      assert.doesNotMatch(text, /--mtp-typical|\bset\b/);
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'tokenv3');
+    });
+    await scenario('a value-only lock on MTP acceptance shows the choice it names', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[0].settings.mtp_acceptance = keyState({ flag: 'typical', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector(row('mtp_acceptance'));
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'typical');
+      assert.match(await page.textContent(row('mtp_acceptance')), /Set by a launch flag\./);
+    });
+    await scenario('a flag the page cannot read shows Launch flag, never "set"', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[0].settings.mtp_acceptance = keyState({ flag: 'set', source: 'flag', locked: true });
+      s.state.models[0].settings.mtp_greedy_tail = keyState({ flag: '--mtp-greedy-tail', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector(row('mtp_acceptance'));
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'Launch flag');
+      assert.doesNotMatch(await page.textContent(row('mtp_acceptance')), /--mtp-typical/);
+      assert.match(await page.textContent(row('mtp_greedy_tail')), /Set by --mtp-greedy-tail at launch/);
+    });
+    await scenario('saving one server setting keeps the other one\'s draft', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#dirPath');
+      await page.fill('#dirPath', '/tmp/typed');
+      await page.fill('#cacheGb', '7');
+      await page.click('#cacheSave');
+      await page.waitForSelector('.toast');
+      await settle(page, 1000);
+      assert.equal(await page.inputValue('#dirPath'), '/tmp/typed', 'the folder draft survives a cache save');
+      await page.fill('#cacheGb', '9');
+      await page.click('#dirSave');
+      await settle(page, 1000);
+      assert.equal(await page.inputValue('#cacheGb'), '9', 'the size draft survives a folder save');
+    });
+    await scenario('an auto-selected model stays under an edit', { path: '/models', setup: (s) => { s.state.models[0].state = 'unloaded'; } }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Broke-D');
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('.list [data-id="GLM-B"] button');
+      await settle(page, 3000);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Broke-D', 'a load elsewhere does not move the selection');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+    });
+    await scenario('a tab switch with unsaved edits asks, and the model is kept on return', { path: '/models#GLM-B' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('#navSettings');
+      assert.equal(await dialogOpen(page), true, 'leaving a dirty form asks');
+      await page.click('#confirmDialog >> text=Keep editing');
+      await settle(page);
+      assert.equal(await page.isVisible('#modelsPanel'), true);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+      await page.click('#navSettings');
+      await page.click('#confirmDialog button:text-is("Discard")');
+      await page.waitForSelector('#settingsPanel:not([hidden])');
+      await page.click('#navModels');
+      await page.waitForSelector('#modelsDetail h2');
+      assert.equal(await page.textContent('#modelsDetail h2'), 'GLM-B', 'back on the model that was open');
+      assert.equal(await page.evaluate(() => location.hash), '#GLM-B');
+    });
+    await scenario('a clean tab switch returns to the same model', { path: '/models' }, async ({ page }) => {
+      await page.waitForSelector('.list [data-id="GLM-B"]');
+      await page.click('.list [data-id="GLM-B"]');
+      await page.click('#navSettings');
+      await page.waitForSelector('#settingsPanel:not([hidden])');
+      await page.click('#navModels');
+      await page.waitForSelector('#modelsDetail h2');
+      assert.equal(await page.textContent('#modelsDetail h2'), 'GLM-B');
+    });
+    await scenario('a filter on a hidden box does not strand the list', { path: '/models', setup: (s) => {
+      s.state.models = ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'Zeta', 'Zulu'].map(plainModel);
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('.list [data-id="A1"]');
+      await page.fill('#modelsFilter', 'Z');
+      assert.equal(await page.locator('#modelsList .row').count(), 2);
+      server.state.models = server.state.models.filter((m) => !m.id.startsWith('Z') && m.id < 'A4');
+      await settle(page, 16_000);
+      await settle(page, 16_000);
+      assert.equal(await page.locator('#modelsList .row').count(), 3, 'the three left show');
+    });
+    await scenario('an invalid value in a closed fold opens it and says so', { path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
+      await page.waitForSelector(`${row('think_penalty')} input`);
+      await page.fill(`${row('think_penalty')} input`, 'abc');
+      await page.click('#modeToggle [data-mode="compact"]');
+      await settle(page);
+      assert.equal(await page.evaluate(() => document.querySelector('details.more-set').open), true, 'the fold holding the error is open');
+      assert.equal(await page.isVisible(`${row('think_penalty')} .bad`), true);
+      assert.match(await page.textContent('details.more-set summary'), /1 invalid/);
+    });
+    await scenario('a saved value on a disabled key can be removed', { serverOpts: { limits: true }, path: '/models#Deep-C', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[2].settings.preserve_thinking = keyState({ file: true, source: 'file' });
+    } }, async ({ page, server }) => {
+      const remove = `${row('preserve_thinking')} button:text-is("Remove saved value")`;
+      await page.waitForSelector(remove);
+      await page.click(remove);
+      await page.waitForFunction(() => /Removed|Saved/.test(document.getElementById('toastHost').textContent));
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Deep-C', set: { preserve_thinking: null } });
+      await settle(page, 1000);
+      assert.equal(await page.isVisible(remove), false, 'nothing is left to remove');
+    });
+    await scenario('the load-error alert goes soon after the server is back', { path: '/models#Qwen-A' }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await settle(page, 1000);
+      server.state.down = true;
+      await settle(page, 6000);
+      await page.evaluate(() => window.sushiAdmin.refresh());
+      await settle(page);
+      assert.equal(await page.isVisible('#modelsAlert'), true);
+      server.state.down = false;
+      await settle(page, 5500);
+      assert.equal(await page.isVisible('#modelsAlert'), false, 'the alert clears once the server answers');
+    });
+    await scenario('a rebuilt list keeps focus on the same control; rows take arrows and Space', { path: '/models#Qwen-A' }, async ({ page, server }) => {
+      await page.waitForSelector('.list [data-id="Deep-C"] button');
+      await page.focus('.list [data-id="Deep-C"] button');
+      server.state.models[0].bytes_resident = 12 * GiB;
+      await settle(page, 6000);
+      assert.equal(await page.evaluate(() => document.activeElement.matches('.row[data-id="Deep-C"] button')), true, 'the Load button keeps focus');
+      await page.focus('.list [data-id="Broke-D"]');
+      await page.keyboard.press('ArrowDown');
+      assert.equal(await page.evaluate(() => document.activeElement.dataset.id), 'Deep-C');
+      await page.keyboard.press('Space');
+      assert.equal(await page.evaluate(() => location.hash), '#Deep-C');
+    });
+    await scenario('a file value the loader drops does not ask for a reload forever', { serverOpts: { limits: true }, path: '/models#Qwen-A', setup: (s) => {
+      s.state.models[0].settings.kv_quant = keyState({ file: '4', source: 'file' });
+      s.state.models[0].loaded_with = { ctx_size: 65536, kv_quant: null };
+    } }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      assert.equal(await page.isVisible('.callout'), false);
+    });
+    await scenario('a click in the dialog padding does not close it', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#clearAll:not([disabled])');
+      await page.click('#clearAll');
+      const b = await page.locator('#confirmDialog').boundingBox();
+      await page.mouse.click(b.x + 6, b.y + 6);
+      assert.equal(await dialogOpen(page), true, 'padding is part of the dialog');
+      await page.mouse.click(5, 5);
+      assert.equal(await dialogOpen(page), false, 'the backdrop still cancels');
+    });
+    await scenario('a cache row\'s Clear goes pending and cannot be repeated', { path: '/settings', setup: (s) => {
+      const gate = new Promise((resolve) => { s.release = resolve; });
+      s.state.hooks['/v1/prefix-cache/clear'] = async () => { await gate; return null; };
+    } }, async ({ page, server }) => {
+      const clear = () => page.locator('#cacheRows tr', { hasText: '22.1' }).locator('button');
+      await page.waitForSelector('#cacheRows tr button');
+      await clear().click();
+      await page.click('#cdOk');
+      await settle(page);
+      assert.equal(await clear().isDisabled(), true);
+      assert.match(await clear().textContent(), /Clearing/);
+      await clear().evaluate((b) => b.click());
+      assert.equal(await dialogOpen(page), false, 'no second confirmation');
+      server.release();
+      await settle(page, 1000);
+      assert.equal(server.count('/v1/prefix-cache/clear'), 1);
+    });
+    await scenario('the zero-size toast quotes the server', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#cacheGb');
+      await page.fill('#cacheGb', '0');
+      await page.click('#cacheSave');
+      await page.click('#cdOk');
+      await page.waitForSelector('.toast');
+      const toast = await page.textContent('#toastHost');
+      assert.match(toast, /next model load/i);
+      assert.doesNotMatch(toast, /now has 0/);
+      await settle(page, 1000);
+      assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"] .badges'), /Applies now/, 'a size of 0 applies at the next load');
+    });
+    await scenario('the model path shows when /v1/settings answers after /v1/models', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.settingsDelay.push(new Promise((resolve) => { s.releaseSettings = resolve; }));
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('#modelsDetail h2');
+      await page.waitForTimeout(300);
+      server.releaseSettings();
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.waitForTimeout(300);
+      assert.equal(await page.locator('.facts .mono').count(), 1);
+    });
+    await scenario('065536 over a saved 65536 is not a change', { path: '/models#Qwen-A' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '065536');
+      await settle(page);
+      assert.equal(await page.evaluate(() => document.querySelector('.set[data-key="ctx_size"]').classList.contains('dirty')), false);
+      assert.doesNotMatch(await page.textContent(`${row('ctx_size')} .hint`), /was/);
+      assert.equal(await page.isVisible('.savebar'), false);
+    });
+    await scenario('an empty models folder shows one Rescan and no empty detail card', { path: '/models', setup: (s) => { s.state.models = []; } }, async ({ page }) => {
+      await page.waitForSelector('#modelsList .empty');
+      assert.equal(await page.isVisible('#modelsDetail'), false);
+      assert.equal(await page.locator('button:visible', { hasText: 'Rescan' }).count(), 1);
+      assert.equal(await page.locator('#modelsList .empty >> text=Open Settings').count(), 1);
+    });
+    await scenario('In use lists the saved folder too', { path: '/settings', setup: (s) => { s.state.server.models_dir.file = '/extra/packs'; } }, async ({ page }) => {
+      await page.waitForSelector('#dirKv');
+      const text = await page.textContent('#dirKv');
+      assert.match(text, /\/models/);
+      assert.match(text, /\/extra\/packs/);
+    });
+    await scenario('Enter submits the size and the folder', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#dirPath');
+      await page.fill('#cacheGb', '12');
+      await page.press('#cacheGb', 'Enter');
+      await page.waitForSelector('.toast');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { prefix_cache_disk_gb: 12 } });
+      await page.fill('#dirPath', '/x/y');
+      await page.press('#dirPath', 'Enter');
+      await settle(page, 500);
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { models_dir: '/x/y' } });
+    });
+    await scenario('a bulk Clear stays off until the table shows the new bytes', { path: '/settings', setup: (s) => {
+      let hold = false;
+      const clearGate = new Promise((resolve) => { s.releaseClear = resolve; }), getGate = new Promise((resolve) => { s.releaseGet = resolve; });
+      s.state.hooks['/v1/prefix-cache/clear'] = async () => { hold = true; await clearGate; return null; };
+      s.state.hooks['/v1/prefix-cache'] = async () => { if (hold) await getGate; return null; };
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('#clearStale:not([disabled])');
+      await page.click('#clearStale');
+      await page.click('#cdOk');
+      await settle(page);
+      server.releaseClear();
+      await page.waitForTimeout(400);
+      assert.equal(await page.isDisabled('#clearStale'), true, 'still pending while the refreshed bytes are on their way');
+      server.releaseGet();
+      await settle(page, 500);
+      assert.equal(await page.isDisabled('#clearStale'), true);
+    });
+    await scenario('an assigned-space box follows the file again once the typing matches it', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#cacheGb');
+      await page.fill('#cacheGb', '5');
+      await page.fill('#cacheGb', '100');
+      Object.assign(server.state.server.prefix_cache_disk_gb, { file: 80, effective_bytes: 80 * GiB });
+      await page.evaluate(() => window.sushiAdmin.refresh());
+      await settle(page, 500);
+      assert.equal(await page.inputValue('#cacheGb'), '80');
+    });
+    await scenario('the confirm dialog is described by its body', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#clearAll');
+      assert.equal(await page.getAttribute('#confirmDialog', 'aria-describedby'), 'cdBody');
+    });
+    await scenario('Advanced lists the cache columns and each namespace\'s write rate', { path: '/settings', open: { mode: 'advanced' } }, async ({ page, server }) => {
+      await page.waitForSelector('#cacheRows tr button');
+      const heads = await page.$$eval('#cacheCard thead th', (ths) => ths.filter((t) => t.offsetParent).map((t) => t.textContent));
+      for (const want of ['Entries', 'ID', 'Tier use', 'Written', 'Write rate']) assert.ok(heads.includes(want), `column ${want} (${heads})`);
+      const cells = await page.$$eval('#cacheRows tr:first-child td', (tds) => tds.map((t) => t.textContent));
+      assert.ok(cells.includes('37'), `entries ${cells}`);
+      assert.ok(cells.includes('aaaaaaaa'), `id ${cells}`);
+      assert.ok(cells.some((c) => /41\.0 GiB \/ 100 GiB/.test(c)), `tier use ${cells}`);
+      assert.ok(cells.includes('5.00 GiB'), `written ${cells}`);
+      server.state.cache.namespaces[0].tier.written_bytes += 100 * 2 ** 20;
+      server.state.cache.total_bytes += 1;
+      await settle(page, 10_000);
+      const rate = await page.$eval('#cacheRows tr:first-child td:nth-last-child(2)', (td) => td.textContent);
+      assert.match(rate, /^\d+(\.\d+)? MiB\/s$/);
+      assert.ok(Number.parseFloat(rate) > 5 && Number.parseFloat(rate) < 12, rate);
+      assert.match(await page.textContent('#cacheKv'), /Write rate/);
+      await page.click('#modeToggle [data-mode="compact"]');
+      assert.equal(await page.isVisible('#cacheCard th:text-is("Entries")'), false, 'Compact keeps the short table');
+    });
+    await scenario('an assigned space beyond the free disk is flagged', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#cacheGb');
+      assert.equal(await page.locator('#cacheCard .warn:visible').count(), 0);
+      await page.fill('#cacheGb', '5000');
+      assert.match(await page.textContent('#cacheCard .warn'), /free/);
+      assert.equal(await page.isDisabled('#cacheSave'), false, 'a warning does not block saving');
+      await page.fill('#cacheGb', '100');
+      assert.equal(await page.locator('#cacheCard .warn:visible').count(), 0);
+    });
+    await scenario('Use default names the default size when the server says it', { path: '/settings', setup: (s) => { s.state.server.prefix_cache_disk_gb.default_bytes = 20 * GiB; } }, async ({ page }) => {
+      await page.waitForSelector('#cacheDefault');
+      assert.equal(await page.textContent('#cacheDefault'), 'Use default (20 GiB)');
+    });
+    await scenario('Use default stays plain when the server does not say the default', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#cacheDefault');
+      assert.equal(await page.textContent('#cacheDefault'), 'Use default');
+    });
+
+    if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);
     console.log('Web UI admin views (browser): passed');
   } finally {
     await browser.close();
