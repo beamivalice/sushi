@@ -12,6 +12,7 @@ extern fn objc_allocateClassPair(super: id, name: [*:0]const u8, extra: usize) i
 extern fn objc_registerClassPair(cls: id) void;
 extern fn class_addMethod(cls: id, sel: SEL, imp: *const anyopaque, types: [*:0]const u8) bool;
 extern var NSRunLoopCommonModes: id;
+extern var NSPasteboardTypeString: id;
 
 pub fn class(name: [*:0]const u8) id {
     return objc_getClass(name);
@@ -60,4 +61,10 @@ pub fn new(cls: id) id {
 pub fn addTimer(seconds: f64, target: id, selector: [*:0]const u8) void {
     const timer = msg(id, class("NSTimer"), "timerWithTimeInterval:target:selector:userInfo:repeats:", .{ seconds, target, sel_registerName(selector), @as(id, null), true });
     msg(void, msg(id, class("NSRunLoop"), "mainRunLoop", .{}), "addTimer:forMode:", .{ timer, NSRunLoopCommonModes });
+}
+
+pub fn copyText(text: [*:0]const u8) void {
+    const pb = msg(id, class("NSPasteboard"), "generalPasteboard", .{});
+    _ = msg(isize, pb, "clearContents", .{});
+    _ = msg(bool, pb, "setString:forType:", .{ nsString(text), NSPasteboardTypeString });
 }

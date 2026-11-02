@@ -497,6 +497,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `--parent-pid` 403 (the host updates its engine), a request decoding or queued or a model loading 409 `update_busy`
   (refused, never queued), an install that cannot replace itself (Homebrew, source build, app bundle, unwritable) 409
   by name, no newer release known 409.
+- A running `sushibar` (the menu bar app) never blocks an update: it restarts itself when the `sushi` beside it changes version.
 - Accepted: 202 `{"status":"updating","from","to"}`, then the SIGTERM shutdown path and the in-place updater
   ([server-lifecycle](server-lifecycle.md#self-update)).
 

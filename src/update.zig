@@ -623,6 +623,13 @@ fn execInPlace(arena: Allocator, argv: []const []const u8) void {
     _ = spawn(arena, argv, true, null) catch {};
 }
 
+/// Whether a process running `exe` stops the swap of `dir`: anything from the install but `sushibar`, which
+/// restarts itself on the new version and never holds `sushi` open.
+fn blocksUpdate(dir: []const u8, exe: []const u8) bool {
+    if (exe.len <= dir.len or !std.mem.startsWith(u8, exe, dir) or exe[dir.len] != '/') return false;
+    return !eql(u8, std.fs.path.basename(exe), "sushibar");
+}
+
 /// Another process running a binary from `dir`, or null.
 fn otherProcessIn(dir: []const u8) ?c_int {
     var pids: [8192]c_int = undefined;
@@ -634,8 +641,7 @@ fn otherProcessIn(dir: []const u8) ?c_int {
         if (pid == self or pid <= 0) continue;
         const len = proc_pidpath(pid, &buf, buf.len);
         if (len <= 0) continue;
-        const p = buf[0..@intCast(len)];
-        if (p.len > dir.len and std.mem.startsWith(u8, p, dir) and p[dir.len] == '/') return pid;
+        if (blocksUpdate(dir, buf[0..@intCast(len)])) return pid;
     }
     return null;
 }
@@ -949,6 +955,14 @@ fn relaunch(arena: Allocator, io: std.Io, argv: []const []const u8, result: anye
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "update: a process from the install blocks the swap, except the menu bar app" {
+    try testing.expect(blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushi"));
+    try testing.expect(blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushi-ubench"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushibar"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/other/sushi"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64"));
+}
 
 test "update: the relaunch log line never carries the api key" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);

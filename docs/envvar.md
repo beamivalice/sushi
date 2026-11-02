@@ -116,7 +116,7 @@ Inputs and hooks that real-pack tests and scripts use.
 | `SUSHI_TEST_LOAD_DELAY_MS` | `model_load.zig` (`startupLoadDelayMs`) | `<ms>` holds the `--model` startup load after its refusals, before the weights, so a test can observe the server listening during the load (`tests/test_early_listener.sh`) | load | yes: server-lifecycle, tests/CLAUDE |
 | `SUSHI_MODELS_DIR` | `test_models.zig:7` | root for real-pack tests (`${SUSHI_MODELS_DIR:-~/.sushi/models}`); the engine itself does not read it | test | yes: tests/CLAUDE |
 | `SUSHI_NO_SUCH_DIAG_SWITCH_PROBE` | `transformer.zig` | unit probe that `diagEnvOnCached` honors `0`/empty/set | test | no |
-| `SUSHIBAR_TEST_POLLS`, `SUSHIBAR_TEST_ACTIONS` | `sushibar_main.zig` (`readTestSeams`) | `sushibar` (not the engine): `N` prints each poll's title, status line and Start/Stop state to stderr and quits after N polls; `start@2,stop@10` runs the Start or Stop action at that poll (`tests/test_sushibar.sh`) | once | yes: tests/CLAUDE |
+| `SUSHIBAR_TEST_POLLS`, `SUSHIBAR_TEST_ACTIONS` | `sushibar_main.zig` (`readTestSeams`) | `sushibar` (not the engine): `N` prints each poll's title, status, Port data, version and update lines to stderr and quits after N polls; `start@2,stop@10,check@3,update@4,port18802@2,confirm@1` runs that action at that poll (`confirm` answers every stop confirmation Yes; without it a test never stops a sushi it did not start) (`tests/test_sushibar.sh`) | once | yes: tests/CLAUDE |
 | `SUSHI_UPDATE_API` | `update.zig:28` | replaces `https://api.github.com` for the update check (`tests/test_self_update.sh`) | per update check | yes: server-lifecycle, tests/CLAUDE |
 
 ## Paths and config (8)
