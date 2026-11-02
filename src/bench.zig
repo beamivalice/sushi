@@ -41,9 +41,9 @@ pub const USAGE =
     \\with a table of prefill, decode and mode by arm and rung.
     \\--url drives a server somebody else booted (tests/bench.sh boots it and takes the box rules) and reads its log.
     \\
-    \\Either way it reads the GPU clock and thermal pressure through `sudo -n powermetrics` beside every request and
+    \\Either way it reads the GPU clock and thermal pressure beside every request, with no sudo, and
     \\stops with an error when the busy clock is throttled (at most 1100 MHz); the pressure level is recorded only.
-    \\Without a passwordless sudo rule it says so and runs unmonitored.
+    \\Where the clock cannot be read it says so and runs unmonitored.
     \\
     \\Options:
     \\  --model <dir>          Pack to load and bench in this process (with --url: the model id to send)
@@ -929,13 +929,13 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
 }
 
 fn startSampler(gpa: std.mem.Allocator, io: std.Io) ?*gpu_clock.Sampler {
-    const s = gpu_clock.Sampler.start(gpa, io, &gpu_clock.powermetrics_argv) catch |e| {
-        log.warn("[bench] the GPU clock is not monitored: cannot run powermetrics ({s})\n", .{@errorName(e)});
+    const s = gpu_clock.Sampler.start(gpa, io) catch |e| {
+        log.warn("[bench] the GPU clock is not monitored: cannot read it ({s})\n", .{@errorName(e)});
         return null;
     };
     if (!s.waitFirst(5000)) {
         s.stop();
-        log.warn("[bench] the GPU clock is not monitored: `sudo -n powermetrics` gave no reading (it needs a passwordless sudo rule)\n", .{});
+        log.warn("[bench] the GPU clock is not monitored: the clock gave no reading\n", .{});
         return null;
     }
     return s;

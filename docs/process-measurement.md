@@ -141,14 +141,14 @@ The protocol, fixed for every model and release:
 - **The report** puts code and prose decode side by side per rung (with the prose/code ratio), one window table per
   arm, and a summary row set: the code rows keep the old shape and stay comparable across releases, and the prose rows
   are added beneath them as `<pack> (prose)`.
-- **The GPU clock is read, and a throttled run stops.** `sushi bench` runs `sudo -n powermetrics --samplers gpu_power,thermal`
-  (500 ms) beside the run and keeps, for each request, the median active MHz of the samples with at least 50% GPU
-  residency and the worst thermal pressure level; both are columns beside the tok/s and the header gives the run's
+- **The GPU clock is read, and a throttled run stops.** `sushi bench` reads the GPU clock (IOReport P-state residency
+  weighted by the `pmgr` frequency table) and the thermal pressure notification, with no sudo, every 500 ms beside the run and keeps, for each request, the median active MHz of the samples with at least 50% GPU
+  utilization (the AGX "Device Utilization %") and the worst thermal pressure level; both are columns beside the tok/s and the header gives the run's
   minimum and median. A request whose busy clock is at 1100 MHz or under aborts the bench with an error naming it
   (the top clock is 1620 MHz; a throttled run sat at 1025 to 1120). The pressure level is recorded only: a DeepSeek run
   reached `Heavy` 25 minutes in with the GPU still at 1539 MHz. The partial report is `bench-aborted.md` in the run
-  directory, never `docs/bench`. `bench.sh` logs the pressure level after the cooldown. Without a passwordless `sudo -n powermetrics` both say the clock is not monitored and
-  go on; a decode number from a run that was not monitored needs a `powermetrics` look beside it before it is recorded.
+  directory, never `docs/bench`. `bench.sh` logs the pressure level after the cooldown. Where the clock cannot be read the bench says it is not monitored and goes on;
+  a decode number from a run that was not monitored needs a clock look beside it before it is recorded.
 - **The prose arm starts cool.** Between the arms `sushi bench` sets the fans to max and idles until the hottest
   `fanctl status` die is under 50 C, at most 180 s (no idle when `fanctl` gives no reading); the wait is logged and named in the report's protocol line.
 - **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a

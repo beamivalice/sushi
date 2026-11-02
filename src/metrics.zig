@@ -92,6 +92,8 @@ pub const Metrics = struct {
     requests_running: Gauge,
     requests_waiting: Gauge,
     gpu_utilization_pct: Gauge, // 0–100
+    gpu_clock_mhz: Gauge, // active-weighted since the last sample; 0 when idle or unreadable
+    gpu_clock_max_mhz: Gauge, // top P-state, 0 when the clock is unreadable
     memory_mb: Gauge, // megabytes (phys_footprint)
     // Real-time throughput source: completed generation tokens PLUS tokens
     // generated so far by in-flight slots. The sampler thread sets this from
@@ -151,6 +153,8 @@ pub const Metrics = struct {
             .requests_running = Gauge.init(),
             .requests_waiting = Gauge.init(),
             .gpu_utilization_pct = Gauge.init(),
+            .gpu_clock_mhz = Gauge.init(),
+            .gpu_clock_max_mhz = Gauge.init(),
             .memory_mb = Gauge.init(),
             .generation_tokens_live = Gauge.init(),
             .prefill_tokens_live = Gauge.init(),
@@ -269,6 +273,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "vllm:num_requests_running", "Number of requests currently being processed", m.requests_running.load());
     try writeGauge(w, "vllm:num_requests_waiting", "Number of requests waiting in the queue", m.requests_waiting.load());
     try writeGauge(w, "sushi:gpu_utilization_pct", "GPU utilization percentage (IOKit AGXAccelerator)", m.gpu_utilization_pct.load());
+    try writeGauge(w, "sushi:gpu_clock_mhz", "GPU clock in MHz, active-weighted over the last sample (IOReport; 0 when idle or unreadable)", m.gpu_clock_mhz.load());
+    try writeGauge(w, "sushi:gpu_clock_max_mhz", "Highest GPU P-state frequency in MHz (0 when unreadable)", m.gpu_clock_max_mhz.load());
     try writeGauge(w, "sushi:memory_mb", "Server physical memory footprint in megabytes (phys_footprint)", m.memory_mb.load());
     try writeGauge(w, "sushi:generation_tokens_live", "Generation tokens completed plus generated-so-far by in-flight slots (real-time tok/s source)", m.generation_tokens_live.load());
     try writeGauge(w, "sushi:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
@@ -429,6 +435,8 @@ pub fn renderJsonWith(m: *const Metrics, sessions: []const Session, history: ?[]
             "\"requests_running\":{d}," ++
             "\"requests_waiting\":{d}," ++
             "\"gpu_utilization_pct\":{d}," ++
+            "\"gpu_clock_mhz\":{d}," ++
+            "\"gpu_clock_max_mhz\":{d}," ++
             "\"memory_mb\":{d}," ++
             "\"generation_tokens_live\":{d}," ++
             "\"prefill_tokens_live\":{d}," ++
@@ -453,6 +461,8 @@ pub fn renderJsonWith(m: *const Metrics, sessions: []const Session, history: ?[]
             m.requests_running.load(),
             m.requests_waiting.load(),
             m.gpu_utilization_pct.load(),
+            m.gpu_clock_mhz.load(),
+            m.gpu_clock_max_mhz.load(),
             m.memory_mb.load(),
             m.generation_tokens_live.load(),
             m.prefill_tokens_live.load(),
@@ -965,6 +975,22 @@ test "renderJson output parses as valid JSON via stdlib parser" {
     // Verify counters sub-object has expected key
     const counters = obj1.get("counters").?.object;
     try testing.expectEqual(@as(i64, 1), counters.get("requests_success_total").?.integer);
+}
+
+test "gpu clock gauges are on both surfaces" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.gpu_clock_mhz.set(1193);
+    m.gpu_clock_max_mhz.set(1620);
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &.{}, &jw);
+    try testing.expect(std.mem.indexOf(u8, jbuf[0..jw.end], "\"gpu_clock_mhz\":1193,\"gpu_clock_max_mhz\":1620,") != null);
+    var pbuf: [64 * 1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try renderPrometheus(&m, &pw);
+    try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "sushi:gpu_clock_mhz 1193") != null);
+    try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "sushi:gpu_clock_max_mhz 1620") != null);
 }
 
 test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {

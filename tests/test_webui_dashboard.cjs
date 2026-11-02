@@ -118,9 +118,10 @@ function installStubs(config) {
         }
         if (stub.history) {
           const since = Number(url.searchParams.get('since') || 0), t0 = Date.now() - 20000;
-          const fields = ['t_ms', 'gen_tokens', 'prefill_tokens', 'running', 'waiting', 'prefilling', 'batched', 'gpu_pct', 'memory_mb', 'mlx_active', 'mlx_cache'];
-          const samples = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => [t0 + (i < 5 ? i : i + 15) * 1000, i * 40, 0, 1, 0, 0, 0, 50, 4096, 2 ** 30, 2 ** 30]).filter((r) => r[0] > since);
-          return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1 }, histograms: {}, sessions: [], history: { interval_ms: 2000, capacity: 1800, fields, samples } });
+          const fields = ['t_ms', 'gen_tokens', 'prefill_tokens', 'running', 'waiting', 'prefilling', 'batched', 'gpu_pct', 'memory_mb', 'mlx_active', 'mlx_cache', 'gpu_mhz'];
+          const samples = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => [t0 + (i < 5 ? i : i + 15) * 1000, i * 40, 0, 1, 0, 0, 0, 50, 4096, 2 ** 30, 2 ** 30, stub.noClock ? 0 : 1200]).filter((r) => r[0] > since);
+          const clock = stub.noClock ? { gpu_clock_mhz: 0, gpu_clock_max_mhz: 0 } : { gpu_clock_mhz: 1200, gpu_clock_max_mhz: 1620 };
+          return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, gpu_utilization_pct: 50, ...clock }, histograms: {}, sessions: [], history: { interval_ms: 2000, capacity: 1800, fields, samples } });
         }
         return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, prefill_tokens_live: stub.prefillTick = (stub.prefillTick ?? 0) + (stub.prefillStep ?? 0), gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 } });
       case '/v1/chat/completions': {
@@ -885,6 +886,39 @@ async function main() {
       assert.deepEqual(errors, []);
       await context.close();
     }
+    for (const mode of ['advanced', 'compact']) {
+      // The GPU chart pairs the clock (left axis, up to the table's top) with utilization (right axis, 0 to 100%); the
+      // history backfill carries both, and a box with no readable clock says so and keeps the utilization.
+      const id = mode === 'advanced' ? 'dashCGpu' : 'dashCGpuc';
+      const hoverTip = async (page) => {
+        const box = await page.evaluate((i) => { const b = document.getElementById(i).getBoundingClientRect(); return { x: b.left, y: b.top, w: b.width, h: b.height }; }, id);
+        await page.mouse.move(box.x + box.w - 60, box.y + box.h / 2);
+        await page.waitForFunction(() => getComputedStyle(document.getElementById('dashTip')).display === 'block', null, { timeout: 5000 });
+        return page.evaluate(() => document.getElementById('dashTip').innerText.replace(/\s+/g, ' '));
+      };
+      const { page, errors, context } = await openPage(browser, '/dashboard', { mode, history: true });
+      await page.waitForFunction((i) => (window.__axis[i] ?? []).includes('1,620'), id, { timeout: 15000 });
+      const axis = await axisOf(page, id);
+      assert.ok(axis.includes('100%') && axis.includes('0%'), `${mode}: the right axis is utilization 0 to 100% (${axis})`);
+      assert.ok(await page.evaluate(() => document.getElementById('dashCGpu').closest('.card').querySelector('.legend').innerText.includes('clock')), `${mode}: the legend names the clock`);
+      const tip = await hoverTip(page);
+      assert.match(tip, /GPU clock\s*1,200 MHz/, `${mode}: the tooltip names the clock from the backfilled samples (${tip})`);
+      assert.match(tip, /Utilization\s*50%/, `${mode}: and the utilization (${tip})`);
+      assert.equal(await textOf(page, mode === 'advanced' ? 'dashCGpuL' : 'dashCGpucL'), '', `${mode}: no unavailable note`);
+      assert.deepEqual(errors, []);
+      await context.close();
+
+      const off = await openPage(browser, '/dashboard', { mode, history: true, noClock: true });
+      await off.page.waitForFunction((i) => (off => off.length > 4)(window.__axis[i] ?? []), id, { timeout: 15000 });
+      const offAxis = await axisOf(off.page, id);
+      assert.ok(!offAxis.includes('1,620') && offAxis.includes('100'), `${mode}: without a clock the axis is utilization alone (${offAxis})`);
+      assert.match(await textOf(off.page, mode === 'advanced' ? 'dashCGpuL' : 'dashCGpucL'), /clock unavailable/, `${mode}: the chart says the clock is unavailable`);
+      const offTip = await hoverTip(off.page);
+      assert.ok(!/GPU clock/.test(offTip) && /Utilization\s*50%/.test(offTip), `${mode}: the tooltip shows utilization only (${offTip})`);
+      assert.deepEqual(off.errors, []);
+      await off.context.close();
+    }
+
     {
       // Hovering a chart costs one redraw per frame and reads no style per colour.
       const { page, errors, context } = await openPage(browser, '/dashboard', { compact: 'decode', mode: 'compact' });

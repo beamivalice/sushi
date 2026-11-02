@@ -72,6 +72,7 @@ const request_policy = @import("request_policy.zig");
 const models_api = @import("models_api.zig");
 const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const metrics_history = @import("metrics_history.zig");
+const gpu_clock_live = @import("gpu_clock_live.zig");
 const json_text = @import("json_text.zig");
 const settings_api = @import("settings_api.zig");
 const logprobs = @import("logprobs.zig");
@@ -8328,6 +8329,8 @@ const GaugeSamplerCtx = struct {
 fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // System gauges (non-blocking syscalls).
     ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
+    ctx.metrics.gpu_clock_mhz.set(gpu_clock_live.sampleMhz());
+    ctx.metrics.gpu_clock_max_mhz.set(gpu_clock_live.maxMhz());
     ctx.metrics.memory_mb.set(@as(u64, metrics.getAppMemFootprintMb()));
     // The two halves of the MLX allocator, so `memory_mb`'s gap has a name.
     var mlx_active: usize = 0;
@@ -8370,6 +8373,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
         .mlx_cache = mlx_cache,
         .memory_mb = @intCast(@min(ctx.metrics.memory_mb.load(), std.math.maxInt(u32))),
         .gpu_pct = @intCast(@min(ctx.metrics.gpu_utilization_pct.load(), 100)),
+        .gpu_mhz = @intCast(@min(ctx.metrics.gpu_clock_mhz.load(), std.math.maxInt(u16))),
         .running = @intCast(@min(running, std.math.maxInt(u16))),
         .waiting = @intCast(@min(waiting, std.math.maxInt(u16))),
         .prefilling = @intCast(@min(ctx.metrics.requests_prefilling.load(), std.math.maxInt(u16))),

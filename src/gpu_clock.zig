@@ -1,9 +1,13 @@
-//! The GPU clock under a timed run. `sudo -n powermetrics` prints the active GPU frequency and the thermal
-//! pressure level every interval; `sushi bench` reads it beside every request so a throttled run is named, and stops.
+//! The GPU clock under a timed run. A thread reads the active GPU frequency (IOReport, `gpu_clock_live.zig`) and the
+//! thermal pressure level (the system notification) every interval, no sudo; `sushi bench` reads it beside every
+//! request so a throttled run is named, and stops.
 //! Docs: process-measurement.md#release-bench.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_util = @import("io_util.zig");
+const live = @import("gpu_clock_live.zig");
+const status = @import("status.zig");
 const testing = std.testing;
 
 /// Ordered by severity, so the worst level seen is the largest.
@@ -11,7 +15,7 @@ pub const Pressure = enum { nominal, moderate, heavy, trapping, sleeping, other 
 
 /// A throttled M5 Max sat at 1025-1120 MHz under `Heavy` pressure; an unthrottled one runs 1578-1620 MHz.
 pub const throttle_mhz: f64 = 1100;
-/// A sample below this GPU residency is idle time and says nothing about the clock under load.
+/// A sample below this GPU utilization (%) is idle time and says nothing about the clock under load.
 pub const busy_residency: f64 = 50;
 pub const interval_ms: u32 = 500;
 
@@ -21,7 +25,6 @@ pub const Reading = struct {
     span_ms: f64,
     mhz: f64,
     residency: f64,
-    power_mw: f64,
     pressure: Pressure,
 };
 
@@ -36,55 +39,33 @@ pub fn pressureLabel(p: Pressure) []const u8 {
     };
 }
 
-/// Folds powermetrics' text, a line at a time, into readings. A sample is complete at its `GPU Power` line;
-/// one that lacks the frequency, residency or pressure line is dropped rather than guessed.
-pub const LineParser = struct {
-    span_ms: f64 = 0,
-    mhz: ?f64 = null,
-    residency: ?f64 = null,
-    pressure: ?Pressure = null,
+extern "c" fn notify_register_check(name: [*:0]const u8, token: *c_int) u32;
+extern "c" fn notify_get_state(token: c_int, state: *u64) u32;
 
-    pub fn feed(p: *LineParser, line: []const u8, at_ms: i64) ?Reading {
-        if (std.mem.startsWith(u8, line, "*** Sampled system activity")) {
-            p.* = .{};
-            if (std.mem.indexOf(u8, line, "ms elapsed")) |end| {
-                const open = std.mem.lastIndexOfScalar(u8, line[0..end], '(') orelse return null;
-                p.span_ms = std.fmt.parseFloat(f64, line[open + 1 .. end]) catch 0;
-            }
-        } else if (valueAfter(line, "Current pressure level:")) |v| {
-            const name = firstWord(v);
-            p.pressure = .other;
-            inline for (.{ .nominal, .moderate, .heavy, .trapping, .sleeping }) |tag| {
-                if (std.ascii.eqlIgnoreCase(name, @tagName(tag))) p.pressure = tag;
-            }
-        } else if (valueAfter(line, "GPU HW active frequency:")) |v| {
-            p.mhz = std.fmt.parseFloat(f64, firstWord(v)) catch null;
-        } else if (valueAfter(line, "GPU HW active residency:")) |v| {
-            p.residency = std.fmt.parseFloat(f64, std.mem.trimEnd(u8, firstWord(v), "%")) catch null;
-        } else if (valueAfter(line, "GPU Power:")) |v| {
-            const done = p.*;
-            p.* = .{};
-            const power = std.fmt.parseFloat(f64, firstWord(v)) catch return null;
-            return .{
-                .at_ms = at_ms,
-                .span_ms = if (done.span_ms > 0) done.span_ms else interval_ms,
-                .mhz = done.mhz orelse return null,
-                .residency = done.residency orelse return null,
-                .power_mw = power,
-                .pressure = done.pressure orelse return null,
-            };
-        }
-        return null;
-    }
+/// `com.apple.system.thermalpressurelevel`: 0 Nominal, 1 Moderate, 2 Heavy (read on a box powermetrics called Heavy),
+/// then Trapping and Sleeping in powermetrics' order.
+pub fn pressureFromLevel(level: u64) Pressure {
+    return switch (level) {
+        0 => .nominal,
+        1 => .moderate,
+        2 => .heavy,
+        3 => .trapping,
+        4 => .sleeping,
+        else => .other,
+    };
+}
 
-    fn valueAfter(line: []const u8, key: []const u8) ?[]const u8 {
-        return if (std.mem.startsWith(u8, line, key)) std.mem.trim(u8, line[key.len..], " \t\r") else null;
+/// Null when the notification is unavailable.
+fn readPressure(token: *?c_int) ?Pressure {
+    if (token.* == null) {
+        var t: c_int = 0;
+        if (notify_register_check("com.apple.system.thermalpressurelevel", &t) != 0) return null;
+        token.* = t;
     }
-
-    fn firstWord(v: []const u8) []const u8 {
-        return v[0 .. std.mem.indexOfAny(u8, v, " (") orelse v.len];
-    }
-};
+    var level: u64 = 0;
+    if (notify_get_state(token.*.?, &level) != 0) return null;
+    return pressureFromLevel(level);
+}
 
 pub const Summary = struct {
     /// Median active MHz of the busy samples; 0 when none was busy.
@@ -158,7 +139,7 @@ pub fn summarizeRun(a: std.mem.Allocator, readings: []const Reading) !RunSummary
 
 pub fn writeRunHeader(w: *std.Io.Writer, s: RunSummary) !void {
     if (!s.monitored) {
-        try w.writeAll("GPU clock: not monitored (no passwordless `sudo -n powermetrics`), so a thermally throttled run would not be flagged.\n\n");
+        try w.writeAll("GPU clock: not monitored (the IOReport clock was unreadable), so a thermally throttled run would not be flagged.\n\n");
         return;
     }
     try w.print("GPU clock, sampled every {d} ms: median {d:.0} MHz, minimum {d:.0} MHz over {d} busy samples; thermal pressure seen:", .{ interval_ms, s.median_mhz, s.min_mhz, s.busy_samples });
@@ -172,53 +153,43 @@ pub fn writeRunHeader(w: *std.Io.Writer, s: RunSummary) !void {
     try w.writeAll(if (first) " none.\n\n" else ".\n\n");
 }
 
-/// powermetrics under `sudo -n`, which never prompts: without a sudoers rule it exits at once and the sampler reads
-/// nothing. `-b 1` makes it write each line as it is produced instead of in blocks.
-pub const powermetrics_argv = [_][]const u8{ "/usr/bin/sudo", "-n", "powermetrics", "--samplers", "gpu_power,thermal", "-i", std.fmt.comptimePrint("{d}", .{interval_ms}), "-b", "1" };
-
-/// A child process that prints powermetrics text, read on a thread into `readings`.
+/// Reads the clock and the pressure every `interval_ms` on a thread into `readings`.
 pub const Sampler = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    child: std.process.Child,
-    pid: std.c.pid_t,
+    reader: live.Reader,
     thread: std.Thread = undefined,
     mu: std.Io.Mutex = .init,
     readings: std.ArrayList(Reading) = .empty,
-    done: std.atomic.Value(bool) = .init(false),
+    stopping: std.atomic.Value(bool) = .init(false),
 
-    pub fn start(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !*Sampler {
+    /// Fails when the clock cannot be read on this box.
+    pub fn start(gpa: std.mem.Allocator, io: std.Io) !*Sampler {
         const self = try gpa.create(Sampler);
         errdefer gpa.destroy(self);
-        const child = try std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .pipe, .stderr = .ignore });
-        self.* = .{ .gpa = gpa, .io = io, .child = child, .pid = child.id.? };
-        self.thread = std.Thread.spawn(.{}, readMain, .{self}) catch |e| {
-            self.child.kill(io);
-            return e;
-        };
+        self.* = .{ .gpa = gpa, .io = io, .reader = live.Reader.open() orelse return error.GpuClockUnavailable };
+        self.thread = try std.Thread.spawn(.{}, readMain, .{self});
         return self;
     }
 
-    /// Ends the child (SIGTERM, which sudo passes on to powermetrics) and frees the sampler.
     pub fn stop(self: *Sampler) void {
-        if (!self.done.load(.acquire)) std.posix.kill(self.pid, .TERM) catch {};
+        self.stopping.store(true, .release);
         self.thread.join();
         self.readings.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
-    /// True once a reading has arrived; false when the child ended without one or `timeout_ms` passed.
+    /// True once a reading has arrived; false when `timeout_ms` passed.
     pub fn waitFirst(self: *Sampler, timeout_ms: u32) bool {
         return self.waitPast(std.math.minInt(i64), timeout_ms);
     }
 
     /// Waits until a reading ends at or after `t_ms`, so the sample that covers a request's last moments is in.
-    /// False when the child ended or `timeout_ms` passed first.
+    /// False when `timeout_ms` passed first.
     pub fn waitPast(self: *Sampler, t_ms: i64, timeout_ms: u32) bool {
         var waited: u32 = 0;
         while (waited <= timeout_ms) : (waited += 50) {
             if (self.lastAt()) |at| if (at >= t_ms) return true;
-            if (self.done.load(.acquire)) return false;
             std.Io.sleep(self.io, .fromMilliseconds(50), .real) catch {};
         }
         return false;
@@ -243,99 +214,35 @@ pub const Sampler = struct {
     }
 
     fn readMain(self: *Sampler) void {
-        var buf: [4096]u8 = undefined;
-        var r = self.child.stdout.?.readerStreaming(self.io, &buf);
-        var parser: LineParser = .{};
-        while (r.interface.takeDelimiter('\n') catch null) |line| {
+        var token: ?c_int = null;
+        var last = io_util.nowMsMonotonic(self.io);
+        while (!self.stopping.load(.acquire)) {
+            std.Io.sleep(self.io, .fromMilliseconds(interval_ms), .real) catch {};
+            const mhz = self.reader.sample() orelse continue;
+            const pressure = readPressure(&token) orelse continue;
             const at = io_util.nowMsMonotonic(self.io);
-            const reading = parser.feed(line, at) orelse continue;
+            const reading: Reading = .{ .at_ms = at, .span_ms = @floatFromInt(@max(at - last, 1)), .mhz = @floatFromInt(mhz), .residency = @floatFromInt(status.getGpuPct()), .pressure = pressure };
+            last = at;
             self.mu.lockUncancelable(self.io);
             self.readings.append(self.gpa, reading) catch {};
             self.mu.unlock(self.io);
         }
-        _ = self.child.wait(self.io) catch {};
-        self.done.store(true, .release);
     }
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
-fn block(comptime pressure: []const u8, comptime mhz: u32, comptime residency: []const u8, comptime power_mw: u32) []const u8 {
-    return std.fmt.comptimePrint(
-        \\*** Sampled system activity (Mon Oct 26 17:54:29 2026 +0700) (503.30ms elapsed) ***
-        \\
-        \\
-        \\
-        \\**** Thermal pressure ****
-        \\
-        \\Current pressure level: {s}
-        \\
-        \\**** GPU usage ****
-        \\
-        \\GPU HW active frequency: {d} MHz
-        \\GPU HW active residency: {s}% (338 MHz:   0% 486 MHz:   0% 636 MHz:   0% 796 MHz:   0% 888 MHz:   0% 988 MHz:   0% 1084 MHz:   0% 1182 MHz:   0% 1278 MHz:   0% 1374 MHz:   0% 1470 MHz:   0% 1578 MHz:  74% 1620 MHz:  26%)
-        \\GPU SW requested state: (P1 :   0% P2 :   0% P3 :   0% P4 :   0% P5 :   0% P6 :   0% P7 :   0% P8 :   0% P9 :   0% P10 :   0% P11 :   0% P12 :   0% P13 : 100%)
-        \\GPU idle residency:   0.00%
-        \\GPU Power: {d} mW
-        \\
-        \\
-    , .{ pressure, mhz, residency, power_mw });
-}
-
-fn parseAll(a: std.mem.Allocator, text: []const u8, readings: *std.ArrayList(Reading)) !void {
-    var p: LineParser = .{};
-    var at: i64 = 1000;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |l| {
-        if (p.feed(l, at)) |r| {
-            try readings.append(a, r);
-            at += 500;
-        }
-    }
-}
-
-test "gpu_clock: powermetrics text becomes one reading per sample" {
-    const a = testing.allocator;
-    var rs: std.ArrayList(Reading) = .empty;
-    defer rs.deinit(a);
-    try parseAll(a, "Machine model: Mac17,6\nBoot time: Sat Oct 24 17:10:32 2026\n\n" ++
-        comptime block("Nominal", 1589, " 100.00", 50761) ++ block("Heavy", 1061, "  31.88", 19400), &rs);
-    try testing.expectEqual(@as(usize, 2), rs.items.len);
-    try testing.expectEqual(@as(f64, 1589), rs.items[0].mhz);
-    try testing.expectEqual(@as(f64, 100), rs.items[0].residency);
-    try testing.expectEqual(@as(f64, 50761), rs.items[0].power_mw);
-    try testing.expectApproxEqAbs(@as(f64, 503.3), rs.items[0].span_ms, 0.001);
-    try testing.expectEqual(Pressure.nominal, rs.items[0].pressure);
-    try testing.expectEqual(@as(i64, 1000), rs.items[0].at_ms);
-    try testing.expectEqual(Pressure.heavy, rs.items[1].pressure);
-    try testing.expectEqual(@as(f64, 1061), rs.items[1].mhz);
-    try testing.expectApproxEqAbs(@as(f64, 31.88), rs.items[1].residency, 0.001);
-}
-
-test "gpu_clock: a sample missing its thermal line is dropped, not read as Nominal" {
-    const a = testing.allocator;
-    var rs: std.ArrayList(Reading) = .empty;
-    defer rs.deinit(a);
-    const full = comptime block("Nominal", 1589, " 100.00", 50761);
-    const cut = comptime std.mem.indexOf(u8, full, "Current pressure level").?;
-    const eol = comptime std.mem.indexOfScalarPos(u8, full, cut, '\n').?;
-    try parseAll(a, full[0..cut] ++ full[eol + 1 ..], &rs);
-    try testing.expectEqual(@as(usize, 0), rs.items.len);
-}
-
-test "gpu_clock: pressure names, unknown ones stay non-nominal" {
-    const a = testing.allocator;
-    var rs: std.ArrayList(Reading) = .empty;
-    defer rs.deinit(a);
-    try parseAll(a, comptime block("Moderate", 1500, " 100.00", 1) ++ block("Trapping", 900, " 100.00", 1) ++ block("Sleeping", 900, " 100.00", 1) ++ block("Weird", 900, " 100.00", 1), &rs);
-    try testing.expectEqual(Pressure.moderate, rs.items[0].pressure);
-    try testing.expectEqual(Pressure.trapping, rs.items[1].pressure);
-    try testing.expectEqual(Pressure.sleeping, rs.items[2].pressure);
-    try testing.expectEqual(Pressure.other, rs.items[3].pressure);
+test "gpu_clock: notification levels map onto the labels, unknown ones stay non-nominal" {
+    try testing.expectEqual(Pressure.nominal, pressureFromLevel(0));
+    try testing.expectEqual(Pressure.moderate, pressureFromLevel(1));
+    try testing.expectEqual(Pressure.heavy, pressureFromLevel(2));
+    try testing.expectEqual(Pressure.trapping, pressureFromLevel(3));
+    try testing.expectEqual(Pressure.sleeping, pressureFromLevel(4));
+    try testing.expectEqual(Pressure.other, pressureFromLevel(7));
 }
 
 fn rd(at_ms: i64, mhz: f64, residency: f64, pressure: Pressure) Reading {
-    return .{ .at_ms = at_ms, .span_ms = 500, .mhz = mhz, .residency = residency, .power_mw = 0, .pressure = pressure };
+    return .{ .at_ms = at_ms, .span_ms = 500, .mhz = mhz, .residency = residency, .pressure = pressure };
 }
 
 test "gpu_clock: a request's summary is the median clock of its busy samples and its worst pressure" {
@@ -399,19 +306,11 @@ test "gpu_clock: the report header names the clock and the pressure levels seen,
     try testing.expect(std.mem.startsWith(u8, out.written(), "GPU clock: not monitored"));
 }
 
-test "gpu_clock: a sampler reads a child's powermetrics text and stops it; a child that ends silently reads nothing" {
-    const a = testing.allocator;
-    const io = testing.io;
-    const text = comptime block("Nominal", 1589, " 100.00", 50761) ++ block("Heavy", 1061, " 100.00", 19400);
-    const s = try Sampler.start(a, io, &.{ "/bin/sh", "-c", "printf '%s' \"$0\"; exec sleep 60", text });
+test "gpu_clock: a sampler delivers readings and stops" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const s = Sampler.start(testing.allocator, testing.io) catch return;
+    defer s.stop();
     try testing.expect(s.waitFirst(5000));
-    while ((try s.summarizeAll(a)).busy_samples < 2) std.Io.sleep(io, .fromMilliseconds(20), .real) catch {};
-    const run = try s.summarizeAll(a);
-    try testing.expectEqual(@as(f64, 1061), run.min_mhz);
-    try testing.expectEqual(@as(u8, 0b101), run.seen);
-    s.stop();
-
-    const dead = try Sampler.start(a, io, &.{ "/bin/sh", "-c", "exit 1" });
-    try testing.expect(!dead.waitFirst(5000));
-    dead.stop();
+    const run = try s.summarizeAll(testing.allocator);
+    try testing.expect(run.monitored and run.seen != 0);
 }

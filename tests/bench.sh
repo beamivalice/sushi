@@ -110,11 +110,11 @@ for _ in $(seq 1 36); do
 done
 echo "bench.sh: die at ${t%.*} C at the boot" | tee -a "$OUT/bench.log"
 # The GPU clock is read by `sushi bench` itself, which aborts a throttled request; the pressure level is only logged.
-pressure="$(sudo -n powermetrics --samplers thermal -i 1000 -n 1 2>/dev/null | sed -n 's/^Current pressure level: *//p')"
+pressure="$(notifyutil -g com.apple.system.thermalpressurelevel 2>/dev/null | sed -n 's/.* //p')"
 if [[ -z "$pressure" ]]; then
-    echo "bench.sh: thermal pressure not read (no passwordless sudo -n powermetrics); the GPU clock is not monitored" | tee -a "$OUT/bench.log"
+    echo "bench.sh: thermal pressure not read" | tee -a "$OUT/bench.log"
 else
-    echo "bench.sh: thermal pressure $pressure at the boot" | tee -a "$OUT/bench.log"
+    echo "bench.sh: thermal pressure level $pressure (0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping) at the boot" | tee -a "$OUT/bench.log"
 fi
 
 # ── Boot, run, stop ──

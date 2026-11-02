@@ -18,6 +18,8 @@ pub const Sample = struct {
     mlx_cache: u64,
     memory_mb: u32,
     gpu_pct: u16,
+    /// 0 where the clock is unreadable.
+    gpu_mhz: u16 = 0,
     running: u16,
     waiting: u16,
     prefilling: u16,
@@ -61,14 +63,15 @@ pub fn Ring(comptime cap: usize) type {
         pub fn writeSince(self: *Self, io: std.Io, since_ms: i64, w: *std.Io.Writer) !void {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
-            try w.print("\"history\":{{\"interval_ms\":{d},\"capacity\":{d},\"started_ms\":{d},\"fields\":[\"t_ms\",\"gen_tokens\",\"prefill_tokens\",\"running\",\"waiting\",\"prefilling\",\"batched\",\"gpu_pct\",\"memory_mb\",\"mlx_active\",\"mlx_cache\"],\"samples\":[", .{ interval_ms, cap, self.started_ms });
+            try w.print("\"history\":{{\"interval_ms\":{d},\"capacity\":{d},\"started_ms\":{d},\"fields\":[\"t_ms\",\"gen_tokens\",\"prefill_tokens\",\"running\",\"waiting\",\"prefilling\",\"batched\",\"gpu_pct\",\"memory_mb\",\"mlx_active\",\"mlx_cache\",\"gpu_mhz\"],\"samples\":[", .{ interval_ms, cap, self.started_ms });
             var first = true;
             for (0..self.len) |i| {
                 const s = self.at(i);
                 if (s.t_ms <= since_ms) continue;
-                try w.print("{s}[{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}]", .{
+                try w.print("{s}[{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}]", .{
                     if (first) "" else ",", s.t_ms, s.gen_tokens, s.prefill_tokens, s.running, s.waiting,
                     s.prefilling,           s.batched, s.gpu_pct,  s.memory_mb, s.mlx_active, s.mlx_cache,
+                    s.gpu_mhz,
                 });
                 first = false;
             }
@@ -93,7 +96,7 @@ pub fn sinceParam(raw_path: []const u8) ?i64 {
 const testing = std.testing;
 
 fn sample(t: i64) Sample {
-    return .{ .t_ms = t, .gen_tokens = @intCast(t), .prefill_tokens = 0, .mlx_active = 0, .mlx_cache = 0, .memory_mb = 1, .gpu_pct = 2, .running = 3, .waiting = 4, .prefilling = 5, .batched = 6 };
+    return .{ .t_ms = t, .gen_tokens = @intCast(t), .prefill_tokens = 0, .mlx_active = 0, .mlx_cache = 0, .memory_mb = 1, .gpu_pct = 2, .gpu_mhz = 1200, .running = 3, .waiting = 4, .prefilling = 5, .batched = 6 };
 }
 
 fn rendered(ring: anytype, since: i64) !std.json.Parsed(std.json.Value) {
@@ -116,6 +119,9 @@ test "metrics history: a ring keeps the newest capacity samples, oldest first, a
     try testing.expectEqual(@as(i64, 3000), rows[0].array.items[0].integer);
     try testing.expectEqual(@as(i64, 6000), rows[3].array.items[0].integer);
     try testing.expectEqual(@as(i64, 3), rows[0].array.items[3].integer);
+    const fields = parsed.value.object.get("history").?.object.get("fields").?.array.items;
+    try testing.expectEqualStrings("gpu_mhz", fields[fields.len - 1].string);
+    try testing.expectEqual(@as(i64, 1200), rows[0].array.items[fields.len - 1].integer);
 }
 
 test "metrics history: since returns only later samples, an empty ring and a future time return none" {

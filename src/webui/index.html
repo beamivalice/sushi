@@ -728,14 +728,15 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <section class="cmp charts-cmp feed">
     <div class="card"><h2>Prefill (tok/s)<span class="sub">one point per finished request</span></h2><canvas id="dashCCpre" role="img" aria-label="Prefill speed of each finished request"></canvas></div>
     <div class="card"><h2>Decode (tok/s)<span class="sub" id="dashCmDecSub">while generating</span></h2><canvas id="dashCCdec" role="img" aria-label="Decode speed while generating"></canvas></div>
-    <div class="card wide"><h2>Memory (GiB)<span class="legend"><span><i style="background:var(--c4)"></i>in use by sushi</span><span style="color:var(--text-2)"><i class="dash"></i><span id="dashCmCeilL">machine memory</span></span></span></h2><canvas id="dashCMemc" role="img" aria-label="Memory in use by sushi"></canvas></div>
+    <div class="card"><h2>Memory (GiB)<span class="legend"><span><i style="background:var(--c4)"></i>in use by sushi</span><span style="color:var(--text-2)"><i class="dash"></i><span id="dashCmCeilL">machine memory</span></span></span></h2><canvas id="dashCMemc" role="img" aria-label="Memory in use by sushi"></canvas></div>
+    <div class="card"><h2>GPU clock and utilization<span class="legend"><span><i style="background:var(--c1)"></i>clock (MHz)</span><span><i class="dash" style="border-top-color:var(--c3)"></i>utilization (%)</span><span id="dashCGpucL" style="color:var(--text-2)"></span></span></h2><canvas id="dashCGpuc" role="img" aria-label="GPU clock and utilization"></canvas></div>
   </section>
 
   <section class="adv tiles feed">
     <div class="tile"><div class="k">Decode</div><div class="v" id="dashTGen">-</div><div class="s" id="dashTGenS">&nbsp;</div></div>
     <div class="tile"><div class="k">Prefill</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">&nbsp;</div></div>
     <div class="tile"><div class="k">Requests</div><div class="v" id="dashTReq">-</div><div class="s" id="dashTReqS">running / waiting</div></div>
-    <div class="tile"><div class="k">GPU</div><div class="v" id="dashTGpu">-</div><div class="s">utilization</div></div>
+    <div class="tile"><div class="k">GPU</div><div class="v" id="dashTGpu">-</div><div class="s" id="dashTGpuS">utilization</div></div>
     <div class="tile" data-tile="mem" tabindex="0"><div class="k">Memory</div><div class="v" id="dashTMem">-</div><div class="s" id="dashTMemS">process footprint</div></div>
     <div class="tile"><div class="k">Avg TTFT</div><div class="v" id="dashTTtft">-</div><div class="s" id="dashTTtftS">since start</div></div>
     <div class="tile" data-tile="cache" tabindex="0"><div class="k">Cache reuse</div><div class="v" id="dashTCache">-</div><div class="s" id="dashTCacheS">of prompt tokens</div></div>
@@ -755,7 +756,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="card"><h2>Prefill (tok/s)<span class="sub">one point per finished request</span></h2><canvas id="dashCPre" role="img" aria-label="Prefill speed of each finished request"></canvas></div>
     <div class="card"><h2>Decode (tok/s)<span class="sub">while generating</span></h2><canvas id="dashCDec" role="img" aria-label="Decode speed while generating"></canvas></div>
     <div class="card"><h2>Requests<span class="legend"><span><i style="background:var(--c1)"></i>running</span><span><i style="background:var(--c2)"></i>prefilling</span><span><i style="background:var(--c3)"></i>waiting</span><span><i style="background:var(--c4)"></i>batched</span></span></h2><canvas id="dashCReq" role="img" aria-label="Requests running, prefilling, waiting and batched"></canvas></div>
-    <div class="card"><h2>GPU utilization (%)<span class="legend"><span><i style="background:var(--c3)"></i>gpu</span></span></h2><canvas id="dashCGpu" role="img" aria-label="GPU utilization"></canvas></div>
+    <div class="card"><h2>GPU clock and utilization<span class="legend"><span><i style="background:var(--c1)"></i>clock (MHz)</span><span><i class="dash" style="border-top-color:var(--c3)"></i>utilization (%)</span><span id="dashCGpuL" style="color:var(--text-2)"></span></span></h2><canvas id="dashCGpu" role="img" aria-label="GPU clock and utilization"></canvas></div>
     <div class="card"><h2>Memory (GiB)<span class="legend"><span><i style="background:var(--c1)"></i>footprint</span><span><i style="background:var(--c2)"></i>MLX active</span><span><i style="background:var(--c4)"></i>MLX cache</span><span style="color:var(--text-2)"><i class="dash"></i>machine memory</span></span></h2><canvas id="dashCMem" role="img" aria-label="Memory footprint, MLX active and MLX cache"></canvas></div>
   </section>
 
@@ -3569,7 +3570,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const wider = windowMs() > shownWindow; shownWindow = windowMs();
     if (wider) { refetch = true; restart(true); } else { trim(srvNow || Date.now()); drawAll(); }
   });
-  const series = { t: [], gen: [], pre: [], run: [], wait: [], pref: [], batch: [], gpu: [], mem: [], act: [], cache: [] };
+  const series = { t: [], gen: [], pre: [], run: [], wait: [], pref: [], batch: [], gpu: [], mem: [], act: [], cache: [], mhz: [] };
   const lastGen = new Map(); // request_id -> {gen, t}
   const finished = []; // {t, rate, tokens, restored}: the prefill speed of each finished request, drawn as the prefill chart
   const lastReq = { pre: null, dec: null }; // {rate, tokens, t} of the latest finished request that has a speed
@@ -3578,7 +3579,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // The server keeps the history (one sample per sampler tick); the page asks for what it has not seen, so a tab that
   // was in the background fills in on return and every point is plotted at the server's own time.
   let lastHistT = 0, histPrev = null, lastRates = { gen: 0, pre: 0 };
-  const HIST = { t: 0, gen: 1, pre: 2, run: 3, wait: 4, pref: 5, batch: 6, gpu: 7, mem: 8, act: 9, cache: 10 };
+  const HIST = { t: 0, gen: 1, pre: 2, run: 3, wait: 4, pref: 5, batch: 6, gpu: 7, mem: 8, act: 9, cache: 10, mhz: 11 };
+  const HIST_FIELD = { t: 't_ms', gen: 'gen_tokens', pre: 'prefill_tokens', run: 'running', wait: 'waiting', pref: 'prefilling', batch: 'batched', gpu: 'gpu_pct', mem: 'memory_mb', act: 'mlx_active', cache: 'mlx_cache', mhz: 'gpu_mhz' };
+  let clockMax = 0; // gpu_clock_max_mhz; 0 when the server cannot read the GPU clock
   const GAP_MS = 3.5 * 2000; // more than this between two samples is a gap, drawn as one
 
   $('pause').onclick = () => {
@@ -3699,14 +3702,15 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   function push(k, v) { series[k].push(v); }
   // Appends the server samples newer than the last one seen; returns the latest decode and prefill rates (tok/s).
-  function ingestHistory(samples) {
+  function ingestHistory(samples, fields) {
+    if (fields) for (const k in HIST) { const i = fields.indexOf(HIST_FIELD[k]); if (i >= 0) HIST[k] = i; }
     let rates = lastRates;
     for (const r of samples) {
       if (r[HIST.t] <= lastHistT) continue;
       const { gen: g, pre: p } = historyRates(histPrev, r, GAP_MS);
       push('t', r[HIST.t]); push('gen', g); push('pre', p);
       push('run', r[HIST.run]); push('wait', r[HIST.wait]); push('pref', r[HIST.pref]); push('batch', r[HIST.batch]);
-      push('gpu', r[HIST.gpu]); push('mem', r[HIST.mem] / 1024); push('act', gib(r[HIST.act])); push('cache', gib(r[HIST.cache]));
+      push('gpu', r[HIST.gpu]); push('mem', r[HIST.mem] / 1024); push('act', gib(r[HIST.act])); push('cache', gib(r[HIST.cache])); push('mhz', r[HIST.mhz] || 0);
       lastHistT = r[HIST.t]; histPrev = r; rates = { gen: g, pre: p };
     }
     return rates;
@@ -3757,7 +3761,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     }
     if (started) startedMs = started;
     // The server's history ring is the only source of the rates; a page that missed samples gets them in this poll.
-    const { gen, pre } = lastRates = ingestHistory(d.history?.samples ?? []);
+    const { gen, pre } = lastRates = ingestHistory(d.history?.samples ?? [], d.history?.fields);
+    clockMax = d.gauges?.gpu_clock_max_mhz || 0;
+    syncGpuLegend();
     ingestRequests(d.requests ?? []);
     srvNow = Math.max(lastHistT, ...finished.map(e => e.t), 0) || now;
     trim(srvNow);
@@ -3783,6 +3789,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     put($('t-req'), `${g.requests_running || 0} / ${g.requests_waiting || 0}`);
     put($('t-req-s'), g.batched_group_size > 1 ? `running / waiting, ${g.batched_group_size} batched` : 'running / waiting');
     put($('t-gpu'), fmtInt(g.gpu_utilization_pct) + '%');
+    put($('t-gpu-s'), clockMax ? `utilization, ${fmtInt(g.gpu_clock_mhz)} MHz` : 'utilization');
     put($('t-mem'), fmt((g.memory_mb || 0) / 1024, 1) + ' GiB');
     lastGauges = g;
     if (serverInfo.free == null) put($('t-mem-s'), `MLX ${fmt(gib(g.mlx_active_bytes || 0), 1)} active, ${fmt(gib(g.mlx_cache_bytes || 0), 1)} cache`);
@@ -4050,7 +4057,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const drawIds = new Set();
   function drawSoon(id) { const idle = !drawIds.size; drawIds.add(id); if (idle) requestAnimationFrame(() => { const ids = new Set(drawIds); drawIds.clear(); drawAll(ids); }); }
 
-  const CHART_NAME = { 'c-cpre': 'Prefill speed', 'c-pre': 'Prefill speed', 'c-cdec': 'Decode speed', 'c-dec': 'Decode speed', 'c-memc': 'Memory in use', 'c-mem': 'Memory', 'c-req': 'Requests', 'c-gpu': 'GPU utilization' };
+  const CHART_NAME = { 'c-cpre': 'Prefill speed', 'c-pre': 'Prefill speed', 'c-cdec': 'Decode speed', 'c-dec': 'Decode speed', 'c-memc': 'Memory in use', 'c-mem': 'Memory', 'c-req': 'Requests', 'c-gpu': 'GPU clock and utilization', 'c-gpuc': 'GPU clock and utilization' };
   const hover = {}; // canvas id -> mouse x/y in CSS px while the pointer is over it
   const charts = {}; // canvas id -> last draw geometry, for hit-testing
 
@@ -4060,9 +4067,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const pw = Math.round(w * dpr), ph = Math.round(hgt * dpr);
     if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; }
     const ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, hgt);
-    const t = series.t, n = t.length, padL = 40, padR = 8, padT = 8, padB = 18;
+    const t = series.t, n = t.length, padL = 40, padR = opts.right ? 40 : 8, padT = 8, padB = 18;
     const win = windowMs();
-    const name = `${CHART_NAME[id]}, last ${span(win / 1000)}: scale up to ${axis(max, opts.dec)}`;
+    const name = `${CHART_NAME[id]}, last ${span(win / 1000)}: scale up to ${axis(max, opts.dec, opts.plain)}${opts.right ? ' and ' + opts.right.max + '%' : ''}`;
     if (cv.getAttribute('aria-label') !== name) cv.setAttribute('aria-label', name);
     const tEnd = opts.tEnd ?? (n ? t[n - 1] : Date.now()), tStart = tEnd - win;
     const X = tm => padL + (w - padL - padR) * (tm - tStart) / win, Y = v => padT + (hgt - padT - padB) * (1 - v / max);
@@ -4070,7 +4077,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     for (let i = 0; i <= 4; i++) {
       const v = max * i / 4, y = Math.round(Y(v)) + .5;
       ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
-      ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(axis(v, opts.dec), padL - 6, y);
+      ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(axis(v, opts.dec, opts.plain), padL - 6, y);
+      if (opts.right) { ctx.textAlign = 'left'; ctx.fillText(fmt(opts.right.max * i / 4) + '%', w - padR + 6, y); }
     }
     ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillText('-' + span(win / 1000), padL, hgt - 4);
     ctx.textAlign = 'right'; ctx.fillText('now', w - padR, hgt - 4);
@@ -4107,16 +4115,18 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const t = series.t, n = t.length;
     const runs = {}, data = {};
     for (const [k] of lines) {
-      const s = series[k]; runs[k] = runsOf(s, opts.gapZero); data[k] = s;
+      const s = series[k]; runs[k] = runsOf(s, opts.gapZero || opts.gapKeys?.includes(k)); data[k] = s;
       if (opts.smooth) {
         data[k] = s.slice();
         for (const [a, b] of runs[k]) for (let i = a; i <= b; i++) { const lo = Math.max(a, i - 1), hi = Math.min(b, i + 1); let sum = 0; for (let j = lo; j <= hi; j++) sum += s[j]; data[k][i] = sum / (hi - lo + 1); }
       }
     }
     let max = opts.exact ? opts.max : opts.max || 0;
-    if (!opts.max || opts.exact) for (const [k] of lines) for (const v of data[k]) if (v > max) max = v;
+    if (!opts.max || opts.exact) for (const [k] of lines) if (opts.right?.k !== k) for (const v of data[k]) if (v > max) max = v;
     if (!opts.exact) max = niceMax(max || (opts.empty ? 100 : 1));
     const f = frame(id, max, opts), { cv, ctx, w, hgt, padL, padR, padT, padB, X, Y } = f;
+    // A series on the right axis is drawn at its share of that axis, on the left axis' scale.
+    const Yk = k => opts.right?.k === k ? v => Y(v * max / opts.right.max) : Y;
     charts[id] = { xs: t.filter((_, i) => !opts.gapZero || lines.some(([k]) => series[k][i] > 0)).map(X), y: (padT + hgt - padB) / 2 };
     if (opts.ceiling) {
       ctx.save(); ctx.strokeStyle = css('--warn'); ctx.fillStyle = css('--warn'); ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
@@ -4136,17 +4146,17 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         const dx = Math.abs(X(t[i]) - hv.x); if (dx < best) { best = dx; hi = i; }
       }
       if (best > 24) hi = -1;
-      if (hi >= 0) { let bd = Infinity; for (const [k] of lines) { const d = Math.abs(Y(data[k][hi]) - hv.y); if (d < bd) { bd = d; near = k; } } }
+      if (hi >= 0) { let bd = Infinity; for (const [k] of lines) { const d = Math.abs(Yk(k)(data[k][hi]) - hv.y); if (d < bd) { bd = d; near = k; } } }
     }
 
     for (const [k, color, fill] of lines) {
-      const s = data[k]; if (!n) continue;
+      const s = data[k], Yv = Yk(k); if (!n) continue;
       if (fill) { // one fill per run; a gap is not bridged
         ctx.save(); ctx.globalAlpha = .12; ctx.fillStyle = css(color);
         for (const [a, b] of runs[k]) {
           if (a === b) continue;
           ctx.beginPath(); ctx.moveTo(X(t[a]), Y(0));
-          for (let i = a; i <= b; i++) ctx.lineTo(X(t[i]), Y(s[i]));
+          for (let i = a; i <= b; i++) ctx.lineTo(X(t[i]), Yv(s[i]));
           ctx.lineTo(X(t[b]), Y(0)); ctx.closePath(); ctx.fill();
         }
         ctx.restore();
@@ -4154,10 +4164,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       ctx.save();
       if (near && near !== k) ctx.globalAlpha = .45;
       ctx.strokeStyle = ctx.fillStyle = css(color); ctx.lineWidth = near === k ? 3 : 2; ctx.lineJoin = 'round';
+      if (opts.dashed?.includes(k)) ctx.setLineDash([6, 4]);
       for (const [a, b] of runs[k]) {
-        if (a === b) { ctx.beginPath(); ctx.arc(X(t[a]), Y(s[a]), 2.5, 0, 2 * Math.PI); ctx.fill(); continue; }
+        if (a === b) { ctx.beginPath(); ctx.arc(X(t[a]), Yv(s[a]), 2.5, 0, 2 * Math.PI); ctx.fill(); continue; }
         ctx.beginPath();
-        for (let i = a; i <= b; i++) i === a ? ctx.moveTo(X(t[i]), Y(s[i])) : ctx.lineTo(X(t[i]), Y(s[i]));
+        for (let i = a; i <= b; i++) i === a ? ctx.moveTo(X(t[i]), Yv(s[i])) : ctx.lineTo(X(t[i]), Yv(s[i]));
         ctx.stroke();
       }
       ctx.restore();
@@ -4168,7 +4179,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       ctx.strokeStyle = css('--text-2'); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
       ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, hgt - padB); ctx.stroke(); ctx.setLineDash([]);
       for (const [k, color] of lines) {
-        ctx.beginPath(); ctx.arc(x, Y(data[k][hi]), near === k ? 4.5 : 3, 0, 2 * Math.PI);
+        ctx.beginPath(); ctx.arc(x, Yk(k)(data[k][hi]), near === k ? 4.5 : 3, 0, 2 * Math.PI);
         ctx.fillStyle = css(color); ctx.fill(); ctx.strokeStyle = css('--surface'); ctx.lineWidth = 1.5; ctx.stroke();
       }
       showTip(cv, x, hv.y, t[hi], lines, hi, near, { ...opts, data });
@@ -4238,13 +4249,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     pref: { name: 'Prefilling', fmt: cnt, help: 'Requests reading their prompt before producing output.' },
     wait: { name: 'Waiting', fmt: cnt, help: 'Requests queued for a free slot. Persistent waiting means more traffic than --max-concurrent allows.' },
     batch: { name: 'Batched', fmt: cnt, help: 'Requests that generated together in one shared pass through the model, at the last step. 0 means nothing was batched.' },
-    gpu: { name: 'GPU', fmt: v => fmtInt(v) + '%', help: 'Apple GPU utilization reported by the system, for the whole GPU (not just Sushi).' },
+    mhz: { name: 'GPU clock', fmt: v => v ? fmtInt(v) + ' MHz' : 'idle', help: 'Average GPU clock while it was running since the previous sample (IOReport P-state residency); idle when the GPU was off.' },
+    gpu: { name: 'Utilization', fmt: v => fmtInt(v) + '%', help: 'Apple GPU utilization reported by the system, for the whole GPU (not just Sushi).' },
     mem: { name: 'Footprint', fmt: gb, help: 'Total physical memory the Sushi process holds, including GPU buffers.' },
     act: { name: 'MLX active', fmt: gb, help: 'Memory MLX is actively using: weights, KV cache and working buffers.' },
     cache: { name: 'MLX cache', fmt: gb, help: 'Freed buffers MLX keeps for reuse. Held by the process but not in use; a steady climb here explains footprint growth.' },
   };
 
-  const CHART_IDS = ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem', 'c-cpre', 'c-cdec', 'c-memc'];
+  const CHART_IDS = ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem', 'c-cpre', 'c-cdec', 'c-memc', 'c-gpuc'];
   const leave = id => { if (!hover[id]) return; delete hover[id]; if (tipOwner === $(id).id) hideTip(); drawSoon(id); };
   for (const id of CHART_IDS) {
     const cv = $(id);
@@ -4267,8 +4279,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // A tap anywhere else puts the tooltip away.
   document.addEventListener('pointerdown', e => { for (const id of CHART_IDS) if (e.target !== $(id)) leave(id); });
 
+  const gpuOpts = () => clockMax
+    ? { max: clockMax, exact: true, plain: true, dec: 0, right: { k: 'gpu', max: 100 }, dashed: ['gpu'], gapKeys: ['mhz'] }
+    : { max: 100 };
+  const gpuLines = () => clockMax ? [['mhz', '--c1', true], ['gpu', '--c3']] : [['gpu', '--c3', true]];
+  function syncGpuLegend() { for (const id of ['c-gpu-l', 'c-gpuc-l']) put($(id), clockMax ? '' : 'GPU clock unavailable on this box'); }
   function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p; }
-  function axis(v, dec) { return v >= 1000 ? fmt(v / 1000, v % 1000 ? 1 : 0) + 'k' : fmt(v, dec ?? (v % 1 ? 1 : 0)); }
+  function axis(v, dec, plain) { return v >= 1000 && !plain ? fmt(v / 1000, v % 1000 ? 1 : 0) + 'k' : fmt(v, dec ?? (v % 1 ? 1 : 0)); }
 
   function drawAll(only) {
     if (!dashActive) return;
@@ -4280,12 +4297,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (on('c-cpre')) eventChart('c-cpre', finished, '--c2');
       if (on('c-cdec')) chart('c-cdec', [['gen', '--c1', true]], decOpts);
       if (on('c-memc')) chart('c-memc', [['mem', '--c4', true]], memOpts);
+      if (on('c-gpuc')) chart('c-gpuc', gpuLines(), gpuOpts());
       return;
     }
     if (on('c-pre')) eventChart('c-pre', finished, '--c2');
     if (on('c-dec')) chart('c-dec', [['gen', '--c1', true]], decOpts);
     if (on('c-req')) chart('c-req', [['wait', '--c3'], ['pref', '--c2'], ['batch', '--c4'], ['run', '--c1']]);
-    if (on('c-gpu')) chart('c-gpu', [['gpu', '--c3', true]], { max: 100 });
+    if (on('c-gpu')) chart('c-gpu', gpuLines(), gpuOpts());
     if (on('c-mem')) chart('c-mem', [['cache', '--c4'], ['act', '--c2'], ['mem', '--c1', true]], { ...memOpts, extra: () => serverInfo.peak ? [['MLX peak (since start)', bytes(serverInfo.peak)]] : [] });
   }
   window.addEventListener('resize', () => drawAll());

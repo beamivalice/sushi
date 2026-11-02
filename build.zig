@@ -168,6 +168,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
         },
     });
+    linkApple(host_mod, macos_sdk_frameworks);
     host_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     host_mod.addIncludePath(b.path("lib/jinja_cpp"));
     host_mod.linkSystemLibrary("c++", .{});
