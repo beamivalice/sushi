@@ -47,13 +47,13 @@ ln -s "$VALID" "$TMPROOT/$VALID_ID"
 # Discoverable, loadable-looking, but shipping no weights.
 mkdir -p "$TMPROOT/weightless-model"
 cat > "$TMPROOT/weightless-model/config.json" <<EOF
-{ "model_type": "qwen3", "hidden_size": 512, "num_hidden_layers": 2,
+{ "model_type": "glm5_next", "hidden_size": 512, "num_hidden_layers": 2,
   "num_attention_heads": 8, "num_key_value_heads": 2, "intermediate_size": 1024,
   "vocab_size": 1000, "rms_norm_eps": 1e-6, "max_position_embeddings": 4096,
   "rope_theta": 10000.0, "tie_word_embeddings": true }
 EOF
 cat > "$TMPROOT/weightless-model/tokenizer_config.json" <<EOF
-{ "model_type": "qwen3" }
+{ "model_type": "glm5_next" }
 EOF
 
 # Arch nothing serves — discovery must refuse this one outright.
