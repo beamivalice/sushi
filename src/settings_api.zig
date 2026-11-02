@@ -188,8 +188,8 @@ pub fn render(
         effective = if (running) @max(effective, t.cap_bytes) else t.cap_bytes;
         running = true;
     };
-    try w.print(",\"source\":\"{s}\",\"locked\":{},\"effective_bytes\":{d},\"ask_bytes\":{d},\"running_tiers\":[", .{
-        if (cache_pinned) "flag" else if (srv.prefix_cache_disk_gb != null) "file" else "default", cache_pinned, effective, view.ask_bytes,
+    try w.print(",\"source\":\"{s}\",\"locked\":{},\"effective_bytes\":{d},\"ask_bytes\":{d},\"default_bytes\":{d},\"running_tiers\":[", .{
+        if (cache_pinned) "flag" else if (srv.prefix_cache_disk_gb != null) "file" else "default", cache_pinned, effective, view.ask_bytes, disk_placement.DEFAULT_DISK_CAP,
     });
     var first_tier = true;
     for (rows) |row| if (row.tier) |t| {
@@ -722,6 +722,8 @@ test "settings api: render reports the file's value, the pinning flag and the wi
     try testing.expectEqual(@as(i64, 30), cache.get("file").?.integer);
     try testing.expectEqualStrings("file", cache.get("source").?.string);
     try testing.expect(!cache.get("locked").?.bool);
+    // A saved size leaves the size "Use default" goes back to.
+    try testing.expectEqual(@as(i64, @intCast(disk_placement.DEFAULT_DISK_CAP)), cache.get("default_bytes").?.integer);
     const s = root.get("models").?.array.items[0].object.get("settings").?.object;
     try testing.expectEqualStrings("file", s.get("kv_quant").?.object.get("source").?.string);
     try testing.expectEqualStrings("4", s.get("kv_quant").?.object.get("file").?.string);

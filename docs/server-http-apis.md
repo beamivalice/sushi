@@ -347,7 +347,8 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
 - `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir` and
   `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, as typed: `models_dir` whole, the size in the
   flag's own syntax such as `512MB`, `source` `flag|file|default`, `locked`; the size also carries `effective_bytes`, the
-  largest running tier's cap or, with none running, the ask; `ask_bytes`, the number the next load starts from; and
+  largest running tier's cap or, with none running, the ask; `ask_bytes`, the number the next load starts from; `default_bytes`, the size an unset key asks for (a load may
+  take less to fit its context or the free space); and
   `running_tiers`, `[{model, cap_bytes, used_bytes}]`), the
   `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
   `locked`. A pinned `mtp_acceptance` reports the flag as typed with its value (`--mtp-tokenv3 0.5`, `--mtp-typical 0.3`) and `mtp_greedy_tail` reports `--mtp-greedy-tail`; the other model keys report their value alone. `POST /v1/settings` takes `{"server":{key:value|null}}` and/or `{"model":id,"set":{key:value|null}}`; null removes
@@ -387,9 +388,8 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `off|4|6|8`, `server.*.flag` as the flag's own text, `server.prefix_cache_disk_gb.ask_bytes`, and `POST
   /v1/prefix-cache/clear {"scope":"namespace","id":...}`. A `flag` is printed as the server sends it: a text starting with `--`
   (`--mtp-tokenv3 0.5`) is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
-  choice shows the choice the spelling names, else "Launch flag". `server.prefix_cache_disk_gb.default_bytes` (the size an unset
-  key resolves to) is optional: the page names "Use default (N GiB)" with it, or from `ask_bytes` while the key is unset, and
-  otherwise says "Use default". The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
+  choice shows the choice the spelling names, else "Launch flag". The page names "Use default (N GiB)" from
+  `server.prefix_cache_disk_gb.default_bytes`. The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
   `/metrics.json` read, which is 503 while metrics are off). Guards: `tests/test_prefix_cache_admin.sh`,
   `node tests/test_webui_admin.cjs` (pure functions), `node tests/test_webui_admin_ui.cjs` (the tabs against a stub).
 
