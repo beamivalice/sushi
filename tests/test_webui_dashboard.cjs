@@ -29,17 +29,65 @@ function installStubs(config) {
   CanvasRenderingContext2D.prototype.clearRect = function (...args) { window.__clears += 1; window.__axis[this.canvas.id] = []; return realClear.apply(this, args); };
   const realText = CanvasRenderingContext2D.prototype.fillText;
   CanvasRenderingContext2D.prototype.fillText = function (text, ...args) { window.__axis[this.canvas.id]?.push(String(text)); return realText.call(this, text, ...args); };
+  window.__dots = {};
+  const realArc = CanvasRenderingContext2D.prototype.arc;
+  CanvasRenderingContext2D.prototype.arc = function (x, y, r, ...rest) { (window.__dots[this.canvas.id] ??= []).push({ x, y, r }); return realArc.call(this, x, y, r, ...rest); };
+  const realClearDots = CanvasRenderingContext2D.prototype.clearRect;
+  CanvasRenderingContext2D.prototype.clearRect = function (...args) { window.__dots[this.canvas.id] = []; return realClearDots.apply(this, args); };
   if (config.key) localStorage.setItem('sushi-api-key', config.key);
+  for (const [k, v] of Object.entries(config.storage ?? {})) localStorage.setItem(k, v);
+  if (config.mockDpr) {
+    // Chromium's emulation never fires the resolution query, so the test fires it: window.__setDpr(ratio).
+    let dpr = 1;
+    const listeners = new Set(), realMatch = window.matchMedia.bind(window);
+    Object.defineProperty(window, 'devicePixelRatio', { get: () => dpr, configurable: true });
+    window.matchMedia = (query) => {
+      const mq = realMatch(query);
+      if (/resolution/.test(query)) { mq.addEventListener = (type, fn) => { if (type === 'change') listeners.add(fn); }; mq.removeEventListener = (type, fn) => { listeners.delete(fn); }; }
+      return mq;
+    };
+    window.__setDpr = (value) => { dpr = value; for (const fn of [...listeners]) fn(new Event('change')); };
+  }
+  if (config.sim) {
+    // A server the test steers: finished requests, a restart, a skewed clock. Times are the server's own (browser time + skew).
+    const skew = config.skew ?? 0, srv = () => Date.now() + skew;
+    const fresh = () => ({ last: 0, started: null, next: 0, samples: [], reqs: [], seq: 0, running: 0, freeze: false, c: { prefill_tokens_total: 0, generation_tokens_total: 0, prompt_tokens_total: 0, prefix_cache_tokens_total: 0 }, h: { pre: { count: 0, sum: 0 }, dec: { count: 0, sum: 0 } } });
+    const sim = window.__sim = {
+      ...fresh(),
+      init() { if (this.started == null) { this.started = srv() - (config.age ?? 0); this.first = this.next = srv(); } },
+      tick() { this.init(); while (!this.freeze && this.next <= srv()) { this.samples.push([this.next, 0, 0, this.running, 0, 0, 0, 50, 50000, 2 ** 30, 2 ** 30]); this.next += 2000; } },
+      finish({ computed, restored = 0, prefillS, gen = 0, decodeS = 0 }) {
+        this.tick();
+        this.c.prefill_tokens_total += computed; this.c.prompt_tokens_total += computed + restored; this.c.prefix_cache_tokens_total += restored; this.c.generation_tokens_total += gen;
+        this.h.pre.count++; this.h.pre.sum += prefillS; this.h.dec.count++; this.h.dec.sum += decodeS;
+        this.last = Math.max(this.last + 1, srv());
+        this.reqs.push({ request_id: ++this.seq, model: 'org/test-model', t_ms: this.last, prompt_tokens: computed, cached_tokens: restored, prefill_seconds: prefillS, generated_tokens: gen, decode_seconds: decodeS, outcome: 'ok' });
+      },
+      restart() { this.tick(); Object.assign(this, fresh()); },
+      body(since) {
+        this.tick();
+        const hist = (x) => ({ count: x.count, sum: x.sum, bounds: [1], bucket_counts: [x.count, x.count] });
+        return {
+          counters: { ...this.c },
+          gauges: { requests_running: this.running, requests_waiting: 0, memory_mb: 50000, mlx_active_bytes: 2 ** 30, mlx_cache_bytes: 2 ** 30 },
+          histograms: { prefill_time_seconds: hist(this.h.pre), decode_time_seconds: hist(this.h.dec) }, sessions: [],
+          history: { interval_ms: 2000, capacity: 1800, started_ms: this.started, samples: this.samples.filter((r) => r[0] > since) },
+          requests: this.reqs.filter((r) => r.t_ms > since),
+        };
+      },
+    };
+  }
   const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
   const realFetch = window.fetch.bind(window);
   window.fetch = async (input, init = {}) => {
     const url = new URL(typeof input === 'string' ? input : input.url, location.href);
     if (url.origin !== location.origin) return realFetch(input, init);
+    if (stub.down) throw new TypeError('Failed to fetch');
     const headers = new Headers(init.headers ?? {});
     stub.calls.push({ path: url.pathname, search: url.search, auth: headers.get('authorization'), method: init.method ?? 'GET' });
     switch (url.pathname) {
       case '/health': return json({ status: 'ok' });
-      case '/v1/models': return json({ data: [{ id: stub.modelId ?? 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
+      case '/v1/models': return json({ data: stub.noModels ? [] : [{ id: stub.modelId ?? 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
       case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: { disk_bytes: 20 * 2 ** 30, disk_used_bytes: 2 * 2 ** 30, disk_written_bytes: 4 * 2 ** 30, disk_entries: 3 } }, memory: { available_bytes: 5e9, total_bytes: 128 * 2 ** 30 }, batching: { supported: true, max_group: 4 }, default_generation_settings: { n_ctx: 8192 } });
       case '/v1/tools': return json({ edit_default: false });
       case '/metrics/enable':
@@ -48,6 +96,8 @@ function installStubs(config) {
         return json({ metrics: true, already_enabled: false });
       case '/metrics.json':
         if (stub.metricsStatus !== 200) return json({ error: { message: 'metrics off' } }, stub.metricsStatus);
+        if (stub.hold) await stub.hold;
+        if (stub.sim) return json(window.__sim.body(Number(url.searchParams.get('since') || 0)));
         if (stub.compact) {
           // A decoding (or idle) server whose fourth poll sees one 12,000-token prefill finish after 10 s of prefilling.
           const polls = stub.polls = (stub.polls ?? 0) + 1, now = Date.now(), origin = stub.origin ??= now, done = polls >= 4 ? 1 : 0;
@@ -63,6 +113,7 @@ function installStubs(config) {
             gauges: { requests_running: stub.compact === 'decode' ? 1 : 0, requests_waiting: 0, memory_mb: 106787, mlx_active_bytes: 113 * 2 ** 30, mlx_cache_bytes: 2 ** 28 },
             histograms: { prefill_time_seconds: hist(15 + done, 60 + 10 * done), decode_time_seconds: hist(15, 180) }, sessions: [],
             history: { interval_ms: 2000, capacity: 1800, started_ms: now - 3 * 3600e3 - 12 * 60e3, samples: samples.filter((r) => r[0] > since) },
+            requests: done ? (stub.reqAt ??= now - 1000) > since ? [{ request_id: 12, model: 'org/test-model', t_ms: stub.reqAt, prompt_tokens: 12000, cached_tokens: 0, prefill_seconds: 10, generated_tokens: 0, decode_seconds: 0, outcome: 'ok' }] : [] : [],
           });
         }
         if (stub.history) {
@@ -104,7 +155,7 @@ function trackTimers() {
 }
 
 async function openPage(browser, urlPath, config = {}, fakeClock = false) {
-  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...(config.contextOptions ?? {}) });
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
@@ -117,6 +168,310 @@ async function openPage(browser, urlPath, config = {}, fakeClock = false) {
   return { page, errors, context };
 }
 
+
+// Steps the page's fake clock in short slices so each fetch lands between them.
+async function adv(page, ms, step = 1000) {
+  for (let left = ms; left > 0;) { const s = Math.min(step, left); left -= s; await page.clock.runFor(s); await page.waitForTimeout(30); }
+}
+const dotsOf = (page, id) => page.evaluate((i) => window.__dots[i] ?? [], id);
+const textOf = (page, id) => page.evaluate((i) => document.getElementById(i).innerText.replace(/\s+/g, ' ').trim(), id);
+const axisOf = (page, id) => page.evaluate((i) => window.__axis[i] ?? [], id);
+const setHidden = (page, hidden) => page.evaluate((h) => { Object.defineProperty(document, 'hidden', { value: h, configurable: true }); document.dispatchEvent(new Event('visibilitychange')); }, hidden);
+const metricsCalls = (page) => page.evaluate(() => window.__stub.calls.filter((c) => c.path === '/metrics.json'));
+async function simPage(browser, config = {}, urlPath = '/dashboard') {
+  const opened = await openPage(browser, urlPath, { mode: 'compact', sim: true, ...config }, true);
+  await adv(opened.page, 4000);
+  return opened;
+}
+
+// The Dashboard's honesty bugs, against a server the test steers (see `sim` in installStubs).
+async function dashboardBugs(browser) {
+  {
+    // One dot per finished request, at its own finish time, however many finish between two polls.
+    const { page, errors, context } = await simPage(browser);
+    await page.selectOption('#dashWindow', '60');
+    await page.evaluate(() => { window.__stub.hold = new Promise((r) => { window.__stub.release = r; }); });
+    await adv(page, 2200, 200);
+    await page.evaluate(() => window.__sim.finish({ computed: 3001, prefillS: 0.08 }));
+    await adv(page, 1000, 200);
+    await page.evaluate(() => { window.__sim.finish({ computed: 2001, prefillS: 0.5 }); window.__stub.hold = null; window.__stub.release(); });
+    await adv(page, 3000);
+    const dots = await dotsOf(page, 'dashCCpre');
+    assert.equal(dots.length, 2, 'two requests between polls are two dots');
+    assert.ok(dots[1].x > dots[0].x, 'each at its own finish time');
+    assert.equal(await textOf(page, 'dashCmPre'), '4,002 tok/s', 'the tile is the newest request, not a pool');
+    assert.match(await textOf(page, 'dashCmPreS'), /2,001 tokens/);
+    await adv(page, 6000);
+    assert.equal((await dotsOf(page, 'dashCCpre')).length, 2, 'later polls add no copies');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // A request finishing after the newest sample is delivered again until a sample passes it: still one dot.
+    const { page, context } = await simPage(browser);
+    await page.evaluate(() => { window.__sim.freeze = true; window.__sim.finish({ computed: 3001, prefillS: 0.08 }); });
+    await adv(page, 8000);
+    assert.equal((await dotsOf(page, 'dashCCpre')).length, 1, 'a re-sent request is one dot');
+    await context.close();
+  }
+  {
+    // A tab hidden for minutes keeps every request that finished meanwhile as its own dot.
+    const { page, context } = await simPage(browser);
+    await setHidden(page, true);
+    for (let i = 0; i < 5; i++) { await page.evaluate(() => window.__sim.finish({ computed: 2000 + 100 * window.__sim.seq, prefillS: 1 })); await page.clock.runFor(30_000); }
+    await setHidden(page, false);
+    await adv(page, 3000);
+    const xs = (await dotsOf(page, 'dashCCpre')).map((d) => d.x);
+    assert.equal(xs.length, 5, 'five requests, five dots');
+    assert.deepEqual(xs, [...xs].sort((a, b) => a - b));
+    assert.equal(new Set(xs).size, 5);
+    await context.close();
+  }
+  {
+    // Pausing stops the polls; resuming fills in every request that finished meanwhile.
+    const { page, context } = await simPage(browser);
+    await page.click('#dashPause');
+    const before = (await metricsCalls(page)).length;
+    await page.evaluate(() => window.__sim.finish({ computed: 3000, prefillS: 1 }));
+    await adv(page, 6000, 2000);
+    await page.evaluate(() => window.__sim.finish({ computed: 4000, prefillS: 1 }));
+    await adv(page, 6000, 2000);
+    assert.equal((await metricsCalls(page)).length, before, 'no poll while paused');
+    await page.click('#dashPause');
+    await adv(page, 3000);
+    assert.equal((await dotsOf(page, 'dashCCpre')).length, 2, 'both requests are there after resuming');
+    await context.close();
+  }
+  {
+    // A restart is the process start time changing, whatever the new counters say; the old server's request is gone.
+    const { page, context } = await simPage(browser, { skew: 600_000 });
+    await page.evaluate(() => window.__sim.finish({ computed: 5000, prefillS: 5, gen: 100, decodeS: 2 }));
+    await adv(page, 3000);
+    assert.equal(await textOf(page, 'dashCmPre'), '1,000 tok/s');
+    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tok/s');
+    await page.evaluate(() => window.__sim.restart());
+    await adv(page, 4000);
+    assert.equal(await textOf(page, 'dashCmPre'), '-', 'the old server\'s last request is not shown');
+    assert.equal(await textOf(page, 'dashCmDec'), '-');
+    assert.equal((await dotsOf(page, 'dashCCpre')).length, 0, 'and its dot is gone');
+    assert.match(await textOf(page, 'dashStatus'), /restarted/);
+    assert.ok((await axisOf(page, 'dashCMemc')).includes('restart'), 'the marker is drawn at the server\'s time (this server\'s clock is 10 min ahead)');
+    await context.close();
+  }
+  {
+    // New counters above the old ones are still a restart: no dot pairs one server's request with the other's.
+    const { page, context } = await simPage(browser);
+    await page.evaluate(() => window.__sim.finish({ computed: 5000, prefillS: 5 }));
+    await adv(page, 3000);
+    await page.evaluate(() => { window.__sim.restart(); window.__sim.finish({ computed: 9000, prefillS: 3 }); });
+    await adv(page, 4000);
+    const dots = await dotsOf(page, 'dashCCpre');
+    assert.equal(dots.length, 1, 'only the new server\'s request');
+    assert.equal(await textOf(page, 'dashCmPre'), '3,000 tok/s');
+    assert.match(await textOf(page, 'dashStatus'), /restarted/);
+    await adv(page, 70_000, 5000);
+    assert.equal(await textOf(page, 'dashStatus'), 'Live', 'the restart note does not stay for the session');
+    await context.close();
+  }
+  {
+    // Uptime is the process's, not the time since metrics (and the history) began.
+    const { page, context } = await simPage(browser, { age: 3 * 3600e3 + 5 * 60e3 });
+    assert.equal(await textOf(page, 'dashCmUp'), 'up 3h 5m');
+    await context.close();
+  }
+  {
+    // A prompt mostly restored from the cache is labelled as such and is not a prefill speed.
+    const { page, context } = await simPage(browser);
+    await page.evaluate(() => window.__sim.finish({ computed: 3001, prefillS: 0.08 }));
+    await adv(page, 3000);
+    await page.evaluate(() => window.__sim.finish({ computed: 71, restored: 2970, prefillS: 0.073 }));
+    await adv(page, 3000);
+    const dots = await dotsOf(page, 'dashCCpre');
+    assert.equal(dots.length, 2);
+    assert.equal(await textOf(page, 'dashCmPre'), '37,513 tok/s', 'the tile keeps the last real prefill');
+    const box = await page.locator('#dashCCpre').boundingBox();
+    await page.mouse.move(box.x + dots[1].x, box.y + 40);
+    await adv(page, 100, 50);
+    const tip = await textOf(page, 'dashTip');
+    assert.match(tip, /71 computed, 2,970 restored/);
+    assert.doesNotMatch(tip, /tok\/s/, 'no speed is claimed for it');
+    await context.close();
+  }
+  {
+    // A short reply still sets the Decode tile.
+    const { page, context } = await simPage(browser);
+    await page.evaluate(() => window.__sim.finish({ computed: 100, prefillS: 0.1, gen: 5, decodeS: 0.1 }));
+    await adv(page, 3000);
+    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tok/s');
+    assert.match(await textOf(page, 'dashCmDecS'), /last request/);
+    await context.close();
+  }
+  {
+    // Offline: the tiles say so instead of the last live numbers, and the charts dim.
+    const { page, context } = await simPage(browser);
+    await page.evaluate(() => { window.__sim.running = 1; });
+    await adv(page, 4000);
+    assert.equal(await textOf(page, 'dashCmReq'), '1 running', 'the gauge is shown while the server answers');
+    await page.evaluate(() => { window.__stub.down = true; });
+    await adv(page, 6000);
+    for (const id of ['dashCmDec', 'dashCmPre', 'dashCmMem', 'dashCmSsd', 'dashCmReq']) assert.equal(await textOf(page, id), '-', `${id} shows nothing`);
+    for (const id of ['dashCmDecS', 'dashCmPreS']) assert.equal(await textOf(page, id), 'server unreachable');
+    assert.equal(await textOf(page, 'dashCmState'), 'Offline');
+    assert.ok(await page.evaluate(() => +getComputedStyle(document.getElementById('dashCCdec')).opacity < 1), 'the charts are dimmed');
+    await page.evaluate(() => { window.__stub.down = false; });
+    await adv(page, 6000);
+    assert.notEqual(await textOf(page, 'dashCmMem'), '-', 'and come back with the server');
+    assert.equal(await page.evaluate(() => +getComputedStyle(document.getElementById('dashCCdec')).opacity), 1);
+    await context.close();
+  }
+  {
+    // Claims need a source: metrics off does not make the server Idle; no model does not make the SSD cache off.
+    const off = await openPage(browser, '/dashboard', { mode: 'compact', metricsStatus: 503 }, true);
+    await adv(off.page, 4000);
+    assert.notEqual(await textOf(off.page, 'dashCmState'), 'Idle', 'idle is unknown without metrics');
+    await off.context.close();
+    const none = await openPage(browser, '/dashboard', { mode: 'compact', sim: true, noModels: true }, true);
+    await adv(none.page, 4000);
+    assert.equal(await textOf(none.page, 'dashCmSsd'), '-');
+    assert.equal(await textOf(none.page, 'dashCmSsdS'), 'no model loaded');
+    await none.context.close();
+  }
+  {
+    // The window can widen again, also while paused, and an unknown stored window falls back.
+    const { page, context } = await simPage(browser);
+    await page.selectOption('#dashWindow', '60');
+    await page.evaluate(() => window.__sim.finish({ computed: 3000, prefillS: 1 }));
+    await adv(page, 90_000, 5000);
+    assert.equal((await dotsOf(page, 'dashCCpre')).length, 0, 'the 1 min window forgets the request');
+    await page.selectOption('#dashWindow', '900');
+    await adv(page, 3000);
+    assert.equal((await dotsOf(page, 'dashCCpre')).length, 1, 'widening brings it back');
+    await page.click('#dashPause');
+    await page.selectOption('#dashWindow', '3600');
+    await adv(page, 100, 50);
+    assert.ok((await axisOf(page, 'dashCCpre')).includes('-1h'), `the chart redraws while paused, labelled -1h (${await axisOf(page, 'dashCCpre')})`);
+    assert.equal((await dotsOf(page, 'dashCCpre')).length, 1);
+    await context.close();
+    const bad = await openPage(browser, '/dashboard', { mode: 'compact', sim: true, storage: { 'sushi-dash:window': '120' } }, true);
+    assert.equal(await bad.page.inputValue('#dashWindow'), '300', 'a window the list lacks falls back to 5 min');
+    await bad.context.close();
+  }
+  {
+    // A change made while a poll is in flight is not lost.
+    const { page, context } = await simPage(browser, { mode: 'advanced' });
+    await page.evaluate(() => { window.__stub.hold = new Promise((r) => { window.__stub.release = r; }); });
+    const n = (await metricsCalls(page)).length;
+    await adv(page, 2500, 500);
+    assert.equal((await metricsCalls(page)).length, n + 1, 'a poll is in flight');
+    await page.selectOption('#dashWindow', '900');
+    await page.evaluate(() => { window.__stub.hold = null; window.__stub.release(); });
+    await adv(page, 600, 100);
+    const calls = await metricsCalls(page);
+    assert.equal(calls[calls.length - 1].search, '?since=0', 'the wider window is fetched at once');
+    await page.evaluate(() => { window.__stub.hold = new Promise((r) => { window.__stub.release = r; }); });
+    await adv(page, 2500, 500);
+    const m = (await metricsCalls(page)).length;
+    await page.selectOption('#dashInterval', '10000');
+    await page.evaluate(() => { window.__stub.hold = null; window.__stub.release(); });
+    await adv(page, 6000, 500);
+    assert.equal((await metricsCalls(page)).length, m + 1, 'one refresh at once, then the new interval');
+    await context.close();
+  }
+  {
+    // Charts answer a tap and the keyboard, not only a mouse.
+    const { page, context } = await simPage(browser, { contextOptions: { hasTouch: true } });
+    await page.evaluate(() => window.__sim.finish({ computed: 3000, prefillS: 1 }));
+    await adv(page, 3000);
+    const dots = await dotsOf(page, 'dashCCpre');
+    const box = await page.locator('#dashCCpre').boundingBox();
+    const tip = () => page.evaluate(() => document.getElementById('dashTip').style.display);
+    await page.touchscreen.tap(box.x + dots[0].x, box.y + dots[0].y);
+    await adv(page, 100, 50);
+    assert.equal(await tip(), 'block', 'a tap on a dot shows its tooltip');
+    await adv(page, 2000);
+    assert.equal(await tip(), 'block', 'and it stays until another tap');
+    await page.touchscreen.tap(20, 20);
+    await adv(page, 100, 50);
+    assert.equal(await tip(), 'none', 'a tap elsewhere hides it');
+    assert.equal(await page.evaluate(() => document.getElementById('dashCCpre').tabIndex), 0, 'charts take focus');
+    await page.focus('#dashCCpre');
+    await page.keyboard.press('ArrowLeft');
+    await adv(page, 100, 50);
+    assert.equal(await tip(), 'block', 'an arrow key steps to a point and shows it');
+    await page.keyboard.press('Escape');
+    await adv(page, 100, 50);
+    assert.equal(await tip(), 'none');
+    await context.close();
+  }
+  {
+    // Nothing ticks once per second in a hidden tab.
+    const { page, context } = await openPage(browser, '/chat', {}, true);
+    await page.waitForSelector('#modelSelect option', { state: 'attached' });
+    await page.evaluate(trackTimers);
+    const fast = () => page.evaluate(() => [...window.__intervals.values()].filter((ms) => ms <= 1000).length);
+    await page.click('#navDashboard');
+    assert.equal(await fast(), 1);
+    await setHidden(page, true);
+    assert.equal(await fast(), 0, 'the hidden tab runs no 1 s interval');
+    await setHidden(page, false);
+    assert.equal(await fast(), 1, 'and it is back when the tab is');
+    await context.close();
+  }
+  for (const mode of ['compact', 'advanced']) {
+    // A poll that brings the same numbers rewrites no part of the page.
+    const { page, context } = await simPage(browser, { mode });
+    await adv(page, 20_000, 2000);
+    await page.evaluate(() => {
+      window.__mutations = [];
+      new MutationObserver((rs) => { for (const r of rs) window.__mutations.push(`${r.type}:${r.attributeName ?? ''}:${r.target.id || r.target.className || r.target.nodeName}`); }).observe(document.getElementById('dashPanel'), { subtree: true, childList: true, attributes: true, characterData: true });
+    });
+    await adv(page, 10_000, 2000);
+    const writes = (await page.evaluate(() => window.__mutations)).filter((m) => m !== 'attributes:title:dashDot');
+    assert.deepEqual(writes, [], `${mode}: an unchanged poll writes nothing`);
+    await context.close();
+  }
+  {
+    // A device pixel ratio change redraws the charts sharply without a resize or a poll; a fractional one does not reallocate each frame.
+    const { page, context } = await simPage(browser, { mockDpr: true });
+    await page.click('#dashPause');
+    const size = () => page.evaluate(() => { const c = document.getElementById('dashCCdec'); return [c.width, c.clientWidth]; });
+    await page.evaluate(() => window.__setDpr(2));
+    await adv(page, 300, 100);
+    let [w, css] = await size();
+    assert.equal(w, css * 2, 'the backing store follows the ratio');
+    await page.evaluate(() => window.__setDpr(1.25));
+    await adv(page, 300, 100);
+    [w, css] = await size();
+    assert.equal(w, Math.round(css * 1.25));
+    await page.evaluate(() => {
+      const c = document.getElementById('dashCCdec'), d = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'width');
+      window.__widthSets = 0;
+      Object.defineProperty(c, 'width', { get() { return d.get.call(this); }, set(v) { window.__widthSets += 1; d.set.call(this, v); } });
+    });
+    const box = await page.locator('#dashCCdec').boundingBox();
+    for (let i = 0; i < 5; i++) { await page.mouse.move(box.x + 100 + i * 10, box.y + 50); await adv(page, 50, 50); }
+    assert.equal(await page.evaluate(() => window.__widthSets), 0, 'a redraw at a fractional ratio keeps the canvas');
+    await context.close();
+  }
+  {
+    // The server's reason for a refused enable is shown.
+    const { page, context } = await openPage(browser, '/dashboard', { metricsStatus: 503, enableStatus: 403 });
+    await page.waitForFunction(() => !document.getElementById('dashOff').hidden);
+    await page.click('#dashEnableMetrics');
+    await page.waitForFunction(() => /refused/.test(document.getElementById('dashOffError').textContent));
+    await context.close();
+  }
+  {
+    // On a phone a tile value keeps its unit on its line.
+    const { page, context } = await simPage(browser, { contextOptions: { viewport: { width: 390, height: 844 } } });
+    for (const id of ['dashCmMem', 'dashCmSsd']) {
+      const fit = await page.evaluate((i) => { const v = document.getElementById(i); return { lines: Math.round(v.getBoundingClientRect().height / parseFloat(getComputedStyle(v).lineHeight)), over: v.scrollWidth - v.clientWidth }; }, id);
+      assert.deepEqual(fit, { lines: 1, over: 0 }, `${id} fits one line at 390 px`);
+    }
+    await context.close();
+  }
+}
+
 async function main() {
   const playwright = loadPlaywright();
   if (!playwright) { console.log('Web UI dashboard: skipped (Playwright is not installed)'); return; }
@@ -126,6 +481,7 @@ async function main() {
     return;
   }
   try {
+    await dashboardBugs(browser);
     {
       const { page, errors, context } = await openPage(browser, '/chat');
       await page.waitForSelector('#modelSelect option', { state: 'attached' });

@@ -439,6 +439,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 @media (min-width: 1100px) { #dashPanel .tiles-cmp { grid-template-columns: repeat(5, 1fr); } #dashPanel .tiles-cmp .tile, #dashPanel .tiles-cmp .tile:nth-child(n+4) { grid-column: auto; } }
 #dashPanel .tiles-cmp .tile { display: flex; flex-direction: column; gap: 4px; padding: 14px var(--s4); }
 #dashPanel .tiles-cmp .tile .v { font-size: var(--fs-2xl); line-height: 1.15; }
+@media (max-width: 559px) { #dashPanel .tiles-cmp .tile .v { font-size: var(--fs-lg); white-space: nowrap; } #dashPanel .tiles-cmp .tile .v small { font-size: var(--fs-sm); } }
 #dashPanel .tiles-cmp .tile .s { overflow-wrap: anywhere; }
 #dashPanel .tiles-cmp .meterbar { height: 6px; margin-top: auto; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
 #dashPanel .tiles-cmp .meterbar > span { display: block; height: 100%; border-radius: 3px; background: var(--info); }
@@ -455,6 +456,8 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 #dashPanel .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
 #dashPanel .legend i.dash { height: 0; width: 14px; border-top: 2px dashed var(--warn); background: none; }
 #dashPanel canvas { width: 100%; height: 170px; display: block; cursor: crosshair; touch-action: pan-y; }
+#dashPanel canvas:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; border-radius: 4px; }
+#dashPanel[data-offline] canvas { opacity: .45; }
 #dashPanel table.sessions { table-layout: fixed; min-width: 1100px; }
 #dashPanel table.sessions td.rid { direction: rtl; text-align: left; }
 #dashPanel table.sessions td, #dashPanel table.sessions th { overflow: hidden; text-overflow: ellipsis; }
@@ -3249,18 +3252,27 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   $('interval').value = store.get('interval', '2000');
   if (!$('interval').value) $('interval').value = '2000'; // a remembered value from an older option list
   $('window').value = store.get('window', '300');
+  if (!$('window').value) $('window').value = '300'; // a remembered value the list lacks
+  const windowMs = () => (+$('window').value || 300) * 1000;
 
-  for (const id of ['interval', 'window']) $(id).addEventListener('change', () => { store.set(id, $(id).value); restart(); });
-
-  let paused = false, timer = null, inflight = false;
+  let paused = false, timer = null, inflight = false, repoll = false, refetch = false, shownWindow = windowMs();
   let dashActive = false, lastData = null, bgStopped = false, lastPollAt = 0, lastServerAt = 0, failures = 0;
-  let lastCounters = null, restartNote = '', metricsOff = false, prevWrites = null, feedOffline = false;
-  const restarts = []; // times the server was seen restarting, drawn on the charts
+  let restartNote = '', restartAt = 0, metricsOff = false, prevWrites = null, feedOffline = false;
+  const restarts = []; // server times the process was seen restarting, drawn on the charts
+
+  $('interval').addEventListener('change', () => { store.set('interval', $('interval').value); restart(); });
+  // A wider window asks the server for everything again (the page trimmed what lay outside the old one), also while paused.
+  $('window').addEventListener('change', () => {
+    store.set('window', $('window').value);
+    const wider = windowMs() > shownWindow; shownWindow = windowMs();
+    if (wider) { refetch = true; restart(true); } else { trim(srvNow || Date.now()); drawAll(); }
+  });
   const series = { t: [], gen: [], pre: [], run: [], wait: [], pref: [], batch: [], gpu: [], mem: [], act: [], cache: [] };
   const lastGen = new Map(); // request_id -> {gen, t}
-  const finished = []; // {t, rate, tokens}: the prefill speed of requests that finished, drawn as the Compact prefill chart
-  const lastReq = { pre: null, dec: null }; // {rate, tokens, at} of the latest finished request, from the counters
-  let lastHists = null, startedMs = 0, modelsKnown = false;
+  const finished = []; // {t, rate, tokens, restored}: the prefill speed of each finished request, drawn as the prefill chart
+  const lastReq = { pre: null, dec: null }; // {rate, tokens, t} of the latest finished request that has a speed
+  const seenReq = new Map(); // "id@t_ms" -> t_ms: the request log repeats a request until a history sample passes it
+  let startedMs = 0, srvNow = 0, modelsKnown = false; // process start and the newest server time seen, both server clock
   // The server keeps the history (one sample per sampler tick); the page asks for what it has not seen, so a tab that
   // was in the background fills in on return and every point is plotted at the server's own time.
   let lastHistT = 0, histPrev = null, lastRates = { gen: 0, pre: 0 };
@@ -3269,32 +3281,46 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   $('pause').onclick = () => {
     paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause';
-    if (paused) { clearTimeout(timer); $('status').textContent = 'Paused'; $('status').className = ''; $('dot').className = 'dot off'; $('dot').title = 'Paused'; }
+    if (paused) { clearTimeout(timer); put($('status'), 'Paused'); $('status').className = ''; $('dot').className = 'dot off'; $('dot').title = 'Paused'; }
     else restart();
   };
 
+  // Writes only what changed, so an unchanged poll touches no DOM.
+  const put = (el, text) => { if (el.textContent !== text) el.textContent = text; };
+  const putClass = (el, cls) => { if (el.className !== cls) el.className = cls; };
   const fmt = (n, d = 0) => n == null || !isFinite(n) ? '-' : n.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
   const fmtInt = n => fmt(n, 0);
   const compact = n => n >= 1e9 ? fmt(n / 1e9, 2) + 'B' : n >= 1e6 ? fmt(n / 1e6, 2) + 'M' : n >= 1e4 ? fmt(n / 1e3, 1) + 'k' : fmtInt(n);
   const gib = b => b / 1073741824;
   const bytes = b => b >= 1073741824 ? fmt(gib(b), 2) + ' GiB' : b >= 1048576 ? fmt(b / 1048576, 1) + ' MiB' : fmt(b / 1024, 0) + ' KiB';
+  const span = s => s < 60 ? s + 's' : s < 3600 ? Math.round(s / 60) + 'm' : Math.floor(s / 3600) + 'h' + (s % 3600 ? Math.round(s % 3600 / 60) + 'm' : '');
   const secs = s => !isFinite(s) ? '-' : s < 1 ? fmt(s * 1000, 0) + ' ms' : s < 60 ? fmt(s, 2) + ' s' : Math.floor(s / 60) + 'm ' + fmt(s % 60, 0) + 's';
   const mean = h => h && h.count ? h.sum / h.count : NaN;
 
   // tone: false = live, true = an error, 'off' = nothing is wrong, the feed is just not running.
   function setStatus(msg, tone, title) {
     if (paused) return;
-    $('dot').title = title || msg; $('status').textContent = msg; $('status').className = tone === true ? 'err' : ''; $('dot').className = 'dot ' + (tone === true ? 'err' : tone === 'off' ? 'off' : 'ok');
+    const dot = $('dot'), t = title || msg;
+    if (dot.title !== t) dot.title = t;
+    put($('status'), msg); putClass($('status'), tone === true ? 'err' : ''); putClass(dot, 'dot ' + (tone === true ? 'err' : tone === 'off' ? 'off' : 'ok'));
   }
 
   // The server answers 503 on /metrics.json exactly while metrics are off; POST /metrics/enable turns them on.
-  function syncEnableButton() { $('off').hidden = !metricsOff; $('panel').dataset.feed = metricsOff ? 'off' : 'on'; if (!metricsOff) $('off-error').hidden = true; }
+  function syncEnableButton() {
+    if ($('off').hidden === metricsOff) $('off').hidden = !metricsOff;
+    const feed = metricsOff ? 'off' : 'on';
+    if ($('panel').dataset.feed !== feed) $('panel').dataset.feed = feed;
+    if (!metricsOff && !$('off-error').hidden) $('off-error').hidden = true;
+  }
   $('enable-metrics').onclick = async () => {
     const button = $('enable-metrics');
     button.disabled = true;
     try {
       const r = await api('/metrics/enable', { method: 'POST' });
-      if (!r.ok) throw new Error(r.status === 401 ? 'the server wants an API key' : 'HTTP ' + r.status);
+      if (!r.ok) {
+        const why = await r.json().then(j => j.error?.message, () => '');
+        throw new Error(r.status === 401 ? 'the server wants an API key' : why || 'HTTP ' + r.status);
+      }
       metricsOff = false; bgStopped = false; failures = 0;
       syncEnableButton();
       restart();
@@ -3304,7 +3330,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     } finally { button.disabled = false; }
   };
 
-  function restart() { clearTimeout(timer); propsAt = 0; if (!paused) tick(); }
+  // A poll in flight keeps its place: the change is polled for the moment it lands. `force` polls once even when paused.
+  function restart(force) { clearTimeout(timer); propsAt = 0; if (inflight) repoll = true; else if (!paused || force) tick(force); }
 
   // Switching views and tab visibility ask for an immediate poll; the 2 s minimum still holds across them.
   function pollSoon() {
@@ -3313,43 +3340,49 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (wait) timer = setTimeout(tick, wait); else tick();
   }
 
-  async function tick() {
+  const interval = () => Math.max(MIN_GAP, +$('interval').value || MIN_GAP);
+  async function tick(force) {
     clearTimeout(timer);
-    const iv = Math.max(MIN_GAP, +$('interval').value || MIN_GAP);
-    let delay = iv;
+    if (inflight) return; // the poll in flight re-arms the timer when it ends
+    let delay = interval();
     // A hidden dashboard polls only when the chat is idle, so background polling never competes with a chat request.
     const quiet = !dashActive && (chatAbort || bgStopped);
-    if (!paused && !document.hidden && !quiet && !inflight) {
+    if ((!paused || force === true) && !document.hidden && !quiet) {
       inflight = true; lastPollAt = Date.now();
+      const full = refetch; refetch = false;
       let permanent = false;
       try {
-        const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), Math.max(3000, iv * 2));
+        const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), Math.max(3000, delay * 2));
         let r;
-        try { r = await api('/metrics.json?since=' + lastHistT, { signal: ctl.signal }); } finally { clearTimeout(to); }
+        try { r = await api('/metrics.json?since=' + (full ? 0 : lastHistT), { signal: ctl.signal }); } finally { clearTimeout(to); }
         permanent = r.status === 503 || r.status === 401;
         metricsOff = r.status === 503;
         syncEnableButton();
         if (r.status === 503) throw new Error('Metrics off');
         if (r.status === 401) throw new Error('Server wants an API key (started with --api-key).');
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        update(await r.json());
+        update(await r.json(), full);
         failures = 0;
         feedOffline = false;
-        setStatus(restartNote ? 'Live. ' + restartNote : 'Live', false, 'Updated ' + new Date().toLocaleTimeString());
+        setStatus(restartNote && Date.now() - restartAt < RESTART_NOTE_MS ? 'Live. ' + restartNote : 'Live', false, 'Updated ' + new Date().toLocaleTimeString());
       } catch (e) {
+        if (full) refetch = true;
         const unreachable = e.name !== 'AbortError' && (e.message === 'Failed to fetch' || e instanceof TypeError);
         const m = e.name === 'AbortError' ? 'Timed out' : unreachable ? 'Offline: cannot reach the server' : e.message;
         feedOffline = unreachable;
         setStatus(m, metricsOff ? 'off' : true);
-        if (dashActive) renderCompact();
+        if (dashActive) { if (feedOffline && lastData) render(lastData); else renderCompact(); }
         // Metrics off or a missing key will not fix itself while hidden; other errors back off and retry.
-        if (permanent) { if (!dashActive) bgStopped = true; } else { failures += 1; delay = Math.max(iv, Math.min(30000, 2000 * 2 ** (failures - 1))); }
+        if (permanent) { if (!dashActive) bgStopped = true; } else { failures += 1; delay = Math.max(interval(), Math.min(30000, 2000 * 2 ** (failures - 1))); }
       } finally { inflight = false; }
+      if (repoll) { repoll = false; delay = 0; } else if (!failures) delay = interval();
     }
-    // A hidden tab re-arms nothing; coming back runs pollSoon.
-    if (!document.hidden) timer = setTimeout(tick, delay);
+    // A hidden or paused page re-arms nothing; coming back runs pollSoon or restart.
+    clearTimeout(timer);
+    if (!document.hidden && !paused) timer = setTimeout(tick, delay);
   }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollSoon(); });
+  const RESTART_NOTE_MS = 60000;
+  document.addEventListener('visibilitychange', () => { syncServerTimer(); if (!document.hidden) pollSoon(); });
 
   const WRITE_KINDS = { kv: 'KV chunks', ssm: 'Restore points', qsa: 'QSA history', spec: 'Speculative state', ring: 'Ring points', meta: 'Manifests and token records' };
   // The cache's write counters as the card shows them: the rate since the previous poll (null on the first poll
@@ -3377,40 +3410,55 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     return rates;
   }
   function trim(now) {
-    const cut = now - (+$('window').value) * 1000;
+    const cut = now - windowMs();
     while (restarts.length && restarts[0] < now - 3600000) restarts.shift();
-    while (finished.length && finished[0].t < cut) finished.shift();
+    for (let i = finished.length; i--;) if (finished[i].t < cut) finished.splice(i, 1);
+    for (const [k, t] of seenReq) if (t < cut) seenReq.delete(k);
     while (series.t.length && series.t[0] < cut) for (const k in series) series[k].shift();
   }
 
-  // Speed of the requests that finished between two polls, from the counter and histogram deltas: tokens divided by
-  // the time the server spent on them. Null when none finished, or too few tokens for a rate to mean anything.
-  function requestRates(pc, ph, c, h) {
-    const one = (tok, hist, min) => {
-      const n = (c[tok] || 0) - (pc[tok] || 0), secs = (h[hist]?.sum || 0) - (ph[hist]?.sum || 0), done = (h[hist]?.count || 0) - (ph[hist]?.count || 0);
-      return done > 0 && n >= min && secs > 0 ? { rate: n / secs, tokens: n } : null;
-    };
-    return { pre: one('prefill_tokens_total', 'prefill_time_seconds', 32), dec: one('generation_tokens_total', 'decode_time_seconds', 8) };
+  // One entry per finished request from the server's log. A prefill speed needs an "ok" request with prefill time; a
+  // request that restored more than it computed is kept (hollow dot, its own label) but never feeds the tile.
+  function ingestRequests(list) {
+    for (const r of list) {
+      const key = r.request_id + '@' + r.t_ms;
+      if (seenReq.has(key)) continue;
+      seenReq.set(key, r.t_ms);
+      if (r.outcome === 'ok' && r.prefill_seconds > 0 && r.prompt_tokens > 0) {
+        const ev = { t: r.t_ms, rate: r.prompt_tokens / r.prefill_seconds, tokens: r.prompt_tokens, restored: r.cached_tokens || 0 };
+        finished.push(ev);
+        if (ev.restored <= ev.tokens && (!lastReq.pre || ev.t >= lastReq.pre.t)) lastReq.pre = ev;
+      }
+      if (r.outcome !== 'rejected' && r.generated_tokens > 0 && r.decode_seconds > 0 && (!lastReq.dec || r.t_ms >= lastReq.dec.t)) lastReq.dec = { rate: r.generated_tokens / r.decode_seconds, tokens: r.generated_tokens, t: r.t_ms };
+    }
+    finished.sort((a, b) => a.t - b.t);
+  }
+  // A new process: its counters, request log and history start over, so nothing derived from the old one is kept.
+  function forgetProcess() {
+    histPrev = null; lastGen.clear(); propsAt = 0; prevWrites = null;
+    finished.length = 0; seenReq.clear(); lastReq.pre = lastReq.dec = null;
   }
   // Mean speed since the server started, shown until a request has finished while the page was watching.
   const meanRate = (c, h, tok, hist) => h[hist]?.sum > 0 && c[tok] > 0 ? { rate: c[tok] / h[hist].sum, tokens: c[tok], avg: true } : null;
 
-  function update(d) {
-    const now = Date.now(), c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
-    // A restarted server starts its counters from zero: mark it and drop rate state built on the old values.
-    if (lastCounters && Object.keys(c).some(k => (c[k] || 0) < (lastCounters[k] || 0))) {
-      restarts.push(now); histPrev = null; lastGen.clear(); propsAt = 0;
-      restartNote = 'Server restarted at ' + new Date(now).toLocaleTimeString();
+  function update(d, full) {
+    const now = Date.now();
+    // The process start is the server's own: a different one is a restart, whatever its counters say.
+    const started = d.history?.started_ms || 0;
+    if (full) {
+      for (const k in series) series[k].length = 0;
+      finished.length = 0; seenReq.clear(); lastHistT = 0; histPrev = null;
     }
-    const fin = lastCounters && lastHists ? requestRates(lastCounters, lastHists, c, h) : {};
-    lastCounters = c; lastHists = h;
-    if (d.history?.started_ms) startedMs = d.history.started_ms;
+    if (startedMs && started && started !== startedMs) {
+      restarts.push(started); forgetProcess();
+      restartNote = 'Server restarted at ' + new Date(started).toLocaleTimeString(); restartAt = now;
+    }
+    if (started) startedMs = started;
     // The server's history ring is the only source of the rates; a page that missed samples gets them in this poll.
     const { gen, pre } = lastRates = ingestHistory(d.history?.samples ?? []);
-    trim(lastHistT || now);
-    const at = series.t.length ? series.t[series.t.length - 1] : now;
-    if (fin.pre) { finished.push({ t: at, ...fin.pre }); lastReq.pre = { ...fin.pre, at: now }; }
-    if (fin.dec) lastReq.dec = { ...fin.dec, at: now };
+    ingestRequests(d.requests ?? []);
+    srvNow = Math.max(lastHistT, ...finished.map(e => e.t), 0) || now;
+    trim(srvNow);
     let onDisk = 0;
     for (const p of modelProps.values()) if (p && typeof p === 'object') onDisk += p.settings?.prefix_cache?.disk_used_bytes || 0;
     const writes = prefixWrites(d.prefix_cache_writes, prevWrites, now, onDisk);
@@ -3422,22 +3470,27 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function render({ d, now, gen, pre, writes }) {
     // The other mode's cards are display:none; they are filled when the toggle shows them.
     if (document.body.dataset.mode === 'compact') { renderCompact(); drawAll(); return; }
+    if (feedOffline) {
+      renderCompact(); speedTiles({ d, now, gen, pre }, 't-gen', 't-pre');
+      for (const id of ['t-req', 't-gpu', 't-mem', 't-ttft', 't-cache', 't-served']) setValue($(id), '-', '');
+      drawAll(); return;
+    }
     const c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
 
     speedTiles({ d, now, gen, pre }, 't-gen', 't-pre');
-    $('t-req').textContent = `${g.requests_running || 0} / ${g.requests_waiting || 0}`;
-    $('t-req-s').textContent = g.batched_group_size > 1 ? `running / waiting, ${g.batched_group_size} batched` : 'running / waiting';
-    $('t-gpu').textContent = fmtInt(g.gpu_utilization_pct) + '%';
-    $('t-mem').textContent = fmt((g.memory_mb || 0) / 1024, 1) + ' GiB';
+    put($('t-req'), `${g.requests_running || 0} / ${g.requests_waiting || 0}`);
+    put($('t-req-s'), g.batched_group_size > 1 ? `running / waiting, ${g.batched_group_size} batched` : 'running / waiting');
+    put($('t-gpu'), fmtInt(g.gpu_utilization_pct) + '%');
+    put($('t-mem'), fmt((g.memory_mb || 0) / 1024, 1) + ' GiB');
     lastGauges = g;
-    if (serverInfo.free == null) $('t-mem-s').textContent = `MLX ${fmt(gib(g.mlx_active_bytes || 0), 1)} active, ${fmt(gib(g.mlx_cache_bytes || 0), 1)} cache`;
-    $('t-ttft').textContent = secs(mean(h.time_to_first_token_seconds));
-    $('t-ttft-s').textContent = `over ${fmtInt(h.time_to_first_token_seconds?.count || 0)} requests`;
+    if (serverInfo.free == null) put($('t-mem-s'), `MLX ${fmt(gib(g.mlx_active_bytes || 0), 1)} active, ${fmt(gib(g.mlx_cache_bytes || 0), 1)} cache`);
+    put($('t-ttft'), secs(mean(h.time_to_first_token_seconds)));
+    put($('t-ttft-s'), `over ${fmtInt(h.time_to_first_token_seconds?.count || 0)} requests`);
     const pt = c.prompt_tokens_total || 0;
-    $('t-cache').textContent = pt ? fmt(100 * (c.prefix_cache_tokens_total || 0) / pt, 0) + '%' : '-';
-    $('t-cache-s').textContent = 'of prompt tokens came from cache';
-    $('t-served').textContent = compact(g.generation_tokens_live || c.generation_tokens_total || 0);
-    $('t-served-s').textContent = `output tokens, ${compact(pt)} input`;
+    put($('t-cache'), pt ? fmt(100 * (c.prefix_cache_tokens_total || 0) / pt, 0) + '%' : '-');
+    put($('t-cache-s'), 'of prompt tokens came from cache');
+    put($('t-served'), compact(g.generation_tokens_live || c.generation_tokens_total || 0));
+    put($('t-served-s'), `output tokens, ${compact(pt)} input`);
 
     const kv = (el, rows) => { setHtml(el, rows.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join('')); };
     const mtp = (h.prefill_time_seconds?.sum || 0), dtp = (h.decode_time_seconds?.sum || 0);
@@ -3527,6 +3580,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // innerHTML only through DOMPurify; a TBODY is wrapped in a table because a bare <tr> is dropped by the HTML parser.
   function setHtml(node, html) {
     if (!window.DOMPurify?.isSupported) { node.textContent = ''; return; }
+    if (node._html === html) return;
+    node._html = html;
     if (node.tagName !== 'TBODY') { node.innerHTML = DOMPurify.sanitize(html); return; }
     node.innerHTML = DOMPurify.sanitize('<table><tbody>' + html + '</tbody></table>').replace(/^<table><tbody>|<\/tbody><\/table>$/g, '');
   }
@@ -3598,33 +3653,42 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   const ago = ms => { const s = Math.max(0, Math.round(ms / 1000)); return s < 5 ? 'just now' : s < 60 ? s + ' s ago' : s < 3600 ? Math.floor(s / 60) + ' min ago' : Math.floor(s / 3600) + ' h ago'; };
   const upFor = ms => { const m = Math.floor(ms / 60000), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`; };
-  // The tile value with its unit beside it, built as nodes so no markup is parsed.
+  // The tile value with its unit beside it, built as nodes so no markup is parsed; rewritten only when it changed.
   function setValue(el, value, unit) {
+    const key = value + '\0' + (unit || '');
+    if (el._key === key) return;
+    el._key = key;
     el.textContent = value;
     if (unit) { const u = document.createElement('small'); u.textContent = ' ' + unit; el.append(u); }
   }
+  const setWidth = (el, pct) => { const w = pct + '%'; if (el.style.width !== w) el.style.width = w; };
   // The memory the Memory chart and tile measure against: the machine's, or what sushi can reach on a server that does not say.
   function memCeiling() {
     if (serverInfo.total) return { gib: gib(serverInfo.total), machine: true };
     const used = (lastData?.d.gauges?.memory_mb || 0) / 1024;
     return serverInfo.free != null ? { gib: used + gib(serverInfo.free), machine: false } : null;
   }
+  const UNREACHABLE = 'server unreachable';
+  function offlineTile(id) { setValue($(id), '-', ''); put($(id + '-s'), UNREACHABLE); putClass($(id + '-s'), 's'); }
 
   // Decode and Prefill tiles, shared by both views: live while running, else the last request's rate, else the mean since start.
   function speedTiles({ d, now, gen, pre }, decId, preId) {
+    if (feedOffline) { offlineTile(decId); offlineTile(preId); return; }
     const c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
-    const since = r => 'last request, ' + ago(now - r.at);
+    const since = r => 'last request, ' + ago(srvNow - r.t);
     const dec = gen > 0 ? { rate: gen, live: true } : lastReq.dec || meanRate(c, h, 'generation_tokens_total', 'decode_time_seconds');
     setValue($(decId), dec ? fmt(dec.rate, 1) : '-', dec ? 'tok/s' : '');
-    $(decId + '-s').textContent = !dec ? 'nothing generated yet' : dec.live ? 'live' : dec.avg ? 'average since start' : since(dec);
-    $(decId + '-s').className = 's' + (dec?.live ? ' live' : '');
+    put($(decId + '-s'), !dec ? 'nothing generated yet' : dec.live ? 'live' : dec.avg ? 'average since start' : since(dec));
+    putClass($(decId + '-s'), 's' + (dec?.live ? ' live' : ''));
     const livePre = (g.requests_prefilling || 0) > 0 && pre > 0;
     const last = lastReq.pre || meanRate(c, h, 'prefill_tokens_total', 'prefill_time_seconds');
     setValue($(preId), livePre ? fmt(pre, 0) : last ? fmt(last.rate, 0) : '-', livePre || last ? 'tok/s' : '');
-    $(preId + '-s').textContent = livePre ? (g.prefill_tokens_expected ? `live, ${compact(g.prefill_tokens_live)} / ${compact(g.prefill_tokens_expected)} tokens` : 'live')
-      : !last ? 'nothing prefilled yet' : last.avg ? 'average since start' : `${since(last)}, ${fmtInt(last.tokens)} tokens`;
-    $(preId + '-s').className = 's' + (livePre ? ' live' : '');
+    put($(preId + '-s'), livePre ? (g.prefill_tokens_expected ? `live, ${compact(g.prefill_tokens_live)} / ${compact(g.prefill_tokens_expected)} tokens` : 'live')
+      : !last ? 'nothing prefilled yet' : last.avg ? 'average since start' : `${since(last)}, ${fmtInt(last.tokens)} tokens${last.restored ? `, ${fmtInt(last.restored)} restored` : ''}`);
+    putClass($(preId + '-s'), 's' + (livePre ? ' live' : ''));
   }
+
+  const setOffline = on => { if ($('panel').hasAttribute('data-offline') !== on) $('panel').toggleAttribute('data-offline', on); };
 
   // The Compact view: status strip, tiles.
   function renderCompact() {
@@ -3632,32 +3696,44 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const ready = modelList.filter(m => m.state === 'ready').map(m => shortName(m.id));
     const busy = (g.requests_running || 0) + (g.requests_waiting || 0) > 0;
     const [state, cls] = feedOffline || modelStore.online === false ? ['Offline', 'err'] : !modelsKnown ? ['Connecting', ''] : modelList.some(m => m.state === 'loading') ? ['Loading', 'busy']
-      : !ready.length ? ['Not loaded', ''] : !busy ? ['Idle', 'idle'] : g.requests_prefilling ? ['Prefilling', 'busy'] : ['Decoding', 'busy'];
-    $('cm-state').textContent = state; $('cm-state').className = 'badge ' + cls;
-    $('cm-model').textContent = ready.length ? ready[0] + (ready.length > 1 ? ` +${ready.length - 1}` : '') : modelsKnown ? 'No model loaded' : '-';
-    $('cm-model').title = ready.join('\n');
-    $('cm-up').textContent = startedMs ? 'up ' + upFor((lastHistT || now) - startedMs) : '';
+      : !ready.length ? ['Not loaded', ''] : metricsOff ? ['Ready', ''] : !busy ? ['Idle', 'idle'] : g.requests_prefilling ? ['Prefilling', 'busy'] : ['Decoding', 'busy'];
+    put($('cm-state'), state); putClass($('cm-state'), 'badge ' + cls);
+    const stateTitle = metricsOff && cls === '' && state === 'Ready' ? 'Metrics are off, so idle or busy is unknown' : '';
+    if ($('cm-state').title !== stateTitle) $('cm-state').title = stateTitle;
+    put($('cm-model'), ready.length ? ready[0] + (ready.length > 1 ? ` +${ready.length - 1}` : '') : modelsKnown ? 'No model loaded' : '-');
+    if ($('cm-model').title !== ready.join('\n')) $('cm-model').title = ready.join('\n');
+    put($('cm-up'), startedMs ? 'up ' + upFor((srvNow || now) - startedMs) : '');
+    setOffline(feedOffline);
     if (!lastData) return;
 
     speedTiles(lastData, 'cm-dec', 'cm-pre');
+    if (feedOffline) {
+      setValue($('cm-mem'), '-', ''); setWidth($('cm-mem-bar'), 0); put($('cm-mem-s'), UNREACHABLE);
+      setValue($('cm-ssd'), '-', ''); setWidth($('cm-ssd-bar'), 0); put($('cm-ssd-s'), UNREACHABLE);
+      setValue($('cm-req'), '-', ''); put($('cm-req-s'), UNREACHABLE);
+      return;
+    }
 
     const used = (g.memory_mb || 0) / 1024, ceil = memCeiling();
     setValue($('cm-mem'), fmt(used, 1) + (ceil ? ' / ' + fmt(ceil.gib, 0) : ''), 'GiB');
-    $('cm-mem-bar').style.width = (ceil ? Math.min(100, 100 * used / ceil.gib) : 0) + '%';
-    $('cm-mem-s').textContent = serverInfo.free != null ? bytes(serverInfo.free) + ' available' : 'in use by sushi';
+    setWidth($('cm-mem-bar'), ceil ? Math.min(100, 100 * used / ceil.gib) : 0);
+    put($('cm-mem-s'), serverInfo.free != null ? bytes(serverInfo.free) + ' available' : 'in use by sushi');
 
-    let ssd = 0, cap = 0, entries = 0;
-    for (const p of modelProps.values()) if (p && typeof p === 'object') {
+    let ssd = 0, cap = 0, entries = 0, known = false;
+    for (const m of modelList) {
+      const p = m.state === 'ready' ? modelProps.get(m.id) : null;
+      if (!p || typeof p !== 'object') continue;
       const pc = p.settings?.prefix_cache || {};
-      ssd += pc.disk_used_bytes || 0; cap = Math.max(cap, pc.disk_bytes || 0); entries += pc.disk_entries || 0;
+      known = true; ssd += pc.disk_used_bytes || 0; cap = Math.max(cap, pc.disk_bytes || 0); entries += pc.disk_entries || 0;
     }
-    setValue($('cm-ssd'), cap ? bytes(ssd) : 'off', cap ? '/ ' + bytes(cap) : '');
-    $('cm-ssd-bar').style.width = (cap ? Math.min(100, 100 * ssd / cap) : 0) + '%';
-    $('cm-ssd-s').textContent = cap ? `${fmtInt(entries)} ${entries === 1 ? 'entry' : 'entries'}` : 'SSD prefix cache is off';
+    // "off" is a claim about a loaded model's settings; without one (or before /props answers) there is nothing to say.
+    setValue($('cm-ssd'), cap ? bytes(ssd) : known ? 'off' : '-', cap ? '/ ' + bytes(cap) : '');
+    setWidth($('cm-ssd-bar'), cap ? Math.min(100, 100 * ssd / cap) : 0);
+    put($('cm-ssd-s'), cap ? `${fmtInt(entries)} ${entries === 1 ? 'entry' : 'entries'}` : known ? 'SSD prefix cache is off' : modelsKnown && !ready.length ? 'no model loaded' : '');
 
     setValue($('cm-req'), String(g.requests_running || 0), 'running');
-    $('cm-req-s').textContent = `${g.requests_waiting || 0} waiting` + (g.requests_prefilling ? ', prefilling' : '');
-    $('cm-ceil-l').textContent = ceil ? (ceil.machine ? 'machine memory' : 'available to sushi') : 'ceiling unknown';
+    put($('cm-req-s'), `${g.requests_waiting || 0} waiting` + (g.requests_prefilling ? ', prefilling' : ''));
+    put($('cm-ceil-l'), ceil ? (ceil.machine ? 'machine memory' : 'available to sushi') : 'ceiling unknown');
   }
 
   // Each theme colour is resolved once per theme (a probe element turns var() into a plain colour), not once per stroke.
@@ -3679,13 +3755,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // Sizes the canvas and draws the grid, axis labels and restart markers; returns what a chart needs to plot on it.
   function frame(id, max, opts) {
     const cv = $(id), dpr = window.devicePixelRatio || 1, w = cv.clientWidth, hgt = cv.clientHeight;
-    if (cv.width !== w * dpr || cv.height !== hgt * dpr) { cv.width = w * dpr; cv.height = hgt * dpr; }
+    const pw = Math.round(w * dpr), ph = Math.round(hgt * dpr);
+    if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; }
     const ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, hgt);
     const t = series.t, n = t.length, padL = 40, padR = 8, padT = 8, padB = 18;
-    const win = (+$('window').value) * 1000;
-    const name = `${CHART_NAME[id]}, last ${secs(win / 1000)}: scale up to ${axis(max, opts.dec)}`;
+    const win = windowMs();
+    const name = `${CHART_NAME[id]}, last ${span(win / 1000)}: scale up to ${axis(max, opts.dec)}`;
     if (cv.getAttribute('aria-label') !== name) cv.setAttribute('aria-label', name);
-    const tEnd = n ? t[n - 1] : Date.now(), tStart = tEnd - win;
+    const tEnd = opts.tEnd ?? (n ? t[n - 1] : Date.now()), tStart = tEnd - win;
     const X = tm => padL + (w - padL - padR) * (tm - tStart) / win, Y = v => padT + (hgt - padT - padB) * (1 - v / max);
     ctx.font = '11px ui-sans-serif, system-ui, sans-serif'; ctx.fillStyle = css('--text-2'); ctx.strokeStyle = css('--surface-2'); ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
@@ -3693,7 +3770,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
       ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(axis(v, opts.dec), padL - 6, y);
     }
-    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillText('-' + secs(win / 1000).replace(' ', ''), padL, hgt - 4);
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillText('-' + span(win / 1000), padL, hgt - 4);
     ctx.textAlign = 'right'; ctx.fillText('now', w - padR, hgt - 4);
     for (const rt of restarts) { // server restart markers
       if (rt < tStart) continue;
@@ -3738,6 +3815,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (!opts.max || opts.exact) for (const [k] of lines) for (const v of data[k]) if (v > max) max = v;
     if (!opts.exact) max = niceMax(max || (opts.empty ? 100 : 1));
     const f = frame(id, max, opts), { cv, ctx, w, hgt, padL, padR, padT, padB, X, Y } = f;
+    charts[id] = { xs: t.filter((_, i) => !opts.gapZero || lines.some(([k]) => series[k][i] > 0)).map(X), y: (padT + hgt - padB) / 2 };
     if (opts.ceiling) {
       ctx.save(); ctx.strokeStyle = css('--warn'); ctx.fillStyle = css('--warn'); ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
       const y = Math.round(Y(opts.ceiling)) + .5;
@@ -3795,9 +3873,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     } else if (tipOwner === cv.id) hideTip();
   }
 
+  const mostlyRestored = e => e.restored > e.tokens;
   // One dot (on a stem) per finished request, at the time it finished and the speed it prefilled at.
   function eventChart(id, evs, color) {
-    const f = frame(id, niceMax(Math.max(evs.length ? 1 : 100, ...evs.map(e => e.rate))), {}), { cv, ctx, X, Y } = f;
+    const tEnd = Math.max(series.t[series.t.length - 1] ?? 0, ...evs.map(e => e.t)) || undefined;
+    const f = frame(id, niceMax(Math.max(evs.length ? 1 : 100, ...evs.map(e => e.rate))), { tEnd }), { cv, ctx, hgt, padT, padB, X, Y } = f;
+    charts[id] = { xs: evs.map(e => X(e.t)), y: (padT + hgt - padB) / 2 };
     if (!evs.length) { emptyNote(f, 'No request finished in this window yet'); if (tipOwner === cv.id) hideTip(); return; }
     const hv = hover[id];
     let near = -1, best = 24;
@@ -3807,14 +3888,18 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       ctx.save(); ctx.strokeStyle = css(color); ctx.globalAlpha = .35; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(x, Y(0)); ctx.lineTo(x, y); ctx.stroke(); ctx.restore();
       ctx.beginPath(); ctx.arc(x, y, i === near ? 6 : 4.5, 0, 2 * Math.PI);
-      ctx.fillStyle = css(color); ctx.fill(); ctx.strokeStyle = css('--surface'); ctx.lineWidth = 1.5; ctx.stroke();
+      if (mostlyRestored(e)) { ctx.fillStyle = css('--surface'); ctx.fill(); ctx.strokeStyle = css(color); ctx.lineWidth = 2; ctx.stroke(); } // hollow: not a plain prefill speed
+      else { ctx.fillStyle = css(color); ctx.fill(); ctx.strokeStyle = css('--surface'); ctx.lineWidth = 1.5; ctx.stroke(); }
     });
     if (near < 0) { if (tipOwner === cv.id) hideTip(); return; }
-    const e = evs[near], r = cv.getBoundingClientRect();
-    placeTip(r.left + X(e.t), r.top + hv.y, `<div class="t">${new Date(e.t).toLocaleTimeString()}</div>
-      <div class="r near" style="grid-template-columns:1fr auto"><span>Prefill</span><b>${fmtInt(e.rate)} tok/s</b></div>
-      <div class="r near" style="grid-template-columns:1fr auto"><span>Prompt tokens computed</span><b>${fmtInt(e.tokens)}</b></div>
-      <div class="h">The speed of one request: its computed prompt tokens divided by the time spent prefilling. Tokens restored from the prefix cache are not counted.</div>`, cv.id);
+    const e = evs[near], r = cv.getBoundingClientRect(), row = (k, v) => `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${v}</b></div>`;
+    const help = mostlyRestored(e) ? 'Mostly restored from the prefix cache. The prefill time includes the restore, so this is not a prefill speed.'
+      : e.restored ? 'Computed prompt tokens divided by the time spent prefilling. That time includes restoring the cached part, so the speed is a lower bound.'
+      : 'The speed of one request: its computed prompt tokens divided by the time spent prefilling.';
+    placeTip(r.left + X(e.t), r.top + hv.y, `<div class="t">${new Date(e.t).toLocaleTimeString()}</div>`
+      + (mostlyRestored(e) ? '' : row('Prefill', `${fmtInt(e.rate)} tok/s`))
+      + row(e.restored ? 'Prompt tokens' : 'Prompt tokens computed', e.restored ? `${fmtInt(e.tokens)} computed, ${fmtInt(e.restored)} restored` : fmtInt(e.tokens))
+      + `<div class="h">${help}</div>`, cv.id);
   }
 
   const tip = document.createElement('div'); tip.id = 'dashTip'; $('panel').appendChild(tip);
@@ -3857,11 +3942,28 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     cache: { name: 'MLX cache', fmt: gb, help: 'Freed buffers MLX keeps for reuse. Held by the process but not in use; a steady climb here explains footprint growth.' },
   };
 
-  for (const id of ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem', 'c-cpre', 'c-cdec', 'c-memc']) {
+  const CHART_IDS = ['c-pre', 'c-dec', 'c-req', 'c-gpu', 'c-mem', 'c-cpre', 'c-cdec', 'c-memc'];
+  const leave = id => { if (!hover[id]) return; delete hover[id]; if (tipOwner === $(id).id) hideTip(); drawSoon(id); };
+  for (const id of CHART_IDS) {
     const cv = $(id);
-    cv.addEventListener('pointermove', e => { const r = cv.getBoundingClientRect(); hover[id] = { x: e.clientX - r.left, y: e.clientY - r.top }; drawSoon(id); });
-    cv.addEventListener('pointerleave', () => { delete hover[id]; hideTip(); drawSoon(id); });
+    cv.tabIndex = 0; // the arrow keys step through its points
+    const point = e => { const r = cv.getBoundingClientRect(); hover[id] = { x: e.clientX - r.left, y: e.clientY - r.top }; drawSoon(id); };
+    cv.addEventListener('pointermove', point);
+    cv.addEventListener('pointerdown', point); // a touch fires no move over a still finger
+    cv.addEventListener('pointerleave', e => { if (e.pointerType !== 'touch') leave(id); }); // a touch "leaves" the moment it lifts
+    cv.addEventListener('blur', () => leave(id));
+    cv.addEventListener('keydown', e => {
+      if (e.key === 'Escape') { leave(id); return; }
+      const dir = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0, xs = charts[id]?.xs;
+      if (!dir || !xs?.length) return;
+      let i = dir < 0 ? xs.length : -1;
+      if (hover[id]) { i = xs.reduce((best, x, j) => Math.abs(x - hover[id].x) < Math.abs(xs[best] - hover[id].x) ? j : best, 0); }
+      i = Math.max(0, Math.min(xs.length - 1, i + dir));
+      hover[id] = { x: xs[i], y: charts[id].y }; drawSoon(id); e.preventDefault();
+    });
   }
+  // A tap anywhere else puts the tooltip away.
+  document.addEventListener('pointerdown', e => { for (const id of CHART_IDS) if (e.target !== $(id)) leave(id); });
 
   function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p; }
   function axis(v, dec) { return v >= 1000 ? fmt(v / 1000, v % 1000 ? 1 : 0) + 'k' : fmt(v, dec ?? (v % 1 ? 1 : 0)); }
@@ -3885,6 +3987,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (on('c-mem')) chart('c-mem', [['cache', '--c4'], ['act', '--c2'], ['mem', '--c1', true]], { ...memOpts, extra: () => serverInfo.peak ? [['MLX peak (since start)', bytes(serverInfo.peak)]] : [] });
   }
   window.addEventListener('resize', () => drawAll());
+  // A new device pixel ratio (a window dragged to another screen, browser zoom) needs a sharper canvas without a poll or resize.
+  let dprQuery = null;
+  const onDpr = () => { watchDpr(); drawAll(); };
+  function watchDpr() { dprQuery?.removeEventListener('change', onDpr); dprQuery = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`); dprQuery.addEventListener('change', onDpr); }
+  watchDpr();
   const themeChanged = () => { palette.clear(); drawAll(); };
   matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', themeChanged);
 
@@ -3932,7 +4039,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   modelStore.subscribe(syncModels);
   syncModels();
-  let serverTimer = null; // runs only while the dashboard is shown
+  let serverTimer = null; // runs only while the dashboard is shown and the tab is visible
+  function syncServerTimer() {
+    const want = dashActive && !document.hidden;
+    if (want && !serverTimer) serverTimer = setInterval(pollServer, 1000);
+    else if (!want && serverTimer) { clearInterval(serverTimer); serverTimer = null; }
+  }
 
   const shortName = id => String(id).split('/').pop();
 
@@ -3941,7 +4053,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const st = p.settings || {}, mem = p.memory || {}, pc = st.prefix_cache || {};
     serverInfo = { free: mem.available_bytes, peak: mem.peak_bytes, total: mem.total_bytes, disk: pc.disk_bytes ? pc : null };
     renderCompact();
-    if (serverInfo.free != null) $('t-mem-s').textContent = bytes(serverInfo.free) + ' free';
+    if (serverInfo.free != null) put($('t-mem-s'), bytes(serverInfo.free) + ' free');
     drawAll();
   }
 
@@ -3998,8 +4110,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     switching = true;
     if (!dash && dashActive) { panelScroll = $('panel').scrollTop; hideTip(); }
     dashActive = dash;
-    if (dash && !serverTimer) serverTimer = setInterval(pollServer, 1000);
-    else if (!dash && serverTimer) { clearInterval(serverTimer); serverTimer = null; }
+    syncServerTimer();
     $('panel').hidden = !dash;
     // inert (with the CSS visibility rule) keeps the hidden chat out of tab order and the accessibility tree.
     chatPanel.inert = !chat;

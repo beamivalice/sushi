@@ -403,12 +403,22 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `/metrics.json?since=<last sample time>`, appends the new samples with decode and prefill rates taken between neighbouring
   samples (`historyRates`), and plots at the server's `t_ms`. A tab in the background does not poll, and on return the next
   poll fills the whole interval in; two samples more than 7 s apart (the server was down, or the ring was cut) are drawn as a
-  gap, never joined. Without a `history` key (an older server) the page falls back to client-time points.
-- The **Compact view** shows a status strip (model, Idle/Busy, uptime from `history.started_ms`), five tiles and three charts.
-  Prefill and decode are separate charts with their own scales. A request's prefill speed is its computed prompt tokens over
-  the prefill time the server spent on it, taken from the `prefill_tokens_total` and `prefill_time_seconds` deltas between
-  two polls (one dot per finished request; the tile shows the latest, or the mean since start until one is seen). Decode is
-  the history's rate with idle samples drawn as gaps; the tile reads live while generating, else the last request's rate.
+  gap, never joined. A wider window than the one shown asks for everything again (`since=0`), also while paused. A change
+  made during a poll in flight is polled for as soon as that poll ends. `history.started_ms` is the process start: a
+  different value is a restart, which draws a marker at that server time, drops the old server's request dots and last-request
+  tiles and shows "Server restarted at ..." for a minute. Uptime reads from it. All times on the charts are the server's clock.
+- **Per-request log**: the same call returns `requests`, one entry per finished request after `since` (`request_id`, `t_ms`,
+  `prompt_tokens` computed, `cached_tokens` restored, `prefill_seconds`, `generated_tokens`, `decode_seconds`, `outcome`).
+  A request is sent again until a history sample passes it, so the page keeps the ones it has seen by `request_id@t_ms`.
+- The **Compact view** shows a status strip (model, Idle/Busy or Ready while metrics are off, uptime from the process start),
+  five tiles and three charts. Prefill and decode are separate charts with their own scales. A request's prefill speed is its
+  computed prompt tokens over its `prefill_seconds`, one dot per finished `ok` request at its own `t_ms`; the tile shows the
+  latest, or the mean since start until one is seen. A request that restored more than it computed is a hollow dot labelled
+  "N computed, M restored" (the time includes the restore, so it is no prefill speed) and never feeds the tile; a partly
+  restored one reads as a lower bound. Decode is the history's rate with idle samples drawn as gaps; the tile reads live while
+  generating, else the last request's `generated_tokens / decode_seconds` (any length). Offline, the tiles read "-" with
+  "server unreachable" and the charts dim. The SSD tile reads "-" while no model is loaded. The charts answer a tap (the
+  nearest point; a tap elsewhere hides it) and the arrow keys (the canvases take focus; Escape hides).
   The Advanced view's Decode and Prefill tiles and its prefill, decode and memory charts are the same functions (`speedTiles`,
   `eventChart`, the shared chart options), so both views read the same.
 - The dashboard's **Prefix cache writes** card (the last card) shows the `prefix_cache_writes` totals: bytes written since
