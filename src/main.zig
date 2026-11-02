@@ -1077,6 +1077,7 @@ pub fn main(init: std.process.Init) !void {
         if (!server_mod.prefix_cache_disk_explicit) if (model_settings_mod.server(&file).prefix_cache_disk_gb) |gb| {
             server_mod.prefix_cache_disk_bytes = @as(u64, gb) << 30;
             server_mod.prefix_cache_disk_explicit = true;
+            server_mod.prefix_cache_disk_from_file = true;
             log.info("[model-settings] server.prefix_cache_disk_gb {d} sets the SSD prefix cache budget\n", .{gb});
         };
     }
@@ -1775,11 +1776,10 @@ fn runHeadlessServe(
         .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
-        .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
         .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
+        .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .metrics = metrics_mod.current(),
@@ -1819,7 +1819,10 @@ fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bo
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
-    if (server_mod.prefix_cache_disk_explicit) locks.prefix_cache_disk_gb.pin("{d}", .{server_mod.prefix_cache_disk_bytes >> 30});
+    if (server_mod.prefix_cache_disk_explicit) {
+        var size_buf: [32]u8 = undefined;
+        locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_mod.prefix_cache_disk_bytes)});
+    }
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
 }
 

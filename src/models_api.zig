@@ -692,6 +692,8 @@ const PropsSettings = struct {
     mtp_acceptance: mtp_acceptance_mod.Mode,
     mtp_acceptance_source: []const u8 = "default",
     mtp_greedy_tail: model_settings.Pick(bool) = .{ .value = false, .source = .default },
+    /// False on an arch whose drafts the file's acceptance and greedy-tail keys do not reach (DSpark).
+    mtp_acceptance_applies: bool = true,
     /// 0 = auto.
     mtp_depth: u32,
     mtp_adaptive: bool,
@@ -715,11 +717,28 @@ fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
     return mlxPropsSettings(lm);
 }
 
+const MtpAcceptanceReport = struct {
+    acceptance: model_settings.Pick(mtp_acceptance_mod.Mode),
+    greedy_tail: model_settings.Pick(bool),
+    applies: bool,
+};
+
+/// What /props says about acceptance and the greedy tail: on an arch the file's keys do not reach, the file's values are not reported.
+fn mtpAcceptanceReport(config: *const model_mod.ModelConfig) MtpAcceptanceReport {
+    const applies = model_settings.applies("mtp_acceptance", server.settingsFit(config));
+    return .{
+        .acceptance = mtp_plan.mtpAcceptanceFor(if (applies) config.mtp_acceptance_override else null),
+        .greedy_tail = mtp_plan.mtpGreedyTailFor(if (applies) config.mtp_greedy_tail_override else null),
+        .applies = applies,
+    };
+}
+
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv_cache = kvCacheFor(config);
     const kv = kv_cache.config;
-    const acceptance = mtp_plan.mtpAcceptanceFor(config.mtp_acceptance_override);
+    const report = mtpAcceptanceReport(config);
+    const acceptance = report.acceptance;
     // This model's own tier, the four numbers from one publish.
     const disk = lm.disk_stats.snapshot();
     return .{
@@ -733,7 +752,8 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_choice = mtpChoiceFor(config),
         .mtp_acceptance = acceptance.value,
         .mtp_acceptance_source = model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
-        .mtp_greedy_tail = mtp_plan.mtpGreedyTailFor(config.mtp_greedy_tail_override),
+        .mtp_greedy_tail = report.greedy_tail,
+        .mtp_acceptance_applies = report.applies,
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
@@ -764,7 +784,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
     };
     var vision_buf: [160]u8 = undefined;
     const vision = try std.fmt.bufPrint(&vision_buf, "{{\"loaded\":{},\"source\":\"{s}\",\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, st.vision.source, st.vision.tower_bytes, st.vision.encode_bytes });
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                st.kv_cache.label(),
         st.kv_cache.sourceName(),
@@ -772,6 +792,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         st.mtp_loaded,                              st.mtp_default_on,
         st.mtp_choice.sourceName(),                 st.mtp_acceptance_source,
         mtp_acceptance_mod.name(st.mtp_acceptance), param,
+        st.mtp_acceptance_applies,
         st.mtp_greedy_tail.value,                   model_settings.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail"),
         st.mtp_depth,                               st.mtp_adaptive,
         st.max_mtp_ctx,                             st.drafter,
@@ -948,6 +969,31 @@ test "settingsPropsJson: /props names the vision choice and a streamed tower's b
     try testing.expectEqualStrings("--vision", vision.get("source").?.string);
     try testing.expectEqual(@as(i64, 493_389_824), vision.get("streamed_tower_bytes").?.integer);
     try testing.expectEqual(@as(i64, 5_000_000_000), vision.get("streamed_encode_bytes").?.integer);
+}
+
+test "/props reports acceptance and greedy tail as not applying on an arch that ignores them" {
+    var dsv = model_mod.ModelConfig{};
+    dsv.model_type = model_settings.prefetch_arch;
+    dsv.mtp_acceptance_override = .{ .typical = .{ .delta = 0.2 } };
+    dsv.mtp_greedy_tail_override = true;
+    const ds = mtpAcceptanceReport(&dsv);
+    try testing.expect(!ds.applies);
+    try testing.expectEqualStrings("exact", mtp_acceptance_mod.name(ds.acceptance.value));
+    try testing.expect(!ds.greedy_tail.value);
+    try testing.expect(ds.greedy_tail.source == .default);
+
+    var qwen = dsv;
+    qwen.model_type = "qwen4_exp";
+    const q = mtpAcceptanceReport(&qwen);
+    try testing.expect(q.applies);
+    try testing.expectEqualStrings("typical", mtp_acceptance_mod.name(q.acceptance.value));
+    try testing.expect(q.greedy_tail.value);
+
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 1, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_acceptance_applies = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
+    defer testing.allocator.free(frag);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+    defer parsed.deinit();
+    try testing.expect(!parsed.value.object.get("mtp").?.object.get("acceptance_applies").?.bool);
 }
 
 test "settingsPropsJson: /props names the effective serving settings a benchmark ran under" {

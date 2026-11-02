@@ -145,7 +145,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   outranks the default; a file value counts as the operator's own number (no formula sizing). `main.zig` records which
   flags were given (`model_settings.launch_locks`), and `GET /v1/settings` reports those keys locked. The web UI edits the
   file through `POST /v1/settings` (validated, temp file + rename, [server-http-apis](server-http-apis.md#ssd-prefix-cache-and-settings-v1prefix-cache-v1settings));
-  `model_settings.model_keys` is the one list of editable per-model keys. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
+  `model_settings.model_keys` is the one list of editable per-model keys, and the loader applies exactly the values its `validate` accepts
+  (one parse and one range: a hand-edited `ssd_budget_gb` over 512 is unset to both). The SSD ask (`server.diskAsk`) is atomic: the settings POST
+  writes it from a connection thread, and every load, cold loads and their checkpoint stride included, reads it at load time rather than a boot snapshot.
+  A key that does not apply to an arch (`model_settings.applies`) is logged as ignored at load and listed as not applying by `GET /v1/settings` and `/props`
+  (`settings.mtp.acceptance_applies`); `ssd_prefetch` also logs that it is ignored on a DeepSeek pack without STQ experts. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
 - **The prefix cache's other tiers are launch flags only**: RAM retention is off unless
   `--prefix-cache-mem` is given with a size (`off` or `0` keeps it off), and the SSD tier is on unless `--prefix-cache-disk 0`
   or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)); its size alone has the

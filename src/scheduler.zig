@@ -989,6 +989,15 @@ pub const UnloadRequest = struct {
     done_cond: std.Io.Condition = .init,
 };
 
+const ColdLoadDisk = struct { bytes: u64, stride: u32 };
+
+/// The SSD ask and checkpoint stride a cold load starts with: the settings as they are now, since
+/// `POST /v1/settings` may have changed the ask since boot. `raw_stride` is the launch stride before the ask gates it.
+fn coldLoadDisk(raw_stride: u32, capacity: u32, ram_enabled: bool) ColdLoadDisk {
+    const ask = @import("server.zig").diskAsk();
+    return .{ .bytes = ask.bytes, .stride = @import("server.zig").effectiveSsmCheckpointStride(raw_stride, capacity, ram_enabled, ask.bytes) };
+}
+
 // Connection-local transport preserves a load diagnostic across a concurrent retry.
 threadlocal var last_load_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
 
@@ -1033,7 +1042,6 @@ pub const Scheduler = struct {
     prefix_cache_ram_enabled: bool,
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
-    prefix_cache_disk_bytes: u64,
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
@@ -1238,7 +1246,6 @@ pub const Scheduler = struct {
             .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
-            .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
             .prefix_cache_disk_resolver = params.prefix_cache_disk_resolver,
             .ssd_budget_bytes = params.ssd_budget_bytes,
             .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
@@ -1721,6 +1728,7 @@ pub const Scheduler = struct {
         }
 
         // ── Stage 2: build + post LoadRequest, wait for completion.
+        const cold_disk = coldLoadDisk(self.ssm_checkpoint_stride, self.prefix_cache_capacity, self.prefix_cache_ram_enabled);
         var req = LoadRequest{
             .entry = entry,
             .config = owned.config,
@@ -1743,11 +1751,11 @@ pub const Scheduler = struct {
             .prefix_cache_ram_enabled = self.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
-            .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
+            .prefix_cache_disk_bytes = cold_disk.bytes,
             .prefix_cache_disk_resolver = self.prefix_cache_disk_resolver,
             .ssd_budget_bytes = self.ssd_budget_bytes,
             .expert_cache_fit_resolver = self.expert_cache_fit_resolver,
-            .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
+            .ssm_checkpoint_stride = cold_disk.stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
             // Cold loads honor the launch-flag MTP settings too (same reason
             // as prefix-cache above) — pre-plumbing these were LoadRequest
@@ -2024,6 +2032,22 @@ const ThreadCtx = struct {
 pub var skip_mem_preflight: bool = false;
 
 pub var load_serving_bill: ?*const fn (*const ModelConfig, u64) ?model_load.LoadServingBill = null;
+
+test "a cold load takes the SSD ask and the checkpoint stride the settings hold now, not the boot snapshot" {
+    const srv = @import("server.zig");
+    const saved = srv.diskAsk();
+    defer srv.setDiskAsk(saved.bytes, saved.explicit);
+
+    srv.setDiskAsk(0, true);
+    const off = coldLoadDisk(256, 32, false);
+    try std.testing.expectEqual(@as(u64, 0), off.bytes);
+    try std.testing.expectEqual(@as(u32, 0), off.stride);
+
+    srv.setDiskAsk(40 << 30, true);
+    const on = coldLoadDisk(256, 32, false);
+    try std.testing.expectEqual(@as(u64, 40 << 30), on.bytes);
+    try std.testing.expectEqual(@as(u32, 256), on.stride);
+}
 
 test "a loaded model's hot-cache budget is the resolver's clamp, never the raw launch flag" {
     const Stub = struct {

@@ -622,11 +622,43 @@ pub fn clearResolvedPrefixCacheMem() void {
 pub var prefix_cache_disk_bytes: u64 = disk_placement.DEFAULT_DISK_CAP;
 /// Set by `--prefix-cache-disk`: the operator's number is the budget as given.
 pub var prefix_cache_disk_explicit = false;
+/// The explicit number came from `model-settings.json`, not the flag.
+pub var prefix_cache_disk_from_file = false;
+
+pub const DiskAsk = struct {
+    bytes: u64,
+    explicit: bool,
+    from_file: bool,
+
+    pub fn sourceName(self: DiskAsk) []const u8 {
+        return if (self.from_file) "model-settings.json" else "--prefix-cache-disk";
+    }
+};
+
+/// The ask as of now. `POST /v1/settings` changes it from a connection thread while loads and bills read it, so
+/// every read after boot comes through here.
+pub fn diskAsk() DiskAsk {
+    const explicit = @atomicLoad(bool, &prefix_cache_disk_explicit, .acquire);
+    return .{ .bytes = @atomicLoad(u64, &prefix_cache_disk_bytes, .monotonic), .explicit = explicit, .from_file = @atomicLoad(bool, &prefix_cache_disk_from_file, .monotonic) };
+}
+
+/// The settings API's write: an explicit number is the file's. Publishes the bytes before the explicit bit, so a
+/// reader that sees `explicit` sees its number.
+pub fn setDiskAsk(bytes: u64, explicit: bool) void {
+    @atomicStore(bool, &prefix_cache_disk_from_file, explicit, .monotonic);
+    if (explicit) {
+        @atomicStore(u64, &prefix_cache_disk_bytes, bytes, .monotonic);
+        @atomicStore(bool, &prefix_cache_disk_explicit, true, .release);
+    } else {
+        @atomicStore(bool, &prefix_cache_disk_explicit, false, .release);
+        @atomicStore(u64, &prefix_cache_disk_bytes, bytes, .monotonic);
+    }
+}
 
 /// Does THIS model run with an SSD tier? The launch asked for one and its load did not decline it
 /// (`ModelConfig.prefix_cache_disk_declined`); every bill, budget and checkpoint policy reads this.
 pub fn diskTierOn(config: *const model_mod.ModelConfig) bool {
-    return prefix_cache_disk_bytes > 0 and !config.prefix_cache_disk_declined;
+    return diskAsk().bytes > 0 and !config.prefix_cache_disk_declined;
 }
 
 /// The SSD writer's permit, sized once from host RAM at startup (`kv_disk_writer.permitForRam`); the
@@ -635,7 +667,7 @@ pub var disk_writer_permit_bytes: u64 = kv_disk_writer.DEFAULT_PERMIT_BYTES;
 
 /// The disk bytes the SSD-tier-dependent policies read: the launch ask, or 0 for a model whose tier is off.
 fn diskBytesFor(config: *const model_mod.ModelConfig) u64 {
-    return if (diskTierOn(config)) prefix_cache_disk_bytes else 0;
+    return if (diskTierOn(config)) diskAsk().bytes else 0;
 }
 
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
@@ -3614,15 +3646,16 @@ fn diskContextForLoad(config: *model_mod.ModelConfig) u64 {
 pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, held: u64) ?disk_placement.DefaultDiskBudget {
     const kv_bits = defaultKvBits(config);
     const bpt = diskBytesPerToken(config, kv_bits);
-    const ctx = if (prefix_cache_disk_explicit) 0 else diskContextForLoad(config);
+    const ask = diskAsk();
+    const ctx = if (ask.explicit) 0 else diskContextForLoad(config);
     // An unreadable volume is no reason to refuse: the tier re-checks before every store.
     const free: u64 = if (disk_placement.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
     var buf: [384]u8 = undefined;
-    const plan = disk_placement.resolveDiskBudget(prefix_cache_disk_explicit, prefix_cache_disk_bytes, prefix_cache_capacity, ctx, bpt, free, held) orelse {
-        log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir)});
+    const plan = disk_placement.resolveDiskBudget(ask.explicit, ask.bytes, prefix_cache_capacity, ctx, bpt, free, held) orelse {
+        log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir, if (ask.explicit and ask.bytes == 0) ask.sourceName() else null)});
         return null;
     };
-    log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, prefix_cache_capacity, ctx, bpt, dir)});
+    log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, prefix_cache_capacity, ctx, bpt, dir, ask.sourceName())});
     return plan;
 }
 
@@ -6000,22 +6033,27 @@ pub fn archFlagRefusal(config: *const model_mod.ModelConfig, use: LaunchFlagUse)
     return null;
 }
 
+/// The facts `model_settings.applies` decides a key's reach from, so the settings API and the loader's ignored-key lines agree.
+pub fn settingsFit(config: *const model_mod.ModelConfig) model_settings.Fit {
+    return .{ .arch = config.model_type, .streams_experts = config.supportsExpertStreaming(), .has_vision = config.has_vision };
+}
+
 /// A model-settings.json `ssd_prefetch` on an arch with no expert prefetcher is ignored with this one line, as `kv_quant` is.
 pub fn settingsSsdPrefetchIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (config.isDsv41() or config.ssd_prefetch_override == null) return null;
+    if (model_settings.applies("ssd_prefetch", settingsFit(config)) or config.ssd_prefetch_override == null) return null;
     return "model-settings.json ssd_prefetch is ignored: this model has no expert prefetcher";
 }
 
 /// A model-settings.json `kv_quant` on an arch with no KV cache is ignored with this one line, never a refusal:
 /// the file outlives the flags that wrote it, and only an explicit launch flag is a request.
 pub fn settingsKvQuantIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (!config.isDsv41() or config.kv_quant_override == null) return null;
+    if (model_settings.applies("kv_quant", settingsFit(config)) or config.kv_quant_override == null) return null;
     return "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 }
 
 /// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` on deepseek_v41 is ignored with this one line, as `kv_quant` is.
 pub fn settingsMtpIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (!config.isDsv41()) return null;
+    if (model_settings.applies("mtp_acceptance", settingsFit(config))) return null;
     const acceptance = config.mtp_acceptance_override != null;
     const tail = config.mtp_greedy_tail_override != null;
     if (acceptance and tail) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only, with no MTP tail)";

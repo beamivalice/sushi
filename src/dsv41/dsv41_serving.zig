@@ -63,6 +63,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg, .act = mdl.act };
         mdl.experts = .{ .hook = experts.hook() };
         shell.dsv41_experts = experts;
+        if (prefetchIgnoredLine(&config)) |line| log.info("{s}\n", .{line});
     }
     shell.dsv41 = mdl;
     shell.expert_stream = engine;
@@ -78,6 +79,13 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     // The warm's transients leave the pool, so the load's memory reading is the model's.
     _ = mlx.mlx_clear_cache();
     return shell;
+}
+
+/// A pack without the STQ stream has no expert prefetcher: `--ssd-prefetch` or the file's `ssd_prefetch` does nothing there.
+fn prefetchIgnoredLine(config: *const ModelConfig) ?[]const u8 {
+    if (config.ssd_prefetch != null) return "[dsv41] --ssd-prefetch is ignored: this pack has no STQ experts, so there is no expert prefetcher";
+    if (config.ssd_prefetch_override != null) return "[dsv41] model-settings.json ssd_prefetch is ignored: this pack has no STQ experts, so there is no expert prefetcher";
+    return null;
 }
 
 /// Starts the expert prefetch at `pct` percent of the read rate the serving pool measures now, or none at 0 or on a
@@ -194,6 +202,15 @@ pub fn dsv41FinishImpl(self: *Transformer, ctx: *ForwardCtx, accepted: usize) !v
     m.s = self.s;
     try dsv41_model.finishVerify(m, accepted);
     ctx.cache.step = (try dsv41_model.ensureState(m)).n;
+}
+
+test "a non-STQ DeepSeek pack names an ssd_prefetch it ignores, from the flag or the file" {
+    var config = ModelConfig{};
+    try std.testing.expect(prefetchIgnoredLine(&config) == null);
+    config.ssd_prefetch_override = 30;
+    try std.testing.expect(std.mem.indexOf(u8, prefetchIgnoredLine(&config).?, "model-settings.json ssd_prefetch is ignored") != null);
+    config.ssd_prefetch = 50;
+    try std.testing.expect(std.mem.indexOf(u8, prefetchIgnoredLine(&config).?, "--ssd-prefetch is ignored") != null);
 }
 
 test "tailUnread: a chunk is state only when no point is taken and the next chunk replays a full window" {

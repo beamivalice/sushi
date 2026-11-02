@@ -8,16 +8,65 @@ const model_registry_mod = @import("model_registry.zig");
 const disk_placement = @import("disk_placement.zig");
 const http_conn = @import("http_conn.zig");
 const server = @import("server.zig");
+const model_discovery = @import("model_discovery.zig");
+const expert_quant = @import("expert_quant.zig");
+const model_mod = @import("model.zig");
 
 const Edit = model_settings.Edit;
 
-pub const ModelRow = struct { id: []const u8, path: []const u8, state: []const u8, bytes: ?u64 };
+/// A running SSD tier as the inference thread last published it.
+pub const TierView = struct { cap_bytes: u64, used_bytes: u64 };
+
+pub const ModelRow = struct {
+    id: []const u8,
+    path: []const u8,
+    state: []const u8,
+    bytes: ?u64,
+    /// What the key gates read (`model_settings.applies`).
+    fit: model_settings.Fit = .{ .arch = "", .streams_experts = false, .has_vision = false },
+    /// The file values a ready model's load stamped; null for a model that is not loaded.
+    loaded: ?model_settings.Override = null,
+    tier: ?TierView = null,
+};
 
 pub const ServerView = struct {
     default_models_dir: []const u8,
     boot_roots: []const []const u8,
-    cache_budget_bytes: u64,
+    /// The server-wide ask, which loads without a number of their own start from.
+    ask_bytes: u64,
 };
+
+/// The file value of one key as a JSON value, or null when the file had none.
+fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "ctx_size")) return if (o.ctx_size) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "kv_quant")) return if (o.kv_quant) |v| .{ .string = v.wireName() } else null;
+    if (eql(u8, name, "mtp")) return if (o.mtp) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "mtp_acceptance")) return if (o.mtp_acceptance) |v| .{ .string = @import("mtp_acceptance.zig").name(v) } else null;
+    if (eql(u8, name, "mtp_greedy_tail")) return if (o.mtp_greedy_tail) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "ssd_budget_gb")) return if (o.ssd_budget_gb) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "ssd_prefetch")) return if (o.ssd_prefetch) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "preserve_thinking")) return if (o.preserve_thinking) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "think_penalty")) return if (o.think_penalty) |v| .{ .float = v } else null;
+    if (eql(u8, name, "vision")) return if (o.vision) |v| .{ .bool = v } else null;
+    return null;
+}
+
+/// The settings a ready model's load stamped on its config.
+fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
+    return .{
+        .ctx_size = if (config.ctx_override > 0) config.ctx_override else null,
+        .kv_quant = config.kv_quant_override,
+        .mtp = config.mtp_override,
+        .mtp_acceptance = config.mtp_acceptance_override,
+        .mtp_greedy_tail = config.mtp_greedy_tail_override,
+        .ssd_budget_gb = if (config.ssd_budget_gb_override > 0) config.ssd_budget_gb_override else null,
+        .ssd_prefetch = config.ssd_prefetch_override,
+        .preserve_thinking = config.preserve_thinking_override,
+        .think_penalty = config.think_penalty_override,
+        .vision = config.vision_override,
+    };
+}
 
 fn writeJson(w: *std.Io.Writer, v: anytype) !void {
     try std.json.Stringify.value(v, .{}, w);
@@ -40,7 +89,7 @@ fn writeSpec(w: *std.Io.Writer, spec: model_settings.KeySpec) !void {
 fn writeKey(w: *std.Io.Writer, spec: model_settings.KeySpec, file_value: ?std.json.Value, lock: ?*const model_settings.Lock) !void {
     const valid = if (file_value) |v| (if (model_settings.validate(spec, v)) true else |_| false) else false;
     try w.writeAll("{\"file\":");
-    if (valid) try writeJson(w, file_value.?) else try w.writeAll("null");
+    if (valid) try writeJson(w, model_settings.canonicalValue(spec, file_value.?)) else try w.writeAll("null");
     const pinned = if (lock) |l| l.set else false;
     try w.writeAll(",\"flag\":");
     if (pinned) try writeJson(w, lock.?.text()) else try w.writeAll("null");
@@ -87,9 +136,24 @@ pub fn render(
     try writeJson(w, srv.prefix_cache_disk_gb);
     try w.writeAll(",\"flag\":");
     if (cache_pinned) try writeJson(w, locks.prefix_cache_disk_gb.text()) else try w.writeAll("null");
-    try w.print(",\"source\":\"{s}\",\"locked\":{},\"effective_bytes\":{d},\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}}}}", .{
-        if (cache_pinned) "flag" else if (srv.prefix_cache_disk_gb != null) "file" else "default", cache_pinned, view.cache_budget_bytes,
+    var effective = view.ask_bytes;
+    var running = false;
+    for (rows) |row| if (row.tier) |t| {
+        effective = if (running) @max(effective, t.cap_bytes) else t.cap_bytes;
+        running = true;
+    };
+    try w.print(",\"source\":\"{s}\",\"locked\":{},\"effective_bytes\":{d},\"ask_bytes\":{d},\"running_tiers\":[", .{
+        if (cache_pinned) "flag" else if (srv.prefix_cache_disk_gb != null) "file" else "default", cache_pinned, effective, view.ask_bytes,
     });
+    var first_tier = true;
+    for (rows) |row| if (row.tier) |t| {
+        if (!first_tier) try w.writeAll(",");
+        first_tier = false;
+        try w.writeAll("{\"model\":");
+        try writeJson(w, row.id);
+        try w.print(",\"cap_bytes\":{d},\"used_bytes\":{d}}}", .{ t.cap_bytes, t.used_bytes });
+    };
+    try w.writeAll("],\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}}");
 
     try w.writeAll(",\"models\":[");
     for (rows, 0..) |row, i| {
@@ -100,6 +164,23 @@ pub fn render(
         try writeJson(w, row.path);
         try w.print(",\"state\":\"{s}\",\"bytes_on_disk\":", .{row.state});
         try writeJson(w, row.bytes);
+        try w.writeAll(",\"keys\":[");
+        var first_key = true;
+        for (model_settings.model_keys) |k| if (model_settings.applies(k.name, row.fit)) {
+            if (!first_key) try w.writeAll(",");
+            first_key = false;
+            try writeJson(w, k.name);
+        };
+        try w.writeAll("],\"loaded_with\":");
+        if (row.loaded) |o| {
+            try w.writeAll("{");
+            for (model_settings.model_keys, 0..) |k, ki| {
+                if (ki > 0) try w.writeAll(",");
+                try w.print("\"{s}\":", .{k.name});
+                try writeJson(w, overrideValue(o, k.name));
+            }
+            try w.writeAll("}");
+        } else try w.writeAll("null");
         try w.writeAll(",\"settings\":{");
         const obj = model_settings.modelObject(file, row.path);
         for (model_settings.model_keys, 0..) |k, ki| {
@@ -139,7 +220,7 @@ fn collect(arena: std.mem.Allocator, specs: []const model_settings.KeySpec, obj:
         }
         model_settings.validate(spec, kv.value_ptr.*) catch
             return reject(arena, 400, "invalid_setting", "\"{s}\" does not take that value", .{spec.name});
-        edits.append(arena, .{ .key = spec.name, .value = kv.value_ptr.* }) catch return reject(arena, 500, "internal_error", "out of memory", .{});
+        edits.append(arena, .{ .key = spec.name, .value = model_settings.canonicalValue(spec, kv.value_ptr.*) }) catch return reject(arena, 500, "internal_error", "out of memory", .{});
     }
     return null;
 }
@@ -186,16 +267,38 @@ fn stateName(s: model_registry_mod.LoadState) []const u8 {
     return @tagName(s);
 }
 
+/// What an unloaded model's config.json says, read without the registry lock.
+fn stubFit(io: std.Io, allocator: std.mem.Allocator, arch: []const u8, path: []const u8) model_settings.Fit {
+    const sm = model_discovery.readStubMeta(io, allocator, path);
+    const geometry = sm.found and sm.hidden_size > 0 and sm.num_hidden_layers > 0 and sm.num_experts > 0 and
+        sm.num_experts_per_tok > 0 and sm.moe_intermediate_size > 0;
+    return .{ .arch = arch, .streams_experts = geometry and expert_quant.isExpertStreamingArch(arch), .has_vision = sm.has_vision };
+}
+
 fn collectRows(allocator: std.mem.Allocator, registry: *model_registry_mod.ModelRegistry) ![]ModelRow {
     var rows = std.ArrayList(ModelRow).empty;
     errdefer rows.deinit(allocator);
-    registry.mutex.lockUncancelable(registry.io);
-    defer registry.mutex.unlock(registry.io);
-    var it = registry.entries.valueIterator();
-    while (it.next()) |p| {
-        const e = p.*;
-        try rows.append(allocator, .{ .id = e.id, .path = e.path, .state = stateName(e.state), .bytes = e.bytes_on_disk });
+    var stubs = std.ArrayList(usize).empty;
+    defer stubs.deinit(allocator);
+    {
+        registry.mutex.lockUncancelable(registry.io);
+        defer registry.mutex.unlock(registry.io);
+        var it = registry.entries.valueIterator();
+        while (it.next()) |p| {
+            const e = p.*;
+            var row: ModelRow = .{ .id = e.id, .path = e.path, .state = stateName(e.state), .bytes = e.bytes_on_disk };
+            row.fit.arch = e.arch_hint;
+            if (e.state == .ready and e.config != null) {
+                const c = e.config.?;
+                row.fit = server.settingsFit(c);
+                row.loaded = loadedWith(c);
+                const snap = e.disk_stats.snapshot();
+                if (snap.namespace != 0) row.tier = .{ .cap_bytes = snap.budget, .used_bytes = snap.used };
+            } else try stubs.append(allocator, rows.items.len);
+            try rows.append(allocator, row);
+        }
     }
+    for (stubs.items) |i| rows.items[i].fit = stubFit(registry.io, allocator, rows.items[i].fit.arch, rows.items[i].path);
     std.mem.sort(ModelRow, rows.items, {}, struct {
         fn lt(_: void, a: ModelRow, b: ModelRow) bool {
             return std.mem.lessThan(u8, a.id, b.id);
@@ -222,7 +325,7 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
     const body = try render(allocator, path, &file, rows, &model_settings.launch_locks, .{
         .default_models_dir = default_dir,
         .boot_roots = roots,
-        .cache_budget_bytes = server.prefix_cache_disk_bytes,
+        .ask_bytes = server.diskAsk().bytes,
     });
     defer allocator.free(body);
     try server.sendResponse(stream, "200 OK", "application/json", body);
@@ -272,6 +375,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     }
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var message_buf: [160]u8 = undefined;
     const path = model_settings.defaultPath(&path_buf);
     const write = struct {
         fn run(a: std.mem.Allocator, io: std.Io, p: []const u8, section: []const u8, edits: []const Edit) !void {
@@ -293,7 +397,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         if (std.mem.eql(u8, e.key, "prefix_cache_disk_gb")) {
             try writeJson(w, applyCacheBudget(sch, e.value));
         } else {
-            try writeJson(w, applyModelsDir(sch, e.value));
+            try writeJson(w, applyModelsDir(sch, &message_buf));
         }
     }
     if (plan.model_edits.len > 0) {
@@ -314,31 +418,43 @@ fn writeFailed(allocator: std.mem.Allocator, stream: *http_conn.Conn, err: anyer
     try server.sendErrorResponse(allocator, stream, "500 Internal Server Error", "settings_write_failed", "Could not write the settings file", 500);
 }
 
-/// The new SSD tier size reaches the running tiers at once; the launch flag, when given, keeps the number it set.
+fn cacheBudgetMessage(running_tiers_resized: usize) []const u8 {
+    return if (running_tiers_resized > 0) "applied to the running tiers" else "saved; applies at the next model load";
+}
+
+/// The new SSD tier size reaches the running tiers at once and every later load; the launch flag, when given, keeps the number it set.
 fn applyCacheBudget(sch: *@import("scheduler.zig").Scheduler, value: ?std.json.Value) []const u8 {
     if (model_settings.launch_locks.prefix_cache_disk_gb.set) return "saved; the --prefix-cache-disk flag still sets the size until a start without it";
     const gb: ?u64 = if (value) |v| @intCast(v.integer) else null;
-    server.prefix_cache_disk_bytes = if (gb) |g| g << 30 else disk_placement.DEFAULT_DISK_CAP;
-    server.prefix_cache_disk_explicit = gb != null;
+    server.setDiskAsk(if (gb) |g| g << 30 else disk_placement.DEFAULT_DISK_CAP, gb != null);
     const bytes = (gb orelse 0) << 30;
-    if (gb == null or bytes == 0) return "saved; applies at the next model load";
-    var it = sch.registry.entries.valueIterator();
+    if (gb == null or bytes == 0) return cacheBudgetMessage(0);
     var tiers = std.ArrayList(*model_registry_mod.LoadedModel).empty;
     defer tiers.deinit(sch.allocator);
-    sch.registry.mutex.lockUncancelable(sch.io);
-    while (it.next()) |p| {
-        if (p.*.state == .ready and p.*.disk_stats.snapshot().namespace != 0) tiers.append(sch.allocator, p.*) catch {};
+    {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        defer sch.registry.mutex.unlock(sch.io);
+        var it = sch.registry.entries.valueIterator();
+        while (it.next()) |p| {
+            if (p.*.state == .ready and p.*.disk_stats.snapshot().namespace != 0) tiers.append(sch.allocator, p.*) catch {};
+        }
     }
-    sch.registry.mutex.unlock(sch.io);
-    for (tiers.items) |e| _ = sch.prefixAdmin(.{ .entry = e, .action = .set_cap, .cap_bytes = bytes }) catch return "saved; applies at the next model load";
-    return "applied to the running tiers";
+    var resized: usize = 0;
+    for (tiers.items) |e| {
+        const r = sch.prefixAdmin(.{ .entry = e, .action = .set_cap, .cap_bytes = bytes }) catch break;
+        if (r.outcome == .cleared) resized += 1;
+    }
+    return cacheBudgetMessage(resized);
 }
 
-fn applyModelsDir(sch: *@import("scheduler.zig").Scheduler, value: ?std.json.Value) []const u8 {
-    _ = value;
+fn modelsDirMessage(buf: []u8, rescan: anyerror!u32) []const u8 {
+    const added = rescan catch return "saved; the rescan failed, use /v1/models/rescan";
+    return std.fmt.bufPrint(buf, "saved; models rescanned, {d} added", .{added}) catch "saved; models rescanned";
+}
+
+fn applyModelsDir(sch: *@import("scheduler.zig").Scheduler, buf: []u8) []const u8 {
     if (model_settings.launch_locks.models_dir.set) return "saved; the --model-dir flag still sets the directories until a start without it";
-    _ = sch.registry.rescan() catch return "saved; the rescan failed, use /v1/models/rescan";
-    return "saved; models rescanned";
+    return modelsDirMessage(buf, sch.registry.rescan());
 }
 
 // ── Tests ──
@@ -379,6 +495,68 @@ test "settings api: a request names real keys with valid values, or is refused w
     try expectRejected("nope", 400, "invalid_request_error");
 }
 
+test "settings api: a kv_quant request in any spelling is stored as its choice name; a value the loader would not read is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for ([_][]const u8{ "0", "16", "\"16\"", "\"off\"" }) |spelling| {
+        const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"model\":\"m\",\"set\":{{\"kv_quant\":{s}}}}}", .{spelling});
+        const parsed = parseRequest(arena_state.allocator(), body);
+        try testing.expectEqualStrings("off", parsed.ok.model_edits[0].value.?.string);
+    }
+    const eight = parseRequest(arena_state.allocator(), "{\"model\":\"m\",\"set\":{\"kv_quant\":8}}");
+    try testing.expectEqualStrings("8", eight.ok.model_edits[0].value.?.string);
+    try expectRejected("{\"model\":\"m\",\"set\":{\"kv_quant\":5}}", 400, "invalid_setting");
+}
+
+test "settings api: the SSD message says running tiers only when one was resized; models_dir reports what the rescan added" {
+    try testing.expectEqualStrings("applied to the running tiers", cacheBudgetMessage(1));
+    try testing.expectEqualStrings("saved; applies at the next model load", cacheBudgetMessage(0));
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings("saved; models rescanned, 2 added", modelsDirMessage(&buf, 2));
+    try testing.expectEqualStrings("saved; the rescan failed, use /v1/models/rescan", modelsDirMessage(&buf, error.OutOfMemory));
+}
+
+test "settings api: render names the keys a model honours, what a loaded model loaded with, and the tiers in force" {
+    var file = try model_settings.parse(testing.allocator,
+        \\{"/m/a": {"kv_quant": 0}, "/m/b": {"kv_quant": "8"}}
+    );
+    defer file.deinit();
+    const locks: model_settings.LaunchLocks = .{};
+    const rows = [_]ModelRow{
+        .{ .id = "a", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = model_settings.prefetch_arch, .streams_experts = true, .has_vision = true }, .loaded = .{ .ctx_size = 4096, .kv_quant = null, .ssd_budget_gb = 60, .mtp_acceptance = .exact }, .tier = .{ .cap_bytes = 2 << 30, .used_bytes = 7 } },
+        .{ .id = "b", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false } },
+    };
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const cache = root.get("server").?.object.get("prefix_cache_disk_gb").?.object;
+    try testing.expectEqual(@as(i64, 2 << 30), cache.get("effective_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 20 << 30), cache.get("ask_bytes").?.integer);
+    const tier = cache.get("running_tiers").?.array.items[0].object;
+    try testing.expectEqualStrings("a", tier.get("model").?.string);
+    try testing.expectEqual(@as(i64, 7), tier.get("used_bytes").?.integer);
+
+    const a = root.get("models").?.array.items[0].object;
+    var has_prefetch = false;
+    for (a.get("keys").?.array.items) |k| {
+        try testing.expect(!std.mem.eql(u8, k.string, "kv_quant"));
+        if (std.mem.eql(u8, k.string, "ssd_prefetch")) has_prefetch = true;
+    }
+    try testing.expect(has_prefetch);
+    const lw = a.get("loaded_with").?.object;
+    try testing.expectEqual(@as(i64, 4096), lw.get("ctx_size").?.integer);
+    try testing.expect(lw.get("kv_quant").? == .null);
+    try testing.expectEqualStrings("exact", lw.get("mtp_acceptance").?.string);
+    try testing.expectEqualStrings("off", a.get("settings").?.object.get("kv_quant").?.object.get("file").?.string);
+
+    const b = root.get("models").?.array.items[1].object;
+    try testing.expect(b.get("loaded_with").? == .null);
+    for (b.get("keys").?.array.items) |k| try testing.expect(!std.mem.startsWith(u8, k.string, "ssd_"));
+}
+
 test "settings api: render reports the file's value, the pinning flag and the winner per key" {
     var file = try model_settings.parse(testing.allocator,
         \\{"/m/a": {"kv_quant": "4", "ssd_prefetch": 200, "mtp": false}, "server": {"prefix_cache_disk_gb": 30}}
@@ -387,7 +565,7 @@ test "settings api: render reports the file's value, the pinning flag and the wi
     var locks: model_settings.LaunchLocks = .{};
     locks.modelMut("mtp").pin("on", .{});
     const rows = [_]ModelRow{.{ .id = "a", .path = "/m/a", .state = "ready", .bytes = 5 }};
-    const body = try render(testing.allocator, "/h/model-settings.json", &file, &rows, &locks, .{ .default_models_dir = "/h/.sushi/models", .boot_roots = &.{"/h/.sushi/models"}, .cache_budget_bytes = 30 << 30 });
+    const body = try render(testing.allocator, "/h/model-settings.json", &file, &rows, &locks, .{ .default_models_dir = "/h/.sushi/models", .boot_roots = &.{"/h/.sushi/models"}, .ask_bytes = 30 << 30 });
     defer testing.allocator.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();

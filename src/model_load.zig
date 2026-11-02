@@ -2467,6 +2467,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // and did not come up (no room, an unreadable fingerprint, a failed init) is recorded on the config,
     // so every bill reads the same answer as `--prefix-cache-disk off`.
     var disk_tier: ?kv_disk_cache.DiskTier = null;
+    if (params.prefix_cache_capacity > 0 and params.prefix_cache_disk_bytes == 0) {
+        const ask = @import("server.zig").diskAsk();
+        var off_buf: [96]u8 = undefined;
+        if (ask.explicit) log.info("{s}\n", .{disk_placement.diskOffLine(&off_buf, 0, "", ask.sourceName())});
+    }
     if (cache_applies and params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
         const layout = diskLayoutKey(sch.allocator, params.config, entry.path, xfm_ptr) catch |err| {
             log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});

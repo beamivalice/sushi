@@ -558,6 +558,17 @@ pub const ModelStatus = struct {
     }
 };
 
+/// The roots a rescan walks: the boot roots plus the settings file's models directory, unless a launch flag pins them.
+fn rootsWithFileDir(buf: *[9][]const u8, boot_roots: []const []const u8, pinned: bool, file_dir: ?[]const u8) []const []const u8 {
+    if (pinned) return boot_roots;
+    const dir = file_dir orelse return boot_roots;
+    if (boot_roots.len >= buf.len) return boot_roots;
+    for (boot_roots) |r| if (std.mem.eql(u8, r, dir)) return boot_roots;
+    @memcpy(buf[0..boot_roots.len], boot_roots);
+    buf[boot_roots.len] = dir;
+    return buf[0 .. boot_roots.len + 1];
+}
+
 /// Registry of all discovered + loaded models. One instance per server.
 ///
 /// Lifecycle:
@@ -843,25 +854,17 @@ pub const ModelRegistry = struct {
     /// can't see them). Add-only: an id or path already registered wins
     /// (first-wins, like boot) and live entries are never re-pointed or
     /// removed. A failed load at the same path becomes retryable. Returns the
-    /// number of stubs added. No roots (a `--model`-only
-    /// server) rescans nothing.
+    /// number of stubs added. A `--model`-only server with no
+    /// settings-file models directory rescans nothing.
     pub fn rescan(self: *ModelRegistry) !u32 {
         const boot_roots = if (self.discovery) |d| d.roots else &.{};
-        if (boot_roots.len == 0) return 0;
         // The settings file's models directory joins the boot roots, so a changed one is found without a restart.
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         var file = model_settings.load(self.allocator, self.io, model_settings.defaultPath(&path_buf));
         defer file.deinit();
         var with_file: [9][]const u8 = undefined;
-        const roots = blk: {
-            if (model_settings.launch_locks.models_dir.set) break :blk boot_roots;
-            const dir = model_settings.server(&file).models_dir orelse break :blk boot_roots;
-            if (boot_roots.len >= with_file.len) break :blk boot_roots;
-            for (boot_roots) |r| if (std.mem.eql(u8, r, dir)) break :blk boot_roots;
-            @memcpy(with_file[0..boot_roots.len], boot_roots);
-            with_file[boot_roots.len] = dir;
-            break :blk with_file[0 .. boot_roots.len + 1];
-        };
+        const roots = rootsWithFileDir(&with_file, boot_roots, model_settings.launch_locks.models_dir.set, model_settings.server(&file).models_dir);
+        if (roots.len == 0) return 0;
         var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer found.deinit();
         var added: u32 = 0;
@@ -911,13 +914,13 @@ pub const ModelRegistry = struct {
     /// set. The returned pointer is borrowed; valid for the registry's
     /// lifetime.
     pub fn resolveEntry(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "sushi"))
             self.default_id
         else
             id_or_empty;
         if (id.len == 0) return error.NoDefaultModel;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         return self.entries.get(id) orelse error.UnknownModelId;
     }
 
@@ -2162,6 +2165,20 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     // registry deinit tries to free entry-owned configs.
     chat.config = null;
     chat2.config = null;
+}
+
+test "ModelRegistry: rescan roots: the settings file's models directory is walked even on a --model-only server" {
+    var buf: [9][]const u8 = undefined;
+    const only_file = rootsWithFileDir(&buf, &.{}, false, "/models");
+    try testing.expectEqual(@as(usize, 1), only_file.len);
+    try testing.expectEqualStrings("/models", only_file[0]);
+    try testing.expectEqual(@as(usize, 0), rootsWithFileDir(&buf, &.{}, false, null).len);
+
+    const boot = [_][]const u8{"/boot"};
+    const both = rootsWithFileDir(&buf, &boot, false, "/models");
+    try testing.expectEqual(@as(usize, 2), both.len);
+    try testing.expectEqual(@as(usize, 1), rootsWithFileDir(&buf, &boot, true, "/models").len);
+    try testing.expectEqual(@as(usize, 1), rootsWithFileDir(&buf, &boot, false, "/boot").len);
 }
 
 test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, idempotent)" {

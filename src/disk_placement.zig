@@ -79,9 +79,10 @@ fn toGb(bytes: u64) f64 {
 }
 
 /// The startup line for the SSD tier: the sizing terms and the bound that set the number.
-pub fn allocatingDiskLine(buf: []u8, plan: DefaultDiskBudget, entries: u32, context: u64, bytes_per_token: u64, dir: []const u8) []const u8 {
+/// `ask_source` names where an explicit number came from: the launch flag or the settings file.
+pub fn allocatingDiskLine(buf: []u8, plan: DefaultDiskBudget, entries: u32, context: u64, bytes_per_token: u64, dir: []const u8, ask_source: []const u8) []const u8 {
     const text = if (plan.bound == .flag)
-        std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache (--prefix-cache-disk) at {s}", .{ toGb(plan.bytes), dir })
+        std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache ({s}) at {s}", .{ toGb(plan.bytes), ask_source, dir })
     else
         std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache ({d} entries x {d} tokens x {d:.1} KB + 2 GB; bound: {s}) at {s}", .{ toGb(plan.bytes), entries, context, @as(f64, @floatFromInt(bytes_per_token)) / 1024.0, plan.bound.label(), dir });
     return text catch buf[0..0];
@@ -92,8 +93,9 @@ pub fn diskUsageLine(buf: []u8, used: u64, budget: u64, entries: u64) []const u8
     return std.fmt.bufPrint(buf, "[disk-cache] usage {d:.2} / {d:.1} GB, {d} entries", .{ toGb(used), toGb(budget), entries }) catch buf[0..0];
 }
 
-/// The startup line when no SSD budget remains.
-pub fn diskOffLine(buf: []u8, free_bytes: u64, dir: []const u8) []const u8 {
+/// The startup line when no SSD budget remains; `off_by` names the source of an explicit 0, which is a request, not a shortage.
+pub fn diskOffLine(buf: []u8, free_bytes: u64, dir: []const u8, off_by: ?[]const u8) []const u8 {
+    if (off_by) |source| return std.fmt.bufPrint(buf, "SSD prefix cache OFF: set to 0 by {s}", .{source}) catch buf[0..0];
     return std.fmt.bufPrint(buf, "SSD prefix cache OFF: {d:.1} GB free at {s} leaves nothing after the 4 GB reserve", .{ toGb(free_bytes), dir }) catch buf[0..0];
 }
 
@@ -298,6 +300,24 @@ pub fn rootIsLive(io: std.Io, root_abs: []const u8) bool {
     const f = std.Io.Dir.openFileAbsolute(io, path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |err|
         return err != error.FileNotFound;
     f.close(io);
+    return false;
+}
+
+/// Does a live tier own the namespace directory, through its shared root or a private `p<pid>-<n>` root inside it?
+pub fn namespaceIsLive(io: std.Io, ns_abs: []const u8) bool {
+    return rootIsLive(io, ns_abs) or privateRootIsLive(io, ns_abs);
+}
+
+pub fn privateRootIsLive(io: std.Io, ns_abs: []const u8) bool {
+    var d = std.Io.Dir.openDirAbsolute(io, ns_abs, .{ .iterate = true }) catch return false;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .directory or dent.name.len < 2 or dent.name[0] != 'p') continue;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sub = std.fmt.bufPrint(&buf, "{s}/{s}", .{ ns_abs, dent.name }) catch return true;
+        if (rootIsLive(io, sub)) return true;
+    }
     return false;
 }
 
@@ -595,6 +615,26 @@ test "DiskTier: the root-wide sweep never deletes a root a live tier owns" {
     try testing.expectEqual(@as(u64, 0), tierBytes(io, base, "fp-held"));
 }
 
+test "namespaceIsLive: a lock on a private root inside the namespace makes the namespace live" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    try tmp.dir.createDirPath(io, "ns/p999-0");
+    try tmp.dir.createDirPath(io, "ns/e1");
+    const ns = try std.fmt.allocPrint(testing.allocator, "{s}/ns", .{base});
+    defer testing.allocator.free(ns);
+    const private = try std.fmt.allocPrint(testing.allocator, "{s}/p999-0", .{ns});
+    defer testing.allocator.free(private);
+
+    try testing.expect(!namespaceIsLive(io, ns));
+    const held = (try lockRoot(io, private)).?;
+    try testing.expect(namespaceIsLive(io, ns));
+    held.close(io);
+    try testing.expect(!namespaceIsLive(io, ns));
+}
+
 test "DiskTier: hard-linked chunks are counted once by the root-wide sweep and tierBytes" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -789,11 +829,14 @@ test "diskUsageLine: used / budget in GB and the entry count" {
 test "allocatingDiskLine: starts with Allocating and names the terms, the bound and the directory" {
     var buf: [256]u8 = undefined;
     const GB: u64 = 1024 * 1024 * 1024;
-    const line = allocatingDiskLine(&buf, .{ .bytes = 20 * GB, .bound = .cap, .cap = 20 * GB }, 32, 262144, 18_400, "/c");
+    const line = allocatingDiskLine(&buf, .{ .bytes = 20 * GB, .bound = .cap, .cap = 20 * GB }, 32, 262144, 18_400, "/c", "--prefix-cache-disk");
     try testing.expectEqualStrings("Allocating 20.0 GB SSD for the prefix cache (32 entries x 262144 tokens x 18.0 KB + 2 GB; bound: 20 GB cap) at /c", line);
-    const flag = allocatingDiskLine(&buf, .{ .bytes = 12 * GB, .bound = .flag, .cap = 12 * GB }, 32, 0, 0, "/c");
+    const flag = allocatingDiskLine(&buf, .{ .bytes = 12 * GB, .bound = .flag, .cap = 12 * GB }, 32, 0, 0, "/c", "--prefix-cache-disk");
     try testing.expectEqualStrings("Allocating 12.0 GB SSD for the prefix cache (--prefix-cache-disk) at /c", flag);
-    try testing.expectEqualStrings("SSD prefix cache OFF: 3.0 GB free at /c leaves nothing after the 4 GB reserve", diskOffLine(&buf, 3 * GB, "/c"));
+    const from_file = allocatingDiskLine(&buf, .{ .bytes = 5 * GB, .bound = .flag, .cap = 5 * GB }, 32, 0, 0, "/c", "model-settings.json");
+    try testing.expectEqualStrings("Allocating 5.0 GB SSD for the prefix cache (model-settings.json) at /c", from_file);
+    try testing.expectEqualStrings("SSD prefix cache OFF: 3.0 GB free at /c leaves nothing after the 4 GB reserve", diskOffLine(&buf, 3 * GB, "/c", null));
+    try testing.expectEqualStrings("SSD prefix cache OFF: set to 0 by model-settings.json", diskOffLine(&buf, 1400 * GB, "/c", "model-settings.json"));
 }
 
 test "diskBudgetFromFreeSpace: the one reserve is 4 GiB, whatever the volume; nothing left stores nothing" {

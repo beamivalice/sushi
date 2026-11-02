@@ -10,6 +10,13 @@
 #  3. GET/POST /v1/settings: unknown keys and bad values are named 400s; a server key and a model key are written to
 #     the settings file and read back; null removes; a models_dir that is not a folder is refused, a real one rescans.
 #  4. Under --api-key --api-key-strict none of the three endpoints answers without the key.
+#  5. A model-scope clear without a model id is a 400 (never the default model's tier); scope `namespace` deletes one
+#     namespace by id and, like `stale`, skips one whose private `p<pid>-<n>` root another process holds.
+#  6. GET /v1/settings: a long --model-dir and a sub-GB --prefix-cache-disk read back whole as the flag text; a hand-edited
+#     trailing-slash model key is the one an edit changes; kv_quant is stored under its choice name; a symlinked settings
+#     file is written through; each model lists the keys that apply to it and loaded_with (null while unloaded).
+#  7. With the tiny DeepSeek fixture (GPU lock): a cache size changed after boot reaches the next load, effective_bytes
+#     reports the tier in force, and the file's models_dir on a --model-only server rescans.
 #
 # Fully hermetic: stub model folders, nothing loads. Usage: ./tests/test_prefix_cache_admin.sh [port]
 
@@ -107,10 +114,46 @@ check "the non-cache folder is untouched" "$([ -f "$CACHE/notes/keep.txt" ] && e
 check "the symlink and what it points at are untouched" "$([ -L "$CACHE/00000000000000d4" ] && [ -f "$WORK/outside/precious.txt" ] && echo 1 || echo 0)"
 check "the listing is empty afterwards" "$(is "$(get /v1/prefix-cache | jq '.namespaces | length')" 0)"
 
+echo "[2b/4] clear scopes: model id required, one namespace by id, a private root held elsewhere"
+check "a model scope without a model is a 400" "$(is "$(code -X POST "$BASE/v1/prefix-cache/clear" -d '{"scope":"model"}')" 400)"
+check "a model scope with a number is a 400" "$(is "$(code -X POST "$BASE/v1/prefix-cache/clear" -d '{"scope":"model","model":5}')" 400)"
+check "a namespace scope with a bad id is a 400" "$(is "$(code -X POST "$BASE/v1/prefix-cache/clear" -d '{"scope":"namespace","id":"../x"}')" 400)"
+check "a namespace scope with an absent id is a 404" "$(is "$(code -X POST "$BASE/v1/prefix-cache/clear" -d '{"scope":"namespace","id":"00000000000000ee"}')" 404)"
+NS_C=00000000000000c3
+NS_E=00000000000000e5
+mkdir -p "$CACHE/$NS_C/e1" "$CACHE/$NS_C/p999-0/e1" "$CACHE/$NS_E/e1"
+echo '{}' > "$CACHE/$NS_C/e1/meta.json"; echo '{}' > "$CACHE/$NS_C/p999-0/e1/meta.json"; echo '{}' > "$CACHE/$NS_E/e1/meta.json"
+head -c 1000 /dev/zero > "$CACHE/$NS_C/p999-0/e1/c000000.safetensors"
+python3 -I -c '
+import fcntl, sys, time
+f = open(sys.argv[1], "w"); fcntl.flock(f, fcntl.LOCK_EX); print("held", flush=True); time.sleep(120)' "$CACHE/$NS_C/p999-0/.lock" > "$WORK/holder.out" &
+HOLDER=$!
+for _ in $(seq 1 20); do grep -q held "$WORK/holder.out" && break; sleep 0.2; done
+L="$(get /v1/prefix-cache)"
+check "a namespace whose private root is held is held_by_other_process, not stale"     "$(echo "$L" | jq --arg id "$NS_C" '.namespaces[] | select(.id == $id) | (.stale == false) and .held_by_other_process')"
+R="$(post /v1/prefix-cache/clear '{"scope":"stale"}')"
+check "stale skips it and deletes the other"     "$(echo "$R" | jq '(.skipped_live_namespaces == 1) and (.stale_namespaces_removed == 1)')"
+check "the held namespace is intact" "$([ -f "$CACHE/$NS_C/p999-0/e1/c000000.safetensors" ] && echo 1 || echo 0)"
+mkdir -p "$CACHE/$NS_E/e1"; echo '{}' > "$CACHE/$NS_E/e1/meta.json"
+R="$(post /v1/prefix-cache/clear "{\"scope\":\"namespace\",\"id\":\"$NS_C\"}")"
+check "the namespace scope skips a held namespace too" "$(echo "$R" | jq '(.skipped_live_namespaces == 1) and (.stale_namespaces_removed == 0)')"
+R="$(post /v1/prefix-cache/clear "{\"scope\":\"namespace\",\"id\":\"$NS_E\"}")"
+check "the namespace scope deletes the one named" "$(echo "$R" | jq '(.stale_namespaces_removed == 1)')"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+R="$(post /v1/prefix-cache/clear "{\"scope\":\"namespace\",\"id\":\"$NS_C\"}")"
+check "once the holder is gone it is deleted" "$(echo "$R" | jq '(.stale_namespaces_removed == 1)')"
+
 echo "[3/4] GET and POST /v1/settings"
 S="$(get /v1/settings)"
 check "the file is under the private HOME" "$(is "$(echo "$S" | jq -r .file)" "$WORK/home/.sushi/model-settings.json")"
 check "the model is listed with every key" "$(echo "$S" | jq '((.models | length) == 1) and ((.models[0].settings | length) == (.model_keys | length))')"
+check "an unloaded model lists the keys that apply and no loaded values" \
+    "$(echo "$S" | jq '.models[0] | (.loaded_with == null) and (.keys | index("kv_quant") != null) and (.keys | index("ssd_prefetch") == null)')"
+check "the SSD cache size reports the ask beside what is in force" "$(echo "$S" | jq '.server.prefix_cache_disk_gb | (.ask_bytes > 0) and (.running_tiers == []) and (.effective_bytes == .ask_bytes)')"
+check "kv_quant 5 is not a choice" "$(is "$(post /v1/settings '{"model":"alpha","set":{"kv_quant":5}}' | jq -r .error.type)" invalid_setting)"
+post /v1/settings '{"model":"alpha","set":{"kv_quant":"16"}}' >/dev/null
+check "kv_quant 16 is accepted and stored as off" "$(jq -e --arg p "$MODELS/alpha" '.[$p].kv_quant == "off"' "$WORK/home/.sushi/model-settings.json" >/dev/null && echo 1 || echo 0)"
+post /v1/settings '{"model":"alpha","set":{"kv_quant":null}}' >/dev/null
 check "nothing is set: every key is default" "$(echo "$S" | jq '[.models[0].settings[] | .source] | all(. == "default")')"
 check "an unknown key is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"temperature":1}}' | jq -r '.error.type')" unknown_setting)"
 check "a bad value is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"ssd_prefetch":101}}' | jq -r '.error.type')" invalid_setting)"
@@ -128,6 +171,26 @@ check "a models_dir that is not a folder is refused" "$(is "$(post /v1/settings 
 check "a real models_dir rescans and finds its models" "$(post /v1/settings "{\"server\":{\"models_dir\":\"$OTHER\"}}" | jq '.ok')"
 check "the other folder's model is listed" "$(get /v1/settings | jq '[.models[].id] | index("beta") != null')"
 check "a settings write keeps the other keys" "$(jq -e '.server.prefix_cache_disk_gb == 7' "$WORK/home/.sushi/model-settings.json" >/dev/null && echo 1 || echo 0)"
+
+echo "[3b/4] trailing-slash key, symlinked settings file, flag text"
+SETTINGS="$WORK/home/.sushi/model-settings.json"
+printf '{"%s/":{"ctx_size":64}}' "$MODELS/alpha" > "$SETTINGS"
+check "a slashed key is read" "$(get /v1/settings | jq '.models[] | select(.id == "alpha") | .settings.ctx_size.file == 64')"
+post /v1/settings '{"model":"alpha","set":{"ctx_size":128}}' >/dev/null
+check "an edit changes that key and adds no second section" \
+    "$(is "$(get /v1/settings | jq '.models[] | select(.id == "alpha") | .settings.ctx_size.file == 128')$(jq 'length' "$SETTINGS")" "true1")"
+mv "$SETTINGS" "$WORK/real-settings.json"; ln -s "$WORK/real-settings.json" "$SETTINGS"
+post /v1/settings '{"model":"alpha","set":{"ctx_size":256}}' >/dev/null
+check "a symlinked settings file stays a link and its target takes the write" \
+    "$([ -L "$SETTINGS" ] && jq -e '[.[]] | .[0].ctx_size == 256' "$WORK/real-settings.json" >/dev/null && echo 1 || echo 0)"
+rm -f "$SETTINGS"
+LONG="$WORK/a-models-directory-with-a-rather-long-name-so-that-the-path-does-not-fit-a-small-buffer-0123456789/inner"
+mk_model "$LONG" gamma qwen4_exp
+boot --model-dir "$LONG" --prefix-cache-disk 512MB || { echo "[fail] boot"; exit 1; }
+S="$(get /v1/settings)"
+check "a long --model-dir reads back whole" "$(is "$(echo "$S" | jq -r .server.models_dir.flag)" "$LONG")"
+check "a sub-GB --prefix-cache-disk reads back with its unit and the effective bytes" \
+    "$(echo "$S" | jq '.server.prefix_cache_disk_gb | (.flag == "512MB") and (.locked) and (.effective_bytes == 536870912)')"
 
 echo "[4/4] --api-key --api-key-strict"
 boot --api-key sekret --api-key-strict || { echo "[fail] boot"; exit 1; }
@@ -169,11 +232,30 @@ PY
     "$LOCK" acquire "$owner" >/dev/null || { echo "FAIL: could not take the GPU lock"; exit 1; }
     trap '"$LOCK" release "$owner" >/dev/null 2>&1; stop_server; rm -rf "$WORK"' EXIT
     rm -rf "$CACHE"; mkdir -p "$CACHE"
+    # The file turns the tier off at boot; a later size has to reach the next load.
+    mkdir -p "$WORK/home/.sushi"
+    echo '{"server":{"prefix_cache_disk_gb":0}}' > "$WORK/home/.sushi/model-settings.json"
     HOME="$WORK/home" SUSHI_PREFIX_CACHE_DIR="$CACHE" "$BINARY" --serve --model-dir "$WORK/tiny-models" --ssd-budget-gb 6 --port "$PORT" --log-file off > "$LOG" 2>&1 &
     SPID=$!
     for _ in $(seq 1 120); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
     PROMPT="$(python3 -c 'print("abcdefghij " * 150)')"
     ask() { curl -s -m 120 "$BASE/v1/completions" -H 'Content-Type: application/json' -d "{\"model\":\"tiny\",\"prompt\":\"$PROMPT\",\"max_tokens\":4,\"temperature\":0}" | jq -r '.choices[0].text'; }
+    ask >/dev/null
+    check "a tier switched off by the file writes nothing" "$(is "$(get /v1/prefix-cache | jq '.namespaces | length')" 0)"
+    check "the boot log says the 0 was a request, not a shortage" "$(grep -q 'SSD prefix cache OFF: set to 0 by model-settings.json' "$LOG" && echo 1 || echo 0)"
+    R="$(post /v1/settings '{"server":{"prefix_cache_disk_gb":2}}')"
+    check "with no running tier the answer says it applies at the next load" "$(echo "$R" | jq '.applied.prefix_cache_disk_gb == "saved; applies at the next model load"')"
+    check "the ask is reported while no tier runs" "$(get /v1/settings | jq '.server.prefix_cache_disk_gb | (.ask_bytes == 2147483648) and (.effective_bytes == 2147483648) and (.running_tiers == [])')"
+    code -X POST "$BASE/v1/unload-model" -d '{"model":"tiny"}' >/dev/null
+    first="$(ask)"
+    check "after a reload the new size is in force: the tier exists" "$(get /v1/prefix-cache | jq '.namespaces | length >= 1')"
+    check "the boot log names the file as the source of the size" "$(grep -q 'Allocating 2.0 GB SSD for the prefix cache (model-settings.json)' "$LOG" && echo 1 || echo 0)"
+    check "effective_bytes is the running tier's cap and running_tiers names it" "$(get /v1/settings | jq '.server.prefix_cache_disk_gb | (.effective_bytes == 2147483648) and (.running_tiers[0].model == "tiny") and (.running_tiers[0].cap_bytes == 2147483648)')"
+    check "the loaded model reports the keys that apply and what it loaded with" \
+        "$(get /v1/settings | jq '.models[] | select(.id == "tiny") | (.loaded_with != null) and (.keys | index("kv_quant") == null) and (.keys | index("ssd_prefetch") != null)')"
+    S="$(get /v1/props 2>/dev/null)"
+    P="$(get /props)"
+    check "/props does not report the file's acceptance as applying on DeepSeek" "$(echo "$P" | jq '.settings.mtp.acceptance_applies == false')"
     # The entry lands after the response; wait for the listing to show it.
     wait_entries() { for _ in $(seq 1 20); do [ "$(get /v1/prefix-cache | jq '[.namespaces[].entries] | add // 0')" -ge 1 ] && return 0; sleep 0.5; done; return 1; }
     first="$(ask)"
@@ -190,6 +272,9 @@ PY
     check "and its cache is written again" "$(get /v1/prefix-cache | jq '.namespaces[0] | (.bytes > 0) and (.tier.entries >= 1) and (.tier.used_bytes > 0)')"
     check "a new size reaches the running tier at once" "$(post /v1/settings '{"server":{"prefix_cache_disk_gb":1}}' | jq '.applied.prefix_cache_disk_gb == "applied to the running tiers"')"
     check "the tier cap follows it" "$(get /v1/prefix-cache | jq '.namespaces[0].tier.cap_bytes <= 1073741824')"
+    check "and effective_bytes reports the cap in force" "$(get /v1/settings | jq '.server.prefix_cache_disk_gb.effective_bytes <= 1073741824')"
+    R="$(post /v1/prefix-cache/clear "{\"scope\":\"namespace\",\"id\":\"$(get /v1/prefix-cache | jq -r '.namespaces[0].id')\"}")"
+    check "a loaded model's namespace is not deletable by id" "$(is "$(echo "$R" | jq -r .error.type)" namespace_in_use)"
     stop_server
 fi
 

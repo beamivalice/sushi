@@ -112,12 +112,18 @@ pub const Deleted = struct {
 /// Deletes every namespace directory whose id is not in `keep`. Each root's lock is held across its delete, so a tier
 /// that loads meanwhile takes a fresh root and one another process holds is skipped.
 pub fn deleteUnused(allocator: std.mem.Allocator, io: std.Io, base_abs: []const u8, keep: []const u64) Deleted {
+    return deleteNamespaces(allocator, io, base_abs, keep, null);
+}
+
+/// `deleteUnused`, narrowed to the one namespace `only` when given.
+pub fn deleteNamespaces(allocator: std.mem.Allocator, io: std.Io, base_abs: []const u8, keep: []const u64, only: ?u64) Deleted {
     var res: Deleted = .{};
     var base = std.Io.Dir.openDirAbsolute(io, base_abs, .{ .iterate = true }) catch return res;
     defer base.close(io);
     var it = base.iterate();
     while (it.next(io) catch null) |dent| {
         const id = namespaceId(dent.name) orelse continue;
+        if (only) |o| if (o != id) continue;
         if (dent.kind == .sym_link) {
             res.refused_links += 1;
             continue;
@@ -131,6 +137,10 @@ pub fn deleteUnused(allocator: std.mem.Allocator, io: std.Io, base_abs: []const 
             continue;
         };
         defer lock.close(io);
+        if (disk_placement.privateRootIsLive(io, path)) {
+            res.skipped_live += 1;
+            continue;
+        }
         const bytes = scanNamespace(allocator, io, base_abs, id).bytes;
         base.deleteTree(io, dent.name) catch |err| {
             log.warn("[prefix-cache-admin] could not delete {s}: {s}\n", .{ path, @errorName(err) });
@@ -282,14 +292,27 @@ pub fn handleList(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
         const nb = n.nameBuf();
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, nb }) catch continue;
-        o.* = disk_placement.rootIsLive(stream.io, path);
+        o.* = disk_placement.namespaceIsLive(stream.io, path);
     }
     const body = try renderList(allocator, root, disk_placement.volumeSpaceNear(root), namespaces, loaded, other);
     defer allocator.free(body);
     try server.sendResponse(stream, "200 OK", "application/json", body);
 }
 
-const Scope = enum { model, stale, all };
+const Scope = enum { model, stale, all, namespace };
+
+/// The `id` of a namespace-scope clear: a namespace folder name.
+fn clearNamespaceId(obj: std.json.ObjectMap) ?u64 {
+    const v = obj.get("id") orelse return null;
+    return if (v == .string) namespaceId(v.string) else null;
+}
+
+/// The `model` field of a model-scope clear. Empty and `sushi` mean the default model to the registry, so a
+/// missing or non-string field must not reach it.
+fn clearModelId(obj: std.json.ObjectMap) ?[]const u8 {
+    const m = obj.get("model") orelse return null;
+    return if (m == .string and m.string.len > 0) m.string else null;
+}
 
 pub fn parseScope(name: []const u8) ?Scope {
     return std.meta.stringToEnum(Scope, name);
@@ -311,7 +334,7 @@ pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, reques
     };
     const scope_name = if (obj.get("scope")) |s| (if (s == .string) s.string else "") else "";
     const scope = parseScope(scope_name) orelse {
-        try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "scope must be \"model\", \"stale\" or \"all\"", 400);
+        try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "scope must be \"model\", \"namespace\", \"stale\" or \"all\"", 400);
         return;
     };
     const root = cacheRoot(allocator) catch {
@@ -324,9 +347,32 @@ pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, reques
     var model_entries: u32 = 0;
     var busy = std.ArrayList([]const u8).empty;
     defer busy.deinit(allocator);
+    var namespace_result: ?Deleted = null;
+
+    if (scope == .namespace) {
+        const ns = clearNamespaceId(obj) orelse {
+            try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "id must be a 16-digit lowercase hex namespace name", 400);
+            return;
+        };
+        const loaded = try loadedTiers(allocator, sch.registry);
+        defer allocator.free(loaded);
+        if (ownerOf(loaded, ns) != null) {
+            try server.sendErrorResponse(allocator, stream, "409 Conflict", "namespace_in_use", "A loaded model uses this namespace; clear it with scope \"model\"", 409);
+            return;
+        }
+        namespace_result = deleteNamespaces(allocator, stream.io, root, &.{}, ns);
+        const r = namespace_result.?;
+        if (r.namespaces == 0 and r.skipped_live == 0 and r.refused_links == 0) {
+            try server.sendErrorResponse(allocator, stream, "404 Not Found", "namespace_not_found", "No such namespace in the cache", 404);
+            return;
+        }
+    }
 
     if (scope == .model) {
-        const id = if (obj.get("model")) |m| (if (m == .string) m.string else "") else "";
+        const id = clearModelId(obj) orelse {
+            try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "model must be a model id", 400);
+            return;
+        };
         const entry = sch.registry.resolveEntry(id) catch |err| {
             const no_default = err == error.NoDefaultModel;
             try server.sendErrorResponse(allocator, stream, if (no_default) "503 Service Unavailable" else "404 Not Found", if (no_default) "no_model" else "model_not_found", if (no_default) "No default model configured" else "Unknown model id", if (no_default) 503 else 404);
@@ -368,8 +414,8 @@ pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, reques
         }
     }
 
-    var stale: Deleted = .{};
-    if (scope != .model) {
+    var stale: Deleted = namespace_result orelse .{};
+    if (scope == .stale or scope == .all) {
         const loaded = try loadedTiers(allocator, sch.registry);
         defer allocator.free(loaded);
         var keep = try allocator.alloc(u64, loaded.len);
@@ -499,6 +545,92 @@ test "prefix cache admin: deleteUnused: keeps the named namespaces and non-cache
     try tmp.dir.access(io, "root/notes/keep.txt", .{});
     try tmp.dir.access(io, "outside/precious.bin", .{});
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "root/00000000000000b2", .{}));
+}
+
+test "prefix cache admin: clearModelId: a model-scope clear names its model, a missing or non-string one is refused" {
+    const parse = struct {
+        fn run(arena: std.mem.Allocator, body: []const u8) !std.json.ObjectMap {
+            return (try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{})).object;
+        }
+    }.run;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("m", clearModelId(try parse(a, "{\"scope\":\"model\",\"model\":\"m\"}")).?);
+    try testing.expect(clearModelId(try parse(a, "{\"scope\":\"model\"}")) == null);
+    try testing.expect(clearModelId(try parse(a, "{\"scope\":\"model\",\"model\":null}")) == null);
+    try testing.expect(clearModelId(try parse(a, "{\"scope\":\"model\",\"model\":5}")) == null);
+    try testing.expect(clearModelId(try parse(a, "{\"scope\":\"model\",\"model\":\"\"}")) == null);
+}
+
+test "prefix cache admin: deleteUnused: a namespace whose private root another process holds is skipped whole" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    try put(&tmp, io, "root/00000000000000c3/e1/c0.safetensors", filler(100));
+    try put(&tmp, io, "root/00000000000000c3/p999-0/e1/c0.safetensors", filler(100));
+    var rbuf: [1024]u8 = undefined;
+    const root = try std.fmt.bufPrint(&rbuf, "{s}/root", .{base});
+    var held_buf: [1024]u8 = undefined;
+    const held_path = try std.fmt.bufPrint(&held_buf, "{s}/00000000000000c3/p999-0", .{root});
+    const held = (try disk_placement.lockRoot(io, held_path)).?;
+    defer held.close(io);
+
+    const res = deleteUnused(testing.allocator, io, root, &.{});
+    try testing.expectEqual(@as(u32, 0), res.namespaces);
+    try testing.expectEqual(@as(u32, 1), res.skipped_live);
+    try tmp.dir.access(io, "root/00000000000000c3/p999-0/e1/c0.safetensors", .{});
+    try tmp.dir.access(io, "root/00000000000000c3/e1/c0.safetensors", .{});
+}
+
+test "prefix cache admin: deleteNamespaces: one namespace by id; a held, symlinked or absent one is not deleted" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try put(&tmp, io, "root/00000000000000a1/e1/c0.safetensors", filler(100));
+    try put(&tmp, io, "root/00000000000000b2/e1/c0.safetensors", filler(200));
+    try put(&tmp, io, "root/00000000000000c3/p9-0/e1/c0.safetensors", filler(300));
+    var rbuf: [1024]u8 = undefined;
+    const root = try std.fmt.bufPrint(&rbuf, "{s}/root", .{base});
+
+    var held_buf: [1024]u8 = undefined;
+    const held_path = try std.fmt.bufPrint(&held_buf, "{s}/00000000000000c3/p9-0", .{root});
+    const held = (try disk_placement.lockRoot(io, held_path)).?;
+    defer held.close(io);
+
+    const one = deleteNamespaces(testing.allocator, io, root, &.{}, 0xb2);
+    try testing.expectEqual(@as(u32, 1), one.namespaces);
+    try testing.expectEqual(@as(u64, 200), one.bytes);
+    try tmp.dir.access(io, "root/00000000000000a1/e1/c0.safetensors", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "root/00000000000000b2", .{}));
+
+    const live = deleteNamespaces(testing.allocator, io, root, &.{}, 0xc3);
+    try testing.expectEqual(@as(u32, 0), live.namespaces);
+    try testing.expectEqual(@as(u32, 1), live.skipped_live);
+    try tmp.dir.access(io, "root/00000000000000c3/p9-0/e1/c0.safetensors", .{});
+
+    const none = deleteNamespaces(testing.allocator, io, root, &.{}, 0xdd);
+    try testing.expectEqual(@as(u32, 0), none.namespaces + none.skipped_live + none.refused_links);
+}
+
+test "prefix cache admin: clearNamespaceId: only a namespace folder name names a namespace" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const parse = struct {
+        fn run(arena: std.mem.Allocator, body: []const u8) !std.json.ObjectMap {
+            return (try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{})).object;
+        }
+    }.run;
+    try testing.expectEqual(@as(?u64, 0xa1), clearNamespaceId(try parse(a, "{\"id\":\"00000000000000a1\"}")));
+    try testing.expectEqual(@as(?u64, null), clearNamespaceId(try parse(a, "{}")));
+    try testing.expectEqual(@as(?u64, null), clearNamespaceId(try parse(a, "{\"id\":5}")));
+    try testing.expectEqual(@as(?u64, null), clearNamespaceId(try parse(a, "{\"id\":\"../etc\"}")));
 }
 
 test "prefix cache admin: renderList: a loaded model's namespace carries its tier, the rest are stale or held elsewhere" {

@@ -303,30 +303,46 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
 - `GET /v1/prefix-cache`: `{root, volume:{free_bytes,total_bytes}|null, total_bytes, namespaces:[{id, bytes, entries,
   newest_mtime (unix s), model|null, stale, held_by_other_process, tier:{used_bytes,cap_bytes,entries,written_bytes}|null}]}`.
   A namespace is a `<16 hex>` directory of the cache root (`SUSHI_PREFIX_CACHE_DIR`, else `~/.sushi/kv-cache`) holding
-  `e<id>` entry directories (a private `p<pid>-<n>` root inside it counts too). `bytes` is the size on disk with a
-  hard-linked file counted once; `entries` counts entry directories with a `meta.json`. `model` is the loaded model whose
+  `e<id>` entry directories (a private `p<pid>-<n>` root inside it counts too). `bytes` is the apparent size (the sum of the
+  files' lengths, not disk blocks) with a hard-linked file counted once; `entries` counts entry directories with a `meta.json`. `model` is the loaded model whose
   tier lives there (and `tier` its live numbers, published by the inference thread); `stale` means no loaded model uses it
-  and no other server holds its lock (`held_by_other_process`). A symlink or a folder that is not a namespace name is never listed.
+  and no other server holds its lock, or the lock of a private `p<pid>-<n>` root inside it (`held_by_other_process`). A symlink or a folder that is not a namespace name is never listed.
   `tier.written_bytes` is cumulative since the tier opened; a client takes the write rate between two polls.
-- `POST /v1/prefix-cache/clear` `{"scope":"model","model":id}` | `{"scope":"stale"}` | `{"scope":"all"}` answers `{scope,
+- `POST /v1/prefix-cache/clear` `{"scope":"model","model":id}` | `{"scope":"namespace","id":"<16 hex>"}` | `{"scope":"stale"}` | `{"scope":"all"}` answers `{scope,
   freed_bytes, model_freed_bytes, model_entries_removed, stale_freed_bytes, stale_namespaces_removed,
   skipped_live_namespaces, refused_symlinks, busy_models}`. `model` empties that model's tier on the inference thread (its
   sole owner): staged writes are fenced, the index, `total_bytes` and the files go together, and the tier takes new writes
   at once. It is refused with 409 `model_busy` while a request holds the model (retry; it is not queued), and 409
   `model_not_loaded` for a model without a tier. `stale` deletes the namespace directories no loaded model uses, each under
   the root's lock (a root another server holds is skipped), and never follows a symlink out of the cache root. `all` is both,
-  with busy models listed and left alone.
+  with busy models listed and left alone. A `model` scope needs a string `model` (400 without one: the empty id would
+  mean the default model). `namespace` deletes exactly that namespace directory under the same locks as `stale`, so a
+  namespace another server holds is skipped (`skipped_live_namespaces: 1`, nothing removed) and a symlink is refused;
+  it answers the `stale_*` fields of the namespace it removed, 400 for an id that is not a namespace name, 404 for
+  one not in the cache and 409 `namespace_in_use` for one a loaded model owns (use `model`).
 - `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir` and
-  `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, `source` `flag|file|default`, `locked`), the
+  `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, as typed: `models_dir` whole, the size in the
+  flag's own syntax such as `512MB`, `source` `flag|file|default`, `locked`; the size also carries `effective_bytes`, the
+  largest running tier's cap or, with none running, the ask; `ask_bytes`, the number the next load starts from; and
+  `running_tiers`, `[{model, cap_bytes, used_bytes}]`), the
   `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
   `locked`. `POST /v1/settings` takes `{"server":{key:value|null}}` and/or `{"model":id,"set":{key:value|null}}`; null removes
-  a key. Unknown keys are a 400 `unknown_setting`, a bad value a 400 `invalid_setting`, a `models_dir` that is not a readable
+  a key. Each model row also carries `keys`, the keys that apply to that model (`model_settings.applies`, the same gates
+  the loader's ignored-key log lines use: `ssd_budget_gb` needs expert streaming, `ssd_prefetch` is DeepSeek-V4.1's,
+  `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
+  null while the model is not loaded and otherwise `{key: value|null}` for every key: the file value the load stamped
+  (null: the file had none then), in the shape of `settings.<key>.file`, so a page tells "saved differs from loaded".
+  `kv_quant` is a choice name (`off`, `4`, `6`, `8`) wherever it is read or written; a request may say `0`, `16`, `"16"` or `"off"`
+  and the file stores `"off"`. Unknown keys are a 400 `unknown_setting`, a bad value a 400 `invalid_setting`, a `models_dir` that is not a readable
   folder a 400, an unknown model a 404, a settings file that is not a JSON object a 409; every key is checked before anything
-  is written, and the write is a temp file plus rename. A key a launch flag pins is still written (it applies at a start
+  is written, and the write is a temp file plus rename (through a symlinked settings file, to its target; a model section is found
+  without regard to a trailing slash in its key). A key a launch flag pins is still written (it applies at a start
   without the flag) and reported with the flag's source. Per-model keys are stamped at load, so they apply at the model's next
   load (the page offers the reload). `prefix_cache_disk_gb` reaches the running tiers at once (the tier re-derives its budget
-  and evicts down to it); 0 and removal apply at the next load. `models_dir` triggers a rescan that adds the folder's models
-  (add-only; the boot discovery follows it at the next start).
+  and evicts down to it) and every later load, cold loads included; the answer says "applied to the running tiers" only
+  when a tier was resized, else "applies at the next model load"; 0 and removal apply at the next load. `models_dir`
+  triggers a rescan that adds the folder's models, also on a `--model`-only server, and says how many (add-only; the boot
+  discovery follows it at the next start).
 - The page shows both in its **Models** (`/models`: per-model size, load/unload, settings, that model's cache) and
   **Settings** (`/settings`: SSD cache size, status, per-namespace rows and the clear buttons, models directory) views.
   Guards: `tests/test_prefix_cache_admin.sh`, `node tests/test_webui_admin.cjs`.

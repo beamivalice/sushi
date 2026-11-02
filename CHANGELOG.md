@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The web page's settings and SSD cache controls apply what they say**: a cache size saved after boot reaches the next model load (it was ignored when the server started with the tier off), the answer says "applied to the running tiers" only when a tier was resized, the shown size is the one in force, a model-scope clear needs a model, a cache another server's private root holds is never deleted, one stale cache can be cleared by id, a long `--model-dir` or a sub-GB `--prefix-cache-disk` shows whole, edits reach a hand-written trailing-slash key and a symlinked settings file, `kv_quant` is stored as `off|4|6|8`, each model lists the keys that apply to it and the values it loaded with, and the boot log names `model-settings.json` when the file set the size.
 - **DeepSeek-V4.1's SSD prefix cache writes far less**: a long agent conversation writes each row once instead of once per turn, and the web page's Settings tab shows and clears it. Caches written by earlier versions are not read; clear them from Settings.
 - **Metrics are on by default**: `/metrics`, `/metrics.json` and the dashboard work without a flag; `--no-metrics` turns them off, and `--metrics` is still accepted and does nothing.
 - **The dashboard's charts no longer break when the tab is in the background**: the server keeps the last hour of samples and the page fills the missing interval from `/metrics.json?since=` when you come back, drawing a real outage as a gap.
