@@ -121,7 +121,7 @@ pub var listen_host: []const u8 = default_host;
 pub var listen_port: u16 = default_port;
 
 pub const default_host: []const u8 = "127.0.0.1";
-pub const default_port: u16 = 12345;
+pub const default_port: u16 = @import("default_port.zig").port;
 
 pub const BindConfig = struct {
     host: []const u8,

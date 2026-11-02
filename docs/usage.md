@@ -12,6 +12,11 @@ brew install beamivalice/tap/sushi
 curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-macos-arm64.tar.gz | tar xz
 ```
 
+The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` (default 12345)
+and it detaches from the terminal. The title is the live decode tok/s (`last N tok/s` once idle); its menu starts a
+headless `sushi --serve` from the same folder, stops only a server it started, and opens the dashboard, chat, Models
+and Settings pages.
+
 A browser download is quarantined: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`. GPU memory and the
 largest context per Mac: [README, Memory](../README.md#memory).
 

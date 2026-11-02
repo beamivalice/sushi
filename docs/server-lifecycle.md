@@ -241,6 +241,15 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - `src/generate.zig`: generation, `commitForcedTokens`; `src/mtp_policy.zig` / `src/mtp_round.zig`: MTP policy and rounds; `src/sampler.zig`: sampling;
   `src/prefill_plan.zig`: prefill chunking; `src/degenerate.zig`: `StallClock`, loop-stop tiers. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts.
 
+## sushibar
+
+`sushibar` (`src/sushibar_main.zig`, `src/sushibar/`) is a separate pure-Zig binary: the Objective-C runtime and AppKit, no MLX, jinja or server module (only `default_port.zig` is shared with `server.zig`).
+
+- **Launch**: bad arguments and an ssh login (`SSH_CONNECTION`/`SSH_TTY`) are refused by name before anything runs; a live `~/.sushi/sushibar.pid` (verified as a `sushibar` process) prints "already running" and exits 0. Otherwise the terminal copy spawns itself with `POSIX_SPAWN_SETSID` (a session leader is the detached copy), waits for it to take the pid file, prints one line and exits 0.
+- **Title**: polled once a second off the main thread from `/metrics.json?since=<ms>`. Live = tokens added to the `decode` rows of `sessions` (same `request_id`) over the wall time between polls; idle = `generated_tokens / decode_seconds` of the newest finished row of `requests`; 401/403 reads "key needed", 503 "metrics off", no answer (a poll times out after 4 s) is offline. The icon beside it is an outline while offline and in colour once any server answers (`icon-offline.svg`, `icon-online.svg`, embedded; swapped only on a state change); an idle or offline title is the icon alone. AppKit runs only on the main thread, which renders the published snapshot from a run-loop timer.
+- **Start/Stop**: Start runs the `sushi` beside the executable as `--serve --port N` (no model flags, so the saved `server.models_dir` applies) in its own session and records `~/.sushi/sushibar-server.pid` (`pid port`). Stop sends SIGTERM only to that pid, and only while it is still a `sushi` whose argv has `--serve --port N`. Quit ends sushibar alone.
+- Test seams: `SUSHIBAR_TEST_POLLS`, `SUSHIBAR_TEST_ACTIONS` ([envvar](envvar.md)); guard `tests/test_sushibar.sh`.
+
 ## Threads
 
 - Detach every per-connection `std.Thread` immediately; on teardown drain conn threads before `scheduler.deinit`.

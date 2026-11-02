@@ -164,6 +164,11 @@ for tag, ok in (("1.0.0", True), ("1.0.0-pre-release.2", True), ("26.9.1", False
 # and for months they did not: the packaging path shipped the binary alone.
 for f in ("LICENSE-APACHE-2.0", "NOTICE"):
     check(f in wf_text, f"release.yml packages {f} into the CLI tarball")
+# ── sushibar ships beside sushi: copied, signed with the same identity (so the notarized zip covers it), verified.
+_pkg = str(steps.get("Package CLI binary", {}).get("run", ""))
+check(any(l.startswith("cp ") and "sushibar" in l for l in _pkg.splitlines()), "release.yml packages sushibar into the CLI tarball")
+check('--sign "$SIGNING_IDENTITY" "$STAGING/sushibar"' in _pkg, "release.yml signs sushibar like sushi")
+check('--verbose=2 "$STAGING/sushibar"' in _pkg, "release.yml verifies sushibar's signature")
 # ── A host that pins a release as its guest engine checks the tarball's sha256
 # and reads guest.json from inside it; both must ship with every release.
 package_run = str(steps.get("Package CLI binary", {}).get("run", ""))

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="18" viewBox="0 0 22 18">
+  <defs>
+    <linearGradient id="box" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#eef0f3"/><stop offset="1" stop-color="#959ca4"/></linearGradient>
+    <linearGradient id="fish" x1="0" y1="0" x2="0.6" y2="1"><stop offset="0" stop-color="#ff9150"/><stop offset="1" stop-color="#e5531c"/></linearGradient>
+  </defs>
+  <rect x="1.2" y="11.2" width="19.6" height="5.8" rx="1.9" fill="url(#box)" stroke="#5c636b" stroke-width="0.7"/>
+  <rect x="3.6" y="14" width="3.4" height="1" rx="0.5" fill="#3a3f45"/>
+  <circle cx="17.7" cy="14.5" r="0.65" fill="#fff" stroke="#5c636b" stroke-width="0.35"/>
+  <path d="M4.4 11.2C3.8 9.4 5.4 7.8 8 7.5L15.6 7.1C17.8 7.1 18.6 8.8 17.9 11.2Z" fill="#fff" stroke="#aab0b7" stroke-width="0.6"/>
+  <path d="M1.6 9C1.8 5.6 6.1 2.6 11.2 1.8C15.7 1.2 19.7 2.1 20.5 4C21.1 5.4 19.5 6.6 16.4 7.2C12.4 8 7 8.8 4.2 9.9C2.8 10.4 1.5 9.9 1.6 9Z" fill="url(#fish)" stroke="#b03f14" stroke-width="0.6"/>
+  <path d="M6.8 4.2Q7.9 6.3 7.1 8.6M10.9 2.6Q12 4.8 11.4 7.7M15 2Q16.1 4.1 15.6 6.9" fill="none" stroke="#ffe6d8" stroke-width="0.95" stroke-linecap="round"/>
+</svg>

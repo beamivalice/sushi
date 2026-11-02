@@ -187,7 +187,7 @@ pub fn installRefusal(io: std.Io, dir: []const u8, buf: []u8) ?[]const u8 {
 }
 
 /// The release tarball's entries; `.DS_Store` is Finder's.
-const release_entries = [_][]const u8{ "sushi", "lib", "LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "guest.json", ".DS_Store" };
+const release_entries = [_][]const u8{ "sushi", "sushibar", "lib", "LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "guest.json", ".DS_Store" };
 
 /// An entry of `dir` that neither the release layout nor `incoming` has: the swap would carry it away, so a folder
 /// holding anything else (a shared bin/) is never swapped.

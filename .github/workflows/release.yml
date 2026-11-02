@@ -136,7 +136,7 @@ jobs:
           STAGING="sushi-macos-arm64"
           mkdir -p "$STAGING/lib"
 
-          cp zig-out/bin/sushi "$STAGING/"
+          cp zig-out/bin/sushi zig-out/bin/sushibar "$STAGING/"
 
           # License + third-party attributions. The tarball links Apache-2.0
           # code (MTPLX/dflash/oMLX kernels, jinja.cpp) whose section 4 wants
@@ -189,12 +189,15 @@ jobs:
             [ -f "$lib" ] && codesign --force "${RUNTIME_FLAG[@]}" --sign "$SIGNING_IDENTITY" "$lib"
           done
           codesign --force "${RUNTIME_FLAG[@]}" --sign "$SIGNING_IDENTITY" "$STAGING/sushi"
+          codesign --force "${RUNTIME_FLAG[@]}" --sign "$SIGNING_IDENTITY" "$STAGING/sushibar"
 
           codesign --verify --deep --strict --verbose=2 "$STAGING/sushi"
+          codesign --verify --deep --strict --verbose=2 "$STAGING/sushibar"
 
           # Smoke test the install_name_tool-rewired binary so missing-dylib
           # errors surface here rather than after notarization.
           "./$STAGING/sushi" --version
+          "./$STAGING/sushibar" --help > /dev/null
 
           # What a host that runs this release as its engine checks first.
           "./$STAGING/sushi" --guest-manifest > "$STAGING/guest.json"

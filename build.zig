@@ -107,6 +107,7 @@ pub fn build(b: *std.Build) void {
     exe.headerpad_max_install_names = true;
 
     b.installArtifact(exe);
+    b.installArtifact(addSushibar(b, target, optimize, macos_sdk_frameworks));
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -214,6 +215,20 @@ pub fn build(b: *std.Build) void {
     guardBenchFiles(b);
     const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
     ubench_step.dependOn(&b.addInstallArtifact(addUbench(b, build_options, target, macos_sdk_frameworks), .{}).step);
+}
+
+/// `sushibar`: the menu bar app. It links no MLX, jinja or server module, only the Objective-C runtime and AppKit.
+fn addSushibar(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, macos_sdk_frameworks: ?[]const u8) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/sushibar_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    if (macos_sdk_frameworks) |fw_path| mod.addFrameworkPath(.{ .cwd_relative = fw_path });
+    mod.linkFramework("AppKit", .{});
+    mod.linkFramework("Foundation", .{});
+    return b.addExecutable(.{ .name = "sushibar", .root_module = mod });
 }
 
 /// `sushi-ubench`: the microbench harness and the bench bodies, a binary of its own. It stamps the commit it was

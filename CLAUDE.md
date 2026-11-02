@@ -79,7 +79,7 @@ link to or quote them from a committed file.
 | `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
 | `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging, card, upload, verification |
 
-Skills: `/release` (SemVer, CHANGELOG), `/bench` (llmprobe methodology, comparison traps).
+Skills: `/release`, `/bench`.
 
 ## Stack
 
@@ -122,6 +122,7 @@ Box: M5 Max 128 GB, macOS 27.
 | `kld.zig` | `sushi kld capture|compare` | quality-kld |
 | `bench.zig` / `bench_box.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power | process-measurement |
 | `ubench_main.zig` / `ubench_report.zig` / `exl3/ubench.zig` | `sushi-ubench` (`zig build ubench`) | process-ubench |
+| `sushibar_main.zig` / `sushibar/` | `sushibar` menu bar app | server-lifecycle |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | format corpus, traffic replay | server-tool-calling |
 
