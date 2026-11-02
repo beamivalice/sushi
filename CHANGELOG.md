@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1's SSD prefix cache writes far less**: a long agent conversation writes each row once instead of once per turn, and the web page's Settings tab shows and clears it. Caches written by earlier versions are not read; clear them from Settings.
 - **Metrics are on by default**: `/metrics`, `/metrics.json` and the dashboard work without a flag; `--no-metrics` turns them off, and `--metrics` is still accepted and does nothing.
 - **The dashboard's charts no longer break when the tab is in the background**: the server keeps the last hour of samples and the page fills the missing interval from `/metrics.json?since=` when you come back, drawing a real outage as a gap.
 - **The web page opens in a Compact view**: big tiles for the loaded model, tokens per second, memory, SSD cache and requests, with two charts; an Advanced toggle in the header brings back the full dashboard, and the Models and Settings tabs hide their expert rows in Compact.
