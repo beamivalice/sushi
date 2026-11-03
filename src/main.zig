@@ -84,7 +84,7 @@ var prompt_client: ?*PromptClient = null;
 
 fn printUsage(io: std.Io) void {
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
+    var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     stdout_w.interface.writeAll(
         \\sushi — MLX inference server for Apple Silicon
         \\
@@ -617,7 +617,7 @@ pub fn main(init: std.process.Init) !void {
                 .nax = transformer_mod.naxStatus(),
             };
             var ver_buf: [512]u8 = undefined;
-            var ver_w = std.Io.File.stdout().writer(io, &ver_buf);
+            var ver_w = std.Io.File.stdout().writerStreaming(io, &ver_buf);
             version_mod.writeReport(&ver_w.interface, info) catch {};
             ver_w.interface.flush() catch {};
             return;
@@ -626,7 +626,7 @@ pub fn main(init: std.process.Init) !void {
             defer _ = mlx.mlx_string_free(mlx_ver);
             try mlx.check(mlx.mlx_version(&mlx_ver));
             var out_buf: [1024]u8 = undefined;
-            var out_w = std.Io.File.stdout().writer(io, &out_buf);
+            var out_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
             try version_mod.writeGuestManifest(&out_w.interface, allocator, .{
                 .version = VERSION,
                 .commit = build_options.git_sha,
@@ -1586,7 +1586,7 @@ pub fn main(init: std.process.Init) !void {
         const sampling = sampler.SamplingParams{ .temperature = temperature };
 
         var stdout_buf: [16 * 1024]u8 = undefined;
-        var stdout_w_state = std.Io.File.stdout().writer(io, &stdout_buf);
+        var stdout_w_state = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
         const stdout_w = &stdout_w_state.interface;
         defer stdout_w.flush() catch {};
 

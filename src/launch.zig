@@ -1066,7 +1066,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
     if (parsed.print_only) {
         var stdout_buf: [8192]u8 = undefined;
-        var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
+        var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
         stdout_w.interface.writeAll(script) catch {};
         stdout_w.interface.flush() catch {};
         return;
