@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The Dashboard and Settings name the volume the SSD cache writes to**, with its free space, and warn below 10% free or near the 4 GiB reserve; a cache folder set to a drive that is not mounted shows as unavailable. Thanks @cyrilmhansen.
 - **A pack that mixes two revisions is refused at load**: a pack whose `config.json` names a `pack_revision` loads only when every shard it reads carries that revision (the shard is named, with both revisions and the fix, in the log and the 503), `/v1/models` and `/props` report it as `pack_revision` (null for a pack that names none), so a half-updated folder can never serve a blend of two uploads.
 - **`sushi pull` compares contents, not sizes**: a file on disk is kept only when its checksum matches the repo's (from the manifest `.sushi-pull.json` a finished pull writes, or a one-time hash of a folder without one), every download is verified before it is put in place, and files the repo has dropped since the last pull are removed.
 - **`sushi list`, the server and `sushibar` say when a newer revision of your pack is published**: `sushi list` prints `update available: 2.0 (you have 1.0) — sushi pull <pack>` under a downloaded pack, `/v1/models` adds `meta.pack_update` to the loaded model's row, and `sushibar` and the Models tab show it with a button or menu item that copies the pull command; `--no-update-check` turns the server's look off.

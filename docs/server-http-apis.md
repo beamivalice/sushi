@@ -256,11 +256,13 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →
   streaming grammar → per-token mask), `src/reasoning_protocol.zig`.
 
-- `/props.settings.prefix_cache` = `{ram_enabled, mem_bytes, disk_bytes, disk_used_bytes, disk_entries}`: `disk_bytes` is
+- `/props.settings.prefix_cache` = `{ram_enabled, mem_bytes, disk_bytes, disk_used_bytes, disk_entries, volume}`: `disk_bytes` is
   the SSD budget the model was given at load (0 = tier off), `disk_used_bytes` and `disk_entries` what the tier holds,
   published by the inference thread after each commit (the web page's meter reads them; the same numbers log as
   `[disk-cache] usage <used> / <budget> GB, <n> entries` once per finished turn). They are the REQUESTED model's own
   tier (`/props?model=X`), the four numbers from one publish. `GB` is binary (1 GB = 1 GiB), as the flags read it.
+  `volume` = `{name, path, free_bytes, total_bytes}` of the cache root, read per request; `name`, `free_bytes` and
+  `total_bytes` are null when it is unavailable ([engine-prefix-cache](engine-prefix-cache.md#listing-and-clearing-from-the-admin-api)).
 - `/props.settings.prefill_decode_share` reports the effective process-wide share, including zero under the interleave kill switch.
 
 ## Security and observability
@@ -329,7 +331,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 All four routes sit behind `--api-key` like the other admin routes, and a request carrying a foreign `Origin` is a 403
 (`crossOriginRefused`). Code: `src/prefix_cache_admin.zig`, `src/settings_api.zig`.
 
-- `GET /v1/prefix-cache`: `{root, volume:{free_bytes,total_bytes}|null, total_bytes, namespaces:[{id, bytes, entries,
+- `GET /v1/prefix-cache`: `{root, volume:{name,path,free_bytes,total_bytes}|null, total_bytes, namespaces:[{id, bytes, entries,
   newest_mtime (unix s), model|null, stale, held_by_other_process, tier:{used_bytes,cap_bytes,entries,written_bytes}|null}]}`.
   A namespace is a `<16 hex>` directory of the cache root (`SUSHI_PREFIX_CACHE_DIR`, else `~/.sushi/kv-cache`) holding
   `e<id>` entry directories (a private `p<pid>-<n>` root inside it counts too). `bytes` is the apparent size (the sum of the

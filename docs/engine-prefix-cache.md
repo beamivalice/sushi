@@ -342,6 +342,11 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   numbers (`DiskStats.namespace`, the fingerprint directory as a number), which is how the listing names the owner without
   touching the tier from a connection thread. The stale delete takes each root's `.lock` like `sweepBase`, so a root another
   process owns is skipped. A new `prefix_cache_disk_gb` runs the same way (`set_cap`: `operator_cap` then `refreshDiskBudget`).
+- The cache volume (`disk_placement.cacheVolume`, on the connection thread): the cache root resolved through symlinks,
+  its free and total bytes and its mount's name. A `SUSHI_PREFIX_CACHE_DIR` that does not exist is unavailable (null
+  name and space), never its parent's volume; the default root, made on first write, reports the volume it will land
+  on. The page warns below 10% free and near the 4 GiB reserve. It reports the destination; it does not stop a write
+  after the volume goes away.
 
 <a id="one-tier-per-root"></a>
 ## One live tier per root

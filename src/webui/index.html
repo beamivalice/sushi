@@ -722,7 +722,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="tile"><div class="k">Decode</div><div class="v" id="dashCmDec">-</div><div class="s" id="dashCmDecS">&nbsp;</div></div>
     <div class="tile"><div class="k">Prefill</div><div class="v" id="dashCmPre">-</div><div class="s" id="dashCmPreS">&nbsp;</div></div>
     <div class="tile"><div class="k">Memory</div><div class="v" id="dashCmMem">-</div><div class="meterbar"><span id="dashCmMemBar" style="width:0"></span></div><div class="s" id="dashCmMemS">&nbsp;</div></div>
-    <div class="tile"><div class="k">SSD cache</div><div class="v" id="dashCmSsd">-</div><div class="meterbar"><span id="dashCmSsdBar" style="width:0"></span></div><div class="s" id="dashCmSsdS">&nbsp;</div></div>
+    <div class="tile"><div class="k">SSD cache</div><div class="v" id="dashCmSsd">-</div><div class="meterbar"><span id="dashCmSsdBar" style="width:0"></span></div><div class="s" id="dashCmSsdS">&nbsp;</div><div class="s" id="dashCmSsdVolume">&nbsp;</div></div>
     <div class="tile"><div class="k">Requests</div><div class="v" id="dashCmReq">-</div><div class="s" id="dashCmReqS">&nbsp;</div></div>
   </section>
   <section class="cmp charts-cmp feed">
@@ -797,7 +797,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       <div class="card-b">
         <div class="usage"><span id="cacheUsage"></span><span id="cacheFree"></span></div>
         <div class="meter" role="meter" aria-label="SSD prefix cache used" aria-valuemin="0" aria-valuemax="100" id="cacheMeter"><span id="cacheBar"></span></div>
-        <div class="kv adv" id="cacheKv"></div>
+        <div class="kv" id="cacheKv"></div>
         <div id="cacheSet"></div>
       </div>
       <div class="tablewrap"><table class="tbl">
@@ -1538,6 +1538,16 @@ function renderPrefixCache(pc) {
   $("prefixCacheMeter").setAttribute("aria-valuenow", String(Math.round(meter.percent)));
   $("prefixCacheUsage").textContent = meter.text;
   $("prefixCacheEntries").textContent = `${meter.entries} ${meter.entries === 1 ? "entry" : "entries"}`;
+}
+function cacheVolumeText(volume) {
+  if (!volume?.name || !(volume.total_bytes > 0) || volume.free_bytes == null) return 'Destination unavailable';
+  const free = Math.max(0, Number(volume.free_bytes));
+  const percent = Math.round(100 * free / Number(volume.total_bytes));
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let n = free, unit = 0;
+  while (n >= 1024 && unit < units.length - 1) { n /= 1024; unit++; }
+  const warning = free <= 5 * 1024 ** 3 ? ' · CRITICAL: near 4 GiB reserve' : free / Number(volume.total_bytes) < 0.1 ? ' · WARNING: below 10% free' : '';
+  return `${volume.name} · ${n.toFixed(unit ? 2 : 0)} ${units[unit]} free (${percent}%)${warning}`;
 }
 // The server flushes a turn's entry after it answers, so a second read catches the stored bytes.
 function refreshPrefixCache() {
@@ -3450,8 +3460,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     q("cacheBar").style.width = `${pct}%`;
     q("cacheMeter").setAttribute("aria-valuenow", String(Math.round(pct)));
     const rate = A.rates.size ? [...A.rates.values()].reduce((a, b) => a + b, 0) : null;
-    const kv = [["Cache folder", c.root], ["Write rate", rate === null ? "-" : rate ? `${adminBytes(rate)}/s` : "idle"]];
-    fill(q("cacheKv"), JSON.stringify(kv), () => kvRows(kv, ["Cache folder"]));
+    const volume = c.volume;
+    const volumeLabel = volume?.name || "Destination unavailable";
+    const cachePath = volume?.path || c.root || "-";
+    const kv = [["Cache volume", `${volumeLabel} · ${cachePath}`], ["Write rate", rate === null ? "-" : rate ? `${adminBytes(rate)}/s` : "idle"]];
+    fill(q("cacheKv"), JSON.stringify(kv), () => kvRows(kv, ["Cache volume"]));
+    const folderRow = q("cacheKv").querySelectorAll("span");
+    if (folderRow.length > 1 && folderRow[1].title !== cachePath) folderRow[1].title = cachePath;
     const locked = !!gb.locked, file = adminFileText(gb.file);
     badges(cacheRow.badge, gb, gb.file === 0 && !locked ? "at the next load" : gb.applies);
     // A pinned size shows the flag as typed; the box is a draft only while it differs from what the page would show.
@@ -3825,13 +3840,20 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       ...serial,
     ]);
 
-    kv($('writes'), writes ? [
+    const ssdVolume = serverInfo.disk?.volume;
+    kv($('writes'), [
+      ['Cache location', esc(ssdVolume ? cacheVolumeText(ssdVolume) : 'Destination unavailable')],
+      ...(writes ? [
       ['Written', bytes(writes.total)],
       ['Write rate', writes.rate == null ? '-' : bytes(writes.rate) + '/s'],
       ['Written per byte on disk', writes.amplification == null ? '-' : fmt(writes.amplification, 1) + 'x'],
       ...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || esc(k), bytes(v)]),
       ['Failed or dropped', bytes(writes.failed)],
-    ] : [['Not reported by this server', '-']]);
+      ] : [['Not reported by this server', '-']]),
+    ]);
+    const writeRows = $('writes').querySelectorAll('span');
+    const writesTitle = ssdVolume?.path || '';
+    if (writeRows.length > 1 && writeRows[1].title !== writesTitle) writeRows[1].title = writesTitle;
     hist('ttft', h.time_to_first_token_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     hist('e2e', h.e2e_request_latency_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     sessions(d.sessions || [], now, g);
@@ -4028,17 +4050,21 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setWidth($('cm-mem-bar'), ceil ? Math.min(100, 100 * used / ceil.gib) : 0);
     put($('cm-mem-s'), serverInfo.free != null ? bytes(serverInfo.free) + ' available' : 'in use by sushi');
 
-    let ssd = 0, cap = 0, entries = 0, known = false;
+    let ssd = 0, cap = 0, entries = 0, known = false, volume = null;
     for (const m of modelList) {
       const p = m.state === 'ready' ? modelProps.get(m.id) : null;
       if (!p || typeof p !== 'object') continue;
       const pc = p.settings?.prefix_cache || {};
       known = true; ssd += pc.disk_used_bytes || 0; cap = Math.max(cap, pc.disk_bytes || 0); entries += pc.disk_entries || 0;
+      if (pc.volume) volume = pc.volume;
     }
     // "off" is a claim about a loaded model's settings; without one (or before /props answers) there is nothing to say.
     setValue($('cm-ssd'), cap ? bytes(ssd) : known ? 'off' : '-', cap ? '/ ' + bytes(cap) : '');
     setWidth($('cm-ssd-bar'), cap ? Math.min(100, 100 * ssd / cap) : 0);
     put($('cm-ssd-s'), cap ? `${fmtInt(entries)} ${entries === 1 ? 'entry' : 'entries'}` : known ? 'SSD prefix cache is off' : modelsKnown && !ready.length ? 'no model loaded' : '');
+    put($('cm-ssd-volume'), cap ? cacheVolumeText(volume) : '');
+    const ssdTitle = volume?.path || '';
+    if ($('cm-ssd-volume').title !== ssdTitle) $('cm-ssd-volume').title = ssdTitle;
 
     setValue($('cm-req'), String(g.requests_running || 0), 'running');
     put($('cm-req-s'), `${g.requests_waiting || 0} waiting` + (g.requests_prefilling ? ', prefilling' : ''));

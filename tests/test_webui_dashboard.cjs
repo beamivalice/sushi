@@ -754,9 +754,13 @@ async function main() {
       const rows = () => page.evaluate(() => Object.fromEntries([...document.querySelectorAll('#dashWrites span')].reduce((acc, el, i, all) => (i % 2 ? acc : [...acc, [el.textContent, all[i + 1].textContent]]), [])));
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       // The rate needs two polls and the ratio needs /props: wait for both, then read one consistent render.
-      await page.waitForFunction(() => /\/s$/.test(document.querySelector('#dashWrites span:nth-child(4)')?.textContent ?? '') && /x$/.test(document.querySelector('#dashWrites span:nth-child(6)')?.textContent ?? ''), null, { timeout: 15000 });
+      await page.waitForFunction(() => {
+        const spans = [...document.querySelectorAll('#dashWrites span')];
+        const value = (label) => spans[spans.findIndex((el) => el.textContent === label) + 1]?.textContent ?? '';
+        return /\/s$/.test(value('Write rate')) && /x$/.test(value('Written per byte on disk'));
+      }, null, { timeout: 15000 });
       const card = await rows();
-      for (const label of ['Written', 'Write rate', 'Written per byte on disk', 'KV chunks', 'Restore points', 'QSA history', 'Speculative state', 'Ring points', 'Manifests and token records', 'Failed or dropped']) {
+      for (const label of ['Cache location', 'Written', 'Write rate', 'Written per byte on disk', 'KV chunks', 'Restore points', 'QSA history', 'Speculative state', 'Ring points', 'Manifests and token records', 'Failed or dropped']) {
         assert.ok(label in card, `the card has a ${label} row`);
       }
       assert.equal(card['Failed or dropped'], '3.0 MiB', 'failed bytes are named apart from the written ones');
