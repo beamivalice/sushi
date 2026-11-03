@@ -28,8 +28,16 @@ largest context per Mac: [README, Memory](../README.md#memory).
 `sushi pull <model>` downloads a pack into `~/.sushi/models/beamster/<repo>`, where `sushi serve` and `sushi run` find it
 by name. `<model>` is a short name (`qwen3.8-flash-next[:tag]`, `mimo-v2.6-flash`, `glm-5.3-flash[:tag]`,
 `deepseek-v4.1-flash`) or `beamster/<repo>`; packs from any other org are refused. A rerun downloads only what is missing
-or short, so it finishes an interrupted pull; until then the folder holds `.pull-incomplete`. A private repo pulls after
+or changed, so it finishes an interrupted pull; until then the folder holds `.pull-incomplete`. A private repo pulls after
 `hf auth login` or with `HF_TOKEN`.
+
+A file is kept by content, never by size: a finished pull leaves `.sushi-pull.json` (repo, Hugging Face commit, and each
+file's size and checksum: sha256 for a large file, the git blob id for a small one) and the next pull skips a file only
+when the repo lists the same checksum. A folder without the manifest (an older sushi, a copy by hand) is hashed once
+(`checking N files already on disk…`) and only the files that differ download. Each download is checked against its
+checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A file the last manifest
+listed that the repo no longer has is removed; nothing else in the folder is touched. `sushi run` still uses a present
+local copy without contacting Hugging Face.
 
 `sushi list` shows each pack's size, whether it is downloaded and whether this Mac meets its tier, and marks the one it
 recommends. A Mac's tier is its installed RAM in whole GB. Below a pack's tier it reads `may stream (--ssd-budget-gb)`:

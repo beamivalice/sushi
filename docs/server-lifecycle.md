@@ -124,6 +124,11 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`) by
   name (`ArchitectureUnsupported` → 503). A checkpoint in an unsupported file format is refused by name
   (`ModelFormatUnsupported` → 503; `--model` exits).
+- The pack-revision check is the first thing `loadWeightsForConfig` does after the arch gate, for every arch: a config
+  that names `pack_revision` and a shard (MTP shards included) that carries another revision or none is refused
+  `PackRevisionMixed` (503 `pack_revision_mixed`; the log names each file) before any weight bytes load
+  ([pack-format](pack-format.md#pack-revision)). `sushi pull` ([usage](usage.md)) compares checksums, not sizes
+  (`src/hf_pull.zig`); the HF address is built in one place, `hf_pull.hfUrl`, over `hf_pull.endpoint()`.
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`: streaming index > MiMo source trunk > vision >
   plain). A second site builds a model the server never serves — a MiMo pack read without its source trunk binds the
   raw FP8 fused QKV and its logits stop following the routed experts.

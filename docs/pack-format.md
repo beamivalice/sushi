@@ -273,6 +273,32 @@ the three linears may be stored; the rest stay bf16. The original checkpoint
 engine quantizes nothing at load: a `config.json` `trunk_quant` block is
 `UnsupportedMimoV2Config`.
 
+<a id="pack-revision"></a>
+## Pack revision
+
+A pack that is re-uploaded under the same name carries a revision, so a folder that mixes two uploads (files of one
+revision beside files of another, which `sushi pull` once left when a file kept its size) is refused instead of served.
+
+- `config.json`, top level: `"pack_revision": {"id": "2.0", "unstamped": ["engram-model-00047-of-00048.safetensors"]}`.
+  `id` is a non-empty string. `unstamped` is optional (default empty): shard names, or paths relative to the pack folder
+  (`mtp/x.safetensors`), admitted whatever their header says (files copied byte-identical from the source checkout,
+  identical across revisions).
+- Every other `.safetensors` shard carries `__metadata__["pack_revision"] = "<id>"` in its header.
+- **Load rule** (`pack_stamp.zig`, run first in `model.loadWeightsForConfig`, headers only, every arch): a config
+  without `pack_revision` is a legacy pack and loads as before. With it, every shard the loader reads (the index's files,
+  MTP files included; with no usable index, every `.safetensors` one folder deep) must carry the stamp, except the
+  `unstamped` names. Another revision or no stamp is `PackRevisionMixed` (503 `pack_revision_mixed`; `--model` exits),
+  and the log names each file: `model-trunk-03.safetensors is pack revision 1.0 (unstamped), the pack is 2.0: the folder
+  mixes two revisions; run `sushi pull <name>` again or re-download it`. An unstamped shard reads as revision 1.0.
+- `/v1/models` loaded rows carry `meta.pack_revision` and `/props` carries `pack_revision`: the id, or `null` for a pack
+  that names none.
+- `sushi pull` leaves `.sushi-pull.json` in the folder (not a pack file; discovery ignores it) so the next pull compares
+  contents ([usage](usage.md#sushi-pull-and-sushi-list)).
+
+Writer side (stamping shards, `sushi repack --pack-revision`): see the writer paragraph below.
+
+<!-- WRITER-SIDE SLOT: the merge puts the paragraph on how packs are stamped (sushi repack --pack-revision, sashimi, the encoder) here. -->
+
 ## The shard stamp
 
 Each written shard carries a safetensors `__metadata__` map — every value a

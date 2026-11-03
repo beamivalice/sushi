@@ -1278,7 +1278,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable, PackRevisionMixed } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
@@ -1310,6 +1310,7 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "Exl3CodebookTableRateMissing")) return error.Exl3CodebookTableRateMissing;
             if (std.mem.eql(u8, n, "Exl3CodebookTableLegacyConfig")) return error.Exl3CodebookTableLegacyConfig;
             if (std.mem.eql(u8, n, "Exl3CodebookTableUndecodable")) return error.Exl3CodebookTableUndecodable;
+            if (std.mem.eql(u8, n, "PackRevisionMixed")) return error.PackRevisionMixed;
         }
         return error.LoadFailed;
     }
@@ -1338,6 +1339,7 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.Exl3ShardStampMismatch, loadErrorFromName("Exl3ShardStampMismatch"));
         try std.testing.expectEqual(error.Exl3TileOrderUnsupported, loadErrorFromName("Exl3TileOrderUnsupported"));
         try std.testing.expectEqual(error.Exl3TileOrderMixed, loadErrorFromName("Exl3TileOrderMixed"));
+        try std.testing.expectEqual(error.PackRevisionMixed, loadErrorFromName("PackRevisionMixed"));
         try std.testing.expectEqual(error.Exl3TileOrderMismatch, loadErrorFromName("Exl3TileOrderMismatch"));
         try std.testing.expectEqual(error.Exl3TileOrderNeedsGroups, loadErrorFromName("Exl3TileOrderNeedsGroups"));
         try std.testing.expectEqual(error.Exl3CodebookTableUnknown, loadErrorFromName("Exl3CodebookTableUnknown"));

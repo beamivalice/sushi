@@ -42,6 +42,8 @@ test {
     _ = @import("repl_input.zig");
     _ = @import("repl_tools.zig");
     _ = @import("update.zig");
+    _ = @import("pack_stamp.zig");
+    _ = @import("hf_pull.zig");
     _ = @import("ws.zig");
     _ = @import("gpu_clock.zig");
     _ = @import("gpu_clock_live.zig");

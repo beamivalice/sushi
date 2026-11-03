@@ -393,6 +393,8 @@ pub fn renderModelEntry(
         defer allocator.free(gen_top_p_str);
         const gen_top_k_str = try optSamplingRecJson(allocator, u32, config.gen_top_k);
         defer allocator.free(gen_top_k_str);
+        const pack_revision_str = try packRevisionJson(allocator, config);
+        defer allocator.free(pack_revision_str);
 
         var streaming_buf: [96]u8 = undefined;
         const streaming_part = streamingRowPart(
@@ -403,7 +405,7 @@ pub fn renderModelEntry(
         );
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":{f},"object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"bytes_linked":{d},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":{f},"engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{f},"context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{f},"object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"bytes_linked":{d},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":{f},"engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{f},"context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s},"pack_revision":{s}}}}}
         , .{
             json_text.Str{ .s = model_id },
             nowSecs(io),
@@ -440,6 +442,7 @@ pub fn renderModelEntry(
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
+            pack_revision_str,
         });
     }
 
@@ -851,6 +854,26 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
     });
 }
 
+/// The pack's revision as a JSON value: its id, or null for a legacy pack that names none.
+fn packRevisionJson(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
+    const rev = config.pack_revision orelse return allocator.dupe(u8, "null");
+    return std.fmt.allocPrint(allocator, "{f}", .{json_text.Str{ .s = rev.id }});
+}
+
+test "packRevisionJson is the id, or null for a legacy pack" {
+    const stamped_json = try std.mem.concat(testing.allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\"},", model_mod.QWEN4_YARN[1..] });
+    defer testing.allocator.free(stamped_json);
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, stamped_json);
+    defer cfg.deinit(testing.allocator);
+    const stamped = try packRevisionJson(testing.allocator, &cfg);
+    defer testing.allocator.free(stamped);
+    try testing.expectEqualStrings("\"2.0\"", stamped);
+    const legacy_cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    const legacy = try packRevisionJson(testing.allocator, &legacy_cfg);
+    defer testing.allocator.free(legacy);
+    try testing.expectEqualStrings("null", legacy);
+}
+
 pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
     const config = lm.config.?;
     const ctx_len = getEffectiveContextLength(config);
@@ -886,7 +909,9 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(update_json);
     const fallbacks_json = try templateFallbacksPropsJson(allocator, chat_mod.template_fallbacks.load(.monotonic));
     defer allocator.free(fallbacks_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ngram_json, batching_json, settings_json, update_json, fallbacks_json });
+    const revision_json = try packRevisionJson(allocator, config);
+    defer allocator.free(revision_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"pack_revision\":{s}", .{ ngram_json, batching_json, settings_json, update_json, fallbacks_json, revision_json });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (server.global_scheduler) |sch|

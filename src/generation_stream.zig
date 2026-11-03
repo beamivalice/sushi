@@ -1993,6 +1993,7 @@ test "every load refusal the registry preserves answers under its own name" {
         "Exl3CodebookTableRateMissing",
         "Exl3CodebookTableLegacyConfig",
         "Exl3CodebookTableUndecodable",
+        "PackRevisionMixed",
     };
     for (names) |name| {
         const refusal = loadRefusalFor(model_registry_mod.ModelRegistry.loadErrorFromName(name)) orelse {
@@ -2010,6 +2011,7 @@ test "every load refusal the registry preserves answers under its own name" {
     try t.expectEqualStrings("exl3_topk_exceeds_reduce_bank", loadRefusalFor(error.Exl3TopKExceedsReduceBank).?.type);
     try t.expectEqualStrings("exl3_trellis_geometry", loadRefusalFor(error.Exl3TrellisGeometry).?.type);
     try t.expectEqualStrings("exl3_window_unsupported", loadRefusalFor(error.Exl3WindowUnsupported).?.type);
+    try t.expectEqualStrings("pack_revision_mixed", loadRefusalFor(error.PackRevisionMixed).?.type);
     try t.expectEqualStrings("exl3_shard_stamp_mismatch", loadRefusalFor(error.Exl3ShardStampMismatch).?.type);
     try t.expectEqualStrings("exl3_codebook_table_unknown", loadRefusalFor(error.Exl3CodebookTableUnknown).?.type);
     try t.expectEqualStrings("exl3_codebook_table_digest_mismatch", loadRefusalFor(error.Exl3CodebookTableDigestMismatch).?.type);
@@ -2065,6 +2067,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3TileOrderMixed => .{ .type = "exl3_tile_order_mixed", .message = "This pack stores some routed trellis tensors as trellis and some as trellis_pm. Re-convert the pack." },
         error.Exl3TileOrderMismatch => .{ .type = "exl3_tile_order_mismatch", .message = "This pack's routed trellis tensor names do not match the tile_order its config.json names. Re-convert the pack, or fix expert_quant to match." },
         error.Exl3TileOrderNeedsGroups => .{ .type = "exl3_tile_order_needs_groups", .message = "A pair_major pack stores every routed layer as rate groups (gN); this layer is not." },
+        error.PackRevisionMixed => .{ .type = "pack_revision_mixed", .message = "This pack folder mixes shards of two pack revisions, or has an unstamped shard in a stamped pack; the server log names the files. Run `sushi pull <name>` again or re-download the pack." },
         error.Exl3ShardStampMismatch => .{ .type = "exl3_shard_stamp_mismatch", .message = "An EXL3 shard in this pack was written for a different decoder than config.json's expert_quant names (k, codebook or window). Re-convert the pack, or fix expert_quant to match the shards." },
         error.Exl3CodebookTableUnknown => .{ .type = "exl3_codebook_table_unknown", .message = "This STQ pack names no codebook table this build holds: expert_quant.codebook_table must be one of std1, spec1-w15, spec1-w16 or pair1-w16-v1. A pack that names no table is reconverted." },
         error.Exl3CodebookTableDigestMismatch => .{ .type = "exl3_codebook_table_digest_mismatch", .message = "This STQ pack's expert_quant.codebook_digest is not its codebook table's digest in this build. Re-convert the pack." },

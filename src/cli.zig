@@ -26,6 +26,7 @@ const status = @import("status.zig");
 const repl_tools = @import("repl_tools.zig");
 const repl_input = @import("repl_input.zig");
 const update = @import("update.zig");
+const hf_pull = @import("hf_pull.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -300,52 +301,9 @@ fn homeDir() []const u8 {
 
 // ── HF tree listing ─────────────────────────────────────────────────────
 
-pub const RepoFile = struct {
-    path: []u8,
-    size: u64,
-};
-
-pub fn freeRepoFiles(allocator: std.mem.Allocator, files: []RepoFile) void {
-    for (files) |f| allocator.free(f.path);
-    allocator.free(files);
-}
-
-/// Parse the HF `/api/models/<repo>/tree/main?recursive=true` JSON array.
-/// LFS entries report the real artifact size under `lfs.size`.
-pub fn parseTreeJson(allocator: std.mem.Allocator, json: []const u8) ![]RepoFile {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.InvalidTree;
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidTree;
-
-    var files = std.ArrayList(RepoFile).empty;
-    errdefer {
-        for (files.items) |f| allocator.free(f.path);
-        files.deinit(allocator);
-    }
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const obj = item.object;
-        const t = obj.get("type") orelse continue;
-        if (t != .string or !std.mem.eql(u8, t.string, "file")) continue;
-        const p = obj.get("path") orelse continue;
-        if (p != .string) continue;
-        var size: u64 = 0;
-        if (obj.get("lfs")) |lfs| {
-            if (lfs == .object) {
-                if (lfs.object.get("size")) |s| {
-                    if (s == .integer and s.integer > 0) size = @intCast(s.integer);
-                }
-            }
-        }
-        if (size == 0) {
-            if (obj.get("size")) |s| {
-                if (s == .integer and s.integer > 0) size = @intCast(s.integer);
-            }
-        }
-        try files.append(allocator, .{ .path = try allocator.dupe(u8, p.string), .size = size });
-    }
-    return files.toOwnedSlice(allocator);
-}
+pub const RepoFile = hf_pull.RepoFile;
+pub const freeRepoFiles = hf_pull.freeRepoFiles;
+pub const parseTreeJson = hf_pull.parseTreeJson;
 
 /// Chat-default file selection (mirrors the app's `FileSelection.chatDefault`):
 /// top-level files + the `mtp/` spec-decode sidecar + GLM's DFlash2 assistant
@@ -536,7 +494,9 @@ fn curlFetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
 /// Download one file to `<dest_dir>/<file>` via curl (`-C -` resume onto a
 /// .partial, atomic rename on success). `show_progress` inherits stderr so
 /// the terminal gets curl's progress bar; the server-side pull passes false.
-fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, show_progress: bool) !void {
+/// With `expect`, the partial's content id must match before it is renamed into place, else it is deleted
+/// and the error is `DownloadCorrupt`.
+fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, show_progress: bool, expect: ?hf_pull.RepoFile) !void {
     const partial = try std.fmt.allocPrint(allocator, "{s}.partial", .{dest_path});
     defer allocator.free(partial);
 
@@ -564,6 +524,10 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
         .exited => |code| if (code != 0) return error.DownloadFailed,
         else => return error.DownloadFailed,
     }
+    if (expect) |e| if (e.oid.len > 0 and !hf_pull.digestMatches(io, partial, e)) {
+        std.Io.Dir.cwd().deleteFile(io, partial) catch {};
+        return error.DownloadCorrupt;
+    };
     std.Io.Dir.renameAbsolute(partial, dest_path, io) catch return error.DownloadFailed;
 }
 
@@ -633,11 +597,13 @@ fn setPullMarker(io: std.Io, dest_dir: []const u8, on: bool) !void {
     }
 }
 
-/// Download `resolved.repo` into `dest_dir`. Skips files already complete
-/// on disk (size match), resumes partials, reports per-file progress.
+/// Download `resolved.repo` into `dest_dir`. A file already on disk is kept only when its content id matches the
+/// listing (the manifest of the last pull, or a one-time hash of a folder without one); partials resume, and every
+/// download is verified before it is renamed into place. Reports per-file progress.
 pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, dest_dir: []const u8, reporter: Reporter, show_progress: bool) !void {
     reporter.say("pulling manifest for {s}", .{resolved.repo});
-    const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
+    const base = hf_pull.endpoint();
+    const tree_url = try hf_pull.hfUrl(allocator, base, "/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
     defer allocator.free(tree_url);
     const tree_json = curlFetch(allocator, io, tree_url) catch |err| {
         if (err == error.NotFound) {
@@ -654,13 +620,15 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
-    var wanted: usize = 0;
+    var wanted_files = std.ArrayList(hf_pull.RepoFile).empty;
+    defer wanted_files.deinit(allocator);
     var total_bytes: u64 = 0;
     for (files) |f| {
         if (!wantedFile(f.path)) continue;
-        wanted += 1;
+        try wanted_files.append(allocator, f);
         total_bytes += f.size;
     }
+    const wanted = wanted_files.items.len;
     if (wanted == 0) {
         reporter.say("error: {s} has no downloadable model files", .{resolved.repo});
         return error.PullFailed;
@@ -671,33 +639,87 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         return error.PullFailed;
     };
 
-    var idx: usize = 0;
-    for (files) |f| {
-        if (!wantedFile(f.path)) continue;
-        idx += 1;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const old = hf_pull.readManifest(arena_state.allocator(), io, dest_dir);
+    const actions = try allocator.alloc(hf_pull.Action, wanted);
+    defer allocator.free(actions);
+    var to_hash = std.ArrayList(hf_pull.RepoFile).empty;
+    defer to_hash.deinit(allocator);
+    var hash_slot = std.ArrayList(usize).empty;
+    defer hash_slot.deinit(allocator);
+    for (wanted_files.items, actions, 0..) |f, *act, i| {
+        const prior: ?hf_pull.RepoFile = if (old) |m| m.find(f.path) else null;
+        act.* = hf_pull.decide(f, prior, old != null, fileSizeAt(io, dest_dir, f.path));
+        if (act.* == .hash) {
+            try to_hash.append(allocator, f);
+            try hash_slot.append(allocator, i);
+        }
+    }
+    if (to_hash.items.len > 0) {
+        reporter.say("checking {d} files already on disk…", .{to_hash.items.len});
+        const match = try allocator.alloc(bool, to_hash.items.len);
+        defer allocator.free(match);
+        hf_pull.hashMatches(io, dest_dir, to_hash.items, match);
+        for (match, hash_slot.items) |ok, i| actions[i] = if (ok) .skip else .download;
+    }
+    // Files are replaced from here on: a manifest left behind would vouch for bytes that are about to change.
+    hf_pull.removeManifest(io, dest_dir);
+
+    for (wanted_files.items, actions, 1..) |f, act, idx| {
+        if (act == .skip) {
+            reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, f.path });
+            continue;
+        }
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
         defer allocator.free(dest_path);
-        if (f.size > 0) {
-            if (fileSizeAt(io, dest_dir, f.path)) |have| {
-                if (have == f.size) {
-                    reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, f.path });
-                    continue;
-                }
-            }
-        }
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
+        const url = try hf_pull.hfUrl(allocator, base, "/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
         defer allocator.free(url);
-        curlDownload(allocator, io, url, dest_path, show_progress) catch {
-            reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
+        const had_partial = fileSizeAt(io, dest_dir, try std.fmt.allocPrint(arena_state.allocator(), "{s}.partial", .{f.path})) != null;
+        curlDownload(allocator, io, url, dest_path, show_progress, f) catch |err| {
+            // A resumed partial may belong to an older revision of the file: once more, from the start.
+            if (err == error.DownloadCorrupt and had_partial) {
+                if (curlDownload(allocator, io, url, dest_path, show_progress, f)) |_| continue else |_| {}
+            }
+            if (err == error.DownloadCorrupt) {
+                reporter.say("error: {s} does not match its Hugging Face checksum (partial deleted — rerun to download it again)", .{f.path});
+            } else {
+                reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
+            }
             return error.PullFailed;
         };
     }
+
+    if (old) |m| {
+        const gone = hf_pull.removeDropped(io, dest_dir, m, files);
+        if (gone > 0) reporter.say("removed {d} files the repo no longer has", .{gone});
+    }
+    const commit = repoCommit(allocator, io, base, resolved.repo);
+    defer if (commit) |c| allocator.free(c);
+    hf_pull.writeManifest(allocator, io, dest_dir, .{ .repo = resolved.repo, .commit = commit orelse "", .files = wanted_files.items }) catch {
+        reporter.say("error: cannot write {s}/{s}", .{ dest_dir, hf_pull.manifest_name });
+        return error.PullFailed;
+    };
     setPullMarker(io, dest_dir, false) catch {
         reporter.say("error: cannot finish {s}: remove {s}/{s} by hand", .{ resolved.repo, dest_dir, pull_marker });
         return error.PullFailed;
     };
     reporter.say("success: {s} ready", .{resolved.repo});
+}
+
+/// The commit the repo's main branch is at, or null when the API does not say.
+fn repoCommit(allocator: std.mem.Allocator, io: std.Io, base: []const u8, repo: []const u8) ?[]u8 {
+    const url = hf_pull.hfUrl(allocator, base, "/api/models/{s}", .{repo}) catch return null;
+    defer allocator.free(url);
+    const got = curlFetch(allocator, io, url) catch return null;
+    defer allocator.free(got);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, got, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const sha = parsed.value.object.get("sha") orelse return null;
+    if (sha != .string) return null;
+    return allocator.dupe(u8, sha.string) catch null;
 }
 
 fn wantedFile(path: []const u8) bool {
@@ -849,7 +871,7 @@ pub const offline_note = "note: could not reach huggingface.co; showing the loca
 
 fn fetchSizeViaCurl(ctx: *anyopaque, repo: []const u8) FetchOutcome {
     const env: *const ListEnv = @ptrCast(@alignCast(ctx));
-    const url = std.fmt.allocPrint(env.allocator, "https://huggingface.co/api/models/{s}?blobs=true", .{repo}) catch return .offline;
+    const url = hf_pull.hfUrl(env.allocator, hf_pull.endpoint(), "/api/models/{s}?blobs=true", .{repo}) catch return .offline;
     defer env.allocator.free(url);
     const got = curlGet(env.allocator, env.io, url, true) catch return .offline;
     defer env.allocator.free(got.body);

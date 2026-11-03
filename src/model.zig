@@ -36,6 +36,7 @@ const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
 const dsv41_config = @import("dsv41/dsv41_config.zig");
 const expert_io = @import("expert_io.zig");
+const pack_revision_mod = @import("pack_stamp.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
 const tokenizer_mod = @import("tokenizer.zig");
@@ -291,6 +292,8 @@ pub const ModelConfig = struct {
     /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the
     /// config does.
     ngram_table_path: ?[]const u8 = null,
+    /// config.json's `pack_revision`; null for a legacy pack (docs/pack-format.md#pack-revision).
+    pack_revision: ?pack_revision_mod.Revision = null,
 
     // Per-layer Q-head count (MiMo: sliding layers differ from global ones).
     // 0 = uniform num_attention_heads.
@@ -1123,6 +1126,8 @@ pub const ModelConfig = struct {
         self.expert_source_dir = null;
         if (self.ngram_bf16_dir) |p| allocator.free(p);
         self.ngram_bf16_dir = null;
+        if (self.pack_revision) |*r| r.deinit(allocator);
+        self.pack_revision = null;
     }
 };
 
@@ -1475,6 +1480,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     const model_type = if (cfgField(root, "model_type")) |v| try cfgString(v) else "";
 
     // Determine which object to read config from: text_config (nested) or root (flat)
+    config.pack_revision = try pack_revision_mod.fromConfig(allocator, root);
+    errdefer if (config.pack_revision) |*r| r.deinit(allocator);
+
     const cfg_obj = if (cfgField(root, "text_config")) |tc_val| try cfgObject(tc_val) else root;
 
     // Parse common fields
@@ -2113,6 +2121,7 @@ pub fn loadWeightsForConfig(
     load_vision: bool,
 ) !Weights {
     try archGate(config);
+    if (config.pack_revision) |rev| try pack_revision_mod.verify(io, allocator, model_dir, rev);
     if (config.isDsv41()) return loadWeightsDsv41(io, allocator, model_dir, config, load_vision);
     if (config.expert_layout == .exl3_k4) try @import("mimo2/mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
@@ -3798,6 +3807,22 @@ test "a non-ringing sliding arch keeps the uniform KV bill" {
     const q = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
     try testing.expectEqual(@as(u64, 0), q.swaRingTokens());
     try testing.expectEqual(@as(u64, 24_576), q.kvBytesPerToken());
+}
+
+test "the loader refuses a mixed-revision pack by name before reading any weight" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model-1.safetensors", .data = "\x02\x00\x00\x00\x00\x00\x00\x00{}" });
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &path);
+    const legacy = try parseConfigFromJson(std.testing.allocator, QWEN4_YARN);
+    try std.testing.expect(legacy.pack_revision == null);
+    const stamped_json = try std.mem.concat(std.testing.allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\"},", QWEN4_YARN[1..] });
+    defer std.testing.allocator.free(stamped_json);
+    var cfg = try parseConfigFromJson(std.testing.allocator, stamped_json);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("2.0", cfg.pack_revision.?.id);
+    try std.testing.expectError(error.PackRevisionMixed, loadWeightsForConfig(std.testing.io, std.testing.allocator, path[0..n], &cfg, false));
 }
 
 test "the loader refuses a model_type this build does not serve, by name, before reading the checkpoint" {
