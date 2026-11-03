@@ -747,6 +747,7 @@ pub fn serveOneForTest(request: []const u8) ![]u8 {
     const a = std.testing.allocator;
     const reg = try ModelRegistry.init(a, std.testing.io, null, 1, 0, null);
     defer reg.deinit();
+    reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
     const prev_registry = server_mod.global_registry;
     defer server_mod.global_registry = prev_registry;
     server_mod.global_registry = reg;

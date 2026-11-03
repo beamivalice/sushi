@@ -596,6 +596,9 @@ pub const ModelRegistry = struct {
     /// API works uniformly.
     discovery: ?model_discovery.DiscoveryResult,
 
+    /// The settings file `rescan` reads; null is `~/.sushi/model-settings.json`. Borrowed.
+    settings_path: ?[]const u8 = null,
+
     /// Map of id → entry. Keys are borrowed from `LoadedModel.id`; entries
     /// are heap-allocated and owned by the registry. Iteration order isn't
     /// guaranteed; snapshot sorts by `last_used_ns` desc for stable output.
@@ -864,7 +867,7 @@ pub const ModelRegistry = struct {
     /// settings-file models directory rescans nothing.
     pub fn rescan(self: *ModelRegistry) !u32 {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        return self.rescanWithSettings(model_settings.defaultPath(&path_buf));
+        return self.rescanWithSettings(self.settings_path orelse model_settings.defaultPath(&path_buf));
     }
 
     /// `rescan` reading the settings file at `settings_path`.
@@ -2305,6 +2308,30 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
     try testing.expectEqual(@as(u32, 0), try reg.rescanWithSettings(no_settings));
     try testing.expect(reg.peek("org/first") != null);
+}
+
+test "ModelRegistry: rescan reads the settings file the registry names instead of the home one" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "models/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/org/m/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/org/m/model.safetensors", .data = "0123" });
+    const settings_json = try std.fmt.allocPrint(testing.allocator, "{{\"server\":{{\"models_dir\":\"{s}/models\"}}}}", .{root});
+    defer testing.allocator.free(settings_json);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = settings_json });
+    const settings = try std.fmt.allocPrint(testing.allocator, "{s}/model-settings.json", .{root});
+    defer testing.allocator.free(settings);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    reg.settings_path = settings;
+    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    try testing.expect(reg.peek("org/m") != null);
+    reg.settings_path = no_settings;
+    try testing.expectEqual(@as(u32, 0), try reg.rescan());
 }
 
 test "ModelRegistry: rescan under a models root never absorbs test-fixtures or dot folders" {

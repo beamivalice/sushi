@@ -863,7 +863,9 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
 
     var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
-    if (@import("model.zig").parseConfigFromJson(allocator, bytes)) |cfg| {
+    if (@import("model.zig").parseConfigFromJson(allocator, bytes)) |parsed| {
+        var cfg = parsed;
+        defer cfg.deinit(allocator);
         meta.context_cap = cfg.contextCap();
     } else |_| {}
     if (dir.openFile(io, "generation_config.json", .{})) |gen| {
@@ -1529,6 +1531,24 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
         \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}
     });
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+}
+
+test "readStubMeta frees the config it parses for the context cap, pack revision included" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    const glm = @embedFile("fixtures/glm5_config.json");
+    const stamped = try std.mem.concat(allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\",\"unstamped\":[\"engram-a.safetensors\",\"engram-b.safetensors\"]},", glm[std.mem.indexOfScalar(u8, glm, '{').? + 1 ..] });
+    defer allocator.free(stamped);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = stamped });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});
+    defer allocator.free(model_dir);
+
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).context_cap > 0);
 }
 
 test "discovery skips a config.json whose root is not an object and drops a size past u32" {
