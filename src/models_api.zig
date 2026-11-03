@@ -26,6 +26,7 @@ const nowSecs = io_util.nowSecs;
 const testing = std.testing;
 const server = @import("server.zig");
 const json_text = @import("json_text.zig");
+const disk_placement = @import("disk_placement.zig");
 const http_conn = @import("http_conn.zig");
 const request_policy = @import("request_policy.zig");
 const Conn = http_conn.Conn;
@@ -760,6 +761,7 @@ const PropsSettings = struct {
     prefix_cache_disk_entries: u64 = 0,
     /// Bytes the tier has written since its model loaded.
     prefix_cache_disk_written_bytes: u64 = 0,
+    prefix_cache_volume_json: []const u8 = "",
     prefix_cache_ram_enabled: bool = true,
     /// The byte figures are a streamed load's (0 resident or off).
     vision: struct { loaded: bool = false, source: []const u8 = "default", tower_bytes: u64 = 0, encode_bytes: u64 = 0 } = .{},
@@ -840,7 +842,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
     };
     const vision = try std.fmt.allocPrint(allocator, "{{\"loaded\":{},\"source\":{f},\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, json_text.Str{ .s = st.vision.source }, st.vision.tower_bytes, st.vision.encode_bytes });
     defer allocator.free(vision);
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"acceptance_source\":{f},\"acceptance\":{f},\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":{f},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"acceptance_source\":{f},\"acceptance\":{f},\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":{f},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}{s}}},\"vision\":{s}}}", .{
         js(build_options.version),                          js(st.engine),
         js(st.kv_quant),                                    js(st.kv_cache.label()),
         js(st.kv_cache.sourceName()),
@@ -856,6 +858,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         st.prefix_cache_ram_enabled,                        st.prefix_cache_mem_bytes,
         st.prefix_cache_disk_bytes,                         st.prefix_cache_disk_used_bytes,
         st.prefix_cache_disk_written_bytes,                 st.prefix_cache_disk_entries,
+        st.prefix_cache_volume_json,
         vision,
     });
 }
@@ -909,7 +912,20 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(ngram_json);
     const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm), if (lm.config) |c| slot_admission.batchGroupCap(c) else slot_admission.MAX_BATCH_GROUP);
     defer allocator.free(batching_json);
-    const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
+    const volume = try disk_placement.cacheVolume(allocator);
+    defer volume.deinit(allocator);
+    const name_json = if (volume.name) |name| try std.fmt.allocPrint(allocator, "{f}", .{js(name)}) else try allocator.dupe(u8, "null");
+    defer allocator.free(name_json);
+    const space_json = if (volume.space) |space|
+        try std.fmt.allocPrint(allocator, "\"free_bytes\":{d},\"total_bytes\":{d}", .{ space.free, space.total })
+    else
+        try allocator.dupe(u8, "\"free_bytes\":null,\"total_bytes\":null");
+    defer allocator.free(space_json);
+    const volume_json = try std.fmt.allocPrint(allocator, ",\"volume\":{{\"name\":{s},\"path\":{f},{s}}}", .{ name_json, js(volume.path), space_json });
+    defer allocator.free(volume_json);
+    var settings = propsSettingsFor(lm);
+    settings.prefix_cache_volume_json = volume_json;
+    const settings_json = try settingsPropsJson(allocator, settings);
     defer allocator.free(settings_json);
     const update_json = try update_mod.propsJson(allocator);
     defer allocator.free(update_json);

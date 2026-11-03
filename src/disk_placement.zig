@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -117,13 +118,75 @@ const DarwinStatfs = extern struct {
     f_bavail: u64,
     f_files: u64,
     f_ffree: u64,
-    tail: [4096]u8,
+    f_fsid: [2]i32,
+    f_owner: u32,
+    f_type: u32,
+    f_flags: u32,
+    f_fssubtype: u32,
+    f_fstypename: [16]u8,
+    f_mntonname: [1024]u8,
+    tail: [3072]u8,
 };
 extern "c" fn statfs(path: [*:0]const u8, buf: *DarwinStatfs) c_int;
 
 extern fn sushi_volume_free_for_use(path: [*:0]const u8) u64;
 
 pub const VolumeSpace = struct { free: u64, total: u64 };
+
+pub const CacheVolume = struct {
+    path: []u8,
+    name: ?[]u8 = null,
+    space: ?VolumeSpace = null,
+
+    pub fn deinit(self: CacheVolume, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.name) |name| allocator.free(name);
+    }
+};
+
+/// Probe on the HTTP connection thread. An explicit missing destination is unavailable,
+/// rather than silently naming the filesystem of its existing parent.
+pub fn cacheVolume(allocator: std.mem.Allocator) !CacheVolume {
+    const base = try defaultBaseDir(allocator);
+    defer allocator.free(base);
+    const explicit = if (std.c.getenv("SUSHI_PREFIX_CACHE_DIR")) |p| std.mem.span(p).len > 0 else false;
+    var candidate: []const u8 = base;
+    var resolved: [std.fs.max_path_bytes]u8 = undefined;
+    var real: ?[]const u8 = null;
+    while (true) {
+        var input: [std.fs.max_path_bytes:0]u8 = undefined;
+        if (candidate.len >= input.len) break;
+        @memcpy(input[0..candidate.len], candidate);
+        input[candidate.len] = 0;
+        if (std.c.realpath(&input, &resolved)) |p| {
+            real = std.mem.span(p);
+            break;
+        }
+        if (explicit) break;
+        candidate = std.fs.path.dirname(candidate) orelse break;
+    }
+    const display_path = if (real) |path|
+        if (candidate.len == base.len) try allocator.dupe(u8, path) else try std.fmt.allocPrint(allocator, "{s}{s}", .{ path, base[candidate.len..] })
+    else
+        try allocator.dupe(u8, base);
+    var out: CacheVolume = .{ .path = display_path };
+    errdefer out.deinit(allocator);
+    const path = real orelse return out;
+    out.space = volumeSpace(path) orelse return out;
+    if (builtin.os.tag == .macos) {
+        var input: [std.fs.max_path_bytes:0]u8 = undefined;
+        @memcpy(input[0..path.len], path);
+        input[path.len] = 0;
+        var st: DarwinStatfs = undefined;
+        if (statfs(input[0..path.len :0].ptr, &st) != 0) {
+            out.space = null;
+            return out;
+        }
+        const mount = std.mem.sliceTo(&st.f_mntonname, 0);
+        out.name = try allocator.dupe(u8, if (std.mem.eql(u8, mount, "/")) "/" else std.fs.path.basename(mount));
+    }
+    return out;
+}
 
 /// Free and total bytes of the volume holding `path`, or null when the query fails or returns
 /// implausible numbers (the plausibility check is the ABI guard).
@@ -865,6 +928,13 @@ test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
     try testing.expect(vs.total > 0);
     try testing.expect(vs.free <= vs.total);
     try testing.expect(vs.total > 1024 * 1024 * 1024); // a macOS root volume
+}
+
+test "cache volume: statfs names the filesystem mounted at root" {
+    if (builtin.os.tag != .macos) return;
+    var st: DarwinStatfs = undefined;
+    try testing.expectEqual(@as(c_int, 0), statfs("/", &st));
+    try testing.expectEqualStrings("/", std.mem.sliceTo(&st.f_mntonname, 0));
 }
 
 test "volumeSpace: free is what the OS grants, never statfs' f_bavail" {

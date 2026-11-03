@@ -456,6 +456,11 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 <a id="write-counters"></a>
 ## Write counters
 
+The SSD cache dashboard reads `settings.prefix_cache.volume` from `/props` on the HTTP connection thread. The probe
+resolves the cache base path before reading filesystem space and the macOS mount point; a missing explicit destination
+or failed lookup is shown as unavailable. The tile keeps the volume visible while idle, with warnings below 10% free
+and at the 4 GiB reserve. This reports the current destination; it does not stop a later mount change before a write.
+
 Cumulative bytes the SSD tier wrote to the filesystem, by file kind (`src/disk_write_stats.zig`): one `Stats` per tier
 (`/props` per model) chained into the process total (`/metrics`, `/metrics.json`; [server-http-apis](server-http-apis.md)).
 They count what the filesystem accepted, never what was submitted, and run from process start whatever turns `--metrics` on.

@@ -232,6 +232,8 @@ pub fn renderList(
     allocator: std.mem.Allocator,
     root: []const u8,
     volume: ?disk_placement.VolumeSpace,
+    volume_name: ?[]const u8,
+    volume_path: []const u8,
     namespaces: []const Namespace,
     loaded: []const Loaded,
     live_elsewhere: []const bool,
@@ -242,7 +244,13 @@ pub fn renderList(
     const esc_root = try server.jsonEscape(allocator, root);
     defer allocator.free(esc_root);
     try w.print("{{\"root\":{s},\"volume\":", .{esc_root});
-    if (volume) |v| try w.print("{{\"free_bytes\":{d},\"total_bytes\":{d}}}", .{ v.free, v.total }) else try w.writeAll("null");
+    if (volume) |v| {
+        const esc_name = if (volume_name) |name| try server.jsonEscape(allocator, name) else try allocator.dupe(u8, "null");
+        defer allocator.free(esc_name);
+        const esc_path = try server.jsonEscape(allocator, volume_path);
+        defer allocator.free(esc_path);
+        try w.print("{{\"name\":{s},\"path\":{s},\"free_bytes\":{d},\"total_bytes\":{d}}}", .{ esc_name, esc_path, v.free, v.total });
+    } else try w.writeAll("null");
     var total: u64 = 0;
     for (namespaces) |n| total +|= n.bytes;
     try w.print(",\"total_bytes\":{d},\"namespaces\":[", .{total});
@@ -294,7 +302,9 @@ pub fn handleList(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
         const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, nb }) catch continue;
         o.* = disk_placement.namespaceIsLive(stream.io, path);
     }
-    const body = try renderList(allocator, root, disk_placement.volumeSpaceNear(root), namespaces, loaded, other);
+    const volume_info = try disk_placement.cacheVolume(allocator);
+    defer volume_info.deinit(allocator);
+    const body = try renderList(allocator, root, volume_info.space, volume_info.name, volume_info.path, namespaces, loaded, other);
     defer allocator.free(body);
     try server.sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -637,7 +647,7 @@ test "prefix cache admin: renderList: a loaded model's namespace carries its tie
     const ns = [_]Namespace{ .{ .id = 0xa1, .bytes = 10, .entries = 1, .newest_ns = 5 * std.time.ns_per_s }, .{ .id = 0xb2, .bytes = 20 }, .{ .id = 0xc3 } };
     var entry: model_registry_mod.LoadedModel = undefined;
     const loaded = [_]Loaded{.{ .id = "m", .entry = &entry, .snap = .{ .budget = 100, .used = 10, .entries = 1, .written = 77, .namespace = 0xa1 } }};
-    const body = try renderList(testing.allocator, "/cache", .{ .free = 9, .total = 99 }, &ns, &loaded, &.{ false, false, true });
+    const body = try renderList(testing.allocator, "/cache", .{ .free = 9, .total = 99 }, "test-volume", "/cache", &ns, &loaded, &.{ false, false, true });
     defer testing.allocator.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
