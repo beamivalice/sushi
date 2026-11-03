@@ -215,6 +215,7 @@ Existing tools:
 | `tests/lib/sushi_test.py` | Tier lib. The Python twin of `boot.sh`'s attach helpers: `SUSHI_URL`, `SUSHI_LOG`, the nonce, the log slice, `require`; exit 3 is SKIP. |
 | `tests/lib/stream_keepalive_probe.py` | Tier lib. The raw-socket probe of `test_stream_keepalive.sh`: one streaming surface, a tool call big enough to buffer for seconds, the gap between successive byte arrivals (exit 0 pass, 1 fail, 2 skip). |
 | `tests/private_cache.sh` | Tier lib. Sourced by scripts that boot a server without the helper: gives the boot a private `SUSHI_PREFIX_CACHE_DIR` so the default SSD tier never touches the real `~/.sushi/kv-cache`. A script moving onto `lib/boot.sh` drops it. |
+| `tests/hf_stub.py ROOT PORT` | Tier lib. The huggingface.co stand-in of `test_pull_integrity.sh`: the repo tree API, `resolve/` downloads with Range, LFS sha256 for `.safetensors` and git blob ids for the rest, a `.corrupt` list served altered, a `.requests` log. |
 
 - `tests/test_logprobs.sh` also checks JSON-object and JSON-schema constrained logprobs on streaming and non-streaming chat; masked choices need not be raw rank one. Hermetic regression: `upstream bugfix: constrained logprobs` in `sampler.zig`.
 - Legacy-completions logprob checks branch on the model returning immediate EOS: zero-token usage, empty text and a normal stop permit no entries; nonempty replies still require token logprobs.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=lib
 """A stand-in for huggingface.co, serving the repo folders under ROOT (tests/test_pull_integrity.sh).
 
     hf_stub.py ROOT PORT
