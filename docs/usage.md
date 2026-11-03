@@ -167,6 +167,9 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 - **Pair-major layout:** `sushi repack <pack>` rewrites a pack-order pack in place into the layout the streaming engine
   reads fastest ([pack-format](pack-format.md#repack)). Stop any server using the pack first; it needs free disk of one
   shard plus 1 GiB, and repeating it after an interruption finishes the job.
+  `--pack-revision <id>` also stamps the pack with a revision, `--shards <name-or-glob>` narrows the stamping to some
+  shards, `--unstamped <shard>` leaves one (a symlink) out and `--check` only verifies
+  ([pack-format](pack-format.md#pack-revision-writer)).
 - **`--drop-expert n`** (multiple of 8) skips the `n` least-used experts a layer, freeing 2.1–2.5 GB at 8 and 4.3–5.0 GB
   at 16. It is lossy: check it with `sushi kld compare` ([dsv41-arch](dsv41-arch.md#drop-expert)).
 - **`--ssd-prefetch <n>` (0..100, default 0 = off) turns on the expert prefetch of a streamed DeepSeek load and caps its SSD reads.**

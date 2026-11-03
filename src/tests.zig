@@ -207,6 +207,8 @@ test {
     _ = @import("cli.zig");
     _ = @import("dsv41/repack.zig");
     _ = @import("dsv41/repack_test.zig");
+    _ = @import("dsv41/repack_stamp.zig");
+    _ = @import("dsv41/repack_stamp_test.zig");
     _ = @import("repl_tools.zig");
     _ = @import("repl_input.zig");
     _ = @import("launch.zig");

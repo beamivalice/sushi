@@ -10,17 +10,18 @@ const model = @import("../model.zig");
 const cli = @import("../cli.zig");
 const disk_placement = @import("../disk_placement.zig");
 const log = @import("../log.zig");
+const stamp = @import("repack_stamp.zig");
 
-const page: u64 = 16384;
+pub const page: u64 = 16384;
 const marker = ".mlp.switch_mlp.";
 const pad_prefix = dsv41_source.pad_prefix;
-const tmp_suffix = ".repack-tmp";
+pub const tmp_suffix = ".repack-tmp";
 const lock_name = ".sushi-repack.lock";
 const index_name = "model.safetensors.index.json";
 const unit_bytes: u64 = 8 << 20;
 const spare_bytes: u64 = 1 << 30;
 
-extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
+pub extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
 extern "c" fn kill(pid: c_int, sig: c_int) c_int;
 extern "c" fn proc_listpidspath(kind: u32, typeinfo: u32, path: [*:0]const u8, flags: u32, buffer: ?*anyopaque, size: c_int) c_int;
 
@@ -39,11 +40,11 @@ fn errno() c_int {
     return std.c._errno().*;
 }
 
-fn pathZ(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![:0]u8 {
+pub fn pathZ(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![:0]u8 {
     return std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, name }, 0);
 }
 
-fn openFd(path: [:0]const u8, write: bool) !std.c.fd_t {
+pub fn openFd(path: [:0]const u8, write: bool) !std.c.fd_t {
     const fd = if (write)
         std.c.open(path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600))
     else
@@ -54,7 +55,7 @@ fn openFd(path: [:0]const u8, write: bool) !std.c.fd_t {
     return fd;
 }
 
-fn writeExact(fd: std.c.fd_t, src: []const u8, offset: u64) !void {
+pub fn writeExact(fd: std.c.fd_t, src: []const u8, offset: u64) !void {
     var done: usize = 0;
     while (done < src.len) {
         const put = std.c.pwrite(fd, src[done..].ptr, src.len - done, @intCast(offset + done));
@@ -68,12 +69,12 @@ fn writeExact(fd: std.c.fd_t, src: []const u8, offset: u64) !void {
 
 /// F_FULLFSYNC reaches the platter; plain fsync, which macOS leaves in the drive's cache, is the fallback for a volume
 /// that refuses it.
-fn fullSync(fd: std.c.fd_t) !void {
+pub fn fullSync(fd: std.c.fd_t) !void {
     if (std.c.fcntl(fd, std.c.F.FULLFSYNC) == 0) return;
     if (std.c.fsync(fd) != 0) return error.RepackIoFailed;
 }
 
-fn syncDir(a: std.mem.Allocator, dir: []const u8) !void {
+pub fn syncDir(a: std.mem.Allocator, dir: []const u8) !void {
     const path = try std.fmt.allocPrintSentinel(a, "{s}", .{dir}, 0);
     defer a.free(path);
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
@@ -82,24 +83,24 @@ fn syncDir(a: std.mem.Allocator, dir: []const u8) !void {
     try fullSync(fd);
 }
 
-fn unlinkQuiet(path: [:0]const u8) void {
+pub fn unlinkQuiet(path: [:0]const u8) void {
     _ = std.c.unlink(path.ptr);
 }
 
-fn fileSize(fd: std.c.fd_t) !u64 {
+pub fn fileSize(fd: std.c.fd_t) !u64 {
     var st: std.c.Stat = undefined;
     if (std.c.fstat(fd, &st) != 0 or st.size < 0) return error.RepackIoFailed;
     return @intCast(st.size);
 }
 
-fn readSmall(io: std.Io, a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
+pub fn readSmall(io: std.Io, a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
     var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
     defer d.close(io);
     return d.readFileAlloc(io, name, a, .limited(256 << 20));
 }
 
 /// `name` replaced by `data` through a tmp file, fsynced before and after the rename; the file keeps its mode.
-fn replaceFile(a: std.mem.Allocator, dir: []const u8, name: []const u8, data: []const u8) !void {
+pub fn replaceFile(a: std.mem.Allocator, dir: []const u8, name: []const u8, data: []const u8) !void {
     const final = try pathZ(a, dir, name);
     defer a.free(final);
     const tmp_name = try std.fmt.allocPrint(a, "{s}{s}", .{ name, tmp_suffix });
@@ -255,7 +256,7 @@ const Plan = struct {
     data_len: u64,
 };
 
-fn appendJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+pub fn appendJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(a, '"');
     for (s) |c| switch (c) {
         '"' => try out.appendSlice(a, "\\\""),
@@ -470,10 +471,10 @@ fn processAlive(pid: c_int) bool {
     return kill(pid, 0) == 0 or errno() == @backingInt(std.c.E.PERM);
 }
 
-const Lock = struct {
+pub const Lock = struct {
     path: [:0]u8,
 
-    fn acquire(a: std.mem.Allocator, io: std.Io, dir: []const u8) !Lock {
+    pub fn acquire(a: std.mem.Allocator, io: std.Io, dir: []const u8) !Lock {
         const path = try pathZ(a, dir, lock_name);
         errdefer a.free(path);
         for (0..2) |_| {
@@ -494,7 +495,7 @@ const Lock = struct {
         return error.RepackPackLocked;
     }
 
-    fn release(self: Lock, a: std.mem.Allocator) void {
+    pub fn release(self: Lock, a: std.mem.Allocator) void {
         unlinkQuiet(self.path);
         a.free(self.path);
     }
@@ -502,7 +503,7 @@ const Lock = struct {
 
 /// Does any other process have `path` open? A running server reads shards through cached descriptors that
 /// revalidate by inode and size, so it would read pair-major bytes under the pack order.
-fn inUse(path: [:0]const u8, count_self: bool) bool {
+pub fn inUse(path: [:0]const u8, count_self: bool) bool {
     var pids: [4096]c_int = undefined;
     const got = proc_listpidspath(1, 0, path.ptr, 0, &pids, @sizeOf(@TypeOf(pids)));
     if (got <= 0) return false;
@@ -735,32 +736,51 @@ fn explain(err: anyerror) []const u8 {
         error.RepackNoSpace => "free disk is under the largest shard plus 1 GiB",
         error.RepackPackLocked => "another repack holds .sushi-repack.lock",
         error.RepackPackInUse => "a process has a shard open (stop the server that serves this pack)",
+        error.RepackStampBadId => "the pack revision id",
+        error.RepackStampConflict => "the pack already carries another pack revision",
+        error.RepackStampMissing => "a shard or config.json lacks the pack revision",
+        error.RepackNoShardMatch => "a --shards pattern selects no shard",
+        error.RepackUnknownShard => "an --unstamped name is not a shard of the pack",
         error.RepackVerifyFailed => "a rewritten shard did not read back equal to its original; the original is untouched",
         else => "see the error name",
     };
 }
 
 pub fn cmdRepack(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-    if (args.len == 0) {
-        log.err("usage: sushi repack <pack>\n", .{});
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cli_args = stamp.parseArgs(a, args) catch {
+        log.err("sushi repack: unexpected argument '{s}' (usage: sushi repack <pack> [--pack-revision <id> [--shards <name-or-glob>]... [--unstamped <shard>]...] | --check [--pack-revision <id>] [--shards <name-or-glob>]...)\n", .{stamp.bad_arg});
         std.process.exit(1);
-    }
-    if (args.len > 1 or (args[0].len > 0 and args[0][0] == '-')) {
-        log.err("sushi repack: unexpected argument '{s}' (usage: sushi repack <pack>)\n", .{if (args.len > 1) args[1] else args[0]});
-        std.process.exit(1);
-    }
+    };
     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
-    const dir = resolvePack(allocator, io, args[0], home) catch |err| {
+    const dir = resolvePack(allocator, io, cli_args.pack, home) catch |err| {
         log.err("sushi repack: {s}: {s}\n", .{ @errorName(err), explain(err) });
         std.process.exit(1);
     };
     defer allocator.free(dir);
-    const outcome = repackPack(allocator, io, dir, .{}) catch |err| {
-        log.err("sushi repack: {s}: {s}\n", .{ @errorName(err), explain(err) });
-        std.process.exit(1);
-    };
-    switch (outcome) {
-        .already_pair_major => log.info("{s} is already pair-major\n", .{dir}),
-        .repacked => log.info("{s} is pair-major\n", .{dir}),
+    var report: stamp.Report = .{};
+    if (cli_args.check) {
+        stamp.checkPack(allocator, io, dir, cli_args.id, cli_args.shards, &report) catch |err| fail(err, &report);
+        log.info("{s}: {d} shards carry the pack revision\n", .{ dir, report.stamped });
+        return;
     }
+    const wants_repack = if (!cli_args.stamping()) true else if (readSmall(io, a, dir, "config.json")) |raw| stamp.wantsRepack(a, raw) else |_| false;
+    if (wants_repack) {
+        const outcome = repackPack(allocator, io, dir, .{}) catch |err| fail(err, &report);
+        switch (outcome) {
+            .already_pair_major => log.info("{s} is already pair-major\n", .{dir}),
+            .repacked => log.info("{s} is pair-major\n", .{dir}),
+        }
+    }
+    if (cli_args.id) |id| {
+        stamp.stampPack(allocator, io, dir, .{ .id = id, .shards = cli_args.shards, .unstamped = cli_args.unstamped }, &report) catch |err| fail(err, &report);
+        log.info("{s}: pack revision {s}: {d} shards stamped, {d} already stamped\n", .{ dir, id, report.stamped, report.skipped });
+    }
+}
+
+fn fail(err: anyerror, report: *const stamp.Report) noreturn {
+    log.err("sushi repack: {s}: {s}\n", .{ @errorName(err), if (report.len > 0) report.text() else explain(err) });
+    std.process.exit(1);
 }

@@ -140,10 +140,19 @@ fn printUsage(io: std.Io) void {
         \\                      (routed experts as EXL3). `sushi convert --help`
         \\                      for options
         \\  repack <pack>       Rewrite an STQ pack in place into the
-        \\                      pair-major layout (no flags). A shard is replaced
-        \\                      only after its rewrite reads back equal; a cut-off
-        \\                      run resumes when repeated. Stop any server using
-        \\                      the pack first. Never downloads.
+        \\                      pair-major layout. A shard is replaced only after
+        \\                      its rewrite reads back equal; a cut-off run
+        \\                      resumes when repeated. Stop any server using the
+        \\                      pack first. Never downloads. Options:
+        \\                      --pack-revision <id>  stamp the pack with a
+        \\                        revision (config.json and every shard header)
+        \\                      --shards <name-or-glob>  stamp only these shards
+        \\                        (repeatable; a pattern matching nothing is
+        \\                        refused)
+        \\                      --unstamped <shard>  leave this shard without a
+        \\                        stamp (repeatable; a symlinked shard needs it)
+        \\                      --check  read only: every shard not unstamped
+        \\                        carries the config's revision
         \\  update              Replace this install with the newest release,
         \\                      after checking its SHA-256, its signature and
         \\                      that it runs; the old one stays as

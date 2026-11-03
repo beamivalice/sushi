@@ -77,7 +77,7 @@ names it; absent is the pack order.
 <a id="repack"></a>
 #### `sushi repack <pack>`
 
-`sushi repack <pack>` (one positional, no flags; a path, relative directory or known alias, never downloaded) turns a
+`sushi repack <pack>` (one positional; options below; a path, relative directory or known alias, never downloaded) turns a
 pack-order `deepseek_v41` STQ pack into the pair-major one, in place. It is the one repacker.
 
 - It writes the shard layout above (trellis, scales, pads; `__metadata__` keeps its source fields and adds `tile_order`).
@@ -96,6 +96,31 @@ pack-order `deepseek_v41` STQ pack into the pair-major one, in place. It is the 
 - A run cut short leaves shards in both orders under a pack-order index and config, which the loader refuses
   (`Exl3TileOrderMixed` / `Exl3TileOrderMismatch`); repeating the command skips the pair-major shards that pass the
   structure check and finishes. The output is byte-identical run to run and box to box.
+
+<a id="pack-revision-writer"></a>
+#### Stamping a pack revision (writer side)
+
+`sushi repack <pack> --pack-revision <id>` stamps a pack with a revision; the loader's check is [Pack revision](#pack-revision).
+
+- Format: `config.json` gains a top-level `"pack_revision": {"id": "<id>", "unstamped": [<shard file names>]}` (replaced
+  where it stands, else the last member; every other byte and key order unchanged). Every other `.safetensors` shard of
+  the pack directory gets `__metadata__["pack_revision"] = "<id>"`; the other metadata keys, the tensor entries and
+  every data byte are unchanged. An id is 1 to 64 characters from letters, numbers and `. _ - +`.
+- Header: 8-byte little-endian length, the JSON, spaces to alignment, then the data (`data_offsets` are relative to the
+  data start, so they do not change). The padding keeps a page-aligned data start page-aligned (pair-major tiles are
+  read from page-aligned offsets); any other shard stays 8-byte aligned.
+- `--shards <name-or-glob>` (repeatable; `*` and `?`) stamps only the matching shards, so a revision can land in steps;
+  `config.json` is written last, and a loader refuses the pack until every shard not in `unstamped` carries the id. A
+  pattern that matches nothing is `RepackNoShardMatch`, before a write. On a pack-order DeepSeek-V4.1 STQ pack the whole
+  pack is repacked first (a partial repack is no pack); `--shards` narrows only the stamping.
+- A symlinked shard is never rewritten through the link: `--unstamped <shard>` (repeatable) lists it, and an unlisted
+  one is `RepackShardIsLink` naming it; a listed name that is no shard is `RepackUnknownShard`.
+- Safety as for the repack: `<shard>.stamp-tmp` beside the shard, `F_FULLFSYNC`, re-read (header equal to the original
+  plus the one key, data section SHA-256 equal), rename, directory fsync; free disk of the largest shard plus 1 GiB
+  (`RepackNoSpace`); the `.sushi-repack.lock` and the in-use refusal. A shard already carrying the id is skipped, so a
+  rerun resumes; another id in a shard or in `config.json` is `RepackStampConflict`, naming it; re-run with that id.
+- `--check` (read only, optionally with `--pack-revision` and `--shards`): `config.json` has the member and every shard
+  not in `unstamped` carries its id (`RepackStampMissing`, `RepackStampConflict`).
 
 ### MTP bank
 
@@ -295,9 +320,8 @@ revision beside files of another, which `sushi pull` once left when a file kept 
 - `sushi pull` leaves `.sushi-pull.json` in the folder (not a pack file; discovery ignores it) so the next pull compares
   contents ([usage](usage.md#sushi-pull-and-sushi-list)).
 
-Writer side (stamping shards, `sushi repack --pack-revision`): see the writer paragraph below.
-
-<!-- WRITER-SIDE SLOT: the merge puts the paragraph on how packs are stamped (sushi repack --pack-revision, sashimi, the encoder) here. -->
+Writers: `sushi repack <pack> --pack-revision <id>` ([writer side](#pack-revision-writer)); the private converter
+stack writes the same format, keeping a page-aligned data start page-aligned.
 
 ## The shard stamp
 
