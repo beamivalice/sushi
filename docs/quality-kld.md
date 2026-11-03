@@ -148,6 +148,7 @@ no `act_quant` on the way ([dsv41-arch](dsv41-arch.md#gaps-against-the-reference
   without head rows is refused (`Dsv41CaptureLeanNeedsHeadRows`); `layer-major.json` binds the mode, so a rerun in another mode
   is refused. The tiny pack proves the rows equal the forward's head input, the last row of each window through the head
   reproduces the fixture logits, a lean run's rows and logits equal the full run's, and both modes resume.
+- `SUSHI_DSV41_COMPOSED=1` (the op chains) captures too: the composed routed sum feeds the imatrix's down moments through the same tap as the fused arm.
 - Refused by name: `--hidden-out` / `SUSHI_HIDDEN_OUT`, `--imatrix-windows`, a quantized KV (`Dsv41KvQuantUnsupported`),
   `--qwen-gdn 16`, `--tokens` other than 1, a missing budget.
 

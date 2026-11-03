@@ -91,10 +91,8 @@ pub fn tryRun(a: std.mem.Allocator, io: std.Io, opts: kld.Options, out: *kld.Out
     if (!try accepts(&cfg, opts)) return false;
     _ = try modeFromEnv();
     const dc = cfg.dsv41.?;
-    const per_expert = try dsv_stream.expertBytes(&dc);
-    const trunk = try dsv_source.residentBytes(io, a, opts.model_dir);
     // The batch pins one layer's whole union at a time, so the cache itself stays at its two-slot floor.
-    const floor = try floorBudget(&dc, trunk, per_expert);
+    const floor = try captureFloor(io, a, &cfg, opts.model_dir);
     const load = loadOptions(opts, floor);
     const batch = if (opts.batch_windows != 0) opts.batch_windows else try batchWindows(&dc, opts.ssd_budget_bytes, floor, chunk_rows);
     const loaded = try kld.loadModel(io, a, load);
@@ -111,13 +109,21 @@ fn loadOptions(opts: kld.Options, floor: u64) kld.Options {
     return load;
 }
 
-/// The cheapest budget the expert engine accepts: trunk, the all-experts workspace, one token's picks, the bounce
-/// buffers and two slots a layer.
-fn floorBudget(dc: *const dsv_cfg.Config, trunk: u64, per_expert: u64) !u64 {
+fn captureFloor(io: std.Io, a: std.mem.Allocator, cfg: *const model.ModelConfig, model_dir: []const u8) !u64 {
+    const dc = cfg.dsv41.?;
+    // What the load's plan bills resident: the trunk, the Engram row caches and the MLX buffer pool. The DSpark stages
+    // and the vision tower stay out of a kld load.
+    const resident = try dsv_source.residentBytes(io, a, model_dir) +| @import("dsv41_engram.zig").cacheBytes(dc.engram) +| cfg.expertPoolBytes();
+    return floorBudget(&dc, resident, try dsv_stream.expertBytes(&dc));
+}
+
+/// The cheapest budget the expert engine accepts: what stays resident, the all-experts workspace, one token's picks,
+/// the bounce buffers and two slots a layer.
+fn floorBudget(dc: *const dsv_cfg.Config, resident: u64, per_expert: u64) !u64 {
     const workspace = try std.math.mul(u64, dc.experts, per_expert);
     const selected = try std.math.mul(u64, dc.top_k, per_expert);
     const cache = try std.math.mul(u64, 2 * @as(u64, dc.layers), per_expert);
-    return trunk + workspace + selected + cache + expert_stream.BOUNCE_BYTES + (1 << 30);
+    return resident + workspace + selected + cache + expert_stream.BOUNCE_BYTES;
 }
 
 /// Bytes of the trunk sums one layer holds on the GPU while a batch runs (a window's term and the running total).
@@ -1896,4 +1902,57 @@ test "deepseek_v41 layer-major capture: head rows are the head's input for every
 
 test "deepseek_v41 capture: lean needs head rows" {
     try testing.expectError(error.Dsv41CaptureLeanNeedsHeadRows, checkedMode(false, true));
+}
+
+test "deepseek_v41 layer-major capture on the composed op chains writes the imatrix too (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const src = try dsv.fixtureDir();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try stageTiny(a, io, tmp.dir, src);
+    const windows = try tinyWindows(a);
+    defer {
+        for (windows) |w| a.free(w);
+        a.free(windows);
+    }
+    try writeTinyPrompts(a, io, tmp.dir, windows);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const tiny = try TinyLoaded.init(a, io, root);
+    defer tiny.deinit();
+    const m = tiny.loaded.xfm.dsv41.?;
+    m.fused = false;
+
+    var rec = try Recorder.init(a, m.s, &m.cfg);
+    defer rec.deinit();
+    m.tap = rec.tap();
+    const want_logits = try windowMajorLogits(a, m, windows, 4);
+    m.tap = null;
+    defer {
+        for (want_logits) |b| a.free(b);
+        a.free(want_logits);
+    }
+    try runTiny(a, io, root, tiny, "composed", 3, 4);
+    for (windows, 0..) |_, w| {
+        const got = try readFile(a, io, root, "composed/prompts/{d:0>2}_w{d}/logits.f32", .{ w, w });
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, want_logits[w], got);
+    }
+    try testing.expect(rec.down[0][0] + rec.down[0][1] > 0);
+    try expectImatrixMatches(a, io, root, "composed", &rec, m.cfg.dim, m.cfg.top_k);
+}
+
+test "deepseek_v41 capture: the floor budget is the least the streamed load's plan accepts (DSV41_TINY)" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try dsv.fixtureDir();
+    var cfg = try model.parseConfig(io, a, dir);
+    defer cfg.deinit(a);
+    const model_load = @import("../model_load.zig");
+    const floor = try captureFloor(io, a, &cfg, dir);
+    const plan = try model_load.planExpertStreaming(io, a, &cfg, dir, floor, false);
+    try testing.expectEqual(@as(u16, 2), plan.cache.slots_per_layer);
+    try testing.expectError(error.SsdBudgetBelowResident, model_load.planExpertStreaming(io, a, &cfg, dir, floor - 1, false));
 }

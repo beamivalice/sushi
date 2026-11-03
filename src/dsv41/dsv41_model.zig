@@ -143,6 +143,13 @@ pub fn gatherQmm(sc: *Scope, x: A, b: Bank, idx: A) !A {
 /// `x` through the routed experts `idx` (`[L, k]`, ids of `banks`' leading axis) weighted by `wts`
 /// (`[L, k]` f32): the clamped SwiGLU of each, summed over the k in f32.
 pub fn routedSum(sc: *Scope, cfg: *const Config, act: mlx.mlx_dtype, x: A, banks: BankSet, idx: A, wts: A) !A {
+    return routedSumTapped(sc, cfg, act, x, banks, idx, wts, null);
+}
+
+/// The layer `li` and the global expert ids of the picks, for a tap to attribute each row's down-projection input.
+const ActTap = struct { tap: Tap, li: usize, ids: A };
+
+fn routedSumTapped(sc: *Scope, cfg: *const Config, act: mlx.mlx_dtype, x: A, banks: BankSet, idx: A, wts: A, probe: ?ActTap) !A {
     const L = dim(x, 0);
     const k = dim(idx, 1);
     const d = dim(x, 1);
@@ -151,6 +158,7 @@ pub fn routedSum(sc: *Scope, cfg: *const Config, act: mlx.mlx_dtype, x: A, banks
     const gate = try gatherQmm(sc, xe, banks.gate, uidx); // [L, k, 1, inter]
     const up = try gatherQmm(sc, xe, banks.up, uidx);
     const a = try sc.astype(try sc.mul(try clampedSwiglu(sc, gate, up, cfg.swiglu_limit), try sc.reshape(wts, &.{ ci(L), ci(k), 1, 1 })), act);
+    if (probe) |p| try p.tap.expert_act(p.tap.ctx, p.li, try sc.reshape(a, &.{ ci(L * k), ci(cfg.moe_inter) }), try sc.reshape(try sc.astype(p.ids, .int32), &.{ ci(L * k), 1 }));
     const dn = try gatherQmm(sc, a, banks.down, uidx); // [L, k, 1, d]
     return sc.sum(try sc.astype(try sc.reshape(dn, &.{ ci(L), ci(k), ci(d) }), .float32), 1, false);
 }
@@ -2239,6 +2247,18 @@ fn moeWide(sc: *Scope, m: *const Model, li: usize, h: A, r: kernels.Routes, sy: 
     return out;
 }
 
+/// `routedSum` over the layer's banks or leased slabs with the tap reading the activations, for the composed chains
+/// (`moeWide` taps the fused arm).
+fn routedTapped(sc: *Scope, m: *const Model, t: Tap, li: usize, h: A, r: kernels.Routes) !A {
+    const lease = try leaseBanks(sc, m, li, r.idx);
+    defer releaseBanks(m, li);
+    errdefer _ = mlx.mlx_synchronize(sc.s);
+    const out = try routedSumTapped(sc, &m.cfg, m.act, h, lease.banks, lease.local, r.wts, .{ .tap = t, .li = li, .ids = r.idx });
+    // Every slab reader completes before another layer can refill the union.
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
 /// The stream `x` `[L, hc, dim]` that a routed sum is expanded into: `hcExpand(x, sum, post, comb)`.
 pub const Expand = struct { x: A, post: A, comb: A };
 
@@ -2456,7 +2476,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
         return out;
     }
     if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, li, ly, h));
-    const y = if (li >= c.layers) try routedSum(sc, c, m.act, h, m.dspark.?.banks[li - c.layers], r.idx, r.wts) else switch (m.experts) {
+    const y = if (li >= c.layers) try routedSum(sc, c, m.act, h, m.dspark.?.banks[li - c.layers], r.idx, r.wts) else if (m.tap) |t| try routedTapped(sc, m, t, li, h, r) else switch (m.experts) {
         .resident => |banks| try routedSum(sc, c, m.act, h, banks[li], r.idx, r.wts),
         .hook => |hk| try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, null),
     };
