@@ -162,6 +162,39 @@ run_bar "$BAR" 3 "" --port "$TPORT"
 check "the status says the port is in use and Start is disabled" "$(yes_if 'grep -q "poll 2 .*Port '"$TPORT"': in use by another program\" start=0 stop=0" "$LOG"')"
 kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
 
+echo "== a newer pack revision on the loaded model =="
+SPORT=$((PORT + 3))
+cat > "$WORK/stub_models.py" <<'EOF'
+import http.server, json, sys
+
+PACK = {"current": "1.0", "latest": "2.0", "command": "sushi pull deepseek-v4.1-flash"}
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path.startswith("/metrics.json"):
+            body = {}
+        elif self.path.startswith("/v1/models"):
+            body = {"data": [{"id": "stub-pack", "state": "ready", "meta": {"pack_update": PACK}}]}
+        else:
+            self.send_response(404); self.end_headers(); return
+        raw = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+EOF
+python3 "$WORK/stub_models.py" "$SPORT" > /dev/null 2>&1 &
+TPID=$!
+for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$SPORT/v1/models" && break; sleep 0.25; done
+run_bar "$BAR" 3 "" --port "$SPORT"
+check "the header card names the pack update under the model" "$(yes_if 'grep -q "poll [23] .*pack=\"Pack 2.0 available (you have 1.0)\"" "$LOG"')"
+check "the menu offers to copy the pull command" "$(yes_if 'grep -q "packcopy=\"Copy “sushi pull deepseek-v4.1-flash”\"" "$LOG"')"
+kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
+
 echo "== version and update =="
 CUR="$("$SUSHI_BIN" --version 2>/dev/null | head -1 | awk '{print $2}')"
 stage_install() {

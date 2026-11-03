@@ -27,6 +27,7 @@ const repl_tools = @import("repl_tools.zig");
 const repl_input = @import("repl_input.zig");
 const update = @import("update.zig");
 const hf_pull = @import("hf_pull.zig");
+const pack_update = @import("pack_update.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -133,6 +134,18 @@ pub const aliases = [_]Alias{
     .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
     .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96 },
 };
+
+/// The published packs as the update check sees them.
+const known_packs = blk: {
+    var k: [aliases.len]pack_update.Known = undefined;
+    for (aliases, 0..) |a, i| k[i] = .{ .name = a.name, .tag = a.tag, .repo = a.repo, .is_default = a.is_default };
+    break :blk k;
+};
+
+/// Server start: the daily pack-revision look, off under `--no-update-check`.
+pub fn configurePackUpdates(io: std.Io, on: bool) void {
+    pack_update.configure(io, on, &known_packs);
+}
 
 pub const Resolved = struct {
     repo: []const u8,
@@ -359,43 +372,8 @@ pub const Reporter = struct {
     }
 };
 
-/// The process environment a Hugging Face token is resolved from; a test passes its own.
-const HfEnv = struct {
-    token: ?[]const u8 = null,
-    token_path: ?[]const u8 = null,
-    hf_home: ?[]const u8 = null,
-    home: []const u8,
-
-    fn fromProcess() HfEnv {
-        const get = struct {
-            fn f(name: [:0]const u8) ?[]const u8 {
-                return if (std.c.getenv(name.ptr)) |v| std.mem.span(v) else null;
-            }
-        }.f;
-        return .{ .token = get("HF_TOKEN"), .token_path = get("HF_TOKEN_PATH"), .hf_home = get("HF_HOME"), .home = homeDir() };
-    }
-};
-
-/// The token `sushi pull` and `sushi list` send: `HF_TOKEN`, else the file `hf auth login` wrote (`HF_TOKEN_PATH`,
-/// else `$HF_HOME/token`, else `~/.cache/huggingface/token`; the first one set is the only one read). Blank is none.
-fn resolveHfToken(allocator: std.mem.Allocator, io: std.Io, env: HfEnv) !?[]u8 {
-    if (env.token) |t| {
-        const v = std.mem.trim(u8, t, " \t\r\n");
-        if (v.len > 0) return try allocator.dupe(u8, v);
-    }
-    const path = try hfTokenPath(allocator, env);
-    defer allocator.free(path);
-    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096)) catch return null;
-    defer allocator.free(raw);
-    const v = std.mem.trim(u8, raw, " \t\r\n");
-    return if (v.len == 0) null else try allocator.dupe(u8, v);
-}
-
-fn hfTokenPath(allocator: std.mem.Allocator, env: HfEnv) ![]u8 {
-    if (env.token_path) |p| if (p.len > 0) return allocator.dupe(u8, p);
-    if (env.hf_home) |h| if (h.len > 0) return std.fmt.allocPrint(allocator, "{s}/token", .{h});
-    return std.fmt.allocPrint(allocator, "{s}/.cache/huggingface/token", .{env.home});
-}
+const HfEnv = pack_update.HfEnv;
+const resolveHfToken = pack_update.resolveHfToken;
 
 var hf_header_seq = std.atomic.Value(u32).init(0);
 
@@ -831,7 +809,7 @@ pub fn parseRepoSize(allocator: std.mem.Allocator, json: []const u8) !u64 {
 /// that is not published yet), or nothing at all (no network, a timeout).
 pub const FetchOutcome = union(enum) { size: u64, not_found, offline };
 
-pub const CatalogRow = struct { alias: Alias, size: ?u64, downloaded: bool, published: bool = true };
+pub const CatalogRow = struct { alias: Alias, size: ?u64, downloaded: bool, published: bool = true, update: ?pack_update.Available = null };
 
 pub const SizeFetch = *const fn (ctx: *anyopaque, repo: []const u8) FetchOutcome;
 
@@ -864,6 +842,10 @@ pub fn writeCatalog(w: *std.Io.Writer, ram_gb: u64, rows: []const CatalogRow) !v
             if (recommended) "  <- recommended" else "",
             if (row.published) "" else "  (not yet published)",
         });
+        if (row.update) |u| {
+            try w.writeAll("  ");
+            try pack_update.listLine(w, u);
+        }
     }
 }
 
@@ -893,16 +875,32 @@ pub fn catalogRow(a: Alias, outcome: FetchOutcome, downloaded: bool) CatalogRow 
     };
 }
 
-fn catalogDownloaded(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) bool {
-    const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo }) catch return false;
-    defer allocator.free(org_path);
-    if (modelPresent(io, org_path)) return true;
+/// Where a catalog pack sits on disk, or null when it is not downloaded. Caller frees.
+fn catalogPackPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) ?[]u8 {
+    const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo }) catch return null;
+    if (modelPresent(io, org_path)) return org_path;
+    allocator.free(org_path);
     // `hf download --local-dir ~/.sushi/models/<pack>` (docs/usage.md) lands without the org folder.
-    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return false;
-    const flat_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo[slash + 1 ..] }) catch return false;
-    defer allocator.free(flat_path);
-    return modelPresent(io, flat_path);
+    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return null;
+    const flat_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo[slash + 1 ..] }) catch return null;
+    if (modelPresent(io, flat_path)) return flat_path;
+    allocator.free(flat_path);
+    return null;
 }
+
+const UpdateJob = struct {
+    io: std.Io,
+    path: []const u8,
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    found: ?pack_update.Available = null,
+
+    fn run(self: *UpdateJob) void {
+        switch (pack_update.checkPack(self.arena.allocator(), self.io, &known_packs, self.path)) {
+            .available => |a| self.found = a,
+            else => {},
+        }
+    }
+};
 
 /// Whether a local model row (`name` as `list` prints it) is one of the catalog packs.
 fn isCatalogName(name: []const u8) bool {
@@ -929,7 +927,28 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     const online = fetchCatalogSizes(&env, &fetchSizeViaCurl, &outcomes);
     if (online) {
         var rows: [aliases.len]CatalogRow = undefined;
-        for (aliases, 0..) |a, i| rows[i] = catalogRow(a, outcomes[i], catalogDownloaded(io, allocator, root, a.repo));
+        var jobs: [aliases.len]?UpdateJob = @splat(null);
+        var paths: [aliases.len]?[]u8 = @splat(null);
+        var threads: [aliases.len]?std.Thread = @splat(null);
+        defer for (&jobs, &paths) |*j, p| {
+            if (j.*) |*job| job.arena.deinit();
+            if (p) |pp| allocator.free(pp);
+        };
+        for (aliases, 0..) |a, i| {
+            paths[i] = catalogPackPath(io, allocator, root, a.repo);
+            rows[i] = catalogRow(a, outcomes[i], paths[i] != null);
+        }
+        // Each downloaded pack asks Hugging Face for its revision at the same time, so a slow answer costs one wait.
+        for (&jobs, &threads, paths) |*j, *t, p| {
+            const path = p orelse continue;
+            j.* = .{ .io = io, .path = path };
+            t.* = std.Thread.spawn(.{}, UpdateJob.run, .{&j.*.?}) catch null;
+            if (t.* == null) j.*.?.run();
+        }
+        for (threads) |t| if (t) |th| th.join();
+        for (&rows, jobs) |*row, j| if (j) |job| {
+            row.update = job.found;
+        };
         try writeCatalog(w, installedGb(status.getTotalMemBytes()), &rows);
         try w.writeAll("\n");
     } else {
@@ -952,7 +971,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         if (isModelDir(io, &sub)) {
             if (online and isCatalogName(entry.name)) continue;
             try printLocalHeader(w, count);
-            try printModelRow(io, allocator, w, &sub, entry.name, root);
+            try printModelRow(io, allocator, w, &sub, entry.name, root, online);
             count += 1;
             continue;
         }
@@ -967,7 +986,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
             if (online and isCatalogName(full)) continue;
             try printLocalHeader(w, count);
-            try printModelRow(io, allocator, w, &leaf, full, root);
+            try printModelRow(io, allocator, w, &leaf, full, root, online);
             count += 1;
         }
     }
@@ -991,7 +1010,7 @@ fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
     return st.kind == .file;
 }
 
-fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
+fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8, check_updates: bool) !void {
     const bytes = dirBytesOneLevel(io, dir);
     // TYPE from the same classification serving uses (chat, embed, drafter,
     // unsupported) so the list is honest about which rows `run` can actually
@@ -1005,6 +1024,16 @@ fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, di
     };
     var size_buf: [32]u8 = undefined;
     try w.print("{s: <56} {s: <12} {s: >10}\n", .{ name, kind_label, formatSize(&size_buf, bytes) });
+    if (!check_updates) return;
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    switch (pack_update.checkPack(arena_state.allocator(), io, &known_packs, abs orelse return)) {
+        .available => |u| {
+            try w.writeAll("  ");
+            try pack_update.listLine(w, u);
+        },
+        else => {},
+    }
 }
 
 /// Sum file bytes in a model dir INCLUDING one level of subdirectories —
@@ -3133,6 +3162,18 @@ test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM o
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &.{ .off, .low, .medium, .xhigh }));
     try testing.expect(parseThinkCommand("/think minimal", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
     try testing.expectEqual(@as(?effort_mod.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
+}
+
+test "list: a downloaded pack with a newer published revision gets an update line under its row" {
+    var rows: [aliases.len]CatalogRow = undefined;
+    for (aliases, 0..) |a, i| rows[i] = .{ .alias = a, .size = 1 << 30, .downloaded = true };
+    rows[aliases.len - 1].update = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull example-pack" };
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeCatalog(&w, 96, &rows);
+    const out = w.buffered();
+    try testing.expect(std.mem.endsWith(u8, out, "  update available: 2.0 (you have 1.0) — sushi pull example-pack\n"));
+    try testing.expectEqual(std.mem.indexOf(u8, out, "update available"), std.mem.lastIndexOf(u8, out, "update available"));
 }
 
 test "hf token: env var, then HF_TOKEN_PATH, then HF_HOME/token, then the default file, then none" {

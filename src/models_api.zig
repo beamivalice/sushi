@@ -17,6 +17,7 @@ const model_settings = @import("model_settings.zig");
 const metrics = @import("status.zig");
 const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const update_mod = @import("update.zig");
+const pack_update = @import("pack_update.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const io_util = @import("io_util.zig");
 const build_options = @import("build_options");
@@ -243,7 +244,7 @@ test "a quantized pack loaded resident advertises no streaming, the same pack st
         .id = "resident",
         .path = path_buf[0..path_len],
         .bytes_on_disk = 0,
-        .arch_hint = "qwen4_exp",
+        .arch_hint = "example_arch",
         .config = &cfg,
         .weights = null,
         .transformer = null,
@@ -396,6 +397,11 @@ pub fn renderModelEntry(
         const pack_revision_str = try packRevisionJson(allocator, config);
         defer allocator.free(pack_revision_str);
 
+        const pack_update_part = try pack_update.rowFragment(allocator, entry.path);
+        defer allocator.free(pack_update_part);
+        const pack_tail = try std.fmt.allocPrint(allocator, "{s}{s}", .{ pack_revision_str, pack_update_part });
+        defer allocator.free(pack_tail);
+
         var streaming_buf: [96]u8 = undefined;
         const streaming_part = streamingRowPart(
             &streaming_buf,
@@ -442,7 +448,7 @@ pub fn renderModelEntry(
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
-            pack_revision_str,
+            pack_tail,
         });
     }
 
@@ -1272,7 +1278,7 @@ test "/v1/models rows stay valid JSON for a model id and error name with a quote
         .id = hostile,
         .path = path,
         .bytes_on_disk = 0,
-        .arch_hint = "qwen4_exp",
+        .arch_hint = "example_arch",
         .config = &cfg,
         .weights = null,
         .transformer = null,
@@ -1397,4 +1403,49 @@ test "model quantization label K4 loaded and unloaded" {
 test "model quantization label affine unchanged" {
     try testQuantizationModelRow(null, "8-bit", true);
     try testQuantizationModelRow(null, "8-bit", false);
+}
+
+test "models row: meta.pack_update appears only for a pack with a newer published revision" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{ .model_type = "example_arch", .quant_bits = 8 };
+    var chat_cfg = chat_mod.ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = t.allocator,
+        .id = "test-pack",
+        .path = "/pack-update-test/ready-row",
+        .bytes_on_disk = 0,
+        .arch_hint = "example_arch",
+        .config = &cfg,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = &chat_cfg,
+        .vision_encoder = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .ready,
+        .error_name = null,
+    };
+    const bare = try renderModelEntry(t.allocator, t.io, &entry);
+    defer t.allocator.free(bare);
+    try t.expect(std.mem.indexOf(u8, bare, "pack_update") == null);
+
+    pack_update.record(entry.path, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull example-pack" } });
+    const row = try renderModelEntry(t.allocator, t.io, &entry);
+    defer t.allocator.free(row);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, row, .{});
+    defer parsed.deinit();
+    const up = parsed.value.object.get("meta").?.object.get("pack_update").?.object;
+    try t.expectEqualStrings("1.0", up.get("current").?.string);
+    try t.expectEqualStrings("2.0", up.get("latest").?.string);
+    try t.expectEqualStrings("sushi pull example-pack", up.get("command").?.string);
+
+    pack_update.record(entry.path, .current);
+    const after = try renderModelEntry(t.allocator, t.io, &entry);
+    defer t.allocator.free(after);
+    try t.expect(std.mem.indexOf(u8, after, "pack_update") == null);
 }

@@ -32,6 +32,7 @@ const model_settings = @import("model_settings.zig");
 const io_util = @import("io_util.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
+const pack_update = @import("pack_update.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
@@ -1164,6 +1165,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         entry.state = .ready;
+        pack_update.watch(entry.path);
         entry.memory_context_refusal = null;
         entry.error_name = null;
         self.lru_clock += 1;

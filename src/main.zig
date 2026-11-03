@@ -1130,6 +1130,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer log.closeFile();
     if (serve_mode and prompt == null and bench_run == null) update_mod.startDailyCheck(io, no_update_check);
+    cli_mod.configurePackUpdates(io, serve_mode and prompt == null and bench_run == null and !no_update_check);
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {

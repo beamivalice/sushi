@@ -108,6 +108,10 @@ const Shared = struct {
     sushi_listening: bool = false,
     port_taken: bool = false,
     model_loading: Str(96) = .{},
+    /// The ready model's `meta.pack_update`; empty `pack_latest` means none.
+    pack_current: Str(32) = .{},
+    pack_latest: Str(32) = .{},
+    pack_command: Str(96) = .{},
     mem_mb: ?u64 = null,
     gpu_mhz: ?u64 = null,
     gpu_pct: ?u64 = null,
@@ -477,6 +481,10 @@ fn pollLoop() void {
             shared.view = tracker.view(sample.link);
             shared.model.set(model orelse "");
             shared.model_loading.set(models.loading orelse "");
+            const pu = models.pack_update orelse logic.PackUpdate{};
+            shared.pack_current.set(pu.current);
+            shared.pack_latest.set(pu.latest);
+            shared.pack_command.set(pu.command);
             if (sample.link == .up) {
                 shared.mem_mb = sample.mem_mb;
                 shared.gpu_mhz = sample.gpu_mhz;
@@ -647,6 +655,7 @@ var open_mis: [4]objc.id = .{ null, null, null, null };
 var check_mi: objc.id = null;
 var update_mi: objc.id = null;
 var copy_mi: objc.id = null;
+var pack_mi: objc.id = null;
 var menu_target: objc.id = null;
 var top_menu: objc.id = null;
 var port_field_mi: objc.id = null;
@@ -805,6 +814,14 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     const view: logic.View = if (fresh) shared.view else .{ .link = .offline };
     const model = if (fresh) take(&model_b, &shared.model) else "";
     const loading_id = if (fresh) take(&loading_b, &shared.model_loading) else "";
+    var pack_cur_b: [32]u8 = undefined;
+    var pack_new_b: [32]u8 = undefined;
+    var pack_cmd_b: [96]u8 = undefined;
+    const pack_update: ?logic.PackUpdate = if (fresh and shared.pack_latest.len > 0) .{
+        .current = take(&pack_cur_b, &shared.pack_current),
+        .latest = take(&pack_new_b, &shared.pack_latest),
+        .command = take(&pack_cmd_b, &shared.pack_command),
+    } else null;
     var ln: usize = 0;
     for (shared.listings[0..shared.listing_n]) |l| {
         const m = take(&list_models[ln], &l.model);
@@ -865,6 +882,7 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .updating = uv.busy == .updating,
         .starting = ours_alive and view.link == .offline,
         .model = if (model.len > 0) model else if (loading_id.len > 0) loading_id else null,
+        .pack_update = pack_update,
         .mem_mb = mem_mb,
         .bar_version = bar_version,
         .update_available = uv.available,
@@ -918,6 +936,10 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     const copy_label = logic.copyLabel(&pb, uv.command);
     objc.msg(void, copy_mi, "setHidden:", .{!(uv.available and uv.path == .brew)});
     setText(copy_mi, "setTitle:", copy_label);
+    var pcb: [128]u8 = undefined;
+    const pack_copy = if (pack_update) |u| logic.copyLabel(&pcb, u.command) else "";
+    objc.msg(void, pack_mi, "setHidden:", .{pack_update == null});
+    setText(pack_mi, "setTitle:", pack_copy);
 
     if (relaunch) relaunchSelf(p);
 
@@ -929,12 +951,12 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
             pn += piece.len;
         }
         const shown_update = if (uv.available and uv.path == .brew) copy_label else if (uv.available) update_label else "";
-        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d}\n", .{
+        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\"\n", .{
             tick_count,                 title,                 status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
             @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         check,
             shown_update,               header.pill.label,     header.line1,           header.line2,
-            tg.label,                   @intFromBool(port_field.isInvalid()),
+            tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_copy,
         });
         if (tick_count >= test_polls) quit();
     }
@@ -1001,6 +1023,15 @@ fn updateAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 fn copyAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     objc.copyText("brew upgrade sushi");
 }
+fn copyPackAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    var cmd: [97]u8 = undefined;
+    lock();
+    const n = shared.pack_command.len;
+    @memcpy(cmd[0..n], shared.pack_command.get());
+    unlock();
+    cmd[n] = 0;
+    if (n > 0) objc.copyText(@ptrCast(&cmd));
+}
 
 /// A symbol in the accent colour (not a template, so the menu does not tint it grey).
 fn accentSymbol(name: []const u8) objc.id {
@@ -1039,6 +1070,7 @@ fn runMenuBar() noreturn {
         .{ .selector = "check:", .imp = @ptrCast(&checkAction), .types = "v@:@" },
         .{ .selector = "update:", .imp = @ptrCast(&updateAction), .types = "v@:@" },
         .{ .selector = "copy:", .imp = @ptrCast(&copyAction), .types = "v@:@" },
+        .{ .selector = "copyPack:", .imp = @ptrCast(&copyPackAction), .types = "v@:@" },
     });
     menu_target = objc.new(cls);
     const menu = objc.new(objc.class("NSMenu"));
@@ -1083,6 +1115,8 @@ fn runMenuBar() noreturn {
     objc.msg(void, update_mi, "setHidden:", .{true});
     copy_mi = addItem(menu, "Copy", "copy:", 0, "", "doc.on.doc");
     objc.msg(void, copy_mi, "setHidden:", .{true});
+    pack_mi = addItem(menu, "Copy", "copyPack:", 0, "", "doc.on.doc");
+    objc.msg(void, pack_mi, "setHidden:", .{true});
     addSeparator(menu);
 
     _ = addItem(menu, "Quit sushibar", "quit:", 0, "q", "power");
@@ -1134,6 +1168,11 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
         .{ .name = "update", .sparkline = true, .in = .{
             .link = .up, .port = 12345, .model = "Example-Flash-Next-Sushi-STQ-2.75bpw", .mem_mb = 31200, .bar_version = "1.5.0",
             .update_available = true, .latest = "1.5.1", .last = 142.6, .last_prefill = 3120, .gpu_mhz = 1380, .gpu_pct = 8,
+        } },
+        .{ .name = "pack-update", .sparkline = true, .in = .{
+            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0", .up_to_date = true,
+            .pack_update = .{ .current = "1.0", .latest = "2.0", .command = "sushi pull example-pack" },
+            .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
         } },
     };
     for (states) |st| {

@@ -17,6 +17,8 @@ extern var NSParagraphStyleAttributeName: id;
 pub const width: f64 = 300;
 pub const height_full: f64 = 168;
 pub const height_short: f64 = 84;
+/// Extra height of the pack-update line under the model.
+const pack_row_h: f64 = 15;
 const pad: f64 = 12;
 const spark_y: f64 = 130;
 const spark_h: f64 = 30;
@@ -42,6 +44,7 @@ const Shown = struct {
     pill_label: Buf(24) = .{},
     pill_tone: logic.Tone = .grey,
     line1: Buf(160) = .{},
+    pack_line: Buf(80) = .{},
     line2: Buf(96) = .{},
     show_stats: bool = false,
     values: [3]Buf(16) = .{ .{}, .{}, .{} },
@@ -117,12 +120,12 @@ fn fillRound(r: NSRect, radius: f64, c: id) void {
     msg(void, path, "fill", .{});
 }
 
-fn drawSpark(accent: id) void {
+fn drawSpark(accent: id, dy: f64) void {
     var raw: [160]logic.PlotPoint = undefined;
-    const pts = logic.plotSpark(&raw, shown.spark[0..shown.spark_n], pad, width - 2 * pad, spark_y + 4, spark_y + spark_h - 2);
+    const pts = logic.plotSpark(&raw, shown.spark[0..shown.spark_n], pad, width - 2 * pad, spark_y + dy + 4, spark_y + dy + spark_h - 2);
     if (pts.len < 2) return;
-    const bottom = spark_y + spark_h - 2;
-    msg(void, objc.class("NSBezierPath"), "clipRect:", .{NSRect{ .x = pad, .y = spark_y, .w = width - 2 * pad, .h = spark_h }});
+    const bottom = spark_y + dy + spark_h - 2;
+    msg(void, objc.class("NSBezierPath"), "clipRect:", .{NSRect{ .x = pad, .y = spark_y + dy, .w = width - 2 * pad, .h = spark_h }});
     const fill_color = msg(id, accent, "colorWithAlphaComponent:", .{@as(f64, 0.12)});
     var s: usize = 0;
     while (s < pts.len) {
@@ -154,10 +157,14 @@ fn drawSpark(accent: id) void {
     }
 }
 
+fn shownHeight() f64 {
+    return (if (shown.show_stats) height_full else height_short) + (if (shown.pack_line.len > 0) pack_row_h else 0);
+}
+
 fn drawRect(_: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     if (opaque_bg) {
         msg(void, color("windowBackgroundColor"), "setFill", .{});
-        msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithRect:", .{NSRect{ .x = 0, .y = 0, .w = width, .h = height_full }}), "fill", .{});
+        msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithRect:", .{NSRect{ .x = 0, .y = 0, .w = width, .h = shownHeight() }}), "fill", .{});
     }
     const label = color("labelColor");
     const secondary = color("secondaryLabelColor");
@@ -182,7 +189,9 @@ fn drawRect(_: id, _: objc.SEL, _: NSRect) callconv(.c) void {
 
     // Row 2: the model and where it is.
     text(shown.line1.get(), .{ .x = pad, .y = 46, .w = width - 2 * pad, .h = 16 }, font(12, weight_medium, false), label, truncate_middle, align_left);
-    text(shown.line2.get(), .{ .x = pad, .y = 63, .w = width - 2 * pad, .h = 14 }, font(11, weight_regular, false), secondary, truncate_tail, align_left);
+    const dy: f64 = if (shown.pack_line.len > 0) pack_row_h else 0;
+    if (dy > 0) text(shown.pack_line.get(), .{ .x = pad, .y = 63, .w = width - 2 * pad, .h = 14 }, font(11, weight_medium, false), color("controlAccentColor"), truncate_tail, align_left);
+    text(shown.line2.get(), .{ .x = pad, .y = 63 + dy, .w = width - 2 * pad, .h = 14 }, font(11, weight_regular, false), secondary, truncate_tail, align_left);
     if (!shown.show_stats) return;
 
     // Row 3: three equal columns.
@@ -191,12 +200,12 @@ fn drawRect(_: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     const label_font = font(10, weight_medium, false);
     for (0..3) |i| {
         const x = pad + @as(f64, @floatFromInt(i)) * col_w;
-        text(shown.values[i].get(), .{ .x = x, .y = 88, .w = col_w - 4, .h = 22 }, value_font, label, clip, align_left);
-        text(shown.labels[i].get(), .{ .x = x, .y = 111, .w = col_w - 4, .h = 12 }, label_font, secondary, truncate_tail, align_left);
+        text(shown.values[i].get(), .{ .x = x, .y = 88 + dy, .w = col_w - 4, .h = 22 }, value_font, label, clip, align_left);
+        text(shown.labels[i].get(), .{ .x = x, .y = 111 + dy, .w = col_w - 4, .h = 12 }, label_font, secondary, truncate_tail, align_left);
     }
 
     // Row 4: decode throughput over the last five minutes.
-    drawSpark(color("controlAccentColor"));
+    drawSpark(color("controlAccentColor"), dy);
 }
 
 fn isFlipped(_: id, _: objc.SEL) callconv(.c) bool {
@@ -226,6 +235,7 @@ pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
     shown.pill_label.set(h.pill.label);
     shown.pill_tone = h.pill.tone;
     shown.line1.set(h.line1);
+    shown.pack_line.set(h.pack_line);
     shown.line2.set(h.line2);
     shown.show_stats = h.show_stats;
     for (h.stats, 0..) |st, i| {
@@ -240,7 +250,7 @@ pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
         msg(void, image_view, "setImage:", .{if (h.color_icon) icon_color else icon_outline});
         msg(void, image_view, "setContentTintColor:", .{if (h.color_icon) @as(id, null) else color("labelColor")});
     }
-    const want_h = if (h.show_stats) height_full else height_short;
+    const want_h = shownHeight();
     msg(void, view, "setFrameSize:", .{objc.NSSize{ .width = width, .height = want_h }});
     msg(void, view, "setAccessibilityLabel:", .{str(h.a11y)});
     msg(void, view, "setNeedsDisplay:", .{true});
@@ -250,7 +260,7 @@ pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
 pub fn renderPng(path: [*:0]const u8, dark: bool) bool {
     opaque_bg = true;
     defer opaque_bg = false;
-    const h: f64 = if (shown.show_stats) height_full else height_short;
+    const h = shownHeight();
     const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
     msg(void, view, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
     const bounds = NSRect{ .x = 0, .y = 0, .w = width, .h = h };

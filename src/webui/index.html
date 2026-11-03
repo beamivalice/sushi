@@ -3274,7 +3274,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const P = per(F.id), pend = modelStore.pending.get(m.id), failed = modelStore.failed.get(m.id);
     setText(F.name, m.id);
     const words = pend ? (pend === "unload" ? "Unloading…" : "Loading…") : { ready: "Loaded", loading: "Loading…", error: "Load failed" }[m.state] ?? "Not loaded";
-    const facts = [m.bytes_on_disk && `${adminBytes(m.bytes_on_disk)} on disk`, m.bytes_linked > 0 && `${adminBytes(m.bytes_linked)} linked from elsewhere`, m.state === "ready" && m.bytes_resident && `${adminBytes(m.bytes_resident)} in memory`,
+    const facts = [m.bytes_on_disk && `${adminBytes(m.bytes_on_disk)} on disk`, m.bytes_linked > 0 && `${adminBytes(m.bytes_linked)} linked from elsewhere`, m.state === "ready" && m.bytes_resident && `${adminBytes(m.bytes_resident)} in memory`, m.meta?.pack_update && `Pack ${m.meta.pack_update.latest} available — ${m.meta.pack_update.command}`,
       m.context_length && `${adminTokens(m.context_length)} max context`, (m.input_modalities ?? []).includes("image") && "sees images", streamsExperts(m) ? "streams experts" : m.streaming && "can stream experts"].filter(Boolean);
     fill(F.facts, [dotOf(m), words, ...facts, m.path].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map((t) => h("span", { text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
     fill(F.actions, `${m.state}|${pend ?? ""}`, () => {

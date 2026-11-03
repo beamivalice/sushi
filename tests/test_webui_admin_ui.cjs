@@ -37,7 +37,7 @@ function makeServer(opts = {}) {
     models: [
       { id: 'Qwen-A', state: 'ready', bytes_on_disk: 38 * GiB, bytes_resident: 40 * GiB, context_length: 262144, input_modalities: ['text', 'image'], keys: [...BASE_KEYS, 'vision'], settings: allKeys({ ctx_size: keyState({ file: 65536, source: 'file' }), kv_quant: keyState({ flag: '8', source: 'flag', locked: true }) }) },
       { id: 'GLM-B', state: 'unloaded', bytes_on_disk: 61 * GiB, context_length: 131072, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys({ kv_quant: keyState({ file: 'off', source: 'file' }) }) },
-      { id: 'Deep-C', state: 'unloaded', bytes_on_disk: 96 * GiB, bytes_linked: 40 * GiB, streaming: true, context_length: 131072, input_modalities: ['text'], keys: [...BASE_KEYS, 'ssd_budget_gb', 'ssd_prefetch'], settings: allKeys() },
+      { id: 'Deep-C', state: 'unloaded', bytes_on_disk: 96 * GiB, bytes_linked: 40 * GiB, pack_update: { current: '1.0', latest: '2.0', command: 'sushi pull deepseek-v4.1-flash' }, streaming: true, context_length: 131072, input_modalities: ['text'], keys: [...BASE_KEYS, 'ssd_budget_gb', 'ssd_prefetch'], settings: allKeys() },
       { id: 'Broke-D', state: 'error_state', bytes_on_disk: 20 * GiB, context_length: 8192, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys() },
     ],
     server: {
@@ -53,7 +53,7 @@ function makeServer(opts = {}) {
       ],
     },
   };
-  const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit' } })) });
+  const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit', ...(m.pack_update ? { pack_update: m.pack_update } : {}) } })) });
   const settingsBody = () => ({ file: '/h/.sushi/model-settings.json', applies: 'next load of the model', model_keys: KEYS, server: state.server,
     models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
   if (opts.limits) {
@@ -323,9 +323,10 @@ async function main() {
       // `streaming` only says the pack can stream; with no budget it loads resident.
       assert.match(await page.textContent('.detail .facts'), /can stream experts/);
       assert.match(await page.textContent('.detail .facts'), /96\.0 GiB on disk.*40\.0 GiB linked from elsewhere/);
+      assert.match(await page.textContent('.detail .facts'), /Pack 2\.0 available — sushi pull deepseek-v4\.1-flash/);
       await page.click('.list [data-id="Qwen-A"]');
       await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Qwen-A');
-      assert.doesNotMatch(await page.textContent('.detail .facts'), /linked from elsewhere/);
+      assert.doesNotMatch(await page.textContent('.detail .facts'), /linked from elsewhere|Pack .* available/);
       await page.click('.list [data-id="Deep-C"]');
       await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Deep-C');
       assert.doesNotMatch(await page.textContent('.list [data-id="Deep-C"]'), /streams experts/);

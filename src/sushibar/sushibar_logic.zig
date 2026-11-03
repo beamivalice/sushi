@@ -153,15 +153,27 @@ fn fieldIndex(fields: []const []const u8, name: []const u8) ?usize {
     return null;
 }
 
-pub const ModelState = struct { ready: ?[]const u8 = null, loading: ?[]const u8 = null };
+/// `meta.pack_update` of a `/v1/models` row: a newer pack revision is published.
+pub const PackUpdate = struct { current: []const u8 = "", latest: []const u8 = "", command: []const u8 = "" };
+
+pub const ModelState = struct { ready: ?[]const u8 = null, loading: ?[]const u8 = null, pack_update: ?PackUpdate = null };
 
 /// Which model `/v1/models` lists as ready, and which as loading.
 pub fn parseModelState(arena: std.mem.Allocator, body: []const u8) !ModelState {
-    const List = struct { data: []const struct { id: []const u8 = "", state: []const u8 = "" } = &.{} };
+    const List = struct { data: []const struct {
+        id: []const u8 = "",
+        state: []const u8 = "",
+        meta: struct { pack_update: ?PackUpdate = null } = .{},
+    } = &.{} };
     const list = try std.json.parseFromSliceLeaky(List, arena, body, .{ .ignore_unknown_fields = true });
     var out: ModelState = .{};
     for (list.data) |m| {
-        if (out.ready == null and std.mem.eql(u8, m.state, "ready")) out.ready = m.id;
+        if (out.ready == null and std.mem.eql(u8, m.state, "ready")) {
+            out.ready = m.id;
+            if (m.meta.pack_update) |u| if (u.latest.len > 0 and u.command.len > 0) {
+                out.pack_update = u;
+            };
+        }
         if (out.loading == null and std.mem.eql(u8, m.state, "loading")) out.loading = m.id;
     }
     return out;
@@ -533,6 +545,7 @@ pub const HeaderIn = struct {
     updating: bool = false,
     starting: bool = false,
     model: ?[]const u8 = null,
+    pack_update: ?PackUpdate = null,
     mem_mb: ?u64 = null,
     bar_version: []const u8 = "",
     update_available: bool = false,
@@ -555,6 +568,8 @@ pub const Header = struct {
     version_tail: []const u8,
     pill: Pill,
     line1: []const u8,
+    /// Accent line under the model: a newer pack revision is published; empty when not.
+    pack_line: []const u8,
     line2: []const u8,
     show_stats: bool,
     stats: [3]Stat,
@@ -602,6 +617,10 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
         h.line2 = fmt(a, "Port {d}", .{in.port});
     }
     h.show_stats = in.link == .up and in.model != null;
+    h.pack_line = "";
+    if (in.link == .up and !in.loading and in.model != null) if (in.pack_update) |u| {
+        h.pack_line = fmt(a, "Pack {s} available (you have {s})", .{ u.latest, u.current });
+    };
 
     var tmp: [32]u8 = undefined;
     const speed: ?f64 = if (in.decoding) in.live else in.last;
@@ -1124,6 +1143,38 @@ test "models: ready and loading are told apart" {
     const loading = try parseModelState(a, "{\"data\":[{\"id\":\"c\",\"state\":\"loading\"}]}");
     try std.testing.expect(loading.ready == null);
     try std.testing.expectEqualStrings("c", loading.loading.?);
+}
+
+test "pack update: the ready model's meta.pack_update is read, a missing or other model's is not" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const up = "{\"current\":\"1.0\",\"latest\":\"2.0\",\"command\":\"sushi pull example-pack\"}";
+    const has = try parseModelState(a, "{\"data\":[{\"id\":\"a\",\"state\":\"unloaded\",\"meta\":{\"pack_update\":" ++ up ++ "}},{\"id\":\"b\",\"state\":\"ready\",\"meta\":{\"pack_update\":" ++ up ++ "}}]}");
+    try std.testing.expectEqualStrings("2.0", has.pack_update.?.latest);
+    try std.testing.expectEqualStrings("1.0", has.pack_update.?.current);
+    try std.testing.expectEqualStrings("sushi pull example-pack", has.pack_update.?.command);
+    const none = try parseModelState(a, "{\"data\":[{\"id\":\"b\",\"state\":\"ready\",\"meta\":{\"quantization\":\"x\"}}]}");
+    try std.testing.expect(none.pack_update == null);
+    const other = try parseModelState(a, "{\"data\":[{\"id\":\"a\",\"state\":\"unloaded\",\"meta\":{\"pack_update\":" ++ up ++ "}},{\"id\":\"b\",\"state\":\"ready\"}]}");
+    try std.testing.expect(other.pack_update == null);
+    const empty = try parseModelState(a, "{\"data\":[{\"id\":\"b\",\"state\":\"ready\",\"meta\":{\"pack_update\":{\"latest\":\"\"}}}]}");
+    try std.testing.expect(empty.pack_update == null);
+}
+
+test "pack update: the card names it under a loaded model, the menu offers its command" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pu: PackUpdate = .{ .current = "1.0", .latest = "2.0", .command = "sushi pull example-pack" };
+    const h = try buildHeader(a, .{ .link = .up, .port = 1, .model = "m", .pack_update = pu });
+    try std.testing.expectEqualStrings("Pack 2.0 available (you have 1.0)", h.pack_line);
+    try std.testing.expectEqualStrings("", (try buildHeader(a, .{ .link = .up, .port = 1, .model = "m" })).pack_line);
+    try std.testing.expectEqualStrings("", (try buildHeader(a, .{ .link = .offline, .port = 1, .model = "m", .pack_update = pu })).pack_line);
+    try std.testing.expectEqualStrings("", (try buildHeader(a, .{ .link = .up, .port = 1, .model = "m", .loading = true, .pack_update = pu })).pack_line);
+    try std.testing.expectEqualStrings("", (try buildHeader(a, .{ .link = .up, .port = 1, .pack_update = pu })).pack_line);
+    var b: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Copy “sushi pull example-pack”", copyLabel(&b, pu.command));
 }
 
 test "menu: the one server toggle" {

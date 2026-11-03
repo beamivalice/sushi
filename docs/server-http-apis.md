@@ -75,6 +75,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - A prompt that tokenizes to zero tokens is a 400 `invalid_request_error` and never reaches generate: completions
   refuse it after tokenizing, `Scheduler.submit` refuses it for every surface (`error.EmptyPrompt`), and
   `Generator.initWithOptions` returns that error rather than index the prompt's last token.
+- `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash"}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it.
 - `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
   a status route never reaches `ensureLoaded` (`handlePropsNoModel`). Removed upstream routes answer named 404s.

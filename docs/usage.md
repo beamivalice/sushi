@@ -56,6 +56,13 @@ it may still run streamed ([README, Streaming](../README.md#streaming)), with no
 Sizes are the whole download; a Qwen pack's n-gram table and DeepSeek's 189 GiB of Engram tables stay on the SSD and are
 never loaded. Offline, `sushi list` shows only the models on disk.
 
+A pack carries a revision in `config.json` (`pack_revision.id`; a pack without it is revision 1.0). When Hugging Face
+publishes a higher revision of a pack you have downloaded, `sushi list` prints, under its row,
+`update available: 2.0 (you have 1.0) — sushi pull deepseek-v4.1-flash`. Nothing is printed when the pack is current,
+when its repo is not known (a folder that is neither a catalog pack nor pulled by `sushi pull`) or when Hugging Face
+cannot be reached or answers 404 (a private repo needs `HF_TOKEN`). The server asks the same once after a model loads and
+then once a day, unless `--no-update-check`.
+
 ## Recommended launch
 
 Every GPU limit below is set with `sudo sysctl iogpu.wired_limit_mb=<N>` and resets at reboot.
