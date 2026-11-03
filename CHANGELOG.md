@@ -4,43 +4,31 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.5.0 — Menu bar, new dashboard, trustworthy pack updates
 
-- **The Dashboard and Settings name the volume the SSD cache writes to**, with its free space, and warn below 10% free or near the 4 GiB reserve; a cache folder set to a drive that is not mounted shows as unavailable. Thanks @cyrilmhansen.
-- **A pack that mixes two revisions is refused at load**: a pack whose `config.json` names a `pack_revision` loads only when every shard it reads carries that revision (the shard is named, with both revisions and the fix, in the log and the 503), `/v1/models` and `/props` report it as `pack_revision` (null for a pack that names none), so a half-updated folder can never serve a blend of two uploads.
-- **`sushi pull` compares contents, not sizes**: a file on disk is kept only when its checksum matches the repo's (from the manifest `.sushi-pull.json` a finished pull writes, or a one-time hash of a folder without one), every download is verified before it is put in place, and files the repo has dropped since the last pull are removed.
-- **`sushi list`, the server and `sushibar` say when a newer revision of your pack is published**: `sushi list` prints `update available: 2.0 (you have 1.0) — sushi pull <pack>` under a downloaded pack, `/v1/models` adds `meta.pack_update` to the loaded model's row, and `sushibar` and the Models tab show it with a button or menu item that copies the pull command; `--no-update-check` turns the server's look off.
-- **`sushi --version >> file` and other redirected output append instead of overwriting the file's start**, and `sushi update --check` names the failure when the release server cannot be reached.
-- **The Dashboard charts the GPU clock beside GPU utilization, and `sushi bench` no longer needs sudo**: the server reads the GPU clock itself (`gpu_clock_mhz` and `gpu_clock_max_mhz` in `/metrics.json` and `/metrics`, `gpu_mhz` in the history), and the bench reads the clock and thermal pressure the same way instead of through `sudo powermetrics`.
-- **`sushibar` puts sushi in the menu bar**: it ships beside `sushi`, shows a sushi icon (outline offline, colour online) and the decode tok/s, and opens on a status card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph); its menu starts a headless server, stops the sushi on the watched port (after a confirm for one it did not start), switches the port (from the list or a field in the menu) and remembers it, checks for and installs sushi updates, and opens the dashboard, chat, Models and Settings pages.
-- **The Models tab no longer overstates disk use**: `/v1/models` adds `bytes_linked`, the part of a pack's size that comes through symlinks to files outside its folder (the DeepSeek STQ Engram shards), and a model's details say "N GiB linked from elsewhere" beside its size.
-- **`sushi serve --model` answers right away**: the web page, dashboard, settings and the status routes work while the model loads, `/v1/models` lists it as loading, `/health` answers 503 `loading` until it is ready, and a chat sent meanwhile is answered once the load finishes; a load that fails still ends the server with its error.
-- **The Models list no longer shows the repo's test fixtures**: a folder named `test-fixtures` (and any dot folder) inside a models folder is skipped by discovery and rescan, while `--model-dir` pointed straight at such a folder still lists what is in it.
-- **The web page opens on the Dashboard**: the tabs read Dashboard, Chat, Models, Settings and Cmd+1 to Cmd+4 switch between them, `/chat` opens the chat, and the startup banner and `sushi run` print that address.
-- **The Dashboard shows one point per finished request**: two requests that end close together no longer merge into one speed, a restart is recognised by the process start time, uptime counts from the process start, and Offline or metrics-off show a dash instead of the last numbers; `/metrics.json?since=` adds the last 128 finished requests, each with its own prefill and decode time.
-- **The chat keeps what you typed and read**: a reply that breaks off keeps its words with a Retry button, a deleted conversation stays deleted, two tabs share one conversation list, a full browser store warns once, and a damaged saved chat no longer stops the page.
-- **Models and Settings keep unsaved edits**: Back, a tab switch or a poll no longer drops an edit or jumps to another model, a setting fixed by a launch flag shows that flag, and the Settings tab lists a saved models folder as in use.
-- **The web page offers each model only the settings it honours**: `GET /v1/settings` lists per model what is disabled (a KV width the model cannot store, MTP where there is no head, a prefetcher a pack lacks), the largest context, and which keys depend on others, `POST /v1/settings` refuses such a value with its reason, and a `kv_quant` 4 in `model-settings.json` no longer stops a GLM load.
-- **The web page's settings and SSD cache controls apply what they say**: a cache size saved after boot reaches the next model load (it was ignored when the server started with the tier off), the answer says "applied to the running tiers" only when a tier was resized, the shown size is the one in force, a model-scope clear needs a model, a cache another server's private root holds is never deleted, one stale cache can be cleared by id, a long `--model-dir` or a sub-GB `--prefix-cache-disk` shows whole, edits reach a hand-written trailing-slash key and a symlinked settings file, `kv_quant` is stored as `off|4|6|8`, each model lists the keys that apply to it and the values it loaded with, and the boot log names `model-settings.json` when the file set the size.
-- **DeepSeek-V4.1's SSD prefix cache writes far less**: a long agent conversation writes each row once instead of once per turn, and the web page's Settings tab shows and clears it. Caches written by earlier versions are not read; clear them from Settings.
-- **Metrics are on by default**: `/metrics`, `/metrics.json` and the dashboard work without a flag; `--no-metrics` turns them off, and `--metrics` is still accepted and does nothing.
-- **The dashboard's charts no longer break when the tab is in the background**: the server keeps the last hour of samples and the page fills the missing interval from `/metrics.json?since=` when you come back, drawing a real outage as a gap.
-- **The web page opens in a Compact view**: a one-line status strip (model, idle or busy, uptime), five equal tiles (decode and prefill speed of the last request, memory against the machine's, SSD cache, requests) and separate prefill, decode and memory charts, each on its own scale; an Advanced toggle in the header brings back the full dashboard, and the dashboard says so plainly when the server is offline or metrics are off.
-
-- **The web page has Models and Settings tabs**: Models lists every model with a form for its `model-settings.json` keys that shows each key's source (default, saved or launch flag), whether a change applies at once or at the next load, and only the values that model supports; unsaved edits survive refreshes and ask before you leave, and Settings shows the SSD prefix cache's size and use, clears one cache or all stale ones after naming the bytes freed, and edits the models folder. `GET /v1/prefix-cache`, `POST /v1/prefix-cache/clear` and `GET`/`POST /v1/settings` serve them behind `--api-key`.
-
-- **DeepSeek-V4.1 decode recomputes only the missed picks of a route-spec rebuild**: when a speculated route leaves some experts off the cache map, only those experts run again and join the kept ones in the same order, with byte-identical text.
-- **DeepSeek-V4.1 expert prefetch is opt-in with `--ssd-prefetch N` (default 0, off; 65 is the tuned cap)**: the expert reads of a route and of the prefetch together stay under that percent of this Mac's measured SSD read rate, so the prefetch never slows an SSD-bound budget.
-- **Streamed experts fill faster with identical output**: a fill's reads are split across the I/O workers by cost per read as well as by bytes, so a run of small scale reads no longer queues behind the last large one.
-- **DeepSeek-V4.1 `/v1/completions` with a text prompt no longer ends at the first token**: the prompt now opens with the model's BOS, as the chat template and a token-id prompt already did.
-- **DeepSeek-V4.1 DSpark drafts from the context when the output copies it**: an echoed file or an edit that leaves most lines alone verifies up to seven copied tokens a round instead of the stage block, with greedy text unchanged. Ported from CommunityServe/plugins #15, thanks @STRML.
-- **DeepSeek-V4.1 packs can be pair-major**: `expert_quant.tile_order` names a `trellis_pm` layout the streaming engine reads without reshuffling tiles, with page-aligned experts read straight into page-aligned pools, and an older build refuses such a pack by name. `sushi repack <pack>` rewrites a pack-order STQ pack into it in place, replacing a shard only after its rewrite reads back equal, and resumes after an interruption; `--pack-revision <id>` (with `--shards`, `--unstamped` and a read-only `--check`) also stamps a pack with a revision in `config.json` and every shard header.
-- **DeepSeek-V4.1 DSpark greedy text no longer depends on the verify-width mix**: the decode attention split a verify
-  row's columns by its block's width, so the same request could differ between runs; it now gives the same text every run.
-- **DeepSeek-V4.1 decode spends less CPU per token with byte-identical output**: fewer Metal command buffers per layer,
-  two fewer kernel launches per layer, custom kernels handed to MLX without comments or unused helpers, a DSpark verify
-  round waits on the host only for its argmax, idle expert prefetches are skipped, and a streamed reply no longer
-  rescans the whole answer on every token.
+- **`sushibar` puts sushi in the menu bar**: a native app beside `sushi` shows live decode speed and a status card
+  (model, memory, prefill, GPU clock, a five-minute decode graph), starts and stops the server on any port, opens the
+  dashboard and chat, and installs sushi updates.
+- **A new web page that opens on the Dashboard**: Dashboard, Chat, Models and Settings tabs (Cmd+1 to Cmd+4); a Compact
+  view with one point per finished request and the GPU clock beside utilization; Models and Settings edit each model's
+  settings and the SSD prefix cache, offering only what that model honours and naming the volume the cache writes to
+  with its free space (thanks @cyrilmhansen). The page answers while a model is still loading, and metrics are on by
+  default.
+- **Pack updates you can trust**: `sushi pull` compares file contents instead of sizes and verifies every download, a
+  pack folder that mixes two uploads is refused at load naming the file, and `sushi list`, the Models tab and `sushibar`
+  say when a newer revision of your pack is published.
+- **DeepSeek-V4.1 pair-major packs**: a new expert layout the streaming engine reads straight into its pools; `sushi
+  repack <pack>` converts a downloaded pack in place, or `sushi pull` fetches the new revision once it is published.
+  Versions before 1.5.0 refuse a pair-major pack by name.
+- **Faster, steadier DeepSeek-V4.1 decode**: DSpark verifies up to seven copied tokens a round when a reply echoes its
+  context (ported from CommunityServe/plugins, thanks @STRML), greedy text no longer varies between runs, decode spends
+  less CPU per token, streamed experts fill faster with identical output, and `--ssd-prefetch N` makes expert prefetch
+  opt-in under an SSD read cap.
+- **DeepSeek-V4.1 fixes**: raw-text `/v1/completions` no longer stops at the first token, and the SSD prefix cache writes
+  each row once instead of once per turn (caches from earlier versions are not read; clear them in Settings).
+- **Smaller fixes**: `sushi bench` no longer needs sudo, redirected output appends instead of overwriting, `sushi update
+  --check` names a network failure, and the Models list hides test fixtures and no longer counts linked Engram shards
+  as the pack's size.
 
 ## v1.4.1 — Faster DeepSeek prefill, DeepSeek with no flags
 
