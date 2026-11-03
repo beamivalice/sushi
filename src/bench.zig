@@ -871,7 +871,7 @@ fn writeFile(io: std.Io, path: []const u8, body: []const u8) !void {
 
 fn printOut(io: std.Io, text: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.writeAll(text);
     try w.interface.flush();
 }

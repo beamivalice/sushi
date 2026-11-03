@@ -157,6 +157,8 @@ echo "[1/7] check, and the refusals that leave the install alone"
 upd --check
 check "--check names $NEXT" "$(has "$WORK/upd.log" "sushi $NEXT is available (this is $CUR)")"
 check "--check recorded the answer" "$(has "$HOME/.sushi/update-check.json" "\"latest\":\"$NEXT\"")"
+if SUSHI_UPDATE_API="http://127.0.0.1:1" upd --check; then offline_rc=0; else offline_rc=1; fi
+check "--check with no release server exits non-zero and says it could not reach it" "$([ "$offline_rc" = 1 ] && grep -q "update: could not reach the release server" "$WORK/upd.log" && echo 1 || echo 0)"
 if boot; then
     upd
     check "a running sushi from the install refuses the update" "$(has "$WORK/upd.log" "(pid $SPID) is running from")"

@@ -6,6 +6,10 @@ const logic = @import("sushibar_logic.zig");
 
 extern fn proc_pidpath(pid: c_int, buffer: *anyopaque, size: u32) c_int;
 extern fn getsid(pid: c_int) c_int;
+extern fn flock(fd: c_int, op: c_int) c_int;
+
+const lock_ex = 2;
+const lock_nb = 4;
 
 const ctl_kern = 1;
 const kern_procargs2 = 49;
@@ -34,6 +38,16 @@ pub fn isSessionLeader() bool {
 
 pub fn pidFilePath(buf: []u8, home: []const u8, name: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.sushi/{s}", .{ home, name }) catch null;
+}
+
+/// Takes the exclusive lock on `path` for the rest of the process (the descriptor stays open; `exec` closes it, and
+/// the new image takes it again). False when another process holds it.
+pub fn acquireLock(path: [*:0]const u8) bool {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return false;
+    if (flock(fd, lock_ex | lock_nb) == 0) return true;
+    _ = std.c.close(fd);
+    return false;
 }
 
 pub fn writePid(io: std.Io, home: []const u8, path: []const u8, entry: logic.PidEntry) !void {
@@ -198,7 +212,7 @@ pub fn runCapture(argv: []const [*:0]const u8, out_path: [*:0]const u8) ?u8 {
 }
 
 /// `path` with every symlink resolved: Homebrew links `bin/sushibar` to the keg's `libexec/sushibar`, and the
-/// sibling `sushi` and the Cellar check belong to the keg.
+/// sibling `sushi` and the Cellar check belong to the keg. Resolve again at each use: an upgrade replaces the keg.
 pub fn realPath(buf: []u8, path: []const u8) ?[]const u8 {
     var in: [std.fs.max_path_bytes:0]u8 = undefined;
     if (path.len >= in.len or buf.len < std.fs.max_path_bytes) return null;
@@ -287,6 +301,18 @@ test "runCapture: output and exit code of a short program, and a program that ca
     const n = try f.readPositionalAll(std.testing.io, &text, 0);
     try std.testing.expectEqualStrings("out\nerr\n", text[0..n]);
     try std.testing.expectEqual(@as(?u8, null), runCapture(&.{"/no/such/program"}, path));
+}
+
+test "acquireLock: a second holder is refused while the first lives, in this process or another" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(std.testing.io, &dir_buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/bar.lock", .{dir}, 0);
+    try std.testing.expect(acquireLock(path));
+    try std.testing.expect(!acquireLock(path));
+    try std.testing.expectEqual(@as(?u8, 1), runCapture(&.{ "/usr/bin/perl", "-e", "use Fcntl qw(:flock); open(my $f, '>>', $ARGV[0]) or exit 2; exit(flock($f, LOCK_EX|LOCK_NB) ? 0 : 1)", path }, "/dev/null"));
 }
 
 test "pid file: written, verified against the process table, and swept when stale" {

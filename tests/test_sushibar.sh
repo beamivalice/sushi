@@ -19,6 +19,8 @@ FPORT=$((PORT + 1))
 TPORT=$((PORT + 2))
 UPORT=$((PORT + 5))
 APORT=$((PORT + 6))
+HPORT=$((PORT + 7))
+SPORT=$((PORT + 8))
 PASS=0
 FAIL=0
 
@@ -47,7 +49,7 @@ check "no libmlx, libmlxc, libwebp or libc++ is linked" "$(yes_if '[ -z "$stray"
 
 SUSHI_BIN="$(dirname "$BAR")/sushi"
 if [ ! -x "$SUSHI_BIN" ]; then echo "SKIP: no sushi beside sushibar"; [ "$FAIL" -eq 0 ] && exit 3 || exit 1; fi
-for p in "$PORT" "$FPORT" "$TPORT" "$UPORT" "$APORT"; do
+for p in "$PORT" "$FPORT" "$TPORT" "$UPORT" "$APORT" "$HPORT" "$SPORT"; do
     if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
         echo "FAIL: port $p is busy; pass a free base port"
         exit 1
@@ -62,11 +64,13 @@ LOG="$WORK/bar.err"
 FPID=""
 TPID=""
 APID=""
+HPID=""
+SPID=""
 cleanup() {
-    for f in "$HOME/.sushi/sushibar-server.pid" "$HOME/.sushi/sushibar.pid"; do
+    for f in "$HOME"/.sushi/sushibar-server-*.pid "$HOME/.sushi/sushibar.pid"; do
         [ -f "$f" ] && kill "$(cut -d' ' -f1 "$f")" 2>/dev/null
     done
-    for p in $FPID $TPID $APID; do kill "$p" 2>/dev/null; done
+    for p in $FPID $TPID $APID $HPID $SPID; do kill "$p" 2>/dev/null; done
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -104,7 +108,7 @@ check "a second sushibar says it is already running and exits 0" "$(yes_if '[ $r
 
 health=$(wait_health "$PORT")
 check "Start launched a headless sushi: /health is 200" "$(yes_if '[ "$health" = 200 ]')"
-SRVPID=$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server.pid" 2>/dev/null)
+SRVPID=$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$PORT.pid" 2>/dev/null)
 check "the server pid file names a live sushi" "$(yes_if '[ -n "$SRVPID" ] && kill -0 "$SRVPID" 2>/dev/null')"
 
 for _ in $(seq 1 60); do kill -0 "$BARPID" 2>/dev/null || break; sleep 0.5; done
@@ -117,7 +121,7 @@ check "the header says Stopped with a Start toggle, then Running with a Stop tog
 check "the Port data lists the running server, checked" "$(yes_if 'grep -q "ports=\"'"$PORT"' — no model\*;" "$LOG"')"
 check "Stop ended the server it started" "$(yes_if '! kill -0 "$SRVPID" 2>/dev/null')"
 check "the last poll reads not running again" "$(yes_if 'tail -n 1 "$LOG" | grep -q "poll 16 .*Port '"$PORT"': not running"')"
-check "a stopped server leaves no pid file entry alive" "$(yes_if '[ ! -f "$HOME/.sushi/sushibar-server.pid" ]')"
+check "a stopped server leaves no pid file entry alive" "$(yes_if '[ ! -f "$HOME/.sushi/sushibar-server-'"$PORT"'.pid" ]')"
 
 echo "== a sushi sushibar did not start, on port $FPORT =="
 start_foreign() {
@@ -127,8 +131,8 @@ start_foreign() {
 }
 start_foreign
 check "a headless sushi started outside sushibar answers on $FPORT" "$(yes_if 'kill -0 "$FPID" 2>/dev/null')"
-run_bar "$BAR" 10 "confirm@1,port$FPORT@2,stop@6" --port "$PORT"
-check "the Port data lists the foreign sushi found by the scan" "$(yes_if 'grep -q "ports=\".*'"$FPORT"' — no model;" "$LOG"')"
+run_bar "$BAR" 11 "confirm@1,models$FPORT@2,port$FPORT@4,stop@8" --port "$PORT"
+check "the Port data lists the foreign sushi found by the scan, its model asked when the submenu opens" "$(yes_if 'grep -q "ports=\".*'"$FPORT"' — no model;" "$LOG"')"
 check "choosing it switches the watched port and names it in the status" "$(yes_if 'grep -q "poll [0-9]* .*Port '"$FPORT"': running, no model loaded\" start=0 stop=1" "$LOG"')"
 check "a sushi sushibar did not start offers Stop with the confirm ellipsis" "$(yes_if 'grep -q "toggle=\"Stop Server…\"" "$LOG"')"
 check "the choice is saved" "$(yes_if 'grep -q "\"port\":'"$FPORT"'" "$HOME/.sushi/sushibar.json"')"
@@ -225,12 +229,194 @@ run_bar "$INST/sushibar" 8 "check@2" --port "$UPORT"
 check "the menu shows the sushi beside sushibar by version" "$(yes_if 'grep -q "version=\"'"$CUR"'" "$LOG"')"
 check "a newer release shows the update item with its mark" "$(yes_if 'grep -q "update=\"Update to sushi 99.0.0\"" "$LOG"')"
 check "the button carries the dot while an update waits" "$(yes_if 'grep -q "title=\"•\"" "$LOG"')"
-check "no server on the port: the CLI path is chosen (no brew command shown)" "$(yes_if '! grep -q "brew upgrade" "$LOG"')"
+check "no server on the port: the CLI path is chosen (the visible update item is not a brew command)" "$(yes_if 'grep -q "update=\"Update to sushi 99.0.0\"" "$LOG" && ! grep -q "brew upgrade" "$LOG"')"
+check "while an update waits the Check for Updates item is hidden, so it is not printed" "$(yes_if 'grep -q "version=\"[^\"]*\" check=\"\" update=\"Update to sushi 99.0.0\"" "$LOG"')"
 
 KEG="$WORK/Cellar/sushi/1.0/libexec"
 stage_install "$KEG"
 run_bar "$KEG/sushibar" 6 "check@2" --port "$UPORT"
 check "a Homebrew keg shows the brew command instead of an update" "$(yes_if 'grep -q "update=\"Copy “brew upgrade sushi”\"" "$LOG"')"
+
+echo "== update failures show where the menu shows them =="
+FAKE="$WORK/fake"
+mkdir -p "$FAKE"
+cp "$BAR" "$FAKE/sushibar"
+long=$(printf 'x%.0s' $(seq 1 300))
+cat > "$FAKE/sushi" <<EOF
+#!/bin/sh
+case "\$1" in
+  --version) echo "sushi 1.0.0"; exit 0;;
+  update)
+    echo "── sushi 1.0.0 update, 2026-11-03 14:57 UTC"
+    if [ "\${FAKE_MODE:-}" = "avail" ] && [ "\${2:-}" = "--check" ]; then echo "sushi 9.0.0 is available (this is 1.0.0): x"; exit 0; fi
+    echo "update: disk full while unpacking $long"
+    echo "trailing log line"
+    exit 1;;
+  --serve) exit 1;;
+esac
+exit 1
+EOF
+chmod +x "$FAKE/sushi"
+run_bar "$FAKE/sushibar" 5 "check@2" --port "$UPORT"
+check "a failed manual check shows its update: line in the note item, cut with an ellipsis" "$(yes_if 'grep -q "poll [3-5] .*note=\"update: disk full while unpacking x*…\"" "$LOG"')"
+check "that note is not the trailing log line" "$(yes_if '! grep -q "note=\"trailing" "$LOG"')"
+FAKE_MODE=avail run_bar "$FAKE/sushibar" 10 "check@2,update@5" --port "$UPORT"
+check "a failed update leaves the update item visible and shows why beside it" "$(yes_if 'grep -q "poll [7-9] .*update=\"Update to sushi 9.0.0\" note=\"Update failed: update: disk full while unpacking x*…\"" "$LOG"')"
+
+echo "== a server that fails to start says so =="
+run_bar "$FAKE/sushibar" 6 "start@2" --port "$UPORT"
+check "a server that exits at once shows a note naming its log" "$(yes_if 'grep -q "note=\"Server on port '"$UPORT"' did not start: see ~/.sushi/logs/sushi-'"$UPORT"'.log\"" "$LOG"')"
+
+echo "== a started server stays tracked after Start on another port =="
+run_bar "$BAR" 14 "start@2,port$FPORT@5,start@8" --port "$PORT"
+check "each port keeps its own pid record" "$(yes_if '[ -f "$HOME/.sushi/sushibar-server-'"$PORT"'.pid" ] && [ -f "$HOME/.sushi/sushibar-server-'"$FPORT"'.pid" ]')"
+P1=$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$PORT.pid" 2>/dev/null)
+P2=$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$FPORT.pid" 2>/dev/null)
+check "both servers are alive" "$(yes_if '[ -n "$P1" ] && [ -n "$P2" ] && kill -0 "$P1" 2>/dev/null && kill -0 "$P2" 2>/dev/null')"
+run_bar "$BAR" 3 "" --port "$PORT"
+check "back on the first port, its server is sushibar's own (Stop without the confirm ellipsis)" "$(yes_if 'grep -q "poll 2 .*Port '"$PORT"': .*toggle=\"Stop Server\"" "$LOG"')"
+kill "$P1" "$P2" 2>/dev/null
+rm -f "$HOME"/.sushi/sushibar-server-*.pid
+
+echo "== two sushibars launched at once leave one =="
+DUAL="$WORK/dual"
+mkdir -p "$DUAL"
+cp "$BAR" "$DUAL/sushibar"
+single=1
+for trial in 1 2 3; do
+    export HOME="$WORK/home-dual-$trial"
+    mkdir -p "$HOME"
+    ( SUSHIBAR_TEST_POLLS=6 "$DUAL/sushibar" --port "$UPORT" 2> /dev/null & SUSHIBAR_TEST_POLLS=6 "$DUAL/sushibar" --port "$UPORT" 2> /dev/null & wait )
+    sleep 1.5
+    n=$(pgrep -f "^$DUAL/sushibar" | wc -l | tr -d ' ')
+    [ "$n" = 1 ] || single=0
+    for _ in $(seq 1 30); do [ -n "$(pgrep -f "^$DUAL/sushibar")" ] || break; sleep 0.5; done
+done
+export HOME="$WORK/home"
+check "three simultaneous double launches each left exactly one sushibar" "$single"
+
+if command -v cc > /dev/null 2>&1; then
+echo "== a hung sushi elsewhere, and a hung one on the watched port =="
+mkdir -p "$WORK/hung"
+cat > "$WORK/hung/hang.c" <<'EOF'
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <fcntl.h>
+int main(int argc, char **argv) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(atoi(argv[1]));
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    if (bind(fd, (void *)&a, sizeof a) || listen(fd, 64)) return 1;
+    for (;;) {
+        if (accept(fd, 0, 0) >= 0 && argc > 2) {
+            int log = open(argv[2], O_WRONLY | O_CREAT | O_APPEND, 0600);
+            if (log >= 0) { write(log, "x", 1); close(log); }
+        }
+    }
+}
+EOF
+if cc -o "$WORK/hung/sushi" "$WORK/hung/hang.c" 2> /dev/null; then
+    "$WORK/hung/sushi" "$HPORT" "$WORK/hung/accepts" &
+    HPID=$!
+    sleep 0.5
+    cat > "$WORK/stub.py" <<'EOF'
+import http.server, json, socketserver, sys, time
+hits = {}
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        hits[path] = hits.get(path, 0) + 1
+        now = int(time.time() * 1000)
+        if path == "/metrics.json": body = {"gauges": {}, "sessions": [], "requests": [], "history": {"fields": ["t_ms", "gen_tokens"], "samples": []}}
+        elif path == "/v1/models": body = {"data": [{"id": "Stub", "state": "ready"}]}
+        elif path == "/hits": body = hits
+        else:
+            self.send_response(404); self.end_headers(); return
+        data = json.dumps(body).encode()
+        self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(data))); self.end_headers(); self.wfile.write(data)
+class S(socketserver.ThreadingMixIn, http.server.HTTPServer): daemon_threads = True
+S(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+EOF
+    python3 "$WORK/stub.py" "$SPORT" &
+    SPID=$!
+    for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$SPORT/hits" && break; sleep 0.25; done
+    # Another sushibar on the box (an older build polls every listener) would be counted as ours: measure it first.
+    : > "$WORK/hung/accepts"
+    sleep 6
+    noise=$(wc -c < "$WORK/hung/accepts" | tr -d ' ')
+    : > "$WORK/hung/accepts"
+    run_bar "$BAR" 12 "" --port "$SPORT"
+    if [ "$noise" = 0 ]; then
+        check "with no Port submenu opened, a sushi on another port is never contacted" "$(yes_if '[ ! -s "$WORK/hung/accepts" ]')"
+    else
+        echo "  SKIP another program on this box polls sushi listeners; the never-contacted check needs a quiet one"
+    fi
+    check "the watched port is still polled about once a second" "$(yes_if '[ "$(curl -s "http://127.0.0.1:'"$SPORT"'/hits" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"/metrics.json\",0))")" -ge 10 ]')"
+    curl -s "http://127.0.0.1:$SPORT/hits" > /dev/null
+    : > "$WORK/hung/accepts"
+    before=$(curl -s "http://127.0.0.1:$SPORT/hits" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("/metrics.json",0))')
+    run_bar "$BAR" 12 "models$HPORT@4" --port "$SPORT"
+    after=$(curl -s "http://127.0.0.1:$SPORT/hits" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("/metrics.json",0))')
+    check "opening the submenu asks the hung sushi once" "$(yes_if '[ -s "$WORK/hung/accepts" ]')"
+    check "that hung sushi never slows the watched port's polls" "$(yes_if '[ $((after - before)) -ge 10 ]')"
+    check "its label reads not answering, never no model" "$(yes_if 'grep -q "ports=\".*'"$HPORT"' — not answering;" "$LOG" && ! grep -q "'"$HPORT"' — no model" "$LOG"')"
+    run_bar "$BAR" 10 "" --port "$HPORT"
+    check "a hung sushi on the watched port reads Not answering" "$(yes_if 'grep -q "poll 10 .*Port '"$HPORT"': not answering.*pill=\"Not answering\"" "$LOG"')"
+    check "and Stop is offered with the confirm ellipsis" "$(yes_if 'grep -q "poll 10 .*stop=1.*toggle=\"Stop Server…\"" "$LOG"')"
+    kill "$HPID" "$SPID" 2>/dev/null
+    wait "$HPID" "$SPID" 2>/dev/null
+else
+    echo "  SKIP no C compiler"
+fi
+fi
+
+echo "== Homebrew: an upgrade replaces the keg under a running sushibar =="
+BREW="$WORK/brew"
+mkdir -p "$BREW/bin" "$WORK/kegsrc"
+# A keg's sushi is a program that names itself `sushi` from its first instruction, as the real one does.
+cat > "$WORK/kegsrc/sushi.c" <<'EOF'
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--version")) { printf("sushi %s\n", VERSION); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "update")) { printf("sushi %s is up to date (latest release %s)\n", VERSION, VERSION); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "--serve")) { argv[0] = REAL; execv(REAL, argv); }
+    return 1;
+}
+EOF
+mk_keg() {
+    local v="$1" dir="$BREW/Cellar/sushi/$1/libexec"
+    mkdir -p "$dir"
+    cc -o "$dir/sushi" "$WORK/kegsrc/sushi.c" -DVERSION="\"$v\"" -DREAL="\"$SUSHI_BIN\"" 2> /dev/null
+    cp "$BAR" "$dir/sushibar"
+}
+if command -v cc > /dev/null 2>&1; then
+    mk_keg 1.0.0
+    ln -s ../Cellar/sushi/1.0.0/libexec/sushibar "$BREW/bin/sushibar"
+    : > "$LOG"
+    SUSHIBAR_TEST_POLLS=16 SUSHIBAR_TEST_ACTIONS="check@6,start@9" "$BREW/bin/sushibar" --port "$UPORT" 2> "$LOG"
+    BPID=$(cut -d' ' -f1 "$HOME/.sushi/sushibar.pid" 2>/dev/null)
+    sleep 3
+    mk_keg 1.1.0
+    ln -sfn ../Cellar/sushi/1.1.0/libexec/sushibar "$BREW/bin/sushibar"
+    rm -rf "$BREW/Cellar/sushi/1.0.0"
+    for _ in $(seq 1 80); do [ -n "$BPID" ] && kill -0 "$BPID" 2>/dev/null || break; sleep 0.5; done
+    check "after the upgrade deleted the old keg, Start still starts a server" "$(yes_if '[ "$(wait_health "$UPORT")" = 200 ]')"
+    check "the version moved to the new keg's" "$(yes_if 'grep -q "version=\"1.1.0" "$LOG"')"
+    check "no step reported that it could not run sushi" "$(yes_if '! grep -q "could not run sushi" "$LOG"')"
+    check "sushibar relaunched itself into the new keg on the same pid" "$(yes_if '[ "$(grep -c "poll 1 " "$LOG")" = 2 ]')"
+    for f in "$HOME"/.sushi/sushibar-server-*.pid; do [ -f "$f" ] && kill "$(cut -d' ' -f1 "$f")" 2> /dev/null; done
+else
+    echo "  SKIP no C compiler"
+fi
 
 echo "== $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

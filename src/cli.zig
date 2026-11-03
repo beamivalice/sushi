@@ -918,7 +918,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     defer allocator.free(root);
 
     var out_buf: [4096]u8 = undefined;
-    var stdout_w = std.Io.File.stdout().writer(io, &out_buf);
+    var stdout_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const w = &stdout_w.interface;
     defer w.flush() catch {};
 
@@ -1659,7 +1659,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     defer allocator.free(chat_url);
 
     var out_buf: [4096]u8 = undefined;
-    var stdout_w = std.Io.File.stdout().writer(io, &out_buf);
+    var stdout_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const w = &stdout_w.interface;
 
     const models_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/models", .{port});
@@ -3069,7 +3069,7 @@ pub fn runPrompt(allocator: std.mem.Allocator, io: std.Io, port: u16, body: []co
     }
 
     var out_buf: [16 * 1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &out_buf);
     try writeResponseEffortNotice(&stdout.interface, response.head);
     var buffered: std.Io.Writer.Allocating = .init(allocator);
     defer buffered.deinit();

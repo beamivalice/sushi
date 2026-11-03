@@ -81,11 +81,26 @@ const weight_regular: f64 = 0.0;
 const weight_medium: f64 = 0.23;
 const weight_semibold: f64 = 0.3;
 
-/// `{NSFontAttributeName: font, NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style}`.
-fn attrs(f: id, c: id, line_break: isize, alignment: isize) id {
+const StyleKey = struct { line_break: isize, alignment: isize, style: id };
+var style_cache: [8]StyleKey = undefined;
+var style_cache_n: usize = 0;
+
+/// One paragraph style per (line break, alignment), kept for the process: attrs() runs many times per redraw.
+fn paragraphStyle(line_break: isize, alignment: isize) id {
+    for (style_cache[0..style_cache_n]) |k| if (k.line_break == line_break and k.alignment == alignment) return k.style;
     const style = objc.new(objc.class("NSMutableParagraphStyle"));
     msg(void, style, "setLineBreakMode:", .{line_break});
     msg(void, style, "setAlignment:", .{alignment});
+    if (style_cache_n < style_cache.len) {
+        style_cache[style_cache_n] = .{ .line_break = line_break, .alignment = alignment, .style = style };
+        style_cache_n += 1;
+    }
+    return style;
+}
+
+/// `{NSFontAttributeName: font, NSForegroundColorAttributeName: color, NSParagraphStyleAttributeName: style}`.
+fn attrs(f: id, c: id, line_break: isize, alignment: isize) id {
+    const style = paragraphStyle(line_break, alignment);
     var keys = [_]id{ NSFontAttributeName, NSForegroundColorAttributeName, NSParagraphStyleAttributeName };
     var vals = [_]id{ f, c, style };
     return msg(id, objc.class("NSDictionary"), "dictionaryWithObjects:forKeys:count:", .{ @as([*]id, &vals), @as([*]id, &keys), @as(usize, 3) });

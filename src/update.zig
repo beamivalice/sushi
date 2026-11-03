@@ -429,7 +429,7 @@ fn checkOnce(io: std.Io) i64 {
 
 /// A fresh check for `sushi update --check` and the REPL's `/update`, recorded in the cache like the daily one.
 pub fn checkNow(arena: Allocator, io: std.Io, pre: bool) !?Release {
-    const f = try fetchReleases(arena, io, "");
+    const f = fetchReleases(arena, io, "") catch |err| return fail("could not reach the release server ({s})", .{@errorName(err)});
     if (f.status != 200) return fail("GitHub answered HTTP {d} for the release list", .{f.status});
     const r = try pickRelease(arena, f.body, pre);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -725,7 +725,7 @@ pub fn cmdUpdate(allocator: Allocator, io: std.Io, args: []const []const u8) !vo
             opts.relaunch = args[i + 2 ..];
             break;
         } else if (eql(u8, a, "--help") or eql(u8, a, "-h")) {
-            var out = std.Io.File.stdout().writer(io, &.{});
+            var out = std.Io.File.stdout().writerStreaming(io, &.{});
             out.interface.writeAll(usage) catch {};
             return;
         } else {

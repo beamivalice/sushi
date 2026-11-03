@@ -59,6 +59,8 @@ pub const Link = enum {
     unauthorized,
     /// 503: the server runs with `--no-metrics`.
     metrics_off,
+    /// A sushi listens on the port and does not answer in time.
+    silent,
     up,
 };
 
@@ -71,7 +73,7 @@ pub const Sample = struct {
     prefilling: bool = false,
     /// The newest finished request that generated tokens: `generated_tokens / decode_seconds`.
     finished_tps: ?f64 = null,
-    /// The same request's prompt speed: `prompt_tokens / prefill_seconds`.
+    /// The same request's prompt speed: `(prompt_tokens - cached_tokens) / prefill_seconds`.
     finished_prefill_tps: ?f64 = null,
     newest_finished_ms: i64 = 0,
     mem_mb: ?u64 = null,
@@ -94,6 +96,8 @@ const Wire = struct {
     requests: []const struct {
         t_ms: i64 = 0,
         prompt_tokens: u64 = 0,
+        cached_tokens: u64 = 0,
+        outcome: []const u8 = "",
         prefill_seconds: f64 = 0,
         generated_tokens: u64 = 0,
         decode_seconds: f64 = 0,
@@ -124,10 +128,10 @@ pub fn parseMetrics(arena: std.mem.Allocator, body: []const u8) !Sample {
     var newest_prefill_ms: i64 = std.math.minInt(i64);
     for (wire.requests) |r| {
         out.newest_finished_ms = @max(out.newest_finished_ms, r.t_ms);
-        if (r.t_ms >= newest_prefill_ms and r.prompt_tokens > 0 and r.prefill_seconds > 0)
-        {
+        const forwarded = r.prompt_tokens -| r.cached_tokens;
+        if (std.mem.eql(u8, r.outcome, "ok") and r.t_ms >= newest_prefill_ms and forwarded > 0 and r.prefill_seconds > 0) {
             newest_prefill_ms = r.t_ms;
-            out.finished_prefill_tps = @as(f64, @floatFromInt(r.prompt_tokens)) / r.prefill_seconds;
+            out.finished_prefill_tps = @as(f64, @floatFromInt(forwarded)) / r.prefill_seconds;
         }
         if (r.generated_tokens == 0 or r.decode_seconds <= 0 or r.t_ms < newest_speed_ms) continue;
         newest_speed_ms = r.t_ms;
@@ -266,6 +270,7 @@ fn titleBase(buf: []u8, v: View) []const u8 {
         .offline => std.fmt.bufPrint(buf, "", .{}),
         .unauthorized => std.fmt.bufPrint(buf, "key needed", .{}),
         .metrics_off => std.fmt.bufPrint(buf, "metrics off", .{}),
+        .silent => std.fmt.bufPrint(buf, "", .{}),
         .up => if (v.decoding)
             std.fmt.bufPrint(buf, "{s} tok/s", .{if (v.live) |t| speedText(&num, t) else "…"})
         else if (v.prefilling)
@@ -282,7 +287,7 @@ pub const Icon = enum { outline, color };
 
 /// Outline while no server answers; colour once one does, whatever it says.
 pub fn iconFor(link: Link) Icon {
-    return if (link == .offline) .outline else .color;
+    return if (link == .offline or link == .silent) .outline else .color;
 }
 
 /// The HTTP status of a poll, or null when nothing answered in time.
@@ -297,12 +302,15 @@ pub fn linkFor(status: ?u16) Link {
 
 // ── Version and update ───────────────────────────────────────────────────
 
-/// `sushi --version` prints `sushi <version>` first.
+/// `sushi --version` prints `sushi <version>` after any `[mem]` lines the engine logs to stderr.
 pub fn parseVersionOutput(text: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
-    var words = std.mem.tokenizeScalar(u8, lines.next() orelse return null, ' ');
-    if (!std.mem.eql(u8, words.next() orelse return null, "sushi")) return null;
-    return words.next();
+    while (lines.next()) |line| {
+        var words = std.mem.tokenizeScalar(u8, line, ' ');
+        if (!std.mem.eql(u8, words.next() orelse continue, "sushi")) continue;
+        return words.next();
+    }
+    return null;
 }
 
 pub const Check = union(enum) { available: []const u8, up_to_date, failed: []const u8 };
@@ -311,11 +319,9 @@ pub const Check = union(enum) { available: []const u8, up_to_date, failed: []con
 /// after whatever the engine logs first.
 pub fn parseCheck(text: []const u8) Check {
     var lines = std.mem.splitScalar(u8, text, '\n');
-    var last: []const u8 = "";
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \r");
         if (line.len == 0) continue;
-        last = line;
         var words = std.mem.tokenizeScalar(u8, line, ' ');
         if (!std.mem.eql(u8, words.next() orelse "", "sushi")) continue;
         const v = words.next() orelse continue;
@@ -323,7 +329,37 @@ pub fn parseCheck(text: []const u8) Check {
         if (std.mem.startsWith(u8, rest, "is available")) return .{ .available = v };
         if (std.mem.startsWith(u8, rest, "is up to date")) return .up_to_date;
     }
-    return .{ .failed = if (last.len == 0) "no answer" else last };
+    return .{ .failed = failureLine(text) };
+}
+
+/// Why a sushi command failed: its last `update:` or `error:` line, else its last line that is not a log header.
+pub fn failureLine(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var tagged: []const u8 = "";
+    var last: []const u8 = "";
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r");
+        if (line.len == 0 or std.mem.startsWith(u8, line, "──") or std.mem.startsWith(u8, line, "[mem]")) continue;
+        last = line;
+        if (std.mem.startsWith(u8, line, "update:") or std.mem.startsWith(u8, line, "error:")) tagged = line;
+    }
+    if (tagged.len > 0) return tagged;
+    return if (last.len == 0) "no answer" else last;
+}
+
+/// `text` cut to at most `max` bytes on a character boundary, with an ellipsis when it was cut.
+pub fn fitNote(buf: []u8, text: []const u8, max: usize) []const u8 {
+    const cap = @min(max, buf.len);
+    if (text.len <= cap) {
+        @memcpy(buf[0..text.len], text);
+        return buf[0..text.len];
+    }
+    const ellipsis = "…";
+    var n = if (cap >= ellipsis.len) cap - ellipsis.len else 0;
+    while (n > 0 and (text[n] & 0xC0) == 0x80) n -= 1;
+    @memcpy(buf[0..n], text[0..n]);
+    @memcpy(buf[n..][0..ellipsis.len], ellipsis);
+    return buf[0 .. n + ellipsis.len];
 }
 
 /// The `update` object of `/props`.
@@ -352,6 +388,13 @@ pub fn parseProps(arena: std.mem.Allocator, body: []const u8) !?PropsUpdate {
 
 pub fn isBrewKeg(real_path: []const u8) bool {
     return std.mem.indexOf(u8, real_path, "/Cellar/sushi/") != null;
+}
+
+/// `name` under brew's stable `opt/sushi/libexec` link of the keg `real_path` lives in; null outside a keg.
+pub fn brewOptPath(buf: []u8, real_path: []const u8, name: []const u8) ?[]const u8 {
+    const marker = "/Cellar/sushi/";
+    const i = std.mem.indexOf(u8, real_path, marker) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/opt/sushi/libexec/{s}", .{ real_path[0..i], name }) catch null;
 }
 
 pub const UpdatePath = enum { none, server, cli, brew };
@@ -402,10 +445,7 @@ pub fn checkLabel(buf: []u8, v: UpdateView) []const u8 {
     const t = switch (v.busy) {
         .checking => std.fmt.bufPrint(buf, "Checking…", .{}),
         .updating => std.fmt.bufPrint(buf, "Updating…", .{}),
-        .none => if (v.note.len > 0)
-            std.fmt.bufPrint(buf, "Check for Updates… — {s}", .{v.note})
-        else
-            std.fmt.bufPrint(buf, "Check for Updates…", .{}),
+        .none => std.fmt.bufPrint(buf, "Check for Updates…", .{}),
     };
     return t catch "Check for Updates…";
 }
@@ -471,6 +511,7 @@ pub fn statusLine(buf: []u8, s: Server) []const u8 {
             std.fmt.bufPrint(buf, "Port {d}: not running", .{s.port}),
         .unauthorized => std.fmt.bufPrint(buf, "Port {d}: running (API key required)", .{s.port}),
         .metrics_off => std.fmt.bufPrint(buf, "Port {d}: running, metrics off", .{s.port}),
+        .silent => std.fmt.bufPrint(buf, "Port {d}: not answering", .{s.port}),
         .up => if (s.model) |m|
             std.fmt.bufPrint(buf, "Port {d}: {s}", .{ s.port, m })
         else
@@ -503,7 +544,7 @@ pub fn toggle(s: Server, stopping: bool) Toggle {
 
 /// The pages need a server that answers.
 pub fn openEnabled(link: Link) bool {
-    return link != .offline;
+    return link != .offline and link != .silent;
 }
 
 // ── The header card ──────────────────────────────────────────────────────
@@ -517,6 +558,7 @@ pub fn pillFor(link: Link, loading: bool, updating: bool, starting: bool) Pill {
         .offline => if (starting) .{ .label = "Loading", .tone = .orange } else .{ .label = "Stopped", .tone = .grey },
         .unauthorized => .{ .label = "Key needed", .tone = .orange },
         .metrics_off => .{ .label = "Metrics off", .tone = .grey },
+        .silent => .{ .label = "Not answering", .tone = .orange },
         .up => if (loading) .{ .label = "Loading", .tone = .orange } else .{ .label = "Running", .tone = .green },
     };
 }
@@ -548,6 +590,8 @@ pub const HeaderIn = struct {
     pack_update: ?PackUpdate = null,
     mem_mb: ?u64 = null,
     bar_version: []const u8 = "",
+    /// The running server's version; shown only when it differs from `bar_version`.
+    server_version: []const u8 = "",
     update_available: bool = false,
     latest: []const u8 = "",
     up_to_date: bool = false,
@@ -584,22 +628,29 @@ fn fmt(a: std.mem.Allocator, comptime f: []const u8, args: anytype) []const u8 {
 
 /// Everything the menu's header card shows, as strings; the view only draws them.
 pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
-    const answering = in.link != .offline;
+    const answering = in.link != .offline and in.link != .silent;
     var h: Header = undefined;
     h.color_icon = answering;
     h.pill = pillFor(in.link, in.loading, in.updating, in.starting);
     h.version_tail = "";
+    const base = if (in.server_version.len > 0 and in.bar_version.len > 0 and !std.mem.eql(u8, in.server_version, in.bar_version))
+        fmt(a, "{s} · server {s}", .{ in.bar_version, in.server_version })
+    else
+        in.bar_version;
     h.version = if (in.update_available and in.latest.len > 0)
-        fmt(a, "{s}{s}", .{ in.bar_version, blk: {
+        fmt(a, "{s}{s}", .{ base, blk: {
             h.version_tail = fmt(a, " · {s} available", .{in.latest});
             break :blk h.version_tail;
         } })
     else if (in.up_to_date and in.bar_version.len > 0)
-        fmt(a, "{s} · up to date", .{in.bar_version})
+        fmt(a, "{s} · up to date", .{base})
     else
-        in.bar_version;
+        base;
     if (in.link == .offline) {
         h.line1 = if (in.starting) "Starting…" else "Not running";
+        h.line2 = fmt(a, "Port {d}", .{in.port});
+    } else if (in.link == .silent) {
+        h.line1 = "Not answering";
         h.line2 = fmt(a, "Port {d}", .{in.port});
     } else if (in.link == .unauthorized) {
         h.line1 = "API key required";
@@ -789,18 +840,18 @@ pub fn formatSaved(buf: []u8, port: u16) []const u8 {
     return std.fmt.bufPrint(buf, "{{\"port\":{d}}}\n", .{port}) catch "";
 }
 
-pub fn startLabel(buf: []u8, port: u16) []const u8 {
-    return std.fmt.bufPrint(buf, "Start Server on Port {d}", .{port}) catch "Start Server";
-}
-
-pub fn stopLabel(buf: []u8, port: u16) []const u8 {
-    return std.fmt.bufPrint(buf, "Stop Server on Port {d}", .{port}) catch "Stop Server";
+/// Shown under the update group when a server sushibar started exits before it listens.
+pub fn startFailedNote(buf: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buf, "Server on port {d} did not start: see ~/.sushi/logs/sushi-{d}.log", .{ port, port }) catch "Server did not start";
 }
 
 /// A sushi listener and what its `/v1/models` said.
-pub const Listing = struct { port: u16, pid: i32, model: ?[]const u8 = null };
+pub const Listing = struct { port: u16, pid: i32, model: ?[]const u8 = null, models: ModelsKnown = .unknown };
 
-pub const PortEntry = struct { port: u16, checked: bool, listening: bool, model: ?[]const u8 };
+/// What the last `/v1/models` fetch of a listener said: not asked yet, answered, or did not answer.
+pub const ModelsKnown = enum { unknown, answered, failed };
+
+pub const PortEntry = struct { port: u16, checked: bool, listening: bool, model: ?[]const u8, models: ModelsKnown = .answered };
 
 /// The Port submenu: every listening sushi, and the watched port too when nothing listens there.
 pub fn portEntries(out: []PortEntry, watched: u16, listings: []const Listing) []PortEntry {
@@ -815,14 +866,18 @@ pub fn portEntries(out: []PortEntry, watched: u16, listings: []const Listing) []
     }
     for (listings) |l| {
         if (n == out.len) break;
-        out[n] = .{ .port = l.port, .checked = l.port == watched, .listening = true, .model = l.model };
+        out[n] = .{ .port = l.port, .checked = l.port == watched, .listening = true, .model = l.model, .models = l.models };
         n += 1;
     }
     return out[0..n];
 }
 
 pub fn portLabel(buf: []u8, e: PortEntry) []const u8 {
-    const what = if (!e.listening) "not running" else e.model orelse "no model";
+    const what = if (!e.listening) "not running" else if (e.model) |m| m else switch (e.models) {
+        .answered => "no model",
+        .failed => "not answering",
+        .unknown => "…",
+    };
     return std.fmt.bufPrint(buf, "{d} — {s}", .{ e.port, what }) catch "";
 }
 
@@ -854,16 +909,15 @@ test "stop: a server sushibar started goes at once, any other sushi on the port 
     try std.testing.expectEqual(StopPlan.none, planStop(null, 18801, &.{.{ .pid = 0, .port = 18801 }}));
 }
 
-test "labels: Start and Stop name the port" {
-    var b: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("Start Server on Port 12345", startLabel(&b, 12345));
-    try std.testing.expectEqualStrings("Stop Server on Port 18801", stopLabel(&b, 18801));
+test "start failure: the note names the port and its log" {
+    var b: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Server on port 18801 did not start: see ~/.sushi/logs/sushi-18801.log", startFailedNote(&b, 18801));
 }
 
 test "port menu: listeners, the watched one checked, an absent watched port still shown" {
     var out: [8]PortEntry = undefined;
     var b: [96]u8 = undefined;
-    const two = [_]Listing{ .{ .port = 18802, .pid = 5, .model = "Qwen" }, .{ .port = 12345, .pid = 6 } };
+    const two = [_]Listing{ .{ .port = 18802, .pid = 5, .model = "Qwen", .models = .answered }, .{ .port = 12345, .pid = 6, .models = .answered } };
     const e = portEntries(&out, 12345, &two);
     try std.testing.expectEqual(@as(usize, 2), e.len);
     try std.testing.expect(!e[0].checked and e[1].checked);
@@ -874,6 +928,48 @@ test "port menu: listeners, the watched one checked, an absent watched port stil
     try std.testing.expect(gone[0].checked and !gone[0].listening);
     try std.testing.expectEqualStrings("18801 — not running", portLabel(&b, gone[0]));
     try std.testing.expectEqual(@as(usize, 1), portEntries(&out, 12345, &.{}).len);
+}
+
+test "port menu: a models fetch that failed or has not run never reads as no model" {
+    var out: [8]PortEntry = undefined;
+    var b: [96]u8 = undefined;
+    const l = [_]Listing{ .{ .port = 18802, .pid = 5, .models = .failed }, .{ .port = 18803, .pid = 6, .models = .unknown } };
+    const e = portEntries(&out, 18801, &l);
+    try std.testing.expectEqualStrings("18802 — not answering", portLabel(&b, e[1]));
+    try std.testing.expectEqualStrings("18803 — …", portLabel(&b, e[2]));
+}
+
+test "note: a failure line is the last update/error line, and a long note is cut with an ellipsis, never dropped" {
+    const text = "── sushi 1.5.0 update, 2026-11-03 14:57 UTC\nupdate: disk full\nlater noise\n";
+    try std.testing.expectEqualStrings("update: disk full", failureLine(text));
+    try std.testing.expectEqualStrings("later noise", failureLine("── header\nlater noise\n"));
+    try std.testing.expectEqualStrings("no answer", failureLine("── header\n"));
+    var b: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("short", fitNote(&b, "short", 20));
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaa…", fitNote(&b, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 20));
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaé…", fitNote(&b, "aaaaaaaaaaaaaaaaéééé", 21));
+}
+
+test "header: the server's version shows only when it differs, before the update tail" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("1.5.0 · server 1.4.1 · up to date", (try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .server_version = "1.4.1", .up_to_date = true })).version);
+    try std.testing.expectEqualStrings("1.5.0 · up to date", (try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .server_version = "1.5.0", .up_to_date = true })).version);
+    const h = try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .server_version = "1.4.1", .update_available = true, .latest = "1.5.1" });
+    try std.testing.expectEqualStrings("1.5.0 · server 1.4.1 · 1.5.1 available", h.version);
+    try std.testing.expectEqualStrings(" · 1.5.1 available", h.version_tail);
+}
+
+test "silent: a sushi that listens and does not answer is Not answering, with Stop offered" {
+    try std.testing.expectEqualStrings("Not answering", pillFor(.silent, false, false, false).label);
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Port 18801: not answering", statusLine(&b, .{ .link = .silent, .port = 18801, .sushi_listening = true }));
+    const t = toggle(.{ .link = .silent, .sushi_listening = true }, false);
+    try std.testing.expect(t.action == .stop and t.enabled);
+    try std.testing.expect(!enabled(.{ .link = .silent, .sushi_listening = true }).start);
+    try std.testing.expect(!openEnabled(.silent));
+    try std.testing.expectEqual(Icon.outline, iconFor(.silent));
 }
 
 test "status: the line names the port, and a port held by another program blocks Start" {
@@ -891,6 +987,7 @@ test "update: the version comes from the second word of the first --version line
     try std.testing.expectEqualStrings("1.5.0-dev1", parseVersionOutput("sushi 1.5.0-dev1\n").?);
     for ([_][]const u8{ "", "sushi", "\n" }) |bad| try std.testing.expect(parseVersionOutput(bad) == null);
     try std.testing.expect(parseVersionOutput("dyld: Library not loaded: x") == null);
+    try std.testing.expectEqualStrings("1.5.0", parseVersionOutput("[mem] MLX buffer-pool cap 8192 MB\n[mem] GPU floor 1 MB\nsushi 1.5.0\nmlx 0.32.3\n").?);
 }
 
 test "update: sushi update --check output is available, up to date or a failure" {
@@ -927,6 +1024,12 @@ test "update: a Homebrew keg is brew's" {
     try std.testing.expect(isBrewKeg("/opt/homebrew/Cellar/sushi/1.5.0/libexec/sushi"));
     try std.testing.expect(!isBrewKeg("/opt/homebrew/Cellar/sushi-nightly/1.5.0/libexec/sushi"));
     try std.testing.expect(!isBrewKeg("/Users/me/sushi-macos-arm64/sushi"));
+}
+
+test "update: a keg path maps to brew's opt link, which survives an upgrade" {
+    var b: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("/opt/homebrew/opt/sushi/libexec/sushi", brewOptPath(&b, "/opt/homebrew/Cellar/sushi/1.4.1/libexec/sushibar", "sushi").?);
+    try std.testing.expect(brewOptPath(&b, "/usr/local/bin/sushibar", "sushi") == null);
 }
 
 test "update: which path an update takes" {
@@ -1119,7 +1222,7 @@ test "sparkline: /metrics.json history is read by field name" {
         \\{"gauges":{"memory_mb":50000,"gpu_clock_mhz":1195,"gpu_utilization_pct":62,"requests_prefilling":0},"sessions":[],
         \\"history":{"interval_ms":2000,"capacity":1800,"started_ms":1,"fields":["t_ms","gen_tokens","prefill_tokens","gpu_mhz"],
         \\"samples":[[1700000000000,10,0,900],[1700000002000,50,0,1000]]},"requests":[
-        \\{"t_ms":5,"prompt_tokens":600,"prefill_seconds":0.5,"generated_tokens":10,"decode_seconds":1.0}]}
+        \\{"t_ms":5,"prompt_tokens":600,"cached_tokens":0,"prefill_seconds":0.5,"generated_tokens":10,"decode_seconds":1.0,"outcome":"ok"}]}
     ;
     const s = try parseMetrics(arena.allocator(), body);
     try std.testing.expectEqual(@as(?u64, 50000), s.mem_mb);
@@ -1206,7 +1309,7 @@ test "menu: update group labels" {
     try std.testing.expectEqualStrings("Check for Updates…", checkLabel(&b, .{}));
     try std.testing.expectEqualStrings("Checking…", checkLabel(&b, .{ .busy = .checking }));
     try std.testing.expectEqualStrings("Updating…", checkLabel(&b, .{ .busy = .updating }));
-    try std.testing.expectEqualStrings("Check for Updates… — disk full", checkLabel(&b, .{ .note = "disk full" }));
+    try std.testing.expectEqualStrings("Check for Updates…", checkLabel(&b, .{ .note = "disk full" }));
     try std.testing.expectEqualStrings("Update to sushi 1.5.1", updateLabel(&b, .{ .available = true, .latest = "1.5.1", .path = .server }).?);
     try std.testing.expect(updateLabel(&b, .{}) == null);
     try std.testing.expectEqualStrings("Copy “brew upgrade sushi”", copyLabel(&b, "brew upgrade sushi"));
@@ -1250,6 +1353,22 @@ test "gui session: an ssh login has none" {
     try std.testing.expect(guiSession("", ""));
     try std.testing.expect(!guiSession("10.0.0.2 5000 10.0.0.3 22", null));
     try std.testing.expect(!guiSession(null, "/dev/ttys003"));
+}
+
+test "metrics: prefill speed counts only the tokens forwarded, of finished requests" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const warm =
+        \\{"requests":[
+        \\{"t_ms":100,"prompt_tokens":1000,"cached_tokens":900,"prefill_seconds":1.0,"generated_tokens":5,"decode_seconds":1,"outcome":"ok"},
+        \\{"t_ms":200,"prompt_tokens":5000,"cached_tokens":0,"prefill_seconds":0.1,"outcome":"cancelled"}]}
+    ;
+    const s = try parseMetrics(arena.allocator(), warm);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), s.finished_prefill_tps.?, 1e-9);
+    const all_cached =
+        \\{"requests":[{"t_ms":100,"prompt_tokens":1000,"cached_tokens":1000,"prefill_seconds":0.01,"outcome":"ok"}]}
+    ;
+    try std.testing.expect((try parseMetrics(arena.allocator(), all_cached)).finished_prefill_tps == null);
 }
 
 test "metrics: a decoding row, a prefilling gauge and the newest finished speed" {
