@@ -61,6 +61,10 @@ pub fn defineSubclass(super: [*:0]const u8, name: [*:0]const u8, methods: []cons
     return cls;
 }
 
+pub fn release(o: id) void {
+    msg(void, o, "release", .{});
+}
+
 pub fn new(cls: id) id {
     return msg(id, msg(id, cls, "alloc", .{}), "init", .{});
 }

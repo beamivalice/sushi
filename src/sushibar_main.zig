@@ -27,9 +27,9 @@ const poll_ms = 1000;
 const server_exe = "sushi";
 const bar_exe = "sushibar";
 const bar_pid_name = "sushibar.pid";
-const server_pid_name = "sushibar-server.pid";
+const server_pid_prefix = "sushibar-server-";
 const saved_name = "sushibar.json";
-const capture_name = "sushibar-capture.txt";
+const lock_name = "sushibar.lock";
 const max_listings = 8;
 const props_every = 5;
 
@@ -54,6 +54,7 @@ fn Str(comptime N: usize) type {
 
         fn set(self: *@This(), s: []const u8) void {
             self.len = @min(s.len, N);
+            while (self.len < s.len and self.len > 0 and (s[self.len] & 0xC0) == 0x80) self.len -= 1;
             @memcpy(self.buf[0..self.len], s[0..self.len]);
         }
 
@@ -65,7 +66,7 @@ fn Str(comptime N: usize) type {
 
 // ── Test seams: SUSHIBAR_TEST_POLLS, SUSHIBAR_TEST_ACTIONS (docs/envvar.md) ──
 
-const ActionKind = enum { start, stop, confirm, check, update, port, typed };
+const ActionKind = enum { start, stop, confirm, check, update, port, typed, models };
 const Action = struct { kind: ActionKind, at: u32, value: u32 = 0 };
 var test_polls: u32 = 0;
 var test_actions: [12]Action = undefined;
@@ -80,7 +81,10 @@ fn readTestSeams() void {
         const at_i = std.mem.indexOfScalar(u8, item, '@') orelse continue;
         const word = item[0..at_i];
         var act: Action = .{ .kind = .start, .at = std.fmt.parseInt(u32, item[at_i + 1 ..], 10) catch continue };
-        if (std.mem.startsWith(u8, word, "port")) {
+        if (std.mem.startsWith(u8, word, "models")) {
+            act.kind = .models;
+            act.value = std.fmt.parseInt(u16, word[6..], 10) catch continue;
+        } else if (std.mem.startsWith(u8, word, "port")) {
             act.kind = .port;
             act.value = std.fmt.parseInt(u16, word[4..], 10) catch continue;
         } else if (std.mem.startsWith(u8, word, "type")) {
@@ -95,7 +99,10 @@ fn readTestSeams() void {
 
 // ── State shared by the poll thread, the update worker and the main thread ──
 
-const Listing = struct { port: u16 = 0, pid: i32 = 0, model: Str(96) = .{} };
+const Listing = struct { port: u16 = 0, pid: i32 = 0, model: Str(96) = .{}, known: logic.ModelsKnown = .unknown };
+
+/// What a foreign listener's `/v1/models` last said; fetched only when the Port submenu opens.
+const ModelCache = struct { port: u16 = 0, known: logic.ModelsKnown = .unknown, busy: bool = false, model: Str(96) = .{} };
 
 const Shared = struct {
     mu: std.Io.Mutex = .init,
@@ -105,6 +112,7 @@ const Shared = struct {
     model: Str(96) = .{},
     listings: [max_listings]Listing = undefined,
     listing_n: usize = 0,
+    models: [16]ModelCache = @splat(.{}),
     sushi_listening: bool = false,
     port_taken: bool = false,
     model_loading: Str(96) = .{},
@@ -127,7 +135,7 @@ const Shared = struct {
     props_command: Str(80) = .{},
     latest: Str(32) = .{},
     available: bool = false,
-    note: Str(120) = .{},
+    note: Str(240) = .{},
     busy: logic.Busy = .none,
     check_failed: bool = false,
     relaunch: bool = false,
@@ -139,14 +147,13 @@ var shared: Shared = .{};
 var g_io: std.Io = undefined;
 var g_port = std.atomic.Value(u16).init(logic.default_port);
 var g_home: []const u8 = "/tmp";
-var g_sushi: ?[:0]const u8 = null;
-var g_sushi_real: []const u8 = "";
+var g_sushi_found = false;
 var g_sibling_brew = false;
+/// The path sushibar was started by, unresolved: a Homebrew link follows the keg of the day.
 var g_self_exe: [:0]const u8 = "";
 var g_bar_pid_path: []const u8 = "";
-var g_server_pid_path: []const u8 = "";
 var g_saved_path: []const u8 = "";
-var g_capture_path: [:0]const u8 = "";
+var g_capture_seq = std.atomic.Value(u32).init(0);
 var g_launched_version: Str(32) = .{};
 
 fn lock() void {
@@ -165,14 +172,19 @@ fn port() u16 {
 const Reply = struct { status: u16, body: []const u8 };
 
 const poll_timeout_s = 4;
+const models_timeout_s = 1;
 
-/// A server that accepts and never answers is offline after `poll_timeout_s`, not a stalled poll thread.
+/// A server that accepts and never answers is offline after `timeout_s`, not a stalled poll thread.
 fn request(a: std.mem.Allocator, method: std.http.Method, url: []const u8, origin: ?[]const u8) ?Reply {
+    return requestWithin(a, method, url, origin, poll_timeout_s);
+}
+
+fn requestWithin(a: std.mem.Allocator, method: std.http.Method, url: []const u8, origin: ?[]const u8, timeout_s: i64) ?Reply {
     const U = union(enum) { got: ?Reply, timer: std.Io.Cancelable!void };
     var buf: [2]U = undefined;
     var sel = std.Io.Select(U).init(g_io, &buf);
     sel.concurrent(.got, fetchNow, .{ a, method, url, origin }) catch return fetchNow(a, method, url, origin);
-    sel.concurrent(.timer, std.Io.sleep, .{ g_io, std.Io.Duration.fromSeconds(poll_timeout_s), .awake }) catch {};
+    sel.concurrent(.timer, std.Io.sleep, .{ g_io, std.Io.Duration.fromSeconds(timeout_s), .awake }) catch {};
     const first = sel.await() catch {
         while (sel.cancel()) |_| {}
         return null;
@@ -215,22 +227,114 @@ fn modelsOf(a: std.mem.Allocator, p: u16) logic.ModelState {
     return logic.parseModelState(a, r.body) catch .{};
 }
 
-// ── Version and update (poll thread and worker) ──
-
-fn readCapture(a: std.mem.Allocator) []const u8 {
-    return std.Io.Dir.cwd().readFileAlloc(g_io, g_capture_path, a, .limited(64 * 1024)) catch "";
+fn cacheSlot(p: u16) *ModelCache {
+    var free: ?*ModelCache = null;
+    for (&shared.models) |*c| {
+        if (c.port == p) return c;
+        if (c.port == 0 and free == null) free = c;
+    }
+    return free orelse &shared.models[p % shared.models.len];
 }
 
-fn lastLine(text: []const u8) []const u8 {
-    const t = std.mem.trimEnd(u8, text, " \r\n");
-    const i = std.mem.lastIndexOfScalar(u8, t, '\n');
-    return if (i) |k| t[k + 1 ..] else t;
+/// One foreign listener's models, with a short timeout, off the poll thread.
+fn modelsWorker(p: u16) void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var b: [64]u8 = undefined;
+    var known: logic.ModelsKnown = .failed;
+    var name: []const u8 = "";
+    if (requestWithin(a, .GET, urlFor(&b, p, "/v1/models"), null, models_timeout_s)) |r| {
+        if (r.status == 200) {
+            if (logic.parseModelState(a, r.body)) |m| {
+                known = .answered;
+                name = m.ready orelse "";
+            } else |_| {}
+        }
+    }
+    lock();
+    defer unlock();
+    const c = cacheSlot(p);
+    c.port = p;
+    c.known = known;
+    c.busy = false;
+    c.model.set(name);
+}
+
+/// The Port submenu is about to be read: ask every foreign listener for its models, in parallel. This is the only
+/// time sushibar talks to a server it is not watching.
+fn refreshModels(only: ?u16) void {
+    var ports: [max_listings]u16 = undefined;
+    var n: usize = 0;
+    lock();
+    for (shared.listings[0..shared.listing_n]) |l| {
+        if (l.port == port() or (only != null and only.? != l.port)) continue;
+        const c = cacheSlot(l.port);
+        if (c.busy) continue;
+        c.port = l.port;
+        c.busy = true;
+        ports[n] = l.port;
+        n += 1;
+    }
+    unlock();
+    for (ports[0..n]) |p| {
+        const t = std.Thread.spawn(.{}, modelsWorker, .{p}) catch {
+            lock();
+            cacheSlot(p).busy = false;
+            unlock();
+            continue;
+        };
+        t.detach();
+    }
+}
+
+// ── Version and update (poll thread and worker) ──
+
+const path_cap = std.fs.max_path_bytes + 1;
+
+/// `name` beside this binary, resolved now: a Homebrew upgrade replaces the keg under a running sushibar, so the
+/// path found at launch may be gone. Falls back to brew's stable `opt` link.
+fn siblingNow(buf: *[path_cap]u8, name: []const u8) ?[:0]const u8 {
+    var real: [std.fs.max_path_bytes]u8 = undefined;
+    var cand: [std.fs.max_path_bytes]u8 = undefined;
+    if (proc.realPath(&real, g_self_exe)) |r| {
+        if (logic.siblingPath(&cand, r, name)) |c| if (reachable(c)) return sentinel(buf, c);
+        if (logic.brewOptPath(&cand, r, name)) |c| if (reachable(c)) return sentinel(buf, c);
+    }
+    if (logic.siblingPath(&cand, g_self_exe, name)) |c| if (reachable(c)) return sentinel(buf, c);
+    return null;
+}
+
+fn reachable(path: []const u8) bool {
+    std.Io.Dir.cwd().access(g_io, path, .{ .execute = true }) catch return false;
+    return true;
+}
+
+fn sentinel(buf: *[path_cap]u8, s: []const u8) ?[:0]const u8 {
+    if (s.len >= buf.len) return null;
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
+}
+
+const Captured = struct { code: ?u8, text: []const u8 };
+
+/// Runs `argv` to its end; its output goes to a file of its own, so concurrent callers never share one.
+fn capture(a: std.mem.Allocator, argv: []const [*:0]const u8) Captured {
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "{s}/.sushi/sushibar-capture-{d}-{d}.txt", .{ g_home, proc.selfPid(), g_capture_seq.fetchAdd(1, .monotonic) }, 0) catch return .{ .code = null, .text = "" };
+    const code = proc.runCapture(argv, path.ptr);
+    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, a, .limited(64 * 1024)) catch "";
+    std.Io.Dir.cwd().deleteFile(g_io, path) catch {};
+    return .{ .code = code, .text = text };
 }
 
 fn refreshBarVersion(a: std.mem.Allocator) void {
-    const sushi = g_sushi orelse return;
-    if (proc.runCapture(&.{ sushi.ptr, "--version" }, g_capture_path.ptr) != 0) return;
-    const v = logic.parseVersionOutput(readCapture(a)) orelse return;
+    var sb: [path_cap]u8 = undefined;
+    const sushi = siblingNow(&sb, server_exe) orelse return;
+    const got = capture(a, &.{ sushi.ptr, "--version" });
+    if (got.code != 0) return;
+    const v = logic.parseVersionOutput(got.text) orelse return;
     if (g_launched_version.len == 0) g_launched_version.set(v);
     lock();
     shared.bar_version.set(v);
@@ -248,11 +352,12 @@ fn setNote(text: []const u8) void {
 /// `sushi update --check`, recorded in sushi's own cache like the daily check. False when it gave no answer.
 fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
     // Both an explicit and a daily check end in the header's "up to date" or "available"; only failures are worded.
-    const sushi = g_sushi orelse return false;
+    var sb: [path_cap]u8 = undefined;
+    const sushi = siblingNow(&sb, server_exe) orelse return false;
     refreshBarVersion(a);
-    const code = proc.runCapture(&.{ sushi.ptr, "update", "--check" }, g_capture_path.ptr);
-    const text = readCapture(a);
-    const result = logic.parseCheck(text);
+    const got = capture(a, &.{ sushi.ptr, "update", "--check" });
+    const code = got.code;
+    const result = logic.parseCheck(got.text);
     lock();
     defer unlock();
     if (code == null) {
@@ -315,15 +420,16 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
     if (r.status != 202) {
         const E = struct { @"error": struct { message: []const u8 = "" } = .{} };
         const e = std.json.parseFromSliceLeaky(E, a, r.body, .{ .ignore_unknown_fields = true }) catch null;
-        var msg: [120]u8 = undefined;
+        var msg: [400]u8 = undefined;
         const text = std.fmt.bufPrint(&msg, "Update refused: {s}", .{if (e != null and e.?.@"error".message.len > 0) e.?.@"error".message else "the server did not accept it"}) catch "Update refused";
         return setNote(text);
     }
     setNote("Updating…");
     var down = false;
     var i: u32 = 0;
-    while (i < 1200) : (i += 1) {
+    while (i < update_wait_polls) : (i += 1) {
         std.Io.sleep(g_io, .fromMilliseconds(500), .real) catch {};
+        if (port() != p) return setNote("Update started; no longer followed after the port change");
         var hb: [64]u8 = undefined;
         const alive = if (get(a, urlFor(&hb, p, "/health"))) |h| h.status == 200 else false;
         if (!alive) {
@@ -344,16 +450,20 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
         var msg: [64]u8 = undefined;
         return finishUpdate(a, std.fmt.bufPrint(&msg, "Updated to sushi {s}", .{up.current}) catch "Updated");
     };
-    var msg: [160]u8 = undefined;
+    var msg: [400]u8 = undefined;
     const why = if (u) |up| up.err orelse "sushi restarted on the version it had" else "the server did not come back";
     setNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{why}) catch "Update failed");
 }
 
+/// Two minutes of half-second polls: past that the update is reported as failed instead of locking the menu.
+const update_wait_polls = 240;
+
 fn updateViaCli(a: std.mem.Allocator) void {
-    const sushi = g_sushi orelse return;
+    var sb: [path_cap]u8 = undefined;
+    const sushi = siblingNow(&sb, server_exe) orelse return setNote("could not find sushi beside sushibar");
     setNote("Updating…");
-    const code = proc.runCapture(&.{ sushi.ptr, "update" }, g_capture_path.ptr);
-    if (code == 0) {
+    const got = capture(a, &.{ sushi.ptr, "update" });
+    if (got.code == 0) {
         var msg: [64]u8 = undefined;
         refreshBarVersion(a);
         lock();
@@ -362,8 +472,8 @@ fn updateViaCli(a: std.mem.Allocator) void {
         unlock();
         return finishUpdate(a, text);
     }
-    var msg: [160]u8 = undefined;
-    setNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{lastLine(readCapture(a))}) catch "Update failed");
+    var msg: [400]u8 = undefined;
+    setNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{logic.failureLine(got.text)}) catch "Update failed");
 }
 
 const WorkerKind = enum { auto_check, check, update };
@@ -427,16 +537,21 @@ fn pollLoop() void {
     var last_check_ms: i64 = 0;
     var last_ok = true;
     var iter: u32 = 0;
+    var loop_start_ms: i64 = 0;
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
     {
         _ = arena_state.reset(.retain_capacity);
         refreshBarVersion(arena_state.allocator());
     }
-    while (true) : (std.Io.sleep(g_io, .fromMilliseconds(poll_ms), .real) catch {}) {
+    while (true) : ({
+        const spent = io_util.nowMs(g_io) - loop_start_ms;
+        if (spent < poll_ms) std.Io.sleep(g_io, .fromMilliseconds(poll_ms - spent), .real) catch {};
+    }) {
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         const now = io_util.nowMs(g_io);
+        loop_start_ms = now;
         const p = port();
         if (p != tracked_port) {
             tracker = .{};
@@ -448,16 +563,6 @@ fn pollLoop() void {
         }
         var url_buf: [96]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/metrics.json?since={d}", .{ p, tracker.since_ms }) catch unreachable;
-        var sample: logic.Sample = .{};
-        const reply = get(a, url);
-        sample.link = logic.linkFor(if (reply) |r| r.status else null);
-        if (sample.link == .up) sample = logic.parseMetrics(a, reply.?.body) catch .{};
-        tracker.observe(now, sample);
-
-        var models: logic.ModelState = .{};
-        if (sample.link == .up or sample.link == .metrics_off) models = modelsOf(a, p);
-        const model = models.ready;
-
         var lbuf: [16]logic.Listener = undefined;
         var listings: [max_listings]Listing = undefined;
         var n: usize = 0;
@@ -469,9 +574,25 @@ fn pollLoop() void {
             } else false;
             if (dup or n == max_listings) continue;
             listings[n] = .{ .port = l.port, .pid = l.pid };
-            const m = if (l.port == p) model else modelsOf(a, l.port).ready;
-            listings[n].model.set(m orelse "");
             n += 1;
+        }
+
+        var sample: logic.Sample = .{};
+        const reply = get(a, url);
+        sample.link = logic.linkFor(if (reply) |r| r.status else null);
+        if (sample.link == .up) sample = logic.parseMetrics(a, reply.?.body) catch .{};
+        // A sushi that holds the port and does not answer is not a stopped one.
+        if (sample.link == .offline and sushi_listening) sample.link = .silent;
+        tracker.observe(now, sample);
+
+        var models: logic.ModelState = .{};
+        if (sample.link == .up or sample.link == .metrics_off) models = modelsOf(a, p);
+        const model = models.ready;
+
+        for (listings[0..n]) |*l| {
+            if (l.port != p) continue;
+            l.model.set(model orelse "");
+            l.known = if (sample.link == .up or sample.link == .metrics_off) .answered else if (sample.link == .silent) .failed else .unknown;
         }
         const taken = sample.link == .offline and !sushi_listening and proc.portInUse(p);
 
@@ -508,7 +629,7 @@ fn pollLoop() void {
         }
 
         iter += 1;
-        if (iter % props_every == 1 and sample.link != .offline and sample.link != .unauthorized) refreshProps(a, p);
+        if (iter % props_every == 1 and sample.link != .offline and sample.link != .silent and sample.link != .unauthorized) refreshProps(a, p);
 
         lock();
         if (shared.check_failed) {
@@ -565,19 +686,61 @@ fn setPort(p: u16) void {
 
 // ── Start and Stop ──
 
+/// One record per port, so a server started on port A stays tracked after Start on port B.
+fn serverPidPath(buf: []u8, p: u16) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.sushi/{s}{d}.pid", .{ g_home, server_pid_prefix, p }) catch "";
+}
+
 fn ownServer() ?logic.PidEntry {
-    const e = proc.verifiedPid(g_io, g_server_pid_path, server_exe, true) orelse return null;
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const e = proc.verifiedPid(g_io, serverPidPath(&pb, port()), server_exe, true) orelse return null;
     return if (e.port == port()) e else null;
 }
 
+/// Servers this process spawned: each is reaped by its own pid, and one that exits before it ever answered is a
+/// failed start.
+const Started = struct { pid: i32 = 0, port: u16 = 0, answered: bool = false, stopping: bool = false };
+var started: [8]Started = @splat(.{});
+
+fn reapStarted() void {
+    for (&started) |*st| {
+        if (st.pid == 0) continue;
+        if (std.c.waitpid(st.pid, null, std.c.W.NOHANG) != st.pid) continue;
+        if (!st.answered and !st.stopping) {
+            var nb: [160]u8 = undefined;
+            setNote(logic.startFailedNote(&nb, st.port));
+        }
+        st.* = .{};
+    }
+}
+
+fn markAnswered(p: u16) void {
+    for (&started) |*st| if (st.pid != 0 and st.port == p) {
+        st.answered = true;
+    };
+}
+
+fn markStopping(pid: i32) void {
+    for (&started) |*st| if (st.pid == pid) {
+        st.stopping = true;
+    };
+}
+
 fn startServer() void {
-    const sushi = g_sushi orelse return;
+    var sb: [path_cap]u8 = undefined;
+    const sushi = siblingNow(&sb, server_exe) orelse return setNote("could not find sushi beside sushibar");
     if (ownServer() != null) return;
     var port_buf: [8:0]u8 = undefined;
     const p = port();
     const port_z = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{p}, 0) catch return;
-    const pid = proc.spawnDetached(&.{ sushi.ptr, "--serve", "--port", port_z.ptr }, false) catch return;
-    proc.writePid(g_io, g_home, g_server_pid_path, .{ .pid = pid, .port = p }) catch {};
+    const pid = proc.spawnDetached(&.{ sushi.ptr, "--serve", "--port", port_z.ptr }, false) catch return setNote("could not start sushi");
+    setNote("");
+    for (&started) |*st| if (st.pid == 0) {
+        st.* = .{ .pid = pid, .port = p };
+        break;
+    };
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    proc.writePid(g_io, g_home, serverPidPath(&pb, p), .{ .pid = pid, .port = p }) catch {};
 }
 
 const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
@@ -590,6 +753,7 @@ fn runAlert(message: []const u8, info: []const u8, ok: [*:0]const u8, cancel: ?[
     const app = objc.msg(objc.id, objc.class("NSApplication"), "sharedApplication", .{});
     objc.msg(void, app, "activateIgnoringOtherApps:", .{true});
     const alert = objc.new(objc.class("NSAlert"));
+    defer objc.release(alert);
     objc.msg(void, alert, "setMessageText:", .{objc.nsString(mz.ptr)});
     objc.msg(void, alert, "setInformativeText:", .{objc.nsString(iz.ptr)});
     _ = objc.msg(objc.id, alert, "addButtonWithTitle:", .{objc.nsString(ok)});
@@ -620,6 +784,7 @@ fn stopServer() void {
     switch (logic.planStop(if (ours) |e| e.pid else null, p, proc.listeners(&lbuf, server_exe))) {
         .none => {},
         .now => |pid| {
+            markStopping(pid);
             proc.terminate(pid);
             stopping_until_ms = io_util.nowMs(g_io) + stopping_ms;
         },
@@ -659,6 +824,8 @@ var pack_mi: objc.id = null;
 var menu_target: objc.id = null;
 var top_menu: objc.id = null;
 var port_field_mi: objc.id = null;
+var note_mi: objc.id = null;
+const note_show_max = 100;
 var icons: [2]objc.id = .{ null, null };
 var shown_icon: ?logic.Icon = null;
 var shown_symbol: ?[*]const u8 = null;
@@ -702,6 +869,7 @@ fn setButtonTitle(button: objc.id, text: []const u8, dim: bool) void {
     @memcpy(z[0..text.len], text);
     z[text.len] = 0;
     const s = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsString(&z), header_view.titleAttributes(dim) });
+    defer objc.release(s);
     objc.msg(void, button, "setAttributedTitle:", .{s});
 }
 
@@ -746,6 +914,7 @@ fn syncPortMenu(entries: []const logic.PortEntry) void {
         const label = logic.portLabel(&lb, e);
         const lz = std.fmt.bufPrintSentinel(&z, "{s}", .{label}, 0) catch continue;
         const mi = newItem(lz.ptr, "pickPort:", e.port, "", null);
+        defer objc.release(mi);
         if (e.checked) objc.msg(void, mi, "setState:", .{@as(isize, 1)});
         objc.msg(void, port_menu, "insertItem:atIndex:", .{ mi, @as(isize, @intCast(i)) });
     }
@@ -756,6 +925,7 @@ fn runAction(act: Action) void {
         .start => startServer(),
         .stop => stopServer(),
         .confirm => {},
+        .models => refreshModels(@intCast(act.value)),
         .check => {
             lock();
             shared.req_check = true;
@@ -794,7 +964,7 @@ fn take(buf: []u8, s: anytype) []const u8 {
 fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     tick_count += 1;
     for (test_actions[0..test_action_n]) |act| if (act.at == tick_count) runAction(act);
-    while (std.c.waitpid(-1, null, std.c.W.NOHANG) > 0) {}
+    reapStarted();
 
     const p = port();
     const now = io_util.nowMs(g_io);
@@ -804,7 +974,7 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     var srv_b: [32]u8 = undefined;
     var latest_b: [32]u8 = undefined;
     var cmd_b: [80]u8 = undefined;
-    var note_b: [120]u8 = undefined;
+    var note_b: [240]u8 = undefined;
     var listings: [max_listings]logic.Listing = undefined;
     var list_models: [max_listings][96]u8 = undefined;
     var hist: [200]logic.Hist = undefined;
@@ -824,8 +994,19 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     } else null;
     var ln: usize = 0;
     for (shared.listings[0..shared.listing_n]) |l| {
-        const m = take(&list_models[ln], &l.model);
-        listings[ln] = .{ .port = l.port, .pid = l.pid, .model = if (m.len > 0) m else null };
+        var known = l.known;
+        var name: []const u8 = l.model.get();
+        if (l.port != p) {
+            known = .unknown;
+            name = "";
+            for (&shared.models) |*c| if (c.port == l.port) {
+                known = c.known;
+                name = c.model.get();
+            };
+        }
+        @memcpy(list_models[ln][0..name.len], name);
+        const m = list_models[ln][0..name.len];
+        listings[ln] = .{ .port = l.port, .pid = l.pid, .model = if (m.len > 0) m else null, .models = known };
         ln += 1;
     }
     const sushi_listening = fresh and shared.sushi_listening;
@@ -854,6 +1035,7 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     const relaunch = shared.relaunch;
     unlock();
 
+    if (view.link == .up or view.link == .metrics_off) markAnswered(p);
     const own = ownServer();
     const ours_alive = own != null;
     if (view.link == .offline or stopping_until_ms <= now) stopping_until_ms = 0;
@@ -862,7 +1044,7 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .link = view.link,
         .model = if (model.len > 0) model else null,
         .ours_alive = ours_alive,
-        .sushi_found = g_sushi != null,
+        .sushi_found = g_sushi_found,
         .port = p,
         .sushi_listening = sushi_listening,
         .port_taken = port_taken,
@@ -885,6 +1067,7 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .pack_update = pack_update,
         .mem_mb = mem_mb,
         .bar_version = bar_version,
+        .server_version = server_version,
         .update_available = uv.available,
         .latest = uv.latest,
         .up_to_date = up_to_date,
@@ -927,6 +1110,10 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     setText(check_mi, "setTitle:", check);
     objc.msg(void, check_mi, "setEnabled:", .{uv.busy == .none});
     objc.msg(void, check_mi, "setHidden:", .{uv.available});
+    var fit_b: [note_show_max + 4]u8 = undefined;
+    const note_shown = if (uv.busy == .none and uv.note.len > 0) logic.fitNote(&fit_b, uv.note, note_show_max) else "";
+    setText(note_mi, "setTitle:", note_shown);
+    objc.msg(void, note_mi, "setHidden:", .{note_shown.len == 0});
     var ub: [200]u8 = undefined;
     const update_label = if (uv.busy == .updating) check else logic.updateLabel(&ub, uv) orelse "";
     objc.msg(void, update_mi, "setHidden:", .{!(uv.available and uv.path != .brew)});
@@ -951,11 +1138,12 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
             pn += piece.len;
         }
         const shown_update = if (uv.available and uv.path == .brew) copy_label else if (uv.available) update_label else "";
-        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\"\n", .{
+        const shown_check = if (uv.available) "" else check;
+        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" note=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\"\n", .{
             tick_count,                 title,                 status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
-            @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         check,
-            shown_update,               header.pill.label,     header.line1,           header.line2,
+            @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         shown_check,
+            shown_update,               note_shown,            header.pill.label,     header.line1,           header.line2,
             tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_copy,
         });
         if (tick_count >= test_polls) quit();
@@ -969,7 +1157,10 @@ fn relaunchSelf(p: u16) void {
     unlock();
     var port_z: [8:0]u8 = undefined;
     const pz = std.fmt.bufPrintSentinel(&port_z, "{d}", .{p}, 0) catch return;
-    proc.execReplace(&.{ g_self_exe.ptr, "--port", pz.ptr });
+    var sb: [path_cap]u8 = undefined;
+    // The path sushibar was started by, so a Homebrew link lands on the new keg; brew's opt link if that is gone.
+    const exe = if (reachable(g_self_exe)) g_self_exe else siblingNow(&sb, bar_exe) orelse g_self_exe;
+    proc.execReplace(&.{ exe.ptr, "--port", pz.ptr });
     setNote("Updated, but sushibar could not restart itself: quit and run it again");
 }
 
@@ -990,7 +1181,7 @@ fn toggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     const state: logic.Server = .{
         .link = shared.view.link,
         .ours_alive = ours_alive,
-        .sushi_found = g_sushi != null,
+        .sushi_found = g_sushi_found,
         .port = port(),
         .sushi_listening = shared.sushi_listening,
         .port_taken = shared.port_taken,
@@ -1033,6 +1224,10 @@ fn copyPackAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     if (n > 0) objc.copyText(@ptrCast(&cmd));
 }
 
+fn menuWillOpen(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    refreshModels(null);
+}
+
 /// A symbol in the accent colour (not a template, so the menu does not tint it grey).
 fn accentSymbol(name: []const u8) objc.id {
     const accent = objc.msg(objc.id, objc.class("NSColor"), "controlAccentColor", .{});
@@ -1071,6 +1266,7 @@ fn runMenuBar() noreturn {
         .{ .selector = "update:", .imp = @ptrCast(&updateAction), .types = "v@:@" },
         .{ .selector = "copy:", .imp = @ptrCast(&copyAction), .types = "v@:@" },
         .{ .selector = "copyPack:", .imp = @ptrCast(&copyPackAction), .types = "v@:@" },
+        .{ .selector = "menuWillOpen:", .imp = @ptrCast(&menuWillOpen), .types = "v@:@" },
     });
     menu_target = objc.new(cls);
     const menu = objc.new(objc.class("NSMenu"));
@@ -1091,6 +1287,7 @@ fn runMenuBar() noreturn {
     port_menu = objc.new(objc.class("NSMenu"));
     objc.msg(void, port_menu, "setAutoenablesItems:", .{false});
     objc.msg(void, port_mi, "setSubmenu:", .{port_menu});
+    objc.msg(void, port_menu, "setDelegate:", .{menu_target});
     addSeparator(port_menu);
     port_field_mi = objc.new(objc.class("NSMenuItem"));
     objc.msg(void, port_field_mi, "setView:", .{port_field.create(menu_target)});
@@ -1117,6 +1314,8 @@ fn runMenuBar() noreturn {
     objc.msg(void, copy_mi, "setHidden:", .{true});
     pack_mi = addItem(menu, "Copy", "copyPack:", 0, "", "doc.on.doc");
     objc.msg(void, pack_mi, "setHidden:", .{true});
+    note_mi = addItem(menu, "", null, 0, "", null);
+    objc.msg(void, note_mi, "setHidden:", .{true});
     addSeparator(menu);
 
     _ = addItem(menu, "Quit sushibar", "quit:", 0, "q", "power");
@@ -1205,11 +1404,18 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
 
 // ── Launch ──
 
+/// The path sushibar was started by, made absolute but not resolved: its symlinks are followed at each use.
 fn selfPath(buf: []u8) ?[:0]const u8 {
     var tmp: [std.fs.max_path_bytes]u8 = undefined;
     var n: u32 = tmp.len;
     if (std.c._NSGetExecutablePath(&tmp, &n) != 0) return null;
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(&tmp)));
+    if (raw.len > 0 and raw[0] == '/') {
+        if (raw.len >= buf.len) return null;
+        @memcpy(buf[0..raw.len], raw);
+        buf[raw.len] = 0;
+        return buf[0..raw.len :0];
+    }
     const real = proc.realPath(buf, raw) orelse return null;
     buf[real.len] = 0;
     return buf[0..real.len :0];
@@ -1231,7 +1437,14 @@ fn detach(gpa: std.mem.Allocator, args: []const []const u8, self_exe: [:0]const 
             out(g_io, "sushibar is already running (pid {d})\n", .{e.pid});
             std.process.exit(0);
         }
-        if (std.c.waitpid(child, null, std.c.W.NOHANG) == child) fail("the detached copy exited at once (no window server?)", .{});
+        if (std.c.waitpid(child, null, std.c.W.NOHANG) == child) {
+            // A copy that lost the race for the single-instance lock exits at once; the winner's pid file explains it.
+            if (proc.verifiedPid(g_io, g_bar_pid_path, bar_exe, false)) |e| {
+                out(g_io, "sushibar is already running (pid {d})\n", .{e.pid});
+                std.process.exit(0);
+            }
+            fail("the detached copy exited at once (no window server?)", .{});
+        }
         std.Io.sleep(g_io, .fromMilliseconds(50), .real) catch {};
     }
     fail("the detached copy did not register within 5 s", .{});
@@ -1269,13 +1482,9 @@ pub fn main(init: std.process.Init) !void {
 
     g_home = env("HOME") orelse "/tmp";
     var p1: [std.fs.max_path_bytes]u8 = undefined;
-    var p2: [std.fs.max_path_bytes]u8 = undefined;
     var p3: [std.fs.max_path_bytes]u8 = undefined;
-    var p4: [std.fs.max_path_bytes]u8 = undefined;
     g_bar_pid_path = try gpa.dupe(u8, proc.pidFilePath(&p1, g_home, bar_pid_name) orelse fail("HOME is too long", .{}));
-    g_server_pid_path = try gpa.dupe(u8, proc.pidFilePath(&p2, g_home, server_pid_name) orelse fail("HOME is too long", .{}));
     g_saved_path = try gpa.dupe(u8, proc.pidFilePath(&p3, g_home, saved_name) orelse fail("HOME is too long", .{}));
-    g_capture_path = try gpa.dupeSentinel(u8, proc.pidFilePath(&p4, g_home, capture_name) orelse fail("HOME is too long", .{}), 0);
     readTestSeams();
 
     const saved_text = std.Io.Dir.cwd().readFileAlloc(g_io, g_saved_path, gpa, .limited(4096)) catch "";
@@ -1292,15 +1501,20 @@ pub fn main(init: std.process.Init) !void {
     }
     if (!proc.isSessionLeader()) detach(gpa, args, g_self_exe);
 
+    // The pid file is checked and written apart; the lock is what keeps two simultaneous launches to one.
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrintSentinel(&lock_buf, "{s}/.sushi/{s}", .{ g_home, lock_name }, 0) catch fail("HOME is too long", .{});
+    std.Io.Dir.cwd().createDirPath(g_io, std.fs.path.dirname(lock_path) orelse ".") catch {};
+    if (!proc.acquireLock(lock_path.ptr)) {
+        out(g_io, "sushibar is already running\n", .{});
+        return;
+    }
     try proc.writePid(g_io, g_home, g_bar_pid_path, .{ .pid = proc.selfPid(), .port = port() });
-    var sibling: [std.fs.max_path_bytes]u8 = undefined;
-    if (logic.siblingPath(&sibling, self_exe, server_exe)) |p| {
-        if (std.Io.Dir.cwd().access(g_io, p, .{ .execute = true })) |_| {
-            g_sushi = try gpa.dupeSentinel(u8, p, 0);
-            var real: [std.fs.max_path_bytes]u8 = undefined;
-            g_sushi_real = try gpa.dupe(u8, proc.realPath(&real, p) orelse p);
-            g_sibling_brew = logic.isBrewKeg(g_sushi_real);
-        } else |_| {}
+    var sb: [path_cap]u8 = undefined;
+    if (siblingNow(&sb, server_exe)) |sushi| {
+        g_sushi_found = true;
+        var real: [std.fs.max_path_bytes]u8 = undefined;
+        g_sibling_brew = logic.isBrewKeg(proc.realPath(&real, sushi) orelse sushi);
     }
     runMenuBar();
 }
