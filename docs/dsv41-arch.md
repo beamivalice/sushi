@@ -347,6 +347,31 @@ After CED and the fused gather-attention (budget 96, chunk 1024, synced stage pr
 - A same-layer read-ahead (the layer's router on the stream before attention, its predicted misses read during attention)
   named 85% of the missed bytes but read 2.5x the fill bytes; live 4k-32k code prefill ran 1-7% slower (on 61daded0, pair-major
   STQ, default budget, one boot each; the fill fell 202 -> 158 ms a 2048-row chunk, the GPU tail rose 601 -> 749), so it was not merged.
+- A pool read-ahead (the next layer's router on the stream entering it, riding this layer's evaluation; the experts
+  at least `max(2, rows/256)` rows name read straight into that layer's pool on a thread, capped at the bytes the last
+  attention window reads) cut a request's misses 9% and read 22% more bytes: 17,890 tokens of new text missed 2,878
+  experts against 3,164 with 999 read ahead (7.7 GB); new-text prefill 1,364 against ~1,359 tok/s at 17.9k and 1,392
+  against ~1,404 at 31.5k (two boots against five of 59e7a562, interleaved, 59e7a562 + 14b4dd2d, pack revision 2.0,
+  `--ssd-budget-gb 108`, `taskpolicy -a`, GPU lock, AC, fans max and under 50 C before each boot; a cold 16,020-token
+  code prompt, then 17,890 and 31,524 tokens of new code text). Same bytes, no gain: not merged.
+- What a 16k prompt reads: on pack revision 2.0 at `--ssd-budget-gb 108` (262 slots a layer of 384) a cold
+  16,020-token code prompt misses 3,356 experts (26.2 GB, 3.1 s of fill at ~8.5 GB/s) and 17,890 tokens of new text
+  3,164 (24.5 GB, 2.8 s), against 0.48 ms a row for the rest of a state-only chunk. Of those misses 2,677 and 2,407
+  are distinct (layer, expert) pairs: a chunk re-reads only ~20-25% of them (the rest each enter the pool once), so a
+  layer-major order that reads each layer's experts once per prompt caps at that share. The other ~2.3 s is the
+  pool's first read of experts it does not hold; the lever there is overlap with compute, not fewer reads.
+- First boot of a binary: Metal compiles the custom kernels on a boot whose system shader cache does not hold them
+  (seen as `[dsv41] kernels warmed ... in` 22-43 s against 10.5-10.8 s when cached). On such a boot the first
+  request also pays up to ~1.3 s in chunk 1 and ~0.47 s in the 31-row pass (655-686 ms against 179-212); a cached boot
+  pays neither, so cold-request comparisons need the same cache state in every arm.
+- A prefill-width load warm (`warmPrefill`: a 2048-row chunk state-only and with its tail, then 31 and 64 rows, on
+  16 distinct token ids; 1f0d3987) removed the 31-row pass's share on an uncached boot (686 -> 212 and 670 -> 202
+  ms) but not chunk 1's: 7 kernel builds of the sorted-route path (`sushi_exl3_sorted_inverse_reduce`, `_rg_combine`,
+  `_mid_swiglu`, `_token_pair_prepare`, `_prepare_h128`, `_finish_h128`) still land in the first request
+  (`SUSHI_KERNEL_BUILD_LOG`), likely because 16 distinct ids never route more experts than a pool holds. It added 3.7-4.0 s to a cached
+  boot's load (14.5 against 10.5-10.8 s). Not merged; a warm of those kernels on synthetic shapes is the open fix.
+- A process-wide `MLX_MAX_MB_PER_BUFFER=500` (decode included) read 1,366 against ~1,359 tok/s at 17.9k and 1,408
+  against ~1,404 at 31.5k (two boots, 59e7a562): inside the noise.
 
 <a id="oracle"></a>
 ## Oracle and what is proven

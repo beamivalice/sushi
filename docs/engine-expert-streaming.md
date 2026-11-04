@@ -290,6 +290,11 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   not a page multiple is direct only at the slots that land on pages). The padding is billed with the layer
   (`LayerGroups.padBytes` in `allBytes`, `floorBytes` and the union workspace). A pair-major pack needs tile-major
   pools (`Exl3TileOrderNeedsTileMajor` otherwise).
+- **Direct reads on 4 KiB blocks** (495d6713, unmerged): a span lands straight in the slab when its offset, length and
+  destination are on the volume's 4 KiB block instead of the 16 KiB page. On pack revision 2.0 it raised the direct
+  share of a 17.9k new-text prompt's reads from 26% to 34% (`reads_direct`/`reads`) and moved neither the fill rate nor prefill
+  (new text 1,370 against ~1,359 tok/s at 17.9k, 1,403 against ~1,404 at 31.5k, two boots, `--ssd-budget-gb 108`):
+  the reads are bound by the SSD at ~8.5 GB/s, not by the bounce copy.
 - The `[expert-stream] forward=` line ends with `bounced_gb` (bytes read through the bounce buffer since boot) and
   `reshuffled_gb` (tile bytes the CPU permuted); a pair-major pack on aligned shards shows both falling to the share
   of reads that cannot be direct, `reshuffled_gb` at 0.
