@@ -758,7 +758,7 @@ fn pollLoop() void {
         if (p == port()) {
             lock();
             shared.port = p;
-            shared.view = tracker.view(sample.link, now);
+            shared.view = tracker.view(sample.link);
             if (fetch_models or !answers) {
                 shared.model.set(models.ready orelse "");
                 shared.model_loading.set(models.loading orelse "");
@@ -1181,7 +1181,6 @@ var tick_count: u32 = 0;
 var last_title: [128]u8 = undefined;
 var shown_title: [128]u8 = undefined;
 var shown_title_len: usize = std.math.maxInt(usize);
-var shown_dim = false;
 var port_sig: [1536]u8 = undefined;
 var port_sig_len: usize = std.math.maxInt(usize);
 
@@ -1208,16 +1207,15 @@ fn showIcon(button: objc.id, icon: logic.Icon) void {
     objc.msg(void, button, "setImage:", .{icons[@intFromEnum(icon)]});
 }
 
-/// The button title in monospaced digits, so its width does not jitter; the last request's speed is dim.
-fn setButtonTitle(button: objc.id, text: []const u8, dim: bool) void {
-    if (shown_title_len == text.len and shown_dim == dim and std.mem.eql(u8, shown_title[0..text.len], text)) return;
+/// The button title in monospaced digits, so its width does not jitter.
+fn setButtonTitle(button: objc.id, text: []const u8) void {
+    if (shown_title_len == text.len and std.mem.eql(u8, shown_title[0..text.len], text)) return;
     shown_title_len = text.len;
-    shown_dim = dim;
     @memcpy(shown_title[0..text.len], text);
     var z: [192:0]u8 = undefined;
     @memcpy(z[0..text.len], text);
     z[text.len] = 0;
-    const s = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsString(&z), header_view.titleAttributes(dim) });
+    const s = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsString(&z), header_view.titleAttributes() });
     defer objc.release(s);
     objc.msg(void, button, "setAttributedTitle:", .{s});
 }
@@ -1294,7 +1292,7 @@ fn watchTransition(p: u16, fresh: bool, link: logic.Link, now: i64) void {
     prev_answering = logic.answering(link);
 }
 
-/// The orange dot on the menu bar icon, at its lower right: it keeps its colour beside the tinted template icon.
+/// The orange dot on the menu bar icon, at its lower right: it sits on the colour icon where the sushi does not hide it.
 fn showBadge(button: objc.id, on: bool) void {
     if (on == shown_badge) return;
     objc.fadeNext(button, 0.25);
@@ -1548,7 +1546,7 @@ fn refresh() void {
     const button = objc.msg(objc.id, status_item, "button", .{});
     showIcon(button, logic.iconFor(view.link));
     showBadge(button, logic.badge(view.link, port_taken, g_crashed_port == p and !ours_alive));
-    setButtonTitle(button, title, logic.titleDim(view));
+    setButtonTitle(button, title);
     var status_buf: [200]u8 = undefined;
     const status = logic.statusLine(&status_buf, state);
     setText(button, "setToolTip:", status);
@@ -1811,7 +1809,7 @@ const icon_h = 18;
 
 fn loadIcons() void {
     icons[@intFromEnum(logic.Icon.outline)] = objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, icon_w, icon_h);
-    icons[@intFromEnum(logic.Icon.filled)] = objc.loadSvg(@embedFile("sushibar/icon-online-template.svg"), true, icon_w, icon_h);
+    icons[@intFromEnum(logic.Icon.color)] = objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, icon_w, icon_h);
 }
 
 const find_show_interface: isize = 1;
@@ -2028,11 +2026,11 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
 /// The menu bar item in its states, on a plain button of the status button's shape over a menu-bar-like fill.
 fn renderBadge(dir: []const u8) void {
     loadIcons();
-    const Case = struct { name: []const u8, icon: logic.Icon, title: []const u8 = "", dim: bool = false, badge: bool = false };
+    const Case = struct { name: []const u8, icon: logic.Icon, title: []const u8 = "", badge: bool = false };
     const cases = [_]Case{
-        .{ .name = "live", .icon = .filled, .title = "105 tok/s" },
-        .{ .name = "last", .icon = .filled, .title = "88.0 tok/s", .dim = true },
-        .{ .name = "badge", .icon = .filled, .badge = true },
+        .{ .name = "live", .icon = .color, .title = "105 tok/s" },
+        .{ .name = "last", .icon = .color, .title = "88.0 tok/s" },
+        .{ .name = "badge", .icon = .color, .badge = true },
         .{ .name = "offline", .icon = .outline },
     };
     for (cases) |c| for ([_]bool{ false, true }) |dark| {
@@ -2048,7 +2046,7 @@ fn renderBadge(dir: []const u8) void {
         // The status bar draws a template image in the bar's text colour; a plain button would draw it dimmed.
         objc.msg(void, button, "setContentTintColor:", .{objc.color("labelColor")});
         shown_title_len = std.math.maxInt(usize);
-        setButtonTitle(button, c.title, c.dim);
+        setButtonTitle(button, c.title);
         makeBadge(button);
         shown_badge = !c.badge;
         showBadge(button, c.badge);

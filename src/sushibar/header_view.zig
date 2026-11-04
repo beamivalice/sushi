@@ -398,6 +398,6 @@ pub fn noteAttributes() id {
 }
 
 /// The attributes of the menu bar button's title: 12 pt monospaced digits, dim for a past reading.
-pub fn titleAttributes(dim: bool) id {
-    return attrs(font(12, weight_regular, true), color(if (dim) "secondaryLabelColor" else "labelColor"), clip, align_left);
+pub fn titleAttributes() id {
+    return attrs(font(12, weight_regular, true), color("labelColor"), clip, align_left);
 }

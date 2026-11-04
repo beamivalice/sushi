@@ -199,13 +199,8 @@ pub const View = struct {
     prefilling: bool = false,
     live: ?f64 = null,
     last: ?f64 = null,
-    /// The last request ended `title_last_ms` or more ago: the title drops its speed.
-    last_old: bool = false,
     update_waiting: bool = false,
 };
-
-/// How long the menu bar keeps showing the last request's speed once the server went idle.
-pub const title_last_ms: i64 = 10 * 60_000;
 
 /// Turns polls into the live decode speed (tokens added to the decoding rows over the wall time between two
 /// polls) and remembers the last finished request's speed.
@@ -219,8 +214,6 @@ pub const Tracker = struct {
     live: ?f64 = null,
     last: ?f64 = null,
     last_prefill: ?f64 = null,
-    /// When a request last decoded or finished.
-    last_at_ms: i64 = 0,
 
     /// `now_ms` is read before the request went out, so the next `since` cannot skip a request.
     pub fn observe(self: *Tracker, now_ms: i64, sample: Sample) void {
@@ -231,7 +224,6 @@ pub const Tracker = struct {
             self.since_ms = @max(sample.newest_finished_ms, now_ms);
             if (sample.finished_tps) |t| self.last = t;
             if (sample.finished_prefill_tps) |t| self.last_prefill = t;
-            if (sample.finished_tps != null or self.decoding) self.last_at_ms = now_ms;
             const dt_ms = now_ms - self.prev_ms;
             if (self.prev_n > 0 and dt_ms > 0) {
                 var added: u64 = 0;
@@ -249,14 +241,13 @@ pub const Tracker = struct {
         self.prev_ms = now_ms;
     }
 
-    pub fn view(self: *const Tracker, link: Link, now_ms: i64) View {
+    pub fn view(self: *const Tracker, link: Link) View {
         return .{
             .link = link,
             .decoding = self.decoding,
             .prefilling = self.prefilling,
             .live = self.live,
             .last = self.last,
-            .last_old = now_ms - self.last_at_ms >= title_last_ms,
         };
     }
 };
@@ -276,33 +267,25 @@ pub fn title(buf: []u8, v: View) []const u8 {
     return buf[0 .. base.len + tail.len];
 }
 
-/// The title shows the last request's speed, not a live one: drawn dim.
-pub fn titleDim(v: View) bool {
-    return v.link == .up and !v.decoding and !v.prefilling and v.last != null and !v.last_old;
-}
-
 fn titleBase(buf: []u8, v: View) []const u8 {
     var num: [32]u8 = undefined;
     const text = switch (v.link) {
         .offline, .unauthorized, .metrics_off, .silent => std.fmt.bufPrint(buf, "", .{}),
         .up => if (v.decoding)
-            std.fmt.bufPrint(buf, "{s} tok/s", .{if (v.live) |t| speedText(&num, t) else "…"})
+            (if (v.live) |t| std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, t)}) else std.fmt.bufPrint(buf, "decode…", .{}))
         else if (v.prefilling)
             std.fmt.bufPrint(buf, "prefill…", .{})
-        else if (v.last != null and !v.last_old)
-            std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, v.last.?)})
         else
             std.fmt.bufPrint(buf, "", .{}),
     };
     return text catch "";
 }
 
-pub const Icon = enum { outline, filled };
+pub const Icon = enum { outline, color };
 
-/// Outline while no server answers; filled once one does, whatever it says. Both are template images, so the menu
-/// bar tints them like its neighbours; the colour icon is the card's.
+/// The outline template while no server answers; the colour sushi once one does, whatever it says.
 pub fn iconFor(link: Link) Icon {
-    return if (link == .offline or link == .silent) .outline else .filled;
+    return if (link == .offline or link == .silent) .outline else .color;
 }
 
 /// A server replied, whatever it said.
@@ -1742,7 +1725,7 @@ test "update: sushibar relaunches only when the sushi beside it changed version"
 test "update menu: a dot on the button while an update waits" {
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("•", title(&b, .{ .link = .up, .update_waiting = true }));
-    try std.testing.expectEqualStrings("88.0 tok/s •", title(&b, .{ .link = .up, .last = 88, .update_waiting = true }));
+    try std.testing.expectEqualStrings("•", title(&b, .{ .link = .up, .last = 88, .update_waiting = true }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .update_waiting = false }));
 }
 
@@ -2081,15 +2064,6 @@ test "menu: update group labels" {
     try std.testing.expectEqualStrings("Copy “brew upgrade sushi”", copyLabel(&b, "brew upgrade sushi"));
 }
 
-test "title: the last request's speed is dim and drops the word last" {
-    var b: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("88.0 tok/s", title(&b, .{ .link = .up, .last = 88 }));
-    try std.testing.expect(titleDim(.{ .link = .up, .last = 88 }));
-    try std.testing.expect(!titleDim(.{ .link = .up, .decoding = true, .live = 5, .last = 88 }));
-    try std.testing.expect(!titleDim(.{ .link = .up }));
-    try std.testing.expect(!titleDim(.{ .link = .offline, .last = 4 }));
-}
-
 test "args: no argument runs on the server's default port" {
     try std.testing.expectEqual(Command{ .run = null }, parseArgs(&.{}));
 }
@@ -2196,7 +2170,7 @@ test "tracker: the last speed outlives the request, and since follows the newest
 
 test "icon and link: outline only when nothing answers, and a silent server is offline" {
     try std.testing.expectEqual(Icon.outline, iconFor(.offline));
-    for ([_]Link{ .up, .unauthorized, .metrics_off }) |l| try std.testing.expectEqual(Icon.filled, iconFor(l));
+    for ([_]Link{ .up, .unauthorized, .metrics_off }) |l| try std.testing.expectEqual(Icon.color, iconFor(l));
     try std.testing.expectEqual(Link.offline, linkFor(null));
     try std.testing.expectEqual(Link.up, linkFor(200));
     try std.testing.expectEqual(Link.unauthorized, linkFor(401));
@@ -2208,9 +2182,9 @@ test "title: live, last, prefill, idle, offline, unauthorized, metrics off" {
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("103 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 102.7 }));
     try std.testing.expectEqualStrings("42.7 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 42.66, .last = 9 }));
-    try std.testing.expectEqualStrings("… tok/s", title(&b, .{ .link = .up, .decoding = true }));
+    try std.testing.expectEqualStrings("decode…", title(&b, .{ .link = .up, .decoding = true }));
     try std.testing.expectEqualStrings("prefill…", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
-    try std.testing.expectEqualStrings("88.0 tok/s", title(&b, .{ .link = .up, .last = 88 }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .last = 88 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .last = 5, .decoding = true }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .unauthorized, .last = 5 }));
@@ -2459,19 +2433,13 @@ test "log scroll: following resumes only at the bottom" {
     try std.testing.expect(atBottom(1200, 1000));
 }
 
-test "title: the last request's speed leaves the menu bar after ten idle minutes, the card keeps it" {
+test "title: an idle server shows the icon only, the card keeps the last speed" {
     var t: Tracker = .{};
     t.observe(1_000, .{ .link = .up, .finished_tps = 42 });
     var b: [64]u8 = undefined;
-    const fresh = t.view(.up, 1_000 + title_last_ms - 1);
-    try std.testing.expectEqualStrings("42.0 tok/s", title(&b, fresh));
-    try std.testing.expect(titleDim(fresh));
-    const old = t.view(.up, 1_000 + title_last_ms);
-    try std.testing.expectEqualStrings("", title(&b, old));
-    try std.testing.expect(!titleDim(old) and old.last.? == 42);
-    t.observe(2_000_000, .{ .link = .up, .decoding = &.{.{ .request_id = 1, .generated = 1 }} });
-    t.observe(2_001_000, .{ .link = .up });
-    try std.testing.expectEqualStrings("42.0 tok/s", title(&b, t.view(.up, 2_000_000 + title_last_ms - 1)));
+    const idle = t.view(.up);
+    try std.testing.expectEqualStrings("", title(&b, idle));
+    try std.testing.expect(idle.last.? == 42);
 }
 
 test "poll cadence: a second while something moves or the menu is open, slower idle, slowest offline" {

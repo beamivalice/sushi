@@ -13,7 +13,7 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 ```
 
 The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` and it detaches from
-the terminal. The title is the live decode tok/s (dim for the last request's once idle, gone after ten idle minutes), beside a menu bar icon
+the terminal. The title is the live decode tok/s while a request generates (the icon alone when idle), beside a menu bar icon
 that is filled while a server answers. Its menu opens on a status
 card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph) and then starts or stops the server
 on the watched port (asking first for one it did not start; Start loads again the model the server last had, and with none known the card links to the Models page; a Stop that has not taken after 15 s offers Force Stop), switches the port (the default port first, then the ports you added by typing one; hover an added port and click its x to forget it; a server on a port you never added is not listed; the choice is remembered; `--port` wins, then the default port,
