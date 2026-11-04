@@ -76,7 +76,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   refuse it after tokenizing, `Scheduler.submit` refuses it for every surface (`error.EmptyPrompt`), and
   `Generator.initWithOptions` returns that error rather than index the prompt's last token.
 - `/v1/models` `meta.default_max_tokens`, `default_temperature`, `default_top_p` and `default_top_k` on a loaded model's row are what a request that omits the field gets (`--max-tokens` / the `max_tokens` setting / the architecture's own, 0 = the rest of the window; then a launch flag > `generation_config.json` > the hardcoded value, `request_policy.sampling*`); the chat page's placeholders read them.
-- `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash"}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it.
+- `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash","repo":"beamster/..."}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it. The tab never offers `sushi pull` for an update (it writes a second copy): its callout opens the Downloads tab at the row of `repo`, which updates in place.
 - `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
   a status route never reaches `ensureLoaded` (`handlePropsNoModel`). Removed upstream routes answer named 404s.
@@ -406,8 +406,11 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `off|4|6|8`, `server.*.flag` as the flag's own text, `server.prefix_cache_disk_gb.ask_bytes`, and `POST
   /v1/prefix-cache/clear {"scope":"namespace","id":...}`. A `flag` is printed as the server sends it: a text starting with `--`
   (`--mtp-tokenv3 0.5`) is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
-  choice shows the choice the spelling names, else "Launch flag". The page names "Use default (N GiB)" from
-  `server.prefix_cache_disk_gb.default_bytes`. The Settings page's "Automatic update checks" card is a Default (On) / On / Off group per check. The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
+  choice shows the choice the spelling names, else "Launch flag". The Settings page's "Automatic update checks" card is a Default (On) / On / Off group per check.
+  Each server setting's badge is `Now`, `Next load` or `Next start`, read from its `applies` sentence; a setting row has no
+  Default badge. A Settings box shows Save only while it differs from the file, and an emptied box says "Use default" and sends
+  `null`. A refusal shows on the setting's row (labels, never keys), not as a toast; while the server cannot be reached the dimmed
+  Models and Settings areas are `inert`. A load toast names the models the server unloaded to fit it. The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
   `/metrics.json` read, which is 503 while metrics are off). Guards: `tests/test_prefix_cache_admin.sh`,
   `node tests/test_webui_admin.cjs` (pure functions), `node tests/test_webui_admin_ui.cjs` (the tabs against a stub).
 

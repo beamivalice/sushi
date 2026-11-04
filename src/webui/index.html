@@ -291,6 +291,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 #viewNav .nav-i { display: none; width: 15px; height: 15px; vertical-align: -3px; }
 .dl-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--s2) var(--s3); padding: var(--s3) var(--s4); border-bottom: 1px solid var(--border); }
 .dl-row:last-child { border-bottom: 0; }
+.dl-row.pick { background: var(--accent-soft); }
 .dl-row .name { font-weight: 600; overflow-wrap: anywhere; display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); }
 .dl-row .meta, .dl-row .why { color: var(--text-2); font-size: var(--fs-sm); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .dl-row .why.err { color: var(--err); }
@@ -372,8 +373,8 @@ dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2);
 .set .ctl .warn { font-size: var(--fs-xs); color: var(--warn); }
 .set .ctl input[aria-invalid="true"] { border-color: var(--err); }
 .set.locked .ctl input { background: var(--surface-2); color: var(--text-2); }
-.tri { display: grid; grid-template-columns: repeat(3, 1fr); padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
-.tri button { height: 26px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; cursor: pointer; }
+.tri { display: grid; grid-template-columns: auto 1fr 1fr; padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
+.tri button { height: 26px; padding: 0 var(--s2); white-space: nowrap; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; cursor: pointer; }
 .tri button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border-strong); }
 .tri.locked button { cursor: default; }
 @media (max-width: 640px) {
@@ -823,11 +824,11 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <thead><tr><th>Model</th><th class="n">Size</th><th>Last used</th><th class="n adv">Entries</th><th class="adv">ID</th><th class="n adv">Tier use</th><th class="n adv">Written</th><th class="n adv">Write rate</th><th></th></tr></thead>
         <tbody id="cacheRows"></tbody>
       </table></div>
-      <div class="card-b"><div class="bulk">
+      <div class="card-b" id="clearBox"><div class="bulk">
         <button class="btn danger" id="clearStale" type="button">Clear stale caches</button>
         <button class="btn danger" id="clearAll" type="button">Clear all caches</button>
       </div>
-      <div class="sub muted" style="margin-top:8px;font-size:var(--fs-sm)">Stale: no loaded model uses it (an old build, a changed pack or an unloaded model).</div></div>
+      <div class="sub muted" id="clearNote" style="margin-top:8px;font-size:var(--fs-sm)">Stale: no loaded model uses it (an old build, a changed pack or an unloaded model).</div></div>
     </section>
     <section class="card" id="dirCard" hidden>
       <div class="card-h">Models folder</div>
@@ -846,7 +847,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     </section>
     <section class="card" id="aboutCard" hidden>
       <div class="card-h">About</div>
-      <div class="card-b"><div class="kv"><span>Version</span><span id="aboutVersion"></span></div>
+      <div class="card-b"><div class="kv"><span>Version</span><span id="aboutVersion">-</span></div>
         <div class="bulk" style="margin-top:12px"><button class="btn sm" id="forgetKeyButton" type="button" hidden>Forget the API key</button></div></div>
     </section>
   </div>
@@ -1130,18 +1131,24 @@ const modelStore = {
     this.emit();
     this.schedule();
     const verbs = { load: ["Loaded", "Load"], unload: ["Unloaded", "Unload"], reload: ["Reloaded", "Reload"] }[kind];
+    const before = this.list.filter((model) => model.state === "ready").map((model) => model.id);
+    let done = false;
     try {
       if (kind !== "load") await postJson("/v1/unload-model", { model: id });
       if (kind !== "unload") await postJson("/v1/load-model", { model: id });
-      toast(`${verbs[0]} ${id}`);
+      done = true;
     } catch (error) {
       const message = adminErrorText(error);
       this.failed.set(id, message);
-      toast(`${verbs[1]} failed: ${message}`, "err");
+      if (!window.sushiAdmin?.shows(id)) toast(`${verbs[1]} failed: ${message}`, "err");
     }
     this.pending.delete(id);
     await this.refresh();
     this.emit();
+    if (!done) return;
+    // A load can evict other models to fit; the list after it says which.
+    const evicted = kind === "unload" ? [] : before.filter((other) => other !== id && this.byId(other)?.state !== "ready");
+    toast(`${verbs[0]} ${id}${evicted.length ? ` · unloaded ${evicted.join(", ")}` : ""}`);
   },
 };
 document.addEventListener("visibilitychange", () => { if (document.hidden) clearTimeout(modelStore.timer); else modelStore.refresh(); });
@@ -1598,7 +1605,7 @@ function loadVersion() {
   apiJson("/props")
     .then((props) => {
       const version = props?.update?.current ?? props?.settings?.version;
-      if (version) $("brandVersion").textContent = `v${String(version).replace(/^v/, "")}`;
+      if (version) $("brandVersion").textContent = $("aboutVersion").textContent = `v${String(version).replace(/^v/, "")}`;
       showUpdate(props?.update);
       reportUpdateResult(props?.update);
       renderPrefixCache(props?.settings?.prefix_cache);
@@ -2897,7 +2904,8 @@ function adminControlValue(spec, text, badInput) {
 // What is wrong with a typed value, or null.
 function adminProblem(spec, text) {
   if (adminControlValue(spec, text).ok) return null;
-  return `Enter ${spec.type === "int" ? "a whole number" : "a number"} from ${spec.min} to ${spec.max}`;
+  const noun = spec.type === "int" ? "a whole number" : "a number";
+  return spec.max >= 4294967295 ? `Enter ${noun} of ${spec.min} or more` : `Enter ${noun} from ${spec.min} to ${spec.max}`;
 }
 // A file value as its control shows it.
 function adminFileText(value) { return value == null ? "" : String(value); }
@@ -2960,6 +2968,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     try { return await fn(); } finally { btn.disabled = false; btn.removeAttribute("aria-busy"); btn.textContent = was; }
   }
   const failToast = (what, e) => toast(`${what} failed: ${adminErrorText(e)}`, "err");
+  // A server message names settings by their key; the page names them by their label.
+  const labelled = (text) => text.replace(/\b[a-z]+(?:_[a-z]+)+\b/g, (key) => KEY[key]?.[0] ?? key);
 
   const applyMode = (mode) => {
     document.body.dataset.mode = mode;
@@ -3011,7 +3021,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
 
   const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
-    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, timer: null, retry: null, tbody: "",
+    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, serr: {}, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
@@ -3035,6 +3045,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const info = (id) => rowsOf().find((m) => m.id === id);
   const isLoaded = (m) => m.state === "ready" || m.state === "loading" || modelStore.pending.has(m.id);
   const selLoaded = () => info(A.sel)?.state === "ready";
+  const needCache = () => A.view === "settings" || selLoaded();
   const wide = () => window.matchMedia("(min-width: 1024px)").matches;
   const hashId = () => { try { return decodeURIComponent(location.hash.slice(1)); } catch { return ""; } };
 
@@ -3050,7 +3061,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   async function refresh() {
     if (A.view !== "models" && A.view !== "settings") return;
-    const wantCache = A.view === "settings" || selLoaded();
+    const wantCache = needCache();
     clearTimeout(A.retry);
     try {
       const [s, c] = await Promise.all([pull("settings", "/v1/settings"), wantCache ? pull("cache", "/v1/prefix-cache") : undefined]);
@@ -3060,6 +3071,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (wantCache && c !== null && A.cache) sampleWrites(A.cache, Date.now());
     } catch (e) { A.error = adminErrorText(e); A.retry = setTimeout(refresh, 4000); }
     renderAll();
+    // The selected model turned out loaded only now (the page opened on its link): its cache has not been asked for.
+    if (!wantCache && needCache() && !A.cache && !A.error) refresh();
   }
   function alertIn(node, message, retry) {
     if ((node.dataset.msg ?? "") === (message ?? "")) return;
@@ -3095,9 +3108,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function dirtyKeys(id) {
     const m = info(id);
     if (!m) return [];
-    const errs = Object.keys(per(id).errors).filter((k) => per(id).errors[k] && !whyDisabled(m, k));
-    return [...new Set([...Object.keys(adminChanges(specsOf(m), m.settings, sendable(m)).set), ...errs])];
+    return [...new Set([...Object.keys(adminChanges(specsOf(m), m.settings, sendable(m)).set), ...invalidKeys(m)])];
   }
+  const invalidKeys = (m) => Object.keys(per(m.id).errors).filter((k) => per(m.id).errors[k] && !whyDisabled(m, k));
   const isDirty = (id) => !!id && dirtyKeys(id).length > 0;
   // True when the saved file differs from what the loaded model started with.
   // A file value the loader drops (a key the model lacks, a choice it cannot store) is never stamped on a load.
@@ -3110,9 +3123,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // `streaming` in /v1/models means the pack can stream; it does only when it must or an SSD budget is set.
   const streamsExperts = (m) => !!(m.streaming_required || m.ssd_budget_gb);
 
+  // Why the last load failed: this session's answer, else the one /v1/models keeps for a failed model.
+  const loadError = (m) => modelStore.failed.get(m.id) || (m.state === "error" ? m.error : "");
+  const evictNote = (m) => { const others = modelStore.list.filter((x) => x.state === "ready" && x.id !== m.id).map((x) => x.id); return others.length ? `May unload ${others.join(", ")} to make room` : ""; };
   function metaOf(m) {
-    const failed = modelStore.failed.get(m.id), n = savedCount(m);
-    const phrase = modelStore.pending.has(m.id) || m.state === "loading" ? "Loading…" : m.state === "error" ? `Load failed${failed ? ` · ${failed.slice(0, 60)}` : ""}` : m.state === "ready" && m.bytes_resident ? `${adminBytes(m.bytes_resident)} in memory` : streamsExperts(m) ? "streams experts" : n ? `${n} saved` : "";
+    const failed = loadError(m), n = savedCount(m);
+    const phrase = modelStore.pending.has(m.id) || m.state === "loading" ? "Loading…" : m.state === "error" ? `Load failed${failed && m.id !== A.sel ? ` · ${failed.slice(0, 60)}` : ""}` : m.state === "ready" && m.bytes_resident ? `${adminBytes(m.bytes_resident)} in memory` : streamsExperts(m) ? "streams experts" : n ? `${n} saved` : "";
     return [m.bytes_on_disk ? adminBytes(m.bytes_on_disk) : "", phrase].filter(Boolean).join(" · ");
   }
   function renderList(rows) {
@@ -3123,21 +3139,21 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     q("modelsFilter").placeholder = `Filter ${rows.length} models`;
     const shown = rows.filter((m) => !filter || m.id.toLowerCase().includes(filter)).sort((a, b) => a.id.localeCompare(b.id));
     const live = shown.filter(isLoaded), both = live.length && live.length < shown.length;
-    const state = (m) => [m.id, dotOf(m), metaOf(m), m.id === A.sel, isDirty(m.id), m.state, modelStore.pending.has(m.id)];
+    const state = (m) => [m.id, dotOf(m), metaOf(m), m.id === A.sel, isDirty(m.id), m.state, modelStore.pending.has(m.id), evictNote(m)];
     const roots = rootsInUse(A.settings?.server.models_dir ?? { boot_roots: [] }).join(", ") || "the models folder";
     const item = (m) => {
       const canLoad = (m.state === "unloaded" || m.state === "error") && !modelStore.pending.has(m.id);
       return h("div", { class: "row", role: "option", tabindex: "0", "data-id": m.id, "aria-selected": String(m.id === A.sel), onclick: () => trySelect(m.id), onkeydown: (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) { e.preventDefault(); trySelect(m.id); } } },
         h("span", { class: `dot ${dotOf(m)}` }), h("div", { class: "main" }, h("div", { class: "name", text: m.id }), h("div", { class: `meta${m.state === "error" && !modelStore.pending.has(m.id) ? " err" : ""}`, text: metaOf(m) })),
         isDirty(m.id) ? h("span", { class: "edit-dot", title: "Unsaved changes" }) : null,
-        canLoad ? h("button", { class: "btn sm", type: "button", text: "Load", onclick: (e) => { e.stopPropagation(); modelStore.act(m.id, "load"); } }) : null);
+        canLoad ? h("button", { class: "btn sm", type: "button", text: "Load", title: evictNote(m) || null, onclick: (e) => { e.stopPropagation(); modelStore.act(m.id, "load"); } }) : null);
     };
     const group = (t) => h("div", { class: "group-l", text: t });
     const at = document.activeElement, held = list.contains(at) ? { id: at.closest(".row")?.dataset.id, button: at.tagName === "BUTTON" } : null;
     fill(list, JSON.stringify([shown.map(state), both, rows.length, roots]), () => shown.length
       ? [...(both ? [group("Loaded")] : []), ...live.map(item), ...(both ? [group("On disk")] : []), ...shown.filter((m) => !live.includes(m)).map(item)]
-      : [h("div", { class: "empty" }, h("span", { text: rows.length ? "No model matches the filter." : `No models in ${roots}. Put a pack folder there, or change the folder in Settings.` }),
-        ...(rows.length ? [] : [" ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
+      : [h("div", { class: "empty" }, h("span", { text: rows.length ? "No model matches the filter." : `No models in ${roots}. Download a pack, or put a pack folder there.` }),
+        ...(rows.length ? [] : [" ", h("button", { class: "btn sm primary", type: "button", text: "Browse downloads", onclick: () => $("navDownloads").click() }), " ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
     if (held?.id && !list.contains(document.activeElement)) {
       const r = list.querySelector(`[data-id="${CSS.escape(held.id)}"]`);
       ((held.button ? r?.querySelector("button") : null) ?? r)?.focus();
@@ -3242,10 +3258,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     patchDetail(m);
   }
 
+  // The server's sentence for when a setting takes effect, as one word.
+  const whenOf = (applies) => /at once/.test(applies) ? "Now" : /next start/.test(applies) ? "Next start" : "Next load";
   function badges(node, st, applies) {
-    const live = /at once/.test(applies || ""), sig = `${st.locked}|${st.file != null}|${applies}`;
-    fill(node, sig, () => [h("span", { class: `badge ${st.locked ? "flag" : st.file != null ? "saved" : ""}` }, ...(st.locked ? [icon("lock", 11), "Launch flag"] : [st.file != null ? "Saved" : "Default"])),
-      ...(applies && !st.locked ? [h("span", { class: `badge ${live ? "live" : ""}`, text: live ? "Applies now" : "On next load" })] : [])]);
+    const sig = `${st.locked}|${st.file != null}|${applies}`;
+    fill(node, sig, () => [...(st.locked ? [h("span", { class: "badge flag" }, icon("lock", 11), "Launch flag")] : st.file != null ? [h("span", { class: "badge saved", text: "Saved" })] : []),
+      ...(applies && !st.locked ? [h("span", { class: `badge ${/at once/.test(applies) ? "live" : ""}`, text: whenOf(applies) })] : [])]);
   }
   function setRow(key, label, forId) {
     const badge = h("span", { class: "badges" }), help = h("div", { class: "help" }), ctl = h("div", { class: "ctl" }), hint = h("div", { class: "hint" }), bad = h("div", { class: "bad", role: "alert" });
@@ -3314,7 +3332,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const changed = !locked && !why && key in P.texts && !(parsed.ok && adminSameAsFile(parsed, s.file));
     S.row.classList.toggle("dirty", changed || !!(P.errors[key] && !why));
     const cut = lim?.choices && S.spec.choices?.filter((c) => !lim.choices.includes(c)).map((c) => choiceLabel(key, c));
-    let hint = key === "ctx_size" && text && !P.errors[key] ? `${adminTokens(Number(text))} tokens` : cut?.length ? `${cut.join(", ")} not available for this model${lim.why ? `: ${lim.why}` : "."}` : "";
+    let hint = key === "ctx_size" && text && !P.errors[key] ? `${adminTokens(Number(text))} tokens` : cut?.length && !locked && !why ? lim.why || `${cut.join(", ")} not available for this model.` : "";
     if (changed) hint = [hint, `was ${saved || "Default"}`].filter(Boolean).join(" · ");
     setText(S.hint, hint);
     setText(S.bad, why ? "" : P.errors[key] ?? "");
@@ -3326,6 +3344,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     F.alert = h("div", { class: "alert err", role: "alert", hidden: true });
     F.callout = h("div", { class: "callout", hidden: true }, h("span", { text: "Saved settings differ from the ones this model loaded with." }),
       h("button", { class: "btn sm primary", type: "button", text: "Reload now", onclick: () => modelStore.act(F.id, "reload") }));
+    F.update = h("div", { class: "callout", hidden: true }, F.updateText = h("span"),
+      h("button", { class: "btn sm primary", type: "button", text: "Open Downloads", onclick: () => { D.pick = F.pick; $("navDownloads").click(); } }));
     F.saveErr = h("div", { class: "alert err", role: "alert", hidden: true });
     F.rows = h("div", { class: "rows" });
     F.cacheKv = h("div", { class: "kv" });
@@ -3338,7 +3358,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const lead = h("div", { class: "lead", text: "Saved in model-settings.json. They apply the next time this model loads; a launch flag outranks the file." });
     delete q("modelsDetail").dataset.sig;
     q("modelsDetail").replaceChildren(h("div", { class: "d-head" }, h("div", { class: "grow" }, F.name, F.facts), F.actions), F.alert,
-      h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.callout, F.saveErr, F.rows), F.cacheSect, F.savebar);
+      h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.callout, F.update, F.saveErr, F.rows), F.cacheSect, F.savebar);
   }
   function buildRows(F, m) {
     const specs = F.specs = specsOf(m), P = per(F.id);
@@ -3352,31 +3372,36 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function patchDetail(m) {
     const F = A.form;
     if (!m || !F || F.id !== m.id) return;
-    const P = per(F.id), pend = modelStore.pending.get(m.id), failed = modelStore.failed.get(m.id);
+    const P = per(F.id), pend = modelStore.pending.get(m.id), why = loadError(m);
     setText(F.name, m.id);
     const words = pend ? (pend === "unload" ? "Unloading…" : "Loading…") : { ready: "Loaded", loading: "Loading…", error: "Load failed" }[m.state] ?? "Not loaded";
-    const facts = [m.bytes_on_disk && `${adminBytes(m.bytes_on_disk)} on disk`, m.bytes_linked > 0 && `${adminBytes(m.bytes_linked)} linked from elsewhere`, m.state === "ready" && m.bytes_resident && `${adminBytes(m.bytes_resident)} in memory`, m.meta?.pack_update && `Pack ${m.meta.pack_update.latest} available — ${m.meta.pack_update.command}`,
-      m.context_length && `${adminTokens(m.context_length)} max context`, (m.input_modalities ?? []).includes("image") && "sees images", streamsExperts(m) ? "streams experts" : m.streaming && "can stream experts"].filter(Boolean);
+    const facts = [m.bytes_on_disk && `${adminBytes(m.bytes_on_disk)} on disk`, m.bytes_linked > 0 && `${adminBytes(m.bytes_linked)} linked from elsewhere`, m.state === "ready" && m.bytes_resident && `${adminBytes(m.bytes_resident)} in memory`, m.context_length && `${adminTokens(m.context_length)} max context`, (m.input_modalities ?? []).includes("image") && "sees images", streamsExperts(m) ? "streams experts" : m.streaming && "can stream experts"].filter(Boolean);
     fill(F.facts, [dotOf(m), words, ...facts, m.path].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map((t) => h("span", { text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
-    fill(F.actions, `${m.state}|${pend ?? ""}`, () => {
-      const btn = (text, kind, cls = "", busy = false) => h("button", { class: `btn sm ${cls}`, type: "button", text, disabled: busy, "aria-busy": busy ? "true" : null, onclick: () => actOn(F.id, kind) });
+    const stale = needsReload(m);
+    fill(F.actions, `${m.state}|${pend ?? ""}|${stale}|${evictNote(m)}`, () => {
+      const btn = (text, kind, cls = "", busy = false, title = "") => h("button", { class: `btn sm ${cls}`, type: "button", text, title: title || null, disabled: busy, "aria-busy": busy ? "true" : null, onclick: () => actOn(F.id, kind) });
       return pend ? [btn(pend === "unload" ? "Unloading…" : pend === "reload" ? "Reloading…" : "Loading…", "", "primary", true)]
-        : m.state === "ready" ? [btn("Reload", "reload"), btn("Unload", "unload")] : m.state === "loading" ? [btn("Loading…", "", "primary", true)] : [btn("Load", "load", "primary")];
+        : m.state === "ready" ? [...(stale ? [] : [btn("Reload", "reload")]), btn("Unload", "unload")] : m.state === "loading" ? [btn("Loading…", "", "primary", true)] : [btn("Load", "load", "primary", false, evictNote(m))];
     });
-    alertIn(F.alert, !pend && failed && m.state !== "ready" ? `Load failed: ${failed}` : !pend && m.state === "error" ? "The last load failed." : "");
+    alertIn(F.alert, !pend && m.state !== "ready" && (why || m.state === "error") ? (why ? `Load failed: ${why}` : "The last load failed.") : "");
     alertIn(F.saveErr, P.saveError ? `Couldn't save: ${P.saveError}` : "");
-    setHidden(F.callout, !needsReload(m));
+    setHidden(F.callout, !stale);
+    const up = m.meta?.pack_update;
+    F.pick = up?.repo;
+    setHidden(F.update, !up);
+    if (up) setText(F.updateText, `Pack ${up.latest} is available; this copy is ${up.current}.`);
     const sig = specsOf(m).map((s) => `${s.name}${s.max}`).join();
     if (F.sig !== sig) { F.sig = sig; buildRows(F, m); }
     for (const k of Object.keys(P.texts)) { const S = F.sets.get(k); if (S && !P.errors[k] && P.texts[k] === adminFileText(m.settings[k]?.file)) delete P.texts[k]; }
     for (const S of F.sets.values()) patchSet(F, S, m);
     const keys = dirtyKeys(F.id), n = keys.length;
     setHidden(F.savebar, n === 0);
-    setText(F.saveMsg, `${n} unsaved change${n === 1 ? "" : "s"}`);
-    F.save.disabled = Object.entries(P.errors).some(([k, e]) => e && !whyDisabled(m, k)) || F.save.getAttribute("aria-busy") === "true";
+    const bad = invalidKeys(m);
+    setText(F.saveMsg, `${n} change${n === 1 ? "" : "s"}${bad.length ? ` · ${bad.length} invalid` : ""}`);
+    F.save.disabled = bad.length > 0 || F.save.getAttribute("aria-busy") === "true";
     if (F.more) {
       const changed = F.moreList.filter((s) => keys.includes(s.name)).length, saved = F.moreList.filter((s) => m.settings[s.name]?.file != null).length;
-      const invalid = F.moreList.filter((s) => P.errors[s.name] && !whyDisabled(m, s.name)).length;
+      const invalid = F.moreList.filter((s) => bad.includes(s.name)).length;
       setText(F.moreSum, `More settings (${F.moreList.length})${invalid ? ` · ${invalid} invalid` : changed ? ` · ${changed} changed` : saved ? ` · ${saved} saved` : ""}`);
       const open = invalid > 0 || (P.moreOpen ?? modeNow() === "advanced");
       if (F.more.open !== open) { F.moreProg = true; F.more.open = open; setTimeout(() => { F.moreProg = false; }); }
@@ -3423,6 +3448,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   async function saveModel(F) {
     const m = info(F.id), P = per(F.id), { set } = adminChanges(F.specs, m.settings, sendable(m));
     if (!Object.keys(set).length) return;
+    let shown = null;
     await withBusy(F.save, "Saving…", async () => {
       try {
         const r = await postJson("/v1/settings", { model: F.id, set });
@@ -3430,13 +3456,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         P.saveError = "";
         toast(r.model_loaded ? `Saved. Reload ${F.id} to use them.` : `Saved. Applies the next time ${F.id} loads.`);
       } catch (e) {
-        // A refusal that names a setting belongs on that setting's row.
-        const text = adminErrorText(e), key = F.specs.find((sp) => new RegExp(`\\b${sp.name}\\b`).test(text))?.name;
+        // A refusal that names a setting belongs on that setting's row; either way it is shown there, not as a toast.
+        const raw = adminErrorText(e), key = F.specs.find((sp) => new RegExp(`\\b${sp.name}\\b`).test(raw))?.name, text = labelled(raw);
         if (key) P.errors[key] = text; else P.saveError = text;
-        failToast("Save", e);
+        shown = key ? F.sets.get(key).row : F.saveErr;
       }
     });
     await refresh();
+    shown?.scrollIntoView({ block: "nearest" });
   }
 
   // One clear at a time: every clear control stays off from the confirmation until the refreshed bytes are on screen.
@@ -3479,42 +3506,41 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const GB_SPEC = { type: "int", min: 0, max: 1048576 };
   // The two server settings reuse the setting row: assigned space and the models folder.
   const cacheRow = setRow("prefix_cache_disk_gb", "Assigned space", "cacheGb"), dirRow = setRow("models_dir", "Models folder", "dirPath");
-  const enterTo = (button) => (e) => { if (e.key === "Enter") { e.preventDefault(); if (!button.disabled) button.click(); } };
-  const cacheIn = h("input", { id: "cacheGb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default", "aria-label": "Assigned SSD prefix cache space in GiB", oninput: () => { A.cacheText = cacheIn.value; renderSettings(); }, onkeydown: (e) => enterTo(cacheSave)(e) });
+  const enterTo = (button) => (e) => { if (e.key === "Enter") { e.preventDefault(); if (!button.disabled && !button.hidden) button.click(); } };
+  // Typing starts a new attempt: the last refusal of this setting goes.
+  const typed = (key) => { delete A.serr[key]; };
+  const cacheIn = h("input", { id: "cacheGb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default", "aria-label": "Assigned SSD prefix cache space in GiB", oninput: () => { A.cacheText = cacheIn.value; typed("prefix_cache_disk_gb"); renderSettings(); }, onkeydown: (e) => enterTo(cacheSave)(e) });
   const cacheUnit = h("span", { class: "muted", text: "GiB" }), cacheWarn = h("div", { class: "warn", role: "status", hidden: true });
   const cacheSave = h("button", { class: "btn sm primary", id: "cacheSave", type: "button", text: "Save", onclick: saveCache });
-  const cacheDefault = h("button", { class: "btn sm", id: "cacheDefault", type: "button", text: "Use default", onclick: () => saveServer("prefix_cache_disk_gb", null, "Back to the default size.", cacheDefault, "Resetting…") });
-  cacheRow.ctl.append(h("div", { class: "row-in" }, cacheIn, cacheUnit), h("div", { class: "row-in" }, cacheSave, cacheDefault), cacheRow.bad, cacheWarn);
-  const dirIn = h("input", { id: "dirPath", type: "text", autocomplete: "off", "aria-label": "Models folder", placeholder: "/absolute/path/to/models", oninput: () => { A.dirText = dirIn.value; setText(dirRow.bad, ""); }, onkeydown: (e) => enterTo(dirSave)(e) });
+  cacheRow.ctl.append(h("div", { class: "row-in" }, cacheIn, cacheUnit, cacheSave), cacheRow.bad, cacheWarn);
+  const dirIn = h("input", { id: "dirPath", type: "text", autocomplete: "off", "aria-label": "Models folder", placeholder: "/absolute/path/to/models", oninput: () => { A.dirText = dirIn.value; typed("models_dir"); renderDir(A.settings.server.models_dir); }, onkeydown: (e) => enterTo(dirSave)(e) });
   const dirSave = h("button", { class: "btn sm primary", id: "dirSave", type: "button", text: "Save and rescan", onclick: () => {
-    if (!dirIn.value.trim().startsWith("/")) return setText(dirRow.bad, "Enter an absolute folder path.");
-    saveServer("models_dir", dirIn.value.trim(), "Saved. Rescanning the folder.", dirSave, "Saving…");
+    const path = dirIn.value.trim();
+    saveServer("models_dir", path || null, path ? "Saved. Rescanning the folder." : "Back to the default folder.", dirSave, "Saving…");
   } });
-  const dirDefault = h("button", { class: "btn sm", id: "dirDefault", type: "button", text: "Use default", onclick: () => saveServer("models_dir", null, "Back to the default folder.", dirDefault, "Resetting…") });
-  const dirCtl = [dirIn, h("div", { class: "row-in" }, dirSave, dirDefault)];
+  const dirCtl = [dirIn, h("div", { class: "row-in" }, dirSave)];
   q("cacheSet").replaceWith(cacheRow.row);
   q("dirSet").replaceWith(dirRow.row);
 
   // The default port: where `sushi --serve` binds without --port, and what sushibar and `sushi launch` target.
   const PORT_SPEC = { type: "int", min: 1, max: 65535 };
   const portRow = setRow("port", "Default port", "portNum");
-  const portIn = h("input", { id: "portNum", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default (12345)", "aria-label": "Default port", oninput: () => { A.portText = portIn.value; renderPort(A.settings.server.port); }, onkeydown: (e) => enterTo(portSave)(e) });
+  const portIn = h("input", { id: "portNum", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default (12345)", "aria-label": "Default port", oninput: () => { A.portText = portIn.value; typed("port"); renderPort(A.settings.server.port); }, onkeydown: (e) => enterTo(portSave)(e) });
   const portSave = h("button", { class: "btn sm primary", id: "portSave", type: "button", text: "Save", onclick: () => {
     const v = adminControlValue(PORT_SPEC, portIn.value);
-    if (v.ok && v.value !== null) saveServer("port", v.value, "Saved.", portSave, "Saving…");
+    if (v.ok) saveServer("port", v.value, v.value === null ? "Back to the default port." : "Saved.", portSave, "Saving…");
   } });
-  const portDefault = h("button", { class: "btn sm", id: "portDefault", type: "button", text: "Use default", onclick: () => saveServer("port", null, "Back to the default port.", portDefault, "Resetting…") });
-  portRow.ctl.append(h("div", { class: "row-in" }, portIn), h("div", { class: "row-in" }, portSave, portDefault), portRow.bad);
+  portRow.ctl.append(h("div", { class: "row-in" }, portIn, portSave), portRow.bad);
   q("portSet").replaceWith(portRow.row);
 
   // The two automatic update checks: Default, On or Off. A file value of null is the default, shown as "Default (On)".
   const UPDATE_KEYS = [
-    ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Update and Check for updates always work."],
-    ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. sushi pull always works."],
+    ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops the daily check only."],
+    ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. Off stops the daily check only."],
   ].map(([key, slot, label, help]) => {
     const row = setRow(key, label);
     const btns = [[null, "Default"], [true, "On"], [false, "Off"]].map(([value, text]) => h("button", { type: "button", "data-value": String(value), text, onclick: (e) => saveServer(key, value, "Saved.", e.currentTarget, "Saving…") }));
-    row.ctl.append(h("div", { class: "tri", role: "group", "aria-label": label }, ...btns));
+    row.ctl.append(h("div", { class: "tri", role: "group", "aria-label": label }, ...btns), row.bad);
     q(slot).replaceWith(row.row);
     return { key, row, btns, help };
   });
@@ -3525,17 +3551,18 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     await withBusy(btn, label, async () => {
       try {
         const r = await postJson("/v1/settings", { server: { [key]: value } });
+        typed(key);
         toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
-        if (key === "models_dir") A.dirText = null; else if (key === "port") A.portText = null; else A.cacheText = null;
-      } catch (e) { failToast("Save", e); }
+        if (key === "models_dir") A.dirText = null; else if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null;
+      } catch (e) { A.serr[key] = adminErrorText(e); }
     });
     await Promise.all([refresh(), key === "models_dir" ? modelStore.refresh() : null]);
   }
   async function saveCache() {
     const v = adminControlValue(GB_SPEC, cacheIn.value);
-    if (!v.ok || v.value === null) return;
+    if (!v.ok) return;
     if (v.value === 0 && !(await confirmAction({ title: "Turn the SSD prefix cache off?", body: "Takes effect at the next model load; existing caches stay on disk until cleared.", confirm: "Turn off" }))) return;
-    saveServer("prefix_cache_disk_gb", v.value, "Saved.", cacheSave, "Saving…");
+    saveServer("prefix_cache_disk_gb", v.value, v.value === null ? "Back to the default size." : "Saved.", cacheSave, "Saving…");
   }
   function renderSettings() {
     const s = A.settings, c = A.cache;
@@ -3547,11 +3574,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     renderDir(s.server.models_dir);
     if (s.server.port) renderPort(s.server.port);
     renderUpdates(s.server);
-    setText(q("aboutVersion"), q("brandVersion").textContent || "-");
   }
   function renderCache(c, gb) {
     const cap = gb.effective_bytes, used = c.total_bytes, busy = (b) => b.getAttribute("aria-busy") === "true", clearing = A.busy.size > 0;
-    setText(q("cacheUsage"), `${adminBytes(used)} of ${adminBytes(cap)} assigned`);
+    setText(q("cacheUsage"), `${used > 0 ? `${adminBytes(used)} of` : "Empty ·"} ${adminBytes(cap)} assigned`);
     setText(q("cacheFree"), c.volume ? `${adminBytes(c.volume.free_bytes)} free on disk` : "");
     const pct = cap > 0 ? Math.min(100, (100 * used) / cap) : 0;
     q("cacheBar").style.width = `${pct}%`;
@@ -3576,11 +3602,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setText(cacheRow.help, locked ? flagHelp("prefix_cache_disk_gb", gb.flag) : "Space the cache may use on the SSD. A smaller size drops the oldest entries at once; 0 turns the cache off at the next model load.");
     const text = cacheIn.value.trim(), parsed = adminControlValue(GB_SPEC, text), dirty = !locked && text !== file;
     cacheIn.disabled = locked;
-    cacheSave.disabled = locked || !dirty || !parsed.ok || parsed.value === null || busy(cacheSave);
-    cacheDefault.disabled = locked || gb.file == null || busy(cacheDefault);
-    const standard = gb.default_bytes ?? (gb.file == null && !locked ? gb.ask_bytes : null);
-    if (!busy(cacheDefault)) setText(cacheDefault, standard ? `Use default (${+(standard / GiB).toFixed(2)} GiB)` : "Use default");
-    setText(cacheRow.bad, dirty && text && !parsed.ok ? "Enter a whole number of GiB (0 turns the cache off)." : "");
+    setHidden(cacheSave, !dirty);
+    cacheSave.disabled = !dirty || !parsed.ok || busy(cacheSave);
+    if (!busy(cacheSave)) setText(cacheSave, text === "" ? "Use default" : "Save");
+    setText(cacheRow.bad, (dirty && text && !parsed.ok ? "Enter a whole number of GiB (0 turns the cache off)." : "") || A.serr.prefix_cache_disk_gb || "");
     cacheIn.setAttribute("aria-invalid", String(!!cacheRow.bad.textContent));
     const want = dirty && parsed.ok && parsed.value !== null ? parsed.value * GiB : cap, room = c.volume ? c.volume.free_bytes + used : Infinity;
     setText(cacheWarn, want > room ? `More than this disk has free (${adminBytes(room)}, counting this cache's own use).` : "");
@@ -3601,9 +3626,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         h("td", { class: "n" }, act(n))))
         : [h("tr", {}, h("td", { colspan: 9, class: "muted", text: "Nothing cached yet. Caches appear after a loaded model answers." }))]));
     }
+    setHidden(q("clearBox"), allBytes(c) === 0);
+    setHidden(q("clearNote"), staleBytes(c) === 0);
     for (const [id, bytes, label, scope] of [["clearStale", staleBytes(c), "Clear stale caches", "stale"], ["clearAll", allBytes(c), "Clear all caches", "all"]]) {
       const mine = A.busy.has(JSON.stringify({ scope }));
       setText(q(id), mine ? "Clearing…" : `${label} (${adminBytes(bytes)})…`);
+      setHidden(q(id), bytes === 0);
       q(id).disabled = bytes === 0 || clearing;
       if (mine) q(id).setAttribute("aria-busy", "true"); else q(id).removeAttribute("aria-busy");
     }
@@ -3620,6 +3648,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         if (b.dataset.value === "null" && b.getAttribute("aria-busy") !== "true") setText(b, `Default (${st.default ? "On" : "Off"})`);
       }
       setText(row.help, locked ? flagHelp(key, st.flag) : help);
+      setText(row.bad, A.serr[key] || "");
     }
   }
   function renderPort(p) {
@@ -3632,21 +3661,27 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setText(portRow.help, locked ? flagHelp("port", p.flag) : "The port sushi serves on when started without --port, and the one sushibar and sushi launch use. It applies at the next start.");
     const text = portIn.value.trim(), parsed = adminControlValue(PORT_SPEC, text), dirty = !locked && text !== file, busy = (b) => b.getAttribute("aria-busy") === "true";
     portIn.disabled = locked;
-    portSave.disabled = locked || !dirty || !parsed.ok || parsed.value === null || busy(portSave);
-    portDefault.disabled = locked || p.file == null || busy(portDefault);
-    if (!busy(portDefault)) setText(portDefault, `Use default (${p.default})`);
-    setText(portRow.bad, dirty && text && !parsed.ok ? "Enter a whole number from 1 to 65535." : "");
+    setHidden(portSave, !dirty);
+    portSave.disabled = !dirty || !parsed.ok || busy(portSave);
+    if (!busy(portSave)) setText(portSave, text === "" ? "Use default" : "Save");
+    setText(portRow.bad, (dirty && text && !parsed.ok ? "Enter a whole number from 1 to 65535." : "") || A.serr.port || "");
     portIn.setAttribute("aria-invalid", String(!!portRow.bad.textContent));
   }
   function renderDir(d) {
     badges(dirRow.badge, d, d.applies);
-    dirRow.ctl.replaceChildren(...(d.locked ? [] : [...dirCtl, dirRow.bad]));
+    fill(dirRow.ctl, String(!!d.locked), () => d.locked ? [] : [...dirCtl, dirRow.bad]);
     if (!d.locked) {
-      if (A.dirText === (d.file || "")) A.dirText = null;
-      if (A.dirText === null && dirIn.value !== (d.file || "")) dirIn.value = d.file || "";
+      const file = d.file || "";
+      if (A.dirText === file) A.dirText = null;
+      if (A.dirText === null && dirIn.value !== file) dirIn.value = file;
       dirIn.placeholder = d.default;
+      const text = dirIn.value.trim(), dirty = text !== file, invalid = dirty && text && !text.startsWith("/");
+      setHidden(dirSave, !dirty);
+      dirSave.disabled = !!invalid || dirSave.getAttribute("aria-busy") === "true";
+      if (dirSave.getAttribute("aria-busy") !== "true") setText(dirSave, text === "" ? "Use default" : "Save and rescan");
+      setText(dirRow.bad, (invalid ? "Enter an absolute folder path." : "") || A.serr.models_dir || "");
     }
-    setText(dirRow.help, d.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : "Where sushi looks for packs. Saving rescans at once. Packs from `sushi pull` still land in ~/.sushi/models.");
+    setText(dirRow.help, d.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : "Where sushi looks for packs, and where Downloads saves new ones. Saving rescans at once.");
     const kv = [["In use", rootsInUse(d).join(", ") || "(none)"], ["Default", d.default]];
     fill(q("dirKv"), JSON.stringify(kv), () => kvRows(kv, ["In use", "Default"]));
   }
@@ -3657,7 +3692,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : A.error ? `Couldn't load: ${A.error}` : "";
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
-    for (const id of ["modelsMd", "cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) q(id).classList.toggle("stale-view", !!msg && !!A.settings);
+    const off = !!msg && !!A.settings;
+    for (const id of ["modelsMd", "cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) {
+      q(id).classList.toggle("stale-view", off);
+      if (q(id).inert !== off) q(id).inert = off;
+    }
     if (A.view === "models") renderModels(); else if (A.view === "settings") renderSettings();
   }
   modelStore.subscribe(() => {
@@ -3668,7 +3707,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
   // Downloads: the packs on Hugging Face, this Mac's fit and the server's download queue (/v1/downloads).
-  const D = { data: null, error: null, timer: null, rows: new Map(), order: "", seen: null };
+  const D = { data: null, error: null, timer: null, rows: new Map(), order: "", seen: null, pick: null, scrolled: false };
   const SEEN_KEY = "sushi-seen-packs";
   const packKeys = (d) => d.packs.flatMap((p) => [p.repo, ...(p.update ? [`${p.repo}@${p.update.latest}`] : [])]);
   // The dot names a pack (or an update) this browser has not listed before; the first full catalog seeds the list
@@ -3772,6 +3811,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       q("dlList").replaceChildren(...(rows.length ? rows.map((r) => r.el) : [h("div", { class: "card-b muted", text: "No packs are published yet." })]));
     }
     for (const p of d.packs) progress(D.rows.get(p.repo), jobOf(p.repo));
+    // A pack the Models tab sent us here for is marked, and scrolled to once.
+    for (const [repo, r] of D.rows) r.el.classList.toggle("pick", repo === D.pick);
+    if (D.pick && !D.scrolled && D.rows.has(D.pick)) { D.scrolled = true; D.rows.get(D.pick).el.scrollIntoView({ block: "center" }); }
   }
   async function refreshDownloads(force) {
     clearTimeout(D.timer);
@@ -3796,8 +3838,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   window.sushiAdmin = {
     refresh,
+    shows: (id) => A.view === "models" && A.sel === id,
     show(view) {
       A.view = view;
+      if (view !== "downloads") Object.assign(D, { pick: null, scrolled: false });
       q("modelsPanel").hidden = view !== "models";
       q("settingsPanel").hidden = view !== "settings";
       q("downloadsPanel").hidden = view !== "downloads";

@@ -62,6 +62,8 @@ assert.equal(page.adminTokens(1048576), '1M');
 assert.equal(page.adminTokens(1000), '1000');
 assert.equal(page.adminProblem(int, '1e'), 'Enter a whole number from 0 to 100');
 assert.equal(page.adminProblem(int, '5'), null);
+assert.equal(page.adminProblem({ name: 'ctx_size', type: 'int', min: 1, max: 4294967295 }, 'x'), 'Enter a whole number of 1 or more', 'a u32 bound is "or more"');
+assert.equal(page.adminProblem({ name: 'think_penalty', type: 'number', min: 0, max: 20 }, 'x'), 'Enter a number from 0 to 20');
 assert.equal(page.adminFileText('8'), '8');
 assert.equal(page.adminFileText('off'), 'off');
 assert.equal(page.adminFileText(null), '');

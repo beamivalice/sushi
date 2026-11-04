@@ -89,7 +89,8 @@ pub fn resolveTarget(arena: Allocator, known: []const Known, folder: []const u8,
     return null;
 }
 
-pub const Available = struct { local: []const u8, latest: []const u8, command: []const u8 };
+/// `repo` is the Hugging Face repo of the published pack, which the Downloads tab lists the update under.
+pub const Available = struct { local: []const u8, latest: []const u8, command: []const u8, repo: []const u8 = "" };
 
 pub const Status = union(enum) {
     unknown,
@@ -106,6 +107,7 @@ pub fn decide(arena: Allocator, local: ?[]const u8, remote: ?[]const u8, target:
         .local = l,
         .latest = r,
         .command = try std.fmt.allocPrint(arena, "sushi pull {s}", .{target.pull}),
+        .repo = target.repo,
     } };
 }
 
@@ -121,7 +123,7 @@ pub fn metaFragment(w: *std.Io.Writer, st: Status) std.Io.Writer.Error!void {
         else => return,
     };
     try w.writeAll(",\"pack_update\":");
-    try std.json.Stringify.value(.{ .current = a.local, .latest = a.latest, .command = a.command }, .{}, w);
+    try std.json.Stringify.value(.{ .current = a.local, .latest = a.latest, .command = a.command, .repo = a.repo }, .{}, w);
 }
 
 // ── Hugging Face credentials ────────────────────────────────────────────
@@ -507,7 +509,7 @@ test "rows: the list line and the /v1/models fragment appear for an update only"
     try testing.expectEqualStrings("update available: 2.0 (you have 1.0) — sushi pull beta\n", w.buffered());
     w = std.Io.Writer.fixed(&buf);
     try metaFragment(&w, up);
-    try testing.expectEqualStrings(",\"pack_update\":{\"current\":\"1.0\",\"latest\":\"2.0\",\"command\":\"sushi pull beta\"}", w.buffered());
+    try testing.expectEqualStrings(",\"pack_update\":{\"current\":\"1.0\",\"latest\":\"2.0\",\"command\":\"sushi pull beta\",\"repo\":\"beamster/X\"}", w.buffered());
     w = std.Io.Writer.fixed(&buf);
     try metaFragment(&w, .current);
     try metaFragment(&w, .unknown);
