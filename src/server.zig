@@ -1850,6 +1850,14 @@ pub fn handleConnection(
         try downloads.handleCancel(allocator, stream, request_body);
         return;
     }
+    if (std.mem.eql(u8, path, "/v1/slots/cancel")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST to cancel an in-flight slot", 405);
+            return;
+        }
+        try handleSlotCancel(allocator, stream, request_body);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
         // Absorb models downloaded AFTER boot (the Model Browser pulls while
         // the server runs; discovery only walks the roots at startup).
@@ -7385,6 +7393,37 @@ fn handleMetricsEnable(stream: *http_conn.Conn) !void {
     };
     if (changed) log.info("Prometheus metrics: ENABLED at runtime (POST /metrics/enable)\n", .{});
     try sendResponse(stream, "200 OK", "application/json", if (changed) "{\"metrics\":true,\"already_enabled\":false}" else "{\"metrics\":true,\"already_enabled\":true}");
+}
+
+fn parseCancelRequestId(allocator: std.mem.Allocator, body: []const u8) ?u64 {
+    if (body.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    const v = obj.get("id") orelse obj.get("request_id") orelse return null;
+    return switch (v) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        .string => |s| std.fmt.parseInt(u64, s, 10) catch null,
+        else => null,
+    };
+}
+
+fn handleSlotCancel(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
+    const scheduler = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is not ready to process requests", 503);
+        return;
+    };
+    const target_id = parseCancelRequestId(allocator, request_body) orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"id\": <request_id>}", 400);
+        return;
+    };
+    if (!scheduler.cancelSlotById(target_id)) {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No in-flight request matches that id", 404);
+        return;
+    }
+    log.info("[cancel] slot request_id={d} cancelled via API\n", .{target_id});
+    try sendResponse(stream, "200 OK", "application/json", "{\"ok\":true}");
 }
 
 fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: []const u8, raw_path: []const u8) !void {

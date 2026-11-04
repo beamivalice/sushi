@@ -1589,6 +1589,32 @@ pub const Scheduler = struct {
         for (self.decoding.items) |slot| slot.cancelForShutdown();
     }
 
+    /// Cancel a single in-flight slot by its request_id (user/dashboard cancellation).
+    /// Returns true if a matching slot was found and cancelled, false otherwise.
+    pub fn cancelSlotById(self: *Scheduler, request_id: u64) bool {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        for (self.pending.items) |slot| {
+            if (slot.request_id == request_id) {
+                slot.cancel();
+                return true;
+            }
+        }
+        for (self.prefilling.items) |slot| {
+            if (slot.request_id == request_id) {
+                slot.cancel();
+                return true;
+            }
+        }
+        for (self.decoding.items) |slot| {
+            if (slot.request_id == request_id) {
+                slot.cancel();
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Plan 05 Phase D: resolve `id_or_empty` ("" / "sushi" → default)
     /// to a refcounted, ready `*LoadedModel`. Cold-loads on demand: if the
     /// entry is `.unloaded`, parses CPU state, picks an LRU victim if

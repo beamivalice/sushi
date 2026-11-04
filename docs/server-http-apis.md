@@ -536,6 +536,10 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   button), `/v1/chat/completions` streamed with `include_usage` (the
   readout is the final chunk's `usage` + `timings`), `reasoning_content` shown collapsed. Stop aborts the fetch; the
   server cancels on disconnect.
+- `POST /v1/slots/cancel {"id": <request_id>}` stops an in-flight slot (pending, prefilling or decoding) by its request id:
+  the slot is marked cancelled, its prefill or decode loop breaks at the next chunk/token boundary, and its allocated memory
+  is returned to the pool. Answers `{"ok":true}` (200), `400` on invalid payload, or `404` when no in-flight slot matches the id.
+  The dashboard's **Sessions** table provides a **Cancel** button on active prefill and decode rows, invoking this endpoint.
 - The effort menu lists exactly the row's `reasoning_efforts`, with no default entry; it shows the stored choice where
   the model takes it, else the row's `default_reasoning_effort`, and every request sends the shown word.
 - The thinking-budget box beside it takes the word's `reasoning_effort_budgets` value whenever the model or the word
