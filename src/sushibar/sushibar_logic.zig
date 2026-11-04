@@ -1366,6 +1366,11 @@ pub fn excessLines(shown: usize, keep: usize) usize {
     return if (shown > keep * 2) shown - keep else 0;
 }
 
+/// The "New lines" pill: on once lines arrive while the reader is scrolled up, off once they are back at the end.
+pub fn newLinesPill(shown: bool, appended: bool, following: bool) bool {
+    return !following and (shown or appended);
+}
+
 /// The view is following the log while its visible bottom is within a few points of the text's end.
 pub fn atBottom(visible_max_y: f64, doc_height: f64) bool {
     return visible_max_y >= doc_height - 24;
@@ -2563,4 +2568,12 @@ test "speeds: one rounding rule in the title and the card, whole numbers from 10
         const t = title(&b, .{ .link = .up, .decoding = true, .live = c.tps });
         try std.testing.expectEqualStrings(c.text, t[0..std.mem.indexOfScalar(u8, t, ' ').?]);
     }
+}
+
+test "log new lines: the pill shows once lines arrive while scrolled up, and goes at the end" {
+    try std.testing.expect(newLinesPill(false, true, false));
+    try std.testing.expect(newLinesPill(true, false, false));
+    try std.testing.expect(!newLinesPill(false, false, false));
+    try std.testing.expect(!newLinesPill(true, true, true));
+    try std.testing.expect(!newLinesPill(false, true, true));
 }

@@ -54,6 +54,8 @@ var shown_has_file: ?bool = null;
 var copy_button: id = null;
 var console_button: id = null;
 var reveal_button: id = null;
+var new_lines: id = null;
+var new_lines_shown = false;
 
 fn z(buf: []u8, s: []const u8) [*:0]const u8 {
     const n = @min(s.len, buf.len - 1);
@@ -95,6 +97,7 @@ fn setBody(bytes: []const u8) void {
     defer if (s != null) objc.release(s);
     msg(void, text_view, "setString:", .{s orelse objc.nsString("")});
     msg(void, text_view, "scrollToEndOfDocument:", .{@as(id, null)});
+    showNewLines(false);
 }
 
 fn append(bytes: []const u8) void {
@@ -103,6 +106,24 @@ fn append(bytes: []const u8) void {
     const follow_end = followingEnd();
     msg(void, text_view, "replaceCharactersInRange:withString:", .{ Range{ .location = textLength(), .length = 0 }, s });
     if (follow_end) msg(void, text_view, "scrollToEndOfDocument:", .{@as(id, null)});
+    showNewLines(logic.newLinesPill(new_lines_shown, true, follow_end));
+}
+
+fn showNewLines(on: bool) void {
+    if (on == new_lines_shown or new_lines == null) return;
+    new_lines_shown = on;
+    objc.fadeNext(msg(id, new_lines, "superview", .{}), 0.2);
+    msg(void, new_lines, "setHidden:", .{!on});
+}
+
+fn newLinesAction(_: id, _: objc.SEL, _: id) callconv(.c) void {
+    msg(void, text_view, "scrollToEndOfDocument:", .{@as(id, null)});
+    showNewLines(false);
+}
+
+fn findAction(_: id, _: objc.SEL, sender: id) callconv(.c) void {
+    msg(void, window, "makeFirstResponder:", .{text_view});
+    msg(void, text_view, "performTextFinderAction:", .{sender});
 }
 
 // ── Window ──
@@ -138,11 +159,13 @@ fn copyAction(_: id, _: objc.SEL, _: id) callconv(.c) void {
     const sel = msg(Range, text_view, "selectedRange", .{});
     const all = msg(id, text_view, "string", .{});
     objc.copyString(if (sel.length > 0) msg(id, all, "substringWithRange:", .{sel}) else all);
+    objc.fadeNext(copy_button, 0.15);
     msg(void, copy_button, "setTitle:", .{objc.nsString("Copied")});
     msg(void, controller, "performSelector:withObject:afterDelay:", .{ objc.sel("copyDone:"), @as(id, null), copied_flash_s });
 }
 
 fn copyDone(_: id, _: objc.SEL, _: id) callconv(.c) void {
+    objc.fadeNext(copy_button, 0.15);
     msg(void, copy_button, "setTitle:", .{objc.nsString("Copy")});
 }
 
@@ -183,6 +206,8 @@ fn build() void {
         .{ .selector = "copyDone:", .imp = @ptrCast(&copyDone), .types = "v@:@" },
         .{ .selector = "openConsole:", .imp = @ptrCast(&consoleAction), .types = "v@:@" },
         .{ .selector = "revealLog:", .imp = @ptrCast(&revealAction), .types = "v@:@" },
+        .{ .selector = "newLines:", .imp = @ptrCast(&newLinesAction), .types = "v@:@" },
+        .{ .selector = "findLog:", .imp = @ptrCast(&findAction), .types = "v@:@" },
     });
     controller = objc.new(controller);
     const style: usize = 1 | 2 | 4 | 8;
@@ -201,13 +226,37 @@ fn build() void {
     msg(void, text_view, "setSelectable:", .{true});
     msg(void, text_view, "setRichText:", .{false});
     msg(void, text_view, "setUsesFindBar:", .{true});
+    msg(void, text_view, "setIncrementalSearchingEnabled:", .{true});
     msg(void, text_view, "setTextContainerInset:", .{NSSize{ .width = 8, .height = 6 }});
     msg(void, text_view, "setFont:", .{msg(id, objc.class("NSFont"), "monospacedSystemFontOfSize:weight:", .{ @as(f64, 11.5), @as(f64, 0) })});
     msg(void, content, "addSubview:", .{scroll});
 
+    // An accent capsule over the text's lower right: a box draws the fill, a borderless button inside takes the click.
+    const pill_w: f64 = 108;
+    new_lines = control("NSBox", .{ .x = win_w - 20 - pill_w, .y = 16, .w = pill_w, .h = 26 });
+    msg(void, new_lines, "setBoxType:", .{@as(isize, 4)});
+    msg(void, new_lines, "setBorderWidth:", .{@as(f64, 0)});
+    msg(void, new_lines, "setCornerRadius:", .{@as(f64, 13)});
+    msg(void, new_lines, "setFillColor:", .{color("controlAccentColor")});
+    msg(void, new_lines, "setContentViewMargins:", .{NSSize{ .width = 0, .height = 0 }});
+    msg(void, new_lines, "setAutoresizingMask:", .{@as(usize, 1 | 32)});
+    msg(void, new_lines, "setHidden:", .{true});
+    const jump = pushButton("New lines", .{ .x = 0, .y = 0, .w = pill_w, .h = 26 }, "newLines:");
+    msg(void, jump, "setBordered:", .{false});
+    const arrow = msg(id, objc.class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ objc.nsString("arrow.down"), @as(id, null) });
+    const weight = msg(id, objc.class("NSImageSymbolConfiguration"), "configurationWithPointSize:weight:", .{ @as(f64, 11), @as(f64, 0.3) });
+    msg(void, jump, "setImage:", .{msg(id, arrow, "imageWithSymbolConfiguration:", .{weight})});
+    msg(void, jump, "setImagePosition:", .{@as(isize, 2)});
+    msg(void, jump, "setImageHugsTitle:", .{true});
+    msg(void, jump, "setContentTintColor:", .{color("whiteColor")});
+    msg(void, jump, "setAutoresizingMask:", .{@as(usize, 0)});
+    msg(void, jump, "setToolTip:", .{objc.nsString("Lines arrived below: jump to the end and follow it")});
+    msg(void, new_lines, "addSubview:", .{jump});
+    msg(void, content, "addSubview:", .{new_lines});
+
     const y = win_h - bar_h + 7;
     path_label = msg(id, objc.class("NSTextField"), "labelWithString:", .{objc.nsString("")});
-    msg(void, path_label, "setFrame:", .{NSRect{ .x = 12, .y = y + 2, .w = win_w - 24 - 3 * 96, .h = 16 }});
+    msg(void, path_label, "setFrame:", .{NSRect{ .x = 12, .y = y + 2, .w = win_w - 24 - 4 * 90, .h = 16 }});
     msg(void, path_label, "setFont:", .{msg(id, objc.class("NSFont"), "systemFontOfSize:", .{@as(f64, 11)})});
     msg(void, path_label, "setTextColor:", .{color("secondaryLabelColor")});
     msg(void, path_label, "setLineBreakMode:", .{@as(isize, 5)});
@@ -219,14 +268,17 @@ fn build() void {
         .{ .title = "Reveal", .w = 70, .selector = "revealLog:", .tip = "Show the log file in Finder" },
         .{ .title = "Open in Console", .w = 120, .selector = "openConsole:", .tip = "Open the log file in Console" },
         .{ .title = "Copy", .w = 60, .selector = "copyLog:", .tip = "Copy the selection, or the whole log when nothing is selected" },
+        .{ .title = "Find", .w = 56, .selector = "findLog:", .tip = "Search the log (⌘F)" },
     };
-    for (buttons, [_]*id{ &reveal_button, &console_button, &copy_button }) |b, slot| {
+    var find_button: id = null;
+    for (buttons, [_]*id{ &reveal_button, &console_button, &copy_button, &find_button }) |b, slot| {
         x -= b.w;
         slot.* = pushButton(b.title, .{ .x = x, .y = y, .w = b.w, .h = 24 }, b.selector);
         msg(void, slot.*, "setToolTip:", .{objc.nsString(b.tip)});
         msg(void, content, "addSubview:", .{slot.*});
         x -= 6;
     }
+    msg(void, find_button, "setTag:", .{@as(isize, 1)});
 }
 
 fn titleFor(port: u16, src: logic.LogSource) void {
@@ -355,6 +407,7 @@ fn syncBody(port: u16, src: logic.LogSource) void {
         .append => extend(o),
         .reload => reload(o, !moved and follow.file != 0),
     }
+    if (new_lines_shown) showNewLines(logic.newLinesPill(true, false, followingEnd()));
     stale = false;
 }
 
@@ -364,6 +417,11 @@ fn showFileButtons() void {
     shown_has_file = has_file;
     msg(void, console_button, "setEnabled:", .{has_file});
     msg(void, reveal_button, "setEnabled:", .{has_file});
+}
+
+/// For a render: the reader scrolled away from the end.
+pub fn scrollToTop() void {
+    msg(void, text_view, "scrollToBeginningOfDocument:", .{@as(id, null)});
 }
 
 pub fn isVisible() bool {

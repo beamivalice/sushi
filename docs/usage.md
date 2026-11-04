@@ -13,13 +13,14 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 ```
 
 The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` and it detaches from
-the terminal. The title is the live decode tok/s (dim for the last request's once idle). Its menu opens on a status
+the terminal. The title is the live decode tok/s (dim for the last request's once idle, gone after ten idle minutes), beside a menu bar icon
+that is filled while a server answers. Its menu opens on a status
 card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph) and then starts or stops the server
-on the watched port (asking first for one it did not start; Start loads again the model the server last had, and with none known the card links to the Models page), switches the port (the default port first, then the ports you added by typing one; hover an added port and click its x to forget it; a server on a port you never added is not listed; the choice is remembered; `--port` wins, then the default port,
+on the watched port (asking first for one it did not start; Start loads again the model the server last had, and with none known the card links to the Models page; a Stop that has not taken after 15 s offers Force Stop), switches the port (the default port first, then the ports you added by typing one; hover an added port and click its x to forget it; a server on a port you never added is not listed; the choice is remembered; `--port` wins, then the default port,
 `server.port` in Settings, 12345 unless changed), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
-three buttons: Log (a window that follows the watched server's log live), Update (Check, which shows Checking… and then
+three buttons: Log (a window that follows the watched server's log live, with Find and a "New lines" button when you scrolled up), Update (Check, which shows Checking… and then
 Up to date, Retry or an orange Update while the menu stays open; with a model loaded it asks before restarting the server; Homebrew installs get an Upgrade button that copies `brew upgrade sushi`; a running sushibar never
-blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q). The card says why a server is stopped, hung, locked or unable to start, an orange dot on the icon marks a server that does not answer, wants a key, lost its port or exited on its own, and a note in the menu opens the log.
+blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q; servers it started keep running, hold ⌥ for Quit & Stop). The card says why a server is stopped, hung, locked or unable to start, an orange dot on the icon marks a server that does not answer, wants a key, lost its port or exited on its own, and a note in the menu opens the log. A server started with `--api-key` or `--api-key-env` is read with its own key. sushibar polls every second while a request runs or the menu is open, and every 5 s (10 s with no server) otherwise.
 
 A browser download is quarantined: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`. GPU memory and the
 largest context per Mac: [README, Memory](../README.md#memory).

@@ -2150,7 +2150,8 @@ fn renderPortRows(dir: []const u8) void {
     }
 }
 
-/// The window reading a real file: its last lines on open, then what the file grew by.
+/// The window reading a real file: its last lines on open, then what the file grew by while the reader was scrolled
+/// up, which the New lines pill announces.
 fn renderFollowedLog(dir: []const u8) void {
     var path: [std.fs.max_path_bytes:0]u8 = undefined;
     const file = std.fmt.bufPrint(&path, "{s}/followed.log", .{dir}) catch return;
@@ -2161,13 +2162,16 @@ fn renderFollowedLog(dir: []const u8) void {
     std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = file, .data = text.written() }) catch return;
     const src: logic.LogSource = .{ .kind = .given, .path = file };
     log_view.sync(11250, src);
+    log_view.scrollToTop();
     for (3001..3006) |i| w.print("line {d} appended later\n", .{i}) catch return;
     w.writeAll("a line still being writ") catch return;
     std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = file, .data = text.written() }) catch return;
     log_view.sync(11250, src);
-    var png: [std.fs.max_path_bytes:0]u8 = undefined;
-    const pz = std.fmt.bufPrintSentinel(&png, "{s}/log-window-followed-light.png", .{dir}, 0) catch return;
-    if (!log_view.renderPng(pz.ptr, false, null)) std.debug.print("sushibar: could not render {s}\n", .{pz});
+    for ([_]bool{ false, true }) |dark| {
+        var png: [std.fs.max_path_bytes:0]u8 = undefined;
+        const pz = std.fmt.bufPrintSentinel(&png, "{s}/log-window-new-lines-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch return;
+        if (!log_view.renderPng(pz.ptr, dark, null)) std.debug.print("sushibar: could not render {s}\n", .{pz});
+    }
 }
 
 // ── Launch ──

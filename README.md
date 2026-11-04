@@ -36,7 +36,7 @@ brew install beamivalice/tap/sushi
 
 Update with `brew upgrade sushi`.
 
-`sushibar` puts the server in the menu bar: decode tok/s as its title, and a menu with a live status card, Start/Stop, a port switcher, its pages, and Log, Update and Quit buttons (Log follows the server log live).
+`sushibar` puts the server in the menu bar: decode tok/s as its title, and a menu with a live status card, Start/Stop, a port switcher, its pages, and Log, Update and Quit buttons (Log follows the server log live; hold ⌥ for Quit & Stop).
 
 * The server listens on `127.0.0.1:12345` (Settings has a Default port).
 * Support speculative decoding: MTP for Qwen and MiMo, DFlash2 for GLM.
