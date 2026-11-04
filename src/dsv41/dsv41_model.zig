@@ -733,6 +733,10 @@ pub const Model = struct {
     pack_kv: bool = true,
     /// Tests: each layer completes on the GPU before the next is built, the decode schedule's reference.
     sync_layers: bool = false,
+    /// Prefill layers allowed in flight: a layer is submitted, not waited on, and the host waits only for the oldest of
+    /// more than `pipe_depth`. 0 waits on every layer (the tests' reference).
+    pipe_depth: usize = 2,
+    pipe: Inflight = .{},
     /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
     /// reads its picks (`Experts.Spec`); off, it waits for them.
     route_spec: bool = true,
@@ -752,6 +756,7 @@ pub const Model = struct {
     profile: ?*Profile = null,
 
     pub fn deinit(self: *Model) void {
+        pipeDrain(self) catch {};
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
@@ -2351,6 +2356,73 @@ pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *co
     return sc.add(y, try sc.astype(sy, .float32));
 }
 
+/// The most layers `pipe_depth` keeps in flight.
+const pipe_max = 8;
+
+/// The output streams of the layers in flight, oldest first. It owns the handles it holds.
+const Inflight = struct {
+    q: [pipe_max]A = @splat(none),
+    head: usize = 0,
+    n: usize = 0,
+
+    /// Adds `x`; once more than `depth` are in flight, the oldest leaves and is returned for the caller to wait on and free.
+    fn push(self: *Inflight, depth: usize, x: A) ?A {
+        std.debug.assert(self.n < pipe_max and depth < pipe_max);
+        self.q[(self.head + self.n) % pipe_max] = x;
+        self.n += 1;
+        return if (self.n > depth) self.pop() else null;
+    }
+
+    fn pop(self: *Inflight) ?A {
+        if (self.n == 0) return null;
+        const x = self.q[self.head];
+        self.q[self.head] = none;
+        self.head = (self.head + 1) % pipe_max;
+        self.n -= 1;
+        return x;
+    }
+};
+
+/// Whether a pass of `rows` pipelines its layers: prefill widths only, and none of the diagnostics that time or read a
+/// layer when it ends.
+///
+/// A streamed expert layer reads its picks on the host before it writes any slab, and that read waits for the router,
+/// which needs the previous layer's routed output, so no queued layer still reads a slab being refilled. That holds
+/// only inside one pass: `extendState` drains before it returns.
+fn pipeOn(m: *const Model, rows: usize) bool {
+    return m.pipe_depth > 0 and rows > exl3.kernels.DECODE_ROWS_MAX and !m.sync_layers and m.profile == null and m.trace == null and m.tap == null;
+}
+
+/// Queues a layer's arrays `ev` and tracks its output stream `x`; past `pipe_depth` layers in flight, waits for the
+/// oldest. The same graphs as an evaluation in place: only when the host waits changes.
+fn pipeSubmit(m: *Model, ev: []const A, x: A) !void {
+    try submitAll(ev);
+    if (m.pipe.push(m.pipe_depth, handle(x))) |old| try waitFree(old);
+}
+
+fn submitAll(xs: []const A) !void {
+    const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try asyncEval(v);
+}
+
+fn waitFree(x: A) !void {
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_array_eval(x));
+}
+
+/// Waits for every pipelined layer and for the rest queued on the stream. A failed wait still empties the ring.
+/// Returns at once with nothing in flight, so decode and verify passes pay no stream sync for it.
+pub fn pipeDrain(m: *Model) !void {
+    if (m.pipe.n == 0) return;
+    var first: ?anyerror = null;
+    while (m.pipe.pop()) |x| waitFree(x) catch |e| {
+        if (first == null) first = e;
+    };
+    _ = mlx.mlx_synchronize(m.s);
+    if (first) |e| return e;
+}
+
 /// Queues `x` on the GPU without waiting for it.
 pub fn submit(x: A) !void {
     try submitWith(x, &.{});
@@ -2472,7 +2544,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
             try p.mark(.routed, &.{out});
             if (hk.host_ns) |f| p.hostShare(f(hk.ctx) - host0);
         }
-        if (!early) try mlx.check(mlx.mlx_array_eval(out));
+        if (!early) try if (pipeOn(m, dim(h, 0))) submit(out) else mlx.check(mlx.mlx_array_eval(out));
         return out;
     }
     if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, li, ly, h));
@@ -2654,6 +2726,8 @@ pub fn ensureState(m: *Model) !*State {
 }
 
 pub fn resetState(m: *Model) void {
+    // Layers in flight read the state about to be freed.
+    pipeDrain(m) catch {};
     m.dropAhead();
     if (m.dec_state) |*st| st.deinit();
     m.dec_state = null;
@@ -3082,7 +3156,10 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     errdefer _ = mlx.mlx_array_free(x);
     errdefer _ = mlx.mlx_array_free(cpre);
     // A decode-width pass builds layer 0 on these lazily: the embedding is a few microseconds of GPU work.
-    if (L > exl3.kernels.DECODE_ROWS_MAX) try evalAll(if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre });
+    if (L > exl3.kernels.DECODE_ROWS_MAX) {
+        const made: []const A = if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre };
+        try if (pipeOn(m, L)) submitAll(made) else evalAll(made);
+    }
     return .{ .st = st, .ids = ids, .p0 = p0, .span = span, .rows = rows, .x = x, .cpre = cpre, .sh = try Shared.init(gpa, (L + span - 1) / span), .img = img };
 }
 
@@ -3407,7 +3484,8 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len) aheadEngram(m, p) catch {};
     const c = &m.cfg;
     // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
-    const wait = m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX;
+    const piped = pipeOn(m, L);
+    const wait = (m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX) and !piped;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     if (p.st.ds.len > 0) for (c.dspark.targets[0..c.dspark.n_targets], 0..) |tl, t| if (tl == li) {
@@ -3431,6 +3509,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     try appendVerifyArrays(gpa, &ev, p.st, li);
     if (m.trace) |t| try t.put("stream_{d}", .{li}, p.x);
     if (prof(m, L)) |pf| return pf.mark(.expand, ev.items);
+    if (piped) return pipeSubmit(m, ev.items, p.x);
     if (wait) return evalAll(ev.items);
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
@@ -3486,6 +3565,7 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
     const t0 = readStart();
     defer readDone(.head, t0);
     try mlx.check(mlx.mlx_array_eval(res));
+    try pipeDrain(m);
     reportReads(L);
     return res;
 }
@@ -3705,6 +3785,7 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     defer ev.deinit(m.gpa);
     try appendStateArrays(m.gpa, &ev, &st.layers[split]);
     try evalAll(ev.items);
+    try pipeDrain(m);
     reportEngramWait(m, ids.len);
     st.n = pass.p0 + ids.len;
     m.state_only_used += 1;
@@ -5334,6 +5415,41 @@ test "dsv41 state-only chunks: a chunk another chunk wider than the window follo
     };
 }
 
+test "dsv41 prefill pipeline: layers in flight leave the logits and state of the waiting schedule (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const ids = try syntheticPrompt(base, 120);
+    defer testing.allocator.free(ids);
+    for ([_]bool{ false, true }) |spark| {
+        const m = try wideWindowModel(dir, .{ .act = .bfloat16, .qat = true, .dspark = spark }, s);
+        defer m.deinit();
+        const w = m.cfg.window;
+        const plans = [_]struct { chunks: []const usize, skip: []const bool }{
+            .{ .chunks = &.{ 33, 29, 25 }, .skip = &.{ false, false, false } },
+            .{ .chunks = &.{ 33, 29, 25 }, .skip = &.{ true, true, false } },
+            .{ .chunks = &.{ w + 1, w + 1, w + 1, w + 1 }, .skip = &.{ true, false, true, false } },
+        };
+        for (plans) |plan| {
+            m.pipe_depth = 0;
+            var waits = try stateArm(m, &sc, ids, plan.chunks, plan.skip, 3, null, SPAN);
+            defer waits.deinit();
+            for ([_]usize{ 1, 2, 3 }) |depth| {
+                m.pipe_depth = depth;
+                var piped = try stateArm(m, &sc, ids, plan.chunks, plan.skip, 3, null, SPAN);
+                defer piped.deinit();
+                try expectArmsEqual(&sc, m, &waits, &piped);
+            }
+        }
+    }
+}
+
 test "dsv41 state-only chunks: skipping before a chunk the window covers leaves stale rows, which the logits show (DSV41_TINY)" {
     try mlx.requireGpu();
     const dir = try fixtureDir();
@@ -6548,4 +6664,22 @@ test "dsv41 profile: a stage mark evaluates every live array it is given and ski
         _ = mlx._mlx_array_is_available(&avail, x);
         try testing.expect(avail);
     }
+}
+
+test "dsv41 pipeline: the ring hands back the oldest layer once more than the depth are in flight" {
+    const h = struct {
+        fn at(i: usize) A {
+            return .{ .ctx = @ptrFromInt(i) };
+        }
+    };
+    var ring: Inflight = .{};
+    try testing.expectEqual(@as(?A, null), ring.push(2, h.at(1)));
+    try testing.expectEqual(@as(?A, null), ring.push(2, h.at(2)));
+    try testing.expectEqual(h.at(1).ctx, ring.push(2, h.at(3)).?.ctx);
+    try testing.expectEqual(@as(usize, 2), ring.n);
+    for (4..4 + 2 * pipe_max) |i| try testing.expectEqual(h.at(i - 2).ctx, ring.push(2, h.at(i)).?.ctx);
+    try testing.expectEqual(h.at(2 + 2 * pipe_max).ctx, ring.pop().?.ctx);
+    try testing.expectEqual(h.at(3 + 2 * pipe_max).ctx, ring.pop().?.ctx);
+    try testing.expectEqual(@as(?A, null), ring.pop());
+    try testing.expectEqual(@as(usize, 0), ring.n);
 }

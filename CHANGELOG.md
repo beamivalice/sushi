@@ -10,6 +10,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The web page has a Downloads tab**: it lists the Sushi packs published on Hugging Face with their size, recommends the one for this Mac's memory, checks the free space, and downloads a pack into the models folder with a progress bar, speed and time left; Stop keeps what is downloaded and Resume continues from it, also after a restart, and a small dot on the tab marks a newly published pack (`GET`/`POST /v1/downloads`, Cmd+5).
 - **The web page says what each Default is**: the Models tab reads "Default (8-bit)", "Default (On)" or "Default (256,000)" from what the loaded model really uses, a new "Max output tokens" setting (`max_tokens`, the per-model twin of `--max-tokens`) sets the reply budget of a request that names none, and the chat options show the model's own defaults.
 - **Settings can turn the automatic sushi and model pack update checks off**, without a restart, and a pack's revision is asked of Hugging Face at most once a day even across restarts.
+- **DeepSeek-V4.1 prefills new text 2-3% faster**: a long prompt keeps two layers in flight on the GPU instead of waiting at each one, with the same output.
 - **Fixes**: DeepSeek-V4.1 raw-text `/v1/completions` refuses an empty prompt again instead of answering it.
 
 ---

@@ -286,6 +286,21 @@ Prefill width:
   code windows within 3%), since the routed trellis GEMM is bound per row, not by its weight decode (wider windows lose, [engine-exl3-experts](engine-exl3-experts.md)). Streamed at
   the default budget, 4096 rows peak at 118.8 GB of 128 and the first chunk of a boot took 17-22 s against 1.7 s at 2048.
 
+<a id="prefill-pipeline"></a>
+Prefill pipeline (`Model.pipe_depth`, 2; load line `[dsv41] prefill pipeline: 2 layers in flight`):
+- A wide layer is submitted, not waited on: no evaluation at the routed sum or the layer's end, the host waits only on
+  the oldest of more than 2 layers in flight, and each chunk drains at its end (`finishPass`, `extendState`), so two
+  chunks never overlap. Streamed experts keep the router readback, which orders every slab refill after the layer
+  before it. Same graphs, so the same bytes: `dsv41 prefill pipeline` compares depths 0 to 3.
+- Measured on 59e7a562 + caee00fe against 59e7a562 (pack revision 2.0, `--ssd-budget-gb 108`, debug log,
+  `taskpolicy -a`, GPU lock, AC, fans max and under 50 C before each boot, one boot an arm, six pipelined boots and six
+  unpipelined boots of the same prefill code interleaved in three rounds; a cold 16,020-token code prompt, then
+  17,890 and 31,524 tokens of new code text): new text 1389 against 1347 tok/s at 17.9k and 1429 against 1394 at 31.5k
+  (means; the last A B B A +1.0% and +1.4%). The cold prompt's steady chunks did not move (9.47 against 9.48 s for
+  chunks 2-8). Greedy tokens and top-5 logprobs of all four requests matched every unpipelined boot.
+- Transient: a 2048-row chunk's `peak - active` rose 3.57 to 3.82 GB (`SUSHI_PREFILL_CHUNK_PEAK`), inside the chunk
+  bill (`chunk + 511` rows at `cap_row_bytes_per_dim`).
+
 Other pieces:
 - A wide chunk's Engram rows are read ahead on a host thread over the whole chunk (`prefetchEngram`). They are
   dequantized at their layer, bit-identical to rows read there.

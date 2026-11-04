@@ -44,6 +44,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     dsv41_model.setReadDiag(diagEnvOn("SUSHI_DSV41_READ_DIAG"));
     if (mdl.ced_split) |split|
         log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });
+    log.info("[dsv41] prefill pipeline: {d} layers in flight\n", .{mdl.pipe_depth});
     const verify_profile = diagEnvOn("SUSHI_DSV41_VERIFY_PROFILE");
     if (verify_profile or diagEnvOn("SUSHI_DSV41_PREFILL_PROFILE")) {
         mdl.profile = try allocator.create(dsv41_model.Profile);

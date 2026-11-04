@@ -4017,7 +4017,7 @@ test "bf16 expert cache admission bills cache workspace bounce and resident trun
     try std.testing.expect(!expertStreamingLoadFits(needed - 1, 10 * gb, 16 * gb, 60 * gb, 536_870_912, fill_peak, serving));
 }
 
-test "DeepSeek's streamed request bill brackets the prefill peaks measured on the M5 Max" {
+test "DeepSeek: the streamed request bill brackets the prefill peaks measured on the M5 Max" {
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
@@ -4038,6 +4038,9 @@ test "DeepSeek's streamed request bill brackets the prefill peaks measured on th
         // Transient peaks of MLX's own bytes, state included, binary 26a28040, budget 108.
         .{ .seq = 2048, .chunk = 2048, .peak_mb = 4_907 },
         .{ .seq = 225_000, .chunk = 2048, .peak_mb = 5_124 },
+        // The two-layer prefill pipeline holds 0.25 GB more of a 2048-row chunk's transient.
+        .{ .seq = 2048, .chunk = 2048, .peak_mb = 4_907 + 250 },
+        .{ .seq = 225_000, .chunk = 2048, .peak_mb = 5_124 + 250 },
     };
     for (measured) |m| {
         const bill = prefillNeededAtChunk(&config, m.seq, 16, 16, m.chunk, .{});
