@@ -980,7 +980,8 @@ pub const ModelsKnown = enum { unknown, answered, failed };
 pub const PortEntry = struct { port: u16, checked: bool, listening: bool, model: ?[]const u8, models: ModelsKnown = .answered, removable: bool = false };
 
 /// The Port submenu: the default port first, then the added ports, the watched port when it is none of those, and every
-/// other listening sushi. A port can be forgotten unless it is the default or a listener nobody added.
+/// other listening sushi. A port can be forgotten unless it is the default or a listener nobody added; the watched
+/// port can always be, even when a file from before added ports or `--port` named it and it was never saved.
 pub fn portEntries(out: []PortEntry, watched: u16, default: u16, saved: []const u16, listings: []const Listing) []PortEntry {
     var n: usize = 0;
     const lead = [_][]const u16{ &.{default}, saved };
@@ -1012,7 +1013,7 @@ fn portEntry(p: u16, watched: u16, default: u16, saved: []const u16, listings: [
         .listening = listing != null,
         .model = if (listing) |l| l.model else null,
         .models = if (listing) |l| l.models else .answered,
-        .removable = p != default and (kept or listing == null),
+        .removable = p != default and (kept or listing == null or p == watched),
     };
 }
 
@@ -1222,6 +1223,17 @@ test "port menu: a listener nobody added is shown but has nothing to forget, an 
     try std.testing.expect(e[1].checked and !e[1].listening and e[1].removable);
     try std.testing.expectEqual(@as(u16, 7000), e[2].port);
     try std.testing.expect(!e[2].removable);
+}
+
+test "port menu: the watched port can be forgotten even when it was never saved and a sushi listens on it" {
+    var out: [12]PortEntry = undefined;
+    const l = [_]Listing{.{ .port = 18802, .pid = 5, .models = .answered }};
+    const e = portEntries(&out, 18802, 12345, &.{}, &l);
+    try std.testing.expectEqual(@as(usize, 2), e.len);
+    try std.testing.expect(e[1].port == 18802 and e[1].checked and e[1].listening and e[1].removable);
+    const after = portEntries(&out, afterRemove(18802, 18802, 12345), 12345, &.{}, &l);
+    try std.testing.expect(after[0].checked and !after[0].removable);
+    try std.testing.expect(after[1].port == 18802 and after[1].listening and !after[1].checked and !after[1].removable);
 }
 
 test "port menu: a default changed in settings is not listed twice when it was added before" {

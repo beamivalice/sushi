@@ -59,7 +59,10 @@ done
 WORK="$(cd "$(mktemp -d)" && pwd -P)"
 export HOME="$WORK/home"
 export SUSHI_PREFIX_CACHE_DIR="$WORK/kv"
-mkdir -p "$HOME"
+mkdir -p "$HOME/.sushi"
+# A private default port, so no run here ever lists or falls back to a real server's port.
+seed_default() { echo '{"server":{"port":'"$((PORT + 9))"'}}' > "$HOME/.sushi/model-settings.json"; }
+seed_default
 LOG="$WORK/bar.err"
 FPID=""
 TPID=""
@@ -169,6 +172,11 @@ check "a port switched to is added, checked and removable" "$(yes_if 'grep -q "p
 check "removing the default port does nothing" "$(yes_if 'grep -q "poll [5-6] .*ports=\"'"$DPORT"' — not running;'"$APORT2"' — not running\*;" "$LOG"')"
 check "removing the watched port forgets it and watches the default" "$(yes_if 'grep -q "poll [7-9] .*Port '"$DPORT"':.*ports=\"'"$DPORT"' — not running\*;" "$LOG" && ! grep -q "poll [7-9] .*'"$APORT2"' — not running" "$LOG"')"
 check "the saved file keeps the watched port and no added one" "$(yes_if 'grep -q "\"port\":'"$DPORT"',\"ports\":\[\]" "$HOME/.sushi/sushibar.json"')"
+start_foreign
+run_bar "$BAR" 8 "remove$FPORT@4" --port "$FPORT"
+check "a watched port that was never added, with a sushi on it, has a remove button" "$(yes_if 'grep -q "poll [1-3] .*Port '"$FPORT"':.*removable=\"[^\"]*'"$FPORT"'" "$LOG"')"
+check "removing it moves the watch to the default and leaves the sushi listed as a listener" "$(yes_if 'grep -q "poll [6-8] .*Port '"$DPORT"':.*ports=\"'"$DPORT"' — not running\*;.*'"$FPORT"' — …;" "$LOG" && ! grep -q "poll [6-8] .*removable=\"[^\"]*'"$FPORT"'" "$LOG"')"
+kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
 echo '{"port":'"$FPORT"'}' > "$HOME/.sushi/sushibar.json"
 run_bar "$BAR" 2 ""
 check "a file from before added ports still sets the watched port" "$(yes_if 'grep -q "poll 1 .*Port '"$FPORT"':" "$LOG"')"
@@ -176,7 +184,8 @@ rm -f "$HOME/.sushi/sushibar.json"
 echo '{"server":{"port":'"$APORT2"'}}' > "$HOME/.sushi/model-settings.json"
 run_bar "$BAR" 2 ""
 check "server.port in the settings file is the default port: watched at first, listed first, not removable" "$(yes_if 'grep -q "poll 1 .*Port '"$APORT2"':.*ports=\"'"$APORT2"' — not running\*;" "$LOG" && ! grep -q "removable=\"[^\"]*'"$APORT2"'" "$LOG"')"
-rm -f "$HOME/.sushi/model-settings.json" "$HOME/.sushi/sushibar.json"
+seed_default
+rm -f "$HOME/.sushi/sushibar.json"
 
 echo "== a port held by another program =="
 mkdir -p "$WORK/empty"
