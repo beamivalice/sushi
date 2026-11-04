@@ -700,8 +700,9 @@ fn repoCommit(allocator: std.mem.Allocator, io: std.Io, base: []const u8, repo: 
     return allocator.dupe(u8, sha.string) catch null;
 }
 
+/// A listed path is written under the pack folder, so one that could leave it is never taken.
 fn wantedFile(path: []const u8) bool {
-    return shouldDownload(path);
+    return hf_pull.safeRelative(path) and shouldDownload(path);
 }
 
 // ── Commands ────────────────────────────────────────────────────────────
@@ -2098,6 +2099,11 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     try testing.expect(resolveShortName("doesnotexist") == null);
     try testing.expect(resolveShortName("qwen3.8-flash-next:nosuchtag") == null);
     try testing.expect(resolveShortName("unlisted-pack") == null);
+}
+
+test "pull: a listed path that leaves the pack folder is never downloaded" {
+    for ([_][]const u8{ "mtp/../x", "mtp/../../../x", "../x", "/etc/x", "mtp//x" }) |p| try testing.expect(!wantedFile(p));
+    for ([_][]const u8{ "config.json", "mtp/weights.safetensors", "model-00001.safetensors" }) |p| try testing.expect(wantedFile(p));
 }
 
 test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
