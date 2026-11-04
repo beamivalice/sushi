@@ -133,7 +133,6 @@ const Shared = struct {
     last_prefill: ?f64 = null,
     hist: [200]logic.Hist = undefined,
     hist_n: usize = 0,
-    up_to_date: bool = false,
     bar_version: Str(32) = .{},
     server_version: Str(32) = .{},
     /// What the running server's `/props.update` says.
@@ -422,13 +421,11 @@ fn applyCheck(result: logic.Check, manual: bool) bool {
         .available => |v| {
             shared.latest.set(v);
             shared.available = true;
-            shared.up_to_date = false;
             shared.note.set("");
             shared.note_problem = false;
         },
         .up_to_date => {
             shared.available = false;
-            shared.up_to_date = true;
             shared.note.set("");
             shared.note_problem = false;
         },
@@ -824,7 +821,6 @@ fn pollLoop() void {
                 refreshBarVersion(a);
                 lock();
                 shared.available = shared.props_available;
-                shared.up_to_date = !shared.props_available;
                 shared.latest.set(shared.props_latest.get());
                 unlock();
             }
@@ -1207,6 +1203,7 @@ fn symbol(name: []const u8) objc.id {
 
 fn showIcon(button: objc.id, icon: logic.Icon) void {
     if (shown_icon == icon) return;
+    if (shown_icon != null) objc.fadeNext(button, 0.3);
     shown_icon = icon;
     objc.msg(void, button, "setImage:", .{icons[@intFromEnum(icon)]});
 }
@@ -1263,7 +1260,7 @@ fn syncPortMenu(entries: []const logic.PortEntry) void {
     port_row.reset();
     while (objc.msg(isize, port_menu, "numberOfItems", .{}) > 2) objc.msg(void, port_menu, "removeItemAtIndex:", .{@as(isize, 0)});
     var width: f64 = port_row.min_width;
-    for (entries) |e| width = @max(width, port_row.widthFor(logic.portLabel(&lb, e)));
+    for (entries) |e| width = @max(width, port_row.widthFor(logic.portLabel(&lb, e), e.removable));
     for (entries, 0..) |e, i| {
         var z: [112:0]u8 = undefined;
         const label = logic.portLabel(&lb, e);
@@ -1297,9 +1294,10 @@ fn watchTransition(p: u16, fresh: bool, link: logic.Link, now: i64) void {
     prev_answering = logic.answering(link);
 }
 
-/// The orange dot on the menu bar icon, at the lower right where the colour icon is grey and shows it.
+/// The orange dot on the menu bar icon, at its lower right: it keeps its colour beside the tinted template icon.
 fn showBadge(button: objc.id, on: bool) void {
     if (on == shown_badge) return;
+    objc.fadeNext(button, 0.25);
     shown_badge = on;
     if (on) {
         const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
@@ -1370,7 +1368,7 @@ fn runAction(act: Action) void {
     }
 }
 
-/// Return in the field or Watch: a valid port switches what is watched and closes the menu; anything else turns
+/// Return in the field or Switch: a valid port switches what is watched and closes the menu; anything else turns
 /// the text red with a hint and keeps the menu open.
 fn applyPortText() void {
     if (logic.parsePortText(port_field.text())) |p| {
@@ -1446,7 +1444,6 @@ fn refresh() void {
     const last_prefill = if (fresh) shared.last_prefill else null;
     const hist_n = if (fresh) shared.hist_n else 0;
     @memcpy(hist[0..hist_n], shared.hist[0..hist_n]);
-    const up_to_date = shared.up_to_date;
     const bar_version = take(&bar_b, &shared.bar_version);
     const server_version = if (fresh) take(&srv_b, &shared.server_version) else "";
     const server_command = shared.props_command.len > 0;
@@ -1535,7 +1532,6 @@ fn refresh() void {
         .server_version = server_version,
         .update_available = uv.available,
         .latest = uv.latest,
-        .up_to_date = up_to_date,
         .decoding = view.decoding,
         .live = view.live,
         .last = view.last,
@@ -1815,7 +1811,7 @@ const icon_h = 18;
 
 fn loadIcons() void {
     icons[@intFromEnum(logic.Icon.outline)] = objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, icon_w, icon_h);
-    icons[@intFromEnum(logic.Icon.color)] = objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, icon_w, icon_h);
+    icons[@intFromEnum(logic.Icon.filled)] = objc.loadSvg(@embedFile("sushibar/icon-online-template.svg"), true, icon_w, icon_h);
 }
 
 const find_show_interface: isize = 1;
@@ -1983,9 +1979,9 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
         .{ .name = "connecting", .in = .{ .link = .offline, .port = 18803, .bar_version = "1.5.0-dev1", .connecting = true } },
         .{ .name = "silent", .in = .{ .link = .silent, .port = 12345, .bar_version = "1.5.0-dev1" } },
         .{ .name = "loading", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .loading = true, .model = deep, .mem_mb = 12000 } },
-        .{ .name = "no-model", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .up_to_date = true, .gpu_mhz = 0 } },
+        .{ .name = "no-model", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .gpu_mhz = 0 } },
         .{ .name = "generating", .sparkline = true, .outage = true, .in = .{
-            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0-dev1", .up_to_date = true,
+            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0-dev1",
             .decoding = true, .live = 105.27, .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
         } },
         .{ .name = "key-needed", .in = .{ .link = .unauthorized, .port = 12345, .bar_version = "1.5.0-dev1" } },
@@ -1994,7 +1990,7 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
             .update_available = true, .latest = "1.5.1", .last = 142.6, .last_prefill = 3120, .gpu_mhz = 1380, .gpu_pct = 8,
         } },
         .{ .name = "pack-update", .sparkline = true, .in = .{
-            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0", .up_to_date = true,
+            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0",
             .pack_update = .{ .current = "1.0", .latest = "2.0", .command = "sushi pull example-pack" },
             .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
         } },
@@ -2029,30 +2025,45 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
     std.process.exit(0);
 }
 
-/// The menu bar icon with its badge, on a plain button of the status button's shape.
+/// The menu bar item in its states, on a plain button of the status button's shape over a menu-bar-like fill.
 fn renderBadge(dir: []const u8) void {
     loadIcons();
-    for ([_]bool{ false, true }) |dark| {
-        const button = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = 96, .h = 24 }});
+    const Case = struct { name: []const u8, icon: logic.Icon, title: []const u8 = "", dim: bool = false, badge: bool = false };
+    const cases = [_]Case{
+        .{ .name = "live", .icon = .filled, .title = "105 tok/s" },
+        .{ .name = "last", .icon = .filled, .title = "88.0 tok/s", .dim = true },
+        .{ .name = "badge", .icon = .filled, .badge = true },
+        .{ .name = "offline", .icon = .outline },
+    };
+    for (cases) |c| for ([_]bool{ false, true }) |dark| {
+        const box = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSBox"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = 104, .h = 24 }});
+        objc.msg(void, box, "setBoxType:", .{@as(isize, 4)});
+        objc.msg(void, box, "setBorderWidth:", .{@as(f64, 0)});
+        objc.msg(void, box, "setContentViewMargins:", .{objc.NSSize{ .width = 0, .height = 0 }});
+        objc.msg(void, box, "setFillColor:", .{objc.msg(objc.id, objc.class("NSColor"), "colorWithWhite:alpha:", .{ @as(f64, if (dark) 0.16 else 0.92), @as(f64, 1) })});
+        const button = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 4, .y = 0, .w = 96, .h = 24 }});
         objc.msg(void, button, "setBordered:", .{false});
         objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
-        objc.msg(void, button, "setImage:", .{icons[@intFromEnum(logic.Icon.color)]});
-        setButtonTitle(button, "105 tok/s", false);
+        objc.msg(void, button, "setImage:", .{icons[@intFromEnum(c.icon)]});
+        // The status bar draws a template image in the bar's text colour; a plain button would draw it dimmed.
+        objc.msg(void, button, "setContentTintColor:", .{objc.color("labelColor")});
         shown_title_len = std.math.maxInt(usize);
+        setButtonTitle(button, c.title, c.dim);
         makeBadge(button);
-        shown_badge = false;
-        showBadge(button, true);
+        shown_badge = !c.badge;
+        showBadge(button, c.badge);
+        objc.msg(void, box, "addSubview:", .{button});
         const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
-        objc.msg(void, button, "setAppearance:", .{objc.msg(objc.id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
-        const bounds = objc.msg(NSRect, button, "bounds", .{});
-        const rep = objc.msg(objc.id, button, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
+        objc.msg(void, box, "setAppearance:", .{objc.msg(objc.id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
+        const bounds = objc.msg(NSRect, box, "bounds", .{});
+        const rep = objc.msg(objc.id, box, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
         if (rep == null) return;
-        objc.msg(void, button, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
+        objc.msg(void, box, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
         const data = objc.msg(objc.id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(objc.id, null) });
         var path: [std.fs.max_path_bytes:0]u8 = undefined;
-        const pz = std.fmt.bufPrintSentinel(&path, "{s}/menubar-badge-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch return;
+        const pz = std.fmt.bufPrintSentinel(&path, "{s}/menubar-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch return;
         _ = objc.msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(pz.ptr), true });
-    }
+    };
 }
 
 fn renderButtonsAndLog(dir: []const u8) void {
@@ -2121,13 +2132,13 @@ fn renderButtonsAndLog(dir: []const u8) void {
     renderFollowedLog(dir);
 }
 
-/// The Port submenu's rows: the default (not removable), an added port, a listener nobody added.
+/// The Port submenu's rows: the default (not removable), then added ports.
 fn renderPortRows(dir: []const u8) void {
     const rows = [_]port_row.Row{
         .{ .port = 12345, .label = "12345 — Example-Flash-Next-Sushi-STQ-2.75bpw", .checked = true, .removable = false },
         .{ .port = 18803, .label = "18803 — not running", .checked = false, .removable = true },
         .{ .port = 18802, .label = "18802 — Example-Flash-1017", .checked = false, .removable = true },
-        .{ .port = 7000, .label = "7000 — no model", .checked = false, .removable = false },
+        .{ .port = 7000, .label = "7000 — no model", .checked = false, .removable = true },
     };
     const Case = struct { name: []const u8, hover: ?usize = null, x_hover: bool = false };
     for ([_]Case{ .{ .name = "normal" }, .{ .name = "hover-default", .hover = 0 }, .{ .name = "hover-added", .hover = 1 }, .{ .name = "hover-remove", .hover = 2, .x_hover = true } }) |c| {

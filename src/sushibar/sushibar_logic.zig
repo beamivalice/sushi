@@ -297,11 +297,12 @@ fn titleBase(buf: []u8, v: View) []const u8 {
     return text catch "";
 }
 
-pub const Icon = enum { outline, color };
+pub const Icon = enum { outline, filled };
 
-/// Outline while no server answers; colour once one does, whatever it says.
+/// Outline while no server answers; filled once one does, whatever it says. Both are template images, so the menu
+/// bar tints them like its neighbours; the colour icon is the card's.
 pub fn iconFor(link: Link) Icon {
-    return if (link == .offline or link == .silent) .outline else .color;
+    return if (link == .offline or link == .silent) .outline else .filled;
 }
 
 /// A server replied, whatever it said.
@@ -790,7 +791,6 @@ pub const HeaderIn = struct {
     server_version: []const u8 = "",
     update_available: bool = false,
     latest: []const u8 = "",
-    up_to_date: bool = false,
     decoding: bool = false,
     live: ?f64 = null,
     last: ?f64 = null,
@@ -840,8 +840,6 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
             h.version_tail = fmt(a, " · {s} available", .{in.latest});
             break :blk h.version_tail;
         } })
-    else if (in.up_to_date and in.bar_version.len > 0)
-        fmt(a, "{s} · up to date", .{base})
     else
         base;
     if (in.connecting) {
@@ -887,7 +885,7 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
     var tmp: [32]u8 = undefined;
     const speed: ?f64 = if (in.decoding) in.live else in.last;
     h.stats[0] = .{
-        .value = if (speed) |t| fmt(a, "{d:.1}", .{t}) else dash,
+        .value = if (speed) |t| try a.dupe(u8, speedText(&tmp, t)) else dash,
         .label = if (!in.decoding and in.last != null) "LAST TOK/S" else "DECODE TOK/S",
     };
     h.stats[1] = .{ .value = if (in.last_prefill) |t| try a.dupe(u8, thousands(&tmp, @intFromFloat(@round(t)))) else dash, .label = "PREFILL TOK/S" };
@@ -1601,8 +1599,8 @@ test "header: the server's version shows only when it differs, before the update
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("1.5.0 · server 1.4.1 · up to date", (try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .server_version = "1.4.1", .up_to_date = true })).version);
-    try std.testing.expectEqualStrings("1.5.0 · up to date", (try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .server_version = "1.5.0", .up_to_date = true })).version);
+    try std.testing.expectEqualStrings("1.5.0 · server 1.4.1", (try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .server_version = "1.4.1" })).version);
+    try std.testing.expectEqualStrings("1.5.0", (try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .server_version = "1.5.0" })).version);
     const h = try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .server_version = "1.4.1", .update_available = true, .latest = "1.5.1" });
     try std.testing.expectEqualStrings("1.5.0 · server 1.4.1 · 1.5.1 available", h.version);
     try std.testing.expectEqualStrings(" · 1.5.1 available", h.version_tail);
@@ -1851,16 +1849,16 @@ test "header: a running model with throughput" {
     defer arena.deinit();
     const h = try buildHeader(arena.allocator(), .{
         .link = .up, .port = 12345, .model = "DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .mem_mb = 49971,
-        .bar_version = "1.5.0-dev1", .up_to_date = true,
+        .bar_version = "1.5.0-dev1",
         .decoding = true, .live = 105.27, .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
     });
     try std.testing.expect(h.color_icon);
-    try std.testing.expectEqualStrings("1.5.0-dev1 · up to date", h.version);
+    try std.testing.expectEqualStrings("1.5.0-dev1", h.version);
     try std.testing.expectEqualStrings("Running", h.pill.label);
     try std.testing.expectEqualStrings("DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", h.line1);
     try std.testing.expectEqualStrings("Port 12345 · 48.8 GB in use", h.line2);
     try std.testing.expect(h.show_stats);
-    try std.testing.expectEqualStrings("105.3", h.stats[0].value);
+    try std.testing.expectEqualStrings("105", h.stats[0].value);
     try std.testing.expectEqualStrings("DECODE TOK/S", h.stats[0].label);
     try std.testing.expectEqualStrings("5,844", h.stats[1].value);
     try std.testing.expectEqualStrings("PREFILL TOK/S", h.stats[1].label);
@@ -1978,7 +1976,7 @@ test "header: an available update names its version in a tail of its own" {
     const up = try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .update_available = true, .latest = "1.5.1" });
     try std.testing.expectEqualStrings("1.5.0 · 1.5.1 available", up.version);
     try std.testing.expectEqualStrings(" · 1.5.1 available", up.version_tail);
-    const same = try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0", .up_to_date = true });
+    const same = try buildHeader(a, .{ .link = .up, .port = 1, .bar_version = "1.5.0" });
     try std.testing.expectEqualStrings("", same.version_tail);
 }
 
@@ -2193,7 +2191,7 @@ test "tracker: the last speed outlives the request, and since follows the newest
 
 test "icon and link: outline only when nothing answers, and a silent server is offline" {
     try std.testing.expectEqual(Icon.outline, iconFor(.offline));
-    for ([_]Link{ .up, .unauthorized, .metrics_off }) |l| try std.testing.expectEqual(Icon.color, iconFor(l));
+    for ([_]Link{ .up, .unauthorized, .metrics_off }) |l| try std.testing.expectEqual(Icon.filled, iconFor(l));
     try std.testing.expectEqual(Link.offline, linkFor(null));
     try std.testing.expectEqual(Link.up, linkFor(200));
     try std.testing.expectEqual(Link.unauthorized, linkFor(401));
@@ -2553,4 +2551,16 @@ test "quit: plain Quit leaves a started server running and says so; with Option 
     try std.testing.expectEqualStrings("Quit & Stop", both.label);
     try std.testing.expect(both.stops and std.mem.indexOf(u8, both.tip, "2 servers") != null);
     try std.testing.expect(std.mem.indexOf(u8, quitButton(&b, true, 1).tip, "the server it started") != null);
+}
+
+test "speeds: one rounding rule in the title and the card, whole numbers from 100 up" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var b: [64]u8 = undefined;
+    for ([_]struct { tps: f64, text: []const u8 }{ .{ .tps = 105.27, .text = "105" }, .{ .tps = 99.94, .text = "99.9" }, .{ .tps = 7.25, .text = "7.3" } }) |c| {
+        const h = try buildHeader(arena.allocator(), .{ .link = .up, .port = 1, .model = "m", .decoding = true, .live = c.tps });
+        try std.testing.expectEqualStrings(c.text, h.stats[0].value);
+        const t = title(&b, .{ .link = .up, .decoding = true, .live = c.tps });
+        try std.testing.expectEqualStrings(c.text, t[0..std.mem.indexOfScalar(u8, t, ' ').?]);
+    }
 }

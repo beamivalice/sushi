@@ -1,5 +1,6 @@
 //! One row of the Port submenu as a custom menu-item view: a check for the watched port, its label, and, on a
-//! port that can be forgotten, a small remove button that shows while the pointer is over the row. A click
+//! port that can be forgotten, a small remove button that shows while the pointer is over the row; the default port
+//! carries a "Default" tag instead. The row under the pointer is highlighted as a system menu item is. A click
 //! closes the menu and then sends the app's target `pickRow:` or `removeRow:` with the row's view; the port is
 //! read back with `portOf`. Rows are rebuilt together (`reset`), so the state pool is module-level.
 const std = @import("std");
@@ -11,9 +12,10 @@ const NSRect = objc.NSRect;
 
 extern var NSFontAttributeName: id;
 extern var NSForegroundColorAttributeName: id;
+extern var NSParagraphStyleAttributeName: id;
 
 pub const min_width: f64 = 216;
-const max_width: f64 = 380;
+const max_width: f64 = 440;
 pub const height: f64 = 24;
 const x_size: f64 = 16;
 const tracking_enter_exit_always_visible: usize = 0x1 | 0x80 | 0x200;
@@ -52,21 +54,47 @@ pub fn reset() void {
     row_n = 0;
 }
 
+var middle_style: id = null;
+
+/// The label: a model name too long for the widest row loses its middle, not its end.
 fn textAttrs(c: id) id {
+    if (middle_style == null) {
+        middle_style = objc.new(objc.class("NSMutableParagraphStyle"));
+        msg(void, middle_style, "setLineBreakMode:", .{@as(isize, 5)});
+    }
     const font = msg(id, objc.class("NSFont"), "systemFontOfSize:", .{@as(f64, 13)});
+    var keys = [_]id{ NSFontAttributeName, NSForegroundColorAttributeName, NSParagraphStyleAttributeName };
+    var vals = [_]id{ font, c, middle_style };
+    return msg(id, objc.class("NSDictionary"), "dictionaryWithObjects:forKeys:count:", .{ @as([*]id, &vals), @as([*]id, &keys), @as(usize, 3) });
+}
+
+fn attrsOf(size: f64, c: id) id {
+    const font = msg(id, objc.class("NSFont"), "systemFontOfSize:", .{size});
     var keys = [_]id{ NSFontAttributeName, NSForegroundColorAttributeName };
     var vals = [_]id{ font, c };
     return msg(id, objc.class("NSDictionary"), "dictionaryWithObjects:forKeys:count:", .{ @as([*]id, &vals), @as([*]id, &keys), @as(usize, 2) });
 }
 
+const tag = "Default";
+const tag_size: f64 = 11;
+
+fn tagWidth() f64 {
+    return msg(objc.NSSize, objc.nsString(tag), "sizeWithAttributes:", .{attrsOf(tag_size, objc.color("labelColor"))}).width;
+}
+
+/// What the right end of a row holds: the remove button, or the default port's tag.
+fn trailing(removable: bool) f64 {
+    return if (removable) x_size + 12 else tagWidth() + 24;
+}
+
 /// The widest a row needs for its label, so a long model name is not cut when there is room.
-pub fn widthFor(label: []const u8) f64 {
+pub fn widthFor(label: []const u8, removable: bool) f64 {
     var z: [112:0]u8 = undefined;
     const n = @min(label.len, z.len - 1);
     @memcpy(z[0..n], label[0..n]);
     z[n] = 0;
     const w = msg(objc.NSSize, objc.nsString(&z), "sizeWithAttributes:", .{textAttrs(objc.color("labelColor"))}).width;
-    return std.math.clamp(w + 30 + 12 + x_size + 8, min_width, max_width);
+    return std.math.clamp(w + 30 + 8 + trailing(removable), min_width, max_width);
 }
 
 fn drawRect(self: id, _: objc.SEL, _: NSRect) callconv(.c) void {
@@ -77,27 +105,34 @@ fn drawRect(self: id, _: objc.SEL, _: NSRect) callconv(.c) void {
         msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithRect:", .{bounds}), "fill", .{});
     }
     if (r.hover) {
-        msg(void, objc.withAlpha(objc.color("labelColor"), 0.1), "setFill", .{});
-        const inner = NSRect{ .x = 4, .y = 0, .w = bounds.w - 8, .h = bounds.h };
-        msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithRoundedRect:xRadius:yRadius:", .{ inner, @as(f64, 5), @as(f64, 5) }), "fill", .{});
+        msg(void, objc.color("controlAccentColor"), "setFill", .{});
+        const inner = NSRect{ .x = 5, .y = 0, .w = bounds.w - 10, .h = bounds.h };
+        msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithRoundedRect:xRadius:yRadius:", .{ inner, @as(f64, 4), @as(f64, 4) }), "fill", .{});
     }
-    const ink = objc.color("labelColor");
+    const ink = objc.color(if (r.hover) "selectedMenuItemTextColor" else "labelColor");
     if (r.checked) {
         if (objc.symbolImage("checkmark", ink)) |img| msg(void, img, "drawInRect:", .{NSRect{ .x = 12, .y = (bounds.h - 11) / 2, .w = 11, .h = 11 }});
     }
     const text = objc.nsString(&r.label);
     const attrs = textAttrs(ink);
     const th = msg(objc.NSSize, text, "sizeWithAttributes:", .{attrs}).height;
-    const room = bounds.w - 30 - (if (r.removable) x_size + 12 else 8);
-    msg(void, text, "drawInRect:withAttributes:", .{ NSRect{ .x = 30, .y = (bounds.h - th) / 2, .w = room, .h = th }, textAttrs(ink) });
+    const room = bounds.w - 30 - 8 - trailing(r.removable);
+    msg(void, text, "drawInRect:withAttributes:", .{ NSRect{ .x = 30, .y = (bounds.h - th) / 2, .w = room, .h = th }, attrs });
+    if (r.removable) return;
+    const tag_attrs = attrsOf(tag_size, if (r.hover) objc.withAlpha(ink, 0.8) else objc.color("secondaryLabelColor"));
+    const tw = tagWidth();
+    const tag_h = msg(objc.NSSize, objc.nsString(tag), "sizeWithAttributes:", .{tag_attrs}).height;
+    msg(void, objc.nsString(tag), "drawAtPoint:withAttributes:", .{ objc.NSPoint{ .x = bounds.w - 14 - tw, .y = (bounds.h - tag_h) / 2 }, tag_attrs });
 }
 
 fn xDrawRect(self: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     const r = stateOf(self) orelse return;
     const bounds = msg(NSRect, self, "bounds", .{});
-    msg(void, objc.withAlpha(objc.color("labelColor"), if (r.x_hover) 0.28 else 0.14), "setFill", .{});
+    // It shows only on the highlighted row, so it is drawn in the highlight's text colour.
+    const ink = objc.color("selectedMenuItemTextColor");
+    msg(void, objc.withAlpha(ink, if (r.x_hover) 0.42 else 0.22), "setFill", .{});
     msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithOvalInRect:", .{bounds}), "fill", .{});
-    if (objc.symbolImage("xmark", objc.color("labelColor"))) |img| msg(void, img, "drawInRect:", .{NSRect{ .x = 4.5, .y = 4.5, .w = 7, .h = 7 }});
+    if (objc.symbolImage("xmark", ink)) |img| msg(void, img, "drawInRect:", .{NSRect{ .x = 4.5, .y = 4.5, .w = 7, .h = 7 }});
 }
 
 fn showX(r: *State) void {
@@ -210,7 +245,7 @@ pub fn renderPng(list: []const Row, path: [*:0]const u8, dark: bool, hover: ?usi
     defer opaque_bg = false;
     reset();
     var w: f64 = min_width;
-    for (list) |r| w = @max(w, widthFor(r.label));
+    for (list) |r| w = @max(w, widthFor(r.label, r.removable));
     const total = height * @as(f64, @floatFromInt(list.len));
     const stack = msg(id, msg(id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = w, .h = total }});
     for (list, 0..) |r, i| {

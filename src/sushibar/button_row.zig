@@ -86,7 +86,8 @@ fn fill(b: *const Btn) id {
         const shade: f64 = if (b.pressed) 0.28 else if (b.hover) 0.14 else 0;
         return if (shade == 0) accent else msg(id, accent, "blendedColorWithFraction:ofColor:", .{ shade, color("blackColor") });
     }
-    const a: f64 = if (!b.enabled) 0.04 else if (b.pressed) 0.24 else if (b.hover) 0.15 else 0.07;
+    // A disabled button keeps its shape: it shows an answer (Up to date) or a wait (Checking…), not an absence.
+    const a: f64 = if (!b.enabled) 0.06 else if (b.pressed) 0.24 else if (b.hover) 0.15 else 0.07;
     return alpha(color("labelColor"), a);
 }
 
@@ -135,12 +136,14 @@ fn redraw(b: *const Btn) void {
 fn mouseEntered(self: id, _: objc.SEL, _: id) callconv(.c) void {
     const b = btnOf(self) orelse return;
     b.hover = true;
+    objc.fadeNext(self, 0.12);
     redraw(b);
 }
 
 fn mouseExited(self: id, _: objc.SEL, _: id) callconv(.c) void {
     const b = btnOf(self) orelse return;
     b.hover = false;
+    objc.fadeNext(self, 0.2);
     redraw(b);
 }
 
@@ -217,6 +220,7 @@ fn set(i: usize, look: Look) void {
     b.spinner = look.spinner;
     placeWheel(b);
     msg(void, b.view, "setToolTip:", .{objc.nsString(&b.tip)});
+    objc.fadeNext(b.view, 0.18);
     redraw(b);
 }
 

@@ -1,4 +1,4 @@
-//! The "Port" field at the bottom of the Port submenu: a label, a text field and a Watch button in one custom
+//! The "Port" field at the bottom of the Port submenu: a label, a text field and a Switch button in one custom
 //! menu-item view. Parsing and the wording live in `sushibar_logic.zig`; applying a port is the app's (the
 //! `target`'s `applyPort:`). Single instance: its controls are module-level.
 const std = @import("std");
@@ -50,7 +50,7 @@ fn acceptsFirstResponder(_: id, _: objc.SEL) callconv(.c) bool {
     return true;
 }
 
-/// `target` receives `applyPort:` when Return is pressed in the field or Watch is clicked, and
+/// `target` receives `applyPort:` when Return is pressed in the field or Switch is clicked, and
 /// `controlTextDidChange:` as the user types.
 pub fn create(target: id) id {
     const cls = objc.defineSubclass("NSView", "SushiBarPortField", &.{
@@ -70,7 +70,7 @@ pub fn create(target: id) id {
     msg(void, view, "addSubview:", .{field});
 
     const button = msg(id, msg(id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 134, .y = 23, .w = 70, .h = 26 }});
-    msg(void, button, "setTitle:", .{objc.nsString("Watch")});
+    msg(void, button, "setTitle:", .{objc.nsString("Switch")});
     msg(void, button, "setBezelStyle:", .{@as(isize, 1)});
     msg(void, button, "setControlSize:", .{@as(isize, 1)});
     msg(void, button, "setFont:", .{systemFont(12, false)});

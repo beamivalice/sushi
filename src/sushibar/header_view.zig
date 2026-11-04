@@ -153,17 +153,35 @@ fn fillRound(r: NSRect, radius: f64, c: id) void {
     msg(void, path, "fill", .{});
 }
 
+/// A dotted hairline along the bottom from `x0` to `x1`: the time the server was down or idle between two runs.
+fn dottedBase(x0: f64, x1: f64, y: f64) void {
+    if (x1 - x0 < 4) return;
+    const line = msg(id, objc.class("NSBezierPath"), "bezierPath", .{});
+    msg(void, line, "moveToPoint:", .{NSPoint{ .x = x0 + 2, .y = y }});
+    msg(void, line, "lineToPoint:", .{NSPoint{ .x = x1 - 2, .y = y }});
+    var dash = [_]f64{ 1.5, 3 };
+    msg(void, line, "setLineDash:count:phase:", .{ @as([*]f64, &dash), @as(isize, 2), @as(f64, 0) });
+    msg(void, line, "setLineWidth:", .{@as(f64, 1)});
+    msg(void, line, "setLineCapStyle:", .{@as(isize, 1)});
+    msg(void, color("tertiaryLabelColor"), "setStroke", .{});
+    msg(void, line, "stroke", .{});
+}
+
 fn drawSpark(accent: id, dy: f64) void {
     var raw: [160]logic.PlotPoint = undefined;
     const pts = logic.plotSpark(&raw, shown.spark[0..shown.spark_n], pad, width - 2 * pad, spark_y + dy + 4, spark_y + dy + spark_h - 2);
     if (pts.len < 2) return;
     const bottom = spark_y + dy + spark_h - 2;
     msg(void, objc.class("NSBezierPath"), "clipRect:", .{NSRect{ .x = pad, .y = spark_y + dy, .w = width - 2 * pad, .h = spark_h }});
-    const fill_color = msg(id, accent, "colorWithAlphaComponent:", .{@as(f64, 0.12)});
+    // The area fades from the line down to nothing, so a run's ends read as the run, not as walls.
+    const gradient = msg(id, msg(id, objc.class("NSGradient"), "alloc", .{}), "initWithStartingColor:endingColor:", .{ objc.withAlpha(accent, 0.24), objc.withAlpha(accent, 0.0) });
+    defer objc.release(gradient);
     var s: usize = 0;
     while (s < pts.len) {
         var e = s + 1;
         while (e < pts.len and !pts[e].gap) e += 1;
+        if (s > 0) dottedBase(pts[s - 1].x, pts[s].x, bottom);
+        if (e - s == 1) fillRound(.{ .x = pts[s].x - 1.25, .y = pts[s].y - 1.25, .w = 2.5, .h = 2.5 }, 1.25, accent);
         if (e - s >= 2) {
             const line = msg(id, objc.class("NSBezierPath"), "bezierPath", .{});
             const area = msg(id, objc.class("NSBezierPath"), "bezierPath", .{});
@@ -178,8 +196,7 @@ fn drawSpark(accent: id, dy: f64) void {
             }
             msg(void, area, "lineToPoint:", .{NSPoint{ .x = pts[e - 1].x, .y = bottom }});
             msg(void, area, "closePath", .{});
-            msg(void, fill_color, "setFill", .{});
-            msg(void, area, "fill", .{});
+            msg(void, gradient, "drawInBezierPath:angle:", .{ area, @as(f64, 90) });
             msg(void, line, "setLineWidth:", .{@as(f64, 1.5)});
             msg(void, line, "setLineJoinStyle:", .{@as(isize, 1)});
             msg(void, line, "setLineCapStyle:", .{@as(isize, 1)});
@@ -188,6 +205,8 @@ fn drawSpark(accent: id, dy: f64) void {
         }
         s = e;
     }
+    // From the newest point to now: no history came in since (an idle or stopped server).
+    dottedBase(pts[pts.len - 1].x, pad + width - 2 * pad, bottom);
 }
 
 fn shownHeight() f64 {
@@ -300,7 +319,26 @@ pub fn create(color_icon: id, outline_icon: id, click_target: id, top_menu: id) 
     return view;
 }
 
-/// Copies `h` and the sparkline in and redraws; the view keeps no pointer into the caller's memory.
+/// What the card draws, to skip a redraw that would change nothing.
+fn signature() u64 {
+    var w = std.hash.Wyhash.init(0);
+    for ([_][]const u8{ shown.version.get(), shown.version_tail.get(), shown.pill_label.get(), shown.line1.get(), shown.pack_line.get(), shown.line2.get(), shown.caption.get() }) |part| {
+        w.update(part);
+        w.update("\x00");
+    }
+    for (shown.values, shown.labels) |v, l| {
+        w.update(v.get());
+        w.update(l.get());
+    }
+    w.update(std.mem.asBytes(&.{ @intFromEnum(shown.pill_tone), @intFromBool(shown.show_stats), @intFromBool(shown.line1_link) }));
+    for (shown.spark[0..shown.spark_n]) |pt| w.update(std.mem.asBytes(&[_]u32{ @bitCast(pt.x), @bitCast(pt.v), @intFromBool(pt.gap) }));
+    return w.final();
+}
+
+var shown_sig: ?u64 = null;
+
+/// Copies `h` and the sparkline in and, when something changed, redraws with a short cross-fade; the view keeps no
+/// pointer into the caller's memory.
 pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
     shown.version.set(h.version[0 .. h.version.len - h.version_tail.len]);
     shown.version_tail.set(h.version_tail);
@@ -321,10 +359,15 @@ pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
     shown.caption.set(logic.sparkCaption(&cap, spark, spark_window_ms));
 
     if (shown_color != h.color_icon) {
+        if (shown_color != null) objc.fadeNext(view, 0.2);
         shown_color = h.color_icon;
         msg(void, image_view, "setImage:", .{if (h.color_icon) icon_color else icon_outline});
         msg(void, image_view, "setContentTintColor:", .{if (h.color_icon) @as(id, null) else color("labelColor")});
     }
+    const sig = signature();
+    if (shown_sig == sig) return;
+    if (shown_sig != null) objc.fadeNext(view, 0.2);
+    shown_sig = sig;
     const want_h = shownHeight();
     msg(void, view, "setFrameSize:", .{objc.NSSize{ .width = width, .height = want_h }});
     msg(void, view, "setAccessibilityLabel:", .{str(h.a11y)});

@@ -96,6 +96,24 @@ pub fn loadSvg(svg: []const u8, template: bool, w: f64, h: f64) id {
     return image;
 }
 
+/// The user asked the system for less motion (Accessibility > Display > Reduce motion).
+pub fn reduceMotion() bool {
+    return msg(bool, msg(id, class("NSWorkspace"), "sharedWorkspace", .{}), "accessibilityDisplayShouldReduceMotion", .{});
+}
+
+/// The next change `view` draws, its subviews' included, cross-fades in over `seconds` instead of snapping; nothing
+/// under Reduce motion. Core Animation, which AppKit already loads.
+pub fn fadeNext(view: id, seconds: f64) void {
+    if (view == null or reduceMotion()) return;
+    msg(void, view, "setWantsLayer:", .{true});
+    const layer = msg(id, view, "layer", .{});
+    if (layer == null) return;
+    const t = msg(id, class("CATransition"), "animation", .{});
+    msg(void, t, "setDuration:", .{seconds});
+    msg(void, t, "setTimingFunction:", .{msg(id, class("CAMediaTimingFunction"), "functionWithName:", .{nsString("easeInEaseOut")})});
+    msg(void, layer, "addAnimation:forKey:", .{ t, nsString("fade") });
+}
+
 pub fn color(name: [*:0]const u8) id {
     return msg(id, class("NSColor"), name, .{});
 }
