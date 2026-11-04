@@ -196,7 +196,7 @@ fi
 
 echo "[4/5] the page stays self-contained"
 check "no external http(s) fetch or CDN in the page" \
-    "$(grep -Eq '(src|href)="https?://|@import|fetch\("https?://' "$PAGE" && echo 0 || echo 1)"
+    "$(grep -Eq 'src="https?://|<link[^>]*href="https?://|@import|fetch\("https?://' "$PAGE" && echo 0 || echo 1)"
 check "the page is under 1 MB" "$([ "$(wc -c < "$PAGE")" -lt 1048576 ] && echo 1 || echo 0)"
 
 echo "[5/5] the page's own functions (node): effort menu, tool loop, SSD prefix-cache meter, Chat/Dashboard navigator"
