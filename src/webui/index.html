@@ -765,8 +765,8 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <section class="card adv feed">
     <h2>Sessions<span class="legend"><span><i style="background:var(--c2)"></i>restored from cache</span><span><i style="background:var(--c1)"></i>new this request</span></span></h2>
     <div class="tablewrap"><table class="tbl sessions">
-      <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"></colgroup>
-      <thead><tr><th>ID</th><th>Model</th><th>Phase</th><th>Context</th><th></th><th>Cached</th><th>Generated</th><th>Elapsed</th><th>Rate</th><th>State</th></tr></thead>
+      <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"><col style="width:72px"></colgroup>
+      <thead><tr><th>ID</th><th>Model</th><th>Phase</th><th>Context</th><th></th><th>Cached</th><th>Generated</th><th>Elapsed</th><th>Rate</th><th>State</th><th></th></tr></thead>
       <tbody id="dashSessions"></tbody>
     </table></div>
   </section>
@@ -4210,7 +4210,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const exp = g.prefill_tokens_expected || 0, done = Math.min(g.prefill_tokens_live || 0, exp);
     const prefillDone = prefilling === 1 && exp > 0 ? 100 * done / exp : null;
     const tb = $('sessions');
-    if (!rows.length) { setHtml(tb, '<tr><td colspan="10" class="empty">No live requests or cached conversations.</td></tr>'); lastGen.clear(); refreshPhaseTip(); return; }
+    if (!rows.length) { setHtml(tb, '<tr><td colspan="11" class="empty">No live requests or cached conversations.</td></tr>'); lastGen.clear(); refreshPhaseTip(); return; }
     const seen = new Set();
     setHtml(tb, rows.map(s => {
       const len = s.context_length || 0, ctx = s.context_tokens || 0;
@@ -4223,6 +4223,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         lastGen.set(s.request_id, { gen: s.generated_tokens, t: now });
       }
       const genTxt = s.phase === 'cached' ? '' : fmtInt(s.generated_tokens) + (s.max_tokens ? ` / ${fmtInt(s.max_tokens)}` : '');
+      const canCancel = (s.phase === 'prefill' || s.phase === 'decode') && s.request_id;
+      const cancelBtn = canCancel
+        ? `<button class="btn sm danger" style="height:22px;padding:0 8px;font-size:11px" onclick="cancelSlot(this, ${esc(s.request_id)})" title="Cancel this in-flight request">Cancel</button>`
+        : '';
       return `<tr>
         <td class="rid"${s.request_id ? ` title="Request ${esc(s.request_id)}"` : ''}>${esc(s.request_id || '')}</td>
         <td title="${esc(s.model)}">${esc(String(s.model).split('/').pop())}</td>
@@ -4233,11 +4237,40 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         <td>${genTxt}</td>
         <td>${s.phase === 'cached' ? '' : secs(s.elapsed_seconds)}</td>
         <td>${rate}</td>
-        <td>${bytes(s.state_bytes || 0)}</td></tr>`;
+        <td>${bytes(s.state_bytes || 0)}</td>
+        <td style="text-align:right">${cancelBtn}</td></tr>`;
     }).join(''));
     for (const id of lastGen.keys()) if (!seen.has(id)) lastGen.delete(id);
     refreshPhaseTip();
   }
+
+  async function cancelSlot(btn, id) {
+    if (!id || btn.disabled) return;
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = 'Stopping…';
+    try {
+      const res = await fetch('/v1/slots/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: Number(id) }),
+      });
+      if (res.ok) {
+        btn.textContent = 'Cancelled';
+        setTimeout(() => pollSoon(), 100);
+      } else {
+        const text = await res.text();
+        console.warn('Failed to cancel slot:', text);
+        btn.textContent = 'Failed';
+        setTimeout(() => { btn.disabled = false; btn.textContent = old; }, 2000);
+      }
+    } catch (e) {
+      console.warn('Cancel slot error:', e);
+      btn.textContent = 'Error';
+      setTimeout(() => { btn.disabled = false; btn.textContent = old; }, 2000);
+    }
+  }
+  window.cancelSlot = cancelSlot;
 
   const ago = ms => { const s = Math.max(0, Math.round(ms / 1000)); return s < 5 ? 'just now' : s < 60 ? s + ' s ago' : s < 3600 ? Math.floor(s / 60) + ' min ago' : Math.floor(s / 3600) + ' h ago'; };
   const upFor = ms => { const m = Math.floor(ms / 60000), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`; };

@@ -425,6 +425,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/settings",
+    "/v1/slots/cancel",
     "/v1/tools",
     "/v1/unload-model",
     "/v1/update",
@@ -439,7 +440,8 @@ pub fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const
         std.mem.eql(u8, path, "/v1/load-model") or std.mem.eql(u8, path, "/v1/unload-model") or
             std.mem.eql(u8, path, "/v1/models/rescan") or std.mem.eql(u8, path, "/v1/prefix-cache/clear") or
             std.mem.eql(u8, path, "/v1/prefix-cache") or std.mem.eql(u8, path, "/v1/settings") or std.mem.eql(u8, path, "/metrics/enable") or
-            std.mem.eql(u8, path, "/v1/downloads") or std.mem.eql(u8, path, "/v1/downloads/cancel");
+            std.mem.eql(u8, path, "/v1/downloads") or std.mem.eql(u8, path, "/v1/downloads/cancel") or
+            std.mem.eql(u8, path, "/v1/slots/cancel");
     if (!guarded) return false;
     const origin = findHeaderValueCI(headers, "origin") orelse return false;
     return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
@@ -1712,6 +1714,8 @@ test "cross-origin policy: a foreign Origin is refused on the state-changing rou
         .{ .method = "GET", .path = "/v1/downloads", .headers = "Origin: http://evil.test\r\n", .refused = true },
         .{ .method = "POST", .path = "/v1/downloads", .headers = "Origin: http://evil.test\r\n", .refused = true },
         .{ .method = "POST", .path = "/v1/downloads/cancel", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/slots/cancel", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/slots/cancel", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/downloads", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
@@ -1740,6 +1744,7 @@ test "cross-origin policy: the routes answer 403 over the wire before any model 
     for ([_]Case{
         .{ .request = "POST /v1/load-model HTTP/1.1\r\nOrigin: http://evil.test\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 403 " },
         .{ .request = "POST /v1/unload-model HTTP/1.1\r\nOrigin: http://evil.test\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 403 " },
+        .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nOrigin: http://evil.test\r\nContent-Length: 10\r\n\r\n{\"id\":123}", .status = "HTTP/1.1 403 " },
         .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nOrigin: http://evil.test\r\n\r\n", .status = "HTTP/1.1 403 " },
         .{ .request = "GET /v1/responses HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nOrigin: http://evil.test\r\n\r\n", .status = "HTTP/1.1 403 " },
         .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
@@ -1762,6 +1767,21 @@ test "downloads: the routes refuse a bad request by name before any model resolv
         .{ .request = "POST /v1/downloads HTTP/1.1\r\nContent-Length: 30\r\n\r\n{\"repo\":\"beamster/Not-A-Pack\"}", .status = "HTTP/1.1 404 ", .says = "published Sushi pack" },
         .{ .request = "DELETE /v1/downloads HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "GET" },
         .{ .request = "GET /v1/downloads/cancel HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "POST" },
+    }) |c| {
+        const response = try serveOneForTest(c.request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, c.status));
+        try t.expect(std.mem.indexOf(u8, responseBody(response), c.says) != null);
+    }
+}
+
+test "slots: cancel route validates request and method" {
+    const t = std.testing;
+    const Case = struct { request: []const u8, status: []const u8, says: []const u8 };
+    for ([_]Case{
+        .{ .request = "GET /v1/slots/cancel HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "Use POST to cancel an in-flight slot" },
+        .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 400 ", .says = "Send {\"id\": <request_id>}" },
+        .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nContent-Length: 12\r\n\r\n{\"id\":\"bad\"}", .status = "HTTP/1.1 400 ", .says = "Send {\"id\": <request_id>}" },
     }) |c| {
         const response = try serveOneForTest(c.request);
         defer t.allocator.free(response);
