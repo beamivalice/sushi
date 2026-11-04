@@ -693,7 +693,7 @@ test "a submit that fails before its slot exists hands the vision array to the i
             sch.shutdown = .init(false);
             sch.queue_cap = 2;
             sch.in_flight = 0;
-            sch.req_seq = 0;
+            sch.req_seq = 1;
             sch.pending = .empty;
             sch.cleanup_queue = .empty;
             sch.prefilling = .empty;

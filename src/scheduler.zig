@@ -1095,8 +1095,9 @@ pub const Scheduler = struct {
     /// A DeepSeek live record holds restore points not yet on SSD: the idle park flushes them (`flushLiveStates`).
     live_unflushed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Submit sequence the session rows carry as `request_id`: taken under
-    /// `queue_mu` in `submit`, immutable on the slot, never reused.
-    req_seq: u64 = 0,
+    /// `queue_mu` in `submit`, immutable on the slot, never reused. 0 is
+    /// reserved for cached/idle sessions.
+    req_seq: u64 = 1,
     /// Every ready model's hot-cache entries for `/metrics.json`, under `digest_mu`.
     cached_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
     cached_session_count: usize = 0,
@@ -5586,7 +5587,7 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.shutdown = .init(false);
     sch.queue_cap = queue_cap;
     sch.in_flight = 0;
-    sch.req_seq = 0;
+    sch.req_seq = 1;
     sch.pending = .empty;
     sch.decoding = .empty;
     sch.cleanup_queue = .empty;
