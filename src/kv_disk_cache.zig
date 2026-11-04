@@ -5728,6 +5728,7 @@ test "DiskTier row-segment share: an heir links the donor's whole segments insid
         const donor_id = tier.entries.items[0].id;
         try testing.expectEqual(@as(usize, 2), tier.entryCount());
         const heir = &tier.entries.items[1];
+        const heir_id = heir.id;
         try testing.expectEqual(@as(u32, 3), heir.inherited_grown);
         try testing.expectEqual(@as(usize, 4), heir.grown.len);
         for (1..4) |j| {
@@ -5746,7 +5747,7 @@ test "DiskTier row-segment share: an heir links the donor's whole segments insid
         // Evicting the donor frees none of the linked segments, and the heir restores from them.
         tier.removeAt(0);
         const kept = &tier.entries.items[0];
-        try testing.expectEqual(heir.id, kept.id);
+        try testing.expectEqual(heir_id, kept.id);
         for (1..4) |j| try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(growSegStat(io, &tier, kept.id, j).?.nlink)));
         for (kept.ssm_positions) |p| try expectGrowPoint(&tier, kept.id, p, s);
         try testing.expectEqual(try uniqueDirBytes(io, &tier), tier.total_bytes);
