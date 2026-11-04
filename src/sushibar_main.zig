@@ -11,6 +11,7 @@ const header_view = @import("sushibar/header_view.zig");
 const port_field = @import("sushibar/port_field.zig");
 const button_row = @import("sushibar/button_row.zig");
 const log_view = @import("sushibar/log_view.zig");
+const port_row = @import("sushibar/port_row.zig");
 
 const usage =
     \\usage: sushibar [--port <n>]
@@ -20,7 +21,8 @@ const usage =
     \\It detaches from the terminal.
     \\
     \\  --port <n>   Port of the server to watch and start (default: the port last chosen
-    \\               in the menu, else {d})
+    \\               in the menu, else the default port: `server.port` in
+    \\               ~/.sushi/model-settings.json, else {d})
     \\  --help       This text
     \\
 ;
@@ -68,7 +70,7 @@ fn Str(comptime N: usize) type {
 
 // ── Test seams: SUSHIBAR_TEST_POLLS, SUSHIBAR_TEST_ACTIONS (docs/envvar.md) ──
 
-const ActionKind = enum { start, stop, confirm, check, update, port, typed, models };
+const ActionKind = enum { start, stop, confirm, check, update, port, typed, models, remove };
 const Action = struct { kind: ActionKind, at: u32, value: u32 = 0 };
 var test_polls: u32 = 0;
 var test_actions: [12]Action = undefined;
@@ -89,6 +91,9 @@ fn readTestSeams() void {
         } else if (std.mem.startsWith(u8, word, "port")) {
             act.kind = .port;
             act.value = std.fmt.parseInt(u16, word[4..], 10) catch continue;
+        } else if (std.mem.startsWith(u8, word, "remove")) {
+            act.kind = .remove;
+            act.value = std.fmt.parseInt(u16, word[6..], 10) catch continue;
         } else if (std.mem.startsWith(u8, word, "type")) {
             act.kind = .typed;
             act.value = std.fmt.parseInt(u32, word[4..], 10) catch continue;
@@ -151,6 +156,10 @@ const Shared = struct {
 var shared: Shared = .{};
 var g_io: std.Io = undefined;
 var g_port = std.atomic.Value(u16).init(logic.default_port);
+/// The port the menu lists first and never lets go: `server.port` of the settings file, re-read as the menu opens.
+var g_default_port: u16 = logic.default_port;
+/// The ports the user added; the menu and the Port field are the main thread's.
+var g_saved: logic.SavedPorts = .{};
 var g_home: []const u8 = "/tmp";
 var g_sushi_found = false;
 var g_sibling_brew = false;
@@ -713,14 +722,24 @@ fn pollLoop() void {
 // ── Port ──
 
 fn writeSaved(p: u16) void {
-    var text: [48]u8 = undefined;
+    var text: [192]u8 = undefined;
     std.Io.Dir.cwd().createDirPath(g_io, std.fs.path.dirname(g_saved_path) orelse ".") catch {};
-    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p) }) catch {};
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items()) }) catch {};
+}
+
+fn readDefaultPort() u16 {
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/.sushi/model-settings.json", .{g_home}) catch return logic.default_port;
+    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, arena_state.allocator(), .limited(1 << 20)) catch return logic.default_port;
+    return logic.defaultPortOf(arena_state.allocator(), text);
 }
 
 fn setPort(p: u16) void {
     if (p == port()) return;
     g_port.store(p, .release);
+    g_saved.add(p, g_default_port);
     writeSaved(p);
     lock();
     shared.view = .{ .link = .offline };
@@ -730,6 +749,15 @@ fn setPort(p: u16) void {
     shared.props_available = false;
     shared.props_command.set("");
     unlock();
+}
+
+/// Forgets an added port; the watch moves to the default port when it was on it. A sushi still listening there
+/// stays in the menu as a listener, and the server is never touched.
+fn removePort(p: u16) void {
+    if (p == g_default_port) return;
+    g_saved.remove(p);
+    const to = logic.afterRemove(port(), p, g_default_port);
+    if (to != port()) setPort(to) else writeSaved(port());
 }
 
 // ── Start and Stop ──
@@ -881,7 +909,7 @@ var last_title: [128]u8 = undefined;
 var shown_title: [128]u8 = undefined;
 var shown_title_len: usize = std.math.maxInt(usize);
 var shown_dim = false;
-var port_sig: [1024]u8 = undefined;
+var port_sig: [1536]u8 = undefined;
 var port_sig_len: usize = std.math.maxInt(usize);
 
 fn setText(setter_target: objc.id, selector: [*:0]const u8, text: []const u8) void {
@@ -943,26 +971,33 @@ fn addSeparator(menu: objc.id) void {
 
 /// Rebuilds the Port submenu only when its entries changed, so an open menu is not disturbed.
 fn syncPortMenu(entries: []const logic.PortEntry) void {
-    var sig: [1024]u8 = undefined;
+    var sig: [1536]u8 = undefined;
     var n: usize = 0;
     var lb: [96]u8 = undefined;
     for (entries) |e| {
         const l = logic.portLabel(&lb, e);
-        const piece = std.fmt.bufPrint(sig[n..], "{s}{d}\n", .{ l, @intFromBool(e.checked) }) catch break;
+        const piece = std.fmt.bufPrint(sig[n..], "{s}{d}{d}\n", .{ l, @intFromBool(e.checked), @intFromBool(e.removable) }) catch break;
         n += piece.len;
     }
     if (n == port_sig_len and std.mem.eql(u8, sig[0..n], port_sig[0..n])) return;
     port_sig_len = n;
     @memcpy(port_sig[0..n], sig[0..n]);
     // The submenu ends with a separator and the port field, which stay; only the entries above them change.
+    port_row.reset();
     while (objc.msg(isize, port_menu, "numberOfItems", .{}) > 2) objc.msg(void, port_menu, "removeItemAtIndex:", .{@as(isize, 0)});
+    var width: f64 = port_row.min_width;
+    for (entries) |e| width = @max(width, port_row.widthFor(logic.portLabel(&lb, e)));
     for (entries, 0..) |e, i| {
         var z: [112:0]u8 = undefined;
         const label = logic.portLabel(&lb, e);
         const lz = std.fmt.bufPrintSentinel(&z, "{s}", .{label}, 0) catch continue;
         const mi = newItem(lz.ptr, "pickPort:", e.port, "", null);
         defer objc.release(mi);
-        if (e.checked) objc.msg(void, mi, "setState:", .{@as(isize, 1)});
+        const view = port_row.create(menu_target, top_menu, .{ .port = e.port, .label = label, .checked = e.checked, .removable = e.removable }, width);
+        if (view) |v| {
+            objc.msg(void, mi, "setView:", .{v});
+            objc.release(v);
+        } else if (e.checked) objc.msg(void, mi, "setState:", .{@as(isize, 1)});
         objc.msg(void, port_menu, "insertItem:atIndex:", .{ mi, @as(isize, @intCast(i)) });
     }
 }
@@ -984,6 +1019,7 @@ fn runAction(act: Action) void {
             unlock();
         },
         .port => setPort(@intCast(act.value)),
+        .remove => removePort(@intCast(act.value)),
         .typed => {
             var z: [16:0]u8 = undefined;
             const t = std.fmt.bufPrintSentinel(&z, "{d}", .{act.value}, 0) catch return;
@@ -1148,8 +1184,8 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     setText(port_mi, "setTitle:", std.fmt.bufPrint(&lab, "Port {d}", .{p}) catch "Port");
     for (open_mis) |mi| objc.msg(void, mi, "setEnabled:", .{logic.openEnabled(view.link)});
 
-    var entries: [max_listings + 1]logic.PortEntry = undefined;
-    const port_entries = logic.portEntries(&entries, p, listings[0..ln]);
+    var entries: [max_listings + logic.max_saved + 2]logic.PortEntry = undefined;
+    const port_entries = logic.portEntries(&entries, p, g_default_port, g_saved.items(), listings[0..ln]);
     syncPortMenu(port_entries);
 
     var cb: [128]u8 = undefined;
@@ -1183,15 +1219,21 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
             const piece = std.fmt.bufPrint(ports_buf[pn..], "{s}{s};", .{ logic.portLabel(&lab, e), if (e.checked) "*" else "" }) catch break;
             pn += piece.len;
         }
+        var removable_buf: [128]u8 = undefined;
+        var rn: usize = 0;
+        for (port_entries) |e| if (e.removable) {
+            const piece = std.fmt.bufPrint(removable_buf[rn..], "{d},", .{e.port}) catch break;
+            rn += piece.len;
+        };
         const shown_update = if (uv.available and uv.path == .brew) copy_label else if (uv.available) update_label else "";
         const shown_check = if (uv.available) "" else check;
-        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" note=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\"\n", .{
+        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" note=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" removable=\"{s}\"\n", .{
             tick_count,                 title,                 status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
             @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         shown_check,
             shown_update,               note_shown,            header.pill.label,     header.line1,           header.line2,
             tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_copy,
-            update_button.label,
+            update_button.label,        removable_buf[0..rn],
         });
         if (tick_count >= test_polls) quit();
     }
@@ -1273,8 +1315,16 @@ fn copyPackAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     if (n > 0) objc.copyText(@ptrCast(&cmd));
 }
 
-fn menuWillOpen(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    refreshModels(null);
+fn pickRowAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
+    if (port_row.portOf(sender)) |p| setPort(p);
+}
+fn removeRowAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
+    if (port_row.portOf(sender)) |p| removePort(p);
+}
+
+/// The top menu re-reads the default port; the Port submenu asks its listeners for their models.
+fn menuWillOpen(_: objc.id, _: objc.SEL, opening: objc.id) callconv(.c) void {
+    if (opening == top_menu) g_default_port = readDefaultPort() else refreshModels(null);
 }
 
 /// The watched port's log: what its server's argv said, or the default file while that is not known yet.
@@ -1324,6 +1374,8 @@ fn runMenuBar() noreturn {
         .{ .selector = "toggle:", .imp = @ptrCast(&toggleAction), .types = "v@:@" },
         .{ .selector = "quit:", .imp = @ptrCast(&quitAction), .types = "v@:@" },
         .{ .selector = "pickPort:", .imp = @ptrCast(&pickPortAction), .types = "v@:@" },
+        .{ .selector = "pickRow:", .imp = @ptrCast(&pickRowAction), .types = "v@:@" },
+        .{ .selector = "removeRow:", .imp = @ptrCast(&removeRowAction), .types = "v@:@" },
         .{ .selector = "applyPort:", .imp = @ptrCast(&applyPortAction), .types = "v@:@" },
         .{ .selector = "controlTextDidChange:", .imp = @ptrCast(&textChangedAction), .types = "v@:@" },
         .{ .selector = "updateButton:", .imp = @ptrCast(&updateButtonAction), .types = "v@:@" },
@@ -1336,6 +1388,7 @@ fn runMenuBar() noreturn {
     menu_target = objc.new(cls);
     const menu = objc.new(objc.class("NSMenu"));
     top_menu = menu;
+    objc.msg(void, menu, "setDelegate:", .{menu_target});
     objc.msg(void, menu, "setAutoenablesItems:", .{false});
 
     header_mi = objc.new(objc.class("NSMenuItem"));
@@ -1488,6 +1541,7 @@ fn renderButtonsAndLog(dir: []const u8) void {
             if (!button_row.renderPng(row, pz.ptr, dark, c.hover, c.pressed)) std.debug.print("sushibar: could not render {s}\n", .{pz});
         }
     }
+    renderPortRows(dir);
     const sample =
         \\2026-11-04 09:12:01 [info] Logging to /Users/me/.sushi/logs/sushi-11250.log (rotates at 100 MB)
         \\2026-11-04 09:12:02 [info] sushi 1.5.0 serving on http://127.0.0.1:11250
@@ -1514,6 +1568,24 @@ fn renderButtonsAndLog(dir: []const u8) void {
         if (!log_view.renderPng(pz.ptr, false, .{ .port = 11250, .src = .{ .kind = .standard, .path = std_path }, .sample = notice })) std.debug.print("sushibar: could not render {s}\n", .{pz});
     } else |_| {}
     renderFollowedLog(dir);
+}
+
+/// The Port submenu's rows: the default (not removable), an added port, a listener nobody added.
+fn renderPortRows(dir: []const u8) void {
+    const rows = [_]port_row.Row{
+        .{ .port = 12345, .label = "12345 — Example-Flash-Next-Sushi-STQ-2.75bpw", .checked = true, .removable = false },
+        .{ .port = 18803, .label = "18803 — not running", .checked = false, .removable = true },
+        .{ .port = 18802, .label = "18802 — Example-Flash-1017", .checked = false, .removable = true },
+        .{ .port = 7000, .label = "7000 — no model", .checked = false, .removable = false },
+    };
+    const Case = struct { name: []const u8, hover: ?usize = null, x_hover: bool = false };
+    for ([_]Case{ .{ .name = "normal" }, .{ .name = "hover-default", .hover = 0 }, .{ .name = "hover-added", .hover = 1 }, .{ .name = "hover-remove", .hover = 2, .x_hover = true } }) |c| {
+        for ([_]bool{ false, true }) |dark| {
+            var path: [std.fs.max_path_bytes:0]u8 = undefined;
+            const pz = std.fmt.bufPrintSentinel(&path, "{s}/portrows-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;
+            if (!port_row.renderPng(&rows, pz.ptr, dark, c.hover, c.x_hover)) std.debug.print("sushibar: could not render {s}\n", .{pz});
+        }
+    }
 }
 
 /// The window reading a real file: its last lines on open, then what the file grew by.
@@ -1621,8 +1693,11 @@ pub fn main(init: std.process.Init) !void {
     g_saved_path = try gpa.dupe(u8, proc.pidFilePath(&p3, g_home, saved_name) orelse fail("HOME is too long", .{}));
     readTestSeams();
 
+    g_default_port = readDefaultPort();
     const saved_text = std.Io.Dir.cwd().readFileAlloc(g_io, g_saved_path, gpa, .limited(4096)) catch "";
-    g_port.store(logic.choosePort(explicit, logic.parseSaved(saved_text)), .release);
+    const saved = logic.parseSaved(saved_text);
+    g_saved = saved.ports;
+    g_port.store(logic.choosePort(explicit, saved.port, g_default_port), .release);
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const self_exe = selfPath(&exe_buf) orelse fail("cannot resolve its own path", .{});

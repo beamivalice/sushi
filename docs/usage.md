@@ -15,8 +15,9 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` and it detaches from
 the terminal. The title is the live decode tok/s (dim for the last request's once idle). Its menu opens on a status
 card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph) and then starts or stops the server
-on the watched port (asking first for one it did not start), switches the port (pick a listening server or type a number in the field; the choice is remembered; `--port`
-wins, then sushi's default 12345), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
+on the watched port (asking first for one it did not start), switches the port (the default port first, then the ports you added by typing or picking one, then any other listening
+server; hover an added port and click its x to forget it; the choice is remembered; `--port` wins, then the default port,
+`server.port` in Settings, 12345 unless changed), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
 three buttons: Log (a window that follows the watched server's log live), Update (Check, or Update while a release
 waits; Homebrew installs get a Copy "brew upgrade sushi" item and the button copies it; a running sushibar never
 blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q).

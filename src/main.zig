@@ -165,7 +165,8 @@ fn printUsage(io: std.Io) void {
         \\  --serve             Start HTTP server mode
         \\  --host <ip>         Bind address (default: 127.0.0.1 — this Mac only;
         \\                      0.0.0.0 opens it to the local network)
-        \\  --port <n>          Bind port (default: 12345)
+        \\  --port <n>          Bind port (default: 12345, or `server.port` in
+        \\                        ~/.sushi/model-settings.json)
         \\  --ctx-size <n>      Maximum context length (default: model max)
         \\  --config-overrides <json>   JSON object deep-merged into EVERY
         \\                      model's config.json this process loads or
@@ -1016,7 +1017,10 @@ pub fn main(init: std.process.Init) !void {
         log.err("--prompt/-p cannot be combined with serve, --serve, --host, --port, or --tool on; it uses a private local listener and exits after one reply.\n", .{});
         return error.PromptModeConflict;
     }
-    const bind = server_mod.resolveBind(host_flag, if (prompt != null or bench_run != null) @as(u16, 0) else port_flag);
+    const bind = if (prompt != null or bench_run != null)
+        server_mod.resolveBind(host_flag, 0, server_mod.default_port)
+    else
+        server_mod.resolveBind(host_flag, port_flag, model_settings_mod.defaultPort(allocator, io));
     const host = bind.host;
     const port = bind.port;
 
@@ -1045,6 +1049,7 @@ pub fn main(init: std.process.Init) !void {
         .vision = if (vision) true else if (no_vision) false else null,
         .models_dir = models_root,
         .no_update_check = no_update_check,
+        .port = port_flag,
     });
     if (dflash_mod.drafter_min_depth) |lo| if (dflash_mod.drafter_max_depth) |hi| if (lo > hi) {
         log.err("--drafter-min-depth {d} is above --drafter-max-depth {d}\n", .{ lo, hi });
@@ -1846,7 +1851,7 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
-fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool }) void {
+fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, port: ?u16 = null }) void {
     const locks = &model_settings_mod.launch_locks;
     if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
@@ -1864,6 +1869,7 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
         locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_mod.prefix_cache_disk_bytes)});
     }
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
+    if (given.port) |p| locks.port.pin("{d}", .{p});
     if (given.no_update_check) {
         locks.update_check.pin("--no-update-check", .{});
         locks.pack_update_check.pin("--no-update-check", .{});
@@ -1929,6 +1935,16 @@ test "both boot modes build their server defaults from the same launch flags" {
     const none = unset.serverConfig();
     try std.testing.expectEqual(@as(?f32, null), none.default_temperature);
     try std.testing.expectEqual(@as(?u32, null), none.default_top_k);
+}
+
+test "launch flags: --port pins server.port as typed, and no flag leaves it free" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.port.set);
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .port = 8080 });
+    try std.testing.expectEqualStrings("8080", model_settings_mod.launch_locks.port.text());
 }
 
 test "launch flags: --no-update-check pins both automatic update checks, and no flag pins neither" {

@@ -4,6 +4,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
+const default_port = @import("default_port.zig");
 const model_registry_mod = @import("model_registry.zig");
 const disk_placement = @import("disk_placement.zig");
 const http_conn = @import("http_conn.zig");
@@ -168,6 +169,8 @@ fn writeLimits(w: *std.Io.Writer, fit: model_settings.Fit) !void {
     try w.writeAll("}");
 }
 
+const port_applies = "the next start; a running server keeps its port";
+
 /// A server-wide on/off key: the file's value, the pinning flag, and the default it falls back to.
 fn writeAutoCheck(w: *std.Io.Writer, name: []const u8, file: ?bool, lock: *const model_settings.Lock) !void {
     try w.print(",\"{s}\":{{\"file\":", .{name});
@@ -239,6 +242,14 @@ pub fn render(
     try w.writeAll("],\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}");
     try writeAutoCheck(w, "update_check", srv.update_check, &locks.update_check);
     try writeAutoCheck(w, "pack_update_check", srv.pack_update_check, &locks.pack_update_check);
+    const port_pinned = locks.port.set;
+    try w.writeAll(",\"port\":{\"file\":");
+    try writeJson(w, srv.port);
+    try w.writeAll(",\"flag\":");
+    if (port_pinned) try writeJson(w, locks.port.text()) else try w.writeAll("null");
+    try w.print(",\"default\":{d},\"source\":\"{s}\",\"locked\":{},\"applies\":\"{s}\"}}", .{
+        default_port.port, if (port_pinned) "flag" else if (srv.port != null) "file" else "default", port_pinned, port_applies,
+    });
     try w.writeAll("}");
 
     try w.writeAll(",\"models\":[");
@@ -545,6 +556,8 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             try writeJson(w, applyCacheBudget(sch, e.value));
         } else if (std.mem.eql(u8, e.key, "update_check") or std.mem.eql(u8, e.key, "pack_update_check")) {
             try writeJson(w, applyUpdateCheck(&model_settings.launch_locks, e.key, e.value));
+        } else if (std.mem.eql(u8, e.key, "port")) {
+            try writeJson(w, portMessage(&model_settings.launch_locks));
         } else {
             try writeJson(w, applyModelsDir(sch, &message_buf));
         }
@@ -605,6 +618,10 @@ fn applyUpdateCheck(locks: *const model_settings.LaunchLocks, key: []const u8, v
     return "applies at once";
 }
 
+fn portMessage(locks: *const model_settings.LaunchLocks) []const u8 {
+    return if (locks.port.set) "saved; the --port flag still sets the port until a start without it" else "saved; applies at the next start";
+}
+
 fn modelsDirMessage(buf: []u8, rescan: anyerror!u32) []const u8 {
     const added = rescan catch return "saved; the rescan failed, use /v1/models/rescan";
     return std.fmt.bufPrint(buf, "saved; models rescanned, {d} added", .{added}) catch "saved; models rescanned";
@@ -643,7 +660,7 @@ test "settings api: a request names real keys with valid values, or is refused w
     try testing.expectEqualStrings("m", ok.ok.model_id.?);
 
     try expectRejected("{\"model\":\"m\",\"set\":{\"temperature\":1}}", 400, "unknown_setting");
-    try expectRejected("{\"server\":{\"port\":1}}", 400, "unknown_setting");
+    try expectRejected("{\"server\":{\"colour\":1}}", 400, "unknown_setting");
     try expectRejected("{\"model\":\"m\",\"set\":{\"ssd_prefetch\":101}}", 400, "invalid_setting");
     try expectRejected("{\"server\":{\"models_dir\":\"relative\"}}", 400, "invalid_setting");
     try expectRejected("{\"set\":{\"mtp\":true}}", 400, "invalid_request_error");
@@ -697,6 +714,53 @@ test "settings api: render reports both update-check keys with their default, fi
         try testing.expect(o.get("locked").?.bool);
         try testing.expectEqualStrings("--no-update-check", o.get("flag").?.string);
     }
+}
+
+test "settings api: render reports the default port with the file's value, the pinning flag and when it applies" {
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    var locks: model_settings.LaunchLocks = .{};
+    {
+        var file = try model_settings.parse(testing.allocator, "{\"server\": {\"port\": 8080}}");
+        defer file.deinit();
+        const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const p = parsed.value.object.get("server").?.object.get("port").?.object;
+        try testing.expectEqual(@as(i64, 8080), p.get("file").?.integer);
+        try testing.expectEqual(@as(i64, 12345), p.get("default").?.integer);
+        try testing.expectEqualStrings("file", p.get("source").?.string);
+        try testing.expect(!p.get("locked").?.bool);
+        try testing.expect(std.mem.indexOf(u8, p.get("applies").?.string, "next start") != null);
+    }
+    var empty = try model_settings.parse(testing.allocator, "{}");
+    defer empty.deinit();
+    locks.port.pin("9000", .{});
+    const body = try render(testing.allocator, "/h/s.json", &empty, &.{}, &locks, view);
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const p = parsed.value.object.get("server").?.object.get("port").?.object;
+    try testing.expect(p.get("file").? == .null);
+    try testing.expectEqualStrings("flag", p.get("source").?.string);
+    try testing.expect(p.get("locked").?.bool);
+    try testing.expectEqualStrings("9000", p.get("flag").?.string);
+}
+
+test "settings api: server.port takes a whole port from 1 to 65535 or null, and says a flag still wins" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ok = parseRequest(arena_state.allocator(), "{\"server\":{\"port\":8080}}");
+    try testing.expectEqual(@as(i64, 8080), ok.ok.server_edits[0].value.?.integer);
+    try testing.expect(parseRequest(arena_state.allocator(), "{\"server\":{\"port\":null}}").ok.server_edits[0].value == null);
+    for ([_][]const u8{ "0", "65536", "-1", "\"80\"", "80.5", "true" }) |bad| {
+        const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"port\":{s}}}}}", .{bad});
+        try expectRejected(body, 400, "invalid_setting");
+    }
+    var locks: model_settings.LaunchLocks = .{};
+    try testing.expect(std.mem.indexOf(u8, portMessage(&locks), "next start") != null);
+    locks.port.pin("9000", .{});
+    try testing.expect(std.mem.indexOf(u8, portMessage(&locks), "--port flag still sets") != null);
 }
 
 test "settings api: a toggle reaches the loops at once, and a pinning flag keeps the key off" {

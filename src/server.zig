@@ -130,10 +130,11 @@ pub const BindConfig = struct {
     port: u16,
 };
 
-pub fn resolveBind(host_flag: ?[]const u8, port_flag: ?u16) BindConfig {
+/// `settings_port` is the settings file's `server.port` or the built-in default: `--port` wins over both.
+pub fn resolveBind(host_flag: ?[]const u8, port_flag: ?u16, settings_port: u16) BindConfig {
     return .{
         .host = host_flag orelse default_host,
-        .port = port_flag orelse default_port,
+        .port = port_flag orelse settings_port,
     };
 }
 
@@ -13172,17 +13173,23 @@ test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expect(templateThinkOpener("assistant") == null);
 }
 
+test "resolveBind: the port is the flag's, else the settings file's, else 12345" {
+    try std.testing.expectEqual(@as(u16, 8080), resolveBind(null, null, 8080).port);
+    try std.testing.expectEqual(@as(u16, 23817), resolveBind(null, 23817, 8080).port);
+    try std.testing.expectEqual(default_port, resolveBind(null, null, default_port).port);
+}
+
 test "resolveBind: no flags bind 127.0.0.1:12345" {
-    const d = resolveBind(null, null);
+    const d = resolveBind(null, null, default_port);
     try std.testing.expectEqualStrings("127.0.0.1", d.host);
     try std.testing.expectEqual(@as(u16, 12345), d.port);
-    const e = resolveBind("0.0.0.0", 23817);
+    const e = resolveBind("0.0.0.0", 23817, default_port);
     try std.testing.expectEqualStrings("0.0.0.0", e.host);
     try std.testing.expectEqual(@as(u16, 23817), e.port);
-    const p = resolveBind(null, 23817);
+    const p = resolveBind(null, 23817, default_port);
     try std.testing.expectEqualStrings("127.0.0.1", p.host);
     try std.testing.expectEqual(@as(u16, 23817), p.port);
-    const h = resolveBind("192.168.7.9", null);
+    const h = resolveBind("192.168.7.9", null, default_port);
     try std.testing.expectEqualStrings("192.168.7.9", h.host);
     try std.testing.expectEqual(@as(u16, 12345), h.port);
 }

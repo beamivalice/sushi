@@ -13,6 +13,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
+const model_settings = @import("model_settings.zig");
 const effort_mod = @import("effort.zig");
 
 pub const Budget = struct { context: u64, output: u64 };
@@ -976,7 +977,8 @@ const LaunchArgs = struct {
     kind: AgentKind,
     model: ?[]const u8 = null,
     url: ?[]const u8 = null,
-    port: u16 = 12345,
+    /// null: the settings file's `server.port`, else 12345.
+    port: ?u16 = null,
     print_only: bool = false,
     think: ?[]const u8 = null,
     persist: bool = false,
@@ -1032,7 +1034,8 @@ fn printLaunchUsage() void {
         \\options:
         \\  --model <id>   Serve this model (default: the server's default model)
         \\  --url <base>   Server base URL (default: http://127.0.0.1:<port>)
-        \\  --port <n>     Server port for the default URL (default: 12345)
+        \\  --port <n>     Server port for the default URL (default: 12345, or
+        \\                 `server.port` in ~/.sushi/model-settings.json)
         \\  --think <word> OpenCode only: explicitly request a server-advertised
         \\                 reasoning effort (including off when supported)
         \\  --persist      OpenCode only: back up and merge into the user config
@@ -1056,7 +1059,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
 
     var url_buf: [64]u8 = undefined;
-    const base_url = parsed.url orelse std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{parsed.port}) catch unreachable;
+    const base_url = parsed.url orelse std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{parsed.port orelse model_settings.defaultPort(allocator, io)}) catch unreachable;
 
     if (!serverUp(allocator, io, base_url)) {
         log.err("no sushi server at {s}.\n", .{base_url});
@@ -1417,8 +1420,9 @@ test "launch args: the removed --no-start is a usage error" {
     try t.expectError(error.Usage, parseLaunchArgs(&.{ "codex", "--no-start" }));
 }
 
-test "launch args: the default port is sushi's own, clear of mlx-serve's 11234" {
-    try t.expectEqual(@as(u16, 12345), (try parseLaunchArgs(&.{"opencode"})).port);
+test "launch args: no --port leaves the port to the settings file's server.port, which falls back to sushi's own 12345" {
+    try t.expectEqual(@as(?u16, null), (try parseLaunchArgs(&.{"opencode"})).port);
+    try t.expectEqual(@as(?u16, 8080), (try parseLaunchArgs(&.{ "opencode", "--port", "8080" })).port);
 }
 
 test "script assembly: extras are shell-quoted onto the invocation line" {

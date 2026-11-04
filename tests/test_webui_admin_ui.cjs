@@ -46,6 +46,7 @@ function makeServer(opts = {}) {
       prefix_cache_disk_gb: { file: 100, flag: null, source: 'file', locked: false, effective_bytes: 100 * GiB, ask_bytes: 100 * GiB, applies: 'a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load' },
       update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       pack_update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
+      port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
     },
     cache: {
       root: '/h/.sushi/kv-cache', volume: { free_bytes: 1399 * GiB, total_bytes: 3722 * GiB }, total_bytes: 71.5 * GiB,
@@ -955,6 +956,30 @@ async function main() {
       assert.equal(await page.locator('.set[data-key="update_check"] button[data-value="false"]').getAttribute('aria-pressed'), 'true');
       assert.match(await page.textContent('#updatesCard'), /Set by --no-update-check at launch/);
       assert.match(await page.textContent('#updatesCard'), /Launch flag/);
+    });
+    await scenario('the default port shows its ghost text, refuses a bad number and saves a good one', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#portNum');
+      assert.equal(await page.getAttribute('#portNum', 'placeholder'), 'Default (12345)');
+      assert.equal(await page.isDisabled('#portSave'), true);
+      await page.fill('#portNum', '70000');
+      assert.equal(await page.isDisabled('#portSave'), true, 'a port past 65535 cannot be saved');
+      assert.match(await page.textContent('.set[data-key="port"]'), /1 to 65535/);
+      await page.fill('#portNum', '8080');
+      await page.click('#portSave');
+      await page.waitForFunction(() => document.querySelector('.set[data-key="port"] .badges').textContent.includes('Saved'));
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { port: 8080 } });
+      assert.equal(await page.textContent('#portDefault'), 'Use default (12345)');
+      await page.click('#portDefault');
+      await page.waitForFunction(() => document.querySelector('#portNum').value === '');
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { port: null } });
+    });
+    await scenario('--port locks the default port and names the flag', { path: '/settings', setup: (s) => {
+      Object.assign(s.state.server.port, { flag: '9000', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector('#portNum');
+      assert.equal(await page.isDisabled('#portNum'), true);
+      assert.equal(await page.inputValue('#portNum'), '9000');
+      assert.match(await page.textContent('.set[data-key="port"]'), /Set by --port 9000 at launch/);
     });
     await scenario('Use default stays plain when the server does not say the default', { path: '/settings' }, async ({ page }) => {
       await page.waitForSelector('#cacheDefault');

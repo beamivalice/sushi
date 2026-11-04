@@ -16,7 +16,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 |---|---|---|---|---|
 | `--serve` | off → HTTP server mode; the headless `--serve --model-dir` form is what the app launches (main.zig:620) | operator | help, server-lifecycle; 123 tests | keep: the app depends on it; overlaps the `serve` subcommand only in spelling |
 | `--host` | `127.0.0.1` → bind address, `0.0.0.0` opens the LAN (main.zig:617) | operator | help, server-lifecycle; 52 tests | keep |
-| `--port` | `12345` → bind port (main.zig:614) | operator | help, server-lifecycle; 139 tests | keep |
+| `--port` | `12345`, or `server.port` of `model-settings.json` → bind port (main.zig:614); pins that key, reported locked | operator | help, server-lifecycle; 139 tests | keep |
 | `--api-key` | none → required on every request, loopback exempt (main.zig:728) | operator | help, server-http-apis; 2 tests | keep |
 | `--api-key-strict` | off → also require the key from loopback (main.zig:732) | operator | help; 1 test | keep: embedders on shared machines |
 | `--api-key-env` | none → read the key from a named env var so argv does not carry it (main.zig:734) | operator | help, envvar; 0 tests | keep: the only way to keep the key out of the process table |
@@ -120,7 +120,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `run`: `--stream` | off → stream tokens with `--prompt` (main.zig:644) | user | help; 1 test | keep |
 | `launch`: `--model` | the server's default → model id (launch.zig:867) | operator | help, usage; 0 tests | keep |
 | `launch`: `--url` | `http://127.0.0.1:<port>` → server base URL (launch.zig:871) | operator | help; test_launch_cmd, test_zcode_launch | keep |
-| `launch`: `--port` | `12345` → server port for the default URL (launch.zig:875) | operator | help; 0 tests | keep |
+| `launch`: `--port` | `12345`, or `server.port` of `model-settings.json` → server port for the default URL (launch.zig:875) | operator | help; 0 tests | keep |
 | `launch`: `--print` | off → write configs and print the script instead of running (launch.zig:879) | user | help, usage; test_launch_cmd | keep |
 | `launch`: `--` | none → everything after goes to the agent (launch.zig:864) | user | help, usage; test_launch_cmd | keep |
 | `update`: `--check` | off → report only (update.zig:709) | user | help; 1 test | keep |

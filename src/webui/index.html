@@ -836,6 +836,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <div class="kv" id="dirKv" style="margin-top:8px"></div>
       </div>
     </section>
+    <section class="card" id="portCard" hidden>
+      <div class="card-h">Server port</div>
+      <div class="card-b"><div id="portSet"></div></div>
+    </section>
     <section class="card" id="updatesCard" hidden>
       <div class="card-h">Automatic update checks</div>
       <div class="card-b"><div id="updateSet"></div><div id="packUpdateSet"></div></div>
@@ -2997,7 +3001,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
   const isOff = (flag) => flag === "off" || flag === "false" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
-  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", update_check: "--no-update-check", pack_update_check: "--no-update-check" }[key] ?? "";
+  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check" }[key] ?? "";
   const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : key === "mtp_greedy_tail" ? flagName(key) : flagName(key) ? `${flagName(key)} ${flag}` : "";
   const flagHelp = (key, flag) => { const text = flagText(key, flag); return `Set by ${text ? `${text} at launch` : "a launch flag"}. Start sushi without the flag to change it here.`; };
   const flagShown = (spec, flag) => {
@@ -3007,7 +3011,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
 
   const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
-    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, timer: null, retry: null, tbody: "",
+    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
@@ -3491,6 +3495,18 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   q("cacheSet").replaceWith(cacheRow.row);
   q("dirSet").replaceWith(dirRow.row);
 
+  // The default port: where `sushi --serve` binds without --port, and what sushibar and `sushi launch` target.
+  const PORT_SPEC = { type: "int", min: 1, max: 65535 };
+  const portRow = setRow("port", "Default port", "portNum");
+  const portIn = h("input", { id: "portNum", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default (12345)", "aria-label": "Default port", oninput: () => { A.portText = portIn.value; renderPort(A.settings.server.port); }, onkeydown: (e) => enterTo(portSave)(e) });
+  const portSave = h("button", { class: "btn sm primary", id: "portSave", type: "button", text: "Save", onclick: () => {
+    const v = adminControlValue(PORT_SPEC, portIn.value);
+    if (v.ok && v.value !== null) saveServer("port", v.value, "Saved.", portSave, "Saving…");
+  } });
+  const portDefault = h("button", { class: "btn sm", id: "portDefault", type: "button", text: "Use default", onclick: () => saveServer("port", null, "Back to the default port.", portDefault, "Resetting…") });
+  portRow.ctl.append(h("div", { class: "row-in" }, portIn), h("div", { class: "row-in" }, portSave, portDefault), portRow.bad);
+  q("portSet").replaceWith(portRow.row);
+
   // The two automatic update checks: Default, On or Off. A file value of null is the default, shown as "Default (On)".
   const UPDATE_KEYS = [
     ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Update and Check for updates always work."],
@@ -3510,7 +3526,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       try {
         const r = await postJson("/v1/settings", { server: { [key]: value } });
         toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
-        if (key === "models_dir") A.dirText = null; else A.cacheText = null;
+        if (key === "models_dir") A.dirText = null; else if (key === "port") A.portText = null; else A.cacheText = null;
       } catch (e) { failToast("Save", e); }
     });
     await Promise.all([refresh(), key === "models_dir" ? modelStore.refresh() : null]);
@@ -3525,10 +3541,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const s = A.settings, c = A.cache;
     if (!s) return;
     setHidden(q("settingsSkel"), true);
-    for (const id of ["cacheCard", "dirCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
+    for (const id of ["cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     setText(q("settingsFile"), `Saved in ${s.file}`);
     if (c) renderCache(c, s.server.prefix_cache_disk_gb);
     renderDir(s.server.models_dir);
+    if (s.server.port) renderPort(s.server.port);
     renderUpdates(s.server);
     setText(q("aboutVersion"), q("brandVersion").textContent || "-");
   }
@@ -3605,6 +3622,22 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       setText(row.help, locked ? flagHelp(key, st.flag) : help);
     }
   }
+  function renderPort(p) {
+    const locked = !!p.locked, file = adminFileText(p.file), shown = locked ? adminFileText(p.flag) : file;
+    badges(portRow.badge, p, p.applies);
+    if (A.portText === shown) A.portText = null;
+    if ((locked || A.portText === null) && portIn.value !== shown) portIn.value = shown;
+    const hint = `Default (${p.default})`;
+    if (portIn.placeholder !== hint) portIn.placeholder = hint;
+    setText(portRow.help, locked ? flagHelp("port", p.flag) : "The port sushi serves on when started without --port, and the one sushibar and sushi launch use. It applies at the next start.");
+    const text = portIn.value.trim(), parsed = adminControlValue(PORT_SPEC, text), dirty = !locked && text !== file, busy = (b) => b.getAttribute("aria-busy") === "true";
+    portIn.disabled = locked;
+    portSave.disabled = locked || !dirty || !parsed.ok || parsed.value === null || busy(portSave);
+    portDefault.disabled = locked || p.file == null || busy(portDefault);
+    if (!busy(portDefault)) setText(portDefault, `Use default (${p.default})`);
+    setText(portRow.bad, dirty && text && !parsed.ok ? "Enter a whole number from 1 to 65535." : "");
+    portIn.setAttribute("aria-invalid", String(!!portRow.bad.textContent));
+  }
   function renderDir(d) {
     badges(dirRow.badge, d, d.applies);
     dirRow.ctl.replaceChildren(...(d.locked ? [] : [...dirCtl, dirRow.bad]));
@@ -3624,7 +3657,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : A.error ? `Couldn't load: ${A.error}` : "";
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
-    for (const id of ["modelsMd", "cacheCard", "dirCard", "updatesCard", "aboutCard"]) q(id).classList.toggle("stale-view", !!msg && !!A.settings);
+    for (const id of ["modelsMd", "cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) q(id).classList.toggle("stale-view", !!msg && !!A.settings);
     if (A.view === "models") renderModels(); else if (A.view === "settings") renderSettings();
   }
   modelStore.subscribe(() => {

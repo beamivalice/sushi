@@ -6,6 +6,7 @@
 const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
+const default_port = @import("default_port.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 
 /// Where a load's value for one key came from. A request's own field outranks all of them.
@@ -303,6 +304,14 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
     };
 }
 
+/// The port a server binds and a client targets without `--port`: the file's `server.port`, else the built-in one.
+pub fn defaultPort(alloc: std.mem.Allocator, io: std.Io) u16 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var file = load(alloc, io, defaultPath(&buf));
+    defer file.deinit();
+    return server(&file).port orelse default_port.port;
+}
+
 pub fn defaultPath(buf: []u8) []const u8 {
     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
     return std.fmt.bufPrint(buf, "{s}/.sushi/model-settings.json", .{home}) catch "";
@@ -368,6 +377,7 @@ pub const server_keys = [_]KeySpec{
     .{ .name = "prefix_cache_disk_gb", .kind = .int, .min = 0, .max = 1 << 20 },
     .{ .name = "update_check", .kind = .bool },
     .{ .name = "pack_update_check", .kind = .bool },
+    .{ .name = "port", .kind = .int, .min = 1, .max = 65535 },
 };
 
 pub const server_section = "server";
@@ -611,6 +621,8 @@ pub const Server = struct {
     update_check: ?bool = null,
     /// The automatic pack revision check.
     pack_update_check: ?bool = null,
+    /// The port a server binds and the clients target without `--port`.
+    port: ?u16 = null,
 };
 
 /// An automatic network look is on unless `--no-update-check` or the file turns it off.
@@ -642,6 +654,7 @@ pub fn server(self: *const Settings) Server {
     if (sec.get("pack_update_check")) |v| if (v == .bool) {
         out.pack_update_check = v.bool;
     };
+    if (sec.get("port")) |v| out.port = default_port.fromValue(v);
     return out;
 }
 
@@ -696,6 +709,7 @@ pub const LaunchLocks = struct {
     prefix_cache_disk_gb: Lock = .{},
     update_check: Lock = .{},
     pack_update_check: Lock = .{},
+    port: Lock = .{},
 
     pub fn model(self: *const LaunchLocks, name: []const u8) ?*const Lock {
         for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];
@@ -1159,4 +1173,26 @@ test "model_settings: max_tokens is a positive integer the model's window bounds
     try t.expectEqualStrings("max_tokens", over.key);
     try t.expect(refuseEdits(fit, null, &.{.{ .key = "max_tokens", .value = .{ .integer = 65536 } }}, &buf) == null);
     try t.expect((Override{ .max_tokens = 1 }).isEmpty() == false);
+}
+
+test "model_settings: server.port is a whole port from 1 to 65535, anything else is ignored" {
+    const t = std.testing;
+    for ([_]struct { body: []const u8, want: ?u16 }{
+        .{ .body = "{\"server\":{\"port\":8080}}", .want = 8080 },
+        .{ .body = "{\"server\":{\"port\":65535}}", .want = 65535 },
+        .{ .body = "{\"server\":{\"port\":1}}", .want = 1 },
+        .{ .body = "{\"server\":{\"port\":0}}", .want = null },
+        .{ .body = "{\"server\":{\"port\":65536}}", .want = null },
+        .{ .body = "{\"server\":{\"port\":\"8080\"}}", .want = null },
+        .{ .body = "{\"server\":{\"port\":80.5}}", .want = null },
+        .{ .body = "{\"server\":{}}", .want = null },
+        .{ .body = "{}", .want = null },
+    }) |c| {
+        var s = try parse(t.allocator, c.body);
+        defer s.deinit();
+        try t.expectEqual(c.want, server(&s).port);
+    }
+    const spec = findKey(&server_keys, "port").?;
+    try t.expectEqual(@as(f64, 1), spec.min);
+    try t.expectEqual(@as(f64, 65535), spec.max);
 }
