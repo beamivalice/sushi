@@ -64,6 +64,8 @@ names it; absent is the pack order.
   and every `trellis_pm` starts on a 16 KiB page of the file. Where the previous tensor does not end on a page, a
   zero-filled `__pad__.<shard stem>.<i>` tensor (`U8`, 1-D, under 16384 bytes) fills the gap and is listed in the index
   (safetensors readers reject gaps). The engine skips every `__pad__.` key: it is not loaded, billed or validated.
+  The published DeepSeek revision 2.0 starts 43 of its `trellis_pm` tensors on a 4 KiB block rather than a 16 KiB
+  page; the loader accepts any start, and only the direct-read share depends on it.
 - Only `deepseek_v41` reads `pair_major`. Its streaming engine lands the bytes in the slot pools unchanged: no CPU
   reshuffle, and a read whose file offset, length and destination lie on pages goes straight into the slab. A
   pair-major pack's rate-group pools always start on pages (the layer's bill grows by under one page per pool, per

@@ -271,8 +271,8 @@ bit-identical lands whatever its size. A change that alters output lands only th
   and record `$!`; plain `nohup … &` dies with the tool's session.
   - Write the END marker from an EXIT trap, and end every wait loop when that PID is gone.
 - Confirm the load lines (`[kv-cache]`, `[mtp]`, engagement lines) show the intended arm.
-- KLD is 16 prompts x 512 tokens scored to the first EOS (GLM: the 4x512 native teacher, code 2x512 reported apart);
-  the teacher carries no lossy step of its own.
+- Reported KLD: the eight-category 16x512 fixture to first EOS; a prose-only fixture is a gate, never reported. The
+  teacher carries no lossy step of its own.
 
 **Coordinator.**
 - Reports partial work to the owner every :00 and :30 while work runs.

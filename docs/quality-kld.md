@@ -199,6 +199,9 @@ subset. This four-prompt screen is not the sixteen-prompt release reading.
 Each release scores two packs with `sushi kld compare --tokens 512 --top-k 10 --ctx-size 8192 --no-mtp`, read to the
 first EOS, against the previous release's reading (within ~1%). The fixture and flags are part of the reading.
 
+Public numbers (pack cards, the README) are the eight-category reading ([below](#eight-category)). A 16-prompt prose
+fixture is a regression gate only: without the other categories its mean leans on raw prose, so it is never reported.
+
 | pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) |
 |---|---|---|---|---|
 | Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions |

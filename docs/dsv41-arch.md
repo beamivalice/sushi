@@ -442,6 +442,9 @@ kernels), AC, pack `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`:
   `MLX_ENABLE_TF32=0`): to-first-EOS 0.18575 (88.51% top-1, 7775 positions) against the recorded 0.1843 (published) and
   0.1853 (same-binary live check); per category code 0.0352, math 0.0593, reasoning 0.1158, design 0.1651, wikitext 0.2815,
   multilingual 0.2736, story 0.4878, stem 0.0963.
+- Pack revision 2.0 (8-category fixture, the settings above, release binary `62184462` at `75996eda`): to-first-EOS 0.15760
+  (89.13% top-1, 7775 positions); code 0.0284, math 0.0480, reasoning 0.0897, design 0.1468, wikitext 0.2545,
+  multilingual 0.2349, story 0.4052, stem 0.0786.
 
 `SUSHI_DSV41_COMPOSED=1` (a diagnostic, read at load) runs the op chains instead and the load logs
 `[dsv41] fused kernels on|off`: the teacher arm of the KLD A/B. The hyper-connection kernels run at 1024 threads a

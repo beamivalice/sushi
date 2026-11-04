@@ -8,7 +8,7 @@ A local AI server for low-bit, very high quality Sushi quants, using custom Sush
 
 Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
-* [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (requires 96 GB+ and sushi 1.4.0 or later, experts [streamed](#streaming), text and image input)
+* [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (pack revision 2.0, requires 96 GB+ and sushi 1.5.0 or later, experts [streamed](#streaming), text and image input)
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming))
 * [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (requires 64 GB+ and sushi 1.3.0 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
@@ -18,10 +18,12 @@ Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
 ## Quality
 
-<p align="center"><img src="docs/assets/dsv41-1.75bpw-kld.png" alt="DeepSeek-V4.1-Flash KLD by category" width="100%"></p>
+<p align="center"><img src="docs/assets/dsv41-1.75bpw-kld-v1-to-v2.svg" alt="DeepSeek-V4.1-Flash KLD by category, pack revision 1.0 to 2.0, against oQ2.5e" width="100%"></p>
 
 <p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
 
+* DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw, pack revision 2.0, scores KLD 0.1576 (top-1 agreement 89.13%) on the
+  eight-category reading, down from 0.1843 in revision 1.0 and below oQ2.5e's 0.1717 at 2.96 bits per weight
 * MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%)
 * GLM-5.3-Flash-Sushi-2.4bpw scores KLD 0.0742 (top-1 agreement 90.33%)
 * GLM-5.3-Flash-Sushi-2bpw scores KLD 0.1037 (top-1 agreement 88.18%)
