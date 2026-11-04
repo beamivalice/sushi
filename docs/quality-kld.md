@@ -193,6 +193,20 @@ subset. This four-prompt screen is not the sixteen-prompt release reading.
   recorded, never treated as a regression or a reason to hold a NAX kernel back, and never "fixed" toward SIMD.
   A NAX arm still has to pass its fp32 parity test; this policy covers only the model-level KLD difference.
 
+<a id="release-gate"></a>
+## Release gate
+
+Each release scores two packs with `sushi kld compare --tokens 512 --top-k 10 --ctx-size 8192 --no-mtp`, read to the
+first EOS, against the previous release's reading (within ~1%). The fixture and flags are part of the reading.
+
+| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | `--ssd-budget-gb 110` | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions |
+
+The Qwen 1.5.0 reading equals the 1.4.0 Homebrew binary's on the same settings to the last digit; the 0.0692 / 92.76%
+quoted for this pack in [qwen4-kld](qwen4-kld.md) was taken on settings it does not name.
+
 <a id="eight-category"></a>
 ## Eight-category reading (Flash-Next)
 

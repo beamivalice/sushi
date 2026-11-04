@@ -389,6 +389,14 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## v1.5.0 release context ladder
+
+[Version summary and per-model reports](bench/v1.5.0/summary.md), 2026-11-04, Apple M5 Max 128 GB. The v1.4.0 `sushi bench`
+protocol and box settings; one binary from `75996eda` (SHA `62184462`). Code arm 512 tokens (DeepSeek 256), prose 128.
+- DeepSeek, `--ssd-budget-gb 108`: prose decode +3% to +10% over v1.4.1 at every rung, prefill level or ahead.
+- Qwen STQ 2.75bpw prefill reads 5-15% below v1.4.1's report; a same-session A/B (1.4.1 vs 1.5.0 binary, one pack) put
+  1.5.0 level or ahead, so the gap is session drift.
+
 ## v1.4.1 release context ladder
 
 [Version summary and per-model reports](bench/v1.4.1/summary.md), 2026-10-30, Apple M5 Max 128 GB. The v1.4.0 `sushi bench`

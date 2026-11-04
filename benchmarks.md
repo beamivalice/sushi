@@ -18,9 +18,9 @@
 
 ## Decode tok/s by release, sushi bench (code / prose, 4k)
 
-| Model | v1.4.0 | v1.4.1 |
-|---|---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (MTP) | 168.6 / 62.8 mtp | 161.0 / 68.6 mtp |
-| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | 146.2 / 65.6 mtp | 144.8 / 77.4 mtp |
-| GLM-5.3-Flash-Sushi-2.4bpw (DFlash2) | 71.5 / 50.9 dflash | 70.5 / 41.0 dflash |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark | 79.5 / 51.4 dspark |
+| Model | v1.4.0 | v1.4.1 | v1.5.0 |
+|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (MTP) | 168.6 / 62.8 mtp | 161.0 / 68.6 mtp | 166.9 / 68.2 mtp |
+| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | 146.2 / 65.6 mtp | 144.8 / 77.4 mtp | 142.7 / 77.1 mtp |
+| GLM-5.3-Flash-Sushi-2.4bpw (DFlash2) | 71.5 / 50.9 dflash | 70.5 / 41.0 dflash | 70.7 / 40.5 dflash |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark | 79.5 / 51.4 dspark | 80.9 / 52.8 dspark |
