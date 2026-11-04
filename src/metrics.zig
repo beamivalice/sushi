@@ -96,12 +96,9 @@ pub const Metrics = struct {
     gpu_clock_max_mhz: Gauge, // top P-state, 0 when the clock is unreadable
     memory_mb: Gauge, // megabytes (phys_footprint)
     // Real-time throughput source: completed generation tokens PLUS tokens
-    // generated so far by in-flight slots. The sampler thread sets this from
-    // `generation_tokens_total` plus the scheduler's `inflight_generated_tokens`
-    // aggregate (published race-free once per decode tick — no per-token write
-    // on the inference path), so the dashboard can derive a live tok/s without
-    // waiting for requests to complete. See server.zig sampleGauges +
-    // liveGenerationTokens below.
+    // generated so far by in-flight slots. The inference thread sets it once
+    // per decode tick (`publishLiveTokens`), so a reader never sees a finished
+    // slot's tokens counted in both halves.
     generation_tokens_live: Gauge,
     // Tokens forwarded so far by the prefill currently running, 0 when none is.
     // The OTHER half of the live picture: `generation_tokens_live` only moves
@@ -239,11 +236,9 @@ pub const Metrics = struct {
 };
 
 /// Pure: the live-tokens gauge value = completed generation tokens PLUS the
-/// tokens generated so far by still-decoding slots. The scheduler publishes the
-/// in-flight aggregate (`inflight_generated_tokens`) once per decode tick; the
-/// sampler thread calls this each tick to set `generation_tokens_live`. Kept
-/// here (not inline in the sampler) so the arithmetic is unit-testable and the
-/// "at rest ⇒ live == total" invariant is pinned without a running server.
+/// tokens generated so far by still-decoding slots. Kept here so the arithmetic
+/// is unit-testable and the "at rest ⇒ live == total" invariant is pinned
+/// without a running server.
 pub fn liveGenerationTokens(m: *const Metrics, inflight: u64) u64 {
     return m.generation_tokens_total.load() + inflight;
 }

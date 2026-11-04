@@ -2197,7 +2197,7 @@ pub const Generator = struct {
                 pos = end;
                 n_chunks += 1;
                 // Publish progress once per chunk — same cadence discipline as
-                // `inflight_generated_tokens` (once per decode tick), never per token.
+                // the live-token gauge (once per decode tick), never per token.
                 if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
                 // Persist this chunk now: the KV bytes for [0, pos) are final.
                 if (options.write_through_hook) |wt| {

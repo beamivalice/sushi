@@ -8351,9 +8351,6 @@ const GaugeSamplerCtx = struct {
 
 /// Sample instantaneous system/queue state into the gauges. Non-blocking
 /// syscalls plus a brief scheduler-counter lock. Called by the sampler thread.
-/// The live-token gauge reads the scheduler's `inflight_generated_tokens`
-/// aggregate (published once per decode tick) — it NEVER touches per-slot
-/// fields off-thread, so the inference path stays lock-free per token.
 fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // System gauges (non-blocking syscalls).
     ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
@@ -8377,13 +8374,6 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.scheduler.queue_mu.unlock(ctx.scheduler.io);
     ctx.metrics.requests_running.set(running);
     ctx.metrics.requests_waiting.set(waiting);
-
-    // Real-time throughput source: completed generation tokens plus the tokens
-    // generated so far by still-decoding slots (the scheduler publishes that
-    // aggregate atomically once per decode tick — race-free, no per-token
-    // write). Non-zero even mid-request, unlike the completion-only counter.
-    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic);
-    ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, inflight));
 
     // The other phase. Prompt-token counters and the prefill-time histogram
     // only advance at request COMPLETION, so a long prefill was invisible: GPU
