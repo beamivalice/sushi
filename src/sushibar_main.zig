@@ -9,6 +9,8 @@ const objc = @import("sushibar/objc.zig");
 const io_util = @import("io_util.zig");
 const header_view = @import("sushibar/header_view.zig");
 const port_field = @import("sushibar/port_field.zig");
+const button_row = @import("sushibar/button_row.zig");
+const log_view = @import("sushibar/log_view.zig");
 
 const usage =
     \\usage: sushibar [--port <n>]
@@ -138,6 +140,9 @@ const Shared = struct {
     note: Str(240) = .{},
     busy: logic.Busy = .none,
     check_failed: bool = false,
+    /// Where the watched port's server writes its log; stale once the watched port changes (`port`).
+    log_kind: logic.LogKind = .standard,
+    log_path: Str(1024) = .{},
     relaunch: bool = false,
     req_check: bool = false,
     req_update: bool = false,
@@ -562,6 +567,10 @@ fn pollLoop() void {
     var last_ok = true;
     var iter: u32 = 0;
     var loop_start_ms: i64 = 0;
+    var log_pid: i32 = 0;
+    var log_port: u16 = 0;
+    var log_buf: [1024]u8 = undefined;
+    var log_src: logic.LogSource = .{ .kind = .standard };
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
     {
@@ -620,6 +629,19 @@ fn pollLoop() void {
         }
         const taken = sample.link == .offline and !sushi_listening and proc.portInUse(p);
 
+        // The server's own argv says whether it was started with --log-file; read again only when its pid changes.
+        var server_pid: i32 = 0;
+        for (listings[0..n]) |l| if (l.port == p) {
+            server_pid = l.pid;
+        };
+        if (server_pid != log_pid or p != log_port) {
+            log_pid = server_pid;
+            log_port = p;
+            const args = a.alloc(u8, proc.args_cap) catch null;
+            const read = if (server_pid != 0 and args != null) proc.argsOfPid(server_pid, args.?) else null;
+            log_src = logic.logSource(&log_buf, g_home, p, read);
+        }
+
         if (p == port()) {
             lock();
             shared.port = p;
@@ -649,6 +671,8 @@ fn pollLoop() void {
             shared.listing_n = n;
             shared.sushi_listening = sushi_listening;
             shared.port_taken = taken;
+            shared.log_kind = log_src.kind;
+            shared.log_path.set(log_src.path);
             unlock();
         }
 
@@ -841,8 +865,7 @@ var toggle_mi: objc.id = null;
 var port_mi: objc.id = null;
 var port_menu: objc.id = null;
 var open_mis: [4]objc.id = .{ null, null, null, null };
-var check_mi: objc.id = null;
-var update_mi: objc.id = null;
+var button_action: logic.ButtonAction = .none;
 var copy_mi: objc.id = null;
 var pack_mi: objc.id = null;
 var menu_target: objc.id = null;
@@ -1131,18 +1154,17 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 
     var cb: [128]u8 = undefined;
     const check = logic.checkLabel(&cb, uv);
-    setText(check_mi, "setTitle:", check);
-    objc.msg(void, check_mi, "setEnabled:", .{uv.busy == .none});
-    objc.msg(void, check_mi, "setHidden:", .{uv.available});
     var fit_b: [note_show_max + 4]u8 = undefined;
     const note_shown = if (uv.busy == .none and uv.note.len > 0) logic.fitNote(&fit_b, uv.note, note_show_max) else "";
     setText(note_mi, "setTitle:", note_shown);
     objc.msg(void, note_mi, "setHidden:", .{note_shown.len == 0});
     var ub: [200]u8 = undefined;
     const update_label = if (uv.busy == .updating) check else logic.updateLabel(&ub, uv) orelse "";
-    objc.msg(void, update_mi, "setHidden:", .{!(uv.available and uv.path != .brew)});
-    setText(update_mi, "setTitle:", update_label);
-    objc.msg(void, update_mi, "setEnabled:", .{logic.updateEnabled(uv)});
+    var tip_b: [160]u8 = undefined;
+    const update_button = logic.updateButton(&tip_b, uv);
+    button_action = update_button.action;
+    button_row.setUpdate(.{ .label = update_button.label, .symbol = update_button.symbol, .tip = update_button.tip, .accent = update_button.accent, .enabled = update_button.enabled });
+    button_row.dropStaleHover();
     var pb: [128]u8 = undefined;
     const copy_label = logic.copyLabel(&pb, uv.command);
     objc.msg(void, copy_mi, "setHidden:", .{!(uv.available and uv.path == .brew)});
@@ -1163,12 +1185,13 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         }
         const shown_update = if (uv.available and uv.path == .brew) copy_label else if (uv.available) update_label else "";
         const shown_check = if (uv.available) "" else check;
-        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" note=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\"\n", .{
+        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" note=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\"\n", .{
             tick_count,                 title,                 status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
             @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         shown_check,
             shown_update,               note_shown,            header.pill.label,     header.line1,           header.line2,
             tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_copy,
+            update_button.label,
         });
         if (tick_count >= test_polls) quit();
     }
@@ -1229,11 +1252,13 @@ fn applyPortAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 fn textChangedAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     port_field.clearInvalid();
 }
-fn checkAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    runAction(.{ .kind = .check, .at = 0 });
-}
-fn updateAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    runAction(.{ .kind = .update, .at = 0 });
+fn updateButtonAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    switch (button_action) {
+        .check => runAction(.{ .kind = .check, .at = 0 }),
+        .update => runAction(.{ .kind = .update, .at = 0 }),
+        .copy_command => copyAction(null, null, null),
+        .none => {},
+    }
 }
 fn copyAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     objc.copyText("brew upgrade sushi");
@@ -1252,12 +1277,27 @@ fn menuWillOpen(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     refreshModels(null);
 }
 
-/// A symbol in the accent colour (not a template, so the menu does not tint it grey).
-fn accentSymbol(name: []const u8) objc.id {
-    const accent = objc.msg(objc.id, objc.class("NSColor"), "controlAccentColor", .{});
-    const colors = objc.msg(objc.id, objc.class("NSArray"), "arrayWithObject:", .{accent});
-    const cfg = objc.msg(objc.id, objc.class("NSImageSymbolConfiguration"), "configurationWithPaletteColors:", .{colors});
-    return objc.msg(objc.id, symbol(name), "imageWithSymbolConfiguration:", .{cfg});
+/// The watched port's log: what its server's argv said, or the default file while that is not known yet.
+fn watchedLog(buf: *[1024]u8) logic.LogSource {
+    const p = port();
+    lock();
+    defer unlock();
+    if (shared.port != p) return logic.logSource(buf, g_home, p, null);
+    const path = shared.log_path.get();
+    @memcpy(buf[0..path.len], path);
+    return .{ .kind = shared.log_kind, .path = buf[0..path.len] };
+}
+
+fn showLogAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    var buf: [1024]u8 = undefined;
+    log_view.open(port(), watchedLog(&buf));
+}
+
+/// Follows the log while its window is open, and the watched port when it changes.
+fn logTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    if (!log_view.isVisible()) return;
+    var buf: [1024]u8 = undefined;
+    log_view.sync(port(), watchedLog(&buf));
 }
 
 const icon_w = 22;
@@ -1286,8 +1326,9 @@ fn runMenuBar() noreturn {
         .{ .selector = "pickPort:", .imp = @ptrCast(&pickPortAction), .types = "v@:@" },
         .{ .selector = "applyPort:", .imp = @ptrCast(&applyPortAction), .types = "v@:@" },
         .{ .selector = "controlTextDidChange:", .imp = @ptrCast(&textChangedAction), .types = "v@:@" },
-        .{ .selector = "check:", .imp = @ptrCast(&checkAction), .types = "v@:@" },
-        .{ .selector = "update:", .imp = @ptrCast(&updateAction), .types = "v@:@" },
+        .{ .selector = "updateButton:", .imp = @ptrCast(&updateButtonAction), .types = "v@:@" },
+        .{ .selector = "showLog:", .imp = @ptrCast(&showLogAction), .types = "v@:@" },
+        .{ .selector = "logTick:", .imp = @ptrCast(&logTick), .types = "v@:@" },
         .{ .selector = "copy:", .imp = @ptrCast(&copyAction), .types = "v@:@" },
         .{ .selector = "copyPack:", .imp = @ptrCast(&copyPackAction), .types = "v@:@" },
         .{ .selector = "menuWillOpen:", .imp = @ptrCast(&menuWillOpen), .types = "v@:@" },
@@ -1325,15 +1366,6 @@ fn runMenuBar() noreturn {
     for (open_mis) |mi| objc.msg(void, mi, "setEnabled:", .{false});
     addSeparator(menu);
 
-    check_mi = addItem(menu, "Check for Updates…", "check:", 0, "", "arrow.triangle.2.circlepath");
-    update_mi = addItem(menu, "Update", "update:", 0, "", null);
-    objc.msg(void, update_mi, "setImage:", .{accentSymbol("arrow.down.circle.fill")});
-    const badge_class = objc.class("NSMenuItemBadge");
-    if (badge_class != null) {
-        const badge = objc.msg(objc.id, objc.msg(objc.id, badge_class, "alloc", .{}), "initWithString:", .{objc.nsString("New")});
-        objc.msg(void, update_mi, "setBadge:", .{badge});
-    }
-    objc.msg(void, update_mi, "setHidden:", .{true});
     copy_mi = addItem(menu, "Copy", "copy:", 0, "", "doc.on.doc");
     objc.msg(void, copy_mi, "setHidden:", .{true});
     pack_mi = addItem(menu, "Copy", "copyPack:", 0, "", "doc.on.doc");
@@ -1342,9 +1374,15 @@ fn runMenuBar() noreturn {
     objc.msg(void, note_mi, "setHidden:", .{true});
     addSeparator(menu);
 
-    _ = addItem(menu, "Quit sushibar", "quit:", 0, "q", "power");
+    const buttons_mi = objc.new(objc.class("NSMenuItem"));
+    objc.msg(void, buttons_mi, "setView:", .{button_row.create(menu_target, menu)});
+    objc.msg(void, menu, "addItem:", .{buttons_mi});
+    // The Quit button is the visible row; this item only keeps ⌘Q.
+    const quit_mi = addItem(menu, "Quit sushibar", "quit:", 0, "q", null);
+    objc.msg(void, quit_mi, "setHidden:", .{true});
     objc.msg(void, status_item, "setMenu:", .{menu});
     objc.addTimer(@as(f64, poll_ms) / 1000.0, menu_target, "tick:");
+    objc.addTimer(0.5, menu_target, "logTick:");
 
     _ = std.Thread.spawn(.{}, pollLoop, .{}) catch fail("cannot start the poll thread", .{});
     objc.msg(void, app, "run", .{});
@@ -1423,7 +1461,79 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
             if (!port_field.renderPng(field, pz.ptr, dark)) std.debug.print("sushibar: could not render {s}\n", .{pz});
         }
     }
+    renderButtonsAndLog(dir);
     std.process.exit(0);
+}
+
+fn renderButtonsAndLog(dir: []const u8) void {
+    const row = button_row.create(null, null);
+    const Case = struct { name: []const u8, uv: logic.UpdateView = .{}, hover: ?usize = null, pressed: ?usize = null };
+    const cases = [_]Case{
+        .{ .name = "normal" },
+        .{ .name = "hover-log", .hover = 0 },
+        .{ .name = "pressed-quit", .hover = 2, .pressed = 2 },
+        .{ .name = "update", .uv = .{ .available = true, .latest = "1.5.1", .path = .server } },
+        .{ .name = "update-hover", .uv = .{ .available = true, .latest = "1.5.1", .path = .server }, .hover = 1 },
+        .{ .name = "update-pressed", .uv = .{ .available = true, .latest = "1.5.1", .path = .server }, .pressed = 1 },
+        .{ .name = "brew", .uv = .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi" } },
+        .{ .name = "checking", .uv = .{ .busy = .checking } },
+    };
+    for (cases) |c| {
+        var tip: [160]u8 = undefined;
+        const b = logic.updateButton(&tip, c.uv);
+        button_row.setUpdate(.{ .label = b.label, .symbol = b.symbol, .tip = b.tip, .accent = b.accent, .enabled = b.enabled });
+        for ([_]bool{ false, true }) |dark| {
+            var path: [std.fs.max_path_bytes:0]u8 = undefined;
+            const pz = std.fmt.bufPrintSentinel(&path, "{s}/buttons-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;
+            if (!button_row.renderPng(row, pz.ptr, dark, c.hover, c.pressed)) std.debug.print("sushibar: could not render {s}\n", .{pz});
+        }
+    }
+    const sample =
+        \\2026-11-04 09:12:01 [info] Logging to /Users/me/.sushi/logs/sushi-11250.log (rotates at 100 MB)
+        \\2026-11-04 09:12:02 [info] sushi 1.5.0 serving on http://127.0.0.1:11250
+        \\2026-11-04 09:12:04 [info] [kv-cache] affine8 KV, context 262144
+        \\2026-11-04 09:12:09 [info] Loaded Example-Flash-Next-Sushi-STQ-2.75bpw in 4.8 s
+        \\2026-11-04 09:13:20 [info] <- 412+0 tokens (chat, stream)
+        \\2026-11-04 09:13:20 [warn] [admission] prefill chunk lowered to 2048 for the free memory
+        \\2026-11-04 09:13:31 [info] [spec-stats] accepted 2.31 of 3 drafted
+        \\2026-11-04 09:13:34 [info] -> 288 tokens, 142.6 tok/s decode
+        \\2026-11-04 09:14:02 [error] jinja error: unknown filter 'tojson_pretty'
+        \\2026-11-04 09:14:40 [info] [hot-cache] kept 3 entries, 1.2 GB
+        \\
+    ;
+    const std_path = "/Users/me/.sushi/logs/sushi-11250.log";
+    for ([_]bool{ false, true }) |dark| {
+        var path: [std.fs.max_path_bytes:0]u8 = undefined;
+        const pz = std.fmt.bufPrintSentinel(&path, "{s}/log-window-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch continue;
+        if (!log_view.renderPng(pz.ptr, dark, .{ .port = 11250, .src = .{ .kind = .standard, .path = std_path }, .sample = sample })) std.debug.print("sushibar: could not render {s}\n", .{pz});
+    }
+    var nb: [600]u8 = undefined;
+    const notice = logic.logNotice(&nb, 11250, .{ .kind = .standard, .path = std_path });
+    var path: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (std.fmt.bufPrintSentinel(&path, "{s}/log-window-missing-light.png", .{dir}, 0)) |pz| {
+        if (!log_view.renderPng(pz.ptr, false, .{ .port = 11250, .src = .{ .kind = .standard, .path = std_path }, .sample = notice })) std.debug.print("sushibar: could not render {s}\n", .{pz});
+    } else |_| {}
+    renderFollowedLog(dir);
+}
+
+/// The window reading a real file: its last lines on open, then what the file grew by.
+fn renderFollowedLog(dir: []const u8) void {
+    var path: [std.fs.max_path_bytes:0]u8 = undefined;
+    const file = std.fmt.bufPrint(&path, "{s}/followed.log", .{dir}) catch return;
+    var text: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer text.deinit();
+    const w = &text.writer;
+    for (1..3001) |i| w.print("line {d} of the first read\n", .{i}) catch return;
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = file, .data = text.written() }) catch return;
+    const src: logic.LogSource = .{ .kind = .given, .path = file };
+    log_view.sync(11250, src);
+    for (3001..3006) |i| w.print("line {d} appended later\n", .{i}) catch return;
+    w.writeAll("a line still being writ") catch return;
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = file, .data = text.written() }) catch return;
+    log_view.sync(11250, src);
+    var png: [std.fs.max_path_bytes:0]u8 = undefined;
+    const pz = std.fmt.bufPrintSentinel(&png, "{s}/log-window-followed-light.png", .{dir}, 0) catch return;
+    if (!log_view.renderPng(pz.ptr, false, null)) std.debug.print("sushibar: could not render {s}\n", .{pz});
 }
 
 // ── Launch ──

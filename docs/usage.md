@@ -16,9 +16,10 @@ The release tarball also holds `sushibar`, a menu bar item for the server: run `
 the terminal. The title is the live decode tok/s (dim for the last request's once idle). Its menu opens on a status
 card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph) and then starts or stops the server
 on the watched port (asking first for one it did not start), switches the port (pick a listening server or type a number in the field; the choice is remembered; `--port`
-wins, then sushi's default 12345), checks for and installs updates (Homebrew installs get a Copy "brew upgrade sushi"
-item; a running sushibar never blocks `sushi update` and restarts itself on the new version), and opens the
-dashboard, chat, Models and Settings pages (⌘1-⌘4).
+wins, then sushi's default 12345), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
+three buttons: Log (a window that follows the watched server's log live), Update (Check, or Update while a release
+waits; Homebrew installs get a Copy "brew upgrade sushi" item and the button copies it; a running sushibar never
+blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q).
 
 A browser download is quarantined: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`. GPU memory and the
 largest context per Mac: [README, Memory](../README.md#memory).

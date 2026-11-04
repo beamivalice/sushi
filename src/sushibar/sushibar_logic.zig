@@ -483,6 +483,25 @@ pub fn updateEnabled(v: UpdateView) bool {
     return v.available and v.busy == .none and (v.path == .server or v.path == .cli);
 }
 
+pub const ButtonAction = enum { none, check, update, copy_command };
+
+/// The menu's one update button: Update while a release waits (or Copy for a Homebrew one), Check otherwise.
+pub const UpdateButton = struct { label: []const u8, symbol: []const u8, tip: []const u8, accent: bool, enabled: bool, action: ButtonAction };
+
+pub fn updateButton(buf: []u8, v: UpdateView) UpdateButton {
+    const check_symbol = "arrow.triangle.2.circlepath";
+    switch (v.busy) {
+        .checking => return .{ .label = "Checking…", .symbol = check_symbol, .tip = "Checking for updates", .accent = false, .enabled = false, .action = .none },
+        .updating => return .{ .label = "Updating…", .symbol = "arrow.down.circle", .tip = "Updating sushi", .accent = true, .enabled = false, .action = .none },
+        .none => {},
+    }
+    if (v.available and v.path == .brew)
+        return .{ .label = "Copy", .symbol = "doc.on.doc", .tip = copyLabel(buf, v.command), .accent = true, .enabled = true, .action = .copy_command };
+    if (v.available and updateEnabled(v))
+        return .{ .label = "Update", .symbol = "arrow.down.circle", .tip = updateLabel(buf, v) orelse "Update", .accent = true, .enabled = true, .action = .update };
+    return .{ .label = "Check", .symbol = check_symbol, .tip = "Check for Updates", .accent = false, .enabled = true, .action = .check };
+}
+
 // ── Menu ─────────────────────────────────────────────────────────────────
 
 pub const Page = enum {
@@ -792,26 +811,49 @@ pub fn pidAlive(e: PidEntry, probe: Probe, want_exe: []const u8, server: bool) b
     return !server or argsServe(probe.args orelse return false, e.port);
 }
 
-/// `args` is a KERN_PROCARGS2 buffer: argc, the executable path, NUL padding, then argc NUL-separated strings.
+/// The arguments of a KERN_PROCARGS2 buffer (argc, the executable path, NUL padding, then argc NUL-separated
+/// strings): the environment that follows them is never yielded.
+const ProcArgs = struct {
+    it: std.mem.SplitIterator(u8, .scalar),
+    left: usize,
+
+    fn init(args: []const u8) ?ProcArgs {
+        if (args.len < 4) return null;
+        const argc: usize = @intCast(@max(0, std.mem.readInt(i32, args[0..4], builtin.cpu.arch.endian())));
+        var it = std.mem.splitScalar(u8, args[4..], 0);
+        _ = it.next();
+        while (it.peek()) |s| : (_ = it.next()) if (s.len > 0) break;
+        return .{ .it = it, .left = argc };
+    }
+
+    fn next(self: *ProcArgs) ?[]const u8 {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        return self.it.next();
+    }
+};
+
 pub fn argsServe(args: []const u8, port: u16) bool {
-    if (args.len < 4) return false;
-    const argc: usize = @intCast(@max(0, std.mem.readInt(i32, args[0..4], builtin.cpu.arch.endian())));
-    var it = std.mem.splitScalar(u8, args[4..], 0);
-    _ = it.next();
-    while (it.peek()) |s| : (_ = it.next()) if (s.len > 0) break;
+    var it = ProcArgs.init(args) orelse return false;
     var want: [8]u8 = undefined;
     const port_text = std.fmt.bufPrint(&want, "{d}", .{port}) catch return false;
     var serving = false;
     var port_ok = false;
     var prev: []const u8 = "";
-    var seen: usize = 0;
-    while (it.next()) |a| : (seen += 1) {
-        if (seen >= argc) break;
+    while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--serve")) serving = true;
         if (std.mem.eql(u8, prev, "--port") and std.mem.eql(u8, a, port_text)) port_ok = true;
         prev = a;
     }
     return serving and port_ok;
+}
+
+/// The value of `--log-file` in a process's arguments.
+pub fn argsLogFile(args: []const u8) ?[]const u8 {
+    var it = ProcArgs.init(args) orelse return null;
+    var prev: []const u8 = "";
+    while (it.next()) |a| : (prev = a) if (std.mem.eql(u8, prev, "--log-file")) return a;
+    return null;
 }
 
 /// `name` in the directory of the running executable.
@@ -898,6 +940,84 @@ pub fn portLabel(buf: []u8, e: PortEntry) []const u8 {
         .unknown => "…",
     };
     return std.fmt.bufPrint(buf, "{d} — {s}", .{ e.port, what }) catch "";
+}
+
+// ── Log window ───────────────────────────────────────────────────────────
+
+/// `standard`: the per-port default, the file when the server was not started with `--log-file`.
+pub const LogKind = enum { standard, given, off, relative };
+pub const LogSource = struct { kind: LogKind, path: []const u8 = "" };
+
+/// Where the server on `port` writes its log. `server_args` are its KERN_PROCARGS2 bytes when a sushi listens
+/// there; without them the default file is the answer.
+pub fn logSource(buf: []u8, home: []const u8, port: u16, server_args: ?[]const u8) LogSource {
+    if (server_args) |args| if (argsLogFile(args)) |v| {
+        if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "none")) return .{ .kind = .off };
+        const path = std.fmt.bufPrint(buf, "{s}", .{v}) catch return standardLog(buf, home, port);
+        return .{ .kind = if (v.len > 0 and v[0] == '/') .given else .relative, .path = path };
+    };
+    return standardLog(buf, home, port);
+}
+
+fn standardLog(buf: []u8, home: []const u8, port: u16) LogSource {
+    const path = std.fmt.bufPrint(buf, "{s}/.sushi/logs/sushi-{d}.log", .{ home, port }) catch "";
+    return .{ .kind = .standard, .path = path };
+}
+
+/// What the log window says in place of text: the file it looked for, or why there is none.
+pub fn logNotice(buf: []u8, port: u16, src: LogSource) []const u8 {
+    const t = switch (src.kind) {
+        .standard => std.fmt.bufPrint(buf, "No log file yet.\n\nLooked for {s}\n\nsushi writes it when it starts. A server started with --log-file logs to that file instead.", .{src.path}),
+        .given => std.fmt.bufPrint(buf, "No log file yet.\n\nThe server on port {d} was started with --log-file {s}.", .{ port, src.path }),
+        .off => std.fmt.bufPrint(buf, "The server on port {d} was started with --log-file off, so it keeps no log file.", .{port}),
+        .relative => std.fmt.bufPrint(buf, "The server on port {d} was started with --log-file {s}, a relative path: sushibar cannot tell which folder it is relative to.", .{ port, src.path }),
+    };
+    return t catch "No log file.";
+}
+
+/// Where the last `max` lines of `text` begin.
+pub fn tailStart(text: []const u8, max: usize) usize {
+    if (max == 0) return text.len;
+    var end = text.len;
+    if (end > 0 and text[end - 1] == '\n') end -= 1;
+    var seen: usize = 0;
+    var i = end;
+    while (i > 0) {
+        i -= 1;
+        if (text[i] == '\n') {
+            seen += 1;
+            if (seen == max) return i + 1;
+        }
+    }
+    return 0;
+}
+
+/// Bytes of `chunk` up to its last newline: a line the server is still writing waits for the rest.
+pub fn completeLen(chunk: []const u8) usize {
+    return if (std.mem.lastIndexOfScalar(u8, chunk, '\n')) |i| i + 1 else 0;
+}
+
+pub fn countLines(text: []const u8) usize {
+    return std.mem.count(u8, text, "\n");
+}
+
+/// How far into which file (device and inode) the window has read.
+pub const Follow = struct { offset: u64 = 0, file: u64 = 0 };
+pub const FollowStep = enum { idle, append, reload };
+
+/// A shorter file was truncated and a different one rotated in: both start over.
+pub fn followStep(f: Follow, size: u64, file: u64) FollowStep {
+    if (file != f.file or size < f.offset) return .reload;
+    return if (size > f.offset) .append else .idle;
+}
+
+pub fn rebuildDue(shown: usize, opened_with: usize) bool {
+    return shown > opened_with * 2;
+}
+
+/// The view is following the log while its visible bottom is within a few points of the text's end.
+pub fn atBottom(visible_max_y: f64, doc_height: f64) bool {
+    return visible_max_y >= doc_height - 24;
 }
 
 test "ports: an explicit --port beats the saved one, which beats the default" {
@@ -1552,4 +1672,118 @@ test "sushi is looked up beside the running executable" {
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("/opt/s/sushi", siblingPath(&b, "/opt/s/sushibar", "sushi").?);
     try std.testing.expect(siblingPath(&b, "sushibar", "sushi") == null);
+}
+
+test "update button: Update when one waits, Check otherwise, and what each runs" {
+    var b: [96]u8 = undefined;
+    const idle = updateButton(&b, .{});
+    try std.testing.expectEqualStrings("Check", idle.label);
+    try std.testing.expectEqual(ButtonAction.check, idle.action);
+    try std.testing.expect(!idle.accent and idle.enabled);
+    try std.testing.expectEqualStrings("Check for Updates", idle.tip);
+
+    const waiting = updateButton(&b, .{ .available = true, .latest = "1.5.1", .path = .server });
+    try std.testing.expectEqualStrings("Update", waiting.label);
+    try std.testing.expectEqual(ButtonAction.update, waiting.action);
+    try std.testing.expect(waiting.accent and waiting.enabled);
+    try std.testing.expectEqualStrings("Update to sushi 1.5.1", waiting.tip);
+
+    const cli = updateButton(&b, .{ .available = true, .latest = "1.5.1", .path = .cli });
+    try std.testing.expectEqual(ButtonAction.update, cli.action);
+}
+
+test "update button: a Homebrew update copies its command, a busy one waits" {
+    var b: [96]u8 = undefined;
+    const brew = updateButton(&b, .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi" });
+    try std.testing.expectEqualStrings("Copy", brew.label);
+    try std.testing.expectEqual(ButtonAction.copy_command, brew.action);
+    try std.testing.expect(brew.accent and brew.enabled);
+    try std.testing.expectEqualStrings("Copy “brew upgrade sushi”", brew.tip);
+
+    const checking = updateButton(&b, .{ .busy = .checking });
+    try std.testing.expectEqualStrings("Checking…", checking.label);
+    try std.testing.expect(!checking.enabled and checking.action == .none);
+    const updating = updateButton(&b, .{ .available = true, .path = .server, .busy = .updating });
+    try std.testing.expectEqualStrings("Updating…", updating.label);
+    try std.testing.expect(!updating.enabled and updating.action == .none);
+}
+
+test "log source: the default file is per port, --log-file moves or turns it off" {
+    var b: [128]u8 = undefined;
+    const home = "/Users/x";
+    const plain = logSource(&b, home, 11250, null);
+    try std.testing.expectEqual(LogKind.standard, plain.kind);
+    try std.testing.expectEqualStrings("/Users/x/.sushi/logs/sushi-11250.log", plain.path);
+
+    const own = procargs(&.{ "/opt/sushi", "--serve", "--port", "11250" });
+    try std.testing.expectEqualStrings("/Users/x/.sushi/logs/sushi-11250.log", logSource(&b, home, 11250, own).path);
+
+    const moved = procargs(&.{ "/opt/sushi", "--serve", "--log-file", "/var/log/s.log", "--port", "9" });
+    const m = logSource(&b, home, 9, moved);
+    try std.testing.expectEqual(LogKind.given, m.kind);
+    try std.testing.expectEqualStrings("/var/log/s.log", m.path);
+
+    try std.testing.expectEqual(LogKind.off, logSource(&b, home, 1, procargs(&.{ "/opt/sushi", "--serve", "--log-file", "off" })).kind);
+    try std.testing.expectEqual(LogKind.off, logSource(&b, home, 1, procargs(&.{ "/opt/sushi", "--log-file", "none" })).kind);
+
+    const r = logSource(&b, home, 1, procargs(&.{ "/opt/sushi", "--log-file", "run/s.log" }));
+    try std.testing.expectEqual(LogKind.relative, r.kind);
+    try std.testing.expectEqualStrings("run/s.log", r.path);
+}
+
+test "log source: a --log-file with no value is not one, and the environment after argv is not read" {
+    try std.testing.expect(argsLogFile(procargs(&.{ "/opt/sushi", "--serve", "--log-file" })) == null);
+}
+
+test "log notice: says which file was looked for and why there is none" {
+    var b: [400]u8 = undefined;
+    const std_missing = logNotice(&b, 11250, .{ .kind = .standard, .path = "/h/.sushi/logs/sushi-11250.log" });
+    try std.testing.expect(std.mem.indexOf(u8, std_missing, "/h/.sushi/logs/sushi-11250.log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std_missing, "--log-file") != null);
+    const off = logNotice(&b, 7, .{ .kind = .off });
+    try std.testing.expect(std.mem.indexOf(u8, off, "port 7") != null and std.mem.indexOf(u8, off, "--log-file off") != null);
+    const rel = logNotice(&b, 7, .{ .kind = .relative, .path = "run/s.log" });
+    try std.testing.expect(std.mem.indexOf(u8, rel, "run/s.log") != null and std.mem.indexOf(u8, rel, "relative") != null);
+    const given = logNotice(&b, 7, .{ .kind = .given, .path = "/v/s.log" });
+    try std.testing.expect(std.mem.indexOf(u8, given, "/v/s.log") != null);
+}
+
+test "log tail: the last N complete lines, whatever the file ends with" {
+    const text = "a\nb\nc\nd\n";
+    try std.testing.expectEqual(@as(usize, 0), tailStart(text, 10));
+    try std.testing.expectEqualStrings("c\nd\n", text[tailStart(text, 2)..]);
+    try std.testing.expectEqualStrings("d\n", text[tailStart(text, 1)..]);
+    try std.testing.expectEqual(text.len, tailStart(text, 0));
+    try std.testing.expectEqual(@as(usize, 0), tailStart("", 5));
+    try std.testing.expectEqualStrings("\n\n", "x\n\n\n"[tailStart("x\n\n\n", 2)..]);
+}
+
+test "log tail: only complete lines are taken, the rest waits for its newline" {
+    try std.testing.expectEqual(@as(usize, 3), completeLen("ab\nc"));
+    try std.testing.expectEqual(@as(usize, 3), completeLen("ab\n"));
+    try std.testing.expectEqual(@as(usize, 0), completeLen("abc"));
+    try std.testing.expectEqual(@as(usize, 0), completeLen(""));
+    try std.testing.expectEqual(@as(usize, 3), countLines("a\nb\nc\n"));
+}
+
+test "log follow: growth appends, a smaller or different file reloads, nothing new is idle" {
+    const f: Follow = .{ .offset = 100, .file = 7 };
+    try std.testing.expectEqual(FollowStep.idle, followStep(f, 100, 7));
+    try std.testing.expectEqual(FollowStep.append, followStep(f, 180, 7));
+    try std.testing.expectEqual(FollowStep.reload, followStep(f, 40, 7));
+    try std.testing.expectEqual(FollowStep.reload, followStep(f, 400, 8));
+    try std.testing.expectEqual(FollowStep.reload, followStep(.{}, 0, 3));
+}
+
+test "log follow: the window is rebuilt before it holds more than twice the lines it opened with" {
+    try std.testing.expect(!rebuildDue(2000, 2000));
+    try std.testing.expect(!rebuildDue(4000, 2000));
+    try std.testing.expect(rebuildDue(4001, 2000));
+}
+
+test "log scroll: following resumes only at the bottom" {
+    try std.testing.expect(atBottom(1000, 1000));
+    try std.testing.expect(atBottom(990, 1000));
+    try std.testing.expect(!atBottom(600, 1000));
+    try std.testing.expect(atBottom(1200, 1000));
 }

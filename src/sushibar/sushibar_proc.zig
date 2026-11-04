@@ -13,14 +13,14 @@ const lock_nb = 4;
 
 const ctl_kern = 1;
 const kern_procargs2 = 49;
-const args_cap = 128 * 1024;
+pub const args_cap = 128 * 1024;
 
 pub fn exeOfPid(pid: i32, buf: []u8) ?[]const u8 {
     const n = proc_pidpath(pid, buf.ptr, @intCast(buf.len));
     return if (n > 0) buf[0..@intCast(n)] else null;
 }
 
-fn argsOfPid(pid: i32, buf: []u8) ?[]const u8 {
+pub fn argsOfPid(pid: i32, buf: []u8) ?[]const u8 {
     const mib = [_]c_int{ ctl_kern, kern_procargs2, pid };
     var len: usize = buf.len;
     if (std.c.sysctl(&mib, mib.len, buf.ptr, &len, null, 0) != 0) return null;
