@@ -1,7 +1,8 @@
-//! The menu's last row: Log, Update and Quit as three rounded buttons in one custom menu-item view. A button
-//! highlights under the pointer and while pressed; a click sends its selector to the app's target, closing the
-//! menu first unless the button says it stays open. What the Update button says and does is decided in
-//! `sushibar_logic.zig` (`updateButton`). Single instance: its state is module-level.
+//! The menu's two button rows, each one custom menu-item view of rounded buttons: Start/Stop and Load/Unload, and
+//! Log, Update and Quit. A button highlights under the pointer and while pressed; a click sends its selector to
+//! the app's target, closing the menu first unless the button says it stays open. What each button says and does
+//! is decided in `sushibar_logic.zig` (`updateButton`, `toggle`, `modelButton`). Single instance: its state is
+//! module-level.
 const std = @import("std");
 const objc = @import("objc.zig");
 
@@ -48,11 +49,15 @@ const Btn = struct {
 const log_i = 0;
 const update_i = 1;
 const quit_i = 2;
+const start_i = 3;
+const load_i = 4;
 
-var btns = [3]Btn{
+var btns = [5]Btn{
     .{ .selector = "showLog:" },
     .{ .selector = "updateButton:" },
     .{ .selector = "quit:" },
+    .{ .selector = "toggle:" },
+    .{ .selector = "loadModel:" },
 };
 var target: id = null;
 var menu: id = null;
@@ -171,25 +176,35 @@ fn mouseDown(self: id, _: objc.SEL, _: id) callconv(.c) void {
     msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.sel(selector), self, @as(f64, 0) });
 }
 
-/// `target` receives `showLog:`, `updateButton:` and `quit:`; `top_menu` is closed when one is clicked.
-pub fn create(app_target: id, top_menu: id) id {
+/// `target` receives `showLog:`, `updateButton:`, `quit:`, `toggle:` and `loadModel:`; `top_menu` is closed when
+/// one is clicked.
+pub fn init(app_target: id, top_menu: id) void {
     target = app_target;
     menu = top_menu;
-    const cls = objc.defineSubclass("NSView", "SushiBarMenuButton", &.{
+}
+
+var button_class: id = null;
+
+/// Registered once: both rows draw the same buttons.
+fn buttonClass() id {
+    if (button_class != null) return button_class;
+    button_class = objc.defineSubclass("NSView", "SushiBarMenuButton", &.{
         .{ .selector = "drawRect:", .imp = @ptrCast(&drawRect), .types = "v@:{CGRect={CGPoint=dd}{CGSize=dd}}" },
         .{ .selector = "mouseEntered:", .imp = @ptrCast(&mouseEntered), .types = "v@:@" },
         .{ .selector = "mouseExited:", .imp = @ptrCast(&mouseExited), .types = "v@:@" },
         .{ .selector = "mouseDown:", .imp = @ptrCast(&mouseDown), .types = "v@:@" },
         .{ .selector = "acceptsFirstMouse:", .imp = @ptrCast(&acceptsFirstMouse), .types = "c@:@" },
     });
+    return button_class;
+}
+
+/// One row view holding `looks.len` equal buttons that are `btns[first..]`.
+fn buildRow(first: usize, looks: []const Look) id {
+    const cls = buttonClass();
     const row = msg(id, msg(id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = width, .h = height }});
-    const bw = (width - 2 * pad - 2 * gap) / 3;
-    const looks = [_]Look{
-        .{ .label = "Log", .symbol = "doc.text", .tip = "Show the server log" },
-        .{ .label = "Check", .symbol = "arrow.triangle.2.circlepath", .tip = "Check for Updates" },
-        .{ .label = "Quit", .symbol = "power", .tip = "Quit sushibar (⌘Q)" },
-    };
-    for (&btns, looks, 0..) |*b, look, i| {
+    const n: f64 = @floatFromInt(looks.len);
+    const bw = (width - 2 * pad - (n - 1) * gap) / n;
+    for (btns[first..][0..looks.len], looks, 0..) |*b, look, i| {
         const frame = NSRect{ .x = pad + @as(f64, @floatFromInt(i)) * (bw + gap), .y = (height - button_h) / 2, .w = bw, .h = button_h };
         b.view = msg(id, msg(id, cls, "alloc", .{}), "initWithFrame:", .{frame});
         const area = msg(id, msg(id, objc.class("NSTrackingArea"), "alloc", .{}), "initWithRect:options:owner:userInfo:", .{ NSRect{ .x = 0, .y = 0, .w = 0, .h = 0 }, tracking_enter_exit_always_visible, b.view, @as(id, null) });
@@ -202,9 +217,26 @@ pub fn create(app_target: id, top_menu: id) id {
         msg(void, b.wheel, "setHidden:", .{true});
         msg(void, b.view, "addSubview:", .{b.wheel});
         objc.release(b.wheel);
-        set(i, look);
+        set(first + i, look);
     }
     return row;
+}
+
+/// Log, Update and Quit.
+pub fn createFooter() id {
+    return buildRow(log_i, &.{
+        .{ .label = "Log", .symbol = "doc.text", .tip = "Show the server log" },
+        .{ .label = "Check", .symbol = "arrow.triangle.2.circlepath", .tip = "Check for Updates" },
+        .{ .label = "Quit", .symbol = "power", .tip = "Quit sushibar (⌘Q)" },
+    });
+}
+
+/// Start/Stop and Load/Unload.
+pub fn createServerRow() id {
+    return buildRow(start_i, &.{
+        .{ .label = "Start Server", .symbol = "play.fill", .closes_menu = false },
+        .{ .label = "Load", .symbol = "arrow.down.circle", .enabled = false, .closes_menu = false },
+    });
 }
 
 fn set(i: usize, look: Look) void {
@@ -241,6 +273,14 @@ pub fn setQuit(look: Look) void {
     set(quit_i, look);
 }
 
+pub fn setStart(look: Look) void {
+    set(start_i, look);
+}
+
+pub fn setLoad(look: Look) void {
+    set(load_i, look);
+}
+
 /// A menu that closed under the pointer sends no exit: the highlight is dropped once the row is off screen.
 pub fn dropStaleHover() void {
     for (&btns) |*b| {
@@ -252,9 +292,10 @@ pub fn dropStaleHover() void {
     }
 }
 
-/// The three buttons in `dark` or light appearance at 2x on an opaque background; `hover` and `pressed` pick a
-/// button (0 Log, 1 Update, 2 Quit) to draw in that state.
-pub fn renderPng(row: id, path: [*:0]const u8, dark: bool, hover: ?usize, pressed: ?usize) bool {
+/// A row in `dark` or light appearance at 2x on an opaque background; `hover` and `pressed` pick a button
+/// (0 Log, 1 Update, 2 Quit, 3 Start, 4 Load) to draw in that state. A `caption` is drawn under it as the menu's
+/// inert line is.
+pub fn renderPng(row: id, path: [*:0]const u8, dark: bool, hover: ?usize, pressed: ?usize, caption: []const u8) bool {
     opaque_bg = true;
     defer opaque_bg = false;
     for (&btns, 0..) |*b, i| {
@@ -265,12 +306,32 @@ pub fn renderPng(row: id, path: [*:0]const u8, dark: bool, hover: ?usize, presse
         b.hover = false;
         b.pressed = false;
     };
+    const caption_h: f64 = if (caption.len > 0) 22 else 0;
+    const bounds = NSRect{ .x = 0, .y = 0, .w = width, .h = height + caption_h };
+    const host = msg(id, msg(id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{bounds});
+    defer objc.release(host);
+    msg(void, row, "setFrameOrigin:", .{objc.NSPoint{ .x = 0, .y = caption_h }});
+    msg(void, host, "addSubview:", .{row});
+    defer {
+        msg(void, row, "removeFromSuperview", .{});
+        msg(void, row, "setFrameOrigin:", .{objc.NSPoint{ .x = 0, .y = 0 }});
+    }
+    if (caption.len > 0) {
+        var z: [128:0]u8 = undefined;
+        setZ(&z, caption);
+        const label = msg(id, objc.class("NSTextField"), "labelWithString:", .{objc.nsString(&z)});
+        msg(void, label, "setFrame:", .{NSRect{ .x = 0, .y = 0, .w = width, .h = caption_h }});
+        msg(void, label, "setDrawsBackground:", .{true});
+        msg(void, label, "setBackgroundColor:", .{color("windowBackgroundColor")});
+        msg(void, label, "setTextColor:", .{color("secondaryLabelColor")});
+        msg(void, label, "setFont:", .{msg(id, objc.class("NSFont"), "menuFontOfSize:", .{@as(f64, 12)})});
+        msg(void, host, "addSubview:", .{label});
+    }
     const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
-    msg(void, row, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
-    const bounds = NSRect{ .x = 0, .y = 0, .w = width, .h = height };
-    const rep = msg(id, row, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
+    msg(void, host, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
+    const rep = msg(id, host, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
     if (rep == null) return false;
-    msg(void, row, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
+    msg(void, host, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
     const data = msg(id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(id, null) });
     if (data == null) return false;
     return msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(path), true });

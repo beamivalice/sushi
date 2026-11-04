@@ -1,7 +1,7 @@
 #!/bin/bash
 # sushi-test: tier=host
 # sushibar, the menu bar app: argument and session refusals by name, no MLX in its link line, and runs under a
-# private HOME on private ports (default 18801-18807): Start launches a headless sushi beside it, the pid files and
+# private HOME on private ports (default 18801-18807): Start launches a headless sushi beside it and loads nothing, the pid files and
 # /health agree, Stop ends only that server, a second sushibar defers; a sushi that sushibar did NOT start is found
 # by the libproc scan, listed in the Port data, switched to, saved, and stopped only through the confirm path (never
 # without the confirm seam); a saved port is used on relaunch and an explicit --port beats it; a port held by a
@@ -120,7 +120,8 @@ check "its pid file is gone" "$(yes_if '[ ! -f "$HOME/.sushi/sushibar.pid" ]')"
 check "the icon is the outline offline and the colour one once the server answers" "$(yes_if 'grep -q "poll 1 .*icon=outline" "$LOG" && grep -q "running, no model loaded.*icon=color" "$LOG" && tail -n 1 "$LOG" | grep -q "icon=outline"')"
 check "the first poll reads not running with Start enabled, the port named" "$(yes_if 'grep -q "poll 1 title=\"\" status=\"Port '"$PORT"': not running\" start=1 stop=0" "$LOG"')"
 check "an idle server reads an icon-only title with Stop enabled" "$(yes_if 'grep -q "title=\"\" status=\"Port '"$PORT"': running, no model loaded\" start=0 stop=1" "$LOG"')"
-check "the header says Stopped with a Start toggle, then No model pointing at the Models page with a Stop toggle" "$(yes_if 'grep -q "poll 1 .*pill=\"Stopped\" line1=\"Ready to start\" line2=\"Port '"$PORT"'\" toggle=\"Start Server\"" "$LOG" && grep -q "pill=\"No model\" line1=\"Open Models to load one\".*toggle=\"Stop Server\"" "$LOG"')"
+check "the header says Stopped with a Start toggle, then No model pointing at the Models page with a Stop toggle" "$(yes_if 'grep -q "poll 1 .*pill=\"Stopped\" line1=\"Ready to start · port '"$PORT"'\" line2=\"No model to load yet\" toggle=\"Start Server\"" "$LOG" && grep -q "pill=\"No model\" line1=\"Open Models to load one\".*toggle=\"Stop Server\"" "$LOG"')"
+check "Load is off with its reason before the server answers and with no model to load" "$(yes_if 'grep -q "poll 1 .*load=\"Load\" load_on=0 why=\"Start the server to load a model\"" "$LOG" && grep -q "pill=\"No model\".*load=\"Load\" load_on=0 why=\"No model to load yet: pick one in Models\"" "$LOG"')"
 check "the Port data lists the running server, checked" "$(yes_if 'grep -q "ports=\".*'"$PORT"' — no model\*;" "$LOG"')"
 check "Stop ended the server it started" "$(yes_if '! kill -0 "$SRVPID" 2>/dev/null')"
 check "the last poll reads not running again" "$(yes_if 'tail -n 1 "$LOG" | grep -q "poll 16 .*Port '"$PORT"': not running"')"
@@ -333,7 +334,7 @@ check "back on the first port, its server is sushibar's own (Stop without the co
 kill "$P1" "$P2" 2>/dev/null
 rm -f "$HOME"/.sushi/sushibar-server-*.pid
 
-echo "== a started server comes back with the model it last had, and its exit is reported =="
+echo "== Start brings the server up empty, Load and Unload act on the last model, and a server exit is reported =="
 LM="$WORK/lm"
 mkdir -p "$LM"
 cat > "$LM/fake.c" <<'EOF'
@@ -347,7 +348,8 @@ cat > "$LM/fake.c" <<'EOF'
 #include <sys/socket.h>
 #include <unistd.h>
 /* A stand-in for `sushi --serve --port N`: answers the feeds sushibar reads, lists FAKE_READY as the ready model
-   and appends the body of every POST /v1/load-model to FAKE_LOG. */
+   appends the body of every POST /v1/load-model (and "unload " and the body of every /v1/unload-model) to FAKE_LOG,
+   and lists the model last loaded, until unloaded. */
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--version")) { puts("sushi 1.0.0"); return 0; }
     int port = 0;
@@ -361,6 +363,8 @@ int main(int argc, char **argv) {
     a.sin_addr.s_addr = htonl(0x7f000001);
     if (bind(fd, (void *)&a, sizeof a) || listen(fd, 16)) return 1;
     const char *ready = getenv("FAKE_READY"), *log = getenv("FAKE_LOG");
+    static char cur[128];
+    if (ready) snprintf(cur, sizeof cur, "%s", ready);
     for (;;) {
         int c = accept(fd, 0, 0);
         if (c < 0) continue;
@@ -375,11 +379,14 @@ int main(int argc, char **argv) {
         }
         char body[512] = "{}";
         if (!strncmp(req, "GET /v1/models", 14))
-            snprintf(body, sizeof body, ready ? "{\"data\":[{\"id\":\"%s\",\"state\":\"ready\"}]}" : "{\"data\":[]}", ready);
-        if (!strncmp(req, "POST /v1/load-model", 19) && log) {
-            char *end = strstr(req, "\r\n\r\n");
-            FILE *f = fopen(log, "a");
-            if (f && end) { fprintf(f, "%s\n", end + 4); fclose(f); }
+            snprintf(body, sizeof body, cur[0] ? "{\"data\":[{\"id\":\"%s\",\"state\":\"ready\"}]}" : "{\"data\":[]}", cur);
+        int is_load = !strncmp(req, "POST /v1/load-model", 19), is_unload = !strncmp(req, "POST /v1/unload-model", 21);
+        if (is_load || is_unload) {
+            char *end = strstr(req, "\r\n\r\n"), *m = end ? strstr(end, "\"model\":\"") : 0;
+            cur[0] = 0;
+            if (is_load && m) { snprintf(cur, sizeof cur, "%s", m + 9); char *q = strchr(cur, '"'); if (q) *q = 0; }
+            FILE *f = log ? fopen(log, "a") : 0;
+            if (f && end) { fprintf(f, "%s%s\n", is_unload ? "unload " : "", end + 4); fclose(f); }
         }
         char head[160];
         int hl = snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
@@ -403,13 +410,23 @@ if command -v cc > /dev/null 2>&1 && cc -o "$LM/sushi" "$LM/fake.c" 2> /dev/null
     stop_fakes
     : > "$WORK/load.log"
     FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 10 "start@2" --port "$UPORT"
-    check "the header names the model Start will load while the server is stopped" "$(yes_if 'grep -q "poll 1 .*line2=\"Port '"$UPORT"' · loads Learned-Pack\"" "$LOG"')"
-    check "Start asks the new server to load it as the web page does, as the default" "$(yes_if 'grep -q "\"model\":\"Learned-Pack\",\"default\":true" "$WORK/load.log"')"
+    check "the header names the last model under Ready to start while the server is stopped" "$(yes_if 'grep -q "poll 1 .*line1=\"Ready to start · port '"$UPORT"'\" line2=\"Learned-Pack\"" "$LOG"')"
+    check "Start brings the server up empty: nothing is asked to load, the card reads Ready to load and Load is on" "$(yes_if '[ ! -s "$WORK/load.log" ] && grep -q "pill=\"No model\" line1=\"Ready to load · port '"$UPORT"'\" line2=\"Learned-Pack\".*load=\"Load\" load_on=1" "$LOG"')"
+    stop_fakes
+    : > "$WORK/load.log"
+    FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 8 "start@2,load@2" --port "$UPORT"
+    check "a Load in the tick of the Start loads nothing: the server has not answered" "$(yes_if '[ ! -s "$WORK/load.log" ]')"
+    stop_fakes
+    : > "$WORK/load.log"
+    FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 20 "start@2,load@7,unload@13" --port "$UPORT"
+    check "Load asks the answering server for the last model as the web page does, as the default" "$(yes_if 'grep -q "\"model\":\"Learned-Pack\",\"default\":true" "$WORK/load.log"')"
+    check "the button then reads Unload with the model in its place" "$(yes_if 'grep -q "pill=\"Running\" .*load=\"Unload\" load_on=1" "$LOG"')"
+    check "Unload names the model and leaves the server running" "$(yes_if 'grep -q "^unload {\"model\":\"Learned-Pack\"}" "$WORK/load.log" && grep -q "poll 20 .*status=\"Port '"$UPORT"': running, no model loaded\".*load=\"Load\" load_on=1" "$LOG"')"
     stop_fakes
     : > "$WORK/load.log"
     echo '{"port":'"$UPORT"',"ports":[]}' > "$HOME/.sushi/sushibar.json"
     FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 8 "start@2" --port "$UPORT"
-    check "with no remembered model Start loads nothing and the header points at the Models page" "$(yes_if '[ ! -s "$WORK/load.log" ] && grep -q "pill=\"No model\" line1=\"Open Models to load one\".*models_link=1" "$LOG"')"
+    check "with no remembered model nothing is asked and the header points at the Models page" "$(yes_if '[ ! -s "$WORK/load.log" ] && grep -q "pill=\"No model\" line1=\"Open Models to load one\".*models_link=1" "$LOG"')"
     stop_fakes
 
     : > "$LOG"

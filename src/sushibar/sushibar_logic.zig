@@ -669,17 +669,60 @@ pub fn enabled(s: Server) Enabled {
 }
 
 pub const ToggleAction = enum { none, start, stop, force_stop };
-pub const Toggle = struct { label: []const u8, enabled: bool, action: ToggleAction, symbol: []const u8 };
+pub const Toggle = struct { label: []const u8, enabled: bool, action: ToggleAction, symbol: []const u8, tip: []const u8 = "" };
 
 /// The one Start/Stop item: Stop (with an ellipsis when it asks first) wherever a sushi listens on the port.
 pub fn toggle(s: Server, stopping: bool) Toggle {
     if (stopping) return .{ .label = "Stopping…", .enabled = false, .action = .none, .symbol = "hourglass" };
-    if (s.stop_stuck and (s.ours_alive or s.sushi_listening)) return .{ .label = "Force Stop", .enabled = true, .action = .force_stop, .symbol = "xmark.octagon" };
+    if (s.stop_stuck and (s.ours_alive or s.sushi_listening)) return .{ .label = "Force Stop", .enabled = true, .action = .force_stop, .symbol = "xmark.octagon", .tip = "Kill the server that did not stop" };
     if (s.ours_alive and s.link == .offline) return .{ .label = "Starting…", .enabled = false, .action = .none, .symbol = "hourglass" };
     if (s.ours_alive or s.sushi_listening)
-        return .{ .label = if (s.ours_alive) "Stop Server" else "Stop Server…", .enabled = true, .action = .stop, .symbol = "stop.fill" };
+        return .{ .label = if (s.ours_alive) "Stop Server" else "Stop Server…", .enabled = true, .action = .stop, .symbol = "stop.fill", .tip = "Stop the server" };
     const can = enabled(s).start;
-    return .{ .label = "Start Server", .enabled = can, .action = if (can) .start else .none, .symbol = "play.fill" };
+    return .{ .label = "Start Server", .enabled = can, .action = if (can) .start else .none, .symbol = "play.fill", .tip = if (can) "Start the server with no model" else "" };
+}
+
+pub const ModelIn = struct {
+    link: Link,
+    connecting: bool = false,
+    /// A server sushibar started is alive and has not answered yet.
+    starting: bool = false,
+    /// The model the watched server has loaded.
+    model: ?[]const u8 = null,
+    /// The model the server last had loaded, the only one Load brings back.
+    last_model: []const u8 = "",
+    /// A load, from here or the web page, is running.
+    loading: bool = false,
+    unloading: bool = false,
+};
+
+pub const ModelAction = enum { none, load, unload };
+
+/// `why` is the line the menu shows under the buttons while the button is off and nothing is running.
+pub const ModelButton = struct { label: []const u8, symbol: []const u8, tip: []const u8, enabled: bool, spinner: bool, action: ModelAction, why: []const u8 };
+
+/// The one Load/Unload button. Load asks a server that already answers for the last model; it is never offered
+/// before that, so a Start can never load.
+pub fn modelButton(buf: []u8, in: ModelIn) ModelButton {
+    if (in.unloading) return .{ .label = "Unloading…", .symbol = "", .tip = "Unloading the model", .enabled = false, .spinner = true, .action = .none, .why = "" };
+    if (in.loading) return .{ .label = "Loading…", .symbol = "", .tip = "Loading the model", .enabled = false, .spinner = true, .action = .none, .why = "" };
+    const why: []const u8 = if (in.connecting)
+        "Looking for a server"
+    else switch (in.link) {
+        .offline => if (in.starting) "Waiting for the server to answer" else "Start the server to load a model",
+        .silent => "The server does not answer",
+        .unauthorized => "The server requires an API key",
+        .up, .metrics_off => "",
+    };
+    if (why.len == 0 and in.model != null) {
+        const tip = std.fmt.bufPrint(buf, "Unload {s}; the server keeps running", .{in.model.?}) catch "Unload the model";
+        return .{ .label = "Unload", .symbol = "eject.fill", .tip = tip, .enabled = true, .spinner = false, .action = .unload, .why = "" };
+    }
+    if (why.len == 0 and in.last_model.len > 0) {
+        const tip = std.fmt.bufPrint(buf, "Load {s}", .{in.last_model}) catch "Load the last model";
+        return .{ .label = "Load", .symbol = "arrow.down.circle", .tip = tip, .enabled = true, .spinner = false, .action = .load, .why = "" };
+    }
+    return .{ .label = "Load", .symbol = "arrow.down.circle", .tip = "", .enabled = false, .spinner = false, .action = .none, .why = if (why.len > 0) why else "No model to load yet: pick one in Models" };
 }
 
 /// The Stop last sent: the pid signalled, its port, and when the menu stops saying Stopping….
@@ -764,7 +807,7 @@ pub const HeaderIn = struct {
     /// Why Start is off while nothing answers.
     port_taken: bool = false,
     sushi_found: bool = true,
-    /// The model the next Start loads.
+    /// The model Load brings back.
     last_model: []const u8 = "",
     model: ?[]const u8 = null,
     pack_update: ?PackUpdate = null,
@@ -839,8 +882,8 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
             h.line1 = "sushi is not beside sushibar";
             h.line2 = fmt(a, "Port {d} · reinstall sushi", .{in.port});
         } else {
-            h.line1 = "Ready to start";
-            if (in.last_model.len > 0) h.line2 = fmt(a, "Port {d} · loads {s}", .{ in.port, in.last_model });
+            h.line1 = fmt(a, "Ready to start · port {d}", .{in.port});
+            h.line2 = if (in.last_model.len > 0) in.last_model else "No model to load yet";
         }
     } else if (in.link == .silent) {
         h.line1 = "Holds the port, does not reply";
@@ -854,6 +897,9 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
             fmt(a, "Port {d} · {d:.1} GB in use", .{ in.port, @as(f64, @floatFromInt(mb)) / 1024.0 })
         else
             fmt(a, "Port {d}", .{in.port});
+    } else if (in.last_model.len > 0) {
+        h.line1 = fmt(a, "Ready to load · port {d}", .{in.port});
+        h.line2 = in.last_model;
     } else {
         h.line1 = "Open Models to load one";
         h.line1_models = true;
@@ -1156,9 +1202,14 @@ pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u
     return w.buffered();
 }
 
-/// The body of `POST /v1/load-model` for the model Start brings back; `default` is what the web page's switch sends.
+/// The body of `POST /v1/load-model` for the model Load brings back; `default` is what the web page's switch sends.
 pub fn loadModelBody(buf: []u8, model: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{{\"model\":{f},\"default\":true}}", .{json_text.Str{ .s = model }}) catch "";
+}
+
+/// The body of `POST /v1/unload-model`.
+pub fn unloadModelBody(buf: []u8, model: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{{\"model\":{f}}}", .{json_text.Str{ .s = model }}) catch "";
 }
 
 /// The port the Port menu lists first and never lets go: `server.port` of `model-settings.json`, else the built-in
@@ -1394,8 +1445,9 @@ test "last model: the saved file keeps the model the watched server had loaded, 
     try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, ""), "model") == null);
 }
 
-test "last model: Start asks the server to load it by the web page's request" {
+test "last model: Load asks the server for it by the web page's request, Unload names it" {
     var b: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"model\":\"Qwen-X\"}", unloadModelBody(&b, "Qwen-X"));
     try std.testing.expectEqualStrings("{\"model\":\"Qwen-X\",\"default\":true}", loadModelBody(&b, "Qwen-X"));
     try std.testing.expectEqualStrings("{\"model\":\"a\\\"b\",\"default\":true}", loadModelBody(&b, "a\"b"));
 }
@@ -1790,10 +1842,11 @@ test "header: the lines say the cause or the next step, never the pill again" {
         try std.testing.expect(std.mem.indexOf(u8, h.line2, h.pill.label) == null);
     }
     const ready = try buildHeader(a, .{ .link = .offline, .port = 18801 });
-    try std.testing.expectEqualStrings("Ready to start", ready.line1);
-    try std.testing.expectEqualStrings("Port 18801", ready.line2);
+    try std.testing.expectEqualStrings("Ready to start · port 18801", ready.line1);
+    try std.testing.expectEqualStrings("No model to load yet", ready.line2);
     const again = try buildHeader(a, .{ .link = .offline, .port = 18801, .last_model = "Qwen-X" });
-    try std.testing.expectEqualStrings("Port 18801 · loads Qwen-X", again.line2);
+    try std.testing.expectEqualStrings("Ready to start · port 18801", again.line1);
+    try std.testing.expectEqualStrings("Qwen-X", again.line2);
     const loading = try buildHeader(a, .{ .link = .up, .port = 18801, .loading = true, .model = "Qwen-X", .mem_mb = 2048 });
     try std.testing.expectEqualStrings("Port 18801 · 2.0 GB in use", loading.line2);
     const connecting = try buildHeader(a, .{ .link = .offline, .port = 18801, .connecting = true });
@@ -1805,10 +1858,16 @@ test "header: a server with no model points at the Models page" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const none = try buildHeader(a, .{ .link = .up, .port = 18801, .last_model = "Qwen-X" });
+    const none = try buildHeader(a, .{ .link = .up, .port = 18801 });
     try std.testing.expectEqualStrings("No model", none.pill.label);
     try std.testing.expectEqualStrings("Open Models to load one", none.line1);
     try std.testing.expect(none.line1_models and !none.show_stats);
+    try std.testing.expectEqualStrings("Port 18801", none.line2);
+    const known = try buildHeader(a, .{ .link = .up, .port = 18801, .last_model = "Qwen-X" });
+    try std.testing.expectEqualStrings("No model", known.pill.label);
+    try std.testing.expectEqualStrings("Ready to load · port 18801", known.line1);
+    try std.testing.expectEqualStrings("Qwen-X", known.line2);
+    try std.testing.expect(!known.line1_models and !known.show_stats);
     const model = try buildHeader(a, .{ .link = .up, .port = 18801, .model = "Qwen-X" });
     try std.testing.expect(!model.line1_models);
     const off = try buildHeader(a, .{ .link = .offline, .port = 18801 });
@@ -1895,8 +1954,8 @@ test "header: no model, stopped, key needed, loading" {
     try std.testing.expect(!stale.show_stats);
     const off = try buildHeader(a, .{ .link = .offline, .port = 18801, .bar_version = "1.5.0" });
     try std.testing.expect(!off.color_icon and !off.show_stats);
-    try std.testing.expectEqualStrings("Ready to start", off.line1);
-    try std.testing.expectEqualStrings("Port 18801", off.line2);
+    try std.testing.expectEqualStrings("Ready to start · port 18801", off.line1);
+    try std.testing.expectEqualStrings("No model to load yet", off.line2);
     try std.testing.expectEqualStrings("sushi stopped, port 18801", off.a11y);
     const key = try buildHeader(a, .{ .link = .unauthorized, .port = 12345 });
     try std.testing.expectEqualStrings("The server requires an API key", key.line1);
@@ -2055,6 +2114,52 @@ test "menu: the one server toggle" {
     const nobin = toggle(.{ .link = .offline, .sushi_found = false }, false);
     try std.testing.expect(!nobin.enabled);
     try std.testing.expect(openEnabled(.up) and openEnabled(.unauthorized) and openEnabled(.metrics_off) and !openEnabled(.offline));
+}
+
+test "menu: the Load/Unload button" {
+    var b: [160]u8 = undefined;
+    const off = modelButton(&b, .{ .link = .offline, .last_model = "Qwen-X" });
+    try std.testing.expectEqualStrings("Load", off.label);
+    try std.testing.expect(!off.enabled and off.action == .none and !off.spinner);
+    try std.testing.expectEqualStrings("Start the server to load a model", off.why);
+    const starting = modelButton(&b, .{ .link = .offline, .starting = true, .last_model = "Qwen-X" });
+    try std.testing.expect(!starting.enabled and starting.action == .none);
+    try std.testing.expectEqualStrings("Waiting for the server to answer", starting.why);
+    try std.testing.expect(!modelButton(&b, .{ .link = .offline, .connecting = true, .last_model = "Qwen-X" }).enabled);
+    try std.testing.expectEqualStrings("The server does not answer", modelButton(&b, .{ .link = .silent, .last_model = "Qwen-X" }).why);
+    try std.testing.expectEqualStrings("The server requires an API key", modelButton(&b, .{ .link = .unauthorized, .last_model = "Qwen-X" }).why);
+
+    const none = modelButton(&b, .{ .link = .up });
+    try std.testing.expect(!none.enabled and none.action == .none);
+    try std.testing.expectEqualStrings("No model to load yet: pick one in Models", none.why);
+
+    const ready = modelButton(&b, .{ .link = .up, .last_model = "Qwen-X" });
+    try std.testing.expectEqualStrings("Load", ready.label);
+    try std.testing.expect(ready.enabled and ready.action == .load and ready.why.len == 0);
+    try std.testing.expectEqualStrings("Load Qwen-X", ready.tip);
+    try std.testing.expect(modelButton(&b, .{ .link = .metrics_off, .last_model = "Qwen-X" }).action == .load);
+
+    const busy = modelButton(&b, .{ .link = .up, .last_model = "Qwen-X", .loading = true });
+    try std.testing.expectEqualStrings("Loading…", busy.label);
+    try std.testing.expect(!busy.enabled and busy.spinner and busy.action == .none and busy.why.len == 0);
+    const gone = modelButton(&b, .{ .link = .up, .model = "Qwen-X", .last_model = "Qwen-X", .unloading = true });
+    try std.testing.expectEqualStrings("Unloading…", gone.label);
+    try std.testing.expect(!gone.enabled and gone.spinner and gone.action == .none);
+
+    const loaded = modelButton(&b, .{ .link = .up, .model = "Qwen-X", .last_model = "Qwen-X" });
+    try std.testing.expectEqualStrings("Unload", loaded.label);
+    try std.testing.expect(loaded.enabled and loaded.action == .unload);
+    try std.testing.expectEqualStrings("Unload Qwen-X; the server keeps running", loaded.tip);
+}
+
+test "menu: no state offers Load before the server answers" {
+    var b: [160]u8 = undefined;
+    for ([_]Link{ .offline, .silent, .unauthorized }) |link| {
+        for ([_]bool{ false, true }) |starting| {
+            const m = modelButton(&b, .{ .link = link, .starting = starting, .last_model = "Qwen-X", .model = null });
+            try std.testing.expect(m.action != .load and !m.enabled);
+        }
+    }
 }
 
 test "menu: update group labels" {
