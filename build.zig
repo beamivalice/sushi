@@ -6,7 +6,7 @@ comptime {
     // (`use of undeclared identifier 'INFINITY'` in its vendored <random>).
     if (builtin.zig_version.major == 0 and builtin.zig_version.minor < 17) {
         @compileError(std.fmt.comptimePrint(
-            "sushi requires Zig 0.17 (have {d}.{d}.{d}). Run ./scripts/fetch-zig.sh, or grab 0.17.0 from https://ziglang.org/download/.",
+            "sushi requires Zig 0.17 (have {d}.{d}.{d}). Run ./scripts/fetch-zig.sh, or grab 0.17.1 from https://ziglang.org/download/.",
             .{ builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
         ));
     }

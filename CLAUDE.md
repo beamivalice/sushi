@@ -83,7 +83,7 @@ Skills: `/release`, `/bench`.
 
 ## Stack
 
-Zig 0.17.0 (`scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39,
+Zig 0.17.1 (`scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39,
 mlx-serve's pins) built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp as
 `lib/jinja_cpp/libjinja.a`; `stb_image` + libwebp for image INPUT. Min macOS 26.2, which NAX needs
 (`tests/test_mlx_staged_nax.sh`); only non-system dylibs: `libmlxc`, `libwebp` (`tests/test_serving_deps.sh`).
@@ -128,7 +128,7 @@ Box: M5 Max 128 GB, macOS 27.
 
 ## Building
 
-- First-time: `./scripts/fetch-zig.sh` stages the pinned Zig (`0.17.0`, sha256-checked) at `.zig-toolchain/`. A git
+- First-time: `./scripts/fetch-zig.sh` stages the pinned Zig (`0.17.1`, sha256-checked) at `.zig-toolchain/`. A git
   worktree lacks `.zig-toolchain/` and `lib/mlx/`: symlink both from the main checkout (fetch-zig replaces a stale
   link with its own copy). After a toolchain/SDK change `rm -rf .zig-cache` (configure-time output is cached).
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
