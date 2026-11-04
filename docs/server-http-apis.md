@@ -564,7 +564,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
 
 ## Agent launcher (`sushi launch <agent>`)
 
-- `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider/zcode/grok): reads `/v1/models`, writes agent configs into
+- `src/launch.zig` (claude/pi/omp/opencode/dsh/codex/hermes/aider/zcode/grok): reads `/v1/models`, writes agent configs into
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
 - Every model id and URL in the zsh script is one single-quoted word (`appendQuoted`) and every config writer escapes
   them for its format (JSON/TOML/YAML `Esc`): ids come from folder names or a `--url` server, so never interpolate bare.
@@ -596,6 +596,19 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   untouched): one `[model."<id>"]` per chat row on `api_backend = "chat_completions"`, dummy `api_key`, advertised
   `context_window`, `max_completion_tokens` from `budgetForContext`, the row's efforts as `reasoning_efforts`, and
   `[session] auto_compact_threshold_percent` = share of the window that leaves `compactionReserve` free (min 50).
+- `sushi launch dsh` (DeepSeek Harness) writes ONE patch layer, `~/.sushi/dsh/patch.yml`, and starts `dsh --profile web
+  --patch "$HOME/.sushi/dsh/patch.yml"` (`dsh` on PATH, else `npx --yes @deepseek-ai/dsh`; `web` is the README's
+  interactive profile). The user's `~/.dsh/profiles/<profile>/cordis.patch.yml` is never read or written: dsh applies
+  `--patch` after the profile layer, so the generated entries (`agent-default-model`, `llm-pi-ai` with `providers.sushi`)
+  win only for their own ids and the user's other entries stay. That is the opencode/omp contract (the agent's own config
+  untouched, sushi's in a sushi-owned place). The provider is `openai-completions` at `<base>/v1` with `compat`
+  (`supportsDeveloperRole: false`, `supportsReasoningEffort: true`, `maxTokensField: max_tokens`), a `Bearer sushi`
+  header (pi-ai refuses to send without a key; like every launch target the key is the dummy, the server exempts
+  loopback), every chat row as a model with its own `contextWindow`, `input` and `reasoningEfforts` (each advertised
+  word to itself; `on` as `high`), the default model's `default_reasoning_effort` as `reasoning`, and the loaded row (else
+  the first) as the default model. `maxTokens` is `launch.dshMaxTokens`: half the window up to 256000, DeepSeek's
+  own omitted-`max_tokens` default (`/v1/models` carries no output limit). Test: `python3 tests/test_dsh_launch.py --bin
+  zig-out/bin/sushi`.
 - `sushi launch zcode [--url U] --model ID [--print] [-- zcode args]` writes schema-1
   `~/.sushi/zcode/provider_config.json` and points `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_DATA_BASE_DIR` and
   `ZCODE_STORAGE_DIR` into `~/.sushi/zcode`; ZCode's own source and project config stay untouched. `--model` must be

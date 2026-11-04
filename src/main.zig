@@ -124,8 +124,8 @@ fn printUsage(io: std.Io) void {
         \\  serve               Start the server over ~/.sushi/models
         \\                      (every pulled model loads on demand by name)
         \\  launch <agent>      Configure + launch a coding agent CLI against the
-        \\                      local server (claude, pi, omp, opencode, codex,
-        \\                      hermes, aider, zcode, grok). `sushi launch <agent> -h`
+        \\                      local server (claude, pi, omp, opencode, dsh,
+        \\                      codex, hermes, aider, zcode, grok). `sushi launch <agent> -h`
         \\                      for options
         \\  kld capture|compare Write a teacher fixture (full-vocab logits at
         \\                      every greedy position), or teacher-force one

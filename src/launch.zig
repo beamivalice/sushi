@@ -96,6 +96,7 @@ pub const AgentKind = enum {
     pi,
     omp,
     opencode,
+    dsh,
     codex,
     hermes,
     aider,
@@ -111,7 +112,7 @@ pub const AgentKind = enum {
         return null;
     }
 
-    pub const names = "claude, pi, omp, opencode, codex, hermes, aider, zcode, grok";
+    pub const names = "claude, pi, omp, opencode, dsh, codex, hermes, aider, zcode, grok";
 };
 
 pub const zcodeConfigJson = @import("zcode_launch.zig").configJson;
@@ -254,6 +255,76 @@ fn writeOmpThinking(allocator: std.mem.Allocator, out: *std.ArrayList(u8), accep
         n += 1;
     };
     try out.appendSlice(allocator, "}\n");
+}
+
+/// The npm scope of dsh and its plugins.
+const dsh_scope = "@deepseek-ai/dsh";
+
+/// `dsh` (Harness) patch layer for `dsh --patch`: the sushi provider with every
+/// chat-capable model, and the default model. The user's own `cordis.patch.yml` is never touched.
+pub fn dshPatchYaml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, api_key: []const u8, entries: []const Entry) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator,
+        \\# written by sushi: the sushi provider for dsh.
+        \\# Regenerated at each launch and passed with `dsh --patch`; your own patch layer is untouched.
+        \\- id: agent-default-model
+        \\  name: "{s}-agent-default-model"
+        \\  config:
+        \\    provider: sushi
+        \\    model: "{f}"
+        \\- id: llm-pi-ai
+        \\  name: "{s}-llm-pi-ai"
+        \\  config:
+        \\    providers:
+        \\      sushi:
+        \\        displayName: sushi
+        \\        api: openai-completions
+        \\        baseURL: "{f}/v1"
+        \\        headers:
+        \\          Authorization: "Bearer {f}"
+        \\        compat:
+        \\          supportsDeveloperRole: false
+        \\          supportsReasoningEffort: true
+        \\          maxTokensField: max_tokens
+        \\
+    , .{ dsh_scope, esc(model), dsh_scope, esc(base_url), esc(api_key) });
+    for (entries) |e| if (std.mem.eql(u8, e.id, model)) {
+        if (e.default_effort) |w| if (dshLevel(w)) |lvl| try out.print(allocator, "        reasoning: {s}\n", .{lvl});
+    };
+    try out.appendSlice(allocator, "        models:\n");
+    for (entries) |e| {
+        try out.print(allocator,
+            \\          - id: "{f}"
+            \\            name: "{f} (sushi)"
+            \\            contextWindow: {d}
+            \\            maxTokens: {d}
+            \\            input: [{s}]
+            \\
+        , .{ esc(e.id), esc(e.id), e.budget.context, dshMaxTokens(e.budget), if (e.vision) "text, image" else "text" });
+        var n: usize = 0;
+        for (e.efforts orelse &.{}) |w| if (dshLevel(w)) |lvl| {
+            if (n == 0) try out.appendSlice(allocator, "            reasoningEfforts:\n");
+            try out.print(allocator, "              \"{s}\": \"{s}\"\n", .{ lvl, w });
+            n += 1;
+        };
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// dsh's thinking level for a server effort word: itself, or high for `on` (an on/off model).
+fn dshLevel(word: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, word, "on")) return "high";
+    for ([_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |lvl| {
+        if (std.mem.eql(u8, word, lvl)) return lvl;
+    }
+    return null;
+}
+
+/// The row's output cap for dsh: half the window, up to the 256000 the largest model omits `max_tokens` at.
+/// `/v1/models` carries no output limit of its own.
+pub fn dshMaxTokens(budget: Budget) u64 {
+    return @min(256000, @max(1024, budget.context / 2));
 }
 
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
@@ -644,6 +715,16 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             try out.append(allocator, '\n');
             return out.toOwnedSlice(allocator);
         },
+        .dsh => {
+            // The user's dsh when installed, else the published npx package; `--profile web` is the
+            // interactive default and the layer rides after it, past the user's own patch layer.
+            try out.print(allocator,
+                \\if command -v dsh >/dev/null 2>&1; then sushi_dsh=(dsh)
+                \\elif command -v npx >/dev/null 2>&1; then sushi_dsh=(npx --yes {s})
+                \\else echo "dsh is not installed: install Node.js, then npx {s} web" >&2; exit 127; fi
+                \\"${{sushi_dsh[@]}}" --profile web --patch "$HOME/.sushi/dsh/patch.yml"
+            , .{ dsh_scope, dsh_scope });
+        },
         .grok => {
             try out.appendSlice(allocator,
                 \\export GROK_HOME="$HOME/.sushi/grok"
@@ -832,6 +913,11 @@ fn writeAgentFile(allocator: std.mem.Allocator, io: std.Io, subdir: []const u8, 
 fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) !void {
     switch (kind) {
         .claude, .opencode => {},
+        .dsh => {
+            const yml = try dshPatchYaml(allocator, base_url, model, "sushi", entries);
+            defer allocator.free(yml);
+            try writeAgentFile(allocator, io, "dsh", "patch.yml", yml);
+        },
         .grok => {
             const toml = try grokConfigToml(allocator, base_url, model, budget, entries);
             defer allocator.free(toml);
@@ -1724,4 +1810,93 @@ test "opencode persist flag is explicit and agent scoped" {
     try t.expect((try parseLaunchArgs(&.{ "opencode", "--persist", "--think", "xhigh" })).persist);
     try t.expect(!(try parseLaunchArgs(&.{"opencode"})).persist);
     try t.expectError(error.Usage, parseLaunchArgs(&.{ "pi", "--persist" }));
+}
+
+const dsh_rows = [_]Entry{
+    .{
+        .id = "big-1m",
+        .budget = budgetForContext(1048576),
+        .vision = true,
+        .loaded = true,
+        .efforts = &.{ "off", "low", "high", "max" },
+        .default_effort = "high",
+    },
+    .{ .id = "plain", .budget = budgetForContext(24576), .vision = false, .loaded = false },
+};
+
+test "dsh patch: default model, provider wiring and the key header" {
+    const yml = try dshPatchYaml(t.allocator, "http://127.0.0.1:12345", "big-1m", "sushi", &dsh_rows);
+    defer t.allocator.free(yml);
+    for ([_][]const u8{
+        "- id: agent-default-model\n  name: \"@deepseek-ai/dsh-agent-default-model\"\n  config:\n    provider: sushi\n    model: \"big-1m\"\n",
+        "- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n",
+        "        api: openai-completions\n        baseURL: \"http://127.0.0.1:12345/v1\"\n",
+        "        headers:\n          Authorization: \"Bearer sushi\"\n",
+        "          supportsDeveloperRole: false\n          supportsReasoningEffort: true\n          maxTokensField: max_tokens\n",
+        "        reasoning: high\n",
+    }) |want| try t.expect(std.mem.indexOf(u8, yml, want) != null);
+    try t.expect(std.mem.indexOf(u8, yml, "ui-settings-general") == null);
+}
+
+test "dsh patch: each row keeps its own window, output cap, input and efforts" {
+    const yml = try dshPatchYaml(t.allocator, "http://h:1", "big-1m", "sushi", &dsh_rows);
+    defer t.allocator.free(yml);
+    const ds = "          - id: \"big-1m\"\n            name: \"big-1m (sushi)\"\n" ++
+        "            contextWindow: 1048576\n            maxTokens: 256000\n            input: [text, image]\n" ++
+        "            reasoningEfforts:\n              \"off\": \"off\"\n              \"low\": \"low\"\n" ++
+        "              \"high\": \"high\"\n              \"max\": \"max\"\n";
+    try t.expect(std.mem.indexOf(u8, yml, ds) != null);
+    const plain = "          - id: \"plain\"\n            name: \"plain (sushi)\"\n" ++
+        "            contextWindow: 24576\n            maxTokens: 12288\n            input: [text]\n";
+    try t.expect(std.mem.indexOf(u8, yml, plain) != null);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, yml[std.mem.indexOf(u8, yml, plain).?..], "reasoningEfforts"));
+}
+
+test "dsh patch: an on/off row maps on to high, a server-only word is dropped" {
+    const rows = [_]Entry{.{ .id = "m", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &.{ "off", "on", "bogus" }, .default_effort = "on" }};
+    const yml = try dshPatchYaml(t.allocator, "http://h:1", "m", "sushi", &rows);
+    defer t.allocator.free(yml);
+    try t.expect(std.mem.indexOf(u8, yml, "              \"off\": \"off\"\n              \"high\": \"on\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "bogus") == null);
+    try t.expect(std.mem.indexOf(u8, yml, "        reasoning: high\n") != null);
+}
+
+test "dsh patch: a row without efforts declares none and sets no default level" {
+    const rows = [_]Entry{.{ .id = "m", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true }};
+    const yml = try dshPatchYaml(t.allocator, "http://h:1", "m", "sushi", &rows);
+    defer t.allocator.free(yml);
+    try t.expect(std.mem.indexOf(u8, yml, "reasoning") == null);
+}
+
+test "dsh patch: ids, url and key are escaped as YAML double-quoted data" {
+    const id = "a\"b\\c'd\ne";
+    const rows = [_]Entry{.{ .id = id, .budget = FALLBACK_BUDGET, .vision = false, .loaded = true }};
+    const yml = try dshPatchYaml(t.allocator, "http://h\"x:1", id, "k\"ey", &rows);
+    defer t.allocator.free(yml);
+    try t.expect(std.mem.indexOf(u8, yml, "model: \"a\\\"b\\\\c'd\\ne\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "- id: \"a\\\"b\\\\c'd\\ne\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "baseURL: \"http://h\\\"x:1/v1\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "Authorization: \"Bearer k\\\"ey\"\n") != null);
+}
+
+test "dsh output cap: half the window up to 256000, never below 1024" {
+    try t.expectEqual(@as(u64, 256000), dshMaxTokens(budgetForContext(1048576)));
+    try t.expectEqual(@as(u64, 131072), dshMaxTokens(budgetForContext(262144)));
+    try t.expectEqual(@as(u64, 1024), dshMaxTokens(budgetForContext(1500)));
+    try t.expectEqual(@as(u64, 16384), dshMaxTokens(budgetForContext(0)));
+}
+
+test "dsh script: the user's dsh when installed, else npx, with the generated layer after --patch" {
+    const script = try scriptFor(t.allocator, .dsh, "http://x:1", "m1", FALLBACK_BUDGET, null, &.{ "--no-open", "a b" });
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "--profile web --patch \"$HOME/.sushi/dsh/patch.yml\" '--no-open' 'a b'\n") != null);
+    try t.expect(std.mem.indexOf(u8, script, "command -v dsh") != null);
+    try t.expect(std.mem.indexOf(u8, script, "npx --yes " ++ dsh_scope) != null);
+    try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
+}
+
+test "launch args: dsh is a named agent and takes no opencode-only flag" {
+    try t.expectEqual(AgentKind.dsh, AgentKind.fromName("dsh").?);
+    try t.expect(std.mem.indexOf(u8, AgentKind.names, "dsh") != null);
+    try t.expectError(error.Usage, parseLaunchArgs(&.{ "dsh", "--think", "high" }));
 }

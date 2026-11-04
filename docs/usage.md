@@ -217,12 +217,12 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 
 ## Coding agents
 
-With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, codex, grok, hermes or aider against it:
+With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, dsh (DeepSeek Harness), codex, grok, hermes or aider against it:
 
 ```bash
 sushi launch omp
 ```
 
-pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched;
+pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched; dsh keeps your `~/.dsh` profile as it is and gets sushi's provider as an extra `--patch` layer (`~/.sushi/dsh/patch.yml`);
 claude, opencode and aider reach the server through environment variables. `--print` writes the config and prints the
 launch script instead of running it.

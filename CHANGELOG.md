@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`sushi launch dsh` starts DeepSeek Harness on your local server**: it lists every chat model with its own window, output cap and reasoning levels in a patch layer of its own, so your `~/.dsh` profile is left as it is.
 - **The web page has a Downloads tab**: it lists the Sushi packs published on Hugging Face with their size, recommends the one for this Mac's memory, checks the free space, and downloads a pack into the models folder with a progress bar, speed and time left; Stop keeps what is downloaded and Resume continues from it, also after a restart, and a small dot on the tab marks a newly published pack (`GET`/`POST /v1/downloads`, Cmd+5).
 - **Fixes**: DeepSeek-V4.1 raw-text `/v1/completions` refuses an empty prompt again instead of answering it.
 
