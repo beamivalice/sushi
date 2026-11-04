@@ -4,6 +4,12 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **Fixes**: DeepSeek-V4.1 raw-text `/v1/completions` refuses an empty prompt again instead of answering it.
+
+---
+
 ## v1.5.0 — Menu bar, new dashboard, 10x lighter DeepSeek cache, trustworthy pack updates
 
 - **`sushibar` puts sushi in the menu bar**: a native app beside `sushi` shows live decode speed and a status card

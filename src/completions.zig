@@ -104,6 +104,8 @@ pub fn completionText(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: 
 
 fn withTextPromptBos(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u32) ![]u32 {
     const bos = config.text_prompt_bos orelse return allocator.dupe(u32, body);
+    // An empty prompt stays empty so it is refused as one, not answered from BOS alone.
+    if (body.len == 0) return allocator.dupe(u32, body);
     const ids = try allocator.alloc(u32, body.len + 1);
     ids[0] = bos;
     @memcpy(ids[1..], body);
@@ -712,6 +714,9 @@ test "a text prompt opens with BOS only where the model's template opens with it
     const with = try withTextPromptBos(a, &ds, &.{ 671, 6102 });
     defer a.free(with);
     try testing.expectEqualSlices(u32, &.{ 0, 671, 6102 }, with);
+    const empty = try withTextPromptBos(a, &ds, &.{});
+    defer a.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
 
     var qwen = model_mod.ModelConfig{};
     qwen.bos_token_id = 248044;
