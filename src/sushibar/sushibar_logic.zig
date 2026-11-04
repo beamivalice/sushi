@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const default_port_mod = @import("../default_port.zig");
+const json_text = @import("../json_text.zig");
 pub const default_port = default_port_mod.port;
 
 pub const Reason = enum { unknown_argument, missing_value, bad_port };
@@ -268,10 +269,7 @@ pub fn titleDim(v: View) bool {
 fn titleBase(buf: []u8, v: View) []const u8 {
     var num: [32]u8 = undefined;
     const text = switch (v.link) {
-        .offline => std.fmt.bufPrint(buf, "", .{}),
-        .unauthorized => std.fmt.bufPrint(buf, "key needed", .{}),
-        .metrics_off => std.fmt.bufPrint(buf, "metrics off", .{}),
-        .silent => std.fmt.bufPrint(buf, "", .{}),
+        .offline, .unauthorized, .metrics_off, .silent => std.fmt.bufPrint(buf, "", .{}),
         .up => if (v.decoding)
             std.fmt.bufPrint(buf, "{s} tok/s", .{if (v.live) |t| speedText(&num, t) else "…"})
         else if (v.prefilling)
@@ -289,6 +287,25 @@ pub const Icon = enum { outline, color };
 /// Outline while no server answers; colour once one does, whatever it says.
 pub fn iconFor(link: Link) Icon {
     return if (link == .offline or link == .silent) .outline else .color;
+}
+
+/// A server replied, whatever it said.
+pub fn answering(link: Link) bool {
+    return link != .offline and link != .silent;
+}
+
+/// The orange mark on the menu bar icon: a state that wants a look, in place of words in the title.
+pub fn badge(link: Link, port_taken: bool, crashed: bool) bool {
+    return switch (link) {
+        .silent, .unauthorized => true,
+        .offline => port_taken or crashed,
+        .up, .metrics_off => false,
+    };
+}
+
+/// A server that was answering is gone and nothing sushibar did explains it.
+pub fn stoppedUnexpectedly(was_answering: bool, link: Link, we_stopped: bool, reaped: bool) bool {
+    return was_answering and link == .offline and !we_stopped and !reaped;
 }
 
 /// The HTTP status of a poll, or null when nothing answered in time.
@@ -370,6 +387,7 @@ pub const PropsUpdate = struct {
     available: bool = false,
     command: ?[]const u8 = null,
     err: ?[]const u8 = null,
+    url: ?[]const u8 = null,
 };
 
 pub fn parseProps(arena: std.mem.Allocator, body: []const u8) !?PropsUpdate {
@@ -380,11 +398,19 @@ pub fn parseProps(arena: std.mem.Allocator, body: []const u8) !?PropsUpdate {
             available: bool = false,
             command: ?[]const u8 = null,
             @"error": ?[]const u8 = null,
+            url: ?[]const u8 = null,
         } = null,
     };
     const w = try std.json.parseFromSliceLeaky(PropsWire, arena, body, .{ .ignore_unknown_fields = true });
     const u = w.update orelse return null;
-    return .{ .current = u.current, .latest = u.latest, .available = u.available, .command = u.command, .err = u.@"error" };
+    return .{ .current = u.current, .latest = u.latest, .available = u.available, .command = u.command, .err = u.@"error", .url = u.url };
+}
+
+pub const releases_url = "https://github.com/beamivalice/sushi/releases/latest";
+
+/// Where "X available" leads: the release page the server's check found, else the project's latest release.
+pub fn releaseNotesUrl(props_url: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, props_url, "https://")) props_url else releases_url;
 }
 
 pub fn isBrewKeg(real_path: []const u8) bool {
@@ -460,16 +486,11 @@ pub const UpdateView = struct {
     busy: Busy = .none,
     path: UpdatePath = .none,
     checked: CheckResult = .none,
+    /// The model the watched server has loaded: an update through the server unloads it.
+    model: []const u8 = "",
+    /// The Homebrew command was copied a moment ago.
+    copied: bool = false,
 };
-
-pub fn checkLabel(buf: []u8, v: UpdateView) []const u8 {
-    const t = switch (v.busy) {
-        .checking => std.fmt.bufPrint(buf, "Checking…", .{}),
-        .updating => std.fmt.bufPrint(buf, "Updating…", .{}),
-        .none => std.fmt.bufPrint(buf, "Check for Updates…", .{}),
-    };
-    return t catch "Check for Updates…";
-}
 
 /// The update item's label, or null while there is nothing newer.
 pub fn updateLabel(buf: []u8, v: UpdateView) ?[]const u8 {
@@ -481,8 +502,24 @@ pub fn copyLabel(buf: []u8, command: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "Copy “{s}”", .{command}) catch "Copy command";
 }
 
+/// How long "Copied" stays on the button and the menu item.
+pub const copied_ms: i64 = 10_000;
+
+pub fn copiedNow(at_ms: i64, now_ms: i64) bool {
+    return at_ms > 0 and now_ms - at_ms < copied_ms;
+}
+
 pub fn updateEnabled(v: UpdateView) bool {
     return v.available and v.busy == .none and (v.path == .server or v.path == .cli);
+}
+
+/// An update through a server that has a model loaded restarts it mid-request: the user is asked first.
+pub fn updateNeedsConfirm(v: UpdateView) bool {
+    return v.available and v.path == .server and v.model.len > 0;
+}
+
+pub fn updateConfirmInfo(buf: []u8, port: u16, model: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "The server on port {d} restarts and unloads {s}; a request in progress is lost.", .{ port, model }) catch "The server restarts and unloads its model.";
 }
 
 pub const ButtonAction = enum { none, check, update, copy_command };
@@ -498,7 +535,7 @@ pub fn shownResult(last: CheckResult, at_ms: i64, open_ms: i64) CheckResult {
     return if (open_ms - at_ms >= result_shown_ms) .none else last;
 }
 
-pub const UpdateState = enum { idle, checking, up_to_date, available, failed, updating, brew_copy };
+pub const UpdateState = enum { idle, checking, up_to_date, available, failed, updating, brew_copy, copied };
 
 pub fn updateState(v: UpdateView) UpdateState {
     switch (v.busy) {
@@ -506,7 +543,7 @@ pub fn updateState(v: UpdateView) UpdateState {
         .updating => return .updating,
         .none => {},
     }
-    if (v.available and v.path == .brew) return .brew_copy;
+    if (v.available and v.path == .brew) return if (v.copied) .copied else .brew_copy;
     if (v.available and updateEnabled(v)) return .available;
     return switch (v.checked) {
         .up_to_date => .up_to_date,
@@ -515,8 +552,8 @@ pub fn updateState(v: UpdateView) UpdateState {
     };
 }
 
-/// The menu's one update button. `accent` is the brand orange; only a Homebrew copy closes the menu, so the button can
-/// show the answer of the check or the progress of the update it started.
+/// The menu's one update button. `accent` is the brand orange. The menu stays open for the answer of a check, the
+/// progress of an update and the "Copied" of a Homebrew command; it closes before an update that asks first.
 pub const UpdateButton = struct { state: UpdateState, label: []const u8, symbol: []const u8, tip: []const u8, accent: bool, enabled: bool, action: ButtonAction, closes_menu: bool = false, spinner: bool = false };
 
 pub fn updateButton(buf: []u8, v: UpdateView) UpdateButton {
@@ -527,8 +564,9 @@ pub fn updateButton(buf: []u8, v: UpdateView) UpdateButton {
         .updating => .{ .state = st, .label = "Updating…", .symbol = "arrow.down.circle", .tip = "Updating sushi", .accent = false, .enabled = false, .action = .none, .spinner = true },
         .up_to_date => .{ .state = st, .label = "Up to date", .symbol = "checkmark", .tip = "sushi is up to date", .accent = false, .enabled = false, .action = .none },
         .failed => .{ .state = st, .label = "Retry", .symbol = check_symbol, .tip = "The check failed: click to try again", .accent = false, .enabled = true, .action = .check },
-        .brew_copy => .{ .state = st, .label = "Copy", .symbol = "doc.on.doc", .tip = copyLabel(buf, v.command), .accent = true, .enabled = true, .action = .copy_command, .closes_menu = true },
-        .available => .{ .state = st, .label = "Update", .symbol = "arrow.down.circle", .tip = updateLabel(buf, v) orelse "Update", .accent = true, .enabled = true, .action = .update },
+        .brew_copy => .{ .state = st, .label = "Upgrade", .symbol = "doc.on.doc", .tip = copyLabel(buf, v.command), .accent = true, .enabled = true, .action = .copy_command },
+        .copied => .{ .state = st, .label = "Copied", .symbol = "checkmark", .tip = "Paste it in a terminal to upgrade", .accent = false, .enabled = true, .action = .copy_command },
+        .available => .{ .state = st, .label = "Update", .symbol = "arrow.down.circle", .tip = updateLabel(buf, v) orelse "Update", .accent = true, .enabled = true, .action = .update, .closes_menu = updateNeedsConfirm(v) },
         .idle => .{ .state = st, .label = "Check", .symbol = check_symbol, .tip = "Check for Updates", .accent = false, .enabled = true, .action = .check },
     };
 }
@@ -566,9 +604,12 @@ pub const Server = struct {
     sushi_listening: bool = false,
     /// Something that is not a sushi answers connections on the watched port.
     port_taken: bool = false,
+    /// The watched port was just chosen and the first poll has not come back.
+    connecting: bool = false,
 };
 
 pub fn statusLine(buf: []u8, s: Server) []const u8 {
+    if (s.connecting) return std.fmt.bufPrint(buf, "Port {d}: connecting…", .{s.port}) catch "Connecting…";
     const text = switch (s.link) {
         .offline => if (s.ours_alive)
             std.fmt.bufPrint(buf, "Port {d}: starting", .{s.port})
@@ -593,7 +634,7 @@ pub const Enabled = struct { start: bool, stop: bool };
 
 pub fn enabled(s: Server) Enabled {
     return .{
-        .start = s.sushi_found and s.link == .offline and !s.ours_alive and !s.port_taken,
+        .start = s.sushi_found and s.link == .offline and !s.ours_alive and !s.port_taken and !s.connecting,
         .stop = s.ours_alive or s.sushi_listening,
     };
 }
@@ -621,14 +662,22 @@ pub fn openEnabled(link: Link) bool {
 pub const Tone = enum { green, orange, grey };
 pub const Pill = struct { label: []const u8, tone: Tone };
 
-pub fn pillFor(link: Link, loading: bool, updating: bool, starting: bool) Pill {
-    if (updating) return .{ .label = "Updating…", .tone = .orange };
-    return switch (link) {
-        .offline => if (starting) .{ .label = "Loading", .tone = .orange } else .{ .label = "Stopped", .tone = .grey },
+pub fn pillFor(in: HeaderIn) Pill {
+    if (in.updating) return .{ .label = "Updating…", .tone = .orange };
+    if (in.connecting) return .{ .label = "Connecting…", .tone = .grey };
+    return switch (in.link) {
+        .offline => if (in.starting)
+            .{ .label = "Starting", .tone = .orange }
+        else if (in.port_taken)
+            .{ .label = "Port in use", .tone = .orange }
+        else if (!in.sushi_found)
+            .{ .label = "No sushi", .tone = .orange }
+        else
+            .{ .label = "Stopped", .tone = .grey },
         .unauthorized => .{ .label = "Key needed", .tone = .orange },
         .metrics_off => .{ .label = "Metrics off", .tone = .grey },
         .silent => .{ .label = "Not answering", .tone = .orange },
-        .up => if (loading) .{ .label = "Loading", .tone = .orange } else .{ .label = "Running", .tone = .green },
+        .up => if (in.loading) .{ .label = "Loading", .tone = .orange } else if (in.model == null) .{ .label = "No model", .tone = .grey } else .{ .label = "Running", .tone = .green },
     };
 }
 
@@ -655,6 +704,12 @@ pub const HeaderIn = struct {
     loading: bool = false,
     updating: bool = false,
     starting: bool = false,
+    connecting: bool = false,
+    /// Why Start is off while nothing answers.
+    port_taken: bool = false,
+    sushi_found: bool = true,
+    /// The model the next Start loads.
+    last_model: []const u8 = "",
     model: ?[]const u8 = null,
     pack_update: ?PackUpdate = null,
     mem_mb: ?u64 = null,
@@ -684,6 +739,8 @@ pub const Header = struct {
     /// Accent line under the model: a newer pack revision is published; empty when not.
     pack_line: []const u8,
     line2: []const u8,
+    /// `line1` is a link to the web Models page.
+    line1_models: bool,
     show_stats: bool,
     stats: [3]Stat,
     a11y: []const u8,
@@ -697,10 +754,10 @@ fn fmt(a: std.mem.Allocator, comptime f: []const u8, args: anytype) []const u8 {
 
 /// Everything the menu's header card shows, as strings; the view only draws them.
 pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
-    const answering = in.link != .offline and in.link != .silent;
     var h: Header = undefined;
-    h.color_icon = answering;
-    h.pill = pillFor(in.link, in.loading, in.updating, in.starting);
+    h.color_icon = answering(in.link) and !in.connecting;
+    h.line1_models = false;
+    h.pill = pillFor(in);
     h.version_tail = "";
     const base = if (in.server_version.len > 0 and in.bar_version.len > 0 and !std.mem.eql(u8, in.server_version, in.bar_version))
         fmt(a, "{s} · server {s}", .{ in.bar_version, in.server_version })
@@ -715,25 +772,38 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
         fmt(a, "{s} · up to date", .{base})
     else
         base;
-    if (in.link == .offline) {
-        h.line1 = if (in.starting) "Starting…" else "Not running";
+    if (in.connecting) {
+        h.line1 = "Looking for a server";
         h.line2 = fmt(a, "Port {d}", .{in.port});
+    } else if (in.link == .offline) {
+        h.line2 = fmt(a, "Port {d}", .{in.port});
+        if (in.starting) {
+            h.line1 = "Waiting for the server to answer";
+        } else if (in.port_taken) {
+            h.line1 = "Another program holds this port";
+            h.line2 = fmt(a, "Port {d} · pick another in the Port menu", .{in.port});
+        } else if (!in.sushi_found) {
+            h.line1 = "sushi is not beside sushibar";
+            h.line2 = fmt(a, "Port {d} · reinstall sushi", .{in.port});
+        } else {
+            h.line1 = "Ready to start";
+            if (in.last_model.len > 0) h.line2 = fmt(a, "Port {d} · loads {s}", .{ in.port, in.last_model });
+        }
     } else if (in.link == .silent) {
-        h.line1 = "Not answering";
-        h.line2 = fmt(a, "Port {d}", .{in.port});
+        h.line1 = "Holds the port, does not reply";
+        h.line2 = fmt(a, "Port {d} · stop it from the menu", .{in.port});
     } else if (in.link == .unauthorized) {
-        h.line1 = "API key required";
-        h.line2 = fmt(a, "Port {d}", .{in.port});
+        h.line1 = "The server requires an API key";
+        h.line2 = fmt(a, "Port {d} · its stats are hidden", .{in.port});
     } else if (in.model) |m| {
         h.line1 = m;
-        h.line2 = if (in.loading)
-            fmt(a, "Loading · Port {d}", .{in.port})
-        else if (in.mem_mb) |mb|
+        h.line2 = if (in.mem_mb) |mb|
             fmt(a, "Port {d} · {d:.1} GB in use", .{ in.port, @as(f64, @floatFromInt(mb)) / 1024.0 })
         else
             fmt(a, "Port {d}", .{in.port});
     } else {
-        h.line1 = "No model loaded";
+        h.line1 = "Open Models to load one";
+        h.line1_models = true;
         h.line2 = fmt(a, "Port {d}", .{in.port});
     }
     h.show_stats = in.link == .up and in.model != null;
@@ -746,14 +816,14 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
     const speed: ?f64 = if (in.decoding) in.live else in.last;
     h.stats[0] = .{
         .value = if (speed) |t| fmt(a, "{d:.1}", .{t}) else dash,
-        .label = if (!in.decoding and in.last != null) "DECODE · LAST" else "DECODE",
+        .label = if (!in.decoding and in.last != null) "LAST TOK/S" else "DECODE TOK/S",
     };
-    h.stats[1] = .{ .value = if (in.last_prefill) |t| try a.dupe(u8, thousands(&tmp, @intFromFloat(@round(t)))) else dash, .label = "PREFILL" };
+    h.stats[1] = .{ .value = if (in.last_prefill) |t| try a.dupe(u8, thousands(&tmp, @intFromFloat(@round(t)))) else dash, .label = "PREFILL TOK/S" };
     const mhz_ok = (in.gpu_mhz orelse 0) > 0;
-    h.stats[2] = .{
-        .value = if (mhz_ok) try a.dupe(u8, thousands(&tmp, in.gpu_mhz.?)) else dash,
-        .label = if (in.gpu_pct) |p| fmt(a, "GPU MHZ · {d}%", .{p}) else "GPU MHZ",
-    };
+    h.stats[2] = if (in.gpu_pct) |p| .{
+        .value = fmt(a, "{d}%", .{p}),
+        .label = if (mhz_ok) fmt(a, "GPU · {s} MHZ", .{thousands(&tmp, in.gpu_mhz.?)}) else "GPU",
+    } else .{ .value = if (mhz_ok) try a.dupe(u8, thousands(&tmp, in.gpu_mhz.?)) else dash, .label = "GPU MHZ" };
 
     var state_word: [24]u8 = undefined;
     const word = std.ascii.lowerString(&state_word, if (in.link == .offline and !in.starting) "stopped" else h.pill.label);
@@ -785,6 +855,14 @@ pub fn plotSpark(out: []PlotPoint, pts: []const SparkPoint, left: f64, inner_w: 
         out[i] = .{ .x = left + x01 * inner_w, .y = bottom - std.math.clamp(p.v / peak, 0, 1) * (bottom - top), .gap = p.gap };
     }
     return out[0..n];
+}
+
+/// The scale the sparkline is drawn to: its peak and the span it covers.
+pub fn sparkCaption(buf: []u8, pts: []const SparkPoint, window_ms: i64) []const u8 {
+    if (pts.len < 2) return "";
+    var peak: f32 = 0;
+    for (pts) |p| peak = @max(peak, p.v);
+    return std.fmt.bufPrint(buf, "peak {d:.0} tok/s · last {d} min", .{ peak, @divTrunc(window_ms, 60_000) }) catch "";
 }
 
 const spark_max_dt_ms: i64 = 5000;
@@ -950,10 +1028,21 @@ pub const SavedPorts = struct {
     }
 };
 
-/// `sushibar.json`: the watched port and the ports added to the menu.
-pub const Saved = struct { port: ?u16 = null, ports: SavedPorts = .{} };
+pub const max_model = 96;
 
-/// A file from before added ports holds the one key `port`.
+/// `sushibar.json`: the watched port, the ports added to the menu and the model the watched server last had loaded.
+pub const Saved = struct {
+    port: ?u16 = null,
+    ports: SavedPorts = .{},
+    model_buf: [max_model]u8 = undefined,
+    model_len: usize = 0,
+
+    pub fn model(self: *const Saved) []const u8 {
+        return self.model_buf[0..self.model_len];
+    }
+};
+
+/// A file from before added ports holds the one key `port`; one from before the model has no `model`.
 pub fn parseSaved(text: []const u8) Saved {
     var arena: std.heap.FixedBufferAllocator = .init(&saved_scratch);
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{}) catch return .{};
@@ -967,16 +1056,27 @@ pub fn parseSaved(text: []const u8) Saved {
         const p = default_port_mod.fromValue(item) orelse continue;
         out.ports.add(p, 0);
     };
+    if (obj.get("model")) |m| if (m == .string and m.string.len <= max_model) {
+        @memcpy(out.model_buf[0..m.string.len], m.string);
+        out.model_len = m.string.len;
+    };
     return out;
 }
 var saved_scratch: [4096]u8 = undefined;
 
-pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16) []const u8 {
+pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.print("{{\"port\":{d},\"ports\":[", .{watched}) catch return "";
     for (ports, 0..) |p, i| w.print("{s}{d}", .{ if (i > 0) "," else "", p }) catch return "";
-    w.writeAll("]}\n") catch return "";
+    w.writeAll("]") catch return "";
+    if (model.len > 0) w.print(",\"model\":{f}", .{json_text.Str{ .s = model }}) catch return "";
+    w.writeAll("}\n") catch return "";
     return w.buffered();
+}
+
+/// The body of `POST /v1/load-model` for the model Start brings back; `default` is what the web page's switch sends.
+pub fn loadModelBody(buf: []u8, model: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{{\"model\":{f},\"default\":true}}", .{json_text.Str{ .s = model }}) catch "";
 }
 
 /// The port the Port menu lists first and never lets go: `server.port` of `model-settings.json`, else the built-in
@@ -996,9 +1096,39 @@ pub fn afterRemove(watched: u16, removed: u16, default: u16) u16 {
     return if (watched == removed) default else watched;
 }
 
-/// Shown under the update group when a server sushibar started exits before it listens.
-pub fn startFailedNote(buf: []u8, port: u16) []const u8 {
-    return std.fmt.bufPrint(buf, "Server on port {d} did not start: see ~/.sushi/logs/sushi-{d}.log", .{ port, port }) catch "Server did not start";
+/// A child's wait status: its exit code, or the signal that ended it.
+pub const Exit = union(enum) { code: u8, signal: u8 };
+
+pub fn exitOf(status: u32) Exit {
+    const sig: u8 = @intCast(status & 0x7f);
+    return if (sig == 0) .{ .code = @intCast((status >> 8) & 0xff) } else .{ .signal = sig };
+}
+
+/// The longest a note is drawn in the menu; the item's tooltip has the rest, so the menu keeps its width.
+pub const note_title_max = 46;
+
+fn exitText(buf: []u8, e: Exit) []const u8 {
+    return (switch (e) {
+        .code => |c| std.fmt.bufPrint(buf, "exit {d}", .{c}),
+        .signal => |g| std.fmt.bufPrint(buf, "signal {d}", .{g}),
+    }) catch "";
+}
+
+/// A server sushibar started exited before it ever answered.
+pub fn startFailedNote(buf: []u8, port: u16, e: Exit) []const u8 {
+    var eb: [16]u8 = undefined;
+    return std.fmt.bufPrint(buf, "Port {d}: server did not start ({s})", .{ port, exitText(&eb, e) }) catch "Server did not start";
+}
+
+/// A server sushibar started answered and then exited on its own.
+pub fn exitedNote(buf: []u8, port: u16, e: Exit) []const u8 {
+    var eb: [16]u8 = undefined;
+    return std.fmt.bufPrint(buf, "Port {d}: server exited ({s})", .{ port, exitText(&eb, e) }) catch "Server exited";
+}
+
+/// A server that sushibar did not start went away.
+pub fn stoppedNote(buf: []u8, port: u16, hour: u8, minute: u8) []const u8 {
+    return std.fmt.bufPrint(buf, "Port {d}: server stopped at {d:0>2}:{d:0>2}", .{ port, hour, minute }) catch "Server stopped";
 }
 
 /// A sushi listener and what its `/v1/models` said.
@@ -1125,8 +1255,9 @@ pub fn followStep(f: Follow, size: u64, file: u64) FollowStep {
     return if (size > f.offset) .append else .idle;
 }
 
-pub fn rebuildDue(shown: usize, opened_with: usize) bool {
-    return shown > opened_with * 2;
+/// How many of the oldest lines to drop once the window holds more than twice `keep`.
+pub fn excessLines(shown: usize, keep: usize) usize {
+    return if (shown > keep * 2) shown - keep else 0;
 }
 
 /// The view is following the log while its visible bottom is within a few points of the text's end.
@@ -1141,15 +1272,38 @@ test "ports: an explicit --port beats the saved one, which beats the default" {
 }
 
 test "ports: the saved file round-trips the watched port and the added ones, and refuses anything else" {
-    var b: [160]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{ 18803, 18804 }));
+    var b: [320]u8 = undefined;
+    const got = parseSaved(formatSaved(&b, 18802, &.{ 18803, 18804 }, ""));
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     try std.testing.expectEqualSlices(u16, &.{ 18803, 18804 }, got.ports.items());
+    try std.testing.expectEqualStrings("", got.model());
     for ([_][]const u8{ "", "{}", "not json", "{\"port\":0}", "{\"port\":70000}", "{\"port\":\"x\"}", "{\"port\":-1}" }) |bad| {
         const r = parseSaved(bad);
         try std.testing.expect(r.port == null and r.ports.n == 0);
     }
     try std.testing.expectEqual(@as(?u16, 5), parseSaved("{\"other\":1,\"port\":5}").port);
+}
+
+test "last model: the saved file keeps the model the watched server had loaded, escaped, and old files have none" {
+    var b: [320]u8 = undefined;
+    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, "Example-Flash-Next-Sushi-STQ-2.75bpw"));
+    try std.testing.expectEqualStrings("Example-Flash-Next-Sushi-STQ-2.75bpw", got.model());
+    try std.testing.expectEqual(@as(?u16, 18802), got.port);
+    try std.testing.expectEqualSlices(u16, &.{18803}, got.ports.items());
+    try std.testing.expectEqualStrings("a\"b\\c", parseSaved(formatSaved(&b, 1, &.{}, "a\"b\\c")).model());
+    try std.testing.expectEqualStrings("", parseSaved("{\"port\":5,\"ports\":[6]}").model());
+    try std.testing.expectEqualStrings("", parseSaved("{\"port\":5}").model());
+    try std.testing.expectEqualStrings("", parseSaved("{\"model\":5}").model());
+    const long: [max_model + 1]u8 = @splat('m');
+    var jb: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("", parseSaved(try std.fmt.bufPrint(&jb, "{{\"model\":\"{s}\"}}", .{&long})).model());
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, ""), "model") == null);
+}
+
+test "last model: Start asks the server to load it by the web page's request" {
+    var b: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"model\":\"Qwen-X\",\"default\":true}", loadModelBody(&b, "Qwen-X"));
+    try std.testing.expectEqualStrings("{\"model\":\"a\\\"b\",\"default\":true}", loadModelBody(&b, "a\"b"));
 }
 
 test "ports: a file from before added ports reads as its one watched port" {
@@ -1210,9 +1364,48 @@ test "stop: a server sushibar started goes at once, any other sushi on the port 
     try std.testing.expectEqual(StopPlan.none, planStop(null, 18801, &.{.{ .pid = 0, .port = 18801 }}));
 }
 
-test "start failure: the note names the port and its log" {
+test "exit notes: a wait status reads as an exit code or a signal, and the notes name the port and the cause" {
+    try std.testing.expectEqual(Exit{ .code = 1 }, exitOf(1 << 8));
+    try std.testing.expectEqual(Exit{ .code = 0 }, exitOf(0));
+    try std.testing.expectEqual(Exit{ .signal = 11 }, exitOf(11));
+    try std.testing.expectEqual(Exit{ .signal = 9 }, exitOf(9 | 0x80));
     var b: [96]u8 = undefined;
-    try std.testing.expectEqualStrings("Server on port 18801 did not start: see ~/.sushi/logs/sushi-18801.log", startFailedNote(&b, 18801));
+    try std.testing.expectEqualStrings("Port 18801: server did not start (exit 1)", startFailedNote(&b, 18801, .{ .code = 1 }));
+    try std.testing.expectEqualStrings("Port 18801: server exited (signal 11)", exitedNote(&b, 18801, .{ .signal = 11 }));
+    try std.testing.expectEqualStrings("Port 18801: server stopped at 09:05", stoppedNote(&b, 18801, 9, 5));
+    var b2: [96]u8 = undefined;
+    var b3: [96]u8 = undefined;
+    for ([_][]const u8{ startFailedNote(&b, 65535, .{ .signal = 31 }), exitedNote(&b2, 65535, .{ .signal = 31 }), stoppedNote(&b3, 65535, 23, 59) }) |n|
+        try std.testing.expect(n.len <= note_title_max);
+}
+
+test "unexpected stop: only an answering server that went away without sushibar stopping it" {
+    try std.testing.expect(stoppedUnexpectedly(true, .offline, false, false));
+    try std.testing.expect(!stoppedUnexpectedly(false, .offline, false, false));
+    try std.testing.expect(!stoppedUnexpectedly(true, .up, false, false));
+    try std.testing.expect(!stoppedUnexpectedly(true, .offline, true, false));
+    try std.testing.expect(!stoppedUnexpectedly(true, .offline, false, true));
+    try std.testing.expect(answering(.up) and answering(.unauthorized) and answering(.metrics_off) and !answering(.offline) and !answering(.silent));
+}
+
+test "badge: a state that wants a look marks the icon, a healthy or stopped server does not" {
+    try std.testing.expect(badge(.silent, false, false));
+    try std.testing.expect(badge(.unauthorized, false, false));
+    try std.testing.expect(badge(.offline, true, false));
+    try std.testing.expect(badge(.offline, false, true));
+    try std.testing.expect(!badge(.offline, false, false));
+    try std.testing.expect(!badge(.up, false, false));
+    try std.testing.expect(!badge(.metrics_off, false, false));
+}
+
+test "release notes: the page the server's check found, else the project's latest release" {
+    try std.testing.expectEqualStrings("https://example.test/v9", releaseNotesUrl("https://example.test/v9"));
+    try std.testing.expectEqualStrings(releases_url, releaseNotesUrl(""));
+    try std.testing.expectEqualStrings(releases_url, releaseNotesUrl("file:///etc/passwd"));
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const u = (try parseProps(arena.allocator(), "{\"update\":{\"current\":\"1.5.0\",\"url\":\"https://example.test/v1.5.1\"}}")).?;
+    try std.testing.expectEqualStrings("https://example.test/v1.5.1", u.url.?);
 }
 
 test "port menu: the default first, then the added ports, each with its state; a listener nobody added is not listed" {
@@ -1308,7 +1501,7 @@ test "header: the server's version shows only when it differs, before the update
 }
 
 test "silent: a sushi that listens and does not answer is Not answering, with Stop offered" {
-    try std.testing.expectEqualStrings("Not answering", pillFor(.silent, false, false, false).label);
+    try std.testing.expectEqualStrings("Not answering", pillFor(.{ .link = .silent, .port = 1 }).label);
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Port 18801: not answering", statusLine(&b, .{ .link = .silent, .port = 18801, .sushi_listening = true }));
     const t = toggle(.{ .link = .silent, .sushi_listening = true }, false);
@@ -1443,17 +1636,97 @@ test "update menu: a dot on the button while an update waits" {
 }
 
 test "header: the pill names the server's state" {
-    try std.testing.expectEqualStrings("Running", pillFor(.up, false, false, false).label);
-    try std.testing.expectEqual(Tone.green, pillFor(.up, false, false, false).tone);
-    try std.testing.expectEqualStrings("Loading", pillFor(.up, true, false, false).label);
-    try std.testing.expectEqualStrings("Loading", pillFor(.offline, false, false, true).label);
-    try std.testing.expectEqualStrings("Stopped", pillFor(.offline, false, false, false).label);
-    try std.testing.expectEqual(Tone.grey, pillFor(.offline, false, false, false).tone);
-    try std.testing.expectEqualStrings("Key needed", pillFor(.unauthorized, false, false, false).label);
-    try std.testing.expectEqual(Tone.orange, pillFor(.unauthorized, false, false, false).tone);
-    try std.testing.expectEqualStrings("Metrics off", pillFor(.metrics_off, false, false, false).label);
-    try std.testing.expectEqualStrings("Updating…", pillFor(.up, false, true, false).label);
-    try std.testing.expectEqual(Tone.orange, pillFor(.up, false, true, false).tone);
+    const pill = struct {
+        fn of(in: HeaderIn) Pill {
+            return pillFor(in);
+        }
+    }.of;
+    try std.testing.expectEqualStrings("Running", pill(.{ .link = .up, .port = 1, .model = "m" }).label);
+    try std.testing.expectEqual(Tone.green, pill(.{ .link = .up, .port = 1, .model = "m" }).tone);
+    try std.testing.expectEqualStrings("Loading", pill(.{ .link = .up, .port = 1, .model = "m", .loading = true }).label);
+    try std.testing.expectEqualStrings("Starting", pill(.{ .link = .offline, .port = 1, .starting = true }).label);
+    try std.testing.expectEqualStrings("Stopped", pill(.{ .link = .offline, .port = 1 }).label);
+    try std.testing.expectEqual(Tone.grey, pill(.{ .link = .offline, .port = 1 }).tone);
+    try std.testing.expectEqualStrings("Key needed", pill(.{ .link = .unauthorized, .port = 1 }).label);
+    try std.testing.expectEqual(Tone.orange, pill(.{ .link = .unauthorized, .port = 1 }).tone);
+    try std.testing.expectEqualStrings("Metrics off", pill(.{ .link = .metrics_off, .port = 1 }).label);
+    try std.testing.expectEqualStrings("Updating…", pill(.{ .link = .up, .port = 1, .model = "m", .updating = true }).label);
+    try std.testing.expectEqual(Tone.orange, pill(.{ .link = .up, .port = 1, .updating = true }).tone);
+    try std.testing.expectEqualStrings("No model", pill(.{ .link = .up, .port = 1 }).label);
+    try std.testing.expectEqual(Tone.grey, pill(.{ .link = .up, .port = 1 }).tone);
+    try std.testing.expectEqualStrings("Connecting…", pill(.{ .link = .offline, .port = 1, .connecting = true }).label);
+    try std.testing.expectEqual(Tone.grey, pill(.{ .link = .offline, .port = 1, .connecting = true }).tone);
+}
+
+test "header: Start being off says why, in an orange pill and a line of its own" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const taken = try buildHeader(a, .{ .link = .offline, .port = 8080, .port_taken = true });
+    try std.testing.expectEqualStrings("Port in use", taken.pill.label);
+    try std.testing.expectEqual(Tone.orange, taken.pill.tone);
+    try std.testing.expectEqualStrings("Another program holds this port", taken.line1);
+    try std.testing.expectEqualStrings("Port 8080 · pick another in the Port menu", taken.line2);
+    const nobin = try buildHeader(a, .{ .link = .offline, .port = 8080, .sushi_found = false });
+    try std.testing.expectEqualStrings("No sushi", nobin.pill.label);
+    try std.testing.expectEqual(Tone.orange, nobin.pill.tone);
+    try std.testing.expectEqualStrings("sushi is not beside sushibar", nobin.line1);
+    const both = try buildHeader(a, .{ .link = .offline, .port = 8080, .port_taken = true, .sushi_found = false });
+    try std.testing.expectEqualStrings("Port in use", both.pill.label);
+    const ours = try buildHeader(a, .{ .link = .offline, .port = 8080, .starting = true, .port_taken = true });
+    try std.testing.expectEqualStrings("Starting", ours.pill.label);
+}
+
+test "header: the lines say the cause or the next step, never the pill again" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const states = [_]HeaderIn{
+        .{ .link = .offline, .port = 1 },
+        .{ .link = .offline, .port = 1, .starting = true },
+        .{ .link = .silent, .port = 1 },
+        .{ .link = .unauthorized, .port = 1 },
+        .{ .link = .up, .port = 1 },
+        .{ .link = .up, .port = 1, .loading = true, .model = "m" },
+        .{ .link = .offline, .port = 1, .connecting = true },
+    };
+    for (states) |in| {
+        const h = try buildHeader(a, in);
+        try std.testing.expect(!std.mem.eql(u8, h.pill.label, h.line1));
+        try std.testing.expect(std.mem.indexOf(u8, h.line2, h.pill.label) == null);
+    }
+    const ready = try buildHeader(a, .{ .link = .offline, .port = 18801 });
+    try std.testing.expectEqualStrings("Ready to start", ready.line1);
+    try std.testing.expectEqualStrings("Port 18801", ready.line2);
+    const again = try buildHeader(a, .{ .link = .offline, .port = 18801, .last_model = "Qwen-X" });
+    try std.testing.expectEqualStrings("Port 18801 · loads Qwen-X", again.line2);
+    const loading = try buildHeader(a, .{ .link = .up, .port = 18801, .loading = true, .model = "Qwen-X", .mem_mb = 2048 });
+    try std.testing.expectEqualStrings("Port 18801 · 2.0 GB in use", loading.line2);
+    const connecting = try buildHeader(a, .{ .link = .offline, .port = 18801, .connecting = true });
+    try std.testing.expectEqualStrings("Looking for a server", connecting.line1);
+    try std.testing.expect(!connecting.color_icon);
+}
+
+test "header: a server with no model points at the Models page" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const none = try buildHeader(a, .{ .link = .up, .port = 18801, .last_model = "Qwen-X" });
+    try std.testing.expectEqualStrings("No model", none.pill.label);
+    try std.testing.expectEqualStrings("Open Models to load one", none.line1);
+    try std.testing.expect(none.line1_models and !none.show_stats);
+    const model = try buildHeader(a, .{ .link = .up, .port = 18801, .model = "Qwen-X" });
+    try std.testing.expect(!model.line1_models);
+    const off = try buildHeader(a, .{ .link = .offline, .port = 18801 });
+    try std.testing.expect(!off.line1_models);
+}
+
+test "connecting: the status names it and Start waits for the first poll" {
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Port 18801: connecting…", statusLine(&b, .{ .link = .offline, .port = 18801, .connecting = true }));
+    try std.testing.expect(!enabled(.{ .link = .offline, .connecting = true }).start);
+    try std.testing.expect(!toggle(.{ .link = .offline, .connecting = true }, false).enabled);
+    try std.testing.expect(toggle(.{ .link = .offline }, false).enabled);
 }
 
 test "header: thousands separators" {
@@ -1480,11 +1753,11 @@ test "header: a running model with throughput" {
     try std.testing.expectEqualStrings("Port 12345 · 48.8 GB in use", h.line2);
     try std.testing.expect(h.show_stats);
     try std.testing.expectEqualStrings("105.3", h.stats[0].value);
-    try std.testing.expectEqualStrings("DECODE", h.stats[0].label);
+    try std.testing.expectEqualStrings("DECODE TOK/S", h.stats[0].label);
     try std.testing.expectEqualStrings("5,844", h.stats[1].value);
-    try std.testing.expectEqualStrings("PREFILL", h.stats[1].label);
-    try std.testing.expectEqualStrings("1,195", h.stats[2].value);
-    try std.testing.expectEqualStrings("GPU MHZ · 62%", h.stats[2].label);
+    try std.testing.expectEqualStrings("PREFILL TOK/S", h.stats[1].label);
+    try std.testing.expectEqualStrings("62%", h.stats[2].value);
+    try std.testing.expectEqualStrings("GPU · 1,195 MHZ", h.stats[2].label);
     try std.testing.expectEqualStrings("sushi running on port 12345, DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw, decode 105 tokens per second", h.a11y);
 }
 
@@ -1497,11 +1770,24 @@ test "header: idle shows the last request, gaps show a dash, an update is named"
     });
     try std.testing.expectEqualStrings("1.5.0 · 1.5.1 available", h.version);
     try std.testing.expectEqualStrings("88.0", h.stats[0].value);
-    try std.testing.expectEqualStrings("DECODE · LAST", h.stats[0].label);
+    try std.testing.expectEqualStrings("LAST TOK/S", h.stats[0].label);
     try std.testing.expectEqualStrings("–", h.stats[1].value);
     try std.testing.expectEqualStrings("–", h.stats[2].value);
     try std.testing.expectEqualStrings("GPU MHZ", h.stats[2].label);
     try std.testing.expectEqualStrings("Port 12345", h.line2);
+    const mhz = try buildHeader(arena.allocator(), .{ .link = .up, .port = 1, .model = "m", .gpu_mhz = 1380 });
+    try std.testing.expectEqualStrings("1,380", mhz.stats[2].value);
+    const pct = try buildHeader(arena.allocator(), .{ .link = .up, .port = 1, .model = "m", .gpu_mhz = 0, .gpu_pct = 8 });
+    try std.testing.expectEqualStrings("8%", pct.stats[2].value);
+    try std.testing.expectEqualStrings("GPU", pct.stats[2].label);
+}
+
+test "sparkline: the caption states the scale it is drawn to" {
+    var b: [64]u8 = undefined;
+    const pts = [_]SparkPoint{ .{ .x = 0.1, .v = 90.4, .gap = true }, .{ .x = 0.5, .v = 124.6, .gap = false }, .{ .x = 0.9, .v = 100, .gap = false } };
+    try std.testing.expectEqualStrings("peak 125 tok/s · last 5 min", sparkCaption(&b, &pts, 300_000));
+    try std.testing.expectEqualStrings("", sparkCaption(&b, pts[0..1], 300_000));
+    try std.testing.expectEqualStrings("", sparkCaption(&b, &.{}, 300_000));
 }
 
 test "header: no model, stopped, key needed, loading" {
@@ -1509,22 +1795,21 @@ test "header: no model, stopped, key needed, loading" {
     defer arena.deinit();
     const a = arena.allocator();
     const none = try buildHeader(a, .{ .link = .up, .port = 12345, .bar_version = "1.5.0" });
-    try std.testing.expectEqualStrings("No model loaded", none.line1);
     try std.testing.expectEqualStrings("Port 12345", none.line2);
     try std.testing.expect(!none.show_stats);
     const stale = try buildHeader(a, .{ .link = .metrics_off, .port = 12345 });
     try std.testing.expect(!stale.show_stats);
     const off = try buildHeader(a, .{ .link = .offline, .port = 18801, .bar_version = "1.5.0" });
     try std.testing.expect(!off.color_icon and !off.show_stats);
-    try std.testing.expectEqualStrings("Not running", off.line1);
+    try std.testing.expectEqualStrings("Ready to start", off.line1);
     try std.testing.expectEqualStrings("Port 18801", off.line2);
     try std.testing.expectEqualStrings("sushi stopped, port 18801", off.a11y);
     const key = try buildHeader(a, .{ .link = .unauthorized, .port = 12345 });
-    try std.testing.expectEqualStrings("API key required", key.line1);
+    try std.testing.expectEqualStrings("The server requires an API key", key.line1);
     try std.testing.expect(key.color_icon and !key.show_stats);
     const load = try buildHeader(a, .{ .link = .up, .loading = true, .model = "Qwen", .port = 12345 });
     try std.testing.expectEqualStrings("Qwen", load.line1);
-    try std.testing.expectEqualStrings("Loading · Port 12345", load.line2);
+    try std.testing.expectEqualStrings("Port 12345", load.line2);
 }
 
 test "sparkline: rates between samples, gaps where the server was down or restarted" {
@@ -1680,10 +1965,6 @@ test "menu: the one server toggle" {
 
 test "menu: update group labels" {
     var b: [96]u8 = undefined;
-    try std.testing.expectEqualStrings("Check for Updates…", checkLabel(&b, .{}));
-    try std.testing.expectEqualStrings("Checking…", checkLabel(&b, .{ .busy = .checking }));
-    try std.testing.expectEqualStrings("Updating…", checkLabel(&b, .{ .busy = .updating }));
-    try std.testing.expectEqualStrings("Check for Updates…", checkLabel(&b, .{ .note = "disk full" }));
     try std.testing.expectEqualStrings("Update to sushi 1.5.1", updateLabel(&b, .{ .available = true, .latest = "1.5.1", .path = .server }).?);
     try std.testing.expect(updateLabel(&b, .{}) == null);
     try std.testing.expectEqualStrings("Copy “brew upgrade sushi”", copyLabel(&b, "brew upgrade sushi"));
@@ -1821,8 +2102,9 @@ test "title: live, last, prefill, idle, offline, unauthorized, metrics off" {
     try std.testing.expectEqualStrings("88.0 tok/s", title(&b, .{ .link = .up, .last = 88 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .last = 5, .decoding = true }));
-    try std.testing.expectEqualStrings("key needed", title(&b, .{ .link = .unauthorized, .last = 5 }));
-    try std.testing.expectEqualStrings("metrics off", title(&b, .{ .link = .metrics_off }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .unauthorized, .last = 5 }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .metrics_off }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .silent }));
 }
 
 test "menu: Start and Stop follow the server state" {
@@ -1930,19 +2212,47 @@ test "update button: a release found beats an older answer, a busy check beats e
     try std.testing.expectEqual(UpdateState.checking, again.state);
 }
 
-test "update button: a Homebrew update copies its command and closes the menu, an update in progress waits" {
+test "update button: a Homebrew update is one Upgrade button that copies its command and says Copied, an update in progress waits" {
     var b: [96]u8 = undefined;
     const brew = updateButton(&b, .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi" });
     try std.testing.expectEqual(UpdateState.brew_copy, brew.state);
-    try std.testing.expectEqualStrings("Copy", brew.label);
+    try std.testing.expectEqualStrings("Upgrade", brew.label);
     try std.testing.expectEqual(ButtonAction.copy_command, brew.action);
-    try std.testing.expect(brew.accent and brew.enabled and brew.closes_menu);
+    try std.testing.expect(brew.accent and brew.enabled and !brew.closes_menu);
     try std.testing.expectEqualStrings("Copy “brew upgrade sushi”", brew.tip);
+
+    const copied = updateButton(&b, .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi", .copied = true });
+    try std.testing.expectEqual(UpdateState.copied, copied.state);
+    try std.testing.expectEqualStrings("Copied", copied.label);
+    try std.testing.expect(!copied.accent and copied.enabled and !copied.closes_menu);
 
     const updating = updateButton(&b, .{ .available = true, .path = .server, .busy = .updating });
     try std.testing.expectEqual(UpdateState.updating, updating.state);
     try std.testing.expectEqualStrings("Updating…", updating.label);
     try std.testing.expect(!updating.enabled and updating.spinner and updating.action == .none);
+}
+
+test "copied: Copied stays ten seconds, then the command is offered again" {
+    try std.testing.expect(copiedNow(1_000, 5_000));
+    try std.testing.expect(!copiedNow(1_000, 11_000));
+    try std.testing.expect(!copiedNow(0, 1_000));
+}
+
+test "update confirm: an update through a server with a model loaded asks first and closes the menu to do it" {
+    var b: [96]u8 = undefined;
+    const loaded: UpdateView = .{ .available = true, .latest = "1.5.1", .path = .server, .model = "Qwen-X" };
+    try std.testing.expect(updateNeedsConfirm(loaded));
+    try std.testing.expect(updateButton(&b, loaded).closes_menu);
+    var empty = loaded;
+    empty.model = "";
+    try std.testing.expect(!updateNeedsConfirm(empty) and !updateButton(&b, empty).closes_menu);
+    var cli = loaded;
+    cli.path = .cli;
+    try std.testing.expect(!updateNeedsConfirm(cli));
+    var none = loaded;
+    none.available = false;
+    try std.testing.expect(!updateNeedsConfirm(none));
+    try std.testing.expectEqualStrings("The server on port 18801 restarts and unloads Qwen-X; a request in progress is lost.", updateConfirmInfo(&b, 18801, "Qwen-X"));
 }
 
 test "update button: an answer older than a minute is dropped when the menu opens, and Check returns" {
@@ -2019,10 +2329,11 @@ test "log follow: growth appends, a smaller or different file reloads, nothing n
     try std.testing.expectEqual(FollowStep.reload, followStep(.{}, 0, 3));
 }
 
-test "log follow: the window is rebuilt before it holds more than twice the lines it opened with" {
-    try std.testing.expect(!rebuildDue(2000, 2000));
-    try std.testing.expect(!rebuildDue(4000, 2000));
-    try std.testing.expect(rebuildDue(4001, 2000));
+test "log trim: the oldest lines go in place once the window holds more than twice what it keeps" {
+    try std.testing.expectEqual(@as(usize, 0), excessLines(2000, 2000));
+    try std.testing.expectEqual(@as(usize, 0), excessLines(4000, 2000));
+    try std.testing.expectEqual(@as(usize, 2001), excessLines(4001, 2000));
+    try std.testing.expectEqual(@as(usize, 0), excessLines(0, 2000));
 }
 
 test "log scroll: following resumes only at the bottom" {

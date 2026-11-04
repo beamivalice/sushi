@@ -10,7 +10,7 @@ const id = objc.id;
 const NSRect = objc.NSRect;
 const NSSize = objc.NSSize;
 
-/// Lines shown on open; a window past twice that is rebuilt from the file's tail.
+/// Lines shown on open; a window past twice that drops its oldest lines in place.
 const keep_lines: usize = 2000;
 /// The most of a file read at once; an opening read takes its tail.
 const read_cap: usize = 1 << 20;
@@ -49,8 +49,11 @@ var shown_path: Buf(1024) = .{};
 var stale = true;
 var follow: logic.Follow = .{};
 var lines: usize = 0;
-var opened_with: usize = 0;
 var has_file = false;
+var shown_has_file: ?bool = null;
+var copy_button: id = null;
+var console_button: id = null;
+var reveal_button: id = null;
 
 fn z(buf: []u8, s: []const u8) [*:0]const u8 {
     const n = @min(s.len, buf.len - 1);
@@ -104,8 +107,43 @@ fn append(bytes: []const u8) void {
 
 // ── Window ──
 
+/// Removes the oldest `n` lines without moving what the reader is looking at: the scroll position shifts by the
+/// height removed, a follower stays at the end, and a selection below the cut stays selected.
+fn trimTop(n: usize) void {
+    const ns = msg(id, text_view, "string", .{});
+    var cut: usize = 0;
+    for (0..n) |_| {
+        const r = msg(Range, ns, "lineRangeForRange:", .{Range{ .location = cut, .length = 0 }});
+        cut = r.location + r.length;
+    }
+    const follow_end = followingEnd();
+    const top = msg(NSRect, msg(id, scroll, "contentView", .{}), "bounds", .{}).y;
+    const before = textHeight();
+    msg(void, text_view, "replaceCharactersInRange:withString:", .{ Range{ .location = 0, .length = cut }, objc.nsString("") });
+    if (follow_end) return msg(void, text_view, "scrollToEndOfDocument:", .{@as(id, null)});
+    msg(void, text_view, "scrollPoint:", .{objc.NSPoint{ .x = 0, .y = @max(0, top - (before - textHeight())) }});
+}
+
+fn textHeight() f64 {
+    const lm = msg(id, text_view, "layoutManager", .{});
+    const tc = msg(id, text_view, "textContainer", .{});
+    msg(void, lm, "ensureLayoutForTextContainer:", .{tc});
+    return msg(NSRect, lm, "usedRectForTextContainer:", .{tc}).h;
+}
+
+const copied_flash_s: f64 = 1.2;
+
+/// The selection, or the whole log when nothing is selected.
 fn copyAction(_: id, _: objc.SEL, _: id) callconv(.c) void {
-    objc.copyString(msg(id, text_view, "string", .{}));
+    const sel = msg(Range, text_view, "selectedRange", .{});
+    const all = msg(id, text_view, "string", .{});
+    objc.copyString(if (sel.length > 0) msg(id, all, "substringWithRange:", .{sel}) else all);
+    msg(void, copy_button, "setTitle:", .{objc.nsString("Copied")});
+    msg(void, controller, "performSelector:withObject:afterDelay:", .{ objc.sel("copyDone:"), @as(id, null), copied_flash_s });
+}
+
+fn copyDone(_: id, _: objc.SEL, _: id) callconv(.c) void {
+    msg(void, copy_button, "setTitle:", .{objc.nsString("Copy")});
 }
 
 fn fileUrlPath() ?id {
@@ -142,6 +180,7 @@ fn build() void {
     if (window != null) return;
     controller = objc.defineClass("SushiBarLogController", &.{
         .{ .selector = "copyLog:", .imp = @ptrCast(&copyAction), .types = "v@:@" },
+        .{ .selector = "copyDone:", .imp = @ptrCast(&copyDone), .types = "v@:@" },
         .{ .selector = "openConsole:", .imp = @ptrCast(&consoleAction), .types = "v@:@" },
         .{ .selector = "revealLog:", .imp = @ptrCast(&revealAction), .types = "v@:@" },
     });
@@ -151,6 +190,7 @@ fn build() void {
     msg(void, window, "setReleasedWhenClosed:", .{false});
     msg(void, window, "setMinSize:", .{NSSize{ .width = 420, .height = 240 }});
     msg(void, window, "center", .{});
+    _ = msg(bool, window, "setFrameAutosaveName:", .{objc.nsString("SushiBarLog")});
     const content = msg(id, window, "contentView", .{});
 
     scroll = msg(id, objc.class("NSTextView"), "scrollableTextView", .{});
@@ -175,14 +215,16 @@ fn build() void {
     msg(void, content, "addSubview:", .{path_label});
 
     var x = win_w - 12;
-    const buttons = [_]struct { title: [*:0]const u8, w: f64, selector: [*:0]const u8 }{
-        .{ .title = "Reveal", .w = 70, .selector = "revealLog:" },
-        .{ .title = "Open in Console", .w = 120, .selector = "openConsole:" },
-        .{ .title = "Copy", .w = 60, .selector = "copyLog:" },
+    const buttons = [_]struct { title: [*:0]const u8, w: f64, selector: [*:0]const u8, tip: [*:0]const u8 }{
+        .{ .title = "Reveal", .w = 70, .selector = "revealLog:", .tip = "Show the log file in Finder" },
+        .{ .title = "Open in Console", .w = 120, .selector = "openConsole:", .tip = "Open the log file in Console" },
+        .{ .title = "Copy", .w = 60, .selector = "copyLog:", .tip = "Copy the selection, or the whole log when nothing is selected" },
     };
-    for (buttons) |b| {
+    for (buttons, [_]*id{ &reveal_button, &console_button, &copy_button }) |b, slot| {
         x -= b.w;
-        msg(void, content, "addSubview:", .{pushButton(b.title, .{ .x = x, .y = y, .w = b.w, .h = 24 }, b.selector)});
+        slot.* = pushButton(b.title, .{ .x = x, .y = y, .w = b.w, .h = 24 }, b.selector);
+        msg(void, slot.*, "setToolTip:", .{objc.nsString(b.tip)});
+        msg(void, content, "addSubview:", .{slot.*});
         x -= 6;
     }
 }
@@ -249,7 +291,6 @@ fn reload(o: Opened, restarted: bool) void {
         setBody(out.items);
     } else setBody(tail);
     lines = logic.countLines(tail) + @intFromBool(restarted);
-    opened_with = @max(lines, keep_lines);
     follow = .{ .offset = chunk_at + whole.len, .file = o.file };
 }
 
@@ -265,6 +306,11 @@ fn extend(o: Opened) void {
     append(chunk[0..take]);
     follow.offset += take;
     lines += logic.countLines(chunk[0..take]);
+    const excess = logic.excessLines(lines, keep_lines);
+    if (excess > 0) {
+        trimTop(excess);
+        lines -= excess;
+    }
 }
 
 fn showNotice(port: u16, src: logic.LogSource) void {
@@ -278,6 +324,11 @@ fn showNotice(port: u16, src: logic.LogSource) void {
 /// Brings the window up to date with `src`, the log of `port`: a new source or a first look loads the file's tail,
 /// after that only what the file grew by is appended.
 pub fn sync(port: u16, src: logic.LogSource) void {
+    syncBody(port, src);
+    showFileButtons();
+}
+
+fn syncBody(port: u16, src: logic.LogSource) void {
     const moved = stale or port != shown_port or src.kind != shown_kind or !std.mem.eql(u8, src.path, shown_path.get());
     if (moved) {
         shown_port = port;
@@ -301,10 +352,18 @@ pub fn sync(port: u16, src: logic.LogSource) void {
     const step = if (moved) logic.FollowStep.reload else logic.followStep(follow, o.size, o.file);
     switch (step) {
         .idle => {},
-        .append => if (logic.rebuildDue(lines, opened_with)) reload(o, false) else extend(o),
+        .append => extend(o),
         .reload => reload(o, !moved and follow.file != 0),
     }
     stale = false;
+}
+
+/// Open in Console and Reveal need a file to act on.
+fn showFileButtons() void {
+    if (shown_has_file == has_file) return;
+    shown_has_file = has_file;
+    msg(void, console_button, "setEnabled:", .{has_file});
+    msg(void, reveal_button, "setEnabled:", .{has_file});
 }
 
 pub fn isVisible() bool {
@@ -323,11 +382,13 @@ pub fn open(port: u16, src: logic.LogSource) void {
 
 /// Draws the window into a PNG at 2x in `dark` or light appearance: with `sample` as the log of `port`, or as it
 /// stands after `sync` calls.
-pub fn renderPng(path: [*:0]const u8, dark: bool, shown: ?struct { port: u16, src: logic.LogSource, sample: []const u8 }) bool {
+pub fn renderPng(path: [*:0]const u8, dark: bool, shown: ?struct { port: u16, src: logic.LogSource, sample: []const u8, has_file: bool = true }) bool {
     build();
     if (shown) |s| {
         titleFor(s.port, s.src);
         setBody(s.sample);
+        has_file = s.has_file;
+        showFileButtons();
     }
     const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
     msg(void, window, "setAppearance:", .{msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});

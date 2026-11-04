@@ -15,13 +15,14 @@ extern var NSForegroundColorAttributeName: id;
 extern var NSParagraphStyleAttributeName: id;
 
 pub const width: f64 = 300;
-pub const height_full: f64 = 168;
+pub const height_full: f64 = 182;
 pub const height_short: f64 = 84;
 /// Extra height of the pack-update line under the model.
 const pack_row_h: f64 = 15;
 const pad: f64 = 12;
 const spark_y: f64 = 130;
 const spark_h: f64 = 30;
+const caption_y: f64 = 162;
 pub const spark_window_ms: i64 = 5 * 60 * 1000;
 
 fn Buf(comptime N: usize) type {
@@ -51,6 +52,8 @@ const Shown = struct {
     labels: [3]Buf(24) = .{ .{}, .{}, .{} },
     spark: [160]logic.SparkPoint = undefined,
     spark_n: usize = 0,
+    caption: Buf(48) = .{},
+    line1_link: bool = false,
 };
 
 var shown: Shown = .{};
@@ -60,6 +63,21 @@ var image_view: id = null;
 var icon_color: id = null;
 var icon_outline: id = null;
 var shown_color: ?bool = null;
+var target: id = null;
+var menu: id = null;
+
+/// What a click on the card can lead to; the rectangles are the ones drawn last.
+const Link = enum { release, models };
+const link_count = 3;
+var link_rects: [link_count]NSRect = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
+var link_kinds: [link_count]Link = .{ .release, .models, .models };
+
+fn linkSelector(l: Link) [*:0]const u8 {
+    return switch (l) {
+        .release => "openRelease:",
+        .models => "openModels:",
+    };
+}
 
 fn str(s: []const u8) id {
     var z: [320:0]u8 = undefined;
@@ -196,16 +214,22 @@ fn drawRect(_: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     const small = font(11, weight_regular, false);
     const head_w = textWidth(shown.version.get(), small);
     text(shown.version.get(), .{ .x = version_x, .y = 17, .w = @max(0, pill_x - 8 - version_x), .h = 14 }, small, secondary, truncate_tail, align_left);
-    text(shown.version_tail.get(), .{ .x = version_x + head_w, .y = 17, .w = @max(0, pill_x - 8 - version_x - head_w), .h = 14 }, small, color("controlAccentColor"), truncate_tail, align_left);
+    const tail_rect = NSRect{ .x = version_x + head_w, .y = 17, .w = @max(0, pill_x - 8 - version_x - head_w), .h = 14 };
+    text(shown.version_tail.get(), tail_rect, small, color("controlAccentColor"), truncate_tail, align_left);
+    link_rects[0] = if (shown.version_tail.len > 0) tail_rect else zero_rect;
     const tone = toneColor(shown.pill_tone);
     fillRound(.{ .x = pill_x, .y = 14, .w = pill_w, .h = 20 }, 10, msg(id, tone, "colorWithAlphaComponent:", .{@as(f64, 0.16)}));
     fillRound(.{ .x = pill_x + 7, .y = 20.5, .w = 7, .h = 7 }, 3.5, tone);
     text(pill_label, .{ .x = pill_x + 7 + 7 + 5, .y = 17, .w = pill_w - 19, .h = 14 }, pill_font, label, clip, align_left);
 
     // Row 2: the model and where it is.
-    text(shown.line1.get(), .{ .x = pad, .y = 46, .w = width - 2 * pad, .h = 16 }, font(12, weight_medium, false), label, truncate_middle, align_left);
+    const line1_rect = NSRect{ .x = pad, .y = 46, .w = width - 2 * pad, .h = 16 };
+    text(shown.line1.get(), line1_rect, font(12, weight_medium, false), if (shown.line1_link) color("controlAccentColor") else label, truncate_middle, align_left);
+    link_rects[1] = if (shown.line1_link) line1_rect else zero_rect;
     const dy: f64 = if (shown.pack_line.len > 0) pack_row_h else 0;
-    if (dy > 0) text(shown.pack_line.get(), .{ .x = pad, .y = 63, .w = width - 2 * pad, .h = 14 }, font(11, weight_medium, false), color("controlAccentColor"), truncate_tail, align_left);
+    const pack_rect = NSRect{ .x = pad, .y = 63, .w = width - 2 * pad, .h = 14 };
+    if (dy > 0) text(shown.pack_line.get(), pack_rect, font(11, weight_medium, false), color("controlAccentColor"), truncate_tail, align_left);
+    link_rects[2] = if (dy > 0) pack_rect else zero_rect;
     text(shown.line2.get(), .{ .x = pad, .y = 63 + dy, .w = width - 2 * pad, .h = 14 }, font(11, weight_regular, false), secondary, truncate_tail, align_left);
     if (!shown.show_stats) return;
 
@@ -220,19 +244,52 @@ fn drawRect(_: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     }
 
     // Row 4: decode throughput over the last five minutes.
+    // The sparkline clips to its own rectangle, so the caption under it is drawn first.
+    text(shown.caption.get(), .{ .x = pad, .y = caption_y + dy, .w = width - 2 * pad, .h = 12 }, label_font, secondary, truncate_tail, align_left);
     drawSpark(color("controlAccentColor"), dy);
+}
+
+const zero_rect = NSRect{ .x = 0, .y = 0, .w = 0, .h = 0 };
+
+fn inside(r: NSRect, p: NSPoint) bool {
+    return r.w > 0 and p.x >= r.x and p.x < r.x + r.w and p.y >= r.y and p.y < r.y + r.h;
+}
+
+/// A click on a link closes the menu, then opens it: the target acts after the menu is gone.
+fn mouseDown(self: id, _: objc.SEL, ev: id) callconv(.c) void {
+    if (target == null) return;
+    const p = msg(NSPoint, self, "convertPoint:fromView:", .{ msg(NSPoint, ev, "locationInWindow", .{}), @as(id, null) });
+    for (link_rects, link_kinds) |r, kind| if (inside(r, p)) {
+        msg(void, menu, "cancelTracking", .{});
+        msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.sel(linkSelector(kind)), @as(id, null), @as(f64, 0) });
+        return;
+    };
+}
+
+fn acceptsFirstMouse(_: id, _: objc.SEL, _: id) callconv(.c) bool {
+    return true;
+}
+
+fn resetCursorRects(self: id, _: objc.SEL) callconv(.c) void {
+    const hand = msg(id, objc.class("NSCursor"), "pointingHandCursor", .{});
+    for (link_rects) |r| if (r.w > 0) msg(void, self, "addCursorRect:cursor:", .{ r, hand });
 }
 
 fn isFlipped(_: id, _: objc.SEL) callconv(.c) bool {
     return true;
 }
 
-pub fn create(color_icon: id, outline_icon: id) id {
+pub fn create(color_icon: id, outline_icon: id, click_target: id, top_menu: id) id {
     icon_color = color_icon;
     icon_outline = outline_icon;
+    target = click_target;
+    menu = top_menu;
     const cls = objc.defineSubclass("NSView", "SushiBarHeader", &.{
         .{ .selector = "drawRect:", .imp = @ptrCast(&drawRect), .types = "v@:{CGRect={CGPoint=dd}{CGSize=dd}}" },
         .{ .selector = "isFlipped", .imp = @ptrCast(&isFlipped), .types = "c@:" },
+        .{ .selector = "mouseDown:", .imp = @ptrCast(&mouseDown), .types = "v@:@" },
+        .{ .selector = "acceptsFirstMouse:", .imp = @ptrCast(&acceptsFirstMouse), .types = "c@:@" },
+        .{ .selector = "resetCursorRects", .imp = @ptrCast(&resetCursorRects), .types = "v@:" },
     });
     view = msg(id, msg(id, cls, "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = width, .h = height_full }});
     image_view = msg(id, msg(id, objc.class("NSImageView"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = pad, .y = 10, .w = 34, .h = 28 }});
@@ -253,12 +310,15 @@ pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
     shown.pack_line.set(h.pack_line);
     shown.line2.set(h.line2);
     shown.show_stats = h.show_stats;
+    shown.line1_link = h.line1_models;
     for (h.stats, 0..) |st, i| {
         shown.values[i].set(st.value);
         shown.labels[i].set(st.label);
     }
     shown.spark_n = @min(spark.len, shown.spark.len);
     @memcpy(shown.spark[0..shown.spark_n], spark[0..shown.spark_n]);
+    var cap: [48]u8 = undefined;
+    shown.caption.set(logic.sparkCaption(&cap, spark, spark_window_ms));
 
     if (shown_color != h.color_icon) {
         shown_color = h.color_icon;
@@ -269,6 +329,8 @@ pub fn update(h: logic.Header, spark: []const logic.SparkPoint) void {
     msg(void, view, "setFrameSize:", .{objc.NSSize{ .width = width, .height = want_h }});
     msg(void, view, "setAccessibilityLabel:", .{str(h.a11y)});
     msg(void, view, "setNeedsDisplay:", .{true});
+    const win = msg(id, view, "window", .{});
+    if (win != null) msg(void, win, "invalidateCursorRectsForView:", .{view});
 }
 
 /// Renders the header at 2x for `dark` or light appearance into a PNG at `path`; false when it could not.
@@ -285,6 +347,11 @@ pub fn renderPng(path: [*:0]const u8, dark: bool) bool {
     const data = msg(id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(id, null) });
     if (data == null) return false;
     return msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(path), true });
+}
+
+/// The attributes of a problem note in the menu: the menu font in orange.
+pub fn noteAttributes() id {
+    return attrs(msg(id, objc.class("NSFont"), "menuFontOfSize:", .{@as(f64, 0)}), color("systemOrangeColor"), clip, align_left);
 }
 
 /// The attributes of the menu bar button's title: 12 pt monospaced digits, dim for a past reading.

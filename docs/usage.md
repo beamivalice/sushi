@@ -15,12 +15,11 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` and it detaches from
 the terminal. The title is the live decode tok/s (dim for the last request's once idle). Its menu opens on a status
 card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph) and then starts or stops the server
-on the watched port (asking first for one it did not start), switches the port (the default port first, then the ports you added by typing or picking one, then any other listening
-server; hover an added port and click its x to forget it; the choice is remembered; `--port` wins, then the default port,
+on the watched port (asking first for one it did not start; Start loads again the model the server last had, and with none known the card links to the Models page), switches the port (the default port first, then the ports you added by typing one; hover an added port and click its x to forget it; a server on a port you never added is not listed; the choice is remembered; `--port` wins, then the default port,
 `server.port` in Settings, 12345 unless changed), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
 three buttons: Log (a window that follows the watched server's log live), Update (Check, which shows Checking… and then
-Up to date, Retry or an orange Update while the menu stays open; Homebrew installs get a Copy "brew upgrade sushi" item and the button copies it; a running sushibar never
-blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q).
+Up to date, Retry or an orange Update while the menu stays open; with a model loaded it asks before restarting the server; Homebrew installs get an Upgrade button that copies `brew upgrade sushi`; a running sushibar never
+blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q). The card says why a server is stopped, hung, locked or unable to start, an orange dot on the icon marks a server that does not answer, wants a key, lost its port or exited on its own, and a note in the menu opens the log.
 
 A browser download is quarantined: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`. GPU memory and the
 largest context per Mac: [README, Memory](../README.md#memory).

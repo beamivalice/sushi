@@ -120,7 +120,7 @@ check "its pid file is gone" "$(yes_if '[ ! -f "$HOME/.sushi/sushibar.pid" ]')"
 check "the icon is the outline offline and the colour one once the server answers" "$(yes_if 'grep -q "poll 1 .*icon=outline" "$LOG" && grep -q "running, no model loaded.*icon=color" "$LOG" && tail -n 1 "$LOG" | grep -q "icon=outline"')"
 check "the first poll reads not running with Start enabled, the port named" "$(yes_if 'grep -q "poll 1 title=\"\" status=\"Port '"$PORT"': not running\" start=1 stop=0" "$LOG"')"
 check "an idle server reads an icon-only title with Stop enabled" "$(yes_if 'grep -q "title=\"\" status=\"Port '"$PORT"': running, no model loaded\" start=0 stop=1" "$LOG"')"
-check "the header says Stopped with a Start toggle, then Running with a Stop toggle" "$(yes_if 'grep -q "poll 1 .*pill=\"Stopped\" line1=\"Not running\" line2=\"Port '"$PORT"'\" toggle=\"Start Server\"" "$LOG" && grep -q "pill=\"Running\" line1=\"No model loaded\".*toggle=\"Stop Server\"" "$LOG"')"
+check "the header says Stopped with a Start toggle, then No model pointing at the Models page with a Stop toggle" "$(yes_if 'grep -q "poll 1 .*pill=\"Stopped\" line1=\"Ready to start\" line2=\"Port '"$PORT"'\" toggle=\"Start Server\"" "$LOG" && grep -q "pill=\"No model\" line1=\"Open Models to load one\".*toggle=\"Stop Server\"" "$LOG"')"
 check "the Port data lists the running server, checked" "$(yes_if 'grep -q "ports=\".*'"$PORT"' — no model\*;" "$LOG"')"
 check "Stop ended the server it started" "$(yes_if '! kill -0 "$SRVPID" 2>/dev/null')"
 check "the last poll reads not running again" "$(yes_if 'tail -n 1 "$LOG" | grep -q "poll 16 .*Port '"$PORT"': not running"')"
@@ -197,6 +197,7 @@ TPID=$!
 for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$TPORT/" && break; sleep 0.25; done
 run_bar "$BAR" 3 "" --port "$TPORT"
 check "the status says the port is in use and Start is disabled" "$(yes_if 'grep -q "poll 2 .*Port '"$TPORT"': in use by another program\" start=0 stop=0" "$LOG"')"
+check "the header says why in an orange pill, and the icon carries a badge" "$(yes_if 'grep -q "poll 2 .*badge=1.*" "$LOG" && grep -q "poll 2 .*pill=\"Port in use\" line1=\"Another program holds this port\"" "$LOG"')"
 kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
 
 echo "== a newer pack revision on the loaded model =="
@@ -260,15 +261,14 @@ INST="$WORK/inst/sushi-macos-arm64"
 stage_install "$INST"
 run_bar "$INST/sushibar" 8 "check@2" --port "$UPORT"
 check "the menu shows the sushi beside sushibar by version" "$(yes_if 'grep -q "version=\"'"$CUR"'" "$LOG"')"
-check "a newer release shows the update item with its mark" "$(yes_if 'grep -q "update=\"Update to sushi 99.0.0\"" "$LOG"')"
+check "a newer release shows the Update button, named in its tooltip" "$(yes_if 'grep -q "button=\"Update\" tip=\"Update to sushi 99.0.0\"" "$LOG"')"
 check "the button carries the dot while an update waits" "$(yes_if 'grep -q "title=\"•\"" "$LOG"')"
-check "no server on the port: the CLI path is chosen (the visible update item is not a brew command)" "$(yes_if 'grep -q "update=\"Update to sushi 99.0.0\"" "$LOG" && ! grep -q "brew upgrade" "$LOG"')"
-check "while an update waits the Check for Updates item is hidden, so it is not printed" "$(yes_if 'grep -q "version=\"[^\"]*\" check=\"\" update=\"Update to sushi 99.0.0\"" "$LOG"')"
+check "no server on the port: the CLI path is chosen (the button is not a brew command)" "$(yes_if 'grep -q "button=\"Update\"" "$LOG" && ! grep -q "brew upgrade" "$LOG"')"
 
 KEG="$WORK/Cellar/sushi/1.0/libexec"
 stage_install "$KEG"
 run_bar "$KEG/sushibar" 6 "check@2" --port "$UPORT"
-check "a Homebrew keg shows the brew command instead of an update" "$(yes_if 'grep -q "update=\"Copy “brew upgrade sushi”\"" "$LOG"')"
+check "a Homebrew keg shows one Upgrade button that copies the brew command" "$(yes_if 'grep -q "button=\"Upgrade\" tip=\"Copy “brew upgrade sushi”\"" "$LOG"')"
 
 echo "== update failures show where the menu shows them =="
 FAKE="$WORK/fake"
@@ -293,18 +293,18 @@ EOF
 chmod +x "$FAKE/sushi"
 rm -f "$HOME/.sushi/update-check.json"
 run_bar "$FAKE/sushibar" 5 "check@2" --port "$UPORT"
-check "a failed manual check shows its update: line in the note item, cut with an ellipsis" "$(yes_if 'grep -q "poll [3-5] .*note=\"update: disk full while unpacking x*…\"" "$LOG"')"
+check "a failed manual check shows its update: line in the note item, cut with an ellipsis" "$(yes_if 'grep -q "poll [3-5] .*note=\"update: disk full while unpacking x*…\" problem=1" "$LOG"')"
 check "that note is not the trailing log line" "$(yes_if '! grep -q "note=\"trailing" "$LOG"')"
 check "the Update button reads Checking… in the poll of the click and Retry once the check failed" "$(yes_if 'grep -q "poll 2 .*button=\"Checking…\"" "$LOG" && grep -q "poll [3-5] .*button=\"Retry\"" "$LOG"')"
 FAKE_MODE=current run_bar "$FAKE/sushibar" 5 "check@2" --port "$UPORT"
 check "the Update button reads Up to date once a check found nothing newer" "$(yes_if 'grep -q "poll [3-5] .*button=\"Up to date\"" "$LOG"')"
 FAKE_MODE=avail run_bar "$FAKE/sushibar" 10 "check@2,update@5" --port "$UPORT"
 check "the Update button reads Update once a check found a release, and still after a failed update" "$(yes_if 'grep -q "poll [3-4] .*button=\"Update\"" "$LOG" && grep -q "poll [7-9] .*button=\"Update\"" "$LOG"')"
-check "a failed update leaves the update item visible and shows why beside it" "$(yes_if 'grep -q "poll [7-9] .*update=\"Update to sushi 9.0.0\" note=\"Update failed: update: disk full while unpacking x*…\"" "$LOG"')"
+check "a failed update leaves the Update button and shows why in an orange note" "$(yes_if 'grep -q "poll [7-9] .*note=\"Update failed: update: disk full while [a-z]*…\" problem=1.*button=\"Update\"" "$LOG"')"
 
 echo "== a server that fails to start says so =="
 run_bar "$FAKE/sushibar" 6 "start@2" --port "$UPORT"
-check "a server that exits at once shows a note naming its log" "$(yes_if 'grep -q "note=\"Server on port '"$UPORT"' did not start: see ~/.sushi/logs/sushi-'"$UPORT"'.log\"" "$LOG"')"
+check "a server that exits at once shows an orange note with its exit status" "$(yes_if 'grep -q "note=\"Port '"$UPORT"': server did not start (exit 1)\" problem=1" "$LOG"')"
 
 echo "== a started server stays tracked after Start on another port =="
 run_bar "$BAR" 14 "start@2,port$FPORT@5,start@8" --port "$PORT"
@@ -316,6 +316,128 @@ run_bar "$BAR" 3 "" --port "$PORT"
 check "back on the first port, its server is sushibar's own (Stop without the confirm ellipsis)" "$(yes_if 'grep -q "poll 2 .*Port '"$PORT"': .*toggle=\"Stop Server\"" "$LOG"')"
 kill "$P1" "$P2" 2>/dev/null
 rm -f "$HOME"/.sushi/sushibar-server-*.pid
+
+echo "== a started server comes back with the model it last had, and its exit is reported =="
+LM="$WORK/lm"
+mkdir -p "$LM"
+cat > "$LM/fake.c" <<'EOF'
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <unistd.h>
+/* A stand-in for `sushi --serve --port N`: answers the feeds sushibar reads, lists FAKE_READY as the ready model
+   and appends the body of every POST /v1/load-model to FAKE_LOG. */
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--version")) { puts("sushi 1.0.0"); return 0; }
+    int port = 0;
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--port")) port = atoi(argv[i + 1]);
+    if (!port) return 1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    if (bind(fd, (void *)&a, sizeof a) || listen(fd, 16)) return 1;
+    const char *ready = getenv("FAKE_READY"), *log = getenv("FAKE_LOG");
+    for (;;) {
+        int c = accept(fd, 0, 0);
+        if (c < 0) continue;
+        char req[8192];
+        ssize_t n = 0, got;
+        req[0] = 0;
+        while ((got = read(c, req + n, sizeof req - 1 - n)) > 0) {
+            n += got;
+            req[n] = 0;
+            char *end = strstr(req, "\r\n\r\n"), *cl = strcasestr(req, "content-length:");
+            if (!end || n >= (end + 4 - req) + (cl ? atoi(cl + 15) : 0)) break;
+        }
+        char body[512] = "{}";
+        if (!strncmp(req, "GET /v1/models", 14))
+            snprintf(body, sizeof body, ready ? "{\"data\":[{\"id\":\"%s\",\"state\":\"ready\"}]}" : "{\"data\":[]}", ready);
+        if (!strncmp(req, "POST /v1/load-model", 19) && log) {
+            char *end = strstr(req, "\r\n\r\n");
+            FILE *f = fopen(log, "a");
+            if (f && end) { fprintf(f, "%s\n", end + 4); fclose(f); }
+        }
+        char head[160];
+        int hl = snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
+        write(c, head, hl);
+        write(c, body, strlen(body));
+        close(c);
+    }
+}
+EOF
+if command -v cc > /dev/null 2>&1 && cc -o "$LM/sushi" "$LM/fake.c" 2> /dev/null; then
+    cp "$BAR" "$LM/sushibar"
+    stop_fakes() {
+        for f in "$HOME"/.sushi/sushibar-server-*.pid; do [ -f "$f" ] && kill "$(cut -d' ' -f1 "$f")" 2> /dev/null; done
+        rm -f "$HOME"/.sushi/sushibar-server-*.pid
+        sleep 0.5
+    }
+    rm -f "$HOME/.sushi/sushibar.json"
+    FAKE_READY=Learned-Pack FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 8 "start@2" --port "$UPORT"
+    check "the model the watched server has loaded is remembered in sushibar.json" "$(yes_if 'grep -q "\"model\":\"Learned-Pack\"" "$HOME/.sushi/sushibar.json"')"
+    check "a server that has a model asked for nothing at start" "$(yes_if '[ ! -s "$WORK/load.log" ]')"
+    stop_fakes
+    : > "$WORK/load.log"
+    FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 10 "start@2" --port "$UPORT"
+    check "the header names the model Start will load while the server is stopped" "$(yes_if 'grep -q "poll 1 .*line2=\"Port '"$UPORT"' · loads Learned-Pack\"" "$LOG"')"
+    check "Start asks the new server to load it as the web page does, as the default" "$(yes_if 'grep -q "\"model\":\"Learned-Pack\",\"default\":true" "$WORK/load.log"')"
+    stop_fakes
+    : > "$WORK/load.log"
+    echo '{"port":'"$UPORT"',"ports":[]}' > "$HOME/.sushi/sushibar.json"
+    FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 8 "start@2" --port "$UPORT"
+    check "with no remembered model Start loads nothing and the header points at the Models page" "$(yes_if '[ ! -s "$WORK/load.log" ] && grep -q "pill=\"No model\" line1=\"Open Models to load one\".*models_link=1" "$LOG"')"
+    stop_fakes
+
+    : > "$LOG"
+    SUSHIBAR_TEST_POLLS=14 SUSHIBAR_TEST_ACTIONS="start@2" FAKE_READY=Crash-Pack "$LM/sushibar" --port "$UPORT" 2> "$LOG"
+    BP=$(cut -d' ' -f1 "$HOME/.sushi/sushibar.pid" 2> /dev/null)
+    [ "$(wait_health "$UPORT")" = 200 ] && sleep 3
+    kill -9 "$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$UPORT.pid" 2> /dev/null)" 2> /dev/null
+    for _ in $(seq 1 60); do kill -0 "$BP" 2> /dev/null || break; sleep 0.5; done
+    check "a server sushibar started that dies after answering says so with the signal, in an orange note" "$(yes_if 'grep -q "note=\"Port '"$UPORT"': server exited (signal 9)\" problem=1" "$LOG"')"
+    check "and the icon carries a badge until a server answers again" "$(yes_if 'grep -q "note=\"Port '"$UPORT"': server exited (signal 9)\" problem=1.*badge=1" "$LOG"')"
+    rm -f "$HOME"/.sushi/sushibar-server-*.pid
+
+    "$LM/sushi" --serve --port "$FPORT" > /dev/null 2>&1 &
+    FPID=$!
+    wait_health "$FPORT" > /dev/null
+    : > "$LOG"
+    SUSHIBAR_TEST_POLLS=12 "$LM/sushibar" --port "$FPORT" 2> "$LOG"
+    BP=$(cut -d' ' -f1 "$HOME/.sushi/sushibar.pid" 2> /dev/null)
+    sleep 4
+    kill -9 "$FPID" 2> /dev/null
+    wait "$FPID" 2> /dev/null
+    for _ in $(seq 1 60); do kill -0 "$BP" 2> /dev/null || break; sleep 0.5; done
+    check "a server sushibar did not start that goes away is reported with the time" "$(yes_if 'grep -qE "note=\"Port '"$FPORT"': server stopped at [0-9]{2}:[0-9]{2}\" problem=1" "$LOG"')"
+else
+    echo "  SKIP no C compiler"
+fi
+
+echo "== a server that wants an API key =="
+cat > "$WORK/stub_key.py" <<'EOF'
+import http.server, sys
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(401); self.send_header("Content-Length", "0"); self.end_headers()
+
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+EOF
+python3 "$WORK/stub_key.py" "$TPORT" > /dev/null 2>&1 &
+TPID=$!
+for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$TPORT/" && break; sleep 0.25; done
+run_bar "$BAR" 3 "" --port "$TPORT"
+check "a 401 reads Key needed with its cause in the header, a badge and no words in the title" "$(yes_if 'grep -q "poll 2 title=\"\" .*pill=\"Key needed\" line1=\"The server requires an API key\".*badge=1" "$LOG"')"
+kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
 
 echo "== two sushibars launched at once leave one =="
 DUAL="$WORK/dual"
@@ -408,7 +530,7 @@ EOF
     check "that hung sushi never slows the watched port's polls" "$(yes_if '[ $((after - before)) -ge 10 ]')"
     check "its label reads not answering, never no model" "$(yes_if 'grep -q "ports=\".*'"$HPORT"' — not answering;" "$LOG" && ! grep -q "'"$HPORT"' — no model" "$LOG"')"
     run_bar "$BAR" 10 "" --port "$HPORT"
-    check "a hung sushi on the watched port reads Not answering" "$(yes_if 'grep -q "poll 10 .*Port '"$HPORT"': not answering.*pill=\"Not answering\"" "$LOG"')"
+    check "a hung sushi on the watched port reads Not answering, with a badge on the icon" "$(yes_if 'grep -q "poll 10 .*Port '"$HPORT"': not answering.*pill=\"Not answering\".*badge=1" "$LOG"')"
     check "and Stop is offered with the confirm ellipsis" "$(yes_if 'grep -q "poll 10 .*stop=1.*toggle=\"Stop Server…\"" "$LOG"')"
     kill "$HPID" "$SPID" 2>/dev/null
     wait "$HPID" "$SPID" 2>/dev/null
