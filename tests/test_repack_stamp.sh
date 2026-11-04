@@ -5,6 +5,7 @@
 # before a write, a different id is refused, `--check` follows the loader's rule, and a rerun changes nothing.
 # Usage: ./tests/test_repack_stamp.sh
 set -u
+. "$(dirname "$0")/private_cache.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BINARY:-$ROOT/zig-out/bin/sushi}"

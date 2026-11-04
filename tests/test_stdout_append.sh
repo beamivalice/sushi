@@ -3,6 +3,7 @@
 # `sushi --version >> f` and `sushi --help >> f` append: stdout is written in streaming mode, never at file offset 0.
 # Usage: ./tests/test_stdout_append.sh
 set -u
+. "$(dirname "$0")/private_cache.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${SUSHI_BIN:-$ROOT/zig-out/bin/sushi}"
