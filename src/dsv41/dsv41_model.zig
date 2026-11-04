@@ -2987,6 +2987,7 @@ pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) 
     for (st.layers, 0..) |*ls, li| {
         const a = &out[2 * li];
         for (0..3) |k| try shareInto(&a[k], fixed[2 * li][k]);
+        if (ls.comp == null and ls.idx_k == null) continue;
         const r = n / m.ratio(li);
         const b = &out[2 * li + 1];
         if (ls.comp) |rows| {
