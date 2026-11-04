@@ -1009,41 +1009,36 @@ pub const ModelsKnown = enum { unknown, answered, failed };
 
 pub const PortEntry = struct { port: u16, checked: bool, listening: bool, model: ?[]const u8, models: ModelsKnown = .answered, removable: bool = false };
 
-/// The Port submenu: the default port first, then the added ports, the watched port when it is none of those, and every
-/// other listening sushi. A port can be forgotten unless it is the default or a listener nobody added; the watched
-/// port can always be, even when a file from before added ports or `--port` named it and it was never saved.
+/// The Port submenu: the default port first, then the added ports, then the watched port when it is none of those. A
+/// sushi on any other port is not listed. Every port but the default can be forgotten, the watched one too (even when
+/// a file from before added ports or `--port` named it and it was never saved); the listener scan only gives a row its state.
 pub fn portEntries(out: []PortEntry, watched: u16, default: u16, saved: []const u16, listings: []const Listing) []PortEntry {
     var n: usize = 0;
     const lead = [_][]const u16{ &.{default}, saved };
     for (lead) |ports| for (ports) |p| {
         if (n < out.len and !listed(out[0..n], p)) {
-            out[n] = portEntry(p, watched, default, saved, listings);
+            out[n] = portEntry(p, watched, default, listings);
             n += 1;
         }
     };
     if (n < out.len and !listed(out[0..n], watched)) {
-        out[n] = portEntry(watched, watched, default, saved, listings);
+        out[n] = portEntry(watched, watched, default, listings);
         n += 1;
     }
-    for (listings) |l| if (n < out.len and !listed(out[0..n], l.port)) {
-        out[n] = portEntry(l.port, watched, default, saved, listings);
-        n += 1;
-    };
     return out[0..n];
 }
 
-fn portEntry(p: u16, watched: u16, default: u16, saved: []const u16, listings: []const Listing) PortEntry {
+fn portEntry(p: u16, watched: u16, default: u16, listings: []const Listing) PortEntry {
     const listing = for (listings) |l| {
         if (l.port == p) break l;
     } else null;
-    const kept = std.mem.indexOfScalar(u16, saved, p) != null;
     return .{
         .port = p,
         .checked = p == watched,
         .listening = listing != null,
         .model = if (listing) |l| l.model else null,
         .models = if (listing) |l| l.models else .answered,
-        .removable = p != default and (kept or listing == null or p == watched),
+        .removable = p != default,
     };
 }
 
@@ -1220,18 +1215,17 @@ test "start failure: the note names the port and its log" {
     try std.testing.expectEqualStrings("Server on port 18801 did not start: see ~/.sushi/logs/sushi-18801.log", startFailedNote(&b, 18801));
 }
 
-test "port menu: the default first, then the added ports, then any other listener, each with its state" {
+test "port menu: the default first, then the added ports, each with its state; a listener nobody added is not listed" {
     var out: [12]PortEntry = undefined;
     var b: [96]u8 = undefined;
     const l = [_]Listing{ .{ .port = 18802, .pid = 5, .model = "Qwen", .models = .answered }, .{ .port = 12345, .pid = 6, .models = .answered }, .{ .port = 7000, .pid = 7, .models = .answered } };
     const e = portEntries(&out, 12345, 12345, &.{ 18803, 18802 }, &l);
-    try std.testing.expectEqual(@as(usize, 4), e.len);
+    try std.testing.expectEqual(@as(usize, 3), e.len);
     try std.testing.expectEqual(@as(u16, 12345), e[0].port);
     try std.testing.expectEqualStrings("12345 — no model", portLabel(&b, e[0]));
     try std.testing.expect(e[0].checked and !e[1].checked);
     try std.testing.expectEqualStrings("18803 — not running", portLabel(&b, e[1]));
     try std.testing.expectEqualStrings("18802 — Qwen", portLabel(&b, e[2]));
-    try std.testing.expectEqual(@as(u16, 7000), e[3].port);
 }
 
 test "port menu: the default port is always listed and never removable, the others are" {
@@ -1244,15 +1238,13 @@ test "port menu: the default port is always listed and never removable, the othe
     try std.testing.expect(!e[0].removable and e[1].removable and e[2].removable);
 }
 
-test "port menu: a listener nobody added is shown but has nothing to forget, an absent watched port can be dropped" {
+test "port menu: a listener nobody added is not listed, an absent watched port is, and can be dropped" {
     var out: [12]PortEntry = undefined;
     const l = [_]Listing{.{ .port = 7000, .pid = 5, .models = .answered }};
     const e = portEntries(&out, 18801, 12345, &.{}, &l);
-    try std.testing.expectEqual(@as(usize, 3), e.len);
+    try std.testing.expectEqual(@as(usize, 2), e.len);
     try std.testing.expectEqual(@as(u16, 18801), e[1].port);
     try std.testing.expect(e[1].checked and !e[1].listening and e[1].removable);
-    try std.testing.expectEqual(@as(u16, 7000), e[2].port);
-    try std.testing.expect(!e[2].removable);
 }
 
 test "port menu: the watched port can be forgotten even when it was never saved and a sushi listens on it" {
@@ -1262,8 +1254,18 @@ test "port menu: the watched port can be forgotten even when it was never saved 
     try std.testing.expectEqual(@as(usize, 2), e.len);
     try std.testing.expect(e[1].port == 18802 and e[1].checked and e[1].listening and e[1].removable);
     const after = portEntries(&out, afterRemove(18802, 18802, 12345), 12345, &.{}, &l);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
     try std.testing.expect(after[0].checked and !after[0].removable);
-    try std.testing.expect(after[1].port == 18802 and after[1].listening and !after[1].checked and !after[1].removable);
+}
+
+test "port menu: forgetting an added port drops it even while a sushi still listens there" {
+    var out: [12]PortEntry = undefined;
+    const l = [_]Listing{.{ .port = 18802, .pid = 5, .models = .answered }};
+    const before = portEntries(&out, 12345, 12345, &.{18802}, &l);
+    try std.testing.expectEqual(@as(usize, 2), before.len);
+    try std.testing.expect(before[1].listening and before[1].removable);
+    const after = portEntries(&out, 12345, 12345, &.{}, &l);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
 }
 
 test "port menu: a default changed in settings is not listed twice when it was added before" {
@@ -1278,9 +1280,9 @@ test "port menu: a models fetch that failed or has not run never reads as no mod
     var out: [12]PortEntry = undefined;
     var b: [96]u8 = undefined;
     const l = [_]Listing{ .{ .port = 18802, .pid = 5, .models = .failed }, .{ .port = 18803, .pid = 6, .models = .unknown } };
-    const e = portEntries(&out, 18801, 12345, &.{}, &l);
-    try std.testing.expectEqualStrings("18802 — not answering", portLabel(&b, e[2]));
-    try std.testing.expectEqualStrings("18803 — …", portLabel(&b, e[3]));
+    const e = portEntries(&out, 18801, 12345, &.{ 18802, 18803 }, &l);
+    try std.testing.expectEqualStrings("18802 — not answering", portLabel(&b, e[1]));
+    try std.testing.expectEqualStrings("18803 — …", portLabel(&b, e[2]));
 }
 
 test "note: a failure line is the last update/error line, and a long note is cut with an ellipsis, never dropped" {

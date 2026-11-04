@@ -276,14 +276,15 @@ fn modelsWorker(p: u16) void {
     c.model.set(name);
 }
 
-/// The Port submenu is about to be read: ask every foreign listener for its models, in parallel. This is the only
-/// time sushibar talks to a server it is not watching.
+/// The Port submenu is about to be read: ask the listed ports' listeners for their models, in parallel. This is the
+/// only time sushibar talks to a server it is not watching, and never to one the menu does not list.
 fn refreshModels(only: ?u16) void {
     var ports: [max_listings]u16 = undefined;
     var n: usize = 0;
     lock();
     for (shared.listings[0..shared.listing_n]) |l| {
         if (l.port == port() or (only != null and only.? != l.port)) continue;
+        if (l.port != g_default_port and !g_saved.has(l.port)) continue;
         const c = cacheSlot(l.port);
         if (c.busy) continue;
         c.port = l.port;

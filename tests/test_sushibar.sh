@@ -134,8 +134,11 @@ start_foreign() {
 }
 start_foreign
 check "a headless sushi started outside sushibar answers on $FPORT" "$(yes_if 'kill -0 "$FPID" 2>/dev/null')"
+run_bar "$BAR" 2 "" --port "$PORT"
+check "a sushi nobody added is found by the scan but not listed in the Port data" "$(yes_if '! grep -q "ports=\".*'"$FPORT"' —" "$LOG"')"
+echo '{"port":'"$PORT"',"ports":['"$FPORT"']}' > "$HOME/.sushi/sushibar.json"
 run_bar "$BAR" 11 "confirm@1,models$FPORT@2,port$FPORT@4,stop@8" --port "$PORT"
-check "the Port data lists the foreign sushi found by the scan, its model asked when the submenu opens" "$(yes_if 'grep -q "ports=\".*'"$FPORT"' — no model;" "$LOG"')"
+check "an added port is listed with the state the scan finds, its model asked when the submenu opens" "$(yes_if 'grep -q "ports=\".*'"$FPORT"' — no model;" "$LOG"')"
 check "choosing it switches the watched port and names it in the status" "$(yes_if 'grep -q "poll [0-9]* .*Port '"$FPORT"': running, no model loaded\" start=0 stop=1" "$LOG"')"
 check "a sushi sushibar did not start offers Stop with the confirm ellipsis" "$(yes_if 'grep -q "toggle=\"Stop Server…\"" "$LOG"')"
 check "the choice is saved" "$(yes_if 'grep -q "\"port\":'"$FPORT"'" "$HOME/.sushi/sushibar.json"')"
@@ -175,7 +178,7 @@ check "the saved file keeps the watched port and no added one" "$(yes_if 'grep -
 start_foreign
 run_bar "$BAR" 8 "remove$FPORT@4" --port "$FPORT"
 check "a watched port that was never added, with a sushi on it, has a remove button" "$(yes_if 'grep -q "poll [1-3] .*Port '"$FPORT"':.*removable=\"[^\"]*'"$FPORT"'" "$LOG"')"
-check "removing it moves the watch to the default and leaves the sushi listed as a listener" "$(yes_if 'grep -q "poll [6-8] .*Port '"$DPORT"':.*ports=\"'"$DPORT"' — not running\*;.*'"$FPORT"' — …;" "$LOG" && ! grep -q "poll [6-8] .*removable=\"[^\"]*'"$FPORT"'" "$LOG"')"
+check "removing it moves the watch to the default and the sushi still listening there is no longer listed" "$(yes_if 'grep -q "poll [6-8] .*Port '"$DPORT"':.*ports=\"'"$DPORT"' — not running\*;\"" "$LOG" && ! grep -q "poll [6-8] .*ports=\"[^\"]*'"$FPORT"' —" "$LOG"')"
 kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
 echo '{"port":'"$FPORT"'}' > "$HOME/.sushi/sushibar.json"
 run_bar "$BAR" 2 ""
@@ -398,6 +401,7 @@ EOF
     curl -s "http://127.0.0.1:$SPORT/hits" > /dev/null
     : > "$WORK/hung/accepts"
     before=$(curl -s "http://127.0.0.1:$SPORT/hits" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("/metrics.json",0))')
+    echo '{"port":'"$SPORT"',"ports":['"$HPORT"']}' > "$HOME/.sushi/sushibar.json"
     run_bar "$BAR" 12 "models$HPORT@4" --port "$SPORT"
     after=$(curl -s "http://127.0.0.1:$SPORT/hits" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("/metrics.json",0))')
     check "opening the submenu asks the hung sushi once" "$(yes_if '[ -s "$WORK/hung/accepts" ]')"
