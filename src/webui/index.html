@@ -4233,7 +4233,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (k === 'progress') html = `<div class="t">Prefill progress</div><div style="line-height:1.4">${fmtInt(+el.dataset.done)} of ${fmtInt(+el.dataset.exp)} prompt tokens processed.</div>`;
     else if (PHASE_HELP[k]) html = `<div class="t">${PHASE_HELP[k][0]}</div><div style="line-height:1.4">${PHASE_HELP[k][1]}</div>`;
     else return;
-    placeTip(r.left + r.width / 2, r.top, html, 'phase');
+    placeTip(r.left + r.width / 2, r.top, html, 'phase', r.bottom + 12);
   }
   // Called after the table is rebuilt: the hovered chip may have changed or its row may be gone.
   function refreshPhaseTip() {
@@ -4556,15 +4556,19 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     tip.style.display = 'block'; tipOwner = cv.id;
     const r = cv.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
     let left = r.left + x + 14; if (left + tw > window.innerWidth - 8) left = r.left + x - tw - 14;
-    let top = r.top + y - th / 2; top = Math.max(8, Math.min(top, window.innerHeight - th - 8));
-    tip.style.left = Math.max(8, left) + 'px'; tip.style.top = top + 'px';
+    const top = tipTop(th, r.top + y - th / 2, r.top + y - th / 2);
+    tip.style.left = Math.max(8, Math.min(left, window.innerWidth - tw - 8)) + 'px'; tip.style.top = top + 'px';
   }
-  function placeTip(cx, cy, html, owner) {
+  // Above the anchor when it fits under the top bar, else below; always inside the viewport.
+  function tipTop(th, above, below) {
+    const min = document.getElementById('appTopbar').getBoundingClientRect().bottom + 8;
+    return Math.max(min, Math.min(above >= min ? above : below, window.innerHeight - th - 8));
+  }
+  function placeTip(cx, cy, html, owner, below = cy + 24) {
     setHtml(tip, html); tip.style.display = 'block'; tipOwner = owner;
     const tw = tip.offsetWidth, th = tip.offsetHeight;
     let left = cx + 14; if (left + tw > window.innerWidth - 8) left = cx - tw - 14;
-    const top = Math.max(8, Math.min(cy - th - 12, window.innerHeight - th - 8));
-    tip.style.left = Math.max(8, left) + 'px'; tip.style.top = top + 'px';
+    tip.style.left = Math.max(8, Math.min(left, window.innerWidth - tw - 8)) + 'px'; tip.style.top = tipTop(th, cy - th - 12, below) + 'px';
   }
   function hideTip() { tip.style.display = 'none'; tipOwner = null; }
 
@@ -4728,7 +4732,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (!el || !TILE_TIPS[el.dataset.tile]) return;
     const [title, rows, help] = TILE_TIPS[el.dataset.tile](), r = el.getBoundingClientRect();
     placeTip(r.left + 20, r.top, `<div class="t">${title}</div>` + rows.map(([k, v]) =>
-      `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${v}</b></div>`).join('') + `<div class="h">${help}</div>`, 'tile');
+      `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${v}</b></div>`).join('') + `<div class="h">${help}</div>`, 'tile', r.bottom + 12);
   };
   for (const tiles of $('panel').querySelectorAll('.tiles')) {
     tiles.addEventListener('pointerover', e => tileTip(e.target.closest('[data-tile]')));

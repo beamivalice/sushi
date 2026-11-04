@@ -378,6 +378,20 @@ async function dashboardBugs(browser) {
     assert.equal((await metricsCalls(page)).length, m + 1, 'one refresh at once, then the new interval');
     await context.close();
   }
+  for (const height of [720, 600]) {
+    // A tile's fly-over opens below the top bar and inside the window, whatever the window height.
+    const { page, context } = await openPage(browser, '/dashboard', { contextOptions: { viewport: { width: 1280, height } } });
+    await page.waitForSelector('[data-tile="mem"]');
+    for (const tile of ['mem', 'cache']) {
+      await page.hover(`[data-tile="${tile}"]`);
+      await page.waitForFunction(() => getComputedStyle(document.getElementById('dashTip')).display === 'block', null, { timeout: 5000 });
+      const box = await page.evaluate(() => { const b = document.getElementById('dashTip').getBoundingClientRect(); return { top: b.top, bottom: b.bottom, left: b.left, right: b.right, bar: document.getElementById('appTopbar').getBoundingClientRect().bottom, w: innerWidth, h: innerHeight }; });
+      assert.ok(box.top >= box.bar, `${tile} at ${height}px: the fly-over starts below the top bar (${JSON.stringify(box)})`);
+      assert.ok(box.bottom <= box.h && box.left >= 0 && box.right <= box.w, `${tile} at ${height}px: and stays inside the window (${JSON.stringify(box)})`);
+      await page.mouse.move(2, height - 2);
+    }
+    await context.close();
+  }
   {
     // Charts answer a tap and the keyboard, not only a mouse.
     const { page, context } = await simPage(browser, { contextOptions: { hasTouch: true } });
