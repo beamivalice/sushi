@@ -512,6 +512,7 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
     var auth = HfAuth.initProcess(allocator, io) catch return error.DownloadFailed;
     defer auth.deinit(allocator, io);
     try curlBaseArgs(&argv, allocator, auth);
+    if (expect) |e| hf_pull.claimPartial(io, partial, e) catch {};
     try argv.appendSlice(allocator, &.{ "--create-dirs", "-C", "-", "-o", partial });
     if (show_progress) {
         try argv.append(allocator, "--progress-bar");
@@ -541,10 +542,11 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
     // A stop asked for now waits for the verify: a complete partial is checked and kept, never left unverified.
     _ = reporter.event(.verifying);
     if (expect) |e| if (e.oid.len > 0 and !hf_pull.digestMatches(io, partial, e)) {
-        std.Io.Dir.cwd().deleteFile(io, partial) catch {};
+        hf_pull.dropPartial(io, partial);
         return error.DownloadCorrupt;
     };
     std.Io.Dir.renameAbsolute(partial, dest_path, io) catch return error.DownloadFailed;
+    hf_pull.dropPartial(io, partial);
 }
 
 fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
@@ -696,13 +698,8 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
         const url = try hf_pull.hfUrl(allocator, base, "/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
         defer allocator.free(url);
-        const had_partial = fileSizeAt(io, dest_dir, try std.fmt.allocPrint(arena_state.allocator(), "{s}.partial", .{f.path})) != null;
         curlDownload(allocator, io, url, dest_path, show_progress, f, reporter) catch |err| {
             if (err == error.PullCancelled) return err;
-            // A resumed partial may belong to an older revision of the file: once more, from the start.
-            if (err == error.DownloadCorrupt and had_partial) {
-                if (curlDownload(allocator, io, url, dest_path, show_progress, f, reporter)) |_| continue else |e| if (e == error.PullCancelled) return e;
-            }
             if (err == error.DownloadCorrupt) {
                 reporter.say("error: {s} does not match its Hugging Face checksum (partial deleted — rerun to download it again)", .{f.path});
             } else {

@@ -184,9 +184,47 @@ pub fn bytesPresent(io: std.Io, dir_path: []const u8, files: []const RepoFile) u
         }
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const partial = std.fmt.bufPrint(&buf, "{s}.partial", .{f.path}) catch continue;
-        total += @min((dir.statFile(io, partial, .{}) catch continue).size, f.size);
+        const size = (dir.statFile(io, partial, .{}) catch continue).size;
+        if (partialKeyed(dir, io, partial, f)) total += @min(size, f.size);
     }
     return total;
+}
+
+/// A `.partial` resumes only for the remote file it was started for: `<file>.partial.oid` holds "<oid> <size>".
+/// A partial with no key, or another one, is from a pull before keys or of another revision.
+pub fn keyMatches(sidecar: []const u8, f: RepoFile) bool {
+    if (f.oid.len == 0) return false;
+    var buf: [128]u8 = undefined;
+    const want = std.fmt.bufPrint(&buf, "{s} {d}", .{ f.oid, f.size }) catch return false;
+    return std.mem.eql(u8, std.mem.trim(u8, sidecar, " \r\n"), want);
+}
+
+fn partialKeyed(dir: std.Io.Dir, io: std.Io, partial: []const u8, f: RepoFile) bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = std.fmt.bufPrint(&path_buf, "{s}.oid", .{partial}) catch return false;
+    var buf: [128]u8 = undefined;
+    const got = dir.readFile(io, key_path, &buf) catch return false;
+    return keyMatches(got, f);
+}
+
+/// Before curl resumes `partial`: keeps it when it is keyed to `f`, else deletes it, and records `f`'s key.
+pub fn claimPartial(io: std.Io, partial: []const u8, f: RepoFile) !void {
+    if (f.oid.len == 0) return;
+    const cwd = std.Io.Dir.cwd();
+    if (!partialKeyed(cwd, io, partial, f)) cwd.deleteFile(io, partial) catch {};
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = try std.fmt.bufPrint(&path_buf, "{s}.oid", .{partial});
+    var buf: [128]u8 = undefined;
+    try cwd.writeFile(io, .{ .sub_path = key_path, .data = try std.fmt.bufPrint(&buf, "{s} {d}\n", .{ f.oid, f.size }) });
+}
+
+/// Removes `partial` and its key.
+pub fn dropPartial(io: std.Io, partial: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(io, partial) catch {};
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = std.fmt.bufPrint(&path_buf, "{s}.oid", .{partial}) catch return;
+    cwd.deleteFile(io, key_path) catch {};
 }
 
 pub const Action = enum { skip, download, hash };
@@ -393,14 +431,47 @@ test "hf pull: the bytes present are whole files at their listed size and the pa
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "whole", .data = "12345" });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "old", .data = "123" }); // an older revision beside its partial
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "old.partial", .data = "12" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "old.partial.oid", .data = "abc 9\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "legacy.partial", .data = "1234" }); // unkeyed: will not resume
     var p: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(testing.io, &p);
     const files = [_]RepoFile{
         .{ .path = @constCast("whole"), .size = 5 },
-        .{ .path = @constCast("old"), .size = 9 },
+        .{ .path = @constCast("old"), .size = 9, .oid = @constCast("abc") },
+        .{ .path = @constCast("legacy"), .size = 9, .oid = @constCast("def") },
         .{ .path = @constCast("missing"), .size = 7 },
     };
     try testing.expectEqual(@as(u64, 7), bytesPresent(testing.io, p[0..n], &files));
+}
+
+test "hf pull: a partial resumes only under the key of its own remote file" {
+    const f: RepoFile = .{ .path = @constCast("m"), .size = 4096, .oid = @constCast("abc") };
+    try testing.expect(keyMatches("abc 4096\n", f));
+    try testing.expect(!keyMatches("abd 4096\n", f));
+    try testing.expect(!keyMatches("abc 4095\n", f));
+    try testing.expect(!keyMatches("", f));
+    try testing.expect(!keyMatches("abc 4096", .{ .path = f.path, .size = 4096 }));
+}
+
+test "hf pull: claiming a partial discards an unkeyed or foreign one and keeps its own" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &p);
+    const partial = try std.fmt.allocPrint(testing.allocator, "{s}/m.partial", .{p[0..n]});
+    defer testing.allocator.free(partial);
+    const f: RepoFile = .{ .path = @constCast("m"), .size = 4, .oid = @constCast("abc") };
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial", .data = "xx" });
+    try claimPartial(testing.io, partial, f);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial", .{}));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial", .data = "xx" });
+    try claimPartial(testing.io, partial, f);
+    _ = try tmp.dir.statFile(testing.io, "m.partial", .{});
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial.oid", .data = "other 4\n" });
+    try claimPartial(testing.io, partial, f);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial", .{}));
+    dropPartial(testing.io, partial);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial.oid", .{}));
 }
 
 test "hf pull: only files the old manifest named and the repo dropped are removed" {

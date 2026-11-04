@@ -35,7 +35,7 @@ A file is kept by content, never by size: a finished pull leaves `.sushi-pull.js
 file's size and checksum: sha256 for a large file, the git blob id for a small one) and the next pull skips a file only
 when the repo lists the same checksum. A folder without the manifest (an older sushi, a copy by hand) is hashed once
 (`checking N files already on disk…`) and only the files that differ download. Each download is checked against its
-checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A file the last manifest
+checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A `.partial` resumes only under its `.partial.oid` key (the checksum and size it was started for); a partial with another key, or none, is deleted and the file starts from zero. A file the last manifest
 listed that the repo no longer has is removed; nothing else in the folder is touched. `sushi run` still uses a present
 local copy without contacting Hugging Face.
 

@@ -108,6 +108,59 @@ pull
 check "the next pull completes" "$?"
 check "the marker is gone and the file is there" "$([ ! -e "$DEST/.pull-incomplete" ] && cmp -s "$REPO/model-00003.safetensors" "$DEST/model-00003.safetensors"; echo $?)"
 
+# ── 7. a partial is resumed only for the remote file it was started for ──
+# The sidecar `<file>.partial.oid` holds "<content id> <size>" of that remote file.
+P="$DEST/model-00004.safetensors.partial"
+NEW4="$REPO/model-00004.safetensors"
+head -c 4096 /dev/zero | tr '\0' 'f' > "$NEW4"
+OID4=$(shasum -a 256 "$NEW4" | cut -d' ' -f1)
+ranged() { [ -s "$HF/.ranges" ] && cut -d' ' -f1 "$HF/.ranges" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+fetch4() { rm -f "$HF/.ranges"; pull; RC=$?; }
+
+# 7a. an unkeyed partial (a pull before keys existed) restarts from zero even though its bytes are a valid prefix
+head -c 2048 "$NEW4" > "$P"
+rm -f "$P.oid"
+fetch4
+check "an unkeyed partial: the pull succeeds" "$RC"
+check "an unkeyed partial is not resumed" "$([ -z "$(ranged)" ]; echo $?)"
+check "an unkeyed partial: the file is right and no partial is left" "$(cmp -s "$NEW4" "$DEST/model-00004.safetensors" && [ ! -e "$P" ] && [ ! -e "$P.oid" ]; echo $?)"
+
+# 7b. a partial keyed to another revision (same size, other bytes) is discarded
+rm "$DEST/model-00004.safetensors"
+head -c 2048 /dev/zero | tr '\0' 'x' > "$P"
+printf '%s 4096\n' "$(printf old-revision | shasum -a 256 | cut -d' ' -f1)" > "$P.oid"
+fetch4
+check "a stale partial: the pull succeeds" "$RC"
+check "a stale partial is not resumed" "$([ -z "$(ranged)" ]; echo $?)"
+check "a stale partial: the file has the new bytes" "$(cmp -s "$NEW4" "$DEST/model-00004.safetensors"; echo $?)"
+
+# 7c. a stale partial longer than the new file is no dead end either
+rm "$DEST/model-00004.safetensors"
+head -c 6000 /dev/zero | tr '\0' 'x' > "$P"
+rm -f "$P.oid"
+fetch4
+check "an oversized stale partial: the pull succeeds" "$RC"
+check "an oversized stale partial: the file has the new bytes" "$(cmp -s "$NEW4" "$DEST/model-00004.safetensors"; echo $?)"
+
+# 7d. a partial keyed to this very file resumes with a ranged request
+rm "$DEST/model-00004.safetensors"
+head -c 2048 "$NEW4" > "$P"
+printf '%s 4096\n' "$OID4" > "$P.oid"
+fetch4
+check "a matching partial: the pull succeeds" "$RC"
+check "a matching partial is resumed with a ranged request" "$([ "$(ranged)" = "model-00004.safetensors" ] && grep -q '^model-00004.safetensors 2048$' "$HF/.ranges"; echo $?)"
+check "a matching partial: the file is right and no partial is left" "$(cmp -s "$NEW4" "$DEST/model-00004.safetensors" && [ ! -e "$P" ] && [ ! -e "$P.oid" ]; echo $?)"
+
+# 7e. a download that fails its checksum leaves neither partial nor key
+rm "$DEST/model-00004.safetensors"
+echo model-00004.safetensors > "$HF/.corrupt"
+fetch4
+check "a corrupt download fails" "$([ "$RC" -ne 0 ]; echo $?)"
+check "a corrupt download leaves no partial and no key" "$([ ! -e "$P" ] && [ ! -e "$P.oid" ]; echo $?)"
+rm "$HF/.corrupt"
+fetch4
+check "the next pull completes after a corrupt one" "$RC"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
