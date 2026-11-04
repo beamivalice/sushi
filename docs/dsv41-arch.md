@@ -360,6 +360,18 @@ After CED and the fused gather-attention (budget 96, chunk 1024, synced stage pr
   are distinct (layer, expert) pairs: a chunk re-reads only ~20-25% of them (the rest each enter the pool once), so a
   layer-major order that reads each layer's experts once per prompt caps at that share. The other ~2.3 s is the
   pool's first read of experts it does not hold; the lever there is overlap with compute, not fewer reads.
+- Resident experts first (bde81972 + ccccde10, unmerged): a wide route's experts already in the pool ran their gate
+  and up GEMMs as soon as the misses' scales landed, the pending experts as planes and window segments of their own
+  (`rate_groups.HitSplit`, same bytes: greedy tokens and top-5 logprobs of all four requests in six boots). Before it,
+  each rate group's GEMMs started once that group's misses landed, so they already overlapped the reads of the groups
+  after it; the change only adds the first group's read window. Against 49960372 (pack revision 2.0,
+  `--ssd-budget-gb 108`, one boot an arm, A B B A plus a warm-up pair, `taskpolicy -a`, GPU lock, AC, fans max and
+  under 50 C before each boot): 17,890 tokens of new text 1,405 against 1,391 tok/s (means of three), 31,524 tokens
+  1,439 against 1,417; the A B B A alone +0.6% and +1.4%; the cold prompt's chunks 2-8 9.35 against 9.42 s. Inside
+  the run-to-run spread, and each pending pool doubles its gate and up planes (`[n, inter]` each): not merged. During
+  a layer's fill (~12 ms of reads a state-only 2048-row chunk) the GPU has only that layer's routed GEMMs to run, so
+  overlap inside the layer hides little; reads started before the layer's own route (a read-ahead that names the
+  misses) are what is left.
 - First boot of a binary: Metal compiles the custom kernels on a boot whose system shader cache does not hold them
   (seen as `[dsv41] kernels warmed ... in` 22-43 s against 10.5-10.8 s when cached). On such a boot the first
   request also pays up to ~1.3 s in chunk 1 and ~0.47 s in the 31-row pass (655-686 ms against 179-212); a cached boot
