@@ -60,8 +60,9 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .brand .name { font-size: var(--fs-lg); font-weight: 700; letter-spacing: -0.02em; }
 .brand .ver { font-size: var(--fs-xs); font-weight: 600; color: var(--text-3); margin-top: 5px; }
 .spacer { flex: 1; }
-.topbar-actions { display: flex; align-items: center; gap: var(--s2); }
-#serverDot { display: inline-flex; align-items: center; gap: var(--s2); height: 28px; padding: 0 10px; border: 0; border-radius: var(--r-pill); background: transparent; color: var(--text-2); font-size: var(--fs-sm); max-width: 300px; cursor: pointer; }
+.topbar-actions { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.topbar-actions > :not(#serverDot) { flex-shrink: 0; }
+#serverDot { display: inline-flex; align-items: center; gap: var(--s2); height: 28px; padding: 0 10px; border: 0; border-radius: var(--r-pill); background: transparent; color: var(--text-2); font-size: var(--fs-sm); min-width: 0; cursor: pointer; }
 #serverDot:hover { background: var(--surface-2); }
 #serverDot b { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #moreMenu:popover-open { display: grid; gap: var(--s3); position: fixed; inset: calc(var(--topbar-h) + 4px) 8px auto auto; margin: 0; padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface); color: var(--text); box-shadow: var(--shadow-pop); }
