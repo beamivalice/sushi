@@ -72,7 +72,7 @@ chk() {
 }
 
 # One request, normalized: ask <chat|messages|responses> <0|1 stream> <json body>. Prints one JSON object with
-# http, finish, content, reasoning, calls[{name,args}], usage (chat) or text/thinking (messages, responses: text only).
+# http, finish, content, reasoning, calls[{name,args}], usage (chat) or text/thinking (messages; responses: text and reasoned).
 HELPER=$(cat <<'PY'
 import json, sys, urllib.error, urllib.request
 
@@ -109,6 +109,7 @@ if out["http"] != 200:
 elif mode == "responses":
     d = json.load(resp)
     out.update(finish=d.get("status"), usage=d.get("usage") or {},
+               reasoned=any(it.get("type") == "reasoning" for it in d.get("output", [])),
                text="".join(c.get("text", "") for it in d.get("output", []) if it.get("type") == "message" for c in it.get("content", [])))
 elif mode == "chat" and not stream:
     d = json.load(resp)
@@ -326,7 +327,7 @@ if [ "$THINKS" = 1 ]; then
     # ── 10. /v1/responses: truncated thinking is no message text, and usage reports the reasoning ──
     R=$(ask responses 0 "{\"model\":\"x\",\"input\":\"$SUSHI_NONCE What is 17*23? Be brief.\",\"max_output_tokens\":120,\"reasoning\":{\"effort\":\"low\"}}")
     chk "10. /v1/responses: truncated thinking not in message text" "r['finish']!='incomplete' or not r['text']"
-    chk "10. /v1/responses: usage output_tokens_details.reasoning_tokens > 0" "r['usage'].get('output_tokens_details',{}).get('reasoning_tokens',0)>0"
+    chk "10. /v1/responses: usage reasoning_tokens > 0 exactly when the output holds a reasoning item" "(r['usage'].get('output_tokens_details',{}).get('reasoning_tokens',0)>0)==r['reasoned']"
 
     # ── 11. Stream + thinking, truncated: deltas split, nothing in content ──
     R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":120,\"temperature\":0,$THINK}")
