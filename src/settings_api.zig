@@ -16,6 +16,8 @@ const models_api = @import("models_api.zig");
 const expert_stream = @import("expert_stream.zig");
 const chat = @import("chat.zig");
 const kv_quant_mod = @import("kv_quant.zig");
+const update_mod = @import("update.zig");
+const pack_update = @import("pack_update.zig");
 
 const Edit = model_settings.Edit;
 
@@ -166,6 +168,17 @@ fn writeLimits(w: *std.Io.Writer, fit: model_settings.Fit) !void {
     try w.writeAll("}");
 }
 
+/// A server-wide on/off key: the file's value, the pinning flag, and the default it falls back to.
+fn writeAutoCheck(w: *std.Io.Writer, name: []const u8, file: ?bool, lock: *const model_settings.Lock) !void {
+    try w.print(",\"{s}\":{{\"file\":", .{name});
+    try writeJson(w, file);
+    try w.writeAll(",\"flag\":");
+    if (lock.set) try writeJson(w, lock.text()) else try w.writeAll("null");
+    try w.print(",\"default\":true,\"source\":\"{s}\",\"locked\":{},\"applies\":\"applies at once\"}}", .{
+        if (lock.set) "flag" else if (file != null) "file" else "default", lock.set,
+    });
+}
+
 pub fn render(
     allocator: std.mem.Allocator,
     file_path: []const u8,
@@ -223,7 +236,10 @@ pub fn render(
         try writeJson(w, row.id);
         try w.print(",\"cap_bytes\":{d},\"used_bytes\":{d}}}", .{ t.cap_bytes, t.used_bytes });
     };
-    try w.writeAll("],\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}}");
+    try w.writeAll("],\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}");
+    try writeAutoCheck(w, "update_check", srv.update_check, &locks.update_check);
+    try writeAutoCheck(w, "pack_update_check", srv.pack_update_check, &locks.pack_update_check);
+    try w.writeAll("}");
 
     try w.writeAll(",\"models\":[");
     for (rows, 0..) |row, i| {
@@ -527,6 +543,8 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         try w.print("\"{s}\":", .{e.key});
         if (std.mem.eql(u8, e.key, "prefix_cache_disk_gb")) {
             try writeJson(w, applyCacheBudget(sch, e.value));
+        } else if (std.mem.eql(u8, e.key, "update_check") or std.mem.eql(u8, e.key, "pack_update_check")) {
+            try writeJson(w, applyUpdateCheck(&model_settings.launch_locks, e.key, e.value));
         } else {
             try writeJson(w, applyModelsDir(sch, &message_buf));
         }
@@ -578,6 +596,15 @@ fn applyCacheBudget(sch: *@import("scheduler.zig").Scheduler, value: ?std.json.V
     return cacheBudgetMessage(resized);
 }
 
+/// The loops read the published value before each look, so a toggle needs no restart; null (key removed) is the default, on.
+fn applyUpdateCheck(locks: *const model_settings.LaunchLocks, key: []const u8, value: ?std.json.Value) []const u8 {
+    const is_sushi = std.mem.eql(u8, key, "update_check");
+    if ((if (is_sushi) locks.update_check else locks.pack_update_check).set) return "saved; --no-update-check still keeps it off until a start without it";
+    const on = if (value) |v| v.bool else true;
+    if (is_sushi) update_mod.setAutoCheck(on) else pack_update.setAuto(on);
+    return "applies at once";
+}
+
 fn modelsDirMessage(buf: []u8, rescan: anyerror!u32) []const u8 {
     const added = rescan catch return "saved; the rescan failed, use /v1/models/rescan";
     return std.fmt.bufPrint(buf, "saved; models rescanned, {d} added", .{added}) catch "saved; models rescanned";
@@ -624,6 +651,68 @@ test "settings api: a request names real keys with valid values, or is refused w
     try expectRejected("{}", 400, "invalid_request_error");
     try expectRejected("[1]", 400, "invalid_request_error");
     try expectRejected("nope", 400, "invalid_request_error");
+}
+
+test "settings api: the update-check keys take a boolean and nothing else" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ok = parseRequest(arena_state.allocator(), "{\"server\":{\"update_check\":false,\"pack_update_check\":null}}");
+    try testing.expectEqual(@as(usize, 2), ok.ok.server_edits.len);
+    try testing.expect(!ok.ok.server_edits[0].value.?.bool);
+    try testing.expect(ok.ok.server_edits[1].value == null);
+    try expectRejected("{\"server\":{\"update_check\":\"off\"}}", 400, "invalid_setting");
+    try expectRejected("{\"server\":{\"pack_update_check\":0}}", 400, "invalid_setting");
+}
+
+test "settings api: render reports both update-check keys with their default, file value, and the flag that pins them" {
+    var file = try model_settings.parse(testing.allocator, "{\"server\": {\"update_check\": false}}");
+    defer file.deinit();
+    var locks: model_settings.LaunchLocks = .{};
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    {
+        const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const srv = parsed.value.object.get("server").?.object;
+        const u = srv.get("update_check").?.object;
+        try testing.expect(!u.get("file").?.bool);
+        try testing.expect(u.get("default").?.bool);
+        try testing.expectEqualStrings("file", u.get("source").?.string);
+        try testing.expect(!u.get("locked").?.bool);
+        try testing.expect(u.get("flag").? == .null);
+        const p = srv.get("pack_update_check").?.object;
+        try testing.expect(p.get("file").? == .null);
+        try testing.expectEqualStrings("default", p.get("source").?.string);
+    }
+    locks.update_check.pin("--no-update-check", .{});
+    locks.pack_update_check.pin("--no-update-check", .{});
+    const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    for ([_][]const u8{ "update_check", "pack_update_check" }) |k| {
+        const o = parsed.value.object.get("server").?.object.get(k).?.object;
+        try testing.expectEqualStrings("flag", o.get("source").?.string);
+        try testing.expect(o.get("locked").?.bool);
+        try testing.expectEqualStrings("--no-update-check", o.get("flag").?.string);
+    }
+}
+
+test "settings api: a toggle reaches the loops at once, and a pinning flag keeps the key off" {
+    defer update_mod.setAutoCheck(true);
+    defer pack_update.setAuto(true);
+    var locks: model_settings.LaunchLocks = .{};
+    try testing.expectEqualStrings("applies at once", applyUpdateCheck(&locks, "update_check", .{ .bool = false }));
+    try testing.expect(!update_mod.autoCheckOn());
+    try testing.expect(pack_update.autoOn());
+    _ = applyUpdateCheck(&locks, "update_check", null);
+    try testing.expect(update_mod.autoCheckOn());
+    _ = applyUpdateCheck(&locks, "pack_update_check", .{ .bool = false });
+    try testing.expect(!pack_update.autoOn());
+    locks.pack_update_check.pin("--no-update-check", .{});
+    _ = applyUpdateCheck(&locks, "pack_update_check", .{ .bool = true });
+    try testing.expect(!pack_update.autoOn());
 }
 
 test "settings api: a kv_quant request in any spelling is stored as its choice name; a value the loader would not read is refused" {

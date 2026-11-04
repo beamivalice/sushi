@@ -836,6 +836,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <div class="kv" id="dirKv" style="margin-top:8px"></div>
       </div>
     </section>
+    <section class="card" id="updatesCard" hidden>
+      <div class="card-h">Automatic update checks</div>
+      <div class="card-b"><div id="updateSet"></div><div id="packUpdateSet"></div></div>
+    </section>
     <section class="card" id="aboutCard" hidden>
       <div class="card-h">About</div>
       <div class="card-b"><div class="kv"><span>Version</span><span id="aboutVersion"></span></div>
@@ -2993,7 +2997,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
   const isOff = (flag) => flag === "off" || flag === "false" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
-  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk" }[key] ?? "";
+  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", update_check: "--no-update-check", pack_update_check: "--no-update-check" }[key] ?? "";
   const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : key === "mtp_greedy_tail" ? flagName(key) : flagName(key) ? `${flagName(key)} ${flag}` : "";
   const flagHelp = (key, flag) => { const text = flagText(key, flag); return `Set by ${text ? `${text} at launch` : "a launch flag"}. Start sushi without the flag to change it here.`; };
   const flagShown = (spec, flag) => {
@@ -3487,6 +3491,18 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   q("cacheSet").replaceWith(cacheRow.row);
   q("dirSet").replaceWith(dirRow.row);
 
+  // The two automatic update checks: Default, On or Off. A file value of null is the default, shown as "Default (On)".
+  const UPDATE_KEYS = [
+    ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Update and Check for updates always work."],
+    ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. sushi pull always works."],
+  ].map(([key, slot, label, help]) => {
+    const row = setRow(key, label);
+    const btns = [[null, "Default"], [true, "On"], [false, "Off"]].map(([value, text]) => h("button", { type: "button", "data-value": String(value), text, onclick: (e) => saveServer(key, value, "Saved.", e.currentTarget, "Saving…") }));
+    row.ctl.append(h("div", { class: "tri", role: "group", "aria-label": label }, ...btns));
+    q(slot).replaceWith(row.row);
+    return { key, row, btns, help };
+  });
+
   // The server's own words for when a server setting takes effect ("saved; applies at the next model load").
   const sentence = (note) => `${note[0].toUpperCase()}${note.slice(1)}.`;
   async function saveServer(key, value, text, btn, label) {
@@ -3509,10 +3525,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const s = A.settings, c = A.cache;
     if (!s) return;
     setHidden(q("settingsSkel"), true);
-    for (const id of ["cacheCard", "dirCard", "aboutCard"]) setHidden(q(id), false);
+    for (const id of ["cacheCard", "dirCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     setText(q("settingsFile"), `Saved in ${s.file}`);
     if (c) renderCache(c, s.server.prefix_cache_disk_gb);
     renderDir(s.server.models_dir);
+    renderUpdates(s.server);
     setText(q("aboutVersion"), q("brandVersion").textContent || "-");
   }
   function renderCache(c, gb) {
@@ -3574,6 +3591,20 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (mine) q(id).setAttribute("aria-busy", "true"); else q(id).removeAttribute("aria-busy");
     }
   }
+  function renderUpdates(srv) {
+    for (const { key, row, btns, help } of UPDATE_KEYS) {
+      const st = srv[key];
+      if (!st) continue;
+      const locked = !!st.locked, shown = locked ? String(!isOff(st.flag ?? "")) : String(st.file);
+      badges(row.badge, st, st.applies);
+      for (const b of btns) {
+        b.disabled = locked;
+        b.setAttribute("aria-pressed", String(b.dataset.value === shown));
+        if (b.dataset.value === "null" && b.getAttribute("aria-busy") !== "true") setText(b, `Default (${st.default ? "On" : "Off"})`);
+      }
+      setText(row.help, locked ? flagHelp(key, st.flag) : help);
+    }
+  }
   function renderDir(d) {
     badges(dirRow.badge, d, d.applies);
     dirRow.ctl.replaceChildren(...(d.locked ? [] : [...dirCtl, dirRow.bad]));
@@ -3593,7 +3624,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : A.error ? `Couldn't load: ${A.error}` : "";
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
-    for (const id of ["modelsMd", "cacheCard", "dirCard", "aboutCard"]) q(id).classList.toggle("stale-view", !!msg && !!A.settings);
+    for (const id of ["modelsMd", "cacheCard", "dirCard", "updatesCard", "aboutCard"]) q(id).classList.toggle("stale-view", !!msg && !!A.settings);
     if (A.view === "models") renderModels(); else if (A.view === "settings") renderSettings();
   }
   modelStore.subscribe(() => {

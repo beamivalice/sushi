@@ -3,7 +3,9 @@
 # Pack-revision update notice, hermetic: a stub Hugging Face (SUSHI_HF_ENDPOINT, the test-only hook) on a private port
 # serves the repo listing and `config.json` for a stamped (2.0), a legacy and a missing remote. `sushi list` under a
 # private HOME with a stub pack folder named like the DeepSeek repo prints the update line against the 2.0 remote and
-# nothing against a legacy (1.0) remote, a 404 or a stub that is down. The server's check and its /v1/models row are
+# nothing against a legacy (1.0) remote, a 404 or a stub that is down. Each answer is kept for a day in
+# ~/.sushi/pack-update-check.json (a second `list` with the stub down still prints the line, a stale entry asks again),
+# and `server.pack_update_check: false` in model-settings.json stops `list` asking at all. The server's check and its /v1/models row are
 # pinned by the pack_update.zig and models_api.zig unit tests (a headless server cannot load stub weights).
 # Usage: ./tests/test_pack_update.sh [port]
 set -uo pipefail
@@ -66,6 +68,8 @@ check() {
     if [ "$2" = "1" ]; then echo "  PASS $1"; else echo "  FAIL $1"; FAILED=1; fi
 }
 count() { grep -c "update available" <<<"$1"; }
+CACHE="$HOME/.sushi/pack-update-check.json"
+forget() { rm -f "$CACHE"; }
 
 serve v2
 out=$("$BIN" list 2>&1)
@@ -75,23 +79,53 @@ check "only that pack is flagged" "$([ "$(count "$out")" = 1 ] && echo 1 || echo
 echo "  list output:"; sed 's/^/    /' <<<"$out"
 stop
 
+forget
 serve legacy
 out=$("$BIN" list 2>&1)
 check "a legacy remote prints no update line" "$([ "$(count "$out")" = 0 ] && echo 1 || echo 0)"
 stop
 
+forget
 serve missing
 out=$("$BIN" list 2>&1)
 check "a 404 remote prints no update line" "$([ "$(count "$out")" = 0 ] && echo 1 || echo 0)"
 stop
 
+forget
 out=$("$BIN" list 2>&1)
 check "a stub that is down prints no update line" "$([ "$(count "$out")" = 0 ] && echo 1 || echo 0)"
 
+forget
 serve v2
 echo '{"model_type":"deepseek_v41","pack_revision":{"id":"2.0","unstamped":[]}}' > "$HOME/.sushi/models/beamster/$PACK/config.json"
 out=$("$BIN" list 2>&1)
 check "a pack already at 2.0 prints no update line" "$([ "$(count "$out")" = 0 ] && echo 1 || echo 0)"
+stop
+
+echo '{"model_type":"deepseek_v41"}' > "$HOME/.sushi/models/beamster/$PACK/config.json"
+forget
+serve v2
+out=$("$BIN" list 2>&1)
+check "the first list asks and prints the update line" "$([ "$(count "$out")" = 1 ] && echo 1 || echo 0)"
+check "the answer is kept with its time and revision" "$(grep -q '"revision":"2.0"' "$CACHE" && grep -q '"checked_at":' "$CACHE" && echo 1 || echo 0)"
+stop
+serve legacy
+out=$("$BIN" list 2>&1)
+check "a list inside the day keeps the cached 2.0 though the remote now says 1.0" "$([ "$(count "$out")" = 1 ] && echo 1 || echo 0)"
+sed -i.bak 's/"checked_at":[0-9]*/"checked_at":1/' "$CACHE"
+out=$("$BIN" list 2>&1)
+check "a day-old answer is asked again" "$([ "$(count "$out")" = 0 ] && echo 1 || echo 0)"
+stop
+
+forget
+echo '{"server":{"pack_update_check":false}}' > "$HOME/.sushi/model-settings.json"
+serve v2
+out=$("$BIN" list 2>&1)
+check "pack_update_check false: list prints no update line" "$([ "$(count "$out")" = 0 ] && echo 1 || echo 0)"
+check "and never asked Hugging Face" "$([ ! -e "$CACHE" ] && echo 1 || echo 0)"
+echo '{"server":{"update_check":false}}' > "$HOME/.sushi/model-settings.json"
+out=$("$BIN" list 2>&1)
+check "update_check false leaves the pack check on" "$([ "$(count "$out")" = 1 ] && echo 1 || echo 0)"
 stop
 
 [ -z "$FAILED" ] && echo "PASS: pack update notice"

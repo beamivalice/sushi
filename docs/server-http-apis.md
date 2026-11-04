@@ -352,7 +352,10 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   namespace another server holds is skipped (`skipped_live_namespaces: 1`, nothing removed) and a symlink is refused;
   it answers the `stale_*` fields of the namespace it removed, 400 for an id that is not a namespace name, 404 for
   one not in the cache and 409 `namespace_in_use` for one a loaded model owns (use `model`).
-- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir` and
+- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir`,
+  `server.update_check` and `server.pack_update_check` (booleans, `default: true`, `file`, `flag`, `source`, `locked`;
+  `--no-update-check` pins both and reports `flag: "--no-update-check"`; a change reaches the check loops at once, no
+  restart) and
   `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, as typed: `models_dir` whole, the size in the
   flag's own syntax such as `512MB`, `source` `flag|file|default`, `locked`; the size also carries `effective_bytes`, the
   largest running tier's cap or, with none running, the ask; `ask_bytes`, the number the next load starts from; `default_bytes`, the size an unset key asks for (a load may
@@ -402,7 +405,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   /v1/prefix-cache/clear {"scope":"namespace","id":...}`. A `flag` is printed as the server sends it: a text starting with `--`
   (`--mtp-tokenv3 0.5`) is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
   choice shows the choice the spelling names, else "Launch flag". The page names "Use default (N GiB)" from
-  `server.prefix_cache_disk_gb.default_bytes`. The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
+  `server.prefix_cache_disk_gb.default_bytes`. The Settings page's "Automatic update checks" card is a Default (On) / On / Off group per check. The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
   `/metrics.json` read, which is 503 while metrics are off). Guards: `tests/test_prefix_cache_admin.sh`,
   `node tests/test_webui_admin.cjs` (pure functions), `node tests/test_webui_admin_ui.cjs` (the tabs against a stub).
 

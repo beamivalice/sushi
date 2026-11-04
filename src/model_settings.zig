@@ -366,6 +366,8 @@ pub const model_keys = [_]KeySpec{
 pub const server_keys = [_]KeySpec{
     .{ .name = "models_dir", .kind = .choice },
     .{ .name = "prefix_cache_disk_gb", .kind = .int, .min = 0, .max = 1 << 20 },
+    .{ .name = "update_check", .kind = .bool },
+    .{ .name = "pack_update_check", .kind = .bool },
 };
 
 pub const server_section = "server";
@@ -605,7 +607,16 @@ pub fn writeEdits(alloc: std.mem.Allocator, io: std.Io, link_path: []const u8, s
 pub const Server = struct {
     models_dir: ?[]const u8 = null,
     prefix_cache_disk_gb: ?u32 = null,
+    /// The automatic sushi release check; null = the file says nothing.
+    update_check: ?bool = null,
+    /// The automatic pack revision check.
+    pack_update_check: ?bool = null,
 };
+
+/// An automatic network look is on unless `--no-update-check` or the file turns it off.
+pub fn autoCheck(no_update_check: bool, file: ?bool) Pick(bool) {
+    return pick(bool, if (no_update_check) false else null, file, true);
+}
 
 /// The file's `"server"` section. `models_dir` borrows from `self`.
 pub fn server(self: *const Settings) Server {
@@ -624,6 +635,12 @@ pub fn server(self: *const Settings) Server {
     };
     if (sec.get("prefix_cache_disk_gb")) |v| if (v == .integer and v.integer >= 0 and v.integer <= server_keys[1].max) {
         out.prefix_cache_disk_gb = @intCast(v.integer);
+    };
+    if (sec.get("update_check")) |v| if (v == .bool) {
+        out.update_check = v.bool;
+    };
+    if (sec.get("pack_update_check")) |v| if (v == .bool) {
+        out.pack_update_check = v.bool;
     };
     return out;
 }
@@ -677,6 +694,8 @@ pub const LaunchLocks = struct {
     models: [model_keys.len]Lock = @splat(.{}),
     models_dir: Lock = .{},
     prefix_cache_disk_gb: Lock = .{},
+    update_check: Lock = .{},
+    pack_update_check: Lock = .{},
 
     pub fn model(self: *const LaunchLocks, name: []const u8) ?*const Lock {
         for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];
@@ -990,6 +1009,28 @@ test "model_settings: validate takes the values the loader reads and names the r
     try validate(findKey(&server_keys, "models_dir").?, .{ .string = "/Users/x/models" });
     try t.expectError(error.InvalidSetting, validate(findKey(&server_keys, "models_dir").?, .{ .string = "models" }));
     try t.expectError(error.InvalidSetting, validate(findKey(&server_keys, "prefix_cache_disk_gb").?, .{ .integer = -1 }));
+}
+
+test "model_settings: the update-check keys are booleans, read from the file, and a launch flag outranks the file" {
+    const t = std.testing;
+    for ([_][]const u8{ "update_check", "pack_update_check" }) |name| {
+        const spec = findKey(&server_keys, name).?;
+        try validate(spec, .{ .bool = false });
+        try t.expectError(error.InvalidSetting, validate(spec, .{ .string = "off" }));
+        try t.expectError(error.InvalidSetting, validate(spec, .{ .integer = 0 }));
+    }
+    var s = try parse(t.allocator, "{\"server\":{\"update_check\":false,\"pack_update_check\":\"no\"}}");
+    defer s.deinit();
+    try t.expectEqual(@as(?bool, false), server(&s).update_check);
+    try t.expectEqual(@as(?bool, null), server(&s).pack_update_check);
+
+    try t.expect(autoCheck(false, null).value);
+    try t.expectEqual(Source.default, autoCheck(false, null).source);
+    try t.expect(!autoCheck(false, false).value);
+    try t.expectEqual(Source.model_settings, autoCheck(false, false).source);
+    try t.expect(autoCheck(false, true).value);
+    try t.expect(!autoCheck(true, true).value);
+    try t.expectEqual(Source.flag, autoCheck(true, true).source);
 }
 
 test "model_settings: writeEdits keeps what it does not touch, round-trips through lookup, and removes an emptied section" {

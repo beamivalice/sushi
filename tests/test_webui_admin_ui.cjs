@@ -44,6 +44,8 @@ function makeServer(opts = {}) {
     server: {
       models_dir: { default: '/h/.sushi/models', boot_roots: ['/models'], file: null, flag: '', source: 'default', locked: !!opts.dirLocked, applies: 'models are rescanned at once' },
       prefix_cache_disk_gb: { file: 100, flag: null, source: 'file', locked: false, effective_bytes: 100 * GiB, ask_bytes: 100 * GiB, applies: 'a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load' },
+      update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
+      pack_update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
     },
     cache: {
       root: '/h/.sushi/kv-cache', volume: { free_bytes: 1399 * GiB, total_bytes: 3722 * GiB }, total_bytes: 71.5 * GiB,
@@ -934,6 +936,25 @@ async function main() {
     await scenario('Use default names the default size when the server says it', { path: '/settings', setup: (s) => { s.state.server.prefix_cache_disk_gb.default_bytes = 20 * GiB; } }, async ({ page }) => {
       await page.waitForSelector('#cacheDefault');
       assert.equal(await page.textContent('#cacheDefault'), 'Use default (20 GiB)');
+    });
+    await scenario('the automatic update checks show Default (On) and save On or Off', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('.set[data-key="update_check"]');
+      const row = (key) => page.locator(`.set[data-key="${key}"]`);
+      assert.equal(await row('update_check').locator('button[data-value="null"]').textContent(), 'Default (On)');
+      assert.equal(await row('update_check').locator('button[data-value="null"]').getAttribute('aria-pressed'), 'true');
+      await row('pack_update_check').locator('button[data-value="false"]').click();
+      await page.waitForFunction(() => document.querySelector('.set[data-key="pack_update_check"] button[data-value="false"]').getAttribute('aria-pressed') === 'true');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { pack_update_check: false } });
+      assert.equal(await row('update_check').locator('button[data-value="false"]').getAttribute('aria-pressed'), 'false', 'the other check is untouched');
+    });
+    await scenario('--no-update-check locks both automatic update checks', { path: '/settings', setup: (s) => {
+      for (const k of ['update_check', 'pack_update_check']) Object.assign(s.state.server[k], { flag: '--no-update-check', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector('.set[data-key="update_check"]');
+      assert.equal(await page.locator('.set[data-key="update_check"] button[data-value="true"]').isDisabled(), true);
+      assert.equal(await page.locator('.set[data-key="update_check"] button[data-value="false"]').getAttribute('aria-pressed'), 'true');
+      assert.match(await page.textContent('#updatesCard'), /Set by --no-update-check at launch/);
+      assert.match(await page.textContent('#updatesCard'), /Launch flag/);
     });
     await scenario('Use default stays plain when the server does not say the default', { path: '/settings' }, async ({ page }) => {
       await page.waitForSelector('#cacheDefault');

@@ -306,10 +306,14 @@ pub fn readCache(arena: Allocator, io: std.Io, path: []const u8) Cache {
     return std.json.parseFromSliceLeaky(Cache, arena, text, .{ .ignore_unknown_fields = true }) catch .{};
 }
 
-/// Written beside and renamed over, so a reader never sees half a file.
 pub fn writeCache(arena: Allocator, io: std.Io, path: []const u8, c: Cache) !void {
+    return writeJsonAtomic(arena, io, path, c);
+}
+
+/// Written beside and renamed over, so a reader never sees half a file.
+pub fn writeJsonAtomic(arena: Allocator, io: std.Io, path: []const u8, value: anytype) !void {
     if (std.fs.path.dirname(path)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
-    const text = try std.json.Stringify.valueAlloc(arena, c, .{});
+    const text = try std.json.Stringify.valueAlloc(arena, value, .{});
     const tmp = try std.fmt.allocPrint(arena, "{s}.tmp", .{path});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = text });
     try std.Io.Dir.renameAbsolute(tmp, path, io);
@@ -373,21 +377,40 @@ pub fn availableVersion(buf: []u8) ?[]const u8 {
 
 pub const CheckChoice = struct { on: bool, source: []const u8 };
 
-pub fn checkChoice(flag_off: bool, source_build: bool) CheckChoice {
+/// `--no-update-check` > a source build (never checks) > the settings file's `update_check` > on.
+pub fn checkChoice(flag_off: bool, source_build: bool, file: ?bool) CheckChoice {
     if (flag_off) return .{ .on = false, .source = "--no-update-check" };
     if (source_build) return .{ .on = false, .source = "source build" };
+    if (file) |f| return .{ .on = f, .source = "model-settings.json" };
     return .{ .on = true, .source = "default" };
 }
 
-/// Logs the resolved choice once and, when on, checks on a detached thread: never the inference thread, never
-/// in the way of the boot, silent on failure.
-pub fn startDailyCheck(io: std.Io, flag_off: bool) void {
+/// The settings page flips this; the check loop reads it before each look.
+var auto_on = std.atomic.Value(bool).init(true);
+
+pub fn setAutoCheck(on: bool) void {
+    auto_on.store(on, .release);
+}
+
+pub fn autoCheckOn() bool {
+    return auto_on.load(.acquire);
+}
+
+/// Whether a loop wakes into a look; a `next_at` more than a day ahead is a clock set back.
+fn looksNow(on: bool, now: i64, next_at: i64) bool {
+    return on and (now >= next_at or next_at - now > day_s);
+}
+
+/// Logs the resolved choice once and checks on a detached thread: never the inference thread, never in the way of
+/// the boot, silent on failure. `file_on` is the settings file's `update_check`; the thread idles while it is off.
+pub fn startDailyCheck(io: std.Io, flag_off: bool, file_on: ?bool) void {
     var ebuf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_dir = selfDir(io, &ebuf) orelse "";
     homebrew.store(isHomebrewKeg(exe_dir), .release);
-    const choice = checkChoice(flag_off, isSourceBuild(io, exe_dir));
+    const choice = checkChoice(flag_off, isSourceBuild(io, exe_dir), file_on);
     if (choice.on or !std.mem.eql(u8, choice.source, "source build")) log.info("[update] daily check {s} ({s})\n", .{ if (choice.on) "on" else "off", choice.source });
-    if (!choice.on) return;
+    setAutoCheck(choice.on);
+    if (flag_off or std.mem.eql(u8, choice.source, "source build")) return;
     const t = std.Thread.spawn(.{}, checkLoop, .{io}) catch |err| {
         log.debug("[update] check thread: {t}\n", .{err});
         return;
@@ -395,10 +418,13 @@ pub fn startDailyCheck(io: std.Io, flag_off: bool) void {
     t.detach();
 }
 
+/// Wakes every minute so a toggle from the settings page takes hold within it.
 fn checkLoop(io: std.Io) void {
+    var next_at: i64 = 0;
     while (true) {
-        const wait = checkOnce(io);
-        const ts = std.c.timespec{ .sec = @intCast(@max(wait, 60)), .nsec = 0 };
+        const now = std.Io.Timestamp.now(io, .real).toSeconds();
+        if (looksNow(autoCheckOn(), now, next_at)) next_at = now + @max(checkOnce(io), 60);
+        const ts = std.c.timespec{ .sec = 60, .nsec = 0 };
         _ = std.c.nanosleep(&ts, null);
     }
 }
@@ -1233,12 +1259,35 @@ test "update: /props carries null fields until a check answers, then the newer r
 }
 
 test "update: the daily check's resolved state names its source" {
-    try testing.expectEqualStrings("--no-update-check", checkChoice(true, true).source);
-    try testing.expectEqualStrings("source build", checkChoice(false, true).source);
-    const on = checkChoice(false, false);
+    try testing.expectEqualStrings("--no-update-check", checkChoice(true, true, null).source);
+    try testing.expectEqualStrings("source build", checkChoice(false, true, null).source);
+    const on = checkChoice(false, false, null);
     try testing.expect(on.on);
     try testing.expectEqualStrings("default", on.source);
-    try testing.expect(!checkChoice(true, false).on);
+    try testing.expect(!checkChoice(true, false, null).on);
+}
+
+test "update: the settings file turns the check off or on, and the flag and a source build outrank it" {
+    const off = checkChoice(false, false, false);
+    try testing.expect(!off.on);
+    try testing.expectEqualStrings("model-settings.json", off.source);
+    try testing.expect(checkChoice(false, false, true).on);
+    try testing.expect(!checkChoice(true, false, true).on);
+    try testing.expectEqualStrings("--no-update-check", checkChoice(true, false, true).source);
+    try testing.expectEqualStrings("source build", checkChoice(false, true, true).source);
+}
+
+test "update: the published toggle gates every automatic look and nothing else" {
+    defer setAutoCheck(true);
+    try testing.expect(autoCheckOn());
+    try testing.expect(looksNow(autoCheckOn(), 100, 100));
+    try testing.expect(!looksNow(autoCheckOn(), 99, 100));
+    setAutoCheck(false);
+    try testing.expect(!looksNow(autoCheckOn(), 1_000_000, 0));
+    setAutoCheck(true);
+    try testing.expect(looksNow(autoCheckOn(), 1_000_000, 0));
+    // A clock set back must not strand the next look a day or more away.
+    try testing.expect(looksNow(true, 100, 100 + 2 * day_s));
 }
 
 test "update: /v1/update is refused on a public bind, a remote peer, a bad key or Origin, a host, a busy server" {

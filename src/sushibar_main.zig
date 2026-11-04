@@ -349,21 +349,10 @@ fn setNote(text: []const u8) void {
     unlock();
 }
 
-/// `sushi update --check`, recorded in sushi's own cache like the daily check. False when it gave no answer.
-fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
-    // Both an explicit and a daily check end in the header's "up to date" or "available"; only failures are worded.
-    var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return false;
-    refreshBarVersion(a);
-    const got = capture(a, &.{ sushi.ptr, "update", "--check" });
-    const code = got.code;
-    const result = logic.parseCheck(got.text);
+/// Folds a check's answer into what the menu shows. False when it was a failure.
+fn applyCheck(result: logic.Check, manual: bool) bool {
     lock();
     defer unlock();
-    if (code == null) {
-        if (manual) shared.note.set("could not run sushi");
-        return false;
-    }
     switch (result) {
         .available => |v| {
             shared.latest.set(v);
@@ -382,6 +371,41 @@ fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
         },
     }
     return true;
+}
+
+/// A daily check answered from sushi's own cache while it is under a day old, so a bar launch asks no one.
+fn cachedCheck(a: std.mem.Allocator) ?logic.Check {
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/.sushi/update-check.json", .{g_home}) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, a, .limited(64 * 1024)) catch return null;
+    lock();
+    const bar = a.dupe(u8, shared.bar_version.get()) catch "";
+    unlock();
+    return logic.cachedCheck(a, text, io_util.nowSecs(g_io), bar);
+}
+
+/// Whether `model-settings.json` leaves the automatic check on.
+fn autoCheckEnabled(a: std.mem.Allocator) bool {
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/.sushi/model-settings.json", .{g_home}) catch return true;
+    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, a, .limited(1 << 20)) catch return true;
+    return logic.autoCheckOn(a, text);
+}
+
+/// `sushi update --check`, recorded in sushi's own cache like the daily check. False when it gave no answer. The
+/// automatic one reuses a cache under a day old; the menu's own "Check for updates" always asks.
+fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
+    // Both an explicit and a daily check end in the header's "up to date" or "available"; only failures are worded.
+    var sb: [path_cap]u8 = undefined;
+    const sushi = siblingNow(&sb, server_exe) orelse return false;
+    refreshBarVersion(a);
+    if (!manual) if (cachedCheck(a)) |hit| return applyCheck(hit, false);
+    const got = capture(a, &.{ sushi.ptr, "update", "--check" });
+    if (got.code == null) {
+        if (manual) setNote("could not run sushi");
+        return false;
+    }
+    return applyCheck(logic.parseCheck(got.text), manual);
 }
 
 fn refreshProps(a: std.mem.Allocator, p: u16) void {
@@ -647,7 +671,7 @@ fn pollLoop() void {
             if (link == .offline) {
                 last_check_ms = now;
                 last_ok = true;
-                startWorker(.auto_check);
+                if (autoCheckEnabled(a)) startWorker(.auto_check);
             } else if (known) {
                 last_check_ms = now;
                 last_ok = true;

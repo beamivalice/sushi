@@ -5,6 +5,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const hf_pull = @import("hf_pull.zig");
+const update = @import("update.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -217,21 +218,90 @@ fn readSmall(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8) ?[
     return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 * 1024 * 1024)) catch null;
 }
 
-/// Where a local pack stands against its Hugging Face repo. Never throws: any failure is `.unknown`.
-pub fn checkPack(arena: Allocator, io: std.Io, known: []const Known, pack_path: []const u8) Status {
-    const folder = std.fs.path.basename(std.mem.trimEnd(u8, pack_path, "/"));
-    const target = resolveTarget(arena, known, folder, readSmall(arena, io, pack_path, ".sushi-pull.json")) orelse return .unknown;
-    const local = revisionOf(arena, readSmall(arena, io, pack_path, "config.json") orelse return .unknown);
-    const remote = revisionOf(arena, fetchRemoteConfig(arena, io, target.repo) orelse return .unknown);
-    return decide(arena, local, remote, target) catch .unknown;
+// ── The answer, kept for a day ──────────────────────────────────────────
+
+const day_s: i64 = 24 * 60 * 60;
+const retry_s: i64 = 60 * 60;
+
+/// What Hugging Face last said a repo's revision is.
+const CacheEntry = struct { repo: []const u8, checked_at: i64, revision: []const u8 };
+const Cache = struct { packs: []const CacheEntry = &.{} };
+
+fn cachePath(buf: []u8) ?[]const u8 {
+    const home = std.c.getenv("HOME") orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/.sushi/pack-update-check.json", .{std.mem.span(home)}) catch null;
 }
 
-// ── The server's look: after a load, then once a day ────────────────────
+fn readCache(arena: Allocator, io: std.Io, path: []const u8) Cache {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch return .{};
+    return std.json.parseFromSliceLeaky(Cache, arena, text, .{ .ignore_unknown_fields = true }) catch .{};
+}
+
+var cache_mu: std.c.pthread_mutex_t = .{};
+
+/// Replaces or adds one repo's entry; the watch threads and `sushi list` share the file.
+fn remember(arena: Allocator, io: std.Io, path: []const u8, entry: CacheEntry) void {
+    _ = std.c.pthread_mutex_lock(&cache_mu);
+    defer _ = std.c.pthread_mutex_unlock(&cache_mu);
+    var keep = std.ArrayList(CacheEntry).empty;
+    for (readCache(arena, io, path).packs) |e| {
+        if (!std.mem.eql(u8, e.repo, entry.repo)) keep.append(arena, e) catch return;
+    }
+    keep.append(arena, entry) catch return;
+    update.writeJsonAtomic(arena, io, path, Cache{ .packs = keep.items }) catch |err| log.debug("[pack-update] cache write: {t}\n", .{err});
+}
+
+/// An answer is reused for a day; one stamped in the future (a clock set back) is not.
+fn due(checked_at: i64, now: i64) bool {
+    return now < checked_at or now - checked_at >= day_s;
+}
+
+const Fetch = *const fn (Allocator, std.Io, []const u8) ?[]const u8;
+
+pub const Env = struct {
+    cache_path: ?[]const u8,
+    now: i64,
+    fetch: Fetch = fetchRemoteConfig,
+};
+
+const Remote = struct { revision: ?[]const u8, wait_s: i64 };
+
+/// The repo's published revision: the cached answer while it is under a day old, else a fresh look that is cached.
+/// `wait_s` is how long until it is worth looking again.
+fn remoteRevision(arena: Allocator, io: std.Io, repo: []const u8, env: Env) Remote {
+    if (env.cache_path) |path| for (readCache(arena, io, path).packs) |e| {
+        if (std.mem.eql(u8, e.repo, repo) and !due(e.checked_at, env.now)) return .{ .revision = e.revision, .wait_s = e.checked_at + day_s - env.now };
+    };
+    const rev = revisionOf(arena, env.fetch(arena, io, repo) orelse return .{ .revision = null, .wait_s = retry_s }) orelse return .{ .revision = null, .wait_s = retry_s };
+    if (env.cache_path) |path| remember(arena, io, path, .{ .repo = repo, .checked_at = env.now, .revision = rev });
+    return .{ .revision = rev, .wait_s = day_s };
+}
+
+pub const Look = struct { status: Status, wait_s: i64 };
+
+pub fn lookWith(arena: Allocator, io: std.Io, known: []const Known, pack_path: []const u8, env: Env) Look {
+    const folder = std.fs.path.basename(std.mem.trimEnd(u8, pack_path, "/"));
+    const target = resolveTarget(arena, known, folder, readSmall(arena, io, pack_path, ".sushi-pull.json")) orelse return .{ .status = .unknown, .wait_s = day_s };
+    const local = revisionOf(arena, readSmall(arena, io, pack_path, "config.json") orelse return .{ .status = .unknown, .wait_s = retry_s });
+    const remote = remoteRevision(arena, io, target.repo, env);
+    return .{ .status = decide(arena, local, remote.revision, target) catch .unknown, .wait_s = remote.wait_s };
+}
+
+/// Where a local pack stands against its Hugging Face repo, asking at most once a day per repo. Never throws: any
+/// failure is `.unknown`.
+pub fn look(arena: Allocator, io: std.Io, known: []const Known, pack_path: []const u8) Look {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    return lookWith(arena, io, known, pack_path, .{ .cache_path = cachePath(&buf), .now = std.Io.Timestamp.now(io, .real).toSeconds() });
+}
+
+pub fn checkPack(arena: Allocator, io: std.Io, known: []const Known, pack_path: []const u8) Status {
+    return look(arena, io, known, pack_path).status;
+}
+
+// ── The server's look: after a load, then once a day (the answer is kept across restarts) ──
 
 const slot_cap = 8;
 const slot_meta_cap = 384;
-const day_s: i64 = 24 * 60 * 60;
-const retry_s: i64 = 60 * 60;
 
 const Slot = struct {
     path: [std.fs.max_path_bytes]u8 = undefined,
@@ -242,17 +312,34 @@ const Slot = struct {
 
 var mu: std.c.pthread_mutex_t = .{};
 var enabled = false;
+var auto_on = std.atomic.Value(bool).init(true);
 var server_io: std.Io = undefined;
 var server_known: []const Known = &.{};
 var slots: [slot_cap]Slot = @splat(.{});
 
-/// Called once at serve start: `on` is false under `--no-update-check`; `known` outlives the process.
-pub fn configure(io: std.Io, on: bool, known: []const Known) void {
+/// Called once at serve start: `on` is false under `--no-update-check`, `auto` is the settings file's choice;
+/// `known` outlives the process.
+pub fn configure(io: std.Io, on: bool, auto: bool, known: []const Known) void {
     _ = std.c.pthread_mutex_lock(&mu);
     defer _ = std.c.pthread_mutex_unlock(&mu);
     server_io = io;
     server_known = known;
     enabled = on;
+    setAuto(auto);
+}
+
+/// The settings page flips this; each watch thread reads it before a look.
+pub fn setAuto(on: bool) void {
+    auto_on.store(on, .release);
+}
+
+pub fn autoOn() bool {
+    return auto_on.load(.acquire);
+}
+
+/// Whether a loop wakes into a look; a `next_at` more than a day ahead is a clock set back.
+fn looksNow(on: bool, now: i64, next_at: i64) bool {
+    return on and (now >= next_at or next_at - now > day_s);
 }
 
 /// False under `--no-update-check`.
@@ -284,24 +371,28 @@ pub fn watch(pack_path: []const u8) void {
     t.detach();
 }
 
+/// Wakes every minute so a toggle from the settings page takes hold within it.
 fn watchLoop(i: usize) void {
+    var next_at: i64 = 0;
     while (true) {
-        var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         _ = std.c.pthread_mutex_lock(&mu);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = path_buf[0..slots[i].path_len];
         @memcpy(path, slots[i].path[0..path.len]);
         const io = server_io;
         const known = server_known;
         _ = std.c.pthread_mutex_unlock(&mu);
 
-        const st = checkPack(arena, io, known, path);
-        record(path, st);
-        if (st == .available) log.info("[pack-update] {s}: revision {s} is available (you have {s}): run `{s}`\n", .{ std.fs.path.basename(path), st.available.latest, st.available.local, st.available.command });
-
-        const ts = std.c.timespec{ .sec = if (st == .unknown) retry_s else day_s, .nsec = 0 };
+        const now = std.Io.Timestamp.now(io, .real).toSeconds();
+        if (looksNow(autoOn(), now, next_at)) {
+            var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer arena_state.deinit();
+            const l = look(arena_state.allocator(), io, known, path);
+            record(path, l.status);
+            if (l.status == .available) log.info("[pack-update] {s}: revision {s} is available (you have {s}): run `{s}`\n", .{ std.fs.path.basename(path), l.status.available.latest, l.status.available.local, l.status.available.command });
+            next_at = now + @max(l.wait_s, 60);
+        }
+        const ts = std.c.timespec{ .sec = 60, .nsec = 0 };
         _ = std.c.nanosleep(&ts, null);
     }
 }
@@ -421,4 +512,125 @@ test "rows: the list line and the /v1/models fragment appear for an update only"
     try metaFragment(&w, .current);
     try metaFragment(&w, .unknown);
     try testing.expectEqual(@as(usize, 0), w.buffered().len);
+}
+
+var test_fetches: usize = 0;
+var test_body: ?[]const u8 = null;
+
+fn countingFetch(_: Allocator, _: std.Io, _: []const u8) ?[]const u8 {
+    test_fetches += 1;
+    return test_body;
+}
+
+fn tmpCachePath(tmp: *testing.TmpDir, arena: Allocator) ![]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    return std.fmt.allocPrint(arena, "{s}/.sushi/pack-update-check.json", .{dir});
+}
+
+test "cache: Hugging Face is asked once a day per repo, across restarts, and a failed look is retried within the hour" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpCachePath(&tmp, a);
+    const io = testing.io;
+    test_fetches = 0;
+    test_body = "{\"pack_revision\":{\"id\":\"2.0\"}}";
+    const at = struct {
+        fn env(p: []const u8, now: i64) Env {
+            return .{ .cache_path = p, .now = now, .fetch = countingFetch };
+        }
+    }.env;
+
+    const first = remoteRevision(a, io, "o/a", at(path, 1_000));
+    try testing.expectEqualStrings("2.0", first.revision.?);
+    try testing.expectEqual(day_s, first.wait_s);
+    try testing.expectEqual(@as(usize, 1), test_fetches);
+
+    // A restart an hour later reads the cache and waits out the rest of the day.
+    const again = remoteRevision(a, io, "o/a", at(path, 1_000 + 3_600));
+    try testing.expectEqualStrings("2.0", again.revision.?);
+    try testing.expectEqual(day_s - 3_600, again.wait_s);
+    try testing.expectEqual(@as(usize, 1), test_fetches);
+
+    // Another repo has its own entry; the first stays.
+    _ = remoteRevision(a, io, "o/b", at(path, 1_000 + 3_600));
+    try testing.expectEqual(@as(usize, 2), test_fetches);
+    _ = remoteRevision(a, io, "o/a", at(path, 1_000 + 7_200));
+    try testing.expectEqual(@as(usize, 2), test_fetches);
+
+    // A day on, it asks again.
+    test_body = "{\"pack_revision\":{\"id\":\"2.1\"}}";
+    const next = remoteRevision(a, io, "o/a", at(path, 1_000 + day_s));
+    try testing.expectEqualStrings("2.1", next.revision.?);
+    try testing.expectEqual(@as(usize, 3), test_fetches);
+
+    // No answer claims nothing, leaves the cache alone and is retried within the hour.
+    test_body = null;
+    const down = remoteRevision(a, io, "o/a", at(path, 1_000 + 2 * day_s));
+    try testing.expect(down.revision == null);
+    try testing.expectEqual(retry_s, down.wait_s);
+    try testing.expectEqualStrings("2.1", remoteRevision(a, io, "o/a", at(path, 1_000 + day_s + 5)).revision.?);
+
+    // A clock set back does not hold a stale answer.
+    test_body = "{\"pack_revision\":{\"id\":\"3.0\"}}";
+    try testing.expectEqualStrings("3.0", remoteRevision(a, io, "o/a", at(path, 10)).revision.?);
+}
+
+test "cache: a missing or unreadable file is an empty cache, and no path means no cache" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpCachePath(&tmp, a);
+    try testing.expectEqual(@as(usize, 0), readCache(a, testing.io, path).packs.len);
+    try tmp.dir.createDirPath(testing.io, ".sushi");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = ".sushi/pack-update-check.json", .data = "not json" });
+    try testing.expectEqual(@as(usize, 0), readCache(a, testing.io, path).packs.len);
+    test_fetches = 0;
+    test_body = "{}";
+    const r = remoteRevision(a, testing.io, "o/a", .{ .cache_path = null, .now = 5, .fetch = countingFetch });
+    try testing.expectEqualStrings("1.0", r.revision.?);
+    _ = remoteRevision(a, testing.io, "o/a", .{ .cache_path = null, .now = 6, .fetch = countingFetch });
+    try testing.expectEqual(@as(usize, 2), test_fetches);
+}
+
+test "look: a pack's status comes from the cached remote revision" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpCachePath(&tmp, a);
+    try tmp.dir.createDirPath(testing.io, "beta-pack");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "beta-pack/config.json", .data = "{\"pack_revision\":{\"id\":\"1.0\"}}" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "beta-pack/.sushi-pull.json", .data = "{\"repo\":\"beamster/Beta-1017-Sushi-1.75bpw\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pack = try std.fmt.allocPrint(a, "{s}/beta-pack", .{buf[0..try tmp.dir.realPath(testing.io, &buf)]});
+    test_fetches = 0;
+    test_body = "{\"pack_revision\":{\"id\":\"2.0\"}}";
+    const env: Env = .{ .cache_path = path, .now = 50, .fetch = countingFetch };
+    const l = lookWith(a, testing.io, &test_known, pack, env);
+    try testing.expectEqualStrings("2.0", l.status.available.latest);
+    try testing.expectEqualStrings("sushi pull beta", l.status.available.command);
+    test_body = null;
+    const cached = lookWith(a, testing.io, &test_known, pack, env);
+    try testing.expectEqualStrings("2.0", cached.status.available.latest);
+    try testing.expectEqual(@as(usize, 1), test_fetches);
+}
+
+test "toggle: the published switch gates the watch loop's look" {
+    defer setAuto(true);
+    try testing.expect(autoOn());
+    try testing.expect(looksNow(autoOn(), 100, 100));
+    setAuto(false);
+    try testing.expect(!autoOn());
+    try testing.expect(!looksNow(autoOn(), 1_000_000, 0));
+    setAuto(true);
+    try testing.expect(looksNow(autoOn(), 1_000_000, 0));
+    try testing.expect(!looksNow(true, 99, 100));
+    try testing.expect(looksNow(true, 100, 100 + 2 * day_s));
 }

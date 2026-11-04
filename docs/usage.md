@@ -61,7 +61,8 @@ publishes a higher revision of a pack you have downloaded, `sushi list` prints, 
 `update available: 2.0 (you have 1.0) — sushi pull deepseek-v4.1-flash`. Nothing is printed when the pack is current,
 when its repo is not known (a folder that is neither a catalog pack nor pulled by `sushi pull`) or when Hugging Face
 cannot be reached or answers 404 (a private repo needs `HF_TOKEN`). The server asks the same once after a model loads and
-then once a day, unless `--no-update-check`.
+then once a day (each answer is kept in `~/.sushi/pack-update-check.json`, so a restart inside a day asks nothing),
+unless `--no-update-check` or the Settings page's pack check is off.
 
 ### The Downloads tab
 

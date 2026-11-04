@@ -424,6 +424,25 @@ pub fn checkDue(last_ms: i64, now_ms: i64, last_ok: bool) bool {
     return now_ms - last_ms >= (if (last_ok) day_ms else retry_ms);
 }
 
+/// Whether `model-settings.json` leaves the automatic sushi check on: only `server.update_check: false` turns it off,
+/// and a file that is missing or not JSON leaves it on.
+pub fn autoCheckOn(arena: std.mem.Allocator, settings_json: []const u8) bool {
+    const Doc = struct { server: ?struct { update_check: ?bool = null } = null };
+    const doc = std.json.parseFromSliceLeaky(Doc, arena, settings_json, .{ .ignore_unknown_fields = true }) catch return true;
+    return (doc.server orelse return true).update_check orelse true;
+}
+
+/// The answer sushi's own cache (`update-check.json`) already holds, while it is under a day old; null when a
+/// fresh look is due. Reading it is what keeps a bar launch from asking GitHub again.
+pub fn cachedCheck(arena: std.mem.Allocator, cache_json: []const u8, now_s: i64, bar_version: []const u8) ?Check {
+    const Doc = struct { checked_at: i64 = 0, latest: []const u8 = "" };
+    const doc = std.json.parseFromSliceLeaky(Doc, arena, cache_json, .{ .ignore_unknown_fields = true }) catch return null;
+    if (doc.checked_at <= 0 or now_s < doc.checked_at or now_s - doc.checked_at >= day_ms / 1000) return null;
+    const latest = std.SemanticVersion.parse(doc.latest) catch return .up_to_date;
+    const current = std.SemanticVersion.parse(bar_version) catch return .up_to_date;
+    return if (latest.order(current) == .gt) .{ .available = doc.latest } else .up_to_date;
+}
+
 pub fn relaunchNeeded(launched: []const u8, installed: []const u8) bool {
     return launched.len > 0 and installed.len > 0 and !std.mem.eql(u8, launched, installed);
 }
@@ -1052,6 +1071,34 @@ test "update: the daily check is due once a day, an hour after a failure, and no
     try std.testing.expect(checkDue(10 * h, 34 * h, true));
     try std.testing.expect(!checkDue(10 * h, 10 * h + h / 2, false));
     try std.testing.expect(checkDue(10 * h, 11 * h, false));
+}
+
+test "update: the bar's automatic check follows server.update_check, on unless the file says false" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expect(autoCheckOn(a, "{\"server\":{\"update_check\":true}}"));
+    try std.testing.expect(!autoCheckOn(a, "{\"server\":{\"update_check\":false,\"pack_update_check\":true}}"));
+    try std.testing.expect(autoCheckOn(a, "{\"server\":{\"pack_update_check\":false}}"));
+    try std.testing.expect(autoCheckOn(a, "{\"/m/a\":{\"mtp\":false}}"));
+    try std.testing.expect(autoCheckOn(a, ""));
+    try std.testing.expect(autoCheckOn(a, "[1,"));
+    try std.testing.expect(autoCheckOn(a, "{\"server\":{\"update_check\":\"no\"}}"));
+}
+
+test "update: a cache under a day old answers the bar's check, an older or missing one leaves it to sushi" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const newer = "{\"checked_at\":1000,\"latest\":\"1.6.0\",\"url\":\"u\",\"etag\":\"e\",\"error\":\"\"}";
+    try std.testing.expectEqualStrings("1.6.0", cachedCheck(a, newer, 1000 + 3600, "1.5.0").?.available);
+    try std.testing.expect(cachedCheck(a, newer, 1000 + 3600, "1.6.0").? == .up_to_date);
+    try std.testing.expect(cachedCheck(a, newer, 1000 + 3600, "1.7.0").? == .up_to_date);
+    try std.testing.expect(cachedCheck(a, newer, 1000 + 24 * 3600, "1.5.0") == null);
+    try std.testing.expect(cachedCheck(a, newer, 999, "1.5.0") == null);
+    try std.testing.expect(cachedCheck(a, "{}", 5000, "1.5.0") == null);
+    try std.testing.expect(cachedCheck(a, "", 5000, "1.5.0") == null);
+    try std.testing.expect(cachedCheck(a, "{\"checked_at\":1000,\"latest\":\"\"}", 2000, "1.5.0").? == .up_to_date);
 }
 
 test "update: sushibar relaunches only when the sushi beside it changed version" {

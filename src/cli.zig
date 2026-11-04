@@ -29,6 +29,7 @@ const update = @import("update.zig");
 const hf_pull = @import("hf_pull.zig");
 const pack_update = @import("pack_update.zig");
 const download_progress = @import("download_progress.zig");
+const model_settings = @import("model_settings.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -147,9 +148,9 @@ pub const known_packs = blk: {
     break :blk k;
 };
 
-/// Server start: the daily pack-revision look, off under `--no-update-check`.
-pub fn configurePackUpdates(io: std.Io, on: bool) void {
-    pack_update.configure(io, on, &known_packs);
+/// Server start: the daily pack-revision look, off under `--no-update-check`; `auto` is the settings file's choice.
+pub fn configurePackUpdates(io: std.Io, on: bool, auto: bool) void {
+    pack_update.configure(io, on, auto, &known_packs);
 }
 
 pub const Resolved = struct {
@@ -905,6 +906,18 @@ fn fetchSizeViaCurl(ctx: *anyopaque, repo: []const u8) FetchOutcome {
     };
 }
 
+/// `sushi list` asks about pack updates unless the settings file's `pack_update_check` is off.
+fn packChecksFor(file: *const model_settings.Settings) bool {
+    return model_settings.server(file).pack_update_check orelse true;
+}
+
+fn packChecksOn(allocator: std.mem.Allocator, io: std.Io) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var file = model_settings.load(allocator, io, model_settings.defaultPath(&buf));
+    defer file.deinit();
+    return packChecksFor(&file);
+}
+
 const ListEnv = struct { allocator: std.mem.Allocator, io: std.Io };
 
 /// `sushi list`'s size look for one repo, for the server's Downloads catalog.
@@ -982,6 +995,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     var env = ListEnv{ .allocator = allocator, .io = io };
     var outcomes: [aliases.len]FetchOutcome = undefined;
     const online = fetchCatalogSizes(&env, &fetchSizeViaCurl, &outcomes);
+    const check_packs = online and packChecksOn(allocator, io);
     if (online) {
         var rows: [aliases.len]CatalogRow = undefined;
         var jobs: [aliases.len]?UpdateJob = @splat(null);
@@ -997,6 +1011,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         }
         // Each downloaded pack asks Hugging Face for its revision at the same time, so a slow answer costs one wait.
         for (&jobs, &threads, paths) |*j, *t, p| {
+            if (!check_packs) break;
             const path = p orelse continue;
             j.* = .{ .io = io, .path = path };
             t.* = std.Thread.spawn(.{}, UpdateJob.run, .{&j.*.?}) catch null;
@@ -1028,7 +1043,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         if (isModelDir(io, &sub)) {
             if (online and isCatalogName(entry.name)) continue;
             try printLocalHeader(w, count);
-            try printModelRow(io, allocator, w, &sub, entry.name, root, online);
+            try printModelRow(io, allocator, w, &sub, entry.name, root, check_packs);
             count += 1;
             continue;
         }
@@ -1043,7 +1058,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
             if (online and isCatalogName(full)) continue;
             try printLocalHeader(w, count);
-            try printModelRow(io, allocator, w, &leaf, full, root, online);
+            try printModelRow(io, allocator, w, &leaf, full, root, check_packs);
             count += 1;
         }
     }
@@ -3361,4 +3376,16 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     try std.testing.expect(resolveRelativeDir(a, io, want) == null);
     try std.testing.expect(resolveRelativeDir(a, io, "qwen3.8-flash-next") == null);
     try std.testing.expect(resolveRelativeDir(a, io, "") == null);
+}
+
+test "list: pack update lookups run unless the settings file turns pack_update_check off" {
+    var on = try model_settings.parse(std.testing.allocator, "{}");
+    defer on.deinit();
+    try std.testing.expect(packChecksFor(&on));
+    var off = try model_settings.parse(std.testing.allocator, "{\"server\":{\"pack_update_check\":false}}");
+    defer off.deinit();
+    try std.testing.expect(!packChecksFor(&off));
+    var other = try model_settings.parse(std.testing.allocator, "{\"server\":{\"update_check\":false}}");
+    defer other.deinit();
+    try std.testing.expect(packChecksFor(&other));
 }

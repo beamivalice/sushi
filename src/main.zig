@@ -1044,6 +1044,7 @@ pub fn main(init: std.process.Init) !void {
         .mtp = if (mtp_explicit) enable_mtp else null,
         .vision = if (vision) true else if (no_vision) false else null,
         .models_dir = models_root,
+        .no_update_check = no_update_check,
     });
     if (dflash_mod.drafter_min_depth) |lo| if (dflash_mod.drafter_max_depth) |hi| if (lo > hi) {
         log.err("--drafter-min-depth {d} is above --drafter-max-depth {d}\n", .{ lo, hi });
@@ -1146,8 +1147,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
-    if (serve_mode and prompt == null and bench_run == null) update_mod.startDailyCheck(io, no_update_check);
-    cli_mod.configurePackUpdates(io, serve_mode and prompt == null and bench_run == null and !no_update_check);
+    {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
+        defer file.deinit();
+        const srv = model_settings_mod.server(&file);
+        const serving = serve_mode and prompt == null and bench_run == null;
+        if (serving) update_mod.startDailyCheck(io, no_update_check, srv.update_check);
+        cli_mod.configurePackUpdates(io, serving and !no_update_check, model_settings_mod.autoCheck(no_update_check, srv.pack_update_check).value);
+    }
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {
@@ -1838,7 +1846,7 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
-fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8 }) void {
+fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool }) void {
     const locks = &model_settings_mod.launch_locks;
     if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
@@ -1856,6 +1864,10 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
         locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_mod.prefix_cache_disk_bytes)});
     }
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
+    if (given.no_update_check) {
+        locks.update_check.pin("--no-update-check", .{});
+        locks.pack_update_check.pin("--no-update-check", .{});
+    }
 }
 
 fn flagInt(comptime T: type, flag: []const u8, text: []const u8, min: T) T {
@@ -1917,4 +1929,16 @@ test "both boot modes build their server defaults from the same launch flags" {
     const none = unset.serverConfig();
     try std.testing.expectEqual(@as(?f32, null), none.default_temperature);
     try std.testing.expectEqual(@as(?u32, null), none.default_top_k);
+}
+
+test "launch flags: --no-update-check pins both automatic update checks, and no flag pins neither" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.update_check.set);
+    try std.testing.expect(!model_settings_mod.launch_locks.pack_update_check.set);
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = true });
+    try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.update_check.text());
+    try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.pack_update_check.text());
 }
