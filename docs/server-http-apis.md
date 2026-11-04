@@ -76,7 +76,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   refuse it after tokenizing, `Scheduler.submit` refuses it for every surface (`error.EmptyPrompt`), and
   `Generator.initWithOptions` returns that error rather than index the prompt's last token.
 - `/v1/models` `meta.default_max_tokens`, `default_temperature`, `default_top_p` and `default_top_k` on a loaded model's row are what a request that omits the field gets (`--max-tokens` / the `max_tokens` setting / the architecture's own, 0 = the rest of the window; then a launch flag > `generation_config.json` > the hardcoded value, `request_policy.sampling*`); the chat page's placeholders read them.
-- `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash","repo":"beamster/..."}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it. The tab never offers `sushi pull` for an update (it writes a second copy): its callout opens the Downloads tab at the row of `repo`, which updates in place.
+- `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash","repo":"beamster/..."}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it. The tab never offers `sushi pull` for an update (it writes a second copy): its callout opens the Models tab's Available list at the row of `repo`, which updates in place.
 - `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
   a status route never reaches `ensureLoaded` (`handlePropsNoModel`). Removed upstream routes answer named 404s.
@@ -438,7 +438,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
 - `installed` looks in the destination and the boot roots (`catalogPackPath`, both layouts); `partial_bytes` is a
   destination folder that is there but not complete, null while that pack downloads. `launch` is `sushi serve --model
   '<path>'` plus the flags of the pack's recommended launch in [usage](usage.md#recommended-launch)
-  (`Alias.serve_flags`), only for a downloaded pack in the table.
+  (`Alias.serve_flags`), only for a downloaded pack in the table; the page does not show it.
 - `dest` is the Settings tab's models folder: the first `--model-dir` (locked), else `server.models_dir`, else
   `~/.sushi/models`; a new pack lands in `<dest>/beamster/<repo>`, an update in the folder it is installed in.
 - `POST /v1/downloads {"repo":"beamster/<repo>"}` takes only a pack the catalog lists, under the catalog's spelling
@@ -458,16 +458,18 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   another process), the hash of the files on disk stops between files, and a file already being verified finishes its
   verify. The partials and `.pull-incomplete` stay, so a later start resumes, after a restart too (the queue is in
   memory; the folder is the state). Server shutdown stops the curl the same way and refuses new starts (503).
-- The page's **Downloads** tab (`/downloads`) draws it: per pack the size, Recommended for this Mac, Needs N GB (with
-  `sushi list`'s words: "may stream (--ssd-budget-gb)", or the streamed tier for DeepSeek; a click asks first), Downloaded,
-  Update, Resume for a partial folder, and for a running download a bar, bytes, speed, time left and the file in flight;
-  Stop shows "Stopping…" until the job reports. It polls every second while a download runs or the catalog loads,
-  every 5 s otherwise, and writes no node on an unchanged answer. From another tab it asks (`background=1`) 3 s after
-  the page opens and then every 30 minutes (every 5 s while the catalog loads); a pack (or a pack's update) missing from
-  `localStorage` `sushi-seen-packs` puts a dot on the tab (its name reads "Downloads, new packs") until the tab is
-  opened. Only a ready catalog seeds or marks the list, the first one silently; under `--no-update-check` there is no
-  dot and no background ask after the first. On a phone (640 px and under) the tab is a download icon, so five tabs
-  fit the top bar. Removing a pack is not offered. Guards: `tests/test_downloads.sh`, `node
+- The page's **Models** tab draws it as its **Available** list (an Installed | Available switch in the tab's head;
+  `/downloads` is the list's own URL): per pack the size, Recommended for this Mac, Needs N GB (with
+  `sushi list`'s words: "may stream (--ssd-budget-gb)", or the streamed tier for DeepSeek; a click asks first), Downloaded
+  with Open (the pack selected in Installed, where it loads), Update, Resume for a partial folder, and for a running
+  download a bar, bytes, speed, time left and the file in flight; Stop shows "Stopping…" until the job reports. It polls
+  every second while a download runs or the catalog loads, every 5 s otherwise, and writes no node on an unchanged
+  answer; on Installed a running download polls every 2 s and shows its percent on the switch. From another tab it asks
+  (`background=1`) 3 s after the page opens and then every 30 minutes (every 5 s while the catalog loads); a pack (or a
+  pack's update) missing from `localStorage` `sushi-seen-packs` puts a dot on the Models tab (its name reads "Models,
+  new packs") and on Available until the list is shown. Only a ready catalog seeds or marks the list, the first one
+  silently; under `--no-update-check` there is no dot and no background ask after the first. Removing a pack is not
+  offered. Guards: `tests/test_downloads.sh`, `node
   tests/test_webui_downloads.cjs`, the `downloads:` tests (download_progress.zig, downloads.zig, http_conn.zig).
 
 ## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`, `GET /downloads`)
@@ -476,10 +478,11 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
   `--api-key` like the other two. Guards: `tests/test_webui.sh`, the `chat page:` and `dashboard page:` tests.
-- The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings | Downloads** navigator in the top bar switches the views of that one page in place (`history.pushState`,
+- The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings** navigator in the top bar, each tab a small icon beside its label (the icon
+  alone on a phone, 640 px and under), switches the views of that one page in place (`history.pushState`,
   `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
   conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
-  Cmd+1..5 (Ctrl+1..5 off a Mac) click the five tabs in that order, so unsaved Models/Settings edits still ask; they do
+  Cmd+1..4 (Ctrl+1..4 off a Mac) click the four tabs in that order, so unsaved Models/Settings edits still ask; they do
   nothing behind the API key overlay or an open dialog. A browser that reserves those keys for its own tabs keeps them.
 - **One reader of `/v1/models`**: `modelStore` (main script) polls it (30 s on Chat, 5 s on Dashboard and Models, 4 s
   while the server is unreachable, 2 s while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only

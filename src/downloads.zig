@@ -1,4 +1,4 @@
-//! The web page's Downloads tab. `GET /v1/downloads` lists the published Sushi packs (the `cli.aliases` table plus
+//! The web page's Available list. `GET /v1/downloads` lists the published Sushi packs (the `cli.aliases` table plus
 //! the org's public repos Hugging Face lists) with size, fit for this Mac's RAM and whether each is on disk, beside
 //! the download queue; `POST /v1/downloads` queues a pack, `POST /v1/downloads/cancel` stops or unqueues one.
 //! Downloads run one at a time through `cli.pullRepo` on a thread this module owns, never the inference thread and

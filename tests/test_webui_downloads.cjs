@@ -1,8 +1,9 @@
 // sushi-test: tier=hermetic needs=node,playwright
-// The Downloads tab in a real headless browser against a stubbed server: the pack rows (recommended, too big for this
-// Mac, downloaded, update, an interrupted pack to resume), Download and Stop, the progress bar with speed and time
-// left, no DOM write on an unchanged poll (also while the folder grows), the "new pack" dot on the tab (never seeded from a
-// catalog still loading, never under --no-update-check), and no sideways scroll at 390 and 1440 px.
+// The Models tab's Available list in a real headless browser against a stubbed server: /downloads as its deep link, the
+// pack rows (recommended, too big for this Mac, downloaded and opened from Installed, update, an interrupted pack to
+// resume), Download and Stop, the progress bar with speed and time left (and its percent on the Available switch), no DOM
+// write on an unchanged poll (also while the folder grows), the "new pack" dot on the Models tab (never seeded from a
+// catalog still loading, never under --no-update-check), and no sideways scroll at 320, 390 and 1440 px.
 // Needs Playwright with a Chromium build (global or local install); skips without one.
 const fs = require('node:fs');
 const path = require('node:path');
@@ -29,18 +30,19 @@ const PACKS = [
   pack('beamster/MiMo-V2.6-Flash-Sushi-2.3bpw', { name: 'mimo-v2.6-flash', tag: '2.3bpw', tier_gb: 128, fits: false }),
   pack('beamster/GLM-5.3-Flash-Sushi-2bpw', { name: 'glm-5.3-flash', tag: '2bpw', tier_gb: 96, fits: false, partial_bytes: 3 * GiB }),
   pack('beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw', { name: 'deepseek-v4.1-flash', tag: '1.75bpw', tier_gb: 96, fits: false, streams_experts: true, installed: true, path: '/m/d', launch: "sushi serve --model '/m/d'", update: { current: '1.0', latest: '2.0' } }),
+  pack('beamster/Qwen3.8-Flash-Next-Sushi-4bpw', { name: 'qwen3.8-flash-next', tag: '4bpw', tier_gb: 96, fits: false, installed: true, path: '/m/beamster/Qwen3.8-Flash-Next-Sushi-4bpw', launch: "sushi serve --model '/m/q4' --mtp" }),
 ];
 
 function makeServer() {
   const calls = [];
-  const state = { packs: PACKS.map((p) => ({ ...p })), jobs: [], catalog: 'ready', updateCheck: true, stopping: false };
+  const state = { packs: PACKS.map((p) => ({ ...p })), jobs: [], models: [], catalog: 'ready', updateCheck: true, stopping: false };
   const json = (body, status = 200) => ({ status, contentType: 'application/json', body: JSON.stringify(body) });
   async function handle(route) {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
     if (/^\/(chat|dashboard|models|settings|downloads)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
     calls.push({ path: p, method: request.method(), body: request.postData() });
     switch (p) {
-      case '/v1/models': return route.fulfill(json({ data: [] }));
+      case '/v1/models': return route.fulfill(json({ data: state.models }));
       case '/props': return route.fulfill(json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 64 * GiB }, batching: {} }));
       case '/v1/settings': return route.fulfill(json({ file: '/h/f.json', model_keys: [], applies: 'x', server: { models_dir: { default: '/d', boot_roots: ['/m'], file: null, flag: '', locked: false }, prefix_cache_disk_gb: { file: null, locked: false, effective_bytes: GiB } }, models: [] }));
       case '/metrics.json': return route.fulfill(json({ counters: {}, gauges: {}, histograms: {}, sessions: [] }));
@@ -86,10 +88,16 @@ async function main() {
   }
   try {
     {
-      // Each row says what it is for this Mac, and the button matches what is on disk.
+      // /downloads opens the Models tab on its Available list; each row says what it is for this Mac, and the button
+      // matches what is on disk.
       const server = makeServer();
       const { page, context, errors } = await open(browser, server, '/downloads');
       await page.waitForSelector('.dl-row');
+      assert.equal(await page.getAttribute('#navModels', 'aria-current'), 'page', 'the deep link lands on the Models tab');
+      assert.equal(await page.getAttribute('#modelsTabAvailable', 'aria-current'), 'page');
+      assert.equal(await page.getAttribute('#modelsTabInstalled', 'aria-current'), null);
+      assert.equal(await page.isVisible('#modelsList'), false, 'the installed list makes room for the available one');
+      assert.equal(await page.$('#navDownloads'), null, 'Downloads is no tab of its own');
       assert.match(await page.textContent('#dlMac'), /64 GB of memory/);
       assert.match(await page.textContent('#dlMac'), /500 GiB free on Macintosh HD/);
       const qwen = row(PACKS[0].repo), mimo = row(PACKS[1].repo), glm = row(PACKS[2].repo), ds = row(PACKS[3].repo);
@@ -103,6 +111,7 @@ async function main() {
       assert.match(await page.textContent(`${ds} .act`), /^Update$/);
       assert.match(await page.textContent(ds), /Needs 96 GB with its experts streamed from the SSD/);
       assert.doesNotMatch(await page.textContent(ds), /in memory/, 'DeepSeek always streams');
+      assert.doesNotMatch(await page.textContent('#downloadsPanel'), /sushi serve/, 'no launch command to copy');
       assert.equal(await page.getAttribute(`${glm} .act button`, 'aria-label'), 'Resume glm-5.3-flash:2bpw');
 
       // A pack above this Mac's RAM asks first; Cancel sends nothing.
@@ -116,6 +125,21 @@ async function main() {
       await page.waitForFunction((r) => /Remove/.test(document.querySelector(`.dl-row[data-repo="${r}"] .act`).textContent), PACKS[0].repo);
       assert.deepEqual(server.calls.filter((c) => c.path.startsWith('/v1/downloads') && c.method === 'POST').map((c) => [c.path, JSON.parse(c.body)]), [['/v1/downloads', { repo: PACKS[0].repo }]]);
       assert.deepEqual(errors, []);
+
+      // A downloaded pack opens in the installed list, where it loads; the switch goes both ways.
+      const q4 = row(PACKS[4].repo);
+      assert.equal(await page.getAttribute(`${q4} .act button`, 'aria-label'), 'Open qwen3.8-flash-next:4bpw in Installed');
+      await page.click(`${q4} .act button`);
+      await page.waitForFunction(() => location.pathname === '/models' && location.hash === '#Qwen3.8-Flash-Next-Sushi-4bpw');
+      assert.equal(await page.getAttribute('#modelsTabInstalled', 'aria-current'), 'page');
+      assert.equal(await page.isVisible('#downloadsPanel'), false);
+      await page.click('#modelsTabAvailable');
+      await page.waitForFunction(() => location.pathname === '/downloads');
+      await page.waitForSelector('#downloadsPanel .dl-row');
+      await page.click('#modelsTabInstalled');
+      await page.waitForFunction(() => location.pathname === '/models');
+      await page.goBack();
+      await page.waitForSelector('#downloadsPanel:visible');
       await context.close();
     }
 
@@ -161,9 +185,27 @@ async function main() {
     }
 
     {
+      // On the installed list a running download shows its percent on the Available switch, and the finished pack
+      // reaches the list without a reload.
+      const server = makeServer();
+      server.state.jobs = [{ repo: PACKS[0].repo, dest: '/m/q', phase: 'downloading', files: 12, file_index: 3, total_bytes: 40 * GiB, done_bytes: 10 * GiB, file: null, speed_bps: 1, eta_s: 9, message: null }];
+      const { page, context } = await open(browser, server, '/downloads');
+      await page.waitForSelector(`${row(PACKS[0].repo)} .prog:not([hidden])`);
+      await page.click('#modelsTabInstalled');
+      await page.waitForFunction(() => document.getElementById('modelsTabPct').textContent === '25%');
+      server.state.jobs[0] = { ...server.state.jobs[0], done_bytes: 30 * GiB };
+      await page.waitForFunction(() => document.getElementById('modelsTabPct').textContent === '75%', null, { timeout: 4000 });
+      server.state.jobs[0] = { ...server.state.jobs[0], phase: 'done', done_bytes: 40 * GiB };
+      server.state.models = [{ id: 'Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw', object: 'model', state: 'unloaded', bytes_on_disk: 40 * GiB }];
+      await page.waitForSelector('#modelsList [data-id="Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"]', { timeout: 4000 });
+      assert.equal(await page.textContent('#modelsTabPct'), '', 'no percent once it is done');
+      await context.close();
+    }
+
+    {
       // The dot: the first full catalog seeds the seen list silently (a catalog still loading, the known packs only,
-      // seeds nothing); a pack published later marks the tab from any view until the tab is opened; an update of a
-      // downloaded pack does the same.
+      // seeds nothing); a pack published later marks the Models tab and its Available switch from any view until the
+      // available list is shown; an update of a downloaded pack does the same.
       const server = makeServer();
       server.state.catalog = 'loading';
       const later_pack = pack('beamster/Older-Sushi-1bpw');
@@ -173,7 +215,7 @@ async function main() {
       server.state.catalog = 'ready';
       server.state.packs.push(later_pack);
       await first.page.waitForFunction(() => localStorage.getItem('sushi-seen-packs'), null, { timeout: 8000 });
-      assert.equal(await first.page.isVisible('#navDownloadsDot'), false, 'nothing is new on the first visit');
+      assert.equal(await first.page.isVisible('#navModelsDot'), false, 'nothing is new on the first visit');
       const seen = await seenNow(first.page);
       assert.ok(seen.includes(PACKS[0].repo) && seen.includes(`${PACKS[3].repo}@2.0`) && seen.includes(later_pack.repo));
       assert.ok(server.calls.some((c) => c.path === '/v1/downloads'), 'another tab asks in the background');
@@ -181,17 +223,22 @@ async function main() {
 
       server.state.packs.push(pack('beamster/Brand-New-Sushi-3bpw'));
       const later = await open(browser, server, '/settings', { storage: { 'sushi-seen-packs': JSON.stringify(seen) } });
-      await later.page.waitForSelector('#navDownloadsDot', { state: 'visible', timeout: 8000 });
-      assert.equal(await later.page.textContent('#navDownloads'), 'Downloads', 'the dot adds no text');
-      assert.equal(await later.page.getAttribute('#navDownloads', 'aria-label'), 'Downloads, new packs');
-      await later.page.click('#navDownloads');
-      await later.page.waitForSelector('#navDownloadsDot', { state: 'hidden' });
+      await later.page.waitForSelector('#navModelsDot', { state: 'visible', timeout: 8000 });
+      assert.equal(await later.page.textContent('#navModels'), 'Models', 'the dot adds no text');
+      assert.equal(await later.page.getAttribute('#navModels', 'aria-label'), 'Models, new packs');
+      await later.page.click('#navModels');
+      assert.equal(await later.page.isVisible('#modelsTabDot'), true, 'the switch shows where the new pack is');
+      assert.equal(await later.page.isVisible('#navModelsDot'), true, 'the installed list alone does not clear it');
+      await later.page.click('#modelsTabAvailable');
+      await later.page.waitForSelector('#navModelsDot', { state: 'hidden' });
+      assert.equal(await later.page.isVisible('#modelsTabDot'), false);
+      assert.equal(await later.page.getAttribute('#navModels', 'aria-label'), 'Models');
       assert.ok((await seenNow(later.page)).includes('beamster/Brand-New-Sushi-3bpw'));
       await later.context.close();
 
       server.state.packs[3].update = { current: '1.0', latest: '3.0' };
       const upd = await open(browser, server, '/chat', { storage: { 'sushi-seen-packs': JSON.stringify([...seen, 'beamster/Brand-New-Sushi-3bpw']) } });
-      await upd.page.waitForSelector('#navDownloadsDot', { state: 'visible', timeout: 8000 });
+      await upd.page.waitForSelector('#navModelsDot', { state: 'visible', timeout: 8000 });
       await upd.context.close();
 
       // Under --no-update-check another tab asks once (no Hugging Face behind it), shows no dot and stops asking.
@@ -200,7 +247,7 @@ async function main() {
       quiet.state.packs.push(pack('beamster/Unseen-Sushi-1bpw'));
       const off = await open(browser, quiet, '/chat', { storage: { 'sushi-seen-packs': JSON.stringify(seen) } });
       await off.page.waitForTimeout(4000);
-      assert.equal(await off.page.isVisible('#navDownloadsDot'), false);
+      assert.equal(await off.page.isVisible('#navModelsDot'), false);
       assert.equal(quiet.calls.filter((c) => c.path === '/v1/downloads').length, 1);
       await off.context.close();
     }
@@ -218,13 +265,13 @@ async function main() {
       await context.close();
     }
 
-    for (const viewport of [PHONE, { width: 1440, height: 900 }]) {
+    for (const viewport of [{ width: 320, height: 640 }, PHONE, { width: 1440, height: 900 }]) {
       const server = makeServer();
       server.state.jobs = [{ repo: PACKS[0].repo, dest: '/m/q', phase: 'downloading', files: 12, file_index: 3, total_bytes: 40 * GiB, done_bytes: 10 * GiB, file: { path: 'model-00003-of-00012.safetensors', size: 4 * GiB, done: GiB }, speed_bps: 100 * 2 ** 20, eta_s: 307, message: null }];
       const { page, context } = await open(browser, server, '/downloads', { viewport });
       await page.waitForSelector(`${row(PACKS[0].repo)} .prog:not([hidden])`);
       await page.waitForTimeout(300);
-      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), viewport.width, `Downloads fits ${viewport.width} px`);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), viewport.width, `Available fits ${viewport.width} px`);
       const spill = await page.evaluate(() => [...document.querySelectorAll('.dl-row')].filter((r) => r.scrollWidth > r.clientWidth + 1).length);
       assert.equal(spill, 0, `no row overflows at ${viewport.width} px`);
       await context.close();

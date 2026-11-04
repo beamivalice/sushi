@@ -1,4 +1,4 @@
-//! The MLX-free half of the Downloads tab (`downloads.zig`): which repo names a download may take, the org listing,
+//! The MLX-free half of the downloads (`downloads.zig`): which repo names a download may take, the org listing,
 //! the free-space verdict, a download's byte accounting from the pull's events, and its speed.
 const std = @import("std");
 const hf_pull = @import("hf_pull.zig");

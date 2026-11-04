@@ -114,7 +114,7 @@ async function main() {
       const server = makeServer();
       for (const view of ['/dashboard', '/models', '/settings', '/downloads']) {
         const { page, context } = await open(browser, server, view, { viewport });
-        await page.waitForSelector(`#${{ '/dashboard': 'dashPanel', '/models': 'modelsPanel', '/settings': 'settingsPanel', '/downloads': 'downloadsPanel' }[view]} .page-head h1`);
+        await page.waitForSelector(`#${{ '/dashboard': 'dashPanel', '/models': 'modelsPanel', '/settings': 'settingsPanel', '/downloads': 'modelsPanel' }[view]} .page-head h1`);
         await page.waitForTimeout(400);
         const edges = await page.evaluate(() => {
           const panel = [...document.querySelectorAll('.panel')].find((p) => !p.hidden);
@@ -217,24 +217,26 @@ async function main() {
     }
 
     {
-      // The landing view is the Dashboard, and the top bar lists Dashboard, Chat, Models, Settings, Downloads.
+      // The landing view is the Dashboard, and the top bar lists Dashboard, Chat, Models, Settings, each with its icon.
       const { page, context } = await open(browser, makeServer(), '/');
       await page.waitForSelector('#dashPanel:not([hidden])');
       assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page', 'the root shows the Dashboard');
       assert.equal(await page.evaluate(() => document.getElementById('chatPanel').inert), true);
-      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings', 'Downloads']);
+      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings']);
+      const shown = (p) => p.$$eval('#viewNav a', (links) => links.map((a) => [a.getAttribute('aria-label'), !!a.querySelector('.nav-i')?.getBoundingClientRect().width, !!a.querySelector('.nav-l')?.getBoundingClientRect().width]));
+      assert.deepEqual(await shown(page), [['Dashboard', true, true], ['Chat', true, true], ['Models', true, true], ['Settings', true, true]], 'icon and label on a wide screen');
       await page.click('#navChat');
       assert.equal(new URL(page.url()).pathname, '/chat');
       await page.goBack();
       assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page', 'Back from the chat returns to the Dashboard');
       await context.close();
       const phone = await open(browser, makeServer(), '/', { viewport: PHONE });
-      assert.deepEqual(await phone.page.$$eval('#viewNav a', (links) => links.filter((a) => a.offsetParent).map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings', 'Downloads'], 'same order on a phone');
+      assert.deepEqual(await shown(phone.page), [['Dashboard', true, false], ['Chat', true, false], ['Models', true, false], ['Settings', true, false]], 'same order on a phone, as icons named by their labels');
       await phone.context.close();
     }
 
     {
-      // Cmd+1..5 (Ctrl+1..5 off a Mac) switch Dashboard, Chat, Models, Settings, Downloads, even from the chat prompt, and each link names its key.
+      // Cmd+1..4 (Ctrl+1..4 off a Mac) switch Dashboard, Chat, Models, Settings, even from the chat prompt, and each link names its key.
       const { page, context } = await open(browser, makeServer(), '/');
       await page.waitForSelector('#dashPanel:not([hidden])');
       const at = () => new URL(page.url()).pathname;
@@ -247,13 +249,12 @@ async function main() {
       await page.keyboard.press('Control+4');
       assert.equal(at(), '/settings', 'Ctrl+4 works too');
       await page.keyboard.press('Meta+5');
-      assert.equal(at(), '/downloads', 'Cmd+5 opens Downloads');
-      assert.equal(await page.isVisible('#downloadsPanel'), true);
+      assert.equal(at(), '/settings', 'Cmd+5 is no tab');
       await page.keyboard.press('Meta+1');
       assert.equal(at(), '/dashboard', 'Cmd+1 returns to the Dashboard');
       await page.keyboard.press('Meta+Shift+2');
       assert.equal(at(), '/dashboard', 'a shifted digit is not a tab switch');
-      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.getAttribute('aria-keyshortcuts'))), ['Meta+1', 'Meta+2', 'Meta+3', 'Meta+4', 'Meta+5']);
+      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.getAttribute('aria-keyshortcuts'))), ['Meta+1', 'Meta+2', 'Meta+3', 'Meta+4']);
       await page.keyboard.press('Meta+2');
       assert.equal(await page.inputValue('#promptInput'), 'half a thought', 'the prompt survives the tab round trip');
       await context.close();
@@ -334,12 +335,17 @@ async function main() {
     }
 
     {
-      // The top bar fits a 320 px phone.
+      // The top bar fits a 320 px phone, and so does the Models head with its Installed | Available switch.
       const { page, context } = await open(browser, makeServer(), '/chat', { viewport: { width: 320, height: 640 } });
       await page.waitForSelector('#modelSelect option', { state: 'attached' });
       await page.waitForTimeout(300);
-      const fit = await page.evaluate(() => ({ doc: document.documentElement.scrollWidth, more: document.getElementById('moreButton').getBoundingClientRect().right }));
-      assert.ok(fit.doc <= 320 && fit.more <= 320, `top bar fits 320 px (${JSON.stringify(fit)})`);
+      const fit = await page.evaluate(() => ({ doc: document.documentElement.scrollWidth, more: document.getElementById('moreButton').getBoundingClientRect().right, nav: [...document.querySelectorAll('#viewNav a')].map((a) => a.getBoundingClientRect().right <= 320) }));
+      assert.ok(fit.doc <= 320 && fit.more <= 320 && fit.nav.every(Boolean), `top bar fits 320 px (${JSON.stringify(fit)})`);
+      await page.click('#navModels');
+      await page.click('#modelsTabAvailable');
+      await page.waitForSelector('.dl-row');
+      const head = await page.evaluate(() => ({ doc: document.documentElement.scrollWidth, tabs: document.getElementById('modelsTabs').getBoundingClientRect().right, spill: [...document.querySelectorAll('#modelsPanel .page-head *')].filter((n) => n.offsetParent && n.getBoundingClientRect().right > 320.5).map((n) => n.id || n.className) }));
+      assert.ok(head.doc <= 320 && head.tabs <= 320 && head.spill.length === 0, `Models head fits 320 px (${JSON.stringify(head)})`);
       await context.close();
     }
 

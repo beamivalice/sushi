@@ -156,7 +156,7 @@ pub fn removeManifest(io: std.Io, dir_path: []const u8) void {
 
 pub const FileEvent = struct { index: usize, path: []const u8, size: u64, skip: bool };
 
-/// What a pull reports beside its lines, for a caller that draws progress (the server's Downloads tab).
+/// What a pull reports beside its lines, for a caller that draws progress (the web page's Available list).
 pub const PullEvent = union(enum) {
     /// The files and bytes the pack downloads, and how many of those bytes are on disk already (`bytesPresent`),
     /// before anything is written.

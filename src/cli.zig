@@ -370,7 +370,7 @@ pub const Reporter = struct {
     impl: *anyopaque,
     /// One human-readable status line per call (no trailing newline).
     reportFn: *const fn (impl: *anyopaque, line: []const u8) void,
-    /// Progress for a caller that draws it (the server's Downloads tab); false stops the pull with `PullCancelled`.
+    /// Progress for a caller that draws it (the web page's Available list); false stops the pull with `PullCancelled`.
     eventFn: ?*const fn (impl: *anyopaque, ev: PullEvent) bool = null,
     /// Set by that caller to stop the pull; the hash of the files on disk checks it between files.
     stop: ?*const std.atomic.Value(bool) = null,

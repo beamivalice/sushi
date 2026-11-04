@@ -730,6 +730,16 @@ async function main() {
       assert.equal(await page.isVisible('#modelsPanel'), true);
       assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
     });
+    await scenario('Available with unsaved edits asks like a tab switch', { path: '/models#GLM-B' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('#modelsTabAvailable');
+      assert.equal(await dialogOpen(page), true, 'the switch asks before leaving a dirty form');
+      await page.click('#confirmDialog >> text=Keep editing');
+      await settle(page);
+      assert.equal(await page.evaluate(() => location.pathname), '/models');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+    });
     await scenario('a clean tab switch returns to the same model', { path: '/models' }, async ({ page }) => {
       await page.waitForSelector('.list [data-id="GLM-B"]');
       await page.click('.list [data-id="GLM-B"]');
@@ -1043,7 +1053,7 @@ async function main() {
       const text = await page.textContent('#settingsPanel');
       assert.doesNotMatch(text, /Check for updates|sushi pull|`/);
       assert.match(await page.textContent('.set[data-key="update_check"] .help'), /Off stops the daily check only/);
-      assert.match(await page.textContent('.set[data-key="models_dir"] .help'), /Downloads saves/);
+      assert.match(await page.textContent('.set[data-key="models_dir"] .help'), /where new downloads are saved/);
     });
     await scenario('a failed load after a reload still says why', { path: '/models#Broke-D', setup: (s) => { s.state.models[3].error = 'OutOfMemory'; } }, async ({ page }) => {
       await page.waitForSelector('.detail .alert.err:not([hidden])');
@@ -1053,7 +1063,7 @@ async function main() {
     await scenario('an empty Models page points at Downloads', { path: '/models', setup: (s) => { s.state.models = []; } }, async ({ page }) => {
       await page.waitForSelector('#modelsList .empty');
       assert.match(await page.textContent('#modelsList .empty'), /Download/);
-      await page.click('#modelsList .empty >> text=Browse downloads');
+      await page.click('#modelsList .empty >> text=See available packs');
       await page.waitForFunction(() => location.pathname === '/downloads');
     });
     await scenario('one Reload at a time: the callout replaces the header button', { path: '/models#Qwen-A', setup: (s) => { s.state.models[0].loaded_with = { ctx_size: 1024 }; } }, async ({ page, server }) => {

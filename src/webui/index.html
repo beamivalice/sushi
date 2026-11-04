@@ -288,10 +288,28 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 #viewNav a { padding: 3px 12px; border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-md); font-weight: 600; }
 #viewNav a:hover { color: var(--text); text-decoration: none; }
 #viewNav a[aria-current="page"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border); }
-#viewNav a { position: relative; }
+#viewNav a { position: relative; display: inline-flex; align-items: center; gap: 6px; transition: color .15s, background-color .15s; }
 .nav-dot { position: absolute; top: 2px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 .nav-dot[hidden] { display: none; }
-#viewNav .nav-i { display: none; width: 15px; height: 15px; vertical-align: -3px; }
+#viewNav .nav-i { width: 14px; height: 14px; flex: none; opacity: .75; }
+#viewNav a[aria-current="page"] .nav-i { opacity: 1; }
+/* Models: Installed | Available, one URL each (/models, /downloads); the thumb slides under the current one. */
+#modelsTabs { position: relative; display: inline-grid; grid-template-columns: 1fr 1fr; padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
+#modelsTabs::before { content: ""; position: absolute; inset: 2px auto 2px 2px; width: calc(50% - 2px); border-radius: var(--r-sm); background: var(--surface); box-shadow: 0 0 0 1px var(--border); transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+#modelsPanel[data-sub="available"] #modelsTabs::before { transform: translateX(100%); }
+#modelsTabs a { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 26px; padding: 0 14px; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; transition: color .15s; }
+#modelsTabs a:hover, #modelsTabs a[aria-current="page"] { color: var(--text); text-decoration: none; }
+#modelsTabPct { color: var(--accent); font-variant-numeric: tabular-nums; }
+#modelsTabPct:empty { display: none; }
+#modelsPanel[data-sub="available"] :is(#modelsBody, #modelsDir, #modelsRescan, #modelsBack),
+#modelsPanel:not([data-sub="available"]) :is(#downloadsPanel, #dlSub, #dlRefresh) { display: none; }
+/* Wide: the switch sits beside the title and the subtitle wraps below, so a longer subtitle never moves it. */
+@media (min-width: 641px) {
+  #modelsPanel .page-head .in { row-gap: 0; padding-top: var(--s2); padding-bottom: var(--s2); }
+  #modelsPanel .page-head .titles { display: contents; }
+  #modelsPanel .page-head .titles .sub { order: 1; flex-basis: 100%; }
+}
+@media (prefers-reduced-motion: reduce) { #modelsTabs::before, #viewNav a { transition: none; } }
 .dl-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--s2) var(--s3); padding: var(--s3) var(--s4); border-bottom: 1px solid var(--border); }
 .dl-row:last-child { border-bottom: 0; }
 .dl-row.pick { background: var(--accent-soft); }
@@ -514,17 +532,18 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 @media (max-width: 640px) {
   .brand .name, #serverDotLabel, .topbar-actions > .seg, #themeToggle { display: none; }
   #viewNav { gap: 0; }
-  #viewNav a { padding: 3px 5px; font-size: var(--fs-sm); }
-  /* Five tabs fit a phone's top bar with Downloads as its icon. */
+  #viewNav a { padding: 4px 9px; font-size: var(--fs-sm); }
+  #viewNav .nav-i { width: 15px; height: 15px; }
   #viewNav .nav-l { display: none; }
-  #viewNav .nav-i { display: inline-block; }
+  /* The switch takes a row of its own under the title. */
+  #modelsTabs { order: 1; width: 100%; margin-bottom: var(--s2); }
+  #modelsPanel .page-head .titles { flex: 1 1 0; }
   .brand { gap: 0; }
   #appTopbar { gap: var(--s2); padding: 0 var(--s2) 0 var(--s3); }
   #serverDot { padding: 0 6px; }
 }
 @media (max-width: 360px) {
-  #viewNav a { padding: 3px; }
-  #viewNav .nav-i { width: 13px; height: 13px; }
+  #viewNav a { padding: 4px 6px; }
   #appTopbar { gap: var(--s1); }
 }
 /* Keyed to the composer's own width: beside the side panels a wide window still leaves a narrow row. */
@@ -563,7 +582,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <symbol id="i-box" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M21 8.2 12 3 3 8.2v7.6L12 21l9-5.2ZM3.3 8.4 12 13.4l8.7-5M12 13.4V21"/></symbol>
   <symbol id="i-sliders" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 8h9m5 0h2M4 16h3m5 0h8"/><circle cx="15.5" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9.5" cy="16" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
   <symbol id="i-pulse" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l2.5-6 4 12 2.5-6h5"/></symbol>
-  <symbol id="i-download" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 4v11m-5-5 5 5 5-5M5 20h14"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M4 5h16v11H10l-5 4v-4H4Z"/></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m11.3 11.7 8.2-8.2m-3 3 2.5 2.5m-5-.5 2 2"/></symbol>
 </svg>
 
@@ -591,11 +610,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <span class="ver num" id="brandVersion"></span>
   </a>
   <nav id="viewNav" aria-label="Views">
-    <a id="navDashboard" href="/dashboard" aria-current="page">Dashboard</a>
-    <a id="navChat" href="/chat">Chat</a>
-    <a id="navModels" href="/models">Models</a>
-    <a id="navSettings" href="/settings">Settings</a>
-    <a id="navDownloads" href="/downloads" aria-label="Downloads"><span class="nav-l">Downloads</span><svg class="nav-i" aria-hidden="true"><use href="#i-download"/></svg><span class="nav-dot" id="navDownloadsDot" title="New packs" hidden></span></a>
+    <a id="navDashboard" href="/dashboard" aria-current="page" aria-label="Dashboard"><svg class="nav-i" aria-hidden="true"><use href="#i-pulse"/></svg><span class="nav-l">Dashboard</span></a>
+    <a id="navChat" href="/chat" aria-label="Chat"><svg class="nav-i" aria-hidden="true"><use href="#i-chat"/></svg><span class="nav-l">Chat</span></a>
+    <a id="navModels" href="/models" aria-label="Models"><svg class="nav-i" aria-hidden="true"><use href="#i-box"/></svg><span class="nav-l">Models</span><span class="nav-dot" id="navModelsDot" title="New packs" hidden></span></a>
+    <a id="navSettings" href="/settings" aria-label="Settings"><svg class="nav-i" aria-hidden="true"><use href="#i-sliders"/></svg><span class="nav-l">Settings</span></a>
   </nav>
   <span class="spacer"></span>
   <div class="topbar-actions">
@@ -795,11 +813,16 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 <section id="modelsPanel" class="panel page" aria-label="Models" hidden>
   <div class="page-head"><div class="in">
     <button class="icon-btn" id="modelsBack" type="button" aria-label="Back to models" hidden><svg width="18" height="18"><use href="#i-back"/></svg></button>
-    <div class="titles"><h1 id="modelsTitle">Models</h1><div class="sub mono" id="modelsDir"></div></div>
+    <div class="titles"><h1 id="modelsTitle">Models</h1><div class="sub mono" id="modelsDir"></div><div class="sub" id="dlSub">Sushi packs on Hugging Face</div></div>
+    <nav id="modelsTabs" aria-label="Models">
+      <a id="modelsTabInstalled" href="/models" aria-current="page">Installed</a>
+      <a id="modelsTabAvailable" href="/downloads">Available<span id="modelsTabPct"></span><span class="nav-dot" id="modelsTabDot" title="New packs" hidden></span></a>
+    </nav>
     <span class="spacer"></span>
     <button class="btn sm" id="modelsRescan" type="button">Rescan</button>
+    <button class="btn sm" id="dlRefresh" type="button">Check again</button>
   </div></div>
-  <div class="page-body">
+  <div class="page-body" id="modelsBody">
     <div id="modelsAlert" class="alert err" role="alert" hidden></div>
     <div class="md" id="modelsMd">
       <div class="card list" id="modelsListCard">
@@ -808,6 +831,11 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       </div>
       <div class="card detail" id="modelsDetail"></div>
     </div>
+  </div>
+  <div class="page-body narrow" id="downloadsPanel">
+    <div id="dlAlert" class="alert err" role="alert" hidden></div>
+    <section class="card" id="dlMacCard"><div class="card-b"><div class="kv" id="dlMac"></div><div class="callout" id="dlNote" style="margin-top:12px" hidden></div></div></section>
+    <section class="card list" id="dlList" aria-label="Sushi packs"><div class="skel"></div><div class="skel"></div><div class="skel"></div></section>
   </div>
 </section>
 <section id="settingsPanel" class="panel page" aria-label="Settings" hidden>
@@ -853,18 +881,6 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       <div class="card-b"><div class="kv"><span>Version</span><span id="aboutVersion">-</span></div>
         <div class="bulk" style="margin-top:12px"><button class="btn sm" id="forgetKeyButton" type="button" hidden>Forget the API key</button></div></div>
     </section>
-  </div>
-</section>
-<section id="downloadsPanel" class="panel page" aria-label="Downloads" hidden>
-  <div class="page-head"><div class="in">
-    <div class="titles"><h1>Downloads</h1><div class="sub">Sushi packs published on Hugging Face</div></div>
-    <span class="spacer"></span>
-    <button class="btn sm" id="dlRefresh" type="button">Check again</button>
-  </div></div>
-  <div class="page-body narrow">
-    <div id="dlAlert" class="alert err" role="alert" hidden></div>
-    <section class="card" id="dlMacCard"><div class="card-b"><div class="kv" id="dlMac"></div><div class="callout" id="dlNote" style="margin-top:12px" hidden></div></div></section>
-    <section class="card list" id="dlList" aria-label="Sushi packs"><div class="skel"></div><div class="skel"></div><div class="skel"></div></section>
   </div>
 </section>
 </main>
@@ -3156,7 +3172,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     fill(list, JSON.stringify([shown.map(state), both, rows.length, roots]), () => shown.length
       ? [...(both ? [group("Loaded")] : []), ...live.map(item), ...(both ? [group("On disk")] : []), ...shown.filter((m) => !live.includes(m)).map(item)]
       : [h("div", { class: "empty" }, h("span", { text: rows.length ? "No model matches the filter." : `No models in ${roots}. Download a pack, or put a pack folder there.` }),
-        ...(rows.length ? [] : [" ", h("button", { class: "btn sm primary", type: "button", text: "Browse downloads", onclick: () => $("navDownloads").click() }), " ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
+        ...(rows.length ? [] : [" ", h("button", { class: "btn sm primary", type: "button", text: "See available packs", onclick: () => q("modelsTabAvailable").click() }), " ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
     if (held?.id && !list.contains(document.activeElement)) {
       const r = list.querySelector(`[data-id="${CSS.escape(held.id)}"]`);
       ((held.button ? r?.querySelector("button") : null) ?? r)?.focus();
@@ -3208,9 +3224,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   window.addEventListener("popstate", onNav);
   window.addEventListener("hashchange", onNav);
   window.addEventListener("beforeunload", (e) => { if ([...A.per.keys()].some(isDirty)) e.preventDefault(); });
-  // Leaving the Models tab by the top bar asks first when the open model has unsaved edits.
+  // Leaving the Models tab by the top bar, or for its Available list, asks first when the open model has unsaved edits.
   document.addEventListener("click", async (e) => {
-    const link = e.target.closest?.("#navChat, #navDashboard, #navSettings, #navDownloads, #serverDot");
+    const link = e.target.closest?.("#navChat, #navDashboard, #navSettings, #modelsTabAvailable, #serverDot");
     if (!link || A.passNav || A.view !== "models" || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || !isDirty(A.sel)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -3248,6 +3264,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     q("modelsMd").classList.toggle("none", !rows.length);
     setHidden(q("modelsBack"), !phoneDetail);
     setHidden(q("modelsRescan"), phoneDetail);
+    setHidden(q("modelsTabs"), phoneDetail);
     setText(q("modelsTitle"), phoneDetail && A.sel ? A.sel : "Models");
     renderList(rows);
     const m = rows.find((x) => x.id === A.sel);
@@ -3348,7 +3365,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     F.callout = h("div", { class: "callout", hidden: true }, h("span", { text: "Saved settings differ from the ones this model loaded with." }),
       h("button", { class: "btn sm primary", type: "button", text: "Reload now", onclick: () => modelStore.act(F.id, "reload") }));
     F.update = h("div", { class: "callout", hidden: true }, F.updateText = h("span"),
-      h("button", { class: "btn sm primary", type: "button", text: "Open Downloads", onclick: () => { D.pick = F.pick; $("navDownloads").click(); } }));
+      h("button", { class: "btn sm primary", type: "button", text: "View update", onclick: () => { D.pick = F.pick; q("modelsTabAvailable").click(); } }));
     F.saveErr = h("div", { class: "alert err", role: "alert", hidden: true });
     F.rows = h("div", { class: "rows" });
     F.cacheKv = h("div", { class: "kv" });
@@ -3684,7 +3701,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (dirSave.getAttribute("aria-busy") !== "true") setText(dirSave, text === "" ? "Use default" : "Save and rescan");
       setText(dirRow.bad, (invalid ? "Enter an absolute folder path." : "") || A.serr.models_dir || "");
     }
-    setText(dirRow.help, d.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : "Where sushi looks for packs, and where Downloads saves new ones. Saving rescans at once.");
+    setText(dirRow.help, d.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : "Where sushi looks for packs, and where new downloads are saved. Saving rescans at once.");
     const kv = [["In use", rootsInUse(d).join(", ") || "(none)"], ["Default", d.default]];
     fill(q("dirKv"), JSON.stringify(kv), () => kvRows(kv, ["In use", "Default"]));
   }
@@ -3725,9 +3742,20 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)); } catch {}
     }
     const fresh = !viewing && !keys.every((k) => seen.includes(k));
-    setHidden(q("navDownloadsDot"), !fresh);
-    const name = fresh ? "Downloads, new packs" : "Downloads";
-    if (q("navDownloads").getAttribute("aria-label") !== name) q("navDownloads").setAttribute("aria-label", name);
+    setHidden(q("navModelsDot"), !fresh);
+    setHidden(q("modelsTabDot"), !fresh);
+    const name = fresh ? "Models, new packs" : "Models";
+    if (q("navModels").getAttribute("aria-label") !== name) q("navModels").setAttribute("aria-label", name);
+  }
+  // The installed list shows a running download's percent on the Available switch.
+  function tabProgress() {
+    const j = D.data?.jobs.find(isActive);
+    setText(q("modelsTabPct"), j?.total_bytes ? `${Math.floor((100 * j.done_bytes) / j.total_bytes)}%` : "");
+  }
+  // A downloaded pack opens in the installed list (its id is its folder's name), where it loads.
+  function openInstalled(p) {
+    history.pushState(null, "", `/models#${encodeURIComponent(p.path.split("/").pop())}`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
   }
   const eta = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s left` : s < 5400 ? `${Math.round(s / 60)} min left` : `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min left`;
   const jobOf = (repo) => D.data?.jobs.filter((j) => j.repo === repo).pop();
@@ -3769,16 +3797,15 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const meta = [p.size_bytes != null ? adminBytes(p.size_bytes) : "size unknown", p.partial_bytes ? `${adminBytes(p.partial_bytes)} on disk, not complete` : "", p.repo].filter(Boolean).join(" · ");
     const why = j?.phase === "failed" ? `Failed: ${j.message || "the download stopped"}. Downloaded files are kept.` : j?.phase === "cancelled" ? "Stopped. The downloaded part is kept; Resume continues from it."
       : p.fits === false ? tierText(p) : "";
-    const btn = (text, cls, fn, off) => { const b = h("button", { class: `btn sm ${cls}`, type: "button", text, "aria-label": `${text} ${label(p)}`, disabled: !!off }); b.addEventListener("click", () => fn(p, b)); return b; };
+    const btn = (text, cls, fn, off) => { const b = h("button", { class: `btn sm ${cls}`, type: "button", text, "aria-label": `${text} ${label(p)}${fn === openInstalled ? " in Installed" : ""}`, disabled: !!off }); b.addEventListener("click", () => fn(p, b)); return b; };
     const action = live ? (j.stopping ? btn("Stopping…", "", stopDownload, true) : btn(j.phase === "queued" ? "Remove" : "Stop", "", stopDownload))
       : p.update ? btn("Update", "primary", startDownload)
-      : p.installed ? null
+      : p.installed ? (p.path ? btn("Open", "", openInstalled) : null)
       : btn(p.partial_bytes || j?.phase === "cancelled" || j?.phase === "failed" ? "Resume" : "Download", p.recommended ? "primary" : "", startDownload);
     const prog = h("div", { class: "prog", hidden: !live }, h("div", { class: "meter", role: "progressbar", "aria-label": `${label(p)} download`, "aria-valuemin": "0", "aria-valuemax": "100" }, h("span")), h("div", { class: "meter-text" }, h("span", { class: "a" }), h("span", { class: "b" })));
     const el = h("div", { class: "dl-row", "data-repo": p.repo },
       h("div", { class: "main" }, h("div", { class: "name" }, h("span", { text: label(p) }), ...badges), h("div", { class: "meta", text: meta }),
-        why ? h("div", { class: `why${j?.phase === "failed" ? " err" : ""}`, text: why }) : null,
-        p.launch ? h("div", { class: "meta mono adv", text: p.launch }) : null),
+        why ? h("div", { class: `why${j?.phase === "failed" ? " err" : ""}`, text: why }) : null),
       h("div", { class: "act" }, action), prog);
     const row = { sig, el, prog };
     D.rows.set(p.repo, row);
@@ -3820,8 +3847,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   async function refreshDownloads(force) {
     clearTimeout(D.timer);
-    const viewing = A.view === "downloads";
-    if (document.hidden && viewing) { D.timer = setTimeout(refreshDownloads, 5000); return; }
+    const viewing = A.view === "downloads", near = () => viewing || (A.view === "models" && !!D.data?.jobs.some(isActive));
+    if (document.hidden && near()) { D.timer = setTimeout(refreshDownloads, 5000); return; }
     try {
       const d = await pull("downloads", force ? "/v1/downloads?refresh=1" : viewing ? "/v1/downloads" : "/v1/downloads?background=1");
       D.error = null;
@@ -3831,10 +3858,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (D.data && (d || viewing)) markNew(D.data, viewing);
     } catch (e) { D.error = adminErrorText(e); }
     if (viewing) renderDownloads();
+    tabProgress();
     const loading = D.data?.refreshing || D.data?.catalog === "loading";
-    // Under --no-update-check another tab asks nothing: Hugging Face is read only while this tab is open.
-    if (!viewing && D.data && !D.data.update_check) return;
-    D.timer = setTimeout(refreshDownloads, viewing ? (loading || D.data?.jobs.some(isActive) ? 1000 : 5000) : loading ? 5000 : 30 * 60 * 1000);
+    // Under --no-update-check another tab asks nothing: Hugging Face is read only while this list is open.
+    if (!near() && D.data && !D.data.update_check) return;
+    D.timer = setTimeout(refreshDownloads, viewing ? (loading || D.data?.jobs.some(isActive) ? 1000 : 5000) : near() ? 2000 : loading ? 5000 : 30 * 60 * 1000);
   }
   q("dlRefresh").addEventListener("click", () => withBusy(q("dlRefresh"), "Checking…", () => refreshDownloads(true)));
   setTimeout(() => { if (A.view !== "downloads") refreshDownloads(); }, 3000);
@@ -3843,12 +3871,20 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     refresh,
     shows: (id) => A.view === "models" && A.sel === id,
     show(view) {
+      const sub = view === "downloads" ? "available" : "installed", panel = q("modelsPanel");
+      // Switching between Installed and Available fades the new list in; the switch's thumb slides in CSS.
+      if (!panel.hidden && (view === "models" || view === "downloads") && panel.dataset.sub !== sub && !matchMedia("(prefers-reduced-motion: reduce)").matches)
+        q(sub === "available" ? "downloadsPanel" : "modelsBody").animate([{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "none" }], { duration: 180, easing: "ease-out" });
       A.view = view;
+      panel.dataset.sub = sub;
+      for (const [id, on] of [["modelsTabInstalled", sub === "installed"], ["modelsTabAvailable", sub === "available"]]) {
+        if (on) q(id).setAttribute("aria-current", "page"); else q(id).removeAttribute("aria-current");
+      }
       if (view !== "downloads") Object.assign(D, { pick: null, scrolled: false });
-      q("modelsPanel").hidden = view !== "models";
+      panel.hidden = view !== "models" && view !== "downloads";
       q("settingsPanel").hidden = view !== "settings";
-      q("downloadsPanel").hidden = view !== "downloads";
-      if (view === "downloads") { renderDownloads(); refreshDownloads(); }
+      if (view === "downloads") { setText(q("modelsTitle"), "Models"); setHidden(q("modelsTabs"), false); renderDownloads(); refreshDownloads(); }
+      else if (view === "models" && D.data?.jobs.some(isActive)) refreshDownloads();
       clearInterval(A.timer);
       clearTimeout(A.retry);
       A.timer = null;
@@ -4767,7 +4803,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
 
   const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard', models: '/models', settings: '/settings', downloads: '/downloads' };
-  const NAV_ID = { chat: 'navChat', dashboard: 'navDashboard', models: 'navModels', settings: 'navSettings', downloads: 'navDownloads' };
+  const NAV_ID = { chat: 'navChat', dashboard: 'navDashboard', models: 'navModels', settings: 'navSettings' };
+  // /downloads is the Models tab's Available list: the tab it lights and the switch that leads there.
+  const navOf = view => view === 'downloads' ? 'models' : view;
+  const SUB_ID = { models: 'modelsTabInstalled', downloads: 'modelsTabAvailable' };
   // The root is the Dashboard: it is where a visit to the server starts; the chat lives at /chat.
   const viewOf = p => Object.keys(VIEW_PATH).find(v => VIEW_PATH[v] === p) ?? 'dashboard';
   const chatTitle = document.title;
@@ -4793,9 +4832,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     document.getElementById('appMain').dataset.view = view;
     for (const v of Object.keys(NAV_ID)) {
       const link = document.getElementById(NAV_ID[v]);
-      if (v === view) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
+      if (v === navOf(view)) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
     }
-    document.title = chat ? chatTitle : 'sushi · ' + view;
+    document.title = chat ? chatTitle : 'sushi · ' + navOf(view);
     modelStore.setView(view);
     window.sushiAdmin?.show(view);
     if (dash) {
@@ -4806,23 +4845,23 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     } else if (chat && chatFocus?.isConnected) chatFocus.focus({ preventScroll: true });
     switching = false;
   }
-  function goTo(view) {
+  function goTo(view, sub) {
     if (viewOf(location.pathname) === view && dashActive === (view === 'dashboard')) return;
     history.pushState(null, '', VIEW_PATH[view]);
     applyView(view);
-    // Keyboard and screen-reader users land on the new page's heading.
-    if (view !== 'chat') document.querySelector('#' + { dashboard: 'dashPanel', models: 'modelsPanel', settings: 'settingsPanel', downloads: 'downloadsPanel' }[view] + ' h1')?.focus({ preventScroll: true });
+    // Keyboard and screen-reader users land on the new page's heading; the Models switch keeps its focus.
+    if (view !== 'chat' && !sub) document.querySelector('#' + { dashboard: 'dashPanel', models: 'modelsPanel', settings: 'settingsPanel' }[view] + ' h1')?.focus({ preventScroll: true });
   }
   document.getElementById('serverDot').addEventListener('click', () => goTo('dashboard'));
   for (const h1 of document.querySelectorAll('.page-head h1')) h1.tabIndex = -1;
-  for (const [view, id] of Object.entries(NAV_ID)) {
+  for (const [ids, sub] of [[NAV_ID, false], [SUB_ID, true]]) for (const [view, id] of Object.entries(ids)) {
     document.getElementById(id).addEventListener('click', e => {
       if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-      e.preventDefault(); goTo(view);
+      e.preventDefault(); goTo(view, sub);
     });
   }
-  // Cmd+1..5 (Ctrl+1..5 off a Mac) click the tabs in their order, so a form with unsaved edits still asks first.
-  const NAV_ORDER = ['dashboard', 'chat', 'models', 'settings', 'downloads'];
+  // Cmd+1..4 (Ctrl+1..4 off a Mac) click the tabs in their order, so a form with unsaved edits still asks first.
+  const NAV_ORDER = ['dashboard', 'chat', 'models', 'settings'];
   const onMac = /Mac/.test(navigator.platform);
   NAV_ORDER.forEach((v, i) => {
     const link = document.getElementById(NAV_ID[v]);
@@ -4831,7 +4870,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   });
   document.addEventListener('keydown', e => {
     if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || e.repeat) return;
-    const i = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5'].indexOf(e.code);
+    const i = ['Digit1', 'Digit2', 'Digit3', 'Digit4'].indexOf(e.code);
     if (i < 0 || document.getElementById('appShell')?.inert || document.querySelector('dialog[open]')) return;
     e.preventDefault();
     document.getElementById(NAV_ID[NAV_ORDER[i]]).click();

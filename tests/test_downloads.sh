@@ -1,7 +1,7 @@
 #!/bin/bash
 # sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
-# The Downloads tab's API on a headless server (private HOME, an empty --model-dir, no model): offline it lists the
+# The downloads API on a headless server (private HOME, an empty --model-dir, no model): offline it lists the
 # known packs without sizes; through tests/hf_stub.py (SUSHI_HF_ENDPOINT) it lists the org's public Sushi repo with its
 # size and hides the known packs the stub lacks and a private one; a download reports its file, bytes and speed, a
 # cancel keeps the partials, a restarted server shows the pack as partly on disk and finishes it with a ranged request

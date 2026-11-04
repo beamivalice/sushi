@@ -66,20 +66,21 @@ cannot be reached or answers 404 (a private repo needs `HF_TOKEN`). The server a
 then once a day (each answer is kept in `~/.sushi/pack-update-check.json`, so a restart inside a day asks nothing),
 unless `--no-update-check` or the Settings page's pack check is off.
 
-### The Downloads tab
+### Downloading from the web page
 
-The web page's **Downloads** tab (`/downloads`, Cmd+5) does the same in the browser: it lists every Sushi pack published
-on Hugging Face (the ones this build knows, and any newer public `-Sushi-` repo of `beamster`) with its size, marks the
-pack `sushi list` recommends for this Mac's memory, says "Needs N GB" for one above it (still downloadable, after a
-confirm), and shows which are downloaded, partly downloaded or have an update. Download saves into the models folder of
-the Settings tab (`--model-dir` when given, else `server.models_dir`, else `~/.sushi/models`) under `beamster/<repo>`,
-after checking the free space: a pack that would leave less than a twentieth of the disk (at least 4 GiB) is refused,
-one that leaves under a tenth free warns. Update replaces a downloaded pack in its own folder, after you unload it.
-A running download shows a progress bar, the file in flight, speed and time left. Stop keeps what is downloaded: Resume
-continues from it, also after the server restarts. A finished pack appears in the Models tab at once, with its
-recommended launch line in the Advanced view. A small dot on the tab marks a pack (or an update) this browser has not
-listed before; under `--no-update-check` the page asks Hugging Face only while the tab is open. From another machine a
-download needs the server's `--api-key`. Downloads use `sushi pull`'s checks; a pack is never deleted from the tab.
+The web page's **Models** tab (Cmd+3) does the same in the browser: its **Available** list (`/downloads`) shows every
+Sushi pack published on Hugging Face (the ones this build knows, and any newer public `-Sushi-` repo of `beamster`) with
+its size, marks the pack `sushi list` recommends for this Mac's memory, says "Needs N GB" for one above it (still
+downloadable, after a confirm), and shows which are downloaded, partly downloaded or have an update. Download saves into
+the models folder of the Settings tab (`--model-dir` when given, else `server.models_dir`, else `~/.sushi/models`) under
+`beamster/<repo>`, after checking the free space: a pack that would leave less than a twentieth of the disk (at least 4
+GiB) is refused, one that leaves under a tenth free warns. Update replaces a downloaded pack in its own folder, after
+you unload it. A running download shows a progress bar, the file in flight, speed and time left. Stop keeps what is
+downloaded: Resume continues from it, also after the server restarts. A finished pack appears in the Installed list at
+once (Open takes you there), ready to load. A small dot on the Models tab marks a pack (or an update) this browser has
+not listed before; under `--no-update-check` the page asks Hugging Face only while the list is open. From another
+machine a download needs the server's `--api-key`. Downloads use `sushi pull`'s checks; a pack is never deleted from the
+page.
 
 ## Recommended launch
 

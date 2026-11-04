@@ -89,7 +89,7 @@ pub fn resolveTarget(arena: Allocator, known: []const Known, folder: []const u8,
     return null;
 }
 
-/// `repo` is the Hugging Face repo of the published pack, which the Downloads tab lists the update under.
+/// `repo` is the Hugging Face repo of the published pack, which the web page's Available list shows the update under.
 pub const Available = struct { local: []const u8, latest: []const u8, command: []const u8, repo: []const u8 = "" };
 
 pub const Status = union(enum) {
