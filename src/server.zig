@@ -71,6 +71,7 @@ const request_media = @import("request_media.zig");
 const request_policy = @import("request_policy.zig");
 const models_api = @import("models_api.zig");
 const prefix_cache_admin = @import("prefix_cache_admin.zig");
+const downloads = @import("downloads.zig");
 const metrics_history = @import("metrics_history.zig");
 const gpu_clock_live = @import("gpu_clock_live.zig");
 const json_text = @import("json_text.zig");
@@ -537,7 +538,7 @@ fn sendWebToolFolders(allocator: std.mem.Allocator, stream: *http_conn.Conn, roo
 
 fn isChatPagePath(path: []const u8) bool {
     return std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/chat") or std.mem.eql(u8, path, "/dashboard") or
-        std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/settings");
+        std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/settings") or std.mem.eql(u8, path, "/downloads");
 }
 
 /// The chat page URL printed at startup. A wildcard bind is shown as loopback,
@@ -1562,6 +1563,7 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
 /// Idempotent; also the cleanup of a boot whose load failed with the listener up.
 fn stopServing(accept_thread: *?std.Thread) void {
     shutdown_requested.store(true, .release);
+    downloads.stop();
     if (accept_thread.*) |t| {
         t.join();
         accept_thread.* = null;
@@ -1823,6 +1825,28 @@ pub fn handleConnection(
             return;
         }
         try prefix_cache_admin.handleClear(allocator, stream, request_body);
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/downloads")) {
+        if (std.mem.eql(u8, method, "GET")) {
+            try downloads.handleGet(allocator, stream, raw_path);
+        } else if (std.mem.eql(u8, method, "POST")) {
+            if (@import("download_progress.zig").startRefused(peerIsLoopback(stream), g_api_key != null)) {
+                try sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "A download from another machine needs the server started with --api-key", 403);
+                return;
+            }
+            try downloads.handleStart(allocator, stream, request_body);
+        } else {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use GET for the packs and downloads and POST to start one", 405);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/downloads/cancel")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST to cancel a download", 405);
+            return;
+        }
+        try downloads.handleCancel(allocator, stream, request_body);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
@@ -8188,7 +8212,7 @@ pub fn sendResponse(stream: *http_conn.Conn, status: []const u8, content_type: [
 /// only a one-line status summary. For high-frequency, self-describing bodies
 /// where the full dump is pure noise: the Prometheus scrape (`/metrics`, hit
 /// every couple seconds) and the panel's JSON feed (`/metrics.json`, ~1 Hz).
-fn sendResponseQuiet(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
+pub fn sendResponseQuiet(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     if (log.isDebug()) log.debug("[http] <- {s} {s} body={d}b (scrape; body not logged)\n", .{ status, content_type, body.len });
     try sendResponseFramed(stream, status, content_type, body);
 }

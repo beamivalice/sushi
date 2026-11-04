@@ -154,7 +154,7 @@ pub fn cacheVolume(allocator: std.mem.Allocator) !CacheVolume {
 
 /// An explicit `base` that does not exist is unavailable (no space, no name) rather than the volume of its nearest
 /// existing parent; the default root, created on first write, reports the volume it will land on.
-fn cacheVolumeAt(allocator: std.mem.Allocator, base: []const u8, explicit: bool) !CacheVolume {
+pub fn cacheVolumeAt(allocator: std.mem.Allocator, base: []const u8, explicit: bool) !CacheVolume {
     var candidate: []const u8 = base;
     var resolved: [std.fs.max_path_bytes]u8 = undefined;
     var real: ?[]const u8 = null;

@@ -255,6 +255,13 @@ pub fn configure(io: std.Io, on: bool, known: []const Known) void {
     enabled = on;
 }
 
+/// False under `--no-update-check`.
+pub fn checksOn() bool {
+    _ = std.c.pthread_mutex_lock(&mu);
+    defer _ = std.c.pthread_mutex_unlock(&mu);
+    return enabled;
+}
+
 /// Starts watching a loaded pack's folder (once per folder) on a detached thread: never the inference thread.
 pub fn watch(pack_path: []const u8) void {
     _ = std.c.pthread_mutex_lock(&mu);

@@ -401,6 +401,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/",
     "/chat",
     "/dashboard",
+    "/downloads",
     "/models",
     "/settings",
     "/detokenize",
@@ -412,6 +413,8 @@ const ROUTE_PATHS = [_][]const u8{
     "/tokenize",
     "/v1/chat/completions",
     "/v1/completions",
+    "/v1/downloads",
+    "/v1/downloads/cancel",
     "/v1/load-model",
     "/v1/messages",
     "/v1/messages/count_tokens",
@@ -435,7 +438,8 @@ pub fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const
     else
         std.mem.eql(u8, path, "/v1/load-model") or std.mem.eql(u8, path, "/v1/unload-model") or
             std.mem.eql(u8, path, "/v1/models/rescan") or std.mem.eql(u8, path, "/v1/prefix-cache/clear") or
-            std.mem.eql(u8, path, "/v1/prefix-cache") or std.mem.eql(u8, path, "/v1/settings") or std.mem.eql(u8, path, "/metrics/enable");
+            std.mem.eql(u8, path, "/v1/prefix-cache") or std.mem.eql(u8, path, "/v1/settings") or std.mem.eql(u8, path, "/metrics/enable") or
+            std.mem.eql(u8, path, "/v1/downloads") or std.mem.eql(u8, path, "/v1/downloads/cancel");
     if (!guarded) return false;
     const origin = findHeaderValueCI(headers, "origin") orelse return false;
     return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
@@ -790,9 +794,9 @@ test "chat page: GET / and GET /chat serve the embedded page as HTML" {
     }
 }
 
-test "dashboard page: GET /dashboard serves the same embedded page as HTML" {
+test "dashboard page: GET /dashboard and GET /downloads serve the same embedded page as HTML" {
     const t = std.testing;
-    for ([_][]const u8{ "/dashboard", "/dashboard?x=1" }) |path| {
+    for ([_][]const u8{ "/dashboard", "/dashboard?x=1", "/downloads" }) |path| {
         const request = try std.fmt.allocPrint(t.allocator, "GET {s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{path});
         defer t.allocator.free(request);
         const response = try serveOneForTest(request);
@@ -988,6 +992,7 @@ test "routeExists answers endpoint existence without consulting the model" {
     try std.testing.expect(routeExists("/v1/chat/completions"));
     try std.testing.expect(!routeExists("/v1/embeddings")); // not served: an unknown path
     try std.testing.expect(routeExists("/health"));
+    try std.testing.expect(routeExists("/downloads") and routeExists("/v1/downloads") and routeExists("/v1/downloads/cancel"));
     // `/v1/responses/{id}` is served by prefix, not by an exact literal.
     try std.testing.expect(routeExists("/v1/responses/resp_abc123"));
     try std.testing.expect(routeExists("/v1/responses/compact"));
@@ -1704,6 +1709,10 @@ test "cross-origin policy: a foreign Origin is refused on the state-changing rou
         .{ .method = "POST", .path = "/v1/prefix-cache/clear", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://evil.test\r\n", .refused = true },
         .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "GET", .path = "/v1/downloads", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/downloads", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/downloads/cancel", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/downloads", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/models/rescan", .headers = "Origin: http://127.0.0.1:12345\r\n", .refused = false },
@@ -1739,6 +1748,25 @@ test "cross-origin policy: the routes answer 403 over the wire before any model 
         const response = try serveOneForTest(c.request);
         defer t.allocator.free(response);
         try t.expect(std.mem.startsWith(u8, response, c.status));
+    }
+}
+
+test "downloads: the routes refuse a bad request by name before any model resolves" {
+    const t = std.testing;
+    const Case = struct { request: []const u8, status: []const u8, says: []const u8 };
+    for ([_]Case{
+        .{ .request = "POST /v1/downloads HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 400 ", .says = "Send {" },
+        .{ .request = "POST /v1/downloads HTTP/1.1\r\nContent-Length: 21\r\n\r\n{\"repo\":\"other/Pack\"}", .status = "HTTP/1.1 400 ", .says = "org beamster only" },
+        .{ .request = "POST /v1/downloads/cancel HTTP/1.1\r\nContent-Length: 24\r\n\r\n{\"repo\":\"beamster/None\"}", .status = "HTTP/1.1 404 ", .says = "queued or running" },
+        .{ .request = "POST /v1/downloads HTTP/1.1\r\nContent-Length: 22\r\n\r\n{\"repo\":\"beamster/..\"}", .status = "HTTP/1.1 400 ", .says = "org beamster only" },
+        .{ .request = "POST /v1/downloads HTTP/1.1\r\nContent-Length: 30\r\n\r\n{\"repo\":\"beamster/Not-A-Pack\"}", .status = "HTTP/1.1 404 ", .says = "published Sushi pack" },
+        .{ .request = "DELETE /v1/downloads HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "GET" },
+        .{ .request = "GET /v1/downloads/cancel HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "POST" },
+    }) |c| {
+        const response = try serveOneForTest(c.request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, c.status));
+        try t.expect(std.mem.indexOf(u8, responseBody(response), c.says) != null);
     }
 }
 

@@ -7,13 +7,16 @@
 ROOT/<org>/<repo>/... is a repo's files, re-read on every request so a test edits them between pulls.
 .safetensors files are listed as LFS (sha256 under lfs.oid), the rest with their git blob sha1.
 ROOT/.corrupt lists paths whose bytes are served altered while the listing still declares the real content id.
-ROOT/.requests gets one line per file request.
+ROOT/.requests gets one line per file request, ROOT/.ranges one "path start" line per ranged one.
+ROOT/.private lists repo ids answered 401 everywhere and left out of the author listing (/api/models?author=).
+ROOT/.rate, when present, caps file downloads at that many bytes per second.
 """
 import hashlib
 import http.server
 import json
 import os
 import sys
+import time
 
 ROOT = os.path.abspath(sys.argv[1])
 
@@ -36,6 +39,11 @@ def listing(repo_dir):
     return out
 
 
+def marked(name, item):
+    path = os.path.join(ROOT, name)
+    return os.path.isfile(path) and item in open(path).read().split()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -48,8 +56,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        path = self.path.split("?")[0]
+        path, _, query = self.path.partition("?")
         parts = path.strip("/").split("/")
+        if parts == ["api", "models"]:
+            author = dict(kv.partition("=")[::2] for kv in query.split("&")).get("author", "")
+            org_dir = os.path.join(ROOT, author)
+            ids = sorted("%s/%s" % (author, n) for n in os.listdir(org_dir)) if author and os.path.isdir(org_dir) else []
+            rows = [{"id": i, "private": False} for i in ids if not marked(".private", i)]
+            return self.send_bytes(200, json.dumps(rows).encode(), "application/json")
+        repo_id = "/".join(parts[2:4] if parts[:2] == ["api", "models"] else parts[:2])
+        if marked(".private", repo_id):
+            return self.send_bytes(401, b"{}")
         if parts[:2] == ["api", "models"] and len(parts) >= 4 and parts[-2:] == ["tree", "main"]:
             repo_dir = os.path.join(ROOT, *parts[2:-2])
             if not os.path.isdir(repo_dir):
@@ -58,7 +75,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if parts[:2] == ["api", "models"] and len(parts) == 4:
             if not os.path.isdir(os.path.join(ROOT, *parts[2:])):
                 return self.send_bytes(404, b"{}")
-            return self.send_bytes(200, json.dumps({"sha": "stubcommit0001"}).encode(), "application/json")
+            siblings = [{"rfilename": f["path"], "size": f["size"]} for f in listing(os.path.join(ROOT, *parts[2:]))]
+            return self.send_bytes(200, json.dumps({"sha": "stubcommit0001", "siblings": siblings}).encode(), "application/json")
         if "resolve" in parts:
             i = parts.index("resolve")
             rel = "/".join(parts[i + 2:])
@@ -75,6 +93,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             rng = self.headers.get("Range")
             if rng and rng.startswith("bytes="):
                 start = int(rng[6:].split("-")[0])
+                with open(os.path.join(ROOT, ".ranges"), "a") as f:
+                    f.write("%s %d\n" % (rel, start))
             if start >= len(data) > 0:
                 return self.send_bytes(416, b"")
             body = data[start:]
@@ -83,7 +103,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if start:
                 self.send_header("Content-Range", "bytes %d-%d/%d" % (start, len(data) - 1, len(data)))
             self.end_headers()
-            self.wfile.write(body)
+            rate_file = os.path.join(ROOT, ".rate")
+            rate = int(open(rate_file).read()) if os.path.isfile(rate_file) else 0
+            step = max(1, rate // 10) if rate else len(body) or 1
+            for i in range(0, len(body), step):
+                self.wfile.write(body[i:i + step])
+                if rate:
+                    self.wfile.flush()
+                    time.sleep(0.1)
             return
         self.send_bytes(404, b"")
 

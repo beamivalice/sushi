@@ -26,7 +26,7 @@ function makeServer({ metrics = 200, loaded = true, down = false, apiKey = null 
   const json = (body, status = 200) => ({ status, contentType: 'application/json', body: JSON.stringify(body) });
   async function handle(route) {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
-    if (/^\/(chat|dashboard|models|settings)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
+    if (/^\/(chat|dashboard|models|settings|downloads)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
     calls.push({ path: p, method: request.method() });
     if (apiKey && request.headers().authorization !== `Bearer ${apiKey}`) return route.fulfill(json({ error: { message: 'bad key' } }, 401));
     if (down) return route.abort();
@@ -37,6 +37,7 @@ function makeServer({ metrics = 200, loaded = true, down = false, apiKey = null 
       case '/v1/tools': return route.fulfill(json({ edit_default: false }));
       case '/v1/settings': return route.fulfill(json({ file: '/h/f.json', model_keys: [], applies: 'x', server: { models_dir: { default: '/d', boot_roots: ['/m'], file: null, flag: '', locked: false }, prefix_cache_disk_gb: { file: null, locked: false, effective_bytes: 2 ** 30 } }, models: [] }));
       case '/v1/prefix-cache': return route.fulfill(json({ root: '/c', volume: null, total_bytes: 0, namespaces: [] }));
+      case '/v1/downloads': return route.fulfill(json({ ram_bytes: 64 * 2 ** 30, ram_gb: 64, dest: { path: '/m', source: 'default', locked: false, volume: 'Disk', free_bytes: 2 ** 40, total_bytes: 2 ** 41 }, catalog: 'ready', refreshing: false, packs: [{ repo: 'beamster/A-Sushi-2bpw', name: 'a', tag: '2bpw', size_bytes: 2 ** 34, tier_gb: 48, fits: true, recommended: true, installed: false, path: null, partial_bytes: null, update: null, launch: null }], jobs: [] }));
       case '/metrics.json': return metrics === 200 ? route.fulfill(json({ counters: {}, gauges: {}, histograms: {}, sessions: [] })) : route.fulfill(json({ error: { message: 'off' } }, metrics));
       case '/metrics/enable': return route.fulfill(json({ metrics: true }));
       default: return route.fulfill(json({}, 404));
@@ -73,7 +74,7 @@ async function main() {
     {
       // The phone: nothing scrolls sideways on any tab, and the More menu holds the view and theme switches.
       const server = makeServer();
-      for (const view of ['/chat', '/dashboard', '/models', '/settings']) {
+      for (const view of ['/chat', '/dashboard', '/models', '/settings', '/downloads']) {
         const { page, context } = await open(browser, server, view, { viewport: PHONE, mode: 'advanced' });
         await page.waitForTimeout(500);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 390, `${view} fits 390 px`);
@@ -111,9 +112,9 @@ async function main() {
     for (const viewport of [{ width: 1440, height: 900 }, { width: 2000, height: 1050 }]) {
       // Heading and content share one left edge on the tabs that use the page frame.
       const server = makeServer();
-      for (const view of ['/dashboard', '/models', '/settings']) {
+      for (const view of ['/dashboard', '/models', '/settings', '/downloads']) {
         const { page, context } = await open(browser, server, view, { viewport });
-        await page.waitForSelector(`${view === '/dashboard' ? '#dashPanel' : view === '/models' ? '#modelsPanel' : '#settingsPanel'} .page-head h1`);
+        await page.waitForSelector(`#${{ '/dashboard': 'dashPanel', '/models': 'modelsPanel', '/settings': 'settingsPanel', '/downloads': 'downloadsPanel' }[view]} .page-head h1`);
         await page.waitForTimeout(400);
         const edges = await page.evaluate(() => {
           const panel = [...document.querySelectorAll('.panel')].find((p) => !p.hidden);
@@ -130,7 +131,7 @@ async function main() {
       // The type scale: the sizes on screen are the seven of the design system (plus chat markdown headings).
       const allowed = new Set([11, 12, 13, 15, 17, 22, 28]);
       const server = makeServer();
-      for (const [view, mode] of [['/chat', 'advanced'], ['/dashboard', 'advanced'], ['/dashboard', 'compact'], ['/models', 'advanced'], ['/settings', 'advanced']]) {
+      for (const [view, mode] of [['/chat', 'advanced'], ['/dashboard', 'advanced'], ['/dashboard', 'compact'], ['/models', 'advanced'], ['/settings', 'advanced'], ['/downloads', 'advanced']]) {
         const { page, context } = await open(browser, server, view, { mode });
         await page.waitForTimeout(700);
         const sizes = await page.evaluate(() => {
@@ -216,24 +217,24 @@ async function main() {
     }
 
     {
-      // The landing view is the Dashboard, and the top bar lists Dashboard, Chat, Models, Settings.
+      // The landing view is the Dashboard, and the top bar lists Dashboard, Chat, Models, Settings, Downloads.
       const { page, context } = await open(browser, makeServer(), '/');
       await page.waitForSelector('#dashPanel:not([hidden])');
       assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page', 'the root shows the Dashboard');
       assert.equal(await page.evaluate(() => document.getElementById('chatPanel').inert), true);
-      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings']);
+      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings', 'Downloads']);
       await page.click('#navChat');
       assert.equal(new URL(page.url()).pathname, '/chat');
       await page.goBack();
       assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page', 'Back from the chat returns to the Dashboard');
       await context.close();
       const phone = await open(browser, makeServer(), '/', { viewport: PHONE });
-      assert.deepEqual(await phone.page.$$eval('#viewNav a', (links) => links.filter((a) => a.offsetParent).map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings'], 'same order on a phone');
+      assert.deepEqual(await phone.page.$$eval('#viewNav a', (links) => links.filter((a) => a.offsetParent).map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings', 'Downloads'], 'same order on a phone');
       await phone.context.close();
     }
 
     {
-      // Cmd+1..4 (Ctrl+1..4 off a Mac) switch Dashboard, Chat, Models, Settings, even from the chat prompt, and each link names its key.
+      // Cmd+1..5 (Ctrl+1..5 off a Mac) switch Dashboard, Chat, Models, Settings, Downloads, even from the chat prompt, and each link names its key.
       const { page, context } = await open(browser, makeServer(), '/');
       await page.waitForSelector('#dashPanel:not([hidden])');
       const at = () => new URL(page.url()).pathname;
@@ -245,11 +246,14 @@ async function main() {
       assert.equal(at(), '/models', 'Cmd+3 works while typing in the prompt');
       await page.keyboard.press('Control+4');
       assert.equal(at(), '/settings', 'Ctrl+4 works too');
+      await page.keyboard.press('Meta+5');
+      assert.equal(at(), '/downloads', 'Cmd+5 opens Downloads');
+      assert.equal(await page.isVisible('#downloadsPanel'), true);
       await page.keyboard.press('Meta+1');
       assert.equal(at(), '/dashboard', 'Cmd+1 returns to the Dashboard');
       await page.keyboard.press('Meta+Shift+2');
       assert.equal(at(), '/dashboard', 'a shifted digit is not a tab switch');
-      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.getAttribute('aria-keyshortcuts'))), ['Meta+1', 'Meta+2', 'Meta+3', 'Meta+4']);
+      assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.getAttribute('aria-keyshortcuts'))), ['Meta+1', 'Meta+2', 'Meta+3', 'Meta+4', 'Meta+5']);
       await page.keyboard.press('Meta+2');
       assert.equal(await page.inputValue('#promptInput'), 'half a thought', 'the prompt survives the tab round trip');
       await context.close();

@@ -267,6 +267,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 ## Threads
 
 - Detach every per-connection `std.Thread` immediately; on teardown drain conn threads before `scheduler.deinit`.
+- **Downloads run on `downloads.zig`'s own detached thread**, one pack at a time, spawning `curl` per file (on Darwin
+  `std.process.spawn` is `posix_spawn`, so the resident engine is never forked); the catalog builds on another detached
+  thread. Neither touches MLX. `stopServing` SIGTERMs a running curl and refuses new starts (`downloads.stop`); the partial stays to resume.
 - Sleep inhibition follows the inference-thread wait.
 - **The first GPU submission after about a second of idle waits 0.6-1.0 s before any work runs** (M5 Max, MiMo
   2.3bpw, ~90 GB resident, measured on e2d5be76; even a one-element op pays it, and a tick every 2 s does not prevent

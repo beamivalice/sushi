@@ -71,7 +71,7 @@ echo "Chat page (port $PORT)"
 
 echo "[1/5] the page and its neighbours"
 if boot; then
-    for path in / /chat /dashboard; do
+    for path in / /chat /dashboard /downloads; do
         curl -s -D "$WORK/headers" -o "$WORK/body" "$BASE$path"
         check "GET $path is 200" "$(grep -q '^HTTP/1.1 200' "$WORK/headers" && echo 1 || echo 0)"
         check "GET $path is text/html; charset=utf-8" \

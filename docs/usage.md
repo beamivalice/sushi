@@ -63,6 +63,21 @@ when its repo is not known (a folder that is neither a catalog pack nor pulled b
 cannot be reached or answers 404 (a private repo needs `HF_TOKEN`). The server asks the same once after a model loads and
 then once a day, unless `--no-update-check`.
 
+### The Downloads tab
+
+The web page's **Downloads** tab (`/downloads`, Cmd+5) does the same in the browser: it lists every Sushi pack published
+on Hugging Face (the ones this build knows, and any newer public `-Sushi-` repo of `beamster`) with its size, marks the
+pack `sushi list` recommends for this Mac's memory, says "Needs N GB" for one above it (still downloadable, after a
+confirm), and shows which are downloaded, partly downloaded or have an update. Download saves into the models folder of
+the Settings tab (`--model-dir` when given, else `server.models_dir`, else `~/.sushi/models`) under `beamster/<repo>`,
+after checking the free space: a pack that would leave less than a twentieth of the disk (at least 4 GiB) is refused,
+one that leaves under a tenth free warns. Update replaces a downloaded pack in its own folder, after you unload it.
+A running download shows a progress bar, the file in flight, speed and time left. Stop keeps what is downloaded: Resume
+continues from it, also after the server restarts. A finished pack appears in the Models tab at once, with its
+recommended launch line in the Advanced view. A small dot on the tab marks a pack (or an update) this browser has not
+listed before; under `--no-update-check` the page asks Hugging Face only while the tab is open. From another machine a
+download needs the server's `--api-key`. Downloads use `sushi pull`'s checks; a pack is never deleted from the tab.
+
 ## Recommended launch
 
 Every GPU limit below is set with `sudo sysctl iogpu.wired_limit_mb=<N>` and resets at reboot.

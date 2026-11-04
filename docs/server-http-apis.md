@@ -400,16 +400,72 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `/metrics.json` read, which is 503 while metrics are off). Guards: `tests/test_prefix_cache_admin.sh`,
   `node tests/test_webui_admin.cjs` (pure functions), `node tests/test_webui_admin_ui.cjs` (the tabs against a stub).
 
-## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`)
+## Downloads (`/v1/downloads`)
+
+Behind `--api-key` like the other admin routes, a foreign `Origin` is a 403 (`crossOriginRefused`), and every method is
+answered before any model resolves, so a headless server with no model serves them. `POST /v1/downloads` from another
+machine is a 403 unless the server has `--api-key` (`download_progress.startRefused`). Code: `src/downloads.zig` (routes,
+catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte accounting, speed).
+
+- `GET /v1/downloads[?refresh=1|?background=1]`: `{ram_bytes, ram_gb, update_check, dest:{path, source:
+  flag|file|default, locked, volume, free_bytes, total_bytes}, catalog: loading|ready|offline, refreshing,
+  packs:[{repo, name, tag, size_bytes|null, tier_gb|null, fits|null, streams_experts, recommended, installed,
+  path|null, partial_bytes|null, update:{current,latest}|null, launch|null}], jobs:[{repo, dest, phase, stopping, files,
+  file_index, total_bytes, done_bytes, file:{path,size,done}|null, speed_bps|null, eta_s|null, message|null}]}`.
+- The catalog is the `cli.aliases` table, then the org's public repos named `-Sushi-` from `/api/models?author=beamster`
+  whose name is plain `[A-Za-z0-9._-]` (a pack published after the build: no tier, so `fits` null). Sizes are `sushi
+  list`'s (`?blobs=true`); a repo the API answers 401/403/404 for is left out; with no answer at all the known packs stand
+  with null sizes and `catalog` `offline`. It is built on a background thread, at most every 10 minutes (1 minute while
+  offline, at once with `refresh=1`), so the answer never waits on Hugging Face; a finished download clears its own
+  row's `update` without asking again. `fits`, `tier_gb` and `recommended` are `sushi list`'s rules (`verdictFor`,
+  `recommendedAlias`) on `hw.memsize`; `streams_experts` marks a pack whose tier is for streamed experts (DeepSeek).
+  `update` is `pack_update.checkPack` for a downloaded pack. Under `--no-update-check` (`update_check` false) there is
+  no update check and a `background=1` GET (the page on another tab) starts no catalog refresh.
+- `installed` looks in the destination and the boot roots (`catalogPackPath`, both layouts); `partial_bytes` is a
+  destination folder that is there but not complete, null while that pack downloads. `launch` is `sushi serve --model
+  '<path>'` plus the flags of the pack's recommended launch in [usage](usage.md#recommended-launch)
+  (`Alias.serve_flags`), only for a downloaded pack in the table.
+- `dest` is the Settings tab's models folder: the first `--model-dir` (locked), else `server.models_dir`, else
+  `~/.sushi/models`; a new pack lands in `<dest>/beamster/<repo>`, an update in the folder it is installed in.
+- `POST /v1/downloads {"repo":"beamster/<repo>"}` takes only a pack the catalog lists, under the catalog's spelling
+  (404 otherwise, 400 for another org or a name outside `[A-Za-z0-9._-]`, `.` or `..`), and answers 202 `{ok, queued,
+  repo, dest, warning}` (`queued` false when that pack is already queued or running). An update of a loaded pack is a
+  409 `model_loaded` naming the model to unload. A new pack whose size, less what its folder holds, would leave less
+  than a twentieth of the volume (at least 4 GiB, the SSD cache's reserve) is a 507 `insufficient_storage`; under a
+  tenth free it carries a `warning`. The download checks again before it writes, against the listing: the listed bytes
+  less the files already at their size and the partials of the others (`hf_pull.bytesPresent`).
+- One download runs at a time on a thread `downloads.zig` owns (never the inference thread or a connection thread),
+  through `cli.pullRepo`: same manifest, content-id skip, `curl -C -` partials and verify-before-rename as `sushi pull`.
+  `phase` is `queued|listing|checking|downloading|verifying|done|failed|cancelled`; `done_bytes` counts finished files and
+  the partial in flight; `speed_bps` is the average over the last 5 s of the samples each GET takes (a resumed partial is
+  not speed); `message` is the pull's error line (a checksum mismatch names the file). A finished pack rescans the registry.
+- `POST /v1/downloads/cancel {"repo":...}` drops a queued pack or stops a running one: `stopping` is true until it
+  reports. The curl in flight gets SIGTERM (its pid is held unreaped until the job clears it, so the signal never reaches
+  another process), the hash of the files on disk stops between files, and a file already being verified finishes its
+  verify. The partials and `.pull-incomplete` stay, so a later start resumes, after a restart too (the queue is in
+  memory; the folder is the state). Server shutdown stops the curl the same way and refuses new starts (503).
+- The page's **Downloads** tab (`/downloads`) draws it: per pack the size, Recommended for this Mac, Needs N GB (with
+  `sushi list`'s words: "may stream (--ssd-budget-gb)", or the streamed tier for DeepSeek; a click asks first), Downloaded,
+  Update, Resume for a partial folder, and for a running download a bar, bytes, speed, time left and the file in flight;
+  Stop shows "Stopping…" until the job reports. It polls every second while a download runs or the catalog loads,
+  every 5 s otherwise, and writes no node on an unchanged answer. From another tab it asks (`background=1`) 3 s after
+  the page opens and then every 30 minutes (every 5 s while the catalog loads); a pack (or a pack's update) missing from
+  `localStorage` `sushi-seen-packs` puts a dot on the tab (its name reads "Downloads, new packs") until the tab is
+  opened. Only a ready catalog seeds or marks the list, the first one silently; under `--no-update-check` there is no
+  dot and no background ask after the first. On a phone (640 px and under) the tab is a download icon, so five tabs
+  fit the top bar. Removing a pack is not offered. Guards: `tests/test_downloads.sh`, `node
+  tests/test_webui_downloads.cjs`, the `downloads:` tests (download_progress.zig, downloads.zig, http_conn.zig).
+
+## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`, `GET /downloads`)
 
 - One self-contained file, `src/webui/index.html` (CSS, JS and the logo inline, no external fetch), embedded with
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
   `--api-key` like the other two. Guards: `tests/test_webui.sh`, the `chat page:` and `dashboard page:` tests.
-- The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings** navigator in the top bar switches the views of that one page in place (`history.pushState`,
+- The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings | Downloads** navigator in the top bar switches the views of that one page in place (`history.pushState`,
   `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
   conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
-  Cmd+1..4 (Ctrl+1..4 off a Mac) click the four tabs in that order, so unsaved Models/Settings edits still ask; they do
+  Cmd+1..5 (Ctrl+1..5 off a Mac) click the five tabs in that order, so unsaved Models/Settings edits still ask; they do
   nothing behind the API key overlay or an open dialog. A browser that reserves those keys for its own tabs keeps them.
 - **One reader of `/v1/models`**: `modelStore` (main script) polls it (30 s on Chat, 5 s on Dashboard and Models, 4 s
   while the server is unreachable, 2 s while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only

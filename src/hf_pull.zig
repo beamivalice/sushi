@@ -154,6 +154,41 @@ pub fn removeManifest(io: std.Io, dir_path: []const u8) void {
     dir.deleteFile(io, manifest_name) catch {};
 }
 
+pub const FileEvent = struct { index: usize, path: []const u8, size: u64, skip: bool };
+
+/// What a pull reports beside its lines, for a caller that draws progress (the server's Downloads tab).
+pub const PullEvent = union(enum) {
+    /// The files and bytes the pack downloads, and how many of those bytes are on disk already (`bytesPresent`),
+    /// before anything is written.
+    listed: struct { files: usize, bytes: u64, present: u64 },
+    /// Hashing the files already on disk.
+    checking,
+    /// File `index` (from 1) starts; `skip` when it is already complete.
+    file: FileEvent,
+    /// The curl process of the file in flight, still unreaped; null once it exited.
+    child: ?std.posix.pid_t,
+    /// The file is down; its checksum is being checked.
+    verifying,
+};
+
+/// The listed bytes a download need not fetch: files on disk at their listed size, and the partials of the others.
+pub fn bytesPresent(io: std.Io, dir_path: []const u8, files: []const RepoFile) u64 {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return 0;
+    defer dir.close(io);
+    var total: u64 = 0;
+    for (files) |f| {
+        const whole = if (dir.statFile(io, f.path, .{})) |st| st.size == f.size else |_| false;
+        if (whole) {
+            total += f.size;
+            continue;
+        }
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const partial = std.fmt.bufPrint(&buf, "{s}.partial", .{f.path}) catch continue;
+        total += @min((dir.statFile(io, partial, .{}) catch continue).size, f.size);
+    }
+    return total;
+}
+
 pub const Action = enum { skip, download, hash };
 
 /// What to do with one wanted file. `old` is the previous manifest's row for it (null: no manifest, or not named),
@@ -221,10 +256,12 @@ const HashJob = struct {
     dir_path: []const u8,
     files: []const RepoFile,
     match: []bool,
+    stop: ?*const std.atomic.Value(bool),
     next: std.atomic.Value(usize) = .init(0),
 
     fn run(self: *HashJob) void {
         while (true) {
+            if (self.stop) |s| if (s.load(.monotonic)) return;
             const i = self.next.fetchAdd(1, .monotonic);
             if (i >= self.files.len) return;
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -234,10 +271,11 @@ const HashJob = struct {
     }
 };
 
-/// Hashes the files in parallel; `match[i]` is whether `files[i]` on disk has its listed content id.
-pub fn hashMatches(io: std.Io, dir_path: []const u8, files: []const RepoFile, match: []bool) void {
+/// Hashes the files in parallel; `match[i]` is whether `files[i]` on disk has its listed content id. Once `stop` is
+/// set no further file starts (the rest read as not matching).
+pub fn hashMatches(io: std.Io, dir_path: []const u8, files: []const RepoFile, match: []bool, stop: ?*const std.atomic.Value(bool)) void {
     @memset(match, false);
-    var job = HashJob{ .io = io, .dir_path = dir_path, .files = files, .match = match };
+    var job = HashJob{ .io = io, .dir_path = dir_path, .files = files, .match = match, .stop = stop };
     var threads: [7]std.Thread = undefined;
     var spawned: usize = 0;
     const want = @min(threads.len, files.len -| 1);
@@ -342,8 +380,27 @@ test "hf pull: digests are the listing's sha256 and git blob sha1" {
         .{ .path = @constCast("missing"), .size = 6, .oid = @constCast("0000") },
     };
     var match: [3]bool = undefined;
-    hashMatches(testing.io, p[0..n], &files, &match);
+    hashMatches(testing.io, p[0..n], &files, &match, null);
     try testing.expectEqualSlices(bool, &.{ true, false, false }, &match);
+    const stopped = std.atomic.Value(bool).init(true);
+    hashMatches(testing.io, p[0..n], &files, &match, &stopped);
+    try testing.expectEqualSlices(bool, &.{ false, false, false }, &match);
+}
+
+test "hf pull: the bytes present are whole files at their listed size and the partials of the rest" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "whole", .data = "12345" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "old", .data = "123" }); // an older revision beside its partial
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "old.partial", .data = "12" });
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &p);
+    const files = [_]RepoFile{
+        .{ .path = @constCast("whole"), .size = 5 },
+        .{ .path = @constCast("old"), .size = 9 },
+        .{ .path = @constCast("missing"), .size = 7 },
+    };
+    try testing.expectEqual(@as(u64, 7), bytesPresent(testing.io, p[0..n], &files));
 }
 
 test "hf pull: only files the old manifest named and the repo dropped are removed" {

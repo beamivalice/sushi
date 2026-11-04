@@ -285,6 +285,19 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 #viewNav a { padding: 3px 12px; border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-md); font-weight: 600; }
 #viewNav a:hover { color: var(--text); text-decoration: none; }
 #viewNav a[aria-current="page"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border); }
+#viewNav a { position: relative; }
+.nav-dot { position: absolute; top: 2px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.nav-dot[hidden] { display: none; }
+#viewNav .nav-i { display: none; width: 15px; height: 15px; vertical-align: -3px; }
+.dl-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--s2) var(--s3); padding: var(--s3) var(--s4); border-bottom: 1px solid var(--border); }
+.dl-row:last-child { border-bottom: 0; }
+.dl-row .name { font-weight: 600; overflow-wrap: anywhere; display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); }
+.dl-row .meta, .dl-row .why { color: var(--text-2); font-size: var(--fs-sm); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.dl-row .why.err { color: var(--err); }
+.dl-row .act { display: flex; gap: var(--s2); }
+.dl-row .prog { grid-column: 1 / -1; }
+.dl-row .prog[hidden] { display: none; }
+.dl-row .prog .meter { margin: 0 0 var(--s1); }
 /* Hidden by visibility, not display or removal: the chat keeps its layout, scroll offset and running stream. */
 #appMain:not([data-view="chat"]) #chatPanel { visibility: hidden; pointer-events: none; }
 body[data-mode="compact"] .adv { display: none !important; }
@@ -498,12 +511,16 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   .brand .name, #serverDotLabel, .topbar-actions > .seg, #themeToggle { display: none; }
   #viewNav { gap: 0; }
   #viewNav a { padding: 3px 5px; font-size: var(--fs-sm); }
+  /* Five tabs fit a phone's top bar with Downloads as its icon. */
+  #viewNav .nav-l { display: none; }
+  #viewNav .nav-i { display: inline-block; }
   .brand { gap: 0; }
   #appTopbar { gap: var(--s2); padding: 0 var(--s2) 0 var(--s3); }
   #serverDot { padding: 0 6px; }
 }
 @media (max-width: 360px) {
   #viewNav a { padding: 3px; }
+  #viewNav .nav-i { width: 13px; height: 13px; }
   #appTopbar { gap: var(--s1); }
 }
 /* Keyed to the composer's own width: beside the side panels a wide window still leaves a narrow row. */
@@ -542,6 +559,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <symbol id="i-box" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M21 8.2 12 3 3 8.2v7.6L12 21l9-5.2ZM3.3 8.4 12 13.4l8.7-5M12 13.4V21"/></symbol>
   <symbol id="i-sliders" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 8h9m5 0h2M4 16h3m5 0h8"/><circle cx="15.5" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9.5" cy="16" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
   <symbol id="i-pulse" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l2.5-6 4 12 2.5-6h5"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 4v11m-5-5 5 5 5-5M5 20h14"/></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m11.3 11.7 8.2-8.2m-3 3 2.5 2.5m-5-.5 2 2"/></symbol>
 </svg>
 
@@ -573,6 +591,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <a id="navChat" href="/chat">Chat</a>
     <a id="navModels" href="/models">Models</a>
     <a id="navSettings" href="/settings">Settings</a>
+    <a id="navDownloads" href="/downloads" aria-label="Downloads"><span class="nav-l">Downloads</span><svg class="nav-i" aria-hidden="true"><use href="#i-download"/></svg><span class="nav-dot" id="navDownloadsDot" title="New packs" hidden></span></a>
   </nav>
   <span class="spacer"></span>
   <div class="topbar-actions">
@@ -822,6 +841,18 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       <div class="card-b"><div class="kv"><span>Version</span><span id="aboutVersion"></span></div>
         <div class="bulk" style="margin-top:12px"><button class="btn sm" id="forgetKeyButton" type="button" hidden>Forget the API key</button></div></div>
     </section>
+  </div>
+</section>
+<section id="downloadsPanel" class="panel page" aria-label="Downloads" hidden>
+  <div class="page-head"><div class="in">
+    <div class="titles"><h1>Downloads</h1><div class="sub">Sushi packs published on Hugging Face</div></div>
+    <span class="spacer"></span>
+    <button class="btn sm" id="dlRefresh" type="button">Check again</button>
+  </div></div>
+  <div class="page-body narrow">
+    <div id="dlAlert" class="alert err" role="alert" hidden></div>
+    <section class="card" id="dlMacCard"><div class="card-b"><div class="kv" id="dlMac"></div><div class="callout" id="dlNote" style="margin-top:12px" hidden></div></div></section>
+    <section class="card list" id="dlList" aria-label="Sushi packs"><div class="skel"></div><div class="skel"></div><div class="skel"></div></section>
   </div>
 </section>
 </main>
@@ -3123,7 +3154,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   window.addEventListener("beforeunload", (e) => { if ([...A.per.keys()].some(isDirty)) e.preventDefault(); });
   // Leaving the Models tab by the top bar asks first when the open model has unsaved edits.
   document.addEventListener("click", async (e) => {
-    const link = e.target.closest?.("#navChat, #navDashboard, #navSettings, #serverDot");
+    const link = e.target.closest?.("#navChat, #navDashboard, #navSettings, #navDownloads, #serverDot");
     if (!link || A.passNav || A.view !== "models" || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || !isDirty(A.sel)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -3539,12 +3570,141 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   window.addEventListener("sushi-mode", () => { if (A.view === "models" || A.view === "settings") renderAll(); });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
+  // Downloads: the packs on Hugging Face, this Mac's fit and the server's download queue (/v1/downloads).
+  const D = { data: null, error: null, timer: null, rows: new Map(), order: "", seen: null };
+  const SEEN_KEY = "sushi-seen-packs";
+  const packKeys = (d) => d.packs.flatMap((p) => [p.repo, ...(p.update ? [`${p.repo}@${p.update.latest}`] : [])]);
+  // The dot names a pack (or an update) this browser has not listed before; the first full catalog seeds the list
+  // silently. A catalog still loading is only the packs this build knows, so it neither seeds nor marks.
+  function markNew(d, viewing) {
+    if (d.catalog !== "ready" || d.refreshing || !d.update_check) return;
+    let seen = null;
+    try { seen = JSON.parse(localStorage.getItem(SEEN_KEY)); } catch {}
+    const keys = packKeys(d);
+    if (!Array.isArray(seen) || viewing) {
+      seen = [...new Set([...(Array.isArray(seen) ? seen : []), ...keys])];
+      try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)); } catch {}
+    }
+    const fresh = !viewing && !keys.every((k) => seen.includes(k));
+    setHidden(q("navDownloadsDot"), !fresh);
+    const name = fresh ? "Downloads, new packs" : "Downloads";
+    if (q("navDownloads").getAttribute("aria-label") !== name) q("navDownloads").setAttribute("aria-label", name);
+  }
+  const eta = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s left` : s < 5400 ? `${Math.round(s / 60)} min left` : `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min left`;
+  const jobOf = (repo) => D.data?.jobs.filter((j) => j.repo === repo).pop();
+  const PHASE = { queued: "Queued", listing: "Listing files…", checking: "Checking the files already on disk…", downloading: "Downloading", verifying: "Verifying", done: "Downloaded", failed: "Failed", cancelled: "Stopped" };
+  const isActive = (j) => !!j && !["done", "failed", "cancelled"].includes(j.phase);
+  const label = (p) => p.tag ? `${p.name}:${p.tag}` : p.name;
+  // `sushi list`'s tier words: a pack below this Mac's tier "may stream (--ssd-budget-gb)"; DeepSeek always streams.
+  const tierText = (p) => p.streams_experts ? `Needs ${p.tier_gb} GB with its experts streamed from the SSD; this Mac has ${D.data.ram_gb} GB.`
+    : `Runs in memory from ${p.tier_gb} GB; this Mac has ${D.data.ram_gb} GB. It may stream (--ssd-budget-gb).`;
+  async function startDownload(p, btn) {
+    if (p.fits === false && !(await confirmAction({ title: `Download ${label(p)}?`, body: `${tierText(p)} Nothing promises it runs here.`, confirm: "Download anyway" }))) return;
+    await withBusy(btn, "Starting…", async () => {
+      try {
+        const r = await postJson("/v1/downloads", { repo: p.repo });
+        toast(r.warning ? `Downloading ${label(p)}; it ${r.warning}.` : `Downloading ${label(p)}.`);
+      } catch (e) { failToast("Download", e); }
+    });
+    refreshDownloads();
+  }
+  async function stopDownload(p, btn) {
+    await withBusy(btn, "Stopping…", async () => {
+      try { await postJson("/v1/downloads/cancel", { repo: p.repo }); } catch (e) { failToast("Stop", e); }
+    });
+    refreshDownloads();
+  }
+  // A row is rebuilt only when what it shows changes; the live numbers of a running download are text writes.
+  function packRow(p) {
+    const j = jobOf(p.repo), live = isActive(j);
+    // A running download's folder grows: its size on disk is no part of the row while it runs.
+    const sig = JSON.stringify([{ ...p, partial_bytes: live ? null : p.partial_bytes }, j && [j.phase, j.message, j.stopping]]);
+    const old = D.rows.get(p.repo);
+    if (old?.sig === sig) return old;
+    const badges = [
+      p.recommended ? h("span", { class: "badge ok", text: "Recommended for this Mac" }) : null,
+      p.installed ? h("span", { class: "badge saved", text: "Downloaded" }) : null,
+      p.update ? h("span", { class: "badge flag", text: `Update ${p.update.latest}` }) : null,
+      p.fits === false ? h("span", { class: "badge", text: `Needs ${p.tier_gb} GB` }) : null,
+    ];
+    const meta = [p.size_bytes != null ? adminBytes(p.size_bytes) : "size unknown", p.partial_bytes ? `${adminBytes(p.partial_bytes)} on disk, not complete` : "", p.repo].filter(Boolean).join(" · ");
+    const why = j?.phase === "failed" ? `Failed: ${j.message || "the download stopped"}. Downloaded files are kept.` : j?.phase === "cancelled" ? "Stopped. The downloaded part is kept; Resume continues from it."
+      : p.fits === false ? tierText(p) : "";
+    const btn = (text, cls, fn, off) => { const b = h("button", { class: `btn sm ${cls}`, type: "button", text, "aria-label": `${text} ${label(p)}`, disabled: !!off }); b.addEventListener("click", () => fn(p, b)); return b; };
+    const action = live ? (j.stopping ? btn("Stopping…", "", stopDownload, true) : btn(j.phase === "queued" ? "Remove" : "Stop", "", stopDownload))
+      : p.update ? btn("Update", "primary", startDownload)
+      : p.installed ? null
+      : btn(p.partial_bytes || j?.phase === "cancelled" || j?.phase === "failed" ? "Resume" : "Download", p.recommended ? "primary" : "", startDownload);
+    const prog = h("div", { class: "prog", hidden: !live }, h("div", { class: "meter", role: "progressbar", "aria-label": `${label(p)} download`, "aria-valuemin": "0", "aria-valuemax": "100" }, h("span")), h("div", { class: "meter-text" }, h("span", { class: "a" }), h("span", { class: "b" })));
+    const el = h("div", { class: "dl-row", "data-repo": p.repo },
+      h("div", { class: "main" }, h("div", { class: "name" }, h("span", { text: label(p) }), ...badges), h("div", { class: "meta", text: meta }),
+        why ? h("div", { class: `why${j?.phase === "failed" ? " err" : ""}`, text: why }) : null,
+        p.launch ? h("div", { class: "meta mono adv", text: p.launch }) : null),
+      h("div", { class: "act" }, action), prog);
+    const row = { sig, el, prog };
+    D.rows.set(p.repo, row);
+    return row;
+  }
+  function progress(row, j) {
+    if (!isActive(j)) return;
+    const pct = j.total_bytes ? Math.min(100, (100 * j.done_bytes) / j.total_bytes) : 0;
+    const bar = row.prog.querySelector(".meter"), fillEl = bar.firstChild, w = `${+pct.toFixed(1)}%`;
+    if (fillEl.style.width !== w) fillEl.style.width = w;
+    if (bar.getAttribute("aria-valuenow") !== String(Math.round(pct))) bar.setAttribute("aria-valuenow", String(Math.round(pct)));
+    const step = j.phase === "downloading" || j.phase === "verifying" ? `${PHASE[j.phase]} ${j.file ? `${j.file.path} (${j.file_index} of ${j.files})` : ""}` : PHASE[j.phase];
+    const nums = j.total_bytes ? [`${adminBytes(j.done_bytes)} of ${adminBytes(j.total_bytes)}`, j.speed_bps != null ? `${adminBytes(j.speed_bps)}/s` : "", j.eta_s != null ? eta(j.eta_s) : ""].filter(Boolean).join(" · ") : "";
+    setText(row.prog.querySelector(".a"), step.trim());
+    setText(row.prog.querySelector(".b"), nums);
+  }
+  function renderDownloads() {
+    const d = D.data;
+    alertIn(q("dlAlert"), D.error ? `Couldn't load: ${D.error}` : "", false);
+    if (!d) return;
+    const where = d.dest.locked ? "set by --model-dir" : d.dest.source === "file" ? "the Settings tab's models folder" : "the default models folder";
+    const space = d.dest.free_bytes != null ? `${adminBytes(d.dest.free_bytes)} free${d.dest.volume ? ` on ${d.dest.volume}` : ""}` : "unknown";
+    const kv = [["This Mac", `${d.ram_gb} GB of memory`], ["Saves to", `${d.dest.path} (${where})`], ["Free space", space]];
+    fill(q("dlMac"), JSON.stringify(kv), () => kvRows(kv, ["Saves to"]));
+    const note = d.catalog === "offline" ? "Hugging Face can't be reached: these are the packs this build knows, without sizes." : d.catalog === "loading" ? "Checking Hugging Face…" : "";
+    setText(q("dlNote"), note);
+    setHidden(q("dlNote"), !note);
+    const rows = d.packs.map(packRow);
+    for (const repo of [...D.rows.keys()]) if (!d.packs.some((p) => p.repo === repo)) D.rows.delete(repo);
+    const order = d.packs.map((p) => D.rows.get(p.repo).sig).join("\n");
+    if (D.order !== order) {
+      D.order = order;
+      q("dlList").replaceChildren(...(rows.length ? rows.map((r) => r.el) : [h("div", { class: "card-b muted", text: "No packs are published yet." })]));
+    }
+    for (const p of d.packs) progress(D.rows.get(p.repo), jobOf(p.repo));
+  }
+  async function refreshDownloads(force) {
+    clearTimeout(D.timer);
+    const viewing = A.view === "downloads";
+    if (document.hidden && viewing) { D.timer = setTimeout(refreshDownloads, 5000); return; }
+    try {
+      const d = await pull("downloads", force ? "/v1/downloads?refresh=1" : viewing ? "/v1/downloads" : "/v1/downloads?background=1");
+      D.error = null;
+      // A finished download is a new model: the Models tab and the chat's list hear of it now.
+      if (d && d.jobs.some((j) => j.phase === "done" && !D.data?.jobs.some((o) => o.repo === j.repo && o.phase === "done"))) modelStore.refresh();
+      if (d) D.data = d;
+      if (D.data && (d || viewing)) markNew(D.data, viewing);
+    } catch (e) { D.error = adminErrorText(e); }
+    if (viewing) renderDownloads();
+    const loading = D.data?.refreshing || D.data?.catalog === "loading";
+    // Under --no-update-check another tab asks nothing: Hugging Face is read only while this tab is open.
+    if (!viewing && D.data && !D.data.update_check) return;
+    D.timer = setTimeout(refreshDownloads, viewing ? (loading || D.data?.jobs.some(isActive) ? 1000 : 5000) : loading ? 5000 : 30 * 60 * 1000);
+  }
+  q("dlRefresh").addEventListener("click", () => withBusy(q("dlRefresh"), "Checking…", () => refreshDownloads(true)));
+  setTimeout(() => { if (A.view !== "downloads") refreshDownloads(); }, 3000);
+
   window.sushiAdmin = {
     refresh,
     show(view) {
       A.view = view;
       q("modelsPanel").hidden = view !== "models";
       q("settingsPanel").hidden = view !== "settings";
+      q("downloadsPanel").hidden = view !== "downloads";
+      if (view === "downloads") { renderDownloads(); refreshDownloads(); }
       clearInterval(A.timer);
       clearTimeout(A.retry);
       A.timer = null;
@@ -4437,8 +4597,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
 
 
-  const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard', models: '/models', settings: '/settings' };
-  const NAV_ID = { chat: 'navChat', dashboard: 'navDashboard', models: 'navModels', settings: 'navSettings' };
+  const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard', models: '/models', settings: '/settings', downloads: '/downloads' };
+  const NAV_ID = { chat: 'navChat', dashboard: 'navDashboard', models: 'navModels', settings: 'navSettings', downloads: 'navDownloads' };
   // The root is the Dashboard: it is where a visit to the server starts; the chat lives at /chat.
   const viewOf = p => Object.keys(VIEW_PATH).find(v => VIEW_PATH[v] === p) ?? 'dashboard';
   const chatTitle = document.title;
@@ -4482,7 +4642,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     history.pushState(null, '', VIEW_PATH[view]);
     applyView(view);
     // Keyboard and screen-reader users land on the new page's heading.
-    if (view !== 'chat') document.querySelector('#' + { dashboard: 'dashPanel', models: 'modelsPanel', settings: 'settingsPanel' }[view] + ' h1')?.focus({ preventScroll: true });
+    if (view !== 'chat') document.querySelector('#' + { dashboard: 'dashPanel', models: 'modelsPanel', settings: 'settingsPanel', downloads: 'downloadsPanel' }[view] + ' h1')?.focus({ preventScroll: true });
   }
   document.getElementById('serverDot').addEventListener('click', () => goTo('dashboard'));
   for (const h1 of document.querySelectorAll('.page-head h1')) h1.tabIndex = -1;
@@ -4492,8 +4652,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       e.preventDefault(); goTo(view);
     });
   }
-  // Cmd+1..4 (Ctrl+1..4 off a Mac) click the tabs in their order, so a form with unsaved edits still asks first.
-  const NAV_ORDER = ['dashboard', 'chat', 'models', 'settings'];
+  // Cmd+1..5 (Ctrl+1..5 off a Mac) click the tabs in their order, so a form with unsaved edits still asks first.
+  const NAV_ORDER = ['dashboard', 'chat', 'models', 'settings', 'downloads'];
   const onMac = /Mac/.test(navigator.platform);
   NAV_ORDER.forEach((v, i) => {
     const link = document.getElementById(NAV_ID[v]);
@@ -4502,7 +4662,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   });
   document.addEventListener('keydown', e => {
     if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || e.repeat) return;
-    const i = ['Digit1', 'Digit2', 'Digit3', 'Digit4'].indexOf(e.code);
+    const i = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5'].indexOf(e.code);
     if (i < 0 || document.getElementById('appShell')?.inert || document.querySelector('dialog[open]')) return;
     e.preventDefault();
     document.getElementById(NAV_ID[NAV_ORDER[i]]).click();
