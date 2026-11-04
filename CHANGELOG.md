@@ -4,7 +4,7 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## v1.5.0 — Menu bar, new dashboard, trustworthy pack updates
+## v1.5.0 — Menu bar, new dashboard, 10x lighter DeepSeek cache, trustworthy pack updates
 
 - **`sushibar` puts sushi in the menu bar**: a native app beside `sushi` shows live decode speed and a status card
   (model, memory, prefill, GPU clock, a five-minute decode graph), starts and stops the server on any port, opens the
@@ -12,6 +12,11 @@ earlier history is mlx-serve's, in that project's changelog.
 
   <p><img src="https://raw.githubusercontent.com/beamivalice/sushi/main/docs/assets/sushibar-running.png" alt="sushibar with a model running" width="316"> <img src="https://raw.githubusercontent.com/beamivalice/sushi/main/docs/assets/sushibar-stopped.png" alt="sushibar with the server stopped" width="312"></p>
 
+- **DeepSeek-V4.1's SSD prefix cache writes about 10x less**: each context row reaches the SSD once per conversation
+  instead of once per turn, so a turn's write no longer grows with the context. Over a week of long agent sessions 1.4
+  wrote 120 GB to the cache, about 100 MB a turn; 1.5.0 writes about 9 MB a turn, and a 30-turn session from 72k to 176k
+  tokens wrote 0.8 GB instead of 3.8 GB with the same restore after a restart. Caches from earlier versions are not
+  read; clear them in Settings.
 - **A new web page that opens on the Dashboard**: Dashboard, Chat, Models and Settings tabs (Cmd+1 to Cmd+4); a Compact
   view with one point per finished request and the GPU clock beside utilization; Models and Settings edit each model's
   settings and the SSD prefix cache, offering only what that model honours and naming the volume the cache writes to
@@ -27,11 +32,9 @@ earlier history is mlx-serve's, in that project's changelog.
   context (ported from CommunityServe/plugins, thanks @STRML), greedy text no longer varies between runs, decode spends
   less CPU per token, streamed experts fill faster with identical output, and `--ssd-prefetch N` makes expert prefetch
   opt-in under an SSD read cap.
-- **DeepSeek-V4.1 fixes**: raw-text `/v1/completions` no longer stops at the first token, and the SSD prefix cache writes
-  each row once instead of once per turn (caches from earlier versions are not read; clear them in Settings).
-- **Smaller fixes**: `sushi bench` no longer needs sudo, redirected output appends instead of overwriting, `sushi update
-  --check` names a network failure, and the Models list hides test fixtures and no longer counts linked Engram shards
-  as the pack's size.
+- **Smaller fixes**: DeepSeek-V4.1 raw-text `/v1/completions` no longer stops at the first token, `sushi bench` no
+  longer needs sudo, redirected output appends instead of overwriting, `sushi update --check` names a network failure,
+  and the Models list hides test fixtures and no longer counts linked Engram shards as the pack's size.
 
 ## v1.4.1 — Faster DeepSeek prefill, DeepSeek with no flags
 

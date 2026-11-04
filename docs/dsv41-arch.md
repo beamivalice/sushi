@@ -854,6 +854,9 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   speed of the two runs is not comparable (a cold page cache slowed the branch's first 7 turns). After a clean shutdown and a boot
   the last prompt restored 176113 of 180308 tokens from SSD on both; after `kill -9` the branch restored the same point (the
   shutdown flush's), main its prompt-end point.
+- **Write cost in daily agent use** (one server's log, default flags, `[dsv41-prefix] ... GB staged` summed per boot): 1.4.x
+  wrote 120.2 GB over 1215 turns (101 MB a turn, prompt median 219k; 150-376 MB a turn in sessions at 230-420k), 1.5.0-dev1
+  (`f7da31aa`) 2.7 GB over 331 turns (9 MB a turn, median 107k). The contexts differ; the A/B above is the matched reading.
 - **The live record reaches SSD only when the state is about to be lost** (`HotPrefixCache.flushLiveDsv41`, inference
   thread): another conversation's lookup that does not roll back, a model unload, an idle queue for 300 s
   (`live_flush_idle_secs`) and a clean shutdown write every point of the record that is not on SSD yet (up to 8: the
