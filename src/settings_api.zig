@@ -15,6 +15,7 @@ const model_load = @import("model_load.zig");
 const models_api = @import("models_api.zig");
 const expert_stream = @import("expert_stream.zig");
 const chat = @import("chat.zig");
+const kv_quant_mod = @import("kv_quant.zig");
 
 const Edit = model_settings.Edit;
 
@@ -32,6 +33,8 @@ pub const ModelRow = struct {
     index_complete: bool = false,
     /// The file values a ready model's load stamped; null for a model that is not loaded.
     loaded: ?model_settings.Override = null,
+    /// What each key resolves to with no flag and no file value, for a ready model; a null field = not knowable.
+    defaults: ?model_settings.Override = null,
     tier: ?TierView = null,
 };
 
@@ -55,6 +58,7 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "preserve_thinking")) return if (o.preserve_thinking) |v| .{ .bool = v } else null;
     if (eql(u8, name, "think_penalty")) return if (o.think_penalty) |v| .{ .float = v } else null;
     if (eql(u8, name, "vision")) return if (o.vision) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "max_tokens")) return if (o.max_tokens) |v| .{ .integer = v } else null;
     return null;
 }
 
@@ -71,6 +75,26 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .preserve_thinking = config.preserve_thinking_override,
         .think_penalty = config.think_penalty_override,
         .vision = config.vision_override,
+        .max_tokens = config.max_tokens_override,
+    };
+}
+
+/// What a loaded model's keys resolve to when the file and the launch flags say nothing, read from the loader's own
+/// resolvers on a config with its overrides cleared. `ctx_size` and `ssd_budget_gb` stay null: they are measured at load.
+pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Override {
+    var bare = config.*;
+    model_load.applyModelSettings(&bare, .{});
+    bare.ssd_prefetch = null;
+    return .{
+        .kv_quant = server.kvCacheForLaunch(&bare, kv_quant_mod.KVQuantConfig.engine_default, false).config,
+        .mtp = model_load.mtpChoiceFor(false, false, &bare).on,
+        .mtp_acceptance = model_settings.default_mtp_acceptance,
+        .mtp_greedy_tail = model_settings.default_mtp_greedy_tail,
+        .ssd_prefetch = bare.ssdPrefetchPct(),
+        .preserve_thinking = model_settings.default_preserve_thinking,
+        .think_penalty = model_settings.default_think_penalty,
+        .vision = model_settings.VisionChoice.resolve(null, null, model_load.visionDefaultOn(&bare, bare.expert_streaming)).on,
+        .max_tokens = bare.defaultMaxTokens(),
     };
 }
 
@@ -229,6 +253,18 @@ pub fn render(
             }
             try w.writeAll("}");
         } else try w.writeAll("null");
+        try w.writeAll(",\"defaults\":");
+        if (row.defaults) |o| {
+            try w.writeAll("{");
+            var first_default = true;
+            for (model_settings.model_keys) |k| if (overrideValue(o, k.name)) |v| {
+                if (!first_default) try w.writeAll(",");
+                first_default = false;
+                try w.print("\"{s}\":", .{k.name});
+                try writeJson(w, v);
+            };
+            try w.writeAll("}");
+        } else try w.writeAll("null");
         try w.writeAll(",\"settings\":{");
         const obj = model_settings.modelObject(file, row.path);
         for (model_settings.model_keys, 0..) |k, ki| {
@@ -356,6 +392,7 @@ fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
         const c = e.config.?;
         row.fit = server.settingsFit(c);
         row.loaded = loadedWith(c);
+        row.defaults = resolvedDefaults(c);
         if (e.chat_config) |cc| {
             row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(cc.chat_template);
             row.fit.template_thinks = chat.templateHasThinkSpan(cc.chat_template);
@@ -735,4 +772,60 @@ test "settings api: render reports the file's value, the pinning flag and the wi
     try testing.expect(mtp.get("locked").?.bool);
     try testing.expect(!mtp.get("file").?.bool);
     try testing.expectEqual(@as(usize, model_settings.model_keys.len), root.get("model_keys").?.array.items.len);
+}
+
+test "settings api: a ready model reports the default each key resolves to; an unloaded one reports none" {
+    var file = try model_settings.parse(testing.allocator, "{}");
+    defer file.deinit();
+    const locks: model_settings.LaunchLocks = .{};
+    const dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 1_048_576, .serve_defaults = @import("dsv41/dsv41_config.zig").Config.serveDefaults(model_mod.ServeDefaults) };
+    const rows = [_]ModelRow{
+        .{ .id = "ready", .path = "/m/a", .state = "ready", .bytes = 5, .defaults = resolvedDefaults(&dsv41) },
+        .{ .id = "cold", .path = "/m/b", .state = "unloaded", .bytes = 5 },
+    };
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const models = parsed.value.object.get("models").?.array.items;
+    const d = models[0].object.get("defaults").?.object;
+    try testing.expectEqual(@as(i64, 256_000), d.get("max_tokens").?.integer);
+    try testing.expectEqualStrings("exact", d.get("mtp_acceptance").?.string);
+    try testing.expect(d.get("mtp").?.bool);
+    try testing.expect(d.get("preserve_thinking").?.bool);
+    try testing.expectEqual(@as(i64, 0), d.get("think_penalty").?.integer);
+    try testing.expectEqual(@as(i64, 0), d.get("ssd_prefetch").?.integer);
+    // Measured at load, so never guessed.
+    try testing.expect(d.get("ctx_size") == null);
+    try testing.expect(d.get("ssd_budget_gb") == null);
+    try testing.expect(models[1].object.get("defaults").? == .null);
+}
+
+test "settings api: the resolved defaults ignore the file's values the config was stamped with" {
+    var stamped = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 262_144 };
+    model_load.applyModelSettings(&stamped, .{ .max_tokens = 999, .mtp = false, .kv_quant = kv_quant_mod.KVQuantConfig.affine(4), .vision = false, .ssd_prefetch = 40 });
+    const d = resolvedDefaults(&stamped);
+    try testing.expectEqual(@as(?u32, 0), d.max_tokens);
+    try testing.expectEqual(@as(?bool, true), d.mtp);
+    try testing.expectEqual(@as(u8, 8), d.kv_quant.?.bits);
+    try testing.expectEqual(@as(?bool, true), d.vision);
+    try testing.expectEqual(@as(?u8, 0), d.ssd_prefetch);
+    // What it was stamped with is still what the model loaded with.
+    try testing.expectEqual(@as(?u32, 999), loadedWith(&stamped).max_tokens);
+}
+
+test "settings api: max_tokens round-trips as a positive integer and is refused above the context window" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ok = parseRequest(arena_state.allocator(), "{\"model\":\"m\",\"set\":{\"max_tokens\":32000}}");
+    try testing.expectEqual(@as(i64, 32000), ok.ok.model_edits[0].value.?.integer);
+    try expectRejected("{\"model\":\"m\",\"set\":{\"max_tokens\":0}}", 400, "invalid_setting");
+    try expectRejected("{\"model\":\"m\",\"set\":{\"max_tokens\":\"big\"}}", 400, "invalid_setting");
+    try expectRejected("{\"model\":\"m\",\"set\":{\"max_tokens\":1.5}}", 400, "invalid_setting");
+    const fit: model_settings.Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .context_cap = 131072 };
+    const edit = [_]Edit{.{ .key = "max_tokens", .value = .{ .integer = 200_000 } }};
+    const msg = refusalMessage(arena_state.allocator(), fit, null, &edit).?;
+    try testing.expect(std.mem.indexOf(u8, msg, "\"max_tokens\"") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "131072") != null);
+    try testing.expect(refusalMessage(arena_state.allocator(), fit, null, &.{.{ .key = "max_tokens", .value = .{ .integer = 131072 } }}) == null);
 }

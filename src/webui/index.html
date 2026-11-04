@@ -678,10 +678,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
           <textarea id="optSystem" rows="3" placeholder="Optional instructions for the model"></textarea>
         </label>
         <div class="opt-grid">
-          <label class="field">Max tokens <input id="optMaxTokens" type="number" min="1" step="1" placeholder="default" /></label>
-          <label class="field">Temperature <input id="optTemperature" type="number" min="0" max="2" step="0.05" placeholder="default" /></label>
-          <label class="field">Top-p <input id="optTopP" type="number" min="0" max="1" step="0.01" placeholder="default" /></label>
-          <label class="field">Top-k <input id="optTopK" type="number" min="0" step="1" placeholder="default" /></label>
+          <label class="field">Max tokens <input id="optMaxTokens" type="number" min="1" step="1" placeholder="Default" /></label>
+          <label class="field">Temperature <input id="optTemperature" type="number" min="0" max="2" step="0.05" placeholder="Default" /></label>
+          <label class="field">Top-p <input id="optTopP" type="number" min="0" max="1" step="0.01" placeholder="Default" /></label>
+          <label class="field">Top-k <input id="optTopK" type="number" min="0" step="1" placeholder="Default" /></label>
         </div>
         <button class="btn sm ghost" id="chatOptionsReset">Reset to the model's defaults</button>
       </div>
@@ -1788,8 +1788,27 @@ function applyEffortBudget() {
   const budget = box.disabled ? null : model?.reasoning_effort_budgets?.[effort];
   box.value = budget == null ? "" : String(budget);
 }
+// "Default (value)" when the server reports what the model uses unset, else a bare "Default".
+function defaultWith(value) { return value == null ? "Default" : `Default (${value})`; }
+const decimalText = (n) => (Number.isInteger(n) ? n.toFixed(1) : String(n));
+function renderChatDefaults(model) {
+  const meta = model?.meta ?? {};
+  const known = (v) => (Number.isFinite(v) ? v : null);
+  const tokens = known(meta.default_max_tokens);
+  const shown = {
+    optMaxTokens: tokens == null ? null : tokens > 0 ? tokens.toLocaleString("en-US") : "rest of the context window",
+    optTemperature: known(meta.default_temperature) == null ? null : decimalText(meta.default_temperature),
+    optTopP: known(meta.default_top_p) == null ? null : decimalText(meta.default_top_p),
+    optTopK: known(meta.default_top_k) == null ? null : meta.default_top_k === 0 ? "off" : String(meta.default_top_k),
+  };
+  for (const [id, value] of Object.entries(shown)) {
+    const text = defaultWith(value);
+    if ($(id).placeholder !== text) $(id).placeholder = text;
+  }
+}
 function renderModelStatus() {
   const model = selectedModel();
+  renderChatDefaults(model);
   $("composerModelName").textContent = model?.id ?? "no model";
   const vision = modelSeesImages(model);
   $("attachButton").hidden = !vision;
@@ -2958,10 +2977,20 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     preserve_thinking: ["Keep earlier thinking", "Keep earlier turns' reasoning in the prompt.", "--preserve-thinking"],
     think_penalty: ["Think penalty", "Pushes the model to finish thinking sooner. 0 to 20.", "--think-penalty"],
     vision: ["Vision tower", "Loads the image tower, so the model can read images. Off saves its memory.", "--vision"],
+    max_tokens: ["Max output tokens", "Longest reply for a request that names no max_tokens. A request's own number outranks it.", "--max-tokens"],
   };
-  const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb"];
+  const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "max_tokens"];
   const KV_LABEL = { off: "16-bit (off)", 4: "4-bit", 6: "6-bit", 8: "8-bit" };
   const choiceLabel = (key, v) => (key === "kv_quant" ? KV_LABEL[v] : null) ?? v;
+  // What the server would use with the key unset, as the label of the Default choice; a bare "Default" when it cannot say.
+  const defaultLabel = (m, spec) => {
+    const v = m.defaults?.[spec.name];
+    if (v == null) return "Default";
+    if (spec.type === "bool") return `Default (${v ? "On" : "Off"})`;
+    if (spec.type === "choice") return `Default (${choiceLabel(spec.name, String(v)).replace(/ \(off\)$/, "")})`;
+    if (spec.name === "max_tokens" && v === 0) return "Default (rest of the context window)";
+    return `Default (${Number(v).toLocaleString("en-US")})`;
+  };
   const isOff = (flag) => flag === "off" || flag === "false" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
   const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk" }[key] ?? "";
@@ -3226,6 +3255,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const btns = names.map(([v, t]) => h("button", { type: "button", text: t, onclick: () => { cur = v; paint(); onChange(); } }));
       paint();
       return { node: h("div", { class: "tri", role: "group", "aria-label": label }, ...btns), get: () => cur, set: (v) => { cur = v; paint(); }, focused: () => false,
+        def: (t) => setText(btns[0], t),
         lock: (on, flag) => { btns.forEach((b) => { b.disabled = on; }); paint(on && flag !== undefined ? (isOff(flag) ? "false" : "true") : cur); } };
     }
     const choice = spec.type === "choice";
@@ -3233,6 +3263,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       : h("input", { type: "text", inputmode: spec.type === "int" ? "numeric" : "decimal", autocomplete: "off", placeholder: "Default", "aria-label": label, oninput: () => onChange() });
     const extra = h("option", { value: "\0" });
     return { node, get: () => node.value, focused: () => document.activeElement === node,
+      def: (t) => { if (choice) setText(node.options[0], t); else if (node.placeholder !== t) node.placeholder = t; },
       set: (v) => { if (choice && v && ![...node.options].some((o) => o.value === v)) node.append(h("option", { value: v, text: `${v} (not valid)`, disabled: true })); node.value = v; },
       lock: (on, flag) => {
         node.disabled = on;
@@ -3267,6 +3298,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     badges(S.badge, s);
     S.control.lock(locked || !!why, locked ? s.flag ?? "" : undefined);
     S.control.allow?.(lim?.choices);
+    S.control.def(defaultLabel(m, S.spec));
     if (!locked && !(key in P.texts) && !S.control.focused()) { const want = adminFileText(s.file); if (S.control.get() !== want) S.control.set(want); }
     setText(S.help, locked ? flagHelp(key, s.flag) : why || KEY[key][1]);
     setHidden(S.remove, locked || !why || s.file == null);
@@ -3504,7 +3536,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const shown = locked ? adminFileText(gb.flag) || adminBytes(cap) : file;
     if (A.cacheText === shown) A.cacheText = null;
     if ((locked || A.cacheText === null) && cacheIn.value !== shown) cacheIn.value = shown;
-    cacheIn.placeholder = String(+(gb.ask_bytes / GiB).toFixed(2));
+    const askText = `Default (${+(gb.ask_bytes / GiB).toFixed(2)})`;
+    if (cacheIn.placeholder !== askText) cacheIn.placeholder = askText;
     setHidden(cacheUnit, locked);
     setText(cacheRow.help, locked ? flagHelp("prefix_cache_disk_gb", gb.flag) : "Space the cache may use on the SSD. A smaller size drops the oldest entries at once; 0 turns the cache off at the next model load.");
     const text = cacheIn.value.trim(), parsed = adminControlValue(GB_SPEC, text), dirty = !locked && text !== file;

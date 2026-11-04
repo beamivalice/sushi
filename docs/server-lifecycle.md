@@ -161,7 +161,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 
 - **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`model_settings.pick`;
   `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
-  `--mtp-greedy-tail`, `--ssd-budget-gb`, `--ssd-prefetch`, `--preserve-thinking`, `--think-penalty`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
+  `--mtp-greedy-tail`, `--ssd-budget-gb`, `--ssd-prefetch`, `--preserve-thinking`, `--think-penalty`, `--vision/--no-vision`, `--max-tokens`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
   `model-settings.json` key ([engine-mtp](engine-mtp.md#depth-range)).
@@ -174,7 +174,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
   the file can only turn it off, or on for an SSD-streamed pack.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
-  `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `ssd_prefetch` (0..100; ignored with a log line on an arch with no expert prefetcher, whereas the flag is refused there), `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`), stamped at BOTH load construction sites and resolved
+  `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `ssd_prefetch` (0..100; ignored with a log line on an arch with no expert prefetcher, whereas the flag is refused there), `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`, `max_tokens`: the per-model twin of `--max-tokens`, a positive integer at most the model's context, the omitted-`max_tokens` budget of `ModelConfig.defaultMaxTokens`), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw

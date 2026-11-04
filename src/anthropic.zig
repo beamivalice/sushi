@@ -50,7 +50,6 @@ const placeRequestMedia = request_media.placeRequestMedia;
 const prepareRequestMedia = request_media.prepareRequestMedia;
 const visionPreprocFromConfig = request_media.visionPreprocFromConfig;
 const request_policy = @import("request_policy.zig");
-const resolveSamplingDefault = request_policy.resolveSamplingDefault;
 const resolveThinkPenalty = request_policy.resolveThinkPenalty;
 const armThinkPenalty = request_policy.armThinkPenalty;
 const launchMaxTokensDefault = request_policy.launchMaxTokensDefault;
@@ -503,9 +502,9 @@ pub fn handleAnthropicMessages(
     // model's generation_config.json — Claude Code omits ALL of them, and the
     // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
     // intended envelope (model card wants top_k=20, top_p=0.95).
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_mod.server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_mod.server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_mod.server_config.default_top_k, config.gen_top_k, 0);
+    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature", 0.0, 2.0));
+    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p", 0.0, 1.0));
+    const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Stop sequences

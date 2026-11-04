@@ -75,6 +75,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - A prompt that tokenizes to zero tokens is a 400 `invalid_request_error` and never reaches generate: completions
   refuse it after tokenizing, `Scheduler.submit` refuses it for every surface (`error.EmptyPrompt`), and
   `Generator.initWithOptions` returns that error rather than index the prompt's last token.
+- `/v1/models` `meta.default_max_tokens`, `default_temperature`, `default_top_p` and `default_top_k` on a loaded model's row are what a request that omits the field gets (`--max-tokens` / the `max_tokens` setting / the architecture's own, 0 = the rest of the window; then a launch flag > `generation_config.json` > the hardcoded value, `request_policy.sampling*`); the chat page's placeholders read them.
 - `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash"}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it.
 - `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
@@ -364,6 +365,11 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
   null while the model is not loaded and otherwise `{key: value|null}` for every key: the file value the load stamped
   (null: the file had none then), in the shape of `settings.<key>.file`, so a page tells "saved differs from loaded".
+  A ready model's row also carries `defaults`, `{key: value}` for the keys whose unset value the server can state (null while the model
+  is not loaded): `settings_api.resolvedDefaults` reads it from the loader's own resolvers on the config with the file's values and the
+  launch flags cleared, so it is never a flag's value. `ctx_size` and `ssd_budget_gb` are absent (measured at load); `max_tokens` is
+  0 when the model has no output budget of its own and an omitted `max_tokens` takes the rest of the window. A page writes "Default (value)"
+  from it and a bare "Default" when a key is absent.
   Each row also carries `limits`, an object holding an entry only for a key the model constrains (`model_settings.limit`, read
   from the same `Fit` the loader's gates use): `disabled: true` (the loader ignores the key; every key missing from `keys` has
   one), `choices` (the subset a choice key takes: GLM's `kv_quant` is `off|6|8`, the widths its MLA latent stores), `max`

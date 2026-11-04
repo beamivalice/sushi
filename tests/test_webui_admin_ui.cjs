@@ -23,9 +23,10 @@ const KEYS = [
   { name: 'mtp', type: 'bool' }, { name: 'mtp_acceptance', type: 'choice', choices: ['exact', 'typical', 'tokenv3'] }, { name: 'mtp_greedy_tail', type: 'bool' },
   { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
   { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' },
+  { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
-const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'mtp_acceptance', 'mtp_greedy_tail', 'preserve_thinking', 'think_penalty'];
+const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'mtp_acceptance', 'mtp_greedy_tail', 'preserve_thinking', 'think_penalty', 'max_tokens'];
 const allKeys = (over = {}) => Object.fromEntries(KEYS.map((k) => [k.name, over[k.name] ?? keyState()]));
 
 // A stub server: its state lives here in node, every call is recorded, and a test can hold a response back.
@@ -55,7 +56,7 @@ function makeServer(opts = {}) {
   };
   const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit', ...(m.pack_update ? { pack_update: m.pack_update } : {}) } })) });
   const settingsBody = () => ({ file: '/h/.sushi/model-settings.json', applies: 'next load of the model', model_keys: KEYS, server: state.server,
-    models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
+    models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, defaults: m.defaults ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
   if (opts.limits) {
     state.models[0].limits = { ctx_size: { max: 131072, why: "This model's context window is 131072 tokens." }, kv_quant: { choices: ['off', '8'], why: '4-bit and 6-bit need a different cache layout.' },
       mtp_acceptance: { requires: { mtp: true }, why: 'Used only while MTP is on.' }, mtp_greedy_tail: { requires: { mtp: true }, why: 'Used only while MTP is on.' } };
@@ -155,6 +156,39 @@ async function main() {
       await page.evaluate(() => { window.__mutations = 0; window.__where = []; });
       await settle(page, 16_000);
       assert.equal(await page.evaluate(() => window.__mutations), 0, `identical answers cause no childList mutation (${await page.evaluate(() => window.__where)})`);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+      // Every Default says what the server would use; a model with no known default keeps the bare word.
+      const server = makeServer();
+      server.state.models[0].defaults = { kv_quant: '8', mtp: true, mtp_acceptance: 'exact', mtp_greedy_tail: false, preserve_thinking: true, think_penalty: 0, vision: false, max_tokens: 256000 };
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A', { viewport, mode: 'advanced' });
+      await page.waitForSelector(`${row('max_tokens')} input`);
+      const first = (key) => page.evaluate((k) => { const r = document.querySelector(`.set[data-key="${k}"]`); const o = r.querySelector('select option'); return o ? o.textContent : r.querySelector('.tri button').textContent; }, key);
+      assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default (256,000)', 'a number shows its default with separators');
+      assert.match(await page.textContent(`${row('max_tokens')} .lab`), /Max output tokens/);
+      assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'placeholder'), 'Default', 'a default measured at load is not guessed');
+      assert.equal(await first('kv_quant'), 'Default (8-bit)', 'a choice shows its label');
+      assert.equal(await first('mtp_acceptance'), 'Default (exact)');
+      assert.equal(await first('mtp'), 'Default (On)', 'a switch shows On or Off');
+      assert.equal(await first('mtp_greedy_tail'), 'Default (Off)');
+      assert.equal(await page.getAttribute(`${row('think_penalty')} input`, 'placeholder'), 'Default (0)');
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'no horizontal overflow');
+      await page.evaluate(() => { window.__mutations = 0; window.__where = []; new MutationObserver((list) => { window.__mutations += list.length; for (const m of list) window.__where.push(`${m.type}:${m.attributeName ?? ''}:${m.target.nodeName}.${m.target.className}`); }).observe(document.querySelector('#modelsDetail .rows'), { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['placeholder'] }); });
+      await settle(page, 16_000);
+      assert.equal(await page.evaluate(() => window.__mutations), 0, `an unchanged poll writes nothing (${await page.evaluate(() => window.__where.slice(0, 5))})`);
+      server.state.models[0].defaults = { ...server.state.models[0].defaults, kv_quant: 'off', max_tokens: 0, mtp: false };
+      await settle(page, 16_000);
+      assert.equal(await first('kv_quant'), 'Default (16-bit)');
+      assert.equal(await first('mtp'), 'Default (Off)');
+      assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default (rest of the context window)', 'no cap of its own means the window');
+      await page.goto(`${ORIGIN}/models#GLM-B`);
+      await page.waitForSelector(`${row('max_tokens')} input`);
+      assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default', 'a model that is not loaded keeps the bare word');
+      assert.equal(await first('kv_quant'), 'Default');
+      assert.equal(await first('mtp'), 'Default');
       assert.deepEqual(errors, []);
       await context.close();
     }
@@ -501,7 +535,7 @@ async function main() {
       assert.equal(await page.isVisible('.callout'), false, 'saving the loaded value back clears the prompt even after an earlier save');
       await page.click('#navSettings');
       await page.waitForSelector('#cacheRows tr');
-      assert.equal(await page.getAttribute('#cacheGb', 'placeholder'), '30', 'the placeholder is what the next load starts from');
+      assert.equal(await page.getAttribute('#cacheGb', 'placeholder'), 'Default (30)', 'the placeholder is what the next load starts from');
       const clears = page.locator('#cacheRows button:text-is("Clear…")');
       assert.equal(await clears.count(), 3, 'every stale row can be cleared on its own, and the loaded one');
       await page.click('#cacheRows tr:has-text("22.1") button');

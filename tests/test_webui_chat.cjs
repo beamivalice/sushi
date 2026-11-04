@@ -91,6 +91,23 @@ const opened = [];
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
+test('the generation fields say what the model uses unset, and a model that cannot say keeps the bare word', async ({ browser }) => {
+  const known = model({ id: 'Known', meta: { default_max_tokens: 256000, default_temperature: 1, default_top_p: 0.95, default_top_k: 20 } });
+  const windowed = model({ id: 'Windowed', meta: { default_max_tokens: 0, default_temperature: 0.6, default_top_p: 1, default_top_k: 0 } });
+  const cold = model({ id: 'Cold', state: 'unloaded', loaded: false });
+  const stub = await startStub({ models: [known, windowed, cold] });
+  const { page, errors } = await open(browser, stub);
+  const placeholders = () => page.evaluate(() => ['optMaxTokens', 'optTemperature', 'optTopP', 'optTopK'].map((id) => document.getElementById(id).placeholder));
+  await page.selectOption('#modelSelect', 'Known');
+  assert.deepEqual(await placeholders(), ['Default (256,000)', 'Default (1.0)', 'Default (0.95)', 'Default (20)']);
+  await page.selectOption('#modelSelect', 'Windowed');
+  assert.deepEqual(await placeholders(), ['Default (rest of the context window)', 'Default (0.6)', 'Default (1.0)', 'Default (off)']);
+  await page.selectOption('#modelSelect', 'Cold');
+  assert.deepEqual(await placeholders(), ['Default', 'Default', 'Default', 'Default']);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+  assert.deepEqual(errors, []);
+});
+
 test('a stream that breaks keeps the words already shown, saved as an interrupted reply with Retry', async ({ browser }) => {
   for (const mode of ['destroy', 'errorEvent', 'cleanClose']) {
     const stub = await startStub({

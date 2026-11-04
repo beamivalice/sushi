@@ -89,7 +89,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `--max-tokens` | `100` offline; serve: default for requests that omit it, else the rest of the window (DeepSeek-V4.1: 256,000) (main.zig:649) | operator | help, usage; 9 tests | keep |
+| `--max-tokens` | `100` offline; serve: default for requests that omit it, else the model's `max_tokens` setting, else the rest of the window (DeepSeek-V4.1: 256,000) (main.zig:649) | operator | help, usage; 9 tests | keep |
 | `--temp` | `0` offline; serve: default temperature before `generation_config.json` (main.zig:653) | operator | help, usage; 2 tests | keep |
 | `--top-p` | model config → serve default for requests that omit it (main.zig:657) | operator | help; 1 test | keep |
 | `--top-k` | model config → serve default for requests that omit it (main.zig:660) | operator | help; 1 test | keep |

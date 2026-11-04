@@ -395,12 +395,19 @@ pub fn renderModelEntry(
         defer allocator.free(gen_top_p_str);
         const gen_top_k_str = try optSamplingRecJson(allocator, u32, config.gen_top_k);
         defer allocator.free(gen_top_k_str);
+        const defaults_str = try std.fmt.allocPrint(allocator, "\"default_max_tokens\":{d},\"default_temperature\":{d},\"default_top_p\":{d},\"default_top_k\":{d}", .{
+            request_policy.filledMaxTokens(config),
+            request_policy.samplingTemperature(config, null),
+            request_policy.samplingTopP(config, null),
+            request_policy.samplingTopK(config, null),
+        });
+        defer allocator.free(defaults_str);
         const pack_revision_str = try packRevisionJson(allocator, config);
         defer allocator.free(pack_revision_str);
 
         const pack_update_part = try pack_update.rowFragment(allocator, entry.path);
         defer allocator.free(pack_update_part);
-        const pack_tail = try std.fmt.allocPrint(allocator, "{s}{s}", .{ pack_revision_str, pack_update_part });
+        const pack_tail = try std.fmt.allocPrint(allocator, "{s},{s}{s}", .{ pack_revision_str, defaults_str, pack_update_part });
         defer allocator.free(pack_tail);
 
         var streaming_buf: [96]u8 = undefined;

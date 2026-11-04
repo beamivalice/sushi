@@ -64,7 +64,7 @@ pub var prefill_chunk_explicit: bool = false;
 
 /// Set once by the serve CLI before request construction. Direct callers may
 /// override it through InitOptions; exact remains the library default.
-pub var mtp_acceptance_default: mtp_acceptance.Mode = .exact;
+pub var mtp_acceptance_default: mtp_acceptance.Mode = model_settings.default_mtp_acceptance;
 /// `--mtp-typical` / `--mtp-tokenv3` chose the default above.
 pub var mtp_acceptance_explicit: bool = false;
 

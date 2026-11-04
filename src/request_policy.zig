@@ -45,6 +45,19 @@ pub fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config
     return request orelse cli orelse gen_config orelse fallback;
 }
 
+/// The sampler values a request that omits them gets on this model; `request` is the body's own value.
+pub fn samplingTemperature(config: *const model_mod.ModelConfig, request: ?f32) f32 {
+    return resolveSamplingDefault(f32, request, server.server_config.default_temperature, config.gen_temperature, 1.0);
+}
+
+pub fn samplingTopP(config: *const model_mod.ModelConfig, request: ?f32) f32 {
+    return resolveSamplingDefault(f32, request, server.server_config.default_top_p, config.gen_top_p, 1.0);
+}
+
+pub fn samplingTopK(config: *const model_mod.ModelConfig, request: ?u32) u32 {
+    return resolveSamplingDefault(u32, request, server.server_config.default_top_k, config.gen_top_k, 0);
+}
+
 /// The in-stream thinking bound needs atomic think markers.
 fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
     if (lm.transformer == null) return false;
@@ -55,7 +68,7 @@ fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 /// model-settings.json > off.
 pub fn resolveThinkPenalty(root: std.json.ObjectMap, flag: ?f32, setting: ?f32) f32 {
     if (parseJsonFloatOpt(root, "think_penalty", 0, model_settings.think_penalty_max)) |v| return v;
-    return model_settings.pick(f32, flag, setting, 0).value;
+    return model_settings.pick(f32, flag, setting, model_settings.default_think_penalty).value;
 }
 
 /// The penalty for one request: off unless it thinks, lambda > 0 and its span is trackable
@@ -675,6 +688,24 @@ test "an omitted max_tokens: --max-tokens, else the architecture's own default, 
     try t.expectEqual(@as(u32, 4096), filledMaxTokens(&dsv41));
 }
 
+test "an omitted max_tokens: --max-tokens, else the model's max_tokens setting, else the architecture's default, else the window" {
+    const t = std.testing;
+    const slot = &@field(server.server_config, "default_max_tokens");
+    const orig = slot.*;
+    defer slot.* = orig;
+    slot.* = 0;
+    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .pinned_context = 1_000_000, .serve_defaults = @import("dsv41/dsv41_config.zig").Config.serveDefaults(model_mod.ServeDefaults) };
+    var qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp", .pinned_context = 1_000_000 };
+    dsv41.max_tokens_override = 50_000;
+    qwen.max_tokens_override = 12_000;
+    try t.expectEqual(@as(u32, 50_000), omittedMaxTokensDefault(&dsv41));
+    try t.expectEqual(@as(u32, 12_000), omittedMaxTokensDefault(&qwen));
+    try t.expectEqual(@as(u32, 12_000), filledMaxTokens(&qwen));
+    slot.* = 4096;
+    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(&dsv41));
+    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(&qwen));
+}
+
 test "describeMaxTokens: an omitted max_tokens logs as auto, never as the sentinel" {
     const t = std.testing;
     var buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
@@ -1265,4 +1296,26 @@ test "thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo
     }
     for ([_][]const u8{ "off", "none" }) |w| try std.testing.expect(!(try reasoningEffortFromWord(w, -1, true, mimo)).enable);
     try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", -1, true, mimo));
+}
+
+test "the sampler values an omitted field gets: launch flag, else the model's generation_config, else the fallback" {
+    const t = std.testing;
+    const cfg_slot = &server.server_config;
+    const saved = .{ cfg_slot.default_temperature, cfg_slot.default_top_p, cfg_slot.default_top_k };
+    defer {
+        cfg_slot.default_temperature, cfg_slot.default_top_p, cfg_slot.default_top_k = saved;
+    }
+    cfg_slot.default_temperature = null;
+    cfg_slot.default_top_p = null;
+    cfg_slot.default_top_k = null;
+    var bare = model_mod.ModelConfig{};
+    try t.expectEqual(@as(f32, 1.0), samplingTemperature(&bare, null));
+    try t.expectEqual(@as(f32, 1.0), samplingTopP(&bare, null));
+    try t.expectEqual(@as(u32, 0), samplingTopK(&bare, null));
+    var tuned = model_mod.ModelConfig{ .gen_temperature = 0.6, .gen_top_p = 0.95, .gen_top_k = 20 };
+    try t.expectEqual(@as(f32, 0.6), samplingTemperature(&tuned, null));
+    try t.expectEqual(@as(u32, 20), samplingTopK(&tuned, null));
+    cfg_slot.default_temperature = 0.3;
+    try t.expectEqual(@as(f32, 0.3), samplingTemperature(&tuned, null));
+    try t.expectEqual(@as(f32, 0.9), samplingTemperature(&tuned, 0.9));
 }

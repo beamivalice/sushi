@@ -167,6 +167,13 @@ check "the model key reads back with source file" \
 check "the file holds the model's path as the key" "$(jq -e --arg p "$MODELS/alpha" '.[$p].kv_quant == "4"' "$WORK/home/.sushi/model-settings.json" >/dev/null && echo 1 || echo 0)"
 post /v1/settings '{"model":"alpha","set":{"kv_quant":null,"think_penalty":null}}' >/dev/null
 check "null removes the keys" "$(get /v1/settings | jq '.models[0].settings | (.kv_quant.file == null) and (.think_penalty.source == "default")')"
+check "max_tokens is a listed key" "$(get /v1/settings | jq '(.model_keys | map(.name) | index("max_tokens")) != null')"
+check "max_tokens 0 is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"max_tokens":0}}' | jq -r .error.type)" invalid_setting)"
+check "max_tokens is saved" "$(post /v1/settings '{"model":"alpha","set":{"max_tokens":32000}}' | jq '.ok')"
+check "and reads back from the file" "$(get /v1/settings | jq '.models[0].settings.max_tokens | (.file == 32000) and (.source == "file")')"
+check "a model that is not loaded reports no defaults" "$(get /v1/settings | jq '.models[0].defaults == null')"
+post /v1/settings '{"model":"alpha","set":{"max_tokens":null}}' >/dev/null
+check "null removes max_tokens" "$(get /v1/settings | jq '.models[0].settings.max_tokens | (.file == null) and (.source == "default")')"
 check "the SSD cache size is saved" "$(post /v1/settings '{"server":{"prefix_cache_disk_gb":7}}' | jq '.ok')"
 check "and read back" "$(get /v1/settings | jq '.server.prefix_cache_disk_gb | (.file == 7) and (.source == "file")')"
 check "a models_dir that is not a folder is refused" "$(is "$(post /v1/settings "{\"server\":{\"models_dir\":\"$WORK/missing\"}}" | jq -r .error.type)" invalid_setting)"

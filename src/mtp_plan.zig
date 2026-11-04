@@ -26,7 +26,7 @@ pub fn mtpAcceptanceFor(setting: ?mtp_acceptance.Mode) model_settings.Pick(mtp_a
 
 /// THIS model's greedy tail: the launch flag > its `mtp_greedy_tail` > off.
 pub fn mtpGreedyTailFor(setting: ?bool) model_settings.Pick(bool) {
-    return model_settings.pick(bool, model_settings.launchFlag(bool, true, generate.mtp_greedy_tail_explicit), setting, false);
+    return model_settings.pick(bool, model_settings.launchFlag(bool, true, generate.mtp_greedy_tail_explicit), setting, model_settings.default_mtp_greedy_tail);
 }
 
 /// Per-prefill state for the adaptive width; lives on `runPrefill`'s stack. The policy is

@@ -39,7 +39,6 @@ const PreparedMedia = request_media.PreparedMedia;
 const prepareRequestMedia = request_media.prepareRequestMedia;
 const visionPreprocFromConfig = request_media.visionPreprocFromConfig;
 const request_policy = @import("request_policy.zig");
-const resolveSamplingDefault = request_policy.resolveSamplingDefault;
 const resolveThinkPenalty = request_policy.resolveThinkPenalty;
 const armThinkPenalty = request_policy.armThinkPenalty;
 const omittedMaxTokensDefault = request_policy.omittedMaxTokensDefault;
@@ -492,9 +491,9 @@ fn handleResponsesInner(
     };
     const max_tokens: u32 = req_max_output_tokens orelse
         (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(config));
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_mod.server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_mod.server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_mod.server_config.default_top_k, config.gen_top_k, 0);
+    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature", 0.0, 2.0));
+    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p", 0.0, 1.0));
+    const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
     const frequency_penalty = parseAdditivePenalty(root, "frequency_penalty");
     const repeat_penalty = parseRepeatPenalty(root);
     const presence_penalty = parseAdditivePenalty(root, "presence_penalty");

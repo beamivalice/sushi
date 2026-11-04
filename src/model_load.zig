@@ -213,6 +213,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.think_penalty_override = o.think_penalty;
     config.logit_bias_file_override = o.logit_bias_file;
     config.vision_override = o.vision;
+    config.max_tokens_override = o.max_tokens;
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
@@ -253,7 +254,7 @@ fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelCon
 
 /// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
 pub fn mtpChoiceFor(mtp_enabled: bool, mtp_explicit: bool, config: *const ModelConfig) model_settings.MtpChoice {
-    return model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, true);
+    return model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, model_settings.default_mtp);
 }
 
 /// The streaming gate's verdict on a load's MTP choice (`expert_stream.mtpUnderStreaming`). The gate
@@ -1098,7 +1099,11 @@ pub fn coldLoadDrafterDir(
 /// too) > the per-model `vision` > on, except off on a streamed load that is not DeepSeek-V4.1
 /// (its tower comes out of the expert cache; DeepSeek-V4.1 always streams and keeps images on).
 pub fn visionChoiceFor(config: *const ModelConfig, streamed: bool) model_settings.VisionChoice {
-    return model_settings.VisionChoice.resolve(model_settings.vision_flag, config.vision_override, !streamed or config.isDsv41());
+    return model_settings.VisionChoice.resolve(model_settings.vision_flag, config.vision_override, visionDefaultOn(config, streamed));
+}
+
+pub fn visionDefaultOn(config: *const ModelConfig, streamed: bool) bool {
+    return !streamed or config.isDsv41();
 }
 
 /// Should a cold load bring up the checkpoint's vision tower?
@@ -2039,10 +2044,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
     }
     if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config.chat_template)) {
-        const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
+        const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, model_settings.default_preserve_thinking);
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", model_settings.sourceLabel(keep.source, "--preserve-thinking") });
     }
-    const think = model_settings.pick(f32, model_settings.think_penalty_flag, params.config.think_penalty_override, 0);
+    const think = model_settings.pick(f32, model_settings.think_penalty_flag, params.config.think_penalty_override, model_settings.default_think_penalty);
     if (think.value > 0) log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, model_settings.sourceLabel(think.source, "--think-penalty") });
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
