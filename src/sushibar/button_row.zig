@@ -23,15 +23,18 @@ const symbol_gap: f64 = 5;
 
 const tracking_enter_exit_always_visible: usize = 0x1 | 0x80 | 0x200;
 
-/// `accent` fills the button in the brand orange; `spinner` shows a spinning wheel where the symbol would be.
-pub const Look = struct { label: []const u8, symbol: []const u8, tip: []const u8 = "", accent: bool = false, enabled: bool = true, closes_menu: bool = true, spinner: bool = false };
+/// `accent` fills the button in the brand orange; `spinner` shows a spinning wheel where the symbol would be;
+/// `selector` replaces the button's own action.
+pub const Look = struct { label: []const u8, symbol: []const u8, tip: []const u8 = "", accent: bool = false, enabled: bool = true, closes_menu: bool = true, spinner: bool = false, selector: ?[*:0]const u8 = null };
 
 const brand_orange = [3]f64{ 0xEE, 0x5A, 0x2F };
 
 const Btn = struct {
     view: id = null,
     selector: [*:0]const u8,
+    action: ?[*:0]const u8 = null,
     label: [32:0]u8 = @splat(0),
+    tip: [128:0]u8 = @splat(0),
     symbol: [48:0]u8 = @splat(0),
     accent: bool = false,
     enabled: bool = true,
@@ -158,10 +161,11 @@ fn mouseDown(self: id, _: objc.SEL, _: id) callconv(.c) void {
     if (!objc.trackClick(self, &pressedWhileInside)) return redraw(b);
     b.hover = false;
     msg(void, self, "display", .{});
-    if (!b.closes_menu) return msg(void, target, b.selector, .{self});
+    const selector = b.action orelse b.selector;
+    if (!b.closes_menu) return msg(void, target, selector, .{self});
     msg(void, menu, "cancelTracking", .{});
     // After the menu has closed: an action that opens a window or an alert must not run inside menu tracking.
-    msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.sel(b.selector), self, @as(f64, 0) });
+    msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.sel(selector), self, @as(f64, 0) });
 }
 
 /// `target` receives `showLog:`, `updateButton:` and `quit:`; `top_menu` is closed when one is clicked.
@@ -202,20 +206,17 @@ pub fn create(app_target: id, top_menu: id) id {
 
 fn set(i: usize, look: Look) void {
     const b = &btns[i];
-    if (same(&b.label, look.label) and same(&b.symbol, look.symbol) and b.accent == look.accent and b.enabled == look.enabled and b.spinner == look.spinner) {
-        b.closes_menu = look.closes_menu;
-        return;
-    }
+    b.closes_menu = look.closes_menu;
+    b.action = look.selector;
+    if (same(&b.label, look.label) and same(&b.symbol, look.symbol) and same(&b.tip, look.tip) and b.accent == look.accent and b.enabled == look.enabled and b.spinner == look.spinner) return;
     setZ(&b.label, look.label);
     setZ(&b.symbol, look.symbol);
+    setZ(&b.tip, look.tip);
     b.accent = look.accent;
     b.enabled = look.enabled;
-    b.closes_menu = look.closes_menu;
     b.spinner = look.spinner;
     placeWheel(b);
-    var tip: [128:0]u8 = undefined;
-    setZ(&tip, look.tip);
-    msg(void, b.view, "setToolTip:", .{objc.nsString(&tip)});
+    msg(void, b.view, "setToolTip:", .{objc.nsString(&b.tip)});
     redraw(b);
 }
 
@@ -230,6 +231,10 @@ fn placeWheel(b: *Btn) void {
 
 pub fn setUpdate(look: Look) void {
     set(update_i, look);
+}
+
+pub fn setQuit(look: Look) void {
+    set(quit_i, look);
 }
 
 /// A menu that closed under the pointer sends no exit: the highlight is dropped once the row is off screen.

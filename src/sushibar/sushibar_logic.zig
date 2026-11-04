@@ -199,8 +199,13 @@ pub const View = struct {
     prefilling: bool = false,
     live: ?f64 = null,
     last: ?f64 = null,
+    /// The last request ended `title_last_ms` or more ago: the title drops its speed.
+    last_old: bool = false,
     update_waiting: bool = false,
 };
+
+/// How long the menu bar keeps showing the last request's speed once the server went idle.
+pub const title_last_ms: i64 = 10 * 60_000;
 
 /// Turns polls into the live decode speed (tokens added to the decoding rows over the wall time between two
 /// polls) and remembers the last finished request's speed.
@@ -214,6 +219,8 @@ pub const Tracker = struct {
     live: ?f64 = null,
     last: ?f64 = null,
     last_prefill: ?f64 = null,
+    /// When a request last decoded or finished.
+    last_at_ms: i64 = 0,
 
     /// `now_ms` is read before the request went out, so the next `since` cannot skip a request.
     pub fn observe(self: *Tracker, now_ms: i64, sample: Sample) void {
@@ -224,6 +231,7 @@ pub const Tracker = struct {
             self.since_ms = @max(sample.newest_finished_ms, now_ms);
             if (sample.finished_tps) |t| self.last = t;
             if (sample.finished_prefill_tps) |t| self.last_prefill = t;
+            if (sample.finished_tps != null or self.decoding) self.last_at_ms = now_ms;
             const dt_ms = now_ms - self.prev_ms;
             if (self.prev_n > 0 and dt_ms > 0) {
                 var added: u64 = 0;
@@ -241,8 +249,15 @@ pub const Tracker = struct {
         self.prev_ms = now_ms;
     }
 
-    pub fn view(self: *const Tracker, link: Link) View {
-        return .{ .link = link, .decoding = self.decoding, .prefilling = self.prefilling, .live = self.live, .last = self.last };
+    pub fn view(self: *const Tracker, link: Link, now_ms: i64) View {
+        return .{
+            .link = link,
+            .decoding = self.decoding,
+            .prefilling = self.prefilling,
+            .live = self.live,
+            .last = self.last,
+            .last_old = now_ms - self.last_at_ms >= title_last_ms,
+        };
     }
 };
 
@@ -263,7 +278,7 @@ pub fn title(buf: []u8, v: View) []const u8 {
 
 /// The title shows the last request's speed, not a live one: drawn dim.
 pub fn titleDim(v: View) bool {
-    return v.link == .up and !v.decoding and !v.prefilling and v.last != null;
+    return v.link == .up and !v.decoding and !v.prefilling and v.last != null and !v.last_old;
 }
 
 fn titleBase(buf: []u8, v: View) []const u8 {
@@ -274,8 +289,8 @@ fn titleBase(buf: []u8, v: View) []const u8 {
             std.fmt.bufPrint(buf, "{s} tok/s", .{if (v.live) |t| speedText(&num, t) else "…"})
         else if (v.prefilling)
             std.fmt.bufPrint(buf, "prefill…", .{})
-        else if (v.last) |t|
-            std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, t)})
+        else if (v.last != null and !v.last_old)
+            std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, v.last.?)})
         else
             std.fmt.bufPrint(buf, "", .{}),
     };
@@ -306,6 +321,34 @@ pub fn badge(link: Link, port_taken: bool, crashed: bool) bool {
 /// A server that was answering is gone and nothing sushibar did explains it.
 pub fn stoppedUnexpectedly(was_answering: bool, link: Link, we_stopped: bool, reaped: bool) bool {
     return was_answering and link == .offline and !we_stopped and !reaped;
+}
+
+pub const Activity = struct { link: Link, decoding: bool = false, menu_open: bool = false, changing: bool = false };
+
+pub const poll_fast_ms: i64 = 1000;
+pub const poll_idle_ms: i64 = 5000;
+pub const poll_offline_ms: i64 = 10_000;
+
+/// The wait before the next poll: a second while a request runs, the menu is open or a start, stop, load or update
+/// is under way; longer while the server idles; longest while nothing answers.
+pub fn pollWaitMs(a: Activity) i64 {
+    if (a.decoding or a.menu_open or a.changing) return poll_fast_ms;
+    return if (answering(a.link)) poll_idle_ms else poll_offline_ms;
+}
+
+pub const models_every = 5;
+
+/// `/v1/models` is asked each poll until a model is ready and while one loads, else every `models_every`-th poll.
+pub fn modelsDue(polls_since: u32, ready: bool, loading: bool) bool {
+    return !ready or loading or polls_since >= models_every;
+}
+
+pub const scan_every = 5;
+
+/// The process scan runs each poll while the server does not answer in full (a silent sushi and a port taken are
+/// told apart by it; a 401 needs the pid whose argv holds the key) or the menu is open, else every `scan_every`-th.
+pub fn scanDue(polls_since: u32, link: Link, menu_open: bool) bool {
+    return (link != .up and link != .metrics_off) or menu_open or polls_since >= scan_every;
 }
 
 /// The HTTP status of a poll, or null when nothing answered in time.
@@ -606,6 +649,8 @@ pub const Server = struct {
     port_taken: bool = false,
     /// The watched port was just chosen and the first poll has not come back.
     connecting: bool = false,
+    /// A Stop sent a while ago has not taken: the same pid still listens (`stopStuck`).
+    stop_stuck: bool = false,
 };
 
 pub fn statusLine(buf: []u8, s: Server) []const u8 {
@@ -639,17 +684,44 @@ pub fn enabled(s: Server) Enabled {
     };
 }
 
-pub const ToggleAction = enum { none, start, stop };
+pub const ToggleAction = enum { none, start, stop, force_stop };
 pub const Toggle = struct { label: []const u8, enabled: bool, action: ToggleAction, symbol: []const u8 };
 
 /// The one Start/Stop item: Stop (with an ellipsis when it asks first) wherever a sushi listens on the port.
 pub fn toggle(s: Server, stopping: bool) Toggle {
     if (stopping) return .{ .label = "Stopping…", .enabled = false, .action = .none, .symbol = "hourglass" };
+    if (s.stop_stuck and (s.ours_alive or s.sushi_listening)) return .{ .label = "Force Stop", .enabled = true, .action = .force_stop, .symbol = "xmark.octagon" };
     if (s.ours_alive and s.link == .offline) return .{ .label = "Starting…", .enabled = false, .action = .none, .symbol = "hourglass" };
     if (s.ours_alive or s.sushi_listening)
         return .{ .label = if (s.ours_alive) "Stop Server" else "Stop Server…", .enabled = true, .action = .stop, .symbol = "stop.fill" };
     const can = enabled(s).start;
     return .{ .label = "Start Server", .enabled = can, .action = if (can) .start else .none, .symbol = "play.fill" };
+}
+
+/// The Stop last sent: the pid signalled, its port, and when the menu stops saying Stopping….
+pub const StopSent = struct { pid: i32 = 0, port: u16 = 0, deadline_ms: i64 = 0 };
+
+/// The Stop has not taken: past its deadline the pid it signalled still serves the watched port (`serving_pid`: the
+/// started server's verified pid, else the sushi listening there).
+pub fn stopStuck(sent: StopSent, watched: u16, now_ms: i64, serving_pid: i32) bool {
+    return sent.pid > 0 and sent.port == watched and now_ms >= sent.deadline_ms and serving_pid == sent.pid;
+}
+
+pub fn stuckNote(buf: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buf, "Port {d}: the server did not stop", .{port}) catch "The server did not stop";
+}
+
+pub const QuitButton = struct { label: []const u8, tip: []const u8, stops: bool };
+
+/// Quit leaves the servers sushibar started running; with Option held while there are any, it stops them too.
+pub fn quitButton(buf: []u8, option: bool, started: usize) QuitButton {
+    if (started == 0) return .{ .label = "Quit", .tip = "Quit sushibar (⌘Q)", .stops = false };
+    if (!option) return .{ .label = "Quit", .tip = if (started == 1) "Quit sushibar (⌘Q); the server it started keeps running. Hold ⌥ to stop it too" else "Quit sushibar (⌘Q); the servers it started keep running. Hold ⌥ to stop them too", .stops = false };
+    const tip = if (started == 1)
+        "Quit sushibar and stop the server it started"
+    else
+        std.fmt.bufPrint(buf, "Quit sushibar and stop the {d} servers it started", .{started}) catch "Quit sushibar and stop the servers it started";
+    return .{ .label = "Quit & Stop", .tip = tip, .stops = true };
 }
 
 /// The pages need a server that answers.
@@ -940,7 +1012,36 @@ const ProcArgs = struct {
         self.left -= 1;
         return self.it.next();
     }
+
+    /// `name`'s value in the environment that follows the arguments; call once `next` is done.
+    fn env(self: *ProcArgs, name: []const u8) ?[]const u8 {
+        while (self.it.next()) |e| {
+            if (e.len > name.len and e[name.len] == '=' and std.mem.startsWith(u8, e, name)) return e[name.len + 1 ..];
+        }
+        return null;
+    }
 };
+
+/// The key the server was started with: `--api-key <key>`, or `--api-key-env <VAR>` read from the server's own
+/// environment; the last of them wins, as the server reads them. Null with none or an empty one.
+pub fn argsApiKey(args: []const u8) ?[]const u8 {
+    var it = ProcArgs.init(args) orelse return null;
+    var prev: []const u8 = "";
+    var key: ?[]const u8 = null;
+    var var_name: ?[]const u8 = null;
+    while (it.next()) |a| : (prev = a) {
+        if (std.mem.eql(u8, prev, "--api-key")) {
+            key = a;
+            var_name = null;
+        } else if (std.mem.eql(u8, prev, "--api-key-env")) {
+            var_name = a;
+            key = null;
+        }
+    }
+    if (var_name) |n| key = it.env(n);
+    const k = key orelse return null;
+    return if (k.len > 0) k else null;
+}
 
 pub fn argsServe(args: []const u8, port: u16) bool {
     var it = ProcArgs.init(args) orelse return false;
@@ -1102,6 +1203,13 @@ pub const Exit = union(enum) { code: u8, signal: u8 };
 pub fn exitOf(status: u32) Exit {
     const sig: u8 = @intCast(status & 0x7f);
     return if (sig == 0) .{ .code = @intCast((status >> 8) & 0xff) } else .{ .signal = sig };
+}
+
+pub const note_kept_ms: i64 = 60_000;
+
+/// A note with news, not a problem, is dropped when the menu opens a minute or more after it was given.
+pub fn noteKept(problem: bool, at_ms: i64, open_ms: i64) bool {
+    return problem or open_ms - at_ms < note_kept_ms;
 }
 
 /// The longest a note is drawn in the menu; the item's tooltip has the rest, so the menu keeps its width.
@@ -2138,9 +2246,14 @@ test "pid file: parse, format, and refuse anything else" {
 }
 
 fn procargs(comptime argv: []const []const u8) []const u8 {
+    return procargsEnv(argv, &.{"HOME=/x"});
+}
+
+fn procargsEnv(comptime argv: []const []const u8, comptime envp: []const []const u8) []const u8 {
     comptime var out: []const u8 = &std.mem.toBytes(@as(i32, argv.len)) ++ "/bin/" ++ argv[0] ++ "\x00\x00\x00";
     inline for (argv) |a| out = out ++ a ++ "\x00";
-    return out ++ "HOME=/x\x00";
+    inline for (envp) |e| out = out ++ e ++ "\x00";
+    return out;
 }
 
 test "pid file: a stale, reused or foreign pid is not alive" {
@@ -2341,4 +2454,103 @@ test "log scroll: following resumes only at the bottom" {
     try std.testing.expect(atBottom(990, 1000));
     try std.testing.expect(!atBottom(600, 1000));
     try std.testing.expect(atBottom(1200, 1000));
+}
+
+test "title: the last request's speed leaves the menu bar after ten idle minutes, the card keeps it" {
+    var t: Tracker = .{};
+    t.observe(1_000, .{ .link = .up, .finished_tps = 42 });
+    var b: [64]u8 = undefined;
+    const fresh = t.view(.up, 1_000 + title_last_ms - 1);
+    try std.testing.expectEqualStrings("42.0 tok/s", title(&b, fresh));
+    try std.testing.expect(titleDim(fresh));
+    const old = t.view(.up, 1_000 + title_last_ms);
+    try std.testing.expectEqualStrings("", title(&b, old));
+    try std.testing.expect(!titleDim(old) and old.last.? == 42);
+    t.observe(2_000_000, .{ .link = .up, .decoding = &.{.{ .request_id = 1, .generated = 1 }} });
+    t.observe(2_001_000, .{ .link = .up });
+    try std.testing.expectEqualStrings("42.0 tok/s", title(&b, t.view(.up, 2_000_000 + title_last_ms - 1)));
+}
+
+test "poll cadence: a second while something moves or the menu is open, slower idle, slowest offline" {
+    try std.testing.expectEqual(poll_fast_ms, pollWaitMs(.{ .link = .up, .decoding = true }));
+    try std.testing.expectEqual(poll_fast_ms, pollWaitMs(.{ .link = .offline, .menu_open = true }));
+    try std.testing.expectEqual(poll_fast_ms, pollWaitMs(.{ .link = .offline, .changing = true }));
+    try std.testing.expectEqual(poll_idle_ms, pollWaitMs(.{ .link = .up }));
+    try std.testing.expectEqual(poll_idle_ms, pollWaitMs(.{ .link = .unauthorized }));
+    try std.testing.expectEqual(poll_offline_ms, pollWaitMs(.{ .link = .offline }));
+    try std.testing.expectEqual(poll_offline_ms, pollWaitMs(.{ .link = .silent }));
+    try std.testing.expect(poll_fast_ms < poll_idle_ms and poll_idle_ms < poll_offline_ms);
+}
+
+test "poll cadence: models are asked each poll until one is ready and while one loads, then every fifth" {
+    try std.testing.expect(modelsDue(0, false, false));
+    try std.testing.expect(modelsDue(1, true, true));
+    try std.testing.expect(!modelsDue(1, true, false));
+    try std.testing.expect(!modelsDue(models_every - 1, true, false));
+    try std.testing.expect(modelsDue(models_every, true, false));
+}
+
+test "poll cadence: the process scan runs each poll until the server answers in full or while the menu is open, else every fifth" {
+    try std.testing.expect(scanDue(1, .offline, false));
+    try std.testing.expect(scanDue(1, .silent, false));
+    try std.testing.expect(scanDue(1, .unauthorized, false));
+    try std.testing.expect(scanDue(1, .up, true));
+    try std.testing.expect(!scanDue(1, .up, false));
+    try std.testing.expect(!scanDue(scan_every - 1, .metrics_off, false));
+    try std.testing.expect(scanDue(scan_every, .up, false));
+}
+
+test "api key: the server's own --api-key, or the variable --api-key-env names in its environment, last flag wins" {
+    try std.testing.expectEqualStrings("s3cret", argsApiKey(procargs(&.{ "sushi", "--serve", "--api-key", "s3cret", "--api-key-strict" })).?);
+    const env_key = procargsEnv(&.{ "sushi", "--serve", "--api-key-env", "SUSHI_KEY" }, &.{ "HOME=/x", "SUSHI_KEY=from-env", "SUSHI_KEY_2=no" });
+    try std.testing.expectEqualStrings("from-env", argsApiKey(env_key).?);
+    try std.testing.expectEqualStrings("b", argsApiKey(procargsEnv(&.{ "sushi", "--api-key-env", "K", "--api-key", "b" }, &.{"K=a"})).?);
+    try std.testing.expectEqualStrings("a", argsApiKey(procargsEnv(&.{ "sushi", "--api-key", "b", "--api-key-env", "K" }, &.{"K=a"})).?);
+    try std.testing.expect(argsApiKey(procargs(&.{ "sushi", "--serve" })) == null);
+    try std.testing.expect(argsApiKey(procargs(&.{ "sushi", "--api-key" })) == null);
+    try std.testing.expect(argsApiKey(procargs(&.{ "sushi", "--api-key", "" })) == null);
+    try std.testing.expect(argsApiKey(procargsEnv(&.{ "sushi", "--api-key-env", "MISSING" }, &.{"MISSING_NOT=x"})) == null);
+    try std.testing.expect(argsApiKey(procargsEnv(&.{ "sushi", "--api-key-env", "K" }, &.{"K="})) == null);
+    try std.testing.expect(argsApiKey(procargs(&.{ "sushi", "--model", "--api-key-env" })) == null);
+}
+
+test "force stop: a Stop that has not taken after its wait offers Force Stop on the pid it signalled" {
+    const sent: StopSent = .{ .pid = 50, .port = 18801, .deadline_ms = 15_000 };
+    try std.testing.expect(stopStuck(sent, 18801, 15_000, 50));
+    try std.testing.expect(!stopStuck(sent, 18801, 14_999, 50));
+    try std.testing.expect(!stopStuck(sent, 18801, 20_000, 0));
+    try std.testing.expect(!stopStuck(sent, 18801, 20_000, 51));
+    try std.testing.expect(!stopStuck(sent, 18802, 20_000, 50));
+    try std.testing.expect(!stopStuck(.{}, 0, 20_000, 0));
+    const ours = toggle(.{ .link = .up, .ours_alive = true, .stop_stuck = true }, false);
+    try std.testing.expectEqualStrings("Force Stop", ours.label);
+    try std.testing.expect(ours.enabled and ours.action == .force_stop);
+    const silent = toggle(.{ .link = .silent, .sushi_listening = true, .stop_stuck = true }, false);
+    try std.testing.expect(silent.action == .force_stop);
+    try std.testing.expect(toggle(.{ .link = .offline, .ours_alive = true, .stop_stuck = true }, false).action == .force_stop);
+    try std.testing.expect(toggle(.{ .link = .offline, .stop_stuck = true }, false).action == .start);
+    var b: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Port 18801: the server did not stop", stuckNote(&b, 18801));
+    try std.testing.expect(stuckNote(&b, 65535).len <= note_title_max);
+}
+
+test "note: news goes when the menu opens a minute after it was given, a problem stays" {
+    try std.testing.expect(noteKept(false, 1_000, 1_000 + note_kept_ms - 1));
+    try std.testing.expect(!noteKept(false, 1_000, 1_000 + note_kept_ms));
+    try std.testing.expect(noteKept(true, 1_000, 1_000 + 10 * note_kept_ms));
+}
+
+test "quit: plain Quit leaves a started server running and says so; with Option it is Quit & Stop" {
+    var b: [160]u8 = undefined;
+    const plain = quitButton(&b, false, 0);
+    try std.testing.expectEqualStrings("Quit", plain.label);
+    try std.testing.expect(!plain.stops);
+    try std.testing.expect(!quitButton(&b, true, 0).stops);
+    const kept = quitButton(&b, false, 1);
+    try std.testing.expectEqualStrings("Quit", kept.label);
+    try std.testing.expect(std.mem.indexOf(u8, kept.tip, "keeps running") != null and std.mem.indexOf(u8, kept.tip, "⌥") != null);
+    const both = quitButton(&b, true, 2);
+    try std.testing.expectEqualStrings("Quit & Stop", both.label);
+    try std.testing.expect(both.stops and std.mem.indexOf(u8, both.tip, "2 servers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quitButton(&b, true, 1).tip, "the server it started") != null);
 }

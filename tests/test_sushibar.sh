@@ -152,6 +152,22 @@ check "Stop without a confirm leaves a sushi sushibar did not start running" "$(
 check "that status offered Stop" "$(yes_if 'grep -q "poll 1 .*Port '"$FPORT"': running.*stop=1" "$LOG"')"
 kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
 
+echo "== a server that wants its API key even from loopback =="
+"$SUSHI_BIN" --serve --port "$FPORT" --api-key sb-test-key --api-key-strict > /dev/null 2>&1 &
+FPID=$!
+for _ in $(seq 1 40); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FPORT/metrics.json")" = 401 ] && break; sleep 0.5; done
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FPORT/metrics.json")
+check "the strict server refuses a request without its key" "$(yes_if '[ "$code" = 401 ]')"
+run_bar "$BAR" 3 "" --port "$FPORT"
+check "sushibar sends the key the server's argv gives it and reads the server as running" "$(yes_if 'grep -q "poll [23] .*Port '"$FPORT"': running, no model loaded\" .*badge=0" "$LOG" && ! grep -q "Key needed" "$LOG"')"
+kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
+SB_TEST_KEY=sb-env-key "$SUSHI_BIN" --serve --port "$FPORT" --api-key-env SB_TEST_KEY --api-key-strict > /dev/null 2>&1 &
+FPID=$!
+for _ in $(seq 1 40); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FPORT/metrics.json")" = 401 ] && break; sleep 0.5; done
+run_bar "$BAR" 3 "" --port "$FPORT"
+check "a key from --api-key-env is read from the server's own environment" "$(yes_if 'grep -q "poll [23] .*Port '"$FPORT"': running, no model loaded\"" "$LOG" && ! grep -q "Key needed" "$LOG"')"
+kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
+
 echo "== the Port field: an invalid number is refused in place, a valid one switches =="
 run_bar "$BAR" 8 "type99999@2,type$FPORT@5" --port "$PORT"
 check "an invalid port turns the field red and keeps the watched port" "$(yes_if 'grep -q "poll [2-4] .*Port '"$PORT"':.*field_invalid=1" "$LOG"')"

@@ -116,6 +116,10 @@ pub fn terminate(pid: i32) void {
     _ = std.c.kill(pid, .TERM);
 }
 
+pub fn kill(pid: i32) void {
+    _ = std.c.kill(pid, .KILL);
+}
+
 const prox_fdtype_socket = 2;
 const proc_all_pids = 1;
 const proc_pidlistfds = 1;

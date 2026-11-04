@@ -70,10 +70,11 @@ pub fn new(cls: id) id {
     return msg(id, msg(id, cls, "alloc", .{}), "init", .{});
 }
 
-/// Calls `[target selector:timer]` every `seconds` on the main run loop, menu tracking included.
-pub fn addTimer(seconds: f64, target: id, selector: [*:0]const u8) void {
+/// Calls `[target selector:timer]` every `seconds` on the main run loop, menu tracking included; `invalidate` stops it.
+pub fn addTimer(seconds: f64, target: id, selector: [*:0]const u8) id {
     const timer = msg(id, class("NSTimer"), "timerWithTimeInterval:target:selector:userInfo:repeats:", .{ seconds, target, sel_registerName(selector), @as(id, null), true });
     msg(void, msg(id, class("NSRunLoop"), "mainRunLoop", .{}), "addTimer:forMode:", .{ timer, NSRunLoopCommonModes });
+    return timer;
 }
 
 pub fn copyText(text: [*:0]const u8) void {
