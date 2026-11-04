@@ -93,6 +93,8 @@ check "config gains the member, other keys keep their order" "$(yes_if "config_i
 check "page-aligned shard keeps a page-aligned data start" "$(yes_if "[ \$(python3 -I -c \"import struct;print((8+struct.unpack('<Q',open('$P/$S2','rb').read(8))[0])%16384)\") -eq 0 ]")"
 check "no temp or lock file left" "$(yes_if "[ -z \"\$(ls -A $P | grep -E 'stamp-tmp|lock')\" ]")"
 "$BIN" repack "$P" --check >/dev/null 2>&1; check "--check passes" "$(yes_if "[ $? -eq 0 ]")"
+"$BIN" repack "$P" --check >"$WORK/out" 2>&1; check "--check never sets up MLX" "$(yes_if "! grep -q '\[mem\]' $WORK/out")"
+"$BIN" --version >"$WORK/out" 2>&1; check "--version never sets up MLX" "$(yes_if "[ -s $WORK/out ] && ! grep -q '\[mem\]' $WORK/out")"
 before="$(tree_hash "$P")"
 "$BIN" repack "$P" --pack-revision 2.0 >/dev/null 2>&1; rc=$?
 check "a rerun exits 0 and changes nothing" "$(yes_if "[ $rc -eq 0 ] && [ \"\$(tree_hash $P)\" = \"$before\" ]")"

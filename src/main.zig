@@ -420,18 +420,35 @@ fn printUsage(io: std.Io) void {
     stdout_w.interface.flush() catch {};
 }
 
+/// False for the commands and flags that never touch MLX, so they do not wake Metal.
+fn commandUsesGpu(proc_args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(proc_args);
+    _ = it.next();
+    var first = true;
+    while (it.next()) |a| {
+        if (first and (std.mem.eql(u8, a, "pull") or std.mem.eql(u8, a, "list") or std.mem.eql(u8, a, "launch") or
+            std.mem.eql(u8, a, "repack") or std.mem.eql(u8, a, "update"))) return false;
+        first = false;
+        if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "--guest-manifest") or
+            std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return false;
+    }
+    return true;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     metrics_history.process.markStarted(io, io_util.nowMs(io));
 
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
-    // above every subcommand branch — a per-serve-path call is how
+    // above every GPU subcommand branch — a per-serve-path call is how
     // `runHeadlessServe` (the mode the app always launches) silently ate the
     // launch flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
-    server_mod.applyMlxCacheLimit();
-    server_mod.resolveMlxCadence();
+    if (commandUsesGpu(init.minimal.args)) {
+        server_mod.applyMlxCacheLimit();
+        server_mod.resolveMlxCadence();
+    }
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
 
