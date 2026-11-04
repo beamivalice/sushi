@@ -2755,6 +2755,8 @@ pub fn warmKernels(m: *Model) !void {
     const n = @min(wide.len, m.cfg.max_pos / 4);
     try warmRun(try extend(m, wide[0..n], .last));
     try warmRun(try extend(m, wide[0 .. n / 6], .last));
+    // The held-back span a prompt's last forward runs (`prefill_plan.ssmSnapshotBackoff` + its last token).
+    try warmRun(try extend(m, wide[0 .. @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1], .last));
     for ([_]usize{ 1, 6 }) |w| try warmRun(try extend(m, ids[0..w], .last));
     if (m.dspark != null) try warmRound(m, ids[0], m.cfg.dspark.block + 1);
 }

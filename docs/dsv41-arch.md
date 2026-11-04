@@ -369,7 +369,7 @@ After CED and the fused gather-attention (budget 96, chunk 1024, synced stage pr
   ms) but not chunk 1's: 7 kernel builds of the sorted-route path (`sushi_exl3_sorted_inverse_reduce`, `_rg_combine`,
   `_mid_swiglu`, `_token_pair_prepare`, `_prepare_h128`, `_finish_h128`) still land in the first request
   (`SUSHI_KERNEL_BUILD_LOG`), likely because 16 distinct ids never route more experts than a pool holds. It added 3.7-4.0 s to a cached
-  boot's load (14.5 against 10.5-10.8 s). Not merged; a warm of those kernels on synthetic shapes is the open fix.
+  boot's load (14.5 against 10.5-10.8 s). Not merged; the spilled-route warm below replaced it.
 - A process-wide `MLX_MAX_MB_PER_BUFFER=500` (decode included) read 1,366 against ~1,359 tok/s at 17.9k and 1,408
   against ~1,404 at 31.5k (two boots, 59e7a562): inside the noise.
 
@@ -1070,6 +1070,14 @@ The f16 attention arm's KLD run (the kernel is in, `Model.attn_f16` off); the li
   the attention split count were template args, so a context under 512 tokens (the ratio-1 layers' top-k width grows
   every token) or a new prompt length built new libraries. They are read at run time now. Row counts of 1..16 stay
   template args of the row kernels (register tiles), so the load runs every decode width and DSpark verify width once,
-  then a CED chunk of 256 rows and a 42-row chunk, on a throwaway state (`dsv41_model.warmKernels`, logged `[dsv41]
-  kernels warmed ... in N ms`); after it nothing compiles but the streamed index top-k past 32k keys
-  (`dsv41 kernels:` tests, `SUSHI_KERNEL_BUILD_LOG=1`).
+  then a CED chunk of 256 rows, a 42-row chunk and the 31-row held-back span, on a throwaway state
+  (`dsv41_model.warmKernels`, logged `[dsv41] kernels warmed ... in N ms`), then a spilled route's prefill chain at
+  the prefill width over one layer's own pools on rows of zeros (`StqStream.warmSplit`: no read, no cache change); after
+  it nothing compiles but the streamed index top-k past 32k keys (`dsv41 kernels:` tests, `SUSHI_KERNEL_BUILD_LOG=1`).
+- On a boot whose shader cache does not hold the kernels, the first long prompt compiled 11 libraries before the
+  spilled-route warm and the 31-row span (the 7 of the spilled chain in chunk 1, 4 sorted GEMMs in the 31-row pass)
+  and none after it. f000eb90 + this warm against 49960372 (pack revision 2.0, `--ssd-budget-gb 108`, `taskpolicy -a`,
+  GPU lock, AC, fans max and under 50 C before each boot, uncached boots): a cold 16,020-token code prompt 1,357 tok/s
+  against 1,179-1,313 (six boots, mean 1,243), chunk 1 2,026 ms against 2,081-3,382, the 31-row pass 188 ms against
+  646-664; the same greedy tokens and top-5 logprobs on all four requests. The warm adds 0.2-0.5 s on a cached boot
+  (10.9 s against 10.4-10.8 s, one cached boot) and the same on an uncached one (38.9 against 37.6-38.1 s).

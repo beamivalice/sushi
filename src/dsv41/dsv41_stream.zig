@@ -168,6 +168,31 @@ pub const StqStream = struct {
         self.bad.deinit(self.engine.allocator);
     }
 
+    /// The prefill chain of a route that spills into the union workspace (more pools than the fused chain takes), run
+    /// once at load over a layer's own pools on `rows` rows of zeros: it compiles what the first spilled route of a long
+    /// prompt would, reads nothing and changes no cache. At the prefill width its picks sort as a wide chunk's do.
+    pub fn warmSplit(self: *StqStream, m: *const model.Model, rows: usize) !void {
+        const engine = self.engine;
+        const li = for (engine.layers, 0..) |*layer, i| {
+            if (layer.active and layer.grouped != null and layer.grouped.?.union_ragged.count == layer.grouped.?.cache_ragged.count) break i;
+        } else return;
+        const gl = engine.layers[li].grouped.?;
+        var overflow: [stream.quant.rate_group_limit]u32 = @splat(1);
+        var bank = try exl3.Ragged.initSplit(engine.s, &gl.cache_ragged, &gl.union_ragged, overflow[0..gl.cache_ragged.count]);
+        defer bank.deinit();
+        var sc = Scope.init(engine.allocator, engine.s);
+        defer sc.deinit();
+        const k: usize = self.cfg.top_k;
+        const ids = try engine.allocator.alloc(i32, rows * k);
+        defer engine.allocator.free(ids);
+        for (ids, 0..) |*id, i| id.* = @intCast(i % bank.experts);
+        const x = try sc.zeros(&.{ @intCast(rows), @intCast(self.cfg.dim) }, m.act);
+        const slots = try sc.ints(ids, &.{ @intCast(rows), @intCast(k) });
+        const wts = try sc.zeros(&.{ @intCast(rows), @intCast(k) }, .float32);
+        const out = try model.stqRoutedEarly(&sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), &bank, x, slots, wts, .{ .layer = .{ .m = m, .li = li } }, null, null);
+        try sc_mod.evalAll(&.{out});
+    }
+
     pub fn hook(self: *StqStream) model.Experts.Hook {
         return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque, .host_ns = hostNsOpaque, .prefetch = prefetchOpaque, .can_prefetch = canPrefetchOpaque, .spec = .{
             .can = canQueue,
@@ -2741,6 +2766,41 @@ test "dsv41 kernels: after the load's warm, prompts of any length, every verify 
             return error.KernelRebuilt;
         }
     };
+}
+
+test "dsv41 kernels: the spilled-route warm reads nothing, leaves every pool as it was, and the served logits are the unwarmed model's bit for bit (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var rows: [2][]f32 = undefined;
+    for (&rows, [_]bool{ false, true }) |*out, warm| {
+        var served: StqServed = undefined;
+        try served.init(dir, .bfloat16, true, false, 3, s);
+        defer served.deinit();
+        if (warm) {
+            const filled = served.engine.fill_experts_total;
+            var before: std.ArrayList(i32) = .empty;
+            defer before.deinit(testing.allocator);
+            for (served.engine.layers) |*layer| if (layer.grouped) |gl| for (gl.caches[0..gl.groups.count]) |c| try before.appendSlice(testing.allocator, c.expert_to_slot);
+            try served.hook.warmSplit(served.m, 400);
+            try testing.expectEqual(filled, served.engine.fill_experts_total);
+            var after: std.ArrayList(i32) = .empty;
+            defer after.deinit(testing.allocator);
+            for (served.engine.layers) |*layer| if (layer.grouped) |gl| for (gl.caches[0..gl.groups.count]) |c| try after.appendSlice(testing.allocator, c.expert_to_slot);
+            try testing.expectEqualSlices(i32, before.items, after.items);
+        }
+        const lg = try model.extend(served.m, ids, .last);
+        defer _ = mlx.mlx_array_free(lg);
+        out.* = try testing.allocator.dupe(f32, try sc_mod.hostF32(lg));
+    }
+    defer for (rows) |r| testing.allocator.free(r);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rows[0]), std.mem.sliceAsBytes(rows[1]));
 }
 
 test "dsv41 kernels: the load's warm leaves no state, and the served logits are the unwarmed model's bit for bit (DSV41_STQ_TINY)" {

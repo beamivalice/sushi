@@ -4,6 +4,7 @@ const dsv41_model = @import("dsv41_model.zig");
 const dsv41_stream = @import("dsv41_stream.zig");
 const kernels = @import("dsv41_kernels.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
+const dsv41_config = @import("dsv41_config.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
 const PrefetchCredit = @import("../prefetch_plan.zig").PrefetchCredit;
 const sushi_exl3 = @import("sushi_exl3");
@@ -71,7 +72,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     // A failed warm costs the first requests their compiles, not the load.
     var clock = expert_stream_mod.Clock.init();
     const had_error = mlx.errorPending();
-    if (dsv41_model.warmKernels(mdl)) {
+    if (warmAll(mdl, shell.dsv41_stq_experts)) {
         log.info("[dsv41] kernels warmed for 1..{d} rows{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", clock.lap() / std.time.ns_per_ms });
     } else |e| {
         mlx.dropLatchedErrorUnless(had_error);
@@ -80,6 +81,11 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     // The warm's transients leave the pool, so the load's memory reading is the model's.
     _ = mlx.mlx_clear_cache();
     return shell;
+}
+
+fn warmAll(mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream) !void {
+    try dsv41_model.warmKernels(mdl);
+    if (stq) |st| try st.warmSplit(mdl, dsv41_config.prefill_width);
 }
 
 /// A pack without the STQ stream has no expert prefetcher: `--ssd-prefetch` or the file's `ssd_prefetch` does nothing there.
