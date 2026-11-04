@@ -55,13 +55,14 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 #appShell { display: flex; flex-direction: column; height: 100dvh; }
 #appTopbar { display: flex; align-items: center; gap: 14px; height: var(--topbar-h); padding: 0 var(--s4); border-bottom: 1px solid var(--border); background: var(--surface); flex: none; z-index: 30; }
 .mark { display: block; flex: none; background: #fff; border-radius: var(--r-md); object-fit: contain; box-shadow: 0 0 0 1px var(--border); }
-.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; color: inherit; text-decoration: none; }
 .brand .mark { width: 30px; height: 30px; }
 .brand .name { font-size: var(--fs-lg); font-weight: 700; letter-spacing: -0.02em; }
 .brand .ver { font-size: var(--fs-xs); font-weight: 600; color: var(--text-3); margin-top: 5px; }
 .spacer { flex: 1; }
-.topbar-actions { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
-.topbar-actions > :not(#serverDot) { flex-shrink: 0; }
+.topbar-actions { display: flex; align-items: center; gap: var(--s2); }
+/* Wide screens: the model name gives up its room first, the controls only once it has none left. */
+@media (min-width: 641px) { .topbar-actions { min-width: 0; } #serverDot { flex-shrink: 100; } }
 #serverDot { display: inline-flex; align-items: center; gap: var(--s2); height: 28px; padding: 0 10px; border: 0; border-radius: var(--r-pill); background: transparent; color: var(--text-2); font-size: var(--fs-sm); min-width: 0; cursor: pointer; }
 #serverDot:hover { background: var(--surface-2); }
 #serverDot b { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -583,11 +584,11 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 
 <div id="appShell">
 <header id="appTopbar">
-  <div class="brand">
+  <a class="brand" href="https://github.com/beamivalice/sushi" target="_blank" rel="noopener" title="sushi on GitHub">
     <img class="mark" alt="" />
     <span class="name">sushi</span>
     <span class="ver num" id="brandVersion"></span>
-  </div>
+  </a>
   <nav id="viewNav" aria-label="Views">
     <a id="navDashboard" href="/dashboard" aria-current="page">Dashboard</a>
     <a id="navChat" href="/chat">Chat</a>
