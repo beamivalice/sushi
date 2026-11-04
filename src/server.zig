@@ -7410,12 +7410,12 @@ fn parseCancelRequestId(allocator: std.mem.Allocator, body: []const u8) ?u64 {
 }
 
 fn handleSlotCancel(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
-    const scheduler = global_scheduler orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is not ready to process requests", 503);
-        return;
-    };
     const target_id = parseCancelRequestId(allocator, request_body) orelse {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"id\": <request_id>}", 400);
+        return;
+    };
+    const scheduler = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is not ready to process requests", 503);
         return;
     };
     if (!scheduler.cancelSlotById(target_id)) {

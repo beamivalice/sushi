@@ -5805,6 +5805,39 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     try testing.expect(cancelled);
 }
 
+test "cancelSlotById cancels the slot with that id in any queue and no other" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.prefilling = .empty;
+    sch.decoding = .empty;
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.prefilling.deinit(testing.allocator);
+    defer sch.decoding.deinit(testing.allocator);
+    var slots: [4]Slot = undefined;
+    for (&slots, 1..) |*slot, id| {
+        slot.io = testing.io;
+        slot.request_id = id;
+        slot.cancelled = .init(false);
+        slot.out_mu = .init;
+        slot.out_cond = .init;
+        slot.out_event = .unset;
+    }
+    try sch.pending.append(testing.allocator, &slots[0]);
+    try sch.prefilling.append(testing.allocator, &slots[1]);
+    try sch.decoding.append(testing.allocator, &slots[2]);
+    try sch.decoding.append(testing.allocator, &slots[3]);
+
+    try testing.expect(!sch.cancelSlotById(99));
+    for (&slots) |*slot| try testing.expect(!slot.cancelled.load(.acquire));
+
+    for ([_]u64{ 1, 2, 3 }) |id| {
+        try testing.expect(sch.cancelSlotById(id));
+        for (&slots) |*slot| try testing.expectEqual(slot.request_id <= id, slot.cancelled.load(.acquire));
+    }
+}
+
 test "a shutdown drain ends a queued request with an error, a client disconnect still ends it as done" {
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;

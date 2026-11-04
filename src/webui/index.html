@@ -35,6 +35,7 @@ a:hover { text-decoration: underline; }
 .btn.ghost { border-color: transparent; background: transparent; color: var(--text-2); }
 .btn.ghost:hover { background: var(--surface-2); }
 .btn.sm { height: var(--h-ctl-sm); padding: 0 10px; font-size: var(--fs-sm); }
+.btn.xs { height: 22px; padding: 0 8px; font-size: 11px; }
 .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: var(--h-ctl); height: var(--h-ctl); border-radius: var(--r-md); border: 1px solid transparent; background: transparent; color: var(--text-2); cursor: pointer; transition: background .15s ease, color .15s ease; }
 .icon-btn:hover { background: var(--surface-2); color: var(--text); }
 .icon-btn svg { width: 18px; height: 18px; }
@@ -4271,7 +4272,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const genTxt = s.phase === 'cached' ? '' : fmtInt(s.generated_tokens) + (s.max_tokens ? ` / ${fmtInt(s.max_tokens)}` : '');
       const canCancel = (s.phase === 'prefill' || s.phase === 'decode') && s.request_id;
       const cancelBtn = canCancel
-        ? `<button class="btn sm danger" style="height:22px;padding:0 8px;font-size:11px" onclick="cancelSlot(this, ${esc(s.request_id)})" title="Cancel this in-flight request">Cancel</button>`
+        ? `<button class="btn xs danger" data-cancel="${esc(s.request_id)}" title="Cancel this in-flight request">Cancel</button>`
         : '';
       return `<tr>
         <td class="rid"${s.request_id ? ` title="Request ${esc(s.request_id)}"` : ''}>${esc(s.request_id || '')}</td>
@@ -4284,39 +4285,27 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         <td>${s.phase === 'cached' ? '' : secs(s.elapsed_seconds)}</td>
         <td>${rate}</td>
         <td>${bytes(s.state_bytes || 0)}</td>
-        <td style="text-align:right">${cancelBtn}</td></tr>`;
+        <td class="n">${cancelBtn}</td></tr>`;
     }).join(''));
     for (const id of lastGen.keys()) if (!seen.has(id)) lastGen.delete(id);
     refreshPhaseTip();
   }
 
-  async function cancelSlot(btn, id) {
-    if (!id || btn.disabled) return;
+  async function cancelSlot(btn) {
     btn.disabled = true;
-    const old = btn.textContent;
     btn.textContent = 'Stopping…';
     try {
-      const res = await fetch('/v1/slots/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: Number(id) }),
-      });
-      if (res.ok) {
-        btn.textContent = 'Cancelled';
-        setTimeout(() => pollSoon(), 100);
-      } else {
-        const text = await res.text();
-        console.warn('Failed to cancel slot:', text);
-        btn.textContent = 'Failed';
-        setTimeout(() => { btn.disabled = false; btn.textContent = old; }, 2000);
-      }
+      const res = await fetch('/v1/slots/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: Number(btn.dataset.cancel) }) });
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error?.message || `HTTP ${res.status}`);
+      btn.textContent = 'Cancelled';
+      setTimeout(pollSoon, 100);
     } catch (e) {
-      console.warn('Cancel slot error:', e);
-      btn.textContent = 'Error';
-      setTimeout(() => { btn.disabled = false; btn.textContent = old; }, 2000);
+      btn.textContent = 'Failed';
+      btn.title = e.message;
     }
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Cancel'; }, 2000);
   }
-  window.cancelSlot = cancelSlot;
+  sess.addEventListener('click', e => { const btn = e.target.closest('button[data-cancel]'); if (btn && !btn.disabled) cancelSlot(btn); });
 
   const ago = ms => { const s = Math.max(0, Math.round(ms / 1000)); return s < 5 ? 'just now' : s < 60 ? s + ' s ago' : s < 3600 ? Math.floor(s / 60) + ' min ago' : Math.floor(s / 3600) + ' h ago'; };
   const upFor = ms => { const m = Math.floor(ms / 60000), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`; };

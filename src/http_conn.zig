@@ -1780,8 +1780,8 @@ test "slots: cancel route validates request and method" {
     const Case = struct { request: []const u8, status: []const u8, says: []const u8 };
     for ([_]Case{
         .{ .request = "GET /v1/slots/cancel HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "Use POST to cancel an in-flight slot" },
-        .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 400 ", .says = "Send {\"id\": <request_id>}" },
-        .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nContent-Length: 12\r\n\r\n{\"id\":\"bad\"}", .status = "HTTP/1.1 400 ", .says = "Send {\"id\": <request_id>}" },
+        .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 400 ", .says = "Send {\\\"id\\\": <request_id>}" },
+        .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nContent-Length: 12\r\n\r\n{\"id\":\"bad\"}", .status = "HTTP/1.1 400 ", .says = "Send {\\\"id\\\": <request_id>}" },
     }) |c| {
         const response = try serveOneForTest(c.request);
         defer t.allocator.free(response);
