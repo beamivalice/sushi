@@ -1,7 +1,7 @@
 //! The menu's last row: Log, Update and Quit as three rounded buttons in one custom menu-item view. A button
-//! highlights under the pointer and while pressed; a click closes the menu and then sends its selector to the
-//! app's target. What the Update button says and does is decided in `sushibar_logic.zig` (`updateButton`).
-//! Single instance: its state is module-level.
+//! highlights under the pointer and while pressed; a click sends its selector to the app's target, closing the
+//! menu first unless the button says it stays open. What the Update button says and does is decided in
+//! `sushibar_logic.zig` (`updateButton`). Single instance: its state is module-level.
 const std = @import("std");
 const objc = @import("objc.zig");
 
@@ -23,7 +23,10 @@ const symbol_gap: f64 = 5;
 
 const tracking_enter_exit_always_visible: usize = 0x1 | 0x80 | 0x200;
 
-pub const Look = struct { label: []const u8, symbol: []const u8, tip: []const u8 = "", accent: bool = false, enabled: bool = true };
+/// `accent` fills the button in the brand orange; `spinner` shows a spinning wheel where the symbol would be.
+pub const Look = struct { label: []const u8, symbol: []const u8, tip: []const u8 = "", accent: bool = false, enabled: bool = true, closes_menu: bool = true, spinner: bool = false };
+
+const brand_orange = [3]f64{ 0xEE, 0x5A, 0x2F };
 
 const Btn = struct {
     view: id = null,
@@ -32,6 +35,9 @@ const Btn = struct {
     symbol: [48:0]u8 = @splat(0),
     accent: bool = false,
     enabled: bool = true,
+    closes_menu: bool = true,
+    spinner: bool = false,
+    wheel: id = null,
     hover: bool = false,
     pressed: bool = false,
 };
@@ -67,9 +73,13 @@ fn btnOf(view: id) ?*Btn {
 const color = objc.color;
 const alpha = objc.withAlpha;
 
+fn orange() id {
+    return msg(id, objc.class("NSColor"), "colorWithSRGBRed:green:blue:alpha:", .{ brand_orange[0] / 255, brand_orange[1] / 255, brand_orange[2] / 255, @as(f64, 1) });
+}
+
 fn fill(b: *const Btn) id {
     if (b.accent and b.enabled) {
-        const accent = color("controlAccentColor");
+        const accent = orange();
         const shade: f64 = if (b.pressed) 0.28 else if (b.hover) 0.14 else 0;
         return if (shade == 0) accent else msg(id, accent, "blendedColorWithFraction:ofColor:", .{ shade, color("blackColor") });
     }
@@ -78,7 +88,7 @@ fn fill(b: *const Btn) id {
 }
 
 fn ink(b: *const Btn) id {
-    if (!b.enabled) return color("tertiaryLabelColor");
+    if (!b.enabled) return color("secondaryLabelColor");
     return if (b.accent) color("whiteColor") else color("labelColor");
 }
 
@@ -93,22 +103,26 @@ fn drawRect(self: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithRoundedRect:xRadius:yRadius:", .{ bounds, radius, radius }), "fill", .{});
 
     const c = ink(b);
+    const img = if (b.spinner) null else objc.symbolImage(&b.symbol, c);
+    const lay = layout(b, c, bounds.w, img);
+    if (img != null) msg(void, img, "drawInRect:", .{NSRect{ .x = lay.icon_x, .y = (bounds.h - symbol_h) / 2, .w = lay.icon_w, .h = symbol_h }});
+    msg(void, objc.nsString(&b.label), "drawAtPoint:withAttributes:", .{ objc.NSPoint{ .x = lay.text_x, .y = (bounds.h - lay.text_h) / 2 }, lay.attrs });
+}
+
+const Layout = struct { icon_x: f64, icon_w: f64, text_x: f64, text_h: f64, attrs: id };
+
+/// The icon (the symbol, or the spinner's place) and the label, centred together.
+fn layout(b: *const Btn, c: id, w: f64, img: id) Layout {
     const font = msg(id, objc.class("NSFont"), "systemFontOfSize:weight:", .{ @as(f64, 12.5), @as(f64, 0.23) });
     var keys = [_]id{ NSFontAttributeName, NSForegroundColorAttributeName };
     var vals = [_]id{ font, c };
     const attrs = msg(id, objc.class("NSDictionary"), "dictionaryWithObjects:forKeys:count:", .{ @as([*]id, &vals), @as([*]id, &keys), @as(usize, 2) });
-    const text = objc.nsString(&b.label);
-    const tsize = msg(objc.NSSize, text, "sizeWithAttributes:", .{attrs});
-    const img = objc.symbolImage(&b.symbol, c);
+    const tsize = msg(objc.NSSize, objc.nsString(&b.label), "sizeWithAttributes:", .{attrs});
     const isize_ = if (img != null) msg(objc.NSSize, img, "size", .{}) else objc.NSSize{ .width = 0, .height = 0 };
-    const iw = if (isize_.height > 0) isize_.width * symbol_h / isize_.height else 0;
+    const iw: f64 = if (b.spinner) symbol_h else if (isize_.height > 0) isize_.width * symbol_h / isize_.height else 0;
     const total = iw + (if (iw > 0) symbol_gap else 0) + tsize.width;
-    var x = (bounds.w - total) / 2;
-    if (img != null) {
-        msg(void, img, "drawInRect:", .{NSRect{ .x = x, .y = (bounds.h - symbol_h) / 2, .w = iw, .h = symbol_h }});
-        x += iw + symbol_gap;
-    }
-    msg(void, text, "drawAtPoint:withAttributes:", .{ objc.NSPoint{ .x = x, .y = (bounds.h - tsize.height) / 2 }, attrs });
+    const x = (w - total) / 2;
+    return .{ .icon_x = x, .icon_w = iw, .text_x = x + iw + (if (iw > 0) symbol_gap else 0), .text_h = tsize.height, .attrs = attrs };
 }
 
 fn redraw(b: *const Btn) void {
@@ -144,6 +158,7 @@ fn mouseDown(self: id, _: objc.SEL, _: id) callconv(.c) void {
     if (!objc.trackClick(self, &pressedWhileInside)) return redraw(b);
     b.hover = false;
     msg(void, self, "display", .{});
+    if (!b.closes_menu) return msg(void, target, b.selector, .{self});
     msg(void, menu, "cancelTracking", .{});
     // After the menu has closed: an action that opens a window or an alert must not run inside menu tracking.
     msg(void, target, "performSelector:withObject:afterDelay:", .{ objc.sel(b.selector), self, @as(f64, 0) });
@@ -173,6 +188,13 @@ pub fn create(app_target: id, top_menu: id) id {
         const area = msg(id, msg(id, objc.class("NSTrackingArea"), "alloc", .{}), "initWithRect:options:owner:userInfo:", .{ NSRect{ .x = 0, .y = 0, .w = 0, .h = 0 }, tracking_enter_exit_always_visible, b.view, @as(id, null) });
         msg(void, b.view, "addTrackingArea:", .{area});
         msg(void, row, "addSubview:", .{b.view});
+        b.wheel = msg(id, msg(id, objc.class("NSProgressIndicator"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = (button_h - symbol_h) / 2, .w = symbol_h, .h = symbol_h }});
+        msg(void, b.wheel, "setStyle:", .{@as(isize, 1)});
+        msg(void, b.wheel, "setControlSize:", .{@as(isize, 1)});
+        msg(void, b.wheel, "setIndeterminate:", .{true});
+        msg(void, b.wheel, "setHidden:", .{true});
+        msg(void, b.view, "addSubview:", .{b.wheel});
+        objc.release(b.wheel);
         set(i, look);
     }
     return row;
@@ -180,15 +202,30 @@ pub fn create(app_target: id, top_menu: id) id {
 
 fn set(i: usize, look: Look) void {
     const b = &btns[i];
-    if (same(&b.label, look.label) and same(&b.symbol, look.symbol) and b.accent == look.accent and b.enabled == look.enabled) return;
+    if (same(&b.label, look.label) and same(&b.symbol, look.symbol) and b.accent == look.accent and b.enabled == look.enabled and b.spinner == look.spinner) {
+        b.closes_menu = look.closes_menu;
+        return;
+    }
     setZ(&b.label, look.label);
     setZ(&b.symbol, look.symbol);
     b.accent = look.accent;
     b.enabled = look.enabled;
+    b.closes_menu = look.closes_menu;
+    b.spinner = look.spinner;
+    placeWheel(b);
     var tip: [128:0]u8 = undefined;
     setZ(&tip, look.tip);
     msg(void, b.view, "setToolTip:", .{objc.nsString(&tip)});
     redraw(b);
+}
+
+/// The wheel sits where the symbol would, and turns only while the button waits.
+fn placeWheel(b: *Btn) void {
+    msg(void, b.wheel, "setHidden:", .{!b.spinner});
+    if (!b.spinner) return msg(void, b.wheel, "stopAnimation:", .{@as(id, null)});
+    const lay = layout(b, ink(b), msg(NSRect, b.view, "bounds", .{}).w, null);
+    msg(void, b.wheel, "setFrameOrigin:", .{objc.NSPoint{ .x = lay.icon_x, .y = (button_h - symbol_h) / 2 }});
+    msg(void, b.wheel, "startAnimation:", .{@as(id, null)});
 }
 
 pub fn setUpdate(look: Look) void {

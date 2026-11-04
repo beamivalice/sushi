@@ -279,6 +279,7 @@ case "\$1" in
   update)
     echo "── sushi 1.0.0 update, 2026-11-03 14:57 UTC"
     if [ "\${FAKE_MODE:-}" = "avail" ] && [ "\${2:-}" = "--check" ]; then echo "sushi 9.0.0 is available (this is 1.0.0): x"; exit 0; fi
+    if [ "\${FAKE_MODE:-}" = "current" ] && [ "\${2:-}" = "--check" ]; then echo "sushi 1.0.0 is up to date"; exit 0; fi
     echo "update: disk full while unpacking $long"
     echo "trailing log line"
     exit 1;;
@@ -287,10 +288,15 @@ esac
 exit 1
 EOF
 chmod +x "$FAKE/sushi"
+rm -f "$HOME/.sushi/update-check.json"
 run_bar "$FAKE/sushibar" 5 "check@2" --port "$UPORT"
 check "a failed manual check shows its update: line in the note item, cut with an ellipsis" "$(yes_if 'grep -q "poll [3-5] .*note=\"update: disk full while unpacking x*…\"" "$LOG"')"
 check "that note is not the trailing log line" "$(yes_if '! grep -q "note=\"trailing" "$LOG"')"
+check "the Update button reads Checking… in the poll of the click and Retry once the check failed" "$(yes_if 'grep -q "poll 2 .*button=\"Checking…\"" "$LOG" && grep -q "poll [3-5] .*button=\"Retry\"" "$LOG"')"
+FAKE_MODE=current run_bar "$FAKE/sushibar" 5 "check@2" --port "$UPORT"
+check "the Update button reads Up to date once a check found nothing newer" "$(yes_if 'grep -q "poll [3-5] .*button=\"Up to date\"" "$LOG"')"
 FAKE_MODE=avail run_bar "$FAKE/sushibar" 10 "check@2,update@5" --port "$UPORT"
+check "the Update button reads Update once a check found a release, and still after a failed update" "$(yes_if 'grep -q "poll [3-4] .*button=\"Update\"" "$LOG" && grep -q "poll [7-9] .*button=\"Update\"" "$LOG"')"
 check "a failed update leaves the update item visible and shows why beside it" "$(yes_if 'grep -q "poll [7-9] .*update=\"Update to sushi 9.0.0\" note=\"Update failed: update: disk full while unpacking x*…\"" "$LOG"')"
 
 echo "== a server that fails to start says so =="

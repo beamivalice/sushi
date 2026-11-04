@@ -12,7 +12,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Settings can turn the automatic sushi and model pack update checks off**, without a restart, and a pack's revision is asked of Hugging Face at most once a day even across restarts.
 - **DeepSeek-V4.1 prefills new text 2-3% faster**: a long prompt keeps two layers in flight on the GPU instead of waiting at each one, with the same output.
 - **DeepSeek-V4.1's first long prompt after an update no longer pays for shader compiles**: the load warms the prefill kernels too, about 9% faster on a cold 16K prompt.
-- **sushibar ends its menu with Log, Update and Quit buttons**: Log opens a window that follows the watched server's log live (the last 2000 lines, then new ones as they are written, following your own `--log-file`), Update checks or installs, and each button lights up under the pointer.
+- **sushibar ends its menu with Log, Update and Quit buttons**: Log opens a window that follows the watched server's log live (the last 2000 lines, then new ones as they are written, following your own `--log-file`), Update checks and then turns orange to install (it shows Checking…, Up to date or Retry while the menu stays open), and each button lights up under the pointer.
 - **The default port is a setting, and sushibar keeps the ports you add**: Settings has a "Default port" (`server.port`, used by `sushi --serve` without `--port`, `sushi launch` and sushibar, applied at the next start), and sushibar's Port menu lists it first and keeps every port you switch to until you click the x on it.
 - **Fixes**: DeepSeek-V4.1 raw-text `/v1/completions` refuses an empty prompt again instead of answering it.
 

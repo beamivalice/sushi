@@ -459,6 +459,7 @@ pub const UpdateView = struct {
     note: []const u8 = "",
     busy: Busy = .none,
     path: UpdatePath = .none,
+    checked: CheckResult = .none,
 };
 
 pub fn checkLabel(buf: []u8, v: UpdateView) []const u8 {
@@ -486,21 +487,50 @@ pub fn updateEnabled(v: UpdateView) bool {
 
 pub const ButtonAction = enum { none, check, update, copy_command };
 
-/// The menu's one update button: Update while a release waits (or Copy for a Homebrew one), Check otherwise.
-pub const UpdateButton = struct { label: []const u8, symbol: []const u8, tip: []const u8, accent: bool, enabled: bool, action: ButtonAction };
+/// How the last check the user asked for ended; the quiet daily checks do not set it.
+pub const CheckResult = enum { none, up_to_date, failed };
+
+/// How long an answer stays on the button once the menu is closed and opened again.
+pub const result_shown_ms: i64 = 60_000;
+
+/// `last`, unless the menu was opened `result_shown_ms` or more after it was given.
+pub fn shownResult(last: CheckResult, at_ms: i64, open_ms: i64) CheckResult {
+    return if (open_ms - at_ms >= result_shown_ms) .none else last;
+}
+
+pub const UpdateState = enum { idle, checking, up_to_date, available, failed, updating, brew_copy };
+
+pub fn updateState(v: UpdateView) UpdateState {
+    switch (v.busy) {
+        .checking => return .checking,
+        .updating => return .updating,
+        .none => {},
+    }
+    if (v.available and v.path == .brew) return .brew_copy;
+    if (v.available and updateEnabled(v)) return .available;
+    return switch (v.checked) {
+        .up_to_date => .up_to_date,
+        .failed => .failed,
+        .none => .idle,
+    };
+}
+
+/// The menu's one update button. `accent` is the brand orange; only a Homebrew copy closes the menu, so the button can
+/// show the answer of the check or the progress of the update it started.
+pub const UpdateButton = struct { state: UpdateState, label: []const u8, symbol: []const u8, tip: []const u8, accent: bool, enabled: bool, action: ButtonAction, closes_menu: bool = false, spinner: bool = false };
 
 pub fn updateButton(buf: []u8, v: UpdateView) UpdateButton {
     const check_symbol = "arrow.triangle.2.circlepath";
-    switch (v.busy) {
-        .checking => return .{ .label = "Checking…", .symbol = check_symbol, .tip = "Checking for updates", .accent = false, .enabled = false, .action = .none },
-        .updating => return .{ .label = "Updating…", .symbol = "arrow.down.circle", .tip = "Updating sushi", .accent = true, .enabled = false, .action = .none },
-        .none => {},
-    }
-    if (v.available and v.path == .brew)
-        return .{ .label = "Copy", .symbol = "doc.on.doc", .tip = copyLabel(buf, v.command), .accent = true, .enabled = true, .action = .copy_command };
-    if (v.available and updateEnabled(v))
-        return .{ .label = "Update", .symbol = "arrow.down.circle", .tip = updateLabel(buf, v) orelse "Update", .accent = true, .enabled = true, .action = .update };
-    return .{ .label = "Check", .symbol = check_symbol, .tip = "Check for Updates", .accent = false, .enabled = true, .action = .check };
+    const st = updateState(v);
+    return switch (st) {
+        .checking => .{ .state = st, .label = "Checking…", .symbol = check_symbol, .tip = "Checking for updates", .accent = false, .enabled = false, .action = .none, .spinner = true },
+        .updating => .{ .state = st, .label = "Updating…", .symbol = "arrow.down.circle", .tip = "Updating sushi", .accent = false, .enabled = false, .action = .none, .spinner = true },
+        .up_to_date => .{ .state = st, .label = "Up to date", .symbol = "checkmark", .tip = "sushi is up to date", .accent = false, .enabled = false, .action = .none },
+        .failed => .{ .state = st, .label = "Retry", .symbol = check_symbol, .tip = "The check failed: click to try again", .accent = false, .enabled = true, .action = .check },
+        .brew_copy => .{ .state = st, .label = "Copy", .symbol = "doc.on.doc", .tip = copyLabel(buf, v.command), .accent = true, .enabled = true, .action = .copy_command, .closes_menu = true },
+        .available => .{ .state = st, .label = "Update", .symbol = "arrow.down.circle", .tip = updateLabel(buf, v) orelse "Update", .accent = true, .enabled = true, .action = .update },
+        .idle => .{ .state = st, .label = "Check", .symbol = check_symbol, .tip = "Check for Updates", .accent = false, .enabled = true, .action = .check },
+    };
 }
 
 // ── Menu ─────────────────────────────────────────────────────────────────
@@ -1849,38 +1879,75 @@ test "sushi is looked up beside the running executable" {
     try std.testing.expect(siblingPath(&b, "sushibar", "sushi") == null);
 }
 
-test "update button: Update when one waits, Check otherwise, and what each runs" {
+test "update button: Check when idle, Update (orange) when a release waits, and what each runs" {
     var b: [96]u8 = undefined;
     const idle = updateButton(&b, .{});
+    try std.testing.expectEqual(UpdateState.idle, idle.state);
     try std.testing.expectEqualStrings("Check", idle.label);
     try std.testing.expectEqual(ButtonAction.check, idle.action);
-    try std.testing.expect(!idle.accent and idle.enabled);
+    try std.testing.expect(!idle.accent and idle.enabled and !idle.closes_menu and !idle.spinner);
     try std.testing.expectEqualStrings("Check for Updates", idle.tip);
 
     const waiting = updateButton(&b, .{ .available = true, .latest = "1.5.1", .path = .server });
+    try std.testing.expectEqual(UpdateState.available, waiting.state);
     try std.testing.expectEqualStrings("Update", waiting.label);
     try std.testing.expectEqual(ButtonAction.update, waiting.action);
-    try std.testing.expect(waiting.accent and waiting.enabled);
+    try std.testing.expect(waiting.accent and waiting.enabled and !waiting.closes_menu);
     try std.testing.expectEqualStrings("Update to sushi 1.5.1", waiting.tip);
 
     const cli = updateButton(&b, .{ .available = true, .latest = "1.5.1", .path = .cli });
     try std.testing.expectEqual(ButtonAction.update, cli.action);
 }
 
-test "update button: a Homebrew update copies its command, a busy one waits" {
+test "update button: a click on Check waits for the answer, which is Up to date, Update or Retry" {
+    var b: [96]u8 = undefined;
+    const checking = updateButton(&b, .{ .busy = .checking });
+    try std.testing.expectEqual(UpdateState.checking, checking.state);
+    try std.testing.expectEqualStrings("Checking…", checking.label);
+    try std.testing.expect(!checking.enabled and checking.spinner and !checking.accent and checking.action == .none);
+
+    const current = updateButton(&b, .{ .checked = .up_to_date });
+    try std.testing.expectEqual(UpdateState.up_to_date, current.state);
+    try std.testing.expectEqualStrings("Up to date", current.label);
+    try std.testing.expect(!current.enabled and !current.accent and !current.spinner and current.action == .none);
+
+    const newer = updateButton(&b, .{ .checked = .none, .available = true, .latest = "1.5.1", .path = .cli });
+    try std.testing.expect(newer.state == .available and newer.accent and newer.enabled);
+
+    const failed = updateButton(&b, .{ .checked = .failed });
+    try std.testing.expectEqual(UpdateState.failed, failed.state);
+    try std.testing.expectEqualStrings("Retry", failed.label);
+    try std.testing.expect(failed.enabled and !failed.accent and failed.action == .check and !failed.closes_menu);
+}
+
+test "update button: a release found beats an older answer, a busy check beats everything but an update" {
+    var b: [96]u8 = undefined;
+    const stale = updateButton(&b, .{ .checked = .up_to_date, .available = true, .latest = "1.5.1", .path = .server });
+    try std.testing.expectEqual(UpdateState.available, stale.state);
+    const again = updateButton(&b, .{ .checked = .failed, .busy = .checking });
+    try std.testing.expectEqual(UpdateState.checking, again.state);
+}
+
+test "update button: a Homebrew update copies its command and closes the menu, an update in progress waits" {
     var b: [96]u8 = undefined;
     const brew = updateButton(&b, .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi" });
+    try std.testing.expectEqual(UpdateState.brew_copy, brew.state);
     try std.testing.expectEqualStrings("Copy", brew.label);
     try std.testing.expectEqual(ButtonAction.copy_command, brew.action);
-    try std.testing.expect(brew.accent and brew.enabled);
+    try std.testing.expect(brew.accent and brew.enabled and brew.closes_menu);
     try std.testing.expectEqualStrings("Copy “brew upgrade sushi”", brew.tip);
 
-    const checking = updateButton(&b, .{ .busy = .checking });
-    try std.testing.expectEqualStrings("Checking…", checking.label);
-    try std.testing.expect(!checking.enabled and checking.action == .none);
     const updating = updateButton(&b, .{ .available = true, .path = .server, .busy = .updating });
+    try std.testing.expectEqual(UpdateState.updating, updating.state);
     try std.testing.expectEqualStrings("Updating…", updating.label);
-    try std.testing.expect(!updating.enabled and updating.action == .none);
+    try std.testing.expect(!updating.enabled and updating.spinner and updating.action == .none);
+}
+
+test "update button: an answer older than a minute is dropped when the menu opens, and Check returns" {
+    try std.testing.expectEqual(CheckResult.up_to_date, shownResult(.up_to_date, 1_000, 30_000));
+    try std.testing.expectEqual(CheckResult.failed, shownResult(.failed, 1_000, 30_000));
+    try std.testing.expectEqual(CheckResult.none, shownResult(.up_to_date, 1_000, 61_000));
+    try std.testing.expectEqual(CheckResult.none, shownResult(.none, 1_000, 2_000));
 }
 
 test "log source: the default file is per port, --log-file moves or turns it off" {

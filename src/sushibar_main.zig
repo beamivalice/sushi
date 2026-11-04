@@ -149,8 +149,9 @@ const Shared = struct {
     log_kind: logic.LogKind = .standard,
     log_path: Str(1024) = .{},
     relaunch: bool = false,
-    req_check: bool = false,
-    req_update: bool = false,
+    /// How the last check the user asked for ended, and when; shown on the Update button.
+    manual_result: logic.CheckResult = .none,
+    manual_at_ms: i64 = 0,
 };
 
 var shared: Shared = .{};
@@ -526,6 +527,10 @@ fn worker(kind: WorkerKind) void {
             const ok = cliCheck(a, kind == .check);
             lock();
             shared.check_failed = !ok;
+            if (kind == .check) {
+                shared.manual_result = if (!ok) .failed else if (shared.available) .none else .up_to_date;
+                shared.manual_at_ms = io_util.nowMs(g_io);
+            }
             unlock();
         },
         .update => {
@@ -695,12 +700,8 @@ fn pollLoop() void {
         }
         const link = shared.view.link;
         const known = shared.props_latest.len > 0;
-        const req_check = shared.req_check;
-        const req_update = shared.req_update;
-        shared.req_check = false;
-        shared.req_update = false;
         unlock();
-        if (req_update) startWorker(.update) else if (req_check) startWorker(.check) else if (logic.checkDue(last_check_ms, now, last_ok)) {
+        if (logic.checkDue(last_check_ms, now, last_ok)) {
             if (link == .offline) {
                 last_check_ms = now;
                 last_ok = true;
@@ -1010,14 +1011,11 @@ fn runAction(act: Action) void {
         .models => refreshModels(@intCast(act.value)),
         .check => {
             lock();
-            shared.req_check = true;
+            shared.manual_result = .none;
             unlock();
+            startWorker(.check);
         },
-        .update => {
-            lock();
-            shared.req_update = true;
-            unlock();
-        },
+        .update => startWorker(.update),
         .port => setPort(@intCast(act.value)),
         .remove => removePort(@intCast(act.value)),
         .typed => {
@@ -1048,7 +1046,11 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     tick_count += 1;
     for (test_actions[0..test_action_n]) |act| if (act.at == tick_count) runAction(act);
     reapStarted();
+    refresh();
+}
 
+/// Renders the published snapshot into the menu, from the timer and straight after a click that changes it.
+fn refresh() void {
     const p = port();
     const now = io_util.nowMs(g_io);
     var model_b: [96]u8 = undefined;
@@ -1114,6 +1116,7 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .command = if (g_sibling_brew and cmd_len == 0) "brew upgrade sushi" else cmd_b[0..cmd_len],
         .note = take(&note_b, &shared.note),
         .busy = shared.busy,
+        .checked = shared.manual_result,
     };
     const relaunch = shared.relaunch;
     unlock();
@@ -1199,7 +1202,7 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     var tip_b: [160]u8 = undefined;
     const update_button = logic.updateButton(&tip_b, uv);
     button_action = update_button.action;
-    button_row.setUpdate(.{ .label = update_button.label, .symbol = update_button.symbol, .tip = update_button.tip, .accent = update_button.accent, .enabled = update_button.enabled });
+    button_row.setUpdate(buttonLook(update_button));
     button_row.dropStaleHover();
     var pb: [128]u8 = undefined;
     const copy_label = logic.copyLabel(&pb, uv.command);
@@ -1294,6 +1297,9 @@ fn applyPortAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 fn textChangedAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     port_field.clearInvalid();
 }
+fn buttonLook(b: logic.UpdateButton) button_row.Look {
+    return .{ .label = b.label, .symbol = b.symbol, .tip = b.tip, .accent = b.accent, .enabled = b.enabled, .closes_menu = b.closes_menu, .spinner = b.spinner };
+}
 fn updateButtonAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     switch (button_action) {
         .check => runAction(.{ .kind = .check, .at = 0 }),
@@ -1301,6 +1307,7 @@ fn updateButtonAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .copy_command => copyAction(null, null, null),
         .none => {},
     }
+    refresh();
 }
 fn copyAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     objc.copyText("brew upgrade sushi");
@@ -1324,7 +1331,11 @@ fn removeRowAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
 
 /// The top menu re-reads the default port; the Port submenu asks its listeners for their models.
 fn menuWillOpen(_: objc.id, _: objc.SEL, opening: objc.id) callconv(.c) void {
-    if (opening == top_menu) g_default_port = readDefaultPort() else refreshModels(null);
+    if (opening != top_menu) return refreshModels(null);
+    g_default_port = readDefaultPort();
+    lock();
+    shared.manual_result = logic.shownResult(shared.manual_result, shared.manual_at_ms, io_util.nowMs(g_io));
+    unlock();
 }
 
 /// The watched port's log: what its server's argv said, or the default file while that is not known yet.
@@ -1530,11 +1541,14 @@ fn renderButtonsAndLog(dir: []const u8) void {
         .{ .name = "update-pressed", .uv = .{ .available = true, .latest = "1.5.1", .path = .server }, .pressed = 1 },
         .{ .name = "brew", .uv = .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi" } },
         .{ .name = "checking", .uv = .{ .busy = .checking } },
+        .{ .name = "up-to-date", .uv = .{ .checked = .up_to_date } },
+        .{ .name = "failed", .uv = .{ .checked = .failed } },
+        .{ .name = "failed-hover", .uv = .{ .checked = .failed }, .hover = 1 },
     };
     for (cases) |c| {
         var tip: [160]u8 = undefined;
         const b = logic.updateButton(&tip, c.uv);
-        button_row.setUpdate(.{ .label = b.label, .symbol = b.symbol, .tip = b.tip, .accent = b.accent, .enabled = b.enabled });
+        button_row.setUpdate(buttonLook(b));
         for ([_]bool{ false, true }) |dark| {
             var path: [std.fs.max_path_bytes:0]u8 = undefined;
             const pz = std.fmt.bufPrintSentinel(&path, "{s}/buttons-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;

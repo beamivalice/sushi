@@ -18,8 +18,8 @@ card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph
 on the watched port (asking first for one it did not start), switches the port (the default port first, then the ports you added by typing or picking one, then any other listening
 server; hover an added port and click its x to forget it; the choice is remembered; `--port` wins, then the default port,
 `server.port` in Settings, 12345 unless changed), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
-three buttons: Log (a window that follows the watched server's log live), Update (Check, or Update while a release
-waits; Homebrew installs get a Copy "brew upgrade sushi" item and the button copies it; a running sushibar never
+three buttons: Log (a window that follows the watched server's log live), Update (Check, which shows Checking… and then
+Up to date, Retry or an orange Update while the menu stays open; Homebrew installs get a Copy "brew upgrade sushi" item and the button copies it; a running sushibar never
 blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q).
 
 A browser download is quarantined: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`. GPU memory and the
