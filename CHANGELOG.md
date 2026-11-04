@@ -9,6 +9,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **`sushibar` puts sushi in the menu bar**: a native app beside `sushi` shows live decode speed and a status card
   (model, memory, prefill, GPU clock, a five-minute decode graph), starts and stops the server on any port, opens the
   dashboard and chat, and installs sushi updates.
+
+  <p><img src="https://raw.githubusercontent.com/beamivalice/sushi/main/docs/assets/sushibar-running.png" alt="sushibar with a model running" width="316"> <img src="https://raw.githubusercontent.com/beamivalice/sushi/main/docs/assets/sushibar-stopped.png" alt="sushibar with the server stopped" width="312"></p>
+
 - **A new web page that opens on the Dashboard**: Dashboard, Chat, Models and Settings tabs (Cmd+1 to Cmd+4); a Compact
   view with one point per finished request and the GPU clock beside utilization; Models and Settings edit each model's
   settings and the SSD prefix cache, offering only what that model honours and naming the volume the cache writes to
