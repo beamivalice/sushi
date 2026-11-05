@@ -94,6 +94,9 @@ const model_load = @import("model_load.zig");
 const dsv41_thought_point = @import("dsv41/dsv41_thought_point.zig");
 const glm5_rows_tick = @import("glm5/glm5_rows_tick.zig");
 
+/// A session row with `request_id` 0 is a cached entry, not a request, so live ids start at 1.
+pub const first_request_id: u64 = 1;
+
 /// Submit-time parameters. `prompt_ids` and `eos_token_ids` are duped into the
 /// slot so callers can free their copies immediately. `vision_embeddings`
 /// ownership transfers into the slot when non-null (the slot will free on
@@ -1105,7 +1108,7 @@ pub const Scheduler = struct {
     live_unflushed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Submit sequence the session rows carry as `request_id`: taken under
     /// `queue_mu` in `submit`, immutable on the slot, never reused.
-    req_seq: u64 = 0,
+    req_seq: u64 = first_request_id,
     /// Every ready model's hot-cache entries for `/metrics.json`, under `digest_mu`.
     cached_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
     cached_session_count: usize = 0,
@@ -5629,7 +5632,7 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.shutdown = .init(false);
     sch.queue_cap = queue_cap;
     sch.in_flight = 0;
-    sch.req_seq = 0;
+    sch.req_seq = first_request_id;
     sch.pending = .empty;
     sch.decoding = .empty;
     sch.cleanup_queue = .empty;
@@ -5639,6 +5642,23 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.abandoned = null;
     sch.orphan_vision_n = 0;
     return sch;
+}
+
+test "the first request after boot carries a non-zero request_id, so the dashboard can show and cancel it" {
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    var sch = submitTestScheduler(testing.allocator, 2);
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.cleanup_queue.deinit(testing.allocator);
+    defer sch.prefilling.deinit(testing.allocator);
+    const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
+    defer {
+        sch.complete(slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+    }
+    try testing.expect(slot.request_id != 0);
 }
 
 test "a model load or unload waits for every queued slot to be destroyed" {

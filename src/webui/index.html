@@ -582,9 +582,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 #dashPanel canvas { width: 100%; display: block; cursor: crosshair; touch-action: pan-y; }
 #dashPanel canvas:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
 #dashPanel[data-offline] canvas { opacity: .45; }
-#dashPanel table.sessions { table-layout: fixed; min-width: 1100px; }
+#dashPanel table.sessions { table-layout: fixed; min-width: 1130px; }
 #dashPanel table.sessions td.rid { direction: rtl; text-align: left; }
-#dashPanel table.sessions td, #dashPanel table.sessions th { overflow: hidden; text-overflow: ellipsis; }
+#dashPanel table.sessions td, #dashPanel table.sessions th { overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+#dashPanel table.sessions td:last-child { overflow: visible; }
 #dashPanel .bar { position: relative; height: 8px; background: var(--surface-2); border-radius: 4px; min-width: 90px; overflow: hidden; }
 #dashPanel .bar > span { position: absolute; top: 0; bottom: 0; left: 0; }
 #dashPanel .bar > span.cached { background: var(--c2); }
@@ -868,7 +869,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <section class="card adv feed">
     <h2>Sessions<span class="legend"><span><i style="background:var(--c2)"></i>restored from cache</span><span><i style="background:var(--c1)"></i>new this request</span></span></h2>
     <div class="tablewrap"><table class="tbl sessions">
-      <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"><col style="width:72px"></colgroup>
+      <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"><col style="width:100px"></colgroup>
       <thead><tr><th>ID</th><th>Model</th><th>Phase</th><th>Context</th><th></th><th>Cached</th><th>Generated</th><th>Elapsed</th><th>Rate</th><th>State</th><th></th></tr></thead>
       <tbody id="dashSessions"></tbody>
     </table></div>
