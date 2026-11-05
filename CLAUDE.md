@@ -187,10 +187,15 @@ number (within a session, inherit the previous one); run an old baseline only in
 for that setting, and say which. Existing pack shards are a converter's byte-identity baseline. Committed docs cite
 commit + settings beside every new number; raw-file paths go to `docs/private/measurement-raw.md`.
 
-**Landing perf.** A speedup that is real (outside run-to-run noise, arms interleaved in one session) and leaves output
-bit-identical lands whatever its size. A change that alters output lands only through the KLD gate
-([quality-kld](docs/quality-kld.md)); one too small to be worth that gate (about 1% of a token) is dropped, not
-queued. Judge a tweak on top of the change it builds on, not alone against the old code.
+**Landing perf.** A speedup is real when it is outside run-to-run noise with arms interleaved in one session.
+- A real speedup that leaves output bit-identical lands whatever its size.
+- A prefill, decode or batching lever worth 5% or more is built and tested, never only noted; one that changes output
+  goes through the KLD gate ([quality-kld](docs/quality-kld.md)).
+- At the gate, a KLD change under 0.01% passes; a larger one goes to the owner with its speed gain to decide.
+- Exactness is judged on one hardware path: a NAX arm whose bytes differ from the SIMD arm's (new vs old hardware) is
+  not an output change.
+- An output-changing tweak worth about 1% of a token or less is dropped, not queued.
+- Judge a tweak on top of the change it builds on, not alone against the old code.
 
 **Measurement hygiene.**
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.
