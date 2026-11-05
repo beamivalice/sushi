@@ -1038,7 +1038,7 @@ async function main() {
       await context.close();
     }
 
-    for (const [scheme, theme, bg, chart] of [['dark', 'system', 'rgb(15, 17, 21)', 'rgb(255, 138, 76)'], ['light', 'system', 'rgb(247, 245, 242)', 'rgb(217, 72, 15)'], ['light', 'night', 'rgb(15, 17, 21)', 'rgb(255, 138, 76)'], ['dark', 'day', 'rgb(247, 245, 242)', 'rgb(217, 72, 15)']]) {
+    for (const [scheme, theme, bg, chart] of [['dark', 'system', 'rgb(15, 17, 21)', 'rgb(255, 156, 126)'], ['light', 'system', 'rgb(247, 245, 242)', 'rgb(220, 90, 54)'], ['light', 'night', 'rgb(15, 17, 21)', 'rgb(255, 156, 126)'], ['dark', 'day', 'rgb(247, 245, 242)', 'rgb(220, 90, 54)']]) {
       // The stored theme wins over the system scheme; the page and the chart palette follow it.
       const context = await browser.newContext({ colorScheme: scheme });
       const page = await context.newPage();

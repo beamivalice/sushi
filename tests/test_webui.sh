@@ -211,7 +211,7 @@ if command -v node >/dev/null 2>&1; then
         check "tests/test_webui_dashboard.cjs passes and names its pass" \
             "$([ "$dash_rc" -eq 0 ] && echo "$dash_out" | grep -q 'Web UI dashboard: passed' && echo 1 || echo 0)"
     fi
-    for t in admin_ui shell chat; do
+    for t in admin_ui shell chat theme; do
         out="$(node "tests/test_webui_$t.cjs" 2>&1)"; rc=$?
         if echo "$out" | grep -q 'skipped'; then
             echo "  SKIP tests/test_webui_$t.cjs ($(echo "$out" | grep 'skipped' | head -1))"

@@ -1,0 +1,80 @@
+# Web UI design (theme 2.0)
+
+The rules the page `src/webui/index.html` follows to look like itself. What it does and which API it calls lives in
+[server-http-apis](server-http-apis.md#chat-page-get--get-chat-get-dashboard-get-models-get-settings-get-downloads).
+Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
+
+## Rules
+
+- One file, no framework, bundle, web font or CDN; a design change keeps the file growth small.
+- Every colour, duration and easing is a custom property in the `:root` block. Light and dark come from the same token
+  through `light-dark()`; `data-theme` (`system`, `day`, `night`, stored as `sushi-theme`) only sets `color-scheme`.
+- Token names are a contract with the dashboard's charts and any branch that draws in the page: rename none; add new ones.
+- Text keeps WCAG AA (4.5:1) on every surface it sits on in both themes; a focus ring or a chart line keeps 3:1.
+
+## Palette
+
+Neutrals are warm in light and cool in dark. Contrast is against the surface the token is used on.
+
+| token | light | dark | use, contrast |
+|---|---|---|---|
+| `--bg`, `--surface`, `--surface-2`, `--surface-3` | `#f7f5f2` `#ffffff` `#f1eeea` `#e8e4de` | `#0f1115` `#16191f` `#1d2129` `#262b35` | page, cards, wells |
+| `--text` | `#1d1b19` | `#eceef1` | 17.2 / 15.1 on surface |
+| `--text-2` | `#5c5752` | `#a9b0bc` | 6.2 / 7.4 on surface-2 |
+| `--text-3` | `#6b645e` | `#8a93a1` | 5.0 / 5.2 on surface-2 |
+| `--accent` (salmon, text-safe) | `#b3452a` | `#ffa286` | 4.8 / 8.3 on surface-2, 4.9 / 7.5 on accent-soft |
+| `--accent-fill` (light salmon) | `#f4896b` | `#ff9c7e` | fills only, under `--on-accent-fill` |
+| `--on-accent-fill` | `#3d1408` | `#2b1209` | 6.6 / 8.6 on the fill, 5.7 / 10.2 on its hover |
+| `--accent-soft` | `#fdeee8` | `#3a231c` | selected rows and conversations |
+| `--focus` | = `--accent` | = `--accent` | 5.5 / 9.0 on surface |
+
+Status colours (`--info`, `--ok`, `--warn`, `--err` and their `-soft` washes) are unchanged from 1.x.
+
+**Salmon is a hint, not a flood.** Beside the logo's own salmon it appears only in: the primary button and Send (light salmon fill, dark
+ink in both themes), the focus ring, the current tab's icon, the composer's focus edge, selected rows (wash + 3 px edge),
+unsaved and new-pack dots, the chat's SSD meter and the decode series (`--c1`). Headings, links, tiles and charts'
+other series stay neutral or keep their status colour.
+
+**Charts**: series `--c1` (salmon: decode, clock, footprint) `#dc5a36` / `#ff9c7e` (3.8 / 8.6 on surface), `--c2` blue,
+`--c3` green, `--c4` violet; `--chart-grid` (= surface-2), `--chart-axis` (= text-2), `--chart-ref` (= warn, dashed
+ceilings and restarts). Tooltips: `--tip-bg`, `--tip-border`, `--tip-text`, `--tip-muted`; the chart tooltip `#dashTip`
+and the page tooltip share them.
+
+## Motion
+
+| token | value | for |
+|---|---|---|
+| `--dur-1` | 120 ms | hover, press, colour, tooltip in/out |
+| `--dur-2` | 180 ms | view cross-fade, menus and dialogs (`pop-in`: fade + 4 px, scale .98), toasts, status dots |
+| `--dur-3` | 240 ms | drawers, the Installed/Available thumb, meters, theme cross-fade |
+| `--ease-out` | `cubic-bezier(.2, .8, .2, 1)` | everything |
+
+- Views cross-fade by opacity only (no transform, so layout and measurements never shift). A theme the user picks
+  cross-fades the colours (`theme-fade` on `<html>` for 300 ms); the first paint and a system change do not.
+- `prefers-reduced-motion: reduce` sets the three durations to 0 and zeroes every transition and animation (spinners
+  stand still), so no rule can forget it.
+
+## Logo
+
+- One logo: the nigiri-on-Mac-Studio art (`LOGO`, an inline 96 px webp) on its white tile, set on every `img.mark`
+  (top bar, empty chat, API-key card) and as the favicon. Theme 2.0 keeps it as it was; the server's state is the
+  status dot's job, not the logo's.
+
+## Tooltips
+
+- One component: any element with `data-tip="plain text"` shares the single `#tip` (`role="tooltip"`; the anchor gets
+  `aria-describedby="tip"` while it shows). No HTML in a tip; `\n` breaks a line.
+- Opens on hover after 400 ms (at once when moving from one tip to the next, or on touch) and on keyboard focus at once
+  (`:focus-visible`). The pointer may move onto it. Leaving both, blur, Escape (focus stays), a press, a scroll of its
+  container, a resize or a shortcut close it.
+- Placed above its anchor, below when the top bar is in the way, and beside it (left) inside a `data-tip-side` container
+  such as the chat's settings column, whose fields stack; clamped 8 px inside the window; never over the anchor.
+- A tip adds what the screen cannot say in place: what a metric means, its unit, where the number comes from, what a
+  setting does, what a pack needs. Never needed content, an action, or a repeat of visible text.
+- An anchor must be focusable: buttons, inputs and labels already are; a tile, fact or table heading takes
+  `tabindex="0"`. Text anchors carry `.tip-u` (dotted underline), non-control anchors get the help cursor.
+- Where tips are: Compact/Advanced and the theme toggle; every dashboard tile (Compact and Advanced; Memory and Cache
+  reuse keep their live `#dashTip`); the chat's Last reply rows and its Max tokens, Temperature, Top-p, Top-k and
+  Thinking budget fields; a model's facts (on disk, linked, in memory, max context, sees images, streams experts);
+  the Available list's "Recommended for this Mac" badge (tier, RAM and download size); the Settings cache table headings.
+- Native `title` stays where a full value rides it (a cut-off model name, a path, a server message) and on icon buttons.

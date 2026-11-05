@@ -53,6 +53,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/engine-mlx-gotchas.md](docs/engine-mlx-gotchas.md) | MLX errors, dtype promotion, barriers, views vs copies, allocator, Zig/tokenizer traps |
 | [docs/engine-memory-admission.md](docs/engine-memory-admission.md) | Metal OOM, preflight, auto-context, prefill chunk, admission |
 | [docs/server-http-apis.md](docs/server-http-apis.md) | API contracts, streaming, sampling, reasoning budget, constrained JSON, launcher |
+| [docs/server-webui.md](docs/server-webui.md) | web UI design: tokens and contrast, salmon accent, motion, logo, tooltips |
 | [docs/server-tool-calling.md](docs/server-tool-calling.md) | templates, tool-call parse chain and invariants, think tags, loop stops |
 | [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, media, sushibar |
 | [docs/envvar.md](docs/envvar.md) | every env var the engine reads, by kind: read site and cost, docs, flag twins, reads to fix, removed list |

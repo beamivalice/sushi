@@ -8,7 +8,22 @@
 <title>sushi</title>
 <style>
 /* sushi chat — design tokens */
-:root { color-scheme: light dark; --bg: light-dark(#f7f5f2, #0f1115); --surface: light-dark(#ffffff, #16191f); --surface-2: light-dark(#f1eeea, #1d2129); --surface-3: light-dark(#e8e4de, #262b35); --border: light-dark(#e6e1da, #272c36); --border-strong: light-dark(#d4cec5, #363d4a); --text: light-dark(#1d1b19, #eceef1); --text-2: light-dark(#5c5752, #a9b0bc); --text-3: light-dark(#736c65, #8a93a1); --accent: light-dark(#c4461d, #ff8a5c); --accent-hover: light-dark(#a93c18, #ffa27c); --accent-soft: light-dark(#fbe7de, #3a2419); --accent-3: light-dark(#5f7a4a, #9cc27a); --on-accent: light-dark(#ffffff, #1a0f0a); --info: light-dark(#326fae, #6cb4d6); --info-soft: light-dark(#e3eef8, #16252f); --ok: light-dark(#177a3f, #4cc38a); --ok-soft: light-dark(#e2f3e9, #16281f); --warn: light-dark(#8a5b06, #e2b45b); --warn-soft: light-dark(#f8efd8, #2d2413); --err: light-dark(#b3261e, #f27b72); --err-soft: light-dark(#fbe9e7, #331c1a); --code-bg: light-dark(#f3f0ec, #1b1f27); --c1: light-dark(#d9480f, #ff8a4c); --c2: light-dark(#1971c2, #5aa9f0); --c3: light-dark(#2f9e44, #63c27a); --c4: light-dark(#7048e8, #a08bf5); --sh-1: light-dark(rgb(20 22 25 / 5%), rgb(0 0 0 / 30%)); --sh-2: light-dark(rgb(20 22 25 / 6%), rgb(0 0 0 / 25%)); --sh-3: light-dark(rgb(20 22 25 / 10%), rgb(0 0 0 / 40%)); --sh-4: light-dark(rgb(20 22 25 / 14%), rgb(0 0 0 / 45%)); --shadow: 0 1px 2px var(--sh-1), 0 6px 24px var(--sh-2); --shadow-pop: 0 4px 12px var(--sh-3), 0 16px 48px var(--sh-4); --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --fs-xs: 11px; --fs-sm: 12px; --fs-md: 13px; --fs-base: 15px; --fs-lg: 17px; --fs-xl: 22px; --fs-2xl: 28px; --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 16px; --r-pill: 999px; --h-ctl: 32px; --h-ctl-sm: 28px; --page-max: 1280px; --topbar-h: 52px; }
+:root { color-scheme: light dark;
+  /* surfaces and text */
+  --bg: light-dark(#f7f5f2, #0f1115); --surface: light-dark(#ffffff, #16191f); --surface-2: light-dark(#f1eeea, #1d2129); --surface-3: light-dark(#e8e4de, #262b35); --border: light-dark(#e6e1da, #272c36); --border-strong: light-dark(#d4cec5, #363d4a); --text: light-dark(#1d1b19, #eceef1); --text-2: light-dark(#5c5752, #a9b0bc); --text-3: light-dark(#6b645e, #8a93a1);
+  /* salmon: --accent is the text-safe shade (AA on every surface), --accent-fill the light salmon behind dark ink */
+  --accent: light-dark(#b3452a, #ffa286); --accent-hover: light-dark(#9c3b23, #ffb8a2); --accent-soft: light-dark(#fdeee8, #3a231c); --on-accent: light-dark(#ffffff, #2b1209); --accent-fill: light-dark(#f4896b, #ff9c7e); --accent-fill-hover: light-dark(#ef7656, #ffb39b); --on-accent-fill: light-dark(#3d1408, #2b1209); --accent-3: light-dark(#5f7a4a, #9cc27a); --focus: var(--accent);
+  --info: light-dark(#326fae, #6cb4d6); --info-soft: light-dark(#e3eef8, #16252f); --ok: light-dark(#177a3f, #4cc38a); --ok-soft: light-dark(#e2f3e9, #16281f); --warn: light-dark(#8a5b06, #e2b45b); --warn-soft: light-dark(#f8efd8, #2d2413); --err: light-dark(#b3261e, #f27b72); --err-soft: light-dark(#fbe9e7, #331c1a); --code-bg: light-dark(#f3f0ec, #1b1f27);
+  /* charts: series, grid, axis text, reference lines; tooltips */
+  --c1: light-dark(#dc5a36, #ff9c7e); --c2: light-dark(#1971c2, #5aa9f0); --c3: light-dark(#2f9e44, #63c27a); --c4: light-dark(#7048e8, #a08bf5); --chart-grid: var(--surface-2); --chart-axis: var(--text-2); --chart-ref: var(--warn); --tip-bg: var(--surface); --tip-border: var(--border-strong); --tip-text: var(--text); --tip-muted: var(--text-2);
+  --sh-1: light-dark(rgb(20 22 25 / 5%), rgb(0 0 0 / 30%)); --sh-2: light-dark(rgb(20 22 25 / 6%), rgb(0 0 0 / 25%)); --sh-3: light-dark(rgb(20 22 25 / 10%), rgb(0 0 0 / 40%)); --sh-4: light-dark(rgb(20 22 25 / 14%), rgb(0 0 0 / 45%)); --shadow: 0 1px 2px var(--sh-1), 0 6px 24px var(--sh-2); --shadow-pop: 0 4px 12px var(--sh-3), 0 16px 48px var(--sh-4);
+  /* motion: short ease-out; all zero under prefers-reduced-motion */
+  --dur-1: 120ms; --dur-2: 180ms; --dur-3: 240ms; --ease-out: cubic-bezier(.2, .8, .2, 1);
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --fs-xs: 11px; --fs-sm: 12px; --fs-md: 13px; --fs-base: 15px; --fs-lg: 17px; --fs-xl: 22px; --fs-2xl: 28px; --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 16px; --r-pill: 999px; --h-ctl: 32px; --h-ctl-sm: 28px; --page-max: 1280px; --topbar-h: 52px; }
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-1: 0s; --dur-2: 0s; --dur-3: 0s; }
+  *, ::before, ::after { transition-duration: 0s !important; transition-delay: 0s !important; animation-duration: 0s !important; animation-iteration-count: 1 !important; }
+}
 :root[data-theme="day"] { color-scheme: light; }
 :root[data-theme="night"] { color-scheme: dark; }
 
@@ -21,22 +36,24 @@ h1, h2, h3 { margin: 0; letter-spacing: -0.015em; }
 a { color: var(--info); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .num { font-variant-numeric: tabular-nums; }
-:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; border-radius: var(--r-sm); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+/* Zero specificity: a control keeps its own radius under the ring; bare text gets a soft one. */
+:where(a, span, summary):focus-visible { border-radius: var(--r-sm); }
 ::selection { background: color-mix(in srgb, var(--info) 25%, transparent); }
 
 /* Buttons & controls */
-.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: var(--h-ctl); border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); border-radius: var(--r-md); padding: 0 var(--s3); font-size: var(--fs-md); font-weight: 550; cursor: pointer; transition: background .15s ease, border-color .15s ease, transform .05s ease; white-space: nowrap; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: var(--h-ctl); border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); border-radius: var(--r-md); padding: 0 var(--s3); font-size: var(--fs-md); font-weight: 550; cursor: pointer; transition: background-color var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out), transform var(--dur-1) var(--ease-out); white-space: nowrap; }
 .btn:hover { background: var(--surface-2); }
 .btn:active { transform: translateY(1px); }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent-fill); }
+.btn.primary:hover { background: var(--accent-fill-hover); border-color: var(--accent-fill-hover); }
 .btn.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border-strong)); }
 .btn.danger:hover { background: var(--err-soft); }
 .btn.ghost { border-color: transparent; background: transparent; color: var(--text-2); }
 .btn.ghost:hover { background: var(--surface-2); }
 .btn.sm { height: var(--h-ctl-sm); padding: 0 10px; font-size: var(--fs-sm); }
 .btn.xs { height: 22px; padding: 0 8px; font-size: 11px; }
-.icon-btn { display: inline-flex; align-items: center; justify-content: center; width: var(--h-ctl); height: var(--h-ctl); border-radius: var(--r-md); border: 1px solid transparent; background: transparent; color: var(--text-2); cursor: pointer; transition: background .15s ease, color .15s ease; }
+.icon-btn { display: inline-flex; align-items: center; justify-content: center; width: var(--h-ctl); height: var(--h-ctl); border-radius: var(--r-md); border: 1px solid transparent; background: transparent; color: var(--text-2); cursor: pointer; transition: background-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out); }
 .icon-btn:hover { background: var(--surface-2); color: var(--text); }
 .icon-btn svg { width: 18px; height: 18px; }
 input[type="text"], input[type="password"], input[type="number"], select, textarea { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-md); padding: 0 10px; height: var(--h-ctl); font-size: var(--fs-md); color: var(--text); width: 100%; }
@@ -47,7 +64,7 @@ select:disabled { opacity: .6; }
 label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sm); font-weight: 550; color: var(--text-2); }
 
 /* Pills, dots */
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); flex: none; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); flex: none; transition: background-color var(--dur-2) var(--ease-out); }
 .dot.ok { background: var(--ok); }
 .dot.warn { background: var(--warn); }
 .dot.err { background: var(--err); }
@@ -78,13 +95,13 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 
 /* Chat */
 #chatPanel { display: flex; height: 100%; overflow: hidden; }
-#chatSidebar { width: 272px; flex: none; border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; min-height: 0; transition: margin-left .2s ease, visibility .2s; }
-#chatRightbar { width: 300px; flex: none; border-left: 1px solid var(--border); background: var(--surface); min-height: 0; overflow-y: auto; transition: margin-right .2s ease, visibility .2s; }
+#chatSidebar { width: 272px; flex: none; border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; min-height: 0; transition: margin-left var(--dur-3) var(--ease-out), visibility var(--dur-3); }
+#chatRightbar { width: 300px; flex: none; border-left: 1px solid var(--border); background: var(--surface); min-height: 0; overflow-y: auto; transition: margin-right var(--dur-3) var(--ease-out), visibility var(--dur-3); }
 .side-section { border-bottom: 1px solid var(--border); }
 .side-section summary { list-style: none; cursor: pointer; user-select: none; padding: 13px 16px; display: flex; align-items: center; gap: 8px; font-size: var(--fs-sm); font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: var(--text-3); }
 .side-section summary::-webkit-details-marker { display: none; }
 .side-section summary svg { width: 14px; height: 14px; color: var(--accent-3); }
-.side-section summary::after { content: "›"; margin-left: auto; font-size: var(--fs-base); transition: transform .15s ease; }
+.side-section summary::after { content: "›"; margin-left: auto; font-size: var(--fs-base); transition: transform var(--dur-2) var(--ease-out); }
 .side-section[open] summary::after { transform: rotate(90deg); }
 .side-body { padding: 2px 16px 16px; display: flex; flex-direction: column; gap: 10px; }
 .side-status { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: var(--fs-sm); color: var(--text-2); }
@@ -95,12 +112,12 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .perf-row .v { font-weight: 650; font-variant-numeric: tabular-nums; text-align: right; }
 .perf-row .v em { font-style: normal; font-weight: 500; font-size: var(--fs-xs); color: var(--text-3); margin-left: 3px; }
 .meter { height: 8px; border-radius: var(--r-pill); background: var(--surface); border: 1px solid var(--border); overflow: hidden; }
-.meter > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s ease; }
+.meter > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width var(--dur-3) var(--ease-out); }
 .meter-text { display: flex; justify-content: space-between; font-size: var(--fs-sm); color: var(--text-2); font-variant-numeric: tabular-nums; }
 .sidebar-top { padding: 14px 14px 8px; }
 #newChatButton { width: 100%; }
 #conversationList { flex: 1; overflow-y: auto; padding: 6px 8px 8px; display: flex; flex-direction: column; gap: 2px; }
-.conv-item { display: flex; align-items: center; gap: 8px; border-radius: var(--r-md); padding: 8px 10px; cursor: pointer; border: 0; background: transparent; text-align: left; width: 100%; color: var(--text); }
+.conv-item { display: flex; align-items: center; gap: 8px; border-radius: var(--r-md); padding: 8px 10px; cursor: pointer; border: 0; background: transparent; text-align: left; width: 100%; color: var(--text); transition: background-color var(--dur-1) var(--ease-out); }
 .conv-item:hover { background: var(--surface-2); }
 .conv-item.selected { background: var(--accent-soft); }
 .conv-item .c-body { flex: 1; min-width: 0; }
@@ -127,7 +144,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .msg.user { align-items: flex-end; }
 .msg.user .bubble { background: var(--surface-2); border: 1px solid var(--border); border-radius: 16px 16px 4px 16px; padding: 10px 16px; max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.assistant .content { font-size: var(--fs-base); overflow-wrap: anywhere; }
-.msg .msg-tools { display: flex; align-items: center; gap: 4px; margin-top: 4px; opacity: 0; transition: opacity .15s ease; }
+.msg .msg-tools { display: flex; align-items: center; gap: 4px; margin-top: 4px; opacity: 0; transition: opacity var(--dur-2) var(--ease-out); }
 .msg:hover .msg-tools, .msg.last .msg-tools { opacity: 1; }
 .msg .msg-tools .icon-btn { width: 27px; height: 27px; }
 .msg .msg-tools .icon-btn svg { width: 14px; height: 14px; }
@@ -142,7 +159,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .tool-result summary::after { flex-shrink: 0; }
 .thinking summary::-webkit-details-marker { display: none; }
 .thinking summary svg { width: 13px; height: 13px; color: var(--accent-3); }
-.thinking summary::after { content: ""; width: 6px; height: 6px; margin-left: auto; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg) translateY(-2px); transition: transform .15s ease; }
+.thinking summary::after { content: ""; width: 6px; height: 6px; margin-left: auto; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg) translateY(-2px); transition: transform var(--dur-2) var(--ease-out); }
 .thinking[open] summary::after { transform: rotate(225deg) translate(-1px, -1px); }
 .thinking[open] summary { border-bottom: 1px solid var(--border); }
 .thinking .t-body { padding: 10px 14px; font-size: var(--fs-md); color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow-y: auto; }
@@ -180,8 +197,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 
 .composer-wrap { flex: none; padding: 8px 20px calc(14px + env(safe-area-inset-bottom)); }
 .composer-column { max-width: 780px; margin: 0 auto; position: relative; }
-#composer { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-xl); box-shadow: var(--shadow); padding: 10px 12px 8px; transition: border-color .15s ease; }
-#composer:focus-within { border-color: var(--accent); }
+#composer { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-xl); box-shadow: var(--shadow); padding: 10px 12px 8px; transition: border-color var(--dur-2) var(--ease-out), box-shadow var(--dur-2) var(--ease-out); }
+#composer:focus-within { border-color: var(--accent-fill); box-shadow: var(--shadow), 0 0 0 3px var(--accent-soft); }
 #promptInput { width: 100%; border: 0; background: transparent; resize: none; padding: 4px 6px 6px; font-size: var(--fs-base); line-height: 1.5; max-height: 200px; outline: none; }
 .composer-attach { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 6px 8px; }
 .attach-chip { position: relative; width: 64px; height: 64px; border-radius: var(--r-md); overflow: hidden; border: 1px solid var(--border); background: var(--surface-2); }
@@ -212,8 +229,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .chip-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #composerEffortName { color: var(--accent); flex: none; }
 #sendButton, #stopButton { width: 36px; height: 36px; border-radius: var(--r-lg); border: 0; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; flex: none; }
-#sendButton { background: var(--accent); color: var(--on-accent); }
-#sendButton:hover { background: var(--accent-hover); }
+#sendButton { background: var(--accent-fill); color: var(--on-accent-fill); transition: background-color var(--dur-1) var(--ease-out); }
+#sendButton:hover { background: var(--accent-fill-hover); }
 #sendButton svg, #stopButton svg { width: 17px; height: 17px; }
 #stopButton { background: var(--surface-3); color: var(--text); }
 #stopButton:hover { background: var(--border-strong); }
@@ -236,13 +253,27 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 
 /* Toasts & misc */
 #toastHost { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 120; align-items: center; pointer-events: none; }
-.toast { background: var(--surface); color: var(--text); border: 1px solid var(--border); box-shadow: var(--shadow-pop); border-radius: var(--r-lg); padding: 10px 18px; font-size: var(--fs-md); font-weight: 550; display: flex; align-items: center; gap: 9px; animation: toast-in .18s ease; }
+.toast { background: var(--surface); color: var(--text); border: 1px solid var(--border); box-shadow: var(--shadow-pop); border-radius: var(--r-lg); padding: 10px 18px; font-size: var(--fs-md); font-weight: 550; display: flex; align-items: center; gap: 9px; animation: toast-in var(--dur-2) var(--ease-out); }
 .toast { pointer-events: auto; }
 .toast svg { width: 15px; height: 15px; flex: none; }
 .toast .icon-btn { width: 24px; height: 24px; margin-left: var(--s2); }
 .toast.ok svg { color: var(--ok); }
 .toast.err svg { color: var(--err); }
-@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+@keyframes toast-in { from { opacity: 0; transform: translateY(6px); } }
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes pop-in { from { opacity: 0; transform: translateY(-4px) scale(.98); } }
+/* Views cross-fade in; dialogs, menus and the theme switch fade, never slide far. */
+.panel:not([hidden]), #appMain[data-view="chat"] #chatPanel { animation: fade-in var(--dur-2) var(--ease-out); }
+#moreMenu:popover-open, dialog[open] { animation: pop-in var(--dur-2) var(--ease-out); }
+dialog[open]::backdrop { animation: fade-in var(--dur-2) var(--ease-out); }
+:root.theme-fade, :root.theme-fade * { transition: background-color var(--dur-3) var(--ease-out), border-color var(--dur-3) var(--ease-out), color var(--dur-3) var(--ease-out), fill var(--dur-3) var(--ease-out) !important; }
+/* One tooltip for every [data-tip]: hover after a pause, keyboard focus at once; Escape, blur or leaving hides it. */
+.tip { position: fixed; z-index: 130; max-width: 280px; padding: var(--s2) 10px; border: 1px solid var(--tip-border); border-radius: var(--r-md); background: var(--tip-bg); color: var(--tip-text); box-shadow: var(--shadow-pop); font-size: var(--fs-sm); line-height: 1.4; white-space: pre-line; overflow-wrap: anywhere; pointer-events: none; opacity: 0; visibility: hidden; transform: translateY(3px); transition: opacity var(--dur-1) var(--ease-out), transform var(--dur-1) var(--ease-out), visibility 0s linear var(--dur-1); }
+.tip[data-side="bottom"] { transform: translateY(-3px); }
+.tip[data-side="left"] { transform: translateX(3px); }
+.tip.show { opacity: 1; visibility: visible; transform: none; pointer-events: auto; transition-delay: 0s; }
+[data-tip]:not(button, a, input, select, textarea, label) { cursor: help; }
+.tip-u { text-decoration: underline dotted color-mix(in srgb, currentColor 45%, transparent); text-underline-offset: 3px; }
 .spin { animation: spin 1s linear infinite; display: inline-flex; }
 @keyframes spin { to { transform: rotate(360deg); } }
 [hidden] { display: none !important; }
@@ -288,16 +319,16 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 #viewNav a { padding: 3px 12px; border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-md); font-weight: 600; }
 #viewNav a:hover { color: var(--text); text-decoration: none; }
 #viewNav a[aria-current="page"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border); }
-#viewNav a { position: relative; display: inline-flex; align-items: center; gap: 6px; transition: color .15s, background-color .15s; }
-.nav-dot { position: absolute; top: 2px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+#viewNav a { position: relative; display: inline-flex; align-items: center; gap: 6px; transition: color var(--dur-1) var(--ease-out), background-color var(--dur-1) var(--ease-out), box-shadow var(--dur-1) var(--ease-out); }
+.nav-dot { position: absolute; top: 2px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent-fill); }
 .nav-dot[hidden] { display: none; }
 #viewNav .nav-i { width: 14px; height: 14px; flex: none; opacity: .75; }
-#viewNav a[aria-current="page"] .nav-i { opacity: 1; }
+#viewNav a[aria-current="page"] .nav-i { opacity: 1; color: var(--accent); }
 /* Models: Installed | Available, one URL each (/models, /downloads); the thumb slides under the current one. */
 #modelsTabs { position: relative; display: inline-grid; grid-template-columns: 1fr 1fr; padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
-#modelsTabs::before { content: ""; position: absolute; inset: 2px auto 2px 2px; width: calc(50% - 2px); border-radius: var(--r-sm); background: var(--surface); box-shadow: 0 0 0 1px var(--border); transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+#modelsTabs::before { content: ""; position: absolute; inset: 2px auto 2px 2px; width: calc(50% - 2px); border-radius: var(--r-sm); background: var(--surface); box-shadow: 0 0 0 1px var(--border); transition: transform var(--dur-3) var(--ease-out); }
 #modelsPanel[data-sub="available"] #modelsTabs::before { transform: translateX(100%); }
-#modelsTabs a { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 26px; padding: 0 14px; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; transition: color .15s; }
+#modelsTabs a { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 26px; padding: 0 14px; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; transition: color var(--dur-1) var(--ease-out); }
 #modelsTabs a:hover, #modelsTabs a[aria-current="page"] { color: var(--text); text-decoration: none; }
 #modelsTabPct { color: var(--accent); font-variant-numeric: tabular-nums; }
 #modelsTabPct:empty { display: none; }
@@ -309,7 +340,6 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
   #modelsPanel .page-head .titles { display: contents; }
   #modelsPanel .page-head .titles .sub { order: 1; flex-basis: 100%; }
 }
-@media (prefers-reduced-motion: reduce) { #modelsTabs::before, #viewNav a { transition: none; } }
 .dl-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--s2) var(--s3); padding: var(--s3) var(--s4); border-bottom: 1px solid var(--border); }
 .dl-row:last-child { border-bottom: 0; }
 .dl-row.pick { background: var(--accent-soft); }
@@ -325,7 +355,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 body[data-mode="compact"] .adv { display: none !important; }
 body[data-mode="advanced"] .cmp { display: none !important; }
 .seg { display: inline-flex; padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
-.seg button { height: 24px; padding: 0 10px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; cursor: pointer; }
+.seg button { height: 24px; padding: 0 10px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; cursor: pointer; transition: background-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out), box-shadow var(--dur-1) var(--ease-out); }
+.seg button:hover { color: var(--text); }
 .seg button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border); }
 .panel { position: absolute; inset: 0; overflow: auto; background: var(--bg); color: var(--text); }
 .page-head { position: sticky; top: 0; z-index: 2; background: var(--surface); border-bottom: 1px solid var(--border); }
@@ -383,7 +414,7 @@ dialog.confirm p { color: var(--text-2); margin: 0 0 var(--s3); }
 dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2); margin-top: var(--s4); }
 .set { display: grid; grid-template-columns: minmax(180px, 1fr) 240px; gap: var(--s1) var(--s4); padding: var(--s3) 0 var(--s3) var(--s3); border-top: 1px solid var(--border); position: relative; }
 .set:first-child { border-top: 0; }
-.set.dirty::before { content: ""; position: absolute; left: 0; top: var(--s3); bottom: var(--s3); width: 3px; border-radius: 2px; background: var(--accent); }
+.set.dirty::before { content: ""; position: absolute; left: 0; top: var(--s3); bottom: var(--s3); width: 3px; border-radius: 2px; background: var(--accent-fill); }
 .set .lab { font-weight: 600; display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .set .help { grid-column: 1; color: var(--text-2); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .set .ctl { grid-row: 1 / span 2; grid-column: 2; align-self: center; display: flex; flex-direction: column; gap: var(--s1); min-width: 0; }
@@ -409,14 +440,15 @@ dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2);
 .list { overflow: hidden; }
 .filter { padding: var(--s2); border-bottom: 1px solid var(--border); }
 .group-l { padding: var(--s2) var(--s4); font-size: var(--fs-xs); font-weight: 650; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); background: var(--surface-2); border-bottom: 1px solid var(--border); }
-.row { display: flex; align-items: center; gap: var(--s3); min-height: 60px; padding: var(--s2) var(--s3) var(--s2) var(--s4); border-bottom: 1px solid var(--border); cursor: pointer; position: relative; }
+.row { display: flex; align-items: center; gap: var(--s3); min-height: 60px; padding: var(--s2) var(--s3) var(--s2) var(--s4); border-bottom: 1px solid var(--border); cursor: pointer; position: relative; transition: background-color var(--dur-1) var(--ease-out); }
+.row:hover { background: var(--surface-2); }
 .row:last-child { border-bottom: 0; }
-.row[aria-selected="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.row[aria-selected="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent-fill); }
 .row .main { flex: 1; min-width: 0; }
 .row .name { font-weight: 600; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .row .meta { color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
 .row .meta.err { color: var(--err); }
-.row .edit-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.row .edit-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-fill); }
 .d-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--s3); padding: var(--s4); border-bottom: 1px solid var(--border); }
 .d-head h2 { margin: 0; font-size: var(--fs-lg); overflow-wrap: anywhere; display: block; }
 .d-head .grow { min-width: 0; flex: 1 1 320px; }
@@ -444,7 +476,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 
 /* ---- Settings ---- */
 .meter { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; margin: var(--s2) 0; }
-.meter > span { display: block; height: 100%; background: var(--info); width: 0; transition: width .3s ease; }
+.meter > span { display: block; height: 100%; background: var(--info); width: 0; transition: width var(--dur-3) var(--ease-out); }
 .usage { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s2); color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
 .card-b > .set { padding-left: 0; }
 .card-b > .set.dirty { padding-left: var(--s3); }
@@ -463,7 +495,8 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 #dashPanel .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
 @media (min-width: 640px) { #dashPanel .tiles { grid-template-columns: repeat(4, 1fr); } }
 @media (min-width: 1200px) { #dashPanel .tiles { grid-template-columns: repeat(8, 1fr); } }
-.tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--s3) 14px; min-width: 0; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--s3) 14px; min-width: 0; transition: border-color var(--dur-1) var(--ease-out); }
+.tile[data-tip]:hover, .tile[data-tile]:hover { border-color: var(--border-strong); }
 #dashPanel [data-tile] { cursor: help; position: relative; }
 #dashPanel .tile .k { font-size: var(--fs-sm); color: var(--text-2); text-transform: uppercase; letter-spacing: .5px; }
 #dashPanel .tile .v { font-size: var(--fs-xl); font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
@@ -483,7 +516,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 @media (max-width: 559px) { #dashPanel .tiles-cmp .tile .v { font-size: var(--fs-lg); white-space: nowrap; } #dashPanel .tiles-cmp .tile .v small { font-size: var(--fs-sm); } }
 #dashPanel .tiles-cmp .tile .s { overflow-wrap: anywhere; }
 #dashPanel .tiles-cmp .meterbar { height: 6px; margin-top: auto; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
-#dashPanel .tiles-cmp .meterbar > span { display: block; height: 100%; border-radius: 3px; background: var(--info); }
+#dashPanel .tiles-cmp .meterbar > span { display: block; height: 100%; border-radius: 3px; background: var(--info); transition: width var(--dur-3) var(--ease-out); }
 #dashPanel .charts-cmp { display: grid; grid-template-columns: 1fr; gap: var(--s3); }
 @media (min-width: 900px) { #dashPanel .charts-cmp { grid-template-columns: 1fr 1fr; } #dashPanel .charts-cmp .wide { grid-column: 1 / -1; } }
 #dashPanel .charts-cmp canvas { height: 210px; }
@@ -497,7 +530,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 #dashPanel .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
 #dashPanel .legend i.dash { height: 0; width: 14px; border-top: 2px dashed var(--warn); background: none; }
 #dashPanel canvas { width: 100%; height: 170px; display: block; cursor: crosshair; touch-action: pan-y; }
-#dashPanel canvas:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; border-radius: 4px; }
+#dashPanel canvas:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
 #dashPanel[data-offline] canvas { opacity: .45; }
 #dashPanel table.sessions { table-layout: fixed; min-width: 1100px; }
 #dashPanel table.sessions td.rid { direction: rtl; text-align: left; }
@@ -511,7 +544,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 #dashPanel .phase.decode { background: var(--ok-soft); color: var(--ok); }
 #dashPanel .phase.cached { background: var(--surface-2); color: var(--text-2); }
 #dashPanel .d-left { color: var(--info); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; margin-left: 4px; cursor: help; }
-#dashPanel #dashTip { position: fixed; display: none; z-index: 10; pointer-events: none; max-width: 280px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s2) 10px; font-size: var(--fs-sm); box-shadow: var(--shadow-pop); font-variant-numeric: tabular-nums; }
+#dashPanel #dashTip { position: fixed; display: none; z-index: 10; pointer-events: none; max-width: 280px; background: var(--tip-bg); color: var(--tip-text); border: 1px solid var(--tip-border); border-radius: var(--r-md); padding: var(--s2) 10px; font-size: var(--fs-sm); box-shadow: var(--shadow-pop); font-variant-numeric: tabular-nums; }
 #dashPanel #dashTip .t { color: var(--text-2); margin-bottom: 4px; }
 #dashPanel #dashTip .t span { opacity: .8; }
 #dashPanel #dashTip .r { display: grid; grid-template-columns: 10px 1fr auto; gap: 6px; align-items: center; padding: 1px 0; opacity: .75; }
@@ -618,8 +651,8 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <span class="spacer"></span>
   <div class="topbar-actions">
     <button id="serverDot" type="button" title="Server status"><span class="dot" id="serverDotLight"></span><b id="serverDotLabel">Checking…</b></button>
-    <div class="seg" id="modeToggle" role="group" aria-label="View"><button type="button" data-mode="compact" aria-pressed="true">Compact</button><button type="button" data-mode="advanced" aria-pressed="false">Advanced</button></div>
-    <button class="icon-btn" id="themeToggle" title="Theme" aria-label="Toggle theme"><svg id="themeToggleIcon"><use href="#i-auto"/></svg></button>
+    <div class="seg" id="modeToggle" role="group" aria-label="View"><button type="button" data-mode="compact" aria-pressed="true" data-tip="The essentials: what is loaded, speeds, memory and the SSD cache.">Compact</button><button type="button" data-mode="advanced" aria-pressed="false" data-tip="Everything: sessions, every chart, latency and histograms, and the expert rows and settings on Models and Settings.">Advanced</button></div>
+    <button class="icon-btn" id="themeToggle" aria-label="Toggle theme"><svg id="themeToggleIcon"><use href="#i-auto"/></svg></button>
     <button class="icon-btn" id="moreButton" popovertarget="moreMenu" aria-label="More"><svg><use href="#i-more"/></svg></button>
   </div>
   <div id="moreMenu" popover>
@@ -680,7 +713,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     </div>
   </div>
 
-  <aside id="chatRightbar" aria-label="Chat settings">
+  <aside id="chatRightbar" aria-label="Chat settings" data-tip-side="left">
     <div class="drawer-head"><span>Chat settings</span><button class="icon-btn" id="rightbarClose" type="button" aria-label="Close chat settings"><svg><use href="#i-x"/></svg></button></div>
     <details class="side-section" open>
       <summary><svg><use href="#i-box"/></svg>Model / Thinking</summary>
@@ -688,7 +721,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <label class="field">Model <select id="modelSelect" aria-label="Model"></select></label>
         <div class="opt-grid">
           <label class="field">Thinking effort <select id="effortSelect" aria-label="Thinking effort"></select></label>
-          <label class="field">Thinking budget <input id="optThinkBudget" type="number" min="1" step="1" placeholder="no cap" title="Thinking tokens before the model must answer" /></label>
+          <label class="field" data-tip="Thinking tokens before the model must answer. Each effort word fills in its own budget; a typed value holds until the model or the word changes.">Thinking budget <input id="optThinkBudget" type="number" min="1" step="1" placeholder="no cap" /></label>
         </div>
         <div class="side-status" id="modelStatus"></div>
       </div>
@@ -700,10 +733,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
           <textarea id="optSystem" rows="3" placeholder="Optional instructions for the model"></textarea>
         </label>
         <div class="opt-grid">
-          <label class="field">Max tokens <input id="optMaxTokens" type="number" min="1" step="1" placeholder="Default" /></label>
-          <label class="field">Temperature <input id="optTemperature" type="number" min="0" max="2" step="0.05" placeholder="Default" /></label>
-          <label class="field">Top-p <input id="optTopP" type="number" min="0" max="1" step="0.01" placeholder="Default" /></label>
-          <label class="field">Top-k <input id="optTopK" type="number" min="0" step="1" placeholder="Default" /></label>
+          <label class="field" data-tip="The longest reply allowed, in tokens. Empty uses the model's default.">Max tokens <input id="optMaxTokens" type="number" min="1" step="1" placeholder="Default" /></label>
+          <label class="field" data-tip="Randomness: 0 always takes the likeliest token, higher values vary more. Empty uses the model's default.">Temperature <input id="optTemperature" type="number" min="0" max="2" step="0.05" placeholder="Default" /></label>
+          <label class="field" data-tip="Sample only from the likeliest tokens whose probabilities add up to p (0 to 1). Empty uses the model's default.">Top-p <input id="optTopP" type="number" min="0" max="1" step="0.01" placeholder="Default" /></label>
+          <label class="field" data-tip="Sample only from the k likeliest tokens; 0 turns the limit off. Empty uses the model's default.">Top-k <input id="optTopK" type="number" min="0" step="1" placeholder="Default" /></label>
         </div>
         <button class="btn sm ghost" id="chatOptionsReset">Reset to the model's defaults</button>
       </div>
@@ -713,12 +746,12 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       <div class="side-body">
         <div class="perf-rows">
           <div class="perf-row"><span class="k">Status</span><span class="v" id="perfStatus">idle</span></div>
-          <div class="perf-row"><span class="k">First token</span><span class="v" id="perfFirstToken">—</span></div>
-          <div class="perf-row"><span class="k">Prompt</span><span class="v" id="perfPrompt">—</span></div>
-          <div class="perf-row"><span class="k">Prompt processing</span><span class="v" id="perfPrefill">—</span></div>
-          <div class="perf-row"><span class="k">Generation</span><span class="v" id="perfGeneration">—</span></div>
-          <div class="perf-row"><span class="k">Output tokens</span><span class="v" id="perfTokens">—</span></div>
-          <div class="perf-row"><span class="k">Duration</span><span class="v" id="perfDuration">—</span></div>
+          <div class="perf-row"><span class="k tip-u" tabindex="0" data-tip="Time from Send to the first streamed token, measured in this browser. It includes reading the prompt.">First token</span><span class="v" id="perfFirstToken">—</span></div>
+          <div class="perf-row"><span class="k tip-u" tabindex="0" data-tip="Prompt tokens of the last request, from the server's usage; cached ones were restored from the prefix cache, not computed.">Prompt</span><span class="v" id="perfPrompt">—</span></div>
+          <div class="perf-row"><span class="k tip-u" tabindex="0" data-tip="Prefill speed the server reported for the last request: prompt tokens computed per second.">Prompt processing</span><span class="v" id="perfPrefill">—</span></div>
+          <div class="perf-row"><span class="k tip-u" tabindex="0" data-tip="Decode speed in tokens per second: the server's figure, or while streaming the tokens shown since the first one.">Generation</span><span class="v" id="perfGeneration">—</span></div>
+          <div class="perf-row"><span class="k tip-u" tabindex="0" data-tip="Tokens in the reply, from the server's usage; while streaming, the pieces this browser received.">Output tokens</span><span class="v" id="perfTokens">—</span></div>
+          <div class="perf-row"><span class="k tip-u" tabindex="0" data-tip="Time from Send to the end of the reply, measured in this browser.">Duration</span><span class="v" id="perfDuration">—</span></div>
         </div>
       </div>
     </details>
@@ -760,11 +793,11 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <button class="btn primary" id="dashEnableMetrics" type="button">Enable metrics</button>
   </section>
   <section class="cmp tiles tiles-cmp feed">
-    <div class="tile"><div class="k">Decode</div><div class="v" id="dashCmDec">-</div><div class="s" id="dashCmDecS">&nbsp;</div></div>
-    <div class="tile"><div class="k">Prefill</div><div class="v" id="dashCmPre">-</div><div class="s" id="dashCmPreS">&nbsp;</div></div>
-    <div class="tile"><div class="k">Memory</div><div class="v" id="dashCmMem">-</div><div class="meterbar"><span id="dashCmMemBar" style="width:0"></span></div><div class="s" id="dashCmMemS">&nbsp;</div></div>
-    <div class="tile"><div class="k">SSD cache</div><div class="v" id="dashCmSsd">-</div><div class="meterbar"><span id="dashCmSsdBar" style="width:0"></span></div><div class="s" id="dashCmSsdS">&nbsp;</div><div class="s" id="dashCmSsdVolume">&nbsp;</div></div>
-    <div class="tile"><div class="k">Requests</div><div class="v" id="dashCmReq">-</div><div class="s" id="dashCmReqS">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-tip="Output tokens per second while the model generates (tok/s). Live during a reply, else the last request's tokens over its decode time. From this server's /metrics.json."><div class="k">Decode</div><div class="v" id="dashCmDec">-</div><div class="s" id="dashCmDecS">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-tip="Prompt tokens computed per second (tok/s), live while a prompt is read, else for the last finished request. Tokens restored from the prefix cache skip computation and are not counted."><div class="k">Prefill</div><div class="v" id="dashCmPre">-</div><div class="s" id="dashCmPreS">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-tip="Memory the sushi process holds (weights, KV cache and GPU buffers), in GiB, out of the memory it may use. Available is the room left; running low means long requests may be refused."><div class="k">Memory</div><div class="v" id="dashCmMem">-</div><div class="meterbar"><span id="dashCmMemBar" style="width:0"></span></div><div class="s" id="dashCmMemS">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-tip="The prefix cache on the SSD: bytes used of its budget, and the saved entries. A follow-up request restores its shared prompt from here instead of computing it again. Size it in Settings."><div class="k">SSD cache</div><div class="v" id="dashCmSsd">-</div><div class="meterbar"><span id="dashCmSsdBar" style="width:0"></span></div><div class="s" id="dashCmSsdS">&nbsp;</div><div class="s" id="dashCmSsdVolume">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-tip="Requests that hold a slot now (reading the prompt or generating), and those queued for one. Waiting that persists means more traffic than --max-concurrent allows."><div class="k">Requests</div><div class="v" id="dashCmReq">-</div><div class="s" id="dashCmReqS">&nbsp;</div></div>
   </section>
   <section class="cmp charts-cmp feed">
     <div class="card"><h2>Prefill (tok/s)<span class="sub">one point per finished request</span></h2><canvas id="dashCCpre" role="img" aria-label="Prefill speed of each finished request"></canvas></div>
@@ -774,14 +807,14 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   </section>
 
   <section class="adv tiles feed">
-    <div class="tile"><div class="k">Decode</div><div class="v" id="dashTGen">-</div><div class="s" id="dashTGenS">&nbsp;</div></div>
-    <div class="tile"><div class="k">Prefill</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">&nbsp;</div></div>
-    <div class="tile"><div class="k">Requests</div><div class="v" id="dashTReq">-</div><div class="s" id="dashTReqS">running / waiting</div></div>
-    <div class="tile"><div class="k">GPU</div><div class="v" id="dashTGpu">-</div><div class="s" id="dashTGpuS">utilization</div></div>
+    <div class="tile" tabindex="0" data-tip="Output tokens per second while the model generates (tok/s). Live during a reply, else the last request's tokens over its decode time. From this server's /metrics.json."><div class="k">Decode</div><div class="v" id="dashTGen">-</div><div class="s" id="dashTGenS">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-tip="Prompt tokens computed per second (tok/s), live while a prompt is read, else for the last finished request. Tokens restored from the prefix cache skip computation and are not counted."><div class="k">Prefill</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-tip="Running / waiting: requests that hold a slot now, and requests queued for one."><div class="k">Requests</div><div class="v" id="dashTReq">-</div><div class="s" id="dashTReqS">running / waiting</div></div>
+    <div class="tile" tabindex="0" data-tip="Utilization of the whole Apple GPU as the system reports it (not only sushi), and its clock when the system exposes it."><div class="k">GPU</div><div class="v" id="dashTGpu">-</div><div class="s" id="dashTGpuS">utilization</div></div>
     <div class="tile" data-tile="mem" tabindex="0"><div class="k">Memory</div><div class="v" id="dashTMem">-</div><div class="s" id="dashTMemS">process footprint</div></div>
-    <div class="tile"><div class="k">Avg TTFT</div><div class="v" id="dashTTtft">-</div><div class="s" id="dashTTtftS">since start</div></div>
+    <div class="tile" tabindex="0" data-tip="Time to first token: the mean time from a request's start to its first output token, over every request since the server started."><div class="k">Avg TTFT</div><div class="v" id="dashTTtft">-</div><div class="s" id="dashTTtftS">since start</div></div>
     <div class="tile" data-tile="cache" tabindex="0"><div class="k">Cache reuse</div><div class="v" id="dashTCache">-</div><div class="s" id="dashTCacheS">of prompt tokens</div></div>
-    <div class="tile"><div class="k">Served</div><div class="v" id="dashTServed">-</div><div class="s" id="dashTServedS">output tokens</div></div>
+    <div class="tile" tabindex="0" data-tip="Output tokens generated since the server started, and the prompt tokens it read."><div class="k">Served</div><div class="v" id="dashTServed">-</div><div class="s" id="dashTServedS">output tokens</div></div>
   </section>
 
   <section class="card adv feed">
@@ -852,7 +885,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <div id="cacheSet"></div>
       </div>
       <div class="tablewrap"><table class="tbl">
-        <thead><tr><th>Model</th><th class="n">Size</th><th>Last used</th><th class="n adv">Entries</th><th class="adv">ID</th><th class="n adv">Tier use</th><th class="n adv">Written</th><th class="n adv">Write rate</th><th></th></tr></thead>
+        <thead><tr><th>Model</th><th class="n"><span class="tip-u" tabindex="0" data-tip="Bytes this model's cache takes on the SSD.">Size</span></th><th><span class="tip-u" tabindex="0" data-tip="When its newest entry was written.">Last used</span></th><th class="n adv"><span class="tip-u" tabindex="0" data-tip="Saved prompt prefixes a later request can restore.">Entries</span></th><th class="adv"><span class="tip-u" tabindex="0" data-tip="The cache folder's key. A new build or a changed pack starts a new one; the old one turns stale.">ID</span></th><th class="n adv"><span class="tip-u" tabindex="0" data-tip="A loaded model's share of the cache budget: used of its cap.">Tier use</span></th><th class="n adv"><span class="tip-u" tabindex="0" data-tip="Bytes this model's cache has written to the SSD since the server started.">Written</span></th><th class="n adv"><span class="tip-u" tabindex="0" data-tip="Bytes written per second between the last two refreshes; idle when nothing was written.">Write rate</span></th><th></th></tr></thead>
         <tbody id="cacheRows"></tbody>
       </table></div>
       <div class="card-b" id="clearBox"><div class="bulk">
@@ -1195,19 +1228,27 @@ const THEME_MODES = ["system", "day", "night"];
 const THEME_LABELS = { system: "System", day: "Light", night: "Dark" };
 const THEME_ICONS = { system: "#i-auto", day: "#i-sun", night: "#i-moon" };
 function applyThemeMode(mode) {
-  const normalized = THEME_MODES.includes(mode) ? mode : "system";
-  document.documentElement.dataset.theme = normalized;
+  const normalized = THEME_MODES.includes(mode) ? mode : "system", root = document.documentElement;
+  // A switch the user makes cross-fades the colours; the first paint and reduced motion do not.
+  if (root.dataset.theme !== normalized && fadeTheme && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    root.classList.add("theme-fade");
+    clearTimeout(applyThemeMode.timer);
+    applyThemeMode.timer = setTimeout(() => root.classList.remove("theme-fade"), 300);
+  }
+  root.dataset.theme = normalized;
   writeStore("sushi-theme", normalized);
   $("themeToggleIcon").firstElementChild?.setAttribute("href", THEME_ICONS[normalized]);
   for (const button of document.querySelectorAll("[data-theme-mode]")) button.setAttribute("aria-pressed", String(button.dataset.themeMode === normalized));
-  $("themeToggle").title = `Theme: ${THEME_LABELS[normalized]}`;
+  $("themeToggle").dataset.tip = `Theme: ${THEME_LABELS[normalized]}. Click for ${THEME_LABELS[THEME_MODES[(THEME_MODES.indexOf(normalized) + 1) % THEME_MODES.length]]}`;
   $("themeToggle").setAttribute("aria-label", `Theme: ${THEME_LABELS[normalized]}. Select the next theme`);
   requestAnimationFrame(() => {
     document.querySelector("meta[name='theme-color']")?.setAttribute("content", getComputedStyle(document.body).backgroundColor);
   });
 }
+let fadeTheme = false;
 function setupThemeMode() {
   applyThemeMode(readStore("sushi-theme") || "system");
+  fadeTheme = true;
   $("themeToggle").onclick = () => {
     const current = document.documentElement.dataset.theme;
     applyThemeMode(THEME_MODES[(THEME_MODES.indexOf(current) + 1) % THEME_MODES.length]);
@@ -1216,6 +1257,70 @@ function setupThemeMode() {
   window.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener("change", () => {
     if (document.documentElement.dataset.theme === "system") applyThemeMode("system");
   });
+}
+
+/* ------------------------------------------------------------
+   Tooltips: one #tip for every [data-tip] (plain text). Hover shows it after a pause, keyboard focus at once; the
+   pointer may move onto it; leaving, blur, Escape, a press or a scroll hides it. It never covers its anchor.
+   ------------------------------------------------------------ */
+const tipState = { anchor: null, timer: 0 };
+function tipOpen(anchor) {
+  const tip = $("tip");
+  clearTimeout(tipState.timer);
+  if (!anchor.isConnected || !anchor.dataset.tip) return;
+  if (tipState.anchor !== anchor) tipClose();
+  tipState.anchor = anchor;
+  tip.textContent = anchor.dataset.tip;
+  anchor.setAttribute("aria-describedby", "tip");
+  const r = anchor.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
+  const minTop = $("appTopbar").getBoundingClientRect().bottom + 4;
+  // A side panel's fields sit in a column: beside them the tip covers no neighbour.
+  const side = anchor.closest("[data-tip-side]") && r.left - w - 12 >= 8;
+  const above = r.top - h - 8 >= minTop || r.bottom + h + 8 > innerHeight;
+  tip.dataset.side = side ? "left" : above ? "top" : "bottom";
+  tip.style.left = `${side ? r.left - w - 12 : Math.max(8, Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - 8))}px`;
+  tip.style.top = `${side ? Math.max(minTop, Math.min(r.top + r.height / 2 - h / 2, innerHeight - h - 8)) : above ? Math.max(4, r.top - h - 8) : r.bottom + 8}px`;
+  tip.classList.add("show");
+}
+function tipClose() {
+  clearTimeout(tipState.timer);
+  if (!tipState.anchor) return;
+  tipState.anchor.removeAttribute("aria-describedby");
+  tipState.anchor = null;
+  $("tip").classList.remove("show");
+}
+function setupTips() {
+  const tip = el("div", "tip");
+  tip.id = "tip";
+  tip.setAttribute("role", "tooltip");
+  document.body.appendChild(tip);
+  const within = (node) => !!node && (tip.contains(node) || !!tipState.anchor?.contains(node));
+  document.addEventListener("pointerover", (event) => {
+    if (tip.contains(event.target)) return clearTimeout(tipState.timer);
+    const anchor = event.target.closest?.("[data-tip]");
+    if (!anchor || anchor === tipState.anchor) return;
+    clearTimeout(tipState.timer);
+    tipState.timer = setTimeout(() => tipOpen(anchor), event.pointerType === "touch" || tipState.anchor ? 0 : 400);
+  });
+  document.addEventListener("pointerout", (event) => {
+    if (within(event.relatedTarget)) return;
+    if (tipState.anchor || event.target.closest?.("[data-tip]")) {
+      clearTimeout(tipState.timer);
+      tipState.timer = setTimeout(tipClose, 100);
+    }
+  });
+  document.addEventListener("focusin", (event) => {
+    const anchor = event.target.closest?.("[data-tip]");
+    if (anchor && event.target.matches(":focus-visible")) tipOpen(anchor);
+  });
+  document.addEventListener("focusout", (event) => { if (tipState.anchor && !within(event.relatedTarget)) tipClose(); });
+  document.addEventListener("pointerdown", (event) => { if (!tip.contains(event.target)) tipClose(); });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && tipState.anchor) { event.preventDefault(); tipClose(); }
+    else if (event.metaKey || event.ctrlKey) tipClose();
+  }, true);
+  addEventListener("scroll", (event) => { if (event.target === document || event.target.contains?.(tipState.anchor)) tipClose(); }, true);
+  addEventListener("resize", tipClose);
 }
 
 /* ------------------------------------------------------------
@@ -2876,6 +2981,7 @@ document.addEventListener("keydown", (event) => {
 async function init() {
   for (const img of document.querySelectorAll("img.mark")) img.src = LOGO;
   $("favicon").href = LOGO;
+  setupTips();
   setupThemeMode();
   loadChatOptions();
   applyChatAsideDefaults();
@@ -3406,8 +3512,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const P = per(F.id), pend = modelStore.pending.get(m.id), why = loadError(m);
     setText(F.name, m.id);
     const words = pend ? (pend === "unload" ? "Unloading…" : "Loading…") : { ready: "Loaded", loading: "Loading…", error: "Load failed" }[m.state] ?? "Not loaded";
-    const facts = [m.bytes_on_disk && `${adminBytes(m.bytes_on_disk)} on disk`, m.bytes_linked > 0 && `${adminBytes(m.bytes_linked)} linked from elsewhere`, m.state === "ready" && m.bytes_resident && `${adminBytes(m.bytes_resident)} in memory`, m.context_length && `${adminTokens(m.context_length)} max context`, (m.input_modalities ?? []).includes("image") && "sees images", streamsExperts(m) ? "streams experts" : m.streaming && "can stream experts"].filter(Boolean);
-    fill(F.facts, [dotOf(m), words, ...facts, m.path].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map((t) => h("span", { text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
+    const facts = [m.bytes_on_disk && [`${adminBytes(m.bytes_on_disk)} on disk`, "Size of the pack's files on this disk."], m.bytes_linked > 0 && [`${adminBytes(m.bytes_linked)} linked from elsewhere`, "Bytes the pack folder reaches through links to files kept elsewhere."], m.state === "ready" && m.bytes_resident && [`${adminBytes(m.bytes_resident)} in memory`, "Memory the loaded model holds now: its weights and caches."], m.context_length && [`${adminTokens(m.context_length)} max context`, "The most tokens a request may hold, prompt and reply together."], (m.input_modalities ?? []).includes("image") && ["sees images", "Takes images as input: the chat shows an attach button."], streamsExperts(m) ? ["streams experts", "Its experts stay on the SSD and are read as layers need them, so it runs in less memory than its size."] : m.streaming && ["can stream experts", "When memory is short its experts can stay on the SSD (--ssd-budget-gb)."]].filter(Boolean);
+    fill(F.facts, [dotOf(m), words, ...facts.map(([t]) => t), m.path].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map(([t, tip]) => h("span", { class: "tip-u", tabindex: "0", "data-tip": tip, text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
     const stale = needsReload(m);
     fill(F.actions, `${m.state}|${pend ?? ""}|${stale}|${evictNote(m)}`, () => {
       const btn = (text, kind, cls = "", busy = false, title = "") => h("button", { class: `btn sm ${cls}`, type: "button", text, title: title || null, disabled: busy, "aria-busy": busy ? "true" : null, onclick: () => actOn(F.id, kind) });
@@ -3800,7 +3906,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const old = D.rows.get(p.repo);
     if (old?.sig === sig) return old;
     const badges = [
-      p.recommended ? h("span", { class: "badge ok", text: "Recommended for this Mac" }) : null,
+      p.recommended ? h("span", { class: "badge ok", tabindex: "0", "data-tip": tierText(p) + (p.size_bytes != null ? ` ${adminBytes(p.size_bytes)} to download.` : ""), text: "Recommended for this Mac" }) : null,
       p.installed ? h("span", { class: "badge saved", text: "Downloaded" }) : null,
       p.update ? h("span", { class: "badge flag", text: `Update ${p.update.latest}` }) : null,
       p.fits === false ? h("span", { class: "badge", text: `Needs ${p.tier_gb} GB` }) : null,
@@ -4472,7 +4578,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (cv.getAttribute('aria-label') !== name) cv.setAttribute('aria-label', name);
     const tEnd = opts.tEnd ?? (n ? t[n - 1] : Date.now()), tStart = tEnd - win;
     const X = tm => padL + (w - padL - padR) * (tm - tStart) / win, Y = v => padT + (hgt - padT - padB) * (1 - v / max);
-    ctx.font = '11px ui-sans-serif, system-ui, sans-serif'; ctx.fillStyle = css('--text-2'); ctx.strokeStyle = css('--surface-2'); ctx.lineWidth = 1;
+    ctx.font = '11px ui-sans-serif, system-ui, sans-serif'; ctx.fillStyle = css('--chart-axis'); ctx.strokeStyle = css('--chart-grid'); ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const v = max * i / 4, y = Math.round(Y(v)) + .5;
       ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();

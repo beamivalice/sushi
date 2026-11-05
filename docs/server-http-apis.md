@@ -492,6 +492,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
 
 ## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`, `GET /downloads`)
 
+- Design rules (tokens, salmon accent, motion, logo, tooltips): [server-webui](server-webui.md).
 - One self-contained file, `src/webui/index.html` (CSS, JS and the logo inline, no external fetch), embedded with
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
