@@ -1992,7 +1992,7 @@ pub const trunk_launches: report.Bench = .{
         .{ .name = "k", .values = &.{ "4", "6" } },
         .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "5", "8" } },
     },
-    .arms = &.{ "affine8", "exact", "walk1", "floor", "unr2", "r32" },
+    .arms = &.{ "affine8", "exact", "walk1", "floor", "unr2", "r32", "own" },
     .ref = "affine8",
     .run = runTrunkLaunches,
 };
@@ -2061,14 +2061,19 @@ fn trunkLaunchStep(c: TrunkLaunchCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_ar
             for (outs[0..np], 0..) |o, p| ys[p] = o;
             return np;
         },
-        2, 4, 5 => {
+        2, 4, 5, 6 => {
             // The served launch on the one-tile walk and the 64-bit reader (walk1), or with only one of them (unr2, r32).
             project_rows.rows_exact = true;
             const p = c.shared[ci].p;
             const out: c_int = @intCast(totalOut(c.sh));
             var g = project_rows.rowsGeometry(@intCast(c.sh.in), out, @intCast(c.rows), 1);
+            g.sw = false;
             if (c.arm != 4) g.unr = 1;
             if (c.arm != 5) g.r32 = false;
+            if (c.arm == 6) {
+                g.unr = 2;
+                g.r32 = true;
+            }
             var bounds: [3]c_int = @splat(out);
             for (1..np) |k| bounds[k - 1] = c.shared[ci].cols[k];
             ys[0] = try project_rows.projectRowsWith(s, x, p.trellis, p.suh, p.svh, g, try project_rows.rowsKernel(g), bounds);
@@ -2241,7 +2246,7 @@ fn runTrunkLaunches(run: *report.Run) anyerror!void {
                 const smp = TrunkLaunchSample{ .s = s, .x0 = x0, .c = ctx, .steps = steps, .link_ns = try trunkLaunchLinkNs(s, x0, steps) };
                 if (run.hasArm("exact")) {
                     const want = try trunkLaunchBytes(a, smp, 1);
-                    for ([_][]const u8{ "walk1", "unr2", "r32" }, [_]usize{ 2, 4, 5 }) |name, arm| {
+                    for ([_][]const u8{ "walk1", "unr2", "r32", "own" }, [_]usize{ 2, 4, 5, 6 }) |name, arm| {
                         if (run.hasArm(name) and !std.mem.eql(u32, want, try trunkLaunchBytes(a, smp, arm)))
                             run.invalid("a walk arm wrote other bytes than the served launch");
                     }

@@ -251,8 +251,8 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\    nfrag wf[UNR][2];
     \\    for (uint u = 0u; u < uint(UNR); u++) {
     \\      const device uint *wp = wcol + (size_t)(tk + u * uint(KPH) - tk0) * OT * PACKED_W;
-    \\      wf[u][0] = rows_wfrag<N, R32>(wp, lane);
-    \\      wf[u][1] = rows_wfrag<N, R32>(wp + PACKED_W, lane);
+    \\      wf[u][0] = rows_wfrag<N, R32, SW>(wp, lane);
+    \\      wf[u][1] = rows_wfrag<N, R32, SW>(wp + PACKED_W, lane);
     \\    }
     \\    for (uint u = 0u; u < uint(UNR); u++) {
     \\      for (short s = 0; s < 8; s++) {
@@ -321,9 +321,9 @@ const ROWS_TG_BYTES: c_int = 8192;
 
 /// One multi-row launch: `tgrp` output tile pairs per threadgroup, `kph` simdgroups per pair over its k
 /// range, `nsplit` threadgroups over the k dim, `chunk` halves per row staged at a time. `nax` launches
-/// `ROWS_NAX_SOURCE`, whose threadgroup is always tgrp 4, kph 1; its `unr` (kph 1 only) and `r32` change how the
-/// fragments are read, never a byte.
-pub const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_int, nax: bool = false, unr: c_int = 1, r32: bool = false };
+/// `ROWS_NAX_SOURCE`, whose threadgroup is always tgrp 4, kph 1; its `unr` (kph 1 only), `r32` and `sw` (n96: the four
+/// words a lane's windows span, loaded once) change how the fragments are read, never a byte.
+pub const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_int, nax: bool = false, unr: c_int = 1, r32: bool = false, sw: bool = false };
 
 const RowsKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, bounds: [3]c_int, geom: RowsGeom };
 
@@ -355,17 +355,32 @@ const W32_FRAGS: [:0]const u8 =
     \\  }
     \\  return true;
     \\}
-    \\template<uint N, uint R32>
+    \\static inline constexpr bool rows_w32(uint N, uint R32) { return R32 != 0u && N != 64u && nax_w32_fits(N); }
+    \\static inline uint rows_funnel(uint late, uint early, uint s) { return uint(((ulong(early) << 32u) | ulong(late)) >> s); }
+    \\template<uint N, uint R32, uint SW>
     \\static inline nfrag rows_wfrag(const device uint *words, uint lane) {
-    \\  if constexpr (R32 != 0u && N != 64u && nax_w32_fits(N)) {
+    \\  if constexpr (rows_w32(N, R32)) {
     \\    constexpr uint W = N / 2u;
     \\    const uint b = (lane >> 3u) & 1u;
     \\    const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
     \\    const uint s0 = nax_sh(N, b, 0u) - 16u;
     \\    const uint s1 = nax_sh(N, b, 1u) - 16u;
     \\    const uint s4 = nax_sh(N, b, 4u);
-    \\    const uint2 lo = nax_win2(words, end, W);
-    \\    const uint2 hi = nax_win2(words, end + W, W);
+    \\    uint2 lo, hi;
+    \\    if constexpr (SW != 0u && N == 96u) {
+    \\      const uint l = (end - 1u) >> 5u;
+    \\      const uint s = (0u - end) & 31u;
+    \\      const uint sp = (s + 16u) & 31u;
+    \\      const uint wm = words[l == 1u ? W - 1u : l - 2u];
+    \\      const uint w0 = words[l - 1u];
+    \\      const uint w1 = words[l];
+    \\      const uint w2 = words[l + 1u];
+    \\      lo = uint2(rows_funnel(w1, w0, s), rows_funnel(w0, wm, sp));
+    \\      hi = uint2(rows_funnel(w2, w1, sp), rows_funnel(w2, w1, s));
+    \\    } else {
+    \\      lo = nax_win2(words, end, W);
+    \\      hi = nax_win2(words, end + W, W);
+    \\    }
     \\    const half2 p0 = exl3_pairh(uint2((lo.y >> s0) & 0xffffu, (lo.y >> s1) & 0xffffu));
     \\    const half2 p1 = exl3_pairh(uint2((lo.x >> s4) & 0xffffu, lo.x & 0xffffu));
     \\    const half2 p2 = exl3_pairh(uint2((hi.y >> s0) & 0xffffu, (hi.y >> s1) & 0xffffu));
@@ -426,6 +441,7 @@ fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, na
     var g = rowsLaunch(in_dim, out_dim, rows, groups, nax);
     if (g.nax) {
         g.r32 = true;
+        g.sw = true;
         if (g.kph == 1) g.unr = 2;
     }
     return g;
@@ -521,6 +537,7 @@ pub fn projectRowsWith(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_arr
         if (g.nax) {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "UNR", g.unr));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "R32", @intFromBool(g.r32)));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "SW", @intFromBool(g.sw)));
         }
         inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
         rows_cfgs.put(key, c);
@@ -843,10 +860,12 @@ test "exl3 NAX multi-row: the unrolled 32-bit walk writes the one-tile walk's by
                 for ([_]c_int{ 1, 3, 8 }) |rows| for ([_]c_int{ rowsChunk(in, rows, nsplit), 128 }) |chunk| {
                     const one = RowsGeom{ .tgrp = 4, .kph = 1, .nsplit = nsplit, .chunk = chunk, .nax = true };
                     const want = try rig.run(alloc, 0, @intCast(rows), one, try rowsKernel(one));
-                    for ([_]c_int{ 1, 2, 4 }) |unr| for ([_]bool{ false, true }) |r32| {
+                    for ([_]c_int{ 1, 2, 4 }) |unr| for ([_]bool{ false, true }) |r32| for ([_]bool{ false, true }) |sw| {
+                        if (sw and (!r32 or unr == 4 or chunk != rowsChunk(in, rows, nsplit))) continue;
                         var g = one;
                         g.unr = unr;
                         g.r32 = r32;
+                        g.sw = sw;
                         try std.testing.expectEqualSlices(u16, want, try rig.run(alloc, 0, @intCast(rows), g, try rowsKernel(g)));
                     };
                 };
@@ -872,11 +891,12 @@ test "exl3 NAX multi-row: the 32-bit funnel reader writes the 64-bit reader's by
             if (dec.codebook.tabledHashMask() and dec.hashMask(.{ .n = n }) == null) continue;
             if (dec.codebook == .pair1 and exl3.pair1Pair(.{ .n = n }) == null) continue;
             const rig = try RowsRig.init(alloc, 0x8c41 + n, 1280, 1024, 1, n);
-            for ([_]c_int{ 1, 4 }) |kph| for ([_]c_int{ 1, 3 }) |rows| {
+            for ([_]c_int{ 1, 4 }) |kph| for ([_]c_int{ 1, 3 }) |rows| for ([_]bool{ false, true }) |sw| {
                 const one = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = 2, .chunk = rowsChunk(1280, rows, 2), .nax = true };
                 const want = try rig.run(alloc, 0, @intCast(rows), one, try rowsKernel(one));
                 var g = one;
                 g.r32 = true;
+                g.sw = sw;
                 try std.testing.expectEqualSlices(u16, want, try rig.run(alloc, 0, @intCast(rows), g, try rowsKernel(g)));
             };
         }

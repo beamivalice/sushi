@@ -349,6 +349,9 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
   `r32` on every NAX launch; `rows_wfrag` takes `nax_win2`'s two 32-bit funnels where a quad's codewords fit them, n62 to
   n102 but n64, else `nax_wfrag_k`). The MMAs run in the one-tile walk's order into the same accumulator, so every byte is the
   old walk's (`the unrolled 32-bit walk writes the one-tile walk's bytes`, `the 32-bit funnel reader ... at every rate`).
+  At n96 (`RowsGeom.sw`) a lane loads the four words its 112 bits span once (`wm`, `w0`..`w2`; only the first group wraps)
+  and cuts its four windows from them with 64-bit funnels, where two `nax_win2` calls loaded six words: the windows ending
+  at `end` and `end + 32` share one shift, those ending at `end - 16` and `end + 48` the next.
   - A one-row trunk launch is bound by the fragment reads and their decode, not the MMA or DRAM: on Flash-Next's qkv+z
     an MMA-free kernel kept ~95% of the time, while the same bytes read as coalesced words with no decode ran at the
     streaming floor. The served launch reads at 60-77% of that floor; affine-8 `quantized_matmul` streams at about it.
@@ -358,10 +361,20 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
     -1 to -2%. Unrolling gives most of it; the 32-bit reader adds 1-2% at n96 and lost 1-2% at n64, which keeps
     `nax_wfrag`. K4 (unroll alone): q+k+v -12%, indexer -30%, shared gate+up -8%, down -13 to -30%, GDN out +3 to +6%.
     DeepSeek's kph-1 linears ran -4 to -9% at 2 to 8 rows in a contended check, its tuned linears and head within noise.
+  - Quiet A/B of the shared-word reader (`--rungs rows=1,k=6,4 --rounds 11 --arms exact,own`, same settings, d42fd4fb;
+    `own` is the unroll-2 32-bit walk with each window loading its own words), us a call, own -> served: K6 qkv+z
+    61.6 -> 52.6 (-15%), GDN out 29.5 -> 26.9 (-9%), q+k+v 58.9 -> 52.0 (-12%), o 20.7 -> 17.8 (-14%), lm_head 941 -> 832
+    (-12%); K4 within +-2% (n64 keeps `nax_wfrag`). A K6 token at one row (36 GDN, 12 attention, the head) is 0.65 ms
+    shorter; the big launches now read at 90-98% of the streaming floor, lm_head at 98%. The 32-bit versus 64-bit funnel
+    was a contended interleaved call (64-bit -4 to -16% across the five big launches).
   - Ruled out (bytes unchanged, contended interleaved A/Bs at the exploration commit 33fe7c71): a threadgroup spanning every k split of a 128-wide block that folds the finish
     in split order (one dispatch, 10-60% slower: the same simdgroups in 5x fewer threadgroups; two splits per simdgroup
     2-5x); threadgroup-major `[OT/8][IT][8][n]` or pair-major addressing (within -3..+6%); four k-tiles ahead (+10-25%);
     staging 4 or 8 k-tiles' words through threadgroup memory by coalesced 16-byte loads (K4 +10-20% at one row, K6 +-5%).
+  - Ruled out on the shared-word reader (bytes unchanged, interleaved): the weight scale left out of the MMA operand and
+    applied once to the f32 sum (within 0.5%); `extract_bits` for the codeword (+3%); one `packed_uint3` load for the three
+    adjacent words (0 to +7%); a pointer-increment k loop (-1 to -2% alone, nothing on top). The K6 decode is bound by
+    the load and funnel instructions per lane, not by the hash multiply.
 - **Flash-Next's trellis trunk against the affine-8 trunk** (`shared.exl3_trunk_launches --rungs rows=1 --rounds 11`, quiet
   as above, 0417ad5b; us a call, median; affine 8 is one `quantized_matmul` per part at the pack's group, the trellis one
   stacked launch; old -> new walk):
