@@ -215,6 +215,9 @@ changes to ALL live workers at once; checks each landing updated its matching do
 **Workers.** Report progress and blockers to the coordinator; commit per step; don't push or merge unless told; put new
 knowledge in the matching doc in the branch.
 
+**Clean up.** Once a branch lands, remove its worktree and branch (local and remote). When a job ends, stop by PID every
+process it started (servers, watchers, `tail -F`, samplers) and delete its temp files and scripts; packs need the owner.
+
 **Growth policy (ENFORCED).** This file holds rules and links only and stays under 25 KB; every rule bullet is
 ≤ 3 lines. Knowledge, measurements and war stories go to `docs/` (converter knowledge to `docs/private/`); commit
 messages carry the story of a change.
