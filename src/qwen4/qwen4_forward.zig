@@ -5646,7 +5646,7 @@ test "single-stream verify feature selection excludes prefill and ordinary decod
                 xfm.spec_capture_ssm = capture;
                 for ([_]c_int{ 1, 2, 4 }) |batch| {
                     for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 4096 }) |width| {
-                        try testing.expectEqual(is_qwen4 and capture and batch == 1 and width >= 2 and width <= 8, xfm.verifyFeatureEnabled(feature, false, batch, width));
+                        try testing.expectEqual(is_qwen4 and capture and batch == 1 and width >= 2 and width <= 9, xfm.verifyFeatureEnabled(feature, false, batch, width));
                         try testing.expectEqual(is_qwen4, xfm.verifyFeatureEnabled(feature, true, batch, width));
                     }
                 }

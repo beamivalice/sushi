@@ -3420,7 +3420,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     try testing.expectEqual(prefill_routes, trf.mtp_verify_kernel_calls[2]);
     try testing.expectEqual(prefill_hc, qwen4_forward.mtp_verify_hc_prepared_calls);
     var position = prefix_len;
-    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |width| {
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }) |width| {
         const input = mlx.mlx_array_new_data(@ptrCast(ids[position..][0..width].ptr), &.{ 1, @as(c_int, @intCast(width)) }, 2, .int32);
         defer _ = mlx.mlx_array_free(input);
         trf.single_verify_test_features = @splat(false);
@@ -3454,7 +3454,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         }
         errdefer std.debug.print("[single-verify-exact] context={d} width={d} before={any} after={any}\n", .{ prefix_len, width, before, after });
         for (before, after, 0..) |old, new, feature| {
-            if (feature == 4 and verifySharedHardware() and width >= 2 and width <= 8) {
+            if (feature == 4 and verifySharedHardware() and width >= 2 and width <= trf.SINGLE_VERIFY_ROWS_MAX) {
                 try testing.expect(new > old);
             } else try testing.expectEqual(old, new);
         }

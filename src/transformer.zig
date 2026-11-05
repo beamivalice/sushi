@@ -617,6 +617,8 @@ pub fn getGdnKernel(vector_gate: bool) !mlx.mlx_fast_metal_kernel {
 
 
 pub const SingleVerifyFeature = enum { routing, down_reduce, hc_graph };
+/// The widest single-stream verify: `MAX_DEPTH` drafts and the round's first token.
+pub const SINGLE_VERIFY_ROWS_MAX: c_int = mtp_mod.MAX_DEPTH + 1;
 pub var single_verify_test_features: [3]bool = @splat(true);
 
 
@@ -3350,7 +3352,7 @@ pub const Transformer = struct {
         if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
         // Capture marks speculative verification. A short prefill tail has the
         // same shape but must keep the ordinary forward path and shared expert.
-        return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 8;
+        return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= SINGLE_VERIFY_ROWS_MAX;
     }
 
 

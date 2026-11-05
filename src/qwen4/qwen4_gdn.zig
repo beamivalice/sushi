@@ -2343,7 +2343,7 @@ const GdnDecayRoute = enum { chain, prework_chain, decode, verify, fold, prefill
 const gdn_decay_a = [8]f32{ -8, -7, -6, -9, -5, -2, 0, -10 };
 const gdn_decay_A_log = [8]f32{ 0, 0, 0, -1, 0, 0, 0, 0 };
 /// Divisible by every width 1..MAX_SEQ.
-const gdn_decay_steps: c_int = 840;
+const gdn_decay_steps: c_int = 2520;
 
 fn gdnDecayGate(head: usize) f64 {
     const sp = @log(1.0 + @exp(@as(f64, gdn_decay_a[head])));
@@ -4150,7 +4150,7 @@ test "gdn verify fold: default serves two rows and timing overrides stay within 
     gdn_verify_fold_override = null;
     for (0..10) |rows| try testing.expectEqual(rows == 2, gdnVerifyFoldFor(@intCast(rows)));
     gdn_verify_fold_override = true;
-    for (0..10) |rows| try testing.expectEqual(rows >= 2 and rows <= 8, gdnVerifyFoldFor(@intCast(rows)));
+    for (0..10) |rows| try testing.expectEqual(rows >= 2 and rows <= gdn_decode.MAX_SEQ, gdnVerifyFoldFor(@intCast(rows)));
     gdn_verify_fold_override = false;
     try testing.expect(!gdnVerifyFoldFor(2));
 }

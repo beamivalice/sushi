@@ -257,7 +257,7 @@ const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
 
 const SPLIT: c_int = 4;
 const NT: c_int = 256; // 4 dv rows per simdgroup
-pub const MAX_SEQ: c_int = 8;
+pub const MAX_SEQ: c_int = 9;
 
 pub const Geometry = struct { hk: c_int, hv: c_int, dk: c_int, dv: c_int };
 

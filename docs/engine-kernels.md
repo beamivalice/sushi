@@ -15,7 +15,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - A kernel keyed on `batch*seq == 1` declines every verify row AND batched slot, so the grid carries the rows
   (`HC_FUSED_MAX_ROWS`/`GDN_FUSED_MAX_ROWS` 16).
 - GDN decode = three fused dispatches (S 1..9 bit-identity is SAMPLING). At B=1,
-  decode (S=1) and capturing verify (S 2..8) run two: `gdn_decode.step` (prework + recurrence, mlx-serve #517)
+  decode (S=1) and capturing verify (S 2..9) run two: `gdn_decode.step` (prework + recurrence, mlx-serve #517)
   then the norm-gate, bit-identical to the chain, ~0.4 ms per forward
   ([perf-baselines](qwen4-perf.md#gdn-decode-recur)). A/B'd in one process on the forward meter.
 - Capturing GDN verify (B=1, S=2, separate projections) folds the norm-gate and rollback convolution history

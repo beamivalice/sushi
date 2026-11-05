@@ -890,6 +890,11 @@ max, die 48-49 C at each boot, 2026-11-05.
   The K6 trunk is 1-8% ahead of affine 8 at 1 to 8 rows; at 9 rows it was 14 ms behind (7217 ops against 4328 at 8 rows),
   and is 5 ms ahead now (6553 ops). (34.7) is one noisy cell. The 9-row step over 8 rows is still 4.8 ms against a 2.5 ms
   slope: GDN, the prepared HC graph and the shared-expert fold stop at 8 rows.
+- **The single-stream verify features reach 9 rows** (`trf.SINGLE_VERIFY_ROWS_MAX`: the prepared HC graph, and
+  `gdn_decode.MAX_SEQ` 9 for the fused GDN step), bytes unchanged. Meter as above, widths 8, 9, 8, 9 per boot, boots
+  A B B A, A = 850d8d8b (main) and B = this change on it, die 44-47 C at each boot; second 9-row pass, ms per forward and
+  ops: A 38.17 / 38.20 (6553), B 36.31 / 36.58 (5353), -1.7 ms (-4.6%). 8 rows: A 33.51 / 33.63, B 33.50 / 33.50.
+  The shared-expert fold (`qwen_riders.max_rows` 8) and the 9-row step to the next 2.5 ms remain.
 - Code 4k rung (`sushi bench --model <pack> --rungs 4k --tokens 512 --code-only`, in process, one load per arm, MTP default),
   decode tok/s of the two repeats (the cold first request pays JIT):
 
