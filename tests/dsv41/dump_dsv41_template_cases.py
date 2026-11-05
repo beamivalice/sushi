@@ -8,7 +8,7 @@ cases through jinja.cpp.
       [--dump src/fixtures/dsv41_template_cases.json]
 
 The server hands the template tool-call `arguments` as objects, omits `reasoning_content` when
-absent, and passes `thinking_mode` and the effort word it mapped (low|high|max).
+absent, and passes `thinking_mode` and the effort it mapped (low|high|max, or 62 for medium and 87 for xhigh).
 """
 import argparse
 import importlib.util
@@ -51,6 +51,8 @@ CASES = [
     ("simple/thinking low", SIMPLE, None, "thinking", "low"),
     ("simple/thinking high", SIMPLE, None, "thinking", "high"),
     ("simple/thinking max", SIMPLE, None, "thinking", "max"),
+    ("simple/thinking medium (62)", SIMPLE, None, "thinking", 62),
+    ("simple/thinking xhigh (87)", SIMPLE, None, "thinking", 87),
     ("system+tools/chat", WITH_SYSTEM, TOOLS, "chat", "low"),
     ("system+tools/thinking", WITH_SYSTEM, TOOLS, "thinking", "high"),
     ("tools, no system/thinking", SIMPLE, TOOLS, "thinking", "high"),

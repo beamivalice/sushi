@@ -52,6 +52,32 @@
   "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Weather in Paris?<｜Assistant｜><think>"
  },
  {
+  "label": "simple/thinking medium (62)",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "tools": null,
+  "thinking_mode": "thinking",
+  "reasoning_effort": 62,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 62 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Weather in Paris?<｜Assistant｜><think>"
+ },
+ {
+  "label": "simple/thinking xhigh (87)",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "tools": null,
+  "thinking_mode": "thinking",
+  "reasoning_effort": 87,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 87 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Weather in Paris?<｜Assistant｜><think>"
+ },
+ {
   "label": "system+tools/chat",
   "messages": [
    {

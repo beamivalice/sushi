@@ -34,11 +34,13 @@ const mimo_v2_efforts = [_]EffortArm{
     .{ .effort = .on },
 };
 
-// DeepSeek's encoder takes low|high|max and renders a numeric budget; medium folds to high.
+// DeepSeek's encoder renders a 1-100 effort: low 50, medium 62, high 75, xhigh 87, max 100 (`chat.dsv41EffortFor`).
 const deepseek_v41_efforts = [_]EffortArm{
     .{ .effort = .off },
     .{ .effort = .low },
+    .{ .effort = .medium },
     .{ .effort = .high },
+    .{ .effort = .xhigh },
     .{ .effort = .max },
 };
 
@@ -106,6 +108,17 @@ pub fn armForWord(arms: []const EffortArm, word: []const u8) ?EffortArm {
     for (arms, 0..) |a, i| offered[i] = a.effort;
     const e = selectEffort(offered[0..arms.len], parseEffort(word) orelse return null) orelse return null;
     return findEffortArm(arms, e);
+}
+
+test "DeepSeek-V4.1 serves medium and xhigh as their own words, without a re-route" {
+    const arms = effortArms("deepseek_v41").?;
+    var offered: [std.enums.values(Effort).len]Effort = undefined;
+    for (arms, 0..) |a, i| offered[i] = a.effort;
+    for ([_]Effort{ .off, .low, .medium, .high, .xhigh, .max }) |e| {
+        const pick = selectEffortPick(offered[0..arms.len], e).?;
+        try testing.expectEqual(e, pick.effort);
+        try testing.expect(pick.rerouted_from == null);
+    }
 }
 
 test "selectEffort: Qwen high and max re-route to xhigh; other unknowns stay refused" {

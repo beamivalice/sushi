@@ -16,8 +16,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
 - Routed experts always stream: 289 GB of FP4 against a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
   model-settings) is required, as on every streamed load; without one the load fails with `ExpertStreamingRequired`.
-- Thinking: `low`, `high`, `max` (the encoder's ladder, rendered as a 50/75/100 budget), default `high`; `medium` is
-  served as `high`; a request that names no thinking or effort thinks, at `high` (`ModelConfig.defaultEnableThinking`; an explicit field wins, `enable_thinking: false` or effort `off` is a `chat` render). The template is [src/fixtures/dsv41_chat_template.jinja](../src/fixtures/dsv41_chat_template.jinja),
+- Thinking: `low` 50, `medium` 62, `high` 75, `xhigh` 87, `max` 100 on the encoder's 1-100 effort scale (its own
+  words are low/high/max; medium and xhigh reach it as numbers), default `high`; a request that names no thinking or effort thinks, at `high` (`ModelConfig.defaultEnableThinking`; an explicit field wins, `enable_thinking: false` or effort `off` is a `chat` render). The template is [src/fixtures/dsv41_chat_template.jinja](../src/fixtures/dsv41_chat_template.jinja),
   pinned byte for byte to the release's `encoding/encoding.py` ([below](#oracle)).
 - Tool calls: DSML with V4.1's leading-space tag names (`<｜DSML｜ invoke name=…>`); the parser takes both spellings.
 

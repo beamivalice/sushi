@@ -11,6 +11,7 @@ DeepSeek vision serving: the processor carries the release's budgets, a placehol
 DeepSeek's image-encode bill, which is also its transient cap, covers a quarter over the measured peak
 DeepSeek's live headroom and its load fit each count the decode pool the ledger parks once
 DeepSeek's request bill takes its prefill working set out of the decoder pools a prefill may release
+DeepSeek-V4.1 serves medium and xhigh as their own words, without a re-route
 DeepSeek: the streamed request bill brackets the prefill peaks measured on the M5 Max
 GLM BF16 individual index recognizes separate gate up down experts
 GLM BF16 individual source preserves shard bytes and leaves dense prefix and MTP unopened
@@ -250,7 +251,7 @@ round_cost: a MiMo boot keeps each long-context rung's rounds in its own bucket
 selectEffort: GLM medium re-routes to high and xhigh to max; other missing words stay refused
 selectEffort: Qwen high and max re-route to xhigh; other unknowns stay refused
 selectEffortPick: only Qwen high and max carry a re-route; MiMo's on-fold stays quiet
-serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto low|high|max
+serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto the encoder's ladder
 slice (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1, SUSHI_MODELS_DIR and ENCODER_SLICE_OUT): writes a layers-by-experts slice for conversion runs
 source: SafetensorsSource streams per-expert public weights for Qwen, GLM and MiMo and refuses GGUF
 spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)

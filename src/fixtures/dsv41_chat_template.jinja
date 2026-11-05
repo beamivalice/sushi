@@ -3,7 +3,7 @@
     encoder by tests/dsv41/dump_dsv41_template_cases.py over the shapes the server sends. jinja.cpp
     drops a newline right after a block tag, so those are spelled out.
     Kwargs: thinking_mode ("chat" | "thinking"; enable_thinking also accepted),
-    reasoning_effort (low | high | max, or 1-100; default high). -#}
+    reasoning_effort (low | high | max, or 1-100: the server sends 62 for medium, 87 for xhigh; default high). -#}
 {%- if thinking_mode is not defined -%}
 {%- set thinking_mode = 'thinking' if (enable_thinking is defined and enable_thinking) else 'chat' -%}
 {%- endif -%}

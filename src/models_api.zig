@@ -1279,7 +1279,7 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
         .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":false}}", .want = ",\"default_reasoning_effort\":\"off\"" },
         .{ .arch = "mimo_v2", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"on\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"on\"" },
         .{ .arch = "glm5_next", .gen = "{}", .want = ",\"reasoning_efforts\":[\"low\",\"high\",\"max\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"high\"" },
-        .{ .arch = "deepseek_v41", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"high\",\"max\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"high\"" },
+        .{ .arch = "deepseek_v41", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"reasoning_effort_budgets\":{},\"default_reasoning_effort\":\"high\"" },
     }) |c| {
         const config_json = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"{s}\"}}", .{c.arch});
         defer t.allocator.free(config_json);

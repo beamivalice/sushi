@@ -1194,12 +1194,15 @@ pub fn templateConsumesEffort(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
 }
 
-/// OpenAI's effort vocabulary -> DeepSeek-V4.1's low|high|max (the encoder's default is high).
+/// OpenAI's effort vocabulary -> the JSON value DeepSeek-V4.1's encoder takes: its words (low 50, high 75, max 100,
+/// default high) or a 1-100 budget for the steps between them.
 fn dsv41EffortFor(effort: ?[]const u8) []const u8 {
-    const e = effort orelse return "high";
-    if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) return "low";
-    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max") or std.mem.eql(u8, e, "ultra")) return "max";
-    return "high";
+    const e = effort orelse return "\"high\"";
+    if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) return "\"low\"";
+    if (std.mem.eql(u8, e, "medium")) return "62";
+    if (std.mem.eql(u8, e, "xhigh")) return "87";
+    if (std.mem.eql(u8, e, "max") or std.mem.eql(u8, e, "ultra")) return "\"max\"";
+    return "\"high\"";
 }
 
 /// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
@@ -1273,9 +1276,8 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.append(allocator, '"');
     } else if (dsv41_style) {
         // V4.1 renders a numeric budget for every thinking turn, on its own ladder.
-        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":");
         try buf.appendSlice(allocator, dsv41EffortFor(effort));
-        try buf.append(allocator, '"');
     } else if (qwen38_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, qwen38EffortFor(effort, enable_thinking));
@@ -2125,7 +2127,7 @@ test "serializeExtraContext with thinking disabled" {
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":false") != null);
 }
 
-test "serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto low|high|max" {
+test "serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto the encoder's ladder" {
     // The family is sniffed by `thinking_mode`, which only this template
     // reads; `thinking_mode` still carries the on/off switch.
     const allocator = testing.allocator;
@@ -2148,7 +2150,8 @@ test "serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto low|hig
     const mapped_cases = [_]struct { in: ?[]const u8, out: []const u8 }{
         .{ .in = "high", .out = "\"reasoning_effort\":\"high\"" },
         .{ .in = "max", .out = "\"reasoning_effort\":\"max\"" },
-        .{ .in = "xhigh", .out = "\"reasoning_effort\":\"max\"" },
+        .{ .in = "xhigh", .out = "\"reasoning_effort\":87" },
+        .{ .in = "medium", .out = "\"reasoning_effort\":62" },
         .{ .in = "low", .out = "\"reasoning_effort\":\"low\"" },
     };
     for (mapped_cases) |case| {
@@ -3270,7 +3273,9 @@ test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with
         defer a.free(msgs);
         const tools: ?[]u8 = if (o.get("tools").? == .null) null else try std.json.Stringify.valueAlloc(a, o.get("tools").?, .{});
         defer if (tools) |t| a.free(t);
-        const extra = try std.fmt.allocPrint(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":\"{s}\"}}", .{ o.get("thinking_mode").?.string, o.get("reasoning_effort").?.string });
+        const effort = try std.json.Stringify.valueAlloc(a, o.get("reasoning_effort").?, .{});
+        defer a.free(effort);
+        const extra = try std.fmt.allocPrint(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":{s}}}", .{ o.get("thinking_mode").?.string, effort });
         defer a.free(extra);
         const tpl_z = try a.dupeSentinel(u8, tpl, 0);
         defer a.free(tpl_z);
@@ -3293,11 +3298,13 @@ test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with
     }
 }
 
-test "chat: the V4.1 effort words stay on the encoder's low|high|max ladder" {
-    try testing.expectEqualStrings("high", dsv41EffortFor(null));
-    try testing.expectEqualStrings("low", dsv41EffortFor("minimal"));
-    try testing.expectEqualStrings("high", dsv41EffortFor("medium"));
-    try testing.expectEqualStrings("max", dsv41EffortFor("xhigh"));
+test "chat: the V4.1 effort words map onto the encoder's 1-100 ladder, medium at 62 and xhigh at 87" {
+    try testing.expectEqualStrings("\"high\"", dsv41EffortFor(null));
+    try testing.expectEqualStrings("\"low\"", dsv41EffortFor("minimal"));
+    try testing.expectEqualStrings("62", dsv41EffortFor("medium"));
+    try testing.expectEqualStrings("\"high\"", dsv41EffortFor("high"));
+    try testing.expectEqualStrings("87", dsv41EffortFor("xhigh"));
+    try testing.expectEqualStrings("\"max\"", dsv41EffortFor("max"));
 }
 
 /// One DeepSeek-V4.1 turn replayed the way a client does: the model's tokens for `raw`, the server's split and parse of
