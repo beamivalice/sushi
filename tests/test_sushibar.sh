@@ -341,27 +341,52 @@ cat > "$LM/fake.c" <<'EOF'
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
 #include <unistd.h>
-/* A stand-in for `sushi --serve --port N`: answers the feeds sushibar reads, lists FAKE_READY as the ready model
-   appends the body of every POST /v1/load-model (and "unload " and the body of every /v1/unload-model) to FAKE_LOG,
-   and lists the model last loaded, until unloaded. */
+/* A stand-in for `sushi --serve --port N [--host A] [--api-key K]`: answers the feeds sushibar reads, lists
+   FAKE_READY as the ready model, appends the body of every POST /v1/load-model (and "unload " and the body of every
+   /v1/unload-model) to FAKE_LOG, and lists the model last loaded, until unloaded. With a key it answers 401 to a
+   request without it. FAKE_VERSION_FILE holds what --version prints, FAKE_CHECK what `update --check` prints;
+   FAKE_SERVER_VERSION is the version /props reports, after FAKE_PROPS_DELAY seconds; POST /v1/update is accepted
+   and changes nothing. FAKE_LINGER: a SIGTERM closes the port at once and exits that many seconds later. */
+static int fd, linger;
+static void on_term(int sig) { (void)sig; close(fd); sleep(linger); _exit(0); }
 int main(int argc, char **argv) {
-    if (argc > 1 && !strcmp(argv[1], "--version")) { puts("sushi 1.0.0"); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "--version")) {
+        char v[32] = "1.0.0";
+        FILE *f = getenv("FAKE_VERSION_FILE") ? fopen(getenv("FAKE_VERSION_FILE"), "r") : 0;
+        if (f) { if (fscanf(f, "%31s", v) != 1) strcpy(v, "1.0.0"); fclose(f); }
+        printf("sushi %s\n", v);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "update") && getenv("FAKE_CHECK")) { puts(getenv("FAKE_CHECK")); return 0; }
     int port = 0;
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--port")) port = atoi(argv[i + 1]);
+    const char *host = "127.0.0.1", *key = 0;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (!strcmp(argv[i], "--port")) port = atoi(argv[i + 1]);
+        if (!strcmp(argv[i], "--host")) host = argv[i + 1];
+        if (!strcmp(argv[i], "--api-key")) key = argv[i + 1];
+    }
     if (!port) return 1;
-    int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
-    a.sin_addr.s_addr = htonl(0x7f000001);
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1) return 1;
     if (bind(fd, (void *)&a, sizeof a) || listen(fd, 16)) return 1;
+    signal(SIGCHLD, SIG_IGN);
+    if (getenv("FAKE_LINGER")) { linger = atoi(getenv("FAKE_LINGER")); signal(SIGTERM, on_term); }
+    char bearer[160] = "";
+    if (key) snprintf(bearer, sizeof bearer, "Bearer %s", key);
+    const char *server_version = getenv("FAKE_SERVER_VERSION");
+    int props_delay = getenv("FAKE_PROPS_DELAY") ? atoi(getenv("FAKE_PROPS_DELAY")) : 0;
     const char *ready = getenv("FAKE_READY"), *log = getenv("FAKE_LOG");
     static char cur[128];
     if (ready) snprintf(cur, sizeof cur, "%s", ready);
@@ -378,21 +403,35 @@ int main(int argc, char **argv) {
             if (!end || n >= (end + 4 - req) + (cl ? atoi(cl + 15) : 0)) break;
         }
         char body[512] = "{}";
-        if (!strncmp(req, "GET /v1/models", 14))
+        const char *status = "200 OK";
+        int child = 0;
+        if (key && !strstr(req, bearer)) status = "401 Unauthorized";
+        else if (!strncmp(req, "POST /v1/update", 15)) status = "202 Accepted";
+        else if (!strncmp(req, "GET /props", 10) && server_version) {
+            snprintf(body, sizeof body, "{\"update\":{\"current\":\"%s\"}}", server_version);
+            /* A slow /props answers from a child, so the polls around it are not held up. */
+            if (props_delay > 0) {
+                pid_t k = fork();
+                if (k > 0) { close(c); continue; }
+                child = k == 0;
+                sleep(props_delay);
+            }
+        } else if (!strncmp(req, "GET /v1/models", 14))
             snprintf(body, sizeof body, cur[0] ? "{\"data\":[{\"id\":\"%s\",\"state\":\"ready\"}]}" : "{\"data\":[]}", cur);
         int is_load = !strncmp(req, "POST /v1/load-model", 19), is_unload = !strncmp(req, "POST /v1/unload-model", 21);
-        if (is_load || is_unload) {
+        if ((is_load || is_unload) && status[0] == '2') {
             char *end = strstr(req, "\r\n\r\n"), *m = end ? strstr(end, "\"model\":\"") : 0;
             cur[0] = 0;
             if (is_load && m) { snprintf(cur, sizeof cur, "%s", m + 9); char *q = strchr(cur, '"'); if (q) *q = 0; }
             FILE *f = log ? fopen(log, "a") : 0;
             if (f && end) { fprintf(f, "%s%s\n", is_unload ? "unload " : "", end + 4); fclose(f); }
         }
-        char head[160];
-        int hl = snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
+        char head[192];
+        int hl = snprintf(head, sizeof head, "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", status, strlen(body));
         write(c, head, hl);
         write(c, body, strlen(body));
         close(c);
+        if (child) _exit(0);
     }
 }
 EOF
@@ -437,6 +476,7 @@ if command -v cc > /dev/null 2>&1 && cc -o "$LM/sushi" "$LM/fake.c" 2> /dev/null
     for _ in $(seq 1 60); do kill -0 "$BP" 2> /dev/null || break; sleep 0.5; done
     check "a server sushibar started that dies after answering says so with the signal, in an orange note" "$(yes_if 'grep -q "note=\"Port '"$UPORT"': server exited (signal 9)\" problem=1" "$LOG"')"
     check "and the icon carries a badge until a server answers again" "$(yes_if 'grep -q "note=\"Port '"$UPORT"': server exited (signal 9)\" problem=1.*badge=1" "$LOG"')"
+    check "that exit is not then reported as a stop once the poll sees the port gone" "$(yes_if '! grep -q "server stopped at" "$LOG" && tail -n 1 "$LOG" | grep -q "note=\"Port '"$UPORT"': server exited (signal 9)\""')"
     rm -f "$HOME"/.sushi/sushibar-server-*.pid
 
     "$LM/sushi" --serve --port "$FPORT" > /dev/null 2>&1 &
@@ -450,6 +490,70 @@ if command -v cc > /dev/null 2>&1 && cc -o "$LM/sushi" "$LM/fake.c" 2> /dev/null
     wait "$FPID" 2> /dev/null
     for _ in $(seq 1 60); do kill -0 "$BP" 2> /dev/null || break; sleep 0.5; done
     check "a server sushibar did not start that goes away is reported with the time" "$(yes_if 'grep -qE "note=\"Port '"$FPORT"': server stopped at [0-9]{2}:[0-9]{2}\" problem=1" "$LOG"')"
+
+    echo "== Stop on a server that closes its port before it exits =="
+    FAKE_LINGER=4 run_bar "$LM/sushibar" 13 "start@2,stop@5" --port "$UPORT"
+    check "the menu reads Stopping… until the server has exited, never Starting" "$(yes_if 'grep -q "poll [6-8] .*toggle=\"Stopping…\"" "$LOG" && ! grep -Eq "poll ([6-9]|1[0-3]) .*(pill=\"Starting\"|toggle=\"Starting…\")" "$LOG" && tail -n 1 "$LOG" | grep -q "pill=\"Stopped\".*toggle=\"Start Server\""')"
+    check "and its exit is no news" "$(yes_if '! grep -q "note=\"Port '"$UPORT"': server" "$LOG"')"
+    stop_fakes
+    "$LM/sushi" --serve --port "$FPORT" > /dev/null 2>&1 &
+    FPID=$!
+    wait_health "$FPORT" > /dev/null
+    FAKE_LINGER=4 run_bar "$LM/sushibar" 9 "start@2,stop@5,port$FPORT@6" --port "$UPORT"
+    check "a Stop on one port does not read Stopping… on the port switched to" "$(yes_if 'grep -q "poll [7-9] .*Port '"$FPORT"': running.*toggle=\"Stop Server…\"" "$LOG" && ! grep -q "Port '"$FPORT"': .*toggle=\"Stopping…\"" "$LOG"')"
+    kill "$FPID" 2> /dev/null; wait "$FPID" 2> /dev/null
+    stop_fakes
+
+    echo "== a server started before sushibar relaunched itself =="
+    echo 1.0.0 > "$WORK/fake-version"
+    : > "$LOG"
+    SUSHIBAR_TEST_POLLS=12 SUSHIBAR_TEST_ACTIONS="start@2,check@11" FAKE_VERSION_FILE="$WORK/fake-version" "$LM/sushibar" --port "$UPORT" 2> "$LOG"
+    BP=$(cut -d' ' -f1 "$HOME/.sushi/sushibar.pid" 2> /dev/null)
+    wait_health "$UPORT" > /dev/null
+    echo 1.0.1 > "$WORK/fake-version"
+    for _ in $(seq 1 80); do [ "$(grep -c "poll 1 " "$LOG")" -ge 2 ] && break; sleep 0.25; done
+    SRV=$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$UPORT.pid" 2> /dev/null)
+    sleep 2
+    kill -9 "$SRV" 2> /dev/null
+    sleep 2
+    zombie=$(ps -o stat= -p "$SRV" 2> /dev/null | tr -d ' ')
+    for _ in $(seq 1 60); do kill -0 "$BP" 2> /dev/null || break; sleep 0.5; done
+    check "sushibar relaunched itself on the new version" "$(yes_if '[ "$(grep -c "poll 1 " "$LOG")" = 2 ]')"
+    check "a server it started before the relaunch is reaped when it dies, not left a zombie" "$(yes_if '[ -n "$SRV" ] && [ -z "$zombie" ]')"
+    check "and its exit is reported as such" "$(yes_if 'awk "/poll 1 /{n++} n>=2" "$LOG" | grep -q "note=\"Port '"$UPORT"': server exited (signal 9)\""')"
+    rm -f "$HOME"/.sushi/sushibar-server-*.pid
+
+    echo "== the props of a port no longer watched stay with it =="
+    FAKE_SERVER_VERSION=9.9.9 FAKE_PROPS_DELAY=3 "$LM/sushi" --serve --port "$FPORT" > /dev/null 2>&1 &
+    FPID=$!
+    wait_health "$FPORT" > /dev/null
+    run_bar "$LM/sushibar" 6 "port$UPORT@2" --port "$FPORT"
+    check "a /props answer that lands after a port switch is not shown for the new port" "$(yes_if 'grep -q "poll [3-6] .*Port '"$UPORT"': not running" "$LOG" && ! grep -q "Port '"$UPORT"': .*version=\"[^\"]*server 9.9.9" "$LOG"')"
+    kill "$FPID" 2> /dev/null; wait "$FPID" 2> /dev/null
+
+    echo "== an Update asked before the server's version is known =="
+    FAKE_SERVER_VERSION=1.0.0 FAKE_PROPS_DELAY=3 "$LM/sushi" --serve --port "$FPORT" > /dev/null 2>&1 &
+    FPID=$!
+    wait_health "$FPORT" > /dev/null
+    FAKE_CHECK="sushi 9.0.0 is available (this is 1.0.0): x" run_bar "$LM/sushibar" 16 "check@1,update@2" --port "$FPORT"
+    check "the update goes to the server, which accepts it and stays on its version" "$(yes_if 'grep -q "button=\"Updating…\"" "$LOG"')"
+    check "and it is not reported as updated" "$(yes_if '! grep -q "note=\"Updated" "$LOG"')"
+    kill "$FPID" 2> /dev/null; wait "$FPID" 2> /dev/null
+    echo '{"port":'"$UPORT"',"ports":[]}' > "$HOME/.sushi/sushibar.json"
+
+    echo "== a server bound to a non-loopback address that wants its key =="
+    IP=$(ifconfig | awk '/inet / && $2 !~ /^127\./ {print $2; exit}')
+    fw=$(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2> /dev/null | grep -c "State = 0")
+    if [ -n "$IP" ] && [ "$fw" = 1 ]; then
+        "$LM/sushi" --serve --port "$FPORT" --host "$IP" --api-key sb-test-key > /dev/null 2>&1 &
+        FPID=$!
+        for _ in $(seq 1 20); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$IP:$FPORT/health")" = 401 ] && break; sleep 0.25; done
+        run_bar "$LM/sushibar" 3 "" --port "$FPORT"
+        check "it reads running from the first poll, with its key, never Not answering" "$(yes_if 'grep -q "poll 1 .*Port '"$FPORT"': running, no model loaded" "$LOG" && ! grep -q "not answering" "$LOG"')"
+        kill "$FPID" 2> /dev/null; wait "$FPID" 2> /dev/null
+    else
+        echo "  SKIP no non-loopback IPv4 address, or the application firewall is on"
+    fi
 else
     echo "  SKIP no C compiler"
 fi

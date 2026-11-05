@@ -31,7 +31,6 @@ const tick_ms = 1000;
 const server_exe = "sushi";
 const bar_exe = "sushibar";
 const bar_pid_name = "sushibar.pid";
-const server_pid_prefix = "sushibar-server-";
 const saved_name = "sushibar.json";
 const lock_name = "sushibar.lock";
 const max_listings = 8;
@@ -179,7 +178,7 @@ var g_bar_pid_path: []const u8 = "";
 var g_saved_path: []const u8 = "";
 var g_capture_seq = std.atomic.Value(u32).init(0);
 var g_launched_version: Str(32) = .{};
-/// The model the watched server last had loaded (`sushibar.json`): Start loads it again.
+/// The model the watched server last had loaded (`sushibar.json`): Load brings it back.
 var g_last_model: Str(logic.max_model) = .{};
 /// The port a server is being asked to load `g_last_model` on, 0 when none is.
 var g_load_port = std.atomic.Value(u16).init(0);
@@ -188,8 +187,6 @@ var g_unload_port = std.atomic.Value(u16).init(0);
 /// A server the user's own Stop is ending, so its going away is no news.
 var g_stop_port: u16 = 0;
 var g_stop_at_ms: i64 = 0;
-/// The port whose server exited on its own, for the icon's badge until a server answers there or Start is pressed.
-var g_crashed_port: u16 = 0;
 
 fn lock() void {
     shared.mu.lockUncancelable(g_io);
@@ -502,6 +499,8 @@ fn refreshProps(a: std.mem.Allocator, p: u16) void {
     if (r.status != 200) return;
     const u = (logic.parseProps(a, r.body) catch return) orelse return;
     lock();
+    // The watch moved while this was asked: the answer is another server's.
+    if (port() != p) return unlock();
     const changed = shared.server_version.len > 0 and !std.mem.eql(u8, shared.server_version.get(), u.current);
     shared.server_version.set(u.current);
     shared.props_latest.set(u.latest orelse "");
@@ -533,9 +532,18 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
     const origin_s = originFor(&origin, p);
     var from_buf: [32]u8 = undefined;
     lock();
-    const from = from_buf[0..shared.server_version.len];
-    @memcpy(from, shared.server_version.get());
+    var from: []const u8 = from_buf[0..shared.server_version.len];
+    @memcpy(from_buf[0..from.len], shared.server_version.get());
     unlock();
+    // Asked before the first /props of a newly watched port: without the version it runs, any answer reads as updated.
+    if (from.len == 0) {
+        var vb: [url_cap]u8 = undefined;
+        if (get(a, p, urlFor(&vb, p, "/props"))) |pr| if (logic.parseProps(a, pr.body) catch null) |u| {
+            from = from_buf[0..@min(u.current.len, from_buf.len)];
+            @memcpy(from_buf[0..from.len], u.current[0..from.len]);
+        };
+    }
+    if (from.len == 0) return setProblem("Update failed: the server did not say which version it runs");
     const r = request(a, p, .POST, urlFor(&url, p, "/v1/update"), origin_s) orelse return setProblem("Update failed: the server did not answer");
     if (r.status != 202) {
         const why = errorMessage(a, r.body);
@@ -711,7 +719,8 @@ fn pollLoop() void {
         }
         const menu_open = g_menu_open.load(.acquire);
         var url_buf: [url_cap + 32]u8 = undefined;
-        const url = metricsUrl(&url_buf, p, tracker.since_ms);
+        var again_buf: [url_cap + 32]u8 = undefined;
+        var url = metricsUrl(&url_buf, p, tracker.since_ms);
         var reply = get(a, p, url);
         var reached = logic.linkFor(if (reply) |r| r.status else null);
 
@@ -738,10 +747,10 @@ fn pollLoop() void {
             unlock();
             // A server bound to a non-loopback address was asked on 127.0.0.1 above: ask where it listens.
             if (reply == null) {
-                var again_buf: [url_cap + 32]u8 = undefined;
                 const again = metricsUrl(&again_buf, p, tracker.since_ms);
                 if (!std.mem.eql(u8, again, url)) {
-                    reply = get(a, p, again);
+                    url = again;
+                    reply = get(a, p, url);
                     reached = logic.linkFor(if (reply) |r| r.status else null);
                 }
             }
@@ -921,7 +930,7 @@ fn removePort(p: u16) void {
 
 /// One record per port, so a server started on port A stays tracked after Start on port B.
 fn serverPidPath(buf: []u8, p: u16) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}/.sushi/{s}{d}.pid", .{ g_home, server_pid_prefix, p }) catch "";
+    return std.fmt.bufPrint(buf, "{s}/.sushi/{s}{d}.pid", .{ g_home, logic.server_pid_prefix, p }) catch "";
 }
 
 fn ownServer() ?logic.PidEntry {
@@ -934,23 +943,43 @@ fn ownServer() ?logic.PidEntry {
 /// failed start.
 const Started = struct { pid: i32 = 0, port: u16 = 0, answered: bool = false, stopping: bool = false };
 var started: [8]Started = @splat(.{});
-var reaped_this_tick = false;
 
 fn reapStarted() void {
     for (&started) |*st| {
         if (st.pid == 0) continue;
         var status: c_int = 0;
-        if (std.c.waitpid(st.pid, &status, std.c.W.NOHANG) != st.pid) continue;
+        const got = std.c.waitpid(st.pid, &status, std.c.W.NOHANG);
+        // An adopted server another sushibar started is not ours to wait for.
+        if (got == -1 and std.posix.errno(got) == .CHILD) st.* = .{};
+        if (got != st.pid) continue;
         if (!st.stopping) {
             var nb: [160]u8 = undefined;
             const how = logic.exitOf(@bitCast(status));
             if (st.answered) {
                 setProblem(logic.exitedNote(&nb, st.port, how));
-                g_crashed_port = st.port;
-                reaped_this_tick = true;
+                g_watch.reaped(st.port, io_util.nowMs(g_io));
             } else setProblem(logic.startFailedNote(&nb, st.port, how));
         }
         st.* = .{};
+    }
+}
+
+/// After a relaunch (an `exec`, same pid) the servers started before it are still this process's children: take
+/// them back from their pid files, so they are reaped, their exit reported and Quit & Stop stops them.
+fn adoptStarted() void {
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = std.fmt.bufPrint(&pb, "{s}/.sushi", .{g_home}) catch return;
+    var dir = std.Io.Dir.openDirAbsolute(g_io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(g_io);
+    var slot: usize = 0;
+    var it = dir.iterate();
+    while (it.next(g_io) catch null) |entry| {
+        if (slot == started.len) break;
+        const p = logic.serverPidPort(entry.name) orelse continue;
+        var fb: [std.fs.max_path_bytes]u8 = undefined;
+        const e = proc.verifiedPid(g_io, serverPidPath(&fb, p), server_exe, true) orelse continue;
+        started[slot] = .{ .pid = e.pid, .port = p, .answered = true };
+        slot += 1;
     }
 }
 
@@ -976,7 +1005,7 @@ fn startServer() void {
     const pid = proc.spawnDetached(&.{ sushi.ptr, "--serve", "--port", port_z.ptr }, false) catch return setProblem("could not start sushi");
     setNote("");
     pollSoon();
-    if (g_crashed_port == p) g_crashed_port = 0;
+    g_watch.started(p);
     for (&started) |*st| if (st.pid == 0) {
         st.* = .{ .pid = pid, .port = p };
         break;
@@ -1089,6 +1118,9 @@ fn confirmUpdate() bool {
 /// How long the menu says "Stopping…" before it trusts what the poll says.
 const stopping_ms = 15_000;
 var stopping_until_ms: i64 = 0;
+/// The pid the last Stop signalled, which may outlive its port by a while, and that port.
+var g_stop_pid: i32 = 0;
+var g_stopping_port: u16 = 0;
 
 /// The Stop last sent, for Force Stop when it does not take.
 var g_stop_sent: logic.StopSent = .{};
@@ -1096,6 +1128,8 @@ var g_stuck_noted = false;
 
 fn noteStopped(p: u16, pid: i32) void {
     pollSoon();
+    g_stop_pid = pid;
+    g_stopping_port = p;
     stopping_until_ms = io_util.nowMs(g_io) + stopping_ms;
     g_stop_port = p;
     g_stop_at_ms = stopping_until_ms;
@@ -1194,8 +1228,7 @@ var button_action: logic.ButtonAction = .none;
 var pack_mi: objc.id = null;
 var badge_view: objc.id = null;
 var shown_badge = false;
-var prev_answering = false;
-var prev_port: u16 = 0;
+var g_watch: logic.Watch = .{};
 /// What was copied to the clipboard last, and when: the button and the pack item say Copied for a few seconds.
 var copied_what: enum { none, upgrade, pack } = .none;
 var copied_at_ms: i64 = 0;
@@ -1309,22 +1342,23 @@ fn syncPortMenu(entries: []const logic.PortEntry) void {
     }
 }
 
-/// A server that was answering is gone: say so unless sushibar stopped it or reaped it just now.
+/// A server that was answering is gone: say so unless sushibar stopped it or reported its exit.
 fn watchTransition(p: u16, fresh: bool, link: logic.Link, now: i64) void {
     if (!fresh) return;
-    if (prev_port != p) {
-        prev_port = p;
-        prev_answering = false;
-    }
     const mine = g_stop_port == p and now < g_stop_at_ms + 45_000;
-    if (logic.stoppedUnexpectedly(prev_answering, link, mine, reaped_this_tick)) {
+    if (g_watch.observe(p, link, now, mine)) {
         var nb: [96]u8 = undefined;
         setProblem(stoppedAtNote(&nb, p));
-        g_crashed_port = p;
     }
     if (link == .offline and mine) g_stop_port = 0;
-    if (logic.answering(link) and g_crashed_port == p) g_crashed_port = 0;
-    prev_answering = logic.answering(link);
+}
+
+/// `pid` is still a sushi process (a zombie is not: its children are reaped before this is asked).
+fn sushiAlive(pid: i32) bool {
+    if (pid <= 0) return false;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = proc.exeOfPid(pid, &buf) orelse return false;
+    return std.mem.eql(u8, std.fs.path.basename(exe), server_exe);
 }
 
 /// The orange dot on the menu bar icon, at its lower right: it sits on the colour icon where the sushi does not hide it.
@@ -1434,13 +1468,13 @@ fn take(buf: []u8, s: anytype) []const u8 {
 fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     tick_count += 1;
     for (test_actions[0..test_action_n]) |act| if (act.at == tick_count) runAction(act);
-    reapStarted();
     refresh();
-    reaped_this_tick = false;
 }
 
 /// Renders the published snapshot into the menu, from the timer and straight after a click that changes it.
 fn refresh() void {
+    // Before the snapshot is read: an exit is reported as such before the poll can report the port gone.
+    reapStarted();
     const p = port();
     const now = io_util.nowMs(g_io);
     var model_b: [96]u8 = undefined;
@@ -1519,8 +1553,9 @@ fn refresh() void {
     watchTransition(p, fresh, view.link, now);
     const own = ownServer();
     const ours_alive = own != null;
-    if (view.link == .offline or stopping_until_ms <= now) stopping_until_ms = 0;
-    const stopping = stopping_until_ms > now;
+    if (!logic.stillStopping(stopping_until_ms, now, view.link, stopping_until_ms > now and sushiAlive(g_stop_pid))) stopping_until_ms = 0;
+    const stopping = stopping_until_ms > now and g_stopping_port == p;
+    const starting = ours_alive and view.link == .offline and !stopping;
     var serving_pid: i32 = if (own) |e| e.pid else 0;
     if (own == null) for (listings[0..ln]) |l| if (l.port == p) {
         serving_pid = l.pid;
@@ -1545,6 +1580,7 @@ fn refresh() void {
         .port_taken = port_taken,
         .connecting = !fresh,
         .stop_stuck = g_stop_stuck,
+        .stopping = stopping,
     };
     const on = logic.enabled(state);
     const tg = logic.toggle(state, stopping);
@@ -1560,7 +1596,7 @@ fn refresh() void {
     // The header card, then everything else it owns the numbers of.
     var arena_buf: [8192]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&arena_buf);
-    // Between Start and the model's row turning to loading, the model Start asked for is already the one loading.
+    // Between Load and the model's row turning to loading, the model Load asked for is already the one loading.
     const asked = g_load_port.load(.acquire) == p and view.link == .up and model.len == 0 and loading_id.len == 0;
     const loading_name = if (loading_id.len > 0) loading_id else if (asked) g_last_model.get() else "";
     const header = logic.buildHeader(fba.allocator(), .{
@@ -1568,7 +1604,7 @@ fn refresh() void {
         .port = p,
         .loading = loading_name.len > 0 and model.len == 0,
         .updating = uv.busy == .updating,
-        .starting = ours_alive and view.link == .offline,
+        .starting = starting,
         .connecting = !fresh,
         .port_taken = port_taken,
         .sushi_found = g_sushi_found,
@@ -1595,7 +1631,7 @@ fn refresh() void {
     const title = logic.title(&last_title, tv);
     const button = objc.msg(objc.id, status_item, "button", .{});
     showIcon(button, logic.iconFor(view.link));
-    showBadge(button, logic.badge(view.link, port_taken, g_crashed_port == p and !ours_alive));
+    showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
     setButtonTitle(button, title);
     var status_buf: [200]u8 = undefined;
     const status = logic.statusLine(&status_buf, state);
@@ -1606,7 +1642,7 @@ fn refresh() void {
     const mb = logic.modelButton(&model_tip, .{
         .link = view.link,
         .connecting = !fresh,
-        .starting = ours_alive and view.link == .offline,
+        .starting = starting,
         .model = if (model.len > 0) model else null,
         .last_model = g_last_model.get(),
         .loading = g_load_port.load(.acquire) == p or (loading_id.len > 0 and model.len == 0),
@@ -1725,7 +1761,7 @@ fn toggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .stop_stuck = g_stop_stuck,
     };
     unlock();
-    switch (logic.toggle(state, stopping_until_ms > io_util.nowMs(g_io)).action) {
+    switch (logic.toggle(state, stopping_until_ms > io_util.nowMs(g_io) and g_stopping_port == port()).action) {
         .start => startServer(),
         .stop => stopServer(),
         .force_stop => forceStop(),
@@ -2399,5 +2435,6 @@ pub fn main(init: std.process.Init) !void {
         var real: [std.fs.max_path_bytes]u8 = undefined;
         g_sibling_brew = logic.isBrewKeg(proc.realPath(&real, sushi) orelse sushi);
     }
+    adoptStarted();
     runMenuBar();
 }

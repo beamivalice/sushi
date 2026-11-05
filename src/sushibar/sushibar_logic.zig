@@ -307,6 +307,50 @@ pub fn stoppedUnexpectedly(was_answering: bool, link: Link, we_stopped: bool, re
     return was_answering and link == .offline and !we_stopped and !reaped;
 }
 
+/// Follows the watched port from refresh to refresh. A server sushibar started is reaped, and its exit reported,
+/// as soon as it ends, while the poll can still read it answering for a while after.
+pub const Watch = struct {
+    port: u16 = 0,
+    answering: bool = false,
+    reaped_port: u16 = 0,
+    reaped_until_ms: i64 = 0,
+    /// Its server went away on its own: the icon's badge, until a server answers there or Start is pressed.
+    crashed_port: u16 = 0,
+
+    const reaped_quiet_ms: i64 = 30_000;
+
+    pub fn reaped(self: *Watch, port: u16, now_ms: i64) void {
+        self.reaped_port = port;
+        self.reaped_until_ms = now_ms + reaped_quiet_ms;
+        self.crashed_port = port;
+    }
+
+    pub fn started(self: *Watch, port: u16) void {
+        if (self.crashed_port == port) self.crashed_port = 0;
+    }
+
+    pub fn crashed(self: *const Watch, port: u16) bool {
+        return self.crashed_port == port;
+    }
+
+    /// The watched `port` reads `link` now: true when its server went away and neither the user's Stop
+    /// (`we_stopped`) nor a reaped exit explains it.
+    pub fn observe(self: *Watch, port: u16, link: Link, now_ms: i64, we_stopped: bool) bool {
+        if (self.port != port) {
+            self.port = port;
+            self.answering = false;
+        }
+        const reaped_here = self.reaped_port == port and now_ms < self.reaped_until_ms;
+        const gone = stoppedUnexpectedly(self.answering, link, we_stopped, reaped_here);
+        if (gone) self.crashed_port = port;
+        // Answering before the reaped server was seen gone is the poll not having caught up yet.
+        if (answering(link) and !reaped_here and self.crashed_port == port) self.crashed_port = 0;
+        if (reaped_here and link == .offline) self.reaped_port = 0;
+        self.answering = answering(link);
+        return gone;
+    }
+};
+
 pub const Activity = struct { link: Link, decoding: bool = false, menu_open: bool = false, changing: bool = false };
 
 pub const poll_fast_ms: i64 = 1000;
@@ -635,12 +679,16 @@ pub const Server = struct {
     connecting: bool = false,
     /// A Stop sent a while ago has not taken: the same pid still listens (`stopStuck`).
     stop_stuck: bool = false,
+    /// A Stop was sent and the sushi it signalled has not exited yet (`stillStopping`).
+    stopping: bool = false,
 };
 
 pub fn statusLine(buf: []u8, s: Server) []const u8 {
     if (s.connecting) return std.fmt.bufPrint(buf, "Port {d}: connecting…", .{s.port}) catch "Connecting…";
     const text = switch (s.link) {
-        .offline => if (s.ours_alive)
+        .offline => if (s.stopping)
+            std.fmt.bufPrint(buf, "Port {d}: stopping", .{s.port})
+        else if (s.ours_alive)
             std.fmt.bufPrint(buf, "Port {d}: starting", .{s.port})
         else if (s.port_taken)
             std.fmt.bufPrint(buf, "Port {d}: in use by another program", .{s.port})
@@ -663,7 +711,7 @@ pub const Enabled = struct { start: bool, stop: bool };
 
 pub fn enabled(s: Server) Enabled {
     return .{
-        .start = s.sushi_found and s.link == .offline and !s.ours_alive and !s.port_taken and !s.connecting,
+        .start = s.sushi_found and s.link == .offline and !s.ours_alive and !s.port_taken and !s.connecting and !s.stopping,
         .stop = s.ours_alive or s.sushi_listening,
     };
 }
@@ -732,6 +780,12 @@ pub const StopSent = struct { pid: i32 = 0, port: u16 = 0, deadline_ms: i64 = 0 
 /// started server's verified pid, else the sushi listening there).
 pub fn stopStuck(sent: StopSent, watched: u16, now_ms: i64, serving_pid: i32) bool {
     return sent.pid > 0 and sent.port == watched and now_ms >= sent.deadline_ms and serving_pid == sent.pid;
+}
+
+/// Stopping… lasts from a Stop until the sushi it signalled has exited, at most until `deadline_ms`: a sushi closes
+/// its port before it has finished shutting down.
+pub fn stillStopping(deadline_ms: i64, now_ms: i64, link: Link, signalled_alive: bool) bool {
+    return now_ms < deadline_ms and (link != .offline or signalled_alive);
 }
 
 pub fn stuckNote(buf: []u8, port: u16) []const u8 {
@@ -1002,6 +1056,14 @@ pub fn parsePidFile(text: []const u8) ?PidEntry {
     const port = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
     if (pid <= 0 or it.next() != null) return null;
     return .{ .pid = pid, .port = port };
+}
+
+/// `<prefix><port>.pid` records a server sushibar started on that port.
+pub const server_pid_prefix = "sushibar-server-";
+
+pub fn serverPidPort(name: []const u8) ?u16 {
+    if (!std.mem.startsWith(u8, name, server_pid_prefix) or !std.mem.endsWith(u8, name, ".pid")) return null;
+    return parsePort(name[server_pid_prefix.len .. name.len - ".pid".len]);
 }
 
 pub fn formatPidFile(buf: []u8, e: PidEntry) []const u8 {
@@ -2396,6 +2458,14 @@ test "origin: a bound address is the host, wildcard and loopback are 127.0.0.1, 
     try std.testing.expectEqualStrings("http://127.0.0.1:9000", originOf(&b, &.{}, 9000));
 }
 
+test "pid file: the server records are told by their names" {
+    try std.testing.expectEqual(@as(?u16, 18801), serverPidPort("sushibar-server-18801.pid"));
+    try std.testing.expectEqual(@as(?u16, null), serverPidPort("sushibar.pid"));
+    try std.testing.expectEqual(@as(?u16, null), serverPidPort("sushibar-server-.pid"));
+    try std.testing.expectEqual(@as(?u16, null), serverPidPort("sushibar-server-0.pid"));
+    try std.testing.expectEqual(@as(?u16, null), serverPidPort("sushibar-server-18801.pid.tmp"));
+}
+
 test "pid file: parse, format, and refuse anything else" {
     try std.testing.expectEqual(PidEntry{ .pid = 4242, .port = 18801 }, parsePidFile("4242 18801\n").?);
     var b: [32]u8 = undefined;
@@ -2684,6 +2754,53 @@ test "force stop: a Stop that has not taken after its wait offers Force Stop on 
     var b: [96]u8 = undefined;
     try std.testing.expectEqualStrings("Port 18801: the server did not stop", stuckNote(&b, 18801));
     try std.testing.expect(stuckNote(&b, 65535).len <= note_title_max);
+}
+
+test "stopping: lasts until the signalled sushi is gone, not only until its port closes" {
+    try std.testing.expect(stillStopping(15_000, 1_000, .up, true));
+    try std.testing.expect(stillStopping(15_000, 1_000, .silent, false));
+    try std.testing.expect(stillStopping(15_000, 1_000, .offline, true));
+    try std.testing.expect(!stillStopping(15_000, 1_000, .offline, false));
+    try std.testing.expect(!stillStopping(15_000, 15_000, .offline, true));
+    try std.testing.expect(!stillStopping(15_000, 15_000, .up, true));
+    var b: [64]u8 = undefined;
+    const s: Server = .{ .link = .offline, .ours_alive = true, .stopping = true };
+    try std.testing.expectEqualStrings("Port 12345: stopping", statusLine(&b, s));
+    try std.testing.expect(!enabled(s).start);
+    try std.testing.expectEqualStrings("Stopping…", toggle(s, true).label);
+}
+
+test "watch: an exit sushibar reaped and reported is not then reported as a stop when the poll catches up" {
+    var w: Watch = .{};
+    try std.testing.expect(!w.observe(18801, .up, 0, false));
+    w.reaped(18801, 1_000);
+    try std.testing.expect(!w.observe(18801, .up, 1_000, false));
+    try std.testing.expect(!w.observe(18801, .offline, 2_000, false));
+    try std.testing.expect(!w.observe(18801, .up, 60_000, false));
+    try std.testing.expect(w.observe(18801, .offline, 61_000, false));
+    try std.testing.expect(!w.observe(18801, .up, 62_000, false));
+    try std.testing.expect(!w.observe(18801, .offline, 63_000, true));
+    w.reaped(18802, 70_000);
+    try std.testing.expect(!w.observe(18801, .up, 70_000, false));
+    try std.testing.expect(w.observe(18801, .offline, 71_000, false));
+    try std.testing.expect(!w.observe(18803, .offline, 72_000, false));
+}
+
+test "watch: the crash badge stays from the exit until a server answers on that port again" {
+    var w: Watch = .{};
+    _ = w.observe(18801, .up, 0, false);
+    w.reaped(18801, 1_000);
+    try std.testing.expect(w.crashed(18801) and !w.crashed(18802));
+    _ = w.observe(18801, .up, 1_000, false);
+    try std.testing.expect(w.crashed(18801));
+    _ = w.observe(18801, .offline, 2_000, false);
+    try std.testing.expect(w.crashed(18801));
+    _ = w.observe(18801, .up, 3_000, false);
+    try std.testing.expect(!w.crashed(18801));
+    try std.testing.expect(w.observe(18801, .offline, 4_000, false));
+    try std.testing.expect(w.crashed(18801));
+    w.started(18801);
+    try std.testing.expect(!w.crashed(18801));
 }
 
 test "note: news goes when the menu opens a minute after it was given, a problem stays" {
