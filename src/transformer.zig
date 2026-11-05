@@ -154,6 +154,7 @@ pub const capBufAppend = ssm_cache.capBufAppend;
 pub const capturePrefillHidden = ssm_cache.capturePrefillHidden;
 pub const capturePrefillHiddenLast = ssm_cache.capturePrefillHiddenLast;
 pub const captureSsmCheckpoint = ssm_cache.captureSsmCheckpoint;
+pub const handOverSsmCheckpoint = ssm_cache.handOverSsmCheckpoint;
 pub const attn256Base16Aligned = attn_kernels.attn256Base16Aligned;
 const cachedScalarInt = verify_qmm.cachedScalarInt;
 pub const bf16Scalar = layer_weights.bf16Scalar;

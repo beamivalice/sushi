@@ -59,6 +59,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - Every request logs one `[prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms` line (`[dsv41-prefix]` on DeepSeek); `prompt_ms` includes that time and `sushi bench` takes it out.
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
   span (`prefill_plan.ssmSnapshotBackoff`). Guard: `tests/test_prefix_reuse.sh`.
+- A speculative Qwen turn also leaves a point right behind its reply ([decode-end points](#decode-end-points)), so the
+  next turn re-prefills none of it; a serial finish keeps only the prompt-end point.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**
   (`KVCache.ringCheckpoint`, `Entry.ring_cps`, up to `RING_CHECKPOINT_MAX` = 8): each ringed layer's
   window + 30 rows at a position (down to the window when the ring holds no more, as one restored off a checkpoint
@@ -296,13 +298,78 @@ reply every turn. A thinking request with tools now takes one more point mid-dec
   starting in whitespace or ending in any the template does not write is re-rendered (`mtp_plan.thoughtEdgesSurvive`) and
   its point dropped; a client must send `reasoning_content` back as delivered.
 - **Armed** by `scheduler.armThoughtPoint` for thinking + tools, a prompt of 512 tokens or more ending in `<think>`, and a
-  speculative round; a thought under 512 tokens takes none, and serial decode (state one token ahead) none either.
+  speculative round; a thought under 512 tokens takes none, and serial decode (state one token ahead) none either. On
+  Qwen a [decode-end point](#decode-end-points) supersedes it.
+- **On Qwen the point needs no grid**: the trunk's QSA leftover is stored at any position. The head's is marked only
+  where its history stands exactly at the point; without a mark a restore that clamps the head below its ring starts
+  it blind (`MtpHeadQsaRingGap`), never wrong, and every path to a commit truncates the head below a stale mark.
 - **The round carrying the closer ends on it** (`mtp_plan.thoughtRound`): Qwen's verified round accepts only through the
   closer and the next accepted draft is pending (`mtp_plan.cutMtpRound`), so the stream is the whole round's byte for byte; GLM's
   budget is cut to the pool position at or below the closer, and a closer in the round's first rows can leave none.
 - **The state is the newest checkpoint, held from the closer to the commit and billed to a request that takes one** (`WarmPrefix.thought`, `server.qwenThoughtPointBytes`,
   `glmThoughtPointBytes`: 58.8 or 110 MB, 147.6 MB). Both tiers treat it as any checkpoint under the cap of 160; an
   over-budget conversation drops its oldest points first, so the newest stays.
+
+<a id="decode-end-points"></a>
+### Decode-end points: the reply's own end
+
+Turn 2 of a conversation is turn 1 + its reply + a follow-up, and the Qwen template renders the reply back token for
+token (`qwen4 replay` in `tool_calls.zig`). The prompt-end point left every reply to be re-prefilled (issue #83:
+restores at the previous prompt less 31).
+
+- **Taken at a natural finish of an MTP request** (`scheduler.takeDecodeEndPoint`, armed by `armDecodeEndPoint` for
+  Qwen with the head on and checkpoints on): the request's stop token is an end-of-turn id, not a length cut, a stop
+  string or a cancel (`not-eos`).
+- **The point sits before the end token**, at prompt + generated: MTP never forwards the token it leaves pending, and
+  the next prompt repeats `<|im_end|>` there. A round that accepts an end-of-turn draft is cut before it
+  (`mtpStopPrefix`, as a planner round is), so the state stands exactly at the committed tokens.
+- **Serial decode takes none** (`serial-finish`, `mtp_plan.endPointStands`): its trunk forwards the token it samples
+  before it commits it, two past the reply at EOS. The guard is the position the last MTP round left
+  (`Generator.spec_round_end`) against the committed length and the trunk; no per-token check. A switch to serial
+  with the end token already pending stops before the serial block forwards it, and takes the point.
+- **The state is handed over, not copied** (`ssm_cache.handOverSsmCheckpoint`): each live array is re-materialized with
+  its handle dropped, so MLX donates a tight buffer, and a view of a verify capture gets a tight copy that lets the
+  parent go. The slot decodes no further, so nothing is billed during decode; the entry bills the point's real bytes.
+- **It supersedes the thought point**, which is dropped: a thinking request with tools stores no more states than
+  before. A request with no thought stores one more (58.8 MB at `--qwen-gdn 16`), under the hot-cache byte budget
+  and the checkpoint cap like any point.
+- **The edges must come back as generated** (`mtp_plan.replyEdgesSurvive`, plus `thoughtEdgesSurvive` on a thought):
+  the template trims the thought and the answer and writes `\n</think>\n\n` between them, so a reply that starts or
+  ends in whitespace takes none (`edges`) and keeps its thought point.
+- **The MTP head reaches the point**: the finish applies the round's pending history and appends the row that reads
+  the token AT the point when the stop token is `<|im_end|>`, so a restore adopts the head whole
+  (`[qwen4] MTP head restored`). Another stop leaves it one row short and the head starts blind, never the trunk.
+- **The SSD tier carries it unchanged**: the point is the record's newest checkpoint, so `highestSsmPosAtOrBelow`
+  restores at it after the RAM entry is gone, head included.
+- **Measured** (Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw-v2.0, kv8, MTP on, greedy; this change against main
+  29f2c2bd; eight two-turn conversations, four with tool calls and four with a thought; turn 2 rendered by the pack's
+  template and scored over 16 greedy tokens with top-20 logprobs up to the first argmax split; one boot per arm,
+  `taskpolicy -a`, GPU lock per boot, QUIET; 2026-11-05). KL of turn 2's next-token distribution from a cold prefill:
+
+  | arm | restores at | first token, mean / max | every compared token, mean | top-1 |
+  |---|---|---|---|---|
+  | main, RAM | prompt - 31 | 0.0485 / 0.179 nats | 0.0100 | 102/104 |
+  | decode-end, RAM | the reply's end | 0.0479 / 0.216 nats | 0.0101 | 104/106 |
+
+  The SSD-only arm restored at the reply's end with the RAM arm's exact KL on the seven turns over the tier's 512-token
+  floor. The two restores drift from cold alike; the per-turn differences between them are of the same size as each one's
+  distance from cold. Turn 2 prefilled 2,662 fewer tokens over the eight turns (the reply plus the 31-token backoff,
+  333 a turn); on the six turns not first after a boot it took 245 ms less prompt time on average (single runs).
+- **Measured on the eight-category fixture's prompts** (same binaries and settings; turn 1 the fixture's own prompt ids
+  to EOS, at most 4096 tokens, as 512 cut every reply; turn 2 adds "Summarize the above in two sentences.", wikitext a
+  paragraph break). End points were taken on 12 of 16 turns (3 hit the cap, 1 raw text ended in whitespace). KL from
+  cold, first token / every compared token: main 0.0284 / 0.0071, decode-end 0.0286 / 0.0072, decode-end against
+  main 0.0034 / 0.0019; the only top-1 splits are exact first-token ties in story, which main splits too. Turn 2
+  prefilled 16,154 fewer tokens (29,909 -> 13,755): code 2,650, math 3,814, reasoning 4,021, design 2,043, story
+  2,246, stem 1,380, wikitext and multilingual 0.
+- **A reply the model tokenized off the tokenizer's own split is not repeated**: the next prompt re-tokenizes the
+  rendered text, so a Thai or Devanagari reply diverges a few tokens in and restores at the prompt end
+  (`lost N: no-point`), as before; its end point is stored and never used.
+- Diagnostics: `[prefix] decode-end restore point at N` or `[prefix] no decode-end restore point: <why>` at the
+  commit; a RAM restore logs `lost L: <why>` (the entry's own reason, or `no-point` when the prompt diverges inside the
+  entry), an SSD one `matched M, lost L`. Guards: `qwen4 decode-end point` (qwen4_generate_test.zig, pack),
+  `handOverSsmCheckpoint` (ssm_cache.zig), `endPointStands`/`replyEdgesSurvive` (mtp_plan.zig),
+  `tests/qwen4/test_qwen4_decode_end_point.sh` (RAM-only and SSD-only).
 
 <a id="checkpoints-on-ssd"></a>
 ### Qwen's GDN checkpoints live on the SSD

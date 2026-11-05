@@ -916,6 +916,75 @@ pub fn captureSsmCheckpoint(
     return .{ .pos = pos, .layers = layers };
 }
 
+/// A finishing slot's own state as a checkpoint at `pos`, MOVED out of `ssm_entries`: each array is re-materialized
+/// with its live handle already dropped, so MLX donates a tight buffer instead of copying it, and a view of a larger
+/// parent (a verify's capture) gets a tight copy and lets the parent go. The QSA history stays live for
+/// `handoffQsaHistoryToLatest`. The entries hold no recurrent state afterwards. Not for a batched group's member.
+pub fn handOverSsmCheckpoint(
+    allocator: std.mem.Allocator,
+    ssm_entries: []SSMCacheEntry,
+    pos: usize,
+    s: mlx.mlx_stream,
+) !SSMCheckpoint {
+    const layers = try allocator.alloc(SSMCacheEntrySnapshot, ssm_entries.len);
+    var built: usize = 0;
+    errdefer {
+        for (layers[0..built]) |*l| ssmSnapshotDeinit(l);
+        allocator.free(layers);
+    }
+    for (ssm_entries, 0..) |*src, i| {
+        std.debug.assert(src.group == null or !src.group.?.live);
+        var out: SSMCacheEntrySnapshot = .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = src.initialized,
+            .qsa_ratio = src.qsa_ratio,
+            .ple_prev = src.ple_prev,
+            .ple_prev_valid = src.ple_prev_valid,
+        };
+        errdefer ssmSnapshotDeinit(&out);
+        // Read before the conv window leaves: an entry without one reads as a QSA layer.
+        const qsa = ssmAuxIsQsaHistory(src);
+        try moveTight(s, &src.conv_state, &out.conv_state);
+        try moveTight(s, &src.ssm_state, &out.ssm_state);
+        if (qsa) {
+            out.qsa_rows = @intCast(pos);
+            if (src.aux_state.ctx != null) {
+                out.aux_state = try qsaLeftoverAt(src.aux_state, qsaHistoryRows(src), @intCast(pos), src.qsa_ratio, s);
+            }
+        } else {
+            try moveTight(s, &src.aux_state, &out.aux_state);
+        }
+        src.initialized = false;
+        layers[i] = out;
+        built = i + 1;
+    }
+    {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var count: usize = 0;
+        for (layers) |*l| {
+            inline for (.{ l.conv_state, l.ssm_state, l.aux_state }) |arr| {
+                if (arr.ctx != null) {
+                    _ = mlx.mlx_vector_array_append_value(vec, arr);
+                    count += 1;
+                }
+            }
+        }
+        if (count > 0) try mlx.check(mlx.mlx_eval(vec));
+    }
+    return .{ .pos = pos, .layers = layers };
+}
+
+fn moveTight(s: mlx.mlx_stream, live: *mlx.mlx_array, dst: *mlx.mlx_array) !void {
+    if (live.ctx == null) return;
+    const owned = try materializedOwnedCopy(s, live.*);
+    _ = mlx.mlx_array_free(live.*);
+    live.* = .{ .ctx = null };
+    if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
+    dst.* = owned;
+}
+
 /// Force a REAL copy of `x` into a freshly allocated buffer. `mlx_copy` and
 /// `mlx_contiguous` both take shared-buffer fast paths (Copy is a view op;
 /// contiguous no-ops when the view's strides read as row-contiguous, which a
@@ -1273,6 +1342,78 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
 
     // Accounting matches true retention: 3*8 f32 elements, nothing more.
     try testing.expectEqual(@as(u64, 3 * 8 * 4), ssmCheckpointBytes(&cp));
+}
+
+test "handOverSsmCheckpoint moves a tight live state without a copy, gives a view its own buffer, and leaves the QSA history live" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const f32Array = struct {
+        fn make(n: f64, shape: []const c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_arange(&flat, 0.0, n, 1.0, .float32, st));
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&out, flat, shape.ptr, shape.len, st));
+            try mlx.check(mlx.mlx_array_eval(out));
+            return out;
+        }
+    }.make;
+
+    // GDN layer: a tight recurrent state and a conv window that is a view of a larger parent (a verify's conv input).
+    const parent = try f32Array(1024 * 8, &.{ 1, 1024, 8 }, s);
+    defer _ = mlx.mlx_array_free(parent);
+    var gdn: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = try f32Array(4096, &.{ 1, 4, 32, 32 }, s), .initialized = true };
+    try mlx.check(mlx.mlx_slice(&gdn.conv_state, parent, &[_]c_int{ 0, 1021, 0 }, 3, &[_]c_int{ 1, 1024, 8 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    try mlx.check(mlx.mlx_array_eval(gdn.conv_state));
+    gdn.aux_state = try f32Array(6 * 16, &.{ 1, 6, 16 }, s);
+    const ssm_ptr = @intFromPtr(mlx.mlx_array_data_float32(gdn.ssm_state).?);
+
+    // QSA layer: the history stays with the slot; the checkpoint gets the leftover rows at its position.
+    const ratio: c_int = 4;
+    var qsa: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true, .qsa_ratio = ratio };
+    qsa.aux_state = try f32Array(10 * 8, &.{ 1, 10, 8 }, s);
+    qsa.qsa_hist_rows = 10;
+    var entries = [_]SSMCacheEntry{ gdn, qsa };
+    defer for (&entries) |*e| {
+        _ = mlx.mlx_array_free(e.conv_state);
+        _ = mlx.mlx_array_free(e.ssm_state);
+        ssmFreeQsaState(e);
+    };
+    var reference = try captureSsmCheckpoint(a, &entries, 10, s);
+    defer reference.deinit(a);
+
+    var cp = try handOverSsmCheckpoint(a, &entries, 10, s);
+    defer cp.deinit(a);
+    try testing.expectEqual(@as(usize, 10), cp.pos);
+    // The tight state is the same buffer: nothing was copied.
+    try testing.expectEqual(ssm_ptr, @intFromPtr(mlx.mlx_array_data_float32(cp.layers[0].ssm_state).?));
+    // The view got its own buffer, outside the parent's.
+    const p0 = @intFromPtr(mlx.mlx_array_data_float32(parent).?);
+    const c0 = @intFromPtr(mlx.mlx_array_data_float32(cp.layers[0].conv_state).?);
+    try testing.expect(c0 < p0 or c0 >= p0 + 1024 * 8 * 4);
+    // The slot keeps no recurrent state, and keeps its QSA history.
+    try testing.expect(entries[0].ssm_state.ctx == null and entries[0].conv_state.ctx == null and entries[0].aux_state.ctx == null);
+    try testing.expect(entries[1].aux_state.ctx != null);
+    // Same state and the same bytes as a capture at that position.
+    try testing.expectEqual(ssmCheckpointBytes(&reference), ssmCheckpointBytes(&cp));
+    for (cp.layers, reference.layers) |*got, *want| {
+        try testing.expectEqual(want.qsa_rows, got.qsa_rows);
+        inline for (.{ "conv_state", "ssm_state", "aux_state" }) |field| {
+            const x = @field(got, field);
+            const y = @field(want, field);
+            try testing.expectEqual(x.ctx == null, y.ctx == null);
+            if (x.ctx != null) {
+                var same = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(same);
+                try mlx.check(mlx.mlx_array_equal(&same, x, y, false, s));
+                try mlx.check(mlx.mlx_array_eval(same));
+                var yes = false;
+                try mlx.check(mlx.mlx_array_item_bool(&yes, same));
+                try testing.expect(yes);
+            }
+        }
+    }
 }
 
 test "two-chunk prefill capture drops the chunk parent after the boundary eval" {

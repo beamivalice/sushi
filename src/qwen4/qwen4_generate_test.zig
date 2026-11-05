@@ -1125,3 +1125,168 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     try testing.expectEqual(prompt.len + at + 1, gen.ssm_checkpoints.items[0].pos);
     try testing.expectEqualSlices(u32, reference[0..want], gen.generated_ids.items[0..want]);
 }
+
+/// Per row: the KL of `got`'s next-token distribution from `want`'s, and whether their argmaxes agree.
+fn decodeEndRowsAgree(want: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream, max_kl: f32) !void {
+    var lp: [2]mlx.mlx_array = undefined;
+    for ([_]mlx.mlx_array{ want, got }, &lp) |logits, *out| {
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_astype(&f, logits, .float32, s));
+        var lse = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lse);
+        try mlx.check(mlx.mlx_logsumexp_axis(&lse, f, -1, true, s));
+        out.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_subtract(out, f, lse, s));
+    }
+    defer for (lp) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var p = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p);
+    try mlx.check(mlx.mlx_exp(&p, lp[0], s));
+    var diff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(diff);
+    try mlx.check(mlx.mlx_subtract(&diff, lp[0], lp[1], s));
+    var terms = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(terms);
+    try mlx.check(mlx.mlx_multiply(&terms, p, diff, s));
+    var kl = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kl);
+    try mlx.check(mlx.mlx_sum_axis(&kl, terms, -1, false, s));
+    var am: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (am) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    try mlx.check(mlx.mlx_argmax_axis(&am[0], lp[0], -1, false, s));
+    try mlx.check(mlx.mlx_argmax_axis(&am[1], lp[1], -1, false, s));
+    for ([_]mlx.mlx_array{ kl, am[0], am[1] }) |x| try mlx.check(mlx.mlx_array_eval(x));
+    const rows: usize = @intCast(mlx.mlx_array_size(kl));
+    const kls = mlx.mlx_array_data_float32(kl).?[0..rows];
+    const a0 = mlx.mlx_array_data_uint32(am[0]).?[0..rows];
+    const a1 = mlx.mlx_array_data_uint32(am[1]).?[0..rows];
+    errdefer std.debug.print("[decode-end] KL per row {any}, argmax {any} vs {any}\n", .{ kls, a0, a1 });
+    for (kls, a0, a1) |k, x, y| {
+        try testing.expect(k < max_kl);
+        try testing.expectEqual(x, y);
+    }
+}
+
+fn decodeEndForward(xfm: *Transformer, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
+    var buf: [8]i32 = undefined;
+    for (ids, 0..) |id, i| buf[i] = @intCast(id);
+    const shape = [_]c_int{ 1, @intCast(ids.len) };
+    const input = mlx.mlx_array_new_data(&buf, &shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(input);
+    return xfm.forwardWith(ctx, input);
+}
+
+test "qwen4 decode-end point: an MTP finish hands over the state behind the reply, a cold forward of the same tokens agrees, and a serial finish takes none (MTP_TEST_MODEL)" {
+    const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
+    defer if (config.ngram_table_path) |name| a.free(name);
+    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var prompt: [96]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
+    const want: usize = 64;
+
+    const whole = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    defer whole.deinit(a);
+    while (whole.gen.?.generated_ids.items.len < want) {
+        const round = (try whole.gen.?.nextMtp(a)) orelse return error.MtpRoundDeclined;
+        a.free(round.tokens);
+    }
+    const reference = whole.gen.?.generated_ids.items;
+    // A token the stream emits stands in for the end of turn; its first occurrence ends the reply.
+    const eos = [_]u32{reference[40]};
+    const at = std.mem.indexOfScalar(u32, reference, eos[0]).?;
+    const end = prompt.len + at;
+
+    // MTP to the end: the round carrying the end-of-turn token stops before it, and the state stands there.
+    const spec = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    defer spec.deinit(a);
+    const gen = &spec.gen.?;
+    gen.eos_token_ids = &eos;
+    gen.end_point_armed = true;
+    while (try gen.nextMtp(a)) |round| a.free(round.tokens);
+    try testing.expectEqual(@as(?u32, eos[0]), gen.stop_token);
+    try testing.expectEqualSlices(u32, reference[0..at], gen.generated_ids.items);
+    const kept = gen.ssm_checkpoints.items.len;
+    try testing.expectEqual(mtp_plan.EndPoint.taken, gen.handOverEndPoint(end, eos[0]));
+    try testing.expectEqual(kept + 1, gen.ssm_checkpoints.items.len);
+    const cp = &gen.ssm_checkpoints.items[kept];
+    try testing.expectEqual(end, cp.pos);
+    // The MTP head's history reaches the point, so a restore there adopts it whole.
+    errdefer std.debug.print("[decode-end] cp.pos {d} committed {d} base {d}\n", .{ cp.pos, gen.mtpCommittedHistoryLen(), gen.mtp_position_base });
+    try testing.expectEqual(end - gen.mtp_position_base, gen.mtpCommittedHistoryLen());
+
+    // Restored from the point against a cold prefill of the same tokens, over the same continuation.
+    // As a commit and a restore do: the slot's QSA history rides the newest point, cut to it.
+    try transformer_mod.handoffQsaHistoryToLatest(gen.ssm_checkpoints.items, spec.entries, xfm.s);
+    try transformer_mod.restoreSsmCheckpoint(spec.entries, cp);
+    try transformer_mod.applyQsaHistoryAt(spec.entries, cp, cp.pos, xfm.s, false);
+    var cold_prompt: [96 + want]u32 = undefined;
+    @memcpy(cold_prompt[0..prompt.len], &prompt);
+    @memcpy(cold_prompt[prompt.len..end], reference[0..at]);
+    const cold = try MtpChainTestSlot.init(a, io, &xfm, &tok, cold_prompt[0..end], 4);
+    defer cold.deinit(a);
+    errdefer std.debug.print("[decode-end] end {d} cold.off {d} spec.off {d} committed {d} base {d}\n", .{ end, cold.off, spec.off, gen.mtpCommittedHistoryLen(), gen.mtp_position_base });
+    try testing.expectEqual(end, cold.off);
+    try testing.expectEqual(end, spec.off);
+    const next = [_]u32{ eos[0], reference[at + 1], reference[at + 2] };
+    const warm_logits = try decodeEndForward(&xfm, &gen.ctx, &next);
+    defer _ = mlx.mlx_array_free(warm_logits);
+    const cold_logits = try decodeEndForward(&xfm, &cold.gen.?.ctx, &next);
+    defer _ = mlx.mlx_array_free(cold_logits);
+    try decodeEndRowsAgree(cold_logits, warm_logits, xfm.s, 0.05);
+
+    // A switch to serial with the end-of-turn token pending still ends on the round's state.
+    const switched = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    defer switched.deinit(a);
+    const sw = &switched.gen.?;
+    sw.eos_token_ids = &eos;
+    sw.end_point_armed = true;
+    while (sw.next_token_id != eos[0]) {
+        const round = (try sw.nextMtp(a)) orelse return error.MtpRoundDeclined;
+        a.free(round.tokens);
+    }
+    errdefer std.debug.print("[decode-end] switched: next {d} off {d} generated {d} round_end {?d} stop {?d}\n", .{ sw.next_token_id, switched.off, sw.generated_ids.items.len, sw.spec_round_end, sw.stop_token });
+    sw.spec_disabled_runtime = true;
+    sw.spec_disable_reason = .max_ctx;
+    try testing.expect(try sw.nextMtp(a) == null);
+    try testing.expectEqual(mtp_plan.EndPoint.taken, sw.handOverEndPoint(end, eos[0]));
+
+    // Serial decode to the end: its trunk ran past the reply, so no point is taken and the state stays with the slot.
+    const serial = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    defer serial.deinit(a);
+    const sg = &serial.gen.?;
+    sg.eos_token_ids = &eos;
+    sg.end_point_armed = true;
+    for (0..2) |_| {
+        const round = (try sg.nextMtp(a)) orelse return error.MtpRoundDeclined;
+        a.free(round.tokens);
+    }
+    sg.spec_disabled_runtime = true;
+    sg.spec_disable_reason = .max_ctx;
+    errdefer std.debug.print("[decode-end] serial: off {d} generated {d} round_end {?d} stop {?d}\n", .{ serial.off, sg.generated_ids.items.len, sg.spec_round_end, sg.stop_token });
+    while (try sg.nextMtp(a)) |round| a.free(round.tokens);
+    try testing.expectEqualSlices(u32, reference[0..at], sg.generated_ids.items);
+    const serial_kept = sg.ssm_checkpoints.items.len;
+    try testing.expectEqual(mtp_plan.EndPoint.serial_finish, sg.handOverEndPoint(end, eos[0]));
+    try testing.expectEqual(serial_kept, sg.ssm_checkpoints.items.len);
+    var holds = false;
+    for (serial.entries) |*e| holds = holds or e.ssm_state.ctx != null;
+    try testing.expect(holds);
+}

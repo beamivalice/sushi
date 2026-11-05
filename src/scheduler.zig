@@ -2973,6 +2973,14 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // attn models this returns an empty slice (no allocator hit). Ownership
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
+    if (takeDecodeEndPoint(slot, gen_ptr)) |end| {
+        hc.commit_end_note = end.label();
+        if (end == .taken) {
+            log.info("[prefix] decode-end restore point at {d}\n", .{total_len});
+        } else {
+            log.info("[prefix] no decode-end restore point: {s}\n", .{end.label()});
+        }
+    }
     settleThoughtPoint(slot, gen_ptr);
     const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
     const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
@@ -3967,6 +3975,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.legacy_gen = gen;
     dsv41_thought_point.armDsv41ThoughtPoint(slot, &slot.legacy_gen.?, write_through_on and cp_stride > 0);
     armThoughtPoint(slot, &slot.legacy_gen.?, cp_stride > 0);
+    armDecodeEndPoint(slot, &slot.legacy_gen.?, cp_stride > 0);
     publishHandoverToken(slot, &slot.legacy_gen.?);
     // A long reply compacts the ring past the prompt end, where the next turn diverges.
     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
@@ -4473,6 +4482,48 @@ fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
     const close = tok.specialTokenId("</think>") orelse return;
     if (std.mem.indexOfScalar(u32, slot.full_prompt[slot.full_prompt.len - 2 ..], open) == null) return;
     gen.thought_point = .{ .closer = close, .grid = grid, .min_tokens = mtp_plan.thought_point_min_tokens, .base = slot.full_prompt.len };
+}
+
+/// A request whose MTP head drafts for a recurrent trunk ends its reply on a restore point the next turn shares
+/// (docs/engine-prefix-cache.md#decode-end-points).
+fn armDecodeEndPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
+    if (!checkpoints_on or slot.ssm_entries == null) return;
+    if (gen.mtp_cache == null or gen.dspark or gen.dflash != null) return;
+    gen.end_point_armed = true;
+}
+
+/// At a natural finish the slot's state stands right behind its reply, which the next prompt repeats: it becomes the
+/// entry's newest restore point. Null when the request armed none.
+fn takeDecodeEndPoint(slot: *Slot, gen: *Generator) ?mtp_plan.EndPoint {
+    if (!gen.end_point_armed) return null;
+    const stop = gen.stop_token orelse return .not_eos;
+    if (slot.cancelled.load(.acquire) or !generate_mod.isEosId(stop, slot.eos_token_ids)) return .not_eos;
+    const generated = gen.generated_ids.items;
+    if (generated.len == 0) return .not_eos;
+    if (!replyReRendered(slot, generated)) return .edges;
+    // The template writes `<|im_end|>` after the reply: only that stop is the next prompt's token at the point.
+    const im_end = if (slot.model.tokenizer) |tok| tok.specialTokenId("<|im_end|>") else null;
+    return gen.handOverEndPoint(slot.full_prompt.len + generated.len, if (im_end == stop) stop else null);
+}
+
+/// Does the next prompt repeat `generated` token for token? Read off the edges the template trims.
+fn replyReRendered(slot: *Slot, generated: []const u32) bool {
+    const tok = slot.model.tokenizer orelse return false;
+    const a = slot.allocator;
+    const first = tok.decode(a, generated[0..1]) catch return false;
+    defer a.free(first);
+    const last = tok.decode(a, generated[generated.len - 1 ..]) catch return false;
+    defer a.free(last);
+    var answer: ?[]u8 = null;
+    defer if (answer) |t| a.free(t);
+    if (tok.specialTokenId("</think>")) |close| if (std.mem.indexOfScalar(u32, generated, close)) |at| {
+        if (at < 2) return false;
+        const tail = tok.decode(a, generated[at - 2 .. at]) catch return false;
+        defer a.free(tail);
+        if (!mtp_plan.thoughtEdgesSurvive(.newline_before_closer, first, tail)) return false;
+        answer = tok.decode(a, generated[at + 1 .. @min(at + 3, generated.len)]) catch return false;
+    };
+    return mtp_plan.replyEdgesSurvive(first, answer, last);
 }
 
 /// A thought the next prompt would re-render differently is no restore point: its state is dropped before the commit.

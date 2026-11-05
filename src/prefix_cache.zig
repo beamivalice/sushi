@@ -393,6 +393,9 @@ const Entry = struct {
     quant_config: kv_quant.KVQuantConfig,
     /// Transient, one `spillIdleEntries` pass only: did this pass leave a durable copy on the SSD tier?
     spill_durable: bool = false,
+    /// Why the request that committed this entry left no restore point at its end (`mtp_plan.EndPoint.label`),
+    /// "taken" when it did, empty when it took none (a prefill, another arch). Named by a restore that loses tokens.
+    end_note: []const u8 = "",
     /// KV-resident bytes for this entry, computed at commit time (Wave 1.B).
     /// Used for `--prefix-cache-mem` memory-budget enforcement; sum across
     /// all entries == `current_kv_bytes`.
@@ -609,6 +612,8 @@ pub const HotPrefixCache = struct {
     /// every turn of an agent conversation — gains one checkpoint per turn for
     /// the life of the session. 0 = unlimited.
     ssm_checkpoint_max: u32 = 0,
+    /// The next commit's `Entry.end_note`, set by the committer right before it; the commit consumes it.
+    commit_end_note: []const u8 = "",
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
     current_kv_bytes: u64,
@@ -812,6 +817,14 @@ pub const HotPrefixCache = struct {
             picked = cp;
         }
         return picked;
+    }
+
+    /// Why a restore stops short of the match: the request that committed `e` left no point at its end, or the
+    /// prompt diverges inside the entry past its last point below the match.
+    fn lostReason(e: *const Entry, shared: usize, restored: usize) []const u8 {
+        if (shared <= restored) return "";
+        const noted = e.end_note.len > 0 and !std.mem.eql(u8, e.end_note, "taken");
+        return if (shared >= e.tokens.len and noted) e.end_note else "no-point";
     }
 
     fn highestCoveringCheckpoint(cps: []const SSMCheckpoint, limit: usize) ?*const SSMCheckpoint {
@@ -1597,7 +1610,10 @@ pub const HotPrefixCache = struct {
                 target_moe_seq_offset.* = restored;
                 self.last_restored_disk_id = d.entries.items[hm.idx].id;
                 const ms = sw.read() / std.time.ns_per_ms;
-                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d})\n", .{ restored, prompt_ids.len, ms, disk_cp });
+                const lost = @as(usize, hm.usable) -| restored;
+                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d}), matched {d}, lost {d}{s}\n", .{
+                    restored, prompt_ids.len, ms, disk_cp, hm.usable, lost, if (lost > 0) ": no-point" else "",
+                });
                 const disk_mtp = diskRestoreSpec(d, hm.idx, mtp_target, restored, s, .mtp);
                 return .{
                     .matched = restored,
@@ -1841,7 +1857,10 @@ pub const HotPrefixCache = struct {
             target_moe_seq_offset.* = matched;
             log.info("  [hot-cache] full reuse {d}/{d}, re-forwarding last token\n", .{ matched, prompt_ids.len });
         } else {
-            log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
+            log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d}; lost {d}{s}{s})\n", .{
+                effective_matched,          prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len, m.shared - effective_matched,
+                if (m.shared > effective_matched) ": " else "", lostReason(e, m.shared, effective_matched),
+            });
         }
         var res: LookupResult = .{
             .matched = matched,
@@ -2065,6 +2084,8 @@ pub const HotPrefixCache = struct {
         ring_cps: SlotRingCps,
         glm: glm5_prefix.GlmTierRows,
     ) !CommitStatus {
+        const end_note = self.commit_end_note;
+        self.commit_end_note = "";
         // Freed on every path that does not move it into an entry.
         var new_rings = ownRingCps(self.allocator, ring_cps);
         defer if (new_rings) |r| freeRingCps(self.allocator, r);
@@ -2542,6 +2563,7 @@ pub const HotPrefixCache = struct {
             e.cache_key = cache_key;
             e.media_start = eff_media_start;
             e.quant_config = quant_config;
+            e.end_note = end_note;
             e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes + ring_bytes + new_glm_bytes;
             if (e.glm) |*rows| rows.deinit();
             e.glm = new_glm;
@@ -2602,6 +2624,7 @@ pub const HotPrefixCache = struct {
             .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
             .quant_config = quant_config,
+            .end_note = end_note,
             .kv_bytes = new_bytes,
             .ssm_checkpoints = eff_cps,
             .ssm_bytes = new_ssm_bytes,

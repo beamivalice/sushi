@@ -168,6 +168,55 @@ pub fn thoughtEdgesSurvive(style: CloserStyle, first: []const u8, tail: []const 
     };
 }
 
+/// A finished request's restore point at the end of its reply, or why its entry has none
+/// ([engine-prefix-cache](../docs/engine-prefix-cache.md#decode-end-points)).
+pub const EndPoint = enum {
+    taken,
+    /// The last tokens came from serial decode, whose trunk runs ahead of what it committed.
+    serial_finish,
+    /// No end-of-turn token: a length cut, a stop string or a cancel; the next prompt does not repeat the reply as generated.
+    not_eos,
+    /// The template re-renders an edge of the reply differently.
+    edges,
+    /// The state lives in a batched group's merged arrays.
+    grouped,
+    failed,
+
+    pub fn label(self: EndPoint) []const u8 {
+        return switch (self) {
+            .taken => "taken",
+            .serial_finish => "serial-finish",
+            .not_eos => "not-eos",
+            .edges => "edges",
+            .grouped => "grouped",
+            .failed => "failed",
+        };
+    }
+};
+
+/// The state stands right behind the committed tokens only where the last speculative round left it: serial decode
+/// forwards the token it samples before it commits it.
+pub fn endPointStands(round_end: ?usize, trunk_pos: usize, committed: usize) bool {
+    const at = round_end orelse return false;
+    return at == committed and trunk_pos == committed;
+}
+
+/// Does the next prompt repeat a generated reply through its last token? The template trims the thought and the
+/// answer and writes `\n</think>\n\n` between them. `first` is the reply's first token as text, `answer` the two
+/// tokens after a generated `</think>` (null without one, empty when the closer ends the reply), `last` its last token.
+pub fn replyEdgesSurvive(first: []const u8, answer: ?[]const u8, last: []const u8) bool {
+    if (first.len == 0 or isWhite(first[0])) return false;
+    if (last.len == 0 or isWhite(last[last.len - 1])) return false;
+    const after = answer orelse return true;
+    if (after.len == 0) return true;
+    if (!std.mem.startsWith(u8, after, "\n\n")) return false;
+    return after.len == 2 or !isWhite(after[2]);
+}
+
+fn isWhite(c: u8) bool {
+    return c == ' ' or c == '\n' or c == '\t' or c == '\r';
+}
+
 /// A round of `t1` and its `accepted` drafts, ending in `pending`, cut to emit `keep` tokens: the draft the round accepted
 /// after the cut is the pending token, so the stream is the whole round's.
 pub fn cutMtpRound(drafts: []const u32, accepted: u32, pending: u32, keep: usize) struct { accepted: u32, pending: u32 } {
@@ -517,6 +566,31 @@ test "cutMtpRound: a round cut at any of its tokens streams what the whole round
     const whole = cutMtpRound(&drafts, 4, 45, 6);
     try testing.expectEqual(@as(u32, 4), whole.accepted);
     try testing.expectEqual(@as(u32, 45), whole.pending);
+}
+
+test "endPointStands: only the state a speculative round left right behind the committed tokens is an end point" {
+    try testing.expect(endPointStands(1200, 1200, 1200));
+    // Serial decode forwarded the token it sampled, and the EOS behind it, before it committed them.
+    try testing.expect(!endPointStands(1180, 1202, 1200));
+    try testing.expect(!endPointStands(1200, 1201, 1200));
+    // A serial tick after the last round committed a token the round's state does not hold.
+    try testing.expect(!endPointStands(1199, 1200, 1200));
+    try testing.expect(!endPointStands(null, 1200, 1200));
+}
+
+test "replyEdgesSurvive: the reply comes back whole only when the template writes its edges as generated" {
+    try testing.expect(replyEdgesSurvive("The", null, "."));
+    try testing.expect(replyEdgesSurvive("The", "\n\n<tool_call>", "</tool_call>"));
+    try testing.expect(replyEdgesSurvive("The", "\n\nI", "."));
+    // The closer was the last token: the reply ends on it.
+    try testing.expect(replyEdgesSurvive("The", "", "</think>"));
+    try testing.expect(!replyEdgesSurvive(" The", null, "."));
+    try testing.expect(!replyEdgesSurvive("\n", null, "."));
+    try testing.expect(!replyEdgesSurvive("The", null, ".\n"));
+    try testing.expect(!replyEdgesSurvive("The", null, ""));
+    try testing.expect(!replyEdgesSurvive("The", "\nI", "."));
+    try testing.expect(!replyEdgesSurvive("The", "\n\n\nI", "."));
+    try testing.expect(!replyEdgesSurvive("The", "\n\n I", "."));
 }
 
 test "thoughtEdgesSurvive: the thought comes back only as the template writes it" {

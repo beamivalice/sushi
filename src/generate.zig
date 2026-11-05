@@ -1007,6 +1007,11 @@ pub const Generator = struct {
     /// Armed by the scheduler for a hybrid thinking request with tools; the restore point it takes is the last
     /// of `ssm_checkpoints` while `state` is `.taken`.
     thought_point: ?mtp_plan.ThoughtPoint = null,
+    /// Armed by the scheduler for a request whose MTP head keeps a recurrent trunk's restore points: the round that carries
+    /// an end-of-turn token ends before it, and a natural finish hands the state to the commit (`handOverEndPoint`).
+    end_point_armed: bool = false,
+    /// The absolute position the last speculative round left the state at.
+    spec_round_end: ?usize = null,
     /// A constrained DSpark request: `next_token_id` is sampled under the grammar but not yet emitted or in the cache,
     /// and `has_pending_logits` is false. Serial decode (`next`) emits it first.
     dspark_pending: bool = false,
@@ -3352,6 +3357,58 @@ pub const Generator = struct {
         };
         tp.state = .taken;
         log.info("[prefix] thought restore point at {d} ({d} tokens in)\n", .{ pos, pos - tp.base });
+    }
+
+    /// A natural finish: the slot's own state, right behind the committed tokens at `pos`, becomes the newest
+    /// checkpoint and supersedes the thought point. Moved, not copied (`handOverSsmCheckpoint`); the slot decodes no
+    /// further. The MTP head's pending history is appended first so it reaches the point; a head that cannot is left
+    /// short and the restore starts it blind, never the trunk.
+    pub fn handOverEndPoint(self: *Generator, pos: usize, head_token: ?u32) mtp_plan.EndPoint {
+        if (!mtp_plan.endPointStands(self.spec_round_end, self.ctx.moe_seq_offset.*, pos)) return .serial_finish;
+        if (self.thoughtStateInGroup()) return .grouped;
+        const a = self.ssm_checkpoint_alloc orelse return .failed;
+        const entries = self.ctx.ssm_entries orelse return .failed;
+        self.completeMtpHistory(pos, head_token);
+        var cp = transformer_mod.handOverSsmCheckpoint(a, entries, pos, self.xfm.s) catch |err| {
+            log.warn("[prefix] decode-end restore point at {d} not taken: {s}\n", .{ pos, @errorName(err) });
+            return .failed;
+        };
+        self.dropThoughtPoint();
+        self.ssm_checkpoints.append(a, cp) catch {
+            cp.deinit(a);
+            return .failed;
+        };
+        return .taken;
+    }
+
+    /// A restore at `pos` adopts head rows through the one that reads the token AT `pos`: the end-of-turn token,
+    /// which the next prompt repeats only when it is `head_token`. Without that row the head restores blind.
+    fn completeMtpHistory(self: *Generator, pos: usize, head_token: ?u32) void {
+        const mc = if (self.mtp_cache) |*m| m else return;
+        if (self.mtpModuleHeadReleased() or !self.has_last_hidden or self.mtp_pre_draft != null) return;
+        mc.activate();
+        self.mtpApplyStash() catch |err| {
+            log.info("[prefix] MTP history not extended to the decode end: {s}\n", .{@errorName(err)});
+            return;
+        };
+        // The commit snapshots the head's KV: realize the lazy appends while their inputs live.
+        defer if (mc.kv()) |kv| kv.evalState();
+        const token = head_token orelse return;
+        const rows = self.mtpCommittedHistoryLen();
+        if (token != self.next_token_id or self.mtp_position_base + rows + 1 != pos) return;
+        const id: i32 = @intCast(token);
+        var hidden = mlx.mlx_array_new();
+        if (mlx.mlx_array_set(&hidden, self.last_hidden) != 0) return;
+        self.mtp_hist_stash = .{
+            .ids = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32),
+            .hidden = hidden,
+            .n = 1,
+            .off0 = rows,
+        };
+        self.mtp_hist_stash.?.host_ids[0] = token;
+        self.mtpApplyStash() catch |err| {
+            log.info("[prefix] MTP history not extended to the decode end: {s}\n", .{@errorName(err)});
+        };
     }
 
     /// Frees the thought point the commit must not carry.

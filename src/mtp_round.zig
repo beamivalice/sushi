@@ -1477,6 +1477,11 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
         }
     }
 
+    // A round's pending token is on the host and not forwarded: an end of turn stops here, where the decode-end
+    // point stands, instead of the serial block forwarding it and its successor first.
+    if (self.end_point_armed and self.spec_round_end == self.ctx.moe_seq_offset.* and !self.has_pending_token and
+        isEosId(self.next_token_id, self.eos_token_ids) and try self.checkStop()) return .{ .done = null };
+
     // Serial block: the runtime-disabled fallback, the bounded probe, or the ramp back.
     if (self.spec_disabled_runtime or self.mtp_serial_left > 0 or self.mtp_serial_exit != .none) {
         try self.mtpDetachHead(allocator, self.mtpSerialMayResume());
@@ -2149,7 +2154,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         greedy_next_pending = verdict.next_pending;
     }
 
-    const stop_prefix = mtpStopPrefix(drafts, accepted, if (self.mtp_planner_owned) self.eos_token_ids else &.{});
+    const stop_prefix = mtpStopPrefix(drafts, accepted, if (self.mtp_planner_owned or self.end_point_armed) self.eos_token_ids else &.{});
     if (stop_prefix.stop) |token| log.debug("[mtp-stop] accepted EOS token={d} accepted={d}->{d}\n", .{ token, accepted, stop_prefix.accepted });
     accepted = stop_prefix.accepted;
     var next_pending: u32 = blk: {
@@ -2277,6 +2282,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
             if (chain.lookup) self.mtpLookupObserve(m, m + 1);
             self.mtpRoundUntimed();
         }
+        self.spec_round_end = self.ctx.moe_seq_offset.*;
         self.thoughtPointTake();
         return DrafterStepResult{
             .tokens = tokens,
@@ -2390,6 +2396,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);
         self.mtpRoundUntimed();
     }
+    self.spec_round_end = self.ctx.moe_seq_offset.*;
     self.thoughtPointTake();
     return DrafterStepResult{
         .tokens = tokens,
