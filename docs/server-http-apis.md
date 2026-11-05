@@ -305,6 +305,24 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   Unlike the request counters they run from process start whatever turns metrics on, and the routes keep the 503-while-off
   rule. `/props settings.prefix_cache.disk_written_bytes` is that model's own total since its tier opened (`disk_stats`,
   the same sequence-locked publish as `disk_used_bytes`), so an unload and reload restarts it while the process total keeps it.
+- <a id="speculative-and-tier-counters"></a>**Speculative and tier counters** (`spec_stats.zig`, `cache_stats.zig`; like the write counters they run from process
+  start, and the routes keep the 503-while-off rule). `/metrics.json` carries, after `prefix_cache_writes`:
+  - `"prefix_cache_tiers":{"hits":{"hot":n,"ssd":n},"evictions":{...},"evicted_bytes":{...},"hot_bytes":n}`: requests
+    whose restored prefix came from memory or the SSD tier, entries each tier dropped to stay inside its budget (and their
+    bytes), and the RAM tier's resident bytes. `/metrics`: `sushi:prefix_cache_tier_hits_total{tier}`,
+    `sushi:prefix_cache_evictions_total{tier}`, `sushi:prefix_cache_evicted_bytes_total{tier}`, `sushi:prefix_cache_hot_bytes`
+    ([engine-prefix-cache](engine-prefix-cache.md#tier-counters)).
+  - `"speculative":{"mtp":{...},"dflash":{...},"dspark":{...}}`, one object per drafting mode (MTP: Qwen and MiMo heads;
+    DFlash2: GLM; DSpark: DeepSeek) with `requests` (that ran a round), `rounds` (one verify forward each), `drafted`,
+    `accepted` (drafted tokens the verifier kept, not the always-committed first token of a round) and `plain_rounds`
+    (DSpark: rounds that carried one verifier row, already inside `rounds`; MTP: planner ticks that ran without a draft,
+    outside `rounds`; DFlash2: always 0). DSpark adds `rows`, `{<verifier rows>:
+    rounds}`. They are the sums of the figures `[spec-stats]` logs, added once when a request ends
+    ([engine-mtp](engine-mtp.md)). Acceptance % is `accepted / drafted`, mean accepted per round `accepted / rounds`.
+    `/metrics`: `sushi:spec_requests_total{mode}`, `sushi:spec_rounds_total{mode}`, `sushi:spec_drafted_tokens_total{mode}`,
+    `sushi:spec_accepted_tokens_total{mode}`, `sushi:spec_plain_rounds_total{mode}`, `sushi:spec_rows_total{mode,rows}`.
+  - A `requests` row of a request that speculated carries `"spec":{"mode","rounds","drafted","accepted"}`; a plain request
+    has no `spec` member.
 - `/metrics.json` ends with `"sessions"`, one row per live request (phases `prefill` and `decode`, cap 32; published
   by the inference thread under `queue_mu`, copied by the reader under the same lock — there is no separate
   `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused),

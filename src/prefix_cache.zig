@@ -27,6 +27,7 @@ const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const dsv41_model = @import("dsv41/dsv41_model.zig");
 const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
 const prefill_plan = @import("prefill_plan.zig");
+const cache_stats = @import("cache_stats.zig");
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -3736,7 +3737,13 @@ pub const HotPrefixCache = struct {
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
         const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
+        cache_stats.process.recordEviction(.hot, self.entries.items[idx].kv_bytes);
         self.evictAt(idx, reason);
+    }
+
+    /// The tier the last lookup's restored rows came from: memory (the RAM tier or the live state) unless the disk supplied them.
+    pub fn lastRestoredTier(self: *const HotPrefixCache) cache_stats.Tier {
+        return if (!self.last_restored_live and self.last_restored_disk_id != null) .ssd else .hot;
     }
 
     /// False when nothing was evictable (every survivor is checked out) — the termination
@@ -10149,6 +10156,44 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
     // One workload = plain LRU: C goes first.
     for (cache.entries.items) |*e| e.cache_key = 0;
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
+}
+
+test "HotPrefixCache: a capacity eviction is counted with its bytes in the hot tier" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    for (1..3) |used| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, &[_]u32{ 1, @intCast(used) }),
+            .has_tools = false,
+            .cache_key = 0,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = used,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = used * 100,
+            .ssm_checkpoints = null,
+            .ssm_bytes = 0,
+        });
+    }
+    cache.current_kv_bytes = 300;
+    const before = cache_stats.process.snapshot();
+    cache.evictOneLru("count cap", null);
+    const after = cache_stats.process.snapshot();
+    try testing.expectEqual(before.evictions[0] + 1, after.evictions[0]);
+    try testing.expectEqual(before.evicted_bytes[0] + 100, after.evicted_bytes[0]);
+    try testing.expectEqual(before.evictions[1], after.evictions[1]);
+    // An invalidation (a failed check) is not a capacity eviction.
+    cache.evictAt(0, "QSA history check");
+    try testing.expectEqual(before.evictions[0] + 1, cache_stats.process.snapshot().evictions[0]);
+}
+
+test "HotPrefixCache: the tier that served a restore is the disk's only when the disk supplied the rows" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    try testing.expectEqual(cache_stats.Tier.hot, cache.lastRestoredTier());
+    cache.last_restored_disk_id = 5;
+    try testing.expectEqual(cache_stats.Tier.ssd, cache.lastRestoredTier());
+    cache.last_restored_live = true;
+    try testing.expectEqual(cache_stats.Tier.hot, cache.lastRestoredTier());
 }
 
 test "HotPrefixCache: checkpoint clone allocation failure releases owned layers" {

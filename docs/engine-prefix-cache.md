@@ -492,6 +492,23 @@ They count what the filesystem accepted, never what was submitted, and run from 
   kind`, `a failed, dropped or fenced blob`, `a file staged in parts`), `DiskTier write counters:` in `kv_disk_cache.zig`
   and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache write counters` in `metrics.zig`.
 
+## Tier counters
+
+Beside the write counters, `src/cache_stats.zig` keeps process-wide relaxed atomics for the two tiers, rendered by
+`/metrics` and `/metrics.json` ([server-http-apis](server-http-apis.md#speculative-and-tier-counters)); they run from
+process start whatever turns `--metrics` on.
+
+- **Hits by tier** (`sushi:prefix_cache_tier_hits_total{tier}`): one per request whose lookup restored tokens, counted in
+  the scheduler where the `[prefix] reused ... from <tier>` line is built. `hot` is the RAM tier or the live state a
+  request keeps by move; `ssd` only when `last_restored_disk_id` is set and the live state did not serve it
+  (`HotPrefixCache.lastRestoredTier`).
+- **Evictions by tier** (`..._evictions_total`, `..._evicted_bytes_total`): entries a tier dropped to stay inside its
+  budget or entry cap: `evictOneLru` for the RAM tier, `gcToBudget` for the SSD tier. An invalidation (a failed QSA
+  check, a merge failure), an idle spill to disk and `clear` are not evictions.
+- **`sushi:prefix_cache_hot_bytes`**: the RAM tier's resident bytes, republished with `publishHotCacheResidency`.
+- Guards: `cache_stats.zig`, `a capacity eviction is counted`, `the tier that served a restore` in `prefix_cache.zig`,
+  `DiskTier: byte budget evicts LRU entries` in `kv_disk_cache.zig`.
+
 ## SSD-first
 
 - Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed. A Qwen GDN model adds a layout tag

@@ -135,6 +135,10 @@ if boot; then
     check "a default boot serves /metrics.json" "$(is "$(code "$BASE/metrics.json")" 200)"
     check "and /metrics" "$(is "$(code "$BASE/metrics")" 200)"
     sleep 3
+    check "/metrics.json carries the speculative and prefix cache tier counters, all zero on a server that served nothing" \
+        "$(curl -s "$BASE/metrics.json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert set(d["speculative"])=={"mtp","dflash","dspark"} and d["speculative"]["mtp"]["rounds"]==0 and d["prefix_cache_tiers"]["hits"]=={"hot":0,"ssd":0} and "hot_bytes" in d["prefix_cache_tiers"]' 2>/dev/null && echo 1 || echo 0)"
+    check "/metrics names them" \
+        "$(curl -s "$BASE/metrics" | grep -q 'sushi:spec_rounds_total{mode="dspark"} 0' && curl -s "$BASE/metrics" | grep -q 'sushi:prefix_cache_tier_hits_total{tier="ssd"} 0' && echo 1 || echo 0)"
     check "?since=0 carries the server's history ring with a sample" \
         "$(curl -s "$BASE/metrics.json?since=0" | python3 -c 'import json,sys; h=json.load(sys.stdin)["history"]; assert h["interval_ms"]==2000 and len(h["samples"])>=1 and len(h["samples"][0])==len(h["fields"])' 2>/dev/null && echo 1 || echo 0)"
     check "?since=<future> returns no samples" \

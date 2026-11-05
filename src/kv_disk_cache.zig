@@ -59,6 +59,7 @@ const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
 const write_stats = @import("disk_write_stats.zig");
+const cache_stats = @import("cache_stats.zig");
 const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
 
@@ -3739,6 +3740,7 @@ pub const DiskTier = struct {
             }
             const mb = @as(f64, @floatFromInt(self.entries.items[lru_idx].bytes)) / (1024.0 * 1024.0);
             log.info("  [disk-cache] evicted LRU entry (byte budget; {d:.1} MB)\n", .{mb});
+            cache_stats.process.recordEviction(.ssd, self.entries.items[lru_idx].bytes);
             self.removeAt(lru_idx);
         }
     }
@@ -4745,8 +4747,12 @@ test "DiskTier: byte budget evicts LRU entries, keeps newest" {
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_a, false, null, s);
     // A budget that holds one entry but not two: the newest evicts the previous one.
     tier.max_bytes = tier.total_bytes + tier.total_bytes / 2;
+    const evicted_before = cache_stats.process.snapshot();
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, null, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    const evicted_after = cache_stats.process.snapshot();
+    try testing.expectEqual(evicted_before.evictions[1] + 1, evicted_after.evictions[1]);
+    try testing.expect(evicted_after.evicted_bytes[1] > evicted_before.evicted_bytes[1]);
     try testing.expect(std.mem.eql(u32, tier.entries.items[0].tokens, &tokens_b));
 
     // The evicted directory is gone from disk.

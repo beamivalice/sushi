@@ -4,6 +4,7 @@
 //! requests that finish between one pair of polls.
 const std = @import("std");
 const json_text = @import("json_text.zig");
+const spec_stats = @import("spec_stats.zig");
 
 pub const capacity: usize = 128;
 /// Longer model ids are cut (on a character boundary).
@@ -29,6 +30,11 @@ pub const Entry = struct {
     prefill_ns: u64,
     decode_ns: u64,
     end: End,
+    /// What speculation did for this request; `.none` when nothing drafted.
+    spec_mode: spec_stats.Mode = .none,
+    spec_rounds: u32 = 0,
+    spec_drafted: u32 = 0,
+    spec_accepted: u32 = 0,
     model_len: u8 = 0,
     model_buf: [model_cap]u8 = undefined,
 
@@ -84,7 +90,7 @@ pub fn Ring(comptime cap: usize) type {
                 if (e.t_ms <= since_ms) continue;
                 try w.print("{s}{{\"request_id\":{d},\"model\":", .{ if (first) "" else ",", e.request_id });
                 try json_text.write(w, e.model());
-                try w.print(",\"t_ms\":{d},\"prompt_tokens\":{d},\"cached_tokens\":{d},\"prefill_seconds\":{d:.6},\"generated_tokens\":{d},\"decode_seconds\":{d:.6},\"outcome\":\"{s}\"}}", .{
+                try w.print(",\"t_ms\":{d},\"prompt_tokens\":{d},\"cached_tokens\":{d},\"prefill_seconds\":{d:.6},\"generated_tokens\":{d},\"decode_seconds\":{d:.6},\"outcome\":\"{s}\"", .{
                     e.t_ms,
                     e.prompt_tokens,
                     e.cached_tokens,
@@ -93,6 +99,8 @@ pub fn Ring(comptime cap: usize) type {
                     @as(f64, @floatFromInt(e.decode_ns)) * ns_to_s,
                     outcomeName(e.end),
                 });
+                if (e.spec_mode != .none) try w.print(",\"spec\":{{\"mode\":\"{s}\",\"rounds\":{d},\"drafted\":{d},\"accepted\":{d}}}", .{ @tagName(e.spec_mode), e.spec_rounds, e.spec_drafted, e.spec_accepted });
+                try w.writeAll("}");
                 first = false;
             }
             try w.writeAll("]");
@@ -209,3 +217,24 @@ test "request log: an empty ring renders an empty array" {
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 0), parsed.value.object.get("requests").?.array.items.len);
 }
+
+test "request log: a speculative request renders its rounds, a plain one has no spec member" {
+    var ring: Ring(4) = .{};
+    var spec = entry(1, 1000, "m");
+    spec.spec_mode = .dspark;
+    spec.spec_rounds = 12;
+    spec.spec_drafted = 96;
+    spec.spec_accepted = 60;
+    ring.push(testing.io, spec);
+    ring.push(testing.io, entry(2, 2000, "m"));
+    const parsed = try rendered(&ring, 0);
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("requests").?.array.items;
+    const got = rows[0].object.get("spec").?.object;
+    try testing.expectEqualStrings("dspark", got.get("mode").?.string);
+    try testing.expectEqual(@as(i64, 12), got.get("rounds").?.integer);
+    try testing.expectEqual(@as(i64, 96), got.get("drafted").?.integer);
+    try testing.expectEqual(@as(i64, 60), got.get("accepted").?.integer);
+    try testing.expect(rows[1].object.get("spec") == null);
+}
+

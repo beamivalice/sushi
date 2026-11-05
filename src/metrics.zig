@@ -20,6 +20,8 @@ const std = @import("std");
 const slot_admission = @import("slot_admission.zig");
 const write_stats = @import("disk_write_stats.zig");
 const request_log = @import("request_log.zig");
+const spec_stats = @import("spec_stats.zig");
+const cache_stats = @import("cache_stats.zig");
 
 // ---------------------------------------------------------------------------
 // Histogram bounds (comptime constants shared by Metrics.init)
@@ -286,6 +288,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     }
     try w.print("\n", .{});
     try write_stats.writePrometheus(write_stats.process.snapshot(), w);
+    try cache_stats.writePrometheus(cache_stats.process.snapshot(), w);
+    try spec_stats.writePrometheus(spec_stats.process.snapshot(), w);
 
     // --- Latency histograms (nanoseconds → seconds) ---
     try writeHistogram(w, "vllm:time_to_first_token_seconds", "Time to first token in seconds", &m.ttft_ns, ns_to_s);
@@ -477,6 +481,10 @@ pub fn renderJsonWith(m: *const Metrics, sessions: []const Session, history: ?[]
     }
     try w.print("}},", .{});
     try write_stats.writeJson(write_stats.process.snapshot(), w);
+    try w.writeAll(",");
+    try cache_stats.writeJson(cache_stats.process.snapshot(), w);
+    try w.writeAll(",");
+    try spec_stats.writeJson(spec_stats.process.snapshot(), w);
     try w.print(",\"histograms\":{{", .{});
 
     try writeHistogramJson(w, "time_to_first_token_seconds", &m.ttft_ns, ns_to_s);
@@ -970,6 +978,35 @@ test "renderJson output parses as valid JSON via stdlib parser" {
     // Verify counters sub-object has expected key
     const counters = obj1.get("counters").?.object;
     try testing.expectEqual(@as(i64, 1), counters.get("requests_success_total").?.integer);
+}
+
+test "speculative and prefix cache tier counters are on both surfaces" {
+    const testing = std.testing;
+    spec_stats.process.record(.mtp, .{ .rounds = 3, .drafted = 9, .accepted = 6 }, &.{});
+    cache_stats.process.recordHit(.ssd);
+    cache_stats.process.recordEviction(.hot, 64);
+    cache_stats.process.setHotBytes(4096);
+    var m = Metrics.init();
+
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &.{}, &jw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jbuf[0..jw.end], .{});
+    defer parsed.deinit();
+    const mtp = parsed.value.object.get("speculative").?.object.get("mtp").?.object;
+    try testing.expect(mtp.get("rounds").?.integer >= 3);
+    try testing.expect(mtp.get("accepted").?.integer >= 6);
+    const tiers = parsed.value.object.get("prefix_cache_tiers").?.object;
+    try testing.expect(tiers.get("hits").?.object.get("ssd").?.integer >= 1);
+    try testing.expect(tiers.get("evictions").?.object.get("hot").?.integer >= 1);
+
+    var pbuf: [64 * 1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try renderPrometheus(&m, &pw);
+    const prom = pbuf[0..pw.end];
+    try testing.expect(std.mem.indexOf(u8, prom, "sushi:spec_rounds_total{mode=\"mtp\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_tier_hits_total{tier=\"ssd\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_hot_bytes ") != null);
 }
 
 test "gpu clock gauges are on both surfaces" {

@@ -17,6 +17,7 @@ const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_settings = @import("model_settings.zig");
 const round_cost = @import("round_cost.zig");
 const spec_cost_gate = @import("spec_cost_gate.zig");
+const spec_stats = @import("spec_stats.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -1282,7 +1283,7 @@ pub const Generator = struct {
         );
     }
 
-    pub const SpecMode = enum { none, dspark, mtp, dflash };
+    pub const SpecMode = spec_stats.Mode;
 
     /// The mode `logSpecStats` reports: the first that drafted.
     pub fn specMode(self: *const Generator) SpecMode {
@@ -1290,6 +1291,31 @@ pub const Generator = struct {
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) return .mtp;
         if (self.dflash != null and self.dflash_attempted > 0) return .dflash;
         return .none;
+    }
+
+    /// This request's speculative sums: what `logSpecStats` prints and the server's totals add.
+    pub fn specTotals(self: *const Generator) spec_stats.Totals {
+        return switch (self.specMode()) {
+            .none => .{},
+            .dspark => .{ .rounds = self.dspark_stats.rounds, .drafted = self.dspark_stats.drafted, .accepted = self.dspark_stats.accepted, .plain = self.dspark_stats.plain },
+            .mtp => .{
+                .rounds = self.mtp_attempted,
+                .drafted = spec_stats.proposed(self.mtp_drafted_tokens, self.mtp_attempted, self.mtp_depth),
+                .accepted = self.mtp_accepted_tokens,
+                .plain = self.mtp_planner_plain_ticks,
+            },
+            .dflash => .{
+                .rounds = self.dflash_attempted,
+                .drafted = if (self.glm_dflash_native) self.glm_round.drafted else spec_stats.proposed(self.dflash_drafts_verified, self.dflash_attempted, if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0),
+                .accepted = self.dflash_accepted_tokens,
+            },
+        };
+    }
+
+    /// Rounds by verifier rows, for the modes that keep it (DSpark).
+    pub fn specRows(self: *const Generator) []const u32 {
+        comptime std.debug.assert(@typeInfo(@FieldType(@FieldType(Generator, "dspark_stats"), "rows_hist")).array.len <= spec_stats.rows_cap);
+        return if (self.specMode() == .dspark) &self.dspark_stats.rows_hist else &.{};
     }
 
     pub fn logSpecStats(self: *const Generator) void {
@@ -1330,10 +1356,7 @@ pub const Generator = struct {
                 @as(f64, @floatFromInt(@max(self.mtp_attempted, 1)));
             // Depth varies per round under the EV controller — the honest
             // denominator is the DRAFTED count, not attempts x cap.
-            const drafts_proposed: u64 = if (self.mtp_drafted_tokens > 0)
-                self.mtp_drafted_tokens
-            else
-                self.mtp_attempted * @as(u64, self.mtp_depth);
+            const drafts_proposed = self.specTotals().drafted;
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
@@ -1389,8 +1412,7 @@ pub const Generator = struct {
         if (mode == .dflash) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dflash_attempted));
-            const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
-            const drafts_proposed: u64 = if (self.glm_dflash_native) self.glm_round.drafted else (if (self.dflash_drafts_verified > 0) self.dflash_drafts_verified else self.dflash_attempted * @as(u64, drafts_per_round));
+            const drafts_proposed = self.specTotals().drafted;
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))

@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`/metrics` and `/metrics.json` report speculative decoding and prefix cache tiers**: rounds, drafted and accepted tokens per drafting mode (MTP, DFlash2, DSpark) with DSpark's verifier rows, each request's own figures in the finished-request log, and per-tier cache hits, evictions and the memory tier's bytes.
 - **Qwen3.8-Flash-Next packs with a trellis trunk decode about 6% faster**: the shared expert now runs inside the routed expert launches as it does on affine packs, also when the model verifies several tokens at once, with the same output.
 - **`sushi launch dsh` starts DeepSeek Harness on your local server**: it lists every chat model with its own window, output cap and reasoning levels in a patch layer of its own, so your `~/.dsh` profile is left as it is.
 - **The web page's Models tab downloads packs**: its Available list (`/downloads`) shows the Sushi packs published on Hugging Face with their size, recommends the one for this Mac's memory, checks the free space, and downloads a pack into the models folder with a progress bar, speed and time left; Stop keeps what is downloaded and Resume continues from it, also after a restart, a finished pack opens in the Installed list ready to load, a small dot on the tab marks a newly published pack, and every tab of the top bar has a small icon (`GET`/`POST /v1/downloads`).

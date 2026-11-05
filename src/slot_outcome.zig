@@ -4,6 +4,7 @@ const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const metrics_mod = @import("metrics.zig");
 const request_log = @import("request_log.zig");
+const spec_stats = @import("spec_stats.zig");
 const io_util = @import("io_util.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const disk_placement = @import("disk_placement.zig");
@@ -228,6 +229,10 @@ fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
 }
 
 /// The `/metrics.json` request-log row of a slot that ended, read before the connection thread can free it.
+fn clampU32(n: u64) u32 {
+    return @intCast(@min(n, std.math.maxInt(u32)));
+}
+
 fn logFinished(m: *metrics_mod.Metrics, slot: anytype, end: request_log.End) void {
     var e: request_log.Entry = .{
         .request_id = slot.request_id,
@@ -238,6 +243,10 @@ fn logFinished(m: *metrics_mod.Metrics, slot: anytype, end: request_log.End) voi
         .prefill_ns = slot.prefill_ns,
         .decode_ns = slot.decode_ns,
         .end = end,
+        .spec_mode = slot.spec_mode,
+        .spec_rounds = clampU32(slot.spec_totals.rounds),
+        .spec_drafted = clampU32(slot.spec_totals.drafted),
+        .spec_accepted = clampU32(slot.spec_totals.accepted),
     };
     e.setModel(slot.model.id);
     m.finished.push(slot.io, e);
@@ -278,13 +287,20 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     recordSlotEnd(m, slot, cleanupOutcome(slot));
 }
 
+/// Logs `[spec-stats]` and keeps what speculation did: on the slot for its request-log entry, and in the server's totals.
+pub fn finishSpec(slot: *Slot, g: *const generate_mod.Generator) void {
+    slot.spec_mode = g.specMode();
+    slot.spec_totals = g.specTotals();
+    g.logSpecStats();
+    spec_stats.process.record(slot.spec_mode, slot.spec_totals, g.specRows());
+}
+
 pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
     if (slot.legacy_gen) |*g| {
-        slot.spec_mode = g.specMode();
-        g.logSpecStats();
+        finishSpec(slot, g);
         // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
         // wiring it only beside generate.zig's own logSpecStats() calls (the
         // legacy/CLI path) makes it dead on every served request.
@@ -389,6 +405,8 @@ const OutcomeStub = struct {
     prompt_tokens: u32 = 100,
     completion_tokens: u32 = 10,
     cached_tokens: u32 = 0,
+    spec_mode: spec_stats.Mode = .none,
+    spec_totals: spec_stats.Totals = .{},
 
     /// `finishSlot` on the inference thread: records, then publishes the terminator.
     fn finish(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {
@@ -560,6 +578,23 @@ test "request log: a finished request is logged once with its split of computed 
     try testing.expectEqual(@as(i64, 10), row.get("generated_tokens").?.integer);
     try testing.expectEqual(@as(f64, 0.004), row.get("prefill_seconds").?.float);
     try testing.expectEqual(@as(f64, 0.02), row.get("decode_seconds").?.float);
+}
+
+test "request log: a finished request carries what speculation did for it" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{ .spec_mode = .mtp, .spec_totals = .{ .rounds = 5, .drafted = 15, .accepted = 11 } };
+    s.finish(&m, "stop");
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{");
+    try m.finished.writeSince(testing.io, 0, &out.writer);
+    try out.writer.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const spec = parsed.value.object.get("requests").?.array.items[0].object.get("spec").?.object;
+    try testing.expectEqualStrings("mtp", spec.get("mode").?.string);
+    try testing.expectEqual(@as(i64, 5), spec.get("rounds").?.integer);
+    try testing.expectEqual(@as(i64, 11), spec.get("accepted").?.integer);
 }
 
 test "request log: a disconnect, an error and a refusal each log once under their own outcome" {

@@ -38,6 +38,8 @@ const qwen4_qsa_gather = @import("qwen4/qwen4_qsa_gather.zig");
 const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const spec_stats = @import("spec_stats.zig");
+const cache_stats = @import("cache_stats.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
@@ -436,6 +438,7 @@ pub const Slot = struct {
     restore_ns: ?u64 = null,
     /// What speculation drafted, set where `logSpecStats` reports it.
     spec_mode: Generator.SpecMode = .none,
+    spec_totals: spec_stats.Totals = .{},
     /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
     /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
     /// that received the tokens; subtracted from this slot's `prefill_ns` so
@@ -2195,6 +2198,7 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
     const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
+    cache_stats.process.setHotBytes(bytes);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
     publishDiskStats(sch);
@@ -2467,8 +2471,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
                 // Streams end this way on a stop sequence or a client that leaves: finishSlot's line is theirs too.
                 if (s.legacy_gen) |*g| {
-                    s.spec_mode = g.specMode();
-                    g.logSpecStats();
+                    slot_outcome.finishSpec(s, g);
                     g.logQsaArms();
                 }
                 commitCancelledAtCleanup(sch, s, commitSlotIfApplicable);
@@ -3596,6 +3599,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
             slot.restore_ns = lookup_sw.read();
+            if (lookup.matched > 0) cache_stats.process.recordHit(hc.lastRestoredTier());
             var restore_line_buf: [192]u8 = undefined;
             if (prefix_cache_mod.restoreLogLine(
                 &restore_line_buf,

@@ -26,6 +26,8 @@ test {
     _ = @import("dsv41/expert_usage.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");
+    _ = @import("cache_stats.zig");
+    _ = @import("spec_stats.zig");
     _ = @import("metrics_history.zig");
     _ = @import("request_log.zig");
     _ = @import("json_text.zig");

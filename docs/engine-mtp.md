@@ -180,6 +180,10 @@ chain/group paths still capture per row. `dflash_policy.ladder()` is that table 
   layers read every key. On one `32k+` cell MiMo dropped nearly every 64k-256k round as implausible against 32k cells.
 - **`[spec-stats] … stalls=N/max_ms`** counts this request's rounds slower than twice the median round at their width
   (`round_cost.RoundLog`), so an info-level log shows a hiccup the table dropped quietly; smooth reads `stalls=0/0`.
+- **Totals on the metrics endpoints**: `Generator.specTotals` (the sums `[spec-stats]` prints) is added to the process
+  counters by `slot_outcome.finishSpec`, once per request, at the same two seams that log the line (`finishSlot`, the
+  cancelled-at-cleanup path), so the decode loop pays nothing. Fields and formulas:
+  [server-http-apis](server-http-apis.md#speculative-and-tier-counters).
 - **One `[spec-stats]` per request**: `finishSlot` writes it for a finished slot, the cleanup drain for one cancelled
   mid-decode (a streamed stop-sequence cut, a client that left), so streamed rounds are timeable from the log.
 - **The regime gate** compares the two round SHAPES at one base depth: two-chunk (draft m_lo, sync on the chain's
