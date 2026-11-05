@@ -344,6 +344,45 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
 - DeepSeek shapes at 2 to 8 rows (a launch-geometry sweep, chained, on a loaded box so +-50% noise): the NAX policy is within noise of the best geometry at every shape and width; the SIMD kernel wins only some
   two-row cells, by less than the noise. The policy stands.
 
+<a id="nax-rows-walk"></a>
+- **The NAX rows walk reads two k-tiles' fragments ahead of their MMAs, on 32-bit funnels** (`RowsGeom.unr` 2 at kph 1,
+  `r32` on every NAX launch; `rows_wfrag` takes `nax_win2`'s two 32-bit funnels where a quad's codewords fit them, n62 to
+  n102 but n64, else `nax_wfrag_k`). The MMAs run in the one-tile walk's order into the same accumulator, so every byte is the
+  old walk's (`the unrolled 32-bit walk writes the one-tile walk's bytes`, `the 32-bit funnel reader ... at every rate`).
+  - A one-row trunk launch is bound by the fragment reads and their decode, not the MMA or DRAM: on Flash-Next's qkv+z
+    an MMA-free kernel kept ~95% of the time, while the same bytes read as coalesced words with no decode ran at the
+    streaming floor. The served launch reads at 60-77% of that floor; affine-8 `quantized_matmul` streams at about it.
+  - Quiet A/B (`sushi-ubench run shared.exl3_trunk_launches --rungs rows=1,4 --rounds 11`, GPU lock, QUIET, fans max,
+    die 50 C, AC, `taskpolicy -a`, arms interleaved; c1f263d3, its `exact` then also taking the 32-bit reader at n64), old
+    walk -> new, 1 and 4 rows: K6 GDN out and attention o -7 to -8%, q+k+v -3%, qkv+z -2%, indexer -10 to -14%, lm_head
+    -1 to -2%. Unrolling gives most of it; the 32-bit reader adds 1-2% at n96 and lost 1-2% at n64, which keeps
+    `nax_wfrag`. K4 (unroll alone): q+k+v -12%, indexer -30%, shared gate+up -8%, down -13 to -30%, GDN out +3 to +6%.
+    DeepSeek's kph-1 linears ran -4 to -9% at 2 to 8 rows in a contended check, its tuned linears and head within noise.
+  - Ruled out (bytes unchanged, contended interleaved A/Bs at the exploration commit 33fe7c71): a threadgroup spanning every k split of a 128-wide block that folds the finish
+    in split order (one dispatch, 10-60% slower: the same simdgroups in 5x fewer threadgroups; two splits per simdgroup
+    2-5x); threadgroup-major `[OT/8][IT][8][n]` or pair-major addressing (within -3..+6%); four k-tiles ahead (+10-25%);
+    staging 4 or 8 k-tiles' words through threadgroup memory by coalesced 16-byte loads (K4 +10-20% at one row, K6 +-5%).
+- **Flash-Next's trellis trunk against the affine-8 trunk** (`shared.exl3_trunk_launches --rungs rows=1 --rounds 11`, quiet
+  as above, 0417ad5b; us a call, median; affine 8 is one `quantized_matmul` per part at the pack's group, the trellis one
+  stacked launch; old -> new walk):
+
+  | launch, 1 row | affine 8 | K4 old / new | K6 old / new | K6 floor |
+  |---|---|---|---|---|
+  | GDN qkv+z 16384x2560 | 79.9 | 44.9 / 46.1 | 72.0 / 73.3 | 55.2 |
+  | GDN out 2560x6144 | 27.0 | 15.6 / 17.2 | 28.7 / 26.0 | 17.9 |
+  | attention q+k+v 13312x2560 | 67.4 | 41.7 / 37.7 | 62.0 / 60.8 | 45.5 |
+  | attention o 2560x6144 | 31.8 | 19.2 / 20.7 | 32.3 / 29.8 | 21.4 |
+  | indexer 640x2560 | 2.9 | 3.5 / 2.7 | 4.0 / 3.5 | |
+  | shared gate+up 1280x2560 | 5.2 | 4.4 / 4.6 | 7.1 / 7.2 | 2.1 |
+  | shared down 2560x640 | 2.9 | 3.0 / 2.4 | 3.8 / 3.2 | |
+  | lm_head 248320x2560 (K6) | 1116 | | 956 / 943 | 817 |
+
+  A token at one row (36 GDN, 12 attention, 48 shared experts, the head): affine 8 6.6 ms, K4 4.3, K6 6.3 -> 6.15. Each
+  call has a per-rung link floor subtracted, which moves the small launches by a few us between runs (a run four minutes
+  earlier put every arm's sum 0.8 ms lower); the differences between arms hold. K4 wins every launch but the indexer
+  and shared down (tied); K6 wins the large launches and the head, and loses the shared expert (1.1-1.4x) and the indexer
+  (1.3x): latency-bound launches that pay a second dispatch, the k-split finish, that affine 8 does not. The contended
+  runs of this work had put K6 and the head behind affine 8: a contended number is a smoke.
 - **DeepSeek trunk by width** (`SUSHI_DSV41_TRUNK_UBENCH=1 MLX_MAX_OPS_PER_BUFFER=16`, exl3 test binary at `d810c50c`; now `sushi-ubench run shared.exl3_trunk_rows`, M5 Max, GPU
   lock, QUIET, fans max, die under 50 °C, `taskpolicy -a`, best of 7 rounds of 96 calls chained over distinct banks): us a call,
   finish included, the served arm (SIMD at 1 row, NAX from 2) and the NAX arm at 1 row, against the same bytes streamed by

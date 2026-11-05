@@ -220,10 +220,12 @@ pub const ROWS_BODY: [:0]const u8 =
 /// `ROWS_SOURCE` on the matrix units: a simdgroup owns 32 outputs, decodes them into `matmul2d` weight
 /// fragments (the NAX GEMM's) and multiplies every k-tile with a 16-row tile holding the prepared rows
 /// (rows past ROWS repeat the last row; their sums are never stored), so a row costs no ALU of its own.
-/// A threadgroup owns one 128-wide output block; FOLD as in `ROWS_SOURCE`.
+/// A threadgroup owns one 128-wide output block; FOLD as in `ROWS_SOURCE`. UNR k-tiles' fragments are read
+/// before their MMAs run, in the one-tile walk's order; R32 reads them on 32-bit funnels where they fit.
 pub const ROWS_NAX_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_BODY, "PREP_SLOT", "lane");
 
 const ROWS_NAX_BODY: [:0]const u8 =
+    \\static_assert(UNR == 1 || KPH == 1, "an unrolled walk steps whole chunks of one slice");
     \\constexpr uint SGS = 4u * uint(KPH);
     \\constexpr uint KPARTS = uint(KPH);
     \\constexpr uint TGT = 8u;
@@ -245,20 +247,25 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\
 ++ ROWS_CHUNK_OPEN ++
     \\  const threadgroup half *pl = prep + xrow * uint(CHUNK) + uint(origin.x);
-    \\  for (uint tk = c0 + (kslice + uint(KPH) - (c0 - tk0) % uint(KPH)) % uint(KPH); tk < c1; tk += uint(KPH)) {
-    \\    const device uint *wp = wcol + (size_t)(tk - tk0) * OT * PACKED_W;
-    \\    const nfrag w0 = nax_wfrag_k<N>(wp, lane);
-    \\    const nfrag w1 = nax_wfrag_k<N>(wp + PACKED_W, lane);
-    \\    for (short s = 0; s < 8; s++) {
-    \\      right[s] = w0[s];
-    \\      right[8 + s] = w1[s];
+    \\  for (uint tk = c0 + (kslice + uint(KPH) - (c0 - tk0) % uint(KPH)) % uint(KPH); tk < c1; tk += uint(UNR) * uint(KPH)) {
+    \\    nfrag wf[UNR][2];
+    \\    for (uint u = 0u; u < uint(UNR); u++) {
+    \\      const device uint *wp = wcol + (size_t)(tk + u * uint(KPH) - tk0) * OT * PACKED_W;
+    \\      wf[u][0] = rows_wfrag<N, R32>(wp, lane);
+    \\      wf[u][1] = rows_wfrag<N, R32>(wp + PACKED_W, lane);
     \\    }
-    \\    const half4 v = *((const threadgroup half4 *)(pl + (tk - c0) * TILE));
-    \\    for (uint c = 0u; c < 4u; c++) {
-    \\      left[c] = v[c];
-    \\      left[4 + c] = half(0.0h);
+    \\    for (uint u = 0u; u < uint(UNR); u++) {
+    \\      for (short s = 0; s < 8; s++) {
+    \\        right[s] = wf[u][0][s];
+    \\        right[8 + s] = wf[u][1][s];
+    \\      }
+    \\      const half4 v = *((const threadgroup half4 *)(pl + (tk + u * uint(KPH) - c0) * TILE));
+    \\      for (uint c = 0u; c < 4u; c++) {
+    \\        left[c] = v[c];
+    \\        left[4 + c] = half(0.0h);
+    \\      }
+    \\      op.run(left, right, destination);
     \\    }
-    \\    op.run(left, right, destination);
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -314,8 +321,9 @@ const ROWS_TG_BYTES: c_int = 8192;
 
 /// One multi-row launch: `tgrp` output tile pairs per threadgroup, `kph` simdgroups per pair over its k
 /// range, `nsplit` threadgroups over the k dim, `chunk` halves per row staged at a time. `nax` launches
-/// `ROWS_NAX_SOURCE`, whose threadgroup is always tgrp 4, kph 1.
-pub const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_int, nax: bool = false };
+/// `ROWS_NAX_SOURCE`, whose threadgroup is always tgrp 4, kph 1; its `unr` (kph 1 only) and `r32` change how the
+/// fragments are read, never a byte.
+pub const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_int, nax: bool = false, unr: c_int = 1, r32: bool = false };
 
 const RowsKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, bounds: [3]c_int, geom: RowsGeom };
 
@@ -334,7 +342,41 @@ var rows_finish_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 pub const ROWS_INS = [_][*:0]const u8{ "x", "trellis", "suh", "svh" };
 
-pub const ROWS_NAX_FRAGS: [:0]const u8 = kernels.GEMM_NAX_INCLUDES ++ kernels.GEMM_NAX_FRAGS ++ ROWS_HELPERS;
+pub const ROWS_NAX_FRAGS: [:0]const u8 = kernels.GEMM_NAX_INCLUDES ++ kernels.GEMM_NAX_FRAGS ++ ROWS_HELPERS ++ W32_FRAGS;
+
+/// `nax_wfrag_k` on two 32-bit funnels (`nax_win2`) where a quad's two early codewords lie in the 32 bits ending 16
+/// before its last bit and its two late ones in the last 32 (n62 to n102): the same codewords, no 64-bit shift. n64 keeps
+/// `nax_wfrag`, whose two-word read measured faster there.
+const W32_FRAGS: [:0]const u8 =
+    \\static inline constexpr bool nax_w32_fits(uint N) {
+    \\  for (uint b = 0u; b < 2u; b++) {
+    \\    const uint last = nax_end(N, b, 5u);
+    \\    if (last - nax_end(N, b, 1u) < 16u || last - nax_end(N, b, 0u) > 32u || last - nax_end(N, b, 4u) > 16u) return false;
+    \\  }
+    \\  return true;
+    \\}
+    \\template<uint N, uint R32>
+    \\static inline nfrag rows_wfrag(const device uint *words, uint lane) {
+    \\  if constexpr (R32 != 0u && N != 64u && nax_w32_fits(N)) {
+    \\    constexpr uint W = N / 2u;
+    \\    const uint b = (lane >> 3u) & 1u;
+    \\    const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * b + nax_end(N, 0u, 5u);
+    \\    const uint s0 = nax_sh(N, b, 0u) - 16u;
+    \\    const uint s1 = nax_sh(N, b, 1u) - 16u;
+    \\    const uint s4 = nax_sh(N, b, 4u);
+    \\    const uint2 lo = nax_win2(words, end, W);
+    \\    const uint2 hi = nax_win2(words, end + W, W);
+    \\    const half2 p0 = exl3_pairh(uint2((lo.y >> s0) & 0xffffu, (lo.y >> s1) & 0xffffu));
+    \\    const half2 p1 = exl3_pairh(uint2((lo.x >> s4) & 0xffffu, lo.x & 0xffffu));
+    \\    const half2 p2 = exl3_pairh(uint2((hi.y >> s0) & 0xffffu, (hi.y >> s1) & 0xffffu));
+    \\    const half2 p3 = exl3_pairh(uint2((hi.x >> s4) & 0xffffu, hi.x & 0xffffu));
+    \\    return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+    \\  } else {
+    \\    return nax_wfrag_k<N>(words, lane);
+    \\  }
+    \\}
+    \\
+;
 
 pub fn rowsKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
     if (g.nax) return kernel_src.codebookKernelWith(&rows_nax_kernel, "sushi_exl3_rows_nax", &ROWS_INS, &.{"y"}, ROWS_NAX_SOURCE, ROWS_NAX_FRAGS);
@@ -378,7 +420,18 @@ const NAX_TUNED = [_]NaxTuned{
     .{ .in_dim = 5120, .out_dim = 129280, .groups = 1, .kph = 1, .nsplit = 2 },
 };
 
+/// The NAX arm walks two k-tiles' fragments ahead of their MMAs at one simdgroup per pair, on 32-bit funnels: a one-row
+/// trunk launch is bound by the fragment reads and decode, not the MMA.
 fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, nax: bool) RowsGeom {
+    var g = rowsLaunch(in_dim, out_dim, rows, groups, nax);
+    if (g.nax) {
+        g.r32 = true;
+        if (g.kph == 1) g.unr = 2;
+    }
+    return g;
+}
+
+fn rowsLaunch(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, nax: bool) RowsGeom {
     if (nax) for (NAX_TUNED) |t| {
         if (t.in_dim == in_dim and t.out_dim == out_dim and t.groups == groups)
             return .{ .tgrp = 4, .kph = t.kph, .nsplit = t.nsplit, .chunk = rowsChunk(in_dim, rows, t.nsplit), .nax = true };
@@ -465,6 +518,10 @@ pub fn projectRowsWith(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_arr
         inline for (.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD" }, .{ in_dim, out_dim, rows, groups, g.tgrp, g.kph, g.nsplit, g.chunk, @as(c_int, @intFromBool(fold)) }) |name, v|
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
+        if (g.nax) {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "UNR", g.unr));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "R32", @intFromBool(g.r32)));
+        }
         inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
         rows_cfgs.put(key, c);
         break :blk c;
@@ -763,5 +820,65 @@ test "exl3 multi-row projection is one dispatch on an lm_head-wide output and tw
         defer _ = mlx.mlx_array_free(y);
         try t.expectEqual(@as(u32, @intCast(c[2])), kernels.fusedDispatchCount());
         try t.expectEqualSlices(c_int, &.{ 4, c[0] }, mlx.getShape(y));
+    }
+}
+
+// The served NAX walk reads two k-tiles' fragments ahead of their MMAs, on 32-bit funnels; the MMAs run in the one-tile
+// walk's order into the same accumulator, so every byte is the one-tile, 64-bit walk's.
+test "exl3 NAX multi-row: the unrolled 32-bit walk writes the one-tile walk's bytes" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    defer kernels.setDecodeParams(.mul1);
+    for ([_]exl3.Decode{ exl3.Decode.tabled(.spec1, .w15), .{ .codebook = .mcg, .window = .w15 } }) |dec| for ([_]u32{ 48, 64, 96 }) |n| {
+        try dec.requireTable();
+        kernels.setDecodeParams(dec);
+        for ([_][3]usize{ .{ 640, 2560, 1 }, .{ 1280, 1024, 2 }, .{ 1408, 384, 1 } }) |sh| {
+            const rig = try RowsRig.init(alloc, 0x6a11 + sh[0] + n, sh[0], sh[1], sh[2], n);
+            const in: c_int = @intCast(sh[0]);
+            for ([_]c_int{ 1, 2, 5, 11 }) |nsplit| {
+                if (@rem(@divExact(in, 128), nsplit) != 0) continue;
+                for ([_]c_int{ 1, 3, 8 }) |rows| for ([_]c_int{ rowsChunk(in, rows, nsplit), 128 }) |chunk| {
+                    const one = RowsGeom{ .tgrp = 4, .kph = 1, .nsplit = nsplit, .chunk = chunk, .nax = true };
+                    const want = try rig.run(alloc, 0, @intCast(rows), one, try rowsKernel(one));
+                    for ([_]c_int{ 1, 2, 4 }) |unr| for ([_]bool{ false, true }) |r32| {
+                        var g = one;
+                        g.unr = unr;
+                        g.r32 = r32;
+                        try std.testing.expectEqualSlices(u16, want, try rig.run(alloc, 0, @intCast(rows), g, try rowsKernel(g)));
+                    };
+                };
+            }
+        }
+    };
+}
+
+// The 32-bit funnel reader takes the 64-bit reader's codewords at every rate it serves (n62 to n102); another rate keeps
+// the 64-bit reader. Sliced k (kph > 1) keeps the one-tile walk and takes the 32-bit reader alone.
+test "exl3 NAX multi-row: the 32-bit funnel reader writes the 64-bit reader's bytes at every rate" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    defer kernels.setDecodeParams(.mul1);
+    for ([_]exl3.Decode{ exl3.Decode.tabled(.spec1, .w15), .{ .codebook = .mcg, .window = .w15 }, .{ .codebook = .pair1, .window = .w16 } }) |dec| {
+        try dec.requireTable();
+        kernels.setDecodeParams(dec);
+        var n: u32 = 56;
+        while (n <= 112) : (n += 2) {
+            if (dec.codebook.tabledHashMask() and dec.hashMask(.{ .n = n }) == null) continue;
+            if (dec.codebook == .pair1 and exl3.pair1Pair(.{ .n = n }) == null) continue;
+            const rig = try RowsRig.init(alloc, 0x8c41 + n, 1280, 1024, 1, n);
+            for ([_]c_int{ 1, 4 }) |kph| for ([_]c_int{ 1, 3 }) |rows| {
+                const one = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = 2, .chunk = rowsChunk(1280, rows, 2), .nax = true };
+                const want = try rig.run(alloc, 0, @intCast(rows), one, try rowsKernel(one));
+                var g = one;
+                g.r32 = true;
+                try std.testing.expectEqualSlices(u16, want, try rig.run(alloc, 0, @intCast(rows), g, try rowsKernel(g)));
+            };
+        }
     }
 }

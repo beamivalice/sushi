@@ -28,6 +28,7 @@ const registry = [_]report.Bench{
     exl3.ubench.moe_layer,
     exl3.ubench.prefill_gemm,
     exl3.ubench.trunk_rows,
+    exl3.ubench.trunk_launches,
     exl3.ubench.routed_t1,
 } ++ ubench_mimo2.benches ++ [_]report.Bench{
     exl3.ubench.exl3_rate_groups,

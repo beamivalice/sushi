@@ -1954,3 +1954,305 @@ fn phaseIndex(name: []const u8) usize {
     for (T1_PHASES, 0..) |p, i| if (std.mem.eql(u8, p, name)) return i;
     unreachable;
 }
+
+// ---- shared.exl3_trunk_launches: Flash-Next's trellis trunk decode launches as served (rows_exact, stacked parts in one
+// launch) against the affine-8 trunk they replace (one `quantized_matmul` per part) ----
+
+/// One decode launch of a trunk layer: its parts (stacked into one trellis launch, one `quantized_matmul` each on the
+/// affine side) over a shared input width, at the affine group the served pack stores it with.
+const TrunkLaunch = struct { name: []const u8, parts: []const usize, in: usize, group: c_int, k6_only: bool = false };
+
+/// Each decode launch of a Flash-Next layer: GDN qkv+z and out, attention q+k+v, o and indexer, the shared expert's
+/// gate+up and down, the lm_head (K6 only).
+const FLASH_NEXT_LAUNCHES = [_]TrunkLaunch{
+    .{ .name = "gdn_qkvz", .parts = &.{ 10240, 6144 }, .in = 2560, .group = 128 },
+    .{ .name = "gdn_out", .parts = &.{2560}, .in = 6144, .group = 128 },
+    .{ .name = "attn_qkv", .parts = &.{ 12288, 512, 512 }, .in = 2560, .group = 64 },
+    .{ .name = "attn_o", .parts = &.{2560}, .in = 6144, .group = 64 },
+    .{ .name = "idx_qk", .parts = &.{640}, .in = 2560, .group = 64 },
+    .{ .name = "shared_gu", .parts = &.{ 640, 640 }, .in = 2560, .group = 128 },
+    .{ .name = "shared_down", .parts = &.{2560}, .in = 640, .group = 128 },
+    .{ .name = "head", .parts = &.{248320}, .in = 2560, .group = 128, .k6_only = true },
+};
+
+const flash_next_launch_names = blk: {
+    var names: [FLASH_NEXT_LAUNCHES.len][]const u8 = undefined;
+    for (FLASH_NEXT_LAUNCHES, 0..) |sh, i| names[i] = sh.name;
+    break :blk names;
+};
+
+pub const trunk_launches: report.Bench = .{
+    .name = "shared.exl3_trunk_launches",
+    .scope = .shared,
+    .what = "Flash-Next trellis trunk launches (K4, K6; stacked parts one launch, rows_exact) against affine-8 qmv per part and the one-tile 64-bit NAX walk, over distinct banks",
+    .unit = .us,
+    .steps = 64,
+    .axes = &.{
+        .{ .name = "shape", .values = &flash_next_launch_names, .numeric = false },
+        .{ .name = "k", .values = &.{ "4", "6" } },
+        .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "5", "8" } },
+    },
+    .arms = &.{ "affine8", "exact", "walk1", "floor", "unr2", "r32" },
+    .ref = "affine8",
+    .run = runTrunkLaunches,
+};
+
+const TrunkLaunchCtx = struct {
+    sh: TrunkLaunch,
+    copies: usize,
+    shared: []const root.linear.Shared,
+    a8_w: []const []mlx.mlx_array,
+    a8_s: []const []mlx.mlx_array,
+    a8_b: []const []mlx.mlx_array,
+    rows: usize,
+    n: usize,
+    arm: usize = 0,
+};
+
+var join_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const JOIN_SOURCE: [:0]const u8 =
+    \\const uint i = thread_position_in_grid.x;
+    \\if (i >= uint(LEN)) return;
+    \\out[i] = a[i];
+    \\if (i == 0u && float(d0[0]) + float(d1[0]) + float(d2[0]) == 1.5e30f) out[0] = a[1];
+;
+
+/// `x0` again, after every part of a step: a stacked launch has one output, the affine arm one per part.
+fn joinLink(s: mlx.mlx_stream, x0: mlx.mlx_array, ys: []const mlx.mlx_array) !mlx.mlx_array {
+    const k = try kernels.getNamedKernel(&join_kernel, "sushi_ubench_trunk_join", &.{ "a", "d0", "d1", "d2" }, &.{"out"}, JOIN_SOURCE, "");
+    const sh = mlx.getShape(x0);
+    const len: c_int = @intCast(mlx.mlx_array_size(x0));
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, sh.ptr, sh.len, mlx.mlx_array_dtype(x0)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, len, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LEN", len));
+    const d = [3]mlx.mlx_array{ ys[0], ys[@min(1, ys.len - 1)], ys[ys.len - 1] };
+    const ov = try kernels.applyOuts(s, k, &.{ x0, d[0], d[1], d[2] }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+    return out;
+}
+
+/// One step's outputs (owned), `n` of them.
+fn trunkLaunchStep(c: TrunkLaunchCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array, ys: *[3]mlx.mlx_array) !usize {
+    const ci = i % c.copies;
+    const np = c.sh.parts.len;
+    switch (c.arm) {
+        0 => {
+            for (0..np) |p| {
+                ys[p] = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_quantized_matmul(&ys[p], x, c.a8_w[ci][p], c.a8_s[ci][p], c.a8_b[ci][p], true, mlx.mlx_optional_int.some(c.sh.group), mlx.mlx_optional_int.some(8), "affine", s));
+            }
+            return np;
+        },
+        1 => {
+            project_rows.rows_exact = true;
+            const sh = c.shared[ci];
+            if (np == 1) {
+                ys[0] = try root.linear.linear(s, x, sh.p, kernels.SPEC1_W15);
+                return 1;
+            }
+            var outs: [root.linear.SHARED_MAX]mlx.mlx_array = undefined;
+            try root.linear.linearShared(s, x, sh, kernels.SPEC1_W15, outs[0..np]);
+            for (outs[0..np], 0..) |o, p| ys[p] = o;
+            return np;
+        },
+        2, 4, 5 => {
+            // The served launch on the one-tile walk and the 64-bit reader (walk1), or with only one of them (unr2, r32).
+            project_rows.rows_exact = true;
+            const p = c.shared[ci].p;
+            const out: c_int = @intCast(totalOut(c.sh));
+            var g = project_rows.rowsGeometry(@intCast(c.sh.in), out, @intCast(c.rows), 1);
+            if (c.arm != 4) g.unr = 1;
+            if (c.arm != 5) g.r32 = false;
+            var bounds: [3]c_int = @splat(out);
+            for (1..np) |k| bounds[k - 1] = c.shared[ci].cols[k];
+            ys[0] = try project_rows.projectRowsWith(s, x, p.trellis, p.suh, p.svh, g, try project_rows.rowsKernel(g), bounds);
+            return 1;
+        },
+        3 => {
+            ys[0] = try streamFloor(s, c.shared[ci].p.trellis, x, c.sh.in * totalOut(c.sh) * c.n / 128);
+            return 1;
+        },
+        else => unreachable,
+    }
+}
+
+fn totalOut(sh: TrunkLaunch) usize {
+    var t: usize = 0;
+    for (sh.parts) |p| t += p;
+    return t;
+}
+
+fn trunkLaunchChainNs(s: mlx.mlx_stream, x0: mlx.mlx_array, steps: usize, c: TrunkLaunchCtx) !u64 {
+    var x = try joinLink(s, x0, &.{ x0, x0, x0 });
+    defer _ = mlx.mlx_array_free(x);
+    for (0..steps) |i| {
+        var ys: [3]mlx.mlx_array = undefined;
+        const n = try trunkLaunchStep(c, s, i, x, &ys);
+        defer for (ys[0..n]) |y| {
+            _ = mlx.mlx_array_free(y);
+        };
+        const next = try joinLink(s, x0, ys[0..n]);
+        _ = mlx.mlx_array_free(x);
+        x = next;
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sw = io_util.Stopwatch.init(io);
+    try mlx.check(mlx.mlx_array_eval(x));
+    return sw.read();
+}
+
+const TrunkLaunchSample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: TrunkLaunchCtx, steps: usize, link_ns: f64 };
+
+/// One rung's link cost, the median of seven link-only chains: a per-sample link chain on a contended box adds its own
+/// noise to every sample.
+fn trunkLaunchLinkNs(s: mlx.mlx_stream, x0: mlx.mlx_array, steps: usize) !f64 {
+    var t: [7]u64 = undefined;
+    for (&t) |*v| v.* = try bench.chainNs(s, x0, steps, {}, bench.linkOnly);
+    return bench.median(&t);
+}
+
+fn sampleTrunkLaunch(smp: TrunkLaunchSample, arm: usize) anyerror!f64 {
+    var c = smp.c;
+    c.arm = arm;
+    kernels.setDecodeParams(kernels.SPEC1_W15);
+    const ns = try trunkLaunchChainNs(smp.s, smp.x0, smp.steps, c);
+    return (@as(f64, @floatFromInt(ns)) - smp.link_ns) / @as(f64, @floatFromInt(smp.steps));
+}
+
+/// An arm's first step, every part in order, as f32 values: the exact and walk1 arms must write the same bytes.
+fn trunkLaunchBytes(a: std.mem.Allocator, smp: TrunkLaunchSample, arm: usize) ![]u32 {
+    var c = smp.c;
+    c.arm = arm;
+    kernels.setDecodeParams(kernels.SPEC1_W15);
+    var ys: [3]mlx.mlx_array = undefined;
+    const n = try trunkLaunchStep(c, smp.s, 0, smp.x0, &ys);
+    defer for (ys[0..n]) |y| {
+        _ = mlx.mlx_array_free(y);
+    };
+    var out: std.ArrayList(u32) = .empty;
+    for (ys[0..n]) |y| {
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_astype(&f, y, .float32, smp.s));
+        try mlx.check(mlx.mlx_array_eval(f));
+        const p: [*]const u32 = @ptrCast(mlx.mlx_array_data_float32(f) orelse return error.F32Unreadable);
+        try out.appendSlice(a, p[0..mlx.mlx_array_size(f)]);
+    }
+    return out.items;
+}
+
+fn runTrunkLaunches(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer {
+        kernels.setDecodeParams(.mul1);
+        project_rows.rows_exact = false;
+    }
+    var prng = std.Random.DefaultPrng.init(0x51);
+    const rnd = prng.random();
+    try kernels.SPEC1_W15.requireTable();
+    for (FLASH_NEXT_LAUNCHES) |sh| {
+        if (!listed(run.axis("shape"), sh.name)) continue;
+        for (run.axis("k")) |k_text| {
+            const n: u32 = if (std.mem.eql(u8, k_text, "4")) 64 else if (std.mem.eql(u8, k_text, "6")) 96 else return error.BadK;
+            if (sh.k6_only and n != 96) continue;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const out = totalOut(sh);
+            const copies = std.math.clamp((768 << 20) / (out * sh.in), 4, 64);
+            var owned: std.ArrayList(mlx.mlx_array) = .empty;
+            defer for (owned.items) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            const words = try a.alloc(u16, copies * (sh.in / 16) * (out / 16) * n);
+            bench.randomWords(rnd, words);
+            const bank = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ @intCast(copies), @intCast(sh.in / 16), @intCast(out / 16), @intCast(n) }, 4, .uint16);
+            try owned.append(a, bank);
+            a.free(words);
+            const np = sh.parts.len;
+            const scaled = try a.alloc(u16, np * sh.in);
+            @memset(scaled, exl3.f32ToF16Bits(1.0 / @sqrt(@as(f32, @floatFromInt(sh.in)))));
+            const ones = try a.alloc(u16, out);
+            @memset(ones, exl3.f32ToF16Bits(1.0));
+            const suh = mlx.mlx_array_new_data(scaled.ptr, &[_]c_int{ @intCast(np), @intCast(sh.in) }, 2, .float16);
+            const svh = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{ 1, @intCast(out) }, 2, .float16);
+            try owned.appendSlice(a, &.{ suh, svh });
+            var cols: [root.linear.SHARED_MAX + 1]c_int = @splat(0);
+            for (sh.parts, 0..) |p, i| cols[i + 1] = cols[i] + @as(c_int, @intCast(p));
+            const shared = try a.alloc(root.linear.Shared, copies);
+            for (shared, 0..) |*p, c| {
+                const tr = try bankView(s, bank, c, 1);
+                try owned.append(a, tr);
+                p.* = .{ .p = .{ .trellis = tr, .suh = suh, .svh = svh }, .cols = cols, .count = np };
+            }
+            const a8_w = try a.alloc([]mlx.mlx_array, copies);
+            const a8_s = try a.alloc([]mlx.mlx_array, copies);
+            const a8_b = try a.alloc([]mlx.mlx_array, copies);
+            for (0..copies) |c| {
+                a8_w[c] = try a.alloc(mlx.mlx_array, np);
+                a8_s[c] = try a.alloc(mlx.mlx_array, np);
+                a8_b[c] = try a.alloc(mlx.mlx_array, np);
+            }
+            for (sh.parts, 0..) |p, pi| {
+                const codes = try a.alloc(u32, copies * p * sh.in / 4);
+                for (codes) |*v| v.* = rnd.int(u32);
+                const wb = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ @intCast(copies), @intCast(p), @intCast(sh.in / 4) }, 3, .uint32);
+                a.free(codes);
+                const gshape = [_]c_int{ @intCast(copies), @intCast(p), @intCast(sh.in / @as(usize, @intCast(sh.group))) };
+                var sb = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_full(&sb, &gshape, 3, mlx.mlx_array_new_float(0.001), .bfloat16, s));
+                var bb = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_full(&bb, &gshape, 3, mlx.mlx_array_new_float(-0.1), .bfloat16, s));
+                try owned.appendSlice(a, &.{ wb, sb, bb });
+                for (0..copies) |c| {
+                    a8_w[c][pi] = try bankView(s, wb, c, 1);
+                    a8_s[c][pi] = try bankView(s, sb, c, 1);
+                    a8_b[c][pi] = try bankView(s, bb, c, 1);
+                    // A [1, out, in/4] view: drop the copy axis.
+                    for ([_]*mlx.mlx_array{ &a8_w[c][pi], &a8_s[c][pi], &a8_b[c][pi] }) |v| {
+                        const vs = mlx.getShape(v.*);
+                        var r = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_reshape(&r, v.*, &[_]c_int{ vs[1], vs[2] }, 2, s));
+                        _ = mlx.mlx_array_free(v.*);
+                        v.* = r;
+                        try owned.append(a, r);
+                    }
+                }
+            }
+            for (run.axis("rows")) |rows_text| {
+                const rows = try std.fmt.parseInt(usize, rows_text, 10);
+                const xs = try a.alloc(u16, rows * sh.in);
+                for (xs) |*v| v.* = @truncate(@as(u32, @bitCast(rnd.float(f32) - 0.5)) >> 16);
+                const x0 = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, .bfloat16);
+                defer _ = mlx.mlx_array_free(x0);
+                const ctx: TrunkLaunchCtx = .{ .sh = sh, .copies = copies, .shared = shared, .a8_w = a8_w, .a8_s = a8_s, .a8_b = a8_b, .rows = rows, .n = n };
+                const steps = run.steps(64);
+                // The served chain first, so the link floor is timed on clocks the arms run at, not after the bank fill.
+                var warm = ctx;
+                warm.arm = 1;
+                kernels.setDecodeParams(kernels.SPEC1_W15);
+                _ = try trunkLaunchChainNs(s, x0, steps, warm);
+                const smp = TrunkLaunchSample{ .s = s, .x0 = x0, .c = ctx, .steps = steps, .link_ns = try trunkLaunchLinkNs(s, x0, steps) };
+                if (run.hasArm("exact")) {
+                    const want = try trunkLaunchBytes(a, smp, 1);
+                    for ([_][]const u8{ "walk1", "unr2", "r32" }, [_]usize{ 2, 4, 5 }) |name, arm| {
+                        if (run.hasArm(name) and !std.mem.eql(u32, want, try trunkLaunchBytes(a, smp, arm)))
+                            run.invalid("a walk arm wrote other bytes than the served launch");
+                    }
+                }
+                const label = try std.fmt.allocPrint(run.a, "{s} [{d}x{d}] K{s} rows {d}", .{ sh.name, out, sh.in, k_text, rows });
+                try run.interleave(label, smp, sampleTrunkLaunch);
+                if (!run.hasArm("exact")) continue;
+                const bytes: f64 = @floatFromInt(sh.in * out * n / 128);
+                try run.metric("exact", "MB", "MB", bytes / 1e6);
+                try run.metric("exact", "GB/s", "GB/s", bench.gbps(bytes, run.lastMedianNs("exact") / 1e3));
+            }
+        }
+    }
+}

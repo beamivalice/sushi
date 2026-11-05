@@ -269,4 +269,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   kL = qL is the chunk alone): a global layer's served chain against pre-dequantized K/V, and a sliding layer's fused band
   kernel against the composed SDPA. MiMo's global decode attention (dense, dequant rebuild, matmul2d, split-K, kv 2k to
   512k) is `sushi-ubench run mimo2.global_decode_attn`.
+- On a box another GPU job holds (`--contended`), a link-chain floor timed per sample adds its own noise to every sample
+  (negative times); subtract one per-rung median link, read the min and the per-round paired ratio, and call nothing
+  under ~5% ([engine-exl3-experts](engine-exl3-experts.md#nax-rows-walk)).
 - Every timing run takes the GPU lock and restores QoS ([CLAUDE.md, Team process](../CLAUDE.md#team-process)).
