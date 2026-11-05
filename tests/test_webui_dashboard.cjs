@@ -499,19 +499,39 @@ async function main() {
   try {
     await dashboardBugs(browser);
     {
-      // A running request has a Cancel button that posts its id; a cached conversation has none.
+      // A running request has a Cancel button that posts its id, with the page's API key; a cached conversation has none.
       const row = (request_id, phase) => ({ request_id, model: 'org/test-model', phase, context_length: 8192, context_tokens: 100, cached_tokens: 0, generated_tokens: 5, elapsed_seconds: 3, state_bytes: 1 << 20 });
       const sessions = [row(7, 'decode'), row(8, 'cached')];
-      const { page, errors, context } = await openPage(browser, '/dashboard', { sessions });
+      const { page, errors, context } = await openPage(browser, '/dashboard', { sessions, key: 'k-12345' });
       await page.waitForSelector('#dashSessions button[data-cancel]');
       assert.equal(await page.locator('#dashSessions button').count(), 1, 'only the decode row has a button');
       await page.click('#dashSessions button[data-cancel="7"]');
       await page.waitForFunction(() => document.querySelector('#dashSessions button')?.textContent === 'Cancelled');
       const posts = await page.evaluate(() => window.__stub.calls.filter((c) => c.path === '/v1/slots/cancel'));
-      assert.deepEqual(posts.map((c) => [c.method, JSON.parse(c.body)]), [['POST', { id: 7 }]]);
+      assert.deepEqual(posts.map((c) => [c.method, JSON.parse(c.body), c.auth]), [['POST', { id: 7 }, 'Bearer k-12345']]);
       assert.equal(await page.isDisabled('#dashSessions button'), true, 'the button stays off once clicked');
       assert.deepEqual(errors, []);
       await context.close();
+    }
+    {
+      // A duration rounds as a whole: 119.7 s is 2m 0s, never 1m 60s.
+      const row = (request_id, elapsed_seconds) => ({ request_id, model: 'org/test-model', phase: 'decode', context_length: 8192, generated_tokens: 5, elapsed_seconds });
+      const { page, context } = await openPage(browser, '/dashboard', { sessions: [row(1, 119.7), row(2, 59.996), row(3, 0.9996)] });
+      await page.waitForSelector('#dashSessions button[data-cancel]');
+      assert.deepEqual(await page.$$eval('#dashSessions tr', (rows) => rows.map((r) => r.children[7].textContent)), ['2m 0s', '1m 0s', '1.00 s']);
+      await context.close();
+    }
+    {
+      // A gridline's label is that line's value: a 0 to 1 scale reads 0.25 and 0.75, a 2,500 one 1.875k, never a rounded neighbour.
+      const { page, context } = await openPage(browser, '/dashboard', { history: true });
+      await page.waitForFunction(() => (window.__axis.dashCReq ?? []).includes('now'));
+      assert.deepEqual((await axisOf(page, 'dashCReq')).slice(0, 5), ['0', '0.25', '0.5', '0.75', '1']);
+      await context.close();
+      const sim = await simPage(browser);
+      await sim.page.evaluate(() => window.__sim.finish({ computed: 5000, prefillS: 2 }));
+      await adv(sim.page, 3000);
+      assert.deepEqual((await axisOf(sim.page, 'dashCCpre')).slice(0, 5), ['0', '625', '1.25k', '1.875k', '2.5k']);
+      await sim.context.close();
     }
     {
       const { page, context } = await openPage(browser, '/dashboard', { sessions: [{ request_id: 9, model: 'org/test-model', phase: 'prefill', context_length: 8192 }], cancelStatus: 404 });

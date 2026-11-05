@@ -1306,7 +1306,8 @@ function sanitizedSvgSource(code) {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(new XMLSerializer().serializeToString(svg))}`;
 }
 function inlineEmphasis(text, host, codes) {
-  const boldRe = /\*\*([^*]+)\*\*/g;
+  // A delimiter opens before a non-space and closes after one, so the stars of `2 * 3 * 4` stay text.
+  const boldRe = /\*\*(?=\S)([^*]*[^*\s])\*\*/g;
   let cursor = 0;
   let match;
   while ((match = boldRe.exec(text)) !== null) {
@@ -1319,7 +1320,7 @@ function inlineEmphasis(text, host, codes) {
   if (cursor < text.length) inlineItalic(text.slice(cursor), host, codes);
 }
 function inlineItalic(text, host, codes) {
-  const italicRe = /(^|[^*])\*([^*\n]+)\*/g;
+  const italicRe = /(^|[^*])\*(?=[^\s*])([^*\n]*[^*\s])\*/g;
   let cursor = 0;
   let match;
   while ((match = italicRe.exec(text)) !== null) {
@@ -1497,6 +1498,7 @@ function renderMarkdown(text) {
         const item = el("li");
         item.appendChild(inlineNodes(itemMatch[3]));
         const nested = [];
+        let nestedOrdered = false;
         while (index + 1 < lines.length) {
           const next = lines[index + 1];
           const nestedFence = /^\s{2,}/.test(next) ? next.match(FENCE_OPEN) : null;
@@ -1508,6 +1510,7 @@ function renderMarkdown(text) {
           }
           const nestedMatch = next.match(/^\s{2,}([-*+]|\d+[.)])\s+(.*)$/);
           if (nestedMatch) {
+            if (!nested.length) nestedOrdered = /\d/.test(nestedMatch[1]);
             nested.push(nestedMatch[2]);
             index += 1;
             continue;
@@ -1521,7 +1524,7 @@ function renderMarkdown(text) {
           break;
         }
         if (nested.length > 0) {
-          const sub = el("ul");
+          const sub = el(nestedOrdered ? "ol" : "ul");
           for (const nestedText of nested) {
             const subItem = el("li");
             subItem.appendChild(inlineNodes(nestedText));
@@ -1985,6 +1988,8 @@ function chatTitle(chat) {
 }
 function renderConversationList() {
   const host = $("conversationList");
+  // A rebuild must not drop the keyboard's place: focus returns to the same row, or to its last action button.
+  const at = document.activeElement, held = host.contains(at) ? { id: at.closest(".conv-item")?.dataset.chat, button: at.tagName === "BUTTON" } : null;
   host.textContent = "";
   if (chats.length === 0) {
     host.appendChild(el("div", "conv-empty", "No conversations yet.\nStart one below."));
@@ -1992,12 +1997,14 @@ function renderConversationList() {
   }
   for (const chat of chats) {
     const item = el("div", `conv-item${chat === currentChat ? " selected" : ""}`);
+    item.dataset.chat = chat.id;
     item.setAttribute("role", "button");
     item.tabIndex = 0;
     const body = el("div", "c-body");
     if (renamingChatId === chat.id) {
       const input = el("input");
       input.type = "text";
+      input.setAttribute("aria-label", "Conversation title");
       input.value = chatTitle(chat);
       input.onclick = (event) => event.stopPropagation();
       let settled = false;
@@ -2073,6 +2080,10 @@ function renderConversationList() {
     };
     host.appendChild(item);
   }
+  const row = held?.id && [...host.children].find((node) => node.dataset.chat === held.id);
+  // The row first: its actions show only while focus is within it.
+  row?.focus();
+  if (row && held.button) row.querySelector(".c-actions button:last-child")?.focus();
 }
 function openChat(id) {
   if (chatAbort) return;
@@ -3757,7 +3768,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     history.pushState(null, "", `/models#${encodeURIComponent(p.path.split("/").pop())}`);
     window.dispatchEvent(new PopStateEvent("popstate"));
   }
-  const eta = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s left` : s < 5400 ? `${Math.round(s / 60)} min left` : `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min left`;
+  const eta = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s left` : s < 5400 ? `${Math.round(s / 60)} min left` : `${Math.floor(Math.round(s / 60) / 60)} h ${Math.round(s / 60) % 60} min left`;
   const jobOf = (repo) => D.data?.jobs.filter((j) => j.repo === repo).pop();
   const PHASE = { queued: "Queued", listing: "Listing files…", checking: "Checking the files already on disk…", downloading: "Downloading", verifying: "Verifying", done: "Downloaded", failed: "Failed", cancelled: "Stopped" };
   const isActive = (j) => !!j && !["done", "failed", "cancelled"].includes(j.phase);
@@ -3954,7 +3965,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const gib = b => b / 1073741824;
   const bytes = b => b >= 1073741824 ? fmt(gib(b), 2) + ' GiB' : b >= 1048576 ? fmt(b / 1048576, 1) + ' MiB' : fmt(b / 1024, 0) + ' KiB';
   const span = s => s < 60 ? s + 's' : s < 3600 ? Math.round(s / 60) + 'm' : Math.floor(s / 3600) + 'h' + (s % 3600 ? Math.round(s % 3600 / 60) + 'm' : '');
-  const secs = s => !isFinite(s) ? '-' : s < 1 ? fmt(s * 1000, 0) + ' ms' : s < 60 ? fmt(s, 2) + ' s' : Math.floor(s / 60) + 'm ' + fmt(s % 60, 0) + 's';
+  // Each unit is picked after rounding, so 59.996 s reads 1m 0s and not 60.00 s.
+  const secs = s => !isFinite(s) ? '-' : s < 0.9995 ? fmt(s * 1000, 0) + ' ms' : s < 59.995 ? fmt(s, 2) + ' s' : Math.floor(Math.round(s) / 60) + 'm ' + Math.round(s) % 60 + 's';
   const mean = h => h && h.count ? h.sum / h.count : NaN;
 
   // tone: false = live, true = an error, 'off' = nothing is wrong, the feed is just not running.
@@ -4331,7 +4343,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     btn.disabled = true;
     btn.textContent = 'Stopping…';
     try {
-      const res = await fetch('/v1/slots/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: Number(btn.dataset.cancel) }) });
+      const res = await api('/v1/slots/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: Number(btn.dataset.cancel) }) });
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.error?.message || `HTTP ${res.status}`);
       btn.textContent = 'Cancelled';
       setTimeout(pollSoon, 100);
@@ -4676,7 +4688,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const gpuLines = () => clockMax ? [['mhz', '--c1', true], ['gpu', '--c3']] : [['gpu', '--c3', true]];
   function syncGpuLegend() { for (const id of ['c-gpu-l', 'c-gpuc-l']) put($(id), clockMax ? '' : 'GPU clock unavailable on this box'); }
   function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p; }
-  function axis(v, dec, plain) { return v >= 1000 && !plain ? fmt(v / 1000, v % 1000 ? 1 : 0) + 'k' : fmt(v, dec ?? (v % 1 ? 1 : 0)); }
+  // The fewest decimals, up to three, that print a gridline's value exactly: 1.875k, not 1.9k.
+  const places = x => [0, 1, 2].find(d => Math.abs(x * 10 ** d - Math.round(x * 10 ** d)) < 1e-6) ?? 3;
+  function axis(v, dec, plain) { return v >= 1000 && !plain ? fmt(v / 1000, places(v / 1000)) + 'k' : fmt(v, dec ?? places(v)); }
 
   function drawAll(only) {
     if (!dashActive) return;
@@ -4865,7 +4879,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const onMac = /Mac/.test(navigator.platform);
   NAV_ORDER.forEach((v, i) => {
     const link = document.getElementById(NAV_ID[v]);
-    link.setAttribute('aria-keyshortcuts', `Meta+${i + 1}`);
+    link.setAttribute('aria-keyshortcuts', `${onMac ? 'Meta' : 'Control'}+${i + 1}`);
     link.title = `${link.textContent} (${onMac ? '⌘' : 'Ctrl+'}${i + 1})`;
   });
   document.addEventListener('keydown', e => {

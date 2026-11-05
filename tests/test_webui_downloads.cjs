@@ -172,6 +172,10 @@ async function main() {
       server.state.jobs[0] = { ...server.state.jobs[0], done_bytes: 30 * GiB, eta_s: 40 };
       await page.waitForFunction((r) => /30\.0 GiB of 40\.0 GiB/.test(document.querySelector(`.dl-row[data-repo="${r}"] .prog`).textContent), PACKS[0].repo);
       assert.equal(await page.$eval(`${qwen} .meter > span`, (s) => s.style.width), '75%');
+      // Hours and minutes round as one time: 7,190 s left is 2 h 0 min, never 1 h 60 min.
+      server.state.jobs[0] = { ...server.state.jobs[0], eta_s: 7190 };
+      await page.waitForFunction((r) => / h .* min left/.test(document.querySelector(`.dl-row[data-repo="${r}"] .prog`).textContent), PACKS[0].repo);
+      assert.match(await page.textContent(`${qwen} .prog`), /· 2 h 0 min left/);
       // Stop shows "Stopping…" until the server reports the job stopped.
       server.state.stopping = true;
       await page.click(`${qwen} .act button`);

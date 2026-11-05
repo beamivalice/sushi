@@ -19,6 +19,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The Models and Settings pages say what they do**: a setting is badged Now, Next load or Next start, a pack update opens Downloads at that pack instead of suggesting `sushi pull`, a load says which models it unloaded, an emptied box saves the default, errors stay on their row, the offline page stops taking clicks, and the Dashboard's card popovers no longer hide under the top bar.
 - **The Dashboard can stop a running request**: a Cancel button on each prefilling or decoding row of the Sessions table (and `POST /v1/slots/cancel {"id": <request id>}`) ends that request, thanks @chuaaron.
 - **Fixes**: DeepSeek-V4.1 raw-text `/v1/completions` refuses an empty prompt again instead of answering it.
+- **Web page fixes**: the Dashboard's Cancel button works on a server started with `--api-key`, chart scales and times show their true values (0.75 instead of 0.8, 2m 0s instead of 1m 60s, 2 h 0 min left instead of 1 h 60 min), the chat shows `2 * 3 * 4` as written and keeps a numbered list inside a numbered list numbered, and the keyboard keeps its place when a conversation is renamed or deleted.
 
 ---
 

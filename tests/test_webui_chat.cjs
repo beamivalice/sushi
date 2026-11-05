@@ -247,6 +247,13 @@ test('the keyboard reaches Rename and Delete on a conversation row', async ({ br
   assert.equal(await page.evaluate(() => document.activeElement.getAttribute('aria-label')), 'Delete conversation');
   await page.keyboard.press('Enter');
   assert.ok(await page.$('.conv-item .btn.danger'), 'Enter on Delete asks for confirmation instead of opening the chat');
+  assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Delete?', 'the confirmation takes the focus');
+  await page.keyboard.press('Enter');
+  assert.deepEqual(await titles(page), ['First'], 'Enter again deletes');
+  await page.focus('.conv-item'); await page.keyboard.press('Tab'); await page.keyboard.press('Enter');
+  await page.keyboard.type('Kept'); await page.keyboard.press('Enter');
+  assert.deepEqual(await titles(page), ['Kept']);
+  assert.equal(await page.evaluate(() => document.activeElement.classList.contains('conv-item')), true, 'a rename ends on its row');
   await page.evaluate(() => { document.activeElement.blur(); });
   await page.focus('.conv-item:nth-child(1)');
   await page.keyboard.press('Space');
@@ -280,6 +287,9 @@ const CASES = [
   ['a pipe inside a code span in a table', '| a | b |\n|---|---|\n| `x|y` | 2 |', { cells: ['a', 'b', 'x|y', '2'] }],
   ['an escaped star', 'a \\* b \\* c', { paras: ['a * b * c'], ems: 0 }],
   ['an unterminated fence', 'text\n```js\nconst a = 1;', { blocks: [['js', 'const a = 1;']] }],
+  ['stars with spaces around them are arithmetic', '2 * 3 * 4 = 24 and x ** 2 ** y', { paras: ['2 * 3 * 4 = 24 and x ** 2 ** y'], ems: 0, strongs: 0 }],
+  ['emphasis beside a spaced star', 'Costs 5 * 2, *really* cheap', { paras: ['Costs 5 * 2, really cheap'], ems: 1 }],
+  ['a numbered list inside a numbered list', '1. one\n   1. a\n   2. b\n2. two', { items: 2, sub: ['OL', 2] }],
 ];
 test('the markdown the models write: fences, links, tables and escapes', async ({ browser }) => {
   const stub = await startStub();
@@ -295,6 +305,8 @@ test('the markdown the models write: fences, links, tables and escapes', async (
         links: [...host.querySelectorAll('a')].map((a) => [a.href, a.textContent]),
         cells: [...host.querySelectorAll('th, td')].map((c) => c.textContent),
         ems: host.querySelectorAll('em').length,
+        strongs: host.querySelectorAll('strong').length,
+        sub: [...host.querySelectorAll('li > ol, li > ul')].map((list) => [list.tagName, list.children.length])[0] ?? null,
       };
     }, markdown);
     for (const [key, value] of Object.entries(want)) assert.deepEqual(got[key], value, `${name}: ${key}`);

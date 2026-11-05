@@ -46,7 +46,7 @@ function makeServer({ metrics = 200, loaded = true, down = false, apiKey = null 
   return { handle, calls, state };
 }
 
-async function open(browser, server, urlPath, { viewport = { width: 1440, height: 900 }, mode = 'compact', scheme = 'dark', clock = false, storage = {} } = {}) {
+async function open(browser, server, urlPath, { viewport = { width: 1440, height: 900 }, mode = 'compact', scheme = 'dark', clock = false, storage = {}, platform = null } = {}) {
   const context = await browser.newContext({ viewport, colorScheme: scheme });
   const page = await context.newPage();
   const errors = [];
@@ -57,6 +57,7 @@ async function open(browser, server, urlPath, { viewport = { width: 1440, height
     sessionStorage.setItem('__seeded', '1');
     try { localStorage.setItem('sushi-ui-mode', m); for (const [k, v] of Object.entries(seed)) localStorage.setItem(k, v); } catch { /* storage off */ }
   }, [mode, storage]);
+  if (platform) await page.addInitScript((p) => Object.defineProperty(Navigator.prototype, 'platform', { get: () => p }), platform);
   if (clock) await page.clock.install();
   await page.goto(`${ORIGIN}${urlPath}`);
   return { page, context, errors };
@@ -258,6 +259,9 @@ async function main() {
       await page.keyboard.press('Meta+2');
       assert.equal(await page.inputValue('#promptInput'), 'half a thought', 'the prompt survives the tab round trip');
       await context.close();
+      const pc = await open(browser, makeServer(), '/', { platform: 'Win32' });
+      assert.deepEqual(await pc.page.$$eval('#viewNav a', (links) => links.map((a) => a.getAttribute('aria-keyshortcuts'))), ['Control+1', 'Control+2', 'Control+3', 'Control+4'], 'off a Mac the links name the key that works');
+      await pc.context.close();
       const keyed = await open(browser, makeServer({ apiKey: 'sekret' }), '/chat');
       await keyed.page.waitForSelector('#keyOverlay:not([hidden])');
       await keyed.page.keyboard.press('Meta+1');
@@ -328,6 +332,7 @@ async function main() {
       await page.waitForTimeout(300);
       await page.hover('.conv-item');
       await page.click('[aria-label="Rename conversation"]');
+      assert.equal(await page.getByRole('textbox', { name: 'Conversation title' }).count(), 1, 'the rename box is named');
       await page.keyboard.press('Escape');
       assert.equal(await page.evaluate(() => document.getElementById('chatPanel').classList.contains('left-open')), true, 'Escape while renaming only ends the rename');
       assert.equal(await page.$('.conv-item input'), null);

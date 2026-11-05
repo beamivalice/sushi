@@ -522,8 +522,9 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   "N computed, M restored" (the time includes the restore, so it is no prefill speed) and never feeds the tile; a partly
   restored one reads as a lower bound. Decode is the history's rate with idle samples drawn as gaps; the tile reads live while
   generating, else the last request's `generated_tokens / decode_seconds` (any length). Offline, the tiles read "-" with
-  "server unreachable" and the charts dim. The SSD tile reads "-" while no model is loaded. The charts answer a tap (the
-  nearest point; a tap elsewhere hides it) and the arrow keys (the canvases take focus; Escape hides).
+  "server unreachable" and the charts dim. The SSD tile reads "-" while no model is loaded. A gridline's label prints its
+  value exactly (1.875k, 0.75), and a duration rounds before it picks its units (2m 0s, never 1m 60s). The charts answer
+  a tap (the nearest point; a tap elsewhere hides it) and the arrow keys (the canvases take focus; Escape hides).
   The Advanced view's Decode and Prefill tiles and its prefill, decode and memory charts are the same functions (`speedTiles`,
   `eventChart`, the shared chart options), so both views read the same.
 - The dashboard's **Prefix cache writes** card (the last card) shows the `prefix_cache_writes` totals: bytes written since
@@ -550,8 +551,9 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   `reasoning_budget_tokens`.
 - Under `--api-key` the page is served without the key (it holds no data), asks for it on the first 401 and sends it as
   a Bearer token. Its fetches use `credentials: "omit"`: the 401's Basic challenge would otherwise open the browser's
-  own login dialog. The key overlay is modal (`#appShell` is `inert` behind it, the key box has the focus); Forget the
-  API key is in the phone `⋯` menu and in Settings › About.
+  own login dialog. Every page fetch but `/health` goes through `api()`, which adds both. The key overlay is modal
+  (`#appShell` is `inert` behind it, the key box has the focus); Forget the API key is in the phone `⋯` menu and in
+  Settings › About.
 - Conversations live in the browser's `localStorage` (every access guarded); attached images stay in memory only, as a
   few photos would fill the storage quota. Saved history is sanitised on load (a damaged chat or message is dropped or
   coerced, never fatal). Tabs share one list: a save merges the stored list by id (this tab's deletions stay deleted)
@@ -679,6 +681,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
 - Markdown image previews fetch through the existing public-address-checked `view_image` bridge (including
   redirect checks and the 2 MB limit), never directly from a model-selected browser URL. A source link remains
   when previewing fails. The page caches up to 32 image requests; pixels are not persisted in chat storage.
+- Markdown emphasis follows CommonMark flanking: `*` and `**` open before a non-space and close after one, so `2 * 3 * 4`
+  stays text. A list nested in an item keeps its numbered or bulleted kind.
 - SVG code blocks offer **Render SVG** / **Hide SVG**. Only clicking renders: the bundled DOMPurify 3.4.16
   SVG profile removes active content; styles, embedded HTML, images, animation and external references are
   disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays
