@@ -1,16 +1,15 @@
 # Sushi — project context for AI
 
-A native Zig inference engine for Apple Silicon serving Qwen3.8-Flash-Next (`qwen4_exp`),
-MiMo-V2.6-Flash (`mimo_v2`), GLM-5.3-Flash (`glm5_next`) and DeepSeek-V4.1-Flash (`deepseek_v41`). Qwen and MiMo use
-native MTP and affine8 KV by default. GLM batches up to four requests over an affine8 MLA latent
-(`--kv-quant 16` = BF16) and FP32 KDA state, with DFlash2, image/video input and prefix reuse; its MTP
-stays off. DeepSeek serves one request at a time with streamed experts, DSpark, image input and prefix reuse. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of ddalcu's mlx-serve.
+A native Zig inference engine for Apple Silicon serving Qwen3.8-Flash-Next (`qwen4_exp`), MiMo-V2.6-Flash (`mimo_v2`),
+GLM-5.3-Flash (`glm5_next`) and DeepSeek-V4.1-Flash (`deepseek_v41`). Qwen and MiMo use native MTP and affine8 KV by
+default. GLM batches up to four requests over an affine8 MLA latent and FP32 KDA state, with DFlash2; its MTP stays off.
+DeepSeek serves one request at a time with streamed experts and DSpark. OpenAI/Anthropic-compatible HTTP, no Python at
+serve time. Fork of ddalcu's mlx-serve.
 
-- **sushi** is public code: every change ships with its license, NOTICE and docs story; it is not scoped to EXL3 or
-  to these four models forever.
-- **sashimi** is the PRIVATE quant-creation stack (converters, allocators, imatrix, repackers). This repo keeps only
-  the CONSUMER contract (`docs/pack-format.md`, the shard-stamp check, `src/fixtures/`, `sushi kld`) and the oracle
-  fixture dumpers (`tests/dump_*_fixtures.py`). Converter knowledge goes to `docs/private/`, never a committed file.
+- **sushi** is public code: every change ships with its license, NOTICE and docs story.
+- **sashimi** is the PRIVATE quant-creation stack. This repo keeps only the CONSUMER contract (`docs/pack-format.md`,
+  the shard-stamp check, `src/fixtures/`, `sushi kld`) and the oracle fixture dumpers (`tests/dump_*_fixtures.py`).
+  Converter knowledge goes to `docs/private/`, never a committed file.
 - `src/` holds only the four served architectures and their shared machinery. Any other `model_type` is refused by
   name (`ArchitectureUnsupported` → 503), as is an unsupported file format (`ModelFormatUnsupported` → 503).
 
@@ -23,6 +22,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 
 | doc | what it holds |
 |---|---|
+| [docs/source-map.md](docs/source-map.md) | which `src/` file holds what, and the doc for each |
 | [docs/qwen4-arch.md](docs/qwen4-arch.md) | Flash-Next trunk, hyper-connections, n-gram PLE, oracle and ties, packs |
 | [docs/qwen4-perf.md](docs/qwen4-perf.md) | Flash-Next tok/s: decode/MTP ladders, GDN/QSA/HC kernel A/Bs, M1/M2 Max |
 | [docs/qwen4-kld.md](docs/qwen4-kld.md) | Flash-Next KLD of every served pack, the KV-width reading |
@@ -35,11 +35,11 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/glm5-kernels.md](docs/glm5-kernels.md) | GLM kernels, exactness rules, drift screen, ruled-out list |
 | [docs/glm5-perf.md](docs/glm5-perf.md) | GLM tok/s: DFlash2 round levers, three/four-row verify, prefill chunk, long context |
 | [docs/glm5-kld.md](docs/glm5-kld.md) | GLM KLD against the native BF16 teacher |
+| [docs/glm5-prefix-cache.md](docs/glm5-prefix-cache.md) | GLM cache keys, latent and KDA state, restore, spec state |
+| [docs/glm5-clamped-experts.md](docs/glm5-clamped-experts.md) | GLM clamped EXL3 experts |
 | [docs/dsv41-arch.md](docs/dsv41-arch.md) | DeepSeek-V4.1-Flash: geometry, FP8 trunk + streamed experts, Engram, CED prefill, oracle, kernels, DSpark, STQ, `--drop-expert`, prefix cache, images |
 | [docs/dsv41-memory.md](docs/dsv41-memory.md) | DeepSeek-V4.1 ledger, per-layer cache split, 1M-token state, prefill borrow, resident load |
 | [docs/dsv41-parity.md](docs/dsv41-parity.md) | DeepSeek-V4.1 against Qwen: feature matrix, larger gaps, live checks |
-| [docs/glm5-prefix-cache.md](docs/glm5-prefix-cache.md) | GLM cache keys, latent and KDA state, restore, spec state |
-| [docs/glm5-clamped-experts.md](docs/glm5-clamped-experts.md) | GLM clamped EXL3 experts |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/encoder.md](docs/encoder.md) | `sushi convert exl3`: flags, what a pack holds, trunk rules, calibration, Hessians, resume, stamps |
 | [docs/engine-exl3-encoder.md](docs/engine-exl3-encoder.md) | EXL3 encoder core: trellis search, LDLQ, signs, shard writer, Qwen BF16 reader |
@@ -54,7 +54,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/engine-memory-admission.md](docs/engine-memory-admission.md) | Metal OOM, preflight, auto-context, prefill chunk, admission |
 | [docs/server-http-apis.md](docs/server-http-apis.md) | API contracts, streaming, sampling, reasoning budget, constrained JSON, launcher |
 | [docs/server-tool-calling.md](docs/server-tool-calling.md) | templates, tool-call parse chain and invariants, think tags, loop stops |
-| [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, media |
+| [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, media, sushibar |
 | [docs/envvar.md](docs/envvar.md) | every env var the engine reads, by kind: read site and cost, docs, flag twins, reads to fix, removed list |
 | [docs/flags.md](docs/flags.md) | every launch flag: default, who it is for, keep/cut recommendation, cut list, owner calls |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, metadata stamp, window, loader rules |
@@ -62,7 +62,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/bench/v1.4.0/summary.md](docs/bench/v1.4.0/summary.md) | release context ladder and per-model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule |
 | [docs/process-ubench.md](docs/process-ubench.md) | `sushi-ubench`: microbench registry, CLI, rungs x arms tables, JSON and compare, the quiet-box steps it takes |
-| [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number, the release bench |
+| [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, cooling, waiting, baseline lookup, recording a number, the release bench, build environment |
 | [docs/testsuite.md](docs/testsuite.md) | what a test may be, tiers (`test-host`, gpu, pack, bench), placement, how a test is built, what a change runs |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
 
@@ -79,131 +79,68 @@ link to or quote them from a committed file.
 | `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
 | `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging, card, upload, verification |
 
-Skills: `/release`, `/bench`.
+Skills: `/release` (release order, gates, CHANGELOG, contributor credit), `/bench` (methodology, claim etiquette).
 
-## Stack
+## Stack and building
 
-Zig 0.17.1 (`scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39,
-mlx-serve's pins) built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp as
-`lib/jinja_cpp/libjinja.a`; `stb_image` + libwebp for image INPUT. Min macOS 26.2, which NAX needs
-(`tests/test_mlx_staged_nax.sh`); only non-system dylibs: `libmlxc`, `libwebp` (`tests/test_serving_deps.sh`).
-Box: M5 Max 128 GB, macOS 27.
+Zig 0.17.1 (`scripts/fetch-zig.sh` stages it at `.zig-toolchain/`); mlx + mlx-c are pinned submodules built NAX-enabled
+by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp as `lib/jinja_cpp/libjinja.a`. Min macOS 26.2.
+Box: M5 Max 128 GB, macOS 27. Bumping mlx or rebuilding jinja: [process-measurement](docs/process-measurement.md#build-environment-notes).
 
-## Navigating `src/` (served path only)
-
-| File | Role | Doc |
-|---|---|---|
-| `main.zig` / `cli.zig` | entry, flags, subcommands (`run/pull/list/serve/launch/kld/convert`), REPL | server-lifecycle |
-| `repl_tools.zig` | `run` REPL client tools (web, confined files, images; write needs `/edit`) | server-http-apis |
-| `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` / `http_conn` / `request_policy` / `request_media` / `models_api` / `logprobs` / `generation_stream` / `anthropic` / `completions` / `responses_api` | all HTTP: `/v1/*`, `/metrics`, WS, `--api-key`, Responses store | server-http-apis |
-| `chat.zig` / `think_tags` / `tool_calls` / `tool_schema` | chat templates, thinking tags, tool-call parse/repair/coercion | server-tool-calling |
-| `reasoning_protocol.zig` / `json_schema.zig` / `json_grammar.zig` / `token_mask.zig` / `regex.zig` | constrained decoding | server-http-apis |
-| `launch.zig` | `sushi launch <agent>` | server-http-apis |
-| `scheduler.zig` / `generate.zig` / `degenerate.zig` / `mtp_plan.zig` / `prefill_plan.zig` / `sampler.zig` / `model_load` / `slot_admission` / `mtp_tick` / `slot_outcome` / `vision_queue` / `mtp_policy` / `mtp_round` | slots, inference thread, batching, admission, load bills; generation; MTP policy/rounds/plan; stop loop, prefill plan, sampler | server-lifecycle |
-| `model.zig` / `effort` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, effort, per-model settings, discovery, registry | server-lifecycle |
-| `transformer.zig` / `kv_cache.zig` / `ssm_cache.zig` / `layer_weights` / `forward_diag` / `test_support` | shared `Transformer`, `ForwardCtx`, arch dispatch, quant resolution, KV/SSM caches, layer weights, `diagEnvOn` | arch-*, engine-* |
-| `nax_gate` / `attn_kernels` / `verify_qmm` / `verify_moe` / `moe_router` / `moe_gqmv` / `moe_stream_compute` | NAX/OS gates; shared attention; verify QMM and MoE; router; gather-QMV; streamed-expert compute | engine-kernels |
-| `qwen4/qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections, PLE / QSA | qwen4-arch, engine-mtp |
-| `mimo2/mimo_forward.zig` | MiMo forward, attention arms, MoE dispatch, batched decode | mimo2-arch |
-| `glm5/glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, kernels, prefix state, vision | glm5-* |
-| `dsv41/dsv41_*.zig` / `dspark_rows.zig` / `expert_usage.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1 loader, forward, QAT, Engram, stream hooks, prefill borrow, prefix state, vision; DSpark width; `--drop-expert` list, pre-tokenizer | dsv41-arch, dsv41-memory |
-| `qwen4/qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side, fused HC prefill | qwen4-arch |
-| `qwen4/gdn_decode.zig` | fused GDN decode/verify step (one dispatch) | engine-kernels |
-| `mimo2/mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, stamp check | mimo2-arch |
-| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) / `trunk_stq.zig` | expert layout, EXL3/STQ decoders and kernels, rate groups, dense linears; trellis trunk banks | engine-exl3-experts |
-| `encoder/` | `sushi convert exl3`: trellis search, source readers, trunk/shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
-| `expert_stream.zig` / `prefetch_plan.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
-| `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, cost table | engine-mtp |
-| `kv_quant.zig` | quantized KV contract | engine-kv-cache |
-| `prefix_cache.zig` / `kv_disk_cache.zig` / `disk_placement.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier, budget, roots | engine-prefix-cache |
-| `mlx_kernel_keys.zig` | custom-kernel library keys for `mlx.zig` wrappers | engine-mlx-gotchas |
-| `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, `digit_group`; prompt LRU | engine-mlx-gotchas |
-| `vision.zig` / `vision_common.zig` / `qwen4/qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: preprocessing, Qwen3-VL, M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
-| `kld.zig` | `sushi kld capture|compare` | quality-kld |
-| `bench.zig` / `bench_box.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power | process-measurement |
-| `ubench_main.zig` / `ubench_report.zig` / `exl3/ubench.zig` | `sushi-ubench` (`zig build ubench`) | process-ubench |
-| `sushibar_main.zig` / `sushibar/` | `sushibar` menu bar app | server-lifecycle |
-| `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |
-| `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | format corpus, traffic replay | server-tool-calling |
-
-## Building
-
-- First-time: `./scripts/fetch-zig.sh` stages the pinned Zig (`0.17.1`, sha256-checked) at `.zig-toolchain/`. A git
-  worktree lacks `.zig-toolchain/` and `lib/mlx/`: symlink both from the main checkout (fetch-zig replaces a stale
-  link with its own copy). After a toolchain/SDK change `rm -rf .zig-cache` (configure-time output is cached).
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
-  `zig build test` does NOT refresh `zig-out/bin/sushi` — rebuild before any live A/B.
-- mlx + mlx-c: `scripts/build-mlx.sh`. Bump = checkout tag → `git add` the submodule → rerun → re-diff `src/mlx.zig` externs against
-  `lib/mlxc-src/mlx/c/*.h`.
-- Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into
-  `obj/`, `ar rcs libjinja.a obj/*.o`.
+  `zig build test` does NOT refresh `zig-out/bin/sushi`: rebuild before any live A/B.
+- A git worktree lacks `.zig-toolchain/` and `lib/mlx/`: symlink both from the main checkout. After a toolchain/SDK
+  change `rm -rf .zig-cache` (configure-time output is cached).
 
 ## Testing — TDD is mandatory
 
 Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) the subset that
-[testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test.
-- A landing runs its change's subset. The full suite runs only for a wide stacked change (shared files, several areas) or
-  a version bump.
+[testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test. The full suite runs
+only for a wide stacked change (shared files, several areas) or a version bump.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a
 corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the matching doc.
 
-`zig build test-host` runs the MLX-free tier beside a live server.
-Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Live scripts and
-their matrix: `tests/CLAUDE.md`.
+`zig build test-host` runs the MLX-free tier beside a live server. Hermetic suites: `-Dtest-filter="format corpus"`,
+`-Dtest-filter="tool traffic"`. Live scripts and their matrix: `tests/CLAUDE.md`.
 
-- **A test never writes to stdout** (stderr only): under `zig build test` fd 1 is the build runner's protocol pipe;
-  one stray line hangs the runner while the standalone binary passes.
-- **A PASSING test prints NOTHING, on either stream**: Zig 0.17 renders any test stderr through its failure
-  renderer (`failed command: … --listen=-`, exit 0), which reads as a failed suite. Diagnostics ride an env switch
-  (`SUSHI_EXL3_PARITY_TRACE`). Guard: `tests/test_test_runner_quiet.sh`.
-- **No source-scan tests** (`@embedFile` + "this string appears in that function"): they pin text, not behaviour.
-  Test the behaviour or state the rule in a comment.
+- **A test never writes to stdout**: under `zig build test` fd 1 is the build runner's protocol pipe; one stray line
+  hangs the runner.
+- **A PASSING test prints NOTHING, on either stream**: Zig renders any test stderr as a failure. Diagnostics ride an env
+  switch (`SUSHI_EXL3_PARITY_TRACE`). Guard: `tests/test_test_runner_quiet.sh`.
+- **No source-scan tests** (`@embedFile` + "this string appears in that function"): test the behaviour or state the
+  rule in a comment.
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
 - A first `zig build test` run sometimes fails and a re-run is green (Metal contention, benign).
 
-## Releases & benchmarking
+## Releases and packs
 
-`/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw,
-GLM 2.4bpw, DeepSeek STQ 1.75bpw), report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per
-release. Protocol: [process-measurement](docs/process-measurement.md#release-bench).
-- Release order: local tests, push the version bump; `./release.sh` (CI's DRAFT) beside the local perf and KLD gates;
-  both green: publish. Any issue: fix, push, delete the draft and its tag, rerun it.
-- Deferred repo work goes to `docs/private/future.md`, never agent memory; a release starts by reading it and
-  telling the owner what is due.
-
-`/bench` for methodology: same-methodology cells only. Interleave A/B kernels in ONE process (separate runs drift 15%);
-same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for cross-engine comparisons only.
-
-Release notes thank each outside contributor by @handle per merged PR; a missed credit goes in the next release
-(`/release`).
-
-A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
-owner-approved card.
-
+`/release` holds the process; the perf gate is `tests/bench.sh` on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw, GLM
+2.4bpw, DeepSeek STQ 1.75bpw). Deferred repo work goes to `docs/private/future.md`, never agent memory.
+- A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
+  owner-approved card.
 - **Adding a pack** (pair-major: [tile order](docs/pack-format.md#tile-order)) updates, in the same landing, its
   `aliases` row in `src/cli.zig` (`Alias.tier_gb`, `recommend_gb`), the tier table and recommended launch in
-  `docs/usage.md`, and the README pack line once the repo is live.
+  `docs/usage.md`, and the README pack line.
 
 ## Conventions
 
 - Minimal DRY Zig; tests at the bottom of each source file; shell integration tests in `tests/`.
 - No tracked file names a box's own directories: packs are `${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/<pack>`, run
   outputs `~/.sushi/runs/` (guard: `tests/test_no_local_paths.sh`).
-- **Env vars** ([envvar](docs/envvar.md)): a temporary A/B knob is fine while developing, tuning, fixing or bisecting;
-  once the answer is known it goes with its losing arm. Only diagnostics (incl. correctness-test knobs) and live dev
-  levers stay, read once via `diagEnvOn`. A user tradeoff or machine-fit setting is a flag, never an env twin.
-- **Flags** ([flags](docs/flags.md)): every flag the binary parses is in `--help`, none hidden; a bad value or unknown
-  argument exits with an error before anything runs. Adding, cutting or changing a flag is the owner's decision.
-- **Diffs are read by a human. Keep them small.** A comment says what the code cannot (a non-obvious WHY, a contract,
-  a unit) in one to three lines. Never bug history, measurements, review items, dates, PR numbers or a restatement of
-  the code.
+- **Env vars** ([envvar](docs/envvar.md)): a temporary A/B knob is fine while developing; once the answer is known it
+  goes with its losing arm. Only diagnostics and live dev levers stay, read once via `diagEnvOn`. A user tradeoff or
+  machine-fit setting is a flag, never an env twin.
+- **Flags** ([flags](docs/flags.md)): every parsed flag is in `--help`, none hidden; a bad value or unknown argument
+  exits with an error before anything runs. Adding, cutting or changing a flag is the owner's decision.
+- **Diffs are read by a human: keep them small.** A comment says what the code cannot (a non-obvious WHY, a contract,
+  a unit) in one to three lines; never bug history, measurements, dates, PR numbers or a restatement of the code.
 - **One story per gotcha, one line per rule**, in the matching doc. CHANGELOG: one user-facing sentence per change,
   no provisional numbers.
-- One squash commit per PR, rebased onto main when needed. Its author is the human who takes responsibility for it
-  (an outside PR: the contributor's GitHub identity); no AI author or Co-Authored-By trailer.
+- One squash commit per PR, rebased onto main. Its author is the human who takes responsibility for it (an outside PR:
+  the contributor's GitHub identity); no AI author or Co-Authored-By trailer.
 
 ## Engine invariants (never break; the doc has the why)
 
@@ -222,12 +159,12 @@ owner-approved card.
 
 ## Debugging
 
-Server log `~/.sushi/logs/sushi-<port>.log` is THE post-mortem file (`--log-level debug`). Grep:
-`jinja error:`, `[cache]`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `[mtp-planner]`, `[mtp-trace]`,
-`[loop-stop]`, `[admission]`, `[kv-cache]`, `[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[dtype-trace]`,
-`[short-gen]`, `[prefill-trace]` (debug level). Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs
-`stream:false` first; between KV-poison tests stop your own server by PID, never `pkill`. `/props` reports
-`active_bytes`, `memory.cache_bytes`, `batching`; RSS is blind to Metal.
+Server log `~/.sushi/logs/sushi-<port>.log` is THE post-mortem file (`--log-level debug`). Grep its tags: `jinja error:`,
+`<- N+M tokens`, `tool_msgs=`, `[cache]`, `[spec-stats]`, `[mtp-planner]`, `[loop-stop]`, `[admission]`, `[kv-cache]`,
+`[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[prefill-trace]`. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
+`tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; stop your own server by PID, never
+`pkill`. `/props` reports `active_bytes`,
+`memory.cache_bytes`, `batching`; RSS is blind to Metal.
 
 <a id="team-process"></a>
 ## Team process
@@ -236,21 +173,18 @@ Procedures and examples: [docs/process-measurement.md](docs/process-measurement.
 
 **GPU sharing.** The lock is for jobs that need the box to themselves: a full model load (server boot, KLD, live test)
 and a quiet-box bench or timing whose absolute number is recorded. Conversions, pilots, builds and tests run in
-parallel without it, as long as the total fits memory: never beside a MiMo-size (≥ 90 GB) load, and a quiet bench waits.
+parallel without it if the total fits memory: never beside a MiMo-size (≥ 90 GB) load, and a quiet bench waits.
 - Take the lock right before EACH run: `scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd>` (releases on any
-  exit; `acquire|release` if it cannot wrap). Declare `--max-min` over ~15 min; model-free tests
-  never take it. FIFO by ticket; `status`: holder, age, queue (`$GPU_LOCK_DIR`).
-- Never hold it across a batch or queue, or while analysing, editing, building or waiting. An A B B A re-acquires per
-  arm. Every brief that runs on the GPU names the lock.
-- A dead `run` holder frees itself. A plain-`acquire`, OVERDUE or idle one: workers report it; the coordinator
-  verifies, stops it, runs `gpu-lock.sh break <holder>`.
+  exit). Declare `--max-min` over ~15 min; model-free tests never take it; `status` shows holder, age, queue.
+- Never hold it across a batch, or while analysing, editing, building or waiting. An A B B A re-acquires per arm.
+  Every brief that runs on the GPU names the lock.
+- A dead `run` holder frees itself. An OVERDUE or idle holder: workers report it; the coordinator verifies, stops it,
+  runs `gpu-lock.sh break <holder>`.
 
-**Baselines.**
-- Never rerun an old-binary/old-code baseline that is already recorded: run only the new arm and compare it with the
-  recorded number. Within a session, inherit the previous number.
-- Run an old-binary baseline only in a clean new session (or when none exists for that exact setting; say which).
-- Existing pack shards are a converter's byte-identity baseline.
-- Committed docs cite commit + settings beside every new number; raw-file paths go to `docs/private/measurement-raw.md`.
+**Baselines.** Never rerun an already-recorded old-code baseline: run only the new arm and compare with the recorded
+number (within a session, inherit the previous one); run an old baseline only in a clean session or when none exists
+for that setting, and say which. Existing pack shards are a converter's byte-identity baseline. Committed docs cite
+commit + settings beside every new number; raw-file paths go to `docs/private/measurement-raw.md`.
 
 **Landing perf.** A speedup that is real (outside run-to-run noise, arms interleaved in one session) and leaves output
 bit-identical lands whatever its size. A change that alters output lands only through the KLD gate
@@ -259,32 +193,27 @@ queued. Judge a tweak on top of the change it builds on, not alone against the o
 
 **Measurement hygiene.**
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.
-- Run every CPU-heavy agent-launched job (builds, tests, conversions, timings) under `taskpolicy -a`: inherited QoS never
-  reaches the Super cores. State the QoS, lock and baseline beside every number.
+- Run every CPU-heavy agent job (builds, tests, conversions, timings) under `taskpolicy -a`, and state the QoS, lock
+  and baseline beside every number.
 - Quiet window: a timed run first touches `~/.sushi/runs/QUIET` and waits until no `zig`/`clang` runs; no worker
   starts a build or test while that file exists. The GPU lock does not stop compiles.
 - Measure only what the diff touches: no arm whose code path is unchanged, no metric the change cannot move.
-- Bench thermal: fans to max; before each server and between arms, idle until the hottest die sensor (`fanctl
-  status`) is under 50 °C, at most 3 min; fans back to auto after. A then B suffices; A B B A only for a few-% gap.
-- Never slot a GPU job into a bench's cooldown idle: the next server starts throttled.
-- Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
-- **The box is macOS, with no `setsid` binary.** To detach a long job, run `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`
-  and record `$!`; plain `nohup … &` dies with the tool's session.
-  - Write the END marker from an EXIT trap, and end every wait loop when that PID is gone.
-- An agent never leaves `sushibar` or a server running for the owner's use: agent shells run reniced (nice 5-10),
-  every child inherits it, and the GPU clocks down (a DeepSeek decode ran ~30% slow). The owner starts their own.
+- Bench thermal: [cool the box](docs/process-measurement.md#4b-cool-the-box-before-a-bench) before each server and
+  between arms; never slot a GPU job into a bench's cooldown idle.
+- Wait on END markers, PIDs or `pgrep -x`, never `pgrep -f <string>` (the waiting shell matches itself).
+- Detach a long job with `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`
+  (macOS has no `setsid`; plain `nohup … &` dies with the tool's session); END marker from an EXIT trap.
+- An agent never leaves `sushibar` or a server running for the owner's use: agent shells run reniced, children
+  inherit it, and the GPU clocks down ([QoS](docs/process-measurement.md#4-restore-qos-for-agent-launched-jobs)).
 - Confirm the load lines (`[kv-cache]`, `[mtp]`, engagement lines) show the intended arm.
 - Reported KLD: the eight-category 16x512 fixture to first EOS; a prose-only fixture is a gate, never reported. The
   teacher carries no lossy step of its own.
 
-**Coordinator.**
-- Reports partial work to the owner every :00 and :30 while work runs.
-- Relays owner decisions and rule changes to ALL live workers at once.
-- Checks each landing updated its matching doc, and this index when a doc appears.
+**Coordinator.** Reports partial work to the owner every :00 and :30 while work runs; relays owner decisions and rule
+changes to ALL live workers at once; checks each landing updated its matching doc, and this index when a doc appears.
 
-**Workers.**
-- Report progress and blockers to the coordinator; commit per step; don't push or merge unless told.
-- State the QoS, lock and baseline used beside every number; put new knowledge in the matching doc in the branch.
+**Workers.** Report progress and blockers to the coordinator; commit per step; don't push or merge unless told; put new
+knowledge in the matching doc in the branch.
 
 **Growth policy (ENFORCED).** This file holds rules and links only and stays under 25 KB; every rule bullet is
 ≤ 3 lines. Knowledge, measurements and war stories go to `docs/` (converter knowledge to `docs/private/`); commit

@@ -23,6 +23,7 @@ Follow CLAUDE.md's Team process and `docs/process-measurement.md`: take `scripts
 
 ### Comparison traps (these cost real days)
 
+- **Interleave A/B arms in ONE process** (separate runs drift up to 15%); same-boot medians per cell; a sub-2% call needs an idle box.
 - **Only diff same-methodology cells.** Columns through 26.7.12 are the old in-repo harness; 26.8 to 1.3.0 are llmprobe (cold prefill per rung); from 1.4.0 `sushi bench` (restore windows, 3 decode samples) — different prompts, warmup and rate math. Never diff across those boundaries. Same rule inside one column: a forced-spec cell and a shipping-defaults cell are not the same measurement.
 - **"Reproducible ≠ not variance"** for spec-decode cells — sample across runs and boot orders before any regression claim. A cell that reads the same twice can still be variance.
 - **Attribute before believing.** Check whether the change could physically reach the cell that moved; reachability is faster to check than another bench and is what makes a repeat a confirmation.

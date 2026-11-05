@@ -72,6 +72,10 @@ Processes spawned from an agent harness inherit background QoS (priority 4 vs 31
 timed jobs with `taskpolicy -a <cmd>` (or restore the running PID), and state the QoS used beside the number. A number
 2-4x worse than a terminal run points at QoS before anything else.
 
+Agent shells also run reniced (nice 5, detached jobs nice 10), and only root can lower that again. A `sushibar` an agent
+left running passed nice 10 to every server it started: the GPU stayed under 1 GHz and a DeepSeek decode ran ~30%
+slow. The owner starts their own `sushibar` and servers.
+
 The same holds for builds and tests: on the M5 Max an agent-launched process with inherited QoS stays on the 12
 Performance cores and never reaches the 6 Super cores (CPUs 12-17); under `taskpolicy -a` it does. Run every CPU-heavy
 agent command (`zig build`, `zig build test`, test scripts, conversions) under `taskpolicy -a`.
@@ -82,10 +86,9 @@ agent command (`zig build`, `zig build test`, test scripts, conversions) under `
 ## 4b. Cool the box before a bench
 
 The M5 Max throttles hard: a 1M ladder read 1358 tok/s prefill at 2k right after hours of GPU work, and 1678 after a cooled
-start (fans at max, 4 min idle). Even with fans at max the die reached 97 °C inside one minute of 4k load. So before any
-bench:
-- heavy GPU workload AND a die sensor over 90 °C: fans to max, then 3 min with nothing running, then start;
-- otherwise: fans to max, wait 10 s, start.
+start (fans at max, 4 min idle). Even with fans at max the die reached 97 °C inside one minute of 4k load. So before each
+server and between arms: fans to max, then idle until the hottest die sensor (`fanctl status`) reads under 50 °C, at most
+3 min. Never slot a GPU job into that idle: the next server starts throttled.
 
 Under this protocol one A arm then one B arm is enough. Run A B B A only when the expected difference is within a few
 percent, where a thermal or drift step between two single arms would read as the effect.
@@ -188,3 +191,10 @@ local path.
   that builds and passes the full suite.
 - A git worktree has neither `.zig-toolchain/` nor the built `lib/mlx/`: symlink both from the main checkout.
 - `lib/mlx-src` and `lib/mlxc-src` are the only submodules; they are needed only to rebuild MLX.
+- Pins: `lib/mlx-src` v0.32.3 and `lib/mlxc-src` 56b2d39 (mlx-serve's). Bumping: check out the tag, `git add` the
+  submodule, rerun `scripts/build-mlx.sh`, re-diff `src/mlx.zig` externs against `lib/mlxc-src/mlx/c/*.h`.
+- After a `lib/jinja_cpp/*.cpp` change: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/`,
+  then `ar rcs libjinja.a obj/*.o`.
+- Image input links `stb_image` and libwebp; the only non-system dylibs are `libmlxc` and `libwebp`
+  (`tests/test_serving_deps.sh`); NAX needs macOS 26.2 (`tests/test_mlx_staged_nax.sh`).
+- `scripts/fetch-zig.sh` replaces a stale `.zig-toolchain` link with its own copy.
