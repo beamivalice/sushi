@@ -74,7 +74,8 @@ and the page tooltip share them.
 - An anchor must be focusable: buttons, inputs and labels already are; a tile, fact or table heading takes
   `tabindex="0"`. Text anchors carry `.tip-u` (dotted underline), non-control anchors get the help cursor.
 - Where tips are: Compact/Advanced and the theme toggle; every dashboard tile (Compact and Advanced; Memory and Cache
-  reuse keep their live `#dashTip`); the chat's Last reply rows and its Max tokens, Temperature, Top-p, Top-k and
+  reuse keep their live `#dashTip`); every bar row and cached-vs-computed column of the dashboard's charts (one Tab stop
+  per card, the arrow keys move along it); the chat's Last reply rows and its Max tokens, Temperature, Top-p, Top-k and
   Thinking budget fields; a model's facts (on disk, linked, in memory, max context, sees images, streams experts);
   the Available list's "Recommended for this Mac" badge (tier, RAM and download size); the Settings cache table headings.
 - Native `title` stays where a full value rides it (a cut-off model name, a path, a server message) and on icon buttons.

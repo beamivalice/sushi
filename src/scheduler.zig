@@ -2198,12 +2198,27 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
     const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
-    cache_stats.process.setHotBytes(bytes);
+    cache_stats.process.setHotBytes(readyHotCacheBytes(sch));
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
     publishDiskStats(sch);
     publishHotCacheDigests(sch);
     if (sch.metrics != null) publishCachedSessions(sch);
+}
+
+/// The RAM tier of every ready model, where `resident_hot_cache_bytes` is the current model's alone.
+/// Caller must not hold `registry.mutex`.
+fn readyHotCacheBytes(sch: *Scheduler) u64 {
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var sum: u64 = 0;
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        if (entry.prefix_cache) |*hc| sum += hc.residentBytes();
+    }
+    return sum;
 }
 
 /// Caller must not hold `registry.mutex`.
@@ -6227,3 +6242,18 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
 }
 
 pub var queue_test_prompt: [4096]u32 = undefined;
+
+test "the hot-tier bytes gauge sums the RAM tier of every ready model" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    for ([_][]const u8{ "a", "b", "c" }, [_]u64{ 100, 20, 3 }, [_]model_registry_mod.LoadState{ .ready, .ready, .evicting }) |id, bytes, state| {
+        const entry = try reg.registerStub(id, id, 1);
+        entry.state = state;
+        entry.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+        entry.prefix_cache.?.current_kv_bytes = bytes;
+    }
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    try testing.expectEqual(@as(u64, 120), readyHotCacheBytes(&sch));
+}

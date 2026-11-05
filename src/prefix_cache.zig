@@ -1628,6 +1628,7 @@ pub const HotPrefixCache = struct {
                 break :disk;
             };
             target_moe_seq_offset.* = final_len;
+            self.last_restored_disk_id = d.entries.items[dm.idx].id;
             const ms = sw.read() / std.time.ns_per_ms;
             log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms });
             const disk_mtp = diskRestoreSpec(d, dm.idx, mtp_target, final_len, s, .mtp);
@@ -2934,7 +2935,7 @@ pub const HotPrefixCache = struct {
                 @as(f64, @floatFromInt(e.kv_bytes)) / (1024.0 * 1024.0),
             });
             idle_bytes -|= e.kv_bytes;
-            self.evictAt(idx, "SSD-first idle allowance");
+            self.evictForSpace(idx, "SSD-first idle allowance");
             evicted += 1;
         }
 
@@ -3737,6 +3738,11 @@ pub const HotPrefixCache = struct {
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
         const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
+        self.evictForSpace(idx, reason);
+    }
+
+    /// An entry dropped for room (a budget, the entry cap, a prefill): a tier-counter eviction, which an SSD-first spill is not.
+    fn evictForSpace(self: *HotPrefixCache, idx: usize, reason: []const u8) void {
         cache_stats.process.recordEviction(.hot, self.entries.items[idx].kv_bytes);
         self.evictAt(idx, reason);
     }
@@ -3950,7 +3956,7 @@ pub const HotPrefixCache = struct {
             var live_before: usize = 0;
             _ = mlx.mlx_get_active_memory(&live_before);
             const acct_before = self.current_kv_bytes;
-            self.evictAt(idx, "admitting a long prefill");
+            self.evictForSpace(idx, "admitting a long prefill");
             var live_after: usize = 0;
             _ = mlx.mlx_get_active_memory(&live_after);
             const freed_live: u64 = @as(u64, live_before) -| @as(u64, live_after);
@@ -5479,6 +5485,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         // re-forward the last token, exactly like a RAM full-match hit.
         try testing.expect(res.full_match);
         try testing.expectEqual(@as(usize, 599), res.matched);
+        try testing.expectEqual(cache_stats.Tier.ssd, hc2.lastRestoredTier());
         try testing.expectEqual(@as(usize, 599), cache2.step);
         try testing.expectEqual(@as(usize, 599), moe_off);
         for (cache2.entries) |*e| {
@@ -8836,21 +8843,30 @@ test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)"
             if (std.mem.eql(u32, e.tokens, &tok_a)) e.snapshot.entries[0].offset = 300;
         }
         hc.ssd_idle_mem = hc.entries.items[0].kv_bytes;
+        const before = cache_stats.process.snapshot();
         hc.spillIdleEntries(s);
 
         // Tier 1 shed B, the durable one, even though A is older.
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
         var saw_a = false;
+        var a_bytes: u64 = 0;
         for (hc.entries.items) |*e| {
-            if (std.mem.eql(u32, e.tokens, &tok_a)) saw_a = true;
+            if (std.mem.eql(u32, e.tokens, &tok_a)) {
+                saw_a = true;
+                a_bytes = e.kv_bytes;
+            }
             try testing.expect(!std.mem.eql(u32, e.tokens, &tok_b));
         }
         try testing.expect(saw_a);
+        // B's copy is on the SSD: a spill, not an eviction.
+        try testing.expectEqual(before.evictions[0], cache_stats.process.snapshot().evictions[0]);
 
         // Allowance zero: A has nowhere to go and the cap is hard, so tier 2 drops it.
         hc.ssd_idle_mem = 0;
         hc.spillIdleEntries(s);
         try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        try testing.expectEqual(before.evictions[0] + 1, cache_stats.process.snapshot().evictions[0]);
+        try testing.expectEqual(before.evicted_bytes[0] + a_bytes, cache_stats.process.snapshot().evicted_bytes[0]);
         try testing.expectEqualSlices(u32, &tok_c, hc.entries.items[0].tokens);
     }
 
@@ -10158,9 +10174,8 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
 }
 
-test "HotPrefixCache: a capacity eviction is counted with its bytes in the hot tier" {
-    var cache = HotPrefixCache.init(testing.allocator, 8);
-    defer cache.deinit();
+/// Two layerless entries of 100 and 200 bytes, the first the LRU.
+fn appendCounterStubs(cache: *HotPrefixCache) !void {
     for (1..3) |used| {
         try cache.entries.append(testing.allocator, .{
             .tokens = try testing.allocator.dupe(u32, &[_]u32{ 1, @intCast(used) }),
@@ -10175,6 +10190,12 @@ test "HotPrefixCache: a capacity eviction is counted with its bytes in the hot t
         });
     }
     cache.current_kv_bytes = 300;
+}
+
+test "HotPrefixCache: a capacity eviction is counted with its bytes in the hot tier" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    try appendCounterStubs(&cache);
     const before = cache_stats.process.snapshot();
     cache.evictOneLru("count cap", null);
     const after = cache_stats.process.snapshot();
@@ -10184,6 +10205,23 @@ test "HotPrefixCache: a capacity eviction is counted with its bytes in the hot t
     // An invalidation (a failed check) is not a capacity eviction.
     cache.evictAt(0, "QSA history check");
     try testing.expectEqual(before.evictions[0] + 1, cache_stats.process.snapshot().evictions[0]);
+}
+
+test "HotPrefixCache: entries evicted to admit a prefill are hot-tier evictions" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    try appendCounterStubs(&cache);
+    const Never = struct {
+        fn call(_: ?*anyopaque) bool {
+            return false;
+        }
+    };
+    const before = cache_stats.process.snapshot();
+    const rep = cache.evictLruToAdmit(1 << 20, null, Never.call, false);
+    try testing.expectEqual(@as(usize, 2), rep.entries);
+    const after = cache_stats.process.snapshot();
+    try testing.expectEqual(before.evictions[0] + 2, after.evictions[0]);
+    try testing.expectEqual(before.evicted_bytes[0] + 300, after.evicted_bytes[0]);
 }
 
 test "HotPrefixCache: the tier that served a restore is the disk's only when the disk supplied the rows" {

@@ -319,7 +319,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
     outside `rounds`; DFlash2: always 0). DSpark adds `rows`, `{<verifier rows>:
     rounds}`. They are the sums of the figures `[spec-stats]` logs, added once when a request ends
     ([engine-mtp](engine-mtp.md)). Acceptance % is `accepted / drafted`, mean accepted per round `accepted / rounds`.
-    `/metrics`: `sushi:spec_requests_total{mode}`, `sushi:spec_rounds_total{mode}`, `sushi:spec_drafted_tokens_total{mode}`,
+    MTP's figures include its prompt-lookup rounds (head + lookup), as DFlash2's do; the `[spec-stats]` `per_draft_pct`
+    stays head-only. `/metrics`: `sushi:spec_requests_total{mode}`, `sushi:spec_rounds_total{mode}`, `sushi:spec_drafted_tokens_total{mode}`,
     `sushi:spec_accepted_tokens_total{mode}`, `sushi:spec_plain_rounds_total{mode}`, `sushi:spec_rows_total{mode,rows}`.
   - A `requests` row of a request that speculated carries `"spec":{"mode","rounds","drafted","accepted"}`; a plain request
     has no `spec` member.
@@ -552,7 +553,14 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   cache reuse (tokens, requests, hits by tier), storage (hot and SSD use, evictions per tier), writes by kind, request
   outcomes, latency, TTFT, end-to-end, prompt and output length, serial-decode reasons, drafting by mode (acceptance and
   mean accepted per round, DSpark plain-round share) and DSpark rows per round. The draft acceptance chart is one dot per
-  request whose log row carries `spec`. Each bar row prints its exact value and has a hover tip (`data-tip` JSON). A count
+  request whose log row carries `spec`. Each bar row prints its exact value and has a tip (`data-tip` text). A card's bar
+  rows (and the cached-vs-computed columns) are one Tab stop the arrow keys, Home and End walk; a poll that rewrites them
+  hands the focus to the same place (`setHtml`, `rove`). A histogram takes the focus and the arrow keys step its buckets.
+  Each card is a `role="group"` named by its picker title. A card under 440 px wide (container query) puts each bar
+  under its label and value, the donut above its bars, and labels every other bucket. A member the server does not export
+  (`speculative`, a histogram, `prefix_cache_writes`) reads "Not reported by this server", never as zero; with no model
+  loaded the hot tier reads "-", not "off"; a rejected request is no column of the cached-vs-computed chart; an empty
+  histogram says so. The open picker's ticks follow the view when Compact/Advanced changes the default. A count
   chart (Requests) puts gridlines on whole numbers only: a step of 1, 2, 5, 10, 20 ... with at most four. A card that is
   hidden is not filled. A **Charts** button opens the picker, an inline panel above the page body that pushes the page
   down (config mode): tick charts on or off, Reset, Done. While it is open each chart shows a strip: drag it onto another

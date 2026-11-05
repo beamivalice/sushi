@@ -501,11 +501,14 @@ process start whatever turns `--metrics` on.
 - **Hits by tier** (`sushi:prefix_cache_tier_hits_total{tier}`): one per request whose lookup restored tokens, counted in
   the scheduler where the `[prefix] reused ... from <tier>` line is built. `hot` is the RAM tier or the live state a
   request keeps by move; `ssd` only when `last_restored_disk_id` is set and the live state did not serve it
-  (`HotPrefixCache.lastRestoredTier`).
-- **Evictions by tier** (`..._evictions_total`, `..._evicted_bytes_total`): entries a tier dropped to stay inside its
-  budget or entry cap: `evictOneLru` for the RAM tier, `gcToBudget` for the SSD tier. An invalidation (a failed QSA
-  check, a merge failure), an idle spill to disk and `clear` are not evictions.
-- **`sushi:prefix_cache_hot_bytes`**: the RAM tier's resident bytes, republished with `publishHotCacheResidency`.
+  (`HotPrefixCache.lastRestoredTier`). Every disk arm of `lookupImpl` that restores rows sets it, the plain-KV arm included.
+  A hit is counted at lookup, so a restore later thrown away (a `QsaHistoryGap` retry, a cancelled prefill) still counts.
+- **Evictions by tier** (`..._evictions_total`, `..._evicted_bytes_total`): entries a tier dropped for room. The RAM
+  tier counts every drop through `evictForSpace`: its budget or entry cap (`evictOneLru`), a prefill being admitted
+  (`evictLruToAdmit`) and an SSD-first idle-allowance drop of an entry with no SSD copy; the SSD tier counts `gcToBudget`.
+  An invalidation (a failed QSA check, a merge failure), an idle spill to disk and `clear` are not evictions.
+- **`sushi:prefix_cache_hot_bytes`**: the RAM tiers of every ready model (`readyHotCacheBytes`), republished with
+  `publishHotCacheResidency`; `resident_hot_cache_bytes` (admission, `/props`) stays the current model's alone.
 - Guards: `cache_stats.zig`, `a capacity eviction is counted`, `the tier that served a restore` in `prefix_cache.zig`,
   `DiskTier: byte budget evicts LRU entries` in `kv_disk_cache.zig`.
 

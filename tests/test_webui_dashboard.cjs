@@ -669,11 +669,106 @@ async function chartExtras(browser) {
     await context.close();
   }
   {
-    // A server that reports none of it (an older build, nothing drafted) leaves the cards empty rather than broken.
+    // An older server that exports no drafting counters is not read as one where nothing drafted.
     const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
     await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
-    assert.match(await textOf(page, 'dashSpecModes'), /No request has drafted yet/);
+    assert.match(await textOf(page, 'dashSpecModes'), /Not reported by this server/);
+    assert.match(await textOf(page, 'dashSpecRows'), /Not reported by this server/);
+    await page.waitForFunction(() => (window.__axis.dashCSpec ?? []).length > 0);
+    assert.ok((await axisOf(page, 'dashCSpec')).includes('Not reported by this server'), 'nor is the acceptance chart');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // A server that drafted nothing says so.
+    const zero = { requests: 0, rounds: 0, drafted: 0, accepted: 0, plain_rounds: 0 };
+    const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { speculative: { mtp: zero, dflash: zero, dspark: zero } } });
+    await page.waitForFunction(() => /No request has drafted yet/.test(document.getElementById('dashSpecModes').textContent));
     assert.match(await textOf(page, 'dashSpecRows'), /No DSpark round yet/);
+    await context.close();
+  }
+}
+
+// The bar, column and histogram charts work from the keyboard, on a phone, and say only what the server reported.
+async function chartAudit(browser) {
+  const tipText = (page) => page.evaluate(() => document.getElementById('tip').classList.contains('show') ? document.getElementById('tip').textContent : null);
+  const latency = (per) => { let c = 0; return { count: per.reduce((a, b) => a + b, 0), sum: 3, bounds: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10], bucket_counts: per.map((v) => c += v) }; };
+  const hists = { time_to_first_token_seconds: latency([0, 0, 1, 2, 3, 1, 0, 0, 0, 0, 0]), e2e_request_latency_seconds: latency(Array(11).fill(0)) };
+  {
+    // A card's bars are one Tab stop; the arrows walk its rows; the focused row keeps the focus and its tip through a poll that changes it.
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { histograms: hists } });
+    await page.waitForFunction(() => document.querySelectorAll('#dashWrites .hb').length > 2);
+    assert.deepEqual(await page.$$eval('#dashWrites .hb', (rows) => rows.map((r) => r.tabIndex)).then((t) => [t[0], t.slice(1).every((x) => x === -1)]), [0, true], 'the first row takes Tab, the others wait for the arrows');
+    await page.locator('#dashTiers .hb').first().focus();
+    await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('#dashWrites .hb')), true, 'Tab goes from one card\'s bars to the next card\'s first row');
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.evaluate(() => document.activeElement === document.querySelectorAll('#dashWrites .hb')[1]), true);
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('#dashWrites .hb')), true, 'the arrows move along the rows');
+    assert.match(await tipText(page) ?? '', /^KV chunks\nWritten: /, 'a focused row shows its tip');
+    const before = await page.$eval('#dashWrites .hb b', (b) => b.textContent);
+    await page.waitForFunction((was) => document.querySelector('#dashWrites .hb b').textContent !== was, before, { timeout: 8000 });
+    assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('#dashWrites .hb')), true, 'a poll that rewrites the row keeps the focus on it');
+    const now = await page.$eval('#dashWrites .hb b', (b) => b.textContent);
+    await page.waitForFunction((v) => document.getElementById('tip').textContent.includes(v), now, { timeout: 3000 });
+    // A histogram steps through its buckets from the keyboard and lets go on blur.
+    await page.focus('#dashHTtft');
+    await page.keyboard.press('ArrowRight'); await page.keyboard.press('ArrowRight'); await page.keyboard.press('ArrowRight');
+    assert.match(await page.textContent('#dashTip'), /25 ms to 50 ms\s*Requests\s*1 \(14%\)/, 'the third bucket, named in the chart tooltip');
+    assert.equal(await page.$$eval('#dashHTtft > div', (b) => b.findIndex((x) => x.classList.contains('on'))), 2);
+    await page.keyboard.press('Tab');
+    assert.equal(await page.isVisible('#dashTip'), false, 'blur hides it');
+    assert.match(await textOf(page, 'dashHE2e'), /No finished request yet/, 'an empty histogram says so instead of drawing nothing');
+    assert.equal(await page.getByRole('group', { name: 'Cache reuse' }).count(), 1, 'each chart card is a named group');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // A refused request computed nothing and restored nothing: it is no bar in the cached vs computed chart.
+    const t = Date.now() - 3000, row = (request_id, outcome, dt) => ({ request_id, model: 'org/test-model', t_ms: t + dt, prompt_tokens: 900, cached_tokens: 100, prefill_seconds: 0, generated_tokens: 0, decode_seconds: 0, outcome });
+    const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { requests: [row(1, 'ok', 0), row(2, 'rejected', 1)] } });
+    await page.waitForFunction(() => document.querySelectorAll('#dashStk > div').length > 0);
+    await page.waitForTimeout(500);
+    assert.equal(await page.locator('#dashStk > div').count(), 1);
+    await context.close();
+  }
+  {
+    // With no model loaded the hot tier's setting is unknown, not off.
+    const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', noModels: true, specData: specFixture() });
+    await page.waitForFunction(() => /Hot \(memory\)/.test(document.getElementById('dashTiers').textContent));
+    assert.match(await textOf(page, 'dashTiers'), /Hot \(memory\)\s*-\s*SSD\s*-/);
+    await context.close();
+  }
+  {
+    // The open picker ticks what the view shows after a Compact/Advanced switch.
+    const { page, context } = await openPage(browser, '/dashboard', { mode: 'compact' });
+    await page.click('#dashChartsBtn');
+    await page.click('#modeToggle [data-mode="advanced"]');
+    const shown = await page.$$eval('#dashCharts .chart:not([hidden])', (c) => c.map((x) => x.dataset.chart).sort());
+    assert.deepEqual(await page.$$eval('#dashPickList input:checked', (c) => c.map((x) => x.dataset.chart).sort()), shown);
+    await context.close();
+  }
+  {
+    // On a 320 px phone every meter keeps a visible track, no value is cut off, and every printed bucket label is whole.
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { ...specFixture(), histograms: hists }, contextOptions: { viewport: { width: 320, height: 800 } } });
+    await page.waitForFunction(() => document.querySelectorAll('#dashTiers .hb').length >= 4 && document.querySelectorAll('#dashHlTtft span').length === 11);
+    const layout = await page.evaluate(() => {
+      const inside = (el) => { const c = el.closest('.chart').getBoundingClientRect(), r = el.getBoundingClientRect(); return r.left >= c.left - 0.5 && r.right <= c.right + 0.5; };
+      document.getElementById('dashHlTtft').scrollIntoView({ block: 'center' });
+      const labels = [...document.querySelectorAll('#dashHlTtft span')].filter((s) => getComputedStyle(s).visibility === 'visible').map((s) => {
+        const range = document.createRange(); range.selectNodeContents(s); const r = range.getBoundingClientRect();
+        return document.elementFromPoint(r.right - 1, r.top + r.height / 2) === s;
+      });
+      return {
+        tracks: [...document.querySelectorAll('#dashTiers .hb .tr, #dashReuseBars .hb .tr')].map((t) => t.getBoundingClientRect().width),
+        values: [...document.querySelectorAll('#dashTiers .hb b, #dashReuseBars .hb b')].map(inside),
+        labels,
+      };
+    });
+    assert.ok(layout.tracks.every((w) => w > 80), `every meter keeps a track (${layout.tracks.map(Math.round)})`);
+    assert.ok(layout.values.every(Boolean), 'every value sits inside its card');
+    assert.ok(layout.labels.length >= 5 && layout.labels.every(Boolean), `every shown bucket label is printed whole (${layout.labels})`);
     assert.deepEqual(errors, []);
     await context.close();
   }
@@ -691,6 +786,7 @@ async function main() {
     await dashboardBugs(browser);
     await chartPicker(browser);
     await chartExtras(browser);
+    await chartAudit(browser);
     {
       // A running request has a Cancel button that posts its id, with the page's API key; a cached conversation has none.
       const row = (request_id, phase) => ({ request_id, model: 'org/test-model', phase, context_length: 8192, context_tokens: 100, cached_tokens: 0, generated_tokens: 5, elapsed_seconds: 3, state_bytes: 1 << 20 });

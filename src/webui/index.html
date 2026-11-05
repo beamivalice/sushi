@@ -544,6 +544,20 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 #dashPanel .stk > div > i:last-child { background: var(--c1); }
 #dashPanel .stk > div:hover { outline: 2px solid var(--text); outline-offset: 1px; }
 #dashPanel .vis .hist { flex: 1; height: auto; min-height: 150px; }
+#dashPanel .hist > .none { margin: auto; }
+#dashReuseDonut { display: contents; }
+#dashPanel .hb:focus-visible, #dashPanel .stk > div:focus-visible, #dashPanel .hist:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: var(--r-sm); }
+/* A narrow card puts each bar under its label and value, the donut above its bars, and labels every other bucket. */
+#dashPanel .chart { container-type: inline-size; }
+@container (max-width: 440px) {
+  #dashPanel .hb, #dashPanel .reuse .hb { grid-template-columns: auto minmax(0, 1fr); row-gap: 3px; }
+  #dashPanel .hb > b { text-align: right; }
+  #dashPanel .hb .tr { grid-column: 1 / -1; grid-row: 2; }
+  #dashPanel .chart .reuse { flex-direction: column; align-items: stretch; }
+  #dashPanel .reuse .donut { align-self: center; }
+  #dashPanel .vis .histlabels span { min-width: 0; overflow: visible; white-space: nowrap; display: flex; justify-content: center; }
+  #dashPanel .vis .histlabels span:nth-child(odd) { visibility: hidden; }
+}
 #dashPanel .hb .tr > i { transition: width var(--dur-3) var(--ease-out); }
 /* Picker and config mode: while the panel is open each chart can be dragged or nudged. */
 #dashPicker { padding: var(--s3) var(--s4); }
@@ -871,15 +885,15 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="card chart" data-chart="specmodes"><h2>Drafting by mode<span class="sub">since the server started</span></h2><div class="vis" id="dashSpecModes"></div><div class="foot" id="dashSpecModesFoot">&nbsp;</div></div>
     <div class="card chart" data-chart="specrows"><h2>Verifier rows per round<span class="sub">DSpark, rounds per row count</span></h2><div class="vis" id="dashSpecRows"></div></div>
     <div class="card chart" data-chart="cachetok"><h2>Cached vs computed prompt tokens<span class="legend"><span><i style="background:var(--c2)"></i>restored from cache</span><span><i style="background:var(--c1)"></i>computed</span></span></h2><div class="vis"><div class="stk" id="dashStk"></div><div class="foot" id="dashStkFoot">&nbsp;</div></div></div>
-    <div class="card chart" data-chart="cachereuse"><h2>Prefix cache reuse<span class="sub">since the server started</span></h2><div class="vis reuse" id="dashReuse"></div></div>
+    <div class="card chart" data-chart="cachereuse"><h2>Prefix cache reuse<span class="sub">since the server started</span></h2><div class="vis reuse" id="dashReuse"><span id="dashReuseDonut"></span><div class="hbs" id="dashReuseBars"></div></div></div>
     <div class="card chart" data-chart="cachetiers"><h2>Prefix cache storage<span class="sub">hot memory and SSD</span></h2><div class="vis" id="dashTiers"></div><div class="foot" id="dashTiersFoot">&nbsp;</div></div>
     <div class="card chart" data-chart="cachewrites"><h2>Prefix cache writes<span class="sub">SSD, since the server started</span></h2><div class="vis" id="dashWrites"></div><div class="foot" id="dashWritesFoot">Filesystem writes, not SSD wear. A rewritten file counts again.</div></div>
     <div class="card chart" data-chart="outcomes"><h2>Request outcomes<span class="sub">since the server started</span></h2><div class="vis" id="dashOutcomes"></div></div>
     <div class="card chart" data-chart="latency"><h2>Latency<span class="sub">mean since the server started</span></h2><div class="vis" id="dashLat"></div><div class="foot" id="dashLatFoot">&nbsp;</div></div>
-    <div class="card chart" data-chart="ttft"><h2>Time to first token<span class="legend">requests per bucket</span></h2><div class="vis"><div class="hist" id="dashHTtft"></div><div class="histlabels" id="dashHlTtft"></div></div></div>
-    <div class="card chart" data-chart="e2e"><h2>End-to-end time per request<span class="legend">requests per bucket</span></h2><div class="vis"><div class="hist" id="dashHE2e"></div><div class="histlabels" id="dashHlE2e"></div></div></div>
-    <div class="card chart" data-chart="ptok"><h2>Prompt length<span class="legend">requests per bucket, tokens</span></h2><div class="vis"><div class="hist" id="dashHPtok"></div><div class="histlabels" id="dashHlPtok"></div></div></div>
-    <div class="card chart" data-chart="otok"><h2>Output length<span class="legend">requests per bucket, tokens</span></h2><div class="vis"><div class="hist" id="dashHOtok"></div><div class="histlabels" id="dashHlOtok"></div></div></div>
+    <div class="card chart" data-chart="ttft"><h2>Time to first token<span class="legend">requests per bucket</span></h2><div class="vis"><div class="hist" id="dashHTtft" tabindex="0" role="img" aria-label="Time to first token, requests per bucket. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlTtft"></div></div></div>
+    <div class="card chart" data-chart="e2e"><h2>End-to-end time per request<span class="legend">requests per bucket</span></h2><div class="vis"><div class="hist" id="dashHE2e" tabindex="0" role="img" aria-label="End-to-end time, requests per bucket. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlE2e"></div></div></div>
+    <div class="card chart" data-chart="ptok"><h2>Prompt length<span class="legend">requests per bucket, tokens</span></h2><div class="vis"><div class="hist" id="dashHPtok" tabindex="0" role="img" aria-label="Prompt length, requests per bucket. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlPtok"></div></div></div>
+    <div class="card chart" data-chart="otok"><h2>Output length<span class="legend">requests per bucket, tokens</span></h2><div class="vis"><div class="hist" id="dashHOtok" tabindex="0" role="img" aria-label="Output length, requests per bucket. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlOtok"></div></div></div>
     <div class="card chart" data-chart="serial"><h2>Why decode ran serial<span class="sub">slot-ticks beside live company</span></h2><div class="vis" id="dashSerial"></div></div>
   </section>
   </div>
@@ -4254,7 +4268,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (seenReq.has(key)) continue;
       seenReq.set(key, r.t_ms);
       if (r.spec?.drafted > 0) specReqs.push({ t: r.t_ms, ...r.spec });
-      if (r.prompt_tokens + (r.cached_tokens || 0) > 0) reqs.push({ t: r.t_ms, computed: r.prompt_tokens, restored: r.cached_tokens || 0 });
+      if (r.outcome !== 'rejected' && r.prompt_tokens + (r.cached_tokens || 0) > 0) reqs.push({ t: r.t_ms, computed: r.prompt_tokens, restored: r.cached_tokens || 0 });
       if (r.outcome === 'ok' && r.prefill_seconds > 0 && r.prompt_tokens > 0) {
         const ev = { t: r.t_ms, rate: r.prompt_tokens / r.prefill_seconds, tokens: r.prompt_tokens, restored: r.cached_tokens || 0 };
         finished.push(ev);
@@ -4339,11 +4353,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const tc = d.prefix_cache_tiers || {};
     if (on('cachereuse')) reuse(c, tc);
     if (on('cachetiers')) tiers(d.sessions || [], tc);
-    if (on('specmodes')) specModes(d.speculative || {});
-    if (on('specrows')) specRows(d.speculative?.dspark?.rows || {});
+    if (on('specmodes')) specModes(d.speculative);
+    if (on('specrows')) specRows(d.speculative && (d.speculative.dspark?.rows || {}));
     if (on('cachewrites')) {
-      const rows = writes ? [...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || k, v, bytes(v), '--c4']), ...(writes.failed ? [['Failed or dropped', writes.failed, bytes(writes.failed), '--err']] : [])] : [];
-      bars('writes', rows, writes ? 'Nothing written yet' : 'Not reported by this server');
+      const share = v => writes.total ? ` (${fmt(100 * v / writes.total, 0)}%)` : '';
+      const rows = writes ? [...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || k, v, bytes(v), '--c4', tip(WRITE_KINDS[k] || k, [['Written', bytes(v) + share(v)]], 'Bytes the SSD tier wrote for this kind since the server started.')]),
+        ...(writes.failed ? [['Failed or dropped', writes.failed, bytes(writes.failed), '--err', tip('Failed or dropped', [['Bytes', bytes(writes.failed)]], 'Writes that failed or were dropped before they reached the disk.')]] : [])] : [];
+      bars('writes', rows, writes ? 'Nothing written yet' : NOT_REPORTED);
       const known = writes ? [writes.rate != null && 'Writing ' + bytes(writes.rate) + '/s', writes.amplification != null && fmt(writes.amplification, 1) + 'x written per byte on disk'].filter(Boolean) : [];
       put($('writes-foot'), (known.length ? known.join(', ') + '. ' : '') + 'A rewritten file counts again; this is not SSD wear.');
     }
@@ -4370,20 +4386,21 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     }
   }
 
-  // Horizontal bars with the exact value beside each. rows: [label, value, text, colour var, tip].
+  // Horizontal bars with the exact value beside each. rows: [label, value, text, colour var, tip]. The rows are one Tab stop.
   function bars(id, rows, none, full) {
     const max = full ?? Math.max(0, ...rows.map(r => r[1]));
-    setHtml($(id), rows.length && (full || max > 0) ? rows.map(([l, v, text, color, tp]) =>
-      `<div class="hb"${tp ? ` data-tip="${esc(tipText(tp))}"` : ''}><span>${esc(l)}</span><span class="tr"><i style="width:${(100 * v / max).toFixed(1)}%;background:var(${color})"></i></span><b>${esc(text)}</b></div>`).join('')
+    setHtml($(id), rows.length && (full || max > 0) ? rows.map(([l, v, text, color, tp], i) =>
+      `<div class="hb" tabindex="${i ? -1 : 0}" data-tip="${esc(tipText(tp))}"><span>${esc(l)}</span><span class="tr"><i style="width:${(100 * Math.min(1, v / max)).toFixed(1)}%;background:var(${color})"></i></span><b>${esc(text)}</b></div>`).join('')
       : `<div class="none">${esc(none)}</div>`);
   }
+  const NOT_REPORTED = 'Not reported by this server';
 
   // One stacked bar per recent request: tokens restored from the cache on top of the tokens computed.
   function stacked() {
     const list = reqs.slice(-60), max = Math.max(0, ...list.map(r => r.computed + r.restored));
-    setHtml($('stk'), list.length ? list.map(r => {
+    setHtml($('stk'), list.length ? list.map((r, i) => {
       const tot = r.computed + r.restored;
-      return `<div style="height:${(100 * tot / max).toFixed(1)}%" data-tip="${esc(tipText({ t: new Date(r.t).toLocaleTimeString(), rows: [['Prompt tokens', fmtInt(tot)], ['Restored from cache', `${fmtInt(r.restored)} (${fmt(100 * r.restored / tot, 0)}%)`], ['Computed', fmtInt(r.computed)]] }))}"><i style="flex:${r.restored}"></i><i style="flex:${r.computed}"></i></div>`;
+      return `<div style="height:${(100 * tot / max).toFixed(1)}%" tabindex="${i ? -1 : 0}" role="img" aria-label="${fmtInt(r.restored)} restored, ${fmtInt(r.computed)} computed" data-tip="${esc(tipText({ t: new Date(r.t).toLocaleTimeString(), rows: [['Prompt tokens', fmtInt(tot)], ['Restored from cache', `${fmtInt(r.restored)} (${fmt(100 * r.restored / tot, 0)}%)`], ['Computed', fmtInt(r.computed)]] }))}"><i style="flex:${r.restored}"></i><i style="flex:${r.computed}"></i></div>`;
     }).join('') : '<div class="none">No request in this window yet</div>');
     const rest = list.reduce((a, r) => a + r.restored, 0), comp = list.reduce((a, r) => a + r.computed, 0);
     put($('stk-foot'), list.length ? `Last ${list.length} request${list.length === 1 ? '' : 's'}: ${fmtInt(rest)} of ${fmtInt(rest + comp)} prompt tokens restored (${fmt(100 * rest / (rest + comp), 0)}%). Tallest bar: ${fmtInt(max)} tokens.` : '');
@@ -4394,31 +4411,33 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const comp = c.prefill_tokens_total || 0, rest = c.prefix_cache_tokens_total || 0, tot = comp + rest, f = tot ? rest / tot : 0;
     const hits = c.prefix_cache_hits_total || 0, qs = c.prefix_cache_queries_total || 0, C = 2 * Math.PI * 40;
     const hot = tc.hits?.hot || 0, ssd = tc.hits?.ssd || 0, byTier = hot + ssd;
-    const row = (l, v, text, color, help) => `<div class="hb" data-tip="${esc(tipText({ t: l, rows: [['Value', text]], h: help }))}"><span>${l}</span><span class="tr"><i style="width:${(100 * v).toFixed(1)}%;background:var(${color})"></i></span><b>${esc(text)}</b></div>`;
-    setHtml($('reuse'), `<svg class="donut" viewBox="0 0 100 100" role="img" aria-label="${tot ? fmt(100 * f, 0) + '% of prompt tokens came from the cache' : 'No prompt tokens yet'}">
+    setHtml($('reuse-donut'), `<svg class="donut" viewBox="0 0 100 100" role="img" aria-label="${tot ? fmt(100 * f, 0) + '% of prompt tokens came from the cache' : 'No prompt tokens yet'}">
       <circle cx="50" cy="50" r="40" fill="none" stroke="${tot ? 'var(--c1)' : 'var(--surface-2)'}" stroke-width="14"/>
       <circle cx="50" cy="50" r="40" fill="none" stroke="var(--c2)" stroke-width="14" stroke-dasharray="${(f * C).toFixed(2)} ${C.toFixed(2)}" transform="rotate(-90 50 50)"/>
-      <text x="50" y="50">${tot ? fmt(100 * f, 0) + '%' : '-'}</text></svg>
-      <div class="hbs">${row('From cache', tot ? f : 0, `${fmtInt(rest)} tok`, '--c2', 'Prompt tokens restored from the prefix cache instead of computed.')}${row('Computed', tot ? 1 - f : 0, `${fmtInt(comp)} tok`, '--c1', 'Prompt tokens the model forwarded.')}${row('Requests that hit', qs ? hits / qs : 0, qs ? `${fmtInt(hits)} of ${fmtInt(qs)}` : '-', '--c3', 'Requests that restored any cached tokens, of all that looked.')}${tc.hits ? row('Hits from memory', byTier ? hot / byTier : 0, fmtInt(hot), '--c4', 'Requests restored from the in-memory tier or the live state of a finished turn.') + row('Hits from SSD', byTier ? ssd / byTier : 0, fmtInt(ssd), '--c2', 'Requests restored from the SSD tier.') : ''}</div>`);
+      <text x="50" y="50">${tot ? fmt(100 * f, 0) + '%' : '-'}</text></svg>`);
+    bars('reuse-bars', [valueRow('From cache', tot ? f : 0, `${fmtInt(rest)} tok`, '--c2', 'Prompt tokens restored from the prefix cache instead of computed.'), valueRow('Computed', tot ? 1 - f : 0, `${fmtInt(comp)} tok`, '--c1', 'Prompt tokens the model forwarded.'),
+      valueRow('Requests that hit', qs ? hits / qs : 0, qs ? `${fmtInt(hits)} of ${fmtInt(qs)}` : '-', '--c3', 'Requests that restored any cached tokens, of all that looked.'),
+      ...(tc.hits ? [valueRow('Hits from memory', byTier ? hot / byTier : 0, fmtInt(hot), '--c4', 'Requests restored from the in-memory tier or the live state of a finished turn.'), valueRow('Hits from SSD', byTier ? ssd / byTier : 0, fmtInt(ssd), '--c2', 'Requests restored from the SSD tier.')] : [])], '', 1);
   }
+  const valueRow = (l, v, text, color, help) => [l, v, text, color, { t: l, rows: [['Value', text]], h: help }];
 
   // Hot (memory) and SSD tiers as meters, then what each evicted. The hot tier's bytes are the server's; its entries are the idle cached conversations.
   function tiers(rows, tc) {
     const t = cacheTiers(), v = t.cap ? t.volume : null, hot = rows.filter(r => r.phase === 'cached'), hotBytes = tc.hot_bytes ?? hot.reduce((a, r) => a + (r.state_bytes || 0), 0);
-    const row = (l, v, text, color, help) => `<div class="hb" data-tip="${esc(tipText({ t: l, rows: [['Value', text]], h: help }))}"><span>${l}</span><span class="tr"><i style="width:${(100 * Math.min(1, v)).toFixed(1)}%;background:var(${color})"></i></span><b>${esc(text)}</b></div>`;
-    const noun = n => `${fmtInt(n)} ${n === 1 ? 'entry' : 'entries'}`;
+    const row = valueRow, noun = n => `${fmtInt(n)} ${n === 1 ? 'entry' : 'entries'}`;
     const ev = tc.evictions, evBytes = tc.evicted_bytes || {}, evMax = Math.max(1, ev?.hot || 0, ev?.ssd || 0);
-    const evRow = (l, k, color) => row(l, (ev[k] || 0) / evMax, `${fmtInt(ev[k])} (${bytes(evBytes[k] || 0)})`, color, 'Entries the tier dropped to stay inside its budget or entry cap since the server started.');
-    setHtml($('tiers'), row('Hot (memory)', t.ramOn && t.ramBudget ? hotBytes / t.ramBudget : 0, t.ramOn ? `${bytes(hotBytes)}${t.ramBudget ? ' / ' + bytes(t.ramBudget) : ''}, ${noun(hot.length)}` : 'off', '--c4', 'Conversations kept in memory for a quick restore. Off unless --prefix-cache-mem is set.')
-      + row('SSD', t.cap ? t.ssd / t.cap : 0, t.cap ? `${bytes(t.ssd)} / ${bytes(t.cap)}, ${noun(t.entries)}` : t.known ? 'off' : '-', '--c2', 'Entries stored on disk, against the space assigned to the cache.')
-      + (v?.total_bytes > 0 && v.free_bytes != null ? row('Disk free', v.free_bytes / v.total_bytes, `${bytes(v.free_bytes)} / ${bytes(v.total_bytes)}`, '--c3', 'Free space on the volume that holds the cache. The cache keeps 4 GiB of it in reserve.') : '')
-      + (ev ? evRow('Evicted from memory', 'hot', '--c4') + evRow('Evicted from SSD', 'ssd', '--c2') : ''));
+    const evRow = (l, k, color) => row(l, (ev[k] || 0) / evMax, `${fmtInt(ev[k])} (${bytes(evBytes[k] || 0)})`, color, 'Entries the tier dropped for room (its budget, its entry cap, a prefill being admitted) since the server started.');
+    bars('tiers', [row('Hot (memory)', t.ramOn && t.ramBudget ? hotBytes / t.ramBudget : 0, t.ramOn ? `${bytes(hotBytes)}${t.ramBudget ? ' / ' + bytes(t.ramBudget) : ''}, ${noun(hot.length)}` : t.known ? 'off' : '-', '--c4', 'Conversations kept in memory for a quick restore. Off unless --prefix-cache-mem is set.'),
+      row('SSD', t.cap ? t.ssd / t.cap : 0, t.cap ? `${bytes(t.ssd)} / ${bytes(t.cap)}, ${noun(t.entries)}` : t.known ? 'off' : '-', '--c2', 'Entries stored on disk, against the space assigned to the cache.'),
+      ...(v?.total_bytes > 0 && v.free_bytes != null ? [row('Disk free', v.free_bytes / v.total_bytes, `${bytes(v.free_bytes)} / ${bytes(v.total_bytes)}`, '--c3', 'Free space on the volume that holds the cache. The cache keeps 4 GiB of it in reserve.')] : []),
+      ...(ev ? [evRow('Evicted from memory', 'hot', '--c4'), evRow('Evicted from SSD', 'ssd', '--c2')] : [])], '', 1);
     put($('tiers-foot'), t.cap ? cacheVolumeText(t.volume) : '');
   }
 
   const SPEC_MODES = [['mtp', 'MTP'], ['dflash', 'DFlash2'], ['dspark', 'DSpark']];
   // Share of drafted tokens the verifier kept, per drafting mode, with the mean it accepted per round.
   function specModes(sp) {
+    if (!sp) { bars('spec-modes', [], NOT_REPORTED); put($('spec-modes-foot'), ''); return; }
     const rows = [];
     for (const [k, name] of SPEC_MODES) {
       const m = sp[k]; if (!m?.rounds) continue;
@@ -4432,6 +4451,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     put($('spec-modes-foot'), mtp?.plain_rounds ? `MTP: ${fmtInt(mtp.plain_rounds)} planner ticks ran without a draft.` : '');
   }
   function specRows(rows) {
+    if (!rows) { bars('spec-rows', [], NOT_REPORTED); return; }
     const list = Object.entries(rows).map(([r, n]) => [+r, n]).sort((a, b) => a[0] - b[0]), total = list.reduce((a, [, n]) => a + n, 0);
     bars('spec-rows', list.map(([r, n]) => [r === 1 ? '1 row (plain)' : `${r} rows`, n, fmtInt(n), '--c4', { t: r === 1 ? '1 verifier row (plain)' : `${r} verifier rows`, rows: [['Rounds', `${fmtInt(n)} (${fmt(100 * n / total, 0)}%)`]], h: 'One row is the committed token alone; every extra row is a drafted token being checked.' }]), 'No DSpark round yet');
   }
@@ -4441,7 +4461,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const tEnd = Math.max(series.t[series.t.length - 1] ?? 0, ...evs.map(e => e.t)) || undefined;
     const f = frame(id, 100, { tEnd, plain: true, dec: 0, unit: '%' }), { cv, ctx, hgt, padT, padB, X, Y } = f;
     charts[id] = { xs: evs.map(e => X(e.t)), y: (padT + hgt - padB) / 2 };
-    if (!evs.length) { emptyNote(f, 'No request drafted in this window yet'); if (tipOwner === cv.id) hideTip(); return; }
+    if (!evs.length) { emptyNote(f, lastData && !lastData.d.speculative ? NOT_REPORTED : 'No request drafted in this window yet'); if (tipOwner === cv.id) hideTip(); return; }
     const hv = hover[id], pct = e => 100 * e.accepted / e.drafted;
     let near = -1, best = 24;
     if (hv) evs.forEach((e, i) => { const dx = Math.abs(X(e.t) - hv.x); if (dx < best) { best = dx; near = i; } });
@@ -4472,7 +4492,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   function hist(id, hg, label) {
     const el = $('h-' + id), lb = $('hl-' + id);
-    if (!hg || !hg.bucket_counts) { setHtml(el, ''); setHtml(lb, ''); delete histData[id]; return; }
+    if (!hg?.bucket_counts || !hg.count) { setHtml(el, `<span class="none">${hg ? 'No finished request yet' : NOT_REPORTED}</span>`); setHtml(lb, ''); delete histData[id]; delete histHover[id]; return; }
     const cum = hg.bucket_counts, per = cum.map((v, i) => v - (i ? cum[i - 1] : 0));
     const max = Math.max(1, ...per);
     const labels = [...hg.bounds.map(b => '≤' + label(b)), '>' + label(hg.bounds[hg.bounds.length - 1])];
@@ -4506,7 +4526,21 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (changed) [...el.children].forEach((c, j) => c.classList.toggle('on', j === i));
       histTip(id);
     });
-    el.addEventListener('pointerleave', () => { delete histHover[id]; [...el.children].forEach(c => c.classList.remove('on')); hideTip(); });
+    const leaveHist = () => { if (!histHover[id]) return; delete histHover[id]; [...el.children].forEach(c => c.classList.remove('on')); hideTip(); };
+    el.addEventListener('pointerleave', leaveHist);
+    el.addEventListener('blur', leaveHist);
+    // The arrow keys, Home and End step through the buckets like a pointer would.
+    el.addEventListener('keydown', e => {
+      const d = histData[id]; if (!d) return;
+      if (e.key === 'Escape') { leaveHist(); return; }
+      const n = d.per.length, cur = histHover[id]?.i, to = { ArrowRight: (cur ?? -1) + 1, ArrowLeft: (cur ?? n) - 1, Home: 0, End: n - 1 }[e.key];
+      if (to == null) return;
+      e.preventDefault();
+      const i = Math.max(0, Math.min(n - 1, to)), r = el.children[i].getBoundingClientRect();
+      histHover[id] = { i, cx: r.left + r.width / 2, cy: r.top };
+      [...el.children].forEach((c, j) => c.classList.toggle('on', j === i));
+      histTip(id);
+    });
   }
 
   // innerHTML only through DOMPurify; a TBODY is wrapped in a table because a bare <tr> is dropped by the HTML parser.
@@ -4514,8 +4548,17 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (!window.DOMPurify?.isSupported) { node.textContent = ''; return; }
     if (node._html === html) return;
     node._html = html;
-    if (node.tagName !== 'TBODY') { node.innerHTML = DOMPurify.sanitize(html); return; }
-    node.innerHTML = DOMPurify.sanitize('<table><tbody>' + html + '</tbody></table>').replace(/^<table><tbody>|<\/tbody><\/table>$/g, '');
+    // A focused bar keeps the keyboard: the same place in the new content takes the focus.
+    const items = () => [...node.querySelectorAll('[data-tip][tabindex]')], at = node.contains(document.activeElement) ? items().indexOf(document.activeElement) : -1;
+    if (node.tagName !== 'TBODY') node.innerHTML = DOMPurify.sanitize(html);
+    else node.innerHTML = DOMPurify.sanitize('<table><tbody>' + html + '</tbody></table>').replace(/^<table><tbody>|<\/tbody><\/table>$/g, '');
+    if (at >= 0) { const now = items(); rove(now[Math.min(at, now.length - 1)]); }
+  }
+  // One item of a row of tips takes Tab (tabindex 0); the arrow keys move it along.
+  function rove(el) {
+    if (!el) return;
+    for (const x of el.parentNode.children) if (x.hasAttribute('tabindex')) x.tabIndex = x === el ? 0 : -1;
+    el.focus({ preventScroll: true });
   }
   const esc = s => String(s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
 
@@ -4996,11 +5039,21 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   function applyLayout() {
     order().forEach((id, i) => { const c = cardOf(id); if (grid.children[i] !== c) grid.insertBefore(c, grid.children[i] ?? null); c.hidden = !cardOn(id); });
+    for (const box of $('pick-list').querySelectorAll('input')) box.checked = cardOn(box.dataset.chart);
     if (dashActive && lastData && !feedOffline) renderCards(lastData.d, lastData.writes);
     drawAll();
   }
-  for (const [id, title] of CHARTS) cardOf(id).insertAdjacentHTML('afterbegin',
-    `<div class="cfg"><span class="grip">Drag to move</span><button type="button" data-move="-1" aria-label="Move ${title} earlier">▲</button><button type="button" data-move="1" aria-label="Move ${title} later">▼</button></div>`);
+  grid.addEventListener('keydown', e => {
+    const el = e.target, row = el.matches('[data-tip][tabindex]') ? [...el.parentNode.children].filter(x => x.matches('[data-tip][tabindex]')) : null;
+    const i = row?.indexOf(el), to = row && { ArrowDown: i + 1, ArrowRight: i + 1, ArrowUp: i - 1, ArrowLeft: i - 1, Home: 0, End: row.length - 1 }[e.key];
+    if (to == null) return;
+    e.preventDefault(); rove(row[Math.max(0, Math.min(row.length - 1, to))]);
+  });
+  for (const [id, title] of CHARTS) {
+    const card = cardOf(id);
+    card.setAttribute('role', 'group'); card.setAttribute('aria-label', title);
+    card.insertAdjacentHTML('afterbegin', `<div class="cfg"><span class="grip">Drag to move</span><button type="button" data-move="-1" aria-label="Move ${title} earlier">▲</button><button type="button" data-move="1" aria-label="Move ${title} later">▼</button></div>`);
+  }
 
   // Config mode (the picker open): a chart moves by dragging its strip (any pointer, touch included) or with its arrow buttons.
   let drag = null;

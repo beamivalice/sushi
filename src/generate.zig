@@ -1298,10 +1298,11 @@ pub const Generator = struct {
         return switch (self.specMode()) {
             .none => .{},
             .dspark => .{ .rounds = self.dspark_stats.rounds, .drafted = self.dspark_stats.drafted, .accepted = self.dspark_stats.accepted, .plain = self.dspark_stats.plain },
+            // A prompt-lookup round is a verify forward too; `[spec-stats]` prints it apart, as `lookup=`.
             .mtp => .{
-                .rounds = self.mtp_attempted,
-                .drafted = spec_stats.proposed(self.mtp_drafted_tokens, self.mtp_attempted, self.mtp_depth),
-                .accepted = self.mtp_accepted_tokens,
+                .rounds = self.mtp_attempted + self.mtp_lookup_rounds,
+                .drafted = self.mtpHeadDrafted() + self.mtp_lookup_drafted,
+                .accepted = self.mtp_accepted_tokens + self.mtp_lookup_accepted,
                 .plain = self.mtp_planner_plain_ticks,
             },
             .dflash => .{
@@ -1310,6 +1311,10 @@ pub const Generator = struct {
                 .accepted = self.dflash_accepted_tokens,
             },
         };
+    }
+
+    fn mtpHeadDrafted(self: *const Generator) u64 {
+        return spec_stats.proposed(self.mtp_drafted_tokens, self.mtp_attempted, self.mtp_depth);
     }
 
     /// Rounds by verifier rows, for the modes that keep it (DSpark).
@@ -1356,7 +1361,7 @@ pub const Generator = struct {
                 @as(f64, @floatFromInt(@max(self.mtp_attempted, 1)));
             // Depth varies per round under the EV controller — the honest
             // denominator is the DRAFTED count, not attempts x cap.
-            const drafts_proposed = self.specTotals().drafted;
+            const drafts_proposed = self.mtpHeadDrafted();
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
@@ -5378,6 +5383,28 @@ test "batched MTP state includes the last row activated by round begin" {
         try testing.expectEqual(meta, state.meta());
     }
     try testing.expect(xfm.qwen4_mtp_owner == null);
+}
+
+test "specTotals: the prompt-lookup rounds of an MTP request count beside its head rounds" {
+    var g: Generator = undefined;
+    g.dspark = false;
+    g.dflash = null;
+    g.mtp = .{ .qwen4 = undefined };
+    g.mtp_depth = 3;
+    g.mtp_attempted = 0;
+    g.mtp_drafted_tokens = 0;
+    g.mtp_accepted_tokens = 0;
+    g.mtp_planner_plain_ticks = 0;
+    g.mtp_lookup_rounds = 2;
+    g.mtp_lookup_drafted = 16;
+    g.mtp_lookup_accepted = 11;
+    try testing.expectEqual(Generator.SpecMode.mtp, g.specMode());
+    try testing.expectEqual(spec_stats.Totals{ .rounds = 2, .drafted = 16, .accepted = 11 }, g.specTotals());
+    g.mtp_attempted = 5;
+    g.mtp_drafted_tokens = 12;
+    g.mtp_accepted_tokens = 7;
+    g.mtp_planner_plain_ticks = 4;
+    try testing.expectEqual(spec_stats.Totals{ .rounds = 7, .drafted = 28, .accepted = 18, .plain = 4 }, g.specTotals());
 }
 
 pub fn installLogitBias(io: std.Io, xfm: *Transformer, tok: *const Tokenizer) !void {

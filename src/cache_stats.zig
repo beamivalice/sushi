@@ -12,10 +12,10 @@ const tier_count = tier_names.len;
 pub const Snapshot = struct {
     /// Requests whose restored prefix came from the tier.
     hits: [tier_count]u64 = @splat(0),
-    /// Entries a tier dropped to stay inside its budget or entry cap.
+    /// Entries a tier dropped for room: its budget, its entry cap, or a prefill being admitted.
     evictions: [tier_count]u64 = @splat(0),
     evicted_bytes: [tier_count]u64 = @splat(0),
-    /// Bytes the hot tier holds now.
+    /// Bytes the hot tier of every ready model holds now.
     hot_bytes: u64 = 0,
 };
 
@@ -54,14 +54,14 @@ pub var process: Stats = .{};
 pub fn writePrometheus(snap: Snapshot, w: *std.Io.Writer) !void {
     inline for (.{
         .{ "sushi:prefix_cache_tier_hits_total", "Requests whose restored prompt prefix came from the tier (hot = memory or the live state)", "hits" },
-        .{ "sushi:prefix_cache_evictions_total", "Entries the tier dropped to stay inside its budget or entry cap", "evictions" },
-        .{ "sushi:prefix_cache_evicted_bytes_total", "Bytes of the entries the tier dropped to stay inside its budget", "evicted_bytes" },
+        .{ "sushi:prefix_cache_evictions_total", "Entries the tier dropped for room (its budget, its entry cap, a prefill being admitted)", "evictions" },
+        .{ "sushi:prefix_cache_evicted_bytes_total", "Bytes of the entries the tier dropped for room", "evicted_bytes" },
     }) |m| {
         try w.print("# HELP {s} {s}\n# TYPE {s} counter\n", .{ m[0], m[1], m[0] });
         inline for (tier_names, 0..) |name, i| try w.print("{s}{{tier=\"{s}\"}} {d}\n", .{ m[0], name, @field(snap, m[2])[i] });
         try w.writeAll("\n");
     }
-    try w.print("# HELP sushi:prefix_cache_hot_bytes Bytes the in-memory prefix cache holds now\n# TYPE sushi:prefix_cache_hot_bytes gauge\nsushi:prefix_cache_hot_bytes {d}\n\n", .{snap.hot_bytes});
+    try w.print("# HELP sushi:prefix_cache_hot_bytes Bytes the in-memory prefix caches of every ready model hold now\n# TYPE sushi:prefix_cache_hot_bytes gauge\nsushi:prefix_cache_hot_bytes {d}\n\n", .{snap.hot_bytes});
 }
 
 /// `"prefix_cache_tiers":{...}` as one member of the `/metrics.json` object.
