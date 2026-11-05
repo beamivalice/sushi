@@ -571,6 +571,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 #dashPanel [data-config] .cfg { display: flex; align-items: center; gap: 2px; margin: -4px 0 var(--s2); color: var(--text-2); font-size: var(--fs-sm); }
 #dashPanel .cfg .grip { flex: 1; min-height: 28px; display: flex; align-items: center; cursor: grab; touch-action: none; user-select: none; }
 #dashPanel .cfg button { width: 24px; height: 24px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text); cursor: pointer; line-height: 1; }
+#dashPanel .cfg button[aria-disabled="true"] { opacity: .35; cursor: default; }
 #dashPanel [data-config] .chart { outline: 1px dashed var(--border-strong); outline-offset: -1px; }
 #dashPanel .chart.dragging { opacity: .4; }
 #dashPanel .chart.over { outline: 2px solid var(--focus); }
@@ -5040,6 +5041,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function applyLayout() {
     order().forEach((id, i) => { const c = cardOf(id); if (grid.children[i] !== c) grid.insertBefore(c, grid.children[i] ?? null); c.hidden = !cardOn(id); });
     for (const box of $('pick-list').querySelectorAll('input')) box.checked = cardOn(box.dataset.chart);
+    markEnds();
     if (dashActive && lastData && !feedOffline) renderCards(lastData.d, lastData.writes);
     drawAll();
   }
@@ -5057,7 +5059,15 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   // Config mode (the picker open): a chart moves by dragging its strip (any pointer, touch included) or with its arrow buttons.
   let drag = null;
-  const saveOrder = () => { keep(ALL.filter(id => !cardOn(id))); if (!$('picker').hidden) buildPicker(); };
+  // The arrows at either end of the shown order have nowhere to go; aria-disabled keeps the focus where it is.
+  function markEnds() {
+    const shown = [...grid.children].filter(c => !c.hidden);
+    for (const c of grid.children) for (const b of c.querySelectorAll('[data-move]')) {
+      const at = shown.indexOf(c), edge = at < 0 || at + +b.dataset.move < 0 || at + +b.dataset.move >= shown.length;
+      if (edge) b.setAttribute('aria-disabled', 'true'); else b.removeAttribute('aria-disabled');
+    }
+  }
+  const saveOrder = () => { keep(ALL.filter(id => !cardOn(id))); markEnds(); if (!$('picker').hidden) buildPicker(); };
   const cardAt = (x, y) => { const c = document.elementFromPoint(x, y)?.closest('.chart'); return c?.parentNode === grid && !c.hidden ? c : null; };
   grid.addEventListener('pointerdown', e => {
     const grip = e.target.closest('.grip');
@@ -5101,13 +5111,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     keep([...off]); applyLayout();
   });
   function setConfig(open) {
+    if (!open && drag) { drag.card.classList.remove('dragging'); drag.over?.classList.remove('over'); drag = null; }
     $('picker').hidden = !open; $('charts-btn').setAttribute('aria-expanded', String(open)); grid.toggleAttribute('data-config', open);
     if (open) { buildPicker(); $('picker').scrollIntoView({ block: 'nearest' }); $('pick-list').querySelector('input')?.focus({ preventScroll: true }); } else $('charts-btn').focus();
   }
   $('charts-btn').onclick = () => setConfig($('picker').hidden);
   $('pick-done').onclick = () => setConfig(false);
   $('pick-reset').onclick = () => { layout = null; store.set('charts', ''); applyLayout(); buildPicker(); };
-  $('picker').addEventListener('keydown', e => { if (e.key === 'Escape') setConfig(false); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !e.defaultPrevented && !$('picker').hidden) setConfig(false); });
   applyLayout();
 
 

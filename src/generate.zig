@@ -980,7 +980,7 @@ pub const Generator = struct {
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Whether a DFlash2 round pays against a plain one-row tick for this request, and the plain ticks it ran.
     glm_gate: spec_cost_gate.Gate = .{},
-    glm_plain: struct { ticks: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
+    dflash_plain: struct { ticks: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, capped by the machine's verify lanes).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
@@ -1309,6 +1309,7 @@ pub const Generator = struct {
                 .rounds = self.dflash_attempted,
                 .drafted = if (self.glm_dflash_native) self.glm_round.drafted else spec_stats.proposed(self.dflash_drafts_verified, self.dflash_attempted, if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0),
                 .accepted = self.dflash_accepted_tokens,
+                .plain = self.dflash_plain.ticks,
             },
         };
     }
@@ -1451,7 +1452,7 @@ pub const Generator = struct {
             if (self.glm_dflash_native) {
                 const rounds: f64 = @floatFromInt(self.dflash_attempted);
                 const r = self.glm_round;
-                const plain_ticks: f64 = @floatFromInt(@max(self.glm_plain.ticks, 1));
+                const plain_ticks: f64 = @floatFromInt(@max(self.dflash_plain.ticks, 1));
                 log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2} lookup={d}/{d} plain={d} serial_ms={d:.2} plain_ms verify={d:.2} replay={d:.2} commit={d:.2}\n", .{
                     @as(f64, @floatFromInt(r.draft_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.verify_ns)) / rounds / 1e6,
@@ -1459,11 +1460,11 @@ pub const Generator = struct {
                     @as(f64, @floatFromInt(r.commit_ns)) / rounds / 1e6,
                     self.glm_lookup.rounds,
                     self.glm_lookup.landed,
-                    self.glm_plain.ticks,
+                    self.dflash_plain.ticks,
                     self.glm_gate.serial_ms orelse 0.0,
-                    @as(f64, @floatFromInt(self.glm_plain.verify_ns)) / plain_ticks / 1e6,
-                    @as(f64, @floatFromInt(self.glm_plain.replay_ns)) / plain_ticks / 1e6,
-                    @as(f64, @floatFromInt(self.glm_plain.commit_ns)) / plain_ticks / 1e6,
+                    @as(f64, @floatFromInt(self.dflash_plain.verify_ns)) / plain_ticks / 1e6,
+                    @as(f64, @floatFromInt(self.dflash_plain.replay_ns)) / plain_ticks / 1e6,
+                    @as(f64, @floatFromInt(self.dflash_plain.commit_ns)) / plain_ticks / 1e6,
                 });
             }
             return;
@@ -1645,6 +1646,9 @@ pub const Generator = struct {
         /// prefill saturates the GPU while both tiles read 0 / "—". The
         /// scheduler resets it to 0 when the prefill ends.
         prefill_progress: ?*std.atomic.Value(u64) = null,
+        /// Prompt tokens this prefill has forwarded itself (the restored prefix excluded), kept current per chunk so a
+        /// prefill that fails or is cancelled still reports them.
+        prefill_computed: ?*u32 = null,
         /// Total tokens this prefill will forward (post-cache tail, same scale
         /// as `prefill_progress`), published once; null on the bypass engines.
         prefill_expected: ?*std.atomic.Value(u64) = null,
@@ -2226,6 +2230,7 @@ pub const Generator = struct {
                 // Publish progress once per chunk — same cadence discipline as
                 // the live-token gauge (once per decode tick), never per token.
                 if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
+                if (options.prefill_computed) |c| c.* = @intCast(pos);
                 // Persist this chunk now: the KV bytes for [0, pos) are final.
                 if (options.write_through_hook) |wt| {
                     wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
@@ -5405,6 +5410,21 @@ test "specTotals: the prompt-lookup rounds of an MTP request count beside its he
     g.mtp_accepted_tokens = 7;
     g.mtp_planner_plain_ticks = 4;
     try testing.expectEqual(spec_stats.Totals{ .rounds = 7, .drafted = 28, .accepted = 18, .plain = 4 }, g.specTotals());
+}
+
+test "specTotals: a DFlash2 request reports the ticks it ran without a draft as plain rounds" {
+    var g: Generator = undefined;
+    var model: DflashModel = undefined;
+    g.dspark = false;
+    g.mtp = null;
+    g.dflash = &model;
+    g.glm_dflash_native = true;
+    g.dflash_attempted = 6;
+    g.dflash_accepted_tokens = 9;
+    g.glm_round = .{ .drafted = 24 };
+    g.dflash_plain = .{ .ticks = 3 };
+    try testing.expectEqual(Generator.SpecMode.dflash, g.specMode());
+    try testing.expectEqual(spec_stats.Totals{ .rounds = 6, .drafted = 24, .accepted = 9, .plain = 3 }, g.specTotals());
 }
 
 pub fn installLogitBias(io: std.Io, xfm: *Transformer, tok: *const Tokenizer) !void {

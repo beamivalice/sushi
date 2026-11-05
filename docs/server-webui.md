@@ -79,3 +79,13 @@ and the page tooltip share them.
   Thinking budget fields; a model's facts (on disk, linked, in memory, max context, sees images, streams experts);
   the Available list's "Recommended for this Mac" badge (tier, RAM and download size); the Settings cache table headings.
 - Native `title` stays where a full value rides it (a cut-off model name, a path, a server message) and on icon buttons.
+
+## Dashboard config mode
+
+- The Charts button opens the picker and puts a strip on every chart: drag it, or use its ▲/▼. The arrow at either end
+  of the shown order (first chart's ▲, last chart's ▼) is `aria-disabled` and drawn faded, not removed, so the focus
+  stays on it; `markEnds` re-reads the ends after every move, tick and Reset.
+- Escape anywhere on the page while it is open closes it and returns the focus to the Charts button, unless a key
+  handler already took the Escape (an open tip closes first). Closing it, by Escape, Done or the button, ends a drag in
+  progress: the marks go and the release drops nothing.
+- Guard: `chartPicker` in `tests/test_webui_dashboard.cjs`.

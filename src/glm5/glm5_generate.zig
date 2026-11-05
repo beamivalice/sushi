@@ -411,10 +411,10 @@ pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *co
         self.glm_round.replay_ns += round.replay_ns;
         self.glm_round.commit_ns += round.commit_ns;
     } else if (!lookup) {
-        self.glm_plain.ticks += 1;
-        self.glm_plain.verify_ns += round.verify_ns;
-        self.glm_plain.replay_ns += round.replay_ns;
-        self.glm_plain.commit_ns += round.commit_ns;
+        self.dflash_plain.ticks += 1;
+        self.dflash_plain.verify_ns += round.verify_ns;
+        self.dflash_plain.replay_ns += round.replay_ns;
+        self.dflash_plain.commit_ns += round.commit_ns;
     }
     if (round.stopped) {
         self.done = true;

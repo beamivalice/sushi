@@ -234,11 +234,14 @@ fn clampU32(n: u64) u32 {
 }
 
 fn logFinished(m: *metrics_mod.Metrics, slot: anytype, end: request_log.End) void {
+    // `prompt_tokens` is set when the prefill completes. A request that ended inside it forwarded
+    // `prefill_computed` tokens and kept no restore.
+    const prefilled = slot.prompt_tokens > 0;
     var e: request_log.Entry = .{
         .request_id = slot.request_id,
         .t_ms = io_util.nowMs(slot.io),
-        .prompt_tokens = slot.prompt_tokens -| slot.cached_tokens,
-        .cached_tokens = slot.cached_tokens,
+        .prompt_tokens = if (prefilled) slot.prompt_tokens -| slot.cached_tokens else slot.prefill_computed,
+        .cached_tokens = if (prefilled) slot.cached_tokens else 0,
         .generated_tokens = slot.completion_tokens,
         .prefill_ns = slot.prefill_ns,
         .decode_ns = slot.decode_ns,
@@ -288,11 +291,20 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
 }
 
 /// Logs `[spec-stats]` and keeps what speculation did: on the slot for its request-log entry, and in the server's totals.
-pub fn finishSpec(slot: *Slot, g: *const generate_mod.Generator) void {
+pub fn finishSpec(slot: anytype, g: anytype) void {
+    if (slot.spec_recorded) return;
+    slot.spec_recorded = true;
     slot.spec_mode = g.specMode();
     slot.spec_totals = g.specTotals();
     g.logSpecStats();
     spec_stats.process.record(slot.spec_mode, slot.spec_totals, g.specRows());
+}
+
+/// A slot that errored in a tick never reaches `finishSlot`; the cleanup drain keeps its speculation here, before the
+/// request-log row reads it.
+pub fn finishSpecAtCleanup(slot: anytype) void {
+    if (slot.error_code == null) return;
+    if (slot.legacy_gen) |*g| finishSpec(slot, g);
 }
 
 pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
@@ -389,6 +401,25 @@ test "a finish over a latched MLX failure ends the request as an ERROR, never a 
     try testing.expect(!Slot.errorNameIsMemory(shape.errored.?));
 }
 
+/// The Generator surface `finishSpec` reads.
+const SpecGenStub = struct {
+    totals: spec_stats.Totals,
+    logged: u32 = 0,
+
+    fn specMode(_: *const SpecGenStub) spec_stats.Mode {
+        return .mtp;
+    }
+    fn specTotals(self: *const SpecGenStub) spec_stats.Totals {
+        return self.totals;
+    }
+    fn specRows(_: *const SpecGenStub) []const u32 {
+        return &.{};
+    }
+    fn logSpecStats(self: *SpecGenStub) void {
+        self.logged += 1;
+    }
+};
+
 const OutcomeStub = struct {
     io: std.Io = testing.io,
     request_id: u64 = 7,
@@ -407,6 +438,9 @@ const OutcomeStub = struct {
     cached_tokens: u32 = 0,
     spec_mode: spec_stats.Mode = .none,
     spec_totals: spec_stats.Totals = .{},
+    spec_recorded: bool = false,
+    legacy_gen: ?SpecGenStub = null,
+    prefill_computed: u32 = 0,
 
     /// `finishSlot` on the inference thread: records, then publishes the terminator.
     fn finish(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {
@@ -578,6 +612,71 @@ test "request log: a finished request is logged once with its split of computed 
     try testing.expectEqual(@as(i64, 10), row.get("generated_tokens").?.integer);
     try testing.expectEqual(@as(f64, 0.004), row.get("prefill_seconds").?.float);
     try testing.expectEqual(@as(f64, 0.02), row.get("decode_seconds").?.float);
+}
+
+test "spec totals: a slot that errors mid-decode keeps its rounds once, in the totals and in its log row" {
+    var m = metrics_mod.Metrics.init();
+    const before = spec_stats.process.snapshot().modes[1];
+    var s = OutcomeStub{ .legacy_gen = .{ .totals = .{ .rounds = 5, .drafted = 15, .accepted = 11 } } };
+    s.fail("MlxFailure");
+    s.complete();
+    finishSpecAtCleanup(&s);
+    recordSlotCleanup(&m, &s);
+    finishSpecAtCleanup(&s);
+    const after = spec_stats.process.snapshot().modes[1];
+    try testing.expectEqual(before.requests + 1, after.requests);
+    try testing.expectEqual(before.rounds + 5, after.rounds);
+    try testing.expectEqual(@as(u32, 1), s.legacy_gen.?.logged);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{");
+    try m.finished.writeSince(testing.io, 0, &out.writer);
+    try out.writer.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const spec = parsed.value.object.get("requests").?.array.items[0].object.get("spec").?.object;
+    try testing.expectEqual(@as(i64, 5), spec.get("rounds").?.integer);
+}
+
+test "spec totals: a slot finishSlot already settled, or one that did not error, is not counted again by the drain" {
+    const before = spec_stats.process.snapshot().modes[1];
+    var settled = OutcomeStub{ .legacy_gen = .{ .totals = .{ .rounds = 4, .drafted = 12, .accepted = 8 } } };
+    finishSpec(&settled, &settled.legacy_gen.?);
+    settled.fail("OutOfMemory");
+    finishSpecAtCleanup(&settled);
+    var cancelled = OutcomeStub{ .legacy_gen = .{ .totals = .{ .rounds = 9, .drafted = 9, .accepted = 9 } } };
+    cancelled.complete();
+    finishSpecAtCleanup(&cancelled);
+    const after = spec_stats.process.snapshot().modes[1];
+    try testing.expectEqual(before.requests + 1, after.requests);
+    try testing.expectEqual(before.rounds + 4, after.rounds);
+    try testing.expectEqual(@as(u32, 1), settled.legacy_gen.?.logged);
+    try testing.expectEqual(@as(u32, 0), cancelled.legacy_gen.?.logged);
+}
+
+test "request log: a request that ends during prefill logs the tokens it forwarded, none restored" {
+    var m = metrics_mod.Metrics.init();
+    var cancelled = OutcomeStub{ .request_id = 1, .prompt_tokens = 0, .cached_tokens = 700, .prefill_computed = 4096 };
+    cancelled.finish(&m, "cancelled");
+    var failed = OutcomeStub{ .request_id = 2, .prompt_tokens = 0, .prefill_computed = 8192 };
+    failed.fail("MlxFailure");
+    failed.complete();
+    recordSlotCleanup(&m, &failed);
+    var refused = OutcomeStub{ .request_id = 3, .prompt_tokens = 0 };
+    refused.fail("PrefillDoesNotFit");
+    recordSlotCleanup(&m, &refused);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{");
+    try m.finished.writeSince(testing.io, 0, &out.writer);
+    try out.writer.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("requests").?.array.items;
+    for (rows, [_][2]i64{ .{ 4096, 0 }, .{ 8192, 0 }, .{ 0, 0 } }) |row, want| {
+        try testing.expectEqual(want[0], row.object.get("prompt_tokens").?.integer);
+        try testing.expectEqual(want[1], row.object.get("cached_tokens").?.integer);
+    }
 }
 
 test "request log: a finished request carries what speculation did for it" {

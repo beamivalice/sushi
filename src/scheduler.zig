@@ -439,6 +439,12 @@ pub const Slot = struct {
     /// What speculation drafted, set where `logSpecStats` reports it.
     spec_mode: Generator.SpecMode = .none,
     spec_totals: spec_stats.Totals = .{},
+    /// The tier the prefix lookup restored from, until the prefill completes and counts the hit.
+    restore_tier: ?cache_stats.Tier = null,
+    /// Prompt tokens the prefill forwarded itself (the restored prefix excluded), for a request that ends inside it.
+    prefill_computed: u32 = 0,
+    /// `finishSpec` ran: `[spec-stats]` is logged and the server's totals added once.
+    spec_recorded: bool = false,
     /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
     /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
     /// that received the tokens; subtracted from this slot's `prefill_ns` so
@@ -2494,6 +2500,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
                 }
             }
+            slot_outcome.finishSpecAtCleanup(s);
             slot_outcome.recordSlotCleanup(sch.metrics, s);
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
@@ -2654,7 +2661,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                                 slot.legacy_gen = null;
                             }
                             slot.moe_seq_offset = 0;
-                            slot.cached_tokens = 0;
+                            discardRestore(slot);
+                            slot.prefill_computed = 0;
                             slot.skip_prefix_cache = true;
                             log.warn("[hot-cache] restored entry failed the QSA history check — dropped, cold prefill\n", .{});
                             qsa_gap_retried = true;
@@ -2729,6 +2737,20 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     }
     flushLiveStates(sch, "shutdown");
     flushImatrixCaptures(sch);
+}
+
+/// Counts the tier hit of the restore a request keeps, once its prefill completes: a restore a retry or an abort throws
+/// away is no hit, so hits never exceed the requests that logged `cached_tokens`.
+fn recordKeptRestore(slot: anytype) void {
+    const tier = slot.restore_tier orelse return;
+    slot.restore_tier = null;
+    cache_stats.process.recordHit(tier);
+}
+
+/// The cold re-prefill of a request whose restore failed its check: nothing it restored stays.
+fn discardRestore(slot: anytype) void {
+    slot.restore_tier = null;
+    slot.cached_tokens = 0;
 }
 
 pub fn postPrefillTerminal(slot: *Slot) bool {
@@ -3614,7 +3636,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
             slot.restore_ns = lookup_sw.read();
-            if (lookup.matched > 0) cache_stats.process.recordHit(hc.lastRestoredTier());
             var restore_line_buf: [192]u8 = undefined;
             if (prefix_cache_mod.restoreLogLine(
                 &restore_line_buf,
@@ -3629,6 +3650,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 prefill_tokens = slot.full_prompt[hot_matched..];
                 hot_checked_out = lookup.ownsRestoredRows();
                 slot.restored_entry = lookup.entry_id;
+                slot.restore_tier = hc.lastRestoredTier();
             }
             // The entry this request restored off may be evicted before it commits, so the fork
             // keeps its own restore point; a full reuse is covered by the prompt end.
@@ -3910,6 +3932,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // construction otherwise) so the cancelled-prefill commit can
             // restore hybrids too.
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
+            .prefill_computed = &slot.prefill_computed,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
             .interleave_hook = if (prefillInterleaveEnabled())
@@ -3961,6 +3984,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // reports the full prompt length: gen.prompt_tokens (= prefill_tokens.len)
     // covers the un-cached tail, and `hot_matched` covers the restored prefix.
     slot.cached_tokens = hot_matched;
+    recordKeptRestore(slot);
     slot.prompt_tokens = gen.prompt_tokens + slot.cached_tokens;
     slot.state = .decoding;
     if (hot_matched == 0) {
@@ -6256,4 +6280,21 @@ test "the hot-tier bytes gauge sums the RAM tier of every ready model" {
     sch.registry = reg;
     sch.io = testing.io;
     try testing.expectEqual(@as(u64, 120), readyHotCacheBytes(&sch));
+}
+
+test "tier hits: a restore a retry throws away is not counted, the one a prefill keeps is, once" {
+    const Stub = struct { restore_tier: ?cache_stats.Tier = null, cached_tokens: u32 = 0 };
+    const before = cache_stats.process.snapshot();
+    var retried = Stub{ .restore_tier = .ssd, .cached_tokens = 900 };
+    discardRestore(&retried);
+    recordKeptRestore(&retried);
+    try testing.expectEqual(@as(u32, 0), retried.cached_tokens);
+    var kept = Stub{ .restore_tier = .ssd, .cached_tokens = 900 };
+    recordKeptRestore(&kept);
+    recordKeptRestore(&kept);
+    var cold = Stub{};
+    recordKeptRestore(&cold);
+    const after = cache_stats.process.snapshot();
+    try testing.expectEqual(before.hits[0], after.hits[0]);
+    try testing.expectEqual(before.hits[1] + 1, after.hits[1]);
 }

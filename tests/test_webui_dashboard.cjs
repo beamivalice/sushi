@@ -588,6 +588,55 @@ async function chartPicker(browser) {
     await context.close();
   }
   {
+    // The arrows at the ends of the order are disabled, Escape from anywhere in config mode closes it, and closing it drops a drag.
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    await page.click('#dashChartsBtn');
+    const ends = () => page.evaluate(() => {
+      const cards = [...document.querySelectorAll('#dashCharts .chart:not([hidden])')];
+      const state = (c, dir) => { const b = c.querySelector(`[data-move="${dir}"]`); return { aria: b.getAttribute('aria-disabled'), opacity: getComputedStyle(b).opacity }; };
+      return { first: state(cards[0], -1), second: state(cards[1], -1), last: state(cards.at(-1), 1), beforeLast: state(cards.at(-2), 1), firstDown: state(cards[0], 1) };
+    });
+    let e = await ends();
+    assert.equal(e.first.aria, 'true', 'the first chart cannot move earlier');
+    assert.ok(Number(e.first.opacity) < 1, 'and its arrow reads as disabled');
+    assert.equal(e.last.aria, 'true', 'the last chart cannot move later');
+    assert.equal(e.second.aria, null, 'a chart with room before it keeps its arrow');
+    assert.equal(e.beforeLast.aria, null);
+    assert.equal(e.firstDown.aria, null);
+    const order = () => page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => c.dataset.chart));
+    const was = await order();
+    await page.click(`#dashCharts .chart[data-chart="${was[0]}"] [data-move="-1"]`, { force: true });
+    assert.deepEqual(await order(), was, 'a disabled arrow moves nothing');
+    await page.click(`#dashCharts .chart[data-chart="${was[1]}"] [data-move="-1"]`);
+    e = await ends();
+    assert.equal(e.first.aria, 'true', 'and the new first chart is the disabled one');
+    assert.equal(e.second.aria, null, 'the arrow of the chart that moved down is live again');
+    await page.uncheck(`#dashPickList input[data-chart="${was[0]}"]`);
+    assert.equal((await ends()).second.aria, null, 'hiding a chart re-reads the ends');
+    await page.keyboard.press('Escape');
+    await page.click('#dashChartsBtn');
+    await page.focus('#dashCharts .chart[data-chart="memory"] [data-move="1"]');
+    await page.keyboard.press('Escape');
+    assert.equal(await page.isVisible('#dashPicker'), false, 'Escape from a chart arrow closes config mode');
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'dashChartsBtn', 'and returns the focus to the Charts button');
+    await page.click('#dashChartsBtn');
+    const before = await order();
+    await page.locator(`#dashCharts .chart[data-chart="${before[1]}"]`).scrollIntoViewIfNeeded();
+    const point = (id) => page.evaluate((i) => { const r = document.querySelector(`#dashCharts .chart[data-chart="${i}"] .grip`).getBoundingClientRect(); return { x: r.left + 20, y: r.top + r.height / 2 }; }, id);
+    const from = await point(before[0]), to = await point(before[1]);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps: 6 });
+    assert.equal(await page.evaluate(() => document.querySelectorAll('#dashCharts .chart.over').length), 1, 'the target is marked mid-drag');
+    await page.keyboard.press('Escape');
+    assert.equal(await page.evaluate(() => document.querySelectorAll('#dashCharts .chart.dragging, #dashCharts .chart.over').length), 0, 'closing the panel clears the drag marks');
+    await page.mouse.up();
+    assert.deepEqual(await order(), before, 'and the release drops nothing');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
     // The picker follows the theme and draws no motion when reduced.
     const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', contextOptions: { reducedMotion: 'reduce' } });
     await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
