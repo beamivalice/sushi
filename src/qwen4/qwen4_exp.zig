@@ -467,6 +467,12 @@ pub const NgramTable = struct {
         });
     }
 
+    /// The calibration reads the table before the warm, so a pool it chose on a cold table stops paying once the warm
+    /// has read every byte: on a resident table the serial walk wins at prefill width.
+    fn poolPreferred(self: *const NgramTable) bool {
+        return self.prefer_pool and self.warm_bytes.load(.acquire) < self.map.len;
+    }
+
     /// Sum a byte from each of the row's regions through the mmap, so the read cannot be
     /// elided and a missing page is faulted in. The regions mirror `preadSite`.
     fn touchRow(self: *const NgramTable, r: u64) u64 {
@@ -619,12 +625,12 @@ pub const NgramTable = struct {
         const need: usize = self.rowBytes();
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         const oversized_bf16 = self.pastResidencyCap();
-        const prefer_pool = oversized_bf16 or self.prefer_pool;
+        const prefer_pool = oversized_bf16 or self.poolPreferred();
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
         // Announce the arm that actually runs, not the lever that permits it.
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
         const whole_chunk = wide and oversized_bf16 and self.bits == 16;
-        if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool));
+        if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool, self.prefer_pool));
         if (pooled and whole_chunk) {
             if (try self.pool.?.runBf16(self, row_ids, out)) return;
         } else if (pooled) {
@@ -655,11 +661,11 @@ pub const NgramTable = struct {
         const need = self.rowBytes();
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         const oversized = self.map.len > ngramCacheLimit();
-        const prefer_pool = oversized or self.prefer_pool;
+        const prefer_pool = oversized or self.poolPreferred();
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
         const whole_chunk = wide and oversized;
-        if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool));
+        if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool, self.prefer_pool));
         if (pooled and whole_chunk) {
             if (try self.pool.?.runBf16Into(self, row_ids, .{ .words = out }, allocator)) return;
         } else if (pooled) {
@@ -959,11 +965,12 @@ fn plePrefillPrefetchEnabled(kv_len: u64, prefer_pool: bool) bool {
 }
 
 /// Why a wide gather took its arm, for the engagement line.
-fn prefillGatherWhy(wanted: bool, pooled: bool, prefer_pool: bool) []const u8 {
+fn prefillGatherWhy(wanted: bool, pooled: bool, prefer_pool: bool, measured_pool: bool) []const u8 {
     if (wanted and !pooled) return "no pool";
     if (plePrefillPrefetchMode() != .kv_gated) return "QWEN4_PLE_PREFETCH_PREFILL";
     if (prefer_pool) return "pool measured faster";
-    return if (wanted) "kv past the gate" else "serial measured faster, kv under the gate";
+    if (wanted) return "kv past the gate";
+    return if (measured_pool) "the warm made the table resident, kv under the gate" else "serial measured faster, kv under the gate";
 }
 
 pub fn bf16ToF32(u: u16) f32 {
@@ -1437,6 +1444,66 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     defer test_ngram_cache_limit = null;
     try t.gatherChecked(ids, got, 0);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref), std.mem.sliceAsBytes(got));
+}
+
+test "ngram prefill gather: a pool chosen on a cold table yields to the serial walk once the warm has read the table" {
+    // 4-bit, group 32, dim 32: 256 rows, 4 pool batches.
+    const ROWS: usize = 256;
+    const HDR: usize = 512;
+    const W: usize = ROWS * 16;
+    const SB: usize = ROWS * 2;
+    const buf = try testing.allocator.alloc(u8, 8 + HDR + W + 2 * SB);
+    defer testing.allocator.free(buf);
+    const header = "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+        "\"weight\":{\"dtype\":\"U32\",\"shape\":[256,4],\"data_offsets\":[0,4096]}," ++
+        "\"scales\":{\"dtype\":\"BF16\",\"shape\":[256,1],\"data_offsets\":[4096,4608]}," ++
+        "\"biases\":{\"dtype\":\"BF16\",\"shape\":[256,1],\"data_offsets\":[4608,5120]}}";
+    std.mem.writeInt(u64, buf[0..8], HDR, .little);
+    @memset(buf[8 .. 8 + HDR], ' ');
+    @memcpy(buf[8..][0..header.len], header);
+    for (buf[8 + HDR ..], 0..) |*b, i| b.* = @truncate(i *% 29 +% 3);
+
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = buf });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]});
+
+    warm_override = true;
+    defer warm_override = null;
+    ple_prefill_min_kv_override = 65_536;
+    defer ple_prefill_min_kv_override = null;
+    var t = try NgramTable.open(path);
+    defer t.close();
+    const pool = t.pool orelse return error.SkipZigTest;
+    const ids = try testing.allocator.alloc(i64, ROWS);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*r, i| r.* = @intCast((i *% 37) % ROWS);
+    const out = try testing.allocator.alloc(f32, ROWS * t.dim);
+    defer testing.allocator.free(out);
+
+    // The calibration read the table cold and chose the pool: below the kv gate the gather rides it.
+    t.prefer_pool = true;
+    const cold = pool.runs.load(.monotonic);
+    try t.gatherChecked(ids, out, 8192);
+    try testing.expectEqual(cold + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
+
+    t.startWarm();
+    var spins: u32 = 0;
+    while (t.warm_bytes.load(.acquire) < t.map.len) : (spins += 1) {
+        if (spins > 10_000) return error.WarmNeverFinished;
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    const warm = pool.runs.load(.monotonic);
+    try t.gatherChecked(ids, out, 8192);
+    try testing.expectEqual(warm, pool.runs.load(.monotonic));
+    // The kv gate still pools a long context.
+    try t.gatherChecked(ids, out, 131_072);
+    try testing.expectEqual(warm + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
 }
 
 test "ngram table: a bf16 .bin gathers rows from the mmap and through the pool" {

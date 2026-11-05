@@ -432,6 +432,12 @@ per arm, NOT a quiet box (no §4b fan protocol available). `SUSHI_FORCE_GPU_FAMI
   `WARM=0` skips the pread, it does not evict. A genuinely cold 3bpw end-to-end cell is still unmeasured, and this box
   cannot produce one (49 GB of weights + 30 GB of table fits inside 128 GB, so nothing is evicted) — a 64 GB box
   would.
+- **A pool chosen on a cold table yields to the serial walk once the warm has read the whole table** (`poolPreferred`).
+  The calibration runs before the warm, so a boot whose table was out of page cache used to keep the pool for the
+  server's life. Here that cost 277 ms of PLE per 4096-row chunk against 47 ms serial, about 12% of the chunk.
+  Measured with `QWEN4_PROFILE_FWD=all` on 3eff69ed, `sushi bench --code-only --rungs 131072`, `taskpolicy -a`, GPU
+  lock, fans max. The STQ 2.75bpw (affine-8 trunk) boot read the table cold (serial 36.3 ms, pool 2.0 ms, POOLED). The
+  v2.0 boot read it warm (SERIAL). A table past the residency cap is never warmed and keeps the measured arm.
 
 <a id="qsa"></a>
 ## QSA wide verify (b89991a)
