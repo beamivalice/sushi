@@ -444,7 +444,22 @@ pub fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const
             std.mem.eql(u8, path, "/v1/slots/cancel");
     if (!guarded) return false;
     const origin = findHeaderValueCI(headers, "origin") orelse return false;
-    return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
+    // A wildcard bind has no host of its own: a page opened at any address the server answers on IS its own
+    // page, so match the Origin against the Host the client reached. A browser cannot forge Host, so a foreign
+    // page still mismatches and is refused.
+    const want = if (std.mem.eql(u8, host, "0.0.0.0")) hostHeaderHost(headers) orelse "127.0.0.1" else host;
+    return !update_mod.originMatches(origin, want, port);
+}
+
+/// The host of the request's `Host` header, its port stripped (IPv6 brackets kept); null when absent or empty.
+fn hostHeaderHost(headers: []const u8) ?[]const u8 {
+    const h = std.mem.trim(u8, findHeaderValueCI(headers, "host") orelse return null, " ");
+    if (h.len == 0) return null;
+    if (h[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, h, ']') orelse return null;
+        return h[0 .. close + 1];
+    }
+    return if (std.mem.indexOfScalar(u8, h, ':')) |colon| h[0..colon] else h;
 }
 
 /// Is `path` an endpoint this server serves at all (any method)?
@@ -1722,6 +1737,14 @@ test "cross-origin policy: a foreign Origin is refused on the state-changing rou
         .{ .method = "POST", .path = "/v1/models/rescan", .headers = "Origin: http://127.0.0.1:12345\r\n", .refused = false },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://127.0.0.1:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://192.168.1.5:12345\r\nHost: 192.168.1.5:12345\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://192.168.1.5:12345\r\nHost: 192.168.1.5\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://[::1]:12345\r\nHost: [::1]:12345\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://evil.test:12345\r\nHost: 192.168.1.5:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://192.168.1.5:12346\r\nHost: 192.168.1.5:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/unload-model", .headers = "Origin: http://192.168.1.5:12345\r\nHost: 127.0.0.1:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://192.168.1.5:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://evil.test\r\nHost: 192.168.1.5:12345\r\n", .refused = true },
         .{ .method = "POST", .path = "/v1/unload-model", .headers = "Host: x\r\n", .refused = false },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws, .refused = false },
         // The inference routes stay open to any page.
@@ -1749,6 +1772,17 @@ test "cross-origin policy: the routes answer 403 over the wire before any model 
         .{ .request = "GET /v1/responses HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nOrigin: http://evil.test\r\n\r\n", .status = "HTTP/1.1 403 " },
         .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
         .{ .request = "POST /v1/models/rescan HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 200 " },
+    }) |c| {
+        const response = try serveOneForTest(c.request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, c.status));
+    }
+    server_mod.listen_host = "0.0.0.0";
+    for ([_]Case{
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: 192.168.1.5:12345\r\nOrigin: http://192.168.1.5:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: 192.168.1.5:12345\r\nOrigin: http://evil.test:12345\r\n\r\n", .status = "HTTP/1.1 403 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: 127.0.0.1:12345\r\nOrigin: http://127.0.0.1:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nOrigin: http://192.168.1.5:12345\r\n\r\n", .status = "HTTP/1.1 403 " },
     }) |c| {
         const response = try serveOneForTest(c.request);
         defer t.allocator.free(response);
