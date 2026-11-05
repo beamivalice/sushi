@@ -4800,11 +4800,18 @@ pub const Transformer = struct {
             const fold_shared = shared != null and moeDumpDir() == null;
             const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
             if (tail_shared and moeDumpDir() == null) {
-                if (try @import("qwen4/qwen4_shared.zig").folded(self.s, expert_x, mw, inds, norm_scores, self.config.expertDecode(), routed.gate_logit)) |folded| return folded;
+                // A dense gate (the packs' bf16 [1, hidden]) has no affine bank for the fold to read: its logit comes in.
+                const dense_gate = mw.shared_expert_gate_s.?.ctx == null;
+                const made_logit = routed.gate_logit.ctx == null and dense_gate;
+                const fold_logit = if (made_logit) try self.moeSharedGateLogit(expert_x, mw) else routed.gate_logit;
+                defer if (made_logit) {
+                    _ = mlx.mlx_array_free(fold_logit);
+                };
+                if (try @import("qwen4/qwen4_shared.zig").folded(self.s, expert_x, mw, inds, norm_scores, self.config.expertDecode(), self.config.trunk_quant, fold_logit)) |folded| return folded;
                 const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
                 defer _ = mlx.mlx_array_free(down);
-                const own_logit = routed.gate_logit.ctx == null;
-                const logit = if (own_logit) try self.moeSharedGateLogit(expert_x, mw) else routed.gate_logit;
+                const own_logit = fold_logit.ctx == null;
+                const logit = if (own_logit) try self.moeSharedGateLogit(expert_x, mw) else fold_logit;
                 defer if (own_logit) {
                     _ = mlx.mlx_array_free(logit);
                 };

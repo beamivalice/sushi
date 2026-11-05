@@ -10,6 +10,7 @@ const rate_groups = @import("rate_groups.zig");
 const codebook_tables = @import("codebook_tables.zig");
 const fuse = @import("fuse.zig");
 const riders = @import("qwen_riders.zig");
+const shared_trellis = @import("shared_trellis.zig");
 const root = @import("root.zig");
 
 const Stage = enum { pair, down };
@@ -26,6 +27,7 @@ const Key = struct {
     group: c_int,
     logit_group: c_int,
     logit: bool,
+    tr: ?shared_trellis.Geo,
     layout: kernels.GemvLayout,
     dec: exl3.Decode,
     shared_first: bool,
@@ -86,7 +88,7 @@ fn stageFor(k: Key) !*const Built {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group };
+    const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group, .tr = k.tr };
     const a = try routedParts(alloc, k.stage, k.hidden, k.inter, k.topk, k.rows, k.n, k.layout, try rate_groups.headerOf(k.dec));
     const b = switch (k.stage) {
         .pair => try riders.gateUpPart(alloc, geo, k.rows, k.logit),
@@ -98,6 +100,10 @@ fn stageFor(k: Key) !*const Built {
     try name.print(alloc, "sushi_qwen_fold_{s}_{s}_w{d}", .{ @tagName(k.stage), @tagName(k.dec.codebook), k.dec.window.bits() });
     if (k.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[k.dec.table.?].digest});
     if (k.logit) try name.appendSlice(alloc, "_logit");
+    if (k.tr) |t| {
+        try name.print(alloc, "_tr_{s}_w{d}_n{d}_{d}", .{ @tagName(t.dec.codebook), t.dec.window.bits(), t.n_gu, t.n_dn });
+        if (t.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[t.dec.table.?].digest});
+    }
     try name.append(alloc, 0);
     var slot: ?mlx.mlx_fast_metal_kernel = null;
     const kernel = try kernels.getNamedKernel(&slot, @ptrCast(name.items.ptr), try fuse.insOf(alloc, a, b), try fuse.outsOf(alloc, a, b), src, head);
@@ -134,7 +140,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     if (gs[3] != us[3]) return null;
     const rate = exl3.kFromPackedDim(@intCast(gs[3])) orelse return null;
     const down_rate = exl3.kFromPackedDim(@intCast(ds[3])) orelse return null;
-    const geo = riders.geometry(sh, hidden) orelse return null;
+    const geo = riders.geometry(sh, hidden, rows) orelse return null;
     const want_logit = sh.logit != null;
     if (!want_logit) {
         const g = gate orelse return null;
@@ -157,7 +163,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     defer _ = mlx.mlx_array_free(sc);
     try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{nslots}, 1, s));
 
-    var key: Key = .{ .stage = .pair, .hidden = hidden, .inter = inter, .width = geo.width, .topk = topk, .rows = rows, .n = rate.n, .group = geo.group, .logit_group = geo.logit_group, .logit = want_logit, .layout = kernels.gemvLayout(@divExact(inter, 16)), .dec = dec, .shared_first = shared_first };
+    var key: Key = .{ .stage = .pair, .hidden = hidden, .inter = inter, .width = geo.width, .topk = topk, .rows = rows, .n = rate.n, .group = geo.group, .logit_group = geo.logit_group, .logit = want_logit, .tr = geo.tr, .layout = kernels.gemvLayout(@divExact(inter, 16)), .dec = dec, .shared_first = shared_first };
     const pair = try stageFor(key);
     var buf: [11]mlx.mlx_array = undefined;
     const rider_in = riders.gateUpInputs(sh, x2, &buf);
@@ -181,7 +187,12 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     key.n = down_rate.n;
     key.layout = kernels.gemvLayout(@divExact(hidden, 16));
     const down_stage = try stageFor(key);
-    const down_ov = try kernels.applyOuts(s, down_stage.kernel, &.{ ig, iu, bank.down.trellis, bank.gate.svh, bank.up.svh, bank.down.suh, slots, mid, sh.down.weight, sh.down.scales, sh.down.biases }, down_stage.cfg, 2);
+    var down_buf: [7]mlx.mlx_array = undefined;
+    const rider_down = riders.downInputs(sh, x2, mid, &down_buf);
+    var down_in: [14]mlx.mlx_array = undefined;
+    down_in[0..7].* = .{ ig, iu, bank.down.trellis, bank.gate.svh, bank.up.svh, bank.down.suh, slots };
+    @memcpy(down_in[7..][0..rider_down.len], rider_down);
+    const down_ov = try kernels.applyOuts(s, down_stage.kernel, down_in[0 .. 7 + rider_down.len], down_stage.cfg, 2);
     defer _ = mlx.mlx_vector_array_free(down_ov);
     const down = try get(down_ov, 0);
     defer _ = mlx.mlx_array_free(down);
@@ -191,7 +202,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     folded_layers += 1;
     // Pair, down, reduce.
     folded_launches += 3;
-    const y = try kernels.downFinishReduceWithShared(s, down, bank.down.svh, slots, sc, hidden, rows, topk, .bfloat16, shared_out, logit_out orelse gate.?, false);
+    const y = try riders.reduce(s, sh, geo, down, bank.down.svh, slots, sc, hidden, rows, topk, shared_out, logit_out orelse gate.?);
     defer _ = mlx.mlx_array_free(y);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);

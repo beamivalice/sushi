@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen3.8-Flash-Next packs with a trellis trunk decode about 6% faster**: the shared expert now runs inside the routed expert launches as it does on affine packs, also when the model verifies several tokens at once, with the same output.
 - **`sushi launch dsh` starts DeepSeek Harness on your local server**: it lists every chat model with its own window, output cap and reasoning levels in a patch layer of its own, so your `~/.dsh` profile is left as it is.
 - **The web page's Models tab downloads packs**: its Available list (`/downloads`) shows the Sushi packs published on Hugging Face with their size, recommends the one for this Mac's memory, checks the free space, and downloads a pack into the models folder with a progress bar, speed and time left; Stop keeps what is downloaded and Resume continues from it, also after a restart, a finished pack opens in the Installed list ready to load, a small dot on the tab marks a newly published pack, and every tab of the top bar has a small icon (`GET`/`POST /v1/downloads`).
 - **The web page says what each Default is**: the Models tab reads "Default (8-bit)", "Default (On)" or "Default (256,000)" from what the loaded model really uses, a new "Max output tokens" setting (`max_tokens`, the per-model twin of `--max-tokens`) sets the reply budget of a request that names none, and the chat options show the model's own defaults.

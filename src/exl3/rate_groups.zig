@@ -14,6 +14,7 @@ const group_layout = @import("layout.zig");
 const root = @import("root.zig");
 const fuse = @import("fuse.zig");
 const riders = @import("qwen_riders.zig");
+const shared_trellis = @import("shared_trellis.zig");
 const linear = @import("linear.zig");
 
 const max_groups = group_layout.max_groups;
@@ -1362,6 +1363,7 @@ const QwenKey = struct {
     group: c_int,
     logit_group: c_int,
     logit: bool,
+    tr: ?shared_trellis.Geo,
     hidden: c_int,
     inter: c_int,
     funnel: bool,
@@ -1392,7 +1394,7 @@ fn qwenStage(k: QwenKey) !*const FusedStage {
     const classes = k.classes[0..k.class_count];
     const nslots = k.rows * k.topk;
     const layout: kernels.GemvLayout = .{ .funnel = k.funnel, .tiles = k.tiles };
-    const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group };
+    const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group, .tr = k.tr };
     const head = try headerOf(k.dec);
     const a: fuse.Part = if (k.down) .{
         .launch = try decodeLaunch(alloc, .{ .in_dim = k.inter, .out_dim = k.hidden, .nslots = nslots, .topk = 0, .down = true, .layout = layout }),
@@ -1416,6 +1418,10 @@ fn qwenStage(k: QwenKey) !*const FusedStage {
     for (classes) |c| try name.print(alloc, "_{d}x{d}", .{ c.gate, c.up });
     if (k.logit) try name.appendSlice(alloc, "_logit");
     if (k.tile_major) try name.appendSlice(alloc, "_tm");
+    if (k.tr) |t| {
+        try name.print(alloc, "_tr_{s}_w{d}_n{d}_{d}", .{ @tagName(t.dec.codebook), t.dec.window.bits(), t.n_gu, t.n_dn });
+        if (t.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[t.dec.table.?].digest});
+    }
     try name.append(alloc, 0);
     var slot: ?mlx.mlx_fast_metal_kernel = null;
     const kernel = try kernels.getNamedKernel(&slot, @ptrCast(name.items.ptr), try fuse.insOf(alloc, a, b), try fuse.outsOf(alloc, a, b), src, header_text);
@@ -1436,7 +1442,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
     const topk = route.topk;
     const hidden = mlx.getShape(x)[2];
     if (hidden != rb.hidden) return null;
-    const geo = riders.geometry(sh, hidden) orelse return null;
+    const geo = riders.geometry(sh, hidden, rows) orelse return null;
     const want_logit = sh.logit != null;
     if (!want_logit) {
         const g = gate orelse return null;
@@ -1473,6 +1479,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
         .group = geo.group,
         .logit_group = geo.logit_group,
         .logit = want_logit,
+        .tr = geo.tr,
         .hidden = rb.hidden,
         .inter = rb.inter,
         .funnel = pair_layout.funnel,
@@ -1510,7 +1517,12 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
     key.class_count = down_classes.len;
     @memcpy(key.classes[0..down_classes.len], down_classes);
     const down_stage = try qwenStage(key);
-    const down_ov = try kernels.applyOuts(s, down_stage.kernel, &.{ ig, iu, rb.trellis[2], rb.svh[0], rb.svh[1], rb.suh[2], slots, rb.meta, mid, sh.down.weight, sh.down.scales, sh.down.biases }, down_stage.cfg, 2);
+    var down_buf: [7]mlx.mlx_array = undefined;
+    const rider_down = riders.downInputs(sh, x2, mid, &down_buf);
+    var down_in: [15]mlx.mlx_array = undefined;
+    down_in[0..8].* = .{ ig, iu, rb.trellis[2], rb.svh[0], rb.svh[1], rb.suh[2], slots, rb.meta };
+    @memcpy(down_in[8..][0..rider_down.len], rider_down);
+    const down_ov = try kernels.applyOuts(s, down_stage.kernel, down_in[0 .. 8 + rider_down.len], down_stage.cfg, 2);
     defer _ = mlx.mlx_vector_array_free(down_ov);
     const down = try getOut(down_ov, 0);
     defer _ = mlx.mlx_array_free(down);
@@ -1520,7 +1532,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
     qwen_layers += 1;
     // Pair, down, reduce.
     qwen_launches += 3;
-    const y = try kernels.downFinishReduceWithShared(s, down, rb.svh[2], slots, sc, rb.hidden, rows, topk, .bfloat16, shared_out, logit_out orelse gate.?, false);
+    const y = try riders.reduce(s, sh, geo, down, rb.svh[2], slots, sc, rb.hidden, rows, topk, shared_out, logit_out orelse gate.?);
     defer _ = mlx.mlx_array_free(y);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);

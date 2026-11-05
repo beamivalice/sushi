@@ -26,12 +26,13 @@ const FoldArm = enum { separate, fused, routed_only };
 pub const shared_expert_fold: report.Bench = .{
     .name = "shared.shared_expert_fold",
     .scope = .shared,
-    .what = "one MoE layer with the shared expert separate, folded into the routed launches, and absent: qwen4 (one bank, rate groups), glm5 (one bank), dsv41 (rate groups, layer 2); dsv41 also counts launches",
+    .what = "one MoE layer with the shared expert separate, folded into the routed launches, and absent: qwen4 (one bank, rate groups; the shared expert affine8 or a 6-bit trellis trunk), glm5 (one bank), dsv41 (rate groups, layer 2); dsv41 also counts launches",
     .unit = .us,
     .steps = default_layers,
     .axes = &.{
         .{ .name = "model", .values = &.{ "qwen4", "glm5", "dsv41" }, .numeric = false },
         .{ .name = "layout", .values = &.{ "bank", "grouped" }, .numeric = false },
+        .{ .name = "shared", .values = &.{ "affine", "trellis" }, .numeric = false },
         .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "6", "8" } },
     },
     .arms = &.{ "separate", "fused", "routed_only" },
@@ -56,7 +57,9 @@ fn runFold(run: *report.Run) anyerror!void {
     const s = mlx.gpuStream();
     const models = run.axis("model");
     const layouts = run.axis("layout");
-    if (listed(models, "qwen4")) for (layouts) |layout| try runQwen(run, s, std.mem.eql(u8, layout, "grouped"));
+    const kinds = run.axis("shared");
+    if (listed(models, "qwen4")) for (kinds) |kind| for (layouts) |layout| try runQwen(run, s, std.mem.eql(u8, layout, "grouped"), std.mem.eql(u8, kind, "trellis"));
+    if (!listed(kinds, "affine")) return;
     if (listed(models, "glm5") and listed(layouts, "bank")) try runGlm(run, s);
     if (listed(models, "dsv41") and listed(layouts, "grouped")) try api.ubench.sharedFoldDsv41(run);
 }
@@ -181,9 +184,11 @@ fn qwenSample(r: *const QwenRung, arm: usize) anyerror!f64 {
 }
 
 const bank_experts = 64;
+/// The trunk's 6-bit trellis, in packed words per tile pair.
+const trellis_bits: u32 = 96;
 const grouped_counts = [_]c_int{ 20, 20, 24 };
 
-fn runQwen(run: *report.Run, s: mlx.mlx_stream, grouped: bool) !void {
+fn runQwen(run: *report.Run, s: mlx.mlx_stream, grouped: bool, trellis: bool) !void {
     const layers = @min(run.steps(default_layers), max_layers);
     var prng = std.Random.DefaultPrng.init(913);
     const rnd = prng.random();
@@ -193,9 +198,12 @@ fn runQwen(run: *report.Run, s: mlx.mlx_stream, grouped: bool) !void {
     var made: usize = 0;
     defer for (ragged[0..made]) |*r| r.deinit();
     var weights: [max_layers]qwen.Weights = undefined;
+    var weights_made: usize = 0;
+    defer for (weights[0..weights_made]) |*w| w.deinit(alloc);
     var chains: [max_layers]qwen.Chain = undefined;
     for (0..layers) |l| {
-        weights[l] = try qwen.weights(&bops[l], alloc, rnd, s, qwen.hidden, qwen.inter, 128, 1);
+        weights[l] = try qwen.weights(&bops[l], alloc, rnd, s, qwen.hidden, qwen.inter, 128, 1, if (trellis) trellis_bits else 0);
+        weights_made += 1;
         if (grouped) {
             var parts: [3]api.Bank = undefined;
             for (&parts, grouped_counts, qwen.group_rates, 0..) |*p, count, r, g| p.* = try qwen.routedBank(&bops[l], count, r[0], r[2], 500 + 100 * @as(u64, @intCast(l)) + @as(u64, @intCast(g)));
@@ -217,7 +225,7 @@ fn runQwen(run: *report.Run, s: mlx.mlx_stream, grouped: bool) !void {
             scores[l] = route.scores;
         }
         const rung: QwenRung = .{ .s = s, .rows = rows, .layers = layers, .dec = dec, .weights = weights[0..layers], .chains = chains[0..layers], .ids = ids[0..layers], .scores = scores[0..layers] };
-        const label = try std.fmt.allocPrint(run.a, "qwen4 {s} rows {d}", .{ if (grouped) "grouped" else "bank", rows });
+        const label = try std.fmt.allocPrint(run.a, "qwen4 {s}{s} rows {d}", .{ if (grouped) "grouped" else "bank", if (trellis) " trellis" else "", rows });
         try run.interleave(label, &rung, qwenSample);
     }
 }

@@ -10,6 +10,7 @@ pub const project_rows = @import("project_rows.zig");
 pub const glm_group2 = @import("glm_group2.zig");
 pub const glm_fold = @import("glm_fold.zig");
 pub const qwen_riders = @import("qwen_riders.zig");
+pub const shared_trellis = @import("shared_trellis.zig");
 pub const qwen_fold = @import("qwen_fold.zig");
 pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
 pub const codebook_tables = @import("codebook_tables.zig");

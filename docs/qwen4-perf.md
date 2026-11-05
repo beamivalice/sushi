@@ -715,6 +715,56 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
   `--no-mtp` decode 63.2 / 63.4 and 62.3 / 62.0 tok/s: a tie that drops 192 launches a serial token. The
   `[qwen] shared expert rides the routed launches engaged` log line shows the fold is on.
 
+<a id="shared-fold-trellis"></a>
+## Flash-Next: a trellis shared expert rides the routed launches too
+
+`exl3/shared_trellis.zig` (the parts), reached through `qwen_riders` (`Shared.trellis`) from the same two folds as above.
+A trunk-STQ pack stores the shared gate/up as one stacked bank and the down as a bank, both on `project_rows`' NAX
+multi-row kernel. Each rides as that kernel itself, with its own k split, so every partial sum is the bytes of the
+linear's own launch; what its two finish dispatches did moves into the neighbour that reads the partials:
+
+- **Pair launch**: extra threadgroups run the gate/up kernel and write its f32 partials `[rows * nsplit, 1280]` (the
+  gate logit of rows 2 to 8 is one more threadgroup per row, as for the affine riders).
+- **Fused-mid down launch**: the shared down kernel prepares its input per 128-wide k block by summing that block's
+  gate/up partials in finish order, applying the output H128 and `svh`, rounding to bf16 and running the SwiGLU of
+  `fusedSwiGLU`, instead of reading a mid vector (`mid_row` in the kernel header).
+- **Finish reduce**: one idle simdgroup sums the down partials, applies H128 and `svh`, rounds to bf16 into
+  threadgroup memory, and the sigmoid-gated add reads that block.
+- The three launches a layer are the affine fold's: the shared gate/up, finish, SwiGLU, down and finish dispatches and
+  the logit are gone. Declines (separate chain): no NAX on the box, a split that folds (`nsplit` 1), `kph` other than 1,
+  a gate/up not stacked in two, a trunk decode without its table.
+- **A dense shared-expert gate** (the packs store it bf16 `[1, hidden]`, so no affine bank) used to decline the fold at 2
+  to 8 rows, where only the router kernel supplies the logit at one row. The layer now computes the logit as the separate
+  chain does and passes it in, so verify widths fold too.
+- **Proof** (`qwen4_shared.zig`): bytes equal to the production separate chain (`sharedProject`, `fusedSwiGLU`,
+  `trunk_stq.matmul`, then `moeWithGatedShared` / `moeRagged`) at 1 to 8 rows, 6-bit and 4-bit shared banks, SPEC1 trunk,
+  one-bank (MCG) and rate-grouped routed layers, logit riding the launch or passed in, three launches a layer; a decline
+  test.
+- **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=qwen4 --rungs shared=trellis`, K6 shared
+  banks, 8 dependent layers over distinct banks, 11 rounds interleaved, median us; commit `3a6c6bb7` ReleaseFast, GPU
+  lock, QUIET, `taskpolicy -a`, AC, fans max, die 50 C at start; the separate arm pays the logit qmv at every width):
+
+  | rows | grouped separate | fused | routed only | one-bank separate | fused | routed only |
+  |---|---|---|---|---|---|---|
+  | 1 | 137.5 | 113.6 | 98.9 | 168.2 | 141.8 | 121.6 |
+  | 2 | 154.2 | 128.1 | 112.7 | 163.5 | 137.8 | 121.5 |
+  | 4 | 229.9 | 198.8 | 181.2 | 236.5 | 211.9 | 190.7 |
+  | 8 | 359.0 | 332.7 | 306.8 | 363.6 | 351.6 | 313.3 |
+
+  Raw: `~/.sushi/runs/ubench/shared.shared_expert_fold-3a6c6bb-20261105T031328.json`.
+- **Decode forward meter** on `Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw-trunkK6` (`SUSHI_DECODE_FWD_UBENCH=40`, `_S=1,2,4,8`,
+  `_KV=1024`, kv8 default, M5 Max on AC, `taskpolicy -a`, GPU lock, QUIET, fans max, one boot per cell, one A then one B,
+  A = 71fd8217 and B = this change on top of it; the A boot began at 55 C, the B boot at 50 C), ms per forward and ops:
+
+  | rows | 1 | 2 | 4 | 8 |
+  |---|---|---|---|---|
+  | A | 17.899 / 5160 | 20.485 / 4829 | 25.259 / 5218 | 35.464 / 5319 |
+  | B | 16.802 / 4296 | 19.637 / 3821 | 24.304 / 4210 | 35.791 / 4311 |
+
+  A serial token drops 1.1 ms (6%) over 48 layers, 0.85 to 0.95 ms at 2 and 4 rows; 8 rows is a tie inside the boot-to-boot
+  band of about 1.5 ms. The first B boot, before the dense-gate change, read 16.788 / 20.048 / 24.822 / 35.024 (ops at 2 to 8
+  rows unchanged from A: the fold declined there).
+
 <a id="verify-rows8"></a>
 ## Flash-Next: verify at 2 to 8 rows costs the same per row (4d7f575c to 8044906b)
 

@@ -59,8 +59,8 @@ hidden 2560, expert intermediate 640.
     stacked row is not bitwise a separate launch's, but it is the same row at every width.
   - **The joined slot rows decline a trellis projection** (`decodeRowsProjection`, `verifyJoinedProjection` need affine8):
     concurrent slots and cross-slot verify run those projections per slot, bytes unchanged. The shared-expert fold
-    (`qwen_riders`) declines a trellis shared expert and the separate chain runs. The trellis lm_head is read whole by the
-    draft (`fullReadoutArgmax`), with no coarse rerank copy.
+    takes a trellis shared expert too ([qwen4-perf](qwen4-perf.md#shared-fold-trellis)), on a NAX box; elsewhere the
+    separate chain runs. The trellis lm_head is read whole by the draft (`fullReadoutArgmax`), with no coarse rerank copy.
   - Load logs `[trunk-stq] N trellis projections (M stacked), lm_head trellis|affine; <codebook> window W`.
 - **A GDN trunk's `KVCache.step` is 0 forever**: see [engine-kv-cache](engine-kv-cache.md#gdn).
 
