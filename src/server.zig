@@ -21,6 +21,7 @@ const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const fp8_block = @import("fp8_block.zig");
+const sushi_exl3 = @import("sushi_exl3");
 const model_mod = @import("model.zig");
 const effort_mod = @import("effort.zig");
 const dsv41_config = @import("dsv41/dsv41_config.zig");
@@ -2848,6 +2849,7 @@ pub fn prefillTransientReserveAtKv(
     ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
+        trunkDecodeScratchBytes(config, @min(chunk, @max(seq, 1))) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
 }
@@ -2878,6 +2880,13 @@ pub fn fp8DequantScratchBytes(config: *const model_mod.ModelConfig, fwd: u64) u6
         widest = @max(widest, qkv);
     }
     return 2 *| widest *| config.hidden_size *| 2;
+}
+
+/// The f16 weight a trellis trunk linear decodes into when a forward is wide enough for MLX's GEMM
+/// (`trunk_gemm.decodedServes`).
+pub fn trunkDecodeScratchBytes(config: *const model_mod.ModelConfig, fwd: u64) u64 {
+    if (config.trunk_quant == null or fwd < @as(u64, @intCast(sushi_exl3.trunk_gemm.DECODED_MIN_ROWS))) return 0;
+    return sushi_exl3.trunk_gemm.DECODED_SCRATCH_BYTES;
 }
 
 /// Dense bytes ONE layer's `KVCache.denseView` rebuild costs at this prompt
@@ -6488,6 +6497,7 @@ pub fn prefillNeededAtChunk(
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
+        trunkDecodeScratchBytes(config, @min(chunk, @max(seq, 1))) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
 }
@@ -12954,6 +12964,18 @@ test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sh
     plain.model_type = "not_a_served_arch";
     attn_kernels.fused256_override = true;
     try t.expectEqual(@as(u64, 0), slidingBandScoreBytes(&plain, chunk));
+}
+
+test "a trellis trunk's prefill bill carries one decoded bank pair from the decoded path's width" {
+    const t = std.testing;
+    var plain = mimoV2BillConfig();
+    var stq = plain;
+    stq.trunk_quant = sushi_exl3.format.Decode.tabled(.spec1, .w15);
+    const min: u64 = @intCast(sushi_exl3.trunk_gemm.DECODED_MIN_ROWS);
+    try t.expectEqual(sushi_exl3.trunk_gemm.DECODED_SCRATCH_BYTES, prefillTransientReserve(&stq, 8, 4096) - prefillTransientReserve(&plain, 8, 4096));
+    try t.expectEqual(sushi_exl3.trunk_gemm.DECODED_SCRATCH_BYTES, trunkDecodeScratchBytes(&stq, min));
+    try t.expectEqual(@as(u64, 0), trunkDecodeScratchBytes(&stq, min - 1));
+    try t.expectEqual(@as(u64, 0), trunkDecodeScratchBytes(&plain, 4096));
 }
 
 test "mimo_v2 prefill bill carries the FP8 trunk's dequant scratch past the GEMV width" {

@@ -16,6 +16,7 @@ pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
 pub const codebook_tables = @import("codebook_tables.zig");
 /// The microbench bodies `sushi-ubench` runs; its host root supplies `report`.
 pub const ubench = @import("ubench.zig");
+pub const bench_util = @import("bench_util.zig");
 
 /// One projection's bank, expert e on axis 0: `trellis` U16 [E, in/16, out/16, n],
 /// `suh` F16 [E, in], `svh` F16 [E, out].
@@ -25,6 +26,7 @@ pub const GroupLayout = group_layout.Layout;
 pub const rate_groups = @import("rate_groups.zig");
 pub const Ragged = rate_groups.Ragged;
 pub const linear = @import("linear.zig");
+pub const trunk_gemm = @import("trunk_gemm.zig");
 pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 
 /// Routed SwiGLU experts over `x` [B, S, D] for the top-k `inds`/`scores` [B, S, K],
@@ -812,6 +814,7 @@ test { _ = glm_group2; }
 test {
     _ = rate_groups;
     _ = linear;
+    _ = trunk_gemm;
     _ = @import("dsv41_real.zig");
 }
 

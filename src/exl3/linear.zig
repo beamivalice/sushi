@@ -8,6 +8,7 @@ const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const project_rows = @import("project_rows.zig");
+const trunk_gemm = @import("trunk_gemm.zig");
 const root = @import("root.zig");
 
 /// Tests and the trunk bench: `rows` is the served arm up to `PROJECT_ROWS_MAX`, `gemm` the sorted GEMM at any width,
@@ -90,6 +91,9 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, grou
     const prepared = try kernels.prepareIndexed(s, x, p.suh, slots);
     defer _ = mlx.mlx_array_free(prepared);
     const inner = if ((force_arm orelse .gemm) == .gemm) blk: {
+        const out_dim: c_int = mlx.getShape(p.trellis)[2] * 16;
+        if (groups == 1 and trunk_gemm.decodedServes(@intCast(rows), mlx.getShape(x)[1], out_dim))
+            break :blk try trunk_gemm.innerDense(s, prepared, p.trellis);
         const tab = try windowTable(groups, rows, kernels.gemmWindowRows());
         defer _ = mlx.mlx_array_free(tab.starts);
         defer _ = mlx.mlx_array_free(tab.nlives);

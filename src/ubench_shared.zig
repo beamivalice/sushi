@@ -1,7 +1,8 @@
 //! Benches that cross model families. `shared.kernel_launch` times the host side of one custom-kernel launch;
 //! `shared.shared_expert_fold` times one MoE layer with the shared expert as its own
 //! kernels, folded into the routed launches, and absent, for Flash-Next, GLM and DeepSeek-V4.1. Run by `sushi-ubench`,
-//! never by a test; the bytes of every arm are asserted by the tests beside the folds.
+//! never by a test; the bytes of every arm are asserted by the tests beside the folds. `shared.exl3_trunk_prefill` times
+//! one Flash-Next trunk projection at prefill width on the sorted GEMM and the decoded path against affine 8.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const io_util = @import("io_util.zig");
@@ -14,8 +15,10 @@ const hc_prefill = @import("hc_prefill.zig");
 const Arr = mlx.mlx_array;
 const Ops = qwen.Ops;
 const Bank = @import("glm5/glm5_decode.zig").Bank;
+const kernels = api.kernels;
+const bench = api.bench_util;
 
-pub const benches = [_]report.Bench{ shared_expert_fold, kernel_launch };
+pub const benches = [_]report.Bench{ shared_expert_fold, kernel_launch, trunk_prefill };
 
 const alloc = std.heap.page_allocator;
 const max_layers = 32;
@@ -334,5 +337,166 @@ fn runLaunch(run: *report.Run) anyerror!void {
         const rung: LaunchRung = .{ .s = s, .kernel = kernel, .x = x, .w = x, .sc = sc, .steps = steps };
         const label = try std.fmt.allocPrint(run.a, "header {s}", .{size});
         try run.interleave(label, &rung, launchSample);
+    }
+}
+
+// ---- shared.exl3_trunk_prefill: one Flash-Next trunk projection at prefill width ----
+
+/// One prefill projection: `out x in`, and the group its affine-8 twin is stored with.
+const TrunkShape = struct { name: []const u8, out: usize, in: usize, group: c_int };
+
+const TRUNK_SHAPES = [_]TrunkShape{
+    .{ .name = "gdn_qkv", .out = 10240, .in = 2560, .group = 128 },
+    .{ .name = "gdn_z", .out = 6144, .in = 2560, .group = 128 },
+    .{ .name = "gdn_out", .out = 2560, .in = 6144, .group = 128 },
+    .{ .name = "attn_q", .out = 12288, .in = 2560, .group = 64 },
+    .{ .name = "attn_kv", .out = 512, .in = 2560, .group = 64 },
+    .{ .name = "attn_o", .out = 2560, .in = 6144, .group = 64 },
+    .{ .name = "idx_q", .out = 640, .in = 2560, .group = 64 },
+    .{ .name = "shared_gate", .out = 640, .in = 2560, .group = 128 },
+    .{ .name = "shared_down", .out = 2560, .in = 640, .group = 128 },
+};
+
+const trunk_shape_names = blk: {
+    var names: [TRUNK_SHAPES.len][]const u8 = undefined;
+    for (TRUNK_SHAPES, 0..) |sh, i| names[i] = sh.name;
+    break :blk names;
+};
+
+pub const trunk_prefill: report.Bench = .{
+    .name = "shared.exl3_trunk_prefill",
+    .scope = .shared,
+    .what = "one Flash-Next trunk projection at prefill width: the trellis bank on the sorted GEMM and decoded once to f16 for MLX's GEMM (served from 1024 rows), at K4 and K6 against affine-8 quantized_matmul and a dense bf16 matmul ceiling",
+    .unit = .us,
+    .steps = 4,
+    .axes = &.{
+        .{ .name = "shape", .values = &trunk_shape_names, .numeric = false },
+        .{ .name = "k", .values = &.{ "4", "6" } },
+        .{ .name = "rows", .values = &.{ "512", "2048", "4096" } },
+    },
+    .arms = &.{ "affine8", "sorted", "decoded", "dense" },
+    .ref = "affine8",
+    .run = runTrunkPrefill,
+};
+
+/// Copies of each weight a chain cycles through, so a step never reads the previous step's weight from cache.
+const TRUNK_COPIES = 2;
+
+const TrunkCtx = struct {
+    s: mlx.mlx_stream,
+    sh: TrunkShape,
+    x0: mlx.mlx_array,
+    trellis: [TRUNK_COPIES]api.Proj,
+    a8: [TRUNK_COPIES][3]mlx.mlx_array,
+    dense: [TRUNK_COPIES]mlx.mlx_array,
+    link_ns: f64,
+};
+
+fn trunkStep(c: *const TrunkCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array, arm: usize) !mlx.mlx_array {
+    const ci = i % TRUNK_COPIES;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    switch (arm) {
+        0 => try mlx.check(mlx.mlx_quantized_matmul(&y, x, c.a8[ci][0], c.a8[ci][1], c.a8[ci][2], true, mlx.mlx_optional_int.some(c.sh.group), mlx.mlx_optional_int.some(8), "affine", s)),
+        1, 2 => {
+            api.project_rows.rows_exact = true;
+            defer api.project_rows.rows_exact = false;
+            api.trunk_gemm.decoded_billed = arm == 2;
+            defer api.trunk_gemm.decoded_billed = false;
+            _ = mlx.mlx_array_free(y);
+            y = try api.linear.linear(s, x, c.trellis[ci], kernels.SPEC1_W15);
+        },
+        3 => {
+            var wt = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_transpose(&wt, c.dense[ci], s));
+            try mlx.check(mlx.mlx_matmul(&y, x, wt, s));
+        },
+        else => unreachable,
+    }
+    return y;
+}
+
+const TrunkArmCtx = struct { c: *const TrunkCtx, arm: usize };
+
+fn trunkArmStep(ac: TrunkArmCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    return trunkStep(ac.c, s, i, x, ac.arm);
+}
+
+const TrunkSample = struct { c: *const TrunkCtx, steps: usize };
+
+fn trunkSample(smp: TrunkSample, arm: usize) anyerror!f64 {
+    kernels.setDecodeParams(kernels.SPEC1_W15);
+    const ns = try bench.chainNs(smp.c.s, smp.c.x0, smp.steps, TrunkArmCtx{ .c = smp.c, .arm = arm }, trunkArmStep);
+    return (@as(f64, @floatFromInt(ns)) - smp.c.link_ns) / @as(f64, @floatFromInt(smp.steps));
+}
+
+fn runTrunkPrefill(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0x7f);
+    const rnd = prng.random();
+    try kernels.SPEC1_W15.requireTable();
+    for (TRUNK_SHAPES) |sh| {
+        if (!listed(run.axis("shape"), sh.name)) continue;
+        for (run.axis("k")) |k_text| {
+            const n: u32 = if (std.mem.eql(u8, k_text, "4")) 64 else if (std.mem.eql(u8, k_text, "6")) 96 else return error.BadK;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var owned: std.ArrayList(mlx.mlx_array) = .empty;
+            defer for (owned.items) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            var c: TrunkCtx = .{ .s = s, .sh = sh, .x0 = undefined, .trellis = undefined, .a8 = undefined, .dense = undefined, .link_ns = 0 };
+            const suh_v = try a.alloc(u16, sh.in);
+            @memset(suh_v, api.format.f32ToF16Bits(1.0 / @sqrt(@as(f32, @floatFromInt(sh.in)))));
+            const svh_v = try a.alloc(u16, sh.out);
+            @memset(svh_v, api.format.f32ToF16Bits(1.0));
+            const suh = mlx.mlx_array_new_data(suh_v.ptr, &[_]c_int{ 1, @intCast(sh.in) }, 2, .float16);
+            const svh = mlx.mlx_array_new_data(svh_v.ptr, &[_]c_int{ 1, @intCast(sh.out) }, 2, .float16);
+            try owned.appendSlice(a, &.{ suh, svh });
+            for (0..TRUNK_COPIES) |ci| {
+                const words = try a.alloc(u16, (sh.in / 16) * (sh.out / 16) * n);
+                bench.randomWords(rnd, words);
+                const tr = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ 1, @intCast(sh.in / 16), @intCast(sh.out / 16), @intCast(n) }, 4, .uint16);
+                try owned.append(a, tr);
+                c.trellis[ci] = .{ .trellis = tr, .suh = suh, .svh = svh };
+                const codes = try a.alloc(u32, sh.out * sh.in / 4);
+                for (codes) |*v| v.* = rnd.int(u32);
+                const wb = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ @intCast(sh.out), @intCast(sh.in / 4) }, 2, .uint32);
+                const gshape = [_]c_int{ @intCast(sh.out), @intCast(sh.in / @as(usize, @intCast(sh.group))) };
+                var sb = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_full(&sb, &gshape, 2, mlx.mlx_array_new_float(0.001), .bfloat16, s));
+                var bb = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_full(&bb, &gshape, 2, mlx.mlx_array_new_float(-0.1), .bfloat16, s));
+                try owned.appendSlice(a, &.{ wb, sb, bb });
+                c.a8[ci] = .{ wb, sb, bb };
+                var dw = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_random_normal(&dw, &[_]c_int{ @intCast(sh.out), @intCast(sh.in) }, 2, .bfloat16, 0, 0.02, .{ .ctx = null }, s));
+                try owned.append(a, dw);
+                c.dense[ci] = dw;
+            }
+            const ev = mlx.mlx_vector_array_new_data(owned.items.ptr, owned.items.len);
+            defer _ = mlx.mlx_vector_array_free(ev);
+            try mlx.check(mlx.mlx_eval(ev));
+            for (run.axis("rows")) |rows_text| {
+                const rows = try std.fmt.parseInt(usize, rows_text, 10);
+                const xs = try a.alloc(u16, rows * sh.in);
+                for (xs) |*v| v.* = @truncate(@as(u32, @bitCast(rnd.float(f32) - 0.5)) >> 16);
+                c.x0 = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, .bfloat16);
+                defer _ = mlx.mlx_array_free(c.x0);
+                const steps = run.steps(4);
+                var t: [5]u64 = undefined;
+                for (&t) |*v| v.* = try bench.chainNs(s, c.x0, steps, {}, bench.linkOnly);
+                c.link_ns = bench.median(&t);
+                const label = try std.fmt.allocPrint(run.a, "{s} [{d}x{d}] K{s} rows {d}", .{ sh.name, sh.out, sh.in, k_text, rows });
+                try run.interleave(label, TrunkSample{ .c = &c, .steps = steps }, trunkSample);
+                const flop: f64 = 2.0 * @as(f64, @floatFromInt(rows * sh.in * sh.out));
+                for ([_][]const u8{ "affine8", "sorted", "decoded", "dense" }) |arm| {
+                    if (run.hasArm(arm)) try run.metric(arm, "TFLOP/s", "TFLOP/s", flop / run.lastMedianNs(arm) / 1e3);
+                }
+            }
+        }
     }
 }

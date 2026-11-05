@@ -315,9 +315,34 @@ A trunk weight stored as a one-bank (or, for a grouped projection, G-bank) trell
 inner product, finish (H128, svh), out in x's dtype, rounded once from the f32 result (`projectRows`,
 `finishIndexedAs`). Up to `PROJECT_ROWS_MAX` (8) rows take the multi-row kernel
 (`projectRows`: two dispatches, each weight decoded once for every row; the NAX kernel from two rows, the SIMD one at one
-row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM over a window table built on the host.
+row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM over a window table built on the host,
+or from 1024 rows the decoded path below.
 `decodeDense` is the host twin a test multiplies beside it.
 
+- **From 1024 rows a billed one-bank linear decodes its bank once to f16 and runs MLX's GEMM** (`trunk_gemm`, Flash-Next's
+  `trunk_stq.matmul` sets `decoded_billed`). The sorted GEMM decodes the whole bank again for each 32-row window. MLX's
+  regular NAX GEMM sums each output in the same order (16x32x16 MMAs, k ascending, one f32 accumulator, stored f16), so
+  the inner plane is byte-identical. Tests: `the dense decode is the host tile decode ...` (n48 MCG, n64, n96, 33 to
+  4096 rows) and `a billed one-bank linear past the decoded width ...`. MLX splits K when K is large against the output
+  (K >= 3 max(M, N), or max(M, N) <= 1024 with K > 2 max(M, N); mlx 0.32.3). That changes the order, so
+  `denseOrderMatches` keeps those shapes on the sorted GEMM, as it does the lm_head (`DECODED_MAX_WEIGHTS`) and rows under
+  1024, where the decode pass does not pay. The f16 bank and the previous one MLX's cache may hold are billed
+  (`trunkDecodeScratchBytes`, 128 MB). An MLX bump re-runs these tests.
+  - `sushi-ubench run shared.exl3_trunk_prefill --rungs k=6`, 5481a90e, GPU lock, QUIET, fans max, AC, `taskpolicy -a`, 7 rounds
+    x 4 steps, us a call at 4096 rows. Columns: sorted / decoded / affine-8 `quantized_matmul` / dense bf16 ceiling.
+
+    | shape | sorted | decoded | affine 8 | dense bf16 |
+    |---|---|---|---|---|
+    | gdn qkv 10240x2560 | 4869 | 3917 | 3947 | 3387 |
+    | gdn z 6144x2560 | 3001 | 2397 | 2401 | 2042 |
+    | gdn out 2560x6144 | 2698 | 2288 | 2203 | 1925 |
+    | attn q 12288x2560 | 5743 | 4680 | 4970 | 4059 |
+    | attn k, v 512x2560 | 318 | 285 | 216 | 184 |
+    | indexer 640x2560 | 410 | 335 | 278 | 239 |
+
+    At 512 rows the two arms tie (qkv 651 / 628); at 128 rows and below the decode pass loses (qkv 187 / 329).
+  - Ruled out: a threadgroup sharing one decode across 4 to 8 row blocks through threadgroup memory, bytes equal. Every
+    variant, single- or double-buffered, lost to the decoded path, and on K = 6144 it lost to the sorted GEMM too.
 - Linears that read the same rows can share one launch (`linearShared`, `projectRowsSegmented`): their trellises stacked
   along the output, `suh` one row per linear, `svh` concatenated, up to four, every boundary a multiple of 128 so a
   threadgroup never straddles two. A threadgroup shifts `suh` to its linear's row (`SB1..SB3`), and the output is
@@ -619,7 +644,8 @@ the fold leaves of the shared stage is those GEMMs (2.2 to 2.6 ms of a 2048-row 
   `taskpolicy -a`; one boot each, A a7242135, B d989d9ea, about 90 min apart): code prefill windows 8k-32k 1377-1420 -> 1443-1493
   tok/s, median 2048-row chunk 1483 -> 1407 ms, of which ~40 ms is a shorter SSD fill in B (run-to-run), not this change.
 
-**The trunk GEMM is not a prefill lever.** At 512 rows the sorted trellis GEMM matches MLX's mxfp8 GEMM and comes
+**The trunk GEMM is not a prefill lever (DeepSeek, 512 rows).** Flash-Next's 4096-row chunks take the decoded path
+([dense linears](#dense-linears)); DeepSeek's linears do not bill it and keep the sorted GEMM. At 512 rows the sorted trellis GEMM matches MLX's mxfp8 GEMM and comes
 within ~15% of affine-4. Times in µs, trellis GEMM / mxfp8 / affine-4, interleaved:
 - `wq_b`: 837 / 828 / 730.
 - `wo_b`: 870 / 968 / 869.

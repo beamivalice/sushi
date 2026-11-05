@@ -547,6 +547,33 @@ chunk, which points at the per-layer host round trip of the host-built table rat
 save ~0.4 s of ~18.8 s (~2%), below the spread of the two-sample 32k run (one arm's samples ranged 17.9 to 20.1 s). The served path also drops the un-sort buffer
 (`[rows x 10, 2560]` f16: 210 MB at 4096 rows, 420 MB at 8192).
 
+<a id="stq-prefill-profile"></a>
+## Flash-Next STQ prefill: where a chunk's time goes, K6 trunk against affine 8
+
+`QWEN4_PROFILE_FWD=all SUSHI_PROFILE_ATTN=1` (a sync per block, so about 10% over an unprofiled chunk), in-process
+`sushi bench --code-only --rungs 131072` on 3eff69ed ReleaseFast, `taskpolicy -a`, GPU lock per run, fans max, die
+under 50 C at boot, 2026-11-05. STQ-2.75bpw-v2.0 (K6 n96 trellis trunk) and STQ-2.75bpw (affine-8 trunk), same
+binary. Each 8k window runs as chunks of 31, 4096 and 4065 rows plus the 31-row tail before the snapshot. ms per
+4096-row chunk:
+
+| pack, kv | total | PLE | HC read | GDN | attention | HC write | MoE | indexer | q/k/v + rope | QSA | o |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| v2.0 K6, 20k | 1852 | 47 | 191 | 518 | 343 | 83 | 670 | 26 | 105 | 170 | 42 |
+| affine 8, 20k | 1931 | 277 | 193 | 413 | 310 | 82 | 655 | 24 | 81 | 170 | 34 |
+| v2.0 K6, 127k | 2041 | 40 | 201 | 536 | 496 | 85 | 683 | 117 | 109 | 228 | 43 |
+| affine 8, 127k | 2116 | 294 | 195 | 421 | 459 | 83 | 664 | 110 | 83 | 231 | 35 |
+
+- The K6 trunk costs about 150 ms per 4096-row chunk against affine 8 (GDN +105, attention projections +33, the
+  shared expert in the MoE +15) at any context. The affine-8 run's PLE is the pooled gather a cold calibration chose
+  ([the n-gram arm](#the-n-gram-gather-arm-is-measured-per-load-feb9ed7d)), not the trunk.
+- Long context grows attention alone, the same on both packs: indexer +90 ms and QSA +58 ms per chunk from 20k to
+  127k. The release bench's K6 shortfall past 64k (1,816 vs 1,883 at 98k, 1,690 vs 1,821 at 128k) follows the GPU
+  clock. Per MHz the K6 code windows read 1.27 / 1.25 / 1.20 tok/s at 8k / 98k / 128k, and 1.5.0 read 1.28 / 1.24 /
+  1.19.
+- A 4065-row chunk costs 60-90 ms more than a 4096-row one despite fewer rows: GDN +25-40, MoE +20-30.
+- The 31-row forwards cost about 140 ms each, unprofiled (`[prefill-trace] last_token`). An 8k window pays two of
+  them, about 7% of the window.
+
 <a id="mtp-depth-policy"></a>
 ## MTP depth policy: one chunk from acceptance EMAs below 8k KV (reverted)
 

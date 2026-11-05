@@ -40,6 +40,9 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.ml
     try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ rows, in }, 2, s));
     const prev = pinExactRows();
     defer exl3.project_rows.rows_exact = prev;
+    const billed = exl3.trunk_gemm.decoded_billed;
+    exl3.trunk_gemm.decoded_billed = true;
+    defer exl3.trunk_gemm.decoded_billed = billed;
     const y = try exl3.linear.linear(s, flat, .{ .trellis = w, .suh = suh, .svh = svh }, dec);
     defer _ = mlx.mlx_array_free(y);
     var shape: [8]c_int = undefined;

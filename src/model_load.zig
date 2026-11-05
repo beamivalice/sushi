@@ -2842,7 +2842,8 @@ test "unwireSettled: the unload waits until most of the freed bytes left the wir
 /// DIAGNOSTIC (SUSHI_PREFILL_UBENCH=N): N cold one-chunk prefills per arm at load, each from an
 /// empty cache, logits never projected (the chunk loop never reads them). `_ROWS` (default 2025)
 /// is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
-/// for real routing; `_ARMS=0,1,1,0` runs a pass per arm, 0 on the reference EXL3 NAX GEMM body.
+/// for real routing; `_ARMS=0,1,1,0` runs a pass per arm, 0 on the reference EXL3 NAX GEMM body, or with
+/// `_LEVER=decoded` 0 on the trunk's sorted GEMM instead of its decoded path.
 fn prefillUbench(alloc: std.mem.Allocator, xfm: *Transformer, cfg: *const ModelConfig, tok: *Tokenizer) void {
     const tio = std.Io.Threaded.global_single_threaded.io();
     const n = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_PREFILL_UBENCH").?, 0), 10) catch 3);
@@ -2867,13 +2868,19 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Transformer, cfg: *const ModelC
     var arms: [16]?bool = @splat(null);
     const n_arms = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ARMS")) |r| parseUbenchArms(std.mem.sliceTo(r, 0), &arms) else 1;
     defer exl3_kernels.nax_reference_override = false;
+    defer @import("sushi_exl3").trunk_gemm.enabled = true;
+    const decoded_lever = if (std.c.getenv("SUSHI_PREFILL_UBENCH_LEVER")) |l| std.mem.eql(u8, std.mem.sliceTo(l, 0), "decoded") else false;
     const had_error = mlx.errorPending();
     defer xfm.resetCache() catch {};
     const shape = [_]c_int{ 1, @intCast(rows) };
     const times = alloc.alloc(f64, n) catch return;
     defer alloc.free(times);
+    var first_ms: f64 = 0;
     for (arms[0..n_arms]) |arm| {
-        exl3_kernels.nax_reference_override = if (arm) |a| !a else false;
+        if (decoded_lever)
+            @import("sushi_exl3").trunk_gemm.enabled = if (arm) |a| a else true
+        else
+            exl3_kernels.nax_reference_override = if (arm) |a| !a else false;
         for (0..n + 1) |iter| {
             xfm.resetCache() catch return;
             var ctx = xfm.defaultCtx();
@@ -2892,12 +2899,13 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Transformer, cfg: *const ModelC
                 log.warn("[prefill-ubench] eval failed: {s}\n", .{@errorName(err)});
                 return;
             };
-            if (iter > 0) times[iter - 1] = @as(f64, @floatFromInt(sw.read())) / 1.0e6;
+            const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6;
+            if (iter > 0) times[iter - 1] = ms else first_ms = ms;
         }
         std.mem.sortUnstable(f64, times, {}, std.sort.asc(f64));
-        log.info("[prefill-ubench] arm={s} rows={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s)\n", .{
+        log.info("[prefill-ubench] arm={s} rows={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s), untimed first {d:.2} ms\n", .{
             if (arm) |a| (if (a) "1" else "0") else "shipped", rows, n, times[n / 2], times[0], times[n - 1],
-            @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0,
+            @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0, first_ms,
         });
     }
 }
