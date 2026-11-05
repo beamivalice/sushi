@@ -33,8 +33,8 @@ const trickling = (count, gap = 100) => async (req, res) => {
   if (!res.destroyed) finish(res);
 };
 
-async function startStub({ models = [model()], chat = replying('hello'), port = 0 } = {}) {
-  const state = { models, chat, calls: [] };
+async function startStub({ models = [model()], chat = replying('hello'), tools = () => ({ edit_default: false }), port = 0 } = {}) {
+  const state = { models, chat, tools, calls: [] };
   const server = http.createServer(async (req, res) => {
     const p = new URL(req.url, 'http://x').pathname;
     let body = ''; for await (const piece of req) body += piece;
@@ -44,7 +44,7 @@ async function startStub({ models = [model()], chat = replying('hello'), port = 
     switch (p) {
       case '/v1/models': return json({ data: state.models });
       case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 2 ** 37 }, batching: {} });
-      case '/v1/tools': return json({ edit_default: false });
+      case '/v1/tools': return json(await state.tools(JSON.parse(body || '{}')));
       case '/v1/chat/completions': return state.chat(req, res, JSON.parse(body || '{}'));
       case '/v1/load-model': return json({ ok: true });
       case '/metrics.json': return json({ counters: {}, gauges: {}, histograms: {}, sessions: [] });
@@ -84,6 +84,11 @@ const seedChats = (...chats) => ({ 'sushi-chats': JSON.stringify(chats) });
 const send = async (page, text) => { await page.fill('#promptInput', text); await page.keyboard.press('Enter'); };
 const stored = (page) => page.evaluate(() => JSON.parse(localStorage.getItem('sushi-chats') || '[]'));
 const titles = (page) => page.$$eval('.conv-item .c-title', (nodes) => nodes.map((n) => n.textContent));
+// A control nested in another (a button in a role=button row) is unreachable or announced wrongly by a screen reader.
+const nestedControls = (page, root) => page.evaluate((selector) => {
+  const control = 'button, a[href], input, select, textarea, summary, [tabindex], [role=button], [role=option], [role=link], [role=menuitem]';
+  return [...document.querySelectorAll(`${selector} :is(${control})`)].filter((node) => node.parentElement.closest(`${selector} :is(${control})`)).map((node) => node.outerHTML.slice(0, 60));
+}, root);
 const idle = (page) => page.waitForSelector('#sendButton:not([hidden])');
 
 // Everything a test opens is closed after it, pass or fail, so a failure cannot leave a server holding the process.
@@ -239,7 +244,10 @@ test('a reloaded image turn is never sent as an empty message, and is not regene
 test('the keyboard reaches Rename and Delete on a conversation row', async ({ browser }) => {
   const stub = await startStub();
   const { page, context } = await open(browser, stub, { storage: seedChats(chatOf('a', 'First', [{ role: 'user', content: 'hi' }]), chatOf('b', 'Second', [{ role: 'user', content: 'yo' }])) });
-  await page.focus('.conv-item:nth-child(2)');
+  assert.deepEqual(await nestedControls(page, '#conversationList'), [], 'no control sits inside another');
+  assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#conversationList, #conversationList [role]')].map((n) => n.getAttribute('role'))), ['list', 'listitem', 'listitem'], 'rows are list items, the open control is a real button');
+  assert.equal(await page.evaluate(() => document.querySelectorAll('#conversationList .conv-item > button.c-open').length), 2);
+  await page.focus('.conv-item:nth-child(2) .c-open');
   await page.keyboard.press('Tab');
   assert.equal(await page.evaluate(() => document.activeElement.getAttribute('aria-label')), 'Rename conversation', 'Tab from a row reaches its Rename button');
   await page.keyboard.press('Shift+Tab');
@@ -250,12 +258,12 @@ test('the keyboard reaches Rename and Delete on a conversation row', async ({ br
   assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Delete?', 'the confirmation takes the focus');
   await page.keyboard.press('Enter');
   assert.deepEqual(await titles(page), ['First'], 'Enter again deletes');
-  await page.focus('.conv-item'); await page.keyboard.press('Tab'); await page.keyboard.press('Enter');
+  await page.focus('.conv-item .c-open'); await page.keyboard.press('Tab'); await page.keyboard.press('Enter');
   await page.keyboard.type('Kept'); await page.keyboard.press('Enter');
   assert.deepEqual(await titles(page), ['Kept']);
-  assert.equal(await page.evaluate(() => document.activeElement.classList.contains('conv-item')), true, 'a rename ends on its row');
+  assert.equal(await page.evaluate(() => document.activeElement.matches('.conv-item .c-open')), true, 'a rename ends on its row, not on the chat it would open');
   await page.evaluate(() => { document.activeElement.blur(); });
-  await page.focus('.conv-item:nth-child(1)');
+  await page.focus('.conv-item:nth-child(1) .c-open');
   await page.keyboard.press('Space');
   assert.ok(await page.$('.conv-item.selected'), 'Space on a row opens it');
   await context.close(); await stub.close();
@@ -290,6 +298,11 @@ const CASES = [
   ['stars with spaces around them are arithmetic', '2 * 3 * 4 = 24 and x ** 2 ** y', { paras: ['2 * 3 * 4 = 24 and x ** 2 ** y'], ems: 0, strongs: 0 }],
   ['emphasis beside a spaced star', 'Costs 5 * 2, *really* cheap', { paras: ['Costs 5 * 2, really cheap'], ems: 1 }],
   ['a numbered list inside a numbered list', '1. one\n   1. a\n   2. b\n2. two', { items: 2, sub: ['OL', 2] }],
+  ['a list three levels deep', '- a\n  - b\n    - c\n      - d\n- e', { items: 2, depth: 4 }],
+  ['a numbered list keeps its first number below the top', '1. one\n   5. five\n   6. six\n2. two', { sub: ['OL', 2], subStart: 5 }],
+  ['a bullet inside a numbered inside a bullet', '- a\n  1. b\n     - c\n  2. d', { depth: 3, items: 1 }],
+  ['triple stars are emphasis around strong', 'plain ***both*** and **bold** and *it*', { strongs: 2, ems: 2, nestedStrong: 1 }],
+  ['triple stars with spaces are text', '2 *** 3 *** 4', { paras: ['2 *** 3 *** 4'], strongs: 0, ems: 0 }],
 ];
 test('the markdown the models write: fences, links, tables and escapes', async ({ browser }) => {
   const stub = await startStub();
@@ -307,6 +320,9 @@ test('the markdown the models write: fences, links, tables and escapes', async (
         ems: host.querySelectorAll('em').length,
         strongs: host.querySelectorAll('strong').length,
         sub: [...host.querySelectorAll('li > ol, li > ul')].map((list) => [list.tagName, list.children.length])[0] ?? null,
+        subStart: host.querySelector('li > ol')?.start ?? null,
+        depth: Math.max(0, ...[...host.querySelectorAll('li')].map((li) => { let d = 0; for (let n = li; n && n !== host; n = n.parentElement) if (n.tagName === 'LI') d++; return d; })),
+        nestedStrong: host.querySelectorAll('em > strong').length,
       };
     }, markdown);
     for (const [key, value] of Object.entries(want)) assert.deepEqual(got[key], value, `${name}: ${key}`);
@@ -408,6 +424,51 @@ test('the chosen model comes back when it returns to the list', async ({ browser
   stub.models = [model({ id: 'A' }), model({ id: 'B' })];
   await page.evaluate(() => modelStore.refresh());
   await page.waitForFunction(() => document.getElementById('modelSelect').value === 'B');
+  await context.close(); await stub.close();
+});
+
+test('a tool round follows the bottom only for a reader who is at the bottom', async ({ browser }) => {
+  const filler = Array.from({ length: 30 }, (_, i) => [{ role: 'user', content: `question ${i}` }, { role: 'assistant', content: `answer ${i}\n\n` + 'line\n\n'.repeat(4) }]).flat();
+  let release;
+  let held = new Promise((resolve) => { release = resolve; });
+  let rounds = 0;
+  const stub = await startStub({
+    chat: (req, res) => {
+      head(res);
+      if (rounds++ % 2 === 0) {
+        sse(res, { choices: [{ delta: { tool_calls: [{ index: 0, id: `c${rounds}`, function: { name: 'list_dir', arguments: '{}' } }] } }] });
+        sse(res, { choices: [{ delta: {}, finish_reason: 'tool_calls' }] }); res.end('data: [DONE]\n\n');
+      } else { delta(res, 'done'); finish(res); }
+    },
+    tools: async (body) => {
+      if (!body.name) return { edit_default: false, tools: [{ type: 'function', function: { name: 'list_dir', description: 'x', parameters: { type: 'object', properties: {} } } }] };
+      await held;
+      return { text: 'listing' };
+    },
+  });
+  const { page, context, errors } = await open(browser, stub, { storage: { ...seedChats(chatOf('a', 'Long', filler)), 'sushi-tools': 'on' } });
+  await page.click('.conv-item');
+  const geometry = () => page.evaluate(() => { const s = document.getElementById('chatScroll'); return { top: s.scrollTop, gap: s.scrollHeight - s.scrollTop - s.clientHeight, room: s.scrollHeight - s.clientHeight }; });
+  assert.ok((await geometry()).room > 1000, 'the chat is taller than the view');
+  const settled = async () => { await page.waitForFunction(() => !document.getElementById('sendButton').hidden); await page.waitForFunction(() => /done/.test(document.getElementById('chatMessages').lastElementChild?.textContent ?? '')); };
+
+  await send(page, 'list it');
+  await page.waitForFunction(() => /list_dir/.test(document.getElementById('chatMessages').textContent));
+  assert.ok((await geometry()).gap < 24, 'sending a message scrolls to the bottom');
+  await page.evaluate(() => { document.getElementById('chatScroll').scrollTop = 300; });
+  const before = (await geometry()).top;
+  release();
+  await settled();
+  assert.equal((await geometry()).top, before, 'a reader who scrolled up stays put through the tool result and the reply');
+
+  held = new Promise((resolve) => { release = resolve; });
+  await page.evaluate(() => { const s = document.getElementById('chatScroll'); s.scrollTop = s.scrollHeight; });
+  await send(page, 'again');
+  await page.waitForFunction(() => document.getElementById('chatMessages').textContent.split('list_dir').length > 2);
+  release();
+  await settled();
+  assert.ok((await geometry()).gap < 24, 'at the bottom the view follows the tool result and the reply');
+  assert.deepEqual(errors, []);
   await context.close(); await stub.close();
 });
 

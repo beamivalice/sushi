@@ -87,7 +87,9 @@ function installStubs(config) {
     stub.calls.push({ path: url.pathname, search: url.search, auth: headers.get('authorization'), method: init.method ?? 'GET', body: init.body });
     switch (url.pathname) {
       case '/health': return json({ status: 'ok' });
-      case '/v1/models': return json({ data: stub.noModels ? [] : [{ id: stub.modelId ?? 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
+      case '/v1/models':
+        if (stub.modelsDelay) await new Promise((r) => setTimeout(r, stub.modelsDelay));
+        return json({ data: stub.noModels ? [] : [{ id: stub.modelId ?? 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
       case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: { disk_bytes: 20 * 2 ** 30, disk_used_bytes: 2 * 2 ** 30, disk_written_bytes: 4 * 2 ** 30, disk_entries: 3 } }, memory: { available_bytes: 5e9, total_bytes: 128 * 2 ** 30 }, batching: { supported: true, max_group: 4 }, default_generation_settings: { n_ctx: 8192 } });
       case '/v1/slots/cancel': return stub.cancelStatus === 404 ? json({ error: { message: 'No in-flight request matches that id' } }, 404) : json({ ok: true });
       case '/v1/tools': return json({ edit_default: false });
@@ -475,6 +477,12 @@ async function dashboardBugs(browser) {
     await page.waitForFunction(() => !document.getElementById('dashOff').hidden);
     await page.click('#dashEnableMetrics');
     await page.waitForFunction(() => /refused/.test(document.getElementById('dashOffError').textContent));
+    await context.close();
+  }
+  {
+    // The first /props read runs before the model list arrives; the read for the loaded model must not wait out the 2 s throttle.
+    const { page, context } = await openPage(browser, '/dashboard', { mode: 'compact', modelsDelay: 300 });
+    await page.waitForFunction(() => /^2\.00 GiB \/ 20\.00 GiB$/.test(document.getElementById('dashCmSsd').innerText.trim()), null, { timeout: 1000 });
     await context.close();
   }
   {

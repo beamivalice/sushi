@@ -83,7 +83,8 @@ and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone che
 - **Arch-test guard.** A test whose name mentions a model (`qwen`, `mimo`, `glm`, `dsv41`, `deepseek`) must sit in a
   folder of a model it names, or its name is in `tests/guards/arch-tests.allow`: shared code tested at that model's
   geometry. The list keys the test name, so moving a test between shared files changes nothing. A stale entry (the
-  test moved into its folder) only prints a note; `--write` drops it. To clear a failure, move the test into
+  test moved into its folder, or renamed) only prints a note; `--write` drops it, and a renamed test needs the same
+  `--write` to list its new name. To clear a failure, move the test into
   `src/<model>/`, or rename it for the shared code it tests.
 - **Model footprint guard.** Shared sources (`src/` root, `src/exl3`, `src/encoder`) may name a model only at
   dispatch points. `tests/guards/model-footprint.allow` holds one count per model: its mentions (case-insensitive

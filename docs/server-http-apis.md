@@ -701,7 +701,15 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   redirect checks and the 2 MB limit), never directly from a model-selected browser URL. A source link remains
   when previewing fails. The page caches up to 32 image requests; pixels are not persisted in chat storage.
 - Markdown emphasis follows CommonMark flanking: `*` and `**` open before a non-space and close after one, so `2 * 3 * 4`
-  stays text. A list nested in an item keeps its numbered or bulleted kind.
+  stays text; `***x***` is `<em><strong>`. A list nests by indentation to any depth (`readList`), each level keeping its
+  numbered or bulleted kind and a numbered one its first number.
+- A reader who scrolled up stays put through a tool round and the reply; `renderTranscript` follows the bottom only for a
+  view already there, or when the user sends a message or opens a chat.
+- No control sits inside another: a conversation row is a `listitem` holding a `button` (open) beside the Rename and Delete
+  buttons, a Models row a `listitem` holding a link (`/models#<id>`, arrows move between them) beside Load. An Enter that
+  rebuilds the list must `preventDefault`, or it also presses the control that took the focus.
+- The dashboard's read of a newly loaded model's `/props` skips the 2 s minimum gap once, so the SSD cache tile fills at
+  once; every other poll keeps the gap.
 - SVG code blocks offer **Render SVG** / **Hide SVG**. Only clicking renders: the bundled DOMPurify 3.4.16
   SVG profile removes active content; styles, embedded HTML, images, animation and external references are
   disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays

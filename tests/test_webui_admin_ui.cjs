@@ -794,15 +794,26 @@ async function main() {
     });
     await scenario('a rebuilt list keeps focus on the same control; rows take arrows and Space', { path: '/models#Qwen-A' }, async ({ page, server }) => {
       await page.waitForSelector('.list [data-id="Deep-C"] button');
+      const nested = await page.evaluate(() => {
+        const control = 'button, a[href], input, select, textarea, summary, [tabindex], [role=button], [role=option], [role=link]';
+        return [...document.querySelectorAll(`#modelsList :is(${control})`)].filter((n) => n.parentElement.closest(`#modelsList :is(${control})`)).length;
+      });
+      assert.equal(nested, 0, 'no control sits inside another in the Models list');
+      assert.equal(await page.evaluate(() => document.querySelectorAll('#modelsList [role=option], #modelsList [role=listbox]').length), 0, 'a list with buttons is not a listbox');
+      assert.equal(await page.evaluate(() => document.querySelector('#modelsList .row.selected .main').getAttribute('aria-current')), 'true', 'the open model is marked current');
       await page.focus('.list [data-id="Deep-C"] button');
       server.state.models[0].bytes_resident = 12 * GiB;
       await settle(page, 6000);
-      assert.equal(await page.evaluate(() => document.activeElement.matches('.row[data-id="Deep-C"] button')), true, 'the Load button keeps focus');
-      await page.focus('.list [data-id="Broke-D"]');
+      assert.equal(await page.evaluate(() => document.activeElement.matches('.row[data-id="Deep-C"] button.btn')), true, 'the Load button keeps focus');
+      await page.focus('.list [data-id="Broke-D"] .main');
       await page.keyboard.press('ArrowDown');
-      assert.equal(await page.evaluate(() => document.activeElement.dataset.id), 'Deep-C');
+      assert.equal(await page.evaluate(() => document.activeElement.closest('.row').dataset.id), 'Deep-C');
       await page.keyboard.press('Space');
       assert.equal(await page.evaluate(() => location.hash), '#Deep-C');
+      await page.keyboard.press('ArrowUp');
+      await page.keyboard.press('Enter');
+      assert.equal(await page.evaluate(() => location.hash), '#Broke-D', 'Enter opens a row');
+      assert.equal(await page.evaluate(() => document.activeElement.matches('.row[data-id="Broke-D"] .main')), true, 'and the focus stays on it');
     });
     await scenario('a file value the loader drops does not ask for a reload forever', { serverOpts: { limits: true }, path: '/models#Qwen-A', setup: (s) => {
       s.state.models[0].settings.kv_quant = keyState({ file: '4', source: 'file' });

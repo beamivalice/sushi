@@ -80,6 +80,17 @@ const checks = async function () {
     assert(host.querySelector('p').textContent.endsWith(' * x') && !host.querySelector('em'), 'escaped star');
     assert([...host.querySelectorAll('td')].map((c) => c.textContent).join('/') === 'x|y/2', 'code span split the cell');
   });
+  await test('Markdown lists nest by indentation, keep a nested start, and *** is emphasis around strong', () => {
+    const host = el('div');
+    host.appendChild(renderMarkdown('- a\n  - b\n    - c\n      - d\n- e\n\n1. one\n   5. five\n   6. six\n\n***both*** and **bold** and *it*'));
+    document.getElementById('examples').appendChild(host);
+    assert(host.querySelectorAll('ul ul ul ul').length === 1, 'the fourth level was flattened');
+    assert(host.querySelectorAll(':scope > ul > li').length === 2, 'the outer list lost an item');
+    assert(host.querySelector('ol ol').start === 5, 'the nested numbered list lost its start');
+    const last = host.lastElementChild;
+    assert(last.querySelectorAll('em > strong').length === 1 && last.querySelectorAll('strong').length === 2 && last.querySelectorAll('em').length === 2, 'triple stars');
+    assert(last.textContent === 'both and bold and it', `stray stars: ${last.textContent}`);
+  });
   document.title = failures ? `${failures} FAILED` : 'All renderer checks passed';
   results.prepend(el('h2', null, document.title));
 };

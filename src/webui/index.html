@@ -121,6 +121,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .conv-item:hover { background: var(--surface-2); }
 .conv-item.selected { background: var(--accent-soft); }
 .conv-item .c-body { flex: 1; min-width: 0; }
+.conv-item button.c-body { display: block; padding: 0; border: 0; background: none; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.conv-item button.c-body > span { display: block; }
 .conv-item .c-title { font-size: var(--fs-md); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv-item.selected .c-title { color: var(--accent); font-weight: 600; }
 .conv-item .c-sub { font-size: var(--fs-sm); color: var(--text-3); }
@@ -443,8 +445,8 @@ dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2);
 .row { display: flex; align-items: center; gap: var(--s3); min-height: 60px; padding: var(--s2) var(--s3) var(--s2) var(--s4); border-bottom: 1px solid var(--border); cursor: pointer; position: relative; transition: background-color var(--dur-1) var(--ease-out); }
 .row:hover { background: var(--surface-2); }
 .row:last-child { border-bottom: 0; }
-.row[aria-selected="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent-fill); }
-.row .main { flex: 1; min-width: 0; }
+.row.selected { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent-fill); }
+.row .main { flex: 1; min-width: 0; color: inherit; text-decoration: none; }
 .row .name { font-weight: 600; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .row .meta { color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
 .row .meta.err { color: var(--err); }
@@ -860,7 +862,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="md" id="modelsMd">
       <div class="card list" id="modelsListCard">
         <div class="filter" id="modelsFilterBox" hidden><input id="modelsFilter" type="text" autocomplete="off" aria-label="Filter models" placeholder="Filter models"></div>
-        <div id="modelsList" role="listbox" aria-label="Models"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
+        <div id="modelsList" role="list" aria-label="Models"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
       </div>
       <div class="card detail" id="modelsDetail"></div>
     </div>
@@ -1412,14 +1414,15 @@ function sanitizedSvgSource(code) {
 }
 function inlineEmphasis(text, host, codes) {
   // A delimiter opens before a non-space and closes after one, so the stars of `2 * 3 * 4` stay text.
-  const boldRe = /\*\*(?=\S)([^*]*[^*\s])\*\*/g;
+  const boldRe = /\*\*\*(?=\S)([^*]*[^*\s])\*\*\*|\*\*(?=\S)([^*]*[^*\s])\*\*/g;
   let cursor = 0;
   let match;
   while ((match = boldRe.exec(text)) !== null) {
     if (match.index > cursor) inlineItalic(text.slice(cursor, match.index), host, codes);
     const bold = el("strong");
-    inlineItalic(match[1], bold, codes);
-    host.appendChild(bold);
+    inlineItalic(match[1] ?? match[2], bold, codes);
+    if (match[1] === undefined) host.appendChild(bold);
+    else host.appendChild(el("em")).appendChild(bold);
     cursor = match.index + match[0].length;
   }
   if (cursor < text.length) inlineItalic(text.slice(cursor), host, codes);
@@ -1521,6 +1524,44 @@ function readFence(lines, start, open) {
   }
   return { node: codeBlockNode(lang, code.join("\n")), next: index + 1 };
 }
+const LIST_ITEM = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+const indentOf = (line) => line.match(/^[ \t]*/)[0].replace(/\t/g, "    ").length;
+// A list's items sit at the indent of its first; a deeper item opens a list inside the item above it, to any depth.
+function readList(lines, start, parentIndent) {
+  const first = lines[start].match(LIST_ITEM);
+  const base = indentOf(lines[start]);
+  const ordered = /\d/.test(first[2]);
+  const list = el(ordered ? "ol" : "ul");
+  if (ordered && parseInt(first[2], 10) > 1) list.start = parseInt(first[2], 10);
+  let index = start;
+  while (index < lines.length) {
+    const itemMatch = lines[index].match(LIST_ITEM);
+    const indent = indentOf(lines[index]);
+    if (!itemMatch || indent <= parentIndent || indent >= base + 2) break;
+    const item = el("li");
+    item.appendChild(inlineNodes(itemMatch[3]));
+    index += 1;
+    while (index < lines.length && indentOf(lines[index]) >= base + 2) {
+      const next = lines[index];
+      const fence = next.match(FENCE_OPEN);
+      if (fence) {
+        const block = readFence(lines, index, fence);
+        item.appendChild(block.node);
+        index = block.next;
+      } else if (LIST_ITEM.test(next)) {
+        const block = readList(lines, index, base);
+        item.appendChild(block.node);
+        index = block.next;
+      } else {
+        item.appendChild(document.createTextNode(" "));
+        item.appendChild(inlineNodes(next.trim()));
+        index += 1;
+      }
+    }
+    list.appendChild(item);
+  }
+  return { node: list, next: index };
+}
 function renderMarkdown(text) {
   const fragment = document.createDocumentFragment();
   const lines = String(text ?? "").split("\n");
@@ -1591,56 +1632,10 @@ function renderMarkdown(text) {
       fragment.appendChild(wrap);
       continue;
     }
-    const listMatch = line.match(/^(\s*)([-*+]|\d+[.)])\s+/);
-    if (listMatch) {
-      const ordered = /\d/.test(listMatch[2]);
-      const list = el(ordered ? "ol" : "ul");
-      const start = ordered ? parseInt(listMatch[2], 10) : 1;
-      if (ordered && start > 1) list.start = start;
-      while (index < lines.length) {
-        const itemMatch = lines[index].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
-        if (!itemMatch) break;
-        const item = el("li");
-        item.appendChild(inlineNodes(itemMatch[3]));
-        const nested = [];
-        let nestedOrdered = false;
-        while (index + 1 < lines.length) {
-          const next = lines[index + 1];
-          const nestedFence = /^\s{2,}/.test(next) ? next.match(FENCE_OPEN) : null;
-          if (nestedFence) {
-            const block = readFence(lines, index + 1, nestedFence);
-            item.appendChild(block.node);
-            index = block.next - 1;
-            continue;
-          }
-          const nestedMatch = next.match(/^\s{2,}([-*+]|\d+[.)])\s+(.*)$/);
-          if (nestedMatch) {
-            if (!nested.length) nestedOrdered = /\d/.test(nestedMatch[1]);
-            nested.push(nestedMatch[2]);
-            index += 1;
-            continue;
-          }
-          if (/^\s{2,}\S/.test(next) && !next.match(/^(\s*)([-*+]|\d+[.)])\s+/)) {
-            item.appendChild(document.createTextNode(" "));
-            item.appendChild(inlineNodes(next.trim()));
-            index += 1;
-            continue;
-          }
-          break;
-        }
-        if (nested.length > 0) {
-          const sub = el(nestedOrdered ? "ol" : "ul");
-          for (const nestedText of nested) {
-            const subItem = el("li");
-            subItem.appendChild(inlineNodes(nestedText));
-            sub.appendChild(subItem);
-          }
-          item.appendChild(sub);
-        }
-        list.appendChild(item);
-        index += 1;
-      }
-      fragment.appendChild(list);
+    if (LIST_ITEM.test(line)) {
+      const block = readList(lines, index, -1);
+      fragment.appendChild(block.node);
+      index = block.next;
       continue;
     }
     if (!line.trim()) {
@@ -2094,8 +2089,10 @@ function chatTitle(chat) {
 function renderConversationList() {
   const host = $("conversationList");
   // A rebuild must not drop the keyboard's place: focus returns to the same row, or to its last action button.
-  const at = document.activeElement, held = host.contains(at) ? { id: at.closest(".conv-item")?.dataset.chat, button: at.tagName === "BUTTON" } : null;
+  const at = document.activeElement, held = host.contains(at) ? { id: at.closest(".conv-item")?.dataset.chat, action: Boolean(at.closest(".c-actions")) } : null;
   host.textContent = "";
+  if (chats.length) host.setAttribute("role", "list");
+  else host.removeAttribute("role");
   if (chats.length === 0) {
     host.appendChild(el("div", "conv-empty", "No conversations yet.\nStart one below."));
     return;
@@ -2103,10 +2100,10 @@ function renderConversationList() {
   for (const chat of chats) {
     const item = el("div", `conv-item${chat === currentChat ? " selected" : ""}`);
     item.dataset.chat = chat.id;
-    item.setAttribute("role", "button");
-    item.tabIndex = 0;
-    const body = el("div", "c-body");
-    if (renamingChatId === chat.id) {
+    item.setAttribute("role", "listitem");
+    const renaming = renamingChatId === chat.id;
+    const body = renaming ? el("div", "c-body") : el("button", "c-body c-open");
+    if (renaming) {
       const input = el("input");
       input.type = "text";
       input.setAttribute("aria-label", "Conversation title");
@@ -2122,8 +2119,11 @@ function renderConversationList() {
         renderConversationList();
       };
       input.onkeydown = (event) => {
-        if (event.key === "Enter") settle(true);
-        else if (event.key === "Escape") {
+        if (event.key === "Enter") {
+          // The rebuilt row takes the focus before the key's default action; Enter must not also press its button.
+          event.preventDefault();
+          settle(true);
+        } else if (event.key === "Escape") {
           event.stopPropagation();
           settle(false);
         }
@@ -2138,8 +2138,11 @@ function renderConversationList() {
       });
       continue;
     }
-    body.appendChild(el("div", "c-title", chatTitle(chat)));
-    body.appendChild(el("div", "c-sub", relativeTime(chat.updated)));
+    body.type = "button";
+    if (chat === currentChat) body.setAttribute("aria-current", "true");
+    body.onclick = () => openChat(chat.id);
+    body.appendChild(el("span", "c-title", chatTitle(chat)));
+    body.appendChild(el("span", "c-sub", relativeTime(chat.updated)));
     item.appendChild(body);
 
     const actions = el("div", "c-actions");
@@ -2177,24 +2180,21 @@ function renderConversationList() {
       actions.append(rename, del);
     }
     item.appendChild(actions);
-    item.onclick = () => openChat(chat.id);
-    item.onkeydown = (event) => {
-      if (event.target !== item || (event.key !== "Enter" && event.key !== " ")) return;
-      event.preventDefault();
-      openChat(chat.id);
+    item.onclick = (event) => {
+      if (event.target === item) openChat(chat.id);
     };
     host.appendChild(item);
   }
   const row = held?.id && [...host.children].find((node) => node.dataset.chat === held.id);
   // The row first: its actions show only while focus is within it.
-  row?.focus();
-  if (row && held.button) row.querySelector(".c-actions button:last-child")?.focus();
+  row?.querySelector(".c-open")?.focus();
+  if (row && held.action) row.querySelector(".c-actions button:last-child")?.focus();
 }
 function openChat(id) {
   if (chatAbort) return;
   currentChat = chats.find((chat) => chat.id === id) ?? null;
   lastTurnError = null;
-  renderTranscript();
+  renderTranscript(true);
   renderConversationList();
   closeChatDrawersOnMobile();
   $("promptInput").focus();
@@ -2213,7 +2213,7 @@ function newChat() {
   draftDirectory = "";
   draftEdit = editDefault;
   lastTurnError = null;
-  renderTranscript();
+  renderTranscript(true);
   renderConversationList();
   closeChatDrawersOnMobile();
   $("promptInput").focus();
@@ -2319,8 +2319,13 @@ function appendMessageNode(message, { last = false, toolCall = null } = {}) {
   $("chatMessages").appendChild(node);
   return node;
 }
-function renderTranscript() {
+// A rebuild follows the bottom only when the view was there (or the caller starts a turn or opens a chat); a reader
+// scrolled up keeps the same offset.
+function renderTranscript(toBottom = false) {
   renderDirectoryButton();
+  const scroller = $("chatScroll");
+  const keepTop = scroller.scrollTop;
+  toBottom ||= scroller.scrollHeight - keepTop - scroller.clientHeight < 24;
   const messages = currentChat?.messages ?? [];
   $("chatMessages").textContent = "";
   $("chatEmpty").hidden = messages.length > 0 || Boolean(lastTurnError);
@@ -2338,7 +2343,8 @@ function renderTranscript() {
     notice.appendChild(retry);
     $("chatMessages").appendChild(notice);
   }
-  scrollChat(true);
+  if (toBottom) scrollChat(true);
+  else scroller.scrollTop = keepTop;
 }
 function scrollChat(force = false) {
   const scroller = $("chatScroll");
@@ -2691,7 +2697,7 @@ function createStreamingView() {
     node.remove();
   };
   $("chatMessages").appendChild(node);
-  scrollChat(true);
+  scrollChat();
   return state;
 }
 function replyMeta(usage, timings, finishReason, aborted, clientRate, effortNotice) {
@@ -2867,7 +2873,7 @@ async function runTurn(chat) {
   chatAbort = new AbortController();
   lastTurnError = null;
   setChatBusy(true);
-  renderTranscript();
+  renderTranscript(true);
   try {
     const vision = modelSeesImages(selectedModel());
     const pack = toolsEnabled ? await callResearchTools({ vision, write: !!chat.edit, ...(chat.directory ? { directory: chat.directory } : {}) }, chatAbort.signal) : null;
@@ -2989,7 +2995,7 @@ async function init() {
   // One damaged saved chat must not keep the models from loading.
   try {
     renderConversationList();
-    renderTranscript();
+    renderTranscript(true);
   } catch (error) {
     console.error(error);
   }
@@ -3279,8 +3285,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const roots = rootsInUse(A.settings?.server.models_dir ?? { boot_roots: [] }).join(", ") || "the models folder";
     const item = (m) => {
       const canLoad = (m.state === "unloaded" || m.state === "error") && !modelStore.pending.has(m.id);
-      return h("div", { class: "row", role: "option", tabindex: "0", "data-id": m.id, "aria-selected": String(m.id === A.sel), onclick: () => trySelect(m.id), onkeydown: (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) { e.preventDefault(); trySelect(m.id); } } },
-        h("span", { class: `dot ${dotOf(m)}` }), h("div", { class: "main" }, h("div", { class: "name", text: m.id }), h("div", { class: `meta${m.state === "error" && !modelStore.pending.has(m.id) ? " err" : ""}`, text: metaOf(m) })),
+      const open = (e) => { if (e.metaKey || e.ctrlKey || e.shiftKey) return; e.preventDefault(); trySelect(m.id); };
+      return h("div", { class: `row${m.id === A.sel ? " selected" : ""}`, role: "listitem", "data-id": m.id, onclick: (e) => { if (e.target === e.currentTarget) trySelect(m.id); } },
+        h("span", { class: `dot ${dotOf(m)}` }), h("a", { class: "main", href: `/models#${encodeURIComponent(m.id)}`, "aria-current": m.id === A.sel ? "true" : null, onclick: open, onkeydown: (e) => { if (e.key === " ") open(e); } }, h("div", { class: "name", text: m.id }), h("div", { class: `meta${m.state === "error" && !modelStore.pending.has(m.id) ? " err" : ""}`, text: metaOf(m) })),
         isDirty(m.id) ? h("span", { class: "edit-dot", title: "Unsaved changes" }) : null,
         canLoad ? h("button", { class: "btn sm", type: "button", text: "Load", title: evictNote(m) || null, onclick: (e) => { e.stopPropagation(); modelStore.act(m.id, "load"); } }) : null);
     };
@@ -3292,12 +3299,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         ...(rows.length ? [] : [" ", h("button", { class: "btn sm primary", type: "button", text: "See available packs", onclick: () => q("modelsTabAvailable").click() }), " ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
     if (held?.id && !list.contains(document.activeElement)) {
       const r = list.querySelector(`[data-id="${CSS.escape(held.id)}"]`);
-      ((held.button ? r?.querySelector("button") : null) ?? r)?.focus();
+      ((held.button ? r?.querySelector("button") : null) ?? r?.querySelector(".main"))?.focus();
     }
   }
   q("modelsList").addEventListener("keydown", (e) => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
-    const rows = [...q("modelsList").querySelectorAll(".row")], at = rows.indexOf(e.target.closest(".row"));
+    const rows = [...q("modelsList").querySelectorAll(".row .main")], at = rows.indexOf(e.target.closest(".main"));
     if (at < 0) return;
     e.preventDefault();
     rows[e.key === "Home" ? 0 : e.key === "End" ? rows.length - 1 : Math.max(0, Math.min(rows.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)))].focus();
@@ -4860,12 +4867,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     } catch { /* the metrics poll already reports connection problems */ }
     finally { polling = false; }
   }
-  // The strip reads the shared model list; a change in what is loaded refreshes the per-model figures at once.
+  // The strip reads the shared model list; a change in what is loaded refreshes the per-model figures at once, past the
+  // minimum gap (the poll that ran before the list arrived must not hold back the first read of a loaded model).
   let readySig = '';
   function syncModels() {
     modelList = modelStore.list; modelsKnown = modelStore.online === true;
     const sig = modelList.filter(m => m.state === 'ready').map(m => m.id).join();
-    if (sig !== readySig) { readySig = sig; propsAt = 0; }
+    if (sig !== readySig) { readySig = sig; propsAt = lastServerAt = 0; }
     if (dashActive) { renderCompact(); pollServer(); }
   }
   modelStore.subscribe(syncModels);
