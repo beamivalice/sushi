@@ -312,12 +312,24 @@ fn selectedByUser(user: ?[]const []const u8, full: []const u8) bool {
 }
 
 /// The filter that selects a user-matched test. Filters reach `zig test` in a response file whose parser reads a quote
-/// or backslash as syntax, so a name is cut at its first one; the cut must not select a test the user's filters skip.
+/// or backslash as syntax, so a name holding one is cut there and its longest piece that no skipped test also holds
+/// stands for it; null when every piece would select a test the user's filters skip.
+fn quoteFreeFilter(full: []const u8, all: []const []const u8, user: []const []const u8) ?[]const u8 {
+    if (std.mem.indexOfAny(u8, full, "'\"\\") == null) return full;
+    var best: ?[]const u8 = null;
+    var pieces = std.mem.tokenizeAny(u8, full, "'\"\\");
+    while (pieces.next()) |piece| {
+        if (best) |b| if (b.len >= piece.len) continue;
+        for (all) |other| {
+            if (std.mem.indexOf(u8, other, piece) != null and !selectedByUser(user, other)) break;
+        } else best = piece;
+    }
+    return best;
+}
+
 fn nameFilter(full: []const u8, all: []const []const u8, user: []const []const u8) []const u8 {
-    const cut = full[0 .. std.mem.indexOfAny(u8, full, "'\"\\") orelse return full];
-    for (all) |other| if (std.mem.indexOf(u8, other, cut) != null and !selectedByUser(user, other))
-        std.debug.panic("rename the test \"{s}\": its filter cannot avoid a quote or backslash", .{full});
-    return cut;
+    return quoteFreeFilter(full, all, user) orelse
+        std.debug.panic("rename the test \"{s}\": no quote-free part of it avoids the tests your filter skips", .{full});
 }
 
 fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, user: ?[]const []const u8) []const *std.Build.Step.Compile {
@@ -702,4 +714,23 @@ fn verifyBrewDeps(b: *std.Build) void {
             std.process.exit(1);
         }
     }
+}
+
+test "a test name with an apostrophe keeps a quote-free filter that skips no other test" {
+    const all = [_][]const u8{
+        "server.test.Flash-Next's request bill brackets the peaks",
+        "server.test.Flash-Next's streamed request bill brackets the streamed peaks",
+        "server.test.plain name",
+    };
+    const user = [_][]const u8{"streamed request bill brackets"};
+    const f = quoteFreeFilter(all[1], &all, &user).?;
+    try std.testing.expect(std.mem.indexOfAny(u8, f, "'\"\\") == null);
+    for (all, 0..) |name, i| try std.testing.expectEqual(i == 1, std.mem.indexOf(u8, name, f) != null);
+}
+
+test "a name without a quote is its own filter, and an unavoidable quote yields none" {
+    const all = [_][]const u8{ "a.test.x's y", "a.test.x and s y" };
+    const user = [_][]const u8{"x's y"};
+    try std.testing.expectEqualStrings("a.test.plain", quoteFreeFilter("a.test.plain", &all, &user).?);
+    try std.testing.expect(quoteFreeFilter(all[0], &all, &user) == null);
 }

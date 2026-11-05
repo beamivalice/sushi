@@ -43,6 +43,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   `b.dependOnDirectoryContents`/`dependOnFileContents`; without that a new test file never runs until the cache goes.
 - A filtered run keeps the parallel binaries: the scan keeps the tests whose full name holds a `-Dtest-filter` substring
   and balances them over the same binaries, and the host tier runs once, in `test-host`.
+  A filter may hold any character; a test name with a quote is selected by its longest quote-free piece that no
+  skipped test holds (the response file the compiler reads cannot carry a quote), and a name with none is renamed.
 - `SUSHI_TEST_NO_GPU=1` makes a test build see no Metal backend, so `requireGpu` skips (diagnostic, test builds only).
 - The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
