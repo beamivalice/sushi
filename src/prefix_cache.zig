@@ -51,6 +51,10 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 /// commit time instead of claim time.
 pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 
+/// Shortest prefix an idle entry is trimmed down to for room. A restore under it saves about a
+/// quarter of a second of prefill, and the remnant would still hold an entry slot.
+pub const MIN_TRIMMED_VICTIM_TOKENS: usize = 512;
+
 /// Shortest prefix a ring-checkpoint restore reuses; below it the request cold-prefills.
 pub const RING_RESTORE_MIN_TOKENS: usize = 64;
 
@@ -2282,30 +2286,14 @@ pub const HotPrefixCache = struct {
                     new_mtp_bytes = 0;
                 }
                 if (eff_cps) |cps| {
-                    var kept: usize = 0;
-                    while (kept < cps.len and cps[kept].pos <= tl) kept += 1;
-                    if (kept < cps.len) {
-                        // The pooled indexer bank lives only on the latest snap (every snap
-                        // carries its own leftover), so it is sliced onto the last KEPT snap
-                        // before the tail is dropped.
-                        if (kept > 0 and checkpointHasQsaPooled(&cps[cps.len - 1])) {
-                            sliceQsaHistoryOntoCheckpoint(&cps[kept - 1], &cps[cps.len - 1], cps[kept - 1].pos, mlx.gpuStream()) catch |err| {
-                                // Retaining a history-less hybrid entry makes every later
-                                // restore a silent miss; decline and let the SSD tier take it.
-                                decline = .qsa_history_slice_failed;
-                                decline_err = err;
-                                break :trim_blk;
-                            };
-                        }
-                        const shrunk = self.allocator.dupe(SSMCheckpoint, cps[0..kept]) catch |err| {
-                            decline = .checkpoint_list_copy_failed;
-                            decline_err = err;
-                            break :trim_blk;
+                    eff_cps = truncateCheckpoints(self.allocator, cps, tl) catch |err| {
+                        decline = switch (err) {
+                            error.QsaHistorySliceFailed => .qsa_history_slice_failed,
+                            error.CheckpointListCopyFailed => .checkpoint_list_copy_failed,
                         };
-                        for (cps[kept..]) |*cp| cp.deinit(self.allocator);
-                        self.allocator.free(cps);
-                        eff_cps = shrunk;
-                    }
+                        decline_err = err;
+                        break :trim_blk;
+                    };
                 }
                 eff_tokens = tokens[0..tl];
                 if (eff_media_start) |ms| {
@@ -2581,7 +2569,7 @@ pub const HotPrefixCache = struct {
                 while (self.current_kv_bytes > self.max_kv_bytes and
                     self.entries.items.len > 1)
                 {
-                    if (!self.evictOneLruProgress("byte budget", null)) break;
+                    if (!self.reclaimFromLru("byte budget", null, self.current_kv_bytes - self.max_kv_bytes)) break;
                 }
                 self.shedCheckpointsToFit();
                 while (self.current_kv_bytes > self.max_kv_bytes and
@@ -2635,6 +2623,25 @@ pub const HotPrefixCache = struct {
         return .{ .ok = eff_tokens.len };
     }
 
+    const TruncateCheckpointsError = error{ QsaHistorySliceFailed, CheckpointListCopyFailed };
+
+    /// The checkpoints at or below `tl`, the rest freed. The pooled indexer bank lives only on the latest
+    /// checkpoint, so it is sliced onto the last KEPT one first; a history-less hybrid entry would make
+    /// every later restore a silent miss. On error `cps` stays owned by the caller.
+    fn truncateCheckpoints(allocator: std.mem.Allocator, cps: []SSMCheckpoint, tl: usize) TruncateCheckpointsError![]SSMCheckpoint {
+        var kept: usize = 0;
+        while (kept < cps.len and cps[kept].pos <= tl) kept += 1;
+        if (kept == cps.len) return cps;
+        if (kept > 0 and checkpointHasQsaPooled(&cps[cps.len - 1])) {
+            sliceQsaHistoryOntoCheckpoint(&cps[kept - 1], &cps[cps.len - 1], cps[kept - 1].pos, mlx.gpuStream()) catch
+                return error.QsaHistorySliceFailed;
+        }
+        const shrunk = allocator.dupe(SSMCheckpoint, cps[0..kept]) catch return error.CheckpointListCopyFailed;
+        for (cps[kept..]) |*cp| cp.deinit(allocator);
+        allocator.free(cps);
+        return shrunk;
+    }
+
     fn retainNewEntry(self: *HotPrefixCache, entry: Entry) !bool {
         var incoming = entry;
         errdefer freeEntryOwnedState(self.allocator, &incoming);
@@ -2643,7 +2650,8 @@ pub const HotPrefixCache = struct {
         }
         if (self.max_kv_bytes > 0) {
             while (self.current_kv_bytes + incoming.kv_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
-                if (!self.evictOneLruProgress("byte budget", incoming.cache_key)) break;
+                const need = self.current_kv_bytes + incoming.kv_bytes - self.max_kv_bytes;
+                if (!self.reclaimFromLru("byte budget", incoming.cache_key, need)) break;
             }
         }
         if (self.entries.items.len >= self.max_entries) return self.declineIncoming(&incoming, "count cap");
@@ -3730,7 +3738,7 @@ pub const HotPrefixCache = struct {
         self.max_kv_bytes = max_kv_bytes;
         if (!shrank) return;
         while (self.current_kv_bytes > max_kv_bytes and self.entries.items.len > 0) {
-            if (!self.evictOneLruProgress("budget revised", null)) break;
+            if (!self.reclaimFromLru("budget revised", null, self.current_kv_bytes - max_kv_bytes)) break;
         }
         self.shedCheckpointsToFit();
         self.logResident();
@@ -3739,6 +3747,106 @@ pub const HotPrefixCache = struct {
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
         const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
         self.evictForSpace(idx, reason);
+    }
+
+    /// Frees at least `need` bytes from the LRU victim: trimmed to the last restore point that leaves it
+    /// small enough, else evicted whole. False when nothing was evictable (the budget loops' exit).
+    fn reclaimFromLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64, need: u64) bool {
+        const idx = self.lruIndexExcluding(null, incoming_key) orelse return false;
+        const why = self.trimVictim(idx, reason, need) orelse return true;
+        var buf: [160]u8 = undefined;
+        self.evictForSpace(idx, std.fmt.bufPrint(&buf, "{s}; not trimmed: {s}", .{ reason, why }) catch reason);
+        return true;
+    }
+
+    /// The longest restore point of `list` (ascending) at or under `limit` and over the useful minimum
+    /// whose prefix, with the checkpoints at or below it, bills at most `allow`. No checkpoint is shed or added.
+    fn victimTrimLen(allow: u64, limit: usize, row_bytes: u64, list: []const SSMCheckpoint) ?usize {
+        var k = list.len;
+        while (k > 0) {
+            k -= 1;
+            const p = list[k].pos;
+            if (p > limit or list[k].isReleased()) continue;
+            if (p < MIN_TRIMMED_VICTIM_TOKENS) return null;
+            var cps_cost: u64 = trimmedCheckpointBytes(list, k);
+            for (list[0..k]) |*cp| cps_cost += ssmCheckpointBytes(cp);
+            if (@as(u64, p) * row_bytes + cps_cost <= allow) return p;
+        }
+        return null;
+    }
+
+    /// Shrinks idle entry `idx` to a real copy of its prefix so that it frees `need` bytes, dropping its
+    /// spec payloads. Null when trimmed; otherwise why not, with the entry untouched.
+    fn trimVictim(self: *HotPrefixCache, idx: usize, reason: []const u8, need: u64) ?[]const u8 {
+        const e = &self.entries.items[idx];
+        const old_snap_bytes = snapshotBytes(&e.snapshot);
+        // Only an entry whose whole bill is rows, checkpoints and spec payloads is re-billed here.
+        if (e.ring_cps != null or ringedBytes(&e.snapshot) > 0 or
+            e.kv_bytes != old_snap_bytes + e.ssm_bytes + e.dflash_bytes + e.mtp_bytes) return "state this trim does not bill";
+        if (need >= e.kv_bytes) return "needs more than the entry holds";
+        const allow = e.kv_bytes - need;
+        const row_bytes = snapshotRowBytes(&e.snapshot);
+        if (row_bytes == 0) return "no per-row price";
+        // A trim never keeps media rows, as the incoming candidate's does not.
+        const limit = @min(e.tokens.len -| 1, e.media_start orelse e.tokens.len);
+        var tl: usize = undefined;
+        if (e.ssm_checkpoints) |list| {
+            if (self.qsa_history_required and !checkpointHasQsaPooled(&list[list.len - 1])) return "no QSA bank on the newest checkpoint";
+            tl = victimTrimLen(allow, limit, row_bytes, list) orelse return "no restore point fits";
+        } else {
+            tl = @min(allow / row_bytes, limit);
+            if (tl < MIN_TRIMMED_VICTIM_TOKENS) return "no prefix fits";
+        }
+        const stream = mlx.gpuStream();
+        const tokens = self.allocator.dupe(u32, e.tokens[0..tl]) catch return "token copy failed";
+        var snap = e.snapshot.trimmedCopy(tl, null, stream) catch {
+            self.allocator.free(tokens);
+            return "snapshot copy failed";
+        };
+        const before_ssm = e.ssm_bytes;
+        var new_cps: ?[]SSMCheckpoint = null;
+        if (e.ssm_checkpoints) |cps| {
+            new_cps = truncateCheckpoints(self.allocator, cps, tl) catch |err| {
+                self.allocator.free(tokens);
+                snap.deinit();
+                // The slice may already have re-billed the kept checkpoint's bank.
+                var ssm: u64 = 0;
+                for (cps) |*cp| ssm += ssmCheckpointBytes(cp);
+                e.ssm_bytes = ssm;
+                e.kv_bytes = e.kv_bytes - before_ssm + ssm;
+                self.current_kv_bytes = self.current_kv_bytes - before_ssm + ssm;
+                return @errorName(err);
+            };
+        }
+        var ssm: u64 = 0;
+        if (new_cps) |cps| for (cps) |*cp| {
+            ssm += ssmCheckpointBytes(cp);
+        };
+        const old_len = e.tokens.len;
+        const old_bytes = e.kv_bytes;
+        const new_bytes = snapshotBytes(&snap) + ssm;
+        self.allocator.free(e.tokens);
+        e.tokens = tokens;
+        e.snapshot.deinit();
+        e.snapshot = snap;
+        e.ssm_checkpoints = new_cps;
+        e.ssm_bytes = ssm;
+        if (e.dflash) |*d| d.deinit();
+        e.dflash = null;
+        e.dflash_bytes = 0;
+        if (e.mtp) |*m| m.deinit();
+        e.mtp = null;
+        e.mtp_bytes = 0;
+        if (e.media_start != null) {
+            e.media_start = null;
+            e.vision_key = 0;
+        }
+        e.kv_bytes = new_bytes;
+        self.current_kv_bytes = self.current_kv_bytes - old_bytes + new_bytes;
+        log.info("  [hot-cache] trimmed idle entry ({s}; key={x}): {d} -> {d} tokens, freed {d:.2} MB\n", .{
+            reason, e.cache_key, old_len, tl, @as(f64, @floatFromInt(old_bytes - new_bytes)) / (1024.0 * 1024.0),
+        });
+        return null;
     }
 
     /// An entry dropped for room (a budget, the entry cap, a prefill): a tier-counter eviction, which an SSD-first spill is not.
@@ -7348,6 +7456,160 @@ test "HotPrefixCache: a revised budget evicts down to fit and a raised one keeps
     hc.setBudget(0);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     try testing.expectEqual(@as(u64, 0), hc.max_kv_bytes);
+}
+
+/// Commit an idle hybrid entry of `n` tokens (ids from `base`) with a restore point at each of `points`.
+fn pcCommitHybridAt(hc: *HotPrefixCache, s: mlx.mlx_stream, base: u32, n: u32, points: []const usize) !void {
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, n);
+    const toks = try testing.allocator.alloc(u32, n);
+    defer testing.allocator.free(toks);
+    for (toks, 0..) |*t, i| t.* = base + @as(u32, @intCast(i));
+    const cps = try testing.allocator.alloc(SSMCheckpoint, points.len);
+    for (cps, points, 0..) |*cp, pos, i| {
+        var src = pcBuildHybrid(s, 100.0 * @as(f64, @floatFromInt(i + 1)), 500.0);
+        defer pcFreeHybrid(&src);
+        cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, pos, s);
+    }
+    _ = try hc.commitWithSsm(&cache, toks, false, cps, null, null);
+}
+
+fn pcCommitPlain(hc: *HotPrefixCache, s: mlx.mlx_stream, base: u32, n: u32) !void {
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, n);
+    const toks = try testing.allocator.alloc(u32, n);
+    defer testing.allocator.free(toks);
+    for (toks, 0..) |*t, i| t.* = base + @as(u32, @intCast(i));
+    _ = try hc.commit(&cache, toks, false);
+}
+
+fn pcBilledSum(hc: *const HotPrefixCache) u64 {
+    var sum: u64 = 0;
+    for (hc.entries.items) |*e| sum += e.kv_bytes;
+    return sum;
+}
+
+/// What entry `e` bills when trimmed to its restore point `p`.
+fn pcBillAt(e: *const Entry, p: usize) u64 {
+    var sum = @as(u64, p) * HotPrefixCache.snapshotRowBytes(&e.snapshot);
+    for (e.ssm_checkpoints.?) |*cp| {
+        if (cp.pos <= p) sum += ssmCheckpointBytes(cp);
+    }
+    return sum;
+}
+
+fn pcPlainBytes(s: mlx.mlx_stream, n: u32) !u64 {
+    var scratch = HotPrefixCache.initWithMem(testing.allocator, 1, 0);
+    defer scratch.deinit();
+    try pcCommitPlain(&scratch, s, 900_000, n);
+    return scratch.current_kv_bytes;
+}
+
+/// Set the budget so that a new `n`-token plain entry fits only if the first entry shrinks to `allow` bytes.
+fn pcCapLeaving(hc: *HotPrefixCache, e: *const Entry, s: mlx.mlx_stream, n: u32, allow: u64) !void {
+    hc.max_kv_bytes = hc.current_kv_bytes + try pcPlainBytes(s, n) - (e.kv_bytes - allow);
+}
+
+test "HotPrefixCache: a byte-budget eviction trims the idle LRU entry to the restore point that fits" {
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try pcCommitHybridAt(&hc, s, 1, 8300, &.{ 512, 8192 });
+    const e0 = &hc.entries.items[0];
+    // Room for the 512 prefix and not for the 8192 one.
+    try pcCapLeaving(&hc, e0, s, 1000, (pcBillAt(e0, 512) + pcBillAt(e0, 8192)) / 2);
+    try pcCommitPlain(&hc, s, 900_000, 1000);
+
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+    try testing.expectEqual(hc.current_kv_bytes, pcBilledSum(&hc));
+    const old = &hc.entries.items[0];
+    try testing.expectEqual(@as(u32, 1), old.tokens[0]);
+    try testing.expectEqual(@as(usize, 512), old.tokens.len);
+    try testing.expectEqual(@as(usize, 1), old.ssm_checkpoints.?.len);
+    try testing.expectEqual(@as(usize, 512), old.ssm_checkpoints.?[0].pos);
+    // The copy owns exactly its rows: a view of the 8448-row buffer would bill the full capacity.
+    try testing.expectEqual(old.kv_bytes, HotPrefixCache.snapshotBytes(&old.snapshot) + old.ssm_bytes);
+    try testing.expectEqual(@as(u64, 512) * HotPrefixCache.snapshotRowBytes(&old.snapshot), HotPrefixCache.snapshotBytes(&old.snapshot));
+
+    var prompt: [700]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = if (i < 600) @as(u32, @intCast(i + 1)) else 700_000 + @as(u32, @intCast(i));
+    var target = try KVCache.init(testing.allocator, 3);
+    defer target.deinit();
+    var restored = pcEmptySsm();
+    defer pcFreeHybrid(&restored);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&target, &moe_off, &restored, s, &prompt, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 512), hit.matched);
+}
+
+test "HotPrefixCache: a victim with no restore point that fits, or only one under the useful minimum, is evicted whole" {
+    const s = mlx.gpuStream();
+    const cases = [_][]const usize{ &.{8192}, &.{ 256, 8192 } };
+    for (cases) |points| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        try pcCommitHybridAt(&hc, s, 1, 8300, points);
+        try pcCapLeaving(&hc, &hc.entries.items[0], s, 1000, pcBillAt(&hc.entries.items[0], 8192) - 1);
+        try pcCommitPlain(&hc, s, 900_000, 1000);
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        try testing.expectEqual(@as(u32, 900_000), hc.entries.items[0].tokens[0]);
+        try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+    }
+}
+
+test "HotPrefixCache: a checked-out entry is neither trimmed nor evicted for room; the idle one is trimmed" {
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    const held = [_]u32{ 5, 6, 7, 8 };
+    try pcAppendCheckedOut(&hc, &held, 1000, 1);
+    try pcCommitHybridAt(&hc, s, 1, 8300, &.{ 512, 8192 });
+    const e1 = &hc.entries.items[1];
+    try pcCapLeaving(&hc, e1, s, 1000, (pcBillAt(e1, 512) + pcBillAt(e1, 8192)) / 2);
+    try pcCommitPlain(&hc, s, 900_000, 1000);
+
+    try testing.expectEqual(@as(usize, 3), hc.entryCount());
+    try testing.expectEqual(@as(usize, 4), hc.entries.items[0].tokens.len);
+    try testing.expect(hc.entries.items[0].checked_out_by != null);
+    try testing.expectEqual(@as(u64, 1000), hc.entries.items[0].kv_bytes);
+    try testing.expectEqual(@as(usize, 512), hc.entries.items[1].tokens.len);
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+}
+
+test "HotPrefixCache: a replacement that outgrows the budget trims another idle entry instead of evicting it" {
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try pcCommitHybridAt(&hc, s, 1, 8300, &.{ 512, 8192 });
+    try pcCommitPlain(&hc, s, 900_000, 1000);
+    const grown = try pcPlainBytes(s, 1500);
+    const e0 = &hc.entries.items[0];
+    const allow = (pcBillAt(e0, 512) + pcBillAt(e0, 8192)) / 2;
+    hc.max_kv_bytes = hc.current_kv_bytes - hc.entries.items[1].kv_bytes + grown - (e0.kv_bytes - allow);
+    try pcCommitPlain(&hc, s, 900_000, 1500);
+
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    try testing.expectEqual(@as(usize, 512), hc.entries.items[0].tokens.len);
+    try testing.expectEqual(@as(usize, 1500), hc.entries.items[1].tokens.len);
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+}
+
+test "HotPrefixCache: a revised budget trims the idle LRU entry instead of evicting it" {
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try pcCommitHybridAt(&hc, s, 1, 8300, &.{ 512, 8192 });
+    try pcCommitPlain(&hc, s, 900_000, 1000);
+    const newest = hc.entries.items[1].kv_bytes;
+    const e0 = &hc.entries.items[0];
+    hc.setBudget(hc.current_kv_bytes - e0.kv_bytes + (pcBillAt(e0, 512) + pcBillAt(e0, 8192)) / 2);
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    try testing.expectEqual(@as(usize, 512), hc.entries.items[0].tokens.len);
+    try testing.expectEqual(newest, hc.entries.items[1].kv_bytes);
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
 }
 
 test "HotPrefixCache: byte budget rejects an oversized sole entry and preserves a smaller prefix" {

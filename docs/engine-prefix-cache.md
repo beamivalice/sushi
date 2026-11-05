@@ -162,6 +162,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   capacity, or a ring checkpoint whose rows become its ring (`trimmedCopy`'s `ring_cp`). Its ringed layers are a
   constant, not a per-token price: priced per token, every MiMo target fell below the ring and every entry declined.
 - A decline carries its `TrimDecline` reason; a RAM-budget decline spills to SSD (`spillDeclinedToDisk`).
+- **A byte-budget eviction trims an idle victim before it evicts it** (`reclaimFromLru`, `trimVictim`; `retainNewEntry`,
+  a replacement that outgrows the cap, and `setBudget`). The LRU victim is cut to its last restore point whose bill leaves the room needed
+  (`victimTrimLen`: rows at the entry's own row price plus the checkpoints at or below it, none shed or added), as a REAL
+  copy (`trimmedCopy`, `truncateCheckpoints`, shared with the incoming candidate's trim), so the dropped rows free their
+  buffers and `kv_bytes` is re-billed from the new storage. Spec payloads go, and the QSA history is sliced onto the
+  last kept checkpoint. One `[hot-cache] trimmed idle entry (...): N -> M tokens, freed X MB` line per trim.
+  - **Evicted whole instead** (the eviction line carries `; not trimmed: <reason>`): no restore point fits, the point
+    is under `MIN_TRIMMED_VICTIM_TOKENS` (512: a restore under it saves about a quarter second of prefill, Qwen STQ 2.75bpw at ~1,900 tokens/s, and the
+    remnant would still hold an entry slot), the room needed is the entry's whole bill, the entry is ringed or holds state the trim
+    does not bill (GLM's MLA rows), a QSA arch's newest checkpoint holds no bank, or a copy fails. A checked-out entry is never a victim.
+  - The count cap and `evictLruToAdmit` (a live prefill's GPU room, judged on freed live bytes) still evict whole. The
+    SSD tier has no such trim: a record is a directory of chunks, hard-linked inherited chunks, a QSA history file
+    sized to the full prefix and sidecars, so a cut needs the history rewritten and the freed bytes depend on link
+    counts. Its one-entry cut to a restore point is `budgetTarget`.
 
 ## Budget
 

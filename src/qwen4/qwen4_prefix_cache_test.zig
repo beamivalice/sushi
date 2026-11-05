@@ -897,6 +897,53 @@ test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays re
     }
 }
 
+test "HotPrefixCache: a trimmed idle victim keeps the QSA history on its last kept checkpoint and restores from it" {
+    const s = mlx.gpuStream();
+    var toks: [1024]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = pcBuildQsaHybrid(s, 1024, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, toks.len);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 4);
+    for (cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+    var other = try KVCache.init(testing.allocator, 3);
+    defer other.deinit();
+    try testFillCache(&other, s, 3, 256);
+    var other_toks: [256]u32 = undefined;
+    for (&other_toks, 0..) |*t, i| t.* = @intCast(i + 900_000);
+    hc.max_kv_bytes = hc.current_kv_bytes + 1;
+    _ = try hc.commit(&other, &other_toks, false);
+
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    const old = &hc.entries.items[0];
+    try testing.expect(old.tokens.len >= 512 and old.tokens.len < toks.len);
+    const kept = old.ssm_checkpoints.?;
+    const last = &kept[kept.len - 1];
+    try testing.expectEqual(old.tokens.len, last.pos);
+    try testing.expect(checkpointHasQsaPooled(last));
+    for (last.layers) |l| {
+        if (l.qsa_pooled.ctx == null) continue;
+        try testing.expectEqual(@as(c_int, @intCast(last.pos / 4)), mlx.getShape(l.qsa_pooled)[1]);
+    }
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+
+    var restored = pcEmptySsm();
+    defer pcFreeQsaHybrid(&restored);
+    var target = try KVCache.init(testing.allocator, 3);
+    defer target.deinit();
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&target, &moe_off, &restored, s, &toks, false, 0, null, null);
+    try testing.expectEqual(old.tokens.len, hit.matched);
+}
+
 test "HotPrefixCache: shed rescues an interior QSA bank" {
     const s = mlx.gpuStream();
     var toks: [30]u32 = undefined;
