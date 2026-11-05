@@ -94,7 +94,7 @@ N plus the context must fit under the GPU limit.
 
 ```bash
 export SUSHI_KEY=<pick a secret>
-sushi serve <pack> --host 0.0.0.0 --api-key-env SUSHI_KEY
+sushi serve --model <pack> --host 0.0.0.0 --api-key-env SUSHI_KEY
 ```
 
 Other computers then reach `http://<your-mac-ip>:12345/v1` (`ipconfig getifaddr en0` prints the IP) and send the key

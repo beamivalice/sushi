@@ -352,7 +352,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 ## One live tier per root
 
 - **A root has one live tier** (`DiskTier.root_lock`: an flock on `<root>/.lock` from `init` to `deinit`; the file is
-  never unlinked). Two processes on one pack (`sushi run X` beside `sushi serve X`) used to share the root, both
+  never unlinked). Two processes on one pack (`sushi run X` beside `sushi serve --model X`) used to share the root, both
   numbered entries from `e1`, and one restored the other's KV for its own prompt with an HTTP 200.
 - **A second tier keeps a private root** `<root>/p<pid>-<n>` and logs one `[disk-cache] ... private SSD tier` line. It
   reuses its own turns, never the shared root's entries, has its own budget, and is removed at `deinit`. A crashed
