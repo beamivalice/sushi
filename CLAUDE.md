@@ -254,7 +254,8 @@ parallel without it, as long as the total fits memory: never beside a MiMo-size 
 
 **Landing perf.** A speedup that is real (outside run-to-run noise, arms interleaved in one session) and leaves output
 bit-identical lands whatever its size. A change that alters output lands only through the KLD gate
-([quality-kld](docs/quality-kld.md)). Judge a tweak on top of the change it builds on, not alone against the old code.
+([quality-kld](docs/quality-kld.md)); one too small to be worth that gate (about 1% of a token) is dropped, not
+queued. Judge a tweak on top of the change it builds on, not alone against the old code.
 
 **Measurement hygiene.**
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.
