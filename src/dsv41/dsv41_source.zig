@@ -363,7 +363,7 @@ fn writeShard(dir: std.Io.Dir, name: []const u8, tensors: []const struct { []con
     try dir.writeFile(testing.io, .{ .sub_path = name, .data = file });
 }
 
-test "dsv41 source: the tower's bytes are the vision section, the trunk's exclude them (the ssd budget's vision term)" {
+test "dsv41 source: the tower bytes are the vision section, the trunk bytes exclude them (the ssd budget's vision term)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeShard(tmp.dir, "model-globals.safetensors", &.{

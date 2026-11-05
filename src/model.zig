@@ -2306,6 +2306,8 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
 pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool {
     if (dtype != .float16) return false;
     if (std.mem.endsWith(u8, key, ".scales") or std.mem.endsWith(u8, key, ".biases")) return true;
+    // Trellis bank scales are read as F16 by `trunk_stq.load`; the kernels take no bf16.
+    if (std.mem.endsWith(u8, key, ".suh") or std.mem.endsWith(u8, key, ".svh")) return false;
     return ndim == 1;
 }
 
@@ -3397,6 +3399,8 @@ test "narrowsLoadedF16 catches per-channel tables, not matmul operands" {
     // not this rule's business — it stays per-site.
     try testing.expect(!narrowsLoadedF16("vision_tower.blocks.0.attn.qkv.weight", 2, .float16));
     try testing.expect(!narrowsLoadedF16("language_model.model.layers.0.linear_attn.conv1d.weight", 3, .float16));
+    try testing.expect(!narrowsLoadedF16("language_model.model.layers.0.self_attn.q_proj.suh", 1, .float16));
+    try testing.expect(!narrowsLoadedF16("language_model.lm_head.svh", 1, .float16));
 
     // Everything already in the engine's dtype, and packed weights, are left
     // alone.

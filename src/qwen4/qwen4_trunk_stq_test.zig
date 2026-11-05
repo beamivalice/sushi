@@ -119,6 +119,70 @@ fn putBank(weights: *Weights, base: []const u8, bank: *const trunk_stq.TestBank)
     }
 }
 
+/// A one-shard safetensors file of the bank's stored tensors beside a 1-D F16 norm, as the encoder writes them.
+fn writeBankShard(dir: std.Io.Dir, bank: *const trunk_stq.TestBank) !void {
+    const a = testing.allocator;
+    const norm = [4]u16{ 0x3c00, 0x3c00, 0x3c00, 0x3c00 };
+    const parts = [_]struct { name: []const u8, dtype: []const u8, shape: []const usize, bytes: []const u8 }{
+        .{ .name = "model.layers.0.self_attn.q_proj.trellis", .dtype = "U16", .shape = &.{ bank.in / 16, bank.out / 16, bank.n }, .bytes = std.mem.sliceAsBytes(bank.words) },
+        .{ .name = "model.layers.0.self_attn.q_proj.suh", .dtype = "F16", .shape = &.{bank.in}, .bytes = std.mem.sliceAsBytes(bank.suh) },
+        .{ .name = "model.layers.0.self_attn.q_proj.svh", .dtype = "F16", .shape = &.{bank.out}, .bytes = std.mem.sliceAsBytes(bank.svh) },
+        .{ .name = "model.layers.0.input_layernorm.weight", .dtype = "F16", .shape = &.{norm.len}, .bytes = std.mem.sliceAsBytes(&norm) },
+    };
+    var header = std.ArrayList(u8).empty;
+    defer header.deinit(a);
+    var data = std.ArrayList(u8).empty;
+    defer data.deinit(a);
+    try header.appendSlice(a, "{\"__metadata__\":{\"format\":\"mlx\"}");
+    for (parts) |p| {
+        try header.print(a, ",\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ p.name, p.dtype });
+        for (p.shape, 0..) |d, i| try header.print(a, "{s}{d}", .{ if (i == 0) "" else ",", d });
+        try header.print(a, "],\"data_offsets\":[{d},{d}]}}", .{ data.items.len, data.items.len + p.bytes.len });
+        try data.appendSlice(a, p.bytes);
+    }
+    try header.append(a, '}');
+    var file = std.ArrayList(u8).empty;
+    defer file.deinit(a);
+    var len_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_bytes, header.items.len, .little);
+    try file.appendSlice(a, &len_bytes);
+    try file.appendSlice(a, header.items);
+    try file.appendSlice(a, data.items);
+    try dir.writeFile(testing.io, .{ .sub_path = "model.safetensors", .data = file.items });
+}
+
+test "trunk STQ: the 1-D F16 scales of a bank survive the safetensors loader as F16 while a norm still narrows" {
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var prng = std.Random.DefaultPrng.init(0x7a15);
+    const bank = try trunk_stq.TestBank.init(arena.allocator(), prng.random(), 128, 256, 48);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeBankShard(tmp.dir, &bank);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &path_buf);
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{path_buf[0..dir_len]}, 0);
+    defer testing.allocator.free(path);
+
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    try model_mod.loadSafetensorsFile(testing.allocator, &weights, path, cpu, false);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("model.layers.0.input_layernorm.weight").?));
+
+    var owned = std.ArrayList(mlx.mlx_array).empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(testing.allocator);
+    }
+    const dec = expert_exl3.Decode.tabled(.spec1, .w15);
+    const t = (try trunk_stq.load(&weights, "model.layers.0.self_attn.q_proj", dec, &owned, testing.allocator, cpu)).?;
+    try testing.expectEqualSlices(c_int, &.{ 1, 8, 16, 48 }, mlx.getShape(t.w));
+    try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(t.s));
+    try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(t.b));
+}
+
 /// A one-layer weight map with the norms every attention layer reads.
 fn layerWeights(s: mlx.mlx_stream) !Weights {
     var weights = Weights.init(testing.allocator);
