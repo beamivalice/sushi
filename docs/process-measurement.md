@@ -93,7 +93,8 @@ server and between arms: fans to max, then idle until the hottest die sensor (`f
 Under this protocol one A arm then one B arm is enough. Run A B B A only when the expected difference is within a few
 percent, where a thermal or drift step between two single arms would read as the effect.
 
-Set the fans back to auto when the bench ends. The fan control and temperature readout are the box's own tooling (on this
+Set the fans back to auto when the bench ends, but only when `gpu-lock.sh status` shows the lock free with an empty
+queue: an exit trap that sets auto under another job's lock lets the next boot start at 105 °C. The fan control and temperature readout are the box's own tooling (on this
 box, the fan-control MCP: `max_fans`, `set_fan_auto`, `get_thermal_status`). A bench script waits on a marker file that
 the driver touches once the fans are at max. Nothing else may compute during the idle and the bench (quiet box).
 
