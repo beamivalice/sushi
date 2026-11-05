@@ -11,6 +11,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Exit 3 is run.sh's SKIP: the parse needs PyYAML, which a stock python3 lacks.
+python3 -c 'import yaml' 2> /dev/null || { echo "SKIP: needs PyYAML (python3 -m pip install pyyaml)"; exit 3; }
+
 python3 - <<'EOF'
 import os, re, sys, yaml
 
