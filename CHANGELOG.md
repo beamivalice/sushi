@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The Dashboard's charts are yours to choose and order**: a Charts button opens a panel that picks which of twenty charts show (draft acceptance and drafting by mode, prefix cache reuse, tiers, evictions and writes, request outcomes, latency and token-length histograms, a memory split and more) and lets you drag them into order, by touch too; every chart is half a row, and the choice stays in this browser.
 - **`/metrics` and `/metrics.json` report speculative decoding and prefix cache tiers**: rounds, drafted and accepted tokens per drafting mode (MTP, DFlash2, DSpark) with DSpark's verifier rows, each request's own figures in the finished-request log, and per-tier cache hits, evictions and the memory tier's bytes.
 - **Qwen3.8-Flash-Next packs with a trellis trunk decode about 6% faster**: the shared expert now runs inside the routed expert launches as it does on affine packs, also when the model verifies several tokens at once, with the same output.
 - **`sushi launch dsh` starts DeepSeek Harness on your local server**: it lists every chat model with its own window, output cap and reasoning levels in a patch layer of its own, so your `~/.dsh` profile is left as it is.

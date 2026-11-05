@@ -122,11 +122,11 @@ function installStubs(config) {
         if (stub.history) {
           const since = Number(url.searchParams.get('since') || 0), t0 = Date.now() - 20000;
           const fields = ['t_ms', 'gen_tokens', 'prefill_tokens', 'running', 'waiting', 'prefilling', 'batched', 'gpu_pct', 'memory_mb', 'mlx_active', 'mlx_cache', 'gpu_mhz'];
-          const samples = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => [t0 + (i < 5 ? i : i + 15) * 1000, i * 40, 0, 1, 0, 0, 0, 50, 4096, 2 ** 30, 2 ** 30, stub.noClock ? 0 : 1200]).filter((r) => r[0] > since);
+          const samples = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => [t0 + (i < 5 ? i : i + 15) * 1000, i * 40, 0, 1, 0, 0, 0, 50, 4096, 2 ** 30, 2 ** 30, stub.noClock ? 0 : 1200]).map((r) => (r[3] = stub.runningCount ?? 1, r)).filter((r) => r[0] > since);
           const clock = stub.noClock ? { gpu_clock_mhz: 0, gpu_clock_max_mhz: 0 } : { gpu_clock_mhz: 1200, gpu_clock_max_mhz: 1620 };
           return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, gpu_utilization_pct: 50, ...clock }, histograms: {}, sessions: [], history: { interval_ms: 2000, capacity: 1800, fields, samples } });
         }
-        return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, prefill_tokens_live: stub.prefillTick = (stub.prefillTick ?? 0) + (stub.prefillStep ?? 0), gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: stub.sessions ?? [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 } });
+        return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, prefill_tokens_live: stub.prefillTick = (stub.prefillTick ?? 0) + (stub.prefillStep ?? 0), gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: stub.sessions ?? [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 }, ...(stub.specData ?? {}) });
       case '/v1/chat/completions': {
         stub.streams += 1;
         const signal = init.signal;
@@ -156,6 +156,16 @@ function trackTimers() {
   window.setInterval = (fn, ms, ...rest) => { const id = realSet(fn, ms, ...rest); live.set(id, ms); return id; };
   window.clearInterval = (id) => { live.delete(id); return realClearI(id); };
   window.setTimeout = (...args) => { window.__timeouts += 1; return realTimeout(...args); };
+}
+
+// The speculative, tier and request-log members a server with drafting and a prefix cache reports.
+function specFixture() {
+  const zero = { requests: 0, rounds: 0, drafted: 0, accepted: 0, plain_rounds: 0 };
+  return {
+    speculative: { mtp: { requests: 4, rounds: 40, drafted: 120, accepted: 84, plain_rounds: 3 }, dflash: zero, dspark: { requests: 2, rounds: 20, drafted: 100, accepted: 60, plain_rounds: 5, rows: { 1: 5, 3: 10, 5: 5 } } },
+    prefix_cache_tiers: { hits: { hot: 3, ssd: 9 }, evictions: { hot: 1, ssd: 2 }, evicted_bytes: { hot: 2 ** 20, ssd: 8 * 2 ** 20 }, hot_bytes: 2 ** 30 },
+    requests: [{ request_id: 1, model: 'org/test-model', t_ms: Date.now() - 3000, prompt_tokens: 100, cached_tokens: 40, prefill_seconds: 0.1, generated_tokens: 50, decode_seconds: 1, outcome: 'ok', spec: { mode: 'mtp', rounds: 10, drafted: 30, accepted: 21 } }],
+  };
 }
 
 async function openPage(browser, urlPath, config = {}, fakeClock = false) {
@@ -496,6 +506,179 @@ async function dashboardBugs(browser) {
   }
 }
 
+// The chart picker: which charts show and in what order is a browser preference; every chart is half a row.
+async function chartPicker(browser) {
+  const shown = (page) => page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => c.dataset.chart));
+  {
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    const all = await shown(page);
+    assert.ok(all.length >= 15, `Advanced shows every chart until a choice is made (${all.length})`);
+    const widths = await page.evaluate(() => {
+      const grid = document.getElementById('dashCharts').getBoundingClientRect(), gap = parseFloat(getComputedStyle(document.getElementById('dashCharts')).columnGap);
+      return { half: (grid.width - gap) / 2, cards: [...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => [c.dataset.chart, c.getBoundingClientRect().width]) };
+    });
+    for (const [id, w] of widths.cards) assert.ok(Math.abs(w - widths.half) < 1.5, `${id} is half the row at 1280 px (${w} vs ${widths.half})`);
+    const rows = await page.evaluate(() => new Set([...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => Math.round(c.getBoundingClientRect().x))).size);
+    assert.equal(rows, 2, 'two columns on a desktop width');
+    await page.setViewportSize({ width: 600, height: 800 });
+    const narrow = await page.evaluate(() => new Set([...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => Math.round(c.getBoundingClientRect().x))).size);
+    assert.equal(narrow, 1, 'one column on a narrow screen');
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    assert.equal(await page.isVisible('#dashPicker'), false, 'the picker starts closed');
+    await page.click('#dashChartsBtn');
+    assert.equal(await page.isVisible('#dashPicker'), true);
+    assert.equal(await page.getAttribute('#dashChartsBtn', 'aria-expanded'), 'true');
+    await page.uncheck('#dashPickList input[data-chart="latency"]');
+    await page.uncheck('#dashPickList input[data-chart="cachereuse"]');
+    const after = await shown(page);
+    assert.deepEqual(all.filter((id) => !after.includes(id)).sort(), ['cachereuse', 'latency'], 'unticking hides exactly those charts');
+    assert.equal(await page.isVisible('#dashLat'), false);
+    await page.check('#dashPickList input[data-chart="latency"]');
+    assert.ok((await shown(page)).includes('latency'), 'ticking brings it back');
+    await page.uncheck('#dashPickList input[data-chart="latency"]');
+    await page.keyboard.press('Escape');
+    assert.equal(await page.isVisible('#dashPicker'), false, 'Escape closes the picker');
+    await page.reload();
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    assert.deepEqual(await shown(page), after.filter((id) => id !== 'latency'), 'the choice survives a reload');
+    await page.click('#dashChartsBtn');
+    assert.equal(await page.isChecked('#dashPickList input[data-chart="latency"]'), false, 'and the picker shows it');
+    await page.click('#dashPickReset');
+    assert.deepEqual(await shown(page), all, 'Reset restores the default for the view');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // Compact starts with four charts; a choice made there holds in both views.
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'compact' });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    assert.deepEqual(await shown(page), ['prefill', 'decode', 'gpu', 'memory'], 'Compact shows the four essentials');
+    await page.click('#dashChartsBtn');
+    await page.check('#dashPickList input[data-chart="outcomes"]');
+    await page.click('#dashPickDone');
+    await page.click('#modeToggle [data-mode="advanced"]');
+    assert.equal((await shown(page)).length, 5, 'a stored choice no longer depends on the view');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // Config mode: dragging a chart onto another moves it, the arrows nudge it, and the order outlives a reload.
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    const first = (await shown(page)).slice(0, 4);
+    assert.equal(await page.evaluate(() => getComputedStyle(document.querySelector('#dashCharts .cfg')).display), 'none', 'no drag strip or arrows while the picker is closed');
+    await page.click('#dashChartsBtn');
+    await page.click('#dashPickDone');
+    await page.click('#dashChartsBtn');
+    await page.locator('#dashCharts .chart[data-chart="decode"]').scrollIntoViewIfNeeded();
+    await page.dragAndDrop('#dashCharts .chart[data-chart="prefill"] .grip', '#dashCharts .chart[data-chart="requests"] .grip');
+    const dragged = await shown(page);
+    assert.deepEqual(dragged.slice(0, 3), [first[1], first[2], first[0]], `dragging prefill onto requests moves it after (${dragged.slice(0, 4)})`);
+    await page.click('#dashCharts .chart[data-chart="gpu"] [data-move="-1"]');
+    assert.deepEqual((await shown(page)).slice(0, 4), [first[1], first[2], first[3], first[0]], 'the earlier arrow swaps with the previous chart');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.move), '-1', 'and keeps the focus on the arrow');
+    await page.click('#dashPickDone');
+    const saved = await shown(page);
+    await page.reload();
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    assert.deepEqual(await shown(page), saved, 'the order survives a reload');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // The picker follows the theme and draws no motion when reduced.
+    const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', contextOptions: { reducedMotion: 'reduce' } });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    const transitions = await page.evaluate(() => [...document.querySelectorAll('#dashCharts .hb .tr > i')].map((i) => getComputedStyle(i).transitionDuration));
+    assert.ok(transitions.length > 0 && transitions.every((d) => d === '0s'), `bars do not animate under reduced motion (${transitions})`);
+    await context.close();
+  }
+}
+
+// The picker is an inline panel, a touch drags a chart too, count charts keep whole-number gridlines, and the drafting and cache charts read the exported fields.
+async function chartExtras(browser) {
+  {
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    const box = (sel) => page.evaluate((q) => { const r = document.querySelector(q).getBoundingClientRect(); return { top: r.top, bottom: r.bottom }; }, sel);
+    const before = await box('#dashCharts');
+    await page.click('#dashChartsBtn');
+    const picker = await box('#dashPicker'), after = await box('#dashCharts');
+    assert.ok(after.top >= picker.bottom - 1, 'the open picker sits above the charts instead of covering them');
+    assert.ok(after.top > before.top + 40, `and pushes them down (${before.top} to ${after.top})`);
+    await page.click('#dashPickDone');
+    assert.ok(Math.abs((await box('#dashCharts')).top - before.top) < 2, 'Done gives the room back');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // A finger drags a chart by its strip: the same reorder as the mouse, no scrolling taken from it.
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', contextOptions: { hasTouch: true } });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    await page.click('#dashChartsBtn');
+    await page.click('#dashPickDone');
+    await page.click('#dashChartsBtn');
+    await page.locator('#dashCharts .chart[data-chart="prefill"]').scrollIntoViewIfNeeded();
+    const order = () => page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => c.dataset.chart));
+    const was = await order();
+    const grip = (id) => page.evaluate((i) => { const r = document.querySelector(`#dashCharts .chart[data-chart="${i}"] .grip`).getBoundingClientRect(); return { x: r.left + 20, y: r.top + r.height / 2 }; }, id);
+    const from = await grip('prefill'), to = await grip('decode');
+    const cdp = await context.newCDPSession(page);
+    const touch = (type, point) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: point ? [{ x: point.x, y: point.y, id: 1 }] : [] });
+    await touch('touchStart', from);
+    // The browser takes up the first move as touch slop and may hold the last, so the path runs on a little inside the target.
+    for (let i = 1; i <= 9; i++) await touch('touchMove', { x: from.x + (to.x - from.x) * i / 6 + (i > 6 ? 4 * (i - 6) : 0), y: from.y + (to.y - from.y) * i / 6 });
+    assert.equal(await page.evaluate(() => document.querySelectorAll('#dashCharts .chart.over').length), 1, 'the chart under the finger is marked');
+    await touch('touchEnd');
+    const now = await order();
+    assert.deepEqual(now.slice(0, 2), [was[1], was[0]], `a touch drag moves prefill after decode (${now.slice(0, 3)})`);
+    assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('sushi-dash:charts')).order.slice(0, 2)), [was[1], was[0]], 'and the order is saved');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  for (const [running, labels] of [[1, ['0', '1']], [2, ['0', '1', '2']], [7, ['0', '2', '4', '6', '8']]]) {
+    const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', history: true, runningCount: running });
+    await page.waitForFunction(() => (window.__axis.dashCReq ?? []).some((t) => /^\d+$/.test(t)), null, { timeout: 15000 });
+    const axis = (await axisOf(page, 'dashCReq')).filter((t) => /^[\d.,]+$/.test(t));
+    assert.deepEqual(axis, labels, `the Requests chart counts in whole numbers at a peak of ${running} (${axis})`);
+    await context.close();
+  }
+  {
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: specFixture() });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    await page.waitForFunction(() => document.getElementById('dashSpecModes').textContent.includes('MTP'), null, { timeout: 15000 });
+    const rows = (id) => page.evaluate((i) => [...document.querySelectorAll(`#${i} .hb`)].map((r) => [r.querySelector('span').textContent, r.querySelector('b').textContent]), id);
+    assert.deepEqual(await rows('dashSpecModes'), [['MTP', '70%, 2.1 per round'], ['DSpark', '60%, 3.0 per round'], ['DSpark plain rounds', '25%']], 'drafting by mode: acceptance and the mean accepted per round');
+    assert.deepEqual(await rows('dashSpecRows'), [['1 row (plain)', '5'], ['3 rows', '10'], ['5 rows', '5']], 'DSpark rounds by verifier rows');
+    await page.hover('#dashSpecModes .hb');
+    await page.waitForFunction(() => document.getElementById('tip').classList.contains('show'), null, { timeout: 5000 });
+    assert.match(await page.evaluate(() => document.getElementById('tip').textContent), /MTP\nAcceptance: 70\.0%\nAccepted \/ drafted: 84 \/ 120\n/, 'a bar row explains its figure in the page\'s one tooltip');
+    await page.waitForFunction(() => (window.__dots.dashCSpec ?? []).length > 0, null, { timeout: 15000 });
+    const axis = await axisOf(page, 'dashCSpec');
+    assert.ok(axis.includes('100%') && axis.includes('0%'), `the acceptance chart is a percentage (${axis})`);
+    const reuse = await textOf(page, 'dashReuse');
+    assert.match(reuse, /Hits from memory\s*3/);
+    assert.match(reuse, /Hits from SSD\s*9/);
+    const tiers = await textOf(page, 'dashTiers');
+    assert.match(tiers, /Evicted from memory\s*1 \(1\.0 MiB\)/);
+    assert.match(tiers, /Evicted from SSD\s*2 \(8\.0 MiB\)/);
+    assert.match(tiers, /Hot \(memory\)/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // A server that reports none of it (an older build, nothing drafted) leaves the cards empty rather than broken.
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    assert.match(await textOf(page, 'dashSpecModes'), /No request has drafted yet/);
+    assert.match(await textOf(page, 'dashSpecRows'), /No DSpark round yet/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+}
+
 async function main() {
   const playwright = loadPlaywright();
   if (!playwright) { console.log('Web UI dashboard: skipped (Playwright is not installed)'); return; }
@@ -506,6 +689,8 @@ async function main() {
   }
   try {
     await dashboardBugs(browser);
+    await chartPicker(browser);
+    await chartExtras(browser);
     {
       // A running request has a Cancel button that posts its id, with the page's API key; a cached conversation has none.
       const row = (request_id, phase) => ({ request_id, model: 'org/test-model', phase, context_length: 8192, context_tokens: 100, cached_tokens: 0, generated_tokens: 5, elapsed_seconds: 3, state_bytes: 1 << 20 });
@@ -530,11 +715,7 @@ async function main() {
       await context.close();
     }
     {
-      // A gridline's label is that line's value: a 0 to 1 scale reads 0.25 and 0.75, a 2,500 one 1.875k, never a rounded neighbour.
-      const { page, context } = await openPage(browser, '/dashboard', { history: true });
-      await page.waitForFunction(() => (window.__axis.dashCReq ?? []).includes('now'));
-      assert.deepEqual((await axisOf(page, 'dashCReq')).slice(0, 5), ['0', '0.25', '0.5', '0.75', '1']);
-      await context.close();
+      // A gridline's label is that line's value: a 2,500 scale reads 1.875k, never a rounded neighbour (a count chart steps in whole numbers: see chartExtras).
       const sim = await simPage(browser);
       await sim.page.evaluate(() => window.__sim.finish({ computed: 5000, prefillS: 2 }));
       await adv(sim.page, 3000);
@@ -554,7 +735,7 @@ async function main() {
       assert.equal(await page.isVisible('#chatPanel'), true, 'chat is the view at /chat');
       assert.equal(await page.isVisible('#dashPanel'), false, 'the dashboard starts hidden');
       assert.equal(await page.getAttribute('#navChat', 'aria-current'), 'page');
-      assert.equal(await page.evaluate(() => document.getElementById('dashCPre').width), 300, 'a hidden dashboard draws nothing');
+      assert.equal(await page.evaluate(() => document.getElementById('dashCCpre').width), 300, 'a hidden dashboard draws nothing');
 
       await page.fill('#promptInput', 'tell me a story');
       await page.click('#sendButton');
@@ -580,7 +761,7 @@ async function main() {
       assert.ok(hiddenChat.width > 0 && hiddenChat.height > 0, 'and its size');
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       await page.waitForFunction(() => document.getElementById('serverDotLabel').textContent.includes('test-model'), null, { timeout: 5000 });
-      assert.notEqual(await page.evaluate(() => document.getElementById('dashCPre').width), 300, 'a visible dashboard draws its charts');
+      assert.notEqual(await page.evaluate(() => document.getElementById('dashCCpre').width), 300, 'a visible dashboard draws its charts');
 
       await page.evaluate(() => window.__stub.openGate());
       await page.waitForTimeout(300);
@@ -816,21 +997,18 @@ async function main() {
 
     {
       const { page, errors, context } = await openPage(browser, '/dashboard');
-      const rows = () => page.evaluate(() => Object.fromEntries([...document.querySelectorAll('#dashWrites span')].reduce((acc, el, i, all) => (i % 2 ? acc : [...acc, [el.textContent, all[i + 1].textContent]]), [])));
+      const rows = () => page.evaluate(() => Object.fromEntries([...document.querySelectorAll('#dashWrites .hb')].map((row) => [row.querySelector('span').textContent, row.querySelector('b').textContent])));
+      const foot = () => textOf(page, 'dashWritesFoot');
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       // The rate needs two polls and the ratio needs /props: wait for both, then read one consistent render.
-      await page.waitForFunction(() => {
-        const spans = [...document.querySelectorAll('#dashWrites span')];
-        const value = (label) => spans[spans.findIndex((el) => el.textContent === label) + 1]?.textContent ?? '';
-        return /\/s$/.test(value('Write rate')) && /x$/.test(value('Written per byte on disk'));
-      }, null, { timeout: 15000 });
+      await page.waitForFunction(() => /Writing .*\/s, [\d.]+x written per byte/.test(document.getElementById('dashWritesFoot').innerText), null, { timeout: 15000 });
       const card = await rows();
-      for (const label of ['Cache location', 'Written', 'Write rate', 'Written per byte on disk', 'KV chunks', 'Restore points', 'QSA history', 'Speculative state', 'Ring points', 'Manifests and token records', 'Failed or dropped']) {
-        assert.ok(label in card, `the card has a ${label} row`);
+      for (const label of ['KV chunks', 'Restore points', 'QSA history', 'Speculative state', 'Ring points', 'Manifests and token records', 'Failed or dropped']) {
+        assert.ok(label in card, `the chart has a ${label} bar`);
       }
       assert.equal(card['Failed or dropped'], '3.0 MiB', 'failed bytes are named apart from the written ones');
       const gib = (text) => parseFloat(text) * (/GiB/.test(text) ? 1 : /MiB/.test(text) ? 1 / 1024 : 1 / 1048576);
-      assert.ok(Math.abs(parseFloat(card['Written per byte on disk']) - gib(card['Written']) / 2) < 0.06, 'written over the 2 GiB on disk');
+      assert.ok(Math.abs(parseFloat((await foot()).match(/([\d.]+)x written/)[1]) - gib(card['KV chunks']) / 2) < 0.1, 'written over the 2 GiB on disk');
       assert.deepEqual(errors, []);
       await context.close();
     }
@@ -839,13 +1017,13 @@ async function main() {
       const { page, errors, context } = await openPage(browser, '/dashboard', { compact: 'decode' });
       const axisTop = (id) => page.evaluate((canvas) => Math.max(0, ...(window.__axis[canvas] ?? []).filter((t) => /^\d+(\.\d+)?k?$/.test(t)).map((t) => parseFloat(t) * (t.endsWith('k') ? 1000 : 1))), id);
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
-      const cards = await page.evaluate(() => [...document.querySelectorAll('#dashPanel .charts.adv .card')].map((card) => ({ title: card.querySelector('h2').firstChild.textContent, legends: card.querySelectorAll('.legend').length, canvas: card.querySelector('canvas').id })));
+      const cards = await page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart canvas')].map((cv) => ({ title: cv.closest('.card').querySelector('h2').firstChild.textContent, legends: cv.closest('.card').querySelectorAll('.legend').length, canvas: cv.id })));
       assert.deepEqual(cards.slice(0, 2).map((card) => card.title), ['Prefill (tok/s)', 'Decode (tok/s)'], 'prefill and decode are separate cards');
       assert.deepEqual(cards.slice(0, 2).map((card) => card.legends), [0, 0], 'a single series needs no legend');
       assert.equal(new Set(cards.map((card) => card.canvas)).size, cards.length, 'every card draws on its own canvas');
       assert.equal(await page.evaluate(() => /\bgeneration\b/i.test(document.getElementById('dashPanel').textContent)), false, 'the dashboard says decode, not generation');
       // The Advanced view draws prefill and decode the way the Compact view does: one dot per finished request, decode on its own scale.
-      assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#dashPanel .charts.adv .card .sub')].map((e) => e.textContent).slice(0, 2)), ['one point per finished request', 'while generating']);
+      assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart .sub')].map((e) => e.textContent).slice(0, 2)), ['one point per finished request', 'while generating']);
       await page.waitForFunction((id) => (window.__axis[id] ?? []).includes('2k'), cards[0].canvas, { timeout: 15000 });
       await page.waitForFunction((id) => (window.__axis[id] ?? []).length > 5, cards[1].canvas, { timeout: 15000 });
       const axis = await page.evaluate(() => window.__axis.dashCMem ?? []);
@@ -938,7 +1116,7 @@ async function main() {
       const narrow = await page.evaluate(() => ({ strip: document.querySelector('.cm-strip').getBoundingClientRect().height, wide: document.getElementById('dashPanel').scrollWidth - document.getElementById('dashPanel').clientWidth,
         tiles: new Set([...document.querySelectorAll('.tiles-cmp .tile')].map((t) => Math.round(t.getBoundingClientRect().x))).size,
         firstRow: [...document.querySelectorAll('.tiles-cmp .tile')].filter((t, _, all) => Math.round(t.getBoundingClientRect().y) === Math.round(all[0].getBoundingClientRect().y)).length,
-        charts: [...document.querySelectorAll('.charts-cmp .card')].map((c) => Math.round(c.getBoundingClientRect().x)) }));
+        charts: [...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => Math.round(c.getBoundingClientRect().x)) }));
       assert.ok(narrow.strip < 70 && narrow.wide <= 0 && narrow.tiles === 2 && narrow.firstRow === 2, `390 px stacks without overflow (${JSON.stringify(narrow)})`);
       assert.equal(new Set(narrow.charts).size, 1, 'the charts stack');
       assert.deepEqual(errors, []);
@@ -958,8 +1136,9 @@ async function main() {
     for (const mode of ['advanced', 'compact']) {
       // The GPU chart pairs the clock (left axis, up to the table's top) with utilization (right axis, 0 to 100%); the
       // history backfill carries both, and a box with no readable clock says so and keeps the utilization.
-      const id = mode === 'advanced' ? 'dashCGpu' : 'dashCGpuc';
+      const id = 'dashCGpuc';
       const hoverTip = async (page) => {
+        await page.evaluate((i) => document.getElementById(i).scrollIntoView({ block: 'center' }), id);
         const box = await page.evaluate((i) => { const b = document.getElementById(i).getBoundingClientRect(); return { x: b.left, y: b.top, w: b.width, h: b.height }; }, id);
         await page.mouse.move(box.x + box.w - 60, box.y + box.h / 2);
         await page.waitForFunction(() => getComputedStyle(document.getElementById('dashTip')).display === 'block', null, { timeout: 5000 });
@@ -969,11 +1148,11 @@ async function main() {
       await page.waitForFunction((i) => (window.__axis[i] ?? []).includes('1,620'), id, { timeout: 15000 });
       const axis = await axisOf(page, id);
       assert.ok(axis.includes('100%') && axis.includes('0%'), `${mode}: the right axis is utilization 0 to 100% (${axis})`);
-      assert.ok(await page.evaluate(() => document.getElementById('dashCGpu').closest('.card').querySelector('.legend').innerText.includes('clock')), `${mode}: the legend names the clock`);
+      assert.ok(await page.evaluate(() => document.getElementById('dashCGpuc').closest('.card').querySelector('.legend').innerText.includes('clock')), `${mode}: the legend names the clock`);
       const tip = await hoverTip(page);
       assert.match(tip, /GPU clock\s*1,200 MHz/, `${mode}: the tooltip names the clock from the backfilled samples (${tip})`);
       assert.match(tip, /Utilization\s*50%/, `${mode}: and the utilization (${tip})`);
-      assert.equal(await textOf(page, mode === 'advanced' ? 'dashCGpuL' : 'dashCGpucL'), '', `${mode}: no unavailable note`);
+      assert.equal(await textOf(page, 'dashCGpucL'), '', `${mode}: no unavailable note`);
       assert.deepEqual(errors, []);
       await context.close();
 
@@ -981,7 +1160,7 @@ async function main() {
       await off.page.waitForFunction((i) => (off => off.length > 4)(window.__axis[i] ?? []), id, { timeout: 15000 });
       const offAxis = await axisOf(off.page, id);
       assert.ok(!offAxis.includes('1,620') && offAxis.includes('100'), `${mode}: without a clock the axis is utilization alone (${offAxis})`);
-      assert.match(await textOf(off.page, mode === 'advanced' ? 'dashCGpuL' : 'dashCGpucL'), /clock unavailable/, `${mode}: the chart says the clock is unavailable`);
+      assert.match(await textOf(off.page, 'dashCGpucL'), /clock unavailable/, `${mode}: the chart says the clock is unavailable`);
       const offTip = await hoverTip(off.page);
       assert.ok(!/GPU clock/.test(offTip) && /Utilization\s*50%/.test(offTip), `${mode}: the tooltip shows utilization only (${offTip})`);
       assert.deepEqual(off.errors, []);

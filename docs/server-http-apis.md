@@ -518,8 +518,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   theme. The GPU chart (Compact and Advanced) draws the clock (left axis, 0 to `gpu_clock_max_mhz`, idle windows are gaps) and the utilization (right axis, 0 to 100%, dashed) from the history's `gpu_mhz` and `gpu_pct`; with `gpu_clock_max_mhz` 0 it draws utilization alone and says the clock is unavailable. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
 - **Compact and Advanced**: a header toggle (remembered in `localStorage` `sushi-ui-mode`, Compact the default) switches
   the page's detail level through `body[data-mode]`. Compact shows what is loaded, decode and prefill tok/s, memory used and
-  available, the SSD cache's use and the request count as big tiles, with a speed chart and a memory chart; Advanced is the
-  full dashboard (sessions, every chart, latency, histograms, write counters; models live on the Models tab). Elements only
+  available, the SSD cache's use and the request count as big tiles; Advanced adds the sessions table and the tile strip
+  (models live on the Models tab). The charts are one grid for both views (next bullet). Elements only
   Advanced shows carry the `adv` class, Compact-only ones `cmp`; the Models and Settings views hide their expert rows
   and columns the same way, and a model's settings form lists every key it has in Advanced but the common five in
   Compact. The Advanced switch builds no Advanced DOM while Compact is shown.
@@ -544,14 +544,27 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   "server unreachable" and the charts dim. The SSD tile reads "-" while no model is loaded. A gridline's label prints its
   value exactly (1.875k, 0.75), and a duration rounds before it picks its units (2m 0s, never 1m 60s). The charts answer
   a tap (the nearest point; a tap elsewhere hides it) and the arrow keys (the canvases take focus; Escape hides).
-  The Advanced view's Decode and Prefill tiles and its prefill, decode and memory charts are the same functions (`speedTiles`,
-  `eventChart`, the shared chart options), so both views read the same.
-- The dashboard's **Prefix cache writes** card (the last card) shows the `prefix_cache_writes` totals: bytes written since
-  the server started, the rate between the last two polls (`-` on the first poll and across a restart), bytes written per
-  byte now on disk (the sum of every ready model's `/props` `disk_used_bytes`, refreshed every 15 s), one row per kind and
-  the failed or dropped bytes. A server without the counters shows "Not reported by this server". Logic:
-  `prefixWrites` in the dashboard script, guarded by `tests/test_webui_prefix_cache.cjs` and the card arm of
-  `tests/test_webui_dashboard.cjs`.
+  The Decode and Prefill tiles of both views are the same function (`speedTiles`).
+- **Dashboard charts** (`#dashCharts`, one `.chart` card per `data-chart` id, every card half the row from 900 px and one per
+  row below): canvas time series (prefill, decode, requests, GPU, memory, a stacked memory split, draft acceptance) and
+  cards of bars, a donut or histograms built from the `/metrics.json` counters, histograms, `decode_serial`,
+  `speculative`, `prefix_cache_tiers`, `sessions` and the request log: cached vs computed tokens per request, prefix
+  cache reuse (tokens, requests, hits by tier), storage (hot and SSD use, evictions per tier), writes by kind, request
+  outcomes, latency, TTFT, end-to-end, prompt and output length, serial-decode reasons, drafting by mode (acceptance and
+  mean accepted per round, DSpark plain-round share) and DSpark rows per round. The draft acceptance chart is one dot per
+  request whose log row carries `spec`. Each bar row prints its exact value and has a hover tip (`data-tip` JSON). A count
+  chart (Requests) puts gridlines on whole numbers only: a step of 1, 2, 5, 10, 20 ... with at most four. A card that is
+  hidden is not filled. A **Charts** button opens the picker, an inline panel above the page body that pushes the page
+  down (config mode): tick charts on or off, Reset, Done. While it is open each chart shows a strip: drag it onto another
+  chart (pointer events, so a finger works too; `touch-action: none` on the strip) or use its arrow buttons, which keep
+  the focus. The choice is `localStorage` `sushi-dash:charts` (`{order, hidden}`), a browser preference and no server
+  setting; until one exists Compact shows prefill, decode, GPU and memory and Advanced shows all. The hot tier's bytes are
+  the server's `prefix_cache_tiers.hot_bytes`. The prefix cache writes chart shows the `prefix_cache_writes` totals:
+  bytes per kind, the rate between the last two polls (absent on the first poll and across a restart), bytes written per
+  byte now on disk (the sum of every ready model's `/props` `disk_used_bytes`, refreshed every 15 s) and the failed or
+  dropped bytes. A server without the counters shows "Not reported by this server". Logic: `prefixWrites`,
+  `renderCards`, `acceptChart` and the layout block in the dashboard script, guarded by `tests/test_webui_prefix_cache.cjs`
+  and `tests/test_webui_dashboard.cjs` (`chartPicker`, `chartExtras`).
 - The right sidebar's "Prefix cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
   (`disk_used_bytes / disk_bytes`, "<used> / <budget> GB" and the entry count beside it). It is read after each reply
   and again 2.5 s later (the server stores a turn's entry after answering) and stays hidden while `disk_bytes` is 0.
