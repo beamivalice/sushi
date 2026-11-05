@@ -271,6 +271,8 @@ queued. Judge a tweak on top of the change it builds on, not alone against the o
 - **The box is macOS, with no `setsid` binary.** To detach a long job, run `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`
   and record `$!`; plain `nohup … &` dies with the tool's session.
   - Write the END marker from an EXIT trap, and end every wait loop when that PID is gone.
+- An agent never leaves `sushibar` or a server running for the owner's use: agent shells run reniced (nice 5-10),
+  every child inherits it, and the GPU clocks down (a DeepSeek decode ran ~30% slow). The owner starts their own.
 - Confirm the load lines (`[kv-cache]`, `[mtp]`, engagement lines) show the intended arm.
 - Reported KLD: the eight-category 16x512 fixture to first EOS; a prose-only fixture is a gate, never reported. The
   teacher carries no lossy step of its own.
