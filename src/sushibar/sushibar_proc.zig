@@ -133,14 +133,20 @@ extern fn proc_pidfdinfo(pid: c_int, fd: c_int, flavor: c_int, buffer: ?*anyopaq
 const FdInfo = extern struct { fd: i32, fd_type: u32 };
 
 // Offsets into `struct socket_fdinfo` (sys/proc_info.h): the 24-byte `proc_fileinfo`, then `socket_info`, whose
-// `soi_kind` is at 232 and whose protocol union starts at 240 with `in_sockinfo` (foreign port, local port).
+// `soi_kind` is at 232 and whose protocol union starts at 240 with `in_sockinfo` (foreign port, local port,
+// `insi_vflag` at +24, the local address at +48: an IPv4 one in the last four bytes of the 16-byte slot).
 const off_family = 24 + 160;
 const off_kind = 24 + 232;
 const off_fport = 24 + 240;
 const off_lport = 24 + 244;
+const off_vflag = 24 + 264;
+const off_laddr = 24 + 288;
 const socket_info_cap = 1024;
+const ini_ipv6 = 2;
 
-fn listeningPort(pid: i32, fd: i32) ?u16 {
+const Bound = struct { port: u16, addr: logic.Addr };
+
+fn listeningSocket(pid: i32, fd: i32) ?Bound {
     var info: [socket_info_cap]u8 align(8) = undefined;
     const n = proc_pidfdinfo(pid, fd, proc_pidfdsocketinfo, &info, socket_info_cap);
     if (n < off_lport + 2) return null;
@@ -150,7 +156,12 @@ fn listeningPort(pid: i32, fd: i32) ?u16 {
     // A listening socket has no peer: an accepted connection carries the same local port but a foreign one.
     if (std.mem.readInt(u16, info[off_fport..][0..2], .big) != 0) return null;
     const port = std.mem.readInt(u16, info[off_lport..][0..2], .big);
-    return if (port == 0) null else port;
+    if (port == 0) return null;
+    const addr: logic.Addr = if (info[off_vflag] & ini_ipv6 != 0)
+        .{ .v6 = info[off_laddr..][0..16].* }
+    else
+        .{ .v4 = info[off_laddr + 12 ..][0..4].* };
+    return .{ .port = port, .addr = addr };
 }
 
 /// Every process listening on a TCP port (own user's only), optionally only those whose executable is `only_exe`.
@@ -171,16 +182,17 @@ pub fn listeners(out: []logic.Listener, only_exe: ?[]const u8) []logic.Listener 
         if (got <= 0) continue;
         for (fds[0 .. @as(usize, @intCast(got)) / @sizeOf(FdInfo)]) |f| {
             if (f.fd_type != prox_fdtype_socket) continue;
-            const port = listeningPort(pid, f.fd) orelse continue;
+            const bound = listeningSocket(pid, f.fd) orelse continue;
             if (n == out.len) return out[0..n];
-            out[n] = .{ .pid = pid, .port = port };
+            out[n] = .{ .pid = pid, .port = bound.port, .addr = bound.addr };
             n += 1;
         }
     }
     return out[0..n];
 }
 
-/// True when something accepts a TCP connection on 127.0.0.1:`port`.
+/// True when something accepts a TCP connection on 127.0.0.1:`port`. Asked only when no sushi listens there, and
+/// Start binds loopback, so a holder on another address does not block it.
 pub fn portInUse(port: u16) bool {
     const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
     if (fd < 0) return false;
@@ -243,16 +255,26 @@ pub fn execReplace(argv: []const [*:0]const u8) void {
     _ = std.c.posix_spawn(&pid, argv[0], &actions, &attr, &args, std.c.environ);
 }
 
-/// A listening socket of this process on an ephemeral loopback port, for tests.
-fn testListener() !struct { fd: c_int, port: u16 } {
-    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+/// A listening socket of this process on an ephemeral port of the loopback address `host`, for tests.
+const TestListener = struct { fd: c_int, port: u16 };
+
+fn testListenerOn(host: logic.Addr) !TestListener {
+    const v6 = host == .v6;
+    const fd = std.c.socket(if (v6) std.c.AF.INET6 else std.c.AF.INET, std.c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
-    var addr: std.c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
-    if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+    errdefer _ = std.c.close(fd);
+    var a4: std.c.sockaddr.in = .{ .port = 0, .addr = if (v6) 0 else @bitCast(host.v4) };
+    var a6: std.c.sockaddr.in6 = .{ .port = 0, .addr = if (v6) host.v6 else @splat(0), .flowinfo = 0, .scope_id = 0 };
+    const sa: *std.c.sockaddr = if (v6) @ptrCast(&a6) else @ptrCast(&a4);
+    var len: std.c.socklen_t = if (v6) @sizeOf(@TypeOf(a6)) else @sizeOf(@TypeOf(a4));
+    if (std.c.bind(fd, sa, len) != 0) return error.BindFailed;
     if (std.c.listen(fd, 4) != 0) return error.ListenFailed;
-    var len: std.c.socklen_t = @sizeOf(@TypeOf(addr));
-    if (std.c.getsockname(fd, @ptrCast(&addr), &len) != 0) return error.NameFailed;
-    return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
+    if (std.c.getsockname(fd, sa, &len) != 0) return error.NameFailed;
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, if (v6) a6.port else a4.port) };
+}
+
+fn testListener() !TestListener {
+    return testListenerOn(logic.loopback);
 }
 
 test "listeners: finds the TCP listener this process opened, and the name filter keeps only sushi" {
@@ -283,6 +305,23 @@ test "listeners: one listener is listed once, and portInUse sees it" {
         if (x.port == l.port and x.pid == selfPid()) hits += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), hits);
+}
+
+test "listeners: carry the address the socket is bound to" {
+    var lo6: [16]u8 = @splat(0);
+    lo6[15] = 1;
+    for ([_]logic.Addr{ logic.loopback, .{ .v6 = lo6 } }) |host| {
+        const l = testListenerOn(host) catch |e| switch (e) {
+            error.SocketFailed, error.BindFailed => continue,
+            else => return e,
+        };
+        defer _ = std.c.close(l.fd);
+        var buf: [64]logic.Listener = undefined;
+        const found = for (listeners(&buf, null)) |x| {
+            if (x.port == l.port) break x;
+        } else return error.ListenerNotFound;
+        try std.testing.expectEqualDeep(host, found.addr);
+    }
 }
 
 test "portInUse: a closed port is free" {

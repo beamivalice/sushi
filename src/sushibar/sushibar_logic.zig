@@ -616,8 +616,8 @@ pub const Page = enum {
     }
 };
 
-pub fn pageUrl(buf: []u8, port: u16, page: Page) []const u8 {
-    return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}{s}", .{ port, page.path() }) catch "";
+pub fn pageUrl(buf: []u8, origin: []const u8, page: Page) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ origin, page.path() }) catch "";
 }
 
 pub const Server = struct {
@@ -1102,8 +1102,45 @@ pub fn siblingPath(buf: []u8, exe_path: []const u8, name: []const u8) ?[]const u
 
 // ── Ports ────────────────────────────────────────────────────────────────
 
-/// A process listening on a TCP port.
-pub const Listener = struct { pid: i32, port: u16 };
+/// The local address of a listening socket.
+pub const Addr = union(enum) { v4: [4]u8, v6: [16]u8 };
+
+pub const loopback: Addr = .{ .v4 = .{ 127, 0, 0, 1 } };
+
+/// A process listening on a TCP port, bound to `addr`.
+pub const Listener = struct { pid: i32, port: u16, addr: Addr = loopback };
+
+/// Where a client reaches a socket bound to `a`: a wildcard or loopback bind answers on 127.0.0.1, any other bind
+/// only on its own address (an IPv4-mapped one as IPv4).
+pub fn reachable(a: Addr) Addr {
+    const v4: [4]u8 = switch (a) {
+        .v4 => |b| b,
+        .v6 => |b| blk: {
+            const mapped = std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
+            if (mapped) break :blk b[12..16].*;
+            if (std.mem.allEqual(u8, b[0..15], 0) and b[15] <= 1) return loopback;
+            return a;
+        },
+    };
+    return if (v4[0] == 127 or std.mem.eql(u8, &v4, &.{ 0, 0, 0, 0 })) loopback else .{ .v4 = v4 };
+}
+
+/// `a` as the host of a URL: IPv6 in brackets.
+pub fn hostText(buf: []u8, a: Addr) []const u8 {
+    return (switch (a) {
+        .v4 => |b| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }),
+        .v6 => |b| std.fmt.bufPrint(buf, "[{f}]", .{std.Io.net.Ip6Address.Unresolved{ .bytes = b, .interface_name = null }}),
+    }) catch "";
+}
+
+/// The `http://host:port` origin of the server on `port`: the address its listener is bound to, else loopback.
+pub fn originOf(buf: []u8, listeners: []const Listener, port: u16) []const u8 {
+    const bound = for (listeners) |l| {
+        if (l.port == port) break l.addr;
+    } else loopback;
+    var host: [48]u8 = undefined;
+    return std.fmt.bufPrint(buf, "http://{s}:{d}", .{ hostText(&host, reachable(bound)), port }) catch "";
+}
 
 pub const StopPlan = union(enum) { none, now: i32, confirm: i32 };
 
@@ -2312,12 +2349,51 @@ test "menu: Start and Stop follow the server state" {
     try std.testing.expectEqualStrings("Port 12345: running (API key required)", statusLine(&b, .{ .link = .unauthorized }));
 }
 
-test "menu: page urls carry the port" {
+test "menu: page urls are the origin plus the page" {
     var b: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("http://127.0.0.1:18801/", pageUrl(&b, 18801, .dashboard));
-    try std.testing.expectEqualStrings("http://127.0.0.1:18801/chat", pageUrl(&b, 18801, .chat));
-    try std.testing.expectEqualStrings("http://127.0.0.1:18801/models", pageUrl(&b, 18801, .models));
-    try std.testing.expectEqualStrings("http://127.0.0.1:18801/settings", pageUrl(&b, 18801, .settings));
+    try std.testing.expectEqualStrings("http://127.0.0.1:18801/", pageUrl(&b, "http://127.0.0.1:18801", .dashboard));
+    try std.testing.expectEqualStrings("http://127.0.0.1:18801/chat", pageUrl(&b, "http://127.0.0.1:18801", .chat));
+    try std.testing.expectEqualStrings("http://127.0.0.1:18801/models", pageUrl(&b, "http://127.0.0.1:18801", .models));
+    try std.testing.expectEqualStrings("http://100.109.114.127:8081/settings", pageUrl(&b, "http://100.109.114.127:8081", .settings));
+}
+
+test "origin: a bound address is the host, wildcard and loopback are 127.0.0.1, no listener falls back to it" {
+    var b: [64]u8 = undefined;
+    var lo6: [16]u8 = @splat(0);
+    lo6[15] = 1;
+    const tail6: [16]u8 = .{ 0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0xab, 0x12, 0x48, 0x43, 0xcd, 0x96, 0x62, 0x6d, 0x72, 0x7f };
+    var mapped: [16]u8 = @splat(0);
+    mapped[10] = 0xff;
+    mapped[11] = 0xff;
+    mapped[12..16].* = .{ 100, 109, 114, 127 };
+    var mapped_lo = mapped;
+    mapped_lo[12..16].* = .{ 127, 0, 0, 2 };
+    var mapped_any = mapped;
+    mapped_any[12..16].* = .{ 0, 0, 0, 0 };
+    const l = [_]Listener{
+        .{ .pid = 1, .port = 8081, .addr = .{ .v4 = .{ 100, 109, 114, 127 } } },
+        .{ .pid = 2, .port = 8082, .addr = .{ .v4 = .{ 0, 0, 0, 0 } } },
+        .{ .pid = 3, .port = 8083, .addr = .{ .v4 = .{ 127, 0, 0, 1 } } },
+        .{ .pid = 4, .port = 8084, .addr = .{ .v6 = @splat(0) } },
+        .{ .pid = 5, .port = 8085, .addr = .{ .v6 = lo6 } },
+        .{ .pid = 6, .port = 8086, .addr = .{ .v6 = tail6 } },
+        .{ .pid = 7, .port = 8087, .addr = .{ .v6 = mapped } },
+        .{ .pid = 8, .port = 8088, .addr = .{ .v6 = mapped_lo } },
+        .{ .pid = 9, .port = 8089, .addr = .{ .v4 = .{ 127, 4, 5, 6 } } },
+        .{ .pid = 10, .port = 8090, .addr = .{ .v6 = mapped_any } },
+    };
+    try std.testing.expectEqualStrings("http://100.109.114.127:8081", originOf(&b, &l, 8081));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8082", originOf(&b, &l, 8082));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8083", originOf(&b, &l, 8083));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8084", originOf(&b, &l, 8084));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8085", originOf(&b, &l, 8085));
+    try std.testing.expectEqualStrings("http://[fd7a:115c:a1e0:ab12:4843:cd96:626d:727f]:8086", originOf(&b, &l, 8086));
+    try std.testing.expectEqualStrings("http://100.109.114.127:8087", originOf(&b, &l, 8087));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8088", originOf(&b, &l, 8088));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8089", originOf(&b, &l, 8089));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8090", originOf(&b, &l, 8090));
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000", originOf(&b, &l, 9000));
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000", originOf(&b, &.{}, 9000));
 }
 
 test "pid file: parse, format, and refuse anything else" {

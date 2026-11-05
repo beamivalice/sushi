@@ -119,6 +119,9 @@ const Shared = struct {
     model: Str(96) = .{},
     listings: [max_listings]Listing = undefined,
     listing_n: usize = 0,
+    /// The sushi listeners of the last scan with the address each is bound to (`originFor`).
+    bound: [max_listings]logic.Listener = undefined,
+    bound_n: usize = 0,
     models: [16]ModelCache = @splat(.{}),
     sushi_listening: bool = false,
     port_taken: bool = false,
@@ -268,12 +271,23 @@ fn fetchNow(a: std.mem.Allocator, method: std.http.Method, url: []const u8, orig
     return .{ .status = @intFromEnum(res.status), .body = body.written() };
 }
 
+const origin_cap = 64;
+const url_cap = 128;
+
+/// `http://host:port` of the server on `p`: the address its listener is bound to, else loopback.
+fn originFor(buf: []u8, p: u16) []const u8 {
+    lock();
+    defer unlock();
+    return logic.originOf(buf, shared.bound[0..shared.bound_n], p);
+}
+
 fn urlFor(buf: []u8, p: u16, comptime path: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}" ++ path, .{p}) catch unreachable;
+    var origin: [origin_cap]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}" ++ path, .{originFor(&origin, p)}) catch unreachable;
 }
 
 fn modelsOf(a: std.mem.Allocator, p: u16) logic.ModelState {
-    var b: [64]u8 = undefined;
+    var b: [url_cap]u8 = undefined;
     const r = get(a, p, urlFor(&b, p, "/v1/models")) orelse return .{};
     if (r.status != 200) return .{};
     return logic.parseModelState(a, r.body) catch .{};
@@ -288,12 +302,17 @@ fn cacheSlot(p: u16) *ModelCache {
     return free orelse &shared.models[p % shared.models.len];
 }
 
+fn metricsUrl(buf: []u8, p: u16, since_ms: i64) []const u8 {
+    var origin: [origin_cap]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}/metrics.json?since={d}", .{ originFor(&origin, p), since_ms }) catch unreachable;
+}
+
 /// One foreign listener's models, with a short timeout, off the poll thread.
 fn modelsWorker(p: u16) void {
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var b: [64]u8 = undefined;
+    var b: [url_cap]u8 = undefined;
     var known: logic.ModelsKnown = .failed;
     var name: []const u8 = "";
     if (requestWithin(a, p, .GET, urlFor(&b, p, "/v1/models"), null, models_timeout_s, "")) |r| {
@@ -478,7 +497,7 @@ fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
 }
 
 fn refreshProps(a: std.mem.Allocator, p: u16) void {
-    var b: [64]u8 = undefined;
+    var b: [url_cap]u8 = undefined;
     const r = get(a, p, urlFor(&b, p, "/props")) orelse return;
     if (r.status != 200) return;
     const u = (logic.parseProps(a, r.body) catch return) orelse return;
@@ -509,9 +528,9 @@ fn errorMessage(a: std.mem.Allocator, body: []const u8) []const u8 {
 }
 
 fn updateViaServer(a: std.mem.Allocator, p: u16) void {
-    var url: [64]u8 = undefined;
-    var origin: [48]u8 = undefined;
-    const origin_s = std.fmt.bufPrint(&origin, "http://127.0.0.1:{d}", .{p}) catch return;
+    var url: [url_cap]u8 = undefined;
+    var origin: [origin_cap]u8 = undefined;
+    const origin_s = originFor(&origin, p);
     var from_buf: [32]u8 = undefined;
     lock();
     const from = from_buf[0..shared.server_version.len];
@@ -529,19 +548,19 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
     while (i < update_wait_polls) : (i += 1) {
         std.Io.sleep(g_io, .fromMilliseconds(500), .real) catch {};
         if (port() != p) return setNote("Update started; no longer followed after the port change");
-        var hb: [64]u8 = undefined;
+        var hb: [url_cap]u8 = undefined;
         const alive = if (get(a, p, urlFor(&hb, p, "/health"))) |h| h.status == 200 else false;
         if (!alive) {
             down = true;
             continue;
         }
         if (down) break;
-        var pb: [64]u8 = undefined;
+        var pb: [url_cap]u8 = undefined;
         const props = get(a, p, urlFor(&pb, p, "/props")) orelse continue;
         const u = (logic.parseProps(a, props.body) catch null) orelse continue;
         if (!std.mem.eql(u8, u.current, from)) break;
     }
-    var pb: [64]u8 = undefined;
+    var pb: [url_cap]u8 = undefined;
     const props = get(a, p, urlFor(&pb, p, "/props"));
     const u = if (props) |pr| (logic.parseProps(a, pr.body) catch null) else null;
     refreshProps(a, p);
@@ -691,8 +710,8 @@ fn pollLoop() void {
             unlock();
         }
         const menu_open = g_menu_open.load(.acquire);
-        var url_buf: [96]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/metrics.json?since={d}", .{ p, tracker.since_ms }) catch unreachable;
+        var url_buf: [url_cap + 32]u8 = undefined;
+        const url = metricsUrl(&url_buf, p, tracker.since_ms);
         var reply = get(a, p, url);
         var reached = logic.linkFor(if (reply) |r| r.status else null);
 
@@ -700,6 +719,7 @@ fn pollLoop() void {
         if (logic.scanDue(since_scan, reached, menu_open)) {
             since_scan = 0;
             var lbuf: [16]logic.Listener = undefined;
+            var bound: [max_listings]logic.Listener = undefined;
             n = 0;
             sushi_listening = false;
             for (proc.listeners(&lbuf, server_exe)) |l| {
@@ -709,7 +729,21 @@ fn pollLoop() void {
                 } else false;
                 if (dup or n == max_listings) continue;
                 listings[n] = .{ .port = l.port, .pid = l.pid };
+                bound[n] = l;
                 n += 1;
+            }
+            lock();
+            shared.bound = bound;
+            shared.bound_n = n;
+            unlock();
+            // A server bound to a non-loopback address was asked on 127.0.0.1 above: ask where it listens.
+            if (reply == null) {
+                var again_buf: [url_cap + 32]u8 = undefined;
+                const again = metricsUrl(&again_buf, p, tracker.since_ms);
+                if (!std.mem.eql(u8, again, url)) {
+                    reply = get(a, p, again);
+                    reached = logic.linkFor(if (reply) |r| r.status else null);
+                }
             }
         }
 
@@ -975,9 +1009,9 @@ fn modelOpWorker(job: ModelOp) void {
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var url: [64]u8 = undefined;
-    var origin: [48]u8 = undefined;
-    const origin_s = std.fmt.bufPrint(&origin, "http://127.0.0.1:{d}", .{job.port}) catch return;
+    var url: [url_cap]u8 = undefined;
+    var origin: [origin_cap]u8 = undefined;
+    const origin_s = originFor(&origin, job.port);
     var body: [logic.max_model * 2 + 40]u8 = undefined;
     const target = if (job.unload) urlFor(&url, job.port, "/v1/unload-model") else urlFor(&url, job.port, "/v1/load-model");
     const payload = if (job.unload) logic.unloadModelBody(&body, job.model.get()) else logic.loadModelBody(&body, job.model.get());
@@ -1656,8 +1690,9 @@ fn openUrl(url: []const u8) void {
 }
 
 fn openWebPage(page: logic.Page) void {
-    var url_buf: [96]u8 = undefined;
-    openUrl(logic.pageUrl(&url_buf, port(), page));
+    var origin: [origin_cap]u8 = undefined;
+    var url_buf: [url_cap]u8 = undefined;
+    openUrl(logic.pageUrl(&url_buf, originFor(&origin, port()), page));
 }
 
 fn openPage(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
