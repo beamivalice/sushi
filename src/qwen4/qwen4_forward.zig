@@ -2199,7 +2199,7 @@ fn hcStreamMean(s: mlx.mlx_stream, h: mlx.mlx_array, hc: u32) !mlx.mlx_array {
 pub fn stackedAttnProjections(self: *Transformer, x: mlx.mlx_array, fa: *const FullAttnWeights) !?AttnVerifyInputs {
     const stack = fa.qkv_stack orelse return null;
     var outs: [3]mlx.mlx_array = undefined;
-    if (!try trunk_stq.sharedProject(self.s, x, stack, self.config.trunk_quant orelse return error.TrunkQuantMissing, &outs)) return null;
+    if (!try trunk_stq.sharedProject(self.s, x, stack, self.config.trunk_quant orelse return error.TrunkQuantMissing, &outs, self.spec_capture_ssm)) return null;
     return .{ .q = outs[0], .k = outs[1], .v = outs[2] };
 }
 

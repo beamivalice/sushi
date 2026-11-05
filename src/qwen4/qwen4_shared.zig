@@ -377,11 +377,11 @@ pub const TrellisShared = struct {
     pub fn separate(self: *const TrellisShared, ops: *Ops, x: Arr, chain: Chain, ids: Arr, scores: Arr, dec: api.format.Decode) !Arr {
         const s = ops.s;
         var gu: [2]Arr = undefined;
-        if (!try trunk_stq.sharedProject(s, x, self.stack, self.dec, &gu)) return error.TestExpectedStack;
+        if (!try trunk_stq.sharedProject(s, x, self.stack, self.dec, &gu, false)) return error.TestExpectedStack;
         const g = try ops.own(gu[0]);
         const u = try ops.own(gu[1]);
         const act = try ops.own((try tfm.fusedSwiGLU(s, g, u)) orelse return error.TestExpectedSwiglu);
-        const down = try ops.own(try trunk_stq.matmul(s, act, self.down.w, self.down.s, self.down.b, self.dec));
+        const down = try ops.own(try trunk_stq.matmul(s, act, self.down.w, self.down.s, self.down.b, self.dec, false));
         const logit = try ops.own(try tfm.qmatmulBits(x, self.logit.weight, self.logit.scales, self.logit.biases, 8, 64, .affine, s));
         return ops.own(switch (chain) {
             .bank => |bank| try api.moeWithGatedShared(s, x, bank, ids, scores, dec, false, down, logit),

@@ -22,24 +22,30 @@ pub fn outDim(w: mlx.mlx_array) usize {
 }
 
 /// Up to eight rows take one arm per machine at every width (`rows_exact`), so a row beside others (a batched tick, a
-/// verify block) rounds as it does alone. The flag is read when a launch is built, and DeepSeek sets it around its own;
-/// returns the value to restore.
-fn pinExactRows() bool {
-    const prev = exl3.project_rows.rows_exact;
+/// verify block) rounds as it does alone; a spec verify (`wide`) keeps that arm up to 16 rows. The flags are read when a
+/// launch is built, and DeepSeek sets `rows_exact` around its own; returns the values to restore.
+fn pinExactRows(wide: bool) [2]bool {
+    const prev = [2]bool{ exl3.project_rows.rows_exact, exl3.project_rows.rows_wide };
     exl3.project_rows.rows_exact = true;
+    exl3.project_rows.rows_wide = wide;
     return prev;
 }
 
-/// `x` `[..., in]` through the bank, in x's dtype, each row rounding as it does alone.
-pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: exl3.format.Decode) !mlx.mlx_array {
+fn unpin(prev: [2]bool) void {
+    exl3.project_rows.rows_exact = prev[0];
+    exl3.project_rows.rows_wide = prev[1];
+}
+
+/// `x` `[..., in]` through the bank, in x's dtype, each row rounding as it does alone; `wide` marks a spec verify.
+pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: exl3.format.Decode, wide: bool) !mlx.mlx_array {
     const sh = mlx.getShape(x);
     const in = sh[sh.len - 1];
     const rows: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(in))));
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ rows, in }, 2, s));
-    const prev = pinExactRows();
-    defer exl3.project_rows.rows_exact = prev;
+    const prev = pinExactRows(wide);
+    defer unpin(prev);
     const billed = exl3.trunk_gemm.decoded_billed;
     exl3.trunk_gemm.decoded_billed = true;
     defer exl3.trunk_gemm.decoded_billed = billed;
@@ -54,7 +60,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.ml
     return out;
 }
 
-/// The most rows one stacked launch serves; a wider chunk runs each projection alone.
+/// The most rows one stacked launch serves outside a wide verify; a wider chunk runs each projection alone.
 pub const SHARED_ROWS_MAX: usize = @intCast(exl3.project_rows.PROJECT_ROWS_MAX);
 
 /// Linears that read the same rows, stacked along the output into one bank (`exl3.linear.Shared`).
@@ -130,17 +136,18 @@ fn disown(owned: *std.ArrayList(mlx.mlx_array), a: mlx.mlx_array) void {
 }
 
 /// `x` `[..., in]` through every linear of `sh` in one launch: `outs[i]` is linear i's `[..., width]` in x's dtype,
-/// owned by the caller. False, with nothing made, when x has more than `SHARED_ROWS_MAX` rows.
-pub fn sharedProject(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.format.Decode, outs: []mlx.mlx_array) !bool {
+/// owned by the caller. False, with nothing made, when x has more rows than a multi-row launch serves (`wide`: a spec
+/// verify).
+pub fn sharedProject(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.format.Decode, outs: []mlx.mlx_array, wide: bool) !bool {
     const sx = mlx.getShape(x);
     const in = sx[sx.len - 1];
     const rows: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(in))));
-    if (rows > SHARED_ROWS_MAX) return false;
+    const prev = pinExactRows(wide);
+    defer unpin(prev);
+    if (rows > exl3.project_rows.rowsMax()) return false;
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ rows, in }, 2, s));
-    const prev = pinExactRows();
-    defer exl3.project_rows.rows_exact = prev;
     try exl3.linear.linearShared(s, flat, sh, dec, outs);
     errdefer for (outs) |a| {
         _ = mlx.mlx_array_free(a);
@@ -339,7 +346,7 @@ test "trunk_stq: a trellis triple multiplies as its host-decoded dense twin does
         }
         const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, @intCast(rows), @intCast(in) }, 3, .bfloat16);
         defer _ = mlx.mlx_array_free(x);
-        const y = try matmul(s, x, t.w, t.s, t.b, dec);
+        const y = try matmul(s, x, t.w, t.s, t.b, dec, false);
         defer _ = mlx.mlx_array_free(y);
         try testing.expectEqualSlices(c_int, &.{ 1, @intCast(rows), @intCast(out) }, mlx.getShape(y));
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
@@ -449,13 +456,13 @@ test "trunk_stq: a row beside others rounds as it does alone, so batched ticks a
     for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
     const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, rows, 2560 }, 3, .bfloat16);
     defer _ = mlx.mlx_array_free(x);
-    const block = try matmul(s, x, t.w, t.s, t.b, dec);
+    const block = try matmul(s, x, t.w, t.s, t.b, dec, false);
     defer _ = mlx.mlx_array_free(block);
     for (0..rows) |r| {
         var xr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xr);
         try mlx.check(mlx.mlx_slice(&xr, x, &[_]c_int{ 0, @intCast(r), 0 }, 3, &[_]c_int{ 1, @intCast(r + 1), 2560 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-        const alone = try matmul(s, xr, t.w, t.s, t.b, dec);
+        const alone = try matmul(s, xr, t.w, t.s, t.b, dec, false);
         defer _ = mlx.mlx_array_free(alone);
         var want = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(want);
@@ -517,9 +524,9 @@ test "trunk_stq: stacked banks serve each linear as its own, and a view run alon
         for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
         const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, rows, 256 }, 3, .bfloat16);
         defer _ = mlx.mlx_array_free(x);
-        const want = try matmul(s, x, o.w, o.s, o.b, dec);
+        const want = try matmul(s, x, o.w, o.s, o.b, dec, false);
         defer _ = mlx.mlx_array_free(want);
-        const got = try matmul(s, x, p.w, p.s, p.b, dec);
+        const got = try matmul(s, x, p.w, p.s, p.b, dec, false);
         defer _ = mlx.mlx_array_free(got);
         try testing.expect(try bitsEqual(s, got, want));
     };
@@ -532,7 +539,7 @@ test "trunk_stq: stacked banks serve each linear as its own, and a view run alon
         const x = mlx.mlx_array_new_data(&xb8, &[_]c_int{ 1, @intCast(rows), 256 }, 3, .bfloat16);
         defer _ = mlx.mlx_array_free(x);
         var outs: [3]mlx.mlx_array = undefined;
-        try testing.expect(try sharedProject(s, x, sh, dec, &outs));
+        try testing.expect(try sharedProject(s, x, sh, dec, &outs, false));
         defer for (outs) |a| {
             _ = mlx.mlx_array_free(a);
         };
@@ -567,7 +574,83 @@ test "trunk_stq: stacked banks serve each linear as its own, and a view run alon
     const wide = mlx.mlx_array_new_data(&zeros, &[_]c_int{ 1, 9, 256 }, 3, .bfloat16);
     defer _ = mlx.mlx_array_free(wide);
     var none: [3]mlx.mlx_array = undefined;
-    try testing.expect(!try sharedProject(s, wide, sh, dec, &none));
+    try testing.expect(!try sharedProject(s, wide, sh, dec, &none, false));
+}
+
+test "trunk_stq: a 9- to 16-row spec verify keeps each row's decode tick bytes, alone and stacked; a prefill chunk keeps the GEMM" {
+    try mlx.requireGpu();
+    if (!exl3.kernels.gemmNaxOn()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x57a8);
+    const rnd = prng.random();
+    const dec = exl3.format.Decode.tabled(.spec1, .w15);
+    const t = try (try TestBank.init(alloc, rnd, 2560, 1024, 96)).triple(s);
+    var parts: [2]Triple = undefined;
+    for (&parts, [_]usize{ 512, 256 }) |*p, w| p.* = try (try TestBank.init(alloc, rnd, 2560, w, 96)).triple(s);
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(testing.allocator);
+    }
+    defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const orig = parts;
+    defer for (orig) |o| for ([_]mlx.mlx_array{ o.w, o.s, o.b }) |arr| {
+        _ = mlx.mlx_array_free(arr);
+    };
+    const sh = (try fuse(&.{ &parts[0], &parts[1] }, &owned, testing.allocator, s)).?;
+    const max: usize = @intCast(exl3.project_rows.NAX_ROWS_MAX);
+    const xb = try alloc.alloc(u16, max * 2560);
+    for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
+    const xs = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, @intCast(max), 2560 }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(xs);
+
+    var pool: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (pool.items) |a| _ = mlx.mlx_array_free(a);
+        pool.deinit(testing.allocator);
+    }
+    const rowsOf = struct {
+        fn f(st: mlx.mlx_stream, a: mlx.mlx_array, r0: usize, r1: usize, list: *std.ArrayList(mlx.mlx_array)) !mlx.mlx_array {
+            const ash = mlx.getShape(a);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&out, a, &[_]c_int{ 0, @intCast(r0), 0 }, 3, &[_]c_int{ 1, @intCast(r1), ash[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, st));
+            try list.append(testing.allocator, out);
+            return out;
+        }
+    }.f;
+    // Serial decode ticks: one row each, the stacked launch and the plain one.
+    var alone: [16][3]mlx.mlx_array = undefined;
+    for (0..max) |r| {
+        const xr = try rowsOf(s, xs, r, r + 1, &pool);
+        alone[r][0] = try matmul(s, xr, t.w, t.s, t.b, dec, false);
+        try pool.append(testing.allocator, alone[r][0]);
+        var outs: [2]mlx.mlx_array = undefined;
+        try testing.expect(try sharedProject(s, xr, sh, dec, &outs, false));
+        try pool.appendSlice(testing.allocator, &outs);
+        alone[r][1] = outs[0];
+        alone[r][2] = outs[1];
+    }
+
+    for (9..max + 1) |rows| {
+        const x = try rowsOf(s, xs, 0, rows, &pool);
+        const block = try matmul(s, x, t.w, t.s, t.b, dec, true);
+        try pool.append(testing.allocator, block);
+        var outs: [2]mlx.mlx_array = undefined;
+        try testing.expect(try sharedProject(s, x, sh, dec, &outs, true));
+        try pool.appendSlice(testing.allocator, &outs);
+        for (0..rows) |r| for ([_]mlx.mlx_array{ block, outs[0], outs[1] }, 0..) |y, i| {
+            try testing.expect(try bitsEqual(s, try rowsOf(s, y, r, r + 1, &pool), alone[r][i]));
+        };
+    }
+
+    try testing.expect(!exl3.project_rows.rows_wide);
+    var none: [2]mlx.mlx_array = undefined;
+    try testing.expect(!try sharedProject(s, try rowsOf(s, xs, 0, 9, &pool), sh, dec, &none, false));
 }
 
 test "trunk_stq: fuse leaves linears it cannot stack as they were" {

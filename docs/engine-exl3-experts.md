@@ -354,6 +354,13 @@ or from 1024 rows the decoded path below.
 - A kernel that reads `exl3_decode2` must pass its stored f32 sum through `exl3_out` (the 2^12 fold of the tabled
   codebooks). MCG folds nothing, so no MCG test can see a missing one: a new reader gets a std1/spec1/pair1 case at its
   first test.
+<a id="verify-rows16"></a>
+- **A spec verify of 9 to 16 rows stays on the NAX rows arm** (`project_rows.rows_wide`, set by Flash-Next's single-stream
+  verify forward; `rowsMax`): the kernel's 16-row MMA tile took rows 0-7 and zeros, and now feeds rows 8-15 from the staged
+  input, so each row keeps its one-row decode tick's bytes. Before, a 9-row verify (an 8-draft prompt lookup) took the
+  sorted GEMM, one launch per projection and another sum order. Prefill chunks of 9 to 16 rows keep the GEMM. Tests: `at 9
+  to 16 rows every row equals the one-row launch`, `a 9- to 16-row spec verify keeps each row's decode tick bytes`.
+  Meter: [qwen4-perf](qwen4-perf.md#verify-rows9).
 - A row's bytes are the same at widths 2 to 8 (NAX); the one-row SIMD kernel and the GEMM differ from them in sum order
   only. All three hold the f32-truth bar 1.5e-3 past the output dtype's own rounding of the truth, added in quadrature
   (worst kernel error measured 4.1e-4: spec1 n64/n96, pair1 n32, mcg, G 1/2/8, rows 1 to 70, f16/bf16/f32).

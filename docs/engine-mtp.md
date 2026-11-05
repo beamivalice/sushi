@@ -169,7 +169,9 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 A verify row costs about 2.9 ms on Flash-Next STQ-2.75 at every width from 2 to 8, with no step at five or seven rows
 ([qwen4-perf](qwen4-perf.md#verify-rows8)). GDN rollback replays the accepted rows from the pre-verify state
 (`SSMCacheEntry.spec_replay`, `ssmRollbackFromCapture`) instead of picking one of R stored states; the S=2 fold and the
-chain/group paths still capture per row. `dflash_policy.ladder()` is that table plus the 4 ms a DFlash2 round pays whatever its width.
+chain/group paths still capture per row. A 9-row verify (an 8-draft prompt lookup) is a code round's most common lookup: on a
+trellis-trunk pack it once took the prefill GEMM for every trunk projection, 57 ms against 34 at 8 rows
+([qwen4-perf](qwen4-perf.md#verify-rows9)). `dflash_policy.ladder()` is that table plus the 4 ms a DFlash2 round pays whatever its width.
 
 ## Round cost table
 

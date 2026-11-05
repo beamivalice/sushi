@@ -861,6 +861,39 @@ Bench on the final tree (`d2a866b4`, binary built 2026-10-22 06:49:59, SHA-256 `
 DFlash2 at 16k and 64k did not move although its verify got cheaper: some requests there are still stopped by the runtime gate
 (`runtime_disabled=true` in their `[spec-stats]`), which prices the round against the serial token.
 
+<a id="verify-rows9"></a>
+## Flash-Next K6 trunk: a 9-row verify on the NAX rows arm
+
+An 8-draft prompt lookup verifies 9 rows. The trellis trunk's rows kernel stopped at 8, so a 9-row verify ran every trunk
+projection through the prefill GEMM, unstacked; it now stays on the NAX rows arm
+([engine-exl3-experts](engine-exl3-experts.md#verify-rows16)). Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw-v2.0 (K6 trunk) against
+the 1.5.0 STQ-2.75bpw pack (affine-8 trunk), M5 Max on AC, ReleaseFast, `taskpolicy -a`, GPU lock and QUIET per boot, fans
+max, die 48-49 C at each boot, 2026-11-05.
+
+- Decode meter (`SUSHI_DECODE_FWD_UBENCH=40`, `_KV=1024`, kv8, one boot per row), ms per forward:
+
+  | binary, pack | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+  |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+  | 3eff69ed, v2.0 (K6) | 16.36 | 19.02 | 21.07 | 23.94 | 26.72 | 29.48 | 31.77 | 34.30 | 56.99 |
+  | 3eff69ed, 1.5.0 (affine 8) | 16.54 | 19.35 | 21.55 | 24.38 | (34.7) | 30.59 | 34.35 | 37.10 | 43.14 |
+  | this change on 3eff69ed, v2.0 (K6) | 16.28 | | | | | | | 33.17 | 38.19 |
+
+  The K6 trunk is 1-8% ahead of affine 8 at 1 to 8 rows; at 9 rows it was 14 ms behind (7217 ops against 4328 at 8 rows),
+  and is 5 ms ahead now (6553 ops). (34.7) is one noisy cell. The 9-row step over 8 rows is still 4.8 ms against a 2.5 ms
+  slope: GDN, the prepared HC graph and the shared-expert fold stop at 8 rows.
+- Code 4k rung (`sushi bench --model <pack> --rungs 4k --tokens 512 --code-only`, in process, one load per arm, MTP default),
+  decode tok/s of the two repeats (the cold first request pays JIT):
+
+  | binary, pack | repeat 1 | repeat 2 | 8-draft lookup round | 7-draft lookup round |
+  |---|--:|--:|--:|--:|
+  | 3eff69ed, v2.0 | 142.7 | 148.9 | 58.4-59.8 ms | 37.1-38.7 ms |
+  | 3eff69ed, 1.5.0 | 159.8 | 159.9 | 44.8-48.8 ms | 42.5-44.1 ms |
+  | this change on 3eff69ed, v2.0 | 170.4 | 169.3 | 40.9-41.8 ms | 39.9-41.2 ms |
+
+  A 4k code request runs about 24 eight-draft lookups among about 43 lookup rounds, which was the code 4k loss of the
+  release bench on a00c9951 (146 against 167). Acceptance on the same binary is close between the packs: 74-83 rounds per
+  512 tokens, v2.0 at the high end, inside the request-to-request spread.
+
 <a id="dflash2"></a>
 ## Flash-Next DFlash2 (`--drafter`) against MTP
 

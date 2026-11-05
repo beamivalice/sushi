@@ -43,7 +43,7 @@ pub const SHARED_MAX: usize = 4;
 /// `[S, in]` (one row per linear), `svh` `[1, out]`; linear s owns columns `cols[s]..cols[s + 1]`, each a multiple of 128.
 pub const Shared = struct { p: root.Proj, cols: [SHARED_MAX + 1]c_int, count: usize };
 
-/// `x` [rows, in] (rows <= `project_rows.PROJECT_ROWS_MAX`) through every linear of `sh` in one multi-row launch: `outs[s]` is
+/// `x` [rows, in] (rows <= `project_rows.rowsMax()`) through every linear of `sh` in one multi-row launch: `outs[s]` is
 /// linear s's [rows, width] in x's dtype (the caller frees each). A row holds the bar of its own linear's launch; the
 /// sum order may differ from it, since the launch splits k for the stacked width.
 pub fn linearShared(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, outs: []mlx.mlx_array) !void {
@@ -80,7 +80,7 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, grou
     const tsh = mlx.getShape(p.trellis);
     if (tsh.len != 4 or tsh[0] != groups) return error.BadExl3Shape;
     kernels.setDecodeParams(dec);
-    if ((force_arm orelse if (rows <= project_rows.PROJECT_ROWS_MAX) Arm.rows else Arm.gemm) == .rows)
+    if ((force_arm orelse if (rows <= project_rows.rowsMax()) Arm.rows else Arm.gemm) == .rows)
         return project_rows.projectRows(s, x, p.trellis, p.suh, p.svh);
     const alloc = std.heap.page_allocator;
     const ids = try alloc.alloc(u32, groups * rows);

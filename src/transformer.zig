@@ -1809,7 +1809,7 @@ pub const Transformer = struct {
         if (linear_tap) |tap| tap.record(tap.ctx, w, x);
         // u8 codes + f32 tile scales = an FP8 source linear (`mimo_source`).
         if (mlx.mlx_array_dtype(w) == .uint8) return fp8_block.linearServing(self.s, x, w, sc);
-        if (mlx.mlx_array_dtype(w) == .uint16) return trunk_stq.matmul(self.s, x, w, sc, bi, self.config.trunk_quant orelse return error.TrunkQuantMissing);
+        if (mlx.mlx_array_dtype(w) == .uint16) return trunk_stq.matmul(self.s, x, w, sc, bi, self.config.trunk_quant orelse return error.TrunkQuantMissing, self.spec_capture_ssm);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the
         // global config; per-weight overrides (mixed-precision checkpoints, e.g.
         // affine 8-bit shared MLP inside an mxfp4 model) are detected on
@@ -3874,7 +3874,7 @@ pub const Transformer = struct {
     pub fn stackedPair(self: *Transformer, x: mlx.mlx_array, stack: ?trunk_stq.Shared) !?[2]mlx.mlx_array {
         const sh = stack orelse return null;
         var outs: [2]mlx.mlx_array = undefined;
-        if (!try trunk_stq.sharedProject(self.s, x, sh, self.config.trunk_quant orelse return error.TrunkQuantMissing, &outs)) return null;
+        if (!try trunk_stq.sharedProject(self.s, x, sh, self.config.trunk_quant orelse return error.TrunkQuantMissing, &outs, self.spec_capture_ssm)) return null;
         return outs;
     }
 
