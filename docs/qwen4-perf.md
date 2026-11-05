@@ -573,6 +573,15 @@ binary. Each 8k window runs as chunks of 31, 4096 and 4065 rows plus the 31-row 
 - A 4065-row chunk costs 60-90 ms more than a 4096-row one despite fewer rows: GDN +25-40, MoE +20-30.
 - The 31-row forwards cost about 140 ms each, unprofiled (`[prefill-trace] last_token`). An 8k window pays two of
   them, about 7% of the window.
+- **The first prefill after a load paid about 3.5 s of first use**, and the cross-process Metal cache does not cover it:
+  the first 4065-row chunk took 4.3 s against 1.84 s, and the 31-row tail 1.09 s against 0.13 s, on a second run of the
+  same binary. That made the release bench's cold 4k window 695 tok/s. A 64-row forward at load (`SUSHI_PREFILL_UBENCH=1
+  _ROWS=64`: cold 439 ms, warm 111 ms) took the first 4k window to 1754 tok/s, TTFT 5.90 to 2.41 s; 4096 rows (cold 5.8 s)
+  did no better (1738). The 8-row warm-up forwards stay on the decode chain (16 rows) and the multi-row trunk kernel (8).
+  The spec warm-up's first slot now prefills 64 rows (`SPEC_WARM_PREFILL_ROWS`), output unchanged: the first 4k window
+  reads 1467 tok/s, TTFT 3.05 s (first chunk 2.41 s, tail 0.33 s), against 695 and 5.97 s. Runs: meter on 3eff69ed +
+  the trunk changes; warm-up on the landing tree; ReleaseFast, `sushi bench --code-only`, GPU lock, fans max, die
+  under 50 C.
 
 <a id="mtp-depth-policy"></a>
 ## MTP depth policy: one chunk from acceptance EMAs below 8k KV (reverted)

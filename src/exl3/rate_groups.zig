@@ -1549,8 +1549,11 @@ fn preparedOn(rb: *const Ragged) bool {
 }
 
 var engaged: [2]bool = @splat(false);
+/// Grouped prefill chains built: what a warm-up ran, for a test.
+pub var prefill_chains: u64 = 0;
 
 fn logEngaged(arm: enum { decode, prefill }, rb: *const Ragged, pair: usize, down: usize) void {
+    if (arm == .prefill) prefill_chains += 1;
     if (engaged[@intFromEnum(arm)]) return;
     engaged[@intFromEnum(arm)] = true;
     if (@import("builtin").is_test) return;

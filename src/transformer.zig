@@ -2872,6 +2872,8 @@ pub const Transformer = struct {
 
     const MAX_WARM_SEQ: usize = MAX_WIDTH_WARM + 1;
     const MAX_WIDTH_WARM: usize = 8;
+    /// Wider than the expert decode chain (16 rows) and the multi-row trunk kernel (8): a prefill forward.
+    pub const SPEC_WARM_PREFILL_ROWS: usize = 64;
 
     // The verify at each draft width, the grouped verify at each row total and the head's own step
     // each JIT their Metal pipelines on first dispatch; left to the first live request that compile
@@ -2900,8 +2902,9 @@ pub const Transformer = struct {
         };
         while (n_slots < max_rows) : (n_slots += 1) {
             slots[n_slots] = try SpecWarmSlot.init(self, kv_config);
-            var prompt_ids: [8]i32 = undefined;
-            const prompt = specWarmIds(&prompt_ids);
+            var prompt_ids: [SPEC_WARM_PREFILL_ROWS]i32 = undefined;
+            // The first slot's prompt is prefill-shaped, so the first request does not pay the prefill kernels' first use.
+            const prompt = specWarmIds(prompt_ids[0..if (n_slots == 0) SPEC_WARM_PREFILL_ROWS else 8]);
             defer _ = mlx.mlx_array_free(prompt);
             var stream = mlx.mlx_array_new();
             slots[n_slots].ctx.capture_stream_all = if (n_slots == 0) &stream else null;

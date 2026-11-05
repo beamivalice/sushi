@@ -383,6 +383,25 @@ const MtpChainTestSlot = struct {
     }
 };
 
+test "qwen4: the spec warm-up runs a prefill-shaped forward through the grouped expert GEMM (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |path| a.free(path);
+    var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    const rate_groups = @import("sushi_exl3").rate_groups;
+    const before = rate_groups.prefill_chains;
+    try xfm.warmupSpecVerify(1, @import("../kv_quant.zig").KVQuantConfig.engine_default);
+    try testing.expect(rate_groups.prefill_chains > before);
+}
+
 test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
