@@ -316,6 +316,8 @@ pub const Watch = struct {
     reaped_until_ms: i64 = 0,
     /// Its server went away on its own: the icon's badge, until a server answers there or Start is pressed.
     crashed_port: u16 = 0,
+    /// The port whose crash badge an answering server just cleared, until `takeRecovered` reads it.
+    recovered_port: u16 = 0,
 
     const reaped_quiet_ms: i64 = 30_000;
 
@@ -327,6 +329,11 @@ pub const Watch = struct {
 
     pub fn started(self: *Watch, port: u16) void {
         if (self.crashed_port == port) self.crashed_port = 0;
+    }
+
+    pub fn takeRecovered(self: *Watch) u16 {
+        defer self.recovered_port = 0;
+        return self.recovered_port;
     }
 
     pub fn crashed(self: *const Watch, port: u16) bool {
@@ -344,7 +351,10 @@ pub const Watch = struct {
         const gone = stoppedUnexpectedly(self.answering, link, we_stopped, reaped_here);
         if (gone) self.crashed_port = port;
         // Answering before the reaped server was seen gone is the poll not having caught up yet.
-        if (answering(link) and !reaped_here and self.crashed_port == port) self.crashed_port = 0;
+        if (answering(link) and !reaped_here and self.crashed_port == port) {
+            self.crashed_port = 0;
+            self.recovered_port = port;
+        }
         if (reaped_here and link == .offline) self.reaped_port = 0;
         self.answering = answering(link);
         return gone;
@@ -742,7 +752,12 @@ pub const ModelIn = struct {
     /// A load, from here or the web page, is running.
     loading: bool = false,
     unloading: bool = false,
+    /// A load or unload that runs on another port: one model operation runs at a time.
+    other: ModelOp = .{},
 };
+
+/// A load or unload in flight; `port` 0 is none.
+pub const ModelOp = struct { port: u16 = 0, unload: bool = false, model: []const u8 = "" };
 
 pub const ModelAction = enum { none, load, unload };
 
@@ -762,6 +777,11 @@ pub fn modelButton(buf: []u8, in: ModelIn) ModelButton {
         .unauthorized => "The server requires an API key",
         .up, .metrics_off => "",
     };
+    if (why.len == 0 and in.other.port != 0) {
+        var name: [48]u8 = undefined;
+        const line = std.fmt.bufPrint(buf, "{s} {s} on port {d}…", .{ if (in.other.unload) "Unloading" else "Loading", fitNote(&name, in.other.model, name.len), in.other.port }) catch "Another model operation is running";
+        return .{ .label = if (in.model != null) "Unload" else "Load", .symbol = if (in.model != null) "eject.fill" else "arrow.down.circle", .tip = "", .enabled = false, .spinner = false, .action = .none, .why = line };
+    }
     if (why.len == 0 and in.model != null) {
         const tip = std.fmt.bufPrint(buf, "Unload {s}; the server keeps running", .{in.model.?}) catch "Unload the model";
         return .{ .label = "Unload", .symbol = "eject.fill", .tip = tip, .enabled = true, .spinner = false, .action = .unload, .why = "" };
@@ -1058,6 +1078,30 @@ pub fn parsePidFile(text: []const u8) ?PidEntry {
     return .{ .pid = pid, .port = port };
 }
 
+/// A server sushibar started: `answered` once it replied to a probe, which tells "did not start" from "exited".
+pub const Started = struct { pid: i32 = 0, port: u16 = 0, answered: bool = false, stopping: bool = false };
+
+pub fn markAnswered(table: []Started, port: u16) void {
+    for (table) |*st| if (st.pid != 0 and st.port == port) {
+        st.answered = true;
+    };
+}
+
+/// The ports of started servers that have not answered yet, which the scan asks.
+pub fn unansweredPorts(table: []const Started, out: []u16) []u16 {
+    var n: usize = 0;
+    for (table) |st| if (st.pid != 0 and !st.answered and n < out.len) {
+        out[n] = st.port;
+        n += 1;
+    };
+    return out[0..n];
+}
+
+/// The note for a started server that ended on its own.
+pub fn startedExitNote(buf: []u8, st: Started, how: Exit) []const u8 {
+    return if (st.answered) exitedNote(buf, st.port, how) else startFailedNote(buf, st.port, how);
+}
+
 /// `<prefix><port>.pid` records a server sushibar started on that port.
 pub const server_pid_prefix = "sushibar-server-";
 
@@ -1255,7 +1299,21 @@ pub const SavedPorts = struct {
     }
 };
 
-pub const max_model = 96;
+/// The longest model id sushibar remembers and sends back to Load; a longer one is never stored cut.
+pub const max_model = 512;
+
+/// What the saved last model becomes when the watched server lists `model`, `full_len` bytes long, as ready.
+pub const Remember = enum { keep, store, too_long };
+
+pub fn rememberModel(last: []const u8, model: []const u8, full_len: usize) Remember {
+    if (model.len == 0) return .keep;
+    if (full_len > max_model) return .too_long;
+    return if (std.mem.eql(u8, last, model)) .keep else .store;
+}
+
+pub fn modelTooLongNote(buf: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buf, "Port {d}: the model id is over {d} bytes, so Load cannot bring it back", .{ port, max_model }) catch "The model id is too long to remember";
+}
 
 /// `sushibar.json`: the watched port, the ports added to the menu and the model the watched server last had loaded.
 pub const Saved = struct {
@@ -1289,7 +1347,8 @@ pub fn parseSaved(text: []const u8) Saved {
     };
     return out;
 }
-var saved_scratch: [4096]u8 = undefined;
+pub const saved_max_bytes = 8192;
+var saved_scratch: [saved_max_bytes]u8 = undefined;
 
 pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -1341,6 +1400,19 @@ pub const note_kept_ms: i64 = 60_000;
 /// A note with news, not a problem, is dropped when the menu opens a minute or more after it was given.
 pub fn noteKept(problem: bool, at_ms: i64, open_ms: i64) bool {
     return problem or open_ms - at_ms < note_kept_ms;
+}
+
+/// Who owns a note: the update flow, a server that went away or did not start, or anything else.
+pub const NoteKind = enum { update, server, other };
+
+/// A finished update check replaces the notes about updates and no other: a crash note stays.
+pub fn checkReplacesNote(kind: NoteKind) bool {
+    return kind == .update;
+}
+
+/// A server-kind note on `note_port` goes when a server answers there again.
+pub fn recoveryClearsNote(kind: NoteKind, note_port: u16, recovered_port: u16) bool {
+    return kind == .server and recovered_port != 0 and note_port == recovered_port;
 }
 
 /// The longest a note is drawn in the menu; the item's tooltip has the rest, so the menu keeps its width.
@@ -1539,7 +1611,7 @@ test "last model: the saved file keeps the model the watched server had loaded, 
     try std.testing.expectEqualStrings("", parseSaved("{\"port\":5}").model());
     try std.testing.expectEqualStrings("", parseSaved("{\"model\":5}").model());
     const long: [max_model + 1]u8 = @splat('m');
-    var jb: [160]u8 = undefined;
+    var jb: [max_model + 32]u8 = undefined;
     try std.testing.expectEqualStrings("", parseSaved(try std.fmt.bufPrint(&jb, "{{\"model\":\"{s}\"}}", .{&long})).model());
     try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, ""), "model") == null);
 }
@@ -2842,4 +2914,87 @@ test "log new lines: the pill shows once lines arrive while scrolled up, and goe
     try std.testing.expect(!newLinesPill(false, false, false));
     try std.testing.expect(!newLinesPill(true, true, true));
     try std.testing.expect(!newLinesPill(false, true, true));
+}
+
+test "last model: a 200-byte id round trips through the saved file, a file from before the wider bound loads unchanged" {
+    const id: [200]u8 = @splat('x');
+    var b: [saved_max_bytes]u8 = undefined;
+    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, &id));
+    try std.testing.expectEqualStrings(&id, got.model());
+    try std.testing.expectEqual(@as(?u16, 18802), got.port);
+    const edge: [max_model]u8 = @splat('e');
+    try std.testing.expectEqualStrings(&edge, parseSaved(formatSaved(&b, 1, &.{}, &edge)).model());
+    const quoted: [max_model]u8 = @splat('"');
+    try std.testing.expectEqualStrings(&quoted, parseSaved(formatSaved(&b, 1, &.{}, &quoted)).model());
+    const old = parseSaved("{\"port\":18802,\"ports\":[18803,18804],\"model\":\"Qwen-Sushi-STQ-2.75bpw\"}\n");
+    try std.testing.expectEqualStrings("Qwen-Sushi-STQ-2.75bpw", old.model());
+    try std.testing.expectEqualSlices(u16, &.{ 18803, 18804 }, old.ports.items());
+}
+
+test "last model: an id past the bound is refused with a note, never stored cut" {
+    const fits: [max_model]u8 = @splat('m');
+    try std.testing.expectEqual(Remember.store, rememberModel("", &fits, fits.len));
+    try std.testing.expectEqual(Remember.keep, rememberModel(&fits, &fits, fits.len));
+    try std.testing.expectEqual(Remember.keep, rememberModel("a", "", 0));
+    try std.testing.expectEqual(Remember.too_long, rememberModel("a", &fits, max_model + 1));
+    var b: [128]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, modelTooLongNote(&b, 18801), "Port 18801") != null);
+}
+
+test "model button: a load running on another port keeps Load off and says which" {
+    var b: [160]u8 = undefined;
+    const busy = modelButton(&b, .{ .link = .up, .last_model = "Qwen-X", .other = .{ .port = 18801, .model = "Qwen-X" } });
+    try std.testing.expect(!busy.enabled and busy.action == .none);
+    try std.testing.expectEqualStrings("Load", busy.label);
+    try std.testing.expectEqualStrings("Loading Qwen-X on port 18801…", busy.why);
+    const gone = modelButton(&b, .{ .link = .up, .model = "Qwen-X", .last_model = "Qwen-X", .other = .{ .port = 18802, .unload = true, .model = "Qwen-X" } });
+    try std.testing.expect(!gone.enabled and gone.action == .none);
+    try std.testing.expectEqualStrings("Unload", gone.label);
+    try std.testing.expectEqualStrings("Unloading Qwen-X on port 18802…", gone.why);
+    const none = modelButton(&b, .{ .link = .up, .last_model = "Qwen-X" });
+    try std.testing.expect(none.enabled and none.action == .load);
+    const long: [300]u8 = @splat('q');
+    const cut = modelButton(&b, .{ .link = .up, .last_model = "Qwen-X", .other = .{ .port = 18801, .model = &long } });
+    try std.testing.expect(cut.why.len < 90 and std.mem.endsWith(u8, cut.why, " on port 18801…"));
+    // The reason the watched server cannot load comes first: a stopped server is not "loading elsewhere".
+    try std.testing.expectEqualStrings("Start the server to load a model", modelButton(&b, .{ .link = .offline, .last_model = "Qwen-X", .other = .{ .port = 18801, .model = "Qwen-X" } }).why);
+}
+
+test "note: a check replaces an update note and leaves a problem about a server alone" {
+    try std.testing.expect(checkReplacesNote(.update));
+    try std.testing.expect(!checkReplacesNote(.server));
+    try std.testing.expect(!checkReplacesNote(.other));
+}
+
+test "note: a server note goes when a server answers on its port again, and only then" {
+    var w: Watch = .{};
+    _ = w.observe(18801, .up, 0, false);
+    w.reaped(18801, 1_000);
+    _ = w.observe(18801, .offline, 2_000, false);
+    try std.testing.expectEqual(@as(u16, 0), w.takeRecovered());
+    try std.testing.expect(!recoveryClearsNote(.server, 18801, 0));
+    _ = w.observe(18801, .up, 40_000, false);
+    const rp = w.takeRecovered();
+    try std.testing.expectEqual(@as(u16, 18801), rp);
+    try std.testing.expectEqual(@as(u16, 0), w.takeRecovered());
+    try std.testing.expect(recoveryClearsNote(.server, 18801, rp));
+    try std.testing.expect(!recoveryClearsNote(.server, 18802, rp));
+    try std.testing.expect(!recoveryClearsNote(.update, 18801, rp));
+    try std.testing.expect(!recoveryClearsNote(.other, 18801, rp));
+}
+
+test "started servers: one that answered on a port that is not watched reads exited, not did not start" {
+    var table: [4]Started = @splat(.{});
+    table[0] = .{ .pid = 100, .port = 18801 };
+    table[1] = .{ .pid = 101, .port = 18802 };
+    var out: [4]u16 = undefined;
+    try std.testing.expectEqualSlices(u16, &.{ 18801, 18802 }, unansweredPorts(&table, &out));
+    markAnswered(&table, 18802);
+    try std.testing.expectEqualSlices(u16, &.{18801}, unansweredPorts(&table, &out));
+    markAnswered(&table, 18809);
+    var b: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("Port 18802: server exited (signal 11)", startedExitNote(&b, table[1], .{ .signal = 11 }));
+    try std.testing.expectEqualStrings("Port 18801: server did not start (exit 1)", startedExitNote(&b, table[0], .{ .code = 1 }));
+    table[0] = .{};
+    try std.testing.expectEqual(@as(usize, 0), unansweredPorts(&table, &out).len);
 }

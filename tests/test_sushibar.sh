@@ -353,7 +353,8 @@ cat > "$LM/fake.c" <<'EOF'
    /v1/unload-model) to FAKE_LOG, and lists the model last loaded, until unloaded. With a key it answers 401 to a
    request without it. FAKE_VERSION_FILE holds what --version prints, FAKE_CHECK what `update --check` prints;
    FAKE_SERVER_VERSION is the version /props reports, after FAKE_PROPS_DELAY seconds; POST /v1/update is accepted
-   and changes nothing. FAKE_LINGER: a SIGTERM closes the port at once and exits that many seconds later. */
+   and changes nothing. FAKE_LINGER: a SIGTERM closes the port at once and exits that many seconds later.
+   FAKE_LOAD_DELAY: a POST /v1/load-model answers that many seconds late. */
 static int fd, linger;
 static void on_term(int sig) { (void)sig; close(fd); sleep(linger); _exit(0); }
 int main(int argc, char **argv) {
@@ -387,8 +388,9 @@ int main(int argc, char **argv) {
     if (key) snprintf(bearer, sizeof bearer, "Bearer %s", key);
     const char *server_version = getenv("FAKE_SERVER_VERSION");
     int props_delay = getenv("FAKE_PROPS_DELAY") ? atoi(getenv("FAKE_PROPS_DELAY")) : 0;
+    int load_delay = getenv("FAKE_LOAD_DELAY") ? atoi(getenv("FAKE_LOAD_DELAY")) : 0;
     const char *ready = getenv("FAKE_READY"), *log = getenv("FAKE_LOG");
-    static char cur[128];
+    static char cur[640];
     if (ready) snprintf(cur, sizeof cur, "%s", ready);
     for (;;) {
         int c = accept(fd, 0, 0);
@@ -402,7 +404,7 @@ int main(int argc, char **argv) {
             char *end = strstr(req, "\r\n\r\n"), *cl = strcasestr(req, "content-length:");
             if (!end || n >= (end + 4 - req) + (cl ? atoi(cl + 15) : 0)) break;
         }
-        char body[512] = "{}";
+        char body[2048] = "{}";
         const char *status = "200 OK";
         int child = 0;
         if (key && !strstr(req, bearer)) status = "401 Unauthorized";
@@ -418,6 +420,12 @@ int main(int argc, char **argv) {
             }
         } else if (!strncmp(req, "GET /v1/models", 14))
             snprintf(body, sizeof body, cur[0] ? "{\"data\":[{\"id\":\"%s\",\"state\":\"ready\"}]}" : "{\"data\":[]}", cur);
+        if (load_delay > 0 && !strncmp(req, "POST /v1/load-model", 19)) {
+            pid_t k = fork();
+            if (k > 0) { close(c); continue; }
+            child = k == 0;
+            sleep(load_delay);
+        }
         int is_load = !strncmp(req, "POST /v1/load-model", 19), is_unload = !strncmp(req, "POST /v1/unload-model", 21);
         if ((is_load || is_unload) && status[0] == '2') {
             char *end = strstr(req, "\r\n\r\n"), *m = end ? strstr(end, "\"model\":\"") : 0;
@@ -522,6 +530,49 @@ if command -v cc > /dev/null 2>&1 && cc -o "$LM/sushi" "$LM/fake.c" 2> /dev/null
     check "a server it started before the relaunch is reaped when it dies, not left a zombie" "$(yes_if '[ -n "$SRV" ] && [ -z "$zombie" ]')"
     check "and its exit is reported as such" "$(yes_if 'awk "/poll 1 /{n++} n>=2" "$LOG" | grep -q "note=\"Port '"$UPORT"': server exited (signal 9)\""')"
     rm -f "$HOME"/.sushi/sushibar-server-*.pid
+
+    echo "== one model operation at a time, and a problem note outlives a check =="
+    echo '{"port":'"$UPORT"',"ports":['"$FPORT"'],"model":"Pack-One"}' > "$HOME/.sushi/sushibar.json"
+    "$LM/sushi" --serve --port "$FPORT" > /dev/null 2>&1 &
+    FPID=$!
+    wait_health "$FPORT" > /dev/null
+    : > "$WORK/load.log"
+    FAKE_LOAD_DELAY=6 FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 16 "start@2,load@6,port$FPORT@7,load@9" --port "$UPORT"
+    check "while a load runs on another port, Load is off and says which model and port" "$(yes_if 'grep -Eq "poll (9|10|11) .*Port '"$FPORT"':.*load=\"Load\" load_on=0 why=\"Loading Pack-One on port '"$UPORT"'…\"" "$LOG"')"
+    check "a click on it starts nothing: the model was asked for once" "$(yes_if '[ "$(grep -c "Pack-One" "$WORK/load.log")" = 1 ]')"
+    check "and Load is on again once that load has ended" "$(yes_if 'tail -n 1 "$LOG" | grep -q "Port '"$FPORT"':.*load=\"Load\" load_on=1"')"
+    kill "$FPID" 2> /dev/null; wait "$FPID" 2> /dev/null
+    stop_fakes
+
+    echo "== a started server that answers while another port is watched, and a note a check must not wipe =="
+    echo '{"port":'"$UPORT"',"ports":[]}' > "$HOME/.sushi/sushibar.json"
+    : > "$LOG"
+    FAKE_CHECK="sushi 1.0.0 is up to date" SUSHIBAR_TEST_POLLS=19 SUSHIBAR_TEST_ACTIONS="start@2,port$FPORT@2,check@14" "$LM/sushibar" --port "$UPORT" 2> "$LOG"
+    BP=$(cut -d' ' -f1 "$HOME/.sushi/sushibar.pid" 2> /dev/null)
+    [ "$(wait_health "$UPORT")" = 200 ] && sleep 4
+    kill -9 "$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$UPORT.pid" 2> /dev/null)" 2> /dev/null
+    for _ in $(seq 1 60); do kill -0 "$BP" 2> /dev/null || break; sleep 0.5; done
+    check "a server that answered, then died while another port was watched, exited (it did not fail to start)" "$(yes_if 'grep -q "Port '"$FPORT"':.*note=\"Port '"$UPORT"': server exited (signal 9)\" problem=1" "$LOG"')"
+    check "a check that finds sushi up to date leaves that note" "$(yes_if 'tail -n 1 "$LOG" | grep -q "button=\"Up to date\".*" && tail -n 1 "$LOG" | grep -q "note=\"Port '"$UPORT"': server exited (signal 9)\" problem=1"')"
+    rm -f "$HOME"/.sushi/sushibar-server-*.pid
+
+    echo "== a long model id is remembered whole, one past the bound is refused with a note =="
+    LONG=$(printf 'Long-Pack-%.0s' $(seq 1 20))
+    TOOLONG=$(printf 'Too-Long-Pack-%.0s' $(seq 1 45))
+    rm -f "$HOME/.sushi/sushibar.json"
+    FAKE_READY="$LONG" run_bar "$LM/sushibar" 8 "start@2" --port "$UPORT"
+    check "a 200-byte id is saved whole" "$(yes_if 'grep -q "\"model\":\"'"$LONG"'\"" "$HOME/.sushi/sushibar.json"')"
+    stop_fakes
+    : > "$WORK/load.log"
+    FAKE_LOG="$WORK/load.log" run_bar "$LM/sushibar" 10 "start@2,load@6" --port "$UPORT"
+    check "and Load asks for exactly that id" "$(yes_if 'grep -q "\"model\":\"'"$LONG"'\",\"default\":true" "$WORK/load.log"')"
+    stop_fakes
+    rm -f "$HOME/.sushi/sushibar.json"
+    FAKE_READY="$TOOLONG" run_bar "$LM/sushibar" 8 "start@2" --port "$UPORT"
+    check "an id past the bound is not saved cut" "$(yes_if '! grep -q "model" "$HOME/.sushi/sushibar.json"')"
+    check "and the note says so" "$(yes_if 'grep -q "note=\"Port '"$UPORT"': the model id is over" "$LOG"')"
+    stop_fakes
+    rm -f "$HOME/.sushi/sushibar.json"
 
     echo "== the props of a port no longer watched stay with it =="
     FAKE_SERVER_VERSION=9.9.9 FAKE_PROPS_DELAY=3 "$LM/sushi" --serve --port "$FPORT" > /dev/null 2>&1 &

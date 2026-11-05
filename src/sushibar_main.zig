@@ -115,7 +115,9 @@ const Shared = struct {
     /// The port the data below belongs to; stale once the watched port changes.
     port: u16 = 0,
     view: logic.View = .{ .link = .offline },
-    model: Str(96) = .{},
+    model: Str(logic.max_model) = .{},
+    /// The byte length of the ready model's id as the server sent it, which `model` cuts to `max_model`.
+    model_full_len: usize = 0,
     listings: [max_listings]Listing = undefined,
     listing_n: usize = 0,
     /// The sushi listeners of the last scan with the address each is bound to (`originFor`).
@@ -124,6 +126,11 @@ const Shared = struct {
     models: [16]ModelCache = @splat(.{}),
     sushi_listening: bool = false,
     port_taken: bool = false,
+    /// Started servers still to be asked whether they answer (`started`), and the ports that did.
+    probe_ports: [8]u16 = undefined,
+    probe_n: usize = 0,
+    answered_ports: [8]u16 = undefined,
+    answered_n: usize = 0,
     model_loading: Str(96) = .{},
     /// The ready model's `meta.pack_update`; empty `pack_latest` means none.
     pack_current: Str(32) = .{},
@@ -146,6 +153,9 @@ const Shared = struct {
     note: Str(240) = .{},
     /// The note says something went wrong: it is drawn orange and opens the Log window.
     note_problem: bool = false,
+    note_kind: logic.NoteKind = .other,
+    /// The port a `.server` note is about.
+    note_port: u16 = 0,
     note_at_ms: i64 = 0,
     props_url: Str(160) = .{},
     busy: logic.Busy = .none,
@@ -180,10 +190,14 @@ var g_capture_seq = std.atomic.Value(u32).init(0);
 var g_launched_version: Str(32) = .{};
 /// The model the watched server last had loaded (`sushibar.json`): Load brings it back.
 var g_last_model: Str(logic.max_model) = .{};
+/// The ready model's id was past `max_model`, so it was not stored and the note said so.
+var g_model_too_long = false;
 /// The port a server is being asked to load `g_last_model` on, 0 when none is.
 var g_load_port = std.atomic.Value(u16).init(0);
 /// The port a server is being asked to unload `g_last_model` on, 0 when none is.
 var g_unload_port = std.atomic.Value(u16).init(0);
+/// The model the running load or unload names; `g_last_model` follows the watched port and may differ.
+var g_op_model: Str(logic.max_model) = .{};
 /// A server the user's own Stop is ending, so its going away is no news.
 var g_stop_port: u16 = 0;
 var g_stop_at_ms: i64 = 0;
@@ -415,20 +429,41 @@ fn refreshBarVersion(a: std.mem.Allocator) void {
 fn setNote(text: []const u8) void {
     lock();
     defer unlock();
-    putNote(text, false);
+    putNote(text, false, .other, 0);
 }
 
 fn setProblem(text: []const u8) void {
     lock();
     defer unlock();
-    putNote(text, true);
+    putNote(text, true, .other, 0);
+}
+
+/// A note about the update flow: a finished check replaces it.
+fn setUpdateNote(text: []const u8, problem: bool) void {
+    lock();
+    defer unlock();
+    putNote(text, problem, .update, 0);
+}
+
+/// A problem with the server on `p`: it stays until a server answers there again or Start is pressed.
+fn setServerProblem(text: []const u8, p: u16) void {
+    lock();
+    defer unlock();
+    putNote(text, true, .server, p);
 }
 
 /// Holding the lock.
-fn putNote(text: []const u8, problem: bool) void {
+fn putNote(text: []const u8, problem: bool, kind: logic.NoteKind, p: u16) void {
     shared.note.set(text);
     shared.note_problem = problem;
+    shared.note_kind = kind;
+    shared.note_port = p;
     shared.note_at_ms = io_util.nowMs(g_io);
+}
+
+/// Holding the lock.
+fn clearNote() void {
+    putNote("", false, .other, 0);
 }
 
 /// Folds a check's answer into what the menu shows. False when it was a failure.
@@ -439,19 +474,14 @@ fn applyCheck(result: logic.Check, manual: bool) bool {
         .available => |v| {
             shared.latest.set(v);
             shared.available = true;
-            shared.note.set("");
-            shared.note_problem = false;
+            if (logic.checkReplacesNote(shared.note_kind)) clearNote();
         },
         .up_to_date => {
             shared.available = false;
-            shared.note.set("");
-            shared.note_problem = false;
+            if (logic.checkReplacesNote(shared.note_kind)) clearNote();
         },
         .failed => |line| {
-            if (manual) {
-                shared.note.set(line);
-                shared.note_problem = true;
-            }
+            if (manual) putNote(line, true, .update, 0);
             return false;
         },
     }
@@ -487,7 +517,7 @@ fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
     if (!manual) if (cachedCheck(a)) |hit| return applyCheck(hit, false);
     const got = capture(a, &.{ sushi.ptr, "update", "--check" });
     if (got.code == null) {
-        if (manual) setProblem("could not run sushi");
+        if (manual) setUpdateNote("could not run sushi", true);
         return false;
     }
     return applyCheck(logic.parseCheck(got.text), manual);
@@ -516,7 +546,7 @@ fn finishUpdate(a: std.mem.Allocator, ok_note: []const u8) void {
     lock();
     defer unlock();
     shared.available = false;
-    putNote(ok_note, false);
+    putNote(ok_note, false, .update, 0);
 }
 
 /// `error.message` of a server's JSON error body, or "".
@@ -543,19 +573,19 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
             @memcpy(from_buf[0..from.len], u.current[0..from.len]);
         };
     }
-    if (from.len == 0) return setProblem("Update failed: the server did not say which version it runs");
-    const r = request(a, p, .POST, urlFor(&url, p, "/v1/update"), origin_s) orelse return setProblem("Update failed: the server did not answer");
+    if (from.len == 0) return setUpdateNote("Update failed: the server did not say which version it runs", true);
+    const r = request(a, p, .POST, urlFor(&url, p, "/v1/update"), origin_s) orelse return setUpdateNote("Update failed: the server did not answer", true);
     if (r.status != 202) {
         const why = errorMessage(a, r.body);
         var msg: [400]u8 = undefined;
-        return setProblem(std.fmt.bufPrint(&msg, "Update refused: {s}", .{if (why.len > 0) why else "the server did not accept it"}) catch "Update refused");
+        return setUpdateNote(std.fmt.bufPrint(&msg, "Update refused: {s}", .{if (why.len > 0) why else "the server did not accept it"}) catch "Update refused", true);
     }
-    setNote("Updating…");
+    setUpdateNote("Updating…", false);
     var down = false;
     var i: u32 = 0;
     while (i < update_wait_polls) : (i += 1) {
         std.Io.sleep(g_io, .fromMilliseconds(500), .real) catch {};
-        if (port() != p) return setNote("Update started; no longer followed after the port change");
+        if (port() != p) return setUpdateNote("Update started; no longer followed after the port change", false);
         var hb: [url_cap]u8 = undefined;
         const alive = if (get(a, p, urlFor(&hb, p, "/health"))) |h| h.status == 200 else false;
         if (!alive) {
@@ -578,7 +608,7 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
     };
     var msg: [400]u8 = undefined;
     const why = if (u) |up| up.err orelse "sushi restarted on the version it had" else "the server did not come back";
-    setProblem(std.fmt.bufPrint(&msg, "Update failed: {s}", .{why}) catch "Update failed");
+    setUpdateNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{why}) catch "Update failed", true);
 }
 
 /// Two minutes of half-second polls: past that the update is reported as failed instead of locking the menu.
@@ -586,8 +616,8 @@ const update_wait_polls = 240;
 
 fn updateViaCli(a: std.mem.Allocator) void {
     var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return setProblem("could not find sushi beside sushibar");
-    setNote("Updating…");
+    const sushi = siblingNow(&sb, server_exe) orelse return setUpdateNote("could not find sushi beside sushibar", true);
+    setUpdateNote("Updating…", false);
     const got = capture(a, &.{ sushi.ptr, "update" });
     if (got.code == 0) {
         var msg: [64]u8 = undefined;
@@ -599,7 +629,7 @@ fn updateViaCli(a: std.mem.Allocator) void {
         return finishUpdate(a, text);
     }
     var msg: [400]u8 = undefined;
-    setProblem(std.fmt.bufPrint(&msg, "Update failed: {s}", .{logic.failureLine(got.text)}) catch "Update failed");
+    setUpdateNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{logic.failureLine(got.text)}) catch "Update failed", true);
 }
 
 const WorkerKind = enum { auto_check, check, update };
@@ -630,8 +660,8 @@ fn worker(kind: WorkerKind) void {
             };
             unlock();
             switch (logic.updatePath(ask)) {
-                .none => setNote("Nothing to update"),
-                .brew => setNote("Homebrew install: use the Upgrade button"),
+                .none => setUpdateNote("Nothing to update", false),
+                .brew => setUpdateNote("Homebrew install: use the Upgrade button", false),
                 .server => updateViaServer(a, p),
                 .cli => updateViaCli(a),
             }
@@ -745,6 +775,7 @@ fn pollLoop() void {
             shared.bound = bound;
             shared.bound_n = n;
             unlock();
+            probeStarted(a, listings[0..n], p);
             // A server bound to a non-loopback address was asked on 127.0.0.1 above: ask where it listens.
             if (reply == null) {
                 const again = metricsUrl(&again_buf, p, tracker.since_ms);
@@ -806,6 +837,7 @@ fn pollLoop() void {
             shared.view = tracker.view(sample.link);
             if (fetch_models or !answers) {
                 shared.model.set(models.ready orelse "");
+                shared.model_full_len = if (models.ready) |m| m.len else 0;
                 shared.model_loading.set(models.loading orelse "");
                 const pu = models.pack_update orelse logic.PackUpdate{};
                 shared.pack_current.set(pu.current);
@@ -886,7 +918,7 @@ fn pollLoop() void {
 // ── Port ──
 
 fn writeSaved(p: u16) void {
-    var text: [512]u8 = undefined;
+    var text: [logic.saved_max_bytes]u8 = undefined;
     std.Io.Dir.cwd().createDirPath(g_io, std.fs.path.dirname(g_saved_path) orelse ".") catch {};
     std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get()) }) catch {};
 }
@@ -909,6 +941,7 @@ fn setPort(p: u16) void {
     lock();
     shared.view = .{ .link = .offline };
     shared.model.set("");
+    shared.model_full_len = 0;
     shared.server_version.set("");
     shared.props_latest.set("");
     shared.props_available = false;
@@ -941,8 +974,7 @@ fn ownServer() ?logic.PidEntry {
 
 /// Servers this process spawned: each is reaped by its own pid, and one that exits before it ever answered is a
 /// failed start.
-const Started = struct { pid: i32 = 0, port: u16 = 0, answered: bool = false, stopping: bool = false };
-var started: [8]Started = @splat(.{});
+var started: [8]logic.Started = @splat(.{});
 
 fn reapStarted() void {
     for (&started) |*st| {
@@ -955,10 +987,8 @@ fn reapStarted() void {
         if (!st.stopping) {
             var nb: [160]u8 = undefined;
             const how = logic.exitOf(@bitCast(status));
-            if (st.answered) {
-                setProblem(logic.exitedNote(&nb, st.port, how));
-                g_watch.reaped(st.port, io_util.nowMs(g_io));
-            } else setProblem(logic.startFailedNote(&nb, st.port, how));
+            setServerProblem(logic.startedExitNote(&nb, st.*, how), st.port);
+            if (st.answered) g_watch.reaped(st.port, io_util.nowMs(g_io));
         }
         st.* = .{};
     }
@@ -983,10 +1013,39 @@ fn adoptStarted() void {
     }
 }
 
-fn markAnswered(p: u16) void {
-    for (&started) |*st| if (st.pid != 0 and st.port == p) {
-        st.answered = true;
-    };
+/// The poll thread asks each started server that has not answered, during its process scan, and the menu thread
+/// learns the answers here: an exit then reads "exited", on whatever port the server runs.
+fn syncProbes() void {
+    var pend: [started.len]u16 = undefined;
+    const ports = logic.unansweredPorts(&started, &pend);
+    lock();
+    defer unlock();
+    for (shared.answered_ports[0..shared.answered_n]) |ap| logic.markAnswered(&started, ap);
+    shared.answered_n = 0;
+    shared.probe_n = ports.len;
+    @memcpy(shared.probe_ports[0..ports.len], ports);
+}
+
+fn probeStarted(a: std.mem.Allocator, listings: []const Listing, watched: u16) void {
+    var ports: [started.len]u16 = undefined;
+    lock();
+    const n = shared.probe_n;
+    @memcpy(ports[0..n], shared.probe_ports[0..n]);
+    unlock();
+    for (ports[0..n]) |q| {
+        if (q == watched) continue;
+        for (listings) |l| if (l.port == q) {
+            var b: [url_cap]u8 = undefined;
+            if (requestWithin(a, q, .GET, urlFor(&b, q, "/health"), null, models_timeout_s, "") == null) break;
+            lock();
+            if (shared.answered_n < shared.answered_ports.len) {
+                shared.answered_ports[shared.answered_n] = q;
+                shared.answered_n += 1;
+            }
+            unlock();
+            break;
+        };
+    }
 }
 
 fn markStopping(pid: i32) void {
@@ -1025,6 +1084,7 @@ fn startModelOp(unload: bool) void {
     if (g_load_port.load(.acquire) != 0 or g_unload_port.load(.acquire) != 0 or g_last_model.len == 0) return;
     const slot = if (unload) &g_unload_port else &g_load_port;
     if (slot.cmpxchgStrong(0, p, .acq_rel, .acquire) != null) return;
+    g_op_model = g_last_model;
     const t = std.Thread.spawn(.{}, modelOpWorker, .{ModelOp{ .port = p, .unload = unload, .model = g_last_model }}) catch return slot.store(0, .release);
     t.detach();
     pollSoon();
@@ -1041,7 +1101,7 @@ fn modelOpWorker(job: ModelOp) void {
     var url: [url_cap]u8 = undefined;
     var origin: [origin_cap]u8 = undefined;
     const origin_s = originFor(&origin, job.port);
-    var body: [logic.max_model * 2 + 40]u8 = undefined;
+    var body: [logic.max_model * 6 + 40]u8 = undefined;
     const target = if (job.unload) urlFor(&url, job.port, "/v1/unload-model") else urlFor(&url, job.port, "/v1/load-model");
     const payload = if (job.unload) logic.unloadModelBody(&body, job.model.get()) else logic.loadModelBody(&body, job.model.get());
     const reply = requestWithin(a, job.port, .POST, target, origin_s, load_timeout_s, payload);
@@ -1049,7 +1109,10 @@ fn modelOpWorker(job: ModelOp) void {
     var msg: [240]u8 = undefined;
     if (reply) |r| if (r.status == 200) {
         lock();
-        if (shared.port == job.port) shared.model.set(if (job.unload) "" else job.model.get());
+        if (shared.port == job.port) {
+            shared.model.set(if (job.unload) "" else job.model.get());
+            shared.model_full_len = shared.model.len;
+        }
         unlock();
         return;
     };
@@ -1348,7 +1411,7 @@ fn watchTransition(p: u16, fresh: bool, link: logic.Link, now: i64) void {
     const mine = g_stop_port == p and now < g_stop_at_ms + 45_000;
     if (g_watch.observe(p, link, now, mine)) {
         var nb: [96]u8 = undefined;
-        setProblem(stoppedAtNote(&nb, p));
+        setServerProblem(stoppedAtNote(&nb, p), p);
     }
     if (link == .offline and mine) g_stop_port = 0;
 }
@@ -1477,7 +1540,7 @@ fn refresh() void {
     reapStarted();
     const p = port();
     const now = io_util.nowMs(g_io);
-    var model_b: [96]u8 = undefined;
+    var model_b: [logic.max_model]u8 = undefined;
     var loading_b: [96]u8 = undefined;
     var bar_b: [32]u8 = undefined;
     var srv_b: [32]u8 = undefined;
@@ -1543,14 +1606,33 @@ fn refresh() void {
     };
     const relaunch = shared.relaunch;
     const note_problem = shared.note_problem;
+    const model_full_len = if (fresh) shared.model_full_len else 0;
     unlock();
 
-    if (view.link == .up or view.link == .metrics_off) markAnswered(p);
-    if (fresh and model.len > 0 and !std.mem.eql(u8, model, g_last_model.get())) {
-        g_last_model.set(model);
-        writeSaved(p);
+    if (view.link == .up or view.link == .metrics_off) logic.markAnswered(&started, p);
+    syncProbes();
+    switch (logic.rememberModel(g_last_model.get(), model, model_full_len)) {
+        .store => {
+            g_last_model.set(model);
+            g_model_too_long = false;
+            writeSaved(p);
+        },
+        .too_long => if (!g_model_too_long) {
+            g_model_too_long = true;
+            var nb: [128]u8 = undefined;
+            setProblem(logic.modelTooLongNote(&nb, p));
+        },
+        .keep => if (model.len > 0) {
+            g_model_too_long = false;
+        },
     }
     watchTransition(p, fresh, view.link, now);
+    const recovered = g_watch.takeRecovered();
+    if (recovered != 0) {
+        lock();
+        if (logic.recoveryClearsNote(shared.note_kind, shared.note_port, recovered)) clearNote();
+        unlock();
+    }
     const own = ownServer();
     const ours_alive = own != null;
     if (!logic.stillStopping(stopping_until_ms, now, view.link, stopping_until_ms > now and sushiAlive(g_stop_pid))) stopping_until_ms = 0;
@@ -1564,7 +1646,7 @@ fn refresh() void {
     g_stop_stuck = logic.stopStuck(g_stop_sent, p, now, serving_pid);
     if (g_stop_stuck and !g_stuck_noted) {
         var sb: [96]u8 = undefined;
-        setProblem(logic.stuckNote(&sb, p));
+        setServerProblem(logic.stuckNote(&sb, p), p);
     }
     g_stuck_noted = g_stop_stuck;
     var started_b: [started.len + 1]u16 = undefined;
@@ -1639,7 +1721,9 @@ fn refresh() void {
 
     button_row.setStart(.{ .label = tg.label, .symbol = tg.symbol, .tip = tg.tip, .enabled = tg.enabled, .closes_menu = tg.action != .start });
     var model_tip: [160]u8 = undefined;
+    const op_port = if (g_load_port.load(.acquire) != 0) g_load_port.load(.acquire) else g_unload_port.load(.acquire);
     const mb = logic.modelButton(&model_tip, .{
+        .other = if (op_port != 0 and op_port != p) .{ .port = op_port, .unload = g_unload_port.load(.acquire) != 0, .model = g_op_model.get() } else .{},
         .link = view.link,
         .connecting = !fresh,
         .starting = starting,
@@ -1767,6 +1851,7 @@ fn toggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .force_stop => forceStop(),
         .none => {},
     }
+    refresh();
 }
 fn loadModelAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     switch (model_action) {
@@ -2403,7 +2488,7 @@ pub fn main(init: std.process.Init) !void {
     readTestSeams();
 
     g_default_port = readDefaultPort();
-    const saved_text = std.Io.Dir.cwd().readFileAlloc(g_io, g_saved_path, gpa, .limited(4096)) catch "";
+    const saved_text = std.Io.Dir.cwd().readFileAlloc(g_io, g_saved_path, gpa, .limited(logic.saved_max_bytes)) catch "";
     const saved = logic.parseSaved(saved_text);
     g_saved = saved.ports;
     g_last_model.set(saved.model());
