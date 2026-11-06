@@ -905,6 +905,8 @@ pub const HeaderIn = struct {
     last_prefill: ?f64 = null,
     gpu_mhz: ?u64 = null,
     gpu_pct: ?u64 = null,
+    /// The watched server's listener is bound to a LAN address.
+    lan: bool = false,
 };
 
 pub const Stat = struct { value: []const u8, label: []const u8 };
@@ -930,6 +932,11 @@ const dash = "–";
 
 fn fmt(a: std.mem.Allocator, comptime f: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(a, f, args) catch "";
+}
+
+/// The header's port line names a LAN bind beside the port.
+fn lanTail(lan: bool) []const u8 {
+    return if (lan) " · LAN" else "";
 }
 
 /// Everything the menu's header card shows, as strings; the view only draws them.
@@ -976,16 +983,16 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
     } else if (in.model) |m| {
         h.line1 = m;
         h.line2 = if (in.mem_mb) |mb|
-            fmt(a, "Port {d} · {d:.1} GB in use", .{ in.port, @as(f64, @floatFromInt(mb)) / 1024.0 })
+            fmt(a, "Port {d}{s} · {d:.1} GB in use", .{ in.port, lanTail(in.lan), @as(f64, @floatFromInt(mb)) / 1024.0 })
         else
-            fmt(a, "Port {d}", .{in.port});
+            fmt(a, "Port {d}{s}", .{ in.port, lanTail(in.lan) });
     } else if (in.last_model.len > 0) {
         h.line1 = fmt(a, "Ready to load · port {d}", .{in.port});
         h.line2 = in.last_model;
     } else {
         h.line1 = "Open Models to load one";
         h.line1_models = true;
-        h.line2 = fmt(a, "Port {d}", .{in.port});
+        h.line2 = fmt(a, "Port {d}{s}", .{ in.port, lanTail(in.lan) });
     }
     h.show_stats = in.link == .up and in.model != null;
     h.pack_line = "";
@@ -1323,10 +1330,12 @@ pub fn modelTooLongNote(buf: []u8, port: u16) []const u8 {
     return std.fmt.bufPrint(buf, "Port {d}: the model id is over {d} bytes, so Load cannot bring it back", .{ port, max_model }) catch "The model id is too long to remember";
 }
 
-/// `sushibar.json`: the watched port, the ports added to the menu and the model the watched server last had loaded.
+/// `sushibar.json`: the watched port, the ports added to the menu, the model the watched server last had loaded
+/// and whether Start binds the LAN.
 pub const Saved = struct {
     port: ?u16 = null,
     ports: SavedPorts = .{},
+    lan: bool = false,
     model_buf: [max_model]u8 = undefined,
     model_len: usize = 0,
 
@@ -1335,7 +1344,8 @@ pub const Saved = struct {
     }
 };
 
-/// A file from before added ports holds the one key `port`; one from before the model has no `model`.
+/// A file from before added ports holds the one key `port`; one from before the model has no `model`; one from
+/// before the LAN switch has no `lan`.
 pub fn parseSaved(text: []const u8) Saved {
     var arena: std.heap.FixedBufferAllocator = .init(&saved_scratch);
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{}) catch return .{};
@@ -1353,19 +1363,49 @@ pub fn parseSaved(text: []const u8) Saved {
         @memcpy(out.model_buf[0..m.string.len], m.string);
         out.model_len = m.string.len;
     };
+    if (obj.get("lan")) |l| if (l == .bool) {
+        out.lan = l.bool;
+    };
     return out;
 }
 pub const saved_max_bytes = 8192;
 var saved_scratch: [saved_max_bytes]u8 = undefined;
 
-pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8) []const u8 {
+pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8, lan: bool) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.print("{{\"port\":{d},\"ports\":[", .{watched}) catch return "";
     for (ports, 0..) |p, i| w.print("{s}{d}", .{ if (i > 0) "," else "", p }) catch return "";
     w.writeAll("]") catch return "";
     if (model.len > 0) w.print(",\"model\":{f}", .{json_text.Str{ .s = model }}) catch return "";
+    if (lan) w.writeAll(",\"lan\":true") catch return "";
     w.writeAll("}\n") catch return "";
     return w.buffered();
+}
+
+/// The bind `Listen on LAN` gives a started server: every interface, so devices on the network reach it.
+pub const lan_host: [*:0]const u8 = "0.0.0.0";
+
+/// A socket bound to `a` answers other machines too: loopback binds (127.x and `::1`) are this Mac's alone; a
+/// wildcard or an interface address is reachable over the LAN.
+pub fn lanBound(a: Addr) bool {
+    const v4: [4]u8 = switch (a) {
+        .v4 => |b| b,
+        .v6 => |b| blk: {
+            const mapped = std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
+            if (mapped) break :blk b[12..16].*;
+            return !(std.mem.allEqual(u8, b[0..15], 0) and b[15] == 1);
+        },
+    };
+    return v4[0] != 127;
+}
+
+/// The note `Listen on LAN` leaves after a click: it changes what the next Start binds, never a running server.
+/// The text fits `note_title_max` so the menu shows it whole.
+pub fn lanNote(buf: []u8, lan: bool) []const u8 {
+    return (if (lan)
+        std.fmt.bufPrint(buf, "Next Start listens on the LAN ({s})", .{lan_host})
+    else
+        std.fmt.bufPrint(buf, "Next Start listens on this Mac only", .{})) catch "";
 }
 
 /// The body of `POST /v1/load-model` for the model Load brings back; `default` is what the web page's switch sends.
@@ -1598,7 +1638,7 @@ test "ports: an explicit --port beats the saved one, which beats the default" {
 
 test "ports: the saved file round-trips the watched port and the added ones, and refuses anything else" {
     var b: [320]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{ 18803, 18804 }, ""));
+    const got = parseSaved(formatSaved(&b, 18802, &.{ 18803, 18804 }, "", false));
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     try std.testing.expectEqualSlices(u16, &.{ 18803, 18804 }, got.ports.items());
     try std.testing.expectEqualStrings("", got.model());
@@ -1611,18 +1651,49 @@ test "ports: the saved file round-trips the watched port and the added ones, and
 
 test "last model: the saved file keeps the model the watched server had loaded, escaped, and old files have none" {
     var b: [320]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, "Example-Flash-Next-Sushi-STQ-2.75bpw"));
+    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, "Example-Flash-Next-Sushi-STQ-2.75bpw", false));
     try std.testing.expectEqualStrings("Example-Flash-Next-Sushi-STQ-2.75bpw", got.model());
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     try std.testing.expectEqualSlices(u16, &.{18803}, got.ports.items());
-    try std.testing.expectEqualStrings("a\"b\\c", parseSaved(formatSaved(&b, 1, &.{}, "a\"b\\c")).model());
+    try std.testing.expectEqualStrings("a\"b\\c", parseSaved(formatSaved(&b, 1, &.{}, "a\"b\\c", false)).model());
     try std.testing.expectEqualStrings("", parseSaved("{\"port\":5,\"ports\":[6]}").model());
     try std.testing.expectEqualStrings("", parseSaved("{\"port\":5}").model());
     try std.testing.expectEqualStrings("", parseSaved("{\"model\":5}").model());
     const long: [max_model + 1]u8 = @splat('m');
     var jb: [max_model + 32]u8 = undefined;
     try std.testing.expectEqualStrings("", parseSaved(try std.fmt.bufPrint(&jb, "{{\"model\":\"{s}\"}}", .{&long})).model());
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, ""), "model") == null);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false), "model") == null);
+}
+
+test "lan: the saved file keeps the switch, writes it only when on, and old files read as off" {
+    var b: [320]u8 = undefined;
+    try std.testing.expectEqual(true, parseSaved(formatSaved(&b, 18802, &.{18803}, "M", true)).lan);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", true), "\"lan\":true") != null);
+    try std.testing.expectEqual(false, parseSaved(formatSaved(&b, 1, &.{}, "", false)).lan);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false), "lan") == null);
+    try std.testing.expectEqual(false, parseSaved("{\"port\":5}").lan);
+    try std.testing.expectEqual(false, parseSaved("{\"lan\":false}").lan);
+    try std.testing.expectEqual(false, parseSaved("{\"lan\":\"0.0.0.0\"}").lan);
+}
+
+test "lan: a loopback bind is this Mac's alone; a wildcard or interface address answers the LAN" {
+    try std.testing.expect(!lanBound(.{ .v4 = .{ 127, 0, 0, 1 } }));
+    try std.testing.expect(lanBound(.{ .v4 = .{ 0, 0, 0, 0 } }));
+    try std.testing.expect(lanBound(.{ .v4 = .{ 192, 168, 1, 5 } }));
+    var v6: [16]u8 = @splat(0);
+    try std.testing.expect(lanBound(.{ .v6 = v6 }));
+    v6[15] = 1;
+    try std.testing.expect(!lanBound(.{ .v6 = v6 }));
+    v6 = @splat(0);
+    v6[15] = 2;
+    try std.testing.expect(lanBound(.{ .v6 = v6 }));
+    v6 = @splat(0);
+    v6[10] = 0xff;
+    v6[11] = 0xff;
+    v6[12] = 127;
+    try std.testing.expect(!lanBound(.{ .v6 = v6 }));
+    v6[12] = 100;
+    try std.testing.expect(lanBound(.{ .v6 = v6 }));
 }
 
 test "last model: Load asks the server for it by the web page's request, Unload names it" {
@@ -2102,6 +2173,12 @@ test "header: a running model with throughput" {
     try std.testing.expectEqualStrings("62%", h.stats[2].value);
     try std.testing.expectEqualStrings("GPU · 1,195 MHZ", h.stats[2].label);
     try std.testing.expectEqualStrings("sushi running on port 12345, DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw, generation speed 105 tokens per second", h.a11y);
+    const lan = try buildHeader(arena.allocator(), .{
+        .link = .up, .port = 12345, .model = "m", .mem_mb = 49971, .bar_version = "1.5.0", .lan = true,
+    });
+    try std.testing.expectEqualStrings("Port 12345 · LAN · 48.8 GB in use", lan.line2);
+    const lan_no_mem = try buildHeader(arena.allocator(), .{ .link = .up, .port = 12345, .model = "m", .bar_version = "1.5.0", .lan = true });
+    try std.testing.expectEqualStrings("Port 12345 · LAN", lan_no_mem.line2);
 }
 
 test "header: idle shows the last request, gaps show a dash, an update is named" {
@@ -2985,13 +3062,13 @@ test "log new lines: the pill shows once lines arrive while scrolled up, and goe
 test "last model: a 200-byte id round trips through the saved file, a file from before the wider bound loads unchanged" {
     const id: [200]u8 = @splat('x');
     var b: [saved_max_bytes]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, &id));
+    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, &id, false));
     try std.testing.expectEqualStrings(&id, got.model());
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     const edge: [max_model]u8 = @splat('e');
-    try std.testing.expectEqualStrings(&edge, parseSaved(formatSaved(&b, 1, &.{}, &edge)).model());
+    try std.testing.expectEqualStrings(&edge, parseSaved(formatSaved(&b, 1, &.{}, &edge, false)).model());
     const quoted: [max_model]u8 = @splat('"');
-    try std.testing.expectEqualStrings(&quoted, parseSaved(formatSaved(&b, 1, &.{}, &quoted)).model());
+    try std.testing.expectEqualStrings(&quoted, parseSaved(formatSaved(&b, 1, &.{}, &quoted, false)).model());
     const old = parseSaved("{\"port\":18802,\"ports\":[18803,18804],\"model\":\"Qwen-Sushi-STQ-2.75bpw\"}\n");
     try std.testing.expectEqualStrings("Qwen-Sushi-STQ-2.75bpw", old.model());
     try std.testing.expectEqualSlices(u16, &.{ 18803, 18804 }, old.ports.items());

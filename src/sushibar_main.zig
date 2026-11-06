@@ -17,7 +17,8 @@ const usage =
     \\usage: sushibar [--port <n>]
     \\
     \\Puts sushi in the menu bar: the generation speed in tok/s as the title, and a menu to start and stop a server,
-    \\switch the port, update sushi, and open the dashboard, chat, models and settings pages.
+    \\switch the port, bind the started servers to the LAN or this Mac alone, update sushi, and open
+    \\the dashboard, chat, models and settings pages.
     \\It detaches from the terminal.
     \\
     \\  --port <n>   Port of the server to watch and start (default: the port last chosen
@@ -69,7 +70,7 @@ fn Str(comptime N: usize) type {
 
 // ── Test seams: SUSHIBAR_TEST_POLLS, SUSHIBAR_TEST_ACTIONS (docs/envvar.md) ──
 
-const ActionKind = enum { start, stop, load, unload, confirm, check, update, port, typed, models, remove };
+const ActionKind = enum { start, stop, load, unload, confirm, check, update, port, typed, models, remove, lan };
 const Action = struct { kind: ActionKind, at: u32, value: u32 = 0 };
 var test_polls: u32 = 0;
 var test_actions: [12]Action = undefined;
@@ -125,6 +126,8 @@ const Shared = struct {
     bound_n: usize = 0,
     models: [16]ModelCache = @splat(.{}),
     sushi_listening: bool = false,
+    /// The watched port's sushi listener is bound to a LAN address (`lanBound`).
+    lan_listening: bool = false,
     port_taken: bool = false,
     /// Started servers still to be asked whether they answer (`started`), and the ports that did.
     probe_ports: [8]u16 = undefined,
@@ -179,6 +182,8 @@ var g_port = std.atomic.Value(u16).init(logic.default_port);
 var g_default_port: u16 = logic.default_port;
 /// The ports the user added; the menu and the Port field are the main thread's.
 var g_saved: logic.SavedPorts = .{};
+/// The "Listen on LAN" switch: Start binds `lan_host` while it is on. The main thread's.
+var g_lan: bool = false;
 var g_home: []const u8 = "/tmp";
 var g_sushi_found = false;
 var g_sibling_brew = false;
@@ -719,6 +724,7 @@ fn pollLoop() void {
     var listings: [max_listings]Listing = undefined;
     var n: usize = 0;
     var sushi_listening = false;
+    var watched_lan = false;
     var since_scan: u32 = logic.scan_every;
     var since_models: u32 = 0;
     var models_ready = false;
@@ -761,8 +767,12 @@ fn pollLoop() void {
             var bound: [max_listings]logic.Listener = undefined;
             n = 0;
             sushi_listening = false;
+            watched_lan = false;
             for (proc.listeners(&lbuf, server_exe)) |l| {
-                if (l.port == p) sushi_listening = true;
+                if (l.port == p) {
+                    sushi_listening = true;
+                    if (logic.lanBound(l.addr)) watched_lan = true;
+                }
                 const dup = for (listings[0..n]) |x| {
                     if (x.port == l.port) break true;
                 } else false;
@@ -867,6 +877,7 @@ fn pollLoop() void {
             shared.listings = listings;
             shared.listing_n = n;
             shared.sushi_listening = sushi_listening;
+            shared.lan_listening = if (sushi_listening) watched_lan else false;
             shared.port_taken = taken;
             shared.log_kind = log_src.kind;
             shared.log_path.set(log_src.path);
@@ -920,7 +931,7 @@ fn pollLoop() void {
 fn writeSaved(p: u16) void {
     var text: [logic.saved_max_bytes]u8 = undefined;
     std.Io.Dir.cwd().createDirPath(g_io, std.fs.path.dirname(g_saved_path) orelse ".") catch {};
-    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get()) }) catch {};
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get(), g_lan) }) catch {};
 }
 
 fn readDefaultPort() u16 {
@@ -1061,7 +1072,10 @@ fn startServer() void {
     var port_buf: [8:0]u8 = undefined;
     const p = port();
     const port_z = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{p}, 0) catch return;
-    const pid = proc.spawnDetached(&.{ sushi.ptr, "--serve", "--port", port_z.ptr }, false) catch return setProblem("could not start sushi");
+    const argv_loopback = [_][*:0]const u8{ sushi.ptr, "--serve", "--port", port_z.ptr };
+    const argv_lan = [_][*:0]const u8{ sushi.ptr, "--serve", "--port", port_z.ptr, "--host", logic.lan_host };
+    const argv: []const [*:0]const u8 = if (g_lan) &argv_lan else &argv_loopback;
+    const pid = proc.spawnDetached(argv, false) catch return setProblem("could not start sushi");
     setNote("");
     pollSoon();
     g_watch.started(p);
@@ -1285,6 +1299,7 @@ fn quit() void {
 var status_item: objc.id = null;
 var header_mi: objc.id = null;
 var port_mi: objc.id = null;
+var lan_mi: objc.id = null;
 var port_menu: objc.id = null;
 var open_mis: [4]objc.id = .{ null, null, null, null };
 var button_action: logic.ButtonAction = .none;
@@ -1385,9 +1400,10 @@ fn syncPortMenu(entries: []const logic.PortEntry) void {
     if (n == port_sig_len and std.mem.eql(u8, sig[0..n], port_sig[0..n])) return;
     port_sig_len = n;
     @memcpy(port_sig[0..n], sig[0..n]);
-    // The submenu ends with a separator and the port field, which stay; only the entries above them change.
+    // The submenu ends with a separator, the Listen on LAN item, another separator and the port field, which
+    // stay; only the port rows above them change.
     port_row.reset();
-    while (objc.msg(isize, port_menu, "numberOfItems", .{}) > 2) objc.msg(void, port_menu, "removeItemAtIndex:", .{@as(isize, 0)});
+    while (objc.msg(isize, port_menu, "numberOfItems", .{}) > 4) objc.msg(void, port_menu, "removeItemAtIndex:", .{@as(isize, 0)});
     var width: f64 = port_row.min_width;
     for (entries) |e| width = @max(width, port_row.widthFor(logic.portLabel(&lb, e), e.removable));
     for (entries, 0..) |e, i| {
@@ -1504,6 +1520,7 @@ fn runAction(act: Action) void {
         .update => startWorker(.update),
         .port => setPort(@intCast(act.value)),
         .remove => removePort(@intCast(act.value)),
+        .lan => toggleLan(),
         .typed => {
             var z: [16:0]u8 = undefined;
             const t = std.fmt.bufPrintSentinel(&z, "{d}", .{act.value}, 0) catch return;
@@ -1586,6 +1603,7 @@ fn refresh() void {
     const mem_mb = if (fresh) shared.mem_mb else null;
     const gpu_mhz = if (fresh) shared.gpu_mhz else null;
     const gpu_pct = if (fresh) shared.gpu_pct else null;
+    const lan_bound = fresh and shared.lan_listening;
     const last_prefill = if (fresh) shared.last_prefill else null;
     const hist_n = if (fresh) shared.hist_n else 0;
     @memcpy(hist[0..hist_n], shared.hist[0..hist_n]);
@@ -1704,6 +1722,7 @@ fn refresh() void {
         .last_prefill = last_prefill,
         .gpu_mhz = gpu_mhz,
         .gpu_pct = gpu_pct,
+        .lan = lan_bound,
     }) catch unreachable;
     var spark: [160]logic.SparkPoint = undefined;
     header_view.update(header, logic.sparkPoints(&spark, hist[0..hist_n], now, header_view.spark_window_ms));
@@ -1737,6 +1756,11 @@ fn refresh() void {
     showWhy(mb.why);
     var lab: [96]u8 = undefined;
     setText(port_mi, "setTitle:", std.fmt.bufPrint(&lab, "Port {d}", .{p}) catch "Port");
+    objc.msg(void, lan_mi, "setState:", .{@as(isize, if (g_lan) 1 else 0)});
+    setText(lan_mi, "setToolTip:", if (g_lan)
+        "Started servers bind 0.0.0.0, so devices on the LAN can reach them. Click to bind 127.0.0.1 again. A server already running keeps its current bind."
+    else
+        "Start servers on every interface (0.0.0.0) so devices on the LAN can reach them. A running server keeps its current bind.");
     for (open_mis) |mi| objc.msg(void, mi, "setEnabled:", .{logic.openEnabled(view.link)});
 
     var entries: [max_listings + logic.max_saved + 2]logic.PortEntry = undefined;
@@ -1773,7 +1797,7 @@ fn refresh() void {
             const piece = std.fmt.bufPrint(removable_buf[rn..], "{d},", .{e.port}) catch break;
             rn += piece.len;
         };
-        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" note=\"{s}\" problem={d} pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" tip=\"{s}\" removable=\"{s}\" badge={d} models_link={d} last_model=\"{s}\" load=\"{s}\" load_on={d} why=\"{s}\" stats=\"{s}|{s}|{s}\" a11y=\"{s}\"\n", .{
+        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" note=\"{s}\" problem={d} pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" tip=\"{s}\" removable=\"{s}\" badge={d} models_link={d} last_model=\"{s}\" load=\"{s}\" load_on={d} why=\"{s}\" stats=\"{s}|{s}|{s}\" a11y=\"{s}\" lan={d}\n", .{
             tick_count,                 title,                 status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
             @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         note_shown,
@@ -1782,6 +1806,7 @@ fn refresh() void {
             update_button.label,        update_button.tip,     removable_buf[0..rn],   @intFromBool(shown_badge),
             @intFromBool(header.line1_models), g_last_model.get(), mb.label, @intFromBool(mb.enabled), mb.why,
             header.stats[0].label,      header.stats[1].label, header.stats[2].label,  header.a11y,
+            @intFromBool(g_lan),
         });
         if (tick_count >= test_polls) quit();
     }
@@ -1892,6 +1917,20 @@ fn flagsTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 }
 fn pickPortAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
     setPort(@intCast(objc.msg(isize, sender, "tag", .{})));
+}
+
+/// Turns the LAN bind for started servers on or off. A running server keeps its current bind; the note says the
+/// switch applies to the next Start.
+fn toggleLan() void {
+    g_lan = !g_lan;
+    writeSaved(port());
+    var nb: [128]u8 = undefined;
+    setNote(logic.lanNote(&nb, g_lan));
+    refresh();
+}
+
+fn lanToggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    toggleLan();
 }
 fn applyPortAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     applyPortText();
@@ -2055,6 +2094,7 @@ fn runMenuBar() noreturn {
         .{ .selector = "quitStop:", .imp = @ptrCast(&quitStopAction), .types = "v@:@" },
         .{ .selector = "flagsTick:", .imp = @ptrCast(&flagsTick), .types = "v@:@" },
         .{ .selector = "pickPort:", .imp = @ptrCast(&pickPortAction), .types = "v@:@" },
+        .{ .selector = "lanToggle:", .imp = @ptrCast(&lanToggleAction), .types = "v@:@" },
         .{ .selector = "pickRow:", .imp = @ptrCast(&pickRowAction), .types = "v@:@" },
         .{ .selector = "removeRow:", .imp = @ptrCast(&removeRowAction), .types = "v@:@" },
         .{ .selector = "applyPort:", .imp = @ptrCast(&applyPortAction), .types = "v@:@" },
@@ -2099,6 +2139,8 @@ fn runMenuBar() noreturn {
     objc.msg(void, port_menu, "setAutoenablesItems:", .{false});
     objc.msg(void, port_mi, "setSubmenu:", .{port_menu});
     objc.msg(void, port_menu, "setDelegate:", .{menu_target});
+    addSeparator(port_menu);
+    lan_mi = addItem(port_menu, "Listen on LAN", "lanToggle:", 0, "", "globe");
     addSeparator(port_menu);
     port_field_mi = objc.new(objc.class("NSMenuItem"));
     objc.msg(void, port_field_mi, "setView:", .{port_field.create(menu_target)});
@@ -2494,6 +2536,7 @@ pub fn main(init: std.process.Init) !void {
     const saved_text = std.Io.Dir.cwd().readFileAlloc(g_io, g_saved_path, gpa, .limited(logic.saved_max_bytes)) catch "";
     const saved = logic.parseSaved(saved_text);
     g_saved = saved.ports;
+    g_lan = saved.lan;
     g_last_model.set(saved.model());
     g_port.store(logic.choosePort(explicit, saved.port, g_default_port), .release);
 

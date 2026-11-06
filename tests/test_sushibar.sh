@@ -1,7 +1,7 @@
 #!/bin/bash
 # sushi-test: tier=host
 # sushibar, the menu bar app: argument and session refusals by name, no MLX in its link line, and runs under a
-# private HOME on private ports (default 18801-18807): Start launches a headless sushi beside it and loads nothing, the pid files and
+# private HOME on private ports (default 18801-18812): Start launches a headless sushi beside it and loads nothing, the pid files and
 # /health agree, Stop ends only that server, a second sushibar defers; a sushi that sushibar did NOT start is found
 # by the libproc scan, listed in the Port data, switched to, saved, and stopped only through the confirm path (never
 # without the confirm seam); a saved port is used on relaunch and an explicit --port beats it; a port held by a
@@ -21,6 +21,7 @@ UPORT=$((PORT + 5))
 APORT=$((PORT + 6))
 HPORT=$((PORT + 7))
 SPORT=$((PORT + 8))
+LPORT=$((PORT + 11))
 PASS=0
 FAIL=0
 
@@ -49,7 +50,7 @@ check "no libmlx, libmlxc, libwebp or libc++ is linked" "$(yes_if '[ -z "$stray"
 
 SUSHI_BIN="$(dirname "$BAR")/sushi"
 if [ ! -x "$SUSHI_BIN" ]; then echo "SKIP: no sushi beside sushibar"; [ "$FAIL" -eq 0 ] && exit 3 || exit 1; fi
-for p in "$PORT" "$FPORT" "$TPORT" "$UPORT" "$APORT" "$HPORT" "$SPORT"; do
+for p in "$PORT" "$FPORT" "$TPORT" "$UPORT" "$APORT" "$HPORT" "$SPORT" "$LPORT"; do
     if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
         echo "FAIL: port $p is busy; pass a free base port"
         exit 1
@@ -218,6 +219,28 @@ run_bar "$BAR" 3 "" --port "$TPORT"
 check "the status says the port is in use and Start is disabled" "$(yes_if 'grep -q "poll 2 .*Port '"$TPORT"': in use by another program\" start=0 stop=0" "$LOG"')"
 check "the header says why in an orange pill, and the icon carries a badge" "$(yes_if 'grep -q "poll 2 .*badge=1.*" "$LOG" && grep -q "poll 2 .*pill=\"Port in use\" line1=\"Another program holds this port\"" "$LOG"')"
 kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
+
+echo "== Listen on LAN binds the servers started from now on =="
+rm -f "$HOME/.sushi/sushibar.json"
+run_bar "$BAR" 8 "lan@2,start@3" --port "$LPORT"
+check "the toggle flips its state and notes it applies to the next Start" "$(yes_if 'grep -q "poll 1 .*lan=0" "$LOG" && grep -q "poll [3-8] .*lan=1" "$LOG" && grep -q "note=\"Next Start listens on the LAN" "$LOG"')"
+check "the saved file keeps the LAN switch" "$(yes_if 'grep -q "\"lan\":true" "$HOME/.sushi/sushibar.json"')"
+SRVPID=$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$LPORT.pid" 2>/dev/null)
+check "the started sushi carries --host 0.0.0.0" "$(yes_if '[ -n "$SRVPID" ] && ps -ww -o command= -p "$SRVPID" | grep -q -- "--host 0.0.0.0"')"
+LAN_OK=0
+for _ in $(seq 1 40); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$LPORT/health" 2>/dev/null)" = 200 ] && { LAN_OK=1; break; }
+    sleep 0.5
+done
+check "a LAN-bound sushi still answers on loopback" "$(yes_if '[ "$LAN_OK" = 1 ]')"
+run_bar "$BAR" 3 "" --port "$LPORT"
+check "the header names the LAN bind" "$(yes_if 'grep -q "line2=\"Port '"$LPORT"' · LAN" "$LOG"')"
+check "the LAN switch persists over relaunch" "$(yes_if 'grep -q "poll [123] .*lan=1" "$LOG"')"
+kill "$SRVPID" 2>/dev/null; wait "$SRVPID" 2>/dev/null
+rm -f "$HOME/.sushi/sushibar-server-$LPORT.pid"
+run_bar "$BAR" 2 "lan@1" --port "$LPORT"
+check "toggling LAN off leaves it out of the saved file" "$(yes_if '! grep -q "\"lan\"" "$HOME/.sushi/sushibar.json"')"
+rm -f "$HOME/.sushi/sushibar.json"
 
 echo "== a newer pack revision on the loaded model =="
 SPORT=$((PORT + 3))

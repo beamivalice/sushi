@@ -444,7 +444,31 @@ pub fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const
             std.mem.eql(u8, path, "/v1/slots/cancel");
     if (!guarded) return false;
     const origin = findHeaderValueCI(headers, "origin") orelse return false;
-    return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
+    // A wildcard bind has no host of its own: a page opened at any IP address the server answers on is its own
+    // page, so match the Origin against the Host the client reached. Only an IP literal counts: a DNS name can be
+    // rebound to this Mac and would then send itself as both Origin and Host.
+    const want = if (std.mem.eql(u8, host, "0.0.0.0")) hostHeaderIp(headers) orelse "127.0.0.1" else host;
+    return !update_mod.originMatches(origin, want, port);
+}
+
+/// The `Host` header's host when it is an IP literal (IPv4, or bracketed IPv6), its port stripped; null otherwise.
+fn hostHeaderIp(headers: []const u8) ?[]const u8 {
+    const h = std.mem.trim(u8, findHeaderValueCI(headers, "host") orelse return null, " ");
+    if (h.len == 0) return null;
+    if (h[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, h, ']') orelse return null;
+        for (h[1..close]) |c| if (!std.ascii.isHex(c) and c != ':' and c != '.') return null;
+        return if (close > 1) h[0 .. close + 1] else null;
+    }
+    const name = if (std.mem.indexOfScalar(u8, h, ':')) |colon| h[0..colon] else h;
+    var parts: usize = 0;
+    var it = std.mem.splitScalar(u8, name, '.');
+    while (it.next()) |part| : (parts += 1) {
+        if (part.len == 0 or part.len > 3) return null;
+        const v = std.fmt.parseInt(u16, part, 10) catch return null;
+        if (v > 255) return null;
+    }
+    return if (parts == 4) name else null;
 }
 
 /// Is `path` an endpoint this server serves at all (any method)?
@@ -1722,6 +1746,18 @@ test "cross-origin policy: a foreign Origin is refused on the state-changing rou
         .{ .method = "POST", .path = "/v1/models/rescan", .headers = "Origin: http://127.0.0.1:12345\r\n", .refused = false },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://127.0.0.1:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://192.168.1.5:12345\r\nHost: 192.168.1.5:12345\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://192.168.1.5:12345\r\nHost: 192.168.1.5\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://[::1]:12345\r\nHost: [::1]:12345\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://evil.test:12345\r\nHost: 192.168.1.5:12345\r\n", .host = "0.0.0.0", .refused = true },
+        // DNS rebinding: a foreign name pointed at this Mac sends its own name as both Origin and Host.
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://evil.test:12345\r\nHost: evil.test:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/settings", .headers = "Origin: http://mac.example:12345\r\nHost: mac.example:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\nHost: localhost:12345\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://192.168.1.5:12346\r\nHost: 192.168.1.5:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/unload-model", .headers = "Origin: http://192.168.1.5:12345\r\nHost: 127.0.0.1:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://192.168.1.5:12345\r\n", .host = "0.0.0.0", .refused = true },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://evil.test\r\nHost: 192.168.1.5:12345\r\n", .refused = true },
         .{ .method = "POST", .path = "/v1/unload-model", .headers = "Host: x\r\n", .refused = false },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws, .refused = false },
         // The inference routes stay open to any page.
@@ -1749,6 +1785,18 @@ test "cross-origin policy: the routes answer 403 over the wire before any model 
         .{ .request = "GET /v1/responses HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nOrigin: http://evil.test\r\n\r\n", .status = "HTTP/1.1 403 " },
         .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
         .{ .request = "POST /v1/models/rescan HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 200 " },
+    }) |c| {
+        const response = try serveOneForTest(c.request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, c.status));
+    }
+    server_mod.listen_host = "0.0.0.0";
+    for ([_]Case{
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: 192.168.1.5:12345\r\nOrigin: http://192.168.1.5:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: 192.168.1.5:12345\r\nOrigin: http://evil.test:12345\r\n\r\n", .status = "HTTP/1.1 403 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: evil.test:12345\r\nOrigin: http://evil.test:12345\r\n\r\n", .status = "HTTP/1.1 403 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: 127.0.0.1:12345\r\nOrigin: http://127.0.0.1:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nOrigin: http://192.168.1.5:12345\r\n\r\n", .status = "HTTP/1.1 403 " },
     }) |c| {
         const response = try serveOneForTest(c.request);
         defer t.allocator.free(response);

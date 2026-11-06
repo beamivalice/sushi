@@ -789,7 +789,10 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   The model never supplies `directory`: the page does, from its own per-chat state, so no tool call moves the root.
 - Same-origin rule: `POST /v1/load-model`, `/v1/unload-model`, `/v1/models/rescan` and the `/v1/responses` WebSocket
   upgrade answer 403 when the request carries an Origin other than this server's own page (`crossOriginRefused`);
-  requests without an Origin (curl, SDKs) pass, and the inference routes stay CORS-open.
+  an explicit bind compares against its host, a wildcard bind against the request's `Host` when that is an IP literal
+  (a LAN page is its own page at the address it reached; a DNS name is never trusted, since one rebound to this Mac
+  sends itself as both Origin and Host) and against loopback otherwise; requests without an Origin (curl, SDKs) pass,
+  and the inference routes stay CORS-open.
 - Image workflow: `web_search` finds pages, `fetch_url` exposes up to 20 resolved image URLs from `img src`
   or `data-src`, and vision models use `view_image` to inspect them. This is page-based discovery, not a
   dedicated image-search index. Tool image results are visible when expanded; the answer can show a direct

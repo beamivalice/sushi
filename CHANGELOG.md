@@ -21,13 +21,15 @@ earlier history is mlx-serve's, in that project's changelog.
   an update about 9% faster. Output is unchanged.
 - **A clearer web page and menu bar**: the Dashboard has fourteen charts you can pick and order, which move only when
   something changes; the web page and sushibar share plain labels (Generation speed, Prompt speed, Prompt cache), and
-  every chart, setting and badge explains itself in a tooltip that also names the engineering term. A Cancel button
-  stops a running request (thanks @chuaaron), and `/metrics` reports speculative decoding and prompt cache tiers.
+  every chart, setting and badge explains itself in a tooltip that also names the engineering term. A page opened at
+  a LAN address of a `--host 0.0.0.0` server can now load and unload models. A Cancel button stops a running request
+  (thanks @chuaaron), and `/metrics` reports speculative decoding and prompt cache tiers.
 - **Download packs from the web page**: Models › Available lists the published Sushi packs, recommends one for this
   Mac and downloads it with progress, Stop and Resume. A pack that is being updated, or whose update stopped half way,
   cannot load until it is complete, and Settings can turn every automatic update check off.
 - **sushibar does more**: Log, Update and Quit buttons, a status card that says why a server stopped, servers bound to
-  a Tailscale or LAN address, and a Port menu that keeps the ports you use. The default port is a setting.
+  a Tailscale or LAN address, a Listen on LAN switch for the servers it starts (thanks @corysus), and a Port menu
+  that keeps the ports you use. The default port is a setting.
 - **MiMo-V2.6-Flash leaves the supported list**: it still loads and serves, but releases no longer test, benchmark or
   tune it; 1.5.0 was its last supported release.
 
