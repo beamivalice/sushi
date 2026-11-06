@@ -2228,7 +2228,7 @@ fn renderBadge(dir: []const u8) void {
         .{ .name = "live", .icon = .color, .title = "105 tok/s" },
         .{ .name = "last", .icon = .color, .title = "88.0 tok/s" },
         .{ .name = "generating", .icon = .color, .title = "generating…" },
-        .{ .name = "reading", .icon = .color, .title = "reading prompt…" },
+        .{ .name = "reading", .icon = .color, .title = "prompt…" },
         .{ .name = "badge", .icon = .color, .badge = true },
         .{ .name = "offline", .icon = .outline },
     };

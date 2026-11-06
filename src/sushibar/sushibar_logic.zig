@@ -282,7 +282,7 @@ fn titleBase(buf: []u8, v: View) []const u8 {
         .up => if (v.decoding)
             (if (v.live) |t| std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, t)}) else std.fmt.bufPrint(buf, "generating…", .{}))
         else if (v.prefilling)
-            std.fmt.bufPrint(buf, "reading prompt…", .{})
+            std.fmt.bufPrint(buf, "prompt…", .{})
         else
             std.fmt.bufPrint(buf, "", .{}),
     };
@@ -2498,12 +2498,12 @@ test "speed: a rate that rounds to 100 reads as a whole number, in the title and
     try std.testing.expectEqualStrings("100", h.stats[0].value);
 }
 
-test "title: live, last, reading prompt, idle, offline, unauthorized, metrics off" {
+test "title: live, last, prompt, idle, offline, unauthorized, metrics off" {
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("103 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 102.7 }));
     try std.testing.expectEqualStrings("42.7 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 42.66, .last = 9 }));
     try std.testing.expectEqualStrings("generating…", title(&b, .{ .link = .up, .decoding = true }));
-    try std.testing.expectEqualStrings("reading prompt…", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
+    try std.testing.expectEqualStrings("prompt…", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .last = 88 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .last = 5, .decoding = true }));
