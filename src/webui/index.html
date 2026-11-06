@@ -5070,7 +5070,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const ready = modelList.filter(m => m.state === 'ready').map(m => shortName(m.id));
     const busy = (g.requests_running || 0) + (g.requests_waiting || 0) > 0;
     const [state, cls] = feedOffline || modelStore.online === false ? ['Offline', 'err'] : !modelsKnown ? ['Connecting', ''] : modelList.some(m => m.state === 'loading') ? ['Loading', 'busy']
-      : !ready.length ? ['Not loaded', ''] : metricsOff ? ['Ready', ''] : !busy ? ['Idle', 'idle'] : g.requests_prefilling ? ['Reading prompt', 'busy'] : ['Generating', 'busy'];
+      : !ready.length ? ['Not loaded', ''] : metricsOff ? ['Ready', ''] : !busy ? ['Idle', 'idle'] : g.requests_prefilling ? ['Reading prompt', 'busy']
+      : g.requests_running ? ['Generating', 'busy'] : ['Waiting', 'busy'];
     put($('cm-state'), state); putClass($('cm-state'), 'badge ' + cls);
     const stateTitle = metricsOff && cls === '' && state === 'Ready' ? 'Live statistics are off, so idle or busy is unknown' : '';
     if ($('cm-state').title !== stateTitle) $('cm-state').title = stateTitle;

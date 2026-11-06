@@ -600,7 +600,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
 - **Per-request log**: the same call returns `requests`, one entry per finished request after `since` (`request_id`, `t_ms`,
   `prompt_tokens` computed, `cached_tokens` restored, `prefill_seconds`, `generated_tokens`, `decode_seconds`, `outcome`).
   A request is sent again until a history sample passes it, so the page keeps the ones it has seen by `request_id@t_ms`.
-- The **Compact view** shows a status strip (model, Idle/Busy or Ready while metrics are off, uptime from the process start),
+- The **Compact view** shows a status strip (model, Idle / Reading prompt / Generating / Waiting (requests only queued), or Ready while metrics are off, uptime from the process start),
   five tiles and three charts. Prefill and decode are separate charts with their own scales. A request's prefill speed is its
   computed prompt tokens over its `prefill_seconds`, one dot per finished `ok` request at its own `t_ms`; the tile shows the
   latest, or the mean since start until one is seen. A request that restored more than it computed is a hollow dot labelled

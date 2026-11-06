@@ -113,7 +113,7 @@ function installStubs(config) {
           const hist = (count, sum) => ({ count, sum, bounds: [1], bucket_counts: [count, count] });
           return json({
             counters: { prefill_tokens_total: 40000 + 12000 * done, generation_tokens_total: 9000 },
-            gauges: { requests_running: stub.compact === 'idle' ? 0 : 1, requests_prefilling: stub.compact === 'prefill' ? 1 : 0, requests_waiting: 0, memory_mb: 106787, mlx_active_bytes: 113 * 2 ** 30, mlx_cache_bytes: 2 ** 28 },
+            gauges: { requests_running: ['idle', 'waiting'].includes(stub.compact) ? 0 : 1, requests_prefilling: stub.compact === 'prefill' ? 1 : 0, requests_waiting: stub.compact === 'waiting' ? 1 : 0, memory_mb: 106787, mlx_active_bytes: 113 * 2 ** 30, mlx_cache_bytes: 2 ** 28 },
             histograms: { prefill_time_seconds: hist(15 + done, 60 + 10 * done), decode_time_seconds: hist(15, 180) }, sessions: [],
             history: { interval_ms: 2000, capacity: 1800, started_ms: now - 3 * 3600e3 - 12 * 60e3, samples: samples.filter((r) => r[0] > since) },
             requests: done ? (stub.reqAt ??= now - 1000) > since ? [{ request_id: 12, model: 'org/test-model', t_ms: stub.reqAt, prompt_tokens: 12000, cached_tokens: 0, prefill_seconds: 10, generated_tokens: 0, decode_seconds: 0, outcome: 'ok' }] : [] : [],
@@ -1510,6 +1510,16 @@ async function main() {
       const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'compact', compact: 'prefill' });
       await page.waitForFunction(() => document.getElementById('dashCmState').textContent === 'Reading prompt', null, { timeout: 15000 });
       assert.match(await page.innerText('#dashCmReqS'), /reading prompt$/, 'the request tile uses the same words');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // Requests that only wait their turn are neither reading a prompt nor generating.
+      const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'compact', compact: 'waiting' });
+      await page.waitForFunction(() => !['Connecting', '-', ''].includes(document.getElementById('dashCmState').textContent), null, { timeout: 15000 });
+      assert.equal(await page.textContent('#dashCmState'), 'Waiting');
+      assert.match(await page.innerText('#dashCmReqS'), /^1 waiting$/, 'the request tile uses the same word');
       assert.deepEqual(errors, []);
       await context.close();
     }
