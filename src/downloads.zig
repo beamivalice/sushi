@@ -314,7 +314,7 @@ fn workerLoop(io: std.Io) void {
         lock();
         const repo = repo_buf[0..@min(job.repo.len, repo_buf.len)];
         @memcpy(repo, job.repo[0..repo.len]);
-        job.progress.finishFile(job.allocator);
+        job.progress.endFile(job.allocator, ok);
         job.pid = null;
         job.phase = if (ok) .done else if (job.cancel.load(.monotonic)) .cancelled else .failed;
         if (job.phase == .failed and job.message.len == 0) job.setMessage("the download failed");

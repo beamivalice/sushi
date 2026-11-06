@@ -126,6 +126,12 @@ pub const Progress = struct {
         self.deinit(allocator);
     }
 
+    /// The pull ended; `ok` false (a failure or a stop) leaves the file in flight unfinished.
+    pub fn endFile(self: *Progress, allocator: std.mem.Allocator, ok: bool) void {
+        if (ok) return self.finishFile(allocator);
+        self.deinit(allocator);
+    }
+
     /// File `f` starts, with `partial` bytes of it already on disk.
     pub fn startFile(self: *Progress, allocator: std.mem.Allocator, f: hf_pull.FileEvent, partial: u64) !void {
         self.finishFile(allocator);
@@ -217,4 +223,19 @@ test "downloads: progress counts skipped and finished files, and a resumed parti
     try testing.expectEqual(@as(u64, 30), p.now(99).done);
     p.finishFile(testing.allocator);
     try testing.expectEqual(@as(u64, 30), p.done);
+}
+
+test "downloads: a pull that fails or is stopped mid-file does not count that file as done" {
+    var p: Progress = .{ .files = 2, .total = 20 };
+    defer p.deinit(testing.allocator);
+    try p.startFile(testing.allocator, .{ .index = 1, .path = "a.safetensors", .size = 10, .skip = false }, 0);
+    try p.startFile(testing.allocator, .{ .index = 2, .path = "b.safetensors", .size = 10, .skip = false }, 4);
+    p.endFile(testing.allocator, false);
+    try testing.expectEqual(@as(u64, 10), p.done);
+    try testing.expectEqual(@as(u64, 10), p.fetched);
+    try testing.expectEqual(@as(u64, 10), p.now(0).done);
+    try p.startFile(testing.allocator, .{ .index = 2, .path = "b.safetensors", .size = 10, .skip = false }, 4);
+    p.endFile(testing.allocator, true);
+    try testing.expectEqual(@as(u64, 20), p.done);
+    try testing.expectEqual(@as(u64, 16), p.fetched);
 }
