@@ -41,25 +41,30 @@ A Mac with Apple silicon shares one pool of memory between the CPU and the GPU. 
 
 1. **Installed memory**: what the Mac has (32, 48, 64 GB and so on).
 2. **GPU limit**: how much of that macOS lets the GPU hold at once. A model runs on the GPU, so this is the number that
-   decides what fits. macOS keeps it well below the installed memory by default. You raise it with:
+   decides what fits. macOS keeps it well below the installed memory by default.
+
+   Raise it **together with the two user-wire limits, always**. macOS also caps how much memory one program may lock in
+   place (`vm.global_user_wire_limit`, `vm.user_wire_limit`), and that cap stays at its lower default when you raise
+   only the GPU limit: sushi then loads, but prompt reading slows down and a large load can make the Mac unresponsive.
+   Set all three to the same value, the GPU limit in megabytes and the other two in bytes (add six zeros):
 
    ```bash
-   sudo sysctl iogpu.wired_limit_mb=59000   # in megabytes; resets at reboot
-   sysctl iogpu.wired_limit_mb              # shows it; 0 means the macOS default
+   sudo sysctl iogpu.wired_limit_mb=59000 vm.global_user_wire_limit=59000000000 vm.user_wire_limit=59000000000
+   sysctl iogpu.wired_limit_mb vm.global_user_wire_limit vm.user_wire_limit   # shows them; 0 means the default
    ```
 
-   Leave room for macOS and your other apps. The values sushi's docs assume:
+   All three reset at reboot. Leave room for macOS and your other apps. The values sushi's docs assume:
 
-   | Installed | GPU limit (MB) |
-   |---|---:|
-   | 32 GB | 27,000 |
-   | 48 GB | 43,000 |
-   | 64 GB | 59,000 (higher risks a kernel panic when macOS runs out of memory) |
-   | 96 GB | 90,000 (93,000 for DeepSeek) |
-   | 128 GB | 120,000 (125,000 for DeepSeek) |
+   | Installed | GPU limit (MB) | user-wire limits (bytes) |
+   |---|---:|---:|
+   | 32 GB | 27,000 | 27000000000 |
+   | 48 GB | 43,000 | 43000000000 |
+   | 64 GB | 59,000 (higher risks a kernel panic when macOS runs out of memory) | 59000000000 |
+   | 96 GB | 90,000 (93,000 for DeepSeek) | 90000000000 (93000000000) |
+   | 128 GB | 120,000 (125,000 for DeepSeek) | 120000000000 (125000000000) |
 
 Everything sushi loads (the weights, plus the memory the conversation's context takes) must fit under the GPU limit.
-When it does not, sushi refuses to load and names the GPU limit that would fit.
+When it does not, sushi refuses to load and prints the `sudo sysctl` command, all three limits, that would fit.
 
 ## What streaming does
 
@@ -92,7 +97,7 @@ set "Memory for SSD streaming (GiB)" in its Settings. It applies at the next loa
 | 128 GB | DeepSeek Sushi-STQ-1.75bpw | 108 (or 96) | 125,000 | 1M | 77 code / 49 prose ² |
 
 - **`--ssd-budget-gb`**: GiB of GPU memory for the model's weights (see above).
-- **GPU limit**: the value for `sudo sysctl iogpu.wired_limit_mb`, in megabytes.
+- **GPU limit**: the value for `iogpu.wired_limit_mb`, in megabytes; set the two user-wire limits with it ([above](#the-two-memory-numbers)).
 - **Context**: the longest conversation, in tokens, that fits beside that budget.
 - ¹ measured on an M1 Max. ² measured on an M5 Max with sushi 1.5.1; an M4 or M5 Pro reads its SSD and computes more
   slowly, so expect less. DeepSeek streams on 96 and 128 GB Macs ([usage](usage.md#deepseek-launch) has its launch

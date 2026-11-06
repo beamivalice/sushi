@@ -16,6 +16,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
 - `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
+- Every message or doc that tells a user to raise `iogpu.wired_limit_mb` raises `vm.global_user_wire_limit` and
+  `vm.user_wire_limit` with it, to the same value in bytes (`server.wireLimitsCommand`): the lower cap binds silently.
 - **A load whose owned bytes plus 1 GiB pass the lower of `vm.global_user_wire_limit` and `vm.user_wire_limit` logs one
   `[mem] warning:` with the `sudo sysctl` fix** (`userWireWarning`, read once after the load): the macOS user-wire cap
   is independent of `iogpu.wired_limit_mb` and default memsize less `vm.global_no_user_wire_amount` (116.82 GB here).

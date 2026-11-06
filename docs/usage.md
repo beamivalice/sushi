@@ -84,7 +84,13 @@ page.
 
 ## Recommended launch
 
-Every GPU limit below is set with `sudo sysctl iogpu.wired_limit_mb=<N>` and resets at reboot.
+Every GPU limit below is set together with the two user-wire limits, always, at the same value in bytes (N MB becomes
+N000000); otherwise macOS keeps capping what sushi may wire at its lower default and prefill slows with no error. All
+three reset at reboot:
+
+```bash
+sudo sysctl iogpu.wired_limit_mb=<N> vm.global_user_wire_limit=<N>000000 vm.user_wire_limit=<N>000000
+```
 
 **48 GB Mac, Qwen Sushi-2bpw** (limit 43000)
 
@@ -155,8 +161,8 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 # pass --ssd-budget-gb to change the budget: 96 on a 128 GB Mac leaves memory to other apps
 ```
 
-On a 128 GB Mac the 108 default needs the GPU wired limit raised (`iogpu.wired_limit_mb=125000`, the limit the
-heading names); without it the default is 96, and it steps down further, saying so, when the Mac's limits cannot hold it.
+On a 128 GB Mac the 108 default needs the GPU limit raised (`sudo sysctl iogpu.wired_limit_mb=125000
+vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000`, the limit the heading names); without it the default is 96, and it steps down further, saying so, when the Mac's limits cannot hold it.
 
 DeepSeek serves a 1,000,000-token context and a 256,000-token budget for a request that omits `max_tokens`, as its
 authors recommend; `--ctx-size` and `--max-tokens` still override them.
@@ -176,12 +182,9 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 
   One `sushi bench` run each on an M5 Max 128 GB (DSpark on, one request); 108 is the
   [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md).
-- **111 on a 128 GB Mac needs the user wire limit raised.** macOS caps the memory a process may wire at
-  `vm.global_user_wire_limit`, 116.8 GB by default on 128 GB, separately from `iogpu.wired_limit_mb`. Past 108 the load
-  crosses it and prefill slows down (7% at 111) with no error. Raising it brings 111's prefill back to 108's speed:
-  ```bash
-  sudo sysctl vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000   # resets at reboot
-  ```
+- **Why the user wire limits always move with the GPU limit.** macOS caps the memory a process may wire at
+  `vm.global_user_wire_limit` (116.8 GB by default on 128 GB) separately from `iogpu.wired_limit_mb`. A load past it
+  slows prefill with no error (7% at a budget of 111 on 128 GB); the command above raises both, so it never binds.
 - **Smaller Macs** are plan numbers only, not measured: 32 GiB (48 slots) from a 48 GB Mac at limit 43000, 48 GiB
   (93 slots) from 64 GB at 59000. The floor is 17 GiB (16 with `--no-vision`). A shorter `--ctx-size` lowers the Mac a
   budget needs.
