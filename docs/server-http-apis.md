@@ -25,7 +25,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `effort.snapshot` and resolves word, default, cap and refusal text against it) on chat, Responses, Anthropic, `--think` and the
   REPL's `/think` alike; the arm's `sends` is what the render passes (`ReasoningEffort.sends`,
   `model.defaultTemplateEffort`), its cap the decode-time bound. A word the table does not offer is refused with the
-  accepted list. An unoffered `off` refuses every way a request turns thinking off (`enable_thinking: false`,
+  accepted list, and so is an effort field that holds no word (a number such as 40, on `reasoning_effort`,
+  `reasoning.effort` or `output_config.effort`; `request_policy.nonWordEffort`); null reads as absent. An unoffered `off` refuses every way a request turns thinking off (`enable_thinking: false`,
   `chat_template_kwargs`, Anthropic `thinking: disabled`) with the same 400, as GLM's off always is
   (`request_policy.thinkingOffRefused`); a model that thinks off by its own default still serves a silent request. **Folds** are a row state of the built-in tables only: Qwen `high` and `max` → `xhigh`, GLM `medium`
   → `high` and `xhigh` → `max` (each word the family has no level for uses the nearest one). A fold is served at its

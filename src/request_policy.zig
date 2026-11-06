@@ -235,7 +235,7 @@ pub const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const
 /// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
 /// low | medium | high | xhigh — values are model-dependent, so unknown
 /// strings still enable). "none" is an explicit off (the gpt-5.1 default
-/// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
+/// spelling). Absent or not a string → null (a non-word is refused first, `nonWordEffort`): the vendor `enable_thinking` bool
 /// stays in charge and existing clients see zero behavior change.
 /// The effort word is the ONLY lever when the template reads it and no
 /// decode-time bound can enforce a budget derived from it (a budget that is
@@ -392,6 +392,35 @@ pub fn reasoningEffortsJson(allocator: std.mem.Allocator, config: *const model_m
     try out.append(allocator, '}');
     if (model_mod.defaultReasoningEffort(config)) |w| try out.print(allocator, ",\"default_reasoning_effort\":\"{s}\"", .{w});
     return out.toOwnedSlice(allocator);
+}
+
+pub const EffortSpelling = enum { chat, responses, anthropic };
+
+/// The request's effort field in `spelling`'s place when it holds something other than a word or null (a number, an
+/// object): refused like an unknown word, never ignored.
+pub fn nonWordEffort(root: std.json.ObjectMap, spelling: EffortSpelling) ?std.json.Value {
+    const v = switch (spelling) {
+        .chat => root.get("reasoning_effort"),
+        .responses => if (root.get("reasoning")) |r| (if (r == .object) r.object.get("effort") else null) else null,
+        .anthropic => if (root.get("output_config")) |o| (if (o == .object) o.object.get("effort") else null) else null,
+    } orelse return null;
+    return switch (v) {
+        .string, .null => null,
+        else => v,
+    };
+}
+
+/// The 400 for a `nonWordEffort`: the unknown-word refusal, naming the value as sent.
+pub fn sendEffortValueRefusal(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, v: std.json.Value, snap: *const effort_mod.Snapshot, anthropic: bool) !void {
+    const text = try std.json.Stringify.valueAlloc(allocator, v, .{});
+    defer allocator.free(text);
+    const config = lm.config.?;
+    const msg = if (effort_mod.servedArmsIn(snap, config.model_type) != null)
+        try effortRefusalFor(allocator, lm, text, snap)
+    else
+        try std.fmt.allocPrint(allocator, "reasoning effort {s} is not a word", .{text});
+    defer allocator.free(msg);
+    if (anthropic) try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400) else try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
 }
 
 /// The refusal text for `word` on `lm`'s model; caller frees.
@@ -1827,4 +1856,29 @@ test "effort table: with off unoffered, chat, Anthropic and Responses refuse a r
     const snap = effort_mod.snapshot();
     for (asks_off) |c| try testing.expect(thinkingOffRefused(&glm, &snap, (try surfaceThinking(a, c[0], &glm, c[1])).enable));
     for (thinks) |c| try testing.expect(!thinkingOffRefused(&glm, &snap, (try surfaceThinking(a, c[0], &glm, c[1])).enable));
+}
+
+test "effort table: a non-word effort is refused on every surface, a word or null is read as before" {
+    const a = testing.allocator;
+    const cases = [_]struct { EffortSpelling, []const u8, bool }{
+        .{ .chat, "{\"reasoning_effort\":40}", true },
+        .{ .chat, "{\"reasoning_effort\":true}", true },
+        .{ .chat, "{\"reasoning_effort\":{\"level\":\"low\"}}", true },
+        .{ .chat, "{\"reasoning_effort\":\"40\"}", false },
+        .{ .chat, "{\"reasoning_effort\":null}", false },
+        .{ .chat, "{}", false },
+        .{ .responses, "{\"reasoning\":{\"effort\":40}}", true },
+        .{ .responses, "{\"reasoning\":{\"effort\":\"low\"}}", false },
+        .{ .responses, "{\"reasoning\":{}}", false },
+        .{ .anthropic, "{\"output_config\":{\"effort\":40}}", true },
+        .{ .anthropic, "{\"output_config\":{\"effort\":\"low\"}}", false },
+        .{ .anthropic, "{\"output_config\":{\"effort\":null}}", false },
+        // Each surface reads only its own spelling.
+        .{ .anthropic, "{\"reasoning_effort\":40}", false },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, c[1], .{});
+        defer parsed.deinit();
+        try testing.expectEqual(c[2], nonWordEffort(parsed.value.object, c[0]) != null);
+    }
 }

@@ -13,6 +13,8 @@
 #       still folds with its notice;
 #   [4] a reset brings the built-in table back: /v1/models equals the boot's rows, the word renders its built-in value
 #       and the cap is gone; the file loses its section; the model never reloaded.
+#   [5] a numeric effort (`reasoning_effort`, Responses `reasoning.effort`, Anthropic `output_config.effort`) is a 400
+#       naming the accepted words, as an unknown word is.
 set -uo pipefail
 . "$(dirname "$0")/lib/boot.sh"
 
@@ -106,6 +108,18 @@ has "it renders the built-in value" "$SEG" "$OLD"
 lacks "the table's cap is gone" "$SEG" "[think-bound] reasoning budget 64 reached"
 check "the file holds no $ARCH table" "$(jq -r --arg s "effort:$ARCH" 'has($s)' "$HOME_FILE" 2> /dev/null || echo false)" false
 check "the model loaded once, never reloaded" "$(grep -c 'Model ready' "$SUSHI_LOG")" 1
+
+echo "[5] a numeric effort is refused on every surface, as an unknown word is"
+for surface in chat responses messages; do
+    case "$surface" in
+        chat) path=/v1/chat/completions body="{\"model\":\"$ID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":40,\"max_tokens\":8}" ;;
+        responses) path=/v1/responses body="{\"model\":\"$ID\",\"input\":\"hi\",\"reasoning\":{\"effort\":40},\"max_output_tokens\":8}" ;;
+        messages) path=/v1/messages body="{\"model\":\"$ID\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"effort\":40}}" ;;
+    esac
+    code=$(curl -s -o "$WORK/refused.json" -w '%{http_code}' -H 'Content-Type: application/json' -d "$body" "$SUSHI_URL$path")
+    check "$surface: a numeric effort is a 400" "$code" 400
+    has "$surface: the refusal names the accepted words" "$(cat "$WORK/refused.json")" "use one of:"
+done
 
 echo "effort table ($ARCH): $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -809,6 +809,10 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         return false;
     }
     const effort_snap = effort_mod.snapshot();
+    if (request_policy.nonWordEffort(root, .anthropic)) |v| {
+        try request_policy.sendEffortValueRefusal(allocator, stream, lm, v, &effort_snap, true);
+        return false;
+    }
     var effort_cfg: ?request_policy.ReasoningEffort = null;
     if (output_cfg.effort) |word| {
         const served_arms = effort_mod.servedArmsIn(&effort_snap, config.model_type);

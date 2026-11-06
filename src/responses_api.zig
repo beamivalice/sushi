@@ -558,6 +558,7 @@ fn handleResponsesInner(
     var reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"));
     const effort_named = reasoning_cfg.effort != null;
     const effort_snap = effort_mod.snapshot();
+    if (request_policy.nonWordEffort(root, .responses)) |v| return request_policy.sendEffortValueRefusal(allocator, stream, lm, v, &effort_snap, false);
     reasoning_cfg.effort = request_policy.responsesEffortWord(root, reasoning_cfg, config, &effort_snap);
     var effort_notice: ?EffortNotice = null;
     defer if (effort_notice) |n| n.deinit(allocator);

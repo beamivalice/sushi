@@ -7928,6 +7928,7 @@ pub fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const effort_snap = effort_mod.snapshot();
+    if (request_policy.nonWordEffort(root, .chat)) |v| return request_policy.sendEffortValueRefusal(allocator, stream, lm, v, &effort_snap, false);
     const served_arms = effort_mod.servedArmsIn(&effort_snap, config.model_type);
     const effort_cfg = request_policy.parseReasoningEffort(root, request_policy.effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
         const msg = try request_policy.effortRefusalFor(allocator, lm, root.get("reasoning_effort").?.string, &effort_snap);
