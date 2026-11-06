@@ -378,6 +378,7 @@ pub const server_keys = [_]KeySpec{
     .{ .name = "prefix_cache_disk_gb", .kind = .int, .min = 0, .max = 1 << 20 },
     .{ .name = "update_check", .kind = .bool },
     .{ .name = "pack_update_check", .kind = .bool },
+    .{ .name = "skip_mem_preflight", .kind = .bool },
     .{ .name = "port", .kind = .int, .min = 1, .max = 65535 },
 };
 
@@ -640,6 +641,8 @@ pub const Server = struct {
     update_check: ?bool = null,
     /// The automatic pack revision check.
     pack_update_check: ?bool = null,
+    /// Load a model without the free-memory check; null = the file says nothing (check on).
+    skip_mem_preflight: ?bool = null,
     /// The port a server binds and the clients target without `--port`.
     port: ?u16 = null,
 };
@@ -647,6 +650,11 @@ pub const Server = struct {
 /// An automatic network look is on unless `--no-update-check` or the file turns it off.
 pub fn autoCheck(no_update_check: bool, file: ?bool) Pick(bool) {
     return pick(bool, if (no_update_check) false else null, file, true);
+}
+
+/// The load-time memory check runs unless `--skip-mem-preflight` or the file turns it off.
+pub fn skipMemPreflight(flag: bool, file: ?bool) Pick(bool) {
+    return pick(bool, if (flag) true else null, file, false);
 }
 
 /// The file's `"server"` section. `models_dir` borrows from `self`.
@@ -672,6 +680,9 @@ pub fn server(self: *const Settings) Server {
     };
     if (sec.get("pack_update_check")) |v| if (v == .bool) {
         out.pack_update_check = v.bool;
+    };
+    if (sec.get("skip_mem_preflight")) |v| if (v == .bool) {
+        out.skip_mem_preflight = v.bool;
     };
     if (sec.get("port")) |v| out.port = default_port.fromValue(v);
     return out;
@@ -758,6 +769,7 @@ pub const LaunchLocks = struct {
     prefix_cache_disk_gb: Lock = .{},
     update_check: Lock = .{},
     pack_update_check: Lock = .{},
+    skip_mem_preflight: Lock = .{},
     port: Lock = .{},
 
     pub fn model(self: *const LaunchLocks, name: []const u8) ?*const Lock {
@@ -1094,6 +1106,31 @@ test "model_settings: the update-check keys are booleans, read from the file, an
     try t.expect(autoCheck(false, true).value);
     try t.expect(!autoCheck(true, true).value);
     try t.expectEqual(Source.flag, autoCheck(true, true).source);
+}
+
+test "model_settings: server.skip_mem_preflight is a boolean read from the file, off when absent or mistyped" {
+    const t = std.testing;
+    const spec = findKey(&server_keys, "skip_mem_preflight").?;
+    try validate(spec, .{ .bool = true });
+    try t.expectError(error.InvalidSetting, validate(spec, .{ .string = "on" }));
+    var on = try parse(t.allocator, "{\"server\":{\"skip_mem_preflight\":true}}");
+    defer on.deinit();
+    try t.expectEqual(@as(?bool, true), server(&on).skip_mem_preflight);
+    var bad = try parse(t.allocator, "{\"server\":{\"skip_mem_preflight\":1}}");
+    defer bad.deinit();
+    try t.expectEqual(@as(?bool, null), server(&bad).skip_mem_preflight);
+    try t.expect(!launch_locks.skip_mem_preflight.set);
+}
+
+test "model_settings: the memory check is skipped when the flag is given or the file says so, and the flag is never overridden" {
+    const t = std.testing;
+    try t.expect(!skipMemPreflight(false, null).value);
+    try t.expectEqual(Source.default, skipMemPreflight(false, null).source);
+    try t.expect(skipMemPreflight(false, true).value);
+    try t.expectEqual(Source.model_settings, skipMemPreflight(false, true).source);
+    try t.expect(!skipMemPreflight(false, false).value);
+    try t.expect(skipMemPreflight(true, false).value);
+    try t.expectEqual(Source.flag, skipMemPreflight(true, false).source);
 }
 
 test "model_settings: writeEdits keeps what it does not touch, round-trips through lookup, and removes an emptied section" {

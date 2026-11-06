@@ -8760,7 +8760,7 @@ pub const not_enough_memory_message =
 /// different knob. Counts go to the log (#126); the client gets the remedy.
 pub const insufficient_free_memory_message =
     "Not enough free memory to load model: weights + warmup headroom exceed what is currently available. " ++
-    "Close other apps or models and retry (the server log names the peak estimate and available memory), or pass --skip-mem-preflight to override.";
+    "Close other apps or models and retry (the server log names the peak estimate and available memory), or turn on \"Skip the memory check before loading\" in Settings (or pass --skip-mem-preflight) to override.";
 
 /// A request refused before it owned a slot. A null sink (metrics off) is one branch.
 pub fn countRejected() void {
@@ -11232,6 +11232,11 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     // free memory here sends the user quitting apps when the fix is the cap.
     try testing.expect(std.mem.indexOf(u8, m, "free memory") == null);
     try testing.expect(std.mem.indexOf(u8, m, "resident-model budget") != null);
+
+    // A dashboard user learns where the switch is; a CLI user keeps the flag.
+    const free = insufficient_free_memory_message;
+    try testing.expect(std.mem.indexOf(u8, free, "Skip the memory check before loading") != null);
+    try testing.expect(std.mem.indexOf(u8, free, "--skip-mem-preflight") != null);
 
     // One mapping serves both load switches; a second literal is the drift.
     try testing.expectEqualStrings("out_of_memory", generation_stream.loadRefusalFor(error.NotEnoughMemory).?.type);

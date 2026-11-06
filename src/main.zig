@@ -575,6 +575,7 @@ pub fn main(init: std.process.Init) !void {
     var log_file_arg: ?[]const u8 = null;
     var parent_pid: ?std.posix.pid_t = null;
     var no_update_check = false;
+    var skip_mem_preflight = false;
     var serve_mode = false;
     var serve_explicit = false;
     var stream_mode = false;
@@ -736,7 +737,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
-            scheduler_mod.skip_mem_preflight = true;
+            skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
             server_mod.g_tool_autocorrect = false;
         } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
@@ -1044,6 +1045,7 @@ pub fn main(init: std.process.Init) !void {
         .vision = if (vision) true else if (no_vision) false else null,
         .models_dir = models_root,
         .no_update_check = no_update_check,
+        .skip_mem_preflight = skip_mem_preflight,
         .port = port_flag,
     });
     if (dflash_mod.drafter_min_depth) |lo| if (dflash_mod.drafter_max_depth) |hi| if (lo > hi) {
@@ -1153,6 +1155,7 @@ pub fn main(init: std.process.Init) !void {
         var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
         defer file.deinit();
         const srv = model_settings_mod.server(&file);
+        scheduler_mod.setSkipMemPreflight(model_settings_mod.skipMemPreflight(skip_mem_preflight, srv.skip_mem_preflight).value);
         const serving = serve_mode and prompt == null and bench_run == null;
         if (serving) update_mod.startDailyCheck(io, no_update_check, srv.update_check);
         cli_mod.configurePackUpdates(io, serving and !no_update_check, model_settings_mod.autoCheck(no_update_check, srv.pack_update_check).value);
@@ -1843,7 +1846,7 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
-fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, port: ?u16 = null }) void {
+fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, skip_mem_preflight: bool = false, port: ?u16 = null }) void {
     const locks = &model_settings_mod.launch_locks;
     if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
@@ -1862,6 +1865,7 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
     }
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
     if (given.port) |p| locks.port.pin("{d}", .{p});
+    if (given.skip_mem_preflight) locks.skip_mem_preflight.pin("--skip-mem-preflight", .{});
     if (given.no_update_check) {
         locks.update_check.pin("--no-update-check", .{});
         locks.pack_update_check.pin("--no-update-check", .{});
@@ -1948,4 +1952,14 @@ test "launch flags: --no-update-check pins both automatic update checks, and no 
     pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = true });
     try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.update_check.text());
     try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.pack_update_check.text());
+}
+
+test "launch flags: --skip-mem-preflight pins server.skip_mem_preflight, and no flag leaves it free" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.skip_mem_preflight.set);
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .skip_mem_preflight = true });
+    try std.testing.expectEqualStrings("--skip-mem-preflight", model_settings_mod.launch_locks.skip_mem_preflight.text());
 }

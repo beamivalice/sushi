@@ -432,7 +432,8 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
 - `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir`,
   `server.update_check` and `server.pack_update_check` (booleans, `default: true`, `file`, `flag`, `source`, `locked`;
   `--no-update-check` pins both and reports `flag: "--no-update-check"`; a change reaches the check loops at once, no
-  restart), `server.port` (an integer 1-65535: `file`, `flag` as typed when `--port` pins it, `default: 12345`, `source`,
+  restart), `server.skip_mem_preflight` (the same fields, `default: false`; `--skip-mem-preflight` pins it and reports
+  `flag: "--skip-mem-preflight"`; the next load reads it, no restart), `server.port` (an integer 1-65535: `file`, `flag` as typed when `--port` pins it, `default: 12345`, `source`,
   `locked`, `applies` "the next start; a running server keeps its port"; the port a server binds without `--port`, and what
   sushibar and `sushi launch` target) and
   `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, as typed: `models_dir` whole, the size in the

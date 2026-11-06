@@ -1010,6 +1010,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       <div class="card-h">Server port</div>
       <div class="card-b"><div id="portSet"></div></div>
     </section>
+    <section class="card" id="memoryCard" hidden>
+      <div class="card-h">Memory</div>
+      <div class="card-b"><div id="memorySet"></div></div>
+    </section>
     <section class="card" id="updatesCard" hidden>
       <div class="card-h">Automatic update checks</div>
       <div class="card-b"><div id="updateSet"></div><div id="packUpdateSet"></div></div>
@@ -3365,7 +3369,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
   const isOff = (flag) => flag === "off" || flag === "false" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
-  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check" }[key] ?? "";
+  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check", skip_mem_preflight: "--skip-mem-preflight" }[key] ?? "";
   // The model-settings.json key beside its launch flag, after any engineering name the plain label replaced.
   const keyTerm = (key, eng = KEY[key]?.[4]) => `${[eng, key].filter(Boolean).join(", ")}${flagName(key) ? ` (${flagName(key)})` : ""}`;
   const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : key === "mtp_greedy_tail" ? flagName(key) : flagName(key) ? `${flagName(key)} ${flag}` : "";
@@ -3903,10 +3907,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   portRow.ctl.append(h("div", { class: "row-in" }, portIn, portSave), portRow.bad);
   q("portSet").replaceWith(portRow.row);
 
-  // The two automatic update checks: Default, On or Off. A file value of null is the default, shown as "Default (On)".
-  const UPDATE_KEYS = [
+  // The on/off server keys: Default, On or Off. A file value of null is the default, shown as "Default (On)".
+  const TOGGLE_KEYS = [
     ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops automatic checks; a check you start yourself still runs.", "When a newer sushi is out, a banner offers it. Nothing installs without you."],
     ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. Off stops automatic checks, the Downloads list's included; Check again on Downloads still looks.", "A model with a newer version gets a note on Models. Nothing downloads without you."],
+    ["skip_mem_preflight", "memorySet", "Skip the memory check before loading", "Load a model even when sushi thinks there is not enough free memory. The check is cautious and can refuse a model that would fit. If the model really does not fit, the Mac can run out of memory: sushi may crash or the system may stall.", "Turn this on only if a model you know fits is refused with \"Not enough free memory\". If it does not fit, the Mac can run out of memory: sushi may crash or the whole system may stall. Applies to the next load."],
   ].map(([key, slot, label, help, tip]) => {
     const row = setRow(key, label, null, tip, keyTerm(key));
     const btns = [[null, "Default"], [true, "On"], [false, "Off"]].map(([value, text]) => h("button", { type: "button", "data-value": String(value), text, onclick: (e) => saveServer(key, value, "Saved.", e.currentTarget, "Saving…") }));
@@ -4089,7 +4094,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const s = A.settings, c = A.cache;
     if (!s) return;
     setHidden(q("settingsSkel"), true);
-    for (const id of ["cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
+    for (const id of ["cacheCard", "dirCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     for (const id of ["secStorage", "secServer"]) setHidden(q(id), false);
     setHidden(q("secInference"), !s.effort);
     setHidden(q("effortCard"), !s.effort);
@@ -4098,7 +4103,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (c) renderCache(c, s.server.prefix_cache_disk_gb);
     renderDir(s.server.models_dir);
     if (s.server.port) renderPort(s.server.port);
-    renderUpdates(s.server);
+    renderToggles(s.server);
   }
   function renderCache(c, gb) {
     const cap = gb.effective_bytes, used = c.total_bytes, busy = (b) => b.getAttribute("aria-busy") === "true", clearing = A.busy.size > 0;
@@ -4161,8 +4166,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (mine) q(id).setAttribute("aria-busy", "true"); else q(id).removeAttribute("aria-busy");
     }
   }
-  function renderUpdates(srv) {
-    for (const { key, row, btns, help } of UPDATE_KEYS) {
+  function renderToggles(srv) {
+    for (const { key, row, btns, help } of TOGGLE_KEYS) {
       const st = srv[key];
       if (!st) continue;
       const locked = !!st.locked, shown = locked ? String(!isOff(st.flag ?? "")) : String(st.file);
@@ -4218,7 +4223,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
     const off = !!msg && !!A.settings;
-    for (const id of ["modelsMd", "cacheCard", "effortCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) {
+    for (const id of ["modelsMd", "cacheCard", "effortCard", "dirCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) {
       q(id).classList.toggle("stale-view", off);
       if (q(id).inert !== off) q(id).inert = off;
     }

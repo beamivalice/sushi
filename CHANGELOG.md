@@ -24,6 +24,7 @@ earlier history is mlx-serve's, in that project's changelog.
   every chart, setting and badge explains itself in a tooltip that also names the engineering term. A page opened at
   a LAN address of a `--host 0.0.0.0` server can now load and unload models. A Cancel button stops a running request
   (thanks @chuaaron), and `/metrics` reports speculative decoding and prompt cache tiers.
+  Settings gains "Skip the memory check before loading" for a Mac whose model fits but is refused (thanks @Cianidos).
 - **Download packs from the web page**: Models › Available lists the published Sushi packs, recommends one for this
   Mac and downloads it with progress, Stop and Resume. A pack that is being updated, or whose update stopped half way,
   cannot load until it is complete, and Settings can turn every automatic update check off.

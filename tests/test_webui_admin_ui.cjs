@@ -46,6 +46,7 @@ function makeServer(opts = {}) {
       prefix_cache_disk_gb: { file: 100, flag: null, source: 'file', locked: false, effective_bytes: 100 * GiB, ask_bytes: 100 * GiB, applies: 'a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load' },
       update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       pack_update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
+      skip_mem_preflight: { file: null, flag: null, default: false, source: 'default', locked: false, applies: 'applies at once' },
       port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
     },
     cache: {
@@ -978,6 +979,30 @@ async function main() {
       assert.match(await page.textContent('#updatesCard'), /Set by --no-update-check at launch/);
       assert.match(await page.textContent('#updatesCard'), /Set at launch/);
     });
+    await scenario('the memory-check switch defaults to Off, warns about running out of memory, and saves On', { path: '/settings', open: { mode: 'advanced' } }, async ({ page, server }) => {
+      await page.waitForSelector('.set[data-key="skip_mem_preflight"]');
+      const row = page.locator('.set[data-key="skip_mem_preflight"]');
+      const label = row.locator('.lab > .tip-u');
+      assert.equal(await label.textContent(), 'Skip the memory check before loading');
+      assert.match(await label.getAttribute('data-tip'), /out of memory/i);
+      assert.match(await label.getAttribute('data-tip'), /crash|stall/);
+      assert.match(await label.getAttribute('data-term'), /skip_mem_preflight.*--skip-mem-preflight/);
+      assert.match(await row.locator('.help').textContent(), /out of memory/i, 'the warning is visible, not only in the tip');
+      assert.equal(await row.locator('button[data-value="null"]').textContent(), 'Default (Off)');
+      await row.locator('button[data-value="true"]').click();
+      await page.waitForFunction(() => document.querySelector('.set[data-key="skip_mem_preflight"] button[data-value="true"]').getAttribute('aria-pressed') === 'true');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { skip_mem_preflight: true } });
+      assert.match(await row.locator('.badges').textContent(), /Now/);
+    });
+    await scenario('--skip-mem-preflight locks the memory-check switch on', { path: '/settings', setup: (s) => {
+      Object.assign(s.state.server.skip_mem_preflight, { flag: '--skip-mem-preflight', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector('.set[data-key="skip_mem_preflight"]');
+      const row = page.locator('.set[data-key="skip_mem_preflight"]');
+      assert.equal(await row.locator('button[data-value="false"]').isDisabled(), true);
+      assert.equal(await row.locator('button[data-value="true"]').getAttribute('aria-pressed'), 'true');
+      assert.match(await row.textContent(), /Set by --skip-mem-preflight at launch/);
+    });
     await scenario('the default port shows its ghost text, refuses a bad number and saves a good one', { path: '/settings' }, async ({ page, server }) => {
       await page.waitForSelector('#portNum');
       assert.equal(await page.getAttribute('#portNum', 'placeholder'), 'Default (12345)');
@@ -1041,7 +1066,7 @@ async function main() {
     // A plain-worded setting or badge keeps its engineering name in the tooltip: the model-settings.json key and the launch flag.
     const FLAGS = { ctx_size: '--ctx-size', kv_quant: '--kv-quant', mtp: '--mtp', mtp_acceptance: null, mtp_greedy_tail: '--mtp-greedy-tail', ssd_budget_gb: '--ssd-budget-gb', ssd_prefetch: '--ssd-prefetch',
       preserve_thinking: '--preserve-thinking', think_penalty: '--think-penalty', vision: '--vision', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
-      update_check: '--no-update-check', pack_update_check: '--no-update-check' };
+      update_check: '--no-update-check', pack_update_check: '--no-update-check', skip_mem_preflight: '--skip-mem-preflight' };
     const WORDS = { ssd_budget_gb: /expert/, ssd_prefetch: /prefetch/ };
     // A label that is already the common term keeps only the key and flag in its technical name.
     const KEY_ONLY = { kv_quant: 'kv_quant (--kv-quant)', mtp: 'mtp (--mtp)', mtp_acceptance: 'mtp_acceptance', vision: 'vision (--vision)' };

@@ -4,6 +4,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
+const scheduler = @import("scheduler.zig");
 const default_port = @import("default_port.zig");
 const model_registry_mod = @import("model_registry.zig");
 const disk_placement = @import("disk_placement.zig");
@@ -175,13 +176,13 @@ fn writeLimits(w: *std.Io.Writer, fit: model_settings.Fit) !void {
 const port_applies = "the next start; a running server keeps its port";
 
 /// A server-wide on/off key: the file's value, the pinning flag, and the default it falls back to.
-fn writeAutoCheck(w: *std.Io.Writer, name: []const u8, file: ?bool, lock: *const model_settings.Lock) !void {
+fn writeToggle(w: *std.Io.Writer, name: []const u8, file: ?bool, lock: *const model_settings.Lock, default: bool) !void {
     try w.print(",\"{s}\":{{\"file\":", .{name});
     try writeJson(w, file);
     try w.writeAll(",\"flag\":");
     if (lock.set) try writeJson(w, lock.text()) else try w.writeAll("null");
-    try w.print(",\"default\":true,\"source\":\"{s}\",\"locked\":{},\"applies\":\"applies at once\"}}", .{
-        if (lock.set) "flag" else if (file != null) "file" else "default", lock.set,
+    try w.print(",\"default\":{},\"source\":\"{s}\",\"locked\":{},\"applies\":\"applies at once\"}}", .{
+        default, if (lock.set) "flag" else if (file != null) "file" else "default", lock.set,
     });
 }
 
@@ -308,8 +309,9 @@ pub fn render(
         try w.print(",\"cap_bytes\":{d},\"used_bytes\":{d}}}", .{ t.cap_bytes, t.used_bytes });
     };
     try w.writeAll("],\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}");
-    try writeAutoCheck(w, "update_check", srv.update_check, &locks.update_check);
-    try writeAutoCheck(w, "pack_update_check", srv.pack_update_check, &locks.pack_update_check);
+    try writeToggle(w, "update_check", srv.update_check, &locks.update_check, true);
+    try writeToggle(w, "pack_update_check", srv.pack_update_check, &locks.pack_update_check, true);
+    try writeToggle(w, "skip_mem_preflight", srv.skip_mem_preflight, &locks.skip_mem_preflight, false);
     const port_pinned = locks.port.set;
     try w.writeAll(",\"port\":{\"file\":");
     try writeJson(w, srv.port);
@@ -738,6 +740,8 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             try writeJson(w, applyCacheBudget(sch, e.value));
         } else if (std.mem.eql(u8, e.key, "update_check") or std.mem.eql(u8, e.key, "pack_update_check")) {
             try writeJson(w, applyUpdateCheck(&model_settings.launch_locks, e.key, e.value));
+        } else if (std.mem.eql(u8, e.key, "skip_mem_preflight")) {
+            try writeJson(w, applySkipMemPreflight(&model_settings.launch_locks, e.value));
         } else if (std.mem.eql(u8, e.key, "port")) {
             try writeJson(w, portMessage(&model_settings.launch_locks));
         } else {
@@ -803,6 +807,13 @@ fn applyUpdateCheck(locks: *const model_settings.LaunchLocks, key: []const u8, v
     if ((if (is_sushi) locks.update_check else locks.pack_update_check).set) return "saved; --no-update-check still keeps it off until a start without it";
     const on = if (value) |v| v.bool else true;
     if (is_sushi) update_mod.setAutoCheck(on) else pack_update.setAuto(on);
+    return "applies at once";
+}
+
+/// The next load reads the published value; null (key removed) is the default, the check on.
+fn applySkipMemPreflight(locks: *const model_settings.LaunchLocks, value: ?std.json.Value) []const u8 {
+    if (locks.skip_mem_preflight.set) return "saved; --skip-mem-preflight still skips the check until a start without it";
+    scheduler.setSkipMemPreflight(if (value) |v| v.bool else false);
     return "applies at once";
 }
 
@@ -965,6 +976,56 @@ test "settings api: a toggle reaches the loops at once, and a pinning flag keeps
     locks.pack_update_check.pin("--no-update-check", .{});
     _ = applyUpdateCheck(&locks, "pack_update_check", .{ .bool = true });
     try testing.expect(!pack_update.autoOn());
+}
+
+test "settings api: render reports skip_mem_preflight off by default, with the file value and the flag that pins it" {
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    var locks: model_settings.LaunchLocks = .{};
+    {
+        var file = try model_settings.parse(testing.allocator, "{\"server\": {\"skip_mem_preflight\": true}}");
+        defer file.deinit();
+        const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const o = parsed.value.object.get("server").?.object.get("skip_mem_preflight").?.object;
+        try testing.expect(o.get("file").?.bool);
+        try testing.expect(!o.get("default").?.bool);
+        try testing.expectEqualStrings("file", o.get("source").?.string);
+        try testing.expect(!o.get("locked").?.bool);
+        try testing.expect(o.get("flag").? == .null);
+        try testing.expectEqualStrings("applies at once", o.get("applies").?.string);
+        const update = parsed.value.object.get("server").?.object.get("update_check").?.object;
+        try testing.expect(update.get("default").?.bool);
+    }
+    var empty = try model_settings.parse(testing.allocator, "{}");
+    defer empty.deinit();
+    locks.skip_mem_preflight.pin("--skip-mem-preflight", .{});
+    const body = try render(testing.allocator, "/h/s.json", &empty, &.{}, &locks, view);
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object.get("server").?.object.get("skip_mem_preflight").?.object;
+    try testing.expectEqualStrings("flag", o.get("source").?.string);
+    try testing.expect(o.get("locked").?.bool);
+    try testing.expectEqualStrings("--skip-mem-preflight", o.get("flag").?.string);
+}
+
+test "settings api: skip_mem_preflight takes a boolean or null, reaches the next load at once, and a pinning flag keeps it on" {
+    defer scheduler.setSkipMemPreflight(false);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect(parseRequest(arena_state.allocator(), "{\"server\":{\"skip_mem_preflight\":true}}").ok.server_edits[0].value.?.bool);
+    try expectRejected("{\"server\":{\"skip_mem_preflight\":\"on\"}}", 400, "invalid_setting");
+    var locks: model_settings.LaunchLocks = .{};
+    try testing.expectEqualStrings("applies at once", applySkipMemPreflight(&locks, .{ .bool = true }));
+    try testing.expect(scheduler.skipMemPreflight());
+    _ = applySkipMemPreflight(&locks, null);
+    try testing.expect(!scheduler.skipMemPreflight());
+    scheduler.setSkipMemPreflight(true);
+    locks.skip_mem_preflight.pin("--skip-mem-preflight", .{});
+    _ = applySkipMemPreflight(&locks, .{ .bool = false });
+    try testing.expect(scheduler.skipMemPreflight());
 }
 
 test "settings api: a kv_quant request in any spelling is stored as its choice name; a value the loader would not read is refused" {

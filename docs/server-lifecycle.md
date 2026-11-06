@@ -195,7 +195,10 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **Server-wide keys live under the file's `"server"` object** (a model's key is its absolute path, so they never meet):
   `prefix_cache_disk_gb` (the SSD tier's size, 0 = off), `models_dir` (the discovery folder when no `--model-dir` is
   given, else `~/.sushi/models`) and the booleans `update_check` (the automatic sushi release check) and
-  `pack_update_check` (the automatic pack revision check), both on by default; `--no-update-check` pins both off; and `port`
+  `pack_update_check` (the automatic pack revision check), both on by default; `--no-update-check` pins both off;
+  `skip_mem_preflight` (off by default: load without the free-memory check; `--skip-mem-preflight` pins it on, locked;
+  the Settings switch reaches the next load at once through an atomic in `scheduler.zig`, read at boot from the file
+  when no flag is given); and `port`
   (1-65535, the bind when `--port` is absent, also read by `sushi launch` and sushibar; flag > file > 12345, read at start,
   so a running server keeps its port; `--port` pins it and the API reports it locked).
   The order is the same: `--prefix-cache-disk` / `--model-dir` outrank the file, which

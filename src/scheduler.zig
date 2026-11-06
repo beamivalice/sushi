@@ -2088,11 +2088,17 @@ const ThreadCtx = struct {
     params: model_load.LoadParams,
 };
 
-/// Set by `--skip-mem-preflight` (main.zig) to bypass the model-load memory
-/// pre-flight below. A module global, not a `LoadParams` field, so it applies
-/// uniformly to startup loads AND later hot-loads — matching the env var
-/// (`SUSHI_SKIP_MEM_PREFLIGHT`) it replaced.
-pub var skip_mem_preflight: bool = false;
+/// Bypasses the model-load memory pre-flight. A module global, not a `LoadParams` field, so it applies uniformly to
+/// startup loads and later hot-loads; atomic because the settings page flips it from an HTTP thread.
+var skip_mem_preflight = std.atomic.Value(bool).init(false);
+
+pub fn setSkipMemPreflight(on: bool) void {
+    skip_mem_preflight.store(on, .release);
+}
+
+pub fn skipMemPreflight() bool {
+    return skip_mem_preflight.load(.acquire);
+}
 
 pub var load_serving_bill: ?*const fn (*const ModelConfig, u64) ?model_load.LoadServingBill = null;
 

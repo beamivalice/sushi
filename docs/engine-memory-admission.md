@@ -67,7 +67,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **A declared `iogpu.wired_limit_mb` lifts the resident Sushi preflight's available figure to the same floor request admission reads** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib`, less resident buffers, still under the working set). Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
-  `iogpu.wired_limit_mb`).
+  `iogpu.wired_limit_mb`). The client-facing preflight message also names the Settings switch "Skip the memory check
+  before loading", the twin of `--skip-mem-preflight` (`server.skip_mem_preflight`, read per load, flag > file > off).
 - **One bill, `loadRequirementBytes`**: the weights the loader bills (enabled tensors only: MTP head, vision tower,
   DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient plus a fixed 1 GiB net
   and the requested context's admission bill (the warmup ends before any request allocates). No proportional term,

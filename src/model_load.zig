@@ -1870,7 +1870,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // an actionable error, when free RAM clearly can't hold the weights + warmup
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
-    if (!scheduler_mod.skip_mem_preflight) {
+    if (!scheduler_mod.skipMemPreflight()) {
         const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
         const gpu_limit = mlx.maxRecommendedWorkingSet();
         const Reader = struct {
@@ -1920,13 +1920,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.entry.memory_context_refusal = refusal;
                 if (@TypeOf(params) == *LoadRequest) params.memory_context_refusal = refusal;
                 sch.registry.mutex.unlock(sch.io);
-                log.err("Insufficient memory for requested context: {d} tokens at KV{d} and prefill chunk {d} need ~{d:.2} GiB including {d:.2} GiB of enabled model/vision/MTP weights, but only {d:.2} GiB is available. Maximum context with this memory budget: {d} tokens. Lower --ctx-size or free memory; --skip-mem-preflight overrides this check.\n", .{
+                log.err("Insufficient memory for requested context: {d} tokens at KV{d} and prefill chunk {d} need ~{d:.2} GiB including {d:.2} GiB of enabled model/vision/MTP weights, but only {d:.2} GiB is available. Maximum context with this memory budget: {d} tokens. Lower --ctx-size or free memory; --skip-mem-preflight, or \"Skip the memory check before loading\" in Settings, overrides this check.\n", .{
                     b.requested_context,                         b.kv_bits,                                 b.chunk,                                                                              @as(f64, @floatFromInt(needed)) / gb,
                     @as(f64, @floatFromInt(weights_bytes)) / gb, @as(f64, @floatFromInt(avail_bytes)) / gb, maximum,
                 });
                 return error.InsufficientMemory;
             }
-            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available (free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets). Close other models/apps (or wait for a prior sushi to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available (free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets). Close other models/apps (or wait for a prior sushi to fully exit) and retry; pass --skip-mem-preflight (or turn on \"Skip the memory check before loading\" in Settings) to override.\n", .{
                 @as(f64, @floatFromInt(needed)) / gb,
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
                 @as(f64, @floatFromInt(avail_bytes)) / gb,
@@ -1942,7 +1942,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const cached_bytes = try @import("glm5/glm5_dflash_cache.zig").plannedResidentBytes(sch.io, sch.allocator, drafter_dir);
             const bf16_bytes = try @import("glm5/glm5_diagnostic.zig").assistantResidentBytes(sch.io, sch.allocator, prepared.path);
             streaming_resident_bytes = streaming_resident_bytes.? -| cached_bytes +| bf16_bytes;
-            if (!scheduler_mod.skip_mem_preflight) {
+            if (!scheduler_mod.skipMemPreflight()) {
                 const available = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
                 const needed = loadRequirementBytes(params.config, streaming_resident_bytes.?, false, 0);
                 log.info("[preflight] BF16 DFlash2 fallback: weights ~{d:.2} GiB, needs ~{d:.2} GiB, available {d:.2} GiB\n", .{ @as(f64, @floatFromInt(streaming_resident_bytes.?)) / (1 << 30), @as(f64, @floatFromInt(needed)) / (1 << 30), @as(f64, @floatFromInt(available)) / (1 << 30) });
