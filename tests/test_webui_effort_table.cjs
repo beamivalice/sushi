@@ -296,9 +296,20 @@ async function main() {
       assert.equal(await page.evaluate(() => document.activeElement.id), 'eff-max-sends');
     });
 
-    await scenario('--think locks the default column and says so', { server: { think: 'xhigh' } }, async ({ page }) => {
+    await scenario('--think locks the default column and says so', { server: { think: 'xhigh' } }, async ({ page, server }) => {
       assert.match(await page.innerText('#effortFlag'), /Default set by --think xhigh at launch/);
       assert.equal(await page.isDisabled(`${tr('low')} input[type=radio]`), true);
+      assert.equal(await page.isChecked(`${tr('xhigh')} input[type=radio]`), true, 'the Default column shows the word --think serves');
+      assert.match(await preview(page), /^xhigh sends "xhigh"/, 'and the preview opens on it');
+      await page.uncheck(`${tr('xhigh')} input[type=checkbox]`);
+      await settle(page);
+      assert.notEqual(await page.innerText(`${tr('xhigh')} [data-bad]`), '', 'unoffering the --think word is refused in its row, as the server refuses it');
+      assert.equal(await page.isDisabled('#effortSave'), true);
+      await page.check(`${tr('xhigh')} input[type=checkbox]`);
+      await page.fill(`${tr('low')} input[id$="-cap"]`, '100');
+      await page.click('#effortSave');
+      await settle(page);
+      assert.deepEqual(server.posts().map((b) => b.effort.qwen4_exp.default), [null], 'a save keeps the file default, not the flag word');
     });
 
     await scenario('the Models page says how each model thinks and links to its tab', { path: '/models#Qwen-A' }, async ({ page }) => {

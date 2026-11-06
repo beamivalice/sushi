@@ -3165,7 +3165,8 @@ function effortRowProblem(fam, word, d, defaultWord) {
     if (!/^\d+$/.test(t) || n < 1 || n > 2147483647) return "Cap: enter a whole number of tokens, 1 or more, or none.";
   }
   if (word === "off" && d.offered && !fam.off_offerable) return "Offered: this template has no thinking-off switch.";
-  if (word === defaultWord && (!d.offered || effortIsFold(fam.rows.find((r) => r.word === word), d))) return "The default word must be offered as itself.";
+  // Under --think the word it serves must stay offered too, or the flag would stop binding.
+  if ((word === defaultWord || (fam.default.locked && word === fam.default.value)) && (!d.offered || effortIsFold(fam.rows.find((r) => r.word === word), d))) return "The default word must be offered as itself.";
   return null;
 }
 // The preview of one row: what a request naming `word` gets. `drafts` maps every word to its draft.
@@ -3917,6 +3918,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // The thinking-effort card: one tab per family, a row per effort word.
   const E = { fam: null, drafts: {}, defaults: {}, sel: {}, errs: {}, serr: "", sig: {} };
   const effFam = () => A.settings?.effort?.families?.find((f) => f.family === E.fam);
+  // The default a request gets now: the --think word while the flag locks it, else the draft (which is what a save writes).
+  const effShownDefault = (fam) => fam.default.locked ? fam.default.value : E.defaults[fam.family];
   function effortBase(fam) { return { rows: Object.fromEntries(fam.rows.map((r) => [r.word, effortDraftOf(r)])), def: fam.default.file ?? fam.default.builtin }; }
   // The drafts follow the server until the user edits; a save or a reset drops them.
   function effortSync(fam) {
@@ -3975,7 +3978,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const capCell = off ? h("span", { class: "muted", text: "-" }) : h("input", { type: "text", inputmode: "numeric", autocomplete: "off", id: `${id}-cap`, "aria-label": `${word} cap in tokens`,
       placeholder: effortIsFold(row, d) ? `same as ${fold}` : row.builtin.cap != null ? String(row.builtin.cap) : "none", value: d.cap,
       oninput: (e) => { E.drafts[fam.family][word].cap = e.currentTarget.value.trim(); E.sel[fam.family] = word; E.serr = ""; effortPatch(); } });
-    const radio = h("input", { type: "radio", name: "effortDefault", id: `${id}-def`, "aria-label": `${word} is the default`, checked: E.defaults[fam.family] === word, disabled: locked,
+    const radio = h("input", { type: "radio", name: "effortDefault", id: `${id}-def`, "aria-label": `${word} is the default`, checked: effShownDefault(fam) === word, disabled: locked,
       onchange: () => { E.defaults[fam.family] = word; E.sel[fam.family] = word; E.serr = ""; renderEffort(A.settings.effort); } });
     const bad = h("span", { class: "bad", role: "alert", "data-bad": word });
     const tr = h("tr", { "data-word": word, class: off ? "off-row" : "" },
@@ -3988,7 +3991,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function effortPatch() {
     const ef = A.settings?.effort, fam = effFam();
     if (!fam) return;
-    const drafts = E.drafts[fam.family], def = E.defaults[fam.family], sel = E.sel[fam.family] ?? def;
+    const drafts = E.drafts[fam.family], def = E.defaults[fam.family], sel = E.sel[fam.family] ?? effShownDefault(fam);
     let invalid = false;
     for (const tr of q("effortRows").querySelectorAll("tr")) {
       const word = tr.dataset.word, msg = effortRowProblem(fam, word, drafts[word], def) || (E.serr && new RegExp(`\\b${word}\\b`).test(E.serr.split(":")[0]) ? E.serr : "");
