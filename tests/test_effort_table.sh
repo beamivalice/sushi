@@ -58,10 +58,13 @@ row() { curl -s "$SUSHI_URL/v1/models" | jq -c --arg id "$ID" '.data[] | select(
 settings() { curl -s -o "$WORK/post.json" -w '%{http_code}' -H 'Content-Type: application/json' -d "$1" "$SUSHI_URL/v1/settings"; }
 # chat <word> [extra fields] [max_tokens]: sets CODE (the HTTP status) and SEG (the request's log); the body lands in $WORK/reply.json.
 # Called directly, never inside $(...): the boot state and these results live in this shell.
+# The counter keeps two requests in one second apart: an identical render skips the `template kwargs` log line.
+SEQ=0
 chat() {
     local off
+    SEQ=$((SEQ + 1))
     off=$(_sushi_size "$SUSHI_LOG")
-    CODE=$(curl -s -o "$WORK/reply.json" -w '%{http_code}' -H 'Content-Type: application/json' -d "{\"model\":\"$ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$(date +%s) $PROMPT\"}],\"reasoning_effort\":\"$1\",\"max_tokens\":${3:-700},\"temperature\":0${2:+,$2}}" "$SUSHI_URL/v1/chat/completions")
+    CODE=$(curl -s -o "$WORK/reply.json" -w '%{http_code}' -H 'Content-Type: application/json' -d "{\"model\":\"$ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$(date +%s).$SEQ $PROMPT\"}],\"reasoning_effort\":\"$1\",\"max_tokens\":${3:-700},\"temperature\":0${2:+,$2}}" "$SUSHI_URL/v1/chat/completions")
     SEG=$(_sushi_tail_from "$SUSHI_LOG" "$off")
 }
 BUILTIN_ROW=$(row)
