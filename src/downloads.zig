@@ -314,9 +314,12 @@ fn workerLoop(io: std.Io) void {
         const ok = if (cli.pullRepo(gpa, io, .{ .repo = job.repo }, job.dest, reporter, false)) |_| true else |_| false;
 
         var repo_buf: [256]u8 = undefined;
+        var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
         lock();
         const repo = repo_buf[0..@min(job.repo.len, repo_buf.len)];
         @memcpy(repo, job.repo[0..repo.len]);
+        const dest = dest_buf[0..@min(job.dest.len, dest_buf.len)];
+        @memcpy(dest, job.dest[0..dest.len]);
         job.progress.endFile(job.allocator, ok);
         job.pid = null;
         job.phase = if (ok) .done else if (job.cancel.load(.monotonic)) .cancelled else .failed;
@@ -330,7 +333,7 @@ fn workerLoop(io: std.Io) void {
         unlock();
         // `job` may be dropped from here on: a new start of the same pack replaces a finished one.
         if (rescan) if (server.global_registry) |r| {
-            const added = r.rescan() catch 0;
+            const added = r.absorbDownload(dest) catch 0;
             log.info("[download] {s} is ready; models rescanned, {d} added\n", .{ repo, added });
         };
     }

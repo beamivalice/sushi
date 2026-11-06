@@ -531,7 +531,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   through `cli.pullRepo`: same manifest, content-id skip, `curl -C -` partials and verify-before-rename as `sushi pull`.
   `phase` is `queued|listing|checking|downloading|verifying|done|failed|cancelled`; `done_bytes` counts finished files and
   the partial in flight; `speed_bps` is the average over the last 5 s of the samples each GET takes (a resumed partial is
-  not speed); `message` is the pull's error line (a checksum mismatch names the file). A finished pack rescans the registry.
+  not speed); `message` is the pull's error line (a checksum mismatch names the file). A finished pack rescans the registry and is listed by its own folder when no root
+  the server walks holds it (a `--model`-only server lists the pack it downloaded, and no other folder).
 - `POST /v1/downloads/cancel {"repo":...}` drops a queued pack or stops a running one: `stopping` is true until it
   reports. The curl in flight gets SIGTERM (its pid is held unreaped until the job clears it, so the signal never reaches
   another process), the hash of the files on disk stops between files, and a file already being verified finishes its

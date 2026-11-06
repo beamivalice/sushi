@@ -864,10 +864,25 @@ pub const ModelRegistry = struct {
     /// (first-wins, like boot) and live entries are never re-pointed or
     /// removed. A failed load at the same path becomes retryable. Returns the
     /// number of stubs added. A `--model`-only server with no
-    /// settings-file models directory rescans nothing.
+    /// settings-file models directory rescans nothing (`absorbDownload`
+    /// still lists what the Downloads tab fetched).
     pub fn rescan(self: *ModelRegistry) !u32 {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         return self.rescanWithSettings(self.settings_path orelse model_settings.defaultPath(&path_buf));
+    }
+
+    /// After a download into the pack folder `path`: the rescan, and that folder itself when no root the server walks
+    /// holds it (a `--model`-only server walks none), so the pack is listed without a restart and no other folder is.
+    pub fn absorbDownload(self: *ModelRegistry, path: []const u8) !u32 {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        return self.absorbDownloadWithSettings(self.settings_path orelse model_settings.defaultPath(&path_buf), path);
+    }
+
+    pub fn absorbDownloadWithSettings(self: *ModelRegistry, settings_path: []const u8, path: []const u8) !u32 {
+        const added = try self.rescanWithSettings(settings_path);
+        if (self.peekByPath(path) != null) return added;
+        _ = self.registerByPath(self.io, path) catch return added;
+        return added + @intFromBool(self.peekByPath(path) != null);
     }
 
     /// `rescan` reading the settings file at `settings_path`.
@@ -2308,6 +2323,29 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
     try testing.expectEqual(@as(u32, 0), try reg.rescanWithSettings(no_settings));
     try testing.expect(reg.peek("org/first") != null);
+}
+
+test "ModelRegistry: a --model-only server lists the pack it downloaded outside every root it walks, and nothing beside it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    for ([_][]const u8{ "beamster/Got-Sushi-1bpw", "beamster/Other-Sushi-1bpw" }) |d| {
+        try tmp.dir.createDirPath(io, d);
+        var p: [256]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&p, "{s}/config.json", .{d}), .data = "{\"model_type\":\"qwen4_exp\"}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&p, "{s}/model.safetensors", .{d}), .data = "0123" });
+    }
+    const got = try std.fmt.allocPrint(testing.allocator, "{s}/beamster/Got-Sushi-1bpw", .{root});
+    defer testing.allocator.free(got);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    try testing.expectEqual(@as(u32, 1), try reg.absorbDownloadWithSettings(no_settings, got));
+    try testing.expectEqualStrings("qwen4_exp", (reg.peekByPath(got) orelse return error.TestExpectedResult).arch_hint);
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
+    try testing.expectEqual(@as(u32, 0), try reg.absorbDownloadWithSettings(no_settings, got));
 }
 
 test "ModelRegistry: rescan reads the settings file the registry names instead of the home one" {
