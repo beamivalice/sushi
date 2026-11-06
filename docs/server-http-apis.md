@@ -270,6 +270,9 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
   `sends` or `cap` on `off` is refused (off sends nothing and has nothing to cap); `offered: true` on GLM's off is
   refused. The default word must be offered as itself. Under `--think`, a save that would unoffer the word `--think`
   serves on that family is refused: the flag would stop binding and the next start with it would exit.
+  A save reads the file, checks, writes every family it names in one rewrite and publishes them, all under the
+  settings write lock (`model_settings.lockWrites`): two saves at once never drop each other's rows, and a failed
+  write publishes nothing.
 - **Validation** (`effort.parseRow`, `checkSends`, `checkCap`, `checkTable`): a save is refused with a 400 naming the
   field (`effort qwen4_exp.high.sends: Qwen takes low, medium or xhigh`) and writes nothing; a start reads the file
   leniently (`model_settings.publishEffortTables`): each bad field is skipped with one `[effort] model-settings.json

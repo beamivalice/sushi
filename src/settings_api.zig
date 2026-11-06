@@ -497,6 +497,9 @@ pub fn parseRequest(arena: std.mem.Allocator, body: []const u8) Parsed {
 /// Writes the named families' tables (only what differs from built-in) and publishes them for the next request. Every
 /// family is checked before any is written; returns the refusal text, or null.
 pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans: [effort_mod.families.len]EffortPlan) !?[]const u8 {
+    // Read, check, write and publish under the write lock: a save never merges into a file another one is rewriting.
+    model_settings.lockWrites(io);
+    defer model_settings.unlockWrites(io);
     var file = model_settings.load(arena, io, path);
     defer file.deinit();
     var next: [effort_mod.families.len]effort_mod.Edits = undefined;
@@ -517,13 +520,21 @@ pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans
         };
         n.* = effort_mod.normalize(f, n.*);
     }
+    // Every family in one rewrite, so a failed write leaves none of them saved.
+    var sections: [effort_mod.families.len]model_settings.SectionEdits = undefined;
+    var n_sections: usize = 0;
     for (effort_mod.families, plans, next) |f, p, n| {
         if (!p.named) continue;
-        var edits: [effort_mod.table_words.len + 1]Edit = undefined;
+        const edits = try arena.alloc(Edit, effort_mod.table_words.len + 1);
         edits[0] = .{ .key = "default", .value = if (n.default) |d| .{ .string = @tagName(d) } else null };
         for (effort_mod.table_words, n.rows, 1..) |word, row, i| edits[i] = .{ .key = @tagName(word), .value = if (row.isEmpty()) null else try effort_mod.rowJson(arena, f, row) };
         var buf: [64]u8 = undefined;
-        try model_settings.writeEdits(arena, io, path, effort_mod.sectionName(&buf, f), &edits);
+        sections[n_sections] = .{ .section = try arena.dupe(u8, effort_mod.sectionName(&buf, f)), .edits = edits };
+        n_sections += 1;
+    }
+    try model_settings.writeSectionsLocked(arena, io, path, sections[0..n_sections]);
+    for (effort_mod.families, plans, next) |f, p, n| {
+        if (!p.named) continue;
         effort_mod.publish(f, n);
         log.info("[effort] {s}: table saved, serving from the next request\n", .{@tagName(f)});
     }
@@ -1318,6 +1329,47 @@ test "settings api: an effort save cannot unoffer the word --think serves, which
     // Without --think the row may go.
     effort_mod.think_effort_flag = null;
     try testing.expect(try applyEffort(a, io, path, unoffer.effort) == null);
+}
+
+test "settings api: two effort saves at once each keep their row, in the file and in the served table" {
+    defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/model-settings.json", .{dir});
+    const Saver = struct {
+        fn run(p: []const u8, body: []const u8, go: *std.atomic.Value(u32), round: u32) void {
+            while (go.load(.acquire) < round) std.atomic.spinLoopHint();
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            _ = applyEffort(a, testing.io, p, parseRequest(a, body).ok.effort) catch {};
+        }
+    };
+    var go = std.atomic.Value(u32).init(0);
+    var round: u32 = 1;
+    while (round <= 60) : (round += 1) {
+        var low_buf: [96]u8 = undefined;
+        var medium_buf: [96]u8 = undefined;
+        const low = try std.fmt.bufPrint(&low_buf, "{{\"effort\":{{\"qwen4_exp\":{{\"low\":{{\"cap\":{d}}}}}}}}}", .{round});
+        const medium = try std.fmt.bufPrint(&medium_buf, "{{\"effort\":{{\"qwen4_exp\":{{\"medium\":{{\"cap\":{d}}}}}}}}}", .{round});
+        const t1 = try std.Thread.spawn(.{}, Saver.run, .{ path, low, &go, round });
+        const t2 = try std.Thread.spawn(.{}, Saver.run, .{ path, medium, &go, round });
+        go.store(round, .release);
+        t1.join();
+        t2.join();
+        var file = model_settings.load(testing.allocator, io, path);
+        defer file.deinit();
+        const saved = model_settings.effortEdits(&file, .qwen4_exp, false);
+        const served = effort_mod.publishedEdits(.qwen4_exp);
+        for ([_]effort_mod.Edits{ saved, served }) |e| {
+            try testing.expectEqual(@as(??i32, @as(i32, @intCast(round))), e.rows[effort_mod.rowIndex(.low).?].cap);
+            try testing.expectEqual(@as(??i32, @as(i32, @intCast(round))), e.rows[effort_mod.rowIndex(.medium).?].cap);
+        }
+    }
 }
 
 test "settings api: a start reads the file's tables, skipping each bad field with a log line" {

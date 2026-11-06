@@ -568,11 +568,27 @@ pub const Edit = struct {
 
 var write_mu: std.Io.Mutex = .init;
 
+/// Held by an edit that reads the file, merges into it and writes it (`writeSectionsLocked`), so no other write lands between.
+pub fn lockWrites(io: std.Io) void {
+    write_mu.lockUncancelable(io);
+}
+
+pub fn unlockWrites(io: std.Io) void {
+    write_mu.unlock(io);
+}
+
+pub const SectionEdits = struct { section: []const u8, edits: []const Edit };
+
 /// Applies `edits` to the object keyed `section` (a model path, or `server_section`) and rewrites the file through a
 /// temp file and a rename. Keys and sections it does not touch are kept as they are; an emptied section goes.
 pub fn writeEdits(alloc: std.mem.Allocator, io: std.Io, link_path: []const u8, section: []const u8, edits: []const Edit) !void {
-    write_mu.lockUncancelable(io);
-    defer write_mu.unlock(io);
+    lockWrites(io);
+    defer unlockWrites(io);
+    return writeSectionsLocked(alloc, io, link_path, &.{.{ .section = section, .edits = edits }});
+}
+
+/// `writeEdits` over several sections in one rewrite; the caller holds `lockWrites`.
+pub fn writeSectionsLocked(alloc: std.mem.Allocator, io: std.Io, link_path: []const u8, sections: []const SectionEdits) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -589,22 +605,24 @@ pub fn writeEdits(alloc: std.mem.Allocator, io: std.Io, link_path: []const u8, s
         if (tree != .object) return error.MalformedSettingsFile;
         root = tree.object;
     }
-    // The loader matches section keys without trailing slashes; the editor must edit the key it reads.
-    const key = for (root.keys()) |k| {
-        if (std.mem.eql(u8, trimSlash(k), trimSlash(section))) break k;
-    } else section;
-    var sec: std.json.ObjectMap = if (root.get(key)) |v| (if (v == .object) v.object else .empty) else .empty;
-    for (edits) |e| {
-        if (e.value) |v| {
-            try sec.put(arena, try arena.dupe(u8, e.key), v);
-        } else {
-            _ = sec.orderedRemove(e.key);
+    for (sections) |one| {
+        // The loader matches section keys without trailing slashes; the editor must edit the key it reads.
+        const key = for (root.keys()) |k| {
+            if (std.mem.eql(u8, trimSlash(k), trimSlash(one.section))) break k;
+        } else one.section;
+        var sec: std.json.ObjectMap = if (root.get(key)) |v| (if (v == .object) v.object else .empty) else .empty;
+        for (one.edits) |e| {
+            if (e.value) |v| {
+                try sec.put(arena, try arena.dupe(u8, e.key), v);
+            } else {
+                _ = sec.orderedRemove(e.key);
+            }
         }
-    }
-    if (sec.count() == 0) {
-        _ = root.orderedRemove(key);
-    } else {
-        try root.put(arena, key, .{ .object = sec });
+        if (sec.count() == 0) {
+            _ = root.orderedRemove(key);
+        } else {
+            try root.put(arena, key, .{ .object = sec });
+        }
     }
     const out = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
 
