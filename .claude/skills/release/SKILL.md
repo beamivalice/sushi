@@ -80,11 +80,9 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
    `.sha256` and run its `sushi --version`, then publish it. Right after publishing, run `scripts/bump-tap.sh`: it
    triggers `beamivalice/homebrew-tap`'s bump with this machine's `gh` login (no repo-secret token) and fails unless
    `Formula/sushi.rb` names the new tag. The tap's hourly schedule is the fallback.
-4. Once the GitHub release is published, bump mlx-serve's Sushi pin to the release commit
-   ([mlx-serve-integration](../../../docs/mlx-serve-integration.md#handing-a-new-engine-to-mlx-serve)): make the
-   commit reachable from the submodule url (`ddalcu/sushi`, branch `exl3-module`), then in the mlx-serve checkout
-   `git -C lib/sushi fetch && git -C lib/sushi checkout v<version>`, commit `lib/sushi`, run mlx-serve's tests and open
-   the PR from `beamivalice/mlx-serve`. Update the doc's "Recommended pin" to the release commit.
+4. mlx-serve pins no Sushi release: it vendors a copy of `src/exl3`
+   ([mlx-serve-integration](../../../docs/mlx-serve-integration.md#how-mlx-serve-consumes-the-module)), so a release
+   needs no step there. A re-vendor is its own task, taken only when the owner asks.
 
 ### CHANGELOG style
 
