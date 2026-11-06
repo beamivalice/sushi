@@ -228,3 +228,93 @@ test "trunk gemm: a billed one-bank linear past the decoded width takes the deco
     const b: [*]const u32 = @ptrCast(mlx.mlx_array_data_float32(f[1]) orelse return error.Unreadable);
     try t.expectEqualSlices(u32, a[0..len], b[0..len]);
 }
+
+test "trunk gemm: real pack trunk banks, every shape the gate allows writes the sorted GEMM bytes at 1024, 2048 and 4096 rows" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    if (!kernels.gemmNaxOn()) return error.SkipZigTest;
+    const linear = @import("linear.zig");
+    const fmt = @import("expert_exl3.zig");
+    const trace = std.c.getenv("SUSHI_EXL3_PARITY_TRACE") != null;
+    const s = mlx.gpuStream();
+    kernels.setDecodeParams(kernels.SPEC1_W15);
+    defer kernels.setDecodeParams(.mul1);
+
+    // One real bank per (in, out) the trunk layers hold.
+    const Bank = struct { in: c_int, out: c_int, trellis: mlx.mlx_array };
+    var banks: [16]Bank = undefined;
+    var n_banks: usize = 0;
+    defer for (banks[0..n_banks]) |b| {
+        _ = mlx.mlx_array_free(b.trellis);
+    };
+    var layer: usize = 0;
+    while (true) : (layer += 1) {
+        const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/trunk-stq-L{d:0>2}.safetensors", .{ dir, layer }, 0);
+        defer t.allocator.free(path);
+        std.Io.Dir.cwd().access(t.io, path, .{}) catch break;
+        var map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        var meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try mlx.check(mlx.mlx_load_safetensors(&map, &meta, path.ptr, mlx.mlx_default_cpu_stream_new()));
+        const it = mlx.mlx_map_string_to_array_iterator_new(map);
+        defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
+        while (true) {
+            var key: ?[*:0]const u8 = null;
+            var value = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(value);
+            if (mlx.mlx_map_string_to_array_iterator_next(&key, &value, it) != 0 or key == null) break;
+            if (!std.mem.endsWith(u8, std.mem.span(key.?), ".trellis")) continue;
+            const sh = mlx.getShape(value);
+            if (sh.len != 3 or sh[2] != 96) continue;
+            const in = sh[0] * 16;
+            const out = sh[1] * 16;
+            const seen = for (banks[0..n_banks]) |b| {
+                if (b.in == in and b.out == out) break true;
+            } else false;
+            if (seen or n_banks == banks.len) continue;
+            var bank = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&bank, value, &[_]c_int{ 1, sh[0], sh[1], sh[2] }, 4, s));
+            banks[n_banks] = .{ .in = in, .out = out, .trellis = bank };
+            n_banks += 1;
+        }
+    }
+    try t.expect(n_banks >= 5);
+
+    var prng = std.Random.DefaultPrng.init(0x7e9);
+    const rnd = prng.random();
+    var allowed: usize = 0;
+    var refused: usize = 0;
+    for (banks[0..n_banks]) |b| for ([_]c_int{ 1024, 2048, 4096 }) |rows| {
+        const ok = denseOrderMatches(rows, b.in, b.out);
+        if (ok) allowed += 1 else refused += 1;
+        const xs = try t.allocator.alloc(u16, @as(usize, @intCast(rows)) * @as(usize, @intCast(b.in)));
+        defer t.allocator.free(xs);
+        for (xs) |*v| v.* = fmt.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 0.5);
+        const x = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ rows, b.in }, 2, .float16);
+        defer _ = mlx.mlx_array_free(x);
+        const ids = try t.allocator.alloc(u32, @intCast(rows));
+        defer t.allocator.free(ids);
+        @memset(ids, 0);
+        const slots = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{rows}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(slots);
+        const tab = try linear.windowTable(1, @intCast(rows), kernels.gemmWindowRows());
+        defer _ = mlx.mlx_array_free(tab.starts);
+        defer _ = mlx.mlx_array_free(tab.nlives);
+        const want = try kernels.innerGemmSortedTable(s, x, b.trellis, slots, kernels.gemmWindowRows(), true, tab);
+        defer _ = mlx.mlx_array_free(want);
+        const got = try innerDense(s, x, b.trellis);
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_array_eval(want));
+        try mlx.check(mlx.mlx_array_eval(got));
+        const len: usize = mlx.mlx_array_size(want);
+        const wp: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(want) orelse return error.Unreadable);
+        const gp: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(got) orelse return error.Unreadable);
+        var differ: usize = 0;
+        for (wp[0..len], gp[0..len]) |a, c| differ += @intFromBool(a != c);
+        if (trace) std.debug.print("trunk gemm {d}x{d}->{d}: gate {s}, {d} of {d} outputs differ\n", .{ rows, b.in, b.out, if (ok) "allows" else "refuses", differ, len });
+        if (ok) try t.expectEqual(@as(usize, 0), differ);
+    };
+    try t.expect(allowed > 0 and refused > 0);
+}
