@@ -509,6 +509,12 @@ pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans
             row.* = given orelse .{};
         };
         if (effort_mod.checkTable(effort_mod.merge(f, n.*))) |problem| return try std.fmt.allocPrint(arena, "effort {s}.{s}: {s}", .{ @tagName(f), problem.key, problem.why });
+        // An unoffered --think word would stop binding now and refuse the next start with the same flag.
+        if (effort_mod.think_effort_flag) |think| if (effort_mod.servedArms(@tagName(f))) |served| {
+            const merged = effort_mod.merge(f, n.*).offeredArms();
+            if (effort_mod.resolve(served.slice(), think) != null and effort_mod.resolve(merged.slice(), think) == null)
+                return try std.fmt.allocPrint(arena, "effort {s}.{s}: --think serves this word; a start without --think may unoffer it", .{ @tagName(f), @tagName(think) });
+        };
         n.* = effort_mod.normalize(f, n.*);
     }
     for (effort_mod.families, plans, next) |f, p, n| {
@@ -1284,6 +1290,34 @@ test "settings api: an effort save writes only what differs from built-in, takes
     defer s.deinit();
     try testing.expect(s.parsed.?.value.object.get("effort:qwen4_exp") == null);
     try testing.expectEqual(@as(?u32, 64), s.lookup("/m/a").ctx_size);
+}
+
+test "settings api: an effort save cannot unoffer the word --think serves, which would refuse the next start" {
+    defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
+    const saved = effort_mod.think_effort_flag;
+    defer effort_mod.think_effort_flag = saved;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/model-settings.json", .{dir});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    effort_mod.think_effort_flag = .xhigh;
+    const unoffer = parseRequest(a, "{\"effort\":{\"qwen4_exp\":{\"xhigh\":{\"offered\":false}}}}").ok;
+    try testing.expect(try applyEffort(a, io, path, unoffer.effort) != null);
+    try testing.expect(effort_mod.thinkFlagArm("qwen4_exp") != null);
+    // A word --think never resolved on a family is no reason to refuse that family's save.
+    effort_mod.think_effort_flag = .off;
+    const glm = parseRequest(a, "{\"effort\":{\"glm5_next\":{\"low\":{\"cap\":64}}}}").ok;
+    try testing.expect(try applyEffort(a, io, path, glm.effort) == null);
+    // Without --think the row may go.
+    effort_mod.think_effort_flag = null;
+    try testing.expect(try applyEffort(a, io, path, unoffer.effort) == null);
 }
 
 test "settings api: a start reads the file's tables, skipping each bad field with a log line" {
