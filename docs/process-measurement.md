@@ -107,6 +107,8 @@ under 50 °C for at most 3 min, `taskpolicy -a`, a private `SUSHI_PREFIX_CACHE_D
 refusal while any `sushi`, `sushi-repack` or `sushi-grid` runs), boots the server by PID, runs `sushi bench` against it
 and stops it. The raw `bench.json` (every request), the server log and `bench.log` stay in the run directory; the report
 `docs/bench/v<ver>/<pack>.md` carries the commit, binary SHA-256 and mtime, flags and hardware.
+While a chain of release benches runs from the main checkout, edit only in a worktree: one uncommitted change there
+refuses every model still queued.
 
 `sushi bench --model <pack> [--rungs 4k,16k] [--tokens 256] [--code-only | --prose-only] [<serve flags>]` is the same
 bench with no server to boot: the pack loads in this process, through the serve path, and each request goes straight
