@@ -218,6 +218,7 @@ pub const Tracker = struct {
 
     /// `now_ms` is read before the request went out, so the next `since` cannot skip a request.
     pub fn observe(self: *Tracker, now_ms: i64, sample: Sample) void {
+        const prev_live = self.live;
         self.live = null;
         self.decoding = sample.decoding.len > 0;
         self.prefilling = sample.prefilling;
@@ -226,6 +227,11 @@ pub const Tracker = struct {
             if (sample.finished_tps) |t| self.last = t;
             if (sample.finished_prefill_tps) |t| self.last_prefill = t;
             const dt_ms = now_ms - self.prev_ms;
+            // A poll woken just after the last one spans too few steps to read a speed: keep it and the baseline.
+            if (self.decoding and self.prev_n > 0 and dt_ms < poll_fast_ms / 2) {
+                self.live = prev_live;
+                return;
+            }
             if (self.prev_n > 0 and dt_ms > 0) {
                 var added: u64 = 0;
                 var matched = false;
@@ -2433,6 +2439,18 @@ test "tracker: live speed is the tokens added to the same requests over the wall
     try std.testing.expectApproxEqAbs(@as(f64, 20), t.live.?, 1e-9);
     t.observe(4000, .{ .link = .up, .decoding = &.{.{ .request_id = 9, .generated = 5 }} });
     try std.testing.expect(t.live == null);
+}
+
+test "tracker: a poll moments after the last (the menu opening) keeps the live speed instead of reading 0" {
+    var t: Tracker = .{};
+    t.observe(1000, .{ .link = .up, .decoding = &.{.{ .request_id = 1, .generated = 10 }} });
+    t.observe(2000, .{ .link = .up, .decoding = &.{.{ .request_id = 1, .generated = 110 }} });
+    t.observe(2020, .{ .link = .up, .decoding = &.{.{ .request_id = 1, .generated = 110 }} });
+    try std.testing.expectApproxEqAbs(@as(f64, 100), t.live.?, 1e-9);
+    t.observe(3000, .{ .link = .up, .decoding = &.{.{ .request_id = 1, .generated = 210 }} });
+    try std.testing.expectApproxEqAbs(@as(f64, 100), t.live.?, 1e-9);
+    t.observe(3010, .{ .link = .up });
+    try std.testing.expect(t.live == null and !t.decoding);
 }
 
 test "tracker: the last speed outlives the request, and since follows the newest row or the poll" {
