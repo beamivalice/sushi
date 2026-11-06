@@ -213,7 +213,7 @@ async function dashboardBugs(browser) {
     const dots = await dotsOf(page, 'dashCCpre');
     assert.equal(dots.length, 2, 'two requests between polls are two dots');
     assert.ok(dots[1].x > dots[0].x, 'each at its own finish time');
-    assert.equal(await textOf(page, 'dashCmPre'), '4,002 tokens/s', 'the tile is the newest request, not a pool');
+    assert.equal(await textOf(page, 'dashCmPre'), '4,002 tok/s', 'the tile is the newest request, not a pool');
     assert.match(await textOf(page, 'dashCmPreS'), /2,001 tokens/);
     await adv(page, 6000);
     assert.equal((await dotsOf(page, 'dashCCpre')).length, 2, 'later polls add no copies');
@@ -257,12 +257,27 @@ async function dashboardBugs(browser) {
     await context.close();
   }
   {
+    // A four-digit speed in the eight-tile Advanced row keeps its unit on the number's line at 1440 px.
+    const { page, context } = await simPage(browser, { mode: 'advanced', contextOptions: { viewport: { width: 1440, height: 900 } } });
+    await page.evaluate(() => window.__sim.finish({ computed: 5600, prefillS: 4, gen: 100, decodeS: 2 }));
+    await adv(page, 3000);
+    for (const id of ['dashTPre', 'dashTGen']) {
+      const drift = await page.evaluate((id) => {
+        const v = document.getElementById(id), u = v.querySelector('small'), r = document.createRange();
+        r.selectNodeContents(v.firstChild);
+        return Math.abs(r.getBoundingClientRect().bottom - u.getBoundingClientRect().bottom);
+      }, id);
+      assert.ok(drift < 6, `${id}'s unit stays on the number's line (${drift}px apart)`);
+    }
+    await context.close();
+  }
+  {
     // A restart is the process start time changing, whatever the new counters say; the old server's request is gone.
     const { page, context } = await simPage(browser, { skew: 600_000 });
     await page.evaluate(() => window.__sim.finish({ computed: 5000, prefillS: 5, gen: 100, decodeS: 2 }));
     await adv(page, 3000);
-    assert.equal(await textOf(page, 'dashCmPre'), '1,000 tokens/s');
-    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tokens/s');
+    assert.equal(await textOf(page, 'dashCmPre'), '1,000 tok/s');
+    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tok/s');
     await page.evaluate(() => window.__sim.restart());
     await adv(page, 4000);
     assert.equal(await textOf(page, 'dashCmPre'), '-', 'the old server\'s last request is not shown');
@@ -281,7 +296,7 @@ async function dashboardBugs(browser) {
     await adv(page, 4000);
     const dots = await dotsOf(page, 'dashCCpre');
     assert.equal(dots.length, 1, 'only the new server\'s request');
-    assert.equal(await textOf(page, 'dashCmPre'), '3,000 tokens/s');
+    assert.equal(await textOf(page, 'dashCmPre'), '3,000 tok/s');
     assert.match(await textOf(page, 'dashStatus'), /restarted/);
     await adv(page, 70_000, 5000);
     assert.equal(await textOf(page, 'dashStatus'), 'Live', 'the restart note does not stay for the session');
@@ -302,7 +317,7 @@ async function dashboardBugs(browser) {
     await adv(page, 3000);
     const dots = await dotsOf(page, 'dashCCpre');
     assert.equal(dots.length, 2);
-    assert.equal(await textOf(page, 'dashCmPre'), '37,513 tokens/s', 'the tile keeps the last real prefill');
+    assert.equal(await textOf(page, 'dashCmPre'), '37,513 tok/s', 'the tile keeps the last real prefill');
     const box = await page.locator('#dashCCpre').boundingBox();
     await page.mouse.move(box.x + dots[1].x, box.y + 40);
     await adv(page, 100, 50);
@@ -316,7 +331,7 @@ async function dashboardBugs(browser) {
     const { page, context } = await simPage(browser);
     await page.evaluate(() => window.__sim.finish({ computed: 100, prefillS: 0.1, gen: 5, decodeS: 0.1 }));
     await adv(page, 3000);
-    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tokens/s');
+    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tok/s');
     assert.match(await textOf(page, 'dashCmDecS'), /last request/);
     await context.close();
   }
@@ -1254,13 +1269,13 @@ async function main() {
       assert.equal(await page.evaluate(() => !!document.getElementById('dashCSpd')), false, 'no chart mixes the two speeds');
 
       // Decode: live from the history while generating; idle falls back to the since-start mean, labelled as such.
-      assert.equal(await text('dashCmDec'), '50.0 tokens/s');
+      assert.equal(await text('dashCmDec'), '50.0 tok/s');
       assert.equal(await text('dashCmDecS'), compact === 'decode' ? 'live' : 'average since start');
       // Prefill is a per-request speed, never an instantaneous 0: the mean until a request is seen to finish (40,000 tokens
       // in 60 s), then that request's own (12,000 tokens in 10 s).
-      assert.notEqual(await text('dashCmPre'), '0 tokens/s');
-      assert.match(await text('dashCmPre'), /^667 tokens\/s$/);
-      await page.waitForFunction(() => /^1,200 tokens\/s$/.test(document.getElementById('dashCmPre').innerText.trim()), null, { timeout: 15000 });
+      assert.notEqual(await text('dashCmPre'), '0 tok/s');
+      assert.match(await text('dashCmPre'), /^667 tok\/s$/);
+      await page.waitForFunction(() => /^1,200 tok\/s$/.test(document.getElementById('dashCmPre').innerText.trim()), null, { timeout: 15000 });
       assert.match(await text('dashCmPreS'), /last request, .*12,000 tokens/);
       await page.waitForFunction(() => (window.__axis.dashCCpre ?? []).includes('2k'), null, { timeout: 5000 });
       assert.deepEqual(await page.evaluate(() => (window.__axis.dashCCpre ?? []).filter((t) => /request finished/.test(t))), [], 'the prefill chart plots the finished request');

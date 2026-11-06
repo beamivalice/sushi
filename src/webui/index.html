@@ -4991,17 +4991,18 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function offlineTile(id) { setValue($(id), '-', ''); put($(id + '-s'), UNREACHABLE); putClass($(id + '-s'), 's'); }
 
   // Decode and Prefill tiles, shared by both views: live while running, else the last request's rate, else the mean since start.
+  // The unit is short (`tok/s`) because the eight-tile row wraps `tokens/s`; the tile's tip spells it out.
   function speedTiles({ d, now, gen, pre }, decId, preId) {
     if (feedOffline) { offlineTile(decId); offlineTile(preId); return; }
     const c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {};
     const since = r => 'last request, ' + ago(srvNow - r.t);
     const dec = gen > 0 ? { rate: gen, live: true } : lastReq.dec || meanRate(c, h, 'generation_tokens_total', 'decode_time_seconds');
-    setValue($(decId), dec ? fmt(dec.rate, 1) : '-', dec ? 'tokens/s' : '');
+    setValue($(decId), dec ? fmt(dec.rate, 1) : '-', dec ? 'tok/s' : '');
     put($(decId + '-s'), !dec ? 'no reply written yet' : dec.live ? 'live' : dec.avg ? 'average since start' : since(dec));
     putClass($(decId + '-s'), 's' + (dec?.live ? ' live' : ''));
     const livePre = (g.requests_prefilling || 0) > 0 && pre > 0;
     const last = lastReq.pre || meanRate(c, h, 'prefill_tokens_total', 'prefill_time_seconds');
-    setValue($(preId), livePre ? fmt(pre, 0) : last ? fmt(last.rate, 0) : '-', livePre || last ? 'tokens/s' : '');
+    setValue($(preId), livePre ? fmt(pre, 0) : last ? fmt(last.rate, 0) : '-', livePre || last ? 'tok/s' : '');
     put($(preId + '-s'), livePre ? (g.prefill_tokens_expected ? `live, ${compact(g.prefill_tokens_live)} / ${compact(g.prefill_tokens_expected)} tokens` : 'live')
       : !last ? 'no prompt read yet' : last.avg ? 'average since start' : `${since(last)}, ${fmtInt(last.tokens)} tokens${last.restored ? `, ${fmtInt(last.restored)} reused` : ''}`);
     putClass($(preId + '-s'), 's' + (livePre ? ' live' : ''));
