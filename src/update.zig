@@ -310,11 +310,15 @@ pub fn writeCache(arena: Allocator, io: std.Io, path: []const u8, c: Cache) !voi
     return writeJsonAtomic(arena, io, path, c);
 }
 
-/// Written beside and renamed over, so a reader never sees half a file.
+var tmp_seq = std.atomic.Value(u32).init(0);
+
+/// Written beside under a name no other writer (thread or process) uses, then renamed over, so a reader never sees
+/// half a file and the last rename wins whole.
 pub fn writeJsonAtomic(arena: Allocator, io: std.Io, path: []const u8, value: anytype) !void {
     if (std.fs.path.dirname(path)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
     const text = try std.json.Stringify.valueAlloc(arena, value, .{});
-    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp", .{path});
+    const tmp = try std.fmt.allocPrint(arena, "{s}.{d}-{d}.tmp", .{ path, std.c.getpid(), tmp_seq.fetchAdd(1, .monotonic) });
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = text });
     try std.Io.Dir.renameAbsolute(tmp, path, io);
 }
@@ -1376,4 +1380,55 @@ test "update: tools run through posix_spawn with their output captured" {
     defer std.posix.sigaction(std.posix.SIG.HUP, &prev, null);
     try testing.expectEqual(@as(u8, 0), try runTool(arena, &.{ "/bin/sh", "-c", "kill -HUP $$; echo survived" }, .{ .path = out }));
     try expectMarker(tmp.dir, "out.txt", "survived\n");
+}
+
+test "update: concurrent writers of one JSON file never expose half a file nor fail each other" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpPath(&tmp, ".");
+    defer testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/cache.json", .{root});
+    defer testing.allocator.free(path);
+    const Doc = struct { text: []const u8 };
+    const Run = struct {
+        path: []const u8,
+        done: std.atomic.Value(u32) = .init(0),
+        failed: std.atomic.Value(u32) = .init(0),
+        torn: std.atomic.Value(u32) = .init(0),
+
+        fn write(self: *@This(), fill: u8) void {
+            defer _ = self.done.fetchAdd(1, .release);
+            var big: [64 * 1024]u8 = undefined;
+            @memset(&big, fill);
+            for (0..150) |_| {
+                var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+                defer arena.deinit();
+                writeJsonAtomic(arena.allocator(), testing.io, self.path, Doc{ .text = &big }) catch {
+                    _ = self.failed.fetchAdd(1, .monotonic);
+                };
+            }
+        }
+
+        fn read(self: *@This()) void {
+            while (self.done.load(.acquire) < 2) {
+                var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+                defer arena.deinit();
+                const text = std.Io.Dir.cwd().readFileAlloc(testing.io, self.path, arena.allocator(), .limited(1 << 20)) catch continue;
+                const doc = std.json.parseFromSliceLeaky(Doc, arena.allocator(), text, .{}) catch {
+                    _ = self.torn.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                if (doc.text.len != 64 * 1024) _ = self.torn.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var run: Run = .{ .path = path };
+    const threads = [_]std.Thread{
+        try std.Thread.spawn(.{}, Run.write, .{ &run, 'a' }),
+        try std.Thread.spawn(.{}, Run.write, .{ &run, 'b' }),
+        try std.Thread.spawn(.{}, Run.read, .{&run}),
+    };
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), run.failed.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), run.torn.load(.monotonic));
 }
