@@ -272,9 +272,9 @@ fn titleBase(buf: []u8, v: View) []const u8 {
     const text = switch (v.link) {
         .offline, .unauthorized, .metrics_off, .silent => std.fmt.bufPrint(buf, "", .{}),
         .up => if (v.decoding)
-            (if (v.live) |t| std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, t)}) else std.fmt.bufPrint(buf, "decode…", .{}))
+            (if (v.live) |t| std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, t)}) else std.fmt.bufPrint(buf, "replying…", .{}))
         else if (v.prefilling)
-            std.fmt.bufPrint(buf, "prefill…", .{})
+            std.fmt.bufPrint(buf, "reading prompt…", .{})
         else
             std.fmt.bufPrint(buf, "", .{}),
     };
@@ -989,9 +989,9 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
     const speed: ?f64 = if (in.decoding) in.live else in.last;
     h.stats[0] = .{
         .value = if (speed) |t| try a.dupe(u8, speedText(&tmp, t)) else dash,
-        .label = if (!in.decoding and in.last != null) "LAST TOK/S" else "DECODE TOK/S",
+        .label = if (!in.decoding and in.last != null) "LAST REPLY" else "REPLY TOK/S",
     };
-    h.stats[1] = .{ .value = if (in.last_prefill) |t| try a.dupe(u8, thousands(&tmp, @intFromFloat(@round(t)))) else dash, .label = "PREFILL TOK/S" };
+    h.stats[1] = .{ .value = if (in.last_prefill) |t| try a.dupe(u8, thousands(&tmp, @intFromFloat(@round(t)))) else dash, .label = "PROMPT TOK/S" };
     const mhz_ok = (in.gpu_mhz orelse 0) > 0;
     h.stats[2] = if (in.gpu_pct) |p| .{
         .value = fmt(a, "{d}%", .{p}),
@@ -1003,7 +1003,7 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
     var out = fmt(a, "sushi {s} on port {d}", .{ word, in.port });
     if (in.link == .offline and !in.starting) out = fmt(a, "sushi stopped, port {d}", .{in.port});
     if (in.model) |m| out = fmt(a, "{s}, {s}", .{ out, m });
-    if (speed) |t| out = fmt(a, "{s}, decode {d:.0} tokens per second", .{ out, t });
+    if (speed) |t| out = fmt(a, "{s}, reply speed {d:.0} tokens per second", .{ out, t });
     h.a11y = out;
     return h;
 }
@@ -2077,12 +2077,12 @@ test "header: a running model with throughput" {
     try std.testing.expectEqualStrings("Port 12345 · 48.8 GB in use", h.line2);
     try std.testing.expect(h.show_stats);
     try std.testing.expectEqualStrings("105", h.stats[0].value);
-    try std.testing.expectEqualStrings("DECODE TOK/S", h.stats[0].label);
+    try std.testing.expectEqualStrings("REPLY TOK/S", h.stats[0].label);
     try std.testing.expectEqualStrings("5,844", h.stats[1].value);
-    try std.testing.expectEqualStrings("PREFILL TOK/S", h.stats[1].label);
+    try std.testing.expectEqualStrings("PROMPT TOK/S", h.stats[1].label);
     try std.testing.expectEqualStrings("62%", h.stats[2].value);
     try std.testing.expectEqualStrings("GPU · 1,195 MHZ", h.stats[2].label);
-    try std.testing.expectEqualStrings("sushi running on port 12345, DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw, decode 105 tokens per second", h.a11y);
+    try std.testing.expectEqualStrings("sushi running on port 12345, DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw, reply speed 105 tokens per second", h.a11y);
 }
 
 test "header: idle shows the last request, gaps show a dash, an update is named" {
@@ -2094,7 +2094,7 @@ test "header: idle shows the last request, gaps show a dash, an update is named"
     });
     try std.testing.expectEqualStrings("1.5.0 · 1.5.1 available", h.version);
     try std.testing.expectEqualStrings("88.0", h.stats[0].value);
-    try std.testing.expectEqualStrings("LAST TOK/S", h.stats[0].label);
+    try std.testing.expectEqualStrings("LAST REPLY", h.stats[0].label);
     try std.testing.expectEqualStrings("–", h.stats[1].value);
     try std.testing.expectEqualStrings("–", h.stats[2].value);
     try std.testing.expectEqualStrings("GPU MHZ", h.stats[2].label);
@@ -2454,18 +2454,40 @@ test "icon and link: outline only when nothing answers, and a silent server is o
     try std.testing.expectEqual(Link.offline, linkFor(404));
 }
 
-test "title: live, last, prefill, idle, offline, unauthorized, metrics off" {
+test "title: live, last, reading prompt, idle, offline, unauthorized, metrics off" {
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("103 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 102.7 }));
     try std.testing.expectEqualStrings("42.7 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 42.66, .last = 9 }));
-    try std.testing.expectEqualStrings("decode…", title(&b, .{ .link = .up, .decoding = true }));
-    try std.testing.expectEqualStrings("prefill…", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
+    try std.testing.expectEqualStrings("replying…", title(&b, .{ .link = .up, .decoding = true }));
+    try std.testing.expectEqualStrings("reading prompt…", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .last = 88 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .last = 5, .decoding = true }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .unauthorized, .last = 5 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .metrics_off }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .silent }));
+}
+
+test "wording: nothing the menu shows uses a retired engineering word" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const retired = [_][]const u8{ "decode", "prefill", "writing reply", "prefix cache", "guess" };
+    var b: [64]u8 = undefined;
+    var shown: std.ArrayList([]const u8) = .empty;
+    for ([_]Link{ .up, .offline, .unauthorized, .metrics_off, .silent }) |link| for ([_]bool{ false, true }) |dec| for ([_]bool{ false, true }) |pre| for ([_]?f64{ null, 12.5 }) |live| {
+        try shown.append(arena.allocator(), try arena.allocator().dupe(u8, title(&b, .{ .link = link, .decoding = dec, .prefilling = pre, .live = live, .last = 9 })));
+    };
+    for ([_]bool{ false, true }) |dec| {
+        const h = try buildHeader(arena.allocator(), .{ .link = .up, .port = 1, .model = "m", .decoding = dec, .live = 105, .last = 90, .last_prefill = 5000, .gpu_mhz = 1195, .gpu_pct = 62 });
+        for (h.stats) |st| try shown.append(arena.allocator(), st.label);
+        try shown.append(arena.allocator(), h.a11y);
+    }
+    try std.testing.expect(shown.items.len > 40);
+    for (shown.items) |text| {
+        var lower: [256]u8 = undefined;
+        const low = std.ascii.lowerString(&lower, text);
+        for (retired) |word| try std.testing.expect(std.mem.indexOf(u8, low, word) == null);
+    }
 }
 
 test "menu: Start and Stop follow the server state" {

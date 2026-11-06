@@ -16,7 +16,7 @@ const port_row = @import("sushibar/port_row.zig");
 const usage =
     \\usage: sushibar [--port <n>]
     \\
-    \\Puts sushi in the menu bar: decode tok/s as the title, and a menu to start and stop a server,
+    \\Puts sushi in the menu bar: the reply speed in tok/s as the title, and a menu to start and stop a server,
     \\switch the port, update sushi, and open the dashboard, chat, models and settings pages.
     \\It detaches from the terminal.
     \\
@@ -1773,7 +1773,7 @@ fn refresh() void {
             const piece = std.fmt.bufPrint(removable_buf[rn..], "{d},", .{e.port}) catch break;
             rn += piece.len;
         };
-        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" note=\"{s}\" problem={d} pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" tip=\"{s}\" removable=\"{s}\" badge={d} models_link={d} last_model=\"{s}\" load=\"{s}\" load_on={d} why=\"{s}\"\n", .{
+        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" note=\"{s}\" problem={d} pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" tip=\"{s}\" removable=\"{s}\" badge={d} models_link={d} last_model=\"{s}\" load=\"{s}\" load_on={d} why=\"{s}\" stats=\"{s}|{s}|{s}\" a11y=\"{s}\"\n", .{
             tick_count,                 title,                 status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
             @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         note_shown,
@@ -1781,6 +1781,7 @@ fn refresh() void {
             tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_tip,
             update_button.label,        update_button.tip,     removable_buf[0..rn],   @intFromBool(shown_badge),
             @intFromBool(header.line1_models), g_last_model.get(), mb.label, @intFromBool(mb.enabled), mb.why,
+            header.stats[0].label,      header.stats[1].label, header.stats[2].label,  header.a11y,
         });
         if (tick_count >= test_polls) quit();
     }
@@ -2226,16 +2227,18 @@ fn renderBadge(dir: []const u8) void {
     const cases = [_]Case{
         .{ .name = "live", .icon = .color, .title = "105 tok/s" },
         .{ .name = "last", .icon = .color, .title = "88.0 tok/s" },
+        .{ .name = "replying", .icon = .color, .title = "replying…" },
+        .{ .name = "reading", .icon = .color, .title = "reading prompt…" },
         .{ .name = "badge", .icon = .color, .badge = true },
         .{ .name = "offline", .icon = .outline },
     };
     for (cases) |c| for ([_]bool{ false, true }) |dark| {
-        const box = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSBox"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = 104, .h = 24 }});
+        const box = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSBox"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = 168, .h = 24 }});
         objc.msg(void, box, "setBoxType:", .{@as(isize, 4)});
         objc.msg(void, box, "setBorderWidth:", .{@as(f64, 0)});
         objc.msg(void, box, "setContentViewMargins:", .{objc.NSSize{ .width = 0, .height = 0 }});
         objc.msg(void, box, "setFillColor:", .{objc.msg(objc.id, objc.class("NSColor"), "colorWithWhite:alpha:", .{ @as(f64, if (dark) 0.16 else 0.92), @as(f64, 1) })});
-        const button = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 4, .y = 0, .w = 96, .h = 24 }});
+        const button = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 4, .y = 0, .w = 160, .h = 24 }});
         objc.msg(void, button, "setBordered:", .{false});
         objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
         objc.msg(void, button, "setImage:", .{icons[@intFromEnum(c.icon)]});

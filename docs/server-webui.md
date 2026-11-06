@@ -74,6 +74,9 @@ and the page tooltip share them.
   Prefer the term users know from other LLM apps (prompt cache, speculative decoding, KV cache, vision) over an invented
   phrase; invent only when no common term exists.
   Where the full form would wrap and read worse (the eight-tile row), the short form (`tok/s`) is allowed; its tip spells it out.
+  One concept, one label: a chart's name is the same in its title, its card and the Charts picker (guard: `chartAudit`),
+  a request step reads Reading prompt / Replying / Cached in the Sessions chips and the compact status, in sentence case.
+  sushibar's menu uses the same words (REPLY TOK/S, PROMPT TOK/S, `replying…`, `reading prompt…`).
   Anything renamed from an engineering term ends its tip with `Technical name: …` through `data-term` (a settings key
   adds its `model-settings.json` key and launch flag; a label that is already the common term, such as KV cache
   precision, keeps only the key and flag): the term is plain text in a muted child of `#tip`, never in a label.

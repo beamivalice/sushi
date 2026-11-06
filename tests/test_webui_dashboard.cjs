@@ -113,7 +113,7 @@ function installStubs(config) {
           const hist = (count, sum) => ({ count, sum, bounds: [1], bucket_counts: [count, count] });
           return json({
             counters: { prefill_tokens_total: 40000 + 12000 * done, generation_tokens_total: 9000 },
-            gauges: { requests_running: stub.compact === 'decode' ? 1 : 0, requests_waiting: 0, memory_mb: 106787, mlx_active_bytes: 113 * 2 ** 30, mlx_cache_bytes: 2 ** 28 },
+            gauges: { requests_running: stub.compact === 'idle' ? 0 : 1, requests_prefilling: stub.compact === 'prefill' ? 1 : 0, requests_waiting: 0, memory_mb: 106787, mlx_active_bytes: 113 * 2 ** 30, mlx_cache_bytes: 2 ** 28 },
             histograms: { prefill_time_seconds: hist(15 + done, 60 + 10 * done), decode_time_seconds: hist(15, 180) }, sessions: [],
             history: { interval_ms: 2000, capacity: 1800, started_ms: now - 3 * 3600e3 - 12 * 60e3, samples: samples.filter((r) => r[0] > since) },
             requests: done ? (stub.reqAt ??= now - 1000) > since ? [{ request_id: 12, model: 'org/test-model', t_ms: stub.reqAt, prompt_tokens: 12000, cached_tokens: 0, prefill_seconds: 10, generated_tokens: 0, decode_seconds: 0, outcome: 'ok' }] : [] : [],
@@ -786,7 +786,10 @@ async function chartAudit(browser) {
     await page.keyboard.press('Tab');
     assert.equal(await page.isVisible('#dashTip'), false, 'blur hides it');
     assert.match(await textOf(page, 'dashHE2e'), /No finished request yet/, 'an empty histogram says so instead of drawing nothing');
-    assert.equal(await page.getByRole('group', { name: 'Cache reuse' }).count(), 1, 'each chart card is a named group');
+    assert.equal(await page.getByRole('group', { name: 'Prompt cache reuse' }).count(), 1, 'each chart card is a named group');
+    const named = await page.$$eval('#dashCharts .chart[role="group"]', (cards) => cards.map((c) => [c.getAttribute('aria-label'), c.querySelector('h2 [data-tip]').textContent.replace(/ \([^)]*\)$/, '')]));
+    assert.ok(named.length >= 15, `chart cards (${named.length})`);
+    assert.deepEqual(named.filter(([a, t]) => a !== t), [], 'a chart has one name: the picker, the card and its title agree');
     assert.deepEqual(errors, []);
     await context.close();
   }
@@ -853,6 +856,7 @@ async function chartAudit(browser) {
     await page.waitForFunction(() => /Replying/.test(document.getElementById('dashTip').textContent));
     assert.match(await page.textContent('#dashTip'), /Technical name:\s*decode/, 'Replying is decode');
     assert.deepEqual(await page.$$eval('#dashSessions .phase', (ns) => ns.map((n) => n.textContent)), ['Reading prompt', 'Replying'], 'the step chips use the usual words');
+    assert.deepEqual(await page.$$eval('#dashSessions .phase', (ns) => ns.map((n) => n.innerText)), ['Reading prompt', 'Replying'], 'and show them in sentence case');
     const titles = await page.$$eval('#dashCharts .chart h2 [data-tip]', (ns) => ns.map((n) => n.textContent));
     for (const t of ['Draft acceptance by method', 'Tokens verified per round', 'Why requests weren\'t batched', 'Prompt cache reuse', 'Prompt cache storage', 'Prompt cache writes']) assert.ok(titles.includes(t), `chart ${t} (${titles})`);
     assert.match(await page.textContent('[data-chart="memsplit"] .legend'), /in use.*reusable cache/, 'the memory split legend');
@@ -1235,7 +1239,7 @@ async function main() {
       const foot = () => textOf(page, 'dashWritesFoot');
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       // The rate needs two polls and the ratio needs /props: wait for both, then read one consistent render.
-      await page.waitForFunction(() => /Writing .*\/s, [\d.]+x written per byte/.test(document.getElementById('dashWritesFoot').innerText), null, { timeout: 15000 });
+      await page.waitForFunction(() => /SSD writes .*\/s, [\d.]+x written per byte/.test(document.getElementById('dashWritesFoot').innerText), null, { timeout: 15000 });
       const card = await rows();
       for (const label of ['Attention memory', 'Restore points', 'Long-context index', 'Draft state', 'Sliding-window points', 'Indexes and token lists', 'Failed or dropped']) {
         assert.ok(label in card, `the chart has a ${label} bar`);
@@ -1257,7 +1261,7 @@ async function main() {
       assert.equal(new Set(cards.map((card) => card.canvas)).size, cards.length, 'every card draws on its own canvas');
       assert.equal(await page.evaluate(() => /\bgeneration\b/i.test(document.getElementById('dashPanel').textContent)), false, 'the dashboard says decode, not generation');
       // The Advanced view draws prefill and decode the way the Compact view does: one dot per finished request, decode on its own scale.
-      assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart .sub')].map((e) => e.textContent).slice(0, 2)), ['one point per finished request', 'while writing']);
+      assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart .sub')].map((e) => e.textContent).slice(0, 2)), ['one point per finished request', 'while replying']);
       await page.waitForFunction((id) => (window.__axis[id] ?? []).includes('2k'), cards[0].canvas, { timeout: 15000 });
       await page.waitForFunction((id) => (window.__axis[id] ?? []).length > 5, cards[1].canvas, { timeout: 15000 });
       const axis = await page.evaluate(() => window.__axis.dashCMem ?? []);
@@ -1311,7 +1315,7 @@ async function main() {
       assert.ok(strip.h < 70, `a long model name does not grow the strip (${strip.h} px)`);
       assert.equal(await page.getAttribute('#dashCmModel', 'title'), name, 'the full name rides the title');
       assert.equal(await page.evaluate(() => getComputedStyle(document.getElementById('dashCmModel')).textOverflow), 'ellipsis');
-      assert.equal(await text('dashCmState'), compact === 'decode' ? 'Writing reply' : 'Idle');
+      assert.equal(await text('dashCmState'), compact === 'decode' ? 'Replying' : 'Idle');
 
       const tiles = await page.evaluate(() => [...document.querySelectorAll('.tiles-cmp .tile')].map((t) => { const r = t.getBoundingClientRect(); return { h: Math.round(r.height), y: Math.round(r.y) }; }));
       assert.equal(tiles.length, 5);
@@ -1353,6 +1357,14 @@ async function main() {
         charts: [...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => Math.round(c.getBoundingClientRect().x)) }));
       assert.ok(narrow.strip < 70 && narrow.wide <= 0 && narrow.tiles === 2 && narrow.firstRow === 2, `390 px stacks without overflow (${JSON.stringify(narrow)})`);
       assert.equal(new Set(narrow.charts).size, 1, 'the charts stack');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'compact', compact: 'prefill' });
+      await page.waitForFunction(() => document.getElementById('dashCmState').textContent === 'Reading prompt', null, { timeout: 15000 });
+      assert.match(await page.innerText('#dashCmReqS'), /reading prompt$/, 'the request tile uses the same words');
       assert.deepEqual(errors, []);
       await context.close();
     }

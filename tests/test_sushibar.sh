@@ -126,6 +126,8 @@ check "the Port data lists the running server, checked" "$(yes_if 'grep -q "port
 check "Stop ended the server it started" "$(yes_if '! kill -0 "$SRVPID" 2>/dev/null')"
 check "the last poll reads not running again" "$(yes_if 'tail -n 1 "$LOG" | grep -q "poll 16 .*Port '"$PORT"': not running"')"
 check "a stopped server leaves no pid file entry alive" "$(yes_if '[ ! -f "$HOME/.sushi/sushibar-server-'"$PORT"'.pid" ]')"
+check "the stat tiles read the web UI's words" "$(yes_if 'grep -q "stats=\"REPLY TOK/S|PROMPT TOK/S|GPU MHZ\"" "$LOG"')"
+check "nothing the menu prints uses a retired word (decode, prefill, writing reply, prefix cache, guess)" "$(yes_if '! grep "^sushibar: poll " "$LOG" | grep -qiE "decode|prefill|writing reply|prefix cache|guess"')"
 
 echo "== a sushi sushibar did not start, on port $FPORT =="
 start_foreign() {
