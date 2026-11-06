@@ -1004,6 +1004,19 @@ async function dashboardV2(browser) {
     await context.close();
   }
   {
+    // A meaning keeps its colour across cards: waiting is the same muted grey in Requests as in Response time.
+    const h1 = (count, sum) => ({ count, sum, bounds: [0.1, 1, 10], bucket_counts: [0, count, count, count] });
+    const specData = { histograms: { time_to_first_token_seconds: h1(2, 2), prefill_time_seconds: h1(2, 1), decode_time_seconds: h1(2, 4), e2e_request_latency_seconds: h1(2, 6) } };
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData });
+    await page.waitForSelector('[data-chart="latency"] .parts span');
+    const swatch = (sel, word) => page.$$eval(sel, (spans, w) => spans.filter((s) => new RegExp(`^${w}`, 'i').test(s.textContent.trim())).map((s) => getComputedStyle(s.querySelector('i')).backgroundColor), word);
+    const muted = await page.evaluate(() => { const i = document.createElement('i'); i.style.color = 'var(--text-3)'; document.body.append(i); const c = getComputedStyle(i).color; i.remove(); return c; });
+    assert.deepEqual(await swatch('[data-chart="latency"] .parts span', 'Waiting'), [muted], 'Response time draws waiting in --text-3');
+    assert.deepEqual(await swatch('[data-chart="requests"] .legend span', 'waiting'), [muted], 'and so does the Requests chart');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
     // A focused Cancel names one request: a poll that puts another request in its row never hands it that request,
     // and a poll that moves its request keeps the focus on it.
     const row = (id, phase) => ({ request_id: id, model: 'org/m', phase, context_length: 8192, context_tokens: 100, cached_tokens: 0, generated_tokens: 0, max_tokens: 100, elapsed_seconds: 1, state_bytes: 1 << 20 });
