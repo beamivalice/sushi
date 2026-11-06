@@ -204,12 +204,15 @@ the mean KLD to the first EOS against the BF16 teacher.
 |---|---|---|---|---|---|---|---|---|---|---|
 | Sushi-2bpw | 0.0188 | 0.0218 | 0.0482 | 0.0545 | 0.2227 | 0.0909 | 0.1118 | 0.0350 | 0.0673 | 91.90% |
 | Sushi-2.6bpw | 0.0090 | 0.0088 | 0.0255 | 0.0266 | 0.1445 | 0.0380 | 0.0471 | 0.0155 | 0.0342 | 94.63% |
+| Sushi-STQ-2.75bpw 1.0 | 0.0059 | 0.0086 | 0.0239 | 0.0188 | 0.0987 | 0.0260 | 0.0576 | 0.0196 | 0.0295 | 94.73% |
+| Sushi-STQ-2.75bpw 2.0 | 0.0050 | 0.0063 | 0.0198 | 0.0156 | 0.0948 | 0.0226 | 0.0438 | 0.0164 | 0.0250 | 94.73% |
 | Sushi-4bpw | 0.0042 | 0.0030 | 0.0128 | 0.0116 | 0.0490 | 0.0137 | 0.0187 | 0.0074 | 0.0135 | 96.14% |
 
-- Sushi-STQ-2.75bpw (scored on the released v1.3.0 binary, the same settings and BF16 teacher): `all` 0.0295, top-1
-  94.73%, against 0.0342 and 94.63% for Sushi-2.6bpw; its 16x512 first-EOS reading is 0.0692 and 92.76% (fixture and KV width not recorded; the
-  [release gate](quality-kld.md#release-gate) reads 0.0659 on the code8-prose8 fixture at `--kv-quant 8`). Peak GPU memory
-  while scoring 49.6 GB. The per-category cells are not in this table.
+- Sushi-STQ-2.75bpw: revision 1.0 scored on the 1.5.1 release binary `399895f6`, revision 2.0 (6-bit STQ trunk, published
+  2026-11-06) on `bd1afcde` and again on its staged upload with 1.5.1 (same value), same settings and BF16 teacher.
+  Peak GPU memory while scoring 49.5 and 48.5 GB. Revision 1.0's 16x512 first-EOS reading is 0.0692 and 92.76% (fixture
+  and KV width not recorded); the [release gate](quality-kld.md#release-gate) reads each on the code8-prose8 fixture at
+  `--kv-quant 8`.
 - Raw wikitext is the hardest category for every pack, 3-4x its `all`. The prose-only standard reading measures each pack
   where it is weakest.
 - Code (thinking off) and math (thinking on, low effort) are the easiest. At 2bpw, story loses 6x and multilingual 5x

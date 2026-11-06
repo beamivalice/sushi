@@ -173,7 +173,7 @@ native tree.
 | pack | directory under the models root | notes |
 |---|---|---|
 | Sushi 2bpw | `Qwen3.8-Flash-Next-Sushi-2bpw` | served, 48 GB tier (32 GB streamed) |
-| Sushi STQ 2.75bpw | `Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw` | served, 64 GB tier, the default `qwen3.8-flash-next` |
+| Sushi STQ 2.75bpw | `Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw` | served, 64 GB tier, the default `qwen3.8-flash-next`; pack revision 2.0 (6-bit STQ trunk) since 2026-11-06 |
 | Sushi 4bpw | `Qwen3.8-Flash-Next-Sushi-4bpw` | served, 96 GB tier |
 | affine 4/8 control | `Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit` | the control column in every table |
 | bf16 source | `Qwen/Qwen3.8-Flash-Next` | the KLD teacher; streams (335 GB) |

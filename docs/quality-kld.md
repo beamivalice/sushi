@@ -209,6 +209,8 @@ fixture is a regression gate only: without the other categories its mean leans o
 
 DeepSeek moved to pack revision 2.0 after 1.5.0; the 1.5.0 binary read it at 0.210305, 86.46% (`--ssd-budget-gb 64`), so
 1.5.1 is within 0.6%. Qwen 1.5.1 equals 1.5.0 to the last digit.
+The published Qwen pack moved to revision 2.0 (6-bit STQ trunk) after 1.5.1: on the 1.5.1 code (`88c0173a`, the same
+flags) it reads 0.061834, 92.30%, 7061 positions, the baseline for the next gate.
 
 The Qwen 1.5.0 reading equals the 1.4.0 Homebrew binary's on the same settings to the last digit; the 0.0692 / 92.76%
 quoted for this pack in [qwen4-kld](qwen4-kld.md) was taken on settings it does not name.

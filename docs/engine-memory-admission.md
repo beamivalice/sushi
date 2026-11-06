@@ -346,6 +346,8 @@ with the tier up the request holds 3 checkpoints ([above](#bill-checkpoints)). B
 24425 and 1080 more (the probe at `eab60060`, reproduced at 4b919abb). Its max-context column is the largest multiple of 8192 tokens whose
 weights + 512-rung bill + 256 MiB spare fits each wired limit, capped at 1M (kv8 and kv4); the 48 and 64 GB rows run at
 `--qwen-gdn 16`, the 96 and 128 GB rows at the f32 default.
+The Sushi-STQ-2.75bpw row (pack revision 2.0) is the 1.5.1 bill over its booted `active_bytes` (48,219,896,252); the
+other rows predate that bill and on today's code would read slightly more context (revision 1.0: 432k / 720k at 64 GB).
 
 The ladder widens the chunk until the bill nearly fills what is available, so the spare in a row is small by
 construction; "largest admitted" (2000-token steps) is where even the 512 rung stops fitting. The ceiling assumes
