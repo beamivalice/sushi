@@ -202,10 +202,13 @@ first EOS, against the previous release's reading (within ~1%). The fixture and 
 Public numbers (pack cards, the README) are the eight-category reading ([below](#eight-category)). A 16-prompt prose
 fixture is a regression gate only: without the other categories its mean leans on raw prose, so it is never reported.
 
-| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) |
-|---|---|---|---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | `--ssd-budget-gb 110` | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions |
+| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) | 1.5.1 (`399895f6`) |
+|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions | 0.065924, 91.94%, 7061 positions |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | `--ssd-budget-gb 110` | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 |
+
+DeepSeek moved to pack revision 2.0 after 1.5.0; the 1.5.0 binary read it at 0.210305, 86.46% (`--ssd-budget-gb 64`), so
+1.5.1 is within 0.6%. Qwen 1.5.1 equals 1.5.0 to the last digit.
 
 The Qwen 1.5.0 reading equals the 1.4.0 Homebrew binary's on the same settings to the last digit; the 0.0692 / 92.76%
 quoted for this pack in [qwen4-kld](qwen4-kld.md) was taken on settings it does not name.
