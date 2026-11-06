@@ -808,11 +808,12 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
         return false;
     }
+    const effort_snap = effort_mod.snapshot();
     var effort_cfg: ?request_policy.ReasoningEffort = null;
     if (output_cfg.effort) |word| {
-        const served_arms = effort_mod.servedArms(config.model_type);
+        const served_arms = effort_mod.servedArmsIn(&effort_snap, config.model_type);
         const cfg = reasoningEffortFromWord(word, effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
-            const msg = try effortRefusalFor(allocator, lm, word);
+            const msg = try effortRefusalFor(allocator, lm, word, &effort_snap);
             defer allocator.free(msg);
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
             return false;
@@ -821,7 +822,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         effort_cfg = cfg;
     }
     // An absent `thinking` object takes the arch default; a present one decides (`request_policy.anthropicThinking`).
-    const thinking = request_policy.anthropicThinking(root, effort_cfg, config);
+    const thinking = request_policy.anthropicThinking(root, effort_cfg, config, &effort_snap);
     var enable_thinking = thinking.enable;
     const reasoning_budget = thinking.budget;
     const effort_word = thinking.template;

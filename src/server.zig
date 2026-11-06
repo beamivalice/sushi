@@ -7927,9 +7927,10 @@ pub fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const served_arms = effort_mod.servedArms(config.model_type);
+    const effort_snap = effort_mod.snapshot();
+    const served_arms = effort_mod.servedArmsIn(&effort_snap, config.model_type);
     const effort_cfg = request_policy.parseReasoningEffort(root, request_policy.effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
-        const msg = try request_policy.effortRefusalFor(allocator, lm, root.get("reasoning_effort").?.string);
+        const msg = try request_policy.effortRefusalFor(allocator, lm, root.get("reasoning_effort").?.string, &effort_snap);
         defer allocator.free(msg);
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
         return;
@@ -7938,7 +7939,7 @@ pub fn handleChatCompletions(
     defer if (effort_notice) |n| n.deinit(allocator);
     defer request_policy.clearEffortNotice(stream);
     if (effort_cfg) |e| effort_notice = try request_policy.holdEffortNotice(allocator, stream, request_policy.effortModelName(lm), e);
-    const thinking = request_policy.chatThinking(root, effort_cfg, config);
+    const thinking = request_policy.chatThinking(root, effort_cfg, config, &effort_snap);
     var enable_thinking = thinking.enable;
     if (!try request_policy.checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
     // Reasoning budget (max tokens in <think> block, -1 = unlimited).

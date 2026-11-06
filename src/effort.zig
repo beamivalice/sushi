@@ -13,8 +13,13 @@ pub var think_effort_flag: ?Effort = null;
 
 /// The arm `--think` selects on this arch from its served table; null leaves the model on its own default.
 pub fn thinkFlagArm(model_type: []const u8) ?EffortArm {
+    const snap = snapshot();
+    return thinkFlagArmIn(&snap, model_type);
+}
+
+pub fn thinkFlagArmIn(snap: *const Snapshot, model_type: []const u8) ?EffortArm {
     const e = think_effort_flag orelse return null;
-    const arms = servedArms(model_type) orelse return null;
+    const arms = servedArmsIn(snap, model_type) orelse return null;
     return armForWord(arms.slice(), @tagName(e));
 }
 
@@ -195,7 +200,12 @@ pub fn effortArms(model_type: []const u8) ?[]const EffortArm {
 
 /// The arms a request is served from now: the family's merged table, MiMo's on/off, null for an inherited arch.
 pub fn servedArms(model_type: []const u8) ?Arms {
-    if (Family.of(model_type)) |f| return table(f).offeredArms();
+    const snap = snapshot();
+    return servedArmsIn(&snap, model_type);
+}
+
+pub fn servedArmsIn(snap: *const Snapshot, model_type: []const u8) ?Arms {
+    if (Family.of(model_type)) |f| return merge(f, snap[@intFromEnum(f)]).offeredArms();
     const built = effortArms(model_type) orelse return null;
     var out: Arms = .{ .len = built.len };
     @memcpy(out.buf[0..built.len], built);
@@ -439,13 +449,27 @@ pub fn publishedEdits(f: Family) Edits {
     return store[@intFromEnum(f)];
 }
 
+/// Every family's edits in one read: a request resolves against one table throughout while a save publishes another.
+pub const Snapshot = [families.len]Edits;
+
+pub fn snapshot() Snapshot {
+    lockStore();
+    defer store_lock.unlock();
+    return store;
+}
+
 pub fn table(f: Family) Table {
     return merge(f, publishedEdits(f));
 }
 
 /// The default word the file names for this arch's family, if it names one.
 pub fn fileDefault(model_type: []const u8) ?Effort {
-    return publishedEdits(Family.of(model_type) orelse return null).default;
+    const snap = snapshot();
+    return fileDefaultIn(&snap, model_type);
+}
+
+pub fn fileDefaultIn(snap: *const Snapshot, model_type: []const u8) ?Effort {
+    return snap[@intFromEnum(Family.of(model_type) orelse return null)].default;
 }
 
 /// `none` is an alias of off. No served table lists `minimal`; inherited arches

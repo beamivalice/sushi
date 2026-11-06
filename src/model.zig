@@ -1074,9 +1074,14 @@ pub const ModelConfig = struct {
     /// vendor documents thinking-on AND the shipped template agrees — never
     /// inferred from "the template mentions enable_thinking".
     pub fn defaultEnableThinking(self: *const ModelConfig) bool {
-        if (effort_mod.thinkFlagArm(self.model_type)) |arm| return arm.effort != .off;
+        const snap = effort_mod.snapshot();
+        return self.defaultEnableThinkingIn(&snap);
+    }
+
+    pub fn defaultEnableThinkingIn(self: *const ModelConfig, snap: *const effort_mod.Snapshot) bool {
+        if (effort_mod.thinkFlagArmIn(snap, self.model_type)) |arm| return arm.effort != .off;
         // The operator's default word outranks the checkpoint's declaration, as a flag does.
-        if (effort_mod.fileDefault(self.model_type)) |e| return e != .off;
+        if (effort_mod.fileDefaultIn(snap, self.model_type)) |e| return e != .off;
         // The checkpoint's own declared default outranks the arch allowlist:
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
@@ -2073,47 +2078,63 @@ pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next
 
 /// The arm a request naming no effort takes when `--think` is not given: its family table's default word. A Qwen
 /// checkpoint that declares thinking off keeps no default word unless the file names one.
-fn tableDefaultArm(config: *const ModelConfig) ?effort_mod.EffortArm {
+fn tableDefaultArm(config: *const ModelConfig, snap: *const effort_mod.Snapshot) ?effort_mod.EffortArm {
     const family = effort_mod.Family.of(config.model_type) orelse return null;
-    const edits = effort_mod.publishedEdits(family);
+    const edits = snap[@intFromEnum(family)];
     if (edits.default == null and config.isQwen4() and config.gen_enable_thinking == false) return null;
     const t = effort_mod.merge(family, edits);
     const row = t.row(t.default);
     return .{ .effort = t.default, .budget = row.cap, .sends = row.sends };
 }
 
-fn defaultArm(config: *const ModelConfig) ?effort_mod.EffortArm {
-    return effort_mod.thinkFlagArm(config.model_type) orelse tableDefaultArm(config);
+fn defaultArm(config: *const ModelConfig, snap: *const effort_mod.Snapshot) ?effort_mod.EffortArm {
+    return effort_mod.thinkFlagArmIn(snap, config.model_type) orelse tableDefaultArm(config, snap);
 }
 
 /// The thinking cap of a request naming no effort: its default word's (`--think`'s, else the table's); -1 = none.
 pub fn defaultThinkBudget(config: *const ModelConfig) i32 {
-    const arm = defaultArm(config) orelse return -1;
+    const snap = effort_mod.snapshot();
+    return defaultThinkBudgetIn(config, &snap);
+}
+
+pub fn defaultThinkBudgetIn(config: *const ModelConfig, snap: *const effort_mod.Snapshot) i32 {
+    const arm = defaultArm(config, snap) orelse return -1;
     return arm.budget orelse -1;
 }
 
 pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
-    return if (defaultArm(config)) |arm| @tagName(arm.effort) else null;
+    const snap = effort_mod.snapshot();
+    return defaultEffortWordIn(config, &snap);
+}
+
+pub fn defaultEffortWordIn(config: *const ModelConfig, snap: *const effort_mod.Snapshot) ?[]const u8 {
+    return if (defaultArm(config, snap)) |arm| @tagName(arm.effort) else null;
 }
 
 /// What the template's `reasoning_effort` receives for a request naming no effort (`effort.templateValue`); an `off`
 /// default sends nothing, so a request it does not keep off renders no level it did not ask for.
 pub fn defaultTemplateEffort(config: *const ModelConfig) ?[]const u8 {
-    const arm = defaultArm(config) orelse return null;
+    const snap = effort_mod.snapshot();
+    return defaultTemplateEffortIn(config, &snap);
+}
+
+pub fn defaultTemplateEffortIn(config: *const ModelConfig, snap: *const effort_mod.Snapshot) ?[]const u8 {
+    const arm = defaultArm(config, snap) orelse return null;
     return if (arm.effort == .off) null else effort_mod.templateValue(arm);
 }
 
 /// The default word (`--think`'s, else the table's) is `off`.
-pub fn defaultEffortIsOff(config: *const ModelConfig) bool {
-    const arm = defaultArm(config) orelse return false;
+pub fn defaultEffortIsOff(config: *const ModelConfig, snap: *const effort_mod.Snapshot) bool {
+    const arm = defaultArm(config, snap) orelse return false;
     return arm.effort == .off;
 }
 
 /// The word a request naming no effort runs at (`/v1/models` `default_reasoning_effort`).
 pub fn defaultReasoningEffort(config: *const ModelConfig) ?[]const u8 {
-    const arms = effort_mod.servedArms(config.model_type) orelse return null;
-    if (defaultEffortWord(config)) |w| return w;
-    if (!config.defaultEnableThinking()) return "off";
+    const snap = effort_mod.snapshot();
+    const arms = effort_mod.servedArmsIn(&snap, config.model_type) orelse return null;
+    if (defaultEffortWordIn(config, &snap)) |w| return w;
+    if (!config.defaultEnableThinkingIn(&snap)) return "off";
     // Silence renders the cheapest thinking level (`chat.qwen38EffortFor`).
     for (arms.slice()) |a| if (a.effort != .off and effort_mod.isListed(a)) return @tagName(a.effort);
     return null;

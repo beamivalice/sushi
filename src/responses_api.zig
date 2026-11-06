@@ -557,15 +557,16 @@ fn handleResponsesInner(
     // Budget precedence as on chat: reasoning_budget_tokens > the effort word's cap.
     var reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"));
     const effort_named = reasoning_cfg.effort != null;
-    reasoning_cfg.effort = request_policy.responsesEffortWord(root, reasoning_cfg, config);
+    const effort_snap = effort_mod.snapshot();
+    reasoning_cfg.effort = request_policy.responsesEffortWord(root, reasoning_cfg, config, &effort_snap);
     var effort_notice: ?EffortNotice = null;
     defer if (effort_notice) |n| n.deinit(allocator);
     defer clearEffortNotice(stream);
     var word_cfg: ?request_policy.ReasoningEffort = null;
     if (reasoning_cfg.effort) |word| {
-        const served_arms = effort_mod.servedArms(config.model_type);
+        const served_arms = effort_mod.servedArmsIn(&effort_snap, config.model_type);
         const cfg = reasoningEffortFromWord(word, effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
-            const msg = try effortRefusalFor(allocator, lm, word);
+            const msg = try effortRefusalFor(allocator, lm, word, &effort_snap);
             defer allocator.free(msg);
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
             return;
@@ -574,7 +575,7 @@ fn handleResponsesInner(
         effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
         word_cfg = cfg;
     }
-    const thinking = request_policy.responsesThinking(root, reasoning_cfg.enable, word_cfg, effort_named, config);
+    const thinking = request_policy.responsesThinking(root, reasoning_cfg.enable, word_cfg, effort_named, config, &effort_snap);
     var enable_thinking = thinking.enable;
     const reasoning_budget: i32 = thinking.budget;
     const template_effort = thinking.template;

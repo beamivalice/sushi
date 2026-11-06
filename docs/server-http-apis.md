@@ -21,7 +21,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   receives) and `cap` (thinking tokens; null = no cap), plus a default word. The built-in tables
   (`effort.builtin`) are the engine's own; `model-settings.json` holds only the fields an operator changed and the
   merge is field by field (`effort.merge`; [Effort tables](#effort-tables)). Every request resolves its word against
-  the served table once (`effort.servedArms` → `effort.resolve`) on chat, Responses, Anthropic, `--think` and the
+  the served table once (`effort.servedArms` → `effort.resolve`; a request reads every family's table in one
+  `effort.snapshot` and resolves word, default, cap and refusal text against it) on chat, Responses, Anthropic, `--think` and the
   REPL's `/think` alike; the arm's `sends` is what the render passes (`ReasoningEffort.sends`,
   `model.defaultTemplateEffort`), its cap the decode-time bound. A word the table does not offer is refused with the
   accepted list. **Folds** are a row state of the built-in tables only: Qwen `high` and `max` → `xhigh`, GLM `medium`
