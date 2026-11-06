@@ -43,7 +43,7 @@ local copy without contacting Hugging Face.
 
 `sushi list` shows each pack's size, whether it is downloaded and whether this Mac meets its tier, and marks the one it
 recommends. A Mac's tier is its installed RAM in whole GB. Below a pack's tier it reads `may stream (--ssd-budget-gb)`:
-it may still run streamed ([README, Streaming](../README.md#streaming)), with no promise.
+it may still run streamed ([Choosing a pack and streaming](usage-streaming.md)), with no promise.
 
 | pack | runs in memory from | recommended from |
 |---|---:|---:|

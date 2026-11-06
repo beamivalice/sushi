@@ -7,11 +7,12 @@ A local AI server for low-bit, very high quality Sushi quants, using custom Sush
 ## Model support list
 
 Usage see [recommended launch commands and coding agent usage](docs/usage.md).
+Which pack suits your Mac, and running a bigger one from the SSD: [Choosing a pack and streaming](docs/usage-streaming.md).
 
 * [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (pack revision 2.0, requires 96 GB+ and sushi 1.5.0 or later, experts [streamed](#streaming), text and image input)
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming))
 * [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (pack revision 2.0, requires 64 GB+ and sushi 1.5.1 or later)
-* [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
+* [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+, or 64 GB [streamed](#streaming))
 * [GLM-5.3-Flash-Sushi-2bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2bpw) (requires 96 GB+, text, image and video input)
 * [GLM-5.3-Flash-Sushi-2.4bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2.4bpw) (requires 128 GB, text, image and video input)
 
@@ -81,16 +82,10 @@ less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 480k / 800k (Sushi-ST
 
 ## Streaming
 
-Any Sushi pack runs on a Mac with less memory than its weights. `--ssd-budget-gb N` keeps N GiB resident (the trunk,
-the speculative head and a cache of routed experts) and reads the other experts from the SSD, with the same replies as
-a resident load. A larger N caches more experts and reads the SSD less. The context's KV or state is billed on top, so
-N plus the context must fit under the GPU limit.
-
-| Mac | pack | `--ssd-budget-gb` | GPU limit (MB) | context | decode at 4k |
-|---|---|---:|---:|---|---|
-| 32 GB | Qwen3.8-Flash-Next-Sushi-2bpw | 18 | 27,000 | 66k | ~20 tok/s |
-| 96 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 80 | 93,000 | 1M | 45 code / 45 prose |
-| 128 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 108 (or 96) | 125,000 | 1M | 77 code / 49 prose |
+A pack bigger than your Mac's GPU memory can still run: `--ssd-budget-gb N` keeps N GiB of the model on the GPU and
+reads the rest from the SSD as it runs, with the same answers and lower speed. Which pack to pick for your Mac, what
+the GPU limit is, how to size the budget and when streaming is worth it, with measured examples:
+[Choosing a pack and streaming](docs/usage-streaming.md).
 
 ## Serve on your network
 
