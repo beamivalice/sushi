@@ -28,7 +28,7 @@ sushi_profile_flags() {
             echo "$common $slots --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off$depth"
             ;;
         ram) echo "$common $slots --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefix-cache-disk off" ;;
-        knobs) echo "$common --think medium --reasoning-budget 1 --think-penalty ${SUSHI_TEST_THINK_PENALTY:-2} --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off" ;;
+        knobs) echo "$common --think medium --think-penalty ${SUSHI_TEST_THINK_PENALTY:-2} --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off" ;;
         *) echo "sushi_profile_flags: unknown profile '$profile'" >&2; return 1 ;;
     esac
 }

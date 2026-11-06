@@ -191,7 +191,6 @@ fn printUsage(io: std.Io) void {
         \\  --timeout <n>       Stall timeout in seconds: abort a request after n seconds
         \\                      WITHOUT producing a token (default: 300, 0=none). A request
         \\                      that keeps generating never times out, however long it runs.
-        \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --preserve-thinking on|off  Templates that read `preserve_thinking` (Qwen3.8)
         \\                      keep every turn's thinking (on, the template default)
         \\                      or only the latest user turn's (off). Request
@@ -592,7 +591,6 @@ pub fn main(init: std.process.Init) !void {
     var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
     var timeout: u32 = 300; // seconds, 0 = no timeout
-    var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
     var vision = false;
     var drafter_dir: ?[]const u8 = null; // Path to a DFlash2 assistant checkpoint
@@ -815,9 +813,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = flagInt(u32, "--max-mtp-ctx", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
-            i += 1;
-            reasoning_budget = flagInt(i32, "--reasoning-budget", args[i], -1);
         } else if (std.mem.eql(u8, args[i], "--log-level") and i + 1 < args.len) {
             i += 1;
             const level = log.Level.fromString(args[i]) orelse {
@@ -1079,6 +1074,7 @@ pub fn main(init: std.process.Init) !void {
         repl_after_serve = false;
     }
     effort_mod.think_effort_flag = if (run_opts.think == .effort) run_opts.think.effort else null;
+    model_settings_mod.loadEffortTables(allocator, io);
     const prompt_body = if (prompt) |text| try cli_mod.buildPromptBody(allocator, text, run_opts.think, .{ .max_tokens = max_tokens, .temperature = temperature, .top_p = top_p_flag orelse 1.0, .top_k = top_k_flag orelse 0 }) else null;
     defer if (prompt_body) |body| allocator.free(body);
     var prompt_state: PromptClient = .{ .allocator = allocator, .io = io, .body = prompt_body orelse "", .stream = stream_mode };
@@ -1255,7 +1251,6 @@ pub fn main(init: std.process.Init) !void {
     const launch_serve = LaunchServe{
         .ctx_size = ctx_size,
         .timeout = timeout,
-        .reasoning_budget = reasoning_budget,
         .max_tokens = serve_default_max_tokens,
         .temperature = if (temp_explicit) temperature else null,
         .top_p = top_p_flag,
@@ -1335,18 +1330,17 @@ pub fn main(init: std.process.Init) !void {
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
     model_load.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
-    if (effort_mod.think_effort_flag) |e| if (effort_mod.effortArms(config.model_type)) |arms| {
+    if (effort_mod.think_effort_flag) |e| if (effort_mod.servedArms(config.model_type)) |served| {
         var choices: [std.enums.values(effort_mod.Effort).len]effort_mod.Effort = undefined;
-        for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
-        if (effort_mod.armForWord(arms, @tagName(e)) == null) {
+        if (effort_mod.resolve(served.slice(), e)) |pick| {
+            if (pick.rerouted_from) |from| log.info("[effort] " ++ effort_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.arm.effort) });
+        } else {
             var w = std.Io.Writer.Allocating.init(allocator);
             defer w.deinit();
-            try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, choices[0..arms.len]);
+            try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, effort_mod.listedWords(served.slice(), &choices));
             log.err("--think: {s}\n", .{w.written()});
             std.process.exit(1);
-        } else if (effort_mod.selectEffortPick(choices[0..arms.len], e)) |pick| if (pick.rerouted_from) |from| {
-            log.info("[effort] " ++ effort_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.effort) });
-        };
+        }
     };
     if (config.glm_fp8_trunk) {
         log.info("Model: {s} ({d} layers, {d}-dim, raw FP8 E4M3FN block128 trunk)\n", .{ config.model_type, config.num_hidden_layers, config.hidden_size });
@@ -1697,7 +1691,6 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
 const LaunchServe = struct {
     ctx_size: u32,
     timeout: u32,
-    reasoning_budget: i32,
     max_tokens: u32,
     temperature: ?f32,
     top_p: ?f32,
@@ -1707,7 +1700,6 @@ const LaunchServe = struct {
         return .{
             .max_context_size = self.ctx_size,
             .request_timeout_sec = self.timeout,
-            .default_reasoning_budget = self.reasoning_budget,
             .default_max_tokens = self.max_tokens,
             .default_temperature = self.temperature,
             .default_top_p = self.top_p,
@@ -1915,7 +1907,6 @@ test "both boot modes build their server defaults from the same launch flags" {
     const launch = LaunchServe{
         .ctx_size = 32768,
         .timeout = 77,
-        .reasoning_budget = 512,
         .max_tokens = 4096,
         .temperature = 0.3,
         .top_p = 0.8,

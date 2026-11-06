@@ -29,7 +29,7 @@ item).
 | Tool calls (DSML, both spellings) stream and non-stream | works | corpus `dsv41-dsml` entries incl. invoke markup inside a value and prose naming `<invoke>` |
 | Forced `tool_choice` | works | `forcedCallText` reads the V4.1 template |
 | Reasoning split, `reasoning_tokens` | works | reasoning is split from content as on Qwen |
-| Effort words, default thinking | works | off, low 50, medium 62, high 75, xhigh 87, max 100 on the encoder's 1-100 scale. A request naming no thinking or effort thinks at `high` (`/v1/models` says so); an explicit field wins. No hard thinking budget for any word (Qwen: low 2048, medium 8192) |
+| Effort words, default thinking | works | off, low 50, medium 62, high 75, xhigh 87, max 100 on the encoder's 1-100 scale. A request naming no thinking or effort thinks at `high` (`/v1/models` says so); an explicit field wins. No hard thinking budget for any built-in word (Qwen: low 2048, medium 8192); the effort table can set a cap per word |
 | Stop sequences, EOS inside a speculative block | works | generic stop gate; `publishSpeculativeBlock` cuts at the first EOS |
 | `ignore_eos`, `min_tokens` | main-wide | chat 400s `ignore_eos` by design on every arch, `/v1/completions` honours it; `min_tokens` is not read on any arch |
 | `/v1/messages/count_tokens` | main-wide gap | not served by any arch |
@@ -57,7 +57,7 @@ Ranked by what an agent client feels.
 3. **Batched decode.** The model holds one request's rings, compressed rows, Engram history and DSpark windows
    (`Model.state`). Batching needs that state per slot (a `State` already exists as one struct), a batched
    `extend` over rows of different positions, and the expert union across slots. Large.
-4. **Hard thinking budgets per effort word.** Today none; Qwen caps low and medium.
+4. **Hard thinking budgets per effort word.** None built in (Qwen caps low and medium); an operator can set one per word in the effort table.
 5. **`/props` DSpark fields**, **`count_tokens`**: small, generic, outside this arch.
 
 ## Live checks (a real pack)

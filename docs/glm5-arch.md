@@ -19,7 +19,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
   ([quality-kld](quality-kld.md)). `--kv-quant 16` (or `kv_quant: 16` per request or in model-settings) keeps the
   latent BF16. The pooled index and KDA state stay lossless. `--kv-quant 6` stores the latent at 6 bits (416 bytes per row, DFlash2 and prefix reuse unchanged); kv4 is refused (`GlmKvQuantUnsupported`), and the KLD teacher capture refuses any kv-quant.
 - Thinking: `low`, `high`, `max` (the template's `effective_reasoning_effort`); Sushi defaults to `high` (the HF
-  template defaults to `max`); `medium` is served as `high` and `xhigh` as `max`, with the same notice as Qwen. Thinking off is refused. The effort words impose no token cap.
+  template defaults to `max`); `medium` folds to `high` and `xhigh` to `max`, with the same notice as Qwen. Thinking off is refused and can never be offered. The built-in words impose no token cap; the GLM effort table (Settings › Inference, `effort:glm5_next` in model-settings.json) can cap, remap or refuse each word ([server-http-apis](server-http-apis.md#effort-tables)).
 - Image and video input through the native tower, on when present (a streamed load only with `--vision`);
   `--no-vision` drops its weights and buffers.
 - DFlash2 speculation when an assistant is found ([below](#dflash2)), for greedy and sampled requests.

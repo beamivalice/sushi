@@ -8,7 +8,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 **Reading the columns.** *default → effect* ends with the parse site. *who* is `user` (a tradeoff), `machine` (fits a Mac), `operator` (port, auth, paths, logging), `dev` (A/B, debug, bench), `test` (only a test needs it), `dead` (no effect left). *documented* names `help` (`sushi --help` or the subcommand's), `usage` (`docs/usage.md`), `README`, the topic docs, and how many `tests/` scripts pass it (`scripts/` counted apart); *hidden* means parsed but absent from `--help`. *recommendation* starts with `keep`, `cut`, `merge` (names the target) or `owner call` (the evidence that decides it is under [Owner calls](#owner-calls)).
 
-**Summary.** 117 rows: 58 shared by `run`, `serve` and the bare form, 59 in `run`, `launch`, `update`, `kld`, `bench` and `convert`. By who: user 33, operator 28, machine 17, dev 38, dead 1. By recommendation: keep 109, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
+**Summary.** 116 rows: 57 shared by `run`, `serve` and the bare form, 59 in `run`, `launch`, `update`, `kld`, `bench` and `convert`. By who: user 32, operator 28, machine 17, dev 38, dead 1. By recommendation: keep 108, cut 4, owner call 4. Among the 57 shared rows: keep 51, cut 4, owner call 2.
 
 ## Serving, network and auth
 
@@ -93,7 +93,6 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--temp` | `0` offline; serve: default temperature before `generation_config.json` (main.zig:653) | operator | help, usage; 2 tests | keep |
 | `--top-p` | model config → serve default for requests that omit it (main.zig:657) | operator | help; 1 test | keep |
 | `--top-k` | model config → serve default for requests that omit it (main.zig:660) | operator | help; 1 test | keep |
-| `--reasoning-budget` | unlimited → max thinking tokens per request (main.zig:799) | user | help, server-http-apis; 2 tests | keep |
 | `--preserve-thinking` | template default → keep every turn's thinking, `on` or `off`; also in settings (main.zig:876) | user | help, usage; 0 tests (settings test) | keep |
 | `--think-penalty` | `0` off → lower overthinking-marker logits inside the reasoning span; also in settings (main.zig:868) | user | help, server-http-apis; 2 tests | keep |
 
@@ -113,7 +112,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `run`: `--think` | model default → reasoning effort, per model (main.zig:623) | user | help, server-http-apis; 2 tests | keep |
+| `run`: `--think` | model default → reasoning effort, per model; outranks the effort table's default word (main.zig:623) | user | help, server-http-apis; 2 tests | keep |
 | `run`: `--tool` | `off` → REPL tools: web, fetch, read files in the folder (main.zig:631) | user | help, server-http-apis; 1 test | keep |
 | `run`: `--edit` | `off` → add `write_file` and `edit_file` inside that folder (main.zig:637) | user | help, server-http-apis; 2 tests | keep |
 | `run`: `--prompt` / `-p` | none → one prompt and exit (cli.zig:2354) | user | help; 4 tests | keep |
@@ -212,6 +211,7 @@ Landed; their rows are gone from the tables above. A removed flag now fails as `
 | `--mtp-cascade` | `--mtp-tokenv3` (the same arm) |
 | `--no-prefix-cache-ram` | `--prefix-cache-mem off` (or `0`); the last `--prefix-cache-mem` on the line wins, where the old flag won in either order |
 | `--fast` | the flags it set: `--mtp`, `--mtp-typical 0.2`, `--mtp-greedy-tail`, `--kv-quant 8`; the `fast` source label and preset are gone |
+| `--reasoning-budget` | the per-word cap of the effort table (Settings › Inference › Thinking effort, `effort:<family>` in `model-settings.json`); a word with no cap has none. A request's own `reasoning_budget_tokens` or Anthropic `budget_tokens` still applies |
 | `--pld`, `--no-pld`, `--pld-draft-len`, `--pld-key-len` | nothing: standalone prompt lookup decoding, its request field `enable_pld` and `/props settings.pld` are gone; MTP's and GLM DFlash2's own lookups stay (`--no-mtp-lookup`) |
 | `--ssm-checkpoint-stride` | a fixed 256 (`server.SSM_CHECKPOINT_STRIDE_DEFAULT`); only tests move it |
 | `--expert-cache-gb` (also `kld`) | `--ssd-budget-gb`; the BF16-source streaming test passes it |

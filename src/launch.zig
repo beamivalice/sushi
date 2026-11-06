@@ -1252,11 +1252,20 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
     }
 }
 
+fn listedCount(comptime model_type: []const u8) usize {
+    var n: usize = 0;
+    for (effort_mod.effortArms(model_type).?) |a| n += @intFromBool(effort_mod.isListed(a));
+    return n;
+}
+
 /// A served arch's `/v1/models` `reasoning_efforts`, read from the engine's own table.
-fn advertised(comptime model_type: []const u8) [effort_mod.effortArms(model_type).?.len][]const u8 {
-    const arms = comptime effort_mod.effortArms(model_type).?;
-    var words: [arms.len][]const u8 = undefined;
-    for (arms, 0..) |a, i| words[i] = @tagName(a.effort);
+fn advertised(comptime model_type: []const u8) [listedCount(model_type)][]const u8 {
+    var words: [listedCount(model_type)][]const u8 = undefined;
+    var i: usize = 0;
+    for (effort_mod.effortArms(model_type).?) |a| if (effort_mod.isListed(a)) {
+        words[i] = @tagName(a.effort);
+        i += 1;
+    };
     return words;
 }
 const qwen4_efforts = advertised("qwen4_exp");

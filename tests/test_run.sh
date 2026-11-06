@@ -139,7 +139,7 @@ P_SHARED='pass shared
   hermetic test_node.cjs needs=node
   host test_host.sh
   pack test_pack.sh
-  boot knobs: --metrics --log-level debug --think medium --reasoning-budget 1 --think-penalty 2 --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off
+  boot knobs: --metrics --log-level debug --think medium --think-penalty 2 --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off
     test_knobs.sh
   own test_own_def.sh pack=default boots=1
   own test_own_glm.sh pack=glm5 boots=2

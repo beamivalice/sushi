@@ -219,8 +219,6 @@ pub const ServerConfig = struct {
     /// Request timeout in seconds (0 = no timeout). `--timeout N`.
     request_timeout_sec: u32 = 300,
     /// Default reasoning budget in tokens (-1 = unlimited).
-    /// `--reasoning-budget N`. Per-request body fields override.
-    default_reasoning_budget: i32 = -1,
     /// Defaults for sampling fields the request OMITS, set by `--temp` /
     /// `--top-p` / `--top-k` in serve mode (the macOS app passes its Settings
     /// values so external clients like Claude Code — which send no sampling
@@ -1422,11 +1420,6 @@ pub fn serve(
     const model_ctx = config.contextCap();
     if (model_ctx > 0) {
         log.info("Model context length: {d} tokens\n", .{model_ctx});
-    }
-    if (server_config.default_reasoning_budget >= 0) {
-        log.info("Reasoning budget: {d} tokens\n", .{server_config.default_reasoning_budget});
-    } else {
-        log.info("Reasoning budget: unlimited\n", .{});
     }
     if (request_policy.filledMaxTokens(config) > 0) {
         log.info("default max_tokens for omitted requests: {d} ({s})\n", .{ request_policy.filledMaxTokens(config), if (request_policy.launchMaxTokensDefault() > 0) "--max-tokens" else "model default" });
@@ -7934,7 +7927,8 @@ pub fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const effort_cfg = request_policy.parseReasoningEffort(root, server_config.default_reasoning_budget, request_policy.effortWordOnly(allocator, lm, tok), effort_mod.effortArms(config.model_type)) catch {
+    const served_arms = effort_mod.servedArms(config.model_type);
+    const effort_cfg = request_policy.parseReasoningEffort(root, request_policy.effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
         const msg = try request_policy.effortRefusalFor(allocator, lm, root.get("reasoning_effort").?.string);
         defer allocator.free(msg);
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
@@ -7948,12 +7942,10 @@ pub fn handleChatCompletions(
     if (!try request_policy.checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
-    const default_effort_budget = model_mod.defaultThinkBudget(config, server_config.default_reasoning_budget);
+    const default_effort_budget = model_mod.defaultThinkBudget(config);
     const effort_budget: i32 = if (effort_cfg) |e| e.budget else default_effort_budget;
-    const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
-        .integer => |i| clampJsonI32(i),
-        else => effort_budget,
-    } else effort_budget;
+    const reasoning_budget: i32 = request_policy.requestThinkBudget(root, effort_budget);
+    const template_effort = if (effort_cfg) |e| e.sends else model_mod.defaultTemplateEffort(config);
 
     // Wave 1.A: per-request KV-quant override. When unset, falls back to the
     // process-level --kv-quant default carried on the scheduler. Cross-scheme
@@ -8039,7 +8031,7 @@ pub fn handleChatCompletions(
     const continue_final = continueFinalMessageRequested(root, messages.items);
     var tokenize_sw = io_util.Stopwatch.init(stream.io);
     const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
-    var prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final) catch |err| return generation_stream.sendGenerationError(allocator, stream, err, .openai);
+    var prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, template_effort, continue_final) catch |err| return generation_stream.sendGenerationError(allocator, stream, err, .openai);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -8057,7 +8049,7 @@ pub fn handleChatCompletions(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final) catch |err| return generation_stream.sendGenerationError(allocator, stream, err, .openai);
+            prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, template_effort, continue_final) catch |err| return generation_stream.sendGenerationError(allocator, stream, err, .openai);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,

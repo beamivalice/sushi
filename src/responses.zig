@@ -116,24 +116,24 @@ pub const ReasoningConfig = struct {
 /// Map `reasoning.effort` → (enable_thinking, reasoning_budget).
 /// "none" is an explicit off, matching the chat and Anthropic surfaces;
 /// `null` / non-object → thinking disabled, budget unchanged.
-pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) ReasoningConfig {
-    const v = reasoning_val orelse return .{ .enable = false, .budget = default_budget };
-    if (v != .object) return .{ .enable = false, .budget = default_budget };
-    const effort_val = v.object.get("effort") orelse return .{ .enable = true, .budget = default_budget };
-    if (effort_val != .string) return .{ .enable = true, .budget = default_budget };
+pub fn parseReasoning(reasoning_val: ?std.json.Value) ReasoningConfig {
+    const v = reasoning_val orelse return .{ .enable = false, .budget = -1 };
+    if (v != .object) return .{ .enable = false, .budget = -1 };
+    const effort_val = v.object.get("effort") orelse return .{ .enable = true, .budget = -1 };
+    if (effort_val != .string) return .{ .enable = true, .budget = -1 };
     const word = effort_val.string;
-    if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
-    return .{ .enable = true, .budget = effortBudget(word, default_budget), .effort = word };
+    if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = -1, .effort = word };
+    return .{ .enable = true, .budget = effortBudget(word), .effort = word };
 }
 
 /// Effort → thinking-budget mapping shared by the Responses `reasoning.effort`
 /// object and the chat-completions `reasoning_effort` string. Unknown efforts
-/// (model-dependent spec values like "xhigh") fall back to the default budget.
-pub fn effortBudget(effort: []const u8, default_budget: i32) i32 {
+/// (model-dependent spec values like "xhigh") are uncapped (-1).
+pub fn effortBudget(effort: []const u8) i32 {
     if (std.mem.eql(u8, effort, "minimal")) return 1024;
     if (std.mem.eql(u8, effort, "low")) return 2048;
     if (std.mem.eql(u8, effort, "medium")) return 8192;
-    return default_budget;
+    return -1;
 }
 
 // ─── text.format → schema constraint ──────────────────────────────────────
@@ -871,15 +871,15 @@ const testing = std.testing;
 test "parseReasoning maps effort levels" {
     const v_low = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"low\"}", .{});
     defer v_low.deinit();
-    try testing.expectEqual(@as(i32, 2048), parseReasoning(v_low.value, -1).budget);
+    try testing.expectEqual(@as(i32, 2048), parseReasoning(v_low.value).budget);
 
     // high is uncapped: the default budget rides through.
     const v_high = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"high\"}", .{});
     defer v_high.deinit();
-    try testing.expectEqual(@as(i32, -1), parseReasoning(v_high.value, -1).budget);
+    try testing.expectEqual(@as(i32, -1), parseReasoning(v_high.value).budget);
 
-    try testing.expectEqual(false, parseReasoning(null, -1).enable);
-    try testing.expectEqual(@as(i32, -1), parseReasoning(null, -1).budget);
+    try testing.expectEqual(false, parseReasoning(null).enable);
+    try testing.expectEqual(@as(i32, -1), parseReasoning(null).budget);
 }
 
 // `none` is the OpenAI/gpt-5.1 spelling of an explicit thinking-off on the chat
@@ -887,7 +887,7 @@ test "parseReasoning maps effort levels" {
 test "parseReasoning: effort none is an explicit thinking-off" {
     const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"none\"}", .{});
     defer v.deinit();
-    const cfg = parseReasoning(v.value, -1);
+    const cfg = parseReasoning(v.value);
     try testing.expectEqual(false, cfg.enable);
     try testing.expectEqualStrings("none", cfg.effort.?);
 }

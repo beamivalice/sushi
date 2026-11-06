@@ -1073,6 +1073,8 @@ pub const ModelConfig = struct {
     /// inferred from "the template mentions enable_thinking".
     pub fn defaultEnableThinking(self: *const ModelConfig) bool {
         if (effort_mod.thinkFlagArm(self.model_type)) |arm| return arm.effort != .off;
+        // The operator's default word outranks the checkpoint's declaration, as a flag does.
+        if (effort_mod.fileDefault(self.model_type)) |e| return e != .off;
         // The checkpoint's own declared default outranks the arch allowlist:
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
@@ -2067,34 +2069,43 @@ pub fn mimoMtpResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir:
 /// by name at the loader, so the inherited forwards behind it are unreachable.
 pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41" };
 
-/// The arm a request naming no effort takes when `--think` is not given: Qwen's own, unless the
-/// checkpoint declares thinking off.
-fn archDefaultArm(config: *const ModelConfig) ?effort_mod.EffortArm {
-    if (!config.isQwen4() or config.gen_enable_thinking == false) return null;
-    return effort_mod.findEffortArm(&effort_mod.qwen4_exp_efforts, .medium);
+/// The arm a request naming no effort takes when `--think` is not given: its family table's default word. A Qwen
+/// checkpoint that declares thinking off keeps no default word unless the file names one.
+fn tableDefaultArm(config: *const ModelConfig) ?effort_mod.EffortArm {
+    const family = effort_mod.Family.of(config.model_type) orelse return null;
+    const edits = effort_mod.publishedEdits(family);
+    if (edits.default == null and config.isQwen4() and config.gen_enable_thinking == false) return null;
+    const t = effort_mod.merge(family, edits);
+    const row = t.row(t.default);
+    return .{ .effort = t.default, .budget = row.cap, .sends = row.sends };
 }
 
-/// The thinking cap of a request naming no effort: `--think`'s, else an explicit
-/// `--reasoning-budget`, else the arch default's.
-pub fn defaultThinkBudget(config: *const ModelConfig, launch_budget: i32) i32 {
-    if (effort_mod.thinkFlagArm(config.model_type)) |arm| return arm.budget orelse launch_budget;
-    if (launch_budget >= 0) return launch_budget;
-    return if (archDefaultArm(config)) |arm| arm.budget orelse launch_budget else launch_budget;
+fn defaultArm(config: *const ModelConfig) ?effort_mod.EffortArm {
+    return effort_mod.thinkFlagArm(config.model_type) orelse tableDefaultArm(config);
+}
+
+/// The thinking cap of a request naming no effort: its default word's (`--think`'s, else the table's); -1 = none.
+pub fn defaultThinkBudget(config: *const ModelConfig) i32 {
+    const arm = defaultArm(config) orelse return -1;
+    return arm.budget orelse -1;
 }
 
 pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
-    if (effort_mod.thinkFlagArm(config.model_type)) |arm| return @tagName(arm.effort);
-    if (archDefaultArm(config)) |arm| return @tagName(arm.effort);
-    return if (config.isGlm5() or config.isDsv41()) "high" else null;
+    return if (defaultArm(config)) |arm| @tagName(arm.effort) else null;
+}
+
+/// What the template's `reasoning_effort` receives for a request naming no effort (`effort.templateValue`).
+pub fn defaultTemplateEffort(config: *const ModelConfig) ?[]const u8 {
+    return if (defaultArm(config)) |arm| effort_mod.templateValue(arm) else null;
 }
 
 /// The word a request naming no effort runs at (`/v1/models` `default_reasoning_effort`).
 pub fn defaultReasoningEffort(config: *const ModelConfig) ?[]const u8 {
-    const arms = effort_mod.effortArms(config.model_type) orelse return null;
+    const arms = effort_mod.servedArms(config.model_type) orelse return null;
     if (defaultEffortWord(config)) |w| return w;
     if (!config.defaultEnableThinking()) return "off";
     // Silence renders the cheapest thinking level (`chat.qwen38EffortFor`).
-    for (arms) |a| if (a.effort != .off) return @tagName(a.effort);
+    for (arms.slice()) |a| if (a.effort != .off and effort_mod.isListed(a)) return @tagName(a.effort);
     return null;
 }
 
@@ -3028,7 +3039,9 @@ test "effortArms: every engine word on each served arch" {
     for (cases) |c| {
         const e = effort_mod.parseEffort(c.word).?;
         for ([_]struct { arch: []const u8, want: ?Budget }{ .{ .arch = "qwen4_exp", .want = c.qwen }, .{ .arch = "mimo_v2", .want = c.mimo } }) |a| {
-            const got = effort_mod.findEffortArm(effort_mod.effortArms(a.arch).?, e);
+            const found = effort_mod.findEffortArm(effort_mod.effortArms(a.arch).?, e);
+            // A fold arm (Qwen high, max) is served as another word, so it is not this word's own arm.
+            const got = if (found) |f| (if (f.fold_to == null) f else null) else null;
             if (a.want) |w| {
                 try testing.expectEqual(w.on, got.?.effort != .off);
                 try testing.expectEqual(w.cap, got.?.budget);
@@ -4082,8 +4095,8 @@ test "GLM serving accepts native effort levels and thinks by default" {
     for ([_]effort_mod.Effort{ .low, .high, .max }) |effort| {
         try testing.expectEqual(@as(?i32, null), effort_mod.findEffortArm(effort_mod.effortArms(cfg.model_type).?, effort).?.budget);
     }
-    try testing.expect(effort_mod.findEffortArm(effort_mod.effortArms(cfg.model_type).?, .medium) == null);
-    try testing.expect(effort_mod.findEffortArm(effort_mod.effortArms(cfg.model_type).?, .xhigh) == null);
+    try testing.expectEqual(effort_mod.Effort.high, effort_mod.findEffortArm(effort_mod.effortArms(cfg.model_type).?, .medium).?.fold_to.?);
+    try testing.expectEqual(effort_mod.Effort.max, effort_mod.findEffortArm(effort_mod.effortArms(cfg.model_type).?, .xhigh).?.fold_to.?);
     try testing.expect(effort_mod.findEffortArm(effort_mod.effortArms(cfg.model_type).?, .off) == null);
     try testing.expectEqualStrings("high", defaultEffortWord(&cfg).?);
 }
@@ -4176,26 +4189,25 @@ test "Qwen3.8-Flash-Next thinks at medium effort by default, under the launch fl
     effort_mod.think_effort_flag = null;
     try testing.expect(qwen.defaultEnableThinking());
     try testing.expectEqualStrings("medium", defaultEffortWord(&qwen).?);
-    // medium's cap applies to silence; an explicit --reasoning-budget outranks it
-    try testing.expectEqual(@as(i32, 8192), defaultThinkBudget(&qwen, -1));
-    try testing.expectEqual(@as(i32, 321), defaultThinkBudget(&qwen, 321));
+    // medium's cap applies to silence.
+    try testing.expectEqual(@as(i32, 8192), defaultThinkBudget(&qwen));
     // A checkpoint that declares thinking off stays off.
     try testing.expect(!qwen_off.defaultEnableThinking());
     try testing.expect(defaultEffortWord(&qwen_off) == null);
-    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&qwen_off, -1));
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&qwen_off));
     // --think outranks the arch default, `off` included.
     effort_mod.think_effort_flag = .low;
     try testing.expectEqualStrings("low", defaultEffortWord(&qwen).?);
-    try testing.expectEqual(@as(i32, 2048), defaultThinkBudget(&qwen, -1));
+    try testing.expectEqual(@as(i32, 2048), defaultThinkBudget(&qwen));
     effort_mod.think_effort_flag = .off;
     try testing.expect(!qwen.defaultEnableThinking());
     effort_mod.think_effort_flag = .xhigh;
     try testing.expectEqualStrings("xhigh", defaultEffortWord(&qwen).?);
-    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&qwen, -1));
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&qwen));
     // MiMo and GLM keep their own defaults and budgets.
     effort_mod.think_effort_flag = null;
-    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&mimo, -1));
-    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&glm, -1));
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&mimo));
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&glm));
     try testing.expect(defaultEffortWord(&mimo) == null);
     try testing.expectEqualStrings("high", defaultEffortWord(&glm).?);
 }
@@ -4442,4 +4454,39 @@ test "a pair-major pack is refused by name by an architecture that reads only th
         const n = try tmp.dir.realPath(io, &buf);
         try testing.expectError(error.Exl3TileOrderUnsupported, parseConfig(io, testing.allocator, buf[0..n]));
     }
+}
+
+test "effort table: the file's default word outranks the built-in one, --think outranks both" {
+    const saved = effort_mod.think_effort_flag;
+    defer effort_mod.think_effort_flag = saved;
+    defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
+    effort_mod.think_effort_flag = null;
+    const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    const qwen_off = ModelConfig{ .model_type = "qwen4_exp", .gen_enable_thinking = false };
+    const ds = ModelConfig{ .model_type = "deepseek_v41" };
+    var e: effort_mod.Edits = .{ .default = .low };
+    effort_mod.publish(.qwen4_exp, e);
+    try testing.expectEqualStrings("low", defaultEffortWord(&qwen).?);
+    try testing.expectEqualStrings("low", defaultTemplateEffort(&qwen).?);
+    try testing.expectEqual(@as(i32, 2048), defaultThinkBudget(&qwen));
+    // The file is the operator speaking, so it outranks a checkpoint that declares thinking off.
+    try testing.expectEqualStrings("low", defaultEffortWord(&qwen_off).?);
+    try testing.expect(qwen_off.defaultEnableThinking());
+    e.default = .off;
+    effort_mod.publish(.qwen4_exp, e);
+    try testing.expect(!qwen.defaultEnableThinking());
+    try testing.expectEqualStrings("off", defaultReasoningEffort(&qwen).?);
+    var d: effort_mod.Edits = .{ .default = .medium };
+    d.rows[effort_mod.rowIndex(.medium).?] = .{ .sends = .{ .scale = 40 }, .cap = @as(?i32, 64) };
+    effort_mod.publish(.deepseek_v41, d);
+    try testing.expectEqualStrings("medium", defaultEffortWord(&ds).?);
+    try testing.expectEqualStrings("40", defaultTemplateEffort(&ds).?);
+    try testing.expectEqual(@as(i32, 64), defaultThinkBudget(&ds));
+    try testing.expectEqualStrings("medium", defaultReasoningEffort(&ds).?);
+    effort_mod.think_effort_flag = .max;
+    try testing.expectEqualStrings("max", defaultEffortWord(&ds).?);
+    try testing.expectEqualStrings("100", defaultTemplateEffort(&ds).?);
+    try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&ds));
+    try testing.expectEqualStrings("xhigh", defaultEffortWord(&qwen).?);
+    try testing.expect(qwen.defaultEnableThinking());
 }

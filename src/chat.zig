@@ -1,4 +1,5 @@
 const std = @import("std");
+const effort_mod = @import("effort.zig");
 const jinja_c = @import("jinja_c");
 const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
@@ -455,6 +456,7 @@ pub fn renderChatTemplate(
     const messages_have_tool_content = messagesHaveToolContent(msgs);
     const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
     defer allocator.free(extra_json);
+    log.debug("[chat] template kwargs {s}\n", .{extra_json});
 
     // A generic role header is not proof that the template emits every role:
     // some templates guard the header to user/assistant/system. Probe only
@@ -1186,7 +1188,7 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 /// levers fight — pi asking for `medium` on Qwen3.8 got the model's default
 /// (unguided, long) thinking AND a 2048-token display cut, then 25.9k tokens
 /// of invisible generation (live 2026-08-14). An explicit
-/// `reasoning_budget_tokens` or `--reasoning-budget` is someone asking for a
+/// `reasoning_budget_tokens` or an effort table's cap is someone asking for a
 /// cap on purpose and still applies.
 ///
 /// Substring on the KEY, so a family reading a different one is untouched.
@@ -1198,6 +1200,15 @@ pub fn templateConsumesEffort(tpl: []const u8) bool {
 /// default high) or a 1-100 budget for the steps between them.
 fn dsv41EffortFor(effort: ?[]const u8) []const u8 {
     const e = effort orelse return "\"high\"";
+    // A table's value on the 1-100 scale; the encoder's own three steps go as its words.
+    if (std.fmt.parseInt(u8, e, 10)) |n| {
+        if (e[0] != '+' and n >= 1 and n <= 100) return switch (n) {
+            50 => "\"low\"",
+            75 => "\"high\"",
+            100 => "\"max\"",
+            else => effort_mod.scaleText(n),
+        };
+    } else |_| {}
     if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) return "\"low\"";
     if (std.mem.eql(u8, e, "medium")) return "62";
     if (std.mem.eql(u8, e, "xhigh")) return "87";
@@ -2174,6 +2185,31 @@ test "serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto the enc
     const off = try serializeExtraContext(allocator, &other, false, null);
     defer allocator.free(off);
     try testing.expect(std.mem.indexOf(u8, off, "\"reasoning_effort\":\"no_think\"") != null);
+}
+
+test "serializeExtraContext: a table's value reaches each family's template as that family spells it" {
+    const allocator = testing.allocator;
+    const Case = struct { tpl: []const u8, value: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .value = "medium", .want = "\"reasoning_effort\":\"medium\"" },
+        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .value = "low", .want = "\"reasoning_effort\":\"low\"" },
+        .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "40", .want = "\"reasoning_effort\":40" },
+        .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "62", .want = "\"reasoning_effort\":62" },
+        .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "50", .want = "\"reasoning_effort\":\"low\"" },
+        .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "75", .want = "\"reasoning_effort\":\"high\"" },
+        .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "100", .want = "\"reasoning_effort\":\"max\"" },
+        .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "101", .want = "\"reasoning_effort\":\"high\"" },
+        .{ .tpl = glm53_template, .value = "low", .want = "\"reasoning_effort\":\"low\"" },
+    }) |c| {
+        var cfg = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+        const r = try serializeExtraContext(allocator, &cfg, true, c.value);
+        defer allocator.free(r);
+        try testing.expect(std.mem.indexOf(u8, r, c.want) != null);
+    }
+    var ds = ChatConfig{ .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    const rendered = try renderChatTemplate(allocator, &.{.{ .role = "user", .content = "hi" }}, &ds, null, null, true, "40", false);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning Effort: 40 (range 1-100") != null);
 }
 
 test "serializeMessagesJson basic" {

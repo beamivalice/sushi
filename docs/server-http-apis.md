@@ -16,30 +16,44 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `reasoning_budget_tokens` outranks); a request naming neither takes the arch default (`defaultEnableThinking`);
   on Responses a `reasoning` object decides alone, and without one the same rule applies; `n>1` 400s.
 - **Effort vocabulary** `off on minimal low medium high xhigh max` (`none` = off; `minimal` keeps the legacy 1024
-  budget on inherited arches): each served arch accepts a subset (`effort.effortArms`), read through
-  `effort.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike. A word outside it
-  is refused with the accepted list. Announced folds: Qwen `high` and `max` → `xhigh`, GLM `medium` → `high` and
-  `xhigh` → `max`. The request is served, and every re-route logs `[effort]` and rides back as
-  `X-Sushi-Effort-Notice` plus `effort_notice` (not in the answer text). MiMo's silent on-fold is unchanged.
-  Uncapped = `--reasoning-budget`.
-- qwen4_exp: off, low (2048), medium (8192), xhigh (uncapped); the template reads the word; `high` and `max`
-  are served as `xhigh` with that notice; `minimal` still 400.
-- glm5_next: low, high, max (uncapped, a prompt instruction); `medium` is served as `high` and `xhigh` as `max`
-  with that notice; off and every other word 400.
+  budget on inherited arches). Qwen, DeepSeek and GLM each serve a **thinking-effort table** (`effort.Table`): one row
+  per word (`off low medium high xhigh max`) with `offered`, `sends` (what the template's `reasoning_effort`
+  receives) and `cap` (thinking tokens; null = no cap), plus a default word. The built-in tables
+  (`effort.builtin`) are the engine's own; `model-settings.json` holds only the fields an operator changed and the
+  merge is field by field (`effort.merge`; [Effort tables](#effort-tables)). Every request resolves its word against
+  the served table once (`effort.servedArms` → `effort.resolve`) on chat, Responses, Anthropic, `--think` and the
+  REPL's `/think` alike; the arm's `sends` is what the render passes (`ReasoningEffort.sends`,
+  `model.defaultTemplateEffort`), its cap the decode-time bound. A word the table does not offer is refused with the
+  accepted list. **Folds** are a row state of the built-in tables only: Qwen `high` and `max` → `xhigh`, GLM `medium`
+  → `high` and `xhigh` → `max` (each word the family has no level for uses the nearest one). A fold is served at its
+  target, logs `[effort]` and rides back as `X-Sushi-Effort-Notice` plus `effort_notice` (not in the answer text); a
+  fold whose target is not offered is refused. A row the file sets `offered` on is no longer a fold: true serves the
+  word as itself (its own `sends` and `cap`, no notice: a mapping, not a re-route), false refuses it. No other word
+  folds. MiMo's silent on-fold is unchanged (it has no table).
+- qwen4_exp (built-in): off, low (2048), medium (8192), xhigh (uncapped); the template reads the word (`sends` takes
+  low|medium|xhigh, which the template accepts); `high` and `max` fold to `xhigh`; `minimal` still 400.
+- deepseek_v41 (built-in): off, low 50, medium 62, high 75, xhigh 87, max 100 on the encoder's 1-100 scale (`sends`
+  takes any whole number 1-100; 50, 75 and 100 reach the encoder as its own words, `chat.dsv41EffortFor`); no caps.
+- glm5_next (built-in): low, high, max (uncapped, a prompt instruction; `sends` takes low|high|max); `medium` folds to
+  `high` and `xhigh` to `max`; off can never be offered (the template has no thinking-off switch).
 - mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
   uncapped, and off/none is off.
-- `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
-  none runs at (`model.defaultReasoningEffort`: `--think`, else Qwen medium, else GLM high, else off/on per
-  `defaultEnableThinking`), and `reasoning_effort_budgets`, the thinking-token cap of each capped word
-  (Qwen `low` 2048, `medium` 8192; `{}` for MiMo and GLM).
+- `/v1/models` rows, loaded or not, are read from the served table on every call: `reasoning_efforts` (the offered
+  words; folds are not listed), `default_reasoning_effort`, the word a request naming none runs at
+  (`model.defaultReasoningEffort`: `--think`, else the table's default word, else off/on per `defaultEnableThinking`),
+  `reasoning_effort_budgets`, the thinking-token cap of each capped word (built-in: Qwen `low` 2048, `medium` 8192;
+  `{}` for MiMo, GLM and DeepSeek), and `reasoning_effort_values`, the template value of each offered thinking word
+  (a word for Qwen and GLM, a number for DeepSeek: `{"low":50,"medium":62,...}`; `{}` for MiMo).
 - CLI `--think X` requires an explicit effort word and is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
   any X but off is on) or, lacking it, keeps its own default. It never fails a load.
 - **Qwen thinks at medium by default** (owner decision): a request naming no thinking field (no `enable_thinking`,
   `reasoning_effort`, Anthropic `thinking` or Responses `reasoning`, as `sushi run` sends none) runs with thinking on
-  at `medium` and its 8192-token cap (`model.archDefaultArm`, read by `defaultEnableThinking`, `defaultEffortWord`
-  and `defaultThinkBudget`). Precedence: the request's own fields, then `--think`, then an explicit
-  `--reasoning-budget` over the cap, then this default; a checkpoint whose `generation_config.json` declares
-  `enable_thinking` false stays off. Explicit thinking off stays off. MiMo and GLM keep their defaults. A thinking
+  at the table's default word, built-in `medium` and its 8192-token cap (`model.tableDefaultArm`, read by
+  `defaultEnableThinking`, `defaultEffortWord`, `defaultTemplateEffort` and `defaultThinkBudget`). Precedence: the
+  request's own fields, then `--think`, then the
+  table's default word (the file's, else the built-in one); a checkpoint whose `generation_config.json` declares
+  `enable_thinking` false stays off unless the file names a default word (the operator outranks the checkpoint, as a
+  flag does). A file default of `off` makes a silent request think off. Explicit thinking off stays off. MiMo and GLM keep their defaults. A thinking
   request on another arch that names NO effort gets no server budget: Qwen3.8's template renders an absent word as
   low (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
   `sequence_number` on every event, stateful via
@@ -237,10 +251,43 @@ the early-stop line + the atomic closer commit as ONE multi-token forward (`comm
 thought is delivered. Every decode tick checks it with the loop stop (`loopGuardTick`), the plain batched tick too
 (`batchedTickRows`): skipped there, a budget under `--max-concurrent` overran by up to ~2.5k tokens while its slot
 batched plain. Guard: `tests/test_reasoning_budget_stream.sh`. Effort budgets = pi's ladder
-(`effort.effortArms` for served arches, `responses.effortBudget` for the rest).
+(the served effort table for served arches, `responses.effortBudget` for the rest).
 Every surface arms it with one precedence: explicit budget (`reasoning_budget_tokens`, Anthropic `budget_tokens`) > the
-request effort word's budget. When the request omits effort, the architecture's `--think` budget supplies the default;
-uncapped effort words fall back to `--reasoning-budget` (unlimited by default). GLM effort words do not impose token caps.
+request effort word's cap in the served table (`request_policy.requestThinkBudget`). When the request omits effort,
+the default word's cap applies (`--think`'s, else the table's). A word with no cap has none; the `--reasoning-budget`
+launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words impose no caps.
+
+<a id="effort-tables"></a>
+## Effort tables
+
+- **Storage**: one section per family in `model-settings.json`, `"effort:qwen4_exp"`, `"effort:deepseek_v41"`,
+  `"effort:glm5_next"` (a model's key is an absolute path, so the two never meet; `effort.sectionName`). Keys: `default`
+  (a word) and each row word, whose object holds only the changed fields: `offered` (bool), `sends` (Qwen
+  low|medium|xhigh, GLM low|high|max, DeepSeek an integer 1-100), `cap` (integer ≥ 1, or null = no cap). A row's
+  `sends` or `cap` on `off` is refused (off sends nothing and has nothing to cap); `offered: true` on GLM's off is
+  refused. The default word must be offered as itself.
+- **Validation** (`effort.parseRow`, `checkSends`, `checkCap`, `checkTable`): a save is refused with a 400 naming the
+  field (`effort qwen4_exp.high.sends: Qwen takes low, medium or xhigh`) and writes nothing; a start reads the file
+  leniently (`model_settings.publishEffortTables`): each bad field is skipped with one `[effort] model-settings.json
+  effort:<family>.<word>.<field>: ...; ignored` line, and a default left unoffered drops the file's default first, then
+  its `offered: false` on the default row. A hand-edit never breaks a render.
+- **Takes effect on the next request, no reload**: a save writes the file (only fields that differ from built-in,
+  `effort.normalize`; an emptied section goes) and publishes the family's edits to a spinlocked store
+  (`effort.publish`); request handlers on connection threads copy the merged table once per request
+  (`effort.servedArms`), so the inference thread and MLX never see it. Hand-edits reach a running server at its
+  next start.
+- `GET /v1/settings` `effort`: `applies` ("applies at once") and `families` (MiMo has none: only on/off), each with `sends` (`{"kind":"word",
+  "choices":[...]}` or `{"kind":"scale","min":1,"max":100,"presets":{"low":50,"high":75,"max":100}}`),
+  `off_offerable`, `default` (`builtin`, `file`, `value`, `flag`, `locked`, `source`; `--think <word>` pins the default
+  of each family it binds, reported as `flag: "--think <word>"`) and six `rows` with `builtin`, `file` (the stored
+  fields, or null) and `value` (the served row), each `{offered, sends, cap, fold_to}`.
+- `POST /v1/settings` `{"effort":{"<family>": null | {"default": word|null, "<word>": row|null}}}`: null resets the
+  family (or the row, or the default) to built-in; a named row replaces the stored row whole, rows not named keep
+  theirs. The answer's `applied.effort` is "applies at once, from the next request" (with a note while `--think` pins
+  the default). `mimo_v2` or any other family is a 400 `unknown_setting`.
+- Guards: the `effort table` tests (effort.zig, request_policy.zig incl. the characterization test that built-in =
+  before the table, model.zig, settings_api.zig, chat.zig), `node tests/test_webui_effort_table.cjs`, live
+  `tests/test_effort_table.sh`.
 
 ## Constrained JSON
 
@@ -383,7 +430,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   take less to fit its context or the free space); and
   `running_tiers`, `[{model, cap_bytes, used_bytes}]`), the
   `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
-  `locked`. A pinned `mtp_acceptance` reports the flag as typed with its value (`--mtp-tokenv3 0.5`, `--mtp-typical 0.3`) and `mtp_greedy_tail` reports `--mtp-greedy-tail`; the other model keys report their value alone. `POST /v1/settings` takes `{"server":{key:value|null}}` and/or `{"model":id,"set":{key:value|null}}`; null removes
+  `locked`. A pinned `mtp_acceptance` reports the flag as typed with its value (`--mtp-tokenv3 0.5`, `--mtp-typical 0.3`) and `mtp_greedy_tail` reports `--mtp-greedy-tail`; the other model keys report their value alone; and `effort`, the thinking-effort tables ([Effort tables](#effort-tables)). `POST /v1/settings` takes `{"server":{key:value|null}}`, `{"model":id,"set":{key:value|null}}` and/or `{"effort":{...}}`; null removes
   a key. Each model row also carries `keys`, the keys that apply to that model (`model_settings.applies`, the same gates
   the loader's ignored-key log lines use: `ssd_budget_gb` needs expert streaming, `ssd_prefetch` is DeepSeek-V4.1's,
   `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
@@ -585,7 +632,12 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   is returned to the pool. Answers `{"ok":true}` (200), `400` on invalid payload, or `404` when no in-flight slot matches the id.
   The dashboard's **Sessions** table provides a **Cancel** button on active prefill and decode rows, invoking this endpoint.
 - The effort menu lists exactly the row's `reasoning_efforts`, with no default entry; it shows the stored choice where
-  the model takes it, else the row's `default_reasoning_effort`, and every request sends the shown word.
+  the model takes it, else the row's `default_reasoning_effort`, and every request sends the shown word. A saved
+  effort table reaches it through `/v1/models` (the Settings card refreshes the model list after a save).
+- Settings › Inference › **Thinking effort** edits the effort tables ([Effort tables](#effort-tables)); each model's
+  detail on the Models page carries one read-only line from its `/v1/models` row (`Thinking: medium by default · low
+  2048 / medium 8192 tokens · Edit`, Edit opening that family's tab; a model without an effort table shows no line). Logic:
+  `effortPreview`, `effortRowProblem`, `effortPostBody`, `effortSummary`; guard `tests/test_webui_effort_table.cjs`.
 - The thinking-budget box beside it takes the word's `reasoning_effort_budgets` value whenever the model or the word
   changes (empty for an uncapped word, disabled at `off`); a typed value holds until then and is sent as
   `reasoning_budget_tokens`.

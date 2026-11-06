@@ -17,7 +17,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 - Routed experts always stream: 289 GB of FP4 against a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
   model-settings) is required, as on every streamed load; without one the load fails with `ExpertStreamingRequired`.
 - Thinking: `low` 50, `medium` 62, `high` 75, `xhigh` 87, `max` 100 on the encoder's 1-100 effort scale (its own
-  words are low/high/max; medium and xhigh reach it as numbers), default `high`; a request that names no thinking or effort thinks, at `high` (`ModelConfig.defaultEnableThinking`; an explicit field wins, `enable_thinking: false` or effort `off` is a `chat` render). The template is [src/fixtures/dsv41_chat_template.jinja](../src/fixtures/dsv41_chat_template.jinja),
+  words are low/high/max; medium and xhigh reach it as numbers), default `high`; the DeepSeek effort table
+  (`effort:deepseek_v41`, [server-http-apis](server-http-apis.md#effort-tables)) can send any 1-100 value, cap or refuse each word; a request that names no thinking or effort thinks, at `high` (`ModelConfig.defaultEnableThinking`; an explicit field wins, `enable_thinking: false` or effort `off` is a `chat` render). The template is [src/fixtures/dsv41_chat_template.jinja](../src/fixtures/dsv41_chat_template.jinja),
   pinned byte for byte to the release's `encoding/encoding.py` ([below](#oracle)).
 - Tool calls: DSML with V4.1's leading-space tag names (`<｜DSML｜ invoke name=…>`); the parser takes both spellings.
 

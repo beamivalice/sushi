@@ -77,8 +77,24 @@ and the page tooltip share them.
   reuse keep their live `#dashTip`); every bar row and cached-vs-computed column of the dashboard's charts (one Tab stop
   per card, the arrow keys move along it); the chat's Last reply rows and its Max tokens, Temperature, Top-p, Top-k and
   Thinking budget fields; a model's facts (on disk, linked, in memory, max context, sees images, streams experts);
-  the Available list's "Recommended for this Mac" badge (tier, RAM and download size); the Settings cache table headings.
+  the Available list's "Recommended for this Mac" badge (tier, RAM and download size); the Settings cache table headings;
+  the Thinking effort card's column headings, Offered boxes, a word's "same as" Sends and the DeepSeek preset chips.
 - Native `title` stays where a full value rides it (a cut-off model name, a path, a server message) and on icon buttons.
+
+## Settings sections and the Thinking effort card
+
+- Settings groups its cards under small uppercase section labels (`.sec-h`): Storage (SSD cache, models folder),
+  Inference (Thinking effort), Server (port, update checks, about).
+- The Thinking effort card: a `.seg` tab row per family (arrow keys, Home and End move between tabs), then a `.tbl` of
+  the six words with Offered (checkbox), Sends (a select of the family's values; DeepSeek a 1-100 box with 50/75/100
+  chips), Cap (a box; blank keeps the default, `none` removes it) and Default (radio). Default values show in grey
+  (`--text-3`) as the select's first option or the box's placeholder; the copy names the shipped value "default" and
+  never "built-in". A word the family has no level for reads "same as xhigh" with the tip "Qwen has no max level, so
+  max uses xhigh".
+- The selected row (click or focus) takes the selected-row wash and 3 px accent edge; an edited row keeps the edge and
+  a small "changed" tag. A preview line under the table shows what a request for the selected word gets, and the exact
+  template text. The card lists only the families with a table. A row's error stays in its word cell (`role="alert"`) and its box turns `aria-invalid`; Save stays
+  disabled until every row is valid. Badges: Saved (the file holds a change) and Now.
 
 ## Dashboard config mode
 

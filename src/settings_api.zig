@@ -19,6 +19,7 @@ const chat = @import("chat.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const update_mod = @import("update.zig");
 const pack_update = @import("pack_update.zig");
+const effort_mod = @import("effort.zig");
 
 const Edit = model_settings.Edit;
 
@@ -46,6 +47,8 @@ pub const ServerView = struct {
     boot_roots: []const []const u8,
     /// The server-wide ask, which loads without a number of their own start from.
     ask_bytes: u64,
+    /// `--think <word>`, which pins each family's default word it binds.
+    think: ?effort_mod.Effort = null,
 };
 
 /// The file value of one key as a JSON value, or null when the file had none.
@@ -182,6 +185,71 @@ fn writeAutoCheck(w: *std.Io.Writer, name: []const u8, file: ?bool, lock: *const
     });
 }
 
+fn writeSends(w: *std.Io.Writer, s: effort_mod.Sends) !void {
+    switch (s) {
+        .none => try w.writeAll("null"),
+        .word => |x| try w.print("\"{s}\"", .{@tagName(x)}),
+        .scale => |n| try w.print("{d}", .{n}),
+    }
+}
+
+fn writeRow(w: *std.Io.Writer, r: effort_mod.Row) !void {
+    try w.print("{{\"offered\":{},\"sends\":", .{r.offered});
+    try writeSends(w, r.sends);
+    try w.writeAll(",\"cap\":");
+    try writeJson(w, r.cap);
+    try w.writeAll(",\"fold_to\":");
+    try writeJson(w, if (r.fold_to) |f| @tagName(f) else null);
+    try w.writeAll("}");
+}
+
+/// The effort tables as the page edits them: per family the built-in row, the stored fields and the served row, the
+/// default word and the `--think` that pins it. Read from the served tables, so a save shows at once.
+fn writeEffort(w: *std.Io.Writer, view: ServerView) !void {
+    try w.writeAll(",\"effort\":{\"applies\":\"applies at once\",\"families\":[");
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    for (effort_mod.families, 0..) |f, fi| {
+        if (fi > 0) try w.writeAll(",");
+        const edits = effort_mod.publishedEdits(f);
+        const b = effort_mod.builtin(f);
+        const t = effort_mod.merge(f, edits);
+        try w.print("{{\"family\":\"{s}\",\"sends\":", .{@tagName(f)});
+        if (f.takesScale()) {
+            try w.writeAll("{\"kind\":\"scale\",\"min\":1,\"max\":100,\"presets\":{");
+            for (f.spec().presets, 0..) |p, i| try w.print("{s}\"{s}\":{d}", .{ if (i > 0) "," else "", @tagName(p.word), p.value });
+            try w.writeAll("}}");
+        } else {
+            try w.writeAll("{\"kind\":\"word\",\"choices\":[");
+            for (f.sendsWords(), 0..) |x, i| try w.print("{s}\"{s}\"", .{ if (i > 0) "," else "", @tagName(x) });
+            try w.writeAll("]}");
+        }
+        const flag_arm: ?effort_mod.EffortArm = if (view.think) |e| blk: {
+            const arms = t.offeredArms();
+            break :blk effort_mod.armForWord(arms.slice(), @tagName(e));
+        } else null;
+        try w.print(",\"off_offerable\":{},\"default\":{{\"builtin\":\"{s}\",\"file\":", .{ f.offOfferable(), @tagName(b.default) });
+        try writeJson(w, if (edits.default) |d| @tagName(d) else null);
+        try w.print(",\"value\":\"{s}\",\"flag\":", .{@tagName(if (flag_arm) |a| a.effort else t.default)});
+        if (flag_arm != null) {
+            try w.print("\"--think {s}\"", .{@tagName(view.think.?)});
+        } else try w.writeAll("null");
+        try w.print(",\"locked\":{},\"source\":\"{s}\"}},\"rows\":[", .{ flag_arm != null, if (flag_arm != null) "flag" else if (edits.default != null) "file" else "default" });
+        for (effort_mod.table_words, 0..) |word, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.print("{{\"word\":\"{s}\",\"builtin\":", .{@tagName(word)});
+            try writeRow(w, b.rows[i]);
+            try w.writeAll(",\"file\":");
+            if (edits.rows[i].isEmpty()) try w.writeAll("null") else try writeJson(w, try effort_mod.rowJson(arena_state.allocator(), f, edits.rows[i]));
+            try w.writeAll(",\"value\":");
+            try writeRow(w, t.rows[i]);
+            try w.writeAll("}");
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]}");
+}
+
 pub fn render(
     allocator: std.mem.Allocator,
     file_path: []const u8,
@@ -251,6 +319,7 @@ pub fn render(
         default_port.port, if (port_pinned) "flag" else if (srv.port != null) "file" else "default", port_pinned, port_applies,
     });
     try w.writeAll("}");
+    try writeEffort(w, view);
 
     try w.writeAll(",\"models\":[");
     for (rows, 0..) |row, i| {
@@ -307,10 +376,26 @@ pub fn render(
 
 pub const Rejection = struct { status: u16, err_type: []const u8, message: []const u8 };
 
+/// One family's part of a save. A named row or default replaces the stored one; null takes the built-in back.
+pub const EffortPlan = struct {
+    named: bool = false,
+    /// The whole table back to built-in.
+    reset: bool = false,
+    /// Outer null: not named.
+    default: ??effort_mod.Effort = null,
+    rows: [effort_mod.table_words.len]??effort_mod.RowEdit = @splat(null),
+};
+
 pub const Plan = struct {
     server_edits: []const Edit = &.{},
     model_id: ?[]const u8 = null,
     model_edits: []const Edit = &.{},
+    effort: [effort_mod.families.len]EffortPlan = @splat(.{}),
+
+    fn namesEffort(self: Plan) bool {
+        for (self.effort) |e| if (e.named) return true;
+        return false;
+    }
 };
 
 pub const Parsed = union(enum) { ok: Plan, rejected: Rejection };
@@ -336,7 +421,41 @@ fn collect(arena: std.mem.Allocator, specs: []const model_settings.KeySpec, obj:
     return null;
 }
 
-/// `{"server": {key: value|null}, "model": "<id>", "set": {key: value|null}}`; every key is checked before anything is written.
+fn effortRejection(arena: std.mem.Allocator, f: effort_mod.Family, p: effort_mod.Problem) Parsed {
+    return reject(arena, 400, "invalid_setting", "effort {s}.{s}{s}{s}: {s}", .{ @tagName(f), p.key, if (p.field.len > 0) "." else "", p.field, p.why });
+}
+
+/// `{"<family>": null | {"default": word|null, "<word>": row|null}}`, each value checked against the family's template.
+fn collectEffort(arena: std.mem.Allocator, obj: std.json.ObjectMap, plan: *Plan) ?Parsed {
+    var it = obj.iterator();
+    while (it.next()) |kv| {
+        const f = effort_mod.Family.of(kv.key_ptr.*) orelse
+            return reject(arena, 400, "unknown_setting", "\"{s}\" has no effort table", .{kv.key_ptr.*});
+        const fp = &plan.effort[@intFromEnum(f)];
+        fp.named = true;
+        const v = kv.value_ptr.*;
+        if (v == .null) {
+            fp.reset = true;
+            continue;
+        }
+        if (v != .object) return reject(arena, 400, "invalid_request_error", "\"effort.{s}\" must be an object or null", .{@tagName(f)});
+        var rows = v.object.iterator();
+        while (rows.next()) |r| {
+            const name = r.key_ptr.*;
+            var problem: ?effort_mod.Problem = null;
+            if (std.mem.eql(u8, name, "default")) {
+                fp.default = if (r.value_ptr.* == .null) @as(?effort_mod.Effort, null) else effort_mod.parseDefault(r.value_ptr.*, &problem);
+            } else if (std.meta.stringToEnum(effort_mod.Effort, name)) |word| {
+                const i = effort_mod.rowIndex(word) orelse return effortRejection(arena, f, .{ .key = name, .why = "not an effort word" });
+                fp.rows[i] = if (r.value_ptr.* == .null) @as(?effort_mod.RowEdit, null) else effort_mod.parseRow(f, word, r.value_ptr.*, &problem);
+            } else problem = .{ .key = name, .why = "not an effort word" };
+            if (problem) |p| return effortRejection(arena, f, p);
+        }
+    }
+    return null;
+}
+
+/// `{"server": {key: value|null}, "model": "<id>", "set": {key: value|null}, "effort": {...}}`; every key is checked before anything is written.
 pub fn parseRequest(arena: std.mem.Allocator, body: []const u8) Parsed {
     const tree = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch
         return reject(arena, 400, "invalid_request_error", "Body must be JSON", .{});
@@ -358,6 +477,9 @@ pub fn parseRequest(arena: std.mem.Allocator, body: []const u8) Parsed {
         } else if (std.mem.eql(u8, k, "set")) {
             if (v != .object) return reject(arena, 400, "invalid_request_error", "\"set\" must be an object", .{});
             set_obj = v.object;
+        } else if (std.mem.eql(u8, k, "effort")) {
+            if (v != .object) return reject(arena, 400, "invalid_request_error", "\"effort\" must be an object", .{});
+            if (collectEffort(arena, v.object, &plan)) |r| return r;
         } else {
             return reject(arena, 400, "unknown_setting", "\"{s}\" is not a field of this request", .{k});
         }
@@ -368,8 +490,43 @@ pub fn parseRequest(arena: std.mem.Allocator, body: []const u8) Parsed {
         if (collect(arena, &model_settings.model_keys, obj, &edits)) |r| return r;
         plan.model_edits = edits.items;
     }
-    if (plan.server_edits.len == 0 and plan.model_edits.len == 0) return reject(arena, 400, "invalid_request_error", "Nothing to change", .{});
+    if (plan.server_edits.len == 0 and plan.model_edits.len == 0 and !plan.namesEffort()) return reject(arena, 400, "invalid_request_error", "Nothing to change", .{});
     return .{ .ok = plan };
+}
+
+/// Writes the named families' tables (only what differs from built-in) and publishes them for the next request. Every
+/// family is checked before any is written; returns the refusal text, or null.
+pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans: [effort_mod.families.len]EffortPlan) !?[]const u8 {
+    var file = model_settings.load(arena, io, path);
+    defer file.deinit();
+    var next: [effort_mod.families.len]effort_mod.Edits = undefined;
+    for (effort_mod.families, plans, &next) |f, p, *n| {
+        n.* = model_settings.effortEdits(&file, f, false);
+        if (!p.named) continue;
+        if (p.reset) n.* = .{};
+        if (p.default) |d| n.default = d;
+        for (p.rows, &n.rows) |r, *row| if (r) |given| {
+            row.* = given orelse .{};
+        };
+        if (effort_mod.checkTable(effort_mod.merge(f, n.*))) |problem| return try std.fmt.allocPrint(arena, "effort {s}.{s}: {s}", .{ @tagName(f), problem.key, problem.why });
+        n.* = effort_mod.normalize(f, n.*);
+    }
+    for (effort_mod.families, plans, next) |f, p, n| {
+        if (!p.named) continue;
+        var edits: [effort_mod.table_words.len + 1]Edit = undefined;
+        edits[0] = .{ .key = "default", .value = if (n.default) |d| .{ .string = @tagName(d) } else null };
+        for (effort_mod.table_words, n.rows, 1..) |word, row, i| edits[i] = .{ .key = @tagName(word), .value = if (row.isEmpty()) null else try effort_mod.rowJson(arena, f, row) };
+        var buf: [64]u8 = undefined;
+        try model_settings.writeEdits(arena, io, path, effort_mod.sectionName(&buf, f), &edits);
+        effort_mod.publish(f, n);
+        log.info("[effort] {s}: table saved, serving from the next request\n", .{@tagName(f)});
+    }
+    return null;
+}
+
+fn effortMessage(think: ?effort_mod.Effort, plans: [effort_mod.families.len]EffortPlan) []const u8 {
+    if (think != null) for (plans) |p| if (p.default != null) return "applies at once, from the next request; --think still picks the default word until a start without it";
+    return "applies at once, from the next request";
 }
 
 // ── HTTP ──
@@ -467,6 +624,7 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
         .default_models_dir = default_dir,
         .boot_roots = roots,
         .ask_bytes = server.diskAsk().bytes,
+        .think = effort_mod.think_effort_flag,
     });
     defer allocator.free(body);
     try server.sendResponse(stream, "200 OK", "application/json", body);
@@ -540,6 +698,13 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             if (edits.len > 0) try model_settings.writeEdits(a, io, p, section, edits);
         }
     }.run;
+    if (plan.namesEffort()) {
+        const refused = applyEffort(arena, stream.io, path, plan.effort) catch |err| return writeFailed(allocator, stream, err);
+        if (refused) |message| {
+            try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
+            return;
+        }
+    }
     write(allocator, stream.io, path, model_settings.server_section, plan.server_edits) catch |err| return writeFailed(allocator, stream, err);
     write(allocator, stream.io, path, model_path, plan.model_edits) catch |err| return writeFailed(allocator, stream, err);
 
@@ -561,6 +726,12 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         } else {
             try writeJson(w, applyModelsDir(sch, &message_buf));
         }
+    }
+    if (plan.namesEffort()) {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.writeAll("\"effort\":");
+        try writeJson(w, effortMessage(effort_mod.think_effort_flag, plan.effort));
     }
     if (plan.model_edits.len > 0) {
         if (!first) try w.writeAll(",");
@@ -981,4 +1152,151 @@ test "settings api: max_tokens round-trips as a positive integer and is refused 
     try testing.expect(std.mem.indexOf(u8, msg, "\"max_tokens\"") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "131072") != null);
     try testing.expect(refusalMessage(arena_state.allocator(), fit, null, &.{.{ .key = "max_tokens", .value = .{ .integer = 131072 } }}) == null);
+}
+
+fn renderJson(file: *const model_settings.Settings, view: ServerView) !std.json.Parsed(std.json.Value) {
+    const locks: model_settings.LaunchLocks = .{};
+    const body = try render(testing.allocator, "/h/s.json", file, &.{}, &locks, view);
+    defer testing.allocator.free(body);
+    return std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+}
+
+fn effortFamily(root: std.json.Value, family: []const u8) std.json.ObjectMap {
+    for (root.object.get("effort").?.object.get("families").?.array.items) |f| {
+        if (std.mem.eql(u8, f.object.get("family").?.string, family)) return f.object;
+    }
+    unreachable;
+}
+
+fn effortRow(fam: std.json.ObjectMap, word: []const u8) std.json.ObjectMap {
+    for (fam.get("rows").?.array.items) |r| if (std.mem.eql(u8, r.object.get("word").?.string, word)) return r.object;
+    unreachable;
+}
+
+test "settings api: an effort save names a family and its rows, and a value its template cannot take is refused by row" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const ok = parseRequest(a,
+        \\{"effort":{"qwen4_exp":{"default":"low","high":{"offered":true,"sends":"medium","cap":64},"max":null},"glm5_next":null}}
+    ).ok;
+    const q = ok.effort[@intFromEnum(effort_mod.Family.qwen4_exp)];
+    try testing.expect(q.named and !q.reset);
+    try testing.expectEqual(@as(?effort_mod.Effort, .low), q.default.?);
+    try testing.expectEqualDeep(effort_mod.RowEdit{ .offered = true, .sends = .{ .word = .medium }, .cap = @as(?i32, 64) }, q.rows[effort_mod.rowIndex(.high).?].?.?);
+    try testing.expect(q.rows[effort_mod.rowIndex(.max).?].? == null);
+    try testing.expect(q.rows[effort_mod.rowIndex(.low).?] == null);
+    try testing.expect(ok.effort[@intFromEnum(effort_mod.Family.glm5_next)].reset);
+    try testing.expect(!ok.effort[@intFromEnum(effort_mod.Family.deepseek_v41)].named);
+    try expectRejected("{\"effort\":{\"mimo_v2\":{\"default\":\"on\"}}}", 400, "unknown_setting");
+    try expectRejected("{\"effort\":{\"qwen4_exp\":{\"ultra\":{}}}}", 400, "invalid_setting");
+    try expectRejected("{\"effort\":{\"qwen4_exp\":{\"high\":{\"sends\":\"high\"}}}}", 400, "invalid_setting");
+    try expectRejected("{\"effort\":{\"deepseek_v41\":{\"medium\":{\"sends\":0}}}}", 400, "invalid_setting");
+    try expectRejected("{\"effort\":{\"glm5_next\":{\"low\":{\"cap\":-1}}}}", 400, "invalid_setting");
+    try expectRejected("{\"effort\":[]}", 400, "invalid_request_error");
+    switch (parseRequest(a, "{\"effort\":{\"qwen4_exp\":{\"high\":{\"sends\":\"high\"}}}}")) {
+        .ok => return error.TestExpectedRejection,
+        .rejected => |r| try testing.expectEqualStrings("effort qwen4_exp.high.sends: Qwen takes low, medium or xhigh", r.message),
+    }
+}
+
+test "settings api: GET carries each family's table, built-in and served value per field, and the --think lock" {
+    defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
+    var file = try model_settings.parse(testing.allocator, "{}");
+    defer file.deinit();
+    var e: effort_mod.Edits = .{};
+    e.rows[effort_mod.rowIndex(.medium).?] = .{ .sends = .{ .scale = 40 }, .cap = @as(?i32, 64) };
+    effort_mod.publish(.deepseek_v41, e);
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 0, .think = .xhigh };
+    const parsed = try renderJson(&file, view);
+    defer parsed.deinit();
+    const ef = parsed.value.object.get("effort").?.object;
+    try testing.expectEqualStrings("applies at once", ef.get("applies").?.string);
+    try testing.expectEqual(@as(usize, 3), ef.get("families").?.array.items.len);
+    const ds = effortFamily(parsed.value, "deepseek_v41");
+    try testing.expectEqualStrings("scale", ds.get("sends").?.object.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 50), ds.get("sends").?.object.get("presets").?.object.get("low").?.integer);
+    const med = effortRow(ds, "medium");
+    try testing.expectEqual(@as(i64, 62), med.get("builtin").?.object.get("sends").?.integer);
+    try testing.expectEqual(@as(i64, 40), med.get("file").?.object.get("sends").?.integer);
+    try testing.expectEqual(@as(i64, 64), med.get("value").?.object.get("cap").?.integer);
+    try testing.expect(effortRow(ds, "low").get("file").? == .null);
+    const ds_default = ds.get("default").?.object;
+    try testing.expect(ds_default.get("locked").?.bool);
+    try testing.expectEqualStrings("--think xhigh", ds_default.get("flag").?.string);
+    try testing.expectEqualStrings("xhigh", ds_default.get("value").?.string);
+    try testing.expectEqualStrings("high", ds_default.get("builtin").?.string);
+    const qwen = effortFamily(parsed.value, "qwen4_exp");
+    const high = effortRow(qwen, "high").get("builtin").?.object;
+    try testing.expect(!high.get("offered").?.bool);
+    try testing.expectEqualStrings("xhigh", high.get("fold_to").?.string);
+    try testing.expectEqual(@as(i64, 2048), effortRow(qwen, "low").get("builtin").?.object.get("cap").?.integer);
+    try testing.expect(effortRow(qwen, "off").get("builtin").?.object.get("sends").? == .null);
+    const glm = effortFamily(parsed.value, "glm5_next");
+    try testing.expect(!glm.get("off_offerable").?.bool);
+    // --think xhigh on GLM is served as max, so it pins GLM's default too.
+    try testing.expectEqualStrings("max", glm.get("default").?.object.get("value").?.string);
+    const plain = try renderJson(&file, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 0 });
+    defer plain.deinit();
+    try testing.expect(!effortFamily(plain.value, "qwen4_exp").get("default").?.object.get("locked").?.bool);
+}
+
+test "settings api: an effort save writes only what differs from built-in, takes hold at once, and a reset clears it" {
+    defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/model-settings.json", .{dir});
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = "{\"/m/a\":{\"ctx_size\":64}}" });
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const set = parseRequest(a, "{\"effort\":{\"qwen4_exp\":{\"high\":{\"offered\":true,\"sends\":\"medium\",\"cap\":64},\"low\":{\"offered\":true,\"cap\":2048}}}}").ok;
+    try testing.expect(try applyEffort(a, io, path, set.effort) == null);
+    try testing.expectEqualDeep(effort_mod.RowEdit{ .offered = true, .sends = .{ .word = .medium }, .cap = @as(?i32, 64) }, effort_mod.publishedEdits(.qwen4_exp).rows[effort_mod.rowIndex(.high).?]);
+    {
+        var s = model_settings.load(testing.allocator, io, path);
+        defer s.deinit();
+        const sec = s.parsed.?.value.object.get("effort:qwen4_exp").?.object;
+        try testing.expectEqual(@as(usize, 1), sec.count());
+        try testing.expectEqual(@as(i64, 64), sec.get("high").?.object.get("cap").?.integer);
+        try testing.expectEqual(@as(?u32, 64), s.lookup("/m/a").ctx_size);
+    }
+    // The default word must be offered; nothing is written when it is not.
+    const bad = parseRequest(a, "{\"effort\":{\"qwen4_exp\":{\"medium\":{\"offered\":false}}}}").ok;
+    try testing.expectEqualStrings("effort qwen4_exp.default: the default word must be offered", (try applyEffort(a, io, path, bad.effort)).?);
+    try testing.expect(effort_mod.publishedEdits(.qwen4_exp).rows[effort_mod.rowIndex(.medium).?].offered == null);
+    // A row named again replaces the stored row; a row not named keeps it.
+    const row = parseRequest(a, "{\"effort\":{\"qwen4_exp\":{\"default\":\"high\",\"low\":{\"cap\":null}}}}").ok;
+    try testing.expect(try applyEffort(a, io, path, row.effort) == null);
+    try testing.expectEqual(effort_mod.Effort.high, effort_mod.table(.qwen4_exp).default);
+    try testing.expectEqual(@as(?i32, null), effort_mod.table(.qwen4_exp).row(.low).cap);
+    try testing.expectEqual(@as(?i32, 64), effort_mod.table(.qwen4_exp).row(.high).cap);
+    // Reset: the section goes, the model's section stays.
+    const reset = parseRequest(a, "{\"effort\":{\"qwen4_exp\":null}}").ok;
+    try testing.expect(try applyEffort(a, io, path, reset.effort) == null);
+    try testing.expectEqualDeep(effort_mod.builtin(.qwen4_exp), effort_mod.table(.qwen4_exp));
+    var s = model_settings.load(testing.allocator, io, path);
+    defer s.deinit();
+    try testing.expect(s.parsed.?.value.object.get("effort:qwen4_exp") == null);
+    try testing.expectEqual(@as(?u32, 64), s.lookup("/m/a").ctx_size);
+}
+
+test "settings api: a start reads the file's tables, skipping each bad field with a log line" {
+    defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
+    var file = try model_settings.parse(testing.allocator,
+        \\{"effort:glm5_next":{"low":{"cap":64,"sends":"medium"},"off":{"offered":true}},"effort:deepseek_v41":{"default":"medium","medium":{"offered":false}}}
+    );
+    defer file.deinit();
+    model_settings.publishEffortTables(&file);
+    try testing.expectEqualDeep(effort_mod.Row{ .offered = true, .sends = .{ .word = .low }, .cap = 64 }, effort_mod.table(.glm5_next).row(.low));
+    try testing.expect(!effort_mod.table(.glm5_next).row(.off).offered);
+    // An unoffered default drops the file's default first.
+    try testing.expectEqual(effort_mod.Effort.high, effort_mod.table(.deepseek_v41).default);
+    try testing.expect(!effort_mod.table(.deepseek_v41).row(.medium).offered);
+    try testing.expectEqualDeep(effort_mod.builtin(.qwen4_exp), effort_mod.table(.qwen4_exp));
 }

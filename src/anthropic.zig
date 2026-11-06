@@ -804,7 +804,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         config.defaultEnableThinking()
     else
         false;
-    var reasoning_budget: i32 = model_mod.defaultThinkBudget(config, server_mod.server_config.default_reasoning_budget);
+    var reasoning_budget: i32 = model_mod.defaultThinkBudget(config);
     var budget_explicit = false;
     if (root.get("thinking")) |think_val| {
         if (think_val == .object) {
@@ -833,15 +833,16 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
         return false;
     }
-    var effort_word: ?[]const u8 = model_mod.defaultEffortWord(config);
+    var effort_word: ?[]const u8 = model_mod.defaultTemplateEffort(config);
     if (output_cfg.effort) |word| {
-        const cfg = reasoningEffortFromWord(word, server_mod.server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), effort_mod.effortArms(config.model_type)) catch {
+        const served_arms = effort_mod.servedArms(config.model_type);
+        const cfg = reasoningEffortFromWord(word, effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
             const msg = try effortRefusalFor(allocator, lm, word);
             defer allocator.free(msg);
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
             return false;
         };
-        effort_word = cfg.effort;
+        effort_word = cfg.sends;
         p.effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);

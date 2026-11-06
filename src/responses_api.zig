@@ -554,23 +554,25 @@ fn handleResponsesInner(
     };
 
     // ── reasoning ──
-    // Budget precedence as on chat: reasoning_budget_tokens > the effort word's budget >
-    // --reasoning-budget.
-    var reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_mod.server_config.default_reasoning_budget);
+    // Budget precedence as on chat: reasoning_budget_tokens > the effort word's cap.
+    var reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"));
     if (reasoning_cfg.effort == null and (root.get("reasoning") == null or reasoning_cfg.enable)) reasoning_cfg.effort = model_mod.defaultEffortWord(config);
     var enable_thinking = reasoning_cfg.enable;
-    var effort_budget: i32 = model_mod.defaultThinkBudget(config, server_mod.server_config.default_reasoning_budget);
+    var effort_budget: i32 = model_mod.defaultThinkBudget(config);
     var effort_notice: ?EffortNotice = null;
     defer if (effort_notice) |n| n.deinit(allocator);
     defer clearEffortNotice(stream);
+    var template_effort = reasoning_cfg.effort;
     if (reasoning_cfg.effort) |word| {
-        const cfg = reasoningEffortFromWord(word, server_mod.server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), effort_mod.effortArms(config.model_type)) catch {
+        const served_arms = effort_mod.servedArms(config.model_type);
+        const cfg = reasoningEffortFromWord(word, effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
             const msg = try effortRefusalFor(allocator, lm, word);
             defer allocator.free(msg);
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
             return;
         };
         reasoning_cfg.effort = cfg.effort;
+        template_effort = cfg.sends;
         enable_thinking = cfg.enable;
         effort_budget = cfg.budget;
         effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
@@ -683,7 +685,7 @@ fn handleResponsesInner(
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
     const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, template_effort, false);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !active_has_tools and enable_thinking) {
@@ -701,7 +703,7 @@ fn handleResponsesInner(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, template_effort, false);
             log.info("[grammar] reasoning protocol unsupported for this model/prompt; rerendered with thinking off\n", .{});
         },
         .no_mask, .token_zero => schema_proto_active = false,

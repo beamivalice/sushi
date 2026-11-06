@@ -8,6 +8,7 @@ const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
 const default_port = @import("default_port.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
+const effort = @import("effort.zig");
 
 /// Where a load's value for one key came from. A request's own field outranks all of them.
 pub const Source = enum { flag, model_settings, default };
@@ -675,6 +676,36 @@ pub fn modelObject(self: *const Settings, model_path: []const u8) ?std.json.Obje
         };
     }
     return null;
+}
+
+/// The family's effort table as the file holds it, checked as a load checks it: a bad field or a default left
+/// unoffered is skipped, each with a log line when `log_problems`.
+pub fn effortEdits(file: *const Settings, f: effort.Family, log_problems: bool) effort.Edits {
+    const p = file.parsed orelse return .{};
+    if (p.value != .object) return .{};
+    var buf: [64]u8 = undefined;
+    const v = p.value.object.get(effort.sectionName(&buf, f)) orelse return .{};
+    const read = effort.parseSection(f, v, log_problems).edits;
+    const kept = effort.servable(f, read);
+    if (log_problems and !std.meta.eql(kept, read)) log.warn("[effort] model-settings.json effort:{s}: the default word must be offered; the edit that unoffered it is ignored\n", .{@tagName(f)});
+    return effort.normalize(f, kept);
+}
+
+/// Publishes every family's table from the file: what a start serves until a settings save replaces it.
+pub fn publishEffortTables(file: *const Settings) void {
+    for (effort.families) |f| {
+        const e = effortEdits(file, f, true);
+        effort.publish(f, e);
+        if (!std.meta.eql(e, effort.Edits{})) log.info("[effort] {s}: table from model-settings.json\n", .{@tagName(f)});
+    }
+}
+
+/// Reads the default settings file and publishes its effort tables.
+pub fn loadEffortTables(alloc: std.mem.Allocator, io: std.Io) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var s = load(alloc, io, defaultPath(&buf));
+    defer s.deinit();
+    publishEffortTables(&s);
 }
 
 /// A launch flag that pins a key: set by `main.zig` once the arguments are parsed, read by the settings API.

@@ -483,6 +483,32 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 .card-b > .set { padding-left: 0; }
 .card-b > .set.dirty { padding-left: var(--s3); }
 .bulk { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s3); }
+.eff-tbl td, .eff-tbl th { vertical-align: middle; }
+.eff-tbl tbody tr { cursor: default; }
+.eff-tbl tbody tr.sel > * { background: var(--accent-soft); }
+.eff-tbl tbody tr.sel > :first-child { box-shadow: inset 3px 0 0 var(--accent-fill); }
+.eff-tbl tbody th { font-weight: 600; border-bottom: 1px solid var(--border); }
+.eff-tbl tbody tr:last-child > th { border-bottom: 0; }
+.eff-tbl tr.off-row .word { color: var(--text-3); }
+.eff-tbl tbody tr.changed > :first-child { box-shadow: inset 3px 0 0 var(--accent-fill); }
+.eff-tbl .tag { margin-left: 6px; padding: 0 6px; border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent); font-size: var(--fs-xs); font-weight: 600; }
+.eff-tbl input[type="text"], .eff-tbl select { height: var(--h-ctl-sm); width: 112px; }
+.eff-tbl select { width: 196px; }
+.eff-tbl input::placeholder, .eff-tbl select.builtin { color: var(--text-3); }
+.eff-tbl input[aria-invalid="true"], .eff-tbl select[aria-invalid="true"] { border-color: var(--err); }
+.eff-tbl .bad { display: block; font-size: var(--fs-xs); color: var(--err); white-space: normal; max-width: 220px; }
+.eff-tbl .presets { display: inline-flex; gap: 4px; margin-left: 6px; }
+.eff-tbl .presets button { height: 22px; padding: 0 8px; border-radius: var(--r-pill); border: 1px solid var(--border); background: var(--surface-2); color: var(--text-2); font-size: var(--fs-xs); font-weight: 600; cursor: pointer; }
+.eff-tbl .presets button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-fill); }
+.eff-tbl .muted { color: var(--text-3); }
+.eff-tbl input[type="checkbox"], .eff-tbl input[type="radio"] { width: 16px; height: 16px; accent-color: var(--accent-fill); }
+.sec-h { margin: var(--s3) 0 calc(-1 * var(--s2)); font-size: var(--fs-xs); font-weight: 650; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
+.sec-h:first-of-type { margin-top: 0; }
+.think-line { color: var(--text-2); font-size: var(--fs-sm); margin-top: var(--s1); }
+.think-line a { color: var(--accent); }
+.eff-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s2); margin-bottom: var(--s3); }
+.eff-preview { margin-top: var(--s3); padding: var(--s2) var(--s3); border-radius: var(--r-md); background: var(--surface-2); font-size: var(--fs-sm); color: var(--text-2); }
+.eff-preview .mono { color: var(--text); overflow-wrap: anywhere; display: block; margin-top: 2px; }
 
 /* Dashboard (the same cards, tiles, badges and tables as the other tabs) */
 #dashPanel { --d-pad: max(20px, calc((100% - 1280px) / 2 + 20px)); }
@@ -933,6 +959,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <div class="page-body narrow">
     <div id="settingsAlert" class="alert err" role="alert" hidden></div>
     <div id="settingsSkel"><div class="card"><div class="skel"></div><div class="skel"></div></div></div>
+    <h2 class="sec-h" id="secStorage" hidden>Storage</h2>
     <section class="card" id="cacheCard" hidden>
       <div class="card-h">SSD prefix cache</div>
       <div class="card-b">
@@ -958,6 +985,25 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <div class="kv" id="dirKv" style="margin-top:8px"></div>
       </div>
     </section>
+    <h2 class="sec-h" id="secInference" hidden>Inference</h2>
+    <section class="card" id="effortCard" hidden>
+      <div class="card-h"><span>Thinking effort</span><span class="badges" id="effortBadges"></span></div>
+      <div class="card-b">
+        <div class="eff-head">
+          <div class="seg" id="effortTabs" role="tablist" aria-label="Model family"></div>
+          <span class="sub muted" id="effortFlag"></span>
+        </div>
+        <div class="help" id="effortHelp" style="color:var(--text-2);font-size:var(--fs-sm);margin-bottom:var(--s2)">What each effort word a request names does on this family: whether it is offered, what the chat template receives and how many thinking tokens it may spend. Changes apply to the next request.</div>
+        <div class="tablewrap"><table class="tbl eff-tbl" id="effortTbl">
+          <thead><tr><th>Word</th><th><span class="tip-u" tabindex="0" data-tip="Whether a request may name this word. Unticked, it is refused. Qwen has no high or max level and GLM no medium or xhigh: by default those words use the nearest level, and the reply carries an effort_notice.">Offered</span></th><th><span class="tip-u" tabindex="0" data-tip="The value the chat template receives as its reasoning effort. Qwen takes low, medium or xhigh; GLM low, high or max; DeepSeek a number from 1 to 100. Grey is the default.">Sends</span></th><th><span class="tip-u" tabindex="0" data-tip="Thinking tokens before the server closes the thought. Blank keeps the default cap; none removes it. A request's own budget outranks it.">Cap</span></th><th><span class="tip-u" tabindex="0" data-tip="The word a request that names no effort runs at. It must be offered. --think at launch outranks it.">Default</span></th></tr></thead>
+          <tbody id="effortRows"></tbody>
+        </table></div>
+        <div class="eff-preview" id="effortPreview" aria-live="polite"></div>
+        <div class="bulk"><button class="btn sm primary" id="effortSave" type="button" hidden>Save</button><button class="btn sm" id="effortUndo" type="button" hidden>Discard changes</button><span class="spacer" style="flex:1"></span><button class="btn sm danger" id="effortReset" type="button" hidden>Reset to defaults</button></div>
+        <div class="bad" id="effortErr" role="alert" style="color:var(--err);font-size:var(--fs-sm);margin-top:var(--s2)" hidden></div>
+      </div>
+    </section>
+    <h2 class="sec-h" id="secServer" hidden>Server</h2>
     <section class="card" id="portCard" hidden>
       <div class="card-h">Server port</div>
       <div class="card-b"><div id="portSet"></div></div>
@@ -3063,6 +3109,94 @@ async function init() {
 init();
 </script>
 <script id="adminScript">
+/* Thinking effort tables (GET/POST /v1/settings `effort`): one per family, edited on the Settings page. */
+const EFFORT_WORDS = ["off", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_FAMILY_LABEL = { qwen4_exp: "Qwen", deepseek_v41: "DeepSeek", glm5_next: "GLM" };
+// A word the family has no level for (Qwen high/max, GLM medium/xhigh) that still uses a near one: accepted, served
+// as that word with a notice. Picking a value or a cap serves the word as itself; unticking refuses it.
+function effortIsFold(row, d) {
+  return !!row.builtin.fold_to && d.offered && !d.own && d.sends === "" && d.cap === "";
+}
+// The text the family's chat template renders for a value it receives.
+function effortTemplateText(family, sends) {
+  if (family === "deepseek_v41") return `Reasoning Effort: ${sends} (range 1-100, the higher the value, the more thorough the reasoning)`;
+  if (family === "glm5_next") return `Reasoning Effort: ${String(sends).charAt(0).toUpperCase()}${String(sends).slice(1)}`;
+  if (sends === "low") return "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+  if (sends === "xhigh") return "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+  return `reasoning_effort = ${sends} (the template adds no instruction line)`;
+}
+const effortUses = (family, word, target) => `${EFFORT_FAMILY_LABEL[family]} has no ${word} level, so ${word} uses ${target}`;
+// Whether a row's draft differs from the family's defaults.
+function effortRowChanged(row, d) {
+  const out = effortPostBody({ family: "", default: { builtin: "" }, rows: [row], sends: { kind: "word" } }, { [row.word]: d }, "").effort[""][row.word];
+  return out !== null;
+}
+// A row's draft: { offered: bool, own: bool, sends: text ("" = default), cap: text ("" = default, "none" = no cap) }.
+function effortDraftOf(row) {
+  const f = row.file || {};
+  return { offered: row.value.offered || !!row.value.fold_to, own: f.offered === true, sends: "sends" in f && f.sends != null ? String(f.sends) : "", cap: "cap" in f ? (f.cap == null ? "none" : String(f.cap)) : "" };
+}
+function effortRowValue(row, d) {
+  const sends = d.sends === "" ? row.builtin.sends : row.value.sends_kind === "scale" || /^\d+$/.test(d.sends) ? Number(d.sends) : d.sends;
+  const cap = d.cap === "" ? row.builtin.cap : d.cap === "none" ? null : Number(d.cap);
+  return { offered: d.offered, sends, cap };
+}
+// What is wrong with a row's draft, or null. `fam` is the family's GET entry.
+function effortRowProblem(fam, word, d, defaultWord) {
+  if (word !== "off" && d.sends !== "") {
+    if (fam.sends.kind === "scale") {
+      const n = Number(d.sends);
+      if (!/^\d+$/.test(d.sends.trim()) || n < fam.sends.min || n > fam.sends.max) return `Sends: enter a whole number from ${fam.sends.min} to ${fam.sends.max}.`;
+    } else if (!fam.sends.choices.includes(d.sends)) return `Sends: ${EFFORT_FAMILY_LABEL[fam.family]} takes ${fam.sends.choices.join(", ")}.`;
+  }
+  if (word !== "off" && d.cap !== "" && d.cap !== "none") {
+    const t = d.cap.trim(), n = Number(t);
+    if (!/^\d+$/.test(t) || n < 1 || n > 2147483647) return "Cap: enter a whole number of tokens, 1 or more, or none.";
+  }
+  if (word === "off" && d.offered && !fam.off_offerable) return "Offered: this template has no thinking-off switch.";
+  if (word === defaultWord && (!d.offered || effortIsFold(fam.rows.find((r) => r.word === word), d))) return "The default word must be offered as itself.";
+  return null;
+}
+// The preview of one row: what a request naming `word` gets. `drafts` maps every word to its draft.
+function effortPreview(fam, word, drafts) {
+  const rows = Object.fromEntries(fam.rows.map((r) => [r.word, r]));
+  const own = new Set(EFFORT_WORDS.filter((w) => drafts[w].offered && !effortIsFold(rows[w], drafts[w])));
+  let served = word, lead = "";
+  if (!drafts[word].offered) return { head: `${word} is not offered: a request for it is refused.`, text: "" };
+  if (!own.has(word)) {
+    served = rows[word].builtin.fold_to;
+    if (!own.has(served)) return { head: `${effortUses(fam.family, word, served)}, which is not offered: a request for ${word} is refused.`, text: "" };
+    lead = `${effortUses(fam.family, word, served)}; the reply carries an effort_notice. `;
+  }
+  if (served === "off") return { head: "off: thinking is off; the template closes the thought before the reply.", text: "" };
+  const v = effortRowValue(rows[served], drafts[served]);
+  const capText = v.cap != null ? `cap ${v.cap}, then the thought is closed` : "no cap";
+  return { head: `${lead}${served} sends ${fam.sends.kind === "scale" ? v.sends : `"${v.sends}"`}; ${capText}.`, text: effortTemplateText(fam.family, v.sends) };
+}
+// A model's one-line thinking summary from its /v1/models row; null when the server lists no efforts for it.
+function effortSummary(m) {
+  const words = m?.reasoning_efforts;
+  if (!Array.isArray(words) || !words.length) return null;
+  const family = m.meta?.architecture;
+  if (!(family in EFFORT_FAMILY_LABEL)) return null;
+  const caps = Object.entries(m.reasoning_effort_budgets ?? {}).map(([w, n]) => `${w} ${n}`);
+  const parts = [`Thinking: ${m.default_reasoning_effort ?? words[0]} by default`, caps.length ? `${caps.join(" / ")} tokens` : "no token caps"];
+  return { text: parts.join(" · "), family };
+}
+// The POST body that makes the file hold `drafts`: every row and the default word, null where it is the default.
+function effortPostBody(fam, drafts, defaultWord) {
+  const body = { default: defaultWord === fam.default.builtin ? null : defaultWord };
+  for (const row of fam.rows) {
+    const d = drafts[row.word], out = {};
+    if (row.builtin.fold_to) { if (!d.offered) out.offered = false; else if (!effortIsFold(row, d)) out.offered = true; }
+    else if (d.offered !== row.builtin.offered) out.offered = d.offered;
+    if (row.word !== "off" && d.sends !== "") out.sends = fam.sends.kind === "scale" ? Number(d.sends) : d.sends;
+    if (row.word !== "off" && d.cap !== "") out.cap = d.cap === "none" ? null : Number(d.cap);
+    body[row.word] = Object.keys(out).length ? out : null;
+  }
+  return { effort: { [fam.family]: body } };
+}
+
 /* Models and Settings views: model-settings.json and the SSD prefix cache, through /v1/settings and /v1/prefix-cache. */
 function adminBytes(n) {
   n = Number(n) || 0;
@@ -3547,6 +3681,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       h("button", { class: "btn sm primary", type: "button", text: "View update", onclick: () => { D.pick = F.pick; q("modelsTabAvailable").click(); } }));
     F.saveErr = h("div", { class: "alert err", role: "alert", hidden: true });
     F.rows = h("div", { class: "rows" });
+    F.think = h("div", { class: "think-line", hidden: true });
     F.cacheKv = h("div", { class: "kv" });
     F.cacheBtn = h("button", { class: "btn sm danger", type: "button", onclick: () => clearModel(F.id) });
     F.cacheSect = h("div", { class: "sect", hidden: true }, h("h3", { text: "SSD prefix cache" }), h("div", { class: "lead", text: "Saved conversations, so a follow-up skips re-reading its prompt." }), F.cacheKv, h("div", {}, F.cacheBtn));
@@ -3557,7 +3692,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const lead = h("div", { class: "lead", text: "Saved in model-settings.json. They apply the next time this model loads; a launch flag outranks the file." });
     delete q("modelsDetail").dataset.sig;
     q("modelsDetail").replaceChildren(h("div", { class: "d-head" }, h("div", { class: "grow" }, F.name, F.facts), F.actions), F.alert,
-      h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.callout, F.update, F.saveErr, F.rows), F.cacheSect, F.savebar);
+      h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.think, F.callout, F.update, F.saveErr, F.rows), F.cacheSect, F.savebar);
   }
   function buildRows(F, m) {
     const specs = F.specs = specsOf(m), P = per(F.id);
@@ -3576,6 +3711,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const words = pend ? (pend === "unload" ? "Unloading…" : "Loading…") : { ready: "Loaded", loading: "Loading…", error: "Load failed" }[m.state] ?? "Not loaded";
     const facts = [m.bytes_on_disk && [`${adminBytes(m.bytes_on_disk)} on disk`, "Size of the pack's files on this disk."], m.bytes_linked > 0 && [`${adminBytes(m.bytes_linked)} linked from elsewhere`, "Bytes the pack folder reaches through links to files kept elsewhere."], m.state === "ready" && m.bytes_resident && [`${adminBytes(m.bytes_resident)} in memory`, "Memory the loaded model holds now: its weights and caches."], m.context_length && [`${adminTokens(m.context_length)} max context`, "The most tokens a request may hold, prompt and reply together."], (m.input_modalities ?? []).includes("image") && ["sees images", "Takes images as input: the chat shows an attach button."], streamsExperts(m) ? ["streams experts", "Its experts stay on the SSD and are read as layers need them, so it runs in less memory than its size."] : m.streaming && ["can stream experts", "When memory is short its experts can stay on the SSD (--ssd-budget-gb)."]].filter(Boolean);
     fill(F.facts, [dotOf(m), words, ...facts.map(([t]) => t), m.path].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map(([t, tip]) => h("span", { class: "tip-u", tabindex: "0", "data-tip": tip, text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
+    const think = effortSummary(modelStore.list.find((x) => x.id === m.id));
+    setHidden(F.think, !think);
+    if (think) fill(F.think, JSON.stringify(think), () => [h("span", { text: think.text }), " · ", h("a", { href: "/settings", "data-fam": think.family, text: "Edit",
+      "data-tip": `Edit the ${EFFORT_FAMILY_LABEL[think.family]} thinking-effort table on Settings.`, onclick: (e) => { e.preventDefault(); openEffort(think.family); } })]);
     const stale = needsReload(m);
     fill(F.actions, `${m.state}|${pend ?? ""}|${stale}|${evictNote(m)}`, () => {
       const btn = (text, kind, cls = "", busy = false, title = "") => h("button", { class: `btn sm ${cls}`, type: "button", text, title: title || null, disabled: busy, "aria-busy": busy ? "true" : null, onclick: () => actOn(F.id, kind) });
@@ -3744,6 +3883,155 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     return { key, row, btns, help };
   });
 
+  // The thinking-effort card: one tab per family, a row per effort word.
+  const E = { fam: null, drafts: {}, defaults: {}, sel: {}, errs: {}, serr: "", sig: {} };
+  const effFam = () => A.settings?.effort?.families?.find((f) => f.family === E.fam);
+  function effortBase(fam) { return { rows: Object.fromEntries(fam.rows.map((r) => [r.word, effortDraftOf(r)])), def: fam.default.file ?? fam.default.builtin }; }
+  // The drafts follow the server until the user edits; a save or a reset drops them.
+  function effortSync(fam) {
+    const sig = JSON.stringify(fam);
+    if (E.sig[fam.family] === sig && E.drafts[fam.family]) return;
+    E.sig[fam.family] = sig;
+    if (!E.drafts[fam.family] || !effortDirty(fam)) { const b = effortBase(fam); E.drafts[fam.family] = b.rows; E.defaults[fam.family] = b.def; }
+  }
+  function effortDirty(fam) {
+    const b = effortBase(fam), d = E.drafts[fam.family];
+    return !!d && (JSON.stringify(b.rows) !== JSON.stringify(d) || b.def !== E.defaults[fam.family]);
+  }
+  const effortTabs = q("effortTabs");
+  function effortTab(next, focus) {
+    if (!next || next === E.fam) return;
+    E.fam = next; E.serr = "";
+    renderEffort(A.settings.effort);
+    if (focus) effortTabs.querySelector(`[data-fam="${next}"]`)?.focus();
+  }
+  effortTabs.addEventListener("keydown", (e) => {
+    const fams = [...effortTabs.querySelectorAll("button")].map((b) => b.dataset.fam), i = fams.indexOf(E.fam);
+    const step = { ArrowRight: 1, ArrowLeft: -1, Home: -i, End: fams.length - 1 - i }[e.key];
+    if (step === undefined) return;
+    e.preventDefault();
+    effortTab(fams[(i + step + fams.length) % fams.length], true);
+  });
+  function effortEdit(word, change) {
+    const fam = effFam();
+    Object.assign(E.drafts[fam.family][word], change);
+    E.sel[fam.family] = word; E.serr = "";
+    renderEffort(A.settings.effort);
+  }
+  function effortRowNode(fam, row, locked) {
+    const word = row.word, d = E.drafts[fam.family][word], off = word === "off", id = `eff-${word}`;
+    const fold = row.builtin.fold_to;
+    const offeredBox = h("input", { type: "checkbox", role: "switch", id: `${id}-on`, "aria-label": `Accept ${word}`, checked: d.offered, disabled: off && !fam.off_offerable,
+      "data-tip": off && !fam.off_offerable ? "This template has no thinking-off switch." : fold ? `${effortUses(fam.family, word, fold)}. Untick to refuse ${word}.` : `Default: ${row.builtin.offered ? "offered" : "not offered"}.`,
+      onchange: (e) => effortEdit(word, { offered: e.currentTarget.checked, own: e.currentTarget.checked && d.own }) });
+    let sendsCell;
+    if (off) sendsCell = h("span", { class: "muted", text: "thinking off" });
+    else if (fam.sends.kind === "scale") {
+      const box = h("input", { type: "text", inputmode: "numeric", autocomplete: "off", id: `${id}-sends`, "aria-label": `${word} sends`, placeholder: String(row.builtin.sends), value: d.sends,
+        oninput: (e) => { E.drafts[fam.family][word].sends = e.currentTarget.value.trim(); E.sel[fam.family] = word; E.serr = ""; effortPatch(); } });
+      const chips = h("span", { class: "presets", role: "group", "aria-label": `${word} presets` }, ...Object.entries(fam.sends.presets).map(([name, n]) =>
+        h("button", { type: "button", text: String(n), "data-tip": `${name}: the encoder's own ${name} is ${n}.`, "aria-pressed": String(d.sends === String(n) || (d.sends === "" && row.builtin.sends === n)),
+          onclick: () => effortEdit(word, { sends: n === row.builtin.sends ? "" : String(n) }) })));
+      sendsCell = h("span", { style: "display:inline-flex;align-items:center" }, box, chips);
+    } else {
+      const foldNow = effortIsFold(row, d) || (!!fold && !d.offered);
+      sendsCell = h("select", { id: `${id}-sends`, "aria-label": `${word} sends`, class: d.sends === "" ? "builtin" : "",
+        "data-tip": fold ? `${effortUses(fam.family, word, fold)}. Pick a value to give ${word} its own.` : null,
+        onchange: (e) => effortEdit(word, { sends: e.currentTarget.value, offered: e.currentTarget.value !== "" || d.offered }) },
+        h("option", { value: "", text: foldNow ? `same as ${fold}` : String(row.builtin.sends) }), ...fam.sends.choices.map((c) => h("option", { value: c, text: c })));
+      sendsCell.value = d.sends;
+    }
+    const capCell = off ? h("span", { class: "muted", text: "-" }) : h("input", { type: "text", inputmode: "numeric", autocomplete: "off", id: `${id}-cap`, "aria-label": `${word} cap in tokens`,
+      placeholder: effortIsFold(row, d) ? `same as ${fold}` : row.builtin.cap != null ? String(row.builtin.cap) : "none", value: d.cap,
+      oninput: (e) => { E.drafts[fam.family][word].cap = e.currentTarget.value.trim(); E.sel[fam.family] = word; E.serr = ""; effortPatch(); } });
+    const radio = h("input", { type: "radio", name: "effortDefault", id: `${id}-def`, "aria-label": `${word} is the default`, checked: E.defaults[fam.family] === word, disabled: locked,
+      onchange: () => { E.defaults[fam.family] = word; E.sel[fam.family] = word; E.serr = ""; renderEffort(A.settings.effort); } });
+    const bad = h("span", { class: "bad", role: "alert", "data-bad": word });
+    const tr = h("tr", { "data-word": word, class: off ? "off-row" : "" },
+      h("th", { scope: "row", class: "word" }, h("span", { text: word }), h("span", { class: "tag", "data-changed": "", hidden: true, text: "changed" }), bad), h("td", {}, offeredBox), h("td", {}, sendsCell), h("td", {}, capCell), h("td", {}, radio));
+    tr.addEventListener("focusin", () => { if (E.sel[fam.family] !== word) { E.sel[fam.family] = word; effortPatch(); } });
+    tr.addEventListener("click", () => { if (E.sel[fam.family] !== word) { E.sel[fam.family] = word; effortPatch(); } });
+    return tr;
+  }
+  // The parts that change as the user types: errors, the selection, the preview and the buttons.
+  function effortPatch() {
+    const ef = A.settings?.effort, fam = effFam();
+    if (!fam) return;
+    const drafts = E.drafts[fam.family], def = E.defaults[fam.family], sel = E.sel[fam.family] ?? def;
+    let invalid = false;
+    for (const tr of q("effortRows").querySelectorAll("tr")) {
+      const word = tr.dataset.word, msg = effortRowProblem(fam, word, drafts[word], def) || (E.serr && new RegExp(`\\b${word}\\b`).test(E.serr.split(":")[0]) ? E.serr : "");
+      invalid ||= !!effortRowProblem(fam, word, drafts[word], def);
+      setText(tr.querySelector("[data-bad]"), msg);
+      for (const n of tr.querySelectorAll("input[type=text], select")) n.setAttribute("aria-invalid", String(!!msg && ((/^Sends/.test(msg) && /sends$/.test(n.id)) || (/^Cap/.test(msg) && /cap$/.test(n.id)))));
+      tr.classList.toggle("sel", word === sel);
+      const box = tr.querySelector(`#eff-${word}-sends`), row = fam.rows.find((r) => r.word === word), fold = row.builtin.fold_to;
+      if (box && box.tagName === "SELECT") {
+        box.classList.toggle("builtin", box.value === "");
+        setText(box.options[0], fold && (effortIsFold(row, drafts[word]) || !drafts[word].offered) ? `same as ${fold}` : String(row.builtin.sends));
+      }
+      const capBox = tr.querySelector(`#eff-${word}-cap`), capHint = effortIsFold(row, drafts[word]) ? `same as ${fold}` : row.builtin.cap != null ? String(row.builtin.cap) : "none";
+      const changed = effortRowChanged(row, drafts[word]);
+      tr.classList.toggle("changed", changed);
+      setHidden(tr.querySelector("[data-changed]"), !changed);
+      if (capBox && capBox.placeholder !== capHint) capBox.placeholder = capHint;
+      for (const b of tr.querySelectorAll(".presets button")) b.setAttribute("aria-pressed", String(drafts[word].sends === b.textContent || (drafts[word].sends === "" && String(fam.rows.find((r) => r.word === word).builtin.sends) === b.textContent)));
+    }
+    const p = effortPreview(fam, sel, drafts);
+    fill(q("effortPreview"), JSON.stringify(p), () => [h("span", { text: p.head }), ...(p.text ? [h("span", { class: "mono", text: p.text })] : [])]);
+    const dirty = effortDirty(fam), hasFile = fam.rows.some((r) => r.file) || fam.default.file != null;
+    setHidden(q("effortSave"), !dirty);
+    setHidden(q("effortUndo"), !dirty);
+    q("effortSave").disabled = invalid || q("effortSave").getAttribute("aria-busy") === "true";
+    setHidden(q("effortReset"), !hasFile);
+    if (q("effortReset").getAttribute("aria-busy") !== "true") setText(q("effortReset"), `Reset ${EFFORT_FAMILY_LABEL[fam.family]} to defaults`);
+    setText(q("effortErr"), E.serr && !/^(off|low|medium|high|xhigh|max|default)\b/.test(E.serr) ? E.serr : "");
+    setHidden(q("effortErr"), !q("effortErr").textContent);
+    badges(q("effortBadges"), { locked: false, file: hasFile ? true : null }, ef.applies);
+  }
+  function renderEffort(ef) {
+    if (!ef) return;
+    const fams = ef.families ?? [];
+    if (!E.fam || !fams.some((f) => f.family === E.fam)) E.fam = fams[0]?.family ?? null;
+    fill(effortTabs, fams.map((f) => f.family).join() + E.fam, () => fams.map((f) => h("button", { type: "button", role: "tab", "data-fam": f.family, text: EFFORT_FAMILY_LABEL[f.family] ?? f.family,
+      "aria-selected": String(f.family === E.fam), "aria-pressed": String(f.family === E.fam), tabindex: f.family === E.fam ? "0" : "-1", onclick: () => effortTab(f.family) })));
+    const fam = effFam();
+    if (!fam) return;
+    effortSync(fam);
+    const locked = !!fam.default.locked;
+    setText(q("effortFlag"), locked ? `Default set by ${fam.default.flag} at launch` : "");
+    const sig = JSON.stringify([fam, E.drafts[fam.family], E.defaults[fam.family]]);
+    const focusId = document.activeElement?.id;
+    fill(q("effortRows"), sig, () => fam.rows.map((r) => effortRowNode(fam, r, locked)));
+    if (focusId && document.activeElement?.id !== focusId) document.getElementById(focusId)?.focus();
+    effortPatch();
+  }
+  async function effortSave(body, btn, label, done) {
+    await withBusy(btn, label, async () => {
+      try {
+        const r = await postJson("/v1/settings", body);
+        E.serr = "";
+        delete E.drafts[E.fam];
+        toast(typeof r.applied?.effort === "string" ? sentence(r.applied.effort) : done);
+      } catch (e) { E.serr = adminErrorText(e).replace(/^effort [a-z0-9_]+\./, ""); }
+    });
+    await Promise.all([refresh(), modelStore.refresh()]);
+    effortPatch();
+  }
+  q("effortSave").addEventListener("click", () => { const fam = effFam(); effortSave(effortPostBody(fam, E.drafts[fam.family], E.defaults[fam.family]), q("effortSave"), "Saving…", "Saved."); });
+  q("effortUndo").addEventListener("click", () => { const fam = effFam(); delete E.drafts[fam.family]; E.sig[fam.family] = ""; E.serr = ""; renderEffort(A.settings.effort); });
+  q("effortReset").addEventListener("click", async () => {
+    const fam = effFam(), name = EFFORT_FAMILY_LABEL[fam.family];
+    if (!(await confirmAction({ title: `Reset ${name} to defaults?`, body: `Every ${name} effort word goes back to its default from the next request.`, confirm: "Reset" }))) return;
+    effortSave({ effort: { [fam.family]: null } }, q("effortReset"), "Resetting…", `${name} is back to its defaults.`);
+  });
+  // The Models page's Edit link: Settings, on that family's tab.
+  function openEffort(family) {
+    E.fam = family;
+    q("navSettings").click();
+    requestAnimationFrame(() => { q("effortCard").scrollIntoView({ block: "start" }); effortTabs.querySelector(`[data-fam="${family}"]`)?.focus(); });
+  }
+
   // The server's own words for when a server setting takes effect ("saved; applies at the next model load").
   const sentence = (note) => `${note[0].toUpperCase()}${note.slice(1)}.`;
   async function saveServer(key, value, text, btn, label) {
@@ -3768,6 +4056,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (!s) return;
     setHidden(q("settingsSkel"), true);
     for (const id of ["cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
+    for (const id of ["secStorage", "secServer"]) setHidden(q(id), false);
+    setHidden(q("secInference"), !s.effort);
+    setHidden(q("effortCard"), !s.effort);
+    renderEffort(s.effort);
     setText(q("settingsFile"), `Saved in ${s.file}`);
     if (c) renderCache(c, s.server.prefix_cache_disk_gb);
     renderDir(s.server.models_dir);
@@ -3892,7 +4184,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
     const off = !!msg && !!A.settings;
-    for (const id of ["modelsMd", "cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) {
+    for (const id of ["modelsMd", "cacheCard", "effortCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) {
       q(id).classList.toggle("stale-view", off);
       if (q(id).inert !== off) q(id).inert = off;
     }

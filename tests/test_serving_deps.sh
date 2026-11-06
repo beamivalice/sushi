@@ -93,6 +93,7 @@ check_flag --pld-key-len 3
 check_flag --ssm-checkpoint-stride 256
 check_flag --expert-cache-gb 60
 check_flag --embedding-max-length 512
+check_flag --reasoning-budget 4
 check_flag --logit-bias-file bias.json
 
 echo "== unsupported checkpoint format refused by name =="

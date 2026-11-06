@@ -70,6 +70,6 @@ if model:
     assert plain.stdout == streamed.stdout, (plain.stdout, streamed.stdout)
     assert b"\x1b" not in plain.stdout
     # The checkpoint chooses whether to reason; only request acceptance and clean exit are invariant.
-    run(*base, "-p", prompt, "--think", "xhigh", "--stream", "--reasoning-budget", "4", "--top-p", "0.9", "--top-k", "20", ok=True, timeout=300, gpu=True)
+    run(*base, "-p", prompt, "--think", "xhigh", "--stream", "--top-p", "0.9", "--top-k", "20", ok=True, timeout=300, gpu=True)
     refused = run(*base, "-p", prompt, "--think", "high", timeout=300, gpu=True)
     assert b"not supported" in refused.stderr  # Qwen3.8 effort vocabulary.

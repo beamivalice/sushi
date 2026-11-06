@@ -80,7 +80,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   and exit, even with redirected stdin. The prompt is passed verbatim, including leading/trailing whitespace.
 - Explicit prompts use the normal scheduler and chat request policy through a private loopback listener on an OS-assigned
   port. They never connect to an existing server or enter the REPL; the client is joined and the listener closes on exit.
-- `--think` enables thinking; `--think <word>` selects an effort the `--model` model takes (GLM low|high|max, with
+- `--think` enables thinking; `--think <word>` selects an effort the `--model` model's served effort table takes (built-in GLM low|high|max, with
   `medium` served as `high` and `xhigh` as `max` and logged; Qwen off|low|medium|xhigh, with `high` and `max` served as `xhigh` and logged; MiMo off or any level as on; `/think` alike); another word fails with the accepted list and a
   nonzero exit. Omission keeps the model default, one-shot and REPL alike. A model loaded on demand takes the word where it can, else keeps its own
   default ([server-http-apis](server-http-apis.md)).
@@ -185,6 +185,12 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
+- **Effort tables live under `"effort:<family>"`** (`qwen4_exp`, `deepseek_v41`, `glm5_next`): `default` and one
+  object per effort word holding only the changed `offered`, `sends` and `cap` (shape, validation and precedence:
+  [server-http-apis](server-http-apis.md#effort-tables)). Read once at start (`model_settings.loadEffortTables`, a bad
+  field skipped with an `[effort]` line), replaced by a settings save at once, with no reload. Precedence: a request's
+  own budget > the table's cap (a word with no cap has none); `--think` > the file's default word > the built-in one.
+  No launch flag: `--reasoning-budget` is gone ([flags](flags.md#removed)).
 - **Server-wide keys live under the file's `"server"` object** (a model's key is its absolute path, so they never meet):
   `prefix_cache_disk_gb` (the SSD tier's size, 0 = off), `models_dir` (the discovery folder when no `--model-dir` is
   given, else `~/.sushi/models`) and the booleans `update_check` (the automatic sushi release check) and

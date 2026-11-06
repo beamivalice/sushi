@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # sushi-test: tier=live boot=knobs
 """Check --think defaults, explicit budgets and repetition-penalty aliases on the knobs boot
-(--think medium --reasoning-budget 1). Requests, responses and server traces are saved under --output."""
+(--think medium). Requests, responses and server traces are saved under --output."""
 import argparse
 import json
 import os
