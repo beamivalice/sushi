@@ -1502,7 +1502,8 @@ pub fn portLabel(buf: []u8, e: PortEntry) []const u8 {
         .failed => "not answering",
         .unknown => "…",
     };
-    return std.fmt.bufPrint(buf, "{d} — {s}", .{ e.port, what }) catch "";
+    const head = std.fmt.bufPrint(buf, "{d} — ", .{e.port}) catch return "";
+    return buf[0 .. head.len + fitNote(buf[head.len..], what, buf.len - head.len).len];
 }
 
 // ── Log window ───────────────────────────────────────────────────────────
@@ -1744,6 +1745,16 @@ test "port menu: the default first, then the added ports, each with its state; a
     try std.testing.expect(e[0].checked and !e[1].checked);
     try std.testing.expectEqualStrings("18803 — not running", portLabel(&b, e[1]));
     try std.testing.expectEqualStrings("18802 — Qwen", portLabel(&b, e[2]));
+}
+
+test "port menu: a model id as long as a listing keeps is cut with an ellipsis, never a blank row" {
+    var b: [96]u8 = undefined;
+    var idb: [96]u8 = @splat('x');
+    @memcpy(idb[0..4], "org/");
+    const id: []const u8 = &idb;
+    const l = portLabel(&b, .{ .port = 18802, .checked = false, .listening = true, .model = id });
+    try std.testing.expect(std.mem.startsWith(u8, l, "18802 — org/xxx"));
+    try std.testing.expect(std.mem.endsWith(u8, l, "…"));
 }
 
 test "port menu: the default port is always listed and never removable, the others are" {
