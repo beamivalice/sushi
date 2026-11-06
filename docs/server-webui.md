@@ -63,7 +63,7 @@ and the page tooltip share them.
 ## Tooltips
 
 - One component: any element with `data-tip="plain text"` shares the single `#tip` (`role="tooltip"`; the anchor gets
-  `aria-describedby="tip"` while it shows). No HTML in a tip; `\n` breaks a line.
+  `aria-describedby="tip"` while it shows). No HTML in a tip; `\n` breaks a line; `data-term="…"` adds the "Technical name" line.
 - Opens on hover after 400 ms (at once when moving from one tip to the next, or on touch) and on keyboard focus at once
   (`:focus-visible`). The pointer may move onto it. Leaving both, blur, Escape (focus stays), a press, a scroll of its
   container, a resize or a shortcut close it.
@@ -72,6 +72,8 @@ and the page tooltip share them.
 - Copy is for someone who is not an engineer: the visible label says what a thing does for the user in plain words
   (Reply speed, Conversation cache, tokens/s), and its `data-tip` says what it is, why it matters and a sensible value.
   Where the full form would wrap and read worse (the eight-tile row), the short form (`tok/s`) is allowed; its tip spells it out.
+  Anything renamed from an engineering term ends its tip with `Technical name: …` through `data-term` (a settings key
+  adds its `model-settings.json` key and launch flag): the term is plain text in a muted child of `#tip`, never in a label.
 - A tip adds what the screen cannot say in place: what a metric means, its unit, where the number comes from, what a
   setting does, what a pack needs. Never needed content, an action, or a repeat of visible text.
 - An anchor must be focusable: buttons, inputs and labels already are; a tile, fact or table heading takes
@@ -86,7 +88,8 @@ and the page tooltip share them.
   "Recommended for this Mac" and "Needs N GB" badges and a pack name that says bpw; the Settings cache table headings;
   the Thinking effort card's column headings, Offered boxes, a word's "same as" Sends and the DeepSeek preset chips.
 - Guards: the keyboard-tooltip checks in `tests/test_webui_admin_ui.cjs` (every setting and badge) and
-  `tests/test_webui_dashboard.cjs` `chartAudit` (every chart title and Sessions column).
+  `tests/test_webui_dashboard.cjs` `chartAudit` (every chart title and Sessions column); the `data-term` line in
+  `tests/test_webui_theme.cjs`, and the renamed-label lists in the dashboard, chat, admin-ui and effort-table tests.
 - Native `title` stays where a full value rides it (a cut-off model name, a path, a server message) and on icon buttons.
 
 ## Settings sections and the Thinking effort card

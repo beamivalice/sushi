@@ -66,7 +66,7 @@ const tipState = (page) => page.evaluate(() => {
   const tip = document.getElementById('tip'), anchor = document.querySelector('[aria-describedby="tip"]');
   const r = tip.getBoundingClientRect(), a = anchor?.getBoundingClientRect();
   return {
-    shown: tip.classList.contains('show') && getComputedStyle(tip).visibility === 'visible', text: tip.textContent, anchorTip: anchor?.dataset.tip ?? null,
+    shown: tip.classList.contains('show') && getComputedStyle(tip).visibility === 'visible', text: tip.firstChild?.textContent ?? '', anchorTip: anchor?.dataset.tip ?? null,
     overlaps: !!a && r.left < a.right && r.right > a.left && r.top < a.bottom && r.bottom > a.top,
     inside: r.left >= 0 && r.top >= 0 && r.right <= innerWidth && r.bottom <= innerHeight,
     box: { x: r.left + r.width / 2, y: r.top + r.height / 2 },
@@ -142,6 +142,56 @@ async function main() {
       assert.equal((await tipState(page)).shown, true, 'the pointer can rest on the tooltip');
       await page.mouse.move(2, 850);
       await page.waitForFunction(() => !document.getElementById('tip').classList.contains('show'), null, { timeout: 3000 });
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    for (const scheme of ['light', 'dark']) {
+      // A data-term adds a "Technical name" line, a child element with the term as text, never markup; no data-term, no line.
+      const { page, context, errors } = await open(browser, '/dashboard', { scheme });
+      await page.waitForSelector('.tiles-cmp .tile[data-tip]');
+      await page.evaluate(() => {
+        const add = (id, term) => {
+          const a = document.body.appendChild(Object.assign(document.createElement('button'), { id, textContent: id }));
+          a.style.cssText = 'position:fixed;left:40px;top:300px';
+          a.dataset.tip = `${id} tip`;
+          if (term != null) a.dataset.term = term;
+        };
+        add('withTerm', 'decode (tok/s)');
+        add('markupTerm', '<b>bold</b>');
+        add('plainTip');
+      });
+      const probe = async (id) => {
+        await page.focus('#plainTip');
+        await page.keyboard.press('Escape');
+        await page.evaluate((i) => { document.getElementById(i).blur(); }, id);
+        await page.keyboard.press('Tab');
+        await page.evaluate((i) => document.getElementById(i).focus(), id);
+        await page.waitForFunction((i) => document.querySelector('[aria-describedby="tip"]')?.id === i, id);
+        return page.evaluate(() => {
+          const tip = document.getElementById('tip'), line = tip.querySelector('.tip-term');
+          const cs = line && getComputedStyle(line), bg = getComputedStyle(tip).backgroundColor;
+          return { text: tip.firstChild.textContent, line: line?.textContent ?? null, tag: line?.tagName ?? null, isChild: line?.parentElement === tip,
+            markup: tip.querySelectorAll('b').length, size: cs && parseFloat(cs.fontSize), tipSize: parseFloat(getComputedStyle(tip).fontSize),
+            color: cs?.color, bg, term: tip.querySelector('.tip-term-v')?.textContent ?? null };
+        });
+      };
+      const a = await probe('withTerm');
+      assert.equal(a.text, 'withTerm tip', `${scheme}: the tip text stays plain`);
+      assert.equal(a.line, 'Technical name: decode (tok/s)', `${scheme}: the term line follows the tip`);
+      assert.equal(a.term, 'decode (tok/s)');
+      assert.equal(a.isChild, true, `${scheme}: it is a child element of the tooltip`);
+      assert.ok(a.size < a.tipSize, `${scheme}: the term line is smaller than the tip text`);
+      const rgb = (c) => c.match(/[\d.]+/g).slice(0, 3).map(Number);
+      const lum = (c) => { const [r, g, b] = rgb(c).map((v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+      const [hi, lo] = [lum(a.color), lum(a.bg)].sort((x, y) => y - x);
+      assert.ok((hi + 0.05) / (lo + 0.05) >= 4.5, `${scheme}: the term line keeps AA on the tooltip surface`);
+      const m = await probe('markupTerm');
+      assert.equal(m.markup, 0, `${scheme}: a term is text, not markup`);
+      assert.equal(m.term, '<b>bold</b>');
+      const p = await probe('plainTip');
+      assert.equal(p.line, null, `${scheme}: no data-term, no term line`);
+      assert.equal(p.text, 'plainTip tip');
       assert.deepEqual(errors, []);
       await context.close();
     }

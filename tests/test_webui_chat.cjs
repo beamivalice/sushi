@@ -113,6 +113,22 @@ test('the generation fields say what the model uses unset, and a model that cann
   assert.deepEqual(errors, []);
 });
 
+test('every plain-worded chat label keeps its engineering name in the tooltip', async ({ browser }) => {
+  const stub = await startStub({ models: [model({ input_modalities: ['text', 'image'] })] });
+  const { page, errors } = await open(browser, stub);
+  await page.waitForSelector('.perf-row .k');
+  const terms = await page.$$eval('#chatRightbar [data-tip], #chatRightbar ~ * [data-tip], .badge[data-tip], .perf-row .k, #chatRightbar summary', (ns) =>
+    Object.fromEntries(ns.map((n) => [n.textContent.trim().replace(/\s+/g, ' '), n.dataset.term ?? ''])));
+  const want = { 'First token': /TTFT/, Prompt: /prompt_tokens/, 'Prompt speed': /prefill/, 'Reply speed': /decode/, 'Reply length': /output tokens|completion_tokens/,
+    'Conversation cache (SSD)': /prefix cache/, '8,192-token context': /ctx_size|context window/, 'sees images': /vision/, 'Thinking budget': /reasoning_budget_tokens/ };
+  for (const [label, term] of Object.entries(want)) {
+    const key = Object.keys(terms).find((k) => k === label || k.startsWith(label));
+    assert.ok(key, `${label} is a tooltip anchor (${Object.keys(terms)})`);
+    assert.match(terms[key], term, `${label} names its technical term`);
+  }
+  assert.deepEqual(errors, []);
+});
+
 test('a refused request shows the server reason and what to do next, not a bare status code', async ({ browser }) => {
   const cases = [[503, 'Requested model is not currently loaded', /on Models/], [400, 'Prompt does not fit', /new chat|settings/i], [500, 'boom', /server log/]];
   for (const [status, message, next] of cases) {

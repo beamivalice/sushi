@@ -802,7 +802,56 @@ async function chartAudit(browser) {
     await page.keyboard.press('Tab');
     await page.locator('#dashCharts .chart h2 [data-tip]').first().focus();
     await page.waitForFunction(() => document.getElementById('tip').classList.contains('show'), null, { timeout: 3000 });
-    assert.equal(await page.textContent('#tip'), titles[0].tip, 'keyboard focus opens a chart title\'s tooltip');
+    assert.equal(await page.evaluate(() => document.getElementById('tip').firstChild.textContent), titles[0].tip, 'keyboard focus opens a chart title\'s tooltip');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // Everything the plain-language pass renamed keeps its engineering name in its tooltip's "Technical name" line.
+    const lines = (page, scope) => page.$$eval(`${scope} [data-tip]`, (ns) => Object.fromEntries(ns.map((n) => [(n.querySelector('.k') ?? [...n.childNodes].find((c) => c.nodeType === 3 && c.textContent.trim()) ?? n).textContent.trim(), n.dataset.term ?? ''])));
+    const expectTerms = (got, want, where) => {
+      for (const [label, term] of Object.entries(want)) {
+        assert.ok(label in got, `${where}: ${label} is an anchor (${Object.keys(got)})`);
+        assert.match(got[label], term, `${where}: ${label} names its technical term`);
+      }
+    };
+    const compact = await openPage(browser, '/dashboard', { mode: 'compact' });
+    await compact.page.waitForSelector('.tiles-cmp .tile[data-tip]');
+    expectTerms(await lines(compact.page, '.tiles-cmp'), {
+      'Reply speed': /decode/, 'Prompt speed': /prefill/, Memory: /MLX active.*MLX cache/, 'Conversation cache': /prefix cache/, Requests: /running.*waiting/,
+    }, 'Compact tiles');
+    await compact.context.close();
+
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', sessions: [{ request_id: 7, model: 'org/test-model', phase: 'prefill', context_length: 8192, prefill_done: 10, prefill_expected: 100 }, { request_id: 8, model: 'org/test-model', phase: 'decode', context_length: 8192 }],
+      specData: { ...specFixture(), decode_serial: { spec_active: 4, pad_waste: 2 } } });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    await page.waitForFunction(() => document.getElementById('dashSpecModes').textContent.includes('MTP') && document.getElementById('dashSerial').textContent.includes('Guessing'), null, { timeout: 15000 });
+    expectTerms(await lines(page, 'section.tiles.feed'), {
+      'Reply speed': /decode/, 'Prompt speed': /prefill/, Requests: /running.*waiting/, GPU: /utilization/, 'First token': /TTFT/, Served: /generation_tokens_total/,
+    }, 'Advanced tiles');
+    expectTerms(await lines(page, 'table.sessions thead th'), { Step: /phase.*prefill.*decode.*cached/, Reused: /cached/, Speed: /rate/, Memory: /state_bytes/ }, 'Sessions columns');
+    assert.match(await page.getAttribute('h2 > span.tip-u:text-is("Sessions")', 'data-term'), /sessions/, 'the Sessions heading');
+    assert.deepEqual(await page.$$eval('label[data-tip]:has(#dashInterval, #dashWindow)', (ns) => ns.map((n) => n.dataset.term)), ['poll interval', 'chart window'], 'the Every and Window selects');
+    const charts = await page.$$eval('#dashCharts .chart', (cards) => Object.fromEntries(cards.map((c) => [c.dataset.chart, c.querySelector('h2 [data-tip]')?.dataset.term ?? ''])));
+    const chartTerms = { prefill: /prefill/, decode: /decode/, requests: /prefill.*batched/, gpu: /utilization/, memory: /footprint/, memsplit: /MLX active.*MLX cache/, specaccept: /draft acceptance/, specmodes: /MTP.*DFlash2.*DSpark/,
+      specrows: /verifier rows/, cachetok: /cached.*computed/, cachereuse: /prefix cache/, cachetiers: /evict/, cachewrites: /prefix cache/, outcomes: /requests_/, latency: /prefill.*decode/, ttft: /TTFT/, e2e: /e2e/,
+      ptok: /prompt_tokens/, otok: /output_tokens/, serial: /decode_serial/ };
+    assert.equal(Object.keys(charts).length, Object.keys(chartTerms).length, 'every chart title was checked');
+    for (const [id, term] of Object.entries(chartTerms)) assert.match(charts[id] ?? '', term, `chart ${id}: its title names the technical term`);
+    const rowTerms = (id) => page.$$eval(`#${id} .hb`, (rows) => rows.map((r) => [r.querySelector('span').textContent, r.dataset.term ?? '']));
+    assert.deepEqual((await rowTerms('dashSerial')).map(([, t]) => t), ['spec_active', 'pad_waste'], 'a serial reason shows the server\'s own name');
+    assert.match((await rowTerms('dashSpecRows'))[0][1], /verifier rows/, 'a verifier-row bar');
+    assert.match((await rowTerms('dashSpecModes'))[0][1], /mtp_acceptance|draft acceptance/, 'a method bar');
+    assert.deepEqual((await rowTerms('dashTiers')).filter(([l]) => /^Dropped/.test(l)).map(([, t]) => /evict/.test(t)), [true, true], 'Dropped is evicted');
+    assert.match((await rowTerms('dashTiers')).find(([l]) => l === 'In memory')[1], /hot/, 'In memory is the hot tier');
+    assert.match((await rowTerms('dashReuse')).find(([l]) => l === 'From cache')[1], /restored|cached/, 'From cache');
+    // A phase chip's fly-over carries the engine's phase name.
+    await page.hover('#dashSessions [data-phase="prefill"]');
+    await page.waitForFunction(() => document.getElementById('dashTip').style.display === 'block');
+    assert.match(await page.textContent('#dashTip'), /Technical name:\s*prefill/, 'Reading is prefill');
+    await page.hover('#dashSessions [data-phase="decode"]');
+    await page.waitForFunction(() => /Writing/.test(document.getElementById('dashTip').textContent));
+    assert.match(await page.textContent('#dashTip'), /Technical name:\s*decode/, 'Writing is decode');
     assert.deepEqual(errors, []);
     await context.close();
   }

@@ -166,6 +166,11 @@ async function main() {
       assert.match(await page.getAttribute(`${tr('max')} select`, 'data-tip'), /^Qwen has no max level, so max uses xhigh\./);
       assert.equal(await page.isChecked(`${tr('medium')} input[type=radio]`), true, 'medium is the default');
       for (const col of ['Offered', 'Sends', 'Cap', 'Default']) assert.ok(await page.$(`#effortTbl th span[data-tip]:text-is("${col}")`), `${col} explains itself`);
+      const heads = await page.$$eval('#effortTbl th span[data-tip]', (ns) => Object.fromEntries(ns.map((n) => [n.textContent, n.dataset.term ?? ''])));
+      assert.match(heads.Offered, /reasoning_efforts/);
+      assert.match(heads.Sends, /reasoning_effort/);
+      assert.match(heads.Cap, /thinking budget.*reasoning_budget_tokens/);
+      assert.match(heads.Default, /default_reasoning_effort/);
       assert.equal(await page.isVisible('#effortReset'), true);
       assert.equal(await page.innerText('#effortReset'), 'Reset Qwen to defaults');
     });
@@ -300,6 +305,7 @@ async function main() {
       await page.waitForSelector('#modelsDetail .think-line:not([hidden])');
       assert.equal(await page.innerText('#modelsDetail .think-line'), 'Thinking: medium by default · low 2048 / medium 8192 tokens · Edit');
       assert.doesNotMatch(await page.getAttribute('#modelsDetail .think-line a', 'data-tip'), /built-in|fold/i);
+      assert.match(await page.getAttribute('#modelsDetail .think-line span[data-tip]', 'data-term'), /default_reasoning_effort.*reasoning_effort_budgets/, 'the Thinking line names its fields');
       await page.goto(`${ORIGIN}/models#MiMo-D`);
       await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'MiMo-D');
       assert.equal(await page.isVisible('#modelsDetail .think-line'), false, 'a model without an effort table has no line');
