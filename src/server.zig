@@ -2468,16 +2468,21 @@ const USER_WIRE_RAM_FLOOR_BYTES: u64 = 12_000_000_000;
 
 /// PURE: the one-line warning for a load whose wired bytes pass macOS's user-wire cap, else null.
 /// The one way sushi tells a user to raise the GPU limit: the two user-wire limits move with it, or the lower of them
-/// binds and prefill slows. Whole GB at or above `need`; the GPU limit takes the same number in MB.
-pub fn wireLimitsCommand(buf: []u8, need: u64) []const u8 {
-    const GB: u64 = 1_000_000_000;
-    const bytes = (need +| (GB - 1)) / GB * GB;
-    return std.fmt.bufPrint(buf, "sudo sysctl iogpu.wired_limit_mb={d} vm.global_user_wire_limit={d} vm.user_wire_limit={d}", .{ bytes / 1_000_000, bytes, bytes }) catch "";
+/// binds and prefill slows. `iogpu.wired_limit_mb` counts MiB, so the user-wire limits get `mb` MiB in bytes.
+pub fn wireLimitsCommand(buf: []u8, mb: u64) []const u8 {
+    const bytes = mb *| (1 << 20);
+    return std.fmt.bufPrint(buf, "sudo sysctl iogpu.wired_limit_mb={d} vm.global_user_wire_limit={d} vm.user_wire_limit={d}", .{ mb, bytes, bytes }) catch "";
+}
+
+/// The GPU limit, in MB, that holds `bytes`: rounded up to 100 so the command reads cleanly.
+pub fn wireLimitMbFor(bytes: u64) u64 {
+    const step: u64 = 100 << 20;
+    return (bytes +| (step - 1)) / step * 100;
 }
 
 /// `limits` are `vm.global_user_wire_limit` and `vm.user_wire_limit` (0 = unreadable); the lower binds.
-/// Past it prefill slows down with no error. The suggested value is the need or the declared
-/// `iogpu.wired_limit_mb`, rounded up to a whole GB, never above `total_ram` less a floor.
+/// Past it prefill slows down with no error. The suggestion matches a declared `iogpu.wired_limit_mb` that holds the
+/// load; otherwise it is the need rounded up to 100 MB, never above `total_ram` less a floor.
 pub fn userWireWarning(buf: []u8, owned_bytes: u64, limits: [2]u64, wired_limit: u64, total_ram: u64) ?[]const u8 {
     const names = [2][]const u8{ "vm.global_user_wire_limit", "vm.user_wire_limit" };
     const bind: usize = if (limits[0] == 0 or (limits[1] != 0 and limits[1] < limits[0])) 1 else 0;
@@ -2485,15 +2490,14 @@ pub fn userWireWarning(buf: []u8, owned_bytes: u64, limits: [2]u64, wired_limit:
     if (limit == 0) return null;
     const need = owned_bytes +| USER_WIRE_MARGIN_BYTES;
     if (need <= limit) return null;
-    const GB: u64 = 1_000_000_000;
-    const cap = total_ram -| USER_WIRE_RAM_FLOOR_BYTES;
-    const suggested = @min((@max(need, wired_limit) +| (GB - 1)) / GB * GB, cap / GB * GB);
     const head = "[mem] warning: this load wires ~{d:.1} GB but {s} is {d:.1} GB: prefill will run slower. ";
     const args = .{ @as(f64, @floatFromInt(need)) / 1e9, names[bind], @as(f64, @floatFromInt(limit)) / 1e9 };
-    if (suggested < need)
+    // A declared GPU limit that holds the load is the user's choice: the user-wire limits come up to match it.
+    const mb = if (wired_limit >= need) wired_limit >> 20 else wireLimitMbFor(need);
+    if (wired_limit < need and mb << 20 > total_ram -| USER_WIRE_RAM_FLOOR_BYTES)
         return std.fmt.bufPrint(buf, head ++ "This Mac cannot wire that much: use a smaller pack or a lower --ssd-budget-gb", args) catch null;
     var cmd: [192]u8 = undefined;
-    return std.fmt.bufPrint(buf, head ++ "Raise it: {s} (resets at reboot)", args ++ .{wireLimitsCommand(&cmd, suggested)}) catch null;
+    return std.fmt.bufPrint(buf, head ++ "Raise it: {s} (resets at reboot)", args ++ .{wireLimitsCommand(&cmd, mb)}) catch null;
 }
 
 fn readSysctlU64(name: [*:0]const u8) u64 {
@@ -2709,7 +2713,7 @@ pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_byte
                 @as(f64, @floatFromInt(expertStreamingPlannedKvBytes(config))) / 1e9,
                 @as(f64, @floatFromInt(config.expert_vision_encode_bytes)) / 1e9,
                 @as(f64, @floatFromInt(limit)) / 1e9,
-                wireLimitsCommand(&cmd, wiredLimitMbForBudget(config.expert_ssd_budget_bytes, beside) << 20),
+                wireLimitsCommand(&cmd, wireLimitMbFor(wiredLimitMbForBudget(config.expert_ssd_budget_bytes, beside) << 20)),
             });
             return error.SsdBudgetExceedsWiredLimit;
         }
@@ -4367,8 +4371,10 @@ test "a loaded streamed row reports its effective budget, an unloaded one the se
 
 test "raising the GPU limit always raises both user-wire limits to match, never below the need" {
     var buf: [192]u8 = undefined;
-    try std.testing.expectEqualStrings("sudo sysctl iogpu.wired_limit_mb=120000 vm.global_user_wire_limit=120000000000 vm.user_wire_limit=120000000000", wireLimitsCommand(&buf, 119_500_000_001));
-    try std.testing.expectEqualStrings("sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000", wireLimitsCommand(&buf, 125_000_000_000));
+    // iogpu.wired_limit_mb counts MiB: the user-wire limits get the same amount in bytes.
+    try std.testing.expectEqualStrings("sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000", wireLimitsCommand(&buf, 125000));
+    try std.testing.expectEqual(@as(u64, 86100), wireLimitMbFor(84 << 30));
+    try std.testing.expectEqual(@as(u64, 125000), wireLimitMbFor(125000 << 20));
 }
 
 test "the user-wire warning fires when the wired bytes pass the lower macOS limit" {
@@ -4388,11 +4394,12 @@ test "the user-wire warning fires when the wired bytes pass the lower macOS limi
     for ([_]u64{ 111, 114 }) |b| {
         const line = userWireWarning(&buf, owned(b), .{ default_limit, default_limit }, 125_000 << 20, ram) orelse return error.TestExpectedWarning;
         try t.expect(std.mem.indexOf(u8, line, "vm.global_user_wire_limit is 116.8 GB") != null);
-        try t.expect(std.mem.indexOf(u8, line, "sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000") != null);
+        // The declared GPU limit covers the load: the user-wire limits match it.
+        try t.expect(std.mem.indexOf(u8, line, "sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000") != null);
     }
     const line = userWireWarning(&buf, owned(111), .{ default_limit, default_limit }, 0, ram).?;
     try t.expect(std.mem.indexOf(u8, line, "wires ~119.2 GB") != null);
-    try t.expect(std.mem.indexOf(u8, line, "limit=120000000000 ") != null);
+    try t.expect(std.mem.indexOf(u8, line, "iogpu.wired_limit_mb=113700 vm.global_user_wire_limit=119223091200 ") != null);
     try t.expect(userWireWarning(&buf, owned(114), .{ 125_000_000_000, 125_000_000_000 }, 125_000 << 20, ram) == null);
     // The per-process limit binds when it is the lower one; unreadable limits never warn.
     try t.expect(std.mem.indexOf(u8, userWireWarning(&buf, owned(111), .{ 125_000_000_000, default_limit }, 0, ram).?, "vm.user_wire_limit is") != null);
@@ -4402,7 +4409,7 @@ test "the user-wire warning fires when the wired bytes pass the lower macOS limi
     const limit96: u64 = 87_600_000_000;
     try t.expect(userWireWarning(&buf, 80 * GiB, .{ limit96, limit96 }, 0, ram96) == null);
     const l96 = userWireWarning(&buf, 83 * GiB, .{ limit96, limit96 }, 0, ram96).?;
-    try t.expect(std.mem.indexOf(u8, l96, "limit=91000000000 ") != null);
+    try t.expect(std.mem.indexOf(u8, l96, "iogpu.wired_limit_mb=86100 vm.global_user_wire_limit=90282393600 ") != null);
     // Past what the Mac may wire, raising the limit cannot help: the line says so.
     const none = userWireWarning(&buf, 95 * GiB, .{ limit96, limit96 }, 0, ram96).?;
     try t.expect(std.mem.indexOf(u8, none, "sudo") == null);

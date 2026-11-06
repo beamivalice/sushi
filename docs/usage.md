@@ -85,11 +85,11 @@ page.
 ## Recommended launch
 
 Every GPU limit below is set together with the two user-wire limits, always, at the same value in bytes (N MB becomes
-N000000); otherwise macOS keeps capping what sushi may wire at its lower default and prefill slows with no error. All
+N × 1,048,576 bytes); otherwise macOS keeps capping what sushi may wire at its lower default and prefill slows with no error. All
 three reset at reboot:
 
 ```bash
-sudo sysctl iogpu.wired_limit_mb=<N> vm.global_user_wire_limit=<N>000000 vm.user_wire_limit=<N>000000
+sudo sysctl iogpu.wired_limit_mb=<N> vm.global_user_wire_limit=<N × 1048576> vm.user_wire_limit=<N × 1048576>
 ```
 
 **48 GB Mac, Qwen Sushi-2bpw** (limit 43000)
@@ -162,7 +162,7 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 ```
 
 On a 128 GB Mac the 108 default needs the GPU limit raised (`sudo sysctl iogpu.wired_limit_mb=125000
-vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000`, the limit the heading names); without it the default is 96, and it steps down further, saying so, when the Mac's limits cannot hold it.
+vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000`, the limit the heading names); without it the default is 96, and it steps down further, saying so, when the Mac's limits cannot hold it.
 
 DeepSeek serves a 1,000,000-token context and a 256,000-token budget for a request that omits `max_tokens`, as its
 authors recommend; `--ctx-size` and `--max-tokens` still override them.

@@ -46,10 +46,10 @@ A Mac with Apple silicon shares one pool of memory between the CPU and the GPU. 
    Raise it **together with the two user-wire limits, always**. macOS also caps how much memory one program may lock in
    place (`vm.global_user_wire_limit`, `vm.user_wire_limit`), and that cap stays at its lower default when you raise
    only the GPU limit: sushi then loads, but prompt reading slows down and a large load can make the Mac unresponsive.
-   Set all three to the same value, the GPU limit in megabytes and the other two in bytes (add six zeros):
+   Set all three to the same amount: the GPU limit in MB and the other two in bytes (the MB times 1,048,576):
 
    ```bash
-   sudo sysctl iogpu.wired_limit_mb=59000 vm.global_user_wire_limit=59000000000 vm.user_wire_limit=59000000000
+   sudo sysctl iogpu.wired_limit_mb=59000 vm.global_user_wire_limit=61865984000 vm.user_wire_limit=61865984000
    sysctl iogpu.wired_limit_mb vm.global_user_wire_limit vm.user_wire_limit   # shows them; 0 means the default
    ```
 
@@ -57,11 +57,11 @@ A Mac with Apple silicon shares one pool of memory between the CPU and the GPU. 
 
    | Installed | GPU limit (MB) | user-wire limits (bytes) |
    |---|---:|---:|
-   | 32 GB | 27,000 | 27000000000 |
-   | 48 GB | 43,000 | 43000000000 |
-   | 64 GB | 59,000 (higher risks a kernel panic when macOS runs out of memory) | 59000000000 |
-   | 96 GB | 90,000 (93,000 for DeepSeek) | 90000000000 (93000000000) |
-   | 128 GB | 120,000 (125,000 for DeepSeek) | 120000000000 (125000000000) |
+   | 32 GB | 27,000 | 28311552000 |
+   | 48 GB | 43,000 | 45088768000 |
+   | 64 GB | 59,000 (higher risks a kernel panic when macOS runs out of memory) | 61865984000 |
+   | 96 GB | 90,000 (93,000 for DeepSeek) | 94371840000 (97517568000) |
+   | 128 GB | 120,000 (125,000 for DeepSeek) | 125829120000 (131072000000) |
 
 Everything sushi loads (the weights, plus the memory the conversation's context takes) must fit under the GPU limit.
 When it does not, sushi refuses to load and prints the `sudo sysctl` command, all three limits, that would fit.

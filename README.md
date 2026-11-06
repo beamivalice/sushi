@@ -62,7 +62,7 @@ The Qwen rows are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16)
 | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw ‡ | 108.0 | 110.0 | 110.3 | 111.0 | 112.5 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb=<N>
-vm.global_user_wire_limit=<N>000000 vm.user_wire_limit=<N>000000` (all three, always: [why](docs/usage-streaming.md#the-two-memory-numbers)). Max context is
+vm.global_user_wire_limit=<N × 1048576> vm.user_wire_limit=<N × 1048576>` (all three, always: [why](docs/usage-streaming.md#the-two-memory-numbers)). Max context is
 the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no
 4-bit KV):
 
@@ -79,7 +79,7 @@ the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
 less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 480k / 800k (Sushi-STQ-2.75bpw) at 64 GB.
 
-‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on 96 and 128 GB Macs. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000` and at `80` on a 96 GB Mac with `sudo sysctl iogpu.wired_limit_mb=93000 vm.global_user_wire_limit=93000000000 vm.user_wire_limit=93000000000` ([usage](docs/usage.md#deepseek-launch)). Always raise the two user-wire limits with the GPU limit: without them the system slows down and can become unresponsive.
+‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on 96 and 128 GB Macs. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000` and at `80` on a 96 GB Mac with `sudo sysctl iogpu.wired_limit_mb=93000 vm.global_user_wire_limit=97517568000 vm.user_wire_limit=97517568000` ([usage](docs/usage.md#deepseek-launch)). Always raise the two user-wire limits with the GPU limit: without them the system slows down and can become unresponsive.
 
 ## Streaming
 
