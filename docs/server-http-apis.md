@@ -563,7 +563,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   `/metrics.json`, and only when no chat request is in flight and the browser tab is visible. Switches and tab
   returns keep the 2 s minimum between polls; a transient error backs off (2 s doubling, up to 30 s), while a 503 or
   401 stops the hidden poll until the dashboard is shown again. It follows the chat's
-  theme. The GPU chart (Compact and Advanced) draws the clock (left axis, 0 to `gpu_clock_max_mhz`, idle windows are gaps) and the utilization (right axis, 0 to 100%, dashed) from the history's `gpu_mhz` and `gpu_pct`; with `gpu_clock_max_mhz` 0 it draws utilization alone and says the clock is unavailable. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
+  theme. The GPU chart (Compact and Advanced) draws the utilization and the clock as a share of `gpu_clock_max_mhz` on one 0 to 100% axis (idle windows are gaps in the clock; its tooltip gives MHz) from the history's `gpu_pct` and `gpu_mhz`; with `gpu_clock_max_mhz` 0 it draws utilization alone, drops the clock from its legend and says the clock is unavailable. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
 - **Compact and Advanced**: a header toggle (remembered in `localStorage` `sushi-ui-mode`, Compact the default) switches
   the page's detail level through `body[data-mode]`. Compact shows what is loaded, decode and prefill tok/s, memory used and
   available, the SSD cache's use and the request count as big tiles; Advanced adds the sessions table and the tile strip
@@ -594,17 +594,20 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   a tap (the nearest point; a tap elsewhere hides it) and the arrow keys (the canvases take focus; Escape hides).
   The Decode and Prefill tiles of both views are the same function (`speedTiles`).
 - **Dashboard charts** (`#dashCharts`, one `.chart` card per `data-chart` id, every card half the row from 900 px and one per
-  row below): canvas time series (prefill, decode, requests, GPU, memory, a stacked memory split, draft acceptance) and
-  cards of bars, a donut or histograms built from the `/metrics.json` counters, histograms, `decode_serial`,
-  `speculative`, `prefix_cache_tiers`, `sessions` and the request log: cached vs computed tokens per request, prefix
-  cache reuse (tokens, requests, hits by tier), storage (hot and SSD use, evictions per tier), writes by kind, request
-  outcomes, latency, TTFT, end-to-end, prompt and output length, serial-decode reasons, drafting by mode (acceptance and
-  mean accepted per round, DSpark plain-round share) and DSpark rows per round. The draft acceptance chart is one dot per
-  request whose log row carries `spec`. Each bar row prints its exact value and has a tip (`data-tip` text). A card's bar
-  rows (and the cached-vs-computed columns) are one Tab stop the arrow keys, Home and End walk; a poll that rewrites them
-  hands the focus to the same place (`setHtml`, `rove`). A histogram takes the focus and the arrow keys step its buckets.
+  row below), fourteen of them: canvas time series (prefill, decode, requests stacked as generating, reading the prompt and
+  waiting with batched as a line over them, GPU, memory stacked as MLX active, MLX cache and other under the machine
+  ceiling, draft acceptance) and cards of bars, columns and histograms built from the `/metrics.json` counters,
+  histograms, `decode_serial`, `speculative`, `prefix_cache_tiers`, `sessions` and the request log: prefix cache reuse
+  (the share of prompt tokens restored, cached vs computed tokens per request, requests that reused, hits by tier),
+  storage (hot and SSD use, evictions per tier), writes by kind, request outcomes, response time (the average request as
+  one bar of waiting, prefill and decode, then TTFT and end-to-end per bucket), prompt and output length side by side per
+  bucket, serial-decode reasons and DSpark rows per round. The draft acceptance card is one dot per request whose log row
+  carries `spec`, with a row per drafting mode under it (acceptance and mean accepted per round, DSpark plain-round
+  share); the dots alone say when nothing drafted or the server does not report it. Each bar row prints its exact value and has a tip (`data-tip` text). A card's bar
+  rows (and the cached-vs-computed columns) are one Tab stop the arrow keys, Home and End walk; a poll that changes them
+  updates the same nodes when the content keeps its shape, else hands the focus to the same place (`setHtml`, `rove`). A histogram takes the focus and the arrow keys step its buckets.
   Each card is a `role="group"` named by its picker title. A card under 440 px wide (container query) puts each bar
-  under its label and value, the donut above its bars, and labels every other bucket. A member the server does not export
+  under its label and value and labels every other bucket. A member the server does not export
   (`speculative`, a histogram, `prefix_cache_writes`) reads "Not reported by this server", never as zero; with no model
   loaded the hot tier reads "-", not "off"; a rejected request is no column of the cached-vs-computed chart; an empty
   histogram says so. The open picker's ticks follow the view when Compact/Advanced changes the default. A count
@@ -613,7 +616,10 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   down (config mode): tick charts on or off, Reset, Done. While it is open each chart shows a strip: drag it onto another
   chart (pointer events, so a finger works too; `touch-action: none` on the strip) or use its arrow buttons, which keep
   the focus ([server-webui](server-webui.md#dashboard-config-mode)). The choice is `localStorage` `sushi-dash:charts` (`{order, hidden}`), a browser preference and no server
-  setting; until one exists Compact shows prefill, decode, GPU and memory and Advanced shows all. The hot tier's bytes are
+  setting; until one exists Compact shows prefill, decode, GPU and memory and Advanced shows all but DSpark rows per round.
+  A stored choice that names a card since merged (`memsplit`, `specmodes`, `cachetok`, `ttft`, `e2e`, `ptok`, `otok`)
+  reads as the card that replaced it, at the first place of any of its parts, hidden only when all of them were; the
+  migrated choice is stored back (`migrateLayout`). The hot tier's bytes are
   the server's `prefix_cache_tiers.hot_bytes`. The prefix cache writes chart shows the `prefix_cache_writes` totals:
   bytes per kind, the rate between the last two polls (absent on the first poll and across a restart), bytes written per
   byte now on disk (the sum of every ready model's `/props` `disk_used_bytes`, refreshed every 15 s) and the failed or

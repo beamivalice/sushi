@@ -53,6 +53,12 @@ and the page tooltip share them.
   cross-fades the colours (`theme-fade` on `<html>` for 300 ms); the first paint and a system change do not.
 - `prefers-reduced-motion: reduce` sets the three durations to 0 and zeroes every transition and animation (spinners
   stand still), so no rule can forget it.
+- Dashboard charts move only to show a change: bars, meters and histogram columns ease to a new value (`--dur-3`, the
+  poll updates the nodes in place); a canvas chart's time axis slides to the newest sample and its scale eases to a new
+  top over 400 ms, the gridlines keeping their round values. All canvas motion goes through one helper (`eased`), which
+  moves only after a poll that brought activity (a request running, waiting or finished) and jumps under reduced motion
+  or in a hidden tab, so an idle or background page draws no extra frame. Tile numbers never count up: a tile is read as
+  an exact value. Guard: `dashboardV2` in `tests/test_webui_dashboard.cjs`.
 
 ## Logo
 
@@ -70,13 +76,17 @@ and the page tooltip share them.
 - Placed above its anchor, below when the top bar is in the way, and beside it (left) inside a `data-tip-side` container
   such as the chat's settings column, whose fields stack; clamped 8 px inside the window; never over the anchor.
 - Copy is for someone who is not an engineer: the visible label says what a thing does for the user in plain words
-  (Reply speed, Prompt cache, tokens/s), and its `data-tip` says what it is, why it matters and a sensible value.
+  (Generation speed, Prompt cache, tokens/s), and its `data-tip` says what it is, why it matters and a sensible value.
   Prefer the term users know from other LLM apps (prompt cache, speculative decoding, KV cache, vision) over an invented
   phrase; invent only when no common term exists.
-  Where the full form would wrap and read worse (the eight-tile row), the short form (`tok/s`) is allowed; its tip spells it out.
+  Where the full form would wrap and read worse (the eight-tile row), the short form (`tok/s`, Gen speed, sushibar's GEN TOK/S)
+  is allowed; its tip spells it out.
   One concept, one label: a chart's name is the same in its title, its card and the Charts picker (guard: `chartAudit`),
-  a request step reads Reading prompt / Replying / Cached in the Sessions chips and the compact status, in sentence case.
-  sushibar's menu uses the same words (REPLY TOK/S, PROMPT TOK/S, `replying…`, `reading prompt…`).
+  a request step reads Reading prompt / Generating / Cached in the Sessions chips and the compact status, in sentence case.
+  sushibar's menu uses the same words (GEN TOK/S, PROMPT TOK/S, `generating…`, `reading prompt…`).
+  Reply is no speed, length or state word: thinking and answer are the same generated tokens, so the page and sushibar say
+  generation (Generation speed, Generating, Generated); "reply" stays only where it means the answer's text (guard:
+  `RETIRED_REPLY` in the chat and dashboard tests, the retired list in sushibar's wording test).
   Anything renamed from an engineering term ends its tip with `Technical name: …` through `data-term` (a settings key
   adds its `model-settings.json` key and launch flag; a label that is already the common term, such as KV cache
   precision, keeps only the key and flag): the term is plain text in a muted child of `#tip`, never in a label.
@@ -87,7 +97,7 @@ and the page tooltip share them.
 - Where tips are: Compact/Advanced and the theme toggle; every dashboard tile (Compact and Advanced; Memory and Cache
   reuse keep their live `#dashTip`); every dashboard chart's title, the Sessions heading and columns, and the Every and
   Window selects; every bar row and cached-vs-computed column of the dashboard's charts (one Tab stop per card, the
-  arrow keys move along it); the chat's Last reply rows, its System prompt, Max tokens, Temperature, Top-p, Top-k and
+  arrow keys move along it); the chat's Last request rows, its System prompt, Max tokens, Temperature, Top-p, Top-k and
   Thinking budget fields, its context and sees-images badges and the conversation cache section; a model's facts (on
   disk, linked, in memory, max context, sees images, runs partly from SSD); every setting's label on Models and Settings
   and every Saved, Set at launch, Now, Next load and Next start badge; Rescan and Check again; the Available list's
@@ -112,6 +122,21 @@ and the page tooltip share them.
   a small "changed" tag. A preview line under the table shows what a request for the selected word gets, and the exact
   template text. The card lists only the families with a table. A row's error stays in its word cell (`role="alert"`) and its box turns `aria-invalid`; Save stays
   disabled until every row is valid. Badges: Saved (the file holds a change) and Now.
+
+## Dashboard charts
+
+- Fourteen half-width cards, two per row: Prompt speed | Generation speed, Requests | Response time, GPU speed and load |
+  Memory, Prompt cache reuse | Prompt cache storage, Draft acceptance | Prompt and generated length, Request outcomes | Why
+  requests weren't batched, Prompt cache writes | Tokens verified per round (DSpark only, hidden until picked).
+- One axis per chart: two measures of different scale get two charts (prompt and generation speed) or a common base (the GPU
+  clock as a share of its top speed beside utilization). Parts of a whole stack, so the top edge is the total (Requests,
+  Memory); a subset of a part is a line over the stack (answered together).
+- Two series over the same buckets share one histogram, side by side per bucket (first and last token, prompt and
+  generated length); a single share is a number, not a two-slice donut (Prompt cache reuse).
+- Series colours follow the meaning across cards: prompt `--c2`, generated `--c1`; waiting is `--text-3`.
+- An empty card says what it waits for in one line across its width ("No request in this window yet"), never a blank box.
+- A merged card's picker name is its title without the unit; a stored choice that names a card it replaced reads as the
+  merged card ([server-http-apis](server-http-apis.md#chat-page-get--get-chat-get-dashboard-get-models-get-settings-get-downloads)).
 
 ## Dashboard config mode
 

@@ -13,9 +13,9 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 ```
 
 The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` and it detaches from
-the terminal. The title is the live reply speed in tok/s while a request generates (the icon alone when idle), beside a menu bar icon
+the terminal. The title is the live generation speed in tok/s while a request generates (the icon alone when idle), beside a menu bar icon
 that is filled while a server answers. Its menu opens on a status
-card (model, memory, reply speed, prompt speed and GPU numbers, a five-minute reply-speed graph) and then starts or stops the server
+card (model, memory, generation speed, prompt speed and GPU numbers, a five-minute generation-speed graph) and then starts or stops the server
 on the watched port (asking first for one it did not start; Start loads again the model the server last had, and with none known the card links to the Models page; a Stop that has not taken after 15 s offers Force Stop), switches the port (the default port first, then the ports you added by typing one; hover an added port and click its x to forget it; a server on a port you never added is not listed; the choice is remembered; `--port` wins, then the default port,
 `server.port` in Settings, 12345 unless changed), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
 three buttons: Log (a window that follows the watched server's log live, with Find and a "New lines" button when you scrolled up), Update (Check, which shows Checking… and then

@@ -113,13 +113,16 @@ test('the generation fields say what the model uses unset, and a model that cann
   assert.deepEqual(errors, []);
 });
 
+// "Reply" as a speed, length or state word is retired; it stays only where it means the answer's text.
+const RETIRED_REPLY = /\\brepl(?:y|ies)\\s+(?:speed|length|tok|done|[\\d-])|\\breplying\\b|\\blast reply\\b|(?:faster|slower|slowly)\\s+repl|repl(?:y|ies)\\s+(?:come\\s+)?(?:faster|more slowly)|\\bspeeds?\\s+(?:up\\s+)?repl|\\breply tokens\\b/i;
+
 test('every plain-worded chat label keeps its engineering name in the tooltip', async ({ browser }) => {
   const stub = await startStub({ models: [model({ input_modalities: ['text', 'image'] })] });
   const { page, errors } = await open(browser, stub);
   await page.waitForSelector('.perf-row .k');
   const terms = await page.$$eval('#chatRightbar [data-tip], #chatRightbar ~ * [data-tip], .badge[data-tip], .perf-row .k, #chatRightbar summary', (ns) =>
     Object.fromEntries(ns.map((n) => [n.textContent.trim().replace(/\s+/g, ' '), n.dataset.term ?? ''])));
-  const want = { 'First token': /TTFT/, Prompt: /prompt_tokens/, 'Prompt speed': /prefill/, 'Reply speed': /decode/, 'Reply length': /output tokens|completion_tokens/,
+  const want = { 'First token': /TTFT/, Prompt: /prompt_tokens/, 'Prompt speed': /prefill/, 'Generation speed': /decode/, Generated: /output tokens|completion_tokens/, 'Last request': /^$/,
     'Prompt cache (SSD)': /prefix cache/, '8,192-token context': /ctx_size|context window/, 'sees images': /vision/, 'Thinking budget': /reasoning_budget_tokens/ };
   for (const [label, term] of Object.entries(want)) {
     const key = Object.keys(terms).find((k) => k === label || k.startsWith(label));
@@ -129,6 +132,7 @@ test('every plain-worded chat label keeps its engineering name in the tooltip', 
   const words = await page.evaluate(() => [...document.querySelectorAll('body *:not(script):not(style)')].flatMap((n) => [...n.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent)
     .concat(['tip', 'term'].map((k) => n.dataset[k]), n.getAttribute('aria-label'), n.title)).filter(Boolean).join('\n'));
   assert.doesNotMatch(words, /guess|conversation cache/i, 'no page says guess or Conversation cache');
+  assert.doesNotMatch(words, RETIRED_REPLY, 'no speed, length or state says reply: thinking and answer are the same generated tokens');
   assert.deepEqual(errors, []);
 });
 

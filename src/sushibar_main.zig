@@ -16,7 +16,7 @@ const port_row = @import("sushibar/port_row.zig");
 const usage =
     \\usage: sushibar [--port <n>]
     \\
-    \\Puts sushi in the menu bar: the reply speed in tok/s as the title, and a menu to start and stop a server,
+    \\Puts sushi in the menu bar: the generation speed in tok/s as the title, and a menu to start and stop a server,
     \\switch the port, update sushi, and open the dashboard, chat, models and settings pages.
     \\It detaches from the terminal.
     \\
@@ -2227,7 +2227,7 @@ fn renderBadge(dir: []const u8) void {
     const cases = [_]Case{
         .{ .name = "live", .icon = .color, .title = "105 tok/s" },
         .{ .name = "last", .icon = .color, .title = "88.0 tok/s" },
-        .{ .name = "replying", .icon = .color, .title = "replying…" },
+        .{ .name = "generating", .icon = .color, .title = "generating…" },
         .{ .name = "reading", .icon = .color, .title = "reading prompt…" },
         .{ .name = "badge", .icon = .color, .badge = true },
         .{ .name = "offline", .icon = .outline },

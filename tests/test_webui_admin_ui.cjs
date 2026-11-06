@@ -171,7 +171,7 @@ async function main() {
       await page.waitForSelector(`${row('max_tokens')} input`);
       const first = (key) => page.evaluate((k) => { const r = document.querySelector(`.set[data-key="${k}"]`); const o = r.querySelector('select option'); return o ? o.textContent : r.querySelector('.tri button').textContent; }, key);
       assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default (256,000)', 'a number shows its default with separators');
-      assert.match(await page.textContent(`${row('max_tokens')} .lab`), /Max reply length/);
+      assert.match(await page.textContent(`${row('max_tokens')} .lab`), /Max generated tokens/);
       assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'placeholder'), 'Default', 'a default measured at load is not guessed');
       assert.equal(await first('kv_quant'), 'Default (8-bit)', 'a choice shows its label');
       assert.equal(await first('mtp_acceptance'), 'Default (Exact)');
