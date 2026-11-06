@@ -2084,6 +2084,14 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
 }
 
 pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, err: anyerror) !bool {
+    if (err == error.PackDownloading) {
+        var gate_buf: [512]u8 = undefined;
+        const entry = scheduler.registry.resolveEntry(id) catch null;
+        const why = (if (entry) |e| scheduler.registry.loadBlocked(&gate_buf, e.path) else null) orelse
+            "A download into this model's folder was running: load it again";
+        try sendErrorResponse(allocator, stream, "409 Conflict", "pack_downloading", why, 409);
+        return true;
+    }
     const refusal = loadRefusalFor(err) orelse return false;
     var buf: [256]u8 = undefined;
     const message = if (err == error.InsufficientMemory) blk: {

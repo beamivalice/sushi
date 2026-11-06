@@ -1275,6 +1275,7 @@ pub fn serve(
     defer global_scheduler = null;
     global_registry = scheduler.registry;
     defer global_registry = null;
+    scheduler.registry.load_gate = downloads.loadGate;
 
     if (instr.current() != null) {
         startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});

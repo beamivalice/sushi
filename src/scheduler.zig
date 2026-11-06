@@ -1657,6 +1657,8 @@ pub const Scheduler = struct {
         // re-check state — between the fast-path call and now another
         // caller could have completed the load.
         const entry = try self.registry.resolveEntry(id_or_empty);
+        var gate_buf: [512]u8 = undefined;
+        if (self.registry.loadBlocked(&gate_buf, entry.path) != null) return error.PackDownloading;
 
         // CPU-only pre-load: parse config / load tokenizer / load chat
         // config. Cheap (~tens of ms); kept outside the mutex so other
@@ -1745,6 +1747,8 @@ pub const Scheduler = struct {
                     .unloaded => break :wait_loop,
                 }
             }
+            // Checked again under the mutex a download start holds while it enqueues, so the two never overlap.
+            if (self.registry.loadBlocked(&gate_buf, entry.path) != null) return error.PackDownloading;
 
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));

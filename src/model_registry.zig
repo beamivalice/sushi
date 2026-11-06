@@ -599,6 +599,10 @@ pub const ModelRegistry = struct {
     /// The settings file `rescan` reads; null is `~/.sushi/model-settings.json`. Borrowed.
     settings_path: ?[]const u8 = null,
 
+    /// Set by the server: why the pack folder `path` cannot load now (a download or update is replacing its files),
+    /// written into `buf`, or null. Called under `mutex`, so it must never take it.
+    load_gate: ?*const fn (buf: []u8, path: []const u8) ?[]const u8 = null,
+
     /// Map of id → entry. Keys are borrowed from `LoadedModel.id`; entries
     /// are heap-allocated and owned by the registry. Iteration order isn't
     /// guaranteed; snapshot sorts by `last_used_ns` desc for stable output.
@@ -844,7 +848,7 @@ pub const ModelRegistry = struct {
         return if (base.len == 0) null else self.entries.get(base);
     }
 
-    fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+    pub fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         var trimmed = path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         if (trimmed.len == 0) return null;
@@ -944,6 +948,12 @@ pub const ModelRegistry = struct {
     /// `error.NoDefaultModel` if `id_or_empty` is empty AND no default is
     /// set. The returned pointer is borrowed; valid for the registry's
     /// lifetime.
+    /// Why `path` cannot load now (`load_gate`), or null.
+    pub fn loadBlocked(self: *ModelRegistry, buf: []u8, path: []const u8) ?[]const u8 {
+        const gate = self.load_gate orelse return null;
+        return gate(buf, path);
+    }
+
     pub fn resolveEntry(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

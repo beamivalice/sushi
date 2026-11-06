@@ -24,6 +24,7 @@ const Job = struct {
     repo: []u8,
     /// The pack folder it fills: an installed pack's own folder for an update.
     dest: []u8,
+    update: bool = false,
     phase: Phase = .queued,
     progress: dp.Progress = .{},
     message: []u8 = &.{},
@@ -33,9 +34,9 @@ const Job = struct {
     pid: ?std.posix.pid_t = null,
     meter: dp.Meter = .{},
 
-    fn create(allocator: Allocator, repo: []const u8, dest: []const u8) !*Job {
+    fn create(allocator: Allocator, repo: []const u8, dest: []const u8, update: bool) !*Job {
         const job = try allocator.create(Job);
-        job.* = .{ .allocator = allocator, .repo = &.{}, .dest = &.{} };
+        job.* = .{ .allocator = allocator, .repo = &.{}, .dest = &.{}, .update = update };
         errdefer job.destroy();
         job.repo = try allocator.dupe(u8, repo);
         job.dest = try allocator.dupe(u8, dest);
@@ -237,14 +238,26 @@ fn dirBytesIn(io: std.Io, dir: std.Io.Dir, depth: u8) u64 {
     return total;
 }
 
-/// The id of the loaded (or loading) model served from `path`, or null.
-fn loadedModelAt(allocator: Allocator, path: []const u8) ?[]u8 {
+/// The id of the loaded (or loading) model served from `path`, or null. Caller holds the registry's mutex.
+fn loadedModelAtLocked(allocator: Allocator, path: []const u8) ?[]u8 {
     const reg = server.global_registry orelse return null;
-    const e = reg.peekByPath(path) orelse return null;
-    reg.mutex.lockUncancelable(reg.io);
-    defer reg.mutex.unlock(reg.io);
+    const e = reg.peekByPathLocked(path) orelse return null;
     if (e.state != .ready and e.state != .loading) return null;
     return allocator.dupe(u8, e.id) catch null;
+}
+
+/// The registry's load gate: a pack folder a queued or running download or update fills cannot load, since its
+/// files are replaced one by one and a load would read some of each revision.
+pub fn loadGate(buf: []u8, path: []const u8) ?[]const u8 {
+    const want = std.mem.trimEnd(u8, path, "/");
+    lock();
+    defer unlock();
+    for (jobs.items) |j| {
+        if (!j.phase.active() or !std.mem.eql(u8, std.mem.trimEnd(u8, j.dest, "/"), want)) continue;
+        return std.fmt.bufPrint(buf, "{s} is being {s} on Downloads: wait for it to finish, or stop it there, then load it", .{ j.repo, if (j.update) "updated" else "downloaded" }) catch
+            "This model is being downloaded on Downloads: wait for it to finish, or stop it there, then load it";
+    }
+    return null;
 }
 
 // ── The download thread ─────────────────────────────────────────────────
@@ -341,7 +354,7 @@ fn workerLoop(io: std.Io) void {
 
 /// Queues `repo` into the pack folder `dest` and starts the download thread when it is idle. False when it is
 /// already queued or running.
-fn enqueue(io: std.Io, repo: []const u8, dest: []const u8) !bool {
+fn enqueue(io: std.Io, repo: []const u8, dest: []const u8, update: bool) !bool {
     lock();
     defer unlock();
     if (stopping) return error.ShuttingDown;
@@ -354,7 +367,7 @@ fn enqueue(io: std.Io, repo: []const u8, dest: []const u8) !bool {
             j.destroy();
         } else i += 1;
     }
-    const job = try Job.create(gpa, repo, dest);
+    const job = try Job.create(gpa, repo, dest, update);
     errdefer job.destroy();
     try jobs.ensureUnusedCapacity(gpa, 1);
     // The thread waits on `mu` until this returns, so it finds the job; it is spawned before the append, so a failed
@@ -595,10 +608,6 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
     var roots_buf: [9][]const u8 = undefined;
     const installed = installedPath(arena, stream.io, roots(&roots_buf, root), repo);
     const dest = installed orelse try ownFolder(arena, root, repo);
-    if (installed) |path| if (loadedModelAt(arena, path)) |id| {
-        const msg = try std.fmt.allocPrint(arena, "{s} is loaded as {s}: unload {s} first, then update it", .{ repo, id, id });
-        return server.sendErrorResponse(allocator, stream, "409 Conflict", "model_loaded", msg, 409);
-    };
     var warning: ?[]const u8 = null;
     if (installed == null) if (size) |s| if (disk_placement.volumeSpaceNear(dest)) |v| {
         const need = s -| (dirBytes(stream.io, dest) orelse 0);
@@ -611,13 +620,23 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
             .fits => {},
         }
     };
-    const queued = enqueue(stream.io, repo, dest) catch |err| switch (err) {
+    // The registry's mutex spans the loaded check and the enqueue: a load checks the queue under it (`load_gate`).
+    const reg = server.global_registry;
+    if (reg) |r| r.mutex.lockUncancelable(r.io);
+    const loaded_as = if (installed) |path| loadedModelAtLocked(arena, path) else null;
+    const queued = if (loaded_as != null) false else enqueue(stream.io, repo, dest, installed != null);
+    if (reg) |r| r.mutex.unlock(r.io);
+    if (loaded_as) |id| {
+        const msg = try std.fmt.allocPrint(arena, "{s} is loaded as {s}: unload {s} first, then update it", .{ repo, id, id });
+        return server.sendErrorResponse(allocator, stream, "409 Conflict", "model_loaded", msg, 409);
+    }
+    const queued_now = queued catch |err| switch (err) {
         error.ShuttingDown => return server.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "The server is shutting down", 503),
         else => return err,
     };
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try std.json.Stringify.value(.{ .ok = true, .queued = queued, .repo = repo, .dest = dest, .warning = warning }, .{}, &out.writer);
+    try std.json.Stringify.value(.{ .ok = true, .queued = queued_now, .repo = repo, .dest = dest, .warning = warning }, .{}, &out.writer);
     try server.sendResponse(stream, "202 Accepted", "application/json", out.written());
 }
 
@@ -667,7 +686,7 @@ test "downloads: progress follows the pull's events, and a stop is answered at t
     defer tmp.cleanup();
     var p: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(testing.io, &p);
-    const job = try Job.create(testing.allocator, "beamster/X", p[0..n]);
+    const job = try Job.create(testing.allocator, "beamster/X", p[0..n], false);
     defer job.destroy();
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.safetensors.partial", .data = "1234" });
     try testing.expect(onEvent(job, .{ .listed = .{ .files = 3, .bytes = 30, .present = 0 } }));
@@ -687,7 +706,7 @@ test "downloads: progress follows the pull's events, and a stop is answered at t
 
 test "downloads: a pack that cannot fit is stopped once its listing is known, naming the space" {
     worker_io = testing.io;
-    const job = try Job.create(testing.allocator, "beamster/X", "/");
+    const job = try Job.create(testing.allocator, "beamster/X", "/", false);
     defer job.destroy();
     const v = disk_placement.volumeSpaceNear("/").?;
     try testing.expect(!onEvent(job, .{ .listed = .{ .files = 1, .bytes = v.free + (1 << 40), .present = 0 } }));
