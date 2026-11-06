@@ -525,7 +525,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   repo, dest, warning}` (`queued` false when that pack is already queued or running). An update of a loaded pack is a
   409 `model_loaded` naming the model to unload; the other way round, a load of a pack folder a queued or running
   download or update fills (`POST /v1/load-model`, or a request naming the model) is a 409 `pack_downloading` naming the
-  pack, since the pull replaces its files one by one. Both checks run under the registry's mutex (`load_gate`), so
+  pack, since the pull replaces its files one by one; a folder a stopped or failed pull left (its `.pull-incomplete`
+  marker) is a 409 `pack_downloading` too, saying to resume it on Downloads. Both checks run under the registry's mutex (`load_gate`), so
   neither slips past the other. A new pack whose size, less what its folder holds, would leave less
   than a twentieth of the volume (at least 4 GiB, the SSD cache's reserve) is a 507 `insufficient_storage`; under a
   tenth free it carries a `warning`. The download checks again before it writes, against the listing: the listed bytes

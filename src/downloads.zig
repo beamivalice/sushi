@@ -247,7 +247,8 @@ fn loadedModelAtLocked(allocator: Allocator, path: []const u8) ?[]u8 {
 }
 
 /// The registry's load gate: a pack folder a queued or running download or update fills cannot load, since its
-/// files are replaced one by one and a load would read some of each revision.
+/// files are replaced one by one and a load would read some of each revision; nor can one a stopped or failed pull
+/// (this server's or `sushi pull`'s) left behind with its `.pull-incomplete` marker.
 pub fn loadGate(buf: []u8, path: []const u8) ?[]const u8 {
     const want = std.mem.trimEnd(u8, path, "/");
     lock();
@@ -257,7 +258,12 @@ pub fn loadGate(buf: []u8, path: []const u8) ?[]const u8 {
         return std.fmt.bufPrint(buf, "{s} is being {s} on Downloads: wait for it to finish, or stop it there, then load it", .{ j.repo, if (j.update) "updated" else "downloaded" }) catch
             "This model is being downloaded on Downloads: wait for it to finish, or stop it there, then load it";
     }
-    return null;
+    // A stopped or failed pull leaves its marker and some files of each revision.
+    var marker: [std.fs.max_path_bytes]u8 = undefined;
+    const at = std.fmt.bufPrintSentinel(&marker, "{s}/{s}", .{ want, cli.pull_marker }, 0) catch return null;
+    if (std.c.access(at, 0) != 0) return null;
+    return std.fmt.bufPrint(buf, "The last download or update of {s} did not finish, so its files are mixed: resume it on Downloads (or `sushi pull` it again), then load it", .{std.fs.path.basename(want)}) catch
+        "The last download or update of this model did not finish: resume it on Downloads, then load it";
 }
 
 // ── The download thread ─────────────────────────────────────────────────

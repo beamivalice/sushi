@@ -5,8 +5,8 @@
 # known packs without sizes; through tests/hf_stub.py (SUSHI_HF_ENDPOINT) it lists the org's public Sushi repo with its
 # size and hides the known packs the stub lacks and a private one; a download reports its file, bytes and speed, a
 # cancel keeps the partials, a restarted server shows the pack as partly on disk and finishes it with a ranged request
-# (resume), the finished pack is in the models list (rescan), a corrupt file fails naming that file, and a load of a pack
-# while its update replaces files is refused naming the update.
+# (resume), the finished pack is in the models list (rescan), a corrupt file fails naming that file, a load of a pack
+# while its update replaces files is refused naming the update, and so is a load after that update was stopped.
 #
 # Usage: ./tests/test_downloads.sh [port]
 set -u
@@ -67,14 +67,14 @@ post() { curl -s -o "$WORK/p.json" -w '%{http_code}' -X POST "$BASE/v1/downloads
 job() { echo "[j for j in d['jobs'] if j['repo']=='$REPO_ID'][-1]"; }
 pk() { echo "[p for p in d['packs'] if p['repo']=='$REPO_ID'][0]"; }
 
-echo "[1/6] offline: the known packs, without sizes"
+echo "[1/7] offline: the known packs, without sizes"
 boot || exit 1
 until_d "d['catalog'] != 'loading'" 30
 check "with Hugging Face unreachable the catalog says offline" "$(t "d['catalog'] == 'offline'")"
 check "the known packs are listed with their tiers, no size" "$(t "len(d['packs']) > 0 and all(p['size_bytes'] is None and p['tier_gb'] for p in d['packs'])")"
 check "this Mac's RAM and the destination are reported" "$(t "d['ram_bytes'] > 0 and d['dest']['path'] == '$MODELS' and d['dest']['locked'] and d['dest']['free_bytes'] > 0")"
 
-echo "[2/6] the stub: the org's public pack with its size, nothing private or unpublished"
+echo "[2/7] the stub: the org's public pack with its size, nothing private or unpublished"
 python3 -I "$HERE/hf_stub.py" "$HF" "$STUB_PORT" > "$WORK/stub.log" 2>&1 &
 STUB=$!
 for _ in $(seq 1 40); do curl -sf "$SUSHI_HF_ENDPOINT/api/models/$REPO_ID" > /dev/null && break; sleep 0.25; done
@@ -89,7 +89,7 @@ check "a repo the catalog does not list is refused" "$(ok test "$(post "" '{"rep
 get ""
 check "a refused start queues nothing" "$(t "d['jobs'] == []")"
 
-echo "[3/6] a download in progress, then Stop"
+echo "[3/7] a download in progress, then Stop"
 echo 400000 > "$HF/.rate"
 check "POST /v1/downloads queues it, under the catalog's spelling" "$(ok test "$(post "" '{"repo":"beamster/stub-sushi-1bpw"}')" = 202)"
 check "the job and folder carry the repo's own spelling" "$(ok grep -q "\"repo\":\"$REPO_ID\"" "$WORK/p.json")"
@@ -105,7 +105,7 @@ check "the job is stopped" "$(t "$(job)['phase'] == 'cancelled'")"
 check "the partial and the incomplete marker stay" "$(ok ls "$DEST"/*.partial "$DEST/.pull-incomplete")"
 check "no curl outlives the stop" "$(ok test "$(ps -axo command | grep -c "^curl .*127.0.0.1:$STUB_PORT")" = 0)"
 
-echo "[4/6] a restart, then resume"
+echo "[4/7] a restart, then resume"
 stop_server
 # Without its config.json the boot's discovery skips the folder, so only the rescan can list the finished pack.
 rm -f "$DEST/config.json"
@@ -125,14 +125,14 @@ check "the pull manifest is written and the marker gone" "$(ok test -f "$DEST/.s
 check "the pack reads as downloaded, with no launch line (no recipe for a pack the table lacks)" "$(t "$(pk)['installed'] and $(pk)['path'] == '$DEST' and $(pk)['launch'] is None")"
 check "the models list has it (rescan)" "$(ok grep -q "Stub-Sushi-1bpw" <(curl -s "$BASE/v1/models"))"
 
-echo "[5/6] a corrupt file fails by name"
+echo "[5/7] a corrupt file fails by name"
 head -c 1000 /dev/urandom > "$REPO/model-00003.safetensors"
 echo model-00003.safetensors > "$HF/.corrupt"
 post "" "{\"repo\":\"$REPO_ID\"}" > /dev/null
 until_d "$(job)['phase'] in ('done', 'failed')" 30
 check "the job fails naming the file" "$(t "$(job)['phase'] == 'failed' and 'model-00003.safetensors does not match' in $(job)['message']")"
 
-echo "[6/6] a load while an update replaces the pack's files"
+echo "[6/7] a load while an update replaces the pack's files"
 rm -f "$HF/.corrupt"
 post "" "{\"repo\":\"$REPO_ID\"}" > /dev/null
 until_d "$(job)['phase'] in ('done', 'failed')" 30
@@ -153,6 +153,28 @@ rm "$HF/.rate"
 until_d "$(job)['phase'] in ('done', 'failed')" 30
 check "the update finishes" "$(t "$(job)['phase'] == 'done'")"
 check "once it is done the pack loads again (no 409)" "$(ok test "$(load)" != 409)"
+
+echo "[7/7] a load after an update was stopped half way"
+printf '{"model_type":"qwen4_exp","revision":3}\n' > "$REPO/config.json"
+head -c 2000000 /dev/urandom > "$REPO/model-00002.safetensors"
+echo 400000 > "$HF/.rate"
+post "" "{\"repo\":\"$REPO_ID\"}" > /dev/null
+until_d "$(job)['phase'] == 'downloading' and $(job)['file'] and $(job)['file']['path'] == 'model-00002.safetensors'" 30
+post /cancel "{\"repo\":\"$REPO_ID\"}" > /dev/null
+until_d "$(job)['phase'] == 'cancelled'" 10
+check "the stopped update left a mixed folder with its incomplete marker" \
+    "$(cmp -s "$REPO/config.json" "$DEST/config.json" && ! cmp -s "$REPO/model-00002.safetensors" "$DEST/model-00002.safetensors" && [ -e "$DEST/.pull-incomplete" ] && echo 1 || echo 0)"
+# The stub weights never load, so step 6's load left the entry failed; a rescan makes it loadable again.
+curl -s -X POST "$BASE/v1/models/rescan" > /dev/null
+CODE=$(load)
+check "a load of the half-updated pack is refused with 409" "$(ok test "$CODE" = 409)"
+check "... saying the update did not finish and to resume it on Downloads" "$(ok grep -q "did not finish.*Downloads" "$WORK/l.json")"
+[ "$CODE" = 409 ] || echo "    (the load answered $CODE: $(head -c 300 "$WORK/l.json"))"
+rm "$HF/.rate"
+post "" "{\"repo\":\"$REPO_ID\"}" > /dev/null
+until_d "$(job)['phase'] in ('done', 'failed')" 30
+check "resumed, the update finishes" "$(t "$(job)['phase'] == 'done'")"
+check "and the pack loads again (no 409)" "$(ok test "$(load)" != 409)"
 
 stop_server
 echo ""

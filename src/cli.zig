@@ -604,7 +604,7 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
 /// Present for the whole of a pull and removed only after the last file verifies: a refused request (HTTP 429)
 /// leaves no `.partial`, so the files alone cannot tell an interrupted pull from a finished one. A pack pulled
 /// before the marker existed never has it and keeps the `.partial` rule.
-const pull_marker = ".pull-incomplete";
+pub const pull_marker = ".pull-incomplete";
 
 fn setPullMarker(io: std.Io, dest_dir: []const u8, on: bool) !void {
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dest_dir, .{});
