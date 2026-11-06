@@ -5312,6 +5312,22 @@ test "the live-token gauge equals the total at rest after a reply that ended on 
     try testing.expectEqual(@as(u64, 940), m.generation_tokens_live.load());
 }
 
+test "the live-token gauge never loses the tokens of a request cancelled or failed mid-decode" {
+    var m = metrics_mod.Metrics.init();
+    var gone = slot_outcome.OutcomeStub{ .completion_tokens = 300 };
+    var broke = slot_outcome.OutcomeStub{ .completion_tokens = 50 };
+    var other = slot_outcome.OutcomeStub{ .completion_tokens = 40 };
+    var active = [_]*slot_outcome.OutcomeStub{ &gone, &broke, &other };
+    publishLiveTokens(&m, active[0..]);
+    try testing.expectEqual(@as(u64, 390), m.generation_tokens_live.load());
+    gone.complete();
+    broke.error_code = "OutOfMemory";
+    recordDrained(&m, &[_]*slot_outcome.OutcomeStub{ &gone, &broke }, active[2..]);
+    try testing.expectEqual(@as(u64, 390), m.generation_tokens_live.load());
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+    try testing.expectEqual(@as(u64, 350), m.generation_tokens_unfinished_total.load());
+}
+
 pub fn expectOutcomes(m: *const metrics_mod.Metrics, success: u64, cancelled: u64, failed: u64, rejected: u64) !void {
     try testing.expectEqual(success, m.requests_success_total.load());
     try testing.expectEqual(cancelled, m.requests_cancelled_total.load());

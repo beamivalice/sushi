@@ -12,7 +12,8 @@
 # Tests:
 #  2. With    --metrics: /metrics → 200 Prometheus text; /metrics.json → 200 JSON.
 #  3. After one chat request: counters/histograms increment; live-gauge holds
-#                             (live > 0 after a request, live == total at rest).
+#                             (live > 0 after a request, live == total + unfinished at rest);
+#                             a request cancelled mid-decode leaves the live gauge where it was.
 
 set -u
 
@@ -172,8 +173,40 @@ GEN=$(echo "$BODY3" | grep "^vllm:generation_tokens_total " | awk '{print $2}')
 LIVE=$(echo "$BODY3" | grep "^sushi:generation_tokens_live " | awk '{print $2}')
 check "generation_tokens_live > 0 after one request (sampler ticked)" \
     "$([ -n "$LIVE" ] && [ "$LIVE" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
-check "generation_tokens_live == generation_tokens_total at rest (no slots decoding)" \
-    "$([ -n "$LIVE" ] && [ -n "$GEN" ] && [ "$LIVE" = "$GEN" ] && echo 1 || echo 0)"
+UNF=$(echo "$BODY3" | grep "^sushi:generation_tokens_unfinished_total " | awk '{print $2}')
+check "generation_tokens_live == generation_tokens_total + generation_tokens_unfinished_total at rest" \
+    "$([ -n "$LIVE" ] && [ -n "$GEN" ] && [ -n "$UNF" ] && [ "$LIVE" = "$((GEN + UNF))" ] && echo 1 || echo 0)"
+
+# A request cancelled mid-decode keeps its tokens in the live gauge (generation_tokens_unfinished_total), so the gauge
+# never falls and a rate taken between two samples never goes negative.
+echo ""
+echo "── Phase 3b: a request cancelled mid-decode ──"
+CANCEL1=$(counter vllm:request_cancelled_total)
+UNF1=$(counter sushi:generation_tokens_unfinished_total)
+STREAM_OUT=$(mktemp)
+curl -sN -X POST "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
+    -d "{\"model\":\"sushi\",\"stream\":true,\"max_tokens\":2000,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Count from 1 to 600, one number per line.\"}]}" > "$STREAM_OUT" &
+CURL_PID=$!
+for _ in $(seq 1 240); do [ "$(grep -c '^data: {' "$STREAM_OUT")" -ge 60 ] && break; sleep 0.25; done
+sleep 2.5
+MID=$(counter sushi:generation_tokens_live)
+kill "$CURL_PID" 2> /dev/null
+wait "$CURL_PID" 2> /dev/null
+rm -f "$STREAM_OUT"
+wait_rest
+sleep 3
+BODY4=$(curl -s "$BASE/metrics")
+GEN4=$(echo "$BODY4" | grep "^vllm:generation_tokens_total " | awk '{print $2}')
+UNF4=$(echo "$BODY4" | grep "^sushi:generation_tokens_unfinished_total " | awk '{print $2}')
+LIVE4=$(echo "$BODY4" | grep "^sushi:generation_tokens_live " | awk '{print $2}')
+echo "  (mid-decode live $MID, at rest live $LIVE4, total $GEN4, unfinished $UNF1 -> $UNF4)"
+check "the request was cancelled" "$([ "$(delta vllm:request_cancelled_total "$CANCEL1")" = "1" ] && echo 1 || echo 0)"
+check "the live gauge did not fall when the request was cancelled" \
+    "$(is_int "$MID" && is_int "$LIVE4" && [ "$LIVE4" -ge "$MID" ] && echo 1 || echo 0)"
+check "its tokens are in generation_tokens_unfinished_total" \
+    "$(is_int "$UNF4" && [ "$UNF4" -gt "${UNF1:-0}" ] && echo 1 || echo 0)"
+check "at rest live == total + unfinished after the cancel" \
+    "$(is_int "$LIVE4" && is_int "$GEN4" && [ "$LIVE4" = "$((GEN4 + UNF4))" ] && echo 1 || echo 0)"
 
 # ── Phase 4: prefill is visible WHILE it runs, not only when the request ends ──
 #
