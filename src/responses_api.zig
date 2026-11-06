@@ -614,7 +614,7 @@ fn handleResponsesInner(
     const active_has_tools = has_tools and !final_answer_mode;
     const active_tools_json: ?[]const u8 = if (active_has_tools) tools_json else null;
     const active_tool_choice_instruction: ?[]const u8 = if (active_has_tools) tool_choice_instruction else null;
-    if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
+    if (!try checkThinkingSupport(allocator, stream, lm, &effort_snap, enable_thinking, false)) return;
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }

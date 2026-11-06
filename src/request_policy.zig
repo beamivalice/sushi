@@ -420,11 +420,26 @@ pub fn responsesEnableThinking(root: std.json.ObjectMap, from_reasoning: bool, a
 /// through to the arch default (`ModelConfig.defaultEnableThinking`).
 ///
 /// The two knobs stay OR'd when both are present, as they always were.
-pub fn checkThinkingSupport(allocator: std.mem.Allocator, stream: *Conn, config: *const model_mod.ModelConfig, enabled: bool, anthropic: bool) !bool {
-    if (!config.isGlm5() or enabled) return true;
-    const message = "GLM-5.3 supports thinking low, high, max; thinking off is not supported by its original template.";
+pub fn checkThinkingSupport(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, snap: *const effort_mod.Snapshot, enabled: bool, anthropic: bool) !bool {
+    const config = lm.config.?;
+    if (!thinkingOffRefused(config, snap, enabled)) return true;
+    const message = if (config.isGlm5())
+        try allocator.dupe(u8, "GLM-5.3 supports thinking low, high, max; thinking off is not supported by its original template.")
+    else
+        try effortRefusalFor(allocator, lm, "off", snap);
+    defer allocator.free(message);
     if (anthropic) try sendAnthropicError(allocator, stream, "invalid_request_error", message, 400) else try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", message, 400);
     return false;
+}
+
+/// Thinking off where the model's served table does not offer `off`, as `reasoning_effort: "off"` is refused there. A
+/// request that thinks off only because the model does (a checkpoint declaring it) passes; GLM's template has no off.
+pub fn thinkingOffRefused(config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot, enabled: bool) bool {
+    if (enabled) return false;
+    if (config.isGlm5()) return true;
+    const arms = effort_mod.servedArmsIn(snap, config.model_type) orelse return false;
+    if (effort_mod.findEffortArm(arms.slice(), .off) != null) return false;
+    return config.defaultEnableThinkingIn(snap);
 }
 
 pub fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
@@ -1774,4 +1789,42 @@ test "effort table: a request resolves against one table while a save publishes 
         const whole = if (t.enable) t.budget == 2048 and t.template != null and std.mem.eql(u8, t.template.?, "low") else t.budget == -1 and t.template == null;
         try testing.expect(whole);
     }
+}
+
+test "effort table: with off unoffered, chat, Anthropic and Responses refuse a request that turns thinking off, as GLM does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const saved = effort_mod.think_effort_flag;
+    defer effort_mod.think_effort_flag = saved;
+    effort_mod.think_effort_flag = null;
+    defer effort_mod.publish(.qwen4_exp, .{});
+    defer effort_mod.publish(.deepseek_v41, .{});
+    const asks_off = [_]struct { OffSurface, []const u8 }{
+        .{ .chat, "{\"enable_thinking\":false}" },
+        .{ .chat, "{\"chat_template_kwargs\":{\"enable_thinking\":false}}" },
+        .{ .anthropic, "{\"thinking\":{\"type\":\"disabled\"}}" },
+        .{ .responses, "{\"enable_thinking\":false}" },
+    };
+    const thinks = [_]struct { OffSurface, []const u8 }{
+        .{ .chat, "{}" },
+        .{ .chat, "{\"enable_thinking\":true}" },
+        .{ .anthropic, "{}" },
+        .{ .responses, "{}" },
+    };
+    for ([_]effort_mod.Family{ .qwen4_exp, .deepseek_v41 }) |f| {
+        const config = model_mod.ModelConfig{ .model_type = @tagName(f) };
+        for ([_]bool{ false, true }) |offered| {
+            var edits: effort_mod.Edits = .{};
+            if (!offered) edits.rows[effort_mod.rowIndex(.off).?] = .{ .offered = false };
+            effort_mod.publish(f, edits);
+            const snap = effort_mod.snapshot();
+            for (asks_off) |c| try testing.expectEqual(!offered, thinkingOffRefused(&config, &snap, (try surfaceThinking(a, c[0], &config, c[1])).enable));
+            for (thinks) |c| try testing.expect(!thinkingOffRefused(&config, &snap, (try surfaceThinking(a, c[0], &config, c[1])).enable));
+        }
+    }
+    const glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    const snap = effort_mod.snapshot();
+    for (asks_off) |c| try testing.expect(thinkingOffRefused(&glm, &snap, (try surfaceThinking(a, c[0], &glm, c[1])).enable));
+    for (thinks) |c| try testing.expect(!thinkingOffRefused(&glm, &snap, (try surfaceThinking(a, c[0], &glm, c[1])).enable));
 }

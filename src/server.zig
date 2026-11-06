@@ -7941,7 +7941,7 @@ pub fn handleChatCompletions(
     if (effort_cfg) |e| effort_notice = try request_policy.holdEffortNotice(allocator, stream, request_policy.effortModelName(lm), e);
     const thinking = request_policy.chatThinking(root, effort_cfg, config, &effort_snap);
     var enable_thinking = thinking.enable;
-    if (!try request_policy.checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
+    if (!try request_policy.checkThinkingSupport(allocator, stream, lm, &effort_snap, enable_thinking, false)) return;
     // Reasoning budget (max tokens in <think> block, -1 = unlimited).
     const reasoning_budget: i32 = thinking.budget;
     const template_effort = thinking.template;

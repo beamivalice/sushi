@@ -826,7 +826,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     var enable_thinking = thinking.enable;
     const reasoning_budget = thinking.budget;
     const effort_word = thinking.template;
-    if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, true)) return false;
+    if (!try checkThinkingSupport(allocator, stream, lm, &effort_snap, enable_thinking, true)) return false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
     // chat-completions' `response_format`: a schema instruction in the system

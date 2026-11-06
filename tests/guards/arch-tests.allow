@@ -118,6 +118,7 @@ dsv41 replay: what the next prompt shares with a generated turn (DeepSeek tokeni
 effort off default: DeepSeek and GLM resolve and render as before
 effort off default: Qwen stays off on chat, Anthropic and Responses for a request naming no effort word or budget
 effort off default: a Qwen request naming an effort word or a budget still thinks, at that word or Qwen's unnamed level
+effort table: with off unoffered, chat, Anthropic and Responses refuse a request that turns thinking off, as GLM does
 every model, GLM included, defaults to kv8 and 16 selects BF16
 exl3 GLM GPU windows match host metadata with zero padded windows
 exl3 GLM GPU windows preserve 288 expert bytes at every admitted rate
