@@ -70,10 +70,13 @@ and the page tooltip share them.
 - Placed above its anchor, below when the top bar is in the way, and beside it (left) inside a `data-tip-side` container
   such as the chat's settings column, whose fields stack; clamped 8 px inside the window; never over the anchor.
 - Copy is for someone who is not an engineer: the visible label says what a thing does for the user in plain words
-  (Reply speed, Conversation cache, tokens/s), and its `data-tip` says what it is, why it matters and a sensible value.
+  (Reply speed, Prompt cache, tokens/s), and its `data-tip` says what it is, why it matters and a sensible value.
+  Prefer the term users know from other LLM apps (prompt cache, speculative decoding, KV cache, vision) over an invented
+  phrase; invent only when no common term exists.
   Where the full form would wrap and read worse (the eight-tile row), the short form (`tok/s`) is allowed; its tip spells it out.
   Anything renamed from an engineering term ends its tip with `Technical name: …` through `data-term` (a settings key
-  adds its `model-settings.json` key and launch flag): the term is plain text in a muted child of `#tip`, never in a label.
+  adds its `model-settings.json` key and launch flag; a label that is already the common term, such as KV cache
+  precision, keeps only the key and flag): the term is plain text in a muted child of `#tip`, never in a label.
 - A tip adds what the screen cannot say in place: what a metric means, its unit, where the number comes from, what a
   setting does, what a pack needs. Never needed content, an action, or a repeat of visible text.
 - An anchor must be focusable: buttons, inputs and labels already are; a tile, fact or table heading takes

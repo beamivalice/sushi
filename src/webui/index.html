@@ -824,7 +824,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <div class="perf-rows">
           <div class="perf-row"><span class="k">Status</span><span class="v" id="perfStatus">idle</span></div>
           <div class="perf-row"><span class="k tip-u" tabindex="0" data-term="TTFT (time to first token)" data-tip="How long you waited from Send until the reply began to appear, including the time to read the prompt.">First token</span><span class="v" id="perfFirstToken">—</span></div>
-          <div class="perf-row"><span class="k tip-u" tabindex="0" data-term="prompt_tokens (cached_tokens come from the prefix cache)" data-tip="Tokens the model read for the last request. Reused ones came from the conversation cache and cost no time.">Prompt</span><span class="v" id="perfPrompt">—</span></div>
+          <div class="perf-row"><span class="k tip-u" tabindex="0" data-term="prompt_tokens (cached_tokens come from the prefix cache)" data-tip="Tokens the model read for the last request. Reused ones came from the prompt cache and cost no time.">Prompt</span><span class="v" id="perfPrompt">—</span></div>
           <div class="perf-row"><span class="k tip-u" tabindex="0" data-term="prefill (tok/s)" data-tip="How fast the model read the prompt, in tokens per second.">Prompt speed</span><span class="v" id="perfPrefill">—</span></div>
           <div class="perf-row"><span class="k tip-u" tabindex="0" data-term="decode (tok/s)" data-tip="How fast the model wrote the reply, in tokens per second.">Reply speed</span><span class="v" id="perfGeneration">—</span></div>
           <div class="perf-row"><span class="k tip-u" tabindex="0" data-term="output tokens (completion_tokens)" data-tip="Length of the reply in tokens. While it is still writing, the pieces received so far.">Reply length</span><span class="v" id="perfTokens">—</span></div>
@@ -833,9 +833,9 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       </div>
     </details>
     <details class="side-section adv" id="prefixCacheSection" open hidden>
-      <summary data-term="prefix cache (KV cache reuse), SSD tier" data-tip="Disk space for saved conversations: used of what is assigned, and how many are saved. A follow-up to a saved conversation starts fast."><svg><use href="#i-box"/></svg>Conversation cache (SSD)</summary>
+      <summary data-term="prefix cache (KV cache reuse), SSD tier" data-tip="Disk space for saved conversations: used of what is assigned, and how many are saved. A follow-up to a saved conversation starts fast."><svg><use href="#i-box"/></svg>Prompt cache (SSD)</summary>
       <div class="side-body">
-        <div class="meter" role="meter" aria-label="Conversation cache (SSD) used" id="prefixCacheMeter" aria-valuemin="0" aria-valuemax="100"><span id="prefixCacheBar"></span></div>
+        <div class="meter" role="meter" aria-label="Prompt cache (SSD) used" id="prefixCacheMeter" aria-valuemin="0" aria-valuemax="100"><span id="prefixCacheBar"></span></div>
         <div class="meter-text"><span id="prefixCacheUsage">—</span><span id="prefixCacheEntries"></span></div>
       </div>
     </details>
@@ -877,15 +877,15 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   </section>
   <section class="cmp tiles tiles-cmp feed">
     <div class="tile" tabindex="0" data-term="decode (tok/s)" data-tip="How fast the model writes its reply, in tokens per second (a token is about three quarters of a word). Live during a reply, otherwise the last request's speed."><div class="k">Reply speed</div><div class="v" id="dashCmDec">-</div><div class="s" id="dashCmDecS">&nbsp;</div></div>
-    <div class="tile" tabindex="0" data-term="prefill (tok/s)" data-tip="How fast the model reads the prompt before it starts answering, in tokens per second. Text reused from the conversation cache is skipped and not counted."><div class="k">Prompt speed</div><div class="v" id="dashCmPre">-</div><div class="s" id="dashCmPreS">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-term="prefill (tok/s)" data-tip="How fast the model reads the prompt before it starts answering, in tokens per second. Text reused from the prompt cache is skipped and not counted."><div class="k">Prompt speed</div><div class="v" id="dashCmPre">-</div><div class="s" id="dashCmPreS">&nbsp;</div></div>
     <div class="tile" tabindex="0" data-term="process footprint (MLX active + MLX cache)" data-tip="Memory sushi uses now (the model, its working memory and GPU buffers), in GiB, out of what it may use. If little is left, long requests may be refused."><div class="k">Memory</div><div class="v" id="dashCmMem">-</div><div class="meterbar"><span id="dashCmMemBar" style="width:0"></span></div><div class="s" id="dashCmMemS">&nbsp;</div></div>
-    <div class="tile" tabindex="0" data-term="SSD prefix cache" data-tip="Saved conversations on the SSD: space used of what is assigned, and how many are saved. A follow-up reuses its saved start instead of reading it again. Size it in Settings."><div class="k">Conversation cache</div><div class="v" id="dashCmSsd">-</div><div class="meterbar"><span id="dashCmSsdBar" style="width:0"></span></div><div class="s" id="dashCmSsdS">&nbsp;</div><div class="s" id="dashCmSsdVolume">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-term="SSD prefix cache" data-tip="Saved conversations on the SSD: space used of what is assigned, and how many are saved. A follow-up reuses its saved start instead of reading it again. Size it in Settings."><div class="k">Prompt cache</div><div class="v" id="dashCmSsd">-</div><div class="meterbar"><span id="dashCmSsdBar" style="width:0"></span></div><div class="s" id="dashCmSsdS">&nbsp;</div><div class="s" id="dashCmSsdVolume">&nbsp;</div></div>
     <div class="tile" tabindex="0" data-term="running / waiting (queued) requests" data-tip="Requests being answered now, and requests waiting their turn. Waiting that does not clear means more requests arrive than the server can answer at once."><div class="k">Requests</div><div class="v" id="dashCmReq">-</div><div class="s" id="dashCmReqS">&nbsp;</div></div>
   </section>
 
   <section class="adv tiles feed">
     <div class="tile" tabindex="0" data-term="decode (tok/s)" data-tip="How fast the model writes its reply, in tokens per second (a token is about three quarters of a word). Live during a reply, otherwise the last request's speed."><div class="k">Reply speed</div><div class="v" id="dashTGen">-</div><div class="s" id="dashTGenS">&nbsp;</div></div>
-    <div class="tile" tabindex="0" data-term="prefill (tok/s)" data-tip="How fast the model reads the prompt before it starts answering, in tokens per second. Text reused from the conversation cache is skipped and not counted."><div class="k">Prompt speed</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">&nbsp;</div></div>
+    <div class="tile" tabindex="0" data-term="prefill (tok/s)" data-tip="How fast the model reads the prompt before it starts answering, in tokens per second. Text reused from the prompt cache is skipped and not counted."><div class="k">Prompt speed</div><div class="v" id="dashTPre">-</div><div class="s" id="dashTPreS">&nbsp;</div></div>
     <div class="tile" tabindex="0" data-term="running / waiting (queued) requests" data-tip="Running / waiting: requests being answered now, and requests waiting their turn."><div class="k">Requests</div><div class="v" id="dashTReq">-</div><div class="s" id="dashTReqS">running / waiting</div></div>
     <div class="tile" tabindex="0" data-term="GPU utilization and clock" data-tip="How busy the whole Mac GPU is (not only sushi), and its clock speed when the Mac reports it."><div class="k">GPU</div><div class="v" id="dashTGpu">-</div><div class="s" id="dashTGpuS">busy</div></div>
     <div class="tile" data-tile="mem" tabindex="0"><div class="k">Memory</div><div class="v" id="dashTMem">-</div><div class="s" id="dashTMemS">used by sushi</div></div>
@@ -898,33 +898,33 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <h2><span class="tip-u" tabindex="0" data-term="sessions (active requests and cached conversations)" data-tip="Requests the server is working on now, and finished conversations it keeps in memory for a quick follow-up.">Sessions</span><span class="legend"><span><i style="background:var(--c2)"></i>reused from cache</span><span><i style="background:var(--c1)"></i>new this request</span></span></h2>
     <div class="tablewrap"><table class="tbl sessions">
       <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"><col style="width:100px"></colgroup>
-      <thead><tr><th><span class="tip-u" tabindex="0" data-tip="The request's number, as the server log names it.">ID</span></th><th><span class="tip-u" tabindex="0" data-tip="The model answering this request.">Model</span></th><th><span class="tip-u" tabindex="0" data-term="phase (prefill / decode / cached)" data-tip="What it is doing: reading the prompt, writing the reply, or saved (a finished conversation kept for a quick follow-up).">Step</span></th><th><span class="tip-u" tabindex="0" data-term="context (tokens, of context_length)" data-tip="Tokens in this conversation so far, of the most the model can hold. The bar splits them into reused and new.">Context</span></th><th></th><th><span class="tip-u" tabindex="0" data-term="cached tokens (restored from the prefix cache)" data-tip="Tokens taken from the conversation cache instead of being read again.">Reused</span></th><th><span class="tip-u" tabindex="0" data-term="generated_tokens" data-tip="Reply tokens written so far, of the request's limit.">Generated</span></th><th><span class="tip-u" tabindex="0" data-tip="How long the request has been running.">Elapsed</span></th><th><span class="tip-u" tabindex="0" data-term="rate (tok/s)" data-tip="How fast it is writing now, in tokens per second.">Speed</span></th><th><span class="tip-u" tabindex="0" data-term="state_bytes (cached KV / recurrent state)" data-tip="Memory this conversation's saved state takes.">Memory</span></th><th></th></tr></thead>
+      <thead><tr><th><span class="tip-u" tabindex="0" data-tip="The request's number, as the server log names it.">ID</span></th><th><span class="tip-u" tabindex="0" data-tip="The model answering this request.">Model</span></th><th><span class="tip-u" tabindex="0" data-term="phase (prefill / decode / cached)" data-tip="What it is doing: reading the prompt, writing the reply, or saved (a finished conversation kept for a quick follow-up).">Step</span></th><th><span class="tip-u" tabindex="0" data-term="context (tokens, of context_length)" data-tip="Tokens in this conversation so far, of the most the model can hold. The bar splits them into reused and new.">Context</span></th><th></th><th><span class="tip-u" tabindex="0" data-term="cached tokens (restored from the prefix cache)" data-tip="Tokens taken from the prompt cache instead of being read again.">Reused</span></th><th><span class="tip-u" tabindex="0" data-term="generated_tokens" data-tip="Reply tokens written so far, of the request's limit.">Generated</span></th><th><span class="tip-u" tabindex="0" data-tip="How long the request has been running.">Elapsed</span></th><th><span class="tip-u" tabindex="0" data-term="rate (tok/s)" data-tip="How fast it is writing now, in tokens per second.">Speed</span></th><th><span class="tip-u" tabindex="0" data-term="state_bytes (cached KV / recurrent state)" data-tip="Memory this conversation's saved state takes.">Memory</span></th><th></th></tr></thead>
       <tbody id="dashSessions"></tbody>
     </table></div>
   </section>
 
 
   <section class="dash-charts feed" id="dashCharts" aria-label="Charts">
-    <div class="card chart" data-chart="prefill"><h2><span class="tip-u" tabindex="0" data-term="prefill speed (tok/s)" data-tip="How fast the model read each prompt before answering, in tokens per second. Each dot is one finished request; a hollow dot was mostly reused from the conversation cache.">Prompt speed (tokens/s)</span><span class="sub">one point per finished request</span></h2><canvas id="dashCCpre" role="img" aria-label="Prompt speed of each finished request"></canvas></div>
+    <div class="card chart" data-chart="prefill"><h2><span class="tip-u" tabindex="0" data-term="prefill speed (tok/s)" data-tip="How fast the model read each prompt before answering, in tokens per second. Each dot is one finished request; a hollow dot was mostly reused from the prompt cache.">Prompt speed (tokens/s)</span><span class="sub">one point per finished request</span></h2><canvas id="dashCCpre" role="img" aria-label="Prompt speed of each finished request"></canvas></div>
     <div class="card chart" data-chart="decode"><h2><span class="tip-u" tabindex="0" data-term="decode speed (tok/s)" data-tip="How fast replies were written, in tokens per second, across all requests. Gaps are idle time.">Reply speed (tokens/s)</span><span class="sub" id="dashCmDecSub">while writing</span></h2><canvas id="dashCCdec" role="img" aria-label="Reply speed while writing"></canvas></div>
     <div class="card chart" data-chart="requests"><h2><span class="tip-u" tabindex="0" data-term="running / prefilling / waiting / batched requests" data-tip="How many requests were being answered, reading their prompt, waiting their turn, or answered together in one shared pass.">Requests</span><span class="legend"><span><i style="background:var(--c1)"></i>running</span><span><i style="background:var(--c2)"></i>reading prompt</span><span><i style="background:var(--c3)"></i>waiting</span><span><i style="background:var(--c4)"></i>answered together</span></span></h2><canvas id="dashCReq" role="img" aria-label="Requests running, reading their prompt, waiting and answered together"></canvas></div>
     <div class="card chart" data-chart="gpu"><h2><span class="tip-u" tabindex="0" data-term="GPU clock and utilization" data-tip="The Mac GPU's clock speed (left scale) and how busy it was (right scale, dashed). The whole GPU counts, not only sushi.">GPU speed and load</span><span class="legend"><span><i style="background:var(--c1)"></i>clock speed (MHz)</span><span><i class="dash" style="border-top-color:var(--c3)"></i>busy (%)</span><span id="dashCGpucL" style="color:var(--text-2)"></span></span></h2><canvas id="dashCGpuc" role="img" aria-label="GPU clock and utilization"></canvas></div>
     <div class="card chart" data-chart="memory"><h2><span class="tip-u" tabindex="0" data-term="process memory footprint" data-tip="Memory sushi used over time, against the machine's memory (dashed line). Close to the line, long requests may be refused.">Memory (GiB)</span><span class="legend"><span><i style="background:var(--c4)"></i>in use by sushi</span><span style="color:var(--text-2)"><i class="dash"></i><span id="dashCmCeilL">machine memory</span></span></span></h2><canvas id="dashCMemc" role="img" aria-label="Memory in use by sushi"></canvas></div>
-    <div class="card chart" data-chart="memsplit"><h2><span class="tip-u" tabindex="0" data-term="MLX active / MLX cache / other" data-tip="Sushi's memory split into what is in use (the model and its working memory), freed memory held for quick reuse, and the rest.">Where the memory sits (GiB)</span><span class="legend"><span><i style="background:var(--c2)"></i>in use</span><span><i style="background:var(--c4)"></i>held for reuse</span><span><i style="background:var(--c1)"></i>other</span></span></h2><canvas id="dashCMem" role="img" aria-label="Memory split into in use, held for reuse and other"></canvas></div>
-    <div class="card chart" data-chart="specaccept"><h2><span class="tip-u" tabindex="0" data-term="draft acceptance (speculative decoding)" data-tip="To reply faster, the model guesses a few tokens ahead and checks them in one step. Each dot is the share of guesses one request kept: higher means faster replies.">Draft acceptance</span><span class="sub">one point per request that drafted</span></h2><canvas id="dashCSpec" role="img" aria-label="Share of guessed tokens each request kept"></canvas></div>
-    <div class="card chart" data-chart="specmodes"><h2><span class="tip-u" tabindex="0" data-term="draft acceptance by mode: MTP, DFlash2, DSpark" data-tip="The share of guessed tokens kept, for each guessing method: MTP (the model's own guesser), DFlash2 (a small helper model) and DSpark (DeepSeek's guesser).">Guesses kept, by method</span><span class="sub">since the server started</span></h2><div class="vis" id="dashSpecModes"></div><div class="foot" id="dashSpecModesFoot">&nbsp;</div></div>
-    <div class="card chart" data-chart="specrows"><h2><span class="tip-u" tabindex="0" data-term="verifier rows per round (DSpark)" data-tip="For DSpark: how many tokens each check step covered. One is the model's own next token; each extra one is a guess.">Tokens checked per step</span><span class="sub">DSpark, steps by tokens checked</span></h2><div class="vis" id="dashSpecRows"></div></div>
-    <div class="card chart" data-chart="cachetok"><h2><span class="tip-u" tabindex="0" data-term="cached vs computed prompt tokens" data-tip="For each recent request, how much of the prompt was reused from the conversation cache (fast) and how much the model had to read now.">Reused vs new prompt tokens</span><span class="legend"><span><i style="background:var(--c2)"></i>reused from cache</span><span><i style="background:var(--c1)"></i>read now</span></span></h2><div class="vis"><div class="stk" id="dashStk"></div><div class="foot" id="dashStkFoot">&nbsp;</div></div></div>
-    <div class="card chart" data-chart="cachereuse"><h2><span class="tip-u" tabindex="0" data-term="prefix cache reuse (hit rate)" data-tip="How much prompt text came from the conversation cache instead of being read again, and how many requests found something to reuse.">Conversation cache reuse</span><span class="sub">since the server started</span></h2><div class="vis reuse" id="dashReuse"><span id="dashReuseDonut"></span><div class="hbs" id="dashReuseBars"></div></div></div>
-    <div class="card chart" data-chart="cachetiers"><h2><span class="tip-u" tabindex="0" data-term="prefix cache storage: hot (memory) and SSD tiers, evictions" data-tip="How full the cache is in memory and on the SSD, the free disk space, and how many saved conversations were dropped to make room.">Conversation cache storage</span><span class="sub">memory and SSD</span></h2><div class="vis" id="dashTiers"></div><div class="foot" id="dashTiersFoot">&nbsp;</div></div>
-    <div class="card chart" data-chart="cachewrites"><h2><span class="tip-u" tabindex="0" data-term="prefix cache writes (SSD)" data-tip="How much the cache has written to the SSD, by kind of data.">Conversation cache writes</span><span class="sub">SSD, since the server started</span></h2><div class="vis" id="dashWrites"></div><div class="foot" id="dashWritesFoot">A file written again counts again; this does not measure SSD wear.</div></div>
+    <div class="card chart" data-chart="memsplit"><h2><span class="tip-u" tabindex="0" data-term="MLX active / MLX cache / other" data-tip="Sushi's memory split into what is in use (the model and its working memory), freed memory kept as a reusable cache, and the rest.">Where the memory sits (GiB)</span><span class="legend"><span><i style="background:var(--c2)"></i>in use</span><span><i style="background:var(--c4)"></i>reusable cache</span><span><i style="background:var(--c1)"></i>other</span></span></h2><canvas id="dashCMem" role="img" aria-label="Memory split into in use, reusable cache and other"></canvas></div>
+    <div class="card chart" data-chart="specaccept"><h2><span class="tip-u" tabindex="0" data-term="draft acceptance (speculative decoding)" data-tip="To reply faster, the model drafts a few tokens ahead and verifies them in one step (speculative decoding). Each dot is the share of drafted tokens one request kept: higher means faster replies.">Draft acceptance</span><span class="sub">one point per request that drafted</span></h2><canvas id="dashCSpec" role="img" aria-label="Share of drafted tokens each request kept"></canvas></div>
+    <div class="card chart" data-chart="specmodes"><h2><span class="tip-u" tabindex="0" data-term="accepted / drafted per mode: MTP, DFlash2, DSpark" data-tip="The share of drafted tokens kept, for each drafting method: MTP (the model's own draft head), DFlash2 (a small helper model) and DSpark (DeepSeek's drafter).">Draft acceptance by method</span><span class="sub">since the server started</span></h2><div class="vis" id="dashSpecModes"></div><div class="foot" id="dashSpecModesFoot">&nbsp;</div></div>
+    <div class="card chart" data-chart="specrows"><h2><span class="tip-u" tabindex="0" data-term="verifier rows per round (DSpark)" data-tip="For DSpark: how many tokens each verification round covered. One is the model's own next token; each extra one is a drafted token.">Tokens verified per round</span><span class="sub">DSpark, rounds by tokens verified</span></h2><div class="vis" id="dashSpecRows"></div></div>
+    <div class="card chart" data-chart="cachetok"><h2><span class="tip-u" tabindex="0" data-term="cached vs computed prompt tokens" data-tip="For each recent request, how much of the prompt was reused from the prompt cache (fast) and how much the model had to read now.">Reused vs new prompt tokens</span><span class="legend"><span><i style="background:var(--c2)"></i>reused from cache</span><span><i style="background:var(--c1)"></i>read now</span></span></h2><div class="vis"><div class="stk" id="dashStk"></div><div class="foot" id="dashStkFoot">&nbsp;</div></div></div>
+    <div class="card chart" data-chart="cachereuse"><h2><span class="tip-u" tabindex="0" data-term="prefix cache reuse (hit rate)" data-tip="How much prompt text came from the prompt cache instead of being read again, and how many requests found something to reuse.">Prompt cache reuse</span><span class="sub">since the server started</span></h2><div class="vis reuse" id="dashReuse"><span id="dashReuseDonut"></span><div class="hbs" id="dashReuseBars"></div></div></div>
+    <div class="card chart" data-chart="cachetiers"><h2><span class="tip-u" tabindex="0" data-term="prefix cache storage: hot (memory) and SSD tiers, evictions" data-tip="How full the cache is in memory and on the SSD, the free disk space, and how many saved conversations were dropped to make room.">Prompt cache storage</span><span class="sub">memory and SSD</span></h2><div class="vis" id="dashTiers"></div><div class="foot" id="dashTiersFoot">&nbsp;</div></div>
+    <div class="card chart" data-chart="cachewrites"><h2><span class="tip-u" tabindex="0" data-term="prefix cache writes (SSD)" data-tip="How much the cache has written to the SSD, by kind of data.">Prompt cache writes</span><span class="sub">SSD, since the server started</span></h2><div class="vis" id="dashWrites"></div><div class="foot" id="dashWritesFoot">A file written again counts again; this does not measure SSD wear.</div></div>
     <div class="card chart" data-chart="outcomes"><h2><span class="tip-u" tabindex="0" data-term="requests_success_total, cancelled, failed, rejected" data-tip="How requests ended since the server started: answered, cancelled, failed or refused.">Request outcomes</span><span class="sub">since the server started</span></h2><div class="vis" id="dashOutcomes"></div></div>
     <div class="card chart" data-chart="latency"><h2><span class="tip-u" tabindex="0" data-term="latency: TTFT, prefill and decode phases, e2e" data-tip="The average time a request spent before its first token, reading the prompt, writing the reply, and in total.">Time per request</span><span class="sub">average since the server started</span></h2><div class="vis" id="dashLat"></div><div class="foot" id="dashLatFoot">&nbsp;</div></div>
     <div class="card chart" data-chart="ttft"><h2><span class="tip-u" tabindex="0" data-term="TTFT (time_to_first_token_seconds)" data-tip="How many requests waited how long before the reply began. Lower is better.">Time to first token</span><span class="legend">requests per bucket</span></h2><div class="vis"><div class="hist" id="dashHTtft" tabindex="0" role="img" aria-label="Time to first token, requests per bucket. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlTtft"></div></div></div>
     <div class="card chart" data-chart="e2e"><h2><span class="tip-u" tabindex="0" data-term="e2e_request_latency_seconds" data-tip="How many requests took how long from arrival to the last token. Long replies take longer.">Total time per request</span><span class="legend">requests per bucket</span></h2><div class="vis"><div class="hist" id="dashHE2e" tabindex="0" role="img" aria-label="Total time, requests per bucket. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlE2e"></div></div></div>
     <div class="card chart" data-chart="ptok"><h2><span class="tip-u" tabindex="0" data-term="prompt_tokens histogram" data-tip="How many requests sent prompts of each length, in tokens.">Prompt length</span><span class="legend">requests per bucket, tokens</span></h2><div class="vis"><div class="hist" id="dashHPtok" tabindex="0" role="img" aria-label="Prompt length, requests per bucket. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlPtok"></div></div></div>
     <div class="card chart" data-chart="otok"><h2><span class="tip-u" tabindex="0" data-term="output_tokens histogram" data-tip="How many replies were of each length, in tokens.">Reply length</span><span class="legend">requests per bucket, tokens</span></h2><div class="vis"><div class="hist" id="dashHOtok" tabindex="0" role="img" aria-label="Reply length, requests per bucket. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlOtok"></div></div></div>
-    <div class="card chart" data-chart="serial"><h2><span class="tip-u" tabindex="0" data-term="serial decode reasons (decode_serial)" data-tip="Sushi can answer several requests in one shared pass. These are the reasons a request had to take its own pass instead, which is slower when many are running.">Why requests ran alone</span><span class="sub">steps a request ran alone while others ran</span></h2><div class="vis" id="dashSerial"></div></div>
+    <div class="card chart" data-chart="serial"><h2><span class="tip-u" tabindex="0" data-term="serial decode reasons (decode_serial)" data-tip="Sushi can answer several requests in one shared pass (batching). These are the reasons a request was not batched and took its own pass instead, which is slower when many are running.">Why requests weren't batched</span><span class="sub">steps a request ran alone while others ran</span></h2><div class="vis" id="dashSerial"></div></div>
   </section>
   </div>
 </section>
@@ -963,10 +963,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div id="settingsSkel"><div class="card"><div class="skel"></div><div class="skel"></div></div></div>
     <h2 class="sec-h" id="secStorage" hidden>Storage</h2>
     <section class="card" id="cacheCard" hidden>
-      <div class="card-h">Conversation cache (SSD)</div>
+      <div class="card-h">Prompt cache (SSD)</div>
       <div class="card-b">
         <div class="usage"><span id="cacheUsage"></span><span id="cacheFree"></span></div>
-        <div class="meter" role="meter" aria-label="Conversation cache used" aria-valuemin="0" aria-valuemax="100" id="cacheMeter"><span id="cacheBar"></span></div>
+        <div class="meter" role="meter" aria-label="Prompt cache used" aria-valuemin="0" aria-valuemax="100" id="cacheMeter"><span id="cacheBar"></span></div>
         <div class="kv" id="cacheKv"></div>
         <div id="cacheSet"></div>
       </div>
@@ -3329,14 +3329,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const KEY = {
     ctx_size: ["Context length", "How much text one conversation can hold, in tokens. Empty: sushi picks the most that fits in memory.", "--ctx-size",
       "A longer context fits bigger chats and files but takes more memory. Leave it empty unless a long request is refused.", "context window"],
-    kv_quant: ["Conversation memory precision", "How exactly the model keeps the conversation in memory. 8-bit is the default; 16-bit is exact and twice the size.", "--kv-quant",
-      "Fewer bits fit a longer conversation in the same memory, at a small quality cost. 8-bit suits almost everyone.", "KV cache quantization"],
-    mtp: ["Guess ahead", "The model guesses a few tokens ahead and checks them in one step, for faster replies. Default: on where the model can.", "--mtp",
-      "Usually makes replies faster at no cost to quality. Turn it off only to save a little memory or to compare speeds.", "MTP (multi-token prediction), speculative decoding"],
-    mtp_acceptance: ["Guess checking", "How strictly the guessed tokens are checked. Exact keeps the output the same as without guessing.", "",
-      "Typical and TokenV3 keep more guesses, so replies come faster, but the wording can differ from Exact. Exact is the safe choice.", "MTP draft acceptance rule"],
-    mtp_greedy_tail: ["Longer guesses when sampling", "With a temperature above 0, also guess the later tokens, picking the most likely ones.", "--mtp-greedy-tail",
-      "Mainly speeds replies together with Typical checking. Off by default.", "MTP greedy tail"],
+    kv_quant: ["KV cache precision", "How precisely the model stores its working memory of the conversation (the KV cache). 8-bit is the default; 16-bit is exact and twice the size.", "--kv-quant",
+      "Fewer bits fit a longer conversation in the same memory, at a small quality cost. 8-bit suits almost everyone.", ""],
+    mtp: ["Speculative decoding", "The model drafts a few tokens ahead and verifies them in one step, for faster replies. Default: on where the model can.", "--mtp",
+      "Usually makes replies faster at no cost to quality. Turn it off only to save a little memory or to compare speeds. It uses the model's own draft head (MTP).", ""],
+    mtp_acceptance: ["Draft acceptance", "How strictly the drafted tokens are verified. Exact keeps the output the same as without drafting.", "",
+      "Typical and TokenV3 accept more drafted tokens, so replies come faster, but the wording can differ from Exact. Exact is the safe choice.", ""],
+    mtp_greedy_tail: ["Longer drafts when sampling", "With a temperature above 0, also draft the later tokens, picking the most likely ones.", "--mtp-greedy-tail",
+      "Mainly speeds replies together with Typical acceptance. Off by default.", "MTP greedy tail"],
     ssd_budget_gb: ["Memory for SSD streaming (GiB)", "Memory for the parts of the model read from the SSD as it runs. More memory, fewer slow SSD reads.", "--ssd-budget-gb",
       "Setting it makes the model run partly from the SSD, so it fits in less memory but replies more slowly. Leave it empty if the model fits in memory.", "expert streaming budget"],
     ssd_prefetch: ["SSD read-ahead (%)", "Share of the SSD's speed sushi may use to read model parts before they are needed. 0 turns it off.", "--ssd-prefetch",
@@ -3345,8 +3345,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Can help long, multi-step tasks, but fills the context faster. The default follows the model's own chat format.", ""],
     think_penalty: ["Shorter thinking", "Nudges the model to finish thinking sooner. 0 is off; the most is 20.", "--think-penalty",
       "Use it when the model thinks for too long. Start low and raise it if thinking still runs long.", ""],
-    vision: ["Image understanding", "Loads the part of the model that reads images. Off saves its memory.", "--vision",
-      "Turn it off if you only chat in text and want the memory back.", "vision tower"],
+    vision: ["Vision (image input)", "Loads the part of the model that reads images. Off saves its memory.", "--vision",
+      "Turn it off if you only chat in text and want the memory back.", ""],
     max_tokens: ["Max reply length (tokens)", "The longest reply when an app sets no limit of its own. An app's own limit wins.", "--max-tokens",
       "A token is about three quarters of a word. Empty uses the model's default.", ""],
   };
@@ -3714,7 +3714,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     F.think = h("div", { class: "think-line", hidden: true });
     F.cacheKv = h("div", { class: "kv" });
     F.cacheBtn = h("button", { class: "btn sm danger", type: "button", onclick: () => clearModel(F.id) });
-    F.cacheSect = h("div", { class: "sect", hidden: true }, h("h3", { text: "Conversation cache" }), h("div", { class: "lead", text: "Saved conversations, so a follow-up skips re-reading its prompt." }), F.cacheKv, h("div", {}, F.cacheBtn));
+    F.cacheSect = h("div", { class: "sect", hidden: true }, h("h3", { text: "Prompt cache" }), h("div", { class: "lead", text: "Saved conversations, so a follow-up skips re-reading its prompt." }), F.cacheKv, h("div", {}, F.cacheBtn));
     F.saveMsg = h("span", { class: "msg" });
     F.discard = h("button", { class: "btn sm ghost", type: "button", text: "Discard", onclick: () => { Object.assign(per(F.id), { texts: {}, errors: {} }); for (const S of F.sets.values()) S.control.node.removeAttribute?.("aria-invalid"); patchDetail(info(F.id)); } });
     F.save = h("button", { class: "btn sm primary", type: "button", text: "Save", onclick: () => saveModel(F) });
@@ -3878,7 +3878,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const enterTo = (button) => (e) => { if (e.key === "Enter") { e.preventDefault(); if (!button.disabled && !button.hidden) button.click(); } };
   // Typing starts a new attempt: the last refusal of this setting goes.
   const typed = (key) => { delete A.serr[key]; };
-  const cacheIn = h("input", { id: "cacheGb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default", "aria-label": "Assigned conversation cache space in GiB", oninput: () => { A.cacheText = cacheIn.value; typed("prefix_cache_disk_gb"); renderSettings(); }, onkeydown: (e) => enterTo(cacheSave)(e) });
+  const cacheIn = h("input", { id: "cacheGb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default", "aria-label": "Assigned prompt cache space in GiB", oninput: () => { A.cacheText = cacheIn.value; typed("prefix_cache_disk_gb"); renderSettings(); }, onkeydown: (e) => enterTo(cacheSave)(e) });
   const cacheUnit = h("span", { class: "muted", text: "GiB" }), cacheWarn = h("div", { class: "warn", role: "status", hidden: true });
   const cacheSave = h("button", { class: "btn sm primary", id: "cacheSave", type: "button", text: "Save", onclick: saveCache });
   cacheRow.ctl.append(h("div", { class: "row-in" }, cacheIn, cacheUnit, cacheSave), cacheRow.bad, cacheWarn);
@@ -4079,7 +4079,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   async function saveCache() {
     const v = adminControlValue(GB_SPEC, cacheIn.value);
     if (!v.ok) return;
-    if (v.value === 0 && !(await confirmAction({ title: "Turn the conversation cache off?", body: "Takes effect at the next model load; existing caches stay on disk until cleared.", confirm: "Turn off" }))) return;
+    if (v.value === 0 && !(await confirmAction({ title: "Turn the prompt cache off?", body: "Takes effect at the next model load; existing caches stay on disk until cleared.", confirm: "Turn off" }))) return;
     saveServer("prefix_cache_disk_gb", v.value, v.value === null ? "Back to the default size." : "Saved.", cacheSave, "Saving…");
   }
   function renderSettings() {
@@ -4552,7 +4552,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   document.addEventListener('visibilitychange', () => { syncServerTimer(); if (!document.hidden) pollSoon(); });
 
   const WRITE_TERMS = { kv: 'kv (KV chunks)', ssm: 'ssm (recurrent state restore points)', qsa: 'qsa (QSA history)', spec: 'spec (speculative state)', ring: 'ring (ring points)', meta: 'meta (manifests and token records)' };
-  const WRITE_KINDS = { kv: 'Attention memory', ssm: 'Restore points', qsa: 'Long-context index', spec: 'Guessing state', ring: 'Sliding-window points', meta: 'Indexes and token lists' };
+  const WRITE_KINDS = { kv: 'Attention memory', ssm: 'Restore points', qsa: 'Long-context index', spec: 'Draft state', ring: 'Sliding-window points', meta: 'Indexes and token lists' };
   // The cache's write counters as the card shows them: the rate since the previous poll (null on the first poll
   // and across a restart) and the bytes written per byte now on disk (null while nothing is on disk).
   function prefixWrites(w, prev, now, onDisk) {
@@ -4661,7 +4661,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     put($('t-gpu-s'), clockMax ? `busy, ${fmtInt(g.gpu_clock_mhz)} MHz` : 'busy');
     put($('t-mem'), fmt((g.memory_mb || 0) / 1024, 1) + ' GiB');
     lastGauges = g;
-    if (serverInfo.free == null) put($('t-mem-s'), `${fmt(gib(g.mlx_active_bytes || 0), 1)} GiB in use, ${fmt(gib(g.mlx_cache_bytes || 0), 1)} held for reuse`);
+    if (serverInfo.free == null) put($('t-mem-s'), `${fmt(gib(g.mlx_active_bytes || 0), 1)} GiB in use, ${fmt(gib(g.mlx_cache_bytes || 0), 1)} reusable cache`);
     put($('t-ttft'), secs(mean(h.time_to_first_token_seconds)));
     put($('t-ttft-s'), `average wait, ${fmtInt(h.time_to_first_token_seconds?.count || 0)} requests`);
     const pt = c.prompt_tokens_total || 0;
@@ -4685,7 +4685,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (on('specrows')) specRows(d.speculative && (d.speculative.dspark?.rows || {}));
     if (on('cachewrites')) {
       const share = v => writes.total ? ` (${fmt(100 * v / writes.total, 0)}%)` : '';
-      const rows = writes ? [...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || k, v, bytes(v), '--c4', tip(WRITE_KINDS[k] || k, [['Written', bytes(v) + share(v)]], 'Bytes the conversation cache wrote to the SSD for this kind since the server started.', WRITE_TERMS[k])]),
+      const rows = writes ? [...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || k, v, bytes(v), '--c4', tip(WRITE_KINDS[k] || k, [['Written', bytes(v) + share(v)]], 'Bytes the prompt cache wrote to the SSD for this kind since the server started.', WRITE_TERMS[k])]),
         ...(writes.failed ? [['Failed or dropped', writes.failed, bytes(writes.failed), '--err', tip('Failed or dropped', [['Bytes', bytes(writes.failed)]], 'Writes that failed or were dropped before they reached the disk.', 'failed_bytes')]] : [])] : [];
       bars('writes', rows, writes ? 'Nothing written yet' : NOT_REPORTED);
       const known = writes ? [writes.rate != null && 'Writing ' + bytes(writes.rate) + '/s', writes.amplification != null && fmt(writes.amplification, 1) + 'x written per byte kept'].filter(Boolean) : [];
@@ -4716,7 +4716,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
 
   // The server's reasons a request decoded alone, in words.
-  const SERIAL_REASON = { spec_active: 'Guessing ahead', head_release_pending: 'Guesser still busy', grammar: 'Structured output (JSON)', forced_call: 'Forced tool call', logprobs: 'Token probabilities asked',
+  const SERIAL_REASON = { spec_active: 'Speculative decoding', head_release_pending: 'Draft head still busy', grammar: 'Structured output (JSON)', forced_call: 'Forced tool call', logprobs: 'Token probabilities asked',
     penalty: 'Repetition penalty', arch: 'Model cannot share a pass', pad_waste: 'Too uneven to share', row_cap: 'Shared pass full', exclusive: 'Model runs one at a time' };
   // Horizontal bars with the exact value beside each. rows: [label, value, text, colour var, tip]. The rows are one Tab stop.
   function bars(id, rows, none, full) {
@@ -4747,7 +4747,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       <circle cx="50" cy="50" r="40" fill="none" stroke="${tot ? 'var(--c1)' : 'var(--surface-2)'}" stroke-width="14"/>
       <circle cx="50" cy="50" r="40" fill="none" stroke="var(--c2)" stroke-width="14" stroke-dasharray="${(f * C).toFixed(2)} ${C.toFixed(2)}" transform="rotate(-90 50 50)"/>
       <text x="50" y="50">${tot ? fmt(100 * f, 0) + '%' : '-'}</text></svg>`);
-    bars('reuse-bars', [valueRow('From cache', tot ? f : 0, `${fmtInt(rest)} tokens`, '--c2', 'Prompt tokens reused from the conversation cache instead of read again.', 'restored (prefix cache hit tokens)'), valueRow('Read now', tot ? 1 - f : 0, `${fmtInt(comp)} tokens`, '--c1', 'Prompt tokens the model had to read.', 'computed (prefill tokens)'),
+    bars('reuse-bars', [valueRow('From cache', tot ? f : 0, `${fmtInt(rest)} tokens`, '--c2', 'Prompt tokens reused from the prompt cache instead of read again.', 'restored (prefix cache hit tokens)'), valueRow('Read now', tot ? 1 - f : 0, `${fmtInt(comp)} tokens`, '--c1', 'Prompt tokens the model had to read.', 'computed (prefill tokens)'),
       valueRow('Requests that reused', qs ? hits / qs : 0, qs ? `${fmtInt(hits)} of ${fmtInt(qs)}` : '-', '--c3', 'Requests that reused any saved tokens, of all that looked.', 'prefix_cache_hits_total / prefix_cache_queries_total'),
       ...(tc.hits ? [valueRow('Reused from memory', byTier ? hot / byTier : 0, fmtInt(hot), '--c4', 'Requests that reused a conversation kept in memory.', 'hot tier hits'), valueRow('Reused from SSD', byTier ? ssd / byTier : 0, fmtInt(ssd), '--c2', 'Requests that reused a conversation saved on the SSD.', 'SSD tier hits')] : [])], '', 1);
   }
@@ -4774,18 +4774,18 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     for (const [k, name] of SPEC_MODES) {
       const m = sp[k]; if (!m?.rounds) continue;
       const acc = m.drafted ? m.accepted / m.drafted : 0, per = m.accepted / m.rounds;
-      rows.push([name, acc, `${fmt(100 * acc, 0)}%, ${fmt(per, 1)} per step`, '--c3', { t: name, rows: [['Acceptance', `${fmt(100 * acc, 1)}%`], ['Accepted / drafted', `${fmtInt(m.accepted)} / ${fmtInt(m.drafted)}`], ['Steps', fmtInt(m.rounds)], ['Kept per step', fmt(per, 2)], ['Requests', fmtInt(m.requests)]], h: 'Guessed tokens the model kept after checking them. Each step also writes one token of its own, which is not counted here.', term: `${k} draft acceptance (accepted / drafted, per round)` }]);
+      rows.push([name, acc, `${fmt(100 * acc, 0)}%, ${fmt(per, 1)} per round`, '--c3', { t: name, rows: [['Acceptance', `${fmt(100 * acc, 1)}%`], ['Accepted / drafted', `${fmtInt(m.accepted)} / ${fmtInt(m.drafted)}`], ['Rounds', fmtInt(m.rounds)], ['Kept per round', fmt(per, 2)], ['Requests', fmtInt(m.requests)]], h: 'Drafted tokens the model kept after verifying them. Each round also writes one token of its own, which is not counted here.', term: `${k} draft acceptance (accepted / drafted, per round)` }]);
     }
     const ds = sp.dspark;
-    if (ds?.rounds) rows.push(['DSpark steps without a guess', ds.plain_rounds / ds.rounds, `${fmt(100 * ds.plain_rounds / ds.rounds, 0)}%`, '--warn', { t: 'DSpark steps without a guess', rows: [['Without a guess / steps', `${fmtInt(ds.plain_rounds)} / ${fmtInt(ds.rounds)}`]], h: 'Steps that wrote one token the normal way, with no guess to check.', term: 'plain_rounds (rounds without a draft)' }]);
-    bars('spec-modes', rows, 'No request has guessed ahead yet', 1);
+    if (ds?.rounds) rows.push(['DSpark rounds without a draft', ds.plain_rounds / ds.rounds, `${fmt(100 * ds.plain_rounds / ds.rounds, 0)}%`, '--warn', { t: 'DSpark rounds without a draft', rows: [['Without a draft / rounds', `${fmtInt(ds.plain_rounds)} / ${fmtInt(ds.rounds)}`]], h: 'Rounds that wrote one token the normal way, with no draft to verify.', term: 'plain_rounds (rounds without a draft)' }]);
+    bars('spec-modes', rows, 'No request has used speculative decoding yet', 1);
     const mtp = sp.mtp;
-    put($('spec-modes-foot'), mtp?.plain_rounds ? `MTP: ${fmtInt(mtp.plain_rounds)} steps ran without a guess.` : '');
+    put($('spec-modes-foot'), mtp?.plain_rounds ? `MTP: ${fmtInt(mtp.plain_rounds)} rounds ran without a draft.` : '');
   }
   function specRows(rows) {
     if (!rows) { bars('spec-rows', [], NOT_REPORTED); return; }
     const list = Object.entries(rows).map(([r, n]) => [+r, n]).sort((a, b) => a[0] - b[0]), total = list.reduce((a, [, n]) => a + n, 0);
-    bars('spec-rows', list.map(([r, n]) => [r === 1 ? '1 token (no guess)' : `${r} tokens`, n, fmtInt(n), '--c4', { t: r === 1 ? '1 token checked (no guess)' : `${r} tokens checked`, rows: [['Steps', `${fmtInt(n)} (${fmt(100 * n / total, 0)}%)`]], h: "One token is the model's own; every extra one is a guess being checked.", term: 'verifier rows per round' }]), 'No DSpark step yet');
+    bars('spec-rows', list.map(([r, n]) => [r === 1 ? '1 token (no draft)' : `${r} tokens`, n, fmtInt(n), '--c4', { t: r === 1 ? '1 token verified (no draft)' : `${r} tokens verified`, rows: [['Rounds', `${fmtInt(n)} (${fmt(100 * n / total, 0)}%)`]], h: "One token is the model's own; every extra one is a drafted token being verified.", term: 'verifier rows per round' }]), 'No DSpark round yet');
   }
 
   // Acceptance of each request that drafted: accepted over drafted, one dot per request at the time it finished.
@@ -4793,7 +4793,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const tEnd = Math.max(series.t[series.t.length - 1] ?? 0, ...evs.map(e => e.t)) || undefined;
     const f = frame(id, 100, { tEnd, plain: true, dec: 0, unit: '%' }), { cv, ctx, hgt, padT, padB, X, Y } = f;
     charts[id] = { xs: evs.map(e => X(e.t)), y: (padT + hgt - padB) / 2 };
-    if (!evs.length) { emptyNote(f, lastData && !lastData.d.speculative ? NOT_REPORTED : 'No request guessed ahead in this window yet'); if (tipOwner === cv.id) hideTip(); return; }
+    if (!evs.length) { emptyNote(f, lastData && !lastData.d.speculative ? NOT_REPORTED : 'No request used speculative decoding in this window yet'); if (tipOwner === cv.id) hideTip(); return; }
     const hv = hover[id], pct = e => 100 * e.accepted / e.drafted;
     let near = -1, best = 24;
     if (hv) evs.forEach((e, i) => { const dx = Math.abs(X(e.t) - hv.x); if (dx < best) { best = dx; near = i; } });
@@ -4807,8 +4807,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (near < 0) { if (tipOwner === cv.id) hideTip(); return; }
     const e = evs[near], r = cv.getBoundingClientRect(), row = (k, v) => `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${v}</b></div>`;
     placeTip(r.left + X(e.t), r.top + hv.y, `<div class="t">${new Date(e.t).toLocaleTimeString()}</div>` + row('Acceptance', `${fmt(pct(e), 1)}%`) + row('Method', esc(SPEC_MODES.find(m => m[0] === e.mode)?.[1] ?? e.mode))
-      + row('Accepted / drafted', `${fmtInt(e.accepted)} / ${fmtInt(e.drafted)}`) + row('Per step', `${fmt(e.accepted / e.rounds, 2)} over ${fmtInt(e.rounds)} steps`)
-      + '<div class="h">Guessed tokens the model kept after checking, of all this request guessed.</div>' + termHtml('draft acceptance (accepted / drafted)'), cv.id);
+      + row('Accepted / drafted', `${fmtInt(e.accepted)} / ${fmtInt(e.drafted)}`) + row('Per round', `${fmt(e.accepted / e.rounds, 2)} over ${fmtInt(e.rounds)} rounds`)
+      + '<div class="h">Drafted tokens the model kept after verifying, of all this request drafted.</div>' + termHtml('draft acceptance (accepted / drafted)'), cv.id);
   }
   window.addEventListener('sushi-mode', () => { applyLayout(); if (dashActive && lastData) render(lastData); });
 
@@ -4896,9 +4896,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   // Fly-over help for the phase chips and the prefill percentage.
   const PHASE_HELP = {
-    prefill: ['Reading', 'The model is reading the prompt before it can answer. Text reused from the conversation cache is skipped, so only the new part is read here. The percentage beside it shows how much is done.'],
-    decode: ['Writing', 'The model is writing the reply one token at a time. It stops when the answer is done or the reply reaches its length limit.'],
-    cached: ['Saved', 'Not a running request: a finished conversation kept in memory, so a follow-up can continue without reading the whole prompt again. It leaves this list while a new request uses it.'],
+    prefill: ['Reading prompt', 'The model is reading the prompt before it can answer. Text reused from the prompt cache is skipped, so only the new part is read here. The percentage beside it shows how much is done.'],
+    decode: ['Replying', 'The model is writing the reply one token at a time. It stops when the answer is done or the reply reaches its length limit.'],
+    cached: ['Cached', 'Not a running request: a finished conversation kept in memory, so a follow-up can continue without reading the whole prompt again. It leaves this list while a new request uses it.'],
   };
   const sess = $('sessions');
   let phasePtr = null; // last pointer position over the table, to re-check after each re-render
@@ -5066,7 +5066,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     // "off" is a claim about a loaded model's settings; without one (or before /props answers) there is nothing to say.
     setValue($('cm-ssd'), cap ? bytes(ssd) : known ? 'off' : '-', cap ? '/ ' + bytes(cap) : '');
     setWidth($('cm-ssd-bar'), cap ? Math.min(100, 100 * ssd / cap) : 0);
-    put($('cm-ssd-s'), cap ? `${fmtInt(entries)} ${entries === 1 ? 'entry' : 'entries'}` : known ? 'Conversation cache is off' : modelsKnown && !ready.length ? 'no model loaded' : '');
+    put($('cm-ssd-s'), cap ? `${fmtInt(entries)} ${entries === 1 ? 'entry' : 'entries'}` : known ? 'Prompt cache is off' : modelsKnown && !ready.length ? 'no model loaded' : '');
     put($('cm-ssd-volume'), cap ? cacheVolumeText(volume) : '');
     const ssdTitle = volume?.path || '';
     if ($('cm-ssd-volume').title !== ssdTitle) $('cm-ssd-volume').title = ssdTitle;
@@ -5242,7 +5242,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     });
     if (near < 0) { if (tipOwner === cv.id) hideTip(); return; }
     const e = evs[near], r = cv.getBoundingClientRect(), row = (k, v) => `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${v}</b></div>`;
-    const help = mostlyRestored(e) ? 'Mostly reused from the conversation cache. The time includes loading the saved part, so this is not a reading speed.'
+    const help = mostlyRestored(e) ? 'Mostly reused from the prompt cache. The time includes loading the saved part, so this is not a reading speed.'
       : e.restored ? 'New prompt tokens divided by the time spent reading. That time includes loading the reused part, so the true speed is at least this.'
       : 'The speed of one request: its prompt tokens divided by the time spent reading them.';
     placeTip(r.left + X(e.t), r.top + hv.y, `<div class="t">${new Date(e.t).toLocaleTimeString()}</div>`
@@ -5289,7 +5289,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const tps = v => fmt(v, v < 100 ? 1 : 0) + ' tokens/s', cnt = v => fmtInt(v), gb = v => fmt(v, 2) + ' GiB';
   const LABELS = {
     gen: { name: 'Reply speed', fmt: tps, help: 'Reply tokens written per second across all requests.', term: 'decode (tok/s)' },
-    pre: { name: 'Prompt speed', fmt: tps, help: 'Prompt tokens read per second. Text reused from the conversation cache is not counted.', term: 'prefill (tok/s)' },
+    pre: { name: 'Prompt speed', fmt: tps, help: 'Prompt tokens read per second. Text reused from the prompt cache is not counted.', term: 'prefill (tok/s)' },
     run: { name: 'Running', fmt: cnt, help: 'Requests being answered now, reading the prompt or writing the reply.', term: 'running requests' },
     pref: { name: 'Reading prompt', fmt: cnt, help: 'Requests reading their prompt before they start the reply.', term: 'prefilling requests' },
     wait: { name: 'Waiting', fmt: cnt, help: 'Requests waiting their turn. Waiting that does not clear means more requests arrive than the server can answer at once.', term: 'waiting (queued) requests' },
@@ -5298,8 +5298,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     gpu: { name: 'Busy', fmt: v => fmtInt(v) + '%', help: 'How busy the whole Mac GPU was, as the Mac reports it (not only sushi).', term: 'gpu_utilization_pct' },
     mem: { name: 'Used by sushi', fmt: gb, help: 'All the memory sushi holds, GPU buffers included.', term: 'process footprint (memory_mb)' },
     act: { name: 'In use', fmt: gb, help: 'Memory in active use: the model, the conversations it is working on and working space.', term: 'MLX active (mlx_active_bytes)' },
-    other: { name: 'Other', fmt: gb, help: 'The rest of what sushi holds: neither in active use nor held for reuse.', term: 'footprint minus MLX active and MLX cache' },
-    cache: { name: 'Held for reuse', fmt: gb, help: 'Freed memory kept ready for the next request. Held by sushi but not in use; a steady climb here explains growing memory use.', term: 'MLX cache (mlx_cache_bytes)' },
+    other: { name: 'Other', fmt: gb, help: 'The rest of what sushi holds: neither in use nor reusable cache.', term: 'footprint minus MLX active and MLX cache' },
+    cache: { name: 'Reusable cache', fmt: gb, help: 'Freed memory kept ready for the next request. Held by sushi but not in use; a steady climb here explains growing memory use.', term: 'MLX cache (mlx_cache_bytes)' },
   };
 
   const CHART_IDS = ['c-req', 'c-spec', 'c-mem', 'c-cpre', 'c-cdec', 'c-memc', 'c-gpuc'];
@@ -5361,9 +5361,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', themeChanged);
 
   // Which charts show and in what order is a preference of this browser. Until one is made, Compact shows four and Advanced all.
-  const CHARTS = [['prefill', 'Prompt speed'], ['decode', 'Reply speed'], ['requests', 'Requests'], ['gpu', 'GPU speed and load'], ['memory', 'Memory'], ['memsplit', 'Memory split'], ['specaccept', 'Draft acceptance'], ['specmodes', 'Guesses by method'], ['specrows', 'Tokens checked per step'],
+  const CHARTS = [['prefill', 'Prompt speed'], ['decode', 'Reply speed'], ['requests', 'Requests'], ['gpu', 'GPU speed and load'], ['memory', 'Memory'], ['memsplit', 'Memory split'], ['specaccept', 'Draft acceptance'], ['specmodes', 'Draft acceptance by method'], ['specrows', 'Tokens verified per round'],
     ['cachetok', 'Reused vs new tokens'], ['cachereuse', 'Cache reuse'], ['cachetiers', 'Cache storage'], ['cachewrites', 'Cache writes'], ['outcomes', 'Request outcomes'], ['latency', 'Time per request'],
-    ['ttft', 'Time to first token'], ['e2e', 'Total time'], ['ptok', 'Prompt length'], ['otok', 'Reply length'], ['serial', 'Why requests ran alone']];
+    ['ttft', 'Time to first token'], ['e2e', 'Total time'], ['ptok', 'Prompt length'], ['otok', 'Reply length'], ['serial', "Why requests weren't batched"]];
   const COMPACT_SET = ['prefill', 'decode', 'memory', 'gpu'], ALL = CHARTS.map(c => c[0]);
   const grid = $('charts'), cardOf = id => grid.querySelector(`[data-chart="${id}"]`);
   let layout = null; // {order, hidden} once chosen
@@ -5528,7 +5528,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const g = lastGauges, rows = [
         ['Used by sushi', bytes((g.memory_mb || 0) * 1048576)],
         ['In use', bytes(g.mlx_active_bytes || 0)],
-        ['Held for reuse', bytes(g.mlx_cache_bytes || 0)],
+        ['Reusable cache', bytes(g.mlx_cache_bytes || 0)],
         ...(serverInfo.free != null ? [['Free for the GPU', bytes(serverInfo.free)]] : []),
         ...(serverInfo.peak ? [['Highest since start', bytes(serverInfo.peak)]] : []),
       ];
@@ -5537,7 +5537,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     cache: () => {
       const d = serverInfo.disk;
       const rows = d ? [['Disk cache used', `${bytes(d.disk_used_bytes || 0)} of ${bytes(d.disk_bytes)}`], ['Conversations saved', fmtInt(d.disk_entries)]] : [['Disk cache', 'off or not reported']];
-      return ['Conversation cache', rows, 'Saved conversations let follow-up requests skip re-reading their prompt. The oldest are dropped when the assigned space fills.', 'SSD prefix cache (disk tier, evictions)'];
+      return ['Prompt cache', rows, 'Saved conversations let follow-up requests skip re-reading their prompt. The oldest are dropped when the assigned space fills.', 'SSD prefix cache (disk tier, evictions)'];
     },
   };
   const tileTip = el => {

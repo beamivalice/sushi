@@ -620,7 +620,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   dropped bytes. A server without the counters shows "Not reported by this server". Logic: `prefixWrites`,
   `renderCards`, `acceptChart` and the layout block in the dashboard script, guarded by `tests/test_webui_prefix_cache.cjs`
   and `tests/test_webui_dashboard.cjs` (`chartPicker`, `chartExtras`).
-- The right sidebar's "Conversation cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
+- The right sidebar's "Prompt cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
   (`disk_used_bytes / disk_bytes`, "<used> / <budget> GB" and the entry count beside it). It is read after each reply
   and again 2.5 s later (the server stores a turn's entry after answering) and stays hidden while `disk_bytes` is 0.
 - It speaks only the public API: `/v1/models` for the picker (`vision` or an `image` input modality shows the attach

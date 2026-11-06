@@ -1042,7 +1042,9 @@ async function main() {
     const FLAGS = { ctx_size: '--ctx-size', kv_quant: '--kv-quant', mtp: '--mtp', mtp_acceptance: null, mtp_greedy_tail: '--mtp-greedy-tail', ssd_budget_gb: '--ssd-budget-gb', ssd_prefetch: '--ssd-prefetch',
       preserve_thinking: '--preserve-thinking', think_penalty: '--think-penalty', vision: '--vision', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
       update_check: '--no-update-check', pack_update_check: '--no-update-check' };
-    const WORDS = { kv_quant: /KV cache quantization/, mtp: /MTP.*speculative decoding/, mtp_acceptance: /draft acceptance/, ssd_budget_gb: /expert/, ssd_prefetch: /prefetch/, vision: /vision/ };
+    const WORDS = { ssd_budget_gb: /expert/, ssd_prefetch: /prefetch/ };
+    // A label that is already the common term keeps only the key and flag in its technical name.
+    const KEY_ONLY = { kv_quant: 'kv_quant (--kv-quant)', mtp: 'mtp (--mtp)', mtp_acceptance: 'mtp_acceptance', vision: 'vision (--vision)' };
     const BADGE_TERMS = { Saved: /model-settings\.json/, 'Set at launch': /launch flag/, Now: /live/, 'Next load': /model load/, 'Next start': /server start/ };
     const termsOf = (page) => page.$$eval('.set', (rows) => rows.filter((r) => r.offsetParent || r.closest('details')).map((r) => ({ key: r.dataset.key, term: r.querySelector('.lab [data-tip]')?.dataset.term ?? '',
       badges: [...r.querySelectorAll('.badges .badge')].map((b) => [b.textContent, b.dataset.term ?? '']) })));
@@ -1060,6 +1062,7 @@ async function main() {
           assert.ok(r.term.includes(r.key), `${r.key}: its term names the key (${r.term})`);
           if (FLAGS[r.key]) assert.ok(r.term.includes(FLAGS[r.key]), `${r.key}: its term names ${FLAGS[r.key]} (${r.term})`);
           if (WORDS[r.key]) assert.match(r.term, WORDS[r.key], `${r.key}: its engineering word`);
+          if (KEY_ONLY[r.key]) assert.equal(r.term, KEY_ONLY[r.key], `${r.key}: its term does not repeat the label`);
           for (const [text, term] of r.badges) { assert.match(term, BADGE_TERMS[text], `${r.key}: the ${text} badge`); seen.add(text); }
         }
         assert.ok(seen.has(path === '/settings' ? 'Next start' : 'Saved'), `a badge was checked (${[...seen]})`);
@@ -1067,6 +1070,25 @@ async function main() {
           assert.ok(rows.length >= 11, `every model key was checked (${rows.map((r) => r.key)})`);
           assert.ok(seen.has('Set at launch'), 'a launch-flag badge was checked');
         }
+      });
+    // The label is the term users know from other LLM apps; the page never says guess or Conversation cache.
+    for (const path of ['/models#Qwen-A', '/settings'])
+      await scenario(`${path} uses the common terms`, { path, open: { mode: 'advanced' }, setup: (s) => {
+        s.state.models[0].keys = KEYS.map((k) => k.name);
+        s.state.cache.namespaces.push({ id: 'dddddddd44444444', bytes: Math.round(3 * GiB), entries: 2, newest_mtime: Date.now() / 1000 - 5 * 86400, model: null, stale: true, held_by_other_process: false, tier: null });
+      } }, async ({ page }) => {
+        await page.waitForSelector('.set .lab');
+        if (path === '/settings') assert.equal(await page.textContent('#cacheCard .card-h'), 'Prompt cache (SSD)');
+        else {
+          const labels = await page.$$eval('.set', (rows) => Object.fromEntries(rows.map((r) => [r.dataset.key, r.querySelector('.lab [data-tip]')?.textContent])));
+          assert.deepEqual([labels.kv_quant, labels.mtp, labels.mtp_acceptance, labels.vision], ['KV cache precision', 'Speculative decoding', 'Draft acceptance', 'Vision (image input)']);
+          const options = await page.$eval(`${row('mtp_acceptance')} select`, (n) => [...n.options].map((o) => o.textContent).join('|'));
+          assert.equal(options, 'Default|Exact (same output)|Typical (faster)|TokenV3 (faster)', options);
+          assert.ok((await page.$$eval('.sect h3', (ns) => ns.map((n) => n.textContent))).includes('Prompt cache'), 'the model page names its cache section');
+        }
+        const words = await page.evaluate(() => [...document.querySelectorAll('body *:not(script):not(style)')].flatMap((n) => [...n.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent)
+          .concat(['tip', 'term'].map((k) => n.dataset[k]), n.getAttribute('aria-label'), n.title)).filter(Boolean).join('\n'));
+        assert.doesNotMatch(words, /guess|conversation cache|conversation memory/i, 'no page says guess or Conversation cache');
       });
     await scenario('a model\'s facts keep their engineering names', { path: '/models#Qwen-A' }, async ({ page }) => {
       await page.waitForSelector('.facts [data-tip]');

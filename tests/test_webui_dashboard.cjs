@@ -714,8 +714,8 @@ async function chartExtras(browser) {
     await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
     await page.waitForFunction(() => document.getElementById('dashSpecModes').textContent.includes('MTP'), null, { timeout: 15000 });
     const rows = (id) => page.evaluate((i) => [...document.querySelectorAll(`#${i} .hb`)].map((r) => [r.querySelector('span').textContent, r.querySelector('b').textContent]), id);
-    assert.deepEqual(await rows('dashSpecModes'), [['MTP', '70%, 2.1 per step'], ['DSpark', '60%, 3.0 per step'], ['DSpark steps without a guess', '25%']], 'guesses by method: acceptance and the mean kept per step');
-    assert.deepEqual(await rows('dashSpecRows'), [['1 token (no guess)', '5'], ['3 tokens', '10'], ['5 tokens', '5']], 'DSpark steps by tokens checked');
+    assert.deepEqual(await rows('dashSpecModes'), [['MTP', '70%, 2.1 per round'], ['DSpark', '60%, 3.0 per round'], ['DSpark rounds without a draft', '25%']], 'draft acceptance by method: acceptance and the mean kept per round');
+    assert.deepEqual(await rows('dashSpecRows'), [['1 token (no draft)', '5'], ['3 tokens', '10'], ['5 tokens', '5']], 'DSpark rounds by tokens verified');
     await page.hover('#dashSpecModes .hb');
     await page.waitForFunction(() => document.getElementById('tip').classList.contains('show'), null, { timeout: 5000 });
     assert.match(await page.evaluate(() => document.getElementById('tip').textContent), /MTP\nAcceptance: 70\.0%\nAccepted \/ drafted: 84 \/ 120\n/, 'a bar row explains its figure in the page\'s one tooltip');
@@ -747,8 +747,8 @@ async function chartExtras(browser) {
     // A server that drafted nothing says so.
     const zero = { requests: 0, rounds: 0, drafted: 0, accepted: 0, plain_rounds: 0 };
     const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { speculative: { mtp: zero, dflash: zero, dspark: zero } } });
-    await page.waitForFunction(() => /No request has guessed ahead yet/.test(document.getElementById('dashSpecModes').textContent));
-    assert.match(await textOf(page, 'dashSpecRows'), /No DSpark step yet/);
+    await page.waitForFunction(() => /No request has used speculative decoding yet/.test(document.getElementById('dashSpecModes').textContent));
+    assert.match(await textOf(page, 'dashSpecRows'), /No DSpark round yet/);
     await context.close();
   }
 }
@@ -818,14 +818,14 @@ async function chartAudit(browser) {
     const compact = await openPage(browser, '/dashboard', { mode: 'compact' });
     await compact.page.waitForSelector('.tiles-cmp .tile[data-tip]');
     expectTerms(await lines(compact.page, '.tiles-cmp'), {
-      'Reply speed': /decode/, 'Prompt speed': /prefill/, Memory: /MLX active.*MLX cache/, 'Conversation cache': /prefix cache/, Requests: /running.*waiting/,
+      'Reply speed': /decode/, 'Prompt speed': /prefill/, Memory: /MLX active.*MLX cache/, 'Prompt cache': /prefix cache/, Requests: /running.*waiting/,
     }, 'Compact tiles');
     await compact.context.close();
 
     const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', sessions: [{ request_id: 7, model: 'org/test-model', phase: 'prefill', context_length: 8192, prefill_done: 10, prefill_expected: 100 }, { request_id: 8, model: 'org/test-model', phase: 'decode', context_length: 8192 }],
       specData: { ...specFixture(), decode_serial: { spec_active: 4, pad_waste: 2 } } });
     await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
-    await page.waitForFunction(() => document.getElementById('dashSpecModes').textContent.includes('MTP') && document.getElementById('dashSerial').textContent.includes('Guessing'), null, { timeout: 15000 });
+    await page.waitForFunction(() => document.getElementById('dashSpecModes').textContent.includes('MTP') && document.getElementById('dashSerial').textContent.includes('Speculative decoding'), null, { timeout: 15000 });
     expectTerms(await lines(page, 'section.tiles.feed'), {
       'Reply speed': /decode/, 'Prompt speed': /prefill/, Requests: /running.*waiting/, GPU: /utilization/, 'First token': /TTFT/, Served: /generation_tokens_total/,
     }, 'Advanced tiles');
@@ -850,8 +850,15 @@ async function chartAudit(browser) {
     await page.waitForFunction(() => document.getElementById('dashTip').style.display === 'block');
     assert.match(await page.textContent('#dashTip'), /Technical name:\s*prefill/, 'Reading is prefill');
     await page.hover('#dashSessions [data-phase="decode"]');
-    await page.waitForFunction(() => /Writing/.test(document.getElementById('dashTip').textContent));
-    assert.match(await page.textContent('#dashTip'), /Technical name:\s*decode/, 'Writing is decode');
+    await page.waitForFunction(() => /Replying/.test(document.getElementById('dashTip').textContent));
+    assert.match(await page.textContent('#dashTip'), /Technical name:\s*decode/, 'Replying is decode');
+    assert.deepEqual(await page.$$eval('#dashSessions .phase', (ns) => ns.map((n) => n.textContent)), ['Reading prompt', 'Replying'], 'the step chips use the usual words');
+    const titles = await page.$$eval('#dashCharts .chart h2 [data-tip]', (ns) => ns.map((n) => n.textContent));
+    for (const t of ['Draft acceptance by method', 'Tokens verified per round', 'Why requests weren\'t batched', 'Prompt cache reuse', 'Prompt cache storage', 'Prompt cache writes']) assert.ok(titles.includes(t), `chart ${t} (${titles})`);
+    assert.match(await page.textContent('[data-chart="memsplit"] .legend'), /in use.*reusable cache/, 'the memory split legend');
+    const words = await page.evaluate(() => [...document.querySelectorAll('body *:not(script):not(style)')].flatMap((n) => [...n.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent)
+      .concat(['tip', 'term'].map((k) => n.dataset[k]), n.getAttribute('aria-label'), n.title)).filter(Boolean).join('\n'));
+    assert.doesNotMatch(words, /guess|conversation cache/i, 'no page says guess or Conversation cache');
     assert.deepEqual(errors, []);
     await context.close();
   }
@@ -1230,7 +1237,7 @@ async function main() {
       // The rate needs two polls and the ratio needs /props: wait for both, then read one consistent render.
       await page.waitForFunction(() => /Writing .*\/s, [\d.]+x written per byte/.test(document.getElementById('dashWritesFoot').innerText), null, { timeout: 15000 });
       const card = await rows();
-      for (const label of ['Attention memory', 'Restore points', 'Long-context index', 'Guessing state', 'Sliding-window points', 'Indexes and token lists', 'Failed or dropped']) {
+      for (const label of ['Attention memory', 'Restore points', 'Long-context index', 'Draft state', 'Sliding-window points', 'Indexes and token lists', 'Failed or dropped']) {
         assert.ok(label in card, `the chart has a ${label} bar`);
       }
       assert.equal(card['Failed or dropped'], '3.0 MiB', 'failed bytes are named apart from the written ones');

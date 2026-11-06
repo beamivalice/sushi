@@ -120,12 +120,15 @@ test('every plain-worded chat label keeps its engineering name in the tooltip', 
   const terms = await page.$$eval('#chatRightbar [data-tip], #chatRightbar ~ * [data-tip], .badge[data-tip], .perf-row .k, #chatRightbar summary', (ns) =>
     Object.fromEntries(ns.map((n) => [n.textContent.trim().replace(/\s+/g, ' '), n.dataset.term ?? ''])));
   const want = { 'First token': /TTFT/, Prompt: /prompt_tokens/, 'Prompt speed': /prefill/, 'Reply speed': /decode/, 'Reply length': /output tokens|completion_tokens/,
-    'Conversation cache (SSD)': /prefix cache/, '8,192-token context': /ctx_size|context window/, 'sees images': /vision/, 'Thinking budget': /reasoning_budget_tokens/ };
+    'Prompt cache (SSD)': /prefix cache/, '8,192-token context': /ctx_size|context window/, 'sees images': /vision/, 'Thinking budget': /reasoning_budget_tokens/ };
   for (const [label, term] of Object.entries(want)) {
     const key = Object.keys(terms).find((k) => k === label || k.startsWith(label));
     assert.ok(key, `${label} is a tooltip anchor (${Object.keys(terms)})`);
     assert.match(terms[key], term, `${label} names its technical term`);
   }
+  const words = await page.evaluate(() => [...document.querySelectorAll('body *:not(script):not(style)')].flatMap((n) => [...n.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent)
+    .concat(['tip', 'term'].map((k) => n.dataset[k]), n.getAttribute('aria-label'), n.title)).filter(Boolean).join('\n'));
+  assert.doesNotMatch(words, /guess|conversation cache/i, 'no page says guess or Conversation cache');
   assert.deepEqual(errors, []);
 });
 
