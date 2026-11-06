@@ -69,16 +69,23 @@ and the page tooltip share them.
   container, a resize or a shortcut close it.
 - Placed above its anchor, below when the top bar is in the way, and beside it (left) inside a `data-tip-side` container
   such as the chat's settings column, whose fields stack; clamped 8 px inside the window; never over the anchor.
+- Copy is for someone who is not an engineer: the visible label says what a thing does for the user in plain words
+  (Reply speed, Conversation cache, tokens/s), and its `data-tip` says what it is, why it matters and a sensible value.
 - A tip adds what the screen cannot say in place: what a metric means, its unit, where the number comes from, what a
   setting does, what a pack needs. Never needed content, an action, or a repeat of visible text.
 - An anchor must be focusable: buttons, inputs and labels already are; a tile, fact or table heading takes
   `tabindex="0"`. Text anchors carry `.tip-u` (dotted underline), non-control anchors get the help cursor.
 - Where tips are: Compact/Advanced and the theme toggle; every dashboard tile (Compact and Advanced; Memory and Cache
-  reuse keep their live `#dashTip`); every bar row and cached-vs-computed column of the dashboard's charts (one Tab stop
-  per card, the arrow keys move along it); the chat's Last reply rows and its Max tokens, Temperature, Top-p, Top-k and
-  Thinking budget fields; a model's facts (on disk, linked, in memory, max context, sees images, streams experts);
-  the Available list's "Recommended for this Mac" badge (tier, RAM and download size); the Settings cache table headings;
+  reuse keep their live `#dashTip`); every dashboard chart's title, the Sessions heading and columns, and the Every and
+  Window selects; every bar row and cached-vs-computed column of the dashboard's charts (one Tab stop per card, the
+  arrow keys move along it); the chat's Last reply rows, its System prompt, Max tokens, Temperature, Top-p, Top-k and
+  Thinking budget fields, its context and sees-images badges and the conversation cache section; a model's facts (on
+  disk, linked, in memory, max context, sees images, runs partly from SSD); every setting's label on Models and Settings
+  and every Saved, Set at launch, Now, Next load and Next start badge; Rescan and Check again; the Available list's
+  "Recommended for this Mac" and "Needs N GB" badges and a pack name that says bpw; the Settings cache table headings;
   the Thinking effort card's column headings, Offered boxes, a word's "same as" Sends and the DeepSeek preset chips.
+- Guards: the keyboard-tooltip checks in `tests/test_webui_admin_ui.cjs` (every setting and badge) and
+  `tests/test_webui_dashboard.cjs` `chartAudit` (every chart title and Sessions column).
 - Native `title` stays where a full value rides it (a cut-off model name, a path, a server message) and on icon buttons.
 
 ## Settings sections and the Thinking effort card

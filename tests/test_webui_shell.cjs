@@ -162,7 +162,7 @@ async function main() {
       const server = makeServer({ metrics: 503 });
       const { page, context } = await open(browser, server, '/dashboard');
       await page.waitForSelector('#dashEnableMetrics');
-      assert.match(await page.textContent('#dashOff'), /--no-metrics/);
+      assert.match(await page.textContent('#dashOff'), /not collecting live statistics/);
       assert.equal(await page.isVisible('.tiles-cmp'), false, 'no empty tiles under the explanation');
       assert.equal(await page.isVisible('.cm-strip'), true, 'the strip stays');
       assert.equal(await page.evaluate(() => document.getElementById('dashDot').className.includes('err')), false, 'metrics off is not an error');

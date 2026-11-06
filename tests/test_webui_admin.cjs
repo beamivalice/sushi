@@ -84,9 +84,9 @@ assert.deepEqual(JSON.parse(JSON.stringify(page.adminChanges([ctxSpec], { ctx_si
 
 // Error text: the server's message, or a short line; never a page of HTML.
 assert.equal(page.adminErrorText(new Error('400 {"error":{"message":"models_dir is not a folder"}}')), 'models_dir is not a folder');
-assert.equal(page.adminErrorText(new Error('502 <html><body>Bad gateway</body></html>')), 'The server answered 502.');
-assert.equal(page.adminErrorText(new TypeError('Failed to fetch')), 'Cannot reach the server.');
-assert.equal(page.adminErrorText(new Error('500 ')), 'The server answered 500.');
+assert.equal(page.adminErrorText(new Error('502 <html><body>Bad gateway</body></html>')), 'The server answered with error 502. Try again; if it repeats, check the server log.');
+assert.equal(page.adminErrorText(new TypeError('Failed to fetch')), 'Cannot reach the server. Check that sushi is running.');
+assert.equal(page.adminErrorText(new Error('500 ')), 'The server answered with error 500. Try again; if it repeats, check the server log.');
 // The dashboard's rates come from the server's samples: exact between neighbours, zero across a gap or on the first.
 const rates = (a, b) => JSON.parse(JSON.stringify(page.historyRates(a, b, 7000)));
 assert.deepEqual(rates(null, [1000, 10, 5]), { gen: 0, pre: 0 });

@@ -36,9 +36,9 @@ assert.equal(node('prefixCacheUsage').textContent, '5.00 / 20.0 GiB');
 assert.equal(node('prefixCacheEntries').textContent, '3 entries');
 assert.equal(node('prefixCacheMeter').attrs['aria-valuenow'], '25');
 assert.equal(page.cacheVolumeText({ name: 'ExternalSSD', free_bytes: 7 * GiB, total_bytes: 10 * GiB }), 'ExternalSSD · 7.00 GiB free (70%)');
-assert.match(page.cacheVolumeText({ name: 'ExternalSSD', free_bytes: 9 * GiB, total_bytes: 100 * GiB }), /WARNING: below 10% free/);
-assert.match(page.cacheVolumeText({ name: 'ExternalSSD', free_bytes: 4 * GiB, total_bytes: 100 * GiB }), /CRITICAL: near 4 GiB reserve/);
-assert.equal(page.cacheVolumeText({ path: '/Volumes/ExternalSSD/cache' }), 'Destination unavailable');
+assert.match(page.cacheVolumeText({ name: 'ExternalSSD', free_bytes: 9 * GiB, total_bytes: 100 * GiB }), /less than 10% free/);
+assert.match(page.cacheVolumeText({ name: 'ExternalSSD', free_bytes: 4 * GiB, total_bytes: 100 * GiB }), /almost full: free some disk space/);
+assert.equal(page.cacheVolumeText({ path: '/Volumes/ExternalSSD/cache' }), 'Cache disk not found');
 page.renderPrefixCache({ disk_bytes: 20 * GiB, disk_used_bytes: 1, disk_entries: 1 });
 assert.equal(node('prefixCacheEntries').textContent, '1 entry');
 

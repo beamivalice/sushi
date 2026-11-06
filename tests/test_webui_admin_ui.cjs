@@ -171,10 +171,10 @@ async function main() {
       await page.waitForSelector(`${row('max_tokens')} input`);
       const first = (key) => page.evaluate((k) => { const r = document.querySelector(`.set[data-key="${k}"]`); const o = r.querySelector('select option'); return o ? o.textContent : r.querySelector('.tri button').textContent; }, key);
       assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default (256,000)', 'a number shows its default with separators');
-      assert.match(await page.textContent(`${row('max_tokens')} .lab`), /Max output tokens/);
+      assert.match(await page.textContent(`${row('max_tokens')} .lab`), /Max reply length/);
       assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'placeholder'), 'Default', 'a default measured at load is not guessed');
       assert.equal(await first('kv_quant'), 'Default (8-bit)', 'a choice shows its label');
-      assert.equal(await first('mtp_acceptance'), 'Default (exact)');
+      assert.equal(await first('mtp_acceptance'), 'Default (Exact)');
       assert.equal(await first('mtp'), 'Default (On)', 'a switch shows On or Off');
       assert.equal(await first('mtp_greedy_tail'), 'Default (Off)');
       assert.equal(await page.getAttribute(`${row('think_penalty')} input`, 'placeholder'), 'Default (0)');
@@ -266,7 +266,7 @@ async function main() {
       await page.waitForSelector(`${row('ctx_size')} input`);
       server.state.failSettings = 1;
       await settle(page, 16_000);
-      assert.match(await page.textContent('#modelsPanel .alert.err'), /The server answered 500/);
+      assert.match(await page.textContent('#modelsPanel .alert.err'), /The server answered with error 500/);
       assert.equal(await page.evaluate(() => /<html>/.test(document.getElementById('modelsPanel').textContent)), false);
       await settle(page, 16_000);
       assert.equal(await page.isVisible('#modelsPanel .alert.err'), false, 'the alert goes when the server answers again');
@@ -349,7 +349,7 @@ async function main() {
       assert.equal(await page.$eval(`${row('kv_quant')} select`, (n) => n.selectedOptions[0].textContent), '8-bit');
       assert.equal(await page.isDisabled(`${row('kv_quant')} select`), true);
       assert.match(await page.textContent(row('kv_quant')), /--kv-quant 8/);
-      assert.match(await page.textContent(row('kv_quant')), /Launch flag/);
+      assert.match(await page.textContent(row('kv_quant')), /Set at launch/);
       assert.equal(await page.isVisible(row('vision')), true, 'an image model lists its vision tower');
       assert.equal(await page.locator(row('ssd_budget_gb')).count(), 0, 'a resident model has no SSD budget row');
       await page.click('.list [data-id="Deep-C"]');
@@ -358,7 +358,7 @@ async function main() {
       assert.equal(await page.locator(row('vision')).count(), 0, 'a text model has no vision row');
       assert.equal(await page.evaluate(() => location.hash), '#Deep-C');
       // `streaming` only says the pack can stream; with no budget it loads resident.
-      assert.match(await page.textContent('.detail .facts'), /can stream experts/);
+      assert.match(await page.textContent('.detail .facts'), /can run partly from SSD/);
       assert.match(await page.textContent('.detail .facts'), /96\.0 GiB on disk.*40\.0 GiB linked from elsewhere/);
       assert.doesNotMatch(await page.textContent('.detail .facts'), /sushi pull/, 'an update is never answered with sushi pull');
       await page.click('.list [data-id="Qwen-A"]');
@@ -366,7 +366,7 @@ async function main() {
       assert.doesNotMatch(await page.textContent('.detail .facts'), /linked from elsewhere|Pack .* available/);
       await page.click('.list [data-id="Deep-C"]');
       await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Deep-C');
-      assert.doesNotMatch(await page.textContent('.list [data-id="Deep-C"]'), /streams experts/);
+      assert.doesNotMatch(await page.textContent('.list [data-id="Deep-C"]'), /runs partly from SSD/);
       await context.close();
     }
 
@@ -652,7 +652,7 @@ async function main() {
       assert.equal(await page.isDisabled('#cacheGb'), true);
       assert.match(await page.textContent('#cacheUsage'), /of 512 MiB/);
       assert.match(await page.textContent('#cacheCard'), /--prefix-cache-disk 512MB/);
-      assert.match(await page.textContent('#cacheCard'), /Launch flag/);
+      assert.match(await page.textContent('#cacheCard'), /Set at launch/);
       assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"] .badges'), /Now|Next/, 'a pinned size has no timing badge');
       assert.doesNotMatch(await page.textContent('#dirCard .badges'), /Now|Next/);
     });
@@ -663,21 +663,21 @@ async function main() {
       const text = await page.textContent(row('mtp_acceptance'));
       assert.match(text, /--mtp-tokenv3 0\.5/);
       assert.doesNotMatch(text, /--mtp-typical|\bset\b/);
-      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'tokenv3');
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'TokenV3 (faster)');
     });
     await scenario('a value-only lock on MTP acceptance shows the choice it names', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
       s.state.models[0].settings.mtp_acceptance = keyState({ flag: 'typical', source: 'flag', locked: true });
     } }, async ({ page }) => {
       await page.waitForSelector(row('mtp_acceptance'));
-      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'typical');
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'Typical (faster)');
       assert.match(await page.textContent(row('mtp_acceptance')), /Set by a launch flag\./);
     });
-    await scenario('a flag the page cannot read shows Launch flag, never "set"', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+    await scenario('a flag the page cannot read shows Set at launch, never "set"', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
       s.state.models[0].settings.mtp_acceptance = keyState({ flag: 'set', source: 'flag', locked: true });
       s.state.models[0].settings.mtp_greedy_tail = keyState({ flag: '--mtp-greedy-tail', source: 'flag', locked: true });
     } }, async ({ page }) => {
       await page.waitForSelector(row('mtp_acceptance'));
-      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'Launch flag');
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'Set at launch');
       assert.doesNotMatch(await page.textContent(row('mtp_acceptance')), /--mtp-typical/);
       assert.match(await page.textContent(row('mtp_greedy_tail')), /Set by --mtp-greedy-tail at launch/);
     });
@@ -934,7 +934,7 @@ async function main() {
     await scenario('Advanced lists the cache columns and each namespace\'s write rate', { path: '/settings', open: { mode: 'advanced' } }, async ({ page, server }) => {
       await page.waitForSelector('#cacheRows tr button');
       const heads = await page.$$eval('#cacheCard thead th', (ths) => ths.filter((t) => t.offsetParent).map((t) => t.textContent));
-      for (const want of ['Entries', 'ID', 'Tier use', 'Written', 'Write rate']) assert.ok(heads.includes(want), `column ${want} (${heads})`);
+      for (const want of ['Entries', 'ID', 'Share used', 'Written', 'Write rate']) assert.ok(heads.includes(want), `column ${want} (${heads})`);
       const cells = await page.$$eval('#cacheRows tr:first-child td', (tds) => tds.map((t) => t.textContent));
       assert.ok(cells.includes('37'), `entries ${cells}`);
       assert.ok(cells.includes('aaaaaaaa'), `id ${cells}`);
@@ -976,7 +976,7 @@ async function main() {
       assert.equal(await page.locator('.set[data-key="update_check"] button[data-value="true"]').isDisabled(), true);
       assert.equal(await page.locator('.set[data-key="update_check"] button[data-value="false"]').getAttribute('aria-pressed'), 'true');
       assert.match(await page.textContent('#updatesCard'), /Set by --no-update-check at launch/);
-      assert.match(await page.textContent('#updatesCard'), /Launch flag/);
+      assert.match(await page.textContent('#updatesCard'), /Set at launch/);
     });
     await scenario('the default port shows its ghost text, refuses a bad number and saves a good one', { path: '/settings' }, async ({ page, server }) => {
       await page.waitForSelector('#portNum');
@@ -1017,10 +1017,31 @@ async function main() {
       await settle(page);
       assert.match(await badgesOf(page, 'prefix_cache_disk_gb'), /Next load/);
     });
+    // Every setting label and every badge explains itself, and the keyboard reaches each explanation.
+    const tipsOf = (page) => page.$$eval('.set', (rows) => rows.filter((r) => r.offsetParent).map((r) => ({
+      key: r.dataset.key,
+      label: r.querySelector('.lab [data-tip]') ? { tip: r.querySelector('.lab [data-tip]').dataset.tip, tab: r.querySelector('.lab [data-tip]').tabIndex } : null,
+      badges: [...r.querySelectorAll('.badges .badge')].map((b) => ({ text: b.textContent, tip: b.dataset.tip ?? '', tab: b.tabIndex })),
+    })));
+    for (const path of ['/models#Qwen-A', '/settings'])
+      await scenario(`every setting and badge on ${path} has a keyboard tooltip`, { path, open: { mode: 'advanced' } }, async ({ page }) => {
+        await page.waitForSelector('.set .lab');
+        const rows = await tipsOf(page);
+        assert.ok(rows.length >= 5, `rows found (${rows.length})`);
+        for (const r of rows) {
+          assert.ok(r.label?.tip.length > 20 && r.label.tab === 0, `${r.key}: its label has a focusable tooltip`);
+          for (const b of r.badges) assert.ok(b.tip.length > 10 && b.tab === 0, `${r.key}: the ${b.text} badge has a focusable tooltip`);
+        }
+        assert.ok(rows.some((r) => r.badges.length), 'some badge was checked');
+        await page.keyboard.press('Tab');
+        await page.locator('.set .lab [data-tip]').first().focus();
+        await page.waitForFunction(() => document.getElementById('tip').classList.contains('show'), null, { timeout: 3000 });
+        assert.equal(await page.textContent('#tip'), rows[0].label.tip, 'keyboard focus opens the tooltip');
+      });
     await scenario('a model row is badged only when saved or pinned', { path: '/models#Qwen-A' }, async ({ page }) => {
       await page.waitForSelector(row('ctx_size'));
       assert.match(await badgesOf(page, 'ctx_size'), /Saved/);
-      assert.match(await badgesOf(page, 'kv_quant'), /Launch flag/);
+      assert.match(await badgesOf(page, 'kv_quant'), /Set at launch/);
       assert.equal(await badgesOf(page, 'mtp'), '', 'a default row has no badge');
     });
     for (const [path, viewport] of [['/models#Qwen-A', { width: 1440, height: 900 }], ['/settings', { width: 1440, height: 900 }], ['/settings', phone]])
@@ -1092,7 +1113,7 @@ async function main() {
     } }, async ({ page }) => {
       await page.waitForSelector('.callout:visible');
       const text = await page.textContent('#modelsDetail .callout:visible');
-      assert.match(text, /Pack 2\.0 is available/);
+      assert.match(text, /newer version of this model \(2\.0\) is available/);
       assert.doesNotMatch(text, /sushi pull/);
       await page.click('#modelsDetail .callout:visible button');
       await page.waitForFunction(() => location.pathname === '/downloads');
@@ -1139,7 +1160,7 @@ async function main() {
       await page.click('.savebar button:text-is("Save")');
       await settle(page, 500);
       const bad = await page.textContent(`${row('think_penalty')} .bad`);
-      assert.match(bad, /^Think penalty is not supported by this model/);
+      assert.match(bad, /^Shorter thinking is not supported by this model/);
       assert.doesNotMatch(bad, /think_penalty/);
       assert.equal(await page.locator('#toastHost .toast').count(), 0);
     });
@@ -1167,7 +1188,7 @@ async function main() {
       assert.match(await page.textContent('#cacheUsage'), /^Empty · 100 GiB assigned$/);
       assert.equal(await page.isVisible('#clearStale'), false);
       assert.equal(await page.isVisible('#clearAll'), false);
-      assert.doesNotMatch(await page.innerText('#cacheCard'), /0 KiB|Stale:/);
+      assert.doesNotMatch(await page.innerText('#cacheCard'), /0 KiB|Unused:/);
     });
     await scenario('a locked KV row shows no hint about unavailable choices', { serverOpts: { limits: true }, path: '/models#Qwen-A' }, async ({ page }) => {
       await page.waitForSelector(row('kv_quant'));

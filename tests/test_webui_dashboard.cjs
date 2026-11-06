@@ -213,7 +213,7 @@ async function dashboardBugs(browser) {
     const dots = await dotsOf(page, 'dashCCpre');
     assert.equal(dots.length, 2, 'two requests between polls are two dots');
     assert.ok(dots[1].x > dots[0].x, 'each at its own finish time');
-    assert.equal(await textOf(page, 'dashCmPre'), '4,002 tok/s', 'the tile is the newest request, not a pool');
+    assert.equal(await textOf(page, 'dashCmPre'), '4,002 tokens/s', 'the tile is the newest request, not a pool');
     assert.match(await textOf(page, 'dashCmPreS'), /2,001 tokens/);
     await adv(page, 6000);
     assert.equal((await dotsOf(page, 'dashCCpre')).length, 2, 'later polls add no copies');
@@ -261,8 +261,8 @@ async function dashboardBugs(browser) {
     const { page, context } = await simPage(browser, { skew: 600_000 });
     await page.evaluate(() => window.__sim.finish({ computed: 5000, prefillS: 5, gen: 100, decodeS: 2 }));
     await adv(page, 3000);
-    assert.equal(await textOf(page, 'dashCmPre'), '1,000 tok/s');
-    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tok/s');
+    assert.equal(await textOf(page, 'dashCmPre'), '1,000 tokens/s');
+    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tokens/s');
     await page.evaluate(() => window.__sim.restart());
     await adv(page, 4000);
     assert.equal(await textOf(page, 'dashCmPre'), '-', 'the old server\'s last request is not shown');
@@ -281,7 +281,7 @@ async function dashboardBugs(browser) {
     await adv(page, 4000);
     const dots = await dotsOf(page, 'dashCCpre');
     assert.equal(dots.length, 1, 'only the new server\'s request');
-    assert.equal(await textOf(page, 'dashCmPre'), '3,000 tok/s');
+    assert.equal(await textOf(page, 'dashCmPre'), '3,000 tokens/s');
     assert.match(await textOf(page, 'dashStatus'), /restarted/);
     await adv(page, 70_000, 5000);
     assert.equal(await textOf(page, 'dashStatus'), 'Live', 'the restart note does not stay for the session');
@@ -302,13 +302,13 @@ async function dashboardBugs(browser) {
     await adv(page, 3000);
     const dots = await dotsOf(page, 'dashCCpre');
     assert.equal(dots.length, 2);
-    assert.equal(await textOf(page, 'dashCmPre'), '37,513 tok/s', 'the tile keeps the last real prefill');
+    assert.equal(await textOf(page, 'dashCmPre'), '37,513 tokens/s', 'the tile keeps the last real prefill');
     const box = await page.locator('#dashCCpre').boundingBox();
     await page.mouse.move(box.x + dots[1].x, box.y + 40);
     await adv(page, 100, 50);
     const tip = await textOf(page, 'dashTip');
-    assert.match(tip, /71 computed, 2,970 restored/);
-    assert.doesNotMatch(tip, /tok\/s/, 'no speed is claimed for it');
+    assert.match(tip, /71 read, 2,970 reused/);
+    assert.doesNotMatch(tip, /tokens\/s/, 'no speed is claimed for it');
     await context.close();
   }
   {
@@ -316,7 +316,7 @@ async function dashboardBugs(browser) {
     const { page, context } = await simPage(browser);
     await page.evaluate(() => window.__sim.finish({ computed: 100, prefillS: 0.1, gen: 5, decodeS: 0.1 }));
     await adv(page, 3000);
-    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tok/s');
+    assert.equal(await textOf(page, 'dashCmDec'), '50.0 tokens/s');
     assert.match(await textOf(page, 'dashCmDecS'), /last request/);
     await context.close();
   }
@@ -699,8 +699,8 @@ async function chartExtras(browser) {
     await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
     await page.waitForFunction(() => document.getElementById('dashSpecModes').textContent.includes('MTP'), null, { timeout: 15000 });
     const rows = (id) => page.evaluate((i) => [...document.querySelectorAll(`#${i} .hb`)].map((r) => [r.querySelector('span').textContent, r.querySelector('b').textContent]), id);
-    assert.deepEqual(await rows('dashSpecModes'), [['MTP', '70%, 2.1 per round'], ['DSpark', '60%, 3.0 per round'], ['DSpark plain rounds', '25%']], 'drafting by mode: acceptance and the mean accepted per round');
-    assert.deepEqual(await rows('dashSpecRows'), [['1 row (plain)', '5'], ['3 rows', '10'], ['5 rows', '5']], 'DSpark rounds by verifier rows');
+    assert.deepEqual(await rows('dashSpecModes'), [['MTP', '70%, 2.1 per step'], ['DSpark', '60%, 3.0 per step'], ['DSpark steps without a guess', '25%']], 'guesses by method: acceptance and the mean kept per step');
+    assert.deepEqual(await rows('dashSpecRows'), [['1 token (no guess)', '5'], ['3 tokens', '10'], ['5 tokens', '5']], 'DSpark steps by tokens checked');
     await page.hover('#dashSpecModes .hb');
     await page.waitForFunction(() => document.getElementById('tip').classList.contains('show'), null, { timeout: 5000 });
     assert.match(await page.evaluate(() => document.getElementById('tip').textContent), /MTP\nAcceptance: 70\.0%\nAccepted \/ drafted: 84 \/ 120\n/, 'a bar row explains its figure in the page\'s one tooltip');
@@ -708,12 +708,12 @@ async function chartExtras(browser) {
     const axis = await axisOf(page, 'dashCSpec');
     assert.ok(axis.includes('100%') && axis.includes('0%'), `the acceptance chart is a percentage (${axis})`);
     const reuse = await textOf(page, 'dashReuse');
-    assert.match(reuse, /Hits from memory\s*3/);
-    assert.match(reuse, /Hits from SSD\s*9/);
+    assert.match(reuse, /Reused from memory\s*3/);
+    assert.match(reuse, /Reused from SSD\s*9/);
     const tiers = await textOf(page, 'dashTiers');
-    assert.match(tiers, /Evicted from memory\s*1 \(1\.0 MiB\)/);
-    assert.match(tiers, /Evicted from SSD\s*2 \(8\.0 MiB\)/);
-    assert.match(tiers, /Hot \(memory\)/);
+    assert.match(tiers, /Dropped from memory\s*1 \(1\.0 MiB\)/);
+    assert.match(tiers, /Dropped from SSD\s*2 \(8\.0 MiB\)/);
+    assert.match(tiers, /In memory/);
     assert.deepEqual(errors, []);
     await context.close();
   }
@@ -732,8 +732,8 @@ async function chartExtras(browser) {
     // A server that drafted nothing says so.
     const zero = { requests: 0, rounds: 0, drafted: 0, accepted: 0, plain_rounds: 0 };
     const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { speculative: { mtp: zero, dflash: zero, dspark: zero } } });
-    await page.waitForFunction(() => /No request has drafted yet/.test(document.getElementById('dashSpecModes').textContent));
-    assert.match(await textOf(page, 'dashSpecRows'), /No DSpark round yet/);
+    await page.waitForFunction(() => /No request has guessed ahead yet/.test(document.getElementById('dashSpecModes').textContent));
+    assert.match(await textOf(page, 'dashSpecRows'), /No DSpark step yet/);
     await context.close();
   }
 }
@@ -750,12 +750,14 @@ async function chartAudit(browser) {
     assert.deepEqual(await page.$$eval('#dashWrites .hb', (rows) => rows.map((r) => r.tabIndex)).then((t) => [t[0], t.slice(1).every((x) => x === -1)]), [0, true], 'the first row takes Tab, the others wait for the arrows');
     await page.locator('#dashTiers .hb').first().focus();
     await page.keyboard.press('Tab');
-    assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('#dashWrites .hb')), true, 'Tab goes from one card\'s bars to the next card\'s first row');
+    assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('[data-chart="cachewrites"] h2 [data-tip]')), true, 'Tab goes from one card\'s bars to the next card\'s title');
+    await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('#dashWrites .hb')), true, 'and then to its first row');
     await page.keyboard.press('ArrowDown');
     assert.equal(await page.evaluate(() => document.activeElement === document.querySelectorAll('#dashWrites .hb')[1]), true);
     await page.keyboard.press('ArrowUp');
     assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('#dashWrites .hb')), true, 'the arrows move along the rows');
-    assert.match(await tipText(page) ?? '', /^KV chunks\nWritten: /, 'a focused row shows its tip');
+    assert.match(await tipText(page) ?? '', /^Attention memory\nWritten: /, 'a focused row shows its tip');
     const before = await page.$eval('#dashWrites .hb b', (b) => b.textContent);
     await page.waitForFunction((was) => document.querySelector('#dashWrites .hb b').textContent !== was, before, { timeout: 8000 });
     assert.equal(await page.evaluate(() => document.activeElement === document.querySelector('#dashWrites .hb')), true, 'a poll that rewrites the row keeps the focus on it');
@@ -774,6 +776,22 @@ async function chartAudit(browser) {
     await context.close();
   }
   {
+    // Every chart title and every Sessions column explains itself, and the keyboard reaches each explanation.
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: specFixture() });
+    await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
+    const titles = await page.$$eval('#dashCharts .chart', (cards) => cards.map((c) => { const a = c.querySelector('h2 [data-tip]'); return { id: c.dataset.chart, tip: a?.dataset.tip ?? '', tab: a?.tabIndex }; }));
+    assert.equal(titles.length, 20, 'every chart was checked');
+    for (const t of titles) assert.ok(t.tip.length > 20 && t.tab === 0, `${t.id}: its title has a focusable tooltip`);
+    const heads = await page.$$eval('table.sessions thead th', (ths) => ths.filter((th) => th.textContent.trim()).map((th) => ({ text: th.textContent, tip: th.querySelector('[data-tip]')?.dataset.tip ?? '' })));
+    for (const h of heads) assert.ok(h.tip.length > 10, `Sessions column ${h.text} has a tooltip`);
+    await page.keyboard.press('Tab');
+    await page.locator('#dashCharts .chart h2 [data-tip]').first().focus();
+    await page.waitForFunction(() => document.getElementById('tip').classList.contains('show'), null, { timeout: 3000 });
+    assert.equal(await page.textContent('#tip'), titles[0].tip, 'keyboard focus opens a chart title\'s tooltip');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
     // A refused request computed nothing and restored nothing: it is no bar in the cached vs computed chart.
     const t = Date.now() - 3000, row = (request_id, outcome, dt) => ({ request_id, model: 'org/test-model', t_ms: t + dt, prompt_tokens: 900, cached_tokens: 100, prefill_seconds: 0, generated_tokens: 0, decode_seconds: 0, outcome });
     const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { requests: [row(1, 'ok', 0), row(2, 'rejected', 1)] } });
@@ -785,8 +803,8 @@ async function chartAudit(browser) {
   {
     // With no model loaded the hot tier's setting is unknown, not off.
     const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', noModels: true, specData: specFixture() });
-    await page.waitForFunction(() => /Hot \(memory\)/.test(document.getElementById('dashTiers').textContent));
-    assert.match(await textOf(page, 'dashTiers'), /Hot \(memory\)\s*-\s*SSD\s*-/);
+    await page.waitForFunction(() => /In memory/.test(document.getElementById('dashTiers').textContent));
+    assert.match(await textOf(page, 'dashTiers'), /In memory\s*-\s*SSD\s*-/);
     await context.close();
   }
   {
@@ -1023,14 +1041,14 @@ async function main() {
 
     {
       const { page, context } = await openPage(browser, '/dashboard', { metricsStatus: 503 });
-      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /--no-metrics/.test(o.textContent); });
+      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /not collecting live statistics/.test(o.textContent); });
       await page.waitForFunction(() => document.getElementById('serverDotLabel').textContent.includes('test-model'));
       await context.close();
     }
 
     {
       const { page, errors, context } = await openPage(browser, '/dashboard', { metricsStatus: 503, key: 'k-12345' });
-      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /--no-metrics/.test(o.textContent); });
+      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /not collecting live statistics/.test(o.textContent); });
       assert.equal(await page.isVisible('#dashEnableMetrics'), true, 'the button shows while metrics are off');
       const enables = () => page.evaluate(() => window.__stub.calls.filter((call) => call.path === '/metrics/enable'));
       assert.equal((await enables()).length, 0, 'nothing is enabled by itself');
@@ -1049,9 +1067,9 @@ async function main() {
 
     {
       const { page, context } = await openPage(browser, '/dashboard', { metricsStatus: 503, enableStatus: 500 });
-      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /--no-metrics/.test(o.textContent); });
+      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /not collecting live statistics/.test(o.textContent); });
       await page.click('#dashEnableMetrics');
-      await page.waitForFunction(() => /Could not enable metrics/.test(document.getElementById('dashStatus').textContent));
+      await page.waitForFunction(() => /Could not turn on live statistics/.test(document.getElementById('dashStatus').textContent));
       assert.equal(await page.isVisible('#dashEnableMetrics'), true, 'a refused enable leaves the button for another try');
       assert.equal(await page.isEnabled('#dashEnableMetrics'), true);
       await context.close();
@@ -1070,7 +1088,7 @@ async function main() {
       await page.waitForSelector('#modelSelect option', { state: 'attached' });
       await page.fill('#promptInput', 'keep me');
       await page.click('#navDashboard');
-      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /--no-metrics/.test(o.textContent); });
+      await page.waitForFunction(() => { const o = document.getElementById('dashOff'); return !o.hidden && /not collecting live statistics/.test(o.textContent); });
       await page.click('#dashEnableMetrics');
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       await page.click('#navChat');
@@ -1148,12 +1166,12 @@ async function main() {
       // The rate needs two polls and the ratio needs /props: wait for both, then read one consistent render.
       await page.waitForFunction(() => /Writing .*\/s, [\d.]+x written per byte/.test(document.getElementById('dashWritesFoot').innerText), null, { timeout: 15000 });
       const card = await rows();
-      for (const label of ['KV chunks', 'Restore points', 'QSA history', 'Speculative state', 'Ring points', 'Manifests and token records', 'Failed or dropped']) {
+      for (const label of ['Attention memory', 'Restore points', 'Long-context index', 'Guessing state', 'Sliding-window points', 'Indexes and token lists', 'Failed or dropped']) {
         assert.ok(label in card, `the chart has a ${label} bar`);
       }
       assert.equal(card['Failed or dropped'], '3.0 MiB', 'failed bytes are named apart from the written ones');
       const gib = (text) => parseFloat(text) * (/GiB/.test(text) ? 1 : /MiB/.test(text) ? 1 / 1024 : 1 / 1048576);
-      assert.ok(Math.abs(parseFloat((await foot()).match(/([\d.]+)x written/)[1]) - gib(card['KV chunks']) / 2) < 0.1, 'written over the 2 GiB on disk');
+      assert.ok(Math.abs(parseFloat((await foot()).match(/([\d.]+)x written/)[1]) - gib(card['Attention memory']) / 2) < 0.1, 'written over the 2 GiB on disk');
       assert.deepEqual(errors, []);
       await context.close();
     }
@@ -1163,12 +1181,12 @@ async function main() {
       const axisTop = (id) => page.evaluate((canvas) => Math.max(0, ...(window.__axis[canvas] ?? []).filter((t) => /^\d+(\.\d+)?k?$/.test(t)).map((t) => parseFloat(t) * (t.endsWith('k') ? 1000 : 1))), id);
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       const cards = await page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart canvas')].map((cv) => ({ title: cv.closest('.card').querySelector('h2').firstChild.textContent, legends: cv.closest('.card').querySelectorAll('.legend').length, canvas: cv.id })));
-      assert.deepEqual(cards.slice(0, 2).map((card) => card.title), ['Prefill (tok/s)', 'Decode (tok/s)'], 'prefill and decode are separate cards');
+      assert.deepEqual(cards.slice(0, 2).map((card) => card.title), ['Prompt speed (tokens/s)', 'Reply speed (tokens/s)'], 'prompt and reply speed are separate cards');
       assert.deepEqual(cards.slice(0, 2).map((card) => card.legends), [0, 0], 'a single series needs no legend');
       assert.equal(new Set(cards.map((card) => card.canvas)).size, cards.length, 'every card draws on its own canvas');
       assert.equal(await page.evaluate(() => /\bgeneration\b/i.test(document.getElementById('dashPanel').textContent)), false, 'the dashboard says decode, not generation');
       // The Advanced view draws prefill and decode the way the Compact view does: one dot per finished request, decode on its own scale.
-      assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart .sub')].map((e) => e.textContent).slice(0, 2)), ['one point per finished request', 'while generating']);
+      assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart .sub')].map((e) => e.textContent).slice(0, 2)), ['one point per finished request', 'while writing']);
       await page.waitForFunction((id) => (window.__axis[id] ?? []).includes('2k'), cards[0].canvas, { timeout: 15000 });
       await page.waitForFunction((id) => (window.__axis[id] ?? []).length > 5, cards[1].canvas, { timeout: 15000 });
       const axis = await page.evaluate(() => window.__axis.dashCMem ?? []);
@@ -1222,7 +1240,7 @@ async function main() {
       assert.ok(strip.h < 70, `a long model name does not grow the strip (${strip.h} px)`);
       assert.equal(await page.getAttribute('#dashCmModel', 'title'), name, 'the full name rides the title');
       assert.equal(await page.evaluate(() => getComputedStyle(document.getElementById('dashCmModel')).textOverflow), 'ellipsis');
-      assert.equal(await text('dashCmState'), compact === 'decode' ? 'Decoding' : 'Idle');
+      assert.equal(await text('dashCmState'), compact === 'decode' ? 'Writing reply' : 'Idle');
 
       const tiles = await page.evaluate(() => [...document.querySelectorAll('.tiles-cmp .tile')].map((t) => { const r = t.getBoundingClientRect(); return { h: Math.round(r.height), y: Math.round(r.y) }; }));
       assert.equal(tiles.length, 5);
@@ -1236,13 +1254,13 @@ async function main() {
       assert.equal(await page.evaluate(() => !!document.getElementById('dashCSpd')), false, 'no chart mixes the two speeds');
 
       // Decode: live from the history while generating; idle falls back to the since-start mean, labelled as such.
-      assert.equal(await text('dashCmDec'), '50.0 tok/s');
+      assert.equal(await text('dashCmDec'), '50.0 tokens/s');
       assert.equal(await text('dashCmDecS'), compact === 'decode' ? 'live' : 'average since start');
       // Prefill is a per-request speed, never an instantaneous 0: the mean until a request is seen to finish (40,000 tokens
       // in 60 s), then that request's own (12,000 tokens in 10 s).
-      assert.notEqual(await text('dashCmPre'), '0 tok/s');
-      assert.match(await text('dashCmPre'), /^667 tok\/s$/);
-      await page.waitForFunction(() => /^1,200 tok\/s$/.test(document.getElementById('dashCmPre').innerText.trim()), null, { timeout: 15000 });
+      assert.notEqual(await text('dashCmPre'), '0 tokens/s');
+      assert.match(await text('dashCmPre'), /^667 tokens\/s$/);
+      await page.waitForFunction(() => /^1,200 tokens\/s$/.test(document.getElementById('dashCmPre').innerText.trim()), null, { timeout: 15000 });
       assert.match(await text('dashCmPreS'), /last request, .*12,000 tokens/);
       await page.waitForFunction(() => (window.__axis.dashCCpre ?? []).includes('2k'), null, { timeout: 5000 });
       assert.deepEqual(await page.evaluate(() => (window.__axis.dashCCpre ?? []).filter((t) => /request finished/.test(t))), [], 'the prefill chart plots the finished request');
@@ -1296,7 +1314,7 @@ async function main() {
       assert.ok(await page.evaluate(() => document.getElementById('dashCGpuc').closest('.card').querySelector('.legend').innerText.includes('clock')), `${mode}: the legend names the clock`);
       const tip = await hoverTip(page);
       assert.match(tip, /GPU clock\s*1,200 MHz/, `${mode}: the tooltip names the clock from the backfilled samples (${tip})`);
-      assert.match(tip, /Utilization\s*50%/, `${mode}: and the utilization (${tip})`);
+      assert.match(tip, /Busy\s*50%/, `${mode}: and the utilization (${tip})`);
       assert.equal(await textOf(page, 'dashCGpucL'), '', `${mode}: no unavailable note`);
       assert.deepEqual(errors, []);
       await context.close();
@@ -1305,9 +1323,9 @@ async function main() {
       await off.page.waitForFunction((i) => (off => off.length > 4)(window.__axis[i] ?? []), id, { timeout: 15000 });
       const offAxis = await axisOf(off.page, id);
       assert.ok(!offAxis.includes('1,620') && offAxis.includes('100'), `${mode}: without a clock the axis is utilization alone (${offAxis})`);
-      assert.match(await textOf(off.page, 'dashCGpucL'), /clock unavailable/, `${mode}: the chart says the clock is unavailable`);
+      assert.match(await textOf(off.page, 'dashCGpucL'), /Clock speed not reported/, `${mode}: the chart says the clock is unavailable`);
       const offTip = await hoverTip(off.page);
-      assert.ok(!/GPU clock/.test(offTip) && /Utilization\s*50%/.test(offTip), `${mode}: the tooltip shows utilization only (${offTip})`);
+      assert.ok(!/GPU clock/.test(offTip) && /Busy\s*50%/.test(offTip), `${mode}: the tooltip shows utilization only (${offTip})`);
       assert.deepEqual(off.errors, []);
       await off.context.close();
     }

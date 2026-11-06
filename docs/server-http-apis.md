@@ -472,7 +472,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `off|4|6|8`, `server.*.flag` as the flag's own text, `server.prefix_cache_disk_gb.ask_bytes`, and `POST
   /v1/prefix-cache/clear {"scope":"namespace","id":...}`. A `flag` is printed as the server sends it: a text starting with `--`
   (`--mtp-tokenv3 0.5`) is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
-  choice shows the choice the spelling names, else "Launch flag". The Settings page's "Automatic update checks" card is a Default (On) / On / Off group per check.
+  choice shows the choice the spelling names, else "Set at launch". The Settings page's "Automatic update checks" card is a Default (On) / On / Off group per check.
   Each server setting's badge is `Now`, `Next load` or `Next start`, read from its `applies` sentence; a setting row has no
   Default badge. A Settings box shows Save only while it differs from the file, and an emptied box says "Use default" and sends
   `null`. A refusal shows on the setting's row (labels, never keys), not as a toast; while the server cannot be reached the dimmed
@@ -557,7 +557,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   no separate `/health` poll. `confirmAction` is the one confirmation dialog (destructive buttons name the bytes they free).
 - The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
   `/v1/models` (through `modelStore`) and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
-  charts need metrics: without them the page says so, shows an **Enable metrics** button (only while `/metrics.json` answers
+  charts need metrics: without them the page says so, shows a **Turn on live statistics** button (only while `/metrics.json` answers
   503; it `POST`s `/metrics/enable` with the chat's key, then polls at once, so the charts start without a reload and the
   button goes away; a refusal leaves the button and says why), and the page says metrics are off instead of drawing empty charts. While hidden it polls only
   `/metrics.json`, and only when no chat request is in flight and the browser tab is visible. Switches and tab
@@ -620,7 +620,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   dropped bytes. A server without the counters shows "Not reported by this server". Logic: `prefixWrites`,
   `renderCards`, `acceptChart` and the layout block in the dashboard script, guarded by `tests/test_webui_prefix_cache.cjs`
   and `tests/test_webui_dashboard.cjs` (`chartPicker`, `chartExtras`).
-- The right sidebar's "Prefix cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
+- The right sidebar's "Conversation cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
   (`disk_used_bytes / disk_bytes`, "<used> / <budget> GB" and the entry count beside it). It is read after each reply
   and again 2.5 s later (the server stores a turn's entry after answering) and stays hidden while `disk_bytes` is 0.
 - It speaks only the public API: `/v1/models` for the picker (`vision` or an `image` input modality shows the attach

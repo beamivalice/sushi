@@ -109,7 +109,7 @@ async function main() {
       assert.match(await page.textContent(glm), /3\.00 GiB on disk, not complete/);
       assert.match(await page.textContent(ds), /Downloaded/);
       assert.match(await page.textContent(`${ds} .act`), /^Update$/);
-      assert.match(await page.textContent(ds), /Needs 96 GB with its experts streamed from the SSD/);
+      assert.match(await page.textContent(ds), /Needs 96 GB of memory, reading part of the model from the SSD/);
       assert.doesNotMatch(await page.textContent(ds), /in memory/, 'DeepSeek always streams');
       assert.doesNotMatch(await page.textContent('#downloadsPanel'), /sushi serve/, 'no launch command to copy');
       assert.equal(await page.getAttribute(`${glm} .act button`, 'aria-label'), 'Resume glm-5.3-flash:2bpw');
@@ -117,7 +117,7 @@ async function main() {
       // A pack above this Mac's RAM asks first; Cancel sends nothing.
       await page.click(`${mimo} .act button`);
       await page.waitForSelector('#confirmDialog[open]');
-      assert.match(await page.textContent('#cdBody'), /Runs in memory from 128 GB/);
+      assert.match(await page.textContent('#cdBody'), /Made for Macs with 128 GB of memory or more/);
       await page.click('#cdCancel');
       assert.deepEqual(server.calls.filter((c) => c.path.startsWith('/v1/downloads') && c.method === 'POST'), []);
 

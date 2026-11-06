@@ -113,6 +113,20 @@ test('the generation fields say what the model uses unset, and a model that cann
   assert.deepEqual(errors, []);
 });
 
+test('a refused request shows the server reason and what to do next, not a bare status code', async ({ browser }) => {
+  const cases = [[503, 'Requested model is not currently loaded', /on Models/], [400, 'Prompt does not fit', /new chat|settings/i], [500, 'boom', /server log/]];
+  for (const [status, message, next] of cases) {
+    const stub = await startStub({ chat: (req, res) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message } })); } });
+    const { page, context } = await open(browser, stub);
+    await send(page, 'question');
+    const text = await (await page.waitForSelector('.chat-error span')).textContent();
+    assert.ok(text.includes(message), `${status}: keeps the server's reason`);
+    assert.match(text, next, `${status}: says what to do next`);
+    assert.doesNotMatch(text, new RegExp(`^${status}:`), `${status}: no bare status prefix`);
+    await context.close(); await stub.close();
+  }
+});
+
 test('a stream that breaks keeps the words already shown, saved as an interrupted reply with Retry', async ({ browser }) => {
   for (const mode of ['destroy', 'errorEvent', 'cleanClose']) {
     const stub = await startStub({
