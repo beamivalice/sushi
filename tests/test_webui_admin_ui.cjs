@@ -1162,7 +1162,8 @@ async function main() {
       await page.waitForSelector('#portNum');
       const text = await page.textContent('#settingsPanel');
       assert.doesNotMatch(text, /Check for updates|sushi pull|`/);
-      assert.match(await page.textContent('.set[data-key="update_check"] .help'), /Off stops the daily check only/);
+      assert.match(await page.textContent('.set[data-key="update_check"] .help'), /Off stops automatic checks; a check you start yourself still runs\./);
+      assert.match(await page.textContent('.set[data-key="pack_update_check"] .help'), /Off stops automatic checks, the Downloads list's included; Check again on Downloads still looks\./);
       assert.match(await page.textContent('.set[data-key="models_dir"] .help'), /where new downloads are saved/);
     });
     await scenario('a failed load after a reload still says why', { path: '/models#Broke-D', setup: (s) => { s.state.models[3].error = 'OutOfMemory'; } }, async ({ page }) => {

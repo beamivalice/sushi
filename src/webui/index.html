@@ -3905,8 +3905,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   // The two automatic update checks: Default, On or Off. A file value of null is the default, shown as "Default (On)".
   const UPDATE_KEYS = [
-    ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops the daily check only.", "When a newer sushi is out, a banner offers it. Nothing installs without you."],
-    ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. Off stops the daily check only.", "A model with a newer version gets a note on Models. Nothing downloads without you."],
+    ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops automatic checks; a check you start yourself still runs.", "When a newer sushi is out, a banner offers it. Nothing installs without you."],
+    ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. Off stops automatic checks, the Downloads list's included; Check again on Downloads still looks.", "A model with a newer version gets a note on Models. Nothing downloads without you."],
   ].map(([key, slot, label, help, tip]) => {
     const row = setRow(key, label, null, tip, keyTerm(key));
     const btns = [[null, "Default"], [true, "On"], [false, "Off"]].map(([value, text]) => h("button", { type: "button", "data-value": String(value), text, onclick: (e) => saveServer(key, value, "Saved.", e.currentTarget, "Saving…") }));
