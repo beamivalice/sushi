@@ -1005,7 +1005,7 @@ pub fn buildHeader(a: std.mem.Allocator, in: HeaderIn) !Header {
     var out = fmt(a, "sushi {s} on port {d}", .{ word, in.port });
     if (in.link == .offline and !in.starting) out = fmt(a, "sushi stopped, port {d}", .{in.port});
     if (in.model) |m| out = fmt(a, "{s}, {s}", .{ out, m });
-    if (speed) |t| out = fmt(a, "{s}, generation speed {d:.0} tokens per second", .{ out, t });
+    if (speed) |t| out = fmt(a, "{s}, {s}generation speed {d:.0} tokens per second", .{ out, if (in.decoding) "" else "last ", t });
     h.a11y = out;
     return h;
 }
@@ -2097,6 +2097,7 @@ test "header: idle shows the last request, gaps show a dash, an update is named"
     try std.testing.expectEqualStrings("1.5.0 · 1.5.1 available", h.version);
     try std.testing.expectEqualStrings("88.0", h.stats[0].value);
     try std.testing.expectEqualStrings("LAST GEN TOK/S", h.stats[0].label);
+    try std.testing.expectEqualStrings("sushi running on port 12345, m, last generation speed 88 tokens per second", h.a11y);
     try std.testing.expectEqualStrings("–", h.stats[1].value);
     try std.testing.expectEqualStrings("–", h.stats[2].value);
     try std.testing.expectEqualStrings("GPU MHZ", h.stats[2].label);
