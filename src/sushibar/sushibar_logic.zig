@@ -254,7 +254,8 @@ pub const Tracker = struct {
 };
 
 fn speedText(buf: []u8, tps: f64) []const u8 {
-    return (if (tps >= 100)
+    // Decided after rounding to one decimal, so 99.96 reads 100 and not 100.0.
+    return (if (@round(tps * 10) >= 1000)
         std.fmt.bufPrint(buf, "{d:.0}", .{tps})
     else
         std.fmt.bufPrint(buf, "{d:.1}", .{tps})) catch "?";
@@ -2455,6 +2456,16 @@ test "icon and link: outline only when nothing answers, and a silent server is o
     try std.testing.expectEqual(Link.unauthorized, linkFor(401));
     try std.testing.expectEqual(Link.metrics_off, linkFor(503));
     try std.testing.expectEqual(Link.offline, linkFor(404));
+}
+
+test "speed: a rate that rounds to 100 reads as a whole number, in the title and the card" {
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("100 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 99.96 }));
+    try std.testing.expectEqualStrings("99.9 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 99.94 }));
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const h = try buildHeader(arena.allocator(), .{ .link = .up, .port = 1, .model = "m", .last = 99.96 });
+    try std.testing.expectEqualStrings("100", h.stats[0].value);
 }
 
 test "title: live, last, reading prompt, idle, offline, unauthorized, metrics off" {
