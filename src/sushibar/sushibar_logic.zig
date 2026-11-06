@@ -75,7 +75,7 @@ pub const Sample = struct {
     prefilling: bool = false,
     /// The newest finished request that generated tokens: `generated_tokens / decode_seconds`.
     finished_tps: ?f64 = null,
-    /// The same request's prompt speed: `(prompt_tokens - cached_tokens) / prefill_seconds`.
+    /// The newest finished request's prompt speed: `prompt_tokens / prefill_seconds` (`prompt_tokens` excludes the restored).
     finished_prefill_tps: ?f64 = null,
     newest_finished_ms: i64 = 0,
     mem_mb: ?u64 = null,
@@ -130,10 +130,11 @@ pub fn parseMetrics(arena: std.mem.Allocator, body: []const u8) !Sample {
     var newest_prefill_ms: i64 = std.math.minInt(i64);
     for (wire.requests) |r| {
         out.newest_finished_ms = @max(out.newest_finished_ms, r.t_ms);
-        const forwarded = r.prompt_tokens -| r.cached_tokens;
-        if (std.mem.eql(u8, r.outcome, "ok") and r.t_ms >= newest_prefill_ms and forwarded > 0 and r.prefill_seconds > 0) {
+        // `prompt_tokens` already excludes the restored ones; a mostly restored prompt says little about speed.
+        const computed = r.prompt_tokens;
+        if (std.mem.eql(u8, r.outcome, "ok") and r.t_ms >= newest_prefill_ms and computed > 0 and r.cached_tokens <= computed and r.prefill_seconds > 0) {
             newest_prefill_ms = r.t_ms;
-            out.finished_prefill_tps = @as(f64, @floatFromInt(forwarded)) / r.prefill_seconds;
+            out.finished_prefill_tps = @as(f64, @floatFromInt(computed)) / r.prefill_seconds;
         }
         if (r.generated_tokens == 0 or r.decode_seconds <= 0 or r.t_ms < newest_speed_ms) continue;
         newest_speed_ms = r.t_ms;
@@ -2371,18 +2372,20 @@ test "gui session: an ssh login has none" {
     try std.testing.expect(!guiSession(null, "/dev/ttys003"));
 }
 
-test "metrics: prefill speed counts only the tokens forwarded, of finished requests" {
+test "metrics: prefill speed is the row's computed prompt_tokens over its prefill time, as the web page reads it" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
+    // `prompt_tokens` is already prompt minus restored; a row that restored more than it computed feeds no speed.
     const warm =
         \\{"requests":[
-        \\{"t_ms":100,"prompt_tokens":1000,"cached_tokens":900,"prefill_seconds":1.0,"generated_tokens":5,"decode_seconds":1,"outcome":"ok"},
+        \\{"t_ms":100,"prompt_tokens":600,"cached_tokens":400,"prefill_seconds":0.5,"generated_tokens":5,"decode_seconds":1,"outcome":"ok"},
+        \\{"t_ms":150,"prompt_tokens":100,"cached_tokens":900,"prefill_seconds":0.01,"generated_tokens":5,"decode_seconds":1,"outcome":"ok"},
         \\{"t_ms":200,"prompt_tokens":5000,"cached_tokens":0,"prefill_seconds":0.1,"outcome":"cancelled"}]}
     ;
     const s = try parseMetrics(arena.allocator(), warm);
-    try std.testing.expectApproxEqAbs(@as(f64, 100), s.finished_prefill_tps.?, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1200), s.finished_prefill_tps.?, 1e-9);
     const all_cached =
-        \\{"requests":[{"t_ms":100,"prompt_tokens":1000,"cached_tokens":1000,"prefill_seconds":0.01,"outcome":"ok"}]}
+        \\{"requests":[{"t_ms":100,"prompt_tokens":0,"cached_tokens":1000,"prefill_seconds":0.01,"outcome":"ok"}]}
     ;
     try std.testing.expect((try parseMetrics(arena.allocator(), all_cached)).finished_prefill_tps == null);
 }
