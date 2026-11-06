@@ -123,7 +123,8 @@ sushi serve --model ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-4bpw \
 between `--drafter-min-depth` (2) and `--drafter-max-depth` (8) rows, and greedy output equals MTP's byte for byte.
 Speed per pack and context: [qwen4-perf](qwen4-perf.md#dflash2).
 
-**128 GB Mac, MiMo-V2.6-Flash-Sushi-2.3bpw** (limit 120000)
+**128 GB Mac, MiMo-V2.6-Flash-Sushi-2.3bpw** (limit 120000). Unsupported: it still loads, but from 1.5.1 releases do
+not test, benchmark or tune it; 1.5.0 is the last release that supports it.
 
 ```bash
 sushi pull mimo-v2.6-flash

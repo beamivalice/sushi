@@ -96,6 +96,7 @@ fn parseMimoVision(c: *ModelConfig, obj: std.json.ObjectMap) !void {
 
 pub fn parseMimoConfig(c: *ModelConfig, obj: std.json.ObjectMap) !void {
     c.model_type = "mimo_v2";
+    c.unsupported_note = "[load] MiMo-V2.6-Flash is not on the supported list: it loads, but releases do not test it (1.5.0 was its last supported release)";
     c.weight_prefix = "model";
     c.norm_has_offset = false;
     c.scale_embeddings = false;
@@ -467,6 +468,14 @@ test "real mimo_v2 Flash config agrees with source geometry" {
     try testing.expectEqual(@as(u32, 8192), c.qv_min_pixels);
     try testing.expectEqual(@as(u32, 8388608), c.qv_max_pixels);
     try testing.expectEqual(@as(u32, 151655), c.image_token_id);
+}
+
+test "a mimo_v2 config carries the off-supported-list note its load logs" {
+    const c = try parseConfigFromJson(testing.allocator, MIMO_V2_BILL_JSON);
+    try testing.expectEqualStrings(
+        "[load] MiMo-V2.6-Flash is not on the supported list: it loads, but releases do not test it (1.5.0 was its last supported release)",
+        c.unsupported_note orelse "",
+    );
 }
 
 test "mimo_v2 bills per-layer KV geometry and the sliding window once per slot" {

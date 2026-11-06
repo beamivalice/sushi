@@ -1,9 +1,10 @@
 # Test suite
 
 A test earns its place by catching a failure nothing else catches, on code a served model reaches. Anything else is
-cut: there is no "might be useful" tier. The served models are Flash-Next (`qwen4`), MiMo (`mimo2`), GLM (`glm5`) and
-DeepSeek (`dsv41`); MiniCPM5 and Gemma tool-call parsing stay because quant work and agents use them. The TDD order
-and the change classes are in [CLAUDE.md](../CLAUDE.md#testing--tdd-is-mandatory); the script matrix is in
+cut: there is no "might be useful" tier. The supported models are Flash-Next (`qwen4`), GLM (`glm5`) and DeepSeek
+(`dsv41`). MiMo (`mimo2`) still loads and keeps its tests, but is unsupported from 1.5.1: no release gate runs its
+pass. MiniCPM5 and Gemma tool-call parsing stay because quant work and agents use them. The TDD order and the change
+classes are in [CLAUDE.md](../CLAUDE.md#testing--tdd-is-mandatory); the script matrix is in
 [tests/CLAUDE.md](../tests/CLAUDE.md).
 
 ## What a test may be

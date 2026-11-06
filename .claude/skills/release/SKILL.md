@@ -26,7 +26,7 @@ Order (owner, 2026-10-31):
 | 1 | Suite + binary | `zig build test -Doptimize=ReleaseFast`; `zig build -Doptimize=ReleaseFast`; `sushi --version` | 0 fail; names `build.zig.zon`'s version |
 | 2 | **Perf gate** | `tests/bench.sh --version <ver> <pack>` (below) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on Qwen Sushi-STQ-2.75bpw and the DeepSeek STQ pack | within ~1% of its row in `docs/quality-kld.md` |
-| 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh`, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |
+| 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh` on the `qwen4`, `glm5` and `dsv41` passes, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |
 | 5 | CI | `./release.sh` beside steps 2-4 (never `ci.yml`): `release.yml` runs the full suite on the macOS 26.2 runner before it packages, and a failed test leaves no draft | green, a DRAFT exists |
 | 6 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
 | 7 | Cross-engine (only before a public claim) | start each engine yourself, `npx -y llmprobe@latest <host:port> -m <id> --bench-only` by hand | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
@@ -37,6 +37,7 @@ Order (owner, 2026-10-31):
 - **The perf gate times on AC power only.** Check `pmset -g batt` right before each model's run and log the power
   source beside it. A run that touched battery is discarded and rerun on AC: battery cost GLM 8–18% decode on 2026-10-11.
   - All other GPU work keeps the battery-above-30% rule.
+- **MiMo-V2.6-Flash is unsupported from 1.5.1:** it still loads, but no gate, bench or tuning step runs on it.
 - **The perf gate is four models: Qwen STQ 2.75bpw, Qwen MCG 4bpw, GLM MCG 2.4bpw, DeepSeek STQ 1.75bpw.** It is ONE
   `tests/bench.sh --version <ver> <pack> [-- <serve flags>]` run per model whose output IS the published
   `docs/bench/v<ver>/` report (`summary.md` plus one `<model>.md` per run; protocol in

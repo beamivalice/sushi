@@ -1737,6 +1737,7 @@ test "the eviction gate bills weights plus 10% headroom" {
 /// started; on-demand → req.error_name + done broadcast).
 pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     try model_mod.archGate(params.config);
+    if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});
     var streaming_resident_bytes: ?u64 = null;
     var expert_source_assigned = false;
     errdefer if (expert_source_assigned) {

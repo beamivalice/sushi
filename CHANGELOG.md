@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **MiMo-V2.6-Flash moves off the supported list**: its pack still loads and serves, with a log line saying so, but from 1.5.1 releases no longer test, benchmark or tune it; 1.5.0 was its last supported release.
 - **`--reasoning-budget` is gone**: set a thinking cap per effort word in Settings › Inference › Thinking effort instead; a word with no cap has none, and a request's own `reasoning_budget_tokens` or `budget_tokens` still applies. The old flag now stops the launch as an unrecognized argument.
 - **Each model family's thinking-effort words are yours to set**: Settings › Inference › Thinking effort edits, for Qwen, DeepSeek and GLM, whether each effort word is offered, what it sends to the chat template and how many thinking tokens it may spend, and which word a request naming none runs at; a save applies from the next request with no reload, `/v1/models` lists each word's value (`reasoning_effort_values`), and each model on the Models page says how it thinks.
 - **DeepSeek-V4.1-Flash thinks at five effort levels**: `medium` and `xhigh` now get their own depth (62 and 87 on DeepSeek's 1-100 effort scale, between low 50, high 75 and max 100) instead of being served as `high` and `max`.

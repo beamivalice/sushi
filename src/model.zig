@@ -294,6 +294,8 @@ pub const ModelConfig = struct {
     ngram_table_path: ?[]const u8 = null,
     /// config.json's `pack_revision`; null for a legacy pack (docs/pack-format.md#pack-revision).
     pack_revision: ?pack_revision_mod.Revision = null,
+    /// Set by an arch that still loads but is off the supported list; the server logs it at load.
+    unsupported_note: ?[]const u8 = null,
 
     // Per-layer Q-head count (MiMo: sliding layers differ from global ones).
     // 0 = uniform num_attention_heads.

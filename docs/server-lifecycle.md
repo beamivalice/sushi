@@ -134,7 +134,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   with the same message instead of co-binding. Guard: `tests/test_port_conflict.sh`.
 - The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`) by
   name (`ArchitectureUnsupported` → 503). A checkpoint in an unsupported file format is refused by name
-  (`ModelFormatUnsupported` → 503; `--model` exits).
+  (`ModelFormatUnsupported` → 503; `--model` exits). A served arch off the supported list (MiMo, from 1.5.1) sets
+  `ModelConfig.unsupported_note` at parse, and the server logs that `[load]` warning on every load.
 - The pack-revision check is the first thing `loadWeightsForConfig` does after the arch gate, for every arch: a config
   that names `pack_revision` and a shard (MTP shards included) that carries another revision or none is refused
   `PackRevisionMixed` (503 `pack_revision_mixed`; the log names each file) before any weight bytes load
