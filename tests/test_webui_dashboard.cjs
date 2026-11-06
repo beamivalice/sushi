@@ -1004,6 +1004,26 @@ async function dashboardV2(browser) {
     await context.close();
   }
   {
+    // A focused Cancel names one request: a poll that puts another request in its row never hands it that request,
+    // and a poll that moves its request keeps the focus on it.
+    const row = (id, phase) => ({ request_id: id, model: 'org/m', phase, context_length: 8192, context_tokens: 100, cached_tokens: 0, generated_tokens: 0, max_tokens: 100, elapsed_seconds: 1, state_bytes: 1 << 20 });
+    const focused = (page) => page.evaluate(() => document.activeElement.dataset.cancel ?? null);
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', sessions: [row(12, 'prefill')] }, true);
+    await adv(page, 3000);
+    await page.focus('button[data-cancel="12"]');
+    await page.evaluate((rows) => { window.__stub.sessions = rows; }, [row(13, 'prefill')]);
+    await adv(page, 3000);
+    assert.notEqual(await focused(page), '13', 'the Cancel of a request that left does not become the next request\'s');
+    await page.evaluate((rows) => { window.__stub.sessions = rows; }, [5, 6, 7].map((id) => row(id, 'decode')));
+    await adv(page, 3000);
+    await page.focus('button[data-cancel="6"]');
+    await page.evaluate((rows) => { window.__stub.sessions = rows; }, [6, 7, 8].map((id) => row(id, 'decode')));
+    await adv(page, 3000);
+    assert.equal(await focused(page), '6', 'a request that moved up a row keeps its focused Cancel');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
     // An empty server: every card says what it is waiting for, readable and as wide as its card.
     const zero = { requests: 0, rounds: 0, drafted: 0, accepted: 0, plain_rounds: 0 }, h0 = (b) => ({ count: 0, sum: 0, bounds: b, bucket_counts: Array(b.length + 1).fill(0) });
     const LAT = [0.01, 0.1, 1, 10], TOK = [32, 512, 8192];

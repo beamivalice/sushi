@@ -4895,12 +4895,16 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (at && node.contains(at)) tipOpen(at);
       return;
     }
-    // A focused bar keeps the keyboard: the same place in the new content takes the focus.
-    const items = () => [...node.querySelectorAll('[data-tip][tabindex]')], at = node.contains(document.activeElement) ? items().indexOf(document.activeElement) : -1;
+    // A focused bar keeps the keyboard: the same place in the new content takes the focus; a focused Cancel follows its request.
+    const f = node.contains(document.activeElement) ? document.activeElement : null;
+    const items = () => [...node.querySelectorAll('[data-tip][tabindex]')], at = f ? items().indexOf(f) : -1;
     node.replaceChildren(...src.childNodes);
     if (at >= 0) { const now = items(); rove(now[Math.min(at, now.length - 1)]); }
+    else if (f?.dataset.cancel) node.querySelector(`[data-cancel="${CSS.escape(f.dataset.cancel)}"]`)?.focus({ preventScroll: true });
   }
-  const sameShape = (a, b) => a.childNodes.length === b.childNodes.length && [...a.childNodes].every((x, i) => x.nodeName === b.childNodes[i].nodeName && (x.nodeType !== 1 || sameShape(x, b.childNodes[i])));
+  // A Cancel button names its request, so a row that now holds another request is not the same shape.
+  const sameShape = (a, b) => a.childNodes.length === b.childNodes.length && [...a.childNodes].every((x, i) => { const y = b.childNodes[i];
+    return x.nodeName === y.nodeName && (x.nodeType !== 1 || (x.getAttribute('data-cancel') === y.getAttribute('data-cancel') && sameShape(x, y))); });
   function copyInto(a, b) {
     a.childNodes.forEach((x, i) => {
       const y = b.childNodes[i];
