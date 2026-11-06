@@ -420,7 +420,7 @@ const SpecGenStub = struct {
     }
 };
 
-const OutcomeStub = struct {
+pub const OutcomeStub = struct {
     io: std.Io = testing.io,
     request_id: u64 = 7,
     model: struct { id: []const u8 = "org/m" } = .{},
@@ -454,7 +454,7 @@ const OutcomeStub = struct {
         self.error_code = name;
     }
     /// The connection thread's `Scheduler.complete`: sets `cancelled` on EVERY completion.
-    fn complete(self: *OutcomeStub) void {
+    pub fn complete(self: *OutcomeStub) void {
         self.cancelled.store(true, .release);
     }
 };

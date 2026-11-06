@@ -2504,12 +2504,16 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
             }
             slot_outcome.finishSpecAtCleanup(s);
-            slot_outcome.recordSlotCleanup(sch.metrics, s);
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
             if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
             if (s.model.config) |c| @import("dsv41/dsv41_borrow.zig").endRequestMlx(c);
+        }
+        if (cleanup_n > 0) {
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            recordDrained(sch.metrics, cleanup_batch[0..cleanup_n], sch.decoding.items);
         }
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
         destroyAbandoned(abandoned);
@@ -4032,6 +4036,13 @@ fn publishLiveTokens(metrics: ?*metrics_mod.Metrics, active: anytype) void {
     m.generation_tokens_live.set(metrics_mod.liveGenerationTokens(m, sumInflightGeneratedTokens(active)));
 }
 
+/// The cleanup drain's request counts, then the live-token gauge: a reply cut by a stop sequence enters the total
+/// here, and the loop may park next, so the gauge follows now. `decoding` is read under `queue_mu`.
+fn recordDrained(metrics: ?*metrics_mod.Metrics, drained: anytype, decoding: anytype) void {
+    for (drained) |s| slot_outcome.recordSlotCleanup(metrics, s);
+    publishLiveTokens(metrics, decoding);
+}
+
 pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (active.len == 0) return;
 
@@ -5283,6 +5294,22 @@ test "the live-token gauge holds a finished slot's tokens once, whenever the sam
 
     publishLiveTokens(&m, active[0..]);
     try testing.expectEqual(@as(u64, 2576), m.generation_tokens_live.load());
+}
+
+test "the live-token gauge equals the total at rest after a reply that ended on a stop sequence" {
+    var m = metrics_mod.Metrics.init();
+    var other = slot_outcome.OutcomeStub{ .completion_tokens = 40 };
+    var stopped = slot_outcome.OutcomeStub{ .completion_tokens = 900 };
+    var active = [_]*slot_outcome.OutcomeStub{ &stopped, &other };
+    publishLiveTokens(&m, active[0..]);
+    // The stream's stop sequence cancels the slot; the tick's cull drops it uncounted.
+    stopped.stop_hit.store(true, .release);
+    stopped.complete();
+    publishLiveTokens(&m, active[0..]);
+    // The drain counts it as a success while `other` still decodes.
+    recordDrained(&m, &[_]*slot_outcome.OutcomeStub{&stopped}, active[1..]);
+    try testing.expectEqual(@as(u64, 900), m.generation_tokens_total.load());
+    try testing.expectEqual(@as(u64, 940), m.generation_tokens_live.load());
 }
 
 pub fn expectOutcomes(m: *const metrics_mod.Metrics, success: u64, cancelled: u64, failed: u64, rejected: u64) !void {
