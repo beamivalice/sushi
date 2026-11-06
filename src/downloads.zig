@@ -102,8 +102,9 @@ const fresh_ms: i64 = 10 * 60 * 1000;
 const offline_retry_ms: i64 = 60 * 1000;
 
 /// Known packs first, in table order, then the org's other public Sushi repos; a pack Hugging Face says is not
-/// there (unpublished, private) is left out, and with no answer at all the known packs stand without sizes.
-fn buildCatalog(arena: Allocator, io: std.Io, rs: []const []const u8) struct { entries: []Entry, state: CatalogState } {
+/// there (unpublished, private) is left out, and with no answer at all the known packs stand without sizes. With
+/// `updates`, each installed pack's update is looked up too.
+fn buildCatalog(arena: Allocator, io: std.Io, rs: []const []const u8, updates: bool) struct { entries: []Entry, state: CatalogState } {
     var repos = std.ArrayList([]const u8).empty;
     for (cli.aliases) |a| repos.append(arena, a.repo) catch {};
     const listed = cli.fetchOrgPacks(arena, io);
@@ -112,7 +113,6 @@ fn buildCatalog(arena: Allocator, io: std.Io, rs: []const []const u8) struct { e
     };
     var entries = std.ArrayList(Entry).empty;
     var offline = false;
-    const updates = pack_update.checksOn();
     for (repos.items, 0..) |repo, i| {
         const outcome: cli.FetchOutcome = if (offline) .offline else cli.fetchRepoSize(arena, io, repo);
         if (i == 0 and outcome == .offline and listed == null) offline = true;
@@ -133,11 +133,11 @@ fn buildCatalog(arena: Allocator, io: std.Io, rs: []const []const u8) struct { e
     return .{ .entries = entries.items, .state = if (offline) .offline else .ready };
 }
 
-fn refreshThread(io: std.Io) void {
+fn refreshThread(io: std.Io, updates: bool) void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     var roots_buf: [9][]const u8 = undefined;
     var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const built = buildCatalog(arena.allocator(), io, roots(&roots_buf, destRoot(&dest_buf, io).path));
+    const built = buildCatalog(arena.allocator(), io, roots(&roots_buf, destRoot(&dest_buf, io).path), updates);
     lock();
     defer unlock();
     if (cat_arena) |*old| old.deinit();
@@ -148,13 +148,16 @@ fn refreshThread(io: std.Io) void {
     cat_busy = false;
 }
 
-/// Starts a catalog refresh when the last one is stale (or `force`), at most one at a time. Holds `mu`.
+/// Starts a catalog refresh, at most one at a time: on Check (`force`), on the first look, and while automatic checks
+/// are on when the last one is stale. Installed packs' updates are looked up only on Check or with the checks on.
+/// Holds `mu`.
 fn refreshIfStaleLocked(io: std.Io, force: bool) void {
     if (cat_busy) return;
+    const auto = pack_update.autoChecksOn();
     const age = io_util.nowMsMonotonic(io) - cat_at_ms;
-    const stale = cat_at_ms == 0 or force or age > (if (cat_state == .offline) offline_retry_ms else fresh_ms);
+    const stale = cat_at_ms == 0 or force or (auto and age > (if (cat_state == .offline) offline_retry_ms else fresh_ms));
     if (!stale) return;
-    const t = std.Thread.spawn(.{}, refreshThread, .{io}) catch return;
+    const t = std.Thread.spawn(.{}, refreshThread, .{ io, auto or force }) catch return;
     t.detach();
     cat_busy = true;
     if (cat_entries.len == 0) cat_state = .loading;
@@ -505,7 +508,7 @@ fn render(allocator: Allocator, io: std.Io) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.print("{{\"ram_bytes\":{d},\"ram_gb\":{d},\"update_check\":{},\"dest\":", .{ ram, ram_gb, pack_update.checksOn() });
+    try w.print("{{\"ram_bytes\":{d},\"ram_gb\":{d},\"update_check\":{},\"dest\":", .{ ram, ram_gb, pack_update.autoChecksOn() });
     try std.json.Stringify.value(.{
         .path = dest.path,
         .source = dest.source,
@@ -540,12 +543,12 @@ fn render(allocator: Allocator, io: std.Io) ![]u8 {
 
 // ── Routes ──────────────────────────────────────────────────────────────
 
-/// `GET /v1/downloads[?refresh=1|?background=1]`: the catalog, this Mac and the queue. A stale catalog refreshes in
-/// the background; the answer never waits on Hugging Face. The page's look from another tab (`background=1`) asks
-/// Hugging Face nothing under `--no-update-check`.
+/// `GET /v1/downloads[?refresh=1|?background=1]`: the catalog, this Mac and the queue. A refresh runs in the
+/// background; the answer never waits on Hugging Face. The page's look from another tab (`background=1`) asks
+/// Hugging Face nothing while automatic checks are off (`--no-update-check`, `pack_update_check: false`).
 pub fn handleGet(allocator: Allocator, stream: *http_conn.Conn, raw_path: []const u8) !void {
     const background = std.mem.indexOf(u8, raw_path, "background=1") != null;
-    if (!background or pack_update.checksOn()) {
+    if (!background or pack_update.autoChecksOn()) {
         lock();
         defer unlock();
         refreshIfStaleLocked(stream.io, std.mem.indexOf(u8, raw_path, "refresh=1") != null);

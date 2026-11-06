@@ -510,8 +510,10 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   offline, at once with `refresh=1`), so the answer never waits on Hugging Face; a finished download clears its own
   row's `update` without asking again. `fits`, `tier_gb` and `recommended` are `sushi list`'s rules (`verdictFor`,
   `recommendedAlias`) on `hw.memsize`; `streams_experts` marks a pack whose tier is for streamed experts (DeepSeek).
-  `update` is `pack_update.checkPack` for a downloaded pack. Under `--no-update-check` (`update_check` false) there is
-  no update check and a `background=1` GET (the page on another tab) starts no catalog refresh.
+  `update` is `pack_update.checkPack` for a downloaded pack. With the automatic checks off (`--no-update-check` or
+  `server.pack_update_check: false`; `update_check` false) a `background=1` GET (the page on another tab) starts no
+  catalog refresh, the open list fetches the catalog only on its first look and on `refresh=1` (Check), and only
+  `refresh=1` looks up an installed pack's update.
 - `installed` looks in the destination and the boot roots (`catalogPackPath`, both layouts); `partial_bytes` is a
   destination folder that is there but not complete, null while that pack downloads. `launch` is `sushi serve --model
   '<path>'` plus the flags of the pack's recommended launch in [usage](usage.md#recommended-launch)
@@ -545,7 +547,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   (`background=1`) 3 s after the page opens and then every 30 minutes (every 5 s while the catalog loads); a pack (or a
   pack's update) missing from `localStorage` `sushi-seen-packs` puts a dot on the Models tab (its name reads "Models,
   new packs") and on Available until the list is shown. Only a ready catalog seeds or marks the list, the first one
-  silently; under `--no-update-check` there is no dot and no background ask after the first. Removing a pack is not
+  silently; with the automatic checks off there is no dot and no background ask after the first. Removing a pack is not
   offered. Guards: `tests/test_downloads.sh`, `node
   tests/test_webui_downloads.cjs`, the `downloads:` tests (download_progress.zig, downloads.zig, http_conn.zig).
 

@@ -351,6 +351,12 @@ pub fn checksOn() bool {
     return enabled;
 }
 
+/// Whether the server may ask Hugging Face on its own: off under `--no-update-check` and under the settings'
+/// `pack_update_check: false`. A request the user makes (Check, Download) asks either way.
+pub fn autoChecksOn() bool {
+    return checksOn() and autoOn();
+}
+
 /// Starts watching a loaded pack's folder (once per folder) on a detached thread: never the inference thread.
 pub fn watch(pack_path: []const u8) void {
     _ = std.c.pthread_mutex_lock(&mu);

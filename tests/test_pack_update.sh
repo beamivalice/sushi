@@ -18,7 +18,8 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "FAIL: port $P
 
 WORK="$(cd "$(mktemp -d)" && pwd -P)"
 SPID=""
-trap '[ -n "$SPID" ] && kill "$SPID" 2>/dev/null; rm -rf "$WORK"' EXIT
+SRV=""
+trap '[ -n "$SPID" ] && kill "$SPID" 2>/dev/null; [ -n "$SRV" ] && { kill "$SRV"; wait "$SRV"; } 2>/dev/null; rm -rf "$WORK"' EXIT
 export HOME="$WORK/home"
 export SUSHI_PREFIX_CACHE_DIR="$WORK/kv"
 export SUSHI_HF_ENDPOINT="http://127.0.0.1:$PORT"
@@ -35,6 +36,7 @@ cat > "$WORK/stub_hf.py" <<'EOF'
 import http.server, json, sys
 
 MODE = sys.argv[2]
+HITS = sys.argv[3] if len(sys.argv) > 3 else None
 
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -46,6 +48,9 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
     def do_GET(self):
+        if HITS:
+            with open(HITS, "a") as f:
+                f.write(self.path + "\n")
         if self.path.startswith("/api/models/"):
             return self.reply(200, {"siblings": [{"size": 1000}]})
         if self.path.endswith("/resolve/main/config.json"):
@@ -59,7 +64,7 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 EOF
 
 serve() {
-    python3 "$WORK/stub_hf.py" "$PORT" "$1" > /dev/null 2>&1 &
+    python3 "$WORK/stub_hf.py" "$PORT" "$1" "$WORK/hits" > /dev/null 2>&1 &
     SPID=$!
     for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$PORT/api/models/x" && break; sleep 0.25; done
 }
@@ -126,6 +131,35 @@ check "and never asked Hugging Face" "$([ ! -e "$CACHE" ] && echo 1 || echo 0)"
 echo '{"server":{"update_check":false}}' > "$HOME/.sushi/model-settings.json"
 out=$("$BIN" list 2>&1)
 check "update_check false leaves the pack check on" "$([ "$(count "$out")" = 1 ] && echo 1 || echo 0)"
+stop
+
+# The server's Downloads list under `pack_update_check: false`: a look from another tab asks Hugging Face nothing,
+# opening the list asks nothing about an installed pack's update, and only Check (refresh=1) does.
+SPORT=$((PORT + 1))
+SBASE="http://127.0.0.1:$SPORT"
+forget
+echo '{"server":{"pack_update_check":false}}' > "$HOME/.sushi/model-settings.json"
+serve v2
+"$BIN" --serve --model-dir "$HOME/.sushi/models" --port "$SPORT" --log-file off > "$WORK/server.log" 2>&1 &
+SRV=$!
+for _ in $(seq 1 60); do curl -sf "$SBASE/health" > /dev/null && break; sleep 0.5; done
+: > "$WORK/hits"
+dl() { curl -s "$SBASE/v1/downloads$1" > "$WORK/d.json"; }
+t() { python3 -c "import json,sys; d=json.load(open('$WORK/d.json')); sys.exit(0 if ($1) else 1)" && echo 1 || echo 0; }
+until_ready() { for _ in $(seq 1 120); do dl "$1"; [ "$(t "d['catalog'] == 'ready' and not d['refreshing']")" = 1 ] && return 0; sleep 0.25; done; }
+row="[p for p in d['packs'] if p['repo'] == 'beamster/$PACK'][0]"
+dl "?background=1"
+sleep 2
+dl "?background=1"
+check "server, checks off: a look from another tab asks Hugging Face nothing" "$([ ! -s "$WORK/hits" ] && echo 1 || echo 0)"
+check "server, checks off: the list reports the automatic check off" "$(t "d['update_check'] is False")"
+until_ready ""
+check "server, checks off: opening the list asks nothing about the installed pack's update" "$(grep -q 'resolve/main/config.json' "$WORK/hits" && echo 0 || echo 1)"
+check "server, checks off: the installed pack shows no update" "$(t "$row['installed'] and $row['update'] is None")"
+dl "?refresh=1"
+until_ready ""
+check "server, checks off: Check asks and shows the update" "$(grep -q 'resolve/main/config.json' "$WORK/hits" && [ "$(t "$row['update']['latest'] == '2.0'")" = 1 ] && echo 1 || echo 0)"
+kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
 stop
 
 [ -z "$FAILED" ] && echo "PASS: pack update notice"
