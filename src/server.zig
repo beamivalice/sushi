@@ -7938,14 +7938,12 @@ pub fn handleChatCompletions(
     defer if (effort_notice) |n| n.deinit(allocator);
     defer request_policy.clearEffortNotice(stream);
     if (effort_cfg) |e| effort_notice = try request_policy.holdEffortNotice(allocator, stream, request_policy.effortModelName(lm), e);
-    var enable_thinking = request_policy.resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking());
+    const thinking = request_policy.chatThinking(root, effort_cfg, config);
+    var enable_thinking = thinking.enable;
     if (!try request_policy.checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
-
-    // Reasoning budget (max tokens in <think> block, -1 = unlimited):
-    const default_effort_budget = model_mod.defaultThinkBudget(config);
-    const effort_budget: i32 = if (effort_cfg) |e| e.budget else default_effort_budget;
-    const reasoning_budget: i32 = request_policy.requestThinkBudget(root, effort_budget);
-    const template_effort = if (effort_cfg) |e| e.sends else model_mod.defaultTemplateEffort(config);
+    // Reasoning budget (max tokens in <think> block, -1 = unlimited).
+    const reasoning_budget: i32 = thinking.budget;
+    const template_effort = thinking.template;
 
     // Wave 1.A: per-request KV-quant override. When unset, falls back to the
     // process-level --kv-quant default carried on the scheduler. Cross-scheme

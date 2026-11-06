@@ -115,6 +115,9 @@ dsv41 real: the attention input's and the compressor's linears in one stacked la
 dsv41 real: the trunk linears of converted layers 0 and 2 hold the f32-truth bar on the served arms (DSV41_RT_PACK)
 dsv41 real: two experts of every rate group of converted layer 2 hold the f32-truth bar (DSV41_RT_PACK)
 dsv41 replay: what the next prompt shares with a generated turn (DeepSeek tokenizer.json)
+effort off default: DeepSeek and GLM resolve and render as before
+effort off default: Qwen stays off on chat, Anthropic and Responses for a request naming no effort word or budget
+effort off default: a Qwen request naming an effort word or a budget still thinks, at that word or Qwen's unnamed level
 every model, GLM included, defaults to kv8 and 16 selects BF16
 exl3 GLM GPU windows match host metadata with zero padded windows
 exl3 GLM GPU windows preserve 288 expert bytes at every admitted rate

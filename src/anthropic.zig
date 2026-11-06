@@ -796,31 +796,6 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         }
     }
 
-    // Thinking config. An absent `thinking` object consults the arch default
-    // (an arch that always reasons delivers it as thinking blocks rather
-    // than paying for it and discarding it); a PRESENT object decides
-    // explicitly, exactly as before.
-    var enable_thinking = if (root.get("thinking") == null)
-        config.defaultEnableThinking()
-    else
-        false;
-    var reasoning_budget: i32 = model_mod.defaultThinkBudget(config);
-    var budget_explicit = false;
-    if (root.get("thinking")) |think_val| {
-        if (think_val == .object) {
-            const think_type = if (think_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-            if (std.mem.eql(u8, think_type, "enabled") or std.mem.eql(u8, think_type, "adaptive")) {
-                enable_thinking = true;
-            }
-            if (think_val.object.get("budget_tokens")) |bt| {
-                if (bt == .integer) {
-                    reasoning_budget = clampJsonI32(bt.integer);
-                    budget_explicit = true;
-                }
-            }
-        }
-    }
-
     // `output_config` (Claude Code's spelling; see parseAnthropicOutputConfig).
     // The effort word is an explicit thinking signal, so it displaces the arch
     // default and OR's with a present `thinking` object — the OpenAI surface's
@@ -833,7 +808,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
         return false;
     }
-    var effort_word: ?[]const u8 = model_mod.defaultTemplateEffort(config);
+    var effort_cfg: ?request_policy.ReasoningEffort = null;
     if (output_cfg.effort) |word| {
         const served_arms = effort_mod.servedArms(config.model_type);
         const cfg = reasoningEffortFromWord(word, effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
@@ -842,11 +817,14 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
             return false;
         };
-        effort_word = cfg.sends;
         p.effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
-        if (!budget_explicit) reasoning_budget = cfg.budget;
-        enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
+        effort_cfg = cfg;
     }
+    // An absent `thinking` object takes the arch default; a present one decides (`request_policy.anthropicThinking`).
+    const thinking = request_policy.anthropicThinking(root, effort_cfg, config);
+    var enable_thinking = thinking.enable;
+    const reasoning_budget = thinking.budget;
+    const effort_word = thinking.template;
     if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, true)) return false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as

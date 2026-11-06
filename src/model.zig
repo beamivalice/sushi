@@ -2096,9 +2096,17 @@ pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
     return if (defaultArm(config)) |arm| @tagName(arm.effort) else null;
 }
 
-/// What the template's `reasoning_effort` receives for a request naming no effort (`effort.templateValue`).
+/// What the template's `reasoning_effort` receives for a request naming no effort (`effort.templateValue`); an `off`
+/// default sends nothing, so a request it does not keep off renders no level it did not ask for.
 pub fn defaultTemplateEffort(config: *const ModelConfig) ?[]const u8 {
-    return if (defaultArm(config)) |arm| effort_mod.templateValue(arm) else null;
+    const arm = defaultArm(config) orelse return null;
+    return if (arm.effort == .off) null else effort_mod.templateValue(arm);
+}
+
+/// The default word (`--think`'s, else the table's) is `off`.
+pub fn defaultEffortIsOff(config: *const ModelConfig) bool {
+    const arm = defaultArm(config) orelse return false;
+    return arm.effort == .off;
 }
 
 /// The word a request naming no effort runs at (`/v1/models` `default_reasoning_effort`).

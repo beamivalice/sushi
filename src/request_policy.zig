@@ -230,7 +230,7 @@ pub fn optSamplingRecJson(allocator: std.mem.Allocator, comptime T: type, v: ?T)
 /// (which outlives the handler), or on a served arch the selected arm's static
 /// word. `sends` is what the template's `reasoning_effort` receives
 /// (`effort.templateValue`, static), the value every render passes.
-const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null, rerouted_from: ?[]const u8 = null, sends: ?[]const u8 = null };
+pub const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null, rerouted_from: ?[]const u8 = null, sends: ?[]const u8 = null };
 
 /// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
 /// low | medium | high | xhigh — values are model-dependent, so unknown
@@ -431,6 +431,85 @@ pub fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEff
     const et = requestEnableThinking(root);
     if (et == null and effort_cfg == null) return arch_default;
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
+}
+
+/// A request's thinking: on or off, its cap (-1 = none) and the template's `reasoning_effort`.
+pub const Thinking = struct { enable: bool, budget: i32, template: ?[]const u8 };
+
+/// Qwen under an `off` default (`--think off`, the table's): a request naming no effort word thinks only when it names a
+/// thinking budget, at the level silence renders (`chat.qwen38EffortFor`); its on switch alone leaves it off.
+fn holdOffDefault(t: *Thinking, config: *const model_mod.ModelConfig, names_effort: bool, names_budget: bool, explicit_off: bool) void {
+    if (names_effort or !config.isQwen4() or !model_mod.defaultEffortIsOff(config)) return;
+    t.enable = names_budget and !explicit_off;
+    if (!t.enable) t.budget = -1;
+    t.template = model_mod.defaultTemplateEffort(config);
+}
+
+fn namesThinkBudget(root: std.json.ObjectMap) bool {
+    const v = root.get("reasoning_budget_tokens") orelse return false;
+    return v == .integer;
+}
+
+/// `/v1/chat/completions`: `effort_cfg` is the request's `reasoning_effort`; the cap is `reasoning_budget_tokens`, else the word's.
+pub fn chatThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, config: *const model_mod.ModelConfig) Thinking {
+    const effort_budget = if (effort_cfg) |e| e.budget else model_mod.defaultThinkBudget(config);
+    var t: Thinking = .{
+        .enable = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking()),
+        .budget = requestThinkBudget(root, effort_budget),
+        .template = if (effort_cfg) |e| e.sends else model_mod.defaultTemplateEffort(config),
+    };
+    holdOffDefault(&t, config, effort_cfg != null, namesThinkBudget(root), requestEnableThinking(root) == false);
+    return t;
+}
+
+/// `/v1/messages`: a `thinking` object decides, OR'd with `output_config.effort` (`effort_cfg`); `budget_tokens`
+/// outranks the word's cap.
+pub fn anthropicThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, config: *const model_mod.ModelConfig) Thinking {
+    const think_obj: ?std.json.ObjectMap = if (root.get("thinking")) |v| (if (v == .object) v.object else null) else null;
+    var t: Thinking = .{
+        .enable = if (root.get("thinking") == null) config.defaultEnableThinking() else false,
+        .budget = model_mod.defaultThinkBudget(config),
+        .template = model_mod.defaultTemplateEffort(config),
+    };
+    var budget_explicit = false;
+    var disabled = false;
+    if (think_obj) |o| {
+        const kind = if (o.get("type")) |v| (if (v == .string) v.string else "") else "";
+        if (std.mem.eql(u8, kind, "enabled") or std.mem.eql(u8, kind, "adaptive")) t.enable = true;
+        disabled = std.mem.eql(u8, kind, "disabled");
+        if (o.get("budget_tokens")) |bt| if (bt == .integer) {
+            t.budget = clampJsonI32(bt.integer);
+            budget_explicit = true;
+        };
+    }
+    if (effort_cfg) |cfg| {
+        t.template = cfg.sends;
+        if (!budget_explicit) t.budget = cfg.budget;
+        t.enable = if (root.get("thinking") == null) cfg.enable else (t.enable or cfg.enable);
+    }
+    holdOffDefault(&t, config, effort_cfg != null, budget_explicit, disabled);
+    return t;
+}
+
+/// The effort word a `/v1/responses` request runs at: `reasoning.effort`, else the default word where it has no
+/// `reasoning` or one that turns thinking on.
+pub fn responsesEffortWord(root: std.json.ObjectMap, parsed: responses_mod.ReasoningConfig, config: *const model_mod.ModelConfig) ?[]const u8 {
+    if (parsed.effort) |w| return w;
+    if (root.get("reasoning") == null or parsed.enable) return model_mod.defaultEffortWord(config);
+    return null;
+}
+
+/// `/v1/responses`: `word_cfg` is the resolved `responsesEffortWord`; `named` says the request named it. A `reasoning`
+/// object decides alone.
+pub fn responsesThinking(root: std.json.ObjectMap, reasoning_enable: bool, word_cfg: ?ReasoningEffort, named: bool, config: *const model_mod.ModelConfig) Thinking {
+    const effort_budget = if (word_cfg) |c| c.budget else model_mod.defaultThinkBudget(config);
+    var t: Thinking = .{
+        .enable = responsesEnableThinking(root, if (word_cfg) |c| c.enable else reasoning_enable, config.defaultEnableThinking()),
+        .budget = requestThinkBudget(root, effort_budget),
+        .template = if (word_cfg) |c| c.sends else null,
+    };
+    holdOffDefault(&t, config, named, namesThinkBudget(root), requestEnableThinking(root) == false);
+    return t;
 }
 
 const SchemaThinkingPolicy = enum {
@@ -1515,4 +1594,155 @@ test "effort table: /v1/models rows follow the served table, with each word's te
     const mimo = try reasoningEffortsJson(a, &.{ .model_type = "mimo_v2" });
     defer a.free(mimo);
     try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"on\"],\"reasoning_effort_budgets\":{},\"reasoning_effort_values\":{},\"default_reasoning_effort\":\"on\"", mimo);
+}
+
+const OffSurface = enum { chat, anthropic, responses };
+
+/// What `surface`'s handler resolves for `body` before the render (no `effortWordOnly` template).
+fn surfaceThinking(a: std.mem.Allocator, surface: OffSurface, config: *const model_mod.ModelConfig, body: []const u8) !Thinking {
+    const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{})).object;
+    const arms = effort_mod.servedArms(config.model_type);
+    const table: ?[]const effort_mod.EffortArm = if (arms) |*x| x.slice() else null;
+    switch (surface) {
+        .chat => return chatThinking(root, try parseReasoningEffort(root, false, table), config),
+        .anthropic => {
+            const word: ?[]const u8 = if (root.get("output_config")) |oc| (if (oc.object.get("effort")) |e| e.string else null) else null;
+            return anthropicThinking(root, if (word) |w| try reasoningEffortFromWord(w, false, table) else null, config);
+        },
+        .responses => {
+            var rc = responses_mod.parseReasoning(root.get("reasoning"));
+            const named = rc.effort != null;
+            rc.effort = responsesEffortWord(root, rc, config);
+            return responsesThinking(root, rc.enable, if (rc.effort) |w| try reasoningEffortFromWord(w, false, table) else null, named, config);
+        },
+    }
+}
+
+fn renderHi(a: std.mem.Allocator, template: []const u8, enable: bool, effort: ?[]const u8) ![]const u8 {
+    var cc: chat_mod.ChatConfig = .{ .chat_template = template, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
+    return chat_mod.renderChatTemplate(a, &msgs, &cc, null, null, enable, effort, false);
+}
+
+const OffDefault = enum { think_flag, table };
+
+/// `--think off`, or the family table's default `off`; the other cleared.
+fn setOffDefault(how: OffDefault, f: effort_mod.Family) void {
+    effort_mod.think_effort_flag = if (how == .think_flag) .off else null;
+    effort_mod.publish(f, if (how == .table) .{ .default = .off } else .{});
+}
+
+test "effort off default: Qwen stays off on chat, Anthropic and Responses for a request naming no effort word or budget" {
+    const qwen38_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const saved = effort_mod.think_effort_flag;
+    defer effort_mod.think_effort_flag = saved;
+    defer effort_mod.publish(.qwen4_exp, .{});
+    const config = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    const cases = [_]struct { OffSurface, []const u8 }{
+        .{ .chat, "{\"enable_thinking\":true}" },
+        .{ .chat, "{\"chat_template_kwargs\":{\"enable_thinking\":true}}" },
+        .{ .chat, "{}" },
+        .{ .chat, "{\"enable_thinking\":false,\"reasoning_budget_tokens\":512}" },
+        .{ .anthropic, "{\"thinking\":{\"type\":\"enabled\"}}" },
+        .{ .anthropic, "{\"thinking\":{\"type\":\"adaptive\"}}" },
+        .{ .anthropic, "{}" },
+        .{ .anthropic, "{\"thinking\":{\"type\":\"disabled\",\"budget_tokens\":512}}" },
+        .{ .responses, "{\"reasoning\":{}}" },
+        .{ .responses, "{\"reasoning\":{\"summary\":\"auto\"}}" },
+        .{ .responses, "{\"enable_thinking\":true}" },
+        .{ .responses, "{}" },
+    };
+    for ([_]OffDefault{ .think_flag, .table }) |how| {
+        setOffDefault(how, .qwen4_exp);
+        const asked_off = try surfaceThinking(a, .chat, &config, "{\"reasoning_effort\":\"off\"}");
+        const off = try renderHi(a, qwen38_template, asked_off.enable, asked_off.template);
+        for (cases) |c| {
+            const t = try surfaceThinking(a, c[0], &config, c[1]);
+            try testing.expect(!t.enable);
+            try testing.expectEqual(@as(i32, -1), t.budget);
+            try testing.expectEqualStrings(off, try renderHi(a, qwen38_template, t.enable, t.template));
+        }
+    }
+}
+
+test "effort off default: a Qwen request naming an effort word or a budget still thinks, at that word or Qwen's unnamed level" {
+    const qwen38_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const saved = effort_mod.think_effort_flag;
+    defer effort_mod.think_effort_flag = saved;
+    defer effort_mod.publish(.qwen4_exp, .{});
+    const config = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    // Surface, body, budget, and the word whose render it is: a budget alone thinks at low, the level silence renders.
+    const cases = [_]struct { OffSurface, []const u8, i32, []const u8 }{
+        .{ .chat, "{\"reasoning_effort\":\"low\"}", 2048, "low" },
+        .{ .chat, "{\"reasoning_effort\":\"xhigh\"}", -1, "xhigh" },
+        .{ .chat, "{\"reasoning_budget_tokens\":512}", 512, "low" },
+        .{ .chat, "{\"enable_thinking\":true,\"reasoning_budget_tokens\":512}", 512, "low" },
+        .{ .anthropic, "{\"output_config\":{\"effort\":\"medium\"}}", 8192, "medium" },
+        .{ .anthropic, "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}}", 1024, "low" },
+        .{ .responses, "{\"reasoning\":{\"effort\":\"low\"}}", 2048, "low" },
+        .{ .responses, "{\"reasoning\":{},\"reasoning_budget_tokens\":512}", 512, "low" },
+        .{ .responses, "{\"reasoning_budget_tokens\":512}", 512, "low" },
+    };
+    for ([_]OffDefault{ .think_flag, .table }) |how| {
+        setOffDefault(how, .qwen4_exp);
+        for (cases) |c| {
+            const t = try surfaceThinking(a, c[0], &config, c[1]);
+            try testing.expect(t.enable);
+            try testing.expectEqual(c[2], t.budget);
+            const word = try reasoningEffortFromWord(c[3], false, effort_mod.servedArms("qwen4_exp").?.slice());
+            try testing.expectEqualStrings(try renderHi(a, qwen38_template, true, word.sends), try renderHi(a, qwen38_template, t.enable, t.template));
+        }
+    }
+}
+
+test "effort off default: DeepSeek and GLM resolve and render as before" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const saved = effort_mod.think_effort_flag;
+    defer effort_mod.think_effort_flag = saved;
+    defer effort_mod.publish(.deepseek_v41, .{});
+    defer effort_mod.publish(.glm5_next, .{});
+    const ds_template = @embedFile("fixtures/dsv41_chat_template.jinja");
+    const ds = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
+    const ds_high = (try reasoningEffortFromWord("high", false, effort_mod.servedArms("deepseek_v41").?.slice())).sends;
+    for ([_]OffDefault{ .think_flag, .table }) |how| {
+        setOffDefault(how, .deepseek_v41);
+        const off = try renderHi(a, ds_template, false, null);
+        // An on switch with no word thinks at high, uncapped; silence and a bare `reasoning` object stay off.
+        for ([_]struct { OffSurface, []const u8, bool }{
+            .{ .chat, "{\"enable_thinking\":true}", true },
+            .{ .anthropic, "{\"thinking\":{\"type\":\"enabled\"}}", true },
+            .{ .responses, "{\"enable_thinking\":true}", true },
+            .{ .chat, "{}", false },
+            .{ .anthropic, "{}", false },
+            .{ .responses, "{\"reasoning\":{}}", false },
+        }) |c| {
+            const t = try surfaceThinking(a, c[0], &ds, c[1]);
+            try testing.expectEqual(c[2], t.enable);
+            try testing.expectEqual(@as(i32, -1), t.budget);
+            const want = if (c[2]) try renderHi(a, ds_template, true, ds_high) else off;
+            try testing.expectEqualStrings(want, try renderHi(a, ds_template, t.enable, t.template));
+        }
+    }
+    // GLM cannot think off: `--think off` does not bind on it, and every surface keeps its default.
+    const glm_template = @embedFile("fixtures/glm53_chat_template.jinja");
+    const glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    for ([_]OffSurface{ .chat, .anthropic, .responses }) |surface| {
+        for ([_][]const u8{ "{}", "{\"enable_thinking\":true}" }) |body| {
+            effort_mod.think_effort_flag = null;
+            const before = try surfaceThinking(a, surface, &glm, body);
+            effort_mod.think_effort_flag = .off;
+            const t = try surfaceThinking(a, surface, &glm, body);
+            try testing.expect(t.enable);
+            try testing.expectEqual(before.budget, t.budget);
+            try testing.expectEqualStrings(try renderHi(a, glm_template, before.enable, before.template), try renderHi(a, glm_template, t.enable, t.template));
+        }
+    }
 }

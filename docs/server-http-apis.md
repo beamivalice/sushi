@@ -53,7 +53,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   request's own fields, then `--think`, then the
   table's default word (the file's, else the built-in one); a checkpoint whose `generation_config.json` declares
   `enable_thinking` false stays off unless the file names a default word (the operator outranks the checkpoint, as a
-  flag does). A file default of `off` makes a silent request think off. Explicit thinking off stays off. MiMo and GLM keep their defaults. A thinking
+  flag does). A file default of `off` makes a silent request think off. Qwen under an `off` default (`--think off` or
+  the table's) stays off for a request naming no effort word, its `enable_thinking: true` or Anthropic `enabled`
+  included; an effort word, or a budget (`reasoning_budget_tokens`, `budget_tokens`), still turns it on, a budget alone
+  at low (`request_policy.holdOffDefault`, on chat, Anthropic and Responses alike). Explicit thinking off stays off. MiMo and GLM keep their defaults. A thinking
   request on another arch that names NO effort gets no server budget: Qwen3.8's template renders an absent word as
   low (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
   `sequence_number` on every event, stateful via

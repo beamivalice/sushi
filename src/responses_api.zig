@@ -556,13 +556,12 @@ fn handleResponsesInner(
     // ── reasoning ──
     // Budget precedence as on chat: reasoning_budget_tokens > the effort word's cap.
     var reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"));
-    if (reasoning_cfg.effort == null and (root.get("reasoning") == null or reasoning_cfg.enable)) reasoning_cfg.effort = model_mod.defaultEffortWord(config);
-    var enable_thinking = reasoning_cfg.enable;
-    var effort_budget: i32 = model_mod.defaultThinkBudget(config);
+    const effort_named = reasoning_cfg.effort != null;
+    reasoning_cfg.effort = request_policy.responsesEffortWord(root, reasoning_cfg, config);
     var effort_notice: ?EffortNotice = null;
     defer if (effort_notice) |n| n.deinit(allocator);
     defer clearEffortNotice(stream);
-    var template_effort = reasoning_cfg.effort;
+    var word_cfg: ?request_policy.ReasoningEffort = null;
     if (reasoning_cfg.effort) |word| {
         const served_arms = effort_mod.servedArms(config.model_type);
         const cfg = reasoningEffortFromWord(word, effortWordOnly(allocator, lm, tok), if (served_arms) |*a| a.slice() else null) catch {
@@ -572,15 +571,13 @@ fn handleResponsesInner(
             return;
         };
         reasoning_cfg.effort = cfg.effort;
-        template_effort = cfg.sends;
-        enable_thinking = cfg.enable;
-        effort_budget = cfg.budget;
         effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
+        word_cfg = cfg;
     }
-    const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
-        .integer => |i| clampJsonI32(i),
-        else => effort_budget,
-    } else effort_budget;
+    const thinking = request_policy.responsesThinking(root, reasoning_cfg.enable, word_cfg, effort_named, config);
+    var enable_thinking = thinking.enable;
+    const reasoning_budget: i32 = thinking.budget;
+    const template_effort = thinking.template;
 
     // ── tools ──
     var tools_json: ?[]const u8 = null;
@@ -616,7 +613,6 @@ fn handleResponsesInner(
     const active_has_tools = has_tools and !final_answer_mode;
     const active_tools_json: ?[]const u8 = if (active_has_tools) tools_json else null;
     const active_tool_choice_instruction: ?[]const u8 = if (active_has_tools) tool_choice_instruction else null;
-    enable_thinking = responsesEnableThinking(root, enable_thinking, config.defaultEnableThinking());
     if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
