@@ -918,7 +918,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   (`live_flush_idle_secs`) and a clean shutdown write every point of the record that is not on SSD yet (up to 8: the
   prompt-end and thought points; a grid point was written through), as one commit over the record's tokens with rows that
   are views of the live ones (`dsv41_model.captureLiveShared`), before the new prefill touches them. A point a later
-  prefill overwrote was popped from the record by its rollback and is not written. A record with images is not flushed.
+  prefill overwrote was popped from the record by its rollback and is not written. A record with images is written under its vision key (a hash of the pixels), so only a prompt with the same images restores past its first image row.
   A crash flushes nothing: the cache restores from the last grid point (at most 8192 tokens of re-prefill). Log:
   `[dsv41-prefix] live points to SSD (why): N points to P, X GB staged, held T ms`. The flush needs no bill of its own: the
   points are the record's, the rows views, and the writer's bounded buffers take the bytes.

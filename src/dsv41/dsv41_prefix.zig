@@ -453,11 +453,13 @@ pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: 
 /// Writes the live record's points that are not on SSD yet, while the rows they lean on are still the state's own: all
 /// of them (up to `live_point_cap`), so what a rewind of the last turns would restore from RAM restores from SSD too. Run
 /// where the state is about to be lost (another conversation takes the slot, unload, shutdown, idle) and before anything
-/// appends to it; a point a later prefill overwrote is no longer in the record. A text-only record: a media chain is not
-/// kept, and the points of a prompt with images stay live-only.
+/// appends to it; a point a later prefill overwrote is no longer in the record. A record with images is written under
+/// its vision key, which hashes the pixels, so only a prompt with the same images restores past the first image row.
 pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
     const live = &self.live_dsv41;
-    if (self.disk == null or !self.ssd_first or !live.ready or live.epoch != m.state_epoch or live.vision_key != 0) return;
+    if (self.disk == null or !self.ssd_first or !live.ready or live.epoch != m.state_epoch) return;
+    // A pixel key with no boundary proves nothing about where its rows begin (`diskTextLen`).
+    if (live.vision_key != 0 and live.media_start == null) return;
     const st = m.dec_state orelse return;
     var cps: std.ArrayList(SSMCheckpoint) = .empty;
     defer {
@@ -488,7 +490,8 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.ml
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     self.disk.?.rows_base = @intCast(live.base);
     defer self.disk.?.rows_base = std.math.maxInt(u32);
-    self.writeThroughHybrid(cache.entries, cache.config, live.tokens[0..top], live.has_tools, .{}, cps.items, std.math.maxInt(u64), s);
+    const media = pc.truncatedMediaKey(&.{}, live.vision_key, if (live.media_start) |v| @as(usize, v) else null, top);
+    self.writeThroughHybrid(cache.entries, cache.config, live.tokens[0..top], live.has_tools, media, cps.items, std.math.maxInt(u64), s);
     for (cps.items) |*cp| live.markFlushed(cp.pos);
     const bytes = self.disk.?.point_bytes_written - staged_before;
     log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, cps.items.len, top, @as(f64, @floatFromInt(bytes)) / 1e9, sw.read() / std.time.ns_per_ms });

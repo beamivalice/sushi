@@ -1067,6 +1067,54 @@ test "DeepSeek live flush: a point inside generated tokens a later turn overwrot
     try testing.expectEqual(before, hc.disk.?.point_bytes_written);
 }
 
+test "DeepSeek live flush: an image conversation's live points reach SSD under its image key, so a restart restores them for that image only (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var ids_buf: [flush_first_len]u32 = undefined;
+    const ids = dsv41LongPrompt(&net, &ids_buf, null, 0);
+    const image: pc.MediaStamp = .{ .key = 0xC3C3_C3C3_C3C3_C3C3, .start = 100 };
+    const other_key: u64 = 0xD4D4_D4D4_D4D4_D4D4;
+
+    // The prompt-end point is off the 128-token grid, so only the live record holds it until the shutdown flush.
+    var want: SSMCheckpoint = undefined;
+    {
+        var hc = try dsv41SplitCache(io, base, "dsv41-media-flush", &net, 128);
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, ids[0..flush_prompt_end], .last));
+        want = try dsv41_prefix.capture(testing.allocator, net.m, flush_prompt_end);
+        var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, flush_prompt_end)};
+        defer cps[0].deinit(testing.allocator);
+        cache.step = flush_prompt_end;
+        hc.writeThroughDsv41(net.m, &cache, ids[0..flush_prompt_end], false, image, &cps, s, "prefill");
+        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, ids[flush_prompt_end..], .last));
+        _ = hc.publishLiveDsv41(net.m, ids, false, image, cache.config);
+        dsv41_prefix.flushLiveDsv41(&hc, net.m, s, "shutdown");
+        hc.disk.?.drainWriter();
+    }
+    defer want.deinit(testing.allocator);
+    var hc = try dsv41SplitCache(io, base, "dsv41-media-flush", &net, 128);
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    try testing.expectEqual(@as(usize, 0), (try dsv41LookupMedia(&hc, &net, ids, other_key, image.start.?)).matched);
+    dsv41_model.resetState(net.m);
+    const res = try dsv41LookupMedia(&hc, &net, ids, image.key, image.start.?);
+    try testing.expectEqual(@as(usize, flush_prompt_end), res.matched);
+    var got = try dsv41_prefix.capture(testing.allocator, net.m, flush_prompt_end);
+    defer got.deinit(testing.allocator);
+    try expectCheckpointBits(&want, &got);
+}
+
 test "DeepSeek live rollback: the state rolled back to each kept point is a full capture of that point, byte for byte (DSV41_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
