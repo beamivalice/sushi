@@ -19,8 +19,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   context, timeout): a flag one mode parses and the other drops is the class. `--no-drafter`/`--drafter` reach both too.
 - **The embedded REPL uses in-process HTTP**: never fork `curl` from the resident engine for readiness checks or chat
   turns. Test `run` on a real TTY; a serving-only smoke test does not exercise its client.
-- **A served arch must be in `model_discovery.supported_model_types`**: `run` refuses what `classifyModelPath` calls non-chat
-  (guard test: every `model.served_model_types` entry classifies chat).
+- **A served arch must be in its `arch.zig` `discovery_types`** (discovery asks `arch/config.discovers`): `run` refuses
+  what `classifyModelPath` calls non-chat (guard test: every `model.served_model_types` entry classifies chat). The config
+  parse also reads a text-only twin discovery has never listed (`config_types`: `qwen4_exp_text` is both, `glm5_next_text`
+  only parses).
 - **An arg loop with no else branch is a silent flag eater** (`cli.classifyUnparsedArg`): every `--flag` any script
   passes must be in main.zig's match list. Removed flags are rejected by name, never eaten.
 - **`--parent-pid <pid>`** is for a host that runs sushi as its engine (`src/parent_watch.zig`): a thread polls the pid
@@ -132,8 +134,10 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `ensurePortFree` probes the address with a connect AND a bind, so a listener or a bound-but-silent socket both refuse
   with "port N is already in use"; the listener binds with SO_REUSEADDR only, so a racing second sushi fails its bind
   with the same message instead of co-binding. Guard: `tests/test_port_conflict.sh`.
-- The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`) by
-  name (`ArchitectureUnsupported` → 503). A checkpoint in an unsupported file format is refused by name
+- The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (the registry's list of every
+  registered type, `-Darchs` or not: `qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`) by name
+  (`ArchitectureUnsupported` → 503). A registered type the build left out keeps its name in the refusal; the text lists
+  the enabled archs in `gate_rank` order. A checkpoint in an unsupported file format is refused by name
   (`ModelFormatUnsupported` → 503; `--model` exits). A served arch off the supported list (MiMo, from 1.5.1) sets
   `ModelConfig.unsupported_note` at parse, and the server logs that `[load]` warning on every load.
 - The pack-revision check is the first thing `loadWeightsForConfig` does after the arch gate, for every arch: a config

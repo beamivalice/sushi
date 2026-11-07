@@ -66,7 +66,7 @@ names it; absent is the pack order.
   (safetensors readers reject gaps). The engine skips every `__pad__.` key: it is not loaded, billed or validated.
   The published DeepSeek revision 2.0 starts 43 of its `trellis_pm` tensors on a 4 KiB block rather than a 16 KiB
   page; the loader accepts any start, and only the direct-read share depends on it.
-- Only `deepseek_v41` reads `pair_major`. Its streaming engine lands the bytes in the slot pools unchanged: no CPU
+- Only `deepseek_v41` reads `pair_major` (its `config_facts.reads_pair_major`; the parse refuses the order under any other arch). Its streaming engine lands the bytes in the slot pools unchanged: no CPU
   reshuffle, and a read whose file offset, length and destination lie on pages goes straight into the slab. A
   pair-major pack's rate-group pools always start on pages (the layer's bill grows by under one page per pool, per
   projection), so a trellis that is off its page costs only its own reads their direct path.

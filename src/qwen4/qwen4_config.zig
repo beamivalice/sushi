@@ -19,6 +19,11 @@ const setConfigOverrides = model_mod.setConfigOverrides;
 const streamingResidentSplit = model_mod.streamingResidentSplit;
 const testing = std.testing;
 
+/// A test that parses this arch's config needs the arch built (`-Darchs`).
+fn built() !void {
+    if (@import("../arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+}
+
 /// One qwen4_exp integer bound, read strictly: wrong-typed or negative refuses.
 pub fn qwen4ConfigU64(cfg_obj: std.json.ObjectMap, key: []const u8) !?u64 {
     const v = cfg_obj.get(key) orelse return null;
@@ -30,6 +35,88 @@ pub fn qwen4ConfigU32(cfg_obj: std.json.ObjectMap, key: []const u8) !?u32 {
     const v = try qwen4ConfigU64(cfg_obj, key) orelse return null;
     if (v > std.math.maxInt(u32)) return error.InvalidQwen4ConfigField;
     return @intCast(v);
+}
+
+/// The Flash-Next part of the parse: the folded-norm trunk defaults, hyper-connections, PLE, QSA and the vision tower.
+pub fn parseFamily(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
+    config.model_type = "qwen4_exp";
+    config.weight_prefix = "language_model.model";
+    config.norm_has_offset = false; // the converter folds every (1 + w) norm
+    config.has_final_norm = false; // hyper_connection_mixer replaces model.norm
+    config.scale_embeddings = false;
+    config.has_pre_ff_norm = false;
+    config.has_qk_norm = true;
+    config.hidden_act = .silu;
+    config.has_sliding_window = false;
+    config.attn_output_gate = true;
+    config.kda_sigmoid_out_gate = true; // output_gate_type "sigmoid"
+    config.rope_scaling_factor = 1.0;
+    config.rope_local_base_freq = config.rope_theta;
+    if (cfg_obj.get("query_pre_attn_scalar") == null) {
+        config.query_pre_attn_scalar = config.head_dim;
+    }
+    config.hc_count = 4;
+    config.hc_lowrank = 320;
+    config.ple_embed_dim = config.hidden_size;
+    try parseQwenVisionFields(config, root, cfg_obj);
+    // YaRN (262144 → e.g. 1048576) rides ONE rotary table for the whole
+    // trunk: attention, the QSA indexer and the MTP head all read it, so
+    // a scaled rotation cannot desync the block selector from attention.
+    try parseYarnRopeParameters(config, cfg_obj);
+    // Read strictly; range-checked in `validateQwen4Config` once every field is in.
+    if (try qwen4ConfigU32(cfg_obj, "hc_count")) |v| config.hc_count = v;
+    if (try qwen4ConfigU32(cfg_obj, "hc_lowrank")) |v| config.hc_lowrank = v;
+    {
+        const v = cfg_obj.get("ple_layer_ids") orelse return error.InvalidQwen4PleLayer;
+        if (v != .array or v.array.items.len != 1 or v.array.items[0] != .integer) {
+            return error.InvalidQwen4PleLayer;
+        }
+        const id = v.array.items[0].integer;
+        if (id < 1 or id > @as(i64, config.num_hidden_layers)) return error.InvalidQwen4PleLayer;
+        config.ple_layer_idx = @intCast(id - 1);
+    }
+    if (try qwen4ConfigU32(cfg_obj, "ple_embed_dim")) |v| config.ple_embed_dim = v;
+    if (try qwen4ConfigU32(cfg_obj, "ple_conv_kernel_size")) |v| config.ple_conv_kernel = v;
+    if (try qwen4ConfigU32(cfg_obj, "ngram_size")) |v| config.ngram_size = v;
+    if (try qwen4ConfigU32(cfg_obj, "heads_per_ngram")) |v| config.heads_per_ngram = v;
+    if (try qwen4ConfigU64(cfg_obj, "ngram_vocab_size_base")) |v| config.ngram_vocab_base = v;
+    if (try qwen4ConfigU32(cfg_obj, "make_ngram_vocab_size_divisible_by")) |v| config.ngram_vocab_divisor = v;
+    if (try qwen4ConfigU64(cfg_obj, "seed")) |v| config.ngram_seed = v;
+    if (try qwen4ConfigU32(cfg_obj, "indexer_n_heads")) |v| config.indexer_n_heads = v;
+    if (try qwen4ConfigU32(cfg_obj, "indexer_head_dim")) |v| config.indexer_head_dim = v;
+    if (try qwen4ConfigU32(cfg_obj, "indexer_budget")) |v| config.indexer_budget = v;
+    if (try qwen4ConfigU32(cfg_obj, "indexer_compress_ratio")) |v| config.indexer_compress_ratio = v;
+    if (cfg_obj.get("eos_token_id")) |v| {
+        switch (v) {
+            .integer => config.ngram_eos = try cfgInt(u32, v),
+            .array => |arr| if (arr.items.len > 0 and arr.items[0] == .integer) {
+                config.ngram_eos = try cfgInt(u32, arr.items[0]);
+            },
+            else => {},
+        }
+        if (config.num_eos_tokens == 0) config.addEosToken(config.ngram_eos);
+    }
+    if (cfgField(root, "trunk_quant")) |block| {
+        const spec = sushi_exl3.parseQuantBlock(block) catch return error.InvalidQwen4ConfigField;
+        if (!spec.codebook.hasTable()) return error.InvalidQwen4ConfigField;
+        config.trunk_quant = .{ .codebook = spec.codebook, .window = spec.window, .table = spec.table };
+    }
+    try validateQwen4Config(config);
+}
+
+/// The PLE table sits beside the shards; `SUSHI_NGRAM_BF16_DIR` serves it from the original bf16 checkpoint instead.
+pub fn parseDir(config: *ModelConfig, allocator: std.mem.Allocator, model_dir: []const u8) !void {
+    config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+    if (std.c.getenv("SUSHI_NGRAM_BF16_DIR")) |raw| {
+        const dir = std.mem.span(raw);
+        if (dir.len > 0) config.ngram_bf16_dir = try allocator.dupe(u8, dir);
+    }
+}
+
+/// Qwen's own recommendation for the family; never guess numbers another one didn't document.
+pub fn samplingDefaults(config: *ModelConfig) void {
+    if (config.gen_top_k == null) config.gen_top_k = 20;
+    if (config.gen_top_p == null) config.gen_top_p = 0.95;
 }
 
 /// Range-check every qwen4_exp bound the forward indexes a fixed array with or divides by.
@@ -291,11 +378,13 @@ pub fn qwen4SplitGateUp(value: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_arr
 }
 
 test "qwen4 convolution transform rejects a non-unit channel axis" {
+    try built();
     try std.testing.expectError(error.InvalidQwen4ConvShape, qwen4ConvShape(&.{ 4, 2, 8 }));
     try qwen4ConvShape(&.{ 4, 1, 8 });
 }
 
 test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048576" {
+    try built();
     const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
     try testing.expect(c.isQwen4());
     // The scaling is recognised and lands where the engine reads it —
@@ -332,6 +421,7 @@ test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048
 }
 
 test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connection, PLE, QSA and text-config eos fields" {
+    try built();
     const json =
         \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
         \\ "text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
@@ -369,6 +459,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
 }
 
 test "parseConfigFromJson accepts dense qwen4 as an expert streaming architecture" {
+    try built();
     const json =
         \\{"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"full_attention_interval":4,"num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"ple_layer_ids":[2],"ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}
     ;
@@ -378,6 +469,7 @@ test "parseConfigFromJson accepts dense qwen4 as an expert streaming architectur
 }
 
 test "expert streaming is a capability of every qwen4 pack and required only by the dense one" {
+    try built();
     const t = std.testing;
     const dense =
         \\{"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"full_attention_interval":4,"num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"ple_layer_ids":[2],"ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}
@@ -397,6 +489,7 @@ test "expert streaming is a capability of every qwen4 pack and required only by 
 }
 
 test "qwen4 streaming loader canonicalizes resident keys and excludes disk tensors" {
+    try built();
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("language_model.model.layers.7.mlp.gate.weight", qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.gate.weight").?);
     try std.testing.expectEqualStrings("language_model.mtp.fc_hidden.weight", qwen4StreamingWeightKey(.bf16_fused, &buf, "mtp.fc_hidden.weight").?);
@@ -407,6 +500,7 @@ test "qwen4 streaming loader canonicalizes resident keys and excludes disk tenso
 }
 
 test "the quantized streaming loader drops the nine routed banks and keeps everything else" {
+    try built();
     var buf: [256]u8 = undefined;
     for ([_][]const u8{ "weight", "scales", "biases" }) |part| {
         for ([_][]const u8{ "gate", "up", "down" }) |proj| {
@@ -430,6 +524,7 @@ test "the quantized streaming loader drops the nine routed banks and keeps every
 }
 
 test "qwen4 streaming loader materializes only transformed resident tensors" {
+    try built();
     const t = std.testing;
     const io = t.io;
     const allocator = t.allocator;
@@ -463,6 +558,7 @@ test "qwen4 streaming loader materializes only transformed resident tensors" {
 }
 
 test "qwen4 streaming resident byte estimate excludes experts PLE and vision" {
+    try built();
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{ .iterate = true });
@@ -483,6 +579,7 @@ test "qwen4 streaming resident byte estimate excludes experts PLE and vision" {
 }
 
 test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower, M-RoPE and vision token ids" {
+    try built();
     const json =
         \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
         \\ "image_token_id":248056,"video_token_id":248057,"vision_start_token_id":248053,"vision_end_token_id":248054,
@@ -517,6 +614,7 @@ test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower
 }
 
 test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched" {
+    try built();
     // The regression guard for every checkpoint that predates the extension:
     // no YaRN, and `contextCap` is just max_position_embeddings, so no server
     // sizing path can shift for a model that did not ask to be scaled.
@@ -536,6 +634,7 @@ test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched"
 }
 
 test "parseConfigFromJson: YaRN reads beta_fast/beta_slow/truncate and honours a pinned mscale" {
+    try built();
     defer setConfigOverrides(null);
     // HF's `attention_factor` REPLACES the computed 0.1·ln(factor)+1.
     setConfigOverrides(
@@ -582,6 +681,7 @@ test "parseConfigFromJson: YaRN reads beta_fast/beta_slow/truncate and honours a
 }
 
 test "parseConfigFromJson: YaRN derives factor from the window when the block omits it (HF)" {
+    try built();
     defer setConfigOverrides(null);
     // HF: `factor = max_position_embeddings / original_max_position_embeddings`
     // when the block names only the window. Here the override widens the
@@ -598,6 +698,7 @@ test "parseConfigFromJson: YaRN derives factor from the window when the block om
 }
 
 test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fails the load" {
+    try built();
     defer setConfigOverrides(null);
     // The ramp bounds come from `original_max_position_embeddings`. Without it
     // every blended frequency is a guess — refuse the load rather than serve a
@@ -621,6 +722,7 @@ test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fa
 }
 
 test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load error" {
+    try built();
     const good = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
     try testing.expectEqual(@as(u32, 3), good.ngram_size);
     try testing.expectEqual(@as(u32, 8), good.heads_per_ngram);
@@ -648,6 +750,7 @@ test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load er
 }
 
 test "qwen4_exp config: trunk_quant names the STQ codebook the stored trellis trunk decodes with" {
+    try built();
     const doc = qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"trunk_quant\":{\"format\":\"stq\",\"k\":6,\"codebook\":\"spec1\",\"window\":15," ++
         "\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"}");
     const c = try parseConfigFromJson(testing.allocator, doc);
@@ -666,6 +769,7 @@ test "qwen4_exp config: trunk_quant names the STQ codebook the stored trellis tr
 }
 
 test "n-gram head count overflow is refused by the config" {
+    try built();
     try expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":2147483656"),
@@ -673,6 +777,7 @@ test "n-gram head count overflow is refused by the config" {
 }
 
 test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a silent default" {
+    try built();
     try expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":-1"),
@@ -692,6 +797,7 @@ test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a si
 }
 
 test "qwen4_exp config: an armed QSA indexer must carry a usable budget and ratio" {
+    try built();
     try expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048"),
@@ -713,6 +819,7 @@ test "qwen4_exp config: an armed QSA indexer must carry a usable budget and rati
 }
 
 test "qwen4_exp config: the PLE layer id must name exactly one layer that exists" {
+    try built();
     try expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ngram_size\":3"),
@@ -742,6 +849,7 @@ test "qwen4_exp config: the PLE layer id must name exactly one layer that exists
 }
 
 test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the configured layer" {
+    try built();
     try testing.expect(qwen4PleInstalledAt(&.{ false, true, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ false, false, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ true, true, false, false }, 1));
@@ -758,6 +866,7 @@ test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the c
 }
 
 test "the n-gram table source: the bf16 override outranks streaming, streaming outranks the pack table" {
+    try built();
     var c = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "language_model.model" };
     try std.testing.expectEqual(ModelConfig.NgramTableSource.quantized, c.ngramTableSource());
     c.expert_streaming = true;
@@ -773,6 +882,7 @@ test "the n-gram table source: the bf16 override outranks streaming, streaming o
 }
 
 test "qwen4_exp config: a geometry the forward divides by or indexes with is a named error" {
+    try built();
     const t = testing;
     const base = "\"model_type\":\"qwen4_exp\",\"hidden_size\":2560,\"num_hidden_layers\":48,\"head_dim\":256," ++
         "\"hc_count\":4,\"hc_lowrank\":320,\"ple_embed_dim\":2560,\"moe_intermediate_size\":640," ++
@@ -788,6 +898,7 @@ test "qwen4_exp config: a geometry the forward divides by or indexes with is a n
 }
 
 test "qwen4PleInstalledAt accepts the MTP head's deliberate -1 and still refuses a stray PLE" {
+    try built();
     try testing.expect(qwen4PleInstalledAt(&.{false}, -1));
     try testing.expect(!qwen4PleInstalledAt(&.{true}, -1));
 }

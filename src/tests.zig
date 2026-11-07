@@ -234,4 +234,5 @@ test {
     _ = @import("arch/forward.zig");
     _ = @import("arch/request.zig");
     _ = @import("arch/admission.zig");
+    _ = @import("arch/config.zig");
 }

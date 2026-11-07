@@ -44,8 +44,8 @@ const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const effort_mod = @import("effort.zig");
 const qwen4_config = @import("qwen4/qwen4_config.zig");
-const mimo_config = @import("mimo2/mimo_config.zig");
-const glm5_config = @import("glm5/glm5_config.zig");
+const arch_config = @import("arch/config.zig");
+const registry = @import("arch/registry.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -100,6 +100,8 @@ pub const ServeDefaults = struct {
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "",
+    /// Set by the parse; a config built by hand resolves its arch from `model_type`.
+    arch: arch_config.ArchSpec = .{},
     weight_prefix: []const u8 = "language_model.model",
 
     // Core dimensions
@@ -603,7 +605,7 @@ pub const ModelConfig = struct {
     /// no in-kernel band reads absolute positions (the fused hd-256 kernel
     /// does, so an arch at that width never rings).
     pub fn swaRingTokens(self: *const ModelConfig) u64 {
-        if (!std.mem.eql(u8, self.model_type, "mimo_v2")) return 0;
+        if (!self.isMimo()) return 0;
         if (!self.has_sliding_window or self.sliding_window == 0) return 0;
         if (self.head_dim == 256) return 0;
         return @as(u64, self.sliding_window) + SWA_RING_SLACK;
@@ -801,11 +803,11 @@ pub const ModelConfig = struct {
     /// Qwen3.8-Flash-Next (`qwen4_exp`): a GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "qwen4_exp");
+        return arch_config.is(self, "qwen4");
     }
 
     pub fn isGlm5(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "glm5_next");
+        return arch_config.is(self, "glm5");
     }
 
     /// The MLX buffer pool a streamed load is allowed to hold, billed in its ssd-budget ledger; 0 keeps the RAM-wide cap.
@@ -819,7 +821,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn isDsv41(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "deepseek_v41");
+        return arch_config.is(self, "dsv41");
     }
 
     /// The context an auto boot serves when memory admits it, ahead of the margined memory ceiling; 0 = none.
@@ -892,7 +894,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn isMimo(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "mimo_v2");
+        return arch_config.is(self, "mimo2");
     }
 
     /// A MiMo checkpoint keeps its trunk in the source FP8 layout beside source
@@ -902,7 +904,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn usesMimoSourceTrunk(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "mimo_v2") and
+        return self.isMimo() and
             (self.expert_layout == .mxfp4_individual or self.expert_layout == .exl3_k4);
     }
 
@@ -1085,13 +1087,7 @@ pub const ModelConfig = struct {
         // The checkpoint's own declared default outranks the arch allowlist:
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
-        if (self.isGlm5() or self.isDsv41()) return true;
-        if (self.isQwen4()) return true;
-        // mimo_v2: the vendor template's own default is on (only an explicit
-        // `enable_thinking is false` closes the think block).
-        if (std.mem.eql(u8, self.model_type, "mimo_v2")) return true;
-
-        return false;
+        return (arch_config.facts(self) orelse return false).thinks_by_default;
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -1106,12 +1102,7 @@ pub const ModelConfig = struct {
     /// the neutral 1.0, and explicit request/flag/file values always win
     /// (this runs AFTER generation_config.json parse, nulls only).
     pub fn applyFamilySamplingDefaults(self: *ModelConfig) void {
-        const t = self.model_type;
-        // Qwen's own recommendation for the family; never guess numbers another one didn't document.
-        if (std.mem.eql(u8, t, "qwen4_exp")) {
-            if (self.gen_top_k == null) self.gen_top_k = 20;
-            if (self.gen_top_p == null) self.gen_top_p = 0.95;
-        }
+        arch_config.samplingDefaults(self);
     }
 
     pub fn isEosToken(self: *const ModelConfig, id: u32) bool {
@@ -1159,21 +1150,13 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     config.gdn_state_f32 = qwen_gdn_f32;
     config.drop_expert = drop_expert;
     config.ssd_prefetch = ssd_prefetch;
-    if (config.isQwen4()) {
-        config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
-        if (std.c.getenv("SUSHI_NGRAM_BF16_DIR")) |raw| {
-            const dir = std.mem.span(raw);
-            if (dir.len > 0) config.ngram_bf16_dir = try allocator.dupe(u8, dir);
-        }
-    }
+    try arch_config.parseDir(&config, allocator, model_dir);
     if (config.supportsExpertStreaming()) {
         const layers: u16 = std.math.cast(u16, config.num_hidden_layers) orelse return error.InvalidQwen4ConfigField;
         const first_moe: u16 = @intCast(config.first_k_dense_replace);
         if (expert_quant.layoutOfDirWithFirstMoe(allocator, io, config.model_type, model_dir, layers, first_moe)) |layout| {
             config.expert_layout = layout;
-            // The MiMo binder reads the source QKV itself; the generic
-            // fused-QKV names never apply to it.
-            if (config.usesMimoSourceTrunk()) config.attn_fused_qkv = false;
+            arch_config.adoptLayout(&config);
             if (layout == .mxfp4_individual) {
                 config.quant_mode = .mxfp4;
                 config.quant_bits = 4;
@@ -1192,7 +1175,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 config.expert_quant_rates = spec.rates;
                 config.expert_tile_order = spec.tile_order;
                 // Only the DeepSeek loader reads pair-major tiles; the index must name the order the config does.
-                if (spec.tile_order == .pair_major and !config.isDsv41()) return error.Exl3TileOrderUnsupported;
+                if (spec.tile_order == .pair_major and !(arch_config.facts(&config) orelse arch_config.Facts{}).reads_pair_major) return error.Exl3TileOrderUnsupported;
                 if (try expert_quant.tileOrderOfDir(allocator, io, model_dir) != spec.tile_order) return error.Exl3TileOrderMismatch;
                 var k_buf: [8]u8 = undefined;
                 log.info("[expert-exl3] engaged K={s} codebook={s} window={d}\n", .{ spec.rate.kText(&k_buf), @tagName(spec.codebook), spec.window.bits() });
@@ -1650,120 +1633,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (v == .integer and config.image_token_id == 0) config.image_token_id = try cfgInt(u32, v);
     }
 
-    // Set model-family defaults based on model_type
-    if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5_next_text")) {
-        try glm5_config.parseGlm5Fields(&config, cfg_obj);
-        if (root.get("sushi_pack")) |pack| {
-            if (pack == .object) if (pack.object.get("trunk_storage")) |storage| {
-                if (storage == .string) config.glm_fp8_trunk = std.mem.eql(u8, storage.string, "source-fp8-e4m3fn-block128");
-            };
-        }
-        if (root.get("quantization_config")) |q| if (q == .object) if (q.object.get("quant_method")) |method| {
-            if (method == .string and std.mem.eql(u8, method.string, "fp8")) {
-                const block = q.object.get("weight_block_size") orelse return error.UnsupportedGlmConfig;
-                if (block != .array or block.array.items.len != 2) return error.UnsupportedGlmConfig;
-                for (block.array.items) |side| if (side != .integer or side.integer != 128) return error.UnsupportedGlmConfig;
-                config.glm_fp8_trunk = true;
-            }
-        };
-        try glm5_config.parseGlm5VisionFields(&config, root);
-    } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
-        std.mem.eql(u8, model_type, "qwen4_exp_text"))
-    {
-        config.model_type = "qwen4_exp";
-        config.weight_prefix = "language_model.model";
-        config.norm_has_offset = false; // the converter folds every (1 + w) norm
-        config.has_final_norm = false; // hyper_connection_mixer replaces model.norm
-        config.scale_embeddings = false;
-        config.has_pre_ff_norm = false;
-        config.has_qk_norm = true;
-        config.hidden_act = .silu;
-        config.has_sliding_window = false;
-        config.attn_output_gate = true;
-        config.kda_sigmoid_out_gate = true; // output_gate_type "sigmoid"
-        config.rope_scaling_factor = 1.0;
-        config.rope_local_base_freq = config.rope_theta;
-        if (cfg_obj.get("query_pre_attn_scalar") == null) {
-            config.query_pre_attn_scalar = config.head_dim;
-        }
-        config.hc_count = 4;
-        config.hc_lowrank = 320;
-        config.ple_embed_dim = config.hidden_size;
-        try qwen4_config.parseQwenVisionFields(&config, root, cfg_obj);
-        // YaRN (262144 → e.g. 1048576) rides ONE rotary table for the whole
-        // trunk: attention, the QSA indexer and the MTP head all read it, so
-        // a scaled rotation cannot desync the block selector from attention.
-        try qwen4_config.parseYarnRopeParameters(&config, cfg_obj);
-        // Read strictly; range-checked in `validateQwen4Config` once every field is in.
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "hc_count")) |v| config.hc_count = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "hc_lowrank")) |v| config.hc_lowrank = v;
-        {
-            const v = cfg_obj.get("ple_layer_ids") orelse return error.InvalidQwen4PleLayer;
-            if (v != .array or v.array.items.len != 1 or v.array.items[0] != .integer) {
-                return error.InvalidQwen4PleLayer;
-            }
-            const id = v.array.items[0].integer;
-            if (id < 1 or id > @as(i64, config.num_hidden_layers)) return error.InvalidQwen4PleLayer;
-            config.ple_layer_idx = @intCast(id - 1);
-        }
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "ple_embed_dim")) |v| config.ple_embed_dim = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "ple_conv_kernel_size")) |v| config.ple_conv_kernel = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "ngram_size")) |v| config.ngram_size = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "heads_per_ngram")) |v| config.heads_per_ngram = v;
-        if (try qwen4_config.qwen4ConfigU64(cfg_obj, "ngram_vocab_size_base")) |v| config.ngram_vocab_base = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "make_ngram_vocab_size_divisible_by")) |v| config.ngram_vocab_divisor = v;
-        if (try qwen4_config.qwen4ConfigU64(cfg_obj, "seed")) |v| config.ngram_seed = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "indexer_n_heads")) |v| config.indexer_n_heads = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "indexer_head_dim")) |v| config.indexer_head_dim = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "indexer_budget")) |v| config.indexer_budget = v;
-        if (try qwen4_config.qwen4ConfigU32(cfg_obj, "indexer_compress_ratio")) |v| config.indexer_compress_ratio = v;
-        if (cfg_obj.get("eos_token_id")) |v| {
-            switch (v) {
-                .integer => config.ngram_eos = try cfgInt(u32, v),
-                .array => |arr| if (arr.items.len > 0 and arr.items[0] == .integer) {
-                    config.ngram_eos = try cfgInt(u32, arr.items[0]);
-                },
-                else => {},
-            }
-            if (config.num_eos_tokens == 0) config.addEosToken(config.ngram_eos);
-        }
-        if (cfgField(root, "trunk_quant")) |block| {
-            const spec = sushi_exl3.parseQuantBlock(block) catch return error.InvalidQwen4ConfigField;
-            if (!spec.codebook.hasTable()) return error.InvalidQwen4ConfigField;
-            config.trunk_quant = .{ .codebook = spec.codebook, .window = spec.window, .table = spec.table };
-        }
-        try qwen4_config.validateQwen4Config(&config);
-    } else if (std.mem.eql(u8, model_type, "mimo_v2")) {
-        try mimo_config.parseMimoConfig(&config, cfg_obj);
-    } else if (std.mem.eql(u8, model_type, "deepseek_v41")) {
-        const c = try dsv41_config.parse(cfg_obj, root);
-        config.model_type = "deepseek_v41";
-        config.weight_prefix = "";
-        config.text_prompt_bos = config.bos_token_id;
-        config.hidden_act = .silu;
-        config.num_experts = c.experts;
-        config.num_experts_per_tok = c.top_k;
-        config.moe_intermediate_size = c.moe_inter;
-        config.first_k_dense_replace = 0;
-        config.rms_norm_eps = c.eps;
-        config.has_vision = c.vision != null;
-        if (c.vision) |v| {
-            // The shared ViT geometry the media bills read.
-            config.qv_depth = v.layers;
-            config.qv_hidden = v.hidden;
-            config.qv_heads = v.heads;
-            config.qv_head_dim = v.headDim();
-            config.qv_intermediate = v.inter;
-            config.qv_out_hidden = c.dim;
-            config.qv_patch = v.patch;
-            config.qv_merge = v.downsample;
-            config.qv_temporal_patch = 1;
-        }
-        config.dsv41 = c;
-        config.serve_defaults = @TypeOf(c).serveDefaults(ServeDefaults);
+    if (arch_config.ofConfigType(model_type)) |tag| {
+        try arch_config.parseFamily(&config, tag, root, cfg_obj);
     } else {
-        // Not served: the weight loader refuses it by name (`ArchitectureUnsupported`).
-        config.model_type = "unsupported";
+        // Not served: the weight loader refuses it by name (`ArchitectureUnsupported`). A type this build left out keeps its own name.
+        config.model_type = for (registry.registered_model_types) |t| {
+            if (std.mem.eql(u8, t, model_type)) break t;
+        } else "unsupported";
     }
 
     return config;
@@ -1928,7 +1804,7 @@ pub const ResidentSplit = struct { trunk: u64, mtp: u64, vision: u64 = 0, stq_he
 /// Resident Sushi EXL3 packs have a measured load envelope and exact component bills.
 pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
     return config.expert_layout == .exl3_k4 and !config.expert_streaming and
-        (std.mem.eql(u8, config.model_type, "qwen4_exp") or config.isMimo());
+        (config.isQwen4() or config.isMimo());
 }
 
 /// Flash-Next's resident tensor payloads, with the loader's vision filter and optional native head.
@@ -1940,26 +1816,7 @@ pub fn qwenResidentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_d
 /// What a streamed load keeps resident under `config.expert_layout`: everything but the routed banks,
 /// with the tower apart.
 pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig) !ResidentSplit {
-    if (config.isDsv41()) {
-        const source = @import("dsv41/dsv41_source.zig");
-        return .{
-            .trunk = try source.residentBytes(io, allocator, model_dir),
-            .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir) else 0,
-            .vision = if (config.has_vision) try source.visionBytes(io, allocator, model_dir, @import("vision_common.zig").vision_bf16) else 0,
-        };
-    }
-    if (config.isGlm5())
-        return @import("glm5/glm5_diagnostic.zig").streamedSplit(io, allocator, model_dir, config.num_hidden_layers);
-    if (config.usesMimoSourceTrunk()) {
-        var streamed = config.*;
-        streamed.expert_streaming = true;
-        const mimo_source = @import("mimo2/mimo_source.zig");
-        return .{
-            .trunk = try mimo_source.residentBytesWithConfig(io, allocator, model_dir, &streamed),
-            .mtp = 0,
-            .vision = try mimo_source.visionResidentBytes(io, allocator, model_dir),
-        };
-    }
+    if (try arch_config.streamedResidentSplit(io, allocator, model_dir, config)) |split| return split;
     return indexedResidentSplit(io, allocator, model_dir, config.expert_layout, true);
 }
 
@@ -2074,7 +1931,7 @@ pub fn mimoMtpResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir:
 
 /// The architectures this build serves. Every other `model_type` is refused
 /// by name at the loader, so the inherited forwards behind it are unreachable.
-pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41" };
+pub const served_model_types = registry.registered_model_types;
 
 /// The arm a request naming no effort takes when `--think` is not given: its family table's default word. A Qwen
 /// checkpoint that declares thinking off keeps no default word unless the file names one.
@@ -2149,8 +2006,8 @@ pub fn isServedArch(model_type: []const u8) bool {
 
 /// The arch gate, also run at the top of a server load so its refusal lands before the listener serves.
 pub fn archGate(config: *const ModelConfig) error{ArchitectureUnsupported}!void {
-    if (isServedArch(config.model_type)) return;
-    log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2, glm5_next, deepseek_v41 only)\n", .{config.model_type});
+    if (arch_config.tagOf(config) != null) return;
+    log.err("model_type \"{s}\" is not served by this build (" ++ arch_config.gate_text ++ " only)\n", .{config.model_type});
     return error.ArchitectureUnsupported;
 }
 
@@ -2184,7 +2041,7 @@ pub fn loadWeightsForConfig(
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    const mtp_off = std.mem.eql(u8, config.model_type, "qwen4_exp") and config.mtp_override == false;
+    const mtp_off = config.isQwen4() and config.mtp_override == false;
     return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null, mtp_off);
 }
 
@@ -3005,6 +2862,7 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
 }
 
 test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config" {
+    if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     // A community re-quant ships NO generation_config.json, so omitted-field
     // sampling resolution bottomed out at the hardcoded 1.0/1.0/off — full
     // untruncated tail sampling on a 4-bit MoE. A 16K-token turn degenerated
@@ -3026,6 +2884,7 @@ test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when t
 }
 
 test "applyFamilySamplingDefaults never overrides explicit generation_config values" {
+    if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     // The checkpoint's own generation_config.json (parsed before this runs)
     // always wins — the family fallback fills NULLS only.
     var config = ModelConfig{ .model_type = "qwen4_exp" };
@@ -3330,6 +3189,7 @@ test "parseVisionProcessorDefaultsFromJson rejects invalid values and ranges" {
 }
 
 test "parseConfig prefers processor_config and fills missing Qwen bounds from preprocessor_config" {
+    if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3685,6 +3545,7 @@ test "ModelConfig.contextCap: the rope-derived window binds what the server adve
 }
 
 test "parseConfigFromJson: --config-overrides deep-merges a nested block without clobbering siblings" {
+    if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     // The merge is what makes the flag usable for rope at all: `rope_parameters`
     // is written as a whole object, and a REPLACE would drop the
     // `partial_rotary_factor` / `mrope_section` keys beside it — silently
@@ -3717,6 +3578,7 @@ test "parseConfigFromJson: --config-overrides deep-merges a nested block without
 }
 
 test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creates new keys, rejects junk" {
+    if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     defer setConfigOverrides(null);
     // Scalars and arrays replace wholesale (vLLM's base case); an array nested
     // in an object that is otherwise merged still replaces the array it meets.
@@ -3969,6 +3831,7 @@ test "parseConfigFromJson: an optional field set to null keeps its default; slid
 }
 
 test "the shipped packs' configs parse to the geometry they serve (src/fixtures/model-configs)" {
+    if (registry.ofModelType("qwen4_exp") == null or registry.ofModelType("mimo_v2") == null) return error.SkipZigTest;
     // Cut from Qwen3.8-Flash-Next-Sushi-3bpw and MiMo-V2.6-Flash-Sushi-2.3bpw. MiMo's `expert_quant.k` 4 is the
     // widest rate a layer packs, the one the engine bills: its last MoE layer is K4, the rest K2.25.
     const t = testing;
@@ -4071,6 +3934,7 @@ test "--qwen-gdn takes 16 or 32 and nothing else" {
 }
 
 test "--qwen-gdn is what parseConfig reads, on a loaded config; the f32 state is the default; GLM keeps its own gate" {
+    if (registry.ofModelType("glm5_next") == null or registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -4454,6 +4318,7 @@ test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned b
 }
 
 test "a text prompt's BOS comes from the release config, whose bos_token_id sits outside text_config" {
+    if (registry.ofModelType("deepseek_v41") == null) return error.SkipZigTest;
     var config = try parseConfigFromJson(testing.allocator, dsv41_config.release_config);
     defer config.deinit(testing.allocator);
     try testing.expectEqual(@as(?u32, 0), config.text_prompt_bos);
@@ -4520,4 +4385,112 @@ test "effort table: the file's default word outranks the built-in one, --think o
     try testing.expectEqual(@as(i32, -1), defaultThinkBudget(&ds));
     try testing.expectEqualStrings("xhigh", defaultEffortWord(&qwen).?);
     try testing.expect(qwen.defaultEnableThinking());
+}
+
+fn pinValue(w: *std.Io.Writer, comptime T: type, v: T, d: ?T, name: []const u8) !void {
+    switch (@typeInfo(T)) {
+        .int, .bool => if (d == null or d.? != v) try w.print("{s}={}\n", .{ name, v }),
+        .float => {
+            const Bits = @Int(.unsigned, @bitSizeOf(T));
+            if (d == null or @as(Bits, @bitCast(d.?)) != @as(Bits, @bitCast(v)))
+                try w.print("{s}={d} bits=0x{x}\n", .{ name, v, @as(Bits, @bitCast(v)) });
+        },
+        .@"enum" => if (d == null or d.? != v) try w.print("{s}=.{s}\n", .{ name, @tagName(v) }),
+        .optional => if (v) |x| {
+            try pinValue(w, std.meta.Child(T), x, if (d) |dd| dd else null, name);
+        } else if (d == null or d.? != null) try w.print("{s}=null\n", .{name}),
+        .array => for (v, 0..) |e, i| {
+            var buf: [192]u8 = undefined;
+            const sub = try std.fmt.bufPrint(&buf, "{s}[{d}]", .{ name, i });
+            try pinValue(w, std.meta.Child(T), e, if (d) |dd| dd[i] else null, sub);
+        },
+        .pointer => {
+            const same = if (std.meta.Child(T) == u8) d != null and std.mem.eql(u8, d.?, v) else v.len == 0;
+            if (!same and std.meta.Child(T) == u8) try w.print("{s}=\"{s}\"\n", .{ name, v });
+            if (!same and std.meta.Child(T) != u8) try w.print("{s}={any}\n", .{ name, v });
+        },
+        .@"struct" => |info| inline for (info.field_names) |f| {
+            var buf: [192]u8 = undefined;
+            const sub = try std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ name, if (name.len > 0) "." else "", f });
+            if (comptime !std.mem.eql(u8, f, "arch"))
+                try pinValue(w, @FieldType(T, f), @field(v, f), if (d) |dd| @field(dd, f) else null, sub);
+        },
+        .@"union" => try w.print("{s}={any}\n", .{ name, v }),
+        else => @compileError("pinValue: " ++ @typeName(T)),
+    }
+}
+
+/// Every field of a parsed config that differs from `ModelConfig{}`, one `name=value` line each.
+fn pinConfig(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var config = try parseConfigFromJson(allocator, json);
+    defer config.deinit(allocator);
+    try pinValue(&out.writer, ModelConfig, config, ModelConfig{}, "");
+    return out.toOwnedSlice();
+}
+
+const mimo_config = @import("mimo2/mimo_config.zig");
+
+const PinCase = struct { name: []const u8, arch_type: []const u8, json: []const u8, swap: ?[2][]const u8 = null };
+
+const config_pin_corpus = [_]PinCase{
+    .{ .name = "model-configs/qwen4_exp.json", .arch_type = "qwen4_exp", .json = @embedFile("fixtures/model-configs/qwen4_exp.json") },
+    .{ .name = "model-configs/mimo_v2.json", .arch_type = "mimo_v2", .json = @embedFile("fixtures/model-configs/mimo_v2.json") },
+    .{ .name = "glm5_config.json", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json") },
+    .{ .name = "dsv41 release", .arch_type = "deepseek_v41", .json = dsv41_config.release_config },
+    .{ .name = "qwen4 shipped", .arch_type = "qwen4_exp", .json = QWEN4_SHIPPED },
+    .{ .name = "qwen4 yarn", .arch_type = "qwen4_exp", .json = QWEN4_YARN },
+    .{ .name = "mimo vision", .arch_type = "mimo_v2", .json = mimo_config.MIMO_V2_VISION_JSON },
+    .{ .name = "mimo bill", .arch_type = "mimo_v2", .json = mimo_config.MIMO_V2_BILL_JSON },
+    .{ .name = "glm5 text alias", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json"), .swap = .{ "\n  \"model_type\": \"glm5_next\"", "\n  \"model_type\": \"glm5_next_text\"" } },
+    .{ .name = "glm5 raw fp8", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json"), .swap = .{ "{\n  \"architectures\"", "{\"quantization_config\":{\"quant_method\":\"fp8\",\"weight_block_size\":[128,128]},\n  \"architectures\"" } },
+    .{ .name = "qwen4 text alias", .arch_type = "qwen4_exp", .json = QWEN4_SHIPPED, .swap = .{ "  \"model_type\": \"qwen4_exp\",\n  \"text_config\"", "  \"model_type\": \"qwen4_exp_text\",\n  \"text_config\"" } },
+    .{ .name = "qwen4 trunk_quant", .arch_type = "qwen4_exp", .json = qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"trunk_quant\":{\"format\":\"stq\",\"k\":6,\"codebook\":\"spec1\",\"window\":15,\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"}") },
+    .{ .name = "unserved", .arch_type = "", .json = "{\"model_type\":\"mistral\",\"hidden_size\":64,\"vocab_size\":32}" },
+};
+
+/// A case's section of the pin file; null when its arch is left out of this build.
+fn pinSection(allocator: std.mem.Allocator, c: PinCase) !?[]u8 {
+    if (c.arch_type.len > 0 and registry.ofModelType(c.arch_type) == null) return null;
+    const json = if (c.swap) |s| try std.mem.replaceOwned(u8, allocator, c.json, s[0], s[1]) else try allocator.dupe(u8, c.json);
+    defer allocator.free(json);
+    if (c.swap != null) try testing.expect(!std.mem.eql(u8, json, c.json));
+    const dump = try pinConfig(allocator, json);
+    defer allocator.free(dump);
+    return try std.fmt.allocPrint(allocator, "== {s}\n{s}", .{ c.name, dump });
+}
+
+test "config pins: every committed config parses to the field values it had before the parse left model.zig" {
+    const pins = @embedFile("fixtures/model-configs/parsed.pins");
+    for (config_pin_corpus) |c| {
+        const section = try pinSection(testing.allocator, c) orelse continue;
+        defer testing.allocator.free(section);
+        const at = std.mem.indexOf(u8, pins, section) orelse return error.PinMismatch;
+        const end = at + section.len;
+        try testing.expect((at == 0 or pins[at - 1] == '\n') and (end == pins.len or std.mem.startsWith(u8, pins[end..], "== ")));
+    }
+}
+
+test "a GLM raw FP8 config with another block size is refused by name" {
+    if (registry.ofModelType("glm5_next") == null) return;
+    const bad = try std.mem.replaceOwned(u8, testing.allocator, @embedFile("fixtures/glm5_config.json"), "{\n  \"architectures\"", "{\"quantization_config\":{\"quant_method\":\"fp8\",\"weight_block_size\":[64,64]},\n  \"architectures\"");
+    defer testing.allocator.free(bad);
+    try expectError(error.UnsupportedGlmConfig, parseConfigFromJson(testing.allocator, bad));
+}
+
+test "a parsed config carries its arch tag; a hand-built one resolves it from model_type; an unserved one has none" {
+    for (config_pin_corpus) |c| {
+        var config = try parseConfigFromJson(testing.allocator, c.json);
+        defer config.deinit(testing.allocator);
+        try testing.expectEqual(registry.ofModelType(config.model_type), config.arch.tag);
+    }
+    const glm = ModelConfig{ .model_type = "glm5_next" };
+    try testing.expectEqual(registry.ofModelType("glm5_next") != null, glm.isGlm5());
+    try testing.expect(!glm.isQwen4() and !glm.isDsv41() and !glm.isMimo());
+    var parsed = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqual(registry.ofModelType("qwen4_exp") != null, parsed.isQwen4());
+    try testing.expect(!parsed.isGlm5());
+    try testing.expect(!(ModelConfig{ .model_type = "mistral" }).isQwen4());
 }

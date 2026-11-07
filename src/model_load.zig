@@ -1656,6 +1656,7 @@ test "the drafter is billed at its quantized resident bytes and its load transie
 }
 
 test "a cold load reads the serving bill on the config the load stamps with the drafter's request terms" {
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     const io = std.testing.io;
     const a = std.testing.allocator;
     const gib: u64 = 1 << 30;

@@ -97,6 +97,24 @@ pub const served_model_types: []const []const u8 = blk: {
     break :blk out;
 };
 
+/// Every registered arch's model types, enabled or not, in the order the arch gate's refusal lists them (`gate_rank`).
+pub const registered_model_types: []const []const u8 = blk: {
+    var order: [entries.len]Entry = entries;
+    for (1..order.len) |i| {
+        var j = i;
+        while (j > 0 and order[j].mod.gate_rank < order[j - 1].mod.gate_rank) : (j -= 1) {
+            const t = order[j];
+            order[j] = order[j - 1];
+            order[j - 1] = t;
+        }
+    }
+    var out: []const []const u8 = &.{};
+    for (order) |e| for (e.mod.model_types) |t| {
+        out = out ++ &[_][]const u8{t};
+    };
+    break :blk out;
+};
+
 test "every enabled arch's own tests are part of the build" {
     inline for (enabled) |e| _ = e.mod;
 }

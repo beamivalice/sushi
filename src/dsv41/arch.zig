@@ -23,7 +23,22 @@ pub const prefix = @import("dsv41_prefix.zig"); // slot:prefix (S2c)
 
 // slot:bill (S2d)
 
-// slot:config (S2e)
+const config_file = @import("dsv41_config.zig");
+const arch_config = @import("../arch/config.zig");
+pub const config_types = model_types;
+pub const discovery_types = model_types;
+pub const gate_rank = 3;
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .reads_pair_major = true };
+pub const parseConfig = config_file.parseFamily;
+
+pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {
+    const source = @import("dsv41_source.zig");
+    return .{
+        .trunk = try source.residentBytes(io, allocator, model_dir),
+        .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir) else 0,
+        .vision = if (config.has_vision) try source.visionBytes(io, allocator, model_dir, @import("../vision_common.zig").vision_bf16) else 0,
+    };
+}
 
 // slot:media (S2f)
 

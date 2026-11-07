@@ -25,7 +25,15 @@ pub const prefix = @import("qwen4_prefix.zig"); // slot:prefix (S2c)
 
 // slot:bill (S2d)
 
-// slot:config (S2e)
+const config_file = @import("qwen4_config.zig");
+const arch_config = @import("../arch/config.zig");
+pub const config_types = [_][]const u8{ "qwen4_exp", "qwen4_exp_text" };
+pub const discovery_types = config_types;
+pub const gate_rank = 0;
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true };
+pub const parseConfig = config_file.parseFamily;
+pub const parseDir = config_file.parseDir;
+pub const samplingDefaults = config_file.samplingDefaults;
 
 // slot:media (S2f)
 

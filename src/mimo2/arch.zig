@@ -25,7 +25,36 @@ pub const prefix = @import("mimo2_prefix.zig"); // slot:prefix (S2c)
 
 // slot:bill (S2d)
 
-// slot:config (S2e)
+const config_file = @import("mimo_config.zig");
+const arch_config = @import("../arch/config.zig");
+pub const config_types = model_types;
+pub const discovery_types = model_types;
+pub const gate_rank = 1;
+pub const config_facts: arch_config.Facts = .{
+    // The vendor template's own default is on: only an explicit `enable_thinking is false` closes the think block.
+    .thinks_by_default = true,
+    .stub_first_moe = 1,
+    .dense_prefix_in_layer_freq = true,
+    .serves_video = false,
+};
+pub const parseConfig = config_file.parseFamily;
+
+pub fn adoptLayout(config: *Config) void {
+    // The MiMo binder reads the source QKV itself; the generic fused-QKV names never apply to it.
+    if (config.usesMimoSourceTrunk()) config.attn_fused_qkv = false;
+}
+
+pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {
+    if (!config.usesMimoSourceTrunk()) return null;
+    var streamed = config.*;
+    streamed.expert_streaming = true;
+    const source = @import("mimo_source.zig");
+    return .{
+        .trunk = try source.residentBytesWithConfig(io, allocator, model_dir, &streamed),
+        .mtp = 0,
+        .vision = try source.visionResidentBytes(io, allocator, model_dir),
+    };
+}
 
 // slot:media (S2f)
 

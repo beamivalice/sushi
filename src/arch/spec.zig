@@ -2,11 +2,12 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const registry = @import("registry.zig");
+const arch_config = @import("config.zig");
 pub const Spec = registry.Spec;
 
 /// The arch that claims the config's `model_type`; null when no enabled arch does.
 pub fn of(config: *const model.ModelConfig) ?Spec {
-    const tag = registry.ofModelType(config.model_type) orelse return null;
+    const tag = arch_config.tagOf(config) orelse return null;
     return switch (tag) {
         inline else => |t| @unionInit(Spec, @tagName(t), config),
     };

@@ -399,6 +399,7 @@ fn runOpts() repack.Options {
 }
 
 test "repack: a legacy pack becomes pair-major: permuted per expert on 16 KiB pages, pads zero, the rest verbatim, index and config renamed" {
+    if (@import("../arch/registry.zig").ofModelType("deepseek_v41") == null) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

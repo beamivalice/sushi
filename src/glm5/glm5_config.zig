@@ -9,6 +9,11 @@ const parseConfigFromJson = model_mod.parseConfigFromJson;
 const parseVisionProcessorDefaultsFromJson = model_mod.parseVisionProcessorDefaultsFromJson;
 const testing = std.testing;
 
+/// A test that parses this arch's config needs the arch built (`-Darchs`).
+fn built() !void {
+    if (@import("../arch/registry.zig").ofModelType("glm5_next") == null) return error.SkipZigTest;
+}
+
 fn glmU32(obj: std.json.ObjectMap, key: []const u8) !u32 {
     const value = try cfgInt(u32, obj.get(key) orelse return error.InvalidGlmConfig);
     if (value > std.math.maxInt(c_int)) return error.UnsupportedGlmConfig;
@@ -85,6 +90,25 @@ pub fn parseGlm5VisionFields(c: *ModelConfig, root: std.json.ObjectMap) !void {
     for ([_]u32{ c.image_token_id, c.video_token_id, c.vision_start_token_id, c.vision_end_token_id }) |id| if (id >= c.vocab_size) return error.InvalidGlmVisionConfig;
     c.glm5_vision = true;
     c.has_vision = true;
+}
+
+/// The GLM part of the parse: the text geometry, how the trunk is stored, and the optional vision tower.
+pub fn parseFamily(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
+    try parseGlm5Fields(config, cfg_obj);
+    if (root.get("sushi_pack")) |pack| {
+        if (pack == .object) if (pack.object.get("trunk_storage")) |storage| {
+            if (storage == .string) config.glm_fp8_trunk = std.mem.eql(u8, storage.string, "source-fp8-e4m3fn-block128");
+        };
+    }
+    if (root.get("quantization_config")) |q| if (q == .object) if (q.object.get("quant_method")) |method| {
+        if (method == .string and std.mem.eql(u8, method.string, "fp8")) {
+            const block = q.object.get("weight_block_size") orelse return error.UnsupportedGlmConfig;
+            if (block != .array or block.array.items.len != 2) return error.UnsupportedGlmConfig;
+            for (block.array.items) |side| if (side != .integer or side.integer != 128) return error.UnsupportedGlmConfig;
+            config.glm_fp8_trunk = true;
+        }
+    };
+    try parseGlm5VisionFields(config, root);
 }
 
 pub fn parseGlm5Fields(c: *ModelConfig, obj: std.json.ObjectMap) !void {
@@ -215,6 +239,7 @@ pub fn parseGlm5Fields(c: *ModelConfig, obj: std.json.ObjectMap) !void {
 }
 
 test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assumptions" {
+    try built();
     const c = try parseConfigFromJson(testing.allocator, @embedFile("../fixtures/glm5_config.json"));
     try testing.expect(c.isGlm5());
     try testing.expect(c.has_vision and c.glm5_vision);
@@ -242,6 +267,7 @@ test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assum
 }
 
 test "GLM stops at the assistant opener the pack emits after its answer" {
+    try built();
     var c = try parseConfigFromJson(testing.allocator, @embedFile("../fixtures/glm5_config.json"));
     const user: u32 = 154827;
     const assistant: u32 = 154828;
@@ -257,6 +283,7 @@ test "GLM stops at the assistant opener the pack emits after its answer" {
 }
 
 test "GLM config refuses unsupported semantics and invalid geometry" {
+    try built();
     const source = @embedFile("../fixtures/glm5_config.json");
     const cases = [_][2][]const u8{
         .{ "\"mhc\": true", "\"mhc\": false" },
@@ -295,6 +322,7 @@ test "GLM config refuses unsupported semantics and invalid geometry" {
 }
 
 test "GLM config preserves optional shared expert counts" {
+    try built();
     for ([_]u32{ 0, 2 }) |count| {
         const replacement = try std.fmt.allocPrint(testing.allocator, "\"n_shared_experts\": {d}", .{count});
         defer testing.allocator.free(replacement);
@@ -306,6 +334,7 @@ test "GLM config preserves optional shared expert counts" {
 }
 
 test "GLM vision config rejects unsupported tower geometry and accepts a text-only checkpoint" {
+    try built();
     const a = testing.allocator;
     const source = @embedFile("../fixtures/glm5_config.json");
     const parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{});
@@ -333,6 +362,7 @@ test "GLM vision config rejects unsupported tower geometry and accepts a text-on
 }
 
 test "GLM raw FP8 config identifies source storage without changing native KV" {
+    try built();
     const source = @embedFile("../fixtures/glm5_config.json");
     const raw = try std.fmt.allocPrint(std.testing.allocator, "{{\"sushi_pack\":{{\"trunk_storage\":\"source-fp8-e4m3fn-block128\"}},{s}", .{source[1..]});
     defer std.testing.allocator.free(raw);

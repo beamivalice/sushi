@@ -37,6 +37,12 @@ joins `DROPPABLE` when its drop passes.
   `registry.ofModelType` returns no tag for a `model_type` no enabled arch claims.
 - `src/arch_host.zig` lists the engine services an arch's model files may reach; `src/arch_host_stub.zig` declares the
   same names for a host that carries less, and a test keeps the two name lists equal.
+- The config side lives in `src/arch/config.zig`. The parse stores the arch tag in `ModelConfig.arch`, and `isQwen4`,
+  `isGlm5`, `isDsv41` and `isMimo` read it (a config built by hand falls back to `model_type`). An arch declares
+  `config_types` (what its parse reads, text twins included), `discovery_types`, `gate_rank` (its place in the arch gate's
+  refusal text), `config_facts` and `parseConfig`, and may declare `parseDir`, `adoptLayout`, `samplingDefaults` and
+  `streamedResidentSplit`. `model.served_model_types` lists every registered type, enabled or not
+  (`registry.registered_model_types`); a test of one arch skips when `registry.ofModelType` says the build left it out. Shared parse code calls those, never a type name.
 - A shared file only one arch uses moves into that arch's folder. A shared file a shared engine path also reaches stays
   shared and is named by capability.
 

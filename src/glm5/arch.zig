@@ -23,7 +23,17 @@ pub const prefix = @import("glm5_prefix.zig"); // slot:prefix (S2c)
 
 // slot:bill (S2d)
 
-// slot:config (S2e)
+const config_file = @import("glm5_config.zig");
+const arch_config = @import("../arch/config.zig");
+pub const config_types = [_][]const u8{ "glm5_next", "glm5_next_text" };
+pub const discovery_types = model_types;
+pub const gate_rank = 2;
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true };
+pub const parseConfig = config_file.parseFamily;
+
+pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {
+    return try @import("glm5_diagnostic.zig").streamedSplit(io, allocator, model_dir, config.num_hidden_layers);
+}
 
 // slot:media (S2f)
 

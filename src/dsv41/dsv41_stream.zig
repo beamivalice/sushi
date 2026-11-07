@@ -3068,6 +3068,7 @@ test "dsv41 pair-major: a pack-order pool cannot take pair-major tiles, and a un
 }
 
 test "dsv41 pair-major: a pack whose order the config, the index, the shapes or the shard stamps disagree on is refused by name before a weight loads (DSV41_STQ_TINY)" {
+    if (@import("../arch/registry.zig").ofModelType("deepseek_v41") == null) return error.SkipZigTest;
     const dir = try stqDir();
     const io = std.Io.Threaded.global_single_threaded.io();
     const model_mod = @import("../model.zig");

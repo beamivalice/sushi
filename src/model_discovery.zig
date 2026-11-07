@@ -21,24 +21,16 @@ const mtp = @import("mtp.zig");
 const expert_stream = @import("expert_stream.zig");
 const expert_quant = @import("expert_quant.zig");
 const sushi_exl3 = @import("sushi_exl3");
+const arch_config = @import("arch/config.zig");
 
-/// Architecture allow-list for discovery: the four served archs. Discovery
-/// silently skips any subdirectory whose `config.json` declares another
-/// `model_type`, so `--model-dir` never picks up a partially-downloaded or
-/// unsupported checkpoint that would crash the tokenizer load.
-const supported_model_types = [_][]const u8{
-    "qwen4_exp", // Qwen3.8-Flash-Next
-    "qwen4_exp_text",
-    "mimo_v2", // MiMo-V2.6-Flash: resident EXL3 packs (text + image), or the original checkpoint streamed.
-    "glm5_next", // GLM-5.3-Flash
-    "deepseek_v41", // DeepSeek-V4.1-Flash: the original checkpoint, experts streamed.
-};
-
+/// Discovery silently skips any subdirectory whose `config.json` declares a `model_type` no served arch lists, so
+/// `--model-dir` never picks up a partially-downloaded or unsupported checkpoint that would crash the tokenizer load.
 fn isSupportedModelType(model_type: []const u8) bool {
-    for (supported_model_types) |t| {
-        if (std.mem.eql(u8, model_type, t)) return true;
-    }
-    return false;
+    return arch_config.discovers(model_type);
+}
+
+fn factsOf(model_type: []const u8) arch_config.Facts {
+    return arch_config.factsOfType(model_type) orelse .{};
 }
 
 /// Quantization modes the MLX loader supports. Must stay in sync with
@@ -162,8 +154,7 @@ pub fn freeShardSet(set: *std.StringHashMapUnmanaged(void)) void {
 /// neither. A dense (fused) index must also name every PLE shard; the quantized
 /// pack keeps its PLE table in `ngram_table.bin` and has none.
 pub fn streamingIndexLayout(allocator: std.mem.Allocator, model_type: []const u8, raw: []const u8, layers: u16, ple_shards: u16) ?expert_quant.Layout {
-    const first_moe: u16 = if (std.mem.eql(u8, model_type, "mimo_v2")) 1 else 0;
-    return streamingIndexLayoutWithFirstMoe(allocator, model_type, raw, layers, first_moe, ple_shards);
+    return streamingIndexLayoutWithFirstMoe(allocator, model_type, raw, layers, factsOf(model_type).stub_first_moe, ple_shards);
 }
 
 fn streamingIndexLayoutWithFirstMoe(allocator: std.mem.Allocator, model_type: []const u8, raw: []const u8, layers: u16, first_moe: u16, ple_shards: u16) ?expert_quant.Layout {
@@ -808,7 +799,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
         @memcpy(meta.model_type_buf[0..mt.len], mt);
         meta.model_type_len = @intCast(mt.len);
     }
-    if (std.mem.eql(u8, mt, "mimo_v2")) {
+    if (factsOf(mt).dense_prefix_in_layer_freq) {
         const cfg = text_cfg orelse root;
         const freq = cfg.get("moe_layer_freq") orelse return .{};
         meta.first_moe_layer = denseMoePrefix(freq, meta.num_hidden_layers) catch return .{};
@@ -816,9 +807,8 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
-    // MiMo serves images only; its video pads are not wired.
-    meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0 and
-        !std.mem.eql(u8, mt, "mimo_v2");
+    // An arch that wires no video serves images only.
+    meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0 and factsOf(mt).serves_video;
     meta.has_chat = has_chat_template;
     return meta;
 }
@@ -1229,7 +1219,9 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
 }
 
 test "every served arch classifies as chat, so `sushi run` accepts it" {
-    for (@import("model.zig").served_model_types) |t| try testing.expectEqual(ModelKind.chat, modelKindFromType(t));
+    for (@import("model.zig").served_model_types) |t| {
+        if (arch_config.discovers(t)) try testing.expectEqual(ModelKind.chat, modelKindFromType(t));
+    }
 }
 
 test "classifyModelPath: drafter dirs classify; junk is null" {
@@ -1343,9 +1335,12 @@ test "lessThanById sorts ascending" {
 }
 
 test "the supported model_type list is the served four" {
-    for (@import("model.zig").served_model_types) |t| try testing.expect(isSupportedModelType(t));
-    try testing.expect(isSupportedModelType("qwen4_exp_text"));
-    try testing.expectEqual(@as(usize, 5), supported_model_types.len);
+    for (@import("model.zig").served_model_types) |t| {
+        try testing.expectEqual(@import("arch/registry.zig").ofModelType(t) != null, isSupportedModelType(t));
+    }
+    try testing.expectEqual(@import("arch/registry.zig").ofModelType("qwen4_exp") != null, isSupportedModelType("qwen4_exp_text"));
+    // The config parse reads `glm5_next_text`; discovery has never listed it.
+    try testing.expect(!isSupportedModelType("glm5_next_text"));
     for ([_][]const u8{ "qwen3", "qwen3_moe", "qwen3_5_moe", "gemma3_text", "gemma4", "llama", "lfm2", "lfm2_vl", "bert", "totally_made_up_arch" }) |t| {
         try testing.expect(!isSupportedModelType(t));
     }
@@ -1568,7 +1563,7 @@ pub fn writePackStub(io: std.Io, dir: std.Io.Dir, sub: []const u8) !void {
     try dir.createDirPath(io, sub);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{sub});
     defer std.testing.allocator.free(path);
-    const body = try std.fmt.allocPrint(std.testing.allocator, "{{\"model_type\":\"{s}\"}}", .{supported_model_types[0]});
+    const body = try std.fmt.allocPrint(std.testing.allocator, "{{\"model_type\":\"{s}\"}}", .{@import("arch/registry.zig").served_model_types[0]});
     defer std.testing.allocator.free(body);
     try dir.writeFile(io, .{ .sub_path = path, .data = body });
 }
@@ -1596,4 +1591,21 @@ test "discovery below a root skips test-fixtures and dot folders at every depth,
     defer named.deinit();
     try std.testing.expectEqual(@as(usize, 1), named.models.len);
     try std.testing.expectEqualStrings("x", named.models[0].id);
+}
+
+test "a stub states what its arch wires: the dense prefix from moe_layer_freq, the first routed layer, video" {
+    const built = @import("arch/registry.zig").ofModelType;
+    if (built("mimo_v2") != null) {
+        const mimo = parseStubMeta(testing.allocator, "{\"model_type\":\"mimo_v2\",\"num_hidden_layers\":3,\"moe_layer_freq\":[0,0,1],\"vision_config\":{},\"video_token_id\":9}", true);
+        try testing.expectEqual(@as(u32, 2), mimo.first_moe_layer);
+        try testing.expect(mimo.has_vision and !mimo.has_video);
+        try testing.expectEqual(@as(u16, 1), factsOf("mimo_v2").stub_first_moe);
+    }
+    if (built("qwen4_exp") != null) {
+        const qwen = parseStubMeta(testing.allocator, "{\"model_type\":\"qwen4_exp\",\"num_hidden_layers\":3,\"moe_layer_freq\":[0,0,1],\"vision_config\":{},\"video_token_id\":9}", true);
+        try testing.expectEqual(@as(u32, 0), qwen.first_moe_layer);
+        try testing.expect(qwen.has_vision and qwen.has_video);
+        try testing.expectEqual(@as(u16, 0), factsOf("qwen4_exp").stub_first_moe);
+    }
+    try testing.expectEqual(@as(u16, 0), factsOf("not_an_arch").stub_first_moe);
 }

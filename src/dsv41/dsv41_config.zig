@@ -354,6 +354,35 @@ fn parseVision(obj: std.json.ObjectMap) !Vision {
     return v;
 }
 
+/// The DeepSeek part of the parse, onto the shared `ModelConfig` (taken as `anytype`: this file stays free of `model.zig`).
+pub fn parseFamily(config: anytype, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
+    const c = try parse(cfg_obj, root);
+    config.model_type = "deepseek_v41";
+    config.weight_prefix = "";
+    config.text_prompt_bos = config.bos_token_id;
+    config.hidden_act = .silu;
+    config.num_experts = c.experts;
+    config.num_experts_per_tok = c.top_k;
+    config.moe_intermediate_size = c.moe_inter;
+    config.first_k_dense_replace = 0;
+    config.rms_norm_eps = c.eps;
+    config.has_vision = c.vision != null;
+    if (c.vision) |v| {
+        // The shared ViT geometry the media bills read.
+        config.qv_depth = v.layers;
+        config.qv_hidden = v.hidden;
+        config.qv_heads = v.heads;
+        config.qv_head_dim = v.headDim();
+        config.qv_intermediate = v.inter;
+        config.qv_out_hidden = c.dim;
+        config.qv_patch = v.patch;
+        config.qv_merge = v.downsample;
+        config.qv_temporal_patch = 1;
+    }
+    config.dsv41 = c;
+    config.serve_defaults = Config.serveDefaults(@TypeOf(config.serve_defaults));
+}
+
 /// `text` is `text_config` (or the root of a flat config), `root` the file's top level.
 pub fn parse(text: std.json.ObjectMap, root: std.json.ObjectMap) !Config {
     var c: Config = .{};

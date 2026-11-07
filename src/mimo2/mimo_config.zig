@@ -16,6 +16,11 @@ const parseConfigFromJson = model_mod.parseConfigFromJson;
 const streamingResidentSplit = model_mod.streamingResidentSplit;
 const testing = std.testing;
 
+/// A test that parses this arch's config needs the arch built (`-Darchs`).
+fn built() !void {
+    if (@import("../arch/registry.zig").ofModelType("mimo_v2") == null) return error.SkipZigTest;
+}
+
 fn mimoUint(obj: std.json.ObjectMap, key: []const u8, fallback: u32) !u32 {
     const v = obj.get(key) orelse return fallback;
     if (v != .integer or v.integer < 0 or v.integer > std.math.maxInt(u32))
@@ -92,6 +97,11 @@ fn parseMimoVision(c: *ModelConfig, obj: std.json.ObjectMap) !void {
         c.qv_max_pixels = try mimoUint(pc.object, "image_max_pixels", 0);
     }
     c.mimo_vision = true;
+}
+
+pub fn parseFamily(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
+    _ = root;
+    try parseMimoConfig(config, cfg_obj);
 }
 
 pub fn parseMimoConfig(c: *ModelConfig, obj: std.json.ObjectMap) !void {
@@ -194,7 +204,7 @@ pub fn parseMimoConfig(c: *ModelConfig, obj: std.json.ObjectMap) !void {
     if (obj.get("trunk_quant") != null) return error.UnsupportedMimoV2Config;
 }
 
-const MIMO_V2_VISION_JSON =
+pub const MIMO_V2_VISION_JSON =
     \\{
     \\  "model_type": "mimo_v2", "hidden_size": 384, "vocab_size": 128,
     \\  "num_hidden_layers": 2, "intermediate_size": 1536,
@@ -218,7 +228,7 @@ const MIMO_V2_VISION_JSON =
 
 /// The mimo_v2 geometry of "ModelConfig parses mimo_v2 hybrid geometry", kept
 /// beside the bill assertions so the expected bytes read against one spelling.
-const MIMO_V2_BILL_JSON =
+pub const MIMO_V2_BILL_JSON =
     \\{
     \\  "model_type": "mimo_v2", "hidden_size": 384, "vocab_size": 128,
     \\  "num_hidden_layers": 4, "intermediate_size": 1536,
@@ -242,11 +252,13 @@ const MIMO_V2_BILL_JSON =
 ;
 
 test "defaultEnableThinking: mimo_v2 thinks by default, with and without tools" {
+    try built();
     const mimo = ModelConfig{ .model_type = "mimo_v2" };
     try testing.expect(mimo.defaultEnableThinking());
 }
 
 test "ModelConfig parses mimo_v2 hybrid geometry and sigmoid routing" {
+    try built();
     const json =
         \\{
         \\  "model_type": "mimo_v2", "hidden_size": 384, "vocab_size": 128,
@@ -300,6 +312,7 @@ test "ModelConfig parses mimo_v2 hybrid geometry and sigmoid routing" {
 }
 
 test "mimo_v2 config reads the MiMo-ViT geometry and the processor's own pixel bounds" {
+    try built();
     const c = try parseConfigFromJson(testing.allocator, MIMO_V2_VISION_JSON);
     try testing.expect(c.has_vision and c.mimo_vision and !c.qwen_vision);
     try testing.expectEqual(@as(u32, 4), c.qv_depth);
@@ -326,6 +339,7 @@ test "mimo_v2 config reads the MiMo-ViT geometry and the processor's own pixel b
 }
 
 test "mimo_v2 config refuses a MiMo-ViT whose block tables disagree with its depth" {
+    try built();
     const cases = [_][]const u8{
         "\"fullatt_block_indexes\": [0, 4], \"vit_window_attn_types\": [-1, 0, 1, -1]",
         "\"fullatt_block_indexes\": [0, 3], \"vit_window_attn_types\": [-1, 0, 1]",
@@ -339,6 +353,7 @@ test "mimo_v2 config refuses a MiMo-ViT whose block tables disagree with its dep
 }
 
 test "mimo_v2 config rejects unsupported routing and malformed layer geometry" {
+    try built();
     const base =
         \\{"model_type":"mimo_v2", "num_hidden_layers":2, "hidden_size":384,
         \\ "num_attention_heads":4, "num_key_value_heads":2, "head_dim":192,
@@ -405,6 +420,7 @@ test "mimo_v2 config rejects unsupported routing and malformed layer geometry" {
 }
 
 test "mimo_v2 refuses a config asking to quantize trunk linears at load" {
+    try built();
     const base =
         \\{"model_type":"mimo_v2", "num_hidden_layers":2, "hidden_size":384,
         \\ "num_attention_heads":4, "num_key_value_heads":2, "head_dim":192,
@@ -421,6 +437,7 @@ test "mimo_v2 refuses a config asking to quantize trunk linears at load" {
 }
 
 test "real mimo_v2 Flash config agrees with source geometry" {
+    try built();
     const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
     var c = try parseConfig(testing.io, testing.allocator, std.mem.span(raw));
     defer c.deinit(testing.allocator);
@@ -471,6 +488,7 @@ test "real mimo_v2 Flash config agrees with source geometry" {
 }
 
 test "a mimo_v2 config carries the off-supported-list note its load logs" {
+    try built();
     const c = try parseConfigFromJson(testing.allocator, MIMO_V2_BILL_JSON);
     try testing.expectEqualStrings(
         "[load] MiMo-V2.6-Flash is not on the supported list: it loads, but releases do not test it (1.5.0 was its last supported release)",
@@ -479,6 +497,7 @@ test "a mimo_v2 config carries the off-supported-list note its load logs" {
 }
 
 test "mimo_v2 bills per-layer KV geometry and the sliding window once per slot" {
+    try built();
     const c = try parseConfigFromJson(testing.allocator, MIMO_V2_BILL_JSON);
     // Global layers 0 and 3 at 2 KV heads x (qk 192 + v 128) x 2 bytes. The
     // sliding pair contributes NOTHING per token — its storage is a ring.
@@ -498,6 +517,7 @@ test "mimo_v2 bills per-layer KV geometry and the sliding window once per slot" 
 }
 
 test "real mimo_v2 original and converted packs bill the same resident trunk" {
+    try built();
     const source = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
     const reference = std.c.getenv("MIMO_PACK_REFERENCE") orelse return error.SkipZigTest;
     var config = try parseConfig(testing.io, testing.allocator, std.mem.span(source));
@@ -510,6 +530,7 @@ test "real mimo_v2 original and converted packs bill the same resident trunk" {
 }
 
 test "real mimo_v2 bill carries the bf16 vision tower exactly when it is loaded" {
+    try built();
     const source = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
     const dir = std.mem.span(source);
     const text = try mimoSourceResidentBytes(testing.io, testing.allocator, dir, false);
@@ -519,6 +540,7 @@ test "real mimo_v2 bill carries the bf16 vision tower exactly when it is loaded"
 }
 
 test "mimo_v2 original config selects split QKV and native expert quantization" {
+    try built();
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -550,6 +572,7 @@ test "mimo_v2 original config selects split QKV and native expert quantization" 
 }
 
 test "mimo_v2 EXL3 routed banks stream on request and take the source trunk loader" {
+    try built();
     var c = ModelConfig{
         .model_type = "mimo_v2",
         .num_hidden_layers = 2,
@@ -584,6 +607,7 @@ test "mimo_v2 EXL3 routed banks stream on request and take the source trunk load
 }
 
 test "mimo_v2 original MXFP4 experts require streaming despite their quantized width" {
+    try built();
     var c = ModelConfig{
         .model_type = "mimo_v2",
         .num_hidden_layers = 2,
@@ -603,6 +627,7 @@ test "mimo_v2 original MXFP4 experts require streaming despite their quantized w
 }
 
 test "mimo_v2 original streaming retains resident names and excludes experts and MTP" {
+    try built();
     var buf: [256]u8 = undefined;
     const key = "model.layers.0.self_attn.qkv_proj.weight";
     try testing.expectEqualStrings(key, qwen4_config.qwen4StreamingWeightKey(.mxfp4_individual, &buf, key).?);
@@ -612,6 +637,7 @@ test "mimo_v2 original streaming retains resident names and excludes experts and
 }
 
 test "mimo_v2 streaming leaves trunk keys intact and excludes only routed banks" {
+    try built();
     var buf: [256]u8 = undefined;
     for ([_][]const u8{
         "lm_head.weight",
