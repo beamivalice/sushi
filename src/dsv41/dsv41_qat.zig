@@ -473,7 +473,7 @@ test "dsv41 qat: the three round trips are bit-exact with the reference's, midpo
     try mlx.requireGpu();
     var w = try loadFixture(try fixtureDir(), "qat.safetensors");
     defer w.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const x = w.get("x").?;
     inline for (.{
@@ -497,7 +497,7 @@ test "dsv41 qat: the three round trips are bit-exact with the reference's, midpo
 
 test "dsv41 packed fp4: rows of both FP4 round trips come back from their stored form bit for bit, zeros and signs included" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var prng = std.Random.DefaultPrng.init(0xf4);
     const rnd = prng.random();
@@ -533,7 +533,7 @@ test "dsv41 packed fp4: rows of both FP4 round trips come back from their stored
 
 test "dsv41 hc split: the sinkhorn coefficients match the reference formulas" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var prng = std.Random.DefaultPrng.init(5);
     const r = prng.random();
@@ -587,7 +587,7 @@ test "dsv41 hc split: the sinkhorn coefficients match the reference formulas" {
 
 test "dsv41 hc split: the kernel and the op chain agree" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var prng = std.Random.DefaultPrng.init(6);
     const r = prng.random();
@@ -610,7 +610,7 @@ test "dsv41 hc split: the kernel and the op chain agree" {
 
 test "dsv41 rotary: a forward rotation then the inverse gives the input, and positions rotate pairs" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var freqs: [8]f32 = undefined;
     invFreqs(&freqs, 16, 64, 10000, 4, 32, 1);

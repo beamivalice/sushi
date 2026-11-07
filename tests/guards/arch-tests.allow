@@ -111,9 +111,6 @@ driver: a tiny Qwen source becomes a complete pack, and a second run into it is 
 dsv41 bills: a prefill holds its restore points beside the state with a RAM tier, and only the writer's in-flight bytes SSD-first (DSV41_TINY)
 dsv41 geometry: the grouped chain at 5120x2304 over n24, n26, n32, n40 and a mixed class holds the f32-truth bar
 dsv41 geometry: the shared expert as a one-expert fused chain gives a row the same bytes at every decode width and holds the f32-truth bar
-dsv41 real: the attention input's and the compressor's linears in one stacked launch hold the f32-truth bar (DSV41_RT_PACK)
-dsv41 real: the trunk linears of converted layers 0 and 2 hold the f32-truth bar on the served arms (DSV41_RT_PACK)
-dsv41 real: two experts of every rate group of converted layer 2 hold the f32-truth bar (DSV41_RT_PACK)
 dsv41 replay: what the next prompt shares with a generated turn (DeepSeek tokenizer.json)
 effort off default: DeepSeek and GLM resolve and render as before
 effort off default: Qwen stays off on chat, Anthropic and Responses for a request naming no effort word or budget

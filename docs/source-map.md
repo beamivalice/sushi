@@ -22,7 +22,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `qwen4/qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side, fused HC prefill | qwen4-arch |
 | `qwen4/gdn_decode.zig` | fused GDN decode/verify step (one dispatch) | engine-kernels |
 | `mimo2/mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, stamp check | mimo2-arch |
-| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3/STQ decoders and kernels, rate groups, dense linears; `exl3/trunk.zig` the trellis trunk math (matmul, fuse, sharedProject) | engine-exl3-experts |
+| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3/STQ decoders and kernels, rate groups, dense linears; `exl3/trunk.zig` the trellis trunk math (matmul, fuse, sharedProject); no file or pub name there names an architecture | engine-exl3-experts |
 | `trunk_stq.zig` | the weight-map binding of the trellis trunk banks (`load`, `drop`); re-exports `exl3/trunk.zig` | engine-exl3-experts |
 | `encoder/` | `sushi convert exl3`: trellis search, source readers, trunk/shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
 | `expert_stream.zig` / `prefetch_plan.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |

@@ -713,7 +713,7 @@ boot. The verify widths run unchanged kernels, so only the one-row forwards insi
 <a id="shared-fold"></a>
 ## Flash-Next: the shared expert rides the routed launches
 
-`exl3/qwen_riders.zig` (the shared kernels), `exl3/qwen_fold.zig` (one-bank MCG layers: Sushi-4bpw, Sushi-2bpw),
+`exl3/riders_gated.zig` (the shared kernels), `exl3/fold_gated.zig` (one-bank MCG layers: Sushi-4bpw, Sushi-2bpw),
 `rate_groups.moeGatedSharedFolded` (rate-grouped STQ layers: Sushi-STQ-2.75bpw), glue `qwen4_shared.folded`, called
 from `moeMLP2WithRouter`'s tail-shared branch. The shared gate/up/SwiGLU kernel becomes extra threadgroups of the
 routed pair launch and the shared down those of the fused-mid down launch (`fuse.zig`); the finish reduce adds
@@ -760,7 +760,7 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
 <a id="shared-fold-trellis"></a>
 ## Flash-Next: a trellis shared expert rides the routed launches too
 
-`exl3/shared_trellis.zig` (the parts), reached through `qwen_riders` (`Shared.trellis`) from the same two folds as above.
+`exl3/shared_trellis.zig` (the parts), reached through `riders_gated` (`Shared.trellis`) from the same two folds as above.
 A trunk-STQ pack stores the shared gate/up as one stacked bank and the down as a bank, both on `project_rows`' NAX
 multi-row kernel. Each rides as that kernel itself, with its own k split, so every partial sum is the bytes of the
 linear's own launch; what its two finish dispatches did moves into the neighbour that reads the partials:
@@ -894,7 +894,7 @@ max, die 48-49 C at each boot, 2026-11-05.
   `gdn_decode.MAX_SEQ` 9 for the fused GDN step), bytes unchanged. Meter as above, widths 8, 9, 8, 9 per boot, boots
   A B B A, A = 850d8d8b (main) and B = this change on it, die 44-47 C at each boot; second 9-row pass, ms per forward and
   ops: A 38.17 / 38.20 (6553), B 36.31 / 36.58 (5353), -1.7 ms (-4.6%). 8 rows: A 33.51 / 33.63, B 33.50 / 33.50.
-  The shared-expert fold (`qwen_riders.max_rows` 8) and the 9-row step to the next 2.5 ms remain.
+  The shared-expert fold (`riders_gated.max_rows` 8) and the 9-row step to the next 2.5 ms remain.
 - Code 4k rung (`sushi bench --model <pack> --rungs 4k --tokens 512 --code-only`, in process, one load per arm, MTP default),
   decode tok/s of the two repeats (the cold first request pays JIT):
 

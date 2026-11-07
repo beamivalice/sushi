@@ -13,7 +13,7 @@ const sorted_windows = @import("sorted_windows.zig");
 const group_layout = @import("layout.zig");
 const root = @import("root.zig");
 const fuse = @import("fuse.zig");
-const riders = @import("qwen_riders.zig");
+const riders = @import("riders_gated.zig");
 const shared_trellis = @import("shared_trellis.zig");
 const linear = @import("linear.zig");
 
@@ -1163,7 +1163,7 @@ fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots:
 
 /// The shared expert's lane-arm shapes at this bank, or null where its own chain would run another arm.
 fn sharedRate(se: SharedExpert, rb: *const Ragged, rows: usize) ?struct { n: u32, one_row_pair: bool, one_row_down: bool } {
-    if (!se.dec.codebook.servesGlmFastPaths() or rows < 1 or rows > kernels.DECODE_ROWS_MAX) return null;
+    if (!se.dec.codebook.servesLaneFastPaths() or rows < 1 or rows > kernels.DECODE_ROWS_MAX) return null;
     const g = mlx.getShape(se.bank.gate.trellis);
     const u = mlx.getShape(se.bank.up.trellis);
     const d = mlx.getShape(se.bank.down.trellis);
@@ -1355,7 +1355,7 @@ pub fn moeDecodeClampedSharedRedo(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *cons
 
 // ---- Qwen's shared expert inside the unprepared decode chain ----
 
-const QwenKey = struct {
+const GatedFoldKey = struct {
     down: bool,
     rows: c_int,
     topk: c_int,
@@ -1375,19 +1375,23 @@ const QwenKey = struct {
     b_first: bool,
 };
 
-var qwen_stages: std.AutoHashMapUnmanaged(QwenKey, FusedStage) = .empty;
-var qwen_layers: usize = 0;
-var qwen_launches: usize = 0;
+var gated_stages: std.AutoHashMapUnmanaged(GatedFoldKey, FusedStage) = .empty;
+var folded_layers: usize = 0;
+var fold_launches: usize = 0;
 /// Layers run folded, and the GPU launches they issued; test seams.
-pub fn qwenFoldedCount() usize {
-    return qwen_layers;
+pub fn foldedCount() usize {
+    return folded_layers;
 }
-pub fn qwenLaunchCount() usize {
-    return qwen_launches;
+pub fn foldLaunchCount() usize {
+    return fold_launches;
 }
 
-fn qwenStage(k: QwenKey) !*const FusedStage {
-    if (qwen_stages.getPtr(k)) |f| return f;
+/// Deprecated names, kept for one release.
+pub const qwenFoldedCount = foldedCount;
+pub const qwenLaunchCount = foldLaunchCount;
+
+fn gatedStage(k: GatedFoldKey) !*const FusedStage {
+    if (gated_stages.getPtr(k)) |f| return f;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1426,8 +1430,8 @@ fn qwenStage(k: QwenKey) !*const FusedStage {
     var slot: ?mlx.mlx_fast_metal_kernel = null;
     const kernel = try kernels.getNamedKernel(&slot, @ptrCast(name.items.ptr), try fuse.insOf(alloc, a, b), try fuse.outsOf(alloc, a, b), src, header_text);
     const built: FusedStage = .{ .kernel = kernel, .cfg = try fuse.config(alloc, a.launch, b.launch, k.b_first) };
-    try qwen_stages.put(std.heap.page_allocator, k, built);
-    return qwen_stages.getPtr(k).?;
+    try gated_stages.put(std.heap.page_allocator, k, built);
+    return gated_stages.getPtr(k).?;
 }
 
 /// `moeRagged`'s decode chain with the gated shared expert `sh` riding its pair and down launches, for one to eight rows
@@ -1471,7 +1475,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
     try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{nslots}, 1, s));
 
     const pair_layout = kernels.gemvLayout(@divExact(rb.inter, 16));
-    var key: QwenKey = .{
+    var key: GatedFoldKey = .{
         .down = false,
         .rows = rows,
         .topk = topk,
@@ -1496,7 +1500,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
     var pair_in: [18]mlx.mlx_array = undefined;
     pair_in[0..7].* = .{ x2, rb.suh[0], rb.suh[1], rb.trellis[0], rb.trellis[1], slots, rb.meta };
     @memcpy(pair_in[7..][0..rider_in.len], rider_in);
-    const pair_ov = try kernels.applyOuts(s, (try qwenStage(key)).kernel, pair_in[0 .. 7 + rider_in.len], (try qwenStage(key)).cfg, if (want_logit) 4 else 3);
+    const pair_ov = try kernels.applyOuts(s, (try gatedStage(key)).kernel, pair_in[0 .. 7 + rider_in.len], (try gatedStage(key)).cfg, if (want_logit) 4 else 3);
     defer _ = mlx.mlx_vector_array_free(pair_ov);
     const ig = try getOut(pair_ov, 0);
     defer _ = mlx.mlx_array_free(ig);
@@ -1516,7 +1520,7 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
     key.classes = std.mem.zeroes([max_groups]RateClass);
     key.class_count = down_classes.len;
     @memcpy(key.classes[0..down_classes.len], down_classes);
-    const down_stage = try qwenStage(key);
+    const down_stage = try gatedStage(key);
     var down_buf: [7]mlx.mlx_array = undefined;
     const rider_down = riders.downInputs(sh, x2, mid, &down_buf);
     var down_in: [15]mlx.mlx_array = undefined;
@@ -1529,9 +1533,9 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
     const shared_out = try getOut(down_ov, 1);
     defer _ = mlx.mlx_array_free(shared_out);
 
-    qwen_layers += 1;
+    folded_layers += 1;
     // Pair, down, reduce.
-    qwen_launches += 3;
+    fold_launches += 3;
     const y = try riders.reduce(s, sh, geo, down, rb.svh[2], slots, sc, rb.hidden, rows, topk, shared_out, logit_out orelse gate.?);
     defer _ = mlx.mlx_array_free(y);
     var out = mlx.mlx_array_new();
@@ -2075,9 +2079,7 @@ fn zerosU32(s: mlx.mlx_stream, rows: c_int) !mlx.mlx_array {
 /// One shared-expert projection over every row: the sorted GEMM on a window table of `rows`, the trunk's own GEMM arm.
 fn sharedGemm(s: mlx.mlx_stream, prepared: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, back: exl3.Decode, zeros: mlx.mlx_array, rows: c_int) !mlx.mlx_array {
     const win = kernels.gemmWindowRows();
-    const tab = try linear.windowTable(1, @intCast(rows), win);
-    defer _ = mlx.mlx_array_free(tab.starts);
-    defer _ = mlx.mlx_array_free(tab.nlives);
+    const tab = (try linear.gemmInputs(1, @intCast(rows), win)).tab;
     kernels.setDecodeParams(dec);
     defer kernels.setDecodeParams(back);
     return kernels.innerGemmSortedTable(s, prepared, p.trellis, zeros, win, true, tab);

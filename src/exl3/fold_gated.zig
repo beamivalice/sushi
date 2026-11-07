@@ -1,4 +1,4 @@
-//! Qwen3.8-Flash-Next decode on a one-bank layer (MCG EXL3): the shared expert's kernels (`qwen_riders.zig`) ride the
+//! Qwen3.8-Flash-Next decode on a one-bank layer (MCG EXL3): the shared expert's kernels (`riders_gated.zig`) ride the
 //! routed chain's pair and fused-mid down launches as extra threadgroups (`fuse.zig`), and the gated shared add rides
 //! the finish reduce, so a layer's shared gate/up, SwiGLU, down, gate logit, pair, down, reduce and sigmoid tail
 //! become three launches. Every part keeps its own statements, so the output is the bytes of the separate chain.
@@ -9,7 +9,7 @@ const kernels = @import("expert_exl3_kernels.zig");
 const rate_groups = @import("rate_groups.zig");
 const codebook_tables = @import("codebook_tables.zig");
 const fuse = @import("fuse.zig");
-const riders = @import("qwen_riders.zig");
+const riders = @import("riders_gated.zig");
 const shared_trellis = @import("shared_trellis.zig");
 const root = @import("root.zig");
 

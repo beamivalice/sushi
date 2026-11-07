@@ -133,7 +133,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   takes the fold below instead.
 
 <a id="shared-fold"></a>
-**The shared expert rides the routed lane chain's launches** (`exl3/glm_fold.zig`, `glm5_shared.folded`, decode
+**The shared expert rides the routed lane chain's launches** (`exl3/fold_clamped.zig`, `glm5_shared.folded`, decode
 rows, `[1,rows,4096]` BF16, resident affine5/6/8 g128 shared banks, an EXL3 pack on the GLM lane arms). The serial layer
 launched gate/up, the stock qmv down and the routed five (prepare, pair, middle, down, reduce): seven. The shared gate/up
 kernel now holds extra threadgroups of the routed pair launch and the shared down those of the routed down launch
@@ -142,13 +142,13 @@ so a layer launches five; the finish reduce still lists the shared output first.
 routed kernels are untouched, and the shared kernels are the qmv_fast row groups of `glm5_decode.zig` and the activation
 text of `gateUp`, laid out 128 threads wide (gate/up: eight rows a threadgroup, a gate simdgroup and an up simdgroup per
 four rows; down: sixteen rows, a simdgroup per four), so every output element has the bytes of the separate chain.
-- **Reach**: a serial decode row (`glm_fold.moeClampedSharedFolded`) and two to eight rows of the batched decode (two to
+- **Reach**: a serial decode row (`fold_clamped.moeClampedSharedFolded`) and two to eight rows of the batched decode (two to
   four requests) and the DFlash2 verify rows (`moeLayoutSharedFolded`, called from `glm5_dflash_ffn.apply` on the lane
   arms: hidden 4096, top-8, limit 10). Not streaming, the covariance tap, or nine to sixteen rows. The rows chain
-  launched the shared rows kernels (gate, up, activation, down: four) and the `glm_group2` routed five: nine; the fold
+  launched the shared rows kernels (gate, up, activation, down: four) and the `coop_rows2` routed five: nine; the fold
   runs five. The multi-row riders are the same two kernels with one grid row per input row: each row is the one-token
   qmv_fast order, which is what the rows kernels reproduce per row, so the bytes are the rows chain's. The routed kernels
-  are `glm_group2`'s own (the two- and three-member group sources, grouped serial reduction, two tiles), untouched. Anything
+  are `coop_rows2`'s own (the two- and three-member group sources, grouped serial reduction, two tiles), untouched. Anything
   the fold cannot reproduce declines to the separate chain before any launch: another row count or dtype, a limit other
   than 10, a codebook off the lane arms, a gate/up pair stored at two widths or with strided or lazy banks, a dense or FP8
   shared expert, a down that is not `width -> hidden`, ids that do not match the rows.
@@ -156,7 +156,7 @@ four rows; down: sixteen rows, a simdgroup per four), so every output element ha
   ...` for two to eight): bytes equal to the separate chain (gate/up plus the stock affine down plus
   `moeClampedWithShared`; the shared rows chain plus `moeLayoutShared`), at the real 4096/2048 geometry with nine experts at
   n36, for gate/up and down stored at 6/6/6, 5/5/5, 8/8/8, 5/5/8, 8/8/6 (and 6/6/5 on one row) bits, large and small gains
-  (the clamps both ways), with either part's threadgroups first; five launches a layer (`glm_fold.launchCount`). Two more
+  (the clamps both ways), with either part's threadgroups first; five launches a layer (`fold_clamped.launchCount`). Two more
   tests cover the declines.
 - **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=glm5` times the routed-first order; this table, base `f831f1e5` plus the rows change,
   ReleaseFast, GPU lock, `taskpolicy -a`, fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over eight
@@ -222,7 +222,7 @@ four rows; down: sixteen rows, a simdgroup per four), so every output element ha
   three rows, and HC collapse emits the normalized branch input directly. The latter preserves the intermediate
   BF16 value and native RMS reduction order. Together with expert reuse/tiling, measured verification is
   [5.25–5.98% lower verification time](glm5-perf.md#glm-three-value-norm) than `f40fa548`; draft depth is unchanged.
-- **Shared-expert rows serve every admitted n** (`glm_group2.servesRate`) and every pack window, never one pack's
+- **Shared-expert rows serve every admitted n** (`coop_rows2.servesRate`) and every pack window, never one pack's
   rate or window. The three-row, 24-slot lane path reuses each expert's decoded weights across up to three matching
   routes and computes two output tiles per threadgroup. Other widths retain two-member reuse and one output tile. Mixed gate/up and down
   rates are exact, and the engagement test runs `apply` at each rate. Together these changes save
@@ -255,7 +255,7 @@ four rows; down: sixteen rows, a simdgroup per four), so every output element ha
 - **Rows 2..8** (bit-exact, [ladder](glm5-perf.md#glm-eight-row-verify)): `glm5_dflash_rows.zig` streams 2..8 rows through each
   A5/A6 weight read (qmv_fast order per row; the straddling bytes keep two products; one simdgroup per two outputs up to
   six rows, two simdgroups splitting the rows at seven and eight, both packs' coefficients live for A6 at K >= 16384);
-  the HC collapse and fused expansion take 1..8 rows; the FFN lane kernels (`glm_group2`, slots in ballots of 32 per
+  the HC collapse and fused expansion take 1..8 rows; the FFN lane kernels (`coop_rows2`, slots in ballots of 32 per
   member loop, two output tiles per threadgroup at every slot count, three-member sharing at 24 slots) serve 2..8 rows and
   the dense KDA column batch 2..8; the MLA absorbed-query and value banks take 2..8 rows as one broadcast QMM; the sparse
   selection of a tree's rows with equal pool and tail counts is one scorer, one argpartition and one expansion

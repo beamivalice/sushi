@@ -1563,7 +1563,7 @@ fn attnNaxTrial(a: std.mem.Allocator, h: usize, d: usize, rd: usize, og: usize, 
     const K = 48;
     const nc = 40;
     const window = 128;
-    var sc = Scope.init(a, mlx.gpuStream());
+    var sc = Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const bf16 = mlx.mlx_dtype.bfloat16;
     const q = try randn(&sc, &.{ L, ci(h), ci(d) }, bf16, 0x4a1, 1.5);
@@ -2165,7 +2165,7 @@ fn bitsEqual(a: []const f32, b: []const f32) bool {
 /// Whether the integer matrix arm scores `spec`'s packed keys with the bits of the scalar kernel, over the whole scan
 /// and over a gather of candidate blocks.
 pub fn indexNaxTrial(a: std.mem.Allocator, spec: IndexNaxSpec) !bool {
-    var sc = Scope.init(a, mlx.gpuStream());
+    var sc = Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const L = spec.rows;
     const nb = spec.nb;
@@ -2658,7 +2658,7 @@ pub fn probeTopk(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
 }
 
 fn probeTopkOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
-    var sc = Scope.init(gpa, s);
+    var sc = Scope.plain(gpa, s);
     defer sc.deinit();
     const x = try sc.zeros(&.{ 1, 64 }, .float32);
     const one = try topkIndicesSplit(&sc, x, 4, 1);
@@ -2682,7 +2682,7 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
 
 /// The fused expand against the chain on random streams of both dtypes at a wide and a narrow row count.
 fn probeHcExpand(gpa: std.mem.Allocator, s: mlx.mlx_stream, D: usize) bool {
-    var sc = Scope.init(gpa, s);
+    var sc = Scope.plain(gpa, s);
     defer sc.deinit();
     return probeHcExpandIn(&sc, D) catch blk: {
         var buf: [512]u8 = undefined;
@@ -2706,7 +2706,7 @@ fn probeHcExpandIn(sc: *Scope, D: usize) !bool {
 }
 
 fn probeHcOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, iters: usize) !void {
-    var sc = Scope.init(gpa, s);
+    var sc = Scope.plain(gpa, s);
     defer sc.deinit();
     const dt = mlx.mlx_dtype.bfloat16;
     const mix = (2 + hc) * hc;
@@ -3033,7 +3033,7 @@ fn kernelFfn(sc: *Scope, f: *const FfnData) !A {
 
 test "dsv41 moe decode: the gate-up and down-expand kernels are no further from the f64 truth than the composed chain, f32 sums in another order" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const f = try ffnData(&sc, .{}, .float32);
     const truth = try testing.allocator.alloc(f64, f.c.hc * f.c.d);
@@ -3049,7 +3049,7 @@ test "dsv41 moe decode: the gate-up and down-expand kernels are no further from 
 
 test "dsv41 moe decode: in bf16 the kernels give the composed chain's stream to a few bf16 ulps" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const f = try ffnData(&sc, .{}, .bfloat16);
     const want = try hostOf(&sc, try composedFfn(&sc, &f, .bfloat16));
@@ -3059,7 +3059,7 @@ test "dsv41 moe decode: in bf16 the kernels give the composed chain's stream to 
 
 test "dsv41 gate: the router logits are no further from the f64 truth than the f32 matmul" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const E = 384;
     const D = 5120;
@@ -3091,7 +3091,7 @@ fn composedRoute(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f3
 
 test "dsv41 route: the experts are the composed chain's, their weights its scores to f32 rounding, with and without normalizing" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const E = 384;
     const K = 6;
@@ -3117,7 +3117,7 @@ test "dsv41 route: the experts are the composed chain's, their weights its score
 
 test "dsv41 route split: the router and the hc split in one launch give the two kernels' bytes" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const eps = try hcEps(&sc, 1e-6, 1e-6);
     for ([_]usize{ 384, 256, 40 }) |E| for ([_]usize{ 1, 2, 5, 16 }) |L| for ([_]f32{ 0.3, 4.0 }) |mag| {
@@ -3138,7 +3138,7 @@ test "dsv41 route split: the router and the hc split in one launch give the two 
 
 test "dsv41 topk: the picks are the k largest in index order, ties to the lower index" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const n = 1500;
     const k = 512;
@@ -3161,7 +3161,7 @@ test "dsv41 topk: the picks are the k largest in index order, ties to the lower 
 
 test "dsv41 topk: the picks do not depend on the threadgroup width" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     try probeTopk(sc.a, sc.s);
     const widest = topk_tg;
@@ -3180,7 +3180,7 @@ test "dsv41 topk: the picks do not depend on the threadgroup width" {
 
 test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long rows, ties and -inf included" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const k = 512;
     var prng = std.Random.DefaultPrng.init(0x70b1);
@@ -3209,7 +3209,7 @@ test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long 
 
 test "dsv41 dense f32x: the product is no further from the f64 truth than the widened f32 matmul" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const N = 1024;
     const K = 5120;
@@ -3243,7 +3243,7 @@ fn expectBitEqual(label: []const u8, got: []const f32, want: []const f32) !void 
 
 test "dsv41 moe act: the clamped SwiGLU times the routing weight is the composed chain's, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const n = 61;
     const N = 2304;
@@ -3259,7 +3259,7 @@ test "dsv41 moe act: the clamped SwiGLU times the routing weight is the composed
 
 test "dsv41 moe combine: unsort, the f32 sum over the slots and the shared add are the composed chain's, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const L = 37;
     const k = 6;
@@ -3299,7 +3299,7 @@ fn positions(sc: *Scope, first: i32, n: usize, step: i32) !A {
 
 test "dsv41 rope tail: the rotation and the activation round trip are the composed chain's, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
     const cases = [_]struct { shape: []const c_int, qat: RopeQat, inverse: bool }{
@@ -3327,7 +3327,7 @@ test "dsv41 rope tail: the rotation and the activation round trip are the compos
 
 test "dsv41 kv row: the rms norm, rotation and fp8 round trip are the composed chain's, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]bool{ true, false }) |qat| {
@@ -3343,7 +3343,7 @@ test "dsv41 kv row: the rms norm, rotation and fp8 round trip are the composed c
 
 test "dsv41 rope kv: the query rotation and the window row in one launch give the two kernels' bytes" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]bool{ true, false }) |qat| for ([_]usize{ 1, 2, 9, 47 }) |L| for ([_]c_int{ 64, 8 }) |H| {
@@ -3447,7 +3447,7 @@ fn truthAttn(sc: *Scope, a: *const AttnData, out: []f64) !void {
 
 test "dsv41 decode attention: every split count is no further from the f64 truth than the composed core" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const a = try attnData(&sc, .{}, .float32);
     const truth = try testing.allocator.alloc(f64, a.c.heads * a.c.d);
@@ -3469,7 +3469,7 @@ test "dsv41 decode attention: every split count is no further from the f64 truth
 
 test "dsv41 decode attention: the folded inverse rotation is the rotation of the heads, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 4 }) |splits| {
@@ -3483,7 +3483,7 @@ test "dsv41 decode attention: the folded inverse rotation is the rotation of the
 
 test "dsv41 decode attention: the folded fp8 round trip is the round trip of the heads, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 2, 4, 5 }) |splits| {
@@ -3499,7 +3499,7 @@ test "dsv41 decode attention: the folded fp8 round trip is the round trip of the
 
 test "dsv41 decode attention: a block of rows is the rows of single-row blocks, bit for bit, over a ring with slack" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
     const rows = 6;
@@ -3525,7 +3525,7 @@ test "dsv41 decode attention: a block of rows is the rows of single-row blocks, 
 
 test "dsv41 decode attention: a verify block's row is its one-row step's bits when the block carries more compressed picks (release shape, two splits)" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
     const rows = 6;
@@ -3559,7 +3559,7 @@ test "dsv41 decode attention: a verify block's row is its one-row step's bits wh
 
 test "dsv41 wide attention: the f16 core gives the f32 chain's heads at the release's span shape" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const L = 256;
     const H = 64;
@@ -3601,7 +3601,7 @@ fn composedIndexScores(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, 
 
 test "dsv41 index scores: the scalar and the matrix kernels are no further from the f64 truth than the composed chain, -inf past the groups seen" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const IH = 64;
     const IHD = 128;
@@ -3648,7 +3648,7 @@ test "dsv41 index scores: the scalar and the matrix kernels are no further from 
 
 test "dsv41 index scores: key slices scored at their offset are the whole list's columns bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const IH = 32;
     const IHD = 128;
@@ -3675,7 +3675,7 @@ test "dsv41 index scores: key slices scored at their offset are the whole list's
 
 test "dsv41 index scores: the scalar kernel over packed keys gives the unpacked keys' scores bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ratio = 1;
     // A few keys, one scale byte a key: arrays MLX passes in the constant address space.
@@ -3710,7 +3710,7 @@ test "dsv41 index scores: the integer matrix kernel gives the bits the scalar ke
     try mlx.requireGpu();
     if (!mlx.streamIsGpu(mlx.gpuStream()) or !indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_INDEX_SCANS") orelse return error.SkipZigTest);
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     for ([_]u8{ 2, 8, 14, 20 }) |layer| for ([_]usize{ 4096, 32768, 131072, 262144, 524288 }) |pos| {
         const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/L{d}-pos{d}.safetensors", .{ dir, layer, pos }, 0);
@@ -3813,7 +3813,7 @@ fn truthHc(sc: *Scope, d: *const HcData, x: A, z: []f64, h: []f64) !void {
 
 test "dsv41 hc stage: the mixes and the normed collapse are no further from the f64 truth than the chain, the expanded stream too" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const d = try hcData(&sc, 1, .float32);
     const z_truth = try testing.allocator.alloc(f64, 24);
@@ -3848,7 +3848,7 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
 
 test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and expanded stream to bf16 ulps" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const d = try hcData(&sc, 1, .bfloat16);
     const x1_ref = try model.hcExpandOps(&sc, d.x, d.y, d.prev.post, d.prev.comb);
@@ -3860,7 +3860,7 @@ test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and ex
 
 test "dsv41 hc stage: a stage that splits its previous mixes gives the split kernel's and the array stage's bytes" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const iters = 20;
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 3, 16 }) |L| {
@@ -3877,7 +3877,7 @@ test "dsv41 hc stage: a stage that splits its previous mixes gives the split ker
 
 test "dsv41 hc split: the lane-per-element split gives the thread-per-row split of the mixes" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const mixes = try randn(&sc, &.{ 37, 24 }, .float32, 141, 3.0);
     const scale = try f32Const(&sc, &.{ 0.3, 0.8, 1.1 });
@@ -3898,7 +3898,7 @@ test "dsv41 hc split: the lane-per-element split gives the thread-per-row split 
 
 test "dsv41 hc wide: the mix and norm kernels give the decode stage's mixes, split and normed collapse, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
         const d = try hcData(&sc, 9, dt);
@@ -3917,7 +3917,7 @@ test "dsv41 hc wide: the mix and norm kernels give the decode stage's mixes, spl
 test "dsv41 hc wide: the release mix tile gives the previous tile's mixes at the release shapes, bit for bit" {
     try mlx.requireGpu();
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 3, 17, 512, 2048 }) |L| {
-        var sc = Scope.init(testing.allocator, mlx.gpuStream());
+        var sc = Scope.plain(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
         const d = try hcData(&sc, L, dt);
         const want = try hcMixTiled(&sc, d.x, d.hw, d.eps, .{ .rows = 4, .cols = 6 });
@@ -3928,7 +3928,7 @@ test "dsv41 hc wide: the release mix tile gives the previous tile's mixes at the
 
 test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     try probeHc(sc.a, sc.s, 4, 5120, 20);
     // The kernel reproduces a TF32-class matmul; where the GPU's is true f32 (relative error under 1e-5 of a stream
@@ -3949,7 +3949,7 @@ test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {
     };
     if (!tf32_class) return;
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5120, 4096, 1000, 40 }) |D| for ([_]c_int{ 1, 3, 16, 17, 33, 100, 1000, 2048, 4096 }) |L| {
-        var cs = Scope.init(testing.allocator, mlx.gpuStream());
+        var cs = Scope.plain(testing.allocator, mlx.gpuStream());
         defer cs.deinit();
         const x = try cs.astype(try randn(&cs, &.{ L, 4, D }, .float32, 181, 1.5), dt);
         const y = try cs.astype(try randn(&cs, &.{ L, D }, .float32, 182, 1.0), dt);
@@ -3966,7 +3966,7 @@ test "dsv41 hc expand: a thread an element writes the bytes of a thread a column
     try mlx.requireGpu();
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5120, 4096, 1000, 40 }) |D| for ([_]c_int{ 1, 2, 5, 17, 512 }) |L| {
         for ([_][2]f32{ .{ 1.5, 1.0 }, .{ 400.0, 60.0 }, .{ 1e-3, 1e-4 } }) |mag| {
-            var cs = Scope.init(testing.allocator, mlx.gpuStream());
+            var cs = Scope.plain(testing.allocator, mlx.gpuStream());
             defer cs.deinit();
             const x = try cs.astype(try randn(&cs, &.{ L, 4, D }, .float32, 191, mag[0]), dt);
             const y = try cs.astype(try randn(&cs, &.{ L, D }, .float32, 192, mag[1]), dt);
@@ -3981,7 +3981,7 @@ test "dsv41 hc expand: a thread an element writes the bytes of a thread a column
 
 test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var cfg = Config{};
     cfg.hc_mult = 4;
@@ -4003,7 +4003,7 @@ test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {
 
 test "dsv41 kernels: a new row count, pick count, split count or context width compiles no new Metal library" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const keys = mlx.kernel_keys;
     _ = keys.trackForTest();

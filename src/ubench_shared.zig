@@ -399,12 +399,8 @@ fn trunkStep(c: *const TrunkCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array, 
     switch (arm) {
         0 => try mlx.check(mlx.mlx_quantized_matmul(&y, x, c.a8[ci][0], c.a8[ci][1], c.a8[ci][2], true, mlx.mlx_optional_int.some(c.sh.group), mlx.mlx_optional_int.some(8), "affine", s)),
         1, 2 => {
-            api.project_rows.rows_exact = true;
-            defer api.project_rows.rows_exact = false;
-            api.trunk_gemm.decoded_billed = arm == 2;
-            defer api.trunk_gemm.decoded_billed = false;
             _ = mlx.mlx_array_free(y);
-            y = try api.linear.linear(s, x, c.trellis[ci], kernels.SPEC1_W15);
+            y = try api.linear.linearWith(s, x, c.trellis[ci], kernels.SPEC1_W15, .{ .rows = .{ .exact = true }, .decoded_billed = arm == 2 });
         },
         3 => {
             var wt = mlx.mlx_array_new();

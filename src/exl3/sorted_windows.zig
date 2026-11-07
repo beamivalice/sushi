@@ -160,11 +160,8 @@ pub fn finishSortedInverse(s: mlx.mlx_stream, inner: mlx.mlx_array, inverse: mlx
     return y;
 }
 
-pub var gpu_window_prefill_force: ?bool = null;
-
 /// The GPU window metadata and the inverse-indexed finish, at the two served geometries (MiMo, Flash-Next).
 pub fn gpuWindowPrefillOn(hidden: c_int, inter: c_int, experts: c_int, topk: c_int) bool {
-    if (gpu_window_prefill_force) |v| return v;
     if (experts < 1) return false;
     return (hidden == 4096 and inter == 2048 and experts <= 256 and topk == 8) or
         (hidden == 2560 and inter == 640 and experts <= GPU_WINDOW_MAX_EXPERTS and topk == 10);
@@ -186,21 +183,21 @@ test "exl3 prefill GPU metadata keys on the served geometries, never on the rate
 test "exl3 Flash-Next prefill reads the sorted down plane through the inverse, to the byte" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const c: kernels.MimoMoeCase = .{ .e = 32, .hidden = 2560, .inter = 640, .topk = 10, .rows = 200, .rate = .{ .n = 48 }, .dec = .{ .codebook = .mcg, .window = .w15 }, .seed = 653 };
+    const c: kernels.MoeCase = .{ .e = 32, .hidden = 2560, .inter = 640, .topk = 10, .rows = 200, .rate = .{ .n = 48 }, .dec = .{ .codebook = .mcg, .window = .w15 }, .seed = 653 };
     kernels.setDecodeParams(c.dec);
     defer kernels.setDecodeParams(.mul1);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try kernels.mimoMoeFixture(arena.allocator(), c);
+    var f = try kernels.moeFixture(arena.allocator(), c);
     defer f.deinit();
-    defer gpu_window_prefill_force = null;
-    gpu_window_prefill_force = false;
-    const scattered = try kernels.mimoPrefillArm(s, &f, c.topk);
-    defer _ = mlx.mlx_array_free(scattered);
-    gpu_window_prefill_force = null;
+    f.window_meta = false;
     gpu_window_engaged = false;
     sorted_inverse_engaged = false;
-    const served = try kernels.mimoPrefillArm(s, &f, c.topk);
+    const scattered = try kernels.moePrefillArm(s, &f, c.topk);
+    defer _ = mlx.mlx_array_free(scattered);
+    try std.testing.expect(!gpu_window_engaged and !sorted_inverse_engaged);
+    f.window_meta = null;
+    const served = try kernels.moePrefillArm(s, &f, c.topk);
     defer _ = mlx.mlx_array_free(served);
     try std.testing.expect(gpu_window_engaged and sorted_inverse_engaged);
     var ca = mlx.mlx_array_new();

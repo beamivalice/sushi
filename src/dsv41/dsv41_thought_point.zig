@@ -328,7 +328,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     const dir = try dsv41_model.fixtureDir();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);

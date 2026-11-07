@@ -49,7 +49,7 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -230,7 +230,7 @@ test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole o
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -309,7 +309,7 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -373,7 +373,7 @@ test "dsv41 generator: a seeded sampled request verifies at one width whatever t
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -451,7 +451,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -521,7 +521,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -680,7 +680,7 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -718,7 +718,7 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -906,7 +906,7 @@ fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     const dsv41_model = @import("dsv41_model.zig");
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -1010,7 +1010,7 @@ test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -1179,7 +1179,7 @@ fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -1273,7 +1273,7 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -1338,7 +1338,7 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -1483,7 +1483,7 @@ test "dsv41 generator: a prefill that skips the decoder tails nothing reads give
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -1533,7 +1533,7 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -1582,7 +1582,7 @@ test "dsv41 generator: after a DSpark request the slot cache marks its rows and 
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
@@ -1650,7 +1650,7 @@ const TinyDsparkNet = struct {
         const dir = try dsv41_model.fixtureDir();
         var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
         errdefer fx.deinit();
-        var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+        var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
         defer sc.deinit();
         const ids = try dsv41_model.tokens(&sc, &fx);
         errdefer a.free(ids);
@@ -1859,7 +1859,7 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);

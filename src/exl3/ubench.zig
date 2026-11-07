@@ -1080,21 +1080,21 @@ pub const decode_chain: report.Bench = .{
     .run = runDecodeChain,
 };
 
-const ChainStep = struct { f: *const kernels.MimoMoeFixture };
+const ChainStep = struct { f: *const kernels.MoeFixture };
 
 fn chainStep(c: ChainStep, s: mlx.mlx_stream, _: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
     return kernels.decodeChain(s, c.f, x);
 }
 
 /// Nanoseconds of one chain step over fixture `f`: the chain less the link floor measured beside it.
-fn stepNs(s: mlx.mlx_stream, f: *const kernels.MimoMoeFixture, steps: usize) !f64 {
+fn stepNs(s: mlx.mlx_stream, f: *const kernels.MoeFixture, steps: usize) !f64 {
     const x0 = f.arrays[8];
     const ns = try bench.chainNs(s, x0, steps, ChainStep{ .f = f }, chainStep);
     const floor = try bench.chainNs(s, x0, steps, {}, bench.linkOnly);
     return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(steps));
 }
 
-const ChainSample = struct { s: mlx.mlx_stream, dec: exl3.Decode, f: [4]*const kernels.MimoMoeFixture, steps: usize };
+const ChainSample = struct { s: mlx.mlx_stream, dec: exl3.Decode, f: [4]*const kernels.MoeFixture, steps: usize };
 
 fn sampleDecodeChain(smp: ChainSample, arm: usize) anyerror!f64 {
     kernels.setDecodeParams(smp.dec);
@@ -1102,7 +1102,7 @@ fn sampleDecodeChain(smp: ChainSample, arm: usize) anyerror!f64 {
 }
 
 fn flashBlock(alloc: std.mem.Allocator, dec: exl3.Decode, n: u32, rows: usize) !kernels.CarriedBlock {
-    return kernels.carriedBlock(alloc, .{ .e = FLASH_EXPERTS, .hidden = FLASH_HIDDEN, .inter = FLASH_INTER, .topk = FLASH_TOPK, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = 5200 + n + 97 * rows, .banks = kernels.MIMO_BANKS, .x_scale = 3 }, 0);
+    return kernels.carriedBlock(alloc, .{ .e = FLASH_EXPERTS, .hidden = FLASH_HIDDEN, .inter = FLASH_INTER, .topk = FLASH_TOPK, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = 5200 + n + 97 * rows, .banks = kernels.SERVED_W12_BANKS, .x_scale = 3 }, 0);
 }
 
 fn runDecodeChain(run: *report.Run) anyerror!void {
@@ -1169,7 +1169,7 @@ pub const grouped_decode: report.Bench = .{
     .run = runGroupedDecode,
 };
 
-const GroupSample = struct { s: mlx.mlx_stream, f: *const kernels.MimoMoeFixture, dec: exl3.Decode, rows: usize, steps: usize };
+const GroupSample = struct { s: mlx.mlx_stream, f: *const kernels.MoeFixture, dec: exl3.Decode, rows: usize, steps: usize };
 
 fn sampleGrouped(smp: GroupSample, arm: usize) anyerror!f64 {
     kernels.setDecodeParams(smp.dec);
@@ -1196,7 +1196,7 @@ fn runGroupedDecode(run: *report.Run) anyerror!void {
                     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                     defer arena.deinit();
                     const alloc = arena.allocator();
-                    const real: kernels.MimoMoeCase = .{ .e = geom.e, .hidden = geom.hidden, .inter = geom.inter, .topk = geom.topk, .rows = rows, .rate = .{ .n = rate.n }, .dec = rate.dec, .seed = 14000 + rate.n, .banks = kernels.MIMO_BANKS, .x_scale = 3 };
+                    const real: kernels.MoeCase = .{ .e = geom.e, .hidden = geom.hidden, .inter = geom.inter, .topk = geom.topk, .rows = rows, .rate = .{ .n = rate.n }, .dec = rate.dec, .seed = 14000 + rate.n, .banks = kernels.SERVED_W12_BANKS, .x_scale = 3 };
                     var block = try kernels.carriedBlock(alloc, real, carry);
                     defer block.f.deinit();
                     const counts = try alloc.alloc(u32, block.used);
@@ -1662,15 +1662,14 @@ fn trunkStep(t: Trunk, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!m
     switch (t.arm) {
         0, 1, 2 => {
             const served = t.rows <= @as(usize, @intCast(project_rows.PROJECT_ROWS_MAX));
-            project_rows.rows_exact = t.arm == 1;
-            defer project_rows.rows_exact = false;
+            const opts: root.linear.Opts = .{ .rows = .{ .exact = t.arm == 1 } };
             root.linear.force_arm = if (t.arm == 2 and served) .gemv else null;
             defer root.linear.force_arm = null;
-            if (sh.groups > 1) return root.linear.linearGrouped(s, x, t.stq[c], dec);
+            if (sh.groups > 1) return root.linear.linearGroupedWith(s, x, t.stq[c], dec, opts);
             var x2 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x2);
             try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ @intCast(t.rows), @intCast(sh.in) }, 2, s));
-            return root.linear.linear(s, x2, t.stq[c], dec);
+            return root.linear.linearWith(s, x2, t.stq[c], dec, opts);
         },
         3 => {
             var o = mlx.mlx_array_new();
@@ -1720,7 +1719,6 @@ fn runTrunkRows(run: *report.Run) anyerror!void {
     const s = mlx.gpuStream();
     defer {
         kernels.setDecodeParams(.mul1);
-        project_rows.rows_exact = false;
         root.linear.force_arm = null;
     }
     var prng = std.Random.DefaultPrng.init(0x7a);
@@ -1822,7 +1820,7 @@ pub const routed_t1: report.Bench = .{
 };
 
 const T1Ctx = struct {
-    f: *const kernels.MimoMoeFixture,
+    f: *const kernels.MoeFixture,
     shared: mlx.mlx_array,
     routes: *const [T1_ROUTES]mlx.mlx_array,
     upto: usize,
@@ -1869,7 +1867,7 @@ fn t1Bytes(a: mlx.mlx_array) ![]const u8 {
 }
 
 /// The two GEMV kinds write the same bytes through the gate, up and down projections.
-fn t1SameBytes(run: *report.Run, s: mlx.mlx_stream, f: *const kernels.MimoMoeFixture, x0: mlx.mlx_array, slots: mlx.mlx_array) !void {
+fn t1SameBytes(run: *report.Run, s: mlx.mlx_stream, f: *const kernels.MoeFixture, x0: mlx.mlx_array, slots: mlx.mlx_array) !void {
     const a = f.arrays;
     var want: [3][]const u8 = undefined;
     for ([_]bool{ true, false }, 0..) |off, vi| {
@@ -1905,7 +1903,7 @@ fn runRoutedT1(run: *report.Run) anyerror!void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        var f = try kernels.mimoMoeFixture(a, .{ .hidden = @intCast(T1_HIDDEN), .inter = @intCast(T1_INTER), .e = T1_EXPERTS, .rows = 1, .topk = T1_TOPK, .rate = .{ .n = n }, .dec = dec, .seed = 7000 + n, .banks = kernels.MIMO_BANKS, .x_scale = 1 });
+        var f = try kernels.moeFixture(a, .{ .hidden = @intCast(T1_HIDDEN), .inter = @intCast(T1_INTER), .e = T1_EXPERTS, .rows = 1, .topk = T1_TOPK, .rate = .{ .n = n }, .dec = dec, .seed = 7000 + n, .banks = kernels.SERVED_W12_BANKS, .x_scale = 1 });
         defer f.deinit();
         var prng = std.Random.DefaultPrng.init(n);
         const rnd = prng.random();
@@ -1955,7 +1953,7 @@ fn phaseIndex(name: []const u8) usize {
     unreachable;
 }
 
-// ---- shared.exl3_trunk_launches: Flash-Next's trellis trunk decode launches as served (rows_exact, stacked parts in one
+// ---- shared.exl3_trunk_launches: Flash-Next's trellis trunk decode launches as served (exact rows, stacked parts in one
 // launch) against the affine-8 trunk they replace (one `quantized_matmul` per part) ----
 
 /// One decode launch of a trunk layer: its parts (stacked into one trellis launch, one `quantized_matmul` each on the
@@ -1984,7 +1982,7 @@ const flash_next_launch_names = blk: {
 pub const trunk_launches: report.Bench = .{
     .name = "shared.exl3_trunk_launches",
     .scope = .shared,
-    .what = "Flash-Next trellis trunk launches (K4, K6; stacked parts one launch, rows_exact) against affine-8 qmv per part and the one-tile 64-bit NAX walk, over distinct banks",
+    .what = "Flash-Next trellis trunk launches (K4, K6; stacked parts one launch, exact rows) against affine-8 qmv per part and the one-tile 64-bit NAX walk, over distinct banks",
     .unit = .us,
     .steps = 64,
     .axes = &.{
@@ -2050,23 +2048,22 @@ fn trunkLaunchStep(c: TrunkLaunchCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_ar
             return np;
         },
         1 => {
-            project_rows.rows_exact = true;
             const sh = c.shared[ci];
+            const opts: root.linear.Opts = .{ .rows = .{ .exact = true } };
             if (np == 1) {
-                ys[0] = try root.linear.linear(s, x, sh.p, kernels.SPEC1_W15);
+                ys[0] = try root.linear.linearWith(s, x, sh.p, kernels.SPEC1_W15, opts);
                 return 1;
             }
             var outs: [root.linear.SHARED_MAX]mlx.mlx_array = undefined;
-            try root.linear.linearShared(s, x, sh, kernels.SPEC1_W15, outs[0..np]);
+            try root.linear.linearSharedWith(s, x, sh, kernels.SPEC1_W15, outs[0..np], opts);
             for (outs[0..np], 0..) |o, p| ys[p] = o;
             return np;
         },
         2, 4, 5, 6 => {
             // The served launch on the one-tile walk and the 64-bit reader (walk1), or with only one of them (unr2, r32).
-            project_rows.rows_exact = true;
             const p = c.shared[ci].p;
             const out: c_int = @intCast(totalOut(c.sh));
-            var g = project_rows.rowsGeometry(@intCast(c.sh.in), out, @intCast(c.rows), 1);
+            var g = project_rows.rowsGeometry(@intCast(c.sh.in), out, @intCast(c.rows), 1, .{ .exact = true });
             g.sw = false;
             if (c.arm != 4) g.unr = 1;
             if (c.arm != 5) g.r32 = false;
@@ -2154,10 +2151,7 @@ fn trunkLaunchBytes(a: std.mem.Allocator, smp: TrunkLaunchSample, arm: usize) ![
 
 fn runTrunkLaunches(run: *report.Run) anyerror!void {
     const s = mlx.gpuStream();
-    defer {
-        kernels.setDecodeParams(.mul1);
-        project_rows.rows_exact = false;
-    }
+    defer kernels.setDecodeParams(.mul1);
     var prng = std.Random.DefaultPrng.init(0x51);
     const rnd = prng.random();
     try kernels.SPEC1_W15.requireTable();

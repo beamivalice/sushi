@@ -28,16 +28,16 @@ admitted rate and is always on for eligible shapes ([glm5-arch](glm5-arch.md)).
   r-then-simdgroup sum, so the bytes are the lane kernels'. Chain meter, n36 / n40: 178.6 / 179.9 → 140.5 / 144.8
   µs per layer (gate/up 108.8 → 82.7, down 59.5 → 47.0). It serves rows 1 only (the lane kernels keep rows 2–16) and
   needs input tiles % 8 and output tiles % 2.
-- **Verification rows share weight reads** (`src/exl3/glm_group2.zig`, 3–4 BF16 rows, 4096/2048, top-8, clamp 10,
+- **Verification rows share weight reads** (`src/exl3/coop_rows2.zig`, 3–4 BF16 rows, 4096/2048, top-8, clamp 10,
   MCG, std1 or spec1 at any window, pair1 at w16, every admitted n, gate/up equal and down free): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
   feeds two independent FP32 accumulator sets, and a serial 4 KiB member reduction keeps the r-then-simdgroup order.
   Singleton leaders run the unchanged body. Routed-chain replay −20% on layers with expert overlap; DFlash2 N2 512/64
-  decode 42.43 → 45.45 tok/s at n36 (`ba106e5e`); at n40 (Sushi-2.5bpw, kv8, A4 DFlash2, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) +3.2% at 512/64 (4/4 pairs) and +5.0% at 8K/128, same bytes. Real 8K verify rounds are singleton-heavy (70% of assignments). The gate is `glm_group2.servesRate`; a guard test enumerates every admitted n.
+  decode 42.43 → 45.45 tok/s at n36 (`ba106e5e`); at n40 (Sushi-2.5bpw, kv8, A4 DFlash2, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) +3.2% at 512/64 (4/4 pairs) and +5.0% at 8K/128, same bytes. Real 8K verify rounds are singleton-heavy (70% of assignments). The gate is `coop_rows2.servesRate`; a guard test enumerates every admitted n.
 - **Prefill** prepares gate/up straight from token rows, shares one window table across the three projections,
   builds the inverse routing on the GPU (at most 512 experts) and finishes from the sorted down plane; the stride
   fallback scatters. WIN32 already skips its second 16-row MMA for runs of at most 16 rows (512-token prompts touch a
   median 230 of 288 experts).
-- **Full T2048 chunks transpose the grid** (`src/exl3/glm_prefill_grid.zig`, B1, H4096/I2048, E288, top-8, every admitted
+- **Full T2048 chunks transpose the grid** (`src/exl3/prefill_grid.zig`, B1, H4096/I2048, E288, top-8, every admitted
   n including mixed per-projection rates, MCG, std1 or spec1 at every window, pair1 at w16 (one NAX kernel per codebook and window, like the GEMM), clamp 10): physical X walks routing windows and Y the 128-column output stripes; logical IDs, dot body and
   stores are unchanged. Actual L20 chain 19.64 → 17.96 ms at n36 (−8.6%, 11/11); at n40 (Sushi-2.5bpw, kv8, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) prefill +4.5% at 8K and +2.7% at 32K, same bytes. A test enumerates every admitted n against the sorted chain. The T2048 routed chain is GEMM-bound
   (gate/up ≈60%, down ≈30%; sort/prepare/middle/finish ≈1.75 of 17.35 ms).

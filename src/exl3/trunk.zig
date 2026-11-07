@@ -9,7 +9,6 @@ const format = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const project_rows = @import("project_rows.zig");
 const linear = @import("linear.zig");
-const trunk_gemm = @import("trunk_gemm.zig");
 
 pub const Triple = struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array };
 
@@ -30,19 +29,11 @@ fn leadingRows(sh: []const c_int) c_int {
     return rows;
 }
 
-/// Up to eight rows take one arm per machine at every width (`rows_exact`), so a row beside others (a batched tick, a
-/// verify block) rounds as it does alone; a spec verify (`wide`) keeps that arm up to 16 rows. The flags are read when a
-/// launch is built, and DeepSeek sets `rows_exact` around its own; returns the values to restore.
-fn pinExactRows(wide: bool) [2]bool {
-    const prev = [2]bool{ project_rows.rows_exact, project_rows.rows_wide };
-    project_rows.rows_exact = true;
-    project_rows.rows_wide = wide;
-    return prev;
-}
-
-fn unpin(prev: [2]bool) void {
-    project_rows.rows_exact = prev[0];
-    project_rows.rows_wide = prev[1];
+/// Up to eight rows take one arm per machine at every width (`exact`), so a row beside others (a batched tick, a
+/// verify block) rounds as it does alone; a spec verify (`wide`) keeps that arm up to 16 rows. The bill of a trunk
+/// launch holds the decoded path's scratch.
+fn launchOpts(wide: bool) linear.Opts {
+    return .{ .rows = .{ .exact = true, .wide = wide }, .decoded_billed = true };
 }
 
 /// `x` `[..., in]` through the bank, in x's dtype, each row rounding as it does alone; `wide` marks a spec verify.
@@ -53,12 +44,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.ml
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ rows, in }, 2, s));
-    const prev = pinExactRows(wide);
-    defer unpin(prev);
-    const billed = trunk_gemm.decoded_billed;
-    trunk_gemm.decoded_billed = true;
-    defer trunk_gemm.decoded_billed = billed;
-    const y = try linear.linear(s, flat, .{ .trellis = w, .suh = suh, .svh = svh }, dec);
+    const y = try linear.linearWith(s, flat, .{ .trellis = w, .suh = suh, .svh = svh }, dec, launchOpts(wide));
     defer _ = mlx.mlx_array_free(y);
     var shape: [8]c_int = undefined;
     @memcpy(shape[0..sh.len], sh);
@@ -151,13 +137,12 @@ pub fn sharedProject(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: forma
     const sx = mlx.getShape(x);
     const in = sx[sx.len - 1];
     const rows = leadingRows(sx);
-    const prev = pinExactRows(wide);
-    defer unpin(prev);
-    if (rows > project_rows.rowsMax()) return false;
+    const opts = launchOpts(wide);
+    if (rows > project_rows.rowsMax(opts.rows)) return false;
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ rows, in }, 2, s));
-    try linear.linearShared(s, flat, sh, dec, outs);
+    try linear.linearSharedWith(s, flat, sh, dec, outs, opts);
     errdefer for (outs) |a| {
         _ = mlx.mlx_array_free(a);
     };
@@ -344,8 +329,6 @@ test "exl3 trunk: a row beside others rounds as it does alone, so batched ticks 
         try mlx.check(mlx.mlx_array_item_bool(&same, eq));
         try testing.expect(same);
     }
-    // The pin is scoped: a caller that runs with the flag off finds it off.
-    try testing.expect(!project_rows.rows_exact);
 }
 
 fn bitsEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !bool {
@@ -518,7 +501,6 @@ test "exl3 trunk: a 9- to 16-row spec verify keeps each row's decode tick bytes,
         };
     }
 
-    try testing.expect(!project_rows.rows_wide);
     var none: [2]mlx.mlx_array = undefined;
     try testing.expect(!try sharedProject(s, try rowsOf(s, xs, 0, 9, &pool), sh, dec, &none, false));
 }

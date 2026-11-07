@@ -380,7 +380,7 @@ pub const Dsv41Vision = struct {
         transient_peak.begin();
         const hidden = try self.towerHidden(patches, grid_h, grid_w);
         defer _ = mlx.mlx_array_free(hidden);
-        var sc = Scope.init(self.allocator, self.s);
+        var sc = Scope.plain(self.allocator, self.s);
         defer sc.deinit();
         const feats = try self.aligner(&sc, hidden, grid_h, grid_w);
         const out = sc.out(try self.span(&sc, feats, grid_h, grid_w));
@@ -402,7 +402,7 @@ pub const Dsv41Vision = struct {
         const shape = mlx.getShape(patches);
         if (n == 0 or shape.len != 2 or shape[0] != ci(n) or shape[1] != ci(3 * v.patch * v.patch)) return error.InvalidPatchGrid;
         var x: A = blk: {
-            var sc = Scope.init(self.allocator, self.s);
+            var sc = Scope.plain(self.allocator, self.s);
             defer sc.deinit();
             const e = sc.out(try self.patch.apply(&sc, try sc.astype(patches, .bfloat16)));
             errdefer _ = mlx.mlx_array_free(e);
@@ -410,11 +410,11 @@ pub const Dsv41Vision = struct {
             break :blk e;
         };
         defer _ = mlx.mlx_array_free(x);
-        var rope_sc = Scope.init(self.allocator, self.s);
+        var rope_sc = Scope.plain(self.allocator, self.s);
         defer rope_sc.deinit();
         const rope = try ropeTables(&rope_sc, v, grid_h, grid_w);
         for (self.blocks[0..n_blocks]) |*b| {
-            var sc = Scope.init(self.allocator, self.s);
+            var sc = Scope.plain(self.allocator, self.s);
             defer sc.deinit();
             const attn = try self.attention(&sc, try sc.rms(x, b.norm1, EPS), b, rope);
             const mid = try sc.add(x, attn);
@@ -429,7 +429,7 @@ pub const Dsv41Vision = struct {
             _ = mlx.mlx_array_set(&partial, x);
             return partial;
         }
-        var sc = Scope.init(self.allocator, self.s);
+        var sc = Scope.plain(self.allocator, self.s);
         defer sc.deinit();
         const out = sc.out(try sc.rms(x, self.norm, EPS));
         errdefer _ = mlx.mlx_array_free(out);

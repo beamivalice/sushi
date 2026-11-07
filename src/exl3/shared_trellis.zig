@@ -45,11 +45,8 @@ pub fn geometry(b: Banks, hidden: c_int, rows: c_int) ?Geo {
     b.dec.requireTable() catch return null;
     const n_gu = (kernels.packedRate(gs[3]) catch return null).n;
     const n_dn = (kernels.packedRate(ds[3]) catch return null).n;
-    const prev = project_rows.rows_exact;
-    project_rows.rows_exact = true;
-    defer project_rows.rows_exact = prev;
-    const gu = project_rows.rowsGeometry(hidden, both, rows, 1);
-    const dn = project_rows.rowsGeometry(width, hidden, rows, 1);
+    const gu = project_rows.rowsGeometry(hidden, both, rows, 1, .{ .exact = true });
+    const dn = project_rows.rowsGeometry(width, hidden, rows, 1, .{ .exact = true });
     for ([_]project_rows.RowsGeom{ gu, dn }) |g| if (!g.nax or g.kph != 1 or g.nsplit < 2) return null;
     return .{ .hidden = hidden, .width = width, .gu = gu, .dn = dn, .n_gu = n_gu, .n_dn = n_dn, .dec = b.dec };
 }

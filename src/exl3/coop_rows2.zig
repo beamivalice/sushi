@@ -303,7 +303,7 @@ pub fn moeLayoutShared(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank
             defer _ = mlx.mlx_array_free(middle);
             break :blk if (down == .grouped) (try projectLayout(s, middle, bank.down.trellis, ids, reduction, .lane)) orelse return null else try support.lane_down(s, middle, bank.down.trellis, ids);
         }
-        if (down == .baseline and h == 4096 and inter == 2048 and gs[3] == 36 and dec.codebook.servesGlmFastPaths() and dec.window == .w12)
+        if (down == .baseline and h == 4096 and inter == 2048 and gs[3] == 36 and dec.codebook.servesLaneFastPaths() and dec.window == .w12)
             if (try support.fused_middle_down(s, gu[0], gu[1], bank.down.trellis, bank.gate.svh, bank.up.svh, bank.down.suh, ids, 10, 8)) |v| {
                 fused_middle_down_calls += 1;
                 break :blk v;

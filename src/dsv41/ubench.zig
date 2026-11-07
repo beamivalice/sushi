@@ -125,7 +125,7 @@ const IndexDecode = struct {
 };
 
 fn sampleIndexDecode(c: *const IndexDecode, arm: usize) anyerror!f64 {
-    var t = Scope.init(alloc, c.gpu);
+    var t = Scope.plain(alloc, c.gpu);
     defer t.deinit();
     var sw = io_util.Stopwatch.init(io());
     switch (@as(IndexStage, @fromBackingInt(@intCast(arm)))) {
@@ -155,7 +155,7 @@ fn runIndexDecode(run: *report.Run) anyerror!void {
     var keys_buf: [8]usize = undefined;
     var rows_buf: [8]usize = undefined;
     for (try axisInts(run, "keys", &keys_buf)) |nb| {
-        var sc = Scope.init(alloc, gpu);
+        var sc = Scope.plain(alloc, gpu);
         defer sc.deinit();
         var rows = try model.streamKeys(&sc, nb, 4096, 0x4d0);
         defer rows.deinit();
@@ -215,7 +215,7 @@ fn sampleSpan(c: *SpanSample, arm: usize) anyerror!f64 {
     var fake: model.Model = undefined;
     fakeModel(&fake);
     const p = Peak.begin(c.gpu);
-    var t = Scope.init(alloc, c.gpu);
+    var t = Scope.plain(alloc, c.gpu);
     defer t.deinit();
     const a = c.a;
     var sw = io_util.Stopwatch.init(io());
@@ -243,7 +243,7 @@ fn runIndexPeak(run: *report.Run) anyerror!void {
         if (!listed(run.axis("span"), g.name)) continue;
         for (try axisInts(run, "ctx", &ctx_buf)) |ctx| {
             const nb = ctx / g.r;
-            var sc = Scope.init(alloc, gpu);
+            var sc = Scope.plain(alloc, gpu);
             defer sc.deinit();
             var rows = try model.streamKeys(&sc, nb, 4096, 0x4d0);
             defer rows.deinit();
@@ -286,7 +286,7 @@ fn sampleBlock(c: *BlockSample, arm: usize) anyerror!f64 {
     var fake: model.Model = undefined;
     fakeModel(&fake);
     const p = Peak.begin(c.gpu);
-    var t = Scope.init(alloc, c.gpu);
+    var t = Scope.plain(alloc, c.gpu);
     defer t.deinit();
     const a = c.a;
     const pk = a.rows.pack.?;
@@ -309,7 +309,7 @@ fn runIndexBlockPeak(run: *report.Run) anyerror!void {
     fakeModel(&fake);
     var ctx_buf: [8]usize = undefined;
     for (try axisInts(run, "ctx", &ctx_buf)) |ctx| {
-        var sc = Scope.init(alloc, gpu);
+        var sc = Scope.plain(alloc, gpu);
         defer sc.deinit();
         const L = block_rows;
         var rows = try model.streamKeys(&sc, ctx, 4096, 0x4d0);
@@ -361,7 +361,7 @@ fn sampleGrow(c: *GrowSample, _: usize) anyerror!f64 {
     try mlx.check(mlx.mlx_array_set(&rows.sbuf, c.base.sbuf));
     defer rows.deinit();
     const p = Peak.begin(c.gpu);
-    var t = Scope.init(alloc, c.gpu);
+    var t = Scope.plain(alloc, c.gpu);
     defer t.deinit();
     var sw = io_util.Stopwatch.init(io());
     try rows.append(&t, c.chunk);
@@ -378,7 +378,7 @@ fn runRowsGrowth(run: *report.Run) anyerror!void {
     for ([_]Store{ .{ .name = "comp", .width = 512, .mode = .fp4_e4m3, .group = 16 }, .{ .name = "index", .width = 128, .mode = .fp4_ue8m0, .group = 32 } }) |g| {
         if (!listed(run.axis("store"), g.name)) continue;
         for (try axisInts(run, "used", &used_buf)) |n| {
-            var sc = Scope.init(alloc, gpu);
+            var sc = Scope.plain(alloc, gpu);
             defer sc.deinit();
             var rows: model.Rows = .{ .width = g.width, .dtype = .bfloat16, .pack = .{ .mode = g.mode, .group = g.group } };
             defer rows.deinit();
@@ -418,7 +418,7 @@ fn sampleAttn(s: *AttnSample, arm: usize) anyerror!f64 {
     const scale = 1.0 / @sqrt(@as(f32, 512));
     const d = s.d;
     const c = s.c;
-    var sc = Scope.init(alloc, s.gpu);
+    var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     const p = Peak.begin(s.gpu);
     var sw = io_util.Stopwatch.init(io());
@@ -445,7 +445,7 @@ fn runAttnSpan(run: *report.Run) anyerror!void {
     };
     for (cases) |cs| {
         if (!listed(run.axis("span"), cs.name)) continue;
-        var base = Scope.init(alloc, gpu);
+        var base = Scope.plain(alloc, gpu);
         defer base.deinit();
         const d = try model.attnCaseData(&base, cs.c, 0xa77);
         try evalAll(&.{ d.q, d.keys, d.band, d.sink });
@@ -474,7 +474,7 @@ pub const attn_decode: report.Bench = .{
 const AttnDecodeSample = struct { gpu: mlx.mlx_stream, q: A, ring: A, comp: A, topk: A, sink: A, freqs: A, steps: usize, splits: usize };
 
 fn sampleAttnDecode(s: *const AttnDecodeSample, _: usize) anyerror!f64 {
-    var sc = Scope.init(alloc, s.gpu);
+    var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     var sw = io_util.Stopwatch.init(io());
     var q = s.q;
@@ -509,7 +509,7 @@ fn runAttnDecode(run: *report.Run) anyerror!void {
     const f32t = mlx.mlx_dtype.float32;
     for (cases) |cs| {
         if (!listed(run.axis("keys"), cs.name)) continue;
-        var sc = Scope.init(alloc, gpu);
+        var sc = Scope.plain(alloc, gpu);
         defer sc.deinit();
         var picks: [512]i32 = undefined;
         for (picks[0..cs.k], 0..) |*v, i| v.* = @intCast((i * 7919 + 3) % cs.nc);
@@ -552,7 +552,7 @@ const EpiSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.Attn
 fn sampleEpilogue(s: *EpiSample, arm: usize) anyerror!f64 {
     const scale = 1.0 / @sqrt(@as(f32, 512));
     const c = s.c;
-    var sc = Scope.init(alloc, s.gpu);
+    var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     const p = Peak.begin(s.gpu);
     var sw = io_util.Stopwatch.init(io());
@@ -584,7 +584,7 @@ fn runAttnEpilogue(run: *report.Run) anyerror!void {
     qat_mod.invFreqs(&f, 64, 65536, 160000, 16, 32, 1);
     for (cases) |cs| {
         if (!listed(run.axis("span"), cs.name)) continue;
-        var base = Scope.init(alloc, gpu);
+        var base = Scope.plain(alloc, gpu);
         defer base.deinit();
         const d = try model.attnCaseData(&base, cs.c, 0xa77);
         var store: ?model.Rows = if (cs.c.K > 0) try model.packedStore(&base, d.comp) else null;
@@ -622,7 +622,7 @@ const PicksSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.At
 
 fn samplePicks(s: *PicksSample, arm: usize) anyerror!f64 {
     const scale = 1.0 / @sqrt(@as(f32, 512));
-    var sc = Scope.init(alloc, s.gpu);
+    var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     const p = Peak.begin(s.gpu);
     var sw = io_util.Stopwatch.init(io());
@@ -644,7 +644,7 @@ fn runPicksSpan(run: *report.Run) anyerror!void {
         if (!listed(run.axis("span"), cs.name)) continue;
         for (try axisInts(run, "rows", &rows_buf)) |nc| {
             const c: model.AttnCase = .{ .L = cs.L, .wp = 127, .K = 512, .nc = nc, .holes = false };
-            var base = Scope.init(alloc, gpu);
+            var base = Scope.plain(alloc, gpu);
             defer base.deinit();
             const d = try model.attnCaseData(&base, c, 0xa77);
             var store = try model.packedStore(&base, d.comp);
@@ -704,7 +704,7 @@ fn picksLink(sc: *Scope, prev: A, rows: A, ids: A) !A {
 const PicksGlueSample = struct { gpu: mlx.mlx_stream, rows: *const model.Rows, topk: A, steps: usize };
 
 fn samplePicksGlue(s: *PicksGlueSample, arm: usize) anyerror!f64 {
-    var sc = Scope.init(alloc, s.gpu);
+    var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     const pk = s.rows.pack.?;
     const fixed = try qat_mod.unpackPicks(&sc, s.rows.buf, s.rows.sbuf, s.topk, pk.mode, pk.group, s.rows.dtype);
@@ -732,7 +732,7 @@ fn runPicksGlue(run: *report.Run) anyerror!void {
     var l_buf: [8]usize = undefined;
     for (try axisInts(run, "rows", &rows_buf)) |nc| for (try axisInts(run, "L", &l_buf)) |L| {
         const c: model.AttnCase = .{ .L = L, .wp = 127, .K = 512, .nc = nc };
-        var base = Scope.init(alloc, gpu);
+        var base = Scope.plain(alloc, gpu);
         defer base.deinit();
         const d = try model.attnCaseData(&base, c, 0xa77);
         var store = try model.packedStore(&base, d.comp);
@@ -774,7 +774,7 @@ pub const topk: report.Bench = .{
 const TopkSample = struct { gpu: mlx.mlx_stream, xs: *const [8]A, batch: usize, k: usize };
 
 fn sampleTopk(c: *const TopkSample, arm: usize) anyerror!f64 {
-    var t = Scope.init(alloc, c.gpu);
+    var t = Scope.plain(alloc, c.gpu);
     defer t.deinit();
     var outs: [8]A = undefined;
     var sw = io_util.Stopwatch.init(io());
@@ -798,7 +798,7 @@ fn runTopk(run: *report.Run) anyerror!void {
             // The gathered width does not depend on the context: time it once.
             if (std.mem.eql(u8, sh.name, "gathered") and ci_ > 0) continue;
             for (try axisInts(run, "rows", &rows_buf)) |L| {
-                var sc = Scope.init(alloc, gpu);
+                var sc = Scope.plain(alloc, gpu);
                 defer sc.deinit();
                 var xs: [8]A = undefined;
                 for (&xs, 0..) |*x, i| x.* = try sc.add(try kernels.randn(&sc, &.{ ci(L), ci(sh.n) }, .float32, 90 + i, 1.0), try sc.f(@floatFromInt(i)));
@@ -838,7 +838,7 @@ const HcExpandSample = struct { gpu: mlx.mlx_stream, d: HcExpandData, ffn: bool 
 
 fn sampleHcExpand(s: *HcExpandSample, arm: usize) anyerror!f64 {
     const d = s.d;
-    var sc = Scope.init(alloc, s.gpu);
+    var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     var sw = io_util.Stopwatch.init(io());
     const x1 = if (arm == 0) try model.hcExpandOps(&sc, d.x, d.y, d.post, d.comb) else try kernels.hcExpandFused(&sc, d.x, d.y, d.post, d.comb);
@@ -858,7 +858,7 @@ fn runHcExpand(run: *report.Run) anyerror!void {
     try kernels.probeHc(alloc, gpu, 4, D, 20);
     var rows_buf: [8]usize = undefined;
     for (try axisInts(run, "rows", &rows_buf)) |L| {
-        var sc = Scope.init(alloc, gpu);
+        var sc = Scope.plain(alloc, gpu);
         defer sc.deinit();
         const l: c_int = ci(L);
         const f32t = mlx.mlx_dtype.float32;
@@ -905,7 +905,7 @@ const HcExpandDecodeSample = struct { gpu: mlx.mlx_stream, d: HcExpandData };
 
 fn sampleHcExpandDecode(s: *HcExpandDecodeSample, arm: usize) anyerror!f64 {
     const d = s.d;
-    var sc = Scope.init(alloc, s.gpu);
+    var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     var sw = io_util.Stopwatch.init(io());
     var x = d.x;
@@ -923,7 +923,7 @@ fn runHcExpandDecode(run: *report.Run) anyerror!void {
     const gpu = mlx.gpuStream();
     const D = 5120;
     try kernels.probeHc(alloc, gpu, 4, D, 20);
-    var sc = Scope.init(alloc, gpu);
+    var sc = Scope.plain(alloc, gpu);
     defer sc.deinit();
     const f32t = mlx.mlx_dtype.float32;
     const d: HcExpandData = .{
@@ -976,7 +976,7 @@ const HcStagesSample = struct { gpu: mlx.mlx_stream, d: HcExpandData, z: A, stag
 fn sampleHcStages(s: *HcStagesSample, arm: usize) anyerror!f64 {
     const d = s.d;
     const tile = hc_tiles[arm];
-    var sc = Scope.init(alloc, s.gpu);
+    var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     var ev: [hc_reps]A = undefined;
     var sw = io_util.Stopwatch.init(io());
@@ -1007,7 +1007,7 @@ fn runHcStages(run: *report.Run) anyerror!void {
     try kernels.probeHc(alloc, gpu, 4, D, 20);
     var rows_buf: [8]usize = undefined;
     for (try axisInts(run, "rows", &rows_buf)) |L| {
-        var sc = Scope.init(alloc, gpu);
+        var sc = Scope.plain(alloc, gpu);
         defer sc.deinit();
         const l: c_int = ci(L);
         const f32t = mlx.mlx_dtype.float32;
@@ -1097,7 +1097,7 @@ const FusionData = struct {
 };
 
 fn sampleFusion(d: *FusionData, arm: usize) anyerror!f64 {
-    var sc = Scope.init(alloc, d.gpu);
+    var sc = Scope.plain(alloc, d.gpu);
     defer sc.deinit();
     var sw = io_util.Stopwatch.init(io());
     var ev: [2]A = undefined;
@@ -1148,7 +1148,7 @@ fn runLaunchFusions(run: *report.Run) anyerror!void {
     var l_buf: [8]usize = undefined;
     const f32t = mlx.mlx_dtype.float32;
     for (try axisInts(run, "L", &l_buf)) |L| {
-        var sc = Scope.init(alloc, gpu);
+        var sc = Scope.plain(alloc, gpu);
         defer sc.deinit();
         const l: c_int = ci(L);
         var f: [32]f32 = undefined;

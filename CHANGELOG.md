@@ -4,6 +4,12 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **The `sushi_exl3` module names no architecture**: its files and public names now say what they do (the old names
+  stay as deprecated aliases for one release), and its per-call modes are parameters instead of process globals, with
+  output unchanged.
+
 ## v1.5.1 — Thinking effort settings, fuller prompt-cache reuse, faster Qwen trellis packs
 
 - **Thinking effort is a setting**: Settings › Inference › Thinking effort sets, for Qwen, DeepSeek and GLM, which

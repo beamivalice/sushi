@@ -2967,6 +2967,7 @@ pub fn moePrefill(
     slots: mlx.mlx_array,
     scores: mlx.mlx_array,
     topk: c_int,
+    window_meta: ?bool,
 ) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
     const rows = xsh[0];
@@ -2990,7 +2991,7 @@ pub fn moePrefill(
     const win = gemmWindowRows();
     const aligned = gemmWindowAligned();
     const gt = mlx.getShape(gate_t);
-    const optimized = sorted_windows.gpuWindowPrefillOn(hidden, gt[2] * 16, gt[0], topk) and aligned;
+    const optimized = (window_meta orelse sorted_windows.gpuWindowPrefillOn(hidden, gt[2] * 16, gt[0], topk)) and aligned;
     const metadata: ?sorted_windows.GpuWindowTable = if (optimized) try sorted_windows.buildGpuWindowTable(s, sorted_slots, order_i, nslots, win, gt[0]) else null;
     defer if (metadata) |m| {
         _ = mlx.mlx_array_free(m.inverse);
@@ -4688,7 +4689,7 @@ test "exl3 moePrefill matches staged sorted chain" {
     defer _ = mlx.mlx_array_free(suh);
     const svh = mlx.mlx_array_new_data(stacked_svh.ptr, &[_]c_int{ E, dim }, 2, .float16);
     defer _ = mlx.mlx_array_free(svh);
-    const got = try moePrefill(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, topk);
+    const got = try moePrefill(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, topk, null);
     defer _ = mlx.mlx_array_free(got);
     var order = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(order);
@@ -4910,7 +4911,7 @@ test "exl3 prefill arm matches the fused decode arm across row counts and top-k"
         defer _ = mlx.mlx_array_free(ca);
         const dec = try moeSwigluFused(s, xa, tr, suh, svh, tr, suh, svh, tr, suh, svh, sa, ca, .float16);
         defer _ = mlx.mlx_array_free(dec);
-        const pre = try moePrefill(s, xa, tr, suh, svh, tr, suh, svh, tr, suh, svh, sa, ca, @intCast(topk));
+        const pre = try moePrefill(s, xa, tr, suh, svh, tr, suh, svh, tr, suh, svh, sa, ca, @intCast(topk), null);
         defer _ = mlx.mlx_array_free(pre);
         var cd = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cd);
@@ -5442,7 +5443,7 @@ test "exl3 decode and prefill arms agree with the indexed chain at production ge
     defer _ = mlx.mlx_array_free(cn);
     const dec = try moeSwigluFused(s, xn, tg, sgh, vgi, tg, sgh, vgi, td, sdi, vdh, sn, cn, .float16);
     defer _ = mlx.mlx_array_free(dec);
-    const pre = try moePrefill(s, xn, tg, sgh, vgi, tg, sgh, vgi, td, sdi, vdh, sn, cn, @intCast(topk));
+    const pre = try moePrefill(s, xn, tg, sgh, vgi, tg, sgh, vgi, td, sdi, vdh, sn, cn, @intCast(topk), null);
     defer _ = mlx.mlx_array_free(pre);
     var cd = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cd);
@@ -5460,7 +5461,7 @@ test "exl3 decode and prefill arms agree with the indexed chain at production ge
 /// One MiMo-V2.6-Flash MoE layer's shape and routing on the GPU arms: hidden
 /// != inter, every expert holding its OWN bank, and a routing that leaves some
 /// experts unrouted while giving others more rows than one GEMM window holds.
-pub const MimoMoeCase = struct {
+pub const MoeCase = struct {
     e: usize,
     hidden: usize,
     inter: usize,
@@ -5470,16 +5471,18 @@ pub const MimoMoeCase = struct {
     dec: exl3.Decode,
     seed: u64,
     /// |suh_h|, |svh_i|, |suh_i|, |svh_h|. The default is the synthetic 0.9 the
-    /// parity cases use; the served pack's own magnitudes are `MIMO_BANKS`.
+    /// parity cases use; the served pack's own magnitudes are `SERVED_W12_BANKS`.
     banks: [4]f32 = @splat(0.9),
     x_scale: f32 = 0.05,
+    /// Forces the GPU window metadata and the inverse-indexed finish on or off in the prefill arm; null keeps the geometry's.
+    window_meta: ?bool = null,
 };
 
 /// The served w12 pack's own scale magnitudes: |suh| is ~0.01 and |svh| ~1,
 /// so the residual's size reaches the arm's f16 planes through the GEMMs.
-pub const MIMO_BANKS = [4]f32{ 0.0126, 1.03, 0.0083, 1.009 };
+pub const SERVED_W12_BANKS = [4]f32{ 0.0126, 1.03, 0.0083, 1.009 };
 
-pub const MimoMoeFixture = struct {
+pub const MoeFixture = struct {
     arrays: [10]mlx.mlx_array,
     gate_t: []u16,
     up_t: []u16,
@@ -5491,15 +5494,16 @@ pub const MimoMoeFixture = struct {
     xf: []f32,
     slots: []u32,
     scores: []f32,
+    window_meta: ?bool = null,
 
-    pub fn deinit(self: *MimoMoeFixture) void {
+    pub fn deinit(self: *MoeFixture) void {
         for (self.arrays) |a| _ = mlx.mlx_array_free(a);
     }
 };
 
 /// Real routing: every row takes `topk` DISTINCT experts from a skewed draw, so
 /// a few experts carry runs longer than a window and many carry none.
-fn mimoRouting(alloc: std.mem.Allocator, rows: usize, topk: usize, e: usize, rnd: std.Random) ![]u32 {
+fn moeRouting(alloc: std.mem.Allocator, rows: usize, topk: usize, e: usize, rnd: std.Random) ![]u32 {
     const out = try alloc.alloc(u32, rows * topk);
     const hot = @max(topk, e / 8);
     for (0..rows) |r| {
@@ -5518,7 +5522,7 @@ fn mimoRouting(alloc: std.mem.Allocator, rows: usize, topk: usize, e: usize, rnd
     return out;
 }
 
-pub fn mimoMoeFixture(alloc: std.mem.Allocator, c: MimoMoeCase) !MimoMoeFixture {
+pub fn moeFixture(alloc: std.mem.Allocator, c: MoeCase) !MoeFixture {
     const n = c.rate.halfwords();
     const ith = c.hidden / 16;
     const iti = c.inter / 16;
@@ -5544,7 +5548,7 @@ pub fn mimoMoeFixture(alloc: std.mem.Allocator, c: MimoMoeCase) !MimoMoeFixture 
         b.* = exl3.f32ToF16Bits((rnd.float(f32) * 2 - 1) * c.x_scale);
         v.* = exl3.f16BitsToF32(b.*);
     }
-    const slots = try mimoRouting(alloc, c.rows, c.topk, c.e, rnd);
+    const slots = try moeRouting(alloc, c.rows, c.topk, c.e, rnd);
     const scores = try alloc.alloc(f32, c.rows * c.topk);
     for (scores) |*v| v.* = 0.05 + rnd.float(f32) * 0.3;
     const ci = struct {
@@ -5575,15 +5579,16 @@ pub fn mimoMoeFixture(alloc: std.mem.Allocator, c: MimoMoeCase) !MimoMoeFixture 
         .xf = xf,
         .slots = slots,
         .scores = scores,
+        .window_meta = c.window_meta,
     };
 }
 
-pub fn mimoPrefillArm(s: mlx.mlx_stream, f: *const MimoMoeFixture, topk: usize) !mlx.mlx_array {
+pub fn moePrefillArm(s: mlx.mlx_stream, f: *const MoeFixture, topk: usize) !mlx.mlx_array {
     const a = f.arrays;
-    return moePrefill(s, a[8], a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], @intCast(topk));
+    return moePrefill(s, a[8], a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], @intCast(topk), f.window_meta);
 }
 
-fn mimoDecodeArm(s: mlx.mlx_stream, f: *const MimoMoeFixture) !mlx.mlx_array {
+fn moeDecodeArm(s: mlx.mlx_stream, f: *const MoeFixture) !mlx.mlx_array {
     const a = f.arrays;
     return moeSwigluFused(s, a[8], a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], .float16);
 }
@@ -5596,7 +5601,7 @@ pub fn evalF16(s: mlx.mlx_stream, a: mlx.mlx_array, out: *mlx.mlx_array) ![*c]co
 
 /// The prefill arm against the host tile decode of the SAME routing: the only
 /// oracle here that shares no kernel with what it scores.
-fn mimoPrefillMatchesHost(c: MimoMoeCase) !void {
+fn moePrefillMatchesHost(c: MoeCase) !void {
     setDecodeParams(c.dec);
     defer setDecodeParams(.mul1);
     const t = std.testing;
@@ -5605,9 +5610,9 @@ fn mimoPrefillMatchesHost(c: MimoMoeCase) !void {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var f = try mimoMoeFixture(alloc, c);
+    var f = try moeFixture(alloc, c);
     defer f.deinit();
-    const pre = try mimoPrefillArm(s, &f, c.topk);
+    const pre = try moePrefillArm(s, &f, c.topk);
     defer _ = mlx.mlx_array_free(pre);
     var cp = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cp);
@@ -5642,7 +5647,7 @@ fn mimoPrefillMatchesHost(c: MimoMoeCase) !void {
 
 /// The two arms on the same rows. The decode chain is what MiMo answers
 /// correctly live, so it is the reference at widths the host oracle cannot reach.
-fn mimoArmsAgree(c: MimoMoeCase) !void {
+fn moeArmsAgree(c: MoeCase) !void {
     setDecodeParams(c.dec);
     defer setDecodeParams(.mul1);
     const t = std.testing;
@@ -5650,11 +5655,11 @@ fn mimoArmsAgree(c: MimoMoeCase) !void {
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), c);
+    var f = try moeFixture(arena.allocator(), c);
     defer f.deinit();
-    const pre = try mimoPrefillArm(s, &f, c.topk);
+    const pre = try moePrefillArm(s, &f, c.topk);
     defer _ = mlx.mlx_array_free(pre);
-    const dec = try mimoDecodeArm(s, &f);
+    const dec = try moeDecodeArm(s, &f);
     defer _ = mlx.mlx_array_free(dec);
     var cp = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cp);
@@ -5673,8 +5678,8 @@ const Exl3F32Peaks = struct { g: f64 = 0, u: f64 = 0, mid: f64 = 0, down_inner: 
 fn exl3SwigluF32(
     alloc: std.mem.Allocator,
     x: []const f32,
-    f: *const MimoMoeFixture,
-    c: MimoMoeCase,
+    f: *const MoeFixture,
+    c: MoeCase,
     slots: []const u32,
     scores: []const f32,
     peaks: *Exl3F32Peaks,
@@ -5735,7 +5740,7 @@ fn exl3SwigluF32(
 }
 
 /// Both arms against the f32 SwiGLU, at whatever magnitude the case carries.
-fn mimoArmMatchesF32(c: MimoMoeCase) !void {
+fn moeArmMatchesF32(c: MoeCase) !void {
     setDecodeParams(c.dec);
     defer setDecodeParams(.mul1);
     const t = std.testing;
@@ -5744,12 +5749,12 @@ fn mimoArmMatchesF32(c: MimoMoeCase) !void {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var f = try mimoMoeFixture(alloc, c);
+    var f = try moeFixture(alloc, c);
     defer f.deinit();
     const y = if (usesPrefillArm(c.rows))
-        try mimoPrefillArm(s, &f, c.topk)
+        try moePrefillArm(s, &f, c.topk)
     else
-        try mimoDecodeArm(s, &f);
+        try moeDecodeArm(s, &f);
     defer _ = mlx.mlx_array_free(y);
     var cy = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cy);
@@ -5804,7 +5809,7 @@ test "exl3 token preparation preserves a subnormal scale on a hot BF16 channel" 
 
 test "mimo_v2 EXL3 arms stay finite where the SwiGLU product passes the f16 ceiling" {
     for ([_]usize{ 4, 33 }) |rows| {
-        try mimoArmMatchesF32(.{
+        try moeArmMatchesF32(.{
             .e = 8,
             .hidden = 512,
             .inter = 256,
@@ -5813,7 +5818,7 @@ test "mimo_v2 EXL3 arms stay finite where the SwiGLU product passes the f16 ceil
             .rate = .{ .n = 40 },
             .dec = .{ .codebook = .mcg, .window = .w12 },
             .seed = 9001 + rows,
-            .banks = MIMO_BANKS,
+            .banks = SERVED_W12_BANKS,
             .x_scale = 512,
         });
     }
@@ -5821,7 +5826,7 @@ test "mimo_v2 EXL3 arms stay finite where the SwiGLU product passes the f16 ceil
 
 test "mimo_v2 EXL3 prefill rows match the host SwiGLU oracle past one GEMM window" {
     for ([_]usize{ 33, 40, 64, 128 }) |rows| {
-        try mimoPrefillMatchesHost(.{
+        try moePrefillMatchesHost(.{
             .e = 64,
             .hidden = 256,
             .inter = 128,
@@ -5836,7 +5841,7 @@ test "mimo_v2 EXL3 prefill rows match the host SwiGLU oracle past one GEMM windo
 
 test "mimo_v2 EXL3 prefill rows match the fused decode arm at E=256 top-8" {
     for ([_]usize{ 33, 64, 128, 512 }) |rows| {
-        try mimoArmsAgree(.{
+        try moeArmsAgree(.{
             .e = 256,
             .hidden = 256,
             .inter = 128,
@@ -5851,7 +5856,7 @@ test "mimo_v2 EXL3 prefill rows match the fused decode arm at E=256 top-8" {
 
 test "mimo_v2 EXL3 prefill rows match the fused decode arm at the served hidden and inter" {
     for ([_]usize{ 33, 64 }) |rows| {
-        try mimoArmsAgree(.{
+        try moeArmsAgree(.{
             .e = 16,
             .hidden = 4096,
             .inter = 2048,
@@ -5866,7 +5871,7 @@ test "mimo_v2 EXL3 prefill rows match the fused decode arm at the served hidden 
 
 /// The window geometry the production code resolves, through the levers it
 /// reads: the cached answer is dropped so the env is what decides.
-fn withGemmWindow(win: ?[*:0]const u8, aligned: bool, c: MimoMoeCase) !void {
+fn withGemmWindow(win: ?[*:0]const u8, aligned: bool, c: MoeCase) !void {
     const prev_win = gemm_win_cached;
     const prev_align = gemm_align_cached;
     defer {
@@ -5879,11 +5884,11 @@ fn withGemmWindow(win: ?[*:0]const u8, aligned: bool, c: MimoMoeCase) !void {
     gemm_align_cached = null;
     if (win) |w| _ = setenv("SUSHI_EXL3_GEMM_WIN", w, 1) else _ = unsetenv("SUSHI_EXL3_GEMM_WIN");
     _ = setenv("SUSHI_EXL3_WIN_ALIGN", if (aligned) "1" else "0", 1);
-    try mimoArmsAgree(c);
+    try moeArmsAgree(c);
 }
 
 test "mimo_v2 EXL3 prefill rows match the fused decode arm on every GEMM arm" {
-    const base = MimoMoeCase{
+    const base = MoeCase{
         .e = 256,
         .hidden = 256,
         .inter = 128,
@@ -5912,7 +5917,7 @@ test "mimo_v2 EXL3 prefill rows match the fused decode arm on every GEMM arm" {
 // cached kernel config, while a tail-bumped pack gives them different RATES:
 // the built dispatches must not read each other's.
 test "mimo_v2 EXL3 prefill layers built lazily keep their own window count and rate" {
-    const c0 = MimoMoeCase{
+    const c0 = MoeCase{
         .e = 256,
         .hidden = 256,
         .inter = 128,
@@ -5931,15 +5936,15 @@ test "mimo_v2 EXL3 prefill layers built lazily keep their own window count and r
     defer arena.deinit();
     const alloc = arena.allocator();
     const L = 48;
-    var fs: [L]MimoMoeFixture = undefined;
+    var fs: [L]MoeFixture = undefined;
     var lazy: [L]mlx.mlx_array = undefined;
     for (0..L) |i| {
         var c = c0;
         c.seed = 7000 + i;
         // The tail layers a bumped pack packs wider, built into the same graph.
         if (i + 2 >= L) c.rate = .{ .n = 64 };
-        fs[i] = try mimoMoeFixture(alloc, c);
-        lazy[i] = try mimoPrefillArm(s, &fs[i], c0.topk);
+        fs[i] = try moeFixture(alloc, c);
+        lazy[i] = try moePrefillArm(s, &fs[i], c0.topk);
     }
     defer for (0..L) |i| {
         _ = mlx.mlx_array_free(lazy[i]);
@@ -5949,7 +5954,7 @@ test "mimo_v2 EXL3 prefill layers built lazily keep their own window count and r
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
     for (0..L) |i| {
-        const dec = try mimoDecodeArm(s, &fs[i]);
+        const dec = try moeDecodeArm(s, &fs[i]);
         defer _ = mlx.mlx_array_free(dec);
         var cp = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cp);
@@ -6073,7 +6078,7 @@ test "exl3 prefill output carries the activation dtype" {
     defer _ = mlx.mlx_array_free(sl);
     const sc = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{rows * topk}, 1, .float32);
     defer _ = mlx.mlx_array_free(sc);
-    const out = try moePrefill(s, x_arr, tr_a, suh_a, svh_a, tr_a, suh_a, svh_a, tr_a, suh_a, svh_a, sl, sc, topk);
+    const out = try moePrefill(s, x_arr, tr_a, suh_a, svh_a, tr_a, suh_a, svh_a, tr_a, suh_a, svh_a, sl, sc, topk, null);
     defer _ = mlx.mlx_array_free(out);
     try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out));
     var c = mlx.mlx_array_new();
@@ -6383,7 +6388,7 @@ pub fn rowsParityStats(c: RowsCase) !Exl3GemmParityStats {
     defer _ = mlx.mlx_array_free(svh_a);
     const slots = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{@intCast(c.rows)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(slots);
-    const geom = c.geom orelse project_rows.rowsGeometry(@intCast(c.in_dim), @intCast(c.out_dim), @intCast(c.rows), 1);
+    const geom = c.geom orelse project_rows.rowsGeometry(@intCast(c.in_dim), @intCast(c.out_dim), @intCast(c.rows), 1, .{});
     const got_a = try project_rows.projectRowsWith(s, x_a, tr3, suh_a, svh_a, geom, if (c.mutant_rows) try rowsMutantKernel(geom) else try project_rows.rowsKernel(geom), null);
     defer _ = mlx.mlx_array_free(got_a);
     const comp_a = try projectIndexed(s, x_a, tr4, suh_a, svh_a, slots);
@@ -6584,21 +6589,21 @@ pub fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime
     }
 }
 
-fn n40PrefillBf16Truth(seed: u64, win: c_int) !void {
-    return n40Bf16Truth(seed, win, 65, false);
+fn n40PrefillBf16Truth(seed: u64, win: c_int, window_meta: ?bool) !void {
+    return n40Bf16Truth(seed, win, 65, false, window_meta);
 }
 
-fn n40Bf16Truth(seed: u64, win: c_int, rows: usize, decode: bool) !void {
-    const c = MimoMoeCase{ .e = 8, .hidden = 256, .inter = 128, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = seed, .banks = MIMO_BANKS, .x_scale = 3 };
+fn n40Bf16Truth(seed: u64, win: c_int, rows: usize, decode: bool, window_meta: ?bool) !void {
+    const c = MoeCase{ .e = 8, .hidden = 256, .inter = 128, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = seed, .banks = SERVED_W12_BANKS, .x_scale = 3, .window_meta = window_meta };
     return bf16TruthCase(c, win, decode);
 }
 
-fn bf16TruthCase(c: MimoMoeCase, win: c_int, decode: bool) !void {
+fn bf16TruthCase(c: MoeCase, win: c_int, decode: bool) !void {
     if (!gemmNaxOn()) return error.SkipZigTest;
     return bf16TruthCaseAnyArm(c, win, decode);
 }
 
-fn bf16TruthCaseAnyArm(c: MimoMoeCase, win: c_int, decode: bool) !void {
+fn bf16TruthCaseAnyArm(c: MoeCase, win: c_int, decode: bool) !void {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const hidden = c.hidden;
@@ -6612,7 +6617,7 @@ fn bf16TruthCaseAnyArm(c: MimoMoeCase, win: c_int, decode: bool) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var f = try mimoMoeFixture(alloc, c);
+    var f = try moeFixture(alloc, c);
     defer f.deinit();
     const xb = try alloc.alloc(u16, f.xf.len);
     for (f.xf, xb) |*v, *b| {
@@ -6626,7 +6631,7 @@ fn bf16TruthCaseAnyArm(c: MimoMoeCase, win: c_int, decode: bool) !void {
     const y = if (decode)
         try moeSwigluFused(s, ar[8], ar[0], ar[3], ar[4], ar[1], ar[3], ar[4], ar[2], ar[5], ar[6], ar[7], ar[9], .bfloat16)
     else
-        try mimoPrefillArm(s, &f, c.topk);
+        try moePrefillArm(s, &f, c.topk);
     defer _ = mlx.mlx_array_free(y);
     // Two or more rows prepare the pair input once per slot in its own dispatch; one row prepares in the pair.
     if (decode and (prepared_mid_force orelse false)) try std.testing.expectEqual(@as(u32, if (rows >= 2) 5 else 4), fusedDispatchCount());
@@ -6690,7 +6695,7 @@ const BF16_NO_WORSE_ULPS = 0.1;
 
 test "exl3 n40 NAX BF16 prefill no worse than composite against f32 truth" {
     for ([_]c_int{32}) |win| {
-        for (0..3) |seed| try n40PrefillBf16Truth(318 + seed, win);
+        for (0..3) |seed| try n40PrefillBf16Truth(318 + seed, win, null);
     }
 }
 
@@ -6699,18 +6704,16 @@ test "exl3 BF16 prefill on the simdgroup-matrix body no worse than composite aga
     var env: FallbackEnv = .{};
     env.force();
     defer env.restore();
-    defer sorted_windows.gpu_window_prefill_force = null;
     gemm_simdmat_engaged = false;
-    // Both window tables: the host-built one, and MiMo's GPU-built metadata with its sorted finish.
-    for ([_]?bool{ null, true }) |mimo_meta| {
-        sorted_windows.gpu_window_prefill_force = mimo_meta;
+    // Both window tables: the host-built one, and the GPU-built metadata with its sorted finish.
+    for ([_]?bool{ null, true }) |window_meta| {
         for (0..PARITY_SEEDS) |seed| {
             for ([_]struct { rate: exl3.Rate, dec: exl3.Decode }{
                 .{ .rate = .{ .n = 36 }, .dec = .{ .codebook = .mcg, .window = .w12 } },
                 .{ .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 } },
                 .{ .rate = .{ .n = 48 }, .dec = .{ .codebook = .mcg, .window = .w15 } },
             }) |arm| {
-                try bf16TruthCaseAnyArm(.{ .e = 8, .hidden = 256, .inter = 128, .topk = 8, .rows = 65, .rate = arm.rate, .dec = arm.dec, .seed = 318 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, false);
+                try bf16TruthCaseAnyArm(.{ .e = 8, .hidden = 256, .inter = 128, .topk = 8, .rows = 65, .rate = arm.rate, .dec = arm.dec, .seed = 318 + seed, .banks = SERVED_W12_BANKS, .x_scale = 3, .window_meta = window_meta }, 32, false);
             }
         }
     }
@@ -6788,14 +6791,12 @@ test "exl3 sorted BF16 finish uses one dispatch and preserves f32 truth error" {
 }
 
 test "exl3 prefill metadata and sorted finish preserve BF16 f32-truth bar" {
-    sorted_windows.gpu_window_prefill_force = true;
-    defer sorted_windows.gpu_window_prefill_force = null;
-    for (0..3) |seed| try n40PrefillBf16Truth(318 + seed, 32);
+    for (0..3) |seed| try n40PrefillBf16Truth(318 + seed, 32, true);
 }
 
 test "exl3 n40 decode BF16 rows no worse than composite against f32 truth" {
     for (1..9) |rows| {
-        for (0..3) |seed| try n40Bf16Truth(318 + seed, 32, rows, true);
+        for (0..3) |seed| try n40Bf16Truth(318 + seed, 32, rows, true, null);
     }
 }
 
@@ -6805,7 +6806,7 @@ test "exl3 n40 prepared mid adds one dispatch and preserves BF16 f32 truth" {
     prepared_mid_force = true;
     defer prepared_mid_force = null;
     for (1..9) |rows| {
-        for (0..3) |seed| try n40Bf16Truth(318 + seed, 32, rows, true);
+        for (0..3) |seed| try n40Bf16Truth(318 + seed, 32, rows, true, null);
     }
 }
 
@@ -7426,7 +7427,7 @@ test "exl3 prepared mid keys on MiMo geometry, never on the rate, and excludes q
 fn n48FunnelCase(cb: exl3.Codebook, rows: usize, seed: u64, decode: bool, prepared: ?bool) !void {
     prepared_mid_force = prepared;
     defer prepared_mid_force = null;
-    try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = .{ .n = 48 }, .dec = exl3.Decode.tabled(cb, .w12), .seed = seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, decode);
+    try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = .{ .n = 48 }, .dec = exl3.Decode.tabled(cb, .w12), .seed = seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, decode);
 }
 
 test "exl3 the n48 funnel engages for every codebook" {
@@ -7445,7 +7446,7 @@ test "exl3 the n42 funnel engages on the decode and NAX arms and keeps the f32-t
     }) |k| {
         funnel_engaged = @splat(false);
         for (0..PARITY_SEEDS) |seed| {
-            try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = k.rows, .rate = .{ .n = 42 }, .dec = w15, .seed = 318 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, k.decode);
+            try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = k.rows, .rate = .{ .n = 42 }, .dec = w15, .seed = 318 + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, k.decode);
         }
         for (k.arms) |arm| try std.testing.expect(funnel_engaged[@backingInt(arm)]);
     }
@@ -7478,14 +7479,14 @@ fn gemvOutBytes(a: mlx.mlx_array) ![]const u8 {
 /// The lane funnel's two-tile layout against the generic window reader at one
 /// tile per threadgroup: the pair planes and both downs must match to the bit.
 /// Both downs read the reference pair planes, so a down mismatch is its own.
-fn funnelLayoutBytesMatch(c: MimoMoeCase) !void {
+fn funnelLayoutBytesMatch(c: MoeCase) !void {
     setDecodeParams(c.dec);
     defer setDecodeParams(.mul1);
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), c);
+    var f = try moeFixture(arena.allocator(), c);
     defer f.deinit();
     const a = f.arrays;
     const hidden: c_int = @intCast(c.hidden);
@@ -7518,15 +7519,15 @@ test "exl3 decode GEMV funnel layout is bit-identical to the one-tile reader" {
     };
     for (cases) |k| {
         for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| {
-            try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = k.topk, .rows = rows, .rate = .{ .n = k.n }, .dec = k.dec, .seed = 318 + rows, .banks = MIMO_BANKS, .x_scale = 3 });
+            try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = k.topk, .rows = rows, .rate = .{ .n = k.n }, .dec = k.dec, .seed = 318 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 });
         }
     }
-    try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = 4, .rate = .{ .n = 42 }, .dec = .mul1, .seed = 518, .banks = MIMO_BANKS, .x_scale = 3 });
+    try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = 4, .rate = .{ .n = 42 }, .dec = .mul1, .seed = 518, .banks = SERVED_W12_BANKS, .x_scale = 3 });
 }
 
 /// The MiMo decode chain at the served hidden and inter (prepared mid, grouped verify
 /// rows) on the fast arms against the one-tile generic reader, to the bit.
-fn mimoChainBytesMatch(c: MimoMoeCase) !void {
+fn moeChainBytesMatch(c: MoeCase) !void {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     setDecodeParams(c.dec);
@@ -7536,7 +7537,7 @@ fn mimoChainBytesMatch(c: MimoMoeCase) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var f = try mimoMoeFixture(alloc, c);
+    var f = try moeFixture(alloc, c);
     defer f.deinit();
     const xb = try alloc.alloc(u16, f.xf.len);
     for (f.xf, xb) |v, *b| b.* = @truncate(@as(u32, @bitCast(v)) >> 16);
@@ -7599,9 +7600,9 @@ test "exl3 every admitted rate takes the fast arms, bit-identical to the generic
     inline for (comptime sampleRates(24, 64, false)) |n| try mcgReadersExact(n);
     for (exl3.ADMITTED_SAMPLE) |n| {
         for ([_]usize{ 1, 4 }) |rows| {
-            try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = w12, .seed = 418 + n + rows, .banks = MIMO_BANKS, .x_scale = 3 });
+            try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = w12, .seed = 418 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 });
         }
-        try mimoChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = n }, .dec = w12, .seed = 618 + n, .banks = MIMO_BANKS, .x_scale = 3 });
+        try moeChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = n }, .dec = w12, .seed = 618 + n, .banks = SERVED_W12_BANKS, .x_scale = 3 });
         naxBodyBytesMatch(.{ .n = n }, w12, 256, 256, 818 + n) catch |e| if (e != error.SkipZigTest) return e;
         for ([_]bool{ false, true }) |fallback| {
             var env: FallbackEnv = .{};
@@ -7617,14 +7618,14 @@ test "exl3 every admitted rate takes the fast arms, bit-identical to the generic
 
 /// GLM's clamped decode chain at one (rate, window): both lane kernels engage under every codebook
 /// GLM's fast paths serve, and the bytes are the staged chain's.
-fn glmLaneChainBytesMatch(n: u32, dec: exl3.Decode, rows: usize, seed: u64) !void {
+fn laneChainBytesMatch(n: u32, dec: exl3.Decode, rows: usize, seed: u64) !void {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     setDecodeParams(dec);
     defer setDecodeParams(.mul1);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = 256, .inter = 256, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = n }, .dec = dec, .seed = seed, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+    var f = try moeFixture(arena.allocator(), .{ .hidden = 256, .inter = 256, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = n }, .dec = dec, .seed = seed, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
     defer f.deinit();
     const a = f.arrays;
     var x = mlx.mlx_array_new();
@@ -7656,10 +7657,10 @@ test "exl3 every K1.5 to K2 rate takes the fast arms at every window, bit-identi
             const dec: exl3.Decode = .{ .codebook = .mcg, .window = win };
             const seed: u64 = 100 * n + win.bits();
             for ([_]usize{ 1, 4 }) |rows| {
-                try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = seed + rows, .banks = MIMO_BANKS, .x_scale = 3 });
-                try glmLaneChainBytesMatch(n, dec, rows, seed + rows);
+                try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = seed + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 });
+                try laneChainBytesMatch(n, dec, rows, seed + rows);
             }
-            try mimoChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = n }, .dec = dec, .seed = seed, .banks = MIMO_BANKS, .x_scale = 3 });
+            try moeChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = n }, .dec = dec, .seed = seed, .banks = SERVED_W12_BANKS, .x_scale = 3 });
             naxBodyBytesMatch(.{ .n = n }, dec, 256, 256, seed) catch |e| if (e != error.SkipZigTest) return e;
             for ([_]bool{ false, true }) |fallback| {
                 var env: FallbackEnv = .{};
@@ -7706,34 +7707,34 @@ test "exl3 PAIR1 decode chain matches the host SwiGLU reference and the host til
 test "exl3 PAIR1 decode and prefill rows hold the f32-truth bar at Flash-Next's top-k" {
     for (PAIR1_NS) |n| {
         for ([_]usize{ 1, 4, 9, 33 }) |rows| {
-            for (0..3) |seed| try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = PAIR1_W16, .seed = 5000 + 10 * n + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, rows <= DECODE_ROWS_MAX);
+            for (0..3) |seed| try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = PAIR1_W16, .seed = 5000 + 10 * n + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, rows <= DECODE_ROWS_MAX);
         }
     }
-    for ([_]usize{ 1, 4 }) |rows| try bf16TruthCase(.{ .e = 32, .hidden = 2560, .inter = 640, .topk = 10, .rows = rows, .rate = .{ .n = 32 }, .dec = PAIR1_W16, .seed = 5900 + rows, .banks = MIMO_BANKS, .x_scale = 3 }, 32, true);
+    for ([_]usize{ 1, 4 }) |rows| try bf16TruthCase(.{ .e = 32, .hidden = 2560, .inter = 640, .topk = 10, .rows = rows, .rate = .{ .n = 32 }, .dec = PAIR1_W16, .seed = 5900 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, true);
 }
 
 test "exl3 PAIR1 decode arms keep the generic reader's bytes, MiMo's prepared and grouped arms included" {
     for ([_]u32{ 24, 32, 42, 64 }) |n| for ([_]usize{ 1, 4, 9 }) |rows| {
-        try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = PAIR1_W16, .seed = 6000 + n + rows, .banks = MIMO_BANKS, .x_scale = 3 });
+        try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = PAIR1_W16, .seed = 6000 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 });
     };
-    try mimoChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = PAIR1_W16, .seed = 6100, .banks = MIMO_BANKS, .x_scale = 3 });
+    try moeChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = PAIR1_W16, .seed = 6100, .banks = SERVED_W12_BANKS, .x_scale = 3 });
 }
 
 test "exl3 GLM serves PAIR1 on its lane fast paths with the staged chain's bytes" {
-    for ([_]u32{ 24, 36, 40 }) |n| for ([_]usize{ 1, 3, 4 }) |rows| try glmLaneChainBytesMatch(n, PAIR1_W16, rows, 6200 + rows);
+    for ([_]u32{ 24, 36, 40 }) |n| for ([_]usize{ 1, 3, 4 }) |rows| try laneChainBytesMatch(n, PAIR1_W16, rows, 6200 + rows);
 }
 
 test "exl3 GLM serves spec1 and std1 on its lane fast paths with the staged chain's bytes" {
-    for ([_]exl3.Decode{ SPEC1_W15, STD1_W15 }) |dec| for ([_]usize{ 1, 3, 4 }) |rows| try glmLaneChainBytesMatch(36, dec, rows, 6200 + rows);
+    for ([_]exl3.Decode{ SPEC1_W15, STD1_W15 }) |dec| for ([_]usize{ 1, 3, 4 }) |rows| try laneChainBytesMatch(36, dec, rows, 6200 + rows);
 }
 
 /// GLM's clamped decode chain under a hash-mask codebook at the served geometry: both lane kernels
 /// engage, the one-row pair and down on one row, and the folded bytes are the unfolded oracle's.
-fn glmLaneFoldMatch(cb: exl3.Codebook, n: u32, win: exl3.Window, rows: usize, banks: [4]f32, x_scale: f32) !void {
-    return glmLaneFoldMatchAt(exl3.Decode.tabled(cb, win), n, rows, banks, x_scale);
+fn laneFoldMatch(cb: exl3.Codebook, n: u32, win: exl3.Window, rows: usize, banks: [4]f32, x_scale: f32) !void {
+    return laneFoldMatchAt(exl3.Decode.tabled(cb, win), n, rows, banks, x_scale);
 }
 
-fn glmLaneFoldMatchAt(dec: exl3.Decode, n: u32, rows: usize, banks: [4]f32, x_scale: f32) !void {
+fn laneFoldMatchAt(dec: exl3.Decode, n: u32, rows: usize, banks: [4]f32, x_scale: f32) !void {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     setDecodeParams(dec);
@@ -7743,7 +7744,7 @@ fn glmLaneFoldMatchAt(dec: exl3.Decode, n: u32, rows: usize, banks: [4]f32, x_sc
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = 4096, .inter = 2048, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = n }, .dec = dec, .seed = 6300 + n + rows, .banks = banks, .x_scale = x_scale });
+    var f = try moeFixture(arena.allocator(), .{ .hidden = 4096, .inter = 2048, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = n }, .dec = dec, .seed = 6300 + n + rows, .banks = banks, .x_scale = x_scale });
     defer f.deinit();
     const a = f.arrays;
     var x = mlx.mlx_array_new();
@@ -7769,18 +7770,18 @@ fn glmLaneFoldMatchAt(dec: exl3.Decode, n: u32, rows: usize, banks: [4]f32, x_sc
 
 test "exl3 GLM serves PAIR1 on its lane chain at the served geometry with the unfolded oracle's bytes" {
     for ([_]u32{ 24, 36, 40 }) |n| for ([_]usize{ 1, 3, 4 }) |rows| {
-        try glmLaneFoldMatch(.pair1, n, .w16, rows, MIMO_BANKS, 0.005);
-        try glmLaneFoldMatch(.pair1, n, .w16, rows, MIMO_BANKS, 3);
-        try glmLaneFoldMatch(.pair1, n, .w16, rows, @splat(0.9), 8);
+        try laneFoldMatch(.pair1, n, .w16, rows, SERVED_W12_BANKS, 0.005);
+        try laneFoldMatch(.pair1, n, .w16, rows, SERVED_W12_BANKS, 3);
+        try laneFoldMatch(.pair1, n, .w16, rows, @splat(0.9), 8);
     };
 }
 
 test "exl3 GLM serves spec1 and std1 on its lane chain at the served geometry with the unfolded oracle's bytes" {
     for ([_]exl3.Codebook{ .spec1, .std1 }) |cb| for ([_]exl3.Window{ .w14, .w15 }) |win| for ([_]u32{ 36, 40 }) |n| for ([_]usize{ 1, 3, 4 }) |rows| {
-        try glmLaneFoldMatch(cb, n, win, rows, MIMO_BANKS, 0.005);
-        try glmLaneFoldMatch(cb, n, win, rows, MIMO_BANKS, 3);
+        try laneFoldMatch(cb, n, win, rows, SERVED_W12_BANKS, 0.005);
+        try laneFoldMatch(cb, n, win, rows, SERVED_W12_BANKS, 3);
         // The SwiGLU clamp is live at these magnitudes.
-        try glmLaneFoldMatch(cb, n, win, rows, @splat(0.9), 8);
+        try laneFoldMatch(cb, n, win, rows, @splat(0.9), 8);
     };
 }
 
@@ -7795,7 +7796,7 @@ fn f32Bits(s: mlx.mlx_stream, a: mlx.mlx_array, out: *mlx.mlx_array) ![]const u3
 
 /// A hash-mask codebook's chains with its scale folded into the stores (served) against the same
 /// chains with the scale decoded into every weight (`unfolded_for_test`, the converter's form): to the byte.
-fn foldBytesMatch(c: MimoMoeCase, arm: FoldArm) !void {
+fn foldBytesMatch(c: MoeCase, arm: FoldArm) !void {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     setDecodeParams(c.dec);
@@ -7818,7 +7819,7 @@ fn foldBytesMatch(c: MimoMoeCase, arm: FoldArm) !void {
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), c);
+    var f = try moeFixture(arena.allocator(), c);
     defer f.deinit();
     const a = f.arrays;
     var xb = mlx.mlx_array_new();
@@ -7835,7 +7836,7 @@ fn foldBytesMatch(c: MimoMoeCase, arm: FoldArm) !void {
         const chain = if (c.rows <= DECODE_ROWS_MAX)
             try moeSwigluFused(s, xb, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], .bfloat16)
         else
-            try moePrefill(s, xb, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], topk);
+            try moePrefill(s, xb, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], topk, null);
         defer _ = mlx.mlx_array_free(chain);
         const clamped = try moeSwigluClamped(s, xb, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], topk, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(clamped);
@@ -7849,24 +7850,24 @@ fn foldBytesMatch(c: MimoMoeCase, arm: FoldArm) !void {
 // down to activations whose unfolded inner sums would sit far below f16's normal range.
 test "exl3 spec1's 2^12 folded into the stores keeps every byte of the decode, verify, prefill and clamped chains" {
     for ([_]f32{ 0.005, 3 }) |x_scale| for ([_]u32{ 24, 32, 40, 48, 64 }) |n| for ([_]usize{ 1, 4, 33 }) |rows| {
-        const c: MimoMoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_W15, .seed = 7300 + n + rows, .banks = MIMO_BANKS, .x_scale = x_scale };
+        const c: MoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_W15, .seed = 7300 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = x_scale };
         try foldBytesMatch(c, .{});
         if (rows > DECODE_ROWS_MAX) try foldBytesMatch(c, .{ .scalar_gemm = true });
     };
-    for ([_]usize{ 1, 4, 33 }) |rows| try foldBytesMatch(.{ .e = 32, .hidden = 2560, .inter = 640, .topk = 10, .rows = rows, .rate = .{ .n = 32 }, .dec = SPEC1_W15, .seed = 7400 + rows, .banks = MIMO_BANKS, .x_scale = 3 }, .{});
-    try foldBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = SPEC1_W15, .seed = 7500, .banks = MIMO_BANKS, .x_scale = 3 }, .{ .prepared = true });
+    for ([_]usize{ 1, 4, 33 }) |rows| try foldBytesMatch(.{ .e = 32, .hidden = 2560, .inter = 640, .topk = 10, .rows = rows, .rate = .{ .n = 32 }, .dec = SPEC1_W15, .seed = 7400 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 }, .{});
+    try foldBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = SPEC1_W15, .seed = 7500, .banks = SERVED_W12_BANKS, .x_scale = 3 }, .{ .prepared = true });
 }
 
 // PAIR1 folds its 2^12 like the hash-mask codebooks: exact, in every chain.
 test "exl3 PAIR1's 2^12 folded into the stores keeps every byte of the decode, verify, prefill and clamped chains" {
     for ([_]f32{ 0.005, 0.5, 3, 30 }) |x_scale| for ([_]u32{ 24, 28, 32, 40, 42, 48, 64 }) |n| for ([_]usize{ 1, 4, 9, 33 }) |rows| {
-        const c: MimoMoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = PAIR1_W16, .seed = 7600 + n + rows, .banks = MIMO_BANKS, .x_scale = x_scale };
+        const c: MoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = PAIR1_W16, .seed = 7600 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = x_scale };
         try foldBytesMatch(c, .{});
         try foldBytesMatch(c, .{ .funnel_off = true });
         if (rows > DECODE_ROWS_MAX) try foldBytesMatch(c, .{ .scalar_gemm = true });
     };
     for ([_]f32{ 0.005, 3 }) |x_scale| {
-        const mimo: MimoMoeCase = .{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = PAIR1_W16, .seed = 7700, .banks = MIMO_BANKS, .x_scale = x_scale };
+        const mimo: MoeCase = .{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = PAIR1_W16, .seed = 7700, .banks = SERVED_W12_BANKS, .x_scale = x_scale };
         try foldBytesMatch(mimo, .{ .prepared = true });
         try foldBytesMatch(mimo, .{ .prepared = true, .grouped_off = true });
         var one = mimo;
@@ -7911,28 +7912,28 @@ test "exl3 SPEC1 per-rate table: the decode chain matches the host SwiGLU refere
 test "exl3 SPEC1 per-rate table: decode and prefill rows hold the f32-truth bar at Flash-Next's top-k" {
     for ([_]u32{ 24, 32, 42, 48, 64 }) |n| {
         for ([_]usize{ 1, 4, 9, 33 }) |rows| {
-            for (0..3) |seed| try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_PER_RATE, .seed = 5000 + 10 * n + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, rows <= DECODE_ROWS_MAX);
+            for (0..3) |seed| try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_PER_RATE, .seed = 5000 + 10 * n + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, rows <= DECODE_ROWS_MAX);
         }
     }
 }
 
 test "exl3 SPEC1 per-rate table: decode arms keep the generic reader's bytes, MiMo's prepared and grouped arms included" {
     for ([_]u32{ 24, 32, 42, 64 }) |n| for ([_]usize{ 1, 4, 9 }) |rows| {
-        try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_PER_RATE, .seed = 6000 + n + rows, .banks = MIMO_BANKS, .x_scale = 3 });
+        try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_PER_RATE, .seed = 6000 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 });
     };
-    try mimoChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = SPEC1_PER_RATE, .seed = 6100, .banks = MIMO_BANKS, .x_scale = 3 });
+    try moeChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = SPEC1_PER_RATE, .seed = 6100, .banks = SERVED_W12_BANKS, .x_scale = 3 });
 }
 
 test "exl3 SPEC1 per-rate table: GLM's lane fast paths and fold keep the staged chain's bytes" {
     for ([_]u32{ 24, 36, 40, 64 }) |n| for ([_]usize{ 1, 3, 4 }) |rows| {
-        try glmLaneChainBytesMatch(n, perRate(.w12), rows, 6200 + rows);
-        try glmLaneFoldMatchAt(perRate(.w12), n, rows, MIMO_BANKS, 3);
+        try laneChainBytesMatch(n, perRate(.w12), rows, 6200 + rows);
+        try laneFoldMatchAt(perRate(.w12), n, rows, SERVED_W12_BANKS, 3);
     };
 }
 
 test "exl3 SPEC1 per-rate table: the 2^12 folded into the stores keeps every byte of every chain" {
     for ([_]f32{ 0.005, 3 }) |x_scale| for ([_]u32{ 24, 32, 40, 48, 64 }) |n| for ([_]usize{ 1, 4, 33 }) |rows| {
-        const c: MimoMoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_PER_RATE, .seed = 7800 + n + rows, .banks = MIMO_BANKS, .x_scale = x_scale };
+        const c: MoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_PER_RATE, .seed = 7800 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = x_scale };
         try foldBytesMatch(c, .{});
         if (rows > DECODE_ROWS_MAX) try foldBytesMatch(c, .{ .scalar_gemm = true });
     };
@@ -7956,10 +7957,10 @@ test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and
                 for (0..PARITY_SEEDS) |i| try sortedGemmParity(rate, dec, 32, 3001 + 10 * n + i);
             }
             for ([_]usize{ 1, 4, 9, 33 }) |rows| {
-                try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = rate, .dec = dec, .seed = 5000 + 10 * n, .banks = MIMO_BANKS, .x_scale = 3 }, 32, rows <= DECODE_ROWS_MAX);
+                try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = rate, .dec = dec, .seed = 5000 + 10 * n, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, rows <= DECODE_ROWS_MAX);
             }
-            try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = 4, .rate = rate, .dec = dec, .seed = 6000 + n, .banks = MIMO_BANKS, .x_scale = 3 });
-            try foldBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = 4, .rate = rate, .dec = dec, .seed = 7800 + n, .banks = MIMO_BANKS, .x_scale = 3 }, .{});
+            try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = 4, .rate = rate, .dec = dec, .seed = 6000 + n, .banks = SERVED_W12_BANKS, .x_scale = 3 });
+            try foldBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = 4, .rate = rate, .dec = dec, .seed = 7800 + n, .banks = SERVED_W12_BANKS, .x_scale = 3 }, .{});
         }
         for (SPEC1_WIDE_NS) |n| for (0..PARITY_SEEDS) |i| try indexedParity(.{ .n = n }, 128, 128, 4, 10, 4001 + 10 * n + i, dec);
     }
@@ -7984,7 +7985,7 @@ fn bf16Bytes(s: mlx.mlx_stream, a: mlx.mlx_array, out: *mlx.mlx_array) ![]const 
 
 /// A MiMo verify block against each row's own one-row decode tick, on a bank so small that
 /// the rows share most experts: every row's bytes must be its tick's (greedy MTP == serial).
-fn verifyRowsMatchDecodeTicks(c: MimoMoeCase) !void {
+fn verifyRowsMatchDecodeTicks(c: MoeCase) !void {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     setDecodeParams(c.dec);
@@ -7994,7 +7995,7 @@ fn verifyRowsMatchDecodeTicks(c: MimoMoeCase) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var f = try mimoMoeFixture(alloc, c);
+    var f = try moeFixture(alloc, c);
     defer f.deinit();
     const xb = try alloc.alloc(u16, f.xf.len);
     for (f.xf, xb) |v, *b| b.* = @truncate(@as(u32, @bitCast(v)) >> 16);
@@ -8032,7 +8033,7 @@ fn verifyRowsMatchDecodeTicks(c: MimoMoeCase) !void {
 test "exl3 MiMo verify rows sharing experts are bit-identical to their one-row decode ticks" {
     for ([_]usize{ 2, 3, 4 }) |rows| {
         for (0..PARITY_SEEDS) |seed| {
-            try verifyRowsMatchDecodeTicks(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 318 + seed, .banks = MIMO_BANKS, .x_scale = 3 });
+            try verifyRowsMatchDecodeTicks(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 318 + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 });
         }
     }
 }
@@ -8047,7 +8048,7 @@ fn shuffled(rnd: std.Random, row: []u32) void {
 /// experts across all rows, `none` gives every row its own. Each row's order is shuffled so the sharing
 /// slots do not line up by position.
 fn plantedRouting(alloc: std.mem.Allocator, route: GroupRoute, rows: usize, topk: usize, e: usize, rnd: std.Random) ![]u32 {
-    if (route == .skewed) return mimoRouting(alloc, rows, topk, e, rnd);
+    if (route == .skewed) return moeRouting(alloc, rows, topk, e, rnd);
     const out = try alloc.alloc(u32, rows * topk);
     const shared = if (route == .one_expert) topk else if (route == .half) topk / 2 else 0;
     for (0..rows) |r| {
@@ -8070,7 +8071,7 @@ fn plantedExperts(route: GroupRoute, rows: usize, topk: usize) usize {
 
 /// A multi-row block on the grouped arm of capacity `bucket` against each row's own one-row decode tick:
 /// every row's bytes must be its tick's.
-fn groupedRowsMatchTicks(c: MimoMoeCase, route: GroupRoute, bucket: c_int, selfprep: bool) !void {
+fn groupedRowsMatchTicks(c: MoeCase, route: GroupRoute, bucket: c_int, selfprep: bool) !void {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     setDecodeParams(c.dec);
@@ -8085,7 +8086,7 @@ fn groupedRowsMatchTicks(c: MimoMoeCase, route: GroupRoute, bucket: c_int, selfp
     const alloc = arena.allocator();
     var e_case = c;
     e_case.e = plantedExperts(route, c.rows, c.topk);
-    var f = try mimoMoeFixture(alloc, e_case);
+    var f = try moeFixture(alloc, e_case);
     defer f.deinit();
     var prng = std.Random.DefaultPrng.init(c.seed ^ 0x9e3779b9);
     const slots = try plantedRouting(alloc, route, c.rows, c.topk, e_case.e, prng.random());
@@ -8140,7 +8141,7 @@ fn naturalBucket(rows: usize) c_int {
 
 fn groupedCodecSweep(dec: exl3.Decode, n: u32, seed: u64) !void {
     for (GROUP_ROWS) |rows| for (GROUP_ROUTES) |route| {
-        const c: MimoMoeCase = .{ .e = 0, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = seed + rows, .banks = MIMO_BANKS, .x_scale = 3 };
+        const c: MoeCase = .{ .e = 0, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = seed + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 };
         try groupedRowsMatchTicks(c, route, naturalBucket(rows), false);
     };
 }
@@ -8161,7 +8162,7 @@ test "exl3 grouped decode rows are bit-identical to their one-row ticks under PA
 test "exl3 grouped decode keeps the ticks' bytes at every capacity, wider than the rows and narrower" {
     const dec: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
     for ([_]usize{ 3, 5, 7, 12, 16 }) |rows| for (GROUP_BUCKETS) |bucket| for ([_]GroupRoute{ .one_expert, .half }) |route| {
-        const c: MimoMoeCase = .{ .e = 0, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = 40 }, .dec = dec, .seed = 11700 + rows, .banks = MIMO_BANKS, .x_scale = 3 };
+        const c: MoeCase = .{ .e = 0, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = 40 }, .dec = dec, .seed = 11700 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 };
         try groupedRowsMatchTicks(c, route, bucket, false);
     };
 }
@@ -8169,7 +8170,7 @@ test "exl3 grouped decode keeps the ticks' bytes at every capacity, wider than t
 test "exl3 grouped decode with the in-kernel prepare keeps the ticks' bytes" {
     const dec: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
     for ([_]usize{ 4, 8, 16 }) |rows| for ([_]GroupRoute{ .one_expert, .half, .skewed }) |route| {
-        const c: MimoMoeCase = .{ .e = 0, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = 40 }, .dec = dec, .seed = 11800 + rows, .banks = MIMO_BANKS, .x_scale = 3 };
+        const c: MoeCase = .{ .e = 0, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = 40 }, .dec = dec, .seed = 11800 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 };
         try groupedRowsMatchTicks(c, route, naturalBucket(rows), true);
     };
 }
@@ -8178,12 +8179,12 @@ test "exl3 grouped decode keeps the ticks' bytes at Flash-Next and DeepSeek geom
     const mcg: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
     for ([_]struct { n: u32, dec: exl3.Decode }{ .{ .n = 40, .dec = mcg }, .{ .n = 64, .dec = mcg }, .{ .n = 36, .dec = PAIR1_W16 }, .{ .n = 42, .dec = SPEC1_W15 } }) |k| {
         for ([_]usize{ 4, 8, 16 }) |rows| for ([_]GroupRoute{ .one_expert, .half, .skewed }) |route| {
-            const flash: MimoMoeCase = .{ .e = 0, .hidden = 2560, .inter = 640, .topk = 10, .rows = rows, .rate = .{ .n = k.n }, .dec = k.dec, .seed = 12000 + rows, .banks = MIMO_BANKS, .x_scale = 3 };
+            const flash: MoeCase = .{ .e = 0, .hidden = 2560, .inter = 640, .topk = 10, .rows = rows, .rate = .{ .n = k.n }, .dec = k.dec, .seed = 12000 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 };
             try groupedRowsMatchTicks(flash, route, naturalBucket(rows), false);
         };
     }
     for ([_]usize{ 3, 8 }) |rows| for ([_]GroupRoute{ .one_expert, .half }) |route| {
-        const ds: MimoMoeCase = .{ .e = 0, .hidden = 5120, .inter = 2304, .topk = 6, .rows = rows, .rate = .{ .n = 40 }, .dec = mcg, .seed = 12100 + rows, .banks = MIMO_BANKS, .x_scale = 3 };
+        const ds: MoeCase = .{ .e = 0, .hidden = 5120, .inter = 2304, .topk = 6, .rows = rows, .rate = .{ .n = 40 }, .dec = mcg, .seed = 12100 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 };
         try groupedRowsMatchTicks(ds, route, naturalBucket(rows), false);
     };
 }
@@ -8256,10 +8257,10 @@ test "exl3 expert grouping leads each run of GROUP same-expert slots, at any slo
     };
 }
 
-/// A verify block's routing at a stated overlap: row 0 and the replacement draws come from `mimoRouting`'s
+/// A verify block's routing at a stated overlap: row 0 and the replacement draws come from `moeRouting`'s
 /// skewed draw, and every later expert is instead one of the previous row's with probability `carry`.
 fn carriedRouting(alloc: std.mem.Allocator, rows: usize, topk: usize, e: usize, carry: f32, rnd: std.Random) ![]u32 {
-    const out = try mimoRouting(alloc, rows, topk, e, rnd);
+    const out = try moeRouting(alloc, rows, topk, e, rnd);
     for (1..rows) |r| {
         const row = out[r * topk ..][0..topk];
         const prev = out[(r - 1) * topk ..][0..topk];
@@ -8288,17 +8289,17 @@ fn compactRouting(slots: []u32, e: usize, alloc: std.mem.Allocator) !usize {
     return next;
 }
 
-pub const CarriedBlock = struct { f: MimoMoeFixture, slots: []u32, used: usize };
+pub const CarriedBlock = struct { f: MoeFixture, slots: []u32, used: usize };
 
 /// A bf16 decode block over `real.e` experts routed by `carriedRouting`, its bank cut to the experts touched. The routing
 /// never depends on the rate, so two rates compare over the same experts.
-pub fn carriedBlock(alloc: std.mem.Allocator, real: MimoMoeCase, carry: f32) !CarriedBlock {
+pub fn carriedBlock(alloc: std.mem.Allocator, real: MoeCase, carry: f32) !CarriedBlock {
     var prng = std.Random.DefaultPrng.init(0x6d656d + real.rows * 31);
     const slots = try carriedRouting(alloc, real.rows, real.topk, real.e, carry, prng.random());
     const used = try compactRouting(slots, real.e, alloc);
     var c = real;
     c.e = used;
-    var f = try mimoMoeFixture(alloc, c);
+    var f = try moeFixture(alloc, c);
     errdefer f.deinit();
     _ = mlx.mlx_array_free(f.arrays[7]);
     f.arrays[7] = mlx.mlx_array_new_data(slots.ptr, &.{@intCast(slots.len)}, 1, .uint32);
@@ -8310,7 +8311,7 @@ pub fn carriedBlock(alloc: std.mem.Allocator, real: MimoMoeCase, carry: f32) !Ca
 }
 
 /// The served decode chain (pair, middle, down, reduce) over block fixture `f`, fed `x`.
-pub fn decodeChain(s: mlx.mlx_stream, f: *const MimoMoeFixture, x: mlx.mlx_array) !mlx.mlx_array {
+pub fn decodeChain(s: mlx.mlx_stream, f: *const MoeFixture, x: mlx.mlx_array) !mlx.mlx_array {
     const a = f.arrays;
     return moeSwigluFused(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], .bfloat16);
 }
@@ -8356,7 +8357,7 @@ test "exl3 grouped decode timing arms all engage and keep the served chain's byt
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const real: MimoMoeCase = .{ .e = 64, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = 40 }, .dec = dec, .seed = 14500 + rows, .banks = MIMO_BANKS, .x_scale = 3 };
+        const real: MoeCase = .{ .e = 64, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = 40 }, .dec = dec, .seed = 14500 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 };
         var block = try carriedBlock(alloc, real, 0.5);
         defer block.f.deinit();
         try std.testing.expect(block.used >= real.topk and block.used <= block.slots.len);
@@ -8401,12 +8402,12 @@ test "exl3 MCG K2.5 BF16 decode and NAX preserve f32 truth across seeds" {
         defer prepared_mid_force = null;
         for (1..9) |rows| {
             for (0..PARITY_SEEDS) |seed| {
-                try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 318 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, true);
+                try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 318 + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, true);
             }
         }
     }
     for (0..PARITY_SEEDS) |seed| {
-        try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 8, .rows = 33, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 318 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, false);
+        try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 8, .rows = 33, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 318 + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, false);
     }
 }
 
@@ -8422,7 +8423,6 @@ test "exl3 Sushi GPU decode and prefill match scalar truth at K1 K1.5 K3 K5 K8" 
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     defer prepared_mid_force = null;
     defer gemm_simdmat_force = null;
-    defer sorted_windows.gpu_window_prefill_force = null;
     for ([_]u32{ 16, 24, 48, 80, 128 }) |n| {
         for ([_]exl3.Codebook{ .mul1, .mcg }) |cb| {
             const dec: exl3.Decode = .{ .codebook = cb, .window = .w12 };
@@ -8430,7 +8430,7 @@ test "exl3 Sushi GPU decode and prefill match scalar truth at K1 K1.5 K3 K5 K8" 
                 try indexedParity(.{ .n = n }, 256, 128, 8, 4, 913 + seed, dec);
                 for ([_]bool{ false, true }) |prepared| {
                     prepared_mid_force = prepared;
-                    for ([_]usize{ 1, 4 }) |rows| try bf16TruthCaseAnyArm(.{ .e = 8, .hidden = 256, .inter = 128, .topk = 4, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = 913 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, true);
+                    for ([_]usize{ 1, 4 }) |rows| try bf16TruthCaseAnyArm(.{ .e = 8, .hidden = 256, .inter = 128, .topk = 4, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = 913 + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, true);
                 }
                 prepared_mid_force = null;
                 for (0..3) |arm| {
@@ -8444,8 +8444,7 @@ test "exl3 Sushi GPU decode and prefill match scalar truth at K1 K1.5 K3 K5 K8" 
                     try std.testing.expectEqual(expect_nax, funnel_engaged[@backingInt(FunnelArm.nax)]);
                     try std.testing.expectEqual(!expect_nax and arm != 2, funnel_engaged[@backingInt(FunnelArm.simdmat)]);
                     for ([_]bool{ false, true }) |metadata| {
-                        sorted_windows.gpu_window_prefill_force = metadata;
-                        try bf16TruthCaseAnyArm(.{ .e = 8, .hidden = 256, .inter = 128, .topk = 4, .rows = 33, .rate = .{ .n = n }, .dec = dec, .seed = 913 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, false);
+                        try bf16TruthCaseAnyArm(.{ .e = 8, .hidden = 256, .inter = 128, .topk = 4, .rows = 33, .rate = .{ .n = n }, .dec = dec, .seed = 913 + seed, .banks = SERVED_W12_BANKS, .x_scale = 3, .window_meta = metadata }, 32, false);
                     }
                 }
             }
@@ -8471,14 +8470,14 @@ test "MiMo EXL3 streaming CPU slab capacities preserve resident kernel arms" {
 
 /// The pair GEMV on a prepared input (one prepare dispatch per slot and projection) against
 /// the pair GEMV that prepares its own K span per threadgroup: both planes to the bit.
-fn pairPreparedBytesMatch(c: MimoMoeCase, group: c_int) !void {
+fn pairPreparedBytesMatch(c: MoeCase, group: c_int) !void {
     setDecodeParams(c.dec);
     defer setDecodeParams(.mul1);
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), c);
+    var f = try moeFixture(arena.allocator(), c);
     defer f.deinit();
     const a = f.arrays;
     const hidden: c_int = @intCast(c.hidden);
@@ -8506,23 +8505,23 @@ test "exl3 pair GEMV on a prepared input keeps the self-preparing kernel's bytes
         for ([_]usize{ 1, 2, 3, 4, 8 }) |rows| {
             for ([_]c_int{ 0, DECODE_GROUP_MEMBERS }) |group| {
                 if (rows == 1 and group != 0) continue;
-                try pairPreparedBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 610 + rows, .banks = MIMO_BANKS, .x_scale = 3 }, group);
+                try pairPreparedBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 610 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 }, group);
             }
         }
     }
-    try pairPreparedBytesMatch(.{ .e = 32, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 640, .banks = MIMO_BANKS, .x_scale = 3 }, DECODE_GROUP_MEMBERS);
+    try pairPreparedBytesMatch(.{ .e = 32, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 640, .banks = SERVED_W12_BANKS, .x_scale = 3 }, DECODE_GROUP_MEMBERS);
 }
 
 /// The down GEMV on a middle prepared once per slot against the down that prepares its own middle
 /// in threadgroup memory, from the same pair planes: the outputs to the bit.
-fn downPreparedBytesMatch(c: MimoMoeCase, group: c_int) !void {
+fn downPreparedBytesMatch(c: MoeCase, group: c_int) !void {
     setDecodeParams(c.dec);
     defer setDecodeParams(.mul1);
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), c);
+    var f = try moeFixture(arena.allocator(), c);
     defer f.deinit();
     const a = f.arrays;
     const hidden: c_int = @intCast(c.hidden);
@@ -8546,11 +8545,11 @@ test "exl3 down GEMV on a prepared middle keeps the self-preparing kernel's byte
         for ([_]usize{ 1, 2, 3, 4, 8 }) |rows| {
             for ([_]c_int{ 0, DECODE_GROUP_MEMBERS }) |group| {
                 if (rows == 1 and group != 0) continue;
-                try downPreparedBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 710 + rows, .banks = MIMO_BANKS, .x_scale = 3 }, group);
+                try downPreparedBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 710 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 }, group);
             }
         }
     }
-    try downPreparedBytesMatch(.{ .e = 32, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 740, .banks = MIMO_BANKS, .x_scale = 3 }, DECODE_GROUP_MEMBERS);
+    try downPreparedBytesMatch(.{ .e = 32, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 740, .banks = SERVED_W12_BANKS, .x_scale = 3 }, DECODE_GROUP_MEMBERS);
 }
 
 /// The served NAX body against GEMM_NAX_REFERENCE_SOURCE on one bank: runs cover a lone row, a
@@ -8857,7 +8856,7 @@ test "exl3 clamped routing preserves GLM production width bytes" {
         setDecodeParams(dec);
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        var f = try mimoMoeFixture(arena.allocator(), .{
+        var f = try moeFixture(arena.allocator(), .{
             .hidden = 4096,
             .inter = 2048,
             .e = 8,
@@ -9004,7 +9003,7 @@ fn clampedWindowBytes(hidden: usize, inter: usize, n: u32, aligned: bool) !void 
     const experts = 288;
     const rows = 37;
     const topk = 8;
-    var f = try mimoMoeFixture(a, .{
+    var f = try moeFixture(a, .{
         .hidden = hidden,
         .inter = inter,
         .e = experts,
@@ -9120,7 +9119,7 @@ test "exl3 paired cooperative projections preserve GLM width and mixed rate fall
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        var f = try mimoMoeFixture(a, .{ .hidden = 4096, .inter = 2048, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = 36 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 29632 + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+        var f = try moeFixture(a, .{ .hidden = 4096, .inter = 2048, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = 36 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 29632 + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
         defer f.deinit();
         const v = f.arrays;
         var random = std.Random.DefaultPrng.init(9762 + rows);
@@ -9250,7 +9249,7 @@ fn clampedMiddleDownCase(hidden: usize, inter: usize, rows: usize, rate: u32, ti
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var f = try mimoMoeFixture(a, .{ .hidden = hidden, .inter = inter, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = rate }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 99211 + rate + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+    var f = try moeFixture(a, .{ .hidden = hidden, .inter = inter, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = rate }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 99211 + rate + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
     defer f.deinit();
     var prng = std.Random.DefaultPrng.init(7821 + rate);
     var planes: [2]mlx.mlx_array = undefined;
@@ -9297,7 +9296,7 @@ fn lanePairCase(hidden: usize, inter: usize, rows: usize, rate: u32) !void {
     const s = mlx.gpuStream();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = hidden, .inter = inter, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = rate }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 78314 + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+    var f = try moeFixture(arena.allocator(), .{ .hidden = hidden, .inter = inter, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = rate }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 78314 + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
     defer f.deinit();
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);
@@ -9439,7 +9438,7 @@ pub fn lanePairCoopWith(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array,
     return result;
 }
 
-// Kernels shared with the DFlash group-of-two expert path in glm_group2.zig.
+// Kernels shared with the DFlash group-of-two expert path in coop_rows2.zig.
 pub const Group2Support = struct {
     pub const Slots = kernel_src.KernelSlots;
     pub const empty = kernel_src.no_kernels;
@@ -9691,7 +9690,7 @@ fn downLaneCase(hidden: usize, inter: usize, rows: usize, rate: u32, tiles: c_in
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var f = try mimoMoeFixture(a, .{ .hidden = hidden, .inter = inter, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = rate }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 99211 + rate + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+    var f = try moeFixture(a, .{ .hidden = hidden, .inter = inter, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = rate }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 99211 + rate + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
     defer f.deinit();
     var prng = std.Random.DefaultPrng.init(7821 + rate);
     var planes: [2]mlx.mlx_array = undefined;
@@ -9747,7 +9746,7 @@ test "exl3 clamped decode adds the shared expert in the finish reduce to the byt
     setDecodeParams(dec);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), .{
+    var f = try moeFixture(arena.allocator(), .{
         .hidden = 4096,
         .inter = 2048,
         .e = 8,
@@ -9789,7 +9788,7 @@ test "exl3 clamped decode adds the shared expert in the finish reduce to the byt
     try std.testing.expectEqualSlices(u8, try gemvOutBytes(want32), try gemvOutBytes(got32));
 }
 
-fn oneRowChain(s: mlx.mlx_stream, f: *const MimoMoeFixture, x: mlx.mlx_array, limit: c_int, off: bool) !mlx.mlx_array {
+fn oneRowChain(s: mlx.mlx_stream, f: *const MoeFixture, x: mlx.mlx_array, limit: c_int, off: bool) !mlx.mlx_array {
     one_row_coop_off = off;
     const a = f.arrays;
     const y = try moeSwigluClamped(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, limit, .bfloat16);
@@ -9813,7 +9812,7 @@ test "exl3 STQ shared expert at DeepSeek's shape: a one-row chain gives row 0 of
     setDecodeParams(dec);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = 5120, .inter = 2304, .e = 1, .rows = 6, .topk = 1, .rate = .{ .n = 64 }, .dec = dec, .seed = 5120, .banks = .{ 0.01, 1, 0.01, 1 }, .x_scale = 4 });
+    var f = try moeFixture(arena.allocator(), .{ .hidden = 5120, .inter = 2304, .e = 1, .rows = 6, .topk = 1, .rate = .{ .n = 64 }, .dec = dec, .seed = 5120, .banks = .{ 0.01, 1, 0.01, 1 }, .x_scale = 4 });
     defer f.deinit();
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);
@@ -9861,7 +9860,7 @@ test "exl3 GLM one-row decode chain equals the lane chain to the byte and engage
         for ([_]usize{ 1, 2 }) |rows| {
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer arena.deinit();
-            var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = 4096, .inter = 2048, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = n }, .dec = dec, .seed = 5100 + n, .banks = .{ 0.9, 0.9, 0.9, 0.9 }, .x_scale = 8 });
+            var f = try moeFixture(arena.allocator(), .{ .hidden = 4096, .inter = 2048, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = n }, .dec = dec, .seed = 5100 + n, .banks = .{ 0.9, 0.9, 0.9, 0.9 }, .x_scale = 8 });
             defer f.deinit();
             var x = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x);

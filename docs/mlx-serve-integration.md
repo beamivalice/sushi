@@ -72,6 +72,49 @@ own files. A host with its own weight loader binds a dense projection to it, add
 
 Sushi's own weight-map binding of it (`load`, `drop`) stays in `src/trunk_stq.zig`, outside the module.
 
+## Names by capability (1.6.0)
+
+The module names no architecture: files and public names say what the code does or the geometry it serves. The old
+names stay as deprecated aliases for one release (`root.zig`, and the declaring file for a declaration inside one);
+the arch folders and a re-vendor compile unchanged, and the aliases are removed after that release.
+
+| old name | new name |
+|---|---|
+| `glm_group2` | `coop_rows2` |
+| `glm_fold` | `fold_clamped` |
+| `qwen_riders` | `riders_gated` |
+| `qwen_fold` | `fold_gated` |
+| `glm_prefill_grid` | `prefill_grid` |
+| `rate_groups.qwenFoldedCount`, `qwenLaunchCount` | `rate_groups.foldedCount`, `foldLaunchCount` |
+| `format.Codebook.servesGlmFastPaths` | `format.Codebook.servesLaneFastPaths` |
+
+Test fixtures renamed without an alias (they are not host API): `kernels.MimoMoeCase`, `MimoMoeFixture`,
+`mimoMoeFixture`, `mimoPrefillArm`, `MIMO_BANKS` are `MoeCase`, `MoeFixture`, `moeFixture`, `moePrefillArm`,
+`SERVED_W12_BANKS`.
+
+Per-call modes are parameters, never process globals. `project_rows.rows_exact` and `rows_wide` are
+`project_rows.Mode{ .exact, .wide }`, taken by `rowsGeometry`, `rowsMax`, `projectRows` and `projectRowsSegmented`;
+`trunk_gemm.decoded_billed` is `linear.Opts.decoded_billed`; `linear.linearWith`, `linearGroupedWith` and
+`linearSharedWith` take `linear.Opts{ .rows, .decoded_billed }` (the plain `linear`, `linearGrouped` and `linearShared`
+are the default options). `kernels.moePrefill` takes a last argument `window_meta: ?bool` (null: the geometry decides).
+
+**Signatures that changed with no alias**, so a host calling any of them must update on a re-vendor: `projectRows` and
+`projectRowsSegmented` (a last `mode: Mode`), `rowsGeometry` (a last `mode: Mode`), `rowsMax` (a `mode: Mode`),
+`trunk_gemm.decodedServes` (a first `billed: bool`) and `kernels.moePrefill` (a last `window_meta: ?bool`). The globals
+`project_rows.rows_exact`, `rows_wide`, `trunk_gemm.decoded_billed` and `sorted_windows.gpu_window_prefill_force` are
+gone.
+
+**Hidden per-call state that remains:** `kernels.setDecodeParams` stores the active `Decode` in a process global that
+every dispatch reads, so a host serving several packs must set it before each call (the module's dispatch entry points do).
+F4's contract documents it.
+
+**Extracted kernel files:** mlx-serve extracts the module's Metal sources to files named after the Zig file
+(`glm_group2_*.metal`). A re-vendor renames them to `coop_rows2_*.metal`, and likewise for the other renamed files; the
+kernel names inside them are unchanged, so the MLX kernel keys and the JIT cache stay valid.
+
+`linear.gemmInputs(groups, rows, win)` is new and additive: the bank ids and window table of a GEMM-arm call, built once
+per `(groups, rows, win)` and kept in a small cache the caller never frees.
+
 The module's tests run as their own artifacts (`exl3-test-N`) on `zig build test`; a change that
 passes them and keeps the names above is safe to re-vendor.
 

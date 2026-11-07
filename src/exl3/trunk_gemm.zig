@@ -11,8 +11,6 @@ const kernel_src = @import("kernel_source.zig");
 pub var enabled: bool = true;
 /// Inner planes taken through the decoded path, for a test.
 pub var decoded_calls: u64 = 0;
-/// Set by a caller around the linears whose transient bill holds `DECODED_SCRATCH_BYTES`; others keep the sorted GEMM.
-pub var decoded_billed: bool = false;
 
 /// A one-bank trellis `[1, in/16, out/16, n]` decoded to its f16 weight `[out, in]`: the values the GEMMs' fragment
 /// reader hands their MMAs, each at its (output, input) place.
@@ -76,9 +74,10 @@ pub const DECODED_MAX_WEIGHTS: usize = 1 << 25;
 /// The decoded path's scratch at its peak: one bank's f16 weight, and the previous one MLX's cache may still hold.
 pub const DECODED_SCRATCH_BYTES: u64 = 2 * DECODED_MAX_WEIGHTS * 2;
 
-/// Whether a one-bank linear of `rows` x `in` -> `out` takes the decoded path.
-pub fn decodedServes(rows: c_int, in: c_int, out: c_int) bool {
-    return enabled and decoded_billed and rows >= DECODED_MIN_ROWS and @as(usize, @intCast(in)) * @as(usize, @intCast(out)) <= DECODED_MAX_WEIGHTS and
+/// Whether a one-bank linear of `rows` x `in` -> `out` takes the decoded path; `billed` says its caller's transient
+/// bill holds `DECODED_SCRATCH_BYTES`.
+pub fn decodedServes(billed: bool, rows: c_int, in: c_int, out: c_int) bool {
+    return enabled and billed and rows >= DECODED_MIN_ROWS and @as(usize, @intCast(in)) * @as(usize, @intCast(out)) <= DECODED_MAX_WEIGHTS and
         denseOrderMatches(rows, in, out);
 }
 
@@ -203,12 +202,10 @@ test "trunk gemm: a billed one-bank linear past the decoded width takes the deco
     };
     const x = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ rows, @intCast(in) }, 2, .bfloat16);
     defer _ = mlx.mlx_array_free(x);
-    defer decoded_billed = false;
     var got: [2]mlx.mlx_array = undefined;
     for (&got, [_]bool{ false, true }) |*g, billed| {
-        decoded_billed = billed;
         const before = decoded_calls;
-        g.* = try linear.linear(s, x, p, kernels.SPEC1_W15);
+        g.* = try linear.linearWith(s, x, p, kernels.SPEC1_W15, .{ .decoded_billed = billed });
         try mlx.check(mlx.mlx_array_eval(g.*));
         try t.expectEqual(before + @intFromBool(billed), decoded_calls);
     }
@@ -317,4 +314,18 @@ test "trunk gemm: real pack trunk banks, every shape the gate allows writes the 
         if (ok) try t.expectEqual(@as(usize, 0), differ);
     };
     try t.expect(allowed > 0 and refused > 0);
+}
+
+test "trunk gemm: only a billed call takes the decoded path, and only from the minimum rows and within the width cap" {
+    try mlx.requireGpu();
+    if (!kernels.gemmNaxOn()) return error.SkipZigTest;
+    const was = enabled;
+    defer enabled = was;
+    enabled = true;
+    try std.testing.expect(!decodedServes(false, DECODED_MIN_ROWS, 1024, 512));
+    try std.testing.expect(decodedServes(true, DECODED_MIN_ROWS, 1024, 512));
+    try std.testing.expect(!decodedServes(true, DECODED_MIN_ROWS - 1, 1024, 512));
+    try std.testing.expect(!decodedServes(true, DECODED_MIN_ROWS, 1 << 13, 1 << 13));
+    enabled = false;
+    try std.testing.expect(!decodedServes(true, DECODED_MIN_ROWS, 1024, 512));
 }

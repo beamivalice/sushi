@@ -180,7 +180,7 @@ pub const StqStream = struct {
         var overflow: [stream.quant.rate_group_limit]u32 = @splat(1);
         var bank = try exl3.Ragged.initSplit(engine.s, &gl.cache_ragged, &gl.union_ragged, overflow[0..gl.cache_ragged.count]);
         defer bank.deinit();
-        var sc = Scope.init(engine.allocator, engine.s);
+        var sc = Scope.plain(engine.allocator, engine.s);
         defer sc.deinit();
         const k: usize = self.cfg.top_k;
         const ids = try engine.allocator.alloc(i32, rows * k);
@@ -375,7 +375,7 @@ test "dsv41 stream: slab-gathered experts give the resident experts' logits, wit
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -415,7 +415,7 @@ test "dsv41 stream: decode steps through the fused kernels over leased slabs giv
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -457,7 +457,7 @@ test "dsv41 shell: the transformer serves the streamed model's logits through fo
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -911,7 +911,7 @@ test "dsv41 stq: the served STQ pack (trunk banks, affine embedding, streamed ra
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1024,7 +1024,7 @@ test "dsv41 stq: the STQ pack's K4 trunk and affine embedding keep the FP4 model
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1072,7 +1072,7 @@ test "dsv41 stq: a wide chunk whose fill is staged per rate group gives the unst
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1111,7 +1111,7 @@ fn dsparkMatchesSerial(drop: ?*const expert_usage.Drop) !void {
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1204,7 +1204,7 @@ test "dsv41 stq: verify rows that decode each distinct expert once give the per-
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1246,7 +1246,7 @@ test "dsv41 stq: a wide chunk's shared expert riding the routed prefill launches
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1295,7 +1295,7 @@ test "dsv41 stq: tile-major pools give the pack-order pools' bytes, through hits
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1333,7 +1333,7 @@ test "dsv41 stq: the submitted decode schedule gives the drained schedule's byte
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1392,7 +1392,7 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1464,7 +1464,7 @@ test "dsv41 stq: a settle that recomputes only the picks off the map gives the w
     var pack: StqServed = undefined;
     try pack.init(dir, .bfloat16, true, false, 4, s);
     defer pack.deinit();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const h = &pack.hook;
     const layer: usize = 3;
@@ -1519,7 +1519,7 @@ test "dsv41 stq: a queued decode layer is one command buffer, two where a prefet
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1570,7 +1570,7 @@ test "dsv41 stq: queued routed chains leave a verify round's kept rows, the DSpa
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1761,7 +1761,7 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1860,7 +1860,7 @@ test "dsv41 prefetch: one-row decode steps ask for nothing and keep the bytes (D
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1916,7 +1916,7 @@ test "dsv41 prefetch: a layer that cannot be prefetched is not predicted, and th
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1953,7 +1953,7 @@ test "dsv41 prefetch: with no credit for one whole expert a round predicts nothi
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -1992,7 +1992,7 @@ test "dsv41 prefetch: a model that never started it predicts and queues nothing 
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2029,7 +2029,7 @@ test "dsv41 drop: the STQ pack with experts dropped gives the logits of the full
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2125,7 +2125,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2226,7 +2226,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2272,7 +2272,7 @@ test "dsv41 borrow: a released pool gives MLX its bytes back, its routes read th
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2364,7 +2364,7 @@ fn borrowCase(cache_bytes: u64) !void {
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2443,7 +2443,7 @@ test "dsv41 resident: a budget that holds every expert reads them all at load, m
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2492,7 +2492,7 @@ test "dsv41 drop: a budget that holds the kept experts alone serves them residen
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2558,7 +2558,7 @@ test "dsv41 lossy pick: on rate-grouped layers a missed expert takes the best po
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2648,7 +2648,7 @@ test "dsv41 stq: the served path is no farther from the f32 CPU truth than the G
     defer fx.deinit();
     const gs = mlx.gpuStream();
     const cs = mlx.mlx_default_cpu_stream_new();
-    var sc = Scope.init(testing.allocator, gs);
+    var sc = Scope.plain(testing.allocator, gs);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2743,7 +2743,7 @@ test "dsv41 kernels: after the load's warm, prompts of any length, every verify 
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2774,7 +2774,7 @@ test "dsv41 kernels: the spilled-route warm reads nothing, leaves every pool as 
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2809,7 +2809,7 @@ test "dsv41 kernels: the load's warm leaves no state, and the served logits are 
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2844,7 +2844,7 @@ test "dsv41 DSpark exact: a one-row round gives the bytes of row 0 of a wider ve
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -2943,7 +2943,7 @@ fn expectPmParity(dir: []const u8, pm_path: []const u8, direct_bytes: u64, budge
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -3128,7 +3128,7 @@ test "dsv41 pair-major: the transformer loads a pair-major pack through the one 
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);

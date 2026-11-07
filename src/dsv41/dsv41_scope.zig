@@ -2,6 +2,7 @@
 //! so a layer's graph is built with `try sc.op(...)` and no per-array bookkeeping.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const exl3 = @import("sushi_exl3");
 
 pub const A = mlx.mlx_array;
 pub const S = mlx.mlx_stream;
@@ -21,9 +22,18 @@ pub const Scope = struct {
     a: std.mem.Allocator,
     s: S,
     items: std.ArrayList(A) = .empty,
+    /// How the trellis linears built through this scope launch.
+    rows: exl3.project_rows.Mode = .{},
 
-    pub fn init(a: std.mem.Allocator, s: S) Scope {
+    /// A scope with the default launch mode, for tests, probes and code outside a pass. A scope inside a pass comes
+    /// from `Model.scope()` or `child()`, or it drops the pass's exact rows.
+    pub fn plain(a: std.mem.Allocator, s: S) Scope {
         return .{ .a = a, .s = s };
+    }
+
+    /// A scope of its own over the same allocator, stream and launch mode.
+    pub fn child(self: *const Scope) Scope {
+        return .{ .a = self.a, .s = self.s, .rows = self.rows };
     }
 
     pub fn deinit(self: *Scope) void {

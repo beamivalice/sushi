@@ -7,16 +7,24 @@ const mlx = @import("mlx_host").mlx;
 pub const format = @import("expert_exl3.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
 pub const project_rows = @import("project_rows.zig");
-pub const glm_group2 = @import("glm_group2.zig");
-pub const glm_fold = @import("glm_fold.zig");
-pub const qwen_riders = @import("qwen_riders.zig");
+pub const coop_rows2 = @import("coop_rows2.zig");
+pub const fold_clamped = @import("fold_clamped.zig");
+pub const riders_gated = @import("riders_gated.zig");
 pub const shared_trellis = @import("shared_trellis.zig");
-pub const qwen_fold = @import("qwen_fold.zig");
-pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
+pub const fold_gated = @import("fold_gated.zig");
+pub const prefill_grid = @import("prefill_grid.zig");
+/// Deprecated names of the files above, kept for one release.
+pub const glm_group2 = coop_rows2;
+pub const glm_fold = fold_clamped;
+pub const qwen_riders = riders_gated;
+pub const qwen_fold = fold_gated;
+pub const glm_prefill_grid = prefill_grid;
 pub const codebook_tables = @import("codebook_tables.zig");
 /// The microbench bodies `sushi-ubench` runs; its host root supplies `report`.
 pub const ubench = @import("ubench.zig");
 pub const bench_util = @import("bench_util.zig");
+/// The f32-truth test helpers the geometry and real-pack parity tests share.
+pub const f32_truth = @import("f32_truth.zig");
 
 /// One projection's bank, expert e on axis 0: `trellis` U16 [E, in/16, out/16, n],
 /// `suh` F16 [E, in], `svh` F16 [E, out].
@@ -156,7 +164,7 @@ fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.m
         else
             try moeMixedDecode(s, x2, bank, slots_u, sc, K, xd)
     else
-        try kernels.moePrefill(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K);
+        try kernels.moePrefill(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K, null);
     defer _ = mlx.mlx_array_free(y);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -811,17 +819,17 @@ test "GLM clamped EXL3 rejects malformed banks before kernel dispatch" {
     }
 }
 
-test { _ = glm_group2; }
+test { _ = coop_rows2; }
 
 test {
     _ = rate_groups;
     _ = linear;
     _ = trunk_gemm;
-    _ = @import("dsv41_real.zig");
+    _ = @import("geometry_5120x2304_test.zig");
 }
 
 test {
-    _ = glm_prefill_grid;
+    _ = prefill_grid;
 }
 
 test "a host Decode that names std1 without its table is refused by name" {

@@ -23,7 +23,7 @@ const Dsv41Net = struct {
         const dir = try dsv41_model.fixtureDir();
         self.fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
         errdefer self.fx.deinit();
-        var sc = @import("dsv41_scope.zig").Scope.init(testing.allocator, mlx.gpuStream());
+        var sc = @import("dsv41_scope.zig").Scope.plain(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
         self.ids = try dsv41_model.tokens(&sc, &self.fx);
         errdefer testing.allocator.free(self.ids);

@@ -526,7 +526,7 @@ const Capture = struct {
 
     /// The head's input rows as the forward made them; bf16 is the activation dtype, so this rounds nothing.
     fn writeHeadRows(self: *Capture, x: A) !void {
-        var sc = Scope.init(self.a, self.s);
+        var sc = Scope.plain(self.a, self.s);
         defer sc.deinit();
         const bytes = try hostBytes(self.a, self.s, try sc.astype(x, .bfloat16));
         defer self.a.free(bytes);
@@ -562,7 +562,7 @@ const Capture = struct {
 
     /// `acc += X^T X` over the rows of `x` (one `[in, in]` matrix, `[groups, in, in]` for the grouped output projection).
     fn accumulate(self: *Capture, kind: dsv.TapKind, x: A) !void {
-        var sc = Scope.init(self.a, self.s);
+        var sc = Scope.plain(self.a, self.s);
         defer sc.deinit();
         const shape = mlx.getShape(x);
         var g: A = undefined;
@@ -1317,7 +1317,7 @@ const Recorder = struct {
     fn input(ctx: *anyopaque, layer: usize, kind: dsv.TapKind, x: A) anyerror!void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         if (kind == .head_in) {
-            var hsc = Scope.init(self.a, self.s);
+            var hsc = Scope.plain(self.a, self.s);
             defer hsc.deinit();
             const bytes = try hostBytes(self.a, self.s, try hsc.astype(x, .bfloat16));
             defer self.a.free(bytes);
@@ -1329,7 +1329,7 @@ const Recorder = struct {
             try (if (kind == .ffn_in) &self.mlp[layer] else &self.dspark_rows[layer]).appendSlice(self.a, bytes);
             if (kind == .dspark_in) return;
         }
-        var sc = Scope.init(self.a, self.s);
+        var sc = Scope.plain(self.a, self.s);
         defer sc.deinit();
         const shape = mlx.getShape(x);
         const host = try sc_mod.hostF32(try sc.contiguous(try sc.astype(x, .float32)));
@@ -1368,7 +1368,7 @@ const Recorder = struct {
 
     fn expertAct(ctx: *anyopaque, layer: usize, act: A, ids: A) anyerror!void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
-        var sc = Scope.init(self.a, self.s);
+        var sc = Scope.plain(self.a, self.s);
         defer sc.deinit();
         const x = try sc_mod.hostF32(try sc.contiguous(try sc.astype(act, .float32)));
         const e = try sc_mod.hostI32(try sc.contiguous(try sc.astype(ids, .int32)));
@@ -1773,7 +1773,7 @@ fn expectHeadRowLogits(a: std.mem.Allocator, io: std.Io, root: []const u8, name:
         const row = try a.alloc(f32, d);
         defer a.free(row);
         for (row, 0..) |*o, i| o.* = @bitCast(@as(u32, std.mem.readInt(u16, raw[i * 2 ..][0..2], .little)) << 16);
-        var sc = Scope.init(a, m.s);
+        var sc = Scope.plain(a, m.s);
         defer sc.deinit();
         const got = try sc_mod.hostF32(try sc.contiguous(try m.head.apply(&sc, try sc.floats(row, &.{ 1, sc_mod.ci(d) }))));
         const want_bytes = try readFile(a, io, root, "{s}/prompts/{d:0>2}_w{d}/logits.f32", .{ name, w, w });

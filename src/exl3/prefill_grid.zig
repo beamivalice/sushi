@@ -77,7 +77,7 @@ fn eligible(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr
     return true;
 }
 pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode, limit: c_int) !?Arr {
-    if (!dec.codebook.servesGlmFastPaths() or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
+    if (!dec.codebook.servesLaneFastPaths() or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
     if (base.gemmWindowRows() != 32 or !base.gemmWindowAligned()) return null;
     base.setDecodeParams(dec);
     if (!support.available()) return null;
@@ -86,7 +86,7 @@ pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: A
     return result;
 }
 pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode) !?Arr {
-    if (!dec.codebook.servesGlmFastPaths() or !eligible(s, x, bank, indices, scores)) return null;
+    if (!dec.codebook.servesLaneFastPaths() or !eligible(s, x, bank, indices, scores)) return null;
     base.setDecodeParams(dec);
     const c = kernel_src.slotRow(dec.codebook, false);
     const w = dec.window.index();
@@ -95,7 +95,7 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr,
     const slot = &kernels[c][w];
     if (slot.* == null) slot.* = build(dec) catch {
         failed[c][w] = true;
-        if (!@import("builtin").is_test) log.info("[exl3-prefill] GLM grid transpose declined (kernel probe failed); the clamped sorted GEMM serves prefill\n", .{});
+        if (!@import("builtin").is_test) log.info("[exl3-prefill] prefill grid transpose declined (kernel probe failed); the clamped sorted GEMM serves prefill\n", .{});
         return null;
     };
     const kernel = slot.*.?;
@@ -125,7 +125,7 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr,
     defer for ([_]Arr{ metadata.inverse, metadata.table.starts, metadata.table.nlives }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    if (metadata.inverse.ctx == null) return error.ExpectedGlmInverseRouting;
+    if (metadata.inverse.ctx == null) return error.ExpectedInverseRouting;
     const tab = metadata.table;
     const gate = try project(s, kernel, prep[0], bank.gate.trellis, sorted, tab.starts, tab.nlives, tab.nwin);
     defer _ = mlx.mlx_array_free(gate);
@@ -240,7 +240,7 @@ fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, dec: api.format.Decode)
     try mlx.check(mlx.mlx_array_eval(want.*));
     base.unfolded_for_test = false;
     const before = dispatchCount();
-    const got = try o.own((try tryMoe(s, x.*, bank, ids.*, scores.*, dec, 10)) orelse return error.TestExpectedGlmGrid);
+    const got = try o.own((try tryMoe(s, x.*, bank, ids.*, scores.*, dec, 10)) orelse return error.TestExpectedGrid);
     try std.testing.expectEqual(before + 1, dispatchCount());
     try mlx.check(mlx.mlx_array_eval(want.*));
     try mlx.check(mlx.mlx_array_eval(got.*));

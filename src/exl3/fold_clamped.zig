@@ -9,7 +9,7 @@ const kernels = @import("expert_exl3_kernels.zig");
 const rate_groups = @import("rate_groups.zig");
 const codebook_tables = @import("codebook_tables.zig");
 const fuse = @import("fuse.zig");
-const group2 = @import("glm_group2.zig");
+const group2 = @import("coop_rows2.zig");
 const root = @import("root.zig");
 
 pub const Affine = struct { weight: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array };
@@ -158,7 +158,7 @@ fn get(v: mlx.mlx_vector_array, i: usize) !mlx.mlx_array {
 /// `moeClampedWithShared` with the shared expert `sh` folded in: the routed sum plus the shared expert's bf16 output,
 /// in `x`'s shape. Null where the chain or the shared kernels do not serve the inputs; nothing has run then.
 pub fn moeClampedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, limit: c_int, sh: Shared) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !dec.codebook.servesGlmFastPaths() or limit != 10 or mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_ndim(x) != 3) return null;
+    if (!mlx.streamIsGpu(s) or !dec.codebook.servesLaneFastPaths() or limit != 10 or mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_ndim(x) != 3) return null;
     const xs = mlx.getShape(x);
     const ix = mlx.getShape(inds);
     if (mlx.mlx_array_strides(x)[2] != 1 or xs[0] != 1 or xs[1] != 1 or ix.len != 3 or ix[0] != 1 or ix[1] != 1 or ix[2] <= 0 or ix[2] > kernels.REDUCE_MAX_TOPK) return null;
@@ -235,12 +235,12 @@ pub fn moeClampedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Ba
     return out;
 }
 
-/// `glm_group2.moeLayoutShared` (lane layout, serial reduction, grouped down) with the shared expert `sh` folded in, for
+/// `coop_rows2.moeLayoutShared` (lane layout, serial reduction, grouped down) with the shared expert `sh` folded in, for
 /// two to eight rows of `x` [1, rows, hidden]: the routed sum plus the shared expert's bf16 rows, in `x`'s shape. Each
 /// shared row is the one-token kernels' bytes, which are the rows kernels'. Null where the chain or the shared kernels do
 /// not serve the inputs; nothing has run then.
 pub fn moeLayoutSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, indices: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: Shared) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !dec.codebook.servesGlmFastPaths() or mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_ndim(x) != 3) return null;
+    if (!mlx.streamIsGpu(s) or !dec.codebook.servesLaneFastPaths() or mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_ndim(x) != 3) return null;
     const xs = mlx.getShape(x);
     const ix = mlx.getShape(indices);
     if (mlx.mlx_array_strides(x)[2] != 1 or xs[0] != 1 or xs[1] < 2 or xs[1] > 8 or ix.len != 3 or ix[0] != 1 or ix[1] != xs[1] or ix[2] != 8) return null;

@@ -19,8 +19,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 | `src/exl3/expert_exl3.zig` | Host reference decoders (MUL1, MCG, STD1, SPEC1, PAIR1), `Rate`, `Window`, `Decode`, fixtures |
 | `src/exl3/expert_exl3_kernels.zig` | Prefill run-aligned 32-row window GEMM (NAX body, K4 fast branch; simdgroup-matrix body off NAX; scalar body), decode chain (`moeSwigluFused`), `DECODE_ROWS_MAX` (16), `usesPrefillArm` |
 | `src/exl3/kernel_source.zig` | Kernel source assembly: codebook and decode helpers, the slot table of built kernels, `CfgCache` |
-| `src/exl3/project_rows.zig` | The dense multi-row projection (`projectRows`, `PROJECT_ROWS_MAX`, `rows_exact`) behind `linear.zig` |
+| `src/exl3/project_rows.zig` | The dense multi-row projection (`projectRows`, `PROJECT_ROWS_MAX`, the per-call `Mode`) behind `linear.zig` |
 | `src/exl3/sorted_windows.zig` | The GPU window table and the sorted-inverse finish (`gpuWindowPrefillOn`) that every model's prefill rides |
+| `src/exl3/coop_rows2.zig` | Cooperative-rows kernels: the lane layout, serial reduction and grouped down for 2 to 4 verify rows (was `glm_group2`) |
+| `src/exl3/fold_clamped.zig` | The affine shared expert folded into the routed lane chain's launches, with the clamped SwiGLU (was `glm_fold`) |
+| `src/exl3/riders_gated.zig`, `src/exl3/fold_gated.zig` | An affine shared expert with a sigmoid gate logit riding the routed launches of a one-bank layer (were `qwen_riders`, `qwen_fold`) |
+| `src/exl3/prefill_grid.zig` | The physical grid transpose of a full routed prefill chunk (was `glm_prefill_grid`) |
+| `src/exl3/geometry_5120x2304_test.zig`, `src/exl3/f32_truth.zig` | The synthetic 5120 x 2304 rate-group parity cases, and the f32-truth helpers they share with `src/dsv41/dsv41_exl3_real_test.zig` (real shards, `DSV41_RT_PACK`) |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab (`gateUpSwiglu`; `downReduce`) for the unquantized HF checkpoint |
 
 **`src/exl3` is a module** (`sushi_exl3`), so another MLX host (mlx-serve) can serve EXL3 packs through the same code.
@@ -85,7 +90,7 @@ kernel on supported hardware.
   kernel copy of its own and a rate with no row fails to compile. A reader must hand `exl3_pairh` a trellis-adjacent
   (even, odd) pair, which every reader does, and the generic one-tile reader decodes a weight through `exl3_slot`,
   which reads its partner's window. The 2^12 folds like STD1's. Window 16 only.
-- **GLM's lane, one-row, group2 and prefill-grid kernels serve the codebooks `Codebook.servesGlmFastPaths` names**
+- **The lane, one-row, cooperative-rows and prefill-grid kernels serve the codebooks `Codebook.servesLaneFastPaths` names**
   (MCG, std1, spec1, pair1), each held to its own bytes.
 - **A shard's `__metadata__` stamp is CHECKED against `expert_quant` before upload**
   (`mimo_source.validateShardStamps`): see [pack-format](pack-format.md#the-shard-stamp).
@@ -291,14 +296,14 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   - Policy: k is split into ranges of at most 512 over at least 320 threadgroups, then one finish dispatch.
   - An output of at least 1024 128-blocks (lm_head) folds the finish into a single dispatch.
   - Time the served geometry with `sushi-ubench run shared.exl3_trunk_rows` (SPEC1 n64 at rows 1, 2, 3, 5, 8).
-- **Exact rows** (`project_rows.rows_exact`): every row, up to `PROJECT_ROWS_MAX`, and the serial one-row tick take ONE
+- **Exact rows** (`project_rows.Mode.exact`, a per-call option of `linear.Opts`): every row, up to `PROJECT_ROWS_MAX`, and the serial one-row tick take ONE
   arm, chosen by the hardware: NAX where `gemmNaxOn()`, else SIMD. Each arm is row-invariant on its own (k split from the
   shape alone; NAX pads to a 16-row tile and runs 1 row too), so a row beside others is bit-identical to the same row
   alone on that arm, stacked or folded, rows 1 to 8 (`with exact rows a row has the same bytes ... at Flash-Next's trunk
   shapes`). NAX and SIMD may differ from each other (the accepted cross-hardware rule). Unpinned, one row takes SIMD and
   two or more take NAX, so a row beside others need not equal itself alone. The
-  Flash-Next trunk pins it around each trellis projection (`exl3/trunk.zig`) and restores it; DeepSeek pins it around its
-  DSpark verify.
+  Flash-Next trunk passes it on each trellis projection (`exl3/trunk.zig`); DeepSeek's scopes carry it through its
+  DSpark verify. No launch mode is a process global: a host running several models cannot leak one into another.
 - The parity bar scores each 128-wide output block in inner space: its error L2 (divided by svh) against the L2 of the
   block's summand magnitudes. The output transform is an orthonormal rotation, so this keeps the inner GEMV bar's
   scale. The composite is `projectIndexed` per row, which shares the bitstream, so it cannot convict a codeword flip;
@@ -320,7 +325,7 @@ or from 1024 rows the decoded path below.
 `decodeDense` is the host twin a test multiplies beside it.
 
 - **From 1024 rows a billed one-bank linear decodes its bank once to f16 and runs MLX's GEMM** (`trunk_gemm`, Flash-Next's
-  `trunk_stq.matmul` sets `decoded_billed`). The sorted GEMM decodes the whole bank again for each 32-row window. MLX's
+  `trunk.matmul` passes `Opts.decoded_billed`). The sorted GEMM decodes the whole bank again for each 32-row window. MLX's
   regular NAX GEMM sums each output in the same order (16x32x16 MMAs, k ascending, one f32 accumulator, stored f16), so
   the inner plane is byte-identical. Tests: `the dense decode is the host tile decode ...` (n48 MCG, n64, n96, 33 to
   4096 rows) and `a billed one-bank linear past the decoded width ...`. MLX splits K when K is large against the output
@@ -355,7 +360,7 @@ or from 1024 rows the decoded path below.
   codebooks). MCG folds nothing, so no MCG test can see a missing one: a new reader gets a std1/spec1/pair1 case at its
   first test.
 <a id="verify-rows16"></a>
-- **A spec verify of 9 to 16 rows stays on the NAX rows arm** (`project_rows.rows_wide`, set by Flash-Next's single-stream
+- **A spec verify of 9 to 16 rows stays on the NAX rows arm** (`project_rows.Mode.wide`, passed by Flash-Next's single-stream
   verify forward; `rowsMax`): the kernel's 16-row MMA tile took rows 0-7 and zeros, and now feeds rows 8-15 from the staged
   input, so each row keeps its one-row decode tick's bytes. Before, a 9-row verify (an 8-draft prompt lookup) took the
   sorted GEMM, one launch per projection and another sum order. Prefill chunks of 9 to 16 rows keep the GEMM. Tests: `at 9

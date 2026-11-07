@@ -47,7 +47,7 @@ hidden 2560, expert intermediate 640.
   triple or a trellis bank carried in the same three slots (`w` the U16 trellis `[1, in/16, out/16, n]`, `s` and `b` the
   F16 scales), and `Transformer.qmatmul` tells them apart by `w`'s dtype, so every call site serves a mixed pack. Tensors
   too narrow for a 16x16 tile grid (GDN a/b, the router, HC mixes) stay affine; the embedding stays affine (a row gather).
-  - **A row rounds the same beside others as alone**: trellis projections run with `project_rows.rows_exact` pinned
+  - **A row rounds the same beside others as alone**: trellis projections run with `project_rows.Mode.exact` passed
     (one arm per machine at every width up to eight: NAX where the box has it, else SIMD,
     [engine-exl3-experts](engine-exl3-experts.md#dense-linears)), so batched ticks, MTP verify blocks and serial ticks
     agree bit for bit on that arm (hermetic: `a GDN layer on trellis projections verifies bit-identically to serial

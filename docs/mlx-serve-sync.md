@@ -78,7 +78,7 @@ chain pays only if rows five to eight cost under about 10 ms each; estimates, no
   chain group of 5 to 8 rows beside the four-row chain on a copy prompt gives the ladder; the rows ubench
   (`SUSHI_GLM_ROWS_UBENCH`) times B one-row requests, so it needs a chain-group arm.
 - **If the marginal row is under about 10 ms**, the work is the paths capped at four rows: the lane and group2 experts
-  (`glm_group2.max_rows` = the overlay's `max_tail`), MLA B3/B4 and the overlay tail, the affine row tiles, the SIMD32 HC
+  (`coop_rows2.max_rows` = the overlay's `max_tail`), MLA B3/B4 and the overlay tail, the affine row tiles, the SIMD32 HC
   collapse (one to four rows). Each falls back to a slower exact arm beyond four, so each is worth its own gate.
 - **Then** upstream's `CopyStats` (hit rate per match length, forgetting) is a small way to pick the chain length.
 Its other policy parts are already ruled out: the confidence-driven row count and the drafting backoff are the measured

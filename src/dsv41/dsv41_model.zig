@@ -87,7 +87,7 @@ pub const Stq = struct {
         const sh = mlx.getShape(x);
         const in = sh[sh.len - 1];
         const rows: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(in))));
-        const y = try sc.keep(try exl3.linear.linear(sc.s, try sc.reshape(x, &.{ rows, in }), self.p, self.dec));
+        const y = try sc.keep(try exl3.linear.linearWith(sc.s, try sc.reshape(x, &.{ rows, in }), self.p, self.dec, .{ .rows = sc.rows }));
         var shape: [8]c_int = undefined;
         @memcpy(shape[0..sh.len], sh);
         shape[sh.len - 1] = @intCast(self.outDim());
@@ -96,7 +96,7 @@ pub const Stq = struct {
 
     /// `x` `[G, rows, in]`, bank g serving `x[g]`.
     pub fn applyGrouped(self: Stq, sc: *Scope, x: A) !A {
-        return sc.astype(try sc.keep(try exl3.linear.linearGrouped(sc.s, x, self.p, self.dec)), mlx.mlx_array_dtype(x));
+        return sc.astype(try sc.keep(try exl3.linear.linearGroupedWith(sc.s, x, self.p, self.dec, .{ .rows = sc.rows })), mlx.mlx_array_dtype(x));
     }
 };
 
@@ -706,6 +706,8 @@ pub const Model = struct {
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
     /// text does not depend on the round mix (`SUSHI_DSV41_DSPARK_EXACT=0` takes the faster arms, which sum by width).
     dspark_exact: bool = true,
+    /// The launch mode of the trellis linears of the pass in flight (`verify` sets it).
+    rows: exl3.project_rows.Mode = .{},
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
     engram_ahead: ?*engram.Prefetch = null,
     engram_ahead_used: u64 = 0,
@@ -754,6 +756,11 @@ pub const Model = struct {
     ced_split: ?usize = null,
     /// Diagnostic (`SUSHI_DSV41_PREFILL_PROFILE`): a wide chunk evaluates after every stage and logs where its time went.
     profile: ?*Profile = null,
+
+    /// A scope over this model's allocator and stream, launching trellis linears in the mode of the pass in flight.
+    pub fn scope(self: *const Model) Scope {
+        return .{ .a = self.gpa, .s = self.s, .rows = self.rows };
+    }
 
     pub fn deinit(self: *Model) void {
         pipeDrain(self) catch {};
@@ -1187,7 +1194,7 @@ fn fuseShared(m: *Model, lins: []const *Lin) !?exl3.linear.Shared {
 
 /// `x` through the stacked bank `sh`: `outs[s]` is linear s's `[rows, width]` in x's dtype, owned by `sc`.
 fn sharedApply(sc: *Scope, sh: exl3.linear.Shared, dec: exl3.format.Decode, x: A, outs: []A) !void {
-    try exl3.linear.linearShared(sc.s, x, sh, dec, outs);
+    try exl3.linear.linearSharedWith(sc.s, x, sh, dec, outs, .{ .rows = sc.rows });
     for (outs) |o| _ = try sc.keep(o);
 }
 
@@ -1624,7 +1631,7 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
     var t0: usize = 0;
     while (t0 < nb) : (t0 += tile) {
         const t1 = @min(nb, t0 + tile);
-        var ts = Scope.init(sc.a, sc.s);
+        var ts = sc.child();
         defer ts.deinit();
         var scores = try kernels.indexScoresTile(&ts, q, try rows.rowsIn(&ts, t0, t1), w, wscale, p0, r, t0);
         var next_blocks = Running{};
@@ -1991,7 +1998,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     for (0..n_spans) |si| {
         // A span's intermediates (the gathered rows above all) are released once its heads are made, not held
         // to the layer's end.
-        var ssc = Scope.init(sc.a, sc.s);
+        var ssc = sc.child();
         defer ssc.deinit();
         const a = si * span;
         const b = @min(L, a + span);
@@ -2662,7 +2669,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     }
     // The attention's and the FFN's intermediates live in scopes of their own, so evaluating the layer can free them.
     const a = blk: {
-        var asc = Scope.init(sc.a, sc.s);
+        var asc = sc.child();
         defer asc.deinit();
         const o = if (ds) |d| try dsparkAttention(&asc, m, li, h, d, p0) else try attention(&asc, m, st, li, h, p0, sh, span);
         break :blk try sc.keep(asc.out(o));
@@ -2686,7 +2693,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     const folded = foldsExpand(m, sh, li, x1);
     expands_folded += @intFromBool(folded);
     const y = blk: {
-        var fsc = Scope.init(sc.a, sc.s);
+        var fsc = sc.child();
         defer fsc.deinit();
         const expand: ?Expand = if (folded) .{ .x = x1, .post = sf.post, .comb = sf.comb } else null;
         break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, r, &.{ sf.pre, sf.post, sf.comb }, expand)));
@@ -3127,7 +3134,7 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
         try st.hist.appendSlice(gpa, comp);
     }
 
-    var sc = Scope.init(gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     const host = try sc.a.alloc(i32, L);
     defer sc.a.free(host);
@@ -3389,7 +3396,7 @@ fn issuePrefetch(m: *const Model, u: *const Unresolved) !void {
 fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
     const hk = m.experts.hook;
     if (u.pred.ctx != null) issuePrefetch(m, u) catch {};
-    var sc = Scope.init(m.gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     const t0 = readStart();
     const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, .{ .layer = .{ .m = m, .li = u.li } }, u.map, u.kept);
@@ -3449,7 +3456,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
         p.tail = null;
     };
     const L = p.ids.len;
-    var sc = Scope.init(gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     if (prof(m, L)) |pf| {
         pf.restart();
@@ -3538,7 +3545,7 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
     reportEngramWait(m, L);
     p.st.n = p.p0 + L;
     if (p.st.ds.len > 0) {
-        var msc = Scope.init(m.gpa, m.s);
+        var msc = m.scope();
         defer msc.deinit();
         const main_rows = try msc.concat(p.targets[0..c.dspark.n_targets], -1); // [L, targets * dim]
         if (p.st.verify) |*v| {
@@ -3547,7 +3554,7 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         } else try commitMain(&msc, m, p.st, main_rows, p.p0, if (L > exl3.kernels.DECODE_ROWS_MAX) .wait else .lazy);
     }
     if (m.tap) |t| {
-        var tsc = Scope.init(m.gpa, m.s);
+        var tsc = m.scope();
         defer tsc.deinit();
         try t.input(t.ctx, c.layers, .head_in, try tsc.rms(try hcCollapse(&tsc, p.x, p.cpre), m.norm, c.eps));
     }
@@ -3575,7 +3582,7 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
 
 fn headLogits(m: *Model, p: *const Pass, want: Want) !A {
     const L = p.ids.len;
-    var sc = Scope.init(m.gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     const xs = if (want == .last) try sc.slice(p.x, 0, L - 1, L) else p.x;
     const ps = if (want == .last) try sc.slice(p.cpre, 0, L - 1, L) else p.cpre;
@@ -3635,7 +3642,7 @@ pub fn extendLazy(m: *Model, id: A, host: *[1]u32) !A {
     var pass: Pass = .{ .st = st, .ids = host, .p0 = st.n, .span = SPAN, .rows = &.{}, .x = none, .cpre = none, .sh = try Shared.init(m.gpa, 1) };
     defer pass.deinit(m.gpa);
     {
-        var sc = Scope.init(m.gpa, m.s);
+        var sc = m.scope();
         defer sc.deinit();
         pass.x, pass.cpre = try startStreams(&sc, m, try m.embed.rows(&sc, try sc.reshape(id, &.{1}), m.act), 1);
     }
@@ -3746,7 +3753,7 @@ pub fn cedFork(m: *const Model, p: *const Pass, want: Want) !?Pass {
     const L = p.ids.len;
     const t = cedRows(m, p.st, L, want) orelse return null;
     const gpa = m.gpa;
-    var sc = Scope.init(gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     const x = sc.out(try sc.slice(p.x, 0, L - t, L));
     errdefer _ = mlx.mlx_array_free(x);
@@ -3781,7 +3788,7 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     try prefetchEngram(m, &pass);
     for (0..split) |li| try passLayer(m, &pass, li);
     _ = try settleLast(m, &pass);
-    var sc = Scope.init(m.gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     try cedCompress(&sc, m, &pass, split);
     var ev: std.ArrayList(A) = .empty;
@@ -3813,7 +3820,7 @@ fn cedCompress(sc: *Scope, m: *Model, p: *Pass, li: usize) !void {
 fn cedReplay(m: *Model, p: *Pass, li: usize, t: usize) !void {
     const gpa = m.gpa;
     const L = p.ids.len;
-    var sc = Scope.init(gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     try cedCompress(&sc, m, p, li);
     const x = sc.out(try sc.slice(p.x, 0, L - t, L));
@@ -3932,7 +3939,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const c = &m.cfg;
     const st = try ensureState(m);
     const ds = &(m.dspark orelse return error.Dsv41NoDspark);
-    var sc = Scope.init(gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     const B = c.dspark.block;
     const n = st.n;
@@ -3987,8 +3994,8 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
 pub fn verify(m: *Model, ids: []const u32) !A {
     const st = try ensureState(m);
     if (st.verify != null) return error.Dsv41VerifyOpen;
-    exl3.project_rows.rows_exact = m.dspark_exact;
-    defer exl3.project_rows.rows_exact = false;
+    m.rows = .{ .exact = m.dspark_exact };
+    defer m.rows = .{};
     // The caller takes the verdict from a value built on the logits, whose evaluation waits for the head.
     m.defer_head = m.lazy_head;
     defer m.defer_head = false;
@@ -4023,7 +4030,7 @@ pub fn finishVerify(m: *Model, accepted: usize) !void {
     const v = &(st.verify orelse return if (accepted == 0) {} else error.Dsv41NoVerify);
     const keep = accepted + 1;
     if (keep > v.rows) return error.Dsv41VerifyTooWide;
-    var sc = Scope.init(m.gpa, m.s);
+    var sc = m.scope();
     defer sc.deinit();
     const end = v.n0 + keep;
     if (keep < v.rows) {
@@ -4217,7 +4224,7 @@ test "dsv41 fixture: prefill matches DeepSeek's reference in f32 with the QAT ro
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4276,7 +4283,7 @@ test "dsv41 fixture: decode one token at a time after a prefill matches the refe
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4308,7 +4315,7 @@ test "dsv41 fixture: with the QAT round trips on, the layers up to the first rou
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4396,7 +4403,7 @@ test "dsv41 fused: decode with the kernels follows the composed path on the GPU 
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4425,7 +4432,7 @@ test "dsv41 fused: prefill with the kernels follows the composed path on the GPU
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4461,7 +4468,7 @@ test "dsv41 decode: a pass builds each position and group-count array once, not 
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4494,7 +4501,7 @@ test "dsv41 fused: the f16 attention arm gives the f32 chain's first-layer heads
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4542,7 +4549,7 @@ test "dsv41 DSpark: the drafted block, its Markov bias and its confidence match 
     defer fx.deinit();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4593,7 +4600,7 @@ test "dsv41 DSpark: with the QAT round trips on, the stages draft the reference'
     defer fx.deinit();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const t1 = try fixtureIds(&sc, &fx, "ds_t1");
     defer testing.allocator.free(t1);
@@ -4648,7 +4655,7 @@ test "dsv41 DSpark: a verify round keeps exactly its accepted prefix, whatever t
     defer fx.deinit();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4719,7 +4726,7 @@ test "dsv41 DSpark: after a rollback the next draft is the serial model's draft 
     defer fx.deinit();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4780,7 +4787,7 @@ test "dsv41 DSpark: a one-row verify round is the serial step, opens no verify a
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4821,7 +4828,7 @@ test "dsv41 DSpark: plain rounds whose commit is left lazy give the drafts and v
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4881,7 +4888,7 @@ test "dsv41 DSpark: a verify round waits on neither its head, its main rows nor 
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -4997,7 +5004,7 @@ test "dsv41 index stream: a prefill whose index top-k streams over key tiles giv
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -5033,7 +5040,7 @@ test "dsv41 packed KV: compressed rows and index keys kept as FP4 give the bf16 
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -5140,7 +5147,7 @@ test "dsv41 restore point: a state restored at a position continues bit for bit 
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -5183,7 +5190,7 @@ test "dsv41 restore point: a checkpoint of another position or shape is refused 
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -5258,7 +5265,7 @@ test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are
     defer _ = mlx.mlx_stream_free(s);
     exact_matmul = true;
     defer exact_matmul = false;
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -5392,7 +5399,7 @@ test "dsv41 state-only chunks: a chunk another chunk wider than the window follo
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const base = try tokens(&sc, &fx);
     defer testing.allocator.free(base);
@@ -5424,7 +5431,7 @@ test "dsv41 prefill pipeline: layers in flight leave the logits and state of the
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const base = try tokens(&sc, &fx);
     defer testing.allocator.free(base);
@@ -5459,7 +5466,7 @@ test "dsv41 state-only chunks: skipping before a chunk the window covers leaves 
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const base = try tokens(&sc, &fx);
     defer testing.allocator.free(base);
@@ -5483,7 +5490,7 @@ test "dsv41 state-only chunks: an image prompt cut by skipped chunks gives the l
     defer _ = mlx.mlx_stream_free(cpu);
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const base = try tokens(&sc, &fx);
     defer testing.allocator.free(base);
@@ -5524,7 +5531,7 @@ test "dsv41 Engram: a chunk's rows read ahead on a thread give the bytes of the 
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -5623,7 +5630,7 @@ test "dsv41 Engram: a prefill that reads each chunk's successor ahead gives the 
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -5651,7 +5658,7 @@ test "dsv41 Engram: the look-ahead holds across an image span cut by a chunk (DS
     defer _ = mlx.mlx_stream_free(cpu);
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const base = try tokens(&sc, &fx);
     defer testing.allocator.free(base);
@@ -5671,7 +5678,7 @@ test "dsv41 Engram: the carried look-ahead is freed by a reset, by a failed pass
     defer _ = mlx.mlx_stream_free(cpu);
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const base = try tokens(&sc, &fx);
     defer testing.allocator.free(base);
@@ -5763,11 +5770,11 @@ test "dsv41 fused attention: the one-pass kernel is no further from the f32 trut
     try mlx.requireGpu();
     const gpu = mlx.gpuStream();
     if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    var sc = Scope.init(testing.allocator, gpu);
+    var sc = Scope.plain(testing.allocator, gpu);
     defer sc.deinit();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var cs = Scope.init(testing.allocator, cpu);
+    var cs = Scope.plain(testing.allocator, cpu);
     defer cs.deinit();
     const cases = [_]AttnCase{
         .{ .L = 256, .wp = 127, .K = 512, .nc = 700 },
@@ -5818,7 +5825,7 @@ test "dsv41 packed picks: the fused kernel reading the picked rows packed gives 
         .{ .L = 40, .wp = 3, .K = 24, .nc = 30, .H = 16, .hd = 64, .window = 8 },
     };
     for (cases, 0..) |c, ci_| {
-        var sc = Scope.init(testing.allocator, gpu);
+        var sc = Scope.plain(testing.allocator, gpu);
         defer sc.deinit();
         const d = try attnCaseData(&sc, c, 0xb11 + ci_);
         var rows = try packedStore(&sc, d.comp);
@@ -5860,7 +5867,7 @@ test "dsv41 packed picks: one kernel gives the rows and ids of the op chain byte
         .{ .L = 5, .K = 7, .nc = 3, .w = 64, .mode = .fp4_e4m3, .group = 16, .dt = .float32, .holes = true },
     };
     for (cases, 0..) |c, ci_| {
-        var sc = Scope.init(testing.allocator, gpu);
+        var sc = Scope.plain(testing.allocator, gpu);
         defer sc.deinit();
         var prng = std.Random.DefaultPrng.init(0x9a1 + ci_);
         const rnd = prng.random();
@@ -5915,7 +5922,7 @@ test "dsv41 attention epilogue: the kernel's store gives attnOut's rotated, fp8-
     qat_mod.invFreqs(&f, 64, 65536, 160000, 16, 32, 1);
     for (cases, 0..) |t, ci_| {
         const c = t.c;
-        var sc = Scope.init(testing.allocator, gpu);
+        var sc = Scope.plain(testing.allocator, gpu);
         defer sc.deinit();
         const d = try attnCaseData(&sc, c, 0xe91 + ci_);
         var rows = try packedStore(&sc, if (c.K > 0) d.comp else try sc.zeros(&.{ 2, 512 }, .bfloat16));
@@ -5992,7 +5999,7 @@ test "dsv41 attention epilogue: a prefill on the kernel's store gives the op cha
     defer fx.deinit();
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -6028,7 +6035,7 @@ test "dsv41 hc mix tile: a prefill on the release tile gives the previous tile's
     defer fx.deinit();
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const ids = try tokens(&sc, &fx);
     defer testing.allocator.free(ids);
@@ -6089,7 +6096,7 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
     try mlx.requireGpu();
     const gpu = mlx.gpuStream();
     if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    var sc = Scope.init(testing.allocator, gpu);
+    var sc = Scope.plain(testing.allocator, gpu);
     defer sc.deinit();
     var fake: Model = undefined;
     fake.fused = true;
@@ -6137,7 +6144,7 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
 test "dsv41 index decode: scoring the candidate blocks' keys picks what the masked whole scan picks" {
     const gpu = mlx.gpuStream();
     if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    var sc = Scope.init(testing.allocator, gpu);
+    var sc = Scope.plain(testing.allocator, gpu);
     defer sc.deinit();
     var fake: Model = undefined;
     fake.fused = true;
@@ -6239,7 +6246,7 @@ fn expectStoredRouterExact(dir: []const u8) !void {
     const s = mlx.gpuStream();
     const m = try tinyModel(dir, .{ .act = .float32, .experts = false, .dspark = true }, s);
     defer m.deinit();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const Bits = struct { logits: []const f32, idx: []const i32, wts: []const f32 };
     const bits = struct {
@@ -6290,7 +6297,7 @@ test "dsv41 drop: the router with experts masked picks the top-k of the kept exp
     defer d.deinit();
     const cut = try tinyModel(dir, .{ .act = .float32, .experts = false, .drop = &d }, s);
     defer cut.deinit();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     const h = try routerRows(&sc, full.cfg.dim, 24, 0xd20b);
     for (0..full.cfg.layers) |li| try expectMaskedRoute(&sc, full, cut, &d, li, h, true);
@@ -6306,7 +6313,7 @@ test "dsv41 drop: the fused router kernel masks the same experts and weights the
     defer d.deinit();
     const cut = try tinyModel(dir, .{ .act = .float32, .experts = false, .drop = &d }, s);
     defer cut.deinit();
-    var sc = Scope.init(testing.allocator, s);
+    var sc = Scope.plain(testing.allocator, s);
     defer sc.deinit();
     // One row is the GEMV width, more is the matmul one.
     for ([_]usize{ 1, 24 }) |rows| {
@@ -6360,7 +6367,7 @@ test "dsv41 vision: the span rows replace the embeddings, and the logits are the
     defer _ = mlx.mlx_stream_free(cpu);
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const base = try tokens(&sc, &fx);
     defer testing.allocator.free(base);
@@ -6411,7 +6418,7 @@ test "dsv41 vision: a span without rows, or a pack without the image bias, is re
     const dir = try fixtureDir();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const t = try visionTinyModel(dir, cpu);
     defer t.m.deinit();
@@ -6431,7 +6438,7 @@ test "dsv41 vision: an image row picks its experts by the image bias, a text row
     const dir = try fixtureDir();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const t = try visionTinyModel(dir, cpu);
     defer t.m.deinit();
@@ -6469,7 +6476,7 @@ test "dsv41 vision: the Engram write leaves an image row's stream untouched (DSV
     const dir = try fixtureDir();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const t = try visionTinyModel(dir, cpu);
     defer t.m.deinit();
@@ -6509,7 +6516,7 @@ test "dsv41 vision: the CED replay keeps the image mask of the rows it replays (
     defer _ = mlx.mlx_stream_free(cpu);
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
-    var sc = Scope.init(testing.allocator, cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
     defer sc.deinit();
     const base = try tokens(&sc, &fx);
     defer testing.allocator.free(base);
@@ -6587,7 +6594,7 @@ test "dsv41 embed: a row gathered on the GPU is the dequantized stored row, for 
             // A scale or bias is a finite number of about 1 (the top byte of a little-endian float).
             if (i % esize == esize - 1) byte.* = 0x30 | (byte.* & 0x0f);
         };
-        var sc = Scope.init(testing.allocator, cpu);
+        var sc = Scope.plain(testing.allocator, cpu);
         defer sc.deinit();
         const shape = [_]c_int{ rows, groups };
         const sa = try sc.keep(mlx.mlx_array_new_data(&sb[0], &shape, 2, sdtype));
@@ -6630,7 +6637,7 @@ test "dsv41 embed: a row gathered on the GPU is the dequantized stored row, for 
 
 test "dsv41 submit: arrays riding the picks' submit are computed with it, and the hc split's bytes are the split evaluated alone" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const eps = try kernels.hcEps(&sc, 1e-6, 1e-6);
     var prng = std.Random.DefaultPrng.init(0x64a1);
@@ -6656,7 +6663,7 @@ test "dsv41 submit: arrays riding the picks' submit are computed with it, and th
 
 test "dsv41 profile: a stage mark evaluates every live array it is given and skips the empty ones" {
     try mlx.requireGpu();
-    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const a = try sc.add(try sc.floats(&.{ 1, 2 }, &.{2}), try sc.f(1));
     const b = try sc.mul(try sc.floats(&.{ 3, 4 }, &.{2}), try sc.f(2));

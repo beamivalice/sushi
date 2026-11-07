@@ -15,20 +15,35 @@ const root = @import("root.zig");
 /// `gemv` the indexed GEMV (one row per bank).
 pub const Arm = enum { rows, gemm, gemv };
 
+/// Per-call launch options; the default is a plain serial call.
+pub const Opts = struct {
+    rows: project_rows.Mode = .{},
+    /// The caller's transient bill holds `trunk_gemm.DECODED_SCRATCH_BYTES`; others keep the sorted GEMM.
+    decoded_billed: bool = false,
+};
+
 /// `x` [rows, in] through the one-bank projection `p` (trellis [1, in/16, out/16, n]): [rows, out] in x's dtype.
 pub fn linear(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode) !mlx.mlx_array {
+    return linearWith(s, x, p, dec, .{});
+}
+
+pub fn linearWith(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, opts: Opts) !mlx.mlx_array {
     const rows: usize = @intCast(mlx.getShape(x)[0]);
-    return run(s, x, p, dec, 1, rows);
+    return run(s, x, p, dec, 1, rows, opts);
 }
 
 /// `x` [G, rows, in] through the G-bank projection `p` (bank g serves x[g]): [G, rows, out] in x's dtype.
 pub fn linearGrouped(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode) !mlx.mlx_array {
+    return linearGroupedWith(s, x, p, dec, .{});
+}
+
+pub fn linearGroupedWith(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, opts: Opts) !mlx.mlx_array {
     const sh = mlx.getShape(x);
     if (sh.len != 3) return error.BadExl3Shape;
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ sh[0] * sh[1], sh[2] }, 2, s));
-    const y = try run(s, flat, p, dec, @intCast(sh[0]), @intCast(sh[1]));
+    const y = try run(s, flat, p, dec, @intCast(sh[0]), @intCast(sh[1]), opts);
     defer _ = mlx.mlx_array_free(y);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -43,10 +58,14 @@ pub const SHARED_MAX: usize = 4;
 /// `[S, in]` (one row per linear), `svh` `[1, out]`; linear s owns columns `cols[s]..cols[s + 1]`, each a multiple of 128.
 pub const Shared = struct { p: root.Proj, cols: [SHARED_MAX + 1]c_int, count: usize };
 
-/// `x` [rows, in] (rows <= `project_rows.rowsMax()`) through every linear of `sh` in one multi-row launch: `outs[s]` is
+/// `x` [rows, in] (rows <= `project_rows.rowsMax(opts.rows)`) through every linear of `sh` in one multi-row launch: `outs[s]` is
 /// linear s's [rows, width] in x's dtype (the caller frees each). A row holds the bar of its own linear's launch; the
 /// sum order may differ from it, since the launch splits k for the stacked width.
 pub fn linearShared(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, outs: []mlx.mlx_array) !void {
+    return linearSharedWith(s, x, sh, dec, outs, .{});
+}
+
+pub fn linearSharedWith(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, outs: []mlx.mlx_array, opts: Opts) !void {
     try dec.requireTable();
     if (outs.len != sh.count) return error.BadExl3Shape;
     const rows: c_int = mlx.getShape(x)[0];
@@ -54,7 +73,7 @@ pub fn linearShared(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.D
     const total = sh.cols[sh.count];
     var bounds: [3]c_int = @splat(total);
     for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
-    const flat = try project_rows.projectRowsSegmented(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, bounds);
+    const flat = try project_rows.projectRowsSegmented(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, bounds, opts.rows);
     defer _ = mlx.mlx_array_free(flat);
     var made: usize = 0;
     errdefer for (outs[0..made]) |o| {
@@ -75,32 +94,53 @@ pub fn linearShared(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.D
 pub var force_arm: ?Arm = null;
 
 /// `x` [groups * rows, in], bank g's rows contiguous.
-fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, groups: usize, rows: usize) !mlx.mlx_array {
+fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, groups: usize, rows: usize, opts: Opts) !mlx.mlx_array {
     try dec.requireTable();
     const tsh = mlx.getShape(p.trellis);
     if (tsh.len != 4 or tsh[0] != groups) return error.BadExl3Shape;
     kernels.setDecodeParams(dec);
-    if ((force_arm orelse if (rows <= project_rows.rowsMax()) Arm.rows else Arm.gemm) == .rows)
-        return project_rows.projectRows(s, x, p.trellis, p.suh, p.svh);
+    if ((force_arm orelse if (rows <= project_rows.rowsMax(opts.rows)) Arm.rows else Arm.gemm) == .rows)
+        return project_rows.projectRows(s, x, p.trellis, p.suh, p.svh, opts.rows);
+    const inputs = try gemmInputs(groups, rows, kernels.gemmWindowRows());
+    const slots = inputs.slots;
+    const prepared = try kernels.prepareIndexed(s, x, p.suh, slots);
+    defer _ = mlx.mlx_array_free(prepared);
+    const inner = if ((force_arm orelse .gemm) == .gemm) blk: {
+        const out_dim: c_int = mlx.getShape(p.trellis)[2] * 16;
+        if (groups == 1 and trunk_gemm.decodedServes(opts.decoded_billed, @intCast(rows), mlx.getShape(x)[1], out_dim))
+            break :blk try trunk_gemm.innerDense(s, prepared, p.trellis);
+        break :blk try kernels.innerGemmSortedTable(s, prepared, p.trellis, slots, kernels.gemmWindowRows(), true, inputs.tab);
+    } else try kernels.indexedGemvCoopF16(s, prepared, p.trellis, slots);
+    defer _ = mlx.mlx_array_free(inner);
+    return kernels.finishIndexedAs(s, inner, p.svh, slots, mlx.mlx_array_dtype(x));
+}
+
+/// What a GEMM-arm call of `groups` banks of `rows` rows needs: each row's bank id, and the window table over them.
+pub const GemmInputs = struct { slots: mlx.mlx_array, tab: kernels.WindowTable };
+
+const GemmKey = struct { groups: usize, rows: usize, win: c_int };
+const gemm_cache_len = 8;
+var gemm_cache: [gemm_cache_len]?struct { key: GemmKey, inputs: GemmInputs } = @splat(null);
+var gemm_cache_next: usize = 0;
+
+/// The inputs depend on `(groups, rows, win)` alone, and a prefill chunk's trellis linears all share them, so they are
+/// built and uploaded once. The handles are the cache's: valid until a later call evicts them, never freed by the caller.
+pub fn gemmInputs(groups: usize, rows: usize, win: c_int) !GemmInputs {
+    const key = GemmKey{ .groups = groups, .rows = rows, .win = win };
+    for (gemm_cache) |e| if (e) |hit| if (std.meta.eql(hit.key, key)) return hit.inputs;
     const alloc = std.heap.page_allocator;
     const ids = try alloc.alloc(u32, groups * rows);
     defer alloc.free(ids);
     for (ids, 0..) |*v, i| v.* = @intCast(i / rows);
     const slots = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(slots);
-    const prepared = try kernels.prepareIndexed(s, x, p.suh, slots);
-    defer _ = mlx.mlx_array_free(prepared);
-    const inner = if ((force_arm orelse .gemm) == .gemm) blk: {
-        const out_dim: c_int = mlx.getShape(p.trellis)[2] * 16;
-        if (groups == 1 and trunk_gemm.decodedServes(@intCast(rows), mlx.getShape(x)[1], out_dim))
-            break :blk try trunk_gemm.innerDense(s, prepared, p.trellis);
-        const tab = try windowTable(groups, rows, kernels.gemmWindowRows());
-        defer _ = mlx.mlx_array_free(tab.starts);
-        defer _ = mlx.mlx_array_free(tab.nlives);
-        break :blk try kernels.innerGemmSortedTable(s, prepared, p.trellis, slots, kernels.gemmWindowRows(), true, tab);
-    } else try kernels.indexedGemvCoopF16(s, prepared, p.trellis, slots);
-    defer _ = mlx.mlx_array_free(inner);
-    return kernels.finishIndexedAs(s, inner, p.svh, slots, mlx.mlx_array_dtype(x));
+    errdefer _ = mlx.mlx_array_free(slots);
+    const tab = try windowTable(groups, rows, win);
+    if (gemm_cache[gemm_cache_next]) |old| for ([_]mlx.mlx_array{ old.inputs.slots, old.inputs.tab.starts, old.inputs.tab.nlives }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    gemm_cache[gemm_cache_next] = .{ .key = key, .inputs = .{ .slots = slots, .tab = tab } };
+    gemm_cache_next = (gemm_cache_next + 1) % gemm_cache_len;
+    return gemm_cache[(gemm_cache_next + gemm_cache_len - 1) % gemm_cache_len].?.inputs;
 }
 
 /// Windows of at most `win` rows that never straddle two banks.
@@ -497,16 +537,16 @@ test "exl3 linear: the multi-row kernel gives a row the same bytes at widths 2 t
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
+const exact: Opts = .{ .rows = .{ .exact = true } };
+
 test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 8 at Flash-Next's trunk shapes, stacked, on the machine's own arm and on SIMD" {
     try mlx.requireGpu();
     // The arm follows the hardware, never the row count.
-    project_rows.rows_exact = true;
-    defer project_rows.rows_exact = false;
-    for (1..9) |rows| try std.testing.expectEqual(kernels.gemmNaxOn(), project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1).nax);
+    for (1..9) |rows| try std.testing.expectEqual(kernels.gemmNaxOn(), project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1, exact.rows).nax);
     try exactRowsCase();
     _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
     defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
-    for (1..9) |rows| try std.testing.expect(!project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1).nax);
+    for (1..9) |rows| try std.testing.expect(!project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1, exact.rows).nax);
     try exactRowsCase();
 }
 
@@ -540,7 +580,7 @@ fn exactRowsCase() !void {
             var row = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(row);
             try mlx.check(mlx.mlx_slice(&row, x, &[_]c_int{ @intCast(r), 0 }, 2, &[_]c_int{ @intCast(r + 1), @intCast(sh[0]) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            const y = try linear(s, row, h.p, dec);
+            const y = try linearWith(s, row, h.p, dec, exact);
             solo_arrays[made] = mlx.mlx_array_new();
             made += 1;
             solo[r] = try hostF32(s, y, &solo_arrays[made - 1]);
@@ -550,7 +590,7 @@ fn exactRowsCase() !void {
             var part = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(part);
             try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(width), @intCast(sh[0]) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            const y = try linear(s, part, h.p, dec);
+            const y = try linearWith(s, part, h.p, dec, exact);
             defer _ = mlx.mlx_array_free(y);
             var cy = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(cy);
@@ -583,7 +623,7 @@ fn exactRowsCase() !void {
         defer _ = mlx.mlx_array_free(row);
         try mlx.check(mlx.mlx_slice(&row, x, &[_]c_int{ @intCast(r), 0 }, 2, &[_]c_int{ @intCast(r + 1), @intCast(in) }, 2, &[_]c_int{ 1, 1 }, 2, s));
         var outs: [3]mlx.mlx_array = undefined;
-        try linearShared(s, row, stacked, dec, &outs);
+        try linearSharedWith(s, row, stacked, dec, &outs, exact);
         for (outs, 0..) |o, i| {
             want_arrays[wm] = mlx.mlx_array_new();
             wm += 1;
@@ -596,7 +636,7 @@ fn exactRowsCase() !void {
         defer _ = mlx.mlx_array_free(part);
         try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(width), @intCast(in) }, 2, &[_]c_int{ 1, 1 }, 2, s));
         var outs: [3]mlx.mlx_array = undefined;
-        try linearShared(s, part, stacked, dec, &outs);
+        try linearSharedWith(s, part, stacked, dec, &outs, exact);
         for (outs, 0..) |o, i| {
             defer _ = mlx.mlx_array_free(o);
             var co = mlx.mlx_array_new();
@@ -612,8 +652,6 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at 
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     defer kernels.setDecodeParams(.mul1);
-    project_rows.rows_exact = true;
-    defer project_rows.rows_exact = false;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -639,7 +677,7 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at 
             var part = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(part);
             try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ @intCast(sh.groups), width, @intCast(sh.in) }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-            const y = try linearGrouped(s, part, h.p, dec);
+            const y = try linearGroupedWith(s, part, h.p, dec, exact);
             defer _ = mlx.mlx_array_free(y);
             var cy = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(cy);
@@ -647,8 +685,6 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at 
             if (width == 1) {
                 one_row = try alloc.dupe(f32, got);
                 if (sh.out == 129280) {
-                    project_rows.rows_exact = false;
-                    defer project_rows.rows_exact = true;
                     const serial = try linearGrouped(s, part, h.p, dec);
                     defer _ = mlx.mlx_array_free(serial);
                     var cs = mlx.mlx_array_new();
@@ -661,4 +697,31 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at 
             for (0..sh.groups) |g| try t.expectEqualSlices(u8, std.mem.sliceAsBytes(one_row[g * sh.out ..][0..sh.out]), std.mem.sliceAsBytes(got[g * w * sh.out ..][0..sh.out]));
         }
     }
+}
+
+fn u32Values(a: mlx.mlx_array) ![]const u32 {
+    try mlx.check(mlx.mlx_array_eval(a));
+    return (mlx.mlx_array_data_uint32(a) orelse return error.Unreadable)[0..mlx.mlx_array_size(a)];
+}
+
+test "exl3 linear: the GEMM inputs of one groups, rows and window are built once, and equal the bank ids and window table built directly" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const first = try gemmInputs(3, 70, 32);
+    const again = try gemmInputs(3, 70, 32);
+    try t.expectEqual(first.slots.ctx, again.slots.ctx);
+    try t.expectEqual(first.tab.starts.ctx, again.tab.starts.ctx);
+    const direct = try windowTable(3, 70, 32);
+    defer _ = mlx.mlx_array_free(direct.starts);
+    defer _ = mlx.mlx_array_free(direct.nlives);
+    try t.expectEqual(direct.nwin, first.tab.nwin);
+    try t.expectEqualSlices(u32, try u32Values(direct.starts), try u32Values(first.tab.starts));
+    try t.expectEqualSlices(u32, try u32Values(direct.nlives), try u32Values(first.tab.nlives));
+    const ids = try u32Values(first.slots);
+    try t.expectEqual(@as(usize, 210), ids.len);
+    for (ids, 0..) |v, i| try t.expectEqual(@as(u32, @intCast(i / 70)), v);
+    // Past the cache's length the oldest entries go and a fresh build still equals the direct one.
+    for (1..gemm_cache_len + 2) |k| _ = try gemmInputs(1, 40 + k, 32);
+    const rebuilt = try gemmInputs(3, 70, 32);
+    try t.expectEqualSlices(u32, try u32Values(direct.starts), try u32Values(rebuilt.tab.starts));
 }
