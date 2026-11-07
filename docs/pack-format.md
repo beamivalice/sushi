@@ -9,7 +9,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related:
 [encoder](encoder.md), [engine-exl3-experts](engine-exl3-experts.md), [quality-kld](quality-kld.md),
 [qwen4-arch](qwen4-arch.md), [mimo2-arch](mimo2-arch.md).
 
-Readers in this repo: `src/expert_quant.zig` (layout), `src/exl3/root.zig`
+Readers in this repo: `src/expert_store.zig` and `src/exl3/pack.zig` (layout), `src/exl3/root.zig`
 (`expert_quant` parse), `src/exl3/codebook_tables.zig` (STQ tables), `src/exl3/expert_exl3.zig` (decode), `src/mimo2/mimo_source.zig` (`validateShardStamps`),
 `src/model.zig` (weight loading).
 
@@ -410,7 +410,7 @@ composite.
 
 ## Loader rules the engine applies to every pack
 
-- **Expert layout is solved from PACKED shapes** (`expert_quant.zig`): affine
+- **Expert layout is solved from PACKED shapes** (`expert_store.zig`): affine
   (bits, group_size) from `w_cols*32 / in_dim`; EXL3 K from the trellis shape;
   `expert_layout` decides `moeExl3` vs the affine kernels and the streaming byte
   plan (`exl3ExpertBytes`). No literal quant width at any

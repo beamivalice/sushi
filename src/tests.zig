@@ -22,7 +22,9 @@ test {
     _ = @import("expert_io.zig");
     _ = @import("imatrix.zig");
     _ = @import("hidden_capture.zig");
-    _ = @import("expert_quant.zig");
+    _ = @import("expert_store.zig");
+    _ = @import("glm5/glm5_store_test.zig");
+    _ = @import("qwen4/qwen4_store_test.zig");
     _ = @import("dsv41/expert_usage.zig");
     _ = @import("log.zig");
     _ = @import("version.zig");

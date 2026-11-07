@@ -14,15 +14,12 @@ DeepSeek's request bill takes its prefill working set out of the decoder pools a
 DeepSeek-V4.1 serves medium and xhigh as their own words, without a re-route
 DeepSeek: the streamed request bill brackets the prefill peaks measured on the M5 Max
 GLM BF16 individual index recognizes separate gate up down experts
-GLM BF16 individual source preserves shard bytes and leaves dense prefix and MTP unopened
-GLM BF16 individual source rejects incomplete quantized or malformed banks
 GLM BF16 stream imports split expert slabs and preserves bytes across cache and union
 GLM DFlash2 reserve at prefill end fits the admission bill at every request shape
 GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised context
 GLM EXL3 index uses native source nesting and refuses mixed expert formats
 GLM EXL3 preflight refuses a rate-grouped layer by name
 GLM EXL3 preflight refuses orphan MTP and out of range packed tensors
-GLM FP8 individual source resolves its layout and keeps e4m3 codes and block scales as stored
 GLM MLA prefill scratch is held by the MLA layers a pending window can contain
 GLM SSD-only bills its checkpoints and window, no writer term (the shared admission headroom has it), and sizes no cache
 GLM admission bills the checkpoints and assistant window a request keeps; the context sizer reserves none of them

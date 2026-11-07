@@ -23,6 +23,7 @@ test {
     _ = @import("test_expect.zig");
     _ = @import("io_util.zig");
     _ = @import("dsv41/dspark_rows.zig");
+    _ = @import("expert_drop.zig");
     _ = @import("dsv41/expert_usage.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");

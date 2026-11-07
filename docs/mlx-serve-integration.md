@@ -38,6 +38,7 @@ meaning:
 |---|---|---|
 | `GroupLayout` (`group_layout.Layout`) | validates a layer's rate-group (`<proj>.gN.*`) names, shapes and dtypes, bills their stored bytes, maps a router index to (group, local expert) | 4ca5ece4 |
 | `moeGroups` | the routed SwiGLU over a layer stored as rate groups: one `moe` pass per group, summed in f32 | 4ca5ece4 |
+| `pack` | EXL3/STQ pack reading over a safetensors index (`pack.zig`, std only): tensor keys, bank completeness, tile order, `LayerGroups`, `groupedLayerSpans` | 1.6.0-dev |
 | `moeWithShared` | `moe` plus an already gated shared expert; at one row the add folds into the decode reduction, rounded as the separate add | 698c4ae8 |
 
 STQ support is additive too: `Spec` gains `rates` and `table`, `format.Decode` gains `table` (null for MCG and MUL1, so

@@ -1,5 +1,6 @@
 //! A pack's per-layer routed-expert usage (`expert_usage.json`) and the drop `--drop-expert n` ranks from it.
 const std = @import("std");
+const drop_set = @import("../expert_drop.zig");
 
 pub const file_name = "expert_usage.json";
 
@@ -9,8 +10,8 @@ pub const file_name = "expert_usage.json";
 pub const granularity: u16 = 8;
 
 /// The widest router a drop covers (the window kernels hold one thread per expert).
-pub const max_experts = 512;
-const words = max_experts / 64;
+pub const max_experts = drop_set.max_experts;
+const words = drop_set.words;
 
 pub const Error = error{
     ExpertUsageMissing,
@@ -94,56 +95,23 @@ pub fn rank(allocator: std.mem.Allocator, counts: []const u64) ![]u16 {
 }
 
 /// The `n` least-used experts of every routed layer, as one bit row a layer.
-pub const Drop = struct {
-    allocator: std.mem.Allocator,
-    n: u16,
-    first_layer: u16,
-    rows: [][words]u64,
-    /// Where the ranking came from, as the file states it.
-    source: []u8,
+pub const Drop = drop_set.DropSet;
 
-    pub fn build(allocator: std.mem.Allocator, usage: *const Usage, n: u16, first_layer: u16) !Drop {
-        const rows = try allocator.alloc([words]u64, usage.counts.len);
-        errdefer allocator.free(rows);
-        const source = try allocator.dupe(u8, usage.source);
-        errdefer allocator.free(source);
-        for (rows, usage.counts) |*row, counts| {
-            if (counts.len > max_experts) return error.DropRouterTooWide;
-            if (n >= counts.len) return error.DropExpertTooMany;
-            row.* = @splat(0);
-            const order = try rank(allocator, counts);
-            defer allocator.free(order);
-            for (order[0..n]) |e| row[e / 64] |= @as(u64, 1) << @intCast(e % 64);
-        }
-        return .{ .allocator = allocator, .n = n, .first_layer = first_layer, .rows = rows, .source = source };
+fn buildDrop(allocator: std.mem.Allocator, usage: *const Usage, n: u16, first_layer: u16) !Drop {
+    const rows = try allocator.alloc([words]u64, usage.counts.len);
+    errdefer allocator.free(rows);
+    const source = try allocator.dupe(u8, usage.source);
+    errdefer allocator.free(source);
+    for (rows, usage.counts) |*row, counts| {
+        if (counts.len > max_experts) return error.DropRouterTooWide;
+        if (n >= counts.len) return error.DropExpertTooMany;
+        row.* = @splat(0);
+        const order = try rank(allocator, counts);
+        defer allocator.free(order);
+        for (order[0..n]) |e| row[e / 64] |= @as(u64, 1) << @intCast(e % 64);
     }
-
-    pub fn deinit(self: *Drop) void {
-        self.allocator.free(self.rows);
-        self.allocator.free(self.source);
-    }
-
-    /// Names the dropped set: two drops with the same digest leave out the same experts in every layer.
-    pub fn digest(self: *const Drop) u64 {
-        var h = std.hash.XxHash64.init(0x6472_6f70_6578_7031);
-        h.update(std.mem.asBytes(&self.n));
-        h.update(std.mem.asBytes(&self.first_layer));
-        h.update(std.mem.sliceAsBytes(self.rows));
-        return h.final();
-    }
-
-    /// How many of `lo..hi` this layer drops.
-    pub fn droppedIn(self: *const Drop, layer: usize, lo: usize, hi: usize) usize {
-        var count: usize = 0;
-        for (lo..hi) |e| count += @intFromBool(self.isDropped(layer, e));
-        return count;
-    }
-
-    pub fn isDropped(self: *const Drop, layer: usize, expert: usize) bool {
-        if (layer < self.first_layer or layer - self.first_layer >= self.rows.len or expert >= max_experts) return false;
-        return self.rows[layer - self.first_layer][expert / 64] >> @intCast(expert % 64) & 1 != 0;
-    }
-};
+    return .{ .allocator = allocator, .n = n, .first_layer = first_layer, .rows = rows, .source = source };
+}
 
 /// A drop that leaves out exactly `ids[row]` of each routed layer, for tests that need a known set.
 pub fn fixedDrop(allocator: std.mem.Allocator, first_layer: u16, ids: []const []const u16) !Drop {
@@ -171,7 +139,7 @@ pub fn load(allocator: std.mem.Allocator, model_dir: []const u8, req: Request) !
     defer allocator.free(raw);
     var usage = try parse(allocator, raw, req.layers, req.experts);
     defer usage.deinit();
-    return Drop.build(allocator, &usage, req.n, req.first_layer);
+    return buildDrop(allocator, &usage, req.n, req.first_layer);
 }
 
 /// The refusal of `load`, worded for the log.
@@ -234,7 +202,7 @@ test "expert usage: the file parses to one count row per routed layer and refuse
 test "expert usage: the drop is the n least-used experts of each layer, offset by the first routed layer" {
     var u = try parse(testing.allocator, sample, 2, 4);
     defer u.deinit();
-    var d = try Drop.build(testing.allocator, &u, 2, 3);
+    var d = try buildDrop(testing.allocator, &u, 2, 3);
     defer d.deinit();
     // Layer 3 counts 4,1,1,9: ids 1 and 2 are least used. Layer 4 counts 0,7,7,0: ids 0 and 3, ties by id.
     for ([_]bool{ false, true, true, false }, 0..) |want, e| try testing.expectEqual(want, d.isDropped(3, e));

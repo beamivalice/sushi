@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 pub const format = @import("expert_exl3.zig");
+pub const pack = @import("pack.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
 pub const project_rows = @import("project_rows.zig");
 pub const coop_rows2 = @import("coop_rows2.zig");
@@ -499,6 +500,7 @@ test "exl3 a layer may pack below the rate the config bills, never above it" {
 
 test {
     _ = format;
+    _ = pack;
     _ = kernels;
     _ = @import("kernel_source.zig");
     _ = project_rows;

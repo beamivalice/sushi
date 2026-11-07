@@ -2,7 +2,7 @@
 
 How routed experts in turboderp's EXL3 trellis format are decoded and multiplied: the rate, codebook and window a
 pack names, the prefill GEMM and the four-dispatch decode chain, and the parity bars their tests hold. Read this
-before touching `src/exl3/`, `src/expert_quant.zig` or `moeExl3`.
+before touching `src/exl3/`, `src/expert_store.zig` or `moeExl3`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.md) (the on-disk contract),
 [engine-kernels](engine-kernels.md), [engine-expert-streaming](engine-expert-streaming.md),
@@ -12,7 +12,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 
 | File | Role |
 |---|---|
-| `src/expert_quant.zig` | Expert layout detection from PACKED shapes: `.quantized_split` (affine banks) vs `.exl3_k4` (trellis); affine (bits, group_size) solved from geometry |
+| `src/expert_store.zig` | Expert layout detection from PACKED shapes: `.quantized_split` (affine banks) vs `.exl3_k4` (trellis); affine (bits, group_size) solved from geometry. `src/expert_quant.zig` re-exports it |
+| `src/exl3/pack.zig` | EXL3/STQ pack reading, std only: tensor keys, bank completeness, tile order, `LayerGroups`, the span plan of a rate-grouped layer |
 | `src/exl3/root.zig` | The `sushi_exl3` module's host API: `expert_quant` parse (`parseExpertQuant`), `admitTopK`, `trellisAdmitted`, `moe` (the one dispatch), `moeRagged` (a rate-grouped layer) |
 | `src/exl3/codebook_tables.zig` | STQ's named codebook tables: rows, pinned digests, per-table rate range, `resolve` and its refusals |
 | `src/exl3/rate_groups.zig` | Rate-grouped layers: the ragged bank (`Ragged`), the one-dispatch mixed-rate decode kernels, the per-group prefill GEMMs |
