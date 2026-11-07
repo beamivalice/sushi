@@ -414,9 +414,9 @@ test "GLM shared expert fold declines what the separate chains must run" {
 pub fn separateRows(ops: *@import("glm5_model.zig").Ops, x: Arr, gate: Bank, up: Bank, down: Bank, routed: api.Bank, ids: Arr, scores: Arr) !?Arr {
     const Linear = @import("glm5_model.zig").Linear;
     const mlp: @import("glm5_model.zig").DenseMlp = .{
-        .gate = Linear{ .w = gate.weight, .scales = gate.scales, .biases = gate.biases, .input = 4096, .output = 2048 },
-        .up = Linear{ .w = up.weight, .scales = up.scales, .biases = up.biases, .input = 4096, .output = 2048 },
-        .down = Linear{ .w = down.weight, .scales = down.scales, .biases = down.biases, .input = 2048, .output = 4096 },
+        .gate = Linear.of(gate.weight, gate.scales, gate.biases, 4096, 2048),
+        .up = Linear.of(up.weight, up.scales, up.biases, 4096, 2048),
+        .down = Linear.of(down.weight, down.scales, down.biases, 2048, 4096),
     };
     const y = try @import("glm5_dflash_ffn.zig").dense(mlp, ops, x, 10);
     const joined = (try api.glm_group2.moeLayoutShared(ops.s, x, routed, ids, scores, test_dec, .serial, .grouped, .lane, y)) orelse return null;

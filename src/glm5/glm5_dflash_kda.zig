@@ -550,7 +550,7 @@ test "GLM DFlash dense rows preserve integrated serial outputs" {
         const x = try ops.slot();
         try mlx.check(mlx.mlx_random_normal(x, &.{ 1, rows, 4096 }, 3, .bfloat16, 0, 0.1, key.*, ops.s));
         try mlx.check(mlx.mlx_array_eval(w.*));
-        const linear = @import("glm5_model.zig").Linear{ .w = w.*, .input = 4096, .output = width };
+        const linear = @import("glm5_model.zig").Linear.of(w.*, .{ .ctx = null }, .{ .ctx = null }, 4096, width);
         const before = dense.dispatchCount();
         const expected = try linearRows(&ops, linear, x.*, .serial_rows);
         try std.testing.expectEqual(before, dense.dispatchCount());

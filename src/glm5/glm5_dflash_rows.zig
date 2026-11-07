@@ -417,7 +417,7 @@ test "GLM row-streaming projections equal serial qmv on every row, width and inp
         const scales = try fx.slot();
         try mlx.check(mlx.mlx_random_uniform(scales, try fx.scalar(0.001, .bfloat16), try fx.scalar(0.02, .bfloat16), &[_]c_int{ shape.n, @divExact(shape.k, 128) }, 2, .bfloat16, key.*, s));
         const biases = try fx.binary(.mul, scales.*, try fx.scalar(if (bits == 5) -15.5 else -31.5, .bfloat16));
-        const linear = Linear{ .w = codes.*, .scales = scales.*, .biases = biases, .input = shape.k, .output = shape.n };
+        const linear = Linear.of(codes.*, scales.*, biases, shape.k, shape.n);
         for ([_]Arr{ linear.w, linear.scales, linear.biases }) |a| try mlx.check(mlx.mlx_array_eval(a));
         // The smaller magnitude pushes x/128 into FP32 subnormals, the larger stays finite in BF16 sums.
         for ([_]f32{ 1, 1e-30, 3e4 }) |spread| {
@@ -450,16 +450,15 @@ test "GLM row-streaming projections decline what they were not proven on" {
     const scales = try ops.ones(&.{ 64, 8 }, .bfloat16);
     try mlx.check(mlx.mlx_array_eval(codes));
     try mlx.check(mlx.mlx_array_eval(scales));
-    const linear = Linear{ .w = codes, .scales = scales, .biases = scales, .input = 1024, .output = 64 };
+    const linear = Linear.of(codes, scales, scales, 1024, 64);
     const x = try ops.ones(&.{ 1, 4, 1024 }, .bfloat16);
     try std.testing.expect((try project(s, x, linear)) != null);
     for ([_]c_int{ 1, 9 }) |rows| try std.testing.expect((try project(s, try ops.ones(&.{ 1, rows, 1024 }, .bfloat16), linear)) == null);
     try std.testing.expect((try project(s, try ops.cast(x, .float32), linear)) == null);
     try std.testing.expect((try project(s, try ops.ones(&.{ 2, 4, 1024 }, .bfloat16), linear)) == null);
     try std.testing.expect((try project(s, try ops.ones(&.{ 1, 4, 1000 }, .bfloat16), linear)) == null);
-    var other = linear;
-    other.scales = try ops.ones(&.{ 64, 16 }, .bfloat16);
-    other.biases = other.scales;
+    const other_grid = try ops.ones(&.{ 64, 16 }, .bfloat16);
+    const other = Linear.of(codes, other_grid, other_grid, 1024, 64);
     try std.testing.expect((try project(s, x, other)) == null);
     const cpu_stream = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu_stream);

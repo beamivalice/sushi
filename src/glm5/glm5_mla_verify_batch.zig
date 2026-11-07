@@ -4,7 +4,9 @@ const mlx = @import("../mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 pub const Direction = enum { query, value };
-pub const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr };
+/// `bits` is the stored precision and `value_proj` the value bank as a `Linear`, when the caller bound them; else they
+/// are read from the arrays on every call.
+pub const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr, bits: ?c_int = null, value_proj: ?@import("glm5_model.zig").Linear = null };
 pub fn run(ops: *Ops, in: Input, dir: Direction) !?Arr {
     if (!mlx.streamIsGpu(ops.s) or !@import("glm5_model.zig").naxArms()) return null;
     for ([_]Arr{ in.x, in.w, in.scales, in.biases }) |a| if (a.ctx == null) return null;
@@ -16,10 +18,10 @@ pub fn run(ops: *Ops, in: Input, dir: Direction) !?Arr {
         !(std.mem.eql(c_int, &.{ 64, 256, 96 }, mlx.getShape(in.w)) or std.mem.eql(c_int, &.{ 64, 256, 80 }, mlx.getShape(in.w))) or !std.mem.eql(c_int, &.{ 64, 256, 4 }, mlx.getShape(in.scales)) or
         !std.mem.eql(c_int, mlx.getShape(in.scales), mlx.getShape(in.biases))) return null;
     if (dir == .value and xs[0] == 3) {
-        const linear = @import("glm5_model.zig").Linear{ .w = in.w, .scales = in.scales, .biases = in.biases, .input = 512, .output = 256 };
+        const linear = in.value_proj orelse @import("glm5_model.zig").Linear.of(in.w, in.scales, in.biases, 512, 256);
         if (try @import("glm5_dflash_a6_hoist.zig").project(ops.s, in.x, linear)) |out| return try ops.own(out);
     }
-    return try ops.qmm(in.x, in.w, in.scales, in.biases, dir == .value);
+    return try ops.qmmBits(in.x, in.w, in.scales, in.biases, dir == .value, in.bits orelse try @import("glm5_model.zig").storedAffineBits(in.w, in.scales, in.biases));
 }
 fn fixture(ops: *Ops, dir: Direction, rows: c_int, bits: c_int) !Input {
     const key = try ops.slot();
@@ -59,4 +61,26 @@ test "GLM MLA verify batch matches each serial row projection" {
             try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(want).?[0..n], mlx.mlx_array_data_bfloat16(have).?[0..n]);
         }
     };
+}
+
+test "GLM MLA verify batch: a bound value bank builds no Linear on a three-row call" {
+    try mlx.requireGpu();
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const in = try fixture(&ops, .value, 3, 6);
+    const bound = @import("glm5_model.zig").Linear.of(in.w, in.scales, in.biases, 512, 256);
+    var with = in;
+    with.value_proj = bound;
+    _ = try run(&ops, with, .value);
+    const built = mlx.query_count;
+    _ = @import("glm5_model.zig").Linear.of(in.w, in.scales, in.biases, 512, 256);
+    const of_cost = mlx.query_count - built;
+    try std.testing.expect(of_cost > 0);
+    const unbound_from = mlx.query_count;
+    _ = try run(&ops, in, .value);
+    const unbound = mlx.query_count - unbound_from;
+    const bound_from = mlx.query_count;
+    _ = try run(&ops, with, .value);
+    try std.testing.expectEqual(unbound - of_cost, mlx.query_count - bound_from);
 }

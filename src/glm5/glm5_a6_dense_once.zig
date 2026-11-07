@@ -17,7 +17,7 @@ pub fn dispatchCount() usize {
 pub fn resetDispatchCount() void {
     dispatches = 0;
 }
-fn geometry(xs: []const c_int, ws: []const c_int, ss: []const c_int, bs: []const c_int, dtypes: [4]mlx.mlx_dtype) bool {
+pub fn geometry(xs: []const c_int, ws: []const c_int, ss: []const c_int, bs: []const c_int, dtypes: [4]mlx.mlx_dtype) bool {
     if (xs.len != 3 or xs[0] != 1 or xs[1] != 2048 or ws.len != 2) return false;
     const k = xs[2];
     const n = ws[0];
@@ -36,10 +36,22 @@ pub fn tryPrefill(ops: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr) !?Arr {
     var dtypes: [4]mlx.mlx_dtype = undefined;
     for (arrays, 0..) |v, i| dtypes[i] = mlx.mlx_array_dtype(v);
     if (!geometry(mlx.getShape(x), mlx.getShape(w), mlx.getShape(scales), mlx.getShape(biases), dtypes)) return null;
-    const weights = try ops.dequant(w, scales, biases);
+    return expandThenMm(ops, x, w, scales, biases, try @import("glm5_model.zig").storedAffineBits(w, scales, biases));
+}
+
+fn expandThenMm(ops: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr, bits: c_int) !?Arr {
+    const weights = try ops.dequantBits(w, scales, biases, bits);
     const result = try ops.binary(.mm, x, try ops.transpose(weights, &.{ 1, 0 }));
     dispatches += 1;
     return result;
+}
+
+/// `tryPrefill` for a bound A6 `linear`: its weight was checked at bind, so only the activation is read.
+pub fn tryPrefillBound(ops: *Ops, x: Arr, linear: @import("glm5_model.zig").Linear) !?Arr {
+    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_model.zig").naxArms() or x.ctx == null) return null;
+    const xs = mlx.getShape(x);
+    if (xs.len != 3 or xs[0] != 1 or xs[1] != 2048 or xs[2] != linear.input or mlx.mlx_array_dtype(x) != .bfloat16) return null;
+    return expandThenMm(ops, x, linear.w, linear.scales, linear.biases, linear.bits);
 }
 fn bill(pending_layers: usize) !usize {
     return std.math.mul(usize, expanded_weight_bytes * banks_per_layer, pending_layers);
@@ -114,7 +126,7 @@ test "GLM A6 dense once Linear keeps native bits and declines decode rows" {
         const k = kn[0];
         const n = kn[1];
         const input = try fixture(&ops, k, n, @intCast(1031 + shape));
-        const linear = @import("glm5_model.zig").Linear{ .w = input.w, .scales = input.scales, .biases = input.biases, .input = k, .output = n };
+        const linear = @import("glm5_model.zig").Linear.of(input.w, input.scales, input.biases, k, n);
         resetDispatchCount();
         const actual = try linear.apply(&ops, input.x);
         try expectBits(try ops.qmm(input.x, input.w, input.scales, input.biases, true), actual);

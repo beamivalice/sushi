@@ -212,12 +212,20 @@ pub fn experimentalMix(s: mlx.mlx_stream, x: Arr, w: Arr, cols: c_int) !?Arr {
     calls += 1;
     return out;
 }
+/// Whether `w` is a mix weight `experimentalRmsMixBound` serves: `[24, 16384]` in FP32 or BF16.
+pub fn rmsMixWeight(w: Arr) bool {
+    return w.ctx != null and (mlx.mlx_array_dtype(w) == .float32 or mlx.mlx_array_dtype(w) == .bfloat16) and
+        std.mem.eql(c_int, &.{ 24, 16384 }, mlx.getShape(w));
+}
 pub fn experimentalRmsMix(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32, cols: c_int) !?Arr {
-    if (!mlx.streamIsGpu(s) or x.ctx == null or w.ctx == null or !std.math.isFinite(epsilon) or epsilon <= 0 or mlx.mlx_array_dtype(x) != .bfloat16 or
-        (mlx.mlx_array_dtype(w) != .float32 and mlx.mlx_array_dtype(w) != .bfloat16)) return null;
+    if (!rmsMixWeight(w)) return null;
+    return experimentalRmsMixBound(s, x, w, epsilon, cols);
+}
+/// `experimentalRmsMix` for a `w` the caller checked with `rmsMixWeight`: only the activation is read.
+pub fn experimentalRmsMixBound(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32, cols: c_int) !?Arr {
+    if (!mlx.streamIsGpu(s) or x.ctx == null or !std.math.isFinite(epsilon) or epsilon <= 0 or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     const sh = mlx.getShape(x);
-    if (sh.len != 4 or sh[0] != 1 or sh[1] < 128 or sh[1] > 65535 or sh[2] != 4 or sh[3] != 4096 or
-        !std.mem.eql(c_int, &.{ 24, 16384 }, mlx.getShape(w)) or (cols != 8 and cols != 24)) return null;
+    if (sh.len != 4 or sh[0] != 1 or sh[1] < 128 or sh[1] > 65535 or sh[2] != 4 or sh[3] != 4096 or (cols != 8 and cols != 24)) return null;
     const out = if (cols == 24) try runRows(s, x, w, epsilon) else try runMode(s, x, w, cols, epsilon);
     calls += 1;
     return out;
@@ -377,7 +385,7 @@ test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
     var bases: [24]f32 = undefined;
     for (&bases, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) / 128;
     const base = try ops.own(mlx.mlx_array_new_data(&bases, &.{24}, 1, .float32));
-    const hc = @import("glm5_model.zig").Hc{ .w = w, .scale = scale, .base = base };
+    const hc = @import("glm5_model.zig").Hc.of(w, scale, base);
     for ([_]c_int{ 1, 17, 127, 128, 512 }) |rows| {
         const x = try ops.own(mlx.mlx_array_new_data(bits.ptr, &.{ 1, rows, 4, 4096 }, 4, .bfloat16));
         const before = dispatchCount();
@@ -391,4 +399,13 @@ test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
         try expectBits(expected.post, actual.post);
         try expectBits(expected.comb, actual.comb);
     }
+    // A bound mix weight is not queried again: the weight's dtype and shape are the difference.
+    try std.testing.expect(hc.rms_mix);
+    const x = try ops.own(mlx.mlx_array_new_data(bits.ptr, &.{ 1, 128, 4, 4096 }, 4, .bfloat16));
+    const bound_from = mlx.query_count;
+    _ = try ops.own((try experimentalRmsMixBound(ops.s, x, hc.w, cfg.rms_norm_eps, 24)).?);
+    const bound = mlx.query_count - bound_from;
+    const read_from = mlx.query_count;
+    _ = try ops.own((try experimentalRmsMix(ops.s, x, hc.w, cfg.rms_norm_eps, 24)).?);
+    try std.testing.expectEqual(bound + 4, mlx.query_count - read_from);
 }

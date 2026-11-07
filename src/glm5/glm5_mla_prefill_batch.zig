@@ -4,7 +4,8 @@ const mlx = @import("../mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 pub const Direction = enum { query, value };
-pub const Input = struct { x: Arr, w: Arr, scales: Arr = .{ .ctx = null }, biases: Arr = .{ .ctx = null } };
+/// `bits` is the stored precision when the caller bound it, else read from the grids.
+pub const Input = struct { x: Arr, w: Arr, scales: Arr = .{ .ctx = null }, biases: Arr = .{ .ctx = null }, bits: ?c_int = null };
 var dispatches: usize = 0;
 pub fn dispatchCount() usize {
     return dispatches;
@@ -48,7 +49,7 @@ pub fn run(ops: *Ops, input: Input, dir: Direction) !?Arr {
     const out: c_int = if (dir == .query) 512 else 256;
     const heads = try ops.contiguous(try ops.reshape(try ops.transpose(input.x, &.{ 1, 0, 2, 3 }), &.{ 64, xs[0], xs[3] }));
     const y = if (affine)
-        try ops.qmm(heads, input.w, input.scales, input.biases, dir == .value)
+        try ops.qmmBits(heads, input.w, input.scales, input.biases, dir == .value, input.bits orelse try @import("glm5_model.zig").storedAffineBits(input.w, input.scales, input.biases))
     else
         try ops.binary(.mm, heads, if (dir == .value) try ops.transpose(input.w, &.{ 0, 2, 1 }) else input.w);
     dispatches += 1;

@@ -49,6 +49,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   the latent (packed and B1/B3 gathers, scalar and overlay partials) dequantizes through `SUSHI_LATENT`, whose
   expression matches MLX's dequantizer bit for bit; dense prefill and the B1 tail row use MLX's dequantizer. Verify
   tails are the rows' quantize-dequantize round trip and commits quantize the raw rows, so verify equals serial decode.
+- **Bound linears**: `glm5_model.Linear` carries its `kind` (`fp8`, `affine`, `affine_a6`, `dense_bf16`, `dense`) and its
+  stored affine `bits`, decided by `Linear.of` when the weight is bound; a projection is one tag switch. Build one with
+  `Linear.of`, never a struct literal. `affine_a6` is an affine weight the T2048 A6 expansion serves: its geometry is
+  checked at bind, so a projection reads only the activation. The split `kv_b` banks of `Mla` hold `kv_bits`, passed to
+  `Ops.qmmBits` and to the MLA batch runners (`Input.bits`); The value bank rides the same way as a bound
+  `Mla.value_proj` (`Input.value_proj`), so the three-row verify builds no `Linear` per call, and the embedding rows
+  dequantize with the head's bound bits. `Ops.qmm` and `Ops.dequant` read the bits from the grids and serve only
+  ubench and test callers. Shape and dtype queries (`mlx.query_count`) of one
+  three-row projection on a NAX box, before and after (`glm5_model.zig` count test, commit
+  `8de61c1a`): dense 1 -> 0, affine 22 -> 0, affine_a6 22 -> 2, fp8 12 -> 11 (the FP8 kernel's own checks). `Hc.of` binds whether the
+  RMS-fused prefill projection serves the mix weight (`rms_mix`), which saves its 4 dtype and shape queries per
+  prefill collapse (`0ec1a7c3`). Still read per call: the DFlash row kernels' weight layout and
+  availability checks, and the FP8 kernel's operand checks.
 - **Model gate**: a component win counts only if a loaded-model ABBA gain exceeds control drift,
   |A_last − A_first| / mean(A), on each workload. Several 8–26% component wins below failed that gate.
 

@@ -117,24 +117,23 @@ fn mlaProject(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import(
     const qr = try ops.rms(try kda.linearRows(ops, layer.qa, x, mode), layer.qa_norm, cfg.rms_norm_eps);
     const q = try ops.reshape(try kda.linearRows(ops, layer.qb, qr, mode), &.{ t, heads, 1, kd });
     const verify_batch = @import("glm5_mla_verify_batch.zig");
-    const broadcast_q = if (layer.quantized) try verify_batch.run(ops, .{ .x = q, .w = layer.wk, .scales = layer.sk, .biases = layer.bk }, .query) else null;
+    const broadcast_q = if (layer.quantized) try verify_batch.run(ops, .{ .x = q, .w = layer.wk, .scales = layer.sk, .biases = layer.bk, .bits = layer.kv_bits }, .query) else null;
     const qa = try ops.reshape(if (broadcast_q) |out| out else blk: {
         var absorbed: [16]Arr = undefined;
         for (0..@intCast(t)) |row| {
             const one = try ops.slice(q, 0, @intCast(row), @intCast(row + 1));
-            absorbed[row] = if (layer.quantized) try ops.qmm(one, layer.wk, layer.sk, layer.bk, false) else try ops.binary(.mm, one, layer.wk);
+            absorbed[row] = if (layer.quantized) try ops.qmmBits(one, layer.wk, layer.sk, layer.bk, false, layer.kv_bits) else try ops.binary(.mm, one, layer.wk);
         }
         break :blk try ops.concat(absorbed[0..@intCast(t)], 0);
     }, &.{ t, heads, width });
     const index_q = try ops.reshape(try kda.linearRows(ops, layer.iq, qr, mode), &.{ t, ih, iw });
-    const compress = base.Linear{ .w = layer.compress, .scales = .{ .ctx = null }, .biases = .{ .ctx = null }, .input = @intCast(cfg.hidden_size), .output = @intCast(cfg.indexer_head_dim) };
     return .{
         .qa = qa,
         .latent = try ops.reshape(try ops.rms(try kda.linearRows(ops, layer.kva, x, mode), layer.kv_norm, cfg.rms_norm_eps), &.{ t, width }),
         .index_q = index_q,
         .keys = try ops.reshape(try ops.layerNorm(try kda.linearRows(ops, layer.ik, x, mode), layer.ik_norm, layer.ik_bias, 1e-6), &.{ t, iw }),
         .index_weights = try ops.reshape(try ops.cast(try ops.binary(.mul, try kda.linearRows(ops, layer.iw, x, mode), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(ih * iw))), .float32)), mlx.mlx_array_dtype(index_q)), &.{ t, ih }),
-        .gates = try ops.reshape(try kda.linearRows(ops, compress, x, mode), &.{ t, iw }),
+        .gates = try ops.reshape(try kda.linearRows(ops, layer.compress_proj, x, mode), &.{ t, iw }),
         .broadcast = broadcast_q != null,
     };
 }
@@ -251,10 +250,10 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
 fn mlaFinish(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, attended: []const Arr, joined: ?Arr, cfg: *const @import("../model.zig").ModelConfig, mode: kda.ProjectionMode) !Arr {
     const value_width: c_int = @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim);
     var result_rows: [16]Arr = undefined;
-    const broadcast = if (rows.broadcast or (layer.quantized and attended.len >= 2)) try @import("glm5_mla_verify_batch.zig").run(ops, .{ .x = joined orelse try ops.concat(attended, 0), .w = layer.wv, .scales = layer.sv, .biases = layer.bv }, .value) else null;
+    const broadcast = if (rows.broadcast or (layer.quantized and attended.len >= 2)) try @import("glm5_mla_verify_batch.zig").run(ops, .{ .x = joined orelse try ops.concat(attended, 0), .w = layer.wv, .scales = layer.sv, .biases = layer.bv, .bits = layer.kv_bits, .value_proj = layer.value_proj }, .value) else null;
     if (joined != null) if (broadcast) |all| return kda.linearRows(ops, layer.out, try ops.reshape(all, &.{ 1, @intCast(attended.len), value_width }), mode);
     for (attended, 0..) |y4, row| {
-        const values = if (broadcast) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
+        const values = if (broadcast) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else if (layer.quantized) try ops.qmmBits(y4, layer.wv, layer.sv, layer.bv, true, layer.kv_bits) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
         result_rows[row] = try ops.reshape(values, &.{ 1, 1, value_width });
     }
     return kda.linearRows(ops, layer.out, try ops.concat(result_rows[0..attended.len], 1), mode);

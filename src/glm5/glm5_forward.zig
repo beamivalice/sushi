@@ -96,6 +96,11 @@ pub const Mla = struct {
     bk: Arr,
     bv: Arr,
     quantized: bool,
+    /// The stored precision of the split `kv_b_proj` banks `wk` / `wv`, 0 when they are dense.
+    kv_bits: c_int,
+    compress_proj: Linear,
+    /// The value bank `wv` as a projection, for the three-row verify; null when the banks are dense.
+    value_proj: ?Linear,
     prepared: Ops,
 
     pub fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig, s: mlx.mlx_stream) !Mla {
@@ -123,6 +128,7 @@ pub const Mla = struct {
             bk = try prep.contiguous(try prep.slice(biases, 1, 0, kd));
             bv = try prep.contiguous(try prep.slice(biases, 1, kd, kd + vd));
         }
+        const compress = try tensor(weights, prefix, "indexer.index_kpool_compress_gate");
         const result = Mla{
             .qa = try linear(weights, prefix, "q_a_proj", cfg.hidden_size),
             .qb = try linear(weights, prefix, "q_b_proj", cfg.mla_q_lora_rank),
@@ -135,7 +141,7 @@ pub const Mla = struct {
             .iw = try linear(weights, prefix, "indexer.weights_proj", cfg.hidden_size),
             .ik_norm = try tensor(weights, prefix, "indexer.k_norm.weight"),
             .ik_bias = try tensor(weights, prefix, "indexer.k_norm.bias"),
-            .compress = try tensor(weights, prefix, "indexer.index_kpool_compress_gate"),
+            .compress = compress,
             .ape = try tensor(weights, prefix, "indexer.index_kpool_compress_ape"),
             .wk = wk,
             .wv = wv,
@@ -144,6 +150,9 @@ pub const Mla = struct {
             .bk = bk,
             .bv = bv,
             .quantized = quant,
+            .kv_bits = kvb.bits,
+            .compress_proj = Linear.of(compress, .{ .ctx = null }, .{ .ctx = null }, @intCast(cfg.hidden_size), @intCast(cfg.indexer_head_dim)),
+            .value_proj = if (quant) Linear.of(wv, sv, bv, latent, vd) else null,
             .prepared = prep,
         };
         const expected_outputs = [_]u32{ cfg.mla_q_lora_rank, cfg.num_attention_heads * cfg.mla_qk_nope_head_dim, cfg.mla_kv_lora_rank, cfg.hidden_size, cfg.indexer_n_heads * cfg.indexer_head_dim, cfg.indexer_head_dim, cfg.indexer_n_heads };
@@ -180,8 +189,8 @@ pub const Mla = struct {
         const latent: c_int = @intCast(cfg.mla_kv_lora_rank);
         const valid_cache = try ops.own(try state.latentView().dense(0, @intCast(state.processed), ops.s));
         const cached = try ops.reshape(valid_cache, &.{ 1, 1, @intCast(state.processed), latent });
-        const keys = if (self.quantized) try ops.qmm(cached, self.wk, self.sk, self.bk, true) else try ops.binary(.mm, cached, try ops.transpose(self.wk, &.{ 0, 2, 1 }));
-        const values = if (self.quantized) try ops.qmm(cached, self.wv, self.sv, self.bv, true) else try ops.binary(.mm, cached, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
+        const keys = if (self.quantized) try ops.qmmBits(cached, self.wk, self.sk, self.bk, true, self.kv_bits) else try ops.binary(.mm, cached, try ops.transpose(self.wk, &.{ 0, 2, 1 }));
+        const values = if (self.quantized) try ops.qmmBits(cached, self.wv, self.sv, self.bv, true, self.kv_bits) else try ops.binary(.mm, cached, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
         const query = try ops.transpose(q, &.{ 2, 1, 0, 3 });
         const attended = try ops.slot();
         // Causal SDPA aligns the query's final row with the final cached key,
@@ -205,10 +214,10 @@ pub const Mla = struct {
         const qr = try ops.rms(try self.qa.apply(ops, x), self.qa_norm, cfg.rms_norm_eps);
         const q = try ops.reshape(try self.qb.apply(ops, qr), &.{ t, h, 1, kd });
         const dense = densePrefillEligible(dense_prefill, t, state.processed, cfg, mlx.mlx_array_dtype(q));
-        const absorbed: Arr = if (dense) .{ .ctx = null } else if (try @import("glm5_mla_prefill_batch.zig").run(ops, .{ .x = q, .w = self.wk, .scales = self.sk, .biases = self.bk }, .query)) |batched|
+        const absorbed: Arr = if (dense) .{ .ctx = null } else if (try @import("glm5_mla_prefill_batch.zig").run(ops, .{ .x = q, .w = self.wk, .scales = self.sk, .biases = self.bk, .bits = self.kv_bits }, .query)) |batched|
             batched
         else if (self.quantized)
-            try ops.qmm(q, self.wk, self.sk, self.bk, false)
+            try ops.qmmBits(q, self.wk, self.sk, self.bk, false, self.kv_bits)
         else
             try ops.binary(.mm, q, self.wk);
         const kv = try ops.rms(try self.kva.apply(ops, x), self.kv_norm, cfg.rms_norm_eps);
@@ -220,10 +229,10 @@ pub const Mla = struct {
         if (dense) return self.densePrefill(ops, q, cfg, state);
         const y = try ops.own(try @import("glm5_attention.zig").attend(state, try ops.reshape(absorbed, &.{ t, h, latent }), iq, try ops.reshape(iw, &.{ t, @intCast(cfg.indexer_n_heads) }), offset, 1 / @sqrt(@as(f32, @floatFromInt(kd))), ops.s));
         const y4 = try ops.reshape(y, &.{ t, h, 1, latent });
-        const values = if (try @import("glm5_mla_prefill_batch.zig").run(ops, .{ .x = y4, .w = self.wv, .scales = self.sv, .biases = self.bv }, .value)) |batched|
+        const values = if (try @import("glm5_mla_prefill_batch.zig").run(ops, .{ .x = y4, .w = self.wv, .scales = self.sv, .biases = self.bv, .bits = self.kv_bits }, .value)) |batched|
             batched
         else if (self.quantized)
-            try ops.qmm(y4, self.wv, self.sv, self.bv, true)
+            try ops.qmmBits(y4, self.wv, self.sv, self.bv, true, self.kv_bits)
         else
             try ops.binary(.mm, y4, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
         return self.out.apply(ops, try ops.reshape(values, &.{ 1, t, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) }));
@@ -608,7 +617,7 @@ pub const Model = struct {
         const e = self.embedding;
         const code = try ops.take(e.w, ids, 0);
         const hidden = if (e.scales.ctx != null)
-            try ops.dequant(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0))
+            try ops.dequantBits(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0), e.bits)
         else
             code;
         return ops.result(hidden);
@@ -744,7 +753,7 @@ pub const Model = struct {
         } else blk: {
             const e = self.embedding;
             const code = try ops.take(e.w, ids, 0);
-            break :blk if (e.scales.ctx != null) try ops.dequant(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0)) else code;
+            break :blk if (e.scales.ctx != null) try ops.dequantBits(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0), e.bits) else code;
         };
         return ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(hidden, &.{ 1, t, 1, @intCast(self.cfg.hidden_size) }), &.{ 1, t, 4, @intCast(self.cfg.hidden_size) })));
     }
@@ -1124,6 +1133,33 @@ test "GLM MLA stored affine kv rows preserve both projection orientations" {
     try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(value_dense).?[0..512], mlx.mlx_array_data_float32(value_quant).?[0..512]);
     try std.testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(layer.wk));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(layer.sk));
+}
+
+test "GLM MLA binds the kv bank bits once and projects with them in the bytes of the grid read" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    for ([_]c_int{ 8, 6 }) |bits| {
+        var weights = model.Weights.init(std.testing.allocator);
+        defer weights.deinit();
+        const cfg = try mlaOrientationFixtureBits(&weights, bits);
+        var layer = try Mla.load(&weights, "mla", &cfg, s);
+        defer layer.deinit();
+        try std.testing.expectEqual(bits, layer.kv_bits);
+        try std.testing.expectEqual(try base.storedAffineBits(layer.wk, layer.sk, layer.bk), layer.kv_bits);
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const x = try base.syntheticArray(&ops, &.{ 2, 2, 1, 128 }, .bfloat16, 3, -1, 1);
+        const want = try ops.qmm(x, layer.wk, layer.sk, layer.bk, false);
+        const before = mlx.query_count;
+        const got = try ops.qmmBits(x, layer.wk, layer.sk, layer.bk, false, layer.kv_bits);
+        try std.testing.expectEqual(@as(u64, 0), mlx.query_count - before);
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, want, got, false, s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try std.testing.expect(same);
+    }
 }
 
 pub fn nonzeroDecodeFixture(weights: *model.Weights) !model.ModelConfig {

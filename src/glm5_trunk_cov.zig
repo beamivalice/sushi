@@ -142,7 +142,7 @@ test "GLM trunk cov collector sums X^T X per projection across calls" {
     defer ops.deinit();
     const in: usize = 128;
     var wdata: [4 * 128]u16 = @splat(0x3f80);
-    const linear = base.Linear{ .w = try ops.own(mlx.mlx_array_new_data(&wdata, &[_]c_int{ 4, 128 }, 2, .bfloat16)), .input = 128, .output = 4 };
+    const linear = base.Linear.of(try ops.own(mlx.mlx_array_new_data(&wdata, &[_]c_int{ 4, 128 }, 2, .bfloat16)), .{ .ctx = null }, .{ .ctx = null }, 128, 4);
     var collector = Collector.init(a, stream);
     defer collector.deinit();
     base.linear_tap = collector.tap();

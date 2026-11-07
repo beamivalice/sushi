@@ -188,15 +188,24 @@ pub const Ops = struct {
         return out.*;
     }
 
+    /// `qmmBits` for a tensor whose bits are not bound: they are read from the stored grids.
     pub fn qmm(self: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr, transposed: bool) !Arr {
+        return self.qmmBits(x, w, scales, biases, transposed, try storedAffineBits(w, scales, biases));
+    }
+
+    pub fn qmmBits(self: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr, transposed: bool, bits: c_int) !Arr {
         const out = try self.slot();
-        try mlx.check(mlx.mlx_quantized_matmul(out, x, w, scales, biases, transposed, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(try storedAffineBits(w, scales, biases)), "affine", self.s));
+        try mlx.check(mlx.mlx_quantized_matmul(out, x, w, scales, biases, transposed, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(bits), "affine", self.s));
         return out.*;
     }
 
     pub fn dequant(self: *Ops, w: Arr, scales: Arr, biases: Arr) !Arr {
+        return self.dequantBits(w, scales, biases, try storedAffineBits(w, scales, biases));
+    }
+
+    pub fn dequantBits(self: *Ops, w: Arr, scales: Arr, biases: Arr, bits: c_int) !Arr {
         const out = try self.slot();
-        try mlx.check(mlx.mlx_dequantize(out, w, scales, biases, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(try storedAffineBits(w, scales, biases)), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, self.s));
+        try mlx.check(mlx.mlx_dequantize(out, w, scales, biases, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(bits), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, self.s));
         return out.*;
     }
 
@@ -243,12 +252,44 @@ pub fn storedAffineBits(w: Arr, scales: Arr, biases: Arr) !c_int {
 pub const LinearTap = struct { ctx: *anyopaque, observe: *const fn (ctx: *anyopaque, w: Arr, x: Arr) anyerror!void };
 pub var linear_tap: ?LinearTap = null;
 
+/// How a projection's weight is stored, decided when it is bound.
+pub const LinearKind = enum {
+    /// u8 codes with f32 block scales.
+    fp8,
+    /// u32 codes with bf16 grids at group size 128; `bits` is their stored precision.
+    affine,
+    /// An affine projection whose weight is one the A6 prefill expansion serves (`glm5_a6_dense_once`).
+    affine_a6,
+    dense_bf16,
+    dense,
+};
+
 pub const Linear = struct {
     w: Arr,
     scales: Arr = .{ .ctx = null },
     biases: Arr = .{ .ctx = null },
     input: c_int,
     output: c_int,
+    kind: LinearKind,
+    /// The affine precision, 0 off the affine kinds or where the stored grids are not a GLM pack's.
+    bits: c_int,
+
+    /// Binds the kind and the stored bits of the weight once, so a projection reads neither again.
+    pub fn of(w: Arr, scales: Arr, biases: Arr, input: c_int, output: c_int) Linear {
+        var value = Linear{ .w = w, .scales = scales, .biases = biases, .input = input, .output = output, .kind = .dense, .bits = 0 };
+        if (mlx.mlx_array_dtype(w) == .uint8) {
+            value.kind = .fp8;
+        } else if (scales.ctx != null) {
+            value.bits = storedAffineBits(w, scales, biases) catch 0;
+            const ws = mlx.getShape(w);
+            const grid = mlx.getShape(scales);
+            const a6 = value.bits == 6 and biases.ctx != null and @import("glm5_a6_dense_once.zig").geometry(&.{ 1, 2048, input }, ws, grid, mlx.getShape(biases), .{ .bfloat16, mlx.mlx_array_dtype(w), mlx.mlx_array_dtype(scales), mlx.mlx_array_dtype(biases) });
+            value.kind = if (a6) .affine_a6 else .affine;
+        } else if (mlx.mlx_array_dtype(w) == .bfloat16) {
+            value.kind = .dense_bf16;
+        }
+        return value;
+    }
 
     pub fn load(weights: *const model.Weights, base: []const u8, input: u32) !Linear {
         var buf: [256]u8 = undefined;
@@ -259,7 +300,7 @@ pub const Linear = struct {
             const sc = weights.get(try std.fmt.bufPrint(&buf, "{s}.weight_scale_inv", .{base})) orelse return error.MissingGlmWeight;
             if (input % fp8_block.BLOCK != 0 or shape[1] != input or mlx.mlx_array_dtype(sc) != .float32 or
                 !std.mem.eql(c_int, &.{ @divTrunc(shape[0] + 127, 128), @intCast(input / 128) }, mlx.getShape(sc))) return error.InvalidGlmLinear;
-            return .{ .w = w, .scales = sc, .input = @intCast(input), .output = shape[0] };
+            return of(w, sc, .{ .ctx = null }, @intCast(input), shape[0]);
         }
         if (mlx.mlx_array_dtype(w) == .uint32) {
             const sc = weights.get(try std.fmt.bufPrint(&buf, "{s}.scales", .{base})) orelse return error.MissingGlmWeight;
@@ -269,28 +310,34 @@ pub const Linear = struct {
             if (input % 128 != 0 or @as(u64, @intCast(shape[1])) * 32 != @as(u64, input) * @as(u64, @intCast(bits)) or
                 !std.mem.eql(c_int, &grid, mlx.getShape(sc)) or !std.mem.eql(c_int, &grid, mlx.getShape(bias)) or
                 mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bias) != .bfloat16) return error.InvalidGlmLinear;
-            return .{ .w = w, .scales = sc, .biases = bias, .input = @intCast(input), .output = shape[0] };
+            return of(w, sc, bias, @intCast(input), shape[0]);
         }
         if (shape[1] != input or (mlx.mlx_array_dtype(w) != .bfloat16 and mlx.mlx_array_dtype(w) != .float32)) return error.InvalidGlmLinear;
-        return .{ .w = w, .input = @intCast(input), .output = shape[0] };
+        return of(w, .{ .ctx = null }, .{ .ctx = null }, @intCast(input), shape[0]);
     }
 
     pub fn isFp8(self: Linear) bool {
-        return mlx.mlx_array_dtype(self.w) == .uint8;
+        return self.kind == .fp8;
     }
 
     pub fn projectsDenseBf16(self: Linear) bool {
-        return self.scales.ctx == null and mlx.mlx_array_dtype(self.w) == .bfloat16;
+        return self.kind == .dense_bf16;
     }
 
     pub fn apply(self: Linear, ops: *Ops, x: Arr) !Arr {
         if (linear_tap) |t| try t.observe(t.ctx, self.w, x);
-        if (self.isFp8()) return ops.own(try fp8_block.linear(ops.s, x, self.w, self.scales));
-        if (self.scales.ctx != null) {
-            if (try @import("glm5_a6_dense_once.zig").tryPrefill(ops, x, self.w, self.scales, self.biases)) |result| return result;
-            return ops.qmm(x, self.w, self.scales, self.biases, true);
+        switch (self.kind) {
+            .fp8 => return ops.own(try fp8_block.linear(ops.s, x, self.w, self.scales)),
+            .affine_a6 => {
+                if (try @import("glm5_a6_dense_once.zig").tryPrefillBound(ops, x, self)) |result| return result;
+                return ops.qmmBits(x, self.w, self.scales, self.biases, true, self.bits);
+            },
+            .affine => {
+                if (self.bits == 0) return error.InvalidGlmAffine;
+                return ops.qmmBits(x, self.w, self.scales, self.biases, true, self.bits);
+            },
+            .dense_bf16, .dense => return ops.binary(.mm, x, try ops.transpose(self.w, &.{ 1, 0 })),
         }
-        return ops.binary(.mm, x, try ops.transpose(self.w, &.{ 1, 0 }));
     }
 };
 
@@ -394,14 +441,20 @@ pub const Hc = struct {
     w: Arr,
     scale: Arr,
     base: Arr,
+    /// `w` is a weight the RMS-fused prefill projection serves, checked when bound.
+    rms_mix: bool,
+
+    pub fn of(w: Arr, scale: Arr, base: Arr) Hc {
+        return .{ .w = w, .scale = scale, .base = base, .rms_mix = @import("glm5_hc_prefill.zig").rmsMixWeight(w) };
+    }
 
     pub fn load(weights: *const model.Weights, prefix: []const u8, label: []const u8, hidden: u32) !Hc {
         var buf: [256]u8 = undefined;
-        const value = Hc{
-            .w = try named(weights, prefix, try std.fmt.bufPrint(&buf, "{s}_fn", .{label})),
-            .scale = try named(weights, prefix, try std.fmt.bufPrint(&buf, "{s}_scale", .{label})),
-            .base = try named(weights, prefix, try std.fmt.bufPrint(&buf, "{s}_base", .{label})),
-        };
+        const value = Hc.of(
+            try named(weights, prefix, try std.fmt.bufPrint(&buf, "{s}_fn", .{label})),
+            try named(weights, prefix, try std.fmt.bufPrint(&buf, "{s}_scale", .{label})),
+            try named(weights, prefix, try std.fmt.bufPrint(&buf, "{s}_base", .{label})),
+        );
         if (!std.mem.eql(c_int, &.{ 24, @intCast(hidden * 4) }, mlx.getShape(value.w)) or
             mlx.mlx_array_size(value.scale) != 3 or mlx.mlx_array_size(value.base) != 24 or
             (mlx.mlx_array_dtype(value.w) != .float32 and mlx.mlx_array_dtype(value.w) != .bfloat16) or mlx.mlx_array_dtype(value.scale) != .float32 or mlx.mlx_array_dtype(value.base) != .float32) return error.InvalidGlmHc;
@@ -410,8 +463,8 @@ pub const Hc = struct {
 
     pub fn collapse(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
         // Skip device/dtype eligibility probes for serial and short tree calls.
-        if (mlx.getShape(x)[1] >= 128 and @import("glm5_hc_prefill.zig").enabled()) {
-            if (try @import("glm5_hc_prefill.zig").experimentalRmsMix(ops.s, x, self.w, cfg.rms_norm_eps, 24)) |candidate| {
+        if (self.rms_mix and mlx.getShape(x)[1] >= 128 and @import("glm5_hc_prefill.zig").enabled()) {
+            if (try @import("glm5_hc_prefill.zig").experimentalRmsMixBound(ops.s, x, self.w, cfg.rms_norm_eps, 24)) |candidate| {
                 const mixes = try ops.own(candidate);
                 return primitive.hcCollapse(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
             }
@@ -1099,7 +1152,7 @@ test "GLM KDA prefill chunk reads the projections in place with the staged path'
     defer fx.deinit();
     const dense = struct {
         fn linear(o: *Ops, n: c_int, k: c_int, seed: u64) !Linear {
-            return .{ .w = try syntheticArray(o, &.{ n, k }, .bfloat16, seed, -0.2, 0.2), .input = k, .output = n };
+            return Linear.of(try syntheticArray(o, &.{ n, k }, .bfloat16, seed, -0.2, 0.2), .{ .ctx = null }, .{ .ctx = null }, k, n);
         }
     };
     var layer = KdaLayer{
@@ -1335,4 +1388,136 @@ pub fn syntheticArray(ops: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype, see
         try mlx.check(mlx.mlx_random_uniform(out, try ops.scalar(low, dtype), try ops.scalar(high, dtype), shape.ptr, shape.len, dtype, key.*, ops.s));
     try mlx.check(mlx.mlx_array_eval(out.*));
     return out.*;
+}
+
+const BoundKind = enum { dense_bf16, dense_f32, affine5, affine6, affine8, a6, fp8 };
+
+/// A weight of each stored kind under `p`, `n` rows by `k` inputs, in host memory the map owns.
+fn putKind(weights: *model.Weights, kind: BoundKind, n: usize, k: usize) !void {
+    const a = std.testing.allocator;
+    const rows: c_int = @intCast(n);
+    var prng = std.Random.DefaultPrng.init(0x61a0 + @as(u64, @intFromEnum(kind)));
+    const rnd = prng.random();
+    switch (kind) {
+        .dense_bf16, .dense_f32 => {
+            const data = try a.alloc(f32, n * k);
+            defer a.free(data);
+            for (data) |*v| v.* = rnd.float(f32) - 0.5;
+            if (kind == .dense_f32) {
+                try weights.map.put(try a.dupe(u8, "p.weight"), mlx.mlx_array_new_data(data.ptr, &.{ rows, @intCast(k) }, 2, .float32));
+            } else {
+                const half = try a.alloc(u16, n * k);
+                defer a.free(half);
+                for (half, data) |*h, v| h.* = @truncate(@as(u32, @bitCast(v)) >> 16);
+                try weights.map.put(try a.dupe(u8, "p.weight"), mlx.mlx_array_new_data(half.ptr, &.{ rows, @intCast(k) }, 2, .bfloat16));
+            }
+        },
+        .fp8 => {
+            const codes = try a.alloc(u8, n * k);
+            defer a.free(codes);
+            for (codes) |*c| c.* = if (rnd.boolean()) 0x38 else 0xb8;
+            const grid = [_]f32{ 0.125, 0.25, 0.5, 1.0 };
+            const blocks: usize = (n + 127) / 128;
+            const scales = try a.alloc(f32, blocks * (k / 128));
+            defer a.free(scales);
+            for (scales, 0..) |*s, i| s.* = grid[i % grid.len];
+            try weights.map.put(try a.dupe(u8, "p.weight"), mlx.mlx_array_new_data(codes.ptr, &.{ rows, @intCast(k) }, 2, .uint8));
+            try weights.map.put(try a.dupe(u8, "p.weight_scale_inv"), mlx.mlx_array_new_data(scales.ptr, &.{ @intCast(blocks), @intCast(k / 128) }, 2, .float32));
+        },
+        .affine5, .affine6, .affine8, .a6 => {
+            const bits: usize = switch (kind) {
+                .affine5 => 5,
+                .affine8 => 8,
+                else => 6,
+            };
+            const words = k * bits / 32;
+            const codes = try a.alloc(u32, n * words);
+            defer a.free(codes);
+            for (codes) |*c| c.* = rnd.int(u32);
+            const grid = try a.alloc(u16, n * (k / 128));
+            defer a.free(grid);
+            for (grid) |*g| g.* = 0x3c00 | (rnd.int(u16) & 0x03ff);
+            const offsets = try a.alloc(u16, grid.len);
+            defer a.free(offsets);
+            for (offsets) |*g| g.* = 0xbd00 | (rnd.int(u16) & 0x03ff);
+            try weights.map.put(try a.dupe(u8, "p.weight"), mlx.mlx_array_new_data(codes.ptr, &.{ rows, @intCast(words) }, 2, .uint32));
+            try weights.map.put(try a.dupe(u8, "p.scales"), mlx.mlx_array_new_data(grid.ptr, &.{ rows, @intCast(k / 128) }, 2, .bfloat16));
+            try weights.map.put(try a.dupe(u8, "p.biases"), mlx.mlx_array_new_data(offsets.ptr, &.{ rows, @intCast(k / 128) }, 2, .bfloat16));
+        },
+    }
+}
+
+/// `Linear.apply` before kinds were bound: the weight's dtype read on every call.
+fn unboundApply(ops: *Ops, w: Arr, sc: Arr, bi: Arr, x: Arr) !Arr {
+    if (mlx.mlx_array_dtype(w) == .uint8) return ops.own(try fp8_block.linear(ops.s, x, w, sc));
+    if (sc.ctx != null) {
+        if (try @import("glm5_a6_dense_once.zig").tryPrefill(ops, x, w, sc, bi)) |result| return result;
+        return ops.qmm(x, w, sc, bi, true);
+    }
+    return ops.binary(.mm, x, try ops.transpose(w, &.{ 1, 0 }));
+}
+
+fn kindShape(kind: BoundKind) [2]usize {
+    return switch (kind) {
+        .a6 => .{ 1536, 4096 },
+        .fp8 => .{ 129, 256 },
+        else => .{ 256, 512 },
+    };
+}
+
+test "GLM bound linear: every stored kind gives the bytes of the per-call dtype dispatch" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    for (std.enums.values(BoundKind)) |kind| {
+        var weights = model.Weights.init(std.testing.allocator);
+        defer weights.deinit();
+        const shape = kindShape(kind);
+        try putKind(&weights, kind, shape[0], shape[1]);
+        const linear = try Linear.load(&weights, "p", @intCast(shape[1]));
+        for ([_]c_int{ 1, 3, 17, 2048 }) |rows| {
+            var ops = Ops{ .s = s };
+            defer ops.deinit();
+            const x = try syntheticArray(&ops, &.{ 1, rows, @intCast(shape[1]) }, .bfloat16, 5 + @as(u64, @intCast(rows)), -1, 1);
+            const want = try unboundApply(&ops, linear.w, linear.scales, linear.biases, x);
+            for (0..2) |_| {
+                const got = try linear.apply(&ops, x);
+                try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+                try std.testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
+                var eq = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(eq);
+                try mlx.check(mlx.mlx_array_equal(&eq, want, got, false, s));
+                var same = false;
+                try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+                try std.testing.expect(same);
+            }
+        }
+    }
+}
+
+test "GLM bound linear: a projection reads no weight dtype, shape or bits per call" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    for (std.enums.values(BoundKind)) |kind| {
+        var weights = model.Weights.init(std.testing.allocator);
+        defer weights.deinit();
+        const shape = kindShape(kind);
+        try putKind(&weights, kind, shape[0], shape[1]);
+        const linear = try Linear.load(&weights, "p", @intCast(shape[1]));
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const x = try syntheticArray(&ops, &.{ 1, 3, @intCast(shape[1]) }, .bfloat16, 9, -1, 1);
+        _ = try linear.apply(&ops, x);
+        const before = mlx.query_count;
+        _ = try linear.apply(&ops, x);
+        const queries = mlx.query_count - before;
+        if (kind == .fp8) {
+            // The FP8 kernel validates its own operands; the dispatch adds nothing to it.
+            const direct = mlx.query_count;
+            _ = try ops.own(try fp8_block.linear(s, x, linear.w, linear.scales));
+            try std.testing.expectEqual(mlx.query_count - direct, queries);
+        } else {
+            // The A6 arm looks at the activation's shape and nothing of the weight.
+            try std.testing.expect(queries <= (if (kind == .a6) @as(u64, 2) else 0));
+        }
+    }
 }
