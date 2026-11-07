@@ -74,3 +74,17 @@ pub fn diagEnvOnCached(cache: *?bool, name: [*:0]const u8) bool {
     cache.* = v;
     return v;
 }
+
+/// Reads exactly `dst.len` bytes at `offset`, retrying an interrupted read.
+pub fn readExact(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
+    var done: usize = 0;
+    while (done < dst.len) {
+        const got = std.c.pread(fd, dst[done..].ptr, dst.len - done, @intCast(offset + done));
+        if (got < 0) {
+            if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
+            return error.FillReadFailed;
+        }
+        if (got == 0) return error.FillShortRead;
+        done += @intCast(got);
+    }
+}

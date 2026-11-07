@@ -21,6 +21,7 @@ test {
     _ = @import("log.zig");
     _ = @import("test_models.zig");
     _ = @import("test_expect.zig");
+    _ = @import("kld_fixture.zig");
     _ = @import("io_util.zig");
     _ = @import("dsv41/dspark_rows.zig");
     _ = @import("expert_drop.zig");

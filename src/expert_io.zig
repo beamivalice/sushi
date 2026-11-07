@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const layout = @import("sushi_exl3").group_layout;
@@ -1395,18 +1396,7 @@ pub const TensorRegion = struct {
     dtype: Dtype,
 };
 
-pub fn readExact(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
-    var done: usize = 0;
-    while (done < dst.len) {
-        const got = std.c.pread(fd, dst[done..].ptr, dst.len - done, @intCast(offset + done));
-        if (got < 0) {
-            if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
-            return error.FillReadFailed;
-        }
-        if (got == 0) return error.FillShortRead;
-        done += @intCast(got);
-    }
-}
+pub const readExact = io_util.readExact;
 
 /// A shard's parsed safetensors header; tensor payloads start at `data_start`.
 pub const SafetensorsHeader = struct {

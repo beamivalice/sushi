@@ -10,16 +10,16 @@
 //! LAYER's token count, so a busy expert keeps its larger vote.
 //!
 //! `<experts>` is the SOURCE checkpoint's own name for the layer's expert
-//! block, which is per-arch (`Arch`): Qwen3.8-Flash-Next stores the routed
-//! experts as one fused pair of tensors under
+//! block, which is per-arch (`Naming`): one checkpoint stores the routed
+//! experts as a fused pair of tensors under
 //! `model.language_model.layers.{L}.mlp.experts.{gate_up_proj,down_proj}`,
-//! MiMo V2.6 Flash one tensor per expert under
+//! another one tensor per expert under
 //! `model.layers.{L}.mlp.experts.{E}.{gate,up,down}_proj.weight`. Both are keyed
 //! here by the layer's `…mlp.experts.` prefix and the flat per-layer layout
 //! above; a converter slices expert e out of it. gate and up share one statistic
 //! because they read the same MLP input row.
 //!
-//! A dense linear the forward reports (`observeLinear`: MiMo's o_proj and
+//! A dense linear the forward reports (`observeLinear`: an o_proj or the
 //! lm_head) is keyed by its source weight name, e.g.
 //! `model.layers.{L}.self_attn.o_proj.weight` [in] = sum(x^2) over the rows it
 //! read divided by that row count, beside `<name>.rows` [1].
@@ -30,40 +30,23 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const offline = @import("arch/offline.zig");
 
 pub const ENV_VAR = "SUSHI_IMATRIX_OUT";
 
-/// The architectures with an expert-naming contract. The converter looks the
-/// imatrix up by SOURCE HF weight name, never by the engine's internal module
-/// names, and those names differ per checkpoint.
-pub const Arch = enum {
-    qwen4_exp,
-    mimo_v2,
-    glm5_next,
-    /// A checkpoint that names the expert block `layers.N.ffn.experts` (no model-type lookup: its capture builds the
-    /// collector itself).
-    ffn_experts,
-
-    /// The SOURCE checkpoint's decoder-layer prefix.
-    pub fn layerPrefix(self: Arch) []const u8 {
-        return switch (self) {
-            .qwen4_exp, .glm5_next => "model.language_model.layers.",
-            .mimo_v2 => "model.layers.",
-            .ffn_experts => "layers.",
-        };
-    }
-
+/// How the SOURCE checkpoint names a decoder layer and the layer's expert block. The converter looks the imatrix up
+/// by those names, never by the engine's internal module names, and they differ per checkpoint. An arch declares
+/// its own (`imatrix_naming` in its `kld` module).
+pub const Naming = struct {
+    layer_prefix: []const u8,
     /// What follows the layer index in the name of the layer's expert block.
-    pub fn expertsInfix(self: Arch) []const u8 {
-        return if (self == .ffn_experts) ".ffn.experts." else ".mlp.experts.";
-    }
+    experts_infix: []const u8 = ".mlp.experts.",
 
-    pub fn fromModelType(model_type: []const u8) ?Arch {
-        if (std.mem.eql(u8, model_type, "qwen4_exp")) return .qwen4_exp;
-        if (std.mem.eql(u8, model_type, "mimo_v2")) return .mimo_v2;
-        if (std.mem.eql(u8, model_type, "glm5_next")) return .glm5_next;
-        return null;
-    }
+    // Transitional spellings for call sites that still name their arch; their owners switch to the arch's own
+    // `imatrix_naming`, and these go with the final cleanup.
+    pub const qwen4_exp: Naming = .{ .layer_prefix = "model.language_model.layers." };
+    pub const glm5_next: Naming = .{ .layer_prefix = "model.language_model.layers." };
+    pub const mimo_v2: Naming = .{ .layer_prefix = "model.layers." };
 };
 
 pub var rows_request: ?usize = null;
@@ -130,7 +113,7 @@ pub const Collector = struct {
     s: mlx.mlx_stream,
     path: []u8,
     experts: c_int,
-    arch: Arch,
+    naming: Naming,
     /// arange [1, E] int32 — the comparand every one-hot count broadcasts against.
     axis: mlx.mlx_array,
     layers: []Layer,
@@ -138,7 +121,7 @@ pub const Collector = struct {
     lm_head: Dense = .{},
     rows_tap: ?RowTap = null,
 
-    pub fn init(allocator: std.mem.Allocator, s: mlx.mlx_stream, path: []const u8, num_layers: usize, experts: c_int, arch: Arch) !*Collector {
+    pub fn init(allocator: std.mem.Allocator, s: mlx.mlx_stream, path: []const u8, num_layers: usize, experts: c_int, naming: Naming) !*Collector {
         if (experts <= 0 or num_layers == 0) return error.ImatrixBadGeometry;
         const self = try allocator.create(Collector);
         errdefer allocator.destroy(self);
@@ -162,7 +145,7 @@ pub const Collector = struct {
             .s = s,
             .path = owned,
             .experts = experts,
-            .arch = arch,
+            .naming = naming,
             .axis = axis_2d,
             .layers = layers,
             .o_proj = o_proj,
@@ -174,13 +157,13 @@ pub const Collector = struct {
     /// has no expert-naming contract.
     pub fn forModel(allocator: std.mem.Allocator, s: mlx.mlx_stream, model_type: []const u8, num_layers: usize, experts: c_int) !?*Collector {
         const path = envPath() orelse (if (rows_request != null) "" else return null);
-        const arch = Arch.fromModelType(model_type) orelse {
+        const naming = offline.imatrixNaming(model_type) orelse {
             log.warn("[imatrix] no expert naming contract for model_type {s}: capture off\n", .{model_type});
             return null;
         };
-        const self = try init(allocator, s, path, num_layers, experts, arch);
+        const self = try init(allocator, s, path, num_layers, experts, naming);
         if (rows_request) |layer| self.armRows(layer);
-        log.info("[imatrix] expert activation capture armed: {s} ({s}, {d} layers, {d} experts)\n", .{ path, @tagName(arch), num_layers, experts });
+        log.info("[imatrix] expert activation capture armed: {s} ({s}, {d} layers, {d} experts)\n", .{ path, model_type, num_layers, experts });
         return self;
     }
 
@@ -515,18 +498,18 @@ pub const Collector = struct {
             const down = try self.scaledFlat(slot.down, denom);
             try held.append(self.allocator, down);
             try mlx.check(mlx.mlx_array_eval(slot.rows));
-            const prefix = self.arch.layerPrefix();
-            const gu_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}gate_up_proj", .{ prefix, li, self.arch.expertsInfix() }, 0);
+            const prefix = self.naming.layer_prefix;
+            const gu_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}gate_up_proj", .{ prefix, li, self.naming.experts_infix }, 0);
             try mlx.check(mlx.mlx_map_string_to_array_insert(map, gu_key.ptr, gu));
-            const rows_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}gate_up_proj.rows", .{ prefix, li, self.arch.expertsInfix() }, 0);
+            const rows_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}gate_up_proj.rows", .{ prefix, li, self.naming.experts_infix }, 0);
             try mlx.check(mlx.mlx_map_string_to_array_insert(map, rows_key.ptr, slot.rows));
-            const down_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}down_proj", .{ prefix, li, self.arch.expertsInfix() }, 0);
+            const down_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}down_proj", .{ prefix, li, self.naming.experts_infix }, 0);
             try mlx.check(mlx.mlx_map_string_to_array_insert(map, down_key.ptr, down));
             entries += 3;
         }
         var name_buf: [192]u8 = undefined;
         for (self.o_proj, 0..) |*d, li| {
-            const name = try std.fmt.bufPrint(&name_buf, "{s}{d}.self_attn.o_proj.weight", .{ self.arch.layerPrefix(), li });
+            const name = try std.fmt.bufPrint(&name_buf, "{s}{d}.self_attn.o_proj.weight", .{ self.naming.layer_prefix, li });
             entries += try self.putDense(map, &held, name, d);
         }
         entries += try self.putDense(map, &held, "lm_head.weight", &self.lm_head);
@@ -554,7 +537,9 @@ pub const Collector = struct {
 // ── tests ──
 
 const testing = std.testing;
-const QWEN_PREFIX = Arch.qwen4_exp.layerPrefix();
+const fused = Naming{ .layer_prefix = "model.language_model.layers." };
+const per_expert = Naming{ .layer_prefix = "model.layers." };
+const FUSED_PREFIX = fused.layer_prefix;
 
 fn f32At(arr: mlx.mlx_array, i: usize) !f32 {
     try mlx.check(mlx.mlx_array_eval(arr));
@@ -569,7 +554,7 @@ test "imatrix accumulates routed sums, rows and token counts by expert" {
     const H: c_int = 2;
     const I: c_int = 2;
 
-    const col = try Collector.init(alloc, s, "/dev/null", 2, E, .qwen4_exp);
+    const col = try Collector.init(alloc, s, "/dev/null", 2, E, fused);
     defer col.deinit();
 
     // rows 0,1; top-2 routing: row0 -> {0,2}, row1 -> {2,2} (a duplicate slot counts twice).
@@ -634,7 +619,7 @@ test "imatrix writes the converter's keys, shapes and layer-normalized values" {
     const out = try std.fs.path.join(alloc, &.{ dir, "imatrix.safetensors" });
     defer alloc.free(out);
 
-    const col = try Collector.init(alloc, s, out, 2, E, .qwen4_exp);
+    const col = try Collector.init(alloc, s, out, 2, E, fused);
     defer col.deinit();
 
     const x = [_]f32{ 1, 2, 3, 4 };
@@ -667,7 +652,7 @@ test "imatrix writes the converter's keys, shapes and layer-normalized values" {
 
     var gu = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gu);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&gu, loaded, QWEN_PREFIX ++ "1.mlp.experts.gate_up_proj"));
+    try mlx.check(mlx.mlx_map_string_to_array_get(&gu, loaded, FUSED_PREFIX ++ "1.mlp.experts.gate_up_proj"));
     try testing.expectEqualSlices(c_int, &[_]c_int{6}, mlx.getShape(gu));
     // 2 tokens in the layer: sum(x^2) per expert channel divided by that count.
     try testing.expectEqual(@as(f32, 0.5), try f32At(gu, 0));
@@ -675,13 +660,13 @@ test "imatrix writes the converter's keys, shapes and layer-normalized values" {
 
     var dn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dn);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&dn, loaded, QWEN_PREFIX ++ "1.mlp.experts.down_proj"));
+    try mlx.check(mlx.mlx_map_string_to_array_get(&dn, loaded, FUSED_PREFIX ++ "1.mlp.experts.down_proj"));
     try testing.expectEqualSlices(c_int, &[_]c_int{6}, mlx.getShape(dn));
     try testing.expectEqual(@as(f32, 14.5), try f32At(dn, 4));
 
     var rows = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rows);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&rows, loaded, QWEN_PREFIX ++ "1.mlp.experts.gate_up_proj.rows"));
+    try mlx.check(mlx.mlx_map_string_to_array_get(&rows, loaded, FUSED_PREFIX ++ "1.mlp.experts.gate_up_proj.rows"));
     try testing.expectEqualSlices(c_int, &[_]c_int{3}, mlx.getShape(rows));
     try testing.expectEqual(@as(f32, 1), try f32At(rows, 0));
     try testing.expectEqual(@as(f32, 3), try f32At(rows, 2));
@@ -689,16 +674,17 @@ test "imatrix writes the converter's keys, shapes and layer-normalized values" {
     // A layer that never routed contributes no entries.
     var absent = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(absent);
-    try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, QWEN_PREFIX ++ "0.mlp.experts.gate_up_proj") != 0);
+    try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, FUSED_PREFIX ++ "0.mlp.experts.gate_up_proj") != 0);
 }
 
 test "imatrix capture is off without the environment variable" {
     try testing.expect(envPath() == null);
+    if (offline.imatrixNaming("qwen4_exp") == null) return error.SkipZigTest;
     const alloc = testing.allocator;
     try testing.expect(try Collector.forModel(alloc, mlx.gpuStream(), "qwen4_exp", 4, 8) == null);
 }
 
-test "the mimo_v2 arch keys the same per-layer layout by MiMo's own expert names" {
+test "a bare layer prefix keys the same per-layer layout by the checkpoint's own expert names" {
     const s = mlx.gpuStream();
     const alloc = testing.allocator;
     const E: c_int = 3;
@@ -710,11 +696,10 @@ test "the mimo_v2 arch keys the same per-layer layout by MiMo's own expert names
     defer tmp.cleanup();
     var path_buf: [512]u8 = undefined;
     const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const out = try std.fs.path.join(alloc, &.{ dir, "mimo.safetensors" });
+    const out = try std.fs.path.join(alloc, &.{ dir, "flat.safetensors" });
     defer alloc.free(out);
 
-    try testing.expectEqual(Arch.mimo_v2, Arch.fromModelType("mimo_v2").?);
-    const col = try Collector.init(alloc, s, out, 3, E, .mimo_v2);
+    const col = try Collector.init(alloc, s, out, 3, E, per_expert);
     defer col.deinit();
 
     const x = [_]f32{ 1, 2, 3, 4 };
@@ -757,10 +742,10 @@ test "the mimo_v2 arch keys the same per-layer layout by MiMo's own expert names
     try testing.expectEqualSlices(c_int, &[_]c_int{E}, mlx.getShape(rows));
     try testing.expectEqual(@as(f32, 3), try f32At(rows, 2));
 
-    // The Qwen prefix is NOT what a MiMo file is keyed by.
+    // The fused prefix is NOT what a flat-prefix file is keyed by.
     var absent = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(absent);
-    try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, QWEN_PREFIX ++ "2.mlp.experts.gate_up_proj") != 0);
+    try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, FUSED_PREFIX ++ "2.mlp.experts.gate_up_proj") != 0);
 }
 
 test "imatrix records a dense linear's input rows under its source weight name" {
@@ -775,7 +760,7 @@ test "imatrix records a dense linear's input rows under its source weight name" 
     const out = try std.fs.path.join(alloc, &.{ dir, "trunk.safetensors" });
     defer alloc.free(out);
 
-    const col = try Collector.init(alloc, s, out, 3, 4, .mimo_v2);
+    const col = try Collector.init(alloc, s, out, 3, 4, per_expert);
     defer col.deinit();
 
     // o_proj of layer 1 sees [batch 1, 2 rows, 2 channels] twice; lm_head one [1, 3, 2].
@@ -824,7 +809,7 @@ test "imatrix records a dense linear's input rows under its source weight name" 
 test "imatrix keeps the armed layer's MLP input rows and routing ids for the encoder" {
     const s = mlx.gpuStream();
     const alloc = testing.allocator;
-    const col = try Collector.init(alloc, s, "/dev/null", 3, 4, .qwen4_exp);
+    const col = try Collector.init(alloc, s, "/dev/null", 3, 4, fused);
     defer col.deinit();
     try testing.expectError(error.ImatrixNoRows, col.takeRows());
     col.armRows(1);
@@ -863,7 +848,7 @@ test "imatrix keeps the armed layer's MLP input rows and routing ids for the enc
 test "rows captured out of order come back in the order asked, ids with their rows" {
     const s = mlx.gpuStream();
     const alloc = testing.allocator;
-    const col = try Collector.init(alloc, s, "/dev/null", 1, 4, .qwen4_exp);
+    const col = try Collector.init(alloc, s, "/dev/null", 1, 4, fused);
     defer col.deinit();
     col.armRows(0);
     const x0 = [_]f32{ 1, 2, 3, 4 };
@@ -894,6 +879,7 @@ test "an encoder request arms the rows tap without the environment variable, and
     const alloc = testing.allocator;
     defer rows_request = null;
     rows_request = 2;
+    if (offline.imatrixNaming("qwen4_exp") == null) return error.SkipZigTest;
     const col = (try Collector.forModel(alloc, mlx.gpuStream(), "qwen4_exp", 3, 4)) orelse return error.TestExpectedCollector;
     defer col.deinit();
     try testing.expectEqual(@as(usize, 2), col.rows_tap.?.layer);
@@ -903,7 +889,7 @@ test "an encoder request arms the rows tap without the environment variable, and
 
 test "a collector armed only for rows has no file to flush" {
     const alloc = testing.allocator;
-    const col = try Collector.init(alloc, mlx.gpuStream(), "", 1, 2, .qwen4_exp);
+    const col = try Collector.init(alloc, mlx.gpuStream(), "", 1, 2, fused);
     defer col.deinit();
     const x = [_]f32{ 1, 2 };
     const ids = [_]i32{ 0, 1 };

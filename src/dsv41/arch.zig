@@ -29,7 +29,7 @@ pub const flags = .{}; // slot:flags (S2h)
 
 // slot:chat (S2g)
 
-// slot:offline (S2i)
+pub const kld = @import("kld_capture.zig");
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *trunk.Weights, s: mlx.mlx_stream) !Trunk {
     _ = io;

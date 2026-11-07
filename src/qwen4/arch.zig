@@ -31,7 +31,10 @@ pub const flags = .{}; // slot:flags (S2h)
 
 // slot:chat (S2g)
 
-// slot:offline (S2i)
+pub const kld = @import("qwen4_kld.zig");
+test {
+    _ = @import("qwen4_kld.zig");
+}
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *trunk.Weights, s: mlx.mlx_stream) !Trunk {
     if (config.indexer_budget != 0) {

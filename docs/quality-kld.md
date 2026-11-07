@@ -13,6 +13,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 
 - `src/kld.zig`: `sushi kld capture|compare`. `capture` writes a teacher fixture from the bf16 path; `compare`
   scores a pack against it. KLD is scored to the teacher's first end-of-turn token.
+- `src/kld_fixture.zig` holds what a fixture is and links no MLX (host tier): the prompt sources, `baseline.json`, the
+  per-prompt files, the teacher's logits rows, `scoreRow` and the first-EOS cut. A plugin's parity harness reads and
+  scores a fixture through it. What an arch adds to the tools lives in its folder (`<arch>/*_kld*.zig`, the `kld`
+  declaration of its `arch.zig`) and is reached through `src/arch/offline.zig`: its hidden-capture width, launch
+  refusals, own capture path, post-load setup and the imatrix names of its source checkpoint.
 - `compare` prints two lines: "to-first-EOS" and all-positions. **Quote the first-EOS number** (the owner's tables);
   give the all-positions number beside it when comparing with older records.
 - `kld` takes the SERVED weight loader (`model.loadWeightsForConfig`); a second loader once bound a MiMo pack's raw FP8

@@ -38,7 +38,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `mlx_kernel_keys.zig` | custom-kernel library keys for `mlx.zig` wrappers | engine-mlx-gotchas |
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, `digit_group`; prompt LRU | engine-mlx-gotchas |
 | `vision.zig` / `vision_common.zig` / `qwen4/qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: preprocessing, Qwen3-VL, M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
-| `kld.zig` | `sushi kld capture|compare` | quality-kld |
+| `kld.zig` / `kld_fixture.zig` / `kld_capture_util.zig` / `arch/offline.zig` | `sushi kld capture|compare`; the MLX-free fixture reader and scoring; the per-arch hooks | quality-kld |
 | `bench.zig` / `bench_box.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power | process-measurement |
 | `ubench_main.zig` / `ubench_report.zig` / `exl3/ubench.zig` | `sushi-ubench` (`zig build ubench`) | process-ubench |
 | `sushibar_main.zig` / `sushibar/` | `sushibar` menu bar app | server-lifecycle |

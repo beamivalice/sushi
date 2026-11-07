@@ -31,7 +31,10 @@ pub const flags = .{}; // slot:flags (S2h)
 
 // slot:chat (S2g)
 
-// slot:offline (S2i)
+pub const kld = @import("mimo2_kld.zig");
+test {
+    _ = @import("mimo2_kld.zig");
+}
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *trunk.Weights, s: mlx.mlx_stream) !Trunk {
     return Trunk.initTrunk(io, allocator, config, weights, s);

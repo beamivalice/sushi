@@ -20,14 +20,17 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const kld = @import("../kld.zig");
+const fixture_mod = @import("../kld_fixture.zig");
 const dsv = @import("dsv41_model.zig");
 const dsv_cfg = @import("dsv41_config.zig");
 const dsv_stream = @import("dsv41_stream.zig");
 const dsv_source = @import("dsv41_source.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const imatrix_capture = @import("../imatrix.zig");
+const transformer_mod = @import("../transformer.zig");
+const tokenizer_mod = @import("../tokenizer.zig");
 const expert_stream = @import("../expert_stream.zig");
-const glm = @import("../glm5/glm5_kld_capture.zig");
+const util = @import("../kld_capture_util.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const A = sc_mod.A;
@@ -65,6 +68,9 @@ fn checkedMode(head_rows: bool, lean: bool) !Mode {
 
 /// DeepSeek-V4.1 keeps its own state in the activation dtype and has no hidden-boundary or imatrix tap:
 /// a flag that would silently do nothing is refused by name.
+/// How a DeepSeek source checkpoint names its experts; its capture builds the collector itself.
+const ffn_naming = imatrix_capture.Naming{ .layer_prefix = "layers.", .experts_infix = ".ffn.experts." };
+
 pub fn refuse(config: *const model.ModelConfig, opts: kld.Options) !void {
     if (!config.isDsv41()) return;
     if (opts.kv_quant_config.isQuant()) return error.Dsv41KvQuantUnsupported;
@@ -678,7 +684,7 @@ const Run = struct {
     stream: *dsv_stream.Stream,
     staging: []const u8,
     calib: []const u8,
-    prompts: []const kld.Prompt,
+    prompts: []const fixture_mod.Prompt,
     inputs: []const []u32,
     capture: *Capture,
     collector: ?*imatrix_capture.Collector,
@@ -705,7 +711,7 @@ const Run = struct {
         const tmp = try self.statePath(&tmp_buf, n, true);
         const final = try self.statePath(&final_buf, n, false);
         try self.collector.?.saveState(tmp);
-        try glm.fsyncPath(tmp);
+        try util.fsyncPath(tmp);
         const cwd = std.Io.Dir.cwd();
         try cwd.rename(tmp, cwd, final, self.io);
     }
@@ -753,7 +759,7 @@ const Run = struct {
             const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{manifest});
             defer a.free(tmp);
             try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = expected });
-            try glm.fsyncPath(tmp);
+            try util.fsyncPath(tmp);
             try cwd.rename(tmp, cwd, manifest, self.io);
         }
         try cwd.createDirPath(self.io, self.calib);
@@ -787,12 +793,12 @@ const Run = struct {
         var offset: u64 = 0;
         for (self.records, 0..) |r, i| {
             if (r.window != i or i >= self.prompts.len or !std.mem.eql(u8, r.id, self.prompts[i].id) or r.tokens != self.inputs[i].len or r.token_offset != offset) return error.GlmLayerMajorWindowChanged;
-            const ids_sha = glm.shaHex(std.mem.sliceAsBytes(self.inputs[i]));
+            const ids_sha = util.shaHex(std.mem.sliceAsBytes(self.inputs[i]));
             const path = try std.fmt.allocPrint(self.a, "{s}/{s}/logits.f32", .{ self.staging, r.dir });
             defer self.a.free(path);
             const logits = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.a, .limited(64 << 20)) catch return error.GlmLayerMajorWindowChanged;
             defer self.a.free(logits);
-            const logits_sha = glm.shaHex(logits);
+            const logits_sha = util.shaHex(logits);
             if (!std.mem.eql(u8, r.ids_sha256, &ids_sha) or !std.mem.eql(u8, r.logits_sha256, &logits_sha)) return error.GlmLayerMajorWindowChanged;
             offset += r.tokens;
         }
@@ -812,7 +818,7 @@ const Run = struct {
         }
     }
 
-    const Result = struct { record: ?kld.PromptRecord = null, chosen: u32 = 0, logits_sha256: [64]u8 = undefined };
+    const Result = struct { record: ?fixture_mod.PromptRecord = null, chosen: u32 = 0, logits_sha256: [64]u8 = undefined };
 
     /// Writes one window's standard fixture row from its logits.
     fn writeWindow(self: *Run, w: usize, logits: A) !Result {
@@ -828,13 +834,13 @@ const Run = struct {
             nonzero = nonzero or v != 0;
         }
         if (!nonzero) return error.Dsv41ZeroNormLogits;
-        const chosen = glm.greedy(self.row);
+        const chosen = util.greedy(self.row);
         const p = self.prompts[w];
-        var writer = try kld.PromptWriter.begin(self.a, self.io, self.staging, w, p.id);
+        var writer = try fixture_mod.PromptWriter.begin(self.a, self.io, self.staging, w, p.id);
         defer writer.deinit();
         try writer.appendRow(self.row, chosen);
         const record = try writer.finish(p.text, p.text, self.inputs[w], &[_]u32{chosen});
-        return .{ .record = record, .chosen = chosen, .logits_sha256 = glm.shaHex(std.mem.sliceAsBytes(self.row)) };
+        return .{ .record = record, .chosen = chosen, .logits_sha256 = util.shaHex(std.mem.sliceAsBytes(self.row)) };
     }
 
     const BatchStats = struct { fill_bytes: u64, fill_ns: u64, wall_ns: u64, pin_ns: u64, extra_ns: u64 };
@@ -919,7 +925,7 @@ const Run = struct {
     }
 
     /// Every uncommitted window, a batch at a time.
-    fn capturePrompts(self: *Run, batch: u32, records: *std.ArrayList(kld.PromptRecord)) !void {
+    fn capturePrompts(self: *Run, batch: u32, records: *std.ArrayList(fixture_mod.PromptRecord)) !void {
         const a = self.a;
         for (self.records) |r| {
             const nll: f64 = @bitCast(r.nll_bits);
@@ -944,7 +950,7 @@ const Run = struct {
         const results = try a.alloc(Result, batch);
         defer a.free(results);
         while (next < self.prompts.len) {
-            try glm.waitWhilePaused(a, self.io, self.pause_file, next, self.out);
+            try util.waitWhilePaused(a, self.io, self.pause_file, next, self.out);
             const end = @min(self.prompts.len, next + batch);
             const batch_results = results[0 .. end - next];
             @memset(batch_results, .{});
@@ -961,9 +967,9 @@ const Run = struct {
                 for ([_][]const u8{ "logits.f32", "prompt_tokens.txt", "generated_tokens.txt" }) |leaf| {
                     const path = try std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ self.staging, record.dir, leaf });
                     defer a.free(path);
-                    try glm.fsyncPath(path);
+                    try util.fsyncPath(path);
                 }
-                const ids_sha = glm.shaHex(std.mem.sliceAsBytes(self.inputs[i]));
+                const ids_sha = util.shaHex(std.mem.sliceAsBytes(self.inputs[i]));
                 const line = try std.json.Stringify.valueAlloc(a, WindowRecord{
                     .window = i,
                     .id = record.id,
@@ -977,11 +983,11 @@ const Run = struct {
                     .logits_sha256 = &res.logits_sha256,
                 }, .{});
                 defer a.free(line);
-                try glm.appendLine(self.log_fd, line);
+                try util.appendLine(self.log_fd, line);
                 offset += self.inputs[i].len;
                 tokens += self.inputs[i].len;
             }
-            if (std.c.fsync(self.log_fd) != 0) return error.GlmLayerMajorSyncFailed;
+            if (std.c.fsync(self.log_fd) != 0) return error.LayerMajorSyncFailed;
             self.committed_tokens = offset;
             self.dropStale(end);
             for (batch_results) |*res| {
@@ -996,7 +1002,7 @@ const Run = struct {
             run_tokens += tokens;
             remaining -= tokens;
             const rate = @as(f64, @floatFromInt(run_tokens)) / (@as(f64, @floatFromInt(run_clock.start.untilNow(run_clock.io, .boot).nanoseconds)) / 1e9);
-            try glm.json(a, self.io, self.staging, "progress.json", .{ .complete = false, .phase = "layer-major", .committed_windows = end, .total_windows = self.prompts.len, .batch_windows = batch, .batch_seconds = wall, .batch_forward_seconds = forward, .batch_pin_seconds = pin, .batch_extra_seconds = extra, .batch_fill_seconds = fill, .batch_fill_bytes = stats.fill_bytes, .batch_tokens = tokens, .tokens_per_second = rate, .eta_hours = @as(f64, @floatFromInt(remaining)) / rate / 3600 });
+            try util.json(a, self.io, self.staging, "progress.json", .{ .complete = false, .phase = "layer-major", .committed_windows = end, .total_windows = self.prompts.len, .batch_windows = batch, .batch_seconds = wall, .batch_forward_seconds = forward, .batch_pin_seconds = pin, .batch_extra_seconds = extra, .batch_fill_seconds = fill, .batch_fill_bytes = stats.fill_bytes, .batch_tokens = tokens, .tokens_per_second = rate, .eta_hours = @as(f64, @floatFromInt(remaining)) / rate / 3600 });
             self.out.print("[kld] layer-major windows {d}..{d} of {d}: {d} tokens in {d:.1} s ({d:.2} tok/s), read {d:.1} GB in {d:.1} s; this run {d:.2} tok/s, {d:.2} h left\n", .{ next, end, self.prompts.len, tokens, wall, @as(f64, @floatFromInt(tokens)) / wall, @as(f64, @floatFromInt(stats.fill_bytes)) / 1e9, fill, rate, @as(f64, @floatFromInt(remaining)) / rate / 3600 });
             self.out.print("[kld] layer-major batch: forward {d:.1} s ({d:.2} tok/s), expert pin {d:.1} s ({d:.2} s a layer), capture extras {d:.1} s\n", .{ forward, @as(f64, @floatFromInt(tokens)) / forward, pin, pin / @as(f64, @floatFromInt(self.m.cfg.layers)), extra });
             next = end;
@@ -1038,7 +1044,7 @@ pub fn runLoadedMode(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld
     const calib = try std.fmt.allocPrint(a, "{s}/calib", .{staging});
     defer a.free(calib);
 
-    var prompts = try kld.loadPrompts(a, io, opts.prompts, opts.limit);
+    var prompts = try fixture_mod.loadPrompts(a, io, opts.prompts, opts.limit);
     defer prompts.deinit();
     if (prompts.items.len == 0) return error.NoPromptsFound;
     const inputs = try a.alloc([]u32, prompts.items.len);
@@ -1053,12 +1059,12 @@ pub fn runLoadedMode(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld
         if (ids.len > dc.max_pos) return error.Dsv41ContextExceeded;
     }
 
-    const config_sha = try glm.metadataHash(a, io, opts.model_dir, "config.json");
-    const index_sha = try glm.metadataHash(a, io, opts.model_dir, "model.safetensors.index.json");
-    const tokenizer_sha = try glm.metadataHash(a, io, opts.model_dir, "tokenizer.json");
+    const config_sha = try util.metadataHash(a, io, opts.model_dir, "config.json");
+    const index_sha = try util.metadataHash(a, io, opts.model_dir, "model.safetensors.index.json");
+    const tokenizer_sha = try util.metadataHash(a, io, opts.model_dir, "tokenizer.json");
     const stat_sha = try sourceStatSha(a, io, opts.model_dir);
-    const inputs_sha = glm.inputsSha(prompts.items, inputs);
-    const engine_sha = try glm.engineSha(a, io);
+    const inputs_sha = util.inputsSha(prompts.items, inputs);
+    const engine_sha = try util.engineSha(a, io);
     const manifest = try std.json.Stringify.valueAlloc(a, Manifest{
         .model = opts.model_dir,
         .config_sha256 = &config_sha,
@@ -1078,7 +1084,7 @@ pub fn runLoadedMode(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld
 
     const imatrix_path = if (opts.imatrix_out.len != 0) opts.imatrix_out else try std.fmt.allocPrint(a, "{s}/imatrix.safetensors", .{calib});
     defer if (opts.imatrix_out.len == 0) a.free(imatrix_path);
-    const collector: ?*imatrix_capture.Collector = if (mode.lean) null else try imatrix_capture.Collector.init(a, m.s, imatrix_path, dc.layers, @intCast(dc.experts), .ffn_experts);
+    const collector: ?*imatrix_capture.Collector = if (mode.lean) null else try imatrix_capture.Collector.init(a, m.s, imatrix_path, dc.layers, @intCast(dc.experts), ffn_naming);
     defer if (collector) |c| c.deinit();
     var folder = Folder{ .a = a, .io = io, .dir = calib };
     var run = Run{
@@ -1112,8 +1118,8 @@ pub fn runLoadedMode(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld
     m.tap = capture.tap();
     defer m.tap = null;
 
-    try glm.json(a, io, staging, "progress.json", .{ .complete = false, .phase = "validated", .prompts = prompts.items.len });
-    var records: std.ArrayList(kld.PromptRecord) = .empty;
+    try util.json(a, io, staging, "progress.json", .{ .complete = false, .phase = "validated", .prompts = prompts.items.len });
+    var records: std.ArrayList(fixture_mod.PromptRecord) = .empty;
     defer {
         for (records.items) |r| r.deinit(a);
         records.deinit(a);
@@ -1123,12 +1129,12 @@ pub fn runLoadedMode(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld
     if (collector) |c| _ = try c.flush();
     run.dropStale(prompts.items.len);
     const elapsed = @as(f64, @floatFromInt(started.untilNow(io, .awake).nanoseconds)) / 1e9;
-    try kld.writeBaseline(a, io, staging, .{ .label = opts.label, .model = opts.model_dir, .run = opts.label, .kv_cache_format = "bf16", .inference_profile = "greedy", .prompt_set = opts.prompts, .ssd_budget_gb = kld.capturedSsdBudgetGb(&l.config, opts.ssd_budget_bytes), .tokens_per_prompt = opts.tokens, .top_k = opts.top_k, .elapsed_secs = elapsed }, records.items);
-    try glm.completeBaseline(a, io, staging, records.items.len, opts.tokens);
-    if (!std.mem.eql(u8, &config_sha, &try glm.metadataHash(a, io, opts.model_dir, "config.json")) or !std.mem.eql(u8, &stat_sha, &try sourceStatSha(a, io, opts.model_dir))) return error.Dsv41CaptureSourceChanged;
+    try fixture_mod.writeBaseline(a, io, staging, .{ .label = opts.label, .model = opts.model_dir, .run = opts.label, .kv_cache_format = "bf16", .inference_profile = "greedy", .prompt_set = opts.prompts, .ssd_budget_gb = kld.capturedSsdBudgetGb(&l.config, opts.ssd_budget_bytes), .tokens_per_prompt = opts.tokens, .top_k = opts.top_k, .elapsed_secs = elapsed }, records.items);
+    try util.completeBaseline(a, io, staging, records.items.len, opts.tokens);
+    if (!std.mem.eql(u8, &config_sha, &try util.metadataHash(a, io, opts.model_dir, "config.json")) or !std.mem.eql(u8, &stat_sha, &try sourceStatSha(a, io, opts.model_dir))) return error.Dsv41CaptureSourceChanged;
     if (!mode.lean) try finalizeSums(a, io, calib, prompts.items.len, dc);
-    try glm.json(a, io, staging, "layout.json", layout(dc, mode));
-    try glm.json(a, io, staging, "progress.json", .{ .complete = true, .phase = "complete", .completed_prompts = records.items.len, .tokens = run.committed_tokens });
+    try util.json(a, io, staging, "layout.json", layout(dc, mode));
+    try util.json(a, io, staging, "progress.json", .{ .complete = true, .phase = "complete", .completed_prompts = records.items.len, .tokens = run.committed_tokens });
     try cwd.renamePreserve(staging, cwd, opts.out_dir, io);
     out.print("[kld] layer-major DeepSeek-V4.1 captured {d} windows into {s}\n", .{ records.items.len, opts.out_dir });
 }
@@ -1682,7 +1688,7 @@ test "deepseek_v41 layer-major logits are the generic window-major capture's fix
     // The fixture reads back through compare's own loader.
     const lm = try std.fmt.allocPrint(a, "{s}/lm", .{root});
     defer a.free(lm);
-    var base = try kld.readBaseline(a, io, lm);
+    var base = try fixture_mod.readBaseline(a, io, lm);
     defer base.deinit();
     try testing.expectEqual(windows.len, base.prompts.len);
 }
@@ -1881,7 +1887,7 @@ test "deepseek_v41 layer-major capture: head rows are the head's input for every
     for (m.cfg.dspark.targets[0..m.cfg.dspark.n_targets]) |t| try expectMissing(a, io, root, "lean/calib/dspark-in-{d:0>2}.bf16", .{t});
     const lean_dir = try std.fmt.allocPrint(a, "{s}/lean", .{root});
     defer a.free(lean_dir);
-    var base = try kld.readBaseline(a, io, lean_dir);
+    var base = try fixture_mod.readBaseline(a, io, lean_dir);
     base.deinit();
 
     // A run interrupted inside the second batch resumes to the uninterrupted rows, lean or not; another mode is refused.
@@ -1955,4 +1961,90 @@ test "deepseek_v41 capture: the floor budget is the least the streamed load's pl
     const plan = try model_load.planExpertStreaming(io, a, &cfg, dir, floor, false);
     try testing.expectEqual(@as(u16, 2), plan.cache.slots_per_layer);
     try testing.expectError(error.SsdBudgetBelowResident, model_load.planExpertStreaming(io, a, &cfg, dir, floor - 1, false));
+}
+
+test "kld: deepseek_v41 refuses by name what its module-owned state cannot honor" {
+    const config = model.ModelConfig{ .model_type = "deepseek_v41" };
+    try refuse(&config, .{});
+    try testing.expectError(error.Dsv41KvQuantUnsupported, refuse(&config, .{ .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) }));
+    try testing.expectError(error.Dsv41HasNoQwenGdnState, refuse(&config, .{ .qwen_gdn_f32 = false }));
+    try testing.expectError(error.Dsv41HiddenCaptureUnsupported, refuse(&config, .{ .hidden_out = "/x" }));
+    try testing.expectError(error.Dsv41ImatrixCaptureUnsupported, refuse(&config, .{ .imatrix_out = "/x.safetensors" }));
+    const qwen = model.ModelConfig{ .model_type = "qwen4_exp" };
+    try refuse(&qwen, .{ .qwen_gdn_f32 = false, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) });
+}
+
+test "kld: a deepseek_v41 load names the missing streaming budget before touching the GPU (DSV41_TINY)" {
+    const dir = try @import("dsv41_model.zig").fixtureDir();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try testing.expectError(error.ExpertStreamingRequired, kld.loadModel(io, testing.allocator, .{ .model_dir = dir }));
+    try testing.expectError(error.Dsv41KvQuantUnsupported, kld.loadModel(io, testing.allocator, .{ .model_dir = dir, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8), .ssd_budget_bytes = 1 << 30 }));
+}
+
+test "kld: a deepseek_v41 teacher captures and compare reads it back, fused against composed included (DSV41_TINY)" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_stream = @import("dsv41_stream.zig");
+    const dir = try dsv41_model.fixtureDir();
+    var metal: bool = false;
+    mlx.check(mlx.mlx_metal_is_available(&metal)) catch return error.SkipZigTest;
+    if (!metal) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"pre_tokenizer":{"type":"ByteLevel"},"model":{"type":"BPE",
+        \\ "vocab":{"a":0,"b":1,"c":2,"d":3},"merges":[]}}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts.jsonl", .data =
+        \\{"id":"p0","prompt_ids":[0,17,23,5,42,8,61,3,90,12,4]}
+        \\{"id":"p1","prompt_ids":[0,33,7,70]}
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try arena.dupe(u8, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
+
+    var config = try model.parseConfig(io, allocator, dir);
+    config.expert_streaming = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try dsv41_stream.expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try allocator.dupe(u8, dir);
+    var loaded = kld.Loaded{ .allocator = allocator, .io = io, .config = config, .tok = try tokenizer_mod.loadTokenizer(io, allocator, root), .chat_config = undefined, .weights = undefined, .xfm = undefined };
+    defer loaded.config.deinit(allocator);
+    defer loaded.tok.deinit();
+    loaded.weights = try model.loadWeightsForConfig(io, allocator, dir, &loaded.config, false);
+    defer loaded.weights.deinit();
+    loaded.xfm = try transformer_mod.Transformer.init(io, allocator, loaded.config, &loaded.weights);
+    defer loaded.xfm.deinit();
+    try testing.expectEqual(@as(u32, 1), loaded.config.eos_token_ids[0]);
+
+    var quiet: kld.Out = .{ .silent = true };
+    const teacher = try std.fmt.allocPrint(arena, "{s}/teacher", .{root});
+    dsv41_model.setFused(loaded.xfm.dsv41.?, true);
+    try kld.runCapture(io, allocator, &loaded, .{ .model_dir = root, .prompts = try std.fmt.allocPrint(arena, "{s}/prompts.jsonl", .{root}), .out_dir = teacher, .tokens = 4, .no_template = true }, &quiet);
+    var base = try fixture_mod.readBaseline(allocator, io, teacher);
+    defer base.deinit();
+    try testing.expectEqual(@as(usize, 2), base.prompts.len);
+    try testing.expectEqualStrings("bf16", base.kv_cache_format);
+
+    for ([_]bool{ true, false }) |composed| {
+        dsv41_model.setFused(loaded.xfm.dsv41.?, composed);
+        const json_path = try std.fmt.allocPrint(arena, "{s}/compare-{s}.json", .{ root, if (composed) "composed" else "fused" });
+        try kld.runCompare(io, allocator, &loaded, .{ .command = .compare, .model_dir = root, .fixture = teacher, .json_out = json_path }, &quiet);
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, json_path, arena, .limited(1 << 22));
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, text, .{});
+        const o = parsed.value.object;
+        try testing.expectEqualStrings(fixture_mod.COMPARE_SCHEMA, o.get("schema").?.string);
+        try testing.expectEqual(@as(f64, 8), try util.jsonNumber(o.get("positions").?));
+        try testing.expectEqual(@as(usize, 2), o.get("prompts").?.array.items.len);
+        const mean_kld = try util.jsonNumber(o.get("mean_kld_to_eos").?);
+        try testing.expect(std.math.isFinite(mean_kld));
+        // The same arm replays its own teacher bit for bit.
+        if (composed) {
+            try testing.expectEqual(@as(f64, 0), mean_kld);
+            try testing.expectEqual(@as(f64, 1), try util.jsonNumber(o.get("mean_top1").?));
+        }
+    }
 }

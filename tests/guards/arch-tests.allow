@@ -153,16 +153,7 @@ fusedSdpaPrefill: qk 192 / v 128 causal parity vs fp32 truth (MiMo global geomet
 glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 tokenizer.json, real template)
 glmLadder: certain drafts take four rows or more, weak ones two, and the cost never falls
 grok config.toml for GLM: chat completions at the server, advertised budgets, only accepted efforts
-hidden spool refuses the chunked GLM path
-kld hidden capture keeps the complete Qwen4 residual stream
 kld: --qwen-gdn 16 stores the GDN state in bf16, 32 is the default width
-kld: GLM full-stream hidden capture retains chunked boundaries and native logits
-kld: a GLM pack captures its BF16-latent reference in prompt chunks and compare scores kv8 against it
-kld: a deepseek_v41 load names the missing streaming budget before touching the GPU (DSV41_TINY)
-kld: a deepseek_v41 teacher captures and compare reads it back, fused against composed included (DSV41_TINY)
-kld: a resident mimo_v2 load takes the source trunk and its logits follow the routed experts
-kld: an imatrix capture records every mimo_v2 o_proj input and the lm_head input the forward read
-kld: deepseek_v41 refuses by name what its module-owned state cannot honor
 kv6 is a first-class wire value: parsed, named and served by GLM's latent backend
 layout resolution is qwen4_exp only: the same index declares nothing for another arch
 list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recommended
@@ -268,7 +259,6 @@ the GPU expert pick matches the host on a sigmoid router's log-sigmoid logits, M
 the concurrency verdict: a resident GLM and qwen4 batch, an exclusive model queues, another MoE interleaves
 the exact load bill admits a MiMo load the flat 7 GiB headroom refused
 the load-time bill drops the MTP head when Qwen's default round is DFlash2
-the mimo_v2 arch keys the same per-layer layout by MiMo's own expert names
 thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only their own words
 thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo folds to on
 thinking policy launch defaults are model-specific and preserve GLM high

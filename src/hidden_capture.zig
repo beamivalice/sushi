@@ -2,7 +2,7 @@
 //! one directory while `sushi kld capture` runs the teacher:
 //!   boundary-XX.bin   XX = 00..num_layers, raw bf16 row-major [tokens, width], no header;
 //!                     boundary 0 is the input to layer 0, boundary b the output of layer b-1
-//!                     width is hidden_size (Qwen4 and GLM: hc_count * hidden_size, [tokens, hc, hidden])
+//!                     width is the arch's `hiddenCaptureWidth` (hidden_size, or hc_count * hidden_size: [tokens, hc, hidden])
 //!   tokens.bin        u32 token ids [tokens]
 //! Every file is opened for append, so prompts (and runs) concatenate in token
 //! order. A prompt's ids land after all of its rows: `tokens.bin` counts only
@@ -562,7 +562,7 @@ test "hidden spool waits while complete windows fill the budget and proceeds onc
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "spool/w-00000000", .{}));
 }
 
-test "hidden spool refuses the chunked GLM path" {
+test "hidden spool refuses the chunked path" {
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = testing.tmpDir(.{});
