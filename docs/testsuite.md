@@ -99,6 +99,10 @@ and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone che
   shrinks: SWA, the ring cache and FP8 are engine features and never count, and a feature a model needs is written
   in a shared file without the model's name.
 
+## Characterization tapes
+
+`tests/tape.sh record|check <pack> <dir>` ([matrix row](../tests/CLAUDE.md)) is the byte-identity proof for an engine/arch decoupling stage: a logit tape (`sushi kld capture` against itself, `cmp`) and a serving tape (HTTP cases per pack, each kept only if repeated recordings agree). Tapes live under `~/.sushi/runs/tapes/<base-commit>/<pack>/`, never in the repo; it is not a release gate.
+
 ## Microbenches
 
 `sushi-ubench` is not a tier: `zig build test` never builds it, CI only compiles it, and its files hold no `test`

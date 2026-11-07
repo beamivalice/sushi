@@ -52,7 +52,8 @@ def free_port():
 @contextmanager
 def gpu_lock(label):
     owner = f"{os.environ.get('GPU_LOCK_OWNER', 'tests')}-{label}"
-    subprocess.run([str(LOCK), "acquire", owner], check=True)
+    max_min = os.environ.get("SUSHI_BOOT_LOCK_MAX_MIN")
+    subprocess.run([str(LOCK), "acquire", owner] + (["--max-min", max_min] if max_min else []), check=True)
     try:
         yield owner
     finally:
