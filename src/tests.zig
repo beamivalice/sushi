@@ -160,6 +160,7 @@ test {
     _ = @import("dsv41/dsv41_prefix.zig");
     _ = @import("dsv41/dsv41_prefix_cache_test.zig");
     _ = @import("dsv41/dsv41_generate_test.zig");
+    _ = @import("dsv41/dsv41_query_count_test.zig");
     _ = @import("dsv41/dsv41_exl3_real_test.zig");
     _ = @import("dsv41/dsv41_kernels.zig");
     _ = @import("glm5/glm5_next.zig");

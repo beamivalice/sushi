@@ -810,6 +810,30 @@ of the score scale on one side (the GPU twin's own f32 matmul noise is ~1e-2 of 
 farther from the f32 CPU truth than the twin, `the served path is no farther from the f32 CPU truth`); a router flip is held to its own margin the same way. Either ends the comparison, so on
 the tiny pack the test covers the rounds before the first tie.
 
+<a id="host-queries"></a>
+**Host queries a decode token** (`mlx.query_count`: shape, size and dtype reads, each an FFI call; test builds only;
+`dsv41_query_count_test.zig`, 0d621106 on the tiny fixtures, ReleaseFast, one decode row, every expert resident):
+
+| path | queries |
+|---|---|
+| a token, `DSV41_TINY` (mxfp8 trunk, FP4 experts, 8 layers) | 1169 / 1218, alternating |
+| a token, `DSV41_STQ_TINY` (trellis trunk, 8 layers) | 2703 / 2774, alternating |
+| mxfp8 trunk linear (`Lin.apply`) | 0 |
+| trellis trunk linear (`Stq.apply`), 1 row (plain decode) / 5 rows (verify, exact mode) | 22 / 22 |
+| grouped trellis `wo_a` (`applyGrouped`), 1 / 5 rows | 19 / 19 |
+| one layer's routed chain with the shared expert riding it (`stqRouted`, `rate_groups` forced to DeepSeek's prepared geometry) | 18 |
+
+- The mxfp8 trunk reads nothing off its weight: `Lin` is the kind and `mlx_quantized_matmul` takes its constants. A
+  trellis linear re-reads its operands' shapes on every call (`linearWith`, `projectRows`): 23 calls and 506 of the 2703
+  queries in a token (a one-off count).
+- The shared chain (`moeDecodeClampedSharedFusedKeep`) re-reads the shared bank's three trellis shapes in `sharedRate`
+  on every call; `rb.hidden` and `rb.inter` are stored.
+- Not bound. `linear.Geo` holds the launch geometry of the exact mode (`project_rows.Mode.exact`), and a plain decode and
+  prefill here run the non-exact mode (`Model.rows`; only `verify` sets `exact`), whose one-row launch is the SIMD arm, not NAX.
+  A `Geo` would change the bytes there; only a verify's exact rows could take one today. Binding all of it takes a mode in `Geo` (`exl3/linear.zig`) and a stored shared-bank shape in
+  `rate_groups.sharedRate`, neither a DeepSeek file. At 43 layers the whole of it is a few thousand queries a token,
+  an estimate of tens of microseconds against a GPU-bound token ([engine-kernels](engine-kernels.md)).
+
 <a id="drop-expert"></a>
 ## Expert drop (`--drop-expert n`)
 
