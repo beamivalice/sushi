@@ -42,6 +42,7 @@ const ChatConfig = chat_mod.ChatConfig;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 const glm5_rows_tick = @import("glm5/glm5_rows_tick.zig");
+const glm5_state = @import("glm5/glm5_state.zig");
 const glmRowsUbench = glm5_rows_tick.glmRowsUbench;
 const glmRoundUbench = glm5_rows_tick.glmRoundUbench;
 const mtp_plan = @import("mtp_plan.zig");
@@ -1857,7 +1858,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     if (transformer_mod.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
-    if (transformer_mod.diagEnvOn("SUSHI_GLM_ROWS_UBENCH")) if (xfm_ptr.glm5) |target| glmRowsUbench(sch.allocator, target, kv_quant_config.glmLatentBits() orelse 0, params.tok);
+    if (transformer_mod.diagEnvOn("SUSHI_GLM_ROWS_UBENCH")) if (glm5_state.modelOf(xfm_ptr)) |target| glmRowsUbench(sch.allocator, target, kv_quant_config.glmLatentBits() orelse 0, params.tok);
 
     // DIAGNOSTIC (SUSHI_DECODE_FWD_UBENCH=N): time N decode-width forward
     // passes back to back, with NO sampling, detokenization, stop-checking or
@@ -2093,7 +2094,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             return error.DrafterUnsupported;
         }
         const d = try sch.allocator.create(DflashModel);
-        d.* = (if (params.config.isGlm5()) @import("glm5/glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
+        d.* = (if (params.config.isGlm5()) @import("glm5/glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, glm5_state.modelOf(xfm_ptr).?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
             sch.allocator.destroy(d);
             log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
             return err;
@@ -2101,7 +2102,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.config.isGlm5()) {
             d.sliding_serving = true;
             log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
-            if (transformer_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, xfm_ptr.glm5.?, d, kv_quant_config.glmLatentBits() orelse 0, params.tok);
+            if (transformer_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, glm5_state.modelOf(xfm_ptr).?, d, kv_quant_config.glmLatentBits() orelse 0, params.tok);
         } else if (params.config.isQwen4()) {
             d.sliding_serving = true;
             d.bind(xfm_ptr) catch |err| {

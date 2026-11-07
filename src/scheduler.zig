@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const arch_state = @import("arch/arch_state.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -278,8 +279,8 @@ pub const Slot = struct {
     cache: KVCache,
     moe_seq_offset: usize,
     ssm_entries: ?[]SSMCacheEntry,
-    /// The arch's per-request state beside the KV cache (`ctx.glm5_request`); null where the arch keeps none.
-    glm5_request: ?sched.NativeRequest = null,
+    /// The arch's per-request state beside the KV cache, which `ctx.arch_ctx` points at; null where the arch keeps none.
+    request: ?sched.NativeRequest = null,
     /// What the scheduler asks of the arch on every tick, resolved once at admission.
     facts: sched.Facts = .{},
     /// SSM stride checkpoints salvaged from a prefill the client cancelled:
@@ -509,8 +510,8 @@ pub const Slot = struct {
             }
             allocator.free(entries);
         };
-        var glm5_request = try sched.initRequest(allocator, config);
-        errdefer if (glm5_request) |*request| request.deinit();
+        var slot_request = try sched.initRequest(allocator, config);
+        errdefer if (slot_request) |*request| request.deinit();
 
         // Dup owned slices.
         const prompt_owned = try allocator.dupe(u32, params.prompt_ids);
@@ -536,7 +537,7 @@ pub const Slot = struct {
             .cache = cache,
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
-            .glm5_request = glm5_request,
+            .request = slot_request,
             .facts = sched.facts(config),
             .vision_embeddings = params.vision_embeddings,
             .deferred_media = params.deferred_media,
@@ -603,7 +604,7 @@ pub const Slot = struct {
             .moe_seq_offset = &slot.moe_seq_offset,
             .ssm_entries = slot.ssm_entries,
             .ssm_member_gen = transformer_mod.nextSsmMemberGen(),
-            .glm5_request = if (slot.glm5_request) |*request| request else null,
+            .arch_ctx = arch_state.ctxForSlot(if (slot.request) |*request| request else null),
             .vision_embeddings = slot.vision_embeddings,
             .mrope_pos = slot.mrope_pos,
             .mrope_total = slot.mrope_total,
@@ -627,7 +628,7 @@ pub const Slot = struct {
         self.cancelled_prefill.deinit();
         self.ring_cps.deinit();
         self.cache.deinit();
-        if (self.glm5_request) |*request| request.deinit();
+        if (self.request) |*request| request.deinit();
         if (self.ssm_entries) |entries| {
             if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
             for (entries) |*e| {
@@ -4778,7 +4779,7 @@ test "a cancelled prefill with no Generator commits its forwarded prefix, pad-on
         slot.model = &model;
         slot.error_code = null;
         slot.legacy_gen = null;
-        slot.glm5_request = null;
+        slot.request = null;
         slot.cancelled_prefill = .{ .forwarded = c.forwarded };
         slot.ssm_entries = if (c.hybrid) &no_ssm else null;
         slot.full_prompt = &tokens;
@@ -5606,7 +5607,7 @@ test "a slot the batched tick hands back to the serial path counts its pending p
     var xfm: Transformer = undefined;
     xfm.config.model_type = "qwen4_exp";
     xfm.config.full_attention_interval = 4;
-    xfm.glm5 = null;
+    xfm.arch_state = .{};
     xfm.moe_layers = &.{};
     var gen: Generator = undefined;
     gen.generated_ids = .empty;
@@ -6108,7 +6109,7 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     slot.max_tokens = 8;
     slot.request_start_ts = std.Io.Timestamp.now(testing.io, .boot);
     slot.legacy_gen = null;
-    slot.glm5_request = null;
+    slot.request = null;
     slot.state = .decoding;
     slot.finished = false;
     slot.error_code = null;
@@ -6145,7 +6146,7 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     slot.legacy_gen = null;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
-    slot.glm5_request = null;
+    slot.request = null;
     slot.ring_cps = .{};
     slot.restored_entry = 0;
     slot.full_prompt = &.{};
@@ -6242,7 +6243,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     slot.legacy_gen = null;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
-    slot.glm5_request = null;
+    slot.request = null;
     slot.ring_cps = .{ .fork = .{ .entries = &cp_entries, .step = 8, .allocator = testing.allocator, .config = .dense } };
     slot.full_prompt = &.{};
     slot.prompt_tokens = 8;

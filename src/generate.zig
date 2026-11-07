@@ -42,6 +42,7 @@ const dspark_rows = @import("dsv41/dspark_rows.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
 const glm5_generate = @import("glm5/glm5_generate.zig");
+const glm5_state = @import("glm5/glm5_state.zig");
 const sampler = @import("sampler.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const mtp_plan = @import("mtp_plan.zig");
@@ -1320,8 +1321,8 @@ pub const Generator = struct {
         try sampling.think_penalty.prepare(allocator, bias_vocab, xfm.think_marker_mask, xfm.s);
         errdefer sampling.think_penalty.deinitPrepared();
         var options = options_in;
-        const glm_dflash_native = xfm.glm5 != null and options.dflash_enabled and options.dflash != null and glm5_generate.glmDflashEligible(sampling, options.logprobs_n);
-        if (xfm.glm5 != null) {
+        const glm_dflash_native = glm5_state.modelOf(xfm) != null and options.dflash_enabled and options.dflash != null and glm5_generate.glmDflashEligible(sampling, options.logprobs_n);
+        if (glm5_state.modelOf(xfm) != null) {
             options.mtp_enabled = false;
             options.dflash_enabled = glm_dflash_native;
         }
@@ -1411,7 +1412,7 @@ pub const Generator = struct {
             ssm_checkpoints.deinit(allocator);
         }
         const has_vision = ctx.vision_embeddings != null;
-        const glm_request = ctx.glm5_request;
+        const glm_request = glm5_state.requestOf(&ctx);
         const want_ssm_cp = prefill_plan.shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
             (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null or xfm.dsv41 != null,
@@ -2894,7 +2895,7 @@ pub const Generator = struct {
 
     /// The absolute position the request's state stands at: GLM's request offset, else the model's position counter.
     fn thoughtStatePos(self: *const Generator) usize {
-        if (self.ctx.glm5_request) |request| return request.offset;
+        if (glm5_state.requestOf(&self.ctx)) |request| return request.offset;
         return self.ctx.moe_seq_offset.*;
     }
 
@@ -2935,7 +2936,7 @@ pub const Generator = struct {
             log.debug("[prefix] no thought restore point: the state stands at {d}, not {d}\n", .{ pos, tp.at });
             return;
         }
-        var cp = capturePrefillCheckpoint(a, self.xfm, &self.ctx, self.ctx.glm5_request, pos, false) catch |err| {
+        var cp = capturePrefillCheckpoint(a, self.xfm, &self.ctx, glm5_state.requestOf(&self.ctx), pos, false) catch |err| {
             log.warn("[prefix] thought restore point at {d} not taken: {s}\n", .{ pos, @errorName(err) });
             return;
         };

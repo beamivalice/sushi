@@ -12,6 +12,7 @@ const streaming = @import("glm5_stream.zig");
 const hidden_capture = @import("../hidden_capture.zig");
 const imatrix_capture = @import("../imatrix.zig");
 const trunk_mod = @import("../trunk.zig");
+const glm5_state = @import("glm5_state.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Arr = mlx.mlx_array;
 const testing = std.testing;
@@ -53,7 +54,7 @@ pub fn hiddenCaptureWidth(config: *const model.ModelConfig) usize {
 }
 
 pub fn capturePromptChunks(allocator: std.mem.Allocator, l: *kld.Loaded, ctx: *trunk_mod.ForwardCtx, ids: []const u32, writer: *hidden_capture.Writer, chunk: usize) !mlx.mlx_array {
-    const request = ctx.glm5_request orelse return error.GlmRequestMissing;
+    const request = glm5_state.requestOf(ctx) orelse return error.GlmRequestMissing;
     if (request.boundaries != null) return error.GlmHiddenCaptureAlreadyActive;
     const saved_prefill = request.prefill_async;
     const saved_decode = request.decode_async;
@@ -1441,7 +1442,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
     var equal = false;
     try mlx.check(mlx.mlx_array_item_bool(&equal, same));
     try testing.expect(equal);
-    try testing.expectEqual(@as(usize, 7), loaded.xfm.glm5_request.?.offset);
+    try testing.expectEqual(@as(usize, 7), glm5_state.ownRequestOf(&loaded.xfm).?.offset);
 
     var quiet: kld.Out = .{ .silent = true };
     const fixture = try std.fmt.allocPrint(arena, "{s}/reference", .{root});
@@ -1457,7 +1458,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
         try testing.expectEqual(@as(f64, 8), try util.jsonNumber(parsed.value.object.get("positions").?));
         try testing.expect(std.math.isFinite(mean_kld));
         if (!kv.isQuant()) try testing.expectEqual(@as(f64, 0), mean_kld);
-        try testing.expectEqual(@as(u8, if (kv.isQuant()) kv.bits else 0), loaded.xfm.glm5_request.?.latent_bits);
+        try testing.expectEqual(@as(u8, if (kv.isQuant()) kv.bits else 0), glm5_state.ownRequestOf(&loaded.xfm).?.latent_bits);
     }
 }
 
@@ -1506,5 +1507,5 @@ test "kld: GLM full-stream hidden capture retains chunked boundaries and native 
     }
     const tokens = try tmp.dir.readFileAlloc(io, "hidden/tokens.bin", arena, .limited(1 << 20));
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&ids), tokens);
-    try testing.expect(loaded.xfm.glm5_request.?.boundaries == null);
+    try testing.expect(glm5_state.ownRequestOf(&loaded.xfm).?.boundaries == null);
 }

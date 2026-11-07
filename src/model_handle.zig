@@ -4,12 +4,10 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_cache = @import("kv_cache.zig");
 const ssm_cache = @import("ssm_cache.zig");
-const glm5_mod = @import("glm5/glm5_forward.zig");
 const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const qwen4_hc = @import("qwen4/qwen4_hc.zig");
 const KVCache = kv_cache.KVCache;
 const SSMCacheEntry = ssm_cache.SSMCacheEntry;
-const GlmRequest = glm5_mod.Request;
 const QsaArmCounts = qwen4_qsa_attn.QsaArmCounts;
 const PlePending = qwen4_hc.PlePending;
 const trunk = @import("trunk.zig");
@@ -18,6 +16,7 @@ const arch_forward = @import("arch/forward.zig");
 const arch_life = @import("arch/life.zig");
 const arch_request = @import("arch/request.zig");
 const arch_registry = @import("arch/registry.zig");
+const arch_state = @import("arch/arch_state.zig");
 
 // ── Forward context ──
 //
@@ -51,9 +50,8 @@ pub const ForwardCtx = struct {
     moe_seq_offset: *usize,
     ssm_entries: ?[]SSMCacheEntry,
     ssm_member_gen: u64 = 0,
-    /// glm5_next: the request's native KDA/MLA state, owned by the slot (the default
-    /// context names the shell's own). A GLM forward without one is refused by name.
-    glm5_request: ?*GlmRequest = null,
+    /// The arch's own per-forward context (`arch/arch_state.zig`): a field per enabled arch.
+    arch_ctx: arch_state.Ctx = .{},
     capture_hidden: ?*mlx.mlx_array,
     /// Like `capture_hidden` but receives the FULL post-final-norm hidden
     /// `[B, L, H]` (all positions, refcount-shared) instead of the last
@@ -186,7 +184,7 @@ pub fn defaultCtx(self: *Trunk) ForwardCtx {
         .ssm_entries = self.ssm_entries,
         .capture_hidden = null,
         .vision_embeddings = self.vision_embeddings,
-        .glm5_request = if (self.glm5_request) |*request| request else null,
+        .arch_ctx = arch_state.ctxOf(&self.arch_state),
     };
 }
 
@@ -196,8 +194,8 @@ pub fn defaultCtx(self: *Trunk) ForwardCtx {
 /// pooled blocks), so slots interleave AND batch freely. The one
 /// module-owned piece on this arch is the MTP head's cache, and the
 /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
-/// glm5: weights only; each slot's `glm5_forward.Request` rides `ForwardCtx.glm5_request`.
-pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "expert_stream", "glm5" };
+/// An arch's own state may share read-only weights too (`arch_state.sharesReadonly`).
+pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "expert_stream" };
 
 /// Whether this model is single-flight at admission (`slot_admission.modelExclusiveDecode`).
 pub fn ownsModuleDecodeState(self: *const Trunk) bool {
@@ -208,7 +206,7 @@ pub fn sharesModuleReadonlyState(self: *const Trunk) bool {
     inline for (module_shared_readonly_fields) |f| {
         if (@field(self, f) != null) return true;
     }
-    return false;
+    return arch_state.sharesReadonly(&self.arch_state);
 }
 
 /// Spec wiring class: module archs run only their OWN MTP head

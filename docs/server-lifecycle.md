@@ -252,8 +252,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
     `releases_checkpoints`, `always_write_through`, `thought_point`, `row_cap`, `pads_batch`), resolved once at admission, so no tick evaluates
     a `model_type` compare. Dispatch reads the arch tag of the slot's transformer config (its model config before a
     transformer exists), so a test slot needs a config, or `model.config = null` for an arch-less one.
-  - `Slot.glm5_request` keeps its name until the GLM stage moves it into the arch's context; its type is
-    `sched.NativeRequest`.
+  - `Slot.request`'s type is `sched.NativeRequest` (`arch_state.SlotRequest`), and the slot's
+    context points the arch at it through `arch_state.ctxForSlot`.
 - `src/model_load.zig`: load plan, streaming plan, load bills; `src/slot_admission.zig`: slot and memory admission, batching
   policy; `src/mtp_tick.zig`: grouped MTP tick; `src/slot_outcome.zig`: slot end, finish outcome, loop-stop reasons;
   `src/vision_queue.zig`: vision encode queue, media deferral.
@@ -282,8 +282,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   qwen4's state is read-only shared and batches freely. The batched-decode gate reads DISPATCH, not ARMED flags
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:
   `tests/test_batched_equivalence.sh` runs a real two-stream arm.
-- **A GLM slot owns its `glm5_forward.Request`** (`Slot.glm5_request`, handed to the forward as
-  `ForwardCtx.glm5_request`; a GLM forward without one is `GlmRequestMissing`), so GLM requests share a model; only a
+- **A GLM slot owns its `glm5_forward.Request`** (`Slot.request`, handed to the forward as
+  `ForwardCtx.arch_ctx.glm5.request`; a GLM forward without one is `GlmRequestMissing`), so GLM requests share a model; only a
   streamed GLM load stays exclusive. The boot line and `/props batching.reason` (`ok` vs `exclusive`) say which.
 - **An exclusive slot blocks admission until the inference thread releases it** (`heldExclusive`: `decoding` plus
   `cleanup_queue`; `complete()` keeps a slot in `decoding` until its pass is out): a disconnect must not let the next

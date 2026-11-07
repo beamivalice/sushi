@@ -77,6 +77,8 @@ private converter repo.
 - Vision: padded CLIP preprocessing, temporal placement of video frames, visual embeddings spliced into the HC input.
   The tower weights join the load bill and the encoder scratch is checked before each image/video encode.
 - Sampling, stop and output budgets run in the shared generator; a request that cannot speculate decodes serially.
+- The model and the default request live in `Trunk.arch_state.glm5` (`glm5_state.State`), a forward's request in
+  `ForwardCtx.arch_ctx.glm5` (`glm5_state.Ctx`); shared code reads them through `glm5_state.modelOf` and `requestOf`.
 
 <a id="dflash2"></a>
 ## DFlash2

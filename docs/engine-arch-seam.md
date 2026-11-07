@@ -40,8 +40,19 @@ joins `DROPPABLE` when its drop passes.
   reset). `Trunk.deinit`, `resetCache` and `warmup` are `model_handle.zig` operations that dispatch to the arch, which
   frees or resets its own state and then calls the trunk's `deinitTrunk` / `resetTrunk` / `warmupTrunk`.
   `Transformer` is an alias of `Trunk`, and `transformer.zig` re-exports the names that moved, until the arch stages
-  move their callers. The arch handle fields (`glm5`, `dsv41`, `qwen4`, ...) stay on `Trunk` for now: callers reach
-  them by name, and each arch's S3 stage moves its own.
+  move their callers. The arch handle fields still on `Trunk` (`dsv41`, `qwen4`, ...) are reached by name until
+  each arch's S3 stage moves its own; GLM's have moved.
+- **An arch's own state rides two registry-built fields.** `Trunk.arch_state` and `ForwardCtx.arch_ctx`
+  (`src/arch/arch_state.zig`) are structs with a field per enabled arch: the `State` and `Ctx` its `arch.zig`
+  declares, void where it declares none, each default-initialised so a context built by hand needs no arch field.
+  An arch's S3 stage moves its `Trunk` and `ForwardCtx` fields into them; a build without the arch has none. A seam guard in
+  `arch_state.zig` fails the build when a `Trunk`, `ForwardCtx` or `Slot` field names a registered arch beyond its
+  allowlist, or an allowlisted field is gone; each S3 stage deletes its lines, and an empty list means the seam is done. A `State` may declare `ctx` (the default context's part), `runsOwnModel`,
+  `sharesReadonly` and `rawEmbedding`, which `arch_state.zig` asks generically; shared code that needs one arch's state
+  goes through that arch's accessors (`glm5_state.modelOf`, `requestOf`), which are null in a build without it. The
+  request a slot owns beside its KV cache is `arch_state.SlotRequest`, the type of the one `Ctx.request` a built arch
+  declares (`NoRequest` when none does). A moved field leaves `Trunk` in the commit that fills its `State`: two
+  owners of one pointer release it twice.
 - **The chat face.** `src/<arch>/<arch>_chat.zig` is the arch's MLX-free face for the host tier (chat templates, tool
   calls, tokenizer: no MLX, so `test-host` runs beside a server). It holds `model_types` (`arch.zig` re-exports them),
   `effort` (an editable table or fixed arms), and, where the arch has them, `pin` (a template it serves instead of the

@@ -243,7 +243,7 @@ fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xf
     slot.request_id = 0;
     slot.max_tokens = 8;
     slot.legacy_gen = null;
-    slot.glm5_request = null;
+    slot.request = null;
     slot.finished = false;
     slot.error_code = null;
     slot.cancelled = .init(false);
@@ -356,7 +356,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };
     slot.ssm_entries = null;
     slot.ring_cps = .{};
-    slot.glm5_request = null;
+    slot.request = null;
     slot.legacy_gen = null;
 
     const rows_and_windows = dsv41_model.stateBytes(&m.dec_state.?);

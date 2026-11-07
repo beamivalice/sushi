@@ -698,7 +698,7 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
 
 test "only the models with per-slot head state are admitted to the MTP slot groups, whose rounds run solo" {
     var t: transformer_mod.Transformer = undefined;
-    t.glm5 = null;
+    t.arch_state = .{};
     t.dsv41 = null;
     t.moe_layers = &.{};
     t.expert_stream = null;

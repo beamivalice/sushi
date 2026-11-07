@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
+const glm5_state = @import("glm5_state.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const model_mod = @import("../model.zig");
 const mtp_lookup = @import("../mtp_lookup.zig");
@@ -129,7 +130,7 @@ pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@im
 pub const GlmSpecWindow = struct { snapshot: trunk_mod.KVCacheSnapshot, base_pos: usize };
 
 pub fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assistant: *const dflash_mod.DflashCtx, max_tokens: u32, s: mlx.mlx_stream) !void {
-    const request = ctx.glm5_request orelse return error.GlmRequestMissing;
+    const request = glm5_state.requestOf(&ctx) orelse return error.GlmRequestMissing;
     const kv = ctx.cache.config;
     const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const held = request.residentBytes() +| assistant.cache.residentBytes();
@@ -192,7 +193,7 @@ pub fn sampledGlmDecisions(raw: *anyopaque, verified: *@import("glm5_dflash_mode
 /// returns the row's logits. A DFlash2 request also appends the row's captures to its
 /// assistant context, so its rounds resume when it decodes alone again.
 pub fn glmRowCommit(self: *Generator, verified: *const @import("glm5_dflash_model.zig").Verified) !mlx.mlx_array {
-    const request = self.ctx.glm5_request orelse return error.GlmRequestMissing;
+    const request = glm5_state.requestOf(&self.ctx) orelse return error.GlmRequestMissing;
     const s = self.xfm.s;
     if (self.glm_dflash_native) {
         var verification = try verified.prepareCommitConsuming(request, 1, self.eos_token_ids, s);
@@ -223,11 +224,11 @@ pub fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
     };
     const draft_ns = timer.read();
     timer.reset();
-    const request = self.ctx.glm5_request.?;
+    const request = glm5_state.requestOf(&self.ctx).?;
     // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
     const group = @import("glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = self.glmPenalty() };
     var verified: [1]@import("glm5_dflash_model.zig").Verified = undefined;
-    try @import("glm5_dflash_model.zig").verifyGroups(self.xfm.glm5.?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
+    try @import("glm5_dflash_model.zig").verifyGroups(glm5_state.modelOf(self.xfm).?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
     const layerwise = &verified[0];
     defer layerwise.deinit();
     const verify_ns = timer.read();
@@ -281,8 +282,8 @@ pub fn glmPenalty(self: *Generator) ?@import("glm5_dflash_model.zig").Penalty {
 pub fn glmRoundReady(self: *Generator) !bool {
     if (self.done or try self.checkStop()) return false;
     if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
-    if (self.ctx.glm5_request == null) return error.GlmRequestMissing;
-    const target = self.xfm.glm5.?;
+    if (glm5_state.requestOf(&self.ctx) == null) return error.GlmRequestMissing;
+    const target = glm5_state.modelOf(self.xfm).?;
     target.s = self.xfm.s;
     target.suppress_mask = self.xfm.suppress_mask;
     self.dflash.?.s = self.xfm.s;
@@ -293,12 +294,12 @@ pub fn glmRoundReady(self: *Generator) !bool {
 pub fn glmProposeRound(self: *Generator) !@import("glm5_dflash.zig").Proposal {
     const costs = dflash_policy.glmLadder();
     const min = dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS;
-    return @import("glm5_dflash.zig").proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_policy.GLM_USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
+    return @import("glm5_dflash.zig").proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, glm5_state.modelOf(self.xfm).?, glm5_state.requestOf(&self.ctx).?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_policy.GLM_USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
 }
 
 /// This request's round draft of at most `max_nodes` nodes.
 pub fn glmPropose(self: *Generator, max_nodes: usize) !@import("glm5_dflash.zig").Proposal {
-    return @import("glm5_dflash.zig").proposeRound(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, max_nodes, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4);
+    return @import("glm5_dflash.zig").proposeRound(self.dflash.?, &self.dflash_ctx.?, glm5_state.modelOf(self.xfm).?, glm5_state.requestOf(&self.ctx).?, self.next_token_id, max_nodes, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4);
 }
 
 /// Decides (sampled requests draw along the visited path), commits and books a verified
@@ -307,7 +308,7 @@ pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *co
     const budget = self.max_tokens - self.completion_tokens;
     const sampled = !sampler.isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
     if (sampled) try sampledGlmDecisions(self, layerwise, budget, self.eos_token_ids);
-    const request = self.ctx.glm5_request.?;
+    const request = glm5_state.requestOf(&self.ctx).?;
     // A round that carries the thought's closer ends on the pool position at or below it; the verified targets
     // already fix the path, so the cut commits a prefix of it with the same pending token.
     var round_budget = budget;
@@ -317,7 +318,7 @@ pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *co
         for (full.rows[0..full.count], path[0..full.count]) |row, *t| t.* = layerwise.tokens[row];
         if (self.thoughtRoundCut(path[0..full.count], request.offset)) |keep| round_budget = @min(budget, keep);
     }
-    var round = try @import("glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, round_budget, self.eos_token_ids);
+    var round = try @import("glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, glm5_state.modelOf(self.xfm).?, request, proposal, layerwise, round_budget, self.eos_token_ids);
     round.draft_ns = draft_ns;
     round.verify_ns = verify_ns;
     if (!lookup and proposal.count > 1) self.dflash_calib.observeTree(&proposal.conf, &proposal.parents, proposal.count, round.rows[0..round.count]);
@@ -637,7 +638,7 @@ test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefi
     for (gen.ssm_checkpoints.items, 0..) |cp, i| at[i] = cp.pos;
     // Stride boundaries, then the backoff snapshot pulled back to a pool boundary (299 - 31).
     try testing.expectEqualSlices(usize, &.{ 64, 128, 192, 256, 268 }, at[0..gen.ssm_checkpoints.items.len]);
-    var rows = try glm5_prefix.MlaRows.capture(a, &turn.glm5_request.?, 268, turn.s);
+    var rows = try glm5_prefix.MlaRows.capture(a, glm5_state.ownRequestOf(&turn).?, 268, turn.s);
     defer rows.deinit();
 
     var cold_xfm = try Transformer.init(testing.io, a, cfg, &weights);
@@ -647,13 +648,13 @@ test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefi
 
     var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
-    try glm5_prefix.restore(&warm_xfm.glm5_request.?, &rows, &gen.ssm_checkpoints.items[3]);
+    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, &gen.ssm_checkpoints.items[3]);
     warm_xfm.cache.step = 256;
     var warm_opts = opts;
     warm_opts.ssm_checkpoint_pos_offset = 256;
     var warm = try Generator.initWithOptions(testing.io, a, &warm_xfm, &tok, next[256..], 4, greedy, &.{}, warm_opts);
     defer warm.deinit(a);
-    try glm5_prefix.expectSameLogicalState(&cold_xfm.glm5_request.?, &warm_xfm.glm5_request.?);
+    try glm5_prefix.expectSameLogicalState(glm5_state.ownRequestOf(&cold_xfm).?, glm5_state.ownRequestOf(&warm_xfm).?);
     try testing.expectEqual(cold.next_token_id, warm.next_token_id);
     try testing.expectEqual(cold.ssm_checkpoints.items[cold.ssm_checkpoints.items.len - 1].pos, warm.ssm_checkpoints.items[warm.ssm_checkpoints.items.len - 1].pos);
     const sched = glmCaptureSchedule(64, 16, 256, next.len - 256);
@@ -823,7 +824,7 @@ test "GLM checkpoints stay on the grid when a request steps its chunk down, and 
     for (gen.ssm_checkpoints.items, 0..) |cp, i| at[i] = cp.pos;
     // 64-wide chunks to 128, 32-wide after: the grid points are still chunk ends.
     try testing.expectEqualSlices(usize, &.{ 64, 128, 192, 256, 268 }, at[0..gen.ssm_checkpoints.items.len]);
-    var rows = try glm5_prefix.MlaRows.capture(a, &turn.glm5_request.?, 268, turn.s);
+    var rows = try glm5_prefix.MlaRows.capture(a, glm5_state.ownRequestOf(&turn).?, 268, turn.s);
     defer rows.deinit();
 
     var cold_xfm = try Transformer.init(testing.io, a, cfg, &weights);
@@ -833,7 +834,7 @@ test "GLM checkpoints stay on the grid when a request steps its chunk down, and 
 
     var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
-    try glm5_prefix.restore(&warm_xfm.glm5_request.?, &rows, &gen.ssm_checkpoints.items[2]);
+    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, &gen.ssm_checkpoints.items[2]);
     warm_xfm.cache.step = 192;
     var warm_opts = opts;
     warm_opts.ssm_checkpoint_pos_offset = 192;
@@ -841,7 +842,7 @@ test "GLM checkpoints stay on the grid when a request steps its chunk down, and 
     warm_opts.pinned_prefill_chunk = 32;
     var warm = try Generator.initWithOptions(testing.io, a, &warm_xfm, &tok, next[192..], 2, greedy, &.{}, warm_opts);
     defer warm.deinit(a);
-    try glm5_prefix.expectSameLogicalState(&cold_xfm.glm5_request.?, &warm_xfm.glm5_request.?);
+    try glm5_prefix.expectSameLogicalState(glm5_state.ownRequestOf(&cold_xfm).?, glm5_state.ownRequestOf(&warm_xfm).?);
     try testing.expectEqual(cold.next_token_id, warm.next_token_id);
 }
 
@@ -881,7 +882,7 @@ test "GLM thought point: the round that carries the closer is cut to a pool boun
     var gen = try Generator.initWithOptions(testing.io, a, &turn, &tok, &prompt, 4, greedy, &.{}, opts);
     defer gen.deinit(a);
     const closer: u32 = 3;
-    const base = turn.glm5_request.?.offset;
+    const base = glm5_state.ownRequestOf(&turn).?.offset;
     gen.thought_point = .{ .closer = closer, .grid = @intCast(glm5_prefix.pool_size), .min_tokens = 8, .base = base };
     const before = gen.ssm_checkpoints.items.len;
 
@@ -893,7 +894,7 @@ test "GLM thought point: the round that carries the closer is cut to a pool boun
     try testing.expectEqual(before, gen.ssm_checkpoints.items.len);
 
     // The round that carries the closer keeps the tokens up to the pool boundary at or below it.
-    const anchor = turn.glm5_request.?.offset;
+    const anchor = glm5_state.ownRequestOf(&turn).?.offset;
     const closing = [_]u32{ 1, 2, 0, 1, 2, closer, 0, 1 };
     const want = (anchor + 5 + 1) / glm5_prefix.pool_size * glm5_prefix.pool_size - anchor;
     try testing.expect(want > 0 and want < closing.len);
@@ -907,20 +908,20 @@ test "GLM thought point: the round that carries the closer is cut to a pool boun
     try testing.expectEqual(ThoughtPoint.State.taken, gen.thought_point.?.state);
 
     // A restore from it is the live state, and the next token from both leaves them the same.
-    var rows = try glm5_prefix.MlaRows.capture(a, &turn.glm5_request.?, point.pos, turn.s);
+    var rows = try glm5_prefix.MlaRows.capture(a, glm5_state.ownRequestOf(&turn).?, point.pos, turn.s);
     defer rows.deinit();
     var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
-    try glm5_prefix.restore(&warm_xfm.glm5_request.?, &rows, point);
+    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, point);
     warm_xfm.cache.step = point.pos;
-    try glm5_prefix.expectSameLogicalState(&turn.glm5_request.?, &warm_xfm.glm5_request.?);
+    try glm5_prefix.expectSameLogicalState(glm5_state.ownRequestOf(&turn).?, glm5_state.ownRequestOf(&warm_xfm).?);
     const next = [_]u32{closing[want]};
     try commitTestRound(&gen, &next);
     var warm_opts = opts;
     warm_opts.ssm_checkpoint_pos_offset = point.pos;
     var warm = try Generator.initWithOptions(testing.io, a, &warm_xfm, &tok, &next, 4, greedy, &.{}, warm_opts);
     defer warm.deinit(a);
-    try glm5_prefix.expectSameLogicalState(&turn.glm5_request.?, &warm_xfm.glm5_request.?);
+    try glm5_prefix.expectSameLogicalState(glm5_state.ownRequestOf(&turn).?, glm5_state.ownRequestOf(&warm_xfm).?);
 
     // The commit may drop the point; the checkpoints are what they were.
     gen.dropThoughtPoint();

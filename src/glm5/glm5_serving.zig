@@ -1,6 +1,7 @@
 const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
 const glm5_mod = @import("glm5_forward.zig");
+const glm5_state = @import("glm5_state.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
@@ -31,14 +32,13 @@ pub fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *con
     var request = try glm5_mod.Request.initServing(allocator, config.num_hidden_layers);
     errdefer request.deinit();
     var shell = try initModuleShell(allocator, config, s);
-    shell.glm5 = mdl;
-    shell.glm5_request = request;
+    shell.arch_state.glm5 = .{ .model = mdl, .request = request };
     shell.expert_stream = engine;
     return shell;
 }
 
 pub fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, mdl: *glm5_mod.Model) !mlx.mlx_array {
-    const request = ctx.glm5_request orelse return error.GlmRequestMissing;
+    const request = glm5_state.requestOf(ctx) orelse return error.GlmRequestMissing;
     if (ctx.cache.step == 0) {
         request.reset();
         try request.setLatentBits(ctx.cache.config.glmLatentBits() orelse return error.GlmKvQuantUnsupported);
@@ -162,7 +162,7 @@ fn glmStreamedExl3MatchesResident(dec: expert_exl3.Decode) !void {
             union_seen = union_seen or engine.breakdown().union_members > 0;
         }
         try testing.expect(logits_moved);
-        try testing.expectEqual(@as(u8, if (kv.isQuant()) kv.bits else 0), streamed.glm5_request.?.latent_bits);
+        try testing.expectEqual(@as(u8, if (kv.isQuant()) kv.bits else 0), glm5_state.ownRequestOf(&streamed).?.latent_bits);
     }
     try testing.expect(union_seen);
     try testing.expect(engine.fill_experts_total > 4);
@@ -199,13 +199,13 @@ test "GLM serving dispatch matches native forward across prefill decode and rese
         try testing.expectEqual(request.offset, xfm.cache.step);
     }
     try xfm.resetCache();
-    try testing.expectEqual(@as(usize, 0), xfm.glm5_request.?.offset);
+    try testing.expectEqual(@as(usize, 0), glm5_state.ownRequestOf(&xfm).?.offset);
     request.reset();
     const ids = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32);
     defer _ = mlx.mlx_array_free(ids);
     const actual = try xfm.forward(ids);
     defer _ = mlx.mlx_array_free(actual);
-    try testing.expectEqual(@as(usize, 1), xfm.glm5_request.?.offset);
+    try testing.expectEqual(@as(usize, 1), glm5_state.ownRequestOf(&xfm).?.offset);
     var ctx = xfm.defaultCtx();
     ctx.cache.step = 2;
     try testing.expectError(error.GlmCachePositionMismatch, xfm.forwardWith(&ctx, ids));
@@ -241,7 +241,7 @@ test "GLM forward contexts carry their own request: interleaved streams equal ea
         caches[i] = try KVCache.init(a, cfg.num_hidden_layers);
         served[i] = try glm5_mod.Request.initServing(a, cfg.num_hidden_layers);
         solo[i] = try glm5_mod.Request.initServing(a, cfg.num_hidden_layers);
-        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offsets[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .glm5_request = &served[i] };
+        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offsets[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .arch_ctx = glm5_state.ctxFor(&served[i]) };
     }
     defer for (0..2) |i| {
         caches[i].deinit();
@@ -266,9 +266,9 @@ test "GLM forward contexts carry their own request: interleaved streams equal ea
         try testing.expectEqual(solo[step.slot].offset, caches[step.slot].step);
     }
     // The shell's own request belongs to the default context only.
-    try testing.expectEqual(@as(usize, 0), xfm.glm5_request.?.offset);
+    try testing.expectEqual(@as(usize, 0), glm5_state.ownRequestOf(&xfm).?.offset);
     var orphan = ctxs[0];
-    orphan.glm5_request = null;
+    orphan.arch_ctx = .{};
     const ids = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32);
     defer _ = mlx.mlx_array_free(ids);
     try testing.expectError(error.GlmRequestMissing, xfm.forwardWith(&orphan, ids));
@@ -289,7 +289,7 @@ test "a GLM prefill interleaved with another stream's decode builds the solo pre
     for (0..3) |i| {
         caches[i] = try KVCache.init(a, cfg.num_hidden_layers);
         requests[i] = try glm5_mod.Request.initServing(a, cfg.num_hidden_layers);
-        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offsets[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .glm5_request = &requests[i] };
+        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offsets[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .arch_ctx = glm5_state.ctxFor(&requests[i]) };
     }
     defer for (0..3) |i| {
         caches[i].deinit();
@@ -330,7 +330,8 @@ test "a streamed GLM load keeps its one teacher stream exclusive" {
     t.expert_stream = null;
     var glm: glm5_mod.Model = undefined;
     glm.expert_stream = null;
-    t.glm5 = &glm;
+    t.arch_state = .{};
+    glm5_state.stateOf(&t).?.model = &glm;
     try testing.expect(!t.ownsModuleDecodeState());
     try testing.expect(t.moduleSpecWiring());
     glm.expert_stream = @ptrFromInt(@alignOf(@import("glm5_stream.zig").Stream));
@@ -369,11 +370,11 @@ test "GLM serving stores the latent its slot cache names and refuses kv4 by name
             try mlx.check(mlx.mlx_array_item_bool(&same, equal));
             try testing.expect(same);
         }
-        const stored = &xfm.glm5_request.?;
+        const stored = glm5_state.ownRequestOf(&xfm).?;
         try testing.expectEqual(bits, stored.latent_bits);
         try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(stored.layers[3].attention.latent));
     }
-    const served = &xfm.glm5_request.?;
+    const served = glm5_state.ownRequestOf(&xfm).?;
     const ids = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32);
     defer _ = mlx.mlx_array_free(ids);
     try xfm.cache.reinit(cfg.num_hidden_layers, KVQuantConfig.affine(4));

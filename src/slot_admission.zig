@@ -803,7 +803,7 @@ test "a staggered admission waits for the growth an earlier request was admitted
     a.max_tokens = 1;
     a.cache.config = .dense;
     a.cache.entries = &.{};
-    a.glm5_request = null;
+    a.request = null;
     a.vision_embeddings = null;
     a.enable_mtp = false;
     a.memory_hold_logged = true;

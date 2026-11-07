@@ -24,6 +24,9 @@ const all_names = blk: {
     break :blk out;
 };
 
+/// Every registered arch's name, built or not.
+pub const registered_names: []const [:0]const u8 = &all_names;
+
 pub fn selected(wanted: []const []const u8, name: []const u8) bool {
     if (wanted.len == 0) return true;
     for (wanted) |w| if (std.mem.eql(u8, w, name)) return true;

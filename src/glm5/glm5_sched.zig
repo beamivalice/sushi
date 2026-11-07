@@ -5,7 +5,8 @@ const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const model_registry = @import("../model_registry.zig");
 const kv_quant = @import("../kv_quant.zig");
-const transformer = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const glm5_state = @import("glm5_state.zig");
 const prefix_cache = @import("../prefix_cache.zig");
 const prefix_arch = @import("../arch/prefix.zig");
 const scheduler = @import("../scheduler.zig");
@@ -18,8 +19,8 @@ const rows_tick = @import("glm5_rows_tick.zig");
 
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
-const Transformer = transformer.Transformer;
-const ForwardCtx = transformer.ForwardCtx;
+const Transformer = trunk_mod.Transformer;
+const ForwardCtx = trunk_mod.ForwardCtx;
 const Generator = generate.Generator;
 const ModelConfig = model.ModelConfig;
 
@@ -37,7 +38,7 @@ pub fn rowCap(config: *const ModelConfig) ?usize {
 }
 
 pub fn modelBatches(xfm: *const Transformer) bool {
-    return xfm.supportsBatchedGlmRows();
+    return glm5_state.supportsBatchedRows(xfm);
 }
 
 /// Per-row attention reads each slot's own cache: nothing pads.
@@ -47,7 +48,7 @@ pub fn padsBatch(config: *const ModelConfig) bool {
 
 pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?sched.BatchArm {
     _ = ctxs;
-    if (!xfm.supportsBatchedGlmRows()) return null;
+    if (!glm5_state.supportsBatchedRows(xfm)) return null;
     return .{ .moe_positions = false, .advances_offset = true };
 }
 
@@ -88,11 +89,11 @@ pub fn commitOwn(
     slot: *Slot,
     gen: ?*Generator,
     tokens: []const u32,
-    cps: ?[]transformer.SSMCheckpoint,
+    cps: ?[]trunk_mod.SSMCheckpoint,
     prompt_len: usize,
 ) bool {
-    const request = if (slot.glm5_request) |*r| r else return false;
-    const window: ?transformer.KVCache = if (gen) |g| if (g.glm_prefill_window) |*w|
+    const request = if (slot.request) |*r| r else return false;
+    const window: ?trunk_mod.KVCache = if (gen) |g| if (g.glm_prefill_window) |*w|
         .{ .entries = w.snapshot.entries, .step = w.snapshot.step, .allocator = w.snapshot.allocator, .config = w.snapshot.config }
     else
         null else null;
@@ -103,7 +104,7 @@ pub fn commitOwn(
 
 pub fn restoreTarget(slot: *Slot, xfm: *Transformer) ?sched.RestoreTarget {
     _ = xfm;
-    const request = if (slot.glm5_request) |*r| r else return null;
+    const request = if (slot.request) |*r| r else return null;
     return .{ .rec = prefix_arch.recurrent("glm5", request), .takes_dflash = true };
 }
 
@@ -113,10 +114,10 @@ pub fn writeThrough(
     entry_id: *?u64,
     prompt: []const u32,
     media: prefix_cache.MediaStamp,
-    cps: []transformer.SSMCheckpoint,
+    cps: []trunk_mod.SSMCheckpoint,
     s: mlx.mlx_stream,
 ) bool {
-    const request = if (slot.glm5_request) |*r| r else return false;
+    const request = if (slot.request) |*r| r else return false;
     glm5_prefix.writeThroughGlm(hc, entry_id, request, prompt, slot.has_tools, media, cps, s);
     return true;
 }
@@ -133,14 +134,14 @@ test "an arch with a native request restores into it with the assistant context 
     var xfm: Transformer = undefined;
     var lm: model_registry.LoadedModel = undefined;
     var slot = sched.testSlot(&xfm, &lm, .{ .model_type = "glm5_next", .num_hidden_layers = 2 });
-    slot.glm5_request = (try initRequest(std.testing.allocator, &xfm.config)).?;
-    defer slot.glm5_request.?.deinit();
+    slot.request = (try initRequest(std.testing.allocator, &xfm.config)).?;
+    defer slot.request.?.deinit();
     const target = sched.restoreTarget(&slot, &xfm).?;
     try std.testing.expectEqualStrings("[prefix]", target.log_tag);
     try std.testing.expect(target.takes_dflash and !target.takes_mtp);
     try std.testing.expect(sched.commitsAtCull(&slot));
-    slot.glm5_request.?.offset = 4;
+    slot.request.?.offset = 4;
     sched.releaseState(&slot);
-    try std.testing.expectEqual(@as(usize, 0), slot.glm5_request.?.offset);
+    try std.testing.expectEqual(@as(usize, 0), slot.request.?.offset);
     try std.testing.expectError(error.GlmKvQuantUnsupported, sched.checkKvQuant(&xfm.config, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
 }

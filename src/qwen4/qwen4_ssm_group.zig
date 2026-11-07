@@ -1374,7 +1374,7 @@ test "persistent group: a qwen4 forwardWith releases a bound member between batc
     }
     // Qwen's forward reaches its embedding before any layer; with no weights it stops there by name.
     p_xfm.arch = tag;
-    p_xfm.glm5 = null;
+    p_xfm.arch_state = .{};
     p_xfm.qwen4 = null;
     p_xfm.dsv41 = null;
     p_xfm.expert_stream = null;

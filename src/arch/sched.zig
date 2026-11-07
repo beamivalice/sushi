@@ -26,8 +26,8 @@ const Transformer = transformer.Transformer;
 const ForwardCtx = transformer.ForwardCtx;
 const ModelConfig = model.ModelConfig;
 
-/// The request state a slot owns beside its KV cache, until the arch's own stage moves it into the arch's context.
-pub const NativeRequest = @typeInfo(@typeInfo(@FieldType(ForwardCtx, "glm5_request")).optional.child).pointer.child;
+/// The request state a slot owns beside its KV cache (`arch_state.SlotRequest`).
+pub const NativeRequest = @import("arch_state.zig").SlotRequest;
 
 pub const ThoughtPoint = enum {
     off,
@@ -255,7 +255,7 @@ pub fn coldLoadBill(load: ColdLoad) !?u64 {
 
 /// Resident bytes of the request state the slot owns beside its KV cache.
 pub fn requestBytes(slot: *const Slot) u64 {
-    return if (slot.glm5_request) |*request| request.residentBytes() else 0;
+    return if (slot.request) |*request| request.residentBytes() else 0;
 }
 
 /// Bytes of request state that live in the model, not in the slot.
@@ -268,13 +268,13 @@ pub fn modelStateBytes(slot: *const Slot) u64 {
 
 /// A slot the inference thread stops touching releases the state a later admission would otherwise read as held.
 pub fn releaseState(slot: *Slot) void {
-    if (slot.glm5_request) |*request| request.reset();
+    if (slot.request) |*request| request.reset();
 }
 
 /// A cancelled decode-phase slot commits at the cull when its request state is reset right after, or is the model's
 /// own (an arch's `commitsAtCull`): the next exclusive request takes that state over.
 pub fn commitsAtCull(slot: *const Slot) bool {
-    if (slot.glm5_request != null) return true;
+    if (slot.request != null) return true;
     const tag = tagOfSlot(slot) orelse return false;
     return switch (tag) {
         inline else => |t| if (comptime has(t, "commitsAtCull")) S(t).commitsAtCull(slot) else false,
@@ -495,7 +495,7 @@ pub fn testSlot(xfm: *Transformer, lm: *model_registry.LoadedModel, config: Mode
     lm.config = null;
     var slot: Slot = undefined;
     slot.model = lm;
-    slot.glm5_request = null;
+    slot.request = null;
     slot.legacy_gen = null;
     return slot;
 }
@@ -522,14 +522,14 @@ test "a slot's own request state is billed, released and culled with no config t
     lm.config = null;
     var slot: Slot = undefined;
     slot.model = &lm;
-    slot.glm5_request = null;
+    slot.request = null;
     try std.testing.expectEqual(@as(u64, 0), requestBytes(&slot));
     try std.testing.expect(!commitsAtCull(&slot));
-    slot.glm5_request = try NativeRequest.init(std.testing.allocator, 2);
-    defer slot.glm5_request.?.deinit();
-    slot.glm5_request.?.offset = 4;
-    try std.testing.expectEqual(slot.glm5_request.?.residentBytes(), requestBytes(&slot));
+    slot.request = try NativeRequest.init(std.testing.allocator, 2);
+    defer slot.request.?.deinit();
+    slot.request.?.offset = 4;
+    try std.testing.expectEqual(slot.request.?.residentBytes(), requestBytes(&slot));
     try std.testing.expect(commitsAtCull(&slot));
     releaseState(&slot);
-    try std.testing.expectEqual(@as(usize, 0), slot.glm5_request.?.offset);
+    try std.testing.expectEqual(@as(usize, 0), slot.request.?.offset);
 }

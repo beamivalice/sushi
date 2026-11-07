@@ -1,9 +1,7 @@
 const std = @import("std");
-const glm5_mod = @import("glm5/glm5_forward.zig");
 const dsv41_model = @import("dsv41/dsv41_model.zig");
 const dsv41_stream = @import("dsv41/dsv41_stream.zig");
 const dsv41_borrow = @import("dsv41/dsv41_borrow.zig");
-const GlmRequest = glm5_mod.Request;
 const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const expert_usage = @import("dsv41/expert_usage.zig");
@@ -84,6 +82,7 @@ const arch_life = @import("arch/life.zig");
 const arch_request = @import("arch/request.zig");
 const arch_admission = @import("arch/admission.zig");
 const arch_registry = @import("arch/registry.zig");
+const arch_state_mod = @import("arch/arch_state.zig");
 const dsv41_serving = @import("dsv41/dsv41_serving.zig");
 const dsv41DraftImpl = dsv41_serving.dsv41DraftImpl;
 const dsv41FinishImpl = dsv41_serving.dsv41FinishImpl;
@@ -848,6 +847,8 @@ const TrunkCells = struct {
 pub const Trunk = struct {
     /// The arch this model was loaded as, stamped once by `life.init`; every dispatch reads it.
     arch: arch_registry.Tag = undefined,
+    /// The arch's own model-lifetime state (`arch/arch_state.zig`): a field per enabled arch.
+    arch_state: arch_state_mod.State = .{},
     config: ModelConfig,
     cache: KVCache,
     s: mlx.mlx_stream,
@@ -949,9 +950,6 @@ pub const Trunk = struct {
     // `constTableAs` — the f32 table is what a bf16 forward must NOT multiply
     // by directly.
     yarn_mscale_cast: DtypeCastCache = .{},
-
-    glm5: ?*glm5_mod.Model = null,
-    glm5_request: ?glm5_mod.Request = null,
 
     // deepseek_v41: the model owns its one request's state (single flight), its routed experts
     // stream through `dsv41_experts` over `expert_stream`.
@@ -1843,7 +1841,7 @@ pub const Trunk = struct {
     }
 
     pub fn embedding(self: *const Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        if (self.glm5) |mdl| return mdl.rawEmbedding(token_ids);
+        if (try arch_state_mod.rawEmbedding(&self.arch_state, token_ids)) |e| return e;
         const raw = try self.rawEmbedding(token_ids);
 
         if (self.emb_scale) |scale| {
@@ -3000,11 +2998,6 @@ pub const Trunk = struct {
 
     pub fn concatAxis0(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
         return ssmConcatAxis0(s, parts);
-    }
-
-    pub fn supportsBatchedGlmRows(self: *const Trunk) bool {
-        const glm = self.glm5 orelse return false;
-        return self.config.supportsBatchedGlmRows() and glm.expert_stream == null;
     }
 
 

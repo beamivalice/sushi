@@ -5,17 +5,17 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const forward = @import("glm5_forward.zig");
-const transformer = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const Arr = mlx.mlx_array;
 const KVQuantConfig = @import("../kv_quant.zig").KVQuantConfig;
 const nil = Arr{ .ctx = null };
-const KVCache = transformer.KVCache;
-const SSMCacheEntry = transformer.SSMCacheEntry;
-const SSMCheckpoint = transformer.SSMCheckpoint;
+const KVCache = trunk_mod.KVCache;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const io_util = @import("../io_util.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const log = @import("../log.zig");
-const ssmCheckpointBytes = transformer.ssmCheckpointBytes;
+const ssmCheckpointBytes = trunk_mod.ssmCheckpointBytes;
 const pc = @import("../prefix_cache.zig");
 const prefix_arch = @import("../arch/prefix.zig");
 
@@ -45,7 +45,7 @@ pub fn checkpointMax(global: u32) u32 {
 
 /// MLA rows a commit copies: a restore resumes from a checkpoint, so the rows past the newest one are
 /// never read.
-pub fn commitRows(cps: []const transformer.SSMCheckpoint, offset: usize) usize {
+pub fn commitRows(cps: []const trunk_mod.SSMCheckpoint, offset: usize) usize {
     var newest: usize = 0;
     for (cps) |cp| newest = @max(newest, cp.pos);
     return @min(newest, offset / pool_size * pool_size);
@@ -67,24 +67,24 @@ pub fn rowBytesOf(request: *const forward.Request) u64 {
 }
 
 /// `cps` without those past `len`, whose KDA state nothing can restore; the rest are freed.
-pub fn keepThrough(allocator: std.mem.Allocator, cps: []transformer.SSMCheckpoint, len: usize) []transformer.SSMCheckpoint {
+pub fn keepThrough(allocator: std.mem.Allocator, cps: []trunk_mod.SSMCheckpoint, len: usize) []trunk_mod.SSMCheckpoint {
     var kept: usize = 0;
     while (kept < cps.len and cps[kept].pos <= len) kept += 1;
     if (kept == cps.len) return cps;
-    const shrunk = allocator.dupe(transformer.SSMCheckpoint, cps[0..kept]) catch return cps;
+    const shrunk = allocator.dupe(trunk_mod.SSMCheckpoint, cps[0..kept]) catch return cps;
     for (cps[kept..]) |*cp| cp.deinit(allocator);
     allocator.free(cps);
     return shrunk;
 }
 
 /// The request's KDA state at its current offset, as owned copies (MLA slots stay empty).
-pub fn captureKda(allocator: std.mem.Allocator, request: *const forward.Request, s: mlx.mlx_stream) !transformer.SSMCheckpoint {
+pub fn captureKda(allocator: std.mem.Allocator, request: *const forward.Request, s: mlx.mlx_stream) !trunk_mod.SSMCheckpoint {
     if (request.failed) return error.GlmRequestNeedsReset;
     if (request.offset % pool_size != 0) return error.GlmCheckpointOffPool;
-    const layers = try allocator.alloc(transformer.SSMCacheEntrySnapshot, request.layers.len);
+    const layers = try allocator.alloc(trunk_mod.SSMCacheEntrySnapshot, request.layers.len);
     var built: usize = 0;
     errdefer {
-        for (layers[0..built]) |*l| transformer.ssmSnapshotDeinit(l);
+        for (layers[0..built]) |*l| trunk_mod.ssmSnapshotDeinit(l);
         allocator.free(layers);
     }
     const evals = mlx.mlx_vector_array_new();
@@ -105,13 +105,13 @@ pub fn captureKda(allocator: std.mem.Allocator, request: *const forward.Request,
 }
 
 /// Installs a checkpoint's KDA state; its arrays are shared, never written.
-pub fn restoreKda(request: *forward.Request, cp: *const transformer.SSMCheckpoint) !void {
+pub fn restoreKda(request: *forward.Request, cp: *const trunk_mod.SSMCheckpoint) !void {
     if (cp.layers.len != request.layers.len) return error.SsmCheckpointLayerMismatch;
-    for (request.layers, cp.layers) |*dst, *src| try transformer.ssmRestore(&dst.recurrent, src);
+    for (request.layers, cp.layers) |*dst, *src| try trunk_mod.ssmRestore(&dst.recurrent, src);
 }
 
 /// The request as it stood at `cp.pos`; a failure leaves it reset.
-pub fn restore(request: *forward.Request, rows: *const MlaRows, cp: *const transformer.SSMCheckpoint) !void {
+pub fn restore(request: *forward.Request, rows: *const MlaRows, cp: *const trunk_mod.SSMCheckpoint) !void {
     try rows.restore(request, cp.pos);
     errdefer request.reset();
     try restoreKda(request, cp);
@@ -284,9 +284,9 @@ pub fn diskQuant(bits: u8) KVQuantConfig {
 }
 
 /// Views of `rows` in the disk layout; free with `freeDiskEntries`.
-pub fn diskEntries(allocator: std.mem.Allocator, rows: *const MlaRows) ![]transformer.KVCacheEntry {
-    const out = try allocator.alloc(transformer.KVCacheEntry, rows.layers.len * 2);
-    for (out) |*e| e.* = transformer.newEmptyKVEntry();
+pub fn diskEntries(allocator: std.mem.Allocator, rows: *const MlaRows) ![]trunk_mod.KVCacheEntry {
+    const out = try allocator.alloc(trunk_mod.KVCacheEntry, rows.layers.len * 2);
+    for (out) |*e| e.* = trunk_mod.newEmptyKVEntry();
     errdefer freeDiskEntries(allocator, out);
     for (rows.layers, 0..) |*layer, i| {
         if (layer.latent.ctx == null) continue;
@@ -302,13 +302,13 @@ pub fn diskEntries(allocator: std.mem.Allocator, rows: *const MlaRows) ![]transf
     return out;
 }
 
-pub fn freeDiskEntries(allocator: std.mem.Allocator, entries: []transformer.KVCacheEntry) void {
-    for (entries) |*e| transformer.resetKVEntry(e);
+pub fn freeDiskEntries(allocator: std.mem.Allocator, entries: []trunk_mod.KVCacheEntry) void {
+    for (entries) |*e| trunk_mod.resetKVEntry(e);
     allocator.free(entries);
 }
 
 /// Takes the rows a disk restore filled into `cache` (the `diskEntries` layout).
-pub fn rowsFromDisk(allocator: std.mem.Allocator, cache: *transformer.KVCache, bits: u8) !MlaRows {
+pub fn rowsFromDisk(allocator: std.mem.Allocator, cache: *trunk_mod.KVCache, bits: u8) !MlaRows {
     const len = cache.step;
     if (len % pool_size != 0 or len == 0 or cache.entries.len % 2 != 0) return error.GlmCheckpointOffPool;
     var out = try MlaRows.empty(allocator, cache.entries.len / 2, len, bits);
@@ -358,7 +358,7 @@ fn bitsOwnedCopy(x: Arr, s: mlx.mlx_stream) !Arr {
     var raw = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(raw);
     try mlx.check(mlx.mlx_view(&raw, x, raw_dtype, s));
-    const copy = try transformer.materializedOwnedCopy(s, raw);
+    const copy = try trunk_mod.materializedOwnedCopy(s, raw);
     if (raw_dtype == dtype) return copy;
     defer _ = mlx.mlx_array_free(copy);
     var out = mlx.mlx_array_new();
@@ -401,7 +401,7 @@ fn tierRows(rows: ?MlaRows) ?prefix_arch.Rows {
 /// `budget`, as `commitImpl`'s trim does, shedding checkpoints to fit; the SSD tier (`disk`)
 /// keeps every checkpoint at or below the rows, so it prices all of them.
 pub fn glmCommitLenFor(
-    policy: transformer.ThinPolicy,
+    policy: trunk_mod.ThinPolicy,
     budget: u64,
     disk: bool,
     newest: usize,
@@ -848,7 +848,7 @@ test "a commit sheds the checkpoints above the rows it keeps" {
     var net = try forward.Model.load(testing.allocator, cfg, &weights, mlx.gpuStream());
     defer net.deinit();
     const tokens = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0 };
-    const cps = try testing.allocator.alloc(transformer.SSMCheckpoint, 2);
+    const cps = try testing.allocator.alloc(trunk_mod.SSMCheckpoint, 2);
     cps[0] = try captureKdaAt(&net, 8, tokens[0..8]);
     cps[1] = try captureKdaAt(&net, 8, tokens[0..16]);
     const kept = keepThrough(testing.allocator, cps, 12);
@@ -860,7 +860,7 @@ test "a commit sheds the checkpoints above the rows it keeps" {
     try testing.expectEqual(@as(usize, 8), kept[0].pos);
 }
 
-fn captureKdaAt(net: *const forward.Model, bits: u8, tokens: []const u32) !transformer.SSMCheckpoint {
+fn captureKdaAt(net: *const forward.Model, bits: u8, tokens: []const u32) !trunk_mod.SSMCheckpoint {
     var req = try servedRequest(bits);
     defer req.deinit();
     _ = mlx.mlx_array_free(try prefill(net, &req, tokens, &.{tokens.len}));
@@ -890,7 +890,7 @@ test "GLM prefix checkpoints keep signed zeros of the KDA state" {
 
 test "a commit copies MLA rows only through its newest checkpoint" {
     const cp = struct {
-        fn at(pos: usize) transformer.SSMCheckpoint {
+        fn at(pos: usize) trunk_mod.SSMCheckpoint {
             return .{ .pos = pos, .layers = &.{} };
         }
     }.at;

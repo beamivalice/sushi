@@ -54,12 +54,12 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
 }
 
 pub fn deinit(xfm: Model) void {
-    glm5_state.deinit(xfm);
+    xfm.arch_state.glm5.deinit(xfm.allocator);
     xfm.deinitTrunk();
 }
 
 pub fn resetCache(xfm: Model) !void {
-    glm5_state.reset(xfm);
+    xfm.arch_state.glm5.reset();
     return xfm.resetTrunk();
 }
 
@@ -68,16 +68,16 @@ pub fn warmup(xfm: Model) !void {
 }
 
 pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {
-    return serving.forwardGlm5WithImpl(xfm, ctx, ids, xfm.glm5.?);
+    return serving.forwardGlm5WithImpl(xfm, ctx, ids, xfm.arch_state.glm5.model.?);
 }
 
 pub fn lmHeadForDraft(xfm: Model, x: mlx.mlx_array) !mlx.mlx_array {
-    return xfm.glm5.?.projectHead(x);
+    return xfm.arch_state.glm5.model.?.projectHead(x);
 }
 
 // A streamed GLM load (the KLD teacher) admits one claimant per expert stream.
 pub fn ownsModuleDecodeState(xfm: Model) bool {
-    return xfm.glm5.?.expert_stream != null;
+    return xfm.arch_state.glm5.model.?.expert_stream != null;
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {

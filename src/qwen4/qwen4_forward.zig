@@ -14,6 +14,7 @@ const std = @import("std");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3_kernels = sushi_exl3.kernels;
 const mlx = @import("../mlx.zig");
+const arch_state_mod = @import("../arch/arch_state.zig");
 const mrope = @import("../mrope.zig");
 const kv_quant = @import("../kv_quant.zig");
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
@@ -4350,7 +4351,7 @@ pub fn supportsBatchedGdnDecode(self: *const Transformer) bool {
     if (!self.config.supportsBatchedGdnDecode()) return false;
     // The loaded trunk must supply MoE layers and per-slot GDN state.
     if (self.moe_layers == null) return false;
-    if (self.glm5 != null) return false;
+    if (arch_state_mod.runsOwnModel(&self.arch_state)) return false;
     return true;
 }
 
