@@ -623,11 +623,102 @@ def main_quick_capture(a, spec, pack):
     return 1 if d else 0
 
 
+REUSED = re.compile(r"\[(?:dsv41-)?prefix\] reused (\d+) of (\d+) prompt tokens from ([A-Za-z ]+?),")
+
+
+def reused_of(seg):
+    m = REUSED.findall(seg)
+    return [int(m[-1][0]), int(m[-1][1]), m[-1][2]] if m else None
+
+
+def file_hashes(root):
+    """sha256 of every regular file under a cache root, by path relative to it."""
+    out = {}
+    for f in sorted(Path(root).rglob("*")):
+        if f.is_file() and not f.is_symlink():
+            with f.open("rb") as h:
+                out[str(f.relative_to(root))] = hashlib.file_digest(h, "sha256").hexdigest()
+    return out
+
+
+def cache_file_diff(base, new):
+    """(changed, only in base, only in new) path lists of two file_hashes maps."""
+    return ([k for k in sorted(base) if k in new and base[k] != new[k]], [k for k in sorted(base) if k not in new],
+            [k for k in sorted(new) if k not in base])
+
+
+def ssd_verdict(ref, got):
+    """None when a restore from the base binary's cache matches the reference: from SSD, the same N of M, the same bytes."""
+    if not got["reused"] or got["reused"][2] != "SSD":
+        return f"ssd/restore: no restore from SSD (reused {got['reused']})"
+    if got["reused"] != ref["reused"]:
+        return f"ssd/restore: reused {got['reused']} vs {ref['reused']}"
+    return first_diff(ref["response"], got["response"], "ssd/restore")
+
+
+def ssd_boot(label, pack, flags, cache_src=None, wait_persist=False):
+    """One boot on a private cache root (a copy of cache_src when given), the one prompt, and the root it ends with."""
+    import sushi_boot
+    env = sushi_boot.private_env(label)
+    root = env["SUSHI_PREFIX_CACHE_DIR"]
+    shutil.rmtree(root, ignore_errors=True)
+    if cache_src:
+        shutil.copytree(cache_src, root, symlinks=True)
+    else:
+        Path(root).mkdir(parents=True)
+    t0 = time.monotonic()
+    with sushi_boot.Server(label, model=pack, flags=["--metrics", "--log-level", "debug"] + flags, env=env) as srv:
+        srv.wait_ready()
+        load = time.monotonic() - t0
+        rp = Replay(srv)
+        n = rp.persisted_count()
+        rp.slice()
+        resp = rp.chat(rp.user(document(20) + "\n\nIn one sentence, what is the oldest structure in the town?"), 48)
+        seg = rp.slice()
+        if wait_persist:
+            rp.persisted(n)
+    return {"response": response_record(resp), "reused": reused_of(seg)}, root, (round(load, 1), round(time.monotonic() - t0, 1))
+
+
+def main_quick_ssd(a, spec, pack):
+    """Files the base binary wrote to the SSD tier must restore unchanged under the binary being checked."""
+    base = Path(a.base).expanduser()
+    base.mkdir(parents=True, exist_ok=True)
+    flags = spec["slots"] + ["--prefix-cache-mem", "off", "--prefix-cache-disk", "4GB"]
+    label = f"tape-ssd-{a.pack}"
+    snap, tape_file = base / "ssd-cache", base / "ssd.json"
+    t0 = time.monotonic()
+    if a.mode == "record":
+        shutil.rmtree(snap, ignore_errors=True)
+        _, root, ta = ssd_boot(label + "-write", pack, flags, wait_persist=True)
+        shutil.copytree(root, snap, symlinks=True)
+        files = file_hashes(snap)
+        ref, _, tb = ssd_boot(label + "-restore", pack, flags, cache_src=snap)
+        if not ref["reused"] or ref["reused"][2] != "SSD":
+            raise AssertionError(f"the reference boot did not restore from SSD: {ref['reused']}")
+        tape_file.write_text(json.dumps({"pack": pack.name, "ref": ref, "files": files}, indent=1, ensure_ascii=False) + "\n")
+        print(f"timeline write(load={ta[0]}s total={ta[1]}s) restore(load={tb[0]}s total={tb[1]}s) all={round(time.monotonic() - t0, 1)}s")
+        print(f"recorded ssd reference ({len(files)} cache files, reused {ref['reused']}) to {tape_file}")
+        return 0
+    want = json.loads(tape_file.read_text())
+    got, _, tb = ssd_boot(label + "-restore", pack, flags, cache_src=snap)
+    d = ssd_verdict(want["ref"], got)
+    _, root, ta = ssd_boot(label + "-write", pack, flags, wait_persist=True)
+    changed, only_base, only_new = cache_file_diff(want["files"], file_hashes(root))
+    print(f"timeline restore(load={tb[0]}s total={tb[1]}s) write(load={ta[0]}s total={ta[1]}s) all={round(time.monotonic() - t0, 1)}s")
+    print(f"info: a fresh cache from this binary: {len(changed)} files differ, {len(only_base)} only in base, {len(only_new)} only in new"
+          + "".join(f"\n  differs {k}" for k in changed[:10]))
+    print("DIFF " + d if d else "IDENTICAL: the base binary's SSD cache restores to the reference")
+    return 1 if d else 0
+
+
 def main_quick(a, pack):
     base = Path(a.base).expanduser()
     base.mkdir(parents=True, exist_ok=True)
     if a.blocks == "capture":
         return main_quick_capture(a, PACKS[a.pack], pack)
+    if a.blocks == "ssd":
+        return main_quick_ssd(a, PACKS[a.pack], pack)
     tape_file = base / "tape.json"
     entries, timeline = run_quick(a.pack, pack)
     print("timeline " + " ".join(f"{n}={s}s" for n, s in timeline))

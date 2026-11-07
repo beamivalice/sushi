@@ -101,6 +101,23 @@ class Tape(unittest.TestCase):
         self.assertEqual(len(m["y"]["runs"]), 2)
 
 
+    def test_ssd_restore_names_what_differs(self):
+        ref = {"response": entry()["response"], "reused": [96, 100, "SSD"]}
+        self.assertIsNone(tape.ssd_verdict(ref, dict(ref)))
+        self.assertIn("no restore from SSD", tape.ssd_verdict(ref, {**ref, "reused": None}))
+        self.assertIn("no restore from SSD", tape.ssd_verdict(ref, {**ref, "reused": [96, 100, "the live state"]}))
+        self.assertIn("reused [64, 100, 'SSD'] vs [96, 100, 'SSD']", tape.ssd_verdict(ref, {**ref, "reused": [64, 100, "SSD"]}))
+        self.assertIn("position 1", tape.ssd_verdict(ref, {**ref, "response": entry(("a", "z", "c"))["response"]}))
+
+    def test_cache_file_diff_and_reused_line(self):
+        self.assertEqual(tape.cache_file_diff({"a": "1", "b": "2", "c": "3"}, {"a": "1", "b": "9", "d": "4"}),
+                         (["b"], ["c"], ["d"]))
+        self.assertEqual(tape.reused_of("x\n[prefix] reused 96 of 100 prompt tokens from SSD, prefilling 4"), [96, 100, "SSD"])
+        self.assertEqual(tape.reused_of("[dsv41-prefix] reused 1 of 9 prompt tokens from the live state, prefilling 8"),
+                         [1, 9, "the live state"])
+        self.assertIsNone(tape.reused_of("nothing here"))
+
+
 if __name__ == "__main__":
     out = io.StringIO()
     result = unittest.TextTestRunner(stream=out, verbosity=0).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tape))
