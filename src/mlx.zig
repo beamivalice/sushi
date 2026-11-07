@@ -119,11 +119,33 @@ pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
 
 // Array info
 pub extern "c" fn mlx_array_tostring(str: *mlx_string, arr: mlx_array) c_int;
-pub extern "c" fn mlx_array_ndim(arr: mlx_array) usize;
-pub extern "c" fn mlx_array_shape(arr: mlx_array) [*]const c_int;
+const array_info = struct {
+    extern "c" fn mlx_array_ndim(arr: mlx_array) usize;
+    extern "c" fn mlx_array_shape(arr: mlx_array) [*]const c_int;
+    extern "c" fn mlx_array_size(arr: mlx_array) usize;
+    extern "c" fn mlx_array_dtype(arr: mlx_array) mlx_dtype;
+};
+
+/// TEST-ONLY count of the array shape, size and dtype queries (each is an FFI call); a release build carries no counter.
+pub var query_count: u64 = 0;
+
+pub inline fn mlx_array_ndim(arr: mlx_array) usize {
+    if (comptime builtin.is_test) query_count += 1;
+    return array_info.mlx_array_ndim(arr);
+}
+pub inline fn mlx_array_shape(arr: mlx_array) [*]const c_int {
+    if (comptime builtin.is_test) query_count += 1;
+    return array_info.mlx_array_shape(arr);
+}
+pub inline fn mlx_array_size(arr: mlx_array) usize {
+    if (comptime builtin.is_test) query_count += 1;
+    return array_info.mlx_array_size(arr);
+}
+pub inline fn mlx_array_dtype(arr: mlx_array) mlx_dtype {
+    if (comptime builtin.is_test) query_count += 1;
+    return array_info.mlx_array_dtype(arr);
+}
 pub extern "c" fn mlx_array_strides(arr: mlx_array) [*]const usize;
-pub extern "c" fn mlx_array_size(arr: mlx_array) usize;
-pub extern "c" fn mlx_array_dtype(arr: mlx_array) mlx_dtype;
 pub extern "c" fn mlx_array_eval(arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_itemsize(arr: mlx_array) usize;
 

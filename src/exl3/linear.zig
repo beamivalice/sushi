@@ -56,7 +56,84 @@ pub const SHARED_MAX: usize = 4;
 
 /// Linears that read the same rows, stacked along the output into one bank: trellis `[1, in/16, out/16, n]`, `suh`
 /// `[S, in]` (one row per linear), `svh` `[1, out]`; linear s owns columns `cols[s]..cols[s + 1]`, each a multiple of 128.
-pub const Shared = struct { p: root.Proj, cols: [SHARED_MAX + 1]c_int, count: usize };
+pub const Shared = struct { p: root.Proj, cols: [SHARED_MAX + 1]c_int, count: usize, geo: ?*const Geo = null };
+
+/// What a one-bank trunk linear's decode-width launches need from its weight, read once when the weight is bound: the
+/// shape and rate, and per row count the launch geometry and its pinned configs (for `bf16` inputs, the trunk's).
+/// A launch that finds no entry runs as `linearWith` does, reading the shapes off its operands.
+pub const Geo = struct {
+    in: c_int,
+    out: c_int,
+    n: u32,
+    rows: [@intCast(project_rows.NAX_ROWS_MAX)]?Row = @splat(null),
+    /// What `init` was asked, which names the geo in `get`.
+    key: Key = .{},
+
+    const Key = struct { shape: [4]c_int = @splat(0), dtype: mlx.mlx_dtype = .uint16, bounds: ?[3]c_int = null, nax: bool = false };
+
+    pub const Row = struct { g: project_rows.RowsGeom, pin: project_rows.PinnedCfg };
+
+    /// `trellis` is `[1, in/16, out/16, n]`; `bounds` are the segment bounds of a stacked bank. A weight the multi-row
+    /// kernels do not take gets an empty geo.
+    pub fn init(trellis: mlx.mlx_array, bounds: ?[3]c_int) !Geo {
+        var geo: Geo = .{ .in = 0, .out = 0, .n = 0 };
+        const ts = mlx.getShape(trellis);
+        if (ts.len == 4) geo.key = .{ .shape = ts[0..4].*, .dtype = mlx.mlx_array_dtype(trellis), .bounds = bounds, .nax = kernels.gemmNaxOn() };
+        if (ts.len != 4 or ts[0] != 1 or mlx.mlx_array_dtype(trellis) != .uint16) return geo;
+        const in = ts[1] * 16;
+        const out = ts[2] * 16;
+        if (@rem(in, 128) != 0 or @rem(out, 128) != 0) return geo;
+        const rate = kernels.packedRate(ts[3]) catch return geo;
+        geo.in = in;
+        geo.out = out;
+        geo.n = rate.n;
+        for (&geo.rows, 1..) |*slot, rows| {
+            const g = project_rows.rowsGeometry(in, out, @intCast(rows), 1, .{ .exact = true });
+            if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) continue;
+            slot.* = .{ .g = g, .pin = try project_rows.pinCfg(.{ .in_dim = in, .out_dim = out, .rows = @intCast(rows), .groups = 1, .n = rate.n, .out_dt = .bfloat16 }, g, bounds) };
+        }
+        return geo;
+    }
+
+    /// The geo of a bank of `trellis`'s shape, made on first ask and kept for the process beside the configs it pins
+    /// (banks of one shape share it), so a `Linear` holds a pointer. Not locked: ask on the MLX-owning thread.
+    pub fn get(trellis: mlx.mlx_array, bounds: ?[3]c_int) !*const Geo {
+        const ts = mlx.getShape(trellis);
+        if (ts.len != 4) return &empty_geo;
+        const key: Key = .{ .shape = ts[0..4].*, .dtype = mlx.mlx_array_dtype(trellis), .bounds = bounds, .nax = kernels.gemmNaxOn() };
+        for (geos.items) |g| if (std.meta.eql(g.key, key)) return g;
+        const made = try std.heap.smp_allocator.create(Geo);
+        errdefer std.heap.smp_allocator.destroy(made);
+        made.* = try init(trellis, bounds);
+        try geos.append(std.heap.smp_allocator, made);
+        return made;
+    }
+
+    /// The launch of `rows` rows, or null when it is not one the multi-row kernels serve.
+    pub fn row(self: *const Geo, rows: c_int) ?Row {
+        if (rows < 1 or rows > project_rows.NAX_ROWS_MAX) return null;
+        return self.rows[@intCast(rows - 1)];
+    }
+
+    pub fn launch(self: *const Geo, rows: c_int) project_rows.RowsLaunch {
+        return .{ .in_dim = self.in, .out_dim = self.out, .rows = rows, .groups = 1, .n = self.n, .out_dt = .bfloat16 };
+    }
+};
+
+var geos: std.ArrayList(*const Geo) = .empty;
+const empty_geo: Geo = .{ .in = 0, .out = 0, .n = 0 };
+
+/// `x` [rows, in] in bf16 through the one-bank projection `p` whose `geo` holds the launch, or null when it does not:
+/// the rows past the multi-row arm, a `force_arm` seam, a weight `geo` is empty for, a NAX launch after the NAX latch
+/// set (the shape-reading path then picks the SIMD arm). [rows, out] otherwise, as `linearWith`.
+pub fn linearGeo(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, p: root.Proj, geo: *const Geo, dec: exl3.Decode, opts: Opts) !?mlx.mlx_array {
+    if (force_arm != null or rows > project_rows.rowsMax(opts.rows)) return null;
+    const r = geo.row(rows) orelse return null;
+    if (r.g.nax and !kernels.gemmNaxOn()) return null;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    return try project_rows.launchRows(s, x, p.trellis, p.suh, p.svh, geo.launch(rows), r.g, try project_rows.rowsKernel(r.g), null, r.pin);
+}
 
 /// `x` [rows, in] (rows <= `project_rows.rowsMax(opts.rows)`) through every linear of `sh` in one multi-row launch: `outs[s]` is
 /// linear s's [rows, width] in x's dtype (the caller frees each). A row holds the bar of its own linear's launch; the
@@ -75,6 +152,30 @@ pub fn linearSharedWith(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: ex
     for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
     const flat = try project_rows.projectRowsSegmented(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, bounds, opts.rows);
     defer _ = mlx.mlx_array_free(flat);
+    try splitShared(s, flat, rows, sh, outs);
+}
+
+/// `linearSharedWith` for bf16 `x` [rows, in] whose `sh.geo` holds the launch; false, with nothing made, when it does not.
+pub fn linearSharedGeo(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, sh: Shared, dec: exl3.Decode, outs: []mlx.mlx_array, opts: Opts) !bool {
+    const geo = sh.geo orelse return false;
+    if (rows > project_rows.rowsMax(opts.rows)) return false;
+    const r = geo.row(rows) orelse return false;
+    if (r.g.nax and !kernels.gemmNaxOn()) return false;
+    if (outs.len != sh.count) return error.BadExl3Shape;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    var bounds: [3]c_int = @splat(sh.cols[sh.count]);
+    for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
+    const y = try project_rows.launchRows(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, geo.launch(rows), r.g, try project_rows.rowsKernel(r.g), bounds, r.pin);
+    defer _ = mlx.mlx_array_free(y);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, y, &[_]c_int{rows * geo.out}, 1, s));
+    try splitShared(s, flat, rows, sh, outs);
+    return true;
+}
+
+fn splitShared(s: mlx.mlx_stream, flat: mlx.mlx_array, rows: c_int, sh: Shared, outs: []mlx.mlx_array) !void {
     var made: usize = 0;
     errdefer for (outs[0..made]) |o| {
         _ = mlx.mlx_array_free(o);

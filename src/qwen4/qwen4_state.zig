@@ -33,7 +33,8 @@ pub fn load(
     var extra: std.ArrayList(mlx.mlx_array) = .empty;
     defer extra.deinit(allocator);
     var mb: [160]u8 = undefined;
-    const mixer = try layer_weights.loadHcWeights(weights, std.fmt.bufPrint(&mb, "{s}.hyper_connection_mixer", .{prefix}) catch unreachable, false, config.hc_count, config.hidden_size, &extra, allocator, s);
+    var mixer = try layer_weights.loadHcWeights(weights, std.fmt.bufPrint(&mb, "{s}.hyper_connection_mixer", .{prefix}) catch unreachable, false, config.hc_count, config.hidden_size, &extra, allocator, s);
+    try layer_weights.bindLinears(&mixer, &config);
     if (extra.items.len > 0) {
         const old = owned_bf16.* orelse &[_]mlx.mlx_array{};
         const merged = try std.mem.concat(allocator, mlx.mlx_array, &.{ old, extra.items });

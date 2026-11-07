@@ -325,6 +325,15 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
 or from 1024 rows the decoded path below.
 `decodeDense` is the host twin a test multiplies beside it.
 
+- **A trunk bank carries its launch (`linear.Geo`).** `Geo.get(trellis, bounds)` reads a one-bank (or stacked) trellis's
+  shape and rate once, and for each row count 1 to 16 the exact-mode launch geometry and its kernel configs, pinned for
+  good (`project_rows.pinCfg`); banks of one shape share one geo, kept for the process. `trunk.matmulGeo` and
+  `linear.linearSharedGeo` launch from it for bf16 inputs up to the multi-row arm's rows and cost the activation's
+  shape and dtype; `trunk.fuse` fills a stack's `Shared.geo`. Anything else (another dtype, wider rows, the `force_arm`
+  seam, an empty geo, a NAX launch once `gemm_nax_failed` is set) runs `matmul` / `linearSharedWith` as before, with the
+  same bytes (`project_rows.projectRowsWith` is `launchRows` after it reads the shapes). The geometry follows
+  `gemmNaxOn()` as read when the bank was bound; the latch is checked again on every launch.
+
 - **From 1024 rows a billed one-bank linear decodes its bank once to f16 and runs MLX's GEMM** (`trunk_gemm`, Flash-Next's
   `trunk.matmul` passes `Opts.decoded_billed`). The sorted GEMM decodes the whole bank again for each 32-row window. MLX's
   regular NAX GEMM sums each output in the same order (16x32x16 MMAs, k ascending, one f32 accumulator, stored f16), so

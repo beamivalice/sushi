@@ -96,6 +96,11 @@ pub fn configFree(cfg: mlx.mlx_fast_metal_kernel_config) void {
 
 pub fn apply(k: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, cfg: mlx.mlx_fast_metal_kernel_config) void {
     if (!on()) return;
+    // The tracking reads each input's shape and dtype; the engine's own query count excludes that.
+    const queries = mlx.query_count;
+    defer if (comptime builtin.is_test) {
+        mlx.query_count = queries;
+    };
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(gpa);
     _ = std.c.pthread_mutex_lock(&mu);

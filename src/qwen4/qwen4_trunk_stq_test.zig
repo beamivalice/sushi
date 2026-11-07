@@ -20,6 +20,10 @@ const ModelConfig = model_mod.ModelConfig;
 const Qwen4TestSlot = qwen4_test_support.Qwen4TestSlot;
 const Transformer = trf.Transformer;
 const Weights = model_mod.Weights;
+const Linear = @import("../linear.zig").Linear;
+const layer_weights = @import("../layer_weights.zig");
+const bindLinears = layer_weights.bindLinears;
+const mlx_util = @import("../mlx_util.zig");
 
 /// A trellis projection through the kernels against its host-decoded dense twin in bf16: the kernels' bar plus the
 /// twin's own weight rounding (a GDN layer on it measures 3.6e-3 and 4.7e-3).
@@ -70,20 +74,20 @@ test "trunk STQ: qmatmul serves a trellis triple as its decoded dense twin and r
     defer free(stq);
     const twin = try bank.twin(arena.allocator(), dec, s);
     defer free(twin);
+    const stq_lin = try Linear.bind(&xfm.config, stq.w, stq.s, stq.b);
+    const twin_lin = try Linear.bind(&xfm.config, twin.w, twin.s, twin.b);
     for ([_]c_int{ 1, 3, 40 }) |rows| {
         const x = try rand(prng.random(), &.{ 1, rows, 256 }, 4.0, s);
         defer _ = mlx.mlx_array_free(x);
-        const got = try xfm.qmatmul(x, stq.w, stq.s, stq.b);
+        const got = try xfm.qmatmul(x, &stq_lin);
         defer _ = mlx.mlx_array_free(got);
-        const want = try xfm.qmatmul(x, twin.w, twin.s, twin.b);
+        const want = try xfm.qmatmul(x, &twin_lin);
         defer _ = mlx.mlx_array_free(want);
         try testing.expectEqualSlices(c_int, &.{ 1, rows, 384 }, mlx.getShape(got));
         try testing.expect(try relRms(s, got, want) < STQ_PROJECTION_BAR);
     }
     xfm.config.trunk_quant = null;
-    const x = try rand(prng.random(), &.{ 1, 1, 256 }, 4.0, s);
-    defer _ = mlx.mlx_array_free(x);
-    try testing.expectError(error.TrunkQuantMissing, xfm.qmatmul(x, stq.w, stq.s, stq.b));
+    try testing.expectError(error.TrunkQuantMissing, Linear.bind(&xfm.config, stq.w, stq.s, stq.b));
 }
 
 test "trunk STQ: the joined decode and verify projections decline a trellis triple and leave it to the per-slot path" {
@@ -281,18 +285,20 @@ test "trunk STQ: a trellis lm_head reads through the full head and keeps no coar
     xfm.lm_head_w = head.w;
     xfm.lm_head_s = head.s;
     xfm.lm_head_b = head.b;
+    xfm.lm_head = try Linear.bind(&xfm.config, head.w, head.s, head.b);
+    const twin_lin = try Linear.bind(&xfm.config, twin.w, twin.s, twin.b);
     try testing.expectEqual(@as(c_int, 1024), xfm.lmHeadRows());
 
     const x = try rand(rnd, &.{ 3, 1, 128 }, 4.0, s);
     defer _ = mlx.mlx_array_free(x);
-    const want = try xfm.qmatmul(x, twin.w, twin.s, twin.b);
+    const want = try xfm.qmatmul(x, &twin_lin);
     defer _ = mlx.mlx_array_free(want);
     const logits = try xfm.lmHeadProject(x, false);
     defer _ = mlx.mlx_array_free(logits);
     try testing.expectEqualSlices(c_int, &.{ 3, 1, 1024 }, mlx.getShape(logits));
     try testing.expect(try relRms(s, logits, want) < STQ_PROJECTION_BAR);
     // The per-row head the MTP block reads, one row at a time through the same bank.
-    const rows = try xfm.mtpProjectionRows(x, xfm.lm_head_w, xfm.lm_head_s, xfm.lm_head_b, true);
+    const rows = try xfm.mtpProjectionRows(x, &xfm.lm_head, true);
     defer _ = mlx.mlx_array_free(rows);
     try testing.expect(try relRms(s, rows, want) < STQ_PROJECTION_BAR);
 
@@ -302,7 +308,7 @@ test "trunk STQ: a trellis lm_head reads through the full head and keeps no coar
     defer _ = mlx.mlx_array_free(x1);
     const picked = try mtp_mod.fullReadoutArgmax(s, &xfm, x1, null);
     defer _ = mlx.mlx_array_free(picked);
-    const truth = try xfm.qmatmul(x1, twin.w, twin.s, twin.b);
+    const truth = try xfm.qmatmul(x1, &twin_lin);
     defer _ = mlx.mlx_array_free(truth);
     const truth_host = try qwen4ReadF32(testing.allocator, truth, s);
     defer testing.allocator.free(truth_host);
@@ -441,20 +447,22 @@ fn attnTwinCase(stacked: bool) !void {
     const k_norm = try rand(rnd, &.{128}, 2.0, s);
     defer _ = mlx.mlx_array_free(k_norm);
     const none: mlx.mlx_array = .{ .ctx = null };
-    const fa_stq = FullAttnWeights{
+    var fa_stq = FullAttnWeights{
         .q_w = stq[0].w, .q_s = stq[0].s, .q_b = stq[0].b,
         .k_w = stq[1].w, .k_s = stq[1].s, .k_b = stq[1].b,
         .v_w = stq[2].w, .v_s = stq[2].s, .v_b = stq[2].b,
         .o_w = stq[3].w, .o_s = stq[3].s, .o_b = stq[3].b,
         .q_norm = q_norm, .k_norm = k_norm, .qkv_stack = stack,
     };
-    const fa_twin = FullAttnWeights{
+    var fa_twin = FullAttnWeights{
         .q_w = twin[0].w, .q_s = none, .q_b = none,
         .k_w = twin[1].w, .k_s = none, .k_b = none,
         .v_w = twin[2].w, .v_s = none, .v_b = none,
         .o_w = twin[3].w, .o_s = none, .o_b = none,
         .q_norm = q_norm, .k_norm = k_norm,
     };
+    try bindLinears(&fa_stq, &xfm.config);
+    try bindLinears(&fa_twin, &xfm.config);
     const slots = [2]*Qwen4TestSlot{ try Qwen4TestSlot.init(testing.allocator, 1), try Qwen4TestSlot.init(testing.allocator, 1) };
     defer for (slots) |sl| sl.deinit(testing.allocator);
     // A prefill chunk past the stacked launch, a verify block, then single decode ticks.
@@ -568,7 +576,9 @@ fn gdnTwinCase(stacked: bool) !void {
     };
     var la_stq = withGdnProjections(&base, stq[0], stq[1], stq[2]);
     la_stq.qkvz_stack = stack;
-    const la_twin = withGdnProjections(&base, twin[0], twin[1], twin[2]);
+    var la_twin = withGdnProjections(&base, twin[0], twin[1], twin[2]);
+    try bindLinears(&la_stq, &xfm.config);
+    try bindLinears(&la_twin, &xfm.config);
     const conv0 = try rand(rnd, &.{ 1, 3, c_dim }, 4.0, s);
     defer _ = mlx.mlx_array_free(conv0);
     const state_bf = try rand(rnd, &.{ 1, hv, 128, 128 }, 1.0, s);
@@ -594,4 +604,111 @@ fn gdnTwinCase(stacked: bool) !void {
         defer _ = mlx.mlx_array_free(want);
         try testing.expect(try relRms(s, got, want) < STQ_PROJECTION_BAR);
     }
+}
+
+test "trunk: a scales key resolved with an input-width hint keeps those parameters for an unhinted ask" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var xfm = bareTransformer(s, cache);
+    xfm.config.quant_bits = 4;
+    xfm.config.quant_group_size = 64;
+    xfm.config.quant_mode = .affine;
+    const cell = try testing.allocator.create(layer_weights.BitsCache);
+    defer testing.allocator.destroy(cell);
+    cell.* = .{};
+    xfm.bits_cache = cell;
+    var prng = std.Random.DefaultPrng.init(0x7a21);
+    const dense = try rand(prng.random(), &.{ 64, 256 }, 1.0, s);
+    defer _ = mlx.mlx_array_free(dense);
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    // 8-bit, group 32 beside a 4-bit, group 64 model.
+    try mlx.check(mlx.mlx_quantize(&parts, dense, .{ .value = 32, .has_value = true }, .{ .value = 8, .has_value = true }, "affine", .{ .ctx = null }, s));
+    var q: [3]mlx.mlx_array = undefined;
+    for (&q, 0..) |*a, i| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(a, parts, i));
+    }
+    defer for (q) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const view: *const Transformer = &xfm;
+    const hinted = view.quantParamsHinted(q[0], q[1], 256);
+    try testing.expectEqual(@as(u32, 8), hinted.bits);
+    try testing.expectEqual(@as(u32, 32), hinted.group_size);
+    // Without the cached entry the unhinted solve is another pair, which is wrong output on this tensor.
+    const bare = layer_weights.computeQuantParams(&xfm.config, q[0], q[1], null);
+    try testing.expect(bare.bits != hinted.bits or bare.group_size != hinted.group_size);
+    const again = view.quantParamsFor(q[0], q[1]);
+    try testing.expectEqual(hinted.bits, again.bits);
+    try testing.expectEqual(hinted.group_size, again.group_size);
+}
+
+test "trunk: a dense head projects through the loaded view and a trunk without one leaves its fields alone" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var xfm = bareTransformer(s, cache);
+    var prng = std.Random.DefaultPrng.init(0x7a22);
+    const rnd = prng.random();
+    const head = try rand(rnd, &.{ 96, 64 }, 1.0, s);
+    defer _ = mlx.mlx_array_free(head);
+    xfm.lm_head_w = head;
+    xfm.lm_head_s = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xfm.lm_head_s);
+    const x = try rand(rnd, &.{ 2, 1, 64 }, 1.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const alone = try xfm.lmHeadProject(x, false);
+    defer _ = mlx.mlx_array_free(alone);
+    try testing.expect(xfm.lm_head_wt.ctx == null);
+    xfm.lm_head_wt = try mlx_util.transposeBf16Weight(head, s);
+    defer _ = mlx.mlx_array_free(xfm.lm_head_wt);
+    const view = xfm.lm_head_wt;
+    const viewed = try xfm.lmHeadProject(x, false);
+    defer _ = mlx.mlx_array_free(viewed);
+    try testing.expectEqual(view.ctx, xfm.lm_head_wt.ctx);
+    try testing.expect(try relRms(s, viewed, alone) < 1e-6);
+}
+
+test "trunk: loading and unloading a second trunk leaves the first's cached constants usable" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var cache_a = try KVCache.init(testing.allocator, 0);
+    defer cache_a.deinit();
+    var cache_b = try KVCache.init(testing.allocator, 0);
+    defer cache_b.deinit();
+    var a = bareTransformer(s, cache_a);
+    var b = bareTransformer(s, cache_b);
+    a.one = mlx_util.bf16Scalar(1.0, s);
+    defer _ = mlx.mlx_array_free(a.one);
+    b.one = mlx_util.bf16Scalar(1.0, s);
+    defer _ = mlx.mlx_array_free(b.one);
+    try a.attachCells();
+    defer a.releaseCells();
+    try b.attachCells();
+
+    const before = try a.createSlidingWindowMask(6, 6, 3);
+    defer _ = mlx.mlx_array_free(before);
+    try testing.expect(a.consts.?.mask_zero != null);
+    const theirs = try b.createSlidingWindowMask(6, 6, 3);
+    _ = mlx.mlx_array_free(theirs);
+    b.releaseCells();
+
+    const after = try a.createSlidingWindowMask(6, 6, 3);
+    defer _ = mlx.mlx_array_free(after);
+    var same = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(same);
+    try mlx.check(mlx.mlx_array_equal(&same, before, after, false, s));
+    var ok = false;
+    try mlx.check(mlx.mlx_array_item_bool(&ok, same));
+    try testing.expect(ok);
+    // The scalar the first trunk cached is still a live array.
+    var zero = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zero);
+    try mlx.check(mlx.mlx_astype(&zero, a.consts.?.mask_zero.?, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(zero));
+    try testing.expectEqual(@as(f32, 0), (mlx.mlx_array_data_float32(zero) orelse return error.Unreadable)[0]);
 }

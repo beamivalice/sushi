@@ -30,7 +30,8 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `qwen4/gdn_decode.zig` | fused GDN decode/verify step (one dispatch) | engine-kernels |
 | `mimo2/mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, stamp check | mimo2-arch |
 | `expert_store.zig` / `expert_drop.zig` / `exl3/pack.zig` | expert layouts and `QuantStore` (byte spans of every routed bank), the `--drop-expert` set, EXL3/STQ pack reading (std only); `expert_quant.zig` re-exports the store | engine-expert-streaming |
-| `exl3/` (`sushi_exl3` module) | EXL3/STQ decoders and kernels, rate groups, dense linears; `exl3/trunk.zig` the trellis trunk math (matmul, fuse, sharedProject); no file or pub name there names an architecture | engine-exl3-experts |
+| `exl3/` (`sushi_exl3` module) | EXL3/STQ decoders and kernels, rate groups, dense linears; `exl3/trunk.zig` the trellis trunk math (matmul, matmulGeo, fuse, sharedProject) and `linear.Geo`, a trunk bank's shapes and launch configs read once; no file or pub name there names an architecture | engine-exl3-experts |
+| `linear.zig` | `Linear`: a trunk projection as dense, affine, FP8 block or trellis, bound once from the weight triple (`layer_weights.bindLayer`) and applied with a tag switch by `Trunk.qmatmul` | engine-kernels |
 | `trunk_stq.zig` | the weight-map binding of the trellis trunk banks (`load`, `drop`); re-exports `exl3/trunk.zig` | engine-exl3-experts |
 | `encoder/` | `sushi convert exl3`: trellis search, source readers, trunk/shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
 | `expert_stream.zig` / `prefetch_plan.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |

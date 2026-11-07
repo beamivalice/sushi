@@ -6,6 +6,7 @@ const gdn_decode = @import("gdn_decode.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
 const trunk_stq = @import("../trunk_stq.zig");
+const bindLinears = @import("../layer_weights.zig").bindLinears;
 const sushi_exl3 = @import("sushi_exl3");
 const testing = std.testing;
 const test_support = @import("../test_support.zig");
@@ -2248,6 +2249,7 @@ fn gdnRecurLayerCase(wide: bool, proj: GdnProjections) !void {
         la.out_b = banks[2].b;
         la.qkvz_stack = stack;
     }
+    try bindLinears(&la, &xfm.config);
     const conv0 = try gdnRecurRand(rnd, &.{ 1, 3, c_dim }, 4.0, .bfloat16, s);
     defer _ = mlx.mlx_array_free(conv0);
     const state0 = try gdnRecurRand(rnd, &.{ 1, hv, 128, 128 }, 1.0, if (wide) .float32 else .bfloat16, s);
@@ -2471,7 +2473,7 @@ fn gdnDecayCase(state_f32: bool) !void {
     var ones_norm = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_ones(&ones_norm, &[_]c_int{128}, 1, .bfloat16, s));
     var prng = std.Random.DefaultPrng.init(0xDECA7);
-    const la = LinearAttnWeights{
+    var la = LinearAttnWeights{
         .qkv_w = zeros[0],
         .qkv_s = .{},
         .qkv_b = .{},
@@ -2492,6 +2494,7 @@ fn gdnDecayCase(state_f32: bool) !void {
         .out_s = .{},
         .out_b = .{},
     };
+    try bindLinears(&la, &xfm.config);
     defer inline for (.{ la.qkv_w, la.z_w, la.a_w, la.b_w, la.conv1d_w, la.A_log, la.dt_bias, la.norm_w, la.out_w }) |arr| {
         _ = mlx.mlx_array_free(arr);
     };
@@ -2702,8 +2705,8 @@ pub fn gatedDeltaNetProjected(
         const proj = try self.gdnProjGpu(x, la);
         qkv = proj.qkv;
         z_proj = proj.z;
-        a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
-        b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
+        a_proj = try self.qmatmul(x, &la.a);
+        b_proj = try self.qmatmul(x, &la.b);
     }
     // Scale scalars + the parameter-free rms_norm ones-weight (mlx-c
     // requires a non-empty weight) are cached on the Transformer — they
@@ -2769,7 +2772,7 @@ pub fn gatedDeltaNetProjected(
                     gdn_verify_fold_engaged = true;
                     log.info("[gdn] verify fold engaged: S={d} Hk={d} Hv={d}\n", .{ seq_len, num_k_heads, num_v_heads });
                 }
-                return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, la.out_w, la.out_s, la.out_b);
+                return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, &la.out);
             }
         }
         var r = (try gdn_decode.step(geo, seq_len, inputs, false, self.s)) orelse break :recur;
@@ -2804,7 +2807,7 @@ pub fn gatedDeltaNetProjected(
             once.* = true;
             log.info("[gdn] {s} recur engaged: S={d} Hk={d} Hv={d}\n", .{ if (seq_len == 1) "decode" else "verify", seq_len, num_k_heads, num_v_heads });
         }
-        return if (skip_output) standinRef(flat) else self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
+        return if (skip_output) standinRef(flat) else self.qmatmul(flat, &la.out);
     }
 
     var q_scaled = mlx.mlx_array_new();
@@ -3122,7 +3125,7 @@ pub fn gatedDeltaNetProjected(
         if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
         if (try gdnNormGateFused(self.s, y_bthd, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, batch, seq_len)) |flat| {
             defer _ = mlx.mlx_array_free(flat);
-            return if (skip_output) standinRef(flat) else self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
+            return if (skip_output) standinRef(flat) else self.qmatmul(flat, &la.out);
         }
     }
 
@@ -3153,7 +3156,7 @@ pub fn gatedDeltaNetProjected(
     defer _ = mlx.mlx_array_free(out_flat);
     try mlx.check(mlx.mlx_reshape(&out_flat, out_gated, &out_flat_shape, 3, self.s));
 
-    return if (skip_output) standinRef(out_flat) else self.qmatmul(out_flat, la.out_w, la.out_s, la.out_b);
+    return if (skip_output) standinRef(out_flat) else self.qmatmul(out_flat, &la.out);
 }
 
 /// Prepends cached conv state, applies depthwise conv1d, updates cache.
@@ -3332,9 +3335,9 @@ pub fn computeGdnGate(self: *const Transformer, A_log: mlx.mlx_array, a: mlx.mlx
 
 pub fn gdnProjGpu(self: *Transformer, x: mlx.mlx_array, la: *const LinearAttnWeights) !GdnProj {
     if (try self.stackedPair(x, la.qkvz_stack)) |pair| return .{ .qkv = pair[0], .z = pair[1] };
-    const qkv = try self.qmatmul(x, la.qkv_w, la.qkv_s, la.qkv_b);
+    const qkv = try self.qmatmul(x, &la.qkv);
     errdefer _ = mlx.mlx_array_free(qkv);
-    const z = try self.qmatmul(x, la.z_w, la.z_s, la.z_b);
+    const z = try self.qmatmul(x, &la.z);
     return .{ .qkv = qkv, .z = z };
 }
 
@@ -3907,7 +3910,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
     xfm.config.rms_norm_eps = 1e-6;
     var prng = std.Random.DefaultPrng.init(0xF32);
     const rnd = prng.random();
-    const la = LinearAttnWeights{
+    var la = LinearAttnWeights{
         .qkv_w = try gdnRecurRand(rnd, &.{ hidden, c_dim }, 0.5, .bfloat16, s),
         .qkv_s = .{},
         .qkv_b = .{},
@@ -3928,6 +3931,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
         .out_s = .{},
         .out_b = .{},
     };
+    try bindLinears(&la, &xfm.config);
     defer inline for (.{ la.qkv_w, la.z_w, la.a_w, la.b_w, la.conv1d_w, la.A_log, la.dt_bias, la.norm_w, la.out_w }) |arr| {
         _ = mlx.mlx_array_free(arr);
     };

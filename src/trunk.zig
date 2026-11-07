@@ -50,6 +50,8 @@ const moe_router = @import("moe_router.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
 const moe_stream_compute = @import("moe_stream_compute.zig");
 const layer_weights = @import("layer_weights.zig");
+const linear_mod = @import("linear.zig");
+const Linear = linear_mod.Linear;
 const forward_diag = @import("forward_diag.zig");
 const GDN_FUSED_MAX_ROWS = qwen4_gdn.GDN_FUSED_MAX_ROWS;
 const GdnPrework = qwen4_gdn.GdnPrework;
@@ -786,6 +788,63 @@ pub const LinearTap = struct {
 /// The old name of the trunk, kept until the arch stages move their callers to `Trunk`.
 pub const Transformer = Trunk;
 
+/// Scalars and tables a forward would rebuild on every call, made on first use and kept to `deinitTrunk` (`TrunkCells`).
+const TrunkConsts = struct {
+    mask_zero: ?mlx.mlx_array = null,
+    mask_neg_inf: ?mlx.mlx_array = null,
+    /// 1/sqrt(2) in bf16, f16 and f32.
+    inv_sqrt2: [3]?mlx.mlx_array = @splat(null),
+    /// The non-YaRN rope spectra by (dims, theta).
+    rope_inv: [4]?struct { dims: c_int, theta: f32, arr: mlx.mlx_array } = @splat(null),
+
+    fn deinit(self: *TrunkConsts) void {
+        for ([_]?mlx.mlx_array{ self.mask_zero, self.mask_neg_inf }) |a| if (a) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
+        for (self.inv_sqrt2) |a| if (a) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
+        for (self.rope_inv) |e| if (e) |entry| {
+            _ = mlx.mlx_array_free(entry.arr);
+        };
+        self.* = .{};
+    }
+};
+
+/// The greedy shortlist's one-time log and the coarse head it reads: the head's one owner, so a failed shortlist retires
+/// it (`mtp_mod.retireCoarse`) for every reader.
+const ShortlistState = struct { logged: bool = false, coarse: ?mtp_mod.RerankCoarse = null };
+
+/// What a first use fills or a readout retires, behind pointers the trunk owns: a lookup holds `*const Trunk`, which the
+/// compiler may assume is never written, and a pointee is not const. Per trunk, never a module global: several trunks
+/// live at once (a drafter beside its target, resident models). A hand-built trunk has none (null cells): every call
+/// resolves directly and nothing is cached or retired.
+const TrunkCells = struct {
+    bits_cache: *BitsCache,
+    consts: *TrunkConsts,
+    shortlist: *ShortlistState,
+
+    fn create(allocator: std.mem.Allocator) !TrunkCells {
+        const bits_cache = try allocator.create(BitsCache);
+        errdefer allocator.destroy(bits_cache);
+        const consts = try allocator.create(TrunkConsts);
+        errdefer allocator.destroy(consts);
+        const shortlist = try allocator.create(ShortlistState);
+        bits_cache.* = .{};
+        consts.* = .{};
+        shortlist.* = .{};
+        return .{ .bits_cache = bits_cache, .consts = consts, .shortlist = shortlist };
+    }
+
+    fn destroy(self: TrunkCells, allocator: std.mem.Allocator) void {
+        self.consts.deinit();
+        mtp_mod.retireCoarse(&self.shortlist.coarse);
+        allocator.destroy(self.bits_cache);
+        allocator.destroy(self.consts);
+        allocator.destroy(self.shortlist);
+    }
+};
+
 pub const Trunk = struct {
     /// The arch this model was loaded as, stamped once by `life.init`; every dispatch reads it.
     arch: arch_registry.Tag = undefined,
@@ -802,7 +861,9 @@ pub const Trunk = struct {
     lm_head_w: mlx.mlx_array,
     lm_head_s: mlx.mlx_array,
     lm_head_b: mlx.mlx_array,
-    /// `[hidden, vocab]` view of a dense bf16 head, built on the inference thread by the first projection.
+    /// The head as the kind it is stored in; absent for a dense head, which `lmHeadProject` reads through a transposed view.
+    lm_head: Linear = .absent,
+    /// `[hidden, vocab]` view of a dense bf16 head, built at load; null-ctx for a head stored quantized.
     lm_head_wt: mlx.mlx_array = .{ .ctx = null },
 
 
@@ -862,8 +923,6 @@ pub const Trunk = struct {
     /// A coarse copy of this lm_head (MiMo, resident): an argmax-only forward shortlists its top-32
     /// on it and re-scores them through the full head. The MTP heads draft on the same copy, so a
     /// load with MTP and one without read the same greedy argmax.
-    lm_head_coarse: ?mtp_mod.RerankCoarse = null,
-    lm_head_coarse_logged: bool = false,
     /// Per-token cos|sin rows for the fused QK-norm+RoPE kernel, one slot per
     /// rope family (0 = default/sliding base, 1 = YaRN freqs). Keyed by
     /// offset: every layer of one decode step shares the row, the next token
@@ -978,7 +1037,10 @@ pub const Trunk = struct {
     // Used instead of config.quant_bits so mixed-precision models
     // with per-layer overrides work correctly while keeping zero per-call FFI overhead
     // after the first touch.
-    bits_cache: BitsCache = .{},
+    // Held by pointer because a lookup holds `*const Trunk` and fills it; null (a hand-built trunk) resolves every call.
+    bits_cache: ?*BitsCache = null,
+    consts: ?*TrunkConsts = null,
+    shortlist: ?*ShortlistState = null,
 
     // The loaded-model operations live in model_handle.zig; they keep their method names.
     pub const defaultCtx = model_handle.defaultCtx;
@@ -1155,7 +1217,8 @@ pub const Trunk = struct {
             allocator.free(loaded.ssm_entries);
         }
 
-        const bits_cache: BitsCache = .{};
+        const cells = try TrunkCells.create(allocator);
+        errdefer cells.destroy(allocator);
 
         // qwen4_exp: ones(hidden_size) for its weight-less RMS norm.
         var ones_hidden: ?mlx.mlx_array = null;
@@ -1228,6 +1291,12 @@ pub const Trunk = struct {
             });
         }
 
+        const lm_head_wt: mlx.mlx_array = if (lm_head_s.ctx == null and lm_head_w.ctx != null) try transposeBf16Weight(lm_head_w, s) else .{ .ctx = null };
+        errdefer if (lm_head_wt.ctx != null) {
+            _ = mlx.mlx_array_free(lm_head_wt);
+        };
+        const lm_head: Linear = if (lm_head_s.ctx == null) .absent else try Linear.bind(&config, lm_head_w, lm_head_s, lm_head_b);
+
         // Batch eval all weights
         {
             const eval_start = std.Io.Timestamp.now(io, .awake);
@@ -1253,8 +1322,8 @@ pub const Trunk = struct {
                     if (lw.ple) |*pw| appendStructArrays(all_vec, pw);
                     appendHybridMlpWeights(all_vec, &lw.mlp);
                     switch (lw.attn) {
-                        .full => |fa| appendFullAttnWeights(all_vec, &fa),
-                        .linear => |la| appendLinearAttnWeights(all_vec, &la),
+                        .full => |*fa| appendFullAttnWeights(all_vec, fa),
+                        .linear => |*la| appendLinearAttnWeights(all_vec, la),
                     }
                 }
             }
@@ -1300,6 +1369,7 @@ pub const Trunk = struct {
             .lm_head_w = lm_head_w,
             .lm_head_s = lm_head_s,
             .lm_head_b = lm_head_b,
+            .lm_head = lm_head,
             .owns_lm_head = owns_lm_head,
             .owns_norms = config.norm_has_offset,
             .decode_async_ladder = decodeAsyncLadderStride(
@@ -1323,7 +1393,10 @@ pub const Trunk = struct {
             .ssm_entries = ssm_entries,
             .moe_seq_offset = 0,
             .moe_owned_bf16 = moe_owned_bf16,
-            .bits_cache = bits_cache,
+            .bits_cache = cells.bits_cache,
+            .consts = cells.consts,
+            .shortlist = cells.shortlist,
+            .lm_head_wt = lm_head_wt,
         };
     }
 
@@ -1494,11 +1567,33 @@ pub const Trunk = struct {
         c.deinit();
     }
 
+    /// The coarse lm_head copy's slot (the shortlist cell's), or null for a trunk without cells.
+    pub fn coarseHead(self: *const Trunk) ?*?mtp_mod.RerankCoarse {
+        return if (self.shortlist) |l| &l.coarse else null;
+    }
+
+    /// Gives the trunk its cells, as `initTrunk` does; for a hand-built trunk that needs the lookups cached.
+    pub fn attachCells(self: *Trunk) !void {
+        std.debug.assert(self.bits_cache == null);
+        const cells = try TrunkCells.create(self.allocator);
+        self.bits_cache = cells.bits_cache;
+        self.consts = cells.consts;
+        self.shortlist = cells.shortlist;
+    }
+
+    pub fn releaseCells(self: *Trunk) void {
+        if (self.bits_cache) |b| if (self.consts) |c| if (self.shortlist) |l| {
+            (TrunkCells{ .bits_cache = b, .consts = c, .shortlist = l }).destroy(self.allocator);
+        };
+        self.bits_cache = null;
+        self.consts = null;
+        self.shortlist = null;
+    }
+
     /// The arch-neutral part of `deinit`; the arch frees its own state first (`life.deinit`).
     pub fn deinitTrunk(self: *Trunk) void {
         self.flushImatrix(); // `/v1/unload-model` reaches here on the inference thread
-        if (self.lm_head_coarse) |*rc| rc.deinit();
-        self.lm_head_coarse = null;
+        self.releaseCells();
         self.releaseJoinedVerifyLogits();
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
@@ -1557,17 +1652,13 @@ pub const Trunk = struct {
 
     // ── Core ops ──
 
-    pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
-        if (linear_tap) |tap| tap.record(tap.ctx, w, x);
-        // u8 codes + f32 tile scales = an FP8 source linear (`mimo_source`).
-        if (mlx.mlx_array_dtype(w) == .uint8) return fp8_block.linearServing(self.s, x, w, sc);
-        if (mlx.mlx_array_dtype(w) == .uint16) return trunk_stq.matmul(self.s, x, w, sc, bi, self.config.trunk_quant orelse return error.TrunkQuantMissing, self.spec_capture_ssm);
-        // Resolve (bits, group_size, mode) per weight. Most weights inherit the
-        // global config; per-weight overrides (mixed-precision checkpoints, e.g.
-        // affine 8-bit shared MLP inside an mxfp4 model) are detected on
-        // first touch — x's inner dim pins (bits, group_size) exactly.
-        const qp = self.quantParamsHinted(w, sc, lastDim(x));
-        return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
+    pub inline fn linearCtx(self: *const Trunk) linear_mod.Ctx {
+        return .{ .s = self.s, .config = &self.config, .wide = self.spec_capture_ssm };
+    }
+
+    pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, lin: *const Linear) !mlx.mlx_array {
+        if (linear_tap) |tap| tap.record(tap.ctx, lin.weight(), x);
+        return lin.apply(self.linearCtx(), x);
     }
 
     /// Final logits projection. For dense bf16 the lm_head weight is [vocab, hidden]
@@ -1578,35 +1669,39 @@ pub const Trunk = struct {
     /// MiMo's coarse shortlist (quantized); false = the full head.
     pub inline fn lmHeadProject(self: *const Trunk, x: mlx.mlx_array, argmax_only: bool) !mlx.mlx_array {
         if (self.lm_head_s.ctx == null) {
-            // A write through *const: safe only because the inference thread is the sole MLX caller.
-            const mut = @constCast(self);
-            if (mut.lm_head_wt.ctx == null) mut.lm_head_wt = try transposeBf16Weight(self.lm_head_w, self.s);
-            return qmatmulBits(x, self.lm_head_wt, .{}, .{}, 0, 64, .affine, self.s);
+            // Load built the view; a hand-built trunk has none and transposes per call.
+            var own: mlx.mlx_array = .{ .ctx = null };
+            defer if (own.ctx != null) {
+                _ = mlx.mlx_array_free(own);
+            };
+            if (self.lm_head_wt.ctx == null) own = try transposeBf16Weight(self.lm_head_w, self.s);
+            return qmatmulBits(x, if (own.ctx != null) own else self.lm_head_wt, .{}, .{}, 0, 64, .affine, self.s);
         }
         if (argmax_only) {
             if (try self.lmHeadShortlistFor(x)) |sparse| return sparse;
         }
-        return self.qmatmul(x, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+        return self.qmatmul(x, &self.lm_head);
     }
 
     /// Argmax-only readout on MiMo: the coarse head's top-32 per row, re-scored through the full head
     /// (a 32-row slice of the same qmv, so each value is the full readout's), every other id -inf.
     /// Serial ticks and verify rows take it alike; null keeps the full head.
     fn lmHeadShortlistFor(self: *const Trunk, x: mlx.mlx_array) !?mlx.mlx_array {
-        const coarse = self.lm_head_coarse orelse return null;
+        const state = self.shortlist orelse return null;
+        const head = state.coarse orelse return null;
+        const bits = head.bits;
         if (!self.config.isMimo() or !lmHeadShortlistOn()) return null;
         const xsh = mlx.getShape(x);
         if (xsh.len != 3 or mlx.mlx_array_dtype(x) != .bfloat16) return null;
         const n: usize = @intCast(xsh[0] * xsh[1]);
         if (n < 1 or n > LMHEAD_SHORTLIST_MAX_ROWS) return null;
-        const vocab = coarse.rows;
-        const mut = @constCast(self);
+        const vocab = head.rows;
         var x3 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x3);
         try mlx.check(mlx.mlx_reshape(&x3, x, &[_]c_int{ @intCast(n), 1, xsh[2] }, 3, self.s));
         var logged = true;
         var lists: [LMHEAD_SHORTLIST_MAX_ROWS]mtp_mod.Shortlist = undefined;
-        if (!try mtp_mod.rerankShortlistsBatched(self.s, mut, &mut.lm_head_coarse, &logged, x3, self.suppress_mask, lists[0..n])) return null;
+        if (!try mtp_mod.rerankShortlistsBatched(self.s, self, &state.coarse, &logged, x3, self.suppress_mask, lists[0..n])) return null;
         defer for (lists[0..n]) |*sl| sl.deinit();
         const sparse = try shortlistSparseLogits(self.s, lists[0..n], vocab);
         defer _ = mlx.mlx_array_free(sparse.idx);
@@ -1615,13 +1710,13 @@ pub const Trunk = struct {
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, sparse.logits, &[_]c_int{ xsh[0], xsh[1], vocab }, 3, self.s));
         if (diagEnvOnCached(&lmhead_shortlist_audit_env, "SUSHI_LMHEAD_SHORTLIST_AUDIT")) {
-            const full = try self.qmatmul(x3, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+            const full = try self.qmatmul(x3, &self.lm_head);
             defer _ = mlx.mlx_array_free(full);
             try shortlistAudit(self.s, full, sparse.logits, sparse.idx, n, vocab);
         }
-        if (!mut.lm_head_coarse_logged) {
-            mut.lm_head_coarse_logged = true;
-            log.info("[lm_head] greedy shortlist engaged: {d}-bit coarse top-32 + full-head re-score (SUSHI_LMHEAD_FULL=1 reads the full head)\n", .{coarse.bits});
+        if (!state.logged) {
+            state.logged = true;
+            log.info("[lm_head] greedy shortlist engaged: {d}-bit coarse top-32 + full-head re-score (SUSHI_LMHEAD_FULL=1 reads the full head)\n", .{bits});
         }
         return out;
     }
@@ -1655,7 +1750,7 @@ pub const Trunk = struct {
             .group_size = self.config.quant_group_size,
             .mode = self.config.quant_mode,
         };
-        const cache = @constCast(&self.bits_cache);
+        const cache = self.bits_cache orelse return computeQuantParams(&self.config, w, sc, in_dim);
         const start = BitsCache.slot(key_raw);
         var i: usize = 0;
         while (i < 4) : (i += 1) {
@@ -1971,8 +2066,26 @@ pub const Trunk = struct {
 
     /// Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2))), in the activation dtype.
     fn geluErf(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
-        const inv_sqrt2 = try scalarOf(0.70710678118654752, mlx.mlx_array_dtype(x), self.s);
-        defer _ = mlx.mlx_array_free(inv_sqrt2);
+        const dt = mlx.mlx_array_dtype(x);
+        const slot: ?usize = switch (dt) {
+            .bfloat16 => 0,
+            .float16 => 1,
+            .float32 => 2,
+            else => null,
+        };
+        var scratch: mlx.mlx_array = .{ .ctx = null };
+        defer if (scratch.ctx != null) {
+            _ = mlx.mlx_array_free(scratch);
+        };
+        const kept: ?*TrunkConsts = if (slot != null) self.consts else null;
+        const inv_sqrt2 = if (kept) |c| blk: {
+            const i = slot.?;
+            if (c.inv_sqrt2[i] == null) c.inv_sqrt2[i] = try scalarOf(0.70710678118654752, dt, self.s);
+            break :blk c.inv_sqrt2[i].?;
+        } else blk: {
+            scratch = try scalarOf(0.70710678118654752, dt, self.s);
+            break :blk scratch;
+        };
         var scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(scaled);
         try mlx.check(mlx.mlx_multiply(&scaled, x, inv_sqrt2, self.s));
@@ -1991,11 +2104,11 @@ pub const Trunk = struct {
     }
 
     fn reluSquared(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
-        const zero = bf16Scalar(0.0, self.s);
-        defer _ = mlx.mlx_array_free(zero);
         var relu = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(relu);
-        try mlx.check(mlx.mlx_maximum(&relu, x, zero, self.s));
+        const mask_scalars = self.maskScalars();
+        defer mask_scalars.deinit();
+        try mlx.check(mlx.mlx_maximum(&relu, x, mask_scalars.zero, self.s));
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_square(&result, relu, self.s));
         return result;
@@ -2982,12 +3095,10 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(valid);
         try mlx.check(mlx.mlx_less(&valid, pos_4d, lens_4d, self.s));
 
-        const zero = bf16Scalar(0.0, self.s);
-        defer _ = mlx.mlx_array_free(zero);
-        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
-        defer _ = mlx.mlx_array_free(neg_inf);
+        const mask_scalars = self.maskScalars();
+        defer mask_scalars.deinit();
         var mask = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_where(&mask, valid, zero, neg_inf, self.s));
+        try mlx.check(mlx.mlx_where(&mask, valid, mask_scalars.zero, mask_scalars.neg_inf, self.s));
         return mask;
     }
 
@@ -3036,6 +3147,13 @@ pub const Trunk = struct {
             const shape = [_]c_int{@intCast(yf.len)};
             return mlx.mlx_array_new_data(f32s.ptr, &shape, 1, .float32);
         }
+        if (self.consts) |c| for (c.rope_inv) |entry| if (entry) |e| {
+            if (e.dims == rope_dims and e.theta == theta) {
+                var shared = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&shared, e.arr));
+                return shared;
+            }
+        };
         var j = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(j);
         try mlx.check(mlx.mlx_arange(&j, 0, @floatFromInt(half), 1.0, .float32, self.s));
@@ -3046,7 +3164,14 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(jl);
         try mlx.check(mlx.mlx_multiply(&jl, j, neg, self.s));
         var inv_freq = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(inv_freq);
         try mlx.check(mlx.mlx_exp(&inv_freq, jl, self.s)); // [half]
+        if (self.consts) |c| for (&c.rope_inv) |*slot| if (slot.* == null) {
+            var kept = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&kept, inv_freq));
+            slot.* = .{ .dims = rope_dims, .theta = theta, .arr = kept };
+            break;
+        };
         return inv_freq;
     }
 
@@ -3266,18 +3391,21 @@ pub const Trunk = struct {
 
 
 
-    pub fn mtpProjectionRows(self: *Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lm_head: bool) !mlx.mlx_array {
+    pub fn mtpProjectionRows(self: *Trunk, x: mlx.mlx_array, lin: *const Linear, lm_head: bool) !mlx.mlx_array {
         const sh = mlx.getShape(x);
         if (sh.len < 2 or sh.len > 8 or sh[0] < 1 or sh[0] > MAX_BATCH_ROWS) return error.MtpProjectionShape;
         const n: usize = @intCast(sh[0]);
         var virtual_rows: c_int = 1;
         for (sh[1 .. sh.len - 1]) |d| virtual_rows *= d;
-        if (virtual_rows == 1 and !trunk_stq.isStq(w)) {
-            const qp = self.quantParamsHinted(w, sc, lastDim(x));
-            if (qp.mode == .affine) {
-                if (try msvQmvRows(self.s, x, w, sc, bi, qp.bits, qp.group_size)) |y| return y;
-            }
-        }
+        if (virtual_rows == 1) switch (lin.*) {
+            .affine => |*a| {
+                const qp = a.params(self.linearCtx(), x);
+                if (qp.mode == .affine) {
+                    if (try msvQmvRows(self.s, x, a.w, a.s, a.b, qp.bits, qp.group_size)) |y| return y;
+                }
+            },
+            else => {},
+        };
         var parts: [MAX_BATCH_ROWS]mlx.mlx_array = @splat(.{ .ctx = null });
         defer for (parts[0..n]) |a| {
             if (a.ctx != null) _ = mlx.mlx_array_free(a);
@@ -3292,7 +3420,7 @@ pub const Trunk = struct {
             var xrow = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(xrow);
             try mlx.check(mlx.mlx_slice(&xrow, x, &starts, @intCast(sh.len), &stops, @intCast(sh.len), &strides, @intCast(sh.len), self.s));
-            parts[row] = if (lm_head) try self.lmHeadProject(xrow, false) else try self.qmatmul(xrow, w, sc, bi);
+            parts[row] = if (lm_head) try self.lmHeadProject(xrow, false) else try self.qmatmul(xrow, lin);
         }
         return concatAxis0(self.s, parts[0..n]);
     }
@@ -3516,13 +3644,13 @@ pub const Trunk = struct {
 
     pub fn denseMLP(self: *Trunk, x: mlx.mlx_array, dw: *const DenseMlpWeights) !mlx.mlx_array {
         const stacked = try self.stackedPair(x, dw.gate_up_stack);
-        const gate = if (stacked) |pair| pair[0] else try self.qmatmul(x, dw.gate_w, dw.gate_s, dw.gate_b);
+        const gate = if (stacked) |pair| pair[0] else try self.qmatmul(x, &dw.gate);
         defer _ = mlx.mlx_array_free(gate);
-        const up = if (stacked) |pair| pair[1] else try self.qmatmul(x, dw.up_w, dw.up_s, dw.up_b);
+        const up = if (stacked) |pair| pair[1] else try self.qmatmul(x, &dw.up);
         defer _ = mlx.mlx_array_free(up);
         const activated = try self.computeGeglu(gate, up);
         defer _ = mlx.mlx_array_free(activated);
-        return self.qmatmul(activated, dw.down_w, dw.down_s, dw.down_b);
+        return self.qmatmul(activated, &dw.down);
     }
 
     /// The two linears of a stacked trellis bank on `x`, or null when there is no stack or `x` is wider than a stacked launch.
@@ -3541,8 +3669,7 @@ pub const Trunk = struct {
     fn moeRouterLogits(self: *Trunk, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
         if (std.mem.eql(u8, cfg.model_type, "mimo_v2")) return self.mimoRouterLogits(router_x, mw);
-        const qp = self.quantParamsHinted(mw.router_w, mw.router_s, lastDim(router_x));
-        return qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, qp.bits, qp.group_size, qp.mode, self.s);
+        return mw.router.apply(self.linearCtx(), router_x);
     }
 
     /// Gate/up/geglu/down of the shared expert. Only `.verify_rows` declines (null);
@@ -3550,20 +3677,24 @@ pub const Trunk = struct {
     pub fn moeSharedDown(self: *Trunk, comptime proj: SharedProjKind, x: mlx.mlx_array, mw: *const MoeMlpWeights, widths: []const c_int) !?mlx.mlx_array {
         // The joined rows of `.verify_rows` decline a trellis bank before any projection runs.
         const stacked = if (proj == .verify_rows) null else try self.stackedPair(x, mw.shared_gate_up_stack);
-        const gate = if (stacked) |pair| pair[0] else (try self.moeSharedProject(proj, x, mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b, widths)) orelse return null;
+        const gate = if (stacked) |pair| pair[0] else (try self.moeSharedProject(proj, x, &mw.shared_gate, widths)) orelse return null;
         defer _ = mlx.mlx_array_free(gate);
-        const up = if (stacked) |pair| pair[1] else (try self.moeSharedProject(proj, x, mw.shared_up_w, mw.shared_up_s, mw.shared_up_b, widths)) orelse return null;
+        const up = if (stacked) |pair| pair[1] else (try self.moeSharedProject(proj, x, &mw.shared_up, widths)) orelse return null;
         defer _ = mlx.mlx_array_free(up);
         const act = try self.computeGeglu(gate, up);
         defer _ = mlx.mlx_array_free(act);
-        return self.moeSharedProject(proj, act, mw.shared_down_w, mw.shared_down_s, mw.shared_down_b, widths);
+        return self.moeSharedProject(proj, act, &mw.shared_down, widths);
     }
 
-    fn moeSharedProject(self: *Trunk, comptime proj: SharedProjKind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !?mlx.mlx_array {
+    fn moeSharedProject(self: *Trunk, comptime proj: SharedProjKind, x: mlx.mlx_array, lin: *const Linear, widths: []const c_int) !?mlx.mlx_array {
         return switch (proj) {
-            .qmatmul => try self.qmatmul(x, w, sc, bi),
-            .mtp_rows => try self.mtpProjectionRows(x, w, sc, bi, false),
-            .verify_rows => (try decodeRowsProjection(self.s, x, w, sc, bi, widths)) orelse try verifySharedProjection(self.s, x, w, sc, bi, widths),
+            .qmatmul => try self.qmatmul(x, lin),
+            .mtp_rows => try self.mtpProjectionRows(x, lin, false),
+            // Only an affine bank rides the joined kernels; every other kind declines them.
+            .verify_rows => switch (lin.*) {
+                .affine => |a| (try decodeRowsProjection(self.s, x, a.w, a.s, a.b, widths)) orelse try verifySharedProjection(self.s, x, a.w, a.s, a.b, widths),
+                else => null,
+            },
         };
     }
 
@@ -3581,9 +3712,7 @@ pub const Trunk = struct {
     }
 
     pub fn moeSharedGateLogit(self: *Trunk, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
-        const seg_w = mw.shared_expert_gate_w.?;
-        const seg_qp = self.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
-        return qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
+        return mw.shared_expert_gate.apply(self.linearCtx(), expert_x);
     }
 
     fn moeSharedGated(self: *Trunk, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
@@ -3616,7 +3745,7 @@ pub const Trunk = struct {
 
     fn moeAddSharedGateRows(self: *Trunk, expert_sum: mlx.mlx_array, joined_input: mlx.mlx_array, inputs: []const mlx.mlx_array, down: mlx.mlx_array, widths: []const c_int, mw: *const MoeMlpWeights) !?mlx.mlx_array {
         if (!sharedGateRowsEligible(widths) or inputs.len != widths.len) return null;
-        const gate_logit = try self.qmatmul(joined_input, mw.shared_expert_gate_w.?, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?);
+        const gate_logit = try self.qmatmul(joined_input, &mw.shared_expert_gate);
         defer _ = mlx.mlx_array_free(gate_logit);
         const result = try self.moeSharedGateTail(expert_sum, gate_logit, down);
         qwen4_forward.mtp_verify_shared_gate_rows_calls +%= 1;
@@ -4776,6 +4905,27 @@ pub const Trunk = struct {
 
     // ── Mask helpers ──
 
+    /// The bf16 zero and -inf every mask is built from.
+    fn maskScalars(self: *const Trunk) MaskScalars {
+        const c = self.consts orelse return .{ .zero = bf16Scalar(0.0, self.s), .neg_inf = bf16Scalar(-std.math.inf(f32), self.s), .owned = true };
+        if (c.mask_zero == null) c.mask_zero = bf16Scalar(0.0, self.s);
+        if (c.mask_neg_inf == null) c.mask_neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+        return .{ .zero = c.mask_zero.?, .neg_inf = c.mask_neg_inf.?, .owned = false };
+    }
+
+    const MaskScalars = struct {
+        zero: mlx.mlx_array,
+        neg_inf: mlx.mlx_array,
+        /// True when the trunk keeps none and the caller frees both.
+        owned: bool,
+
+        fn deinit(self: MaskScalars) void {
+            if (!self.owned) return;
+            _ = mlx.mlx_array_free(self.zero);
+            _ = mlx.mlx_array_free(self.neg_inf);
+        }
+    };
+
     fn createCausalMask(self: *const Trunk, q_len: c_int, kv_len: c_int) !mlx.mlx_array {
         const offset_val = kv_len - q_len;
         const shape = [_]c_int{ q_len, kv_len };
@@ -4788,12 +4938,10 @@ pub const Trunk = struct {
         var bool_upper = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(bool_upper);
         try mlx.check(mlx.mlx_astype(&bool_upper, upper, .bool_, self.s));
-        const zero = bf16Scalar(0.0, self.s);
-        defer _ = mlx.mlx_array_free(zero);
-        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
-        defer _ = mlx.mlx_array_free(neg_inf);
+        const mask_scalars = self.maskScalars();
+        defer mask_scalars.deinit();
         var mask = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_where(&mask, bool_upper, neg_inf, zero, self.s));
+        try mlx.check(mlx.mlx_where(&mask, bool_upper, mask_scalars.neg_inf, mask_scalars.zero, self.s));
         const mask_shape = [_]c_int{ 1, 1, q_len, kv_len };
         var mask_4d = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_reshape(&mask_4d, mask, &mask_shape, 4, self.s));
@@ -4831,13 +4979,11 @@ pub const Trunk = struct {
         var too_far = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(too_far);
         try mlx.check(mlx.mlx_greater_equal(&too_far, dist, window_arr, self.s));
-        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
-        defer _ = mlx.mlx_array_free(neg_inf);
-        const zero = bf16Scalar(0.0, self.s);
-        defer _ = mlx.mlx_array_free(zero);
+        const mask_scalars = self.maskScalars();
+        defer mask_scalars.deinit();
         var sw_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sw_mask);
-        try mlx.check(mlx.mlx_where(&sw_mask, too_far, neg_inf, zero, self.s));
+        try mlx.check(mlx.mlx_where(&sw_mask, too_far, mask_scalars.neg_inf, mask_scalars.zero, self.s));
         const mask_shape = [_]c_int{ 1, 1, q_len, kv_len };
         var sw_4d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sw_4d);
@@ -5230,6 +5376,8 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 try maybeTransposeForBf16(&dw.down_w, dw.down_s, &owned_bf16, allocator, s);
             }
         }
+
+        try layer_weights.bindLayer(lw, &config);
 
         ssm_entries[i] = .{
             .conv_state = mlx.mlx_array_new(),
@@ -6592,6 +6740,45 @@ test "argmax-only shortlist rows hold the exact logits at their ids and argmax t
     try std.testing.expectEqual(@as(i32, 3 + 7 * 31), ids[1]);
 }
 
+test "a retired coarse head is gone for every reader and is not freed twice, and another trunk's stays" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var a = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 512, 8, 64, 0x1A4D);
+    defer a.deinit();
+    var b = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 512, 8, 64, 0x1A4E);
+    defer b.deinit();
+    var cells: [2]ShortlistState = .{ .{ .logged = true }, .{ .logged = true } };
+    for ([_]*mtp_mod.RerankFixture{ &a, &b }, &cells) |fx, *cell| {
+        fx.xfm.config.model_type = "mimo_v2";
+        fx.xfm.suppress_mask = null;
+        fx.xfm.bits_cache = null;
+        fx.xfm.shortlist = cell;
+        cell.coarse = mtp_mod.buildRerankCoarse(s, &fx.xfm, 2) orelse return error.CoarseBuildDeclined;
+    }
+    defer for (&cells) |*cell| mtp_mod.retireCoarse(&cell.coarse);
+
+    // What a failed shortlist does: the MiMo readers go through `coarseHead`, which now reads null.
+    mtp_mod.retireCoarse(a.xfm.coarseHead().?);
+    try std.testing.expect(a.xfm.coarseHead().?.* == null);
+    try std.testing.expect(b.xfm.coarseHead().?.* != null);
+    // Retiring again, as the deinit does, frees nothing twice.
+    mtp_mod.retireCoarse(a.xfm.coarseHead().?);
+    // The readout falls back to the full head on A and keeps its shortlist on B.
+    var buf: [512]f32 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.03125;
+    const xf = mlx.mlx_array_new_data(&buf, &[_]c_int{ 1, 1, 512 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(xf);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
+    const full = try a.xfm.lmHeadProject(x, true);
+    defer _ = mlx.mlx_array_free(full);
+    const sparse = try b.xfm.lmHeadProject(x, true);
+    defer _ = mlx.mlx_array_free(sparse);
+    try mlx.check(mlx.mlx_array_eval(full));
+    try mlx.check(mlx.mlx_array_eval(sparse));
+}
+
 test "a MiMo argmax-only readout holds the full head's bit-exact logits at its top-32, one row or four" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -6600,10 +6787,11 @@ test "a MiMo argmax-only readout holds the full head's bit-exact logits at its t
     defer fx.deinit();
     fx.xfm.config.model_type = "mimo_v2";
     fx.xfm.suppress_mask = null;
-    fx.xfm.bits_cache = .{};
-    fx.xfm.lm_head_coarse = mtp_mod.buildRerankCoarse(s, &fx.xfm, 2) orelse return error.CoarseBuildDeclined;
-    fx.xfm.lm_head_coarse_logged = true;
-    defer if (fx.xfm.lm_head_coarse) |*c| c.deinit();
+    fx.xfm.bits_cache = null;
+    var shortlist: ShortlistState = .{ .logged = true };
+    fx.xfm.shortlist = &shortlist;
+    shortlist.coarse = mtp_mod.buildRerankCoarse(s, &fx.xfm, 2) orelse return error.CoarseBuildDeclined;
+    defer mtp_mod.retireCoarse(&shortlist.coarse);
     const vocab: usize = @intCast(fx.vocab);
     var prng = std.Random.DefaultPrng.init(0x7E57);
     for ([_]c_int{ 1, 4 }) |rows| {

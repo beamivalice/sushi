@@ -2175,8 +2175,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     };
     // The heads built the coarse copy for their drafts; without them the trunk's greedy readout still takes one.
     // Same predicate as the resident bill that prices this copy.
-    if (mimoCoarseHeadBytes(params.config) > 0 and xfm_ptr.lm_head_coarse == null)
-        xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
+    if (mimoCoarseHeadBytes(params.config) > 0) if (xfm_ptr.coarseHead()) |slot| {
+        if (slot.* == null) slot.* = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
+    };
     // The qwen4_exp in-checkpoint head's coarse rerank build: a
     // `requantizeRows` of the whole
     // trunk lm_head plus a synchronous eval of ~240 MB. Lazily it ran inside

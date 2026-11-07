@@ -1127,7 +1127,7 @@ pub fn qsaSlotEntry(sc: *ForwardCtx, layer: u32) *SSMCacheEntry {
 }
 
 pub fn qsaMask(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
-    const qk = try self.qmatmul(x, fa.idx_qk_w, fa.idx_qk_s, fa.idx_qk_b); // [B,S,(n+1)*hd]
+    const qk = try self.qmatmul(x, &fa.idx_qk); // [B,S,(n+1)*hd]
     defer _ = mlx.mlx_array_free(qk);
     if (ctx.batch_slots) |slots| return self.qsaMaskBatched(slots, qk, fa, layer);
     return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer);

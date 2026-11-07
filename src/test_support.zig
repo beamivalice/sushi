@@ -9,6 +9,7 @@ const testing = std.testing;
 const KVCacheSnapshot = trf.KVCacheSnapshot;
 const MoeMlpWeights = trf.MoeMlpWeights;
 const Transformer = trf.Transformer;
+const bindLinears = @import("layer_weights.zig").bindLinears;
 
 
 pub const Exl3MoeHarness = struct {
@@ -120,7 +121,7 @@ pub const Exl3MoeHarness = struct {
             .hidden_act = .silu,
         };
         h.xfm.one = one;
-        h.xfm.bits_cache = .{};
+        h.xfm.bits_cache = null;
         h.xfm.compiled_moe_routing = null;
         h.xfm.compiled_gelu = null;
         h.xfm.compiled_geglu = null;
@@ -140,6 +141,7 @@ pub const Exl3MoeHarness = struct {
             h.mw.shared_down_w = h.owned[6];
             h.mw.shared_expert_gate_w = h.owned[7];
         }
+        try bindLinears(&h.mw, &h.xfm.config);
         for (h.owned) |a| try mlx.check(mlx.mlx_array_eval(a));
         return h;
     }
@@ -588,12 +590,13 @@ pub const MimoExl3MoeHarness = struct {
             .moe_route_norm = true,
         };
         h.xfm.one = one;
-        h.xfm.bits_cache = .{};
+        h.xfm.bits_cache = null;
         h.xfm.compiled_moe_routing = null;
         h.xfm.compiled_gelu = null;
         h.xfm.compiled_geglu = null;
         h.xfm.cost_trace_active = false;
         h.xfm.expert_stream = null;
+        try bindLinears(&h.mw, &h.xfm.config);
         for (h.owned) |a| try mlx.check(mlx.mlx_array_eval(a));
         return h;
     }

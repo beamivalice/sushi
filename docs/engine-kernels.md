@@ -66,6 +66,54 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - The decode meter splits eval into `mlx_async_eval` wall time and thread CPU. Wall far above CPU means the encoder is
   blocked on in-flight buffers: the forward is GPU-bound, and cutting host work cannot help.
 
+## Trunk linears
+
+- `src/linear.zig` holds `Linear`, the kind a trunk weight is stored in, decided once when the weight is bound:
+  `dense` (bf16 `[in, out]`), `affine` (w, scales, biases, and the bits, group size and mode), `fp8_block` (u8 codes and
+  f32 tile scales) or `trellis` (the bank, its decode and its `Geo`). A projection is `Trunk.qmatmul(x, &lin)`: one tag
+  switch, no dtype query on the weight and no hash probe.
+- `layer_weights.bindLayer` binds a layer's `Linear` fields from their `_w`, `_s`, `_b` arrays at the end of
+  `initMoeLayers`, after the arrays are transposed, scaled and stacked; a trunk's head is bound in `initTrunk`. The
+  arrays stay beside it for the kernels that read them (stacks, fused decode, verify rows). A `Linear` borrows its
+  arrays and never frees them. A test that builds a weight struct by hand, or edits an array of a bound one, calls
+  `bindLinears` again; an unbound projection fails with `LinearUnbound`.
+- An affine bank's bits, group size and mode are solved by its first projection from the activation's inner dimension
+  (a tensor whose group differs from the model's needs it) and kept in a cell the `Linear` points at, so every copy of
+  it shares them. The cache keyed on the scales pointer (`quantParamsHinted`) stays for the embedding gather, the
+  routed experts and the fused hyper-connection kernels (`qwen4_hc.zig`), which read the arrays, not a `Linear`.
+- A projection holds `*const Linear` (and `*const Trunk`), which the compiler may assume is never written: state a
+  first use fills or a readout retires lives behind a pointer the owner holds (the affine cell, a `Geo`, the trunk's
+  `TrunkCells`: params cache, scalar constants, shortlist state), never a `@constCast` write and never a module global
+  for per-model state (several trunks are alive at once). A hand-built test trunk has null cells and resolves every
+  call. A weight struct switches by pointer capture (`|*fa|`), as a by-value capture copies a struct of several KB per
+  layer.
+- A trellis bank's `linear.Geo` (`sushi_exl3.linear.Geo.get`) holds its shape, rate and, per row count, the launch
+  geometry and the pinned kernel configs of the multi-row arm for bf16 inputs. Banks of one shape share one, and a
+  `Linear` holds a pointer (about 100 bytes). `trunk.matmulGeo` and `linear.linearSharedGeo` launch from it and read
+  only `x`'s shape and dtype. A call it does not hold (rows past the multi-row arm, another dtype, a `force_arm` seam,
+  a NAX launch once the NAX latch is set) runs the entry point that reads the operands, with the same bytes. Geos and
+  pinned configs are never freed: one per distinct shape and launch, bounded by the model's shapes; bind and launch on
+  the MLX-owning thread.
+- The joined verify and decode-row kernels serve affine banks only; a group of projections (q/k/v, qkv/z/a/b) looks at
+  its kinds once before it joins its inputs.
+- `mlx.query_count` counts shape, size and dtype queries (each an FFI call) in test builds only, leaving out the kernel-key
+  tracking of `mlx_kernel_keys.zig`. `linear.zig`'s count test pins the queries of a one-row bf16 projection per kind
+  (4-bit affine tensors, 256 wide). Before is the pre-binding `qmatmul` at 36184601, after the binding at 1d20b3f3:
+
+  | kind | before (36184601) | after (1d20b3f3) |
+  |---|---|---|
+  | trellis bank | 21 | 3 |
+  | stacked trellis pair | 16 | 3 |
+  | affine 4-bit | 12 | 8 |
+  | dense | 15 | 11 |
+  | FP8 block | 12 | 11 |
+
+  The trellis bank's before is the 19 queries of the shape-reading `trunk.matmul` plus the two dtype queries of the
+  old `qmatmul`; the test measures the 19 and the pair's 16 (`sharedProject` without a geo) on every run. The dense and
+  FP8 "before" are the after-count plus the removed dtype and `lastDim` calls. A trellis bank's 3 are its activation's
+  shape and dtype. The rest of a dense, affine or FP8 projection is the queries of `qmatmulBits` and the FP8 launch,
+  which the binding leaves.
+
 ## Batched Qwen4 decode overlap
 
 - Qwen4 batched S=1 forwards submit the live residual and pending MLP output every fourth layer. An explicit

@@ -737,27 +737,29 @@ pub const Head = struct {
         return steps;
     }
 
-    /// Drafts shortlist on the trunk's coarse lm_head copy (`Transformer.lm_head_coarse`), built at
+    /// Drafts shortlist on the trunk's coarse lm_head copy (`Transformer.coarseHead`), built at
     /// the first ask when the trunk has none yet.
     pub fn canRerankDrafts(self: *Head) bool {
         const t = self.target orelse return false;
         if (!self.rerank_tried) {
             self.rerank_tried = true;
-            if (t.lm_head_coarse == null) t.lm_head_coarse = mtp_mod.buildRerankCoarse(self.s, t, rerankBits());
+            if (t.coarseHead()) |slot| if (slot.* == null) {
+                slot.* = mtp_mod.buildRerankCoarse(self.s, t, rerankBits());
+            };
         }
-        return t.lm_head_coarse != null;
+        return if (t.coarseHead()) |slot| slot.* != null else false;
     }
 
     pub fn draftSelect(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         if (self.canRerankDrafts()) {
-            if (try mtp_mod.rerankSelect(self.s, target, &target.lm_head_coarse, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+            if (try mtp_mod.rerankSelect(self.s, target, target.coarseHead().?, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
         }
         return mtp_mod.fullReadoutArgmax(self.s, target, x, suppress_mask);
     }
 
     pub fn draftShortlist(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
         if (!self.canRerankDrafts()) return null;
-        return mtp_mod.rerankShortlist(self.s, target, &target.lm_head_coarse, &self.rerank_logged, x, suppress_mask);
+        return mtp_mod.rerankShortlist(self.s, target, target.coarseHead().?, &self.rerank_logged, x, suppress_mask);
     }
 };
 

@@ -16,6 +16,7 @@ const transformer_mod = @import("trunk.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
 const log = @import("log.zig");
 const trunk_stq = @import("trunk_stq.zig");
+const Linear = @import("linear.zig").Linear;
 const Transformer = transformer_mod.Transformer;
 const expert_quant = @import("expert_quant.zig");
 
@@ -544,11 +545,17 @@ pub const Shortlist = struct {
     }
 };
 
+/// Frees the coarse head and leaves null in its one owner, so every reader sees it gone.
+pub fn retireCoarse(coarse: *?RerankCoarse) void {
+    if (coarse.*) |*dead| dead.deinit();
+    coarse.* = null;
+}
+
 /// Shortlist one coarse row `flat` `[rows]` and re-score it through the trunk head.
 /// Null retires the coarse head, so every later step lands on the caller's fallback.
 fn rerankShortlistRow(
     s: mlx.mlx_stream,
-    target: *Transformer,
+    target: *const Transformer,
     coarse: *?RerankCoarse,
     flat: mlx.mlx_array,
     rows: c_int,
@@ -556,9 +563,7 @@ fn rerankShortlistRow(
 ) !?Shortlist {
     const cands = draftTop32(s, flat, rows) catch |err| {
         log.warn("[mtp] draft rerank shortlist failed ({s}) - dropping to the full readout\n", .{@errorName(err)});
-        var dead = coarse.*.?;
-        dead.deinit();
-        coarse.* = null;
+        retireCoarse(coarse);
         return null;
     };
     errdefer _ = mlx.mlx_array_free(cands);
@@ -727,7 +732,7 @@ fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse
 /// False = the coarse head is unavailable (nothing is written to `out`).
 pub fn rerankShortlistsBatched(
     s: mlx.mlx_stream,
-    target: *Transformer,
+    target: *const Transformer,
     coarse: *?RerankCoarse,
     logged: *bool,
     x: mlx.mlx_array,
@@ -1523,6 +1528,7 @@ pub const RerankFixture = struct {
         try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_w, qv, 0));
         try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_s, qv, 1));
         try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_b, qv, 2));
+        xfm.lm_head = try Linear.bind(&xfm.config, xfm.lm_head_w, xfm.lm_head_s, xfm.lm_head_b);
         return .{ .xfm = xfm, .dense = dense, .vocab = vocab, .hidden = hidden };
     }
 

@@ -294,11 +294,11 @@ pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, 
     try mlx.check(mlx.mlx_reshape(&n_flat, n4, &flat_shape, 3, self.s));
 
     // down/inject carry the reference's `/hc` in their weights (load-time fold).
-    const down = try self.qmatmul(n_flat, w.down_w, w.down_s, w.down_b);
+    const down = try self.qmatmul(n_flat, &w.down);
     defer _ = mlx.mlx_array_free(down);
     const act = (try Transformer.applyClosure(self.compiled_hc_silu, &.{down})) orelse try self.silu(down);
     defer _ = mlx.mlx_array_free(act);
-    const up = try self.qmatmul(act, w.up_w, w.up_s, w.up_b);
+    const up = try self.qmatmul(act, &w.up);
     defer _ = mlx.mlx_array_free(up);
     const shape4 = [_]c_int{ batch, seq_len, hc, hidden };
     var up4 = mlx.mlx_array_new();
@@ -324,7 +324,7 @@ pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, 
 
     var inj = mlx.mlx_array_new();
     if (w.inject_w.ctx != null) {
-        const raw = if (raw_inject) |r| try standinRef(r) else try self.qmatmul(n_flat, w.inject_w, w.inject_s, w.inject_b);
+        const raw = if (raw_inject) |r| try standinRef(r) else try self.qmatmul(n_flat, &w.inject);
         defer _ = mlx.mlx_array_free(raw);
         const g = (try Transformer.applyClosure(self.compiled_hc_inj, &.{raw})) orelse blk: {
             var sig = mlx.mlx_array_new();
@@ -459,11 +459,11 @@ pub fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, t
     defer _ = mlx.mlx_array_free(emb);
     if (Transformer.qwen4_trace) |tr| Transformer.Qwen4Trace.set(&tr.ple_emb, emb);
 
-    const key_raw = try self.qmatmul(emb, pw.key_w, pw.key_s, pw.key_b);
+    const key_raw = try self.qmatmul(emb, &pw.key);
     defer _ = mlx.mlx_array_free(key_raw);
     const key4 = try self.hcGroupNorm(key_raw, pw.norm_key, batch, seq_len);
     defer _ = mlx.mlx_array_free(key4);
-    const value = try self.qmatmul(emb, pw.value_w, pw.value_s, pw.value_b);
+    const value = try self.qmatmul(emb, &pw.value);
     defer _ = mlx.mlx_array_free(value);
     const query4 = try self.hcGroupNorm(stream, pw.norm_query, batch, seq_len);
     defer _ = mlx.mlx_array_free(query4);

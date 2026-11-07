@@ -4,6 +4,7 @@ const std = @import("std");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const trunk_stq = @import("trunk_stq.zig");
+const linear_mod = @import("linear.zig");
 const expert_exl3 = sushi_exl3.format;
 const mlx = @import("mlx.zig");
 const mlx_util = @import("mlx_util.zig");
@@ -25,6 +26,8 @@ const Transformer = trunk.Transformer;
 const seFillBf16 = trunk_helpers_test.seFillBf16;
 
 pub const expert_exl3_kernels = sushi_exl3.kernels;
+
+pub const Linear = linear_mod.Linear;
 
 const expert_quant_mod = @import("expert_quant.zig");
 
@@ -59,6 +62,12 @@ pub const FullAttnWeights = struct {
     o_b: mlx.mlx_array,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
+    /// The projections above as the kinds they are stored in, bound by `bindLinears` once the triples are final.
+    q: Linear = .absent,
+    k: Linear = .absent,
+    v: Linear = .absent,
+    o: Linear = .absent,
+    idx_qk: Linear = .absent,
     // qwen4_exp QSA indexer: one projection for the index queries + the
     // single shared key head, and their per-head RMS norms. Null-ctx on
     // every other arch.
@@ -92,6 +101,9 @@ pub const HcWeights = struct {
     /// Dense inject weight materialized row-major `[hc*hidden, hc]` for the
     /// fused decode kernel (the qmatmul path reads the lazy transpose view).
     inject_flat: mlx.mlx_array = .{ .ctx = null },
+    down: Linear = .absent,
+    up: Linear = .absent,
+    inject: Linear = .absent,
 };
 
 /// qwen4_exp PLE: n-gram embedding → per-stream keys + one value, gated by
@@ -107,6 +119,8 @@ pub const PleWeights = struct {
     norm_query: mlx.mlx_array,
     norm_conv: mlx.mlx_array,
     conv_w: mlx.mlx_array, // [hc*hidden, K, 1]
+    key: Linear = .absent,
+    value: Linear = .absent,
 };
 
 
@@ -133,6 +147,11 @@ pub const LinearAttnWeights = struct {
     out_b: mlx.mlx_array,
     /// qkv and z as one trellis bank, for the decode widths; `qkv_w` and `z_w` are then views of it.
     qkvz_stack: ?trunk_stq.Shared = null,
+    qkv: Linear = .absent,
+    z: Linear = .absent,
+    a: Linear = .absent,
+    b: Linear = .absent,
+    out: Linear = .absent,
 };
 
 pub const DenseMlpWeights = struct {
@@ -147,7 +166,11 @@ pub const DenseMlpWeights = struct {
     down_b: mlx.mlx_array,
     /// gate and up as one trellis bank, for the decode widths; `gate_w` and `up_w` are then views of it.
     gate_up_stack: ?trunk_stq.Shared = null,
+    gate: Linear = .absent,
+    up: Linear = .absent,
+    down: Linear = .absent,
 };
+
 
 pub const MoeMlpWeights = struct {
     /// A rate-grouped EXL3 layer's banks; its handles are the transformer's to free.
@@ -187,6 +210,14 @@ pub const MoeMlpWeights = struct {
     expert_bias: ?mlx.mlx_array = null,
     route_norm: bool = true,
     route_scale: f32 = 1.0,
+    /// The folded shared expert's launch geometry per row count (index rows - 1). L-qwen4 fills it once at load, so the
+    /// launches take it instead of reading the arrays again on every token; null until then.
+    shared_geo: [@intCast(sushi_exl3.project_rows.NAX_ROWS_MAX)]?sushi_exl3.riders_gated.Geometry = @splat(null),
+    router: Linear = .absent,
+    shared_gate: Linear = .absent,
+    shared_up: Linear = .absent,
+    shared_down: Linear = .absent,
+    shared_expert_gate: Linear = .absent,
 };
 
 const HybridMlpWeights = union(enum) {
@@ -206,6 +237,31 @@ pub const MoeLayerWeights = struct {
     hc_mlp: ?HcWeights = null,
     ple: ?PleWeights = null,
 };
+
+fn arrayOf(v: anytype) mlx.mlx_array {
+    return if (@TypeOf(v) == ?mlx.mlx_array) v orelse .{ .ctx = null } else v;
+}
+
+/// Binds each `Linear` field `name` of `w` from its `name_w`, `name_s` and `name_b` arrays. Call it once the arrays are
+/// final (transposed, scaled, stacked): the bound kinds do not follow later changes to them.
+pub fn bindLinears(w: anytype, config: *const ModelConfig) !void {
+    inline for (comptime structFields(@TypeOf(w.*))) |field| {
+        if (comptime field.type != Linear) continue;
+        @field(w, field.name) = try Linear.bind(config, arrayOf(@field(w, field.name ++ "_w")), arrayOf(@field(w, field.name ++ "_s")), arrayOf(@field(w, field.name ++ "_b")));
+    }
+}
+
+pub fn bindLayer(lw: *MoeLayerWeights, config: *const ModelConfig) !void {
+    if (lw.hc_attn) |*hc| try bindLinears(hc, config);
+    if (lw.hc_mlp) |*hc| try bindLinears(hc, config);
+    if (lw.ple) |*ple| try bindLinears(ple, config);
+    switch (lw.attn) {
+        inline else => |*w| try bindLinears(w, config),
+    }
+    switch (lw.mlp) {
+        inline else => |*w| try bindLinears(w, config),
+    }
+}
 
 
 // ── Quantization params cache ──
@@ -934,7 +990,7 @@ pub fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, 
 
 pub fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
     const cache = try KVCache.init(allocator, 0);
-    return .{
+    var shell: Transformer = .{
         .config = config,
         .cache = cache,
         .s = s,
@@ -960,6 +1016,9 @@ pub fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx
         .ssm_entries = null,
         .moe_seq_offset = 0,
     };
+    errdefer shell.cache.deinit();
+    try shell.attachCells();
+    return shell;
 }
 
 /// [E, out, in] affine-4/g64 expert bank — the stand-in for a streamed MXFP4
@@ -1544,7 +1603,7 @@ test "imatrix capture on the streamed QUANTIZED MoE path keys the routing's glob
         .hidden_act = .silu,
     };
     xfm.one = one;
-    xfm.bits_cache = .{};
+    xfm.bits_cache = null;
     xfm.qwen4 = null;
     xfm.compiled_moe_routing = null;
     xfm.compiled_gelu = null;
@@ -1624,7 +1683,7 @@ test "exl3 shared add releases routed output study3" {
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var xfm: Transformer = undefined;
     xfm.config = .{};
-    xfm.bits_cache = .{};
+    xfm.bits_cache = null;
     xfm.compiled_geglu = null;
     xfm.allocator = testing.allocator;
     xfm.s = s;
@@ -1652,7 +1711,7 @@ test "exl3 shared add releases routed output study3" {
     const sc: [64]u16 = @splat(0x3f80);
     const scores = mlx.mlx_array_new_data(&sc, &.{ 1, 64, 1 }, 3, .bfloat16);
     defer _ = mlx.mlx_array_free(scores);
-    var mw = std.mem.zeroes(MoeMlpWeights);
+    var mw = std.mem.zeroInit(MoeMlpWeights, .{});
     mw.switch_gate_w = tr;
     mw.switch_up_w = tr;
     mw.switch_down_w = tr;
@@ -1668,6 +1727,7 @@ test "exl3 shared add releases routed output study3" {
     mw.shared_expert_gate_w = gate;
     mw.shared_expert_gate_s = .{ .ctx = null };
     mw.shared_expert_gate_b = .{ .ctx = null };
+    try bindLinears(&mw, &xfm.config);
     var before: usize = 0;
     var after: usize = 0;
     for (0..5) |rep| {
@@ -1835,4 +1895,112 @@ test "sushi coder GPU a loaded grouped layer keeps its stored bytes resident onc
     try mlx.check(mlx.mlx_get_active_memory(&after));
     // The stored bytes once, plus the per-expert table; the loaded originals are gone.
     try t.expectEqual(stored + 128 * sushi_exl3.rate_groups.META_WORDS * 4, after - before);
+}
+
+fn liveArrays(comptime n: usize, s: mlx.mlx_stream) ![n]mlx.mlx_array {
+    var arrs: [n]mlx.mlx_array = undefined;
+    for (&arrs) |*a| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(a, &[_]c_int{1}, 1, .bfloat16, s));
+    }
+    return arrs;
+}
+
+fn freeAll(arrs: []const mlx.mlx_array) void {
+    for (arrs) |a| _ = mlx.mlx_array_free(a);
+}
+
+test "the eval batch of a full-attention layer holds each live array of it once and no other field" {
+    const s = mlx.gpuStream();
+    const a = try liveArrays(16, s);
+    defer freeAll(&a);
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    const none = mlx.mlx_array{ .ctx = null };
+    var fa: FullAttnWeights = .{
+        .q_w = a[0], .q_s = a[1], .q_b = a[2],
+        .k_w = a[3], .k_s = a[4], .k_b = a[5],
+        .v_w = a[6], .v_s = a[7], .v_b = a[8],
+        .o_w = a[9], .o_s = none, .o_b = none,
+        .q_norm = a[10], .k_norm = a[11],
+    };
+    appendFullAttnWeights(vec, &fa);
+    // Twelve live handles; the dense `o` carries no scales or biases and the optional ones are unset.
+    try testing.expectEqual(@as(usize, 12), mlx.mlx_vector_array_size(vec));
+    fa.idx_qk_w = a[12];
+    fa.idx_qk_s = a[13];
+    fa.idx_qk_b = a[14];
+    fa.idx_q_norm = a[15];
+    fa.sinks = a[0];
+    const vec2 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec2);
+    appendFullAttnWeights(vec2, &fa);
+    try testing.expectEqual(@as(usize, 17), mlx.mlx_vector_array_size(vec2));
+}
+
+test "the eval batch of a hyper-connection and a PLE holds each live array of them" {
+    const s = mlx.gpuStream();
+    const a = try liveArrays(11, s);
+    defer freeAll(&a);
+    const none = mlx.mlx_array{ .ctx = null };
+    const hc: HcWeights = .{
+        .norm_w = a[0],
+        .down_w = a[1], .down_s = a[2], .down_b = a[3],
+        .up_w = a[4], .up_s = none, .up_b = none,
+        .inject_w = a[5], .inject_s = a[6], .inject_b = a[7],
+        .inject_flat = a[8],
+    };
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    appendStructArrays(vec, &hc);
+    try testing.expectEqual(@as(usize, 9), mlx.mlx_vector_array_size(vec));
+    const ple: PleWeights = .{
+        .key_w = a[0], .key_s = a[1], .key_b = a[2],
+        .value_w = a[3], .value_s = none, .value_b = none,
+        .norm_key = a[4], .norm_query = a[5], .norm_conv = a[6],
+        .conv_w = a[7],
+    };
+    const vec2 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec2);
+    appendStructArrays(vec2, &ple);
+    try testing.expectEqual(@as(usize, 8), mlx.mlx_vector_array_size(vec2));
+}
+
+test "the trellis count of a layer set is its banks outside the routed experts and the stacks it holds" {
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var prng = std.Random.DefaultPrng.init(0x7c01);
+    const bank = try trunk_stq.TestBank.init(arena.allocator(), prng.random(), 128, 128, 48);
+    const stq = try bank.triple(s);
+    defer freeAll(&.{ stq.w, stq.s, stq.b });
+    const dense = try liveArrays(1, s);
+    defer freeAll(&dense);
+    const none = mlx.mlx_array{ .ctx = null };
+    const dense_triple = .{ dense[0], none, none };
+    const stack: trunk_stq.Shared = .{ .p = .{ .trellis = stq.w, .suh = stq.s, .svh = stq.b }, .cols = @splat(0), .count = 2 };
+    var layers: [2]MoeLayerWeights = undefined;
+    layers[0] = .{
+        .input_norm = none, .post_attn_norm = none, .is_linear = false,
+        .attn = .{ .full = .{
+            .q_w = stq.w, .q_s = stq.s, .q_b = stq.b,
+            .k_w = stq.w, .k_s = stq.s, .k_b = stq.b,
+            .v_w = dense_triple[0], .v_s = none, .v_b = none,
+            .o_w = dense_triple[0], .o_s = none, .o_b = none,
+            .q_norm = none, .k_norm = none,
+            .qkv_stack = stack,
+        } },
+        .mlp = .{ .dense = .{
+            .gate_w = stq.w, .gate_s = stq.s, .gate_b = stq.b,
+            .up_w = dense_triple[0], .up_s = none, .up_b = none,
+            .down_w = dense_triple[0], .down_s = none, .down_b = none,
+            .gate_up_stack = stack,
+        } },
+    };
+    layers[1] = layers[0];
+    layers[1].attn.full.qkv_stack = null;
+    layers[1].mlp.dense.gate_up_stack = null;
+    const counts = TrunkCounts.of(&layers);
+    try testing.expectEqual(@as(usize, 6), counts.banks);
+    try testing.expectEqual(@as(usize, 2), counts.stacks);
 }

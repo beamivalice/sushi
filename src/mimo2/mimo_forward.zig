@@ -736,7 +736,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 
         const attn_out = switch (lw.attn) {
             .linear => return error.UnsupportedLinearAttention,
-            .full => |fa| try self.mimoAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask),
+            .full => |*fa| try self.mimoAttnWith(ctx, normed, fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask),
         };
         defer _ = mlx.mlx_array_free(attn_out);
         if (prof) {
@@ -918,15 +918,15 @@ pub fn mimoAttnWith(
     defer for (proj) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    if (mlx.mlx_array_dtype(fa.q_w) == .uint8) {
+    if (fa.q == .fp8_block) {
         // The source FP8 QKV: q_w holds all three, rank-local; V leaves it already scaled.
         var split = try fp8_block.RowSplit.qkv(@intCast(h_count * hd), @intCast(kv_h * hd), @intCast(kv_h * vhd), @intCast(mlx.getShape(fa.q_s)[0]));
         split.v_scale = cfg.attention_value_scale;
         try fp8_block.projectServing(self.s, x, fa.q_w, fa.q_s, split, &proj);
     } else {
-        proj[0] = try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
-        proj[1] = try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
-        proj[2] = try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
+        proj[0] = try self.qmatmul(x, &fa.q);
+        proj[1] = try self.qmatmul(x, &fa.k);
+        proj[2] = try self.qmatmul(x, &fa.v);
     }
     const attn_out = if (ctx.batch_rows) |rows|
         try self.mimoBatchRowsAttn(rows, ctx.batch_row_offsets, proj, fa, layer, local_decode_mask)
@@ -941,7 +941,7 @@ pub fn mimoAttnWith(
     defer _ = mlx.mlx_array_free(attn_flat);
     try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
     if (self.imatrix) |c| try c.observeLinear(.{ .o_proj = layer }, attn_flat);
-    return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+    return self.qmatmul(attn_flat, &fa.o);
 }
 
 /// Rope, KV append and attention of one MiMo layer over the QKV projection `proj`, on
@@ -981,7 +981,7 @@ pub fn mimoAttnCore(
     };
     const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
     const max_kv: u32 = if (is_global) 0 else sliding.span;
-    const fp8_qkv = mlx.mlx_array_dtype(fa.q_w) == .uint8;
+    const fp8_qkv = fa.q == .fp8_block;
     const prepped: ?DenseKVView = if (fp8_qkv and batch == 1 and seq_len <= MIMO_VERIFY_ROWS_MAX and hd == 192 and vhd == 128)
         try self.mimoDecodePrep(ctx, proj, is_global, rope_dims, rope_base, offset, seq_len, h_count, kv_h, layer, max_kv, &q_rope)
     else
@@ -1124,10 +1124,7 @@ pub fn mimoRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const 
     var x32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x32);
     try mlx.check(mlx.mlx_astype(&x32, router_x, .float32, self.s));
-    if (mw.router_s.ctx != null) {
-        const qp = self.quantParamsHinted(mw.router_w, mw.router_s, lastDim(x32));
-        return qmatmulBits(x32, mw.router_w, mw.router_s, mw.router_b, qp.bits, qp.group_size, qp.mode, self.s);
-    }
+    if (mw.router == .affine) return mw.router.apply(self.linearCtx(), x32);
     var w32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(w32);
     try mlx.check(mlx.mlx_astype(&w32, mw.router_w, .float32, self.s));

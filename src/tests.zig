@@ -111,6 +111,7 @@ test {
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
     _ = @import("trunk_stq.zig");
+    _ = @import("linear.zig");
     _ = @import("model_settings.zig");
     _ = @import("spec_cost_gate.zig");
     _ = @import("dsv41/dspark_rows.zig");

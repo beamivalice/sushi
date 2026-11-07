@@ -349,7 +349,7 @@ test "mimo v2 fixture full and cached forwards track the HF reference (MIMO_V2_M
         defer _ = mlx.mlx_array_free(normed);
         const norm_host = try qwen4ReadF32(allocator, normed, s);
         defer allocator.free(norm_host);
-        const value_proj = try component_xfm.qmatmul(normed, lw.attn.full.v_w, lw.attn.full.v_s, lw.attn.full.v_b);
+        const value_proj = try component_xfm.qmatmul(normed, &lw.attn.full.v);
         defer _ = mlx.mlx_array_free(value_proj);
         const value_host = try qwen4ReadF32(allocator, value_proj, s);
         defer allocator.free(value_host);

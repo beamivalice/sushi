@@ -3,6 +3,9 @@
 const trf = @import("../transformer.zig");
 const trunk_mod = @import("../trunk.zig");
 const forward_diag = @import("../forward_diag.zig");
+const linear_mod = @import("../linear.zig");
+const Linear = linear_mod.Linear;
+const bindLinears = @import("../layer_weights.zig").bindLinears;
 const moe_gqmv = @import("../moe_gqmv.zig");
 const qwen4_gdn = @import("qwen4_gdn.zig");
 const Transformer = trf.Transformer;
@@ -262,6 +265,8 @@ pub const Qwen4Mtp = struct {
     fc_hid_w: mlx.mlx_array,
     fc_hid_s: mlx.mlx_array,
     fc_hid_b: mlx.mlx_array,
+    fc_emb: Linear,
+    fc_hid: Linear,
     mixer: HcWeights,
     owned: []mlx.mlx_array,
     cache: KVCache,
@@ -531,7 +536,8 @@ pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: 
     }
     const fe = try weightTriple(weights, mtp_prefix ++ ".fc_embedding", &owned, allocator, s);
     const fh = try weightTriple(weights, mtp_prefix ++ ".fc_hidden", &owned, allocator, s);
-    const mixer = try loadHcWeights(weights, mtp_prefix ++ ".hyper_connection_mixer", false, config.hc_count, config.hidden_size, &owned, allocator, s);
+    var mixer = try loadHcWeights(weights, mtp_prefix ++ ".hyper_connection_mixer", false, config.hc_count, config.hidden_size, &owned, allocator, s);
+    try bindLinears(&mixer, &config);
     const pne = weights.get(mtp_prefix ++ ".pre_fc_norm_embedding.weight") orelse return error.MissingWeight;
     const pnh = weights.get(mtp_prefix ++ ".pre_fc_norm_hidden.weight") orelse return error.MissingWeight;
     var cache = try KVCache.init(allocator, config.num_hidden_layers + 1);
@@ -547,6 +553,8 @@ pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: 
         .fc_hid_w = fh.w,
         .fc_hid_s = fh.sc,
         .fc_hid_b = fh.bi,
+        .fc_emb = try Linear.bind(&config, fe.w, fe.sc, fe.bi),
+        .fc_hid = try Linear.bind(&config, fh.w, fh.sc, fh.bi),
         .mixer = mixer,
         .owned = try owned.toOwnedSlice(allocator),
         .cache = cache,
@@ -978,7 +986,7 @@ pub fn mtpMoeRows(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights
     defer _ = mlx.mlx_array_free(expert_sum);
     const down = (try self.moeSharedDown(.mtp_rows, x, mw, &.{})).?;
     defer _ = mlx.mlx_array_free(down);
-    const gate_logit = try self.mtpProjectionRows(x, mw.shared_expert_gate_w.?, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, false);
+    const gate_logit = try self.mtpProjectionRows(x, &mw.shared_expert_gate, false);
     defer _ = mlx.mlx_array_free(gate_logit);
     return self.moeSharedGateTail(expert_sum, gate_logit, down);
 }
@@ -1066,14 +1074,14 @@ pub fn qwen4MtpForwardBatched(
     defer _ = mlx.mlx_array_free(e);
     const en = try self.rmsNorm(e, m.pre_norm_emb);
     defer _ = mlx.mlx_array_free(en);
-    const ep = try self.mtpProjectionRows(en, m.fc_emb_w, m.fc_emb_s, m.fc_emb_b, false);
+    const ep = try self.mtpProjectionRows(en, &m.fc_emb, false);
     defer _ = mlx.mlx_array_free(ep);
     const hn = try self.rmsNorm(stream_prev, m.pre_norm_hidden);
     defer _ = mlx.mlx_array_free(hn);
     var hn4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(hn4);
     try mlx.check(mlx.mlx_reshape(&hn4, hn, &[_]c_int{ N, s_max, hc, hidden }, 4, self.s));
-    const hp = try self.mtpProjectionRows(hn4, m.fc_hid_w, m.fc_hid_s, m.fc_hid_b, false);
+    const hp = try self.mtpProjectionRows(hn4, &m.fc_hid, false);
     defer _ = mlx.mlx_array_free(hp);
     var ep4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ep4);
@@ -1103,7 +1111,7 @@ pub fn qwen4MtpForwardBatched(
     const li: u32 = cfg.num_hidden_layers;
     const lw = &m.layer;
     const fa = switch (lw.attn) {
-        .full => |w| w,
+        .full => |*w| w,
         .linear => return error.MtpLayerNotAttention,
     };
 
@@ -1129,7 +1137,7 @@ pub fn qwen4MtpForwardBatched(
             try mlx.check(mlx.mlx_slice(&h_i, h, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seqs[i], hsh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
             var pre = try self.hcRead(h_i, &lw.hc_attn.?, 1, seqs[i]);
             defer pre.deinit();
-            const ao = try self.qwen4AttnWith(slot_ptrs[i], pre.mixed, &fa, &r.st.entry, li, @intCast(r.st.seq_offset), r.st.pos_base, 1, seqs[i], seqs[i] > 1);
+            const ao = try self.qwen4AttnWith(slot_ptrs[i], pre.mixed, fa, &r.st.entry, li, @intCast(r.st.seq_offset), r.st.pos_base, 1, seqs[i], seqs[i] > 1);
             defer _ = mlx.mlx_array_free(ao);
             h_i = try self.hcWrite(h_i, ao, pre.inj, 1, seqs[i]);
             const pre2 = try self.hcRead(h_i, &lw.hc_mlp.?, 1, seqs[i]);
@@ -1207,7 +1215,7 @@ pub fn qwen4MtpForwardBatched(
         _ = mlx.mlx_array_free(logits_all);
     };
     if (project != .mixed_last_row) {
-        logits_all = try self.mtpProjectionRows(mix.mixed, self.lm_head_w, self.lm_head_s, self.lm_head_b, true);
+        logits_all = try self.mtpProjectionRows(mix.mixed, &self.lm_head, true);
     }
     const lsh = if (logits_all.ctx != null) mlx.getShape(logits_all) else mlx.getShape(mix.mixed);
     for (0..rows.len) |i| {
@@ -1251,7 +1259,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
     defer _ = mlx.mlx_array_free(e);
     const en = try self.rmsNorm(e, m.pre_norm_emb);
     defer _ = mlx.mlx_array_free(en);
-    const ep = try self.qmatmul(en, m.fc_emb_w, m.fc_emb_s, m.fc_emb_b);
+    const ep = try self.qmatmul(en, &m.fc_emb);
     defer _ = mlx.mlx_array_free(ep);
     const hn = try self.rmsNorm(stream_prev, m.pre_norm_hidden); // ONE rms over all hc*H
     defer _ = mlx.mlx_array_free(hn);
@@ -1259,7 +1267,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
     var hn4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(hn4);
     try mlx.check(mlx.mlx_reshape(&hn4, hn, &shape4, 4, self.s));
-    const hp = try self.qmatmul(hn4, m.fc_hid_w, m.fc_hid_s, m.fc_hid_b);
+    const hp = try self.qmatmul(hn4, &m.fc_hid);
     defer _ = mlx.mlx_array_free(hp);
     var ep4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ep4);
@@ -1284,7 +1292,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
     var pre = try self.hcRead(h, &lw.hc_attn.?, batch, seq_len);
     defer pre.deinit();
     const attn_out = switch (lw.attn) {
-        .full => |fa| try self.qwen4AttnWith(&ctx, pre.mixed, &fa, live.entry, li, @intCast(live.seq_offset.*), live.pos_base.*, batch, seq_len, is_prefill),
+        .full => |*fa| try self.qwen4AttnWith(&ctx, pre.mixed, fa, live.entry, li, @intCast(live.seq_offset.*), live.pos_base.*, batch, seq_len, is_prefill),
         .linear => return error.MtpLayerNotAttention,
     };
     defer _ = mlx.mlx_array_free(attn_out);
@@ -1460,7 +1468,7 @@ pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_a
     const si = qwen4Standin();
     if (si.gdn or si.attn or si.mlp or si.gdn_recur or si.gdn_proj or si.attn_qsa or si.attn_sdpa or si.hc or si.moe_shared or si.moe_router or si.moe_gateup or si.moe_down) return false;
     for (self.moe_layers.?) |lw| switch (lw.mlp) {
-        .moe => |mw| if (mw.expert_bias != null) return false,
+        .moe => |*mw| if (mw.expert_bias != null) return false,
         else => return false,
     };
     var total_tokens: u64 = 0;
@@ -1580,8 +1588,8 @@ pub fn forwardQwen4VerifyRows(
             } else {
                 defer read.deinit();
                 const attn = switch (layer.attn) {
-                    .linear => |la| try self.gatedDeltaNet(read.mixed, &la, &row.entries[layer_idx], layer_idx, 1, row.seq, true),
-                    .full => |fa| try self.qwen4AttnWith(row.ctx, read.mixed, &fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
+                    .linear => |*la| try self.gatedDeltaNet(read.mixed, la, &row.entries[layer_idx], layer_idx, 1, row.seq, true),
+                    .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                 };
                 defer _ = mlx.mlx_array_free(attn);
                 try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
@@ -2042,8 +2050,8 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         defer pre.deinit();
         try prof.lap(pre.mixed, .hc_read);
         const attn_out = switch (lw.attn) {
-            .linear => |la| if (si.gdn) try standinRef(pre.mixed) else try self.gatedDeltaNet(pre.mixed, &la, entry, layer_idx, batch, seq_len, is_prefill),
-            .full => |fa| if (si.attn) try standinRef(pre.mixed) else try self.qwen4AttnWith(ctx, pre.mixed, &fa, entry, li, @intCast(offset), 0, batch, seq_len, is_prefill),
+            .linear => |*la| if (si.gdn) try standinRef(pre.mixed) else try self.gatedDeltaNet(pre.mixed, la, entry, layer_idx, batch, seq_len, is_prefill),
+            .full => |*fa| if (si.attn) try standinRef(pre.mixed) else try self.qwen4AttnWith(ctx, pre.mixed, fa, entry, li, @intCast(offset), 0, batch, seq_len, is_prefill),
         };
         defer _ = mlx.mlx_array_free(attn_out);
         try prof.lap(attn_out, if (lw.attn == .linear) .gdn else .attn);
@@ -2233,7 +2241,7 @@ pub fn gatedFullAttnProjected(
     const given: ?*const AttnVerifyInputs = if (stacked) |*values| values else projected;
 
     // Q projection
-    const q_proj = if (given) |values| values.q else try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
+    const q_proj = if (given) |values| values.q else try self.qmatmul(x, &fa.q);
     defer if (given == null) {
         _ = mlx.mlx_array_free(q_proj);
     };
@@ -2274,11 +2282,11 @@ pub fn gatedFullAttnProjected(
     }
 
     // K, V projections
-    const k_proj = if (given) |values| values.k else try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
+    const k_proj = if (given) |values| values.k else try self.qmatmul(x, &fa.k);
     defer if (given == null) {
         _ = mlx.mlx_array_free(k_proj);
     };
-    const v_proj = if (given) |values| values.v else try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
+    const v_proj = if (given) |values| values.v else try self.qmatmul(x, &fa.v);
     defer if (given == null) {
         _ = mlx.mlx_array_free(v_proj);
     };
@@ -2627,14 +2635,14 @@ pub fn gatedAttnTail(
         defer _ = mlx.mlx_array_free(gated);
         try mlx.check(mlx.mlx_reshape(&gated, gated_4d, &flat_shape, 3, self.s));
         if (skip_output) return standinRef(gated);
-        return self.qmatmul(gated, fa.o_w, fa.o_s, fa.o_b);
+        return self.qmatmul(gated, &fa.o);
     }
 
     var attn_flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_flat);
     try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
     if (skip_output) return standinRef(attn_flat);
-    return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+    return self.qmatmul(attn_flat, &fa.o);
 }
 
 pub const AttnVerifyInputs = struct {
@@ -2677,6 +2685,11 @@ pub fn verifyRowsJoined(
     },
 ) !?[]mlx.mlx_array {
     if (inputs.len < 2 or inputs.len > 8) return null;
+    // The joined kernels serve affine banks only: one look at the group's kinds, not a query per projection.
+    inline for (switch (kind) {
+        .attention => .{ "q", "k", "v" },
+        .gdn => .{ "qkv", "z", "a", "b" },
+    }) |name| if (@field(w, name) != .affine) return null;
     var widths: [MAX_BATCH_ROWS]c_int = undefined;
     var total: c_int = 0;
     for (inputs, 0..) |input, i| {
@@ -2701,8 +2714,8 @@ pub fn verifyRowsJoined(
         .gdn => .{ "qkv", "z", "a", "b" },
     }) |name| {
         const part = switch (kind) {
-            .attention => try projectRows(self.s, decode, .attention, joined, @field(w, name ++ "_w"), @field(w, name ++ "_s"), @field(w, name ++ "_b"), widths[0..inputs.len]),
-            .gdn => try projectRows(self.s, decode, .gdn, joined, @field(w, name ++ "_w"), @field(w, name ++ "_s"), @field(w, name ++ "_b"), widths[0..inputs.len]),
+            .attention => try projectRows(self.s, decode, .attention, joined, &@field(w, name), widths[0..inputs.len]),
+            .gdn => try projectRows(self.s, decode, .gdn, joined, &@field(w, name), widths[0..inputs.len]),
         };
         @field(projections, name) = part orelse return null;
     }
@@ -2728,16 +2741,16 @@ pub fn verifyRowsJoined(
         };
         offset += widths[i];
     }
-    const out_w, const out_s, const out_b = switch (kind) {
-        .attention => .{ w.o_w, w.o_s, w.o_b },
-        .gdn => .{ w.out_w, w.out_s, w.out_b },
+    const out: *const Linear = switch (kind) {
+        .attention => &w.o,
+        .gdn => &w.out,
     };
     const flat_vec = mlx.mlx_vector_array_new_data(&flat, inputs.len);
     defer _ = mlx.mlx_vector_array_free(flat_vec);
     var joined_flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(joined_flat);
     try mlx.check(mlx.mlx_concatenate_axis(&joined_flat, flat_vec, 1, self.s));
-    const projected = try projectRows(self.s, decode, kind, joined_flat, out_w, out_s, out_b, widths[0..inputs.len]);
+    const projected = try projectRows(self.s, decode, kind, joined_flat, out, widths[0..inputs.len]);
     defer if (projected) |value| {
         _ = mlx.mlx_array_free(value);
     };
@@ -2754,8 +2767,8 @@ pub fn verifyRowsJoined(
             errdefer _ = mlx.mlx_array_free(result[i]);
             try mlx.check(mlx.mlx_slice(&result[i], value, &.{ 0, offset, 0 }, 3, &.{ 1, offset + widths[i], mlx.getShape(value)[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
         } else result[i] = switch (kind) {
-            .attention => try self.qmatmul(flat[i], out_w, out_s, out_b),
-            .gdn => try self.qmatmul(flat[i], out_w, out_s, out_b),
+            .attention => try self.qmatmul(flat[i], out),
+            .gdn => try self.qmatmul(flat[i], out),
         };
         built += 1;
         offset += widths[i];
@@ -2793,12 +2806,16 @@ pub fn attnVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, entries
     return self.verifyRowsJoined(.attention, false, inputs, entries, ctxs, generations, layer, fa);
 }
 
-pub fn projectRows(s: mlx.mlx_stream, comptime decode: bool, comptime kind: VerifyRowsKind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !?mlx.mlx_array {
+pub fn projectRows(s: mlx.mlx_stream, comptime decode: bool, comptime kind: VerifyRowsKind, x: mlx.mlx_array, lin: *const Linear, widths: []const c_int) !?mlx.mlx_array {
     const pk: VerifyProjectionKind = switch (kind) {
         .attention => .attention,
         .gdn => .gdn,
     };
-    return if (decode) decodeRowsProjection(s, x, w, sc, bi, widths) else verifyJoinedProjection(s, x, w, sc, bi, widths, pk);
+    const a = switch (lin.*) {
+        .affine => |a| a,
+        else => return null,
+    };
+    return if (decode) decodeRowsProjection(s, x, a.w, a.s, a.b, widths) else verifyJoinedProjection(s, x, a.w, a.s, a.b, widths, pk);
 }
 
 pub fn gdnDecodeRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, generations: []const u64, layer: usize, la: *const LinearAttnWeights) !?[]mlx.mlx_array {
@@ -2875,8 +2892,8 @@ pub fn evalQwen4MtpResident(mtp_head: *const Qwen4Mtp) !void {
     if (layer.hc_mlp) |*weights| appendStructArrays(vec, weights);
     appendHybridMlpWeights(vec, &layer.mlp);
     switch (layer.attn) {
-        .full => |weights| appendFullAttnWeights(vec, &weights),
-        .linear => |weights| appendLinearAttnWeights(vec, &weights),
+        .full => |*weights| appendFullAttnWeights(vec, weights),
+        .linear => |*weights| appendLinearAttnWeights(vec, weights),
     }
     inline for (.{
         mtp_head.pre_norm_emb,
@@ -3828,7 +3845,7 @@ fn expectLadderPleHistoryEqual(want: *const SSMCacheEntry, got: *const SSMCacheE
 const Qwen4LadderRig = struct {
     fx: Qwen4LadderHostFixture,
     layer_bytes: [LAYERS * @sizeOf(MoeLayerWeights)]u8 align(@alignOf(MoeLayerWeights)),
-    arrs: [16]mlx.mlx_array,
+    arrs: [40]mlx.mlx_array,
     n: usize,
 
     const LAYERS = 4;
@@ -3898,6 +3915,8 @@ const Qwen4LadderRig = struct {
             .norm_conv = try self.weight(r, &.{ HC, HIDDEN }),
             .conv_w = try self.weight(r, &.{ HC * HIDDEN, @intCast(x.config.ple_conv_kernel), 1 }),
         };
+        try bindLinears(&x.qwen4_mixer.?, &x.config);
+        try bindLinears(&layers[0].ple.?, &x.config);
         x.moe_layers = layers[0..LAYERS];
         x.decode_async_ladder = 0;
         x.decode_async_ladder_qwen4 = Transformer.qwen4DecodeLadderStride(null);
@@ -4039,14 +4058,15 @@ const StreamDeferredRig = struct {
         x.one = mlx.mlx_array_new_float(1);
         x.ones_hidden = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_ones(&x.ones_hidden.?, &[_]c_int{64}, 1, .bfloat16, x.s));
-        const hc_weights = HcWeights{
+        var hc_weights = HcWeights{
             .norm_w = try self.weight(r, &.{ 4, 64 }),
             .down_w = try self.weight(r, &.{ 256, 8 }), .down_s = none, .down_b = none,
             .up_w = try self.weight(r, &.{ 8, 256 }), .up_s = none, .up_b = none,
             .inject_w = try self.weight(r, &.{ 256, 4 }), .inject_s = none, .inject_b = none,
         };
+        try bindLinears(&hc_weights, &x.config);
         x.qwen4_mixer = hc_weights;
-        var mw: MoeMlpWeights = std.mem.zeroes(MoeMlpWeights);
+        var mw: MoeMlpWeights = std.mem.zeroInit(MoeMlpWeights, .{});
         mw.router_w = try self.weight(r, &.{ 64, 4 });
         mw.switch_gate_w = pack.residentBank(4, 0);
         mw.switch_gate_s = pack.residentBank(4, 1);
@@ -4061,7 +4081,7 @@ const StreamDeferredRig = struct {
             self.arrays[self.count] = a;
             self.count += 1;
         }
-        const la = LinearAttnWeights{
+        var la = LinearAttnWeights{
             .qkv_w = try self.weight(r, &.{ 64, 96 }), .qkv_s = none, .qkv_b = none,
             .z_w = try self.weight(r, &.{ 64, 32 }), .z_s = none, .z_b = none,
             .a_w = try self.weight(r, &.{ 64, 1 }), .a_s = none, .a_b = none,
@@ -4071,6 +4091,8 @@ const StreamDeferredRig = struct {
             .norm_w = try self.weight(r, &.{32}),
             .A_log = try self.weight(r, &.{1}), .dt_bias = try self.weight(r, &.{1}),
             };
+        try bindLinears(&la, &x.config);
+        try bindLinears(&mw, &x.config);
         for (&self.layers) |*layer| layer.* = .{
             .input_norm = none, .post_attn_norm = none, .is_linear = true,
             .attn = .{ .linear = la }, .mlp = .{ .moe = mw },
@@ -4509,7 +4531,7 @@ test "exl3 MTP rows wider than the decode arm refuse by Exl3MtpRowsExceedDecode"
     };
     xfm.one = mlx.mlx_array_new_float(1.0);
     defer _ = mlx.mlx_array_free(xfm.one);
-    xfm.bits_cache = .{};
+    xfm.bits_cache = null;
     xfm.compiled_moe_routing = null;
     xfm.cost_trace_active = false;
     var mw: MoeMlpWeights = .{
@@ -4535,6 +4557,7 @@ test "exl3 MTP rows wider than the decode arm refuse by Exl3MtpRowsExceedDecode"
         .shared_down_s = mlx.mlx_array_new(),
         .shared_down_b = mlx.mlx_array_new(),
     };
+    try bindLinears(&mw, &xfm.config);
     defer {
         const arrs = [_]mlx.mlx_array{
             mw.router_w,      mw.router_s,      mw.router_b,
@@ -4613,7 +4636,7 @@ test "exl3 MTP fused rows match N solo calls on the same kernel" {
     };
     xfm.one = mlx.mlx_array_new_float(1.0);
     defer _ = mlx.mlx_array_free(xfm.one);
-    xfm.bits_cache = .{};
+    xfm.bits_cache = null;
     xfm.compiled_moe_routing = null;
     xfm.compiled_gelu = null;
     xfm.compiled_geglu = null;
@@ -4669,6 +4692,7 @@ test "exl3 MTP fused rows match N solo calls on the same kernel" {
         .shared_expert_gate_s = none,
         .shared_expert_gate_b = none,
     };
+    try bindLinears(&mw, &xfm.config);
     const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), 1, @intCast(dim) }, 3, .float16);
     defer _ = mlx.mlx_array_free(x_arr);
     try mlx.check(mlx.mlx_array_eval(tr));
@@ -5665,6 +5689,67 @@ test "single-stream verify feature selection excludes prefill and ordinary decod
     }
 }
 
+/// A random `[rows, cols]` bf16 weight stored as a 4-bit affine triple, kept by the rig.
+fn ladderAffine(rig: *Qwen4LadderRig, r: std.Random, rows: c_int, cols: c_int) ![3]mlx.mlx_array {
+    const s = rig.fx.xfm().s;
+    const dense = try rig.weight(r, &.{ rows, cols });
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_quantize(&parts, dense, .{ .value = 64, .has_value = true }, .{ .value = 4, .has_value = true }, "affine", .{ .ctx = null }, s));
+    var q: [3]mlx.mlx_array = undefined;
+    for (&q, 0..) |*a, i| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(a, parts, i));
+        rig.keep(a.*);
+    }
+    return q;
+}
+
+test "qwen4 forward: the layer dispatch resolves an affine projection once, in the weights it stores" {
+    try mlx.requireGpu();
+    qwen4_standin_override = .{ .gdn = true, .mlp = true, .hc = true };
+    defer qwen4_standin_override = null;
+    var rig: Qwen4LadderRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const x = rig.fx.xfm();
+    x.config.num_attention_heads = 2;
+    x.config.num_key_value_heads = 1;
+    x.config.head_dim = 128;
+    x.config.query_pre_attn_scalar = 128;
+    x.config.partial_rotary_factor = 0.25;
+    x.config.attn_output_gate = true;
+    x.config.rms_norm_eps = 1e-6;
+    x.config.quant_bits = 4;
+    x.config.quant_group_size = 64;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    const dims = [4][2]c_int{ .{ 512, 128 }, .{ 128, 128 }, .{ 128, 128 }, .{ 128, 256 } };
+    var t: [4][3]mlx.mlx_array = undefined;
+    for (&t, dims) |*triple, d| triple.* = try ladderAffine(&rig, r, d[0], d[1]);
+    var fa = std.mem.zeroInit(FullAttnWeights, .{
+        .q_w = t[0][0], .q_s = t[0][1], .q_b = t[0][2],
+        .k_w = t[1][0], .k_s = t[1][1], .k_b = t[1][2],
+        .v_w = t[2][0], .v_s = t[2][1], .v_b = t[2][2],
+        .o_w = t[3][0], .o_s = t[3][1], .o_b = t[3][2],
+        .q_norm = try rig.weight(r, &.{128}),
+        .k_norm = try rig.weight(r, &.{128}),
+    });
+    try bindLinears(&fa, &x.config);
+    for (x.moe_layers.?) |*lw| lw.attn = .{ .full = fa };
+
+    var sl = try Qwen4TestSlot.init(testing.allocator, Qwen4LadderRig.LAYERS);
+    defer sl.deinit(testing.allocator);
+    // A prefill chunk, then a decode tick: both reach the dispatch.
+    try rig.prefill(sl, &.{ 5, 17, 42, 9 });
+    sl.off += 4;
+    try rig.prefill(sl, &.{13});
+    for (x.moe_layers.?) |lw| {
+        const bound = lw.attn.full;
+        inline for (.{ "q", "k", "v", "o" }) |name| try testing.expect(@field(bound, name).affine.solved.bits != 0);
+    }
+}
+
 test "qwen4 decode ladder: stride resolution keeps an explicit off and leaves other arches off" {
     try testing.expectEqual(@as(u32, 4), Transformer.qwen4DecodeLadderStride(null));
     try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride("0"));
@@ -5801,17 +5886,17 @@ test "qwen4 attention profiler: off and narrow widths stay idle, reset clears fo
 
 test "streamed deferred verification crosses only GDN MoE layers without PLE" {
     var layer: MoeLayerWeights = undefined;
-    layer.attn = .{ .linear = std.mem.zeroes(LinearAttnWeights) };
-    layer.mlp = .{ .moe = std.mem.zeroes(MoeMlpWeights) };
+    layer.attn = .{ .linear = std.mem.zeroInit(LinearAttnWeights, .{}) };
+    layer.mlp = .{ .moe = std.mem.zeroInit(MoeMlpWeights, .{}) };
     layer.ple = null;
     try testing.expect(streamedSuccessorSafe(&layer));
-    layer.ple = std.mem.zeroes(PleWeights);
+    layer.ple = std.mem.zeroInit(PleWeights, .{});
     try testing.expect(!streamedSuccessorSafe(&layer));
     layer.ple = null;
-    layer.attn = .{ .full = std.mem.zeroes(FullAttnWeights) };
+    layer.attn = .{ .full = std.mem.zeroInit(FullAttnWeights, .{}) };
     try testing.expect(!streamedSuccessorSafe(&layer));
-    layer.attn = .{ .linear = std.mem.zeroes(LinearAttnWeights) };
-    layer.mlp = .{ .dense = std.mem.zeroes(DenseMlpWeights) };
+    layer.attn = .{ .linear = std.mem.zeroInit(LinearAttnWeights, .{}) };
+    layer.mlp = .{ .dense = std.mem.zeroInit(DenseMlpWeights, .{}) };
     try testing.expect(!streamedSuccessorSafe(&layer));
 }
 

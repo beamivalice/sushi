@@ -55,6 +55,28 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.ml
     return out;
 }
 
+/// `matmul` for a bank whose launches `geo` holds (`linear.Geo.get` on its trellis, read once at load): the weight's
+/// shapes and the launch's configs are not read again, so a bf16 `x` costs its own shape query and a dtype query.
+/// A call `geo` does not serve (rows past the multi-row arm, another dtype) is `matmul`.
+pub fn matmulGeo(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, geo: *const linear.Geo, dec: format.Decode, wide: bool) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const in = sh[sh.len - 1];
+    const rows = leadingRows(sh);
+    if (in != geo.in or mlx.mlx_array_dtype(x) != .bfloat16) return matmul(s, x, w, suh, svh, dec, wide);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ rows, in }, 2, s));
+    const y = (try linear.linearGeo(s, flat, rows, .{ .trellis = w, .suh = suh, .svh = svh }, geo, dec, launchOpts(wide))) orelse return matmul(s, x, w, suh, svh, dec, wide);
+    defer _ = mlx.mlx_array_free(y);
+    var shape: [8]c_int = undefined;
+    @memcpy(shape[0..sh.len], sh);
+    shape[sh.len - 1] = geo.out;
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, y, &shape, sh.len, s));
+    return out;
+}
+
 /// The most rows one stacked launch serves outside a wide verify; a wider chunk runs each projection alone.
 pub const SHARED_ROWS_MAX: usize = @intCast(project_rows.PROJECT_ROWS_MAX);
 
@@ -96,6 +118,9 @@ pub fn fuse(parts: []const *Triple, owned: *std.ArrayList(mlx.mlx_array), alloca
     const ev = mlx.mlx_vector_array_new_data(&cat, 3);
     defer _ = mlx.mlx_vector_array_free(ev);
     try mlx.check(mlx.mlx_eval(ev));
+    var bounds: [3]c_int = @splat(cols[parts.len]);
+    for (1..parts.len) |i| bounds[i - 1] = cols[i];
+    const geo = try linear.Geo.get(cat[0], bounds);
     // Views first, so a failure leaves the parts as they were.
     var views: [linear.SHARED_MAX]Triple = undefined;
     var viewed: usize = 0;
@@ -119,7 +144,7 @@ pub fn fuse(parts: []const *Triple, owned: *std.ArrayList(mlx.mlx_array), alloca
         owned.appendSliceAssumeCapacity(&.{ stacked.w, stacked.s, stacked.b });
     }
     owned.appendSliceAssumeCapacity(&cat);
-    return .{ .p = .{ .trellis = cat[0], .suh = cat[1], .svh = cat[2] }, .cols = cols, .count = parts.len };
+    return .{ .p = .{ .trellis = cat[0], .suh = cat[1], .svh = cat[2] }, .cols = cols, .count = parts.len, .geo = geo };
 }
 
 /// Frees `a` from `owned`, if it holds it.
@@ -142,7 +167,9 @@ pub fn sharedProject(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: forma
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ rows, in }, 2, s));
-    try linear.linearSharedWith(s, flat, sh, dec, outs, opts);
+    // The geo's launches are bf16's; another dtype reads its shapes as `linearSharedWith` does.
+    const geo_ok = if (sh.geo) |g| in == g.in and mlx.mlx_array_dtype(x) == .bfloat16 else false;
+    if (!geo_ok or !try linear.linearSharedGeo(s, flat, rows, sh, dec, outs, opts)) try linear.linearSharedWith(s, flat, sh, dec, outs, opts);
     errdefer for (outs) |a| {
         _ = mlx.mlx_array_free(a);
     };
@@ -503,6 +530,171 @@ test "exl3 trunk: a 9- to 16-row spec verify keeps each row's decode tick bytes,
 
     var none: [2]mlx.mlx_array = undefined;
     try testing.expect(!try sharedProject(s, try rowsOf(s, xs, 0, 9, &pool), sh, dec, &none, false));
+}
+
+test "exl3 trunk: a launch from the weight's geo gives the bytes of the launch that reads its shapes, alone and stacked" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x57b1);
+    const rnd = prng.random();
+    const dec = format.Decode.tabled(.spec1, .w15);
+    const rates = [_]u32{ 48, 96 };
+    for (rates) |n| {
+        const t = try (try TestBank.init(alloc, rnd, 2560, 1024, n)).triple(s);
+        var parts: [2]Triple = undefined;
+        for (&parts, [_]usize{ 512, 256 }) |*p, w| p.* = try (try TestBank.init(alloc, rnd, 2560, w, n)).triple(s);
+        var owned: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (owned.items) |a| _ = mlx.mlx_array_free(a);
+            owned.deinit(testing.allocator);
+        }
+        defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const orig = parts;
+        defer for (orig) |o| for ([_]mlx.mlx_array{ o.w, o.s, o.b }) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
+        const sh = (try fuse(&.{ &parts[0], &parts[1] }, &owned, testing.allocator, s)).?;
+        try testing.expect(sh.geo != null);
+        const geo = try linear.Geo.init(t.w, null);
+        try testing.expectEqual(@as(c_int, 2560), geo.in);
+        try testing.expectEqual(@as(c_int, 1024), geo.out);
+        const max: usize = if (kernels.gemmNaxOn()) @intCast(project_rows.NAX_ROWS_MAX) else @intCast(project_rows.PROJECT_ROWS_MAX);
+        const xb = try alloc.alloc(u16, (max + 4) * 2560);
+        for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
+        for (1..max + 5) |rows| {
+            const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, @intCast(rows), 2560 }, 3, .bfloat16);
+            defer _ = mlx.mlx_array_free(x);
+            for ([_]bool{ false, true }) |wide| {
+                const want = try matmul(s, x, t.w, t.s, t.b, dec, wide);
+                defer _ = mlx.mlx_array_free(want);
+                const got = try matmulGeo(s, x, t.w, t.s, t.b, &geo, dec, wide);
+                defer _ = mlx.mlx_array_free(got);
+                try testing.expect(try bitsEqual(s, got, want));
+                var a: [2]mlx.mlx_array = undefined;
+                var b: [2]mlx.mlx_array = undefined;
+                var bare = sh;
+                bare.geo = null;
+                const served = try sharedProject(s, x, bare, dec, &a, wide);
+                try testing.expectEqual(served, try sharedProject(s, x, sh, dec, &b, wide));
+                if (!served) continue;
+                defer for (a ++ b) |arr| {
+                    _ = mlx.mlx_array_free(arr);
+                };
+                for (a, b) |ya, yb| try testing.expect(try bitsEqual(s, ya, yb));
+            }
+        }
+    }
+}
+
+test "exl3 trunk: a geo bound with NAX on runs the SIMD arm once the NAX latch is set" {
+    try mlx.requireGpu();
+    if (!kernels.gemmNaxOn()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x57b3);
+    const rnd = prng.random();
+    const dec = format.Decode.tabled(.spec1, .w15);
+    const t = try (try TestBank.init(alloc, rnd, 2560, 1024, 48)).triple(s);
+    defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var parts: [2]Triple = undefined;
+    for (&parts, [_]usize{ 512, 256 }) |*p, w| p.* = try (try TestBank.init(alloc, rnd, 2560, w, 48)).triple(s);
+    const orig = parts;
+    defer for (orig) |o| for ([_]mlx.mlx_array{ o.w, o.s, o.b }) |arr| {
+        _ = mlx.mlx_array_free(arr);
+    };
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(testing.allocator);
+    }
+    const sh = (try fuse(&.{ &parts[0], &parts[1] }, &owned, testing.allocator, s)).?;
+    const geo = try linear.Geo.init(t.w, null);
+    const xb = try alloc.alloc(u16, 8 * 2560);
+    for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
+
+    const previous = kernels.gemm_nax_failed;
+    defer kernels.gemm_nax_failed = previous;
+    kernels.gemm_nax_failed = true;
+    for (1..9) |rows| {
+        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, @intCast(rows), 2560 }, 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(x);
+        const want = try matmul(s, x, t.w, t.s, t.b, dec, false);
+        defer _ = mlx.mlx_array_free(want);
+        const got = try matmulGeo(s, x, t.w, t.s, t.b, &geo, dec, false);
+        defer _ = mlx.mlx_array_free(got);
+        try testing.expect(try bitsEqual(s, got, want));
+        var a: [2]mlx.mlx_array = undefined;
+        var b: [2]mlx.mlx_array = undefined;
+        var bare = sh;
+        bare.geo = null;
+        const served = try sharedProject(s, x, bare, dec, &a, false);
+        try testing.expectEqual(served, try sharedProject(s, x, sh, dec, &b, false));
+        if (!served) continue;
+        defer for (a ++ b) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
+        for (a, b) |ya, yb| try testing.expect(try bitsEqual(s, ya, yb));
+    }
+}
+
+test "exl3 trunk: banks of one shape share one geo, and a geo made after the NAX latch holds no NAX launch" {
+    try mlx.requireGpu();
+    if (!kernels.gemmNaxOn()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x57b4);
+    const rnd = prng.random();
+    var t: [2]Triple = undefined;
+    for (&t) |*x| x.* = try (try TestBank.init(alloc, rnd, 2560, 1152, 48)).triple(s);
+    defer for (t) |x| for ([_]mlx.mlx_array{ x.w, x.s, x.b }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    try testing.expectEqual(try linear.Geo.get(t[0].w, null), try linear.Geo.get(t[1].w, null));
+    try testing.expect(try linear.Geo.get(t[0].w, null) != try linear.Geo.get(t[0].w, .{ 512, 1024, 1152 }));
+    const before = try linear.Geo.get(t[0].w, null);
+    const previous = kernels.gemm_nax_failed;
+    defer kernels.gemm_nax_failed = previous;
+    kernels.gemm_nax_failed = true;
+    const after = try linear.Geo.get(t[0].w, null);
+    try testing.expect(before != after);
+    for (after.rows) |r| if (r) |row| try testing.expect(!row.g.nax);
+}
+
+test "exl3 trunk: a launch of another dtype runs as it did, whatever the geo holds" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x57b2);
+    const rnd = prng.random();
+    const dec = format.Decode.tabled(.spec1, .w15);
+    const t = try (try TestBank.init(alloc, rnd, 256, 384, 64)).triple(s);
+    defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const geo = try linear.Geo.init(t.w, null);
+    const xb = try alloc.alloc(u16, 3 * 256);
+    for (xb) |*b| b.* = format.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+    const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, 3, 256 }, 3, .float16);
+    defer _ = mlx.mlx_array_free(x);
+    const want = try matmul(s, x, t.w, t.s, t.b, dec, false);
+    defer _ = mlx.mlx_array_free(want);
+    const got = try matmulGeo(s, x, t.w, t.s, t.b, &geo, dec, false);
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(got));
+    try testing.expect(try bitsEqual(s, got, want));
 }
 
 test "exl3 trunk: fuse leaves linears it cannot stack as they were" {
