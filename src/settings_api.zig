@@ -2,6 +2,7 @@
 //! live under its `"server"` object, a model's under its absolute path. A launch flag outranks the file, so a key
 //! a flag pins is reported locked; the file still takes the write, for the next start without that flag.
 const std = @import("std");
+const http = @import("http.zig");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
 const scheduler = @import("scheduler.zig");
@@ -10,6 +11,8 @@ const model_registry_mod = @import("model_registry.zig");
 const disk_placement = @import("disk_placement.zig");
 const http_conn = @import("http_conn.zig");
 const server = @import("server.zig");
+const server_state = @import("server_state.zig");
+const arch_flags = @import("arch/flags.zig");
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
 const model_mod = @import("model.zig");
@@ -563,20 +566,14 @@ fn stubFit(io: std.Io, allocator: std.mem.Allocator, row: *const ModelRow) model
     const sm = model_discovery.readStubMeta(io, allocator, row.path);
     const geometry = sm.found and sm.hidden_size > 0 and sm.num_hidden_layers > 0 and sm.num_experts > 0 and
         sm.num_experts_per_tok > 0 and sm.moe_intermediate_size > 0;
-    const probe = model_mod.ModelConfig{ .model_type = arch };
-    const latent = probe.isGlm5();
-    const layout: expert_quant.Layout = if (sm.quantized_experts) .exl3_k4 else .mxfp4_w123;
-    return .{
-        .arch = arch,
-        .streams_experts = geometry and expert_quant.isExpertStreamingArch(arch),
-        .has_vision = sm.has_vision,
-        .serves_mtp = !latent,
-        .streaming_required = probe.isDsv41() or models_api.streamingRequiredMarker(arch, sm.quant_bits, sm.quantized_experts, geometry, row.index_complete),
-        .head_streams = expert_stream.streamedMtpHeadSupported(probe.isQwen4(), probe.isDsv41(), layout),
-        .stq_experts = sm.quantized_experts,
-        .latent_kv = latent,
-        .context_cap = sm.context_cap,
-    };
+    const probe = model_mod.ModelConfig{ .model_type = arch, .expert_layout = if (sm.quantized_experts) .exl3_k4 else .mxfp4_w123 };
+    var fit = arch_flags.settingsFit(&probe);
+    fit.streams_experts = geometry and expert_quant.isExpertStreamingArch(arch);
+    fit.has_vision = sm.has_vision;
+    fit.streaming_required = probe.isDsv41() or models_api.streamingRequiredMarker(arch, sm.quant_bits, sm.quantized_experts, geometry, row.index_complete);
+    fit.stq_experts = sm.quantized_experts;
+    fit.context_cap = sm.context_cap;
+    return fit;
 }
 
 /// The facts only the pack's files hold, read for a loaded model as for a stub: its head, and for a stub its chat template.
@@ -596,7 +593,7 @@ fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
     row.fit.arch = e.arch_hint;
     if (e.state == .ready and e.config != null) {
         const c = e.config.?;
-        row.fit = server.settingsFit(c);
+        row.fit = arch_flags.settingsFit(c);
         row.loaded = loadedWith(c);
         row.defaults = resolvedDefaults(c);
         if (e.chat_config) |cc| {
@@ -628,8 +625,8 @@ fn collectRows(allocator: std.mem.Allocator, registry: *model_registry_mod.Model
 }
 
 pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
-    const registry = server.global_registry orelse {
-        try server.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+    const registry = server_state.global_registry orelse {
+        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
         return;
     };
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -649,7 +646,7 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
         .think = effort_mod.think_effort_flag,
     });
     defer allocator.free(body);
-    try server.sendResponse(stream, "200 OK", "application/json", body);
+    try http.sendResponse(stream, "200 OK", "application/json", body);
 }
 
 fn dirReadable(io: std.Io, path: []const u8) bool {
@@ -666,8 +663,8 @@ fn refusalMessage(arena: std.mem.Allocator, fit: model_settings.Fit, existing: ?
 }
 
 pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
-    const sch = server.global_scheduler orelse {
-        try server.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+    const sch = server_state.global_scheduler orelse {
+        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -678,14 +675,14 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         .rejected => |r| {
             var status_buf: [32]u8 = undefined;
             const status = std.fmt.bufPrint(&status_buf, "{d} Bad Request", .{r.status}) catch "400 Bad Request";
-            try server.sendErrorResponse(allocator, stream, status, r.err_type, r.message, r.status);
+            try http.sendErrorResponse(allocator, stream, status, r.err_type, r.message, r.status);
             return;
         },
     };
 
     for (plan.server_edits) |e| if (std.mem.eql(u8, e.key, "models_dir")) if (e.value) |v| {
         if (!dirReadable(stream.io, v.string)) {
-            try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", "models_dir does not exist or cannot be read", 400);
+            try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", "models_dir does not exist or cannot be read", 400);
             return;
         }
     };
@@ -695,7 +692,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     var model_loaded = false;
     if (plan.model_id) |id| {
         const entry = sch.registry.resolveEntry(id) catch {
-            try server.sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+            try http.sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
             return;
         };
         model_path = entry.path;
@@ -708,7 +705,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             var held = model_settings.load(allocator, stream.io, path);
             defer held.deinit();
             if (refusalMessage(arena, row.fit, model_settings.modelObject(&held, model_path), plan.model_edits)) |message| {
-                try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
+                try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
                 return;
             }
         }
@@ -723,7 +720,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     if (plan.namesEffort()) {
         const refused = applyEffort(arena, stream.io, path, plan.effort) catch |err| return writeFailed(allocator, stream, err);
         if (refused) |message| {
-            try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
+            try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
             return;
         }
     }
@@ -763,16 +760,16 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         try writeJson(w, if (model_loaded) "saved; the loaded model uses it after a reload" else "saved; applies at the model's next load");
     }
     try w.print("}},\"model_loaded\":{}}}", .{model_loaded});
-    try server.sendResponse(stream, "200 OK", "application/json", out.written());
+    try http.sendResponse(stream, "200 OK", "application/json", out.written());
 }
 
 fn writeFailed(allocator: std.mem.Allocator, stream: *http_conn.Conn, err: anyerror) !void {
     if (err == error.MalformedSettingsFile) {
-        try server.sendErrorResponse(allocator, stream, "409 Conflict", "settings_file_malformed", "The settings file is not a JSON object; fix or remove it before saving", 409);
+        try http.sendErrorResponse(allocator, stream, "409 Conflict", "settings_file_malformed", "The settings file is not a JSON object; fix or remove it before saving", 409);
         return;
     }
     log.warn("[settings] write failed: {s}\n", .{@errorName(err)});
-    try server.sendErrorResponse(allocator, stream, "500 Internal Server Error", "settings_write_failed", "Could not write the settings file", 500);
+    try http.sendErrorResponse(allocator, stream, "500 Internal Server Error", "settings_write_failed", "Could not write the settings file", 500);
 }
 
 fn cacheBudgetMessage(running_tiers_resized: usize) []const u8 {
@@ -783,7 +780,7 @@ fn cacheBudgetMessage(running_tiers_resized: usize) []const u8 {
 fn applyCacheBudget(sch: *@import("scheduler.zig").Scheduler, value: ?std.json.Value) []const u8 {
     if (model_settings.launch_locks.prefix_cache_disk_gb.set) return "saved; the --prefix-cache-disk flag still sets the size until a start without it";
     const gb: ?u64 = if (value) |v| @intCast(v.integer) else null;
-    server.setDiskAsk(if (gb) |g| g << 30 else disk_placement.DEFAULT_DISK_CAP, gb != null);
+    server_state.setDiskAsk(if (gb) |g| g << 30 else disk_placement.DEFAULT_DISK_CAP, gb != null);
     const bytes = (gb orelse 0) << 30;
     if (gb == null or bytes == 0) return cacheBudgetMessage(0);
     var tiers = std.ArrayList(*model_registry_mod.LoadedModel).empty;

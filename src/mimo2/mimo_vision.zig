@@ -17,6 +17,7 @@ const rmsRatio = vision_common.rmsRatio;
 const log = @import("../log.zig");
 const chat_mod = @import("../chat.zig");
 const request_media = @import("../request_media.zig");
+const arch_media = @import("../arch/media.zig");
 const parseImageUrlContent = request_media.parseImageUrlContent;
 
 const ModelConfig = model_mod.ModelConfig;
@@ -946,7 +947,7 @@ test "mimo vision bill: encode scratch stays within encodeScratchBytes per image
 test "a MiMo image is resized and normalized the vendor way, in Qwen2-VL patch order" {
     // 36x20 PNG, four flat quadrants: red, green / blue, yellow.
     const url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACQAAAAUCAIAAABqGAhiAAAALUlEQVR42mM4ISdHBpIjSxvDqGWjlo1aNswsI0/fhw8iZKBRy0YtG7VsmFkGAGi0hC5b6HVfAAAAAElFTkSuQmCC";
-    const vp = chat_mod.VisionPreproc{ .mode = .mimo, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 8192, .max_pixels = 8388608 };
+    const vp = chat_mod.VisionPreproc{ .mode = arch_media.modeNamed("mimo") orelse return error.SkipZigTest, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 8192, .max_pixels = 8388608 };
     const img = parseImageUrlContent(std.testing.allocator, url, vp) orelse return error.DecodeFailed;
     defer std.testing.allocator.free(img.pixels);
     // Vendor smart_resize: 20x36 -> 96x128 -> a 6x8 patch grid.

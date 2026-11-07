@@ -14,8 +14,15 @@ pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
 
-pub const packs = .{}; // slot:packs (S2h)
-pub const flags = .{}; // slot:flags (S2h)
+pub const packs = struct { // slot:packs (S2h)
+    pub const product = "Qwen3.8-Flash-Next";
+    pub const aliases = [_]@import("../arch/packs.zig").Alias{
+        .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 131072 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+        .{ .name = "qwen3.8-flash-next", .tag = "2.75bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .is_default = true, .tier_gb = 64, .recommend_gb = 64, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 250000 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+        .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 --prefill-chunk 2048 --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+    };
+};
+pub const flags = @import("qwen4_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("qwen4_drafter.zig");
 

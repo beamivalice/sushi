@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The "architecture not supported" and "file format not supported" load refusals list every architecture this build
+  serves**: the first now also names DeepSeek-V4.1-Flash, the second no longer stops at Qwen and MiMo.
 - **The `sushi_exl3` module names no architecture**: its files and public names now say what they do (the old names
   stay as deprecated aliases for one release), and its per-call modes are parameters instead of process globals, with
   output unchanged.

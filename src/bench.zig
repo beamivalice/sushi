@@ -9,6 +9,7 @@ const gpu_clock = @import("gpu_clock.zig");
 const box = @import("bench_box.zig");
 const completions = @import("completions.zig");
 const server_mod = @import("server.zig");
+const server_state = @import("server_state.zig");
 const LoadedModel = @import("model_registry.zig").LoadedModel;
 const build_options = @import("build_options");
 const testing = std.testing;
@@ -1259,7 +1260,7 @@ fn inProcessMain(run: *InProcess) void {
 fn runLocal(run: *InProcess) !void {
     const a = run.arena.allocator();
     const io = run.io;
-    const sch = server_mod.global_scheduler orelse return error.BenchNoScheduler;
+    const sch = server_state.global_scheduler orelse return error.BenchNoScheduler;
     const lm = try sch.ensureLoaded("");
     defer sch.release(lm);
     var local: LocalBackend = .{ .io = io, .lm = lm };

@@ -1,4 +1,6 @@
 const std = @import("std");
+const request_parse = @import("request_parse.zig");
+const http = @import("http.zig");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
 const think_tags = @import("think_tags.zig");
@@ -64,38 +66,39 @@ const nowSecs = io_util.nowSecs;
 const Stopwatch = io_util.Stopwatch;
 const testing = std.testing;
 const server_mod = @import("server.zig");
+const server_state = @import("server_state.zig");
 const anthropic = @import("anthropic.zig");
-const SSE_ALLOW_HEADERS_DEFAULT = server_mod.SSE_ALLOW_HEADERS_DEFAULT;
+const SSE_ALLOW_HEADERS_DEFAULT = http.SSE_ALLOW_HEADERS_DEFAULT;
 const TOOL_CHOICE_UNDECLARED = server_mod.TOOL_CHOICE_UNDECLARED;
 const admitMtpForCtx = server_mod.admitMtpForCtx;
 const armCallForce = server_mod.armCallForce;
 const armThinkBound = server_mod.armThinkBound;
 const cachedFormatChat = server_mod.cachedFormatChat;
 const checkAttentionMemory = server_mod.checkAttentionMemory;
-const clampJsonI32 = server_mod.clampJsonI32;
-const countRejected = server_mod.countRejected;
+const clampJsonI32 = request_parse.clampJsonI32;
+const countRejected = http.countRejected;
 const defaultEnableMtpForStreaming = server_mod.defaultEnableMtpForStreaming;
 const forceMtpFor = server_mod.forceMtpFor;
 const getEffectiveContextLength = server_mod.getEffectiveContextLength;
 const getTimeoutNs = server_mod.getTimeoutNs;
-const jsonEscape = server_mod.jsonEscape;
-const logHttpSseData = server_mod.logHttpSseData;
+const jsonEscape = http.jsonEscape;
+const logHttpSseData = http.logHttpSseData;
 const nativeMeasuredMoeHead = server_mod.nativeMeasuredMoeHead;
-const parseJsonFloatOpt = server_mod.parseJsonFloatOpt;
-const parseJsonTopKOpt = server_mod.parseJsonTopKOpt;
-const parseKvQuantOverride = server_mod.parseKvQuantOverride;
-const parseRequestSeed = server_mod.parseRequestSeed;
+const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
+const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
+const parseKvQuantOverride = request_parse.parseKvQuantOverride;
+const parseRequestSeed = request_parse.parseRequestSeed;
 const parseToolCallsForRequest = server_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const renderConfigFor = server_mod.renderConfigFor;
 const renderQwenForResponsesTest = server_mod.renderQwenForResponsesTest;
 const requestBillsMtpHead = server_mod.requestBillsMtpHead;
-const requestCacheKey = server_mod.requestCacheKey;
+const requestCacheKey = request_parse.requestCacheKey;
 const resolveReasoningProtocol = server_mod.resolveReasoningProtocol;
 const rowMaskedDrafter = server_mod.rowMaskedDrafter;
 const sendAnthropicEvent = anthropic.sendAnthropicEvent;
-const sendErrorResponse = server_mod.sendErrorResponse;
-const sendResponse = server_mod.sendResponse;
+const sendErrorResponse = http.sendErrorResponse;
+const sendResponse = http.sendResponse;
 const shouldParseToolCalls = server_mod.shouldParseToolCalls;
 
 /// In-memory store for OpenAI Responses API state (`store: true` requests).
@@ -933,14 +936,14 @@ fn handleResponsesInner(
         noteMtpRefused(enable_mtp_resp, lm.mtp != null, sampling, 0);
 
         var slot_handle: ?*scheduler_mod.Slot = null;
-        defer if (slot_handle) |s| server_mod.global_scheduler.?.complete(s);
+        defer if (slot_handle) |s| server_state.global_scheduler.?.complete(s);
 
         // Transfer vision ownership into the slot.
         const slot_ve_resp = req_media.deferred;
         req_media.deferred = null;
         const slot_mrope_resp = req_media.mrope;
         req_media.mrope = .{};
-        const sch = server_mod.global_scheduler.?;
+        const sch = server_state.global_scheduler.?;
         slot_handle = try sch.submit(.{
             .model = lm,
             .prompt_ids = prompt_ids,
@@ -1020,7 +1023,7 @@ fn handleResponsesInner(
                         client_gone = true;
                         break;
                     }
-                    sendStreamIdle(stream, slot_admission.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
+                    sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, slot_handle.?)) catch {
                         log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                         slot_handle.?.cancel();
                         client_gone = true;
@@ -1222,7 +1225,7 @@ fn handleResponsesInner(
         const slot_mrope_ns = req_media.mrope;
         req_media.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, server_mod.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, stream, .{ .stops = stop_sequences.items });
+        result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, stream, .{ .stops = stop_sequences.items });
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);

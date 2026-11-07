@@ -30,6 +30,7 @@ const hf_pull = @import("hf_pull.zig");
 const pack_update = @import("pack_update.zig");
 const download_progress = @import("download_progress.zig");
 const model_settings = @import("model_settings.zig");
+const packs = @import("arch/packs.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -105,41 +106,14 @@ test "--log-level: only the four levels parse" {
 
 // ── Alias table ─────────────────────────────────────────────────────────
 
-pub const Alias = struct {
-    /// Short name before the ':', e.g. "qwen3.8-flash-next".
-    name: []const u8,
-    /// Tag after the ':'; empty = selectable only by full name:tag.
-    tag: []const u8,
-    repo: []const u8,
-    /// Picked when the user gives the bare name with no tag.
-    is_default: bool = false,
-    /// Installed RAM, in GB, the README and docs/usage.md document for running the pack in memory.
-    tier_gb: u32,
-    /// Installed RAM, in GB, from which `sushi list` recommends the pack (the largest such pack of a
-    /// family at or under the machine's RAM); 0 = never recommended.
-    recommend_gb: u32 = 0,
-    /// Its experts always stream from the SSD (DeepSeek): `tier_gb` is the memory it streams from, not "in memory".
-    streams_experts: bool = false,
-    /// The flags of the pack's recommended `sushi serve --model <pack>` in docs/usage.md.
-    serve_flags: []const u8 = "",
-};
+pub const Alias = packs.Alias;
 
 /// The Hugging Face org every `pull` and `run` download comes from.
 pub const HF_ORG = "beamster";
 
-/// The published Sushi packs, with the memory tiers the README and docs/usage.md state. The bare Qwen
-/// name picks 2.75bpw (64 GB); 4bpw needs 96 GB. MiMo's pack and
-/// GLM's default 2.4bpw need 128 GB, GLM's 2bpw 96 GB. Qwen 2bpw also streams on a 32 GB Mac (README, "Streaming on a 32 GB Mac").
-/// A new pack lands here, in docs/usage.md and, once its repo is live, in the README.
-pub const aliases = [_]Alias{
-    .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 131072 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
-    .{ .name = "qwen3.8-flash-next", .tag = "2.75bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .is_default = true, .tier_gb = 64, .recommend_gb = 64, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 250000 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
-    .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 --prefill-chunk 2048 --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
-    .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128, .serve_flags = "--ctx-size 1048576" },
-    .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
-    .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
-    .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams_experts = true },
-};
+/// The published Sushi packs, each declared in its arch's `packs` slot (`src/<arch>/arch.zig`) with the memory tiers
+/// the README and docs/usage.md state; `sushi list` shows them in the arch gate's order.
+pub const aliases = packs.aliases;
 
 /// The published packs as the update check sees them.
 pub const known_packs = blk: {

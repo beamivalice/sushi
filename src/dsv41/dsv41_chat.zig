@@ -62,6 +62,7 @@ test "the pinned template and image atom are the encoder's" {
 }
 
 test "DeepSeek's Sequence of Splits is read as its own pre-tokenizer, any other spelling is not" {
+    if (@import("../arch/registry.zig").ofModelType("deepseek_v41") == null) return error.SkipZigTest;
     const a = std.testing.allocator;
     const j = std.json.fmt;
     const deepseek = try std.fmt.allocPrint(a,

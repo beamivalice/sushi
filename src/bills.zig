@@ -39,8 +39,7 @@ const gpu_mem = @import("gpu_mem.zig");
 const fixtures = @import("bills_fixtures_test.zig");
 const arch_spec = @import("arch/spec.zig");
 const arch_registry = @import("arch/registry.zig");
-// Temporary until S2h: the launch vars main.zig and the settings API write live in server.zig, read here and never called.
-pub const launch_state = @import("server.zig");
+pub const launch_state = @import("server_state.zig");
 
 /// An arch's own bill terms live in its `bill` module (`src/<arch>/<arch>_bill.zig`, declared in its `arch.zig`). Each hook
 /// takes the config first and may return null; one the arch omits leaves the generic term.

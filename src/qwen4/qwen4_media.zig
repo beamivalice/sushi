@@ -8,7 +8,7 @@ const vision_common = @import("../vision_common.zig");
 const arch_media = @import("../arch/media.zig");
 const qwen_vision = @import("qwen_vision.zig");
 
-pub const mode: arch_media.Mode = .qwen;
+pub const mode = .qwen;
 pub const Tower = qwen_vision.QwenVision;
 pub const scratchBytes = qwen_vision.encodeScratchBytes;
 

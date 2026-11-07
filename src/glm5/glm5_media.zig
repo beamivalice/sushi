@@ -7,7 +7,7 @@ const vision_common = @import("../vision_common.zig");
 const arch_media = @import("../arch/media.zig");
 const glm5_vision = @import("glm5_vision.zig");
 
-pub const mode: arch_media.Mode = .glm5;
+pub const mode = .glm5;
 pub const Tower = glm5_vision.GlmVision;
 pub const scratchBytes = glm5_vision.encodeScratchBytes;
 

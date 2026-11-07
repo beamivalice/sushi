@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = @import("http.zig");
 const build_options = @import("build_options");
 // pub: src/exl3 reaches mlx, log and io_util through its host root.
 pub const mlx = @import("mlx.zig");
@@ -22,6 +23,7 @@ const depth_bounds = @import("mtp_depth_bounds.zig");
 const dflash_mod = @import("dflash.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
+const server_state = @import("server_state.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_load = @import("model_load.zig");
 const expert_stream_mod = @import("expert_stream.zig");
@@ -29,7 +31,9 @@ const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
-const pack_cmds = @import("dsv41/commands.zig");
+const help = @import("help.zig");
+const arch_flags = @import("arch/flags.zig");
+const arch_packs = @import("arch/packs.zig");
 const bench_mod = @import("bench.zig");
 const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
@@ -75,7 +79,7 @@ const PromptClient = struct {
 
     fn run(self: *PromptClient, port: u16) void {
         defer server_mod.requestShutdown();
-        cli_mod.runPrompt(self.allocator, self.io, port, self.body, self.stream, server_mod.g_api_key) catch |err| {
+        cli_mod.runPrompt(self.allocator, self.io, port, self.body, self.stream, server_state.g_api_key) catch |err| {
             self.err = err;
         };
     }
@@ -85,338 +89,7 @@ var prompt_client: ?*PromptClient = null;
 fn printUsage(io: std.Io) void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
-    stdout_w.interface.writeAll(
-        \\sushi — MLX inference server for Apple Silicon
-        \\
-        \\Usage: sushi <command> [options]
-        \\       sushi [options]
-        \\
-        \\Commands:
-        \\  run <model>         Download if needed, serve it, and chat right here
-        \\                      (a local model name or a HuggingFace "org/repo")
-        \\                      --think <value>: GLM low|high|max (default high);
-        \\                      Qwen off|low|medium|xhigh; MiMo off, or any
-        \\                      other level as on.
-        \\                      /think <effort> changes it in the chat;
-        \\                      --tool on (or /tool on) lets the model search the
-        \\                      web, fetch pages and read files in the current
-        \\                      folder, read-only (off by default); /edit on|off
-        \\                      (or the browser's Edit chip) adds write_file and
-        \\                      edit_file, still inside that folder; they start
-        \\                      off unless launched with --edit on; /cd
-        \\                      <folder> moves that folder; /image <path> shows a
-        \\                      vision model an image (a relative path is read
-        \\                      from that folder). The prompt shows the folder and
-        \\                      whether tools are on. The same chat opens in a
-        \\                      browser at the URL it prints. /update installs
-        \\                      a newer release and restarts the chat.
-        \\  pull <model>        Download a Sushi pack from the Hugging Face org
-        \\                      beamster into ~/.sushi/models: a short name
-        \\                      (qwen3.8-flash-next[:tag], mimo-v2.6-flash,
-        \\                      glm-5.3-flash[:tag]) or beamster/<repo>. Warns
-        \\                      when this Mac has less memory than the pack's
-        \\                      documented tier, then pulls anyway.
-        \\  list                Show the Sushi packs with their size, whether they
-        \\                      are downloaded and whether this Mac meets their
-        \\                      memory tier (the recommended one marked), then
-        \\                      the other models on disk. Offline: the local
-        \\                      models only.
-        \\  serve               Start the server over ~/.sushi/models
-        \\                      (every pulled model loads on demand by name)
-        \\  launch <agent>      Configure + launch a coding agent CLI against the
-        \\                      local server (claude, pi, omp, opencode, dsh,
-        \\                      codex, hermes, aider, zcode, grok). `sushi launch <agent> -h`
-        \\                      for options
-        \\  kld capture|compare Write a teacher fixture (full-vocab logits at
-        \\                      every greedy position), or teacher-force one
-        \\                      through a model and report KLD / top-1 / NLL.
-        \\                      `sushi kld --help` for options
-        \\  bench               Bench a model in this process (--model <dir>), or
-        \\                      drive a running server (--url; tests/bench.sh boots
-        \\                      it and takes the box rules).
-        \\                      `sushi bench --help` for options
-        \\  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
-        \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
-        \\                      (routed experts as EXL3). `sushi convert --help`
-        \\                      for options
-        \\  repack <pack>       Rewrite an STQ pack in place into the
-        \\                      pair-major layout. A shard is replaced only after
-        \\                      its rewrite reads back equal; a cut-off run
-        \\                      resumes when repeated. Stop any server using the
-        \\                      pack first. Never downloads. Options:
-        \\                      --pack-revision <id>  stamp the pack with a
-        \\                        revision (config.json and every shard header)
-        \\                      --shards <name-or-glob>  stamp only these shards
-        \\                        (repeatable; a pattern matching nothing is
-        \\                        refused)
-        \\                      --unstamped <shard>  leave this shard without a
-        \\                        stamp (repeatable; a symlinked shard needs it)
-        \\                      --check  read only: every shard not unstamped
-        \\                        carries the config's revision
-        \\  update              Replace this install with the newest release,
-        \\                      after checking its SHA-256, its signature and
-        \\                      that it runs; the old one stays as
-        \\                      <install>.previous. --check only reports,
-        \\                      --rollback swaps the previous one back.
-        \\                      `sushi update --help` for options
-        \\
-        \\Options:
-        \\  --model <dir>       Path to MLX model directory
-        \\  --serve             Start HTTP server mode
-        \\  --host <ip>         Bind address (default: 127.0.0.1 — this Mac only;
-        \\                      0.0.0.0 opens it to the local network)
-        \\  --port <n>          Bind port (default: 12345, or `server.port` in
-        \\                        ~/.sushi/model-settings.json)
-        \\  --ctx-size <n>      Maximum context length (default: model max)
-        \\  --config-overrides <json>   JSON object deep-merged into EVERY
-        \\                      model's config.json this process loads or
-        \\                      discovers. Generic keys
-        \\                      like max_position_embeddings hit everything.
-        \\                      HF attention_factor replaces the computed YaRN
-        \\                      mscale; vLLM attn_factor multiplies it.
-        \\                      e.g. '{"text_config":{"rope_parameters":{"rope_type":
-        \\                      "yarn","factor":4.0,"original_max_position_embeddings":
-        \\                      262144},"max_position_embeddings":1048576}}'
-        \\  --prompt, -p <text> Run one prompt and exit (also with run <model>)
-        \\  --stream            Stream tokens as they are generated (with --prompt)
-        \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
-        \\                      mode, the default for requests that omit the field
-        \\  --temp <f>          Temperature. Offline: sampling temp (default 0.0).
-        \\                      Serve: default for requests that omit `temperature`
-        \\                      (otherwise the model's generation_config.json, then 1.0)
-        \\  --top-p <f>         Serve-mode default top_p for requests that omit it
-        \\                      (otherwise generation_config.json, then 1.0 = off)
-        \\  --top-k <n>         Serve-mode default top_k for requests that omit it
-        \\                      (otherwise generation_config.json, then 0 = off)
-        \\  --timeout <n>       Stall timeout in seconds: abort a request after n seconds
-        \\                      WITHOUT producing a token (default: 300, 0=none). A request
-        \\                      that keeps generating never times out, however long it runs.
-        \\  --preserve-thinking on|off  Templates that read `preserve_thinking` (Qwen3.8)
-        \\                      keep every turn's thinking (on, the template default)
-        \\                      or only the latest user turn's (off). Request
-        \\                      chat_template_kwargs > this flag > model-settings.json
-        \\  --think-penalty <f> Lower the logits of ~50 overthinking markers ("Wait",
-        \\                      "But", "Alternatively", ...) by f inside the reasoning
-        \\                      span (default 0 = off). Request think_penalty > this
-        \\                      flag > model-settings.json
-        \\  --no-vision         Disable vision encoder (saves memory)
-        \\  --vision-bf16       Keep a bf16 vision tower as stored instead of requantizing
-        \\                      it to affine 8-bit at load (more memory, exact tower)
-        \\  --vision            Load the vision tower on an SSD-streamed load too (off by
-        \\                      default there, except for DeepSeek-V4.1: its weights
-        \\                      come out of the expert cache)
-        \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
-        \\                      loads. Display sleep is always allowed.
-        \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
-        \\                        refuses a load whose weights + warmup headroom
-        \\                        look too big for current free memory. The check
-        \\                        is conservative (macOS reclaims file cache as
-        \\                        MLX allocates); use this if a load you know fits
-        \\                        is being refused. A genuine over-commit can
-        \\                        hard-crash the server.
-        \\  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
-        \\                        rounds and GLM DFlash2 (default: ON).
-        \\  --no-mtp            Disable the native MTP head. Qwen and MiMo load it
-        \\                        and run it by default; GLM's stays off. On
-        \\                        DeepSeek-V4.1 it turns DSpark off.
-        \\  --mtp               Force the MTP head ON. Qwen and MiMo run it by
-        \\                        default, GLM does not; an SSD-streamed pack
-        \\                        that cannot stream its head refuses --mtp.
-        \\  --drafter <dir>     Use the DFlash2 assistant stored in <dir>. GLM
-        \\                        finds the pack's own dflash2/ folder or the
-        \\                        released assistant folder beside the weights
-        \\                        by itself; Qwen3.8-Flash-Next decodes with MTP
-        \\                        unless this flag names the assistant.
-        \\  --drafter-min-depth <n> Fewest verifier rows (t1 plus drafts) a DFlash2
-        \\                        round carries, 2..16 (default 2). On
-        \\                        Qwen3.8-Flash-Next the round picks its rows
-        \\                        within --drafter-min-depth..--drafter-max-depth
-        \\                        from the drafter's confidence; equal values
-        \\                        pin one count. GLM only checks it.
-        \\  --drafter-max-depth <n> Most verifier rows a DFlash2 round carries
-        \\                        (default: 8 on Qwen3.8-Flash-Next, at most 8;
-        \\                        3 on GLM, at most 4).
-        \\  --no-drafter        Never load the DFlash2 assistant (saves its memory).
-        \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
-        \\                        --kv-quant (default OFF: the head keeps
-        \\                        dense bf16 KV). No effect on MiMo, whose
-        \\                        heads keep a dense sliding window.
-        \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
-        \\                        (default 1). Every depth the planner picks
-        \\                        stays inside --mtp-min-depth..--mtp-max-depth;
-        \\                        equal values pin one depth. DeepSeek-V4.1:
-        \\                        DSpark verifies depth + 1 rows (its block
-        \\                        is 5 drafts); a min above 1 never takes a
-        \\                        plain step.
-        \\  --mtp-max-depth <n> Most tokens an MTP round drafts, 1..8 (default:
-        \\                        adaptive — the EV controller plans depth
-        \\                        per round up to 8 on eligible M5 NAX targets,
-        \\                        otherwise 6, lower on silicon with a measured
-        \\                        verify-width cliff; SUSHI_MTP_ADAPTIVE=0
-        \\                        reverts to the fixed windowed controller,
-        \\                        cap 3). A --mtp-min-depth above that default
-        \\                        lifts it. Each machine finds its own range.
-        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
-        \\                        Use 0.2 for the Qwen3.8 matched comparison.
-        \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
-        \\                        Use 0.95 for the Qwen3.8 matched
-        \\                        comparison. Exclusive with
-        \\                        --mtp-typical; exact is the default.
-        \\  --mtp-greedy-tail   Sampled requests draft only the first MTP token
-        \\                        from the draft sampler, every later one by
-        \\                        argmax. Pays beside --mtp-typical (faster,
-        \\                        slightly more predictable text); greedy
-        \\                        requests are unchanged. Default off.
-        \\  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
-        \\                        context tokens (default: 0 = no ceiling).
-        \\                        A verify row is BYTES, so on a long-context
-        \\                        trunk a round can cost more than the serial
-        \\                        steps it replaces. A request whose prompt is
-        \\                        past <n> decodes serially, and one that
-        \\                        GENERATES past it switches mid-flight. The
-        \\                        bound is inclusive (<n> itself still drafts)
-        \\                        and it outranks `enable_mtp:true` in the
-        \\                        request body.
-        \\  --qwen-gdn <32|16>  Qwen only: bits of the GatedDeltaNet recurrent state
-        \\                      between tokens (default 32 = f32; the decay gate
-        \\                      is f32 either way). 16 (bf16) halves the state in
-        \\                      every cache checkpoint (about 54 MB each on
-        \\                      Flash-Next) to save memory on smaller machines.
-        \\                      No effect on GLM or MiMo, which have no GDN arm.
-        \\  --drop-expert <n>   DeepSeek-V4.1 only: never load or pick the n least-used
-        \\                      routed experts of every layer, ranked by the pack's
-        \\                      expert_usage.json (n a multiple of 8; default 0 =
-        \\                      off). A token's pick moves to its next-best expert;
-        \\                      the memory bill shrinks by the dropped bytes. Answers
-        \\                      change, so score it with `sushi kld compare`.
-        \\  --kv-quant <mode>   KV-cache quantization scheme:
-        \\                        8, 6 or 4 — affine group quant; default 8 on
-        \\                          every model but DeepSeek-V4.1, which has no
-        \\                          KV cache and refuses the flag (GLM refuses
-        \\                          4). 16 (or `off`)
-        \\                          keeps dense bf16 KV. It outranks a
-        \\                          model's model-settings.json `kv_quant`.
-        \\                          Per-request override via the `kv_quant`
-        \\                          body field.
-        \\  --prefill-chunk <n> Maximum tokens forwarded per prefill chunk
-        \\                        (default: 8192). Auto-capped further per model
-        \\                        so one layer's attention scores stay within
-        \\                        budget; this flag is the ceiling, not a floor.
-        \\                        When a request does not fit at <n>, it runs
-        \\                        at the widest narrower width that fits (down
-        \\                        to 512) instead of being refused.
-        \\  --max-concurrent <n>  Sizes the submit queue (n + 32) and floors the
-        \\                        prefix-cache entry count. Requests batch at
-        \\                        any value (default: 1).
-        \\  --prefill-decode-share <s>
-        \\                      Target decode wall-time share during another
-        \\                        request's prefill (0..0.9); never narrows
-        \\                        chunks. Default 0.25.
-        \\  --prefix-cache-entries <n>
-        \\                      Hot prefix cache LRU capacity in entries
-        \\                        (default: 32). 0 disables all prefix reuse.
-        \\  --prefix-cache-mem <n>{{KB,MB,GB}}
-        \\                      Turn on RAM retention of idle prefix-cache
-        \\                        entries with this KV-bytes budget (default:
-        \\                        off; prefixes live on the SSD tier).
-        \\                      Evicts LRU entries until the budget fits.
-        \\                      Pass 0 (or off) to keep RAM retention off.
-        \\  --prefix-cache-disk <n>{{KB,MB,GB}}
-        \\                      SSD tier byte budget for the prefix cache
-        \\                        (default: on, min(entries x context x bytes
-        \\                        per token + 2GB, 20GB, free disk - 4GB)).
-        \\                      Sizes are binary: 1GB = 1 GiB.
-        \\                      Seen prefixes persist under ~/.sushi/kv-cache
-        \\                        (SUSHI_PREFIX_CACHE_DIR) and are restored
-        \\                        across restarts instead of recomputed. 0/off
-        \\                        disables.
-        \\  --ssm-checkpoint-max <n>
-        \\                      Cap on SSM checkpoint states held in memory per
-        \\                        cache entry (default: 16). The first and the
-        \\                        newest are always kept; beyond the cap the
-        \\                        interior is thinned. 0 = unlimited, bounded only
-        \\                        by the prefix cache's byte budget. It never
-        \\                        thins the restore points on SSD, which keep
-        \\                        every 8192 tokens and each prompt's end
-        \\                        (--prefix-cache-disk sizes them).
-        \\  --wired-margin-gib <n>
-        \\                      How far under iogpu.wired_limit_mb a plan may
-        \\                        reach (default: 1, integers 1..32).
-        \\  --expert-pick-tolerance <n>
-        \\                      LOSSY, streamed packs only (default: 0 = off,
-        \\                        exact routing). A routed expert missing from the
-        \\                        cache is replaced by the best cached expert the
-        \\                        router did not pick, when that expert's probability
-        \\                        is at least (1 - n) x the missed one's. 0..0.6;
-        \\                        0.3 is a mild setting. A sigmoid router (MiMo)
-        \\                        compares sigmoid probabilities.
-        \\  --ssd-budget-gb <n> Stream routed experts from SSD (Sushi pack or
-        \\                        source checkpoint) with a
-        \\                        TOTAL resident target of <n> GiB; the expert
-        \\                        cache is what is left after the trunk, the
-        \\                        prefill union and the fill buffers.
-        \\  --ssd-prefetch <n>  Streamed-expert prefetch read cap (default: 0, off).
-        \\                        The share, in percent (0..100), of this Mac's SSD
-        \\                        read rate (measured at load) that the expert
-        \\                        reads of a streamed load may use, the reads a
-        \\                        route waits for and the prefetch's together.
-        \\                        0 = no prefetch; 65 is the tuned cap on a fast
-        \\                        SSD; lower it to leave the SSD to other programs.
-        \\  --model-dir <dir>   Directory of MLX models to discover at startup.
-        \\                        Discovered siblings appear in /v1/models and
-        \\                        can be loaded on-demand via /v1/load-model
-        \\                        (or by sending a request with model=<id>).
-        \\                        REPEATABLE (up to 8) — pass it once per folder
-        \\                        your models live in. Scanned in order; the
-        \\                        first folder wins a repeated model id, and a
-        \\                        folder that can't be opened is skipped.
-        \\  --max-resident-models <n>
-        \\                      Maximum loaded models in memory (default: 3).
-        \\                        ensureLoaded evicts LRU before exceeding.
-        \\  --max-resident-mem <n>{{KB,MB,GB}}|auto
-        \\                      Summed resident-bytes cap across all loaded
-        \\                        models. Default 'auto' = 80% of MLX wired
-        \\                        limit at startup. Pass 0 to disable.
-        \\  --idle-evict-secs <n>
-        \\                      Evict .ready entries with refcount==0 if
-        \\                        idle for this many seconds. Default: off.
-        \\  --gpu-warm-secs <n> Keep the GPU awake for this many seconds after
-        \\                        the last request, so the next one starts
-        \\                        without a wake-up delay (default: 60, 0 = off).
-        \\  --no-metrics        Turn off the metrics at GET /metrics and /metrics.json
-        \\                        (on by default; POST /metrics/enable turns them back
-        \\                        on). --metrics is accepted and does nothing.
-        \\  --no-tool-autocorrect
-        \\                      Disable tool-call ARGUMENT auto-correct — the
-        \\                        coercion of parsed args to the tool schema's
-        \\                        declared types (e.g. Python `False` -> JSON
-        \\                        `false`). Args then pass through as the model
-        \\                        emitted them (still valid JSON). Default: on.
-        \\  --api-key <token>   Require this key on every request (OpenAI/
-        \\                        Anthropic/Ollama APIs + index page + metrics).
-        \\                        Accepts Authorization: Bearer, x-api-key, HTTP
-        \\                        Basic (key = password), or ?api_key=. /health
-        \\                        stays open. Unset = no auth (default).
-        \\  --api-key-strict    Require the key from loopback too (localhost is
-        \\                        exempt by default). For embedders that want
-        \\                        "only the key holder drives inference" on a
-        \\                        shared machine. No effect without --api-key.
-        \\  --api-key-env <VAR> Read the key from environment variable VAR
-        \\                        instead of argv (the process table is
-        \\                        world-readable). Unset/empty VAR = no auth.
-        \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
-        \\  --log-file <path>   Persist the server log ("off" disables).
-        \\                      Default: ~/.sushi/logs/sushi-<port>.log
-        \\  --parent-pid <pid>  Shut down when process <pid> exits (for a host
-        \\                        that runs sushi as its engine).
-        \\  --no-update-check   Never ask GitHub for a newer release (a server
-        \\                        otherwise checks at most once a day)
-        \\  --version           Print version and exit
-        \\  --guest-manifest    Print the JSON a host checks before running this
-        \\                        build as its engine (guest.json), and exit
-        \\  --help, -h          Show this help
-        \\
-    ) catch {};
+    stdout_w.interface.writeAll(help.text) catch {};
     stdout_w.interface.flush() catch {};
 }
 
@@ -427,7 +100,7 @@ fn commandUsesGpu(proc_args: std.process.Args) bool {
     var first = true;
     while (it.next()) |a| {
         if (first and (std.mem.eql(u8, a, "pull") or std.mem.eql(u8, a, "list") or std.mem.eql(u8, a, "launch") or
-            std.mem.eql(u8, a, "repack") or std.mem.eql(u8, a, "update"))) return false;
+            std.mem.eql(u8, a, "update") or arch_flags.commandSkipsGpu(a))) return false;
         first = false;
         if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "--guest-manifest") or
             std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return false;
@@ -550,14 +223,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
             return;
-        } else if (std.mem.eql(u8, cmd, "repack")) {
-            try pack_cmds.repack.cmdRepack(allocator, io, args[2..]);
-            return;
         } else if (std.mem.eql(u8, cmd, "update")) {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
+        } else if (try arch_flags.runCommand(allocator, io, cmd, args[2..])) {
+            return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, repack, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected " ++ help.known_commands ++ ")\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -602,7 +274,6 @@ pub fn main(init: std.process.Init) !void {
     var force_mtp = false;
     // Either flag given: it outranks the per-model `mtp` (the last one wins).
     var mtp_explicit = false;
-    var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = null;
     var mtp_tokenv3_raw: ?[]const u8 = null;
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default;
@@ -671,7 +342,7 @@ pub fn main(init: std.process.Init) !void {
             serve_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--think")) {
             const f = cli_mod.parseThinkFlag(if (i + 1 < args.len) args[i + 1] else null) catch {
-                log.err("--think requires a model-supported value: GLM low|high|max, Qwen off|low|medium|xhigh, MiMo off or any level (on)\n", .{});
+                log.err("--think requires a model-supported value: " ++ help.think_values ++ "\n", .{});
                 std.process.exit(1);
             };
             run_opts.think = f.think;
@@ -689,7 +360,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--edit takes on or off, not '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-            server_mod.g_web_edit = run_opts.edit;
+            server_state.g_web_edit = run_opts.edit;
         } else if (std.mem.eql(u8, args[i], "--stream")) {
             stream_mode = true;
         } else if (cli_mod.isPromptFlag(args[i]) and i + 1 < args.len) {
@@ -739,7 +410,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
-            server_mod.g_tool_autocorrect = false;
+            server_state.g_tool_autocorrect = false;
         } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
             generate_mod.mtp_lookup_disabled = true;
         } else if (std.mem.eql(u8, args[i], "--drafter") and i + 1 < args.len) {
@@ -752,9 +423,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--api-key") and i + 1 < args.len) {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
-            if (args[i].len > 0) server_mod.g_api_key = args[i];
+            if (args[i].len > 0) server_state.g_api_key = args[i];
         } else if (std.mem.eql(u8, args[i], "--api-key-strict")) {
-            server_mod.g_api_key_strict = true;
+            server_state.g_api_key_strict = true;
         } else if (std.mem.eql(u8, args[i], "--api-key-env") and i + 1 < args.len) {
             i += 1;
             // The key read from a named environment variable instead of argv:
@@ -770,7 +441,7 @@ pub fn main(init: std.process.Init) !void {
             if (name) |name_z| {
                 if (std.c.getenv(name_z.ptr)) |value| {
                     const key = std.mem.span(value);
-                    if (key.len > 0) server_mod.g_api_key = key;
+                    if (key.len > 0) server_state.g_api_key = key;
                 }
             }
         } else if (std.mem.eql(u8, args[i], "--drafter-min-depth") or std.mem.eql(u8, args[i], "--drafter-max-depth")) {
@@ -792,8 +463,6 @@ pub fn main(init: std.process.Init) !void {
             enable_mtp = true;
             force_mtp = true;
             mtp_explicit = true;
-        } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
-            mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             i += 1;
@@ -831,7 +500,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--parent-pid: expected a process id above 1; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-            server_mod.host_managed = true;
+            server_state.host_managed = true;
         } else if (std.mem.eql(u8, args[i], "--no-update-check")) {
             no_update_check = true;
         } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
@@ -841,29 +510,29 @@ pub fn main(init: std.process.Init) !void {
             generate_mod.prefill_chunk_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
-            server_mod.prefix_cache_capacity = flagInt(u32, "--prefix-cache-entries", args[i], 0);
+            server_state.prefix_cache_capacity = flagInt(u32, "--prefix-cache-entries", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and i + 1 < args.len) {
             // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
             // bare numbers (bytes), a suffix of `MB`/`GB`/`KB` (case-
             // insensitive); `0`/`off` keeps RAM retention off.
             i += 1;
-            server_mod.prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
+            server_state.prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-            server_mod.prefix_cache_mem_explicit = true;
-            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionForMemArg(server_mod.prefix_cache_mem_bytes);
+            server_state.prefix_cache_mem_explicit = true;
+            server_state.prefix_cache_ram_enabled = server_state.ramRetentionForMemArg(server_state.prefix_cache_mem_bytes);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts
             // and RAM evictions instead of recomputed. Byte budget with the
             // same size grammar as --prefix-cache-mem; `0`/`off` disables.
             i += 1;
-            server_mod.prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
+            server_state.prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-            server_mod.prefix_cache_disk_explicit = true;
+            server_state.prefix_cache_disk_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--think-penalty") and i + 1 < args.len) {
             i += 1;
             const lambda = std.fmt.parseFloat(f32, args[i]) catch -1;
@@ -880,10 +549,10 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
-            server_mod.ssm_checkpoint_max = flagInt(u32, "--ssm-checkpoint-max", args[i], 0);
+            server_state.ssm_checkpoint_max = flagInt(u32, "--ssm-checkpoint-max", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
+            server_state.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
                 log.err("--wired-margin-gib: expected an integer 1..32, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -898,7 +567,7 @@ pub fn main(init: std.process.Init) !void {
             decode_share_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
-            server_mod.max_concurrent = flagInt(u32, "--max-concurrent", args[i], 0);
+            server_state.max_concurrent = flagInt(u32, "--max-concurrent", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--model-dir") and i + 1 < args.len) {
             // REPEATABLE. A user's library can live in more than one place (the
             // app's download folder, an external drive, an LM Studio tree), and
@@ -948,18 +617,6 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             const n = flagInt(u32, "--idle-evict-secs", args[i], 0);
             idle_evict_secs = if (n > 0) n else null;
-        } else if (std.mem.eql(u8, args[i], "--qwen-gdn") and i + 1 < args.len) {
-            i += 1;
-            model_mod.qwen_gdn_f32 = model_mod.parseQwenGdn(args[i]) orelse {
-                log.err("--qwen-gdn: expected 32 or 16; got '{s}'\n", .{args[i]});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, args[i], "--drop-expert") and i + 1 < args.len) {
-            i += 1;
-            model_mod.drop_expert = pack_cmds.expert_usage.parseCount(args[i]) orelse {
-                log.err("--drop-expert: expected a multiple of 8 routed experts per layer (0 = off); got '{s}'\n", .{args[i]});
-                std.process.exit(1);
-            };
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             kv_quant_explicit = true;
@@ -979,6 +636,14 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--ssd-prefetch: expected an integer in 0..100; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (arch_flags.parseOption(args, &i)) |parsed| {
+            switch (parsed) {
+                .applied => {},
+                .refused => |r| {
+                    log.err("{s}: {s}; got '{s}'\n", .{ r.name, r.expected, r.got });
+                    std.process.exit(1);
+                },
+            }
         } else {
             // Nothing above consumed it. This loop used to end here with no
             // else at all, so an unrecognized argument was dropped in SILENCE
@@ -1014,9 +679,9 @@ pub fn main(init: std.process.Init) !void {
         return error.PromptModeConflict;
     }
     const bind = if (prompt != null or bench_run != null)
-        server_mod.resolveBind(host_flag, 0, server_mod.default_port)
+        http.resolveBind(host_flag, 0, server_state.default_port)
     else
-        server_mod.resolveBind(host_flag, port_flag, model_settings_mod.defaultPort(allocator, io));
+        http.resolveBind(host_flag, port_flag, model_settings_mod.defaultPort(allocator, io));
     const host = bind.host;
     const port = bind.port;
 
@@ -1030,7 +695,6 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
         log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-tokenv3 needs 0 <= a <= 1; choose one)\n", .{@errorName(err)});
         std.process.exit(1);
@@ -1108,10 +772,10 @@ pub fn main(init: std.process.Init) !void {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
         defer file.deinit();
-        if (!server_mod.prefix_cache_disk_explicit) if (model_settings_mod.server(&file).prefix_cache_disk_gb) |gb| {
-            server_mod.prefix_cache_disk_bytes = @as(u64, gb) << 30;
-            server_mod.prefix_cache_disk_explicit = true;
-            server_mod.prefix_cache_disk_from_file = true;
+        if (!server_state.prefix_cache_disk_explicit) if (model_settings_mod.server(&file).prefix_cache_disk_gb) |gb| {
+            server_state.prefix_cache_disk_bytes = @as(u64, gb) << 30;
+            server_state.prefix_cache_disk_explicit = true;
+            server_state.prefix_cache_disk_from_file = true;
             log.info("[model-settings] server.prefix_cache_disk_gb {d} sets the SSD prefix cache budget\n", .{gb});
         };
     }
@@ -1212,9 +876,9 @@ pub fn main(init: std.process.Init) !void {
     // In serve mode, check if the port is already in use before loading the model
     // (model loading takes seconds — fail fast instead of wasting time)
     if (serve_mode and bench_run == null) {
-        server_mod.ensurePortFree(io, host, port) catch |err| {
+        http.ensurePortFree(io, host, port) catch |err| {
             var msg_buf: [512]u8 = undefined;
-            if (server_mod.startupRefusal(err, host, port, &msg_buf)) |msg| {
+            if (http.startupRefusal(err, host, port, &msg_buf)) |msg| {
                 log.err("{s}\n", .{msg});
                 std.process.exit(1);
             }
@@ -1241,7 +905,7 @@ pub fn main(init: std.process.Init) !void {
 
     // An unsupported file format is refused by name before any config.json read.
     if (isGgufPath(io, model_dir)) {
-        log.err("[load] {s}: unsupported model format. Serve an MLX safetensors checkpoint (qwen4_exp or mimo_v2).\n", .{model_dir});
+        log.err("[load] {s}: unsupported model format. Serve an MLX safetensors checkpoint (" ++ arch_packs.served_types_or ++ ").\n", .{model_dir});
         std.process.exit(1);
     }
 
@@ -1298,7 +962,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
-    server_mod.disk_writer_permit_bytes = @import("kv_disk_writer.zig").permitForRam(@import("status.zig").getTotalMemBytes());
+    server_state.disk_writer_permit_bytes = @import("kv_disk_writer.zig").permitForRam(@import("status.zig").getTotalMemBytes());
 
     if (serve_mode) {
         // Headless boot: `--model-dir` given, no `--model`. Start with no
@@ -1522,21 +1186,21 @@ pub fn main(init: std.process.Init) !void {
             .no_drafter = no_drafter,
             .mtp_enabled = enable_mtp,
             .mtp_explicit = mtp_explicit,
-            .mtp_head_kv_quant = mtp_head_kv_quant,
+            .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
             .mtp_depth = depth_bounds.active.max,
             .load_vision = load_vision,
             .kv_quant_config = kv_quant_config,
             .kv_quant_explicit = kv_quant_explicit,
-            .prefix_cache_capacity = server_mod.prefix_cache_capacity,
-            .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
-            .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+            .prefix_cache_capacity = server_state.prefix_cache_capacity,
+            .prefix_cache_ram_enabled = server_state.prefix_cache_ram_enabled,
+            .prefix_cache_mem_bytes = server_state.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
-            .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
+            .prefix_cache_disk_bytes = server_state.prefix_cache_disk_bytes,
             .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
             .ssd_budget_bytes = ssd_budget_bytes,
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
-            .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_state.ssm_checkpoint_stride, server_state.prefix_cache_capacity, server_state.prefix_cache_ram_enabled, server_state.prefix_cache_disk_bytes),
+            .ssm_checkpoint_max = server_state.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .metrics = metrics_mod.current(),
         };
@@ -1699,7 +1363,7 @@ const LaunchServe = struct {
     top_p: ?f32,
     top_k: ?u32,
 
-    fn serverConfig(self: LaunchServe) server_mod.ServerConfig {
+    fn serverConfig(self: LaunchServe) server_state.ServerConfig {
         return .{
             .max_context_size = self.ctx_size,
             .request_timeout_sec = self.timeout,
@@ -1811,15 +1475,15 @@ fn runHeadlessServe(
         // `ensureLoaded` skipped `HotPrefixCache` init → cross-turn KV reuse
         // was silently dead for the entire headless serving mode (the default
         // `serve` path). Mirrors the LoadParams built in `main()`.
-        .prefix_cache_capacity = server_mod.prefix_cache_capacity,
-        .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
-        .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+        .prefix_cache_capacity = server_state.prefix_cache_capacity,
+        .prefix_cache_ram_enabled = server_state.prefix_cache_ram_enabled,
+        .prefix_cache_mem_bytes = server_state.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-        .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
-        .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+        .ssm_checkpoint_stride = server_state.ssm_checkpoint_stride,
+        .ssm_checkpoint_max = server_state.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .metrics = metrics_mod.current(),
     };
@@ -1859,9 +1523,9 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
-    if (server_mod.prefix_cache_disk_explicit) {
+    if (server_state.prefix_cache_disk_explicit) {
         var size_buf: [32]u8 = undefined;
-        locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_mod.prefix_cache_disk_bytes)});
+        locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_state.prefix_cache_disk_bytes)});
     }
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
     if (given.port) |p| locks.port.pin("{d}", .{p});

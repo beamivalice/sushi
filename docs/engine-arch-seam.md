@@ -17,7 +17,17 @@ joins `DROPPABLE` when its drop passes.
   `<arch>_bill.zig`), the slot `sched` (its `<arch>_sched.zig`), and the slots `packs` and `flags`.
   The arch a model runs as is stamped on it once, by `life.init` (`Trunk.arch`); `handleOf` reads that tag and tests
   nothing else. The arch that runs a `model_type` no arch claims declares `default_arch`. The
-  `packs` and `flags` slots are empty: alias rows still live in `aliases` in `src/cli.zig`, and arch-only flags in `src/cli.zig`.
+  `packs` slot holds its `product` name and its pack `aliases` rows; the `flags` slot is its `<arch>_flags.zig`.
+- **The launch face.** `src/arch/packs.zig` builds `cli.aliases` from the enabled archs' `packs` (in gate order, the
+  order `sushi list` shows) and the load refusals' arch lists. `src/arch/flags.zig` reads each `flags` module, every
+  part optional: `options` (the flags only that arch takes, parsed by `main.zig` through `parseOption`), `help` (their
+  `--help` lines, placed before the shared flag they name), `think_help` and `think_refusal` (its `--think` words),
+  `command` (a subcommand such as DeepSeek's `repack`), `refusal` (launch flags it cannot act on), the settings-ignored
+  and boot lines, and `serve` / `warm` (the MLX-side hooks `arch/serve.zig` calls). `src/help.zig` assembles `--help`
+  from the shared text and those parts; with every arch built the text is byte for byte the committed
+  `src/fixtures/help.txt`. A flag, subcommand or refusal text is the owner's decision: moving one never changes it.
+  `ExpertStreamTraits` also says whether an arch has an expert prefetcher (`prefetch`), which `--ssd-prefetch` and the
+  settings-ignored line read.
 - **An arch's bill terms are hooks.** `bills.zig` keeps the generic bill and asks the arch's `bill` module through
   `archHook(name, ...)`: a hook the arch omits leaves the generic term (`requestBill`, `transientReserve`,
   `neutralChunkWidth`, `unnamedCacheAsk`, `diskTokenBytes`, `memoryContext`, `cacheReserve`, `commitBytes`,
@@ -69,7 +79,7 @@ joins `DROPPABLE` when its drop passes.
    forward, config parse and refusals, bills, drafter, prefix/SSD codec parts, media, kernels only it uses, its tests
    and fixtures.
 2. One entry in `src/arch/registry.zig`, marked `// arch:<arch>`. Its `arch.zig` tests run with the registry's.
-3. Its packs: the `aliases` row in `src/cli.zig`, the tier table and recommended launch in [usage](usage.md), the
+3. Its packs: the `packs` rows in its `arch.zig`, the tier table and recommended launch in [usage](usage.md), the
    README pack line (the CLAUDE.md "Adding a pack" rule).
 4. Its docs, prefixed `<arch>-`: at least `<arch>-arch.md`; their rows in CLAUDE.md's docs index and in
    [source-map](source-map.md); its section in [pack-format](pack-format.md); its flags and env vars in
@@ -94,7 +104,7 @@ A passing drop of one arch costs about 2.7 minutes on the M5 Max (cold `.zig-cac
 the link check. A busy box roughly doubles it. Expect the same order on a CI runner.
 
 A drop is one commit that removes:
-- `src/<arch>/` (its fixtures go with it), its registry entry, its `aliases` rows and arch-only flags in `src/cli.zig`;
+- `src/<arch>/` (its fixtures go with it), its registry entry (its packs and flags go with the folder);
 - the arch's files from the `src/tests.zig` import list, and what `build.zig` still names for it (`test_dirs`,
   `TestModel`, the `ubench_<arch>.zig` files in `guardBenchFiles` and `ubench_main.zig`), until those leave the shared
   files;

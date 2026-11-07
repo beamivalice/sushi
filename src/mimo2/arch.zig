@@ -14,8 +14,13 @@ pub const Model = *Trunk;
 /// A model type no arch claims runs the generic MoE trunk, which is this arch.
 pub const default_arch = true;
 
-pub const packs = .{}; // slot:packs (S2h)
-pub const flags = .{}; // slot:flags (S2h)
+pub const packs = struct { // slot:packs (S2h)
+    pub const product = "MiMo-V2.6-Flash";
+    pub const aliases = [_]@import("../arch/packs.zig").Alias{
+        .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128, .serve_flags = "--ctx-size 1048576" },
+    };
+};
+pub const flags = @import("mimo2_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("mimo2_drafter.zig");
 

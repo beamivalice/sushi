@@ -1,4 +1,5 @@
 const std = @import("std");
+const media_mode = @import("arch/media_mode.zig");
 const effort_mod = @import("effort.zig");
 const arch_chat = @import("arch/chat.zig");
 const jinja_c = @import("jinja_c");
@@ -37,7 +38,7 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, mimo, glm5, dsv41 } = .gemma,
+    mode: media_mode.Mode = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,

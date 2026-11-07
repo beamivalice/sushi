@@ -1,4 +1,6 @@
 const std = @import("std");
+const server_state = @import("server_state.zig");
+const arch_flags = @import("arch/flags.zig");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -1522,7 +1524,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             return error.GlmKvQuantUnsupported;
         }
     }
-    if (@import("server.zig").archFlagRefusal(params.config, .{
+    if (arch_flags.archFlagRefusal(params.config, .{
         .kv_quant = params.kv_quant_explicit,
         .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
@@ -1535,9 +1537,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
     }
-    if (@import("server.zig").settingsSsdPrefetchIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
-    if (@import("server.zig").settingsKvQuantIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
-    if (@import("server.zig").settingsMtpIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
+    if (arch_flags.settingsSsdPrefetchIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
+    if (arch_flags.settingsKvQuantIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
+    if (arch_flags.settingsMtpIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());
     const streamed = expert_stream_mod.expertStreamingEngaged(
         params.config.supportsExpertStreaming(),
@@ -2377,7 +2379,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         );
         // Every tier writes off the inference thread, so a commit lands whole after the response.
         if (entry.prefix_cache.?.disk) |*d| {
-            d.writer_permit_bytes = @import("server.zig").disk_writer_permit_bytes;
+            d.writer_permit_bytes = server_state.disk_writer_permit_bytes;
             d.enableBackgroundWriter();
         }
         if (entry.prefix_cache.?.ssd_first) {

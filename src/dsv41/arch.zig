@@ -12,8 +12,13 @@ pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
 
-pub const packs = .{}; // slot:packs (S2h)
-pub const flags = .{}; // slot:flags (S2h)
+pub const packs = struct { // slot:packs (S2h)
+    pub const product = "DeepSeek-V4.1-Flash";
+    pub const aliases = [_]@import("../arch/packs.zig").Alias{
+        .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams_experts = true },
+    };
+};
+pub const flags = @import("dsv41_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("dsv41_drafter.zig");
 
@@ -78,7 +83,7 @@ pub fn ownsModuleDecodeState(xfm: Model) bool {
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
-    return .{ .drop_expert = true, .tile_major = config.expert_layout == .exl3_k4 };
+    return .{ .drop_expert = true, .prefetch = true, .tile_major = config.expert_layout == .exl3_k4 };
 }
 
 test "a model stamped as dsv41 is dispatched to dsv41" {

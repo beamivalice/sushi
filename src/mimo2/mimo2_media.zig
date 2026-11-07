@@ -6,7 +6,7 @@ const vision_common = @import("../vision_common.zig");
 const arch_media = @import("../arch/media.zig");
 const mimo_vision = @import("mimo_vision.zig");
 
-pub const mode: arch_media.Mode = .mimo;
+pub const mode = .mimo;
 pub const Tower = mimo_vision.MimoVision;
 pub const scratchBytes = mimo_vision.encodeScratchBytes;
 

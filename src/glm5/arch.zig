@@ -12,8 +12,14 @@ pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
 
-pub const packs = .{}; // slot:packs (S2h)
-pub const flags = .{}; // slot:flags (S2h)
+pub const packs = struct { // slot:packs (S2h)
+    pub const product = "GLM-5.3-Flash";
+    pub const aliases = [_]@import("../arch/packs.zig").Alias{
+        .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
+        .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
+    };
+};
+pub const flags = @import("glm5_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("glm5_drafter.zig");
 

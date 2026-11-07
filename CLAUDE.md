@@ -128,7 +128,7 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 - A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
   owner-approved card.
 - **Adding a pack** (pair-major: [tile order](docs/pack-format.md#tile-order)) updates, in the same landing, its
-  `aliases` row in `src/cli.zig` (`Alias.tier_gb`, `recommend_gb`), the tier table and recommended launch in
+  `packs` row in `src/<arch>/arch.zig` (`Alias.tier_gb`, `recommend_gb`), the tier table and recommended launch in
   `docs/usage.md`, and the README pack line.
 
 ## Conventions

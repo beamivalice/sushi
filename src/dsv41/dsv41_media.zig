@@ -7,7 +7,7 @@ const model = @import("../model.zig");
 const arch_media = @import("../arch/media.zig");
 const dsv41_vision = @import("dsv41_vision.zig");
 
-pub const mode: arch_media.Mode = .dsv41;
+pub const mode = .dsv41;
 pub const Tower = dsv41_vision.Dsv41Vision;
 pub const scratchBytes = dsv41_vision.encodeScratchBytes;
 

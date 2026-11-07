@@ -25,6 +25,12 @@ test {
     _ = @import("regex.zig");
     _ = @import("tokenizer.zig");
     _ = @import("arch/chat.zig");
+    _ = @import("arch/packs.zig");
+    _ = @import("arch/flags.zig");
+    _ = @import("help.zig");
+    _ = @import("http.zig");
+    _ = @import("request_parse.zig");
+    _ = @import("server_state.zig");
     _ = @import("dsv41/tokenizer_deepseek.zig");
     _ = @import("stop_sequences.zig");
     _ = @import("row_grammar.zig");

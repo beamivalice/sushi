@@ -12,8 +12,10 @@ const model = @import("../model.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const vision_common = @import("../vision_common.zig");
 const registry = @import("registry.zig");
+const media_mode = @import("media_mode.zig");
 
-pub const Mode = @FieldType(chat.VisionPreproc, "mode");
+pub const Mode = media_mode.Mode;
+pub const modeNamed = media_mode.modeNamed;
 
 /// The size a processor resizes an image to and the patch grid it lands on.
 pub const ImagePlan = struct { width: u32, height: u32, grid_h: u32, grid_w: u32 };

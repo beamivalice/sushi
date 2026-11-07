@@ -14,8 +14,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 Every bill, admission, context and chunk function is in `src/bills.zig`, which links no MLX and runs in
 `zig build test-host`; `gpu_mem.zig` holds the live GPU readers, so a host test that would read the device panics
 instead of guessing. An arch's own terms are in `src/<arch>/<arch>_bill.zig` ([engine-arch-seam](engine-arch-seam.md)).
-`bills.zig` reads the launch vars `main.zig` writes through `launch_state` (an alias of `server.zig`, temporary until
-the launch state has its own file); `requestBillsMtpHead` stays in `server.zig`. The `bill pin:` tests hold every
+`bills.zig` reads the launch vars `main.zig` writes through `launch_state` (an alias of `server_state.zig`, the process
+globals' file); `requestBillsMtpHead` stays in `server.zig`. The `bill pin:` tests hold every
 bill function's output on the committed fixture configs of all served packs: a bill change moves a pin, on purpose.
 
 ## Metal OOM

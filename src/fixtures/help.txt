@@ -1,0 +1,329 @@
+sushi — MLX inference server for Apple Silicon
+
+Usage: sushi <command> [options]
+       sushi [options]
+
+Commands:
+  run <model>         Download if needed, serve it, and chat right here
+                      (a local model name or a HuggingFace "org/repo")
+                      --think <value>: GLM low|high|max (default high);
+                      Qwen off|low|medium|xhigh; MiMo off, or any
+                      other level as on.
+                      /think <effort> changes it in the chat;
+                      --tool on (or /tool on) lets the model search the
+                      web, fetch pages and read files in the current
+                      folder, read-only (off by default); /edit on|off
+                      (or the browser's Edit chip) adds write_file and
+                      edit_file, still inside that folder; they start
+                      off unless launched with --edit on; /cd
+                      <folder> moves that folder; /image <path> shows a
+                      vision model an image (a relative path is read
+                      from that folder). The prompt shows the folder and
+                      whether tools are on. The same chat opens in a
+                      browser at the URL it prints. /update installs
+                      a newer release and restarts the chat.
+  pull <model>        Download a Sushi pack from the Hugging Face org
+                      beamster into ~/.sushi/models: a short name
+                      (qwen3.8-flash-next[:tag], mimo-v2.6-flash,
+                      glm-5.3-flash[:tag]) or beamster/<repo>. Warns
+                      when this Mac has less memory than the pack's
+                      documented tier, then pulls anyway.
+  list                Show the Sushi packs with their size, whether they
+                      are downloaded and whether this Mac meets their
+                      memory tier (the recommended one marked), then
+                      the other models on disk. Offline: the local
+                      models only.
+  serve               Start the server over ~/.sushi/models
+                      (every pulled model loads on demand by name)
+  launch <agent>      Configure + launch a coding agent CLI against the
+                      local server (claude, pi, omp, opencode, dsh,
+                      codex, hermes, aider, zcode, grok). `sushi launch <agent> -h`
+                      for options
+  kld capture|compare Write a teacher fixture (full-vocab logits at
+                      every greedy position), or teacher-force one
+                      through a model and report KLD / top-1 / NLL.
+                      `sushi kld --help` for options
+  bench               Bench a model in this process (--model <dir>), or
+                      drive a running server (--url; tests/bench.sh boots
+                      it and takes the box rules).
+                      `sushi bench --help` for options
+  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
+                      GLM-5.3-Flash source checkpoint into a Sushi pack
+                      (routed experts as EXL3). `sushi convert --help`
+                      for options
+  repack <pack>       Rewrite an STQ pack in place into the
+                      pair-major layout. A shard is replaced only after
+                      its rewrite reads back equal; a cut-off run
+                      resumes when repeated. Stop any server using the
+                      pack first. Never downloads. Options:
+                      --pack-revision <id>  stamp the pack with a
+                        revision (config.json and every shard header)
+                      --shards <name-or-glob>  stamp only these shards
+                        (repeatable; a pattern matching nothing is
+                        refused)
+                      --unstamped <shard>  leave this shard without a
+                        stamp (repeatable; a symlinked shard needs it)
+                      --check  read only: every shard not unstamped
+                        carries the config's revision
+  update              Replace this install with the newest release,
+                      after checking its SHA-256, its signature and
+                      that it runs; the old one stays as
+                      <install>.previous. --check only reports,
+                      --rollback swaps the previous one back.
+                      `sushi update --help` for options
+
+Options:
+  --model <dir>       Path to MLX model directory
+  --serve             Start HTTP server mode
+  --host <ip>         Bind address (default: 127.0.0.1 — this Mac only;
+                      0.0.0.0 opens it to the local network)
+  --port <n>          Bind port (default: 12345, or `server.port` in
+                        ~/.sushi/model-settings.json)
+  --ctx-size <n>      Maximum context length (default: model max)
+  --config-overrides <json>   JSON object deep-merged into EVERY
+                      model's config.json this process loads or
+                      discovers. Generic keys
+                      like max_position_embeddings hit everything.
+                      HF attention_factor replaces the computed YaRN
+                      mscale; vLLM attn_factor multiplies it.
+                      e.g. '{"text_config":{"rope_parameters":{"rope_type":
+                      "yarn","factor":4.0,"original_max_position_embeddings":
+                      262144},"max_position_embeddings":1048576}}'
+  --prompt, -p <text> Run one prompt and exit (also with run <model>)
+  --stream            Stream tokens as they are generated (with --prompt)
+  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
+                      mode, the default for requests that omit the field
+  --temp <f>          Temperature. Offline: sampling temp (default 0.0).
+                      Serve: default for requests that omit `temperature`
+                      (otherwise the model's generation_config.json, then 1.0)
+  --top-p <f>         Serve-mode default top_p for requests that omit it
+                      (otherwise generation_config.json, then 1.0 = off)
+  --top-k <n>         Serve-mode default top_k for requests that omit it
+                      (otherwise generation_config.json, then 0 = off)
+  --timeout <n>       Stall timeout in seconds: abort a request after n seconds
+                      WITHOUT producing a token (default: 300, 0=none). A request
+                      that keeps generating never times out, however long it runs.
+  --preserve-thinking on|off  Templates that read `preserve_thinking` (Qwen3.8)
+                      keep every turn's thinking (on, the template default)
+                      or only the latest user turn's (off). Request
+                      chat_template_kwargs > this flag > model-settings.json
+  --think-penalty <f> Lower the logits of ~50 overthinking markers ("Wait",
+                      "But", "Alternatively", ...) by f inside the reasoning
+                      span (default 0 = off). Request think_penalty > this
+                      flag > model-settings.json
+  --no-vision         Disable vision encoder (saves memory)
+  --vision-bf16       Keep a bf16 vision tower as stored instead of requantizing
+                      it to affine 8-bit at load (more memory, exact tower)
+  --vision            Load the vision tower on an SSD-streamed load too (off by
+                      default there, except for DeepSeek-V4.1: its weights
+                      come out of the expert cache)
+  --no-prevent-sleep  Allow Mac idle sleep during inference and model
+                      loads. Display sleep is always allowed.
+  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
+                        refuses a load whose weights + warmup headroom
+                        look too big for current free memory. The check
+                        is conservative (macOS reclaims file cache as
+                        MLX allocates); use this if a load you know fits
+                        is being refused. A genuine over-commit can
+                        hard-crash the server.
+  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
+                        rounds and GLM DFlash2 (default: ON).
+  --no-mtp            Disable the native MTP head. Qwen and MiMo load it
+                        and run it by default; GLM's stays off. On
+                        DeepSeek-V4.1 it turns DSpark off.
+  --mtp               Force the MTP head ON. Qwen and MiMo run it by
+                        default, GLM does not; an SSD-streamed pack
+                        that cannot stream its head refuses --mtp.
+  --drafter <dir>     Use the DFlash2 assistant stored in <dir>. GLM
+                        finds the pack's own dflash2/ folder or the
+                        released assistant folder beside the weights
+                        by itself; Qwen3.8-Flash-Next decodes with MTP
+                        unless this flag names the assistant.
+  --drafter-min-depth <n> Fewest verifier rows (t1 plus drafts) a DFlash2
+                        round carries, 2..16 (default 2). On
+                        Qwen3.8-Flash-Next the round picks its rows
+                        within --drafter-min-depth..--drafter-max-depth
+                        from the drafter's confidence; equal values
+                        pin one count. GLM only checks it.
+  --drafter-max-depth <n> Most verifier rows a DFlash2 round carries
+                        (default: 8 on Qwen3.8-Flash-Next, at most 8;
+                        3 on GLM, at most 4).
+  --no-drafter        Never load the DFlash2 assistant (saves its memory).
+  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
+                        --kv-quant (default OFF: the head keeps
+                        dense bf16 KV). No effect on MiMo, whose
+                        heads keep a dense sliding window.
+  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
+                        (default 1). Every depth the planner picks
+                        stays inside --mtp-min-depth..--mtp-max-depth;
+                        equal values pin one depth. DeepSeek-V4.1:
+                        DSpark verifies depth + 1 rows (its block
+                        is 5 drafts); a min above 1 never takes a
+                        plain step.
+  --mtp-max-depth <n> Most tokens an MTP round drafts, 1..8 (default:
+                        adaptive — the EV controller plans depth
+                        per round up to 8 on eligible M5 NAX targets,
+                        otherwise 6, lower on silicon with a measured
+                        verify-width cliff; SUSHI_MTP_ADAPTIVE=0
+                        reverts to the fixed windowed controller,
+                        cap 3). A --mtp-min-depth above that default
+                        lifts it. Each machine finds its own range.
+  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
+                        Use 0.2 for the Qwen3.8 matched comparison.
+  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
+                        Use 0.95 for the Qwen3.8 matched
+                        comparison. Exclusive with
+                        --mtp-typical; exact is the default.
+  --mtp-greedy-tail   Sampled requests draft only the first MTP token
+                        from the draft sampler, every later one by
+                        argmax. Pays beside --mtp-typical (faster,
+                        slightly more predictable text); greedy
+                        requests are unchanged. Default off.
+  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
+                        context tokens (default: 0 = no ceiling).
+                        A verify row is BYTES, so on a long-context
+                        trunk a round can cost more than the serial
+                        steps it replaces. A request whose prompt is
+                        past <n> decodes serially, and one that
+                        GENERATES past it switches mid-flight. The
+                        bound is inclusive (<n> itself still drafts)
+                        and it outranks `enable_mtp:true` in the
+                        request body.
+  --qwen-gdn <32|16>  Qwen only: bits of the GatedDeltaNet recurrent state
+                      between tokens (default 32 = f32; the decay gate
+                      is f32 either way). 16 (bf16) halves the state in
+                      every cache checkpoint (about 54 MB each on
+                      Flash-Next) to save memory on smaller machines.
+                      No effect on GLM or MiMo, which have no GDN arm.
+  --drop-expert <n>   DeepSeek-V4.1 only: never load or pick the n least-used
+                      routed experts of every layer, ranked by the pack's
+                      expert_usage.json (n a multiple of 8; default 0 =
+                      off). A token's pick moves to its next-best expert;
+                      the memory bill shrinks by the dropped bytes. Answers
+                      change, so score it with `sushi kld compare`.
+  --kv-quant <mode>   KV-cache quantization scheme:
+                        8, 6 or 4 — affine group quant; default 8 on
+                          every model but DeepSeek-V4.1, which has no
+                          KV cache and refuses the flag (GLM refuses
+                          4). 16 (or `off`)
+                          keeps dense bf16 KV. It outranks a
+                          model's model-settings.json `kv_quant`.
+                          Per-request override via the `kv_quant`
+                          body field.
+  --prefill-chunk <n> Maximum tokens forwarded per prefill chunk
+                        (default: 8192). Auto-capped further per model
+                        so one layer's attention scores stay within
+                        budget; this flag is the ceiling, not a floor.
+                        When a request does not fit at <n>, it runs
+                        at the widest narrower width that fits (down
+                        to 512) instead of being refused.
+  --max-concurrent <n>  Sizes the submit queue (n + 32) and floors the
+                        prefix-cache entry count. Requests batch at
+                        any value (default: 1).
+  --prefill-decode-share <s>
+                      Target decode wall-time share during another
+                        request's prefill (0..0.9); never narrows
+                        chunks. Default 0.25.
+  --prefix-cache-entries <n>
+                      Hot prefix cache LRU capacity in entries
+                        (default: 32). 0 disables all prefix reuse.
+  --prefix-cache-mem <n>{{KB,MB,GB}}
+                      Turn on RAM retention of idle prefix-cache
+                        entries with this KV-bytes budget (default:
+                        off; prefixes live on the SSD tier).
+                      Evicts LRU entries until the budget fits.
+                      Pass 0 (or off) to keep RAM retention off.
+  --prefix-cache-disk <n>{{KB,MB,GB}}
+                      SSD tier byte budget for the prefix cache
+                        (default: on, min(entries x context x bytes
+                        per token + 2GB, 20GB, free disk - 4GB)).
+                      Sizes are binary: 1GB = 1 GiB.
+                      Seen prefixes persist under ~/.sushi/kv-cache
+                        (SUSHI_PREFIX_CACHE_DIR) and are restored
+                        across restarts instead of recomputed. 0/off
+                        disables.
+  --ssm-checkpoint-max <n>
+                      Cap on SSM checkpoint states held in memory per
+                        cache entry (default: 16). The first and the
+                        newest are always kept; beyond the cap the
+                        interior is thinned. 0 = unlimited, bounded only
+                        by the prefix cache's byte budget. It never
+                        thins the restore points on SSD, which keep
+                        every 8192 tokens and each prompt's end
+                        (--prefix-cache-disk sizes them).
+  --wired-margin-gib <n>
+                      How far under iogpu.wired_limit_mb a plan may
+                        reach (default: 1, integers 1..32).
+  --expert-pick-tolerance <n>
+                      LOSSY, streamed packs only (default: 0 = off,
+                        exact routing). A routed expert missing from the
+                        cache is replaced by the best cached expert the
+                        router did not pick, when that expert's probability
+                        is at least (1 - n) x the missed one's. 0..0.6;
+                        0.3 is a mild setting. A sigmoid router (MiMo)
+                        compares sigmoid probabilities.
+  --ssd-budget-gb <n> Stream routed experts from SSD (Sushi pack or
+                        source checkpoint) with a
+                        TOTAL resident target of <n> GiB; the expert
+                        cache is what is left after the trunk, the
+                        prefill union and the fill buffers.
+  --ssd-prefetch <n>  Streamed-expert prefetch read cap (default: 0, off).
+                        The share, in percent (0..100), of this Mac's SSD
+                        read rate (measured at load) that the expert
+                        reads of a streamed load may use, the reads a
+                        route waits for and the prefetch's together.
+                        0 = no prefetch; 65 is the tuned cap on a fast
+                        SSD; lower it to leave the SSD to other programs.
+  --model-dir <dir>   Directory of MLX models to discover at startup.
+                        Discovered siblings appear in /v1/models and
+                        can be loaded on-demand via /v1/load-model
+                        (or by sending a request with model=<id>).
+                        REPEATABLE (up to 8) — pass it once per folder
+                        your models live in. Scanned in order; the
+                        first folder wins a repeated model id, and a
+                        folder that can't be opened is skipped.
+  --max-resident-models <n>
+                      Maximum loaded models in memory (default: 3).
+                        ensureLoaded evicts LRU before exceeding.
+  --max-resident-mem <n>{{KB,MB,GB}}|auto
+                      Summed resident-bytes cap across all loaded
+                        models. Default 'auto' = 80% of MLX wired
+                        limit at startup. Pass 0 to disable.
+  --idle-evict-secs <n>
+                      Evict .ready entries with refcount==0 if
+                        idle for this many seconds. Default: off.
+  --gpu-warm-secs <n> Keep the GPU awake for this many seconds after
+                        the last request, so the next one starts
+                        without a wake-up delay (default: 60, 0 = off).
+  --no-metrics        Turn off the metrics at GET /metrics and /metrics.json
+                        (on by default; POST /metrics/enable turns them back
+                        on). --metrics is accepted and does nothing.
+  --no-tool-autocorrect
+                      Disable tool-call ARGUMENT auto-correct — the
+                        coercion of parsed args to the tool schema's
+                        declared types (e.g. Python `False` -> JSON
+                        `false`). Args then pass through as the model
+                        emitted them (still valid JSON). Default: on.
+  --api-key <token>   Require this key on every request (OpenAI/
+                        Anthropic/Ollama APIs + index page + metrics).
+                        Accepts Authorization: Bearer, x-api-key, HTTP
+                        Basic (key = password), or ?api_key=. /health
+                        stays open. Unset = no auth (default).
+  --api-key-strict    Require the key from loopback too (localhost is
+                        exempt by default). For embedders that want
+                        "only the key holder drives inference" on a
+                        shared machine. No effect without --api-key.
+  --api-key-env <VAR> Read the key from environment variable VAR
+                        instead of argv (the process table is
+                        world-readable). Unset/empty VAR = no auth.
+  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
+  --log-file <path>   Persist the server log ("off" disables).
+                      Default: ~/.sushi/logs/sushi-<port>.log
+  --parent-pid <pid>  Shut down when process <pid> exits (for a host
+                        that runs sushi as its engine).
+  --no-update-check   Never ask GitHub for a newer release (a server
+                        otherwise checks at most once a day)
+  --version           Print version and exit
+  --guest-manifest    Print the JSON a host checks before running this
+                        build as its engine (guest.json), and exit
+  --help, -h          Show this help

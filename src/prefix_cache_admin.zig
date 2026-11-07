@@ -3,12 +3,14 @@
 //! no loaded model uses. The scan and the stale delete are filesystem-only and run on the connection thread;
 //! a model's clear goes through its `DiskTier` on the inference thread, the tier's sole owner.
 const std = @import("std");
+const http = @import("http.zig");
 const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const http_conn = @import("http_conn.zig");
 const server = @import("server.zig");
+const server_state = @import("server_state.zig");
 
 pub const ns_name_len = 16;
 
@@ -241,13 +243,13 @@ pub fn renderList(
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    const esc_root = try server.jsonEscape(allocator, root);
+    const esc_root = try http.jsonEscape(allocator, root);
     defer allocator.free(esc_root);
     try w.print("{{\"root\":{s},\"volume\":", .{esc_root});
     if (volume) |v| {
-        const esc_name = if (volume_name) |name| try server.jsonEscape(allocator, name) else try allocator.dupe(u8, "null");
+        const esc_name = if (volume_name) |name| try http.jsonEscape(allocator, name) else try allocator.dupe(u8, "null");
         defer allocator.free(esc_name);
-        const esc_path = try server.jsonEscape(allocator, volume_path);
+        const esc_path = try http.jsonEscape(allocator, volume_path);
         defer allocator.free(esc_path);
         try w.print("{{\"name\":{s},\"path\":{s},\"free_bytes\":{d},\"total_bytes\":{d}}}", .{ esc_name, esc_path, v.free, v.total });
     } else try w.writeAll("null");
@@ -261,7 +263,7 @@ pub fn renderList(
             if (i == 0) "" else ",", n.nameBuf(), n.bytes, n.entries, @divTrunc(n.newest_ns, std.time.ns_per_s),
         });
         if (owner) |o| {
-            const esc_id = try server.jsonEscape(allocator, o.id);
+            const esc_id = try http.jsonEscape(allocator, o.id);
             defer allocator.free(esc_id);
             try w.print("\"model\":{s},\"stale\":false,\"held_by_other_process\":false,\"tier\":{{\"used_bytes\":{d},\"cap_bytes\":{d},\"entries\":{d},\"written_bytes\":{d}}}}}", .{
                 esc_id, o.snap.used, o.snap.budget, o.snap.entries, o.snap.written,
@@ -279,12 +281,12 @@ fn cacheRoot(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn handleList(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
-    const registry = server.global_registry orelse {
-        try server.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+    const registry = server_state.global_registry orelse {
+        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
         return;
     };
     const root = cacheRoot(allocator) catch {
-        try server.sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "No cache directory", 500);
+        try http.sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "No cache directory", 500);
         return;
     };
     defer allocator.free(root);
@@ -306,7 +308,7 @@ pub fn handleList(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
     defer volume_info.deinit(allocator);
     const body = try renderList(allocator, root, volume_info.space, volume_info.name, volume_info.path, namespaces, loaded, other);
     defer allocator.free(body);
-    try server.sendResponse(stream, "200 OK", "application/json", body);
+    try http.sendResponse(stream, "200 OK", "application/json", body);
 }
 
 const Scope = enum { model, stale, all, namespace };
@@ -329,26 +331,26 @@ pub fn parseScope(name: []const u8) ?Scope {
 }
 
 pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
-    const sch = server.global_scheduler orelse {
-        try server.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+    const sch = server_state.global_scheduler orelse {
+        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, request_body, .{}) catch {
-        try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Body must be JSON", 400);
+        try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Body must be JSON", 400);
         return;
     };
     defer parsed.deinit();
     const obj = if (parsed.value == .object) parsed.value.object else {
-        try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Body must be a JSON object", 400);
+        try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Body must be a JSON object", 400);
         return;
     };
     const scope_name = if (obj.get("scope")) |s| (if (s == .string) s.string else "") else "";
     const scope = parseScope(scope_name) orelse {
-        try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "scope must be \"model\", \"namespace\", \"stale\" or \"all\"", 400);
+        try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "scope must be \"model\", \"namespace\", \"stale\" or \"all\"", 400);
         return;
     };
     const root = cacheRoot(allocator) catch {
-        try server.sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "No cache directory", 500);
+        try http.sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "No cache directory", 500);
         return;
     };
     defer allocator.free(root);
@@ -361,44 +363,44 @@ pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, reques
 
     if (scope == .namespace) {
         const ns = clearNamespaceId(obj) orelse {
-            try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "id must be a 16-digit lowercase hex namespace name", 400);
+            try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "id must be a 16-digit lowercase hex namespace name", 400);
             return;
         };
         const loaded = try loadedTiers(allocator, sch.registry);
         defer allocator.free(loaded);
         if (ownerOf(loaded, ns) != null) {
-            try server.sendErrorResponse(allocator, stream, "409 Conflict", "namespace_in_use", "A loaded model uses this namespace; clear it with scope \"model\"", 409);
+            try http.sendErrorResponse(allocator, stream, "409 Conflict", "namespace_in_use", "A loaded model uses this namespace; clear it with scope \"model\"", 409);
             return;
         }
         namespace_result = deleteNamespaces(allocator, stream.io, root, &.{}, ns);
         const r = namespace_result.?;
         if (r.namespaces == 0 and r.skipped_live == 0 and r.refused_links == 0) {
-            try server.sendErrorResponse(allocator, stream, "404 Not Found", "namespace_not_found", "No such namespace in the cache", 404);
+            try http.sendErrorResponse(allocator, stream, "404 Not Found", "namespace_not_found", "No such namespace in the cache", 404);
             return;
         }
     }
 
     if (scope == .model) {
         const id = clearModelId(obj) orelse {
-            try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "model must be a model id", 400);
+            try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "model must be a model id", 400);
             return;
         };
         const entry = sch.registry.resolveEntry(id) catch |err| {
             const no_default = err == error.NoDefaultModel;
-            try server.sendErrorResponse(allocator, stream, if (no_default) "503 Service Unavailable" else "404 Not Found", if (no_default) "no_model" else "model_not_found", if (no_default) "No default model configured" else "Unknown model id", if (no_default) 503 else 404);
+            try http.sendErrorResponse(allocator, stream, if (no_default) "503 Service Unavailable" else "404 Not Found", if (no_default) "no_model" else "model_not_found", if (no_default) "No default model configured" else "Unknown model id", if (no_default) 503 else 404);
             return;
         };
         const r = sch.prefixAdmin(.{ .entry = entry }) catch {
-            try server.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+            try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
             return;
         };
         switch (r.outcome) {
             .not_loaded => {
-                try server.sendErrorResponse(allocator, stream, "409 Conflict", "model_not_loaded", "The model is not loaded or has no SSD prefix cache; use scope \"stale\" to delete the caches of unloaded models", 409);
+                try http.sendErrorResponse(allocator, stream, "409 Conflict", "model_not_loaded", "The model is not loaded or has no SSD prefix cache; use scope \"stale\" to delete the caches of unloaded models", 409);
                 return;
             },
             .busy => {
-                try server.sendErrorResponse(allocator, stream, "409 Conflict", "model_busy", "A request is using the model; retry when it finishes", 409);
+                try http.sendErrorResponse(allocator, stream, "409 Conflict", "model_busy", "A request is using the model; retry when it finishes", 409);
                 return;
             },
             .cleared => {
@@ -441,13 +443,13 @@ pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, reques
         @tagName(scope), model_freed +| stale.bytes, model_freed, model_entries, stale.bytes, stale.namespaces, stale.skipped_live, stale.refused_links,
     });
     for (busy.items, 0..) |id, i| {
-        const esc = try server.jsonEscape(allocator, id);
+        const esc = try http.jsonEscape(allocator, id);
         defer allocator.free(esc);
         try w.print("{s}{s}", .{ if (i == 0) "" else ",", esc });
     }
     try w.writeAll("]}");
     log.info("[prefix-cache-admin] clear scope={s}: freed {d} MB\n", .{ @tagName(scope), (model_freed +| stale.bytes) >> 20 });
-    try server.sendResponse(stream, "200 OK", "application/json", out.written());
+    try http.sendResponse(stream, "200 OK", "application/json", out.written());
 }
 
 // ── Tests ──

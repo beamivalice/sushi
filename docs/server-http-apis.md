@@ -2,7 +2,7 @@
 
 What each HTTP surface promises its clients: the OpenAI chat/completions/Responses and Anthropic Messages contracts,
 streaming and usage chunks, logprobs, seeds and sampling, reasoning budgets and constrained JSON, plus the agent
-launcher. Read this before touching `src/server.zig`, `src/http_conn.zig`, `src/anthropic.zig`, `src/responses_api.zig`, `src/completions.zig`, `src/generation_stream.zig`, `src/request_policy.zig`, `src/responses.zig`, `src/launch.zig` or the sampler.
+launcher. Read this before touching `src/server.zig`, `src/http.zig`, `src/request_parse.zig`, `src/http_conn.zig`, `src/anthropic.zig`, `src/responses_api.zig`, `src/completions.zig`, `src/generation_stream.zig`, `src/request_policy.zig`, `src/responses.zig`, `src/launch.zig` or the sampler.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](server-tool-calling.md),
 [server-lifecycle](server-lifecycle.md), [engine-mtp](engine-mtp.md).
@@ -506,7 +506,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   packs:[{repo, name, tag, size_bytes|null, tier_gb|null, fits|null, streams_experts, recommended, installed,
   path|null, partial_bytes|null, update:{current,latest}|null, launch|null}], jobs:[{repo, dest, phase, stopping, files,
   file_index, total_bytes, done_bytes, file:{path,size,done}|null, speed_bps|null, eta_s|null, message|null}]}`.
-- The catalog is the `cli.aliases` table, then the org's public repos named `-Sushi-` from `/api/models?author=beamster`
+- The catalog is the `cli.aliases` table (the enabled archs' `packs` rows), then the org's public repos named `-Sushi-` from `/api/models?author=beamster`
   whose name is plain `[A-Za-z0-9._-]` (a pack published after the build: no tier, so `fits` null). Sizes are `sushi
   list`'s (`?blobs=true`); a repo the API answers 401/403/404 for is left out; with no answer at all the known packs stand
   with null sizes and `catalog` `offline`. It is built on a background thread, at most every 10 minutes (1 minute while

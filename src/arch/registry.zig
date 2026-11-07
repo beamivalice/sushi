@@ -79,6 +79,11 @@ pub fn Mod(comptime tag: Tag) type {
     return @field(archs, @tagName(tag)).mod;
 }
 
+/// Where the arch gate lists the arch: the `gate_rank` of its registry line.
+pub fn gateRank(comptime tag: Tag) u8 {
+    return @field(archs, @tagName(tag)).gate_rank;
+}
+
 /// The arch's MLX-free chat face (`<arch>_chat.zig`): effort offer, pinned template, pre-tokenizer.
 pub fn Chat(comptime tag: Tag) type {
     return @field(archs, @tagName(tag)).chat;

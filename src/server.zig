@@ -4,13 +4,9 @@ const transformer_mod = @import("transformer.zig");
 const verify_moe = @import("verify_moe.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const nax_gate = @import("nax_gate.zig");
-const qwen4_qsa_select = @import("qwen4/qwen4_qsa_select.zig");
-const qwen4_qsa_gather = @import("qwen4/qwen4_qsa_gather.zig");
-const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const mtp_mod = @import("mtp.zig");
-const mimo_mtp = @import("mimo2/mimo_mtp.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const chat_mod = @import("chat.zig");
 const think_tags = @import("think_tags.zig");
@@ -24,18 +20,13 @@ const fp8_block = @import("fp8_block.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const model_mod = @import("model.zig");
 const effort_mod = @import("effort.zig");
-const dsv41_config = @import("dsv41/dsv41_config.zig");
-const qwen_vision = @import("qwen4/qwen_vision.zig");
-const vision_common = @import("vision_common.zig");
-const mimo_vision = @import("mimo2/mimo_vision.zig");
-const glm5_vision = @import("glm5/glm5_vision.zig");
-const dsv41_vision = @import("dsv41/dsv41_vision.zig");
-const glm5_prefix = @import("glm5/glm5_prefix.zig");
-const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
-const dsv41_borrow = @import("dsv41/dsv41_borrow.zig");
-const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
+const server_state = @import("server_state.zig");
+const http = @import("http.zig");
+const request_parse = @import("request_parse.zig");
+const arch_flags = @import("arch/flags.zig");
+const arch_serve = @import("arch/serve.zig");
 const responses_mod = @import("responses.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const kv_disk_writer = @import("kv_disk_writer.zig");
@@ -53,7 +44,6 @@ const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
-const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const update_mod = @import("update.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -93,6 +83,7 @@ const manualContext = bills.manualContext;
 pub const resolvedPrefixCacheMem = bills.resolvedPrefixCacheMem;
 const clearResolvedPrefixCacheMem = bills.clearResolvedPrefixCacheMem;
 pub const diskAsk = bills.diskAsk;
+pub const setDiskAsk = server_state.setDiskAsk;
 const diskTierOn = bills.diskTierOn;
 pub const effectiveSsmCheckpointStride = bills.effectiveSsmCheckpointStride;
 pub const getEffectiveContextLength = bills.getEffectiveContextLength;
@@ -108,7 +99,6 @@ pub const memoryContextRefusalMessage = bills.memoryContextRefusalMessage;
 const loadServingBill = bills.loadServingBill;
 pub const prefixCacheMemForLoad = bills.prefixCacheMemForLoad;
 pub const prefixCacheDiskForLoad = bills.prefixCacheDiskForLoad;
-pub const qsaScoreFusedOffGuard = fixtures.qsaScoreFusedOffGuard;
 pub const computeMemoryContext = bills.computeMemoryContext;
 pub const glmDflashReserveBudget = bills.glmDflashReserveBudget;
 pub const prefillRequestTerms = bills.prefillRequestTerms;
@@ -124,120 +114,60 @@ const pinnedResidentBytes = bills.pinnedResidentBytes;
 const prefillFitsNow = bills.prefillFitsNow;
 const prefillBillNumbersNow = bills.prefillBillNumbersNow;
 const logPrefillRefusal = bills.logPrefillRefusal;
-pub const qwen4ExpOomConfig = fixtures.qwen4ExpOomConfig;
 pub const resolveMlxCadence = gpu_mem.resolveMlxCadence;
 pub const applyMlxCacheLimit = gpu_mem.applyMlxCacheLimit;
 pub const capMlxPool = gpu_mem.capMlxPool;
-/// Global flag set by signal handler for graceful shutdown.
-pub var shutdown_requested = std.atomic.Value(bool).init(false);
+
+// The transport and the request readers live in http.zig and request_parse.zig; the handlers here call them by name.
+const startupRefusal = http.startupRefusal;
+const sendResponse = http.sendResponse;
+const sendResponseQuiet = http.sendResponseQuiet;
+const logHttpRequest = http.logHttpRequest;
+const peerIsLoopback = http.peerIsLoopback;
+const responseBody = http.responseBody;
+const not_enough_memory_message = http.not_enough_memory_message;
+const insufficient_free_memory_message = http.insufficient_free_memory_message;
+const countRejected = http.countRejected;
+const sendErrorResponse = http.sendErrorResponse;
+pub const jsonEscape = http.jsonEscape;
+const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
+const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
+const parseModelFromBody = request_parse.parseModelFromBody;
+const queryModel = request_parse.queryModel;
+const messageReasoningFromObj = request_parse.messageReasoningFromObj;
+const parseRequestSeed = request_parse.parseRequestSeed;
+const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
+const chatIgnoreEosRejectReason = request_parse.chatIgnoreEosRejectReason;
+const parseCancelRequestId = request_parse.parseCancelRequestId;
+const joinedTextParts = request_parse.joinedTextParts;
+pub const requestCacheKey = request_parse.requestCacheKey;
+const nChoicesRejectReason = request_parse.nChoicesRejectReason;
+const extractJsonField = request_parse.extractJsonField;
+const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
+const parseKvQuantOverride = request_parse.parseKvQuantOverride;
+const unescapeJsonSlashes = request_parse.unescapeJsonSlashes;
 /// Number of live per-connection threads. Incremented before each spawn,
 /// decremented when the thread's handler returns. On shutdown, `serve` waits
 /// for this to reach 0 before returning (which runs `scheduler.deinit`) — a
 /// detached conn thread still in `Scheduler.complete` would otherwise race
 /// deinit's teardown of the slot queues into a use-after-free (SIGSEGV).
 var active_conn_threads = std.atomic.Value(u32).init(0);
-pub var completion_id_counter = std.atomic.Value(i64).init(0);
-/// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
-/// (i.e. from another machine over the network) except the `/health` probe and
-/// CORS preflight requires the key — the OpenAI/Anthropic APIs AND the
-/// metrics feed. Loopback (127.0.0.0/8, ::1) is TRUSTED and
-/// exempt, so the local app + a local browser keep working with no credentials;
-/// the key protects the surface that actually matters — network exposure
-/// (`--host 0.0.0.0`). Accepted as `Authorization: Bearer <key>`, `x-api-key:
-/// <key>` (Anthropic), HTTP Basic (browser pages — the key is the password), or
-/// an `?api_key=` / `?key=` query param. null ⇒ fully open (default, unchanged).
-pub var g_api_key: ?[]const u8 = null;
 
-/// `--api-key-strict`: drop the loopback exemption, so the key is required
-/// from 127.0.0.1 too (`/health` and CORS preflight stay open). For hosts
-/// where localhost is NOT one trust domain — an embedding application that
-/// generates a fresh key per start wants "only the process holding the key
-/// can drive inference", and loopback exemption made any local process (and
-/// any browser page via a simple no-preflight POST) a key holder. No effect
-/// unless `--api-key` is set.
-pub var g_api_key_strict: bool = false;
 
-/// Tool-call ARGUMENT auto-correct. When true (default), parsed tool-call
-/// arguments are coerced to the types the request's tool schema declares
-/// (`tool_schema.coerceToolArgsToSchema` — e.g. Python's `False` → JSON `false`, an
-/// `edits` array shipped as a string → a real array). `--no-tool-autocorrect`
-/// turns it OFF: arguments pass through exactly as the model emitted them (still
-/// valid JSON — the parse-repair + safety net always run; this gates ONLY the
-/// schema-type coercion, the opinionated layer). Off means a weak model's
-/// mistyped value reaches the client verbatim, which strict clients reject.
-pub var g_tool_autocorrect: bool = true;
 
-/// `--parent-pid`: a host runs this engine, so the host (not `/v1/update`) updates it.
-pub var host_managed: bool = false;
-/// The bind `serve` listens on; `/v1/update` checks the page's Origin against it.
-pub var listen_host: []const u8 = default_host;
-pub var listen_port: u16 = default_port;
 
-pub const default_host: []const u8 = "127.0.0.1";
-pub const default_port: u16 = @import("default_port.zig").port;
 
-pub const BindConfig = struct {
-    host: []const u8,
-    port: u16,
-};
-
-/// `settings_port` is the settings file's `server.port` or the built-in default: `--port` wins over both.
-pub fn resolveBind(host_flag: ?[]const u8, port_flag: ?u16, settings_port: u16) BindConfig {
-    return .{
-        .host = host_flag orelse default_host,
-        .port = port_flag orelse settings_port,
-    };
-}
-
-pub fn bindAddress(host: []const u8, port: u16) error{InvalidHost}!std.Io.net.IpAddress {
-    var ip4_bytes: [4]u8 = undefined;
-    if (std.mem.eql(u8, host, "localhost")) {
-        ip4_bytes = .{ 127, 0, 0, 1 };
-    } else if (std.mem.eql(u8, host, "0.0.0.0")) {
-        ip4_bytes = .{ 0, 0, 0, 0 };
-    } else {
-        // Parse dotted-decimal IP
-        var parts = std.mem.splitScalar(u8, host, '.');
-        var idx: usize = 0;
-        while (parts.next()) |part| {
-            if (idx >= 4) return error.InvalidHost;
-            ip4_bytes[idx] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidHost;
-            idx += 1;
-        }
-        if (idx != 4) return error.InvalidHost;
-    }
-    return .{ .ip4 = .{ .bytes = ip4_bytes, .port = port } };
-}
-
-pub fn ensurePortFree(io: std.Io, host: []const u8, port: u16) (error{InvalidHost} || std.Io.net.IpAddress.ListenError)!void {
-    const addr = try bindAddress(host, port);
-    if (addr.connect(io, .{ .mode = .stream })) |s| {
-        s.close(io);
-        return error.AddressInUse;
-    } else |_| {}
-    var probe = try http_conn.startListener(host, port);
-    probe.deinit(io);
-}
-
-pub fn startupRefusal(err: anyerror, host: []const u8, port: u16, buf: []u8) ?[]const u8 {
-    switch (err) {
-        error.AddressInUse => return std.fmt.bufPrint(buf, "port {d} is already in use", .{port}) catch unreachable,
-        error.InvalidHost => return std.fmt.bufPrint(buf, "invalid --host '{s}'", .{host}) catch "invalid --host",
-        else => return null,
-    }
-}
 
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
 const build_options = @import("build_options");
-const glm5_generate = @import("glm5/glm5_generate.zig");
 const mtp_plan = @import("mtp_plan.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const sampler = @import("sampler.zig");
 const think_penalty = @import("think_penalty.zig");
 
 fn signalHandler(_: std.posix.SIG) callconv(.c) void {
-    shutdown_requested.store(true, .release);
+    server_state.shutdown_requested.store(true, .release);
 }
 
 // Plan 05: drafter state moved to `LoadedModel` (per-model `drafter`,
@@ -249,45 +179,9 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
 // is re-computed per-request as `lm.drafter != null and !config.isMoe()`.
 
 pub fn requestShutdown() void {
-    shutdown_requested.store(true, .release);
+    server_state.shutdown_requested.store(true, .release);
 }
 
-/// Server-level configuration. Single source of truth for all process-wide
-/// defaults that handlers might consult. Populated once by `serve()` from
-/// its CLI args; read-only afterwards (no synchronization required, the
-/// values don't change for the server's lifetime).
-pub const ServerConfig = struct {
-    /// Starts an embedded client only after this process owns its listening socket.
-    on_ready: ?*const fn (u16) anyerror!std.Thread = null,
-    /// Starts a client that submits to the scheduler directly, once the model is loaded and the context is
-    /// pinned. The server binds no socket; the client ends the run with `requestShutdown`.
-    embedded_client: ?*const fn () anyerror!std.Thread = null,
-    /// Maximum context size (0 = unlimited). `--ctx-size N`.
-    max_context_size: u32 = 0,
-    /// Request timeout in seconds (0 = no timeout). `--timeout N`.
-    request_timeout_sec: u32 = 300,
-    /// Default reasoning budget in tokens (-1 = unlimited).
-    /// Defaults for sampling fields the request OMITS, set by `--temp` /
-    /// `--top-p` / `--top-k` in serve mode (the macOS app passes its Settings
-    /// values so external clients like Claude Code — which send no sampling
-    /// params at all — inherit them). null = flag not given; resolution falls
-    /// through to the model's generation_config.json recommendation, then the
-    /// hardcoded fallback. Explicit request body fields always win. See
-    /// `resolveSamplingDefault`.
-    default_temperature: ?f32 = null,
-    default_top_p: ?f32 = null,
-    default_top_k: ?u32 = null,
-    /// Default `max_tokens` for a request that omits the field (`--max-tokens N` in serve mode;
-    /// 0 = flag not given). Agent clients send nothing, and an omitted budget is the rest of
-    /// the window, which the admission bill reserves for. Read through `launchMaxTokensDefault`.
-    default_max_tokens: u32 = 0,
-    /// `--mtp`: force the native MTP head ON for MoE targets too. The
-    /// per-request default is otherwise `sidecar loaded and !isMoe()` (the
-    /// verify-forward expert-routing caution the drafter shares), which makes
-    /// a MoE MTP checkpoint unreachable from any client that doesn't send
-    /// `enable_mtp:true` in the body. Per-request `enable_mtp` still wins.
-    default_force_mtp: bool = false,
-};
 
 /// The per-request `enable_mtp` default, for a request that omitted the field.
 /// The ONE place this policy lives — every HTTP surface calls it, so a new
@@ -303,8 +197,6 @@ pub const ServerConfig = struct {
 /// ladder (`Transformer.nativeMoeMtpHeadMeasured`, which carries the bar). It
 /// still needs a head LOADED — the claim is about the head, not the arch.
 
-/// Explicit launch choice, for the bills a load runs before `global_scheduler` is published.
-pub var configured_mtp: ?bool = null;
 
 ///
 /// `served`: `model.served_model_types` default ON with a head loaded (owner policy: MTP is always
@@ -347,114 +239,27 @@ pub fn admitMtpForCtx(enable_mtp: bool, prompt_tokens: usize) bool {
     return false;
 }
 
-/// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
-/// from an explicit value, for fields whose default comes from the
-/// resolution chain above.
-pub fn parseJsonFloatOpt(root: std.json.ObjectMap, key: []const u8, min: f32, max: f32) ?f32 {
-    const v = root.get(key) orelse return null;
-    const raw: f32 = switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => return null,
-    };
-    return std.math.clamp(raw, min, max);
-}
 
-/// Optional top_k body-field parse (positive integer, capped at 1000).
-/// null = omitted or unusable; explicit 0 means "disable top-k".
-pub fn parseJsonTopKOpt(root: std.json.ObjectMap, key: []const u8) ?u32 {
-    const v = root.get(key) orelse return null;
-    return switch (v) {
-        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
-        .float => |f| if (f > 0) @intFromFloat(@min(f, 1000)) else 0,
-        else => null,
-    };
-}
 
-/// Live process-wide config. Mutated by `serve()` at startup from its
-/// parameters; never written from a handler after that. Public so main.zig
-/// can supply defaults (notably the per-request override CLI flags don't
-/// flow through `serve()` arguments).
-pub var server_config: ServerConfig = .{};
 
 pub fn getTimeoutNs() u64 {
-    if (server_config.request_timeout_sec == 0) return 0;
-    return @as(u64, server_config.request_timeout_sec) * std.time.ns_per_s;
+    if (server_state.server_config.request_timeout_sec == 0) return 0;
+    return @as(u64, server_state.server_config.request_timeout_sec) * std.time.ns_per_s;
 }
 
-/// Plan 01 Phase 2 — continuous-batching scheduler. Always non-null in
-/// serve mode (set by `serve()`); null only before `serve()` runs. Every
-/// inference request handler routes through this; the scheduler's
-/// inference thread is the single mlx-call site.
-pub var global_scheduler: ?*scheduler_mod.Scheduler = null;
 
-/// The boot's explicit `--kv-quant`, published by `serve()` before `Scheduler.init` so a
-/// load-time bill sees it (the scheduler does not exist yet during the load; asking it billed
-/// the SSD-first session at bf16, ~8.6 GB of idle allowance lost at 786k). Null = unflagged.
-pub var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
 
-/// Plan 05 — model registry. Always non-null in serve mode (set by
-/// `serve()`); handleConnection resolves `model` body fields against this
-/// per request via `ensureLoaded`/`release`.
-pub var global_registry: ?*ModelRegistry = null;
 
-/// Plan 05 — extract the `"model":"..."` value from a JSON request body
-/// without doing a full parse. Returns a borrowed slice into `body` (valid
-/// until the body buffer is freed) or null if the field is missing or
-/// malformed. Used by `handleConnection` to route each POST to the right
-/// LoadedModel before invoking the handler.
-///
-/// Cheap (single linear scan, ~tens of nanoseconds for typical bodies);
-/// the per-handler full JSON parse runs immediately after and rejects any
-/// truly malformed body, so robustness here is fine.
-pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
-    var idx: usize = 0;
-    while (idx < body.len) {
-        const key_start = std.mem.indexOfPos(u8, body, idx, "\"model\"") orelse return null;
-        // Must be JSON object key: preceded by `{` or `,` (skipping whitespace).
-        var prev = key_start;
-        while (prev > 0) {
-            prev -= 1;
-            const c = body[prev];
-            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
-            if (c == '{' or c == ',') break;
-            // Not a top-level key — keep searching after this match.
-            idx = key_start + 1;
-            return parseModelFromBody(body[idx..]);
-        }
-        // Skip past the key + the colon.
-        var pos = key_start + "\"model\"".len;
-        while (pos < body.len and (body[pos] == ' ' or body[pos] == '\t')) pos += 1;
-        if (pos >= body.len or body[pos] != ':') return null;
-        pos += 1;
-        while (pos < body.len and (body[pos] == ' ' or body[pos] == '\t' or body[pos] == '\n' or body[pos] == '\r')) pos += 1;
-        if (pos >= body.len) return null;
-        // Accept "string" only — null/numbers/etc fall back to default.
-        if (body[pos] != '"') return null;
-        pos += 1;
-        const val_start = pos;
-        while (pos < body.len and body[pos] != '"') {
-            if (body[pos] == '\\' and pos + 1 < body.len) pos += 1; // skip escape
-            pos += 1;
-        }
-        if (pos >= body.len) return null;
-        return body[val_start..pos];
-    }
-    return null;
-}
 
 /// The browser chat page: one self-contained file that talks to this server's own API.
 const chat_page_html = @embedFile("webui/index.html");
 
-/// `--edit on|off`: whether a new chat on the page starts with its write tools on. Each chat's
-/// Edit chip then switches them for itself.
-pub var g_web_edit: bool = false;
 
 /// The browser orchestrates calls; this local-only bridge shares the REPL's restrictions.
 fn handleWebTools(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: []const u8, body: []const u8) !void {
     const origin = http_conn.findHeaderValueCI(headers, "origin") orelse "";
-    if (!peerIsLoopback(stream) or !update_mod.isLoopbackHost(listen_host) or
-        !update_mod.originMatches(origin, listen_host, listen_port))
+    if (!peerIsLoopback(stream) or !update_mod.isLoopbackHost(server_state.listen_host) or
+        !update_mod.originMatches(origin, server_state.listen_host, server_state.listen_port))
     {
         return sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "Tools require this Mac's chat page Origin and a loopback server bind", 403);
     }
@@ -488,7 +293,7 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers
     if (name == null) {
         const defs = try std.json.parseFromSlice(std.json.Value, allocator, pack.definitionsJson(vision, writable), .{});
         defer defs.deinit();
-        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root, .edit_default = g_web_edit }, .{});
+        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root, .edit_default = server_state.g_web_edit }, .{});
         defer allocator.free(json);
         return sendResponse(stream, "200 OK", "application/json", json);
     }
@@ -553,105 +358,11 @@ pub fn chatPageUrl(buf: []u8, host: []const u8, port: u16) []const u8 {
 
 pub const max_request_bytes: usize = 64 * 1024 * 1024;
 
-/// `?model=<id>` for bodiless GETs (`/props`), percent-decoded into `buf`.
-pub fn queryModel(buf: []u8, raw_path: []const u8) ?[]const u8 {
-    const q = raw_path[(std.mem.indexOfScalar(u8, raw_path, '?') orelse return null) + 1 ..];
-    var it = std.mem.splitScalar(u8, q, '&');
-    while (it.next()) |kv| {
-        if (!std.mem.startsWith(u8, kv, "model=") or kv.len == "model=".len) continue;
-        const v = kv["model=".len..];
-        if (v.len > buf.len) return null;
-        @memcpy(buf[0..v.len], v);
-        return std.Uri.percentDecodeInPlace(buf[0..v.len]);
-    }
-    return null;
-}
 
-/// Module-level capacity for plan 03 hot prefix cache. main.zig writes this
-/// from `--prefix-cache-entries N` before calling `serve()`.
-// Default 32: agent clients (Claude Code, the app's agent loop) interleave
-// requests from several conversation roots — main thread, subagents, title
-// generation — and a single-entry cache gets its long system-prompt prefix
-// evicted by every interleaved request, forcing a full re-prefill each
-// turn. The count cap is pure retention metadata; the SSD byte budget
-// (`prefixCacheDiskForLoad`) is what bounds the bytes. 0 disables.
-pub var prefix_cache_capacity: u32 = 32;
-/// RAM retention is opt-in: `--prefix-cache-mem` turns it on, `0` or `off` keeps it off.
-pub var prefix_cache_ram_enabled: bool = false;
 
-/// The RAM tier's byte budget, read only where RAM retention is on (`--prefix-cache-mem`). The cache
-/// evicts LRU entries on commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. 0
-/// disables the byte budget (the machine's headroom and the count cap from `--prefix-cache-entries`
-/// still apply).
-pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
-pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
-/// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
-pub var prefix_cache_mem_explicit = false;
 
-/// `--prefix-cache-mem 0` (or `off`) is "no RAM retention".
-pub fn ramRetentionForMemArg(mem_bytes: u64) bool {
-    return mem_bytes > 0;
-}
 
-test "ramRetentionForMemArg: a zero budget keeps RAM retention off" {
-    try testing.expect(!ramRetentionForMemArg(0));
-    try testing.expect(ramRetentionForMemArg(1 << 30));
-}
 
-/// The SSD tier's byte ask (`--prefix-cache-disk`, 0 = off). Committed KV prefixes persist as chunked
-/// safetensors under `~/.sushi/kv-cache/<model-fingerprint>` and are restored across restarts instead
-/// of recomputed, LRU-evicted to the budget. Unnamed, the ask is the 20 GB ceiling and the tier is on;
-/// `prefixCacheDiskForLoad` sizes the real budget per model (the Swift app's Settings toggle passes the flag).
-pub var prefix_cache_disk_bytes: u64 = disk_placement.DEFAULT_DISK_CAP;
-/// Set by `--prefix-cache-disk`: the operator's number is the budget as given.
-pub var prefix_cache_disk_explicit = false;
-/// The explicit number came from `model-settings.json`, not the flag.
-pub var prefix_cache_disk_from_file = false;
-
-/// The settings API's write: an explicit number is the file's. Publishes the bytes before the explicit bit, so a
-/// reader that sees `explicit` sees its number.
-pub fn setDiskAsk(bytes: u64, explicit: bool) void {
-    @atomicStore(bool, &prefix_cache_disk_from_file, explicit, .monotonic);
-    if (explicit) {
-        @atomicStore(u64, &prefix_cache_disk_bytes, bytes, .monotonic);
-        @atomicStore(bool, &prefix_cache_disk_explicit, true, .release);
-    } else {
-        @atomicStore(bool, &prefix_cache_disk_explicit, false, .release);
-        @atomicStore(u64, &prefix_cache_disk_bytes, bytes, .monotonic);
-    }
-}
-
-/// The SSD writer's permit, sized once from host RAM at startup (`kv_disk_writer.permitForRam`); the
-/// scheduler arms every writer with it.
-pub var disk_writer_permit_bytes: u64 = kv_disk_writer.DEFAULT_PERMIT_BYTES;
-
-/// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
-/// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
-/// architectures (Flash-Next GatedDeltaNet). Set to 0 to disable (fall back to pre-Phase-1 behavior:
-/// hybrid models bypass the hot prefix cache entirely). Override via
-/// `--ssm-checkpoint-stride N`.
-///
-/// Default 256. The stride forces a prefill CHUNK boundary at every multiple
-/// (to snapshot SSM/sliding-window state mid-prompt). On dense / non-MoE-hybrid
-/// models prefill is compute-bound, so a fine 256 stride is ~free and buys
-/// finer warm mid-prompt reuse. **MoE models are different**: their prefill is
-/// memory-bound on the per-expert weights, and every extra chunk re-streams
-/// ~all expert weights from HBM, so a fine stride silently costs cold prefill
-/// on a MoE (an 850-token prompt = 4 chunks = ~4x expert-weight traffic). To
-/// avoid that, the prefill loop
-/// **coarsens this stride to >= PREFILL_CHUNK for MoE models only** (see
-/// `generate.effectiveSsmCheckpointStride`), so MoE prefill is never
-/// over-chunked at any prompt length while non-MoE keeps the fine stride.
-/// The always-on end-of-prompt snapshot preserves append-growth multi-turn
-/// reuse for MoE regardless. 0 disables (hybrid models then bypass the hot cache);
-/// only tests move it off the default.
-pub const SSM_CHECKPOINT_STRIDE_DEFAULT: u32 = 256;
-pub var ssm_checkpoint_stride: u32 = SSM_CHECKPOINT_STRIDE_DEFAULT;
-
-/// Phase 1: cap on the number of checkpoints retained per request. Snapshots
-/// past this drop the oldest (front of list) to keep memory bounded on very
-/// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
-pub var ssm_checkpoint_max: u32 = 16;
 
 /// LRU capacity of the per-LoadedModel chat-template tokenize cache. Small
 /// because real chat conversations mutate the messages list every turn; it
@@ -665,33 +376,12 @@ pub fn parseOnOff(word: []const u8) ?bool {
     return null;
 }
 
-/// Plan 01 — continuous batching: maximum concurrent in-flight requests sharing
-/// the inference thread's batched-decode pass. Set via `--max-concurrent N`.
-/// Default 1 = legacy single-slot behavior (no scheduler engagement, every
-/// existing test bit-identical). Values >1 require Phase 2's scheduler wiring
-/// (handler refactor + per-connection threads), which the `serve()` startup
-/// guard checks before enabling.
-pub var max_concurrent: u32 = 1;
 
 // Plan 05: vision encoder and model id moved to `LoadedModel.vision_encoder`
 // and `LoadedModel.id`. Handlers read them off `lm`. `global_vision_encoder`
 // and `global_model_id` singletons were removed. The `discovered_models`
 // slice was also removed — `/v1/models` iterates `registry.entries` directly.
 
-/// Assistant-history reasoning field on an incoming chat message:
-/// `reasoning_content` (our own SSE/vLLM field, what pi rounds-trips) with
-/// `reasoning` (the vLLM request spelling some templates read first) as
-/// the fallback. Non-empty strings only — an empty string would render an
-/// empty <think></think> block, which is exactly the nothink signature this
-/// field exists to avoid.
-fn messageReasoningFromObj(obj: std.json.ObjectMap) ?[]const u8 {
-    inline for (.{ "reasoning_content", "reasoning" }) |key| {
-        if (obj.get(key)) |v| {
-            if (v == .string and v.string.len > 0) return v.string;
-        }
-    }
-    return null;
-}
 
 /// True when the rendered generation prompt ends inside a template-opened
 /// think block (Qwen 3.5/3.6 render `…assistant\n<think>\n` when thinking is
@@ -986,35 +676,10 @@ pub fn resolveReasoningProtocol(
     return true;
 }
 
-/// A request's `seed`; negative is the llama.cpp "random" convention and means unseeded.
-pub fn parseRequestSeed(v: ?std.json.Value) ?u64 {
-    const val = v orelse return null;
-    return switch (val) {
-        .integer => |i| if (i < 0) null else @as(u64, @intCast(i)),
-        else => null,
-    };
-}
 
-/// A client-supplied JSON integer narrowed to i32 by clamping, never by `@intCast`.
-pub fn clampJsonI32(i: i64) i32 {
-    return @intCast(std.math.clamp(i, std.math.minInt(i32), std.math.maxInt(i32)));
-}
 
-/// Widest string `describeMaxTokens` writes: a 10-digit budget plus
-/// " (launch default)".
-pub const MAX_TOKENS_DESC_LEN: usize = 27;
 
-pub fn ignoreEosRequested(root: std.json.ObjectMap) bool {
-    const v = root.get("ignore_eos") orelse return false;
-    return v == .bool and v.bool;
-}
 
-/// Chat refuses `ignore_eos`: past its end of turn the model writes another turn, whose think
-/// block the non-stream reply merges into the reasoning and the live stream cannot.
-pub fn chatIgnoreEosRejectReason(root: std.json.ObjectMap) ?[]const u8 {
-    if (!ignoreEosRequested(root)) return null;
-    return "'ignore_eos' is supported on /v1/completions only: a chat reply ends at its end of turn";
-}
 
 /// The auto budget's own tightness question: under a quarter of the window left.
 pub fn autoBudgetWindowTight(remaining: u32, effective_ctx: u32) bool {
@@ -1131,7 +796,7 @@ pub fn parseToolCallsForRequest(
         one[0] = kept;
         calls = one;
     }
-    if (g_tool_autocorrect) {
+    if (server_state.g_tool_autocorrect) {
         if (tools_json) |tj| {
             // Order matters: put a buried required param back where the schema
             // says it lives BEFORE coercing types, so the hoisted value is
@@ -1159,26 +824,26 @@ pub fn serve(
     /// tokenizer load, EOS resolution, chat-template load); everything that
     /// touches mlx is done on the inference thread.
     load_params: model_load.LoadParams,
-    config: *const model_mod.ModelConfig,
+    config: *model_mod.ModelConfig,
     host: []const u8,
     port: u16,
-    cfg: ServerConfig,
+    cfg: server_state.ServerConfig,
 ) !void {
-    server_config = cfg;
+    server_state.server_config = cfg;
     // Before `Scheduler.init`: that call starts the model load and every load-time bill inside it
     // asks for the KV width.
-    configured_kv_quant = if (load_params.kv_quant_explicit) load_params.kv_quant_config else null;
-    defer configured_kv_quant = null;
-    configured_mtp = model_settings.launchFlag(bool, load_params.mtp_enabled, load_params.mtp_explicit);
-    defer configured_mtp = null;
+    server_state.configured_kv_quant = if (load_params.kv_quant_explicit) load_params.kv_quant_config else null;
+    defer server_state.configured_kv_quant = null;
+    server_state.configured_mtp = model_settings.launchFlag(bool, load_params.mtp_enabled, load_params.mtp_explicit);
+    defer server_state.configured_mtp = null;
     scheduler_mod.load_serving_bill = &loadServingBill;
     defer scheduler_mod.load_serving_bill = null;
 
     scheduler_mod.prefill_ubench_chunk = &requestPrefillChunkNow;
     defer scheduler_mod.prefill_ubench_chunk = null;
 
-    listen_host = host;
-    listen_port = port;
+    server_state.listen_host = host;
+    server_state.listen_port = port;
     var listener: ?std.Io.net.Server = if (cfg.embedded_client != null) null else http_conn.startListener(host, port) catch |err| {
         var msg_buf: [512]u8 = undefined;
         if (startupRefusal(err, host, port, &msg_buf)) |msg| {
@@ -1187,7 +852,7 @@ pub fn serve(
         }
         return err;
     };
-    if (listener) |l| listen_port = l.socket.address.ip4.port;
+    if (listener) |l| server_state.listen_port = l.socket.address.ip4.port;
 
     const boots_model = !load_params.no_initial_load;
     if (boots_model) boot_gate.process.begin();
@@ -1201,16 +866,16 @@ pub fn serve(
         allocator,
         io,
         load_params,
-        max_concurrent,
+        server_state.max_concurrent,
     ) catch |err| {
         if (listener) |*l| l.deinit(io);
         return err;
     };
     defer scheduler.deinit();
-    global_scheduler = scheduler;
-    defer global_scheduler = null;
-    global_registry = scheduler.registry;
-    defer global_registry = null;
+    server_state.global_scheduler = scheduler;
+    defer server_state.global_scheduler = null;
+    server_state.global_registry = scheduler.registry;
+    defer server_state.global_registry = null;
     scheduler.registry.load_gate = downloads.loadGate;
 
     if (instr.current() != null) {
@@ -1225,7 +890,7 @@ pub fn serve(
     var accept_thread: ?std.Thread = null;
     defer stopServing(&accept_thread);
     if (listener != null) {
-        log.info("\nServer listening on http://{s}:{d}\n", .{ host, listen_port });
+        log.info("\nServer listening on http://{s}:{d}\n", .{ host, server_state.listen_port });
         if (boots_model) log.info("  {s} is loading: the page, /health, /v1/models, /props, /v1/settings and the metrics answer now; generation waits for the model\n", .{load_params.entry.id});
         accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ allocator, io, &listener.? });
     }
@@ -1250,10 +915,8 @@ pub fn serve(
     // Asked by the prefill loop: the width of the next chunk, re-priced at every boundary.
     scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
     defer scheduler_mod.prefill_chunk_adapt = null;
-    dsv41_borrow.headroom_fn = &bills.dsv41Headroom;
-    defer dsv41_borrow.headroom_fn = null;
-    dsv41_borrow.pool_ram_cap = mlxCacheLimitBytes(metrics.getTotalMemBytes());
-    defer dsv41_borrow.pool_ram_cap = 0;
+    arch_serve.install(mlxCacheLimitBytes(metrics.getTotalMemBytes()));
+    defer arch_serve.uninstall();
     scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
     defer scheduler_mod.prefill_chunk_widen_ok = null;
     // Whether the hook above can move anything for a given model (the installs are process-wide, so presence is not a gate).
@@ -1285,19 +948,19 @@ pub fn serve(
     // using the per-LoadParams capacity + byte budget. Surface a friendly
     // log line so users see whether the cache engaged.
     if (scheduler.hot_prefix_cache != null) {
-        if (!prefix_cache_ram_enabled and diskTierOn(config)) {
+        if (!server_state.prefix_cache_ram_enabled and diskTierOn(config)) {
             log.info("Prefix cache: SSD ONLY (RAM retention off)\n", .{});
         } else if (resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB)\n", .{ prefix_cache_capacity, cap_mb });
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB)\n", .{ server_state.prefix_cache_capacity, cap_mb });
         } else {
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited)\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited)\n", .{server_state.prefix_cache_capacity});
         }
-    } else if (prefix_cache_capacity > 0) {
+    } else if (server_state.prefix_cache_capacity > 0) {
         if (config.full_attention_interval > 0) {
-            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{server_state.prefix_cache_capacity});
         } else {
-            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{server_state.prefix_cache_capacity});
         }
     }
 
@@ -1315,8 +978,8 @@ pub fn serve(
     // at every value so a default-1 boot does not read as "one at a time".
     const startup_entry = scheduler.registry.resolveEntry("") catch null;
     const verdict = if (startup_entry) |e| batchVerdictFor(e) else batchVerdictOf(config, false);
-    log.info("Concurrency: --max-concurrent={d}, {s} (arch: {s})\n", .{ max_concurrent, concurrencyClause(verdict), config.model_type });
-    if (verdict == .ok and prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
+    log.info("Concurrency: --max-concurrent={d}, {s} (arch: {s})\n", .{ server_state.max_concurrent, concurrencyClause(verdict), config.model_type });
+    if (verdict == .ok and server_state.prefix_cache_capacity > 0 and server_state.prefix_cache_capacity < server_state.max_concurrent) server_state.prefix_cache_capacity = server_state.max_concurrent;
     // Installed only now: until the load ends, a signal's default action ends the process mid-load.
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -1326,16 +989,16 @@ pub fn serve(
     std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
 
-    client_thread = if (server_config.on_ready) |ready| try ready(listen_port) else null;
+    client_thread = if (server_state.server_config.on_ready) |ready| try ready(server_state.listen_port) else null;
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
     // loaded and nothing else has taken RAM. Clients read this number once
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
-    const pinned = bills.pinAutoContext(@constCast(config));
+    const pinned = bills.pinAutoContext(config);
     warnUserWireLimit();
     if (manualContext(config) > 0) {
-        const ctx = model_settings.contextPick(server_config.max_context_size, config.ctx_override);
+        const ctx = model_settings.contextPick(server_state.server_config.max_context_size, config.ctx_override);
         log.info("Context size: {d} tokens ({s})\n", .{ ctx.value, model_settings.sourceLabel(ctx.source, "--ctx-size") });
     } else {
         const memory_ctx = computeMemoryContext(config);
@@ -1351,8 +1014,8 @@ pub fn serve(
         }
     }
 
-    if (server_config.request_timeout_sec > 0) {
-        log.info("Request timeout: {d}s\n", .{server_config.request_timeout_sec});
+    if (server_state.server_config.request_timeout_sec > 0) {
+        log.info("Request timeout: {d}s\n", .{server_state.server_config.request_timeout_sec});
     }
     const model_ctx = config.contextCap();
     if (model_ctx > 0) {
@@ -1364,20 +1027,21 @@ pub fn serve(
     if (scheduler.dflash != null) {
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
-    if (config.isGlm5()) {
-        log.info("MTP: off (GLM native serving has no integrated MTP head)\n", .{});
+    if (arch_flags.mtpOffLine(config)) |line| {
+        log.info("{s}\n", .{line});
     } else if (config.expert_streaming and !config.stream_mtp_head) {
         log.info("MTP: off under expert streaming (--mtp keeps the head resident)\n", .{});
-    } else if (server_config.default_force_mtp) {
+    } else if (server_state.server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
-    if (mtpHeadKvLine(config, transformer_mod.Transformer.mtp_head_kv_quant_flag)) |line| log.info("{s}\n", .{line});
-    if (qwenGdnLine(config, model_mod.qwen_gdn_f32)) |line| log.info("{s}\n", .{line});
+    const launch_use = arch_flags.LaunchFlagUse{ .qwen_gdn_16 = !model_mod.qwen_gdn_f32, .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag };
+    var boot_lines: [arch_flags.options.len]?[]const u8 = undefined;
+    for (arch_flags.bootLines(config, launch_use, &boot_lines)) |line| if (line) |l| log.info("{s}\n", .{l});
     if (generate_mod.max_mtp_ctx != 0) {
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
     if (listener != null) {
-        if (g_api_key != null) {
+        if (server_state.g_api_key != null) {
             log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health and the chat page stay open)\n", .{});
         }
         log.info("  GET  /, /chat (chat page)\n", .{});
@@ -1395,7 +1059,7 @@ pub fn serve(
         log.info("  POST /tokenize\n", .{});
         log.info("  POST /detokenize\n\n", .{});
         var chat_url_buf: [96]u8 = undefined;
-        log.info("chat in your browser: {s}chat\n\n", .{chatPageUrl(&chat_url_buf, host, listen_port)});
+        log.info("chat in your browser: {s}chat\n\n", .{chatPageUrl(&chat_url_buf, host, server_state.listen_port)});
     }
 
     // Print system metrics once at startup
@@ -1437,18 +1101,18 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
         .revents = 0,
     }};
 
-    while (!shutdown_requested.load(.acquire)) {
+    while (!server_state.shutdown_requested.load(.acquire)) {
         // Poll with 1-second timeout so we can check shutdown flag
         const poll_result = std.posix.poll(&poll_fds, 1000) catch |err| {
-            if (shutdown_requested.load(.acquire)) break;
+            if (server_state.shutdown_requested.load(.acquire)) break;
             log.err("poll error: {}\n", .{err});
             continue;
         };
         if (poll_result == 0) continue; // timeout, re-check shutdown flag
-        if (shutdown_requested.load(.acquire)) break;
+        if (server_state.shutdown_requested.load(.acquire)) break;
 
         const accepted_stream = listener.?.accept(io) catch |err| {
-            if (shutdown_requested.load(.acquire)) break;
+            if (server_state.shutdown_requested.load(.acquire)) break;
             log.err("accept error: {}\n", .{err});
             continue;
         };
@@ -1494,13 +1158,13 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
 /// slots settle promptly. Bounded so a wedged thread can't hang shutdown forever.
 /// Idempotent; also the cleanup of a boot whose load failed with the listener up.
 fn stopServing(accept_thread: *?std.Thread) void {
-    shutdown_requested.store(true, .release);
+    server_state.shutdown_requested.store(true, .release);
     downloads.stop();
     if (accept_thread.*) |t| {
         t.join();
         accept_thread.* = null;
     }
-    if (global_scheduler) |sch| sch.cancelAllInFlight();
+    if (server_state.global_scheduler) |sch| sch.cancelAllInFlight();
     var waited_ms: u64 = 0;
     var idle_fds = [_]std.posix.pollfd{};
     while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
@@ -1559,7 +1223,7 @@ pub fn handleConnection(
     // and parse out the optional `"model"` field. For Phase C we use the
     // default model for everything (only one is loaded), but the plumbing
     // is in place for Phase D's hot-load path.
-    const registry = global_registry orelse {
+    const registry = server_state.global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Server not ready", 503);
         return;
     };
@@ -1588,7 +1252,7 @@ pub fn handleConnection(
     //    exposure. Browser-facing pages get a `WWW-Authenticate: Basic`
     //    challenge so a browser prompts for the key; API clients
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
-    if (http_conn.apiKeyGateApplies(g_api_key != null, g_api_key_strict, peerIsLoopback(stream)) and
+    if (http_conn.apiKeyGateApplies(server_state.g_api_key != null, server_state.g_api_key_strict, peerIsLoopback(stream)) and
         !std.mem.eql(u8, method, "OPTIONS") and
         !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) and
         !(std.mem.eql(u8, method, "GET") and isChatPagePath(path)) and
@@ -1666,7 +1330,7 @@ pub fn handleConnection(
         try sendResponse(stream, "204 No Content", "text/plain", "");
         return;
     }
-    if (http_conn.crossOriginRefused(method, path, request[0..header_end_pos], listen_host, listen_port)) {
+    if (http_conn.crossOriginRefused(method, path, request[0..header_end_pos], server_state.listen_host, server_state.listen_port)) {
         log.debug("{s} {s} -> 403 (foreign Origin)\n", .{ method, path });
         try sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "This route accepts browser requests from this server's own page only", 403);
         return;
@@ -1763,7 +1427,7 @@ pub fn handleConnection(
         if (std.mem.eql(u8, method, "GET")) {
             try downloads.handleGet(allocator, stream, raw_path);
         } else if (std.mem.eql(u8, method, "POST")) {
-            if (@import("download_progress.zig").startRefused(peerIsLoopback(stream), g_api_key != null)) {
+            if (@import("download_progress.zig").startRefused(peerIsLoopback(stream), server_state.g_api_key != null)) {
                 try sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "A download from another machine needs the server started with --api-key", 403);
                 return;
             }
@@ -1803,7 +1467,7 @@ pub fn handleConnection(
     //    no LRU victim → 503 (NotEnoughMemory). Block-until-loaded is
     //    intentional; clients targeting an unloaded model should set a
     //    longer request timeout (or hit /v1/load-model first).
-    const scheduler = global_scheduler orelse {
+    const scheduler = server_state.global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
@@ -2035,7 +1699,7 @@ pub fn handleConnection(
 /// Session is POD with an inline model buffer, so the copy stays valid after
 /// its slot frees. Rows carry no pointers into scheduler or registry state.
 fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Session) []instr.Session {
-    const sch = global_scheduler orelse return buf[0..0];
+    const sch = server_state.global_scheduler orelse return buf[0..0];
     sch.queue_mu.lockUncancelable(sch.io);
     const live = sch.live_session_count;
     @memcpy(buf[0..live], sch.live_sessions[0..live]);
@@ -2055,20 +1719,14 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
     return buf[0..n];
 }
 
-/// How far under the enforced wired limit a plan may reach: past the limit Metal returns
-/// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
-pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 1 << 30;
-
-/// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
-pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 
 test "Sushi quant memory request refusal carries the actual KV width MTP and maximum to the wire" {
-    const saved_ctx = server_config.max_context_size;
-    defer server_config.max_context_size = saved_ctx;
-    const saved_mtp = configured_mtp;
-    defer configured_mtp = saved_mtp;
-    server_config.max_context_size = 500000;
-    configured_mtp = null;
+    const saved_ctx = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = saved_ctx;
+    const saved_mtp = server_state.configured_mtp;
+    defer server_state.configured_mtp = saved_mtp;
+    server_state.server_config.max_context_size = 500000;
+    server_state.configured_mtp = null;
     var cfg = fixtures.qwen4RequestTestConfig();
     cfg.expert_layout = .exl3_k4;
     const chunk: u64 = 1024;
@@ -2084,102 +1742,14 @@ test "Sushi quant memory request refusal carries the actual KV width MTP and max
     const message = memoryContextRefusalMessage(&buf, refusal);
     try std.testing.expect(std.mem.indexOf(u8, message, "Maximum context: 64000 tokens") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "KV4") != null);
-    slot_memory_context_refusal = refusal;
+    server_state.slot_memory_context_refusal = refusal;
     const wire = generation_stream.mapGenerationError(error.PrefillDoesNotFit, &buf);
     try std.testing.expectEqual(@as(u32, 400), wire.code);
     try std.testing.expect(std.mem.indexOf(u8, wire.message, "Maximum context: 64000 tokens") != null);
-    try std.testing.expectEqual(@as(?model_registry_mod.MemoryContextRefusal, null), slot_memory_context_refusal);
+    try std.testing.expectEqual(@as(?model_registry_mod.MemoryContextRefusal, null), server_state.slot_memory_context_refusal);
     try std.testing.expectEqualStrings(generation_stream.PREFILL_NOFIT_MSG, generation_stream.mapGenerationError(error.PrefillDoesNotFit, &buf).message);
 }
 
-pub fn testDsv41Vp() !chat_mod.VisionPreproc {
-    var cfg: model_mod.ModelConfig = .{};
-    cfg.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    return request_media.visionPreprocFromConfig(&cfg);
-}
-
-/// What `--mtp-head-kv-quant` does on this arch, for the boot log; null when unset.
-pub fn mtpHeadKvLine(config: *const model_mod.ModelConfig, flag: bool) ?[]const u8 {
-    if (!flag) return null;
-    if (config.isMimo()) return "MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)";
-    return "MTP head KV: following --kv-quant (--mtp-head-kv-quant)";
-}
-
-/// The launch flags a load can be refused for, as the process was started.
-pub const LaunchFlagUse = struct { kv_quant: bool = false, qwen_gdn_16: bool = false, mtp_head_kv_quant: bool = false, drop_expert: bool = false, ssd_prefetch: bool = false, mtp_typical: bool = false, mtp_tokenv3: bool = false, mtp_greedy_tail: bool = false };
-
-/// A launch flag with nothing to act on in this arch, named with the reason; null when every flag given applies.
-/// An explicit flag is refused rather than ignored, before the weights load.
-pub fn archFlagRefusal(config: *const model_mod.ModelConfig, use: LaunchFlagUse) ?[]const u8 {
-    if (use.drop_expert and !config.isDsv41()) return "--drop-expert has no effect on this model: only deepseek_v41 packs carry an expert usage list; drop the flag";
-    if (use.ssd_prefetch and !config.isDsv41()) return "--ssd-prefetch has no effect on this model: it has no expert prefetcher; drop the flag";
-    if (!config.isDsv41()) return null;
-    if (use.kv_quant) return "--kv-quant has no effect on deepseek_v41: its compressed state is stored as the QAT round trips left it, so there is no KV cache to quantize; drop the flag";
-    if (use.qwen_gdn_16) return "--qwen-gdn has no effect on deepseek_v41: it has no GatedDeltaNet layers; drop the flag";
-    if (use.mtp_head_kv_quant) return "--mtp-head-kv-quant has no effect on deepseek_v41: its DSpark stages keep their own windows; drop the flag";
-    if (use.mtp_typical) return "--mtp-typical has no effect on deepseek_v41: DSpark accepts drafts by the exact rule only; drop the flag";
-    if (use.mtp_tokenv3) return "--mtp-tokenv3 has no effect on deepseek_v41: DSpark accepts drafts by the exact rule only; drop the flag";
-    if (use.mtp_greedy_tail) return "--mtp-greedy-tail has no effect on deepseek_v41: DSpark drafts one block from the trunk's own state, with no MTP tail; drop the flag";
-    return null;
-}
-
-/// The facts `model_settings.applies` decides a key's reach from, so the settings API and the loader's ignored-key lines agree.
-pub fn settingsFit(config: *const model_mod.ModelConfig) model_settings.Fit {
-    const latent = config.isGlm5();
-    return .{
-        .arch = config.model_type,
-        .streams_experts = config.supportsExpertStreaming(),
-        .has_vision = config.has_vision,
-        .serves_mtp = !latent,
-        .streaming_required = config.expertStreamingRequired(),
-        .head_streams = expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), config.expert_layout),
-        .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false,
-        .latent_kv = latent,
-        .context_cap = config.contextCap(),
-    };
-}
-
-/// A model-settings.json `ssd_prefetch` on an arch with no expert prefetcher is ignored with this one line, as `kv_quant` is.
-/// A pack of the arch that has one but streams no STQ experts says so at its own load (`dsv41_serving`).
-pub fn settingsSsdPrefetchIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (config.isDsv41() or model_settings.applies("ssd_prefetch", settingsFit(config)) or config.ssd_prefetch_override == null) return null;
-    return "model-settings.json ssd_prefetch is ignored: this model has no expert prefetcher";
-}
-
-/// A model-settings.json `kv_quant` on an arch with no KV cache is ignored with this one line, never a refusal:
-/// the file outlives the flags that wrote it, and only an explicit launch flag is a request.
-pub fn settingsKvQuantIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (model_settings.applies("kv_quant", settingsFit(config)) or config.kv_quant_override == null) return null;
-    return "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
-}
-
-/// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` where no MTP head runs is ignored with this one line, as `kv_quant` is.
-pub fn settingsMtpIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (model_settings.applies("mtp_acceptance", settingsFit(config))) return null;
-    const acceptance = config.mtp_acceptance_override != null;
-    const tail = config.mtp_greedy_tail_override != null;
-    if (!config.isDsv41()) {
-        if (acceptance or tail) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored: this load runs no MTP head";
-        return null;
-    }
-    if (acceptance and tail) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only, with no MTP tail)";
-    if (acceptance) return "model-settings.json mtp_acceptance is ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only)";
-    if (tail) return "model-settings.json mtp_greedy_tail is ignored on deepseek_v41 (DSpark has no MTP tail)";
-    return null;
-}
-
-/// What `--qwen-gdn 16` does on this arch, for the boot log; null at the f32 default.
-/// GLM and MiMo have no GatedDeltaNet arm, so the flag has no effect there.
-pub fn qwenGdnLine(config: *const model_mod.ModelConfig, f32_state: bool) ?[]const u8 {
-    if (f32_state) return null;
-    if (config.isGlm5()) return "GDN state: --qwen-gdn 16 has no effect on GLM (its KDA state is f32 already)";
-    if (config.isMimo()) return "GDN state: --qwen-gdn 16 has no effect on mimo_v2 (no GatedDeltaNet layers)";
-    return "GDN state: bf16 between tokens (--qwen-gdn 16; f32 is the default; the decay gate is f32 either way)";
-}
-
-// Numeric slot diagnostics cross to error mapping only on this connection's thread.
-pub threadlocal var slot_memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
-pub threadlocal var slot_media_refusal: ?vision_queue.MediaRefusal = null;
 
 /// The message `error.GenerationOutOfMemory` sends on every surface and both paths.
 pub const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
@@ -2209,8 +1779,7 @@ const IdleUnloadFit = struct {
 };
 
 pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, keep_id: []const u8, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
-    if (config.isGlm5() and (kv_override orelse configuredKvQuantFor(config)).glmLatentBits() == null) {
-        const msg = "GLM native MLA cache supports kv_quant 8, 6 or off.";
+    if (arch_flags.kvQuantRequestRefusal(config, kv_override orelse configuredKvQuantFor(config))) |msg| {
         if (is_anthropic) {
             try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -2244,7 +1813,7 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
     }
     // Idle resident models are memory too: a connection thread asks the inference thread to unload
     // them, least recently used first, before it refuses.
-    if (needed > available) if (global_scheduler) |sch| {
+    if (needed > available) if (server_state.global_scheduler) |sch| {
         var unloading = IdleUnloadFit{ .sch = sch, .keep_id = keep_id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked_prefill = unchunked_prefill, .enable_mtp = enable_mtp };
         if (fitAfterUnloadingIdle(&unloading, IdleUnloadFit.fits, IdleUnloadFit.unloadOne)) return true;
     };
@@ -2319,7 +1888,7 @@ pub fn modelQuantizationLabel(allocator: std.mem.Allocator, config: *const model
 /// caller asked for a specific id, not "anything"). Routes through
 /// scheduler.ensureLoaded so eviction/back-pressure kicks in.
 fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
-    const scheduler = global_scheduler orelse {
+    const scheduler = server_state.global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
@@ -2354,7 +1923,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
     // model_type + quant mode) before anything is registered; the load then
     // proceeds under the directory-basename id.
     if (std.mem.startsWith(u8, requested_id, "/")) {
-        const registry = global_registry orelse {
+        const registry = server_state.global_registry orelse {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
             return;
         };
@@ -2408,7 +1977,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
     // Promotion happens only past ensureLoaded's error switch: a load that
     // FAILED must never steal the default from a model that answers.
     if (make_default) {
-        if (global_registry) |registry| {
+        if (server_state.global_registry) |registry| {
             registry.setDefault(lm.id) catch {};
             log.info("[registry] default model -> {s} (load-model request)\n", .{lm.id});
         }
@@ -2485,7 +2054,7 @@ test "an unload body naming an unrecognised key is a 400, not the default model"
 /// state (the stub stays registered so it can reload). Idempotent. Returns a
 /// small status payload confirming the model is unloaded.
 fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
-    const scheduler = global_scheduler orelse {
+    const scheduler = server_state.global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
@@ -2513,7 +2082,7 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
         var trimmed = requested_id;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         // A discovered entry is keyed `org/name`, so the path is the only exact handle.
-        const by_path = if (global_registry) |r| r.peekByPath(trimmed) else null;
+        const by_path = if (server_state.global_registry) |r| r.peekByPath(trimmed) else null;
         requested_id = if (by_path) |e| e.id else std.fs.path.basename(trimmed);
     }
 
@@ -2568,13 +2137,13 @@ pub fn concurrencyClause(verdict: slot_admission.BatchVerdict) []const u8 {
 
 /// A request decoding or queued, or a model loading or evicting: an update now would cut it off.
 fn busyForUpdate(io: std.Io) bool {
-    if (global_scheduler) |sch| {
+    if (server_state.global_scheduler) |sch| {
         sch.queue_mu.lockUncancelable(sch.io);
         const in_flight = sch.in_flight;
         sch.queue_mu.unlock(sch.io);
         if (in_flight > 0) return true;
     }
-    const reg = global_registry orelse return false;
+    const reg = server_state.global_registry orelse return false;
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var it = reg.entries.valueIterator();
@@ -2596,26 +2165,13 @@ fn handleMetricsEnable(stream: *http_conn.Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", if (changed) "{\"metrics\":true,\"already_enabled\":false}" else "{\"metrics\":true,\"already_enabled\":true}");
 }
 
-fn parseCancelRequestId(allocator: std.mem.Allocator, body: []const u8) ?u64 {
-    if (body.len == 0) return null;
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const obj = parsed.value.object;
-    const v = obj.get("id") orelse obj.get("request_id") orelse return null;
-    return switch (v) {
-        .integer => |i| if (i >= 0) @intCast(i) else null,
-        .string => |s| std.fmt.parseInt(u64, s, 10) catch null,
-        else => null,
-    };
-}
 
 fn handleSlotCancel(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
     const target_id = parseCancelRequestId(allocator, request_body) orelse {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"id\": <request_id>}", 400);
         return;
     };
-    const scheduler = global_scheduler orelse {
+    const scheduler = server_state.global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is not ready to process requests", 503);
         return;
     };
@@ -2633,13 +2189,13 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: 
     var vbuf: [64]u8 = undefined;
     const latest = update_mod.availableVersion(&vbuf);
     const ask: update_mod.Ask = .{
-        .bind_host = listen_host,
-        .port = listen_port,
+        .bind_host = server_state.listen_host,
+        .port = server_state.listen_port,
         .peer_loopback = peerIsLoopback(stream),
         .origin = http_conn.findHeaderValueCI(headers, "origin"),
-        .key_set = g_api_key != null,
+        .key_set = server_state.g_api_key != null,
         .key_ok = http_conn.apiKeyAuthorized(headers, raw_path),
-        .host_managed = host_managed,
+        .host_managed = server_state.host_managed,
         .busy = busyForUpdate(stream.io),
         .install = update_mod.selfInstallRefusal(stream.io, &ebuf, &rbuf),
         .available = latest != null,
@@ -2654,7 +2210,7 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: 
     try sendResponse(stream, "202 Accepted", "application/json", body);
     log.info("[update] updating {s} -> {s} from the chat page; the server restarts\n", .{ update_mod.version, latest.? });
     update_mod.relaunch_requested.store(true, .release);
-    shutdown_requested.store(true, .release);
+    server_state.shutdown_requested.store(true, .release);
 }
 
 fn handleTokenize(
@@ -2789,97 +2345,10 @@ fn continueFinalMessageRequested(root: std.json.ObjectMap, messages: []const cha
     return think_tags.continuationRequested(messages);
 }
 
-const JoinedText = struct { text: []const u8, owned: bool };
 
-/// Collect every `{"type":"text"}` part of a content array into one string,
-/// in order, '\n'-joined. A single (or no) text part borrows the JSON's
-/// bytes (`owned=false`); 2+ parts allocate (`owned=true`, caller frees).
-///
-/// Multiple text parts are real traffic: opencode plan mode appends its
-/// "Plan Mode - System Reminder" as a SECOND text part on the user message,
-/// and last-wins here dropped the user's actual prompt — the model answered
-/// "What would you like to accomplish?" to every first plan-mode message
-/// (issue #195).
-pub fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) !JoinedText {
-    var single: []const u8 = "";
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(allocator);
-    var n: usize = 0;
-    for (parts) |part| {
-        if (part != .object) continue;
-        const ptype = part.object.get("type") orelse continue;
-        if (ptype != .string or !std.mem.eql(u8, ptype.string, "text")) continue;
-        const tv = part.object.get("text") orelse continue;
-        if (tv != .string or tv.string.len == 0) continue;
-        n += 1;
-        if (n == 1) {
-            single = tv.string;
-            continue;
-        }
-        if (n == 2) try buf.appendSlice(allocator, single);
-        try buf.append(allocator, '\n');
-        try buf.appendSlice(allocator, tv.string);
-    }
-    if (n <= 1) return .{ .text = single, .owned = false };
-    return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
-}
 
-/// Workload key for hot-cache eviction (#378): `prompt_cache_key` (OpenAI's own
-/// routing field) > `metadata.user_id` (Anthropic; Claude Code sends its session
-/// id) > the system prompt (OpenAI `messages[0]`, Anthropic `system`, Responses
-/// `instructions`) > 0 = anonymous. Text parts hash in order like `joinedTextParts`.
-pub fn requestCacheKey(root: std.json.ObjectMap) u64 {
-    if (root.get("prompt_cache_key")) |v| if (v == .string and v.string.len > 0)
-        return std.hash.Wyhash.hash(1, v.string);
-    if (root.get("metadata")) |mv| if (mv == .object) {
-        if (mv.object.get("user_id")) |v| if (v == .string and v.string.len > 0)
-            return std.hash.Wyhash.hash(2, v.string);
-    };
-    if (root.get("messages")) |mv| if (mv == .array and mv.array.items.len > 0) {
-        const first = mv.array.items[0];
-        if (first == .object) if (first.object.get("role")) |r| if (r == .string and std.mem.eql(u8, chat_mod.canonicalRole(r.string), "system")) {
-            if (first.object.get("content")) |c| return hashTextValue(c) orelse 0;
-        };
-    };
-    if (root.get("system")) |v| return hashTextValue(v) orelse 0;
-    if (root.get("instructions")) |v| return hashTextValue(v) orelse 0;
-    return 0;
-}
 
-fn hashTextValue(v: std.json.Value) ?u64 {
-    var h = std.hash.Wyhash.init(3);
-    var n: usize = 0;
-    switch (v) {
-        .string => |t| {
-            if (t.len == 0) return null;
-            h.update(t);
-            n = 1;
-        },
-        .array => |parts| for (parts.items) |part| {
-            if (part != .object) continue;
-            const ptype = part.object.get("type") orelse continue;
-            if (ptype != .string or !std.mem.eql(u8, ptype.string, "text")) continue;
-            const tv = part.object.get("text") orelse continue;
-            if (tv != .string or tv.string.len == 0) continue;
-            if (n > 0) h.update("\n");
-            h.update(tv.string);
-            n += 1;
-        },
-        else => {},
-    }
-    return if (n == 0) null else h.final();
-}
 
-pub fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
-    const v = root.get("n") orelse return null;
-    switch (v) {
-        .null => return null,
-        .integer => |i| if (i == 1) return null,
-        .float => |f| if (f == 1.0) return null,
-        else => {},
-    }
-    return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
-}
 
 pub fn handleChatCompletions(
     allocator: std.mem.Allocator,
@@ -3421,9 +2890,9 @@ pub fn requestBillsMtpHead(
 
 test "the bill prices the MTP head only for a request that runs it: a DFlash2 request never builds the head's cache" {
     const t = std.testing;
-    const saved_force = server_config.default_force_mtp;
-    defer server_config.default_force_mtp = saved_force;
-    server_config.default_force_mtp = false;
+    const saved_force = server_state.server_config.default_force_mtp;
+    defer server_state.server_config.default_force_mtp = saved_force;
+    server_state.server_config.default_force_mtp = false;
     const plain = sampler.SamplingParams{};
     // A loaded drafter outranks the head; `enable_drafter:false` hands the request back to it.
     try t.expect(!requestBillsMtpHead(true, true, true, true, plain, 0));
@@ -3432,7 +2901,7 @@ test "the bill prices the MTP head only for a request that runs it: a DFlash2 re
     try t.expect(requestBillsMtpHead(true, true, true, true, .{ .presence_penalty = 1.5 }, 0));
     try t.expect(requestBillsMtpHead(true, true, false, true, plain, 0));
     try t.expect(!requestBillsMtpHead(true, false, false, true, plain, 0));
-    var cfg = qwen4ExpOomConfig();
+    var cfg = fixtures.qwen4ExpOomConfig();
     cfg.mtp_override = null;
     cfg.dflash_loaded = true;
     const seq: u64 = 100_000;
@@ -3446,137 +2915,17 @@ test "the bill prices the MTP head only for a request that runs it: a DFlash2 re
 
 // ── Shared utilities ──
 
-pub fn sendResponse(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
-    logHttpResponse(status, content_type, body);
-    try sendResponseFramed(stream, status, content_type, body);
-}
 
-/// Like `sendResponse` but does NOT dump the response body to the debug log —
-/// only a one-line status summary. For high-frequency, self-describing bodies
-/// where the full dump is pure noise: the Prometheus scrape (`/metrics`, hit
-/// every couple seconds) and the panel's JSON feed (`/metrics.json`, ~1 Hz).
-pub fn sendResponseQuiet(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
-    if (log.isDebug()) log.debug("[http] <- {s} {s} body={d}b (scrape; body not logged)\n", .{ status, content_type, body.len });
-    try sendResponseFramed(stream, status, content_type, body);
-}
 
-pub fn sendResponseFramed(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
-    const extra = stream.effort_notice_json orelse "";
-    const inject = extra.len > 0 and body.len > 0 and body[body.len - 1] == '}' and std.mem.indexOf(u8, body, "\"effort_notice\":") == null;
-    const out_len = body.len + if (inject) extra.len else 0;
-    if (stream.ws_mode) |bridge| {
-        if (body.len > 0) try bridge.sendText(body);
-        return;
-    }
 
-    var hdr_buf: [512]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n", .{
-        status,
-        content_type,
-        out_len,
-    }) catch return error.Overflow;
-    try stream.writeAllNoFlush(hdr);
-    try request_policy.writeEffortNoticeHeader(stream);
-    try stream.writeAllNoFlush("\r\n");
-    stream.length_framed = true;
-    if (inject) {
-        try stream.writeAllNoFlush(body[0 .. body.len - 1]);
-        try stream.writeAllNoFlush(extra);
-        try stream.writeAll("}");
-    } else if (body.len > 0) {
-        try stream.writeAll(body);
-    } else try stream.flush();
-}
 
-/// `raw_path` with the value of every `api_key` / `key` query parameter replaced by `***`; a query too long for
-/// `buf` is dropped whole rather than risk logging a key.
-pub fn redactQueryKeys(buf: []u8, raw_path: []const u8) []const u8 {
-    const qpos = std.mem.indexOfScalar(u8, raw_path, '?') orelse return raw_path;
-    const fail_closed = raw_path[0 .. qpos + 1];
-    if (qpos + 1 > buf.len) return fail_closed[0..@min(fail_closed.len, buf.len)];
-    @memcpy(buf[0 .. qpos + 1], fail_closed);
-    var n = qpos + 1;
-    var it = std.mem.splitScalar(u8, raw_path[qpos + 1 ..], '&');
-    var first = true;
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=');
-        const secret = eq != null and (std.mem.eql(u8, pair[0..eq.?], "api_key") or std.mem.eql(u8, pair[0..eq.?], "key"));
-        const kept = if (secret) pair[0 .. eq.? + 1] else pair;
-        const tail = if (secret) "***" else "";
-        const need = @intFromBool(!first) + kept.len + tail.len;
-        if (n + need > buf.len) return fail_closed;
-        if (!first) {
-            buf[n] = '&';
-            n += 1;
-        }
-        @memcpy(buf[n..][0..kept.len], kept);
-        n += kept.len;
-        @memcpy(buf[n..][0..tail.len], tail);
-        n += tail.len;
-        first = false;
-    }
-    return buf[0..n];
-}
 
-fn logHttpRequest(method: []const u8, raw_path: []const u8, body: []const u8) void {
-    if (!log.isDebug()) return;
-    var buf: [1024]u8 = undefined;
-    log.debug("[http] -> {s} {s} body={d}b\n", .{ method, redactQueryKeys(&buf, raw_path), body.len });
-    logHttpBody("[http] request body", body);
-}
 
-pub fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u8) void {
-    if (!log.isDebug()) return;
-    log.debug("[http] <- {s} {s} body={d}b\n", .{ status, content_type, body.len });
-    logHttpBody("[http] response body", body);
-}
 
-/// The `Access-Control-Allow-Headers` value each SSE surface advertises.
-pub const SSE_ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization";
 
-pub fn logHttpSseData(data: []const u8) void {
-    if (!log.isDebug()) return;
-    log.debug("[http] <- sse data={d}b\n", .{data.len});
-    logHttpBody("[http] sse data", data);
-}
 
-/// Cap on how much of a BINARY body reaches the debug log.
-const BODY_LOG_LIMIT = 4096;
 
-/// True when every byte is printable or ordinary whitespace. Multibyte UTF-8
-/// (≥0x80) counts as text, so an emoji in a chat body doesn't demote it.
-fn bodyIsText(body: []const u8) bool {
-    for (body) |c| {
-        if (c == '\n' or c == '\r' or c == '\t') continue;
-        if (c < 0x20 or c == 0x7f) return false;
-    }
-    return true;
-}
 
-/// Bounded, strictly-printable view of a body, copied into `out`.
-fn bodyPreview(out: []u8, body: []const u8) []const u8 {
-    const n = @min(@min(body.len, out.len), BODY_LOG_LIMIT);
-    for (body[0..n], 0..) |c, i| {
-        out[i] = if (c == '\n' or c == '\r' or c == '\t' or (c >= 0x20 and c < 0x7f)) c else '.';
-    }
-    return out[0..n];
-}
-
-pub fn logHttpBody(label: []const u8, body: []const u8) void {
-    if (body.len == 0) return;
-    // Text bodies go out WHOLE — reading a full request body out of the debug
-    // log is the documented way to reproduce a tool-calling bug.
-    if (bodyIsText(body)) {
-        log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, body });
-        return;
-    }
-    // Binary is a different story. `/v1/images/edits` is multipart, so one image
-    // upload wrote raw PNG bytes into the log, and a body near the 64 MB request
-    // cap blew through the 32 MB rotation — taking the post-mortem file with it.
-    var buf: [BODY_LOG_LIMIT]u8 = undefined;
-    const preview = bodyPreview(&buf, body);
-    log.debug("{s} ({d}b binary, first {d} sanitized):\n{s}…\n", .{ label, body.len, preview.len, preview });
-}
 
 const GaugeSamplerCtx = struct {
     metrics: *instr.Metrics,
@@ -3604,7 +2953,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
     // qwen4 n-gram table warm (F8) — same lock-free published-atomic pattern.
-    ctx.metrics.ngram_warm_bytes.set(qwen4_mod.live_warm_bytes.load(.monotonic));
+    ctx.metrics.ngram_warm_bytes.set(arch_serve.warmBytes(.monotonic));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -3711,7 +3060,7 @@ var sampler_stop = std.atomic.Value(bool).init(false);
 /// there first. A no-op while metrics are off, before the scheduler exists, and after shutdown began.
 fn startGaugeSampler() !void {
     const m = instr.current() orelse return;
-    const sch = global_scheduler orelse return;
+    const sch = server_state.global_scheduler orelse return;
     if (sampler_state.cmpxchgStrong(sampler_idle, sampler_spawning, .acquire, .monotonic) != null) return;
     errdefer sampler_state.store(sampler_idle, .release);
     sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{GaugeSamplerCtx{ .metrics = m, .scheduler = sch, .stop = &sampler_stop }});
@@ -3755,64 +3104,10 @@ fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
 
 // ── API-key auth helpers (used only when --api-key / g_api_key is set) ──
 
-/// True if the connection's peer is a loopback address (127.0.0.0/8, ::1, or an
-/// IPv4-mapped-IPv6 loopback). Loopback is the local machine → trusted and
-/// exempt from the API key, so the same-host app never needs credentials.
-fn ipIsLoopback(addr: std.Io.net.IpAddress) bool {
-    return switch (addr) {
-        .ip4 => |a4| a4.bytes[0] == 127, // 127.0.0.0/8
-        .ip6 => |a6| blk: {
-            const b = a6.bytes; // big-endian 16 bytes
-            const zeros10: [10]u8 = @splat(0);
-            // ::1
-            const zeros15: [15]u8 = @splat(0);
-            if (std.mem.eql(u8, b[0..15], &zeros15) and b[15] == 1) break :blk true;
-            // ::ffff:127.x.x.x  (IPv4-mapped loopback)
-            if (std.mem.eql(u8, b[0..10], &zeros10) and b[10] == 0xff and b[11] == 0xff and b[12] == 127) break :blk true;
-            break :blk false;
-        },
-    };
-}
 
-fn peerIsLoopback(conn: *const http_conn.Conn) bool {
-    return ipIsLoopback(conn.stream.socket.address);
-}
 
-/// Collapse JSON's optional `\/` escape to `/`. Swift's JSONSerialization
-/// (and PHP's json_encode) escape every slash, and a model id is read out of
-/// the RAW body, so `org\/name` would miss the registry. Returns the input
-/// verbatim (zero-copy) when there is nothing to collapse or the scratch
-/// buffer is too small.
-fn unescapeJsonSlashes(buf: []u8, s: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, s, "\\/") == null or s.len > buf.len) return s;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        if (s[i] == '\\' and i + 1 < s.len and s[i + 1] == '/') continue;
-        buf[n] = s[i];
-        n += 1;
-    }
-    return buf[0..n];
-}
 
-test "JSON-escaped slashes in a model id canonicalize (Swift clients send org\\/name)" {
-    const t = std.testing;
-    var buf: [256]u8 = undefined;
-    try t.expectEqualStrings("ddalcu/gemma-e2b", unescapeJsonSlashes(&buf, "ddalcu\\/gemma-e2b"));
-    // No escapes → the INPUT slice comes back verbatim (zero-copy).
-    const plain = "ddalcu/gemma-e2b";
-    try t.expect(unescapeJsonSlashes(&buf, plain).ptr == plain.ptr);
-    // Only the two-byte sequence `\/` collapses; other backslashes survive.
-    try t.expectEqualStrings("a\\b/c", unescapeJsonSlashes(&buf, "a\\b\\/c"));
-    // Oversized input degrades to verbatim rather than truncating.
-    var tiny: [4]u8 = undefined;
-    try t.expectEqualStrings("x\\/y", unescapeJsonSlashes(tiny[0..2], "x\\/y"));
-}
 
-pub fn responseBody(response: []const u8) []const u8 {
-    const at = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
-    return response[at + 4 ..];
-}
 
 test "metrics enable: POST /metrics/enable turns the feeds on, idempotently" {
     const t = std.testing;
@@ -3851,162 +3146,21 @@ test "metrics enable: POST /metrics/enable turns the feeds on, idempotently" {
 test "an unknown endpoint is a 404 that never reaches model resolution" {
     const t = std.testing;
     var sch: scheduler_mod.Scheduler = undefined;
-    const prev_sch = global_scheduler;
-    defer global_scheduler = prev_sch;
-    global_scheduler = &sch;
+    const prev_sch = server_state.global_scheduler;
+    defer server_state.global_scheduler = prev_sch;
+    server_state.global_scheduler = &sch;
     const response = try http_conn.serveOneForTest("POST /v1/load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"model\":\"m\"}");
     defer t.allocator.free(response);
     try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 404 Not Found\r\n"));
     try t.expect(std.mem.indexOf(u8, responseBody(response), "Unknown endpoint") != null);
 }
 
-test "ipIsLoopback exempts local addresses only" {
-    // IPv4 loopback (whole 127.0.0.0/8) is exempt; a LAN address is not.
-    try std.testing.expect(ipIsLoopback(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }));
-    try std.testing.expect(ipIsLoopback(.{ .ip4 = .{ .bytes = .{ 127, 3, 2, 1 }, .port = 0 } }));
-    try std.testing.expect(!ipIsLoopback(.{ .ip4 = .{ .bytes = .{ 192, 168, 1, 42 }, .port = 0 } }));
-    try std.testing.expect(!ipIsLoopback(.{ .ip4 = .{ .bytes = .{ 10, 0, 0, 5 }, .port = 0 } }));
-    // IPv6 ::1 is exempt; a routable v6 address is not.
-    try std.testing.expect(ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } }));
-    // IPv4-mapped loopback ::ffff:127.0.0.1
-    try std.testing.expect(ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = 0 } }));
-    try std.testing.expect(!ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } }));
-}
 
-/// Extract a JSON field's raw value from a JSON body string.
-/// Returns the raw substring for the field value (e.g., the array or object).
-fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
-    // Search for "field": or "field" :
-    var pos: usize = 0;
-    while (pos < body.len) {
-        const quote_pos = std.mem.indexOf(u8, body[pos..], "\"") orelse return null;
-        const key_start = pos + quote_pos + 1;
-        if (key_start + field.len >= body.len) return null;
 
-        if (std.mem.eql(u8, body[key_start .. key_start + field.len], field) and
-            body[key_start + field.len] == '"')
-        {
-            // Found the key, skip to colon
-            var i = key_start + field.len + 1;
-            while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\n' or body[i] == '\r' or body[i] == '\t')) {
-                i += 1;
-            }
-            if (i >= body.len) return null;
 
-            // Now extract the value - find matching bracket/brace
-            const start = i;
-            const open = body[start];
-            const close: u8 = if (open == '[') ']' else if (open == '{') '}' else return null;
-            var depth: usize = 1;
-            var j = start + 1;
-            var in_string = false;
-            while (j < body.len and depth > 0) {
-                if (body[j] == '\\' and in_string) {
-                    j += 1; // skip escaped char
-                } else if (body[j] == '"') {
-                    in_string = !in_string;
-                } else if (!in_string) {
-                    if (body[j] == open) depth += 1;
-                    if (body[j] == close) depth -= 1;
-                }
-                j += 1;
-            }
-            if (depth == 0) return body[start..j];
-            return null;
-        }
-        pos = key_start;
-    }
-    return null;
-}
 
-/// Body text for a context-overflow 400, in a caller-owned buffer.
-///
-/// The COUNTS are the point. "Prompt exceeds maximum context length" tells a
-/// client only that it failed; with both numbers the client can say how far
-/// over it went and offer the one action that fixes it (raise the context to
-/// N). Our own app renders exactly that, and the numbers are only knowable
-/// here — the request is rejected before any usage is reported.
-///
-/// The legacy sentence stays the PREFIX: `APIError.looksLikeContextOverflow`
-/// and third-party clients key on it, so appending must not move it. Output is
-/// digits and spaces, so it carries no escaping hazard into the JSON sink, and
-/// a bufPrint failure falls back to the bare sentence rather than sending no
-/// body at all (the media-gen fixed-buffer class).
-/// The `error.NotEnoughMemory` refusal, in ONE place because two identical
-/// copies of it is how they drift.
-///
-/// The old wording ("retry after current requests complete") named concurrency,
-/// which is the one thing it is never waiting for: the gate refuses against a
-/// STATIC cap, so on an idle server with nothing loaded there is nothing to
-/// retry after (#126). The counts are knowable only server-side and go to the
-/// log; what the client needs is the knob.
-///
-/// ONE gate reaches this arm: the resident-model budget with no evictable
-/// LRU victim (scheduler's `planEvictionsLocked` refusal). The free-memory
-/// PREFLIGHT refuses as `error.InsufficientMemory` and gets its own message
-/// below (#144) — blaming free memory here sends a user quitting apps when
-/// the fix is unloading a model or moving the cap.
-pub const not_enough_memory_message =
-    "Not enough memory to load model: it would exceed the resident-model budget and no loaded model can be evicted. " ++
-    "Unload the model you are chatting with (tray > Models > eject), " ++
-    "or raise or disable the cap with --max-resident-mem <size>|0. " ++
-    "The server log names the exact figures and the current cap.";
 
-/// #144: the memory PREFLIGHT refusal (free RAM can't hold weights + warmup
-/// headroom) is distinct from the resident-budget gate above and has a
-/// different knob. Counts go to the log (#126); the client gets the remedy.
-pub const insufficient_free_memory_message =
-    "Not enough free memory to load model: weights + warmup headroom exceed what is currently available. " ++
-    "Close other apps or models and retry (the server log names the peak estimate and available memory), or turn on \"Skip the memory check before loading\" in Settings (or pass --skip-mem-preflight) to override.";
 
-/// A request refused before it owned a slot. A null sink (metrics off) is one branch.
-pub fn countRejected() void {
-    if (instr.current()) |m| m.recordRejected();
-}
-
-pub fn sendErrorResponse(allocator: std.mem.Allocator, stream: *http_conn.Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
-    const escaped_msg = try jsonEscape(allocator, message);
-    defer allocator.free(escaped_msg);
-
-    var code_buf: [16]u8 = undefined;
-    const code_str = if (code) |c|
-        std.fmt.bufPrint(&code_buf, "{d}", .{c}) catch "null"
-    else
-        "null";
-
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}}}}}
-    , .{ escaped_msg, err_type, code_str });
-    defer allocator.free(body);
-    try sendResponse(stream, status, "application/json", body);
-}
-
-/// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
-/// raw nanosecond counts and token totals. Caller frees. Returns an empty
-/// string when `prefill_ns`, `decode_ns`, AND `tokenize_ns` are all zero
-/// (legacy paths that don't measure timing) so the field can be omitted.
-///
-/// `tokenize_ns` is the wall-clock cost of the synchronous
-/// `renderChatTemplate + tokenizer.encode` step on the request thread.
-/// Phase 4 #1 of `performance-plan.md` calls for instrumentation-first:
-/// before we move tokenize onto a worker thread, we need numbers per
-/// engine / prompt length. Pass 0 for legacy paths that don't measure it
-/// (the field is then omitted from the JSON; existing callers stay shape-
-/// compatible while the new ones surface the metric).
-///
-/// Iteration 2: chat-template render+tokenize wrapper that consults a
-/// per-LoadedModel LRU cache before calling the underlying engine's
-/// encoder. On hit the returned slice is a fresh allocation owned by the
-/// caller (drop-in replacement for the engine encoders). On miss it
-/// stores a copy of the result in the cache.
-/// A bool the client set in `chat_template_kwargs` (the vLLM/SGLang spelling for
-/// template variables); null when absent or not a bool. The one reader of that object.
-pub fn chatTemplateKwargBool(root: std.json.ObjectMap, key: []const u8) ?bool {
-    const kwargs = root.get("chat_template_kwargs") orelse return null;
-    if (kwargs != .object) return null;
-    const v = kwargs.object.get(key) orelse return null;
-    return if (v == .bool) v.bool else null;
-}
 
 /// The model's chat config as this request renders it.
 pub fn renderConfigFor(chat_config: *const chat_mod.ChatConfig, root: std.json.ObjectMap, flag: ?bool, setting: ?bool) chat_mod.ChatConfig {
@@ -4048,86 +3202,9 @@ pub fn cachedFormatChat(
     return ids;
 }
 
-/// THE JSON string escaper for every response body. Every string here is model bytes
-/// somewhere and a token is a BPE fragment, so invalid UTF-8 is sanitized INSIDE the
-/// escaper (one U+FFFD per bad sequence); valid input passes through byte for byte.
-pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    if (std.unicode.utf8ValidateSlice(input)) return jsonEscapeValid(allocator, input);
-    const clean = try chat_mod.utf8Sanitize(allocator, input);
-    defer allocator.free(clean);
-    return jsonEscapeValid(allocator, clean);
-}
 
-fn jsonEscapeValid(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
 
-    try result.append(allocator, '"');
-    for (input) |c| {
-        switch (c) {
-            '"' => try result.appendSlice(allocator, "\\\""),
-            '\\' => try result.appendSlice(allocator, "\\\\"),
-            '\n' => try result.appendSlice(allocator, "\\n"),
-            '\r' => try result.appendSlice(allocator, "\\r"),
-            '\t' => try result.appendSlice(allocator, "\\t"),
-            else => {
-                if (c < 0x20) {
-                    var esc_buf: [6]u8 = undefined;
-                    const s = std.fmt.bufPrint(&esc_buf, "\\u{x:0>4}", .{c}) catch unreachable;
-                    try result.appendSlice(allocator, s);
-                } else {
-                    try result.append(allocator, c);
-                }
-            },
-        }
-    }
-    try result.append(allocator, '"');
-    return result.toOwnedSlice(allocator);
-}
 
-test "EVERY JSON string escaper survives bytes that are not valid UTF-8" {
-    // Class guard over the three escapers (OpenAI/Anthropic, Responses, the prompt
-    // render): one passing bytes through loses a whole reply.
-    const a = std.testing.allocator;
-    const cases = [_][]const u8{
-        "near\xe8\x91\xe4\xb8\x89 in", // 3-byte lead, one continuation, then another lead
-        "\xff\xfe", // never-valid lead bytes
-        "tail\xf0\x9f", // first half of a 4-byte emoji, cut by max_tokens
-    };
-    for (cases) |bad| {
-        const a1 = try jsonEscape(a, bad);
-        defer a.free(a1);
-        try std.testing.expect(std.unicode.utf8ValidateSlice(a1));
-
-        const a2 = try responses_mod.jsonEscape(a, bad);
-        defer a.free(a2);
-        try std.testing.expect(std.unicode.utf8ValidateSlice(a2));
-
-        var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(a);
-        try chat_mod.appendJsonString(a, &buf, bad);
-        try std.testing.expect(std.unicode.utf8ValidateSlice(buf.items));
-    }
-    // Valid input is passed through byte for byte.
-    const good = try jsonEscape(a, "héllo \u{1F600}");
-    defer a.free(good);
-    try std.testing.expectEqualStrings("\"héllo \u{1F600}\"", good);
-}
-
-/// Wave 1.A — parse the optional per-request `kv_quant` body field. Accepts
-/// the string forms `"off"`, `"0"`, `"4"`, `"6"`, `"8"` and the integer forms `0`,
-/// `4`, `6`, `8`. Returns null when the field is absent or unrecognized (the
-/// caller falls back to the process-level `--kv-quant` default carried on
-/// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
-pub fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
-    const v = root.get("kv_quant") orelse return null;
-    const kq = transformer_mod.KVQuantConfig.fromJsonValue(v) orelse return null;
-    switch (kq.scheme) {
-        .off => log.info("  kv-quant override: off (per-request)\n", .{}),
-        .affine => log.info("  kv-quant override: affine {d}-bit (per-request)\n", .{kq.bits}),
-    }
-    return kq;
-}
 
 // ── Vision Processing ──
 
@@ -4346,7 +3423,7 @@ pub const MropeData = struct {
 // 8x8 solid PNGs: red and blue.
 pub const test_png_red = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEUlEQVR42mP4z8CAFTEMLQkAKP8/wc53yE8AAAAASUVORK5CYII=";
 pub const test_png_blue = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQVR42mNgYPiPAw0pCQCpcD/B/MtF/AAAAABJRU5ErkJggg==";
-const test_wire_vp: chat_mod.VisionPreproc = .{ .mode = .qwen, .patch = 16, .tps = 2, .merge = 2 };
+const test_wire_vp: chat_mod.VisionPreproc = .{ .mode = arch_media.modeNamed("qwen") orelse .gemma, .patch = 16, .tps = 2, .merge = 2 };
 
 pub fn testWire(body: []const u8, vocab: WireVocab) !struct { parsed: std.json.Parsed(std.json.Value), wire: WireMessages } {
     // The processor is the arch's: a build without it cannot decode these images.
@@ -4420,190 +3497,29 @@ test "a long agent session's 65 images pass the image limit" {
     try std.testing.expect(t.wire.media.refusal() == null);
 }
 
-/// Serialize a std.json.Value to JSON text, appending to buf.
-pub fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: std.json.Value) !void {
-    switch (value) {
-        .null => try buf.appendSlice(allocator, "null"),
-        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |i| {
-            var num_buf: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch "0";
-            try buf.appendSlice(allocator, s);
-        },
-        .float => |f| {
-            var num_buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "{d}", .{f}) catch "0";
-            try buf.appendSlice(allocator, s);
-        },
-        .string => |s| {
-            const escaped = try jsonEscape(allocator, s);
-            defer allocator.free(escaped);
-            try buf.appendSlice(allocator, escaped);
-        },
-        .array => |arr| {
-            try buf.append(allocator, '[');
-            for (arr.items, 0..) |item, idx| {
-                if (idx > 0) try buf.append(allocator, ',');
-                try serializeJsonValue(allocator, buf, item);
-            }
-            try buf.append(allocator, ']');
-        },
-        .object => |obj| {
-            try buf.append(allocator, '{');
-            var iter = obj.iterator();
-            var first = true;
-            while (iter.next()) |entry| {
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                const ek = try jsonEscape(allocator, entry.key_ptr.*);
-                defer allocator.free(ek);
-                try buf.appendSlice(allocator, ek);
-                try buf.append(allocator, ':');
-                try serializeJsonValue(allocator, buf, entry.value_ptr.*);
-            }
-            try buf.append(allocator, '}');
-        },
-        .number_string => |s| try buf.appendSlice(allocator, s),
-    }
-}
 
-/// Convert Anthropic tools format to OpenAI tools format for chat template compatibility.
-pub fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array) ![]const u8 {
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, '[');
-    for (tools_array.items, 0..) |tool_val, i| {
-        if (i > 0) try buf.append(allocator, ',');
-        if (tool_val != .object) continue;
-        const tool = tool_val.object;
-        const name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
-        const desc = if (tool.get("description")) |v| (if (v == .string) v.string else "") else "";
-        const esc_n = try jsonEscape(allocator, name);
-        defer allocator.free(esc_n);
-        const esc_d = try jsonEscape(allocator, desc);
-        defer allocator.free(esc_d);
-        try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
-        try buf.appendSlice(allocator, esc_n);
-        try buf.appendSlice(allocator, ",\"description\":");
-        try buf.appendSlice(allocator, esc_d);
-        try buf.appendSlice(allocator, ",\"parameters\":");
-        if (tool.get("input_schema")) |schema_val| {
-            try serializeJsonValue(allocator, &buf, schema_val);
-        } else {
-            try buf.appendSlice(allocator, "{}");
-        }
-        try buf.appendSlice(allocator, "}}");
-    }
-    try buf.append(allocator, ']');
-    return try buf.toOwnedSlice(allocator);
-}
 
 // ── Tests ──
 
 const testing = std.testing;
 
-test "debug body log bounds BINARY but never truncates text (multipart PNG class)" {
-    // `/v1/images/edits` is the first binary body we serve. `logHttpBody` dumped
-    // whatever it got verbatim, so at --log-level debug one image upload wrote
-    // raw PNG bytes into the log — and a body near the 64 MB request cap blew
-    // straight through the 32 MB rotation, taking the post-mortem file with it.
-    //
-    // Text bodies must stay WHOLE: reading a full request body out of the debug
-    // log is the documented way to reproduce a tool-calling bug.
-    try testing.expect(bodyIsText("{\"model\":\"x\",\"prompt\":\"hi\"}"));
-    try testing.expect(bodyIsText("multi\nline\twith\r\nwhitespace"));
-    try testing.expect(bodyIsText("utf8 stays text: é ✓ 🎉")); // multibyte, not control
-    try testing.expect(!bodyIsText("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
-    // The real shape: text multipart framing wrapped around a binary payload.
-    try testing.expect(!bodyIsText("--B\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\n\x89PNG\x00\x01\r\n--B--"));
 
-    // A binary preview is bounded AND strictly printable ASCII.
-    var buf: [64]u8 = undefined;
-    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\xffbinary tail";
-    const p = bodyPreview(&buf, png);
-    try testing.expect(p.len <= buf.len);
-    for (p) |c| try testing.expect(c == '\n' or c == '\r' or c == '\t' or (c >= 0x20 and c < 0x7f));
 
-    // Larger than the sink → truncated, never streamed.
-    const big = try testing.allocator.alloc(u8, 1024 * 1024);
-    defer testing.allocator.free(big);
-    @memset(big, 0);
-    try testing.expectEqual(@as(usize, buf.len), bodyPreview(&buf, big).len);
-    // The cap is the SMALLER of the caller's buffer and the byte limit, so a
-    // generous buffer can't reintroduce the megabyte dump.
-    var huge: [BODY_LOG_LIMIT * 2]u8 = undefined;
-    try testing.expectEqual(@as(usize, BODY_LOG_LIMIT), bodyPreview(&huge, big).len);
-}
 
-test "extractJsonField extracts array" {
-    const body =
-        \\{"messages":[{"role":"user","content":"hi"}],"temperature":0.7}
-    ;
-    const result = extractJsonField(body, "messages").?;
-    try testing.expect(std.mem.startsWith(u8, result, "["));
-    try testing.expect(std.mem.endsWith(u8, result, "]"));
-}
 
-test "extractJsonField extracts nested object" {
-    const body =
-        \\{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}}
-    ;
-    const result = extractJsonField(body, "response_format").?;
-    try testing.expect(std.mem.startsWith(u8, result, "{"));
-    try testing.expect(std.mem.endsWith(u8, result, "}"));
-}
 
-test "extractJsonField returns null for missing field" {
-    const body = "{\"messages\":[]}";
-    try testing.expect(extractJsonField(body, "tools") == null);
-}
 
-test "extractJsonField handles escaped quotes in strings" {
-    const body =
-        \\{"tools":[{"type":"function","function":{"name":"say_\"hello\""}}]}
-    ;
-    const result = extractJsonField(body, "tools").?;
-    try testing.expect(std.mem.startsWith(u8, result, "["));
-    try testing.expect(std.mem.endsWith(u8, result, "]"));
-}
 
-test "jsonEscape basic string" {
-    const allocator = testing.allocator;
-    const result = try jsonEscape(allocator, "hello");
-    defer allocator.free(result);
-    try testing.expectEqualStrings("\"hello\"", result);
-}
 
-test "jsonEscape special characters" {
-    const allocator = testing.allocator;
-    const result = try jsonEscape(allocator, "line1\nline2\t\"quoted\"\\back");
-    defer allocator.free(result);
-    try testing.expectEqualStrings("\"line1\\nline2\\t\\\"quoted\\\"\\\\back\"", result);
-}
-
-test "jsonEscape control characters" {
-    const allocator = testing.allocator;
-    const input = &[_]u8{ 0x01, 0x02 };
-    const result = try jsonEscape(allocator, input);
-    defer allocator.free(result);
-    try testing.expectEqualStrings("\"\\u0001\\u0002\"", result);
-}
-
-test "jsonEscape empty string" {
-    const allocator = testing.allocator;
-    const result = try jsonEscape(allocator, "");
-    defer allocator.free(result);
-    try testing.expectEqualStrings("\"\"", result);
-}
 
 test "getTimeoutNs computes correctly" {
-    const original = server_config.request_timeout_sec;
-    defer server_config.request_timeout_sec = original;
+    const original = server_state.server_config.request_timeout_sec;
+    defer server_state.server_config.request_timeout_sec = original;
 
-    server_config.request_timeout_sec = 300;
+    server_state.server_config.request_timeout_sec = 300;
     try testing.expectEqual(@as(u64, 300_000_000_000), getTimeoutNs());
 
-    server_config.request_timeout_sec = 0;
+    server_state.server_config.request_timeout_sec = 0;
     try testing.expectEqual(@as(u64, 0), getTimeoutNs());
 }
 
@@ -4641,95 +3557,10 @@ test "Responses: a stored reasoning turn renders as the model's own think block"
     try testing.expect(std.mem.indexOf(u8, r_inline, "<think>\ninspect it\n</think>") == null);
 }
 
-test "content-array text parts JOIN in order — plan-mode's [prompt, reminder] shape (issue #195)" {
-    // opencode plan mode appends its system-reminder as a SECOND text part on
-    // the user message. Last-wins parsing kept only the reminder, so the model
-    // saw no user prompt at all.
-    const body =
-        \\[{"type":"text","text":"analyze project"},
-        \\ {"type":"image_url","image_url":{"url":"data:x"}},
-        \\ {"type":"text","text":"<system-reminder>plan mode</system-reminder>"}]
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-    defer parsed.deinit();
-    const j = try joinedTextParts(testing.allocator, parsed.value.array.items);
-    defer if (j.owned) testing.allocator.free(j.text);
-    try testing.expect(j.owned);
-    try testing.expectEqualStrings("analyze project\n<system-reminder>plan mode</system-reminder>", j.text);
-}
 
-test "joinedTextParts: single text part borrows; empty and non-text parts ignored" {
-    const body =
-        \\[{"type":"text","text":""}, {"type":"input_audio"}, {"type":"text","text":"hello"}, {"nope":1}]
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-    defer parsed.deinit();
-    const j = try joinedTextParts(testing.allocator, parsed.value.array.items);
-    try testing.expect(!j.owned);
-    try testing.expectEqualStrings("hello", j.text);
 
-    const none = try joinedTextParts(testing.allocator, &.{});
-    try testing.expect(!none.owned);
-    try testing.expectEqualStrings("", none.text);
-}
 
-fn cacheKeyOf(body: []const u8) !u64 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-    defer parsed.deinit();
-    return requestCacheKey(parsed.value.object);
-}
 
-test "canonicalRole: developer is the system turn; every other role is itself" {
-    try testing.expectEqualStrings("system", chat_mod.canonicalRole("developer"));
-    try testing.expectEqualStrings("system", chat_mod.canonicalRole("system"));
-    try testing.expectEqualStrings("tool", chat_mod.canonicalRole("tool"));
-    try testing.expectEqualStrings("assistant", chat_mod.canonicalRole("assistant"));
-}
-
-test "requestCacheKey: prompt_cache_key > metadata.user_id > system prompt > anonymous" {
-    const sys_str = try cacheKeyOf(
-        \\{"messages":[{"role":"system","content":"You are S."},{"role":"user","content":"hi"}]}
-    );
-    const sys_parts = try cacheKeyOf(
-        \\{"messages":[{"role":"system","content":[{"type":"text","text":"You are S."}]}]}
-    );
-    const anth = try cacheKeyOf(
-        \\{"system":[{"type":"text","text":"You are S."}],"messages":[{"role":"user","content":"hi"}]}
-    );
-    const resp = try cacheKeyOf(
-        \\{"instructions":"You are S.","input":"hi"}
-    );
-    try testing.expect(sys_str != 0);
-    try testing.expectEqual(sys_str, sys_parts);
-    try testing.expectEqual(sys_str, anth);
-    try testing.expectEqual(sys_str, resp);
-    // OpenAI's reasoning-model spelling of the system turn (pi sends it).
-    try testing.expectEqual(sys_str, try cacheKeyOf(
-        \\{"messages":[{"role":"developer","content":"You are S."},{"role":"user","content":"hi"}]}
-    ));
-    try testing.expect(sys_str != try cacheKeyOf(
-        \\{"messages":[{"role":"system","content":"You are T."}]}
-    ));
-
-    const uid = try cacheKeyOf(
-        \\{"metadata":{"user_id":"sess-1"},"messages":[{"role":"system","content":"You are S."}]}
-    );
-    try testing.expect(uid != 0 and uid != sys_str);
-    const pck = try cacheKeyOf(
-        \\{"prompt_cache_key":"batch","metadata":{"user_id":"sess-1"},"messages":[{"role":"system","content":"You are S."}]}
-    );
-    try testing.expect(pck != 0 and pck != uid);
-    try testing.expectEqual(pck, try cacheKeyOf(
-        \\{"prompt_cache_key":"batch","prompt":"doc"}
-    ));
-
-    try testing.expectEqual(@as(u64, 0), try cacheKeyOf(
-        \\{"messages":[{"role":"user","content":"hi"}]}
-    ));
-    try testing.expectEqual(@as(u64, 0), try cacheKeyOf(
-        \\{"prompt_cache_key":"","prompt":"doc"}
-    ));
-}
 
 test "settingsPropsJson: /props names the greedy tail and where it came from" {
     for ([_]model_settings.Pick(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail" }) |tail, source| {
@@ -4748,7 +3579,7 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // thread, subagents, title generation). With capacity 1, every
     // interleaved request evicted the long system-prompt prefix and forced a
     // full re-prefill per turn.
-    try testing.expect(prefix_cache_capacity >= 4);
+    try testing.expect(server_state.prefix_cache_capacity >= 4);
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {
@@ -4820,8 +3651,8 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
 
     // The escape hatch covers this correction too: it repairs the MODEL's output
     // (unlike the inferred-name filter, which corrects our own heuristic).
-    g_tool_autocorrect = false;
-    defer g_tool_autocorrect = true;
+    server_state.g_tool_autocorrect = false;
+    defer server_state.g_tool_autocorrect = true;
     const raw_calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (raw_calls) |tc| {
@@ -4848,8 +3679,8 @@ test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
     const text = "<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
         "<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
 
-    g_tool_autocorrect = false;
-    defer g_tool_autocorrect = true; // restore the default for other tests
+    server_state.g_tool_autocorrect = false;
+    defer server_state.g_tool_autocorrect = true; // restore the default for other tests
     const calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (calls) |tc| {
@@ -5104,27 +3935,6 @@ test "finishDetailsField: the loop cause rides beside finish_reason, and only a 
     try std.testing.expectEqualStrings("", finishDetailsField("client_disconnect", "repetition_loop"));
 }
 
-test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
-    const allocator = std.testing.allocator;
-    const cases = [_]struct { body: []const u8, rejected: bool }{
-        // Absent, explicit null, and the two spellings of "one choice" pass.
-        .{ .body = "{}", .rejected = false },
-        .{ .body = "{\"n\":null}", .rejected = false },
-        .{ .body = "{\"n\":1}", .rejected = false },
-        .{ .body = "{\"n\":1.0}", .rejected = false },
-        // Anything else is a request for multi-choice (or garbage) — reject
-        // instead of the silent one-choice no-op.
-        .{ .body = "{\"n\":2}", .rejected = true },
-        .{ .body = "{\"n\":0}", .rejected = true },
-        .{ .body = "{\"n\":\"2\"}", .rejected = true },
-    };
-    for (cases) |case| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
-        defer parsed.deinit();
-        const reason = nChoicesRejectReason(parsed.value.object);
-        try std.testing.expectEqual(case.rejected, reason != null);
-    }
-}
 
 test "jsonEscapeOrEmpty: escaping an empty string is OWNED (leak class 2026-07-19)" {
     // The old inline pattern decided ownership by CONTENT
@@ -5261,34 +4071,6 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     try testing.expectEqualStrings(insufficient_free_memory_message, generation_stream.loadRefusalFor(error.InsufficientMemory).?.message);
 }
 
-test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback, empty dropped" {
-    const t = std.testing;
-    const allocator = t.allocator;
-    const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
-        // pi/vLLM SSE spelling (live 2026-07-29).
-        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":\"two plus two\"}", .want = "two plus two" },
-        // vLLM request spelling.
-        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning\":\"twice two\"}", .want = "twice two" },
-        // reasoning_content wins when both are present.
-        .{ .body = "{\"role\":\"assistant\",\"reasoning_content\":\"a\",\"reasoning\":\"b\"}", .want = "a" },
-        // Empty string is NOT reasoning — it would render the empty
-        // <think></think> nothink signature the field exists to avoid.
-        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":\"\"}", .want = null },
-        // Non-string shapes are ignored, never crash.
-        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":{\"x\":1}}", .want = null },
-        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\"}", .want = null },
-    };
-    for (cases) |case| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
-        defer parsed.deinit();
-        const got = messageReasoningFromObj(parsed.value.object);
-        if (case.want) |w| {
-            try t.expectEqualStrings(w, got.?);
-        } else {
-            try t.expect(got == null);
-        }
-    }
-}
 
 test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag" {
     const saved = generate_mod.max_mtp_ctx;
@@ -5307,127 +4089,6 @@ test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag"
     try std.testing.expect(!admitMtpForCtx(false, 1));
 }
 
-test "mtpHeadKvLine: --mtp-head-kv-quant is reported per arch" {
-    const t = std.testing;
-    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
-    try t.expect(mtpHeadKvLine(&qwen4, false) == null);
-    try t.expect(mtpHeadKvLine(&mimo, false) == null);
-    try t.expectEqualStrings("MTP head KV: following --kv-quant (--mtp-head-kv-quant)", mtpHeadKvLine(&qwen4, true).?);
-    // MiMo's heads keep their own dense window (`mimo_mtp.RowCache`); the flag never reaches them.
-    try t.expectEqualStrings("MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)", mtpHeadKvLine(&mimo, true).?);
-}
-
-test "qwenGdnLine: --qwen-gdn 16 is reported per arch, and has no effect where there is no GDN arm" {
-    const t = std.testing;
-    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    const glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
-    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
-    try t.expect(qwenGdnLine(&qwen4, true) == null);
-    try t.expect(qwenGdnLine(&glm, true) == null);
-    try t.expectEqualStrings("GDN state: bf16 between tokens (--qwen-gdn 16; f32 is the default; the decay gate is f32 either way)", qwenGdnLine(&qwen4, false).?);
-    // GLM's recurrent state is KDA, not GDN: the flag names a layer it does not have.
-    try t.expectEqualStrings("GDN state: --qwen-gdn 16 has no effect on GLM (its KDA state is f32 already)", qwenGdnLine(&glm, false).?);
-    try t.expectEqualStrings("GDN state: --qwen-gdn 16 has no effect on mimo_v2 (no GatedDeltaNet layers)", qwenGdnLine(&mimo, false).?);
-}
-
-test "deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line" {
-    const t = std.testing;
-    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
-    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    try t.expect(archFlagRefusal(&dsv41, .{}) == null);
-    const all = LaunchFlagUse{ .kv_quant = true, .qwen_gdn_16 = true, .mtp_head_kv_quant = true, .mtp_typical = true, .mtp_tokenv3 = true, .mtp_greedy_tail = true };
-    try t.expect(archFlagRefusal(&qwen4, all) == null);
-    for ([_]struct { use: LaunchFlagUse, flag: []const u8 }{
-        .{ .use = .{ .kv_quant = true }, .flag = "--kv-quant" },
-        .{ .use = .{ .qwen_gdn_16 = true }, .flag = "--qwen-gdn" },
-        .{ .use = .{ .mtp_head_kv_quant = true }, .flag = "--mtp-head-kv-quant" },
-        .{ .use = .{ .mtp_typical = true }, .flag = "--mtp-typical" },
-        .{ .use = .{ .mtp_tokenv3 = true }, .flag = "--mtp-tokenv3" },
-        .{ .use = .{ .mtp_greedy_tail = true }, .flag = "--mtp-greedy-tail" },
-    }) |c| {
-        const why = archFlagRefusal(&dsv41, c.use) orelse return error.TestExpectedRefusal;
-        try t.expect(std.mem.startsWith(u8, why, c.flag));
-        try t.expect(std.mem.indexOf(u8, why, "deepseek_v41") != null);
-    }
-    try t.expectEqualStrings("off", kvCacheForLaunch(&dsv41, transformer_mod.KVQuantConfig.affine(4), true).label());
-    try t.expectEqualStrings("kv4", kvCacheForLaunch(&qwen4, transformer_mod.KVQuantConfig.affine(4), true).label());
-    try t.expect(settingsKvQuantIgnoredLine(&dsv41) == null);
-    dsv41.kv_quant_override = transformer_mod.KVQuantConfig.affine(8);
-    try t.expect(std.mem.indexOf(u8, settingsKvQuantIgnoredLine(&dsv41).?, "model-settings.json kv_quant is ignored") != null);
-    try t.expect(settingsKvQuantIgnoredLine(&qwen4) == null);
-    try t.expectEqualStrings("off", kvCacheForLaunch(&dsv41, transformer_mod.KVQuantConfig.engine_default, false).label());
-}
-
-test "deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one line naming the keys set" {
-    const t = std.testing;
-    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
-    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    try t.expect(settingsMtpIgnoredLine(&dsv41) == null);
-    dsv41.mtp_acceptance_override = .{ .typical = .{ .delta = 0.3 } };
-    try t.expectEqualStrings("model-settings.json mtp_acceptance is ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only)", settingsMtpIgnoredLine(&dsv41).?);
-    dsv41.mtp_acceptance_override = null;
-    dsv41.mtp_greedy_tail_override = true;
-    try t.expectEqualStrings("model-settings.json mtp_greedy_tail is ignored on deepseek_v41 (DSpark has no MTP tail)", settingsMtpIgnoredLine(&dsv41).?);
-    dsv41.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
-    try t.expectEqualStrings("model-settings.json mtp_acceptance and mtp_greedy_tail are ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only, with no MTP tail)", settingsMtpIgnoredLine(&dsv41).?);
-    qwen4.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
-    qwen4.mtp_greedy_tail_override = true;
-    try t.expect(settingsMtpIgnoredLine(&qwen4) == null);
-
-    var glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
-    try t.expect(settingsMtpIgnoredLine(&glm) == null);
-    glm.mtp_greedy_tail_override = true;
-    try t.expect(std.mem.indexOf(u8, settingsMtpIgnoredLine(&glm).?, "mtp_greedy_tail are ignored: this load runs no MTP head") != null);
-}
-
-test "settingsFit: a latent-cache arch stores only the latent widths and serves no MTP head; the cap is the model's window" {
-    const t = std.testing;
-    var glm = model_mod.ModelConfig{ .model_type = "glm5_next", .max_position_embeddings = 131072 };
-    const fit = settingsFit(&glm);
-    try t.expect(fit.latent_kv and !fit.serves_mtp);
-    try t.expectEqual(@as(u32, 131072), fit.context_cap);
-    try t.expect(!model_settings.choiceAllowed("kv_quant", "4", fit));
-    try t.expect(model_settings.choiceAllowed("kv_quant", "6", fit));
-    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    try t.expect(!settingsFit(&qwen4).latent_kv and settingsFit(&qwen4).serves_mtp);
-    // A DSpark pack without STQ experts has no prefetcher, and says so at its own load.
-    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .ssd_prefetch_override = 30 };
-    try t.expect(!model_settings.applies("ssd_prefetch", settingsFit(&dsv41)));
-    try t.expect(settingsSsdPrefetchIgnoredLine(&dsv41) == null);
-}
-
-test "--ssd-prefetch is refused where there is no expert prefetcher, before the weights load, and its model setting is ignored there" {
-    const t = std.testing;
-    const use = LaunchFlagUse{ .ssd_prefetch = true };
-    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
-    dsv41.ssd_prefetch_override = 30;
-    try t.expect(archFlagRefusal(&dsv41, use) == null);
-    try t.expect(settingsSsdPrefetchIgnoredLine(&dsv41) == null);
-    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" }) |arch| {
-        var cfg = model_mod.ModelConfig{ .model_type = arch };
-        const why = archFlagRefusal(&cfg, use) orelse return error.TestExpectedRefusal;
-        try t.expect(std.mem.startsWith(u8, why, "--ssd-prefetch"));
-        try t.expect(archFlagRefusal(&cfg, .{}) == null);
-        try t.expect(settingsSsdPrefetchIgnoredLine(&cfg) == null);
-        cfg.ssd_prefetch_override = 30;
-        try t.expect(settingsSsdPrefetchIgnoredLine(&cfg) != null);
-    }
-}
-
-test "--drop-expert is refused on every arch but deepseek_v41, before the weights load" {
-    const t = std.testing;
-    const use = LaunchFlagUse{ .drop_expert = true };
-    const dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41" };
-    try t.expect(archFlagRefusal(&dsv41, use) == null);
-    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" }) |arch| {
-        const cfg = model_mod.ModelConfig{ .model_type = arch };
-        const why = archFlagRefusal(&cfg, use) orelse return error.TestExpectedRefusal;
-        try t.expect(std.mem.startsWith(u8, why, "--drop-expert"));
-        try t.expect(archFlagRefusal(&cfg, .{}) == null);
-    }
-}
-
 test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expectEqualStrings("<think>", templateThinkOpener("{{ '<think>' }} <think>").?);
     try std.testing.expect(templateThinkOpener("{{ '<think:opensource>' }}") == null);
@@ -5436,55 +4097,10 @@ test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expect(templateThinkOpener("assistant") == null);
 }
 
-test "resolveBind: the port is the flag's, else the settings file's, else 12345" {
-    try std.testing.expectEqual(@as(u16, 8080), resolveBind(null, null, 8080).port);
-    try std.testing.expectEqual(@as(u16, 23817), resolveBind(null, 23817, 8080).port);
-    try std.testing.expectEqual(default_port, resolveBind(null, null, default_port).port);
-}
 
-test "resolveBind: no flags bind 127.0.0.1:12345" {
-    const d = resolveBind(null, null, default_port);
-    try std.testing.expectEqualStrings("127.0.0.1", d.host);
-    try std.testing.expectEqual(@as(u16, 12345), d.port);
-    const e = resolveBind("0.0.0.0", 23817, default_port);
-    try std.testing.expectEqualStrings("0.0.0.0", e.host);
-    try std.testing.expectEqual(@as(u16, 23817), e.port);
-    const p = resolveBind(null, 23817, default_port);
-    try std.testing.expectEqualStrings("127.0.0.1", p.host);
-    try std.testing.expectEqual(@as(u16, 23817), p.port);
-    const h = resolveBind("192.168.7.9", null, default_port);
-    try std.testing.expectEqualStrings("192.168.7.9", h.host);
-    try std.testing.expectEqual(@as(u16, 12345), h.port);
-}
 
-test "startupRefusal: AddressInUse refuses naming the port" {
-    var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("port 12345 is already in use", startupRefusal(error.AddressInUse, "127.0.0.1", 12345, &buf).?);
-    try std.testing.expectEqualStrings("port 23817 is already in use", startupRefusal(error.AddressInUse, "127.0.0.1", 23817, &buf).?);
-    try std.testing.expect(startupRefusal(error.AccessDenied, "127.0.0.1", 23817, &buf) == null);
-    try std.testing.expect(startupRefusal(error.SystemResources, "127.0.0.1", 23817, &buf) == null);
-}
 
-test "bindAddress: localhost is loopback; wildcards stay" {
-    const l = try bindAddress("localhost", 12345);
-    try std.testing.expect(std.mem.eql(u8, &l.ip4.bytes, &.{ 127, 0, 0, 1 }));
-    try std.testing.expectEqual(@as(u16, 12345), l.ip4.port);
-    const e = try bindAddress("127.0.0.1", 23817);
-    try std.testing.expect(std.mem.eql(u8, &e.ip4.bytes, &.{ 127, 0, 0, 1 }));
-    try std.testing.expectEqual(@as(u16, 23817), e.ip4.port);
-    const w = try bindAddress("0.0.0.0", 12345);
-    try std.testing.expect(std.mem.eql(u8, &w.ip4.bytes, &.{ 0, 0, 0, 0 }));
-    try std.testing.expectEqual(@as(u16, 12345), w.ip4.port);
-}
 
-test "bindAddress: garbage is refused by name" {
-    try std.testing.expectError(error.InvalidHost, bindAddress("example.com", 80));
-    try std.testing.expectError(error.InvalidHost, bindAddress("999.1.2.3", 80));
-    try std.testing.expectError(error.InvalidHost, bindAddress("1.2.3", 80));
-    var buf: [512]u8 = undefined;
-    try std.testing.expectEqualStrings("invalid --host 'example.com'", startupRefusal(error.InvalidHost, "example.com", 80, &buf).?);
-    try std.testing.expectEqualStrings("invalid --host '999.1.2.3'", startupRefusal(error.InvalidHost, "999.1.2.3", 80, &buf).?);
-}
 
 const byteTokenizerForTests = tokenizer_mod.byteTokenizerForTests;
 const deinitTestTokenizer = tokenizer_mod.deinitTestTokenizer;
@@ -5665,9 +4281,9 @@ test "liveSessions copies the queue snapshot and stamps the effective context li
     sch.cached_sessions[0] = restored;
     sch.cached_sessions[1] = idle;
     sch.cached_session_count = 2;
-    const prev_sch = global_scheduler;
-    defer global_scheduler = prev_sch;
-    global_scheduler = &sch;
+    const prev_sch = server_state.global_scheduler;
+    defer server_state.global_scheduler = prev_sch;
+    server_state.global_scheduler = &sch;
 
     const reg = try ModelRegistry.init(t.allocator, t.io, null, 1, 0, null);
     defer reg.deinit();
@@ -5676,9 +4292,9 @@ test "liveSessions copies the queue snapshot and stamps the effective context li
     lm.state = .ready;
     lm.config = &cfg;
     defer lm.config = null; // LoadedModel.deinit destroys a non-null config — detach first
-    const prev_ctx = server_config.max_context_size;
-    defer server_config.max_context_size = prev_ctx;
-    server_config.max_context_size = 8192; // manualContext wins: no GPU sizing
+    const prev_ctx = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = prev_ctx;
+    server_state.server_config.max_context_size = 8192; // manualContext wins: no GPU sizing
 
     var buf: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
     const rows = liveSessions(reg, &buf);
@@ -5701,7 +4317,7 @@ test "liveSessions copies the queue snapshot and stamps the effective context li
     try t.expectEqual(@as(u32, 0), sch.live_sessions[0].context_length);
 
     // Before `serve()` wires a scheduler: an empty slice, not a crash.
-    global_scheduler = null;
+    server_state.global_scheduler = null;
     try t.expectEqual(@as(usize, 0), liveSessions(reg, &buf).len);
 }
 

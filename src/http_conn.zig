@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = @import("http.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
@@ -18,28 +19,29 @@ const ws_mod = @import("ws.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;
 const server_mod = @import("server.zig");
+const server_state = @import("server_state.zig");
 const generation_stream = @import("generation_stream.zig");
 const responses_api = @import("responses_api.zig");
 const completions = @import("completions.zig");
 const anthropic = @import("anthropic.zig");
 const EMPTY_PROMPT_MSG = generation_stream.EMPTY_PROMPT_MSG;
-const SSE_ALLOW_HEADERS_DEFAULT = server_mod.SSE_ALLOW_HEADERS_DEFAULT;
-const bindAddress = server_mod.bindAddress;
+const SSE_ALLOW_HEADERS_DEFAULT = http.SSE_ALLOW_HEADERS_DEFAULT;
+const bindAddress = http.bindAddress;
 const chatPageUrl = server_mod.chatPageUrl;
 const getOrInitResponseStore = responses_api.getOrInitResponseStore;
 const handleCompletions = completions.handleCompletions;
 const handleConnection = server_mod.handleConnection;
 const handleResponses = responses_api.handleResponses;
 const isAnthropicRoute = anthropic.isAnthropicRoute;
-const jsonEscape = server_mod.jsonEscape;
-const logHttpResponse = server_mod.logHttpResponse;
+const jsonEscape = http.jsonEscape;
+const logHttpResponse = http.logHttpResponse;
 const mapGenerationError = generation_stream.mapGenerationError;
 const max_request_bytes = server_mod.max_request_bytes;
 const readAllFromPair = server_mod.readAllFromPair;
-const redactQueryKeys = server_mod.redactQueryKeys;
-const responseBody = server_mod.responseBody;
-const sendErrorResponse = server_mod.sendErrorResponse;
-const sendResponseFramed = server_mod.sendResponseFramed;
+const redactQueryKeys = http.redactQueryKeys;
+const responseBody = http.responseBody;
+const sendErrorResponse = http.sendErrorResponse;
+const sendResponseFramed = http.sendResponseFramed;
 const sendStreamIdle = generation_stream.sendStreamIdle;
 
 pub fn startListener(host: []const u8, port: u16) (error{InvalidHost} || std.Io.net.IpAddress.ListenError)!std.Io.net.Server {
@@ -287,7 +289,7 @@ pub const Conn = struct {
         const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
         var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
         var sink: [256]u8 = undefined;
-        while (nowMsMonotonic(c.io) < deadline and !server_mod.shutdown_requested.load(.acquire)) {
+        while (nowMsMonotonic(c.io) < deadline and !server_state.shutdown_requested.load(.acquire)) {
             const n = std.posix.poll(&fds, 500) catch break;
             if (n == 0) continue;
             // EOF or reset ends the wait; discard any pipelined request bytes.
@@ -710,7 +712,7 @@ fn basicAuthMatches(enc: []const u8, key: []const u8) bool {
 /// is set). Accepts, in order: `Authorization: Bearer <key>`, HTTP Basic (key as
 /// the password), `x-api-key: <key>` (Anthropic), and `?api_key=` / `?key=`.
 pub fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
-    const key = server_mod.g_api_key orelse return true;
+    const key = server_state.g_api_key orelse return true;
     if (findHeaderValueCI(raw_headers, "authorization")) |auth| {
         if (std.mem.startsWith(u8, auth, "Bearer ")) {
             if (constTimeEql(std.mem.trim(u8, auth["Bearer ".len..], " \t"), key)) return true;
@@ -747,9 +749,9 @@ pub fn sendUnauthorized(stream: *Conn) !void {
 }
 
 test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
-    const prev = server_mod.g_api_key;
-    defer server_mod.g_api_key = prev;
-    server_mod.g_api_key = "s3cret";
+    const prev = server_state.g_api_key;
+    defer server_state.g_api_key = prev;
+    server_state.g_api_key = "s3cret";
 
     // Bearer
     try std.testing.expect(apiKeyAuthorized("Authorization: Bearer s3cret\r\n", "/v1/chat/completions"));
@@ -767,7 +769,7 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     try std.testing.expect(!apiKeyAuthorized("", "/v1/models"));
 
     // No key configured ⇒ always authorized (open mode)
-    server_mod.g_api_key = null;
+    server_state.g_api_key = null;
     try std.testing.expect(apiKeyAuthorized("", "/v1/chat/completions"));
 }
 
@@ -778,9 +780,9 @@ pub fn serveOneForTest(request: []const u8) ![]u8 {
     const reg = try ModelRegistry.init(a, std.testing.io, null, 1, 0, null);
     defer reg.deinit();
     reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
-    const prev_registry = server_mod.global_registry;
-    defer server_mod.global_registry = prev_registry;
-    server_mod.global_registry = reg;
+    const prev_registry = server_state.global_registry;
+    defer server_state.global_registry = prev_registry;
+    server_state.global_registry = reg;
 
     var sv: [2]std.posix.fd_t = undefined;
     if (std.c.socketpair(1, 1, 0, &sv) != 0) return error.SocketPairFailed; // AF_UNIX, SOCK_STREAM
@@ -849,14 +851,14 @@ test "dashboard page: every other method is a 405 and /dashboard/x is not the pa
 
 test "dashboard page: --api-key leaves the page open and keeps the metrics feed behind the key" {
     const t = std.testing;
-    const prev_key = server_mod.g_api_key;
-    const prev_strict = server_mod.g_api_key_strict;
+    const prev_key = server_state.g_api_key;
+    const prev_strict = server_state.g_api_key_strict;
     defer {
-        server_mod.g_api_key = prev_key;
-        server_mod.g_api_key_strict = prev_strict;
+        server_state.g_api_key = prev_key;
+        server_state.g_api_key_strict = prev_strict;
     }
-    server_mod.g_api_key = "s3cret";
-    server_mod.g_api_key_strict = true;
+    server_state.g_api_key = "s3cret";
+    server_state.g_api_key_strict = true;
     const Case = struct { request: []const u8, status: []const u8 };
     for ([_]Case{
         .{ .request = "GET /dashboard HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 200 OK\r\n" },
@@ -887,20 +889,20 @@ test "metrics enable: --api-key binds the route, and a foreign Origin is refused
     const t = std.testing;
     instr.process = .{};
     defer instr.process = .{};
-    const prev_key = server_mod.g_api_key;
-    const prev_strict = server_mod.g_api_key_strict;
-    const old_host = server_mod.listen_host;
-    const old_port = server_mod.listen_port;
+    const prev_key = server_state.g_api_key;
+    const prev_strict = server_state.g_api_key_strict;
+    const old_host = server_state.listen_host;
+    const old_port = server_state.listen_port;
     defer {
-        server_mod.g_api_key = prev_key;
-        server_mod.g_api_key_strict = prev_strict;
-        server_mod.listen_host = old_host;
-        server_mod.listen_port = old_port;
+        server_state.g_api_key = prev_key;
+        server_state.g_api_key_strict = prev_strict;
+        server_state.listen_host = old_host;
+        server_state.listen_port = old_port;
     }
-    server_mod.g_api_key = "s3cret";
-    server_mod.g_api_key_strict = true;
-    server_mod.listen_host = "127.0.0.1";
-    server_mod.listen_port = 12345;
+    server_state.g_api_key = "s3cret";
+    server_state.g_api_key_strict = true;
+    server_state.listen_host = "127.0.0.1";
+    server_state.listen_port = 12345;
     const keyless = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
     defer t.allocator.free(keyless);
     try t.expect(std.mem.startsWith(u8, keyless, "HTTP/1.1 401 "));
@@ -949,15 +951,15 @@ test "chat page: the API routes beside it answer as before" {
 
 test "chat page: --api-key leaves the page open and keeps the API behind the key" {
     const t = std.testing;
-    const prev_key = server_mod.g_api_key;
-    const prev_strict = server_mod.g_api_key_strict;
+    const prev_key = server_state.g_api_key;
+    const prev_strict = server_state.g_api_key_strict;
     defer {
-        server_mod.g_api_key = prev_key;
-        server_mod.g_api_key_strict = prev_strict;
+        server_state.g_api_key = prev_key;
+        server_state.g_api_key_strict = prev_strict;
     }
     // Strict so the loopback test peer is gated like a network one.
-    server_mod.g_api_key = "s3cret";
-    server_mod.g_api_key_strict = true;
+    server_state.g_api_key = "s3cret";
+    server_state.g_api_key_strict = true;
     const Case = struct { request: []const u8, status: []const u8 };
     for ([_]Case{
         .{ .request = "GET / HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 200 OK\r\n" },
@@ -974,8 +976,8 @@ test "chat page: --api-key leaves the page open and keeps the API behind the key
 
 test "self-update: /v1/update refuses by name over the wire and never shuts the server down" {
     const t = std.testing;
-    const prev_key = server_mod.g_api_key;
-    defer server_mod.g_api_key = prev_key;
+    const prev_key = server_state.g_api_key;
+    defer server_state.g_api_key = prev_key;
     const Case = struct { request: []const u8, status: []const u8, says: []const u8 };
     for ([_]Case{
         .{ .request = "GET /v1/update HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "POST only" },
@@ -990,12 +992,12 @@ test "self-update: /v1/update refuses by name over the wire and never shuts the 
         try t.expect(std.mem.indexOf(u8, responseBody(response), c.says) != null);
     }
     // The key binds this route from loopback too: loopback is otherwise exempt.
-    server_mod.g_api_key = "s3cret";
+    server_state.g_api_key = "s3cret";
     const keyless = try serveOneForTest("POST /v1/update HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n");
     defer t.allocator.free(keyless);
     try t.expect(std.mem.startsWith(u8, keyless, "HTTP/1.1 401 "));
     try t.expect(!update_mod.relaunch_requested.load(.acquire));
-    try t.expect(!server_mod.shutdown_requested.load(.acquire));
+    try t.expect(!server_state.shutdown_requested.load(.acquire));
 }
 
 test "chat page URL: a wildcard bind is opened through loopback" {
@@ -1425,8 +1427,8 @@ test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
 /// Runs `Conn.close` after one response, with a peer that stays connected, and checks whether it
 /// held the socket (`close_delimited`) or returned at once.
 fn expectCloseWaitsForPeer(close_delimited: bool, stop_server: bool) !void {
-    const was_shutdown = server_mod.shutdown_requested.swap(false, .acq_rel);
-    defer server_mod.shutdown_requested.store(was_shutdown, .release);
+    const was_shutdown = server_state.shutdown_requested.swap(false, .acq_rel);
+    defer server_state.shutdown_requested.store(was_shutdown, .release);
     var sv: [2]std.posix.fd_t = undefined;
     const AF_UNIX: c_uint = 1;
     const SOCK_STREAM: c_uint = 1;
@@ -1474,7 +1476,7 @@ fn expectCloseWaitsForPeer(close_delimited: bool, stop_server: bool) !void {
     try testing.expectEqual(!close_delimited, closed.load(.acquire));
 
     if (stop_server) {
-        server_mod.shutdown_requested.store(true, .release);
+        server_state.shutdown_requested.store(true, .release);
         // A stray byte wakes the close's poll so it re-reads the flag now, not at the end of its 500 ms slice.
         _ = std.c.send(sv[1], "x", 1, 0);
     } else {
@@ -1675,14 +1677,14 @@ test "one-shot shutdown closes an unaccepted connection before joining its clien
 
 test "web tools: list, confined execution, and browser origin guard" {
     const t = std.testing;
-    const old_host = server_mod.listen_host;
-    const old_port = server_mod.listen_port;
+    const old_host = server_state.listen_host;
+    const old_port = server_state.listen_port;
     defer {
-        server_mod.listen_host = old_host;
-        server_mod.listen_port = old_port;
+        server_state.listen_host = old_host;
+        server_state.listen_port = old_port;
     }
-    server_mod.listen_host = "127.0.0.1";
-    server_mod.listen_port = 12345;
+    server_state.listen_host = "127.0.0.1";
+    server_state.listen_port = 12345;
     const Case = struct { origin: []const u8, body: []const u8, status: []const u8, contains: []const u8, lacks: []const u8 = "" };
     const write_call = "{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside.md\\\",\\\"content\\\":\\\"x\\\"}\",\"write\":true}";
     const cases = [_]Case{
@@ -1705,10 +1707,10 @@ test "web tools: list, confined execution, and browser origin guard" {
         .{ .origin = "http://localhost:12345", .body = "{\"write\":\"yes\"}", .status = "400 Bad Request", .contains = "boolean" },
         .{ .origin = "http://evil.test", .body = write_call, .status = "403 Forbidden", .contains = "Origin" },
     };
-    const old_edit = server_mod.g_web_edit;
-    defer server_mod.g_web_edit = old_edit;
+    const old_edit = server_state.g_web_edit;
+    defer server_state.g_web_edit = old_edit;
     for ([_]bool{ false, true }) |edit_default| {
-        server_mod.g_web_edit = edit_default;
+        server_state.g_web_edit = edit_default;
         // --edit on only changes what a new chat starts with; it never writes on its own.
         const extra = [_]Case{.{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = if (edit_default) "\"edit_default\":true" else "\"edit_default\":false", .lacks = "write_file" }};
         for (if (edit_default) &extra else &cases) |c| {
@@ -1768,14 +1770,14 @@ test "cross-origin policy: a foreign Origin is refused on the state-changing rou
 
 test "cross-origin policy: the routes answer 403 over the wire before any model resolves" {
     const t = std.testing;
-    const old_host = server_mod.listen_host;
-    const old_port = server_mod.listen_port;
+    const old_host = server_state.listen_host;
+    const old_port = server_state.listen_port;
     defer {
-        server_mod.listen_host = old_host;
-        server_mod.listen_port = old_port;
+        server_state.listen_host = old_host;
+        server_state.listen_port = old_port;
     }
-    server_mod.listen_host = "127.0.0.1";
-    server_mod.listen_port = 12345;
+    server_state.listen_host = "127.0.0.1";
+    server_state.listen_port = 12345;
     const Case = struct { request: []const u8, status: []const u8 };
     for ([_]Case{
         .{ .request = "POST /v1/load-model HTTP/1.1\r\nOrigin: http://evil.test\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 403 " },
@@ -1790,7 +1792,7 @@ test "cross-origin policy: the routes answer 403 over the wire before any model 
         defer t.allocator.free(response);
         try t.expect(std.mem.startsWith(u8, response, c.status));
     }
-    server_mod.listen_host = "0.0.0.0";
+    server_state.listen_host = "0.0.0.0";
     for ([_]Case{
         .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: 192.168.1.5:12345\r\nOrigin: http://192.168.1.5:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
         .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nHost: 192.168.1.5:12345\r\nOrigin: http://evil.test:12345\r\n\r\n", .status = "HTTP/1.1 403 " },
@@ -1942,14 +1944,14 @@ test "count_tokens: routed like /v1/messages, with Anthropic-shaped refusals, be
     try t.expect(isTextGenRoute("POST", "/v1/messages/count_tokens"));
     try t.expect(isAnthropicRoute("/v1/messages/count_tokens"));
 
-    const prev_key = server_mod.g_api_key;
-    const prev_strict = server_mod.g_api_key_strict;
+    const prev_key = server_state.g_api_key;
+    const prev_strict = server_state.g_api_key_strict;
     defer {
-        server_mod.g_api_key = prev_key;
-        server_mod.g_api_key_strict = prev_strict;
+        server_state.g_api_key = prev_key;
+        server_state.g_api_key_strict = prev_strict;
     }
-    server_mod.g_api_key = "s3cret";
-    server_mod.g_api_key_strict = true;
+    server_state.g_api_key = "s3cret";
+    server_state.g_api_key_strict = true;
     const keyless = try serveOneForTest("POST /v1/messages/count_tokens?beta=true HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
     defer t.allocator.free(keyless);
     try t.expect(std.mem.startsWith(u8, keyless, "HTTP/1.1 401 "));

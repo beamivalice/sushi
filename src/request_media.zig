@@ -19,6 +19,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
 const server = @import("server.zig");
+const server_state = @import("server_state.zig");
 const generation_stream = @import("generation_stream.zig");
 const MropeData = server.MropeData;
 const WirePos = server.WirePos;
@@ -86,9 +87,9 @@ fn testPngUrl(a: std.mem.Allocator, w: u32, h: u32) ![]u8 {
 }
 
 const test_vision_modes = [_]chat_mod.VisionPreproc{
-    .{ .mode = .qwen, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 65536, .max_pixels = 1048576 },
-    .{ .mode = .mimo, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 8192, .max_pixels = 8388608 },
-    .{ .mode = .glm5, .patch = 14, .tps = 2, .merge = 2, .min_tokens = 16, .max_tokens = 8000 },
+    .{ .mode = arch_media.modeNamed("qwen") orelse .gemma, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 65536, .max_pixels = 1048576 },
+    .{ .mode = arch_media.modeNamed("mimo") orelse .gemma, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 8192, .max_pixels = 8388608 },
+    .{ .mode = arch_media.modeNamed("glm5") orelse .gemma, .patch = 14, .tps = 2, .merge = 2, .min_tokens = 16, .max_tokens = 8000 },
 };
 
 /// The processor of the enabled arch serving `model_type`; a test of an arch the build left out passes unrun.
@@ -152,7 +153,7 @@ test "the plan read from an image's header is the grid and size its full decode 
             try std.testing.expectEqual(want.grid_h, got.grid_h);
             try std.testing.expectEqual(want.grid_w, got.grid_w);
             // The rows the prompt places for the plan are the rows the tower will produce.
-            if (vp.mode == .dsv41) try std.testing.expectEqual(
+            if (arch_media.modeNamed("dsv41") == vp.mode) try std.testing.expectEqual(
                 arch_media.imageRows(&dsv_config.?, vp.merge, want.grid_h, want.grid_w),
                 arch_media.imageRows(&dsv_config.?, vp.merge, got.grid_h, got.grid_w),
             );
@@ -274,13 +275,13 @@ test "a media encode refused after the restore reaches the client with the text 
     const fit = vision_queue.MediaRefusal{ .server_error = false, .buf = undefined, .len = 0 };
     var refused = fit;
     refused.len = (std.fmt.bufPrint(&refused.buf, "needs ~9 MB, ~1 MB is available", .{}) catch unreachable).len;
-    server.slot_media_refusal = refused;
+    server_state.slot_media_refusal = refused;
     const wire = mapGenerationError(error.MediaRefused, &buf);
     try std.testing.expectEqual(@as(u32, 400), wire.code);
     try std.testing.expectEqualStrings("needs ~9 MB, ~1 MB is available", wire.message);
-    try std.testing.expectEqual(@as(?vision_queue.MediaRefusal, null), server.slot_media_refusal);
+    try std.testing.expectEqual(@as(?vision_queue.MediaRefusal, null), server_state.slot_media_refusal);
     refused.server_error = true;
-    server.slot_media_refusal = refused;
+    server_state.slot_media_refusal = refused;
     try std.testing.expectEqual(@as(u32, 500), mapGenerationError(error.MediaRefused, &buf).code);
 }
 
@@ -799,7 +800,7 @@ test "visionPreprocFromConfig threads each tower's processor bounds" {
     };
     if (arch_media.claimed(&qwen_config)) {
         const qwen = visionPreprocFromConfig(&qwen_config);
-        try std.testing.expectEqual(.qwen, qwen.mode);
+        try std.testing.expect(arch_media.modeNamed("qwen") == qwen.mode);
         try std.testing.expectEqual(@as(u32, 14), qwen.patch);
         try std.testing.expectEqual(@as(u32, 2), qwen.tps);
         try std.testing.expectEqual(@as(u32, 2), qwen.merge);
@@ -817,7 +818,7 @@ test "visionPreprocFromConfig threads each tower's processor bounds" {
     };
     if (arch_media.claimed(&mimo_config)) {
         const mimo = visionPreprocFromConfig(&mimo_config);
-        try std.testing.expectEqual(.mimo, mimo.mode);
+        try std.testing.expect(arch_media.modeNamed("mimo") == mimo.mode);
         try std.testing.expectEqual(@as(u32, 8192), mimo.min_pixels);
         try std.testing.expectEqual(@as(u32, 8388608), mimo.max_pixels);
     }
@@ -836,7 +837,8 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     try std.testing.expectEqual(@as(u32, 2), gemma.width);
     try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
 
-    for ([_]chat_mod.VisionPreproc{ .{ .mode = .mimo }, .{ .mode = .qwen } }) |vp| {
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = arch_media.modeNamed("mimo") orelse .gemma }, .{ .mode = arch_media.modeNamed("qwen") orelse .gemma } }) |vp| {
+        if (!arch_media.servesMode(vp.mode)) continue;
         try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
     }
 }
@@ -1714,7 +1716,7 @@ test "visionEncodeBill covers each measured video peak by >= 25% and within 1.5x
 test "GLM vision serving processor carries image and video token budgets without M-RoPE" {
     const cfg = arch_media.testConfig("glm5_next") orelse return;
     const processor = visionPreprocFromConfig(&cfg);
-    try std.testing.expectEqual(.glm5, processor.mode);
+    try std.testing.expect(arch_media.modeNamed("glm5") == processor.mode);
     try std.testing.expectEqual(@as(u32, 14), processor.patch);
     try std.testing.expectEqual(@as(u32, 2), processor.tps);
     try std.testing.expectEqual(@as(u32, 16), processor.min_tokens);
@@ -1746,7 +1748,7 @@ test "DeepSeek vision serving: the processor carries the release's budgets, a pl
     const a = std.testing.allocator;
     const cfg = arch_media.testConfig("deepseek_v41") orelse return;
     const vp = visionPreprocFromConfig(&cfg);
-    try std.testing.expectEqual(.dsv41, vp.mode);
+    try std.testing.expect(arch_media.modeNamed("dsv41") == vp.mode);
     try std.testing.expectEqual(@as(u32, 14), vp.patch);
     try std.testing.expectEqual(@as(u32, 3), vp.merge);
     try std.testing.expectEqual(@as(u32, 1024), vp.max_tokens);

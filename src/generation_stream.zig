@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = @import("http.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -34,13 +35,15 @@ const nowMsMonotonic = io_util.nowMsMonotonic;
 const Stopwatch = io_util.Stopwatch;
 const nextCompletionId = io_util.nextCompletionId;
 const server_mod = @import("server.zig");
+const server_state = @import("server_state.zig");
+const arch_packs = @import("arch/packs.zig");
 const anthropic = @import("anthropic.zig");
 const responses_api = @import("responses_api.zig");
 const completions = @import("completions.zig");
 const FakeSlot = server_mod.FakeSlot;
 const GEN_OOM_MSG = server_mod.GEN_OOM_MSG;
 const MropeData = server_mod.MropeData;
-const SSE_ALLOW_HEADERS_DEFAULT = server_mod.SSE_ALLOW_HEADERS_DEFAULT;
+const SSE_ALLOW_HEADERS_DEFAULT = http.SSE_ALLOW_HEADERS_DEFAULT;
 const TickPlayer = server_mod.TickPlayer;
 const appendRawToolDump = server_mod.appendRawToolDump;
 const buildAnthropicStreamError = anthropic.buildAnthropicStreamError;
@@ -49,20 +52,20 @@ const completionShowsToken = completions.completionShowsToken;
 const completionText = completions.completionText;
 const finishDetailsField = server_mod.finishDetailsField;
 const getTimeoutNs = server_mod.getTimeoutNs;
-const insufficient_free_memory_message = server_mod.insufficient_free_memory_message;
-const jsonEscape = server_mod.jsonEscape;
+const insufficient_free_memory_message = http.insufficient_free_memory_message;
+const jsonEscape = http.jsonEscape;
 const jsonEscapeOrEmpty = server_mod.jsonEscapeOrEmpty;
-const logHttpSseData = server_mod.logHttpSseData;
+const logHttpSseData = http.logHttpSseData;
 const memoryContextRefusalMessage = server_mod.memoryContextRefusalMessage;
 const mtpCapable = server_mod.mtpCapable;
-const not_enough_memory_message = server_mod.not_enough_memory_message;
+const not_enough_memory_message = http.not_enough_memory_message;
 const parseToolCallsForRequest = server_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const reasoningWithinBudget = server_mod.reasoningWithinBudget;
 const sendAnthropicError = anthropic.sendAnthropicError;
 const sendAnthropicEvent = anthropic.sendAnthropicEvent;
-const sendErrorResponse = server_mod.sendErrorResponse;
-const sendResponse = server_mod.sendResponse;
+const sendErrorResponse = http.sendErrorResponse;
+const sendResponse = http.sendResponse;
 const sendResponsesEvent = responses_api.sendResponsesEvent;
 const shouldParseToolCalls = server_mod.shouldParseToolCalls;
 const splitConstrainedResponse = responses_api.splitConstrainedResponse;
@@ -82,8 +85,8 @@ fn loopTrimmedIds(ids: []const u32, start: ?usize) []const u32 {
 /// A slot that errored reports why: the MLX error latch's `error.OutOfMemory` is a memory
 /// failure the operator can act on. One helper for the three slot-drain sites.
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
-    server_mod.slot_memory_context_refusal = slot.memory_context_refusal;
-    server_mod.slot_media_refusal = slot.media_refusal;
+    server_state.slot_memory_context_refusal = slot.memory_context_refusal;
+    server_state.slot_media_refusal = slot.media_refusal;
     if (slot.shutdown_cancelled.load(.acquire)) return error.ServerShutdown;
     if (slot.errorNameIs("MediaRefused")) return error.MediaRefused;
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
@@ -116,10 +119,10 @@ pub const GenErrorWire = struct {
 /// non-streaming arms; streaming arms wrote a bare `server_error` into an SSE frame, so agents
 /// never saw the actionable 400/503. The unknown arm keeps the error name at a mapped 500.
 pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
-    const context_refusal = server_mod.slot_memory_context_refusal;
-    server_mod.slot_memory_context_refusal = null;
-    const media_refusal = server_mod.slot_media_refusal;
-    server_mod.slot_media_refusal = null;
+    const context_refusal = server_state.slot_memory_context_refusal;
+    server_state.slot_memory_context_refusal = null;
+    const media_refusal = server_state.slot_media_refusal;
+    server_state.slot_media_refusal = null;
     return switch (err) {
         // The media encode the prefix restore left to do could not run: the same text and status the
         // connection thread gave before the encode moved behind the restore.
@@ -563,7 +566,7 @@ pub fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, server_mod.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences });
+    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences });
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -700,7 +703,7 @@ pub fn handleNonStreamingGeneration(
             const response = try std.fmt.allocPrint(allocator,
                 \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
             , .{
-                nextCompletionId(&server_mod.completion_id_counter, nowMs(stream.io)),
+                nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
                 nowSecs(stream.io),
                 model_name,
                 tc_content_json,
@@ -780,7 +783,7 @@ pub fn handleNonStreamingGeneration(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
     , .{
-        nextCompletionId(&server_mod.completion_id_counter, nowMs(stream.io)),
+        nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
         nowSecs(stream.io),
         model_name,
         escaped_text,
@@ -1127,7 +1130,7 @@ pub fn handleStreamingGeneration(
     var ve_local = deferred_media;
     defer if (ve_local) |d| d.deinit();
 
-    const chat_id = nextCompletionId(&server_mod.completion_id_counter, nowMs(stream.io));
+    const chat_id = nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io));
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed buffered output is
     // reasoning, never content (mirrors the non-streaming split policy).
@@ -1155,12 +1158,12 @@ pub fn handleStreamingGeneration(
     // ring; this thread reads via `slot.waitNext` through the
     // `StreamingTokenStream.initFromSlot` adapter.
     var slot_handle: ?*scheduler_mod.Slot = null;
-    defer if (slot_handle) |s| server_mod.global_scheduler.?.complete(s);
+    defer if (slot_handle) |s| server_state.global_scheduler.?.complete(s);
 
     // Transfer vision ownership into the slot.
     const slot_ve_s = ve_local;
     ve_local = null;
-    const sch = server_mod.global_scheduler.?;
+    const sch = server_state.global_scheduler.?;
     slot_handle = try sch.submit(.{
         .model = lm,
         .prompt_ids = prompt_ids,
@@ -1309,7 +1312,7 @@ pub fn handleStreamingGeneration(
                     client_gone = true;
                     break;
                 }
-                sendStreamIdle(stream, slot_admission.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
+                sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
@@ -2036,12 +2039,24 @@ test "streaming layout refusal explains MiMo repacking without assuming Qwen" {
     try std.testing.expect(std.mem.indexOf(u8, budget.message, "--ssd-budget-gb") != null);
 }
 
+test "the load refusals list the archs this build serves" {
+    if (arch_packs.gate_order.len != 4) return error.SkipZigTest;
+    try std.testing.expectEqualStrings(
+        "This checkpoint's model_type is not served by this build, which loads qwen4_exp (Qwen3.8-Flash-Next), mimo_v2 (MiMo-V2.6-Flash), glm5_next (GLM-5.3-Flash), and deepseek_v41 (DeepSeek-V4.1-Flash).",
+        loadRefusalFor(error.ArchitectureUnsupported).?.message,
+    );
+    try std.testing.expectEqualStrings(
+        "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (qwen4_exp, mimo_v2, glm5_next or deepseek_v41).",
+        loadRefusalFor(error.ModelFormatUnsupported).?.message,
+    );
+}
+
 pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
     return switch (err) {
         error.NotEnoughMemory => .{ .type = "out_of_memory", .message = not_enough_memory_message },
         error.InsufficientMemory => .{ .type = "out_of_memory", .message = insufficient_free_memory_message },
-        error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads qwen4_exp (Qwen3.8-Flash-Next), mimo_v2 (MiMo-V2.6-Flash), and glm5_next (GLM-5.3-Flash)." },
-        error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (qwen4_exp or mimo_v2)." },
+        error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads " ++ arch_packs.served_list ++ "." },
+        error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (" ++ arch_packs.served_types_or ++ ")." },
         error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --ssd-budget-gb or free memory." },
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
         error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = model_load_mod.budget_required_message },

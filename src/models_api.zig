@@ -1,4 +1,6 @@
 const std = @import("std");
+const request_parse = @import("request_parse.zig");
+const http = @import("http.zig");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
@@ -15,7 +17,8 @@ const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const model_settings = @import("model_settings.zig");
 const metrics = @import("status.zig");
-const qwen4_mod = @import("qwen4/qwen4_exp.zig");
+const arch_serve = @import("arch/serve.zig");
+const arch_flags = @import("arch/flags.zig");
 const update_mod = @import("update.zig");
 const pack_update = @import("pack_update.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -25,6 +28,7 @@ const mtp_plan = @import("mtp_plan.zig");
 const nowSecs = io_util.nowSecs;
 const testing = std.testing;
 const server = @import("server.zig");
+const server_state = @import("server_state.zig");
 const json_text = @import("json_text.zig");
 const disk_placement = @import("disk_placement.zig");
 const http_conn = @import("http_conn.zig");
@@ -36,19 +40,19 @@ const computeMemoryContext = server.computeMemoryContext;
 const defaultEnableMtpForStreaming = server.defaultEnableMtpForStreaming;
 const forceMtpFor = server.forceMtpFor;
 const getEffectiveContextLength = server.getEffectiveContextLength;
-const jsonEscape = server.jsonEscape;
+const jsonEscape = http.jsonEscape;
 const kvCacheFor = server.kvCacheFor;
 const modelQuantizationLabel = server.modelQuantizationLabel;
 const mtpCapable = server.mtpCapable;
 const mtpChoiceFor = server.mtpChoiceFor;
 const nativeMeasuredMoeHead = server.nativeMeasuredMoeHead;
 const optSamplingRecJson = request_policy.optSamplingRecJson;
-const queryModel = server.queryModel;
+const queryModel = request_parse.queryModel;
 const reasoningEffortsJson = request_policy.reasoningEffortsJson;
 const resolvedPrefixCacheMem = server.resolvedPrefixCacheMem;
 const rowSsdBudgetGb = server.rowSsdBudgetGb;
-const sendErrorResponse = server.sendErrorResponse;
-const sendResponse = server.sendResponse;
+const sendErrorResponse = http.sendErrorResponse;
+const sendResponse = http.sendResponse;
 
 pub fn streamingStubMarker(architecture: []const u8, geometry_ok: bool, index_complete: bool) bool {
     return expert_quant.isExpertStreamingArch(architecture) and geometry_ok and index_complete;
@@ -272,9 +276,9 @@ test "a quantized pack loaded resident advertises no streaming, the same pack st
     try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, streamed_row, "\"streaming_required\":true"));
 
     // A ready row names the load's KV scheme and where it came from.
-    const saved_kv = server.configured_kv_quant;
-    defer server.configured_kv_quant = saved_kv;
-    server.configured_kv_quant = null;
+    const saved_kv = server_state.configured_kv_quant;
+    defer server_state.configured_kv_quant = saved_kv;
+    server_state.configured_kv_quant = null;
     const default_row = try renderModelEntry(t.allocator, io, &entry);
     defer t.allocator.free(default_row);
     try t.expect(std.mem.indexOf(u8, default_row, "\"kv_quant\":\"8\",\"kv_cache\":{\"scheme\":\"kv8\",\"source\":\"default\"}") != null);
@@ -604,7 +608,7 @@ pub fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {
     // us; each rendered entry is at most a few hundred bytes. This handler
     // does NOT route through `scheduler.ensureLoaded` — listing metadata
     // shouldn't trigger a cold load of the default model.
-    const registry = server.global_registry orelse {
+    const registry = server_state.global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
         return;
     };
@@ -651,7 +655,7 @@ pub fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {
 /// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
 /// new dirs and clear failed loads (`ModelRegistry.rescan`). Answers `{"added":N}`.
 pub fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
-    const registry = server.global_registry orelse {
+    const registry = server_state.global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
         return;
     };
@@ -786,7 +790,7 @@ const MtpAcceptanceReport = struct {
 
 /// What /props says about acceptance and the greedy tail: on an arch the file's keys do not reach, the file's values are not reported.
 fn mtpAcceptanceReport(config: *const model_mod.ModelConfig) MtpAcceptanceReport {
-    const applies = model_settings.applies("mtp_acceptance", server.settingsFit(config));
+    const applies = model_settings.applies("mtp_acceptance", arch_flags.settingsFit(config));
     return .{
         .acceptance = mtp_plan.mtpAcceptanceFor(if (applies) config.mtp_acceptance_override else null),
         .greedy_tail = mtp_plan.mtpGreedyTailFor(if (applies) config.mtp_greedy_tail_override else null),
@@ -819,9 +823,9 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else "none",
-        .max_concurrent = server.max_concurrent,
+        .max_concurrent = server_state.max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
-        .prefix_cache_ram_enabled = server.prefix_cache_capacity > 0 and server.prefix_cache_ram_enabled,
+        .prefix_cache_ram_enabled = server_state.prefix_cache_capacity > 0 and server_state.prefix_cache_ram_enabled,
         .prefix_cache_disk_bytes = disk.budget,
         .prefix_cache_disk_used_bytes = disk.used,
         .prefix_cache_disk_entries = disk.entries,
@@ -927,7 +931,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
 
     // qwen4 n-gram table warm (F8) — the two module-level atomics are zero
     // whenever no table is warming, so the object is absent off qwen4_exp.
-    const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
+    const ngram_json = try ngramWarmPropsJson(allocator, arch_serve.warmBytes(.acquire), arch_serve.warmTotal(.acquire));
     defer allocator.free(ngram_json);
     const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm), if (lm.config) |c| slot_admission.batchGroupCap(c) else slot_admission.MAX_BATCH_GROUP);
     defer allocator.free(batching_json);
@@ -948,7 +952,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"pack_revision\":{s}", .{ ngram_json, batching_json, settings_json, update_json, fallbacks_json, revision_json });
     defer allocator.free(extra_json);
 
-    const kv_cache_mem: u64 = if (server.global_scheduler) |sch|
+    const kv_cache_mem: u64 = if (server_state.global_scheduler) |sch|
         sch.resident_hot_cache_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
     else
         0;

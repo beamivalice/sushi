@@ -1,4 +1,6 @@
 const std = @import("std");
+const request_parse = @import("request_parse.zig");
+const http = @import("http.zig");
 const json_text = @import("json_text.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -52,32 +54,33 @@ const testing = std.testing;
 const byteTokenizerForTests = tokenizer_mod.byteTokenizerForTests;
 const deinitTestTokenizer = tokenizer_mod.deinitTestTokenizer;
 const server_mod = @import("server.zig");
-const MAX_TOKENS_DESC_LEN = server_mod.MAX_TOKENS_DESC_LEN;
-const SSE_ALLOW_HEADERS_DEFAULT = server_mod.SSE_ALLOW_HEADERS_DEFAULT;
+const server_state = @import("server_state.zig");
+const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
+const SSE_ALLOW_HEADERS_DEFAULT = http.SSE_ALLOW_HEADERS_DEFAULT;
 const admitMtpForCtx = server_mod.admitMtpForCtx;
-const chatIgnoreEosRejectReason = server_mod.chatIgnoreEosRejectReason;
+const chatIgnoreEosRejectReason = request_parse.chatIgnoreEosRejectReason;
 const checkAttentionMemory = server_mod.checkAttentionMemory;
-const countRejected = server_mod.countRejected;
+const countRejected = http.countRejected;
 const defaultEnableMtpForStreaming = server_mod.defaultEnableMtpForStreaming;
 const finishDetailsField = server_mod.finishDetailsField;
 const forceMtpFor = server_mod.forceMtpFor;
 const getEffectiveContextLength = server_mod.getEffectiveContextLength;
 const getTimeoutNs = server_mod.getTimeoutNs;
-const ignoreEosRequested = server_mod.ignoreEosRequested;
-const jsonEscape = server_mod.jsonEscape;
+const ignoreEosRequested = request_parse.ignoreEosRequested;
+const jsonEscape = http.jsonEscape;
 const jsonEscapeOrEmpty = server_mod.jsonEscapeOrEmpty;
-const logHttpSseData = server_mod.logHttpSseData;
+const logHttpSseData = http.logHttpSseData;
 const mtpCapable = server_mod.mtpCapable;
-const nChoicesRejectReason = server_mod.nChoicesRejectReason;
+const nChoicesRejectReason = request_parse.nChoicesRejectReason;
 const nativeMeasuredMoeHead = server_mod.nativeMeasuredMoeHead;
-const parseJsonFloatOpt = server_mod.parseJsonFloatOpt;
-const parseJsonTopKOpt = server_mod.parseJsonTopKOpt;
-const parseKvQuantOverride = server_mod.parseKvQuantOverride;
-const parseRequestSeed = server_mod.parseRequestSeed;
+const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
+const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
+const parseKvQuantOverride = request_parse.parseKvQuantOverride;
+const parseRequestSeed = request_parse.parseRequestSeed;
 const requestBillsMtpHead = server_mod.requestBillsMtpHead;
-const requestCacheKey = server_mod.requestCacheKey;
-const sendErrorResponse = server_mod.sendErrorResponse;
-const sendResponse = server_mod.sendResponse;
+const requestCacheKey = request_parse.requestCacheKey;
+const sendErrorResponse = http.sendErrorResponse;
+const sendResponse = http.sendResponse;
 
 /// vLLM's `ignore_eos`: an EOS id does not end the reply, so it runs to `max_tokens`. Stop
 /// sequences and the loop stops still end it.
@@ -386,7 +389,7 @@ pub fn completeIds(allocator: std.mem.Allocator, lm: *LoadedModel, ids: []const 
     const enable_mtp = admitMtpForCtx(spec_request.mtp, ids.len);
     const spec = requestSpecModes(spec_request.drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
 
-    return nonStreamingViaScheduler(allocator, server_mod.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, ids.len, effective_ctx), sampling, requestEosSlice(config, root), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, 0, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true });
+    return nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, ids.len, effective_ctx), sampling, requestEosSlice(config, root), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, 0, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true });
 }
 
 fn handleNonStreamingCompletion(
@@ -418,7 +421,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = spec.use_drafter;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, server_mod.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special });
+    var result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special });
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -462,7 +465,7 @@ fn handleNonStreamingCompletion(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
     , .{
-        nextCompletionId(&server_mod.completion_id_counter, nowMs(stream.io)),
+        nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
         nowSecs(stream.io),
         model_name,
         escaped_text,
@@ -507,7 +510,7 @@ fn handleStreamingCompletion(
     cache_key: u64,
     kv_quant_override: ?transformer_mod.KVQuantConfig,
 ) !void {
-    const cmpl_id = nextCompletionId(&server_mod.completion_id_counter, nowMs(stream.io));
+    const cmpl_id = nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io));
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
@@ -517,9 +520,9 @@ fn handleStreamingCompletion(
     noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, logprobs_n);
 
     var slot_handle: ?*scheduler_mod.Slot = null;
-    defer if (slot_handle) |s| server_mod.global_scheduler.?.complete(s);
+    defer if (slot_handle) |s| server_state.global_scheduler.?.complete(s);
 
-    const sch = server_mod.global_scheduler.?;
+    const sch = server_state.global_scheduler.?;
     slot_handle = try sch.submit(.{
         .model = lm,
         .prompt_ids = prompt_ids,
@@ -586,7 +589,7 @@ fn handleStreamingCompletion(
                     client_gone = true;
                     break;
                 }
-                sendStreamIdle(stream, slot_admission.queueWait(server_mod.global_scheduler.?, slot_handle.?)) catch {
+                sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     slot_handle.?.cancel();
                     client_gone = true;
@@ -823,10 +826,10 @@ test "completions sampling: the body outranks the launch flag, which outranks th
     try testing.expectEqual(@as(f32, 0.95), gen.top_p);
     try testing.expectEqual(@as(u32, 20), gen.top_k);
 
-    const saved = server_mod.server_config;
-    defer server_mod.server_config = saved;
-    server_mod.server_config.default_temperature = 0.3;
-    server_mod.server_config.default_top_k = 5;
+    const saved = server_state.server_config;
+    defer server_state.server_config = saved;
+    server_state.server_config.default_temperature = 0.3;
+    server_state.server_config.default_top_k = 5;
     const flag = requestSampling(&config, try rootOf(a, "{}"));
     try testing.expectEqual(@as(f32, 0.3), flag.temperature);
     try testing.expectEqual(@as(u32, 5), flag.top_k);

@@ -7,6 +7,8 @@ const spec = @import("spec.zig");
 pub const ExpertStreamTraits = struct {
     /// `--drop-expert` is accepted.
     drop_expert: bool = false,
+    /// `--ssd-prefetch` is accepted: the arch has an expert prefetcher.
+    prefetch: bool = false,
     /// The expert slabs are read tile-major.
     tile_major: bool = false,
 };
@@ -22,8 +24,8 @@ pub fn expertStream(config: *const model.ModelConfig) ExpertStreamTraits {
 test "expert-stream traits per model type and layout" {
     const T = ExpertStreamTraits;
     const rows = [_]struct { model_type: []const u8, layout: @TypeOf(@as(model.ModelConfig, .{}).expert_layout), want: T }{
-        .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .tile_major = true } },
-        .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .tile_major = false } },
+        .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = true } },
+        .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = false } },
         .{ .model_type = "glm5_next", .layout = .exl3_k4, .want = .{} },
         .{ .model_type = "qwen4_exp", .layout = .exl3_k4, .want = .{} },
         .{ .model_type = "mimo_v2", .layout = .exl3_k4, .want = .{} },

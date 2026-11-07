@@ -9,6 +9,8 @@ const expert_stream_mod = @import("expert_stream.zig");
 const model_load = @import("model_load.zig");
 const model_settings_mod = @import("model_settings.zig");
 const server_mod = @import("server.zig");
+const arch_flags = @import("arch/flags.zig");
+const server_state = @import("server_state.zig");
 const hidden_capture = @import("hidden_capture.zig");
 const fp8_block = @import("fp8_block.zig");
 const offline = @import("arch/offline.zig");
@@ -296,7 +298,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     };
     errdefer self.config.deinit(allocator);
     try offline.refuse(&self.config, opts);
-    if (server_mod.archFlagRefusal(&self.config, .{ .drop_expert = opts.drop_expert != 0, .ssd_prefetch = opts.ssd_prefetch != null })) |why| {
+    if (arch_flags.archFlagRefusal(&self.config, .{ .drop_expert = opts.drop_expert != 0, .ssd_prefetch = opts.ssd_prefetch != null })) |why| {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
     }
@@ -908,7 +910,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     if (try offline.tryRun(allocator, io, opts, &out)) return;
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
-    if (opts.wired_margin_bytes > 0) server_mod.wired_limit_margin_bytes = opts.wired_margin_bytes;
+    if (opts.wired_margin_bytes > 0) server_state.wired_limit_margin_bytes = opts.wired_margin_bytes;
     const loaded = try loadModel(io, allocator, opts);
     defer loaded.deinit();
     switch (opts.command) {

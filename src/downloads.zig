@@ -5,6 +5,7 @@
 //! never a connection thread. Partials and the pull manifest stay on disk, so a stopped download resumes when it is
 //! started again, after a restart too. The byte accounting, speed and space rules are in `download_progress.zig`.
 const std = @import("std");
+const http = @import("http.zig");
 const cli = @import("cli.zig");
 const dp = @import("download_progress.zig");
 const pack_update = @import("pack_update.zig");
@@ -15,6 +16,7 @@ const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const http_conn = @import("http_conn.zig");
 const server = @import("server.zig");
+const server_state = @import("server_state.zig");
 
 const Allocator = std.mem.Allocator;
 const Phase = dp.Phase;
@@ -180,7 +182,7 @@ fn destRoot(buf: []u8, io: std.Io) Dest {
     const locks = &model_settings.launch_locks;
     if (locks.models_dir.set) return .{ .path = locks.models_dir.text(), .source = "flag", .locked = true };
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const reg = server.global_registry;
+    const reg = server_state.global_registry;
     const settings_path = if (reg) |r| r.settings_path orelse model_settings.defaultPath(&path_buf) else model_settings.defaultPath(&path_buf);
     var file = model_settings.load(gpa, io, settings_path);
     defer file.deinit();
@@ -196,7 +198,7 @@ fn destRoot(buf: []u8, io: std.Io) Dest {
 fn roots(buf: *[9][]const u8, dest: []const u8) []const []const u8 {
     buf[0] = dest;
     var n: usize = 1;
-    const boot = if (server.global_registry) |r| if (r.discovery) |d| d.roots else &.{} else &.{};
+    const boot = if (server_state.global_registry) |r| if (r.discovery) |d| d.roots else &.{} else &.{};
     for (boot) |r| {
         if (n == buf.len) break;
         if (std.mem.eql(u8, r, buf[0])) continue;
@@ -240,7 +242,7 @@ fn dirBytesIn(io: std.Io, dir: std.Io.Dir, depth: u8) u64 {
 
 /// The id of the loaded (or loading) model served from `path`, or null. Caller holds the registry's mutex.
 fn loadedModelAtLocked(allocator: Allocator, path: []const u8) ?[]u8 {
-    const reg = server.global_registry orelse return null;
+    const reg = server_state.global_registry orelse return null;
     const e = reg.peekByPathLocked(path) orelse return null;
     if (e.state != .ready and e.state != .loading) return null;
     return allocator.dupe(u8, e.id) catch null;
@@ -351,7 +353,7 @@ fn workerLoop(io: std.Io) void {
         const rescan = ok and !stopping;
         unlock();
         // `job` may be dropped from here on: a new start of the same pack replaces a finished one.
-        if (rescan) if (server.global_registry) |r| {
+        if (rescan) if (server_state.global_registry) |r| {
             const added = r.absorbDownload(dest) catch 0;
             log.info("[download] {s} is ready; models rescanned, {d} added\n", .{ repo, added });
         };
@@ -577,7 +579,7 @@ pub fn handleGet(allocator: Allocator, stream: *http_conn.Conn, raw_path: []cons
     }
     const body = try render(allocator, stream.io);
     defer allocator.free(body);
-    try server.sendResponseQuiet(stream, "200 OK", "application/json", body);
+    try http.sendResponseQuiet(stream, "200 OK", "application/json", body);
 }
 
 fn bodyRepo(arena: Allocator, body: []const u8) ?[]const u8 {
@@ -595,9 +597,9 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const asked = bodyRepo(arena, body) orelse
-        return server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"repo\":\"beamster/<repo>\"}", 400);
+        return http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"repo\":\"beamster/<repo>\"}", 400);
     if (!dp.validRepo(cli.HF_ORG, asked))
-        return server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Not a Sushi pack: downloads come from the Hugging Face org beamster only", 400);
+        return http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Not a Sushi pack: downloads come from the Hugging Face org beamster only", 400);
     var size: ?u64 = null;
     const repo = blk: {
         lock();
@@ -607,7 +609,7 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
             size = e.size;
         };
         break :blk try arena.dupe(u8, r);
-    } orelse return server.sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Not a published Sushi pack; Check again refreshes the list", 404);
+    } orelse return http.sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Not a published Sushi pack; Check again refreshes the list", 404);
 
     var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = destRoot(&dest_buf, stream.io).path;
@@ -620,30 +622,30 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
         switch (dp.spaceVerdict(need, v.free, v.total)) {
             .short => {
                 const msg = try std.fmt.allocPrint(arena, "{s} needs {d:.1} GiB; the destination has {d:.1} GiB free and keeps {d:.1} GiB in reserve", .{ repo, gib(need), gib(v.free), gib(dp.reserve(v.total)) });
-                return server.sendErrorResponse(allocator, stream, "507 Insufficient Storage", "insufficient_storage", msg, 507);
+                return http.sendErrorResponse(allocator, stream, "507 Insufficient Storage", "insufficient_storage", msg, 507);
             },
             .low => warning = try std.fmt.allocPrint(arena, "leaves {d:.1} GiB free on the destination", .{gib(v.free - need)}),
             .fits => {},
         }
     };
     // The registry's mutex spans the loaded check and the enqueue: a load checks the queue under it (`load_gate`).
-    const reg = server.global_registry;
+    const reg = server_state.global_registry;
     if (reg) |r| r.mutex.lockUncancelable(r.io);
     const loaded_as = if (installed) |path| loadedModelAtLocked(arena, path) else null;
     const queued = if (loaded_as != null) false else enqueue(stream.io, repo, dest, installed != null);
     if (reg) |r| r.mutex.unlock(r.io);
     if (loaded_as) |id| {
         const msg = try std.fmt.allocPrint(arena, "{s} is loaded as {s}: unload {s} first, then update it", .{ repo, id, id });
-        return server.sendErrorResponse(allocator, stream, "409 Conflict", "model_loaded", msg, 409);
+        return http.sendErrorResponse(allocator, stream, "409 Conflict", "model_loaded", msg, 409);
     }
     const queued_now = queued catch |err| switch (err) {
-        error.ShuttingDown => return server.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "The server is shutting down", 503),
+        error.ShuttingDown => return http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "The server is shutting down", 503),
         else => return err,
     };
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try std.json.Stringify.value(.{ .ok = true, .queued = queued_now, .repo = repo, .dest = dest, .warning = warning }, .{}, &out.writer);
-    try server.sendResponse(stream, "202 Accepted", "application/json", out.written());
+    try http.sendResponse(stream, "202 Accepted", "application/json", out.written());
 }
 
 /// `POST /v1/downloads/cancel {"repo":...}`: the partials stay, so starting it again resumes.
@@ -651,9 +653,9 @@ pub fn handleCancel(allocator: Allocator, stream: *http_conn.Conn, body: []const
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
     const repo = bodyRepo(arena_state.allocator(), body) orelse
-        return server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"repo\":\"beamster/<repo>\"}", 400);
-    if (!cancel(repo)) return server.sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No download of that pack is queued or running", 404);
-    try server.sendResponse(stream, "200 OK", "application/json", "{\"ok\":true}");
+        return http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"repo\":\"beamster/<repo>\"}", 400);
+    if (!cancel(repo)) return http.sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No download of that pack is queued or running", 404);
+    try http.sendResponse(stream, "200 OK", "application/json", "{\"ok\":true}");
 }
 
 const testing = std.testing;

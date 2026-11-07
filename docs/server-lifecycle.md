@@ -129,7 +129,14 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   alone, its I/O workers ran on in freed memory. Guard: a FailingAllocator sweep over `initExpertStream` with the
   imatrix collector armed.
 
-- **Bind**: `server.resolveBind` takes `--port`, else `server.port` of `model-settings.json`, else `127.0.0.1:12345`; `--host` takes an IPv4 literal, `0.0.0.0` or
+- **Process globals**: every launch value the handlers, bills and scheduler read (`server_config`, `g_api_key`,
+  `global_scheduler`, `global_registry`, `configured_mtp`, `configured_kv_quant`, the `prefix_cache_*` set, the SSD
+  permit, the SSM checkpoint stride and cap, `max_concurrent`, the wired margin, the per-thread refusal slots) lives in
+  `src/server_state.zig`. A Zig `var` cannot be re-exported, so a reader names `server_state`, never `server`.
+  `server.zig` keeps `serve`, `handleConnection` and the handlers; `src/http.zig` is the transport (bind, response
+  writers, the debug body log, `sendErrorResponse`, `jsonEscape`) and `src/request_parse.zig` reads a request (model id,
+  seed, cache key, content parts, tool definitions); both run in the host tier.
+- **Bind**: `http.resolveBind` takes `--port`, else `server.port` of `model-settings.json`, else `127.0.0.1:12345`; `--host` takes an IPv4 literal, `0.0.0.0` or
   `localhost` (= 127.0.0.1; anything else is refused by name, never widened). Before any model loads,
   `ensurePortFree` probes the address with a connect AND a bind, so a listener or a bound-but-silent socket both refuse
   with "port N is already in use"; the listener binds with SO_REUSEADDR only, so a racing second sushi fails its bind
@@ -137,8 +144,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (the registry's list of every
   registered type, `-Darchs` or not: `qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`) by name
   (`ArchitectureUnsupported` → 503). A registered type the build left out keeps its name in the refusal; the text lists
-  the enabled archs in `gate_rank` order. A checkpoint in an unsupported file format is refused by name
-  (`ModelFormatUnsupported` → 503; `--model` exits). A served arch off the supported list (MiMo, from 1.5.1) sets
+  the enabled archs in `gate_rank` order, each with its pack family from its `packs` slot. A checkpoint in an
+  unsupported file format is refused by name (`ModelFormatUnsupported` → 503; `--model` exits); that text lists the
+  enabled archs' types. A served arch off the supported list (MiMo, from 1.5.1) sets
   `ModelConfig.unsupported_note` at parse, and the server logs that `[load]` warning on every load.
 - The pack-revision check is the first thing `loadWeightsForConfig` does after the arch gate, for every arch: a config
   that names `pack_revision` and a shard (MTP shards included) that carries another revision or none is refused

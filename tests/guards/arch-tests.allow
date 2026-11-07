@@ -219,7 +219,6 @@ qwen4ExpOomConfig does not leak qsa_score_fused_override
 qwen4MtpResetOwned: a non-MTP request leaves the head untouched
 qwen4RequestTestConfig does not leak qsa_score_fused_override
 qwen: a checkpoint's 16.7 Mpx bound is clamped to what the ViT can attend
-qwenGdnLine: --qwen-gdn 16 is reported per arch, and has no effect where there is no GDN arm
 real Qwen pack loaded through ChatConfig keeps late notes in place
 real mimo_v2 original checkpoint discovers complete streamed expert headers
 real mimo_v2 template is the committed fixture

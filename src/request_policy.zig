@@ -1,4 +1,6 @@
 const std = @import("std");
+const request_parse = @import("request_parse.zig");
+const http = @import("http.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
@@ -15,28 +17,30 @@ const sampler = @import("sampler.zig");
 const think_penalty = @import("think_penalty.zig");
 const testing = std.testing;
 const server = @import("server.zig");
+const server_state = @import("server_state.zig");
 const http_conn = @import("http_conn.zig");
 const generation_stream = @import("generation_stream.zig");
 const Conn = http_conn.Conn;
-const MAX_TOKENS_DESC_LEN = server.MAX_TOKENS_DESC_LEN;
+const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
 const StreamMode = generation_stream.StreamMode;
 const atomicTokenId = server.atomicTokenId;
 const autoBudgetWindowTight = server.autoBudgetWindowTight;
-const chatTemplateKwargBool = server.chatTemplateKwargBool;
-const clampJsonI32 = server.clampJsonI32;
-const jsonEscape = server.jsonEscape;
-const parseJsonFloatOpt = server.parseJsonFloatOpt;
+const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
+const clampJsonI32 = request_parse.clampJsonI32;
+const jsonEscape = http.jsonEscape;
+const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseOnOff = server.parseOnOff;
-const parseRequestSeed = server.parseRequestSeed;
+const parseRequestSeed = request_parse.parseRequestSeed;
 const pickStreamMode = generation_stream.pickStreamMode;
 const prefillRequestTerms = server.prefillRequestTerms;
 const promptOpensThink = server.promptOpensThink;
-const qsaScoreFusedOffGuard = server.qsaScoreFusedOffGuard;
-const qwen4ExpOomConfig = server.qwen4ExpOomConfig;
+const fixtures = @import("bills_fixtures_test.zig");
+const qsaScoreFusedOffGuard = fixtures.qsaScoreFusedOffGuard;
+const qwen4ExpOomConfig = fixtures.qwen4ExpOomConfig;
 const renderConfigFor = server.renderConfigFor;
 const requestSpecModes = generation_stream.requestSpecModes;
 const sendAnthropicError = @import("anthropic.zig").sendAnthropicError;
-const sendErrorResponse = server.sendErrorResponse;
+const sendErrorResponse = http.sendErrorResponse;
 
 /// Sampling-default resolution chain: request body > CLI launch flag >
 /// model generation_config.json > hardcoded fallback. An explicit request
@@ -47,15 +51,15 @@ pub fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config
 
 /// The sampler values a request that omits them gets on this model; `request` is the body's own value.
 pub fn samplingTemperature(config: *const model_mod.ModelConfig, request: ?f32) f32 {
-    return resolveSamplingDefault(f32, request, server.server_config.default_temperature, config.gen_temperature, 1.0);
+    return resolveSamplingDefault(f32, request, server_state.server_config.default_temperature, config.gen_temperature, 1.0);
 }
 
 pub fn samplingTopP(config: *const model_mod.ModelConfig, request: ?f32) f32 {
-    return resolveSamplingDefault(f32, request, server.server_config.default_top_p, config.gen_top_p, 1.0);
+    return resolveSamplingDefault(f32, request, server_state.server_config.default_top_p, config.gen_top_p, 1.0);
 }
 
 pub fn samplingTopK(config: *const model_mod.ModelConfig, request: ?u32) u32 {
-    return resolveSamplingDefault(u32, request, server.server_config.default_top_k, config.gen_top_k, 0);
+    return resolveSamplingDefault(u32, request, server_state.server_config.default_top_k, config.gen_top_k, 0);
 }
 
 /// The in-stream thinking bound needs atomic think markers.
@@ -126,7 +130,7 @@ pub fn filledMaxTokens(config: *const model_mod.ModelConfig) u32 {
 
 /// The one read of `ServerConfig.default_max_tokens`. 0 = flag not given.
 pub fn launchMaxTokensDefault() u32 {
-    return server.server_config.default_max_tokens;
+    return server_state.server_config.default_max_tokens;
 }
 
 /// Resolve a request's `max_tokens` (or its aliases) to an effective cap.
@@ -713,9 +717,9 @@ test "parseJsonFloat handles integer value" {
 }
 
 test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-size)" {
-    const original = server.server_config.max_context_size;
-    defer server.server_config.max_context_size = original;
-    server.server_config.max_context_size = 0; // auto: the old code never clamped here
+    const original = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = original;
+    server_state.server_config.max_context_size = 0; // auto: the old code never clamped here
 
     // 4096-token window, 4000-token prompt -> only 96 tokens of generation left.
     try testing.expectEqual(@as(u32, 96), clampMaxTokens(8192, 4000, 4096));
@@ -729,13 +733,13 @@ test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-s
 }
 
 test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback otherwise" {
-    const original = server.server_config.max_context_size;
-    defer server.server_config.max_context_size = original;
+    const original = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = original;
 
     // OpenAI semantics: omitted max_tokens = generate until EOS bounded by the
     // context window. The old fixed 256 default broke agent clients (pi) whose
     // thinking-enabled turns hit `length` mid-reasoning on EVERY request.
-    server.server_config.max_context_size = 32768;
+    server_state.server_config.max_context_size = 32768;
     const sentinel = omittedMaxTokensDefault(&model_mod.ModelConfig{});
     // Big enough that clampMaxTokens (the downstream bound) always wins…
     try testing.expect(sentinel > 32768);
@@ -744,7 +748,7 @@ test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback 
 
     // ctx unknown (max_context_size=0): clampMaxTokens won't bound anything,
     // so the default itself must stay finite.
-    server.server_config.max_context_size = 0;
+    server_state.server_config.max_context_size = 0;
     try testing.expectEqual(@as(u32, 4096), omittedMaxTokensDefaultWith(0, 0, 0));
 }
 
@@ -782,7 +786,7 @@ test "--max-tokens is the omitted-field default: unset is byte-identical, set wi
     try t.expectEqual(@as(u32, 65536), resolveRequestMaxTokens(.{ .integer = 0 }, auto));
 
     // The live wrapper reads the ServerConfig field through the one accessor.
-    const slot = &@field(server.server_config, "default_max_tokens");
+    const slot = &@field(server_state.server_config, "default_max_tokens");
     const orig = slot.*;
     defer slot.* = orig;
     slot.* = 0;
@@ -819,7 +823,7 @@ test "an omitted max_tokens: --max-tokens, else the architecture's own default, 
     try t.expectEqualStrings("256000 (model default)", describeMaxTokens(&buf, 256_000, .model_default));
 
     // The live wrapper reads the flag and the model's own default.
-    const slot = &@field(server.server_config, "default_max_tokens");
+    const slot = &@field(server_state.server_config, "default_max_tokens");
     const orig = slot.*;
     defer slot.* = orig;
     slot.* = 0;
@@ -836,7 +840,7 @@ test "an omitted max_tokens: --max-tokens, else the architecture's own default, 
 
 test "an omitted max_tokens: --max-tokens, else the model's max_tokens setting, else the architecture's default, else the window" {
     const t = std.testing;
-    const slot = &@field(server.server_config, "default_max_tokens");
+    const slot = &@field(server_state.server_config, "default_max_tokens");
     const orig = slot.*;
     defer slot.* = orig;
     slot.* = 0;
@@ -930,35 +934,35 @@ test "an omitted max_tokens reserves the LAUNCH default, not the whole window" {
 }
 
 test "clampMaxTokens no limit when ctx_size=0" {
-    const original = server.server_config.max_context_size;
-    defer server.server_config.max_context_size = original;
-    server.server_config.max_context_size = 0;
+    const original = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = original;
+    server_state.server_config.max_context_size = 0;
 
     try testing.expectEqual(@as(u32, 1000), clampMaxTokens(1000, 500, 0));
 }
 
 test "clampMaxTokens clamps when would exceed" {
-    const original = server.server_config.max_context_size;
-    defer server.server_config.max_context_size = original;
-    server.server_config.max_context_size = 4096;
+    const original = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = original;
+    server_state.server_config.max_context_size = 4096;
 
     // prompt=3000, max_tokens=2000 → clamp to 1096
     try testing.expectEqual(@as(u32, 1096), clampMaxTokens(2000, 3000, 4096));
 }
 
 test "clampMaxTokens no clamp when fits" {
-    const original = server.server_config.max_context_size;
-    defer server.server_config.max_context_size = original;
-    server.server_config.max_context_size = 4096;
+    const original = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = original;
+    server_state.server_config.max_context_size = 4096;
 
     // prompt=100, max_tokens=200 → fits, no clamp
     try testing.expectEqual(@as(u32, 200), clampMaxTokens(200, 100, 4096));
 }
 
 test "clampMaxTokens at boundary" {
-    const original = server.server_config.max_context_size;
-    defer server.server_config.max_context_size = original;
-    server.server_config.max_context_size = 4096;
+    const original = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = original;
+    server_state.server_config.max_context_size = 4096;
 
     // prompt=4096 → only 1 token allowed
     try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4096, 4096));
@@ -1443,7 +1447,7 @@ test "thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo
 
 test "the sampler values an omitted field gets: launch flag, else the model's generation_config, else the fallback" {
     const t = std.testing;
-    const cfg_slot = &server.server_config;
+    const cfg_slot = &server_state.server_config;
     const saved = .{ cfg_slot.default_temperature, cfg_slot.default_top_p, cfg_slot.default_top_k };
     defer {
         cfg_slot.default_temperature, cfg_slot.default_top_p, cfg_slot.default_top_k = saved;
