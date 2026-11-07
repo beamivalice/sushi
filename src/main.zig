@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const http = @import("http.zig");
 const build_options = @import("build_options");
 // pub: src/exl3 reaches mlx, log and io_util through its host root.
@@ -254,12 +255,11 @@ pub fn main(init: std.process.Init) !void {
     var tool_flag_given = false;
     var prompt: ?[]const u8 = null;
     var max_tokens: u32 = 100;
-    var temperature: f32 = 0.0;
     // Serve-mode sampling defaults for requests that omit the field
     // (request > flag > model generation_config.json > hardcoded). `--temp`
     // doubles as the offline --prompt sampling temp, so track whether it was
     // explicitly given — only then does it become the serve default.
-    var temp_explicit = false;
+    var temp_flag: ?f32 = null;
     var top_p_flag: ?f32 = null;
     var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
@@ -268,25 +268,20 @@ pub fn main(init: std.process.Init) !void {
     var vision = false;
     var drafter_dir: ?[]const u8 = null; // Path to a DFlash2 assistant checkpoint
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
-    var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
-    // --mtp: force the head ON where requests do not default to it: an SSD-streamed
-    // pack and inherited MoE arches (server.defaultEnableMtp).
-    var force_mtp = false;
-    // Either flag given: it outranks the per-model `mtp` (the last one wins).
-    var mtp_explicit = false;
+    // `--mtp` / `--no-mtp`, the last one given. `--mtp` also forces the head on where requests do not default to
+    // it: an SSD-streamed pack and inherited MoE arches (server.defaultEnableMtp).
+    var mtp_flag: ?bool = null;
     var mtp_typical_raw: ?[]const u8 = null;
     var mtp_tokenv3_raw: ?[]const u8 = null;
-    var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default;
-    var kv_quant_explicit = false;
+    var kv_quant_flag: ?transformer_mod.KVQuantConfig = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running small models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
     var max_resident_models: u32 = 3;
-    var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
-    var max_resident_mem_explicit: bool = false;
+    var max_resident_mem_flag: ?u64 = null; // null = auto (80% of wired limit at startup)
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = true;
-    var log_level_explicit = false;
+    var log_level_flag: ?log.Level = null;
     var decode_share_flag: ?[]const u8 = null;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
@@ -372,8 +367,7 @@ pub fn main(init: std.process.Init) !void {
             serve_default_max_tokens = max_tokens;
         } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
             i += 1;
-            temperature = flagFloat("--temp", args[i]);
-            temp_explicit = true;
+            temp_flag = flagFloat("--temp", args[i]);
         } else if (std.mem.eql(u8, args[i], "--top-p") and i + 1 < args.len) {
             i += 1;
             top_p_flag = flagFloat("--top-p", args[i]);
@@ -456,13 +450,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-drafter")) {
             no_drafter = true;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
-            enable_mtp = false;
-            force_mtp = false;
-            mtp_explicit = true;
+            mtp_flag = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
-            enable_mtp = true;
-            force_mtp = true;
-            mtp_explicit = true;
+            mtp_flag = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             i += 1;
@@ -479,7 +469,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             mtp_tokenv3_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--mtp-greedy-tail")) {
-            generate_mod.mtp_greedy_tail_explicit = true;
+            settings_resolve.launch.mtp_greedy_tail = true;
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = flagInt(u32, "--max-mtp-ctx", args[i], 0);
@@ -490,7 +480,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             log.setLevel(level);
-            log_level_explicit = true;
+            log_level_flag = level;
         } else if (std.mem.eql(u8, args[i], "--log-file") and i + 1 < args.len) {
             i += 1;
             log_file_arg = args[i];
@@ -506,8 +496,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
             i += 1;
             // `explicit` disables the machine-sized pin, so only a real width earns it.
-            generate_mod.prefill_chunk_override = flagInt(usize, "--prefill-chunk", args[i], 1);
-            generate_mod.prefill_chunk_explicit = true;
+            settings_resolve.prefill_chunk = .{ .value = flagInt(usize, "--prefill-chunk", args[i], 1), .source = .flag };
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_state.prefix_cache_capacity = flagInt(u32, "--prefix-cache-entries", args[i], 0);
@@ -520,7 +509,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-            server_state.prefix_cache_mem_explicit = true;
+            server_state.prefix_cache_mem_source = .flag;
             server_state.prefix_cache_ram_enabled = server_state.ramRetentionForMemArg(server_state.prefix_cache_mem_bytes);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
@@ -532,7 +521,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-            server_state.prefix_cache_disk_explicit = true;
+            server_state.prefix_cache_disk_source = .flag;
         } else if (std.mem.eql(u8, args[i], "--think-penalty") and i + 1 < args.len) {
             i += 1;
             const lambda = std.fmt.parseFloat(f32, args[i]) catch -1;
@@ -596,13 +585,12 @@ pub fn main(init: std.process.Init) !void {
             // (or default 0) → 80% of mlx_set_wired_limit at server start.
             i += 1;
             if (std.mem.eql(u8, args[i], "auto")) {
-                max_resident_mem = 0;
+                if (max_resident_mem_flag != null) max_resident_mem_flag = 0;
             } else {
-                max_resident_mem = parseSizeArg(args[i]) catch {
+                max_resident_mem_flag = parseSizeArg(args[i]) catch {
                     log.err("--max-resident-mem: expected '<n>{{MB,GB,KB}}' or 'auto'; got '{s}'\n", .{args[i]});
                     std.process.exit(1);
                 };
-                max_resident_mem_explicit = true;
             }
         } else if (std.mem.eql(u8, args[i], "--gpu-warm-secs") and i + 1 < args.len) {
             i += 1;
@@ -619,8 +607,7 @@ pub fn main(init: std.process.Init) !void {
             idle_evict_secs = if (n > 0) n else null;
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
-            kv_quant_explicit = true;
-            kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
+            kv_quant_flag = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
                 log.err("--kv-quant: expected one of {{16, 8, 6, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -695,17 +682,18 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
+    const acceptance_flag = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
         log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-tokenv3 needs 0 <= a <= 1; choose one)\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    generate_mod.mtp_acceptance_explicit = mtp_typical_raw != null or mtp_tokenv3_raw != null;
+    if (mtp_typical_raw != null or mtp_tokenv3_raw != null) settings_resolve.launch.mtp_acceptance = acceptance_flag;
+    const temperature: f32 = temp_flag orelse 0.0;
     var acceptance_flag_buf: [128]u8 = undefined;
     pinLaunchFlags(.{
         .mtp_acceptance_flag = model_settings_mod.acceptanceFlagText(&acceptance_flag_buf, mtp_typical_raw, mtp_tokenv3_raw),
         .ctx_size = ctx_size,
-        .kv_quant = if (kv_quant_explicit) kv_quant_config.wireName() else null,
-        .mtp = if (mtp_explicit) enable_mtp else null,
+        .kv_quant = if (kv_quant_flag) |q| q.wireName() else null,
+        .mtp = mtp_flag,
         .vision = if (vision) true else if (no_vision) false else null,
         .models_dir = models_root,
         .no_update_check = no_update_check,
@@ -772,10 +760,9 @@ pub fn main(init: std.process.Init) !void {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
         defer file.deinit();
-        if (!server_state.prefix_cache_disk_explicit) if (model_settings_mod.server(&file).prefix_cache_disk_gb) |gb| {
+        if (server_state.prefix_cache_disk_source == .default) if (model_settings_mod.server(&file).prefix_cache_disk_gb) |gb| {
             server_state.prefix_cache_disk_bytes = @as(u64, gb) << 30;
-            server_state.prefix_cache_disk_explicit = true;
-            server_state.prefix_cache_disk_from_file = true;
+            server_state.prefix_cache_disk_source = .model_settings;
             log.info("[model-settings] server.prefix_cache_disk_gb {d} sets the SSD prefix cache budget\n", .{gb});
         };
     }
@@ -783,7 +770,7 @@ pub fn main(init: std.process.Init) !void {
     // `sushi run` on a TTY quiets logs to warn (unless --log-level was
     // given) BEFORE the models-root scan below — discovery's per-directory
     // `[discovery] skip …` info lines would otherwise spam the chat REPL.
-    if (repl_after_serve and !log_level_explicit) log.setLevel(.warn);
+    if (repl_after_serve and log_level_flag == null) log.setLevel(.warn);
 
     // Persist the server log. The macOS app only keeps stderr in a 64 KB
     // in-memory ring, so a server that crashed or was restarted takes its
@@ -919,7 +906,7 @@ pub fn main(init: std.process.Init) !void {
         .ctx_size = ctx_size,
         .timeout = timeout,
         .max_tokens = serve_default_max_tokens,
-        .temperature = if (temp_explicit) temperature else null,
+        .temperature = temp_flag,
         .top_p = top_p_flag,
         .top_k = top_k_flag,
     };
@@ -942,11 +929,11 @@ pub fn main(init: std.process.Init) !void {
             sleep_inhibit_mod.isEnabled(),
         });
     }
-    if (!kv_quant_explicit) {
-        log.info("[args] kv-quant: model default (resolved at load)\n", .{});
-    } else switch (kv_quant_config.scheme) {
+    if (kv_quant_flag) |kv| switch (kv.scheme) {
         .off => log.info("[args] kv-quant: off\n", .{}),
-        .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
+        .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv.bits, kv.group_size }),
+    } else {
+        log.info("[args] kv-quant: model default (resolved at load)\n", .{});
     }
 
     // Set GPU as default
@@ -972,7 +959,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, launch_serve, drafter_dir orelse "", no_drafter, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, kv_quant_explicit, enable_mtp, mtp_explicit);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, launch_serve, drafter_dir orelse "", no_drafter, max_resident_models, max_resident_mem_flag, idle_evict_secs, kv_quant_flag, mtp_flag);
             return;
         }
     }
@@ -1116,19 +1103,7 @@ pub fn main(init: std.process.Init) !void {
         // for sustained GPU work). The wired limit was already applied in
         // the inference thread's load path; here we mirror that calculation
         // so the registry's eviction gate stays in sync. 0 disables the cap.
-        const effective_max_resident_mem: u64 = if (max_resident_mem_explicit)
-            max_resident_mem
-        else blk: {
-            var dev = mlx.mlx_device{ .ctx = null };
-            _ = mlx.mlx_get_default_device(&dev);
-            defer _ = mlx.mlx_device_free(dev);
-            var info = mlx.mlx_device_info_new();
-            defer _ = mlx.mlx_device_info_free(info);
-            if (mlx.mlx_device_info_get(&info, dev) != 0) break :blk 0;
-            var max_rec: usize = 0;
-            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) break :blk 0;
-            break :blk @as(u64, max_rec) * 4 / 5;
-        };
+        const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_flag);
         if (effective_max_resident_mem > 0) {
             log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
                 max_resident_models,
@@ -1147,7 +1122,7 @@ pub fn main(init: std.process.Init) !void {
             idle_evict_secs,
         );
         defer registry.deinit();
-        registry.mem_cap_binds_alone = max_resident_mem_explicit;
+        registry.mem_cap_binds_alone = max_resident_mem_flag != null;
 
         // Register the loaded model. Use the pre-registered discovery entry
         // when available (so id/path/bytes_on_disk are consistent across
@@ -1184,13 +1159,11 @@ pub fn main(init: std.process.Init) !void {
             .ctx_size = ctx_size,
             .drafter_dir = drafter_dir orelse "",
             .no_drafter = no_drafter,
-            .mtp_enabled = enable_mtp,
-            .mtp_explicit = mtp_explicit,
+            .mtp = mtp_flag,
             .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
             .mtp_depth = depth_bounds.active.max,
             .load_vision = load_vision,
-            .kv_quant_config = kv_quant_config,
-            .kv_quant_explicit = kv_quant_explicit,
+            .kv_quant = kv_quant_flag,
             .prefix_cache_capacity = server_state.prefix_cache_capacity,
             .prefix_cache_ram_enabled = server_state.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = server_state.prefix_cache_mem_bytes,
@@ -1207,7 +1180,7 @@ pub fn main(init: std.process.Init) !void {
         var serve_cfg = launch_serve.serverConfig();
         serve_cfg.on_ready = if (prompt != null) PromptClient.ready else null;
         serve_cfg.embedded_client = if (bench_run != null) bench_mod.embeddedClient else null;
-        serve_cfg.default_force_mtp = force_mtp;
+        serve_cfg.default_force_mtp = mtp_flag == true;
         try server_mod.serve(io, allocator, params, config, host, port, serve_cfg);
         if (prompt_state.err) |err| return err;
         if (bench_run) |r| if (r.err) |err| return err;
@@ -1237,9 +1210,9 @@ pub fn main(init: std.process.Init) !void {
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
-        const kv_cache = server_mod.kvCacheForLaunch(config, kv_quant_config, kv_quant_explicit);
+        const kv_cache = server_mod.kvCacheForLaunch(config, kv_quant_flag);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
-        const mtp_choice = model_load.mtpChoiceFor(enable_mtp, mtp_explicit, config);
+        const mtp_choice = model_load.mtpChoiceFor(mtp_flag, config);
         log.info("[mtp] {s} ({s})\n", .{ mtp_choice.label(), mtp_choice.sourceName() });
         if (kv_cache.config.scheme != .off) {
             try xfm.cache.reinit(config.num_hidden_layers, kv_cache.config);
@@ -1340,8 +1313,8 @@ const isGgufPath = model_discovery.isGgufModelPath;
 /// Registry resident-memory cap: the user's explicit value, or 80% of mlx's
 /// wired limit at startup (mirrors the MLX serve block). 0 = query failed →
 /// unlimited (the count cap still applies).
-fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
-    if (explicit) return val;
+fn autoResidentMemBytes(flag: ?u64) u64 {
+    if (flag) |bytes| return bytes;
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
     defer _ = mlx.mlx_device_free(dev);
@@ -1390,13 +1363,10 @@ fn runHeadlessServe(
     drafter_dir: []const u8,
     no_drafter: bool,
     max_resident_models: u32,
-    max_resident_mem: u64,
-    max_resident_mem_explicit: bool,
+    max_resident_mem_flag: ?u64,
     idle_evict_secs: ?u32,
-    kv_quant_config: transformer_mod.KVQuantConfig,
-    kv_quant_explicit: bool,
-    enable_mtp: bool,
-    mtp_explicit: bool,
+    kv_quant_flag: ?transformer_mod.KVQuantConfig,
+    mtp_flag: ?bool,
 ) !void {
     log.info("sushi {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1404,7 +1374,7 @@ fn runHeadlessServe(
     var stub = try model_load.headlessStubCpuState(allocator);
     defer model_load.freeCpuState(allocator, &stub);
 
-    const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
+    const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_flag);
     if (effective_max_resident_mem > 0) {
         log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{ max_resident_models, @as(f64, @floatFromInt(effective_max_resident_mem)) / 1_073_741_824.0 });
     } else {
@@ -1413,7 +1383,7 @@ fn runHeadlessServe(
 
     const registry = try model_registry_mod.ModelRegistry.init(allocator, io, discovery, max_resident_models, effective_max_resident_mem, idle_evict_secs);
     defer registry.deinit();
-    registry.mem_cap_binds_alone = max_resident_mem_explicit;
+    registry.mem_cap_binds_alone = max_resident_mem_flag != null;
 
     // Carrier entry for LoadParams (required field), never loaded here
     // (`no_initial_load`). Prefer a discovered stub (so it's listed in
@@ -1463,10 +1433,8 @@ fn runHeadlessServe(
         .no_initial_load = true,
         .load_vision = false,
         .warmup_eager = false,
-        .kv_quant_config = kv_quant_config,
-        .kv_quant_explicit = kv_quant_explicit,
-        .mtp_enabled = enable_mtp,
-        .mtp_explicit = mtp_explicit,
+        .kv_quant = kv_quant_flag,
+        .mtp = mtp_flag,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         // Seed the scheduler's prefix-cache config from the server globals so
         // on-demand (headless/discover-mode) loads get the SAME hot prefix
@@ -1489,9 +1457,9 @@ fn runHeadlessServe(
     };
 
     var serve_cfg = launch_serve.serverConfig();
-    // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
-    // defaults true), so the MoE force flag has to reach this path too.
-    serve_cfg.default_force_mtp = enable_mtp and mtp_explicit;
+    // On-demand MLX loads auto-attach an MTP sidecar (MTP is on unless a flag or the
+    // file says off), so the MoE force flag has to reach this path too.
+    serve_cfg.default_force_mtp = mtp_flag == true;
     try server_mod.serve(io, allocator, params, stub.config, host, port, serve_cfg);
 }
 
@@ -1516,14 +1484,14 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
     if (given.mtp) |m| locks.modelMut("mtp").pin("{s}", .{if (m) "on" else "off"});
     if (given.mtp_acceptance_flag) |f| locks.modelMut("mtp_acceptance").pin("{s}", .{f});
-    if (generate_mod.mtp_greedy_tail_explicit) locks.modelMut("mtp_greedy_tail").pin("--mtp-greedy-tail", .{});
+    if (settings_resolve.launch.mtp_greedy_tail != null) locks.modelMut("mtp_greedy_tail").pin("--mtp-greedy-tail", .{});
     if (ssd_budget_bytes != 0) locks.modelMut("ssd_budget_gb").pin("{d}", .{ssd_budget_bytes >> 30});
     if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
-    if (server_state.prefix_cache_disk_explicit) {
+    if (server_state.prefix_cache_disk_source != .default) {
         var size_buf: [32]u8 = undefined;
         locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_state.prefix_cache_disk_bytes)});
     }

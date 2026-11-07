@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
-const model_settings = @import("model_settings.zig");
+const settings_resolve = @import("settings_resolve.zig");
 
 /// KV-cache storage scheme.
 ///   * `off`      — dense bf16.
@@ -107,14 +107,13 @@ pub fn unpackedDim(words: c_int, bits: u8) c_int {
 }
 
 /// The KV scheme a load stores at, with its provenance: `--kv-quant` > per-model setting >
-/// `KVQuantConfig.engine_default`. `launch` is the flag's value, or the default when unflagged.
-/// A request's own `kv_quant` outranks all of them.
+/// `KVQuantConfig.engine_default`. A request's own `kv_quant` outranks all of them.
 pub const KvCacheChoice = struct {
     config: KVQuantConfig,
-    source: model_settings.Source,
+    source: settings_resolve.Source,
 
-    pub fn resolve(setting: ?KVQuantConfig, launch: KVQuantConfig, launch_explicit: bool) KvCacheChoice {
-        const p = model_settings.pick(KVQuantConfig, model_settings.launchFlag(KVQuantConfig, launch, launch_explicit), setting, launch);
+    pub fn resolve(flag: ?KVQuantConfig, file: ?KVQuantConfig) KvCacheChoice {
+        const p = settings_resolve.resolve(KVQuantConfig, flag, file, KVQuantConfig.engine_default);
         return .{ .config = p.value, .source = p.source };
     }
 
@@ -130,7 +129,7 @@ pub const KvCacheChoice = struct {
     }
 
     pub fn sourceName(self: KvCacheChoice) []const u8 {
-        return model_settings.sourceLabel(self.source, "--kv-quant");
+        return settings_resolve.sourceLabel(self.source, "--kv-quant");
     }
 };
 
@@ -399,17 +398,17 @@ test "kv6 round-trip error sits between kv4 and kv8" {
 test "a load's KV choice: --kv-quant > setting > the kv8 default, each named by its source" {
     const t = std.testing;
     try t.expectEqual(KVQuantConfig.affine(8), KVQuantConfig.engine_default);
-    const unflagged = KvCacheChoice.resolve(null, KVQuantConfig.engine_default, false);
+    const unflagged = KvCacheChoice.resolve(null, null);
     try t.expectEqual(KVQuantConfig.affine(8), unflagged.config);
     try t.expectEqualStrings("kv8", unflagged.label());
     try t.expectEqualStrings("default", unflagged.sourceName());
-    const flagged = KvCacheChoice.resolve(null, KVQuantConfig.affine(4), true);
+    const flagged = KvCacheChoice.resolve(KVQuantConfig.affine(4), null);
     try t.expectEqualStrings("kv4", flagged.label());
     try t.expectEqualStrings("--kv-quant", flagged.sourceName());
-    const flag_wins = KvCacheChoice.resolve(KVQuantConfig.dense, KVQuantConfig.affine(4), true);
+    const flag_wins = KvCacheChoice.resolve(KVQuantConfig.affine(4), KVQuantConfig.dense);
     try t.expectEqual(KVQuantConfig.affine(4), flag_wins.config);
     try t.expectEqualStrings("--kv-quant", flag_wins.sourceName());
-    const set = KvCacheChoice.resolve(KVQuantConfig.dense, KVQuantConfig.engine_default, false);
+    const set = KvCacheChoice.resolve(null, KVQuantConfig.dense);
     try t.expectEqual(KVQuantConfig.dense, set.config);
     try t.expectEqualStrings("off", set.label());
     try t.expectEqualStrings("model-settings.json", set.sourceName());
@@ -429,12 +428,12 @@ test "KVQuantConfig.affine builds a sane config" {
 }
 
 test "every model, GLM included, defaults to kv8 and 16 selects BF16" {
-    const choice = KvCacheChoice.resolve(null, KVQuantConfig.engine_default, false);
+    const choice = KvCacheChoice.resolve(null, null);
     try std.testing.expectEqual(KVQuantConfig.affine(8), choice.config);
     try std.testing.expectEqualStrings("default", choice.sourceName());
     try std.testing.expectEqual(KVQuantConfig.dense, KVQuantConfig.fromJsonValue(.{ .string = "16" }).?);
     try std.testing.expectEqual(KVQuantConfig.dense, KVQuantConfig.fromJsonValue(.{ .integer = 16 }).?);
-    try std.testing.expectEqual(KVQuantConfig.dense, KvCacheChoice.resolve(null, KVQuantConfig.fromJsonValue(.{ .string = "16" }).?, true).config);
+    try std.testing.expectEqual(KVQuantConfig.dense, KvCacheChoice.resolve(KVQuantConfig.fromJsonValue(.{ .string = "16" }).?, null).config);
 }
 
 test "GLM latent stores BF16, kv8 or kv6 and names kv4 unsupported" {

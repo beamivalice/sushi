@@ -437,8 +437,7 @@ test "every GLM slot owns its native request and hands it to its forward context
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;
@@ -476,8 +475,7 @@ test "a GLM slot submitted with a kv4 override is refused by the same name admis
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;

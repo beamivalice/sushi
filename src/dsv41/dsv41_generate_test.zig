@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("../settings_resolve.zig");
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
@@ -1354,9 +1355,9 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     const greedy = SamplingParams{ .temperature = 0.0 };
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-    const saved_chunk = generate.prefill_chunk_override;
-    defer generate.prefill_chunk_override = saved_chunk;
-    generate.prefill_chunk_override = 256;
+    const saved_chunk = settings_resolve.prefill_chunk.value;
+    defer settings_resolve.prefill_chunk.value = saved_chunk;
+    settings_resolve.prefill_chunk.value = 256;
     const base: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 256, .adaptive_chunk_width = false, .ssm_checkpoint_stride = 256, .ssm_checkpoint_max = 4 };
 
     var want: std.ArrayList(u32) = .empty;
@@ -1498,9 +1499,9 @@ test "dsv41 generator: a prefill that skips the decoder tails nothing reads give
     defer tok.deinit();
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-    const saved_chunk = generate.prefill_chunk_override;
-    defer generate.prefill_chunk_override = saved_chunk;
-    generate.prefill_chunk_override = 256;
+    const saved_chunk = settings_resolve.prefill_chunk.value;
+    defer settings_resolve.prefill_chunk.value = saved_chunk;
+    settings_resolve.prefill_chunk.value = 256;
 
     // Offset 0: chunks end at 256, 512, 768 and 1369 (a merged tail); points at 512 and the prompt end. The chunks
     // ending at 256 and 768 leave state only. Offset 246: the chunk ending at 502 is followed by one of ten rows,
@@ -1549,9 +1550,9 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     const greedy = SamplingParams{ .temperature = 0.0 };
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-    const saved_chunk = generate.prefill_chunk_override;
-    defer generate.prefill_chunk_override = saved_chunk;
-    generate.prefill_chunk_override = 256;
+    const saved_chunk = settings_resolve.prefill_chunk.value;
+    defer settings_resolve.prefill_chunk.value = saved_chunk;
+    settings_resolve.prefill_chunk.value = 256;
 
     // The hook runs once a chunk and once more at the prompt end, before the final span.
     const Count = struct {

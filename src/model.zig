@@ -338,7 +338,7 @@ pub const ModelConfig = struct {
     pinned_context: u32 = 0,
 
     /// Per-model settings from `model-settings.json`, set at the load
-    /// construction site; an explicit launch flag outranks each (`model_settings.pick`).
+    /// construction site; an explicit launch flag outranks each (`settings_resolve.resolve`).
     /// 0/null = unset; `mtp_override` true = head loaded AND on by default (`--mtp`, per model).
     ctx_override: u32 = 0,
     kv_quant_override: ?kv_quant_mod.KVQuantConfig = null,

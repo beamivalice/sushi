@@ -86,7 +86,7 @@ pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     if (opts.hidden_out.len > 0) return error.Dsv41HiddenCaptureUnsupported;
     if (opts.imatrix_windows != 0) return error.Dsv41ImatrixWindowsUnsupported;
     if (opts.tokens != 1) return error.Dsv41LayerMajorNeedsOneRow;
-    if (!opts.no_template or opts.ssd_budget_bytes == 0 or opts.pick_tolerance != 0 or opts.enable_mtp or opts.wired_margin_bytes != 0) return error.Dsv41CaptureNeedsLosslessStreaming;
+    if (!opts.no_template or opts.ssd_budget_bytes == 0 or opts.pick_tolerance != 0 or (opts.mtp orelse false) or opts.wired_margin_bytes != 0) return error.Dsv41CaptureNeedsLosslessStreaming;
     return true;
 }
 

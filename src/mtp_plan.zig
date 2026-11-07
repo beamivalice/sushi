@@ -2,8 +2,6 @@ const std = @import("std");
 const transformer_mod = @import("transformer.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
-const mtp_acceptance = @import("mtp_acceptance.zig");
-const model_settings = @import("model_settings.zig");
 const round_cost = @import("round_cost.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const Transformer = transformer_mod.Transformer;
@@ -18,16 +16,6 @@ const Generator = generate.Generator;
 const SamplingParams = sampler.SamplingParams;
 const dsparkEligible = dsv41_dspark.dsparkEligible;
 const penaltyActive = sampler.penaltyActive;
-
-/// THIS model's acceptance mode: the launch flag > its `mtp_acceptance` > exact.
-pub fn mtpAcceptanceFor(setting: ?mtp_acceptance.Mode) model_settings.Pick(mtp_acceptance.Mode) {
-    return model_settings.pick(mtp_acceptance.Mode, model_settings.launchFlag(mtp_acceptance.Mode, generate.mtp_acceptance_default, generate.mtp_acceptance_explicit), setting, generate.mtp_acceptance_default);
-}
-
-/// THIS model's greedy tail: the launch flag > its `mtp_greedy_tail` > off.
-pub fn mtpGreedyTailFor(setting: ?bool) model_settings.Pick(bool) {
-    return model_settings.pick(bool, model_settings.launchFlag(bool, true, generate.mtp_greedy_tail_explicit), setting, model_settings.default_mtp_greedy_tail);
-}
 
 /// Per-prefill state for the adaptive width; lives on `runPrefill`'s stack. The policy is
 /// `server.adaptivePrefillWidth`.
@@ -373,18 +361,6 @@ fn mtpEvTestGenerator() Generator {
     g.mtp_ev_costs = mtp_policy.MTP_EV_DEFAULT_COSTS;
     g.spec_disabled_runtime = false;
     return g;
-}
-
-test "mtpGreedyTailFor: the greedy tail flag outranks the per-model mtp_greedy_tail, which outranks off" {
-    const saved = generate.mtp_greedy_tail_explicit;
-    defer generate.mtp_greedy_tail_explicit = saved;
-    generate.mtp_greedy_tail_explicit = false;
-    try testing.expectEqual(model_settings.Pick(bool){ .value = false, .source = .default }, mtpGreedyTailFor(null));
-    try testing.expectEqual(model_settings.Pick(bool){ .value = true, .source = .model_settings }, mtpGreedyTailFor(true));
-    try testing.expectEqual(model_settings.Pick(bool){ .value = false, .source = .model_settings }, mtpGreedyTailFor(false));
-    generate.mtp_greedy_tail_explicit = true;
-    try testing.expectEqual(model_settings.Pick(bool){ .value = true, .source = .flag }, mtpGreedyTailFor(false));
-    try testing.expectEqual(model_settings.Pick(bool){ .value = true, .source = .flag }, mtpGreedyTailFor(null));
 }
 
 test "updateMtpEvRound: sticky disable uses the first draft at base depth one" {

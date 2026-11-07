@@ -1,6 +1,7 @@
 //! Bills, admission, context and chunk math. It reads the GPU only through gpu_mem.zig, so a test that reaches no
 //! live reading runs in the host tier.
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const transformer_mod = @import("transformer.zig");
 const verify_moe = @import("verify_moe.zig");
 const attn_kernels = @import("attn_kernels.zig");
@@ -73,22 +74,21 @@ fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
 
 /// THIS model's MTP decision and its source, the answer the load log and `/props` read.
 pub fn mtpChoiceFor(config: *const model_mod.ModelConfig) model_settings.MtpChoice {
-    if (launch_state.global_scheduler) |sch| return model_load.mtpChoiceFor(sch.mtp_enabled, sch.mtp_explicit, config);
+    if (launch_state.global_scheduler) |sch| return model_load.mtpChoiceFor(sch.mtp, config);
     const flag: ?bool = launch_state.configured_mtp orelse (if (launch_state.server_config.default_force_mtp) @as(?bool, true) else null);
-    return model_load.mtpChoiceFor(flag orelse true, flag != null, config);
+    return model_load.mtpChoiceFor(flag, config);
 }
 
 /// THIS model's KV scheme and its source, the one answer the load log, `/props` and every bill read.
 pub fn kvCacheFor(config: *const model_mod.ModelConfig) transformer_mod.KvCacheChoice {
-    if (launch_state.global_scheduler) |sch| return kvCacheForLaunch(config, sch.kv_quant_config, sch.kv_quant_explicit);
-    const launch = launch_state.configured_kv_quant orelse transformer_mod.KVQuantConfig.engine_default;
-    return kvCacheForLaunch(config, launch, launch_state.configured_kv_quant != null);
+    if (launch_state.global_scheduler) |sch| return kvCacheForLaunch(config, sch.kv_quant);
+    return kvCacheForLaunch(config, launch_state.configured_kv_quant);
 }
 
 /// `kvCacheFor` under a given launch choice. deepseek_v41 keeps its own compressed state; `--kv-quant` has nothing to quantize.
-pub fn kvCacheForLaunch(config: *const model_mod.ModelConfig, launch: transformer_mod.KVQuantConfig, explicit: bool) transformer_mod.KvCacheChoice {
+pub fn kvCacheForLaunch(config: *const model_mod.ModelConfig, flag: ?transformer_mod.KVQuantConfig) transformer_mod.KvCacheChoice {
     if (config.isDsv41()) return .{ .config = .dense, .source = .default };
-    return transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, launch, explicit);
+    return transformer_mod.KvCacheChoice.resolve(flag, config.kv_quant_override);
 }
 
 pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
@@ -128,19 +128,23 @@ pub fn clearResolvedPrefixCacheMem() void {
 
 pub const DiskAsk = struct {
     bytes: u64,
-    explicit: bool,
-    from_file: bool,
+    source: settings_resolve.Source,
+
+    /// An operator named the number, by flag or in the file: it is the budget as given.
+    pub fn explicit(self: DiskAsk) bool {
+        return self.source != .default;
+    }
 
     pub fn sourceName(self: DiskAsk) []const u8 {
-        return if (self.from_file) "model-settings.json" else "--prefix-cache-disk";
+        return if (self.source == .model_settings) "model-settings.json" else "--prefix-cache-disk";
     }
 };
 
 /// The ask as of now. `POST /v1/settings` changes it from a connection thread while loads and bills read it, so
 /// every read after boot comes through here.
 pub fn diskAsk() DiskAsk {
-    const explicit = @atomicLoad(bool, &launch_state.prefix_cache_disk_explicit, .acquire);
-    return .{ .bytes = @atomicLoad(u64, &launch_state.prefix_cache_disk_bytes, .monotonic), .explicit = explicit, .from_file = @atomicLoad(bool, &launch_state.prefix_cache_disk_from_file, .monotonic) };
+    const source = @atomicLoad(settings_resolve.Source, &launch_state.prefix_cache_disk_source, .acquire);
+    return .{ .bytes = @atomicLoad(u64, &launch_state.prefix_cache_disk_bytes, .monotonic), .source = source };
 }
 
 /// Does THIS model run with an SSD tier? The launch asked for one and its load did not decline it
@@ -928,8 +932,8 @@ fn advertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceili
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
 /// forward does: `--prefill-chunk 4096` used to run against a 512-token reserve.
 pub fn explicitPrefillChunk() u32 {
-    if (!generate_mod.prefill_chunk_explicit) return 0;
-    const raw: usize = @min(generate_mod.prefill_chunk_override, @as(usize, std.math.maxInt(u32)));
+    if (settings_resolve.prefill_chunk.source != .flag) return 0;
+    const raw: usize = @min(settings_resolve.prefill_chunk.value, @as(usize, std.math.maxInt(u32)));
     return @intCast(raw);
 }
 
@@ -1081,9 +1085,9 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
         // unexplained slowdown.
-        if (!generate_mod.prefill_chunk_explicit) {
+        if (settings_resolve.prefill_chunk.source != .flag) {
             var buf: [256]u8 = undefined;
-            if (prefillChunkLoadLine(&buf, config, config.pinned_prefill_chunk, generate_mod.prefill_chunk_override)) |line| log.info("{s}", .{line});
+            if (prefillChunkLoadLine(&buf, config, config.pinned_prefill_chunk, settings_resolve.prefill_chunk.value)) |line| log.info("{s}", .{line});
         }
     }
     return config.pinned_prefill_chunk;
@@ -1422,7 +1426,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
             ctx_tokens +| slotRingBytes(config, kv_bits);
         // Context sizing and the chunk pin read the raw ask, so neither moves with this one.
         const one = oneSessionFor(config, kv_bits, ceiling, active_mem, qwen4_mod.page_cache_claim.load(.acquire), ctx_tokens, chunk);
-        const ask = defaultPrefixCacheAskFor(config, requested, launch_state.prefix_cache_mem_explicit, one.ask());
+        const ask = defaultPrefixCacheAskFor(config, requested, launch_state.prefix_cache_mem_source != .default, one.ask());
         const clamped = clampedPrefixCacheMem(
             ask,
             ceiling,
@@ -1455,7 +1459,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     const ctx_tokens = ramFirstContextForLoad(config, kv_bits, active_mem, pinned);
     // Static ceiling, not the live one: the budget must be reproducible boot to boot.
     const one = oneSessionFor(config, kv_bits, staticGpuMemoryCeiling(), active_mem, qwen4_mod.page_cache_claim.load(.acquire), ctx_tokens, clampReserveWidth(config, pinned));
-    const ask = defaultPrefixCacheAskFor(config, requested, launch_state.prefix_cache_mem_explicit, one.ask());
+    const ask = defaultPrefixCacheAskFor(config, requested, launch_state.prefix_cache_mem_source != .default, one.ask());
     const plan = planHotCache(
         config,
         kv_bits,
@@ -1513,12 +1517,12 @@ pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, h
     const kv_bits = defaultKvBits(config);
     const bpt = diskBytesPerToken(config, kv_bits);
     const ask = diskAsk();
-    const ctx = if (ask.explicit) 0 else diskContextForLoad(config);
+    const ctx = if (ask.explicit()) 0 else diskContextForLoad(config);
     // An unreadable volume is no reason to refuse: the tier re-checks before every store.
     const free: u64 = if (disk_placement.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
     var buf: [384]u8 = undefined;
-    const plan = disk_placement.resolveDiskBudget(ask.explicit, ask.bytes, launch_state.prefix_cache_capacity, ctx, bpt, free, held) orelse {
-        log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir, if (ask.explicit and ask.bytes == 0) ask.sourceName() else null)});
+    const plan = disk_placement.resolveDiskBudget(ask.explicit(), ask.bytes, launch_state.prefix_cache_capacity, ctx, bpt, free, held) orelse {
+        log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir, if (ask.explicit() and ask.bytes == 0) ask.sourceName() else null)});
         return null;
     };
     log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, launch_state.prefix_cache_capacity, ctx, bpt, dir, ask.sourceName())});
@@ -1939,7 +1943,7 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     const per_cp = config.ssmCheckpointBytes();
     if (per_cp == 0 or launch_state.ssm_checkpoint_stride == 0) return 0;
     if (archHook("retainedCheckpoints", u64, config, .{ seq, matched })) |bytes| return bytes;
-    const stride: u64 = prefill_plan.effectiveSsmCheckpointStride(launch_state.ssm_checkpoint_stride, @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override));
+    const stride: u64 = prefill_plan.effectiveSsmCheckpointStride(launch_state.ssm_checkpoint_stride, @max(@as(usize, @intCast(chunk)), settings_resolve.prefill_chunk.value));
     if (stride == 0) return 0;
     // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt
     // snapshot, the only capture a warm append shorter than one stride makes.
@@ -2794,13 +2798,13 @@ test "Sushi quant memory production context CPU audit" {
     defer cfg.deinit(std.testing.allocator);
     const saved_ctx = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved_ctx;
-    const saved_width = generate_mod.prefill_chunk_override;
-    defer generate_mod.prefill_chunk_override = saved_width;
-    const saved_explicit = generate_mod.prefill_chunk_explicit;
-    defer generate_mod.prefill_chunk_explicit = saved_explicit;
+    const saved_width = settings_resolve.prefill_chunk.value;
+    defer settings_resolve.prefill_chunk.value = saved_width;
+    const saved_source = settings_resolve.prefill_chunk.source;
+    defer settings_resolve.prefill_chunk.source = saved_source;
     launch_state.server_config.max_context_size = 500000;
-    generate_mod.prefill_chunk_override = 2048;
-    generate_mod.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.value = 2048;
+    settings_resolve.prefill_chunk.source = .flag;
     const budget: u64 = 16 << 30;
     const bill = loadServingBill(&cfg, budget).?;
     try std.testing.expectEqual(@as(u64, 8), bill.kv_bits);
@@ -2817,15 +2821,15 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
     defer launch_state.configured_mtp = saved_mtp;
     const saved_kv = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_kv;
-    const saved_width = generate_mod.prefill_chunk_override;
-    defer generate_mod.prefill_chunk_override = saved_width;
-    const saved_explicit = generate_mod.prefill_chunk_explicit;
-    defer generate_mod.prefill_chunk_explicit = saved_explicit;
+    const saved_width = settings_resolve.prefill_chunk.value;
+    defer settings_resolve.prefill_chunk.value = saved_width;
+    const saved_source = settings_resolve.prefill_chunk.source;
+    defer settings_resolve.prefill_chunk.source = saved_source;
     launch_state.server_config.max_context_size = 500000;
     launch_state.configured_kv_quant = null;
     launch_state.configured_mtp = false;
-    generate_mod.prefill_chunk_override = 2048;
-    generate_mod.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.value = 2048;
+    settings_resolve.prefill_chunk.source = .flag;
     var cfg = fixtures.qwen4RequestTestConfig();
     cfg.expert_layout = .exl3_k4;
     const budget = sushiContextBytesAt(&cfg, 128000, 8).bytes;
@@ -3371,15 +3375,15 @@ test "a streamed load bills the narrowest rung the per-request ladder can take" 
     const saved_kv = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_kv;
     launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
-    const saved_explicit = generate_mod.prefill_chunk_explicit;
-    const saved_chunk = generate_mod.prefill_chunk_override;
+    const saved_source = settings_resolve.prefill_chunk.source;
+    const saved_chunk = settings_resolve.prefill_chunk.value;
     defer {
-        generate_mod.prefill_chunk_explicit = saved_explicit;
-        generate_mod.prefill_chunk_override = saved_chunk;
+        settings_resolve.prefill_chunk.source = saved_source;
+        settings_resolve.prefill_chunk.value = saved_chunk;
     }
     const saved_per_request = per_request_chunk_override;
     defer per_request_chunk_override = saved_per_request;
-    generate_mod.prefill_chunk_explicit = false;
+    settings_resolve.prefill_chunk.source = .default;
     per_request_chunk_override = true;
     const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
     const at = struct {
@@ -3390,17 +3394,17 @@ test "a streamed load bills the narrowest rung the per-request ladder can take" 
     try std.testing.expectEqual(at(&config, floor), expertStreamingServingBytes(&config));
     try std.testing.expect(at(&config, floor) < at(&config, 8192));
     // An explicit width caps the ladder, so the load proves the floor, or a narrower flag.
-    generate_mod.prefill_chunk_explicit = true;
-    generate_mod.prefill_chunk_override = 4096;
+    settings_resolve.prefill_chunk.source = .flag;
+    settings_resolve.prefill_chunk.value = 4096;
     try std.testing.expectEqual(at(&config, floor), expertStreamingServingBytes(&config));
-    generate_mod.prefill_chunk_override = 256;
+    settings_resolve.prefill_chunk.value = 256;
     try std.testing.expectEqual(at(&config, 256), expertStreamingServingBytes(&config));
     // With the ladder off the flag is a pin again.
-    generate_mod.prefill_chunk_override = 4096;
+    settings_resolve.prefill_chunk.value = 4096;
     per_request_chunk_override = false;
     try std.testing.expectEqual(at(&config, 4096), expertStreamingServingBytes(&config));
     per_request_chunk_override = true;
-    generate_mod.prefill_chunk_explicit = false;
+    settings_resolve.prefill_chunk.source = .default;
     config.pinned_prefill_chunk = 1024;
     try std.testing.expectEqual(at(&config, 1024), expertStreamingServingBytes(&config));
     config.pinned_prefill_chunk = 0;
@@ -3581,11 +3585,11 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
     // Squeezed so the machine sizer would step below the flag.
     const ceiling: u64 = weights + 6 * GiB;
 
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.value = 4096;
+    settings_resolve.prefill_chunk.source = .flag;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        settings_resolve.prefill_chunk.value = 8192;
+        settings_resolve.prefill_chunk.source = .default;
     }
     try t.expectEqual(@as(u32, 4096), explicitPrefillChunk());
     const sized = resolvePrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0);
@@ -3631,9 +3635,9 @@ test "Flash-Next's request bill brackets the peaks measured on the M1 Max, with 
     const saved_ctx = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved_ctx;
     launch_state.server_config.max_context_size = 100000;
-    const saved_width = generate_mod.prefill_chunk_override;
-    defer generate_mod.prefill_chunk_override = saved_width;
-    generate_mod.prefill_chunk_override = 512;
+    const saved_width = settings_resolve.prefill_chunk.value;
+    defer settings_resolve.prefill_chunk.value = saved_width;
+    settings_resolve.prefill_chunk.value = 512;
     const cfg = fixtures.qwen4MeasuredTestConfig();
     // Live `peak_bytes - active_bytes` after one prompt per boot (512 rung, kv8, no MTP, SSD tier on, 16 new
     // tokens), with each landed checkpoint already moved to the SSD.
@@ -3891,8 +3895,8 @@ test "clampReserveWidth: the load-time reserve is a promise to the FIRST request
     }
 
     // An explicit --prefill-chunk caps the ladder, so the clamp still reserves the floor.
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.value = 4096;
+    settings_resolve.prefill_chunk.source = .flag;
     const capped = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, explicitPrefillChunk());
     try t.expectEqual(@as(u32, 4096), capped.chunk);
     try t.expectEqual(floor_rung, capped.reserve_chunk);
@@ -3901,8 +3905,8 @@ test "clampReserveWidth: the load-time reserve is a promise to the FIRST request
     per_request_chunk_override = false;
     const pinned = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, explicitPrefillChunk());
     per_request_chunk_override = null;
-    generate_mod.prefill_chunk_override = 8192;
-    generate_mod.prefill_chunk_explicit = false;
+    settings_resolve.prefill_chunk.value = 8192;
+    settings_resolve.prefill_chunk.source = .default;
     try t.expectEqual(@as(u32, 4096), pinned.reserve_chunk);
     try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), pinned.reserve);
 
@@ -3960,19 +3964,19 @@ test "an explicit --prefill-chunk is the widest width a request may run, not a p
     const t = std.testing;
     attn_kernels.fused256_override = true;
     defer attn_kernels.fused256_override = null;
-    const saved_chunk = generate_mod.prefill_chunk_override;
-    const saved_explicit = generate_mod.prefill_chunk_explicit;
+    const saved_chunk = settings_resolve.prefill_chunk.value;
+    const saved_source = settings_resolve.prefill_chunk.source;
     defer {
-        generate_mod.prefill_chunk_override = saved_chunk;
-        generate_mod.prefill_chunk_explicit = saved_explicit;
+        settings_resolve.prefill_chunk.value = saved_chunk;
+        settings_resolve.prefill_chunk.source = saved_source;
     }
     // The live shape: MiMo, `--prefill-chunk 4096`, a 139,717-token turn.
     const cfg = fixtures.mimoV2FlashBillConfig();
     const kv_bits: u64 = 8;
     const seq: u64 = 139_717;
     const pin: u32 = 2048;
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.value = 4096;
+    settings_resolve.prefill_chunk.source = .flag;
     const n = explicitPrefillChunk();
     const at_n = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 4096, .{});
     const at_2048 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 2048, .{});
@@ -3996,13 +4000,13 @@ test "an explicit --prefill-chunk is the widest width a request may run, not a p
     try t.expectEqual(@as(usize, pick), prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), pick));
 
     // A narrower N is the cap for every rung; one below the floor is the floor.
-    generate_mod.prefill_chunk_override = 3000;
+    settings_resolve.prefill_chunk.value = 3000;
     try t.expectEqual(@as(u32, 3000), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 200 << 30, pin, explicitPrefillChunk(), .{}));
-    generate_mod.prefill_chunk_override = 256;
+    settings_resolve.prefill_chunk.value = 256;
     try t.expectEqual(@as(u32, 256), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, explicitPrefillChunk(), .{}));
 
     // Per-request picking off: the explicit width is the pin again, on the bill and the forward.
-    generate_mod.prefill_chunk_override = 4096;
+    settings_resolve.prefill_chunk.value = 4096;
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
     const off = requestPrefillPick(&cfg, seq, 2048, kv_bits, 0, false, .{});
@@ -4371,7 +4375,7 @@ test "mlxCacheLimitBytes: RAM-proportional cap, 2 GB floor, 8 GB ceiling" {
 test "prefix cache defaults: no RAM retention, an unnamed SSD tier on" {
     try testing.expect(!launch_state.prefix_cache_ram_enabled);
     try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
-    try testing.expect(!launch_state.prefix_cache_mem_explicit and !launch_state.prefix_cache_disk_explicit);
+    try testing.expect(launch_state.prefix_cache_mem_source == .default and launch_state.prefix_cache_disk_source == .default);
     try testing.expectEqual(disk_placement.DEFAULT_DISK_CAP, launch_state.prefix_cache_disk_bytes);
 }
 
@@ -4708,11 +4712,11 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         unpinned_prefill_chunk,
     ));
     // An explicit --prefill-chunk outranks the pin in BOTH directions.
-    generate_mod.prefill_chunk_override = 2048;
-    generate_mod.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.value = 2048;
+    settings_resolve.prefill_chunk.source = .flag;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        settings_resolve.prefill_chunk.value = 8192;
+        settings_resolve.prefill_chunk.source = .default;
     }
     try t.expectEqual(@as(usize, 2048), prefill_plan.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
@@ -5466,11 +5470,11 @@ test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned 
     adaptive_chunk_override = null;
 
     // An operator who pinned a width pinned every forward.
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.value = 4096;
+    settings_resolve.prefill_chunk.source = .flag;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        settings_resolve.prefill_chunk.value = 8192;
+        settings_resolve.prefill_chunk.source = .default;
     }
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
 }
@@ -6178,14 +6182,14 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
     try t.expectEqual(explicitPrefillChunk() == 0, adaptivePrefillChunkEnabled(&cfg));
 
     // 2048 is a default: an explicit `--prefill-chunk 4096` raises the ladder's top rung, billed at that width.
-    const saved_explicit = generate_mod.prefill_chunk_explicit;
-    const saved_chunk = generate_mod.prefill_chunk_override;
+    const saved_source = settings_resolve.prefill_chunk.source;
+    const saved_chunk = settings_resolve.prefill_chunk.value;
     defer {
-        generate_mod.prefill_chunk_explicit = saved_explicit;
-        generate_mod.prefill_chunk_override = saved_chunk;
+        settings_resolve.prefill_chunk.source = saved_source;
+        settings_resolve.prefill_chunk.value = saved_chunk;
     }
-    generate_mod.prefill_chunk_explicit = true;
-    generate_mod.prefill_chunk_override = 4096;
+    settings_resolve.prefill_chunk.source = .flag;
+    settings_resolve.prefill_chunk.value = 4096;
     try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 4096, .{}));
     const need4096 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 4096, .{});
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, need4096 - 1, pin, 4096, .{}));
@@ -7369,8 +7373,8 @@ test "bill pin: the SSD ask and tier" {
         fn run(c: *const PinCfg, g: *PinGot) void {
             const ask = diskAsk();
             g.add(ask.bytes);
-            g.add(ask.explicit);
-            g.add(ask.from_file);
+            g.add(ask.explicit());
+            g.add(ask.source == .model_settings);
             g.add(diskTierOn(c));
             g.add(diskBytesFor(c));
             g.add(resolvedPrefixCacheMem());
@@ -7441,9 +7445,9 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     cfg.pinned_context = 0;
     per_request_chunk_override = true;
     defer per_request_chunk_override = null;
-    const orig_explicit = generate_mod.prefill_chunk_explicit;
-    defer generate_mod.prefill_chunk_explicit = orig_explicit;
-    generate_mod.prefill_chunk_explicit = false;
+    const orig_source = settings_resolve.prefill_chunk.source;
+    defer settings_resolve.prefill_chunk.source = orig_source;
+    settings_resolve.prefill_chunk.source = .default;
 
     // The pure chunk resolver: `pinPrefillChunk` reads live memory.
     const chunk: u32 = @intCast(prefill_plan.effectivePrefillChunk(
@@ -8081,10 +8085,10 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const seq: u64 = 368_208;
     const matched: u64 = 364_478;
     const chunk: u64 = 512;
-    // The stride follows the uncapped base chunk (`prefill_chunk_override`), not the adaptive width.
-    const saved_override = generate_mod.prefill_chunk_override;
-    defer generate_mod.prefill_chunk_override = saved_override;
-    generate_mod.prefill_chunk_override = 8192;
+    // The stride follows the uncapped base chunk (`settings_resolve.prefill_chunk`), not the adaptive width.
+    const saved_override = settings_resolve.prefill_chunk.value;
+    defer settings_resolve.prefill_chunk.value = saved_override;
+    settings_resolve.prefill_chunk.value = 8192;
     const stride: u64 = 8192;
     try t.expectEqual(stride, prefill_plan.effectiveSsmCheckpointStride(launch_state.ssm_checkpoint_stride, 8192));
 

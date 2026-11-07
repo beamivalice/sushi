@@ -178,18 +178,23 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 <a id="settings"></a>
 ## Settings precedence
 
-- **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`model_settings.pick`;
-  `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
+- **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`settings_resolve.resolve`,
+  the one resolver: `Setting(T) = { value, source: flag | model_settings | default }`; `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
   `--mtp-greedy-tail`, `--ssd-budget-gb`, `--ssd-prefetch`, `--preserve-thinking`, `--think-penalty`, `--vision/--no-vision`, `--max-tokens`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
   `model-settings.json` key ([engine-mtp](engine-mtp.md#depth-range)).
 - **`--no-mtp-lookup` is launch-only too** (no `model-settings.json` key): it turns off the prompt-lookup drafts in MTP
   rounds (Qwen, MiMo) and GLM DFlash2's lookup chains.
-- A flag that shapes a LOAD is retained on the Scheduler with its `*_explicit` bit (`ensureLoaded`'s cold-load
-  `LoadRequest` is a SECOND site); read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. Each load logs its
-  resolved value and source (`[kv-cache] kv8 (source); ctx N (source)`, `[mtp] on|off (source)`; `/props
-  settings.mtp.source`). Guard: `tests/test_cold_load.sh`.
+- **A flag the operator did not pass is null, never a value beside a "given" bit.** A flag that shapes a LOAD is retained
+  as `?T` on `LoadParams`, the Scheduler and the cold-load `LoadRequest` (a SECOND site): `mtp: ?bool`,
+  `kv_quant: ?KVQuantConfig`; read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. The process-wide ones are
+  `settings_resolve.launch` (`mtp_acceptance`, `mtp_greedy_tail`) and `settings_resolve.prefill_chunk` (a `Setting`
+  whose source is `.flag` once `--prefill-chunk` is given); the prefix-cache asks carry a `Source`
+  (`server_state.prefix_cache_mem_source`, `prefix_cache_disk_source`: `.flag`, `.model_settings` for
+  `server.prefix_cache_disk_gb`, or `.default`). Each load logs its resolved value and source (`[kv-cache] kv8
+  (source); ctx N (source)`, `[mtp] on|off (source)`; `/props settings.mtp.source`). Guard: `tests/test_cold_load.sh`.
+  The table test in `settings_resolve.zig` pins flag, file and default for every key (host tier).
 - MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
   the file can only turn it off, or on for an SSD-streamed pack.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
@@ -221,13 +226,14 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   (one parse and one range: a hand-edited `ssd_budget_gb` over 512 is unset to both). The SSD ask (`server.diskAsk`) is atomic: the settings POST
   writes it from a connection thread, and every load, cold loads and their checkpoint stride included, reads it at load time rather than a boot snapshot.
   A key that does not apply to an arch (`model_settings.applies`) is logged as ignored at load and listed as not applying by `GET /v1/settings` and `/props`
-  (`settings.mtp.acceptance_applies`); `ssd_prefetch` also logs that it is ignored on a DeepSeek pack without STQ experts. `model_settings.Fit` (built by `server.settingsFit` from a loaded config, by the settings API from a stub's files) is the one set of facts behind `applies`, `limit` and `refuseEdits`; add a gate there, never in the page. A `kv_quant` file value GLM's latent cannot store (4) is dropped at stamping with a warning, never a refused load. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
+  (`settings.mtp.acceptance_applies`); `ssd_prefetch` also logs that it is ignored on a DeepSeek pack without STQ experts. `model_settings.Fit` (built by `arch_flags.settingsFit` from a loaded config, by the settings API from a stub's files) is the one set of facts behind `applies`, `limit` and `refuseEdits`; add a gate there, never in the page (`Fit.prefetch` is the arch's `ExpertStreamTraits.prefetch`; the arch that has a prefetcher also keeps no KV cache and accepts drafts by the exact rule only). A `kv_quant` file value GLM's latent cannot store (4) is dropped at stamping with a warning, never a refused load. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
 - **The prefix cache's other tiers are launch flags only**: RAM retention is off unless
   `--prefix-cache-mem` is given with a size (`off` or `0` keeps it off), and the SSD tier is on unless `--prefix-cache-disk 0`
   or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)); its size alone has the
   `server.prefix_cache_disk_gb` key.
-- A new per-model setting or launch flag follows this order, carries an `*_explicit` bit through both load sites and
-  cold loads, and logs its resolved value with its source at load.
+- A new per-model setting or launch flag follows this order, resolves through `settings_resolve`, carries its flag as
+  `?T` through both load sites and cold loads, gets a row in the table test, and logs its resolved value with its
+  source at load.
 - Load-time context bills see explicit KV and MTP choices from the load's start (`serve` publishes them before `Scheduler.init`), including `--no-mtp`.
 
 ## Scheduler and batching

@@ -30,7 +30,7 @@ pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     }
     if (cfg.quant_bits != 0 or
         opts.tokens == 0 or opts.ssd_budget_bytes == 0 or opts.pick_tolerance != 0 or
-        !opts.no_template or opts.enable_mtp or
+        !opts.no_template or (opts.mtp orelse false) or
         opts.kv_quant_config.scheme != .off or opts.wired_margin_bytes != 0)
         return error.NativeGlmTeacherRequiresLosslessStreaming;
     // A layer-major window ends with its prefill: no layer's cache outlives that layer.
@@ -860,9 +860,9 @@ fn windowMajor(a: std.mem.Allocator, io: std.Io, s: mlx.mlx_stream, net: *const 
 test "GLM native KLD capture rejects lossy options" {
     const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .bf16_individual };
     var opts = kld.Options{ .command = .capture, .no_template = true, .tokens = 512, .ssd_budget_bytes = 100 << 30 };
-    opts.enable_mtp = true;
+    opts.mtp = true;
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
-    opts.enable_mtp = false;
+    opts.mtp = false;
     opts.pick_tolerance = 0.3;
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
     opts.pick_tolerance = 0;

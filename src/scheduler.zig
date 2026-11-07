@@ -32,6 +32,7 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
 const arch_state = @import("arch/arch_state.zig");
 const transformer_mod = @import("transformer.zig");
@@ -142,7 +143,7 @@ pub const SubmitParams = struct {
     logprobs_n: u32 = 0,
     /// Wave 1.A: per-request override of the process-default KV-cache quant
     /// scheme. When non-null, this slot's KVCache is constructed with this
-    /// config instead of `Scheduler.kv_quant_config`. Lets one server host a
+    /// config instead of `Scheduler.kv_quant`. Lets one server host a
     /// single model and let clients trade accuracy for context length on a
     /// per-call basis (`{"kv_quant": "off"|4|8}` body field).
     kv_quant_config: ?transformer_mod.KVQuantConfig = null,
@@ -930,8 +931,7 @@ pub const LoadRequest = struct {
     /// checkpoint could carry its own, so the opt-out needs its own bit.
     no_drafter: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
-    mtp_enabled: bool = true,
-    mtp_explicit: bool = false,
+    mtp: ?bool = null,
     mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
@@ -939,8 +939,7 @@ pub const LoadRequest = struct {
 
     load_vision: bool = false,
     warmup_eager: bool = true,
-    kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default,
-    kv_quant_explicit: bool = false,
+    kv_quant: ?transformer_mod.KVQuantConfig = null,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_ram_enabled: bool = true,
     prefix_cache_mem_bytes: u64 = 0,
@@ -1036,8 +1035,7 @@ pub const Scheduler = struct {
     vision_encoder: ?*VisionEncoder,
     dflash: ?*DflashModel = null,
     drafter_block_size: u32,
-    kv_quant_config: transformer_mod.KVQuantConfig,
-    kv_quant_explicit: bool,
+    kv_quant: ?transformer_mod.KVQuantConfig,
     /// `LoadParams.ctx_size`, retained so every load resolves its context
     /// against the launch flag (`model_settings.contextPick`).
     ctx_size_flag: u32,
@@ -1062,8 +1060,7 @@ pub const Scheduler = struct {
     /// Pre-plumbing, the cold-load `LoadRequest` used its struct defaults
     /// (mtp on, default depth), silently ignoring these flags on every
     /// on-demand load and model switch.
-    mtp_enabled: bool,
-    mtp_explicit: bool,
+    mtp: ?bool,
     mtp_head_kv_quant: bool,
     mtp_depth: u32,
     /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
@@ -1246,8 +1243,7 @@ pub const Scheduler = struct {
             .weights = null,
             .vision_encoder = null,
             .drafter_block_size = 0,
-            .kv_quant_config = params.kv_quant_config,
-            .kv_quant_explicit = params.kv_quant_explicit,
+            .kv_quant = params.kv_quant,
             .ctx_size_flag = params.ctx_size,
             .prefix_cache_capacity = params.prefix_cache_capacity,
             .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
@@ -1258,8 +1254,7 @@ pub const Scheduler = struct {
             .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
-            .mtp_enabled = params.mtp_enabled,
-            .mtp_explicit = params.mtp_explicit,
+            .mtp = params.mtp,
             .mtp_head_kv_quant = params.mtp_head_kv_quant,
             .mtp_depth = params.mtp_depth,
             .no_drafter = params.no_drafter,
@@ -1499,7 +1494,7 @@ pub const Scheduler = struct {
         if ((params.full_prompt orelse params.prompt_ids).len == 0) return error.EmptyPrompt;
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
         const eff_kv_quant = params.kv_quant_config orelse
-            transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
+            transformer_mod.KvCacheChoice.resolve(self.kv_quant, slot_config.kv_quant_override).config;
         try sched.checkKvQuant(slot_config, eff_kv_quant);
         return Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
     }
@@ -1693,7 +1688,7 @@ pub const Scheduler = struct {
             settings_budget,
         )) blk: {
             if (settings_budget == 0 and model_load.ramDefaultTierFor(owned.config) == null) return error.ExpertStreamingRequired;
-            const mtp = model_load.mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
+            const mtp = model_load.mtpChoiceFor(self.mtp, owned.config);
             const verdict = model_load.mtpStreamingVerdict(mtp, model_load.streamedHeadSupportedAt(self.io, self.allocator, owned.config, entry.path));
             switch (verdict) {
                 .keep => owned.config.stream_mtp_head = true,
@@ -1710,7 +1705,7 @@ pub const Scheduler = struct {
             .config = owned.config,
             .path = entry.path,
             .load_vision = model_load.coldLoadVision(owned.config, false),
-            .mtp_on = model_load.mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config).on,
+            .mtp_on = model_load.mtpChoiceFor(self.mtp, owned.config).on,
             .no_drafter = self.no_drafter,
             .drafter_dir = model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
         })) |bill|
@@ -1722,7 +1717,7 @@ pub const Scheduler = struct {
                 owned.config,
                 entry.path,
                 model_load.coldLoadVision(owned.config, false),
-                model_load.mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config).on,
+                model_load.mtpChoiceFor(self.mtp, owned.config).on,
                 self.no_drafter,
                 model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
             )
@@ -1811,8 +1806,7 @@ pub const Scheduler = struct {
             .no_drafter = self.no_drafter,
             .load_vision = model_load.coldLoadVision(owned.config, false),
             .warmup_eager = true,
-            .kv_quant_config = self.kv_quant_config,
-            .kv_quant_explicit = self.kv_quant_explicit,
+            .kv_quant = self.kv_quant,
             // Cold loads get the SAME prefix-cache configuration as the
             // startup model — pre-plumbing these were (1, 0, stride 0),
             // which silently degraded warm reuse after every model switch.
@@ -1830,8 +1824,7 @@ pub const Scheduler = struct {
             // as prefix-cache above) — pre-plumbing these were LoadRequest
             // defaults, so --no-mtp / --mtp-max-depth were silently dropped on
             // every on-demand load and model switch.
-            .mtp_enabled = self.mtp_enabled,
-            .mtp_explicit = self.mtp_explicit,
+            .mtp = self.mtp,
             .mtp_head_kv_quant = self.mtp_head_kv_quant,
             .mtp_depth = self.mtp_depth,
             .evict_entries = victims_buf[0..n_victims],
@@ -2111,14 +2104,14 @@ pub var load_serving_bill: ?*const fn (*const ModelConfig, u64) ?model_load.Load
 test "a cold load takes the SSD ask and the checkpoint stride the settings hold now, not the boot snapshot" {
     const srv = @import("server.zig");
     const saved = srv.diskAsk();
-    defer srv.setDiskAsk(saved.bytes, saved.explicit);
+    defer srv.setDiskAsk(saved.bytes, saved.source);
 
-    srv.setDiskAsk(0, true);
+    srv.setDiskAsk(0, .model_settings);
     const off = coldLoadDisk(256, 32, false);
     try std.testing.expectEqual(@as(u64, 0), off.bytes);
     try std.testing.expectEqual(@as(u32, 0), off.stride);
 
-    srv.setDiskAsk(40 << 30, true);
+    srv.setDiskAsk(40 << 30, .model_settings);
     const on = coldLoadDisk(256, 32, false);
     try std.testing.expectEqual(@as(u64, 40 << 30), on.bytes);
     try std.testing.expectEqual(@as(u32, 256), on.stride);
@@ -3876,8 +3869,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // Use the resolved thinking mode and normalize the M5/block-16
             // calibration to this machine's effective assistant width.
             .mtp_enabled = use_head_mtp,
-            .mtp_acceptance = mtp_plan.mtpAcceptanceFor(slot.model.config.?.mtp_acceptance_override).value,
-            .mtp_greedy_tail = mtp_plan.mtpGreedyTailFor(slot.model.config.?.mtp_greedy_tail_override).value,
+            .mtp_acceptance = settings_resolve.acceptanceFor(slot.model.config.?.mtp_acceptance_override).value,
+            .mtp_greedy_tail = settings_resolve.greedyTailFor(slot.model.config.?.mtp_greedy_tail_override).value,
             .mtp = if (use_head_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,
@@ -5138,8 +5131,7 @@ test "complete keeps a slot in decoding until its pass is out, so admission neve
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;
@@ -5654,8 +5646,7 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;
@@ -5732,8 +5723,7 @@ test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitte
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;
@@ -5776,8 +5766,7 @@ test "an empty prompt is refused at submit, before any slot reaches the inferenc
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;
@@ -5808,8 +5797,7 @@ test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;
@@ -5867,8 +5855,7 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;
@@ -6307,8 +6294,7 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     sch.io = io;
     sch.allocator = testing.allocator;
     sch.ssd_budget_bytes = 0;
-    sch.mtp_enabled = true;
-    sch.mtp_explicit = false;
+    sch.mtp = null;
 
     try testing.expectError(error.NotEnoughMemory, sch.ensureLoaded("b"));
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);

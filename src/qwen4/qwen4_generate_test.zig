@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("../settings_resolve.zig");
 const mlx = @import("../mlx.zig");
 const transformer_mod = @import("../transformer.zig");
 const trunk = @import("../trunk.zig");
@@ -36,7 +37,7 @@ const MtpHeadRef = generate.MtpHeadRef;
 
 test "a 40k Qwen prefill checkpoints every 8192 tokens at any chunk width the ladder takes" {
     for ([_]usize{ 8192, 4096, 2048, 512 }) |width| {
-        const stride = effectiveSsmCheckpointStride(256, @max(width, generate.prefill_chunk_override));
+        const stride = effectiveSsmCheckpointStride(256, @max(width, settings_resolve.prefill_chunk.value));
         try testing.expectEqual(@as(usize, kv_disk_cache_mod.POINT_GRID), stride);
         var buf: [128]usize = undefined;
         const ends = walkChunkEnds(&buf, 39969, &.{width}, true, stride, 0);

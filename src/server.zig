@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const verify_moe = @import("verify_moe.zig");
@@ -832,9 +833,9 @@ pub fn serve(
     server_state.server_config = cfg;
     // Before `Scheduler.init`: that call starts the model load and every load-time bill inside it
     // asks for the KV width.
-    server_state.configured_kv_quant = if (load_params.kv_quant_explicit) load_params.kv_quant_config else null;
+    server_state.configured_kv_quant = load_params.kv_quant;
     defer server_state.configured_kv_quant = null;
-    server_state.configured_mtp = model_settings.launchFlag(bool, load_params.mtp_enabled, load_params.mtp_explicit);
+    server_state.configured_mtp = load_params.mtp;
     defer server_state.configured_mtp = null;
     scheduler_mod.load_serving_bill = &loadServingBill;
     defer scheduler_mod.load_serving_bill = null;
@@ -999,7 +1000,7 @@ pub fn serve(
     warnUserWireLimit();
     if (manualContext(config) > 0) {
         const ctx = model_settings.contextPick(server_state.server_config.max_context_size, config.ctx_override);
-        log.info("Context size: {d} tokens ({s})\n", .{ ctx.value, model_settings.sourceLabel(ctx.source, "--ctx-size") });
+        log.info("Context size: {d} tokens ({s})\n", .{ ctx.value, settings_resolve.sourceLabel(ctx.source, "--ctx-size") });
     } else {
         const memory_ctx = computeMemoryContext(config);
         const memory_allows = bills.safeAutoContext(memory_ctx);
@@ -3563,7 +3564,7 @@ test "Responses: a stored reasoning turn renders as the model's own think block"
 
 
 test "settingsPropsJson: /props names the greedy tail and where it came from" {
-    for ([_]model_settings.Pick(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail" }) |tail, source| {
+    for ([_]settings_resolve.Setting(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail" }) |tail, source| {
         const frag = try models_api.settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
         defer testing.allocator.free(frag);
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});

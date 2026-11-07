@@ -9,28 +9,9 @@ const log = @import("log.zig");
 const default_port = @import("default_port.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const effort = @import("effort.zig");
+const settings_resolve = @import("settings_resolve.zig");
 
-/// Where a load's value for one key came from. A request's own field outranks all of them.
-pub const Source = enum { flag, model_settings, default };
-
-pub fn Pick(comptime T: type) type {
-    return struct { value: T, source: Source };
-}
-
-/// An explicit launch flag outranks the file, which outranks the default. `flag` null = not given.
-pub fn pick(comptime T: type, flag: ?T, setting: ?T, default: T) Pick(T) {
-    if (flag) |f| return .{ .value = f, .source = .flag };
-    if (setting) |s| return .{ .value = s, .source = .model_settings };
-    return .{ .value = default, .source = .default };
-}
-
-pub fn sourceLabel(source: Source, flag_name: []const u8) []const u8 {
-    return switch (source) {
-        .flag => flag_name,
-        .model_settings => "model-settings.json",
-        .default => "default",
-    };
-}
+const Source = settings_resolve.Source;
 
 /// `--preserve-thinking on|off`; null = not given. Read per render, where a
 /// request's `chat_template_kwargs.preserve_thinking` outranks it.
@@ -41,11 +22,6 @@ pub var think_penalty_flag: ?f32 = null;
 /// The largest think penalty any source may set, in logits.
 pub const think_penalty_max: f32 = 20;
 
-/// A launch value counts as a flag only when the operator passed it.
-pub fn launchFlag(comptime T: type, value: T, explicit: bool) ?T {
-    return if (explicit) value else null;
-}
-
 /// What a load picks for a key with no flag and no file value; the load sites and the settings API read these.
 pub const default_mtp = true;
 pub const default_mtp_acceptance: mtp_acceptance.Mode = .exact;
@@ -54,8 +30,8 @@ pub const default_preserve_thinking = true;
 pub const default_think_penalty: f32 = 0;
 
 /// The manual context: `--ctx-size` > `ctx_size` > auto. 0 = auto, i.e. not given, on both sides.
-pub fn contextPick(flag: u32, setting: u32) Pick(u32) {
-    return pick(u32, if (flag > 0) flag else null, if (setting > 0) setting else null, 0);
+pub fn contextPick(flag: u32, setting: u32) settings_resolve.Setting(u32) {
+    return settings_resolve.resolve(u32, if (flag > 0) flag else null, if (setting > 0) setting else null, 0);
 }
 
 /// Whether a load arms the MTP head, and whether requests then default to it on any arch.
@@ -64,7 +40,7 @@ pub const MtpChoice = struct {
     source: Source,
 
     pub fn resolve(flag: ?bool, setting: ?bool, default: bool) MtpChoice {
-        const p = pick(bool, flag, setting, default);
+        const p = settings_resolve.resolve(bool, flag, setting, default);
         return .{ .on = p.value, .source = p.source };
     }
 
@@ -79,7 +55,7 @@ pub const MtpChoice = struct {
     }
 
     pub fn sourceName(self: MtpChoice) []const u8 {
-        return sourceLabel(self.source, if (self.on) "--mtp" else "--no-mtp");
+        return settings_resolve.sourceLabel(self.source, if (self.on) "--mtp" else "--no-mtp");
     }
 };
 
@@ -98,12 +74,12 @@ pub const VisionChoice = struct {
 
     /// `default_on` is false for a streamed load, whose tower and encode reserve come out of the expert cache.
     pub fn resolve(flag: ?bool, setting: ?bool, default_on: bool) VisionChoice {
-        const p = pick(bool, flag, setting, default_on);
+        const p = settings_resolve.resolve(bool, flag, setting, default_on);
         return .{ .on = p.value, .source = p.source };
     }
 
     pub fn sourceName(self: VisionChoice) []const u8 {
-        return sourceLabel(self.source, if (self.on) "--vision" else "--no-vision");
+        return settings_resolve.sourceLabel(self.source, if (self.on) "--vision" else "--no-vision");
     }
 };
 
@@ -407,6 +383,9 @@ pub const Fit = struct {
     head_streams: bool = true,
     /// The pack's experts are STQ, the only stream with an expert prefetcher.
     stq_experts: bool = true,
+    /// The arch has an expert prefetcher (`arch/admission.zig` `ExpertStreamTraits.prefetch`). It keeps no KV cache
+    /// and runs no MTP tail either: its drafts accept by the exact rule only.
+    prefetch: bool = false,
     /// The cache stores only what the MLA latent holds (`KVQuantConfig.glmLatentBits`).
     latent_kv: bool = false,
     /// The model's context window; 0 = unknown.
@@ -415,13 +394,10 @@ pub const Fit = struct {
     template_thinks: bool = true,
 };
 
-/// The arch with an expert prefetcher and no KV cache or MTP tail: its drafts accept by the exact rule only.
-pub const prefetch_arch = "deepseek_v41";
-
 /// Why the loader ignores `key` for this model, as a sentence for the person editing; null when it takes effect.
 pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
     const eql = std.mem.eql;
-    const special = eql(u8, fit.arch, prefetch_arch);
+    const special = fit.prefetch;
     if (eql(u8, key, "ssd_budget_gb")) return if (fit.streams_experts) null else "This model does not stream its experts from SSD.";
     if (eql(u8, key, "ssd_prefetch")) {
         if (!special) return "This model has no expert prefetcher.";
@@ -648,13 +624,13 @@ pub const Server = struct {
 };
 
 /// An automatic network look is on unless `--no-update-check` or the file turns it off.
-pub fn autoCheck(no_update_check: bool, file: ?bool) Pick(bool) {
-    return pick(bool, if (no_update_check) false else null, file, true);
+pub fn autoCheck(no_update_check: bool, file: ?bool) settings_resolve.Setting(bool) {
+    return settings_resolve.resolve(bool, if (no_update_check) false else null, file, true);
 }
 
 /// The load-time memory check runs unless `--skip-mem-preflight` or the file turns it off.
-pub fn skipMemPreflight(flag: bool, file: ?bool) Pick(bool) {
-    return pick(bool, if (flag) true else null, file, false);
+pub fn skipMemPreflight(flag: bool, file: ?bool) settings_resolve.Setting(bool) {
+    return settings_resolve.resolve(bool, if (flag) true else null, file, false);
 }
 
 /// The file's `"server"` section. `models_dir` borrows from `self`.
@@ -817,7 +793,7 @@ test "model_settings: the editor accepts exactly the values the loader applies" 
 
 test "model_settings: applies: a key shows only for a model the loader would honour it on" {
     const t = std.testing;
-    const dsv: Fit = .{ .arch = prefetch_arch, .streams_experts = true, .has_vision = true };
+    const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true };
     for ([_][]const u8{ "kv_quant", "mtp_acceptance", "mtp_greedy_tail" }) |k| try t.expect(!applies(k, dsv));
     for ([_][]const u8{ "ssd_budget_gb", "ssd_prefetch", "vision", "mtp", "ctx_size", "preserve_thinking", "think_penalty" }) |k| try t.expect(applies(k, dsv));
 
@@ -967,7 +943,7 @@ test "an explicit --ctx-size outranks the per-model ctx_size; 0 is auto on both 
     const t = std.testing;
     const flag = contextPick(16384, 4096);
     try t.expectEqual(@as(u32, 16384), flag.value);
-    try t.expectEqualStrings("--ctx-size", sourceLabel(flag.source, "--ctx-size"));
+    try t.expectEqualStrings("--ctx-size", settings_resolve.sourceLabel(flag.source, "--ctx-size"));
     const file = contextPick(0, 4096);
     try t.expectEqual(@as(u32, 4096), file.value);
     try t.expectEqual(Source.model_settings, file.source);
@@ -980,13 +956,13 @@ test "an explicit --mtp-typical / --mtp-tokenv3 outranks the per-model mtp_accep
     const t = std.testing;
     const Mode = mtp_acceptance.Mode;
     const typical: Mode = .{ .typical = .{ .delta = 0.3 } };
-    const flag = pick(Mode, typical, .{ .tokenv3 = 0.95 }, .exact);
+    const flag = settings_resolve.resolve(Mode, typical, .{ .tokenv3 = 0.95 }, .exact);
     try t.expectEqual(@as(f32, 0.3), flag.value.typical.delta);
-    try t.expectEqualStrings("--mtp-typical", sourceLabel(flag.source, acceptanceFlagName(flag.value)));
-    const file = pick(Mode, null, .{ .tokenv3 = 0.95 }, .exact);
+    try t.expectEqualStrings("--mtp-typical", settings_resolve.sourceLabel(flag.source, acceptanceFlagName(flag.value)));
+    const file = settings_resolve.resolve(Mode, null, .{ .tokenv3 = 0.95 }, .exact);
     try t.expectEqual(@as(f32, 0.95), file.value.tokenv3);
     try t.expectEqual(Source.model_settings, file.source);
-    const engine = pick(Mode, null, null, .exact);
+    const engine = settings_resolve.resolve(Mode, null, null, .exact);
     try t.expect(engine.value == .exact);
     try t.expectEqual(Source.default, engine.source);
 }
@@ -1195,10 +1171,10 @@ test "model_settings: limits: each arch and pack variant is offered only what th
     const headless: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .mtp_head = false };
     for ([_][]const u8{ "mtp", "mtp_acceptance", "mtp_greedy_tail" }) |k| try t.expect(!applies(k, headless));
 
-    const dsv: Fit = .{ .arch = prefetch_arch, .streams_experts = true, .has_vision = true, .streaming_required = true, .stq_experts = false };
+    const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true, .streaming_required = true, .stq_experts = false };
     try t.expect(!applies("ssd_prefetch", dsv));
     try t.expect(applies("mtp", dsv));
-    try t.expect(applies("ssd_prefetch", .{ .arch = prefetch_arch, .streams_experts = true, .has_vision = true }));
+    try t.expect(applies("ssd_prefetch", .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true }));
 
     const dropped: Fit = .{ .arch = "a", .streams_experts = true, .has_vision = false, .head_streams = false };
     try t.expectEqualStrings("ssd_budget_gb", limit("mtp", dropped).unset[0]);

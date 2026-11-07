@@ -512,8 +512,7 @@ test "a cleanup allocation failure never frees MLX on the connection thread" {
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
-    sch.kv_quant_config = .dense;
-    sch.kv_quant_explicit = false;
+    sch.kv_quant = .dense;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
     sch.submit_cond = .init;
@@ -685,8 +684,7 @@ test "a submit that fails before its slot exists hands the vision array to the i
             var sch: Scheduler = undefined;
             sch.allocator = allocator;
             sch.io = testing.io;
-            sch.kv_quant_config = kv;
-            sch.kv_quant_explicit = true;
+            sch.kv_quant = kv;
             sch.queue_mu = .init;
             sch.queue_cond = .init;
             sch.submit_cond = .init;

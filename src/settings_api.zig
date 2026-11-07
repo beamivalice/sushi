@@ -96,8 +96,8 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
     model_load.applyModelSettings(&bare, .{});
     bare.ssd_prefetch = null;
     return .{
-        .kv_quant = server.kvCacheForLaunch(&bare, kv_quant_mod.KVQuantConfig.engine_default, false).config,
-        .mtp = model_load.mtpChoiceFor(false, false, &bare).on,
+        .kv_quant = server.kvCacheForLaunch(&bare, null).config,
+        .mtp = model_load.mtpChoiceFor(null, &bare).on,
         .mtp_acceptance = model_settings.default_mtp_acceptance,
         .mtp_greedy_tail = model_settings.default_mtp_greedy_tail,
         .ssd_prefetch = bare.ssdPrefetchPct(),
@@ -780,7 +780,7 @@ fn cacheBudgetMessage(running_tiers_resized: usize) []const u8 {
 fn applyCacheBudget(sch: *@import("scheduler.zig").Scheduler, value: ?std.json.Value) []const u8 {
     if (model_settings.launch_locks.prefix_cache_disk_gb.set) return "saved; the --prefix-cache-disk flag still sets the size until a start without it";
     const gb: ?u64 = if (value) |v| @intCast(v.integer) else null;
-    server_state.setDiskAsk(if (gb) |g| g << 30 else disk_placement.DEFAULT_DISK_CAP, gb != null);
+    server_state.setDiskAsk(if (gb) |g| g << 30 else disk_placement.DEFAULT_DISK_CAP, if (gb != null) .model_settings else .default);
     const bytes = (gb orelse 0) << 30;
     if (gb == null or bytes == 0) return cacheBudgetMessage(0);
     var tiers = std.ArrayList(*model_registry_mod.LoadedModel).empty;
@@ -1056,7 +1056,7 @@ test "settings api: render names the keys a model honours, what a loaded model l
     defer file.deinit();
     const locks: model_settings.LaunchLocks = .{};
     const rows = [_]ModelRow{
-        .{ .id = "a", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = model_settings.prefetch_arch, .streams_experts = true, .has_vision = true }, .loaded = .{ .ctx_size = 4096, .kv_quant = null, .ssd_budget_gb = 60, .mtp_acceptance = .exact }, .tier = .{ .cap_bytes = 2 << 30, .used_bytes = 7 } },
+        .{ .id = "a", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true }, .loaded = .{ .ctx_size = 4096, .kv_quant = null, .ssd_budget_gb = 60, .mtp_acceptance = .exact }, .tier = .{ .cap_bytes = 2 << 30, .used_bytes = 7 } },
         .{ .id = "b", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false } },
     };
     const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
@@ -1098,7 +1098,7 @@ test "settings api: each model lists the limits its arch and pack put on its key
         .{ .id = "latent", .path = "/m/a", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false, .context_cap = 131072 } },
         .{ .id = "dropped", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "b", .streams_experts = true, .has_vision = false, .head_streams = false } },
         .{ .id = "plain", .path = "/m/c", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "c", .streams_experts = true, .has_vision = true } },
-        .{ .id = "bare", .path = "/m/d", .state = "unloaded", .bytes = 5, .fit = .{ .arch = model_settings.prefetch_arch, .streams_experts = true, .has_vision = true, .template_preserves_thinking = false } },
+        .{ .id = "bare", .path = "/m/d", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true, .template_preserves_thinking = false } },
     };
     const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
     defer testing.allocator.free(body);

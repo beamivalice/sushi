@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const qwen4_forward = @import("qwen4/qwen4_forward.zig");
@@ -53,27 +54,6 @@ const mtp_round = @import("mtp_round.zig");
 const drafter = @import("arch/drafter.zig");
 const spec_types = @import("spec_types.zig");
 const registry = @import("arch/registry.zig");
-
-/// Module-level overrides for prefill behavior. Defaults match the original
-/// hardcoded values; main.zig may overwrite these from CLI flags before
-/// `serve()` runs. Per-request reads happen on the same thread that did the
-/// CLI parse, so no atomicity needed.
-pub var prefill_chunk_override: usize = 8192;
-
-/// Set by `--prefill-chunk` in main.zig. An operator-chosen width outranks the
-/// per-model chunk the memory sizer pins (`ModelConfig.pinned_prefill_chunk`);
-/// without this flag the default 8192 is indistinguishable from a request.
-/// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
-pub var prefill_chunk_explicit: bool = false;
-
-/// Set once by the serve CLI before request construction. Direct callers may
-/// override it through InitOptions; exact remains the library default.
-pub var mtp_acceptance_default: mtp_acceptance.Mode = model_settings.default_mtp_acceptance;
-/// `--mtp-typical` / `--mtp-tokenv3` chose the default above.
-pub var mtp_acceptance_explicit: bool = false;
-
-/// `--mtp-greedy-tail` was given.
-pub var mtp_greedy_tail_explicit: bool = false;
 
 /// `--no-mtp-lookup`: no prompt-lookup drafts in MTP rounds or GLM DFlash2 chains .
 pub var mtp_lookup_disabled: bool = false;
@@ -1370,7 +1350,7 @@ pub const Generator = struct {
         // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
         // Vision requests skip chunking since image token positions must be visible
         // in a single forward pass for spliceVisionEmbeddings to work correctly.
-        // PREFILL_CHUNK comes from the module-level `prefill_chunk_override`
+        // PREFILL_CHUNK comes from the module-level `settings_resolve.prefill_chunk`
         // (set by --prefill-chunk in main.zig).
         //
         // Safety cap: on unfused head dims (>128)
@@ -1437,7 +1417,7 @@ pub const Generator = struct {
         else if (glm_request != null)
             glm5_generate.glm_checkpoint_stride
         else
-            prefill_plan.effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override));
+            prefill_plan.effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, settings_resolve.prefill_chunk.value));
         // Where a checkpoint is captured: GLM chunks on its chunk grid but keeps points only on the wider
         // restore-point grid.
         const cp_grid: usize = if (glm_request != null and want_ssm_cp) glm5_generate.glm_capture_stride else ssm_cp_stride;

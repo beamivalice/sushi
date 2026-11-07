@@ -31,6 +31,7 @@ test {
     _ = @import("http.zig");
     _ = @import("request_parse.zig");
     _ = @import("server_state.zig");
+    _ = @import("settings_resolve.zig");
     _ = @import("dsv41/tokenizer_deepseek.zig");
     _ = @import("stop_sequences.zig");
     _ = @import("row_grammar.zig");

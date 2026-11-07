@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const transformer_mod = @import("transformer.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const model_mod = @import("model.zig");
@@ -59,7 +60,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // 2048 is the default (a 64k prompt prefills within noise of 4096); an
     // explicit `--prefill-chunk` may raise it to that ceiling.
     if (head_dim == 192 and transformer_mod.prefillHeadDimFused(head_dim)) {
-        return @min(base_chunk, @as(usize, if (generate.prefill_chunk_explicit) 4096 else 2048));
+        return @min(base_chunk, @as(usize, if (settings_resolve.prefill_chunk.source == .flag) 4096 else 2048));
     }
     // Non-sliding hd-256 archs under FUSED causal (the default since the
     // budgeted-dispatch flip): no score tensor exists, so the scores-budget
@@ -106,10 +107,10 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     // the widest chunk whose one-off transient reserve still leaves this box a
     // real KV budget. It NARROWS, never raises, and an explicit
     // `--prefill-chunk` outranks it — the operator asked for a width.
-    const base: usize = if (generate.prefill_chunk_explicit or pinned_chunk == 0)
-        generate.prefill_chunk_override
+    const base: usize = if (settings_resolve.prefill_chunk.source == .flag or pinned_chunk == 0)
+        settings_resolve.prefill_chunk.value
     else
-        @min(generate.prefill_chunk_override, pinned_chunk);
+        @min(settings_resolve.prefill_chunk.value, pinned_chunk);
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
@@ -489,7 +490,7 @@ test "the held-state cap thins only states in memory: restore points already on 
 
 test "every ladder rung the adaptive width can take divides the checkpoint stride" {
     const t = testing;
-    const stride = effectiveSsmCheckpointStride(256, generate.prefill_chunk_override);
+    const stride = effectiveSsmCheckpointStride(256, settings_resolve.prefill_chunk.value);
     try t.expect(stride > 0);
     for ([_]usize{ 8192, 4096, 2048, 1024, PREFILL_CHUNK_FLOOR }) |rung| {
         try t.expect(rung <= stride);
@@ -626,17 +627,17 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
     // formula measures nothing and the chunk keeps its default at every
     // context. Without this the formula pins the 512 floor past ~256k.
     attn_kernels.fused256_override = true;
-    const saved_explicit = generate.prefill_chunk_explicit;
-    defer generate.prefill_chunk_explicit = saved_explicit;
-    generate.prefill_chunk_explicit = false;
+    const saved_source = settings_resolve.prefill_chunk.source;
+    defer settings_resolve.prefill_chunk.source = saved_source;
+    settings_resolve.prefill_chunk.source = .default;
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 192, 32, 8192, false, true, false));
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 192, 32, 262_144, false, true, false));
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 192, 32, 1_048_576, false, true, false));
     // An explicit `--prefill-chunk` raises it as far as the MoE ceiling.
-    generate.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.source = .flag;
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 192, 32, 262_144, false, true, false));
     try testing.expectEqual(@as(usize, 3072), boundedPrefillChunk(3072, 192, 32, 262_144, false, true, false));
-    generate.prefill_chunk_explicit = false;
+    settings_resolve.prefill_chunk.source = .default;
     // Never raises a caller-lowered base.
     try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(512, 192, 32, 1_048_576, false, true, false));
     // A real hd-256 MoE keeps its own measured 4096 branch.

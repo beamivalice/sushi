@@ -1,5 +1,6 @@
 //! DeepSeek-V4.1's own terms of the bill: the compressed state, the restore points and the forward cap.
 const std = @import("std");
+const settings_resolve = @import("../settings_resolve.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
@@ -16,7 +17,7 @@ const prefix_cache_mod = @import("../prefix_cache.zig");
 pub fn checkpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
     const c = config.dsv41 orelse return 0;
     const base = bills.effectiveSsmCheckpointStride(bills.launch_state.ssm_checkpoint_stride, bills.launch_state.prefix_cache_capacity, bills.launch_state.prefix_cache_ram_enabled, bills.diskBytesFor(config));
-    const stride = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override));
+    const stride = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), settings_resolve.prefill_chunk.value));
     if (stride == 0) return 0;
     const one = c.stateFixedBytes(config.dsparkOn()) +| seq *| c.stateBytesPerToken();
     // SSD-first, a point the tier takes shares the request's rows and leaves RAM as the writer copies it: what is in

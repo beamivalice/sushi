@@ -43,8 +43,8 @@ pub const Options = struct {
     ssd_prefetch: ?u8 = null,
     pick_tolerance: f32 = 0,
     wired_margin_bytes: u64 = 0,
-    enable_mtp: bool = false,
-    mtp_explicit: bool = false,
+    /// `--mtp` / `--no-mtp`; null = not given (the head stays off).
+    mtp: ?bool = null,
     /// `SUSHI_HIDDEN_OUT`: capture appends each prompt forward's block boundaries here.
     hidden_out: []const u8 = "",
     /// `SUSHI_IMATRIX_OUT`: a native GLM capture also accumulates the experts' imatrix and writes it here.
@@ -147,11 +147,9 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
         } else if (std.mem.eql(u8, a, "--no-template")) {
             o.no_template = true;
         } else if (std.mem.eql(u8, a, "--no-mtp")) {
-            o.enable_mtp = false;
-            o.mtp_explicit = true;
+            o.mtp = false;
         } else if (std.mem.eql(u8, a, "--mtp")) {
-            o.enable_mtp = true;
-            o.mtp_explicit = true;
+            o.mtp = true;
         } else if (std.mem.eql(u8, a, "--layer-major")) {
             o.layer_major = true;
         } else if (valueFlag(a)) |flag| {
@@ -313,7 +311,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     )) {
         const budget = kld_budget;
         if (budget.bytes == 0) return error.ExpertStreamingRequired;
-        const mtp = model_settings_mod.MtpChoice.resolve(model_settings_mod.launchFlag(bool, opts.enable_mtp, opts.mtp_explicit), self.config.mtp_override, false);
+        const mtp = model_settings_mod.MtpChoice.resolve(opts.mtp, self.config.mtp_override, false);
         switch (expert_stream_mod.mtpUnderStreaming(mtp.on, mtp.source == .model_settings, mtp.source == .default, false)) {
             .keep, .refuse => {
                 log.err("[expert-stream] KLD scoring under expert streaming runs without the MTP head; drop --mtp\n", .{});
@@ -979,16 +977,16 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(@as(u32, 8192), capture.ctx_size);
     try testing.expectEqual(@as(u8, 8), capture.kv_quant_config.bits);
     try testing.expectEqual(@as(u64, 94) << 30, capture.ssd_budget_bytes);
-    try testing.expect(!capture.enable_mtp);
+    try testing.expect(capture.mtp == false);
 
     const compare = try parseArgs(&.{ "compare", "--model", "/models/pack", "--fixture", "/fixtures/teacher", "--json", "/tmp/out.json" });
     try testing.expectEqual(Command.compare, compare.command);
     try testing.expectEqualStrings("/fixtures/teacher", compare.fixture);
     try testing.expectEqualStrings("/tmp/out.json", compare.json_out);
-    try testing.expect(!compare.enable_mtp);
+    try testing.expect(compare.mtp == null);
     try testing.expectEqual(@as(u32, 64), compare.tokens);
     const with_mtp = try parseArgs(&.{ "compare", "--model", "/models/pack", "--fixture", "/fixtures/teacher", "--mtp" });
-    try testing.expect(with_mtp.enable_mtp);
+    try testing.expect(with_mtp.mtp == true);
 
     const routed = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.3", "--wired-margin-gib", "5" });
     try testing.expectEqual(@as(f32, 0.3), routed.pick_tolerance);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const server_state = @import("server_state.zig");
 const arch_flags = @import("arch/flags.zig");
 const mlx = @import("mlx.zig");
@@ -45,7 +46,6 @@ const glm5_rows_tick = @import("glm5/glm5_rows_tick.zig");
 const glm5_state = @import("glm5/glm5_state.zig");
 const glmRowsUbench = glm5_rows_tick.glmRowsUbench;
 const glmRoundUbench = glm5_rows_tick.glmRoundUbench;
-const mtp_plan = @import("mtp_plan.zig");
 const sampler = @import("sampler.zig");
 const testing = std.testing;
 const bills = @import("bills.zig");
@@ -113,9 +113,8 @@ pub const LoadParams = struct {
     /// checkpoint could carry its own, so the opt-out needs its own bit.
     no_drafter: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
-    mtp_enabled: bool = true,
-    /// `--mtp` / `--no-mtp` was given: `mtp_enabled` then outranks the per-model `mtp`.
-    mtp_explicit: bool = false,
+    /// `--mtp` / `--no-mtp`; null = not given. A flag outranks the per-model `mtp`.
+    mtp: ?bool = null,
     mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
@@ -127,11 +126,8 @@ pub const LoadParams = struct {
     /// the decode path on the inference thread. Adds ~600-900 ms at boot but
     /// keeps the first user request fast.
     warmup_eager: bool = true,
-    /// KV-cache storage backend: `--kv-quant`, else the kv8 engine default. Stored on every
-    /// per-slot KVCache and consulted at every read/write boundary.
-    kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default,
-    /// `--kv-quant` was given: the flag then outranks the per-model `kv_quant`.
-    kv_quant_explicit: bool = false,
+    /// `--kv-quant`; null = not given. A flag outranks the per-model `kv_quant`, which outranks the kv8 engine default.
+    kv_quant: ?transformer_mod.KVQuantConfig = null,
     /// Per-model hot prefix cache capacity (count). 0 disables.
     prefix_cache_capacity: u32 = 1,
     prefix_cache_ram_enabled: bool = true,
@@ -270,8 +266,8 @@ fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelCon
 }
 
 /// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
-pub fn mtpChoiceFor(mtp_enabled: bool, mtp_explicit: bool, config: *const ModelConfig) model_settings.MtpChoice {
-    return model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, model_settings.default_mtp);
+pub fn mtpChoiceFor(flag: ?bool, config: *const ModelConfig) model_settings.MtpChoice {
+    return model_settings.MtpChoice.resolve(flag, config.mtp_override, model_settings.default_mtp);
 }
 
 /// The streaming gate's verdict on a load's MTP choice (`expert_stream.mtpUnderStreaming`). The gate
@@ -313,44 +309,24 @@ test "a streamed load drops only the engine-default MTP, never an asked-for one"
 /// What a load line and `/props` read for the MTP, acceptance, greedy-tail and KV keys, under the launch globals.
 const LaunchPicks = struct {
     mtp: model_settings.MtpChoice,
-    acceptance: model_settings.Pick(mtp_acceptance_mod.Mode),
-    greedy_tail: model_settings.Pick(bool),
+    acceptance: settings_resolve.Setting(mtp_acceptance_mod.Mode),
+    greedy_tail: settings_resolve.Setting(bool),
     kv: transformer_mod.KvCacheChoice,
 
     fn of(mtp_flag: ?bool, kv_flag: ?transformer_mod.KVQuantConfig, config: *const ModelConfig) LaunchPicks {
         return .{
-            .mtp = mtpChoiceFor(mtp_flag orelse true, mtp_flag != null, config),
-            .acceptance = mtp_plan.mtpAcceptanceFor(config.mtp_acceptance_override),
-            .greedy_tail = mtp_plan.mtpGreedyTailFor(config.mtp_greedy_tail_override),
-            .kv = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_flag orelse transformer_mod.KVQuantConfig.engine_default, kv_flag != null),
+            .mtp = mtpChoiceFor(mtp_flag, config),
+            .acceptance = settings_resolve.acceptanceFor(config.mtp_acceptance_override),
+            .greedy_tail = settings_resolve.greedyTailFor(config.mtp_greedy_tail_override),
+            .kv = transformer_mod.KvCacheChoice.resolve(kv_flag, config.kv_quant_override),
         };
-    }
-};
-
-const LaunchGlobals = struct {
-    acceptance: mtp_acceptance_mod.Mode,
-    acceptance_explicit: bool,
-    greedy_tail_explicit: bool,
-
-    fn save() LaunchGlobals {
-        return .{
-            .acceptance = generate_mod.mtp_acceptance_default,
-            .acceptance_explicit = generate_mod.mtp_acceptance_explicit,
-            .greedy_tail_explicit = generate_mod.mtp_greedy_tail_explicit,
-        };
-    }
-
-    fn restore(self: LaunchGlobals) void {
-        generate_mod.mtp_acceptance_default = self.acceptance;
-        generate_mod.mtp_acceptance_explicit = self.acceptance_explicit;
-        generate_mod.mtp_greedy_tail_explicit = self.greedy_tail_explicit;
     }
 };
 
 test "an explicit launch flag outranks model-settings.json for MTP, acceptance, greedy tail and KV" {
-    const saved = LaunchGlobals.save();
-    defer saved.restore();
-    (LaunchGlobals{ .acceptance = .exact, .acceptance_explicit = false, .greedy_tail_explicit = false }).restore();
+    const saved = settings_resolve.launch;
+    defer settings_resolve.launch = saved;
+    settings_resolve.launch = .{};
     var file = ModelConfig{};
     file.mtp_override = false;
     file.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
@@ -359,22 +335,28 @@ test "an explicit launch flag outranks model-settings.json for MTP, acceptance, 
 
     const unflagged = LaunchPicks.of(null, null, &file);
     try testing.expect(!unflagged.mtp.on);
-    try testing.expectEqual(model_settings.Source.model_settings, unflagged.mtp.source);
-    try testing.expectEqual(model_settings.Source.model_settings, unflagged.acceptance.source);
-    try testing.expectEqual(model_settings.Pick(bool){ .value = true, .source = .model_settings }, unflagged.greedy_tail);
+    try testing.expectEqual(settings_resolve.Source.model_settings, unflagged.mtp.source);
+    try testing.expectEqual(settings_resolve.Source.model_settings, unflagged.acceptance.source);
+    try testing.expectEqual(settings_resolve.Setting(bool){ .value = true, .source = .model_settings }, unflagged.greedy_tail);
     try testing.expectEqualStrings("model-settings.json", unflagged.kv.sourceName());
 
-    generate_mod.mtp_acceptance_default = .{ .typical = .{ .delta = 0.1 } };
-    generate_mod.mtp_acceptance_explicit = true;
-    generate_mod.mtp_greedy_tail_explicit = true;
+    settings_resolve.launch = .{ .mtp_acceptance = .{ .typical = .{ .delta = 0.1 } }, .mtp_greedy_tail = true };
     const flagged = LaunchPicks.of(true, transformer_mod.KVQuantConfig.affine(4), &file);
     try testing.expect(flagged.mtp.on);
     try testing.expectEqualStrings("--mtp", flagged.mtp.sourceName());
     try testing.expectEqual(@as(f32, 0.1), flagged.acceptance.value.typical.delta);
-    try testing.expectEqual(model_settings.Source.flag, flagged.acceptance.source);
-    try testing.expectEqual(model_settings.Source.flag, flagged.greedy_tail.source);
+    try testing.expectEqual(settings_resolve.Source.flag, flagged.acceptance.source);
+    try testing.expectEqual(settings_resolve.Source.flag, flagged.greedy_tail.source);
     try testing.expectEqualStrings("kv4", flagged.kv.label());
     try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
+}
+
+test "the width a load warms its spec verify at is the one it resolved, a file kv_quant included" {
+    var cfg = ModelConfig{ .model_type = "qwen4_exp" };
+    try testing.expectEqual(transformer_mod.KVQuantConfig.engine_default, bills.kvCacheForLaunch(&cfg, null).config);
+    cfg.kv_quant_override = transformer_mod.KVQuantConfig.affine(4);
+    try testing.expectEqual(transformer_mod.KVQuantConfig.affine(4), bills.kvCacheForLaunch(&cfg, null).config);
+    try testing.expectEqual(transformer_mod.KVQuantConfig.affine(6), bills.kvCacheForLaunch(&cfg, transformer_mod.KVQuantConfig.affine(6)).config);
 }
 
 test "a model-settings kv_quant the MLA latent cannot store is dropped at stamping, never a refused load" {
@@ -389,12 +371,12 @@ test "a model-settings kv_quant the MLA latent cannot store is dropped at stampi
 }
 
 test "an explicit --mtp keeps the head on a streamed load, or refuses when it cannot" {
-    const asked = mtpChoiceFor(true, true, &ModelConfig{});
+    const asked = mtpChoiceFor(true, &ModelConfig{});
     try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.keep, mtpStreamingVerdict(asked, true));
     try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked, false));
     var streamed = ModelConfig{};
     streamed.expert_streaming = true;
-    try testing.expect(mtpChoiceFor(true, true, &streamed).on);
+    try testing.expect(mtpChoiceFor(true, &streamed).on);
 }
 
 pub const SsdBudgetOrigin = enum { none, flag, model_settings, ram_default };
@@ -1503,7 +1485,7 @@ test "a cold load reads the serving bill on the config the load stamps with the 
 /// `params` is duck-typed (`anytype`): both `LoadParams` (startup) and
 /// `*LoadRequest` (on-demand) supply the same field set — `entry`,
 /// `config`/`tok`/`chat_config` (heap pointers), `model_dir`,
-/// `drafter_dir`, `load_vision`, `warmup_eager`, `kv_quant_config`,
+/// `drafter_dir`, `load_vision`, `warmup_eager`, `kv_quant`,
 /// `prefix_cache_capacity`, `prefix_cache_mem_bytes`. The function reads them by name.
 ///
 /// On any error the partial state has already been freed via errdefer; the
@@ -1519,21 +1501,21 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         params.config.expert_source_dir = null;
     };
     if (params.config.isGlm5()) {
-        const kv = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
+        const kv = transformer_mod.KvCacheChoice.resolve(params.kv_quant, params.config.kv_quant_override);
         if (kv.config.glmLatentBits() == null) {
             log.err("[glm] native MLA cache supports --kv-quant 8, 6 or off\n", .{});
             return error.GlmKvQuantUnsupported;
         }
     }
     if (arch_flags.archFlagRefusal(params.config, .{
-        .kv_quant = params.kv_quant_explicit,
+        .kv_quant = params.kv_quant != null,
         .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         .drop_expert = params.config.drop_expert != 0,
         .ssd_prefetch = params.config.ssd_prefetch != null,
-        .mtp_typical = generate_mod.mtp_acceptance_explicit and generate_mod.mtp_acceptance_default == .typical,
-        .mtp_tokenv3 = generate_mod.mtp_acceptance_explicit and generate_mod.mtp_acceptance_default == .tokenv3,
-        .mtp_greedy_tail = generate_mod.mtp_greedy_tail_explicit,
+        .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
+        .mtp_tokenv3 = if (settings_resolve.launch.mtp_acceptance) |m| m == .tokenv3 else false,
+        .mtp_greedy_tail = settings_resolve.launch.mtp_greedy_tail != null,
     })) |why| {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
@@ -1557,7 +1539,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             log.err("{s}\n", .{budget_required_message});
             return error.ExpertStreamingRequired;
         }
-        const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
+        const mtp = mtpChoiceFor(params.mtp, params.config);
         const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(sch.io, sch.allocator, params.config, params.model_dir));
         switch (verdict) {
             .refuse => {
@@ -1605,9 +1587,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     } else if (params.config.isGlm5()) {
         streaming_resident_bytes = try @import("glm5/glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, load_vision and params.config.glm5_vision);
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
-        streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
+        streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on);
     } else if (params.config.usesMimoSourceTrunk()) {
-        streaming_resident_bytes = try mimoResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
+        streaming_resident_bytes = try mimoResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on);
     }
     if (params.config.has_vision) {
         var line_buf: [256]u8 = undefined;
@@ -1627,7 +1609,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.config.isQwen4() and drafter_dir.len > 0) try stampDflashRequestTerms(sch.io, sch.allocator, params.config, drafter_dir);
     if (params.config.isQwen4() and drafter_dir.len == 0) {
         const why: []const u8 = if (params.no_drafter) "--no-drafter" else "DFlash2: --drafter <path>";
-        const mtp_on = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
+        const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
         log.info("[spec] Qwen3.8-Flash-Next decodes with {s} ({s})\n", .{ if (mtp_on) "MTP" else "plain ticks", why });
     }
     if (params.config.isGlm5()) {
@@ -1664,7 +1646,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config), .wired_floor = bills.wiredCeilingFloorFor(params.config) };
         var avail_bytes = reader.read();
-        const mtp_on = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
+        const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
         var serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
         var needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         if (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
@@ -1751,7 +1733,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     errdefer sch.allocator.destroy(weights_ptr);
     var load_config = params.config.*;
     // The resolved launch choice gates lazy native-head tensors before Transformer.init binds them.
-    load_config.mtp_override = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
+    load_config.mtp_override = mtpChoiceFor(params.mtp, params.config).on;
     weights_ptr.* = try model_mod.loadWeightsForConfig(sch.io, sch.allocator, params.model_dir, &load_config, load_vision);
     errdefer weights_ptr.deinit();
     model_mod.resolveWeightPrefix(params.config, weights_ptr);
@@ -1778,23 +1760,23 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
     // An explicit launch flag outranks the per-model settings stamped on the config at BOTH construction sites.
-    const kv_cache = bills.kvCacheForLaunch(params.config, params.kv_quant_config, params.kv_quant_explicit);
+    const kv_cache = bills.kvCacheForLaunch(params.config, params.kv_quant);
     const load_ctx = model_settings.contextPick(sch.ctx_size_flag, params.config.ctx_override);
     var ctx_buf: [16]u8 = undefined;
     log.info("[kv-cache] {s} ({s}); ctx {s} ({s})\n", .{
         kv_cache.label(),                                      kv_cache.sourceName(),
-        model_settings.contextLabel(&ctx_buf, load_ctx.value), model_settings.sourceLabel(load_ctx.source, "--ctx-size"),
+        model_settings.contextLabel(&ctx_buf, load_ctx.value), settings_resolve.sourceLabel(load_ctx.source, "--ctx-size"),
     });
     const kv_quant_config = kv_cache.config;
-    const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
+    const mtp = mtpChoiceFor(params.mtp, params.config);
     const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming, params.config.stream_mtp_head);
-    const acceptance = mtp_plan.mtpAcceptanceFor(params.config.mtp_acceptance_override);
-    const greedy_tail = mtp_plan.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
+    const acceptance = settings_resolve.acceptanceFor(params.config.mtp_acceptance_override);
+    const greedy_tail = settings_resolve.greedyTailFor(params.config.mtp_greedy_tail_override);
     // GLM has no MTP head; the server's `MTP: off` line already says so.
     if (!params.config.isGlm5() and !params.config.isDsv41()) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
         if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
-        mtp_acceptance_mod.name(acceptance.value),     model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
-        if (greedy_tail.value) "on" else "off",        model_settings.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
+        mtp_acceptance_mod.name(acceptance.value),     settings_resolve.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
+        if (greedy_tail.value) "on" else "off",        settings_resolve.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
     });
     const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5() and !params.config.isDsv41();
     if (params.config.isDsv41()) {
@@ -1819,11 +1801,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
     }
     if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config.chat_template)) {
-        const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, model_settings.default_preserve_thinking);
-        log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", model_settings.sourceLabel(keep.source, "--preserve-thinking") });
+        const keep = settings_resolve.resolve(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, model_settings.default_preserve_thinking);
+        log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", settings_resolve.sourceLabel(keep.source, "--preserve-thinking") });
     }
-    const think = model_settings.pick(f32, model_settings.think_penalty_flag, params.config.think_penalty_override, model_settings.default_think_penalty);
-    if (think.value > 0) log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, model_settings.sourceLabel(think.source, "--think-penalty") });
+    const think = settings_resolve.resolve(f32, model_settings.think_penalty_flag, params.config.think_penalty_override, model_settings.default_think_penalty);
+    if (think.value > 0) log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, settings_resolve.sourceLabel(think.source, "--think-penalty") });
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
@@ -2218,11 +2200,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
         if (mtp_enabled and xfm_ptr.qwen4_mtp != null) {
             const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
-            xfm_ptr.warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
+            xfm_ptr.warmupSpecVerify(cap, kv_quant_config) catch |err| {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
         }
-        if (mimoVerifyWarmWanted(params.config)) mimoSpecWarmup(sch.io, xfm_ptr, mimo_head, params.kv_quant_config);
+        if (mimoVerifyWarmWanted(params.config)) mimoSpecWarmup(sch.io, xfm_ptr, mimo_head, kv_quant_config);
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
@@ -2298,7 +2280,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.prefix_cache_capacity > 0 and params.prefix_cache_disk_bytes == 0) {
         const ask = bills.diskAsk();
         var off_buf: [96]u8 = undefined;
-        if (ask.explicit) log.info("{s}\n", .{disk_placement.diskOffLine(&off_buf, 0, "", ask.sourceName())});
+        if (ask.explicit()) log.info("{s}\n", .{disk_placement.diskOffLine(&off_buf, 0, "", ask.sourceName())});
     }
     if (cache_applies and params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
         const layout = diskLayoutKey(sch.allocator, params.config, entry.path, xfm_ptr) catch |err| {

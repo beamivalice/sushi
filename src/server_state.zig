@@ -1,6 +1,7 @@
 //! The process globals of the server: what `main.zig` and the settings API set at launch and the handlers, bills and the
 //! scheduler read. Written before `serve` accepts a connection unless a field says otherwise.
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const transformer_mod = @import("transformer.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -138,8 +139,8 @@ pub var prefix_cache_ram_enabled: bool = false;
 /// still apply).
 pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
 pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
-/// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
-pub var prefix_cache_mem_explicit = false;
+/// `.flag` once `--prefix-cache-mem` is given: the operator's number is used as given, even when it equals the default.
+pub var prefix_cache_mem_source: settings_resolve.Source = .default;
 
 /// `--prefix-cache-mem 0` (or `off`) is "no RAM retention".
 pub fn ramRetentionForMemArg(mem_bytes: u64) bool {
@@ -156,20 +157,17 @@ test "ramRetentionForMemArg: a zero budget keeps RAM retention off" {
 /// of recomputed, LRU-evicted to the budget. Unnamed, the ask is the 20 GB ceiling and the tier is on;
 /// `prefixCacheDiskForLoad` sizes the real budget per model (the Swift app's Settings toggle passes the flag).
 pub var prefix_cache_disk_bytes: u64 = disk_placement.DEFAULT_DISK_CAP;
-/// Set by `--prefix-cache-disk`: the operator's number is the budget as given.
-pub var prefix_cache_disk_explicit = false;
-/// The explicit number came from `model-settings.json`, not the flag.
-pub var prefix_cache_disk_from_file = false;
+/// Who named the ask: `--prefix-cache-disk` (`.flag`) or `server.prefix_cache_disk_gb` (`.model_settings`) make the
+/// number the budget as given; `.default` leaves it to the per-model sizing.
+pub var prefix_cache_disk_source: settings_resolve.Source = .default;
 
-/// The settings API's write: an explicit number is the file's. Publishes the bytes before the explicit bit, so a
-/// reader that sees `explicit` sees its number.
-pub fn setDiskAsk(bytes: u64, explicit: bool) void {
-    @atomicStore(bool, &prefix_cache_disk_from_file, explicit, .monotonic);
-    if (explicit) {
+/// The settings API's write. Publishes the bytes before a named source, so a reader that sees the source sees its number.
+pub fn setDiskAsk(bytes: u64, source: settings_resolve.Source) void {
+    if (source != .default) {
         @atomicStore(u64, &prefix_cache_disk_bytes, bytes, .monotonic);
-        @atomicStore(bool, &prefix_cache_disk_explicit, true, .release);
+        @atomicStore(settings_resolve.Source, &prefix_cache_disk_source, source, .release);
     } else {
-        @atomicStore(bool, &prefix_cache_disk_explicit, false, .release);
+        @atomicStore(settings_resolve.Source, &prefix_cache_disk_source, source, .release);
         @atomicStore(u64, &prefix_cache_disk_bytes, bytes, .monotonic);
     }
 }

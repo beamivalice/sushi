@@ -18,6 +18,7 @@ const request_policy = @import("request_policy.zig");
 const scheduler_mod = @import("scheduler.zig");
 const slot_admission = @import("slot_admission.zig");
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const testing = std.testing;
 const transformer_mod = @import("transformer.zig");
 
@@ -252,11 +253,11 @@ test "admission tries the ladder DOWN before refusing: a prompt that fits only a
     bills.per_request_chunk_override = null;
 
     // An explicit `--prefill-chunk` caps the ladder, it does not pin it: the same step down.
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    settings_resolve.prefill_chunk.value = 4096;
+    settings_resolve.prefill_chunk.source = .flag;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        settings_resolve.prefill_chunk.value = 8192;
+        settings_resolve.prefill_chunk.source = .default;
     }
     const capped = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, bills.explicitPrefillChunk(), .{});
     try t.expectEqual(floor_width, capped);

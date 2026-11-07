@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const mlx = @import("mlx.zig");
@@ -755,7 +756,7 @@ const PropsSettings = struct {
     mtp_choice: model_settings.MtpChoice = .{ .on = true, .source = .default },
     mtp_acceptance: mtp_acceptance_mod.Mode,
     mtp_acceptance_source: []const u8 = "default",
-    mtp_greedy_tail: model_settings.Pick(bool) = .{ .value = false, .source = .default },
+    mtp_greedy_tail: settings_resolve.Setting(bool) = .{ .value = false, .source = .default },
     /// False on an arch whose drafts the file's acceptance and greedy-tail keys do not reach (DSpark).
     mtp_acceptance_applies: bool = true,
     /// 0 = auto.
@@ -783,8 +784,8 @@ fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
 }
 
 const MtpAcceptanceReport = struct {
-    acceptance: model_settings.Pick(mtp_acceptance_mod.Mode),
-    greedy_tail: model_settings.Pick(bool),
+    acceptance: settings_resolve.Setting(mtp_acceptance_mod.Mode),
+    greedy_tail: settings_resolve.Setting(bool),
     applies: bool,
 };
 
@@ -792,8 +793,8 @@ const MtpAcceptanceReport = struct {
 fn mtpAcceptanceReport(config: *const model_mod.ModelConfig) MtpAcceptanceReport {
     const applies = model_settings.applies("mtp_acceptance", arch_flags.settingsFit(config));
     return .{
-        .acceptance = mtp_plan.mtpAcceptanceFor(if (applies) config.mtp_acceptance_override else null),
-        .greedy_tail = mtp_plan.mtpGreedyTailFor(if (applies) config.mtp_greedy_tail_override else null),
+        .acceptance = settings_resolve.acceptanceFor(if (applies) config.mtp_acceptance_override else null),
+        .greedy_tail = settings_resolve.greedyTailFor(if (applies) config.mtp_greedy_tail_override else null),
         .applies = applies,
     };
 }
@@ -810,13 +811,13 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .engine = "mlx",
         .kv_quant = kv.wireName(),
         .kv_cache = kv_cache,
-        .prefill_chunk = generate_mod.prefill_chunk_override,
+        .prefill_chunk = settings_resolve.prefill_chunk.value,
         .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
         .mtp_loaded = mtpCapable(lm),
         .mtp_default_on = defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head),
         .mtp_choice = mtpChoiceFor(config),
         .mtp_acceptance = acceptance.value,
-        .mtp_acceptance_source = model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
+        .mtp_acceptance_source = settings_resolve.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
         .mtp_greedy_tail = report.greedy_tail,
         .mtp_acceptance_applies = report.applies,
         .mtp_depth = lm.mtp_depth,
@@ -862,7 +863,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         js(st.mtp_choice.sourceName()),                     js(st.mtp_acceptance_source),
         js(mtp_acceptance_mod.name(st.mtp_acceptance)),     param,
         st.mtp_acceptance_applies,
-        st.mtp_greedy_tail.value,                           js(model_settings.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail")),
+        st.mtp_greedy_tail.value,                           js(settings_resolve.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail")),
         st.mtp_depth,                                       st.mtp_adaptive,
         st.max_mtp_ctx,                                     js(st.drafter),
         st.max_concurrent,                                  st.prefill_decode_share,
@@ -1082,8 +1083,9 @@ test "settingsPropsJson: /props names the vision choice and a streamed tower's b
 }
 
 test "/props reports acceptance and greedy tail as not applying on an arch that ignores them" {
+    if (@import("arch/registry.zig").ofModelType("deepseek_v41") == null) return error.SkipZigTest;
     var dsv = model_mod.ModelConfig{};
-    dsv.model_type = model_settings.prefetch_arch;
+    dsv.model_type = "deepseek_v41";
     dsv.mtp_acceptance_override = .{ .typical = .{ .delta = 0.2 } };
     dsv.mtp_greedy_tail_override = true;
     const ds = mtpAcceptanceReport(&dsv);
@@ -1138,7 +1140,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     const frag = try settingsPropsJson(testing.allocator, .{
         .engine = "mlx",
         .kv_quant = "4",
-        .kv_cache = transformer_mod.KvCacheChoice.resolve(transformer_mod.KVQuantConfig.affine(4), transformer_mod.KVQuantConfig.engine_default, false),
+        .kv_cache = transformer_mod.KvCacheChoice.resolve(null, transformer_mod.KVQuantConfig.affine(4)),
         .prefill_chunk = 8192,
         .mtp_loaded = true,
         .mtp_default_on = true,

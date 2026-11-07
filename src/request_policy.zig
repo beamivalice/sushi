@@ -1,4 +1,5 @@
 const std = @import("std");
+const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const transformer_mod = @import("transformer.zig");
@@ -72,7 +73,7 @@ fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 /// model-settings.json > off.
 pub fn resolveThinkPenalty(root: std.json.ObjectMap, flag: ?f32, setting: ?f32) f32 {
     if (parseJsonFloatOpt(root, "think_penalty", 0, model_settings.think_penalty_max)) |v| return v;
-    return model_settings.pick(f32, flag, setting, model_settings.default_think_penalty).value;
+    return settings_resolve.resolve(f32, flag, setting, model_settings.default_think_penalty).value;
 }
 
 /// The penalty for one request: off unless it thinks, lambda > 0 and its span is trackable
