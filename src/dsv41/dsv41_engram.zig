@@ -228,8 +228,8 @@ pub const Table = struct {
     sdim: u32,
     /// Hot rows held in RAM; null reads every row from the shard.
     cache: ?*RowCache = null,
-    /// Rows `pread` from the shard so far.
-    rows_read: std.atomic.Value(u64) = .init(0),
+    /// A counter of the rows `pread` from the shard, for a test to point at its own cell.
+    rows_read: ?*std.atomic.Value(u64) = null,
 
     pub fn close(self: *Table) void {
         _ = std.c.close(self.fd);
@@ -371,8 +371,8 @@ pub const Table = struct {
     /// Reads `ids[i]` into row i of `w` and `sc` for every i of `only` (all of them when null).
     fn readInto(self: *const Table, ids: []const u32, only: ?[]const u32, w: []u8, sc: []u8) !void {
         const n = if (only) |o| o.len else ids.len;
-        _ = @constCast(&self.rows_read).fetchAdd(n, .monotonic);
-        const job: Job = .{ .t = self, .ids = ids, .only = only, .w = w, .s = sc };
+        if (self.rows_read) |c| _ = c.fetchAdd(n, .monotonic);
+        var job: Job = .{ .t = self, .ids = ids, .only = only, .w = w, .s = sc };
         // One thread per 16 rows (a verify's rows wait at the first Engram layer), this one included.
         const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
         if (parts > 1) {
@@ -430,12 +430,12 @@ pub const Table = struct {
         s: []u8,
         bad: std.atomic.Value(bool) = .init(false),
 
-        fn runVoid(self: *const Job, first: usize, stride: usize) void {
+        fn runVoid(self: *Job, first: usize, stride: usize) void {
             _ = self.run(first, stride);
         }
 
         /// Every `stride`-th row from `first`, asked of the kernel first.
-        fn run(self: *const Job, first: usize, stride: usize) bool {
+        fn run(self: *Job, first: usize, stride: usize) bool {
             const t = self.t;
             const wl = t.head_dim;
             const sl = t.sdim;
@@ -449,7 +449,7 @@ pub const Table = struct {
                     !preadAll(t.fd, self.w[i * wl ..][0..wl], t.w_off + r * wl) or
                     !preadAll(t.fd, self.s[i * sl ..][0..sl], t.s_off + r * sl))
                 {
-                    @constCast(&self.bad).store(true, .release);
+                    self.bad.store(true, .release);
                     return false;
                 }
             }
@@ -974,15 +974,17 @@ test "dsv41 engram: an id repeated within a batch is read from the shard once an
     const dir = buf[0..try td.dir.realPath(io, &buf)];
     var t = try Table.open(testing.allocator, dir, 1, 4, 64);
     defer t.close();
+    var rows_read: std.atomic.Value(u64) = .init(0);
+    t.rows_read = &rows_read;
     var wide: [144]u32 = undefined;
     for (&wide, 0..) |*id, i| id.* = @intCast((i * 7 + i / 5) % 4);
     for ([_][]const u32{ &.{ 3, 1, 3, 3, 0, 1, 2, 3 }, &.{ 2, 2 }, &.{1}, &wide }) |ids| {
-        const before = t.rows_read.load(.monotonic);
+        const before = rows_read.load(.monotonic);
         const got = try t.read(testing.allocator, ids);
         defer got.deinit(testing.allocator);
         var distinct: u64 = 0;
         for (0..4) |r| distinct += @intFromBool(std.mem.indexOfScalar(u32, ids, @intCast(r)) != null);
-        try testing.expectEqual(distinct, t.rows_read.load(.monotonic) - before);
+        try testing.expectEqual(distinct, rows_read.load(.monotonic) - before);
         for (ids, 0..) |id, i| {
             try testing.expectEqual(@as(u8, @intCast(127 + id)), got.s[2 * i]);
             try testing.expectEqual(@as(u8, 126), got.s[2 * i + 1]);
@@ -1004,17 +1006,37 @@ test "dsv41 engram: with a row cache a repeated missed id is read once, and a ca
     var cache = try RowCache.init(testing.allocator, 4 * RowCache.WAYS, 64, 2);
     defer cache.deinit();
     t.cache = &cache;
+    var rows_read: std.atomic.Value(u64) = .init(0);
+    t.rows_read = &rows_read;
     for ([_]struct { ids: []const u32, reads: u64 }{
         .{ .ids = &.{ 2, 1, 2, 2, 1 }, .reads = 2 },
         .{ .ids = &.{ 1, 2, 3, 3 }, .reads = 1 },
         .{ .ids = &.{ 3, 2, 1, 2 }, .reads = 0 },
     }) |c| {
-        const before = t.rows_read.load(.monotonic);
+        const before = rows_read.load(.monotonic);
         const got = try t.read(testing.allocator, c.ids);
         defer got.deinit(testing.allocator);
-        try testing.expectEqual(c.reads, t.rows_read.load(.monotonic) - before);
+        try testing.expectEqual(c.reads, rows_read.load(.monotonic) - before);
         for (c.ids, 0..) |id, i| try testing.expectEqual(@as(u8, @intCast(127 + id)), got.s[2 * i]);
     }
+}
+
+test "dsv41 engram: a bad id in a helper thread's rows fails the read" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeFp8Fixture(io, td.dir, true);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 1, 4, 64);
+    defer t.close();
+    // 64 rows make four parts; part k takes the rows j with j % 4 == k, so row 17 is a helper's.
+    var ids: [64]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(i % 4);
+    var w: [64 * 64]u8 = undefined;
+    var sc: [64 * 2]u8 = undefined;
+    try t.readInto(&ids, null, &w, &sc);
+    ids[17] = 7;
+    try testing.expectError(error.EngramRead, t.readInto(&ids, null, &w, &sc));
 }
 
 test "dsv41 engram: a prefetch is the next chunk's only when its grid starts there and holds the same row ids" {
