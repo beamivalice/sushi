@@ -125,7 +125,7 @@ pub fn dsv41StateBytes(s: *const Slot) u64 {
 pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, tokens: []const u32) void {
     const dsv = (slot.model.transformer orelse return).dsv41 orelse return;
     const media = prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start);
-    if (hc.publishLiveDsv41(dsv, tokens, slot.has_tools, media, slot.cache.config)) sch.live_unflushed.store(true, .release);
+    if (dsv41_prefix.publishLiveDsv41(hc, dsv, tokens, slot.has_tools, media, slot.cache.config)) sch.live_unflushed.store(true, .release);
 }
 
 /// DeepSeek: a thinking request with tools is re-rendered with its thought, so the state right behind the generated
@@ -173,7 +173,7 @@ pub fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) 
     @memcpy(tokens[0..slot.full_prompt.len], slot.full_prompt);
     @memcpy(tokens[slot.full_prompt.len..], generated);
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, pos);
-    hc.writeDecodePointDsv41(&slot.cache, dsv, tokens, slot.has_tools, media, xfm.s) catch |err| {
+    dsv41_prefix.writeDecodePointDsv41(hc, &slot.cache, dsv, tokens, slot.has_tools, media, xfm.s) catch |err| {
         log.warn("[dsv41-prefix] decode restore point not written: {s}\n", .{@errorName(err)});
     };
 }
@@ -261,6 +261,7 @@ test "a cancelled DeepSeek slot commits when it is culled and not again at the c
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm: Transformer = undefined;
     xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    xfm.config = .{ .model_type = "deepseek_v41" };
     var slot: Slot = undefined;
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
     defer sch.decoding.deinit(testing.allocator);
@@ -288,6 +289,7 @@ test "a finished DeepSeek slot is not committed again by the cull" {
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm: Transformer = undefined;
     xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    xfm.config = .{ .model_type = "deepseek_v41" };
     var slot: Slot = undefined;
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
     defer sch.decoding.deinit(testing.allocator);
@@ -340,6 +342,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
 
     var xfm: Transformer = undefined;
     xfm.dsv41 = m;
+    xfm.config = .{ .model_type = "deepseek_v41" };
     var model: model_registry_mod.LoadedModel = undefined;
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(a, 2);
     defer model.prefix_cache.?.deinit();

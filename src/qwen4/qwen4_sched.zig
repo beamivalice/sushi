@@ -1,0 +1,112 @@
+//! Flash-Next as the scheduler sees it: what batches, which rounds group, the head it commits beside the KV.
+const std = @import("std");
+const mlx = @import("../mlx.zig");
+const model = @import("../model.zig");
+const log = @import("../log.zig");
+const transformer = @import("../transformer.zig");
+const scheduler = @import("../scheduler.zig");
+const sched = @import("../arch/sched.zig");
+const qsa_state = @import("qwen4_qsa_state.zig");
+
+const Slot = scheduler.Slot;
+const Scheduler = scheduler.Scheduler;
+const Transformer = transformer.Transformer;
+const ForwardCtx = transformer.ForwardCtx;
+const ModelConfig = model.ModelConfig;
+
+pub fn facts(config: *const ModelConfig) sched.Facts {
+    return .{
+        .long_ctx = config.longCtxGated(),
+        .caps_ssm_checkpoints = true,
+        .thought_point = .with_mtp,
+    };
+}
+
+pub fn batches(config: *const ModelConfig) bool {
+    return config.supportsBatchedGdnDecode();
+}
+
+pub fn rowCap(config: *const ModelConfig) ?usize {
+    return if (config.supportsBatchedQwen4Rows()) 8 else null;
+}
+
+pub fn modelBatches(xfm: *const Transformer) bool {
+    return xfm.supportsBatchedGdnDecode();
+}
+
+pub fn padsBatch(config: *const ModelConfig) bool {
+    return !config.supportsBatchedQwen4Rows();
+}
+
+pub fn plannerObservesPlainRows(xfm: *const Transformer) bool {
+    return xfm.qwen4 != null;
+}
+
+const arm_padded: u8 = 0;
+const arm_rows: u8 = 1;
+
+pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?sched.BatchArm {
+    if (!(xfm.supportsBatchedGdnDecode() and xfm.batchedGdnReady(ctxs))) return null;
+    // A per-row tick moves each slot's `moe_seq_offset` itself; the padded batch leaves it to the scheduler.
+    const rows = xfm.supportsBatchedQwen4Rows();
+    return .{ .arm = if (rows) arm_rows else arm_padded, .moe_positions = true, .advances_offset = !rows };
+}
+
+pub fn batchedForward(
+    sch: *Scheduler,
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    batch: *[]*Slot,
+    next_tokens: []const u32,
+    ctxs: []const *ForwardCtx,
+    rope_offsets: []const u32,
+    arm: sched.BatchArm,
+    hidden_rows: ?*?[]mlx.mlx_array,
+) ![]mlx.mlx_array {
+    _ = .{ sch, allocator, batch };
+    if (arm.arm == arm_rows) return xfm.forwardQwen4DecodeRows(next_tokens, ctxs, hidden_rows);
+    return xfm.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, hidden_rows);
+}
+
+/// A head the model owns (never a per-request one) cannot ride a grouped verify.
+pub fn mtpGroupable(slot: *const Slot) bool {
+    const gen = if (slot.legacy_gen) |*g| g else return false;
+    if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
+    if (gen.mtp.?.moduleOwned()) return false;
+    if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
+    if (gen.ctx.ssm_entries == null) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
+    const t = slot.model.transformer orelse return false;
+    if (!t.supportsBatchedGdnDecode()) return false;
+    return scheduler.specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
+}
+
+pub fn tickClass(slot: *const Slot) sched.TickClass {
+    return if (mtpGroupable(slot)) .mtp_group else .none;
+}
+
+/// The newest checkpoint takes the slot's live QSA indexer history as a view of the capacity buffer (the slot is
+/// torn down right after). A failure commits the entry history-less, which a QSA arch treats as a miss.
+pub fn handoffHistory(slot: *Slot, cps: []transformer.SSMCheckpoint) void {
+    if (qsa_state.checkpointHasQsaPooled(&cps[cps.len - 1])) return;
+    const ents = slot.ssm_entries orelse return;
+    const xf = slot.model.transformer orelse return;
+    qsa_state.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
+        log.warn("[hot-cache] QSA history handoff failed: {s} — committing without it\n", .{@errorName(err)});
+    };
+}
+
+/// The in-checkpoint head commits its QSA half beside the KV. Its row count IS its cache's step; a snapshot whose
+/// step disagrees is refused.
+pub fn mtpHeadCommit(head: *const Transformer) ?sched.HeadParts {
+    const hm = &head.qwen4_mtp.?;
+    if (hm.cache.step != hm.seq_offset) {
+        log.warn("[hot-cache] mtp head step gap (cache.step={d}, history={d} rows) — head history not committed\n", .{ hm.cache.step, hm.seq_offset });
+        return null;
+    }
+    return .{ .entry = &hm.entry, .pos_base = hm.pos_base, .marks = head.qwen4MtpMarks() };
+}
+
+pub fn resetForRetry(slot: *const Slot, xfm: *Transformer) void {
+    xfm.qwen4MtpResetOwned(slot.enable_mtp);
+}

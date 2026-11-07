@@ -19,7 +19,7 @@ pub const flags = .{}; // slot:flags (S2h)
 
 pub const drafter = @import("mimo2_drafter.zig");
 
-// slot:sched (S2b)
+pub const sched = @import("mimo2_sched.zig"); // slot:sched (S2b)
 
 pub const prefix = @import("mimo2_prefix.zig"); // slot:prefix (S2c)
 

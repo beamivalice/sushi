@@ -17,7 +17,7 @@ pub const flags = .{}; // slot:flags (S2h)
 
 pub const drafter = @import("dsv41_drafter.zig");
 
-// slot:sched (S2b)
+pub const sched = @import("dsv41_sched.zig"); // slot:sched (S2b)
 
 pub const prefix = @import("dsv41_prefix.zig"); // slot:prefix (S2c)
 

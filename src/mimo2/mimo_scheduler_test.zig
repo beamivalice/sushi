@@ -19,7 +19,11 @@ const anyPenalised = mtp_tick.anyPenalised;
 const mimoCoarseHeadBytes = model_load.mimoCoarseHeadBytes;
 const mimoVerifyWarmWanted = model_load.mimoVerifyWarmWanted;
 const resolveExpertCache = model_load.resolveExpertCache;
-const slotMimoMtpCrowdable = scheduler_mod.slotMimoMtpCrowdable;
+const sched = @import("../arch/sched.zig");
+
+fn slotMimoMtpCrowdable(slot: *const Slot) bool {
+    return sched.tickClass(slot) == .mtp_group;
+}
 
 test "a resident MiMo warms its verify rows without its heads; a streamed one and another arch do not" {
     var mimo = ModelConfig{};

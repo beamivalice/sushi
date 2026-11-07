@@ -30,7 +30,7 @@ test "a model type resolves to the arch that claims it" {
 
 test "every enabled arch declares the operations the dispatch files call" {
     inline for (tags) |t| {
-        inline for (.{ "model_types", "Config", "Model", "packs", "flags", "chat", "init", "deinit", "resetCache", "warmup", "forward", "lmHeadForDraft", "ownsModuleDecodeState", "expertStream" }) |decl| {
+        inline for (.{ "model_types", "Config", "Model", "packs", "flags", "sched", "chat", "init", "deinit", "resetCache", "warmup", "forward", "lmHeadForDraft", "ownsModuleDecodeState", "expertStream" }) |decl| {
             if (!@hasDecl(Mod(t), decl)) @compileError(@tagName(t) ++ "/arch.zig lacks " ++ decl);
         }
     }

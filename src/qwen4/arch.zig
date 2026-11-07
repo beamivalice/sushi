@@ -19,7 +19,7 @@ pub const flags = .{}; // slot:flags (S2h)
 
 pub const drafter = @import("qwen4_drafter.zig");
 
-// slot:sched (S2b)
+pub const sched = @import("qwen4_sched.zig"); // slot:sched (S2b)
 
 pub const prefix = @import("qwen4_prefix.zig"); // slot:prefix (S2c)
 

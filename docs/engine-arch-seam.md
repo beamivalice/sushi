@@ -14,7 +14,7 @@ joins `DROPPABLE` when its drop passes.
   `// arch:<name>`.
 - `src/<arch>/arch.zig` is the arch's only public face. It declares `model_types`, `Config`, `Model`, the operations
   the dispatch files call (`init`, `deinit`, `resetCache`, `warmup`, `forward`, ...), the slot `bill` (its
-  `<arch>_bill.zig`), and the slots `packs` and `flags`.
+  `<arch>_bill.zig`), the slot `sched` (its `<arch>_sched.zig`), and the slots `packs` and `flags`.
   The arch a model runs as is stamped on it once, by `life.init` (`Trunk.arch`); `handleOf` reads that tag and tests
   nothing else. The arch that runs a `model_type` no arch claims declares `default_arch`. The
   `packs` and `flags` slots are empty: alias rows still live in `aliases` in `src/cli.zig`, and arch-only flags in `src/cli.zig`.
@@ -45,7 +45,8 @@ joins `DROPPABLE` when its drop passes.
   teardown, cache reset, warmup), `forward`, `request`, `admission` (expert-stream traits from the config), `drafter` (the
   speculative head: [engine-mtp](engine-mtp.md#the-drafter-seam)), `media` (tower, processor, prompt rows, M-RoPE; the
   config picks the arch whose `media.claims` holds), `prefix` (the prefix cache's restore target, per-entry
-  rows and disk sections: [engine-prefix-cache](engine-prefix-cache.md#arch-seam)), and `spec` (the config side: `Spec`,
+  rows and disk sections: [engine-prefix-cache](engine-prefix-cache.md#arch-seam)), `sched` (what the scheduler asks of
+  an arch: [server-lifecycle](server-lifecycle.md#scheduler-and-batching)), and `spec` (the config side: `Spec`,
   the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU
   graphs do not change.
 - `-Darchs=<a,b,...>` (default: every registered arch) builds `Tag`, `Spec` and `Arch` from the listed archs. An

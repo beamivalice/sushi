@@ -13,6 +13,7 @@ const scheduler_mod = @import("scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
 const submitTestScheduler = scheduler_mod.submitTestScheduler;
+const sched = @import("arch/sched.zig");
 
 pub const PostEvictionWidth = struct {
     /// The width the prefill runs at. Always the re-ask.
@@ -80,14 +81,12 @@ pub const BatchVerdict = enum {
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.
 pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
-    return cfg.supportsBatchedGdnDecode() or cfg.supportsBatchedMimoDecode() or cfg.supportsBatchedGlmRows();
+    return sched.batches(cfg);
 }
 
-/// MiMo and GLM batching are certified (and GLM measured) for up to four independent slots; qwen4 rows
-/// share kernels up to the joined hyper-connection and expert width of eight.
+/// The rows one batched forward carries: the arch's bound, where it declares one (`sched.rowCap`).
 pub fn batchGroupCap(cfg: *const model_mod.ModelConfig) usize {
-    if (cfg.supportsBatchedQwen4Rows()) return 8;
-    return if (cfg.supportsBatchedMimoDecode() or cfg.supportsBatchedGlmRows()) 4 else MAX_BATCH_GROUP;
+    return sched.rowCap(cfg) orelse MAX_BATCH_GROUP;
 }
 
 /// One line per slot the first time it decodes serial beside live company;
@@ -145,7 +144,7 @@ pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
 }
 
 /// A group whose longest billed slot is at most this long pads a small tensor, and splitting it sends a slot
-/// through a whole serial forward instead: under the qwen4 gather arm every long slot bills at the indexer
+/// through a whole serial forward instead: under a gather arm every long slot bills at the indexer
 /// budget, so a short sub-agent beside long streams reads as a 2x pad.
 pub const PAD_FREE_KV: u32 = 4096;
 
@@ -425,7 +424,7 @@ fn outstandingGrowth(commit: u64, resident: u64) u64 {
 
 fn slotOutstandingGrowth(s: *const Slot) u64 {
     var resident = s.cache.residentBytes();
-    if (s.glm5_request) |*request| resident +|= request.residentBytes();
+    resident +|= sched.requestBytes(s);
     return outstandingGrowth(s.growth_commit, resident);
 }
 

@@ -34,8 +34,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
-const qwen4_qsa_gather = @import("qwen4/qwen4_qsa_gather.zig");
-const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const spec_stats = @import("spec_stats.zig");
@@ -43,14 +41,11 @@ const cache_stats = @import("cache_stats.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
-const dspark_rows = @import("dsv41/dspark_rows.zig");
-const mimo_mtp = @import("mimo2/mimo_mtp.zig");
 const chip_mod = @import("chip.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
-const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -72,13 +67,12 @@ const ForwardCtx = transformer_mod.ForwardCtx;
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
+const Drafter = @import("arch/drafter.zig").Drafter;
 const SamplingParams = sampler.SamplingParams;
 const dflash_mod = @import("dflash.zig");
-const glm5_forward_mod = @import("glm5/glm5_forward.zig");
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const expert_stream_mod = @import("expert_stream.zig");
-const expert_usage = @import("dsv41/expert_usage.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -91,8 +85,7 @@ const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const slot_admission = @import("slot_admission.zig");
 const vision_queue = @import("vision_queue.zig");
 const model_load = @import("model_load.zig");
-const dsv41_thought_point = @import("dsv41/dsv41_thought_point.zig");
-const glm5_rows_tick = @import("glm5/glm5_rows_tick.zig");
+const sched = @import("arch/sched.zig");
 
 /// A session row with `request_id` 0 is a cached entry, not a request, so live ids start at 1.
 pub const first_request_id: u64 = 1;
@@ -123,7 +116,7 @@ pub const SubmitParams = struct {
     drafter_block_size: u32 = 4,
     enable_mtp: bool = false,
     allow_batch_mtp: bool = true,
-    mtp: ?generate_mod.MtpHeadRef = null,
+    mtp: ?Drafter = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
     /// Vision embeddings spliced at image-token positions during prefill.
@@ -285,8 +278,10 @@ pub const Slot = struct {
     cache: KVCache,
     moe_seq_offset: usize,
     ssm_entries: ?[]SSMCacheEntry,
-    /// glm5_next: this request's native KDA/MLA state (`ctx.glm5_request`).
-    glm5_request: ?glm5_forward_mod.Request = null,
+    /// The arch's per-request state beside the KV cache (`ctx.glm5_request`); null where the arch keeps none.
+    glm5_request: ?sched.NativeRequest = null,
+    /// What the scheduler asks of the arch on every tick, resolved once at admission.
+    facts: sched.Facts = .{},
     /// SSM stride checkpoints salvaged from a prefill the client cancelled:
     /// `Generator.initWithOptions` moves its captured checkpoints into this
     /// sink before returning `error.Cancelled` (they die with the failed
@@ -340,7 +335,7 @@ pub const Slot = struct {
     drafter_block_size: u32,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    mtp: ?generate_mod.MtpHeadRef,
+    mtp: ?Drafter,
     mtp_depth: u32,
     cached_tokens: u32,
     logprobs_n: u32,
@@ -514,7 +509,7 @@ pub const Slot = struct {
             }
             allocator.free(entries);
         };
-        var glm5_request: ?glm5_forward_mod.Request = if (config.isGlm5()) try glm5_forward_mod.Request.initServing(allocator, config.num_hidden_layers) else null;
+        var glm5_request = try sched.initRequest(allocator, config);
         errdefer if (glm5_request) |*request| request.deinit();
 
         // Dup owned slices.
@@ -542,6 +537,7 @@ pub const Slot = struct {
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
             .glm5_request = glm5_request,
+            .facts = sched.facts(config),
             .vision_embeddings = params.vision_embeddings,
             .deferred_media = params.deferred_media,
             .vision_key = params.vision_key,
@@ -1503,7 +1499,7 @@ pub const Scheduler = struct {
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
         const eff_kv_quant = params.kv_quant_config orelse
             transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
-        if (slot_config.isGlm5() and eff_kv_quant.glmLatentBits() == null) return error.GlmKvQuantUnsupported;
+        try sched.checkKvQuant(slot_config, eff_kv_quant);
         return Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
     }
 
@@ -1707,9 +1703,18 @@ pub const Scheduler = struct {
             const assistant_bytes = try model_load.streamedAssistantBytes(self.io, self.allocator, owned.config, self.no_drafter, model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path), entry.path);
             const plan = try model_load.planExpertStreamingWith(self.io, self.allocator, owned.config, entry.path, settings_budget, model_load.coldLoadVision(owned.config, true), assistant_bytes);
             break :blk model_load.streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, model_load.loadStagingBytes(owned.config, model_load.billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.workspace_bytes), plan.cache.bounce_bytes);
-        } else if (owned.config.isGlm5())
-            try model_load.glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, model_load.coldLoadVision(owned.config, false), self.no_drafter, model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
-        else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
+        } else if (try sched.coldLoadBill(.{
+            .io = self.io,
+            .allocator = self.allocator,
+            .config = owned.config,
+            .path = entry.path,
+            .load_vision = model_load.coldLoadVision(owned.config, false),
+            .mtp_on = model_load.mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config).on,
+            .no_drafter = self.no_drafter,
+            .drafter_dir = model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
+        })) |bill|
+            bill
+        else if (model_mod.usesSushiQuantMemoryBill(owned.config))
             try model_load.residentColdLoadBillBytes(
                 self.io,
                 self.allocator,
@@ -2077,7 +2082,7 @@ pub const Scheduler = struct {
         if (sampler.penaltyActive(slot.sampling)) return .penalty;
         // Ask the transformer, never name the arch here — same rule as `modelExclusiveDecode`.
         const t = slot.model.transformer orelse return .arch;
-        return if (t.supportsBatchedGdnDecode() or t.supportsBatchedMimoDecode() or t.supportsBatchedGlmRows()) .ok else .arch;
+        return if (sched.modelBatches(t)) .ok else .arch;
     }
 };
 
@@ -2518,7 +2523,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
             if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
-            if (s.model.config) |c| @import("dsv41/dsv41_borrow.zig").endRequestMlx(c);
+            if (s.model.config) |c| sched.endRequest(c);
         }
         if (cleanup_n > 0) {
             sch.queue_mu.lockUncancelable(sch.io);
@@ -2671,7 +2676,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             if (slot.model.transformer) |xf| {
                                 slot.cache.truncate(0, xf.s) catch {};
                                 xf.resetQsaPooledRope();
-                                xf.qwen4MtpResetOwned(slot.enable_mtp);
+                                sched.resetForRetry(slot, xf);
                             }
                             if (slot.legacy_gen) |*g| {
                                 g.deinit(slot.allocator);
@@ -2811,14 +2816,11 @@ pub fn cullDecodingWith(sch: *Scheduler, commit: *const fn (*Scheduler, *Slot) v
     }
 }
 
-/// A cancelled decode-phase slot commits at the cull when its state is GLM's native request, which resets right
-/// after, or DeepSeek's live record: the next exclusive request is admitted as soon as the slot leaves `decoding`
-/// and takes that record over, so a commit at the cleanup drain would publish onto its state.
+/// A cancelled decode-phase slot commits at the cull when its state is not the slot's own, or is reset right after
+/// (`sched.commitsAtCull`): the next exclusive request is admitted as soon as the slot leaves `decoding`.
 fn commitsAtCull(s: *const Slot) bool {
     if (!s.cancelled.load(.acquire) or s.finished or s.error_code != null) return false;
-    if (s.glm5_request != null) return true;
-    const xfm = s.model.transformer orelse return false;
-    return xfm.dsv41 != null;
+    return sched.commitsAtCull(s);
 }
 
 pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*Scheduler, *Slot) void) void {
@@ -2829,7 +2831,7 @@ pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*S
 /// (finished, errored or cancelled) releases its reserved target state before the next
 /// admission read, not when its connection thread completes it.
 pub fn releaseNativeState(slot: *Slot) void {
-    if (slot.glm5_request) |*request| request.reset();
+    sched.releaseState(slot);
 }
 
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
@@ -2874,14 +2876,14 @@ fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session
 /// to that entry (`shared_view`), not here.
 pub fn slotStateBytes(s: *const Slot) u64 {
     var bytes = s.cache.residentBytes();
-    if (s.glm5_request) |*request| bytes += request.residentBytes();
+    bytes += sched.requestBytes(s);
     if (s.legacy_gen) |*gen| {
         if (gen.dflash_ctx) |*ctx| bytes += ctx.cache.residentBytes();
     }
     if (s.ssm_entries) |ents| for (ents) |*e| {
         bytes += transformer_mod.ssmEntryBytes(e);
     };
-    return bytes + s.ring_cps.bytes() + dsv41_thought_point.dsv41StateBytes(s);
+    return bytes + s.ring_cps.bytes() + sched.modelStateBytes(s);
 }
 
 /// The part of `slotStateBytes` that `resident_hot_cache_bytes` already bills: a donated checkout's
@@ -2897,7 +2899,7 @@ const live_flush_idle_secs: u64 = 300;
 
 /// Writes the live restore points of one resident model that keeps any (DeepSeek). Inference thread.
 pub fn flushLiveState(entry: *model_registry_mod.LoadedModel, why: []const u8) void {
-    @import("dsv41/dsv41_prefix.zig").flushResident(entry, why);
+    sched.flushResident(entry, why);
 }
 
 /// `flushLiveState` for every resident model, the registry lock held only to list them.
@@ -2972,7 +2974,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // generated this turn. The cache reflects exactly this state — Generator
     // forwarded each emitted token into slot.cache as it was sampled.
     const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
-    if (slot.model.transformer) |t| if (t.dsv41 != null) @import("dsv41/dsv41_prefix.zig").markRows(&slot.cache) catch |err| {
+    sched.prepareCommit(slot) catch |err| {
         log.warn("[hot-cache] DeepSeek row marker failed: {s} — not committed\n", .{@errorName(err)});
         return;
     };
@@ -2980,7 +2982,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
     @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
-    dsv41_thought_point.publishLive(sch, slot, hc, total_tokens);
+    sched.publishLive(sch, slot, hc, total_tokens);
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-
@@ -3003,27 +3005,11 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
-    if (slot.glm5_request) |*request| {
-        const window: ?transformer_mod.KVCache = if (gen_ptr.glm_prefill_window) |*w| .{ .entries = w.snapshot.entries, .step = w.snapshot.step, .allocator = w.snapshot.allocator, .config = w.snapshot.config } else null;
-        const dflash: ?prefix_cache_mod.DflashCommit = if (window) |*w| .{ .cache = w, .base_pos = gen_ptr.glm_prefill_window.?.base_pos } else null;
-        glm5_rows_tick.commitGlmSlot(hc, slot, request, total_tokens, ssm_cps_opt, dflash, slot.full_prompt.len);
+    if (sched.commitOwn(hc, slot, gen_ptr, total_tokens, ssm_cps_opt, slot.full_prompt.len)) {
         publishHotCacheResidency(sch);
         return;
     }
-    // qwen4_exp: the newest checkpoint takes the slot's live QSA indexer history as a view
-    // of the capacity buffer (the slot is torn down right after). A failure commits the
-    // entry history-less, which a QSA arch treats as a miss.
-    if (ssm_cps_opt) |cps| {
-        if (!transformer_mod.checkpointHasQsaPooled(&cps[cps.len - 1])) {
-            if (slot.ssm_entries) |ents| {
-                if (slot.model.transformer) |xf| {
-                    transformer_mod.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
-                        log.warn("[hot-cache] QSA history handoff failed: {s} — committing without it\n", .{@errorName(err)});
-                    };
-                }
-            }
-        }
-    }
+    if (ssm_cps_opt) |cps| sched.handoffHistory(slot, cps);
     // A runtime fallback leaves the dormant assistant context at its last
     // speculative boundary while serial decode continues growing the trunk.
     // Only pair the assistant payload with this prefix when both end at the
@@ -3052,24 +3038,16 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
         };
-        // The qwen4_exp in-checkpoint head also commits its QSA half.
+        // An in-checkpoint head commits its own half beside the KV.
         mc.activate();
         const head = mc.head();
-        // Its row count IS its cache's step (`KVCache.update` never advances a non-zero
-        // layer index); a snapshot whose step disagrees is refused, and says why.
-        if (head) |t| {
-            const hm = &t.qwen4_mtp.?;
-            if (hm.cache.step != hm.seq_offset) {
-                log.warn("[hot-cache] mtp head step gap (cache.step={d}, history={d} rows) — head history not committed\n", .{ hm.cache.step, hm.seq_offset });
-                break :blk null;
-            }
-        }
+        const parts = if (head) |t| sched.mtpHeadCommit(slot, t) orelse break :blk null else sched.HeadParts{};
         break :blk .{
             .cache = mc.kv() orelse break :blk null,
             .base_pos = gen_ptr.mtp_position_base,
-            .head = if (head) |t| &t.qwen4_mtp.?.entry else null,
-            .head_pos_base = if (head) |t| t.qwen4_mtp.?.pos_base else 0,
-            .head_marks = if (head) |t| t.qwen4MtpMarks() else &.{},
+            .head = parts.entry,
+            .head_pos_base = parts.pos_base,
+            .head_marks = parts.marks,
         };
     };
     // Ownership transfers to the cache on every outcome, like the checkpoints.
@@ -3123,8 +3101,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         log.debug("[hot-cache] cancelled prefill carried no stride checkpoints — a hybrid entry would restore as a miss; not committed\n", .{});
         return;
     }
-    const is_dsv41 = if (slot.model.transformer) |t| t.dsv41 != null else false;
-    if (is_dsv41 and salvage.checkpoints.len == 0) {
+    if (sched.cancelledNeedsCheckpoints(slot) and salvage.checkpoints.len == 0) {
         log.debug("[hot-cache] cancelled prefill carried no checkpoints — a DeepSeek entry would restore as a miss; not committed\n", .{});
         return;
     }
@@ -3136,7 +3113,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         return;
     };
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
-    if (is_dsv41) @import("dsv41/dsv41_prefix.zig").markRows(&slot.cache) catch return;
+    sched.prepareCommit(slot) catch return;
     // Pass the media boundary RAW: when the cancelled prefill forwarded less
     // than the media position, the cache re-keys the pure-text entry to the
     // null vision key (a kept pixel key with no boundary is the
@@ -3149,7 +3126,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
-    if (slot.glm5_request) |*request| return glm5_rows_tick.commitGlmSlot(hc, slot, request, slot.full_prompt[0..len], cps, null, len);
+    if (sched.commitOwn(hc, slot, null, slot.full_prompt[0..len], cps, len)) return;
     const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, media.key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
@@ -3271,8 +3248,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trans
     wc.chunks += 1;
     // A chunk record covers a prefix, so it may claim only the media blocks inside it.
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, abs_kv_pos);
-    if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s);
-    if (slot.model.transformer.?.dsv41) |dsv| return hc.writeThroughDsv41(dsv, &slot.cache, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s, "prefill");
+    if (sched.writeThrough(hc, slot, &wc.entry_id, slot.full_prompt[0..abs_kv_pos], media, cps, s)) return;
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     hc.writeThroughHybrid(
@@ -3293,7 +3269,7 @@ pub const WRITE_THROUGH_FLUSH_BOUND_BYTES: u64 = 1;
 const WriteThroughCtx = struct {
     slot: *Slot,
     chunks: u32 = 0,
-    /// GLM: the SSD entry this prefill is writing.
+    /// The SSD entry this prefill is writing, for an arch whose entry grows across chunks.
     entry_id: ?u64 = null,
 };
 
@@ -3312,8 +3288,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     if (d.writer == null) return false;
-    // A DeepSeek restore point is a full copy of the state: it goes to SSD however short the new span.
-    if (slot.model.transformer) |t| if (t.dsv41 != null) return true;
+    if (slot.facts.always_write_through) return true;
     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
         if (!write_through_span_declined_logged.swap(true, .monotonic)) {
             log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
@@ -3333,8 +3308,7 @@ fn qwenCheckpointCap(slot: *Slot, cp_max: u32, write_through: bool) u32 {
 }
 
 fn qwenCheckpointCapped(slot: *Slot, write_through: bool) bool {
-    const cfg = slot.model.config orelse return false;
-    if (write_through or !cfg.isQwen4()) return false;
+    if (write_through or !slot.facts.caps_ssm_checkpoints) return false;
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
     return hc.disk != null;
 }
@@ -3342,7 +3316,7 @@ fn qwenCheckpointCapped(slot: *Slot, write_through: bool) bool {
 /// Does this GLM request's prefill move each KDA checkpoint to SSD and free its RAM copy? Admission bills
 /// from this answer and the prefill arms its hook from the same one.
 fn glmCheckpointsRelease(slot: *Slot, new_span: usize) bool {
-    return slot.glm5_request != null and writeThroughArmed(slot, new_span);
+    return slot.facts.releases_checkpoints and writeThroughArmed(slot, new_span);
 }
 
 /// Context for `Generator.InitOptions.chunk_width_hook`. `cfg` is optional (embedded engines).
@@ -3557,7 +3531,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const use_mtp = wiring.use_mtp;
     const use_dspark = use_mtp and if (slot.mtp) |h| h.kind() == .dspark else false;
     const use_head_mtp = use_mtp and !use_dspark;
-    const use_dflash = wiring.use_dflash or glm5_rows_tick.glmNativeDflashArmed(slot.model.config.?.isGlm5(), slot.enable_drafter, slot.dflash != null, slot.sampling, slot.logprobs_n);
+    const use_dflash = wiring.use_dflash or sched.nativeDflashArmed(slot);
     log.debug("[spec-wiring] mtp={} dflash={} (slot: drafter_flag={} dflash_handle={})\n", .{
         use_mtp,             use_dflash,
         slot.enable_drafter, slot.dflash != null,
@@ -3617,43 +3591,20 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // releases it on every path that ends the slot.
             const dfl_restore: ?prefix_cache_mod.DflashTarget = if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null;
             const lookup_sw = io_util.Stopwatch.init(sch.io);
-            const lookup = (if (xfm_ptr.dsv41) |dsv| hc.lookupAndRestoreDsv41(
+            const target = sched.restoreTarget(slot, xfm_ptr);
+            const rec: prefix_cache_mod.Recurrent = if (target) |t| t.rec else if (slot.ssm_entries) |e| .{ .ssm = e } else .none;
+            const lookup = (hc.lookupImpl(
                 &slot.cache,
                 &slot.moe_seq_offset,
-                dsv,
+                rec,
                 xfm_ptr.s,
                 slot.full_prompt,
                 slot.has_tools,
                 slot.vision_key,
                 slot.media_start,
                 slot.media_chain,
-                @intFromPtr(slot),
-                slot.skip_prefix_cache,
-            ) else if (slot.glm5_request) |*request| hc.lookupAndRestoreGlm(
-                &slot.cache,
-                &slot.moe_seq_offset,
-                request,
-                xfm_ptr.s,
-                slot.full_prompt,
-                slot.has_tools,
-                slot.vision_key,
-                slot.media_start,
-                slot.media_chain,
-                dfl_restore,
-                @intFromPtr(slot),
-                slot.skip_prefix_cache,
-            ) else hc.lookupAndRestoreWithMedia(
-                &slot.cache,
-                &slot.moe_seq_offset,
-                slot.ssm_entries,
-                xfm_ptr.s,
-                slot.full_prompt,
-                slot.has_tools,
-                slot.vision_key,
-                slot.media_start,
-                slot.media_chain,
-                dfl_restore,
-                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
+                if (target == null or target.?.takes_dflash) dfl_restore else null,
+                if (target == null or target.?.takes_mtp) (if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null) else null,
                 @intFromPtr(slot),
                 slot.skip_prefix_cache,
             )) catch |err| blk: {
@@ -3664,7 +3615,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             var restore_line_buf: [192]u8 = undefined;
             if (prefix_cache_mod.restoreLogLine(
                 &restore_line_buf,
-                if (xfm_ptr.dsv41 != null) "[dsv41-prefix]" else "[prefix]",
+                if (target) |t| t.log_tag else "[prefix]",
                 lookup.matched,
                 slot.full_prompt.len,
                 if (lookup.matched == 0) "nothing" else if (hc.last_restored_live) "the live state" else if (hc.last_restored_disk_id != null) "SSD" else "RAM",
@@ -3788,7 +3739,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .warm_will_donate = hot_checked_out,
                 .enable_mtp = slot.enable_mtp,
                 .checkpoints = .{
-                    .keep = if (cfg.isGlm5() and cp_stride > 0) cp_max else 0,
+                    .keep = if (slot.facts.bills_checkpoints and cp_stride > 0) cp_max else 0,
                     .released = glmCheckpointsRelease(slot, slot.full_prompt.len - hot_matched),
                     .thought = thoughtPointWanted(slot, cp_stride > 0),
                 },
@@ -3818,7 +3769,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 publishHotCacheResidency(sch);
                 // What the allocator returned, not what the cache was billed for.
                 evicted_live_bytes = report.bytes;
-                const kept: ?u32 = if (!report.admitted and cfg.isGlm5() and cp_stride > 0)
+                const kept: ?u32 = if (!report.admitted and slot.facts.bills_checkpoints and cp_stride > 0)
                     slot_admission.fewerCheckpointsToAdmit(cp_max, &probe, Probe.keeping)
                 else
                     null;
@@ -3987,7 +3938,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
-    dsv41_thought_point.armDsv41ThoughtPoint(slot, &slot.legacy_gen.?, write_through_on and cp_stride > 0);
+    sched.armThoughtPoint(slot, &slot.legacy_gen.?, write_through_on and cp_stride > 0);
     armThoughtPoint(slot, &slot.legacy_gen.?, cp_stride > 0);
     armDecodeEndPoint(slot, &slot.legacy_gen.?, cp_stride > 0);
     publishHandoverToken(slot, &slot.legacy_gen.?);
@@ -4113,13 +4064,14 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var glm_n: usize = 0;
     for (active) |s| {
         const why = sch.batchVerdict(s);
+        const cls = sched.tickClass(s);
         if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
             batchable_n += 1;
-        } else if (why == .spec_active and (glm5_rows_tick.slotMtpGroupable(s) or slotMimoMtpCrowdable(s)) and mtp_n < mtp_buf.len) {
+        } else if (why == .spec_active and cls == .mtp_group and mtp_n < mtp_buf.len) {
             mtp_buf[mtp_n] = s;
             mtp_n += 1;
-        } else if (why == .spec_active and glm5_rows_tick.slotGlmRowable(s) and glm_n < glm_buf.len) {
+        } else if (why == .spec_active and cls == .rows_company and glm_n < glm_buf.len) {
             glm_buf[glm_n] = s;
             glm_n += 1;
         } else {
@@ -4167,7 +4119,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // A DFlash2 GLM slot in company decodes as a plain row of the grouped tick (a row for another
     // request beats a draft row, glm5-arch#concurrency); alone it drafts.
     for (glm_buf[0..glm_n]) |slot| {
-        if (glm5_rows_tick.glmRowsInCompany(slot, glm_buf[0..glm_n], batchable_buf[0..batchable_n]) and batchable_n < batchable_buf.len) {
+        if (sched.rowsInCompany(slot, glm_buf[0..glm_n], batchable_buf[0..batchable_n]) and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = slot;
             batchable_n += 1;
         } else try runSingleDecodeTick(sch, slot);
@@ -4191,7 +4143,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
         var group = batchable_buf[start..end];
-        const row_cap = if (group[0].model.config) |c| slot_admission.batchGroupCap(c) else slot_admission.MAX_BATCH_GROUP;
+        const row_cap = group[0].facts.row_cap orelse slot_admission.MAX_BATCH_GROUP;
         if (group.len > row_cap) {
             for (group[row_cap..]) |s| {
                 slot_admission.noteSerial(sch, s, .row_cap);
@@ -4200,9 +4152,9 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             group = group[0..row_cap];
         }
         // One predicate for both halves of the pad-waste change: the kv-length rule and the sort.
-        const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
+        const gate_batch_kv_len = group[0].facts.long_ctx;
         // Per-row attention reads each slot's own cache: nothing pads.
-        const pads = if (group[0].model.transformer) |t| !t.supportsBatchedMimoDecode() and !t.supportsBatchedGlmRows() and !t.supportsBatchedQwen4Rows() else true;
+        const pads = group[0].facts.pads_batch;
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than
@@ -4481,10 +4433,13 @@ fn pushForcedToken(slot: *Slot, t: u32) void {
 
 /// The request shape that takes a thought point: admission bills the state from this answer, the arming acts on it.
 fn thoughtPointWanted(slot: *const Slot, checkpoints_on: bool) bool {
-    const cfg = slot.model.config orelse return false;
     if (!checkpoints_on or !slot.has_tools or !slot.enable_thinking) return false;
     if (slot.full_prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return false;
-    return cfg.isGlm5() or (cfg.isQwen4() and slot.enable_mtp);
+    return switch (slot.facts.thought_point) {
+        .off => false,
+        .always => true,
+        .with_mtp => slot.enable_mtp,
+    };
 }
 
 /// Qwen over MTP and GLM over DFlash2 keep a recurrent state that restores only at a saved point, and a thinking request
@@ -4492,9 +4447,7 @@ fn thoughtPointWanted(slot: *const Slot, checkpoints_on: bool) bool {
 /// at or below it) is a restore point the next prompt shares (docs/engine-prefix-cache.md#thought-points).
 fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
     if (!thoughtPointWanted(slot, checkpoints_on)) return;
-    const grid: u32 = if (gen.glm_dflash_native)
-        @intCast(glm5_prefix.pool_size)
-    else if (gen.mtp != null and !gen.dspark and slot.ssm_entries != null)
+    const grid: u32 = sched.thoughtGrid(slot, gen) orelse if (gen.mtp != null and !gen.dspark and slot.ssm_entries != null)
         1
     else
         return;
@@ -4640,7 +4593,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         }
         defer slot.allocator.free(result.?.tokens);
         publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
-        dsv41_thought_point.writeDsv41ThoughtPoint(slot, gen, result.?.tokens);
+        sched.afterSpecBlock(slot, gen, result.?.tokens);
         return;
     }
     if (tick_mode == .mtp) {
@@ -4810,6 +4763,7 @@ test "a cancelled prefill with no Generator commits its forwarded prefix, pad-on
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer model.prefix_cache.?.deinit();
     model.transformer = null;
+    model.config = null;
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     var no_ssm: [0]SSMCacheEntry = .{};
@@ -4878,22 +4832,6 @@ fn batchedTickAction(cancelled: bool) BatchedTickAction {
 /// in one kernel pass, sample per-slot, push the OLD next_token_id (= the
 /// token we just committed to cache via the forward), and load the new
 /// sampled id back into next_token_id.
-/// Batched sibling: a batched group shares one forward, so a failure belongs to every slot in it.
-/// Can this MTP slot's verify ride one batched trunk forward with its neighbours?
-/// Per-request head (never qwen4's module-owned one), a GDN trunk with per-slot state
-/// the batched path merges, and a round that is actually speculating this tick.
-/// A MiMo MTP slot that may drop to plain batched ticks when crowded (`mtpCrowdThresholdFor`);
-/// its rounds otherwise stay solo, and no grouped verify ever takes it.
-pub fn slotMimoMtpCrowdable(slot: *const Slot) bool {
-    const gen = if (slot.legacy_gen) |*g| g else return false;
-    if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
-    if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
-    const t = slot.model.transformer orelse return false;
-    if (!t.supportsBatchedMimoDecode()) return false;
-    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
-}
-
 const Planner = @import("mtp_group_planner.zig");
 const degenerate = @import("degenerate.zig");
 const mtp_plan = @import("mtp_plan.zig");
@@ -5006,7 +4944,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
 
     if (try serialFallback(sch, xfm_ptr, active, runSingleDecodeTick)) return;
 
-    const observe_plain = Planner.enabled() and xfm_ptr.qwen4 != null and N <= Planner.MAX_ROWS;
+    const observe_plain = Planner.enabled() and sched.plannerObservesPlainRows(xfm_ptr) and N <= Planner.MAX_ROWS;
     var price_watch = io_util.Stopwatch.init(active[0].io);
     var price_key: group_cost_mod.GroupShape = .{};
     var price_clean = observe_plain;
@@ -5055,19 +4993,13 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         ctxs[i] = &gen.ctx;
     }
 
-    // Two batched kernels: the standard one, and the GatedDeltaNet twin for
-    // hybrid trunks. `batchedGdnReady` is the runtime half of
-    // the gate — a slot that has not prefilled yet carries no recurrent state
-    // to merge, so that tick stays serial rather than merging a wrong width.
-    const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
-    const use_mimo = xfm_ptr.supportsBatchedMimoDecode();
-    const use_glm = xfm_ptr.supportsBatchedGlmRows();
-    const use_qwen4_rows = use_gdn and xfm_ptr.supportsBatchedQwen4Rows();
-    // Position source is per PATH: a GDN trunk positions from the slot's
-    // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
-    // linear layer there, so it reads 0 forever and every batched token was
+    // The arch names the kernel the group takes; a slot that has not prefilled yet carries no recurrent state to
+    // merge, so that tick stays serial rather than merging a wrong width.
+    const arm_ready = sched.batchArm(xfm_ptr, ctxs);
+    // Position source is per PATH: a GDN trunk positions from the slot's `moe_seq_offset` -- `KVCache.step` only
+    // advances on layer 0, which is a linear layer there, so it reads 0 forever and every batched token was
     // roped at position 0.
-    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn or use_mimo) slot.moe_seq_offset else slot.cache.step);
+    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (arm_ready != null and arm_ready.?.moe_positions) slot.moe_seq_offset else slot.cache.step);
     var want_hidden = false;
     for (batch) |slot| {
         want_hidden = want_hidden or slot.mtp_plain_tick;
@@ -5084,16 +5016,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (rows) |a| _ = mlx.mlx_array_free(a);
         allocator.free(rows);
     };
-    const logits_arr = if (use_glm)
-        try glm5_rows_tick.glmRowsForward(sch, allocator, xfm_ptr, &batch, next_tokens)
-    else if (use_qwen4_rows)
-        try xfm_ptr.forwardQwen4DecodeRows(next_tokens, ctxs, if (want_hidden) &hidden_rows else null)
-    else if (use_gdn)
-        try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
-    else if (use_mimo)
-        try xfm_ptr.forwardMimoBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
-    else
-        return error.NoBatchedKernel;
+    const arm = arm_ready orelse return error.NoBatchedKernel;
+    const logits_arr = try sched.batchedForward(sch, allocator, xfm_ptr, &batch, next_tokens, ctxs, rope_offsets, arm, if (want_hidden) &hidden_rows else null);
     defer {
         for (logits_arr) |a| _ = mlx.mlx_array_free(a);
         allocator.free(logits_arr);
@@ -5114,7 +5038,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // The batched forward advances only its scratch offset; each slot's own
     // position moves here so a slot leaving the batch resumes serial from
     // the right place (qwen4's QSA reads it for kv length + tail rule).
-    if (!use_qwen4_rows) {
+    if (arm.advances_offset) {
         for (batch) |slot| slot.moe_seq_offset += 1;
     }
 
@@ -5565,7 +5489,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.generated_ids = .empty;
     gen.loop_guard_start = 0;
     gen.think_closed_by_loop = false;
-    gen.mtp = generate_mod.MtpHeadRef.of("qwen4", &xfm);
+    gen.mtp = Drafter.of("qwen4", &xfm);
     gen.mtp_cache = generate_mod.MtpCacheRef.of("mimo2", undefined);
     gen.has_last_hidden = true;
     gen.dflash = null;
@@ -6166,6 +6090,8 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/err-alloc";
     model.prefix_cache = null;
+    model.transformer = null;
+    model.config = null;
     var slot: Slot = undefined;
     slot.io = testing.io;
     slot.allocator = failing.allocator();
@@ -6212,6 +6138,7 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     model.id = "org/live-test";
     model.prefix_cache = null;
     model.transformer = null;
+    model.config = null;
     var slot: Slot = undefined;
     // Only the fields the publish path reads: rows are value copies.
     slot.model = &model;
@@ -6298,6 +6225,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     model.id = "org/live-test";
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
     model.transformer = null;
+    model.config = null;
     defer model.prefix_cache.?.entries.deinit(testing.allocator);
     sch.hot_prefix_cache = &model.prefix_cache.?;
 

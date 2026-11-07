@@ -226,6 +226,26 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 
 - `src/scheduler.zig`: slots, inference thread (sole MLX caller), queues, batching, admission, spec wiring, hot-cache
   budget revise.
+- **The scheduler names no arch.** What differs per arch is the `sched` decl of its `arch.zig` (`<arch>_sched.zig`),
+  reached through `src/arch/sched.zig`; a hook an arch omits leaves the default stated on its dispatch function, and a
+  test fails on a declaration no dispatch reads. It answers:
+  - what batches (`batches`, `rowCap`, `modelBatches`, `padsBatch`; the row cap and whether a group pads are in
+    `Slot.facts`), and the kernel a group takes (`batchArm`,
+    `batchedForward`: the arch's arm says whether rows are positioned by `moe_seq_offset` and whether the tick moves
+    it, so a per-row forward and a padded one share the tick);
+  - how a speculating slot ticks (`tickClass`: `mtp_group` joins the grouped verify or drops to a plain row when
+    crowded, `rows_company` rides a plain grouped row when its model has company);
+  - what a request owns beside its KV (`initRequest`, `commitsAtCull`, `modelStateBytes`, `checkKvQuant`; the
+    request's bytes, release and cull read the slot's own state, never a config) and how it commits, restores and writes through (`prepareCommit`,
+    `commitOwn`, `publishLive`, `restoreTarget`, `writeThrough`, `mtpHeadCommit`, `handoffHistory`);
+  - when a thought point is armed (`facts.thought_point`, `thoughtGrid`, `armThoughtPoint`, `afterSpecBlock`) and the
+    cold-load bill (`coldLoadBill`).
+  - `Slot.facts` holds the per-config booleans (`long_ctx`, `caps_ssm_checkpoints`, `bills_checkpoints`,
+    `releases_checkpoints`, `always_write_through`, `thought_point`, `row_cap`, `pads_batch`), resolved once at admission, so no tick evaluates
+    a `model_type` compare. Dispatch reads the arch tag of the slot's transformer config (its model config before a
+    transformer exists), so a test slot needs a config, or `model.config = null` for an arch-less one.
+  - `Slot.glm5_request` keeps its name until the GLM stage moves it into the arch's context; its type is
+    `sched.NativeRequest`.
 - `src/model_load.zig`: load plan, streaming plan, load bills; `src/slot_admission.zig`: slot and memory admission, batching
   policy; `src/mtp_tick.zig`: grouped MTP tick; `src/slot_outcome.zig`: slot end, finish outcome, loop-stop reasons;
   `src/vision_queue.zig`: vision encode queue, media deferral.

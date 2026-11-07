@@ -26,6 +26,7 @@ const scheduler_mod = @import("../scheduler.zig");
 const slot_admission = @import("../slot_admission.zig");
 const model_load = @import("../model_load.zig");
 const slot_outcome = @import("../slot_outcome.zig");
+const sched = @import("../arch/sched.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
 const batchGroupCap = slot_admission.batchGroupCap;
@@ -60,8 +61,8 @@ pub fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request:
     // The rows are chosen before the copy: only what the RAM tier keeps, never a full copy followed by a trim.
     const window: u64 = if (dflash) |d| prefix_cache_mod.HotPrefixCache.liveCacheBytes(d.cache) else 0;
     const row_bytes = glm5_prefix.rowBytesOf(request);
-    const ram_len = hc.glmCommitLen(cps_all, request.offset, row_bytes, window);
-    const disk_len = hc.glmDiskLen(cps_all, request.offset, row_bytes, window);
+    const ram_len = glm5_prefix.glmCommitLen(hc, cps_all, request.offset, row_bytes, window);
+    const disk_len = glm5_prefix.glmDiskLen(hc, cps_all, request.offset, row_bytes, window);
     const len = @max(ram_len orelse 0, disk_len orelse 0);
     if (len == 0) {
         log.debug("[hot-cache] GLM commit keeps no rows within either tier's budget; not committed\n", .{});
@@ -84,7 +85,7 @@ pub fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request:
         return;
     }
     const n_cps = cps.len;
-    const st = hc.commitGlmTiers(&slot.cache, tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, cps, ram_rows, disk_rows, dflash, prompt_len) catch |err| {
+    const st = glm5_prefix.commitGlmTiers(hc, &slot.cache, tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, cps, ram_rows, disk_rows, dflash, prompt_len) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -175,14 +176,6 @@ pub fn glmTreeNodes(slots: usize, rate: f32, cost: GlmRowCost) usize {
     return best;
 }
 
-/// Does another slot of this one's model decode this tick (a drafting GLM slot or a plain batchable one)?
-pub fn glmRowsInCompany(slot: *const Slot, drafting: []const *Slot, plain: []const *Slot) bool {
-    var company: usize = 0;
-    for (drafting) |other| company += @intFromBool(other.model == slot.model);
-    for (plain) |other| company += @intFromBool(other.model == slot.model);
-    return company >= 2;
-}
-
 /// A DFlash2 GLM slot that can ride a plain grouped tick: its rounds only need the row committed
 /// with the assistant's taps (`Generator.glmRowCommit`).
 pub fn slotGlmRowable(slot: *const Slot) bool {
@@ -191,18 +184,6 @@ pub fn slotGlmRowable(slot: *const Slot) bool {
     if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
     const t = slot.model.transformer orelse return false;
     return t.supportsBatchedGlmRows();
-}
-
-pub fn slotMtpGroupable(slot: *const Slot) bool {
-    const gen = if (slot.legacy_gen) |*g| g else return false;
-    if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
-    if (gen.mtp.?.moduleOwned()) return false;
-    if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
-    if (gen.ctx.ssm_entries == null) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
-    const t = slot.model.transformer orelse return false;
-    if (!t.supportsBatchedGdnDecode()) return false;
-    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }
 
 var glm_rows_logged = false;
@@ -435,10 +416,10 @@ test "a drafting GLM slot rides plain rows only in company of its own model" {
     var glm_b: LoadedModel = undefined;
     var slots: [4]Slot = undefined;
     for (&slots, 0..) |*s, i| s.model = if (i == 3) &glm_b else &glm_a;
-    try testing.expect(!glmRowsInCompany(&slots[0], &.{&slots[0]}, &.{}));
-    try testing.expect(!glmRowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[3]}));
-    try testing.expect(glmRowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[1]}));
-    try testing.expect(glmRowsInCompany(&slots[0], &.{ &slots[0], &slots[2] }, &.{}));
+    try testing.expect(!sched.rowsInCompany(&slots[0], &.{&slots[0]}, &.{}));
+    try testing.expect(!sched.rowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[3]}));
+    try testing.expect(sched.rowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[1]}));
+    try testing.expect(sched.rowsInCompany(&slots[0], &.{ &slots[0], &slots[2] }, &.{}));
 }
 
 test "a resident GLM batches plain rows four at a time, a streamed one stays serial" {
@@ -533,6 +514,8 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     model.id = "org/glm-cull";
     model.prefix_cache = null;
     model.transformer = null;
+    var cfg = ModelConfig{ .model_type = "glm5_next" };
+    model.config = &cfg;
     var slots: [3]Slot = undefined;
     for (&slots, 0..) |*slot, i| {
         slot.model = &model;
@@ -590,6 +573,8 @@ test "a GLM cancel landing between the cull passes is committed once before its 
     model.id = "org/glm-cull-race";
     model.prefix_cache = null;
     model.transformer = null;
+    var cfg = ModelConfig{ .model_type = "glm5_next" };
+    model.config = &cfg;
     var slots: [2]Slot = undefined;
     for (&slots, 0..) |*slot, i| {
         slot.model = &model;
@@ -628,7 +613,12 @@ test "a GLM cancel landing between the cull passes is committed once before its 
 }
 
 test "postPrefillTerminal releases native GLM state for a cancelled slot but not a live one" {
+    var cfg = ModelConfig{ .model_type = "glm5_next" };
+    var model: LoadedModel = undefined;
+    model.transformer = null;
+    model.config = &cfg;
     var cancelled_slot: Slot = undefined;
+    cancelled_slot.model = &model;
     cancelled_slot.state = .decoding;
     cancelled_slot.cancelled = .init(true);
     cancelled_slot.glm5_request = try glm5_forward_mod.Request.init(testing.allocator, 2);
@@ -636,6 +626,7 @@ test "postPrefillTerminal releases native GLM state for a cancelled slot but not
     defer cancelled_slot.glm5_request.?.deinit();
 
     var live_slot: Slot = undefined;
+    live_slot.model = &model;
     live_slot.state = .decoding;
     live_slot.cancelled = .init(false);
     live_slot.glm5_request = try glm5_forward_mod.Request.init(testing.allocator, 2);
@@ -643,6 +634,7 @@ test "postPrefillTerminal releases native GLM state for a cancelled slot but not
     defer live_slot.glm5_request.?.deinit();
 
     var errored_slot: Slot = undefined;
+    errored_slot.model = &model;
     errored_slot.state = .errored;
     errored_slot.cancelled = .init(false);
     errored_slot.glm5_request = null;

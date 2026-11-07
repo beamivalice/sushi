@@ -232,6 +232,7 @@ test {
     _ = @import("arch_host_stub.zig");
     _ = @import("arch/registry.zig");
     _ = @import("arch/drafter.zig");
+    _ = @import("arch/sched.zig");
     _ = @import("qwen4/qwen4_drafter.zig");
     _ = @import("arch/spec.zig");
     _ = @import("arch/life.zig");
