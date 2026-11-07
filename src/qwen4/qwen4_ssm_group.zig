@@ -2,6 +2,7 @@ const trf = @import("../transformer.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
+const arch_registry = @import("../arch/registry.zig");
 const ModelConfig = model_mod.ModelConfig;
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
@@ -1339,8 +1340,9 @@ test "persistent group: a full-width group repacks when a member leaves" {
     try std.testing.expect(xfm.ssm_group.matches(ctxs[1..]));
 }
 
-test "persistent group: forwardWith releases a bound member between batched ticks" {
+test "persistent group: a qwen4 forwardWith releases a bound member between batched ticks" {
     try mlx.requireGpu();
+    const tag = arch_registry.ofModelType("qwen4_exp") orelse return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(alloc, 1);
@@ -1370,10 +1372,13 @@ test "persistent group: forwardWith releases a bound member between batched tick
         try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
         try ssmTickBumpSlots(s, &o_ctxs, kinds);
     }
+    // Qwen's forward reaches its embedding before any layer; with no weights it stops there by name.
+    p_xfm.arch = tag;
     p_xfm.glm5 = null;
     p_xfm.qwen4 = null;
     p_xfm.dsv41 = null;
-    p_xfm.moe_layers = null;
+    p_xfm.expert_stream = null;
+    p_xfm.moe_layers = &.{};
     p_xfm.emb_w = .{ .ctx = null };
     p_xfm.config = std.mem.zeroes(ModelConfig);
     const tok_shape = [_]c_int{ 1, 1 };

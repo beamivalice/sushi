@@ -12,7 +12,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
-const transformer_mod = @import("transformer.zig");
+const transformer_mod = @import("trunk.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
 const log = @import("log.zig");
 const trunk_stq = @import("trunk_stq.zig");
@@ -696,7 +696,7 @@ fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse
     if (shape.len < 2 or shape.len > 3 or shape[0] < 1 or shape[0] > 32) return error.MtpRerankBatchTooWide;
     if (shape.len == 3 and shape[1] != 1) return error.MtpRerankInputShape;
     if (try transformer_mod.mtpCoarsePairs(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
-    if (try @import("transformer.zig").msvQmvRows(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
+    if (try @import("trunk.zig").msvQmvRows(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
     const n: usize = @intCast(shape[0]);
     var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
     defer for (parts[0..n]) |p| {

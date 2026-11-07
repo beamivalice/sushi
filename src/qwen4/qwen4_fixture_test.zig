@@ -1,4 +1,5 @@
 const trf = @import("../transformer.zig");
+const trunk = @import("../trunk.zig");
 const verify_qmm = @import("../verify_qmm.zig");
 const kv_cache = @import("../kv_cache.zig");
 const std = @import("std");
@@ -2839,10 +2840,10 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     var ids: [640]i32 = undefined;
     for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % 40000);
     const prompts = [2][]const i32{ ids[0..320], ids[64..232] };
-    const indexed_before = trf.mtp_verify_indexed_input_calls;
-    const reduce_before = trf.mtp_verify_expert_reduce_calls;
-    const expert_before = trf.mtp_verify_expert_pairs_calls;
-    const rows_before = trf.mtp_verify_expert_rows_calls;
+    const indexed_before = trunk.mtp_verify_indexed_input_calls;
+    const reduce_before = trunk.mtp_verify_expert_reduce_calls;
+    const expert_before = trunk.mtp_verify_expert_pairs_calls;
+    const rows_before = trunk.mtp_verify_expert_rows_calls;
     const attn_before = qwen4_forward.mtp_verify_attn_rows_calls;
     const lmhead_before = qwen4_forward.mtp_verify_lmhead_rows_calls;
     const gdn_before = qwen4_forward.mtp_verify_gdn_rows_calls;
@@ -2896,10 +2897,10 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
         }
     }
     try testing.expectEqual(@as(u64, 7), qwen4_forward.mtp_verify_moe_group_graphs - grouped_before);
-    try testing.expectEqual(indexed_before, trf.mtp_verify_indexed_input_calls);
-    try testing.expectEqual(reduce_before, trf.mtp_verify_expert_reduce_calls);
-    try testing.expectEqual(expert_before, trf.mtp_verify_expert_pairs_calls);
-    try testing.expect(trf.mtp_verify_expert_rows_calls > rows_before);
+    try testing.expectEqual(indexed_before, trunk.mtp_verify_indexed_input_calls);
+    try testing.expectEqual(reduce_before, trunk.mtp_verify_expert_reduce_calls);
+    try testing.expectEqual(expert_before, trunk.mtp_verify_expert_pairs_calls);
+    try testing.expect(trunk.mtp_verify_expert_rows_calls > rows_before);
     try testing.expect(qwen4_forward.mtp_verify_gdn_rows_calls > gdn_before);
     try testing.expect(qwen4_forward.mtp_verify_shared_gate_rows_calls > shared_gate_before);
     try testing.expect(qwen4_forward.mtp_verify_attn_rows_calls > attn_before);
@@ -3380,8 +3381,8 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const old_features = trf.single_verify_test_features;
-    defer trf.single_verify_test_features = old_features;
+    const old_features = trunk.single_verify_test_features;
+    defer trunk.single_verify_test_features = old_features;
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));
     defer if (config.ngram_table_path) |name| a.free(name);
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
@@ -3399,10 +3400,10 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     var slots: [2]*Qwen4TestSlot = undefined;
     var initialized: usize = 0;
     defer for (slots[0..initialized]) |slot| slot.deinit(a);
-    const prefill_routes = trf.mtp_verify_kernel_calls[2];
+    const prefill_routes = trunk.mtp_verify_kernel_calls[2];
     const prefill_hc = qwen4_forward.mtp_verify_hc_prepared_calls;
     for (&slots, 0..) |*target, arm| {
-        trf.single_verify_test_features = @splat(arm == 1);
+        trunk.single_verify_test_features = @splat(arm == 1);
         target.* = try Qwen4TestSlot.init(a, config.num_hidden_layers);
         initialized += 1;
         target.*.cache.config = KVQuantConfig.affine(8);
@@ -3417,20 +3418,20 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         }
         target.*.ctx.skip_lm_head = false;
     }
-    try testing.expectEqual(prefill_routes, trf.mtp_verify_kernel_calls[2]);
+    try testing.expectEqual(prefill_routes, trunk.mtp_verify_kernel_calls[2]);
     try testing.expectEqual(prefill_hc, qwen4_forward.mtp_verify_hc_prepared_calls);
     var position = prefix_len;
     for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }) |width| {
         const input = mlx.mlx_array_new_data(@ptrCast(ids[position..][0..width].ptr), &.{ 1, @as(c_int, @intCast(width)) }, 2, .int32);
         defer _ = mlx.mlx_array_free(input);
-        trf.single_verify_test_features = @splat(false);
+        trunk.single_verify_test_features = @splat(false);
         var reference = try singleVerifyTestRound(&xfm, slots[0], input);
         defer reference.deinit();
-        const before = [_]u64{ trf.mtp_verify_kernel_calls[2], trf.mtp_verify_indexed_input_calls, trf.mtp_verify_expert_pairs_calls, trf.mtp_verify_expert_reduce_calls, qwen4_forward.mtp_verify_hc_prepared_calls };
-        trf.single_verify_test_features = @splat(true);
+        const before = [_]u64{ trunk.mtp_verify_kernel_calls[2], trunk.mtp_verify_indexed_input_calls, trunk.mtp_verify_expert_pairs_calls, trunk.mtp_verify_expert_reduce_calls, qwen4_forward.mtp_verify_hc_prepared_calls };
+        trunk.single_verify_test_features = @splat(true);
         var candidate = try singleVerifyTestRound(&xfm, slots[1], input);
         defer candidate.deinit();
-        const after = [_]u64{ trf.mtp_verify_kernel_calls[2], trf.mtp_verify_indexed_input_calls, trf.mtp_verify_expert_pairs_calls, trf.mtp_verify_expert_reduce_calls, qwen4_forward.mtp_verify_hc_prepared_calls };
+        const after = [_]u64{ trunk.mtp_verify_kernel_calls[2], trunk.mtp_verify_indexed_input_calls, trunk.mtp_verify_expert_pairs_calls, trunk.mtp_verify_expert_reduce_calls, qwen4_forward.mtp_verify_hc_prepared_calls };
         inline for (.{ "logits", "last", "all" }) |field| try expectRowsByteEqual(a, xfm.s, @field(reference, field), @field(candidate, field), "single verify " ++ field);
         for (slots[0].entries, slots[1].entries) |*left, *right| {
             inline for (.{ "conv_state", "ssm_state", "aux_state", "qsa_pooled", "spec_conv_input", "spec_ple_input" }) |field| {

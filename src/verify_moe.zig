@@ -1,4 +1,5 @@
 const trf = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
 const std = @import("std");
 const mtp_mod = @import("mtp.zig");
@@ -339,7 +340,7 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_vector_array_get(&result, ov, 0));
-    trf.mtp_coarse_pair_dispatches +%= 1;
+    trunk.mtp_coarse_pair_dispatches +%= 1;
     const Once = struct {
         var logged = false;
     };
@@ -485,7 +486,7 @@ pub fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_ar
     }
     if (total != xs[1] or total > (if (wide) @as(c_int, 12) else 24)) return null;
     const value = (try @import("mtp_qmv.zig").matmul(s, x, w, sc, bi)) orelse return error.Affine8SerialProjectionUnsupported;
-    trf.mtp_verify_kernel_calls[0] +%= 1;
+    trunk.mtp_verify_kernel_calls[0] +%= 1;
     return value;
 }
 

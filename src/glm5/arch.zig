@@ -1,15 +1,16 @@
 //! GLM-5.3-Flash (`glm5_next`) as the registry sees it: its one public face.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const trf = @import("../transformer.zig");
+const trunk = @import("../trunk.zig");
+const glm5_state = @import("glm5_state.zig");
 const serving = @import("glm5_serving.zig");
 const admission = @import("../arch/admission.zig");
 const registry = @import("../arch/registry.zig");
-const Transformer = trf.Transformer;
+const Trunk = trunk.Trunk;
 
 pub const model_types = [_][]const u8{"glm5_next"};
 pub const Config = @import("../model.zig").ModelConfig;
-pub const Model = *Transformer;
+pub const Model = *Trunk;
 
 pub const packs = .{}; // slot:packs (S2h)
 pub const flags = .{}; // slot:flags (S2h)
@@ -30,16 +31,26 @@ pub const flags = .{}; // slot:flags (S2h)
 
 // slot:offline (S2i)
 
-pub fn loaded(xfm: Model) bool {
-    return xfm.glm5 != null;
-}
-
-pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *trf.Weights, s: mlx.mlx_stream) !Transformer {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *trunk.Weights, s: mlx.mlx_stream) !Trunk {
     _ = io;
     return serving.initGlm5(allocator, config, weights, s);
 }
 
-pub fn forward(xfm: Model, ctx: *trf.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {
+pub fn deinit(xfm: Model) void {
+    glm5_state.deinit(xfm);
+    xfm.deinitTrunk();
+}
+
+pub fn resetCache(xfm: Model) !void {
+    glm5_state.reset(xfm);
+    return xfm.resetTrunk();
+}
+
+pub fn warmup(xfm: Model) !void {
+    return xfm.warmupTrunk();
+}
+
+pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {
     return serving.forwardGlm5WithImpl(xfm, ctx, ids, xfm.glm5.?);
 }
 
@@ -57,9 +68,9 @@ pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
     return .{};
 }
 
-test "a model loaded as glm5 is dispatched to glm5" {
+test "a model stamped as glm5 is dispatched to glm5" {
     const tag = registry.ofModelType(model_types[0]) orelse return;
-    var xfm: Transformer = undefined;
-    xfm.glm5 = @ptrFromInt(@alignOf(@TypeOf(xfm.glm5.?.*)));
+    var xfm: Trunk = undefined;
+    xfm.arch = tag;
     try std.testing.expectEqual(tag, std.meta.activeTag(registry.handleOf(&xfm)));
 }

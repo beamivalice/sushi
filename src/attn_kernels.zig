@@ -1,4 +1,7 @@
-const trf = @import("transformer.zig");
+const trunk = @import("trunk.zig");
+const trunk_helpers_test = @import("trunk_helpers_test.zig");
+const mlx_util = @import("mlx_util.zig");
+pub const sliceAttentionSeq = mlx_util.sliceAttentionSeq;
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
@@ -20,25 +23,25 @@ const qsaProbeCorruptFirst = nax_gate.qsaProbeCorruptFirst;
 const qsaProbeLcgBf16 = nax_gate.qsaProbeLcgBf16;
 const qsaProbeMaxAbsDiff = nax_gate.qsaProbeMaxAbsDiff;
 const verifyQmmNaxAvailable = nax_gate.verifyQmmNaxAvailable;
-const DenseKVView = trf.DenseKVView;
-const KVCache = trf.KVCache;
-const SWA_TEST_WINDOW = trf.SWA_TEST_WINDOW;
-const ShapeKey = trf.ShapeKey;
-const SwaGeom = trf.SwaGeom;
-const TestQuantView = trf.TestQuantView;
-const Transformer = trf.Transformer;
-const absMax = trf.absMax;
-const attnPdCausalTruth = trf.attnPdCausalTruth;
-const attnPdTestArms = trf.attnPdTestArms;
-const attnPdTruthF32 = trf.attnPdTruthF32;
-const expectAttnPdNoWorse = trf.expectAttnPdNoWorse;
-const sliceSeq = trf.sliceSeq;
-const slidingViewFor = trf.slidingViewFor;
-const swaBandMask = trf.swaBandMask;
-const swaHostF32 = trf.swaHostF32;
-const swaMaxErr = trf.swaMaxErr;
-const swaSinkTestConfig = trf.swaSinkTestConfig;
-const swaSinkTruth = trf.swaSinkTruth;
+const DenseKVView = trunk.DenseKVView;
+const KVCache = trunk.KVCache;
+const SWA_TEST_WINDOW = trunk_helpers_test.SWA_TEST_WINDOW;
+const ShapeKey = trunk.ShapeKey;
+const SwaGeom = trunk_helpers_test.SwaGeom;
+const TestQuantView = trunk_helpers_test.TestQuantView;
+const Transformer = trunk.Transformer;
+const absMax = trunk_helpers_test.absMax;
+const attnPdCausalTruth = trunk_helpers_test.attnPdCausalTruth;
+const attnPdTestArms = trunk_helpers_test.attnPdTestArms;
+const attnPdTruthF32 = trunk_helpers_test.attnPdTruthF32;
+const expectAttnPdNoWorse = trunk_helpers_test.expectAttnPdNoWorse;
+const sliceSeq = trunk_helpers_test.sliceSeq;
+const slidingViewFor = trunk.slidingViewFor;
+const swaBandMask = trunk_helpers_test.swaBandMask;
+const swaHostF32 = trunk_helpers_test.swaHostF32;
+const swaMaxErr = trunk_helpers_test.swaMaxErr;
+const swaSinkTestConfig = trunk_helpers_test.swaSinkTestConfig;
+const swaSinkTruth = trunk_helpers_test.swaSinkTruth;
 
 const ATTN_PD_KERNEL_HEADER =
     \\#include <metal_simdgroup_matrix>
@@ -1575,14 +1578,6 @@ fn attnPdDispatch(
             o_new = .{ .ctx = null };
         }
     }
-    return out;
-}
-
-pub fn sliceAttentionSeq(s: mlx.mlx_stream, a: mlx.mlx_array, start: c_int, end: c_int) !mlx.mlx_array {
-    const sh = mlx.getShape(a);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_slice(&out, a, &.{ 0, 0, start, 0 }, 4, &.{ sh[0], sh[1], end, sh[3] }, 4, &.{ 1, 1, 1, 1 }, 4, s));
     return out;
 }
 

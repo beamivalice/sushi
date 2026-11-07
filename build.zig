@@ -303,7 +303,7 @@ fn linkApple(module: *std.Build.Module, macos_sdk_frameworks: ?[]const u8) void 
 /// a list of `<stem>.test.` filters plus one filter per nested test; the last bucket takes every MLX stem the others
 /// do not name.
 const test_buckets = [_][]const []const u8{
-    &.{ "transformer", "gdn_decode", "cli", "launch" },
+    &.{ "trunk", "gdn_decode", "cli", "launch" },
     &.{ "generate", "mtp_policy", "mtp_round", "scheduler", "prefix_cache", "kv_disk_cache", "disk_placement", "restore_dump", "mtp", "dflash" },
     &.{ "server", "responses" },
 };

@@ -14,7 +14,7 @@ import sushi_test as st
 run_nonce = st.attach()
 url = st.url()
 model = 'sushi'
-source = (Path(__file__).resolve().parents[2] / 'src/transformer.zig').read_text()
+source = (Path(__file__).resolve().parents[2] / 'src/trunk.zig').read_text()
 corpus = '\n'.join(source.splitlines()[100:900])
 for nonce in ('81492017', '52839106', '90371648'):
     prompt = (f'Nonce {run_nonce}-{nonce}. Remember the passphrase MAGNOLIA-7731.\n'

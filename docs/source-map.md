@@ -13,7 +13,12 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `scheduler.zig` / `generate.zig` / `degenerate.zig` / `mtp_plan.zig` / `prefill_plan.zig` / `sampler.zig` / `model_load` / `slot_admission` / `mtp_tick` / `slot_outcome` / `vision_queue` / `mtp_policy` / `mtp_round` | slots, inference thread, batching, admission, load bills; generation; MTP policy/rounds/plan; stop loop, prefill plan, sampler | server-lifecycle |
 | `model.zig` / `effort` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, effort words and the per-family effort tables, per-model settings, discovery, registry | server-lifecycle, server-http-apis |
 | `arch/registry.zig` / `arch/*.zig` / `arch_host.zig` / `<arch>/arch.zig` | the only arch names outside a folder, `inline else` dispatch per area, the engine services an arch may import, each arch's public face | engine-arch-seam |
-| `transformer.zig` / `kv_cache.zig` / `ssm_cache.zig` / `layer_weights` / `forward_diag` / `test_support` | shared `Transformer`, `ForwardCtx`, arch dispatch, quant resolution, KV/SSM caches, layer weights, `diagEnvOn` | arch-*, engine-* |
+| `trunk.zig` | `Trunk`: embeddings, lm head, rope/M-RoPE/YaRN tables, compiled closures, the MoE family, eval cadence, the warmup scaffold; `Transformer` is its alias | arch-*, engine-* |
+| `model_handle.zig` | `ForwardCtx`, `CaptureLayers`, the loaded-model operations that dispatch through the registry (`deinit`, `resetCache`, `warmup`, `forwardWith`, ...) | arch-* |
+| `transformer.zig` | compatibility re-exports of the names that moved to `trunk.zig` / `model_handle.zig`; shrinks as arch stages move their callers | arch-* |
+| `mlx_util.zig` / `trunk_helpers_test.zig` | MLX helpers with no model knowledge (scalars, owned copy, masks); test-only fixtures shared by the trunk, KV, attention and MoE tests | engine-mlx-gotchas |
+| `<arch>/<arch>_state.zig` | what an arch owns beyond the trunk: load, `deinit`, cache reset | arch-* |
+| `kv_cache.zig` / `ssm_cache.zig` / `layer_weights` / `forward_diag` / `test_support` | KV/SSM caches, quant resolution, layer weights, `diagEnvOn` | arch-*, engine-* |
 | `nax_gate` / `attn_kernels` / `verify_qmm` / `verify_moe` / `moe_router` / `moe_gqmv` / `moe_stream_compute` | NAX/OS gates; shared attention; verify QMM and MoE; router; gather-QMV; streamed-expert compute | engine-kernels |
 | `qwen4/qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections, PLE / QSA | qwen4-arch, engine-mtp |
 | `mimo2/mimo_forward.zig` | MiMo forward, attention arms, MoE dispatch, batched decode | mimo2-arch |

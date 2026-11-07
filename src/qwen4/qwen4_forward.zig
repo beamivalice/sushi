@@ -1,6 +1,7 @@
 //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
 
 const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const forward_diag = @import("../forward_diag.zig");
 const moe_gqmv = @import("../moe_gqmv.zig");
 const qwen4_gdn = @import("qwen4_gdn.zig");
@@ -21,6 +22,7 @@ const imatrix_capture = @import("../imatrix.zig");
 const expert_exl3 = sushi_exl3.format;
 const expert_quant_mod = @import("../expert_quant.zig");
 const model_mod = @import("../model.zig");
+const arch_registry = @import("../arch/registry.zig");
 const testing = std.testing;
 const qwen4_test_support = @import("qwen4_test_support.zig");
 const Qwen4TestSlot = qwen4_test_support.Qwen4TestSlot;
@@ -3775,6 +3777,7 @@ const Qwen4LadderHostFixture = struct {
     cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)),
 
     pub fn init(self: *Qwen4LadderHostFixture) !void {
+        const tag = arch_registry.ofModelType("qwen4_exp") orelse return error.SkipZigTest;
         const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
         const dim = 64;
         self.bytes = try testing.allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), @intCast(hash.total_rows * dim * 2));
@@ -3792,6 +3795,7 @@ const Qwen4LadderHostFixture = struct {
         x.allocator = testing.allocator;
         x.s = mlx.gpuStream();
         x.qwen4 = &self.st;
+        x.arch = tag;
     }
 
     fn xfm(self: *Qwen4LadderHostFixture) *Transformer {
@@ -5636,9 +5640,9 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
 test "single-stream verify feature selection excludes prefill and ordinary decoding" {
     var xfm: Transformer = undefined;
     var qwen4: qwen4_mod.Qwen4State = undefined;
-    const old_features = trf.single_verify_test_features;
-    defer trf.single_verify_test_features = old_features;
-    trf.single_verify_test_features = @splat(true);
+    const old_features = trunk_mod.single_verify_test_features;
+    defer trunk_mod.single_verify_test_features = old_features;
+    trunk_mod.single_verify_test_features = @splat(true);
     inline for (.{ SingleVerifyFeature.routing, SingleVerifyFeature.down_reduce, SingleVerifyFeature.hc_graph }) |feature| {
         for ([_]bool{ false, true }) |is_qwen4| {
             xfm.qwen4 = if (is_qwen4) &qwen4 else null;
@@ -5654,10 +5658,10 @@ test "single-stream verify feature selection excludes prefill and ordinary decod
         }
         xfm.qwen4 = &qwen4;
         xfm.spec_capture_ssm = true;
-        trf.single_verify_test_features[@backingInt(feature)] = false;
+        trunk_mod.single_verify_test_features[@backingInt(feature)] = false;
         try testing.expect(!xfm.verifyFeatureEnabled(feature, false, 1, 5));
         try testing.expect(xfm.verifyFeatureEnabled(feature, true, 1, 5));
-        trf.single_verify_test_features[@backingInt(feature)] = true;
+        trunk_mod.single_verify_test_features[@backingInt(feature)] = true;
     }
 }
 

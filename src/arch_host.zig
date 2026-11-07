@@ -3,6 +3,7 @@
 pub const log = @import("log.zig");
 pub const io_util = @import("io_util.zig");
 pub const mlx = @import("mlx.zig");
+pub const mlx_util = @import("mlx_util.zig");
 pub const nax = @import("nax_gate.zig");
 pub const kernel_keys = @import("mlx_kernel_keys.zig");
 pub const forward_diag = @import("forward_diag.zig");

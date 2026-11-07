@@ -109,7 +109,7 @@ Copyright 2026 Xiaomi Corporation.
 Copyright 2026 The HuggingFace Inc. team.
 Licensed under the Apache License, Version 2.0.
 
-The MiMo attention and routing implementation in src/transformer.zig follows
+The MiMo attention and routing implementation in src/trunk.zig follows
 the reference's partial rotary embedding, asymmetric K/V, attention-sink,
 value-scaling and sigmoid-routing contracts. It is implemented in Zig against
 mlx-c with SSD-streamed expert banks. tests/mimo2/dump_mimo_v2_fixtures.py loads the
@@ -157,7 +157,7 @@ Reproduced from MTPLX's NOTICE file:
     (https://github.com/bstnxbt/dflash-mlx), Copyright dflash-mlx contributors,
     licensed under the Apache License 2.0. See mtplx/nax_verify.py for details.
 
-Used in sushi (`src/transformer.zig`):
+Used in sushi (`src/trunk.zig`):
 
   * The verify-shaped quantized matmul kernel family (`verifyQmm`), ported from
     `mtplx/verify_kernels.py`. Their design: one threadgroup per column tile,
@@ -192,7 +192,7 @@ Inco Splash
 https://github.com/incoai/splash
 Licensed under the Apache License, Version 2.0.
 
-The matmul2d packed-KV attention kernel (sushi_qkv_mpp in src/transformer.zig)
+The matmul2d packed-KV attention kernel (sushi_qkv_mpp in src/trunk.zig)
 follows the structure of Splash's q8 attention tile
 (runtime/metal/kernels/common/q8_attention_tile.h): per-page QK and PV through
 the MetalPerformancePrimitives tensor op with an online softmax and split-KV
@@ -249,7 +249,7 @@ Used in sushi (`src/glm5/glm5_router.zig`):
     6745c39c GLM module. Storage checks and native fallback were added;
     one-token FP32 score and tie-order parity is retained.
 
-Used in sushi (`src/transformer.zig`):
+Used in sushi (`src/trunk.zig`):
 
   * The GatedDeltaNet blocked-sequence prefill kernel, ported from
     `custom_kernels/qwen35_prefill/gdn.py` (`gated_delta_blocked_seq`).
@@ -308,7 +308,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     @brandondyal. Modifications: SSD deltas retain sushi's
     ring files and transactional metadata publication; logprob regressions
     use synthetic logits and the existing HTTP integration suite.
-  * Affine KV activation dtype preservation (`src/transformer.zig` and
+  * Affine KV activation dtype preservation (`src/trunk.zig` and
     `src/kv_quant.zig`), from mlx-serve #553 by Jason Titus (@jasontitus).
     Modifications: cache writes use sushi's shared batched/solo chunk path;
     the regression also forces capacity growth.
@@ -327,12 +327,12 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     each stored capture state to the next token as sushi's capture kernel does;
     the Hadamard norm-gate-rotate kernel is not ported.
   * GDN verify norm-gate and rollback-history folding (`src/qwen4/gdn_decode.zig`,
-    `src/transformer.zig`, `src/mlx.zig`), from mlx-serve #558 by Samuel Reed
+    `src/trunk.zig`, `src/mlx.zig`), from mlx-serve #558 by Samuel Reed
     (@STRML). Modifications: bf16-only with sushi's per-token state rounding;
     the pipeline probe uses independent dummy inputs to preserve deferred PLE,
     and the default dispatch serves two rows only.
   * Batched Qwen4 decode's async evaluation ladder and its deferred-PLE guard
-    (`src/transformer.zig`), from mlx-serve #584 by @cowboycoderhq.
+    (`src/trunk.zig`), from mlx-serve #584 by @cowboycoderhq.
     Modifications: host-only PLE, synthetic bf16 table fixtures and a separate
     batched engagement line; serial decode keeps its existing default.
   * Prefill/decode wall-time sharing (`src/scheduler.zig`, `src/generate.zig`,
@@ -341,7 +341,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     sushi's single boundary tick; its admission and adaptive-widening checks
     remain in place, and decode-time budget arithmetic saturates on overflow.
   * The fused QSA pooled-key kernel (`sushi_qsa_pool_rope`,
-    `qsaPoolNormRopeFused` in `src/transformer.zig`): the indexer's block mean,
+    `qsaPoolNormRopeFused` in `src/trunk.zig`): the indexer's block mean,
     key RMSNorm and partial RoPE in one dispatch, bit-identical to the MLX op
     chain it replaces, from mlx-serve #556 by Samuel Reed (@STRML).
     Modifications: no environment switch; a microbenchmark arm compares it
@@ -368,7 +368,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     arm of `tests/test_prefix_cache_restart.sh`), from mlx-serve #527 by @brandondyal.
     Modifications: the ring-restore entry point drops its latch too.
   * The first append after a short shared restore sizes its copy from the
-    request rather than the donor's buffer (`src/transformer.zig`), from
+    request rather than the donor's buffer (`src/trunk.zig`), from
     mlx-serve 0405fd10 (#492, reported by @celestial-rose) by David Dalcu.
     Modifications: the copy is taken whenever the donor's buffer is longer
     than the request reserves, and a donated checkout adopts its buffers.
@@ -433,7 +433,7 @@ Copyright (c) 2023 Apple Inc.
 Pinned submodule at `lib/mlx-src`, built by `scripts/build-mlx.sh` and linked
 into the sushi binary. Unmodified as a dependency.
 
-Separately, Metal source from MLX was ported into `src/transformer.zig`: the
+Separately, Metal source from MLX was ported into `src/trunk.zig`: the
 fused head-dim-256 prefill attention kernel (`sushi_attn_p256`) began as a
 self-contained port of MLX's steel attention (FA-2 online softmax, float32
 accumulation, exp2 softmax) specialized to head_dim 256, and its fragment
@@ -512,13 +512,13 @@ Copyright (c) 2023-2026 Apple Inc.
 
 Used in sushi:
 
-  * The GatedDeltaNet fused recurrence kernel in `src/transformer.zig`
+  * The GatedDeltaNet fused recurrence kernel in `src/trunk.zig`
     (`gdnKernelSource`) is a port of `mlx_lm/models/gated_delta.py`'s
     `_make_gated_delta_kernel(has_mask=False, vectorized=False)`.
   * The global-sort MoE gather (`_gather_sort`: argsort the flattened
     (token, expert) pairs, gather rows, run with sorted indices, then inverse
     permute) is theirs, used by our multi-position MoE paths in
-    `src/transformer.zig`.
+    `src/trunk.zig`.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the GDN
 kernel is extended by a sequence variant (`capture_seq`) that records
@@ -547,7 +547,7 @@ mlxfast-challenge
 https://github.com/Layr-Labs/mlxfast-challenge
 Copyright (c) 2026 Layr Labs, Inc.
 
-Four decode fast paths in `src/transformer.zig` were derived from their tree
+Four decode fast paths in `src/trunk.zig` were derived from their tree
 over two porting rounds in July 2026:
 
   * The certified lm_head prune, a port of `LagunaLmHeadPrune.swift`: an MXFP8
@@ -575,7 +575,7 @@ Ideas and code derived from validated challenge submissions at commit b6ce964,
 ported in August 2026 (each item names the submission's co-author handle):
 
   * The hd-256 causal sdpa query split for 6-9-row verify blocks
-    (`splitCausalSdpa` in `src/transformer.zig`), from
+    (`splitCausalSdpa` in `src/trunk.zig`), from
     `Vendor/mlx-swift-lm/.../AttentionUtils.swift` at b6ce964 (a-github-name):
     split the queries at row 5 so both halves ride MLX's sdpa vector path,
     with bottom-right causal alignment keeping each half's key window exact.

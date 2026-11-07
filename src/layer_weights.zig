@@ -1,10 +1,17 @@
-const trf = @import("transformer.zig");
+const trunk = @import("trunk.zig");
+const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const std = @import("std");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const trunk_stq = @import("trunk_stq.zig");
 const expert_exl3 = sushi_exl3.format;
 const mlx = @import("mlx.zig");
+const mlx_util = @import("mlx_util.zig");
+const addOne = mlx_util.addOne;
+const bf16Scalar = mlx_util.bf16Scalar;
+const lastDim = mlx_util.lastDim;
+const scalarOf = mlx_util.scalarOf;
+const transposeBf16Weight = mlx_util.transposeBf16Weight;
 const test_support = @import("test_support.zig");
 const attn256RandBf16 = test_support.attn256RandBf16;
 const model_mod = @import("model.zig");
@@ -13,9 +20,9 @@ const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
 const Weights = model_mod.Weights;
 const testing = std.testing;
-const KVCache = trf.KVCache;
-const Transformer = trf.Transformer;
-const seFillBf16 = trf.seFillBf16;
+const KVCache = trunk.KVCache;
+const Transformer = trunk.Transformer;
+const seFillBf16 = trunk_helpers_test.seFillBf16;
 
 pub const expert_exl3_kernels = sushi_exl3.kernels;
 
@@ -248,23 +255,6 @@ const QuantParamsCache = struct {
 // Backwards-compatibility alias — keeps existing field names readable.
 pub const BitsCache = QuantParamsCache;
 
-/// Pre-transpose a plain-BF16 weight stored as `[out, in]` to `[in, out]` so
-/// `mlx_matmul(x, w_t)` lands the contraction over the input axis. Used by
-/// Unsloth Dynamic checkpoints that leave linear-attention projections
-/// unquantized while quantizing the rest. Caller owns the returned array.
-pub fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    // Swap the last two axes for any rank: 2D weights [out, in] → [in, out];
-    // stacked MoE expert tensors [experts, out, in] → [experts, in, out].
-    const ndim = mlx.getShape(w).len;
-    var perm: [8]c_int = undefined; // mlx arrays never exceed 8 dims here
-    for (0..ndim) |i| perm[i] = @intCast(i);
-    perm[ndim - 2] = @intCast(ndim - 1);
-    perm[ndim - 1] = @intCast(ndim - 2);
-    var w_t = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, @intCast(ndim), s));
-    return w_t;
-}
-
 /// In-place: if `*sc` is null-ctx, we treat the matching `*w` as plain bf16.
 /// Replace `*w` with its pre-transposed `[in, out]` form and record the new
 /// array in `owned` so we can free it on Transformer.deinit.
@@ -476,16 +466,6 @@ fn detectQuantBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
     const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
     if (s_cols == 0) return 4;
     return (w_cols * 32) / (s_cols * group_size);
-}
-
-/// Last-axis size of an array, as the input-dimension hint for
-/// `quantParamsHinted`. Null for null-ctx handles or degenerate shapes.
-pub inline fn lastDim(x: mlx.mlx_array) ?u32 {
-    if (x.ctx == null) return null;
-    const shape = mlx.getShape(x);
-    if (shape.len == 0) return null;
-    const d = shape[shape.len - 1];
-    return if (d > 0) @as(u32, @intCast(d)) else null;
 }
 
 /// Detect a quantized weight's (bits, group_size, mode) from its scales tensor
@@ -952,23 +932,6 @@ pub fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, 
     return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
 }
 
-/// A 0-d scalar in `dt` (a bare f32 scalar array promotes bf16 operands).
-pub fn scalarOf(val: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
-    const raw = mlx.mlx_array_new_float(val);
-    defer _ = mlx.mlx_array_free(raw);
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, raw, dt, s));
-    return out;
-}
-
-pub fn bf16Scalar(val: f32, s: mlx.mlx_stream) mlx.mlx_array {
-    const f32_arr = mlx.mlx_array_new_float(val);
-    defer _ = mlx.mlx_array_free(f32_arr);
-    var bf16_arr = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&bf16_arr, f32_arr, .bfloat16, s);
-    return bf16_arr;
-}
-
 pub fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
     const cache = try KVCache.init(allocator, 0);
     return .{
@@ -997,14 +960,6 @@ pub fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx
         .ssm_entries = null,
         .moe_seq_offset = 0,
     };
-}
-
-pub fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const one = bf16Scalar(1.0, s);
-    defer _ = mlx.mlx_array_free(one);
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&result, one, arr, s));
-    return result;
 }
 
 /// [E, out, in] affine-4/g64 expert bank — the stand-in for a streamed MXFP4

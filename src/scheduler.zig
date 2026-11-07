@@ -2,7 +2,7 @@
 //!
 //! Owns the single inference thread (the only thread that calls into mlx
 //! ops; mlx 0.31.2 made GPU streams thread-local so the model weights are
-//! bound to the thread that builds them in `Transformer.init`). Connection
+//! bound to the thread that builds them in `Trunk.init`). Connection
 //! threads parse HTTP, build prompt token ids, call
 //! `submit()` and then loop on `Slot.waitNext()` to read generated tokens
 //! one at a time. The state machines for tool-call detection, thinking
@@ -487,7 +487,7 @@ pub const Slot = struct {
         errdefer cache.deinit();
         if (config.swaRingTokens() > 0) cache.setSwaRing(config.sliding_window);
 
-        // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
+        // Per-slot SSM cache. Mirror the same predicate `Trunk.initTrunk`
         // uses to allocate `xfm.ssm_entries` (`needsSsmEntries`). Without this
         // branch the slot's `ctx.ssm_entries` is null and the
         // linear-attention layers crash on `ctx.ssm_entries.?`. Pure-attention

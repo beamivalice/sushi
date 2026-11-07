@@ -53,7 +53,10 @@ test {
     _ = @import("mtp_plan.zig");
     _ = @import("prefill_plan.zig");
     _ = @import("sampler.zig");
-    _ = @import("transformer.zig");
+    _ = @import("trunk.zig");
+    _ = @import("model_handle.zig");
+    _ = @import("mlx_util.zig");
+    _ = @import("trunk_helpers_test.zig");
     _ = @import("vision.zig");
     _ = @import("qwen4/qwen_vision.zig");
     _ = @import("vision_common.zig");

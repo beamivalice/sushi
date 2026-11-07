@@ -1,6 +1,7 @@
 //! Flash-Next hyper-connections and the n-gram PLE table.
 
 const trf = @import("../transformer.zig");
+const trunk = @import("../trunk.zig");
 const kv_cache = @import("../kv_cache.zig");
 const io_util_mod = @import("../io_util.zig");
 const Transformer = trf.Transformer;
@@ -153,7 +154,7 @@ pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWei
             return .{ .stream = try standinRef(n.stream), .mixed = read.mixed, .inj = read.inj };
         }
     }
-    if (trf.linear_tap != null or batch * seq_len > HC_FUSED_MAX_ROWS or w.down_s.ctx == null or w.up_s.ctx == null or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
+    if (trunk.linear_tap != null or batch * seq_len > HC_FUSED_MAX_ROWS or w.down_s.ctx == null or w.up_s.ctx == null or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
     const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
     const uqp = self.quantParamsFor(w.up_w, w.up_s);
     if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
@@ -216,7 +217,7 @@ pub fn hcReadVerifyRows(self: *Transformer, rows: anytype, w: *const HcWeights) 
             row.pending = null;
         }
     }
-    trf.mtp_verify_kernel_calls[1] +%= 1;
+    trunk.mtp_verify_kernel_calls[1] +%= 1;
     const Once = struct {
         var logged = false;
     };

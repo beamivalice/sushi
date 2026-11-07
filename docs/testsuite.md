@@ -114,7 +114,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - Beside the code it tests, at the bottom of that file. Tests move with their code.
 - A test's model is its file's folder (`src/qwen4/`, `src/mimo2/`, `src/glm5/`, `src/dsv41/`); the `src/` root is shared.
   `-Dmodel=<arch>` runs one folder's tests plus the shared ones.
-- A shared file (`transformer.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
+- A shared file (`trunk.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
   holds only `shared` tests. Code for one arch lives in that arch's files, and so do its tests.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.
 - Integration scripts in `tests/` cover only what HTTP shows and a unit test cannot reach.

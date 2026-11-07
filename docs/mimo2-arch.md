@@ -4,7 +4,7 @@ How the engine serves MiMo-V2.6-Flash (the served pack is quantized from the MOP
 layout): the source checkpoint's layout, the resident trunk, the MXFP4 and EXL3
 expert paths, the hybrid global/sliding attention with its ring, the vision tower, and the bills that follow the
 storage. MiMo serves text and image input; the supported product is the MCG EXL3 pack. Read this before touching
-`src/mimo2/mimo_source.zig`, `src/mimo2/mimo_vision.zig`, `src/mimo2/mimo_forward.zig` (forward, attention arms, MoE dispatch), the shared `src/transformer.zig`, or anything that bills MiMo's KV.
+`src/mimo2/mimo_source.zig`, `src/mimo2/mimo_vision.zig`, `src/mimo2/mimo_forward.zig` (forward, attention arms, MoE dispatch), the shared `src/trunk.zig`, or anything that bills MiMo's KV.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-expert-streaming](engine-expert-streaming.md), [engine-kv-cache](engine-kv-cache.md),

@@ -1,15 +1,15 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
-const trf = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
-const KVCache = trf.KVCache;
-const Transformer = trf.Transformer;
-const standinOnes = trf.standinOnes;
+const KVCache = trunk.KVCache;
+const Transformer = trunk.Transformer;
+const standinOnes = trunk.standinOnes;
 
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var sigmoid_table: ?mlx.mlx_array = null;

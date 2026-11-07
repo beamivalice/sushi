@@ -11,13 +11,21 @@ joins `DROPPABLE` when its drop passes.
 ## The rules
 
 - `src/arch/registry.zig` is the only file outside `src/<arch>/` that names an architecture: one entry per arch, marked
-  `// arch:<name>`. The entry order is the dispatch order of `handleOf`; the arch without a `loaded` is the default and
-  goes last.
+  `// arch:<name>`.
 - `src/<arch>/arch.zig` is the arch's only public face. It declares `model_types`, `Config`, `Model`, the operations
-  the dispatch files call, `loaded` (does this model hold the arch's state), and the slots `packs` and `flags`. The
+  the dispatch files call (`init`, `deinit`, `resetCache`, `warmup`, `forward`, ...), and the slots `packs` and `flags`.
+  The arch a model runs as is stamped on it once, by `life.init` (`Trunk.arch`); `handleOf` reads that tag and tests
+  nothing else. The arch that runs a `model_type` no arch claims declares `default_arch`. The
   slots are empty: alias rows still live in `aliases` in `src/cli.zig`, and arch-only flags in `src/cli.zig`.
 - **Shared code may name a format, never an arch**: a tool-call grammar, a template dialect, a codebook, a prefix-cache
   kind. The arch picks among them.
+- A model is `Trunk` (`src/trunk.zig`: embeddings, lm head, rope tables, compiled closures, the MoE family, the
+  warmup scaffold) plus the arch's own state, which lives in `src/<arch>/<arch>_state.zig` (load, `deinit`, cache
+  reset). `Trunk.deinit`, `resetCache` and `warmup` are `model_handle.zig` operations that dispatch to the arch, which
+  frees or resets its own state and then calls the trunk's `deinitTrunk` / `resetTrunk` / `warmupTrunk`.
+  `Transformer` is an alias of `Trunk`, and `transformer.zig` re-exports the names that moved, until the arch stages
+  move their callers. The arch handle fields (`glm5`, `dsv41`, `qwen4`, ...) stay on `Trunk` for now: callers reach
+  them by name, and each arch's S3 stage moves its own.
 - Dispatch is `inline else` over the union, one area file per concern in `src/arch/`: `life` (construction, stream
   rebind), `forward`, `request`, `admission` (expert-stream traits from the config), and `spec` (the config side:
   `Spec`, the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU

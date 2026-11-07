@@ -6,7 +6,6 @@ const opts = @import("build_options");
 
 const Entry = struct { name: [:0]const u8, mod: type };
 
-// The order is the dispatch order of `handleOf`. The arch without a `loaded` is the default and goes last.
 const entries = [_]Entry{
     .{ .name = "glm5", .mod = @import("../glm5/arch.zig") }, // arch:glm5
     .{ .name = "dsv41", .mod = @import("../dsv41/arch.zig") }, // arch:dsv41
@@ -76,19 +75,18 @@ pub fn ofModelType(model_type: []const u8) ?Tag {
     return null;
 }
 
-/// The arch that runs a model type no arch claims: today the generic MoE trunk. Null when its arch is not built.
+/// The arch that runs a model type no arch claims: today the generic MoE trunk, which declares `default_arch`. Null
+/// when its arch is not built.
 pub const default: ?Tag = blk: {
-    for (enabled, 0..) |e, i| if (!@hasDecl(e.mod, "loaded")) break :blk @enumFromInt(i);
+    for (enabled, 0..) |e, i| if (@hasDecl(e.mod, "default_arch")) break :blk @enumFromInt(i);
     break :blk null;
 };
 
-/// The arch of a loaded model: the first whose `loaded` holds, else the default.
+/// The handle of a loaded model: the arch `life.init` stamped on it, no test of its state.
 pub fn handleOf(model: anytype) Arch {
-    inline for (enabled) |e| {
-        if (@hasDecl(e.mod, "loaded") and e.mod.loaded(model)) return @unionInit(Arch, e.name, model);
-    }
-    if (comptime default) |d| return @unionInit(Arch, @tagName(d), model);
-    @panic("no enabled architecture claims this model");
+    return switch (model.arch) {
+        inline else => |t| @unionInit(Arch, @tagName(t), model),
+    };
 }
 
 pub const served_model_types: []const []const u8 = blk: {
@@ -121,13 +119,13 @@ test "a model type resolves to the arch that claims it" {
 
 test "every enabled arch declares the operations the dispatch files call" {
     inline for (enabled) |e| {
-        inline for (.{ "model_types", "Config", "Model", "packs", "flags", "init", "forward", "lmHeadForDraft", "ownsModuleDecodeState", "expertStream" }) |decl| {
+        inline for (.{ "model_types", "Config", "Model", "packs", "flags", "init", "deinit", "resetCache", "warmup", "forward", "lmHeadForDraft", "ownsModuleDecodeState", "expertStream" }) |decl| {
             if (!@hasDecl(e.mod, decl)) @compileError(e.name ++ "/arch.zig lacks " ++ decl);
         }
     }
     comptime var defaults = 0;
     inline for (enabled) |e| {
-        if (!@hasDecl(e.mod, "loaded")) defaults += 1;
+        if (@hasDecl(e.mod, "default_arch")) defaults += 1;
     }
     try std.testing.expect(defaults <= 1);
 }

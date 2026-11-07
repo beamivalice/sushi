@@ -8,6 +8,7 @@ const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
 const KVQuantConfig = kv_quant.KVQuantConfig;
 const model_mod = @import("../model.zig");
+const arch_registry = @import("../arch/registry.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const testing = std.testing;
@@ -323,6 +324,7 @@ test "a GLM prefill interleaved with another stream's decode builds the solo pre
 
 test "a streamed GLM load keeps its one teacher stream exclusive" {
     var t: Transformer = undefined;
+    t.arch = arch_registry.ofModelType("glm5_next") orelse return error.SkipZigTest;
     t.qwen4 = null;
     t.dsv41 = null;
     t.expert_stream = null;

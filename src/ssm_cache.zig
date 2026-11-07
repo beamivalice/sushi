@@ -1,4 +1,6 @@
-const trf = @import("transformer.zig");
+const model_handle = @import("model_handle.zig");
+const mlx_util = @import("mlx_util.zig");
+pub const materializedOwnedCopy = mlx_util.materializedOwnedCopy;
 const std = @import("std");
 const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const gdn_decode = @import("qwen4/gdn_decode.zig");
@@ -16,7 +18,7 @@ const ssmAuxIsQsaHistory = qwen4_qsa_state.ssmAuxIsQsaHistory;
 const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
 const test_support = @import("test_support.zig");
 const qwen4ReadF32 = test_support.qwen4ReadF32;
-const ForwardCtx = trf.ForwardCtx;
+const ForwardCtx = model_handle.ForwardCtx;
 
 pub const SSMCacheEntry = struct {
     conv_state: mlx.mlx_array, // [B, kernel-1, conv_dim]
@@ -983,27 +985,6 @@ fn moveTight(s: mlx.mlx_stream, live: *mlx.mlx_array, dst: *mlx.mlx_array) !void
     live.* = .{ .ctx = null };
     if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
     dst.* = owned;
-}
-
-/// Force a REAL copy of `x` into a freshly allocated buffer. `mlx_copy` and
-/// `mlx_contiguous` both take shared-buffer fast paths (Copy is a view op;
-/// contiguous no-ops when the view's strides read as row-contiguous, which a
-/// size-1-leading-dim slice does), so neither breaks the alias to a slice's
-/// parent buffer. Adding a same-dtype scalar zero always runs a kernel with a
-/// newly allocated output. Buffer donation can't alias either: the caller
-/// still holds `x`, so its buffer is never donated.
-pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array {
-    var zero = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(zero);
-    const scalar_shape = [_]c_int{1};
-    try mlx.check(mlx.mlx_zeros(&zero, &scalar_shape, 0, mlx.mlx_array_dtype(x), s));
-    var neg_zero = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(neg_zero);
-    try mlx.check(mlx.mlx_negative(&neg_zero, zero, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_add(&out, x, neg_zero, s));
-    return out;
 }
 
 /// `settle` evaluates the copy so it lets go of a prefill chunk; a verify's few rows stay

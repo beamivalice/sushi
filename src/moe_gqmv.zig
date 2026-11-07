@@ -1,4 +1,5 @@
-const trf = @import("transformer.zig");
+const trunk_helpers_test = @import("trunk_helpers_test.zig");
+const trunk = @import("trunk.zig");
 const std = @import("std");
 const expert_stream_mod = @import("expert_stream.zig");
 const mlx = @import("mlx.zig");
@@ -15,12 +16,12 @@ const attn_kernels = @import("attn_kernels.zig");
 const QsaCfgCache = attn_kernels.QsaCfgCache;
 const verify_qmm = @import("verify_qmm.zig");
 const cachedScalarInt = verify_qmm.cachedScalarInt;
-const fusedSwiGLU = trf.fusedSwiGLU;
-const gatherExpertMm = trf.gatherExpertMm;
-const moeRowsAffineBank = trf.moeRowsAffineBank;
-const moeRowsSliceRow = trf.moeRowsSliceRow;
-const seHash = trf.seHash;
-const swigluSigTable = trf.swigluSigTable;
+const fusedSwiGLU = trunk.fusedSwiGLU;
+const gatherExpertMm = trunk.gatherExpertMm;
+const moeRowsAffineBank = trunk_helpers_test.moeRowsAffineBank;
+const moeRowsSliceRow = trunk_helpers_test.moeRowsSliceRow;
+const seHash = trunk_helpers_test.seHash;
+const swigluSigTable = trunk.swigluSigTable;
 
 fn gatherQmvSource(comptime x_per_expert: bool) [:0]const u8 {
     // Everything is indexed off the raw buffer names rather than through
@@ -436,7 +437,7 @@ pub fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int) MoeDecodeDispatchArm {
     const total_inds: c_int = B * S * K;
     const do_sort = B * S > 1 or total_inds >= 64;
     if (B >= 1 and B <= 8 and S >= 1 and B * S >= 2 and B * S <= 16 and moeRowsFusedEnabled() and
-        !trf.qwen4Standin().moe_gateup and !trf.qwen4Standin().moe_down)
+        !trunk.qwen4Standin().moe_gateup and !trunk.qwen4Standin().moe_down)
         return .rows;
     if (do_sort) return .sorted;
     return .gather_qmv;
@@ -1497,8 +1498,8 @@ test "fused gate+up+SwiGLU expert kernel is bit-identical to the split gatherQmv
     const rnd = prng.random();
     gqmv_gateup_override = true;
     defer gqmv_gateup_override = null;
-    trf.swiglu_fused_override = true;
-    defer trf.swiglu_fused_override = null;
+    trunk.swiglu_fused_override = true;
+    defer trunk.swiglu_fused_override = null;
 
     const E: c_int = 8;
     const N: c_int = 64;
