@@ -50,6 +50,21 @@ class Tape(unittest.TestCase):
         b["log"][1] = "[prefix] reused 0 of 9 prompt tokens from SSD"
         self.assertIn("log line 1", tape.compare_case("hot", a, b))
 
+    def test_spec_timing_counters_and_a_race_order_are_not_a_difference(self):
+        def spec(attempts, stalls, table, drops):
+            return tape.log_lines(f"[spec-stats] mode=mtp attempts={attempts} accepts=90 drafted=114 table=<2k:w3:0.31/{table} "
+                                  f"table_drops=t0/c0/b0/i{drops} serial_drops=t0/c0/b0 lookup=0/0/0 stalls={stalls}")
+        self.assertEqual(spec(38, "6/852", 27, 1), spec(38, "12/2359", 23, 5))
+        self.assertNotEqual(spec(38, "6/852", 27, 1), spec(39, "6/852", 27, 1))
+        hot = lambda e, n: tape.log_lines(f"[hot-cache] reused {n}/30 tokens (matched 30; entry {e}/3; lost 1: no-point)")
+        self.assertEqual(hot(1, 29), hot(2, 29))
+        self.assertNotEqual(hot(1, 29), hot(1, 28))
+
+    def test_a_tape_recorded_under_older_masks_still_compares(self):
+        old = entry(log=["[spec-stats] mode=mtp attempts=38 stalls=6/852"])
+        new = entry(log=["[spec-stats] mode=mtp attempts=38 stalls=12/2359"])
+        self.assertIsNone(tape.compare_case("spec", old, new))
+
     def test_unstable_case_needs_only_the_serial_prefix(self):
         want = {"unstable": True}
         serial = {"p0": {"text": "The quick brown fox jumps over the lazy dog again and again"}}

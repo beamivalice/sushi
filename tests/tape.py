@@ -159,7 +159,9 @@ def response_record(resp):
 
 
 NOISE = [(re.compile(r"\d+(\.\d+)?\s*(ms|us|ns|s|MB/s|GB/s|tok/s|t/s)\b"), "#"), (re.compile(r"\b\w*_ms=\S+"), "#"),
-         (re.compile(r"\d+\.\d+"), "#"), (re.compile(r"\b[ep]\d+-\d+\b"), "#"), (re.compile(r"\be\d+\b"), "e#")]
+         (re.compile(r"\d+\.\d+"), "#"), (re.compile(r"\b[ep]\d+-\d+\b"), "#"), (re.compile(r"\be\d+\b"), "e#"),
+         # Wall-clock counters of the spec controllers, and which of two concurrent rows committed first.
+         (re.compile(r"\b(stalls|table|table_drops)=\S+"), r"\1=#"), (re.compile(r"\bentry \d+/"), "entry #/")]
 TAGS = re.compile(r"\[(cache|disk-cache|hot-cache|spec-stats|mtp-planner|kv-cache|mtp|dflash|dsv41-prefix|prefix|batched)\]")
 
 
@@ -224,8 +226,9 @@ def compare_case(name, want, got, serial_of=None):
     d = first_diff(want["response"], got["response"], f"{name}")
     if d:
         return d
-    if "log" in want and want["log"] != got.get("log"):
-        a, b = want["log"], got.get("log") or []
+    # Both sides through today's masks, so a tape recorded under an older mask set still compares.
+    a, b = (sum((log_lines(x) for x in side), []) for side in (want.get("log") or [], got.get("log") or []))
+    if "log" in want and a != b:
         i = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
         return f"{name} log line {i}: {a[i] if i < len(a) else None!r} vs {b[i] if i < len(b) else None!r}"
     return None
