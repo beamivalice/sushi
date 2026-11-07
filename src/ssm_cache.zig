@@ -2,20 +2,18 @@ const model_handle = @import("model_handle.zig");
 const mlx_util = @import("mlx_util.zig");
 pub const materializedOwnedCopy = mlx_util.materializedOwnedCopy;
 const std = @import("std");
-const qwen4_mod = @import("qwen4/qwen4_exp.zig");
-const gdn_decode = @import("qwen4/gdn_decode.zig");
 const mlx = @import("mlx.zig");
 const testing = std.testing;
 const kv_cache = @import("kv_cache.zig");
 const KVCacheEntry = kv_cache.KVCacheEntry;
-const qwen4_qsa_state = @import("qwen4/qwen4_qsa_state.zig");
-const qsaHistoryRows = qwen4_qsa_state.qsaHistoryRows;
-const qsaKeyAppendPlan = qwen4_qsa_state.qsaKeyAppendPlan;
-const qsaLeftoverAt = qwen4_qsa_state.qsaLeftoverAt;
-const qsaRawKeyBytes = qwen4_qsa_state.qsaRawKeyBytes;
-const qsaResliceToKeep = qwen4_qsa_state.qsaResliceToKeep;
-const ssmAuxIsQsaHistory = qwen4_qsa_state.ssmAuxIsQsaHistory;
-const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
+const arch_aux = @import("arch/prefix.zig").aux;
+const qsaHistoryRows = arch_aux.qsaHistoryRows;
+const qsaKeyAppendPlan = arch_aux.qsaKeyAppendPlan;
+const qsaLeftoverAt = arch_aux.qsaLeftoverAt;
+const qsaRawKeyBytes = arch_aux.qsaRawKeyBytes;
+const qsaResliceToKeep = arch_aux.qsaResliceToKeep;
+const ssmAuxIsQsaHistory = arch_aux.ssmAuxIsQsaHistory;
+const ssmFreeQsaState = arch_aux.ssmFreeQsaState;
 const test_support = @import("test_support.zig");
 const qwen4ReadF32 = test_support.qwen4ReadF32;
 const ForwardCtx = model_handle.ForwardCtx;
@@ -34,12 +32,12 @@ pub const SSMCacheEntry = struct {
     spec_state_seq: mlx.mlx_array = .{ .ctx = null },
     /// The verify that stored only its final state: what rollback replays the accepted rows from.
     /// Held instead of `spec_state_seq`, never beside it.
-    spec_replay: gdn_decode.Replay = .{},
+    spec_replay: arch_aux.Replay = .{},
     /// PLD spec-decode capture: the conv1d input `[B, (kernel-1)+T, conv_dim]`
     /// of the verify forward, so the accepted-position `conv_state` is just a
     /// slice (no re-forward). Null outside capture.
     spec_conv_input: mlx.mlx_array = .{ .ctx = null },
-    /// qwen4_exp per-request state beside the GDN pair: the PLE dilated-conv
+    /// Per-request aux state beside the recurrent pair: the PLE dilated-conv
     /// window `[B, (K-1)*dilation, hc*hidden]` on the PLE layer, the raw QSA
     /// indexer key history `[B, kv, idx_hd]` on full-attention layers.
     /// QSA history is a prefix of ONE buffer — stride checkpoints must NOT
@@ -47,7 +45,7 @@ pub const SSMCacheEntry = struct {
     aux_state: mlx.mlx_array = .{ .ctx = null },
     /// PLE: the (ngram_size-1) tokens preceding the next forward.
     /// The (ngram_size - 1) tokens preceding this entry.
-    ple_prev: [qwen4_mod.MAX_NGRAM_SIZE]u32 = @splat(0),
+    ple_prev: [arch_aux.ple_prev_len]u32 = @splat(0),
     ple_prev_valid: bool = false,
     /// Spec-verify capture for the PLE layer: the dilated-conv input
     /// `[B, state_len + T, hc*hidden]` and the token history (prev ++ ids)
@@ -146,7 +144,7 @@ pub fn seedCapBuf(s: mlx.mlx_stream, src: mlx.mlx_array, axis: usize, reserve: u
     errdefer _ = mlx.mlx_array_free(seeded);
     try mlx.check(mlx.mlx_slice_update(&seeded, grown, src, &start, nd, &stop, nd, &strides, nd, s));
     // Not counted in `qsa_cap_buf_allocs`: that counter means "capBufAppend had to grow".
-    qwen4_qsa_state.qsa_history_seeds += 1;
+    arch_aux.noteHistorySeed();
     return seeded;
 }
 
@@ -166,7 +164,7 @@ pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array
     for (csh, 0..) |d, i| stop[i] = d;
 
     if (plan.new_cap != cap) {
-        qwen4_qsa_state.qsa_cap_buf_allocs += 1;
+        arch_aux.noteCapBufAlloc();
         var shape = [_]c_int{ 0, 0, 0, 0 };
         for (csh, 0..) |d, i| shape[i] = d;
         shape[axis] = @intCast(plan.new_cap);
@@ -220,7 +218,7 @@ pub const SSMCacheEntrySnapshot = struct {
     conv_state: mlx.mlx_array,
     ssm_state: mlx.mlx_array,
     initialized: bool,
-    /// qwen4_exp per-request state beside the GDN pair (see SSMCacheEntry):
+    /// Per-request aux state beside the recurrent pair (see SSMCacheEntry):
     /// the PLE conv window / QSA key history, the pooled block keys, and the
     /// PLE token history. Null / invalid on every other arch.
     aux_state: mlx.mlx_array = .{ .ctx = null },
@@ -228,7 +226,7 @@ pub const SSMCacheEntrySnapshot = struct {
     qsa_ratio: c_int = 4,
     qsa_rows: c_int = 0,
     /// The (ngram_size - 1) tokens preceding this entry.
-    ple_prev: [qwen4_mod.MAX_NGRAM_SIZE]u32 = @splat(0),
+    ple_prev: [arch_aux.ple_prev_len]u32 = @splat(0),
     ple_prev_valid: bool = false,
 };
 
@@ -342,7 +340,7 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
     if (snap.ssm_state.ctx != null) {
         try mlx.check(mlx.mlx_array_set(&dst.ssm_state, snap.ssm_state));
     }
-    // qwen4_exp aux state: REPLACED, never merged — the entry may hold the
+    // The aux state: REPLACED, never merged — the entry may hold the
     // previous request's key history.
     ssmFreeQsaState(dst);
     if (snap.aux_state.ctx != null) {
@@ -459,7 +457,7 @@ pub fn ssmHasSpecCapture(entry: *const SSMCacheEntry) bool {
 }
 
 pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
-    // qwen4_exp per-request state beside the GDN pair. PLE layer: the conv
+    // Per-request aux state beside the recurrent pair. PLE layer: the conv
     // window + token history slice at 1+accepted (same shape as conv_state
     // below). Attention layer: the QSA raw-key history is positional — keep
     // the rows up to the accepted verify prefix.
@@ -520,7 +518,7 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
     }
     const acc: c_int = @intCast(accepted);
     if (entry.spec_state_seq.ctx == null and entry.spec_replay.held() and entry.spec_conv_input.ctx != null) {
-        const replayed = try gdn_decode.replayState(entry.spec_replay, entry.spec_conv_input, acc + 1, s);
+        const replayed = try arch_aux.replayState(entry.spec_replay, entry.spec_conv_input, acc + 1, s);
         _ = mlx.mlx_array_free(entry.ssm_state);
         entry.ssm_state = replayed;
         patch_ssm = true;
@@ -825,7 +823,7 @@ pub const SSMCheckpoint = struct {
     }
 };
 
-/// Checkpoint states one Qwen request holds in RAM when an SSD tier backs its cache: a write-through prefill
+/// Checkpoint states one request holds in RAM when an SSD tier backs its cache: a write-through prefill
 /// holds two (the one before the newest, until its file is written, and the one just captured); a request
 /// it cannot serve is thinned to two and holds a third while one is captured. The admission bill and the
 /// capture cap both read it.
@@ -1086,10 +1084,10 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
 }
 
 /// Which retention policy a checkpoint list is thinned with. The span-preserving thin moves
-/// where a warm turn restores from and was measured on qwen4_exp only, so the policy is chosen
+/// where a warm turn restores from and was measured on the long-context archs only, so the policy is chosen
 /// by `longCtxGated()` at each site and the ungated value names that site's previous
 /// behaviour: `.oldest` (prefill capture, disk tier), `.min_span` (hot-cache merge/shed),
-/// `.min_span_recency` (`.min_span` plus a dense newest quarter; qwen4_exp).
+/// `.min_span_recency` (`.min_span` plus a dense newest quarter; the long-context archs).
 pub const ThinPolicy = enum { oldest, min_span, min_span_recency };
 
 /// The checkpoint index to drop when a retention list is over its cap: the interior position

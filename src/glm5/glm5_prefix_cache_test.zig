@@ -9,6 +9,7 @@ const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 const std = @import("std");
+const prefix_arch = @import("../arch/prefix.zig");
 const testing = std.testing;
 const pc = @import("../prefix_cache.zig");
 
@@ -176,6 +177,7 @@ fn expectGlmRestoreLikeCold(hc: *pc.HotPrefixCache, net: *const glm5_forward.Mod
 }
 
 test "GLM hot cache restores the highest checkpoint under the match and continues like a cold prefill" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
@@ -188,7 +190,7 @@ test "GLM hot cache restores the highest checkpoint under the match and continue
         const e = &hc.entries.items[0];
         var cps_bytes: u64 = 0;
         for (e.ssm_checkpoints.?) |*cp| cps_bytes += ssmCheckpointBytes(cp);
-        try testing.expectEqual(e.glm.?.bytes() + cps_bytes, e.kv_bytes);
+        try testing.expectEqual(e.rows.?.bytes() + cps_bytes, e.kv_bytes);
         try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
 
         var warm = try glm5_prefix.servedRequest(bits);
@@ -213,6 +215,7 @@ test "GLM hot cache restores the highest checkpoint under the match and continue
 }
 
 test "GLM hot cache trims an entry over the byte budget to a checkpoint and bills what it keeps" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
@@ -242,7 +245,7 @@ test "GLM hot cache trims an entry over the byte budget to a checkpoint and bill
     defer turn.cache.deinit();
     try testing.expectEqual(pc.CommitStatus{ .ok = 264 }, try hc.commitGlm(&turn.cache, &long, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 236 }, long.len));
     const e = &hc.entries.items[0];
-    try testing.expectEqual(@as(usize, 264), e.glm.?.len);
+    try testing.expectEqual(@as(usize, 264), e.rows.?.len());
     try testing.expect(e.dflash != null);
     try testing.expectEqual(window_bytes + 264 * row + per_cp, e.kv_bytes);
     try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
@@ -252,6 +255,7 @@ test "GLM hot cache trims an entry over the byte budget to a checkpoint and bill
 }
 
 test "GLM hot cache evicts by count, invalidates, and a miss leaves the request cold" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
@@ -275,6 +279,7 @@ test "GLM hot cache evicts by count, invalidates, and a miss leaves the request 
 }
 
 test "GLM hot cache gives entries back LRU first to admit a long prefill, sparing the one it restored from" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
@@ -307,6 +312,7 @@ test "GLM hot cache gives entries back LRU first to admit a long prefill, sparin
 }
 
 test "GLM hot cache shares across media keys only below the first block the request lacks" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
@@ -325,6 +331,7 @@ test "GLM hot cache shares across media keys only below the first block the requ
 }
 
 test "GLM hot cache checkout hands the MLA rows to the slot so its first append donates" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     var fx: GlmNet = undefined;
     try fx.load();
@@ -336,7 +343,7 @@ test "GLM hot cache checkout hands the MLA rows to the slot so its first append 
     hc.ssd_first = true;
     var turn = try GlmTurn.run(&fx.net, 8, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
     _ = try turn.commit(&hc, &glm_first, 0, null);
-    const billed = hc.entries.items[0].glm_bytes;
+    const billed = hc.entries.items[0].rows_bytes;
     var warm = try glm5_prefix.servedRequest(8);
     defer warm.deinit();
     var target = try KVCache.initWithConfig(testing.allocator, 4, kv_quant.KVQuantConfig.affine(8));
@@ -347,13 +354,14 @@ test "GLM hot cache checkout hands the MLA rows to the slot so its first append 
     try testing.expect(res.checked_out);
     try testing.expectEqual(@as(usize, 16), res.matched);
     hc.donateCheckout(7);
-    try testing.expectEqual(@as(u64, 0), hc.entries.items[0].glm.?.bytes());
+    try testing.expectEqual(@as(u64, 0), hc.entries.items[0].rows.?.bytes());
     try testing.expectEqual(billed, hc.donatedBytes(7));
     hc.releaseCheckout(7, "test");
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
 }
 
 test "GLM SSD tier restores a checkpoint after the RAM copy is gone and continues like a cold prefill" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -408,6 +416,7 @@ test "GLM SSD tier restores a checkpoint after the RAM copy is gone and continue
 }
 
 test "GLM SSD tier: one fingerprint dir serves each latent width its own entry, and a lookup at another width misses" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -446,6 +455,7 @@ test "GLM SSD tier: one fingerprint dir serves each latent width its own entry, 
 }
 
 test "GLM entries carry the assistant window, and a restore hands back its rows below the checkpoint, RAM and SSD" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -494,6 +504,7 @@ test "GLM entries carry the assistant window, and a restore hands back its rows 
 }
 
 test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart restores it like a cold prefill" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -558,6 +569,7 @@ test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart 
 }
 
 test "GLM: the SSD tier gets every row in one flush whatever the RAM tier keeps, and the longer tier restores" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -591,7 +603,7 @@ test "GLM: the SSD tier gets every row in one flush whatever the RAM tier keeps,
         const status = try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, ram_rows, turn.rows, null, first.len);
         if (arm.ram) {
             try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, status);
-            try testing.expectEqual(@as(usize, 256), hc.entries.items[0].glm.?.len);
+            try testing.expectEqual(@as(usize, 256), hc.entries.items[0].rows.?.len());
             try testing.expectEqual(@as(usize, 1), hc.entries.items[0].ssm_checkpoints.?.len);
         } else {
             try testing.expectEqual(pc.CommitStatus{ .disk_only = first.len }, status);
@@ -623,6 +635,7 @@ test "GLM: the SSD tier gets every row in one flush whatever the RAM tier keeps,
 }
 
 test "GLM SSD-only: a prefill keeps at most two checkpoint states in RAM, and a restore at a released one reads SSD like a cold prefill" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -666,6 +679,7 @@ test "GLM SSD-only: a prefill keeps at most two checkpoint states in RAM, and a 
 }
 
 test "GLM RAM tier beside an SSD tier judges the byte budget by the two checkpoints that stay" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -701,6 +715,7 @@ test "GLM RAM tier beside an SSD tier judges the byte budget by the two checkpoi
 }
 
 test "GLM SSD-only: past the checkpoint cap the loop-end checkpoint still reaches disk" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -737,6 +752,7 @@ test "GLM SSD-only: past the checkpoint cap the loop-end checkpoint still reache
 }
 
 test "GLM SSD-only: a restore at an 8192 grid point reads SSD like a cold prefill" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -768,6 +784,7 @@ test "GLM SSD-only: a restore at an 8192 grid point reads SSD like a cold prefil
 }
 
 test "GLM SSD-only: a checkpoint whose write failed is not a restore point" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -803,6 +820,7 @@ test "GLM SSD-only: a checkpoint whose write failed is not a restore point" {
 }
 
 test "GLM RAM tier beside an SSD tier: the hot entry keeps its two newest checkpoints, the SSD tier all of them" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -832,7 +850,7 @@ test "GLM RAM tier beside an SSD tier: the hot entry keeps its two newest checkp
         var bytes: u64 = 0;
         for (e.ssm_checkpoints.?) |*cp| bytes += ssmCheckpointBytes(cp);
         try testing.expectEqual(bytes, e.ssm_bytes);
-        try testing.expectEqual(e.glm.?.bytes() + bytes, e.kv_bytes);
+        try testing.expectEqual(e.rows.?.bytes() + bytes, e.kv_bytes);
         try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
@@ -846,6 +864,7 @@ test "GLM RAM tier beside an SSD tier: the hot entry keeps its two newest checkp
 }
 
 test "GLM SSD-only: two commits before one flush (two cancels culled in one pass) both reach disk" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -879,6 +898,7 @@ test "GLM SSD-only: two commits before one flush (two cancels culled in one pass
 }
 
 test "GLM SSD-only without the writer: one flush finishes the whole entry before its source goes" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -911,6 +931,7 @@ test "GLM SSD-only without the writer: one flush finishes the whole entry before
 }
 
 test "a GLM commit hands the SSD tier every row through its newest checkpoint, past any one flush" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -940,6 +961,7 @@ test "a GLM commit hands the SSD tier every row through its newest checkpoint, p
 }
 
 test "GLM SSD-only: the disk budget evicts the least recently used conversation" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -984,6 +1006,7 @@ test "GLM SSD-only: the disk budget evicts the least recently used conversation"
 }
 
 test "GLM's 1 GiB RAM tier keeps a 30K or 60K session at its prompt end and sheds checkpoints, a longer one trims" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     const cp: u64 = 147_619_840;
     const row: u64 = 6688;
     const window: u64 = 2047 * 5 * 8 * 128 * 2 * 2;
@@ -1005,6 +1028,7 @@ test "GLM's 1 GiB RAM tier keeps a 30K or 60K session at its prompt end and shed
 }
 
 test "a GLM commit copies only the rows its destination tier keeps, chosen before the copy" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     const t = testing;
     const row: u64 = 6688;
     const cp: u64 = 147_619_840;
@@ -1039,6 +1063,7 @@ test "a GLM commit copies only the rows its destination tier keeps, chosen befor
 }
 
 test "a GLM commit whose retention snapshot fails still destroys every transferred checkpoint once" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const cps = try testing.allocator.alloc(SSMCheckpoint, 3);
     for (cps, 0..) |*cp, i| {
@@ -1068,6 +1093,7 @@ test "a GLM commit whose retention snapshot fails still destroys every transferr
 }
 
 test "a GLM replace commit that fails at any allocation leaks nothing and leaves the cache consistent" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const Stub = struct {
         fn cps(pos: usize) ![]SSMCheckpoint {
@@ -1105,6 +1131,7 @@ test "a GLM replace commit that fails at any allocation leaks nothing and leaves
 }
 
 test "GLM image turn persists its whole turn, and a foreign key restarts like a cold prefill below its item" {
+    if (comptime !prefix_arch.has("glm5")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();

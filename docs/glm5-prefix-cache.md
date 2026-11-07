@@ -72,7 +72,7 @@ pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   ([SSD flush](engine-prefix-cache.md#ssd-flush)).
   - Billed in `kv_bytes` beside the checkpoints: 6,688 bytes per row at kv8, 11,968 at BF16.
   - A budget trim lands on a checkpoint (`MlaRows.trimmedCopy`), sheds interior checkpoints and keeps the window.
-  - Beside an SSD tier the hot entry keeps only its newest 2 checkpoints (`checkpoint_hot_kept`): the pending record
+  - Beside an SSD tier the hot entry keeps only its newest 2 checkpoints (`CHECKPOINT_HOT_KEPT`): the pending record
     holds all of them for the flush, and a restore under the oldest of the two reads SSD
     ([the longer tier restores](engine-prefix-cache.md#ssd-flush)). Without an SSD tier it keeps them all.
     The byte budget and the row length (`glmLenFor`) are judged by those two, not by the full list.

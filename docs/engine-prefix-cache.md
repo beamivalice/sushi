@@ -16,10 +16,39 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 | `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`) |
 | `src/disk_placement.zig` | The SSD tier's default budget (`resolveDiskBudget`), cache roots and model fingerprint, and the startup/usage lines |
 | `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
+| `src/arch/prefix.zig` | The seam: dispatch over the arch's `prefix` module (restore target `State`, per-entry `Rows`, per-cache `CacheState`, the hooks below, the QSA-history `disk` section, the SSM-entry `aux` accelerators). The three files above name no arch. [Arch seam](#arch-seam) |
 | `src/disk_write_stats.zig` | Cumulative write bytes by file kind, per tier and per process ([write counters](#write-counters)) |
 | `src/restore_dump.zig` | Prefix-cache restore diagnostics (`tests/diff_restore_dump.py`) |
 | `src/glm5/glm5_prefix.zig` | GLM restore points and the `HotPrefixCache` arms and tests that serve them: KDA checkpoints, MLA rows, their SSD layout ([GLM](glm5-prefix-cache.md#glm)) |
 | `src/dsv41/dsv41_prefix.zig` | DeepSeek-V4.1 restore points and the `HotPrefixCache` arms and tests that serve them: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
+| `src/qwen4/qwen4_prefix.zig` | Flash-Next: the QSA-history section of a hybrid SSD record (`qwen4_disk_qsa.zig`), the QSA / GDN-replay accelerators of an SSM entry, the in-checkpoint MTP head's adoption |
+| `src/mimo2/mimo2_prefix.zig` | MiMo: no state of its own; the sliding ring is a cache kind the hot cache and the SSD tier serve ([ring](#basics)) |
+
+<a id="arch-seam"></a>
+## Arch seam
+
+The hot cache, the SSD tier and `ssm_cache.zig` name no arch. What is an arch's own is declared by its
+`src/<arch>/<arch>_prefix.zig` (the arch's `prefix` declaration) and reached through `src/arch/prefix.zig`, `inline else`
+over the enabled archs:
+- **`State`** (GLM: the request; DeepSeek: the model): `Recurrent.arch`. A lookup with one restores through the hooks
+  `rollbackLive` (DeepSeek only), `restoreDisk` (the SSD arm; null is a cold prefill, never the dense chunks),
+  `restoreEntry` (the RAM arm; returns the position installed) and `handover` (the state is about to be replaced),
+  and `reset`.
+- **`Rows`** (GLM's MLA rows): `Entry.rows` / `PendingDiskFlush.rows`, billed in `rows_bytes`. The commit hands each tier
+  its own (`TierRows`), trims and shares them through the wrapper, and the SSD flush writes them with the arch's own
+  layout (`persistRows`); `keepThrough` drops the checkpoints past the rows.
+- **`CacheState`**: `HotPrefixCache.arch.<arch>` (DeepSeek's live-state record).
+- **`checkpointsRequired(config)`**: `shouldUse` is off without SSM checkpoints for an arch whose request state is one.
+- **`adoptSpecHead`**: the in-checkpoint MTP head's snapshot adopted by the model's own head (Flash-Next), with its log lines.
+- **`disk`** and **`aux`** (Flash-Next): the `qsa.safetensors` section of a hybrid record (`DiskTier.persistQsaHistory`
+  and its siblings) and the QSA / GDN-replay accelerators `SSMCacheEntry` carries. A build without that arch gets
+  inert stand-ins, so no record carries the section.
+
+Bytes on disk are the arch bodies' own and have not moved: `DiskTier: the bytes of a dense, a hybrid-with-QSA and a
+head-sidecar record are pinned` holds the SHA-256 of each entry directory.
+
+The scheduler, the server and the arch tests still call GLM's and DeepSeek's entry points by their old names on
+`HotPrefixCache` (the compat block at its top); each owner moves to the dispatch and the block goes with the last.
 
 ## Basics
 
@@ -109,8 +138,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   divergence. Only a segment whose span ends at or before `DiskTier.rows_base` is linked (DeepSeek sets it to the request's
   restore or rollback point, `Live.base`): a span holding rows the heir recomputed is written fresh, so a restore of the
   heir is its live state's bytes.
-- **DeepSeek rolls its live state back before any stored restore** (`HotPrefixCache.rollbackLiveDsv41`,
-  `dsv41_prefix.Live`; [dsv41-arch](dsv41-arch.md#prefix-cache)): the slot's last request keeps the fixed arrays of its
+- **DeepSeek rolls its live state back before any stored restore** (`prefix_arch.rollbackLive` into
+  `dsv41_prefix.rollbackLive`, `dsv41_prefix.Live` as `HotPrefixCache.arch.dsv41`; [dsv41-arch](dsv41-arch.md#prefix-cache)): the slot's last request keeps the fixed arrays of its
   deepest 8 points in RAM, and a prompt sharing its history rolls the model's state back to the deepest one it reaches
   unless a stored point reaches further. Valid only while `Model.state_epoch` is unchanged and a request finished over it.
   Its off-grid points (prompt end, thought) are not written through; `flushLiveDsv41` writes them when the state is about to

@@ -41,7 +41,7 @@
 //! [0, cp_pos) AND the SSM state at cp_pos (`restoreIntoHybrid`) — mirroring
 //! the RAM tier's rewind-both semantics.
 //!
-//! Ringed sliding layers (MiMo) hold a window, not a prefix, so the chunks carry only the other
+//! Ringed sliding layers hold a window, not a prefix, so the chunks carry only the other
 //! layers; each ring restore point persists as
 //!   <base>/<fingerprint>/e<id>/r0000700.safetensors   ringed layers' rows below pos 700
 //! and a ringed entry restores only at one of them (`restoreIntoRinged`).
@@ -54,7 +54,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const transformer_mod = @import("transformer.zig");
-const disk_qsa = @import("qwen4/qwen4_disk_qsa.zig");
+const prefix_arch = @import("arch/prefix.zig");
 const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
@@ -93,10 +93,10 @@ pub const SSM_DISK_MAX_PER_ENTRY: usize = 160;
 /// The cap every arch outside the long-context gate keeps.
 pub const SSM_DISK_MAX_PER_ENTRY_LEGACY: usize = 8;
 
-/// Ring restore points one entry keeps on disk (~16 MiB each on MiMo at kv8), thinned (`thinRingPositions`).
+/// Ring restore points one entry keeps on disk (~16 MiB each at kv8), thinned (`thinRingPositions`).
 pub const RING_DISK_MAX_PER_ENTRY: usize = 8;
 
-/// How a tier stores a restore point whose arrays grow with the prompt (DeepSeek's compressed rows). Every `span`
+/// How a tier stores a restore point whose arrays grow with the prompt (compressed rows). Every `span`
 /// tokens of rows go once per entry into `g<n>.safetensors`; a point's own file keeps its fixed arrays and the rows
 /// past its last whole span, so a restore reads the point and the first `pos / span` segments.
 pub const GrownSpec = struct {
@@ -194,14 +194,14 @@ pub const SpecMeta = struct {
     /// count declines (KVCache.restore asserts equal lengths).
     layers: u32,
     quant: kv_quant.KVQuantConfig,
-    /// v5, qwen4_exp MTP head only: the head's QSA aux half in the same sidecar. Null = a
+    /// v5, in-checkpoint MTP head only: the head's QSA aux half in the same sidecar. Null = a
     /// head-only miss at restore; the trunk entry is unaffected.
     head: ?SpecHeadMeta = null,
 };
 
 /// v5 head half of a `SpecMeta`: the scalars the head's position bookkeeping needs.
 pub const SpecHeadMeta = struct {
-    /// Absolute position of the head's key row 0 (`Qwen4Mtp.pos_base`).
+    /// Absolute position of the head's key row 0 (the head's `pos_base`).
     pos_base: i32,
     ratio: i32,
     pooled: bool,
@@ -220,7 +220,7 @@ pub const SpecCommit = struct {
     step: usize,
     config: kv_quant.KVQuantConfig,
     base_pos: usize,
-    /// qwen4_exp MTP head: the QSA aux half, persisted alongside the KV.
+    /// In-checkpoint MTP head: the QSA aux half, persisted alongside the KV.
     head_aux: ?*const transformer_mod.SSMCacheEntrySnapshot = null,
     head_pos_base: c_int = 0,
     head_marks: []const transformer_mod.QsaHeadMark = &.{},
@@ -258,7 +258,7 @@ pub fn persistTargetLen(
         any = true;
         if (!entry.ringed and entry.offset > max_off) max_off = entry.offset;
     }
-    // A cache whose state lives elsewhere (GLM's request) holds no rows to persist.
+    // A cache whose state lives elsewhere (a request-held state) holds no rows to persist.
     if (!any) return 0;
     return @min(@max(step, max_off), tokens_len);
 }
@@ -1085,7 +1085,7 @@ pub const DiskTier = struct {
         return cp_pos;
     }
 
-    /// `restoreIntoHybrid` for a state with no QSA history (GLM's KDA): the KV prefix and the
+    /// `restoreIntoHybrid` for a state with no QSA history (a KDA state): the KV prefix and the
     /// checkpoint at `cp_pos`, without reading any other checkpoint file.
     pub fn restoreIntoKda(
         self: *DiskTier,
@@ -1112,7 +1112,7 @@ pub const DiskTier = struct {
     }
 
     /// The restore point at `cp_pos` of entry `idx` as a checkpoint the caller owns, for a state that has no KV
-    /// rows of its own (DeepSeek's): the entry's chunks are read only to prove they cover the position.
+    /// rows of its own (compressed rows): the entry's chunks are read only to prove they cover the position.
     pub fn restoreCheckpointInto(
         self: *DiskTier,
         cache: *KVCache,
@@ -2463,7 +2463,7 @@ pub const DiskTier = struct {
     ) ?struct {
         snap: transformer_mod.KVCacheSnapshot,
         base: usize,
-        /// v5 qwen4_exp head half; null on every other entry.
+        /// v5 in-checkpoint head half; null on every other entry.
         head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null,
         head_pos_base: c_int = 0,
         /// v8: the head's checkpoint-position leftovers. Empty on a v5..v7 sidecar, which
@@ -3268,7 +3268,7 @@ pub const DiskTier = struct {
         // Taken after the last append: an earlier slice would dangle across list growth.
         try meta.append(self.allocator, .{ .key = "init", .value = init_buf.items[0..init_len] });
 
-        // qwen4_exp aux state rides the same file: `l{d}.aux` / `l{d}.pooled`
+        // Aux state rides the same file: `l{d}.aux` / `l{d}.pooled`
         // tensors and `l{d}.ple` = uint32 [9] (valid flag, then the 8 token
         // history slots); the compress ratio is one `qsa_ratio` metadata key.
         var ratio_buf: [16]u8 = undefined;
@@ -3984,7 +3984,7 @@ pub const DiskTier = struct {
 
         const version = jsonU64(obj, "v") orelse return null;
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
-        // adds optional spec snapshots; v5 the qwen4_exp MTP head's QSA half; v6 inherited
+        // adds optional spec snapshots; v5 the in-checkpoint MTP head's QSA half; v6 inherited
         // chunks; v9 ring restore points; v10 the media identity; v11 row segments. All restore; a
         // lower-version entry just carries none of the newer state, and a pre-v10 one holds no media row.
         if (version < 2 or version > 11) return null;
@@ -4306,12 +4306,12 @@ pub const DiskTier = struct {
             .mtime = stat.mtime.nanoseconds,
         };
     }
-    pub const linkInheritedQsa = disk_qsa.linkInheritedQsa;
-    pub const loadQsaHistoryFile = disk_qsa.loadQsaHistoryFile;
-    pub const newestQsaCheckpoint = disk_qsa.newestQsaCheckpoint;
-    pub const persistQsaHistory = disk_qsa.persistQsaHistory;
-    pub const qsaHistoryRowsOf = disk_qsa.qsaHistoryRowsOf;
-    pub const writeQsaHistoryFile = disk_qsa.writeQsaHistoryFile;
+    pub const linkInheritedQsa = prefix_arch.disk.linkInheritedQsa;
+    pub const loadQsaHistoryFile = prefix_arch.disk.loadQsaHistoryFile;
+    pub const newestQsaCheckpoint = prefix_arch.disk.newestQsaCheckpoint;
+    pub const persistQsaHistory = prefix_arch.disk.persistQsaHistory;
+    pub const qsaHistoryRowsOf = prefix_arch.disk.qsaHistoryRowsOf;
+    pub const writeQsaHistoryFile = prefix_arch.disk.writeQsaHistoryFile;
 };
 
 // ── Model fingerprint ──
@@ -4397,7 +4397,7 @@ fn manifestQuant(obj: std.json.ObjectMap) ?kv_quant.KVQuantConfig {
     const scheme_v = obj.get("scheme") orelse return null;
     if (scheme_v != .string) return null;
     const scheme = std.meta.stringToEnum(kv_quant.Scheme, scheme_v.string) orelse return null;
-    // A dense entry may still name a width: GLM's disk layout keys its kv8 and kv6 latent rows so.
+    // A dense entry may still name a width: a latent-row layout keys its kv8 and kv6 rows so.
     if (scheme == .off) return .{ .scheme = .off, .bits = jsonInt(u8, obj, "bits") orelse 0, .group_size = jsonInt(u32, obj, "group_size") orelse 0 };
     if (scheme != .affine) return null;
     const bits = jsonInt(u8, obj, "bits") orelse return null;
@@ -5230,7 +5230,7 @@ test "DiskTier: SSM retention thins the interior, keeping both ends" {
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-retain", 0, 128);
     defer tier.deinit();
-    // The span-preserving policy is qwen4_exp's; the tier's default is drop-oldest (below).
+    // The span-preserving policy is the long-context archs'; the tier's default is drop-oldest (below).
     tier.cp_thin = .min_span_recency;
     tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
 
@@ -7566,7 +7566,7 @@ test "DiskTier: the manifest stamps the LOWEST version that describes the entry"
     e.spec_dflash = kv_only;
     try t.expectEqual(@as(u8, 4), DiskTier.metaVersionFor(e));
 
-    // A KV-only MTP snap is still v4; the qwen4_exp head's QSA half lifts it to v5.
+    // A KV-only MTP snap is still v4; the in-checkpoint head's QSA half lifts it to v5.
     e.spec_mtp = kv_only;
     try t.expectEqual(@as(u8, 4), DiskTier.metaVersionFor(e));
     e.spec_mtp = with_head;
@@ -7676,7 +7676,7 @@ test "DiskTier: a failed background write INVALIDATES the entry it belonged to (
 }
 
 test "DiskTier: a poisoned entry is invisible to the hybrid lookup too" {
-    // Poisoning is the tier's "this entry is dead" mark; the hybrid arm is the lookup qwen4_exp
+    // Poisoning is the tier's "this entry is dead" mark; the hybrid arm is the lookup an SSM-checkpoint arch
     // actually takes, so a gap there makes the mark meaningless.
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -8023,7 +8023,7 @@ test "DiskTier: a commit holding no KV rows persists nothing, even with checkpoi
     const base = buf[0..try tmp.dir.realPath(io, &buf)];
     var tier = try DiskTier.init(std.testing.allocator, io, base, "fp-no-rows", 0, 128);
     defer tier.deinit();
-    // A cache whose state lives elsewhere (GLM's request): every layer uninitialized, step set.
+    // A cache whose state lives elsewhere (a request-held state): every layer uninitialized, step set.
     var cache = try KVCache.init(std.testing.allocator, 3);
     defer cache.deinit();
     cache.step = 2048;
@@ -8491,4 +8491,120 @@ test "DiskTier: an extend writes the new tail of the token record, not the whole
     const record = try tmp.dir.readFileAlloc(io, "fp-tail/e1/tokens.bin", testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(record);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&tokens), record);
+}
+
+/// SHA-256 over an entry directory's files in name order, each as name, length and bytes.
+fn entryDirDigest(io: std.Io, abs_dir: []const u8) ![64]u8 {
+    var dir = try std.Io.Dir.openDirAbsolute(io, abs_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var names = std.ArrayList([]u8).empty;
+    defer {
+        for (names.items) |n| testing.allocator.free(n);
+        names.deinit(testing.allocator);
+    }
+    var it = dir.iterate();
+    while (try it.next(io)) |ent| {
+        if (ent.kind != .file) continue;
+        try names.append(testing.allocator, try testing.allocator.dupe(u8, ent.name));
+    }
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (names.items) |name| {
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ abs_dir, name });
+        defer testing.allocator.free(path);
+        const bytes = readFileAlloc(testing.allocator, io, path, 64 << 20) orelse return error.TestUnexpectedResult;
+        defer testing.allocator.free(bytes);
+        h.update(name);
+        h.update(std.mem.asBytes(&@as(u64, bytes.len)));
+        h.update(bytes);
+    }
+    return std.fmt.bytesToHex(h.finalResult(), .lower);
+}
+
+fn pinDigest(base: []const u8, fp: []const u8, io: std.Io) ![64]u8 {
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/{s}/e1", .{ base, fp });
+    defer testing.allocator.free(dir);
+    return entryDirDigest(io, dir);
+}
+
+// The SSD file bytes are a contract with files already on users' disks: a record the engine wrote
+// must read back unchanged, and a new one must be byte-identical for the same state.
+test "DiskTier: the bytes of a dense, a hybrid-with-QSA and a head-sidecar record are pinned" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "pin-dense", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    }
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "pin-hybrid", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+        var src128 = buildHybridEntries(s, 100.0, 500.0);
+        defer freeHybridEntries(&src128);
+        var src256 = buildHybridEntries(s, 200.0, 600.0);
+        defer freeHybridEntries(&src256);
+        src256[2].aux_state = makeArange(s, &[_]c_int{ 1, 256, 4 }, 700.0);
+        src256[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 64, 4 }, 800.0);
+        src256[2].qsa_ratio = 4;
+        src256[1].ple_prev = .{ 42, 43, 0, 0, 0, 0, 0, 0 };
+        src256[1].ple_prev_valid = true;
+        var cps = [_]transformer_mod.SSMCheckpoint{
+            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
+        };
+        defer for (&cps) |*cp| cp.deinit(testing.allocator);
+        try transformer_mod.attachQsaHistoryToLatest(&cps, &src256, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    }
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "pin-head", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+        var mtp = try KVCache.init(testing.allocator, 1);
+        defer mtp.deinit();
+        try fillCache(&mtp, s, 1, 600, 8, 9.5, .float32);
+        var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+        defer {
+            _ = mlx.mlx_array_free(aux_src.conv_state);
+            _ = mlx.mlx_array_free(aux_src.ssm_state);
+            transformer_mod.ssmFreeQsaState(&aux_src);
+        }
+        aux_src.aux_state = makeArange(s, &[_]c_int{ 1, 600, 8 }, 1.0);
+        aux_src.qsa_pooled = makeArange(s, &[_]c_int{ 1, 150, 8 }, -9.0);
+        aux_src.qsa_ratio = 4;
+        var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+        defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+        _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, null, .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        }, s);
+    }
+
+    try testing.expectEqualStrings("a1d5b16ec224167edf2408761ba1bd2a27c6cca87b65d7361b9353be815b6d2a", &try pinDigest(base, "pin-dense", io));
+    try testing.expectEqualStrings("a5e1217a34240076979b1aec705dc2f2b7f0366d584bced4d7c2917634d0fe5c", &try pinDigest(base, "pin-hybrid", io));
+    try testing.expectEqualStrings("6792dfb8d99607a62ecbe5b3b8674638ac1e1a6e4c098ebcab8c03e526c154b6", &try pinDigest(base, "pin-head", io));
 }

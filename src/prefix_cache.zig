@@ -22,10 +22,7 @@ const kv_disk_cache = @import("kv_disk_cache.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
-const glm5_forward = @import("glm5/glm5_forward.zig");
-const glm5_prefix = @import("glm5/glm5_prefix.zig");
-const dsv41_model = @import("dsv41/dsv41_model.zig");
-const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
+const prefix_arch = @import("arch/prefix.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const cache_stats = @import("cache_stats.zig");
 
@@ -59,7 +56,7 @@ pub const MIN_TRIMMED_VICTIM_TOKENS: usize = 512;
 pub const RING_RESTORE_MIN_TOKENS: usize = 64;
 
 /// Ring checkpoints one entry keeps, thinned so the lowest (a shared preamble) and the newest
-/// (where the conversation goes on) stay (`thinRingCps`). One is ~16 MiB on MiMo at kv8.
+/// (where the conversation goes on) stay (`thinRingCps`). One is ~16 MiB at kv8 on the ringed pack served.
 pub const RING_CHECKPOINT_MAX: usize = 8;
 
 /// Ring checkpoints a hot entry keeps in RAM when the SSD tier holds the older ones.
@@ -352,7 +349,7 @@ pub fn truncatedMediaKey(
     return if (last == 0) .{} else MediaStamp.of(last, ms);
 }
 
-const Entry = struct {
+pub const Entry = struct {
     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
     /// Owned by the entry; freed on eviction.
     tokens: []u32,
@@ -429,9 +426,10 @@ const Entry = struct {
     mtp: ?DflashSnap = null,
     /// Bytes resident in `mtp`, folded into `kv_bytes` like `ssm_bytes`.
     mtp_bytes: u64 = 0,
-    /// GLM only: the MLA rows every checkpoint of `ssm_checkpoints` restores from, billed in `kv_bytes`.
-    glm: ?glm5_prefix.MlaRows = null,
-    glm_bytes: u64 = 0,
+    /// The arch's rows every checkpoint of `ssm_checkpoints` restores from (an arch whose KV lives in them),
+    /// billed in `kv_bytes`.
+    rows: ?prefix_arch.Rows = null,
+    rows_bytes: u64 = 0,
     /// Ringed caches only: restore points below the entry's END (`KVCache.ringCheckpoint`),
     /// ascending by `step`, billed in `kv_bytes`: the prompt end, which a long reply carries the
     /// ring past, and those inherited from the entry this prompt forked off (`bestRingDonor`).
@@ -447,12 +445,11 @@ const Entry = struct {
     donated_bytes: u64 = 0,
 };
 
-/// Where a hybrid restore puts its recurrent state: the slot's SSM entries, a GLM request, or the DeepSeek model's request state.
-const Recurrent = union(enum) {
+/// Where a hybrid restore puts its recurrent state: the slot's SSM entries, or the state an arch owns.
+pub const Recurrent = union(enum) {
     none,
     ssm: []SSMCacheEntry,
-    glm: *glm5_forward.Request,
-    dsv41: *dsv41_model.Model,
+    arch: prefix_arch.State,
 
     fn hybrid(self: Recurrent) bool {
         return self != .none;
@@ -464,11 +461,22 @@ const Recurrent = union(enum) {
         switch (self) {
             .none => {},
             .ssm => |entries| HotPrefixCache.resetSsmEntries(entries),
-            .glm => |request| request.reset(),
-            .dsv41 => |m| dsv41_model.resetState(m),
+            .arch => |state| prefix_arch.reset(state),
         }
     }
 };
+
+/// The RAM entry a lookup matched: its index and the tokens it shares with the prompt.
+pub const RamMatch = struct { idx: usize, shared: usize };
+
+/// The rows a commit hands each tier: the RAM tier's within its budget, the SSD tier's through the newest checkpoint.
+pub const TierRows = struct {
+    ram: ?prefix_arch.Rows = null,
+    disk: ?prefix_arch.Rows = null,
+};
+
+/// KDA-class checkpoints the RAM tier's hot entry keeps (the newest) when an SSD tier holds the rest.
+pub const CHECKPOINT_HOT_KEPT: u32 = 2;
 
 /// What a spec-snap adoption may do, decided before any mlx call.
 pub const SpecAdopt = union(enum) {
@@ -476,7 +484,7 @@ pub const SpecAdopt = union(enum) {
     skip,
     /// A KV-only spec cache (dflash context, sidecar MTP head).
     kv_only: usize,
-    /// The qwen4_exp in-checkpoint head: KV + QSA aux together.
+    /// An in-checkpoint head: KV + QSA aux together.
     head: usize,
     /// A head target met a payload with no QSA half (pre-v5 sidecar). Head-only miss.
     decline_head_no_history,
@@ -526,11 +534,11 @@ const PendingDiskFlush = struct {
     ring_cps: ?[]KVCacheSnapshot = null,
     dflash: ?DflashSnap = null,
     mtp: ?DflashSnap = null,
-    glm: ?glm5_prefix.MlaRows = null,
+    rows: ?prefix_arch.Rows = null,
 
     fn deinit(self: *PendingDiskFlush, allocator: std.mem.Allocator) void {
         self.snapshot.deinit();
-        if (self.glm) |*rows| rows.deinit();
+        if (self.rows) |*rows| rows.deinit();
         allocator.free(self.tokens);
         if (self.ssm_cps) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
@@ -549,14 +557,25 @@ const PendingDiskFlush = struct {
 pub const DflashSnap = struct {
     snapshot: KVCacheSnapshot,
     base_pos: usize,
-    /// qwen4_exp MTP head only: the head's QSA aux entry and the absolute position of its key
+    /// In-checkpoint MTP head only: the head's QSA aux entry and the absolute position of its key
     /// row 0. A snap with one half and not the other is declined.
     head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null,
     head_pos_base: c_int = 0,
-    /// qwen4_exp MTP head only: the head's QSA leftovers at the trunk's checkpoint positions.
+    /// In-checkpoint MTP head only: the head's QSA leftovers at the trunk's checkpoint positions.
     /// A clamp to a restored trunk position lands far below the head's raw-key ring; this is
     /// what makes it exact there.
     head_marks: transformer_mod.QsaHeadMarkSet = .{},
+
+    /// The MTP snapshot of a commit, over a snapshot of its cache.
+    fn ofCommit(c: DflashCommit, snapshot: KVCacheSnapshot) DflashSnap {
+        return .{
+            .snapshot = snapshot,
+            .base_pos = c.base_pos,
+            .head_aux = if (c.head) |h| transformer_mod.ssmSnapshot(h) else null,
+            .head_pos_base = c.head_pos_base,
+            .head_marks = transformer_mod.QsaHeadMarkSet.share(c.head_marks),
+        };
+    }
 
     pub fn deinit(self: *DflashSnap) void {
         self.snapshot.deinit();
@@ -566,7 +585,7 @@ pub const DflashSnap = struct {
     }
 };
 
-/// What `commitWithState` reads to build a `DflashSnap`. `head` is set only by the qwen4_exp MTP head.
+/// What `commitWithState` reads to build a `DflashSnap`. `head` is set only by an in-checkpoint MTP head.
 pub const DflashCommit = struct {
     cache: *const KVCache,
     base_pos: usize,
@@ -576,8 +595,8 @@ pub const DflashCommit = struct {
 };
 
 /// Where `lookupAndRestore` puts a restored assistant context. `base_pos` is
-/// written on every path so the caller can build `DflashCtx` from it. `head` is the qwen4_exp
-/// Transformer owning the in-checkpoint MTP head; the adoption then goes through `qwen4MtpAdopt`.
+/// written on every path so the caller can build `DflashCtx` from it. `head` is the Transformer
+/// owning an in-checkpoint MTP head; the adoption then goes through the arch (`prefix_arch.adoptSpecHead`).
 pub const DflashTarget = struct {
     cache: *KVCache,
     base_pos: *usize,
@@ -636,11 +655,11 @@ pub const HotPrefixCache = struct {
     /// The raw prefix that restore matched, before a hybrid clamp (`checkoutRestored`).
     last_restored_shared: usize = 0,
     last_restored_disk_id: ?u64 = null,
-    /// DeepSeek: the last lookup rolled the model's live state back instead of restoring a stored point.
+    /// The last lookup rolled the model's live state back instead of restoring a stored point.
     last_restored_live: bool = false,
-    /// DeepSeek: the points of the slot's last request, which its live state can be rolled back to.
-    live_dsv41: dsv41_prefix.Live = .{},
-    /// The arch keeps a QSA indexer history beside its SSM state (qwen4_exp).
+    /// What each arch keeps beside the entries (the points of a live state it can be rolled back to).
+    arch: prefix_arch.CacheState = .{},
+    /// The arch keeps a QSA indexer history beside its SSM state.
     /// A restore that leaves the live entries without it cannot prefill —
     /// `qsaMaskFromQk` errors on every turn on that prefix — so it is a MISS.
     qsa_history_required: bool = false,
@@ -678,6 +697,22 @@ pub const HotPrefixCache = struct {
         };
     }
 
+    // Entry points the scheduler, the server and the arch tests still call on the cache by these names. Each
+    // owner moves to the dispatch of `arch/prefix.zig` or to its arch's module, and this block goes with the last.
+    const rows_arch = @import("glm5/glm5_prefix.zig");
+    const state_arch = @import("dsv41/dsv41_prefix.zig");
+    pub const glmCommitLenFor = rows_arch.glmCommitLenFor;
+    pub const glmCommitLen = rows_arch.glmCommitLen;
+    pub const glmDiskLen = rows_arch.glmDiskLen;
+    pub const lookupAndRestoreGlm = rows_arch.lookupAndRestoreGlm;
+    pub const commitGlm = rows_arch.commitGlm;
+    pub const commitGlmTiers = rows_arch.commitGlmTiers;
+    pub const writeThroughGlm = rows_arch.writeThroughGlm;
+    pub const lookupAndRestoreDsv41 = state_arch.lookupAndRestoreDsv41;
+    pub const writeThroughDsv41 = state_arch.writeThroughDsv41;
+    pub const writeDecodePointDsv41 = state_arch.writeDecodePointDsv41;
+    pub const publishLiveDsv41 = state_arch.publishLiveDsv41;
+
     pub fn deinit(self: *HotPrefixCache) void {
         for (self.entries.items) |*e| {
             freeEntryOwnedState(self.allocator, e);
@@ -685,7 +720,7 @@ pub const HotPrefixCache = struct {
         self.entries.deinit(self.allocator);
         if (self.pending_disk) |*p| p.deinit(self.allocator);
         self.pending_disk = null;
-        self.live_dsv41.deinit(self.allocator);
+        prefix_arch.deinitCacheState(&self.arch, self.allocator);
         if (self.disk) |*d| d.deinit();
         self.disk = null;
     }
@@ -696,8 +731,8 @@ pub const HotPrefixCache = struct {
     fn freeEntryOwnedState(allocator: std.mem.Allocator, e: *Entry) void {
         allocator.free(e.tokens);
         e.snapshot.deinit();
-        if (e.glm) |*rows| rows.deinit();
-        e.glm = null;
+        if (e.rows) |*rows| rows.deinit();
+        e.rows = null;
         if (e.ssm_checkpoints) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
             allocator.free(cps);
@@ -727,28 +762,14 @@ pub const HotPrefixCache = struct {
     fn restoreSpecSnap(snap_opt: ?*const DflashSnap, target: ?DflashTarget, matched: usize, s: mlx.mlx_stream, what: []const u8) ?usize {
         const t = target orelse return null;
         const snap = snap_opt orelse return null;
-        const want = switch (specAdoptPlan(snap.base_pos, snap.snapshot.step, matched, t.head != null, snap.head_aux != null)) {
-            .skip => {
-                log.info("  [hot-cache] {s} not adopted: want {d} tokens from base {d}, snap holds {d} (matched {d})\n", .{ what, matched -| snap.base_pos, snap.base_pos, snap.snapshot.step, matched });
-                return null;
-            },
-            .decline_head_no_history => {
-                log.info("  [qwen4] MTP head restore declined (snapshot carries no QSA history) — head starts blind\n", .{});
-                return null;
-            },
-            .kv_only, .head => |w| w,
-        };
-        // qwen4_exp in-checkpoint head: KV + QSA aux adopt together or not at all.
-        if (t.head) |xfm| {
-            const aux = &snap.head_aux.?;
-            xfm.qwen4MtpAdopt(&snap.snapshot, aux, snap.head_marks.slice(), snap.head_pos_base, want) catch |err| {
-                log.warn("  [qwen4] MTP head restore declined ({s}) — head starts blind\n", .{@errorName(err)});
-                return null;
-            };
-            t.base_pos.* = snap.base_pos;
-            log.info("  [qwen4] MTP head restored ({d} tokens from base {d})\n", .{ want, snap.base_pos });
-            return snap.base_pos;
+        const plan = specAdoptPlan(snap.base_pos, snap.snapshot.step, matched, t.head != null, snap.head_aux != null);
+        if (plan == .skip) {
+            log.info("  [hot-cache] {s} not adopted: want {d} tokens from base {d}, snap holds {d} (matched {d})\n", .{ what, matched -| snap.base_pos, snap.base_pos, snap.snapshot.step, matched });
+            return null;
         }
+        // An in-checkpoint head adopts its KV and aux halves together or not at all.
+        if (t.head) |xfm| return prefix_arch.adoptSpecHead(xfm, plan, snap, t.base_pos);
+        const want = plan.kv_only;
         t.cache.restore(&snap.snapshot) catch |err| {
             log.warn("  [hot-cache] {s} restore failed: {s} — starts blind\n", .{ what, @errorName(err) });
             return null;
@@ -787,7 +808,7 @@ pub const HotPrefixCache = struct {
         const loaded = d.loadSpecSnap(idx, which, t.cache.entries.len, t.cache.config) orelse return null;
         // restore() refcount-shares the arrays into the target, so the
         // transient snapshot is freed right after. A pre-v5 sidecar carries no head half, so a
-        // qwen4 head target declines it.
+        // head target declines it.
         var snap = DflashSnap{
             .snapshot = loaded.snap,
             .base_pos = loaded.base,
@@ -878,7 +899,7 @@ pub const HotPrefixCache = struct {
         transformer_mod.ssmDetachFromGroup(entries);
     }
 
-    /// Pure-attention + DSV4 are eligible by default. Hybrid recurrent-state
+    /// Pure-attention archs are eligible by default. Hybrid recurrent-state
     /// archs are gated by `enable_ssm_checkpoints` (set by the scheduler
     /// when `--ssm-checkpoint-stride > 0`): with checkpoints we can rewind
     /// both KV and SSM state to a stride-aligned position; without them
@@ -892,8 +913,8 @@ pub const HotPrefixCache = struct {
         config: *const model_mod.ModelConfig,
         enable_ssm_checkpoints: bool,
     ) bool {
-        // deepseek_v41's request state is a checkpoint (`dsv41_prefix`): without them nothing restores.
-        if (config.isDsv41()) return enable_ssm_checkpoints;
+        // An arch whose request state is a checkpoint restores nothing without them.
+        if (prefix_arch.checkpointsRequired(config)) return enable_ssm_checkpoints;
         const has_ssm_layers = config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
@@ -929,7 +950,7 @@ pub const HotPrefixCache = struct {
         return total;
     }
 
-    /// Resident bytes of a speculative-side snap: the KV plus (qwen4_exp) the head's QSA aux half.
+    /// Resident bytes of a speculative-side snap: the KV plus an in-checkpoint head's QSA aux half.
     pub fn specSnapBytes(snap: *const DflashSnap) u64 {
         var total = snapshotBytes(&snap.snapshot);
         if (snap.head_aux) |a| {
@@ -1160,14 +1181,6 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
-    pub const glmCommitLenFor = glm5_prefix.glmCommitLenFor;
-
-    pub const glmCommitLen = glm5_prefix.glmCommitLen;
-
-    pub const glmDiskLen = glm5_prefix.glmDiskLen;
-
-    pub const glmLenFor = glm5_prefix.glmLenFor;
-
     /// Which arm `trimLenForBudget` bills a list of this length with (for the log).
     fn trimBillArm(list_len: usize, gated: bool) []const u8 {
         if (!gated) return "all_lower";
@@ -1249,7 +1262,7 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
         require_ssm_checkpoint: bool,
         probe: ?*MatchProbe,
-    ) ?struct { idx: usize, shared: usize } {
+    ) ?RamMatch {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         var best_effective: usize = 0;
@@ -1320,7 +1333,7 @@ pub const HotPrefixCache = struct {
         return if (len == prompt_len and len > 1) len - 1 else len;
     }
 
-    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
+    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?RamMatch {
         const match = self.findBestRestorableMatch(prompt_ids, has_tools, vision_key, null, &.{}, quant_config, false, null) orelse return null;
         return .{ .idx = match.idx, .shared = match.shared };
     }
@@ -1413,10 +1426,6 @@ pub const HotPrefixCache = struct {
         return self.lookupImpl(target_cache, target_moe_seq_offset, rec, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, mtp_target, slot_id, skip);
     }
 
-    pub const lookupAndRestoreGlm = glm5_prefix.lookupAndRestoreGlm;
-
-    pub const lookupAndRestoreDsv41 = dsv41_prefix.lookupAndRestoreDsv41;
-
     /// An unreadable or corrupt file fails the same way on every later lookup, so its entry dies;
     /// a coverage miss (no checkpoint, QSA gap) can still serve a shorter prefix, so it stays.
     pub fn poisonUnreadable(d: *kv_disk_cache.DiskTier, idx: usize, err: anyerror) void {
@@ -1427,10 +1436,6 @@ pub const HotPrefixCache = struct {
             else => {},
         }
     }
-
-    pub const restoreGlmFromDisk = glm5_prefix.restoreGlmFromDisk;
-
-    pub const rollbackLiveDsv41 = dsv41_prefix.rollbackLiveDsv41;
 
     pub fn lookupImpl(
         self: *HotPrefixCache,
@@ -1456,7 +1461,7 @@ pub const HotPrefixCache = struct {
         self.last_restored_disk_id = null;
         self.last_restored_live = false;
         if (skip) {
-            if (rec == .dsv41) self.releaseLive(rec.dsv41, s, "handover");
+            if (rec == .arch) prefix_arch.handover(self, rec.arch, s);
             try target_cache.truncate(0, s);
             rec.reset();
             target_moe_seq_offset.* = 0;
@@ -1483,8 +1488,8 @@ pub const HotPrefixCache = struct {
             &probe,
         );
 
-        if (rec == .dsv41) {
-            if (self.rollbackLiveDsv41(rec.dsv41, target_cache, target_moe_seq_offset, s, prompt_ids, has_tools, media_limits, match)) |res| return res;
+        if (rec == .arch) {
+            if (prefix_arch.rollbackLive(self, rec.arch, target_cache, target_moe_seq_offset, s, prompt_ids, has_tools, media_limits, match)) |res| return res;
         }
 
         // ── SSD tier: consult when it can beat the RAM match meaningfully
@@ -1492,46 +1497,17 @@ pub const HotPrefixCache = struct {
         // the tier persists per-position SSM checkpoints beside the KV chunks
         // and restores both.
         if (self.disk) |*d| disk: {
-            if (rec == .glm) {
-                const ram_eff: usize = if (match) |m| blk: {
-                    const e = &self.entries.items[m.idx];
-                    const cps = e.ssm_checkpoints orelse break :blk 0;
-                    const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
-                    break :blk cp.pos;
-                } else 0;
-                if (self.restoreGlmFromDisk(d, rec.glm, target_cache, ram_eff, prompt_ids, has_tools, media_limits, dflash_target, s)) |res| {
-                    target_moe_seq_offset.* = res.matched;
-                    return res;
-                }
-                break :disk;
-            }
-            if (rec == .dsv41) {
+            if (rec == .arch) {
                 const ram_eff: usize = if (match) |m| blk: {
                     const cps = self.entries.items[m.idx].ssm_checkpoints orelse break :blk 0;
                     const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
                     break :blk cp.pos;
                 } else 0;
-                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @intCast(prompt_ids.len), media_limits) orelse break :disk;
-                if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
-                const sw = io_util.Stopwatch.init(d.io);
-                var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, dsv41_prefix.snapshotLayers(rec.dsv41), s) catch |err| {
-                    log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-                    poisonUnreadable(d, hm.idx, err);
-                    target_cache.truncate(0, s) catch {};
-                    break :disk;
-                };
-                defer cp.deinit(d.allocator);
-                dsv41_prefix.restore(rec.dsv41, &cp, prompt_ids) catch |err| {
-                    log.warn("  [disk-cache] DeepSeek state not installed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-                    target_cache.truncate(0, s) catch {};
-                    rec.reset();
-                    break :disk;
-                };
-                target_moe_seq_offset.* = hm.cp;
-                self.last_restored_disk_id = d.entries.items[hm.idx].id;
-                self.live_dsv41.keepRestored(self.allocator, rec.dsv41, &cp, true) catch {};
-                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
-                return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
+                if (prefix_arch.restoreDisk(self, d, rec.arch, target_cache, ram_eff, prompt_ids, has_tools, media_limits, dflash_target, s)) |res| {
+                    target_moe_seq_offset.* = res.matched;
+                    return res;
+                }
+                break :disk;
             }
             const disk_limit: u32 = @intCast(prompt_ids.len);
             // A ringed cache restores only at a ring file: the chunks hold its other layers alone.
@@ -1739,20 +1715,8 @@ pub const HotPrefixCache = struct {
         // The two MUST stay in sync, so we rewind KV further too.
         var dump = restore_dump.RestoreDumpMeta{ .kind = "restore", .pos = 0 };
         var effective_matched: usize = restore_cap;
-        if (rec == .glm) {
-            effective_matched = 0;
-            if (e.glm) |*rows| if (e.ssm_checkpoints) |cps| if (highestCheckpointAtOrBelow(cps, @min(restore_cap, rows.len))) |cp| {
-                try glm5_prefix.restore(rec.glm, rows, cp);
-                effective_matched = cp.pos;
-            };
-            if (effective_matched == 0) rec.reset();
-        } else if (rec == .dsv41) {
-            effective_matched = 0;
-            if (e.ssm_checkpoints) |cps| if (highestCheckpointAtOrBelow(cps, restore_cap)) |cp| {
-                try dsv41_prefix.restore(rec.dsv41, cp, prompt_ids);
-                self.live_dsv41.keepRestored(self.allocator, rec.dsv41, cp, false) catch {};
-                effective_matched = cp.pos;
-            };
+        if (rec == .arch) {
+            effective_matched = try prefix_arch.restoreEntry(self, rec.arch, e, restore_cap, prompt_ids);
             if (effective_matched == 0) rec.reset();
         } else if (rec.ssmEntries()) |entries| {
             if (e.ssm_checkpoints) |cps| {
@@ -1941,9 +1905,9 @@ pub const HotPrefixCache = struct {
         for (self.entries.items) |*e| {
             if (e.checked_out_by != slot_id) continue;
             if (e.checkout_donated) continue;
-            e.donated_bytes = snapshotBytes(&e.snapshot) + e.glm_bytes;
+            e.donated_bytes = snapshotBytes(&e.snapshot) + e.rows_bytes;
             e.snapshot.releaseHandles();
-            if (e.glm) |*rows| rows.releaseHandles();
+            if (e.rows) |*rows| rows.releaseHandles();
             e.checkout_donated = true;
         }
     }
@@ -2065,10 +2029,6 @@ pub const HotPrefixCache = struct {
         return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, ssm_cps, dflash, mtp, prompt_len, ring_cps, .{});
     }
 
-    pub const commitGlm = glm5_prefix.commitGlm;
-
-    pub const commitGlmTiers = glm5_prefix.commitGlmTiers;
-
     pub fn commitImpl(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
@@ -2082,7 +2042,7 @@ pub const HotPrefixCache = struct {
         mtp: ?DflashCommit,
         prompt_len: usize,
         ring_cps: SlotRingCps,
-        glm: glm5_prefix.GlmTierRows,
+        tier_rows: TierRows,
     ) !CommitStatus {
         const end_note = self.commit_end_note;
         self.commit_end_note = "";
@@ -2090,11 +2050,11 @@ pub const HotPrefixCache = struct {
         var new_rings = ownRingCps(self.allocator, ring_cps);
         defer if (new_rings) |r| freeRingCps(self.allocator, r);
         var new_ring_bytes = ringCpsBytes(new_rings);
-        var new_glm = glm.ram;
-        defer if (new_glm) |*rows| rows.deinit();
-        var disk_glm = glm.disk;
-        defer if (disk_glm) |*rows| rows.deinit();
-        var new_glm_bytes: u64 = if (new_glm) |*rows| rows.bytes() else 0;
+        var new_rows = tier_rows.ram;
+        defer if (new_rows) |*rows| rows.deinit();
+        var disk_rows = tier_rows.disk;
+        defer if (disk_rows) |*rows| rows.deinit();
+        var new_rows_bytes: u64 = if (new_rows) |*rows| rows.bytes() else 0;
         const quant_config = source_cache.config;
         var ssm_cps = all_cps;
 
@@ -2119,11 +2079,13 @@ pub const HotPrefixCache = struct {
         const disk_len = diskTextLen(tokens.len, eff_vision_key, eff_media_start);
         // Record what the live cache holds now, before any byte-budget trim: the SSD tier gets the
         // whole entry whatever the RAM tier keeps.
+        var record_taken = false;
         if (self.capturesLiveForDisk() and disk_len > 0) {
-            const rows: ?*const glm5_prefix.MlaRows = if (disk_glm) |*r| r else if (new_glm) |*r| r else null;
+            const rows: ?*const prefix_arch.Rows = if (disk_rows) |*r| r else if (new_rows) |*r| r else null;
             self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, eff_vision_key, eff_media_start, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
             // Whatever the RAM tier then does with the candidate, the record is flushed.
-            if (self.pending_disk != null) self.disk_dirty = true;
+            record_taken = self.pending_disk != null;
+            if (record_taken) self.disk_dirty = true;
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
         // KVCache deinit then frees nothing. Function scope on purpose.
@@ -2132,8 +2094,8 @@ pub const HotPrefixCache = struct {
             self.pending_disk = null;
         };
 
-        // A GLM entry with no rows within the RAM budget keeps nothing in RAM.
-        if (!self.ram_enabled or (glm.disk != null and new_glm == null)) {
+        // An entry with SSD rows but none within the RAM budget keeps nothing in RAM.
+        if (!self.ram_enabled or (tier_rows.disk != null and new_rows == null)) {
             if (ssm_cps) |cps| {
                 for (cps) |*cp| cp.deinit(self.allocator);
                 self.allocator.free(cps);
@@ -2143,15 +2105,15 @@ pub const HotPrefixCache = struct {
             return .{ .disk_only = tokens.len };
         }
         // The RAM entry keeps only the checkpoints its own rows restore.
-        if (new_glm) |*rows| if (ssm_cps) |cps| {
-            ssm_cps = glm5_prefix.keepThrough(self.allocator, cps, rows.len);
+        if (new_rows) |*rows| if (ssm_cps) |cps| {
+            ssm_cps = rows.keepCheckpoints(self.allocator, cps);
         };
         // The pending record holds every checkpoint for the SSD tier, so the hot entry keeps only its newest.
         // A GDN checkpoint past the record's text prefix is not in it and stays.
-        const hot_keeps_newest = self.pending_disk != null and (new_glm != null or (glm.ram == null and glm.disk == null));
-        const record_text: usize = if (new_glm != null) std.math.maxInt(usize) else disk_len;
+        const hot_keeps_newest = self.pending_disk != null and (new_rows != null or (tier_rows.ram == null and tier_rows.disk == null));
+        const record_text: usize = if (new_rows != null) std.math.maxInt(usize) else disk_len;
         // GDN checkpoints are cut after the byte-budget trim below, which lands on one of them.
-        if (hot_keeps_newest and new_glm != null) self.keepNewestCheckpoints(&ssm_cps, record_text);
+        if (hot_keeps_newest and new_rows != null) self.keepNewestCheckpoints(&ssm_cps, record_text);
 
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
@@ -2169,7 +2131,8 @@ pub const HotPrefixCache = struct {
         }
 
         // Ownership of `ssm_cps` is ours from entry; no cleanup is armed until here.
-        var new_snap = source_cache.snapshotRetained(mlx.gpuStream()) catch |err| {
+        // The record holds this cache's retained rows already: sharing them spares a ring's second copy.
+        var new_snap = (if (record_taken) self.pending_disk.?.snapshot.share() else source_cache.snapshotRetained(mlx.gpuStream())) catch |err| {
             if (ssm_cps) |cps| {
                 for (cps) |*cp| cp.deinit(self.allocator);
                 self.allocator.free(cps);
@@ -2192,13 +2155,7 @@ pub const HotPrefixCache = struct {
         var new_mtp_bytes: u64 = 0;
         if (mtp) |m2| {
             if (m2.cache.snapshot()) |snap| {
-                new_mtp = .{
-                    .snapshot = snap,
-                    .base_pos = m2.base_pos,
-                    .head_aux = if (m2.head) |h| transformer_mod.ssmSnapshot(h) else null,
-                    .head_pos_base = m2.head_pos_base,
-                    .head_marks = transformer_mod.QsaHeadMarkSet.share(m2.head_marks),
-                };
+                new_mtp = DflashSnap.ofCommit(m2, snap);
                 new_mtp_bytes = specSnapBytes(&new_mtp.?);
             } else |err| {
                 log.warn("  [hot-cache] mtp history snapshot failed: {s}\n", .{@errorName(err)});
@@ -2209,7 +2166,7 @@ pub const HotPrefixCache = struct {
         if (ssm_cps) |cps| {
             for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
         }
-        var new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes + new_ring_bytes + new_glm_bytes;
+        var new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes + new_ring_bytes + new_rows_bytes;
         // Effective candidate: a byte-budget trim below shortens these.
         var eff_tokens = tokens;
         var eff_cps = ssm_cps;
@@ -2228,14 +2185,14 @@ pub const HotPrefixCache = struct {
             var limit = if (eff_media_start) |ms| @min(tokens.len, ms) else tokens.len;
             var inputs_logged = false;
             trim_blk: while (true) {
-                const row_bytes = snapshotRowBytes(&new_snap) + (if (new_glm) |*rows| rows.rowBytes() else 0);
+                const row_bytes = snapshotRowBytes(&new_snap) + (if (new_rows) |*rows| rows.rowBytes() else 0);
                 const ring_bytes = ringedBytes(&new_snap);
                 var ring_cp: ?*const KVCacheSnapshot = null;
                 const tl_opt = if (ring_bytes > 0) blk: {
                     const rt = ringTrimLen(self.max_kv_bytes, limit, row_bytes, tokens.len, ring_bytes, new_rings orelse &.{}) orelse break :blk null;
                     if (rt.cp) |k| ring_cp = &new_rings.?[k];
                     break :blk rt.len;
-                } else self.trimLenForBudget(self.max_kv_bytes -| (if (new_glm != null) new_dflash_bytes else 0), limit, row_bytes, eff_cps);
+                } else self.trimLenForBudget(self.max_kv_bytes -| (if (new_rows != null) new_dflash_bytes else 0), limit, row_bytes, eff_cps);
                 if (!inputs_logged) {
                     inputs_logged = true;
                     logTrimInputs(tokens.len, row_bytes, self.max_kv_bytes, eff_cps, tl_opt, self.cp_thin != .min_span);
@@ -2252,7 +2209,7 @@ pub const HotPrefixCache = struct {
                     {
                         // The resident entry already covers the trim target;
                         // the candidate's EXTRA tokens still belong on disk.
-                        self.spillDeclinedToDisk(&new_snap, tokens, diskTextLen(tokens.len, eff_vision_key, eff_media_start), has_tools, MediaStamp.of(eff_vision_key, eff_media_start), eff_cps, new_rings, if (new_glm) |*rows| rows else null);
+                        self.spillDeclinedToDisk(&new_snap, tokens, diskTextLen(tokens.len, eff_vision_key, eff_media_start), has_tools, MediaStamp.of(eff_vision_key, eff_media_start), eff_cps, new_rings, if (new_rows) |*rows| rows else null);
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -2283,20 +2240,20 @@ pub const HotPrefixCache = struct {
                 };
                 new_snap.deinit();
                 new_snap = trimmed;
-                if (new_glm) |*rows| if (tl < rows.len) {
+                if (new_rows) |*rows| if (tl < rows.len()) {
                     const short = rows.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
                         decline = .snapshot_copy_failed;
                         decline_err = err;
                         break :trim_blk;
                     };
                     rows.deinit();
-                    new_glm = short;
-                    new_glm_bytes = short.bytes();
+                    new_rows = short;
+                    new_rows_bytes = short.bytes();
                 };
                 // Spec payloads describe the FULL-length state; a trimmed
-                // prefix rebuilds them on its first reused turn. GLM's window is the prompt end's,
+                // prefix rebuilds them on its first reused turn. A rows arch's window is the prompt end's,
                 // which a restore at any lower checkpoint clamps (`specAdoptPlan`).
-                if (new_glm == null) if (new_dflash) |*d| {
+                if (new_rows == null) if (new_dflash) |*d| {
                     d.deinit();
                     new_dflash = null;
                     new_dflash_bytes = 0;
@@ -2340,7 +2297,7 @@ pub const HotPrefixCache = struct {
                     new_rings = ringCpsUpTo(self.allocator, r, if (ring_cp != null) tl - 1 else tl);
                     new_ring_bytes = ringCpsBytes(new_rings);
                 }
-                new_bytes = new_kv_bytes + new_ssm_bytes + new_ring_bytes + new_glm_bytes + new_dflash_bytes;
+                new_bytes = new_kv_bytes + new_ssm_bytes + new_ring_bytes + new_rows_bytes + new_dflash_bytes;
                 log.info("  [hot-cache] trimmed oversized entry to {d}/{d} tokens ({d:.2} MB before checkpoint shedding; {d:.2} MB budget)\n", .{
                     tl,
                     tokens.len,
@@ -2353,7 +2310,7 @@ pub const HotPrefixCache = struct {
             if (!trimmed_ok) {
                 // RAM decline is not a value verdict: offer the candidate to
                 // the SSD tier before discarding it.
-                self.spillDeclinedToDisk(&new_snap, tokens, diskTextLen(tokens.len, eff_vision_key, eff_media_start), has_tools, MediaStamp.of(eff_vision_key, eff_media_start), eff_cps, new_rings, if (new_glm) |*rows| rows else null);
+                self.spillDeclinedToDisk(&new_snap, tokens, diskTextLen(tokens.len, eff_vision_key, eff_media_start), has_tools, MediaStamp.of(eff_vision_key, eff_media_start), eff_cps, new_rings, if (new_rows) |*rows| rows else null);
                 var discarded_snap = new_snap;
                 discarded_snap.deinit();
                 if (new_dflash) |*d| d.deinit();
@@ -2564,11 +2521,11 @@ pub const HotPrefixCache = struct {
             e.media_start = eff_media_start;
             e.quant_config = quant_config;
             e.end_note = end_note;
-            e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes + ring_bytes + new_glm_bytes;
-            if (e.glm) |*rows| rows.deinit();
-            e.glm = new_glm;
-            e.glm_bytes = new_glm_bytes;
-            new_glm = null;
+            e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes + ring_bytes + new_rows_bytes;
+            if (e.rows) |*rows| rows.deinit();
+            e.rows = new_rows;
+            e.rows_bytes = new_rows_bytes;
+            new_rows = null;
             e.ssm_checkpoints = merged_cps;
             e.ssm_bytes = merged_ssm_bytes;
             e.dflash = new_dflash;
@@ -2633,11 +2590,11 @@ pub const HotPrefixCache = struct {
             .mtp = new_mtp,
             .mtp_bytes = new_mtp_bytes,
             .ring_cps = new_rings,
-            .glm = new_glm,
-            .glm_bytes = new_glm_bytes,
+            .rows = new_rows,
+            .rows_bytes = new_rows_bytes,
         };
         new_rings = null;
-        new_glm = null;
+        new_rows = null;
         if (!try self.retainNewEntry(incoming)) return .declined;
         // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
         if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
@@ -2725,7 +2682,7 @@ pub const HotPrefixCache = struct {
         media: MediaStamp,
         all_cps: ?[]SSMCheckpoint,
         ring_cps: ?[]const KVCacheSnapshot,
-        glm: ?*const glm5_prefix.MlaRows,
+        rows: ?*const prefix_arch.Rows,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
         if (text_len == 0) return;
@@ -2749,7 +2706,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = (if (glm) |rows| persistGlm(d, rows, tokens, has_tools, media, cps, null, false, mlx.gpuStream()) else d.appendCommitWith(.{
+        const outcome = (if (rows) |r| r.persist(d, tokens, has_tools, media, cps, null, false, mlx.gpuStream()) else d.appendCommitWith(.{
             .kv_entries = snap.entries,
             .step = snap.step,
             .config = snap.config,
@@ -2787,7 +2744,7 @@ pub const HotPrefixCache = struct {
         all_dflash: ?DflashCommit,
         all_mtp: ?DflashCommit,
         ring_cps: ?[]const KVCacheSnapshot,
-        glm: ?*const glm5_prefix.MlaRows,
+        rows: ?*const prefix_arch.Rows,
     ) void {
         const tokens = all_tokens[0..text_len];
         // The spec snapshots cover rows past a cut record.
@@ -2812,7 +2769,7 @@ pub const HotPrefixCache = struct {
             .media = MediaStamp.of(vision_key, media_start),
         };
         if (ring_cps) |cps| rec.ring_cps = shareRingCpsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
-        if (glm) |rows| rec.glm = rows.share() catch {
+        if (rows) |r| rec.rows = r.share() catch {
             rec.deinit(self.allocator);
             return;
         };
@@ -2837,13 +2794,7 @@ pub const HotPrefixCache = struct {
         }
         if (mtp) |m2| {
             if (m2.cache.snapshot()) |ms| {
-                rec.mtp = .{
-                    .snapshot = ms,
-                    .base_pos = m2.base_pos,
-                    .head_aux = if (m2.head) |h| transformer_mod.ssmSnapshot(h) else null,
-                    .head_pos_base = m2.head_pos_base,
-                    .head_marks = transformer_mod.QsaHeadMarkSet.share(m2.head_marks),
-                };
+                rec.mtp = DflashSnap.ofCommit(m2, ms);
             } else |_| {}
         }
         self.pending_disk = rec;
@@ -3005,11 +2956,7 @@ pub const HotPrefixCache = struct {
         return "partial copy";
     }
 
-    pub const persistGlm = glm5_prefix.persistGlm;
-
-    pub const writeThroughGlm = glm5_prefix.writeThroughGlm;
-
-    /// Qwen's prefill write-through: the rows and checkpoints so far go to the SSD tier as the prefill produces
+    /// The hybrid prefill write-through: the rows and checkpoints so far go to the SSD tier as the prefill produces
     /// them, and every checkpoint but the newest leaves RAM once its file is written. Best effort: what a failed
     /// write could not land is released too, since the admission bill counts on the bound.
     pub fn writeThroughHybrid(
@@ -3041,14 +2988,6 @@ pub const HotPrefixCache = struct {
         if (floor) d.settleCheckpoints(d.last_store_id, cps);
     }
 
-    pub const writeThroughDsv41 = dsv41_prefix.writeThroughDsv41;
-
-    pub const writeDecodePointDsv41 = dsv41_prefix.writeDecodePointDsv41;
-
-    pub const publishLiveDsv41 = dsv41_prefix.publishLiveDsv41;
-
-    pub const releaseLive = dsv41_prefix.releaseLive;
-
     /// Write the pending record whole and release it: its rows may be a finished request's own
     /// buffers, which nothing could read again to resume a partial entry.
     fn flushPendingRecord(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, s: mlx.mlx_stream) void {
@@ -3070,7 +3009,7 @@ pub const HotPrefixCache = struct {
             .head_pos_base = mm.head_pos_base,
             .head_marks = mm.head_marks.slice(),
         } else null;
-        _ = (if (pending.glm) |*rows| persistGlm(d, rows, pending.tokens, pending.has_tools, pending.media, pending.ssm_cps, p_dflash, true, s) else d.appendCommitWith(.{
+        _ = (if (pending.rows) |*rows| rows.persist(d, pending.tokens, pending.has_tools, pending.media, pending.ssm_cps, p_dflash, true, s) else d.appendCommitWith(.{
             .kv_entries = pending.snapshot.entries,
             .step = pending.snapshot.step,
             .config = pending.snapshot.config,
@@ -3158,8 +3097,8 @@ pub const HotPrefixCache = struct {
         const specs: EntrySpecs = if (text.cut) .{} else entrySpecCommits(newest);
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
-        if (newest.glm) |*rows| {
-            const done = persistGlm(d, rows, tokens, newest.has_tools, media, text.list, dflash_spec, false, s) catch |err| {
+        if (newest.rows) |*rows| {
+            const done = rows.persist(d, tokens, newest.has_tools, media, text.list, dflash_spec, false, s) catch |err| {
                 log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
                 return;
             };
@@ -3345,7 +3284,7 @@ pub const HotPrefixCache = struct {
         vision_key: u64,
         media_start: ?usize,
         quant_config: kv_quant.KVQuantConfig,
-    ) ?struct { idx: usize, shared: usize } {
+    ) ?RamMatch {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         var best_pos: usize = 0;
@@ -3661,12 +3600,12 @@ pub const HotPrefixCache = struct {
         return try out.toOwnedSlice(allocator);
     }
 
-    /// Frees all but the newest `glm5_prefix.checkpoint_hot_kept` of an ascending checkpoint list. The older
+    /// Frees all but the newest `CHECKPOINT_HOT_KEPT` of an ascending checkpoint list. The older
     /// ones are restored from the SSD tier, which holds them all; one past `text_len` is not in the SSD record
     /// and stays.
     fn keepNewestCheckpoints(self: *HotPrefixCache, list: *?[]SSMCheckpoint, text_len: usize) void {
         const cps = list.* orelse return;
-        const newest: usize = glm5_prefix.checkpoint_hot_kept;
+        const newest: usize = CHECKPOINT_HOT_KEPT;
         var n_keep: usize = 0;
         for (cps, 0..) |*cp, i| {
             if (cps.len - i <= newest or cp.pos > text_len) n_keep += 1;
@@ -4558,7 +4497,7 @@ fn ringWriteLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, 
     return cache.update(layer, k, k, s, span);
 }
 
-/// MiMo shape: layer 0 global, every other layer sliding.
+/// Ringed-trunk shape: layer 0 global, every other layer sliding.
 fn ringFill(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, from: u32, to: u32, chunk: u32) !void {
     var written: u32 = from;
     while (written < to) {
@@ -4643,7 +4582,48 @@ test "a hot entry holds a ringed layer's retained rows, not the ring buffer's ca
     }
 }
 
-/// A MiMo-shaped turn: `prompt` rows, a ring checkpoint at the prompt end, then a reply long
+test "a commit that records the live state for the SSD tier gives its RAM entry the record's rows, not a second copy" {
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt_len: u32 = 700;
+    var toks: [prompt_len]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    live.setSwaRing(window);
+    try ringFill(&live, s, n_layers, window, 0, prompt_len, 64);
+
+    // Without spare ring capacity both snapshots would share the live buffers and the test could not tell a copy.
+    for (live.entries) |*l| {
+        if (l.ringed) try testing.expect(l.offset < KVCache.bufferCapacity(l.keys));
+    }
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-record-share", 0, 128);
+    defer hc.deinit();
+    _ = try hc.commitWithState(&live, &toks, false, 0, null, null, null);
+
+    const record = &hc.pending_disk.?.snapshot;
+    const entry = &hc.entries.items[0].snapshot;
+    var ringed: usize = 0;
+    for (record.entries, entry.entries) |*r, *e| {
+        if (!r.ringed) continue;
+        ringed += 1;
+        try testing.expectEqual(mlx.mlx_array_data_uint8(r.keys), mlx.mlx_array_data_uint8(e.keys));
+        try testing.expectEqual(mlx.mlx_array_data_uint8(r.values), mlx.mlx_array_data_uint8(e.values));
+    }
+    try testing.expect(ringed > 0);
+}
+
+/// A ringed-trunk turn: `prompt` rows, a ring checkpoint at the prompt end, then a reply long
 /// enough that the ring compacts past the prompt. The caller owns the checkpoint.
 fn ringTurn(live: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, prompt: u32, reply: u32) !?KVCacheSnapshot {
     live.setSwaRing(window);
@@ -5451,7 +5431,7 @@ test "a ringed entry persists to the SSD tier and restores only at a ring checkp
     try testing.expectEqual(@as(usize, 0), miss.matched);
 }
 
-/// One MiMo-shaped turn (`ringTurn`) committed and flushed to a fresh SSD tier at `base/fp`.
+/// One ringed-trunk turn (`ringTurn`) committed and flushed to a fresh SSD tier at `base/fp`.
 fn persistRingTurn(io: std.Io, base: []const u8, fp: []const u8, toks: []const u32, prompt: u32, window: u32, n_layers: u32) !void {
     const s = mlx.gpuStream();
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
@@ -6850,7 +6830,7 @@ test "a fork's SSD entry keeps its donor's ring checkpoint, so a restart restore
     try expectRingContinuesCold(&restored, s, n_layers, window, prompt, next.len);
 }
 
-/// A MiMo-shaped turn whose slot took a ring checkpoint at each of `at` (ascending, the last the
+/// A ringed-trunk turn whose slot took a ring checkpoint at each of `at` (ascending, the last the
 /// prompt end, the rest marks), then `reply` rows.
 fn ringTurnAt(live: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, at: []const u32, reply: u32) !SlotRingCps {
     live.setSwaRing(window);
@@ -7388,7 +7368,7 @@ test "HotPrefixCache: hybrid RAM match at least as good as disk skips the SSD re
 // captures, but the replace path merges the previous entry's checkpoints with
 // this turn's, and nothing re-applied a cap to the merged list — so an agent
 // conversation gained one checkpoint per turn forever. Observed on
-// Qwen3.8-Flash-Next (36 GDN layers): 31237 MB of SSM state in ONE entry under
+// A 36-GDN-layer trunk: 31237 MB of SSM state in ONE entry under
 // `--ssm-checkpoint-max 8`, which starved the prompt-admission check.
 //
 // Capping oldest-first fixes the size but leaves every survivor near the end,
@@ -7851,7 +7831,7 @@ test "HotPrefixCache: oversized hybrid entry trims to the highest checkpoint tha
 }
 
 test "HotPrefixCache: a trim priced after its checkpoint shed is retained, then shed" {
-    // qwen4_exp prices a trim against the checkpoints that survive the shed; retaining the new
+    // The long-context archs price a trim against the checkpoints that survive the shed; retaining the new
     // entry declined it on its unshed size, so a session past the budget was never cached.
     const s = mlx.gpuStream();
     var toks: [900]u32 = undefined;
@@ -8536,7 +8516,7 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer hc.deinit();
     hc.ssd_first = true;
-    // The qwen4_exp arm: the indexer history travels with the KV or the
+    // The SSM-checkpoint arm: the indexer history travels with the KV or the
     // restore is a miss (`MtpHeadQsaHistoryGap`).
     hc.qsa_history_required = true;
 
@@ -9503,7 +9483,7 @@ test "prefix cache: the trim bill prices only the checkpoints a shed would keep"
 }
 
 test "prefix cache: a 383k oversized hybrid entry trims instead of flat-declining" {
-    // The live #330 follow-up shape: qwen4_exp, stride 4096, a 383,069-token entry at 13,056
+    // The live #330 follow-up shape: a long-context arch, stride 4096, a 383,069-token entry at 13,056
     // bytes per KV row, ~26 MB per checkpoint, a 3,873.54 MB budget; it flat-declined.
     const row_bytes: u64 = 13_056;
     const per_cp: u64 = 26 * 1024 * 1024;
@@ -9693,7 +9673,7 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
         var cache = try KVCache.initWithConfig(testing.allocator, 2, cfg);
         defer cache.deinit();
 
-        // qwen4_exp's own attention shape: 2 kv heads, head_dim 256.
+        // A long-context attention shape: 2 kv heads, head_dim 256.
         const mk = struct {
             fn f(str: mlx.mlx_stream, len: c_int) !mlx.mlx_array {
                 const shape = [_]c_int{ 1, 2, len, 256 };

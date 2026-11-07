@@ -19,7 +19,7 @@ pub const drafter = @import("dsv41_drafter.zig");
 
 // slot:sched (S2b)
 
-// slot:prefix (S2c)
+pub const prefix = @import("dsv41_prefix.zig"); // slot:prefix (S2c)
 
 // slot:bill (S2d)
 

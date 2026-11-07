@@ -16,6 +16,37 @@ const kv_disk_cache = @import("../kv_disk_cache.zig");
 const log = @import("../log.zig");
 const pc = @import("../prefix_cache.zig");
 const kv_quant = @import("../kv_quant.zig");
+const prefix_arch = @import("../arch/prefix.zig");
+
+/// The model whose request state a lookup restores into.
+pub const State = *dsv41_model.Model;
+
+/// What the hot cache keeps beside its entries: the slot's last request, which its state can be rolled back to.
+pub const CacheState = Live;
+
+pub fn liveOf(hc: *pc.HotPrefixCache) *Live {
+    if (comptime !prefix_arch.has("dsv41")) unreachable;
+    return &hc.arch.dsv41;
+}
+
+/// Bytes the cache's live record of the slot's last request holds.
+pub fn liveBytes(hc: *pc.HotPrefixCache) u64 {
+    return liveOf(hc).bytes();
+}
+
+pub fn reset(m: State) void {
+    dsv41_model.resetState(m);
+}
+
+/// The request state is a checkpoint: without checkpoints nothing restores.
+pub fn checkpointsRequired(config: *const @import("../model.zig").ModelConfig) bool {
+    _ = config;
+    return true;
+}
+
+pub fn handover(self: *pc.HotPrefixCache, m: State, s: mlx.mlx_stream) void {
+    releaseLive(self, m, s, "handover");
+}
 
 /// Snapshot layers a restore point holds: each model slot's four arrays ride two layers' conv and ssm fields
 /// (the aux and pooled fields mean a QSA history to the cache, so they stay empty). A slot array the
@@ -333,40 +364,40 @@ pub fn lookupAndRestoreDsv41(
     slot_id: ?usize,
     skip: bool,
 ) !pc.LookupResult {
-    return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .dsv41 = dsv }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, null, null, slot_id, skip);
+    return self.lookupImpl(target_cache, target_moe_seq_offset, prefix_arch.recurrent("dsv41", dsv), s, prompt_ids, has_tools, vision_key, media_start, media_chain, null, null, slot_id, skip);
 }
 
 /// DeepSeek: the live state rolled back in place to the deepest point of the slot's last request that this prompt
 /// shares, when no stored point reaches further: no read, no copy. Null means the state is lost to this request:
 /// the record was flushed to SSD and cleared.
-pub fn rollbackLiveDsv41(
+pub fn rollbackLive(
     self: *pc.HotPrefixCache,
-    m: *dsv41_model.Model,
+    m: State,
     target_cache: *KVCache,
     target_moe_seq_offset: *usize,
     s: mlx.mlx_stream,
     prompt_ids: []const u32,
     has_tools: bool,
     media_limits: kv_disk_cache.MediaLimits,
-    ram_match: anytype,
+    ram_match: ?pc.RamMatch,
 ) ?pc.LookupResult {
-    if (rollbackLive(self, m, target_cache, target_moe_seq_offset, s, prompt_ids, has_tools, media_limits, ram_match)) |res| return res;
+    if (rollbackLiveInPlace(self, m, target_cache, target_moe_seq_offset, s, prompt_ids, has_tools, media_limits, ram_match)) |res| return res;
     releaseLive(self, m, s, "handover");
     return null;
 }
 
-fn rollbackLive(
+fn rollbackLiveInPlace(
     self: *pc.HotPrefixCache,
-    m: *dsv41_model.Model,
+    m: State,
     target_cache: *KVCache,
     target_moe_seq_offset: *usize,
     s: mlx.mlx_stream,
     prompt_ids: []const u32,
     has_tools: bool,
     media_limits: kv_disk_cache.MediaLimits,
-    ram_match: anytype,
+    ram_match: ?pc.RamMatch,
 ) ?pc.LookupResult {
-    const live = &self.live_dsv41;
+    const live = liveOf(self);
     const cap: usize = if (media_limits.rule) |r| (r.limitFor(r.ctx, live.vision_key, live.media_start) orelse 0) else kv_disk_cache.MediaLimits.UNBOUNDED;
     const idx = live.pick(m, prompt_ids, has_tools, cap) orelse return null;
     const pos = live.points.items[idx].pos;
@@ -390,6 +421,51 @@ fn rollbackLive(
     return .{ .matched = pos, .full_match = false, .slot_owned = true };
 }
 
+/// DeepSeek's SSD arm: the stored point under the match that beats the RAM match restores into the model.
+pub fn restoreDisk(
+    self: *pc.HotPrefixCache,
+    d: *kv_disk_cache.DiskTier,
+    m: State,
+    target_cache: *KVCache,
+    ram_eff: usize,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    media_limits: kv_disk_cache.MediaLimits,
+    dflash_target: ?pc.DflashTarget,
+    s: mlx.mlx_stream,
+) ?pc.LookupResult {
+    _ = dflash_target;
+    const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @intCast(prompt_ids.len), media_limits) orelse return null;
+    if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) return null;
+    const sw = io_util.Stopwatch.init(d.io);
+    var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, snapshotLayers(m), s) catch |err| {
+        log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+        pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err);
+        target_cache.truncate(0, s) catch {};
+        return null;
+    };
+    defer cp.deinit(d.allocator);
+    restore(m, &cp, prompt_ids) catch |err| {
+        log.warn("  [disk-cache] DeepSeek state not installed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+        target_cache.truncate(0, s) catch {};
+        reset(m);
+        return null;
+    };
+    self.last_restored_disk_id = d.entries.items[hm.idx].id;
+    liveOf(self).keepRestored(self.allocator, m, &cp, true) catch {};
+    log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
+    return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
+}
+
+/// Installs the entry's checkpoint under `restore_cap` into the model; 0 when none serves.
+pub fn restoreEntry(self: *pc.HotPrefixCache, m: State, e: *pc.Entry, restore_cap: usize, prompt_ids: []const u32) !usize {
+    const cps = e.ssm_checkpoints orelse return 0;
+    const cp = pc.HotPrefixCache.highestCheckpointAtOrBelow(cps, restore_cap) orelse return 0;
+    try restore(m, cp, prompt_ids);
+    liveOf(self).keepRestored(self.allocator, m, cp, false) catch {};
+    return cp.pos;
+}
+
 /// DeepSeek's write-through: the request's restore points on the tier's row-segment grid go to the SSD tier and every
 /// point leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
 /// commit returns. A point off the grid is kept live only (`Live`), whatever the tier does. Below the tier's floor nothing is written and the points stay for the commit.
@@ -403,16 +479,16 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
         log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
         return;
     };
-    for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.keep(self.allocator, m, cp, false) catch |err| {
+    for (cps) |*cp| if (!cp.isReleased()) liveOf(self).keep(self.allocator, m, cp, false) catch |err| {
         log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
     };
     // A point off the row-segment grid would copy the rows past the last segment into its own file; it stays live.
     const span: usize = if (self.disk.?.grown) |g| g.span else 0;
     for (cps) |*cp| if (!cp.isReleased() and span != 0 and cp.pos % span != 0) cp.release();
-    for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.markFlushed(cp.pos);
+    for (cps) |*cp| if (!cp.isReleased()) liveOf(self).markFlushed(cp.pos);
     const staged_before = self.disk.?.point_bytes_written;
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-    self.disk.?.rows_base = @intCast(self.live_dsv41.base);
+    self.disk.?.rows_base = @intCast(liveOf(self).base);
     defer self.disk.?.rows_base = std.math.maxInt(u32);
     self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
     const bytes = self.disk.?.point_bytes_written - staged_before;
@@ -432,15 +508,15 @@ pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCac
 /// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
 /// True when the record holds points that are not on SSD.
 pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, quant: kv_quant.KVQuantConfig) bool {
-    self.live_dsv41.publish(self.allocator, m, tokens, has_tools, media.key, media.start);
-    self.live_dsv41.quant = quant;
-    return self.live_dsv41.unflushed();
+    liveOf(self).publish(self.allocator, m, tokens, has_tools, media.key, media.start);
+    liveOf(self).quant = quant;
+    return liveOf(self).unflushed();
 }
 
 /// The state is about to be replaced: its record reaches SSD (`flushLiveDsv41`), then goes.
 pub fn releaseLive(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
     flushLiveDsv41(self, m, s, why);
-    self.live_dsv41.clear(self.allocator);
+    liveOf(self).clear(self.allocator);
 }
 
 /// `flushLiveDsv41` for a resident model, if it is a DeepSeek one. Inference thread.
@@ -456,7 +532,7 @@ pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: 
 /// appends to it; a point a later prefill overwrote is no longer in the record. A record with images is written under
 /// its vision key, which hashes the pixels, so only a prompt with the same images restores past the first image row.
 pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
-    const live = &self.live_dsv41;
+    const live = liveOf(self);
     if (self.disk == null or !self.ssd_first or !live.ready or live.epoch != m.state_epoch) return;
     // A pixel key with no boundary proves nothing about where its rows begin (`diskTextLen`).
     if (live.vision_key != 0 and live.media_start == null) return;

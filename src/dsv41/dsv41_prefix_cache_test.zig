@@ -11,6 +11,7 @@ const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 const std = @import("std");
+const prefix_arch = @import("../arch/prefix.zig");
 const testing = std.testing;
 const pc = @import("../prefix_cache.zig");
 
@@ -114,6 +115,7 @@ fn dsv41SplitCache(io: std.Io, base: []const u8, fp: []const u8, net: *const Dsv
 }
 
 test "HotPrefixCache: shouldUse admits deepseek_v41 only with checkpoints (its state restores from them)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "deepseek_v41";
     try testing.expect(!pc.HotPrefixCache.shouldUse(&cfg, false));
@@ -121,6 +123,7 @@ test "HotPrefixCache: shouldUse admits deepseek_v41 only with checkpoints (its s
 }
 
 test "DeepSeek hot cache: an image prompt restores whole for its own images and only up to the image for others (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
@@ -152,6 +155,7 @@ test "DeepSeek hot cache: an image prompt restores whole for its own images and 
 }
 
 test "DeepSeek hot cache restores the highest checkpoint under the match and continues like a cold prefill (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
@@ -218,6 +222,7 @@ test "DeepSeek hot cache restores the highest checkpoint under the match and con
 }
 
 test "DeepSeek hot cache bills the held checkpoints in its residency and gives them back on eviction (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
@@ -249,6 +254,7 @@ test "DeepSeek hot cache bills the held checkpoints in its residency and gives t
 }
 
 test "DeepSeek hot cache over its byte budget keeps the entry with fewer checkpoints, billed exactly (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
@@ -278,6 +284,7 @@ test "DeepSeek hot cache over its byte budget keeps the entry with fewer checkpo
 }
 
 test "DeepSeek SSD tier: a checkpoint written to disk reads back as the same bytes, and a restart restores it like a cold prefill (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -348,6 +355,7 @@ test "DeepSeek SSD tier: a checkpoint written to disk reads back as the same byt
 }
 
 test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as they are taken and restore the same bytes (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -392,7 +400,7 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
             // What the prefill still holds is the tier's row markers (a byte a token for keys and for values) and the point's
             // fixed arrays kept for the next turn's rollback, not the state. Metal rounds a small buffer up to the next
             // power of two, so a kept array may occupy twice its bytes.
-            try testing.expect(after <= before + 2 * at + 2 * hc.live_dsv41.bytes());
+            try testing.expect(after <= before + 2 * at + 2 * dsv41_prefix.liveOf(&hc).bytes());
         }
         cache.step = first.len;
         try dsv41_prefix.markRows(&cache);
@@ -426,6 +434,7 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
 }
 
 test "DeepSeek SSD tier split: the layers the tier treats as rows are the arrays a capture holds as rows (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     var net: Dsv41Net = undefined;
     try net.load();
@@ -457,6 +466,7 @@ test "DeepSeek SSD tier split: the layers the tier treats as rows are the arrays
 }
 
 test "DeepSeek SSD tier split: every restore point on the grid reads back the bytes a full capture holds, and a restore between two points prefills like cold (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -531,6 +541,7 @@ test "DeepSeek SSD tier split: every restore point on the grid reads back the by
 }
 
 test "DeepSeek SSD tier split: a write-through prefill stages the points on the grid and keeps the others live, never copying rows past the store (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -568,7 +579,7 @@ test "DeepSeek SSD tier split: a write-through prefill stages the points on the 
         hc.disk.?.drainWriter();
         try testing.expect(cps.items[cps.items.len - 1].isReleased());
         // Every point is kept for the next turn's rollback, staged or not.
-        try testing.expectEqual(at, hc.live_dsv41.points.items[hc.live_dsv41.points.items.len - 1].pos);
+        try testing.expectEqual(at, dsv41_prefix.liveOf(&hc).points.items[dsv41_prefix.liveOf(&hc).points.items.len - 1].pos);
         if (step == 1) {
             try testing.expectEqual(before, hc.disk.?.point_bytes_written);
             try testing.expectEqual(@as(usize, 1), hc.disk.?.entries.items[0].ssm_positions.len);
@@ -591,6 +602,7 @@ test "DeepSeek SSD tier split: a write-through prefill stages the points on the 
 }
 
 test "DeepSeek SSD tier split: an heir that restored from its donor links the donor's row segments, restores a full capture's bytes and outlives the donor (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -673,6 +685,7 @@ test "DeepSeek SSD tier split: an heir that restored from its donor links the do
 }
 
 test "DeepSeek SSD tier split: an heir that restored mid-span and recomputed rows up to the divergence stores its own rows there and restores its live state's bytes (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -745,6 +758,7 @@ test "DeepSeek SSD tier split: an heir that restored mid-span and recomputed row
 }
 
 test "DeepSeek decode point: a restore point taken mid-decode serves the next turn from RAM and from an SSD file, like cold on the same grid (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -909,6 +923,7 @@ fn expectPointOnDisk(hc: *pc.HotPrefixCache, net: *Dsv41Net, want: *const SSMChe
 }
 
 test "DeepSeek live flush: another conversation takes the model and every point of the first still stands on SSD, the earlier ones too, byte for byte (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -933,7 +948,7 @@ test "DeepSeek live flush: another conversation takes the model and every point 
         try flushTurn(&net, &hc, first, &gen, &want_end, &want_thought);
         // Until the handover only the grid point is on SSD; the other two ride the live record.
         try testing.expectEqualSlices(u32, &.{512}, hc.disk.?.entries.items[0].ssm_positions);
-        try testing.expectEqual(@as(usize, 3), hc.live_dsv41.points.items.len);
+        try testing.expectEqual(@as(usize, 3), dsv41_prefix.liveOf(&hc).points.items.len);
         const res = try dsv41Lookup(&hc, &net, &other);
         try testing.expectEqual(@as(usize, 0), res.matched);
         hc.disk.?.drainWriter();
@@ -949,6 +964,7 @@ test "DeepSeek live flush: another conversation takes the model and every point 
 }
 
 test "DeepSeek live flush: a clean shutdown flushes the same points, and a crash leaves the grid point to restore from and continue like cold (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -1017,6 +1033,7 @@ test "DeepSeek live flush: a clean shutdown flushes the same points, and a crash
 }
 
 test "DeepSeek live flush: a point inside generated tokens a later turn overwrote is dropped, and a replaced state is not flushed (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -1068,6 +1085,7 @@ test "DeepSeek live flush: a point inside generated tokens a later turn overwrot
 }
 
 test "DeepSeek live flush: an image conversation's live points reach SSD under its image key, so a restart restores them for that image only (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -1116,6 +1134,7 @@ test "DeepSeek live flush: an image conversation's live points reach SSD under i
 }
 
 test "DeepSeek live rollback: the state rolled back to each kept point is a full capture of that point, byte for byte (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const a = testing.allocator;
     var net: Dsv41Net = undefined;
@@ -1167,6 +1186,7 @@ test "DeepSeek live rollback: the state rolled back to each kept point is a full
 }
 
 test "DeepSeek live rollback: only a state still standing for the same history serves, at a point the prompt shares (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const a = testing.allocator;
     var net: Dsv41Net = undefined;
@@ -1201,6 +1221,7 @@ test "DeepSeek live rollback: only a state still standing for the same history s
 }
 
 test "DeepSeek live rollback: a turn that diverges inside the last turn's generation rolls back to its deepest kept point and continues like an SSD restore (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -1253,10 +1274,10 @@ test "DeepSeek live rollback: a turn that diverges inside the last turn's genera
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
         // The two points' fixed arrays and the history's ids ride beside the model's state.
-        const sets = hc.live_dsv41.points.items.len;
+        const sets = dsv41_prefix.liveOf(&hc).points.items.len;
         try testing.expectEqual(@as(usize, 2), sets);
-        try testing.expect(hc.live_dsv41.bytes() > all.len * @sizeOf(u32));
-        try testing.expect(hc.live_dsv41.bytes() <= sets * net.m.cfg.stateFixedBytes(true) + all.len * @sizeOf(u32));
+        try testing.expect(dsv41_prefix.liveOf(&hc).bytes() > all.len * @sizeOf(u32));
+        try testing.expect(dsv41_prefix.liveOf(&hc).bytes() <= sets * net.m.cfg.stateFixedBytes(true) + all.len * @sizeOf(u32));
 
         // The live state serves: the deepest point under the 610 shared tokens, with no stored copy read.
         var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
@@ -1299,6 +1320,7 @@ test "DeepSeek live rollback: a turn that diverges inside the last turn's genera
 }
 
 test "DeepSeek live rollback: another conversation, a replaced state or a point behind a stored one takes the normal path (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1343,8 +1365,8 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
     for (other[100..]) |*t| t.* = 92;
     try testing.expectEqual(@as(usize, 0), (try dsv41Lookup(&hc, &net, &other)).matched);
     try testing.expect(!hc.last_restored_live);
-    try testing.expectEqual(@as(usize, 0), hc.live_dsv41.points.items.len);
-    try testing.expectEqual(@as(u64, 0), hc.live_dsv41.bytes());
+    try testing.expectEqual(@as(usize, 0), dsv41_prefix.liveOf(&hc).points.items.len);
+    try testing.expectEqual(@as(u64, 0), dsv41_prefix.liveOf(&hc).bytes());
 
     // The model's state was replaced after the turn: the stored point serves.
     try Turn.run(&hc, &net, first);
@@ -1354,8 +1376,8 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
     try testing.expect(!hc.last_restored_live);
     try testing.expect(hc.last_restored_disk_id != null);
     // The restored point is the first of this request's own.
-    try testing.expectEqual(@as(usize, 1), hc.live_dsv41.points.items.len);
-    try testing.expectEqual(@as(usize, 512), hc.live_dsv41.points.items[0].pos);
+    try testing.expectEqual(@as(usize, 1), dsv41_prefix.liveOf(&hc).points.items.len);
+    try testing.expectEqual(@as(usize, 512), dsv41_prefix.liveOf(&hc).points.items[0].pos);
 
     // The live state serves where it can: the same prompt after a finished turn.
     try Turn.run(&hc, &net, first);
@@ -1367,6 +1389,7 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
 // A cancelled request publishes its live record when the scheduler culls it, before the next exclusive request is
 // admitted (`cullDecodingWith`); its tokens are never paired with that request's state, whatever happens to it.
 test "DeepSeek live rollback: a cancelled request's record, published at the cull, never serves a request that continues it from the next one's state (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const a = testing.allocator;
     var net: Dsv41Net = undefined;
@@ -1410,6 +1433,7 @@ test "DeepSeek live rollback: a cancelled request's record, published at the cul
 }
 
 test "DeepSeek SSD tier: the namespace names the layout, and another layout's entries are never read (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const dir = try dsv41_model.fixtureDir();
@@ -1498,6 +1522,7 @@ test "DeepSeek SSD tier: the namespace names the layout, and another layout's en
 }
 
 test "DeepSeek with both tiers: the RAM entry serves the active session and, once it is gone, the SSD entry does (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -1544,6 +1569,7 @@ test "DeepSeek with both tiers: the RAM entry serves the active session and, onc
 }
 
 test "DeepSeek SSD tier under the engine's default KV scheme, which every slot cache carries: commit, restart, restore (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -1589,6 +1615,7 @@ test "DeepSeek SSD tier under the engine's default KV scheme, which every slot c
 }
 
 test "DeepSeek SSD tier: an image's restore points never land in, or come from, another same-size image's record (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     // Images A and B have one size, so their prompts carry the same ids; A's rows are stood in for by the state of
     // another prompt, which is what other pixels at the image rows give.
     try mlx.requireGpu();

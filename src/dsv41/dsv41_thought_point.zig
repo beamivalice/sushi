@@ -5,6 +5,7 @@ const generate_mod = @import("../generate.zig");
 const model_mod = @import("../model.zig");
 const prefix_cache_mod = @import("../prefix_cache.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
+const prefix_arch = @import("../arch/prefix.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const model_registry_mod = @import("../model_registry.zig");
 const model_settings = @import("../model_settings.zig");
@@ -115,7 +116,7 @@ test "a streamed DeepSeek load bills its union workspace and MLX pool and no fil
 pub fn dsv41StateBytes(s: *const Slot) u64 {
     const dsv = (s.model.transformer orelse return 0).dsv41 orelse return 0;
     var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41_model.zig").stateBytes(st) else 0;
-    if (s.model.prefix_cache) |*hc| bytes += hc.live_dsv41.bytes();
+    if (s.model.prefix_cache) |*hc| bytes += dsv41_prefix.liveBytes(hc);
     return bytes;
 }
 
@@ -322,6 +323,7 @@ test "a DSpark round that finished the slot leaves the thought point to the comm
 }
 
 test "a DeepSeek slot's state bytes hold the model's rows and windows and the live points (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const a = testing.allocator;
@@ -345,7 +347,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     const hc = &model.prefix_cache.?;
     var cp = try dsv41_prefix.capture(a, m, 40);
     defer cp.deinit(a);
-    try hc.live_dsv41.keep(a, m, &cp, false);
+    try dsv41_prefix.liveOf(hc).keep(a, m, &cp, false);
     var slot: Slot = undefined;
     slot.model = &model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };
@@ -356,6 +358,6 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
 
     const rows_and_windows = dsv41_model.stateBytes(&m.dec_state.?);
     try testing.expect(rows_and_windows > 0);
-    try testing.expect(hc.live_dsv41.bytes() > 0);
-    try testing.expectEqual(rows_and_windows + hc.live_dsv41.bytes(), slotStateBytes(&slot));
+    try testing.expect(dsv41_prefix.liveOf(hc).bytes() > 0);
+    try testing.expectEqual(rows_and_windows + dsv41_prefix.liveOf(hc).bytes(), slotStateBytes(&slot));
 }

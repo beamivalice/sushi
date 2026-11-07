@@ -21,7 +21,7 @@ pub const drafter = @import("mimo2_drafter.zig");
 
 // slot:sched (S2b)
 
-// slot:prefix (S2c)
+pub const prefix = @import("mimo2_prefix.zig"); // slot:prefix (S2c)
 
 // slot:bill (S2d)
 

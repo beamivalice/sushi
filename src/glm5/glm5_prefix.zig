@@ -17,6 +17,14 @@ const kv_disk_cache = @import("../kv_disk_cache.zig");
 const log = @import("../log.zig");
 const ssmCheckpointBytes = transformer.ssmCheckpointBytes;
 const pc = @import("../prefix_cache.zig");
+const prefix_arch = @import("../arch/prefix.zig");
+
+/// The live request a lookup restores into.
+pub const State = *forward.Request;
+
+pub fn reset(request: State) void {
+    request.reset();
+}
 
 pub const pool_size: usize = 4;
 
@@ -29,7 +37,7 @@ pub const checkpoint_cap: u32 = 8;
 pub const checkpoint_ram_held: u32 = 2;
 
 /// KDA checkpoints the RAM tier's hot entry keeps (the newest) when an SSD tier holds the rest.
-pub const checkpoint_hot_kept: u32 = 2;
+pub const checkpoint_hot_kept: u32 = pc.CHECKPOINT_HOT_KEPT;
 
 pub fn checkpointMax(global: u32) u32 {
     return if (global == 0) checkpoint_cap else @min(global, checkpoint_cap);
@@ -381,11 +389,12 @@ fn rowsView(x: Arr, from: usize, to: usize, s: mlx.mlx_stream) !Arr {
     return sliced;
 }
 
-/// A GLM commit's MLA rows for each tier; null for any other arch.
-pub const GlmTierRows = struct {
-    ram: ?MlaRows = null,
-    disk: ?MlaRows = null,
-};
+/// The per-entry rows the cache holds for a GLM entry.
+pub const Rows = MlaRows;
+
+fn tierRows(rows: ?MlaRows) ?prefix_arch.Rows {
+    return if (rows) |r| prefix_arch.Rows.ofName("glm5", r) else null;
+}
 
 /// The MLA rows (a checkpoint position) a GLM commit keeps, chosen before anything is copied.
 /// `budget` 0 keeps every row. A RAM tier keeps the rows, its checkpoints and the window within
@@ -431,7 +440,7 @@ pub fn glmCommitLenFor(
 /// RAM retention off or nothing that fits.
 pub fn glmCommitLen(self: *const pc.HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, row_bytes: u64, window_bytes: u64) ?usize {
     if (!self.ram_enabled) return null;
-    return self.glmLenFor(cps, offset, self.max_kv_bytes, false, row_bytes, window_bytes);
+    return glmLenFor(self, cps, offset, self.max_kv_bytes, false, row_bytes, window_bytes);
 }
 
 /// The rows a GLM commit hands the SSD tier: through the newest checkpoint whose rows, every
@@ -439,7 +448,7 @@ pub fn glmCommitLen(self: *const pc.HotPrefixCache, cps: []const SSMCheckpoint, 
 /// the request's own buffers, piece by piece.
 pub fn glmDiskLen(self: *const pc.HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, row_bytes: u64, window_bytes: u64) ?usize {
     const d = if (self.disk) |*dd| dd else return null;
-    return self.glmLenFor(cps, offset, d.max_bytes, true, row_bytes, window_bytes);
+    return glmLenFor(self, cps, offset, d.max_bytes, true, row_bytes, window_bytes);
 }
 
 pub fn glmLenFor(self: *const pc.HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, budget: u64, disk: bool, row_bytes: u64, window_bytes: u64) ?usize {
@@ -461,7 +470,7 @@ pub fn glmLenFor(self: *const pc.HotPrefixCache, cps: []const SSMCheckpoint, off
     return glmCommitLenFor(self.cp_thin, budget, disk, newest, row_bytes, window_bytes, pos_buf[0..cps.len], byte_buf[0..cps.len]);
 }
 
-/// A GLM request restores its KDA state from the entry's checkpoints and its MLA rows from `Entry.glm`.
+/// A GLM request restores its KDA state from the entry's checkpoints and its MLA rows from `Entry.rows`.
 pub fn lookupAndRestoreGlm(
     self: *pc.HotPrefixCache,
     target_cache: *KVCache,
@@ -477,12 +486,12 @@ pub fn lookupAndRestoreGlm(
     slot_id: ?usize,
     skip: bool,
 ) !pc.LookupResult {
-    return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .glm = request }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, null, slot_id, skip);
+    return self.lookupImpl(target_cache, target_moe_seq_offset, prefix_arch.recurrent("glm5", request), s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, null, slot_id, skip);
 }
 
 /// GLM's SSD arm: the entry whose highest persisted KDA checkpoint under the match beats the RAM
 /// match restores its MLA rows and that checkpoint into buffers the request then owns.
-pub fn restoreGlmFromDisk(
+pub fn restoreDisk(
     self: *pc.HotPrefixCache,
     d: *kv_disk_cache.DiskTier,
     request: *forward.Request,
@@ -540,6 +549,18 @@ pub fn restoreGlmFromDisk(
     };
 }
 
+/// Installs the entry's MLA rows and KDA state at the highest checkpoint under `restore_cap`; 0 when none serves.
+pub fn restoreEntry(self: *pc.HotPrefixCache, request: State, e: *pc.Entry, restore_cap: usize, prompt_ids: []const u32) !usize {
+    _ = self;
+    _ = prompt_ids;
+    if (comptime !prefix_arch.has("glm5")) unreachable;
+    const rows = if (e.rows) |*r| r.asName("glm5") else return 0;
+    const cps = e.ssm_checkpoints orelse return 0;
+    const cp = pc.HotPrefixCache.highestCheckpointAtOrBelow(cps, @min(restore_cap, rows.len)) orelse return 0;
+    try restore(request, rows, cp);
+    return cp.pos;
+}
+
 /// A GLM commit: `cps` are its KDA checkpoints and `rows` the MLA rows below them, for both
 /// tiers; ownership of both transfers to the cache on every outcome.
 pub fn commitGlm(
@@ -555,7 +576,7 @@ pub fn commitGlm(
     dflash: ?pc.DflashCommit,
     prompt_len: usize,
 ) !pc.CommitStatus {
-    return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, .{ .ram = rows });
+    return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, .{ .ram = tierRows(rows) });
 }
 
 /// `commitGlm` with each tier's own rows: `ram_rows` within the RAM budget (`glmCommitLen`),
@@ -575,7 +596,7 @@ pub fn commitGlmTiers(
     dflash: ?pc.DflashCommit,
     prompt_len: usize,
 ) !pc.CommitStatus {
-    return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, .{ .ram = ram_rows, .disk = disk_rows });
+    return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, .{ .ram = tierRows(ram_rows), .disk = tierRows(disk_rows) });
 }
 
 /// Flush the most recent commit to the SSD tier. Called by the scheduler
@@ -601,6 +622,8 @@ pub fn persistGlm(d: *kv_disk_cache.DiskTier, rows: *const MlaRows, tokens: []co
         .media_start = media.start,
     }, s, .{ .whole = whole });
 }
+
+pub const persistRows = persistGlm;
 
 /// GLM's prefill write-through: the rows through `request.offset` and the checkpoints so far go to the SSD tier
 /// as the prefill produces them, and every checkpoint but the newest leaves RAM. `entry_id` follows the entry

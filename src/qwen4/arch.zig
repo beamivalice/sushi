@@ -21,7 +21,7 @@ pub const drafter = @import("qwen4_drafter.zig");
 
 // slot:sched (S2b)
 
-// slot:prefix (S2c)
+pub const prefix = @import("qwen4_prefix.zig"); // slot:prefix (S2c)
 
 // slot:bill (S2d)
 

@@ -854,7 +854,9 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   arrays ride two snapshot layers' conv and ssm fields (the aux and pooled fields mean a QSA history to the cache, so
   they stay empty; an absent array is a one-byte placeholder), so the cache's checkpoint list, thinning, merge, byte bill
   and the SSD tier's `s<pos>.safetensors` files serve it unchanged. A restore shares the checkpoint's arrays and never
-  writes them.
+  writes them. The cache reaches the arch's restore, rollback and live record through its `State` and `CacheState`
+  ([arch seam](engine-prefix-cache.md#arch-seam)): `dsv41_prefix.restoreDisk`, `restoreEntry`, `rollbackLive`, `handover`,
+  and `HotPrefixCache.arch.dsv41` (the `Live` record).
 - **The SSD tier indexes by KV rows and this arch has none**: before a commit `dsv41_prefix.markRows` gives layer 0 of
   the slot's cache one zero byte per token, so the tier's chunk files, sizes, scan and eviction cover the entry
   (about 2 B a token); the forward never reads it. A restore (`DiskTier.restoreCheckpointInto`) loads the checkpoint

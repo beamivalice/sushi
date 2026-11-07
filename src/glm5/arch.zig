@@ -19,7 +19,7 @@ pub const drafter = @import("glm5_drafter.zig");
 
 // slot:sched (S2b)
 
-// slot:prefix (S2c)
+pub const prefix = @import("glm5_prefix.zig"); // slot:prefix (S2c)
 
 // slot:bill (S2d)
 
