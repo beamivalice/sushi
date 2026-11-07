@@ -233,6 +233,9 @@ pub fn build(b: *std.Build) void {
     guardBenchFiles(b);
     const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
     ubench_step.dependOn(&b.addInstallArtifact(addUbench(b, build_options, target, macos_sdk_frameworks), .{}).step);
+
+    const host_check_step = b.step("exl3-host-check", "Compile the sushi_exl3 module and its tests against the minimal host root src/exl3/host_min.zig (nothing links or runs)");
+    for (addExl3HostCheck(b, target)) |check| host_check_step.dependOn(&check.step);
 }
 
 /// `-Darchs=qwen4,glm5`: the architectures this build serves, named as `src/arch/registry.zig` names them; empty is
@@ -280,6 +283,15 @@ fn addUbench(b: *std.Build, build_options: *std.Build.Step.Options, target: std.
     addMlxLib(b, mod);
     const exl3 = addExl3Module(b, mod, target, .ReleaseFast);
     mod.addImport("sushi_encoder", addEncoderModule(b, mod, exl3, target, .ReleaseFast));
+    mod.addImport("sushi_exl3_ubench", b.createModule(.{
+        .root_source_file = b.path("src/exl3_ubench/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "mlx_host", .module = mod },
+            .{ .name = "sushi_exl3", .module = exl3 },
+        },
+    }));
     linkApple(mod, macos_sdk_frameworks);
     return b.addExecutable(.{ .name = "sushi-ubench", .root_module = mod });
 }
@@ -293,7 +305,7 @@ const stamp_script =
 /// `ubench_report.zig` is the harness's host tier and keeps its tests.
 fn guardBenchFiles(b: *std.Build) void {
     const io = b.graph.io;
-    const files = [_][]const u8{ "src/ubench_qwen4.zig", "src/ubench_mimo2.zig", "src/ubench_glm5.zig", "src/dsv41/ubench.zig", "src/ubench_shared.zig", "src/exl3/ubench.zig", "src/encoder/ubench.zig" };
+    const files = [_][]const u8{ "src/ubench_qwen4.zig", "src/ubench_mimo2.zig", "src/ubench_glm5.zig", "src/dsv41/ubench.zig", "src/ubench_shared.zig", "src/exl3_ubench/ubench.zig", "src/encoder/ubench.zig" };
     for (files) |path| {
         const source = buildRootHandle(b).readFileAlloc(io, path, b.allocator, .limited(8 << 20)) catch continue;
         var lines = std.mem.splitScalar(u8, source, '\n');
@@ -671,10 +683,39 @@ fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.Resol
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "mlx_host", .module = host }},
+        .imports = &.{
+            .{ .name = "mlx_host", .module = host },
+        },
     });
     host.addImport("sushi_exl3", exl3);
     return exl3;
+}
+
+/// `sushi_exl3` compiled against `src/exl3/host_min.zig`, whose `mlx`, `log` and `io_util` are sushi's own files. A
+/// module that reaches any other host name fails here instead of in a host that lacks it. Two objects: the module's
+/// own tests, and host_min's walk over the module's public declarations.
+fn addExl3HostCheck(b: *std.Build, target: std.Build.ResolvedTarget) [2]*std.Build.Step.Compile {
+    const files = b.createModule(.{ .root_source_file = b.path("src/arch_host_stub.zig"), .target = target, .optimize = .Debug });
+    const host = b.createModule(.{
+        .root_source_file = b.path("src/exl3/host_min.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .imports = &.{.{ .name = "host_files", .module = files }},
+    });
+    const exl3 = b.createModule(.{
+        .root_source_file = b.path("src/exl3/root.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "mlx_host", .module = host },
+        },
+    });
+    host.addImport("sushi_exl3", exl3);
+    return .{
+        b.addTest(.{ .name = "exl3-host-check-tests", .root_module = exl3, .emit_object = true }),
+        b.addTest(.{ .name = "exl3-host-check-decls", .root_module = host, .emit_object = true }),
+    };
 }
 
 /// The encoder behind `sushi convert exl3`, also tested alone as `encoder-test`.

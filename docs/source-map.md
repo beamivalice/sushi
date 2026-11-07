@@ -34,7 +34,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `qwen4/gdn_decode.zig` | fused GDN decode/verify step (one dispatch) | engine-kernels |
 | `mimo2/mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, stamp check | mimo2-arch |
 | `expert_store.zig` / `expert_drop.zig` / `exl3/pack.zig` | expert layouts and `QuantStore` (byte spans of every routed bank), the `--drop-expert` set, EXL3/STQ pack reading (std only); `expert_quant.zig` re-exports the store | engine-expert-streaming |
-| `exl3/` (`sushi_exl3` module) | EXL3/STQ decoders and kernels, rate groups, dense linears; `exl3/trunk.zig` the trellis trunk math (matmul, matmulGeo, fuse, sharedProject) and `linear.Geo`, a trunk bank's shapes and launch configs read once; no file or pub name there names an architecture | engine-exl3-experts |
+| `exl3/` (`sushi_exl3` module) | EXL3/STQ decoders and kernels, rate groups, dense linears; `exl3/trunk.zig` the trellis trunk math (matmul, matmulGeo, fuse, sharedProject) and `linear.Geo`, a trunk bank's shapes and launch configs read once; no file or pub name there names an architecture; `exl3/host_min.zig` is the host `exl3-host-check` compiles it against; the benches are the separate module `exl3_ubench/` | engine-exl3-experts |
 | `linear.zig` | `Linear`: a trunk projection as dense, affine, FP8 block or trellis, bound once from the weight triple (`layer_weights.bindLayer`) and applied with a tag switch by `Trunk.qmatmul` | engine-kernels |
 | `trunk_stq.zig` | the weight-map binding of the trellis trunk banks (`load`, `drop`); re-exports `exl3/trunk.zig` | engine-exl3-experts |
 | `encoder/` | `sushi convert exl3`: trellis search, source readers, trunk/shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
@@ -48,7 +48,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `vision.zig` / `vision_common.zig` / `arch/media.zig` / `<arch>/<arch>_media.zig` / `qwen4/qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: the tower holder, preprocessing, the media dispatch and each arch's processor, Qwen3-VL, M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` / `kld_fixture.zig` / `kld_capture_util.zig` / `arch/offline.zig` | `sushi kld capture|compare`; the MLX-free fixture reader and scoring; the per-arch hooks | quality-kld |
 | `bench.zig` / `bench_box.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power | process-measurement |
-| `ubench_main.zig` / `ubench_report.zig` / `exl3/ubench.zig` | `sushi-ubench` (`zig build ubench`) | process-ubench |
+| `ubench_main.zig` / `ubench_report.zig` / `exl3_ubench/ubench.zig` | `sushi-ubench` (`zig build ubench`) | process-ubench |
 | `sushibar_main.zig` / `sushibar/` | `sushibar` menu bar app | server-lifecycle |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | format corpus, traffic replay | server-tool-calling |

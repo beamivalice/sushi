@@ -8,7 +8,7 @@ const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const rate_groups = @import("rate_groups.zig");
 const root = @import("root.zig");
-const bench = @import("bench_util.zig");
+const bench = @import("synth.zig");
 const truth = @import("f32_truth.zig");
 
 const relRms = truth.relRms;

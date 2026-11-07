@@ -14,7 +14,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 |---|---|
 | `src/expert_store.zig` | Expert layout detection from PACKED shapes: `.quantized_split` (affine banks) vs `.exl3_k4` (trellis); affine (bits, group_size) solved from geometry. `src/expert_quant.zig` re-exports it |
 | `src/exl3/pack.zig` | EXL3/STQ pack reading, std only: tensor keys, bank completeness, tile order, `LayerGroups`, the span plan of a rate-grouped layer |
-| `src/exl3/root.zig` | The `sushi_exl3` module's host API: `expert_quant` parse (`parseExpertQuant`), `admitTopK`, `trellisAdmitted`, `moe` (the one dispatch), `moeRagged` (a rate-grouped layer) |
+| `src/exl3/root.zig` | The `sushi_exl3` module's public names ([mlx-serve-integration](mlx-serve-integration.md) lists them): `expert_quant` parse (`parseExpertQuant`), `admitTopK`, `trellisAdmitted`, `moe` (the one dispatch), `moeRagged` (a rate-grouped layer), `version` |
+| `src/exl3/host_min.zig` | The minimal host root `zig build exl3-host-check` compiles the module against: exactly `mlx`, `log`, `io_util` |
 | `src/exl3/codebook_tables.zig` | STQ's named codebook tables: rows, pinned digests, per-table rate range, `resolve` and its refusals |
 | `src/exl3/rate_groups.zig` | Rate-grouped layers: the ragged bank (`Ragged`), the one-dispatch mixed-rate decode kernels, the per-group prefill GEMMs |
 | `src/exl3/expert_exl3.zig` | Host reference decoders (MUL1, MCG, STD1, SPEC1, PAIR1), `Rate`, `Window`, `Decode`, fixtures |
@@ -26,13 +27,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 | `src/exl3/fold_clamped.zig` | The affine shared expert folded into the routed lane chain's launches, with the clamped SwiGLU (was `glm_fold`) |
 | `src/exl3/riders_gated.zig`, `src/exl3/fold_gated.zig` | An affine shared expert with a sigmoid gate logit riding the routed launches of a one-bank layer (were `qwen_riders`, `qwen_fold`) |
 | `src/exl3/prefill_grid.zig` | The physical grid transpose of a full routed prefill chunk (was `glm_prefill_grid`) |
-| `src/exl3/geometry_5120x2304_test.zig`, `src/exl3/f32_truth.zig` | The synthetic 5120 x 2304 rate-group parity cases, and the f32-truth helpers they share with `src/dsv41/dsv41_exl3_real_test.zig` (real shards, `DSV41_RT_PACK`) |
+| `src/exl3/geometry_5120x2304_test.zig`, `src/exl3/f32_truth.zig`, `src/exl3/synth.zig` | The synthetic 5120 x 2304 rate-group parity cases, the f32-truth helpers they share with `src/dsv41/dsv41_exl3_real_test.zig` (real shards, `DSV41_RT_PACK`), and the random banks both and the benches build |
+| `src/exl3_ubench/` | The module `sushi_exl3_ubench` (`ubench.zig`, `bench_util.zig`): the kernel microbenches `sushi-ubench` runs. Not part of the vendorable unit; it imports `sushi_exl3` by its public names |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab (`gateUpSwiglu`; `downReduce`) for the unquantized HF checkpoint |
 
 **`src/exl3` is a module** (`sushi_exl3`), so another MLX host (mlx-serve) can serve EXL3 packs through the same code.
 It reaches `mlx`, `log` and `io_util` through an `mlx_host` import whose root file exposes them as `pub const`; here that
 root is `src/main.zig` (and `src/tests.zig` for tests), and it can never import a Sushi file by path. Its tests run as
 their own artifacts (`exl3-test-1` to `-6`, balanced by `exl3_test_weights` in `build.zig`) on `zig build test`.
+`zig build exl3-host-check` compiles the module and walks its public declarations against `host_min.zig`, a host that
+exports exactly those three names, so a fourth `mlx_host` name is a build error. The vendorable unit, its names and its
+hidden state are [mlx-serve-integration](mlx-serve-integration.md); `root.version` is the Sushi version it was cut at
+(a literal, checked against `build.zig.zon` by a test in `src/version.zig`).
 
 The NAX compile-probe regression test checks hardware capability independently
 of the runtime failure latch. It deliberately latches dispatch off before

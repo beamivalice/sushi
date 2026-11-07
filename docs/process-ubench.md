@@ -61,8 +61,8 @@ A `--contended` number is a smoke, never a recorded baseline.
   `mimo2`, `glm5`, `dsv41`, `enc` or `shared`), kind (kernel on synthetic tensors, or pack), unit, steps, axes, arms,
   reference arm, opts, and a body.
 - The body calls `run.interleave(label, ctx, f)` per rung, then `run.metric` / `run.invalid`. Chains of dependent calls
-  come from `src/exl3/bench_util.zig`, so launch latency counts as it does in a forward.
-- Bench files (`src/ubench_*.zig`, `src/exl3/ubench.zig`, `src/encoder/ubench.zig`) hold no `test` block: the build
+  come from `src/exl3_ubench/bench_util.zig`, so launch latency counts as it does in a forward.
+- Bench files (`src/ubench_*.zig`, `src/exl3_ubench/ubench.zig`, `src/encoder/ubench.zig`) hold no `test` block: the build
   refuses one. A bench's correctness half (bytes against an oracle) stays a test beside the code.
 - Knobs are flags (`--opt`), never env vars.
 

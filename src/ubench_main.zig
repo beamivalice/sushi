@@ -1,17 +1,17 @@
 //! `sushi-ubench`: the microbench binary. It owns the registry, the CLI and the quiet-box steps; the bench bodies
-//! are `exl3/ubench.zig` and its siblings, and the pure half (tables, JSON, compare) is ubench_report.zig. A bench
+//! are `exl3_ubench/ubench.zig` and its siblings, and the pure half (tables, JSON, compare) is ubench_report.zig. A bench
 //! is never a test: the exit code says whether it measured, never how fast.
 //! Docs: process-ubench.md.
 const std = @import("std");
 const builtin = @import("builtin");
 const stamp = @import("ubench_stamp");
-// pub: src/exl3 reaches mlx, log, io_util and the bench types through its host root.
+// pub: src/exl3 and src/exl3_ubench reach mlx, log, io_util and the bench types through this host root.
 pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 pub const log = @import("log.zig");
 pub const report = @import("ubench_report.zig");
 const box = @import("bench_box.zig");
-const exl3 = @import("sushi_exl3");
+const exl3_ubench = @import("sushi_exl3_ubench").ubench;
 const dsv_benches = @import("dsv41/ubench.zig");
 const glm5 = @import("ubench_glm5.zig");
 const shared = @import("ubench_shared.zig");
@@ -19,20 +19,20 @@ const encoder = @import("sushi_encoder");
 const ubench_mimo2 = @import("ubench_mimo2.zig");
 
 const registry = [_]report.Bench{
-    exl3.ubench.dsv41_experts,
-    exl3.ubench.dsv41_tail_routed,
-    exl3.ubench.dsv41_shared_prefill,
+    exl3_ubench.dsv41_experts,
+    exl3_ubench.dsv41_tail_routed,
+    exl3_ubench.dsv41_shared_prefill,
 } ++ dsv_benches.benches ++ [_]report.Bench{
-    exl3.ubench.decode_chain,
-    exl3.ubench.grouped_decode,
-    exl3.ubench.moe_layer,
-    exl3.ubench.prefill_gemm,
-    exl3.ubench.trunk_rows,
-    exl3.ubench.trunk_launches,
-    exl3.ubench.routed_t1,
+    exl3_ubench.decode_chain,
+    exl3_ubench.grouped_decode,
+    exl3_ubench.moe_layer,
+    exl3_ubench.prefill_gemm,
+    exl3_ubench.trunk_rows,
+    exl3_ubench.trunk_launches,
+    exl3_ubench.routed_t1,
 } ++ ubench_mimo2.benches ++ [_]report.Bench{
-    exl3.ubench.exl3_rate_groups,
-    exl3.ubench.exl3_rate_groups_rows,
+    exl3_ubench.exl3_rate_groups,
+    exl3_ubench.exl3_rate_groups_rows,
     encoder.ubench.factor,
     encoder.ubench.search,
 } ++ glm5.benches ++ shared.benches;

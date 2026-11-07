@@ -16,7 +16,8 @@ const Arr = mlx.mlx_array;
 const Ops = qwen.Ops;
 const Bank = @import("glm5/glm5_decode.zig").Bank;
 const kernels = api.kernels;
-const bench = api.bench_util;
+const exl3_ubench = @import("sushi_exl3_ubench");
+const bench = exl3_ubench.bench_util;
 
 pub const benches = [_]report.Bench{ shared_expert_fold, kernel_launch, trunk_prefill };
 
@@ -64,7 +65,7 @@ fn runFold(run: *report.Run) anyerror!void {
     if (listed(models, "qwen4")) for (kinds) |kind| for (layouts) |layout| try runQwen(run, s, std.mem.eql(u8, layout, "grouped"), std.mem.eql(u8, kind, "trellis"));
     if (!listed(kinds, "affine")) return;
     if (listed(models, "glm5") and listed(layouts, "bank")) try runGlm(run, s);
-    if (listed(models, "dsv41") and listed(layouts, "grouped")) try api.ubench.sharedFoldDsv41(run);
+    if (listed(models, "dsv41") and listed(layouts, "grouped")) try exl3_ubench.ubench.sharedFoldDsv41(run);
 }
 
 // ── glm5: one routed layer at the real geometry (nine experts at n36, 4096 -> 2048 -> 4096), shared A6 ──

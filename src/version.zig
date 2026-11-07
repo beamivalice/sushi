@@ -117,6 +117,10 @@ fn val(s: []const u8) []const u8 {
     return if (s.len == 0) "unknown" else s;
 }
 
+test "version: the vendorable module is cut at the build's version" {
+    try std.testing.expectEqualStrings(@import("build_options").version, @import("sushi_exl3").version);
+}
+
 test "version: report renders one name-value line per component" {
     const s = try report(std.testing.allocator, .{
         .app = "1.0.0",

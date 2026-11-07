@@ -11,7 +11,7 @@ const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const model = @import("dsv41_model.zig");
-const exl3 = @import("sushi_exl3");
+const exl3_ubench = @import("sushi_exl3_ubench").ubench;
 
 pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions, reduce_expand, settle_redo };
 
@@ -1203,7 +1203,7 @@ pub const reduce_expand: report.Bench = .{
     .axes = &.{.{ .name = "rows", .values = &.{ "1", "2", "4", "8" } }},
     .arms = &.{ "reduce_cast_expand", "reduce_expand", "reduce" },
     .ref = "reduce_cast_expand",
-    .run = exl3.ubench.runReduceExpand,
+    .run = exl3_ubench.runReduceExpand,
 };
 
 pub const settle_redo: report.Bench = .{
@@ -1218,5 +1218,5 @@ pub const settle_redo: report.Bench = .{
     },
     .arms = &.{ "full", "redo", "queued", "queued_keep" },
     .ref = "full",
-    .run = exl3.ubench.runSettleRedo,
+    .run = exl3_ubench.runSettleRedo,
 };
