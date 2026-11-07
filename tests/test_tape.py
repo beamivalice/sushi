@@ -77,6 +77,14 @@ class Tape(unittest.TestCase):
             (b / "prompts/00_x/logits.f32").write_bytes(bytes(8) + b"\x01" + bytes(23))
             self.assertIn("prompts/00_x/logits.f32 differs at f32 2 of 8", tape.cmp_captures(a, b))
 
+    def test_second_recording_marks_only_a_differing_case_unstable(self):
+        a = {"x": tape.settle([entry()]), "y": tape.settle([entry()])}
+        b = {"x": tape.settle([entry()]), "y": tape.settle([entry(("a", "q", "c"))])}
+        m = tape.merge_recordings(a, b)
+        self.assertNotIn("unstable", m["x"])
+        self.assertTrue(m["y"]["unstable"])
+        self.assertEqual(len(m["y"]["runs"]), 2)
+
 
 if __name__ == "__main__":
     out = io.StringIO()

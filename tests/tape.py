@@ -76,13 +76,18 @@ PACKS = {
                          "hot": (HOT, ["hot", "image"]),
                          "ssd": (SSD, ["ssd"])}),
     "dsv41": dict(dir="DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", ids="dsv41", n_ids=2,
-                  slots=["--ssd-budget-gb", "110", "--max-concurrent", "1"],
+                  slots=["--ssd-budget-gb", "48", "--max-concurrent", "1"],
                   captures={"streamed": ["--ssd-budget-gb", "110"]},
                   blocks={"serial": (EXACT + ["--no-mtp"], ["serial", "raw"]),
                           "spec": (EXACT + ["--mtp-min-depth", "2", "--mtp-max-depth", "2"], ["spec"]),
                           "hot": (HOT + ["--vision"], ["hot", "image", "think"]),
                           "ssd": (SSD, ["ssd"])}),
 }
+QUICK = {"qwen-stq": (HOT + MTP33, ["serial", "spec", "batch", "repeat"]),
+         "glm": (HOT + ["--drafter-min-depth", "4", "--drafter-max-depth", "4"], ["serial", "spec", "batch", "repeat", "image"]),
+         "dsv41": (HOT + ["--vision", "--mtp-min-depth", "2", "--mtp-max-depth", "2"], ["serial", "spec", "repeat", "image"]),
+         "mimo": (["--prefix-cache-entries", "4", "--prefix-cache-mem", "1GB", "--prefix-cache-disk", "off"] + MTP33,
+                  ["serial", "spec", "batch", "repeat"])}
 CAPTURE_IDS = ["code-python-intervalset", "math-compute-integral", "multilingual-translate-th-zh-ja-ar", "story-night-train"]
 IDS_FILE = {"qwen": "qwen38-flash-next-bf16-gdnf32-8cat-v1.prompts.jsonl",
             "text": "qwen38-flash-next-bf16-gdnf32-8cat-v1.prompts.jsonl",
@@ -211,7 +216,8 @@ def compare_case(name, want, got, serial_of=None):
     if want.get("unstable"):
         # A non-deterministic case is held to an invariant: each batched row starts like the serial answer.
         for i, row in enumerate(got.get("rows") or []):
-            ref = (serial_of or {}).get(got["prompts"][i])
+            prompts = got.get("prompts") or []
+            ref = (serial_of or {}).get(prompts[i] if i < len(prompts) else None)
             if ref is not None and common_prefix(ref["text"], row["text"]) < min(40, len(ref["text"])):
                 return f"{name} row {i}: unstable case, and its text no longer starts like the serial answer"
         return None
@@ -390,6 +396,45 @@ class Replay:
         return {"response": [response_record(a), response_record(b)], "log": log_lines(seg_a) + ["--"] + log_lines(self.slice())}
 
 
+    # --- the --quick cases: one boot, one pass, spec on at boot and switched off per request where a case needs it
+    SPEC_OFF = {"enable_mtp": False, "enable_drafter": False}
+
+    def q_serial(self):
+        """Logprobs request: speculation is off for it by design, so this is the serial decode."""
+        self.slice()
+        out = [self.chat(self.user(p), 96) for p in PROMPTS[:2]]
+        return self.result(out, self.slice(), prompts=PROMPTS[:2])
+
+    def q_spec(self):
+        self.slice()
+        out = self.chat(self.user(PROMPTS[2]), 128, lp=False)
+        seg = self.wait_log(r"\[spec-stats\] mode=")
+        if "[spec-stats] mode=" not in seg:
+            raise AssertionError(f"speculation never engaged; log {self.s.log}")
+        return self.result(out, seg)
+
+    def q_batch(self):
+        self.slice()
+        bodies = [{"model": "sushi", "messages": self.user(p), "max_tokens": 96, "temperature": 0, "seed": 1, "stream": False,
+                   **self.think, **self.SPEC_OFF} for p in PROMPTS[:2]]
+        return self.result(self.barrier(bodies), self.slice(), prompts=PROMPTS[:2])
+
+    def q_repeat(self):
+        """The same prompt twice: the second must restore, and answers the first's text."""
+        q = self.user(document(8) + "\n\nIn one sentence, what is the oldest structure in the town?")
+        self.slice()
+        a = self.chat(q, 48)
+        seg_a = self.slice()
+        b = self.chat(q, 48)
+        seg_b = self.slice()
+        if not (response_record(b).get("cached_tokens") or 0):
+            raise AssertionError(f"the repeated prompt restored nothing; log {self.s.log}")
+        return {"response": [response_record(a), response_record(b)], "log": log_lines(seg_a) + ["--"] + log_lines(seg_b)}
+
+    def q_image(self):
+        return self.case_image(0)
+
+
 def run_boot(label, pack, flags, cases, runs):
     """One server under the lock; every case `runs` times. {case: [result per pass]}, plus the boot's load-time facts."""
     import sushi_boot
@@ -451,7 +496,7 @@ def run_ssd(label, pack, flags, runs):
     return {"persist": [persisted], "restore": restored}
 
 
-def capture(pack, name, flags, out, prompts, binary):
+def capture(pack, name, flags, out, prompts, binary, tokens=256):
     import sushi_boot
     home = Path(out).parent / f"{name}.home"
     (home / ".sushi").mkdir(parents=True, exist_ok=True)
@@ -459,7 +504,7 @@ def capture(pack, name, flags, out, prompts, binary):
     owner = f"{os.environ.get('GPU_LOCK_OWNER', 'tape')}-capture-{name}"
     max_min = os.environ.get("SUSHI_BOOT_LOCK_MAX_MIN", "40")
     cmd = [str(LOCK), "run", owner, "--max-min", max_min, "--", "taskpolicy", "-a", str(binary), "kld", "capture",
-           "--model", str(pack), "--prompts", str(prompts), "--out", str(out), "--tokens", "256", "--top-k", "10"] + flags
+           "--model", str(pack), "--prompts", str(prompts), "--out", str(out), "--tokens", str(tokens), "--top-k", "10"] + flags
     log = Path(out).parent / f"{name}.log"
     with log.open("wb") as f:
         r = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env={**os.environ, "HOME": str(home)})
@@ -483,10 +528,10 @@ def cmp_captures(a, b):
     return None
 
 
-def write_prompts(spec, dest):
+def write_prompts(spec, dest, n=None):
     src = PROMPTS_SRC / IDS_FILE[spec["ids"]]
     rows = {d["id"]: d for d in map(json.loads, src.read_text().splitlines())}
-    ids = CAPTURE_IDS[:spec["n_ids"]]
+    ids = CAPTURE_IDS[:n or spec["n_ids"]]
     with dest.open("w") as f:
         for i in ids:
             d = rows[i]
@@ -518,6 +563,99 @@ def settle(passes):
     return e
 
 
+def merge_recordings(old, new):
+    """A second recording of the same case: equal keeps it, a difference marks it unstable (both runs kept)."""
+    out = {}
+    for c, e in new.items():
+        o = old.get(c)
+        if o is None or o.get("unstable") and "runs" not in o:
+            out[c] = e
+        elif o.get("unstable"):
+            out[c] = {**o, "runs": o["runs"] + [e.get("response")]}
+        elif first_diff(o["response"], e["response"], c) is None:
+            out[c] = o
+        else:
+            out[c] = {"unstable": True, "runs": [o["response"], e["response"]], "rows": e["response"] if isinstance(e["response"], list) else None,
+                      "prompts": e.get("prompts")}
+    return out
+
+
+def run_quick(pack_key, pack):
+    """One boot, one pass, every quick case; returns ({case: entry}, timeline)."""
+    import sushi_boot
+    flags, cases = QUICK[pack_key]
+    t0 = time.monotonic()
+    marks = []
+    out = {}
+    with sushi_boot.Server(f"tape-quick-{pack_key}", model=pack,
+                           flags=["--metrics", "--log-level", "debug"] + PACKS[pack_key]["slots"] + flags) as srv:
+        srv.wait_ready()
+        marks.append(("load", time.monotonic() - t0))
+        rp = Replay(srv)
+        for c in cases:
+            t = time.monotonic()
+            out[c] = settle([getattr(rp, f"q_{c}")()])
+            marks.append((c, time.monotonic() - t))
+    marks.append(("total", time.monotonic() - t0))
+    return out, [(n, round(s, 1)) for n, s in marks]
+
+
+def main_quick_capture(a, spec, pack):
+    """One `kld capture` of the pack against itself: 2 prompts x 48 tokens, load included."""
+    base = Path(a.base).expanduser()
+    base.mkdir(parents=True, exist_ok=True)
+    import sushi_boot
+    flags = next(iter(spec["captures"].values()))
+    t0 = time.monotonic()
+    write_prompts(spec, base / "prompts-quick.jsonl", n=2)
+    out = base / "capture-quick"
+    capture(pack, "quick", flags, out if a.mode == "record" else base / "capture-quick-check", base / "prompts-quick.jsonl",
+            sushi_boot.BIN, tokens=48)
+    print(f"timeline capture={round(time.monotonic() - t0, 1)}s")
+    if a.mode == "record":
+        print(f"recorded capture to {out}")
+        return 0
+    d = cmp_captures(out, base / "capture-quick-check")
+    print("DIFF " + d if d else f"IDENTICAL to {out}")
+    return 1 if d else 0
+
+
+def main_quick(a, pack):
+    base = Path(a.base).expanduser()
+    base.mkdir(parents=True, exist_ok=True)
+    if a.blocks == "capture":
+        return main_quick_capture(a, PACKS[a.pack], pack)
+    tape_file = base / "tape.json"
+    entries, timeline = run_quick(a.pack, pack)
+    print("timeline " + " ".join(f"{n}={s}s" for n, s in timeline))
+    if a.mode == "record":
+        old = json.loads(tape_file.read_text())["boots"]["quick"] if tape_file.exists() else {}
+        merged = merge_recordings(old, entries) if old else entries
+        tape_file.write_text(json.dumps({"pack": pack.name, "boots": {"quick": merged}, "timeline": timeline}, indent=1,
+                                        ensure_ascii=False) + "\n")
+        for c, e in merged.items():
+            if e.get("unstable"):
+                print(f"quick/{c}: UNSTABLE across recordings (invariant only)")
+        print(f"recorded {len(merged)} quick cases to {tape_file}")
+        return 0
+    want = json.loads(tape_file.read_text())["boots"]["quick"]
+    ser = entries.get("serial") or {}
+    ref = dict(zip(ser.get("prompts") or [], ser.get("response") or []))
+    fails = []
+    for c, e in entries.items():
+        w = want.get(c)
+        if w is None:
+            print(f"quick/{c}: not in the tape, skipped")
+            continue
+        d = compare_case(f"quick/{c}", w, {"rows": e["response"], "prompts": e.get("prompts")} if w.get("unstable") else e,
+                         serial_of=ref)
+        print(f"quick/{c}: " + (f"FAIL {d}" if d else "IDENTICAL"))
+        if d:
+            fails.append(d)
+    print("DIFF " + fails[0] if fails else f"IDENTICAL to {tape_file}")
+    return 1 if fails else 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("mode", choices=["record", "check", "diff"])
@@ -525,6 +663,7 @@ def main(argv):
     ap.add_argument("base", help="the tape directory (record writes it, check reads it); the second tape for diff")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--blocks", default="")
+    ap.add_argument("--quick", action="store_true", help="one boot, one pass, about five minutes; no capture")
     a = ap.parse_args(argv)
 
     if a.mode == "diff":
@@ -537,6 +676,8 @@ def main(argv):
     pack = Path(os.environ.get(f"SUSHI_TEST_PACK_{a.pack.upper().replace('-', '_')}") or MODELS / spec["dir"])
     if not pack.is_dir():
         sushi_boot.skip(f"pack {pack} is missing")
+    if a.quick:
+        return main_quick(a, pack)
     binary = sushi_boot.BIN
     base = Path(a.base).expanduser()
     recording = a.mode == "record"
