@@ -84,6 +84,7 @@ PACKS = {
                           "ssd": (SSD, ["ssd"])}),
 }
 QUICK = {"qwen-stq": (HOT + MTP33, ["serial", "spec", "batch", "repeat"]),
+         "qwen-2bpw": (HOT + MTP33, ["serial", "spec", "batch", "repeat"]),
          "glm": (HOT + ["--drafter-min-depth", "4", "--drafter-max-depth", "4"], ["serial", "spec", "batch", "repeat", "image"]),
          "dsv41": (HOT + ["--vision", "--mtp-min-depth", "2", "--mtp-max-depth", "2"], ["serial", "spec", "repeat", "image"]),
          "mimo": (["--prefix-cache-entries", "4", "--prefix-cache-mem", "1GB", "--prefix-cache-disk", "off"] + MTP33,
