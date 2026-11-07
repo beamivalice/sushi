@@ -3,6 +3,7 @@ const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const drafter_mod = @import("arch/drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const dspark_rows = @import("dsv41/dspark_rows.zig");
@@ -2315,6 +2316,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // DFlash block-drafter (any `*_assistant` family); anything else is refused.
     var dflash_ptr: ?*DflashModel = null;
     if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
+        if (!drafter_mod.supportsDflash(xfm_ptr)) {
+            log.err("DFlash assistant at {s} refused: {s} models have no DFlash2 drafter\n", .{ drafter_dir, params.config.model_type });
+            return error.DrafterUnsupported;
+        }
         const d = try sch.allocator.create(DflashModel);
         d.* = (if (params.config.isGlm5()) @import("glm5/glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
             sch.allocator.destroy(d);
@@ -2463,14 +2468,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.vision_encoder = vision_ptr;
     entry.dflash = dflash_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
-    entry.mtp = if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
-        generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
-    else if (xfm_ptr.dsv41 != null and xfm_ptr.dsv41.?.dspark != null)
-        generate_mod.MtpHeadRef{ .dsv41 = xfm_ptr }
-    else if (mimo_head) |h|
-        generate_mod.MtpHeadRef{ .mimo = h }
-    else
-        null;
+    entry.mtp = generate_mod.MtpHeadRef.fromModel(xfm_ptr, mtp_enabled, if (mimo_head) |h| @ptrCast(h) else null);
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);

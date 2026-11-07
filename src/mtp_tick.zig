@@ -8,20 +8,14 @@ const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
-const ForwardCtx = transformer_mod.ForwardCtx;
 const Generator = generate_mod.Generator;
-const dflash_mod = @import("dflash.zig");
+const MtpHeadRef = generate_mod.MtpHeadRef;
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const slot_admission = @import("slot_admission.zig");
 const MAX_BATCH_GROUP = slot_admission.MAX_BATCH_GROUP;
-const noteSerial = slot_admission.noteSerial;
 const batchedKvKeepCount = slot_admission.batchedKvKeepCount;
-const groupKeepCount = slot_admission.groupKeepCount;
-const groupCtxMax = slot_admission.groupCtxMax;
-const fillGroupPadWasteKvLens = slot_admission.fillGroupPadWasteKvLens;
 const glm5_rows_tick = @import("glm5/glm5_rows_tick.zig");
 const slotMtpGroupable = glm5_rows_tick.slotMtpGroupable;
 const Planner = @import("mtp_group_planner.zig");
@@ -447,14 +441,6 @@ pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     return true;
 }
 
-fn mtpRoundsStaySolo(slot: *const Slot) bool {
-    const t = slot.model.transformer orelse return true;
-    // A MiMo verify keeps each row's decode arithmetic only in its own solo forward.
-    if (t.config.isMimo()) return true;
-    // qwen4_exp verify rows are expert bytes, so a batched verify measured no better than solo rounds.
-    return t.qwen4 != null;
-}
-
 /// A plain batched tick samples no repeat or presence penalty, so a penalised slot keeps its MTP round.
 pub fn anyPenalised(slots: []const *Slot) bool {
     for (slots) |slot| {
@@ -463,8 +449,12 @@ pub fn anyPenalised(slots: []const *Slot) bool {
     return false;
 }
 
-pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {
-    return if (mtpRoundsStaySolo(slot)) 3 else mtpCrowdThreshold();
+/// MTP slots on one model at or past this count decode on the plain batched tick instead. Every slot that reaches
+/// `runMtpGroups` runs its rounds solo (see there), so the threshold is the same for all of them.
+pub const mtp_crowd_threshold: usize = 3;
+
+pub fn mtpCrowdThresholdFor(_: *const Slot) usize {
+    return mtp_crowd_threshold;
 }
 
 fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
@@ -531,7 +521,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
             .t1 = 0,
             .t1_arr = .{ .ctx = null },
             .drafts = &.{},
-            .draft_arrs = &.{},
+            .draft_arrs = undefined,
             .n_drafted = 0,
             .conf_arrs = null,
             .n_conf = 0,
@@ -597,226 +587,11 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     observeGroupRound(vlive[0..vn], states[0..vn], group.len, &tick_sw, head_calls_before);
 }
 
-/// Group MTP slots by model (pad-waste capped like the plain group) and run one
-/// batched verify per group; a group of one takes the solo round.
+/// Every MTP slot that reaches here is Flash-Next (`slotMtpGroupable` needs its GDN trunk) or MiMo
+/// (`slotMimoMtpCrowdable`), and both keep each round solo: a MiMo verify holds each row's decode arithmetic only
+/// in its own forward, and Flash-Next verify rows are expert bytes, so a batched verify measured no better.
 pub fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
-    if (slots.len == 0) return;
-    std.sort.pdq(*Slot, slots, {}, struct {
-        fn lt(_: void, a: *Slot, b: *Slot) bool {
-            return @intFromPtr(a.model) < @intFromPtr(b.model);
-        }
-    }.lt);
-    var start: usize = 0;
-    while (start < slots.len) {
-        var end = start + 1;
-        while (end < slots.len and slots[end].model == slots[start].model) end += 1;
-        var group = slots[start..end];
-        if (mtpRoundsStaySolo(group[0])) {
-            for (group) |slot| try runSingleDecodeTick(sch, slot);
-            start = end;
-            continue;
-        }
-        if (group.len >= 2) {
-            var kv_lens: [MAX_BATCH_GROUP]u32 = undefined;
-            var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
-            for (group, 0..) |g, i| {
-                caches_buf[i] = &g.cache;
-            }
-            fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 2, kv_lens[0..group.len]);
-            const ctx_max = groupCtxMax(caches_buf[0..group.len]);
-            var i: usize = 1;
-            while (i < group.len) : (i += 1) {
-                const slot_i = group[i];
-                const len_i = kv_lens[i];
-                var j = i;
-                while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
-                    group[j] = group[j - 1];
-                    kv_lens[j] = kv_lens[j - 1];
-                }
-                group[j] = slot_i;
-                kv_lens[j] = len_i;
-            }
-            const keep = groupKeepCount(kv_lens[0..group.len], ctx_max);
-            for (group[keep..]) |s| {
-                noteSerial(sch, s, .pad_waste);
-                try runSingleDecodeTick(sch, s);
-            }
-            group = group[0..keep];
-        }
-        // Sub-groups sized to the verify lane's row budget; the leftover slot rounds solo.
-        var g0: usize = 0;
-        while (g0 < group.len) {
-            const rem = group.len - g0;
-            const size = mtpSubGroupSize(rem, mtpGroupRowCap());
-            const sub = group[g0 .. g0 + size];
-            if (size >= 2) {
-                const cap = mtpGroupRowCap() / @as(u32, @intCast(size)) - 1;
-                for (sub) |slot| slot.legacy_gen.?.mtp_group_cap = cap;
-                try runBatchedMtpTick(sch, sub);
-            } else {
-                sub[0].legacy_gen.?.mtp_group_cap = 0;
-                try runSingleDecodeTick(sch, sub[0]);
-            }
-            g0 += size;
-        }
-        start = end;
-    }
-}
-
-/// Rows one batched verify may carry: past 7 the projections leave the split-K lane for
-/// stock kernels; the NAX m16 tile carries 16.
-pub fn mtpGroupRowCap() u32 {
-    return if (dflash_mod.wideVerifyLaneAvailable()) 16 else 7;
-}
-
-/// MTP slots on one model at or past this count decode on the plain batched tick instead:
-/// sub-grouped verify rounds lose to one plain tick there.
-fn mtpCrowdThreshold() usize {
-    return mtpSubGroupSize(std.math.maxInt(usize), mtpGroupRowCap()) + 1;
-}
-
-/// Slots in the next sub-group: two at depth 2 or three at depth 1 fill 7 rows; four is
-/// better as 2+2 than 3+1.
-pub fn mtpSubGroupSize(remaining: usize, row_cap: u32) usize {
-    if (remaining < 2) return remaining;
-    if (row_cap >= 16) return @min(remaining, 4);
-    if (remaining == 3 or remaining >= 5) return 3;
-    return 2;
-}
-
-fn runBatchedMtpTick(sch: *Scheduler, group: []*Slot) !void {
-    var inner_err: ?anyerror = null;
-    runBatchedMtpTickInner(sch, group) catch |e| {
-        inner_err = e;
-    };
-    mlx.checkErrorDecode() catch |mlx_err| {
-        log.err("[scheduler] batched verify aborted: MLX failure mid-generation ({s}) — failing these requests, the server keeps serving\n", .{@errorName(mlx_err)});
-        for (group) |slot| slot.markError(@errorName(mlx_err));
-        return;
-    };
-    if (inner_err) |e| return e;
-}
-
-/// One speculative round for a group: every slot drafts on its own head, the trunk
-/// verifies all of them in ONE `[N, S]` forward (rows padded to the widest draft),
-/// every slot accepts and rolls back on its own row.
-fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
-    const allocator = sch.allocator;
-    var states: [MAX_BATCH_GROUP]mtp_round.MtpRoundState = undefined;
-    var live: [MAX_BATCH_GROUP]*Slot = undefined;
-    var n: usize = 0;
-    defer for (states[0..n], live[0..n]) |*st, slot| {
-        st.deinit(slot.allocator);
-    };
-
-    for (group) |slot| {
-        const gen = &slot.legacy_gen.?;
-        if (try loopGuardTick(sch, slot, gen)) continue;
-        capMtpRoundToThinkBound(gen);
-        const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
-            slot.markError(@errorName(e));
-            continue;
-        };
-        switch (begun) {
-            .open => unreachable,
-            .done => |r| publishMtpResult(sch, slot, gen, r),
-            .verify => |st| {
-                states[n] = st;
-                live[n] = slot;
-                n += 1;
-            },
-        }
-    }
-    if (n == 0) return;
-    if (n == 1) {
-        const gen = &live[0].legacy_gen.?;
-        try gen.mtpRoundVerify(&states[0]);
-        const r = try gen.mtpRoundFinish(live[0].allocator, &states[0]);
-        publishMtpResult(sch, live[0], gen, r);
-        return;
-    }
-
-    const xfm = live[0].model.transformer.?;
-    const s_stream = xfm.s;
-    var width: u32 = 0;
-    for (states[0..n]) |*st| width = @max(width, st.verify_len);
-    const ctxs = try allocator.alloc(*ForwardCtx, n);
-    defer allocator.free(ctxs);
-    const rope_offsets = try allocator.alloc(u32, n);
-    defer allocator.free(rope_offsets);
-    for (live[0..n], 0..) |slot, i| {
-        ctxs[i] = &slot.legacy_gen.?.ctx;
-        rope_offsets[i] = @intCast(slot.moe_seq_offset);
-    }
-    if (!xfm.batchedGdnReady(ctxs)) {
-        // No recurrent state to merge yet: every round solo this tick.
-        for (states[0..n], live[0..n]) |*st, slot| {
-            const gen = &slot.legacy_gen.?;
-            try gen.mtpRoundVerify(st);
-            const r = try gen.mtpRoundFinish(slot.allocator, st);
-            publishMtpResult(sch, slot, gen, r);
-        }
-        return;
-    }
-
-    // [N, width] rows: each verify input right-padded with token 0 (never read past 1+m).
-    const rows_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(rows_vec);
-    var padded: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
-    var padded_n: usize = 0;
-    defer for (padded[0..padded_n]) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    for (states[0..n]) |*st| {
-        const pad: c_int = @intCast(width - st.verify_len);
-        var row = mlx.mlx_array_new();
-        if (pad > 0) {
-            const axes = [_]c_int{1};
-            const low = [_]c_int{0};
-            const high = [_]c_int{pad};
-            const zero = mlx.mlx_array_new_int(0);
-            defer _ = mlx.mlx_array_free(zero);
-            try mlx.check(mlx.mlx_pad(&row, st.verify_input, &axes, 1, &low, 1, &high, 1, zero, "constant", s_stream));
-        } else {
-            try mlx.check(mlx.mlx_array_set(&row, st.verify_input));
-        }
-        padded[padded_n] = row;
-        padded_n += 1;
-        _ = mlx.mlx_vector_array_append_value(rows_vec, row);
-    }
-    var token_arr = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(token_arr);
-    try mlx.check(mlx.mlx_concatenate_axis(&token_arr, rows_vec, 0, s_stream));
-
-    var hidden_last = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(hidden_last);
-    var hidden_all = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(hidden_all);
-    const logits = try xfm.forwardMoeBatchedVerify(token_arr, ctxs, rope_offsets, &hidden_last, &hidden_all);
-    defer _ = mlx.mlx_array_free(logits);
-    // The batched forward moved only its scratch offset; the solo forward would have
-    // advanced every slot by the rows it ran, and the finish rolls back from there.
-    for (live[0..n]) |slot| slot.moe_seq_offset += width;
-
-    const logit_rows = try Transformer.sliceBatchRows(allocator, s_stream, logits, n);
-    defer allocator.free(logit_rows);
-    const last_rows = try Transformer.sliceBatchRows(allocator, s_stream, hidden_last, n);
-    defer allocator.free(last_rows);
-    const all_rows = try Transformer.sliceBatchRows(allocator, s_stream, hidden_all, n);
-    defer allocator.free(all_rows);
-    for (states[0..n], live[0..n], 0..) |*st, slot, i| {
-        st.verify_logits = logit_rows[i];
-        st.new_hidden = last_rows[i];
-        st.verify_hidden_all = all_rows[i];
-        st.verify_len = width;
-        _ = try slot.legacy_gen.?.thinkShiftRows(&st.verify_logits, padded[i]);
-        _ = try slot.legacy_gen.?.penaltyShiftRows(&st.verify_logits, padded[i]);
-    }
-    if (sch.metrics) |m| m.batched_group_size.set(n);
-    for (states[0..n], live[0..n]) |*st, slot| {
-        const gen = &slot.legacy_gen.?;
-        mtpFinishPublish(sch, slot, gen, st);
-    }
+    for (slots) |slot| try runSingleDecodeTick(sch, slot);
 }
 
 fn groupCostSampleComplete(expected: usize, retained: []const u32, published: []const bool) bool {
@@ -921,27 +696,28 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
     try testing.expect(loopStopReason(healthy.items) == null);
 }
 
-test "mtpSubGroupSize fills the verify lane's row budget" {
-    // 7 rows off-NAX: pairs at depth 2, triples at depth 1, four as 2+2, one rounds solo.
-    try testing.expectEqual(@as(usize, 1), mtpSubGroupSize(1, 7));
-    try testing.expectEqual(@as(usize, 2), mtpSubGroupSize(2, 7));
-    try testing.expectEqual(@as(usize, 3), mtpSubGroupSize(3, 7));
-    try testing.expectEqual(@as(usize, 2), mtpSubGroupSize(4, 7));
-    try testing.expectEqual(@as(usize, 3), mtpSubGroupSize(5, 7));
-    try testing.expectEqual(@as(usize, 4), mtpSubGroupSize(9, 16));
-    // The depth each sub-group gets: floor(rows / size) - 1.
-    try testing.expectEqual(@as(u32, 2), 7 / @as(u32, 2) - 1);
-    try testing.expectEqual(@as(u32, 1), 7 / @as(u32, 3) - 1);
+test "only the models with per-slot head state are admitted to the MTP slot groups, whose rounds run solo" {
+    var t: transformer_mod.Transformer = undefined;
+    t.glm5 = null;
+    t.dsv41 = null;
+    t.moe_layers = &.{};
+    t.expert_stream = null;
+    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41", "qwen3_moe", "" }) |model_type| {
+        t.config = .{ .model_type = model_type, .full_attention_interval = 4 };
+        const admitted = t.supportsBatchedGdnDecode() or t.supportsBatchedMimoDecode();
+        try testing.expectEqual(t.config.isQwen4() or t.config.isMimo(), admitted);
+    }
 }
 
 test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP ticks" {
+    if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     var t: transformer_mod.Transformer = undefined;
     var forced = [_]u32{7};
     var tb = mtp_plan.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
     var gen: Generator = undefined;
     gen.sampling = .{ .think_bound = &tb };
     gen.think_closed_by_loop = false;
-    gen.mtp = .{ .qwen4 = &t };
+    gen.mtp = MtpHeadRef.of("qwen4", &t);
     // What commitThoughtClose leaves behind after a head resumed.
     gen.spec_disabled_runtime = false;
     gen.spec_disable_reason = .none;

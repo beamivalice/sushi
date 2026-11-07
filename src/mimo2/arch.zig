@@ -17,7 +17,7 @@ pub const default_arch = true;
 pub const packs = .{}; // slot:packs (S2h)
 pub const flags = .{}; // slot:flags (S2h)
 
-// slot:drafter (S2a)
+pub const drafter = @import("mimo2_drafter.zig");
 
 // slot:sched (S2b)
 

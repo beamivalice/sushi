@@ -2212,3 +2212,45 @@ test "dsv41 prefetch: --ssd-prefetch 0 and the default create no prefetch machin
     try testing.expect(try prefetchAt(dir, 1, 1, streamed));
     try testing.expect(!try prefetchAt(dir, 108, 65, 64 << 20));
 }
+
+test "every generator start path copies the launch round options (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var st = try TinyDsparkNet.init(a, io);
+    defer st.deinit(a);
+    var xfm = try Transformer.init(io, a, st.config, &st.weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    const saved_lookup = generate.mtp_lookup_disabled;
+    const saved_ctx = generate.max_mtp_ctx;
+    defer {
+        generate.mtp_lookup_disabled = saved_lookup;
+        generate.max_mtp_ctx = saved_ctx;
+    }
+    generate.mtp_lookup_disabled = true;
+    generate.max_mtp_ctx = 77;
+    const starts = [_]Generator.InitOptions{ .{}, .{ .skip_lazy_preforward = true }, .{ .dspark_enabled = true } };
+    for (starts) |opts| {
+        var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, opts);
+        defer g.deinit(a);
+        try testing.expect(g.opts.lookup_disabled);
+        try testing.expectEqual(@as(u32, 77), g.opts.max_mtp_ctx);
+    }
+}
+
+test "dsv41 generator: a DFlash round is refused by name, not asserted (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var st = try TinyDsparkNet.init(a, io);
+    defer st.deinit(a);
+    var xfm = try Transformer.init(io, a, st.config, &st.weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, .{});
+    defer g.deinit(a);
+    try testing.expectError(error.DrafterUnsupported, g.nextDflash(a));
+}

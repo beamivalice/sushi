@@ -356,13 +356,7 @@ pub const LoadedModel = struct {
             // Only MiMo's heads are a separately allocated object; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
-            switch (h) {
-                .mimo => |m| {
-                    m.deinit();
-                    self.allocator.destroy(m);
-                },
-                .qwen4, .dsv41 => {}, // in-trunk head, owned by the Transformer
-            }
+            h.destroyHead(self.allocator);
             self.mtp = null;
         }
         if (self.dflash) |d| {
@@ -485,13 +479,7 @@ pub const LoadedModel = struct {
             // Only MiMo's heads are a separately allocated object; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
-            switch (h) {
-                .mimo => |m| {
-                    m.deinit();
-                    self.allocator.destroy(m);
-                },
-                .qwen4, .dsv41 => {}, // in-trunk head, owned by the Transformer
-            }
+            h.destroyHead(self.allocator);
             self.mtp = null;
         }
         if (self.dflash) |d| {

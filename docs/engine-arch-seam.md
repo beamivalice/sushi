@@ -27,7 +27,7 @@ joins `DROPPABLE` when its drop passes.
   move their callers. The arch handle fields (`glm5`, `dsv41`, `qwen4`, ...) stay on `Trunk` for now: callers reach
   them by name, and each arch's S3 stage moves its own.
 - Dispatch is `inline else` over the union, one area file per concern in `src/arch/`: `life` (construction, stream
-  rebind), `forward`, `request`, `admission` (expert-stream traits from the config), and `spec` (the config side:
+  rebind), `forward`, `request`, `admission` (expert-stream traits from the config), `drafter` (the speculative head: [engine-mtp](engine-mtp.md#the-drafter-seam)), and `spec` (the config side:
   `Spec`, the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU
   graphs do not change.
 - `-Darchs=<a,b,...>` (default: every registered arch) builds `Tag`, `Spec` and `Arch` from the listed archs. An

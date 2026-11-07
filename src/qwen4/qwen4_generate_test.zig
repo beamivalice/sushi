@@ -59,7 +59,7 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     // (and of the Transformer) is never read on this path.
     var t: Transformer = undefined;
     t.qwen4_mtp = null;
-    const ref = MtpHeadRef{ .qwen4 = &t };
+    const ref = MtpHeadRef.of("qwen4", &t);
 
     // `--no-mtp`: no head to seed, and setting one must not fault.
     try testing.expect(ref.evSeed() == null);
@@ -211,7 +211,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     // ...and the draft path now only READS it. Same mlx handle => the ask
     // did not rebuild anything (which is what the lazy path did).
     const head_ctx = built.q.w.ctx;
-    const ref = MtpHeadRef{ .qwen4 = &fx.xfm };
+    const ref = MtpHeadRef.of("qwen4", &fx.xfm);
     try testing.expect(ref.canRerankDrafts());
     try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
 
@@ -315,7 +315,7 @@ const MtpChainTestSlot = struct {
         const ctx: ForwardCtx = .{ .cache = &slot.cache, .moe_seq_offset = &slot.off, .ssm_entries = entries, .capture_hidden = null, .vision_embeddings = null };
         slot.gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, 256, .{ .temperature = 0 }, &.{}, .{
             .ctx = ctx,
-            .mtp = .{ .qwen4 = xfm },
+            .mtp = MtpHeadRef.of("qwen4", xfm),
             .mtp_enabled = true,
             .model_has_mtp = true,
             .mtp_depth = depth,
@@ -360,7 +360,6 @@ const MtpChainTestSlot = struct {
             if (open.chain.conf_arrs != null) std.debug.print("[mtp fixture] existing confidence plan={any}\n", .{open.chain.plan});
             try testing.expect(open.chain.conf_arrs == null);
             open.chain.drafts = try a.realloc(open.chain.drafts, depth + 1);
-            open.chain.draft_arrs = try a.realloc(open.chain.draft_arrs, depth + 1);
             open.chain.conf_arrs = try a.alloc(mlx.mlx_array, depth);
             open.chain.plan.m_hi = depth + 1;
             open.chain.plan.tau_ln = 1;
@@ -517,8 +516,8 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
                     try testing.expectEqual(sh.off0, bh.off0);
                     try MtpChainTestSlot.equal(sh.ids, bh.ids, xfm.s, "sh.ids");
                     try MtpChainTestSlot.equal(sh.hidden, bh.hidden, xfm.s, "sh.hidden");
-                    const hs = sg.mtp_cache.?.qwen4StateForBatch();
-                    const hb = gens[i].mtp_cache.?.qwen4StateForBatch();
+                    const hs = sg.mtp_cache.?.as("qwen4").batchState();
+                    const hb = gens[i].mtp_cache.?.as("qwen4").batchState();
                     try testing.expectEqual(hs.meta(), hb.meta());
                     try MtpChainTestSlot.equal(hs.entry.aux_state, hb.entry.aux_state, xfm.s, "hs.entry.aux_state");
                     try MtpChainTestSlot.equal(hs.entry.qsa_pooled, hb.entry.qsa_pooled, xfm.s, "hs.entry.qsa_pooled");
@@ -891,8 +890,8 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
         try testing.expectEqual(rg.next_token_id, cg.next_token_id);
         try testing.expectEqual(ref.off, candidate.off);
         try MtpChainTestSlot.equal(rg.last_hidden, cg.last_hidden, xfm.s, "resumed hidden");
-        const rh = rg.mtp_cache.?.qwen4StateForBatch();
-        const ch = cg.mtp_cache.?.qwen4StateForBatch();
+        const rh = rg.mtp_cache.?.as("qwen4").batchState();
+        const ch = cg.mtp_cache.?.as("qwen4").batchState();
         try testing.expectEqual(rh.meta(), ch.meta());
         try MtpChainTestSlot.equal(rh.entry.aux_state, ch.entry.aux_state, xfm.s, "resumed head keys");
         try MtpChainTestSlot.equal(rh.entry.qsa_pooled, ch.entry.qsa_pooled, xfm.s, "resumed head pool");
@@ -1011,8 +1010,8 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
         try testing.expect(bg.mtp_hist_stash.?.off0 > 0);
         try bg.mtpDetachHead(a, true);
         try rg.mtpDetachHead(a, true);
-        const rh = rg.mtp_cache.?.qwen4StateForBatch();
-        const bh = bg.mtp_cache.?.qwen4StateForBatch();
+        const rh = rg.mtp_cache.?.as("qwen4").batchState();
+        const bh = bg.mtp_cache.?.as("qwen4").batchState();
         try testing.expectEqual(@as(c_int, 1), bh.pos_base);
         try testing.expectEqual(rh.meta(), bh.meta());
         try testing.expectEqualSlices(u32, rg.generated_ids.items, bg.generated_ids.items);
@@ -1044,6 +1043,7 @@ test "a Qwen round below 8192 KV prices widths by the table's realized tokens an
     }
     var prompt: [1000]u32 = @splat(0);
     var gen = Generator{
+        .opts = .{},
         .xfm = &xfm,
         .ctx = undefined,
         .tok = undefined,

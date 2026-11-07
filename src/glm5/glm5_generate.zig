@@ -96,65 +96,12 @@ pub fn restorableCheckpoint(glm: ?*glm5_forward.Request, pos: usize) bool {
     return glm == null or pos % glm5_prefix.pool_size == 0;
 }
 
-// DFlash has different economics from sequential-token drafters: one
-// assistant call proposes the whole block and the M5 NAX verify lane makes
-// wide blocks cheap. Per-draft percentage therefore penalizes block 16
-// even when it is decisively profitable. The stable cross-width signal is
-// accepted drafts per verify round. M5 sweeps put code/tool traffic at
-// 4.4-15.0 accepted/round and the regressing prose/vision class at
-// 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
-// workloads accepting 62-86% remain above it as well.
-// Warmup 8, not 3 (2026-09-03): three rounds tripped on ONE dry opening
-// (llmprobe's 16k rung: 0/3, drafter off for the whole request at 25
-// tok/s; the same prompt restored from cache decoded at 73).
-pub const DFLASH_GATE_WARMUP: u64 = 8;
-/// A DFlash round that costs more per emitted token than this multiple of a serial step is dropped.
-pub const DFLASH_GATE_MARGIN: f32 = 0.05;
-
-/// Accepted drafts per round at which a round of `rows` verifier rows costs one serial step per
-/// token, used while the request's context bucket holds no serial sample. The policy's own cost ladder.
-pub fn dflashBreakEvenAccepted(rows: f32) f32 {
-    return dflash_policy.breakEvenDrafts(rows);
-}
-
-/// Does the request's DFlash yield lose to serial decoding? With a measured serial price (the
-/// round-cost table's cell) the test is ms per emitted token; without one it is the ladder's
-/// break-even yield. Never decided before the warmup rounds.
-pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
-    if (attempted < DFLASH_GATE_WARMUP) return false;
-    if (serial_ms_tok) |serial| {
-        if (std.math.isFinite(serial) and serial > 0) {
-            const emitted: f64 = @floatFromInt(attempted + accepted);
-            return wall_ms / emitted > @as(f64, serial) * (1.0 + DFLASH_GATE_MARGIN);
-        }
-    }
-    const avg = @as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(attempted));
-    return avg < dflashBreakEvenAccepted(rows);
-}
-
-/// The rounds the gate judges: those after the warmup. The warmup's own wall carries one-time costs (graph builds,
-/// first touches of a long context) that would decide a request the steady rounds win.
-pub const DflashGateWindow = struct {
-    open: bool = false,
-    attempted: u64 = 0,
-    accepted: u64 = 0,
-    wall_ms: f64 = 0,
-
-    pub fn shouldDisable(self: *DflashGateWindow, attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
-        if (attempted < DFLASH_GATE_WARMUP) return false;
-        if (!self.open) {
-            self.* = .{ .open = true, .attempted = attempted, .accepted = accepted, .wall_ms = wall_ms };
-            return false;
-        }
-        return dflashGateShouldDisable(attempted - self.attempted, accepted - self.accepted, wall_ms - self.wall_ms, rows, serial_ms_tok);
-    }
-};
-
-/// The serial price a DFlash request is held to: the plain-tick cell at width 0, which this
-/// path's own fallback ticks feed, else the serial row MTP's adaptive serial feeds.
-pub fn dflashSerialPrice(t: *const round_cost.Table, bucket: usize) ?f32 {
-    return t.msPerTok(0, bucket) orelse t.serialMsPerTok(bucket);
-}
+pub const DFLASH_GATE_WARMUP = dflash_policy.DFLASH_GATE_WARMUP;
+pub const DFLASH_GATE_MARGIN = dflash_policy.DFLASH_GATE_MARGIN;
+pub const dflashBreakEvenAccepted = dflash_policy.dflashBreakEvenAccepted;
+pub const dflashGateShouldDisable = dflash_policy.dflashGateShouldDisable;
+pub const DflashGateWindow = dflash_policy.DflashGateWindow;
+pub const dflashSerialPrice = dflash_policy.dflashSerialPrice;
 
 /// Logit biases and the think penalty ride the verifier (`Generator.glmPenalty`).
 pub fn glmDflashEligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool {
@@ -314,7 +261,7 @@ pub const glm_lookup_drafts = 3;
 /// span (`mtp_lookup.STRONG_SUFFIX` tokens of agreement), as a chain in place of the
 /// assistant's tree.
 pub fn glmLookupChain(self: *Generator, allocator: std.mem.Allocator) !?@import("glm5_dflash.zig").Proposal {
-    if (generate.mtp_lookup_disabled or isEosId(self.next_token_id, self.eos_token_ids)) return null;
+    if (self.opts.lookup_disabled or isEosId(self.next_token_id, self.eos_token_ids)) return null;
     const got = (try self.mtpLookupIndex(allocator)).match(self.next_token_id, glm_lookup_drafts);
     const chain = glmLookupProposal(got, self.next_token_id, self.max_tokens -| self.completion_tokens) orelse return null;
     if (self.glm_lookup.rounds == 0) log.info("[glm-dflash] lookup chain engaged: {d} drafts, suffix {d}\n", .{ glm_lookup_drafts, got.?.suffix });
@@ -575,10 +522,8 @@ pub fn glmCaptureOracle(chunk_grid: usize, grid: usize, cap: u32, offset: usize,
 }
 
 test "--no-mtp-lookup: a GLM DFlash2 lookup chain is declined too" {
-    const off = generate.mtp_lookup_disabled;
-    defer generate.mtp_lookup_disabled = off;
-    generate.mtp_lookup_disabled = true;
     var g: Generator = undefined;
+    g.opts = .{ .lookup_disabled = true };
     try testing.expect((try g.glmLookupChain(testing.allocator)) == null);
 }
 

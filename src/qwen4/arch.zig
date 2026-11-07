@@ -17,7 +17,7 @@ pub const Model = *Trunk;
 pub const packs = .{}; // slot:packs (S2h)
 pub const flags = .{}; // slot:flags (S2h)
 
-// slot:drafter (S2a)
+pub const drafter = @import("qwen4_drafter.zig");
 
 // slot:sched (S2b)
 

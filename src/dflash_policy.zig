@@ -6,6 +6,7 @@
 //! The confidence calibration and the row choice follow mlx-serve's `dflash_policy.zig`
 //! (https://github.com/ddalcu/mlx-serve, MIT); the cost ladder is Qwen3.8-Flash-Next's.
 const std = @import("std");
+const round_cost = @import("round_cost.zig");
 
 /// t1 plus the drafts of the widest block a drafter serves.
 pub const MAX_ROWS: u32 = 16;
@@ -191,6 +192,66 @@ pub fn pickRows(calib: *const Calibration, conf: []const f32, min: u32, max: u32
 }
 
 const testing = std.testing;
+
+// DFlash has different economics from sequential-token drafters: one
+// assistant call proposes the whole block and the M5 NAX verify lane makes
+// wide blocks cheap. Per-draft percentage therefore penalizes block 16
+// even when it is decisively profitable. The stable cross-width signal is
+// accepted drafts per verify round. M5 sweeps put code/tool traffic at
+// 4.4-15.0 accepted/round and the regressing prose/vision class at
+// 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
+// workloads accepting 62-86% remain above it as well.
+// Warmup 8, not 3 (2026-09-03): three rounds tripped on ONE dry opening
+// (llmprobe's 16k rung: 0/3, drafter off for the whole request at 25
+// tok/s; the same prompt restored from cache decoded at 73).
+pub const DFLASH_GATE_WARMUP: u64 = 8;
+/// A DFlash round that costs more per emitted token than this multiple of a serial step is dropped.
+pub const DFLASH_GATE_MARGIN: f32 = 0.05;
+
+/// Accepted drafts per round at which a round of `rows` verifier rows costs one serial step per
+/// token, used while the request's context bucket holds no serial sample. The policy's own cost ladder.
+pub fn dflashBreakEvenAccepted(rows: f32) f32 {
+    return breakEvenDrafts(rows);
+}
+
+/// Does the request's DFlash yield lose to serial decoding? With a measured serial price (the
+/// round-cost table's cell) the test is ms per emitted token; without one it is the ladder's
+/// break-even yield. Never decided before the warmup rounds.
+pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
+    if (attempted < DFLASH_GATE_WARMUP) return false;
+    if (serial_ms_tok) |serial| {
+        if (std.math.isFinite(serial) and serial > 0) {
+            const emitted: f64 = @floatFromInt(attempted + accepted);
+            return wall_ms / emitted > @as(f64, serial) * (1.0 + DFLASH_GATE_MARGIN);
+        }
+    }
+    const avg = @as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(attempted));
+    return avg < dflashBreakEvenAccepted(rows);
+}
+
+/// The rounds the gate judges: those after the warmup. The warmup's own wall carries one-time costs (graph builds,
+/// first touches of a long context) that would decide a request the steady rounds win.
+pub const DflashGateWindow = struct {
+    open: bool = false,
+    attempted: u64 = 0,
+    accepted: u64 = 0,
+    wall_ms: f64 = 0,
+
+    pub fn shouldDisable(self: *DflashGateWindow, attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
+        if (attempted < DFLASH_GATE_WARMUP) return false;
+        if (!self.open) {
+            self.* = .{ .open = true, .attempted = attempted, .accepted = accepted, .wall_ms = wall_ms };
+            return false;
+        }
+        return dflashGateShouldDisable(attempted - self.attempted, accepted - self.accepted, wall_ms - self.wall_ms, rows, serial_ms_tok);
+    }
+};
+
+/// The serial price a DFlash request is held to: the plain-tick cell at width 0, which this
+/// path's own fallback ticks feed, else the serial row MTP's adaptive serial feeds.
+pub fn dflashSerialPrice(t: *const round_cost.Table, bucket: usize) ?f32 {
+    return t.msPerTok(0, bucket) orelse t.serialMsPerTok(bucket);
+}
 
 test "ladder: priced from the measured forward and the fixed round cost, never cheaper for more rows" {
     const c = ladder();

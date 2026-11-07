@@ -21,8 +21,35 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 | `src/round_cost.zig` | Measured per-model/width/KV-bucket spec round-cost table (`Transformer.round_cost`) |
 | `src/mtp_lookup.zig` | Prompt lookup inside the MTP round: the committed-context index and its gate |
 | `src/generate.zig` | MTP entry, `commitForcedTokens` |
+| `src/arch/drafter.zig` | the `Drafter` union (`MtpHeadRef`) and its history cache (`MtpCacheRef`): the head operations, answered by each arch's `<arch>_drafter.zig` |
+| `src/spec_types.zig` | what the round, the policy and the drafters share so none imports `generate.zig` or `scheduler.zig`: `RoundOpts`, `EvSeed`, `Kind`, `CommittedArgmax`, `verifyArgmax`, `verifyRows2d`, `isEosId`, `readEnvBool` |
 | `src/mtp_policy.zig` | adaptive serial/MTP, regime, EV plan and cost table, depth caps (`Generator` methods) |
 | `src/mtp_round.zig` | round chain build and dispatch, batched accept graphs, serial ticks, group verify (`Generator` methods) |
+
+## The drafter seam
+
+- `Drafter` (`generate.MtpHeadRef`) wraps a union the registry builds: one prong per registered arch whose
+  `drafter` declares a `Head` (Flash-Next's in-checkpoint head, MiMo's trained heads, DeepSeek's DSpark, which has
+  no head to step). `Drafter.Cache` (`MtpCacheRef`) is the per-request committed history of the arches that
+  declare a `Cache`. Each operation (`forward`, `appendHistory`, `canRerankDrafts`, `draftSelect`, `draftShortlist`,
+  `costProfile`, `evSeed`, `setEvSeed`, `moduleOwned`, `makeCache`, `destroyHead`) is answered by the arch's
+  `src/<arch>/<arch>_drafter.zig`, published as `drafter` in its `arch.zig`; an operation the module omits has the
+  default stated on the method (no step, no shortlist, `generic` cost profile). `arch/drafter.zig` imports no arch
+  folder. Shared code asks `kind()` (`mtp`, `dspark`), `batchesHeadRows()` and the cache's `positionDrift`,
+  `reseedAfterForcedCommit` and `rebuiltFromTail`, never an arch.
+- A DFlash2 round is `Generator.nextDflash`, which calls the loaded arch's `drafter.nextDflash`: GLM's native round
+  (`glm5_generate.nextGlmDflash`), or `dflash_round.zig`, the generic round Flash-Next and MiMo list. An arch whose
+  `kinds` lacks `.dflash2` refuses a DFlash sidecar at load (`DrafterUnsupported`) and the round returns the same
+  error. DSpark rounds are `dsv41_drafter.nextDspark`. The gate every block drafter shares (`DFLASH_GATE_WARMUP`,
+  `DflashGateWindow`, `dflashSerialPrice`) is in `dflash_policy.zig`.
+- The launch settings a round reads (`--no-mtp-lookup`, `--max-mtp-ctx`) are copied into `Generator.opts`
+  (`spec_types.RoundOpts`, a field every start path must set) when a request starts; no round reads
+  `generate.mtp_lookup_disabled` or `generate.max_mtp_ctx`.
+- Every MTP slot that reaches `mtp_tick.runMtpGroups` is Flash-Next or MiMo, and both run their rounds solo (a MiMo
+  verify keeps a row's decode arithmetic only in its own forward; Flash-Next verify rows are expert bytes), so the
+  group is a loop of solo ticks. The planner's batched head tick (`tryPlannerTick`) is the only grouped verify.
+- A round's draft and history buffers are bounded by `MAX_DEPTH` and live on the stack; a chain deeper than that
+  is `MtpDepthRange`.
 
 ## The head
 

@@ -3511,6 +3511,7 @@ test "upstream bugfix: constrained logprobs describe the returned token before m
     const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"boolean\"}", .{});
     defer parsed.deinit();
     var gen = Generator{
+        .opts = .{},
         .xfm = &xfm,
         .ctx = undefined,
         .tok = undefined,

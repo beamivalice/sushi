@@ -308,7 +308,7 @@ pub fn mtpCapable(lm: *LoadedModel) bool {
 
 /// DSpark verifies each row under that row's grammar mask, so a constrained request may speculate with it.
 pub fn rowMaskedDrafter(lm: *LoadedModel) bool {
-    return if (lm.mtp) |head| head == .dsv41 else false;
+    return if (lm.mtp) |head| head.kind() == .dspark else false;
 }
 
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once

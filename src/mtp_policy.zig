@@ -2,6 +2,7 @@ const std = @import("std");
 const chip_mod = @import("chip.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const generate_mod = @import("generate.zig");
+const spec_types = @import("spec_types.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const io_util = @import("io_util.zig");
@@ -14,7 +15,7 @@ const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
 const MtpWidthTrial = round_cost.TrialSchedule;
 const mtpRoundOff0 = Generator.mtpRoundOff0;
-const readEnvBool = generate_mod.readEnvBool;
+const readEnvBool = spec_types.readEnvBool;
 const testing = std.testing;
 
 /// Model-level twin of `mtpAdaptiveArchEligible`: only the in-checkpoint heads were
@@ -816,25 +817,14 @@ pub fn mtpAdaptiveSerialEnabled() bool {
 
 /// Drift between the head's position bookkeeping and what its next forward demands
 /// (`pos_offset == pos_base + seq_offset`; `seq_offset == 0` re-seeds). 0 = in sync.
-pub fn mtpHeadPositionDrift(pos_base: i64, seq_offset: usize, next_pos_offset: i64) i64 {
-    if (seq_offset == 0) return 0;
-    return next_pos_offset - (pos_base + @as(i64, @intCast(seq_offset)));
-}
+pub const mtpHeadPositionDrift = spec_types.headPositionDrift;
 
 /// The drift the next round would hit. A serial block advances the trunk while the head's
 /// `seq_offset` stays put. Null = no head state.
 pub fn mtpHeadDriftNow(self: *const Generator) ?i64 {
     if (self.mtp_cache == null) return null;
     const mc = &self.mtp_cache.?;
-    return switch (mc.*) {
-        .mimo => 0,
-        .qwen4 => |r| blk: {
-            r.t.qwen4MtpActivate(r.st);
-            const m = &(r.t.qwen4_mtp orelse break :blk 0);
-            const off0 = mtpRoundOff0(self.mtp_hist_stash, mc.step());
-            break :blk mtpHeadPositionDrift(@intCast(m.pos_base), m.seq_offset, @intCast(off0 + 1));
-        },
-    };
+    return mc.positionDrift(mtpRoundOff0(self.mtp_hist_stash, mc.step()));
 }
 
 /// May this request resume MTP after a serial block? An M-RoPE turn ropes the head at an
@@ -881,13 +871,13 @@ pub fn mtpMaybeReleaseModuleHead(self: *Generator) void {
 
 /// The heads the adaptive serial switch was calibrated for: qwen4_exp's and MiMo's; DeepSeek's
 /// DSpark has a different verify surface. Not `moduleOwned()`: different question.
-pub fn mtpAdaptiveHeadEligible(tag: std.meta.Tag(MtpHeadRef)) bool {
-    return tag == .qwen4 or tag == .mimo;
+pub fn mtpAdaptiveHeadEligible(kind: spec_types.Kind) bool {
+    return kind == .mtp;
 }
 
 pub fn mtpAdaptiveArchEligible(self: *const Generator) bool {
     const head = self.mtp orelse return false;
-    return mtpAdaptiveHeadEligible(std.meta.activeTag(head));
+    return mtpAdaptiveHeadEligible(head.kind());
 }
 
 pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
@@ -2808,10 +2798,11 @@ test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is t
 }
 
 test "S21: a to_serial on a per-request head is not sticky; the release stays a one-shot" {
+    if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     const G = Generator;
     // The qwen4 head keeps per-request state now (`Qwen4MtpState`), so a serial switch
     // no longer has to give the module back.
-    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
+    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef.of("qwen4", undefined)));
 
     var a = MtpAdaptive{};
     try testing.expectEqual(MtpAdaptiveAction.to_serial, a.round(0, 3, .serial, 1));
@@ -2836,8 +2827,9 @@ test "S21: a to_serial on a per-request head is not sticky; the release stays a 
 }
 
 test "S21: a head that is not module-owned keeps its re-arm, and nothing about it changes" {
+    if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     const G = Generator;
-    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
+    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef.of("qwen4", undefined)));
     try testing.expect(!G.stickyOnSerialSwitch(null));
 
     var b = MtpAdaptive{};
@@ -2978,9 +2970,9 @@ test "characterization: a sidecar boot's width-trial SCHEDULE re-reads its perio
 
 test "mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, DSpark does not" {
     const G = Generator;
-    try testing.expect(G.mtpAdaptiveHeadEligible(.qwen4));
-    try testing.expect(G.mtpAdaptiveHeadEligible(.mimo));
-    try testing.expect(!G.mtpAdaptiveHeadEligible(.dsv41));
+    inline for (.{ .{ "qwen4", true }, .{ "mimo2", true }, .{ "dsv41", false } }) |c| {
+        if (comptime MtpHeadRef.has(c[0])) try testing.expectEqual(c[1], G.mtpAdaptiveHeadEligible(MtpHeadRef.of(c[0], undefined).kind()));
+    }
 }
 
 test "mtpAdaptiveMinKvFor: MiMo's switch starts at 64k, qwen4's at 32k" {

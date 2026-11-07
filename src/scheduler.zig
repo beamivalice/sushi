@@ -3555,7 +3555,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     );
     // deepseek_v41's head is DSpark: no head cache, no hidden capture; the model holds its own state.
     const use_mtp = wiring.use_mtp;
-    const use_dspark = use_mtp and if (slot.mtp) |h| h == .dsv41 else false;
+    const use_dspark = use_mtp and if (slot.mtp) |h| h.kind() == .dspark else false;
     const use_head_mtp = use_mtp and !use_dspark;
     const use_dflash = wiring.use_dflash or glm5_rows_tick.glmNativeDflashArmed(slot.model.config.?.isGlm5(), slot.enable_drafter, slot.dflash != null, slot.sampling, slot.logprobs_n);
     log.debug("[spec-wiring] mtp={} dflash={} (slot: drafter_flag={} dflash_handle={})\n", .{
@@ -5555,6 +5555,7 @@ test "retained position: a padded row can never take the full-accept arm" {
 }
 
 test "single MTP slot reaches the round entry through runDecodeTick" {
+    if (comptime !@import("arch/drafter.zig").Drafter.has("mimo2") or !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     try mlx.requireGpu();
     var xfm: Transformer = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
@@ -5564,8 +5565,8 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.generated_ids = .empty;
     gen.loop_guard_start = 0;
     gen.think_closed_by_loop = false;
-    gen.mtp = .{ .qwen4 = &xfm };
-    gen.mtp_cache = .{ .mimo = undefined };
+    gen.mtp = generate_mod.MtpHeadRef.of("qwen4", &xfm);
+    gen.mtp_cache = generate_mod.MtpCacheRef.of("mimo2", undefined);
     gen.has_last_hidden = true;
     gen.dflash = null;
     gen.done = false;

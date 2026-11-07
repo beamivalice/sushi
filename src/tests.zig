@@ -10,6 +10,7 @@ pub const kld = @import("kld.zig");
 pub const imatrix = @import("imatrix.zig");
 pub const transformer = @import("transformer.zig");
 
+const registry = @import("arch/registry.zig");
 const expert_stream = @import("expert_stream.zig");
 const expert_bf16_kernels = @import("expert_bf16_kernels.zig");
 
@@ -18,7 +19,7 @@ test {
     _ = expert_bf16_kernels;
     _ = @import("mimo2/mimo_quant_test.zig");
     _ = @import("mimo2/mimo_config.zig");
-    _ = @import("mimo2/mimo_generate_test.zig");
+    if (comptime @hasField(registry.Tag, "mimo2")) _ = @import("mimo2/mimo_generate_test.zig");
     _ = @import("expert_io.zig");
     _ = @import("imatrix.zig");
     _ = @import("hidden_capture.zig");
@@ -124,7 +125,7 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("qwen4/qwen4_exp.zig");
-    _ = @import("qwen4/qwen4_generate_test.zig");
+    if (comptime @hasField(registry.Tag, "qwen4")) _ = @import("qwen4/qwen4_generate_test.zig");
     _ = @import("tokenizer.zig");
     _ = @import("dsv41/tokenizer_deepseek.zig");
     _ = @import("tokenize_cache.zig");
@@ -204,7 +205,7 @@ test {
     _ = @import("slot_admission.zig");
     _ = @import("vision_queue.zig");
     _ = @import("model_load.zig");
-    _ = @import("mimo2/mimo_scheduler_test.zig");
+    if (comptime @hasField(registry.Tag, "mimo2")) _ = @import("mimo2/mimo_scheduler_test.zig");
     _ = @import("dsv41/dsv41_thought_point.zig");
     _ = @import("glm5/glm5_rows_tick.zig");
     _ = @import("kld.zig");
@@ -226,6 +227,8 @@ test {
     _ = @import("arch_host.zig");
     _ = @import("arch_host_stub.zig");
     _ = @import("arch/registry.zig");
+    _ = @import("arch/drafter.zig");
+    _ = @import("qwen4/qwen4_drafter.zig");
     _ = @import("arch/spec.zig");
     _ = @import("arch/life.zig");
     _ = @import("arch/forward.zig");

@@ -6,6 +6,7 @@ const model_mod = @import("../model.zig");
 const mtp_lookup = @import("../mtp_lookup.zig");
 const mtp_mod = @import("../mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
+const mimo_drafter = @import("mimo2_drafter.zig");
 const think_penalty = @import("../think_penalty.zig");
 const logit_bias = @import("../logit_bias.zig");
 const Transformer = transformer_mod.Transformer;
@@ -45,7 +46,7 @@ test "mtpEvPlanFor: MiMo's surface drafts one on prose and three on code, where 
 
 test "the MiMo EXL3 round-cost surface serves every KV width, kv6 included, and other layouts stay generic" {
     var xfm: Transformer = undefined;
-    const head = MtpHeadRef{ .mimo = undefined };
+    const head = MtpHeadRef.of("mimo2", undefined);
     const kv = transformer_mod.KVQuantConfig;
     xfm.config = .{ .expert_layout = .exl3_k4 };
     for ([_]kv{ kv.dense, kv.affine(4), kv.affine(6), kv.affine(8) }) |width| {
@@ -202,7 +203,7 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     xfm.mtp_depth_free = Generator.mtpVerifyDraftsMax(true);
     var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want + 16, greedy, &.{}, .{
         .mtp_enabled = true,
-        .mtp = .{ .mimo = &head },
+        .mtp = MtpHeadRef.of("mimo2", &head),
         .model_has_mtp = true,
         .mtp_depth = Generator.mtpVerifyDraftsMax(true),
     });
@@ -297,7 +298,7 @@ test "mimoStepOut: a failed lm_head projection frees the step's arrays once each
     StepOutFrees.n = 0;
     defer StepOutFrees.releaseAll();
     const last = mlx.mlx_array_new_int(7);
-    try testing.expectError(error.InjectedFault, MtpHeadRef.mimoStepOut(Failing{}, StepOutFrees.record, last, 1, .logits));
+    try testing.expectError(error.InjectedFault, mimo_drafter.stepOut(Failing{}, StepOutFrees.record, last, 1, .logits));
     try testing.expectEqual(@as(usize, 1), StepOutFrees.count(last.ctx));
     try testing.expectEqual(@as(usize, 2), StepOutFrees.n);
 }
@@ -311,14 +312,14 @@ test "mimoStepOut: logits consume the row once; a rerank step hands it over" {
     StepOutFrees.n = 0;
     defer StepOutFrees.releaseAll();
     const last = mlx.mlx_array_new_int(7);
-    const out = try MtpHeadRef.mimoStepOut(Ok{}, StepOutFrees.record, last, 2, .logits);
+    const out = try mimo_drafter.stepOut(Ok{}, StepOutFrees.record, last, 2, .logits);
     defer _ = mlx.mlx_array_free(out.logits);
     defer _ = mlx.mlx_array_free(out.hidden_next);
     try testing.expectEqual(@as(usize, 1), StepOutFrees.count(last.ctx));
     try testing.expect(out.rerank_x.ctx == null);
 
     const row = mlx.mlx_array_new_int(8);
-    const mixed = try MtpHeadRef.mimoStepOut(Ok{}, StepOutFrees.record, row, 2, .mixed);
+    const mixed = try mimo_drafter.stepOut(Ok{}, StepOutFrees.record, row, 2, .mixed);
     defer _ = mlx.mlx_array_free(mixed.hidden_next);
     defer _ = mlx.mlx_array_free(mixed.rerank_x);
     try testing.expectEqual(@as(usize, 0), StepOutFrees.count(row.ctx));

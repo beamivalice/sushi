@@ -2,6 +2,7 @@ const std = @import("std");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const expectError = @import("test_expect.zig").expectError;
 const generate_mod = @import("generate.zig");
+const spec_types = @import("spec_types.zig");
 const mtp_policy = @import("mtp_policy.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const io_util = @import("io_util.zig");
@@ -16,16 +17,18 @@ const mtp_plan = @import("mtp_plan.zig");
 const round_cost = @import("round_cost.zig");
 const sampler = @import("sampler.zig");
 const transformer_mod = @import("transformer.zig");
-const CommittedArgmax = generate_mod.CommittedArgmax;
+const CommittedArgmax = spec_types.CommittedArgmax;
 const DrafterStepResult = Generator.DrafterStepResult;
 const ForwardCtx = transformer_mod.ForwardCtx;
 const Generator = generate_mod.Generator;
+const MtpHeadRef = generate_mod.MtpHeadRef;
+const MtpCacheRef = generate_mod.MtpCacheRef;
 const MTP_EV_WARMUP_ROUNDS = mtp_policy.MTP_EV_WARMUP_ROUNDS;
 const MtpCostSource = mtp_policy.MtpCostSource;
 const MtpRoundPlan = mtp_policy.MtpRoundPlan;
 const SubLap = mtp_policy.SubLap;
 const Transformer = transformer_mod.Transformer;
-const isEosId = generate_mod.isEosId;
+const isEosId = spec_types.isEosId;
 const mtpAdaptiveEnabled = Generator.mtpAdaptiveEnabled;
 const mtpAdaptiveSerialEnabled = Generator.mtpAdaptiveSerialEnabled;
 const mtpAdaptiveSerialTickFor = Generator.mtpAdaptiveSerialTickFor;
@@ -35,8 +38,12 @@ const mtpPinnedDepth = Generator.mtpPinnedDepth;
 const mtpTraceEnabled = Generator.mtpTraceEnabled;
 const mtpVerifyDraftsMax = Generator.mtpVerifyDraftsMax;
 const testing = std.testing;
-const verifyArgmax = generate_mod.verifyArgmax;
-const verifyRows2d = generate_mod.verifyRows2d;
+
+comptime {
+    std.debug.assert(mtp_lookup.MAX_DRAFT_STRONG <= mtp_mod.MAX_DEPTH);
+}
+const verifyArgmax = spec_types.verifyArgmax;
+const verifyRows2d = spec_types.verifyRows2d;
 const tokenizer_mod = @import("tokenizer.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 
@@ -46,7 +53,7 @@ var mtp_trace_sync_env: ?bool = null;
 /// = log p_head(draft). Two vocab reductions on the head's own (draft-head)
 /// logits — must be built BEFORE the caller frees the logits handle (lazy
 /// graphs hold their inputs internally). Returns a `[1]`-shaped lazy array.
-fn draftConfidenceGraph(logits: mlx.mlx_array, draft_id: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn draftConfidenceGraph(logits: mlx.mlx_array, draft_id: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var lse = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(lse);
     try mlx.check(mlx.mlx_logsumexp_axis(&lse, logits, -1, false, s));
@@ -151,12 +158,11 @@ pub fn mtpSamplingDraw(self: *Generator, params: sampler.SamplingParams) sampler
 
 /// Allocate an empty draft chain for `plan` (nothing built yet).
 pub fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !MtpPreDraft {
+    if (plan.m_hi > mtp_mod.MAX_DEPTH) return error.MtpDepthRange;
     const consider_ext = plan.m_hi > plan.m_lo;
     const sharp_drafts = !sampler.isGreedyTemperature(self.mtpDraftSampling(0).temperature);
     const drafts = try allocator.alloc(u32, plan.m_hi);
     errdefer allocator.free(drafts);
-    const draft_arrs = try allocator.alloc(mlx.mlx_array, plan.m_hi);
-    errdefer allocator.free(draft_arrs);
     const conf_arrs: ?[]mlx.mlx_array = if (consider_ext) try allocator.alloc(mlx.mlx_array, plan.m_lo) else null;
     errdefer if (conf_arrs) |slots| allocator.free(slots);
     const q_probs: ?[]mlx.mlx_array = if (sharp_drafts) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null;
@@ -169,7 +175,7 @@ pub fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRou
         .t1 = t1,
         .t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 1, .int32),
         .drafts = drafts,
-        .draft_arrs = draft_arrs,
+        .draft_arrs = undefined,
         .n_drafted = 0,
         .conf_arrs = conf_arrs,
         .n_conf = 0,
@@ -194,7 +200,7 @@ pub fn acceptPrefixFor(self: *const Generator, lookup: bool) mtp_acceptance.Pref
 /// May a lookup stand in for this request's next MTP chain? Not for a batched head or a
 /// planner-owned round, which builds every chain as a group.
 pub fn mtpLookupAllowed(self: *const Generator) bool {
-    if (generate_mod.mtp_lookup_disabled) return false;
+    if (self.opts.lookup_disabled) return false;
     if (self.mtp == null or self.mtp_batch_head) return false;
     return !(group_planner.enabled() and self.mtp_planner_owned);
 }
@@ -295,10 +301,9 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
     const drafts = try allocator.alloc(u32, k);
     errdefer allocator.free(drafts);
     @memcpy(drafts, got.?.draft[0..k]);
-    const draft_arrs = try allocator.alloc(mlx.mlx_array, k);
-    errdefer allocator.free(draft_arrs);
+    var draft_arrs: [mtp_mod.MAX_DEPTH]mlx.mlx_array = undefined;
     const one = [_]c_int{1};
-    for (drafts, draft_arrs) |d, *arr| {
+    for (drafts, draft_arrs[0..k]) |d, *arr| {
         const v: i32 = @intCast(d);
         arr.* = mlx.mlx_array_new_data(&v, &one, 1, .int32);
     }
@@ -649,140 +654,17 @@ pub fn mtpBatchHeadPosition(pos_base: c_int, seq_offset: usize) c_int {
 pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32) !void {
     if (gens.len == 0) return;
     std.debug.assert(gens.len == chains.len);
-    const xfm = gens[0].xfm;
     var any_mrope = false;
-    var all_qwen4 = true;
+    var all_batched = true;
     for (gens) |g| {
         if (g.mtpMropeContext() != null) any_mrope = true;
-        switch (g.mtp.?) {
-            .qwen4 => {},
-            .mimo, .dsv41 => all_qwen4 = false,
-        }
+        if (!g.mtp.?.batchesHeadRows()) all_batched = false;
     }
-    if (!all_qwen4 or any_mrope or gens.len == 1) {
+    if (!all_batched or any_mrope or gens.len == 1) {
         for (gens, chains) |g, *c| try g.mtpChainBuild(c, from, to);
         return;
     }
-    const n = gens.len;
-    var i: u32 = from;
-    while (i < to) : (i += 1) {
-        var rows: [32]transformer_mod.Transformer.Qwen4MtpBatchRow = undefined;
-        var merged_ids: [32]mlx.mlx_array = undefined;
-        var merged_hidden: [32]mlx.mlx_array = undefined;
-        var own_ids: [32]bool = @splat(false);
-        var own_h: [32]bool = @splat(false);
-        for (merged_ids[0..n], 0..) |*p, k| {
-            p.* = .{ .ctx = null };
-            merged_hidden[k] = .{ .ctx = null };
-        }
-        defer for (0..n) |k| {
-            if (own_ids[k] and merged_ids[k].ctx != null) _ = mlx.mlx_array_free(merged_ids[k]);
-            if (own_h[k] and merged_hidden[k].ctx != null) _ = mlx.mlx_array_free(merged_hidden[k]);
-        };
-        var modes: [32]bool = undefined;
-        for (gens, chains, 0..) |g, *c, row| modes[row] = mtpRowRerankMode(g, c, i);
-        const use_rerank = modes[0];
-        const project: transformer_mod.Transformer.Qwen4MtpProject = if (use_rerank) .mixed_last_row else .last_row;
-        for (gens, chains, 0..) |g, *c, k| {
-            const qref = g.mtp_cache.?.qwen4;
-            const st = g.mtp_cache.?.qwen4StateForBatch();
-            const h_prev_arg: mlx.mlx_array = if (c.h_chain) |h| h else g.last_hidden;
-            const prev_tok_arr: mlx.mlx_array = if (i == 0) c.t1_arr else c.draft_arrs[i - 1];
-            if (i == 0 and g.mtp_hist_stash != null) {
-                var stash = g.mtp_hist_stash.?;
-                g.mtp_hist_stash = null;
-                defer stash.deinit();
-                try qref.t.qwen4MtpTruncateOn(st, stash.off0);
-                var mids = mlx.mlx_array_new();
-                var mh = mlx.mlx_array_new();
-                {
-                    const idv = mlx.mlx_vector_array_new();
-                    defer _ = mlx.mlx_vector_array_free(idv);
-                    _ = mlx.mlx_vector_array_append_value(idv, stash.ids);
-                    _ = mlx.mlx_vector_array_append_value(idv, prev_tok_arr);
-                    try mlx.check(mlx.mlx_concatenate_axis(&mids, idv, 0, xfm.s));
-                    const hv = mlx.mlx_vector_array_new();
-                    defer _ = mlx.mlx_vector_array_free(hv);
-                    _ = mlx.mlx_vector_array_append_value(hv, stash.hidden);
-                    _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
-                    try mlx.check(mlx.mlx_concatenate_axis(&mh, hv, 1, xfm.s));
-                }
-                merged_ids[k] = mids;
-                merged_hidden[k] = mh;
-                own_ids[k] = true;
-                own_h[k] = true;
-            } else {
-                merged_ids[k] = prev_tok_arr;
-                merged_hidden[k] = h_prev_arg;
-            }
-            rows[k] = .{
-                .st = st,
-                .stream = merged_hidden[k],
-                .token_ids = merged_ids[k],
-                .pos_offset = mtpBatchHeadPosition(st.pos_base, st.seq_offset),
-            };
-        }
-        const outs = try xfm.qwen4MtpForwardBatched(rows[0..n], project, to);
-        defer {
-            for (outs) |out| {
-                if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
-                if (out.stream.ctx != null) _ = mlx.mlx_array_free(out.stream);
-                if (out.mixed.ctx != null) _ = mlx.mlx_array_free(out.mixed);
-            }
-            xfm.allocator.free(outs);
-        }
-        var mixed_parts: [32]mlx.mlx_array = undefined;
-        if (use_rerank) {
-            for (outs, 0..) |o, k| mixed_parts[k] = o.mixed;
-            const mvec = mlx.mlx_vector_array_new_data(mixed_parts[0..n].ptr, n);
-            defer _ = mlx.mlx_vector_array_free(mvec);
-            var stacked_x = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(stacked_x);
-            try mlx.check(mlx.mlx_concatenate_axis(&stacked_x, mvec, 0, xfm.s));
-            var any_sampled = false;
-            for (chains) |*c| {
-                if (c.q_probs != null) any_sampled = true;
-            }
-            if (any_sampled) {
-                try mtpGroupSampledDrafts(gens, chains, stacked_x, i);
-            } else {
-                const ids = try xfm.qwen4DraftSelectBatched(stacked_x, gens[0].sampling.suppress_mask);
-                defer _ = mlx.mlx_array_free(ids);
-                for (chains, 0..) |*c, k| {
-                    const k_c: c_int = @intCast(k);
-                    var one = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_slice(&one, ids, &[_]c_int{ k_c, 0 }, 2, &[_]c_int{ k_c + 1, 1 }, 2, &[_]c_int{ 1, 1 }, 2, xfm.s));
-                    c.draft_arrs[i] = one;
-                }
-            }
-            for (chains, 0..) |*c, k| {
-                c.n_drafted = i + 1;
-                if (c.h_chain) |h_old| _ = mlx.mlx_array_free(h_old);
-                c.h_chain = outs[k].stream;
-                outs[k].stream = .{ .ctx = null };
-            }
-        } else {
-            for (gens, chains, 0..) |g, *c, k| {
-                const draft_sampling = g.mtpDraftSampling(i);
-                if (c.q_probs) |slots| {
-                    const prop = try sampler.logitsStepProposal(outs[k].logits, g.mtpSamplingDraw(draft_sampling), xfm.s);
-                    slots[i] = prop.q;
-                    c.n_qp = i + 1;
-                    c.draft_arrs[i] = prop.id;
-                } else {
-                    c.draft_arrs[i] = sampler.sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
-                }
-                c.n_drafted = i + 1;
-                if (c.conf_arrs != null and i < c.plan.m_lo) {
-                    c.conf_arrs.?[i] = try draftConfidenceGraph(outs[k].logits, c.draft_arrs[i], xfm.s);
-                    c.n_conf = i + 1;
-                }
-                if (c.h_chain) |h_old| _ = mlx.mlx_array_free(h_old);
-                c.h_chain = outs[k].stream;
-                outs[k].stream = .{ .ctx = null };
-            }
-        }
-    }
+    try gens[0].mtp.?.buildBatchedChains(gens, chains, from, to);
 }
 
 pub fn mtpBatchedExactGraph(
@@ -1259,14 +1141,9 @@ pub fn mtpSerialExitAfterForced(planner_owned: bool) MtpSerialExit {
 pub fn mtpResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !bool {
     if (self.mtp == null or self.mtp_cache == null or !self.mtpAdaptiveHeadMayResume()) return false;
     try self.mtpDetachHead(allocator, false);
-    switch (self.mtp_cache.?) {
-        .qwen4 => |r| {
-            if (self.mtp_hist_stash) |*st| st.deinit();
-            self.mtp_hist_stash = null;
-            r.t.qwen4MtpActivate(r.st);
-            try r.t.qwen4MtpReset();
-        },
-        .mimo => {},
+    if (try self.mtp_cache.?.reseedAfterForcedCommit()) {
+        if (self.mtp_hist_stash) |*st| st.deinit();
+        self.mtp_hist_stash = null;
     }
     self.spec_disabled_runtime = false;
     self.spec_disable_reason = .none;
@@ -1432,11 +1309,11 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
     // `--max-mtp-ctx`, checked at the top of the round against prompt + generated. Sticky
     // (context only grows), routed through the same `spec_disabled_runtime` fallback.
     if (!self.spec_disabled_runtime and
-        !mtp_mod.mtpCtxWithinLimit(generate_mod.max_mtp_ctx, self.mtpKvLen()))
+        !mtp_mod.mtpCtxWithinLimit(self.opts.max_mtp_ctx, self.mtpKvLen()))
     {
         log.info(
             "  mtp=off (ctx {d} > --max-mtp-ctx {d})\n",
-            .{ self.mtpKvLen(), generate_mod.max_mtp_ctx },
+            .{ self.mtpKvLen(), self.opts.max_mtp_ctx },
         );
         self.spec_disabled_runtime = true;
         self.spec_disable_reason = .max_ctx;
@@ -1639,6 +1516,7 @@ pub fn mtpRoundAfterChain(
         }
     }
     const m: u32 = chain.m;
+    if (m > mtp_mod.MAX_DEPTH) return error.MtpDepthRange;
     // Chain complete — release the chain hidden (only chunk B needed it).
     if (chain.h_chain) |h| {
         _ = mlx.mlx_array_free(h);
@@ -1671,12 +1549,12 @@ pub fn mtpRoundAfterChain(
     var verify_input = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(verify_input);
     {
-        const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
+        var drafts_2d_buf: [mtp_mod.MAX_DEPTH]mlx.mlx_array = undefined;
+        const drafts_2d = drafts_2d_buf[0..m];
         var drafts_2d_n: usize = 0;
-        defer {
-            for (drafts_2d[0..drafts_2d_n]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(drafts_2d);
-        }
+        defer for (drafts_2d[0..drafts_2d_n]) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
         for (draft_arrs[0..m], drafts_2d) |dlazy, *out| {
             out.* = mlx.mlx_array_new();
             drafts_2d_n += 1;
@@ -1903,8 +1781,10 @@ pub fn mtpGroupSampledAccept(
     }
 
     const joined = states[0].group_logits;
-    const use_joined = k == gens.len and joined.ctx != null and
-        mlx.getShape(joined).len == 3 and mlx.getShape(joined)[1] == total;
+    const use_joined = k == gens.len and joined.ctx != null and blk: {
+        const joined_shape = mlx.getShape(joined);
+        break :blk joined_shape.len == 3 and joined_shape[1] == total;
+    };
     var block = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(block);
     if (use_joined) {
@@ -1975,6 +1855,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     const m_lo: u32 = plan.m_lo;
     const m_max: u32 = plan.m_hi;
     const m: u32 = chain.m;
+    if (m > mtp_mod.MAX_DEPTH) return error.MtpDepthRange;
     const observed_limit = @min(m, self.max_tokens -| self.completion_tokens -| 1);
     const t1: u32 = chain.t1;
     const mtp_off0: usize = chain.off0;
@@ -2201,8 +2082,8 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     {
         std.debug.assert(self.mtp_hist_stash == null);
         const n_commit: usize = accepted;
-        const ids_i32 = try allocator.alloc(i32, 1 + n_commit);
-        defer allocator.free(ids_i32);
+        var ids_buf: [mtp_mod.MAX_DEPTH + 1]i32 = undefined;
+        const ids_i32 = ids_buf[0 .. 1 + n_commit];
         ids_i32[0] = @intCast(t1);
         for (drafts[0..n_commit], 0..) |d, idx| ids_i32[1 + idx] = @intCast(d);
         const id_shape = [_]c_int{@intCast(1 + n_commit)};
@@ -2337,8 +2218,8 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
 
         const re_seq_len: c_int = @intCast(1 + accepted);
-        const re_input_buf = try allocator.alloc(i32, 1 + accepted);
-        defer allocator.free(re_input_buf);
+        var re_buf: [mtp_mod.MAX_DEPTH + 1]i32 = undefined;
+        const re_input_buf = re_buf[0 .. 1 + accepted];
         re_input_buf[0] = @intCast(t1);
         for (drafts[0..accepted], 0..) |d, idx| re_input_buf[1 + idx] = @intCast(d);
         const re_shape = [_]c_int{ 1, re_seq_len };
@@ -2508,8 +2389,8 @@ pub const MtpPreDraft = struct {
     t1_arr: mlx.mlx_array,
     /// Host draft ids, filled at the Phase 4b sync. len = plan.m_hi.
     drafts: []u32,
-    /// Lazy `[1]` int32 draft ids. len = plan.m_hi; [0..n_drafted) valid.
-    draft_arrs: []mlx.mlx_array,
+    /// Lazy `[1]` int32 draft ids; [0..n_drafted) valid.
+    draft_arrs: [mtp_mod.MAX_DEPTH]mlx.mlx_array,
     n_drafted: u32,
     /// Rows the head's first step reads (the stash plus t1); 0 for a lookup chain.
     head_input_rows: u32 = 1,
@@ -2533,7 +2414,6 @@ pub const MtpPreDraft = struct {
     pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
         _ = mlx.mlx_array_free(self.t1_arr);
         for (self.draft_arrs[0..self.n_drafted]) |arr| _ = mlx.mlx_array_free(arr);
-        allocator.free(self.draft_arrs);
         if (self.conf_arrs) |slots| {
             for (slots[0..self.n_conf]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
@@ -3001,17 +2881,11 @@ test "group acceptance: every row's verdict comes from its OWN am, at any accept
     }
 }
 
-test "batched MTP draft rows stop at their own depth and allocation" {
+test "batched MTP draft rows stop at their own depth" {
     var chains: [3]MtpPreDraft = undefined;
-    var wide: [5]mlx.mlx_array = undefined;
-    var short: [1]mlx.mlx_array = undefined;
-    var middle: [3]mlx.mlx_array = undefined;
     chains[0].m = 4;
-    chains[0].draft_arrs = &wide;
     chains[1].m = 1;
-    chains[1].draft_arrs = &short;
     chains[2].m = 3;
-    chains[2].draft_arrs = &middle;
     var indices: [3]usize = undefined;
     const expected = [_][]const usize{ &.{ 0, 1, 2 }, &.{ 0, 2 }, &.{ 0, 2 }, &.{0}, &.{}, &.{} };
     for (expected, 0..) |want, step| {
@@ -3035,6 +2909,7 @@ test "batched MTP draft rows stop without touching inactive generators" {
 }
 
 test "MTP continuation releases its owned chain when drafting fails" {
+    if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     const allocator = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -3044,8 +2919,8 @@ test "MTP continuation releases its owned chain when drafting fails" {
     var state: Transformer.Qwen4MtpState = undefined;
     var gen: Generator = undefined;
     gen.xfm = &xfm;
-    gen.mtp = .{ .qwen4 = &xfm };
-    gen.mtp_cache = .{ .qwen4 = .{ .t = &xfm, .st = &state, .allocator = allocator } };
+    gen.mtp = MtpHeadRef.of("qwen4", &xfm);
+    gen.mtp_cache = MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &state, .allocator = allocator });
     gen.sampling = .{ .temperature = 0 };
     gen.ctx.mrope_pos = null;
     gen.mtp_hist_stash = null;
@@ -3056,7 +2931,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
         .t1 = 1,
         .t1_arr = mlx.mlx_array_new(),
         .drafts = try allocator.alloc(u32, 2),
-        .draft_arrs = try allocator.alloc(mlx.mlx_array, 2),
+        .draft_arrs = undefined,
         .n_drafted = 0,
         .conf_arrs = try allocator.alloc(mlx.mlx_array, 1),
         .n_conf = 0,
@@ -3097,6 +2972,7 @@ test "mtpPreDraftOpenAllows: a pre-draft needs a later round to read it" {
 }
 
 test "MTP detaching a pre-draft preserves the committed head boundary" {
+    if (comptime !@import("arch/drafter.zig").Drafter.has("mimo2")) return error.SkipZigTest;
     const allocator = testing.allocator;
     const stream = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
@@ -3109,11 +2985,11 @@ test "MTP detaching a pre-draft preserves the committed head boundary" {
             gen.mtp_planner_owned = owned;
             const head_state = try allocator.create(mimo_mtp.State);
             head_state.* = .{ .allocator = allocator, .hid_base = 9 };
-            gen.mtp_cache = .{ .mimo = .{ .st = head_state } };
+            gen.mtp_cache = MtpCacheRef.of("mimo2", .{ .st = head_state });
             defer gen.mtp_cache.?.deinit();
             gen.mtp_hist_stash = null;
-            const arrays = try allocator.alloc(mlx.mlx_array, 3);
-            for (arrays) |*array| array.* = mlx.mlx_array_new();
+            var arrays: [mtp_mod.MAX_DEPTH]mlx.mlx_array = undefined;
+            for (arrays[0..3]) |*array| array.* = mlx.mlx_array_new();
             gen.mtp_pre_draft = .{
                 .plan = .{ .m_lo = 3, .m_hi = 3, .tau_ln = 0 },
                 .off0 = 6,
@@ -3148,28 +3024,27 @@ test "cold grouped MTP head seeds the solo position and preserves valid origins"
 }
 
 test "mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never a batched head or a planner-owned round" {
-    const off = generate_mod.mtp_lookup_disabled;
+    if (comptime !@import("arch/drafter.zig").Drafter.has("mimo2") or !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     const bounds_before = depth_bounds.active;
     const planner = group_planner.enabled_override;
     defer {
-        generate_mod.mtp_lookup_disabled = off;
         depth_bounds.active = bounds_before;
         group_planner.enabled_override = planner;
     }
-    generate_mod.mtp_lookup_disabled = false;
     depth_bounds.active = .{};
     group_planner.enabled_override = true;
     var g: Generator = undefined;
-    g.mtp = .{ .qwen4 = undefined };
+    g.opts = .{};
+    g.mtp = MtpHeadRef.of("qwen4", undefined);
     g.mtp_batch_head = false;
     g.mtp_planner_owned = false;
     try testing.expect(g.mtpLookupAllowed());
 
-    g.mtp = .{ .mimo = undefined };
+    g.mtp = MtpHeadRef.of("mimo2", undefined);
     try testing.expect(g.mtpLookupAllowed());
     g.mtp = null;
     try testing.expect(!g.mtpLookupAllowed());
-    g.mtp = .{ .qwen4 = undefined };
+    g.mtp = MtpHeadRef.of("qwen4", undefined);
 
     depth_bounds.active = .{ .min = 3, .max = 3 };
     try testing.expect(g.mtpLookupAllowed());
@@ -3184,7 +3059,7 @@ test "mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never 
     group_planner.enabled_override = false;
     try testing.expect(g.mtpLookupAllowed());
 
-    generate_mod.mtp_lookup_disabled = true;
+    g.opts.lookup_disabled = true;
     try testing.expect(!g.mtpLookupAllowed());
 }
 

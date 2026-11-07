@@ -117,8 +117,8 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
 
     const policy = &self.dspark_policy;
     // `--max-mtp-ctx` against prompt + generated, as `mtpRoundBegin` checks it; context only grows, so it is sticky.
-    if (!self.spec_disabled_runtime and !mtp_mod.mtpCtxWithinLimit(generate_mod.max_mtp_ctx, self.mtpKvLen())) {
-        log.info("  dspark=off (ctx {d} > --max-mtp-ctx {d})\n", .{ self.mtpKvLen(), generate_mod.max_mtp_ctx });
+    if (!self.spec_disabled_runtime and !mtp_mod.mtpCtxWithinLimit(self.opts.max_mtp_ctx, self.mtpKvLen())) {
+        log.info("  dspark=off (ctx {d} > --max-mtp-ctx {d})\n", .{ self.mtpKvLen(), self.opts.max_mtp_ctx });
         self.spec_disabled_runtime = true;
         self.spec_disable_reason = .max_ctx;
     }

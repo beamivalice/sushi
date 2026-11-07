@@ -431,6 +431,7 @@ fn mtpBoundsPlanFixture(xfm: *Transformer, prompt: []u32, depth: u32) Generator 
         _ = xfm.round_cost.observe(5, 1000, 42.0, 3.5, true, false);
     }
     return Generator{
+        .opts = .{},
         .xfm = xfm,
         .ctx = undefined,
         .tok = undefined,
