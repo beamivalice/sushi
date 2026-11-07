@@ -70,15 +70,15 @@ const expectSlotStateEqual = qwen4_test_support.expectSlotStateEqual;
 const logicalSsmCapture = qwen4_test_support.logicalSsmCapture;
 const qwen4BatchedPleForward = qwen4_test_support.qwen4BatchedPleForward;
 const qwen4ExpectMoeBitsEqual = qwen4_test_support.qwen4ExpectMoeBitsEqual;
-const glm5_serving = @import("glm5/glm5_serving.zig");
-const forwardGlm5WithImpl = glm5_serving.forwardGlm5WithImpl;
-const initGlm5 = glm5_serving.initGlm5;
+const arch_forward = @import("arch/forward.zig");
+const arch_life = @import("arch/life.zig");
+const arch_request = @import("arch/request.zig");
+const arch_admission = @import("arch/admission.zig");
+const arch_registry = @import("arch/registry.zig");
 const dsv41_serving = @import("dsv41/dsv41_serving.zig");
 const dsv41DraftImpl = dsv41_serving.dsv41DraftImpl;
 const dsv41FinishImpl = dsv41_serving.dsv41FinishImpl;
 const dsv41VerifyImpl = dsv41_serving.dsv41VerifyImpl;
-const forwardDsv41With = dsv41_serving.forwardDsv41With;
-const initDsv41 = dsv41_serving.initDsv41;
 pub const DenseKVView = kv_cache.DenseKVView;
 pub const KVCache = kv_cache.KVCache;
 pub const KVCacheEntry = kv_cache.KVCacheEntry;
@@ -1155,12 +1155,14 @@ pub const Transformer = struct {
             qsaNaxArm();
         }
         fp8_block.tile_nax = verifyQmmNaxAvailable();
+        return arch_life.init(io, allocator, config, weights, s);
+    }
+
+    /// The generic MoE trunk's construction, which qwen4 and mimo2 share.
+    pub fn initTrunk(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
         const prefix = config.weight_prefix;
 
         var name_buf: [256]u8 = undefined;
-
-        if (config.isGlm5()) return initGlm5(allocator, config, weights, s);
-        if (config.isDsv41()) return initDsv41(allocator, config, weights, s);
 
         const emb_base: []const u8 = "embed_tokens";
         const emb_w = getNamedWeight(weights, &name_buf, prefix, emb_base, "weight") orelse {
@@ -1802,8 +1804,7 @@ pub const Transformer = struct {
     /// thread-local (a stream created on thread A is invisible to thread B).
     pub fn useCurrentThreadStream(self: *Transformer) void {
         self.s = mlx.gpuStream();
-        if (self.glm5) |mdl| mdl.s = self.s;
-        if (self.dsv41) |m| m.s = self.s;
+        arch_life.useCurrentThreadStream(arch_registry.handleOf(self));
     }
 
     // ── Core ops ──
@@ -2468,9 +2469,7 @@ pub const Transformer = struct {
 
     /// Whether this model is single-flight at admission (`slot_admission.modelExclusiveDecode`).
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
-        // A streamed GLM load (the KLD teacher) admits one claimant per expert stream.
-        if (self.glm5) |m| if (m.expert_stream != null) return true;
-        return self.dsv41 != null;
+        return arch_request.ownsModuleDecodeState(arch_registry.handleOf(@constCast(self)));
     }
 
     pub fn sharesModuleReadonlyState(self: *const Transformer) bool {
@@ -2693,10 +2692,7 @@ pub const Transformer = struct {
 
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
-        if (self.glm5) |mdl| return forwardGlm5WithImpl(self, ctx, token_ids, mdl);
-        if (self.dsv41) |m| return forwardDsv41With(self, ctx, token_ids, m);
-        if (self.qwen4 != null) return self.forwardQwen4With(ctx, token_ids);
-        return self.forwardMoeWith(ctx, token_ids);
+        return arch_forward.forward(arch_registry.handleOf(self), ctx, token_ids);
     }
 
     /// Project a hidden state through the trunk's lm_head, dense (no argmax
@@ -2704,8 +2700,7 @@ pub const Transformer = struct {
     /// THIS head — the reference applies the bare Linear (no softcap /
     /// output_multiplier; both are monotone, so draft argmax is unaffected).
     pub fn lmHeadForDraft(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
-        if (self.glm5) |mdl| return mdl.projectHead(x);
-        return self.lmHeadProject(x, false);
+        return arch_forward.lmHeadForDraft(arch_registry.handleOf(@constCast(self)), x);
     }
 
     /// Free compiled JIT closures (compiled_gelu /
@@ -3529,8 +3524,9 @@ pub const Transformer = struct {
         errdefer allocator.destroy(engine);
         const dir = config.expert_source_dir orelse return error.MissingExpertSourceDir;
         // The engine owns the drop for its life; nothing else lets go of it.
+        const traits = arch_admission.expertStream(config);
         const drop: ?*expert_usage.Drop = if (config.drop_expert == 0) null else blk: {
-            if (!config.isDsv41()) return error.LaunchFlagUnsupported;
+            if (!traits.drop_expert) return error.LaunchFlagUnsupported;
             const d = try allocator.create(expert_usage.Drop);
             errdefer allocator.destroy(d);
             d.* = try expert_usage.load(allocator, dir, config.expertDropRequest());
@@ -3542,7 +3538,7 @@ pub const Transformer = struct {
         };
         var geometry = config.expertGeometry();
         geometry.drop = drop;
-        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = config.isDsv41() and config.expert_layout == .exl3_k4 });
+        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = traits.tile_major });
         return engine;
     }
 

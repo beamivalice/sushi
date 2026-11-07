@@ -217,4 +217,12 @@ test {
     _ = @import("mlx.zig");
     _ = @import("mlx_kernel_keys.zig");
     _ = @import("test_models.zig");
+    _ = @import("arch_host.zig");
+    _ = @import("arch_host_stub.zig");
+    _ = @import("arch/registry.zig");
+    _ = @import("arch/spec.zig");
+    _ = @import("arch/life.zig");
+    _ = @import("arch/forward.zig");
+    _ = @import("arch/request.zig");
+    _ = @import("arch/admission.zig");
 }

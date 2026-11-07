@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "mlx_sha", mlx_sha);
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
     build_options.addOption([]const u8, "git_sha", git_sha);
+    build_options.addOption([]const []const u8, "archs", archList(b));
 
     const mod = b.createModule(.{
         .root_source_file = b.path(if (b.option(bool, "glm-ffn-replay", "Build offline GLM frozen-prefix extractor") orelse false) "src/glm5_ffn_replay.zig" else if (b.option(bool, "glm-trunk-cov", "Build offline GLM trunk input-covariance extractor") orelse false) "src/glm5_trunk_cov.zig" else "src/main.zig"),
@@ -218,6 +219,16 @@ pub fn build(b: *std.Build) void {
     ubench_step.dependOn(&b.addInstallArtifact(addUbench(b, build_options, target, macos_sdk_frameworks), .{}).step);
 }
 
+/// `-Darchs=qwen4,glm5`: the architectures this build serves, named as `src/arch/registry.zig` names them; empty is
+/// every registered one. An arch left out has no prong in the dispatch unions, so none of its code is analysed.
+fn archList(b: *std.Build) []const []const u8 {
+    const raw = b.option([]const u8, "archs", "Architectures to build, comma separated (default: every registered one)") orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, raw, ',');
+    while (it.next()) |name| out.append(b.allocator, name) catch @panic("OOM");
+    return out.items;
+}
+
 /// `sushibar`: the menu bar app. It links no MLX, jinja or server module, only the Objective-C runtime and AppKit.
 fn addSushibar(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, macos_sdk_frameworks: ?[]const u8) *std.Build.Step.Compile {
     const mod = b.createModule(.{
@@ -298,7 +309,7 @@ const test_buckets = [_][]const []const u8{
 };
 
 /// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
-const test_dirs = [_][]const u8{ "src", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
+const test_dirs = [_][]const u8{ "src", "src/arch", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
 
 /// A test's model is its file's folder; the src root is shared.
 const TestModel = enum { qwen4, mimo2, glm5, dsv41, exl3, enc };
@@ -343,10 +354,14 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
     var all_names: std.ArrayList([]const u8) = .empty;
     var top: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
     for (test_dirs) |dir_path| {
-        const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
+        const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path, "src/arch") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
+        // A dropped architecture has no folder.
+        var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => std.debug.panic("{s}: {t}", .{ dir_path, e }),
+        };
         // The scan runs at configure time, whose cache would otherwise miss a new or edited test file.
         b.dependOnDirectoryContents(b.path(dir_path));
-        var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e });
         defer src.close(io);
         var it = src.iterate();
         while (it.next(io) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e })) |entry| {

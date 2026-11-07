@@ -2,8 +2,8 @@
 //!
 //! Owns the single inference thread (the only thread that calls into mlx
 //! ops; mlx 0.31.2 made GPU streams thread-local so the model weights are
-//! bound to whichever thread first calls `useCurrentThreadStream` after
-//! load). Connection threads parse HTTP, build prompt token ids, call
+//! bound to the thread that builds them in `Transformer.init`). Connection
+//! threads parse HTTP, build prompt token ids, call
 //! `submit()` and then loop on `Slot.waitNext()` to read generated tokens
 //! one at a time. The state machines for tool-call detection, thinking
 //! blocks, SSE streaming, etc. live on the connection thread, unchanged.

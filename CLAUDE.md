@@ -13,6 +13,9 @@ serve time. Fork of ddalcu's mlx-serve.
   Converter knowledge goes to `docs/private/`, never a committed file.
 - `src/` holds only the four served architectures and their shared machinery. Any other `model_type` is refused by
   name (`ArchitectureUnsupported` → 503), as is an unsupported file format (`ModelFormatUnsupported` → 503).
+- Target: an architecture is `src/<arch>/` plus one `src/arch/registry.zig` line, the only place outside its folder
+  that names it; shared code names formats, never archs. Adding or dropping one:
+  [engine-arch-seam](docs/engine-arch-seam.md).
 
 <a id="docs-index"></a>
 ## Docs index
@@ -24,6 +27,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | doc | what it holds |
 |---|---|
 | [docs/source-map.md](docs/source-map.md) | which `src/` file holds what, and the doc for each |
+| [docs/engine-arch-seam.md](docs/engine-arch-seam.md) | the arch seam: registry, `arch.zig`, `-Darchs`, adding and dropping an arch, the drop test |
 | [docs/qwen4-arch.md](docs/qwen4-arch.md) | Flash-Next trunk, hyper-connections, n-gram PLE, oracle and ties, packs |
 | [docs/qwen4-perf.md](docs/qwen4-perf.md) | Flash-Next tok/s: decode/MTP ladders, GDN/QSA/HC kernel A/Bs, M1/M2 Max |
 | [docs/qwen4-kld.md](docs/qwen4-kld.md) | Flash-Next KLD of every served pack, the KV-width reading |
