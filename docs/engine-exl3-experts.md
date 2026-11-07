@@ -297,7 +297,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   alone on that arm, stacked or folded, rows 1 to 8 (`with exact rows a row has the same bytes ... at Flash-Next's trunk
   shapes`). NAX and SIMD may differ from each other (the accepted cross-hardware rule). Unpinned, one row takes SIMD and
   two or more take NAX, so a row beside others need not equal itself alone. The
-  Flash-Next trunk pins it around each trellis projection (`trunk_stq`) and restores it; DeepSeek pins it around its
+  Flash-Next trunk pins it around each trellis projection (`exl3/trunk.zig`) and restores it; DeepSeek pins it around its
   DSpark verify.
 - The parity bar scores each 128-wide output block in inner space: its error L2 (divided by svh) against the L2 of the
   block's summand magnitudes. The output transform is an orthonormal rotation, so this keeps the inner GEMV bar's

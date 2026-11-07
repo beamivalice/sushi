@@ -60,6 +60,18 @@ only `…trellis` finds no tensor and refuses such a pack on its own; it should 
 order's shape, and `shardTileOrderAgrees` checks a shard's `tile_order` stamp. Only this repo's DeepSeek loader reads
 `pair_major` today.
 
+The STQ trunk math is in the module too, as `trunk` (`src/exl3/trunk.zig`), and imports nothing beyond `mlx_host` and its
+own files. A host with its own weight loader binds a dense projection to it, additively:
+
+| name | what it does |
+|---|---|
+| `trunk.Triple` | a trellis bank carried in an affine triple's slots: `w` `[1, in/16, out/16, n]`, `s` `[1, in]`, `b` `[1, out]` |
+| `trunk.isStq`, `trunk.outDim` | tells a bank from an affine or dense weight (U16), reads its output width |
+| `trunk.matmul` | `x` through one bank in x's dtype, each row rounding as it does alone |
+| `trunk.fuse`, `trunk.sharedProject`, `trunk.Shared` | projections that read the same rows stacked into one bank and served by one launch |
+
+Sushi's own weight-map binding of it (`load`, `drop`) stays in `src/trunk_stq.zig`, outside the module.
+
 The module's tests run as their own artifacts (`exl3-test-N`) on `zig build test`; a change that
 passes them and keeps the names above is safe to re-vendor.
 

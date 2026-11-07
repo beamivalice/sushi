@@ -23,7 +23,7 @@ hidden 2560, expert intermediate 640.
 | `src/transformer.zig` | shared `Transformer`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3`; `KVCache` is in `src/kv_cache.zig`, the SSM cache in `src/ssm_cache.zig` |
 | `src/qwen4/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
 | `src/hc_prefill.zig` | Fused hyper-connection norm/mix prefill kernels (chunk width as a scalar INPUT, never a template) |
-| `src/trunk_stq.zig` | Trunk projections stored as trellis banks: the loader (`load`), the one-launch stacking (`fuse`, `sharedProject`), the matmul |
+| `src/trunk_stq.zig`, `src/exl3/trunk.zig` | Trunk projections stored as trellis banks: the loader (`load`, `trunk_stq`), the one-launch stacking (`fuse`, `sharedProject`) and the matmul (`exl3/trunk.zig`, re-exported by `trunk_stq`) |
 | `src/mtp.zig` | Shared MTP machinery (depth caps, cost profiles, draft rerank); the head itself is `Qwen4Mtp` in `qwen4_forward.zig`, see [engine-mtp](engine-mtp.md) |
 
 ## Trunk rules

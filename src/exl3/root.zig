@@ -27,6 +27,7 @@ pub const rate_groups = @import("rate_groups.zig");
 pub const Ragged = rate_groups.Ragged;
 pub const linear = @import("linear.zig");
 pub const trunk_gemm = @import("trunk_gemm.zig");
+pub const trunk = @import("trunk.zig");
 pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 
 /// Routed SwiGLU experts over `x` [B, S, D] for the top-k `inds`/`scores` [B, S, K],
@@ -495,6 +496,7 @@ test {
     _ = project_rows;
     _ = @import("sorted_windows.zig");
     _ = codebook_tables;
+    _ = trunk;
 }
 
 test "exl3 Sushi CPU config and packed shapes admit K1 through K8" {
