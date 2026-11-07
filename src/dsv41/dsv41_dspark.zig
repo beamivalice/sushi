@@ -1,5 +1,6 @@
 const std = @import("std");
 const dspark_rows = @import("dspark_rows.zig");
+const dsv41_serving = @import("dsv41_serving.zig");
 const generate_mod = @import("../generate.zig");
 const io_util = @import("../io_util.zig");
 const log = @import("../log.zig");
@@ -144,7 +145,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     defer if (block) |*b| b.deinit();
     var block_len: usize = 1 + copied;
     if (copied == 0 and (forced == null or forced.? > 1)) {
-        block = try xfm.dsv41Draft(t1);
+        block = try dsv41_serving.dsv41DraftImpl(xfm, t1);
         block_len = block.?.ids.len;
         @memcpy(ids_buf[0..block_len], block.?.ids);
         @memcpy(conf_buf[0 .. block_len - 1], block.?.conf);
@@ -173,7 +174,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         self.dspark_stats.mask_ns += mask_timer.read();
     }
     const ctx_before = self.ctx.cache.step;
-    var logits = try xfm.dsv41Verify(&self.ctx, ids_buf[0..rows]);
+    var logits = try dsv41_serving.dsv41VerifyImpl(xfm, &self.ctx, ids_buf[0..rows]);
     defer _ = mlx.mlx_array_free(logits);
     if (self.sampling.think_penalty.active() or sampler.penaltyActive(self.sampling)) {
         var row_ids: [dsv41_max_drafts + 1]i32 = undefined;
@@ -202,7 +203,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         accepted = verdict.accepted;
         pending = verdict.pending;
     }
-    try xfm.dsv41Finish(&self.ctx, accepted);
+    try dsv41_serving.dsv41FinishImpl(xfm, &self.ctx, accepted);
     const verify_ns = timer.read();
 
     const n_commit: usize = 1 + accepted;

@@ -1,17 +1,18 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const model_mod = @import("../model.zig");
 const token_mask = @import("../token_mask.zig");
 const rp_mod = @import("../reasoning_protocol.zig");
 const depth_bounds = @import("../mtp_depth_bounds.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
-const SSMCheckpoint = transformer_mod.SSMCheckpoint;
+const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const glm5_forward = @import("../glm5/glm5_forward.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
-const KVCache = transformer_mod.KVCache;
+const dsv41_serving = @import("dsv41_serving.zig");
+const KVCache = trunk_mod.KVCache;
 const testing = std.testing;
 const prefill_plan = @import("../prefill_plan.zig");
 const CACHE_CLEAR_INTERVAL = prefill_plan.CACHE_CLEAR_INTERVAL;
@@ -569,7 +570,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     };
     {
         try xfm.resetCache();
-        var cache = try KVCache.initWithConfig(a, config.num_hidden_layers, transformer_mod.KVQuantConfig.engine_default);
+        var cache = try KVCache.initWithConfig(a, config.num_hidden_layers, trunk_mod.KVQuantConfig.engine_default);
         defer cache.deinit();
         if (config.swaRingTokens() > 0) cache.setSwaRing(config.sliding_window);
         var off: usize = 0;
@@ -612,7 +613,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
         hc.disk.?.enableBackgroundWriter();
 
         try xfm.resetCache();
-        var cache = try KVCache.initWithConfig(a, config.num_hidden_layers, transformer_mod.KVQuantConfig.engine_default);
+        var cache = try KVCache.initWithConfig(a, config.num_hidden_layers, trunk_mod.KVQuantConfig.engine_default);
         defer cache.deinit();
         if (config.swaRingTokens() > 0) cache.setSwaRing(config.sliding_window);
         var off: usize = 0;
@@ -631,7 +632,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
             if (!armed or r.tokens[r.tokens.len - 1] != end_id) continue;
             gen.dspark_round_ends_at = null;
             try testing.expectEqual(point, prompt.len + gen.generated_ids.items.len);
-            try hc.writeDecodePointDsv41(&cache, xfm.dsv41.?, next[0..point], false, .{}, s);
+            try dsv41_prefix.writeDecodePointDsv41(&hc, &cache, xfm.dsv41.?, next[0..point], false, .{}, s);
             written = true;
         }
         try testing.expect(written);
@@ -661,10 +662,10 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     hc.disk.?.armTestSpace(256 << 30, 1 << 40);
     hc.disk.?.enableBackgroundWriter();
     try xfm.resetCache();
-    var target = try KVCache.initWithConfig(a, config.num_hidden_layers, transformer_mod.KVQuantConfig.engine_default);
+    var target = try KVCache.initWithConfig(a, config.num_hidden_layers, trunk_mod.KVQuantConfig.engine_default);
     defer target.deinit();
     var moe: usize = 0;
-    const res = try hc.lookupAndRestoreDsv41(&target, &moe, xfm.dsv41.?, s, next, false, 0, null, &.{}, 9, false);
+    const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &moe, xfm.dsv41.?, s, next, false, 0, null, &.{}, 9, false);
     try testing.expectEqual(point, res.matched);
     try testing.expect(hc.last_restored_disk_id != null);
     const got = try dsv41_model.extend(xfm.dsv41.?, &suffix, .all);
@@ -777,7 +778,7 @@ const LazyHeadRun = struct {
     }
 };
 
-fn forwardIds(xfm: *Transformer, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
+fn forwardIds(xfm: *Transformer, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
     const a = testing.allocator;
     const ids32 = try a.alloc(i32, ids.len);
     defer a.free(ids32);
@@ -1600,7 +1601,7 @@ test "dsv41 generator: after a DSpark request the slot cache marks its rows and 
     defer tok.deinit();
     // The scheduler's slot owns a cache with one entry per layer; the Transformer's own is a shell.
     // `initSlot` hands every slot the engine's default KV scheme, whatever the pack reports.
-    var slot_cache = try KVCache.initWithConfig(a, config.num_hidden_layers, transformer_mod.KVQuantConfig.engine_default);
+    var slot_cache = try KVCache.initWithConfig(a, config.num_hidden_layers, trunk_mod.KVQuantConfig.engine_default);
     defer slot_cache.deinit();
     if (config.swaRingTokens() > 0) slot_cache.setSwaRing(config.sliding_window);
     var off: usize = 0;
@@ -1721,7 +1722,7 @@ test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since
     // The draft heads score the whole vocabulary, so the image id is one of their possible picks; this pack's
     // image id is made an id the draft already holds past row 1.
     const dsv = xfm.dsv41.?;
-    var d = try xfm.dsv41Draft(g.next_token_id);
+    var d = try dsv41_serving.dsv41DraftImpl(&xfm, g.next_token_id);
     defer d.deinit();
     const k = for (2..d.ids.len) |i| {
         if (d.ids[i] != d.ids[0] and d.ids[i] != d.ids[1]) break i;

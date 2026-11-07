@@ -11,6 +11,7 @@ const Trunk = trunk.Trunk;
 pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
+pub const State = dsv41_state.State;
 
 pub const packs = struct { // slot:packs (S2h)
     pub const product = "DeepSeek-V4.1-Flash";

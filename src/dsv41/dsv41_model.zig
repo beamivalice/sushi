@@ -5277,7 +5277,7 @@ test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are
     try testing.expectEqual(@as(?usize, null), cedTail(m, st0, w, .last));
     try testing.expectEqual(@as(?usize, w), cedTail(m, st0, w + 1, .last));
     try testing.expectEqual(@as(?usize, null), cedTail(m, st0, w + 1, .all));
-    const report = @import("../transformer.zig").diagEnvOn("SUSHI_DSV41_CED_REPORT");
+    const report = @import("../trunk.zig").diagEnvOn("SUSHI_DSV41_CED_REPORT");
     const N: usize = 40;
     const steps = ids.len - N;
     const V: usize = m.cfg.vocab;

@@ -1,8 +1,8 @@
 //! DeepSeek-V4.1's drafter: DSpark rounds over the model's own state (`dsv41_dspark`). There is no head to step, so
 //! `arch/drafter.zig` answers every head operation with its default and the rounds run from `nextDspark`.
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const spec_types = @import("../spec_types.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk_mod.Transformer;
 
 pub const kinds = [_]spec_types.Kind{.dspark};
 pub const head_kind: spec_types.Kind = .dspark;

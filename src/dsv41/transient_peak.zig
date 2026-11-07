@@ -3,7 +3,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
-const transformer = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 
 pub const Phase = enum {
     decode,
@@ -26,7 +26,7 @@ pub const Phase = enum {
 var enabled_cache: ?bool = null;
 
 fn enabled() bool {
-    return transformer.diagEnvOnCached(&enabled_cache, "SUSHI_DSV41_TRANSIENT_PEAK");
+    return trunk_mod.diagEnvOnCached(&enabled_cache, "SUSHI_DSV41_TRANSIENT_PEAK");
 }
 
 pub fn begin() void {

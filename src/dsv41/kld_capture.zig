@@ -27,7 +27,7 @@ const dsv_stream = @import("dsv41_stream.zig");
 const dsv_source = @import("dsv41_source.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const imatrix_capture = @import("../imatrix.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const expert_stream = @import("../expert_stream.zig");
 const util = @import("../kld_capture_util.zig");
@@ -56,7 +56,7 @@ pub const Mode = struct {
 };
 
 fn modeFromEnv() !Mode {
-    const diagEnvOn = @import("../transformer.zig").diagEnvOn;
+    const diagEnvOn = @import("../trunk.zig").diagEnvOn;
     return checkedMode(diagEnvOn("SUSHI_DSV41_HEAD_ROWS"), diagEnvOn("SUSHI_DSV41_CAPTURE_LEAN"));
 }
 
@@ -1192,7 +1192,7 @@ fn layout(dc: *const dsv_cfg.Config, mode: Mode) Layout {
 // ── tests: a tiny seeded DeepSeek pack (DSV41_TINY, tests/dsv41/dump_dsv41_fixtures.py) ──────────────────
 
 const testing = std.testing;
-const Transformer = @import("../transformer.zig").Transformer;
+const Transformer = @import("../trunk.zig").Transformer;
 
 const tiny_tokenizer =
     \\{"pre_tokenizer":{"type":"ByteLevel"},"model":{"type":"BPE",
@@ -1966,19 +1966,19 @@ test "deepseek_v41 capture: the floor budget is the least the streamed load's pl
 test "kld: deepseek_v41 refuses by name what its module-owned state cannot honor" {
     const config = model.ModelConfig{ .model_type = "deepseek_v41" };
     try refuse(&config, .{});
-    try testing.expectError(error.Dsv41KvQuantUnsupported, refuse(&config, .{ .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) }));
+    try testing.expectError(error.Dsv41KvQuantUnsupported, refuse(&config, .{ .kv_quant_config = trunk_mod.KVQuantConfig.affine(8) }));
     try testing.expectError(error.Dsv41HasNoQwenGdnState, refuse(&config, .{ .qwen_gdn_f32 = false }));
     try testing.expectError(error.Dsv41HiddenCaptureUnsupported, refuse(&config, .{ .hidden_out = "/x" }));
     try testing.expectError(error.Dsv41ImatrixCaptureUnsupported, refuse(&config, .{ .imatrix_out = "/x.safetensors" }));
     const qwen = model.ModelConfig{ .model_type = "qwen4_exp" };
-    try refuse(&qwen, .{ .qwen_gdn_f32 = false, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8) });
+    try refuse(&qwen, .{ .qwen_gdn_f32 = false, .kv_quant_config = trunk_mod.KVQuantConfig.affine(8) });
 }
 
 test "kld: a deepseek_v41 load names the missing streaming budget before touching the GPU (DSV41_TINY)" {
     const dir = try @import("dsv41_model.zig").fixtureDir();
     const io = std.Io.Threaded.global_single_threaded.io();
     try testing.expectError(error.ExpertStreamingRequired, kld.loadModel(io, testing.allocator, .{ .model_dir = dir }));
-    try testing.expectError(error.Dsv41KvQuantUnsupported, kld.loadModel(io, testing.allocator, .{ .model_dir = dir, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8), .ssd_budget_bytes = 1 << 30 }));
+    try testing.expectError(error.Dsv41KvQuantUnsupported, kld.loadModel(io, testing.allocator, .{ .model_dir = dir, .kv_quant_config = trunk_mod.KVQuantConfig.affine(8), .ssd_budget_bytes = 1 << 30 }));
 }
 
 test "kld: a deepseek_v41 teacher captures and compare reads it back, fused against composed included (DSV41_TINY)" {
@@ -2016,7 +2016,7 @@ test "kld: a deepseek_v41 teacher captures and compare reads it back, fused agai
     defer loaded.tok.deinit();
     loaded.weights = try model.loadWeightsForConfig(io, allocator, dir, &loaded.config, false);
     defer loaded.weights.deinit();
-    loaded.xfm = try transformer_mod.Transformer.init(io, allocator, loaded.config, &loaded.weights);
+    loaded.xfm = try trunk_mod.Transformer.init(io, allocator, loaded.config, &loaded.weights);
     defer loaded.xfm.deinit();
     try testing.expectEqual(@as(u32, 1), loaded.config.eos_token_ids[0]);
 

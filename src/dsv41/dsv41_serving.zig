@@ -1,4 +1,4 @@
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
 const dsv41_model = @import("dsv41_model.zig");
 const dsv41_stream = @import("dsv41_stream.zig");
@@ -18,14 +18,14 @@ const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const diagEnvValueOn = io_util_mod.diagEnvValueOn;
 const diagEnvOn = io_util_mod.diagEnvOn;
-const ForwardCtx = trf.ForwardCtx;
-const Transformer = trf.Transformer;
-const initModuleShell = trf.initModuleShell;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const Transformer = trunk_mod.Transformer;
+const initModuleShell = trunk_mod.initModuleShell;
 
 /// Layers ahead of a layer whose picks its router input predicts.
 const prefetch_lead_rows: u8 = 3;
 
-pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
+pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
     const stq = config.dsv41.?.expert_dec != null;
     if (!config.expert_streaming or config.expert_layout != (if (stq) expert_quant_mod.Layout.exl3_k4 else .mxfp4_w123)) return error.ExpertStreamingRequired;
     const engine = try Transformer.newExpertEngine(allocator, &config, s);
@@ -34,7 +34,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         allocator.destroy(engine);
     }
     // The load drops each tensor from the map once its arrays are bound.
-    const mdl = try dsv41_model.init(allocator, config.dsv41.?, @constCast(weights), config.expert_source_dir orelse return error.MissingExpertSourceDir, s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
+    const mdl = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
     errdefer mdl.deinit();
     dsv41_model.logMemory(mdl);
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));

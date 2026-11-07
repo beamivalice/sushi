@@ -453,7 +453,7 @@ test "dsv41 shell: the transformer serves the streamed model's logits through fo
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try model.fixtureDir();
     const model_mod = @import("../model.zig");
-    const Transformer = @import("../transformer.zig").Transformer;
+    const Transformer = @import("../trunk.zig").Transformer;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
@@ -2121,7 +2121,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
     const model_load = @import("../model_load.zig");
-    const Transformer = @import("../transformer.zig").Transformer;
+    const Transformer = @import("../trunk.zig").Transformer;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
@@ -2222,7 +2222,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
-    const Transformer = @import("../transformer.zig").Transformer;
+    const Transformer = @import("../trunk.zig").Transformer;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
@@ -2359,7 +2359,7 @@ fn borrowCase(cache_bytes: u64) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
-    const Transformer = @import("../transformer.zig").Transformer;
+    const Transformer = @import("../trunk.zig").Transformer;
     const borrow = @import("dsv41_borrow.zig");
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -3125,7 +3125,7 @@ test "dsv41 pair-major: the transformer loads a pair-major pack through the one 
     var pm = try PmDir.make(dir, .none);
     defer pm.deinit();
     const model_mod = @import("../model.zig");
-    const Transformer = @import("../transformer.zig").Transformer;
+    const Transformer = @import("../trunk.zig").Transformer;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
