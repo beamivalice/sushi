@@ -1,8 +1,9 @@
 //! Trunk projections stored as STQ trellis banks, through the Flash-Next layers that read them: loading beside affine and
 //! dense tensors, stacking, the head, and each layer against its dense twin (the bank decoded on the host).
 const std = @import("std");
+const qwen4_gdn = @import("qwen4_gdn.zig");
 const mlx = @import("../mlx.zig");
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const trunk_stq = @import("../trunk_stq.zig");
 const mtp_mod = @import("../mtp.zig");
 const model_mod = @import("../model.zig");
@@ -14,11 +15,11 @@ const testing = std.testing;
 const expert_exl3 = sushi_exl3.format;
 const attn256RandBf16Scaled = test_support.attn256RandBf16Scaled;
 const qwen4ReadF32 = test_support.qwen4ReadF32;
-const FullAttnWeights = trf.FullAttnWeights;
-const KVCache = trf.KVCache;
+const FullAttnWeights = trunk_mod.FullAttnWeights;
+const KVCache = trunk_mod.KVCache;
 const ModelConfig = model_mod.ModelConfig;
 const Qwen4TestSlot = qwen4_test_support.Qwen4TestSlot;
-const Transformer = trf.Transformer;
+const Transformer = trunk_mod.Transformer;
 const Weights = model_mod.Weights;
 const Linear = @import("../linear.zig").Linear;
 const layer_weights = @import("../layer_weights.zig");
@@ -101,8 +102,8 @@ test "trunk STQ: the joined decode and verify projections decline a trellis trip
     defer free(stq);
     const x = try rand(prng.random(), &.{ 1, 2, 2560 }, 4.0, s);
     defer _ = mlx.mlx_array_free(x);
-    try testing.expectEqual(@as(?mlx.mlx_array, null), try trf.decodeRowsProjection(s, x, stq.w, stq.s, stq.b, &.{ 1, 1 }));
-    try testing.expectEqual(@as(?mlx.mlx_array, null), try trf.verifyJoinedProjection(s, x, stq.w, stq.s, stq.b, &.{ 1, 1 }, .shared));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try trunk_mod.decodeRowsProjection(s, x, stq.w, stq.s, stq.b, &.{ 1, 1 }));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try trunk_mod.verifyJoinedProjection(s, x, stq.w, stq.s, stq.b, &.{ 1, 1 }, .shared));
 }
 
 /// A named-tensor map entry of `shape` zeros in `dt`, standing in for a stored tensor the loader only binds.
@@ -242,7 +243,7 @@ test "trunk STQ: a layer loads each projection as the pack stores it, trellis be
 
     var config = ModelConfig{ .model_type = "llama", .weight_prefix = "model", .num_hidden_layers = 1, .quant_bits = 4, .quant_group_size = 64, .trunk_quant = dec };
     var name_buf: [256]u8 = undefined;
-    const loaded = try trf.initMoeLayers(testing.allocator, config, &weights, &name_buf, s);
+    const loaded = try trunk_mod.initMoeLayers(testing.allocator, config, &weights, &name_buf, s);
     defer freeLoaded(loaded);
     const fa = loaded.moe_layers[0].attn.full;
     for ([_]mlx.mlx_array{ fa.q_w, fa.k_w, fa.o_w }) |w| try testing.expect(trunk_stq.isStq(w));
@@ -260,7 +261,7 @@ test "trunk STQ: a layer loads each projection as the pack stores it, trellis be
 
     // A trellis bank with no trunk_quant block is a named refusal.
     config.trunk_quant = null;
-    try testing.expectError(error.TrunkQuantMissing, trf.initMoeLayers(testing.allocator, config, &weights, &name_buf, s));
+    try testing.expectError(error.TrunkQuantMissing, trunk_mod.initMoeLayers(testing.allocator, config, &weights, &name_buf, s));
 }
 
 test "trunk STQ: a trellis lm_head reads through the full head and keeps no coarse rerank copy" {
@@ -352,7 +353,7 @@ test "trunk STQ: a layer stacks the projections that share an input and drops th
 
     const config = ModelConfig{ .model_type = "llama", .weight_prefix = "model", .num_hidden_layers = 1, .quant_bits = 4, .quant_group_size = 64, .trunk_quant = dec };
     var name_buf: [256]u8 = undefined;
-    const loaded = try trf.initMoeLayers(testing.allocator, config, &weights, &name_buf, s);
+    const loaded = try trunk_mod.initMoeLayers(testing.allocator, config, &weights, &name_buf, s);
     defer freeLoaded(loaded);
     const fa = loaded.moe_layers[0].attn.full;
     const dense = loaded.moe_layers[0].mlp.dense;
@@ -472,7 +473,7 @@ fn attnTwinCase(stacked: bool) !void {
         defer _ = mlx.mlx_array_free(x);
         var outs: [2]mlx.mlx_array = undefined;
         for ([_]*const FullAttnWeights{ &fa_stq, &fa_twin }, slots, &outs) |fa, sl, *o| {
-            o.* = try xfm.qwen4AttnWith(&sl.ctx, x, fa, &sl.entries[0], 0, offset, 0, 1, seq, seq > 1);
+            o.* = try qwen4_forward.qwen4AttnWith(&xfm, &sl.ctx, x, fa, &sl.entries[0], 0, offset, 0, 1, seq, seq > 1);
         }
         defer for (outs) |o| {
             _ = mlx.mlx_array_free(o);
@@ -490,7 +491,7 @@ fn asF32(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return out;
 }
 
-fn withGdnProjections(base: *const trf.LinearAttnWeights, qkv: trunk_stq.Triple, z: trunk_stq.Triple, out: trunk_stq.Triple) trf.LinearAttnWeights {
+fn withGdnProjections(base: *const trunk_mod.LinearAttnWeights, qkv: trunk_stq.Triple, z: trunk_stq.Triple, out: trunk_stq.Triple) trunk_mod.LinearAttnWeights {
     var la = base.*;
     la.qkv_w = qkv.w;
     la.qkv_s = qkv.s;
@@ -556,7 +557,7 @@ fn gdnTwinCase(stacked: bool) !void {
     defer for (twin) |t| free(t);
     const stack = if (stacked) (try trunk_stq.fuse(&.{ &stq[0], &stq[1] }, &held, testing.allocator, s)).? else null;
     const none: mlx.mlx_array = .{ .ctx = null };
-    const base = trf.LinearAttnWeights{
+    const base = trunk_mod.LinearAttnWeights{
         .qkv_w = none, .qkv_s = none, .qkv_b = none,
         .z_w = none, .z_s = none, .z_b = none,
         .a_w = try rand(rnd, &.{ hidden, hv }, 2.0, s),
@@ -586,7 +587,7 @@ fn gdnTwinCase(stacked: bool) !void {
     const state0 = try asF32(state_bf, s);
     defer _ = mlx.mlx_array_free(state0);
     for ([_]c_int{ 1, 5, 20 }) |seq| {
-        var entries: [2]trf.SSMCacheEntry = undefined;
+        var entries: [2]trunk_mod.SSMCacheEntry = undefined;
         for (&entries) |*e| {
             e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
             try mlx.check(mlx.mlx_array_set(&e.conv_state, conv0));
@@ -598,9 +599,9 @@ fn gdnTwinCase(stacked: bool) !void {
         };
         const x = try rand(rnd, &.{ 1, seq, hidden }, 2.0, s);
         defer _ = mlx.mlx_array_free(x);
-        const got = try xfm.gatedDeltaNetProjected(x, &la_stq, &entries[0], 0, 1, seq, seq > 1, null, false);
+        const got = try qwen4_gdn.gatedDeltaNetProjected(&xfm, x, &la_stq, &entries[0], 0, 1, seq, seq > 1, null, false);
         defer _ = mlx.mlx_array_free(got);
-        const want = try xfm.gatedDeltaNetProjected(x, &la_twin, &entries[1], 0, 1, seq, seq > 1, null, false);
+        const want = try qwen4_gdn.gatedDeltaNetProjected(&xfm, x, &la_twin, &entries[1], 0, 1, seq, seq > 1, null, false);
         defer _ = mlx.mlx_array_free(want);
         try testing.expect(try relRms(s, got, want) < STQ_PROJECTION_BAR);
     }

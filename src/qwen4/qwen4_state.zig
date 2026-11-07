@@ -9,9 +9,57 @@ const trunk = @import("../trunk.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
+const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
+const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
+const qwen4_hc = @import("qwen4_hc.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const Trunk = trunk.Trunk;
+
+/// The model-lifetime state. Until it replaces the trunk's `qwen4*`, `qsa_*`, `gdn_*` and `compiled_hc_*` fields, each
+/// member is the type of the trunk field it is named for.
+pub const State = struct {
+    model: ?*qwen4_mod.Qwen4State = null,
+    stream_f32: bool = false,
+    mixer: ?layer_weights.HcWeights = null,
+    qsa_consts: qwen4_qsa_select.QsaBlockConsts = .{},
+    qsa_pooled_rope: qwen4_qsa_select.QsaPooledRope = .{},
+    qsa_score_bank_builds: usize = 0,
+    mtp: ?qwen4_forward.Qwen4Mtp = null,
+    mtp_owner: ?*qwen4_forward.Qwen4MtpState = null,
+    gdn_ones_w: ?mlx.mlx_array = null,
+    gdn_q_scale: ?mlx.mlx_array = null,
+    gdn_k_scale: ?mlx.mlx_array = null,
+    gdn_eps: ?mlx.mlx_array = null,
+    compiled_gdn_gate: ?mlx.mlx_closure = null,
+    compiled_hc_silu: ?mlx.mlx_closure = null,
+    compiled_hc_mix: ?mlx.mlx_closure = null,
+    compiled_hc_inj: ?mlx.mlx_closure = null,
+    compiled_hc_write: ?mlx.mlx_closure = null,
+
+    /// Frees what `load` made and the QSA scratch; the trunk's teardown still frees the closures and GDN constants.
+    pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        release(allocator, &self.qsa_consts, &self.qsa_pooled_rope, &self.mtp, &self.model);
+    }
+};
+
+/// What a forward context carries for Flash-Next: M-RoPE tables, the QSA selection of the layer in flight and the
+/// deferred PLE rows.
+pub const Ctx = struct {
+    mrope_pos: ?[]const i32 = null,
+    mrope_total: usize = 0,
+    mrope_delta: i32 = 0,
+    mrope_cos_cur: ?mlx.mlx_array = null,
+    mrope_sin_cur: ?mlx.mlx_array = null,
+    qsa_mask: mlx.mlx_array = .{ .ctx = null },
+    qsa_blocks: mlx.mlx_array = .{ .ctx = null },
+    qsa_arms: qwen4_qsa_attn.QsaArmCounts = .{},
+    qsa_entry: ?*trunk.SSMCacheEntry = null,
+    qsa_pos_base: c_int = 0,
+    ple_defer: bool = false,
+    ple_pending: ?qwen4_hc.PlePending = null,
+    capture_stream_all: ?*mlx.mlx_array = null,
+};
 
 pub const Loaded = struct {
     state: *qwen4_mod.Qwen4State,
@@ -90,18 +138,70 @@ pub fn load(
     return .{ .state = st, .mixer = mixer, .mtp = mtp, .stream = stream };
 }
 
+fn release(
+    allocator: std.mem.Allocator,
+    consts: *qwen4_qsa_select.QsaBlockConsts,
+    pooled_rope: *qwen4_qsa_select.QsaPooledRope,
+    mtp: *?qwen4_forward.Qwen4Mtp,
+    model: *?*qwen4_mod.Qwen4State,
+) void {
+    consts.deinit();
+    pooled_rope.deinit();
+    if (mtp.*) |*m| {
+        m.deinit(allocator);
+        mtp.* = null;
+    }
+    if (model.*) |st| {
+        st.deinit();
+        allocator.destroy(st);
+        model.* = null;
+    }
+}
+
 /// Frees what `load` made, and the QSA and persistent-group scratch the forward grew beside it.
 pub fn deinit(self: *Trunk) void {
-    self.qsa_consts.deinit();
-    self.qsa_pooled_rope.deinit();
+    release(self.allocator, &self.qsa_consts, &self.qsa_pooled_rope, &self.qwen4_mtp, &self.qwen4);
     self.ssm_group.deinit();
-    if (self.qwen4_mtp) |*m| {
-        m.deinit(self.allocator);
-        self.qwen4_mtp = null;
-    }
-    if (self.qwen4) |st| {
-        st.deinit();
-        self.allocator.destroy(st);
-        self.qwen4 = null;
-    }
+}
+
+test "Flash-Next state: an empty state releases as a no-op, twice" {
+    var state: State = .{};
+    state.deinit(std.testing.allocator);
+    state.deinit(std.testing.allocator);
+    try std.testing.expect(state.model == null and state.mtp == null);
+}
+
+test "Flash-Next state: State holds the types the trunk's Flash-Next fields hold today" {
+    const pairs = .{
+        .{ "model", "qwen4" },
+        .{ "stream_f32", "qwen4_stream_f32" },
+        .{ "mixer", "qwen4_mixer" },
+        .{ "qsa_consts", "qsa_consts" },
+        .{ "qsa_pooled_rope", "qsa_pooled_rope" },
+        .{ "qsa_score_bank_builds", "qsa_score_bank_builds" },
+        .{ "mtp", "qwen4_mtp" },
+        .{ "mtp_owner", "qwen4_mtp_owner" },
+        .{ "gdn_ones_w", "gdn_ones_w" },
+        .{ "gdn_q_scale", "gdn_q_scale" },
+        .{ "gdn_k_scale", "gdn_k_scale" },
+        .{ "gdn_eps", "gdn_eps" },
+        .{ "compiled_gdn_gate", "compiled_gdn_gate" },
+        .{ "compiled_hc_silu", "compiled_hc_silu" },
+        .{ "compiled_hc_mix", "compiled_hc_mix" },
+        .{ "compiled_hc_inj", "compiled_hc_inj" },
+        .{ "compiled_hc_write", "compiled_hc_write" },
+    };
+    inline for (pairs) |pair| try std.testing.expect(@FieldType(State, pair[0]) == @FieldType(Trunk, pair[1]));
+    try std.testing.expectEqual(pairs.len, std.meta.fieldNames(State).len);
+}
+
+test "Flash-Next state: Ctx holds the types the forward context's Flash-Next fields hold today" {
+    const testing = std.testing;
+    const names = comptime std.meta.fieldNames(Ctx);
+    inline for (names) |name| try testing.expect(@FieldType(Ctx, name) == @FieldType(trunk.ForwardCtx, name));
+    try testing.expectEqual(@as(usize, 13), names.len);
+    const ctx: Ctx = .{};
+    try testing.expect(ctx.mrope_pos == null and ctx.mrope_total == 0 and ctx.mrope_delta == 0);
+    try testing.expect(ctx.qsa_mask.ctx == null and ctx.qsa_blocks.ctx == null and ctx.qsa_entry == null);
+    try testing.expect(ctx.qsa_pos_base == 0 and !ctx.ple_defer and ctx.ple_pending == null);
 }

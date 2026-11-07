@@ -1,9 +1,10 @@
 //! Flash-Next on the offline tools: the names its source checkpoint gives the imatrix, the width of a hidden-capture
 //! row, and the state it sets up once a KLD model is loaded.
 const std = @import("std");
+const qwen4_forward = @import("qwen4_forward.zig");
 const model = @import("../model.zig");
 const imatrix = @import("../imatrix.zig");
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 
 pub const imatrix_naming = imatrix.Naming{ .layer_prefix = "model.language_model.layers." };
 
@@ -12,10 +13,10 @@ pub fn hiddenCaptureWidth(config: *const model.ModelConfig) usize {
     return @as(usize, config.hidden_size) * @max(config.hc_count, 1);
 }
 
-pub fn afterLoad(xfm: *trf.Transformer, config: model.ModelConfig, kv: trf.KVQuantConfig) !void {
+pub fn afterLoad(xfm: *trunk_mod.Transformer, config: model.ModelConfig, kv: trunk_mod.KVQuantConfig) !void {
     _ = config;
-    try xfm.qwen4MtpApplyKvQuant(kv);
-    xfm.compileQwen4Hc();
+    try qwen4_forward.qwen4MtpApplyKvQuant(xfm, kv);
+    qwen4_forward.compileQwen4Hc(xfm);
 }
 
 test "a hidden-capture row is the hidden size times every hyper-connection stream" {

@@ -1,9 +1,11 @@
 //! Flash-Next quantized sparse attention: block pooling, scoring and top-block selection.
 
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
+const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
-const Transformer = trf.Transformer;
+const Transformer = trunk_mod.Transformer;
 const std = @import("std");
 const disk_format = @import("../disk_format.zig");
 const mlx = @import("../mlx.zig");
@@ -12,64 +14,64 @@ const testing = std.testing;
 const test_support = @import("../test_support.zig");
 const attn256MaxDiff = test_support.attn256MaxDiff;
 
-const DenseKVView = trf.DenseKVView;
-const FUSED256_MIN_Q_LEN = trf.FUSED256_MIN_Q_LEN;
-const ForwardCtx = trf.ForwardCtx;
-const FullAttnWeights = trf.FullAttnWeights;
-const KVCache = trf.KVCache;
-const KvPrefixView = trf.KvPrefixView;
-const OneShotBits = trf.OneShotBits;
-const ProfClock = trf.ProfClock;
-const QSA_PACKED_GATHER_MAX_REUSE = trf.QSA_PACKED_GATHER_MAX_REUSE;
-const QsaArm = trf.QsaArm;
-const QsaSelectCfgKey = trf.QsaSelectCfgKey;
-const QsaSelectSplitCfgKey = trf.QsaSelectSplitCfgKey;
-const SSMCacheEntry = trf.SSMCacheEntry;
-const capBufAppend = trf.capBufAppend;
-const diagEnvOnCached = trf.diagEnvOnCached;
-const diagEnvValueOn = trf.diagEnvValueOn;
-const fusedSdpa256Masked = trf.fusedSdpa256Masked;
-const gatherQsa256 = trf.gatherQsa256;
-const gatherQsa256Packed = trf.gatherQsa256Packed;
+const DenseKVView = trunk_mod.DenseKVView;
+const FUSED256_MIN_Q_LEN = trunk_mod.FUSED256_MIN_Q_LEN;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const FullAttnWeights = trunk_mod.FullAttnWeights;
+const KVCache = trunk_mod.KVCache;
+const KvPrefixView = trunk_mod.KvPrefixView;
+const OneShotBits = qwen4_qsa_attn.OneShotBits;
+const ProfClock = trunk_mod.ProfClock;
+const QSA_PACKED_GATHER_MAX_REUSE = qwen4_qsa_attn.QSA_PACKED_GATHER_MAX_REUSE;
+const QsaArm = qwen4_qsa_attn.QsaArm;
+const QsaSelectCfgKey = qwen4_qsa_select.QsaSelectCfgKey;
+const QsaSelectSplitCfgKey = qwen4_qsa_select.QsaSelectSplitCfgKey;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const capBufAppend = trunk_mod.capBufAppend;
+const diagEnvOnCached = trunk_mod.diagEnvOnCached;
+const diagEnvValueOn = trunk_mod.diagEnvValueOn;
+const fusedSdpa256Masked = qwen4_qsa_gather.fusedSdpa256Masked;
+const gatherQsa256 = qwen4_qsa_gather.gatherQsa256;
+const gatherQsa256Packed = qwen4_qsa_gather.gatherQsa256Packed;
 const getQsaSelectKernel = qwen4_forward.getQsaSelectKernel;
 const getQsaSelectSplitLocalKernel = qwen4_forward.getQsaSelectSplitLocalKernel;
 const getQsaSelectSplitMergeKernel = qwen4_forward.getQsaSelectSplitMergeKernel;
-const log = trf.log;
+const log = trunk_mod.log;
 const markPosOf = qwen4_forward.markPosOf;
-const QSA_RING_ROWS = trf.QSA_RING_ROWS;
-const qsaAttnKernelEnabled = trf.qsaAttnKernelEnabled;
-const qsaBatchedGatherEnabled = trf.qsaBatchedGatherEnabled;
-const qsaDecodeGatherAttn = trf.qsaDecodeGatherAttn;
-const qsaDecodeGatherEnabled = trf.qsaDecodeGatherEnabled;
-const qsaEntrySatisfiesForward = trf.qsaEntrySatisfiesForward;
-const qsaGatherEnabled = trf.qsaGatherEnabled;
-const qsaGatherMinKv = trf.qsaGatherMinKv;
-const qsaHistoryRows = trf.qsaHistoryRows;
-const qsaMaskFromBlockSel = trf.qsaMaskFromBlockSel;
-const qsaMaskFromBlocks = trf.qsaMaskFromBlocks;
-const qsaNaxEnabled = trf.qsaNaxEnabled;
-const qsaNaxOsOk = trf.qsaNaxOsOk;
-const qsaPoolNormRopeFused = trf.qsaPoolNormRopeFused;
-const qsaPrefillGatherMinKvFrom = trf.qsaPrefillGatherMinKvFrom;
-const qsaScoreFusedActiveFor = trf.qsaScoreFusedActiveFor;
-const qsaScoreFusedArm = trf.qsaScoreFusedArm;
-const qsaScoreFusedDispatch = trf.qsaScoreFusedDispatch;
-const qsaScoreRowsPerChunkFused = trf.qsaScoreRowsPerChunkFused;
-const qsaScoreSheetComposed = trf.qsaScoreSheetComposed;
-const qsaSelectKernelEnabled = trf.qsaSelectKernelEnabled;
-const qsaSelectSplitEnabled = trf.qsaSelectSplitEnabled;
-const qsaSparseAttn = trf.qsaSparseAttn;
-const qsaSparseAttnServes = trf.qsaSparseAttnServes;
-const qsaVerifyGatherAttn = trf.qsaVerifyGatherAttn;
-const qsaVerifyGatherEnabled = trf.qsaVerifyGatherEnabled;
-const qsaVerifyGatherMinKvFor = trf.qsaVerifyGatherMinKvFor;
-const qsaWidthBucket = trf.qsaWidthBucket;
-const seedCapBuf = trf.seedCapBuf;
+const QSA_RING_ROWS = trunk_mod.QSA_RING_ROWS;
+const qsaAttnKernelEnabled = qwen4_qsa_attn.qsaAttnKernelEnabled;
+const qsaBatchedGatherEnabled = qwen4_qsa_gather.qsaBatchedGatherEnabled;
+const qsaDecodeGatherAttn = qwen4_qsa_attn.qsaDecodeGatherAttn;
+const qsaDecodeGatherEnabled = qwen4_qsa_gather.qsaDecodeGatherEnabled;
+const qsaEntrySatisfiesForward = qwen4_qsa_state.qsaEntrySatisfiesForward;
+const qsaGatherEnabled = qwen4_qsa_gather.qsaGatherEnabled;
+const qsaGatherMinKv = qwen4_qsa_gather.qsaGatherMinKv;
+const qsaHistoryRows = qwen4_qsa_state.qsaHistoryRows;
+const qsaMaskFromBlockSel = qwen4_qsa_attn.qsaMaskFromBlockSel;
+const qsaMaskFromBlocks = qwen4_qsa_attn.qsaMaskFromBlocks;
+const qsaNaxEnabled = qwen4_qsa_gather.qsaNaxEnabled;
+const qsaNaxOsOk = trunk_mod.qsaNaxOsOk;
+const qsaPoolNormRopeFused = qwen4_qsa_select.qsaPoolNormRopeFused;
+const qsaPrefillGatherMinKvFrom = qwen4_qsa_gather.qsaPrefillGatherMinKvFrom;
+const qsaScoreFusedActiveFor = qwen4_qsa_select.qsaScoreFusedActiveFor;
+const qsaScoreFusedArm = qwen4_qsa_select.qsaScoreFusedArm;
+const qsaScoreFusedDispatch = qwen4_qsa_select.qsaScoreFusedDispatch;
+const qsaScoreRowsPerChunkFused = qwen4_qsa_attn.qsaScoreRowsPerChunkFused;
+const qsaScoreSheetComposed = qwen4_qsa_select.qsaScoreSheetComposed;
+const qsaSelectKernelEnabled = qwen4_qsa_select.qsaSelectKernelEnabled;
+const qsaSelectSplitEnabled = qwen4_qsa_select.qsaSelectSplitEnabled;
+const qsaSparseAttn = qwen4_qsa_attn.qsaSparseAttn;
+const qsaSparseAttnServes = qwen4_qsa_attn.qsaSparseAttnServes;
+const qsaVerifyGatherAttn = qwen4_qsa_attn.qsaVerifyGatherAttn;
+const qsaVerifyGatherEnabled = qwen4_qsa_attn.qsaVerifyGatherEnabled;
+const qsaVerifyGatherMinKvFor = qwen4_qsa_attn.qsaVerifyGatherMinKvFor;
+const qsaWidthBucket = qwen4_qsa_attn.qsaWidthBucket;
+const seedCapBuf = trunk_mod.seedCapBuf;
 const qwen4Standin = qwen4_forward.qwen4Standin;
-const sliceAttentionSeq = trf.sliceAttentionSeq;
-const spanPreservingDropIndex = trf.spanPreservingDropIndex;
-const splitMaskedSdpa256 = trf.splitMaskedSdpa256;
-const verifyQmmNaxAvailable = trf.verifyQmmNaxAvailable;
+const sliceAttentionSeq = trunk_mod.sliceAttentionSeq;
+const spanPreservingDropIndex = trunk_mod.spanPreservingDropIndex;
+const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
+const verifyQmmNaxAvailable = trunk_mod.verifyQmmNaxAvailable;
 
 
 pub fn qsaPrefillGatherMinKv() c_int {
@@ -1035,7 +1037,7 @@ pub fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb:
                 3,
                 self.s,
             ));
-            const cols = try self.qsaScoreCols(new_pooled, batch, n_new, idx_hd);
+            const cols = try qsaScoreCols(self, new_pooled, batch, n_new, idx_hd);
             defer _ = mlx.mlx_array_free(cols);
             try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, reserve);
             self.qsa_score_bank_builds += 1;
@@ -1048,7 +1050,7 @@ pub fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb:
     entry.qsa_score_bank = .{ .ctx = null };
     entry.qsa_score_buf = .{ .ctx = null };
     entry.qsa_score_blocks = 0;
-    const cols = try self.qsaScoreCols(entry.qsa_pooled, batch, nb, idx_hd);
+    const cols = try qsaScoreCols(self, entry.qsa_pooled, batch, nb, idx_hd);
     defer _ = mlx.mlx_array_free(cols);
     try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, reserve);
     self.qsa_score_bank_builds += 1;
@@ -1057,7 +1059,7 @@ pub fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb:
 
 pub fn qsaScoreOperand(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int, fused: bool) !mlx.mlx_array {
     if (fused) return .{ .ctx = null };
-    return self.qsaScoreBank(entry, batch, nb, idx_hd);
+    return qsaScoreBank(self, entry, batch, nb, idx_hd);
 }
 
 /// The pooled-block cos/sin for this forward, built on first ask. Borrowed handles.
@@ -1096,13 +1098,13 @@ pub fn qsaPooledCosSin(self: *Transformer, ctx: *ForwardCtx, rope_dims: c_int, b
 pub fn qsaPooledKeys(self: *Transformer, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, rope_dims: c_int, base: c_int) !mlx.mlx_array {
     const sh = mlx.getShape(kb4);
     if (ctx.mrope_pos == null and qsaPoolRopeFusedEnabled() and mlx.mlx_array_dtype(norm_w) == .bfloat16) {
-        const cs = try self.qsaPooledCosSin(ctx, rope_dims, base, sh[2], sh[1], .bfloat16);
+        const cs = try qsaPooledCosSin(self, ctx, rope_dims, base, sh[2], sh[1], .bfloat16);
         if (try qsaPoolNormRopeFused(self.s, kb4, norm_w, self.config.rms_norm_eps, cs.cos, cs.sin, rope_dims)) |out| return out;
     }
-    const pn = try self.qsaPoolNorm(kb4, norm_w);
+    const pn = try qsaPoolNorm(self, kb4, norm_w);
     defer _ = mlx.mlx_array_free(pn);
-    const cs = try self.qsaPooledCosSin(ctx, rope_dims, base, sh[2], sh[1], mlx.mlx_array_dtype(pn));
-    if (ctx.mrope_pos == null) return self.qsaPooledRopeComposed(pn, rope_dims, cs.cos, cs.sin);
+    const cs = try qsaPooledCosSin(self, ctx, rope_dims, base, sh[2], sh[1], mlx.mlx_array_dtype(pn));
+    if (ctx.mrope_pos == null) return qsaPooledRopeComposed(self, pn, rope_dims, cs.cos, cs.sin);
     var pn4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pn4);
     try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
@@ -1130,8 +1132,8 @@ pub fn qsaSlotEntry(sc: *ForwardCtx, layer: u32) *SSMCacheEntry {
 pub fn qsaMask(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
     const qk = try self.qmatmul(x, &fa.idx_qk); // [B,S,(n+1)*hd]
     defer _ = mlx.mlx_array_free(qk);
-    if (ctx.batch_slots) |slots| return self.qsaMaskBatched(slots, qk, fa, layer);
-    return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer);
+    if (ctx.batch_slots) |slots| return qsaMaskBatched(self, slots, qk, fa, layer);
+    return qsaMaskFromQk(self, ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer);
 }
 
 /// Batched decode: the indexer projection ran once on `[N,1,·]`; each row
@@ -1168,7 +1170,7 @@ pub fn qsaMaskBatched(self: *Transformer, slots: []const *ForwardCtx, qk: mlx.ml
         var qk_i = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(qk_i);
         try mlx.check(mlx.mlx_slice(&qk_i, qk, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seq_len, w }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-        masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, sc.qsa_pos_base, 1, seq_len, layer);
+        masks[i] = try qsaMaskFromQk(self, sc, qk_i, fa, e, cache_len, sc.qsa_pos_base, 1, seq_len, layer);
         kv_lens[i] = cache_len + seq_len;
         if (kv_lens[i] > kv_max) kv_max = kv_lens[i];
         if (masks[i].ctx != null) any = true;
@@ -1275,12 +1277,12 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
         var kb4 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(kb4);
         try mlx.check(mlx.mlx_reshape(&kb4, kb_flat, &kb_shape, 4, self.s));
-        const new3 = try self.qsaPooledKeys(ctx, kb4, fa.idx_k_norm, rope_dims, pos_base + nb_cached * ratio);
+        const new3 = try qsaPooledKeys(self, ctx, kb4, fa.idx_k_norm, rope_dims, pos_base + nb_cached * ratio);
         defer _ = mlx.mlx_array_free(new3);
-        try self.qsaAppendPooled(entry, new3, nb_cached);
+        try qsaAppendPooled(self, entry, new3, nb_cached);
     }
 
-    try self.qsaAppendKeys(entry, k_raw, offset);
+    try qsaAppendKeys(self, entry, k_raw, offset);
     var keys = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(keys);
     try mlx.check(mlx.mlx_array_set(&keys, entry.aux_state));
@@ -1328,7 +1330,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
             .value = cfg.rope_theta,
             .has_value = !use_yarn,
         }, 1.0, eff_off, if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null }, self.s));
-        if (use_yarn) try self.yarnScaleRotated(&q_rope, rope_dims);
+        if (use_yarn) try qwen4_forward.yarnScaleRotated(self, &q_rope, rope_dims);
     }
 
     // Pooled block keys: mean of leftover + this chunk, already appended above.
@@ -1340,7 +1342,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     // scale is dropped because it is monotone for the top-k. Borrowed from the entry.
     const fused = qsaScoreFusedEligibleFrom(q_rope, entry.qsa_pooled) and
         qsaPooledRowContiguous(entry.qsa_pooled) and mlx.streamIsGpu(self.s);
-    const k32 = try self.qsaScoreOperand(entry, batch, nb, idx_hd, fused);
+    const k32 = try qsaScoreOperand(self, entry, batch, nb, idx_hd, fused);
 
     // A packed cache gathers at every width (split-K, packed, or from its rebuild), never the mask arm.
     const quantized = ctx.cache.config.scheme == .affine;
@@ -1366,7 +1368,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
         // Free before assign: a `defer` registered below a fallible call leaked a handle per tick.
         if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
         ctx.qsa_blocks = .{ .ctx = null };
-        ctx.qsa_blocks = try self.qsaSelectBlocks(q_rope, k32, entry.qsa_pooled, offset, seq_len, nb, block_topk, fused);
+        ctx.qsa_blocks = try qsaSelectBlocks(self, q_rope, k32, entry.qsa_pooled, offset, seq_len, nb, block_topk, fused);
         if (ctx.qsa_blocks.ctx != null) {
             const kb_dim: c_int = if (mlx.mlx_array_ndim(ctx.qsa_blocks) == 3) mlx.getShape(ctx.qsa_blocks)[2] else block_topk;
             qsaDumpQsaBlocks(layer, offset, seq_len, kb_dim, ctx.qsa_blocks);
@@ -1400,7 +1402,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     defer if (vis3.ctx != null) {
         _ = mlx.mlx_array_free(vis3);
     };
-    if (!all_vis or nb <= block_topk) vis3 = try self.qsaBlockVisibility(offset, seq_len, nb, ratio);
+    if (!all_vis or nb <= block_topk) vis3 = try qsaBlockVisibility(self, offset, seq_len, nb, ratio);
 
     try self.qsa_consts.ensure(self.s, nb, ratio);
     return qsaSelectMaskOps(self.allocator, self.s, scores, vis3, self.qsa_consts.tie_bias, offset, seq_len, kv, nb, ratio, block_topk, batch);
@@ -1522,7 +1524,7 @@ pub fn qsaChunkSelect(self: *Transformer, scores: mlx.mlx_array, canonical: mlx.
     defer if (vis3.ctx != null) {
         _ = mlx.mlx_array_free(vis3);
     };
-    if (!all_vis) vis3 = try self.qsaBlockVisibility(row0, rows, nb, ratio);
+    if (!all_vis) vis3 = try qsaBlockVisibility(self, row0, rows, nb, ratio);
     if (canonical.ctx == null) {
         try self.qsa_consts.ensure(self.s, nb, ratio);
         return qsaSelectComposedOps(self.s, scores, vis3, self.qsa_consts.tie_bias, rows, nb, kb, block_topk, all_vis);
@@ -1573,7 +1575,7 @@ pub fn qsaSelectBlocks(self: *Transformer, q_rope: mlx.mlx_array, k32t: mlx.mlx_
         qsa_index_score_graphs += 1;
         const scores = try qsaScoreSheet(self.s, q_chunk, pooled, k32t, fused);
         defer _ = mlx.mlx_array_free(scores);
-        const sorted = try self.qsaChunkSelect(scores, canonical, offset + r0, rows, nb, ratio, kb, block_topk, qsaAllBlocksVisible(offset + r0, nb, ratio));
+        const sorted = try qsaChunkSelect(self, scores, canonical, offset + r0, rows, nb, ratio, kb, block_topk, qsaAllBlocksVisible(offset + r0, nb, ratio));
         errdefer _ = mlx.mlx_array_free(sorted);
         try parts.append(self.allocator, sorted);
     }
@@ -1709,7 +1711,7 @@ pub fn qsaAppendKeys(self: *Transformer, entry: *SSMCacheEntry, k_raw: mlx.mlx_a
 
     const ring_cap: usize = @intCast(QSA_RING_ROWS);
     if (add >= QSA_RING_ROWS) {
-        try self.qsaInstallRing(entry, k_raw, s);
+        try qsaInstallRing(self, entry, k_raw, s);
     } else if (held + add <= QSA_RING_ROWS) {
         try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, ring_cap);
     } else {
@@ -1734,7 +1736,7 @@ pub fn qsaAppendKeys(self: *Transformer, entry: *SSMCacheEntry, k_raw: mlx.mlx_a
         const vec = mlx.mlx_vector_array_new_data(&parts, 2);
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 1, s));
-        try self.qsaInstallRing(entry, cat, s);
+        try qsaInstallRing(self, entry, cat, s);
     }
     entry.qsa_hist_rows = offset + add;
 }
@@ -1814,10 +1816,10 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     const step: c_int = 4; // = indexer_compress_ratio
     const n: c_int = 5;
 
-    const cs = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    const cs = try qsaPooledCosSin(&t, &ctx, rope_dims, base, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
     for (0..11) |_| {
-        const again = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+        const again = try qsaPooledCosSin(&t, &ctx, rope_dims, base, step, n, .bfloat16);
         try testing.expect(again.cos.ctx == cs.cos.ctx and again.sin.ctx == cs.sin.ctx);
     }
     try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
@@ -1838,9 +1840,9 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
 
     // A new forward at the same position hits: the forward counter is not in the key.
     t.fwd_gen += 1;
-    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    _ = try qsaPooledCosSin(&t, &ctx, rope_dims, base, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
-    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    _ = try qsaPooledCosSin(&t, &ctx, rope_dims, base + step, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
 
     // The M-RoPE arm is a different table at the same (base, step, n).
@@ -1849,14 +1851,14 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     for (pos, 0..) |*p, i| p.* = @intCast(i % 256);
     ctx.mrope_pos = pos;
     ctx.mrope_total = 256;
-    const m = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    const m = try qsaPooledCosSin(&t, &ctx, rope_dims, base + step, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
     const direct = try t.mropeCosSinAt(.{ .pos = pos, .total = 256, .delta = 0 }, @intCast(base + step), @intCast(step), @intCast(n), .bfloat16);
     defer _ = mlx.mlx_array_free(direct.cos);
     defer _ = mlx.mlx_array_free(direct.sin);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.cos, direct.cos, s));
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.sin, direct.sin, s));
-    for (0..11) |_| _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
+    for (0..11) |_| _ = try qsaPooledCosSin(&t, &ctx, rope_dims, base + step, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
 }
 
@@ -1888,17 +1890,17 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     const step: c_int = 4;
     const n: c_int = 5;
 
-    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    _ = try qsaPooledCosSin(&t, &ctx, rope_dims, base, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
 
     const Worker = struct {
         fn run(xfm: *Transformer) void {
-            xfm.markQsaPooledRopeStale();
+            markQsaPooledRopeStale(xfm);
         }
     };
     const th = try std.Thread.spawn(.{}, Worker.run, .{&t});
     th.join();
     try testing.expect(t.qsa_pooled_rope.stale.load(.acquire));
-    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    _ = try qsaPooledCosSin(&t, &ctx, rope_dims, base, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
 }

@@ -1,9 +1,10 @@
 //! Flash-Next's own terms of the bill: the MTP head's KV, ring and state, and the thought-point checkpoint.
 const std = @import("std");
+const qwen4_forward = @import("qwen4_forward.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
-const Transformer = transformer_mod.Transformer;
-const transformer_mod = @import("../transformer.zig");
+const Transformer = trunk_mod.Transformer;
+const trunk_mod = @import("../trunk.zig");
 
 // Hooks: bills.zig reaches these through the arch's `bill` declaration; a hook returns null where it has no say.
 
@@ -11,7 +12,7 @@ const transformer_mod = @import("../transformer.zig");
 pub fn headKvPerToken(config: *const model_mod.ModelConfig) ?u64 {
     const n = config.attnCacheLayerCount();
     if (n == 0) return 0;
-    const head_cfg = transformer_mod.Transformer.qwen4MtpHeadKvConfig(bills.configuredKvQuantFor(config));
+    const head_cfg = qwen4_forward.qwen4MtpHeadKvConfig(bills.configuredKvQuantFor(config));
     const bits: u64 = if (head_cfg.scheme == .off) 16 else head_cfg.bits;
     return bills.kvBytesPerTokenAtBits(config.kvBytesPerToken() / n, bits);
 }
@@ -40,6 +41,6 @@ pub fn thoughtPoint(config: *const model_mod.ModelConfig, warm: bills.WarmPrefix
 /// (`scheduler.qwenCheckpointCap`). Null = every checkpoint stays in RAM.
 pub fn residentCheckpointCap(config: *const model_mod.ModelConfig) ?u64 {
     if (!bills.diskTierOn(config)) return null;
-    return transformer_mod.SSM_RESIDENT_MAX;
+    return trunk_mod.SSM_RESIDENT_MAX;
 }
 

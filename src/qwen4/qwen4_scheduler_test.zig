@@ -1,11 +1,11 @@
 const std = @import("std");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
 const model_mod = @import("../model.zig");
 const model_registry_mod = @import("../model_registry.zig");
-const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const Transformer = trunk_mod.Transformer;
+const KVCache = trunk_mod.KVCache;
 const ModelConfig = model_mod.ModelConfig;
 const expert_stream_mod = @import("../expert_stream.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -370,7 +370,7 @@ test "admitPendingTick: per-slot exclusivity (qwen4 MTP slot) blocks only its ow
 
 test "admission combines Qwen and MiMo reservations in either order" {
     const Probe = struct {
-        fn numbers(cfg: *const ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: bool, _: bool) MemoryBill {
+        fn numbers(cfg: *const ModelConfig, _: usize, _: u32, _: trunk_mod.KVQuantConfig, _: bool, _: bool) MemoryBill {
             return .{ .needed = if (cfg.longCtxGated()) 8 else 7, .available = 10 };
         }
     };

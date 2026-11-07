@@ -1,4 +1,4 @@
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
@@ -8,28 +8,28 @@ const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
 const test_support = @import("../test_support.zig");
 const attn256MaxDiff = test_support.attn256MaxDiff;
-const ForwardCtx = trf.ForwardCtx;
-const KVCache = trf.KVCache;
-const MAX_BATCH_ROWS = trf.MAX_BATCH_ROWS;
-const PersistentSsmGroup = trf.PersistentSsmGroup;
-const SSMCacheEntry = trf.SSMCacheEntry;
-const SsmMergeKind = trf.SsmMergeKind;
-const Transformer = trf.Transformer;
-const captureSsmCheckpoint = trf.captureSsmCheckpoint;
-const materializedOwnedCopy = trf.materializedOwnedCopy;
-const restoreSsmCheckpoint = trf.restoreSsmCheckpoint;
-const splitSpecCaptures = trf.splitSpecCaptures;
-const ssmEvalHandles = trf.ssmEvalHandles;
-const ssmFreeMergedLayer = trf.ssmFreeMergedLayer;
-const ssmFreeSpecCapture = trf.ssmFreeSpecCapture;
-const ssmLiveAux = trf.ssmLiveAux;
-const ssmMaterializeLive = trf.ssmMaterializeLive;
-const ssmRollbackFromCapture = trf.ssmRollbackFromCapture;
-const ssmRowView = trf.ssmRowView;
-const ssmSnapshot = trf.ssmSnapshot;
-const ssmSnapshotDeinit = trf.ssmSnapshotDeinit;
-const ssmUnbindAll = trf.ssmUnbindAll;
-const ssmUnbindEntries = trf.ssmUnbindEntries;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const KVCache = trunk_mod.KVCache;
+const MAX_BATCH_ROWS = trunk_mod.MAX_BATCH_ROWS;
+const PersistentSsmGroup = trunk_mod.PersistentSsmGroup;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const SsmMergeKind = trunk_mod.SsmMergeKind;
+const Transformer = trunk_mod.Transformer;
+const captureSsmCheckpoint = trunk_mod.captureSsmCheckpoint;
+const materializedOwnedCopy = trunk_mod.materializedOwnedCopy;
+const restoreSsmCheckpoint = trunk_mod.restoreSsmCheckpoint;
+const splitSpecCaptures = trunk_mod.splitSpecCaptures;
+const ssmEvalHandles = trunk_mod.ssmEvalHandles;
+const ssmFreeMergedLayer = trunk_mod.ssmFreeMergedLayer;
+const ssmFreeSpecCapture = trunk_mod.ssmFreeSpecCapture;
+const ssmLiveAux = trunk_mod.ssmLiveAux;
+const ssmMaterializeLive = trunk_mod.ssmMaterializeLive;
+const ssmRollbackFromCapture = trunk_mod.ssmRollbackFromCapture;
+const ssmRowView = trunk_mod.ssmRowView;
+const ssmSnapshot = trunk_mod.ssmSnapshot;
+const ssmSnapshotDeinit = trunk_mod.ssmSnapshotDeinit;
+const ssmUnbindAll = trunk_mod.ssmUnbindAll;
+const ssmUnbindEntries = trunk_mod.ssmUnbindEntries;
 
 
 var ssm_member_gen_src: std.atomic.Value(u64) = .init(1);
@@ -625,7 +625,7 @@ fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Tr
 }
 
 fn ssmTickBindXfm(xfm: *Transformer, ctxs: []const *ForwardCtx, kinds: []const SsmMergeKind) !void {
-    try xfm.ssmBindBatched(ctxs, kinds);
+    try ssmBindBatched(xfm, ctxs, kinds);
 }
 
 fn ssmTickBind(
@@ -944,7 +944,7 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
     xfm.ssm_group = .{ .allocator = alloc };
     defer xfm.ssm_group.deinit();
     try ssmTickBind(alloc, s, &xfm.ssm_group, &ctxs, kinds, true);
-    xfm.ssmGroupDrop(slots[0].entries);
+    ssmGroupDrop(&xfm, slots[0].entries);
     try std.testing.expect(xfm.ssm_group.live);
     try std.testing.expectEqual(@as(usize, 1), xfm.ssm_group.n);
     try std.testing.expect(xfm.ssm_group.kinds.len == kinds.len);
@@ -983,7 +983,7 @@ test "persistent group: a solo tick after N=2 batched ticks matches the old path
         try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
         try ssmTickBumpSlots(s, &o_ctxs, kinds);
     }
-    try p_xfm.ssmGroupRelease(&p_slots[0].ctx);
+    try ssmGroupRelease(&p_xfm, &p_slots[0].ctx);
     try ssmTickBumpSlots(s, p_ctxs[0..1], kinds);
     try ssmTickBumpSlots(s, o_ctxs[0..1], kinds);
     try ssmTickBindXfm(&p_xfm, &p_ctxs, kinds);
@@ -1312,7 +1312,7 @@ test "persistent group: drop failure exports survivor rows" {
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
     const drop_alloc = xfm.ssm_group.allocator;
     xfm.ssm_group.allocator = failing.allocator();
-    xfm.ssmGroupDrop(slots[0].entries);
+    ssmGroupDrop(&xfm, slots[0].entries);
     xfm.ssm_group.allocator = drop_alloc;
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(slots[1].entries[0].conv_state, want, s));
 }

@@ -1,10 +1,10 @@
 //! Flash-Next hyper-connections and the n-gram PLE table.
 
-const trf = @import("../transformer.zig");
+const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const trunk = @import("../trunk.zig");
 const kv_cache = @import("../kv_cache.zig");
 const io_util_mod = @import("../io_util.zig");
-const Transformer = trf.Transformer;
+const Transformer = trunk.Transformer;
 const std = @import("std");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3_kernels = sushi_exl3.kernels;
@@ -16,25 +16,25 @@ const attn256MaxDiff = test_support.attn256MaxDiff;
 const qkvExpectBitsEqual = test_support.qkvExpectBitsEqual;
 const testReadF32 = test_support.testReadF32;
 
-const ForwardCtx = trf.ForwardCtx;
-const HcWeights = trf.HcWeights;
-const KVCache = trf.KVCache;
-const ModelConfig = trf.ModelConfig;
-const PleWeights = trf.PleWeights;
-const SSMCacheEntry = trf.SSMCacheEntry;
-const bf16Scalar = trf.bf16Scalar;
+const ForwardCtx = trunk.ForwardCtx;
+const HcWeights = trunk.HcWeights;
+const KVCache = trunk.KVCache;
+const ModelConfig = trunk.ModelConfig;
+const PleWeights = trunk.PleWeights;
+const SSMCacheEntry = trunk.SSMCacheEntry;
+const bf16Scalar = trunk.bf16Scalar;
 const getHcFusedKernel = qwen4_forward.getHcFusedKernel;
-const MAX_BATCH_ROWS = trf.MAX_BATCH_ROWS;
-const ProfClock = trf.ProfClock;
-const diagEnvOnCached = trf.diagEnvOnCached;
-const log = trf.log;
-const materializedOwnedCopy = trf.materializedOwnedCopy;
-const qmatmulBits = trf.qmatmulBits;
-const scalarOf = trf.scalarOf;
-const ssmFreeQsaState = trf.ssmFreeQsaState;
-const standinOnes = trf.standinOnes;
-const standinRef = trf.standinRef;
-const verifySharedHardware = trf.verifySharedHardware;
+const MAX_BATCH_ROWS = trunk.MAX_BATCH_ROWS;
+const ProfClock = trunk.ProfClock;
+const diagEnvOnCached = trunk.diagEnvOnCached;
+const log = trunk.log;
+const materializedOwnedCopy = trunk.materializedOwnedCopy;
+const qmatmulBits = trunk.qmatmulBits;
+const scalarOf = trunk.scalarOf;
+const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
+const standinOnes = trunk.standinOnes;
+const standinRef = trunk.standinRef;
+const verifySharedHardware = trunk.verifySharedHardware;
 
 
 pub fn claimPleSpecCapture(entry: *SSMCacheEntry, n: usize, ctx_len: usize, capturing: bool) bool {
@@ -48,17 +48,17 @@ pub fn claimPleSpecCapture(entry: *SSMCacheEntry, n: usize, ctx_len: usize, capt
 
 pub fn hcSiluCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Transformer = @ptrCast(@alignCast(payload.?));
-    const x = Transformer.closureIn(input, 0) orelse return -1;
+    const x = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(x);
     const y = self.silu(x) catch return -1;
-    return Transformer.closureOut(res, y);
+    return qwen4_forward.closureOut(res, y);
 }
 
 pub fn hcMixCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Transformer = @ptrCast(@alignCast(payload.?));
-    const up4 = Transformer.closureIn(input, 0) orelse return -1;
+    const up4 = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(up4);
-    const n4 = Transformer.closureIn(input, 1) orelse return -1;
+    const n4 = qwen4_forward.closureIn(input, 1) orelse return -1;
     defer _ = mlx.mlx_array_free(n4);
     var mix = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mix);
@@ -68,12 +68,12 @@ pub fn hcMixCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, pa
     if (mlx.mlx_multiply(&prod, mix, n4, self.s) != 0) return -1;
     var mixed = mlx.mlx_array_new();
     if (mlx.mlx_mean_axis(&mixed, prod, 2, false, self.s) != 0) return -1;
-    return Transformer.closureOut(res, mixed);
+    return qwen4_forward.closureOut(res, mixed);
 }
 
 pub fn hcInjCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Transformer = @ptrCast(@alignCast(payload.?));
-    const x = Transformer.closureIn(input, 0) orelse return -1;
+    const x = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(x);
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
@@ -82,23 +82,23 @@ pub fn hcInjCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, pa
     defer _ = mlx.mlx_array_free(two);
     var g = mlx.mlx_array_new();
     if (mlx.mlx_multiply(&g, sig, two, self.s) != 0) return -1;
-    return Transformer.closureOut(res, g);
+    return qwen4_forward.closureOut(res, g);
 }
 
 pub fn hcWriteCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Transformer = @ptrCast(@alignCast(payload.?));
-    const stream4 = Transformer.closureIn(input, 0) orelse return -1;
+    const stream4 = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(stream4);
-    const out4 = Transformer.closureIn(input, 1) orelse return -1;
+    const out4 = qwen4_forward.closureIn(input, 1) orelse return -1;
     defer _ = mlx.mlx_array_free(out4);
-    const inj = Transformer.closureIn(input, 2) orelse return -1;
+    const inj = qwen4_forward.closureIn(input, 2) orelse return -1;
     defer _ = mlx.mlx_array_free(inj);
     var add4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(add4);
     if (mlx.mlx_multiply(&add4, out4, inj, self.s) != 0) return -1;
     var next = mlx.mlx_array_new();
     if (mlx.mlx_add(&next, stream4, add4, self.s) != 0) return -1;
-    return Transformer.closureOut(res, next);
+    return qwen4_forward.closureOut(res, next);
 }
 
 pub const HcRead = struct {
@@ -132,14 +132,14 @@ pub fn hcReadPending(self: *Transformer, h: *mlx.mlx_array, w: *const HcWeights,
     if (pending.*) |*pd| {
         defer pending.* = null;
         defer pd.deinit();
-        if (try self.hcReadFusedFor(h.*, w, batch, seq_len, pd.*)) |o| {
+        if (try hcReadFusedFor(self, h.*, w, batch, seq_len, pd.*)) |o| {
             _ = mlx.mlx_array_free(h.*);
             h.* = o.stream;
             return .{ .mixed = o.mixed, .inj = o.inj };
         }
-        h.* = try self.hcWrite(h.*, pd.out, pd.inj, batch, seq_len);
+        h.* = try hcWrite(self, h.*, pd.out, pd.inj, batch, seq_len);
     }
-    return self.hcRead(h.*, w, batch, seq_len);
+    return hcRead(self, h.*, w, batch, seq_len);
 }
 
 pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pend: ?HcPending) !?HcFusedOut {
@@ -149,7 +149,7 @@ pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWei
     if (hp.eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(stream))) {
         if (try hp.norm(self.s, stream, w.norm_w, w.inject_flat, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = p.out, .inj = p.inj } else null)) |n| {
             defer n.deinit();
-            var read = try self.hcReadNormed(n.normalized, w, batch, seq_len, n.raw_inject);
+            var read = try hcReadNormed(self, n.normalized, w, batch, seq_len, n.raw_inject);
             errdefer read.deinit();
             return .{ .stream = try standinRef(n.stream), .mixed = read.mixed, .inj = read.inj };
         }
@@ -175,8 +175,8 @@ pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWei
 }
 
 pub fn addVerifyPle(self: *Transformer, row: anytype, pw: *const PleWeights, layer: usize, index: usize) !void {
-    try self.hcFlush(&row.h, 1, row.seq, &row.pending);
-    const add = try self.pleForward(row.ctx, row.h, row.tokens, pw, &row.entries[layer], layer, 1, row.seq);
+    try hcFlush(self, &row.h, 1, row.seq, &row.pending);
+    const add = try pleForward(self, row.ctx, row.h, row.tokens, pw, &row.entries[layer], layer, 1, row.seq);
     defer _ = mlx.mlx_array_free(add);
     var with_ple = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(with_ple);
@@ -244,14 +244,14 @@ pub fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array,
         pending.* = pd;
         return;
     }
-    h.* = try self.hcWrite(h.*, out, inj, batch, seq_len);
+    h.* = try hcWrite(self, h.*, out, inj, batch, seq_len);
 }
 
 pub fn hcFlush(self: *Transformer, h: *mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
     if (pending.*) |*pd| {
         defer pending.* = null;
         defer pd.deinit();
-        h.* = try self.hcWrite(h.*, pd.out, pd.inj, batch, seq_len);
+        h.* = try hcWrite(self, h.*, pd.out, pd.inj, batch, seq_len);
     }
 }
 
@@ -276,13 +276,13 @@ pub fn hcGroupNorm(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, batch
 /// Qwen4ExpTextGatedResidual.forward: the block input is a sigmoid-mixed
 /// mean of the normalized streams; the write gates are `2·σ(inject/hc)`.
 pub fn hcRead(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int) !HcRead {
-    if (try self.hcReadFusedFor(stream, w, batch, seq_len, null)) |o| {
+    if (try hcReadFusedFor(self, stream, w, batch, seq_len, null)) |o| {
         if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
         return .{ .mixed = o.mixed, .inj = o.inj };
     }
-    const n4 = try self.hcGroupNorm(stream, w.norm_w, batch, seq_len);
+    const n4 = try hcGroupNorm(self, stream, w.norm_w, batch, seq_len);
     defer _ = mlx.mlx_array_free(n4);
-    return self.hcReadNormed(n4, w, batch, seq_len, null);
+    return hcReadNormed(self, n4, w, batch, seq_len, null);
 }
 
 pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, raw_inject: ?mlx.mlx_array) !HcRead {
@@ -296,7 +296,7 @@ pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, 
     // down/inject carry the reference's `/hc` in their weights (load-time fold).
     const down = try self.qmatmul(n_flat, &w.down);
     defer _ = mlx.mlx_array_free(down);
-    const act = (try Transformer.applyClosure(self.compiled_hc_silu, &.{down})) orelse try self.silu(down);
+    const act = (try qwen4_forward.applyClosure(self.compiled_hc_silu, &.{down})) orelse try self.silu(down);
     defer _ = mlx.mlx_array_free(act);
     const up = try self.qmatmul(act, &w.up);
     defer _ = mlx.mlx_array_free(up);
@@ -308,7 +308,7 @@ pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, 
     const prefill_mix = if (@import("../hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(n4))) try @import("../hc_prefill.zig").mix(self.s, up4, n4, batch, seq_len) else null;
     if (prefill_mix) |m| {
         mixed = m;
-    } else if (try Transformer.applyClosure(self.compiled_hc_mix, &.{ up4, n4 })) |m| {
+    } else if (try qwen4_forward.applyClosure(self.compiled_hc_mix, &.{ up4, n4 })) |m| {
         mixed = m;
     } else {
         var mix = mlx.mlx_array_new();
@@ -326,7 +326,7 @@ pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, 
     if (w.inject_w.ctx != null) {
         const raw = if (raw_inject) |r| try standinRef(r) else try self.qmatmul(n_flat, &w.inject);
         defer _ = mlx.mlx_array_free(raw);
-        const g = (try Transformer.applyClosure(self.compiled_hc_inj, &.{raw})) orelse blk: {
+        const g = (try qwen4_forward.applyClosure(self.compiled_hc_inj, &.{raw})) orelse blk: {
             var sig = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sig);
             try mlx.check(mlx.mlx_sigmoid(&sig, raw, self.s));
@@ -357,7 +357,7 @@ pub fn hcWrite(self: *Transformer, stream: mlx.mlx_array, out: mlx.mlx_array, in
     defer _ = mlx.mlx_array_free(stream4);
     try mlx.check(mlx.mlx_reshape(&stream4, stream, &shape4, 4, self.s));
     var next4: mlx.mlx_array = undefined;
-    if (try Transformer.applyClosure(self.compiled_hc_write, &.{ stream4, out4, inj })) |n| {
+    if (try qwen4_forward.applyClosure(self.compiled_hc_write, &.{ stream4, out4, inj })) |n| {
         next4 = n;
     } else {
         var add4 = mlx.mlx_array_new();
@@ -395,12 +395,12 @@ pub fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arr
             const per: usize = @intCast(seq_len);
             var any = false;
             for (slots) |sc| {
-                if (self.pleClaimSpecCapture(&sc.ssm_entries.?[layer], per)) any = true;
+                if (pleClaimSpecCapture(self, &sc.ssm_entries.?[layer], per)) any = true;
             }
-            if (any) _ = self.pleClaimSpecCapture(entry, per);
+            if (any) _ = pleClaimSpecCapture(self, entry, per);
             break :blk any;
         }
-        break :blk self.pleClaimSpecCapture(entry, n);
+        break :blk pleClaimSpecCapture(self, entry, n);
     };
     if (ctx.ple_defer and pleDeferrable(&self.config, n)) {
         if (ctx.ple_pending != null) return error.PlePendingAlreadySet;
@@ -416,7 +416,7 @@ pub fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arr
         ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len, .capture = capture };
         return emb;
     }
-    try self.pleGatherBf16(ctx, token_ids, entry, layer, seq_len, pk, capture);
+    try pleGatherBf16(self, ctx, token_ids, entry, layer, seq_len, pk, capture);
     return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
 }
 
@@ -446,7 +446,7 @@ pub fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) 
 /// freezes on the way to it, must be materialized on a FILLED leaf.
 pub fn plePreEval(self: *Transformer, ctx: *ForwardCtx) !void {
     if (ctx.ple_pending == null) return;
-    try self.flushDeferredPle(ctx);
+    try flushDeferredPle(self, ctx);
 }
 
 /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend. Batched
@@ -455,17 +455,17 @@ pub fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, t
     const cfg = &self.config;
     const hc: c_int = @intCast(cfg.hc_count);
     const hidden: c_int = @intCast(cfg.hidden_size);
-    const emb = try self.pleEmbedding(ctx, token_ids, entry, layer, seq_len);
+    const emb = try pleEmbedding(self, ctx, token_ids, entry, layer, seq_len);
     defer _ = mlx.mlx_array_free(emb);
-    if (Transformer.qwen4_trace) |tr| Transformer.Qwen4Trace.set(&tr.ple_emb, emb);
+    if (Transformer.qwen4_trace) |tr| qwen4_forward.Qwen4Trace.set(&tr.ple_emb, emb);
 
     const key_raw = try self.qmatmul(emb, &pw.key);
     defer _ = mlx.mlx_array_free(key_raw);
-    const key4 = try self.hcGroupNorm(key_raw, pw.norm_key, batch, seq_len);
+    const key4 = try hcGroupNorm(self, key_raw, pw.norm_key, batch, seq_len);
     defer _ = mlx.mlx_array_free(key4);
     const value = try self.qmatmul(emb, &pw.value);
     defer _ = mlx.mlx_array_free(value);
-    const query4 = try self.hcGroupNorm(stream, pw.norm_query, batch, seq_len);
+    const query4 = try hcGroupNorm(self, stream, pw.norm_query, batch, seq_len);
     defer _ = mlx.mlx_array_free(query4);
 
     var kq = mlx.mlx_array_new();
@@ -515,7 +515,7 @@ pub fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, t
     var gv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gv);
     try mlx.check(mlx.mlx_reshape(&gv, gv4, &flat_shape, 3, self.s));
-    const gvn4 = try self.hcGroupNorm(gv, pw.norm_conv, batch, seq_len);
+    const gvn4 = try hcGroupNorm(self, gv, pw.norm_conv, batch, seq_len);
     defer _ = mlx.mlx_array_free(gvn4);
     var gvn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gvn);
@@ -564,13 +564,13 @@ pub fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, t
     }
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&out, gv, conv_act, self.s));
-    if (Transformer.qwen4_trace) |tr| Transformer.Qwen4Trace.set(&tr.ple_out, out);
+    if (Transformer.qwen4_trace) |tr| qwen4_forward.Qwen4Trace.set(&tr.ple_out, out);
     return out;
 }
 
 /// `HcRead` for every row: one joined kernel pass when it serves, else each row's own read.
 pub fn hcReadRows(self: *Transformer, rows: anytype, w: *const HcWeights, out: []HcRead) !void {
-    if (try self.hcReadVerifyRows(rows, w)) |joined| {
+    if (try hcReadVerifyRows(self, rows, w)) |joined| {
         defer self.allocator.free(joined);
         @memcpy(out[0..rows.len], joined);
         return;
@@ -579,7 +579,7 @@ pub fn hcReadRows(self: *Transformer, rows: anytype, w: *const HcWeights, out: [
     errdefer for (out[0..built]) |*read| read.deinit();
     for (rows, out[0..rows.len]) |*row, *read| {
         self.fwd_gen = row.generation;
-        read.* = try self.hcReadPending(&row.h, w, 1, row.seq, &row.pending);
+        read.* = try hcReadPending(self, &row.h, w, 1, row.seq, &row.pending);
         built += 1;
     }
 }
@@ -860,7 +860,7 @@ pub var hc_prepared_entries: [16]HcPrepared = @splat(.{});
 pub var hc_prepared_clock: u64 = 0;
 
 pub fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending) !?HcFusedOut {
-    return hcReadPreparedWidth(s, x, w, width, eps, pending, trf.SINGLE_VERIFY_ROWS_MAX);
+    return hcReadPreparedWidth(s, x, w, width, eps, pending, trunk.SINGLE_VERIFY_ROWS_MAX);
 }
 
 pub fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {
@@ -1220,7 +1220,7 @@ pub fn flushDeferredPle(self: *Transformer, ctx: *ForwardCtx) !void {
     const p = ctx.ple_pending orelse return;
     const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
     const out: [*]u16 = @constCast(dst);
-    try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
+    try pleGatherBf16(self, ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
     ctx.ple_pending = null;
     _ = mlx.mlx_array_free(p.emb);
     _ = mlx.mlx_array_free(p.token_ids);
@@ -1239,7 +1239,7 @@ pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !voi
     defer _ = mlx.mlx_vector_array_free(vec);
     for (ctxs) |ctx| {
         const p = ctx.ple_pending orelse continue;
-        ids[n] = try self.plePrepareIds(p.token_ids);
+        ids[n] = try plePrepareIds(self, p.token_ids);
         _ = mlx.mlx_vector_array_append_value(vec, ids[n]);
         n += 1;
     }
@@ -1253,7 +1253,7 @@ pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !voi
         const p = ctx.ple_pending orelse continue;
         const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
         const out: [*]u16 = @constCast(dst);
-        try self.pleFillFromIds(ctx, ids[k], p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
+        try pleFillFromIds(self, ctx, ids[k], p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
         k += 1;
         ctx.ple_pending = null;
         _ = mlx.mlx_array_free(p.emb);
@@ -1284,12 +1284,12 @@ pub fn discardDeferredPle(_: *Transformer, ctx: *ForwardCtx) void {
 /// BUILD time (never re-read off `spec_capture_ssm`, which a deferred
 /// flush sees already cleared).
 pub fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
-    const ids_c = try self.plePrepareIds(token_ids);
+    const ids_c = try plePrepareIds(self, token_ids);
     defer _ = mlx.mlx_array_free(ids_c);
     var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     try mlx.check(mlx.mlx_array_eval(ids_c));
     self.verify_laps.ple_sync_ns = sync_lap.read();
-    return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
+    return pleFillFromIds(self, ctx, ids_c, entry, layer, seq_len, pk, capture);
 }
 
 /// The gather ids as one contiguous int32 array, still LAZY: a group evaluates every
@@ -1791,11 +1791,11 @@ test "hc prefill: incompatible read writes immediately" {
             defer _ = mlx.mlx_array_free(h);
             var pending: ?HcPending = null;
             defer if (pending) |*p| p.deinit();
-            try xfm.hcWriteOrDefer(&h, out, inj, 1, 17, iw, &pending);
+            try hcWriteOrDefer(&xfm, &h, out, inj, 1, 17, iw, &pending);
             const can_defer = dtype == .bfloat16 and inject_dtype == .bfloat16;
             try testing.expectEqual(can_defer, pending != null);
-            try xfm.hcFlush(&h, 1, 17, &pending);
-            const expected = try xfm.hcWrite(try standinRef(h0), out, inj, 1, 17);
+            try hcFlush(&xfm, &h, 1, 17, &pending);
+            const expected = try hcWrite(&xfm, try standinRef(h0), out, inj, 1, 17);
             defer _ = mlx.mlx_array_free(expected);
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(h, expected, s));
         }
@@ -1810,7 +1810,7 @@ test "hc write compilation preserves the serial pending-write rounding" {
     xfm.config.hc_count = 4;
     xfm.config.hidden_size = 2560;
     xfm.compiled_hc_write = null;
-    const raw = mlx.mlx_closure_new_func_payload(&Transformer.hcWriteCallback, @ptrCast(&xfm), null);
+    const raw = mlx.mlx_closure_new_func_payload(&hcWriteCallback, @ptrCast(&xfm), null);
     defer _ = mlx.mlx_closure_free(raw);
     var compiled = mlx.mlx_closure{ .ctx = null };
     try mlx.check(mlx.mlx_compile(&compiled, raw, true));
@@ -1830,10 +1830,10 @@ test "hc write compilation preserves the serial pending-write rounding" {
         try mlx.check(mlx.mlx_full(&out, &[_]c_int{ 1, rows, 2560 }, 3, val, .bfloat16, s));
         try mlx.check(mlx.mlx_full(&inj, &[_]c_int{ 1, rows, 4, 1 }, 4, val, .bfloat16, s));
         xfm.compiled_hc_write = null;
-        const separate = try xfm.hcWrite(try standinRef(stream), out, inj, 1, rows);
+        const separate = try hcWrite(&xfm, try standinRef(stream), out, inj, 1, rows);
         defer _ = mlx.mlx_array_free(separate);
         xfm.compiled_hc_write = compiled;
-        const together = try xfm.hcWrite(try standinRef(stream), out, inj, 1, rows);
+        const together = try hcWrite(&xfm, try standinRef(stream), out, inj, 1, rows);
         defer _ = mlx.mlx_array_free(together);
         try qkvExpectBitsEqual(s, separate, together);
     }

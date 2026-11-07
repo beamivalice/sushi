@@ -93,6 +93,7 @@ test {
     _ = @import("qwen4/qwen4_qsa_gather.zig");
     _ = @import("qwen4/qwen4_qsa_select.zig");
     _ = @import("qwen4/qwen4_qsa_state.zig");
+    _ = @import("qwen4/qwen4_state.zig");
     _ = @import("qwen4/qwen4_ssm_group.zig");
     _ = @import("qwen4/qwen4_prefix_cache_test.zig");
     _ = @import("qwen4/qwen4_disk_qsa.zig");

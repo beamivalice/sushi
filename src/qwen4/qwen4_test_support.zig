@@ -1,4 +1,8 @@
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
+const qwen4_hc = @import("qwen4_hc.zig");
+const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
+const qwen4_ssm_group = @import("qwen4_ssm_group.zig");
 const std = @import("std");
 const gdn_decode = @import("gdn_decode.zig");
 const mlx = @import("../mlx.zig");
@@ -7,14 +11,14 @@ const KVQuantConfig = kv_quant.KVQuantConfig;
 const testing = std.testing;
 const test_support = @import("../test_support.zig");
 const qwen4ReadF32 = test_support.qwen4ReadF32;
-const ForwardCtx = trf.ForwardCtx;
-const KVCache = trf.KVCache;
-const SSMCacheEntry = trf.SSMCacheEntry;
-const Transformer = trf.Transformer;
-const nextSsmMemberGen = trf.nextSsmMemberGen;
-const ssmFreeQsaState = trf.ssmFreeQsaState;
-const ssmFreeSpecCapture = trf.ssmFreeSpecCapture;
-const ssmRollbackFromCapture = trf.ssmRollbackFromCapture;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const KVCache = trunk_mod.KVCache;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const Transformer = trunk_mod.Transformer;
+const nextSsmMemberGen = qwen4_ssm_group.nextSsmMemberGen;
+const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
+const ssmFreeSpecCapture = trunk_mod.ssmFreeSpecCapture;
+const ssmRollbackFromCapture = trunk_mod.ssmRollbackFromCapture;
 
 /// A QSA-shaped bool mask [1,1,qL,kL]: causal, bottom-right aligned, with a
 /// random half of the complete 4-token blocks dropped per row and the row's
@@ -54,7 +58,7 @@ pub const Qwen4TestSlot = struct {
     ctx: ForwardCtx = undefined,
     /// The MTP head's per-request stash, so a committed-state bar can assert the trunk
     /// verify left it where the solo round did.
-    head: Transformer.Qwen4MtpState,
+    head: qwen4_forward.Qwen4MtpState,
 
     pub fn init(alloc: std.mem.Allocator, n_layers: u32) !*Qwen4TestSlot {
         return initWith(alloc, n_layers, KVQuantConfig.dense);
@@ -132,7 +136,7 @@ pub fn qwen4BatchedPleForward(
     };
     for (ml, 0..) |*lw, l| {
         if (!lw.is_linear and lw.ple == null) continue;
-        merged[l] = try xfm.mergeSsmAcrossSlots(ctxs, l);
+        merged[l] = try qwen4_ssm_group.mergeSsmAcrossSlots(xfm, ctxs, l);
     }
     const off_shape = [_]c_int{@intCast(N)};
     const rope_offset_arr = mlx.mlx_array_new_data(off_buf.ptr, &off_shape, 1, .int32);
@@ -152,13 +156,13 @@ pub fn qwen4BatchedPleForward(
     const tshape = [_]c_int{ @intCast(N), seq_len };
     const tarr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &tshape, 2, .int32);
     defer _ = mlx.mlx_array_free(tarr);
-    const logits = try xfm.forwardQwen4With(&bctx, tarr);
+    const logits = try qwen4_forward.forwardQwen4With(xfm, &bctx, tarr);
     errdefer _ = mlx.mlx_array_free(logits);
     const pending = bctx.ple_pending != null;
-    if (do_flush) try xfm.flushDeferredPle(&bctx) else if (bctx.ple_pending != null) xfm.discardDeferredPle(&bctx);
+    if (do_flush) try qwen4_hc.flushDeferredPle(xfm, &bctx) else if (bctx.ple_pending != null) qwen4_hc.discardDeferredPle(xfm, &bctx);
     for (merged, 0..) |*m, li| {
         if (!ml[li].is_linear and ml[li].ple == null) continue;
-        try xfm.splitSsmToSlots(m, ctxs, li);
+        try qwen4_ssm_group.splitSsmToSlots(xfm, m, ctxs, li);
     }
     for (slots) |sl| sl.off += @intCast(seq_len);
     return .{ .logits = logits, .pending = pending };

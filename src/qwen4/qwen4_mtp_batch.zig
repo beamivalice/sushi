@@ -1,7 +1,8 @@
 //! Flash-Next's draft step for several requests' MTP chains in one head forward (`Drafter.buildBatchedChains`).
 const std = @import("std");
+const qwen4_forward = @import("qwen4_forward.zig");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const generate = @import("../generate.zig");
 const mtp_round = @import("../mtp_round.zig");
 const sampler = @import("../sampler.zig");
@@ -15,7 +16,7 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
     const n = gens.len;
     var i: u32 = from;
     while (i < to) : (i += 1) {
-        var rows: [32]transformer_mod.Transformer.Qwen4MtpBatchRow = undefined;
+        var rows: [32]qwen4_forward.Qwen4MtpBatchRow = undefined;
         var merged_ids: [32]mlx.mlx_array = undefined;
         var merged_hidden: [32]mlx.mlx_array = undefined;
         var own_ids: [32]bool = @splat(false);
@@ -31,7 +32,7 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
         var modes: [32]bool = undefined;
         for (gens, chains, 0..) |g, *c, row| modes[row] = mtp_round.mtpRowRerankMode(g, c, i);
         const use_rerank = modes[0];
-        const project: transformer_mod.Transformer.Qwen4MtpProject = if (use_rerank) .mixed_last_row else .last_row;
+        const project: qwen4_forward.Qwen4MtpProject = if (use_rerank) .mixed_last_row else .last_row;
         for (gens, chains, 0..) |g, *c, k| {
             const qref = g.mtp_cache.?.as("qwen4");
             const st = qref.batchState();
@@ -41,7 +42,7 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
                 var stash = g.mtp_hist_stash.?;
                 g.mtp_hist_stash = null;
                 defer stash.deinit();
-                try qref.t.qwen4MtpTruncateOn(st, stash.off0);
+                try qwen4_forward.qwen4MtpTruncateOn(qref.t, st, stash.off0);
                 var mids = mlx.mlx_array_new();
                 var mh = mlx.mlx_array_new();
                 {
@@ -71,7 +72,7 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
                 .pos_offset = mtp_round.mtpBatchHeadPosition(st.pos_base, st.seq_offset),
             };
         }
-        const outs = try xfm.qwen4MtpForwardBatched(rows[0..n], project, to);
+        const outs = try qwen4_forward.qwen4MtpForwardBatched(xfm, rows[0..n], project, to);
         defer {
             for (outs) |out| {
                 if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
@@ -95,7 +96,7 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
             if (any_sampled) {
                 try mtp_round.mtpGroupSampledDrafts(gens, chains, stacked_x, i);
             } else {
-                const ids = try xfm.qwen4DraftSelectBatched(stacked_x, gens[0].sampling.suppress_mask);
+                const ids = try qwen4_forward.qwen4DraftSelectBatched(xfm, stacked_x, gens[0].sampling.suppress_mask);
                 defer _ = mlx.mlx_array_free(ids);
                 for (chains, 0..) |*c, k| {
                     const k_c: c_int = @intCast(k);

@@ -1,17 +1,18 @@
 //! Flash-Next as the scheduler sees it: what batches, which rounds group, the head it commits beside the KV.
 const std = @import("std");
+const qwen4_forward = @import("qwen4_forward.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const log = @import("../log.zig");
-const transformer = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const scheduler = @import("../scheduler.zig");
 const sched = @import("../arch/sched.zig");
 const qsa_state = @import("qwen4_qsa_state.zig");
 
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
-const Transformer = transformer.Transformer;
-const ForwardCtx = transformer.ForwardCtx;
+const Transformer = trunk_mod.Transformer;
+const ForwardCtx = trunk_mod.ForwardCtx;
 const ModelConfig = model.ModelConfig;
 
 pub fn facts(config: *const ModelConfig) sched.Facts {
@@ -31,7 +32,7 @@ pub fn rowCap(config: *const ModelConfig) ?usize {
 }
 
 pub fn modelBatches(xfm: *const Transformer) bool {
-    return xfm.supportsBatchedGdnDecode();
+    return qwen4_forward.supportsBatchedGdnDecode(xfm);
 }
 
 pub fn padsBatch(config: *const ModelConfig) bool {
@@ -46,9 +47,9 @@ const arm_padded: u8 = 0;
 const arm_rows: u8 = 1;
 
 pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?sched.BatchArm {
-    if (!(xfm.supportsBatchedGdnDecode() and xfm.batchedGdnReady(ctxs))) return null;
+    if (!(qwen4_forward.supportsBatchedGdnDecode(xfm) and qwen4_forward.batchedGdnReady(xfm, ctxs))) return null;
     // A per-row tick moves each slot's `moe_seq_offset` itself; the padded batch leaves it to the scheduler.
-    const rows = xfm.supportsBatchedQwen4Rows();
+    const rows = qwen4_forward.supportsBatchedQwen4Rows(xfm);
     return .{ .arm = if (rows) arm_rows else arm_padded, .moe_positions = true, .advances_offset = !rows };
 }
 
@@ -64,8 +65,8 @@ pub fn batchedForward(
     hidden_rows: ?*?[]mlx.mlx_array,
 ) ![]mlx.mlx_array {
     _ = .{ sch, allocator, batch };
-    if (arm.arm == arm_rows) return xfm.forwardQwen4DecodeRows(next_tokens, ctxs, hidden_rows);
-    return xfm.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, hidden_rows);
+    if (arm.arm == arm_rows) return qwen4_forward.forwardQwen4DecodeRows(xfm, next_tokens, ctxs, hidden_rows);
+    return qwen4_forward.forwardMoeBatchedDecode(xfm, next_tokens, ctxs, rope_offsets, hidden_rows);
 }
 
 /// A head the model owns (never a per-request one) cannot ride a grouped verify.
@@ -77,7 +78,7 @@ pub fn mtpGroupable(slot: *const Slot) bool {
     if (gen.ctx.ssm_entries == null) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
     const t = slot.model.transformer orelse return false;
-    if (!t.supportsBatchedGdnDecode()) return false;
+    if (!qwen4_forward.supportsBatchedGdnDecode(t)) return false;
     return scheduler.specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }
 
@@ -87,7 +88,7 @@ pub fn tickClass(slot: *const Slot) sched.TickClass {
 
 /// The newest checkpoint takes the slot's live QSA indexer history as a view of the capacity buffer (the slot is
 /// torn down right after). A failure commits the entry history-less, which a QSA arch treats as a miss.
-pub fn handoffHistory(slot: *Slot, cps: []transformer.SSMCheckpoint) void {
+pub fn handoffHistory(slot: *Slot, cps: []trunk_mod.SSMCheckpoint) void {
     if (qsa_state.checkpointHasQsaPooled(&cps[cps.len - 1])) return;
     const ents = slot.ssm_entries orelse return;
     const xf = slot.model.transformer orelse return;
@@ -104,9 +105,9 @@ pub fn mtpHeadCommit(head: *const Transformer) ?sched.HeadParts {
         log.warn("[hot-cache] mtp head step gap (cache.step={d}, history={d} rows) — head history not committed\n", .{ hm.cache.step, hm.seq_offset });
         return null;
     }
-    return .{ .entry = &hm.entry, .pos_base = hm.pos_base, .marks = head.qwen4MtpMarks() };
+    return .{ .entry = &hm.entry, .pos_base = hm.pos_base, .marks = qwen4_forward.qwen4MtpMarks(head) };
 }
 
 pub fn resetForRetry(slot: *const Slot, xfm: *Transformer) void {
-    xfm.qwen4MtpResetOwned(slot.enable_mtp);
+    qwen4_forward.qwen4MtpResetOwned(xfm, slot.enable_mtp);
 }

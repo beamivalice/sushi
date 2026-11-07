@@ -1,6 +1,9 @@
 //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
 
-const trf = @import("../transformer.zig");
+const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
+const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
+const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
+const qwen4_ssm_group = @import("qwen4_ssm_group.zig");
 const trunk_mod = @import("../trunk.zig");
 const forward_diag = @import("../forward_diag.zig");
 const linear_mod = @import("../linear.zig");
@@ -8,7 +11,7 @@ const Linear = linear_mod.Linear;
 const bindLinears = @import("../layer_weights.zig").bindLinears;
 const moe_gqmv = @import("../moe_gqmv.zig");
 const qwen4_gdn = @import("qwen4_gdn.zig");
-const Transformer = trf.Transformer;
+const Transformer = trunk_mod.Transformer;
 const sliceBatchRows = Transformer.sliceBatchRows;
 const std = @import("std");
 const sushi_exl3 = @import("sushi_exl3");
@@ -46,92 +49,92 @@ const qkvIdentityArray = test_support.qkvIdentityArray;
 const qwen4ReadF32 = test_support.qwen4ReadF32;
 
 const trunk_stq = @import("../trunk_stq.zig");
-const DenseKVView = trf.DenseKVView;
-const DenseMlpWeights = trf.DenseMlpWeights;
-const FUSED256_MIN_Q_LEN = trf.FUSED256_MIN_Q_LEN;
-const ForwardCtx = trf.ForwardCtx;
-const FullAttnWeights = trf.FullAttnWeights;
+const DenseKVView = trunk_mod.DenseKVView;
+const DenseMlpWeights = trunk_mod.DenseMlpWeights;
+const FUSED256_MIN_Q_LEN = trunk_mod.FUSED256_MIN_Q_LEN;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const FullAttnWeights = trunk_mod.FullAttnWeights;
 const HC_FUSED_D_SOURCE = qwen4_hc.HC_FUSED_D_SOURCE;
 const HC_FUSED_N_SOURCE = qwen4_hc.HC_FUSED_N_SOURCE;
 const HC_FUSED_U_SOURCE = qwen4_hc.HC_FUSED_U_SOURCE;
 const HcPending = qwen4_hc.HcPending;
-const HcWeights = trf.HcWeights;
-const KVCache = trf.KVCache;
-const KVCacheSnapshot = trf.KVCacheSnapshot;
-const LinearAttnWeights = trf.LinearAttnWeights;
-const MAX_BATCH_ROWS = trf.MAX_BATCH_ROWS;
-const ModelConfig = trf.ModelConfig;
-const MoeDecodeDispatchArm = trf.MoeDecodeDispatchArm;
-const MoeLayerWeights = trf.MoeLayerWeights;
-const MoeMlpWeights = trf.MoeMlpWeights;
-const PleWeights = trf.PleWeights;
-const ProfClock = trf.ProfClock;
+const HcWeights = trunk_mod.HcWeights;
+const KVCache = trunk_mod.KVCache;
+const KVCacheSnapshot = trunk_mod.KVCacheSnapshot;
+const LinearAttnWeights = trunk_mod.LinearAttnWeights;
+const MAX_BATCH_ROWS = trunk_mod.MAX_BATCH_ROWS;
+const ModelConfig = trunk_mod.ModelConfig;
+const MoeDecodeDispatchArm = trunk_mod.MoeDecodeDispatchArm;
+const MoeLayerWeights = trunk_mod.MoeLayerWeights;
+const MoeMlpWeights = trunk_mod.MoeMlpWeights;
+const PleWeights = trunk_mod.PleWeights;
+const ProfClock = trunk_mod.ProfClock;
 const QSA_SELECT_KERNEL_HEADER = qwen4_qsa.QSA_SELECT_KERNEL_HEADER;
 const QSA_SELECT_KERNEL_SOURCE = qwen4_qsa.QSA_SELECT_KERNEL_SOURCE;
 const QSA_SELECT_SPLIT_LOCAL_SOURCE = qwen4_qsa.QSA_SELECT_SPLIT_LOCAL_SOURCE;
 const QSA_SELECT_SPLIT_MERGE_SOURCE = qwen4_qsa.QSA_SELECT_SPLIT_MERGE_SOURCE;
 const QsaHeadMark = qwen4_qsa.QsaHeadMark;
 const QsaHeadMarkSet = qwen4_qsa.QsaHeadMarkSet;
-const SSMCacheEntry = trf.SSMCacheEntry;
-const SSMCacheEntrySnapshot = trf.SSMCacheEntrySnapshot;
-const SingleVerifyFeature = trf.SingleVerifyFeature;
-const SsmMergeKind = trf.SsmMergeKind;
-const VerifyProjectionKind = trf.VerifyProjectionKind;
-const Weights = trf.Weights;
-const appendFullAttnWeights = trf.appendFullAttnWeights;
-const appendHybridMlpWeights = trf.appendHybridMlpWeights;
-const appendLinearAttnWeights = trf.appendLinearAttnWeights;
-const appendStructArrays = trf.appendStructArrays;
-const bf16Scalar = trf.bf16Scalar;
-const capturePrefillHidden = trf.capturePrefillHidden;
-const capturePrefillHiddenLast = trf.capturePrefillHiddenLast;
-const constTableAs = trf.constTableAs;
-const decodeProfileEnabled = trf.decodeProfileEnabled;
-const decodeRowsProjection = trf.decodeRowsProjection;
-const diagEnvOn = trf.diagEnvOn;
-const diagEnvOnCached = trf.diagEnvOnCached;
-const fusedSdpa256Masked = trf.fusedSdpa256Masked;
-const fusedSdpaPrefill = trf.fusedSdpaPrefill;
-const gatherQsa256 = trf.gatherQsa256;
-const gatherQsa256Packed = trf.gatherQsa256Packed;
-const gdnGateChain = trf.gdnGateChain;
-const initMoeLayers = trf.initMoeLayers;
-const layerCap = trf.layerCap;
-const loadHcWeights = trf.loadHcWeights;
-const log = trf.log;
-const materializedOwnedCopy = trf.materializedOwnedCopy;
-const moeDecodeDispatchArm = trf.moeDecodeDispatchArm;
-const moeDumpBeginForward = trf.moeDumpBeginForward;
-const moeDumpForwardDone = trf.moeDumpForwardDone;
-const moeRouterFusedEnabled = trf.moeRouterFusedEnabled;
-const mtp_mod = trf.mtp_mod;
-const naxSdpaPreferred = trf.naxSdpaPreferred;
-const scalarOf = trf.scalarOf;
-const splitSpecCaptures = trf.splitSpecCaptures;
-const ssmBindSlotRefs = trf.ssmBindSlotRefs;
-const ssmBindTickState = trf.ssmBindTickState;
-const ssmFreeMergedLayer = trf.ssmFreeMergedLayer;
-const ssmFreeSpecCapture = trf.ssmFreeSpecCapture;
-const ssmSplitAll = trf.ssmSplitAll;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const SSMCacheEntrySnapshot = trunk_mod.SSMCacheEntrySnapshot;
+const SingleVerifyFeature = trunk_mod.SingleVerifyFeature;
+const SsmMergeKind = trunk_mod.SsmMergeKind;
+const VerifyProjectionKind = trunk_mod.VerifyProjectionKind;
+const Weights = trunk_mod.Weights;
+const appendFullAttnWeights = trunk_mod.appendFullAttnWeights;
+const appendHybridMlpWeights = trunk_mod.appendHybridMlpWeights;
+const appendLinearAttnWeights = trunk_mod.appendLinearAttnWeights;
+const appendStructArrays = trunk_mod.appendStructArrays;
+const bf16Scalar = trunk_mod.bf16Scalar;
+const capturePrefillHidden = trunk_mod.capturePrefillHidden;
+const capturePrefillHiddenLast = trunk_mod.capturePrefillHiddenLast;
+const constTableAs = trunk_mod.constTableAs;
+const decodeProfileEnabled = trunk_mod.decodeProfileEnabled;
+const decodeRowsProjection = trunk_mod.decodeRowsProjection;
+const diagEnvOn = trunk_mod.diagEnvOn;
+const diagEnvOnCached = trunk_mod.diagEnvOnCached;
+const fusedSdpa256Masked = qwen4_qsa_gather.fusedSdpa256Masked;
+const fusedSdpaPrefill = trunk_mod.fusedSdpaPrefill;
+const gatherQsa256 = qwen4_qsa_gather.gatherQsa256;
+const gatherQsa256Packed = qwen4_qsa_gather.gatherQsa256Packed;
+const gdnGateChain = qwen4_gdn.gdnGateChain;
+const initMoeLayers = trunk_mod.initMoeLayers;
+const layerCap = trunk_mod.layerCap;
+const loadHcWeights = trunk_mod.loadHcWeights;
+const log = trunk_mod.log;
+const materializedOwnedCopy = trunk_mod.materializedOwnedCopy;
+const moeDecodeDispatchArm = trunk_mod.moeDecodeDispatchArm;
+const moeDumpBeginForward = trunk_mod.moeDumpBeginForward;
+const moeDumpForwardDone = trunk_mod.moeDumpForwardDone;
+const moeRouterFusedEnabled = trunk_mod.moeRouterFusedEnabled;
+const mtp_mod = trunk_mod.mtp_mod;
+const naxSdpaPreferred = trunk_mod.naxSdpaPreferred;
+const scalarOf = trunk_mod.scalarOf;
+const splitSpecCaptures = trunk_mod.splitSpecCaptures;
+const ssmBindSlotRefs = qwen4_ssm_group.ssmBindSlotRefs;
+const ssmBindTickState = qwen4_ssm_group.ssmBindTickState;
+const ssmFreeMergedLayer = trunk_mod.ssmFreeMergedLayer;
+const ssmFreeSpecCapture = trunk_mod.ssmFreeSpecCapture;
+const ssmSplitAll = qwen4_ssm_group.ssmSplitAll;
 const noteQsaArmForSlots = qwen4_qsa.noteQsaArmForSlots;
 const qsaAlignedSparseAttn = qwen4_qsa.qsaAlignedSparseAttn;
-const qsaDecodeGatherAttn = trf.qsaDecodeGatherAttn;
-const qsaHistoryRows = trf.qsaHistoryRows;
-const qsaLeftoverAt = trf.qsaLeftoverAt;
-const qsaMaskFromBlocks = trf.qsaMaskFromBlocks;
+const qsaDecodeGatherAttn = qwen4_qsa_attn.qsaDecodeGatherAttn;
+const qsaHistoryRows = qwen4_qsa_state.qsaHistoryRows;
+const qsaLeftoverAt = qwen4_qsa_state.qsaLeftoverAt;
+const qsaMaskFromBlocks = qwen4_qsa_attn.qsaMaskFromBlocks;
 const qsaPackedGatherServes = qwen4_qsa.qsaPackedGatherServes;
-const qsaResliceToKeep = trf.qsaResliceToKeep;
-const qsaSparseAttnServes = trf.qsaSparseAttnServes;
-const qsaVerifyGatherAttn = trf.qsaVerifyGatherAttn;
-const ropeAngleRows = trf.ropeAngleRows;
-const sliceAttentionSeq = trf.sliceAttentionSeq;
-const ssmFreeQsaState = trf.ssmFreeQsaState;
-const ssmRestore = trf.ssmRestore;
-const ssmSnapshotDeinit = trf.ssmSnapshotDeinit;
-const standinRef = trf.standinRef;
-const truncatePooled = trf.truncatePooled;
-const verifyJoinedProjection = trf.verifyJoinedProjection;
-const weightTriple = trf.weightTriple;
+const qsaResliceToKeep = qwen4_qsa_state.qsaResliceToKeep;
+const qsaSparseAttnServes = qwen4_qsa_attn.qsaSparseAttnServes;
+const qsaVerifyGatherAttn = qwen4_qsa_attn.qsaVerifyGatherAttn;
+const ropeAngleRows = trunk_mod.ropeAngleRows;
+const sliceAttentionSeq = trunk_mod.sliceAttentionSeq;
+const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
+const ssmRestore = trunk_mod.ssmRestore;
+const ssmSnapshotDeinit = trunk_mod.ssmSnapshotDeinit;
+const standinRef = trunk_mod.standinRef;
+const truncatePooled = trunk_mod.truncatePooled;
+const verifyJoinedProjection = trunk_mod.verifyJoinedProjection;
+const weightTriple = trunk_mod.weightTriple;
 
 
 
@@ -359,10 +362,10 @@ pub fn gdnGateClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_
 /// qwen4_exp: compile the four hyper-connection elementwise tails.
 pub fn compileQwen4Hc(self: *Transformer) void {
     const specs = .{
-        .{ &self.compiled_hc_silu, &Transformer.hcSiluCallback, true },
-        .{ &self.compiled_hc_mix, &Transformer.hcMixCallback, false },
-        .{ &self.compiled_hc_inj, &Transformer.hcInjCallback, true },
-        .{ &self.compiled_hc_write, &Transformer.hcWriteCallback, true },
+        .{ &self.compiled_hc_silu, &qwen4_hc.hcSiluCallback, true },
+        .{ &self.compiled_hc_mix, &qwen4_hc.hcMixCallback, false },
+        .{ &self.compiled_hc_inj, &qwen4_hc.hcInjCallback, true },
+        .{ &self.compiled_hc_write, &qwen4_hc.hcWriteCallback, true },
     };
     var n: usize = 0;
     inline for (specs) |sp| {
@@ -472,7 +475,7 @@ pub fn supportsBatchedQwen4Rows(self: *const Transformer) bool {
 /// Full-attention layer with the QSA mask threaded through
 /// `gatedFullAttnWith` (q-gate, QK norm, partial RoPE, KV cache all shared).
 pub fn qwen4AttnWith(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
-    return self.qwen4AttnProjected(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len, is_prefill, null, false);
+    return qwen4AttnProjected(self, ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len, is_prefill, null, false);
 }
 
 pub fn qwen4AttnProjected(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool, projected: ?*const AttnVerifyInputs, skip_output: bool) !mlx.mlx_array {
@@ -495,7 +498,7 @@ pub fn qwen4AttnProjected(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array
     defer Qwen4AttnProf.active = false;
     errdefer Qwen4AttnProf.reset();
     if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
-        ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
+        ctx.qsa_mask = try qwen4_qsa.qsaMask(self, ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
     }
     if (prof) Qwen4AttnProf.lap(if (ctx.qsa_blocks.ctx != null) ctx.qsa_blocks else ctx.qsa_mask, .indexer);
     if (layer == 3) if (Transformer.qwen4_trace) |tr| {
@@ -507,7 +510,7 @@ pub fn qwen4AttnProjected(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array
             Qwen4Trace.set(&tr.qsa_mask, m);
         }
     };
-    const out = try self.gatedFullAttnProjected(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill, projected, skip_output);
+    const out = try gatedFullAttnProjected(self, ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill, projected, skip_output);
     if (prof) Qwen4AttnProf.lap(out, .tail);
     return out;
 }
@@ -690,7 +693,7 @@ pub fn qwen4MtpReset(self: *Transformer) !void {
 }
 
 pub fn qwen4MtpResetOwned(self: *Transformer, enable_mtp: bool) void {
-    if (enable_mtp) self.qwen4MtpReset() catch {};
+    if (enable_mtp) qwen4MtpReset(self) catch {};
 }
 
 pub fn mtpHeadKvQuantEnabled() bool {
@@ -813,12 +816,12 @@ pub const Qwen4MtpProject = enum {
 pub fn qwen4MtpTruncate(self: *Transformer, len: usize) !void {
     const m = &(self.qwen4_mtp orelse return);
     var live = qwen4MtpLiveModule(m);
-    try self.qwen4MtpTruncateLive(&live, len);
+    try qwen4MtpTruncateLive(self, &live, len);
 }
 
 pub fn qwen4MtpTruncateOn(self: *Transformer, st: *Qwen4MtpState, len: usize) !void {
     var live = qwen4MtpLiveState(st);
-    try self.qwen4MtpTruncateLive(&live, len);
+    try qwen4MtpTruncateLive(self, &live, len);
 }
 
 pub fn qwen4MtpTruncateLive(self: *Transformer, live: *Qwen4MtpLive, len: usize) !void {
@@ -839,7 +842,7 @@ pub fn qwen4MtpTruncateLive(self: *Transformer, live: *Qwen4MtpLive, len: usize)
                     const ks = mlx.getShape(live.entry.aux_state);
                     const new_held = ks[1] - drop_tail;
                     if (new_held < @mod(keep, @max(live.entry.qsa_ratio, 1))) {
-                        try self.qwen4MtpTruncateToMarkLive(live, keep);
+                        try qwen4MtpTruncateToMarkLive(self, live, keep);
                     } else {
                         const start = [_]c_int{ 0, 0, 0 };
                         const stop = [_]c_int{ ks[0], new_held, ks[2] };
@@ -909,7 +912,7 @@ pub fn qwen4MtpAdopt(
         break :blk if (sh.len >= 2) sh[1] else 0;
     };
     if (hist != @as(c_int, @intCast(kv_snap.step))) return error.MtpHeadQsaHistoryGap;
-    errdefer self.qwen4MtpReset() catch {};
+    errdefer qwen4MtpReset(self) catch {};
     try m.cache.restore(kv_snap);
     // `ssmRestore` replaces the aux state, so a stale history cannot survive.
     try ssmRestore(&m.entry, aux);
@@ -920,7 +923,7 @@ pub fn qwen4MtpAdopt(
     m.seq_offset = kv_snap.step;
     m.pos_base = pos_base;
     // Unconditional clamp: a snapshot's buffer can be longer than the matched prefix.
-    try self.qwen4MtpTruncate(want);
+    try qwen4MtpTruncate(self, want);
     if (m.seq_offset != want) return error.MtpHeadTrimGap;
 }
 
@@ -939,13 +942,13 @@ pub fn qwen4MtpAdvance(cache: *KVCache, seq_offset: *usize, seq_len: c_int) void
 pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveModule(m);
-    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
+    return qwen4MtpForwardLive(self, m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
 }
 
 pub fn qwen4MtpForwardOn(self: *Transformer, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveState(st);
-    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
+    return qwen4MtpForwardLive(self, m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
 }
 
 pub const Qwen4MtpBatchRow = struct {
@@ -1015,7 +1018,7 @@ pub fn qwen4MtpForwardBatched(
         var buf = try Qwen4MtpOutBuf.init(self.allocator, rows.len);
         errdefer buf.deinit();
         for (rows, 0..) |r, i| {
-            buf.items[i] = try self.qwen4MtpForwardOn(r.st, r.stream, r.token_ids, r.pos_offset, r.mrope_ctx, project);
+            buf.items[i] = try qwen4MtpForwardOn(self, r.st, r.stream, r.token_ids, r.pos_offset, r.mrope_ctx, project);
             buf.built = i + 1;
         }
         return buf.abandon();
@@ -1061,10 +1064,10 @@ pub fn qwen4MtpForwardBatched(
             _ = mlx.mlx_array_free(tok2);
         };
         try mlx.check(mlx.mlx_reshape(&tok2, r.token_ids, &[_]c_int{ 1, seqs[i] }, 2, self.s));
-        tok_parts[i] = try self.mtpPadSeq(tok2, s_max);
+        tok_parts[i] = try mtpPadSeq(self, tok2, s_max);
         _ = mlx.mlx_array_free(tok2);
         tok2 = .{ .ctx = null };
-        str_parts[i] = try self.mtpPadSeq(r.stream, s_max);
+        str_parts[i] = try mtpPadSeq(self, r.stream, s_max);
     }
     const token_ids = try Transformer.concatAxis0(self.s, tok_parts[0..rows.len]);
     defer _ = mlx.mlx_array_free(token_ids);
@@ -1136,12 +1139,12 @@ pub fn qwen4MtpForwardBatched(
             var h_i = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(h_i);
             try mlx.check(mlx.mlx_slice(&h_i, h, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seqs[i], hsh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            var pre = try self.hcRead(h_i, &lw.hc_attn.?, 1, seqs[i]);
+            var pre = try qwen4_hc.hcRead(self, h_i, &lw.hc_attn.?, 1, seqs[i]);
             defer pre.deinit();
-            const ao = try self.qwen4AttnWith(slot_ptrs[i], pre.mixed, fa, &r.st.entry, li, @intCast(r.st.seq_offset), r.st.pos_base, 1, seqs[i], seqs[i] > 1);
+            const ao = try qwen4AttnWith(self, slot_ptrs[i], pre.mixed, fa, &r.st.entry, li, @intCast(r.st.seq_offset), r.st.pos_base, 1, seqs[i], seqs[i] > 1);
             defer _ = mlx.mlx_array_free(ao);
-            h_i = try self.hcWrite(h_i, ao, pre.inj, 1, seqs[i]);
-            const pre2 = try self.hcRead(h_i, &lw.hc_mlp.?, 1, seqs[i]);
+            h_i = try qwen4_hc.hcWrite(self, h_i, ao, pre.inj, 1, seqs[i]);
+            const pre2 = try qwen4_hc.hcRead(self, h_i, &lw.hc_mlp.?, 1, seqs[i]);
             mlp_mix[i] = pre2.mixed;
             mlp_inj[i] = pre2.inj;
             h_parts[i] = h_i;
@@ -1152,7 +1155,7 @@ pub fn qwen4MtpForwardBatched(
     const mix_all = try Transformer.concatAxis0(self.s, mlp_mix[0..rows.len]);
     defer _ = mlx.mlx_array_free(mix_all);
     const mo_all = switch (lw.mlp) {
-        .moe => |*mw| try self.mtpMoeRows(mix_all, mw),
+        .moe => |*mw| try mtpMoeRows(self, mix_all, mw),
         .dense => |*dw| try self.denseMLP(mix_all, dw),
     };
     defer _ = mlx.mlx_array_free(mo_all);
@@ -1162,7 +1165,7 @@ pub fn qwen4MtpForwardBatched(
         var mo_i = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mo_i);
         try mlx.check(mlx.mlx_slice(&mo_i, mo_all, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seqs[i], msh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-        h_parts[i] = try self.hcWrite(h_parts[i], mo_i, mlp_inj[i], 1, seqs[i]);
+        h_parts[i] = try qwen4_hc.hcWrite(self, h_parts[i], mo_i, mlp_inj[i], 1, seqs[i]);
     }
     for (rows, 0..) |r, i| {
         qwen4MtpAdvance(&r.st.cache, &r.st.seq_offset, seqs[i]);
@@ -1206,7 +1209,7 @@ pub fn qwen4MtpForwardBatched(
         part.* = .{ .ctx = null };
     }
     const n_rows: c_int = @intCast(rows.len);
-    const mix = try self.hcRead(last_h, &m.mixer, n_rows, 1);
+    const mix = try qwen4_hc.hcRead(self, last_h, &m.mixer, n_rows, 1);
     if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
     defer if (mix.mixed.ctx != null) {
         _ = mlx.mlx_array_free(mix.mixed);
@@ -1290,22 +1293,22 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
     defer Transformer.endMropeChunk(&ctx);
     const li: u32 = cfg.num_hidden_layers;
     const lw = &m.layer;
-    var pre = try self.hcRead(h, &lw.hc_attn.?, batch, seq_len);
+    var pre = try qwen4_hc.hcRead(self, h, &lw.hc_attn.?, batch, seq_len);
     defer pre.deinit();
     const attn_out = switch (lw.attn) {
-        .full => |*fa| try self.qwen4AttnWith(&ctx, pre.mixed, fa, live.entry, li, @intCast(live.seq_offset.*), live.pos_base.*, batch, seq_len, is_prefill),
+        .full => |*fa| try qwen4AttnWith(self, &ctx, pre.mixed, fa, live.entry, li, @intCast(live.seq_offset.*), live.pos_base.*, batch, seq_len, is_prefill),
         .linear => return error.MtpLayerNotAttention,
     };
     defer _ = mlx.mlx_array_free(attn_out);
-    h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len);
-    var pre2 = try self.hcRead(h, &lw.hc_mlp.?, batch, seq_len);
+    h = try qwen4_hc.hcWrite(self, h, attn_out, pre.inj, batch, seq_len);
+    var pre2 = try qwen4_hc.hcRead(self, h, &lw.hc_mlp.?, batch, seq_len);
     defer pre2.deinit();
     const mlp_out = switch (lw.mlp) {
         .moe => |*mw| try self.moeMLP(pre2.mixed, mw),
         .dense => |*dw| try self.denseMLP(pre2.mixed, dw),
     };
     defer _ = mlx.mlx_array_free(mlp_out);
-    h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len);
+    h = try qwen4_hc.hcWrite(self, h, mlp_out, pre2.inj, batch, seq_len);
     qwen4MtpAdvance(live.cache, live.seq_offset, seq_len);
 
     // History append wants the stream and nothing else: the mixer read and
@@ -1334,7 +1337,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
         out_seq = 1;
     }
 
-    const mix = try self.hcRead(h, &m.mixer, batch, out_seq);
+    const mix = try qwen4_hc.hcRead(self, h, &m.mixer, batch, out_seq);
     if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
     // Rerank draft: the mixer output IS the answer. Skipping
     // `lmHeadProject` here is the whole point — the 248320-wide 8-bit
@@ -1383,7 +1386,7 @@ pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
 pub fn qwen4DraftRerankReady(self: *Transformer) bool {
     const m = &(self.qwen4_mtp orelse return false);
     if (m.rerank_tried) return m.rerank != null;
-    return self.qwen4BuildDraftRerank();
+    return qwen4BuildDraftRerank(self);
 }
 
 /// One greedy draft id from the mixer output `x` `[B,1,H]`. Shares the
@@ -1558,7 +1561,7 @@ pub fn forwardQwen4VerifyRows(
             }
             group_projection = group_projection and total <= 12;
         }
-        var attn_reads: [MAX_BATCH_ROWS]Transformer.HcRead = undefined;
+        var attn_reads: [MAX_BATCH_ROWS]qwen4_hc.HcRead = undefined;
         var attn_count: usize = 0;
         defer for (attn_reads[0..attn_count]) |*read| read.deinit();
         var attn_inputs: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
@@ -1566,9 +1569,9 @@ pub fn forwardQwen4VerifyRows(
         var generations: [MAX_BATCH_ROWS]u64 = undefined;
         for (rows[0..initialized], 0..) |*row, i| {
             self.fwd_gen = row.generation;
-            if (layer.ple) |*pw| try self.addVerifyPle(row, pw, layer_idx, i);
+            if (layer.ple) |*pw| try qwen4_hc.addVerifyPle(self, row, pw, layer_idx, i);
         }
-        const joined_attn = try self.hcReadVerifyRows(rows[0..initialized], &layer.hc_attn.?);
+        const joined_attn = try qwen4_hc.hcReadVerifyRows(self, rows[0..initialized], &layer.hc_attn.?);
         defer if (joined_attn) |values| {
             for (values) |*value| if (value.mixed.ctx != null) value.deinit();
             self.allocator.free(values);
@@ -1579,7 +1582,7 @@ pub fn forwardQwen4VerifyRows(
                 const value = values[i];
                 values[i] = .{ .mixed = .{}, .inj = .{} };
                 break :blk value;
-            } else try self.hcReadPending(&row.h, &layer.hc_attn.?, 1, row.seq, &row.pending);
+            } else try qwen4_hc.hcReadPending(self, &row.h, &layer.hc_attn.?, 1, row.seq, &row.pending);
             if (group_projection) {
                 attn_reads[i] = read;
                 attn_count += 1;
@@ -1589,17 +1592,17 @@ pub fn forwardQwen4VerifyRows(
             } else {
                 defer read.deinit();
                 const attn = switch (layer.attn) {
-                    .linear => |*la| try self.gatedDeltaNet(read.mixed, la, &row.entries[layer_idx], layer_idx, 1, row.seq, true),
-                    .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
+                    .linear => |*la| try gatedDeltaNet(self, read.mixed, la, &row.entries[layer_idx], layer_idx, 1, row.seq, true),
+                    .full => |*fa| try qwen4AttnWith(self, row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                 };
                 defer _ = mlx.mlx_array_free(attn);
-                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+                try qwen4_hc.hcWriteOrDefer(self, &row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
             }
         }
         if (group_projection) {
             const projected = switch (layer.attn) {
-                .linear => |*la| try self.gdnVerifyRows(attn_inputs[0..initialized], attn_entries[0..initialized], generations[0..initialized], layer_idx, la),
-                .full => |*fa| try self.attnVerifyRows(attn_inputs[0..initialized], attn_entries[0..initialized], ctxs, generations[0..initialized], layer_idx, fa),
+                .linear => |*la| try gdnVerifyRows(self, attn_inputs[0..initialized], attn_entries[0..initialized], generations[0..initialized], layer_idx, la),
+                .full => |*fa| try attnVerifyRows(self, attn_inputs[0..initialized], attn_entries[0..initialized], ctxs, generations[0..initialized], layer_idx, fa),
             };
             defer if (projected) |values| {
                 for (values) |value| _ = mlx.mlx_array_free(value);
@@ -1608,19 +1611,19 @@ pub fn forwardQwen4VerifyRows(
             for (rows[0..initialized], attn_reads[0..initialized], 0..) |*row, read, i| {
                 self.fwd_gen = row.generation;
                 const attn = if (projected) |values| try standinRef(values[i]) else switch (layer.attn) {
-                    .linear => |*la| try self.gatedDeltaNet(read.mixed, la, &row.entries[layer_idx], layer_idx, 1, row.seq, true),
-                    .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
+                    .linear => |*la| try gatedDeltaNet(self, read.mixed, la, &row.entries[layer_idx], layer_idx, 1, row.seq, true),
+                    .full => |*fa| try qwen4AttnWith(self, row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                 };
                 defer _ = mlx.mlx_array_free(attn);
-                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+                try qwen4_hc.hcWriteOrDefer(self, &row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
             }
         }
 
-        var reads: [MAX_BATCH_ROWS]Transformer.HcRead = undefined;
+        var reads: [MAX_BATCH_ROWS]qwen4_hc.HcRead = undefined;
         var read_count: usize = 0;
         defer for (reads[0..read_count]) |*read| read.deinit();
         var inputs: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-        const joined_mlp = try self.hcReadVerifyRows(rows[0..initialized], &layer.hc_mlp.?);
+        const joined_mlp = try qwen4_hc.hcReadVerifyRows(self, rows[0..initialized], &layer.hc_mlp.?);
         defer if (joined_mlp) |values| {
             for (values) |*value| if (value.mixed.ctx != null) value.deinit();
             self.allocator.free(values);
@@ -1631,7 +1634,7 @@ pub fn forwardQwen4VerifyRows(
                 const value = values[i];
                 values[i] = .{ .mixed = .{}, .inj = .{} };
                 break :blk value;
-            } else try self.hcReadPending(&row.h, &layer.hc_mlp.?, 1, row.seq, &row.pending);
+            } else try qwen4_hc.hcReadPending(self, &row.h, &layer.hc_mlp.?, 1, row.seq, &row.pending);
             read_count += 1;
             inputs[i] = reads[i].mixed;
         }
@@ -1646,7 +1649,7 @@ pub fn forwardQwen4VerifyRows(
         }
         for (rows[0..initialized], mlp, reads[0..initialized]) |*row, value, read| {
             self.fwd_gen = row.generation;
-            try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+            try qwen4_hc.hcWriteOrDefer(self, &row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
         }
     }
 
@@ -1673,7 +1676,7 @@ pub fn forwardQwen4VerifyRows(
     };
     for (rows[0..initialized], 0..) |*row, i| {
         self.fwd_gen = row.generation;
-        try self.hcFlush(&row.h, 1, row.seq, &row.pending);
+        try qwen4_hc.hcFlush(self, &row.h, 1, row.seq, &row.pending);
         row.ctx.moe_seq_offset.* += @intCast(row.seq);
         var all = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&all, row.h));
@@ -1682,7 +1685,7 @@ pub fn forwardQwen4VerifyRows(
         var last = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_slice(&last, row.h, &.{ 0, shape[1] - 1, 0 }, 3, &.{ 1, shape[1], shape[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(last);
-        const mix = try self.hcReadPending(&row.h, &self.qwen4_mixer.?, 1, row.seq, &row.pending);
+        const mix = try qwen4_hc.hcReadPending(self, &row.h, &self.qwen4_mixer.?, 1, row.seq, &row.pending);
         _ = mlx.mlx_array_free(row.h);
         row.h = .{ .ctx = null };
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
@@ -1774,11 +1777,11 @@ pub fn forwardQwen4DecodeRows(
     defer for (ctxs) |ctx| {
         ctx.ple_defer = false;
     };
-    errdefer for (ctxs) |ctx| self.discardDeferredPle(ctx);
+    errdefer for (ctxs) |ctx| qwen4_hc.discardDeferredPle(self, ctx);
     self.spec_capture_ssm = false;
     var generation = self.fwd_gen;
     for (ctxs, next_tokens) |ctx, token| {
-        try self.ssmGroupRelease(ctx);
+        try qwen4_ssm_group.ssmGroupRelease(self, ctx);
         generation +%= 1;
         self.fwd_gen = generation;
         const id: i32 = @intCast(token);
@@ -1813,11 +1816,11 @@ pub fn forwardQwen4DecodeRows(
         const li: u32 = @intCast(layer_idx);
         if (layer.ple) |*pw| for (live, 0..) |*row, i| {
             self.fwd_gen = row.generation;
-            try self.addVerifyPle(row, pw, layer_idx, i);
+            try qwen4_hc.addVerifyPle(self, row, pw, layer_idx, i);
         };
 
-        var attn_reads: [MAX_BATCH_ROWS]Transformer.HcRead = undefined;
-        try self.hcReadRows(live, &layer.hc_attn.?, &attn_reads);
+        var attn_reads: [MAX_BATCH_ROWS]qwen4_hc.HcRead = undefined;
+        try qwen4_hc.hcReadRows(self, live, &layer.hc_attn.?, &attn_reads);
         defer for (attn_reads[0..n]) |*read| read.deinit();
         var inputs: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
         var entries: [MAX_BATCH_ROWS]*SSMCacheEntry = undefined;
@@ -1828,8 +1831,8 @@ pub fn forwardQwen4DecodeRows(
             generations[i] = row.generation;
         }
         const projected = switch (layer.attn) {
-            .linear => |*la| try self.gdnDecodeRows(inputs[0..n], entries[0..n], generations[0..n], layer_idx, la),
-            .full => |*fa| try self.attnDecodeRows(inputs[0..n], entries[0..n], ctxs, generations[0..n], layer_idx, fa),
+            .linear => |*la| try gdnDecodeRows(self, inputs[0..n], entries[0..n], generations[0..n], layer_idx, la),
+            .full => |*fa| try attnDecodeRows(self, inputs[0..n], entries[0..n], ctxs, generations[0..n], layer_idx, fa),
         };
         defer if (projected) |values| {
             for (values) |value| _ = mlx.mlx_array_free(value);
@@ -1838,15 +1841,15 @@ pub fn forwardQwen4DecodeRows(
         for (live, attn_reads[0..n], 0..) |*row, read, i| {
             self.fwd_gen = row.generation;
             const attn = if (projected) |values| try standinRef(values[i]) else switch (layer.attn) {
-                .linear => |*la| try self.gatedDeltaNet(read.mixed, la, entries[i], layer_idx, 1, 1, false),
-                .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, entries[i], li, @intCast(row.offset), 0, 1, 1, false),
+                .linear => |*la| try gatedDeltaNet(self, read.mixed, la, entries[i], layer_idx, 1, 1, false),
+                .full => |*fa| try qwen4AttnWith(self, row.ctx, read.mixed, fa, entries[i], li, @intCast(row.offset), 0, 1, 1, false),
             };
             defer _ = mlx.mlx_array_free(attn);
-            try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, 1, layer.hc_mlp.?.inject_flat, &row.pending);
+            try qwen4_hc.hcWriteOrDefer(self, &row.h, attn, read.inj, 1, 1, layer.hc_mlp.?.inject_flat, &row.pending);
         }
 
-        var mlp_reads: [MAX_BATCH_ROWS]Transformer.HcRead = undefined;
-        try self.hcReadRows(live, &layer.hc_mlp.?, &mlp_reads);
+        var mlp_reads: [MAX_BATCH_ROWS]qwen4_hc.HcRead = undefined;
+        try qwen4_hc.hcReadRows(self, live, &layer.hc_mlp.?, &mlp_reads);
         defer for (mlp_reads[0..n]) |*read| read.deinit();
         for (live, 0..) |_, i| inputs[i] = mlp_reads[i].mixed;
         const mlp: []mlx.mlx_array = switch (layer.mlp) {
@@ -1872,7 +1875,7 @@ pub fn forwardQwen4DecodeRows(
         const next_inject: mlx.mlx_array = if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) layers[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null };
         for (live, mlp, mlp_reads[0..n]) |*row, value, read| {
             self.fwd_gen = row.generation;
-            try self.hcWriteOrDefer(&row.h, value, read.inj, 1, 1, next_inject, &row.pending);
+            try qwen4_hc.hcWriteOrDefer(self, &row.h, value, read.inj, 1, 1, next_inject, &row.pending);
         }
     }
 
@@ -1891,10 +1894,10 @@ pub fn forwardQwen4DecodeRows(
     };
     for (live, 0..) |*row, i| {
         self.fwd_gen = row.generation;
-        try self.hcFlush(&row.h, 1, 1, &row.pending);
+        try qwen4_hc.hcFlush(self, &row.h, 1, 1, &row.pending);
         row.ctx.moe_seq_offset.* += 1;
         if (hidden_out) |values| values[i] = try materializedOwnedCopy(self.s, row.h);
-        const mix = try self.hcReadPending(&row.h, &self.qwen4_mixer.?, 1, 1, &row.pending);
+        const mix = try qwen4_hc.hcReadPending(self, &row.h, &self.qwen4_mixer.?, 1, 1, &row.pending);
         _ = mlx.mlx_array_free(row.h);
         row.h = .{ .ctx = null };
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
@@ -1930,7 +1933,7 @@ pub fn forwardQwen4DecodeRows(
         made += 1;
     }
     self.fwd_gen = generation;
-    try self.flushDeferredPleGroup(ctxs);
+    try qwen4_hc.flushDeferredPleGroup(self, ctxs);
     if (hidden_rows) |dst| dst.* = hidden_out;
     hidden_out = null;
     return logits;
@@ -2027,7 +2030,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         const entry = &entries[layer_idx];
         const next_safe = defer_moe and layer_idx + 1 < layerCap(cfg.num_hidden_layers) and streamedSuccessorSafe(&ml[layer_idx + 1]);
         if (deferred != null and !streamedSuccessorSafe(lw))
-            _ = try self.verifyQwenMoe(&deferred, &h, &pending, batch, seq_len);
+            _ = try verifyQwenMoe(self, &deferred, &h, &pending, batch, seq_len);
         var undo: ?StreamGdnUndo = if (deferred != null) try StreamGdnUndo.init(entry) else null;
         defer if (undo) |*u| u.deinit();
         var submitted: ?Transformer.StreamMoe = null;
@@ -2035,24 +2038,24 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
 
         if (lw.ple != null and !ctx.skip_ple) {
             const pw = &lw.ple.?;
-            try self.hcFlush(&h, batch, seq_len, &pending);
-            const add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
+            try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
+            const add = try qwen4_hc.pleForward(self, ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
             defer _ = mlx.mlx_array_free(add);
             var h_ple = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_add(&h_ple, h, add, self.s));
             _ = mlx.mlx_array_free(h);
             h = h_ple;
-            if (prof.timing) try self.plePreEval(ctx);
+            if (prof.timing) try qwen4_hc.plePreEval(self, ctx);
             try prof.lap(h, .ple);
         }
 
         const si = qwen4Standin();
-        var pre: Transformer.HcRead = if (si.hc) try self.hcReadStandin(h, batch, seq_len) else try self.hcReadPending(&h, &lw.hc_attn.?, batch, seq_len, &pending);
+        var pre: qwen4_hc.HcRead = if (si.hc) try qwen4_hc.hcReadStandin(self, h, batch, seq_len) else try qwen4_hc.hcReadPending(self, &h, &lw.hc_attn.?, batch, seq_len, &pending);
         defer pre.deinit();
         try prof.lap(pre.mixed, .hc_read);
         const attn_out = switch (lw.attn) {
-            .linear => |*la| if (si.gdn) try standinRef(pre.mixed) else try self.gatedDeltaNet(pre.mixed, la, entry, layer_idx, batch, seq_len, is_prefill),
-            .full => |*fa| if (si.attn) try standinRef(pre.mixed) else try self.qwen4AttnWith(ctx, pre.mixed, fa, entry, li, @intCast(offset), 0, batch, seq_len, is_prefill),
+            .linear => |*la| if (si.gdn) try standinRef(pre.mixed) else try gatedDeltaNet(self, pre.mixed, la, entry, layer_idx, batch, seq_len, is_prefill),
+            .full => |*fa| if (si.attn) try standinRef(pre.mixed) else try qwen4AttnWith(self, ctx, pre.mixed, fa, entry, li, @intCast(offset), 0, batch, seq_len, is_prefill),
         };
         defer _ = mlx.mlx_array_free(attn_out);
         try prof.lap(attn_out, if (lw.attn == .linear) .gdn else .attn);
@@ -2065,11 +2068,11 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             Qwen4Trace.set(&tr.inj_attn, pre.inj);
             Qwen4Trace.set(&tr.attn_out, attn_out);
         };
-        if (si.hc) h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending);
-        if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
+        if (si.hc) h = try qwen4_hc.hcWrite(self, h, attn_out, pre.inj, batch, seq_len) else try qwen4_hc.hcWriteOrDefer(self, &h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending);
+        if (prof.timing) try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
         try prof.lap(h, .hc_write);
 
-        var pre2: Transformer.HcRead = if (si.hc) try self.hcReadStandin(h, batch, seq_len) else try self.hcReadPending(&h, &lw.hc_mlp.?, batch, seq_len, &pending);
+        var pre2: qwen4_hc.HcRead = if (si.hc) try qwen4_hc.hcReadStandin(self, h, batch, seq_len) else try qwen4_hc.hcReadPending(self, &h, &lw.hc_mlp.?, batch, seq_len, &pending);
         defer pre2.deinit();
         try prof.lap(pre2.mixed, .hc_read);
         var mlp_out = if (si.mlp) try standinRef(pre2.mixed) else switch (lw.mlp) {
@@ -2085,7 +2088,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         };
         defer _ = mlx.mlx_array_free(mlp_out);
         if (deferred != null) {
-            if (!try self.verifyQwenMoe(&deferred, &h, &pending, batch, seq_len)) {
+            if (!try verifyQwenMoe(self, &deferred, &h, &pending, batch, seq_len)) {
                 undo.?.restore(entry);
                 continue;
             }
@@ -2109,8 +2112,8 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             Qwen4Trace.set(&tr.inj_mlp, pre2.inj);
             Qwen4Trace.set(&tr.mlp_out, mlp_out);
         };
-        if (si.hc) h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending);
-        if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
+        if (si.hc) h = try qwen4_hc.hcWrite(self, h, mlp_out, pre2.inj, batch, seq_len) else try qwen4_hc.hcWriteOrDefer(self, &h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending);
+        if (prof.timing) try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
         try prof.lap(h, .hc_write);
         prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);
         if (ladder != 0 and seq_len == 1 and (layer_idx + 1) % ladder == 0 and !ladder_blocked) {
@@ -2119,7 +2122,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             if (ctx.ple_pending) |pp| {
                 var ids_available = false;
                 if (mlx._mlx_array_is_available(&ids_available, pp.token_ids) == 0 and ids_available)
-                    try self.flushDeferredPle(ctx)
+                    try qwen4_hc.flushDeferredPle(self, ctx)
                 else
                     ladder_blocked = true;
             }
@@ -2136,7 +2139,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         if (ctx.capture_layers) |cl| {
             for (cl.ids, cl.out) |cid, *slot| {
                 if (cid == li) {
-                    try self.hcFlush(&h, batch, seq_len, &pending);
+                    try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
                     if (cl.hc_mean == 0) {
                         _ = mlx.mlx_array_set(slot, h);
                     } else {
@@ -2148,8 +2151,8 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             }
         }
         if (is_prefill and Transformer.prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
-            try self.hcFlush(&h, batch, seq_len, &pending);
-            try self.plePreEval(ctx);
+            try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
+            try qwen4_hc.plePreEval(self, ctx);
             try Transformer.evalCadencePoint(h, ctx.ssm_entries);
         }
         dt.layer(h, layer_idx);
@@ -2158,8 +2161,8 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     std.debug.assert(deferred == null);
 
     if (ctx.capture_stream_all != null or ctx.capture_hidden != null or ctx.capture_hidden_all != null) {
-        try self.hcFlush(&h, batch, seq_len, &pending);
-        try self.plePreEval(ctx);
+        try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
+        try qwen4_hc.plePreEval(self, ctx);
     }
     ctx.moe_seq_offset.* += @intCast(seq_len);
     dt.end(h);
@@ -2173,7 +2176,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     }
     if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, true);
 
-    const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
+    const mix = try qwen4_hc.hcReadPending(self, &h, &self.qwen4_mixer.?, batch, seq_len, &pending);
     // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
     _ = mlx.mlx_array_free(h);
     h = .{ .ctx = null };
@@ -2346,7 +2349,7 @@ pub fn gatedFullAttnProjected(
         self.rms_eps_arr.ctx != null)
     blk: {
         const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
-        const angles = self.qkAngleFor(rope_family, rope_dims, rope_base, rope_freqs, eff_off, 1.0) catch break :blk;
+        const angles = qkAngleFor(self, rope_family, rope_dims, rope_base, rope_freqs, eff_off, 1.0) catch break :blk;
         const ms: ?mlx.mlx_array = if (use_yarn)
             try constTableAs(self.yarn_mscale.?, mlx.mlx_array_dtype(queries), &self.yarn_mscale_cast, self.s)
         else
@@ -2412,12 +2415,12 @@ pub fn gatedFullAttnProjected(
             // folded each slot's M-RoPE delta into it.
             try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, rope_dims, false, rope_base, 1.0, off_arr, rope_freqs, self.s));
             try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, rope_base, 1.0, off_arr, rope_freqs, self.s));
-            if (use_yarn) try self.yarnScaleQK(&q_rope, &k_rope);
+            if (use_yarn) try yarnScaleQK(self, &q_rope, &k_rope);
         } else {
             const eff_offset: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
             try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, eff_offset, rope_freqs, self.s));
             try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, eff_offset, rope_freqs, self.s));
-            if (use_yarn) try self.yarnScaleQK(&q_rope, &k_rope);
+            if (use_yarn) try yarnScaleQK(self, &q_rope, &k_rope);
         }
     }
 
@@ -2442,7 +2445,7 @@ pub fn gatedFullAttnProjected(
                 self.batched_kv_append_override orelse true,
             );
 
-            if (try self.qsaBatchedAttn(ctx, slots, q_rope, layer, seq_len, attn_scale)) |gathered| {
+            if (try qwen4_qsa.qsaBatchedAttn(self, ctx, slots, q_rope, layer, seq_len, attn_scale)) |gathered| {
                 _ = mlx.mlx_array_free(attn_out_b);
                 attn_out_b = gathered;
             } else {
@@ -2486,7 +2489,7 @@ pub fn gatedFullAttnProjected(
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, false, self.s));
             }
         }
-        return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, skip_output);
+        return gatedAttnTail(self, attn_out_b, gate, fa, flat_shape, skip_output);
     }
 
     var kv_view = try cache.update(layer, k_rope, v_t, self.s, 0);
@@ -2601,7 +2604,7 @@ pub fn gatedFullAttnProjected(
     if (Qwen4AttnProf.active) Qwen4AttnProf.lap(attn_out, .qsa);
 
     if (layer == 3) if (Transformer.qwen4_trace) |tr| Qwen4Trace.set(&tr.attn3_pre_tail, attn_out);
-    return self.gatedAttnTail(attn_out, gate, fa, flat_shape, skip_output);
+    return gatedAttnTail(self, attn_out, gate, fa, flat_shape, skip_output);
 }
 
 /// Shared tail of `gatedFullAttnWith`: transpose the attention output back
@@ -2732,12 +2735,12 @@ pub fn verifyRowsJoined(
                 defer values.deinit();
                 self.fwd_gen = generation;
                 const ctx = ctxs[i];
-                break :blk try self.qwen4AttnProjected(ctx, input, w, entry, @intCast(layer), @intCast(ctx.moe_seq_offset.*), 0, 1, widths[i], !decode, &values, true);
+                break :blk try qwen4AttnProjected(self, ctx, input, w, entry, @intCast(layer), @intCast(ctx.moe_seq_offset.*), 0, 1, widths[i], !decode, &values, true);
             },
             .gdn => blk: {
                 const values = try projections.slice(self.s, offset, widths[i]);
                 self.fwd_gen = generation;
-                break :blk try self.gatedDeltaNetProjected(input, w, entry, layer, 1, widths[i], !decode, values, true);
+                break :blk try qwen4_gdn.gatedDeltaNetProjected(self, input, w, entry, layer, 1, widths[i], !decode, values, true);
             },
         };
         offset += widths[i];
@@ -2800,11 +2803,11 @@ pub fn verifyRowsJoined(
 }
 
 pub fn attnDecodeRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, ctxs: []const *ForwardCtx, generations: []const u64, layer: usize, fa: *const FullAttnWeights) !?[]mlx.mlx_array {
-    return self.verifyRowsJoined(.attention, true, inputs, entries, ctxs, generations, layer, fa);
+    return verifyRowsJoined(self, .attention, true, inputs, entries, ctxs, generations, layer, fa);
 }
 
 pub fn attnVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, ctxs: []const *ForwardCtx, generations: []const u64, layer: usize, fa: *const FullAttnWeights) !?[]mlx.mlx_array {
-    return self.verifyRowsJoined(.attention, false, inputs, entries, ctxs, generations, layer, fa);
+    return verifyRowsJoined(self, .attention, false, inputs, entries, ctxs, generations, layer, fa);
 }
 
 pub fn projectRows(s: mlx.mlx_stream, comptime decode: bool, comptime kind: VerifyRowsKind, x: mlx.mlx_array, lin: *const Linear, widths: []const c_int) !?mlx.mlx_array {
@@ -2820,11 +2823,11 @@ pub fn projectRows(s: mlx.mlx_stream, comptime decode: bool, comptime kind: Veri
 }
 
 pub fn gdnDecodeRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, generations: []const u64, layer: usize, la: *const LinearAttnWeights) !?[]mlx.mlx_array {
-    return self.verifyRowsJoined(.gdn, true, inputs, entries, &.{}, generations, layer, la);
+    return verifyRowsJoined(self, .gdn, true, inputs, entries, &.{}, generations, layer, la);
 }
 
 pub fn gdnVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, generations: []const u64, layer: usize, la: *const LinearAttnWeights) !?[]mlx.mlx_array {
-    return self.verifyRowsJoined(.gdn, false, inputs, entries, &.{}, generations, layer, la);
+    return verifyRowsJoined(self, .gdn, false, inputs, entries, &.{}, generations, layer, la);
 }
 
 // ── GatedDeltaNet (linear attention layers) ──
@@ -2839,7 +2842,7 @@ pub fn gatedDeltaNet(
     seq_len: c_int,
     is_prefill: bool,
 ) !mlx.mlx_array {
-    return self.gatedDeltaNetProjected(x, la, ssm, layer_idx, batch, seq_len, is_prefill, null, false);
+    return qwen4_gdn.gatedDeltaNetProjected(self, x, la, ssm, layer_idx, batch, seq_len, is_prefill, null, false);
 }
 
 pub const DeferredQwenMoe = struct {
@@ -2880,7 +2883,7 @@ pub fn verifyQwenMoe(self: *Transformer, deferred: *?DeferredQwenMoe, h: *mlx.ml
         pending.* = null;
         restoreStreamH(h, &d.h);
         const next = @as(usize, d.moe.stream_ctx.layer) + 1;
-        try self.hcWriteOrDefer(h, exact, d.inj, batch, seq, self.moe_layers.?[next].hc_attn.?.inject_flat, pending);
+        try qwen4_hc.hcWriteOrDefer(self, h, exact, d.inj, batch, seq, self.moe_layers.?[next].hc_attn.?.inject_flat, pending);
     }
     return kept;
 }
@@ -3920,7 +3923,7 @@ const Qwen4LadderRig = struct {
         try bindLinears(&layers[0].ple.?, &x.config);
         x.moe_layers = layers[0..LAYERS];
         x.decode_async_ladder = 0;
-        x.decode_async_ladder_qwen4 = Transformer.qwen4DecodeLadderStride(null);
+        x.decode_async_ladder_qwen4 = qwen4DecodeLadderStride(null);
     }
 
     pub fn deinit(self: *Qwen4LadderRig) void {
@@ -3946,10 +3949,10 @@ const Qwen4LadderRig = struct {
         x.decode_async_ladder = ladder;
         defer x.decode_async_ladder = 0;
         var ctx: ForwardCtx = .{ .cache = @ptrCast(&self.fx.cache_bytes), .moe_seq_offset = &slot.off, .ssm_entries = &slot.entries, .capture_hidden = null, .vision_embeddings = null, .ple_defer = true };
-        const logits = try x.forwardQwen4With(&ctx, ids);
+        const logits = try forwardQwen4With(x, &ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
         const pending = ctx.ple_pending != null;
-        try x.flushDeferredPle(&ctx);
+        try qwen4_hc.flushDeferredPle(x, &ctx);
         return .{ .logits = try qwen4ReadF32(testing.allocator, logits, x.s), .pending = pending };
     }
 
@@ -3957,7 +3960,7 @@ const Qwen4LadderRig = struct {
         const shape = [_]c_int{ 1, @intCast(ids.len) };
         const arr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &shape, 2, .int32);
         defer _ = mlx.mlx_array_free(arr);
-        const logits = try self.fx.xfm().forwardQwen4With(&sl.ctx, arr);
+        const logits = try forwardQwen4With(self.fx.xfm(), &sl.ctx, arr);
         defer _ = mlx.mlx_array_free(logits);
         try mlx.check(mlx.mlx_array_eval(logits));
     }
@@ -3966,7 +3969,7 @@ const Qwen4LadderRig = struct {
     fn batchedStep(self: *Qwen4LadderRig, slots: []const *Qwen4TestSlot, ids: []const i32, ladder: u32, fill: bool) !Step {
         const x = self.fx.xfm();
         x.decode_async_ladder_qwen4 = ladder;
-        defer x.decode_async_ladder_qwen4 = Transformer.qwen4DecodeLadderStride(null);
+        defer x.decode_async_ladder_qwen4 = qwen4DecodeLadderStride(null);
         const run = try qwen4BatchedPleForward(x, slots, ids, 1, false, true, fill);
         defer _ = mlx.mlx_array_free(run.logits);
         return .{ .logits = try qwen4ReadF32(testing.allocator, run.logits, x.s), .pending = run.pending };
@@ -4205,7 +4208,7 @@ pub fn forwardMoeBatchedDecode(
 
     var hidden = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(hidden);
-    const logits = try self.forwardMoeBatchedRows(token_arr, ctxs, rope_offsets, false, if (hidden_rows != null) &hidden else null, null);
+    const logits = try forwardMoeBatchedRows(self, token_arr, ctxs, rope_offsets, false, if (hidden_rows != null) &hidden else null, null);
     defer _ = mlx.mlx_array_free(logits);
     if (hidden_rows) |out| out.* = try sliceBatchRows(self.allocator, self.s, hidden, next_tokens.len);
     return sliceBatchRows(self.allocator, self.s, logits, next_tokens.len);
@@ -4227,7 +4230,7 @@ pub fn forwardMoeBatchedVerify(
         qwen4_gdn.gdn_batched_verify_logged = true;
         log.info("[batched] gdn batched verify engaged (slots={d}, width={d})\n", .{ ctxs.len, mlx.getShape(token_arr)[1] });
     }
-    return self.forwardMoeBatchedRows(token_arr, ctxs, rope_offsets, true, hidden_last, hidden_all);
+    return forwardMoeBatchedRows(self, token_arr, ctxs, rope_offsets, true, hidden_last, hidden_all);
 }
 
 pub fn forwardMoeBatchedRows(
@@ -4301,15 +4304,15 @@ pub fn forwardMoeBatchedRows(
 
     // qwen4_exp rides the same driver: GDN + PLE window merged here, QSA
     // key histories reached per slot through `batch_slots` (kv differs).
-    const logits = (if (self.qwen4 != null) self.forwardQwen4With(&bctx, token_arr) else self.forwardMoeWith(&bctx, token_arr)) catch |e| {
-        self.discardDeferredPle(&bctx);
+    const logits = (if (self.qwen4 != null) forwardQwen4With(self, &bctx, token_arr) else self.forwardMoeWith(&bctx, token_arr)) catch |e| {
+        qwen4_hc.discardDeferredPle(self, &bctx);
         return e;
     };
     errdefer {
-        self.discardDeferredPle(&bctx);
+        qwen4_hc.discardDeferredPle(self, &bctx);
         _ = mlx.mlx_array_free(logits);
     }
-    try self.flushDeferredPle(&bctx);
+    try qwen4_hc.flushDeferredPle(self, &bctx);
 
     if (persist) {
         if (capture_ssm) {
@@ -4435,16 +4438,16 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
     defer m.cache.deinit();
 
     const ca = try KVCache.init(t.allocator, 1);
-    var a: Transformer.Qwen4MtpState = .{ .cache = ca, .entry = m.entry, .seq_offset = 7, .pos_base = 3 };
+    var a: Qwen4MtpState = .{ .cache = ca, .entry = m.entry, .seq_offset = 7, .pos_base = 3 };
     a.cache.step = 7;
     defer a.deinit();
     const cb = try KVCache.init(t.allocator, 1);
-    var b: Transformer.Qwen4MtpState = .{ .cache = cb, .entry = m.entry, .seq_offset = 2, .pos_base = 11 };
+    var b: Qwen4MtpState = .{ .cache = cb, .entry = m.entry, .seq_offset = 2, .pos_base = 11 };
     b.cache.step = 2;
     defer b.deinit();
 
-    const live_a = Transformer.qwen4MtpLiveState(&a);
-    const live_b = Transformer.qwen4MtpLiveState(&b);
+    const live_a = qwen4MtpLiveState(&a);
+    const live_b = qwen4MtpLiveState(&b);
     try t.expect(live_a.cache == &a.cache);
     try t.expect(live_b.cache == &b.cache);
     try t.expect(xfm.qwen4_mtp_owner == null);
@@ -4490,26 +4493,26 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     defer m.cache.deinit();
 
     const ca = try KVCache.init(t.allocator, 1);
-    var a: Transformer.Qwen4MtpState = .{ .cache = ca, .entry = m.entry };
+    var a: Qwen4MtpState = .{ .cache = ca, .entry = m.entry };
     defer a.deinit();
     const cb = try KVCache.init(t.allocator, 1);
-    var b: Transformer.Qwen4MtpState = .{ .cache = cb, .entry = m.entry };
+    var b: Qwen4MtpState = .{ .cache = cb, .entry = m.entry };
     defer b.deinit();
 
-    xfm.qwen4MtpActivate(&a);
+    qwen4MtpActivate(&xfm, &a);
     m.seq_offset = 7;
     m.pos_base = 3;
-    xfm.qwen4MtpActivate(&a); // idempotent
+    qwen4MtpActivate(&xfm, &a); // idempotent
     try t.expectEqual(@as(usize, 7), m.seq_offset);
-    xfm.qwen4MtpActivate(&b);
+    qwen4MtpActivate(&xfm, &b);
     try t.expectEqual(@as(usize, 0), m.seq_offset);
     try t.expectEqual(@as(c_int, -1), m.pos_base);
     m.seq_offset = 2;
-    xfm.qwen4MtpActivate(&a);
+    qwen4MtpActivate(&xfm, &a);
     try t.expectEqual(@as(usize, 7), m.seq_offset);
     try t.expectEqual(@as(c_int, 3), m.pos_base);
     try t.expectEqual(@as(usize, 2), b.seq_offset);
-    xfm.qwen4MtpRelease(&a);
+    qwen4MtpRelease(&xfm, &a);
     try t.expectEqual(@as(usize, 0), m.seq_offset);
     try t.expectEqual(@as(usize, 7), a.seq_offset);
     try t.expect(xfm.qwen4_mtp_owner == null);
@@ -4575,7 +4578,7 @@ test "exl3 MTP rows wider than the decode arm refuse by Exl3MtpRowsExceedDecode"
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_zeros(&x, &shape, 3, .float16, s));
-    try t.expectError(error.Exl3MtpRowsExceedDecode, xfm.mtpMoeRows(x, &mw));
+    try t.expectError(error.Exl3MtpRowsExceedDecode, mtpMoeRows(&xfm, x, &mw));
 }
 
 test "exl3 MTP fused rows match N solo calls on the same kernel" {
@@ -4708,7 +4711,7 @@ test "exl3 MTP fused rows match N solo calls on the same kernel" {
     expert_exl3_kernels.resetFusedDispatchCount();
     expert_exl3_kernels.setPairSplitsForTest(1);
     defer expert_exl3_kernels.setPairSplitsForTest(null);
-    const fused = try xfm.mtpMoeRows(x_arr, &mw);
+    const fused = try mtpMoeRows(&xfm, x_arr, &mw);
     defer _ = mlx.mlx_array_free(fused);
     const n_disp = expert_exl3_kernels.fusedDispatchCount();
     var c_f = mlx.mlx_array_new();
@@ -4720,7 +4723,7 @@ test "exl3 MTP fused rows match N solo calls on the same kernel" {
     while (r < rows) : (r += 1) {
         const x1 = mlx.mlx_array_new_data(xh[r * dim ..][0..dim].ptr, &[_]c_int{ 1, 1, @intCast(dim) }, 3, .float16);
         defer _ = mlx.mlx_array_free(x1);
-        const solo = try xfm.mtpMoeRows(x1, &mw);
+        const solo = try mtpMoeRows(&xfm, x1, &mw);
         defer _ = mlx.mlx_array_free(solo);
         var c_s = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(c_s);
@@ -4896,18 +4899,18 @@ test "qwen4 PLE spec capture follows the verify flag, streamed or not" {
     xfm.spec_capture_ssm = false;
     var entry = SSMCacheEntry{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
     entry.spec_ple_len = 17;
-    try testing.expect(!xfm.pleClaimSpecCapture(&entry, 4));
+    try testing.expect(!qwen4_hc.pleClaimSpecCapture(&xfm, &entry, 4));
     try testing.expectEqual(@as(u32, 0), entry.spec_ple_len);
     xfm.spec_capture_ssm = true;
-    try testing.expect(xfm.pleClaimSpecCapture(&entry, 4));
+    try testing.expect(qwen4_hc.pleClaimSpecCapture(&xfm, &entry, 4));
     try testing.expectEqual(@as(u32, 6), entry.spec_ple_len);
     var engine: expert_stream_mod.Engine = undefined;
     xfm.expert_stream = &engine;
     entry.spec_ple_len = 17;
-    try testing.expect(xfm.pleClaimSpecCapture(&entry, 4));
+    try testing.expect(qwen4_hc.pleClaimSpecCapture(&xfm, &entry, 4));
     try testing.expectEqual(@as(u32, 6), entry.spec_ple_len);
     xfm.spec_capture_ssm = false;
-    try testing.expect(!xfm.pleClaimSpecCapture(&entry, 4));
+    try testing.expect(!qwen4_hc.pleClaimSpecCapture(&xfm, &entry, 4));
     try testing.expectEqual(@as(u32, 0), entry.spec_ple_len);
 }
 
@@ -5533,10 +5536,10 @@ test "qwen4 MTP head KV stays dense under the engine-default trunk scheme unless
     try t.expectEqual(kv_quant.Scheme.off, xfm.qwen4_mtp.?.cache.config.scheme);
     const trunk = kv_quant.KVQuantConfig.engine_default;
     try t.expect(trunk.isQuant());
-    try xfm.qwen4MtpApplyKvQuant(trunk);
+    try qwen4MtpApplyKvQuant(&xfm, trunk);
     try t.expectEqual(kv_quant.Scheme.off, xfm.qwen4_mtp.?.cache.config.scheme);
     Transformer.mtp_head_kv_quant_override = true;
-    try xfm.qwen4MtpApplyKvQuant(trunk);
+    try qwen4MtpApplyKvQuant(&xfm, trunk);
     try t.expectEqual(trunk.scheme, xfm.qwen4_mtp.?.cache.config.scheme);
     try t.expectEqual(trunk.bits, xfm.qwen4_mtp.?.cache.config.bits);
 }
@@ -5566,7 +5569,7 @@ test "verify MoE rows preserve every value with fewer graph operations" {
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.qwen4 != null);
-    xfm.compileMoeRouting();
+    compileMoeRouting(&xfm);
     var prng = std.Random.DefaultPrng.init(924);
     for ([_]usize{ 0, config.num_hidden_layers / 2, config.num_hidden_layers - 1 }) |layer| {
         const mw = &xfm.moe_layers.?[layer].mlp.moe;
@@ -5652,11 +5655,11 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
         live.qsa_marks.deinit();
     }
 
-    try testing.expectError(error.MtpHeadInvalidOrigin, xfm.qwen4MtpAdopt(&snapshot, &aux, &.{}, -1, 1));
+    try testing.expectError(error.MtpHeadInvalidOrigin, qwen4MtpAdopt(&xfm, &snapshot, &aux, &.{}, -1, 1));
     try testing.expectEqual(@as(usize, 0), xfm.qwen4_mtp.?.cache.step);
     try testing.expectEqual(@as(usize, 0), xfm.qwen4_mtp.?.seq_offset);
     try testing.expectEqual(@as(c_int, 7), xfm.qwen4_mtp.?.pos_base);
-    try xfm.qwen4MtpAdopt(&snapshot, &aux, &.{}, 8, 1);
+    try qwen4MtpAdopt(&xfm, &snapshot, &aux, &.{}, 8, 1);
     try testing.expectEqual(@as(usize, 1), xfm.qwen4_mtp.?.cache.step);
     try testing.expectEqual(@as(usize, 1), xfm.qwen4_mtp.?.seq_offset);
     try testing.expectEqual(@as(c_int, 8), xfm.qwen4_mtp.?.pos_base);
@@ -5752,12 +5755,12 @@ test "qwen4 forward: the layer dispatch resolves an affine projection once, in t
 }
 
 test "qwen4 decode ladder: stride resolution keeps an explicit off and leaves other arches off" {
-    try testing.expectEqual(@as(u32, 4), Transformer.qwen4DecodeLadderStride(null));
-    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride("0"));
-    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride("off"));
-    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride(""));
-    try testing.expectEqual(@as(u32, 2), Transformer.qwen4DecodeLadderStride("2"));
-    try testing.expectEqual(@as(u32, 8), Transformer.qwen4DecodeLadderStride("auto"));
+    try testing.expectEqual(@as(u32, 4), qwen4DecodeLadderStride(null));
+    try testing.expectEqual(@as(u32, 0), qwen4DecodeLadderStride("0"));
+    try testing.expectEqual(@as(u32, 0), qwen4DecodeLadderStride("off"));
+    try testing.expectEqual(@as(u32, 0), qwen4DecodeLadderStride(""));
+    try testing.expectEqual(@as(u32, 2), qwen4DecodeLadderStride("2"));
+    try testing.expectEqual(@as(u32, 8), qwen4DecodeLadderStride("auto"));
     try testing.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride(null));
 }
 
@@ -5821,7 +5824,7 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
     defer rig.deinit();
     const alloc = testing.allocator;
     // Arms: off, on at stride 1, on at the shipped stride, and an unfilled leaf.
-    const strides = [_]u32{ 0, 1, Transformer.qwen4DecodeLadderStride(null) };
+    const strides = [_]u32{ 0, 1, qwen4DecodeLadderStride(null) };
     const prompts = [2][]const i32{ &.{ 5, 17, 42, 9 }, &.{ 11, 4, 19 } };
     var slots: [strides.len + 1][2]*Qwen4TestSlot = undefined;
     var made: usize = 0;
@@ -5979,7 +5982,7 @@ test "streamed rollback owns HC handle after injected MLX failure" {
     };
     const Rollback = struct {
         fn run(dst: *mlx.mlx_array, src: *mlx.mlx_array) !void {
-            Transformer.restoreStreamH(dst, src);
+            restoreStreamH(dst, src);
             try mlx.check(mlx.mlx_array_eval(dst.*));
         }
     };
@@ -6028,7 +6031,7 @@ test "qsa indexer scalar rope applies yarn mscale to first rope_dims only" {
     defer _ = mlx.mlx_array_free(unscaled);
     try mlx.check(mlx.mlx_array_set(&unscaled, roped));
 
-    try t.yarnScaleRotated(&roped, 64);
+    try yarnScaleRotated(&t, &roped, 64);
 
     var a = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(a);

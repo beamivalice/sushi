@@ -1,11 +1,12 @@
 //! Flash-Next's drafters: the in-checkpoint MTP head (`Head`, `Cache`) behind `arch/drafter.zig`.
 const std = @import("std");
+const qwen4_forward = @import("qwen4_forward.zig");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const mtp_mod = @import("../mtp.zig");
 const spec_types = @import("../spec_types.zig");
-const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const Transformer = trunk_mod.Transformer;
+const KVCache = trunk_mod.KVCache;
 /// DFlash2 is opt-in on a Qwen pack that ships a block drafter.
 pub const kinds = [_]spec_types.Kind{ .mtp, .dflash2 };
 pub const head_kind: spec_types.Kind = .mtp;
@@ -31,16 +32,16 @@ pub const buildBatchedChains = @import("qwen4_mtp_batch.zig").build;
 /// The in-checkpoint head plus this request's own half of it.
 pub const Cache = struct {
     t: *Transformer,
-    st: *Transformer.Qwen4MtpState,
+    st: *qwen4_forward.Qwen4MtpState,
     allocator: std.mem.Allocator,
 
     /// Installs this request's state on the head.
     pub fn activate(self: *const Cache) void {
-        self.t.qwen4MtpActivate(self.st);
+        qwen4_forward.qwen4MtpActivate(self.t, self.st);
     }
 
-    pub fn batchState(self: *const Cache) *Transformer.Qwen4MtpState {
-        self.t.qwen4MtpRelease(self.st);
+    pub fn batchState(self: *const Cache) *qwen4_forward.Qwen4MtpState {
+        qwen4_forward.qwen4MtpRelease(self.t, self.st);
         return self.st;
     }
 
@@ -64,7 +65,7 @@ pub const Cache = struct {
 
     pub fn truncate(self: *const Cache, len: usize, _: mlx.mlx_stream) !void {
         self.activate();
-        try self.t.qwen4MtpTruncate(len);
+        try qwen4_forward.qwen4MtpTruncate(self.t, len);
     }
 
     /// How far the head's position has drifted from where the next round would read it: a serial block advances the
@@ -79,11 +80,11 @@ pub const Cache = struct {
     /// gap, so it starts over.
     pub fn reseedAfterForcedCommit(self: *const Cache) !void {
         self.activate();
-        try self.t.qwen4MtpReset();
+        try qwen4_forward.qwen4MtpReset(self.t);
     }
 
     pub fn deinit(self: *const Cache) void {
-        self.t.qwen4MtpRelease(self.st);
+        qwen4_forward.qwen4MtpRelease(self.t, self.st);
         self.st.deinit();
         self.allocator.destroy(self.st);
     }
@@ -119,10 +120,10 @@ pub fn moduleOwned(_: Head) bool {
 }
 
 pub fn makeCache(t: Head, allocator: std.mem.Allocator) !Cache {
-    const st = try allocator.create(Transformer.Qwen4MtpState);
+    const st = try allocator.create(qwen4_forward.Qwen4MtpState);
     errdefer allocator.destroy(st);
-    st.* = try t.qwen4MtpStateNew();
-    t.qwen4MtpActivate(st);
+    st.* = try qwen4_forward.qwen4MtpStateNew(t);
+    qwen4_forward.qwen4MtpActivate(t, st);
     return .{ .t = t, .st = st, .allocator = allocator };
 }
 
@@ -136,12 +137,12 @@ pub fn forward(t: Head, _: *Transformer, cache: *Cache, id_arr: mlx.mlx_array, h
 fn step(t: Head, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want: mtp_mod.StepWant, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
     // `.mixed` is NOT `.none`: a rerank draft still needs the mixer output, which is the vector the lm_head
     // consumes. `hidden_next` is the PRE-mixer stream here and would be a silent shape error there.
-    const project: Transformer.Qwen4MtpProject = switch (want) {
+    const project: qwen4_forward.Qwen4MtpProject = switch (want) {
         .logits => .last_row,
         .mixed => .mixed_last_row,
         .none => .none,
     };
-    const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1, mrope_ctx, project);
+    const out = try qwen4_forward.qwen4MtpForward(t, hidden, id_arr, rope_offset + 1, mrope_ctx, project);
     return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
 }
 
@@ -162,19 +163,19 @@ pub fn appendHistory(t: Head, _: *Transformer, cache: *Cache, token_ids: []const
 /// Built lazily on the first ask: `loadQwen4Mtp` runs while the Transformer is still under construction and its
 /// lm_head, which the coarse head is a copy of, is not assigned yet.
 pub fn canRerankDrafts(t: Head) bool {
-    return t.qwen4DraftRerankReady();
+    return qwen4_forward.qwen4DraftRerankReady(t);
 }
 
 /// `x` is the MIXER output the target's lm_head consumes, never the pre-mixer `[B,S,hc*H]` stream.
 pub fn draftSelect(t: Head, _: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
-    return t.qwen4DraftSelect(x, suppress_mask);
+    return qwen4_forward.qwen4DraftSelect(t, x, suppress_mask);
 }
 
 pub fn draftShortlist(t: Head, _: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
-    return t.qwen4DraftShortlist(x, suppress_mask);
+    return qwen4_forward.qwen4DraftShortlist(t, x, suppress_mask);
 }
 
-pub fn costProfile(t: Head, _: *const Transformer, kv: transformer_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
+pub fn costProfile(t: Head, _: *const Transformer, kv: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
     return mtp_mod.qwen4G17CostProfileForKv(t, kv);
 }
 

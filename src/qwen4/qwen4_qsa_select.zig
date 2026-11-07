@@ -1,4 +1,6 @@
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
+const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const moe_gqmv = @import("../moe_gqmv.zig");
 const nax_gate = @import("../nax_gate.zig");
 const std = @import("std");
@@ -35,23 +37,23 @@ const attn256RandBf16 = test_support.attn256RandBf16;
 const qsaArraysAllEqual = test_support.qsaArraysAllEqual;
 const qwen4ReadF32 = test_support.qwen4ReadF32;
 const testRandUniformBf16 = test_support.testRandUniformBf16;
-const ForwardCtx = trf.ForwardCtx;
-const FullAttnWeights = trf.FullAttnWeights;
-const KVCache = trf.KVCache;
-const MoeDecodeDispatchArm = trf.MoeDecodeDispatchArm;
-const QSA_SCORE_KERNEL_HEADER = trf.QSA_SCORE_KERNEL_HEADER;
-const QsaCfgCache = trf.QsaCfgCache;
-const SSMCacheEntry = trf.SSMCacheEntry;
-const Transformer = trf.Transformer;
-const VqmmLane = trf.VqmmLane;
-const moeDecodeDispatchArm = trf.moeDecodeDispatchArm;
-const qsaProbeAllFinite = trf.qsaProbeAllFinite;
-const qsaProbeCorruptFirst = trf.qsaProbeCorruptFirst;
-const qsaProbeLcgBf16 = trf.qsaProbeLcgBf16;
-const ssmFreeQsaState = trf.ssmFreeQsaState;
-const verifyQmmNaxAvailable = trf.verifyQmmNaxAvailable;
-const vqmmLaneFor = trf.vqmmLaneFor;
-const yarnSpec = trf.yarnSpec;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const FullAttnWeights = trunk_mod.FullAttnWeights;
+const KVCache = trunk_mod.KVCache;
+const MoeDecodeDispatchArm = trunk_mod.MoeDecodeDispatchArm;
+const QSA_SCORE_KERNEL_HEADER = trunk_mod.QSA_SCORE_KERNEL_HEADER;
+const QsaCfgCache = trunk_mod.QsaCfgCache;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const Transformer = trunk_mod.Transformer;
+const VqmmLane = trunk_mod.VqmmLane;
+const moeDecodeDispatchArm = trunk_mod.moeDecodeDispatchArm;
+const qsaProbeAllFinite = trunk_mod.qsaProbeAllFinite;
+const qsaProbeCorruptFirst = trunk_mod.qsaProbeCorruptFirst;
+const qsaProbeLcgBf16 = trunk_mod.qsaProbeLcgBf16;
+const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
+const verifyQmmNaxAvailable = trunk_mod.verifyQmmNaxAvailable;
+const vqmmLaneFor = trunk_mod.vqmmLaneFor;
+const yarnSpec = qwen4_forward.yarnSpec;
 
 /// Keyed on what the config reads: output `[1, rows, kb]`, grid `(tg, rows, 1)`, templates
 /// TGS and K. `nb` is a runtime shape (it advances every `ratio` decode tokens).
@@ -832,9 +834,9 @@ const QsaPoolTestTrunk = struct {
         const cs = try self.cosSin(base, sh[2], sh[1]);
         defer _ = mlx.mlx_array_free(cs.cos);
         defer _ = mlx.mlx_array_free(cs.sin);
-        const pn = try t.qsaPoolNorm(kb4, norm_w);
+        const pn = try qwen4_qsa.qsaPoolNorm(t, kb4, norm_w);
         defer _ = mlx.mlx_array_free(pn);
-        const want = try t.qsaPooledRopeComposed(pn, 64, cs.cos, cs.sin);
+        const want = try qwen4_qsa.qsaPooledRopeComposed(t, pn, 64, cs.cos, cs.sin);
         defer _ = mlx.mlx_array_free(want);
         const got = (try qsaPoolNormRopeFused(t.s, kb4, norm_w, t.config.rms_norm_eps, cs.cos, cs.sin, 64)) orelse return error.FusedDeclined;
         defer _ = mlx.mlx_array_free(got);
@@ -1202,7 +1204,7 @@ test "qsa pooled keys: the pooled bank after prefill, decode and verify is bit-i
             try mlx.check(mlx.mlx_concatenate_axis(&qk3, vec, 2, s));
             for (&arms, [_]bool{ true, false }) |*e, fused| {
                 qwen4_qsa.qsa_pool_rope_fused_override = fused;
-                const m = try tr.t.qsaMaskFromQk(&ctx, qk3, &fa, e, offset, pos_base, 1, w, 0);
+                const m = try qwen4_qsa.qsaMaskFromQk(&tr.t, &ctx, qk3, &fa, e, offset, pos_base, 1, w, 0);
                 if (m.ctx != null) _ = mlx.mlx_array_free(m);
             }
             offset += w;
@@ -1249,7 +1251,7 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
                 const sheet = try qsaVisSheetForTest(s, offset, seq_len, nb, ratio);
                 defer _ = mlx.mlx_array_free(sheet);
 
-                const ref = try Transformer.qsaSelectMaskOps(std.testing.allocator, s, scores, sheet, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+                const ref = try qwen4_qsa.qsaSelectMaskOps(std.testing.allocator, s, scores, sheet, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
                 defer _ = mlx.mlx_array_free(ref);
                 try mlx.check(mlx.mlx_array_eval(ref));
 
@@ -1259,7 +1261,7 @@ test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv
                 try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1, seq_len, nb }, 3, .bool_, s));
                 try std.testing.expect(try qsaArraysAllEqual(sheet, ones, s));
                 const null_vis = mlx.mlx_array{ .ctx = null };
-                const got = try Transformer.qsaSelectMaskOps(std.testing.allocator, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+                const got = try qwen4_qsa.qsaSelectMaskOps(std.testing.allocator, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
                 defer _ = mlx.mlx_array_free(got);
                 try std.testing.expect(try qsaArraysAllEqual(got, ref, s));
                 checked_skip += 1;
@@ -1296,7 +1298,7 @@ test "qsa selection: the mask arm and the gather path use ONE tie rule" {
     const null_vis = mlx.mlx_array{ .ctx = null };
 
     const before = qsaSelectCfgBuilds();
-    const got = try Transformer.qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+    const got = try qwen4_qsa.qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
     defer _ = mlx.mlx_array_free(got);
     try mlx.check(mlx.mlx_array_eval(got));
     // A build, not a hit: this key is unique to this test, so the counter moving IS the dispatch.
@@ -1311,7 +1313,7 @@ test "qsa selection: the mask arm and the gather path use ONE tie rule" {
     // With the kernel off both arms fall to the chain: still one rule.
     qsa_select_kernel_override = false;
     defer qsa_select_kernel_override = null;
-    const chain = try Transformer.qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+    const chain = try qwen4_qsa.qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
     defer _ = mlx.mlx_array_free(chain);
     try mlx.check(mlx.mlx_array_eval(chain));
     try std.testing.expectEqual(kv, mlx.getShape(chain)[3]);
@@ -1379,18 +1381,18 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
 
     const row0_all: c_int = nb * ratio - 1;
     try testing.expect(qsaAllBlocksVisible(row0_all, nb, ratio));
-    const a = try t.qsaChunkSelect(scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, true);
+    const a = try qwen4_qsa.qsaChunkSelect(&t, scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, true);
     defer _ = mlx.mlx_array_free(a);
-    const b = try t.qsaChunkSelect(scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, false);
+    const b = try qwen4_qsa.qsaChunkSelect(&t, scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, false);
     defer _ = mlx.mlx_array_free(b);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(a, b, s));
 
     // One row earlier is not all-visible: the two arms must disagree.
     const row0_partial: c_int = 4;
     try testing.expect(!qsaAllBlocksVisible(row0_partial, nb, ratio));
-    const c = try t.qsaChunkSelect(scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, true);
+    const c = try qwen4_qsa.qsaChunkSelect(&t, scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, true);
     defer _ = mlx.mlx_array_free(c);
-    const d = try t.qsaChunkSelect(scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, false);
+    const d = try qwen4_qsa.qsaChunkSelect(&t, scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, false);
     defer _ = mlx.mlx_array_free(d);
     try testing.expect(try attn256MaxDiff(c, d, s) > 0.0);
 
@@ -1401,9 +1403,9 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
     var canonical = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(canonical);
     try mlx.check(mlx.mlx_reshape(&canonical, ar, &[_]c_int{ 1, 1, nb }, 3, s));
-    const e = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, true);
+    const e = try qwen4_qsa.qsaChunkSelect(&t, scores, canonical, row0_all, rows, nb, ratio, nb, nb, true);
     defer _ = mlx.mlx_array_free(e);
-    const f = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, false);
+    const f = try qwen4_qsa.qsaChunkSelect(&t, scores, canonical, row0_all, rows, nb, ratio, nb, nb, false);
     defer _ = mlx.mlx_array_free(f);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e, f, s));
 }
@@ -2504,7 +2506,7 @@ test "qsa score fused: no bank is built under the fused arm" {
     const nb: c_int = 32;
     const pooled = try attn256RandBf16(prng.random(), &[_]c_int{ 1, nb, hd }, s);
     defer _ = mlx.mlx_array_free(pooled);
-    try xfm.qsaAppendPooled(&entry, pooled, 0);
+    try qwen4_qsa.qsaAppendPooled(&xfm, &entry, pooled, 0);
     const saved_fused = qsa_score_fused_override;
     const saved_nax = nax_gate.vqmm_nax_probe_override;
     defer {
@@ -2513,7 +2515,7 @@ test "qsa score fused: no bank is built under the fused arm" {
     }
     qsa_score_fused_override = false;
     nax_gate.vqmm_nax_probe_override = false;
-    _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, false);
+    _ = try qwen4_qsa.qsaScoreOperand(&xfm, &entry, 1, nb, hd, false);
     try testing.expect(entry.qsa_score_bank.ctx != null);
     if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
     entry.qsa_score_bank = .{ .ctx = null };
@@ -2524,7 +2526,7 @@ test "qsa score fused: no bank is built under the fused arm" {
     nax_gate.vqmm_nax_probe_override = null;
     qsaScoreFusedArm();
     if (qsaScoreFusedActive()) {
-        _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, true);
+        _ = try qwen4_qsa.qsaScoreOperand(&xfm, &entry, 1, nb, hd, true);
         try testing.expect(entry.qsa_score_bank.ctx == null);
     }
 }

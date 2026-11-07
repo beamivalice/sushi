@@ -1,7 +1,7 @@
 const std = @import("std");
 const settings_resolve = @import("../settings_resolve.zig");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const trunk = @import("../trunk.zig");
 const kv_cache = @import("../kv_cache.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
@@ -12,11 +12,11 @@ const mtp_mod = @import("../mtp.zig");
 const round_cost = @import("../round_cost.zig");
 const group_planner = @import("../mtp_group_planner.zig");
 const depth_bounds = @import("../mtp_depth_bounds.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
-const ForwardCtx = transformer_mod.ForwardCtx;
+const ForwardCtx = trunk.ForwardCtx;
 const kv_disk_cache_mod = @import("../kv_disk_cache.zig");
-const KVCache = transformer_mod.KVCache;
+const KVCache = trunk.KVCache;
 const testing = std.testing;
 const expectError = @import("../test_expect.zig").expectError;
 const sampler = @import("../sampler.zig");
@@ -68,7 +68,7 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     ref.setEvSeed(zeros, 4);
     try testing.expect(ref.evSeed() == null);
 
-    var head: transformer_mod.Qwen4Mtp = undefined;
+    var head: qwen4_forward.Qwen4Mtp = undefined;
     head.ev_seed_accept = null;
     head.ev_seed_m_lo = 1;
     t.qwen4_mtp = head;
@@ -192,7 +192,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     defer fx.deinit();
     // Only the rerank fields are read by the build; the rest of the head is
     // the trunk's business.
-    var head: transformer_mod.Qwen4Mtp = undefined;
+    var head: qwen4_forward.Qwen4Mtp = undefined;
     head.rerank = null;
     head.rerank_logged = false;
     head.rerank_tried = false;
@@ -204,7 +204,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     // Nothing is built by construction...
     try testing.expect(fx.xfm.qwen4_mtp.?.rerank == null);
     // ...the eager build stands on its own...
-    try testing.expect(fx.xfm.qwen4BuildDraftRerank());
+    try testing.expect(qwen4_forward.qwen4BuildDraftRerank(&fx.xfm));
     const built = fx.xfm.qwen4_mtp.?.rerank orelse return error.NoCoarseHead;
     try testing.expectEqual(fx.vocab, built.rows);
     try testing.expect(built.bits > 0 and built.bits < 8);
@@ -218,7 +218,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
 
     // One-shot: a second eager build (both load paths firing, a re-probe)
     // keeps the head it already has.
-    try testing.expect(fx.xfm.qwen4BuildDraftRerank());
+    try testing.expect(qwen4_forward.qwen4BuildDraftRerank(&fx.xfm));
     try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
 }
 
@@ -272,7 +272,7 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     const max_tokens: u64 = 2048;
 
     var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 1_048_576 };
-    const KVC = transformer_mod.KVCache;
+    const KVC = trunk.KVCache;
     try t.expectEqual(
         KVC.reservedTokens(seq, max_tokens, chunk, 1_048_576),
         reservedPrefillTokens(&qwen4, seq, max_tokens, chunk),
@@ -294,7 +294,7 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
 const MtpChainTestSlot = struct {
     cache: KVCache,
     off: usize = 0,
-    entries: []transformer_mod.SSMCacheEntry,
+    entries: []trunk.SSMCacheEntry,
     gen: ?Generator = null,
 
     fn init(a: std.mem.Allocator, io: std.Io, xfm: *Transformer, tok: *Tokenizer, prompt: []const u32, depth: u32) !*@This() {
@@ -302,14 +302,14 @@ const MtpChainTestSlot = struct {
         errdefer a.destroy(slot);
         var cache = try KVCache.init(a, xfm.config.num_hidden_layers);
         errdefer cache.deinit();
-        const entries = try a.alloc(transformer_mod.SSMCacheEntry, xfm.config.num_hidden_layers);
+        const entries = try a.alloc(trunk.SSMCacheEntry, xfm.config.num_hidden_layers);
         slot.* = .{ .cache = cache, .entries = entries };
         for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
         errdefer {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                transformer_mod.ssmFreeQsaState(e);
+                qwen4_qsa_state.ssmFreeQsaState(e);
             }
             a.free(entries);
         }
@@ -330,7 +330,7 @@ const MtpChainTestSlot = struct {
         for (slot.entries) |*e| {
             _ = mlx.mlx_array_free(e.conv_state);
             _ = mlx.mlx_array_free(e.ssm_state);
-            transformer_mod.ssmFreeQsaState(e);
+            qwen4_qsa_state.ssmFreeQsaState(e);
         }
         a.free(slot.entries);
         slot.cache.deinit();
@@ -429,9 +429,9 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    qwen4_forward.compileQwen4Hc(&xfm);
+    qwen4_forward.compileGdnGate(&xfm);
+    qwen4_forward.compileMoeRouting(&xfm);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -534,7 +534,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
             }
         }
     }
-    if (transformer_mod.verifySharedHardware()) {
+    if (trunk.verifySharedHardware()) {
         try testing.expect(trunk.mtp_coarse_pair_dispatches > coarse_before);
         {
             try testing.expect(qwen4_forward.mtp_verify_hc_prepared_calls > hc_prepared_before);
@@ -571,9 +571,9 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    qwen4_forward.compileQwen4Hc(&xfm);
+    qwen4_forward.compileGdnGate(&xfm);
+    qwen4_forward.compileMoeRouting(&xfm);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -668,9 +668,9 @@ test "acceptance failure restores every unfinished row after verify returns" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    qwen4_forward.compileQwen4Hc(&xfm);
+    qwen4_forward.compileGdnGate(&xfm);
+    qwen4_forward.compileMoeRouting(&xfm);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -688,10 +688,10 @@ test "acceptance failure restores every unfinished row after verify returns" {
     var before: [2]usize = undefined;
     var old_keys: [2]mlx.mlx_array = @splat(.{ .ctx = null });
     var layers: [2]usize = undefined;
-    var saved_ssm: [2][]transformer_mod.SSMCacheEntrySnapshot = undefined;
+    var saved_ssm: [2][]trunk.SSMCacheEntrySnapshot = undefined;
     var saved_rows: usize = 0;
     defer for (saved_ssm[0..saved_rows]) |snapshots| {
-        for (snapshots) |*snapshot| transformer_mod.ssmSnapshotDeinit(snapshot);
+        for (snapshots) |*snapshot| trunk.ssmSnapshotDeinit(snapshot);
         a.free(snapshots);
     };
     const Prefix = struct {
@@ -706,7 +706,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
             try mlx.check(mlx.mlx_slice(&right_slice, right, &.{ 0, 0, 0, 0 }, 4, &.{ rsh[0], rsh[1], @intCast(len), rsh[3] }, 4, &.{ 1, 1, 1, 1 }, 4, s));
             try MtpChainTestSlot.equal(left_slice, right_slice, s, "KV valid prefix");
         }
-        fn state(saved: []const transformer_mod.SSMCacheEntrySnapshot, current: []const transformer_mod.SSMCacheEntry, s: mlx.mlx_stream) !void {
+        fn state(saved: []const trunk.SSMCacheEntrySnapshot, current: []const trunk.SSMCacheEntry, s: mlx.mlx_stream) !void {
             try testing.expectEqual(saved.len, current.len);
             for (saved, current) |snapshot, entry| {
                 try testing.expectEqual(snapshot.initialized, entry.initialized);
@@ -738,8 +738,8 @@ test "acceptance failure restores every unfinished row after verify returns" {
             break;
         }
         try testing.expect(old_keys[i].ctx != null);
-        saved_ssm[i] = try a.alloc(transformer_mod.SSMCacheEntrySnapshot, slot.entries.len);
-        for (slot.entries, saved_ssm[i]) |*entry, *snapshot| snapshot.* = transformer_mod.ssmSnapshot(entry);
+        saved_ssm[i] = try a.alloc(trunk.SSMCacheEntrySnapshot, slot.entries.len);
+        for (slot.entries, saved_ssm[i]) |*entry, *snapshot| snapshot.* = trunk.ssmSnapshot(entry);
         saved_rows += 1;
     }
     const syncs = kv_cache.deferred_ple_group_syncs;
@@ -805,7 +805,7 @@ const L11PlainReplay = struct {
             for (rows) |row| _ = mlx.mlx_array_free(row);
             a.free(rows);
         };
-        const logits = try xfm.forwardMoeBatchedDecode(tokens[0..slots.len], contexts[0..slots.len], offsets[0..slots.len], if (capture) &hidden else null);
+        const logits = try qwen4_forward.forwardMoeBatchedDecode(xfm, tokens[0..slots.len], contexts[0..slots.len], offsets[0..slots.len], if (capture) &hidden else null);
         defer {
             for (logits) |row| _ = mlx.mlx_array_free(row);
             a.free(logits);
@@ -842,9 +842,9 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    qwen4_forward.compileQwen4Hc(&xfm);
+    qwen4_forward.compileGdnGate(&xfm);
+    qwen4_forward.compileMoeRouting(&xfm);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const previous = group_planner.enabled_override;
@@ -932,9 +932,9 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    qwen4_forward.compileQwen4Hc(&xfm);
+    qwen4_forward.compileGdnGate(&xfm);
+    qwen4_forward.compileMoeRouting(&xfm);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const prior = group_planner.enabled_override;
@@ -961,7 +961,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
             const gen = &slot.gen.?;
             try testing.expect(gen.mtp_hist_stash == null and gen.mtp_pre_draft == null);
             gen.mtp_cache.?.activate();
-            try xfm.qwen4MtpReset();
+            try qwen4_forward.qwen4MtpReset(&xfm);
             gen.mtp_planner_owned = true;
             gen.mtp_planner_width = 1;
             gen.mtp_batch_head = true;
@@ -1088,9 +1088,9 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    qwen4_forward.compileQwen4Hc(&xfm);
+    qwen4_forward.compileGdnGate(&xfm);
+    qwen4_forward.compileMoeRouting(&xfm);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -1195,9 +1195,9 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    qwen4_forward.compileQwen4Hc(&xfm);
+    qwen4_forward.compileGdnGate(&xfm);
+    qwen4_forward.compileMoeRouting(&xfm);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -1236,9 +1236,9 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
 
     // Restored from the point against a cold prefill of the same tokens, over the same continuation.
     // As a commit and a restore do: the slot's QSA history rides the newest point, cut to it.
-    try transformer_mod.handoffQsaHistoryToLatest(gen.ssm_checkpoints.items, spec.entries, xfm.s);
-    try transformer_mod.restoreSsmCheckpoint(spec.entries, cp);
-    try transformer_mod.applyQsaHistoryAt(spec.entries, cp, cp.pos, xfm.s, false);
+    try qwen4_qsa_state.handoffQsaHistoryToLatest(gen.ssm_checkpoints.items, spec.entries, xfm.s);
+    try trunk.restoreSsmCheckpoint(spec.entries, cp);
+    try qwen4_qsa_state.applyQsaHistoryAt(spec.entries, cp, cp.pos, xfm.s, false);
     var cold_prompt: [96 + want]u32 = undefined;
     @memcpy(cold_prompt[0..prompt.len], &prompt);
     @memcpy(cold_prompt[prompt.len..end], reference[0..at]);

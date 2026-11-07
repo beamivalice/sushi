@@ -3,7 +3,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const api = @import("sushi_exl3");
-const tfm = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const trunk_stq = @import("../trunk_stq.zig");
 const Arr = mlx.mlx_array;
 
@@ -16,7 +16,7 @@ fn affine(w: Arr, s: ?Arr, b: ?Arr) api.qwen_riders.Affine {
 /// The layer output with the shared expert folded into the routed launches, for one to eight rows of `x` [1, rows, hidden];
 /// null where the separate chain runs. `router_logit` is the shared-expert gate logit when the router kernel already
 /// computed it (null ctx otherwise: the fold computes it). `trunk_dec` decodes a trellis shared expert.
-pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const tfm.MoeMlpWeights, inds: Arr, scores: Arr, dec: api.format.Decode, trunk_dec: ?api.format.Decode, router_logit: Arr) !?Arr {
+pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const trunk_mod.MoeMlpWeights, inds: Arr, scores: Arr, dec: api.format.Decode, trunk_dec: ?api.format.Decode, router_logit: Arr) !?Arr {
     const gate_w = mw.shared_expert_gate_w orelse return null;
     const own_logit = router_logit.ctx == null;
     const trellis: ?api.shared_trellis.Banks = if (mw.shared_gate_up_stack) |stack| blk: {
@@ -32,7 +32,7 @@ pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const tfm.MoeMlpWeights, inds: Arr
         .up = affine(mw.shared_up_w, mw.shared_up_s, mw.shared_up_b),
         .down = affine(mw.shared_down_w, mw.shared_down_s, mw.shared_down_b),
         .trellis = trellis,
-        .sigmoid = try tfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator),
+        .sigmoid = try trunk_mod.swigluSigTable(s, .bfloat16, std.heap.c_allocator),
         .logit = if (own_logit) affine(gate_w, mw.shared_expert_gate_s, mw.shared_expert_gate_b) else null,
     };
     const gate: ?Arr = if (own_logit) null else router_logit;
@@ -154,7 +154,7 @@ pub fn weights(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, s: mlx.mlx_stre
             .gate = try affineBank(ops, a, rnd, width, hidden_k, group, gain),
             .up = try affineBank(ops, a, rnd, width, hidden_k, group, gain),
             .down = try affineBank(ops, a, rnd, hidden_k, width, group, gain),
-            .sigmoid = try tfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator),
+            .sigmoid = try trunk_mod.swigluSigTable(s, .bfloat16, std.heap.c_allocator),
         },
         .logit = try affineBank(ops, a, rnd, 1, hidden_k, 64, gain),
         .group = group,
@@ -168,11 +168,11 @@ pub const Chain = union(enum) { bank: api.Bank, ragged: *const api.Ragged };
 pub fn separate(ops: *Ops, x: Arr, w: Weights, chain: Chain, ids: Arr, scores: Arr, dec: api.format.Decode) !Arr {
     if (w.trellis) |t| return t.separate(ops, x, chain, ids, scores, dec);
     const s = ops.s;
-    const g = try ops.own(try tfm.qmatmulBits(x, w.shared.gate.weight, w.shared.gate.scales, w.shared.gate.biases, 8, @intCast(w.group), .affine, s));
-    const u = try ops.own(try tfm.qmatmulBits(x, w.shared.up.weight, w.shared.up.scales, w.shared.up.biases, 8, @intCast(w.group), .affine, s));
-    const act = try ops.own((try tfm.fusedSwiGLU(s, g, u)) orelse return error.TestExpectedSwiglu);
-    const down = try ops.own(try tfm.qmatmulBits(act, w.shared.down.weight, w.shared.down.scales, w.shared.down.biases, 8, @intCast(w.group), .affine, s));
-    const logit = try ops.own(try tfm.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
+    const g = try ops.own(try trunk_mod.qmatmulBits(x, w.shared.gate.weight, w.shared.gate.scales, w.shared.gate.biases, 8, @intCast(w.group), .affine, s));
+    const u = try ops.own(try trunk_mod.qmatmulBits(x, w.shared.up.weight, w.shared.up.scales, w.shared.up.biases, 8, @intCast(w.group), .affine, s));
+    const act = try ops.own((try trunk_mod.fusedSwiGLU(s, g, u)) orelse return error.TestExpectedSwiglu);
+    const down = try ops.own(try trunk_mod.qmatmulBits(act, w.shared.down.weight, w.shared.down.scales, w.shared.down.biases, 8, @intCast(w.group), .affine, s));
+    const logit = try ops.own(try trunk_mod.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
     return ops.own(switch (chain) {
         .bank => |bank| try api.moeWithGatedShared(s, x, bank, ids, scores, dec, false, down, logit),
         .ragged => |rb| try api.moeRagged(s, x, rb, ids, scores, dec, false, down, logit),
@@ -229,7 +229,7 @@ test "Qwen shared expert folded into the one-bank routed launches is bit exact t
                     var sh = w.shared;
                     var gate: ?Arr = null;
                     if (router_logit) {
-                        gate = try scope.own(try tfm.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
+                        gate = try scope.own(try trunk_mod.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
                     } else sh.logit = w.logit;
                     const folded_before = api.qwen_fold.foldedCount();
                     const launches_before = api.qwen_fold.launchCount();
@@ -275,7 +275,7 @@ test "Qwen shared expert folded into the rate-grouped routed launches is bit exa
                 var sh = w.shared;
                 var gate: ?Arr = null;
                 if (router_logit) {
-                    gate = try ops.own(try tfm.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
+                    gate = try ops.own(try trunk_mod.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
                 } else sh.logit = w.logit;
                 const folded_before = api.rate_groups.qwenFoldedCount();
                 const launches_before = api.rate_groups.qwenLaunchCount();
@@ -368,7 +368,7 @@ pub const TrellisShared = struct {
 
     pub fn shared(self: *const TrellisShared, ops: *Ops) !api.qwen_riders.Shared {
         return .{
-            .sigmoid = try tfm.swigluSigTable(ops.s, .bfloat16, std.heap.c_allocator),
+            .sigmoid = try trunk_mod.swigluSigTable(ops.s, .bfloat16, std.heap.c_allocator),
             .trellis = .{ .gate_up = self.stack.p, .down = .{ .trellis = self.down.w, .suh = self.down.s, .svh = self.down.b }, .dec = self.dec },
         };
     }
@@ -380,9 +380,9 @@ pub const TrellisShared = struct {
         if (!try trunk_stq.sharedProject(s, x, self.stack, self.dec, &gu, false)) return error.TestExpectedStack;
         const g = try ops.own(gu[0]);
         const u = try ops.own(gu[1]);
-        const act = try ops.own((try tfm.fusedSwiGLU(s, g, u)) orelse return error.TestExpectedSwiglu);
+        const act = try ops.own((try trunk_mod.fusedSwiGLU(s, g, u)) orelse return error.TestExpectedSwiglu);
         const down = try ops.own(try trunk_stq.matmul(s, act, self.down.w, self.down.s, self.down.b, self.dec, false));
-        const logit = try ops.own(try tfm.qmatmulBits(x, self.logit.weight, self.logit.scales, self.logit.biases, 8, 64, .affine, s));
+        const logit = try ops.own(try trunk_mod.qmatmulBits(x, self.logit.weight, self.logit.scales, self.logit.biases, 8, 64, .affine, s));
         return ops.own(switch (chain) {
             .bank => |bank| try api.moeWithGatedShared(s, x, bank, ids, scores, dec, false, down, logit),
             .ragged => |rb| try api.moeRagged(s, x, rb, ids, scores, dec, false, down, logit),
@@ -416,7 +416,7 @@ test "Qwen trellis shared expert folded into the routed launches is bit exact to
                 var sh = try w.shared(&ops);
                 var gate: ?Arr = null;
                 if (router_logit) {
-                    gate = try ops.own(try tfm.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
+                    gate = try ops.own(try trunk_mod.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
                 } else sh.logit = w.logit;
                 const dispatches_before = api.kernels.fusedDispatchCount();
                 const got = try ops.own((if (chain_kind == 0)

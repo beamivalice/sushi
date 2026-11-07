@@ -1,4 +1,4 @@
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const attn_kernels = @import("../attn_kernels.zig");
 const std = @import("std");
 const qwen4_mod = @import("qwen4_exp.zig");
@@ -35,27 +35,27 @@ const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
 const attn256Reference = test_support.attn256Reference;
 const testRandWeightBf16 = test_support.testRandWeightBf16;
-const ATTN_QSA256_KERNEL_HEADER = trf.ATTN_QSA256_KERNEL_HEADER;
-const DenseKVView = trf.DenseKVView;
-const FUSED256_MIN_Q_LEN = trf.FUSED256_MIN_Q_LEN;
-const ForwardCtx = trf.ForwardCtx;
-const KVCache = trf.KVCache;
-const KV_UNPACK_HEADER = trf.KV_UNPACK_HEADER;
-const QsaCfgCache = trf.QsaCfgCache;
-const ShapeKey = trf.ShapeKey;
-const Transformer = trf.Transformer;
-const attn256Base16Aligned = trf.attn256Base16Aligned;
-const fused256Enabled = trf.fused256Enabled;
-const fusedSdpaPrefillImpl = trf.fusedSdpaPrefillImpl;
-const qsaNaxOsOk = trf.qsaNaxOsOk;
-const qsaNaxOsSupported = trf.qsaNaxOsSupported;
-const qsaProbeAllFinite = trf.qsaProbeAllFinite;
-const qsaProbeCorruptFirst = trf.qsaProbeCorruptFirst;
-const qsaProbeLcgBf16 = trf.qsaProbeLcgBf16;
-const qsaProbeMaxAbsDiff = trf.qsaProbeMaxAbsDiff;
-const sliceAttentionSeq = trf.sliceAttentionSeq;
-const splitMaskedSdpa256 = trf.splitMaskedSdpa256;
-const verifyQmmNaxAvailable = trf.verifyQmmNaxAvailable;
+const ATTN_QSA256_KERNEL_HEADER = trunk_mod.ATTN_QSA256_KERNEL_HEADER;
+const DenseKVView = trunk_mod.DenseKVView;
+const FUSED256_MIN_Q_LEN = trunk_mod.FUSED256_MIN_Q_LEN;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const KVCache = trunk_mod.KVCache;
+const KV_UNPACK_HEADER = trunk_mod.KV_UNPACK_HEADER;
+const QsaCfgCache = trunk_mod.QsaCfgCache;
+const ShapeKey = trunk_mod.ShapeKey;
+const Transformer = trunk_mod.Transformer;
+const attn256Base16Aligned = trunk_mod.attn256Base16Aligned;
+const fused256Enabled = trunk_mod.fused256Enabled;
+const fusedSdpaPrefillImpl = trunk_mod.fusedSdpaPrefillImpl;
+const qsaNaxOsOk = trunk_mod.qsaNaxOsOk;
+const qsaNaxOsSupported = trunk_mod.qsaNaxOsSupported;
+const qsaProbeAllFinite = trunk_mod.qsaProbeAllFinite;
+const qsaProbeCorruptFirst = trunk_mod.qsaProbeCorruptFirst;
+const qsaProbeLcgBf16 = trunk_mod.qsaProbeLcgBf16;
+const qsaProbeMaxAbsDiff = trunk_mod.qsaProbeMaxAbsDiff;
+const sliceAttentionSeq = trunk_mod.sliceAttentionSeq;
+const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
+const verifyQmmNaxAvailable = trunk_mod.verifyQmmNaxAvailable;
 
 var qsa_fused_logged = false;
 
@@ -1854,7 +1854,7 @@ test "qsaBatchedAttn: the kill switch refuses the gather arm" {
     const prev_g = qsa_batched_gather_override;
     defer qsa_batched_gather_override = prev_g;
     qsa_batched_gather_override = false;
-    try std.testing.expect((try xfm.qsaBatchedAttn(&ctx, &slots, dummy, 0, 4, 1.0)) == null);
+    try std.testing.expect((try qwen4_qsa.qsaBatchedAttn(xfm, &ctx, &slots, dummy, 0, 4, 1.0)) == null);
 }
 
 test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions" {
@@ -1915,11 +1915,11 @@ test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the
     try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
 
     const slots = [_]*ForwardCtx{ &ctxs[0], &ctxs[1] };
-    const plain = (try xfm.qsaBatchedAttn(&ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
+    const plain = (try qwen4_qsa.qsaBatchedAttn(xfm, &ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(plain);
     const pos = [_]i32{ 0, 1, 2 };
     ctxs[1].mrope_pos = &pos;
-    const with_pos = (try xfm.qsaBatchedAttn(&ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
+    const with_pos = (try qwen4_qsa.qsaBatchedAttn(xfm, &ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(with_pos);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(with_pos, plain, s));
 }

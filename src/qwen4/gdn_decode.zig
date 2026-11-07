@@ -12,15 +12,15 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const testing = std.testing;
 const qwen4_test_support = @import("qwen4_test_support.zig");
 const logicalSsmCapture = qwen4_test_support.logicalSsmCapture;
 const test_support = @import("../test_support.zig");
 const qsaArraysAllEqual = test_support.qsaArraysAllEqual;
-const SSMCacheEntry = trf.SSMCacheEntry;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
 
-const HEADER = @import("../transformer.zig").GDN_KERNEL_HEADER;
+const HEADER = @import("../trunk.zig").GDN_KERNEL_HEADER;
 
 const K1_SOURCE =
     \\constexpr int NSG = NT / 32;

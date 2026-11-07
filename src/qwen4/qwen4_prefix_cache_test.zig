@@ -1,17 +1,19 @@
 const pc = @import("../prefix_cache.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const log = @import("../log.zig");
 const restore_dump = @import("../restore_dump.zig");
 const prefill_plan = @import("../prefill_plan.zig");
-const KVCache = transformer_mod.KVCache;
-const SSMCacheEntry = transformer_mod.SSMCacheEntry;
-const SSMCheckpoint = transformer_mod.SSMCheckpoint;
-const checkpointHasQsaPooled = transformer_mod.checkpointHasQsaPooled;
-const sliceQsaHistoryOntoCheckpoint = transformer_mod.sliceQsaHistoryOntoCheckpoint;
-const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
+const KVCache = trunk_mod.KVCache;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const SSMCheckpoint = trunk_mod.SSMCheckpoint;
+const checkpointHasQsaPooled = qwen4_qsa_state.checkpointHasQsaPooled;
+const sliceQsaHistoryOntoCheckpoint = qwen4_qsa_state.sliceQsaHistoryOntoCheckpoint;
+const ssmCheckpointBytes = trunk_mod.ssmCheckpointBytes;
 const testing = std.testing;
 const CommitStatus = pc.CommitStatus;
 const DflashSnap = pc.DflashSnap;
@@ -42,7 +44,7 @@ fn testFillHeadCache(cache: *KVCache, s: mlx.mlx_stream, layer: u32, tokens: u32
     while (written < tokens) {
         const step: u32 = @min(64, tokens - written);
         try testWriteCacheLayer(cache, s, layer, written, step);
-        transformer_mod.Transformer.qwen4MtpAdvance(cache, seq_offset, @intCast(step));
+        qwen4_forward.qwen4MtpAdvance(cache, seq_offset, @intCast(step));
         written += step;
     }
 }
@@ -111,7 +113,7 @@ fn pcQsaArangeKeys(s: mlx.mlx_stream, rows: c_int, hd: c_int) !mlx.mlx_array {
 }
 
 fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: usize, hi: usize, s: mlx.mlx_stream) !void {
-    var xfm: transformer_mod.Transformer = undefined;
+    var xfm: trunk_mod.Transformer = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     var r = lo;
@@ -160,7 +162,7 @@ fn pcSsmDiffField(s: mlx.mlx_stream, a: []const SSMCacheEntry, b: []const SSMCac
 fn pcCaptureFed(
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
-    xfm: *transformer_mod.Transformer,
+    xfm: *trunk_mod.Transformer,
     keys: mlx.mlx_array,
     pos: c_int,
     conv_base: f64,
@@ -173,7 +175,7 @@ fn pcCaptureFed(
     };
     defer pcFreeQsaHybrid(&live);
     try pcQsaFeed(xfm, &live[0], keys, pos, s);
-    return transformer_mod.captureSsmCheckpoint(allocator, &live, @intCast(pos), s);
+    return trunk_mod.captureSsmCheckpoint(allocator, &live, @intCast(pos), s);
 }
 
 test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every position, and any of them restores from SSD exactly" {
@@ -213,13 +215,13 @@ test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every 
     // The prefill loop: a checkpoint after each chunk, then the write-through.
     for (0..7) |i| {
         const pos = 512 + 128 * i;
-        try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], pos, s));
+        try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], pos, s));
         peak = @max(peak, pcHeld(cps.items));
         hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, cps.items, std.math.maxInt(u64), s);
         try testing.expectEqual(@as(usize, 1), pcHeld(cps.items));
     }
     // The prompt-end snapshot is taken after the loop, past the hook.
-    try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[7], 1400, s));
+    try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[7], 1400, s));
     try testing.expectEqual(@as(usize, 2), pcHeld(cps.items));
     try testing.expect(peak <= 2);
     try testing.expectEqual(@as(usize, 8), cps.items.len);
@@ -267,14 +269,14 @@ test "HotPrefixCache: a trim that cannot carry the QSA history over declines ins
     defer c1.deinit();
     try testFillCache(&c1, s, 3, 900);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &wide, 300, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &narrow, 600, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &narrow, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &wide, 300, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &narrow, 600, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &narrow, s);
     try testing.expect(checkpointHasQsaPooled(&cps[1]));
 
     var probe = try c1.snapshot();
     defer probe.deinit();
-    const budget = pcRowBytes(&probe) * 300 + transformer_mod.ssmCheckpointBytes(&cps[0]);
+    const budget = pcRowBytes(&probe) * 300 + trunk_mod.ssmCheckpointBytes(&cps[0]);
 
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
     defer hc.deinit();
@@ -368,8 +370,8 @@ test "HotPrefixCache: a QSA arch restore with no indexer history is a miss, neve
         var live = pcBuildQsaHybrid(s, 10, 100.0);
         defer pcFreeQsaHybrid(&live);
         const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
-        if (with_history) try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+        cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
+        if (with_history) try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
         _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
         var target_cache = try KVCache.init(testing.allocator, 3);
@@ -408,9 +410,9 @@ test "HotPrefixCache: a history tensor shorter than the checkpoint is a miss, no
     var live = pcBuildQsaHybrid(s, 8, 100.0);
     defer pcFreeQsaHybrid(&live);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 64, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 64, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     try testing.expect(cps[1].layers[0].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 64), cps[1].layers[0].qsa_rows);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
@@ -446,9 +448,9 @@ test "HotPrefixCache: a lookup that fails after binding the KV leaves nothing be
     var live = pcBuildQsaHybridUneven(s, 16, 1);
     defer pcFreeQsaHybrid(&live);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 12, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 12, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -483,8 +485,8 @@ test "HotPrefixCache: prefix-extend keeps ONE QSA history across turns" {
     var l1 = pcBuildQsaHybrid(s, 10, 100.0);
     defer pcFreeQsaHybrid(&l1);
     const cps1 = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps1[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &l1, 4, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps1, &l1, s);
+    cps1[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &l1, 4, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps1, &l1, s);
     _ = try hc.commitWithState(&c1, &t1, false, 0, cps1, null, null);
 
     var c2 = try KVCache.init(testing.allocator, 3);
@@ -493,15 +495,15 @@ test "HotPrefixCache: prefix-extend keeps ONE QSA history across turns" {
     var l2 = pcBuildQsaHybrid(s, 14, 200.0);
     defer pcFreeQsaHybrid(&l2);
     const cps2 = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps2[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &l2, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps2, &l2, s);
+    cps2[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &l2, 8, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps2, &l2, s);
     _ = try hc.commitWithState(&c2, &t2, false, 0, cps2, null, null);
 
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     const merged = hc.entries.items[0].ssm_checkpoints.?;
     try testing.expectEqual(@as(usize, 2), merged.len);
-    try testing.expect(!transformer_mod.checkpointHasQsaHistory(&merged[0]));
-    try testing.expect(transformer_mod.checkpointHasQsaHistory(&merged[1]));
+    try testing.expect(!qwen4_qsa_state.checkpointHasQsaHistory(&merged[0]));
+    try testing.expect(qwen4_qsa_state.checkpointHasQsaHistory(&merged[1]));
     try testing.expect(merged[1].layers[0].aux_state.ctx == null);
     try testing.expect(merged[1].layers[0].qsa_pooled.ctx != null);
 }
@@ -523,11 +525,11 @@ test "HotPrefixCache: a handed-off QSA history commits, restores and bills exact
         try testFillCache(&cache, s, 3, tokens.len);
         var live = pcBuildQsaHybrid(s, 10, 100.0);
         const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
+        cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
         if (handoff) {
-            try transformer_mod.handoffQsaHistoryToLatest(cps, &live, s);
+            try qwen4_qsa_state.handoffQsaHistoryToLatest(cps, &live, s);
         } else {
-            try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+            try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
         }
         _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
         pcFreeQsaHybrid(&live);
@@ -569,10 +571,10 @@ test "HotPrefixCache: inheriting a 1-token-tail commit cannot restore a bank-les
     defer donor_cache.deinit();
     try testFillCache(&donor_cache, s, 3, donor_toks.len);
     const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
-    donor_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
-    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    donor_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    donor_cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
+    donor_cps[2] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(donor_cps, &live, s);
     _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_cache = try KVCache.init(testing.allocator, 3);
@@ -611,9 +613,9 @@ test "HotPrefixCache: a 1-token-tail heir restores a bank that sits at prompt_en
     defer donor_cache.deinit();
     try testFillCache(&donor_cache, s, 3, donor_toks.len);
     const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
-    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    donor_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    donor_cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(donor_cps, &live, s);
     _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_live = pcBuildQsaHybrid(s, 21, 100.0);
@@ -622,7 +624,7 @@ test "HotPrefixCache: a 1-token-tail heir restores a bank that sits at prompt_en
     defer heir_cache.deinit();
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
     const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 21, s);
+    heir_own[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 21, s);
     _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
 
     var lookup = heir_toks ++ [_]u32{ 300, 301 };
@@ -654,8 +656,8 @@ test "HotPrefixCache: a leftover-only checkpoint list is a lookup miss" {
     defer cache.deinit();
     try testFillCache(&cache, s, 3, toks.len);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
     _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -688,10 +690,10 @@ test "HotPrefixCache: v3 heir full-reuse clamp satisfies QSA at the restored pos
     defer donor_cache.deinit();
     try testFillCache(&donor_cache, s, 3, donor_toks.len);
     const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 8, s);
-    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 16, s);
-    donor_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 25, s);
-    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
+    donor_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 8, s);
+    donor_cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 16, s);
+    donor_cps[2] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 25, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
     _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_live = pcBuildQsaHybrid(s, 21, 200.0);
@@ -700,8 +702,8 @@ test "HotPrefixCache: v3 heir full-reuse clamp satisfies QSA at the restored pos
     defer heir_cache.deinit();
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
     const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 20, s);
-    try transformer_mod.attachQsaHistoryToLatest(heir_own, &heir_live, s);
+    heir_own[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 20, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(heir_own, &heir_live, s);
     _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
 
     var n: usize = 17;
@@ -719,7 +721,7 @@ test "HotPrefixCache: v3 heir full-reuse clamp satisfies QSA at the restored pos
         try testing.expect(!r.full_match);
         if (r.matched > 0) {
             hits += 1;
-            try testing.expect(transformer_mod.qsaRestoreSatisfiesForward(&target, r.matched));
+            try testing.expect(qwen4_qsa_state.qsaRestoreSatisfiesForward(&target, r.matched));
             try testing.expectEqual(r.matched, moe_off);
         }
     }
@@ -736,7 +738,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
     var toks: [P]u32 = undefined;
     for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
 
-    var xfm: transformer_mod.Transformer = undefined;
+    var xfm: trunk_mod.Transformer = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -755,12 +757,12 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
             const pos: c_int = @intCast(P - 40 + i);
             const chunk = try pcQsaSliceAxis1(s, keys, 0, pos);
             defer _ = mlx.mlx_array_free(chunk);
-            transformer_mod.ssmFreeQsaState(&live[0]);
+            qwen4_qsa_state.ssmFreeQsaState(&live[0]);
             live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 };
-            try transformer_mod.qsaTestAppendPool(&xfm, &live[0], chunk, 0, s);
-            cps[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, @intCast(pos), s);
+            try qwen4_qsa_state.qsaTestAppendPool(&xfm, &live[0], chunk, 0, s);
+            cps[i] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, @intCast(pos), s);
         }
-        try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+        try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
         var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
         defer hc.deinit();
         hc.qsa_history_required = true;
@@ -797,12 +799,12 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
         for ([_]c_int{ 16, 32, 48, 56, 64 }, 0..) |pos, i| {
             const chunk = try pcQsaSliceAxis1(s, donor_keys, 0, pos);
             defer _ = mlx.mlx_array_free(chunk);
-            transformer_mod.ssmFreeQsaState(&donor_live[0]);
+            qwen4_qsa_state.ssmFreeQsaState(&donor_live[0]);
             donor_live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 };
-            try transformer_mod.qsaTestAppendPool(&xfm, &donor_live[0], chunk, 0, s);
-            donor_cps[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, @intCast(pos), s);
+            try qwen4_qsa_state.qsaTestAppendPool(&xfm, &donor_live[0], chunk, 0, s);
+            donor_cps[i] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &donor_live, @intCast(pos), s);
         }
-        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
+        try qwen4_qsa_state.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
         var donor_cache = try KVCache.init(testing.allocator, 3);
         defer donor_cache.deinit();
         try testFillCache(&donor_cache, s, 3, donor_toks.len);
@@ -817,10 +819,10 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
         {
             const chunk = try pcQsaSliceAxis1(s, donor_keys, 0, @intCast(shared));
             defer _ = mlx.mlx_array_free(chunk);
-            try transformer_mod.qsaTestAppendPool(&xfm, &heir_live[0], chunk, 0, s);
+            try qwen4_qsa_state.qsaTestAppendPool(&xfm, &heir_live[0], chunk, 0, s);
         }
         const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-        heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, shared, s);
+        heir_own[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &heir_live, shared, s);
         var heir_cache = try KVCache.init(testing.allocator, 3);
         defer heir_cache.deinit();
         try testFillCache(&heir_cache, s, 3, heir_toks.len);
@@ -835,11 +837,11 @@ test "HotPrefixCache: QSA trim checkpoint bill matches materialized history" {
     var live = pcBuildQsaHybrid(s, 1027, 100.0);
     defer pcFreeQsaHybrid(&live);
     var cps: [2]SSMCheckpoint = undefined;
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 1027, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 1027, s);
     defer cps[1].deinit(testing.allocator);
-    try transformer_mod.attachQsaHistoryToLatest(cps[1..], &live, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps[1..], &live, s);
     for ([_]usize{ 256, 257, 258, 259, 512, 1024, 1027 }) |pos| {
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, pos, s);
+        cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, pos, s);
         defer cps[0].deinit(testing.allocator);
         const predicted = HotPrefixCache.trimmedCheckpointBytes(&cps, 0);
         try sliceQsaHistoryOntoCheckpoint(&cps[0], &cps[1], pos, s);
@@ -851,7 +853,7 @@ test "HotPrefixCache: QSA trim checkpoint bill matches materialized history" {
 
 test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays reusable" {
     const s = mlx.gpuStream();
-    for ([_]transformer_mod.ThinPolicy{ .min_span_recency, .min_span }) |policy| {
+    for ([_]trunk_mod.ThinPolicy{ .min_span_recency, .min_span }) |policy| {
         for ([_]bool{ false, true }) |replace| {
             var toks: [1024]u32 = undefined;
             for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
@@ -863,8 +865,8 @@ test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays re
             var snap = try cache.snapshot();
             defer snap.deinit();
             const cps = try testing.allocator.alloc(SSMCheckpoint, 4);
-            for (cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
-            try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+            for (cps, 0..) |*cp, i| cp.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
+            try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
             // 768 KV rows and all small checkpoints fit, but the 768-row bank does not.
             const budget = HotPrefixCache.snapshotRowBytes(&snap) * 768 + ssmCheckpointBytes(&cps[0]) * 4 + 1024;
             var hc = HotPrefixCache.initWithMem(testing.allocator, 1, budget);
@@ -876,7 +878,7 @@ test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays re
                 defer seed.deinit();
                 try testFillCache(&seed, s, 3, 256);
                 const seed_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-                seed_cps[0] = try transformer_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
+                seed_cps[0] = try trunk_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
                 try sliceQsaHistoryOntoCheckpoint(&seed_cps[0], &cps[3], 256, s);
                 _ = try hc.commitWithState(&seed, toks[0..256], false, 0, seed_cps, null, null);
             }
@@ -907,8 +909,8 @@ test "HotPrefixCache: a trimmed idle victim keeps the QSA history on its last ke
     defer cache.deinit();
     try testFillCache(&cache, s, 3, toks.len);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 4);
-    for (cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    for (cps, 0..) |*cp, i| cp.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
 
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer hc.deinit();
@@ -958,11 +960,11 @@ test "HotPrefixCache: shed rescues an interior QSA bank" {
     hc.qsa_history_required = true;
     hc.ssm_checkpoint_max = 8;
     const cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
-    cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    try transformer_mod.sliceQsaHistoryOntoCheckpoint(&cps[1], &cps[2], cps[1].pos, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
+    cps[2] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
+    try qwen4_qsa_state.sliceQsaHistoryOntoCheckpoint(&cps[1], &cps[2], cps[1].pos, s);
     for (cps[2].layers) |*l| {
         if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
         l.qsa_pooled = .{ .ctx = null };
@@ -975,7 +977,7 @@ test "HotPrefixCache: shed rescues an interior QSA bank" {
     try testing.expect(hc.entryCount() == 1);
     const kept = hc.entries.items[0].ssm_checkpoints.?;
     try testing.expect(kept.len >= 1);
-    try testing.expect(transformer_mod.checkpointListHasQsaPooled(kept));
+    try testing.expect(qwen4_qsa_state.checkpointListHasQsaPooled(kept));
 }
 
 test "HotPrefixCache: dropLastRestored removes the restored entry so the next lookup is cold" {
@@ -990,8 +992,8 @@ test "HotPrefixCache: dropLastRestored removes the restored entry so the next lo
     var live = pcBuildQsaHybrid(s, 10, 100.0);
     defer pcFreeQsaHybrid(&live);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -1026,8 +1028,8 @@ test "HotPrefixCache: QSA self-heal drops the slot model cache and leaves a sibl
     var live_a = pcBuildQsaHybrid(s, 10, 100.0);
     defer pcFreeQsaHybrid(&live_a);
     const cps_a = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps_a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_a, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps_a, &live_a, s);
+    cps_a[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live_a, 8, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps_a, &live_a, s);
     _ = try last_loaded.commitWithState(&cache_a, &tokens_a, false, 0, cps_a, null, null);
 
     var slot_hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
@@ -1039,8 +1041,8 @@ test "HotPrefixCache: QSA self-heal drops the slot model cache and leaves a sibl
     var live_b = pcBuildQsaHybrid(s, 10, 200.0);
     defer pcFreeQsaHybrid(&live_b);
     const cps_b = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps_b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_b, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps_b, &live_b, s);
+    cps_b[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live_b, 8, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps_b, &live_b, s);
     _ = try slot_hc.commitWithState(&cache_b, &tokens_b, false, 0, cps_b, null, null);
 
     var tgt_a = try KVCache.init(testing.allocator, 3);
@@ -1081,9 +1083,9 @@ test "HotPrefixCache: inherited checkpoints never exceed the shared prefix" {
     defer donor_cache.deinit();
     try testFillCache(&donor_cache, s, 3, donor_toks.len);
     const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
-    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    donor_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    donor_cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(donor_cps, &live, s);
     _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_cache = try KVCache.init(testing.allocator, 3);
@@ -1106,7 +1108,7 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
     const s = mlx.gpuStream();
     const P: usize = 20;
     const hd: c_int = 8;
-    var xfm: transformer_mod.Transformer = undefined;
+    var xfm: trunk_mod.Transformer = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 40, hd);
@@ -1141,7 +1143,7 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
         };
         defer pcFreeQsaHybrid(&live);
         try pcQsaFeed(&xfm, &live[0], keys, 40, s);
-        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+        try qwen4_qsa_state.attachQsaHistoryToLatest(donor_cps, &live, s);
     }
     _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
@@ -1186,7 +1188,7 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
     const P: usize = 48;
     const prompt_len: usize = P - 1;
     const hd: c_int = 8;
-    var xfm: transformer_mod.Transformer = undefined;
+    var xfm: trunk_mod.Transformer = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 80, hd);
@@ -1216,7 +1218,7 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
         };
         defer pcFreeQsaHybrid(&live);
         try pcQsaFeed(&xfm, &live[0], keys, 64, s);
-        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+        try qwen4_qsa_state.attachQsaHistoryToLatest(donor_cps, &live, s);
     }
     _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
@@ -1242,7 +1244,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
     const ratio: c_int = 4;
     const B: usize = 19;
     const H: usize = 80;
-    var xfm: transformer_mod.Transformer = undefined;
+    var xfm: trunk_mod.Transformer = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, @intCast(H), hd);
@@ -1256,18 +1258,18 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
     defer pcFreeQsaHybrid(&live);
     try pcQsaFeed(&xfm, &live[0], keys, @intCast(B), s);
     var cps = [_]SSMCheckpoint{
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, B, s),
+        try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, B, s),
         undefined,
     };
-    transformer_mod.ssmFreeQsaState(&live[0]);
+    qwen4_qsa_state.ssmFreeQsaState(&live[0]);
     live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = ratio };
     try pcQsaFeed(&xfm, &live[0], keys, @intCast(H), s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, H, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, H, s);
     defer for (&cps) |*c| c.deinit(testing.allocator);
-    try transformer_mod.attachQsaHistoryToLatest(&cps, &live, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(&cps, &live, s);
     if (live[0].aux_state.ctx != null) {
         if (cps[1].layers[0].aux_state.ctx != null) _ = mlx.mlx_array_free(cps[1].layers[0].aux_state);
-        cps[1].layers[0].aux_state = try transformer_mod.materializedOwnedCopy(s, live[0].aux_state);
+        cps[1].layers[0].aux_state = try trunk_mod.materializedOwnedCopy(s, live[0].aux_state);
         _ = mlx.mlx_array_eval(cps[1].layers[0].aux_state);
     }
 
@@ -1278,8 +1280,8 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
 
     var from_full = pcEmptySsm();
     defer pcFreeQsaHybrid(&from_full);
-    try transformer_mod.restoreSsmCheckpoint(&from_full, &cps[0]);
-    transformer_mod.applyQsaHistoryAt(&from_full, &cps[1], B, s, false) catch |err| {
+    try trunk_mod.restoreSsmCheckpoint(&from_full, &cps[0]);
+    qwen4_qsa_state.applyQsaHistoryAt(&from_full, &cps[1], B, s, false) catch |err| {
         std.debug.print("sliced-apply residue fail K=full field=apply {s}\n", .{@errorName(err)});
         return err;
     };
@@ -1294,15 +1296,15 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
 
     var K: usize = B + 1;
     while (K < H) : (K += 1) {
-        var sliced = try transformer_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
+        var sliced = try trunk_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
         defer sliced.deinit(testing.allocator);
         sliced.pos = K;
-        try transformer_mod.sliceQsaHistoryOntoCheckpoint(&sliced, &cps[1], K, s);
+        try qwen4_qsa_state.sliceQsaHistoryOntoCheckpoint(&sliced, &cps[1], K, s);
 
         var from_sliced = pcEmptySsm();
         defer pcFreeQsaHybrid(&from_sliced);
-        try transformer_mod.restoreSsmCheckpoint(&from_sliced, &cps[0]);
-        transformer_mod.applyQsaHistoryAt(&from_sliced, &sliced, B, s, false) catch |err| {
+        try trunk_mod.restoreSsmCheckpoint(&from_sliced, &cps[0]);
+        qwen4_qsa_state.applyQsaHistoryAt(&from_sliced, &sliced, B, s, false) catch |err| {
             std.debug.print("sliced-apply residue fail K={d} field=apply {s}\n", .{ K, @errorName(err) });
             return err;
         };
@@ -1337,7 +1339,7 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
     const donor_gen: usize = 16;
     const heir_gen: usize = 12;
     const a2_extra: usize = 8;
-    var xfm: transformer_mod.Transformer = undefined;
+    var xfm: trunk_mod.Transformer = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -1375,7 +1377,7 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
         };
         defer pcFreeQsaHybrid(&live);
         try pcQsaFeed(&xfm, &live[0], keys, @intCast(donor_len), s);
-        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+        try qwen4_qsa_state.attachQsaHistoryToLatest(donor_cps, &live, s);
     }
     _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
@@ -1392,7 +1394,7 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
         };
         defer pcFreeQsaHybrid(&live);
         try pcQsaFeed(&xfm, &live[0], keys, @intCast(a2_len), s);
-        try transformer_mod.attachQsaHistoryToLatest(a2_own, &live, s);
+        try qwen4_qsa_state.attachQsaHistoryToLatest(a2_own, &live, s);
     }
     _ = try hc.commitWithState(&a2_cache, &a2_toks, false, 0, a2_own, null, null);
 
@@ -1448,9 +1450,9 @@ test "HotPrefixCache: a verbatim re-send restores at prompt_len-1" {
     defer cache.deinit();
     try testFillCache(&cache, s, 3, toks.len);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, toks.len - 1, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, toks.len - 1, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -1461,7 +1463,7 @@ test "HotPrefixCache: a verbatim re-send restores at prompt_len-1" {
     const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null);
     try testing.expectEqual(toks.len - 1, r.matched);
     try testing.expect(!r.full_match);
-    try testing.expect(transformer_mod.qsaRestoreSatisfiesForward(&target, r.matched));
+    try testing.expect(qwen4_qsa_state.qsaRestoreSatisfiesForward(&target, r.matched));
 }
 
 test "HotPrefixCache: a hybrid full-prefix extend checks out under SSD-first" {
@@ -1483,8 +1485,8 @@ test "HotPrefixCache: a hybrid full-prefix extend checks out under SSD-first" {
     defer cache.deinit();
     try testFillCache(&cache, s, 3, toks.len);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
 
     var slot = try KVCache.init(testing.allocator, 3);
@@ -1511,9 +1513,9 @@ test "HotPrefixCache: walk-down restores the higher covering checkpoint, not a l
     defer cache.deinit();
     try testFillCache(&cache, s, 3, toks.len);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -1538,8 +1540,8 @@ test "HotPrefixCache: skip set on the cache without a lookup does not poison the
     var live = pcBuildQsaHybrid(s, 10, 100.0);
     defer pcFreeQsaHybrid(&live);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -1570,8 +1572,8 @@ test "HotPrefixCache: skip_prefix_cache lookup is cold even when a covering entr
     var live = pcBuildQsaHybrid(s, 10, 100.0);
     defer pcFreeQsaHybrid(&live);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -1603,8 +1605,8 @@ test "HotPrefixCache: a skipped lookup of a covering prompt matches a cold cache
     var live = pcBuildQsaHybrid(s, 10, 100.0);
     defer pcFreeQsaHybrid(&live);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
     var skipped_cache = try KVCache.init(testing.allocator, 3);
@@ -1653,7 +1655,7 @@ test "HotPrefixCache: inherit-branch QSA invariant drop unbills the dropped SSM 
     defer donor_cache.deinit();
     try testFillCache(&donor_cache, s, 3, donor_toks.len);
     const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
+    donor_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
     for (donor_cps[0].layers) |*l| {
         if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
         l.qsa_pooled = .{ .ctx = null };
@@ -1667,7 +1669,7 @@ test "HotPrefixCache: inherit-branch QSA invariant drop unbills the dropped SSM 
     defer heir_cache.deinit();
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
     const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 18, s);
+    heir_own[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 18, s);
     for (heir_own[0].layers) |*l| {
         if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
         l.qsa_pooled = .{ .ctx = null };
@@ -1701,9 +1703,9 @@ test "HotPrefixCache: shedding the oldest QSA bank with no lower destination dro
     hc.qsa_history_required = true;
     hc.ssm_checkpoint_max = 8;
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live2, 25, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps[0..1], &live, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live2, 25, s);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(cps[0..1], &live, s);
     for (cps[1].layers) |*l| {
         if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
         l.qsa_pooled = .{ .ctx = null };
@@ -1726,7 +1728,7 @@ test "HotPrefixCache: a QSA-required restore without indexer history is a miss e
     var live = pcBuildHybrid(s, 123.0, 456.0);
     defer pcFreeHybrid(&live);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
     hc.qsa_history_required = true;
 
@@ -1809,14 +1811,14 @@ test "spec snap bytes: the qwen4 head's QSA half is billed into the entry" {
     try testing.expect(kv_only > 0);
 
     var entry: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
-    defer transformer_mod.ssmFreeQsaState(&entry);
+    defer qwen4_qsa_state.ssmFreeQsaState(&entry);
     defer _ = mlx.mlx_array_free(entry.conv_state);
     defer _ = mlx.mlx_array_free(entry.ssm_state);
     const shape = [_]c_int{ 1, 16, 128 };
     entry.aux_state = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_zeros(&entry.aux_state, &shape, 3, .bfloat16, s));
     entry.qsa_ratio = 4;
-    snap.head_aux = transformer_mod.ssmSnapshot(&entry);
+    snap.head_aux = trunk_mod.ssmSnapshot(&entry);
     const with_head = HotPrefixCache.specSnapBytes(&snap);
     try testing.expectEqual(kv_only + 16 * 128 * 2, with_head);
 }
@@ -1863,12 +1865,12 @@ test "Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD
     while (pos < loop_end) {
         pos = prefill_plan.nextChunkEnd(pos, loop_end, 8192, true, stride, 0, true);
         if (pos % stride == 0) {
-            try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[cps.items.len], pos, s));
+            try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[cps.items.len], pos, s));
             peak = @max(peak, pcHeld(cps.items));
         }
         hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, cps.items, std.math.maxInt(u64), s);
     }
-    try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[4], loop_end, s));
+    try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[4], loop_end, s));
     try testing.expect(peak <= 2);
 
     const owned = try cps.toOwnedSlice(testing.allocator);
@@ -1905,9 +1907,9 @@ test "an image turn on a QSA hybrid persists the indexer history its checkpoint 
         var live = pcBuildQsaHybrid(s, 1024, 100.0);
         defer pcFreeQsaHybrid(&live);
         const cps = try testing.allocator.alloc(SSMCheckpoint, 4);
-        for (cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
+        for (cps, 0..) |*cp, i| cp.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
         // The pooled bank lives on the newest checkpoint, which is past the item.
-        try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+        try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
         var cache = try KVCache.init(testing.allocator, 3);
         defer cache.deinit();
         try testFillCache(&cache, s, 3, tokens.len);

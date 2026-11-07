@@ -1,4 +1,6 @@
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
+const trunk_helpers_test = @import("../trunk_helpers_test.zig");
 const nax_gate = @import("../nax_gate.zig");
 const ssm_cache = @import("../ssm_cache.zig");
 const std = @import("std");
@@ -16,26 +18,26 @@ const attn256RandBf16Scaled = test_support.attn256RandBf16Scaled;
 const bf16Trunc = test_support.bf16Trunc;
 const evalToF32 = test_support.evalToF32;
 const qkvExpectBitsEqual = test_support.qkvExpectBitsEqual;
-const GDN_KERNEL_HEADER = trf.GDN_KERNEL_HEADER;
-const KVCache = trf.KVCache;
-const LinearAttnWeights = trf.LinearAttnWeights;
-const SSMCacheEntry = trf.SSMCacheEntry;
-const Transformer = trf.Transformer;
+const GDN_KERNEL_HEADER = trunk_mod.GDN_KERNEL_HEADER;
+const KVCache = trunk_mod.KVCache;
+const LinearAttnWeights = trunk_mod.LinearAttnWeights;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const Transformer = trunk_mod.Transformer;
 const GdnProj = Transformer.GdnProj;
 const GdnVerifyInputs = Transformer.GdnVerifyInputs;
 const PREFILL_EVAL_MIN_SEQ = Transformer.PREFILL_EVAL_MIN_SEQ;
-const bf16Scalar = trf.bf16Scalar;
-const compactConvStateEnabled = trf.compactConvStateEnabled;
-const conv1dExpectBitEqual = trf.conv1dExpectBitEqual;
-const diagEnvOnCached = trf.diagEnvOnCached;
-const getGdnKernel = trf.getGdnKernel;
-const getGdnKernelFor = trf.getGdnKernelFor;
-const materializedOwnedCopy = trf.materializedOwnedCopy;
-const qwen4Standin = trf.qwen4Standin;
-const ssmFreeSpecCapture = trf.ssmFreeSpecCapture;
-const ssmRollbackFromCapture = trf.ssmRollbackFromCapture;
-const standinRef = trf.standinRef;
-const verifyQmmNaxAvailable = trf.verifyQmmNaxAvailable;
+const bf16Scalar = trunk_mod.bf16Scalar;
+const compactConvStateEnabled = trunk_mod.compactConvStateEnabled;
+const conv1dExpectBitEqual = trunk_helpers_test.conv1dExpectBitEqual;
+const diagEnvOnCached = trunk_mod.diagEnvOnCached;
+const getGdnKernel = trunk_mod.getGdnKernel;
+const getGdnKernelFor = trunk_mod.getGdnKernelFor;
+const materializedOwnedCopy = trunk_mod.materializedOwnedCopy;
+const qwen4Standin = qwen4_forward.qwen4Standin;
+const ssmFreeSpecCapture = trunk_mod.ssmFreeSpecCapture;
+const ssmRollbackFromCapture = trunk_mod.ssmRollbackFromCapture;
+const standinRef = trunk_mod.standinRef;
+const verifyQmmNaxAvailable = trunk_mod.verifyQmmNaxAvailable;
 
 
 
@@ -1326,7 +1328,7 @@ fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
-    xfm.compileGdnGate();
+    qwen4_forward.compileGdnGate(&xfm);
     defer if (xfm.compiled_gdn_gate) |closure| {
         _ = mlx.mlx_closure_free(closure);
     };
@@ -1475,7 +1477,7 @@ fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
         defer _ = mlx.mlx_array_free(g_ref);
         try gdnGateExpectClose(pre.g, g_ref, gate_dt, s);
         if (gate_dt == xfm.config.gdnGateDtype()) {
-            const g_compiled = try xfm.computeGdnGate(A_log, a_in, dt_bias);
+            const g_compiled = try computeGdnGate(&xfm, A_log, a_in, dt_bias);
             defer _ = mlx.mlx_array_free(g_compiled);
             try gdnGateExpectClose(pre.g, g_compiled, gate_dt, s);
         }
@@ -2137,13 +2139,13 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
     defer xfm.spec_capture_ssm = false;
     defer gdn_decode_recur_override = null;
     gdn_decode_recur_override = false;
-    const out_chain = try xfm.gatedDeltaNetProjected(x, la, chain, 0, 1, seq, seq > 1, null, false);
+    const out_chain = try gatedDeltaNetProjected(xfm, x, la, chain, 0, 1, seq, seq > 1, null, false);
     defer _ = mlx.mlx_array_free(out_chain);
     const engaged = if (seq == 1) &gdn_decode_recur_engaged else &gdn_verify_recur_engaged;
     engaged.* = false;
     gdn_verify_fold_engaged = false;
     gdn_decode_recur_override = true;
-    const out = try xfm.gatedDeltaNetProjected(x, la, fused, 0, 1, seq, seq > 1, null, false);
+    const out = try gatedDeltaNetProjected(xfm, x, la, fused, 0, 1, seq, seq > 1, null, false);
     errdefer _ = mlx.mlx_array_free(out);
     try testing.expect(engaged.*);
     if (capture and gdnVerifyFoldFor(seq) and !gdn_decode.foldDeclined(seq)) try testing.expect(gdn_verify_fold_engaged);
@@ -2288,7 +2290,7 @@ fn gdnRecurLayerCase(wide: bool, proj: GdnProjections) !void {
             defer _ = mlx.mlx_array_free(x_j);
             gdn_decode_recur_override = true;
             defer gdn_decode_recur_override = null;
-            const out_j = try xfm.gatedDeltaNetProjected(x_j, &la, &serial, 0, 1, 1, false, null, false);
+            const out_j = try gatedDeltaNetProjected(&xfm, x_j, &la, &serial, 0, 1, 1, false, null, false);
             defer _ = mlx.mlx_array_free(out_j);
             const row_j = try gdnRecurRows(out, j, j + 1, s);
             defer _ = mlx.mlx_array_free(row_j);
@@ -2416,7 +2418,7 @@ fn gdnDecayRun(xfm: *Transformer, la: *const LinearAttnWeights, route: GdnDecayR
     try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1, per_call, 128 }, 3, .bfloat16, s));
     var call: c_int = 0;
     while (call < @divExact(gdn_decay_steps, per_call)) : (call += 1) {
-        _ = mlx.mlx_array_free(try xfm.gatedDeltaNetProjected(ones, la, &entry, 0, 1, per_call, route == .prefill, null, false));
+        _ = mlx.mlx_array_free(try gatedDeltaNetProjected(xfm, ones, la, &entry, 0, 1, per_call, route == .prefill, null, false));
     }
     switch (route) {
         .decode => try testing.expect(gdn_decode_recur_engaged),
@@ -2581,7 +2583,7 @@ fn conv1dTailRetentionDelta(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int
     var baseline: usize = 0;
     _ = mlx.mlx_get_active_memory(&baseline);
 
-    const out = try xfm.conv1dWithCache(x, w, null, &entry, batch, cdim, kernel, false);
+    const out = try conv1dWithCache(&xfm, x, w, null, &entry, batch, cdim, kernel, false);
     var out_live = true;
     defer if (out_live) {
         _ = mlx.mlx_array_free(out);
@@ -2630,7 +2632,7 @@ fn conv1dBitCopy(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int, compact: 
     };
     errdefer _ = mlx.mlx_array_free(entry.conv_state);
     defer _ = mlx.mlx_array_free(entry.ssm_state);
-    const out = try xfm.conv1dWithCache(x, w, null, &entry, batch, cdim, kernel, true);
+    const out = try conv1dWithCache(&xfm, x, w, null, &entry, batch, cdim, kernel, true);
     return .{ .out = out, .conv_state = entry.conv_state };
 }
 
@@ -2658,9 +2660,9 @@ fn conv1dTwoChunk(batch: c_int, t1: c_int, t2: c_int, cdim: c_int, kernel: c_int
     };
     errdefer _ = mlx.mlx_array_free(entry.conv_state);
     defer _ = mlx.mlx_array_free(entry.ssm_state);
-    const out1 = try xfm.conv1dWithCache(x1, w, null, &entry, batch, cdim, kernel, true);
+    const out1 = try conv1dWithCache(&xfm, x1, w, null, &entry, batch, cdim, kernel, true);
     _ = mlx.mlx_array_free(out1);
-    const out2 = try xfm.conv1dWithCache(x2, w, null, &entry, batch, cdim, kernel, true);
+    const out2 = try conv1dWithCache(&xfm, x2, w, null, &entry, batch, cdim, kernel, true);
     return .{ .out = out2, .conv_state = entry.conv_state };
 }
 
@@ -2702,7 +2704,7 @@ pub fn gatedDeltaNetProjected(
         a_proj = values.a;
         b_proj = values.b;
     } else {
-        const proj = try self.gdnProjGpu(x, la);
+        const proj = try gdnProjGpu(self, x, la);
         qkv = proj.qkv;
         z_proj = proj.z;
         a_proj = try self.qmatmul(x, &la.a);
@@ -2880,7 +2882,7 @@ pub fn gatedDeltaNetProjected(
                 break :blk;
             };
         }
-        if (diagEnvOnCached(&gdn_check_env, "QWEN4_GDN_CHECK")) self.gdnCheckFused(la, qkv, incoming_conv, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
+        if (diagEnvOnCached(&gdn_check_env, "QWEN4_GDN_CHECK")) gdnCheckFused(self, la, qkv, incoming_conv, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
         _ = mlx.mlx_array_free(ssm.conv_state);
         ssm.conv_state = pre.conv_state;
         ssm.initialized = true;
@@ -2906,7 +2908,7 @@ pub fn gatedDeltaNetProjected(
 
     if (!fused_prework) {
         // Conv1d with cache: prepend conv_state, apply depthwise conv + silu
-        const conv_out = try self.conv1dWithCache(qkv, la.conv1d_w, null, ssm, batch, conv_dim, kernel, true);
+        const conv_out = try conv1dWithCache(self, qkv, la.conv1d_w, null, ssm, batch, conv_dim, kernel, true);
         defer _ = mlx.mlx_array_free(conv_out);
 
         // Split conv output into Q, K, V
@@ -2974,7 +2976,7 @@ pub fn gatedDeltaNetProjected(
     // [B, S, Hv]. KDA: one value per KEY CHANNEL — [B, S, Hv*Dk], which the
     // `_vec` kernel variant indexes.
     const vector_gate = cfg.kda_vector_gate;
-    const g = g_fused orelse try self.computeGdnGate(la.A_log, a_proj, la.dt_bias);
+    const g = g_fused orelse try computeGdnGate(self, la.A_log, a_proj, la.dt_bias);
     defer _ = mlx.mlx_array_free(g);
 
     // beta = sigmoid(b)
@@ -3304,7 +3306,7 @@ pub fn gdnCheckFused(self: *Transformer, la: *const LinearAttnWeights, qkv: mlx.
         case[4].* = try attn256MaxDiff(case[3], scaled, s);
     }
     const dst = try attn256MaxDiff(pre.conv_state, ref_state, s);
-    const g_ref = try self.computeGdnGate(la.A_log, a_proj, la.dt_bias);
+    const g_ref = try computeGdnGate(self, la.A_log, a_proj, la.dt_bias);
     defer _ = mlx.mlx_array_free(g_ref);
     const dg = try attn256MaxDiff(pre.g, g_ref, s);
     var beta_ref = mlx.mlx_array_new();
@@ -3946,7 +3948,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
     {
         const x = try gdnRecurRand(rnd, &.{ 1, 5, hidden }, 2.0, .bfloat16, s);
         defer _ = mlx.mlx_array_free(x);
-        _ = mlx.mlx_array_free(try xfm.gatedDeltaNetProjected(x, &la, &fresh, 0, 1, 5, true, null, false));
+        _ = mlx.mlx_array_free(try gatedDeltaNetProjected(&xfm, x, &la, &fresh, 0, 1, 5, true, null, false));
         try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(fresh.ssm_state));
     }
 
@@ -3963,7 +3965,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
     {
         const x = try gdnRecurRand(rnd, &.{ 1, 1, hidden }, 2.0, .bfloat16, s);
         defer _ = mlx.mlx_array_free(x);
-        _ = mlx.mlx_array_free(try xfm.gatedDeltaNetProjected(x, &la, &live, 0, 1, 1, false, null, false));
+        _ = mlx.mlx_array_free(try gatedDeltaNetProjected(&xfm, x, &la, &live, 0, 1, 1, false, null, false));
         try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(live.ssm_state));
     }
 
@@ -3976,7 +3978,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
     const x = try gdnRecurRand(rnd, &.{ 1, seq, hidden }, 2.0, .bfloat16, s);
     defer _ = mlx.mlx_array_free(x);
     xfm.spec_capture_ssm = true;
-    const out = try xfm.gatedDeltaNetProjected(x, &la, &live, 0, 1, seq, false, null, false);
+    const out = try gatedDeltaNetProjected(&xfm, x, &la, &live, 0, 1, seq, false, null, false);
     xfm.spec_capture_ssm = false;
     defer _ = mlx.mlx_array_free(out);
     try testing.expectEqual(f32_dt, mlx.mlx_array_dtype(live.ssm_state));
@@ -3984,7 +3986,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
 
     const x0 = try gdnRecurRows(x, 0, 1, s);
     defer _ = mlx.mlx_array_free(x0);
-    _ = mlx.mlx_array_free(try xfm.gatedDeltaNetProjected(x0, &la, &serial, 0, 1, 1, false, null, false));
+    _ = mlx.mlx_array_free(try gatedDeltaNetProjected(&xfm, x0, &la, &serial, 0, 1, 1, false, null, false));
     try ssmRollbackFromCapture(&live, 0, @intCast(seq), s);
     try qkvExpectBitsEqual(s, live.ssm_state, serial.ssm_state);
     try qkvExpectBitsEqual(s, live.conv_state, serial.conv_state);
@@ -4058,7 +4060,7 @@ test "gdn gate at f32: compiled closure, graph chain and prework kernel agree fa
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
-    xfm.compileGdnGate();
+    qwen4_forward.compileGdnGate(&xfm);
     defer if (xfm.compiled_gdn_gate) |closure| {
         _ = mlx.mlx_closure_free(closure);
     };
@@ -4092,7 +4094,7 @@ test "gdn gate at f32: compiled closure, graph chain and prework kernel agree fa
         defer inline for (.{ pre.q, pre.k, pre.v, pre.conv_state, pre.g, pre.beta }) |arr| {
             _ = mlx.mlx_array_free(arr);
         };
-        const g_closure = try xfm.computeGdnGate(A_log, a_in, dt_bias);
+        const g_closure = try computeGdnGate(&xfm, A_log, a_in, dt_bias);
         defer _ = mlx.mlx_array_free(g_closure);
         const g_chain = try gdnGateChain(A_log, a_in, dt_bias, .float32, s);
         defer _ = mlx.mlx_array_free(g_chain);

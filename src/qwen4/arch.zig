@@ -1,5 +1,6 @@
 //! Flash-Next (`qwen4_exp`) as the registry sees it: its one public face.
 const std = @import("std");
+const qwen4_forward = @import("qwen4_forward.zig");
 const mlx = @import("../mlx.zig");
 const trunk = @import("../trunk.zig");
 const qwen4_state = @import("qwen4_state.zig");
@@ -73,8 +74,8 @@ pub fn warmup(xfm: Model) !void {
 
 pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {
     // Only a batched GDN tick binds the persistent group, so no other arch has one to release.
-    if (ctx.batch_slots == null) try xfm.ssmGroupRelease(ctx);
-    return xfm.forwardQwen4With(ctx, ids);
+    if (ctx.batch_slots == null) try qwen4_ssm_group.ssmGroupRelease(xfm, ctx);
+    return qwen4_forward.forwardQwen4With(xfm, ctx, ids);
 }
 
 pub fn lmHeadForDraft(xfm: Model, x: mlx.mlx_array) !mlx.mlx_array {

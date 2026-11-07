@@ -1,6 +1,7 @@
 //! Flash-Next prefix-cache parts: the QSA-history section of an SSD record, the GDN/QSA accelerators on an SSM
 //! entry, and the adoption of a committed MTP head. Reached through `arch/prefix.zig`.
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
 const pc = @import("../prefix_cache.zig");
 const log = @import("../log.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
@@ -35,7 +36,7 @@ pub const aux = struct {
 
 /// The in-checkpoint MTP head's snapshot (KV and QSA aux together) adopted into the model's own head. Null leaves
 /// the head blind, which costs acceptance and never a token.
-pub fn adoptSpecHead(xfm: *trf.Transformer, plan: pc.SpecAdopt, snap: *const pc.DflashSnap, base_pos: *usize) ?usize {
+pub fn adoptSpecHead(xfm: *trunk_mod.Transformer, plan: pc.SpecAdopt, snap: *const pc.DflashSnap, base_pos: *usize) ?usize {
     const want = switch (plan) {
         .head => |w| w,
         .decline_head_no_history => {
@@ -44,7 +45,7 @@ pub fn adoptSpecHead(xfm: *trf.Transformer, plan: pc.SpecAdopt, snap: *const pc.
         },
         .skip, .kv_only => return null,
     };
-    xfm.qwen4MtpAdopt(&snap.snapshot, &snap.head_aux.?, snap.head_marks.slice(), snap.head_pos_base, want) catch |err| {
+    qwen4_forward.qwen4MtpAdopt(xfm, &snap.snapshot, &snap.head_aux.?, snap.head_marks.slice(), snap.head_pos_base, want) catch |err| {
         log.warn("  [qwen4] MTP head restore declined ({s}) — head starts blind\n", .{@errorName(err)});
         return null;
     };
