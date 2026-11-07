@@ -39,6 +39,10 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
 - `zig build test-host` builds `src/tests_host.zig`, a root that links no MLX: a file in it that reaches MLX fails the
   link. The build reads that root's imports as the host list, and no MLX bucket may also select a host file's tests.
+  The host binary is filtered to the tests of those files (`hostFilters` in build.zig); its module is built with
+  `build_options.host_tier`, under which a live GPU read (`gpu_mem.zig`) panics and the NAX probe answers false.
+  Every `<arch>/<arch>_bill.zig` is a host file too, by its `_bill` stem; `bills.zig` reaches the enabled archs' through the registry.
+  A bill test that needs the live GPU lives in `bills_live_test.zig` (or `<arch>_bill_test.zig`) in the MLX tier.
 - `zig build test` runs the host tier, the MLX buckets, the exl3 binaries and the encoder binary.
 - build.zig names a bucket's files at configure time, so every folder or file it scans is declared with
   `b.dependOnDirectoryContents`/`dependOnFileContents`; without that a new test file never runs until the cache goes.
@@ -72,14 +76,14 @@ a test that skips only inside a helper counts as gpu or cpu.
 
 | folder | model | test files | host | gpu | pack | cpu | tests |
 |---|---|---|---|---|---|---|---|
-| `src/` | shared (every model) | 99 | 710 | 151 | 73 | 1718 | 2652 |
-| `src/exl3/` | shared (the sushi_exl3 module) | 13 | 0 | 27 | 80 | 138 | 245 |
+| `src/` | shared (every model) | 134 | 1068 | 149 | 70 | 1638 | 2925 |
+| `src/exl3/` | shared (the sushi_exl3 module) | 15 | 0 | 31 | 91 | 143 | 265 |
 | `src/encoder/` | shared (the encoder, `-Dmodel=enc`) | 17 | 0 | 23 | 4 | 51 | 78 |
-| `src/qwen4/` | qwen4 | 16 | 0 | 119 | 67 | 121 | 307 |
-| `src/mimo2/` | mimo2 | 8 | 0 | 13 | 17 | 53 | 83 |
-| `src/glm5/` | glm5 | 46 | 0 | 159 | 27 | 115 | 301 |
-| `src/dsv41/` | dsv41 | 19 | 22 | 114 | 18 | 82 | 236 |
-| total | | 218 | 732 | 606 | 286 | 2278 | 3902 |
+| `src/qwen4/` | qwen4 | 21 | 0 | 132 | 72 | 206 | 410 |
+| `src/mimo2/` | mimo2 | 10 | 0 | 13 | 20 | 67 | 100 |
+| `src/glm5/` | glm5 | 50 | 9 | 159 | 27 | 126 | 321 |
+| `src/dsv41/` | dsv41 | 23 | 22 | 148 | 40 | 112 | 322 |
+| total | | 270 | 1099 | 655 | 324 | 2343 | 4421 |
 
 Two hermetic guards keep the folders honest. Both are checked by `python3 tests/test_suite_guards.py` (CI runs it) and
 read allowlists that `python3 tests/suite_guards.py --write` regenerates; run it after every landing that moves code,

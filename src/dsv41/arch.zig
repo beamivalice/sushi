@@ -21,7 +21,7 @@ pub const drafter = @import("dsv41_drafter.zig");
 
 pub const prefix = @import("dsv41_prefix.zig"); // slot:prefix (S2c)
 
-// slot:bill (S2d)
+pub const bill = @import("dsv41_bill.zig"); // slot:bill (S2d)
 
 const config_file = @import("dsv41_config.zig");
 const arch_config = @import("../arch/config.zig");

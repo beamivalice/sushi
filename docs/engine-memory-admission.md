@@ -9,6 +9,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 [engine-prefix-cache](engine-prefix-cache.md#budget), [engine-expert-streaming](engine-expert-streaming.md#budget),
 [mimo2-arch](mimo2-arch.md#bills-the-bill-follows-the-storage-in-the-same-commit).
 
+## Where the bills live
+
+Every bill, admission, context and chunk function is in `src/bills.zig`, which links no MLX and runs in
+`zig build test-host`; `gpu_mem.zig` holds the live GPU readers, so a host test that would read the device panics
+instead of guessing. An arch's own terms are in `src/<arch>/<arch>_bill.zig` ([engine-arch-seam](engine-arch-seam.md)).
+`bills.zig` reads the launch vars `main.zig` writes through `launch_state` (an alias of `server.zig`, temporary until
+the launch state has its own file); `requestBillsMtpHead` stays in `server.zig`. The `bill pin:` tests hold every
+bill function's output on the committed fixture configs of all served packs: a bill change moves a pin, on purpose.
+
 ## Metal OOM
 
 - **Metal OOM is UNCATCHABLE and Metal at the working-set edge returns ZEROS before it aborts**: all-zero logits from

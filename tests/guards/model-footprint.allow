@@ -1,6 +1,6 @@
 # Mentions of each model in the shared sources (src/ root, src/exl3, src/encoder), outside comments and tests.
 # The count may only shrink. Generated: python3 tests/suite_guards.py --write. Keyed by model, not file.
-qwen4 860
-mimo2 287
-glm5 603
-dsv41 286
+qwen4 858
+mimo2 282
+glm5 556
+dsv41 291

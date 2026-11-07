@@ -225,7 +225,10 @@ def host_files(root):
     path = os.path.join(root, "src/tests_host.zig")
     with open(path) as f:
         text = f.read()
-    return {"src/" + p for p in re.findall(r'_ = @import\("([^"]+\.zig)"\);', text)}
+    listed = {"src/" + p for p in re.findall(r'_ = @import\("([^"]+\.zig)"\);', text)}
+    # build.zig runs every <arch>/<arch>_bill.zig in the host tier too.
+    bills = {os.path.relpath(os.path.join(d, f), root) for d, _, fs in os.walk(os.path.join(root, "src")) for f in fs if f.endswith("_bill.zig")}
+    return listed | bills
 
 
 def tier_of(rel, body, host):

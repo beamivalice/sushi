@@ -1,3 +1,12 @@
+// src/exl3 reaches these through its host root.
+pub const mlx = @import("mlx.zig");
+pub const log = @import("log.zig");
+pub const io_util = @import("io_util.zig");
+pub const tokenizer = @import("tokenizer.zig");
+pub const kld = @import("kld.zig");
+pub const imatrix = @import("imatrix.zig");
+pub const transformer = @import("transformer.zig");
+
 test {
     _ = @import("chat.zig");
     _ = @import("tool_schema.zig");
@@ -7,6 +16,7 @@ test {
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("tokenize_cache.zig");
     _ = @import("round_cost.zig");
+    _ = @import("bills.zig");
     _ = @import("effort.zig");
     _ = @import("reasoning_protocol.zig");
     _ = @import("json_schema.zig");

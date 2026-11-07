@@ -20,15 +20,9 @@ GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised
 GLM EXL3 index uses native source nesting and refuses mixed expert formats
 GLM EXL3 preflight refuses a rate-grouped layer by name
 GLM EXL3 preflight refuses orphan MTP and out of range packed tensors
-GLM MLA prefill scratch is held by the MLA layers a pending window can contain
-GLM SSD-only bills its checkpoints and window, no writer term (the shared admission headroom has it), and sizes no cache
-GLM admission bills the checkpoints and assistant window a request keeps; the context sizer reserves none of them
-GLM admission bills the commit's row copy, so a long generation cannot commit above the ceiling, and the copy never costs a long prompt its checkpoints
 GLM admission credits the hot cache, so an eviction lets a long prefill in
 GLM assistant bounded block tail preserves visible keys and masks
 GLM assistant cached sliding mask equals the mask built at any absolute position
-GLM billed checkpoint peak equals the checkpoints its prefill captures, whatever stride is configured
-GLM bills two KDA states, not eight, while its prefill moves each to SSD and frees the RAM copy
 GLM clamped EXL3 rejects malformed banks before kernel dispatch
 GLM group2 cooperative projections preserve F16 bits at all rates and ballot boundaries
 GLM group2 half4 composition preserves all-rate cooperative projection bits
@@ -44,9 +38,7 @@ GLM prefill chunk never widens past the width its numerics are built for
 GLM prefill grid declines guards before dispatch
 GLM prefill grid serves W14 packs with the sorted chain's bytes
 GLM prefill grid serves every admitted rate, mixed projections included, with the sorted chain's bytes
-GLM prefill transient bill follows the latent width: kv6 sheds 128 bytes per latent row against kv8
 GLM raw FP8 honors the declared wired limit with the same reserve as MiMo
-GLM raw FP8 scratch bills all pending projections only beyond direct decode
 GLM release defaults advertise the full context at the widest prefill chunk that keeps it
 GLM requests prefill at 2048 and step down a rung only where a chunk stops fitting
 GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included
@@ -54,7 +46,6 @@ GLM serves PAIR1 on the prefill grid with the unfolded sorted chain's bytes
 GLM serves spec1 and std1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included
 GLM serves spec1 and std1 on the prefill grid with the unfolded sorted chain's bytes
 GLM serves std1 on the prefill grid and probes a failing kernel once per codebook and window
-GLM serving DFlash2 bill includes the bounded window captures replay and scratch
 GLM serving DFlash2 trims physical window and preserves absolute append positions
 GLM serving accepts native effort levels and thinks by default
 GLM serving memory bills one latent at the request's KV width and pooled index per token
@@ -91,7 +82,6 @@ a streamed DeepSeek bills its workspace at load and no fill peak at load or per 
 a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep theirs
 a streamed GLM bills its fill peak per request and its latent at the KV width plus the pooled index per planned token
 a streamed Qwen plans its QSA history beside its KV for every planned token
-a thought point is one more checkpoint state in the bill: every Qwen request, a GLM request that keeps checkpoints
 an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths
 an unloaded qwen4 stub is text-only only when the checkpoint must stream
 applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config

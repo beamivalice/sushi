@@ -61,7 +61,17 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "mlx_sha", mlx_sha);
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
     build_options.addOption([]const u8, "git_sha", git_sha);
-    build_options.addOption([]const []const u8, "archs", archList(b));
+    const archs = archList(b);
+    build_options.addOption([]const []const u8, "archs", archs);
+    build_options.addOption(bool, "host_tier", false);
+    // The host test root links no MLX, so gpu_mem.zig refuses a live GPU read under it.
+    const host_options = b.addOptions();
+    host_options.addOption([]const u8, "version", version);
+    host_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
+    host_options.addOption([]const u8, "mlx_sha", mlx_sha);
+    host_options.addOption([]const u8, "git_sha", git_sha);
+    host_options.addOption([]const []const u8, "archs", archs);
+    host_options.addOption(bool, "host_tier", true);
 
     const mod = b.createModule(.{
         .root_source_file = b.path(if (b.option(bool, "glm-ffn-replay", "Build offline GLM frozen-prefix extractor") orelse false) "src/glm5_ffn_replay.zig" else if (b.option(bool, "glm-trunk-cov", "Build offline GLM trunk input-covariance extractor") orelse false) "src/glm5_trunk_cov.zig" else "src/main.zig"),
@@ -165,15 +175,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libcpp = true,
         .imports = &.{
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = host_options.createModule() },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
         },
     });
+    // bills.zig reaches the transformer's and the model's pure helpers, which import these three modules; no MLX symbol is linked.
+    _ = addExl3Module(b, host_mod, target, optimize);
+    host_mod.addImport("stb", addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize));
+    host_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+    host_mod.addIncludePath(b.path("lib"));
+    host_mod.addImport("webp", addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize));
     linkApple(host_mod, macos_sdk_frameworks);
     host_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     host_mod.addIncludePath(b.path("lib/jinja_cpp"));
     host_mod.linkSystemLibrary("c++", .{});
-    const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = test_filter orelse &.{} });
+    const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = test_filter orelse hostFilters(b) });
     test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
     const run_host_tests = b.addRunArtifact(host_tests);
     test_host_step.dependOn(&run_host_tests.step);
@@ -477,7 +493,41 @@ fn hostStems(b: *std.Build) []const []const u8 {
     return stems.items;
 }
 
+/// An arch's `<arch>_bill.zig` is MLX-free and runs in the host tier; the bills test reaches each enabled arch's through the registry.
+const arch_bill_suffix = "_bill";
+
+/// The host tier's tests by name. Zig keeps a test by its name and collects the tests of every file the root reaches:
+/// bills.zig reaches the transformer and the model, whose own tests need MLX and must not join this binary.
+fn hostFilters(b: *std.Build) []const []const u8 {
+    b.dependOnFileContents(b.path("src/tests_host.zig"));
+    const io = b.graph.io;
+    const source = buildRootHandle(b).readFileAlloc(io, "src/tests_host.zig", b.allocator, .limited(1 << 20)) catch |e| std.debug.panic("src/tests_host.zig: {t}", .{e});
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const head = "    _ = @import(\"";
+        const tail = ".zig\");";
+        if (!std.mem.startsWith(u8, line, head) or !std.mem.endsWith(u8, line, tail)) continue;
+        const path = line[head.len .. line.len - tail.len];
+        const stem = path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0..];
+        out.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
+        b.dependOnFileContents(b.path(b.fmt("src/{s}.zig", .{path})));
+        const file = buildRootHandle(b).readFileAlloc(io, b.fmt("src/{s}.zig", .{path}), b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("src/{s}.zig: {t}", .{ path, e });
+        var owner: []const u8 = "";
+        var rows = std.mem.splitScalar(u8, file, '\n');
+        while (rows.next()) |row| {
+            if ((std.mem.startsWith(u8, row, "pub const ") or std.mem.startsWith(u8, row, "const ")) and std.mem.endsWith(u8, row, " = struct {"))
+                owner = row[std.mem.indexOf(u8, row, "const ").? + "const ".len .. row.len - " = struct {".len];
+            if (std.mem.startsWith(u8, row, "    test \"") and owner.len != 0)
+                out.append(b.allocator, b.fmt("{s}.{s}.test.", .{ stem, owner })) catch @panic("OOM");
+        }
+    }
+    out.append(b.allocator, arch_bill_suffix ++ ".test.") catch @panic("OOM");
+    return out.items;
+}
+
 fn isHostStem(host_stems: []const []const u8, stem: []const u8) bool {
+    if (std.mem.endsWith(u8, stem, arch_bill_suffix)) return true;
     for (host_stems) |h| if (std.mem.eql(u8, h, stem)) return true;
     return false;
 }

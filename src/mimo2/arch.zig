@@ -23,7 +23,7 @@ pub const drafter = @import("mimo2_drafter.zig");
 
 pub const prefix = @import("mimo2_prefix.zig"); // slot:prefix (S2c)
 
-// slot:bill (S2d)
+pub const bill = @import("mimo_bill.zig"); // slot:bill (S2d)
 
 const config_file = @import("mimo_config.zig");
 const arch_config = @import("../arch/config.zig");

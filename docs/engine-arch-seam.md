@@ -13,10 +13,16 @@ joins `DROPPABLE` when its drop passes.
 - `src/arch/registry.zig` is the only file outside `src/<arch>/` that names an architecture: one entry per arch, marked
   `// arch:<name>`.
 - `src/<arch>/arch.zig` is the arch's only public face. It declares `model_types`, `Config`, `Model`, the operations
-  the dispatch files call (`init`, `deinit`, `resetCache`, `warmup`, `forward`, ...), and the slots `packs` and `flags`.
+  the dispatch files call (`init`, `deinit`, `resetCache`, `warmup`, `forward`, ...), the slot `bill` (its
+  `<arch>_bill.zig`), and the slots `packs` and `flags`.
   The arch a model runs as is stamped on it once, by `life.init` (`Trunk.arch`); `handleOf` reads that tag and tests
   nothing else. The arch that runs a `model_type` no arch claims declares `default_arch`. The
-  slots are empty: alias rows still live in `aliases` in `src/cli.zig`, and arch-only flags in `src/cli.zig`.
+  `packs` and `flags` slots are empty: alias rows still live in `aliases` in `src/cli.zig`, and arch-only flags in `src/cli.zig`.
+- **An arch's bill terms are hooks.** `bills.zig` keeps the generic bill and asks the arch's `bill` module through
+  `archHook(name, ...)`: a hook the arch omits leaves the generic term (`requestBill`, `transientReserve`,
+  `neutralChunkWidth`, `unnamedCacheAsk`, `diskTokenBytes`, `memoryContext`, `cacheReserve`, `commitBytes`,
+  `loadWarmup`, `slotRing`, `sessionBytes`, `stateBilled`, `retainedCheckpoints`, and the MTP-head, thought-point,
+  decode-rows and FP8-scratch terms). Bill code never names an arch.
 - **Shared code may name a format, never an arch**: a tool-call grammar, a template dialect, a codebook, a prefix-cache
   kind. The arch picks among them.
 - A model is `Trunk` (`src/trunk.zig`: embeddings, lm head, rope tables, compiled closures, the MoE family, the

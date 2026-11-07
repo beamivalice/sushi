@@ -23,7 +23,7 @@ pub const drafter = @import("qwen4_drafter.zig");
 
 pub const prefix = @import("qwen4_prefix.zig"); // slot:prefix (S2c)
 
-// slot:bill (S2d)
+pub const bill = @import("qwen4_bill.zig"); // slot:bill (S2d)
 
 const config_file = @import("qwen4_config.zig");
 const arch_config = @import("../arch/config.zig");

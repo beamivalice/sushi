@@ -132,6 +132,8 @@ pub fn verifyQmmNaxAvailable() bool {
 }
 
 fn computeNaxAvailable() bool {
+    // The MLX-free test tier reaches this through the bill and has no device to ask.
+    if (@import("build_options").host_tier) return false;
     var force = false;
     if (std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK")) |p| {
         const v = std.mem.span(p);

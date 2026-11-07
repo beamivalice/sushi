@@ -10,6 +10,7 @@ const dspark_rows = @import("dsv41/dspark_rows.zig");
 const mimo_mtp = @import("mimo2/mimo_mtp.zig");
 const chip_mod = @import("chip.zig");
 const model_mod = @import("model.zig");
+const admission = @import("arch/admission.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -44,6 +45,18 @@ const glmRoundUbench = glm5_rows_tick.glmRoundUbench;
 const mtp_plan = @import("mtp_plan.zig");
 const sampler = @import("sampler.zig");
 const testing = std.testing;
+const bills = @import("bills.zig");
+
+// The load-time bills live in bills.zig; these are the names the loader and its callers use.
+pub const billedFillPeakBytes = bills.billedFillPeakBytes;
+const expertStreamingGateBytes = bills.expertStreamingGateBytes;
+const fp8ExpertScratchBytes = bills.fp8ExpertScratchBytes;
+pub const gateEstimateBytes = bills.gateEstimateBytes;
+pub const loadRequirementBytes = bills.loadRequirementBytes;
+pub const loadStagingBytes = bills.loadStagingBytes;
+pub const mimoCoarseHeadBytes = bills.mimoCoarseHeadBytes;
+const residentWeightBytes = bills.residentWeightBytes;
+pub const streamedLoadRequirementBytes = bills.streamedLoadRequirementBytes;
 const scheduler_mod = @import("scheduler.zig");
 const BudgetRevise = scheduler_mod.BudgetRevise;
 const LoadRequest = scheduler_mod.LoadRequest;
@@ -519,7 +532,6 @@ pub const budget_required_message = "This checkpoint streams its experts from SS
 /// The budget a DeepSeek load takes from its Mac's RAM tier. The planner is asked what holding every routed expert
 /// resident needs (a budget no pack exhausts), and the limits then decide whether that, or a streamed budget, fits.
 fn ramDefaultChoice(sch: *Scheduler, params: anytype, tier: RamTier, load_vision: bool, assistant_bytes: u64) !SsdBudgetChoice {
-    const server = @import("server.zig");
     const unbounded: u64 = 1 << 50;
     const probe = planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, unbounded, load_vision, assistant_bytes) catch null;
     var resident_need: u64 = 0;
@@ -530,7 +542,7 @@ fn ramDefaultChoice(sch: *Scheduler, params: anytype, tier: RamTier, load_vision
             resident_need = led.trunk_bytes +| led.mtp_bytes +| led.vision_bytes +| led.pool_bytes +| led.cache_bytes;
         };
     }
-    const d = ramDefaultBudget(tier, resident_need, server.defaultRequestBill(params.config) +| encode, server.defaultBudgetLimits());
+    const d = ramDefaultBudget(tier, resident_need, bills.defaultRequestBill(params.config) +| encode, bills.defaultBudgetLimits());
     var buf: [256]u8 = undefined;
     if (d.bound_by.len > 0) log.warn("{s}\n", .{stepDownLine(&buf, d)});
     return .{ .bytes = d.bytes, .origin = .ram_default, .setting_ignored = false, .wired_limit_mb = d.wired_limit_mb };
@@ -634,7 +646,7 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
 /// `assistant_bytes` is a resident DFlash2 drafter: it comes out of the budget the expert cache is cut from.
 pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, budget_bytes: u64, vision: bool, assistant_bytes: u64) !StreamingPlan {
     var geometry = config.expertGeometry();
-    if (config.drop_expert != 0 and !config.isDsv41()) return error.LaunchFlagUnsupported;
+    if (config.drop_expert != 0 and !admission.expertStream(config).drop_expert) return error.LaunchFlagUnsupported;
     var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else expert_usage.load(allocator, model_dir, config.expertDropRequest()) catch |err| {
         log.err("{s}\n", .{expert_usage.describe(err)});
         return error.ExpertDropRefused;
@@ -713,27 +725,6 @@ fn visionLoadLine(buf: []u8, choice: model_settings.VisionChoice, streamed: bool
         std.fmt.bufPrint(buf, "[vision] off under expert streaming; pass --vision to load the tower (+{d:.2} GB, -{d} slots/layer)", .{ tower, lost })) catch "[vision]";
 }
 
-/// FP8 experts compute from bf16 copies of a layer's routed slots (`glm5_stream.fp8Routed`): at most
-/// every expert, plus the gathered codes when the routed slots of a cache slab are not contiguous.
-pub fn fp8ExpertScratchBytes(layout: expert_stream_mod.quant.Layout, geometry: expert_stream_mod.Geometry) u64 {
-    if (layout != .fp8_individual) return 0;
-    const codes = 3 *| @as(u64, geometry.hidden) *| geometry.intermediate;
-    return @as(u64, geometry.experts) *| codes *| (2 + 1);
-}
-
-/// The expert fill peak a streamed load and its requests bill. Flash-Next's streamed prefill peaked no higher than
-/// its resident one, the union workspace and bounce already inside the budget (engine-expert-streaming.md#budget).
-/// DeepSeek fills preallocated slabs in place: its fill stages nothing beyond the workspace and bounce the budget holds.
-pub fn billedFillPeakBytes(config: *const ModelConfig, prefill_peak_bytes: u64) u64 {
-    return if (config.longCtxGated() or config.isDsv41()) 0 else prefill_peak_bytes;
-}
-
-/// What a streamed load holds beside its cache and bounce buffers while it fills. A request bill never carries the
-/// workspace: it is allocated at boot and already counted in the active memory a request reads.
-pub fn loadStagingBytes(config: *const ModelConfig, billed_fill_peak_bytes: u64, workspace_bytes: u64) u64 {
-    return billed_fill_peak_bytes +| (if (config.isDsv41()) workspace_bytes else 0) +| config.expertPoolBytes();
-}
-
 /// Marks the config streamed: the fields every streamed forward and bill reads.
 pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_bytes: u64) void {
     config.expert_layout = plan.layout;
@@ -777,13 +768,6 @@ pub fn resolveExpertCache(
         config.expert_shape,
     );
     return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger };
-}
-
-/// The 2-bit lm_head copy a MiMo source trunk keeps, resident or streamed: the heads draft on it
-/// and a greedy readout shortlists on it.
-pub fn mimoCoarseHeadBytes(config: *const ModelConfig) u64 {
-    if (!config.usesMimoSourceTrunk() or mimo_mtp.rerankBits() == 0) return 0;
-    return mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mimo_mtp.rerankBits());
 }
 
 /// Frees the three CPU-state pointers.
@@ -847,37 +831,6 @@ fn stubCpuState(allocator: std.mem.Allocator, config_value: ModelConfig) !CpuSta
     };
 
     return .{ .config = config, .tok = tok, .chat_config = cc };
-}
-
-/// The post-load residency bill the eviction gate reserves, in bytes: the
-/// weights plus 10% headroom for KV / vision / drafter overhead.
-pub fn gateEstimateBytes(bytes_on_disk: ?u64, num_hidden_layers: u32, hidden_size: u32) u64 {
-    const base: u64 = if (bytes_on_disk) |b|
-        b
-    else
-        @as(u64, num_hidden_layers) * @as(u64, hidden_size) * 4 * 4;
-    return base + base / 10;
-}
-
-/// A boot `--model` entry carries no discovery `bytes_on_disk`, so the measured shard sum is
-/// the answer before the layers x hidden guess (which read 1966080 for a ~64 GiB pack).
-pub fn residentWeightBytes(billed: ?u64, bytes_on_disk: ?u64, measured_disk: u64, num_hidden_layers: u32, hidden_size: u32) u64 {
-    if (billed) |b| return b;
-    if (bytes_on_disk) |b| return b;
-    if (measured_disk > 0) return measured_disk;
-    return @as(u64, num_hidden_layers) * @as(u64, hidden_size) * 4 * 4;
-}
-
-test "residentWeightBytes: a boot entry without a disk hint reports its measured shards" {
-    const gib: u64 = 1 << 30;
-    try testing.expectEqual(64 * gib, residentWeightBytes(null, null, 64 * gib, 48, 2560));
-    try testing.expectEqual(@as(u64, 97) * gib, residentWeightBytes(97 * gib, 64 * gib, 64 * gib, 48, 2560));
-    try testing.expectEqual(@as(u64, 5), residentWeightBytes(null, 5, 64 * gib, 48, 2560));
-    try testing.expectEqual(@as(u64, 48 * 2560 * 16), residentWeightBytes(null, null, 0, 48, 2560));
-}
-
-pub fn expertStreamingGateBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64) u64 {
-    return resident_bytes +| cache_bytes +| fill_peak_bytes +| bounce_bytes;
 }
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
@@ -970,26 +923,7 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
     if (config.isMimo()) return mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
-    return split.trunk +| split.mtp +| rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits());
-}
-
-/// The draft head's coarse lm_head copy: built only with MTP on, from an affine head (a trellis head has no packed rows to shrink).
-fn rerankCoarseBill(split: model_mod.ResidentSplit, config: *const ModelConfig, mtp_on: bool, coarse_bits: u32) u64 {
-    if (!mtp_on or split.mtp == 0 or coarse_bits == 0 or split.stq_head) return 0;
-    return mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits);
-}
-
-test "the Sushi resident bill leaves out the coarse rerank copy of a trellis head" {
-    var config = ModelConfig{ .model_type = "qwen4_exp" };
-    config.vocab_size = 128;
-    config.hidden_size = 64;
-    const affine: model_mod.ResidentSplit = .{ .trunk = 1000, .mtp = 100 };
-    const trellis: model_mod.ResidentSplit = .{ .trunk = 1000, .mtp = 100, .stq_head = true };
-    const coarse = mtp_mod.rerankCoarseBytes(128, 64, 3);
-    try testing.expect(coarse > 0);
-    try testing.expectEqual(coarse, rerankCoarseBill(affine, &config, true, 3));
-    try testing.expectEqual(@as(u64, 0), rerankCoarseBill(trellis, &config, true, 3));
-    try testing.expectEqual(@as(u64, 0), rerankCoarseBill(affine, &config, false, 3));
+    return split.trunk +| split.mtp +| bills.rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits());
 }
 
 /// The resident bytes a MiMo source-trunk load holds: trunk and vision tower as stored, the heads
@@ -1393,11 +1327,6 @@ test "EXL3 streaming CPU settings budget engages the EXL3 loader" {
     try t.expect(expert_stream_mod.expertStreamingEngaged(q4.supportsExpertStreaming(), q4.expertStreamingRequired(), budget.bytes));
 }
 
-test "bf16 streaming registry gate uses resident plan not checkpoint disk size" {
-    try testing.expectEqual(@as(u64, 81), expertStreamingGateBytes(10, 60, 5, 6));
-    try testing.expect(expertStreamingGateBytes(15_000_000_000, 60_000_000_000, 5_033_164_800, 536_870_912) < 360_000_000_000);
-}
-
 test "coldLoadVision honors --no-vision, --vision and the per-model vision, resident and streamed" {
     const saved = model_settings.vision_flag;
     defer model_settings.vision_flag = saved;
@@ -1416,134 +1345,6 @@ test "coldLoadVision honors --no-vision, --vision and the per-model vision, resi
     try std.testing.expect(coldLoadVision(&cfg, true));
     cfg.vision_override = false;
     try std.testing.expect(!coldLoadVision(&cfg, false));
-}
-
-/// Which "available memory" figure the preflight should trust. On iOS the
-/// host-wide number is meaningless — the OS keeps RAM full (file cache,
-/// jetsam-evictable background apps) and will evict on our behalf, so the
-/// per-PROCESS jetsam headroom (`os_proc_available_memory`, nonzero only on
-/// iOS) is the figure that decides whether the load survives. Live bug: an
-/// 8 GB iPhone reported ~4 GB host-free and the preflight refused a 3.6 GB
-/// model that fit comfortably inside the ~6.4 GB process limit.
-/// `gpu_limit` = Metal's working-set limit (0 = unknown): a lowered `iogpu.wired_limit_mb` binds
-/// below free RAM, and weights past it OOM in warmup instead of refusing by name.
-fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
-    const avail = if (proc_avail > 0) proc_avail else host_avail;
-    return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
-}
-
-/// A just-exited process returns its Metal memory over seconds: while a short reading keeps
-/// rising, poll every 500 ms; stop at enough, after 2 s without growth, or after 15 s.
-fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
-    var avail = first;
-    var stalled: u32 = 0;
-    var polls: u32 = 0;
-    while (avail > 0 and avail < needed and stalled < 4 and polls < 30) : (polls += 1) {
-        reader.sleep();
-        const next = reader.read();
-        stalled = if (next > avail) 0 else stalled + 1;
-        avail = next;
-    }
-    return avail;
-}
-
-/// A resident Sushi load shares the working-set cap with already active model buffers. A declared
-/// wired limit (`wired_floor`, 0 = none) lifts the free-RAM figure to what that limit leaves the
-/// GPU, the same floor request admission reads.
-fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) u64 {
-    const host = if (wired_floor > 0) @max(host_avail, wired_floor -| active) else host_avail;
-    const available = effectiveAvailableBytes(host, proc_avail, gpu_limit);
-    return if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
-}
-
-test "load preflight waits for a prior process's memory to come back, and only while it does" {
-    const gib: u64 = 1 << 30;
-    const Fake = struct {
-        seq: []const u64,
-        i: usize = 0,
-        fn read(f: *@This()) u64 {
-            const v = f.seq[@min(f.i, f.seq.len - 1)];
-            f.i += 1;
-            return v;
-        }
-        fn sleep(_: *@This()) void {}
-    };
-    var rising = Fake{ .seq = &.{ 80 * gib, 95 * gib, 110 * gib } };
-    try testing.expectEqual(@as(u64, 110 * gib), settleAvailableBytes(69 * gib, 100 * gib, &rising));
-    var short = Fake{ .seq = &.{ 70 * gib, 70 * gib, 70 * gib, 70 * gib, 70 * gib, 200 * gib } };
-    try testing.expectEqual(@as(u64, 70 * gib), settleAvailableBytes(69 * gib, 100 * gib, &short));
-    try testing.expectEqual(@as(usize, 5), short.i);
-    var never = Fake{ .seq = &.{200 * gib} };
-    try testing.expectEqual(@as(u64, 120 * gib), settleAvailableBytes(120 * gib, 100 * gib, &never));
-    try testing.expectEqual(@as(usize, 0), never.i);
-}
-
-test "Sushi quant memory subtracts existing resident buffers from the GPU limit" {
-    const gib: u64 = 1 << 30;
-    try testing.expectEqual(@as(u64, 54 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 94 * gib, 40 * gib, 0));
-    try testing.expectEqual(@as(u64, 30 * gib), effectiveSushiAvailableBytes(30 * gib, 0, 94 * gib, 40 * gib, 0));
-    try testing.expectEqual(@as(u64, 0), effectiveSushiAvailableBytes(88 * gib, 0, 40 * gib, 40 * gib, 0));
-    try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib, 0));
-}
-
-test "a declared wired limit lifts the load preflight's free-RAM figure, never past the working set" {
-    const gib: u64 = 1 << 30;
-    // 32 GB box, iogpu.wired_limit_mb raised: file cache and other apps' pages read as gone,
-    // but the declared limit says the GPU may claim the floor.
-    try testing.expectEqual(@as(u64, 28 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
-    // Resident buffers come off the floor, as they come off the working set.
-    try testing.expectEqual(@as(u64, 18 * gib), effectiveSushiAvailableBytes(15 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
-    // More free RAM than the floor keeps the larger figure; the working set still caps it.
-    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 28 * gib));
-    // A floor above the working set never raises the cap.
-    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 31 * gib));
-}
-
-test "effectiveAvailableBytes is capped by the GPU working-set limit" {
-    const GB: u64 = 1024 * 1024 * 1024;
-    try std.testing.expectEqual(36 * GB, effectiveAvailableBytes(98 * GB, 0, 36 * GB));
-    try std.testing.expect(memInsufficientForLoad(70 * GB, effectiveAvailableBytes(98 * GB, 0, 36 * GB), 71 * GB));
-}
-
-test "effectiveAvailableBytes prefers the per-process jetsam headroom when present" {
-    const GB: u64 = 1024 * 1024 * 1024;
-    try std.testing.expectEqual(6 * GB, effectiveAvailableBytes(4 * GB, 6 * GB, 0)); // iOS: proc wins
-    try std.testing.expectEqual(4 * GB, effectiveAvailableBytes(4 * GB, 0, 0)); // macOS: proc query = 0 → host
-    try std.testing.expectEqual(@as(u64, 0), effectiveAvailableBytes(0, 0, 0)); // both unknown → 0 (never blocks)
-}
-
-/// Free memory a load keeps beyond everything it bills: allocator slack and pages macOS has not yet handed back.
-const LOAD_SAFETY_NET_BYTES: u64 = 1 << 30;
-
-/// What a load's warmup allocates above its billed weights: the measured peak over the billed bytes at
-/// each architecture's worst setting, rounded up (engine-memory-admission.md#load-warmup).
-fn loadWarmupBytes(config: *const ModelConfig, mtp_on: bool) u64 {
-    const gib: u64 = 1 << 30;
-    // GLM warms T=1 and T=8, then resets; its KDA state, rings and first latent rows exist from then on.
-    if (config.isGlm5()) return config.ssmCheckpointBytes() +| config.qsaRingBytes() +|
-        (config.kvBytesPerToken() +| config.qsaHistoryBytesPerToken()) *| 1024 +| gib * 3 / 8;
-    if (config.isMimo()) return gib / 4;
-    // Flash-Next: reading the MTP head peaks about a GiB above its resident bytes, and quantizing the
-    // drafter holds its dense linears beside the quantized ones until the load ends.
-    return gib / 8 +| (if (mtp_on) gib * 9 / 8 else 0) +| config.dflash_load_transient_bytes;
-}
-
-/// A streamed load holds the cache, the whole-layer fill union and the bounce buffers beside the resident trunk.
-pub fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64) u64 {
-    return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES;
-}
-
-/// Free memory a load demands: its billed weights, then the larger of the warmup transient plus the safety net and
-/// the requested context's admission bill (the warmup ends before any request allocates).
-pub fn loadRequirementBytes(config: *const ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
-    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes);
-    return weights_bytes +| @max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill);
-}
-
-/// Unknown figures (a failed memory query, an unmeasurable size) never block a load.
-fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64, required_bytes: u64) bool {
-    if (weights_bytes == 0 or avail_bytes == 0) return false;
-    return avail_bytes < required_bytes;
 }
 
 /// Stamp the per-request terms of a sliding DFlash2 assistant on the target's config.
@@ -1692,38 +1493,6 @@ test "a cold load reads the serving bill on the config the load stamps with the 
     try testing.expect(!cfg.dflash_loaded);
 }
 
-test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net" {
-    const gib: u64 = 1 << 30;
-    const cfg = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true, .expert_cache_bytes = 12 * gib, .expert_fill_peak_bytes = 2 * gib, .expert_bounce_bytes = gib / 2 };
-    try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + gib, loadRequirementBytes(&cfg, 6 * gib, true, 0));
-    try testing.expectEqual(loadRequirementBytes(&cfg, 6 * gib, true, 0), streamedLoadRequirementBytes(6 * gib, 12 * gib, 2 * gib, gib / 2));
-}
-
-test "the exact load bill admits a MiMo load the flat 7 GiB headroom refused" {
-    const gib: u64 = 1 << 30;
-    var f = try LoadBillFixtures.init();
-    defer f.deinit();
-    const weights = 90 * gib;
-    const available = 92 * gib;
-    // The retired headroom demanded weights + min(weights / 8, 6 GiB) + 1 GiB.
-    try testing.expect(memInsufficientForLoad(weights, available, weights + 7 * gib));
-    const exact = loadRequirementBytes(&f.mimo, weights, true, 0);
-    try testing.expect(!memInsufficientForLoad(weights, available, exact));
-    try testing.expect(!memInsufficientForLoad(weights, exact, exact));
-    try testing.expect(memInsufficientForLoad(weights, exact - 1, exact));
-    // Unknown figures (a failed memory query, an unmeasurable size) never block a load.
-    try testing.expect(!memInsufficientForLoad(0, available, exact));
-    try testing.expect(!memInsufficientForLoad(weights, 0, exact));
-}
-
-test "the eviction gate bills weights plus 10% headroom" {
-    try testing.expectEqual(@as(u64, 1100), gateEstimateBytes(1000, 0, 0));
-    try testing.expectEqual(@as(u64, 0), gateEstimateBytes(0, 0, 0));
-    // No bytes_on_disk → the layers × hidden × 16 fallback.
-    const fallback: u64 = 32 * 4096 * 16;
-    try testing.expectEqual(fallback + fallback / 10, gateEstimateBytes(null, 32, 4096));
-}
-
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
 /// mlx ops here bind to this thread's GPU stream from t0; subsequent
 /// forwards stay on the same thread.
@@ -1823,7 +1592,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (led.resident) ", every routed expert resident" else "",
         });
         applyStreamingPlan(params.config, plan, budget.bytes);
-        if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) @import("server.zig").capMlxPool(led.pool_bytes);
+        if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) @import("gpu_mem.zig").capMlxPool(led.pool_bytes);
         if (params.config.expert_source_dir == null) {
             params.config.expert_source_dir = try sch.allocator.dupe(u8, params.model_dir);
             expert_source_assigned = true;
@@ -1880,27 +1649,27 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             gpu_limit: usize,
             sushi: bool,
             wired_floor: u64,
-            fn read(r: *@This()) u64 {
-                if (!r.sushi) return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit);
+            pub fn read(r: *@This()) u64 {
+                if (!r.sushi) return bills.effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit);
                 var active: usize = 0;
                 _ = mlx.mlx_get_active_memory(&active);
-                return effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, active, r.wired_floor);
+                return bills.effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, active, r.wired_floor);
             }
-            fn sleep(r: *@This()) void {
+            pub fn sleep(r: *@This()) void {
                 std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
             }
         };
-        var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config), .wired_floor = @import("server.zig").wiredCeilingFloorFor(params.config) };
+        var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config), .wired_floor = bills.wiredCeilingFloorFor(params.config) };
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
         var serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
         var needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
-        if (memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
+        if (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
             log.info("[preflight] {d:.2} GB available of {d:.2} GB needed; waiting while memory is still being released\n", .{
                 @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
-            avail_bytes = settleAvailableBytes(avail_bytes, needed, &reader);
+            avail_bytes = bills.settleAvailableBytes(avail_bytes, needed, &reader);
             serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
             needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
@@ -1913,7 +1682,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             @as(f64, @floatFromInt(needed -| weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
         });
         const gpu_exhausted = model_mod.usesSushiQuantMemoryBill(params.config) and gpu_limit > 0 and active >= gpu_limit;
-        if (weights_bytes > 0 and (memInsufficientForLoad(weights_bytes, avail_bytes, needed) or gpu_exhausted)) {
+        if (weights_bytes > 0 and (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed) or gpu_exhausted)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             if (serving) |b| {
                 const maximum: u32 = if (avail_bytes < loadRequirementBytes(params.config, weights_bytes, mtp_on, 0)) 0 else b.max_context;
@@ -1945,7 +1714,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const bf16_bytes = try @import("glm5/glm5_diagnostic.zig").assistantResidentBytes(sch.io, sch.allocator, prepared.path);
             streaming_resident_bytes = streaming_resident_bytes.? -| cached_bytes +| bf16_bytes;
             if (!scheduler_mod.skipMemPreflight()) {
-                const available = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+                const available = bills.effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
                 const needed = loadRequirementBytes(params.config, streaming_resident_bytes.?, false, 0);
                 log.info("[preflight] BF16 DFlash2 fallback: weights ~{d:.2} GiB, needs ~{d:.2} GiB, available {d:.2} GiB\n", .{ @as(f64, @floatFromInt(streaming_resident_bytes.?)) / (1 << 30), @as(f64, @floatFromInt(needed)) / (1 << 30), @as(f64, @floatFromInt(available)) / (1 << 30) });
                 if (available > 0 and needed > available) return error.InsufficientMemory;
@@ -2006,7 +1775,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
     // An explicit launch flag outranks the per-model settings stamped on the config at BOTH construction sites.
-    const kv_cache = @import("server.zig").kvCacheForLaunch(params.config, params.kv_quant_config, params.kv_quant_explicit);
+    const kv_cache = bills.kvCacheForLaunch(params.config, params.kv_quant_config, params.kv_quant_explicit);
     const load_ctx = model_settings.contextPick(sch.ctx_size_flag, params.config.ctx_override);
     var ctx_buf: [16]u8 = undefined;
     log.info("[kv-cache] {s} ({s}); ctx {s} ({s})\n", .{
@@ -2041,7 +1810,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
     if (params.config.isGlm5()) {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
-        log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
+        log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", bills.kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
         log.info("[glm] NAX arms {s}\n", .{if (@import("glm5/glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
@@ -2523,7 +2292,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // so every bill reads the same answer as `--prefix-cache-disk off`.
     var disk_tier: ?kv_disk_cache.DiskTier = null;
     if (params.prefix_cache_capacity > 0 and params.prefix_cache_disk_bytes == 0) {
-        const ask = @import("server.zig").diskAsk();
+        const ask = bills.diskAsk();
         var off_buf: [96]u8 = undefined;
         if (ask.explicit) log.info("{s}\n", .{disk_placement.diskOffLine(&off_buf, 0, "", ask.sourceName())});
     }
@@ -3015,3 +2784,7 @@ test "a failed cold load drops the MLX error it latched and keeps one latched be
     try testing.expect(mlx.errorPending());
     mlx.dropLatchedErrorUnless(false);
 }
+
+// ── Bill pins ──
+// One test per load-time bill function, on the committed fixture config of every served pack.
+

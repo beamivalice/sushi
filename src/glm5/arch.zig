@@ -21,7 +21,7 @@ pub const drafter = @import("glm5_drafter.zig");
 
 pub const prefix = @import("glm5_prefix.zig"); // slot:prefix (S2c)
 
-// slot:bill (S2d)
+pub const bill = @import("glm5_bill.zig"); // slot:bill (S2d)
 
 const config_file = @import("glm5_config.zig");
 const arch_config = @import("../arch/config.zig");
