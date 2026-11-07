@@ -126,7 +126,38 @@ const arch_named_fields = [_][]const u8{
     "Trunk.qwen4_mtp",
     "Trunk.qwen4_mtp_owner",
     "Trunk.decode_async_ladder_qwen4",
+    "Trunk.qsa_consts",
+    "Trunk.qsa_pooled_rope",
+    "Trunk.qsa_score_bank_builds",
+    "Trunk.compiled_gdn_gate",
+    "Trunk.compiled_hc_silu",
+    "Trunk.compiled_hc_mix",
+    "Trunk.compiled_hc_inj",
+    "Trunk.compiled_hc_write",
+    "Trunk.gdn_ones_w",
+    "Trunk.gdn_q_scale",
+    "Trunk.gdn_k_scale",
+    "Trunk.gdn_eps",
+    "ForwardCtx.qsa_mask",
+    "ForwardCtx.qsa_blocks",
+    "ForwardCtx.qsa_arms",
+    "ForwardCtx.skip_ple",
+    "ForwardCtx.qsa_entry",
+    "ForwardCtx.qsa_pos_base",
+    "ForwardCtx.ple_defer",
+    "ForwardCtx.ple_pending",
 };
+
+/// Whether `field`'s `_`-separated words hold `term`'s words in a row: `gdn` matches `compiled_gdn_gate`, not `agdn`.
+fn namesTerm(comptime field: []const u8, comptime term: []const u8) bool {
+    var i: usize = 0;
+    while (i + term.len <= field.len) : (i += 1) {
+        const starts = i == 0 or field[i - 1] == '_';
+        const ends = i + term.len == field.len or field[i + term.len] == '_';
+        if (starts and ends and std.mem.eql(u8, field[i..][0..term.len], term)) return true;
+    }
+    return false;
+}
 
 /// The arch name without its version digits (`glm5` -> `glm`), the stem a field naming that arch carries.
 fn stem(comptime name: []const u8) []const u8 {
@@ -144,7 +175,12 @@ test "no field of Trunk, ForwardCtx or Slot names an arch beyond the allowlist, 
         for (handles) |T| for (@typeInfo(T).@"struct".field_names) |field| {
             const type_name = @typeName(T);
             const qualified = type_name[if (std.mem.lastIndexOfScalar(u8, type_name, '.')) |i| i + 1 else 0..] ++ "." ++ field;
-            for (registry.registered_names) |arch| if (std.mem.indexOf(u8, field, stem(arch)) != null) {
+            const names_arch = for (registry.registered_names) |arch| {
+                if (std.mem.indexOf(u8, field, stem(arch)) != null) break true;
+            } else for (registry.registered_seam_terms) |term| {
+                if (namesTerm(field, term)) break true;
+            } else false;
+            if (names_arch) {
                 const at: ?usize = for (arch_named_fields, 0..) |allowed, i| {
                     if (std.mem.eql(u8, allowed, qualified)) break i;
                 } else null;
@@ -153,8 +189,7 @@ test "no field of Trunk, ForwardCtx or Slot names an arch beyond the allowlist, 
                 } else {
                     offenders = offenders ++ " " ++ qualified;
                 }
-                break;
-            };
+            }
         };
         for (arch_named_fields, seen) |allowed, s| {
             if (!s) offenders = offenders ++ " stale:" ++ allowed;

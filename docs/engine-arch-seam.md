@@ -43,18 +43,22 @@ joins `DROPPABLE` when its drop passes.
   move their callers. The arch handle fields still on `Trunk` (`qwen4`, ...) are reached by name until each arch's
   S3 stage moves its own; GLM's and DeepSeek's have moved.
 - **An arch's own state rides two registry-built fields.** `Trunk.arch_state` and `ForwardCtx.arch_ctx`
-  (`src/arch/arch_state.zig`) are structs with a field per enabled arch: the `State` and `Ctx` its `arch.zig`
-  declares, void where it declares none, each default-initialised so a context built by hand needs no arch field.
-  An arch's S3 stage moves its `Trunk` and `ForwardCtx` fields into them; a build without the arch has none. A seam guard in
-  `arch_state.zig` fails the build when a `Trunk`, `ForwardCtx` or `Slot` field names a registered arch beyond its
-  allowlist, or an allowlisted field is gone; each S3 stage deletes its lines, and an empty list means the seam is done. A `State` may declare `ctx` (the default context's part), `runsOwnModel`,
-  `sharesReadonly` and `rawEmbedding`, which `arch_state.zig` asks generically; shared code that needs one arch's state
-  goes through that arch's accessors (`glm5_state.modelOf`, `requestOf`, `dsv41_state.modelOf`), which are null in a build
-  without it. A `prefix` module may declare `diskLayoutKey`, the arch's own SSD namespace key (DeepSeek names its drop
-  list and arms there; `arch/prefix.zig` asks it, and the config's tag is the fallback). The
-  request a slot owns beside its KV cache is `arch_state.SlotRequest`, the type of the one `Ctx.request` a built arch
-  declares (`NoRequest` when none does). A moved field leaves `Trunk` in the commit that fills its `State`: two
-  owners of one pointer release it twice.
+  (`src/arch/arch_state.zig`) are structs with a field per enabled arch: the `State` and `Ctx` its `arch.zig` declares,
+  void where it declares none, each default-initialised so a context built by hand needs no arch field. An arch's S3
+  stage moves its `Trunk` and `ForwardCtx` fields into them; a build without the arch has none. A `State` may declare
+  `ctx` (the default context's part), `runsOwnModel`, `sharesReadonly` and `rawEmbedding`, which `arch_state.zig` asks
+  generically; shared code that needs one arch's state goes through that arch's accessors (`glm5_state.modelOf`,
+  `requestOf`, `dsv41_state.modelOf`), which are null in a build without it. A `prefix` module may declare
+  `diskLayoutKey`, the arch's own SSD namespace key (DeepSeek names its drop list and arms there; `arch/prefix.zig` asks
+  it, and the config's tag is the fallback). The request a slot owns beside its KV cache is `arch_state.SlotRequest`,
+  the type of the one `Ctx.request` a built arch declares (`NoRequest` when none does). A moved field leaves `Trunk` in
+  the commit that fills its `State`: two owners of one pointer release it twice.
+- **The seam guard** (`arch_state.zig`, at compile time) covers `Trunk`, `ForwardCtx` and `Slot` only, not `Generator`,
+  `LoadedModel` or `ModelConfig`. A field there fails the build when it holds a registered arch's name stem (`glm`,
+  `dsv`, `qwen`, `mimo`) or, as whole `_`-separated words, one of the `seam_terms` on that arch's registry line (qwen4:
+  `qsa`, `gdn`, `ple`, `compiled_hc`), and is not on the allowlist; a listed field that is gone fails too. Each S3 stage
+  deletes its lines, and an empty list means the seam is done. A term names a concept only that arch owns, never a
+  shared one (`hc_mean`).
 - **The chat face.** `src/<arch>/<arch>_chat.zig` is the arch's MLX-free face for the host tier (chat templates, tool
   calls, tokenizer: no MLX, so `test-host` runs beside a server). It holds `model_types` (`arch.zig` re-exports them),
   `effort` (an editable table or fixed arms), and, where the arch has them, `pin` (a template it serves instead of the

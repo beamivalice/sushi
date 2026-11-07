@@ -9,12 +9,13 @@ const opts = @import("build_options");
 // One line per arch.
 // `mod` is its `arch.zig` and `chat` its MLX-free face. They are separate decls, so a file is read only where it is
 // used: the host tier uses `chat` alone, and an arch left out of `-Darchs` is read by neither. The line's own
-// `model_types` and `gate_rank` are what the arch gate needs of an arch the build left out, without reading its files.
+// `model_types` and `gate_rank` are what the arch gate needs of an arch the build left out, without reading its files;
+// `seam_terms` are the concepts only that arch owns, which a shared handle field must not name (the seam guard).
 const archs = struct {
-    pub const glm5 = struct { const name = "glm5"; const model_types = [_][]const u8{"glm5_next"}; const gate_rank = 2; const mod = @import("../glm5/arch.zig"); const chat = @import("../glm5/glm5_chat.zig"); }; // arch:glm5
-    pub const dsv41 = struct { const name = "dsv41"; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); }; // arch:dsv41
-    pub const qwen4 = struct { const name = "qwen4"; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); }; // arch:qwen4
-    pub const mimo2 = struct { const name = "mimo2"; const model_types = [_][]const u8{"mimo_v2"}; const gate_rank = 1; const mod = @import("../mimo2/arch.zig"); const chat = @import("../mimo2/mimo_chat.zig"); }; // arch:mimo2
+    pub const glm5 = struct { const name = "glm5"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"glm5_next"}; const gate_rank = 2; const mod = @import("../glm5/arch.zig"); const chat = @import("../glm5/glm5_chat.zig"); }; // arch:glm5
+    pub const dsv41 = struct { const name = "dsv41"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); }; // arch:dsv41
+    pub const qwen4 = struct { const name = "qwen4"; const seam_terms = [_][]const u8{ "qsa", "gdn", "ple", "compiled_hc" }; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); }; // arch:qwen4
+    pub const mimo2 = struct { const name = "mimo2"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"mimo_v2"}; const gate_rank = 1; const mod = @import("../mimo2/arch.zig"); const chat = @import("../mimo2/mimo_chat.zig"); }; // arch:mimo2
 };
 
 const all_names = blk: {
@@ -26,6 +27,15 @@ const all_names = blk: {
 
 /// Every registered arch's name, built or not.
 pub const registered_names: []const [:0]const u8 = &all_names;
+
+/// Every registered arch's `seam_terms`, built or not.
+pub const registered_seam_terms: []const []const u8 = blk: {
+    var out: []const []const u8 = &.{};
+    for (std.meta.declarations(archs)) |d| for (@field(archs, d).seam_terms) |term| {
+        out = out ++ &[_][]const u8{term};
+    };
+    break :blk out;
+};
 
 pub fn selected(wanted: []const []const u8, name: []const u8) bool {
     if (wanted.len == 0) return true;
