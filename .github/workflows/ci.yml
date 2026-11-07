@@ -78,3 +78,8 @@ jobs:
         with:
           tier: ${{ inputs.tier || 'host' }}
           test_filter: ${{ inputs.test_filter }}
+
+      # Deleting a DROPPABLE arch's folder and registry line must still build and pass the host tier
+      # (engine-arch-seam.md). Debug compile in temporary worktrees, no GPU; passes at once while DROPPABLE is empty.
+      - name: Arch drop test
+        run: bash tests/test_arch_drop.sh

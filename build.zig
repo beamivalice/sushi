@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxPin(b, "mlxc=") orelse "unknown";
     const mlx_sha = readMlxPin(b, "mlx=") orelse "";
 
+    const build_roots = archBuildRoots(b);
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
@@ -74,7 +75,7 @@ pub fn build(b: *std.Build) void {
     host_options.addOption(bool, "host_tier", true);
 
     const mod = b.createModule(.{
-        .root_source_file = b.path(if (b.option(bool, "glm-ffn-replay", "Build offline GLM frozen-prefix extractor") orelse false) "src/glm5_ffn_replay.zig" else if (b.option(bool, "glm-trunk-cov", "Build offline GLM trunk input-covariance extractor") orelse false) "src/glm5_trunk_cov.zig" else "src/main.zig"),
+        .root_source_file = b.path(toolRoot(b, build_roots)),
         .target = target,
         .optimize = optimize,
         .link_libcpp = true,
@@ -194,6 +195,13 @@ pub fn build(b: *std.Build) void {
     const run_host_tests = b.addRunArtifact(host_tests);
     test_host_step.dependOn(&run_host_tests.step);
     test_step.dependOn(&run_host_tests.step);
+    // A user's filter may select nothing in the host binary, which then rightly runs 0 tests.
+    const count_guard = addCountGuard(b, target);
+    if (test_filter == null) {
+        const host_count = countGuard(b, count_guard, host_tests);
+        test_host_step.dependOn(host_count);
+        test_step.dependOn(host_count);
+    }
     const unit_tests: []const *std.Build.Step.Compile = if (test_model == .exl3 or test_model == .enc)
         &.{}
     else
@@ -208,6 +216,7 @@ pub fn build(b: *std.Build) void {
             run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
         }
         test_step.dependOn(&run_unit_tests.step);
+        test_step.dependOn(countGuard(b, count_guard, unit_test));
     }
 
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
@@ -218,6 +227,7 @@ pub fn build(b: *std.Build) void {
     for (exl3_tests) |exl3_test| {
         test_build.dependOn(&b.addInstallArtifact(exl3_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         test_step.dependOn(&b.addRunArtifact(exl3_test).step);
+        test_step.dependOn(countGuard(b, count_guard, exl3_test));
     }
 
     const encoder_tests = b.addTest(.{
@@ -230,12 +240,14 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
     }
 
-    guardBenchFiles(b);
+    guardBenchFiles(b, build_roots);
     const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
     ubench_step.dependOn(&b.addInstallArtifact(addUbench(b, build_options, target, macos_sdk_frameworks), .{}).step);
 
     const host_check_step = b.step("exl3-host-check", "Compile the sushi_exl3 module and its tests against the minimal host root src/exl3/host_min.zig (nothing links or runs)");
     for (addExl3HostCheck(b, target)) |check| host_check_step.dependOn(&check.step);
+
+    addArchSlice(b, target, optimize, build_options);
 }
 
 /// `-Darchs=qwen4,glm5`: the architectures this build serves, named as `src/arch/registry.zig` names them; empty is
@@ -301,13 +313,72 @@ const stamp_script =
     \\  "$(git rev-parse HEAD)" "$(test -n "$(git status --porcelain --untracked-files=no)" && echo true || echo false)" "$(pwd -P)"
 ;
 
+/// What an arch folder declares to the build in `src/<arch>/build_roots.zon`, so the shared build names no arch: an
+/// offline tool built in place of the server by `-D<option>=true`, and the arch's microbench files. Paths are from the
+/// repo root, so moving a file edits its folder's list only; a dropped folder takes its options with it.
+const BuildRoots = struct {
+    tools: []const struct { option: []const u8, help: []const u8, root: []const u8 } = &.{},
+    benches: []const []const u8 = &.{},
+};
+
+fn parseBuildRoots(arena: std.mem.Allocator, source: [:0]const u8, diag: *std.zon.parse.Diagnostics) !BuildRoots {
+    return std.zon.parse.fromSlice(BuildRoots, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = diag });
+}
+
+/// Every `src/<folder>/build_roots.zon`, in folder order.
+fn archBuildRoots(b: *std.Build) []const BuildRoots {
+    const io = b.graph.io;
+    var src = buildRootHandle(b).openDir(io, "src", .{ .iterate = true }) catch |e| std.debug.panic("src: {t}", .{e});
+    defer src.close(io);
+    b.dependOnDirectoryContents(b.path("src"));
+    var folders: std.ArrayList([]const u8) = .empty;
+    var it = src.iterate();
+    while (it.next(io) catch |e| std.debug.panic("src: {t}", .{e})) |entry| {
+        if (entry.kind == .directory or entry.kind == .sym_link) folders.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+    }
+    std.mem.sortUnstable([]const u8, folders.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    var out: std.ArrayList(BuildRoots) = .empty;
+    for (folders.items) |folder| {
+        b.dependOnDirectoryContents(b.path(b.fmt("src/{s}", .{folder})));
+        const path = b.fmt("src/{s}/build_roots.zon", .{folder});
+        const source = buildRootHandle(b).readFileAllocOptions(io, path, b.allocator, .limited(1 << 16), .of(u8), 0) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => continue,
+            else => std.debug.panic("{s}: {t}", .{ path, e }),
+        };
+        b.dependOnFileContents(b.path(path));
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const roots = parseBuildRoots(b.allocator, source, &diag) catch |e| {
+            if (e == error.ParseZon) diag.log(path);
+            std.debug.panic("{s}: {t}", .{ path, e });
+        };
+        out.append(b.allocator, roots) catch @panic("OOM");
+    }
+    return out.items;
+}
+
+/// The server, or the first declared offline tool whose `-D` option is on.
+fn toolRoot(b: *std.Build, roots: []const BuildRoots) []const u8 {
+    for (roots) |r| for (r.tools) |tool| {
+        if (b.option(bool, tool.option, tool.help) orelse false) return tool.root;
+    };
+    return "src/main.zig";
+}
+
 /// A microbench file holds no `test` block: a bench is timed by `sushi-ubench`, never run by the suite.
 /// `ubench_report.zig` is the harness's host tier and keeps its tests.
-fn guardBenchFiles(b: *std.Build) void {
+fn guardBenchFiles(b: *std.Build, roots: []const BuildRoots) void {
     const io = b.graph.io;
-    const files = [_][]const u8{ "src/ubench_qwen4.zig", "src/ubench_mimo2.zig", "src/ubench_glm5.zig", "src/dsv41/ubench.zig", "src/ubench_shared.zig", "src/exl3_ubench/ubench.zig", "src/encoder/ubench.zig" };
-    for (files) |path| {
-        const source = buildRootHandle(b).readFileAlloc(io, path, b.allocator, .limited(8 << 20)) catch continue;
+    const shared = [_][]const u8{ "src/ubench_shared.zig", "src/exl3_ubench/ubench.zig", "src/encoder/ubench.zig" };
+    var files: std.ArrayList([]const u8) = .empty;
+    files.appendSlice(b.allocator, &shared) catch @panic("OOM");
+    for (roots) |r| files.appendSlice(b.allocator, r.benches) catch @panic("OOM");
+    for (files.items) |path| {
+        const source = buildRootHandle(b).readFileAlloc(io, path, b.allocator, .limited(8 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ path, e });
+        b.dependOnFileContents(b.path(path));
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
             const at = std.mem.indexOf(u8, line, "test \"") orelse continue;
@@ -522,9 +593,13 @@ fn hostFilters(b: *std.Build) []const []const u8 {
         if (!std.mem.startsWith(u8, line, head) or !std.mem.endsWith(u8, line, tail)) continue;
         const path = line[head.len .. line.len - tail.len];
         const stem = path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0..];
+        // A dropped arch's file is missing: the import then fails the compile, naming it, instead of the configure.
+        const file = buildRootHandle(b).readFileAlloc(io, b.fmt("src/{s}.zig", .{path}), b.allocator, .limited(16 << 20)) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => std.debug.panic("src/{s}.zig: {t}", .{ path, e }),
+        };
         out.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
         b.dependOnFileContents(b.path(b.fmt("src/{s}.zig", .{path})));
-        const file = buildRootHandle(b).readFileAlloc(io, b.fmt("src/{s}.zig", .{path}), b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("src/{s}.zig: {t}", .{ path, e });
         var owner: []const u8 = "";
         var rows = std.mem.splitScalar(u8, file, '\n');
         while (rows.next()) |row| {
@@ -598,11 +673,13 @@ fn addExl3TestBins(b: *std.Build, root: *std.Build.Module, user: ?[]const []cons
     var all_names: std.ArrayList([]const u8) = .empty;
     var dir = buildRootHandle(b).openDir(io, "src/exl3", .{ .iterate = true }) catch |e| std.debug.panic("src/exl3/: {t}", .{e});
     defer dir.close(io);
+    b.dependOnDirectoryContents(b.path("src/exl3"));
     var files = dir.iterate();
     while (files.next(io) catch |e| std.debug.panic("src/exl3/: {t}", .{e})) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
         const stem = entry.name[0 .. entry.name.len - ".zig".len];
         const source = dir.readFileAlloc(io, entry.name, b.allocator, .limited(8 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
+        b.dependOnFileContents(b.path(b.fmt("src/exl3/{s}", .{entry.name})));
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
             if (!std.mem.startsWith(u8, line, "test \"")) continue;
@@ -716,6 +793,66 @@ fn addExl3HostCheck(b: *std.Build, target: std.Build.ResolvedTarget) [2]*std.Bui
         b.addTest(.{ .name = "exl3-host-check-tests", .root_module = exl3, .emit_object = true }),
         b.addTest(.{ .name = "exl3-host-check-decls", .root_module = host, .emit_object = true }),
     };
+}
+
+/// Zig reports a test binary whose filters select nothing as a pass. This helper fails such a binary, naming it.
+fn addCountGuard(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
+    return b.addExecutable(.{ .name = "test-count-guard", .root_module = b.createModule(.{
+        .root_source_file = b.path("scripts/test_count_guard.zig"),
+        .target = target,
+        .optimize = .Debug,
+    }) });
+}
+
+fn countGuard(b: *std.Build, guard: *std.Build.Step.Compile, unit_test: *std.Build.Step.Compile) *std.Build.Step {
+    const run = b.addRunArtifact(guard);
+    run.addArg(unit_test.name);
+    run.addArtifactArg(unit_test);
+    return &run.step;
+}
+
+/// `zig build arch-slice -Dslice-arch=<name>`: the arch's folder as a module of its own, rooted at its `arch.zig`, against
+/// `arch_host_stub.zig`. Zig refuses an import that leaves a module's folder, so every engine file the folder reaches
+/// other than through `arch_host` is a compile error; nothing links or runs.
+fn addArchSlice(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
+    const step = b.step("arch-slice", "Compile one arch's folder alone against the host stub (-Dslice-arch=<name>); nothing links or runs");
+    const arch = b.option([]const u8, "slice-arch", "The architecture folder src/<name> that arch-slice builds") orelse {
+        step.dependOn(&b.addFail("arch-slice needs -Dslice-arch=<name>, the folder under src/ that holds an arch.zig").step);
+        return;
+    };
+    const root = b.fmt("src/{s}/arch.zig", .{arch});
+    const named = arch.len > 0 and for (arch) |c| {
+        if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '_') break false;
+    } else true;
+    if (!named or std.meta.isError(buildRootHandle(b).access(b.graph.io, root, .{}))) {
+        step.dependOn(&b.addFail(b.fmt("-Dslice-arch={s}: {s} does not exist", .{ arch, root })).step);
+        return;
+    }
+    const host = b.createModule(.{
+        .root_source_file = b.path("src/arch_host_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "build_options", .module = build_options.createModule() }},
+    });
+    addMlxLib(b, host);
+    const exl3 = addExl3Module(b, host, target, optimize);
+    const folder = b.createModule(.{
+        .root_source_file = b.path(root),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "arch_host", .module = host },
+            .{ .name = "sushi_exl3", .module = exl3 },
+        },
+    });
+    const check = b.createModule(.{
+        .root_source_file = b.path("src/arch/slice_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "arch_slice", .module = folder }},
+    });
+    step.dependOn(&b.addTest(.{ .name = b.fmt("arch-slice-{s}", .{arch}), .root_module = check, .emit_object = true }).step);
 }
 
 /// The encoder behind `sushi convert exl3`, also tested alone as `encoder-test`.
@@ -839,4 +976,22 @@ test "a name without a quote is its own filter, and an unavoidable quote yields 
     const user = [_][]const u8{"x's y"};
     try std.testing.expectEqualStrings("a.test.plain", quoteFreeFilter("a.test.plain", &all, &user).?);
     try std.testing.expect(quoteFreeFilter(all[0], &all, &user) == null);
+}
+
+test "a build_roots.zon declares tools and benches, and a misspelt key is refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const roots = try parseBuildRoots(arena.allocator(),
+        \\.{
+        \\    .tools = .{ .{ .option = "a-tool", .help = "Build a", .root = "src/a/tool.zig" } },
+        \\    .benches = .{ "src/a/ubench.zig", "src/b.zig" },
+        \\}
+    , &diag);
+    try std.testing.expectEqual(@as(usize, 1), roots.tools.len);
+    try std.testing.expectEqualStrings("a-tool", roots.tools[0].option);
+    try std.testing.expectEqualStrings("src/a/tool.zig", roots.tools[0].root);
+    try std.testing.expectEqual(@as(usize, 2), roots.benches.len);
+    try std.testing.expectEqual(@as(usize, 0), (try parseBuildRoots(arena.allocator(), ".{}", &diag)).benches.len);
+    try std.testing.expectError(error.ParseZon, parseBuildRoots(arena.allocator(), ".{ .bench = .{} }", &diag));
 }

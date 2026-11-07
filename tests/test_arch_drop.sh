@@ -12,7 +12,8 @@
 # A stray reference outside the folder fails step 2. `-Darchs` alone cannot catch one: the folder still exists.
 #
 # An arch joins DROPPABLE in its S4 stage. DROP_TRY=<arch> runs the same check for an arch not in the list (it is
-# expected to fail while shared code still names it); DROP_KEEP=1 keeps the worktree for a look.
+# expected to fail while shared code still names it); DROP_KEEP=1 keeps the worktree for a look. DROP_ONLY=<arch>
+# drops only that arch, for a local run; the registry check still covers every arch.
 #
 # Usage: ./tests/test_arch_drop.sh
 
@@ -45,7 +46,7 @@ for arch in $registered; do
     FAIL=1
   fi
 done
-for arch in "${DROPPABLE[@]+"${DROPPABLE[@]}"}" ${DROP_TRY:-}; do
+for arch in "${DROPPABLE[@]+"${DROPPABLE[@]}"}" ${DROP_TRY:-} ${DROP_ONLY:-}; do
   if ! grep -qx "$arch" <<< "$registered"; then
     echo "  FAIL: $arch is not a registered architecture"
     FAIL=1
@@ -97,6 +98,7 @@ drop_one() {
 }
 
 for arch in "${DROPPABLE[@]+"${DROPPABLE[@]}"}" ${DROP_TRY:-}; do
+  [ -z "${DROP_ONLY:-}" ] || [ "$arch" = "$DROP_ONLY" ] || continue
   drop_one "$arch" || FAIL=1
 done
 

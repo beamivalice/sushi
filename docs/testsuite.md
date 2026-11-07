@@ -44,6 +44,11 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   Every `<arch>/<arch>_bill.zig` is a host file too, by its `_bill` stem; `bills.zig` reaches the enabled archs' through the registry.
   A bill test that needs the live GPU lives in `bills_live_test.zig` (or `<arch>_bill_test.zig`) in the MLX tier.
 - `zig build test` runs the host tier, the MLX buckets, the exl3 binaries and the encoder binary.
+- **A binary that runs no test fails.** Zig reports a test binary whose filters select nothing as a pass, so each MLX
+  bucket, each exl3 binary and the unfiltered host binary is followed by `scripts/test_count_guard.zig`, which asks the
+  runner for the binary's test list (nothing runs) and fails, naming the bucket (`test-rest`, `exl3-test-3`), when no
+  named test is in it. The root file's anonymous `test { ... }` does not count: it survives every filter. A run with a
+  `-Dtest-filter` skips the host check, since a filter may select nothing there. `tests/test_test_count_guard.sh` pins it.
 - build.zig names a bucket's files at configure time, so every folder or file it scans is declared with
   `b.dependOnDirectoryContents`/`dependOnFileContents`; without that a new test file never runs until the cache goes.
 - A filtered run keeps the parallel binaries: the scan keeps the tests whose full name holds a `-Dtest-filter` substring

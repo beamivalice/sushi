@@ -99,6 +99,18 @@ joins `DROPPABLE` when its drop passes.
 6. `NOTICE` for any kernel it ports.
 7. The arch joins `DROPPABLE` in `tests/test_arch_drop.sh` in the same landing.
 
+## Build roots an arch declares
+
+An arch folder may hold `build_roots.zon`; `build.zig` reads every `src/<folder>/build_roots.zon` at configure time, so
+the shared build names no arch for these:
+- `.tools`: an offline tool built in place of the server by `-D<option>=true` (`option`, `help`, `root`). `glm5` declares
+  `-Dglm-ffn-replay` and `-Dglm-trunk-cov`; the option name and what it builds are unchanged.
+- `.benches`: the arch's microbench files, which `build.zig` holds to the no-`test`-block rule (see
+  [testsuite](testsuite.md#microbenches)). The files are still imported by `ubench_main.zig`, until the arch's S4 stage.
+
+Paths are from the repo root. Moving a root file edits its folder's list; dropping the folder drops its options.
+A key the file does not know, or a bench path that is missing, stops the configure.
+
 ## Dropping an architecture
 
 `tests/test_arch_drop.sh` proves a drop compiles before anyone makes it: for each arch in `DROPPABLE`, in a temporary
@@ -110,6 +122,16 @@ QUIET marker like any build. Before any drop it checks that each registry entry 
 folder. `DROP_TRY=<arch>` runs the same check for an arch not in the list (a stray reference fails it in seconds),
 `DROP_KEEP=1` keeps the worktree.
 
+CI runs it on every PR as a step of the build-and-test job, after the test tier, on the runner and build that job
+already set up; the loop covers every arch in `DROPPABLE` and passes at once while the list is empty.
+
+`zig build arch-slice -Dslice-arch=<name>` is the quick form of the same question, for the arch's own folder: it compiles
+`src/<name>/arch.zig` as a module of its own, with `build_options`, `sushi_exl3` and `arch_host` (here
+`arch_host_stub.zig`) as its only imports, and walks its public declarations (`src/arch/slice_check.zig`). Zig reads a
+module only inside its root folder, so every `../` import of an engine file is an error; what the folder needs of the
+engine goes through `arch_host`. Nothing links or runs. Until an arch's S4 stage lands the step fails on the first stray
+import (one error is shown at a time); `tests/test_arch_slice.sh` pins both outcomes on probe folders.
+
 A passing drop of one arch costs about 2.7 minutes on the M5 Max (cold `.zig-cache`, warm global cache,
 `taskpolicy -a`, Debug): 27 s for `zig build`, 41 s for `zig build test-build`, 92 s for `zig build test-host`, 1 s for
 the link check. A busy box roughly doubles it. Expect the same order on a CI runner.
@@ -117,8 +139,7 @@ the link check. A busy box roughly doubles it. Expect the same order on a CI run
 A drop is one commit that removes:
 - `src/<arch>/` (its fixtures go with it), its registry entry (its packs and flags go with the folder);
 - the arch's files from the `src/tests.zig` import list, and what `build.zig` still names for it (`test_dirs`,
-  `TestModel`, the `ubench_<arch>.zig` files in `guardBenchFiles` and `ubench_main.zig`), until those leave the shared
-  files;
+  `TestModel`, the bench imports of `ubench_main.zig`), until those leave the shared files;
 - `tests/<arch>/`, its rows in `tests/CLAUDE.md`, its pack-tier env in [testsuite](testsuite.md);
 - `docs/<arch>-*.md` and their rows in CLAUDE.md's docs index and [source-map](source-map.md); its rows in
   [usage](usage.md), [flags](flags.md), [envvar](envvar.md) and its [pack-format](pack-format.md) section

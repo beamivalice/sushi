@@ -1,0 +1,7 @@
+.{
+    .tools = .{
+        .{ .option = "glm-ffn-replay", .help = "Build offline GLM frozen-prefix extractor", .root = "src/glm5_ffn_replay.zig" },
+        .{ .option = "glm-trunk-cov", .help = "Build offline GLM trunk input-covariance extractor", .root = "src/glm5_trunk_cov.zig" },
+    },
+    .benches = .{"src/ubench_glm5.zig"},
+}
