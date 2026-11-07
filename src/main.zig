@@ -673,7 +673,7 @@ pub fn main(init: std.process.Init) !void {
     const port = bind.port;
 
     if (decode_share_flag) |text| {
-        scheduler_mod.prefill_decode_share = scheduler_mod.parseDecodeShare(text) catch {
+        scheduler_mod.prefill_decode_share = @import("sched_policy.zig").parseDecodeShare(text) catch {
             log.err("--prefill-decode-share: expected a number >= 0 (above 0.9 clamps), got '{s}'\n", .{text});
             std.process.exit(1);
         };

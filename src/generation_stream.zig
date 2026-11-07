@@ -1018,7 +1018,7 @@ pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool };
 
 /// The ONE request-level spec dispatch, shared by every surface x stream /
 /// non-stream. Priority: DFlash > MTP, mirroring
-/// `scheduler.specInitWiring`. A loaded DFlash sidecar is an explicit choice
+/// `sched_policy.specInitWiring`. A loaded DFlash sidecar is an explicit choice
 /// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
 /// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
 /// false` hand the round back to MTP. logprobs and a grammar constraint disable every mode; a repeat or presence

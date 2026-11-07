@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
+const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
 const arch_state = @import("arch/arch_state.zig");
 const transformer_mod = @import("transformer.zig");
@@ -227,7 +228,6 @@ pub var vision_fit_fault: ?*const fn ([]u8, *const model_mod.ModelConfig, []cons
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
 
-pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
 /// The error name latched when the real one cannot be copied; `Slot.deinit` must not free it.
 const static_error_name: []const u8 = "OutOfMemory";
@@ -359,7 +359,7 @@ pub const Slot = struct {
     mtp_publish_gap_ms: f32 = 0,
 
     // ── State + output channel. ──
-    state: SlotState,
+    state: sched_policy.SlotState,
 
     out_mu: std.Io.Mutex,
     out_cond: std.Io.Condition,
@@ -749,14 +749,18 @@ pub const Slot = struct {
         return self.logprobs_buf.toOwnedSlice(self.allocator) catch null;
     }
 
+    /// The tick loop still drives this slot: not cancelled, finished or errored.
+    pub fn joinsTick(self: *const Slot) bool {
+        return sched_policy.joinsTick(self.cancelled.load(.acquire), self.finished, self.error_code != null);
+    }
+
     /// Inference thread: signal normal completion. Safe to call multiple
     /// times (idempotent on `finished`).
     pub fn markFinished(self: *Slot, reason: []const u8) void {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
-        if (self.finished) return;
+        self.state = sched_policy.finishState(self.finished) orelse return;
         self.finished = true;
-        self.state = .finished;
         self.finish_reason = reason;
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
@@ -795,7 +799,7 @@ pub const Slot = struct {
     pub fn markError(self: *Slot, name: []const u8) void {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
-        if (self.error_code != null or self.finished) return;
+        if (!sched_policy.errorLands(self.error_code != null, self.finished)) return;
         self.latchErrorLocked(name);
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
@@ -2063,20 +2067,15 @@ pub const Scheduler = struct {
     /// and `decode_serial_total{reason}` name.
     pub fn batchVerdict(self: *const Scheduler, slot: *const Slot) slot_admission.BatchVerdict {
         _ = self;
-        // The gate reads dispatch via slotTicksRegular, never the armed enable_drafter or enable_mtp flags.
-        if (!slotTicksRegular(slot)) return .spec_active;
-        // A slot whose module-head release is armed but not landed still holds the head.
-        if (slotReleasePending(slot)) return .head_release_pending;
-        if (slot.sampling.constraint != null) return .grammar;
-        // The batched tick samples every slot's successor; a forced call decides its own.
-        if (slot.sampling.call_force) |cf| {
-            if (cf.pending()) return .forced_call;
-        }
-        if (slot.logprobs_n > 0) return .logprobs;
-        if (sampler.penaltyActive(slot.sampling)) return .penalty;
-        // Ask the transformer, never name the arch here — same rule as `modelExclusiveDecode`.
-        const t = slot.model.transformer orelse return .arch;
-        return if (sched.modelBatches(t)) .ok else .arch;
+        return sched_policy.batchVerdictOf(.{
+            .ticks_regular = slotTicksRegular(slot),
+            .release_pending = slotReleasePending(slot),
+            .grammar = slot.sampling.constraint != null,
+            .forced_call_pending = if (slot.sampling.call_force) |cf| cf.pending() else false,
+            .logprobs = slot.logprobs_n > 0,
+            .penalty = sampler.penaltyActive(slot.sampling),
+            .model_batches = if (slot.model.transformer) |t| sched.modelBatches(t) else null,
+        });
     }
 };
 
@@ -2359,31 +2358,9 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
 /// thread keeps the GPU awake. Left idle, the driver drops the resident set's state, and the next
 /// submission then waits before any work runs (docs/server-lifecycle.md#threads).
 pub var gpu_warm_secs: u32 = 60;
-/// Shorter than the idle time after which the state is gone.
-pub const GPU_WARM_TICK_NS: u64 = 500 * std.time.ns_per_ms;
-
-/// PURE: whether an idle thread ticks now. `idle_ns` is null until the thread has run a
-/// prefill or decode; a thread with work never ticks.
-pub fn gpuWarmTickDue(has_work: bool, idle_ns: ?u64, window_ns: u64) bool {
-    const idle = idle_ns orelse return false;
-    return !has_work and idle < window_ns;
-}
-
-/// PURE: how long an idle thread parks before its next tick, or null to park until work arrives.
-pub fn gpuWarmParkNs(idle_ns: ?u64, window_ns: u64) ?u64 {
-    const idle = idle_ns orelse return null;
-    if (idle >= window_ns) return null;
-    return @min(GPU_WARM_TICK_NS, window_ns - idle);
-}
-
-pub const GpuWarmWindow = enum { keep, restart, close };
-
-/// PURE: the window as the thread is about to park. The last pass's prefill or decode restarts it;
-/// an unload closes it, since no model may be left to keep warm.
-pub fn gpuWarmBeforePark(worked: bool, unloaded: bool) GpuWarmWindow {
-    if (unloaded) return .close;
-    return if (worked) .restart else .keep;
-}
+const gpuWarmTickDue = sched_policy.gpuWarmTickDue;
+const gpuWarmParkNs = sched_policy.gpuWarmParkNs;
+const gpuWarmBeforePark = sched_policy.gpuWarmBeforePark;
 
 /// One synced element-op on the GPU stream. Inference thread only; a failure stays unlatched.
 fn gpuWarmTick() void {
@@ -2399,13 +2376,48 @@ fn gpuWarmTick() void {
     _ = mlx.mlx_array_eval(out);
 }
 
-/// Poll interval for the idle-eviction sweep, given the configured window.
-///
-/// A quarter of the window, so a model is evicted within ~1.25x the configured
-/// idle time rather than up to 2x it. Floored at a second so `--idle-evict-secs 1`
-/// does not spin, capped at 30s so a long window still costs ~nothing.
-pub fn idleEvictTickMs(window_ms: i64) i64 {
-    return @max(1000, @min(@divTrunc(window_ms, 4), 30_000));
+const TO_PREFILL_MAX = 16;
+
+/// Takes this tick's admits out of `pending` into `to_prefill` and returns how many (queue_mu held).
+fn admitPendingLocked(sch: *Scheduler, to_prefill: *[TO_PREFILL_MAX]*Slot) usize {
+    // Nothing waits: no candidate list to build and no decoding slot to scan.
+    if (sch.pending.items.len == 0) return 0;
+    var n_prefill: usize = 0;
+    // Single-flight admission: a model with
+    // MODULE-OWNED decode state admits at most one live slot.
+    // Snapshot live exclusive-model slots (same liveness predicate
+    // as the step-3 active list), let `admitPendingTick` decide,
+    // and leave held slots in `pending` — their conn threads keep
+    // flowing SSE keepalives while they wait, and the wait
+    // in `inferenceLoop` never blocks while `pending` is non-empty,
+    // so a held slot admits on the first tick after the active one
+    // is culled (step 5, same mutex).
+    var live_buf: [32]slot_admission.AdmitCand = undefined;
+    const n_live = slot_admission.heldExclusive(&live_buf, &.{ sch.decoding.items, sch.cleanup_queue.items }, slot_admission.slotExclusiveDecode);
+    var cand_buf: [32]slot_admission.AdmitCand = undefined;
+    const n_cands = @min(sch.pending.items.len, cand_buf.len);
+    for (sch.pending.items[0..n_cands], 0..) |s, i| {
+        cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slot_admission.slotExclusiveDecode(s) };
+    }
+    var admit_idx: [TO_PREFILL_MAX]usize = undefined;
+    // Pending admits only through admitPendingTick.
+    const n_admit = slot_admission.memoryAdmitCount(sch, admit_idx[0..sched_policy.admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)]);
+    for (admit_idx[0..n_admit]) |idx| {
+        to_prefill[n_prefill] = admitForPrefillLocked(sch, idx);
+        n_prefill += 1;
+    }
+    // Remove admitted entries in DESCENDING index order so the
+    // earlier (ascending) indices stay valid during removal.
+    var r = n_admit;
+    while (r > 0) {
+        r -= 1;
+        _ = sch.pending.orderedRemove(admit_idx[r]);
+    }
+    var queue_line: [192]u8 = undefined;
+    for (sch.pending.items) |held| {
+        if (slot_admission.queueLogLine(sch, &queue_line, held)) |line| log.info("{s}\n", .{line});
+    }
+    return n_prefill;
 }
 
 fn inferenceLoop(ctx: ThreadCtx) void {
@@ -2447,6 +2459,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     var warm_since: ?io_util.Stopwatch = null;
     var warm_ticks: u32 = 0;
     var worked = false;
+    var active: std.ArrayList(*Slot) = .empty;
+    defer active.deinit(sch.allocator);
     while (!sch.shutdown.load(.acquire)) {
         // 0a. Drain slots queued for cleanup. Conn threads hand finished
         //     slots here in `complete()` — we own the mlx stream binding,
@@ -2546,7 +2560,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
 
         // 1. Wait for work. Drain pending slots into a local list under lock,
         //    run prefills outside the lock.
-        var to_prefill: [16]*Slot = undefined;
+        var to_prefill: [TO_PREFILL_MAX]*Slot = undefined;
         var n_prefill: usize = 0;
         {
             sch.queue_mu.lockUncancelable(sch.io);
@@ -2595,40 +2609,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // If only vision/embed/cleanup/load work is pending, loop back to drain it.
             if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
 
-            // Single-flight admission: a model with
-            // MODULE-OWNED decode state admits at most one live slot.
-            // Snapshot live exclusive-model slots (same liveness predicate
-            // as the step-3 active list), let `admitPendingTick` decide,
-            // and leave held slots in `pending` — their conn threads keep
-            // flowing SSE keepalives while they wait, and the wait
-            // condition above never blocks while `pending` is non-empty,
-            // so a held slot admits on the first tick after the active one
-            // is culled (step 5, same mutex).
-            var live_buf: [32]slot_admission.AdmitCand = undefined;
-            const n_live = slot_admission.heldExclusive(&live_buf, &.{ sch.decoding.items, sch.cleanup_queue.items }, slot_admission.slotExclusiveDecode);
-            var cand_buf: [32]slot_admission.AdmitCand = undefined;
-            const n_cands = @min(sch.pending.items.len, cand_buf.len);
-            for (sch.pending.items[0..n_cands], 0..) |s, i| {
-                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slot_admission.slotExclusiveDecode(s) };
-            }
-            var admit_idx: [to_prefill.len]usize = undefined;
-            // Pending admits only through admitPendingTick.
-            const n_admit = slot_admission.memoryAdmitCount(sch, admit_idx[0..slot_admission.admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)]);
-            for (admit_idx[0..n_admit]) |idx| {
-                to_prefill[n_prefill] = admitForPrefillLocked(sch, idx);
-                n_prefill += 1;
-            }
-            // Remove admitted entries in DESCENDING index order so the
-            // earlier (ascending) indices stay valid during removal.
-            var r = n_admit;
-            while (r > 0) {
-                r -= 1;
-                _ = sch.pending.orderedRemove(admit_idx[r]);
-            }
-            var queue_line: [192]u8 = undefined;
-            for (sch.pending.items) |held| {
-                if (slot_admission.queueLogLine(sch, &queue_line, held)) |line| log.info("{s}\n", .{line});
-            }
+            n_prefill = admitPendingLocked(sch, &to_prefill);
         }
 
         if (sch.budget_revise_sw) |sw| {
@@ -2715,13 +2696,12 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
 
         // 3. Build active-list snapshot (skip cancelled / finished / errored).
-        var active: std.ArrayList(*Slot) = .empty;
-        defer active.deinit(sch.allocator);
+        active.clearRetainingCapacity();
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
             for (sch.decoding.items) |s| {
-                if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+                if (!s.joinsTick()) continue;
                 active.append(sch.allocator, s) catch break;
                 _ = s.in_pass.fetchAdd(1, .acq_rel);
             }
@@ -2791,7 +2771,7 @@ pub fn cullDecodingWith(sch: *Scheduler, commit: *const fn (*Scheduler, *Slot) v
     var i: usize = 0;
     while (i < sch.decoding.items.len) {
         const s = sch.decoding.items[i];
-        const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
+        const drop = !s.joinsTick();
         // An allocation failure keeps the slot for the next tick; every pass skips it meanwhile.
         if (drop and if (dropped.append(sch.allocator, s)) true else |_| false) {
             _ = sch.decoding.orderedRemove(i);
@@ -2813,7 +2793,7 @@ pub fn cullDecodingWith(sch: *Scheduler, commit: *const fn (*Scheduler, *Slot) v
 /// A cancelled decode-phase slot commits at the cull when its state is not the slot's own, or is reset right after
 /// (`sched.commitsAtCull`): the next exclusive request is admitted as soon as the slot leaves `decoding`.
 fn commitsAtCull(s: *const Slot) bool {
-    if (!s.cancelled.load(.acquire) or s.finished or s.error_code != null) return false;
+    if (!sched_policy.cancelOpen(s.cancelled.load(.acquire), s.finished, s.error_code != null)) return false;
     return sched.commitsAtCull(s);
 }
 
@@ -3190,32 +3170,8 @@ pub fn prefillDecodeShare() f32 {
     return if (prefillInterleaveEnabled()) prefill_decode_share else 0;
 }
 
-pub const PREFILL_DECODE_SHARE_MAX: f32 = 0.9;
-pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
-    const v = std.fmt.parseFloat(f32, text) catch return error.InvalidDecodeShare;
-    if (std.math.isNan(v) or v < 0) return error.InvalidDecodeShare;
-    return @min(v, PREFILL_DECODE_SHARE_MAX);
-}
-pub fn decodeShareBudgetNs(chunk_ns: u64, share: f32) u64 {
-    if (std.math.isNan(share) or share <= 0) return 0;
-    const fraction: f64 = @min(share, PREFILL_DECODE_SHARE_MAX);
-    const budget = @as(f64, @floatFromInt(chunk_ns)) * fraction / (1 - fraction);
-    if (budget >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
-    return @intFromFloat(budget);
-}
-pub const OwedTicks = struct { ticks: u32, spent_ns: u64 };
-pub fn runOwedDecodeTicks(share: f32, chunk_ns: u64, first_ns: u64, ctx: *anyopaque, tick: *const fn (*anyopaque) u64) OwedTicks {
-    var result = OwedTicks{ .ticks = 1, .spent_ns = first_ns };
-    if (first_ns == 0) return result;
-    const budget = decodeShareBudgetNs(chunk_ns, share);
-    while (result.spent_ns < budget) {
-        const ns = tick(ctx);
-        if (ns == 0) break;
-        result.ticks +|= 1;
-        result.spent_ns +|= ns;
-    }
-    return result;
-}
+const decodeShareBudgetNs = sched_policy.decodeShareBudgetNs;
+const runOwedDecodeTicks = sched_policy.runOwedDecodeTicks;
 
 const InterleaveCtx = struct {
     sch: *Scheduler,
@@ -3397,7 +3353,7 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     var n: usize = 0;
     sch.queue_mu.lockUncancelable(sch.io);
     for (sch.decoding.items) |s| {
-        if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+        if (!s.joinsTick()) continue;
         if (n >= buf.len) break;
         buf[n] = s;
         _ = s.in_pass.fetchAdd(1, .acq_rel);
@@ -3513,7 +3469,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.model.transformer.?.moduleSpecWiring();
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
-    const wiring = specInitWiring(
+    const wiring = sched_policy.specInitWiring(
         owns_module_state,
         module_spec_rollback,
         slot.enable_mtp,
@@ -4054,24 +4010,28 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var batchable_n: usize = 0;
     var mtp_buf: [slot_admission.MAX_BATCH_GROUP]*Slot = undefined;
     var mtp_n: usize = 0;
-    var glm_buf: [slot_admission.MAX_BATCH_GROUP]*Slot = undefined;
-    var glm_n: usize = 0;
+    var rows_buf: [slot_admission.MAX_BATCH_GROUP]*Slot = undefined;
+    var rows_n: usize = 0;
     for (active) |s| {
         const why = sch.batchVerdict(s);
-        const cls = sched.tickClass(s);
-        if (why == .ok and batchable_n < batchable_buf.len) {
-            batchable_buf[batchable_n] = s;
-            batchable_n += 1;
-        } else if (why == .spec_active and cls == .mtp_group and mtp_n < mtp_buf.len) {
-            mtp_buf[mtp_n] = s;
-            mtp_n += 1;
-        } else if (why == .spec_active and cls == .rows_company and glm_n < glm_buf.len) {
-            glm_buf[glm_n] = s;
-            glm_n += 1;
-        } else {
-            // legacy single-slot for spec / grammar / overflow
-            slot_admission.noteSerial(sch, s, why);
-            try runSingleDecodeTick(sch, s);
+        switch (sched_policy.bucketOf(why, sched.tickClass(s), .{ .batch = batchable_n, .mtp = mtp_n, .rows = rows_n })) {
+            .batch => {
+                batchable_buf[batchable_n] = s;
+                batchable_n += 1;
+            },
+            .mtp => {
+                mtp_buf[mtp_n] = s;
+                mtp_n += 1;
+            },
+            .rows => {
+                rows_buf[rows_n] = s;
+                rows_n += 1;
+            },
+            .serial => {
+                // legacy single-slot for spec / grammar / overflow
+                slot_admission.noteSerial(sch, s, why);
+                try runSingleDecodeTick(sch, s);
+            },
         }
     }
     // A crowded MTP group (measured past 3 slots on the 27B) beats its sub-grouped verify
@@ -4079,16 +4039,11 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // capturing the hidden the tick forwards (`mtp_plain_tick`).
     var mtp_group_n: usize = 0;
     {
-        std.sort.pdq(*Slot, mtp_buf[0..mtp_n], {}, struct {
-            fn lt(_: void, a: *Slot, b: *Slot) bool {
-                return @intFromPtr(a.model) < @intFromPtr(b.model);
-            }
-        }.lt);
+        sched_policy.sortByModel(*Slot, mtp_buf[0..mtp_n]);
         var i: usize = 0;
         while (i < mtp_n) {
-            var j = i + 1;
-            while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
-            if (j - i >= mtp_tick.mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len and !mtp_tick.anyPenalised(mtp_buf[i..j])) {
+            const j = sched_policy.modelRunEnd(*Slot, mtp_buf[0..mtp_n], i);
+            if (sched_policy.crowdFits(j - i, mtp_tick.mtpCrowdThresholdFor(mtp_buf[i]), batchable_n) and !mtp_tick.anyPenalised(mtp_buf[i..j])) {
                 for (mtp_buf[i..j]) |slot| {
                     const gen = &slot.legacy_gen.?;
                     gen.mtpDetachHead(slot.allocator, true) catch |e| {
@@ -4112,8 +4067,8 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     try mtp_tick.runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
     // A DFlash2 GLM slot in company decodes as a plain row of the grouped tick (a row for another
     // request beats a draft row, glm5-arch#concurrency); alone it drafts.
-    for (glm_buf[0..glm_n]) |slot| {
-        if (sched.rowsInCompany(slot, glm_buf[0..glm_n], batchable_buf[0..batchable_n]) and batchable_n < batchable_buf.len) {
+    for (rows_buf[0..rows_n]) |slot| {
+        if (sched.rowsInCompany(slot, rows_buf[0..rows_n], batchable_buf[0..batchable_n]) and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = slot;
             batchable_n += 1;
         } else try runSingleDecodeTick(sch, slot);
@@ -4126,18 +4081,13 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // Group batchable slots by model pointer (in-place partition by sort).
     // The order of slots within a model doesn't matter for batched decode;
     // we only need contiguous runs per model.
-    std.sort.pdq(*Slot, batchable_buf[0..batchable_n], {}, struct {
-        fn lt(_: void, a: *Slot, b: *Slot) bool {
-            return @intFromPtr(a.model) < @intFromPtr(b.model);
-        }
-    }.lt);
+    sched_policy.sortByModel(*Slot, batchable_buf[0..batchable_n]);
 
     var start: usize = 0;
     while (start < batchable_n) {
-        var end = start + 1;
-        while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
+        const end = sched_policy.modelRunEnd(*Slot, batchable_buf[0..batchable_n], start);
         var group = batchable_buf[start..end];
-        const row_cap = group[0].facts.row_cap orelse slot_admission.MAX_BATCH_GROUP;
+        const row_cap = sched_policy.rowsKept(group.len, group[0].facts.row_cap);
         if (group.len > row_cap) {
             for (group[row_cap..]) |s| {
                 slot_admission.noteSerial(sch, s, .row_cap);
@@ -4187,68 +4137,8 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
 }
 
-/// What `runPrefill` arms in a slot's Generator init options.
-pub const SpecInitWiring = struct {
-    use_mtp: bool,
-    use_dflash: bool,
-};
-
-/// Per-site spec gating for one slot, as a pure function.
-///
-/// Speculative decode must be able to ROLL BACK a rejected tail, and the shell
-/// rolls back what it owns: the slot's KVCache and ssm_entries. A MODULE-OWNED
-/// arch uses neither — by the time a verify forward returns, its own state has
-/// already absorbed every draft token, and the shell's snapshot/truncate run
-/// over an empty entries array. So every shell-driven spec mode is off there.
-pub fn specInitWiring(
-    owns_module_state: bool,
-    module_spec_rollback: bool,
-    enable_mtp: bool,
-    has_mtp: bool,
-    enable_drafter: bool,
-    has_dflash: bool,
-) SpecInitWiring {
-    if (owns_module_state) {
-        // A module-owned arch that CAN rewind its state across a verify runs
-        // a DFlash2 drafter or its own MTP head like any other target (qwen4_exp:
-        // `ssmRollbackFromCapture` rewinds GDN, PLE and QSA state). Without
-        // rollback every spec mode stays off.
-        const use_dflash = module_spec_rollback and enable_drafter and has_dflash;
-        return .{
-            .use_mtp = !use_dflash and module_spec_rollback and enable_mtp and has_mtp,
-            .use_dflash = use_dflash,
-        };
-    }
-    // enable_drafter is the request-level "assistant sidecar" switch for BOTH
-    // sidecar kinds; the loader guarantees at most one of drafter/dflash is
-    // loaded per model. Priority: dflash > MTP — a
-    // loaded DFlash sidecar is an explicit choice (`--drafter` or the pack's
-    // own `drafter/`) while the MTP head ships with the checkpoint;
-    // `--no-drafter` (or `enable_drafter:false`) hands the round back to MTP.
-    const use_dflash = enable_drafter and has_dflash;
-    const use_mtp = !use_dflash and enable_mtp and has_mtp;
-    return .{
-        .use_mtp = use_mtp,
-        .use_dflash = use_dflash,
-    };
-}
-
-/// Which spec mode a decode tick drives for a slot.
-pub const SpecTickMode = enum { mtp, dflash, regular };
-
-/// Pure decode-tick dispatch decision. The slot flags carry the REQUEST's
-/// wish; the generator-side values carry what `Generator.initWithOptions`
-/// actually armed. Every arm must require BOTH.
-pub fn specTickMode(
-    slot_enable_mtp: bool,
-    gen_has_mtp: bool,
-    slot_enable_drafter: bool,
-    gen_has_dflash: bool,
-) SpecTickMode {
-    if (slot_enable_drafter and gen_has_dflash) return .dflash;
-    if (slot_enable_mtp and gen_has_mtp) return .mtp;
-    return .regular;
-}
+pub const SpecTickMode = sched_policy.SpecTickMode;
+pub const specTickMode = sched_policy.specTickMode;
 
 /// Drive one Generator step (regular / DFlash / MTP) and push emitted
 /// tokens into the slot's output ring. Mirrors the existing
@@ -4708,37 +4598,6 @@ test "a decode-phase cancel that never passed the cull commits at the cleanup dr
     try testing.expectEqual(@as(usize, 1), Hook.commits);
 }
 
-test "idleEvictTickMs: sweeps well inside the window without spinning" {
-    // Bar: a quarter of the window, clamped to [1s, 30s] — eviction lands near
-    // the configured time without the sweep becoming a busy loop.
-    try testing.expectEqual(@as(i64, 5_000), idleEvictTickMs(20_000));
-    try testing.expectEqual(@as(i64, 15_000), idleEvictTickMs(60_000));
-    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(900_000));
-    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(1000));
-    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
-    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
-    try testing.expect(idleEvictTickMs(0) >= 1000);
-}
-
-test "gpu warm: ticks every half second inside the window after work, never past it or with work" {
-    const w: u64 = 60 * std.time.ns_per_s;
-    try testing.expectEqual(@as(?u64, null), gpuWarmParkNs(null, w));
-    try testing.expectEqual(@as(?u64, GPU_WARM_TICK_NS), gpuWarmParkNs(0, w));
-    try testing.expectEqual(@as(?u64, GPU_WARM_TICK_NS), gpuWarmParkNs(30 * std.time.ns_per_s, w));
-    try testing.expectEqual(@as(?u64, 100), gpuWarmParkNs(w - 100, w));
-    try testing.expectEqual(@as(?u64, null), gpuWarmParkNs(w, w));
-    try testing.expectEqual(@as(?u64, null), gpuWarmParkNs(0, 0));
-    try testing.expect(gpuWarmTickDue(false, 0, w));
-    try testing.expect(!gpuWarmTickDue(true, 0, w));
-    try testing.expect(!gpuWarmTickDue(false, null, w));
-    try testing.expect(!gpuWarmTickDue(false, w, w));
-    try testing.expect(!gpuWarmTickDue(false, 0, 0));
-    try testing.expectEqual(GpuWarmWindow.restart, gpuWarmBeforePark(true, false));
-    try testing.expectEqual(GpuWarmWindow.keep, gpuWarmBeforePark(false, false));
-    try testing.expectEqual(GpuWarmWindow.close, gpuWarmBeforePark(false, true));
-    try testing.expectEqual(GpuWarmWindow.close, gpuWarmBeforePark(true, true));
-}
-
 test "a cancelled prefill with no Generator commits its forwarded prefix, pad-only flag or not" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -4967,19 +4826,20 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // already-emitted token, corrupting any stream whose slot joined a
     // batch mid-generation (tests/test_batched_transition.sh). Slots that
     // finish during the drain are excluded from the batch.
-    const live = try allocator.alloc(*Slot, N);
-    defer allocator.free(live);
+    if (N > slot_admission.MAX_BATCH_GROUP) return error.BatchGroupTooWide;
+    var live_buf: [slot_admission.MAX_BATCH_GROUP]*Slot = undefined;
+    const live = live_buf[0..N];
     const live_n = try batchedTickRows(sch, active, live);
     if (live_n == 0) return;
     var batch = live[0..live_n];
 
     // Build inputs.
-    const next_tokens = try allocator.alloc(u32, live_n);
-    defer allocator.free(next_tokens);
-    const ctxs = try allocator.alloc(*ForwardCtx, live_n);
-    defer allocator.free(ctxs);
-    const rope_offsets = try allocator.alloc(u32, live_n);
-    defer allocator.free(rope_offsets);
+    var next_tokens_buf: [slot_admission.MAX_BATCH_GROUP]u32 = undefined;
+    const next_tokens = next_tokens_buf[0..live_n];
+    var ctxs_buf: [slot_admission.MAX_BATCH_GROUP]*ForwardCtx = undefined;
+    const ctxs = ctxs_buf[0..live_n];
+    var rope_offsets_buf: [slot_admission.MAX_BATCH_GROUP]u32 = undefined;
+    const rope_offsets = rope_offsets_buf[0..live_n];
 
     for (batch, 0..) |slot, i| {
         const gen = &slot.legacy_gen.?;
@@ -5260,105 +5120,6 @@ pub fn expectOutcomes(m: *const metrics_mod.Metrics, success: u64, cancelled: u6
     try testing.expectEqual(cancelled, m.requests_cancelled_total.load());
     try testing.expectEqual(failed, m.requests_failed_total.load());
     try testing.expectEqual(rejected, m.requests_rejected_total.load());
-}
-
-test "specInitWiring: a module-owned arch only gets the spec modes it can roll back" {
-    // Spec decode must be able to ROLL BACK a rejected tail. The shell rolls
-    // back its KVCache/ssm_entries — which a module-owned arch does not use, so
-    // by the time the verify returns, the module has already absorbed every
-    // draft and the shell's snapshot/truncate run over an EMPTY entries array.
-    // The predicate is per-ARCH CAPABILITY (`moduleStateSpecRollback`), not ownership.
-    // Args: (owns_module_state, module_spec_rollback,
-    //        enable_mtp, has_mtp, enable_drafter, has_dflash)
-
-    // Plain arch: MTP wins over a missing sidecar.
-    {
-        const w = specInitWiring(false, false, true, true, true, false);
-        try testing.expect(w.use_mtp and !w.use_dflash);
-    }
-    // A flag with no loaded handle never arms.
-    {
-        const w = specInitWiring(false, false, true, false, false, false);
-        try testing.expect(!w.use_mtp and !w.use_dflash);
-    }
-
-    // DFlash rides the enable_drafter switch: dflash > MTP.
-    {
-        const w = specInitWiring(false, false, false, false, true, true);
-        try testing.expect(!w.use_mtp and w.use_dflash);
-    }
-    // A loaded drafter outranks the checkpoint's own MTP head: the sidecar
-    // is an explicit choice (`--drafter` or the in-dir `drafter/`), the head
-    // ships with every pack; `--no-drafter` restores MTP by not loading it.
-    {
-        const w = specInitWiring(false, false, true, true, true, true);
-        try testing.expect(w.use_dflash and !w.use_mtp);
-    }
-    // enable_drafter:false on the request hands the round back to MTP.
-    {
-        const w = specInitWiring(false, false, true, true, false, true);
-        try testing.expect(w.use_mtp and !w.use_dflash);
-    }
-    // enable_drafter:false opts the sidecar out.
-    {
-        const w = specInitWiring(false, false, false, false, false, true);
-        try testing.expect(!w.use_dflash);
-    }
-
-    // Module-owned with NO rollback: everything off.
-    {
-        const w = specInitWiring(true, false, true, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_dflash);
-    }
-
-    // Module-owned WITH rollback: a loaded, requested drafter outranks the head;
-    // without one the head arms.
-    {
-        const w = specInitWiring(true, true, true, true, true, true);
-        try testing.expect(w.use_dflash and !w.use_mtp);
-    }
-    {
-        const w = specInitWiring(true, true, true, true, false, true);
-        try testing.expect(w.use_mtp and !w.use_dflash);
-    }
-    {
-        const w = specInitWiring(true, false, false, false, true, true);
-        try testing.expect(!w.use_mtp and !w.use_dflash);
-    }
-    // Rollback capability alone never arms a head or a drafter that is not loaded.
-    {
-        const w = specInitWiring(true, true, true, false, true, false);
-        try testing.expect(!w.use_mtp and !w.use_dflash);
-    }
-    // ...nor one the request opted out of.
-    {
-        const w = specInitWiring(true, true, false, true, true, false);
-        try testing.expect(!w.use_mtp);
-    }
-    // An image request keeps the head when the drafter is off for it.
-    {
-        const w = specInitWiring(true, true, true, true, false, true);
-        try testing.expect(w.use_mtp and !w.use_dflash);
-    }
-}
-
-test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {
-    // mtp and dflash each need the slot's wish AND the generator's handle.
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false));
-    // Generator armed but the request opted enable_mtp off → serial.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, true, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false));
-
-    // DFlash: slot's enable_drafter + generator's dflash handle; outranks the MTP
-    // head (a loaded sidecar is the explicit choice). A generator handle alone never
-    // resurrects it, and a dflash generator with the slot flag off stays regular, or
-    // MTP when that is armed.
-    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true));
-    try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, true));
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, true));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, true));
 }
 
 test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the prefill" {
@@ -5952,73 +5713,6 @@ test "decode share: the default is 0.25 and reaches /props" {
     prefill_interleave_cached = true;
     try testing.expectEqual(@as(f32, 0.25), prefill_decode_share);
     try testing.expectEqual(@as(f32, 0.25), prefillDecodeShare());
-}
-
-test "decode share: parse clamps above 0.9 and rejects anything that is not a share" {
-    try testing.expectEqual(@as(f32, 0), try parseDecodeShare("0"));
-    try testing.expectEqual(@as(f32, 0.5), try parseDecodeShare("0.5"));
-    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("0.95"));
-    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("inf"));
-    for ([_][]const u8{ "", "abc", "nan", "-0.3", "0.5x" }) |bad| {
-        try testing.expectError(error.InvalidDecodeShare, parseDecodeShare(bad));
-    }
-}
-
-test "decode share: the budget is chunk * S / (1 - S), zero when off" {
-    const ms = std.time.ns_per_ms;
-    try testing.expectEqual(@as(u64, 0), decodeShareBudgetNs(400 * ms, 0));
-    try testing.expectApproxEqAbs(@as(f64, 400 * ms), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.5))), 1e3);
-    try testing.expectApproxEqAbs(@as(f64, 3600 * ms), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.9))), 1e4);
-    try testing.expectApproxEqAbs(@as(f64, 400 * ms * 3 / 7), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.3))), 1e4);
-}
-
-const FakeDecodeTicks = struct {
-    left: u32,
-    ns: u64,
-    calls: u32 = 0,
-    fn tick(ctx: *anyopaque) u64 {
-        const f: *FakeDecodeTicks = @ptrCast(@alignCast(ctx));
-        f.calls += 1;
-        if (f.left == 0) return 0;
-        f.left -= 1;
-        return f.ns;
-    }
-};
-
-test "decode share: ticks to the budget, keeps one tick at zero, stops when decoders run out" {
-    const ms = std.time.ns_per_ms;
-    // S=0.5 on a 400 ms chunk with 8 ms ticks: 50 ticks, 400 ms of decode.
-    var full = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
-    const r = runOwedDecodeTicks(0.5, 400 * ms, 8 * ms, &full, FakeDecodeTicks.tick);
-    try testing.expectEqual(@as(u32, 50), r.ticks);
-    try testing.expectEqual(@as(u64, 400 * ms), r.spent_ns);
-    // Share zero retains sushi's single boundary tick.
-    for ([_]u64{ 100, 300, 2300, 8000 }) |c| {
-        var legacy = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
-        const l = runOwedDecodeTicks(0, c * ms, 8 * ms, &legacy, FakeDecodeTicks.tick);
-        try testing.expectEqual(@as(u32, 1), l.ticks);
-    }
-    // The decoders finish after 3 more ticks: the 4th call returns 0 and the loop stops.
-    var dry = FakeDecodeTicks{ .left = 3, .ns = 8 * ms };
-    const d = runOwedDecodeTicks(0.5, 400 * ms, 8 * ms, &dry, FakeDecodeTicks.tick);
-    try testing.expectEqual(@as(u32, 4), d.ticks);
-    try testing.expectEqual(@as(u32, 4), dry.calls);
-    try testing.expectEqual(@as(u64, 32 * ms), d.spent_ns);
-    // Nobody decoding at the boundary: the first tick measured 0, no more are tried.
-    var none = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
-    const n = runOwedDecodeTicks(0.5, 2300 * ms, 0, &none, FakeDecodeTicks.tick);
-    try testing.expectEqual(@as(u32, 1), n.ticks);
-    try testing.expectEqual(@as(u32, 0), none.calls);
-}
-
-
-
-test "decode share: 0.25 owes a third of the chunk time in ticks" {
-    const ms = std.time.ns_per_ms;
-    var f = FakeDecodeTicks{ .left = 1000, .ns = 10 * ms };
-    const r = runOwedDecodeTicks(0.25, 3000 * ms, 10 * ms, &f, FakeDecodeTicks.tick);
-    try testing.expectEqual(@as(u32, 100), r.ticks);
-    try testing.expectEqual(@as(u64, 1000 * ms), r.spent_ns);
 }
 
 test "decode share: the kill switch disables the effective share" {

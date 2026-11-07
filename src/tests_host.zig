@@ -59,6 +59,7 @@ test {
     _ = @import("spec_cost_gate.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("prefix_policy.zig");
+    _ = @import("sched_policy.zig");
     _ = @import("disk_format.zig");
     _ = @import("opencode_persist.zig");
     _ = @import("parent_watch.zig");

@@ -55,15 +55,7 @@ pub const Facts = struct {
     pads_batch: bool = true,
 };
 
-/// How a slot is ticked while it speculates.
-pub const TickClass = enum {
-    /// Runs its round alone.
-    none,
-    /// Its MTP round may join the grouped verify, or drop to a plain batched tick when crowded.
-    mtp_group,
-    /// Decodes as a plain row of the grouped tick when its model has company.
-    rows_company,
-};
+pub const TickClass = @import("../sched_policy.zig").TickClass;
 
 /// The batched kernel a group takes this tick. `arm` is the arch's own id for it, handed back to `batchedForward`.
 pub const BatchArm = struct {

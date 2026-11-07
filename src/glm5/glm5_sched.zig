@@ -15,6 +15,7 @@ const sched = @import("../arch/sched.zig");
 const model_load = @import("../model_load.zig");
 const forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
+const flags = @import("glm5_flags.zig");
 const rows_tick = @import("glm5_rows_tick.zig");
 
 const Slot = scheduler.Slot;
@@ -75,9 +76,9 @@ pub fn initRequest(allocator: std.mem.Allocator, config: *const ModelConfig) !?s
     return try forward.Request.initServing(allocator, config.num_hidden_layers);
 }
 
-/// The MLA latent is stored affine8 or affine6; a request for any other scheme is refused by name.
+/// The same fact as the request-side refusal (`glm5_flags`): the latent's schemes are one list.
 pub fn checkKvQuant(kv: kv_quant.KVQuantConfig) !void {
-    if (kv.glmLatentBits() == null) return error.GlmKvQuantUnsupported;
+    if (flags.kvQuantRequestRefusal(kv) != null) return error.GlmKvQuantUnsupported;
 }
 
 pub fn coldLoadBill(load: sched.ColdLoad) !?u64 {
@@ -144,4 +145,17 @@ test "an arch with a native request restores into it with the assistant context 
     sched.releaseState(&slot);
     try std.testing.expectEqual(@as(usize, 0), slot.request.?.offset);
     try std.testing.expectError(error.GlmKvQuantUnsupported, sched.checkKvQuant(&xfm.config, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
+}
+
+test "a KV scheme is refused at submit exactly when the request-side check refuses it" {
+    const odd_group: kv_quant.KVQuantConfig = .{ .scheme = .affine, .bits = 8, .group_size = 32 };
+    const schemes = [_]kv_quant.KVQuantConfig{ .dense, .affine(8), .affine(6), .affine(4), odd_group };
+    for (schemes) |kv| {
+        const refused = flags.kvQuantRequestRefusal(kv) != null;
+        if (refused) {
+            try std.testing.expectError(error.GlmKvQuantUnsupported, checkKvQuant(kv));
+        } else {
+            try checkKvQuant(kv);
+        }
+    }
 }

@@ -3009,7 +3009,7 @@ const IdleEvictCtx = struct {
 /// nothing here touches mlx directly.
 fn idleEvictLoop(ctx: IdleEvictCtx) void {
     const sch = ctx.scheduler;
-    const tick_ms = scheduler_mod.idleEvictTickMs(ctx.window_ms);
+    const tick_ms = @import("sched_policy.zig").idleEvictTickMs(ctx.window_ms);
     // Wake every 500 ms to check the stop flag; sweep once per tick interval.
     // `std.c.nanosleep` for the same reason as the gauge sampler: `std.time.sleep`
     // is gone in Zig 0.16, and a blocking Io timer here could outlive the stop.

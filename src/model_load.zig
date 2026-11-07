@@ -213,7 +213,7 @@ pub fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
 pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
-    if (config.isGlm5()) if (o.kv_quant) |k| if (k.glmLatentBits() == null) {
+    if (o.kv_quant) |k| if (arch_flags.kvQuantRequestRefusal(config, k) != null) {
         config.kv_quant_override = null;
         log.warn("[model-settings] kv_quant {s} ignored: the MLA latent is stored at off, 6 or 8 bits\n", .{k.wireName()});
     };
@@ -1497,12 +1497,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.free(params.config.expert_source_dir.?);
         params.config.expert_source_dir = null;
     };
-    if (params.config.isGlm5()) {
-        const kv = transformer_mod.KvCacheChoice.resolve(params.kv_quant, params.config.kv_quant_override);
-        if (kv.config.glmLatentBits() == null) {
-            log.err("[glm] native MLA cache supports --kv-quant 8, 6 or off\n", .{});
-            return error.GlmKvQuantUnsupported;
-        }
+    const launch_kv = transformer_mod.KvCacheChoice.resolve(params.kv_quant, params.config.kv_quant_override);
+    if (arch_flags.kvQuantRequestRefusal(params.config, launch_kv.config)) |why| {
+        log.err("[kv-cache] {s}\n", .{why});
+        return error.GlmKvQuantUnsupported;
     }
     if (arch_flags.archFlagRefusal(params.config, .{
         .kv_quant = params.kv_quant != null,

@@ -14,6 +14,7 @@ const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
 const submitTestScheduler = scheduler_mod.submitTestScheduler;
 const sched = @import("arch/sched.zig");
+const sched_policy = @import("sched_policy.zig");
 
 pub const PostEvictionWidth = struct {
     /// The width the prefill runs at. Always the re-ask.
@@ -60,23 +61,12 @@ pub fn adaptiveChunkWidthFor(cfg: ?*const model_mod.ModelConfig) bool {
     return enabled(c);
 }
 
-/// Slots one batched forward can carry; the tail decodes serial this tick.
-pub const MAX_BATCH_GROUP = 32;
-
-pub const BatchVerdict = enum {
-    ok,
-    spec_active,
-    head_release_pending,
-    grammar,
-    forced_call,
-    logprobs,
-    penalty,
-    arch,
-    pad_waste,
-    row_cap,
-    /// The model owns its decode state (`slotExclusiveDecode`): requests queue, never co-decode.
-    exclusive,
-};
+// The pure decisions live in `sched_policy.zig`; these keep their old names for callers.
+pub const MAX_BATCH_GROUP = sched_policy.MAX_BATCH_GROUP;
+pub const BatchVerdict = sched_policy.BatchVerdict;
+pub const batchedKvKeepCount = sched_policy.batchedKvKeepCount;
+pub const batchedPadWaste = sched_policy.batchedPadWaste;
+pub const AdmitCand = sched_policy.AdmitCand;
 
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.
@@ -98,65 +88,6 @@ pub fn noteSerial(sch: *Scheduler, slot: *Slot, why: BatchVerdict) void {
     log.info("[batched] slot serial: {s} (model={s})\n", .{ @tagName(why), slot.model.id });
 }
 
-/// Batched decode pads every slot's KV to the group's LONGEST (`padAndStackBatchedKV`),
-/// so the tensor it builds is `N x kv_max`, not `sum(kv_len)`. A group mixing one
-/// 100k-token stream with three 1k ones therefore materializes ~100x the bytes the
-/// short slots need — on a qwen4_exp trunk (hd 256, `--ctx-size` up to 262144) that is
-/// ~410 MB per full-attention layer, ~6.5 GB across the 16 of them, and NOTHING bills
-/// it: it is a per-tick transient, invisible to `prefillTransientReserve` and to the
-/// load-time gate. An uncatchable Metal OOM is the failure mode.
-///
-/// So the group is capped by PADDING WASTE, which is the quantity that actually hurts,
-/// rather than by a length ratio: keep the largest prefix of the ascending-sorted
-/// lengths whose padded tensor stays within `MAX_PAD_WASTE` of its useful bytes. The
-/// slots that fall out are the LONGEST ones — the ones dominating kv_max — and they
-/// decode serially this tick, so every slot still advances.
-///
-/// Returns how many of `kv_lens_asc` may batch together (0 or 1 = nobody batches).
-/// The lengths are the arch's true attention KV length (`batchKvLenOf`), pre-tick counts,
-/// so this is a heuristic bar on the padding the forward will build, not an accounting identity.
-/// The padded tensor may be at most this multiple of the bytes the group
-/// actually needs. It must stay BELOW 2.0 or a two-slot group can never be
-/// vetoed: one 1-token slot beside one 200k slot pads to exactly 2x, which is
-/// the worst case for N=2 and the pathological pair this cap exists for.
-pub const MAX_PAD_WASTE: f64 = 1.5;
-
-pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
-    if (kv_lens_asc.len < 2) return 0;
-    var k: usize = kv_lens_asc.len;
-    while (k >= 2) : (k -= 1) {
-        var sum: u64 = 0;
-        for (kv_lens_asc[0..k]) |l| sum += l;
-        if (sum == 0) return k; // nothing prefilled yet: no padding to waste
-        const padded: f64 = @floatFromInt(@as(u64, k) * kv_lens_asc[k - 1]);
-        if (padded <= MAX_PAD_WASTE * @as(f64, @floatFromInt(sum))) return k;
-    }
-    return 0;
-}
-
-/// The padding waste the whole group would pay; reported by the cap's log.
-pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
-    var sum: u64 = 0;
-    for (kv_lens_asc) |l| sum += l;
-    if (sum == 0 or kv_lens_asc.len == 0) return 1.0;
-    const padded: f64 = @floatFromInt(@as(u64, kv_lens_asc.len) * kv_lens_asc[kv_lens_asc.len - 1]);
-    return padded / @as(f64, @floatFromInt(sum));
-}
-
-/// A group whose longest billed slot is at most this long pads a small tensor, and splitting it sends a slot
-/// through a whole serial forward instead: under a gather arm every long slot bills at the indexer
-/// budget, so a short sub-agent beside long streams reads as a 2x pad.
-pub const PAD_FREE_KV: u32 = 4096;
-
-/// The floor only engages once a slot holds this much context: below it the serial forward it saves is cheap.
-pub const PAD_FREE_MIN_CTX: u32 = 131072;
-
-/// `batchedKvKeepCount` for a group whose longest TRUE context is `ctx_max`.
-pub fn groupKeepCount(kv_lens_asc: []const u32, ctx_max: u32) usize {
-    if (kv_lens_asc.len >= 2 and ctx_max >= PAD_FREE_MIN_CTX and kv_lens_asc[kv_lens_asc.len - 1] <= PAD_FREE_KV) return kv_lens_asc.len;
-    return batchedKvKeepCount(kv_lens_asc);
-}
-
 pub fn padWasteKeepCount(group: []*Slot, gate_batch_kv_len: bool, kv_lens: *[32]u32) usize {
     var ctx_max: u32 = 0;
     // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
@@ -168,19 +99,7 @@ pub fn padWasteKeepCount(group: []*Slot, gate_batch_kv_len: bool, kv_lens: *[32]
         }
         fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, kv_lens[0..group.len]);
         ctx_max = groupCtxMax(caches_buf[0..group.len]);
-        // Stable insertion sort, ascending, slots and lengths moving together.
-        var i: usize = 1;
-        while (i < group.len) : (i += 1) {
-            const slot_i = group[i];
-            const len_i = kv_lens[i];
-            var j = i;
-            while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
-                group[j] = group[j - 1];
-                kv_lens[j] = kv_lens[j - 1];
-            }
-            group[j] = slot_i;
-            kv_lens[j] = len_i;
-        }
+        sched_policy.sortByKeyStable(*Slot, group, kv_lens[0..group.len]);
     } else {
         std.sort.pdq(*Slot, group, {}, struct {
             fn lt(_: void, a: *Slot, b: *Slot) bool {
@@ -189,7 +108,7 @@ pub fn padWasteKeepCount(group: []*Slot, gate_batch_kv_len: bool, kv_lens: *[32]
         }.lt);
         for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
     }
-    return groupKeepCount(kv_lens[0..group.len], ctx_max);
+    return sched_policy.groupKeepCount(kv_lens[0..group.len], ctx_max);
 }
 
 pub fn groupCtxMax(caches: []const *const KVCache) u32 {
@@ -235,42 +154,16 @@ pub fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     return t.ownsModuleDecodeState();
 }
 
-/// Pure core of `slotExclusiveDecode`. `model_owns_state` wins outright and is never
-/// released; the head clause is qwen4_exp's per-model head, released for good once the
-/// adaptive switch moved the slot to serial (`Generator.mtpModuleHeadReleased`).
-pub fn headExclusiveFor(
-    model_owns_state: bool,
-    head_module_owned: bool,
-    slot_enable_mtp: bool,
-    head_released: bool,
-) bool {
-    if (model_owns_state) return true;
-    if (!head_module_owned or !slot_enable_mtp) return false;
-    return !head_released;
-}
-
-/// A slot whose drafter outranks the head (`specTickMode`) never touches the module-owned head.
-pub fn slotDrivesHead(enable_mtp: bool, enable_drafter: bool, has_dflash: bool) bool {
-    return enable_mtp and !(enable_drafter and has_dflash);
-}
-
-test "a slot running a DFlash drafter does not hold the module-owned MTP head" {
-    try testing.expect(slotDrivesHead(true, false, true));
-    try testing.expect(slotDrivesHead(true, true, false));
-    try testing.expect(!slotDrivesHead(true, true, true));
-    try testing.expect(!slotDrivesHead(false, false, false));
-}
-
 /// Per-SLOT exclusivity: the model's own bit, OR a slot that will drive a
 /// module-owned MTP head (qwen4: `Qwen4Mtp.cache` is one per model). Plain
 /// slots on the same model keep interleaving/batching beside it; two MTP
 /// slots serialize, until one of them releases the head.
 pub fn slotExclusiveDecode(slot: *const Slot) bool {
     const head = slot.model.mtp;
-    return headExclusiveFor(
+    return sched_policy.headExclusiveFor(
         modelExclusiveDecode(slot.model),
         if (head) |h| h.moduleOwned() else false,
-        slotDrivesHead(slot.enable_mtp, slot.enable_drafter, slot.dflash != null),
+        sched_policy.slotDrivesHead(slot.enable_mtp, slot.enable_drafter, slot.dflash != null),
         if (slot.legacy_gen) |*g| g.mtpModuleHeadReleased() else false,
     );
 }
@@ -279,7 +172,7 @@ pub fn slotExclusiveDecode(slot: *const Slot) bool {
 /// `cleanup_queue` without a cull in between: until the inference thread has released it, the slot
 /// still owns its native state and keeps blocking exclusive admission.
 fn slotHoldsAdmission(slot: *const Slot) bool {
-    return !slot.finished and slot.error_code == null;
+    return sched_policy.holdsAdmission(slot.finished, slot.error_code != null);
 }
 
 /// Exclusive slots in `lists` (decoding, then queued for cleanup) that still hold admission.
@@ -291,35 +184,6 @@ pub fn heldExclusive(out: []AdmitCand, lists: []const []const *Slot, exclusive: 
         out[n] = .{ .model = @intFromPtr(s.model), .exclusive = true };
         n += 1;
     };
-    return n;
-}
-
-/// One pending-drain candidate (or live decoding slot), reduced to what
-/// admission needs: an opaque model identity + the exclusive-decode bit.
-pub const AdmitCand = struct { model: usize, exclusive: bool };
-
-/// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
-/// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
-/// admitted exclusive candidate claimed it this tick
-/// (a same-tick sibling is not in `decoding` yet — the claim covers the
-/// window). Non-exclusive candidates always admit — no head-of-line
-/// blocking behind a held exclusive request. Writes admitted candidate
-/// indices to `out` (queue order preserved), returns the count. Held
-/// candidates stay where they are and retry next tick; no release
-/// bookkeeping exists — the busy signal IS presence in `decoding`.
-pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out: []usize) usize {
-    var n: usize = 0;
-    outer: for (cands, 0..) |c, i| {
-        if (n >= out.len) break;
-        if (c.exclusive) {
-            for (active) |a| if (a.exclusive and a.model == c.model) continue :outer;
-            for (out[0..n]) |j| {
-                if (cands[j].exclusive and cands[j].model == c.model) continue :outer;
-            }
-        }
-        out[n] = i;
-        n += 1;
-    }
     return n;
 }
 
@@ -434,7 +298,7 @@ pub fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
     var live = false;
     var outstanding: u64 = 0;
     for (sch.decoding.items) |s| {
-        if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+        if (!s.joinsTick()) continue;
         live = true;
         outstanding +|= slotOutstandingGrowth(s);
     }
@@ -498,50 +362,6 @@ test "a resident MiMo batches decode in groups of the FP8 GEMV's row-identical w
     try testing.expectEqual(MAX_BATCH_GROUP, batchGroupCap(&cfg));
 }
 
-test "batchedKvKeepCount: padding waste caps the group, and the long slots are the ones dropped" {
-    // Even lengths: no padding waste, everybody batches.
-    try testing.expectEqual(@as(usize, 4), batchedKvKeepCount(&[_]u32{ 1000, 1000, 1000, 1000 }));
-    try testing.expectEqual(@as(usize, 4), batchedKvKeepCount(&[_]u32{ 900, 1000, 1100, 1200 }));
-
-    // The case this exists for: three short streams and one long one. Batching
-    // all four pads to 4 x 100000 = 400k against 103k useful (3.9x); dropping
-    // the long one leaves 3 x 1000 vs 3000 (1.0x).
-    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 1000, 1000, 1000, 100_000 }));
-
-    // Two long ones: the pair still batches together, since 2 x 100000 against
-    // 200000 useful wastes nothing — the veto is about the padding, not length.
-    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&[_]u32{ 100_000, 100_000 }));
-    // One short slot among two long ones still batches: 3 x 100000 padded
-    // against 200010 useful is 1.5x, inside the bar. The veto is about the
-    // WASTE the padding creates, not about any slot being an outlier.
-    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 10, 100_000, 100_000 }));
-
-    // One slot never "batches", and neither does an empty group.
-    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{1000}));
-    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{}));
-
-    // Nothing prefilled yet: no padding to waste, so nothing is vetoed (the
-    // ready gate, not this one, is what keeps unprefilled slots out).
-    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
-
-    // A pathological pair degrades to no batch at all rather than making the
-    // 1-token slot build a 200k-wide tensor nobody billed. This is why the bar
-    // has to sit below 2.0 — at 2.0 a pair is unvetoable by construction.
-    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{ 1, 200_000 }));
-}
-
-test "groupKeepCount: the small-pad floor keeps a group whole only at long context" {
-    // A long stream billed at the gather arm's 2052-row cap beside two short sub-agents: 3x pad.
-    const billed = [_]u32{ 10, 10, 2052 };
-    try testing.expectEqual(@as(usize, 2), groupKeepCount(&billed, PAD_FREE_MIN_CTX - 1));
-    try testing.expectEqual(@as(usize, 3), groupKeepCount(&billed, PAD_FREE_MIN_CTX));
-    // Past the floor's billed bound the cap holds at any context.
-    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV + 1 }, 300_000));
-    try testing.expectEqual(@as(usize, 2), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV }, 300_000));
-    // A group of one never batches.
-    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{2052}, 300_000));
-}
-
 test "the batched group is capped by padding waste: the longest slot sorts last and falls out" {
     var slots: [3]Slot = undefined;
     var group: [3]*Slot = undefined;
@@ -583,7 +403,7 @@ test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.ste
     for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, null));
 
     try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&kv_lens));
-    try testing.expect(batchedPadWaste(&kv_lens) > MAX_PAD_WASTE);
+    try testing.expect(batchedPadWaste(&kv_lens) > sched_policy.MAX_PAD_WASTE);
 
     try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
     try testing.expectEqual(@as(f64, 1.0), batchedPadWaste(&[_]u32{ 0, 0, 0 }));
@@ -615,85 +435,6 @@ test "an attention-first trunk's batching lengths are unchanged by the fix" {
     );
 }
 
-test "admitPendingTick: exclusive single-flight FIFO contract" {
-    const A: usize = 0xA0;
-    const B: usize = 0xB0;
-    var out: [16]usize = undefined;
-
-    // Held while a live slot on the same exclusive model is decoding.
-    {
-        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
-    }
-    // Admits once no live slot holds the model.
-    {
-        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
-        try testing.expectEqual(@as(usize, 0), out[0]);
-    }
-    // Two exclusive candidates on the SAME model in one tick: only the
-    // first admits — the tick-claim covers slots not yet in `decoding`.
-    {
-        const cands = [_]AdmitCand{
-            .{ .model = A, .exclusive = true },
-            .{ .model = A, .exclusive = true },
-        };
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
-        try testing.expectEqual(@as(usize, 0), out[0]);
-    }
-    // Distinct exclusive models admit independently.
-    {
-        const cands = [_]AdmitCand{
-            .{ .model = A, .exclusive = true },
-            .{ .model = B, .exclusive = true },
-        };
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &out));
-        try testing.expectEqual(@as(usize, 0), out[0]);
-        try testing.expectEqual(@as(usize, 1), out[1]);
-    }
-}
-
-test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
-    const A: usize = 0xA0;
-    const L: usize = 0x10;
-    var out: [16]usize = undefined;
-
-    // Non-exclusive candidates (per-slot state) admit freely
-    // even beside live slots — their serial-tick interleave is safe.
-    {
-        const cands = [_]AdmitCand{
-            .{ .model = L, .exclusive = false },
-            .{ .model = L, .exclusive = false },
-        };
-        const active = [_]AdmitCand{.{ .model = L, .exclusive = false }};
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &active, &out));
-    }
-    // A held exclusive candidate must not head-of-line-block a later
-    // candidate on another model (requests for OTHER models keep flowing).
-    {
-        const cands = [_]AdmitCand{
-            .{ .model = A, .exclusive = true },
-            .{ .model = L, .exclusive = false },
-        };
-        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
-        try testing.expectEqual(@as(usize, 1), out[0]);
-    }
-    // `out` caps the admitted count (mirrors to_prefill's 16), in order.
-    {
-        const cands = [_]AdmitCand{
-            .{ .model = L, .exclusive = false },
-            .{ .model = L, .exclusive = false },
-            .{ .model = L, .exclusive = false },
-        };
-        var small: [2]usize = undefined;
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &small));
-        try testing.expectEqual(@as(usize, 0), small[0]);
-        try testing.expectEqual(@as(usize, 1), small[1]);
-    }
-}
-
 test "a cancelled or queued-for-cleanup slot still blocks exclusive admission until released" {
     const Fake = struct {
         fn exclusive(_: *const Slot) bool {
@@ -718,17 +459,6 @@ test "a cancelled or queued-for-cleanup slot still blocks exclusive admission un
     const cleanup = [_]*Slot{&queued};
     try testing.expectEqual(@as(usize, 3), heldExclusive(&out, &.{ &decoding, &cleanup }, Fake.exclusive));
     try testing.expectEqual(@as(usize, 0), heldExclusive(&out, &.{ &.{}, &.{} }, Fake.exclusive));
-}
-
-test "S21: a released module head drops the slot's exclusivity, and the MODEL bit is untouched" {
-    try testing.expect(headExclusiveFor(false, true, true, false));
-    try testing.expect(!headExclusiveFor(false, true, true, true));
-    try testing.expect(!headExclusiveFor(false, true, false, false));
-    try testing.expect(!headExclusiveFor(false, true, false, true));
-    try testing.expect(!headExclusiveFor(false, false, true, false));
-    try testing.expect(!headExclusiveFor(false, false, true, true));
-    try testing.expect(headExclusiveFor(true, false, false, true));
-    try testing.expect(headExclusiveFor(true, true, true, true));
 }
 
 test "postEvictionPrefillChunk: the re-asked width is the one that runs, in BOTH directions" {
