@@ -120,9 +120,6 @@ test "arch_state and arch_ctx have a field per enabled arch, its declared type o
 /// Fields of the engine handles that still name an arch: each arch's S3 stage moves its own into `arch_state` /
 /// `arch_ctx` and deletes its lines here. Empty means the seam is done.
 const arch_named_fields = [_][]const u8{
-    "Trunk.dsv41",
-    "Trunk.dsv41_experts",
-    "Trunk.dsv41_stq_experts",
     "Trunk.qwen4",
     "Trunk.qwen4_stream_f32",
     "Trunk.qwen4_mixer",

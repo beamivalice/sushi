@@ -1,6 +1,7 @@
 //! deepseek_v41 routed experts over the shared expert cache: the checkpoint's own e2m1 experts are read
 //! from their shards into slabs and gathered as MLX `mxfp4`, one layer at a time.
 const std = @import("std");
+const dsv41_state = @import("dsv41_state.zig");
 const mlx = @import("../mlx.zig");
 const stream = @import("../expert_stream.zig");
 const cfg_mod = @import("dsv41_config.zig");
@@ -496,7 +497,7 @@ test "dsv41 shell: the transformer serves the streamed model's logits through fo
         for (exp, got) |a, b| try testing.expectEqual(a, b);
     }
     try xfm.resetCache();
-    try testing.expectEqual(@as(usize, 0), (try model.ensureState(xfm.dsv41.?)).n);
+    try testing.expectEqual(@as(usize, 0), (try model.ensureState(dsv41_state.modelOf(&xfm).?)).n);
 }
 
 /// `DSV41_STQ_TINY`: the tiny STQ pack (PAIR1 experts in rate groups, SPEC1 trunk, affine embedding), with the FP4
@@ -2247,7 +2248,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
     defer weights.deinit();
     var xfm = try Transformer.init(io, testing.allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.dsv41_stq_experts != null and xfm.dsv41.?.head.stq != null);
+    try testing.expect(dsv41_state.stqExpertsOf(&xfm) != null and dsv41_state.modelOf(&xfm).?.head.stq != null);
 
     var at: usize = 0;
     for ([_]usize{ 25, 1, 1, 7, 1 }) |n| {
@@ -2383,11 +2384,11 @@ fn borrowCase(cache_bytes: u64) !void {
     defer xfm.deinit();
     const engine = xfm.expert_stream.?;
     const last: u16 = @intCast(config.dsv41.?.layers - 1);
-    try testing.expectEqual(@as(u16, @intCast(xfm.dsv41.?.ced_split.?)), engine.borrow_from);
+    try testing.expectEqual(@as(u16, @intCast(dsv41_state.modelOf(&xfm).?.ced_split.?)), engine.borrow_from);
 
     // The first chunk finds the need less one and a half of the last two pools: those two go, the rest stay.
     const first = 25;
-    const need = borrow.prefillNeed(&xfm.dsv41.?.cfg, first, first);
+    const need = borrow.prefillNeed(&dsv41_state.modelOf(&xfm).?.cfg, first, first);
     BorrowProbe.engine = engine;
     try testing.expectEqual(cache_bytes == 64 << 20, engine.plan.resident);
     BorrowProbe.base = need + engine.unionPending() - engine.poolBytes(last) - engine.poolBytes(last - 1) / 2;

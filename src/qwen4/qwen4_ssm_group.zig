@@ -1376,7 +1376,6 @@ test "persistent group: a qwen4 forwardWith releases a bound member between batc
     p_xfm.arch = tag;
     p_xfm.arch_state = .{};
     p_xfm.qwen4 = null;
-    p_xfm.dsv41 = null;
     p_xfm.expert_stream = null;
     p_xfm.moe_layers = &.{};
     p_xfm.emb_w = .{ .ctx = null };

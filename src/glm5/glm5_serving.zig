@@ -326,7 +326,6 @@ test "a streamed GLM load keeps its one teacher stream exclusive" {
     var t: Transformer = undefined;
     t.arch = arch_registry.ofModelType("glm5_next") orelse return error.SkipZigTest;
     t.qwen4 = null;
-    t.dsv41 = null;
     t.expert_stream = null;
     var glm: glm5_mod.Model = undefined;
     glm.expert_stream = null;

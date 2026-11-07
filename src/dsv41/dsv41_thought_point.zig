@@ -1,6 +1,7 @@
 const std = @import("std");
+const dsv41_state = @import("dsv41_state.zig");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const transformer_mod = @import("../trunk.zig");
 const generate_mod = @import("../generate.zig");
 const model_mod = @import("../model.zig");
 const prefix_cache_mod = @import("../prefix_cache.zig");
@@ -114,7 +115,7 @@ test "a streamed DeepSeek load bills its union workspace and MLX pool and no fil
 /// DeepSeek's request state lives in the model, not in `slot.cache` (a one-byte-a-token row marker): its window
 /// rings, compressed and index rows, DSpark windows, and the live restore points the request keeps.
 pub fn dsv41StateBytes(s: *const Slot) u64 {
-    const dsv = (s.model.transformer orelse return 0).dsv41 orelse return 0;
+    const dsv = (s.model.transformer orelse return 0).arch_state.dsv41.model orelse return 0;
     var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41_model.zig").stateBytes(st) else 0;
     if (s.model.prefix_cache) |*hc| bytes += dsv41_prefix.liveBytes(hc);
     return bytes;
@@ -123,7 +124,7 @@ pub fn dsv41StateBytes(s: *const Slot) u64 {
 /// The request over a DeepSeek model's state finished with `tokens`: its record is published, and the idle flush armed
 /// when the record holds points that are not on SSD.
 pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, tokens: []const u32) void {
-    const dsv = (slot.model.transformer orelse return).dsv41 orelse return;
+    const dsv = (slot.model.transformer orelse return).arch_state.dsv41.model orelse return;
     const media = prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start);
     if (dsv41_prefix.publishLiveDsv41(hc, dsv, tokens, slot.has_tools, media, slot.cache.config)) sch.live_unflushed.store(true, .release);
 }
@@ -153,7 +154,7 @@ pub fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) 
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     const xfm = slot.model.transformer orelse return;
     const tok = slot.model.tokenizer orelse return;
-    const dsv = xfm.dsv41 orelse return;
+    const dsv = dsv41_state.modelOf(xfm) orelse return;
     if (thought < dsv41_prefix.min_thought_tokens) {
         log.debug("[dsv41-prefix] no decode restore point: a {d}-token thought is cheaper to prefill than to keep\n", .{thought});
         return;
@@ -257,10 +258,12 @@ test "a cancelled DeepSeek slot commits when it is culled and not again at the c
             commits += 1;
         }
     };
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var sch: Scheduler = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm: Transformer = undefined;
-    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    xfm.arch_state = .{};
+    xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
     xfm.config = .{ .model_type = "deepseek_v41" };
     var slot: Slot = undefined;
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
@@ -285,10 +288,12 @@ test "a finished DeepSeek slot is not committed again by the cull" {
             commits += 1;
         }
     };
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var sch: Scheduler = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm: Transformer = undefined;
-    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    xfm.arch_state = .{};
+    xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
     xfm.config = .{ .model_type = "deepseek_v41" };
     var slot: Slot = undefined;
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
@@ -341,7 +346,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     _ = mlx.mlx_array_free(try dsv41_model.extend(m, ids[0..40], .last));
 
     var xfm: Transformer = undefined;
-    xfm.dsv41 = m;
+    xfm.arch_state.dsv41.model = m;
     xfm.config = .{ .model_type = "deepseek_v41" };
     var model: model_registry_mod.LoadedModel = undefined;
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(a, 2);

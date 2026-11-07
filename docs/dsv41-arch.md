@@ -539,6 +539,12 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   `[collapsed stream, markov embedding]`. `draft(m, t1, with_heads)` returns the picks, and the biased logits and
   confidence when asked; both are pinned to the reference (`ds_*` in the fixture, QAT off to 1e-4/2e-3 of the peak, QAT on
   to a cosine over the reference's own main rows).
+- **State and entries.** The model and its expert streams are `dsv41_state.State`, `Trunk.arch_state.dsv41`; shared code
+  reads them through `dsv41_state.modelOf` and `stqExpertsOf`. A round calls `dsv41_serving.dsv41DraftImpl`, `VerifyImpl`
+  and `FinishImpl` directly: the trunk has no DeepSeek method. `State.deinit` calls `Model.deinit`, which frees the model
+  itself, and destroys the streams without a `deinit` of their own (a `Stream` holds no resource; the engine is the
+  trunk's `expert_stream`): both are intended. DeepSeek has no draft head: `lmHeadForDraft` refuses by name, and no
+  caller reaches it (DFlash2 is not one of its drafters).
 - **A round** (`Generator.nextDspark`): draft from the pending token, verify `[t1, drafts]` as one chunk through the
   normal forward and the streamed experts (`dsv41_model.verify`), keep the longest prefix the trunk's own masked argmax
   agrees with plus the argmax after it (`finishVerify`). The chunk is cut to the tokens the budget still allows.
@@ -891,7 +897,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   it would copy the rows past its last whole segment into its own file, again for every point, and a follow-up turn rolls
   back to it from RAM instead of reading it. Each logs `[dsv41-prefix] restore points to
   SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
-- **Namespace**: `dsv41_prefix.layoutKey` (`model_load.diskLayoutKey`) is `namespaceTag` (`dsv41-state-v4`, or
+- **Namespace**: `dsv41_prefix.layoutKey` (through the `dsv41_prefix.diskLayoutKey` hook that `model_load.diskLayoutKey` asks) is `namespaceTag` (`dsv41-state-v4`, or
   `dsv41-state-v5-dspark` when the stages are resident: the per-row attention split moved the verify rows' bytes; the tags moved
   when segments became shared between entries and points started to be flushed lazily, and no reader of the old layout exists), then `-simd` when the SIMD attention kernel serves, `-composed` for a
   `SUSHI_DSV41_COMPOSED=1` boot, `-dsparkinexact` for `SUSHI_DSV41_DSPARK_EXACT=0` with DSpark, then the drop list and

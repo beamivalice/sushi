@@ -1,4 +1,5 @@
 const std = @import("std");
+const dsv41_state = @import("dsv41_state.zig");
 const settings_resolve = @import("../settings_resolve.zig");
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
@@ -33,7 +34,7 @@ const dsv41_max_drafts = dsv41_dspark.dsv41_max_drafts;
 const dsv41_max_verify_rows = dsv41_dspark.dsv41_max_verify_rows;
 const parseDsparkDiag = dsv41_dspark.parseDsparkDiag;
 
-test "SUSHI_DSV41_DSPARK_ROWS never forces a verify wider than dsv41Verify accepts" {
+test "SUSHI_DSV41_DSPARK_ROWS never forces a verify wider than dsv41VerifyImpl accepts" {
     const limit = dsv41_max_verify_rows;
     try testing.expectEqual(DsparkDiag{ .rows = limit }, parseDsparkDiag("17"));
     try testing.expectEqual(DsparkDiag{ .rows = limit }, parseDsparkDiag("255"));
@@ -65,7 +66,7 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.dsv41.?.dspark != null and xfm.moduleStateSpecRollback());
+    try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null and xfm.moduleStateSpecRollback());
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
@@ -325,7 +326,7 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.dsv41.?.dspark != null);
+    try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
@@ -354,14 +355,14 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
     }
 
     // `SUSHI_DSV41_DSPARK_EXACT=0` still decodes a whole request; its text may differ with the round mix.
-    dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+    dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, false);
     try xfm.resetCache();
     var fast = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
     defer fast.deinit(a);
     var n: usize = 0;
     while (try fast.nextDspark(a)) |r| {
         defer a.free(r.tokens);
-        for (r.tokens) |t| try testing.expect(t < xfm.dsv41.?.cfg.vocab);
+        for (r.tokens) |t| try testing.expect(t < dsv41_state.modelOf(&xfm).?.cfg.vocab);
         n += r.tokens.len;
     }
     try testing.expectEqual(@as(usize, want), n);
@@ -393,7 +394,7 @@ test "dsv41 generator: a seeded sampled request verifies at one width whatever t
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 60;
-    dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+    dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, false);
 
     const Perturb = enum { none, dear, cheap, owed };
     var base_hist: [dsv41_max_drafts + 2]u32 = undefined;
@@ -502,7 +503,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
             // No round runs past the id, and the state stands on the committed tokens, so a restore point can be taken there.
             if (armed) if (std.mem.indexOfScalar(u32, r.tokens, end_id)) |at| {
                 try testing.expectEqual(r.tokens.len - 1, at);
-                var cp = try dsv41_prefix.capture(a, xfm.dsv41.?, prompt.len + total);
+                var cp = try dsv41_prefix.capture(a, dsv41_state.modelOf(&xfm).?, prompt.len + total);
                 cp.deinit(a);
                 ended_rounds += 1;
                 gen.dspark_round_ends_at = null;
@@ -589,7 +590,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
             @memcpy(next_buf[0..prompt.len], &prompt);
             @memcpy(next_buf[prompt.len..point], gen.generated_ids.items);
             @memcpy(next_buf[point .. point + suffix.len], &suffix);
-            want_logits = try dsv41_model.extend(xfm.dsv41.?, &suffix, .all);
+            want_logits = try dsv41_model.extend(dsv41_state.modelOf(&xfm).?, &suffix, .all);
             break;
         }
     }
@@ -633,7 +634,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
             if (!armed or r.tokens[r.tokens.len - 1] != end_id) continue;
             gen.dspark_round_ends_at = null;
             try testing.expectEqual(point, prompt.len + gen.generated_ids.items.len);
-            try dsv41_prefix.writeDecodePointDsv41(&hc, &cache, xfm.dsv41.?, next[0..point], false, .{}, s);
+            try dsv41_prefix.writeDecodePointDsv41(&hc, &cache, dsv41_state.modelOf(&xfm).?, next[0..point], false, .{}, s);
             written = true;
         }
         try testing.expect(written);
@@ -666,10 +667,10 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     var target = try KVCache.initWithConfig(a, config.num_hidden_layers, trunk_mod.KVQuantConfig.engine_default);
     defer target.deinit();
     var moe: usize = 0;
-    const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &moe, xfm.dsv41.?, s, next, false, 0, null, &.{}, 9, false);
+    const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &moe, dsv41_state.modelOf(&xfm).?, s, next, false, 0, null, &.{}, 9, false);
     try testing.expectEqual(point, res.matched);
     try testing.expect(hc.last_restored_disk_id != null);
-    const got = try dsv41_model.extend(xfm.dsv41.?, &suffix, .all);
+    const got = try dsv41_model.extend(dsv41_state.modelOf(&xfm).?, &suffix, .all);
     defer _ = mlx.mlx_array_free(got);
     try glm5_forward.expectArrayBits(want_logits.?, got);
 }
@@ -811,7 +812,7 @@ fn lazyHeadSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, s
     var tok = try argmaxHost(xfm, lg);
     _ = mlx.mlx_array_free(lg);
     try run.tokens.append(a, tok);
-    const vocab = xfm.dsv41.?.cfg.vocab;
+    const vocab = dsv41_state.modelOf(xfm).?.cfg.vocab;
     for (0..steps) |_| {
         ctx.lazy_logits = lazy;
         lg = try forwardIds(xfm, &ctx, &.{tok});
@@ -830,7 +831,7 @@ fn lazyHeadSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, s
 fn lazyIdSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, steps: usize, queue: bool) !LazyHeadRun {
     var run: LazyHeadRun = .{};
     errdefer run.deinit(a);
-    const m = xfm.dsv41.?;
+    const m = dsv41_state.modelOf(xfm).?;
     m.lazy_start = queue;
     defer m.lazy_start = true;
     try xfm.resetCache();
@@ -865,7 +866,7 @@ fn lazyIdSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, ste
 
 /// A lazy pass whose token the model refuses (an image id with no image rows) is dropped from the state it was queued on.
 fn droppedStartLeavesNothing(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, token: u32) !void {
-    const m = xfm.dsv41.?;
+    const m = dsv41_state.modelOf(xfm).?;
     const vocab = m.cfg.vocab;
     var logits: [2]std.ArrayList(f32) = @splat(.empty);
     defer for (&logits) |*l| l.deinit(a);
@@ -922,7 +923,7 @@ fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    const m = xfm.dsv41.?;
+    const m = dsv41_state.modelOf(&xfm).?;
     try testing.expectEqual(dspark, m.dspark != null);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -1205,7 +1206,7 @@ fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
         // One-row rounds that do not sum by width are the serial step. The forced commit is one forward whose width
         // depends on the exit state (a spec exit re-feeds t1), so serial decode agrees through the forced ids only;
         // the answer is compared with the same commit followed by serial ticks.
-        dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+        dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, false);
         var serial = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .serial, .{ .temperature = 0.0 });
         defer serial.deinit(a);
         var tail = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .tail, .{ .temperature = 0.0 });
@@ -1221,7 +1222,7 @@ fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
         // Exact rounds (the STQ trunk) give a row the same bytes at every width: any mix, cut by the budget, equals the
         // one-row stream.
         if (!stq) continue;
-        dsv41_model.setDsparkExact(xfm.dsv41.?, true);
+        dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, true);
         var base = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = .{ .rows = 1 } }, .{ .temperature = 0.0 });
         defer base.deinit(a);
         try testing.expectEqual(@as(?usize, budget), base.fired_at);
@@ -1318,7 +1319,7 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
 
     // The first request's own checkpoint at 69 serves the second, which shares 80 tokens with it.
     try xfm.resetCache();
-    try dsv41_prefix.restore(xfm.dsv41.?, &gen.ssm_checkpoints.items[0], &next);
+    try dsv41_prefix.restore(dsv41_state.modelOf(&xfm).?, &gen.ssm_checkpoints.items[0], &next);
     xfm.cache.step = 69;
     var warm_opts = opts;
     warm_opts.ssm_checkpoint_pos_offset = 69;
@@ -1424,7 +1425,7 @@ const TailArm = struct {
         errdefer self.weights.deinit();
         self.xfm = try Transformer.init(io, a, config, &self.weights);
         errdefer self.xfm.deinit();
-        const m = self.xfm.dsv41.?;
+        const m = dsv41_state.modelOf(&self.xfm).?;
         // Wider than a decode-width pass, as the release's window is: a narrower replay reads the ring below its floor.
         m.cfg.window = 20;
         m.s = self.xfm.s;
@@ -1459,7 +1460,7 @@ const TailArm = struct {
     /// The logits of what a request does after restore point `i`: a pass of fewer rows than the window, then decode.
     fn continueAt(self: *TailArm, a: std.mem.Allocator, sc: *@import("dsv41_scope.zig").Scope, i: usize, prompt: []const u32) ![]f32 {
         const dsv41_model = @import("dsv41_model.zig");
-        const m = self.xfm.dsv41.?;
+        const m = dsv41_state.modelOf(&self.xfm).?;
         const cp = &self.gen.ssm_checkpoints.items[i];
         try dsv41_prefix.restore(m, cp, prompt);
         var rows: std.ArrayList(f32) = .empty;
@@ -1511,8 +1512,8 @@ test "dsv41 generator: a prefill that skips the decoder tails nothing reads give
         defer full.destroy(a);
         const lean = try TailArm.start(a, config, dir, &tok, &prompt, c.offset, true);
         defer lean.destroy(a);
-        try testing.expectEqual(@as(u64, 0), full.xfm.dsv41.?.state_only_used);
-        try testing.expectEqual(c.skipped, lean.xfm.dsv41.?.state_only_used);
+        try testing.expectEqual(@as(u64, 0), dsv41_state.modelOf(&full.xfm).?.state_only_used);
+        try testing.expectEqual(c.skipped, dsv41_state.modelOf(&lean.xfm).?.state_only_used);
         try testing.expectEqualSlices(u32, full.tokens.items, lean.tokens.items);
         try testing.expectEqual(@as(usize, 2), full.gen.ssm_checkpoints.items.len);
         try testing.expectEqual(full.gen.ssm_checkpoints.items.len, lean.gen.ssm_checkpoints.items.len);
@@ -1572,8 +1573,8 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     defer gen.deinit(a);
     try testing.expect(count.n > 4);
     // Every forward but the first, the final span included, started with the rows read during the one before it.
-    try testing.expectEqual(@as(u64, count.n - 1), xfm.dsv41.?.engram_ahead_used);
-    try testing.expect(xfm.dsv41.?.engram_ahead == null);
+    try testing.expectEqual(@as(u64, count.n - 1), dsv41_state.modelOf(&xfm).?.engram_ahead_used);
+    try testing.expect(dsv41_state.modelOf(&xfm).?.engram_ahead == null);
 }
 
 test "dsv41 generator: after a DSpark request the slot cache marks its rows and snapshots like the scheduler's commit (DSV41_TINY)" {
@@ -1722,7 +1723,7 @@ test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since
 
     // The draft heads score the whole vocabulary, so the image id is one of their possible picks; this pack's
     // image id is made an id the draft already holds past row 1.
-    const dsv = xfm.dsv41.?;
+    const dsv = dsv41_state.modelOf(&xfm).?;
     var d = try dsv41_serving.dsv41DraftImpl(&xfm, g.next_token_id);
     defer d.deinit();
     const k = for (2..d.ids.len) |i| {
@@ -1875,13 +1876,13 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.dsv41.?.dspark != null);
+    try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null);
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
     const want: u32 = 48;
-    const vocab = xfm.dsv41.?.cfg.vocab;
+    const vocab = dsv41_state.modelOf(&xfm).?.cfg.vocab;
 
     // The reasoning ends on a token the model picks a few steps in, so the boundary lands inside the request.
     var free: std.ArrayList(u32) = .empty;
@@ -1898,7 +1899,7 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
     defer tb.deinit();
 
     // A one-row round is the serial step when the rows do not sum by width, so every token must match.
-    dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+    dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, false);
     for ([_]?u32{ closer, null }) |c| {
         var serial = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, greedy, .serial);
         defer serial.deinit(a);
@@ -1914,7 +1915,7 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
     }
 
     // Exact rounds give a row the same bytes at every width: any mix equals the one-row stream.
-    dsv41_model.setDsparkExact(xfm.dsv41.?, true);
+    dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, true);
     const modes = [_]?DsparkDiag{ .{ .rows = 3 }, .{ .rows = 6 }, .sweep, null };
     for ([_]?u32{ closer, null }) |c| {
         var base = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, greedy, .{ .spark = .{ .rows = 1 } });
@@ -1943,13 +1944,13 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
         try testing.expectEqualSlices(u32, base.tokens.items, got.tokens.items);
         try expectAnswer(a, got);
     }
-    dsv41_model.setDsparkExact(xfm.dsv41.?, false);
+    dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, false);
     var serial = try grammarRun(a, io, &xfm, &tok, prompt, want, &forced_tb, closer, eos_in_reasoning, greedy, .serial);
     defer serial.deinit(a);
     var plain = try grammarRun(a, io, &xfm, &tok, prompt, want, &forced_tb, closer, eos_in_reasoning, greedy, .{ .spark = .{ .rows = 1 } });
     defer plain.deinit(a);
     try testing.expectEqualSlices(u32, serial.tokens.items, plain.tokens.items);
-    dsv41_model.setDsparkExact(xfm.dsv41.?, true);
+    dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, true);
 
     // A sampled request keeps to the grammar and repeats at a forced width.
     const sampled = SamplingParams{ .temperature = 0.8, .seed = 7 };
@@ -1969,7 +1970,7 @@ const WidthProbe = struct {
 
     /// One forward of `ids` as the server runs it: a verify round, or a plain chunk when `plain`.
     fn forward(xfm: *Transformer, ids: []const u32, plain: bool) !A {
-        const m = xfm.dsv41.?;
+        const m = dsv41_state.modelOf(xfm).?;
         const engine = xfm.expert_stream.?;
         const st = try dsv41_model.ensureState(m);
         try @import("dsv41_borrow.zig").beforeForward(engine, &xfm.config, &m.cfg, ids.len, st.n + ids.len);
@@ -2055,7 +2056,7 @@ const WidthProbe = struct {
     }
 
     fn at(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, cont: []const u32, W: usize, verbose: bool) !usize {
-        const m = xfm.dsv41.?;
+        const m = dsv41_state.modelOf(xfm).?;
         // One-row rounds, each traced.
         dsv41_model.resetState(m);
         _ = mlx.mlx_array_free(try forward(xfm, prompt, true));
@@ -2159,7 +2160,7 @@ test "dsv41 DSpark: on the real pack each row of a wide verify is the bits of it
     defer weights.deinit();
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    const m = xfm.dsv41.?;
+    const m = dsv41_state.modelOf(&xfm).?;
     try testing.expect(m.dspark != null);
     var tok = try tokenizer_mod.loadTokenizer(io, a, dir);
     defer tok.deinit();
@@ -2199,7 +2200,7 @@ fn prefetchAt(dir: []const u8, budget_gb: u64, pct: ?u8, cache_bytes: u64) !bool
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
     const on = xfm.expert_stream.?.prefetcher != null;
-    try testing.expectEqual(on, xfm.dsv41.?.prefetch_lead_rows != 0);
+    try testing.expectEqual(on, dsv41_state.modelOf(&xfm).?.prefetch_lead_rows != 0);
     return on;
 }
 

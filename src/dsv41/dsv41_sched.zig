@@ -3,7 +3,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
-const transformer = @import("../transformer.zig");
+const transformer = @import("../trunk.zig");
 const prefix_cache = @import("../prefix_cache.zig");
 const prefix_arch = @import("../arch/prefix.zig");
 const model_registry = @import("../model_registry.zig");
@@ -33,13 +33,13 @@ pub fn modelStateBytes(slot: *const Slot) u64 {
 /// commit at the cleanup drain would publish onto its state.
 pub fn commitsAtCull(slot: *const Slot) bool {
     const xfm = slot.model.transformer orelse return false;
-    return xfm.dsv41 != null;
+    return xfm.arch_state.dsv41.model != null;
 }
 
 /// The cache holds a one-byte-a-token row marker for the model's rows.
 pub fn prepareCommit(slot: *Slot) !void {
     const xfm = slot.model.transformer orelse return;
-    if (xfm.dsv41 == null) return;
+    if (xfm.arch_state.dsv41.model == null) return;
     try dsv41_prefix.markRows(&slot.cache);
 }
 
@@ -54,7 +54,7 @@ pub fn cancelledNeedsCheckpoints() bool {
 
 pub fn restoreTarget(slot: *Slot, xfm: *Transformer) ?sched.RestoreTarget {
     _ = slot;
-    const dsv = xfm.dsv41 orelse return null;
+    const dsv = xfm.arch_state.dsv41.model orelse return null;
     return .{ .rec = prefix_arch.recurrent("dsv41", dsv), .log_tag = "[dsv41-prefix]" };
 }
 
@@ -68,7 +68,7 @@ pub fn writeThrough(
     s: mlx.mlx_stream,
 ) bool {
     _ = entry_id;
-    const dsv = (slot.model.transformer orelse return false).dsv41 orelse return false;
+    const dsv = (slot.model.transformer orelse return false).arch_state.dsv41.model orelse return false;
     dsv41_prefix.writeThroughDsv41(hc, dsv, &slot.cache, prompt, slot.has_tools, media, cps, s, "prefill");
     return true;
 }
@@ -93,13 +93,13 @@ test "an arch whose request state lives in the model restores into it under its 
     var xfm: Transformer = undefined;
     var lm: model_registry.LoadedModel = undefined;
     var slot = sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" });
-    xfm.dsv41 = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
     const target = sched.restoreTarget(&slot, &xfm).?;
     try std.testing.expectEqualStrings("[dsv41-prefix]", target.log_tag);
     try std.testing.expect(!target.takes_dflash and !target.takes_mtp);
     try std.testing.expect(sched.cancelledNeedsCheckpoints(&slot));
     try std.testing.expect(sched.commitsAtCull(&slot));
-    xfm.dsv41 = null;
+    xfm.arch_state.dsv41.model = null;
     try std.testing.expect(sched.restoreTarget(&slot, &xfm) == null);
     try std.testing.expect(!sched.commitsAtCull(&slot));
 }

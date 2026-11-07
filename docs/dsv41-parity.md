@@ -49,7 +49,7 @@ Ranked by what an agent client feels.
 1. **Prompt-lookup rounds.** MTP replaces its draft with a verbatim copy of the context when the suffix matches
    (`mtpLookupChain`); DSpark never does, and agent edits repeat their context. Design: `mtp_lookup.Index` over prompt and
    generated ids, and in `nextDspark` a match with a strong suffix becomes the verify block (up to `ring_slack` = 16 rows,
-   then `dsv41Finish(accepted)` as now); a simple gate (suffix length, expected rows against the 5-row block, since each
+   then `dsv41_serving.dsv41FinishImpl(accepted)` as now); a simple gate (suffix length, expected rows against the 5-row block, since each
    extra row widens the expert union read from SSD). Needs a live measurement of verify ms against rows.
 2. **Prefill throughput.** The routed experts' fill and grouped GEMM are about 55% of a warm chunk
    ([dsv41-arch](dsv41-arch.md#ced)). A layer-ahead read of the next layer's guessed experts was tried and cut: it guessed

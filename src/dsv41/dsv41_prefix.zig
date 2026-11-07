@@ -4,7 +4,7 @@
 //! checkpoint list, thinning, merge and byte bill serve it unchanged.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const transformer = @import("../transformer.zig");
+const transformer = @import("../trunk.zig");
 const model = @import("dsv41_model.zig");
 const expert_usage = @import("expert_usage.zig");
 const testing = std.testing;
@@ -331,6 +331,14 @@ pub fn rowDivisors(allocator: std.mem.Allocator, c: *const @import("dsv41_config
     return divs;
 }
 
+/// The SSD namespace of a loaded DeepSeek model: `layoutKey` over the boot's arms and the expert drop list it names.
+pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, model_dir: []const u8, xfm: *transformer.Transformer) !?[]u8 {
+    var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
+    defer if (drop) |*d| d.deinit();
+    const m = xfm.arch_state.dsv41.model.?;
+    return try layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance);
+}
+
 /// The SSD namespace of one boot: `namespaceTag` plus what changes the numbers a stored state was computed
 /// under. `drop` is the ranked list in use; a non-zero `pick_tolerance` stores states built on cache-dependent
 /// picks, so no exact boot reads them. `attn_nax` is the attention arm that serves: the SIMD arm sums in another
@@ -502,7 +510,7 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
 pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCache, m: *dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, s: mlx.mlx_stream) !void {
     var cps = [1]SSMCheckpoint{try captureShared(self.allocator, m, tokens.len)};
     defer cps[0].deinit(self.allocator);
-    self.writeThroughDsv41(m, cache, tokens, has_tools, media, &cps, s, "decode");
+    writeThroughDsv41(self, m, cache, tokens, has_tools, media, &cps, s, "decode");
 }
 
 /// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
@@ -523,7 +531,7 @@ pub fn releaseLive(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_s
 pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: []const u8) void {
     const hc = if (entry.prefix_cache) |*p| p else return;
     const xfm = entry.transformer orelse return;
-    flushLiveDsv41(hc, xfm.dsv41 orelse return, xfm.s, why);
+    flushLiveDsv41(hc, xfm.arch_state.dsv41.model orelse return, xfm.s, why);
 }
 
 /// Writes the live record's points that are not on SSD yet, while the rows they lean on are still the state's own: all

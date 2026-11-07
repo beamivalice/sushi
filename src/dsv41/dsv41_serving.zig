@@ -1,6 +1,7 @@
 const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
 const dsv41_model = @import("dsv41_model.zig");
+const dsv41_state = @import("dsv41_state.zig");
 const dsv41_stream = @import("dsv41_stream.zig");
 const kernels = @import("dsv41_kernels.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
@@ -52,27 +53,31 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         mdl.profile.?.* = .init(verify_profile);
     }
     var shell = try initModuleShell(allocator, config, s);
+    // Only the trunk half: `shell.arch_state` is filled last, so the model and engine have the errdefers above.
+    errdefer shell.deinitTrunk();
     if (stq) {
         // CED runs the decoder over a chunk's last rows, so a prefill can take the decoder's pools for its working set.
         if (mdl.ced_split) |split| engine.borrow_from = @intCast(split);
         const experts = try allocator.create(dsv41_stream.StqStream);
+        errdefer allocator.destroy(experts);
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg };
         mdl.experts = .{ .hook = experts.hook() };
-        shell.dsv41_stq_experts = experts;
+        shell.arch_state.dsv41.stq_experts = experts;
         try startExpertPrefetch(engine, mdl, config.ssdPrefetchPct());
     } else {
         const experts = try allocator.create(dsv41_stream.Stream);
+        errdefer allocator.destroy(experts);
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg, .act = mdl.act };
         mdl.experts = .{ .hook = experts.hook() };
-        shell.dsv41_experts = experts;
+        shell.arch_state.dsv41.experts = experts;
         if (prefetchIgnoredLine(&config)) |line| log.info("{s}\n", .{line});
     }
-    shell.dsv41 = mdl;
+    shell.arch_state.dsv41.model = mdl;
     shell.expert_stream = engine;
     // A failed warm costs the first requests their compiles, not the load.
     var clock = expert_stream_mod.Clock.init();
     const had_error = mlx.errorPending();
-    if (warmAll(mdl, shell.dsv41_stq_experts)) {
+    if (warmAll(mdl, shell.arch_state.dsv41.stq_experts)) {
         log.info("[dsv41] kernels warmed for 1..{d} rows{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", clock.lap() / std.time.ns_per_ms });
     } else |e| {
         mlx.dropLatchedErrorUnless(had_error);
@@ -178,7 +183,7 @@ pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array
 
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
 pub fn dsv41DraftImpl(self: *Transformer, t1: u32) !dsv41_model.Draft {
-    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
     return dsv41_model.draftHeads(m, t1, .conf);
 }
@@ -186,7 +191,7 @@ pub fn dsv41DraftImpl(self: *Transformer, t1: u32) !dsv41_model.Draft {
 /// Advances the request by `ids` (`[t1, drafts...]`) as a chunk `dsv41Finish` trims; the logits of every row,
 /// f32 `[1, L, vocab]`.
 pub fn dsv41VerifyImpl(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
-    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
@@ -205,7 +210,7 @@ pub fn dsv41VerifyImpl(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !
 
 /// Keeps the first `accepted + 1` rows of the open verify chunk.
 pub fn dsv41FinishImpl(self: *Transformer, ctx: *ForwardCtx, accepted: usize) !void {
-    const m = self.dsv41 orelse return error.Dsv41NoDspark;
+    const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
     try dsv41_model.finishVerify(m, accepted);
     ctx.cache.step = (try dsv41_model.ensureState(m)).n;

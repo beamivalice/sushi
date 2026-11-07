@@ -8,6 +8,7 @@
 //! - `State` (a pointer to the live request state), with `reset`, and the hooks `handover`, `rollbackLive`,
 //!   `restoreDisk` and `restoreEntry`: a lookup restores into it instead of into SSM entries;
 //! - `CacheState`: what the hot cache keeps per cache for this arch (default-initialised, `deinit(allocator)`);
+//! - `diskLayoutKey(allocator, config, model_dir, xfm)`: the SSD namespace key when it names more than the config's tag;
 //! - `checkpointsRequired(config)`, `adoptSpecHead`, `aux` (SSM entry accelerators), `disk` (the QSA-history section).
 const std = @import("std");
 const mlx = @import("../mlx.zig");
@@ -242,6 +243,13 @@ pub fn checkpointsRequired(config: *const model.ModelConfig) bool {
     const tag = registry.ofModelType(config.model_type) orelse return false;
     switch (tag) {
         inline else => |t| return if (comptime @hasDecl(P(t), "checkpointsRequired")) P(t).checkpointsRequired(config) else false,
+    }
+}
+
+/// The stored-state layout the SSD namespace is keyed by, when the loaded arch names more than the config's own tag.
+pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const model.ModelConfig, model_dir: []const u8, xfm: *transformer.Transformer) !?[]u8 {
+    switch (registry.handleOf(xfm)) {
+        inline else => |_, t| return if (comptime @hasDecl(P(t), "diskLayoutKey")) P(t).diskLayoutKey(allocator, config, model_dir, xfm) else null,
     }
 }
 

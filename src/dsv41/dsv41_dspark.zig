@@ -1,4 +1,5 @@
 const std = @import("std");
+const dsv41_state = @import("dsv41_state.zig");
 const dspark_rows = @import("dspark_rows.zig");
 const dsv41_serving = @import("dsv41_serving.zig");
 const generate_mod = @import("../generate.zig");
@@ -39,7 +40,7 @@ pub fn dsparkSeededRows(sampling: sampler.SamplingParams, range: dspark_rows.Ran
 /// Drafts a sampled DSpark round can verify; the checkpoint's block is 5.
 pub const dsv41_max_drafts = 16;
 
-/// The widest verify `dsv41Verify` accepts, a ring slack's rows.
+/// The widest verify `dsv41VerifyImpl` accepts, a ring slack's rows.
 pub const dsv41_max_verify_rows: u8 = @intCast(@import("dsv41_config.zig").ring_slack);
 
 /// The widest verify whose rows are their one-row step's bits: past `project_rows.PROJECT_ROWS_MAX` the trunk linears
@@ -74,7 +75,7 @@ pub fn dsparkDiag() DsparkDiag {
 fn dsparkCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []u32) !usize {
     const remaining = self.max_tokens - self.completion_tokens;
     const cap = @min(drafts.len, remaining -| 1, (self.dspark_copy_rows orelse dsv41_exact_verify_rows) - 1);
-    const block: usize = if (self.xfm.dsv41) |m| m.cfg.dspark.block else return 0;
+    const block: usize = if (dsv41_state.modelOf(self.xfm)) |m| m.cfg.dspark.block else return 0;
     if (cap <= block) return 0;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, @intCast(self.dspark_copy_backoff.width(cap)));
@@ -160,10 +161,10 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     var rows: usize = dsparkRowsForRoom(mtp_plan.rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at), think_room);
     // The draft heads score the whole vocabulary, but only a prompt may carry the image id (the model refuses it
     // without rows), and the trunk never picks it: a draft that holds it ends the chunk before it.
-    if (xfm.dsv41) |m| if (m.cfg.image_token_id != 0) {
+    if (dsv41_state.modelOf(xfm)) |m| if (m.cfg.image_token_id != 0) {
         if (std.mem.indexOfScalar(u32, ids_buf[1..rows], m.cfg.image_token_id)) |at| rows = 1 + at;
     };
-    const vocab: usize = if (xfm.dsv41) |m| m.cfg.vocab else 0;
+    const vocab: usize = if (dsv41_state.modelOf(xfm)) |m| m.cfg.vocab else 0;
     var rows_masked = false;
     if (constraint) |c| {
         var mask_timer = io_util.Stopwatch.init(self.timer.io);
@@ -274,7 +275,7 @@ pub fn dsparkNoteSerial(self: *Generator, why: []const u8) void {
 pub fn dsparkConstrainedEntry(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !ConstrainedEntry {
     if (self.checkBudgetStop()) return .stop;
     const phase = c.pstate.phase;
-    const vocab: usize = if (self.xfm.dsv41) |m| m.cfg.vocab else 0;
+    const vocab: usize = if (dsv41_state.modelOf(self.xfm)) |m| m.cfg.vocab else 0;
     const why: ?[]const u8 = if (c.pstate.recovering)
         "a forced boundary drains"
     else if (phase != .reasoning and phase != .json_body)

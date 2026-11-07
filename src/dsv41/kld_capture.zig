@@ -17,6 +17,7 @@
 //! Rows are appended in window order; a window commits (windows.jsonl) only after every file of its batch is synced,
 //! and a rerun of the same command truncates to the committed windows and continues.
 const std = @import("std");
+const dsv41_state = @import("dsv41_state.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const kld = @import("../kld.zig");
@@ -1034,8 +1035,8 @@ pub fn runLoaded(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld.Opt
 }
 
 pub fn runLoadedMode(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld.Options, batch: u32, chunk: usize, out: *kld.Out, mode: Mode) !void {
-    const m = l.xfm.dsv41 orelse return error.Dsv41ModelMissing;
-    const stream = l.xfm.dsv41_experts orelse return error.Dsv41ModelMissing;
+    const m = dsv41_state.modelOf(&l.xfm) orelse return error.Dsv41ModelMissing;
+    const stream = dsv41_state.expertsOf(&l.xfm) orelse return error.Dsv41ModelMissing;
     const dc = &m.cfg;
     const cwd = std.Io.Dir.cwd();
     if (cwd.access(io, opts.out_dir, .{})) |_| return error.Dsv41CaptureOutputExists else |err| if (err != error.FileNotFound) return err;
@@ -1586,7 +1587,7 @@ test "deepseek_v41 layer-major capture equals the window-major forward byte for 
     const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     const tiny = try TinyLoaded.init(a, io, root);
     defer tiny.deinit();
-    const m = tiny.loaded.xfm.dsv41.?;
+    const m = dsv41_state.modelOf(&tiny.loaded.xfm).?;
     const layers = m.cfg.layers;
 
     var first_dir: ?[]const u8 = null;
@@ -1647,7 +1648,7 @@ test "deepseek_v41 layer-major capture equals the window-major forward byte for 
             }
         }
     }
-    try testing.expect(tiny.loaded.xfm.dsv41_experts.?.pinned_leases > 0);
+    try testing.expect(dsv41_state.expertsOf(&tiny.loaded.xfm).?.pinned_leases > 0);
 }
 
 test "deepseek_v41 layer-major logits are the generic window-major capture's fixture, file for file (DSV41_TINY)" {
@@ -1711,7 +1712,7 @@ test "deepseek_v41 layer-major capture interrupted inside a batch resumes to the
     const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     const tiny = try TinyLoaded.init(a, io, root);
     defer tiny.deinit();
-    const layers = tiny.loaded.xfm.dsv41.?.cfg.layers;
+    const layers = dsv41_state.modelOf(&tiny.loaded.xfm).?.cfg.layers;
 
     try runTiny(a, io, root, tiny, "whole", 3, 4);
     // Batch one is windows 0..2: 2 + 4 + 3 chunk passes per layer.
@@ -1830,7 +1831,7 @@ test "deepseek_v41 layer-major capture: head rows are the head's input for every
     const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     const tiny = try TinyLoaded.init(a, io, root);
     defer tiny.deinit();
-    const m = tiny.loaded.xfm.dsv41.?;
+    const m = dsv41_state.modelOf(&tiny.loaded.xfm).?;
     const layers = m.cfg.layers;
     var tokens: usize = 0;
     for (windows) |w| tokens += w.len;
@@ -1928,7 +1929,7 @@ test "deepseek_v41 layer-major capture on the composed op chains writes the imat
     const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     const tiny = try TinyLoaded.init(a, io, root);
     defer tiny.deinit();
-    const m = tiny.loaded.xfm.dsv41.?;
+    const m = dsv41_state.modelOf(&tiny.loaded.xfm).?;
     m.fused = false;
 
     var rec = try Recorder.init(a, m.s, &m.cfg);
@@ -2022,7 +2023,7 @@ test "kld: a deepseek_v41 teacher captures and compare reads it back, fused agai
 
     var quiet: kld.Out = .{ .silent = true };
     const teacher = try std.fmt.allocPrint(arena, "{s}/teacher", .{root});
-    dsv41_model.setFused(loaded.xfm.dsv41.?, true);
+    dsv41_model.setFused(dsv41_state.modelOf(&loaded.xfm).?, true);
     try kld.runCapture(io, allocator, &loaded, .{ .model_dir = root, .prompts = try std.fmt.allocPrint(arena, "{s}/prompts.jsonl", .{root}), .out_dir = teacher, .tokens = 4, .no_template = true }, &quiet);
     var base = try fixture_mod.readBaseline(allocator, io, teacher);
     defer base.deinit();
@@ -2030,7 +2031,7 @@ test "kld: a deepseek_v41 teacher captures and compare reads it back, fused agai
     try testing.expectEqualStrings("bf16", base.kv_cache_format);
 
     for ([_]bool{ true, false }) |composed| {
-        dsv41_model.setFused(loaded.xfm.dsv41.?, composed);
+        dsv41_model.setFused(dsv41_state.modelOf(&loaded.xfm).?, composed);
         const json_path = try std.fmt.allocPrint(arena, "{s}/compare-{s}.json", .{ root, if (composed) "composed" else "fused" });
         try kld.runCompare(io, allocator, &loaded, .{ .command = .compare, .model_dir = root, .fixture = teacher, .json_out = json_path }, &quiet);
         const text = try std.Io.Dir.cwd().readFileAlloc(io, json_path, arena, .limited(1 << 22));

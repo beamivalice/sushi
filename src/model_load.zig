@@ -17,7 +17,7 @@ const admission = @import("arch/admission.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
-const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
+const prefix_arch = @import("arch/prefix.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const disk_placement = @import("disk_placement.zig");
@@ -613,13 +613,10 @@ pub const VisionCost = struct {
     slots_with: ?u16 = null,
 };
 
-/// The stored-state layout the SSD namespace is keyed by; DeepSeek's names the expert drop list and the lossy pick too.
-fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, xfm: *const transformer_mod.Transformer) !?[]u8 {
-    if (!config.isDsv41()) return if (config.cacheLayoutNamespace()) |tag| try allocator.dupe(u8, tag) else null;
-    var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
-    defer if (drop) |*d| d.deinit();
-    const m = xfm.dsv41.?;
-    return try dsv41_prefix.layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, expert_stream_mod.pick_tolerance);
+/// The stored-state layout the SSD namespace is keyed by: the loaded arch's own key, else the config's tag.
+fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, xfm: *transformer_mod.Transformer) !?[]u8 {
+    if (try prefix_arch.diskLayoutKey(allocator, config, model_dir, xfm)) |key| return key;
+    return if (config.cacheLayoutNamespace()) |tag| try allocator.dupe(u8, tag) else null;
 }
 
 /// The ONE streamed-load plan, read by the serving load, its registry gate and `kld`: the

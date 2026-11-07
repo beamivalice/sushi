@@ -15,5 +15,5 @@ pub const nextDspark = rounds.nextDspark;
 pub const Head = *Transformer;
 
 pub fn headOf(xfm: *Transformer, _: bool, _: ?*anyopaque) ?Head {
-    return if (xfm.dsv41 != null and xfm.dsv41.?.dspark != null) xfm else null;
+    return if (xfm.arch_state.dsv41.model != null and xfm.arch_state.dsv41.model.?.dspark != null) xfm else null;
 }

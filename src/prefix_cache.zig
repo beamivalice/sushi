@@ -664,22 +664,6 @@ pub const HotPrefixCache = struct {
         };
     }
 
-    // Entry points the scheduler, the server and the arch tests still call on the cache by these names. Each
-    // owner moves to the dispatch of `arch/prefix.zig` or to its arch's module, and this block goes with the last.
-    const rows_arch = @import("glm5/glm5_prefix.zig");
-    const state_arch = @import("dsv41/dsv41_prefix.zig");
-    pub const glmCommitLenFor = rows_arch.glmCommitLenFor;
-    pub const glmCommitLen = rows_arch.glmCommitLen;
-    pub const glmDiskLen = rows_arch.glmDiskLen;
-    pub const lookupAndRestoreGlm = rows_arch.lookupAndRestoreGlm;
-    pub const commitGlm = rows_arch.commitGlm;
-    pub const commitGlmTiers = rows_arch.commitGlmTiers;
-    pub const writeThroughGlm = rows_arch.writeThroughGlm;
-    pub const lookupAndRestoreDsv41 = state_arch.lookupAndRestoreDsv41;
-    pub const writeThroughDsv41 = state_arch.writeThroughDsv41;
-    pub const writeDecodePointDsv41 = state_arch.writeDecodePointDsv41;
-    pub const publishLiveDsv41 = state_arch.publishLiveDsv41;
-
     pub fn deinit(self: *HotPrefixCache) void {
         for (self.entries.items) |*e| {
             freeEntryOwnedState(self.allocator, e);

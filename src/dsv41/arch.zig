@@ -57,12 +57,12 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
 }
 
 pub fn deinit(xfm: Model) void {
-    dsv41_state.deinit(xfm);
+    xfm.arch_state.dsv41.deinit(xfm.allocator);
     xfm.deinitTrunk();
 }
 
 pub fn resetCache(xfm: Model) !void {
-    dsv41_state.reset(xfm);
+    xfm.arch_state.dsv41.reset();
     return xfm.resetTrunk();
 }
 
@@ -71,11 +71,14 @@ pub fn warmup(xfm: Model) !void {
 }
 
 pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {
-    return serving.forwardDsv41With(xfm, ctx, ids, xfm.dsv41.?);
+    return serving.forwardDsv41With(xfm, ctx, ids, xfm.arch_state.dsv41.model.?);
 }
 
+// DeepSeek drafts with DSpark from its own stages and loads no DFlash drafter, so nothing projects through the shell's
+// empty head.
 pub fn lmHeadForDraft(xfm: Model, x: mlx.mlx_array) !mlx.mlx_array {
-    return xfm.lmHeadProject(x, false);
+    _ = .{ xfm, x };
+    return error.DraftHeadUnsupported;
 }
 
 pub fn ownsModuleDecodeState(xfm: Model) bool {

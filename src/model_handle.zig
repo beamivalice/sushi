@@ -17,6 +17,7 @@ const arch_life = @import("arch/life.zig");
 const arch_request = @import("arch/request.zig");
 const arch_registry = @import("arch/registry.zig");
 const arch_state = @import("arch/arch_state.zig");
+const dsv41_state = @import("dsv41/dsv41_state.zig");
 
 // ── Forward context ──
 //
@@ -232,7 +233,7 @@ pub fn moduleStateSpecRollback(self: *const Trunk) bool {
     // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
     // head's verify can rewind. dsv4 cannot. deepseek_v41 cuts its own rows
     // back to the accepted prefix (`dsv41_model.finishVerify`).
-    if (self.dsv41) |m| return m.dspark != null;
+    if (dsv41_state.modelOf(self)) |m| return m.dspark != null;
     return self.qwen4_mtp != null;
 }
 

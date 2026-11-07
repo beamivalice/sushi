@@ -44,6 +44,7 @@ const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
 const glm5_generate = @import("glm5/glm5_generate.zig");
 const glm5_state = @import("glm5/glm5_state.zig");
+const dsv41_state = @import("dsv41/dsv41_state.zig");
 const sampler = @import("sampler.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const mtp_plan = @import("mtp_plan.zig");
@@ -421,7 +422,7 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 /// A prefill checkpoint at absolute `pos`: the slot's SSM entries, the GLM request's KDA state, or DeepSeek's whole request state.
 /// `to_ssd`: a write-through takes the point to the SSD tier before the next forward, so DeepSeek's shares its rows.
 fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Transformer, ctx: *const ForwardCtx, glm: ?*glm5_forward.Request, pos: usize, to_ssd: bool) !SSMCheckpoint {
-    if (xfm.dsv41) |m| return if (to_ssd and pos >= @import("kv_disk_cache.zig").MIN_PERSIST_TOKENS) dsv41_prefix.captureShared(allocator, m, pos) else dsv41_prefix.capture(allocator, m, pos);
+    if (dsv41_state.modelOf(xfm)) |m| return if (to_ssd and pos >= @import("kv_disk_cache.zig").MIN_PERSIST_TOKENS) dsv41_prefix.captureShared(allocator, m, pos) else dsv41_prefix.capture(allocator, m, pos);
     if (glm) |request| {
         if (request.offset != pos) return error.GlmCachePositionMismatch;
         return glm5_prefix.captureKda(allocator, request, xfm.s);
@@ -1395,7 +1396,7 @@ pub const Generator = struct {
         const glm_request = glm5_state.requestOf(&ctx);
         const want_ssm_cp = prefill_plan.shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
-            (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null or xfm.dsv41 != null,
+            (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null or dsv41_state.modelOf(xfm) != null,
             has_vision,
         );
         // The snapshot backoff: a checkpoint AT the prompt end is
@@ -1622,7 +1623,7 @@ pub const Generator = struct {
                     prefill_plan.nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 // The model reads the next forward's Engram rows while this chunk runs: the next chunk, or the final span.
-                if (xfm.dsv41 != null) {
+                if (dsv41_state.modelOf(xfm) != null) {
                     const ahead_end = if (end < loop_end)
                         prefill_plan.nextChunkEnd(end, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                     else
@@ -1889,7 +1890,7 @@ pub const Generator = struct {
                         return e;
                     };
                     // DeepSeek's shared point leaves before the final span appends to the rows it views.
-                    if (xfm.dsv41 != null) if (options.write_through_hook) |wt| wt.call(wt.ctx, final_abs, ssm_checkpoints.items);
+                    if (dsv41_state.modelOf(xfm) != null) if (options.write_through_hook) |wt| wt.call(wt.ctx, final_abs, ssm_checkpoints.items);
                     ssm_cp_peak = @max(ssm_cp_peak, @as(u32, @intCast(ssm_checkpoints.items.len)));
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
@@ -2080,7 +2081,7 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .dspark = options.dspark_enabled and dsv41_dspark.dsparkEligible(sampling, options.logprobs_n),
                 .dspark_diag = dsv41_dspark.dsparkDiag(),
-                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, if (xfm.dsv41) |m| m.cfg.dspark.block else 5),
+                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, if (dsv41_state.modelOf(xfm)) |m| m.cfg.dspark.block else 5),
             };
             gen.pending_logits = logits;
             gen.has_pending_logits = true;
@@ -2234,7 +2235,7 @@ pub const Generator = struct {
                 .prompt_ids_alloc = allocator,
                 .dspark = options.dspark_enabled and dsv41_dspark.dsparkEligible(sampling, options.logprobs_n),
                 .dspark_diag = dsv41_dspark.dsparkDiag(),
-                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, if (xfm.dsv41) |m| m.cfg.dspark.block else 5),
+                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, if (dsv41_state.modelOf(xfm)) |m| m.cfg.dspark.block else 5),
             };
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;

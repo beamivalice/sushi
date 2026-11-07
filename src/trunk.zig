@@ -1,7 +1,4 @@
 const std = @import("std");
-const dsv41_model = @import("dsv41/dsv41_model.zig");
-const dsv41_stream = @import("dsv41/dsv41_stream.zig");
-const dsv41_borrow = @import("dsv41/dsv41_borrow.zig");
 const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const expert_usage = @import("dsv41/expert_usage.zig");
@@ -83,10 +80,6 @@ const arch_request = @import("arch/request.zig");
 const arch_admission = @import("arch/admission.zig");
 const arch_registry = @import("arch/registry.zig");
 const arch_state_mod = @import("arch/arch_state.zig");
-const dsv41_serving = @import("dsv41/dsv41_serving.zig");
-const dsv41DraftImpl = dsv41_serving.dsv41DraftImpl;
-const dsv41FinishImpl = dsv41_serving.dsv41FinishImpl;
-const dsv41VerifyImpl = dsv41_serving.dsv41VerifyImpl;
 pub const DenseKVView = kv_cache.DenseKVView;
 pub const KVCache = kv_cache.KVCache;
 pub const KVCacheEntry = kv_cache.KVCacheEntry;
@@ -950,12 +943,6 @@ pub const Trunk = struct {
     // `constTableAs` — the f32 table is what a bf16 forward must NOT multiply
     // by directly.
     yarn_mscale_cast: DtypeCastCache = .{},
-
-    // deepseek_v41: the model owns its one request's state (single flight), its routed experts
-    // stream through `dsv41_experts` over `expert_stream`.
-    dsv41: ?*dsv41_model.Model = null,
-    dsv41_experts: ?*dsv41_stream.Stream = null,
-    dsv41_stq_experts: ?*dsv41_stream.StqStream = null,
 
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
@@ -2454,18 +2441,6 @@ pub const Trunk = struct {
     pub const warmupMimoVerify = mimo_forward.warmupMimoVerify;
     pub const yarnScaleQK = qwen4_forward.yarnScaleQK;
     pub const yarnScaleRotated = qwen4_forward.yarnScaleRotated;
-
-    pub fn dsv41Draft(self: *Trunk, t1: u32) !dsv41_model.Draft {
-        return dsv41DraftImpl(self, t1);
-    }
-
-    pub fn dsv41Verify(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
-        return dsv41VerifyImpl(self, ctx, ids);
-    }
-
-    pub fn dsv41Finish(self: *Trunk, ctx: *ForwardCtx, accepted: usize) !void {
-        return dsv41FinishImpl(self, ctx, accepted);
-    }
 
     /// Free compiled JIT closures (compiled_gelu /
     /// compiled_geglu / compiled_softcap / compiled_moe_routing). They get
