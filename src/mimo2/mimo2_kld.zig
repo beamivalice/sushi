@@ -4,7 +4,7 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const imatrix = @import("../imatrix.zig");
 const kld = @import("../kld.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const testing = std.testing;
 
 pub const imatrix_naming = imatrix.Naming{ .layer_prefix = "model.layers." };
@@ -466,7 +466,7 @@ test "kld: a hidden capture appends every block boundary of each prompt and leav
         defer _ = mlx.mlx_array_free(input);
         var final = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(final);
-        var cl: transformer_mod.CaptureLayers = .{ .ids = &layer_ids, .out = &outs, .input = &input };
+        var cl: trunk_mod.CaptureLayers = .{ .ids = &layer_ids, .out = &outs, .input = &input };
         var ctx = loaded.xfm.defaultCtx();
         ctx.capture_layers = &cl;
         ctx.capture_hidden_all = &final;

@@ -69,6 +69,7 @@ test {
     _ = @import("mimo2/mimo_vision.zig");
     _ = @import("mimo2/mimo_forward.zig");
     _ = @import("mimo2/mimo_fixture_test.zig");
+    _ = @import("mimo2/mimo2_state.zig");
     _ = @import("qwen4/qwen4_gdn.zig");
     _ = @import("qwen4/qwen4_config.zig");
     _ = @import("ssm_cache.zig");

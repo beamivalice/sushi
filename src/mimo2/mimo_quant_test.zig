@@ -1,6 +1,6 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const transformer = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 
 const testing = std.testing;
 
@@ -347,7 +347,7 @@ test "mimo MXFP4 custom gatherQmv declines the native mode" {
     const ids = makeArray(ids_data[0..], &index_shape, .uint32);
     defer _ = mlx.mlx_array_free(ids);
 
-    const declined = try transformer.gatherQmvGateUp(
+    const declined = try trunk_mod.gatherQmvGateUp(
         stream,
         x,
         w,

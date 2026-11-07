@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const mimo_forward = @import("mimo_forward.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const model_mod = @import("../model.zig");
 const mtp_lookup = @import("../mtp_lookup.zig");
@@ -9,7 +10,7 @@ const mimo_mtp = @import("mimo_mtp.zig");
 const mimo_drafter = @import("mimo2_drafter.zig");
 const think_penalty = @import("../think_penalty.zig");
 const logit_bias = @import("../logit_bias.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ThinkPenalty = think_penalty.ThinkPenalty;
 const testing = std.testing;
@@ -47,7 +48,7 @@ test "mtpEvPlanFor: MiMo's surface drafts one on prose and three on code, where 
 test "the MiMo EXL3 round-cost surface serves every KV width, kv6 included, and other layouts stay generic" {
     var xfm: Transformer = undefined;
     const head = MtpHeadRef.of("mimo2", undefined);
-    const kv = transformer_mod.KVQuantConfig;
+    const kv = trunk_mod.KVQuantConfig;
     xfm.config = .{ .expert_layout = .exl3_k4 };
     for ([_]kv{ kv.dense, kv.affine(4), kv.affine(6), kv.affine(8) }) |width| {
         try testing.expectEqual(mtp_mod.MtpCostProfile.mimo_exl3, head.costProfile(&xfm, width));
@@ -88,7 +89,7 @@ fn kvRowsEqual(x: *Transformer, y: *Transformer, layer: usize, rows: usize) !boo
     return true;
 }
 
-fn pldTestTransformer(io: std.Io, config: model_mod.ModelConfig, weights: anytype, kv: transformer_mod.KVQuantConfig) !Transformer {
+fn pldTestTransformer(io: std.Io, config: model_mod.ModelConfig, weights: anytype, kv: trunk_mod.KVQuantConfig) !Transformer {
     var xfm = try Transformer.init(io, testing.allocator, config, weights);
     errdefer xfm.deinit();
     try xfm.cache.reinit(config.num_hidden_layers, kv);
@@ -115,7 +116,7 @@ test "mimo ring marks leave the prefill's logits, cache and greedy tokens unchan
     defer if (config.ngram_table_path) |p| a.free(p);
     var weights = try model_mod.loadWeightsForConfig(io, a, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
-    try transformer_mod.stackMimoFixtureExperts(&weights, config, mlx.gpuStream());
+    try mimo_forward.stackMimoFixtureExperts(&weights, config, mlx.gpuStream());
     model_mod.resolveWeightPrefix(&config, &weights);
     var tok_dummy: Tokenizer = undefined;
     const greedy = SamplingParams{ .temperature = 0.0 };
@@ -123,12 +124,12 @@ test "mimo ring marks leave the prefill's logits, cache and greedy tokens unchan
     var prompt: [1500]u32 = undefined;
     for (&prompt, 0..) |*v, i| v.* = @intCast((i * 7) % config.vocab_size);
     const at = [_]usize{ 300, 700, 1100 };
-    for ([_]transformer_mod.KVQuantConfig{ transformer_mod.KVQuantConfig.dense, transformer_mod.KVQuantConfig.affine(8) }) |kv| {
+    for ([_]trunk_mod.KVQuantConfig{ trunk_mod.KVQuantConfig.dense, trunk_mod.KVQuantConfig.affine(8) }) |kv| {
         var plain = try pldTestTransformer(io, config, &weights, kv);
         defer plain.deinit();
         var marked = try pldTestTransformer(io, config, &weights, kv);
         defer marked.deinit();
-        var marks: [at.len]transformer_mod.KVCacheSnapshot = undefined;
+        var marks: [at.len]trunk_mod.KVCacheSnapshot = undefined;
         var n: usize = 0;
         defer for (marks[0..n]) |*m| m.deinit();
         for (at) |p| {
@@ -165,7 +166,7 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     defer if (config.ngram_table_path) |p| a.free(p);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    try transformer_mod.stackMimoFixtureExperts(&weights, config, mlx.gpuStream());
+    try mimo_forward.stackMimoFixtureExperts(&weights, config, mlx.gpuStream());
     model_mod.resolveWeightPrefix(&config, &weights);
     var mtp_weights = try @import("mimo_source.zig").loadMtpWeights(io, a, dir);
     defer mtp_weights.deinit();
@@ -174,7 +175,7 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const want: usize = 64;
-    const kv = transformer_mod.KVQuantConfig.affine(8);
+    const kv = trunk_mod.KVQuantConfig.affine(8);
     var prompt: [168]u32 = undefined;
     for (&prompt, 0..) |*v, i| v.* = @intCast((i * 7) % config.vocab_size);
 

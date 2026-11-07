@@ -816,7 +816,7 @@ test "mimo vision tiny: the tower matches the reference, with the sink as a bias
     const cos = try cosineSim(out, want, tower.s);
     const ratio = try rmsRatio(out, want, tower.s);
     const cos_other = try cosineSim(out, other, tower.s);
-    if (@import("../transformer.zig").diagEnvOn("SUSHI_MIMO_VISION_DIAG"))
+    if (@import("../trunk.zig").diagEnvOn("SUSHI_MIMO_VISION_DIAG"))
         std.debug.print("[mimo-vit tiny] cos={d:.6} rms_ratio={d:.5} cos_sink_column={d:.5}\n", .{ cos, ratio, cos_other });
     try testing.expect(cos > 0.9995);
     try testing.expect(ratio > 0.99 and ratio < 1.01);
@@ -858,7 +858,7 @@ test "mimo vision real: preprocessing and the bf16 tower match the f32 reference
     var tower = try MimoVision.init(a, config, &weights);
     defer tower.deinit();
     const s = tower.s;
-    const diag = @import("../transformer.zig").diagEnvOn("SUSHI_MIMO_VISION_DIAG");
+    const diag = @import("../trunk.zig").diagEnvOn("SUSHI_MIMO_VISION_DIAG");
 
     const grid = fx.get("grid_thw") orelse return error.MissingFixtureTensor;
     try mlx.check(mlx.mlx_array_eval(grid));

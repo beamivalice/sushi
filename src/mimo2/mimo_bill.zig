@@ -6,7 +6,7 @@ const fp8_block = @import("../fp8_block.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const mtp_mod = @import("../mtp.zig");
 const slot_admission = @import("../slot_admission.zig");
-const transformer_mod = @import("../transformer.zig");
+const mimo_forward = @import("mimo_forward.zig");
 
 
 
@@ -27,7 +27,7 @@ pub fn headRings(config: *const model_mod.ModelConfig) ?u64 {
 /// dense below the packed arms' floor, where a solo tick's rebuild was alone. Zero where decode does not batch.
 pub fn decodeRows(config: *const model_mod.ModelConfig) ?u64 {
     if (!config.supportsBatchedMimoDecode()) return 0;
-    const keys = transformer_mod.mimoGlobalDecodeRebuildMaxKeys();
+    const keys = mimo_forward.mimoGlobalDecodeRebuildMaxKeys();
     var widest: u64 = 0;
     var li: u32 = 0;
     while (li < config.num_hidden_layers) : (li += 1) {

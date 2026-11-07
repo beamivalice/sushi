@@ -1,4 +1,4 @@
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
 const expert_stream_mod = @import("../expert_stream.zig");
 const mlx = @import("../mlx.zig");
@@ -19,12 +19,12 @@ const test_support = @import("../test_support.zig");
 const mimoExpectClose = test_support.mimoExpectClose;
 const qwen4ReadF32 = test_support.qwen4ReadF32;
 const snapshotsBitEqual = test_support.snapshotsBitEqual;
-const CaptureLayers = trf.CaptureLayers;
-const ForwardCtx = trf.ForwardCtx;
-const KVCache = trf.KVCache;
-const MimoExl3MoeHarness = trf.MimoExl3MoeHarness;
-const Transformer = trf.Transformer;
-const loadSwitchMlpBank = trf.loadSwitchMlpBank;
+const CaptureLayers = trunk_mod.CaptureLayers;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const KVCache = trunk_mod.KVCache;
+const MimoExl3MoeHarness = trunk_mod.MimoExl3MoeHarness;
+const Transformer = trunk_mod.Transformer;
+const loadSwitchMlpBank = trunk_mod.loadSwitchMlpBank;
 
 /// Prefill `prefix`, then either decode `rows` ids one tick at a time or verify them in
 /// one `verify_rows` forward; the logits rows, `[rows, vocab]` f32.
@@ -146,9 +146,9 @@ test "mimo_v2 EXL3 real shard routed fork matches CPU dump oracle" {
         var x = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x);
         try mlx.check(mlx.mlx_tile(&x, xb, &.{ 1, rows, 1 }, 3, s));
-        const logits = try h.xfm.mimoRouterLogits(x, &h.mw);
+        const logits = try mimo_forward.mimoRouterLogits(&h.xfm, x, &h.mw);
         defer _ = mlx.mlx_array_free(logits);
-        const routes = try h.xfm.computeMimoRouting(logits, h.mw.expert_bias.?);
+        const routes = try mimo_forward.computeMimoRouting(&h.xfm, logits, h.mw.expert_bias.?);
         defer _ = mlx.mlx_array_free(routes.inds);
         defer _ = mlx.mlx_array_free(routes.norm_scores);
         var ids32 = mlx.mlx_array_new();
@@ -367,7 +367,7 @@ test "mimo v2 fixture full and cached forwards track the HF reference (MIMO_V2_M
         try mimoExpectClose("layer 0 value projection", value_host[0..vrows], truth_v, 5e-4);
         var local_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(local_mask);
-        const attn = try component_xfm.mimoAttnWith(&component_ctx, normed, &lw.attn.full, 0, 0, 1, @intCast(token_count), true, &local_mask, .{ .ctx = null });
+        const attn = try mimo_forward.mimoAttnWith(&component_xfm, &component_ctx, normed, &lw.attn.full, 0, 0, 1, @intCast(token_count), true, &local_mask, .{ .ctx = null });
         defer _ = mlx.mlx_array_free(attn);
         const ours = try qwen4ReadF32(allocator, attn, s);
         defer allocator.free(ours);
@@ -507,7 +507,7 @@ test "mimo batched decode rows equal each slot's own decode tick bit for bit (MI
                     batch_ptrs[i] = &batch_ctx[i];
                 }
                 var hiddens: ?[]mlx.mlx_array = null;
-                const rows = try xfm.forwardMimoBatchedDecode(tokens[0..n], batch_ptrs[0..n], offsets[0..n], &hiddens);
+                const rows = try mimo_forward.forwardMimoBatchedDecode(&xfm, tokens[0..n], batch_ptrs[0..n], offsets[0..n], &hiddens);
                 defer {
                     for (rows) |r| _ = mlx.mlx_array_free(r);
                     a.free(rows);
@@ -571,11 +571,11 @@ test "mimo spec warm-up runs every verify row count on its own slot (MIMO_V2_MOD
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var want: Transformer.MimoWarmRows = 0;
+    var want: mimo_forward.MimoWarmRows = 0;
     var rows: usize = 2;
-    while (rows <= MIMO_VERIFY_ROWS_MAX) : (rows += 1) want |= @as(Transformer.MimoWarmRows, 1) << @intCast(rows);
+    while (rows <= MIMO_VERIFY_ROWS_MAX) : (rows += 1) want |= @as(mimo_forward.MimoWarmRows, 1) << @intCast(rows);
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |kv| {
-        try testing.expectEqual(want, try xfm.warmupMimoVerify(kv));
+        try testing.expectEqual(want, try mimo_forward.warmupMimoVerify(&xfm, kv));
         for (xfm.cache.entries) |e| try testing.expect(!e.initialized);
     }
 }

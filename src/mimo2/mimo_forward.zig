@@ -1,10 +1,10 @@
 //! MiMo-V2 forward: sliding/global attention arms, routed-MoE dispatch, batched decode and verify rows.
 
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const forward_diag = @import("../forward_diag.zig");
 const moe_router = @import("../moe_router.zig");
 const nax_gate = @import("../nax_gate.zig");
-const Transformer = trf.Transformer;
+const Transformer = trunk_mod.Transformer;
 const std = @import("std");
 const fp8_block = @import("../fp8_block.zig");
 const mlx = @import("../mlx.zig");
@@ -24,45 +24,45 @@ const testRandWeightBf16 = test_support.testRandWeightBf16;
 const testReadF32 = test_support.testReadF32;
 const routerRefRow = test_support.routerRefRow;
 
-const DenseKVView = trf.DenseKVView;
-const FUSED256_MIN_Q_LEN = trf.FUSED256_MIN_Q_LEN;
-const ForwardCtx = trf.ForwardCtx;
-const FullAttnWeights = trf.FullAttnWeights;
-const KVCache = trf.KVCache;
-const KV_UNPACK_HEADER = trf.KV_UNPACK_HEADER;
-const KvPrefixView = trf.KvPrefixView;
-const ModelConfig = trf.ModelConfig;
-const MoeMlpWeights = trf.MoeMlpWeights;
-const ProfClock = trf.ProfClock;
-const QSA_ATTN_BK = trf.QSA_ATTN_BK;
-const QSA_SCORE_KERNEL_HEADER = trf.QSA_SCORE_KERNEL_HEADER;
-const QsaAttnCfgKey = trf.QsaAttnCfgKey;
-const SLIDING_TRIM_UNBOUNDED = trf.SLIDING_TRIM_UNBOUNDED;
-const ShapeKey = trf.ShapeKey;
-const bf16Scalar = trf.bf16Scalar;
-const capturePrefillHidden = trf.capturePrefillHidden;
-const capturePrefillHiddenLast = trf.capturePrefillHiddenLast;
-const decodeProfReport = trf.decodeProfReport;
-const decodeProfileEnabled = trf.decodeProfileEnabled;
-const decodeProfileRows = trf.decodeProfileRows;
-const fusedSdpaPrefillKv = trf.fusedSdpaPrefillKv;
-const lastDim = trf.lastDim;
-const layerCap = trf.layerCap;
-const log = trf.log;
-const moeDumpBeginForward = trf.moeDumpBeginForward;
-const moeDumpForwardDone = trf.moeDumpForwardDone;
-const moeDumpTensor = trf.moeDumpTensor;
-const moeRouterTopK = trf.moeRouterTopK;
-const qmatmulBits = trf.qmatmulBits;
-const ropeAngleRows = trf.ropeAngleRows;
-const scalarOf = trf.scalarOf;
-const sliceAttentionSeq = trf.sliceAttentionSeq;
-const slidingDecodeMask = trf.slidingDecodeMask;
-const slidingPrefillAttn = trf.slidingPrefillAttn;
-const slidingTailSpan = trf.slidingTailSpan;
-const slidingViewFor = trf.slidingViewFor;
-const splitKAttnDispatch = trf.splitKAttnDispatch;
-const verifyQmmNaxAvailable = trf.verifyQmmNaxAvailable;
+const DenseKVView = trunk_mod.DenseKVView;
+const FUSED256_MIN_Q_LEN = trunk_mod.FUSED256_MIN_Q_LEN;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const FullAttnWeights = trunk_mod.FullAttnWeights;
+const KVCache = trunk_mod.KVCache;
+const KV_UNPACK_HEADER = trunk_mod.KV_UNPACK_HEADER;
+const KvPrefixView = trunk_mod.KvPrefixView;
+const ModelConfig = trunk_mod.ModelConfig;
+const MoeMlpWeights = trunk_mod.MoeMlpWeights;
+const ProfClock = trunk_mod.ProfClock;
+const QSA_ATTN_BK = trunk_mod.QSA_ATTN_BK;
+const QSA_SCORE_KERNEL_HEADER = trunk_mod.QSA_SCORE_KERNEL_HEADER;
+const QsaAttnCfgKey = trunk_mod.QsaAttnCfgKey;
+const SLIDING_TRIM_UNBOUNDED = trunk_mod.SLIDING_TRIM_UNBOUNDED;
+const ShapeKey = trunk_mod.ShapeKey;
+const bf16Scalar = trunk_mod.bf16Scalar;
+const capturePrefillHidden = trunk_mod.capturePrefillHidden;
+const capturePrefillHiddenLast = trunk_mod.capturePrefillHiddenLast;
+const decodeProfReport = trunk_mod.decodeProfReport;
+const decodeProfileEnabled = trunk_mod.decodeProfileEnabled;
+const decodeProfileRows = trunk_mod.decodeProfileRows;
+const fusedSdpaPrefillKv = trunk_mod.fusedSdpaPrefillKv;
+const lastDim = trunk_mod.lastDim;
+const layerCap = trunk_mod.layerCap;
+const log = trunk_mod.log;
+const moeDumpBeginForward = trunk_mod.moeDumpBeginForward;
+const moeDumpForwardDone = trunk_mod.moeDumpForwardDone;
+const moeDumpTensor = trunk_mod.moeDumpTensor;
+const moeRouterTopK = trunk_mod.moeRouterTopK;
+const qmatmulBits = trunk_mod.qmatmulBits;
+const ropeAngleRows = trunk_mod.ropeAngleRows;
+const scalarOf = trunk_mod.scalarOf;
+const sliceAttentionSeq = trunk_mod.sliceAttentionSeq;
+const slidingDecodeMask = trunk_mod.slidingDecodeMask;
+const slidingPrefillAttn = trunk_mod.slidingPrefillAttn;
+const slidingTailSpan = trunk_mod.slidingTailSpan;
+const slidingViewFor = trunk_mod.slidingViewFor;
+const splitKAttnDispatch = trunk_mod.splitKAttnDispatch;
+const verifyQmmNaxAvailable = trunk_mod.verifyQmmNaxAvailable;
 
 pub var mimo_batched_logged: bool = false;
 
@@ -584,7 +584,7 @@ pub fn forwardMimoBatchedDecode(
         .batch_rows = ctxs,
         .batch_row_offsets = rope_offsets,
     };
-    const normed = try self.forwardMoeWith(&bctx, token_arr);
+    const normed = try forwardMoeWith(self, &bctx, token_arr);
     defer _ = mlx.mlx_array_free(normed);
     const hidden = mlx.getShape(normed)[2];
     const out = try self.allocator.alloc(mlx.mlx_array, n);
@@ -736,7 +736,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 
         const attn_out = switch (lw.attn) {
             .linear => return error.UnsupportedLinearAttention,
-            .full => |*fa| try self.mimoAttnWith(ctx, normed, fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask),
+            .full => |*fa| try mimoAttnWith(self, ctx, normed, fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask),
         };
         defer _ = mlx.mlx_array_free(attn_out);
         if (prof) {
@@ -929,9 +929,9 @@ pub fn mimoAttnWith(
         proj[2] = try self.qmatmul(x, &fa.v);
     }
     const attn_out = if (ctx.batch_rows) |rows|
-        try self.mimoBatchRowsAttn(rows, ctx.batch_row_offsets, proj, fa, layer, local_decode_mask)
+        try mimoBatchRowsAttn(self, rows, ctx.batch_row_offsets, proj, fa, layer, local_decode_mask)
     else
-        try self.mimoAttnCore(ctx, proj, fa, layer, offset, batch, seq_len, is_prefill, local_prefill_mask, local_decode_mask);
+        try mimoAttnCore(self, ctx, proj, fa, layer, offset, batch, seq_len, is_prefill, local_prefill_mask, local_decode_mask);
     defer _ = mlx.mlx_array_free(attn_out);
 
     var attn_t = mlx.mlx_array_new();
@@ -983,7 +983,7 @@ pub fn mimoAttnCore(
     const max_kv: u32 = if (is_global) 0 else sliding.span;
     const fp8_qkv = fa.q == .fp8_block;
     const prepped: ?DenseKVView = if (fp8_qkv and batch == 1 and seq_len <= MIMO_VERIFY_ROWS_MAX and hd == 192 and vhd == 128)
-        try self.mimoDecodePrep(ctx, proj, is_global, rope_dims, rope_base, offset, seq_len, h_count, kv_h, layer, max_kv, &q_rope)
+        try mimoDecodePrep(self, ctx, proj, is_global, rope_dims, rope_base, offset, seq_len, h_count, kv_h, layer, max_kv, &q_rope)
     else
         null;
     var kv_view = prepped orelse blk: {
@@ -1107,7 +1107,7 @@ pub fn mimoBatchRowsAttn(
             dst.* = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_slice(dst, src, &[_]c_int{ 0, @intCast(i), 0 }, 3, &[_]c_int{ 1, @as(c_int, @intCast(i)) + 1, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
         }
-        outs[n] = try self.mimoAttnCore(row_ctx, row_proj, fa, layer, @intCast(off), 1, 1, false, &no_prefill_mask, local_decode_mask);
+        outs[n] = try mimoAttnCore(self, row_ctx, row_proj, fa, layer, @intCast(off), 1, 1, false, &no_prefill_mask, local_decode_mask);
         n += 1;
     }
     const vec = mlx.mlx_vector_array_new_data(&outs, n);

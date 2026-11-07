@@ -1,12 +1,12 @@
 //! MiMo's drafter: the checkpoint's trained MTP heads behind `arch/drafter.zig`.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const mtp_mod = @import("../mtp.zig");
 const spec_types = @import("../spec_types.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
-const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const Transformer = trunk_mod.Transformer;
+const KVCache = trunk_mod.KVCache;
 
 pub const kinds = [_]spec_types.Kind{ .mtp, .dflash2 };
 pub const head_kind: spec_types.Kind = .mtp;
@@ -121,7 +121,7 @@ pub fn draftShortlist(h: Head, target: *Transformer, x: mlx.mlx_array, suppress_
 
 /// Every G17/NAX cost surface is calibrated against the qwen4_exp in-checkpoint head, so every other head plans
 /// under `generic` unless it has a surface of its own.
-pub fn costProfile(_: Head, target: *const Transformer, _: transformer_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
+pub fn costProfile(_: Head, target: *const Transformer, _: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
     return if (target.config.expert_layout == .exl3_k4) .mimo_exl3 else .generic;
 }
 

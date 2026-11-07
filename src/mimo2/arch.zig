@@ -1,6 +1,7 @@
 //! MiMo-V2.6-Flash (`mimo_v2`) as the registry sees it: its one public face. It runs the generic MoE trunk, so it
 //! is the registry's default arch (`default_arch`).
 const std = @import("std");
+const mimo_forward = @import("mimo_forward.zig");
 const mlx = @import("../mlx.zig");
 const trunk = @import("../trunk.zig");
 const admission = @import("../arch/admission.zig");
@@ -86,7 +87,7 @@ pub fn warmup(xfm: Model) !void {
 }
 
 pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {
-    return xfm.forwardMoeWith(ctx, ids);
+    return mimo_forward.forwardMoeWith(xfm, ctx, ids);
 }
 
 pub fn lmHeadForDraft(xfm: Model, x: mlx.mlx_array) !mlx.mlx_array {

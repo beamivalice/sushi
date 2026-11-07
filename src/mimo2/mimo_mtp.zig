@@ -16,12 +16,13 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
+const mimo_forward = @import("mimo_forward.zig");
 const mtp_mod = @import("../mtp.zig");
 const fp8_block = @import("../fp8_block.zig");
 const log = @import("../log.zig");
 
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk_mod.Transformer;
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 
@@ -268,7 +269,7 @@ pub const State = struct {
             // A slice pins the rows it views from: past a prefill chunk, the whole chunk's
             // hiddens where `billedBytes` holds the ring. Copied and evaluated, it lets go.
             if (drop > RING_ROWS) {
-                const owned = try transformer_mod.materializedOwnedCopy(s, cut);
+                const owned = try trunk_mod.materializedOwnedCopy(s, cut);
                 _ = mlx.mlx_array_free(cut);
                 cut = owned;
                 const vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{cut}, 1);
@@ -549,7 +550,7 @@ pub const Head = struct {
         var v_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(v_scaled);
         {
-            const scale = try transformer_mod.scalarOf(self.value_scale, mlx.mlx_array_dtype(v), s);
+            const scale = try trunk_mod.scalarOf(self.value_scale, mlx.mlx_array_dtype(v), s);
             defer _ = mlx.mlx_array_free(scale);
             try mlx.check(mlx.mlx_multiply(&v_scaled, v, scale, s));
         }
@@ -820,7 +821,7 @@ test "mimo mtp heads warm up every head on a throwaway state (MIMO_V2_MODEL)" {
     defer if (config.ngram_table_path) |p| a.free(p);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    try transformer_mod.stackMimoFixtureExperts(&weights, config, s);
+    try mimo_forward.stackMimoFixtureExperts(&weights, config, s);
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
@@ -884,7 +885,7 @@ test "mimo mtp heads track the torch rendering of the MiMo-V2 MTP layer across r
     defer if (config.ngram_table_path) |p| a.free(p);
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
     defer weights.deinit();
-    try transformer_mod.stackMimoFixtureExperts(&weights, config, s);
+    try mimo_forward.stackMimoFixtureExperts(&weights, config, s);
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
