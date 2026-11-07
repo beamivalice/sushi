@@ -17,7 +17,7 @@ const ParsedToolCall = tool_schema.ParsedToolCall;
 const ReplayCase = chat.ReplayCase;
 const ToolCall = chat.ToolCall;
 const appendJsonString = chat.appendJsonString;
-const dsv41_image_atom = chat.dsv41_image_atom;
+const arch_chat = @import("arch/chat.zig");
 const jsonIsValidObject = tool_schema.jsonIsValidObject;
 const loadChatConfig = chat.loadChatConfig;
 const renderChatTemplate = chat.renderChatTemplate;
@@ -1102,7 +1102,7 @@ const InvokeDialect = struct {
     inferred: bool,
 };
 /// Claude's spelling of the same grammar (`<function_calls><invoke name="X"><parameter name="k">`),
-/// which models trained on Claude transcripts emit in place of their own (qwen4_exp).
+/// which models trained on Claude transcripts emit in place of their own.
 pub const BARE_INVOKE: InvokeDialect = .{ .invoke = "<invoke", .param = "<parameter", .param_close = "</parameter>", .invoke_close = "</invoke>", .inferred = true };
 pub const FUNCTION_CALLS_TAG = "<function_calls>";
 
@@ -5217,7 +5217,7 @@ test "parseToolCalls qwen: a parameter value types from JSON's number grammar, n
 }
 
 fn dsv41Replay(a: std.mem.Allocator, tok: *const Tokenizer, tools: ?[]const u8, thinking: bool, raw: []const u8) !Dsv41Replay {
-    var cfg = ChatConfig{ .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = dsv41_image_atom };
+    var cfg = ChatConfig{ .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = (arch_chat.pinOf("deepseek_v41") orelse return error.SkipZigTest).image_placeholder };
     const first = [_]Message{.{ .role = "user", .content = "q" }};
     const p1_text = try renderChatTemplate(a, &first, &cfg, tools, null, thinking, "high", false);
     defer a.free(p1_text);

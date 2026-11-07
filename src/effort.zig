@@ -1,5 +1,6 @@
 const std = @import("std");
 const log = @import("log.zig");
+const arch_chat = @import("arch/chat.zig");
 const testing = std.testing;
 
 /// The engine's thinking-effort vocabulary. Each served arch accepts a subset
@@ -36,18 +37,34 @@ pub fn isListed(a: EffortArm) bool {
 /// What a row puts in the template's `reasoning_effort`: nothing (off), one of the family's words, or DeepSeek's 1-100 scale.
 pub const Sends = union(enum) { none, word: Effort, scale: u8 };
 
-/// A served family with an editable effort table (model-settings.json `effort:<family>`). MiMo has only on/off.
+/// What an arch offers for `reasoning_effort` (its `<arch>_chat.zig`): a table the settings file can edit, or fixed arms.
+pub const Offer = union(enum) { table: Spec, fixed: []const EffortArm };
+
+/// The editable effort tables, named by their model-settings.json `effort:<family>` section. A family's table is its
+/// arch's (`arch/chat.zig`); one whose arch is not built is absent from `families`.
 pub const Family = enum {
     qwen4_exp,
     deepseek_v41,
     glm5_next,
 
     pub fn of(model_type: []const u8) ?Family {
-        return std.meta.stringToEnum(Family, model_type);
+        const offer = arch_chat.effortOffer(model_type) orelse return null;
+        return switch (offer.*) {
+            .table => |t| std.meta.stringToEnum(Family, t.section),
+            .fixed => null,
+        };
+    }
+
+    pub fn built(f: Family) bool {
+        return switch (f) {
+            inline else => |c| arch_chat.tableSpec(@tagName(c)) != null,
+        };
     }
 
     pub fn spec(f: Family) *const Spec {
-        return &specs[@intFromEnum(f)];
+        return switch (f) {
+            inline else => |c| arch_chat.tableSpec(@tagName(c)) orelse unreachable,
+        };
     }
 
     /// Its template has a thinking-off switch.
@@ -65,11 +82,12 @@ pub const Family = enum {
     }
 };
 
-/// A scale value the template takes as a word of its own (`chat.dsv41EffortFor`).
+/// A scale value the template takes as a word of its own (`chat.scaleEffortFor`).
 pub const Preset = struct { word: Effort, value: u8 };
 
-/// One family's facts, in `Family` order: what its template takes and its built-in table.
+/// One family's facts: what its template takes and its built-in table.
 pub const Spec = struct {
+    section: []const u8,
     label: []const u8,
     words: []const Effort,
     presets: []const Preset = &.{},
@@ -79,10 +97,11 @@ pub const Spec = struct {
     off_why: []const u8,
 };
 
-fn makeSpec(comptime label: []const u8, comptime words: []const Effort, comptime presets: []const Preset, comptime off_offerable: bool, comptime t: Table) Spec {
+pub fn makeSpec(comptime section: []const u8, comptime label: []const u8, comptime words: []const Effort, comptime presets: []const Preset, comptime off_offerable: bool, comptime t: Table) Spec {
     comptime var list: []const u8 = "";
     inline for (words, 0..) |w, i| list = list ++ (if (i == 0) "" else if (i + 1 == words.len) " or " else ", ") ++ @tagName(w);
     return .{
+        .section = section,
         .label = label,
         .words = words,
         .presets = presets,
@@ -93,7 +112,25 @@ fn makeSpec(comptime label: []const u8, comptime words: []const Effort, comptime
     };
 }
 
-pub const families = std.enums.values(Family);
+const all_families = std.enums.values(Family);
+
+/// Per-family arrays (the store, a settings plan) are sized by this and indexed by `@intFromEnum(family)`;
+/// `families` is only which slots hold a built arch.
+pub const family_count = all_families.len;
+
+pub const families = blk: {
+    var out: [all_families.len]Family = undefined;
+    var n: usize = 0;
+    for (all_families) |f| if (f.built()) {
+        out[n] = f;
+        n += 1;
+    };
+    const kept = out[0..n].*;
+    break :blk kept;
+};
+
+/// Every table has its arch: a test that names a family by value runs only then.
+pub const all_built = families.len == family_count;
 
 /// A table's rows, in the order the settings page shows them.
 pub const table_words = [_]Effort{ .off, .low, .medium, .high, .xhigh, .max };
@@ -146,56 +183,24 @@ pub const Arms = struct {
     }
 };
 
-/// The engine's own tables, in `Family` order. Qwen high/max and GLM medium/xhigh are folds: served at a near word, with
-/// a notice. The 1-100 family's own words are low 50, high 75 and max 100.
-const specs = [_]Spec{
-    makeSpec("Qwen", &.{ .low, .medium, .xhigh }, &.{}, true, .{ .default = .medium, .rows = .{
-        .{ .offered = true },
-        .{ .offered = true, .sends = .{ .word = .low }, .cap = 2048 },
-        .{ .offered = true, .sends = .{ .word = .medium }, .cap = 8192 },
-        .{ .offered = false, .sends = .{ .word = .xhigh }, .fold_to = .xhigh },
-        .{ .offered = true, .sends = .{ .word = .xhigh } },
-        .{ .offered = false, .sends = .{ .word = .xhigh }, .fold_to = .xhigh },
-    } }),
-    makeSpec("DeepSeek", &.{}, &.{ .{ .word = .low, .value = 50 }, .{ .word = .high, .value = 75 }, .{ .word = .max, .value = 100 } }, true, .{ .default = .high, .rows = .{
-        .{ .offered = true },
-        .{ .offered = true, .sends = .{ .scale = 50 } },
-        .{ .offered = true, .sends = .{ .scale = 62 } },
-        .{ .offered = true, .sends = .{ .scale = 75 } },
-        .{ .offered = true, .sends = .{ .scale = 87 } },
-        .{ .offered = true, .sends = .{ .scale = 100 } },
-    } }),
-    makeSpec("GLM", &.{ .low, .high, .max }, &.{}, false, .{ .default = .high, .rows = .{
-        .{ .offered = false },
-        .{ .offered = true, .sends = .{ .word = .low } },
-        .{ .offered = false, .sends = .{ .word = .high }, .fold_to = .high },
-        .{ .offered = true, .sends = .{ .word = .high } },
-        .{ .offered = false, .sends = .{ .word = .max }, .fold_to = .max },
-        .{ .offered = true, .sends = .{ .word = .max } },
-    } }),
-};
-
+/// A family's engine-own table (its arch's). Its built-in folds are served at a near word, with a notice.
 pub fn builtin(f: Family) Table {
     return f.spec().table;
 }
 
 const builtin_arms = blk: {
-    var out: [families.len]Arms = undefined;
-    for (families, &out) |f, *a| a.* = builtin(f).offeredArms();
+    var out: [all_families.len]Arms = @splat(.{});
+    for (families) |f| out[@intFromEnum(f)] = builtin(f).offeredArms();
     break :blk out;
-};
-
-// MiMo's template has only on/off; do not advertise artificial effort levels.
-const mimo_v2_efforts = [_]EffortArm{
-    .{ .effort = .off },
-    .{ .effort = .on },
 };
 
 /// The built-in offered arms; null = an inherited arch: its effort words keep `responses.effortBudget`.
 pub fn effortArms(model_type: []const u8) ?[]const EffortArm {
-    if (Family.of(model_type)) |f| return builtin_arms[@intFromEnum(f)].slice();
-    if (std.mem.eql(u8, model_type, "mimo_v2")) return &mimo_v2_efforts;
-    return null;
+    const offer = arch_chat.effortOffer(model_type) orelse return null;
+    return switch (offer.*) {
+        .table => builtin_arms[@intFromEnum(Family.of(model_type).?)].slice(),
+        .fixed => |arms| arms,
+    };
 }
 
 /// The arms a request is served from now: the family's merged table, MiMo's on/off, null for an inherited arch.
@@ -430,7 +435,7 @@ pub fn sectionName(buf: []u8, f: Family) []const u8 {
 // ── The served tables ──
 
 var store_lock: std.atomic.Mutex = .unlocked;
-var store: [families.len]Edits = @splat(.{});
+var store: [all_families.len]Edits = @splat(.{});
 
 fn lockStore() void {
     while (!store_lock.tryLock()) std.atomic.spinLoopHint();
@@ -450,7 +455,7 @@ pub fn publishedEdits(f: Family) Edits {
 }
 
 /// Every family's edits in one read: a request resolves against one table throughout while a save publishes another.
-pub const Snapshot = [families.len]Edits;
+pub const Snapshot = [all_families.len]Edits;
 
 pub fn snapshot() Snapshot {
     lockStore();
@@ -545,7 +550,7 @@ pub fn listedWords(arms: []const EffortArm, buf: []Effort) []const Effort {
 }
 
 test "DeepSeek-V4.1 serves medium and xhigh as their own words, without a re-route" {
-    const arms = effortArms("deepseek_v41").?;
+    const arms = effortArms("deepseek_v41") orelse return;
     var offered: [std.enums.values(Effort).len]Effort = undefined;
     for (arms, 0..) |a, i| offered[i] = a.effort;
     for ([_]Effort{ .off, .low, .medium, .high, .xhigh, .max }) |e| {
@@ -612,25 +617,16 @@ fn parseJson(text: []const u8) !std.json.Parsed(std.json.Value) {
 }
 
 test "effort table: the built-in tables are the arms each family served before the table" {
-    for ([_]Family{ .qwen4_exp, .deepseek_v41, .glm5_next }) |f| {
+    for (families) |f| {
         const arms = servedArms(@tagName(f)).?;
         const before = effortArms(@tagName(f)).?;
         try testing.expectEqual(before.len, arms.len);
         for (arms.slice(), before) |a, b| try testing.expectEqualDeep(b, a);
     }
-    const q = builtin(.qwen4_exp);
-    try testing.expectEqual(Effort.medium, q.default);
-    try testing.expectEqualDeep(Row{ .offered = false, .sends = .{ .word = .xhigh }, .fold_to = .xhigh }, q.row(.high));
-    try testing.expectEqualDeep(Row{ .offered = false, .sends = .{ .word = .xhigh }, .fold_to = .xhigh }, q.row(.max));
-    try testing.expectEqualDeep(Row{ .offered = true, .sends = .{ .word = .low }, .cap = 2048 }, q.row(.low));
-    const d = builtin(.deepseek_v41);
-    for ([_]Effort{ .low, .medium, .high, .xhigh, .max }, [_]u8{ 50, 62, 75, 87, 100 }) |w, n| try testing.expectEqualDeep(Row{ .offered = true, .sends = .{ .scale = n } }, d.row(w));
-    const g = builtin(.glm5_next);
-    try testing.expect(!g.row(.off).offered);
-    try testing.expectEqualDeep(Row{ .offered = false, .sends = .{ .word = .high }, .fold_to = .high }, g.row(.medium));
-    try testing.expectEqualDeep(Row{ .offered = false, .sends = .{ .word = .max }, .fold_to = .max }, g.row(.xhigh));
-    try testing.expect(Family.of("mimo_v2") == null);
-    try testing.expectEqual(@as(usize, 2), servedArms("mimo_v2").?.len);
+    if (effortArms("mimo_v2")) |fixed| {
+        try testing.expect(Family.of("mimo_v2") == null);
+        try testing.expectEqual(fixed.len, servedArms("mimo_v2").?.len);
+    }
     try testing.expect(servedArms("not_a_served_arch") == null);
 }
 
@@ -642,6 +638,7 @@ test "effort table: a row's template value is its word, or its number on the 1-1
 }
 
 test "effort table: the file's fields merge row by row over the built-in table" {
+    if (!Family.qwen4_exp.built()) return;
     const parsed = try parseJson(
         \\{"default":"low","high":{"offered":true,"sends":"medium","cap":64},"low":{"cap":null},"medium":{"offered":false}}
     );
@@ -683,6 +680,7 @@ test "effort table: each family's template takes only its own values, on save an
         .{ .f = .qwen4_exp, .body = "{\"default\":\"ultra\"}", .field = "" },
         .{ .f = .qwen4_exp, .body = "{\"low\":7}", .field = "" },
     }) |c| {
+        if (!c.f.built()) continue;
         const parsed = try parseJson(c.body);
         defer parsed.deinit();
         const got = parseSection(c.f, parsed.value, false);
@@ -692,6 +690,7 @@ test "effort table: each family's template takes only its own values, on save an
         // The bad field is skipped, so the table it loads is the built-in one.
         try testing.expectEqualDeep(builtin(c.f), merge(c.f, got.edits));
     }
+    if (!Family.deepseek_v41.built()) return;
     const good = try parseJson("{\"medium\":{\"sends\":40,\"cap\":64},\"off\":{\"offered\":false}}");
     defer good.deinit();
     const ds = parseSection(.deepseek_v41, good.value, false);
@@ -700,6 +699,7 @@ test "effort table: each family's template takes only its own values, on save an
 }
 
 test "effort table: a load keeps the good fields of a row beside a bad one" {
+    if (!Family.qwen4_exp.built()) return;
     const parsed = try parseJson("{\"high\":{\"offered\":true,\"sends\":\"ultra\",\"cap\":64}}");
     defer parsed.deinit();
     const got = parseSection(.qwen4_exp, parsed.value, false);
@@ -708,6 +708,7 @@ test "effort table: a load keeps the good fields of a row beside a bad one" {
 }
 
 test "effort table: the default word must be offered; a load that breaks it drops the edit that did" {
+    if (!Family.qwen4_exp.built() or !Family.glm5_next.built() or !Family.deepseek_v41.built()) return;
     var e: Edits = .{};
     e.rows[rowIndex(.medium).?].offered = false;
     try testing.expectEqualStrings("default", checkTable(merge(.qwen4_exp, e)).?.key);
@@ -725,6 +726,7 @@ test "effort table: the default word must be offered; a load that breaks it drop
 }
 
 test "effort table: the file keeps only the fields that differ from the built-in table" {
+    if (!Family.qwen4_exp.built() or !Family.deepseek_v41.built()) return;
     var e: Edits = .{ .default = .medium };
     e.rows[rowIndex(.low).?] = .{ .offered = true, .sends = .{ .word = .low }, .cap = @as(?i32, 2048) };
     e.rows[rowIndex(.high).?] = .{ .offered = true, .sends = .{ .word = .xhigh }, .cap = @as(?i32, 64) };
@@ -745,6 +747,7 @@ test "effort table: the file keeps only the fields that differ from the built-in
 }
 
 test "effort table: a published table reaches the next lookup, and a reset brings the built-in one back" {
+    if (!Family.glm5_next.built()) return;
     defer publish(.glm5_next, .{});
     var e: Edits = .{};
     e.rows[rowIndex(.low).?].cap = @as(?i32, 64);
@@ -755,6 +758,7 @@ test "effort table: a published table reaches the next lookup, and a reset bring
 }
 
 test "effort table: --think picks its word from the served table" {
+    if (!Family.qwen4_exp.built()) return;
     const saved = think_effort_flag;
     defer think_effort_flag = saved;
     defer publish(.qwen4_exp, .{});
@@ -768,6 +772,7 @@ test "effort table: --think picks its word from the served table" {
 }
 
 test "effort table: only the built-in folds fold; a file's offered false refuses the word" {
+    if (!Family.qwen4_exp.built() or !Family.deepseek_v41.built() or effortArms("mimo_v2") == null) return;
     const arms = builtin(.qwen4_exp).offeredArms();
     const high = resolve(arms.slice(), .high).?;
     try testing.expectEqual(Effort.xhigh, high.arm.effort);
@@ -793,4 +798,45 @@ test "effort table: only the built-in folds fold; a file's offered false refuses
     const mimo = resolve(effortArms("mimo_v2").?, .high).?;
     try testing.expectEqual(Effort.on, mimo.arm.effort);
     try testing.expect(mimo.rerouted_from == null);
+}
+
+fn armsText(a: std.mem.Allocator, arms: []const EffortArm) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(a);
+    for (arms) |arm| {
+        try out.print(a, "{s}", .{@tagName(arm.effort)});
+        if (arm.budget) |b| try out.print(a, ":cap{d}", .{b});
+        switch (arm.sends) {
+            .none => {},
+            .word => |w| try out.print(a, ":={s}", .{@tagName(w)}),
+            .scale => |n| try out.print(a, ":={d}", .{n}),
+        }
+        if (arm.fold_to) |t| try out.print(a, ":->{s}", .{@tagName(t)});
+        try out.append(a, ' ');
+    }
+    return out.toOwnedSlice(a);
+}
+
+test "every served model type offers the effort arms it always did" {
+    const Case = struct { model_type: []const u8, arms: []const u8, section: ?[]const u8 };
+    for ([_]Case{
+        .{ .model_type = "qwen4_exp", .arms = "off low:cap2048:=low medium:cap8192:=medium high:->xhigh xhigh:=xhigh max:->xhigh ", .section = "qwen4_exp" },
+        .{ .model_type = "deepseek_v41", .arms = "off low:=50 medium:=62 high:=75 xhigh:=87 max:=100 ", .section = "deepseek_v41" },
+        .{ .model_type = "glm5_next", .arms = "low:=low medium:->high high:=high xhigh:->max max:=max ", .section = "glm5_next" },
+        .{ .model_type = "mimo_v2", .arms = "off on ", .section = null },
+    }) |c| {
+        const arms = effortArms(c.model_type) orelse continue;
+        const text = try armsText(testing.allocator, arms);
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings(c.arms, text);
+        const served = servedArms(c.model_type).?;
+        const served_text = try armsText(testing.allocator, served.slice());
+        defer testing.allocator.free(served_text);
+        try testing.expectEqualStrings(c.arms, served_text);
+        if (Family.of(c.model_type)) |f| {
+            try testing.expectEqualStrings(c.section.?, @tagName(f));
+        } else try testing.expect(c.section == null);
+    }
+    try testing.expect(effortArms("mistral") == null);
+    try testing.expect(Family.of("mistral") == null);
 }

@@ -26,6 +26,15 @@ joins `DROPPABLE` when its drop passes.
   `Transformer` is an alias of `Trunk`, and `transformer.zig` re-exports the names that moved, until the arch stages
   move their callers. The arch handle fields (`glm5`, `dsv41`, `qwen4`, ...) stay on `Trunk` for now: callers reach
   them by name, and each arch's S3 stage moves its own.
+- **The chat face.** `src/<arch>/<arch>_chat.zig` is the arch's MLX-free face for the host tier (chat templates, tool
+  calls, tokenizer: no MLX, so `test-host` runs beside a server). It holds `model_types` (`arch.zig` re-exports them),
+  `effort` (an editable table or fixed arms), and, where the arch has them, `pin` (a template it serves instead of the
+  checkpoint's, plus its image atom) and `pretokenizer` (a tokenizer.json spelling it claims and the grammar that
+  splits it). `src/arch/chat.zig` reads the faces through `registry.Chat`; `effort.zig`, `chat.zig` and `tokenizer.zig`
+  call it. A host file never imports `registry.zig`'s `Mod` or an `arch.zig`: naming one pulls its tests, and with them
+  MLX, into the host binary. That is also why `registry.zig` holds no test (`registry_test.zig` does) and lists each arch's
+  `mod` and `chat` as separate decls on the one marked line. A new editable effort table also adds its `effort:<family>`
+  name to `effort.Family`, which settings keys and `/v1/settings` use.
 - Dispatch is `inline else` over the union, one area file per concern in `src/arch/`: `life` (construction,
   teardown, cache reset, warmup), `forward`, `request`, `admission` (expert-stream traits from the config), `drafter` (the
   speculative head: [engine-mtp](engine-mtp.md#the-drafter-seam)), `prefix` (the prefix cache's restore target, per-entry
@@ -39,16 +48,16 @@ joins `DROPPABLE` when its drop passes.
   same names for a host that carries less, and a test keeps the two name lists equal.
 - The config side lives in `src/arch/config.zig`. The parse stores the arch tag in `ModelConfig.arch`, and `isQwen4`,
   `isGlm5`, `isDsv41` and `isMimo` read it (a config built by hand falls back to `model_type`). An arch declares
-  `config_types` (what its parse reads, text twins included), `discovery_types`, `gate_rank` (its place in the arch gate's
-  refusal text), `config_facts` and `parseConfig`, and may declare `parseDir`, `adoptLayout`, `samplingDefaults` and
-  `streamedResidentSplit`. `model.served_model_types` lists every registered type, enabled or not
-  (`registry.registered_model_types`); a test of one arch skips when `registry.ofModelType` says the build left it out. Shared parse code calls those, never a type name.
+  `config_types` (what its parse reads, text twins included), `discovery_types`, `config_facts` and `parseConfig`,
+  and may declare `parseDir`, `adoptLayout`, `samplingDefaults` and `streamedResidentSplit`. `model.served_model_types`
+  lists every registered type, enabled or not (`registry.registered_model_types`, from each registry line's own
+  `model_types` and `gate_rank`, its place in the gate's refusal text, so a left-out arch's files are never read); a test of one arch skips when `registry.ofModelType` says the build left it out. Shared parse code calls those, never a type name.
 - A shared file only one arch uses moves into that arch's folder. A shared file a shared engine path also reaches stays
   shared and is named by capability.
 
 ## Adding an architecture
 
-1. `src/<arch>/` with `arch.zig` (every declaration above; `registry.zig`'s test names any that is missing), the
+1. `src/<arch>/` with `arch.zig` and `<arch>_chat.zig` (every declaration above; `registry_test.zig` names any that is missing), the
    forward, config parse and refusals, bills, drafter, prefix/SSD codec parts, media, kernels only it uses, its tests
    and fixtures.
 2. One entry in `src/arch/registry.zig`, marked `// arch:<arch>`. Its `arch.zig` tests run with the registry's.

@@ -17,6 +17,7 @@ const expert_bf16_kernels = @import("expert_bf16_kernels.zig");
 test {
     _ = expert_stream;
     _ = expert_bf16_kernels;
+    _ = @import("arch/registry_test.zig");
     _ = @import("mimo2/mimo_quant_test.zig");
     _ = @import("mimo2/mimo_config.zig");
     if (comptime @hasField(registry.Tag, "mimo2")) _ = @import("mimo2/mimo_generate_test.zig");

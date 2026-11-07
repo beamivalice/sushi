@@ -32,6 +32,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## Templates
 
 - One-shot CLI prompts carry the same thinking fields through the chat request policy; no CLI render may hardcode thinking off.
+- **Dialects are named by format and sniffed from the template text, never from the model type**: `serializeExtraContext`
+  maps the client's effort word per template dialect (scale: `thinking_mode`, a 1-100 ladder; ladder: the literal
+  `'xhigh'`, xhigh|medium|low; word: `effective_reasoning_effort` with `[gMASK]<sop>`, the word as sent; any other gets
+  high/no_think). An arch brings only what a template cannot say: a template it pins when the checkpoint's cannot be
+  parsed by jinja.cpp (`pin` in its `<arch>_chat.zig`, read by `loadChatConfig` from the model type in `config.json`;
+  DeepSeek-V4.1's, with its image atom), and a pre-tokenizer spelling (`pretokenizer`, read by the tokenizer). See
+  [engine-arch-seam](engine-arch-seam.md).
 
 - **Control bytes**: ONE raw byte <0x20 in history kills the strict render → `fallbackFormatChat` on a `<|im_end|>` model
   (ChatML, the stop token kept), a named 500 `chat template unusable: <jinja error>` on any other. Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A

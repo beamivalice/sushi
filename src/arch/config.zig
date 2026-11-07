@@ -127,7 +127,7 @@ pub const gate_text = blk: {
 test "every enabled arch declares its config side" {
     inline for (comptime std.enums.values(Tag)) |tag| {
         const M = registry.Mod(tag);
-        inline for (.{ "config_types", "discovery_types", "config_facts", "parseConfig", "gate_rank" }) |decl| {
+        inline for (.{ "config_types", "discovery_types", "config_facts", "parseConfig" }) |decl| {
             if (!@hasDecl(M, decl)) @compileError(@tagName(tag) ++ "/arch.zig lacks " ++ decl);
         }
         for (M.model_types) |t| try std.testing.expect(claims(M.config_types, t) and claims(M.discovery_types, t));

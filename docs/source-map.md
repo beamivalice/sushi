@@ -8,6 +8,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `repl_tools.zig` | `run` REPL client tools (web, confined files, images; write needs `/edit`) | server-http-apis |
 | `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` / `http_conn` / `request_policy` / `request_media` / `models_api` / `logprobs` / `generation_stream` / `anthropic` / `completions` / `responses_api` | all HTTP: `/v1/*`, `/metrics`, WS, `--api-key`, Responses store | server-http-apis |
 | `chat.zig` / `think_tags` / `tool_calls` / `tool_schema` | chat templates, thinking tags, tool-call parse/repair/coercion | server-tool-calling |
+| `arch/chat.zig` / `<arch>/<arch>_chat.zig` | each arch's MLX-free chat face: effort table, pinned template and image atom, pre-tokenizer; the host tier reads them through `registry.Chat` | engine-arch-seam |
 | `reasoning_protocol.zig` / `json_schema.zig` / `json_grammar.zig` / `token_mask.zig` / `regex.zig` | constrained decoding | server-http-apis |
 | `launch.zig` | `sushi launch <agent>` | server-http-apis |
 | `scheduler.zig` / `generate.zig` / `degenerate.zig` / `mtp_plan.zig` / `prefill_plan.zig` / `sampler.zig` / `model_load` / `slot_admission` / `mtp_tick` / `slot_outcome` / `vision_queue` / `mtp_policy` / `mtp_round` | slots, inference thread, batching, admission, load bills; generation; MTP policy/rounds/plan; stop loop, prefill plan, sampler | server-lifecycle |

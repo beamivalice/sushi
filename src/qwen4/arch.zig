@@ -10,7 +10,7 @@ const admission = @import("../arch/admission.zig");
 const registry = @import("../arch/registry.zig");
 const Trunk = trunk.Trunk;
 
-pub const model_types = [_][]const u8{"qwen4_exp"};
+pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
 
@@ -29,7 +29,6 @@ const config_file = @import("qwen4_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "qwen4_exp", "qwen4_exp_text" };
 pub const discovery_types = config_types;
-pub const gate_rank = 0;
 pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true };
 pub const parseConfig = config_file.parseFamily;
 pub const parseDir = config_file.parseDir;
@@ -37,7 +36,7 @@ pub const samplingDefaults = config_file.samplingDefaults;
 
 // slot:media (S2f)
 
-// slot:chat (S2g)
+pub const chat = @import("qwen4_chat.zig"); // slot:chat (S2g)
 
 pub const kld = @import("qwen4_kld.zig");
 test {

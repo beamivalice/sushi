@@ -392,7 +392,7 @@ pub const Plan = struct {
     server_edits: []const Edit = &.{},
     model_id: ?[]const u8 = null,
     model_edits: []const Edit = &.{},
-    effort: [effort_mod.families.len]EffortPlan = @splat(.{}),
+    effort: [effort_mod.family_count]EffortPlan = @splat(.{}),
 
     fn namesEffort(self: Plan) bool {
         for (self.effort) |e| if (e.named) return true;
@@ -498,14 +498,16 @@ pub fn parseRequest(arena: std.mem.Allocator, body: []const u8) Parsed {
 
 /// Writes the named families' tables (only what differs from built-in) and publishes them for the next request. Every
 /// family is checked before any is written; returns the refusal text, or null.
-pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans: [effort_mod.families.len]EffortPlan) !?[]const u8 {
+pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans: [effort_mod.family_count]EffortPlan) !?[]const u8 {
     // Read, check, write and publish under the write lock: a save never merges into a file another one is rewriting.
     model_settings.lockWrites(io);
     defer model_settings.unlockWrites(io);
     var file = model_settings.load(arena, io, path);
     defer file.deinit();
-    var next: [effort_mod.families.len]effort_mod.Edits = undefined;
-    for (effort_mod.families, plans, &next) |f, p, *n| {
+    var next: [effort_mod.family_count]effort_mod.Edits = undefined;
+    for (effort_mod.families) |f| {
+        const p = plans[@intFromEnum(f)];
+        const n = &next[@intFromEnum(f)];
         n.* = model_settings.effortEdits(&file, f, false);
         if (!p.named) continue;
         if (p.reset) n.* = .{};
@@ -523,10 +525,11 @@ pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans
         n.* = effort_mod.normalize(f, n.*);
     }
     // Every family in one rewrite, so a failed write leaves none of them saved.
-    var sections: [effort_mod.families.len]model_settings.SectionEdits = undefined;
+    var sections: [effort_mod.family_count]model_settings.SectionEdits = undefined;
     var n_sections: usize = 0;
-    for (effort_mod.families, plans, next) |f, p, n| {
-        if (!p.named) continue;
+    for (effort_mod.families) |f| {
+        if (!plans[@intFromEnum(f)].named) continue;
+        const n = next[@intFromEnum(f)];
         const edits = try arena.alloc(Edit, effort_mod.table_words.len + 1);
         edits[0] = .{ .key = "default", .value = if (n.default) |d| .{ .string = @tagName(d) } else null };
         for (effort_mod.table_words, n.rows, 1..) |word, row, i| edits[i] = .{ .key = @tagName(word), .value = if (row.isEmpty()) null else try effort_mod.rowJson(arena, f, row) };
@@ -535,15 +538,15 @@ pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans
         n_sections += 1;
     }
     try model_settings.writeSectionsLocked(arena, io, path, sections[0..n_sections]);
-    for (effort_mod.families, plans, next) |f, p, n| {
-        if (!p.named) continue;
-        effort_mod.publish(f, n);
+    for (effort_mod.families) |f| {
+        if (!plans[@intFromEnum(f)].named) continue;
+        effort_mod.publish(f, next[@intFromEnum(f)]);
         log.info("[effort] {s}: table saved, serving from the next request\n", .{@tagName(f)});
     }
     return null;
 }
 
-fn effortMessage(think: ?effort_mod.Effort, plans: [effort_mod.families.len]EffortPlan) []const u8 {
+fn effortMessage(think: ?effort_mod.Effort, plans: [effort_mod.family_count]EffortPlan) []const u8 {
     if (think != null) for (plans) |p| if (p.default != null) return "applies at once, from the next request; --think still picks the default word until a start without it";
     return "applies at once, from the next request";
 }
@@ -1252,6 +1255,7 @@ fn effortRow(fam: std.json.ObjectMap, word: []const u8) std.json.ObjectMap {
 }
 
 test "settings api: an effort save names a family and its rows, and a value its template cannot take is refused by row" {
+    if (!effort_mod.all_built) return;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1279,6 +1283,7 @@ test "settings api: an effort save names a family and its rows, and a value its 
 }
 
 test "settings api: GET carries each family's table, built-in and served value per field, and the --think lock" {
+    if (!effort_mod.all_built) return;
     defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
     var file = try model_settings.parse(testing.allocator, "{}");
     defer file.deinit();
@@ -1290,7 +1295,7 @@ test "settings api: GET carries each family's table, built-in and served value p
     defer parsed.deinit();
     const ef = parsed.value.object.get("effort").?.object;
     try testing.expectEqualStrings("applies at once", ef.get("applies").?.string);
-    try testing.expectEqual(@as(usize, 3), ef.get("families").?.array.items.len);
+    try testing.expectEqual(effort_mod.families.len, ef.get("families").?.array.items.len);
     const ds = effortFamily(parsed.value, "deepseek_v41");
     try testing.expectEqualStrings("scale", ds.get("sends").?.object.get("kind").?.string);
     try testing.expectEqual(@as(i64, 50), ds.get("sends").?.object.get("presets").?.object.get("low").?.integer);
@@ -1319,7 +1324,33 @@ test "settings api: GET carries each family's table, built-in and served value p
     try testing.expect(!effortFamily(plain.value, "qwen4_exp").get("default").?.object.get("locked").?.bool);
 }
 
+test "settings api: an effort save lands on the table it names whichever families are built" {
+    defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/model-settings.json", .{dir});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (effort_mod.families) |f| {
+        const body = try std.fmt.allocPrint(a, "{{\"effort\":{{\"{s}\":{{\"high\":{{\"cap\":64}}}}}}}}", .{@tagName(f)});
+        const plan = parseRequest(a, body).ok;
+        for (effort_mod.families) |g| try testing.expectEqual(g == f, plan.effort[@intFromEnum(g)].named);
+        try testing.expect(try applyEffort(a, io, path, plan.effort) == null);
+        for (effort_mod.families) |g| {
+            const cap = effort_mod.publishedEdits(g).rows[effort_mod.rowIndex(.high).?].cap;
+            try testing.expectEqual(if (g == f) @as(??i32, @as(?i32, 64)) else null, cap);
+        }
+        for (effort_mod.families) |g| effort_mod.publish(g, .{});
+    }
+}
+
 test "settings api: an effort save writes only what differs from built-in, takes hold at once, and a reset clears it" {
+    if (!effort_mod.all_built) return;
     defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -1365,6 +1396,7 @@ test "settings api: an effort save writes only what differs from built-in, takes
 }
 
 test "settings api: an effort save cannot unoffer the word --think serves, which would refuse the next start" {
+    if (!effort_mod.all_built) return;
     defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
     const saved = effort_mod.think_effort_flag;
     defer effort_mod.think_effort_flag = saved;
@@ -1393,6 +1425,7 @@ test "settings api: an effort save cannot unoffer the word --think serves, which
 }
 
 test "settings api: two effort saves at once each keep their row, in the file and in the served table" {
+    if (!effort_mod.all_built) return;
     defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -1434,6 +1467,7 @@ test "settings api: two effort saves at once each keep their row, in the file an
 }
 
 test "settings api: a start reads the file's tables, skipping each bad field with a log line" {
+    if (!effort_mod.all_built) return;
     defer for (effort_mod.families) |f| effort_mod.publish(f, .{});
     var file = try model_settings.parse(testing.allocator,
         \\{"effort:glm5_next":{"low":{"cap":64,"sends":"medium"},"off":{"offered":true}},"effort:deepseek_v41":{"default":"medium","medium":{"offered":false}}}

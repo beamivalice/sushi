@@ -34,10 +34,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   fold whose target is not offered is refused. A row the file sets `offered` on is no longer a fold: true serves the
   word as itself (its own `sends` and `cap`, no notice: a mapping, not a re-route), false refuses it. No other word
   folds. MiMo's silent on-fold is unchanged (it has no table).
+- Each built-in table below is its arch's (`effort` in `src/<arch>/<arch>_chat.zig`); `effort.zig` holds the machinery
+  (merge, parse, resolve, the served store) and the section names (`effort.Family`) the settings file keys them by.
 - qwen4_exp (built-in): off, low (2048), medium (8192), xhigh (uncapped); the template reads the word (`sends` takes
   low|medium|xhigh, which the template accepts); `high` and `max` fold to `xhigh`; `minimal` still 400.
 - deepseek_v41 (built-in): off, low 50, medium 62, high 75, xhigh 87, max 100 on the encoder's 1-100 scale (`sends`
-  takes any whole number 1-100; 50, 75 and 100 reach the encoder as its own words, `chat.dsv41EffortFor`); no caps.
+  takes any whole number 1-100; 50, 75 and 100 reach the encoder as its own words, `chat.scaleEffortFor`); no caps.
 - glm5_next (built-in): low, high, max (uncapped, a prompt instruction; `sends` takes low|high|max); `medium` folds to
   `high` and `xhigh` to `max`; off can never be offered (the template has no thinking-off switch).
 - mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
@@ -62,7 +64,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   included; an effort word, or a budget (`reasoning_budget_tokens`, `budget_tokens`), still turns it on, a budget alone
   at low (`request_policy.holdOffDefault`, on chat, Anthropic and Responses alike). Explicit thinking off stays off. MiMo and GLM keep their defaults. A thinking
   request on another arch that names NO effort gets no server budget: Qwen3.8's template renders an absent word as
-  low (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
+  low (`chat.ladderEffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
   `sequence_number` on every event, stateful via
   `ResponseStore`, WS via Upgrade. A replayed `reasoning` input item (`content[].reasoning_text`, else
   `summary[].summary_text`) joins the following message and calls as ONE assistant turn's `reasoning_content`, and the

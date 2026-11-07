@@ -14,6 +14,7 @@ test {
     _ = @import("token_mask.zig");
     _ = @import("regex.zig");
     _ = @import("tokenizer.zig");
+    _ = @import("arch/chat.zig");
     _ = @import("dsv41/tokenizer_deepseek.zig");
     _ = @import("stop_sequences.zig");
     _ = @import("row_grammar.zig");

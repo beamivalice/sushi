@@ -8,7 +8,7 @@ const admission = @import("../arch/admission.zig");
 const registry = @import("../arch/registry.zig");
 const Trunk = trunk.Trunk;
 
-pub const model_types = [_][]const u8{"glm5_next"};
+pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
 
@@ -27,7 +27,6 @@ const config_file = @import("glm5_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "glm5_next", "glm5_next_text" };
 pub const discovery_types = model_types;
-pub const gate_rank = 2;
 pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true };
 pub const parseConfig = config_file.parseFamily;
 
@@ -37,7 +36,7 @@ pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir
 
 // slot:media (S2f)
 
-// slot:chat (S2g)
+pub const chat = @import("glm5_chat.zig"); // slot:chat (S2g)
 
 pub const kld = @import("glm5_kld_capture.zig");
 

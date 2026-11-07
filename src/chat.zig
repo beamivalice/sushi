@@ -1,5 +1,6 @@
 const std = @import("std");
 const effort_mod = @import("effort.zig");
+const arch_chat = @import("arch/chat.zig");
 const jinja_c = @import("jinja_c");
 const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
@@ -173,22 +174,22 @@ pub const ChatConfig = struct {
     }
 };
 
-/// True when `<model_dir>/config.json` declares the given model_type. Any
-/// read/parse failure is false — this only ARMS a family fallback, never
-/// blocks a load.
-fn dirModelTypeIs(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, want: []const u8) bool {
-    const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+/// The template the arch of `<model_dir>/config.json` pins, if it pins one. Any read/parse failure is no pin: this
+/// only ARMS a family fallback, never blocks a load.
+fn dirPin(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?arch_chat.Pin {
+    const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return null;
     defer allocator.free(cfg_path);
-    const file = std.Io.Dir.openFileAbsolute(io, cfg_path, .{}) catch return false;
+    const file = std.Io.Dir.openFileAbsolute(io, cfg_path, .{}) catch return null;
     defer file.close(io);
     var buf: [4096]u8 = undefined;
     var rs = file.reader(io, &buf);
-    const content = rs.interface.allocRemaining(allocator, .limited(1 << 22)) catch return false;
+    const content = rs.interface.allocRemaining(allocator, .limited(1 << 22)) catch return null;
     defer allocator.free(content);
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
     defer parsed.deinit();
-    const mt = parsed.value.object.get("model_type") orelse return false;
-    return mt == .string and std.mem.eql(u8, mt.string, want);
+    if (parsed.value != .object) return null;
+    const mt = parsed.value.object.get("model_type") orelse return null;
+    return if (mt == .string) arch_chat.pinOf(mt.string) else null;
 }
 
 /// Is this `chat_template` entry just an `{% include %}` POINTER at the
@@ -325,10 +326,9 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 
     const root = parsed.value.object;
 
-    // DeepSeek's V4.1 template merges dicts with `**`, which jinja.cpp cannot parse; ours is pinned to the encoder.
-    const dsv41 = dirModelTypeIs(io, allocator, model_dir, "deepseek_v41");
-    const chat_template: []const u8 = if (dsv41)
-        try allocator.dupe(u8, @embedFile("fixtures/dsv41_chat_template.jinja"))
+    const pin = dirPin(io, allocator, model_dir);
+    const chat_template: []const u8 = if (pin) |p|
+        try allocator.dupe(u8, p.template)
     else if (chatTemplateFromValue(root.get("chat_template"))) |t|
         try allocator.dupe(u8, t)
     else blk: {
@@ -366,12 +366,9 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         .eos_token = eos_token,
         .add_bos_token = add_bos_token,
         .allocator = allocator,
-        .image_placeholder = if (dsv41) dsv41_image_atom else null,
+        .image_placeholder = if (pin) |p| p.image_placeholder else null,
     };
 }
-
-/// V4.1's image placeholder token, which the processor expands into the image's span.
-pub const dsv41_image_atom = "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>";
 
 /// Format chat messages into token IDs using the model's Jinja chat template.
 /// `effort` is the client's raw `reasoning_effort` string (see
@@ -1196,9 +1193,9 @@ pub fn templateConsumesEffort(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
 }
 
-/// OpenAI's effort vocabulary -> the JSON value DeepSeek-V4.1's encoder takes: its words (low 50, high 75, max 100,
-/// default high) or a 1-100 budget for the steps between them.
-fn dsv41EffortFor(effort: ?[]const u8) []const u8 {
+/// OpenAI's effort vocabulary -> the scale dialect, the JSON value a `thinking_mode` encoder takes (DeepSeek-V4.1):
+/// its words (low 50, high 75, max 100, default high) or a 1-100 budget for the steps between them.
+fn scaleEffortFor(effort: ?[]const u8) []const u8 {
     const e = effort orelse return "\"high\"";
     // A table's value on the 1-100 scale; the encoder's own three steps go as its words.
     if (std.fmt.parseInt(u8, e, 10)) |n| {
@@ -1216,11 +1213,11 @@ fn dsv41EffortFor(effort: ?[]const u8) []const u8 {
     return "\"high\"";
 }
 
-/// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
+/// OpenAI's effort vocabulary -> the ladder dialect, xhigh|medium|low (Qwen3.8). The template
 /// raise_exception's on any other string and its own default is xhigh, so an
 /// absent or unrecognized effort keeps the checkpoint default. The template
 /// never reads the key on its thinking-off arm, so the value is inert there.
-fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
+fn ladderEffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     if (!enable_thinking) return "low";
     // An ABSENT effort takes OUR default, not the checkpoint's. The template
     // defaults to xhigh, whose preamble asks the model to validate assumptions
@@ -1240,8 +1237,8 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
 }
 
 /// `effort` is the client's raw `reasoning_effort` string (null when the
-/// request didn't send one) — today only the dsv4 family maps it into the
-/// template; other families keep their fixed vocabulary.
+/// request didn't send one). The scale, ladder and word dialects each map it into their template; any other
+/// template keeps a fixed vocabulary.
 fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -1265,7 +1262,7 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // accepted-values tuple, so a reworded raise message can't drift the
     // detection. EVERY 3.8 template raises on OpenAI's "high", so this keys the
     // mapping for the whole family.
-    const qwen38_style = std.mem.indexOf(u8, chat_config.chat_template, "'xhigh'") != null;
+    const ladder_style = std.mem.indexOf(u8, chat_config.chat_template, "'xhigh'") != null;
     if (need_comma) try buf.append(allocator, ',');
     if (enable_thinking) {
         try buf.appendSlice(allocator, "\"enable_thinking\":true");
@@ -1277,21 +1274,21 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // xhigh|medium|low, DeepSeek's low|high|max) and raise on any other string:
     // a raise swaps in fallbackFormatChat (wrong-family tags), so every one is
     // mapped below instead of sent the default.
-    const dsv41_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
-    const glm5_style = std.mem.indexOf(u8, chat_config.chat_template, "effective_reasoning_effort") != null and
+    const scale_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
+    const word_style = std.mem.indexOf(u8, chat_config.chat_template, "effective_reasoning_effort") != null and
         std.mem.indexOf(u8, chat_config.chat_template, "[gMASK]<sop>") != null;
-    if (glm5_style) {
+    if (word_style) {
         // Sushi defaults to high; depth is a prompt instruction, never a token cap.
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, effort orelse "high");
         try buf.append(allocator, '"');
-    } else if (dsv41_style) {
+    } else if (scale_style) {
         // V4.1 renders a numeric budget for every thinking turn, on its own ladder.
         try buf.appendSlice(allocator, ",\"reasoning_effort\":");
-        try buf.appendSlice(allocator, dsv41EffortFor(effort));
-    } else if (qwen38_style) {
+        try buf.appendSlice(allocator, scaleEffortFor(effort));
+    } else if (ladder_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
-        try buf.appendSlice(allocator, qwen38EffortFor(effort, enable_thinking));
+        try buf.appendSlice(allocator, ladderEffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
@@ -3281,7 +3278,7 @@ test "chat: V4.1 renders images as the release's encoder does, an atom for each 
             .thinking = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}System\u{ff5c}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nS<\u{ff5c}User\u{ff5c}><\u{ff5c}deepseek_image\u{ff5c}>\n\nq1<\u{ff5c}Assistant\u{ff5c}></think>a1<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>q2\n\n<\u{ff5c}deepseek_image\u{ff5c}><\u{ff5c}Assistant\u{ff5c}><think>",
         },
     };
-    var cfg = ChatConfig{ .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = dsv41_image_atom };
+    var cfg = ChatConfig{ .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = (arch_chat.pinOf("deepseek_v41") orelse return).image_placeholder };
     const tpl_z = try a.dupeSentinel(u8, cfg.chat_template, 0);
     defer a.free(tpl_z);
     for (cases) |c| for ([_]struct { mode: []const u8, want: []const u8 }{ .{ .mode = "chat", .want = c.chat }, .{ .mode = "thinking", .want = c.thinking } }) |arm| {
@@ -3335,12 +3332,12 @@ test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with
 }
 
 test "chat: the V4.1 effort words map onto the encoder's 1-100 ladder, medium at 62 and xhigh at 87" {
-    try testing.expectEqualStrings("\"high\"", dsv41EffortFor(null));
-    try testing.expectEqualStrings("\"low\"", dsv41EffortFor("minimal"));
-    try testing.expectEqualStrings("62", dsv41EffortFor("medium"));
-    try testing.expectEqualStrings("\"high\"", dsv41EffortFor("high"));
-    try testing.expectEqualStrings("87", dsv41EffortFor("xhigh"));
-    try testing.expectEqualStrings("\"max\"", dsv41EffortFor("max"));
+    try testing.expectEqualStrings("\"high\"", scaleEffortFor(null));
+    try testing.expectEqualStrings("\"low\"", scaleEffortFor("minimal"));
+    try testing.expectEqualStrings("62", scaleEffortFor("medium"));
+    try testing.expectEqualStrings("\"high\"", scaleEffortFor("high"));
+    try testing.expectEqualStrings("87", scaleEffortFor("xhigh"));
+    try testing.expectEqualStrings("\"max\"", scaleEffortFor("max"));
 }
 
 /// One DeepSeek-V4.1 turn replayed the way a client does: the model's tokens for `raw`, the server's split and parse of
@@ -3434,3 +3431,74 @@ const NextReuse = enum {
 };
 
 pub const ReplayCase = struct { name: []const u8, tools: ?[]const u8, thinking: bool, raw: []const u8, reuse: NextReuse };
+
+test "serializeExtraContext: every family's template reads the same extra context for every effort word" {
+    // One line per template x thinking x effort, FNV-1a over all of them: a changed byte in any context fails this.
+    const a = testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+    const tpls = [_]struct { n: []const u8, t: []const u8 }{
+        .{ .n = "qwen", .t = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
+        .{ .n = "dsv", .t = @embedFile("fixtures/dsv41_chat_template.jinja") },
+        .{ .n = "glm", .t = @embedFile("fixtures/glm53_chat_template.jinja") },
+        .{ .n = "mimo", .t = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .n = "plain", .t = "{{ reasoning_effort }}" },
+    };
+    const efforts = [_]?[]const u8{ null, "none", "minimal", "low", "medium", "high", "xhigh", "max", "62", "100" };
+    for (tpls) |tp| for ([_]bool{ true, false }) |th| for (efforts) |e| {
+        var cfg = ChatConfig{ .chat_template = tp.t, .bos_token = "<b>", .eos_token = "<e>", .add_bos_token = false, .allocator = a, .preserve_thinking = true };
+        const r = try serializeExtraContext(a, &cfg, th, e);
+        defer a.free(r);
+        const line = try std.fmt.allocPrint(a, "{s}|{}|{s}|{s}\n", .{ tp.n, th, e orelse "~", r });
+        defer a.free(line);
+        try out.appendSlice(a, line);
+    };
+    try testing.expectEqual(@as(u64, 0xb1ce8d4293138d42), std.hash.Fnv1a_64.hash(out.items));
+}
+
+test "loadChatConfig: a config.json that is not an object pins nothing" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    for ([_][]const u8{ "[]", "7", "\"deepseek_v41\"", "null" }) |body| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = body });
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"own\"}" });
+        var cc = try loadChatConfig(io, testing.allocator, root);
+        defer cc.deinit();
+        try testing.expectEqualStrings("own", cc.chat_template);
+        try testing.expect(cc.image_placeholder == null);
+    }
+}
+
+test "loadChatConfig: the checkpoint's own template is read, and a model type with a pin gets its pinned template and image atom" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    for ([_][]const u8{ "deepseek_v41", "qwen4_exp", "mimo_v2" }) |model_type| {
+        const dir = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ root, model_type });
+        defer testing.allocator.free(dir);
+        try tmp.dir.createDirPath(io, model_type);
+        const config = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{model_type});
+        defer testing.allocator.free(config);
+        const config_json = try std.fmt.allocPrint(testing.allocator, "{{\"model_type\":\"{s}\"}}", .{model_type});
+        defer testing.allocator.free(config_json);
+        try tmp.dir.writeFile(io, .{ .sub_path = config, .data = config_json });
+        const tok = try std.fmt.allocPrint(testing.allocator, "{s}/tokenizer_config.json", .{model_type});
+        defer testing.allocator.free(tok);
+        try tmp.dir.writeFile(io, .{ .sub_path = tok, .data = "{\"chat_template\":\"own\",\"bos_token\":\"<b>\"}" });
+        var cc = try loadChatConfig(io, testing.allocator, dir);
+        defer cc.deinit();
+        if (arch_chat.pinOf(model_type) != null) {
+            try testing.expectEqualStrings(@embedFile("fixtures/dsv41_chat_template.jinja"), cc.chat_template);
+            try testing.expectEqualStrings("<\u{ff5c}deepseek_image\u{ff5c}>", cc.image_placeholder.?);
+        } else {
+            try testing.expectEqualStrings("own", cc.chat_template);
+            try testing.expect(cc.image_placeholder == null);
+        }
+        try testing.expectEqualStrings("<b>", cc.bos_token.?);
+    }
+}

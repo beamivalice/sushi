@@ -2,7 +2,7 @@ const std = @import("std");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const unicode_props = @import("tokenizer_unicode.zig");
-const deepseek_pretok = @import("dsv41/tokenizer_deepseek.zig");
+const arch_chat = @import("arch/chat.zig");
 
 const WordRules = enum { legacy, letters, letters_marks };
 
@@ -42,8 +42,8 @@ pub fn reservedOutputIds(
     return out.toOwnedSlice(allocator);
 }
 
-/// Pre-tokenizer grammar selected from tokenizer.json.
-pub const PretokStyle = enum { gpt2, deepseek };
+/// Pre-tokenizer grammar selected from tokenizer.json: `gpt2` here, or one an arch brings (`arch/chat.zig`).
+pub const PretokStyle = arch_chat.PretokStyle;
 
 /// Precedes a special's text that the sender wrote as plain text (see `Tokenizer.markLiteralSpecials`).
 /// A Unicode noncharacter, so it cannot be part of a real message.
@@ -343,10 +343,9 @@ pub const Tokenizer = struct {
             for (words.items) |w| allocator.free(w);
             words.deinit(allocator);
         }
-        switch (self.pretok_style) {
-            .gpt2 => try gpt2PreTokenizeRules(allocator, text, self.digit_group, self.word_rules, &words),
-            .deepseek => try deepseek_pretok.preTokenize(allocator, text, &words),
-        }
+        if (self.pretok_style == .gpt2) {
+            try gpt2PreTokenizeRules(allocator, text, self.digit_group, self.word_rules, &words);
+        } else try arch_chat.preTokenize(self.pretok_style, allocator, text, &words);
 
         // For each word: map bytes to unicode chars, then BPE merge, then look up vocab
         var all_ids = std.ArrayList(u32).empty;
@@ -1022,7 +1021,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .special_tokens = special_tokens,
         .flagged_specials = try flagged.toOwnedSlice(allocator),
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
-        .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
+        .pretok_style = if (root.get("pre_tokenizer")) |pt| arch_chat.pretokStyleOf(pt) else .gpt2,
         .word_rules = if (root.get("pre_tokenizer")) |pt| wordRulesFromPreTokenizer(pt) else .legacy,
         .ignore_merges = if (model_obj.get("ignore_merges")) |v| v == .bool and v.bool else false,
         .byte_to_unicode = byte_to_unicode,
@@ -1064,35 +1063,7 @@ fn isIndividualDigitsRule(node: std.json.Value) bool {
     return ind == .bool and ind.bool;
 }
 
-/// Pre-tokenizer grammar from the tokenizer.json Split regex.
-fn pretokStyleFromPreTokenizer(pt: std.json.Value) PretokStyle {
-    if (pt != .object) return .gpt2;
-    if (isDeepseekSequence(pt)) return .deepseek;
-    return .gpt2;
-}
-
-/// DeepSeek-V4.x's `Sequence`: its three Splits (digits, CJK, the punctuation grammar), each isolated, then a
-/// ByteLevel that does not split. Only that exact spelling is read as the grammar `tokenizer_deepseek` runs.
-fn isDeepseekSequence(pt: std.json.Value) bool {
-    const list = pt.object.get("pretokenizers") orelse return false;
-    if (list != .array or list.array.items.len != 4) return false;
-    const regexes = [_][]const u8{ deepseek_pretok.digits_regex, deepseek_pretok.cjk_regex, deepseek_pretok.main_regex };
-    for (regexes, list.array.items[0..3]) |want, node| {
-        if (node != .object) return false;
-        const rx = splitRegexOf(node) orelse return false;
-        const behavior = node.object.get("behavior") orelse return false;
-        const invert = node.object.get("invert") orelse return false;
-        if (!std.mem.eql(u8, rx, want) or behavior != .string or !std.mem.eql(u8, behavior.string, "Isolated") or invert != .bool or invert.bool) return false;
-    }
-    const byte_level = list.array.items[3];
-    if (byte_level != .object) return false;
-    const ty = byte_level.object.get("type") orelse return false;
-    if (ty != .string or !std.mem.eql(u8, ty.string, "ByteLevel")) return false;
-    const use_regex = byte_level.object.get("use_regex") orelse return false;
-    return use_regex == .bool and !use_regex.bool;
-}
-
-fn splitRegexOf(node: std.json.Value) ?[]const u8 {
+pub fn splitRegexOf(node: std.json.Value) ?[]const u8 {
     const obj = node.object;
     const ty = obj.get("type") orelse return null;
     if (ty != .string or !std.mem.eql(u8, ty.string, "Split")) return null;
@@ -1878,4 +1849,19 @@ test "real tokenizer reference parity (CPU only, gated)" {
             };
         }
     }
+}
+
+test "pre-tokenizer style: a spelling no arch claims stays gpt2" {
+    const a = testing.allocator;
+    const qwen =
+        \\{"type":"Sequence","pretokenizers":[
+        \\{"type":"Split","pattern":{"Regex":"\\p{N}"},"behavior":"Isolated","invert":false},
+        \\{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}
+    ;
+    var q = try std.json.parseFromSlice(std.json.Value, a, qwen, .{});
+    defer q.deinit();
+    try testing.expectEqual(PretokStyle.gpt2, arch_chat.pretokStyleOf(q.value));
+    var plain = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"ByteLevel\"}", .{});
+    defer plain.deinit();
+    try testing.expectEqual(PretokStyle.gpt2, arch_chat.pretokStyleOf(plain.value));
 }

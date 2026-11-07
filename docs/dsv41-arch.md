@@ -176,7 +176,7 @@ against the reference's own kernels on a midpoint-rich fixture.
 
 The release's pre-tokenizer is a `Sequence` of three isolating Splits (`\p{N}{1,3}`, a CJK class, a punctuation grammar)
 and a ByteLevel that does not split. `src/dsv41/tokenizer_deepseek.zig` runs it exactly, each Split on the pieces the one before
-left, so a whitespace run at a piece's edge stays whole; it is selected only when the tokenizer.json spells those three
+left, so a whitespace run at a piece's edge stays whole; it is selected (`pretokenizer` in `src/dsv41/dsv41_chat.zig`) only when the tokenizer.json spells those three
 regexes verbatim. It needs `\p{P}` and `\p{S}`, which `scripts/gen-tokenizer-unicode.py` now emits beside letters, marks and
 numbers. Pinned to HF `tokenizers` by `deepseek pre-tokenizer` (21 inputs, hermetic) and by the real-pack parity in
 `tests/test_tokenizer_reference.sh`. The embedded Engram token map matches the real tokenizer (129280 tokens to 99092 ids).

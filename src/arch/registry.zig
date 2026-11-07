@@ -1,16 +1,27 @@
 //! The one file meant to name an architecture outside `src/<arch>/`. The target is that dropping one means deleting
 //! its folder and its `// arch:<name>` line; shared files still name archs, and `tests/test_arch_drop.sh` lists the
 //! strays. `-Darchs=` builds a subset: an arch left out has no prong in `Tag`, `Spec` or `Arch`.
+//! No test lives here: the host tier (no MLX) reaches `Chat`, and a test in this file would pull every `arch.zig`
+//! in with it. The tests are `registry_test.zig`.
 const std = @import("std");
 const opts = @import("build_options");
 
-const Entry = struct { name: [:0]const u8, mod: type };
+// One line per arch.
+// `mod` is its `arch.zig` and `chat` its MLX-free face. They are separate decls, so a file is read only where it is
+// used: the host tier uses `chat` alone, and an arch left out of `-Darchs` is read by neither. The line's own
+// `model_types` and `gate_rank` are what the arch gate needs of an arch the build left out, without reading its files.
+const archs = struct {
+    pub const glm5 = struct { const name = "glm5"; const model_types = [_][]const u8{"glm5_next"}; const gate_rank = 2; const mod = @import("../glm5/arch.zig"); const chat = @import("../glm5/glm5_chat.zig"); }; // arch:glm5
+    pub const dsv41 = struct { const name = "dsv41"; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); }; // arch:dsv41
+    pub const qwen4 = struct { const name = "qwen4"; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); }; // arch:qwen4
+    pub const mimo2 = struct { const name = "mimo2"; const model_types = [_][]const u8{"mimo_v2"}; const gate_rank = 1; const mod = @import("../mimo2/arch.zig"); const chat = @import("../mimo2/mimo_chat.zig"); }; // arch:mimo2
+};
 
-const entries = [_]Entry{
-    .{ .name = "glm5", .mod = @import("../glm5/arch.zig") }, // arch:glm5
-    .{ .name = "dsv41", .mod = @import("../dsv41/arch.zig") }, // arch:dsv41
-    .{ .name = "qwen4", .mod = @import("../qwen4/arch.zig") }, // arch:qwen4
-    .{ .name = "mimo2", .mod = @import("../mimo2/arch.zig") }, // arch:mimo2
+const all_names = blk: {
+    const decls = std.meta.declarations(archs);
+    var out: [decls.len][:0]const u8 = undefined;
+    for (decls, &out) |d, *name| name.* = @field(archs, d).name;
+    break :blk out;
 };
 
 pub fn selected(wanted: []const []const u8, name: []const u8) bool {
@@ -20,17 +31,17 @@ pub fn selected(wanted: []const []const u8, name: []const u8) bool {
 }
 
 fn registered(name: []const u8) bool {
-    for (entries) |e| if (std.mem.eql(u8, e.name, name)) return true;
+    for (all_names) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
 }
 
 const enabled = blk: {
     for (opts.archs) |w| if (!registered(w))
         @compileError("-Darchs names \"" ++ w ++ "\", which src/arch/registry.zig does not register");
-    var buf: [entries.len]Entry = undefined;
+    var buf: [all_names.len][:0]const u8 = undefined;
     var n: usize = 0;
-    for (entries) |e| if (selected(opts.archs, e.name)) {
-        buf[n] = e;
+    for (all_names) |name| if (selected(opts.archs, name)) {
+        buf[n] = name;
         n += 1;
     };
     if (n == 0) @compileError("-Darchs leaves no architecture to build");
@@ -41,8 +52,8 @@ const enabled = blk: {
 pub const Tag = blk: {
     var names: [enabled.len][]const u8 = undefined;
     var values: [enabled.len]u8 = undefined;
-    for (enabled, &names, &values, 0..) |e, *name, *value, i| {
-        name.* = e.name;
+    for (enabled, &names, &values, 0..) |name, *n, *value, i| {
+        n.* = name;
         value.* = i;
     }
     break :blk @Enum(u8, .exhaustive, &names, &values);
@@ -56,21 +67,26 @@ pub const Arch = Tagged("Model", false);
 fn Tagged(comptime decl: []const u8, comptime by_const_ptr: bool) type {
     var names: [enabled.len][]const u8 = undefined;
     var types: [enabled.len]type = undefined;
-    for (enabled, &names, &types) |e, *name, *ty| {
-        name.* = e.name;
-        ty.* = if (by_const_ptr) *const @field(e.mod, decl) else @field(e.mod, decl);
+    for (std.meta.tags(Tag), &names, &types) |t, *name, *ty| {
+        name.* = @tagName(t);
+        ty.* = if (by_const_ptr) *const @field(Mod(t), decl) else @field(Mod(t), decl);
     }
     return @Union(.auto, Tag, &names, &types, &@splat(.{}));
 }
 
 /// The arch module behind a tag.
 pub fn Mod(comptime tag: Tag) type {
-    return enabled[@intFromEnum(tag)].mod;
+    return @field(archs, @tagName(tag)).mod;
+}
+
+/// The arch's MLX-free chat face (`<arch>_chat.zig`): effort offer, pinned template, pre-tokenizer.
+pub fn Chat(comptime tag: Tag) type {
+    return @field(archs, @tagName(tag)).chat;
 }
 
 pub fn ofModelType(model_type: []const u8) ?Tag {
-    inline for (enabled, 0..) |e, i| {
-        for (e.mod.model_types) |t| if (std.mem.eql(u8, t, model_type)) return @enumFromInt(i);
+    inline for (comptime std.meta.tags(Tag)) |t| {
+        for (Chat(t).model_types) |m| if (std.mem.eql(u8, m, model_type)) return t;
     }
     return null;
 }
@@ -78,7 +94,7 @@ pub fn ofModelType(model_type: []const u8) ?Tag {
 /// The arch that runs a model type no arch claims: today the generic MoE trunk, which declares `default_arch`. Null
 /// when its arch is not built.
 pub const default: ?Tag = blk: {
-    for (enabled, 0..) |e, i| if (@hasDecl(e.mod, "default_arch")) break :blk @enumFromInt(i);
+    for (std.meta.tags(Tag)) |t| if (@hasDecl(Mod(t), "default_arch")) break :blk t;
     break :blk null;
 };
 
@@ -91,67 +107,33 @@ pub fn handleOf(model: anytype) Arch {
 
 pub const served_model_types: []const []const u8 = blk: {
     var out: []const []const u8 = &.{};
-    for (enabled) |e| for (e.mod.model_types) |t| {
-        out = out ++ &[_][]const u8{t};
+    for (std.meta.tags(Tag)) |t| for (Chat(t).model_types) |m| {
+        out = out ++ &[_][]const u8{m};
     };
     break :blk out;
 };
 
 /// Every registered arch's model types, enabled or not, in the order the arch gate's refusal lists them (`gate_rank`).
 pub const registered_model_types: []const []const u8 = blk: {
-    var order: [entries.len]Entry = entries;
+    const decls = std.meta.declarations(archs);
+    var order: [decls.len]type = undefined;
+    for (decls, &order) |d, *a| a.* = @field(archs, d);
     for (1..order.len) |i| {
         var j = i;
-        while (j > 0 and order[j].mod.gate_rank < order[j - 1].mod.gate_rank) : (j -= 1) {
-            const t = order[j];
+        while (j > 0 and order[j].gate_rank < order[j - 1].gate_rank) : (j -= 1) {
+            const a = order[j];
             order[j] = order[j - 1];
-            order[j - 1] = t;
+            order[j - 1] = a;
         }
     }
     var out: []const []const u8 = &.{};
-    for (order) |e| for (e.mod.model_types) |t| {
-        out = out ++ &[_][]const u8{t};
+    for (order) |a| for (a.model_types) |m| {
+        out = out ++ &[_][]const u8{m};
     };
     break :blk out;
 };
 
-test "every enabled arch's own tests are part of the build" {
-    inline for (enabled) |e| _ = e.mod;
-}
-
-test "an empty arch list builds every arch, a named one only itself" {
-    const testing = std.testing;
-    try testing.expect(selected(&.{}, "glm5"));
-    try testing.expect(selected(&.{ "qwen4", "glm5" }, "glm5"));
-    try testing.expect(!selected(&.{ "qwen4", "glm5" }, "dsv41"));
-}
-
-test "a model type resolves to the arch that claims it" {
-    const testing = std.testing;
-    inline for (.{ .{ "qwen4_exp", "qwen4" }, .{ "mimo_v2", "mimo2" }, .{ "glm5_next", "glm5" }, .{ "deepseek_v41", "dsv41" } }) |c| {
-        if (comptime selected(opts.archs, c[1])) try testing.expectEqualStrings(c[1], @tagName(ofModelType(c[0]).?));
-    }
-    try testing.expectEqual(@as(?Tag, null), ofModelType("mistral"));
-    try testing.expectEqual(@as(?Tag, null), ofModelType(""));
-}
-
-test "every enabled arch declares the operations the dispatch files call" {
-    inline for (enabled) |e| {
-        inline for (.{ "model_types", "Config", "Model", "packs", "flags", "init", "deinit", "resetCache", "warmup", "forward", "lmHeadForDraft", "ownsModuleDecodeState", "expertStream" }) |decl| {
-            if (!@hasDecl(e.mod, decl)) @compileError(e.name ++ "/arch.zig lacks " ++ decl);
-        }
-    }
-    comptime var defaults = 0;
-    inline for (enabled) |e| {
-        if (@hasDecl(e.mod, "default_arch")) defaults += 1;
-    }
-    try std.testing.expect(defaults <= 1);
-}
-
-test "served model types list each enabled arch's types once" {
-    const testing = std.testing;
-    try testing.expectEqual(enabled.len, served_model_types.len);
-    for (served_model_types, 0..) |t, i| {
-        for (served_model_types[i + 1 ..]) |u| try testing.expect(!std.mem.eql(u8, t, u));
-    }
+/// The model types `tag`'s registry line names.
+pub fn lineModelTypes(comptime tag: Tag) []const []const u8 {
+    return &@field(archs, @tagName(tag)).model_types;
 }
