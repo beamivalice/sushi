@@ -122,7 +122,7 @@ PARA = [
 
 
 def document(sections):
-    """About 180 tokens a section; the heading keeps repeats from collapsing into a loop."""
+    """About 100 tokens a section; the heading keeps repeats from collapsing into a loop."""
     return "\n\n".join(f"Section {i + 1}. {PARA[i % len(PARA)]}" for i in range(sections))
 
 
@@ -267,13 +267,11 @@ class Replay:
         seg, self.mark = text[self.mark:], len(text)
         return seg
 
-    def chat(self, messages, n, lp=True, think=None, key=None):
+    def chat(self, messages, n, lp=True, think=None):
         body = {"model": "sushi", "messages": messages, "max_tokens": n, "temperature": 0, "seed": 1, "stream": False,
                 **(self.think if think is None else think)}
         if lp:
             body.update(logprobs=True, top_logprobs=5)
-        if key:
-            body["prompt_cache_key"] = key
         return post(self.s.base, "/v1/chat/completions", body)
 
     def raw(self, prompt, n, lp=True):
@@ -348,7 +346,7 @@ class Replay:
 
     def case_long(self, k):
         self.slice()
-        return self.result(self.chat(self.user(document(33) + "\n\nSummarize the history above in three sentences."), 128),
+        return self.result(self.chat(self.user(document(60) + "\n\nSummarize the history above in three sentences."), 128),
                            self.slice())
 
     def case_spec(self, k):
@@ -360,15 +358,14 @@ class Replay:
         return self.result(out, seg, prompts=PROMPTS[:2])
 
     def case_hot(self, k):
-        """~2k-token prompt, then the same plus a follow-up turn; a pass has its own cache key so it starts cold."""
-        key = f"tape{k}"
-        q1 = document(11) + "\n\nIn one sentence, what is the oldest structure in the town?"
+        """~2k-token prompt, then the same plus a follow-up turn; the cache starts empty."""
+        q1 = document(20) + "\n\nIn one sentence, what is the oldest structure in the town?"
         self.slice()
-        a = self.chat(self.user(q1), 64, key=key)
+        a = self.chat(self.user(q1), 64)
         seg_a = self.slice()
         follow = [*self.user(q1), {"role": "assistant", "content": "The stone quay."},
                   {"role": "user", "content": "And what was the quay built from before it was rebuilt in stone?"}]
-        b = self.chat(follow, 64, key=key)
+        b = self.chat(follow, 64)
         seg_b = self.slice()
         return {"response": [response_record(a), response_record(b)], "log": log_lines(seg_a) + ["--"] + log_lines(seg_b)}
 
@@ -377,19 +374,19 @@ class Replay:
         msg = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}},
                                             {"type": "text", "text": "What is in this image? Answer in one sentence."}]}]
         self.slice()
-        return self.result(self.chat(msg, 64, key=f"tape{k}"), self.slice())
+        return self.result(self.chat(msg, 64), self.slice())
 
     def case_think(self, k):
         """Two thinking turns; the second carries the first's reasoning back, so the thought point is exercised."""
         think = {"reasoning_effort": "low"}
         m1 = self.user("A bat and a ball cost 1.10 together and the bat costs one more than the ball. What does the ball cost?")
         self.slice()
-        a = self.chat(m1, 400, think=think, key=f"tape{k}")
+        a = self.chat(m1, 400, think=think)
         seg_a = self.slice()
         msg = a["choices"][0]["message"]
         m2 = [*m1, {"role": "assistant", "content": msg.get("content") or "", "reasoning_content": msg.get("reasoning_content") or ""},
               {"role": "user", "content": "Now answer the same question for a bat that costs two more."}]
-        b = self.chat(m2, 400, think=think, key=f"tape{k}")
+        b = self.chat(m2, 400, think=think)
         return {"response": [response_record(a), response_record(b)], "log": log_lines(seg_a) + ["--"] + log_lines(self.slice())}
 
 
@@ -407,10 +404,20 @@ def run_boot(label, pack, flags, cases, runs):
         return out, load
 
 
+def run_fresh(label, pack, flags, cases, runs):
+    """Cases that leave state in the prefix cache record each run on a boot of its own: no key isolates a run."""
+    out, load = {c: [] for c in cases}, None
+    for k in range(runs):
+        one, load = run_boot(f"{label}-{k}", pack, flags, cases, 1)
+        for c in cases:
+            out[c] += one[c]
+    return out, load
+
+
 def run_ssd(label, pack, flags, runs):
     """Case 5: one boot persists prompt A, then `runs` boots each start from a copy of that cache and restore it."""
     import sushi_boot
-    doc = document(11)
+    doc = document(20)
     qa = doc + "\n\nIn one sentence, what is the oldest structure in the town?"
     follow = [{"role": "user", "content": qa}, {"role": "assistant", "content": "The stone quay."},
               {"role": "user", "content": "And what was the quay built from before it was rebuilt in stone?"}]
@@ -567,7 +574,7 @@ def main(argv):
             res = run_ssd(f"tape-{a.pack}-ssd", pack, spec["slots"] + flags, runs)
             entries = {"persist": settle(res["persist"]), "restore": settle(res["restore"])}
         else:
-            res, load = run_boot(f"tape-{a.pack}-{block}", pack, spec["slots"] + flags, cases, runs)
+            res, load = (run_fresh if block == "hot" else run_boot)(f"tape-{a.pack}-{block}", pack, spec["slots"] + flags, cases, runs)
             entries = {c: settle(res[c]) for c in cases}
             entries["load"] = {"response": None, "log": load, "note": True}
         got["boots"][block] = entries
