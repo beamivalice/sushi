@@ -2,5 +2,5 @@
 # The count may only shrink. Generated: python3 tests/suite_guards.py --write. Keyed by model, not file.
 qwen4 792
 mimo2 247
-glm5 461
-dsv41 210
+glm5 439
+dsv41 175

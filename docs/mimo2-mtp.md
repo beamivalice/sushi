@@ -21,6 +21,10 @@ MiMo's three MTP heads, split out of [engine-mtp](engine-mtp.md); everything sha
   per-request `RowCache` holding the window, never a `KVCache`; the prompt appends only its last window per head.
   The target hiddens ride a 256-row ring (`State.record`), copied out of a prefill chunk's hiddens and evaluated at
   once: a slice of them held the whole chunk (35 MB at 4096 rows) until the first round.
+- **The head's projections are bound once at load** (`Head.bindLinear`, `linear.Linear`): an FP8 one holds its codes and
+  scales, with the qkv's `RowSplit` beside it in `Layer.qkv_split`; a dense one holds its transposed view, built at
+  load and billed nowhere (it shares the weight's bytes). A draft builds no view. A dense
+  projection stays `mlx_matmul` against the view, not `Linear.apply`, whose short-row kernels would change the bytes.
 - The `.mimo` arm maps the generic stash + merged first step onto head 0 and each later step onto head i
   (`draftStep`); the step index rides `hidden_next` (a scalar), host token ids ride `host_ids`. Depth and the free
   EV cap clamp to the head count and to the verify row budget; rounds stay solo (`mtpRoundsStaySolo`); no

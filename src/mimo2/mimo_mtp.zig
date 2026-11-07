@@ -20,7 +20,10 @@ const trunk_mod = @import("../trunk.zig");
 const mimo_forward = @import("mimo_forward.zig");
 const mtp_mod = @import("../mtp.zig");
 const fp8_block = @import("../fp8_block.zig");
+const linear = @import("../linear.zig");
 const log = @import("../log.zig");
+
+const builtin = @import("builtin");
 
 const Transformer = trunk_mod.Transformer;
 const Weights = model_mod.Weights;
@@ -43,28 +46,18 @@ fn rerankBitsFrom(raw: ?[]const u8) u32 {
 /// window plus the rows a lagging head catches up and a round's drafts.
 const RING_ROWS: usize = 256;
 
-/// A projection as the checkpoint stores it: FP8 codes + 128x128 tile scales,
-/// or a dense `[out, in]` matrix (the f32 oracle fixture, the bf16 projections).
-const Linear = union(enum) {
-    fp8: struct { w: mlx.mlx_array, s: mlx.mlx_array, split: fp8_block.RowSplit },
-    dense: mlx.mlx_array,
+/// Transposed views built so far; only a test build counts them.
+var views_built: u64 = 0;
 
-    fn apply(self: Linear, s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array {
-        return switch (self) {
-            .fp8 => |f| fp8_block.linearServing(s, x, f.w, f.s),
-            .dense => |w| blk: {
-                var wt = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(wt);
-                try mlx.check(mlx.mlx_transpose(&wt, w, s));
-                var out = mlx.mlx_array_new();
-                errdefer _ = mlx.mlx_array_free(out);
-                try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
-                break :blk out;
-            },
-        };
-    }
-
-};
+/// The `[in, out]` view of a dense `[out, in]` projection: lazy metadata, so the matmul keeps the operand layout
+/// (and the GEMM kernel) it has always had.
+fn transposedView(s: mlx.mlx_stream, w: mlx.mlx_array) !mlx.mlx_array {
+    if (comptime builtin.is_test) views_built += 1;
+    var wt = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_transpose(&wt, w, s));
+    return wt;
+}
 
 const Layer = struct {
     enorm: mlx.mlx_array,
@@ -73,12 +66,15 @@ const Layer = struct {
     pre_mlp_norm: mlx.mlx_array,
     final_norm: mlx.mlx_array,
     sinks: mlx.mlx_array,
-    eh_proj: Linear,
-    qkv: Linear,
-    o_proj: Linear,
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    // Project these through `Head.project`, never `Linear.apply`: its `qmatmulBits` dense arm changes the bytes.
+    eh_proj: linear.Linear,
+    qkv: linear.Linear,
+    /// The FP8 qkv's tile-scale grid; only that projection splits its output.
+    qkv_split: fp8_block.RowSplit,
+    o_proj: linear.Linear,
+    gate: linear.Linear,
+    up: linear.Linear,
+    down: linear.Linear,
 };
 
 /// Rows `[base, base + len)` of one head's keys and values, the newest last.
@@ -319,6 +315,8 @@ pub const Head = struct {
     layers: [MAX_HEADS]Layer = undefined,
     /// Every array this head owns.
     owned: std.ArrayList(mlx.mlx_array) = .empty,
+    /// The transposed dense projections: views of `owned` arrays, so they hold no bytes of their own.
+    views: std.ArrayList(mlx.mlx_array) = .empty,
     allocator: std.mem.Allocator,
     hidden: c_int,
     n_heads: c_int,
@@ -391,13 +389,34 @@ pub const Head = struct {
         return arr;
     }
 
-    fn linear(self: *Head, weights: *const Weights, comptime base: []const u8, k: usize, out_rows: u64, in_cols: u64, split: ?fp8_block.RowSplit) !Linear {
+    /// Bound once here, as the kind the checkpoint stores it in: FP8 codes with 128x128 tile scales, or a dense
+    /// `[out, in]` matrix (the f32 oracle fixture, the bf16 projections) held as its transposed view.
+    fn bindLinear(self: *Head, weights: *const Weights, comptime base: []const u8, k: usize, out_rows: u64, in_cols: u64) !linear.Linear {
         const w = try self.own(weights, base ++ ".weight", k);
         const sh = mlx.getShape(w);
         if (sh.len != 2 or sh[0] != @as(c_int, @intCast(out_rows)) or sh[1] != @as(c_int, @intCast(in_cols))) return error.MimoMtpShapeMismatch;
-        if (mlx.mlx_array_dtype(w) != .uint8) return .{ .dense = w };
-        const sc = try self.own(weights, base ++ ".scales", k);
-        return .{ .fp8 = .{ .w = w, .s = sc, .split = split orelse fp8_block.RowSplit.dense(@intCast(out_rows)) } };
+        if (mlx.mlx_array_dtype(w) != .uint8) {
+            const wt = try transposedView(self.s, w);
+            errdefer _ = mlx.mlx_array_free(wt);
+            try self.views.append(self.allocator, wt);
+            return .{ .dense = wt };
+        }
+        return .{ .fp8_block = .{ .w = w, .s = try self.own(weights, base ++ ".scales", k) } };
+    }
+
+    /// `x @ W` in the numbers this head has always had: a dense projection is MLX's own matmul against the bound view,
+    /// not `qmatmulBits`, whose short-row kernels would change the bytes.
+    fn project(self: *const Head, lin: *const linear.Linear, x: mlx.mlx_array) !mlx.mlx_array {
+        switch (lin.*) {
+            .dense => |wt| {
+                var out = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(out);
+                try mlx.check(mlx.mlx_matmul(&out, x, wt, self.s));
+                return out;
+            },
+            .fp8_block => |f| return fp8_block.linearServing(self.s, x, f.w, f.s),
+            else => return error.LinearUnbound,
+        }
     }
 
     fn loadLayer(self: *Head, config: *const ModelConfig, weights: *const Weights, k: usize) !Layer {
@@ -406,7 +425,7 @@ pub const Head = struct {
         const k_rows: u64 = @intCast(self.n_kv * self.head_dim);
         const v_rows: u64 = @intCast(self.n_kv * self.v_dim);
         const inter: u64 = config.intermediate_size;
-        var qkv_split: ?fp8_block.RowSplit = null;
+        var qkv_split = fp8_block.RowSplit.dense(@intCast(q_rows + k_rows + v_rows));
         {
             var name: [128]u8 = undefined;
             const sk = try std.fmt.bufPrint(&name, "model.mtp.layers.{d}.self_attn.qkv_proj.scales", .{k});
@@ -419,16 +438,19 @@ pub const Head = struct {
             .pre_mlp_norm = try self.own(weights, "pre_mlp_layernorm.weight", k),
             .final_norm = try self.own(weights, "final_layernorm.weight", k),
             .sinks = if (config.attn_sinks_sliding) try self.own(weights, "self_attn.attention_sink_bias", k) else .{ .ctx = null },
-            .eh_proj = try self.linear(weights, "eh_proj", k, h, 2 * h, null),
-            .qkv = try self.linear(weights, "self_attn.qkv_proj", k, q_rows + k_rows + v_rows, h, qkv_split),
-            .o_proj = try self.linear(weights, "self_attn.o_proj", k, h, @intCast(self.n_heads * self.v_dim), null),
-            .gate = try self.linear(weights, "mlp.gate_proj", k, inter, h, null),
-            .up = try self.linear(weights, "mlp.up_proj", k, inter, h, null),
-            .down = try self.linear(weights, "mlp.down_proj", k, h, inter, null),
+            .eh_proj = try self.bindLinear(weights, "eh_proj", k, h, 2 * h),
+            .qkv = try self.bindLinear(weights, "self_attn.qkv_proj", k, q_rows + k_rows + v_rows, h),
+            .qkv_split = qkv_split,
+            .o_proj = try self.bindLinear(weights, "self_attn.o_proj", k, h, @intCast(self.n_heads * self.v_dim)),
+            .gate = try self.bindLinear(weights, "mlp.gate_proj", k, inter, h),
+            .up = try self.bindLinear(weights, "mlp.up_proj", k, inter, h),
+            .down = try self.bindLinear(weights, "mlp.down_proj", k, h, inter),
         };
     }
 
     pub fn deinit(self: *Head) void {
+        for (self.views.items) |a| _ = mlx.mlx_array_free(a);
+        self.views.deinit(self.allocator);
         for (self.owned.items) |a| _ = mlx.mlx_array_free(a);
         self.owned.deinit(self.allocator);
     }
@@ -454,15 +476,13 @@ pub const Head = struct {
         return out;
     }
 
-    /// Head `li` over rows `[pos0, pos0 + R)`: `ids` `[1, R]` int32 (row p's token
-    /// x_{p+li+1}), `hid` `[1, R, H]` the target hiddens. Appends the rows' keys and
+    /// Head `li` over rows `[pos0, pos0 + R)`: `emb` `[1, R, H]` the embedding of row p's token
+    /// x_{p+li+1}, `hid` `[1, R, H]` the target hiddens. Appends the rows' keys and
     /// values and returns the final-normed `[1, R, H]` rows.
-    fn layerForward(self: *const Head, target: *Transformer, li: usize, cache: *RowCache, ids: mlx.mlx_array, hid: mlx.mlx_array, pos0: usize) !mlx.mlx_array {
+    fn layerForward(self: *const Head, li: usize, cache: *RowCache, emb: mlx.mlx_array, hid: mlx.mlx_array, pos0: usize) !mlx.mlx_array {
         const s = self.s;
         const lw = &self.layers[li];
-        const rows: c_int = mlx.getShape(ids)[1];
-        const emb = try target.embedding(ids);
-        defer _ = mlx.mlx_array_free(emb);
+        const rows: c_int = mlx.getShape(emb)[1];
         const en = try self.rmsNorm(emb, lw.enorm);
         defer _ = mlx.mlx_array_free(en);
         var hid_cast = mlx.mlx_array_new();
@@ -477,7 +497,7 @@ pub const Head = struct {
             defer _ = mlx.mlx_vector_array_free(vec);
             try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
         }
-        const x = try lw.eh_proj.apply(s, cat);
+        const x = try self.project(&lw.eh_proj, cat);
         defer _ = mlx.mlx_array_free(x);
 
         const a_in = try self.rmsNorm(x, lw.input_norm);
@@ -490,9 +510,9 @@ pub const Head = struct {
 
         const m_in = try self.rmsNorm(x2, lw.pre_mlp_norm);
         defer _ = mlx.mlx_array_free(m_in);
-        const g = try lw.gate.apply(s, m_in);
+        const g = try self.project(&lw.gate, m_in);
         defer _ = mlx.mlx_array_free(g);
-        const u = try lw.up.apply(s, m_in);
+        const u = try self.project(&lw.up, m_in);
         defer _ = mlx.mlx_array_free(u);
         var sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sig);
@@ -503,7 +523,7 @@ pub const Head = struct {
         var gu = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gu);
         try mlx.check(mlx.mlx_multiply(&gu, act, u, s));
-        const mlp = try lw.down.apply(s, gu);
+        const mlp = try self.project(&lw.down, gu);
         defer _ = mlx.mlx_array_free(mlp);
         var x3 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x3);
@@ -521,9 +541,9 @@ pub const Head = struct {
         const k_w = self.n_kv * self.head_dim;
         const v_w = self.n_kv * self.v_dim;
         switch (lw.qkv) {
-            .fp8 => |f| try fp8_block.projectServing(s, x, f.w, f.s, f.split, &proj),
-            .dense => {
-                const qkv = try lw.qkv.apply(s, x);
+            .fp8_block => |f| try fp8_block.projectServing(s, x, f.w, f.s, lw.qkv_split, &proj),
+            else => {
+                const qkv = try self.project(&lw.qkv, x);
                 defer _ = mlx.mlx_array_free(qkv);
                 const bounds = [_][2]c_int{ .{ 0, q_w }, .{ q_w, q_w + k_w }, .{ q_w + k_w, q_w + k_w + v_w } };
                 for (bounds, 0..) |b, i| {
@@ -586,7 +606,7 @@ pub const Head = struct {
         var flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat);
         try mlx.check(mlx.mlx_reshape(&flat, out_t, &[_]c_int{ 1, rows, self.n_heads * self.v_dim }, 3, s));
-        return lw.o_proj.apply(s, flat);
+        return self.project(&lw.o_proj, flat);
     }
 
     fn headsFirst(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, heads: c_int, dim: c_int, perm: *const [4]c_int) !mlx.mlx_array {
@@ -643,7 +663,9 @@ pub const Head = struct {
         }
         const hid = try st.hiddenRows(s, start, q + 1);
         defer _ = mlx.mlx_array_free(hid);
-        const out = try self.layerForward(target, li, cache, ids, hid, start);
+        const emb = try target.embedding(ids);
+        defer _ = mlx.mlx_array_free(emb);
+        const out = try self.layerForward(li, cache, emb, hid, start);
         st.committed_end[li] = q + 1 - tentative;
         return out;
     }
@@ -962,4 +984,201 @@ test "mimo mtp heads track the torch rendering of the MiMo-V2 MTP layer across r
         rounds += 1;
     }
     try testing.expect(rounds >= 5);
+}
+
+const test_hidden: c_int = 256;
+
+const FixtureKind = enum { dense, fp8 };
+
+fn fixtureConfig() ModelConfig {
+    return .{
+        .model_type = "mimo_v2",
+        .hidden_size = @intCast(test_hidden),
+        .intermediate_size = 256,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .v_head_dim = 64,
+        .sliding_window = 32,
+        .sliding_window_pattern = 2,
+        .partial_rotary_factor = 0.5,
+    };
+}
+
+fn putFixture(w: *Weights, name: []const u8, arr: mlx.mlx_array) !void {
+    var key: [96]u8 = undefined;
+    try w.map.put(try w.allocator.dupe(u8, try std.fmt.bufPrint(&key, "model.mtp.layers.0.{s}", .{name})), arr);
+}
+
+fn fixtureProjection(w: *Weights, rnd: std.Random, kind: FixtureKind, name: []const u8, out: usize, in: usize, scale_rows: usize, s: mlx.mlx_stream) !void {
+    var key: [64]u8 = undefined;
+    const wname = try std.fmt.bufPrint(&key, "{s}.weight", .{name});
+    switch (kind) {
+        .dense => try putFixture(w, wname, try @import("../test_support.zig").attn256RandBf16Scaled(rnd, &.{ @intCast(out), @intCast(in) }, 0.2, s)),
+        .fp8 => {
+            const codes = try testing.allocator.alloc(u8, out * in);
+            defer testing.allocator.free(codes);
+            for (codes) |*c| c.* = @intCast(0x20 + rnd.uintLessThan(u8, 0x40));
+            try putFixture(w, wname, mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ @intCast(out), @intCast(in) }, 2, .uint8));
+            const grid = try testing.allocator.alloc(f32, scale_rows * (in / 128));
+            defer testing.allocator.free(grid);
+            for (grid) |*g| g.* = 2e-4 + rnd.float(f32) * 6e-4;
+            var skey: [64]u8 = undefined;
+            try putFixture(w, try std.fmt.bufPrint(&skey, "{s}.scales", .{name}), mlx.mlx_array_new_data(grid.ptr, &[_]c_int{ @intCast(scale_rows), @intCast(in / 128) }, 2, .float32));
+        },
+    }
+}
+
+/// One MTP head of a small MiMo geometry; the qkv scale grid is the 8-rank split of the checkpoint.
+fn fixtureWeights(rnd: std.Random, kind: FixtureKind, s: mlx.mlx_stream) !Weights {
+    var w = Weights.init(testing.allocator);
+    errdefer w.deinit();
+    const h: usize = @intCast(test_hidden);
+    for ([_][]const u8{ "enorm.weight", "hnorm.weight", "input_layernorm.weight", "pre_mlp_layernorm.weight", "final_layernorm.weight" }) |n| {
+        var ones = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(ones);
+        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{test_hidden}, 1, .bfloat16, s));
+        try putFixture(&w, n, ones);
+    }
+    try putFixture(&w, "self_attn.attention_sink_bias", try @import("../test_support.zig").attn256RandBf16Scaled(rnd, &.{2}, 1.0, s));
+    try fixtureProjection(&w, rnd, kind, "eh_proj", h, 2 * h, 2, s);
+    try fixtureProjection(&w, rnd, kind, "self_attn.qkv_proj", 256, h, 8, s);
+    try fixtureProjection(&w, rnd, kind, "self_attn.o_proj", h, 128, 2, s);
+    try fixtureProjection(&w, rnd, kind, "mlp.gate_proj", 256, h, 2, s);
+    try fixtureProjection(&w, rnd, kind, "mlp.up_proj", 256, h, 2, s);
+    try fixtureProjection(&w, rnd, kind, "mlp.down_proj", h, 256, 2, s);
+    return w;
+}
+
+fn expectOneDraftBuildsNoView(kind: FixtureKind) !u64 {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x3d0 + @as(u64, @intFromEnum(kind)));
+    const rnd = prng.random();
+    var weights = try fixtureWeights(rnd, kind, s);
+    defer weights.deinit();
+    const config = fixtureConfig();
+    const built = views_built;
+    var head = (try Head.load(testing.allocator, s, &config, &weights)) orelse return error.NoMtpHeads;
+    defer head.deinit();
+    const at_load = views_built - built;
+    const support = @import("../test_support.zig");
+    const emb = try support.attn256RandBf16Scaled(rnd, &.{ 1, 1, test_hidden }, 1.0, s);
+    defer _ = mlx.mlx_array_free(emb);
+    const hid = try support.attn256RandBf16Scaled(rnd, &.{ 1, 1, test_hidden }, 1.0, s);
+    defer _ = mlx.mlx_array_free(hid);
+    var cache = RowCache{};
+    defer cache.reset(0);
+    for (0..2) |_| _ = mlx.mlx_array_free(try head.layerForward(0, &cache, emb, hid, cache.end()));
+    const before = views_built;
+    _ = mlx.mlx_array_free(try head.layerForward(0, &cache, emb, hid, cache.end()));
+    try testing.expectEqual(@as(u64, 0), views_built - before);
+    return at_load;
+}
+
+fn expectBitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    try testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    try testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try testing.expect(same);
+}
+
+fn expectProjectionBytes(kind: FixtureKind) !void {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x3d8 + @as(u64, @intFromEnum(kind)));
+    const rnd = prng.random();
+    var weights = try fixtureWeights(rnd, kind, s);
+    defer weights.deinit();
+    const config = fixtureConfig();
+    var head = (try Head.load(testing.allocator, s, &config, &weights)) orelse return error.NoMtpHeads;
+    defer head.deinit();
+    const lw = &head.layers[0];
+    const cases = [_]struct { name: []const u8, lin: *const linear.Linear, in: c_int }{
+        .{ .name = "eh_proj", .lin = &lw.eh_proj, .in = 2 * test_hidden },
+        .{ .name = "self_attn.qkv_proj", .lin = &lw.qkv, .in = test_hidden },
+        .{ .name = "self_attn.o_proj", .lin = &lw.o_proj, .in = 128 },
+        .{ .name = "mlp.gate_proj", .lin = &lw.gate, .in = test_hidden },
+        .{ .name = "mlp.up_proj", .lin = &lw.up, .in = test_hidden },
+        .{ .name = "mlp.down_proj", .lin = &lw.down, .in = 256 },
+    };
+    for (cases) |c| {
+        var key: [64]u8 = undefined;
+        const w = weights.get(try std.fmt.bufPrint(&key, "model.mtp.layers.0.{s}.weight", .{c.name})).?;
+        var skey: [64]u8 = undefined;
+        const sc = weights.get(try std.fmt.bufPrint(&skey, "model.mtp.layers.0.{s}.scales", .{c.name})) orelse mlx.mlx_array{ .ctx = null };
+        for ([_]c_int{ 1, 3, 4 }) |rows| {
+            const x = try @import("../test_support.zig").attn256RandBf16Scaled(rnd, &.{ 1, rows, c.in }, 1.0, s);
+            defer _ = mlx.mlx_array_free(x);
+            const want = switch (kind) {
+                .fp8 => try fp8_block.linearServing(s, x, w, sc),
+                .dense => blk: {
+                    const wt = try transposedView(s, w);
+                    defer _ = mlx.mlx_array_free(wt);
+                    var out = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
+                    break :blk out;
+                },
+            };
+            defer _ = mlx.mlx_array_free(want);
+            // Twice: the first call evaluates a bound view, the second reads it evaluated.
+            for (0..2) |_| {
+                const got = try head.project(c.lin, x);
+                defer _ = mlx.mlx_array_free(got);
+                try expectBitEqual(got, want, s);
+            }
+        }
+    }
+}
+
+test "mimo mtp: a bound dense projection gives the bytes of the per-call transpose" {
+    try expectProjectionBytes(.dense);
+}
+
+test "mimo mtp: a bound FP8 projection gives the bytes of the serving path" {
+    try expectProjectionBytes(.fp8);
+}
+
+test "mimo mtp: a head's draft rows come out the same on the call that evaluates its views and on later ones" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const support = @import("../test_support.zig");
+    for ([_]FixtureKind{ .dense, .fp8 }) |kind| {
+        var prng = std.Random.DefaultPrng.init(0x3de + @as(u64, @intFromEnum(kind)));
+        const rnd = prng.random();
+        var weights = try fixtureWeights(rnd, kind, s);
+        defer weights.deinit();
+        const config = fixtureConfig();
+        var head = (try Head.load(testing.allocator, s, &config, &weights)) orelse return error.NoMtpHeads;
+        defer head.deinit();
+        const emb = try support.attn256RandBf16Scaled(rnd, &.{ 1, 3, test_hidden }, 1.0, s);
+        defer _ = mlx.mlx_array_free(emb);
+        const hid = try support.attn256RandBf16Scaled(rnd, &.{ 1, 3, test_hidden }, 1.0, s);
+        defer _ = mlx.mlx_array_free(hid);
+        var outs: [2]mlx.mlx_array = undefined;
+        for (&outs, 0..) |*o, i| {
+            var cache = RowCache{};
+            defer cache.reset(0);
+            o.* = try head.layerForward(0, &cache, emb, hid, 0);
+            // Evaluated before the second run builds its graph over the same bound views.
+            if (i == 0) try mlx.check(mlx.mlx_array_eval(o.*));
+        }
+        defer for (outs) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        try expectBitEqual(outs[0], outs[1], s);
+    }
+}
+
+test "mimo mtp: a draft through dense heads builds no transposed view, the load built each once" {
+    try testing.expectEqual(@as(u64, 6), try expectOneDraftBuildsNoView(.dense));
+}
+
+test "mimo mtp: a draft through FP8 heads builds no transposed view either" {
+    try testing.expectEqual(@as(u64, 0), try expectOneDraftBuildsNoView(.fp8));
 }
