@@ -168,7 +168,7 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
             const kept: usize = @min(@as(usize, oracle.events), 8);
             // What the commit copies: the RAM tier's rows within its budget, chosen before the copy.
             // The SSD tier copies none: its flush reads the request's own rows.
-            const copied_len = if (!ram) 0 else prefix_cache_mod.HotPrefixCache.glmCommitLenFor(
+            const copied_len = if (!ram) 0 else glm5_prefix.glmCommitLenFor(
                 .min_span_recency,
                 bills.resolvedPrefixCacheMem(),
                 false,

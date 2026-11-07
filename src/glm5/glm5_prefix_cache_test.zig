@@ -1,13 +1,13 @@
-const transformer_mod = @import("../transformer.zig");
-const KVCache = transformer_mod.KVCache;
-const SSMCheckpoint = transformer_mod.SSMCheckpoint;
+const trunk_mod = @import("../trunk.zig");
+const KVCache = trunk_mod.KVCache;
+const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const glm5_forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const kv_quant = @import("../kv_quant.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
-const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
+const ssmCheckpointBytes = trunk_mod.ssmCheckpointBytes;
 const std = @import("std");
 const prefix_arch = @import("../arch/prefix.zig");
 const testing = std.testing;
@@ -48,7 +48,7 @@ const GlmTurn = struct {
     /// Hands `cps` and `rows` to the cache.
     fn commit(self: *GlmTurn, hc: *pc.HotPrefixCache, tokens: []const u32, vision_key: u64, media_start: ?usize) !pc.CommitStatus {
         defer self.cache.deinit();
-        return hc.commitGlm(&self.cache, tokens, false, vision_key, 0, media_start, self.cps, self.rows, null, tokens.len);
+        return glm5_prefix.commitGlm(hc, &self.cache, tokens, false, vision_key, 0, media_start, self.cps, self.rows, null, tokens.len);
     }
 };
 
@@ -66,7 +66,7 @@ fn glmLookup(hc: *pc.HotPrefixCache, req: *glm5_forward.Request, bits: u8, promp
     var target = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
     defer target.deinit();
     var moe: usize = 0;
-    const res = try hc.lookupAndRestoreGlm(&target, &moe, req, mlx.gpuStream(), prompt, false, vision_key, media_start, chain, null, null, false);
+    const res = try glm5_prefix.lookupAndRestoreGlm(hc, &target, &moe, req, mlx.gpuStream(), prompt, false, vision_key, media_start, chain, null, null, false);
     try testing.expectEqual(res.matched, target.step);
     try testing.expectEqual(res.matched, req.offset);
     return res;
@@ -118,7 +118,7 @@ const GlmPrefill = struct {
             _ = mlx.mlx_array_free(try glm5_prefix.prefill(net, &self.req, tokens[at .. at + n], &.{n}));
             at += n;
             if (i + 1 < chunks.len) try self.capture();
-            hc.writeThroughGlm(&self.entry_id, &self.req, tokens[0..at], false, .{}, self.cps.items, mlx.gpuStream());
+            glm5_prefix.writeThroughGlm(hc, &self.entry_id, &self.req, tokens[0..at], false, .{}, self.cps.items, mlx.gpuStream());
         }
         try self.capture();
         if (at < tokens.len) _ = mlx.mlx_array_free(try glm5_prefix.prefill(net, &self.req, tokens[at..], &.{tokens.len - at}));
@@ -143,7 +143,7 @@ const GlmPrefill = struct {
         cache.step = self.req.offset;
         const disk_rows = try glm5_prefix.MlaRows.shareLive(testing.allocator, &self.req, glm5_prefix.commitRows(self.cps.items, self.req.offset), mlx.gpuStream());
         const owned = try self.cps.toOwnedSlice(testing.allocator);
-        return hc.commitGlmTiers(&cache, tokens, false, 0, 0, null, owned, null, disk_rows, null, tokens.len);
+        return glm5_prefix.commitGlmTiers(hc, &cache, tokens, false, 0, 0, null, owned, null, disk_rows, null, tokens.len);
     }
 
     fn deinit(self: *GlmPrefill) void {
@@ -243,7 +243,7 @@ test "GLM hot cache trims an entry over the byte budget to a checkpoint and bill
     defer hc.deinit();
     var turn = try GlmTurn.run(&fx.net, 8, &long, &.{ 264, 32, 4 }, &.{ 0, 1 });
     defer turn.cache.deinit();
-    try testing.expectEqual(pc.CommitStatus{ .ok = 264 }, try hc.commitGlm(&turn.cache, &long, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 236 }, long.len));
+    try testing.expectEqual(pc.CommitStatus{ .ok = 264 }, try glm5_prefix.commitGlm(&hc, &turn.cache, &long, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 236 }, long.len));
     const e = &hc.entries.items[0];
     try testing.expectEqual(@as(usize, 264), e.rows.?.len());
     try testing.expect(e.dflash != null);
@@ -350,7 +350,7 @@ test "GLM hot cache checkout hands the MLA rows to the slot so its first append 
     defer target.deinit();
     var moe: usize = 0;
     const longer = glm_first ++ [_]u32{ 2, 2, 2, 2 };
-    const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, mlx.gpuStream(), &longer, false, 0, null, &.{}, null, 7, false);
+    const res = try glm5_prefix.lookupAndRestoreGlm(&hc, &target, &moe, &warm, mlx.gpuStream(), &longer, false, 0, null, &.{}, null, 7, false);
     try testing.expect(res.checked_out);
     try testing.expectEqual(@as(usize, 16), res.matched);
     hc.donateCheckout(7);
@@ -479,7 +479,7 @@ test "GLM entries carry the assistant window, and a restore hands back its rows 
     committing.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
     var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
     defer turn.cache.deinit();
-    _ = try committing.commitGlm(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
+    _ = try glm5_prefix.commitGlm(&committing, &turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
     committing.flushPendingDisk(s);
     var restarted = pc.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer restarted.deinit();
@@ -496,7 +496,7 @@ test "GLM entries carry the assistant window, and a restore hands back its rows 
         var target = try KVCache.initWithConfig(testing.allocator, 4, kv_quant.KVQuantConfig.affine(8));
         defer target.deinit();
         var moe: usize = 0;
-        const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, s, &next, false, 0, null, &.{}, .{ .cache = &drafter, .base_pos = &drafter_base }, null, false);
+        const res = try glm5_prefix.lookupAndRestoreGlm(hc, &target, &moe, &warm, s, &next, false, 0, null, &.{}, .{ .cache = &drafter, .base_pos = &drafter_base }, null, false);
         try testing.expectEqual(@as(usize, 512), res.matched);
         try testing.expectEqual(@as(?usize, 400), res.dflash_base);
         try testing.expectEqual(@as(usize, 112), drafter.step);
@@ -531,7 +531,7 @@ test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart 
             defer hc.deinit();
             var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
             defer turn.cache.deinit();
-            const status = try hc.commitGlm(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
+            const status = try glm5_prefix.commitGlm(&hc, &turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
             try testing.expectEqual(pc.CommitStatus{ .disk_only = first.len }, status);
             try testing.expectEqual(@as(usize, 0), hc.entryCount());
             try testing.expectEqual(@as(u64, 0), hc.residentBytes());
@@ -551,7 +551,7 @@ test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart 
         var target = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
         defer target.deinit();
         var moe: usize = 0;
-        const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, s, &next, false, 0, null, &.{}, .{ .cache = &drafter, .base_pos = &drafter_base }, 9, false);
+        const res = try glm5_prefix.lookupAndRestoreGlm(&hc, &target, &moe, &warm, s, &next, false, 0, null, &.{}, .{ .cache = &drafter, .base_pos = &drafter_base }, 9, false);
         try testing.expectEqual(@as(usize, 512), res.matched);
         try testing.expect(res.ownsRestoredRows());
         try testing.expectEqual(@as(?usize, 400), res.dflash_base);
@@ -600,7 +600,7 @@ test "GLM: the SSD tier gets every row in one flush whatever the RAM tier keeps,
         defer turn.cache.deinit();
         // The RAM tier keeps the rows through the first checkpoint; the SSD tier gets them all.
         const ram_rows: ?glm5_prefix.MlaRows = if (arm.ram) try turn.rows.trimmedCopy(256, s) else null;
-        const status = try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, ram_rows, turn.rows, null, first.len);
+        const status = try glm5_prefix.commitGlmTiers(&hc, &turn.cache, &first, false, 0, 0, null, turn.cps, ram_rows, turn.rows, null, first.len);
         if (arm.ram) {
             try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, status);
             try testing.expectEqual(@as(usize, 256), hc.entries.items[0].rows.?.len());
@@ -708,7 +708,7 @@ test "GLM RAM tier beside an SSD tier judges the byte budget by the two checkpoi
         var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 512, 64, 64, 60 }, &.{ 0, 1, 2, 3 });
         defer turn.cache.deinit();
         const disk_rows = try turn.rows.share();
-        try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, disk_rows, null, first.len));
+        try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, try glm5_prefix.commitGlmTiers(&hc, &turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, disk_rows, null, first.len));
         try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ssm_checkpoints.?.len);
         try testing.expect(hc.current_kv_bytes <= budget);
     }
@@ -843,7 +843,7 @@ test "GLM RAM tier beside an SSD tier: the hot entry keeps its two newest checkp
         var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 512, 64, 64, 60 }, &.{ 0, 1, 2, 3 });
         defer turn.cache.deinit();
         const disk_rows = try turn.rows.share();
-        try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, disk_rows, null, first.len));
+        try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, try glm5_prefix.commitGlmTiers(&hc, &turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, disk_rows, null, first.len));
         const e = &hc.entries.items[0];
         try testing.expectEqual(@as(usize, 2), e.ssm_checkpoints.?.len);
         try testing.expectEqualSlices(usize, &.{ 640, 700 }, &.{ e.ssm_checkpoints.?[0].pos, e.ssm_checkpoints.?[1].pos });
@@ -947,16 +947,16 @@ test "a GLM commit hands the SSD tier every row through its newest checkpoint, p
     {
         var hc = try glmSsdOnlyCache(io, base, "glm-len-ssd", 20 << 30, false);
         defer hc.deinit();
-        try testing.expectEqual(@as(?usize, null), hc.glmCommitLen(&cps, 1_040_003, row, 0));
-        try testing.expectEqual(@as(?usize, 1_040_000), hc.glmDiskLen(&cps, 1_040_003, row, 0));
+        try testing.expectEqual(@as(?usize, null), glm5_prefix.glmCommitLen(&hc, &cps, 1_040_003, row, 0));
+        try testing.expectEqual(@as(?usize, 1_040_000), glm5_prefix.glmDiskLen(&hc, &cps, 1_040_003, row, 0));
     }
     {
         // Both tiers: the RAM tier keeps what its 1 GiB holds, the SSD tier every row.
         var hc = pc.HotPrefixCache.initWithMem(testing.allocator, 4, 1 << 30);
         defer hc.deinit();
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "glm-len-both", 20 << 30, 128);
-        try testing.expectEqual(@as(?usize, 2048), hc.glmCommitLen(&cps, 1_040_003, row, 0));
-        try testing.expectEqual(@as(?usize, 1_040_000), hc.glmDiskLen(&cps, 1_040_003, row, 0));
+        try testing.expectEqual(@as(?usize, 2048), glm5_prefix.glmCommitLen(&hc, &cps, 1_040_003, row, 0));
+        try testing.expectEqual(@as(?usize, 1_040_000), glm5_prefix.glmDiskLen(&hc, &cps, 1_040_003, row, 0));
     }
 }
 
@@ -1035,31 +1035,31 @@ test "a GLM commit copies only the rows its destination tier keeps, chosen befor
     const gib: u64 = 1 << 30;
     const positions = [_]usize{ 2048, 131072, 262144, 524288, 1_040_000 };
     const bytes: [5]u64 = @splat(cp);
-    const policy: transformer_mod.ThinPolicy = .min_span_recency;
+    const policy: trunk_mod.ThinPolicy = .min_span_recency;
     // Everything fits: every row to the newest checkpoint.
-    try t.expectEqual(@as(?usize, 64), pc.HotPrefixCache.glmCommitLenFor(policy, gib, false, 64, row, 0, &.{64}, &.{cp}));
-    try t.expectEqual(@as(?usize, 1_040_000), pc.HotPrefixCache.glmCommitLenFor(policy, 0, false, 1_040_000, row, 0, &positions, &bytes));
+    try t.expectEqual(@as(?usize, 64), glm5_prefix.glmCommitLenFor(policy, gib, false, 64, row, 0, &.{64}, &.{cp}));
+    try t.expectEqual(@as(?usize, 1_040_000), glm5_prefix.glmCommitLenFor(policy, 0, false, 1_040_000, row, 0, &positions, &bytes));
     // A 1 GiB RAM tier keeps the newest checkpoint whose rows and a surviving checkpoint fit, never the full 7 GB.
-    const ram = pc.HotPrefixCache.glmCommitLenFor(policy, gib, false, 1_040_000, row, 0, &positions, &bytes).?;
+    const ram = glm5_prefix.glmCommitLenFor(policy, gib, false, 1_040_000, row, 0, &positions, &bytes).?;
     try t.expectEqual(@as(usize, 131072), ram);
     try t.expect(@as(u64, ram) * row + cp <= gib);
     // The window comes out of the budget first.
-    try t.expectEqual(@as(?usize, 2048), pc.HotPrefixCache.glmCommitLenFor(policy, gib, false, 1_040_000, row, 200 << 20, &positions, &bytes));
+    try t.expectEqual(@as(?usize, 2048), glm5_prefix.glmCommitLenFor(policy, gib, false, 1_040_000, row, 200 << 20, &positions, &bytes));
     // The SSD tier keeps every row through the newest checkpoint; only its own byte budget bounds
     // them, priced with every checkpoint it keeps at or below.
-    try t.expectEqual(@as(?usize, 1_040_000), pc.HotPrefixCache.glmCommitLenFor(policy, 0, true, 1_040_000, row, 0, &positions, &bytes));
-    try t.expectEqual(@as(?usize, 1_040_000), pc.HotPrefixCache.glmCommitLenFor(policy, 20 * gib, true, 1_040_000, row, 0, &positions, &bytes));
+    try t.expectEqual(@as(?usize, 1_040_000), glm5_prefix.glmCommitLenFor(policy, 0, true, 1_040_000, row, 0, &positions, &bytes));
+    try t.expectEqual(@as(?usize, 1_040_000), glm5_prefix.glmCommitLenFor(policy, 20 * gib, true, 1_040_000, row, 0, &positions, &bytes));
     // 262,144 rows (1.75 GB) fit 2 GiB alone; with their three checkpoints (0.44 GB) they do not.
-    try t.expectEqual(@as(?usize, 131072), pc.HotPrefixCache.glmCommitLenFor(policy, 2 * gib, true, 1_040_000, row, 0, &positions, &bytes));
+    try t.expectEqual(@as(?usize, 131072), glm5_prefix.glmCommitLenFor(policy, 2 * gib, true, 1_040_000, row, 0, &positions, &bytes));
     // A 1 GiB tier and ~131K rows with eight checkpoints: 0.82 GiB of rows, 1.92 GiB in all.
     const eight = [_]usize{ 2048, 18432, 43008, 69632, 92160, 116736, 126976, 131040 };
     const eight_bytes: [8]u64 = @splat(cp);
-    const kept = pc.HotPrefixCache.glmCommitLenFor(policy, gib, true, 131040, row, 0, &eight, &eight_bytes).?;
+    const kept = glm5_prefix.glmCommitLenFor(policy, gib, true, 131040, row, 0, &eight, &eight_bytes).?;
     var priced: u64 = @as(u64, kept) * row;
     for (eight) |p| priced += if (p <= kept) cp else 0;
     try t.expect(priced <= gib);
     try t.expect(kept < 131040);
-    try t.expectEqual(@as(?usize, null), pc.HotPrefixCache.glmCommitLenFor(policy, gib, false, 0, row, 0, &.{}, &.{}));
+    try t.expectEqual(@as(?usize, null), glm5_prefix.glmCommitLenFor(policy, gib, false, 0, row, 0, &.{}, &.{}));
 }
 
 test "a GLM commit whose retention snapshot fails still destroys every transferred checkpoint once" {
@@ -1067,7 +1067,7 @@ test "a GLM commit whose retention snapshot fails still destroys every transferr
     try mlx.requireGpu();
     const cps = try testing.allocator.alloc(SSMCheckpoint, 3);
     for (cps, 0..) |*cp, i| {
-        const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 2);
+        const layers = try testing.allocator.alloc(trunk_mod.SSMCacheEntrySnapshot, 2);
         for (layers) |*l| l.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
         cp.* = .{ .pos = (i + 1) * 8, .layers = layers };
     }
@@ -1088,7 +1088,7 @@ test "a GLM commit whose retention snapshot fails still destroys every transferr
     var hc = pc.HotPrefixCache.init(testing.allocator, 2);
     defer hc.deinit();
     const tokens: [24]u32 = @splat(1);
-    try testing.expectError(error.OutOfMemory, hc.commitGlm(&source, &tokens, false, 0, 0, null, cps, rows, null, tokens.len));
+    try testing.expectError(error.OutOfMemory, glm5_prefix.commitGlm(&hc, &source, &tokens, false, 0, 0, null, cps, rows, null, tokens.len));
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
 }
 
@@ -1098,7 +1098,7 @@ test "a GLM replace commit that fails at any allocation leaks nothing and leaves
     const Stub = struct {
         fn cps(pos: usize) ![]SSMCheckpoint {
             const out = try testing.allocator.alloc(SSMCheckpoint, 1);
-            const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 1);
+            const layers = try testing.allocator.alloc(trunk_mod.SSMCacheEntrySnapshot, 1);
             layers[0] = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
             out[0] = .{ .pos = pos, .layers = layers };
             return out;
@@ -1117,11 +1117,11 @@ test "a GLM replace commit that fails at any allocation leaks nothing and leaves
         defer hc.deinit();
         var source = try KVCache.initWithConfig(testing.allocator, 1, glmKvConfig(8));
         defer source.deinit();
-        _ = try hc.commitGlm(&source, tokens[0..16], false, 0, 0, null, try Stub.cps(8), try Stub.rows(), null, 16);
+        _ = try glm5_prefix.commitGlm(&hc, &source, tokens[0..16], false, 0, 0, null, try Stub.cps(8), try Stub.rows(), null, 16);
         try testing.expectEqual(@as(usize, 1), hc.entryCount());
 
         failing.fail_index = failing.alloc_index + k;
-        const res = hc.commitGlm(&source, &tokens, false, 0, 0, null, try Stub.cps(16), try Stub.rows(), null, 24);
+        const res = glm5_prefix.commitGlm(&hc, &source, &tokens, false, 0, 0, null, try Stub.cps(16), try Stub.rows(), null, 24);
         var sum: u64 = 0;
         for (hc.entries.items) |e| sum += e.kv_bytes;
         try testing.expectEqual(sum, hc.current_kv_bytes);
@@ -1157,7 +1157,7 @@ test "GLM image turn persists its whole turn, and a foreign key restarts like a 
         defer hc.deinit();
         var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
         defer turn.cache.deinit();
-        _ = try hc.commitGlm(&turn.cache, &first, false, 0xABCD, 0, 600, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
+        _ = try glm5_prefix.commitGlm(&hc, &turn.cache, &first, false, 0xABCD, 0, 600, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
         hc.flushPendingDisk(s);
         try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
         try testing.expectEqual(@as(u32, first.len), hc.disk.?.entries.items[0].kv_len);

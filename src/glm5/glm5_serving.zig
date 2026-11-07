@@ -1,4 +1,4 @@
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
 const glm5_mod = @import("glm5_forward.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
@@ -12,11 +12,11 @@ const arch_registry = @import("../arch/registry.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const testing = std.testing;
-const CaptureLayers = trf.CaptureLayers;
-const ForwardCtx = trf.ForwardCtx;
-const KVCache = trf.KVCache;
-const Transformer = trf.Transformer;
-const initModuleShell = trf.initModuleShell;
+const CaptureLayers = trunk_mod.CaptureLayers;
+const ForwardCtx = trunk_mod.ForwardCtx;
+const KVCache = trunk_mod.KVCache;
+const Transformer = trunk_mod.Transformer;
+const initModuleShell = trunk_mod.initModuleShell;
 
 pub fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
     const engine = if (config.expert_streaming) try Transformer.newExpertEngine(allocator, &config, s) else null;

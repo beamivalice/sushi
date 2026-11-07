@@ -342,7 +342,7 @@ fn reference(ops: *@import("glm5_model.zig").Ops, in: Inputs) ![6]Arr {
     const decay = try ops.unary(.exp, try ops.binary(.mul, forget, try ops.scalar(in.lower, .float32)));
     const beta = try ops.unary(.sigmoid, in.beta);
     const tail = try ops.slice(joined, 1, rows, rows + 3);
-    const compact = if (rows > 1) try ops.own(try @import("../transformer.zig").materializedOwnedCopy(ops.s, tail)) else try ops.contiguous(tail);
+    const compact = if (rows > 1) try ops.own(try @import("../trunk.zig").materializedOwnedCopy(ops.s, tail)) else try ops.contiguous(tail);
     return .{ qr, kr, v, decay, beta, compact };
 }
 fn randomArray(ops: *@import("glm5_model.zig").Ops, shape: []const c_int, dtype: mlx.mlx_dtype, seed: u64, scale: f32) !Arr {

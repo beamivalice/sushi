@@ -407,7 +407,7 @@ pub fn kda(in: KdaInputs, s: mlx.mlx_stream) !KdaResult {
     defer _ = mlx.mlx_vector_array_free(inputs);
     var outputs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs);
-    const kernel = try @import("../transformer.zig").getGdnKernel(true);
+    const kernel = try @import("../trunk.zig").getGdnKernel(true);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, config, s));
     var result = KdaResult{ .y = mlx.mlx_array_new(), .state = mlx.mlx_array_new() };
     errdefer result.deinit();

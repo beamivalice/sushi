@@ -26,7 +26,7 @@ pub fn leaveTeacher() void {
 /// The one device decision for GLM arms built on MLX's NAX kernels (fused D512 SDPA, NAX GEMM/QMM
 /// tiles). Qwen's and MiMo's gate, so `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` rehearses an M1–M4.
 pub fn naxArms() bool {
-    return @import("../transformer.zig").verifyQmmNaxAvailable();
+    return @import("../trunk.zig").verifyQmmNaxAvailable();
 }
 
 pub const Ops = struct {
@@ -460,7 +460,7 @@ pub const Hc = struct {
 fn compactConvTail(ops: *Ops, input: Arr, rows: c_int, keep: c_int) !Arr {
     const tail = try ops.slice(input, 1, rows, rows + keep);
     // A batch-one tail is already contiguous but still owns its whole prompt parent.
-    if (rows > 1) return ops.own(try @import("../transformer.zig").materializedOwnedCopy(ops.s, tail));
+    if (rows > 1) return ops.own(try @import("../trunk.zig").materializedOwnedCopy(ops.s, tail));
     return ops.contiguous(tail);
 }
 
@@ -580,7 +580,7 @@ pub const KdaLayer = struct {
         } else [_]Arr{ try self.q.apply(ops, x), try self.k.apply(ops, x), try self.v.apply(ops, x) };
     }
 
-    pub fn applyFused(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("../transformer.zig").SSMCacheEntry) !?Arr {
+    pub fn applyFused(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("../trunk.zig").SSMCacheEntry) !?Arr {
         const sh = mlx.getShape(x);
         if (sh.len != 3 or sh[0] != 1 or sh[1] != 1 or mlx.mlx_array_dtype(x) != .bfloat16 or cfg.linear_key_head_dim != 128 or cfg.linear_conv_kernel_dim != 4 or cfg.kda_gate_lower_bound != -5 or self.prepared_conv.ctx == null or self.prepared_decay.ctx == null) return null;
         const heads: c_int = @intCast(cfg.linear_num_value_heads);
@@ -620,12 +620,12 @@ pub const KdaLayer = struct {
         return try self.out.apply(ops, result.y);
     }
 
-    pub fn apply(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("../transformer.zig").SSMCacheEntry) !Arr {
+    pub fn apply(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("../trunk.zig").SSMCacheEntry) !Arr {
         if (try self.applyFused(ops, x, cfg, state)) |result| return result;
         return self.applyReference(ops, x, cfg, state);
     }
 
-    pub fn applyReference(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("../transformer.zig").SSMCacheEntry) !Arr {
+    pub fn applyReference(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("../trunk.zig").SSMCacheEntry) !Arr {
         const sh = mlx.getShape(x);
         const heads: c_int = @intCast(cfg.linear_num_value_heads);
         const dim: c_int = @intCast(cfg.linear_key_head_dim);
@@ -845,7 +845,7 @@ test "GLM reference full KDA apply matches oMLX serial and irregular chunks" {
     try layer.prepare(mlx.gpuStream());
     const Case = struct { label: []const u8, chunks: []const c_int };
     for ([_]Case{ .{ .label = "full", .chunks = &.{5} }, .{ .label = "serial", .chunks = &.{ 1, 1, 1, 1, 1 } }, .{ .label = "irregular", .chunks = &.{ 2, 1, 2 } }, .{ .label = "cold", .chunks = &.{5} } }) |case| {
-        var state = @import("../transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = !std.mem.eql(u8, case.label, "cold") };
+        var state = @import("../trunk.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = !std.mem.eql(u8, case.label, "cold") };
         defer _ = mlx.mlx_array_free(state.conv_state);
         defer _ = mlx.mlx_array_free(state.ssm_state);
         try mlx.check(mlx.mlx_array_set(&state.conv_state, fixture.get("initial.conv").?));
@@ -927,7 +927,7 @@ test "GLM prepared KDA constants preserve results and have idempotent ownership"
         }
         var ops = Ops{ .s = mlx.gpuStream() };
         defer ops.deinit();
-        var state = @import("../transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        var state = @import("../trunk.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
         defer _ = mlx.mlx_array_free(state.conv_state);
         defer _ = mlx.mlx_array_free(state.ssm_state);
         const out = try layer.apply(&ops, fixture.get("input").?, &cfg, &state);
@@ -1006,10 +1006,10 @@ test "GLM fused KDA decode preserves output and FP32 state exactly" {
         try layer.prepare(mlx.gpuStream());
         defer layer.deinit();
         for ([_]bool{ false, true }) |initial| {
-            var reference = @import("../transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = initial };
+            var reference = @import("../trunk.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = initial };
             defer _ = mlx.mlx_array_free(reference.conv_state);
             defer _ = mlx.mlx_array_free(reference.ssm_state);
-            var fused = @import("../transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = initial };
+            var fused = @import("../trunk.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = initial };
             defer _ = mlx.mlx_array_free(fused.conv_state);
             defer _ = mlx.mlx_array_free(fused.ssm_state);
             if (initial) {
@@ -1049,10 +1049,10 @@ test "GLM KDA prework integration preserves whole layer and state bits" {
     defer layer.deinit();
     try layer.prepare(mlx.gpuStream());
     for ([_]bool{ false, true }) |hot| {
-        var old = @import("../transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = hot };
+        var old = @import("../trunk.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = hot };
         defer _ = mlx.mlx_array_free(old.conv_state);
         defer _ = mlx.mlx_array_free(old.ssm_state);
-        var fused = @import("../transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = hot };
+        var fused = @import("../trunk.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = hot };
         defer _ = mlx.mlx_array_free(fused.conv_state);
         defer _ = mlx.mlx_array_free(fused.ssm_state);
         if (hot) {
@@ -1126,7 +1126,7 @@ test "GLM KDA prefill chunk reads the projections in place with the staged path'
         var ops = Ops{ .s = s };
         defer ops.deinit();
         const x = try syntheticArray(&ops, &.{ 1, rows, 256 }, .bfloat16, 7, -1, 1);
-        var states: [2]@import("../transformer.zig").SSMCacheEntry = undefined;
+        var states: [2]@import("../trunk.zig").SSMCacheEntry = undefined;
         for (&states) |*state| {
             state.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = hot };
             if (hot) {

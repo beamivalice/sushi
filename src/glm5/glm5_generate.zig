@@ -1,19 +1,19 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const transformer_mod = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const model_mod = @import("../model.zig");
 const mtp_lookup = @import("../mtp_lookup.zig");
 const round_cost = @import("../round_cost.zig");
 const dflash_policy = @import("../dflash_policy.zig");
 const logit_bias = @import("../logit_bias.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
-const SSMCheckpoint = transformer_mod.SSMCheckpoint;
+const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const glm5_forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
 const kv_disk_cache_mod = @import("../kv_disk_cache.zig");
-const KVCache = transformer_mod.KVCache;
+const KVCache = trunk_mod.KVCache;
 const testing = std.testing;
 const expectError = @import("../test_expect.zig").expectError;
 const mtp_plan = @import("../mtp_plan.zig");
@@ -36,7 +36,7 @@ const dflash_mod = @import("../dflash.zig");
 const io_util = @import("../io_util.zig");
 const log = @import("../log.zig");
 const DrafterStepResult = Generator.DrafterStepResult;
-const ForwardCtx = transformer_mod.ForwardCtx;
+const ForwardCtx = trunk_mod.ForwardCtx;
 const isEosId = generate.isEosId;
 const tokenStops = generate.tokenStops;
 
@@ -126,7 +126,7 @@ pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@im
 
 /// Takes the verifier's MLA capacity right after prefill, inside the request's admission bill: no
 /// round grows a buffer, and a later admission already sees the capacity as live memory.
-pub const GlmSpecWindow = struct { snapshot: transformer_mod.KVCacheSnapshot, base_pos: usize };
+pub const GlmSpecWindow = struct { snapshot: trunk_mod.KVCacheSnapshot, base_pos: usize };
 
 pub fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assistant: *const dflash_mod.DflashCtx, max_tokens: u32, s: mlx.mlx_stream) !void {
     const request = ctx.glm5_request orelse return error.GlmRequestMissing;

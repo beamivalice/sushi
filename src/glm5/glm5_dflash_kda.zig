@@ -208,7 +208,7 @@ pub const Tape = struct {
         if (self.retained_state.ctx != null) _ = mlx.mlx_array_free(self.retained_state);
         for ([_]Arr{ self.inputs.q, self.inputs.k, self.inputs.v, self.inputs.decay, self.inputs.beta, self.inputs.state, self.conv_input }) |value| _ = mlx.mlx_array_free(value);
     }
-    pub fn replay(self: *const Tape, path: []const u32, s: mlx.mlx_stream) !@import("../transformer.zig").SSMCacheEntry {
+    pub fn replay(self: *const Tape, path: []const u32, s: mlx.mlx_stream) !@import("../trunk.zig").SSMCacheEntry {
         const rows = mlx.getShape(self.inputs.q)[1];
         if (path.len == 0 or path.len > 16 or path[0] != 0 or self.count != rows) return error.InvalidGlmDraftTree;
         for (path, 0..) |row, i| {
@@ -243,7 +243,7 @@ pub fn forceStagedForTest(on: bool) void {
 }
 
 const KdaLayer = @import("glm5_model.zig").KdaLayer;
-const SSMCacheEntry = @import("../transformer.zig").SSMCacheEntry;
+const SSMCacheEntry = @import("../trunk.zig").SSMCacheEntry;
 
 /// `.serial_rows` keeps one-row projection geometry; the affine modes batch rows exactly.
 pub fn applyLayer(layer: KdaLayer, ops: *Ops, x: Arr, cfg: *const @import("../model.zig").ModelConfig, state: *const SSMCacheEntry, parents: []const i32, mode: ProjectionMode) !LayerResult {
@@ -405,7 +405,7 @@ test "GLM DFlash KDA layer tree and replay equal serial ancestor forwards" {
         var ops = Ops{ .s = s };
         defer ops.deinit();
         const x = try ops.own(try @import("../dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 5, 128 }, 37, s));
-        const initial = @import("../transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        const initial = @import("../trunk.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
         defer _ = mlx.mlx_array_free(initial.conv_state);
         defer _ = mlx.mlx_array_free(initial.ssm_state);
         const parents = [_]i32{ -1, 0, 0, 1, 2 };
@@ -427,7 +427,7 @@ test "GLM DFlash KDA layer tree and replay equal serial ancestor forwards" {
                 try equalArray(@field(staged.tape.inputs, field), @field(all.tape.inputs, field), s);
             try equalArray(staged.tape.conv_input, all.tape.conv_input, s);
         }
-        var states: [5]@import("../transformer.zig").SSMCacheEntry = undefined;
+        var states: [5]@import("../trunk.zig").SSMCacheEntry = undefined;
         var made: usize = 0;
         defer for (states[0..made]) |state| {
             _ = mlx.mlx_array_free(state.conv_state);

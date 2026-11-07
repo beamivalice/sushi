@@ -11,6 +11,8 @@ const Trunk = trunk.Trunk;
 pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
+pub const State = glm5_state.State;
+pub const Ctx = glm5_state.Ctx;
 
 pub const packs = struct { // slot:packs (S2h)
     pub const product = "GLM-5.3-Flash";

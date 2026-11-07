@@ -300,7 +300,7 @@ const Layer = struct {
     }
 };
 const LayerState = struct {
-    recurrent: @import("../transformer.zig").SSMCacheEntry,
+    recurrent: @import("../trunk.zig").SSMCacheEntry,
     attention: @import("glm5_attention.zig").State,
     fn init() LayerState {
         return .{ .recurrent = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false }, .attention = .init() };

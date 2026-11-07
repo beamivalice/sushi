@@ -11,7 +11,7 @@ const forward = @import("glm5_forward.zig");
 const streaming = @import("glm5_stream.zig");
 const hidden_capture = @import("../hidden_capture.zig");
 const imatrix_capture = @import("../imatrix.zig");
-const trf = @import("../transformer.zig");
+const trunk_mod = @import("../trunk.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Arr = mlx.mlx_array;
 const testing = std.testing;
@@ -52,7 +52,7 @@ pub fn hiddenCaptureWidth(config: *const model.ModelConfig) usize {
     return @as(usize, config.hidden_size) * @max(config.hc_count, 1);
 }
 
-pub fn capturePromptChunks(allocator: std.mem.Allocator, l: *kld.Loaded, ctx: *trf.ForwardCtx, ids: []const u32, writer: *hidden_capture.Writer, chunk: usize) !mlx.mlx_array {
+pub fn capturePromptChunks(allocator: std.mem.Allocator, l: *kld.Loaded, ctx: *trunk_mod.ForwardCtx, ids: []const u32, writer: *hidden_capture.Writer, chunk: usize) !mlx.mlx_array {
     const request = ctx.glm5_request orelse return error.GlmRequestMissing;
     if (request.boundaries != null) return error.GlmHiddenCaptureAlreadyActive;
     const saved_prefill = request.prefill_async;
@@ -865,7 +865,7 @@ test "GLM native KLD capture rejects lossy options" {
     opts.pick_tolerance = 0.3;
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
     opts.pick_tolerance = 0;
-    opts.kv_quant_config = @import("../transformer.zig").KVQuantConfig.affine(8);
+    opts.kv_quant_config = @import("../trunk.zig").KVQuantConfig.affine(8);
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
     opts.command = .compare;
     try std.testing.expect(!try accepts(&cfg, opts));
@@ -1412,7 +1412,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
     cfg.max_position_embeddings = 64;
     var loaded = kld.Loaded{ .allocator = allocator, .io = io, .config = cfg, .tok = try tokenizer_mod.loadTokenizer(io, allocator, root), .chat_config = undefined, .weights = undefined, .xfm = undefined };
     defer loaded.tok.deinit();
-    loaded.xfm = try trf.Transformer.init(io, allocator, cfg, &weights);
+    loaded.xfm = try trunk_mod.Transformer.init(io, allocator, cfg, &weights);
     defer loaded.xfm.deinit();
 
     // Chunked prompt forwards continue one request exactly as the native model run in the same chunks.
@@ -1446,7 +1446,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
     var quiet: kld.Out = .{ .silent = true };
     const fixture = try std.fmt.allocPrint(arena, "{s}/reference", .{root});
     try kld.runCapture(io, allocator, &loaded, .{ .model_dir = root, .prompts = try std.fmt.allocPrint(arena, "{s}/prompts.jsonl", .{root}), .out_dir = fixture, .tokens = 4, .no_template = true }, &quiet);
-    for ([_]trf.KVQuantConfig{ .dense, .affine(8), .affine(6) }) |kv| {
+    for ([_]trunk_mod.KVQuantConfig{ .dense, .affine(8), .affine(6) }) |kv| {
         // As `kld.loadModel` applies the flag to the loaded cache.
         if (kv.isQuant()) try loaded.xfm.cache.reinit(cfg.num_hidden_layers, kv);
         const json_path = try std.fmt.allocPrint(arena, "{s}/compare-{s}.json", .{ root, kld.kvCacheFormat(kv) });
@@ -1477,7 +1477,7 @@ test "kld: GLM full-stream hidden capture retains chunked boundaries and native 
     defer weights.deinit();
     const cfg = try glm.routedFixture(&weights, 4);
     var loaded = kld.Loaded{ .allocator = a, .io = io, .config = cfg, .tok = undefined, .chat_config = undefined, .weights = undefined, .xfm = undefined };
-    loaded.xfm = try trf.Transformer.init(io, a, cfg, &weights);
+    loaded.xfm = try trunk_mod.Transformer.init(io, a, cfg, &weights);
     defer loaded.xfm.deinit();
     const ids = [_]u32{ 1, 3, 0, 2, 2, 1, 3 };
     var ctx = loaded.xfm.defaultCtx();
