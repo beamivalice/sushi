@@ -5,6 +5,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const testing = std.testing;
 const kv_cache = @import("kv_cache.zig");
+const prefix_policy = @import("prefix_policy.zig");
 const KVCacheEntry = kv_cache.KVCacheEntry;
 const arch_aux = @import("arch/prefix.zig").aux;
 const qsaHistoryRows = arch_aux.qsaHistoryRows;
@@ -1083,77 +1084,14 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
     return total;
 }
 
-/// Which retention policy a checkpoint list is thinned with. The span-preserving thin moves
-/// where a warm turn restores from and was measured on the long-context archs only, so the policy is chosen
-/// by `longCtxGated()` at each site and the ungated value names that site's previous
-/// behaviour: `.oldest` (prefill capture, disk tier), `.min_span` (hot-cache merge/shed),
-/// `.min_span_recency` (`.min_span` plus a dense newest quarter; the long-context archs).
-pub const ThinPolicy = enum { oldest, min_span, min_span_recency };
-
-/// The checkpoint index to drop when a retention list is over its cap: the interior position
-/// whose removal widens the coverage gap least; index 0 and the last are always kept. One
-/// selection for every retention site (#330: end-anchored survivors left no affordable trim point).
-pub fn spanPreservingDropIndex(
-    comptime T: type,
-    items: []const T,
-    comptime posOf: fn (*const T) usize,
-    policy: ThinPolicy,
-    /// An index the caller knows a later turn must restore from (a media boundary): never
-    /// selected. When it is the only candidate the oldest goes instead — that one sits below
-    /// it, so the protected position survives either way.
-    protect: ?usize,
-) usize {
-    std.debug.assert(items.len > 0);
-    if (policy == .oldest) return 0;
-    if (items.len < 3) return 0;
-    // Recency bias: the newest quarter stays at capture density (a warm turn that edits near
-    // the end restores from there); everything below it is thinned span-preservingly.
-    const scan_end = if (policy == .min_span_recency and items.len >= RECENCY_DENSE_MIN)
-        items.len - items.len / 4
-    else
-        items.len;
-    var best_at: usize = 1;
-    var best_span: usize = std.math.maxInt(usize);
-    var k: usize = 1;
-    while (k + 1 < items.len and k < scan_end) : (k += 1) {
-        if (protect) |p| if (k == p) continue;
-        const span = posOf(&items[k + 1]) -| posOf(&items[k - 1]);
-        if (span < best_span) {
-            best_span = span;
-            best_at = k;
-        }
-    }
-    if (best_span == std.math.maxInt(usize)) return 0;
-    return best_at;
-}
-
-/// Shortest list that reserves a dense newest quarter.
-const RECENCY_DENSE_MIN: usize = 8;
-
-fn checkpointPosOf(cp: *const SSMCheckpoint) usize {
-    return cp.pos;
-}
-
-fn u32PosOf(p: *const u32) usize {
-    return p.*;
-}
-
-fn usizePosOf(p: *const usize) usize {
-    return p.*;
-}
+pub const ThinPolicy = prefix_policy.ThinPolicy;
+pub const spanPreservingDropIndex = prefix_policy.spanPreservingDropIndex;
+pub const positionDropIndex = prefix_policy.positionDropIndex;
+pub const positionDropIndexUsize = prefix_policy.positionDropIndexUsize;
 
 /// `spanPreservingDropIndex` over a checkpoint list.
 pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, protect: ?usize) usize {
-    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect);
-}
-
-/// `spanPreservingDropIndex` over a bare ascending position list.
-pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null);
-}
-
-pub fn positionDropIndexUsize(positions: []const usize, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(usize, positions, usizePosOf, policy, null);
+    return prefix_policy.checkpointDropIndex(SSMCheckpoint, cps, policy, protect);
 }
 
 test "splitSpecCaptures: spec_ple_input row view is the rollback shape" {
@@ -1437,51 +1375,6 @@ test "two-chunk prefill capture drops the chunk parent after the boundary eval" 
     _ = mlx.mlx_get_active_memory(&after);
     const delta = after -| baseline;
     try t.expect(delta < parent_bytes);
-}
-
-test "ssm retention: the span-preserving thin keeps both ends and spreads the survivors" {
-    // Drop-oldest survivors covered only the last `max * stride` tokens (#330).
-    const t = std.testing;
-    var positions: [94]usize = undefined;
-    for (&positions, 0..) |*p, i| p.* = (i + 1) * 4096;
-    var n: usize = positions.len;
-    while (n > 16) {
-        const drop = positionDropIndexUsize(positions[0..n], .min_span_recency);
-        try t.expect(drop != 0);
-        try t.expect(drop + 1 != n);
-        var k = drop;
-        while (k + 1 < n) : (k += 1) positions[k] = positions[k + 1];
-        n -= 1;
-    }
-    try t.expectEqual(@as(usize, 16), n);
-    try t.expectEqual(@as(usize, 4096), positions[0]);
-    try t.expectEqual(@as(usize, 94 * 4096), positions[n - 1]);
-    // Spread, but not evenly: the newest quarter stays at capture density.
-    const ideal = (positions[n - 1] - positions[0]) / (n - 1);
-    var i: usize = 1;
-    while (i < n) : (i += 1) try t.expect(positions[i] - positions[i - 1] <= 2 * ideal);
-    try t.expectEqual(@as(usize, 4096), positions[n - 1] - positions[n - 2]);
-    try t.expectEqual(@as(usize, 4096), positions[n - 2] - positions[n - 3]);
-    try t.expect(positions[1] - positions[0] > 4 * 4096);
-    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..2], .min_span_recency));
-    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..1], .min_span_recency));
-    const clustered = [_]u32{ 0, 1000, 1010, 2000 };
-    try t.expectEqual(@as(usize, 2), positionDropIndex(&clustered, .min_span_recency));
-
-    // Every other arch keeps the previous policy of its own site: `.oldest` (prefill capture,
-    // disk tier) and `.min_span` (hot-cache sites, no recency quarter).
-    try t.expectEqual(@as(usize, 0), positionDropIndex(&clustered, .oldest));
-    try t.expectEqual(@as(usize, 0), positionDropIndexUsize(positions[0..n], .oldest));
-    {
-        // 12 entries; the tightest pair is inside the newest quarter (starts at 9).
-        var pos12: [12]usize = .{ 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 9010, 10_000 };
-        try t.expectEqual(@as(usize, 10), positionDropIndexUsize(&pos12, .min_span));
-        try t.expect(positionDropIndexUsize(&pos12, .min_span_recency) < 9);
-        try t.expectEqual(
-            positionDropIndexUsize(pos12[0..7], .min_span),
-            positionDropIndexUsize(pos12[0..7], .min_span_recency),
-        );
-    }
 }
 
 test "hidden capture: a verify's stays lazy for its one dispatch, a prefill chunk's is settled" {

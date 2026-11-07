@@ -24,6 +24,7 @@ const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
 const prefix_arch = @import("arch/prefix.zig");
 const prefill_plan = @import("prefill_plan.zig");
+const prefix_policy = @import("prefix_policy.zig");
 const cache_stats = @import("cache_stats.zig");
 
 const KVCache = transformer_mod.KVCache;
@@ -53,7 +54,7 @@ pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 pub const MIN_TRIMMED_VICTIM_TOKENS: usize = 512;
 
 /// Shortest prefix a ring-checkpoint restore reuses; below it the request cold-prefills.
-pub const RING_RESTORE_MIN_TOKENS: usize = 64;
+pub const RING_RESTORE_MIN_TOKENS = prefix_policy.RING_RESTORE_MIN_TOKENS;
 
 /// Ring checkpoints one entry keeps, thinned so the lowest (a shared preamble) and the newest
 /// (where the conversation goes on) stay (`thinRingCps`). One is ~16 MiB at kv8 on the ringed pack served.
@@ -63,7 +64,7 @@ pub const RING_CHECKPOINT_MAX: usize = 8;
 pub const RING_CHECKPOINT_RAM_KEEP: usize = 2;
 
 /// Message starts one prefill takes a ring checkpoint at (`ringMarkPositions`).
-pub const RING_MARKS_MAX: usize = 4;
+pub const RING_MARKS_MAX = prefix_policy.RING_MARKS_MAX;
 
 /// The special token that opens a message in the served chat templates: where the marks sit.
 pub const RING_MARK_TOKEN = "<|im_start|>";
@@ -232,25 +233,9 @@ pub const SlotRingCps = struct {
     }
 };
 
-/// Where a prefill takes ring checkpoints: the message starts (`mark_id`) it forwards past the
-/// `restored` prefix, from the restore floor up to where the prompt-end checkpoint reaches;
-/// thinned to `RING_MARKS_MAX` keeping the first (a shared preamble's end) and the last.
+/// `prefix_policy.ringMarkPositions` with the model's prompt-end backoff.
 pub fn ringMarkPositions(prompt: []const u32, restored: usize, mark_id: u32, out: *[RING_MARKS_MAX]usize) []usize {
-    var buf: [RING_MARKS_MAX + 1]usize = undefined;
-    var n: usize = 0;
-    var p = @max(restored + 1, RING_RESTORE_MIN_TOKENS);
-    while (p + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF < prompt.len) : (p += 1) {
-        if (prompt[p] != mark_id) continue;
-        buf[n] = p;
-        n += 1;
-        if (n > RING_MARKS_MAX) {
-            const k = transformer_mod.positionDropIndexUsize(buf[0..n], .min_span);
-            for (k..n - 1) |i| buf[i] = buf[i + 1];
-            n -= 1;
-        }
-    }
-    @memcpy(out[0..n], buf[0..n]);
-    return out[0..n];
+    return prefix_policy.ringMarkPositions(prompt, restored, mark_id, model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF, out);
 }
 
 /// One media block of a prompt: where its placeholder rows start, and a key
@@ -478,26 +463,8 @@ pub const TierRows = struct {
 /// KDA-class checkpoints the RAM tier's hot entry keeps (the newest) when an SSD tier holds the rest.
 pub const CHECKPOINT_HOT_KEPT: u32 = 2;
 
-/// What a spec-snap adoption may do, decided before any mlx call.
-pub const SpecAdopt = union(enum) {
-    /// Nothing to adopt: no payload, or the snap does not cover the reused range.
-    skip,
-    /// A KV-only spec cache (dflash context, sidecar MTP head).
-    kv_only: usize,
-    /// An in-checkpoint head: KV + QSA aux together.
-    head: usize,
-    /// A head target met a payload with no QSA half (pre-v5 sidecar). Head-only miss.
-    decline_head_no_history,
-};
-
-pub fn specAdoptPlan(base_pos: usize, snap_step: usize, matched: usize, has_head_target: bool, has_head_aux: bool) SpecAdopt {
-    if (base_pos > matched) return .skip;
-    const want = matched - base_pos;
-    if (want > snap_step) return .skip;
-    if (!has_head_target) return .{ .kv_only = want };
-    if (!has_head_aux) return .decline_head_no_history;
-    return .{ .head = want };
-}
+pub const SpecAdopt = prefix_policy.SpecAdopt;
+pub const specAdoptPlan = prefix_policy.specAdoptPlan;
 
 /// Test seam: forces SSD-first mode off (or on); null = on, armed only where
 /// `ModelConfig.ssdFirstCapable()`.
@@ -1097,7 +1064,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// Stack bound for the shed simulation; a longer list falls back to billing every lower checkpoint.
-    pub const SHED_SIM_MAX: usize = 192;
+    pub const SHED_SIM_MAX = prefix_policy.SHED_SIM_MAX;
 
     /// The last retained checkpoint inherits the latest checkpoint's pooled bank.
     /// Price its sliced shape before allocating/copying any multi-GB KV prefix.
@@ -1123,30 +1090,7 @@ pub const HotPrefixCache = struct {
         return bytes;
     }
 
-    /// Bytes the checkpoints at or below a candidate trim point cost after the commit path's
-    /// span-preserving shed to `allowance`; null when even the last survivor is over.
-    pub fn shedSurvivorBytes(positions: []const usize, bytes: []const u64, allowance: u64, policy: transformer_mod.ThinPolicy) ?u64 {
-        var total: u64 = 0;
-        for (bytes) |b| total += b;
-        if (total <= allowance) return total;
-        if (positions.len > SHED_SIM_MAX) return null;
-        var pos_buf: [SHED_SIM_MAX]usize = undefined;
-        var byte_buf: [SHED_SIM_MAX]u64 = undefined;
-        @memcpy(pos_buf[0..positions.len], positions);
-        @memcpy(byte_buf[0..bytes.len], bytes);
-        var n = positions.len;
-        while (total > allowance and n > 1) {
-            const drop = transformer_mod.positionDropIndexUsize(pos_buf[0..n], policy);
-            total -= byte_buf[drop];
-            var k = drop;
-            while (k + 1 < n) : (k += 1) {
-                pos_buf[k] = pos_buf[k + 1];
-                byte_buf[k] = byte_buf[k + 1];
-            }
-            n -= 1;
-        }
-        return if (total <= allowance) total else null;
-    }
+    pub const shedSurvivorBytes = prefix_policy.shedSurvivorBytes;
 
     /// Shared hybrid selector; checkpoints optionally supply the transferred QSA bank's bill.
     pub fn trimLenForBudgetPure(
@@ -1263,9 +1207,7 @@ pub const HotPrefixCache = struct {
         require_ssm_checkpoint: bool,
         probe: ?*MatchProbe,
     ) ?RamMatch {
-        var best_idx: ?usize = null;
-        var best_shared: usize = 0;
-        var best_effective: usize = 0;
+        var best: prefix_policy.BestMatch = .{};
         for (self.entries.items, 0..) |*e, i| {
             // A checked-out entry's buffers belong to another slot; its snapshot is empty.
             if (e.checked_out_by != null) continue;
@@ -1281,8 +1223,7 @@ pub const HotPrefixCache = struct {
                 const safe_boundary = crossKeyBoundary(e.vision_key, e.media_start, media_start, media_chain) orelse continue;
                 max_shared = @min(max_shared, safe_boundary);
             }
-            var shared: usize = 0;
-            while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
+            const shared = prefix_policy.commonPrefixLen(e.tokens, prompt_ids, max_shared);
 
             // Record the RAW match before the restorability filter can drop
             // this candidate — a null return with a long raw match is the
@@ -1299,15 +1240,9 @@ pub const HotPrefixCache = struct {
                 const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
                 break :blk cp.pos;
             } else if (ringRestore(e, shared, prompt_ids.len)) |rr| rr.len else 0;
-            if (effective > best_effective or
-                (effective == best_effective and shared > best_shared))
-            {
-                best_effective = effective;
-                best_shared = shared;
-                best_idx = i;
-            }
+            best.offer(i, effective, shared);
         }
-        if (best_idx) |idx| return .{ .idx = idx, .shared = best_shared };
+        if (best.idx) |idx| return .{ .idx = idx, .shared = best.shared };
         return null;
     }
 
@@ -3077,10 +3012,7 @@ pub const HotPrefixCache = struct {
         // Flush the live state captured at commit, not what the RAM entry retained after its trim.
         if (self.pending_disk != null) return self.flushPendingRecord(d, s);
         if (self.entries.items.len == 0) return;
-        var newest: *Entry = &self.entries.items[0];
-        for (self.entries.items[1..]) |*e| {
-            if (e.last_used > newest.last_used) newest = e;
-        }
+        const newest = &self.entries.items[prefix_policy.newestIndex(Entry, self.entries.items, .first).?];
         const text_len = diskTextLen(newest.tokens.len, newest.vision_key, newest.media_start);
         const media = MediaStamp.of(newest.vision_key, newest.media_start);
         if (text_len == 0) return;
@@ -3627,10 +3559,7 @@ pub const HotPrefixCache = struct {
     pub fn shedCheckpointsToFit(self: *HotPrefixCache) void {
         if (self.max_kv_bytes == 0 or self.current_kv_bytes <= self.max_kv_bytes) return;
         if (self.entries.items.len == 0) return;
-        var newest: *Entry = &self.entries.items[0];
-        for (self.entries.items[1..]) |*e| {
-            if (e.last_used > newest.last_used) newest = e;
-        }
+        const newest = &self.entries.items[prefix_policy.newestIndex(Entry, self.entries.items, .first).?];
         self.shedRingCheckpoints(newest);
         const cps = newest.ssm_checkpoints orelse return;
         var n = cps.len;
@@ -3975,9 +3904,7 @@ pub const HotPrefixCache = struct {
                 checked_out += e.kv_bytes;
                 continue;
             }
-            const max_shared = @min(e.tokens.len, prompt_tokens.len);
-            var shared: usize = 0;
-            while (shared < max_shared and e.tokens[shared] == prompt_tokens[shared]) shared += 1;
+            const shared = prefix_policy.commonPrefixLen(e.tokens, prompt_tokens, @min(e.tokens.len, prompt_tokens.len));
             if (shared < MIN_CANCELLED_COMMIT_TOKENS) continue;
             pinned = @max(pinned, e.kv_bytes);
         }
@@ -3987,27 +3914,11 @@ pub const HotPrefixCache = struct {
     /// Evict least-recently-used entries until `fits()` says the request fits (#353): a cached
     /// prefix is an optimization, the request is the work. Never evicts the entry this request
     /// restored from; `fits` is re-asked after every eviction.
-    /// Smallest eviction whose live/billed ratio is meaningful.
-    pub const SHARED_RATIO_MIN_BYTES: u64 = 1 << 20;
-
-    /// An eviction returning less than 1/Nth of what the entry was billed gave the allocator
-    /// nothing (refcount-shared with a live cache). A ratio, not a floor: a small exclusive
-    /// entry also returns little.
-    pub const SHARED_RETURN_DIVISOR: u64 = 4;
-
-    /// A restore is a lien on the whole entry: `KVCache.restore` shares the entire allocation
-    /// and `truncate` frees nothing, so a slot that matched 11 tokens of a 524k entry held all
-    /// 11.5 GB and the admission pass could not touch it. A restore may not pin an entry that
-    /// hands back less than 1/`RESTORE_PIN_RATIO` of what it pins; small entries never reach the test.
-    pub const RESTORE_PIN_MIN_BYTES: u64 = 1 << 30;
-    pub const RESTORE_PIN_RATIO: usize = 64;
-
-    /// Would restoring `shared` rows from this entry be a lien rather than a hit?
-    pub fn restoreWouldPinEntry(kv_bytes: u64, min_bytes: u64, entry_tokens: usize, shared: usize) bool {
-        if (kv_bytes < min_bytes) return false;
-        if (shared == 0) return true;
-        return entry_tokens > shared *| RESTORE_PIN_RATIO;
-    }
+    pub const SHARED_RATIO_MIN_BYTES = prefix_policy.SHARED_RATIO_MIN_BYTES;
+    pub const SHARED_RETURN_DIVISOR = prefix_policy.SHARED_RETURN_DIVISOR;
+    pub const RESTORE_PIN_MIN_BYTES = prefix_policy.RESTORE_PIN_MIN_BYTES;
+    pub const RESTORE_PIN_RATIO = prefix_policy.RESTORE_PIN_RATIO;
+    pub const restoreWouldPinEntry = prefix_policy.restoreWouldPinEntry;
 
     pub fn evictLruToAdmit(
         self: *HotPrefixCache,
@@ -4035,9 +3946,7 @@ pub const HotPrefixCache = struct {
             const acct_delta = acct_before -| self.current_kv_bytes;
             report.accounted_bytes += acct_delta;
             // Judge only entries big enough for the ratio to mean something.
-            if (acct_delta >= SHARED_RATIO_MIN_BYTES and
-                freed_live * SHARED_RETURN_DIVISOR < acct_delta)
-            {
+            if (prefix_policy.evictionWasShared(acct_delta, freed_live)) {
                 report.shared_stop = true;
                 break;
             }
@@ -4055,35 +3964,8 @@ pub const HotPrefixCache = struct {
         return report;
     }
 
-    /// Least-recently-used entry index, skipping the one whose `last_used` equals `protect`.
-    /// Workload-fair: only entries of the `cache_key` holding the most eligible entries
-    /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own
-    /// documents before another workload's conversation. One key = plain LRU.
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
-        var best: ?usize = null;
-        var best_used: u64 = std.math.maxInt(u64);
-        var max_count: usize = 0;
-        for (self.entries.items, 0..) |*e, i| {
-            // Held by a live slot that owns its buffers: evicting it frees nothing.
-            if (e.checked_out_by != null) continue;
-            if (protect) |p| {
-                if (e.last_used == p) continue;
-            }
-            var count: usize = if (incoming_key != null and incoming_key.? == e.cache_key) 1 else 0;
-            for (self.entries.items) |*o| {
-                if (o.checked_out_by != null or o.cache_key != e.cache_key) continue;
-                if (protect) |p| {
-                    if (o.last_used == p) continue;
-                }
-                count += 1;
-            }
-            if (count > max_count or (count == max_count and e.last_used < best_used)) {
-                max_count = count;
-                best_used = e.last_used;
-                best = i;
-            }
-        }
-        return best;
+        return prefix_policy.lruIndexExcluding(Entry, self.entries.items, protect, incoming_key);
     }
 
     fn logResident(self: *const HotPrefixCache) void {
@@ -4138,14 +4020,7 @@ pub const HotPrefixCache = struct {
             self.pending_disk = null;
         }
         if (self.entries.items.len == 0) return;
-        var newest_idx: usize = 0;
-        var newest_used: u64 = 0;
-        for (self.entries.items, 0..) |*e, i| {
-            if (e.last_used >= newest_used) {
-                newest_used = e.last_used;
-                newest_idx = i;
-            }
-        }
+        const newest_idx = prefix_policy.newestIndex(Entry, self.entries.items, .last).?;
         var evicted = self.entries.swapRemove(newest_idx);
         self.current_kv_bytes -|= evicted.kv_bytes;
         freeEntryOwnedState(self.allocator, &evicted);

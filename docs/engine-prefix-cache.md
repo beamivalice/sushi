@@ -2,7 +2,7 @@
 
 How prompt-prefix KV reuse works: the hot RAM cache, hybrid (GDN/QSA) restore points, the SSD tier and SSD-first
 mode, checkouts and donations, spec state riding the cache, and GLM's native state. Read this before touching `src/prefix_cache.zig`,
-`src/kv_disk_cache.zig`, `src/disk_placement.zig` or `src/kv_disk_writer.zig`.
+`src/kv_disk_cache.zig`, `src/prefix_policy.zig`, `src/disk_format.zig`, `src/disk_placement.zig` or `src/kv_disk_writer.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-kv-cache.md),
 [engine-memory-admission](engine-memory-admission.md), [engine-mtp](engine-mtp.md),
@@ -14,6 +14,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 |---|---|
 | `src/prefix_cache.zig` | Hot prefix cache (`--prefix-cache-entries`, `--prefix-cache-mem`) |
 | `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`) |
+| `src/prefix_policy.zig` | The cache's rules on positions, lengths and byte counts, host tier: the checkpoint drop index and `ThinPolicy`, `specAdoptPlan`, the ring mark positions, the shed simulation, the lookup's `BestMatch`, the eviction victim (`lruIndexExcluding`), the shared-return stop and the restore lien. [Policy and format](#policy-format) |
+| `src/disk_format.zig` | The SSD record's wire format, host tier: the safetensors header, `IndexEntry` and the `meta.json` manifest (render, version stamp, parse). [Policy and format](#policy-format) |
 | `src/disk_placement.zig` | The SSD tier's default budget (`resolveDiskBudget`), cache roots and model fingerprint, and the startup/usage lines |
 | `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
 | `src/arch/prefix.zig` | The seam: dispatch over the arch's `prefix` module (restore target `State`, per-entry `Rows`, per-cache `CacheState`, the hooks below, the QSA-history `disk` section, the SSM-entry `aux` accelerators). The three files above name no arch. [Arch seam](#arch-seam) |
@@ -23,6 +25,29 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 | `src/dsv41/dsv41_prefix.zig` | DeepSeek-V4.1 restore points and the `HotPrefixCache` arms and tests that serve them: the whole request state as one checkpoint, both tiers ([DeepSeek](dsv41-arch.md#prefix-cache)) |
 | `src/qwen4/qwen4_prefix.zig` | Flash-Next: the QSA-history section of a hybrid SSD record (`qwen4_disk_qsa.zig`), the QSA / GDN-replay accelerators of an SSM entry, the in-checkpoint MTP head's adoption |
 | `src/mimo2/mimo2_prefix.zig` | MiMo: no state of its own; the sliding ring is a cache kind the hot cache and the SSD tier serve ([ring](#basics)) |
+
+<a id="policy-format"></a>
+## Policy and format
+
+The rules and the bytes sit apart from the arrays they act on, so the host tier tests them on recorded position lists
+and golden strings (`zig build test-host`, no GPU, no lock).
+- **`prefix_policy.zig`**: no function reads an MLX array. `prefix_cache.zig`, `ssm_cache.zig` and the arch bodies keep
+  the old names (`ThinPolicy`, `positionDropIndex*`, `ssmCheckpointDropIndex`, `SpecAdopt`, `specAdoptPlan`,
+  `ringMarkPositions`, `HotPrefixCache.shedSurvivorBytes`, `restoreWouldPinEntry`, ...) as re-exports or one-line
+  wrappers. The walks over `entries` stay in `HotPrefixCache` and ask the policy for the decision: the winner of a
+  lookup (`BestMatch.offer`, ties to the longer raw match, then the earlier entry), the victim (`lruIndexExcluding`:
+  the LRU of the `cache_key` holding the most eligible entries), the newest entry (`newestIndex`, which side wins a tie
+  is named at the call), and whether an eviction handed back too little to go on (`evictionWasShared`).
+- **`disk_format.zig`**: the record's bytes do not change with a refactor, only with a manifest version.
+  `encodeHeader` writes the 8-byte length and the header JSON in one buffer; `renderMeta` and `metaVersionFor` write the
+  manifest and stamp the lowest version that describes the entry; `parseManifest` reads a manifest into scalars and
+  borrowed lists, and `loadEntry` then checks files against it (a record whose `media` block names no boundary is
+  refused before any file is read). The golden strings in the file's tests are the manifest of a plain and of a fully
+  loaded (v11) entry; the SHA-256 pins of the three entry directories stay in `kv_disk_cache.zig`.
+  `HEAD_MARKS_MAX` (the marks a head sidecar records) is the format's constant; the QSA code takes `QSA_HEAD_MARKS_MAX`
+  from it, so the file imports no arch.
+- Entry-count walks in `HotPrefixCache` are bounded by `--prefix-cache-entries` and none grows with the context, so
+  they stay walks.
 
 <a id="arch-seam"></a>
 ## Arch seam

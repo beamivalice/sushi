@@ -62,6 +62,7 @@ const write_stats = @import("disk_write_stats.zig");
 const cache_stats = @import("cache_stats.zig");
 const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
+const disk_format = @import("disk_format.zig");
 
 const KVCache = transformer_mod.KVCache;
 
@@ -107,69 +108,8 @@ pub const GrownSpec = struct {
     row_bytes: u64,
 };
 
-pub const IndexEntry = struct {
-    /// Directory id — the `e<id>` component.
-    id: u64,
-    /// Full committed token sequence (prompt ++ generated). Owned.
-    tokens: []u32,
-    /// KV positions actually persisted (== snapshot `step` at commit; may be
-    /// tokens.len - 1 when the final sampled token was never forwarded).
-    kv_len: u32,
-    has_tools: bool,
-    quant: kv_quant.KVQuantConfig,
-    /// Total on-disk bytes (chunks + tokens.bin + meta).
-    bytes: u64,
-    /// Per-chunk file sizes recorded at commit (meta.json "chunk_bytes").
-    /// The scan validates actual file sizes against these and clamps kv_len
-    /// to the last contiguous valid chunk — a kill -9 mid-flush truncates a
-    /// chunk, and restoring it would poison the cache. Owned.
-    chunk_bytes: []u64,
-    /// The first `inherited_chunks` chunk files are hard links into a donor entry's chunks;
-    /// this entry never billed them. meta.json v6 `inherited_chunks`; 0 on older manifests.
-    inherited_chunks: u32 = 0,
-    /// Phase 3: persisted SSM checkpoint positions (sorted ascending; empty
-    /// for pure-attention entries) and per-file byte sizes (parallel array —
-    /// the same kill -9 salvage role as `chunk_bytes`: the scan drops
-    /// individual positions whose file size mismatches). Owned.
-    ssm_positions: []u32,
-    ssm_bytes: []u64,
-    /// v4: spec-snapshot sidecar (`spec.safetensors`) byte size; 0 = none.
-    /// The same kill -9 salvage as chunks — a size mismatch at scan drops the
-    /// SPEC only (a restore then starts blind), never the entry.
-    spec_bytes: u64 = 0,
-    /// v4: dflash assistant context / MTP committed history persisted in the
-    /// spec sidecar. DRAFT-side state — a missing or dropped snap costs
-    /// acceptance on the first reused turn, never a token.
-    spec_dflash: ?SpecMeta = null,
-    spec_mtp: ?SpecMeta = null,
-    /// A background write for this entry failed: never matched, never a donor, never reported
-    /// complete; the next commit reclaims its directory. Not persisted (`scan` re-validates).
-    poisoned: bool = false,
-    qsa_history_bytes: u64 = 0,
-    qsa_history_rows: u32 = 0,
-    inherited_qsa: bool = false,
-    /// v11: bytes of each row segment `g<n>.safetensors`, in order, and the tokens a segment spans. Empty for
-    /// an entry whose restore points hold their own rows.
-    grown: []u64 = &.{},
-    grown_span: u32 = 0,
-    /// The first `inherited_grown` of them are hard links into a donor entry's: this entry never billed them.
-    inherited_grown: u32 = 0,
-    /// v9: the ringed layers' restore points (`r{pos}.safetensors`), ascending; empty for an
-    /// entry whose layers all hold the prefix. A ringed entry restores only at one of them. Owned.
-    rings: []RingFile = &.{},
-    /// v10: the media chain this record's rows were computed under (`prefix_cache.MediaSpan`), as
-    /// its last block's key, and the first media placeholder in `tokens`. 0 / null = no media row,
-    /// which is what every pre-v10 record is. A lookup hands the tier per-entry limits
-    /// (`MediaLimits`) computed from these by the one owner of the rule,
-    /// `prefix_cache.crossKeyBoundary`; a commit applies that rule with no chain (`commitShares`).
-    vision_key: u64 = 0,
-    media_start: ?u32 = null,
-    /// In-process LRU stamp; seeded from meta.json mtime order at scan.
-    last_used: u64,
-};
-
-/// One persisted ring restore point: the ringed layers' rows `[pos - rows, pos)`.
-pub const RingFile = struct { pos: u32, rows: u32, bytes: u64 };
+pub const IndexEntry = disk_format.IndexEntry;
+pub const RingFile = disk_format.RingFile;
 
 /// What a commit of a ringed cache adds: its sliding layers hold only a window, so the entry
 /// persists restore points instead, at the persisted length off the cache's own ring and at
@@ -182,36 +122,8 @@ pub const RingCommit = struct {
 /// `bestRingMatch`'s result: the entry, the ring file, and the length it restores to.
 pub const RingMatch = struct { idx: usize, pos: u32, at: u32 };
 
-/// v4 spec-snapshot metadata for one speculative-side cache (dflash assistant
-/// context or MTP committed history). The tensors live in the entry's ONE
-/// `spec.safetensors` file, keyed `d{layer}.*` / `m{layer}.*`.
-pub const SpecMeta = struct {
-    /// Absolute trunk position the snapshot's index 0 represents.
-    base: u64,
-    /// Positions persisted (the snapshot's logical length).
-    step: u32,
-    /// Layer count of the source cache — a restore target with a different
-    /// count declines (KVCache.restore asserts equal lengths).
-    layers: u32,
-    quant: kv_quant.KVQuantConfig,
-    /// v5, in-checkpoint MTP head only: the head's QSA aux half in the same sidecar. Null = a
-    /// head-only miss at restore; the trunk entry is unaffected.
-    head: ?SpecHeadMeta = null,
-};
-
-/// v5 head half of a `SpecMeta`: the scalars the head's position bookkeeping needs.
-pub const SpecHeadMeta = struct {
-    /// Absolute position of the head's key row 0 (the head's `pos_base`).
-    pos_base: i32,
-    ratio: i32,
-    pooled: bool,
-    rows: i32 = 0,
-    /// v8: head rows the sidecar carries a QSA leftover for, ascending — the trunk's
-    /// checkpoint positions. Tensor `<prefix>h.lv<i>` holds the i-th. Inline: an IndexEntry
-    /// is scanned and copied by value.
-    marks: [transformer_mod.QSA_HEAD_MARKS_MAX]i32 = @splat(0),
-    mark_count: u8 = 0,
-};
+pub const SpecMeta = disk_format.SpecMeta;
+pub const SpecHeadMeta = disk_format.SpecHeadMeta;
 
 /// What `appendCommitWithSpec` reads to persist one spec snapshot — the same
 /// snapshot-shaped parts the trunk flush takes, plus the base position.
@@ -2404,7 +2316,7 @@ pub const DiskTier = struct {
                 // v8: the leftovers a warm clamp reads, one tensor each (at most ratio-1 rows).
                 for (sc.head_marks) |mk| {
                     if (mk.rows.ctx == null or mk.pos > hist) continue;
-                    if (hm.mark_count == transformer_mod.QSA_HEAD_MARKS_MAX) break;
+                    if (hm.mark_count == disk_format.HEAD_MARKS_MAX) break;
                     var kind_buf: [16]u8 = undefined;
                     const kind = try std.fmt.bufPrint(&kind_buf, "h.lv{d}", .{hm.mark_count});
                     try self.appendSpecArray(list, prefix, kind, mk.rows);
@@ -2789,18 +2701,9 @@ pub const DiskTier = struct {
         return self.encodeSafetensors(tensors, meta);
     }
 
-    /// One `__metadata__` entry. The encoder refuses anything needing JSON escaping.
-    pub const MetaPair = struct { key: []const u8, value: []const u8 };
+    pub const MetaPair = disk_format.MetaPair;
 
     const no_meta: []const MetaPair = &[_]MetaPair{};
-
-    /// Is `v` safe inside a JSON string with no escaping?
-    fn plainJsonAscii(v: []const u8) bool {
-        for (v) |c| {
-            if (c < 0x20 or c > 0x7e or c == '"' or c == '\\') return false;
-        }
-        return true;
-    }
 
     /// Header + payload encode over an already-materialized tensor list. Evaluates nothing.
     fn encodeSafetensors(self: *DiskTier, tensors: []const NamedTensor, meta: []const MetaPair) ![]u8 {
@@ -2890,36 +2793,27 @@ pub const DiskTier = struct {
         return total;
     }
 
-    /// The 8-byte little-endian header length and the header JSON, as `mlx::core::save_safetensors` writes them.
-    fn encodeHeader(self: *DiskTier, tensors: []const NamedTensor, meta: []const MetaPair) ![]u8 {
-        var header = std.ArrayList(u8).empty;
-        defer header.deinit(self.allocator);
-        const hw = &header;
-        try hw.appendSlice(self.allocator, "{\"__metadata__\":{");
-        for (meta, 0..) |m, mi| {
-            if (!plainJsonAscii(m.key) or !plainJsonAscii(m.value)) return error.DiskCacheBadMetadata;
-            if (mi > 0) try hw.appendSlice(self.allocator, ",");
-            try hw.print(self.allocator, "\"{s}\":\"{s}\"", .{ m.key, m.value });
-        }
-        try hw.appendSlice(self.allocator, "}");
-        var off: u64 = 0;
-        for (tensors) |*t| {
-            const nb = nbytesOf(t.arr);
-            const dname = safetensorsDtypeName(mlx.mlx_array_dtype(t.arr)) orelse return error.DiskCacheBadDtype;
-            try hw.print(self.allocator, ",\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ t.key, dname });
-            for (mlx.getShape(t.arr), 0..) |d, i| {
-                if (i > 0) try hw.appendSlice(self.allocator, ",");
-                try hw.print(self.allocator, "{d}", .{d});
-            }
-            try hw.print(self.allocator, "],\"data_offsets\":[{d},{d}]}}", .{ off, off + nb });
-            off += nb;
-        }
-        try hw.appendSlice(self.allocator, "}");
+    /// A tensor list as the header encoder reads it.
+    const HeaderSource = struct {
+        tensors: []const NamedTensor,
 
-        const out = try self.allocator.alloc(u8, 8 + header.items.len);
-        std.mem.writeInt(u64, out[0..8], @intCast(header.items.len), .little);
-        @memcpy(out[8..], header.items);
-        return out;
+        pub fn len(self: HeaderSource) usize {
+            return self.tensors.len;
+        }
+
+        pub fn desc(self: HeaderSource, i: usize) !disk_format.TensorDesc {
+            const t = &self.tensors[i];
+            return .{
+                .key = t.key,
+                .dtype = safetensorsDtypeName(mlx.mlx_array_dtype(t.arr)) orelse return error.DiskCacheBadDtype,
+                .shape = mlx.getShape(t.arr),
+                .nbytes = nbytesOf(t.arr),
+            };
+        }
+    };
+
+    fn encodeHeader(self: *DiskTier, tensors: []const NamedTensor, meta: []const MetaPair) ![]u8 {
+        return disk_format.encodeHeader(self.allocator, HeaderSource{ .tensors = tensors }, meta);
     }
 
     // ── SSM checkpoint persistence (Phase 3, hybrid archs) ──
@@ -3778,91 +3672,10 @@ pub const DiskTier = struct {
         self.stats.recordWritten(.meta, buf.items.len);
     }
 
-    /// The lowest manifest version that describes this entry. The version is a compatibility
-    /// claim: an older reader accepts only 2..4, so stamping v6 unconditionally made a binary
-    /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
-    pub fn metaVersionFor(e: IndexEntry) u8 {
-        // v11: an older reader would look for rows in the point files, which keep only the ones past the segments.
-        if (e.grown.len > 0) return 11;
-        // v10: an older reader knows no media identity, so it would hand a text prompt rows that
-        // only this record's pixels explain. Dropping the record is the only safe read.
-        if (e.vision_key != 0) return 10;
-        // v9: an older reader would restore the chunks alone, leaving the ringed layers empty.
-        if (e.rings.len > 0) return 9;
-        if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) return 8;
-        if (e.inherited_chunks > 0) return 6;
-        if (e.spec_mtp) |m| if (m.head) |h| return if (h.mark_count > 0) 8 else 5;
-        return 4;
-    }
+    pub const metaVersionFor = disk_format.metaVersionFor;
 
-    /// The meta.json body; one renderer for the synchronous and the staged path.
     fn renderMeta(self: *DiskTier, out: *std.ArrayList(u8), e: IndexEntry) !void {
-        const a = self.allocator;
-        try out.print(
-            a,
-            "{{\"v\":{d},\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"inherited_chunks\":{d},\"bytes\":{d},\"chunk_bytes\":[",
-            .{
-                metaVersionFor(e),
-                e.kv_len,
-                e.tokens.len,
-                e.has_tools,
-                @tagName(e.quant.scheme),
-                e.quant.bits,
-                e.quant.group_size,
-                self.chunk_tokens,
-                e.inherited_chunks,
-                e.bytes,
-            },
-        );
-        for (e.chunk_bytes, 0..) |cb, i| {
-            if (i > 0) try out.appendSlice(a, ",");
-            try out.print(a, "{d}", .{cb});
-        }
-        // v3: SSM checkpoints as [{pos,bytes},...] (sorted ascending).
-        try out.appendSlice(a, "],\"ssm\":[");
-        for (e.ssm_positions, e.ssm_bytes, 0..) |pos, sz, i| {
-            if (i > 0) try out.appendSlice(a, ",");
-            try out.print(a, "{{\"pos\":{d},\"bytes\":{d}}}", .{ pos, sz });
-        }
-        try out.appendSlice(a, "]");
-        if (e.grown.len > 0) {
-            try out.print(a, ",\"grown\":{{\"span\":{d},\"inherited\":{d},\"bytes\":[", .{ e.grown_span, e.inherited_grown });
-            for (e.grown, 0..) |gb, i| {
-                if (i > 0) try out.appendSlice(a, ",");
-                try out.print(a, "{d}", .{gb});
-            }
-            try out.appendSlice(a, "]}");
-        }
-        if (e.rings.len > 0) {
-            try out.appendSlice(a, ",\"ring\":[");
-            for (e.rings, 0..) |r, i| {
-                if (i > 0) try out.appendSlice(a, ",");
-                try out.print(a, "{{\"pos\":{d},\"rows\":{d},\"bytes\":{d}}}", .{ r.pos, r.rows, r.bytes });
-            }
-            try out.appendSlice(a, "]");
-        }
-        // v10: the media chain the rows were computed under. `start` is absent when the record
-        // holds no media row, which is every record an older binary wrote.
-        if (e.vision_key != 0) {
-            try out.print(a, ",\"media\":{{\"key\":\"{x}\"", .{e.vision_key});
-            if (e.media_start) |ms| try out.print(a, ",\"start\":{d}", .{ms});
-            try out.appendSlice(a, "}");
-        }
-        if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) {
-            try out.print(a, ",\"qsa_history\":{{\"bytes\":{d},\"rows\":{d},\"inherited\":{}}}", .{
-                e.qsa_history_bytes,
-                e.qsa_history_rows,
-                e.inherited_qsa,
-            });
-        }
-        // v4: spec snapshots (dflash context / MTP history); a size mismatch drops only the spec.
-        if (e.spec_bytes > 0 and (e.spec_dflash != null or e.spec_mtp != null)) {
-            try out.print(a, ",\"spec\":{{\"bytes\":{d}", .{e.spec_bytes});
-            if (e.spec_dflash) |sm| try writeSpecMetaJson(a, out, "dflash", sm);
-            if (e.spec_mtp) |sm| try writeSpecMetaJson(a, out, "mtp", sm);
-            try out.appendSlice(a, "}");
-        }
-        try out.appendSlice(a, "}");
+        return disk_format.renderMeta(self.allocator, out, e, self.chunk_tokens);
     }
 
     fn scan(self: *DiskTier) !void {
@@ -3982,31 +3795,25 @@ pub const DiskTier = struct {
         if (parsed.value != .object) return null;
         const obj = parsed.value.object;
 
-        const version = jsonU64(obj, "v") orelse return null;
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
         // adds optional spec snapshots; v5 the in-checkpoint MTP head's QSA half; v6 inherited
         // chunks; v9 ring restore points; v10 the media identity; v11 row segments. All restore; a
         // lower-version entry just carries none of the newer state, and a pre-v10 one holds no media row.
-        if (version < 2 or version > 11) return null;
+        const man = disk_format.parseManifest(obj) orelse return null;
         // v6: the leading `inherited_chunks` chunk files are hard links into a donor's.
-        const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
-        var kv_len = jsonU64(obj, "kv_len") orelse return null;
-        const n_tokens = jsonU64(obj, "tokens") orelse return null;
-        const chunk_tokens = jsonU64(obj, "chunk_tokens") orelse return null;
-        const has_tools_v = obj.get("has_tools") orelse return null;
-        if (has_tools_v != .bool) return null;
-        const chunk_bytes_v = obj.get("chunk_bytes") orelse return null;
-        if (chunk_bytes_v != .array) return null;
+        const inherited_rec = man.inherited_chunks;
+        var kv_len = man.kv_len;
+        const n_tokens = man.tokens;
+        const chunk_tokens = man.chunk_tokens;
+        const chunk_bytes_items = man.chunk_bytes;
 
         // Chunk geometry must match this tier's configuration — a stale root
         // written under a different chunk size can't be extended coherently.
         if (chunk_tokens != self.chunk_tokens) return null;
         if (kv_len == 0 or kv_len > n_tokens) return null;
 
-        const quant = manifestQuant(obj) orelse return null;
-
         const n_chunks: u64 = (kv_len + chunk_tokens - 1) / chunk_tokens;
-        if (chunk_bytes_v.array.items.len != n_chunks) return null;
+        if (chunk_bytes_items.len != n_chunks) return null;
 
         // Validate each chunk file's size against the recorded one. A kill -9
         // mid-flush truncates the chunk being (re)written while meta still
@@ -4016,12 +3823,11 @@ pub const DiskTier = struct {
         // prefix.
         var valid_chunks: u64 = 0;
         while (valid_chunks < n_chunks) : (valid_chunks += 1) {
-            const want_v = chunk_bytes_v.array.items[@intCast(valid_chunks)];
-            if (want_v != .integer or want_v.integer < 0) break;
+            const want = disk_format.valueU64(chunk_bytes_items[@intCast(valid_chunks)]) orelse break;
             const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, id, valid_chunks }) catch return null;
             defer self.allocator.free(cp);
             const have = fileSize(self.io, cp) orelse break;
-            if (have != @as(u64, @intCast(want_v.integer))) break;
+            if (have != want) break;
         }
         if (valid_chunks < n_chunks) {
             const salvaged = valid_chunks * chunk_tokens;
@@ -4031,7 +3837,7 @@ pub const DiskTier = struct {
         }
 
         const chunk_bytes = self.allocator.alloc(u64, @intCast(valid_chunks)) catch return null;
-        for (chunk_bytes, 0..) |*cb, i| cb.* = @intCast(chunk_bytes_v.array.items[i].integer);
+        for (chunk_bytes, 0..) |*cb, i| cb.* = disk_format.valueU64(chunk_bytes_items[i]).?;
 
         // Token record.
         const tokens_path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/tokens.bin", .{ self.root, id }) catch {
@@ -4068,24 +3874,20 @@ pub const DiskTier = struct {
         var grown_span: u32 = 0;
         var grown_rec_span: u32 = 1;
         var grown_inherited: u32 = 0;
-        if (obj.get("grown")) |gv| grown_blk: {
-            if (gv != .object) break :grown_blk;
-            const span = jsonInt(u32, gv.object, "span") orelse break :grown_blk;
-            const list_v = gv.object.get("bytes") orelse break :grown_blk;
-            if (list_v != .array or span == 0) break :grown_blk;
-            grown_recorded = list_v.array.items;
-            grown_rec_span = span;
-            grown_inherited = jsonInt(u32, gv.object, "inherited") orelse break :grown_blk;
+        if (man.grown) |gm| grown_blk: {
+            grown_recorded = gm.bytes;
+            grown_rec_span = gm.span;
+            grown_inherited = gm.inherited orelse break :grown_blk;
             for (grown_recorded, 1..) |bv, j| {
-                if (bv != .integer or bv.integer < 0) break;
+                const want = disk_format.valueU64(bv) orelse break;
                 const gp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/g{d:0>5}.safetensors", .{ self.root, id, j }) catch break;
                 defer self.allocator.free(gp);
                 const have = fileSize(self.io, gp) orelse break;
-                if (have != @as(u64, @intCast(bv.integer))) break;
+                if (have != want) break;
                 grown_valid = j;
                 total += have;
             }
-            if (grown_valid > 0) grown_span = span;
+            if (grown_valid > 0) grown_span = gm.span;
         }
 
         // v3 SSM checkpoints (v2 entries have no "ssm" field → pure-attention,
@@ -4094,67 +3896,61 @@ pub const DiskTier = struct {
         // (or now sits beyond a salvaged-down kv_len) is dropped individually.
         var ssm_positions: []u32 = &[_]u32{};
         var ssm_bytes: []u64 = &[_]u64{};
-        var had_ssm_listed = false;
-        if (obj.get("ssm")) |ssm_v| {
-            if (ssm_v == .array) {
-                had_ssm_listed = ssm_v.array.items.len > 0;
-                var pos_list = std.ArrayList(u32).empty;
-                defer pos_list.deinit(self.allocator);
-                var byte_list = std.ArrayList(u64).empty;
-                defer byte_list.deinit(self.allocator);
-                for (ssm_v.array.items) |it_v| {
-                    if (it_v != .object) continue;
-                    const o = it_v.object;
-                    const pos = jsonU64(o, "pos") orelse continue;
-                    const szrec = jsonU64(o, "bytes") orelse continue;
-                    if (pos == 0 or pos > kv_len) continue; // beyond the salvaged KV → unusable
-                    if (grown_recorded.len > 0 and pos / grown_rec_span > grown_valid) continue; // its rows are in a lost segment
-                    const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch continue;
-                    defer self.allocator.free(sp);
-                    const have = fileSize(self.io, sp) orelse continue;
-                    if (have != szrec) continue; // truncated mid-flush — drop this position
-                    pos_list.append(self.allocator, @intCast(pos)) catch continue;
-                    byte_list.append(self.allocator, szrec) catch {
-                        _ = pos_list.pop();
-                        continue;
-                    };
+        const had_ssm_listed = man.ssm.len > 0;
+        var pos_list = std.ArrayList(u32).empty;
+        defer pos_list.deinit(self.allocator);
+        var byte_list = std.ArrayList(u64).empty;
+        defer byte_list.deinit(self.allocator);
+        for (man.ssm) |it_v| {
+            const item = disk_format.ssmItem(it_v) orelse continue;
+            const pos = item.pos;
+            const szrec = item.bytes;
+            if (pos == 0 or pos > kv_len) continue; // beyond the salvaged KV → unusable
+            if (grown_recorded.len > 0 and pos / grown_rec_span > grown_valid) continue; // its rows are in a lost segment
+            const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch continue;
+            defer self.allocator.free(sp);
+            const have = fileSize(self.io, sp) orelse continue;
+            if (have != szrec) continue; // truncated mid-flush — drop this position
+            pos_list.append(self.allocator, @intCast(pos)) catch continue;
+            byte_list.append(self.allocator, szrec) catch {
+                _ = pos_list.pop();
+                continue;
+            };
+        }
+        if (pos_list.items.len > 0) {
+            // meta lists positions ascending, but re-sort defensively so
+            // highestSsmPosAtOrBelow / retention can trust the order.
+            const Pair = struct { pos: u32, bytes: u64 };
+            const pairs = self.allocator.alloc(Pair, pos_list.items.len) catch {
+                self.allocator.free(tokens);
+                self.allocator.free(chunk_bytes);
+                return null;
+            };
+            defer self.allocator.free(pairs);
+            for (pairs, 0..) |*pr, i| pr.* = .{ .pos = pos_list.items[i], .bytes = byte_list.items[i] };
+            std.mem.sort(Pair, pairs, {}, struct {
+                fn lt(_: void, a: Pair, b: Pair) bool {
+                    return a.pos < b.pos;
                 }
-                if (pos_list.items.len > 0) {
-                    // meta lists positions ascending, but re-sort defensively so
-                    // highestSsmPosAtOrBelow / retention can trust the order.
-                    const Pair = struct { pos: u32, bytes: u64 };
-                    const pairs = self.allocator.alloc(Pair, pos_list.items.len) catch {
-                        self.allocator.free(tokens);
-                        self.allocator.free(chunk_bytes);
-                        return null;
-                    };
-                    defer self.allocator.free(pairs);
-                    for (pairs, 0..) |*pr, i| pr.* = .{ .pos = pos_list.items[i], .bytes = byte_list.items[i] };
-                    std.mem.sort(Pair, pairs, {}, struct {
-                        fn lt(_: void, a: Pair, b: Pair) bool {
-                            return a.pos < b.pos;
-                        }
-                    }.lt);
-                    const sp_arr = self.allocator.alloc(u32, pairs.len) catch {
-                        self.allocator.free(tokens);
-                        self.allocator.free(chunk_bytes);
-                        return null;
-                    };
-                    const sb_arr = self.allocator.alloc(u64, pairs.len) catch {
-                        self.allocator.free(sp_arr);
-                        self.allocator.free(tokens);
-                        self.allocator.free(chunk_bytes);
-                        return null;
-                    };
-                    for (pairs, 0..) |pr, i| {
-                        sp_arr[i] = pr.pos;
-                        sb_arr[i] = pr.bytes;
-                        total += pr.bytes;
-                    }
-                    ssm_positions = sp_arr;
-                    ssm_bytes = sb_arr;
-                }
+            }.lt);
+            const sp_arr = self.allocator.alloc(u32, pairs.len) catch {
+                self.allocator.free(tokens);
+                self.allocator.free(chunk_bytes);
+                return null;
+            };
+            const sb_arr = self.allocator.alloc(u64, pairs.len) catch {
+                self.allocator.free(sp_arr);
+                self.allocator.free(tokens);
+                self.allocator.free(chunk_bytes);
+                return null;
+            };
+            for (pairs, 0..) |pr, i| {
+                sp_arr[i] = pr.pos;
+                sb_arr[i] = pr.bytes;
+                total += pr.bytes;
             }
+            ssm_positions = sp_arr;
+            ssm_bytes = sb_arr;
         }
         // A hybrid entry (SSM listed in meta) whose checkpoints ALL failed
         // validation is unusable — KV without any SSM state can't restore a
@@ -4170,15 +3966,14 @@ pub const DiskTier = struct {
         // v9 ring restore points, salvaged per file like the SSM checkpoints. A ringed entry whose
         // files all fail restores nothing (its chunks lack the ringed layers): dropped wholesale.
         var rings: []RingFile = &.{};
-        if (obj.get("ring")) |ring_v| ring_blk: {
-            if (ring_v != .array or ring_v.array.items.len == 0) break :ring_blk;
+        if (man.ring.len > 0) {
             var list = std.ArrayList(RingFile).empty;
             defer list.deinit(self.allocator);
-            for (ring_v.array.items) |it_v| {
-                if (it_v != .object) continue;
-                const pos = jsonInt(u32, it_v.object, "pos") orelse continue;
-                const rows = jsonInt(u32, it_v.object, "rows") orelse continue;
-                const szrec = jsonU64(it_v.object, "bytes") orelse continue;
+            for (man.ring) |it_v| {
+                const item = disk_format.ringItem(it_v) orelse continue;
+                const pos = item.pos;
+                const rows = item.rows;
+                const szrec = item.bytes;
                 if (pos > kv_len or rows == 0 or rows > pos) continue;
                 const rp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/r{d:0>7}.safetensors", .{ self.root, id, pos }) catch continue;
                 defer self.allocator.free(rp);
@@ -4206,13 +4001,10 @@ pub const DiskTier = struct {
         var qsa_history_bytes: u64 = 0;
         var qsa_history_rows: u32 = 0;
         var inherited_qsa = false;
-        if (obj.get("qsa_history")) |qh_v| qh_blk: {
-            if (qh_v != .object) break :qh_blk;
-            const qo = qh_v.object;
-            const rec_bytes = jsonU64(qo, "bytes") orelse break :qh_blk;
-            const rec_rows = jsonInt(u32, qo, "rows") orelse break :qh_blk;
-            const inh_v = qo.get("inherited");
-            inherited_qsa = inh_v != null and inh_v.? == .bool and inh_v.?.bool;
+        if (man.qsa_history) |qh| qh_blk: {
+            const rec_bytes = qh.bytes;
+            const rec_rows = qh.rows;
+            inherited_qsa = qh.inherited;
             const qp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, id }) catch break :qh_blk;
             defer self.allocator.free(qp);
             const have = fileSize(self.io, qp) orelse break :qh_blk;
@@ -4231,10 +4023,8 @@ pub const DiskTier = struct {
         var spec_bytes: u64 = 0;
         var spec_dflash: ?SpecMeta = null;
         var spec_mtp: ?SpecMeta = null;
-        if (obj.get("spec")) |spec_v| parse_spec: {
-            if (spec_v != .object) break :parse_spec;
-            const so = spec_v.object;
-            const rec_bytes = jsonU64(so, "bytes") orelse break :parse_spec;
+        if (man.spec) |sc| parse_spec: {
+            const rec_bytes = sc.bytes;
             const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/spec.safetensors", .{ self.root, id }) catch break :parse_spec;
             defer self.allocator.free(sp);
             const have = fileSize(self.io, sp) orelse break :parse_spec;
@@ -4242,30 +4032,15 @@ pub const DiskTier = struct {
                 log.info("  [disk-cache] e{d}: spec sidecar size mismatch — dropping the spec\n", .{id});
                 break :parse_spec;
             }
-            spec_dflash = parseSpecMeta(so, "dflash");
-            spec_mtp = parseSpecMeta(so, "mtp");
+            spec_dflash = sc.dflash;
+            spec_mtp = sc.mtp;
             if (spec_dflash == null and spec_mtp == null) break :parse_spec;
             spec_bytes = rec_bytes;
             total += rec_bytes;
         }
 
-        // v10 media identity. A record claiming media must say where it starts: a key without a
-        // boundary would be matched by nothing (`crossKeyBoundary` needs one of the two), so the
-        // pair is read together or neither is.
-        var vision_key: u64 = 0;
-        var media_start: ?u32 = null;
-        if (obj.get("media")) |mv| {
-            if (mv != .object) return null;
-            // Hex, not a number: a Wyhash key runs past JSON's i64 and `std.json` hands those
-            // back as `.number_string`, which would have dropped half of all media records.
-            const key_v = mv.object.get("key") orelse return null;
-            if (key_v != .string) return null;
-            const key = std.fmt.parseInt(u64, key_v.string, 16) catch return null;
-            const start = jsonInt(u32, mv.object, "start") orelse return null;
-            if (key == 0 or start >= n_tokens) return null;
-            vision_key = key;
-            media_start = start;
-        }
+        const vision_key: u64 = if (man.media) |md| md.key else 0;
+        const media_start: ?u32 = if (man.media) |md| md.start else null;
 
         const grown = self.allocator.alloc(u64, grown_valid) catch {
             self.allocator.free(tokens);
@@ -4275,7 +4050,7 @@ pub const DiskTier = struct {
             self.allocator.free(rings);
             return null;
         };
-        for (grown, grown_recorded[0..grown_valid]) |*g, rec| g.* = @intCast(rec.integer);
+        for (grown, grown_recorded[0..grown_valid]) |*g, rec| g.* = disk_format.valueU64(rec).?;
 
         return .{
             .e = .{
@@ -4285,10 +4060,10 @@ pub const DiskTier = struct {
                 .grown_span = grown_span,
                 .inherited_grown = @min(grown_inherited, @as(u32, @intCast(grown_valid))),
                 .kv_len = @intCast(kv_len),
-                .has_tools = has_tools_v.bool,
+                .has_tools = man.has_tools,
                 .vision_key = vision_key,
                 .media_start = media_start,
-                .quant = quant,
+                .quant = man.quant,
                 .bytes = total,
                 .inherited_chunks = inherited,
                 .chunk_bytes = chunk_bytes,
@@ -4375,95 +4150,6 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, io: std.Io, abs_path: []const
     var rb: [8192]u8 = undefined;
     var rs = f.reader(io, &rb);
     return rs.interface.allocRemaining(allocator, .limited(limit)) catch null;
-}
-
-fn jsonU64(obj: std.json.ObjectMap, key: []const u8) ?u64 {
-    const v = obj.get(key) orelse return null;
-    if (v != .integer) return null;
-    if (v.integer < 0) return null;
-    return @intCast(v.integer);
-}
-
-/// A manifest scalar narrowed to the field that will hold it. meta.json is on disk and
-/// hand-editable, so a value that does not fit drops its record rather than being cast.
-fn jsonInt(comptime T: type, obj: std.json.ObjectMap, key: []const u8) ?T {
-    const v = obj.get(key) orelse return null;
-    if (v != .integer) return null;
-    return std.math.cast(T, v.integer);
-}
-
-/// The KV quant config a manifest describes, or null when it is not one this build can hold.
-fn manifestQuant(obj: std.json.ObjectMap) ?kv_quant.KVQuantConfig {
-    const scheme_v = obj.get("scheme") orelse return null;
-    if (scheme_v != .string) return null;
-    const scheme = std.meta.stringToEnum(kv_quant.Scheme, scheme_v.string) orelse return null;
-    // A dense entry may still name a width: a latent-row layout keys its kv8 and kv6 rows so.
-    if (scheme == .off) return .{ .scheme = .off, .bits = jsonInt(u8, obj, "bits") orelse 0, .group_size = jsonInt(u32, obj, "group_size") orelse 0 };
-    if (scheme != .affine) return null;
-    const bits = jsonInt(u8, obj, "bits") orelse return null;
-    if (!kv_quant.KVQuantConfig.supportedBits(bits)) return null;
-    const gs = jsonInt(u32, obj, "group_size") orelse return null;
-    if (gs == 0) return null;
-    var q = kv_quant.KVQuantConfig.affine(bits);
-    q.group_size = gs;
-    return q;
-}
-
-fn writeSpecMetaJson(a: std.mem.Allocator, w: *std.ArrayList(u8), name: []const u8, sm: SpecMeta) !void {
-    try w.print(a, ",\"{s}\":{{\"base\":{d},\"step\":{d},\"layers\":{d},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d}", .{
-        name, sm.base, sm.step, sm.layers, @tagName(sm.quant.scheme), sm.quant.bits, sm.quant.group_size,
-    });
-    if (sm.head) |h| {
-        try w.print(a, ",\"head\":{{\"pos_base\":{d},\"ratio\":{d},\"pooled\":{s},\"rows\":{d}", .{
-            h.pos_base, h.ratio, if (h.pooled) "true" else "false", h.rows,
-        });
-        if (h.mark_count > 0) {
-            try w.appendSlice(a, ",\"marks\":[");
-            for (h.marks[0..h.mark_count], 0..) |pos, i| {
-                if (i > 0) try w.appendSlice(a, ",");
-                try w.print(a, "{d}", .{pos});
-            }
-            try w.appendSlice(a, "]");
-        }
-        try w.appendSlice(a, "}");
-    }
-    try w.appendSlice(a, "}");
-}
-
-fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
-    const v = obj.get(key) orelse return null;
-    if (v != .object) return null;
-    const o = v.object;
-    const base = jsonU64(o, "base") orelse return null;
-    const step = jsonInt(u32, o, "step") orelse return null;
-    const layers = jsonInt(u32, o, "layers") orelse return null;
-    if (step == 0 or layers == 0) return null;
-    const quant = manifestQuant(o) orelse return null;
-    // v5 head half; absent on every earlier manifest.
-    var head: ?SpecHeadMeta = null;
-    if (o.get("head")) |hv| head_blk: {
-        if (hv != .object) break :head_blk;
-        const ho = hv.object;
-        const pb = jsonInt(i32, ho, "pos_base") orelse break :head_blk;
-        const ratio = jsonInt(i32, ho, "ratio") orelse break :head_blk;
-        if (ratio == 0) break :head_blk;
-        const pooled_v = ho.get("pooled") orelse break :head_blk;
-        if (pooled_v != .bool) break :head_blk;
-        const rows = jsonInt(i32, ho, "rows") orelse 0;
-        var hm: SpecHeadMeta = .{ .pos_base = pb, .ratio = ratio, .pooled = pooled_v.bool, .rows = rows };
-        // v8 leftovers; absent on every earlier manifest.
-        if (ho.get("marks")) |mv| {
-            if (mv == .array) {
-                for (mv.array.items) |iv| {
-                    if (iv != .integer or hm.mark_count == transformer_mod.QSA_HEAD_MARKS_MAX) break;
-                    hm.marks[hm.mark_count] = std.math.cast(i32, iv.integer) orelse break;
-                    hm.mark_count += 1;
-                }
-            }
-        }
-        head = hm;
-    }
-    return .{ .base = base, .step = step, .layers = layers, .quant = quant, .head = head };
 }
 
 // ── Tests ──
@@ -6287,38 +5973,6 @@ test "DiskTier: a quantized MTP sidecar is rewritten to dense on the next commit
     try testing.expectEqual(@as(usize, 590), loaded.snap.step);
 }
 
-test "spec meta json: the v5 head half round-trips and a v4 record parses without one" {
-    var w = std.ArrayList(u8).empty;
-    defer w.deinit(testing.allocator);
-    const sm: SpecMeta = .{
-        .base = 62_000,
-        .step = 700,
-        .layers = 1,
-        .quant = kv_quant.KVQuantConfig.dense,
-        .head = .{ .pos_base = 1, .ratio = 4, .pooled = true },
-    };
-    try writeSpecMetaJson(testing.allocator, &w, "mtp", sm);
-    const rec = try std.fmt.allocPrint(testing.allocator, "{{\"bytes\":1{s}}}", .{w.items});
-    defer testing.allocator.free(rec);
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, rec, .{});
-    defer parsed.deinit();
-    const back = parseSpecMeta(parsed.value.object, "mtp") orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(sm.base, back.base);
-    try testing.expectEqual(sm.step, back.step);
-    const h = back.head orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(i32, 1), h.pos_base);
-    try testing.expectEqual(@as(i32, 4), h.ratio);
-    try testing.expect(h.pooled);
-
-    // A v4-shaped record (no "head") parses, with the head half absent.
-    const v4 = "{\"mtp\":{\"base\":5,\"step\":9,\"layers\":1,\"scheme\":\"off\",\"bits\":0,\"group_size\":0}}";
-    var p4 = try std.json.parseFromSlice(std.json.Value, testing.allocator, v4, .{});
-    defer p4.deinit();
-    const old = parseSpecMeta(p4.value.object, "mtp") orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u64, 5), old.base);
-    try testing.expectEqual(@as(?SpecHeadMeta, null), old.head);
-}
-
 test "DiskTier: a swallowed commit failure drops the latch it raised and keeps a foreign one" {
     try mlx.requireGpu();
     // Bar: the appendCommit funnel's errdefer removes only the error THIS call raised.
@@ -7528,61 +7182,6 @@ test "DiskTier: a media record is never matched on token equality alone" {
     try t.expect(tier.bestMatch(&toks, false, kv_quant.KVQuantConfig.dense, .{ .rule = .{ .ctx = &tier, .limitFor = Never.limitFor } }) == null);
 }
 
-test "DiskTier: the manifest stamps the LOWEST version that describes the entry" {
-    // The version is a compatibility claim: an older reader accepts 2..4 only, so a v6 stamp on
-    // every entry made a downgrade discard the whole tier.
-    const t = std.testing;
-
-    // Plain entry: v4.
-    var toks = [_]u32{ 1, 2, 3 };
-    var cbytes = [_]u64{4096};
-    var spos = [_]u32{};
-    var sbytes = [_]u64{};
-    const kv_only = SpecMeta{ .base = 0, .step = 600, .layers = 2, .quant = kv_quant.KVQuantConfig.dense };
-    const with_head = SpecMeta{
-        .base = 0,
-        .step = 600,
-        .layers = 1,
-        .quant = kv_quant.KVQuantConfig.dense,
-        .head = .{ .pos_base = 1, .ratio = 4, .pooled = true },
-    };
-
-    var e = IndexEntry{
-        .id = 1,
-        .tokens = &toks,
-        .kv_len = 600,
-        .has_tools = false,
-        .quant = kv_quant.KVQuantConfig.dense,
-        .bytes = 4096,
-        .chunk_bytes = &cbytes,
-        .ssm_positions = &spos,
-        .ssm_bytes = &sbytes,
-        .last_used = 1,
-    };
-    try t.expectEqual(@as(u8, 4), DiskTier.metaVersionFor(e));
-
-    // A dflash sidecar is v4 shape too.
-    e.spec_bytes = 4096;
-    e.spec_dflash = kv_only;
-    try t.expectEqual(@as(u8, 4), DiskTier.metaVersionFor(e));
-
-    // A KV-only MTP snap is still v4; the in-checkpoint head's QSA half lifts it to v5.
-    e.spec_mtp = kv_only;
-    try t.expectEqual(@as(u8, 4), DiskTier.metaVersionFor(e));
-    e.spec_mtp = with_head;
-    try t.expectEqual(@as(u8, 5), DiskTier.metaVersionFor(e));
-
-    // Inherited (hard-linked) chunks are v6: an older reader would bill and delete a donor's files.
-    e.inherited_chunks = 4;
-    try t.expectEqual(@as(u8, 6), DiskTier.metaVersionFor(e));
-    e.spec_mtp = null;
-    try t.expectEqual(@as(u8, 6), DiskTier.metaVersionFor(e));
-
-    e.qsa_history_rows = 256;
-    e.qsa_history_bytes = 4096;
-    try t.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(e));
-}
-
 test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps 8" {
     const t = std.testing;
     const io = std.testing.io;
@@ -7769,6 +7368,57 @@ test "DiskTier: a manifest scalar that does not fit its field drops the record, 
             try testing.expect(!c.entry_survives);
         }
     }
+}
+
+test "DiskTier: a manifest whose media block names no boundary is refused without leaking what the scan read" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-badmedia", 0, 1024);
+    defer tier.deinit();
+
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/e1", .{tier.root});
+    defer testing.allocator.free(dir);
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const tokens = try testing.allocator.alloc(u8, 600 * 4);
+    defer testing.allocator.free(tokens);
+    @memset(tokens, 1);
+    const files = [_]struct { name: []const u8, data: []const u8 }{
+        .{ .name = "tokens.bin", .data = tokens },
+        .{ .name = "c000000.safetensors", .data = "0123456789abcdef" },
+        .{ .name = "s0000512.safetensors", .data = "01234567" },
+    };
+    for (files) |f| {
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir, f.name });
+        defer testing.allocator.free(path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = f.data });
+    }
+    const meta = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"v\":10,\"kv_len\":600,\"tokens\":600,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":0," ++
+            "\"chunk_tokens\":{d},\"inherited_chunks\":0,\"bytes\":1,\"chunk_bytes\":[16]," ++
+            "\"ssm\":[{{\"pos\":512,\"bytes\":8}}],\"media\":{{\"key\":\"f00d\"}}}}",
+        .{tier.chunk_tokens},
+    );
+    defer testing.allocator.free(meta);
+    const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/meta.json", .{dir});
+    defer testing.allocator.free(meta_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = meta });
+
+    // The same record with a boundary loads, so the files above are valid and only the media block refuses it.
+    const whole = try std.mem.replaceOwned(u8, testing.allocator, meta, "\"key\":\"f00d\"", "\"key\":\"f00d\",\"start\":3");
+    defer testing.allocator.free(whole);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = whole });
+    if (tier.loadEntry(1)) |l| {
+        var e = l.e;
+        defer tier.freeIndexEntryOwned(&e);
+        try testing.expectEqual(@as(?u32, 3), e.media_start);
+    } else return error.TestUnexpectedResult;
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = meta });
+    try testing.expect(tier.loadEntry(1) == null);
 }
 
 test "DiskTier: entryWholeOnDisk stats what the index NAMES (a truncated chunk fails it with a clean writer)" {

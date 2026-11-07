@@ -5,6 +5,7 @@ const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const Transformer = trf.Transformer;
 const std = @import("std");
+const disk_format = @import("../disk_format.zig");
 const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const testing = std.testing;
@@ -898,7 +899,7 @@ pub const QsaHeadMark = struct {
 
 /// Marks a head keeps. A prefill's checkpoints are capped at `ssm_checkpoint_max` (16) and a
 /// warm turn merges the donor's; past this the list thins like the checkpoints themselves.
-pub const QSA_HEAD_MARKS_MAX: usize = 32;
+pub const QSA_HEAD_MARKS_MAX: usize = disk_format.HEAD_MARKS_MAX;
 
 /// One owner of a head's marks: the live head holds one, its committed snapshot a
 /// refcount-sharing copy. Positions ascend.
