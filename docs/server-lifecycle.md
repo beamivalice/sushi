@@ -367,7 +367,15 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   more than `chat.MAX_REQUEST_IMAGES` (1024) a 400 with both counts, a prompt the media pushes past the context a 400
   naming the media's tokens, an encode that does not fit a 400 (`towerFitFault`), a failed encode a 500
   (`MediaFault`); both of the last two are raised after the restore as the slot's `MediaRefused`; never a text-only answer.
-- Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen4/qwen_vision.zig` / `src/mimo2/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
+- **Media is an arch seam** ([engine-arch-seam](engine-arch-seam.md)): `src/request_media.zig` (request shape, placement,
+  keys, decode driver) and `src/vision.zig` (the resident tower) name no arch; `src/arch/media.zig` dispatches to each
+  arch's `src/<arch>/<arch>_media.zig`. An arch's `media` declares its processor (`mode`, `claims`, `preproc`, `resize` +
+  `normalizeChw`, or `planImage` + `decodeImage` when it decodes on its own), its `Tower`, `scratchBytes`, and optionally
+  `maxImagePatches`, `imageRows`, `expandVideo`, `videoResize`, `mropePositions`. A config reaches the arch
+  whose `claims` holds, a `VisionPreproc.mode` the arch that declares it; the media key is arch-neutral (a hash of the
+  decoded pixels and the tower's bf16 or requantized form), so it stays in `request_media`.
+- Media INPUT code: `src/vision_common.zig` (shared preprocessing), `src/mrope.zig` and each arch's tower:
+  `src/qwen4/qwen_vision.zig` / `src/mimo2/mimo_vision.zig` / `src/glm5/glm5_vision.zig` (Qwen3-VL
   image/video tower, M-RoPE positions over every block; MiMo-ViT images, [mimo2-arch](mimo2-arch.md#vision));
   `src/dsv41/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));
   `stb_image` (JPEG, PNG, GIF first frame, BMP) + libwebp decode image input; `lib/stb_image_impl.c` names the formats compiled in.

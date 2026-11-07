@@ -69,6 +69,7 @@ const generation_stream = @import("generation_stream.zig");
 const http_conn = @import("http_conn.zig");
 const boot_gate = @import("boot_gate.zig");
 const request_media = @import("request_media.zig");
+const arch_media = @import("arch/media.zig");
 const request_policy = @import("request_policy.zig");
 const models_api = @import("models_api.zig");
 const prefix_cache_admin = @import("prefix_cache_admin.zig");
@@ -9172,17 +9173,19 @@ pub const MropeData = struct {
 // 8x8 solid PNGs: red and blue.
 pub const test_png_red = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEUlEQVR42mP4z8CAFTEMLQkAKP8/wc53yE8AAAAASUVORK5CYII=";
 pub const test_png_blue = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQVR42mNgYPiPAw0pCQCpcD/B/MtF/AAAAABJRU5ErkJggg==";
-const test_qwen_vp: chat_mod.VisionPreproc = .{ .mode = .qwen, .patch = 16, .tps = 2, .merge = 2 };
+const test_wire_vp: chat_mod.VisionPreproc = .{ .mode = .qwen, .patch = 16, .tps = 2, .merge = 2 };
 
 pub fn testWire(body: []const u8, vocab: WireVocab) !struct { parsed: std.json.Parsed(std.json.Value), wire: WireMessages } {
+    // The processor is the arch's: a build without it cannot decode these images.
+    if (!arch_media.servesMode(test_wire_vp.mode)) return error.SkipZigTest;
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     errdefer parsed.deinit();
     var wire = WireMessages.init(std.testing.allocator);
     errdefer wire.deinit();
     const items = parsed.value.object.get("messages").?.array.items;
     switch (vocab) {
-        .openai => try readOpenAiMessages(&wire, items, test_qwen_vp),
-        .anthropic => try anthropic.readAnthropicMessages(&wire, items, test_qwen_vp),
+        .openai => try readOpenAiMessages(&wire, items, test_wire_vp),
+        .anthropic => try anthropic.readAnthropicMessages(&wire, items, test_wire_vp),
     }
     return .{ .parsed = parsed, .wire = wire };
 }
@@ -13709,6 +13712,7 @@ test "a streamed Qwen plans its QSA history beside its KV for every planned toke
 
 test "a streamed --vision load proves its largest image encode beside the budget, with the planned KV" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    if (!arch_media.claimed(&cfg)) return;
     cfg.expert_streaming = true;
     const kv = expertStreamingPlannedKvBytes(&cfg);
     try std.testing.expectEqual(kv, expertStreamingBesideBudgetBytes(&cfg));

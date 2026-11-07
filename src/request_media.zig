@@ -3,13 +3,8 @@ const mlx = @import("mlx.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
-const dsv41_config = @import("dsv41/dsv41_config.zig");
-const qwen_vision = @import("qwen4/qwen_vision.zig");
 const vision_common = @import("vision_common.zig");
-const mimo_vision = @import("mimo2/mimo_vision.zig");
-const glm5_vision = @import("glm5/glm5_vision.zig");
-const dsv41_vision = @import("dsv41/dsv41_vision.zig");
-const mrope_mod = @import("mrope.zig");
+const arch_media = @import("arch/media.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -29,7 +24,6 @@ const MropeData = server.MropeData;
 const WirePos = server.WirePos;
 const currentGpuMemoryCeiling = server.currentGpuMemoryCeiling;
 const mapGenerationError = generation_stream.mapGenerationError;
-const testDsv41Vp = server.testDsv41Vp;
 const testWire = server.testWire;
 const test_png_blue = server.test_png_blue;
 const test_png_red = server.test_png_red;
@@ -97,9 +91,15 @@ const test_vision_modes = [_]chat_mod.VisionPreproc{
     .{ .mode = .glm5, .patch = 14, .tps = 2, .merge = 2, .min_tokens = 16, .max_tokens = 8000 },
 };
 
+/// The processor of the enabled arch serving `model_type`; a test of an arch the build left out passes unrun.
+fn testVp(model_type: []const u8) ?chat_mod.VisionPreproc {
+    const cfg = arch_media.testConfig(model_type) orelse return null;
+    return visionPreprocFromConfig(&cfg);
+}
+
 test "a request holds its images as the files it was sent, not the patches they decode to" {
     const a = std.testing.allocator;
-    const vp = try testDsv41Vp();
+    const vp = testVp("deepseek_v41") orelse return;
     const urls = [_][]const u8{ test_png_0, test_png_1, test_png_2 };
     var media = RequestMedia.init(a);
     defer media.deinit();
@@ -131,8 +131,9 @@ test "the plan read from an image's header is the grid and size its full decode 
     };
     var modes = std.ArrayList(chat_mod.VisionPreproc).empty;
     defer modes.deinit(a);
-    try modes.append(a, try testDsv41Vp());
-    try modes.appendSlice(a, &test_vision_modes);
+    if (testVp("deepseek_v41")) |vp| try modes.append(a, vp);
+    for (test_vision_modes) |vp| if (arch_media.servesMode(vp.mode)) try modes.append(a, vp);
+    const dsv_config = arch_media.testConfig("deepseek_v41");
     for (sizes) |size| {
         const url = try testPngUrl(a, size[0], size[1]);
         defer a.free(url);
@@ -152,8 +153,8 @@ test "the plan read from an image's header is the grid and size its full decode 
             try std.testing.expectEqual(want.grid_w, got.grid_w);
             // The rows the prompt places for the plan are the rows the tower will produce.
             if (vp.mode == .dsv41) try std.testing.expectEqual(
-                dsv41_vision.spanRows(want.grid_h, want.grid_w, vp.merge),
-                dsv41_vision.spanRows(got.grid_h, got.grid_w, vp.merge),
+                arch_media.imageRows(&dsv_config.?, vp.merge, want.grid_h, want.grid_w),
+                arch_media.imageRows(&dsv_config.?, vp.merge, got.grid_h, got.grid_w),
             );
         }
     }
@@ -161,11 +162,10 @@ test "the plan read from an image's header is the grid and size its full decode 
 
 test "decoding a held image later gives the patches an up-front decode gave" {
     const a = std.testing.allocator;
-    const vp = try testDsv41Vp();
     var modes = std.ArrayList(chat_mod.VisionPreproc).empty;
     defer modes.deinit(a);
-    try modes.append(a, vp);
-    try modes.appendSlice(a, &test_vision_modes);
+    if (testVp("deepseek_v41")) |vp| try modes.append(a, vp);
+    for (test_vision_modes) |vp| if (arch_media.servesMode(vp.mode)) try modes.append(a, vp);
     for ([_][]const u8{ test_png_0, test_png_1, test_png_2 }) |url| {
         for (modes.items) |mode| {
             const eager = parseImageUrlContent(a, url, mode) orelse return error.DecodeFailed;
@@ -184,15 +184,14 @@ test "decoding a held image later gives the patches an up-front decode gave" {
 
 test "the encode bill of a held image is the bill of its decode" {
     const a = std.testing.allocator;
-    var cfg: model_mod.ModelConfig = .{ .qv_patch = 14, .qv_temporal_patch = 1, .qv_heads = 16, .qv_hidden = 1024, .qv_out_hidden = 4096 };
-    cfg.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    const cfg = arch_media.testConfig("deepseek_v41") orelse return;
     const vp = visionPreprocFromConfig(&cfg);
     for ([_][]const u8{ test_png_0, test_png_1, test_png_2 }) |url| {
         const eager = parseImageUrlContent(a, url, vp) orelse return error.DecodeFailed;
         defer a.free(eager.pixels);
         const held = imageUrlContent(a, url, vp) orelse return error.DecodeFailed;
         defer a.free(held.pixels);
-        const rows = dsv41_vision.spanRows(eager.grid_h, eager.grid_w, vp.merge);
+        const rows = arch_media.imageRows(&cfg, vp.merge, eager.grid_h, eager.grid_w);
         const want = visionEncodeBill(&cfg, &.{eager}, &.{}, rows);
         const got = visionEncodeBill(&cfg, &.{held}, &.{}, rows);
         try std.testing.expectEqual(want.bytes, got.bytes);
@@ -202,7 +201,7 @@ test "the encode bill of a held image is the bill of its decode" {
 
 test "an image the header cannot place is refused when the request is read" {
     const a = std.testing.allocator;
-    const vp = try testDsv41Vp();
+    const vp = testVp("deepseek_v41") orelse return;
     var media = RequestMedia.init(a);
     defer media.deinit();
     const list = media.images(try media.openImages());
@@ -213,11 +212,12 @@ test "an image the header cannot place is refused when the request is read" {
 
 test "an undecoded image's chain key is the key its decoded pixels always had" {
     const a = std.testing.allocator;
-    var dsv: model_mod.ModelConfig = .{};
-    dsv.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    const dsv = arch_media.testConfig("deepseek_v41");
     const qwen: model_mod.ModelConfig = .{ .qwen_vision = true, .qv_patch = 16, .qv_temporal_patch = 2, .qv_merge = 2, .qv_min_pixels = 65536, .qv_max_pixels = 1048576 };
     const urls = [_][]const u8{ test_png_0, test_png_1, test_png_2 };
-    for ([_]*const model_mod.ModelConfig{ &dsv, &qwen }) |config| {
+    for ([_]?model_mod.ModelConfig{ dsv, qwen }) |maybe| {
+        if (maybe == null or !arch_media.claimed(&maybe.?)) continue;
+        const config = &maybe.?;
         const vp = visionPreprocFromConfig(config);
         // More images than one decode window, so the key crosses a refill.
         const n = 2 * vision_queue.decode_workers + 3;
@@ -246,7 +246,7 @@ test "an undecoded image's chain key is the key its decoded pixels always had" {
 
 test "the chain key of a decoded image is pinned: existing prefix-cache records must keep matching" {
     const a = std.testing.allocator;
-    const vp = try testDsv41Vp();
+    const vp = testVp("deepseek_v41") orelse return;
     const img = parseImageUrlContent(a, test_png_0, vp) orelse return error.DecodeFailed;
     defer a.free(img.pixels);
     const chain = try mediaChain(a, &.{.{ .kind = .image, .start = 3, .rows = 1 }}, &.{img}, &.{}, null);
@@ -256,8 +256,7 @@ test "the chain key of a decoded image is pinned: existing prefix-cache records 
 
 test "a request whose image will not decode is refused naming it when it is keyed" {
     const a = std.testing.allocator;
-    var cfg: model_mod.ModelConfig = .{};
-    cfg.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    const cfg = arch_media.testConfig("deepseek_v41") orelse return;
     const vp = visionPreprocFromConfig(&cfg);
     const good = imageUrlContent(a, test_png_0, vp) orelse return error.DecodeFailed;
     defer a.free(good.pixels);
@@ -466,14 +465,6 @@ fn mediaKindRefusal(messages: []const chat_mod.Message, flat: FlatMedia, has_tow
     return null;
 }
 
-/// Peak GPU scratch of one ViT call over `patches` rows, from each tower's measured bill.
-fn visionScratchBytes(config: *const model_mod.ModelConfig, patches: u64) u64 {
-    if (config.mimo_vision) return mimo_vision.encodeScratchBytes(config, patches);
-    if (config.glm5_vision) return glm5_vision.encodeScratchBytes(config, patches);
-    if (config.isDsv41()) return dsv41_vision.encodeScratchBytes(config, patches);
-    return qwen_vision.encodeScratchBytes(config, patches);
-}
-
 /// GPU bytes a request's media encode peaks at: the largest block's tower scratch
 /// (a video's block is one temporal group, `forwardVideo` evaluates each alone),
 /// every block's f32 pixels, and three bf16 copies of the soft-token rows.
@@ -492,7 +483,7 @@ pub fn visionEncodeBill(config: *const model_mod.ModelConfig, images: []const ch
         input_bytes += @max(vd.pixels.len, @as(u64, vd.grid_t) * patches * patch_bytes);
     }
     const output_bytes = @as(u64, rows) * @max(config.qv_out_hidden, 1) * 2;
-    return .{ .bytes = visionScratchBytes(config, worst) + input_bytes + 3 * output_bytes, .largest_group_patches = worst };
+    return .{ .bytes = arch_media.scratchBytes(config, worst) + input_bytes + 3 * output_bytes, .largest_group_patches = worst };
 }
 
 /// The encode bill of the largest single image this tower's processor admits: a streamed
@@ -500,12 +491,7 @@ pub fn visionEncodeBill(config: *const model_mod.ModelConfig, images: []const ch
 pub fn largestImageEncodeBytes(config: *const model_mod.ModelConfig) u64 {
     const vp = visionPreprocFromConfig(config);
     const merge: u64 = @max(vp.merge, 1);
-    const patches: u64 = if (vp.mode == .glm5)
-        @as(u64, vp.max_tokens) * merge * merge
-    else if (vp.mode == .dsv41)
-        merge * merge * (vp.max_tokens - 2)
-    else
-        vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / @max(@as(u64, vp.patch) * vp.patch, 1);
+    const patches = arch_media.maxImagePatches(vp);
     const largest = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
     return visionEncodeBill(config, &largest, &.{}, @intCast(patches / (merge * merge))).bytes;
 }
@@ -547,11 +533,6 @@ fn countMediaPlaceholders(ids: []const u32, config: *const model_mod.ModelConfig
     return .{ .images = images, .videos = videos };
 }
 
-/// Soft-token rows a patch-grid tower produces for one block: its merged grid.
-fn mediaRows(grid_t: u32, grid_h: u32, grid_w: u32, merge: u32) usize {
-    const m = @max(merge, 1);
-    return @as(usize, grid_t) * (grid_h / m) * (grid_w / m);
-}
 
 /// Expand each template placeholder to its block's run of pad tokens: the
 /// k-th image pad takes `images[k]`, the k-th video pad `videos[k]`. The
@@ -584,29 +565,14 @@ fn placeMedia(
             next_image += 1;
             // A gridless (fixed-square) tower has no per-image row count here.
             if (im.grid_h == 0) return error.MediaLayoutUnsupported;
-            break :blk if (config.isDsv41()) dsv41_vision.spanRows(im.grid_h, im.grid_w, merge) else mediaRows(1, im.grid_h, im.grid_w, merge);
+            break :blk arch_media.imageRows(config, merge, im.grid_h, im.grid_w);
         } else blk: {
             const vd = videos[next_video];
             next_video += 1;
-            break :blk mediaRows(vd.grid_t, vd.grid_h, vd.grid_w, merge);
+            break :blk arch_media.gridRows(vd.grid_t, vd.grid_h, vd.grid_w, merge);
         };
         try items.append(allocator, .{ .kind = if (is_image) .image else .video, .start = out.items.len, .rows = rows });
-        if (is_video and config.glm5_vision) {
-            const tok = tokenizer orelse return error.MediaLayoutUnsupported;
-            const video = videos[next_video - 1];
-            const per_group = rows / video.grid_t;
-            for (0..video.grid_t) |group| {
-                try out.append(allocator, config.vision_start_token_id);
-                try out.appendNTimes(allocator, config.image_token_id, per_group);
-                try out.append(allocator, config.vision_end_token_id);
-                var stamp: [64]u8 = undefined;
-                const seconds = @as(f64, @floatFromInt(group * config.qv_temporal_patch)) / video.fps;
-                const text = try std.fmt.bufPrint(&stamp, "{d:.1} seconds", .{seconds});
-                const stamp_ids = try tok.encode(allocator, text);
-                defer allocator.free(stamp_ids);
-                try out.appendSlice(allocator, stamp_ids);
-            }
-        } else try out.appendNTimes(allocator, t, rows);
+        if (is_video) try arch_media.expandVideo(allocator, &out, config, tokenizer, videos[next_video - 1], rows, t) else try out.appendNTimes(allocator, t, rows);
         rows_total += rows;
     }
     const owned_ids = try out.toOwnedSlice(allocator);
@@ -767,7 +733,9 @@ pub fn prepareRequestMedia(
     const deferred = try allocator.create(vision_queue.DeferredMedia);
     deferred.* = .{ .allocator = allocator, .images = images, .videos = videos, .blocks = blocks, .decode_ns = takeMediaDecodeNs() };
     ready.deferred = deferred;
-    ready.mrope = computeQwenMrope(allocator, placed.ids, flat.images, flat.videos, config) catch MropeData{};
+    if (arch_media.mropePositions(allocator, placed.ids, flat.images, flat.videos, config)) |m| {
+        ready.mrope = .{ .pos = m.pos, .total = m.total, .delta = m.delta };
+    } else |_| {}
     log.info("  Multimodal: {d} soft tokens placed in a {d}-token prompt\n", .{ placed.rows, placed.ids.len });
 
     allocator.free(ids.*);
@@ -788,39 +756,6 @@ fn monotonicNs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
-/// Compute the interleaved-M-RoPE table from the FINAL prompt_ids (after pad
-/// expansion) + every image and video grid in prompt order. Returns an empty
-/// bundle when the model isn't Qwen-vision or there are no grids. Caller owns `pos`.
-fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, config: *const model_mod.ModelConfig) !MropeData {
-    if (!config.qwen_vision) return .{};
-    // Each modality's grids in its own document order: getRopeIndex
-    // interleaves the two lists by whichever marker occurs first in tokens.
-    var image_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
-    defer image_grids.deinit(allocator);
-    var video_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
-    defer video_grids.deinit(allocator);
-    for (images) |im| {
-        if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
-    }
-    for (videos) |vd| {
-        try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
-    }
-    if (image_grids.items.len == 0 and video_grids.items.len == 0) return .{};
-
-    var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, image_grids.items, video_grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
-        log.warn("M-RoPE get_rope_index failed ({s}); falling back to scalar RoPE\n", .{@errorName(err)});
-        return .{};
-    };
-    defer ri.deinit();
-    const total = prompt_ids.len;
-    const flat = try allocator.alloc(i32, 3 * total);
-    @memcpy(flat[0..total], ri.pos[0]);
-    @memcpy(flat[total .. 2 * total], ri.pos[1]);
-    @memcpy(flat[2 * total .. 3 * total], ri.pos[2]);
-    log.info("  M-RoPE: {d} images, {d} videos, position ids over {d} tokens, decode delta {d}\n", .{ image_grids.items.len, video_grids.items.len, total, ri.delta });
-    return .{ .pos = flat, .total = total, .delta = ri.delta };
 }
 
 /// Decode an `input_audio.data` payload into raw float32-LE PCM samples for the
@@ -848,79 +783,44 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
-    if (config.mimo_vision) return .{
-        .mode = .mimo,
-        .patch = config.qv_patch,
-        .tps = config.qv_temporal_patch,
-        .merge = config.qv_merge,
-        .min_pixels = config.qv_min_pixels,
-        .max_pixels = config.qv_max_pixels,
-    };
-    if (config.dsv41) |c| if (c.vision) |v| return .{
-        .mode = .dsv41,
-        .patch = v.patch,
-        .merge = v.downsample,
-        .min_pixels = v.min_pixels,
-        .max_tokens = v.max_tokens,
-        .max_wh_ratio = v.max_wh_ratio,
-    };
-    if (config.glm5_vision) return .{
-        .mode = .glm5,
-        .patch = config.qv_patch,
-        .tps = config.qv_temporal_patch,
-        .merge = config.qv_merge,
-        .min_tokens = config.glmv_min_image_tokens,
-        .max_tokens = config.glmv_max_image_tokens,
-        .max_video_tokens = config.glmv_max_video_tokens,
-    };
-    if (!config.qwen_vision) return .{};
-    return .{
-        .mode = .qwen,
-        .patch = config.qv_patch,
-        .tps = config.qv_temporal_patch,
-        .merge = config.qv_merge,
-        .min_pixels = config.qv_min_pixels,
-        .max_pixels = config.qv_max_pixels,
-    };
-}
-
-var vision_pixel_clamp_logged: bool = false;
-/// One-shot: the checkpoint declared more pixels than the ViT can attend.
-fn logVisionPixelClamp(declared: u32) void {
-    if (vision_pixel_clamp_logged) return;
-    vision_pixel_clamp_logged = true;
-    log.info("[vision] image area capped at {d} px (checkpoint declares {d}): the ViT materializes its full attention\n", .{ vision_common.ENGINE_MAX_PIXELS, declared });
+    return arch_media.preproc(config);
 }
 
 test "visionPreprocFromConfig threads each tower's processor bounds" {
-    const qwen = visionPreprocFromConfig(&.{
+    try std.testing.expectEqual(.gemma, visionPreprocFromConfig(&.{}).mode);
+
+    const qwen_config: model_mod.ModelConfig = .{
         .qwen_vision = true,
         .qv_patch = 14,
         .qv_temporal_patch = 2,
         .qv_merge = 2,
         .qv_min_pixels = 65536,
         .qv_max_pixels = 16777216,
-    });
-    try std.testing.expectEqual(.qwen, qwen.mode);
-    try std.testing.expectEqual(@as(u32, 14), qwen.patch);
-    try std.testing.expectEqual(@as(u32, 2), qwen.tps);
-    try std.testing.expectEqual(@as(u32, 2), qwen.merge);
-    try std.testing.expectEqual(@as(u32, 65536), qwen.min_pixels);
-    try std.testing.expectEqual(@as(u32, 16777216), qwen.max_pixels);
+    };
+    if (arch_media.claimed(&qwen_config)) {
+        const qwen = visionPreprocFromConfig(&qwen_config);
+        try std.testing.expectEqual(.qwen, qwen.mode);
+        try std.testing.expectEqual(@as(u32, 14), qwen.patch);
+        try std.testing.expectEqual(@as(u32, 2), qwen.tps);
+        try std.testing.expectEqual(@as(u32, 2), qwen.merge);
+        try std.testing.expectEqual(@as(u32, 65536), qwen.min_pixels);
+        try std.testing.expectEqual(@as(u32, 16777216), qwen.max_pixels);
+    }
 
-    try std.testing.expectEqual(.gemma, visionPreprocFromConfig(&.{}).mode);
-
-    const mimo = visionPreprocFromConfig(&.{
+    const mimo_config: model_mod.ModelConfig = .{
         .mimo_vision = true,
         .qv_patch = 16,
         .qv_temporal_patch = 2,
         .qv_merge = 2,
         .qv_min_pixels = 8192,
         .qv_max_pixels = 8388608,
-    });
-    try std.testing.expectEqual(.mimo, mimo.mode);
-    try std.testing.expectEqual(@as(u32, 8192), mimo.min_pixels);
-    try std.testing.expectEqual(@as(u32, 8388608), mimo.max_pixels);
+    };
+    if (arch_media.claimed(&mimo_config)) {
+        const mimo = visionPreprocFromConfig(&mimo_config);
+        try std.testing.expectEqual(.mimo, mimo.mode);
+        try std.testing.expectEqual(@as(u32, 8192), mimo.min_pixels);
+        try std.testing.expectEqual(@as(u32, 8388608), mimo.max_pixels);
+    }
 }
 
 test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma format)" {
@@ -1014,22 +914,6 @@ fn imageHeaderSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
     return .{ .w = @intCast(w), .h = @intCast(h) };
 }
 
-/// What a patch-grid tower's processor makes of a `src_w` x `src_h` image: the size it resizes to and its
-/// patch grid. `decodeImageToPixels` builds its buffers from the same numbers.
-const ImagePlan = struct { width: u32, height: u32, grid_h: u32, grid_w: u32 };
-
-fn planImage(vp: chat_mod.VisionPreproc, src_w: u32, src_h: u32) ?ImagePlan {
-    if (vp.mode == .gemma) return null;
-    if (vp.mode == .dsv41) {
-        const plan = dsv41_vision.planGrid(src_w, src_h, .{ .patch = vp.patch, .downsample = vp.merge, .max_tokens = vp.max_tokens, .min_pixels = vp.min_pixels, .max_wh_ratio = vp.max_wh_ratio }) orelse return null;
-        return .{ .width = plan.w, .height = plan.h, .grid_h = plan.vit_h, .grid_w = plan.vit_w };
-    }
-    const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
-    if (factor == 0 or vp.tps == 0) return null;
-    const rs = imageResize(vp, factor, src_h, src_w);
-    return .{ .width = rs.w, .height = rs.h, .grid_h = rs.h / vp.patch, .grid_w = rs.w / vp.patch };
-}
-
 /// An image the tower will decode later: its file bytes and the plan the decode reaches, so the request
 /// holds the compressed size and the prompt still places the rows of the grid.
 fn planEncodedImage(allocator: std.mem.Allocator, b64: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
@@ -1041,7 +925,7 @@ fn planEncodedImage(allocator: std.mem.Allocator, b64: []const u8, vp: chat_mod.
     defer if (!kept) allocator.free(raw);
     std.base64.standard.Decoder.decode(raw, b64) catch return null;
     const dims = imageHeaderSize(raw) orelse return null;
-    const plan = planImage(vp, dims.w, dims.h) orelse return null;
+    const plan = arch_media.planImage(vp, dims.w, dims.h) orelse return null;
     kept = true;
     return .{ .pixels = raw, .width = plan.width, .height = plan.height, .grid_h = plan.grid_h, .grid_w = plan.grid_w, .undecoded = true };
 }
@@ -1234,13 +1118,6 @@ pub fn appendImageUrlContent(
     return list.items.len > before;
 }
 
-/// The resample filter belongs to the arch's reference processor; every served
-/// patch-grid tower resizes bicubic.
-fn resampleFilterFor(vp: chat_mod.VisionPreproc) vision_common.Filter {
-    _ = vp;
-    return .bicubic;
-}
-
 /// A decoded source image as packed RGB8, owned by `allocator`. One owner and
 /// one free path — stb and libwebp buffers are copied out and released here, so
 /// callers do not juggle three different deallocators.
@@ -1283,17 +1160,6 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
     return .{ .rgb = rgb, .w = @intCast(webp_w), .h = @intCast(webp_h) };
 }
 
-/// The pixel size a patch-grid tower's processor resizes an `src_h` x `src_w` image to.
-fn imageResize(vp: chat_mod.VisionPreproc, factor: u32, src_h: u32, src_w: u32) vision_common.Resized {
-    const bounds = vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
-    if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
-    return switch (vp.mode) {
-        .mimo => mimo_vision.smartResize(src_h, src_w, factor, bounds.min, bounds.max),
-        .glm5 => glm5_vision.smartResize(vp.tps, src_h, src_w, vp.tps, factor, vp.min_tokens, vp.max_tokens),
-        else => vision_common.smartResizeImage(src_h, src_w, factor, bounds.min, bounds.max),
-    };
-}
-
 fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const target: u32 = 768; // Gemma 4 default for square images
 
@@ -1303,21 +1169,14 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
 
-    // DeepSeek-V4.1 letterboxes into a canvas of whole patches; the span's size is `dsv41_vision.spanRows`.
-    if (vp.mode == .dsv41) {
-        const pr: dsv41_vision.Processor = .{ .patch = vp.patch, .downsample = vp.merge, .max_tokens = vp.max_tokens, .min_pixels = vp.min_pixels, .max_wh_ratio = vp.max_wh_ratio };
-        const pv = dsv41_vision.preprocess(allocator, px[0 .. @as(usize, src_h) * src_w * 3], src_h, src_w, pr) catch return null;
-        log.info("  Decoded {d}x{d} image → deepseek grid {d}x{d} ({d} tokens, canvas {d}x{d})\n", .{ src_w, src_h, pv.grid_h, pv.grid_w, dsv41_vision.spanRows(pv.grid_h, pv.grid_w, vp.merge), pv.w, pv.h });
-        return .{ .pixels = pv.bytes, .width = pv.w, .height = pv.h, .grid_h = pv.grid_h, .grid_w = pv.grid_w };
-    }
+    if (arch_media.decodesItself(vp)) return arch_media.decodeImage(allocator, px[0 .. @as(usize, src_h) * src_w * 3], src_h, src_w, vp);
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
     // processor's pixel_values. `grid_h/grid_w` carry the full patch grid;
     // token count = (gh/merge)·(gw/merge). Qwen bounds the PIXEL area.
     if (vp.mode != .gemma) {
-        const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
-        const plan = planImage(vp, src_w, src_h) orelse return null;
+        const plan = arch_media.planImage(vp, src_w, src_h) orelse return null;
         const rh = plan.height;
         const rw = plan.width;
         const C: u32 = 3;
@@ -1330,26 +1189,11 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
         defer allocator.free(chw);
         const source_len: usize = @as(usize, src_h) * src_w * C;
-        if (vp.mode == .mimo) {
-            mimo_vision.resizeNormalizedChw(chw, px[0..source_len], src_h, src_w, rh, rw) catch return null;
-        } else if (vp.mode == .glm5) {
-            glm5_vision.resizeNormalizedChw(allocator, chw, px[0..source_len], src_h, src_w, rh, rw, vp.tps, vp.tps, factor, vp.min_tokens) catch return null;
-        } else vision_common.resizeRgbNormalizedChw(
-            allocator,
-            chw,
-            px[0..source_len],
-            src_h,
-            src_w,
-            rh,
-            rw,
-            resampleFilterFor(vp),
-        ) catch return null;
+        arch_media.normalizeChw(allocator, vp, chw, px[0..source_len], src_h, src_w, rh, rw, vp.tps) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
-        switch (vp.mode) {
-            else => vision_common.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge),
-        }
+        vision_common.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge);
         log.info("  Decoded {d}x{d} image → {s} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, @tagName(vp.mode), gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
         return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
     }
@@ -1393,7 +1237,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
 /// patch groups — the last group pads by repeating its final frame, matching
 /// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
-    if ((vp.mode != .qwen and vp.mode != .glm5) or frame_urls.len == 0) return null;
+    if (!arch_media.hasVideo(vp) or frame_urls.len == 0) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
 
@@ -1418,16 +1262,8 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         };
     }
 
-    const bounds = vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
-    const min_pixels = bounds.min;
-    const max_pixels = bounds.max;
-    if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
     const first = decoded.items[0];
-    if (vp.mode == .glm5 and @as(u64, (frame_urls.len + vp.tps - 1) / vp.tps) > vp.max_video_tokens) return null;
-    const rs = if (vp.mode == .glm5)
-        glm5_vision.smartResize(@intCast(frame_urls.len), first.h, first.w, vp.tps, factor, vp.min_tokens, vp.max_video_tokens)
-    else
-        vision_common.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
+    const rs = arch_media.videoResize(vp, @intCast(frame_urls.len), first.h, first.w, factor) orelse return null;
     const rh = rs.h;
     const rw = rs.w;
     const C: u32 = 3;
@@ -1445,11 +1281,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
     for (decoded.items) |d| {
         const source_len: usize = @as(usize, d.h) * d.w * C;
         const chw = allocator.alloc(f32, @as(usize, C) * rh * rw) catch return null;
-        const resize = if (vp.mode == .glm5)
-            glm5_vision.resizeNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, @intCast(frame_urls.len), vp.tps, factor, vp.min_tokens)
-        else
-            vision_common.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp));
-        resize catch {
+        arch_media.normalizeChw(allocator, vp, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, @intCast(frame_urls.len)) catch {
             allocator.free(chw);
             return null;
         };
@@ -1586,26 +1418,32 @@ test "an input_audio part sent to a vision-only model is refused by name" {
     try std.testing.expect(std.mem.indexOf(u8, mediaKindRefusal(&msgs, flat, false, false).?.text(), "audio") != null);
 }
 
-fn testTowerConfigs() [3]model_mod.ModelConfig {
-    return .{
+/// Hand-flagged tower configs; a row is null when its arch is not in the build.
+fn testTowerConfigs() [3]?model_mod.ModelConfig {
+    var rows: [3]?model_mod.ModelConfig = .{
         // Qwen3.8 packs: no processor config, so the 1,003,520 px default.
         .{ .has_vision = true, .qwen_vision = true, .qv_heads = 16, .qv_hidden = 1152, .qv_intermediate = 4304, .qv_out_hidden = 2560, .qv_patch = 16, .qv_temporal_patch = 2, .qv_merge = 2 },
         .{ .has_vision = true, .mimo_vision = true, .qv_heads = 32, .mvit_kv_heads = 8, .qv_head_dim = 64, .qv_hidden = 1280, .qv_intermediate = 4608, .qv_out_hidden = 4096, .qv_patch = 16, .qv_temporal_patch = 2, .qv_merge = 2, .qv_min_pixels = 8192, .qv_max_pixels = 8388608 },
         .{ .has_vision = true, .glm5_vision = true, .qv_heads = 16, .qv_head_dim = 64, .qv_hidden = 1024, .qv_intermediate = 4096, .qv_out_hidden = 4096, .glmv_projection_intermediate = 10240, .qv_patch = 14, .qv_temporal_patch = 2, .qv_merge = 2, .glmv_min_image_tokens = 16, .glmv_max_image_tokens = 8000 },
     };
+    for (&rows) |*row| if (!arch_media.claimed(&row.*.?)) {
+        row.* = null;
+    };
+    return rows;
 }
 
 test "the largest-image encode bill covers any single image the tower's processor admits" {
     const t = std.testing;
     const sides = [_][2]u32{ .{ 1080, 1920 }, .{ 20000, 20000 }, .{ 30000, 64 }, .{ 64, 30000 }, .{ 4321, 3210 }, .{ 7, 9 } };
-    for (testTowerConfigs()) |config| {
+    for (testTowerConfigs()) |row| {
+        const config = row orelse continue;
         const reserve = largestImageEncodeBytes(&config);
         const vp = visionPreprocFromConfig(&config);
         var largest: u64 = 0;
         for (sides) |s| {
-            const rs = imageResize(vp, vp.patch * vp.merge, s[0], s[1]);
-            const img = [_]chat_mod.ImageData{testGridImage(rs.h / vp.patch, rs.w / vp.patch, "")};
-            const bill = visionEncodeBill(&config, &img, &.{}, mediaRows(1, img[0].grid_h, img[0].grid_w, vp.merge)).bytes;
+            const plan = arch_media.planImage(vp, s[1], s[0]).?;
+            const img = [_]chat_mod.ImageData{testGridImage(plan.grid_h, plan.grid_w, "")};
+            const bill = visionEncodeBill(&config, &img, &.{}, arch_media.gridRows(1, img[0].grid_h, img[0].grid_w, vp.merge)).bytes;
             try t.expect(bill <= reserve);
             largest = @max(largest, bill);
         }
@@ -1616,7 +1454,8 @@ test "the largest-image encode bill covers any single image the tower's processo
 test "an image request bills its encode the same on a streamed load as on a resident one" {
     const t = std.testing;
     const img = [_]chat_mod.ImageData{testGridImage(46, 82, "")};
-    for (testTowerConfigs()) |resident| {
+    for (testTowerConfigs()) |row| {
+        const resident = row orelse continue;
         var streamed = resident;
         streamed.expert_streaming = true;
         streamed.expert_vision_tower_bytes = 1 << 30;
@@ -1642,6 +1481,7 @@ test "towerFitFault admits an image at the 1536^2 cap when 9 GB is free" {
 test "towerFitFault bills a MiMo image by the MiMo-ViT's measured scratch, not score sheets" {
     var config = model_mod.ModelConfig{};
     config.mimo_vision = true;
+    if (!arch_media.claimed(&config)) return;
     config.qv_heads = 32;
     config.mvit_kv_heads = 8;
     config.qv_head_dim = 64;
@@ -1650,21 +1490,22 @@ test "towerFitFault bills a MiMo image by the MiMo-ViT's measured scratch, not s
     config.qv_out_hidden = 4096;
     // The engine's 1536^2 cap: 96x96 patches. N^2 score sheets would bill ~33 GB.
     const cap = [_]chat_mod.ImageData{testGridImage(96, 96, "")};
-    const need = mimo_vision.encodeScratchBytes(&config, 9216);
+    const need = arch_media.scratchBytes(&config, 9216);
     try std.testing.expect(need < 3 * (1 << 30));
     try std.testing.expect(towerFitFault(&config, &cap, &.{}, 2304, 3 * (1 << 30)) == null);
     try std.testing.expect(towerFitFault(&config, &cap, &.{}, 2304, need / 2) != null);
 }
 
 test "towerFitFault refuses an encode whose scratch does not fit, naming both sizes" {
-    var config = model_mod.ModelConfig{};
+    var config = model_mod.ModelConfig{ .qwen_vision = true };
+    if (!arch_media.claimed(&config)) return;
     config.qv_heads = 16;
     config.qv_hidden = 1152;
     config.qv_intermediate = 4304;
     config.qv_out_hidden = 2560;
     // ~8100 patches is a 1920x1080 screenshot at the 1536^2 cap: one block's f32 score sheet is 4.2 GB.
     const shot = [_]chat_mod.ImageData{ testGridImage(90, 90, ""), testGridImage(8, 8, "") };
-    const need = visionScratchBytes(&config, 8100);
+    const need = arch_media.scratchBytes(&config, 8100);
     try std.testing.expect(need > 4 * (1 << 30));
     const fault = towerFitFault(&config, &shot, &.{}, 2041, need / 2) orelse return error.TestExpectedRefusal;
     try std.testing.expect(std.mem.indexOf(u8, fault.text(), "8100 patches") != null);
@@ -1831,12 +1672,13 @@ test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {
 }
 
 test "video admission bills the largest temporal group" {
-    const config = model_mod.ModelConfig{ .qv_heads = 16, .qv_hidden = 1152, .qv_intermediate = 4304, .qv_out_hidden = 2560 };
+    const config = model_mod.ModelConfig{ .qwen_vision = true, .qv_heads = 16, .qv_hidden = 1152, .qv_intermediate = 4304, .qv_out_hidden = 2560 };
+    if (!arch_media.claimed(&config)) return;
     const videos = [_]chat_mod.VideoData{.{ .pixels = &.{}, .grid_t = 8, .grid_h = 46, .grid_w = 82 }};
     const patches: u64 = 46 * 82;
     const rows = 8 * patches / 4;
-    const old_bill = visionScratchBytes(&config, 8 * patches) + rows * config.qv_out_hidden * 2;
-    const floor = visionScratchBytes(&config, patches) + 8 * patches * 3 * 2 * 16 * 16 * 4 + rows * config.qv_out_hidden * 2;
+    const old_bill = arch_media.scratchBytes(&config, 8 * patches) + rows * config.qv_out_hidden * 2;
+    const floor = arch_media.scratchBytes(&config, patches) + 8 * patches * 3 * 2 * 16 * 16 * 4 + rows * config.qv_out_hidden * 2;
     const bill = visionEncodeBill(&config, &.{}, &videos, rows);
     try std.testing.expectEqual(patches, bill.largest_group_patches);
     try std.testing.expect(bill.bytes < old_bill / 8);
@@ -1848,7 +1690,8 @@ test "video admission bills the largest temporal group" {
 }
 
 test "visionEncodeBill covers each measured video peak by >= 25% and within 1.5x" {
-    const config = model_mod.ModelConfig{ .qv_heads = 16, .qv_hidden = 1152, .qv_intermediate = 4304, .qv_out_hidden = 2560 };
+    const config = model_mod.ModelConfig{ .qwen_vision = true, .qv_heads = 16, .qv_hidden = 1152, .qv_intermediate = 4304, .qv_out_hidden = 2560 };
+    if (!arch_media.claimed(&config)) return;
     // Peak from pixel upload to evaluated output, bytes (`qwen vision ubench`, Sushi-3bpw tower).
     const measured = [_]struct { t: u32, h: u32, w: u32, peak: u64 }{
         .{ .t = 1, .h = 46, .w = 82, .peak = 1_248_628_098 },
@@ -1869,7 +1712,7 @@ test "visionEncodeBill covers each measured video peak by >= 25% and within 1.5x
 }
 
 test "GLM vision serving processor carries image and video token budgets without M-RoPE" {
-    const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const cfg = arch_media.testConfig("glm5_next") orelse return;
     const processor = visionPreprocFromConfig(&cfg);
     try std.testing.expectEqual(.glm5, processor.mode);
     try std.testing.expectEqual(@as(u32, 14), processor.patch);
@@ -1896,12 +1739,12 @@ test "GLM vision serving processor carries image and video token budgets without
     try std.testing.expectEqual(@as(u64, 16), bill.largest_group_patches);
     const input_bytes: u64 = 3 * 16 * 3 * 2 * 14 * 14 * 4;
     const output_bytes: u64 = 12 * 4096 * 2;
-    try std.testing.expectEqual(glm5_vision.encodeScratchBytes(&cfg, 16) + input_bytes + 3 * output_bytes, bill.bytes);
+    try std.testing.expectEqual(arch_media.scratchBytes(&cfg, 16) + input_bytes + 3 * output_bytes, bill.bytes);
 }
 
 test "DeepSeek vision serving: the processor carries the release's budgets, a placeholder expands to the whole span, and its encode is billed" {
     const a = std.testing.allocator;
-    const cfg = try model_mod.parseConfigFromJson(a, dsv41_config.release_config);
+    const cfg = arch_media.testConfig("deepseek_v41") orelse return;
     const vp = visionPreprocFromConfig(&cfg);
     try std.testing.expectEqual(.dsv41, vp.mode);
     try std.testing.expectEqual(@as(u32, 14), vp.patch);
@@ -1927,16 +1770,15 @@ test "DeepSeek vision serving: the processor carries the release's budgets, a pl
     try std.testing.expectEqual(@as(u64, 1530), bill.largest_group_patches);
     const input_bytes: u64 = 1530 * 588 * 4;
     const output_bytes: u64 = 194 * 5120 * 2;
-    try std.testing.expectEqual(dsv41_vision.encodeScratchBytes(&cfg, 1530) + input_bytes + 3 * output_bytes, bill.bytes);
+    try std.testing.expectEqual(arch_media.scratchBytes(&cfg, 1530) + input_bytes + 3 * output_bytes, bill.bytes);
 
     // The reserve a streamed load keeps covers the largest image the processor admits.
     const reserve = largestImageEncodeBytes(&cfg);
-    const proc = dsv41_vision.Processor.of(cfg.dsv41.?.vision.?);
     var largest: u64 = 0;
     for ([_][2]u32{ .{ 1920, 1080 }, .{ 4000, 3000 }, .{ 7000, 1000 }, .{ 1000, 7000 }, .{ 640, 640 }, .{ 14, 14 } }) |s| {
-        const plan = dsv41_vision.planGrid(s[0], s[1], proc).?;
-        const img = [_]chat_mod.ImageData{testGridImage(plan.vit_h, plan.vit_w, "")};
-        const rows = dsv41_vision.spanTokens(plan.llm_h, plan.llm_w);
+        const plan = arch_media.planImage(vp, s[0], s[1]).?;
+        const img = [_]chat_mod.ImageData{testGridImage(plan.grid_h, plan.grid_w, "")};
+        const rows = arch_media.imageRows(&cfg, vp.merge, plan.grid_h, plan.grid_w);
         const one = visionEncodeBill(&cfg, &img, &.{}, rows).bytes;
         try std.testing.expect(one <= reserve);
         largest = @max(largest, one);
@@ -1945,7 +1787,7 @@ test "DeepSeek vision serving: the processor carries the release's budgets, a pl
 }
 
 test "DeepSeek's image-encode bill, which is also its transient cap, covers a quarter over the measured peak" {
-    const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, dsv41_config.release_config);
+    const cfg = arch_media.testConfig("deepseek_v41") orelse return;
     // One 1031-token image of 8463 patches peaked at 1.111 GiB of MLX's own bytes (binary 26a28040, budget 108).
     const images = [_]chat_mod.ImageData{testGridImage(91, 93, "")};
     // Less the 0.052 GiB a decode forward holds before the encode starts: the cap is over that level.
@@ -1970,4 +1812,112 @@ test "image input decodes GIF and BMP: red, green over blue, white" {
         try std.testing.expectEqual(@as(u32, 2), size.w);
         try std.testing.expectEqual(@as(u32, 2), size.h);
     }
+}
+
+fn pinOfImage(img: chat_mod.ImageData) [5]u64 {
+    return .{ img.width, img.height, img.grid_h, img.grid_w, std.hash.Wyhash.hash(0, img.pixels) };
+}
+
+const TestProcessors = struct { qwen: ?chat_mod.VisionPreproc, mimo: ?chat_mod.VisionPreproc, glm5: ?chat_mod.VisionPreproc, dsv41: ?chat_mod.VisionPreproc };
+
+fn testProcessors() TestProcessors {
+    const cfgs = testTowerConfigs();
+    return .{
+        .qwen = if (cfgs[0]) |*c| visionPreprocFromConfig(c) else null,
+        .mimo = if (cfgs[1]) |*c| visionPreprocFromConfig(c) else null,
+        .glm5 = if (cfgs[2]) |*c| visionPreprocFromConfig(c) else null,
+        .dsv41 = testVp("deepseek_v41"),
+    };
+}
+
+test "an image decodes to the pixels, size and grid each processor has always made of it" {
+    const a = std.testing.allocator;
+    const procs = testProcessors();
+    const rows = [_]struct { vp: ?chat_mod.VisionPreproc, url: []const u8, want: [5]u64 }{
+        .{ .vp = procs.qwen, .url = test_png_0, .want = .{ 96, 64, 4, 6, 4149077796133081678 } },
+        .{ .vp = procs.qwen, .url = test_png_1, .want = .{ 64, 64, 4, 4, 2194103195719558942 } },
+        .{ .vp = procs.mimo, .url = test_png_0, .want = .{ 128, 96, 6, 8, 9862854407119173112 } },
+        .{ .vp = procs.mimo, .url = test_png_1, .want = .{ 128, 96, 6, 8, 4374061203260551084 } },
+        .{ .vp = procs.glm5, .url = test_png_0, .want = .{ 140, 112, 8, 10, 5106878532303169288 } },
+        .{ .vp = procs.glm5, .url = test_png_1, .want = .{ 140, 112, 8, 10, 13315574616504384767 } },
+        .{ .vp = procs.dsv41, .url = test_png_0, .want = .{ 630, 476, 34, 45, 15322854265658043389 } },
+        .{ .vp = procs.dsv41, .url = test_png_1, .want = .{ 630, 476, 34, 45, 811190763718401708 } },
+    };
+    for (rows) |r| {
+        const img = parseImageUrlContent(a, r.url, r.vp orelse continue) orelse return error.DecodeFailed;
+        defer a.free(img.pixels);
+        try std.testing.expectEqual(r.want, pinOfImage(img));
+    }
+}
+
+test "a video decodes to the temporal groups its processor has always made, and a tower without video refuses it" {
+    const a = std.testing.allocator;
+    const procs = testProcessors();
+    const frames = [_][]const u8{ test_png_0, test_png_0, test_png_0 };
+    const rows = [_]struct { vp: ?chat_mod.VisionPreproc, want: ?[4]u64 }{
+        .{ .vp = procs.qwen, .want = .{ 2, 4, 6, 9758287172417293698 } },
+        .{ .vp = procs.mimo, .want = null },
+        .{ .vp = procs.glm5, .want = .{ 2, 6, 8, 16172933978579232372 } },
+        .{ .vp = procs.dsv41, .want = null },
+    };
+    for (rows) |r| {
+        var list = std.ArrayList(chat_mod.VideoData).empty;
+        defer list.deinit(a);
+        const ok = appendVideoUrlContent(a, &list, &frames, r.vp orelse continue);
+        try std.testing.expectEqual(r.want != null, ok);
+        if (!ok) continue;
+        defer a.free(list.items[0].pixels);
+        const v = list.items[0];
+        try std.testing.expectEqual(r.want.?, [4]u64{ v.grid_t, v.grid_h, v.grid_w, std.hash.Wyhash.hash(0, v.pixels) });
+    }
+}
+
+test "M-RoPE positions of a prompt's blocks exist only for a tower that declares them" {
+    const a = std.testing.allocator;
+    var cfgs = testTowerConfigs();
+    const ids = [_]u32{ 1, 7, 9, 9, 9, 9, 6, 2, 7, 8, 8, 6, 3 };
+    const images = [_]chat_mod.ImageData{testGridImage(4, 4, "a")};
+    const videos = [_]chat_mod.VideoData{.{ .pixels = "v", .grid_t = 2, .grid_h = 2, .grid_w = 2 }};
+    if (cfgs[0]) |*cfg| {
+        cfg.image_token_id = 9;
+        cfg.video_token_id = 8;
+        cfg.vision_start_token_id = 7;
+        const qwen = try arch_media.mropePositions(a, &ids, &images, &videos, cfg);
+        defer if (qwen.pos) |p| a.free(p);
+        try std.testing.expectEqual(@as(usize, 13), qwen.total);
+        try std.testing.expectEqual(@as(i32, -2), qwen.delta);
+        try std.testing.expectEqual(@as(u64, 2718383550012186370), std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(qwen.pos.?)));
+    }
+    if (cfgs[1]) |*cfg| {
+        cfg.image_token_id = 9;
+        const mimo = try arch_media.mropePositions(a, &ids, &images, &videos, cfg);
+        try std.testing.expectEqual(@as(?[]const i32, null), mimo.pos);
+    }
+}
+
+test "the reserve a streamed load keeps for the largest image is pinned per tower" {
+    const cfgs = testTowerConfigs();
+    const want = [_]u64{ 1770396672, 2256535552, 5814411264 };
+    for (cfgs, want) |row, bytes| {
+        const cfg = row orelse continue;
+        try std.testing.expectEqual(bytes, largestImageEncodeBytes(&cfg));
+    }
+    const full = arch_media.testConfig("deepseek_v41") orelse return;
+    const dsv: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .dsv41 = full.dsv41 };
+    try std.testing.expectEqual(@as(u64, 123627508), largestImageEncodeBytes(&dsv));
+}
+
+test "a tower config without a vision block reserves the pixel-cap image, not a token budget it does not have" {
+    var cfg = arch_media.testConfig("deepseek_v41") orelse return;
+    cfg.dsv41.?.vision = null;
+    const vp = visionPreprocFromConfig(&cfg);
+    try std.testing.expectEqual(.gemma, vp.mode);
+    const patches: u64 = vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / (@as(u64, vp.patch) * vp.patch);
+    const img = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
+    const want = visionEncodeBill(&cfg, &img, &.{}, @intCast(patches / (vp.merge * vp.merge))).bytes;
+    try std.testing.expectEqual(want, largestImageEncodeBytes(&cfg));
+}
+
+test {
+    _ = arch_media;
 }

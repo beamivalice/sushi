@@ -34,7 +34,7 @@ pub const parseConfig = config_file.parseFamily;
 pub const parseDir = config_file.parseDir;
 pub const samplingDefaults = config_file.samplingDefaults;
 
-// slot:media (S2f)
+pub const media = @import("qwen4_media.zig"); // slot:media (S2f)
 
 pub const chat = @import("qwen4_chat.zig"); // slot:chat (S2g)
 

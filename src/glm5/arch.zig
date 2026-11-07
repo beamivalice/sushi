@@ -34,7 +34,7 @@ pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir
     return try @import("glm5_diagnostic.zig").streamedSplit(io, allocator, model_dir, config.num_hidden_layers);
 }
 
-// slot:media (S2f)
+pub const media = @import("glm5_media.zig"); // slot:media (S2f)
 
 pub const chat = @import("glm5_chat.zig"); // slot:chat (S2g)
 

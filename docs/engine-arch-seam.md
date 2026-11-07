@@ -37,7 +37,8 @@ joins `DROPPABLE` when its drop passes.
   name to `effort.Family`, which settings keys and `/v1/settings` use.
 - Dispatch is `inline else` over the union, one area file per concern in `src/arch/`: `life` (construction,
   teardown, cache reset, warmup), `forward`, `request`, `admission` (expert-stream traits from the config), `drafter` (the
-  speculative head: [engine-mtp](engine-mtp.md#the-drafter-seam)), `prefix` (the prefix cache's restore target, per-entry
+  speculative head: [engine-mtp](engine-mtp.md#the-drafter-seam)), `media` (tower, processor, prompt rows, M-RoPE; the
+  config picks the arch whose `media.claims` holds), `prefix` (the prefix cache's restore target, per-entry
   rows and disk sections: [engine-prefix-cache](engine-prefix-cache.md#arch-seam)), and `spec` (the config side: `Spec`,
   the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU
   graphs do not change.

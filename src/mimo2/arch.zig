@@ -55,7 +55,7 @@ pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir
     };
 }
 
-// slot:media (S2f)
+pub const media = @import("mimo2_media.zig"); // slot:media (S2f)
 
 pub const chat = @import("mimo_chat.zig"); // slot:chat (S2g)
 
