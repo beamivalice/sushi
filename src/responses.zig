@@ -4,6 +4,7 @@
 //! translation, output-item JSON builders, and the in-memory response store.
 //! HTTP plumbing and generation orchestration live in `server.zig`.
 
+const arch_fx = @import("arch_fixtures_test.zig");
 const std = @import("std");
 const chat_mod = @import("chat.zig");
 
@@ -1259,14 +1260,8 @@ test "ResponseStore evicts LRU at cap" {
 
 fn expectSameQwenPrompt(actual: []const chat_mod.Message, expected: []const chat_mod.Message) !void {
     const a = testing.allocator;
-    const config = chat_mod.ChatConfig{
-        .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
-        .bos_token = null,
-        .eos_token = "<|im_end|>",
-        .add_bos_token = false,
-        .allocator = a,
-        .preserve_thinking = true,
-    };
+    var config = arch_fx.qwenChatConfig(a) orelse return error.SkipZigTest;
+    config.preserve_thinking = true;
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}]";
     const got = try chat_mod.renderChatTemplate(a, actual, &config, tools, null, true, null, false);
     defer a.free(got);

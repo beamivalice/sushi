@@ -43,6 +43,14 @@ pub fn tableSpec(comptime section: []const u8) ?*const effort.Spec {
     return null;
 }
 
+/// The committed fixtures of the arch registered as `name` (its chat face's `fixtures`), for a shared test of that
+/// arch's data. An empty struct where the build left the arch out, so the test checks `@hasDecl` and skips.
+pub fn Fixtures(comptime name: []const u8) type {
+    if (comptime !@hasField(registry.Tag, name)) return struct {};
+    const face = faceOf(@field(registry.Tag, name));
+    return if (@hasDecl(face, "fixtures")) face.fixtures else struct {};
+}
+
 pub fn pinOf(model_type: []const u8) ?Pin {
     const tag = registry.ofModelType(model_type) orelse return null;
     switch (tag) {

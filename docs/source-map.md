@@ -56,3 +56,4 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `sushibar_main.zig` / `sushibar/` | `sushibar` menu bar app | server-lifecycle |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | format corpus, traffic replay | server-tool-calling |
+| `arch_fixtures_test.zig` / `launch_fixtures_test.zig` / `mrope_fixtures_test.zig` / `request_media_fixtures_test.zig` / `ubench_report_fixtures_test.zig` | the arch data (templates, tower geometries, effort words, the rope golden, a fake bench registry) the shared tests of those areas read, so no shared file declares it | engine-arch-seam, testsuite |

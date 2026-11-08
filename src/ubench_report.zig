@@ -3,6 +3,7 @@
 //! body reaches this file through its host root as `report`. It holds the only tests a microbench has: a bench file
 //! never carries a `test` block ([process-ubench](../docs/process-ubench.md)).
 const std = @import("std");
+const fx = @import("ubench_report_fixtures_test.zig");
 
 pub const Scope = enum { qwen4, mimo2, glm5, dsv41, enc, shared };
 pub const Kind = enum { kernel, pack };
@@ -653,17 +654,7 @@ pub fn formatTime(a: std.mem.Allocator, secs: i64, human: bool) ![]u8 {
 
 const testing = std.testing;
 
-fn fakeRun(_: *Run) anyerror!void {}
-
-const fake_axes = [_]Axis{
-    .{ .name = "rows", .values = &.{ "1", "4" } },
-    .{ .name = "mode", .values = &.{ "uniform", "lowest" }, .numeric = false },
-};
-const fake_registry = [_]Bench{
-    .{ .name = "dsv41.experts", .scope = .dsv41, .what = "chain", .axes = &fake_axes, .arms = &.{ "a", "b" }, .ref = "a", .opts = &.{.{ .name = "text", .help = "x" }}, .run = fakeRun },
-    .{ .name = "dsv41.packed", .scope = .dsv41, .kind = .pack, .what = "p", .arms = &.{"only"}, .ref = "only", .run = fakeRun },
-    .{ .name = "shared.other", .scope = .shared, .what = "o", .arms = &.{"x"}, .ref = "x", .run = fakeRun },
-};
+const fake_registry = fx.fake_registry;
 
 fn parseOne(a: std.mem.Allocator, argv: []const []const u8) !Command {
     var msg: []const u8 = "";
@@ -775,7 +766,7 @@ fn sampleResult(a: std.mem.Allocator, contended: bool) !Result {
     try run.interleave("rows 1", SampleCtx{ .seen = &seen, .a = a }, sampleArm);
     try run.metric("a", "MB read", "MB", 12.5);
     try run.metric("a", "GB/s", "GB/s", 400);
-    const stamps: Stamps = .{ .commit = "abc1234", .dirty = false, .sha256 = "4b7e..19", .mtime = "2026-10-29 14:02 UTC", .chip = "Apple M5 Max", .qos = 31, .power = "AC", .die_start_c = 46, .lock = "ubench:dsv41.experts", .contended = contended, .time = "20261029T140200" };
+    const stamps: Stamps = .{ .commit = "abc1234", .dirty = false, .sha256 = "4b7e..19", .mtime = "2026-10-29 14:02 UTC", .chip = "Apple M5 Max", .qos = 31, .power = "AC", .die_start_c = 46, .lock = "ubench:" ++ fake_registry[0].name, .contended = contended, .time = "20261029T140200" };
     return run.finish(stamps);
 }
 

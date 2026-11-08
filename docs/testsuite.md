@@ -141,6 +141,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A shared file (`trunk.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
   holds only `shared` tests. Code for one arch lives in that arch's files, and so do its tests.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.
+- A helper, constant or fixture builder only tests use is not declared in a shared file outside its `test` blocks: it
+  goes to the arch's folder when one arch owns it, else to a `*_test.zig` beside the shared file.
 - Integration scripts in `tests/` cover only what HTTP shows and a unit test cannot reach.
 
 ## How a test is built

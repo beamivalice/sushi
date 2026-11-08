@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_fx = @import("arch_fixtures_test.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const json_text = @import("json_text.zig");
@@ -2134,11 +2135,10 @@ const CountTokensFixture = struct {
 
     fn init(f: *CountTokensFixture) !void {
         const a = std.testing.allocator;
+        f.cfg = arch_fx.qwenCountConfig() orelse return error.SkipZigTest;
+        f.chat_cfg = arch_fx.qwenChatConfig(a) orelse return error.SkipZigTest;
         f.arena = .init(a);
         f.tok = try byteTokenizerForTests(a, f.arena.allocator(), &.{ "<|im_start|>", "<|im_end|>", "<think>", "</think>" });
-        // Thinking declared off, so only a test that names a thinking default meets one.
-        f.cfg = .{ .num_hidden_layers = 0, .pinned_context = 4096, .model_type = "qwen4_exp", .gen_enable_thinking = false };
-        f.chat_cfg = .{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
         f.lm = undefined;
         f.lm.id = "";
         f.lm.config = &f.cfg;

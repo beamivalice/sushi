@@ -2,6 +2,7 @@
 //! per-prompt files, the teacher's logits rows, and the scoring of a student row against one. Links no MLX, so a
 //! host-tier test or a plugin's parity harness reads and scores a fixture without loading a model.
 const std = @import("std");
+const arch_fx = @import("arch_fixtures_test.zig");
 const io_util = @import("io_util.zig");
 const testing = std.testing;
 
@@ -939,7 +940,7 @@ test "kld fixture: the real teacher fixture reads back at full width" {
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fixture_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const fixture = teacherFixture(&fixture_buf, io) orelse return error.SkipZigTest;
+    const fixture = teacherFixture(&fixture_buf, io, arch_fx.qwen_teacher_pack) orelse return error.SkipZigTest;
 
     var base = try readBaseline(allocator, io, fixture);
     defer base.deinit();
@@ -1034,7 +1035,7 @@ test "kld fixture: prompt sources parse from a fixture dir, a text dir and a jso
     try testing.expectEqual(@as(usize, 1), limited.items.len);
 
     var fixture_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (teacherFixture(&fixture_buf, io)) |fixture| {
+    if (teacherFixture(&fixture_buf, io, arch_fx.qwen_teacher_pack)) |fixture| {
         try testing.expectEqual(SourceKind.fixture, try classifySource(io, fixture));
         var from_fixture = try loadPrompts(allocator, io, fixture, 2);
         defer from_fixture.deinit();
@@ -1048,7 +1049,7 @@ test "kld fixture: the recorded strict NLL is the teacher's own log-softmax, as 
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var fixture_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const fixture = teacherFixture(&fixture_buf, io) orelse return error.SkipZigTest;
+    const fixture = teacherFixture(&fixture_buf, io, arch_fx.qwen_teacher_pack) orelse return error.SkipZigTest;
 
     var base = try readBaseline(allocator, io, fixture);
     defer base.deinit();
@@ -1153,8 +1154,8 @@ test "kld fixture: pickToken scores the forced token and falls back to the argma
 }
 
 /// The 60x64 teacher fixture under the models root, or null when it is absent.
-fn teacherFixture(buf: []u8, io: std.Io) ?[]const u8 {
-    const path = @import("test_models.zig").packPath(buf, "kld-teacher/Qwen3.8-Flash-Next-wikitext2-60x64") catch return null;
+fn teacherFixture(buf: []u8, io: std.Io, pack: ?[]const u8) ?[]const u8 {
+    const path = @import("test_models.zig").packPath(buf, pack orelse return null) catch return null;
     var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return null;
     defer dir.close(io);
     _ = dir.statFile(io, "baseline.json", .{}) catch return null;

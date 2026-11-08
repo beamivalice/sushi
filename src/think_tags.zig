@@ -7,7 +7,6 @@ const ChatConfig = chat.ChatConfig;
 const FUNCTION_CALLS_TAG = tool_calls_mod.FUNCTION_CALLS_TAG;
 const Message = chat.Message;
 const ToolCall = chat.ToolCall;
-const mimoTemplateConfig = chat.mimoTemplateConfig;
 const miniCpm5AttrValue = tool_calls_mod.miniCpm5AttrValue;
 const renderChatTemplate = chat.renderChatTemplate;
 
@@ -1492,30 +1491,6 @@ pub fn cutThoughtDelta(held: []const u8, opener_consumed: bool, shipped: bool) [
 pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
     if (already >= reasoning.len) return null;
     return reasoning[already..];
-}
-
-test "mimo_v2 template preserves reasoning and XML tool history" {
-    const a = testing.allocator;
-    var config = mimoTemplateConfig(a);
-    const calls = [_]ToolCall{.{ .id = "call_1", .name = "sum", .arguments = "{\"x\":2}" }};
-    const messages = [_]Message{
-        .{ .role = "user", .content = "Compute." },
-        .{ .role = "assistant", .content = "", .reasoning_content = "Use sum.", .tool_calls = &calls },
-        .{ .role = "tool", .content = "2" },
-        .{ .role = "user", .content = "Continue." },
-    };
-    const expected = "<|im_start|>user\nCompute.<|im_end|>" ++
-        "<|im_start|>assistant\n<think>Use sum.</think>" ++
-        "<tool_call><function=sum><parameter=x>2</parameter></function></tool_call><|im_end|>" ++
-        "<|im_start|>tool\n2<|im_end|>" ++
-        "<|im_start|>user\nContinue.<|im_end|><|im_start|>assistant\n";
-    const thinking = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
-    defer a.free(thinking);
-    try testing.expectEqualStrings(expected, thinking);
-    try testing.expect(!promptTailOpensThink(thinking));
-    const plain = try renderChatTemplate(a, &messages, &config, null, null, false, null, false);
-    defer a.free(plain);
-    try testing.expectEqualStrings(expected ++ "<think></think>", plain);
 }
 
 test "split content: think tags never reach content" {

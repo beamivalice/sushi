@@ -2569,6 +2569,7 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
 
 const testing = std.testing;
 const expectError = @import("test_expect.zig").expectError;
+const arch_chat = @import("arch/chat.zig");
 
 test "ModelConfig defaults" {
     const config = ModelConfig{};
@@ -3481,59 +3482,10 @@ test "real qwen streaming resident estimate is trunk plus MTP only" {
     try std.testing.expect(bytes > 14_000_000_000 and bytes < 16_000_000_000);
 }
 
-// ── qwen4_exp YaRN context extension (262144 → 1048576) ──────────────────
-//
-// Both documents below are the SHIPPED checkpoint's text config (Qwen3.8-Flash-
-// Next, `model_type: qwen4_exp`) — one as it ships (plain rope, 262144) and one
-// with the YaRN block vLLM's `--hf-overrides` recipe writes. Keeping them as
-// literals means the parser is tested against the real file shape, braces and
-// all, rather than a synthesized one.
-
-/// The checkpoint as it ships: `rope_type: "default"`, a 262144 window.
-pub const QWEN4_SHIPPED =
-    \\{
-    \\  "architectures": ["Qwen4ExpForConditionalGeneration"],
-    \\  "model_type": "qwen4_exp",
-    \\  "text_config": {
-    \\    "model_type": "qwen4_exp_text",
-    \\    "hidden_size": 2560, "num_hidden_layers": 48, "full_attention_interval": 4,
-    \\    "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
-    \\    "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
-    \\    "ple_layer_ids": [2],
-    \\    "vocab_size": 248320, "eos_token_id": 248044, "max_position_embeddings": 262144,
-    \\    "rope_parameters": {
-    \\      "rope_type": "default", "rope_theta": 10000000, "partial_rotary_factor": 0.25,
-    \\      "mrope_section": [11, 11, 10], "mrope_interleaved": true
-    \\    }
-    \\  }
-    \\}
-;
-
-/// The same checkpoint with its rope scaled 4× and the window widened — exactly
-/// `vllm serve ... --hf-overrides '{"text_config": {"rope_parameters": {...}}}'
-/// --max-model-len 1010000` expressed as config instead of a flag.
-pub const QWEN4_YARN =
-    \\{
-    \\  "architectures": ["Qwen4ExpForConditionalGeneration"],
-    \\  "model_type": "qwen4_exp",
-    \\  "text_config": {
-    \\    "model_type": "qwen4_exp_text",
-    \\    "hidden_size": 2560, "num_hidden_layers": 48, "full_attention_interval": 4,
-    \\    "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
-    \\    "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
-    \\    "ple_layer_ids": [2],
-    \\    "vocab_size": 248320, "eos_token_id": 248044, "max_position_embeddings": 1048576,
-    \\    "rope_parameters": {
-    \\      "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144,
-    \\      "rope_theta": 10000000, "partial_rotary_factor": 0.25,
-    \\      "mrope_section": [11, 11, 10], "mrope_interleaved": true
-    \\    }
-    \\  }
-    \\}
-;
-
 test "ModelConfig.contextCap: the rope-derived window binds what the server advertises" {
-    const scaled = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    const fx = arch_chat.Fixtures("qwen4");
+    if (!@hasDecl(fx, "yarn")) return error.SkipZigTest;
+    const scaled = try parseConfigFromJson(testing.allocator, fx.yarn);
     // Over-advertised: a config claiming 2M tokens on a factor-4 ramp out of
     // 262144 still cannot resolve past 1048576 — past there positions alias back
     // inside the window, which is the failure this clamps against.
@@ -3553,6 +3505,8 @@ test "ModelConfig.contextCap: the rope-derived window binds what the server adve
 }
 
 test "parseConfigFromJson: --config-overrides deep-merges a nested block without clobbering siblings" {
+    const fx = arch_chat.Fixtures("qwen4");
+    if (!@hasDecl(fx, "yarn")) return error.SkipZigTest;
     if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     // The merge is what makes the flag usable for rope at all: `rope_parameters`
     // is written as a whole object, and a REPLACE would drop the
@@ -3562,13 +3516,13 @@ test "parseConfigFromJson: --config-overrides deep-merges a nested block without
     // non-config values), and the same trap is documented in its source.
     defer setConfigOverrides(null);
     // Pre-override: the shipped config really does have no scaling.
-    try testing.expect(!(try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED)).rope_yarn);
+    try testing.expect(!(try parseConfigFromJson(testing.allocator, fx.shipped)).rope_yarn);
     setConfigOverrides(
         \\{"text_config":{"max_position_embeddings":1048576,
         \\  "rope_parameters":{"rope_type":"yarn","factor":4.0,
         \\    "original_max_position_embeddings":262144}}}
     );
-    const c = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    const c = try parseConfigFromJson(testing.allocator, fx.shipped);
     try testing.expect(c.rope_yarn);
     try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-9);
     try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
@@ -3579,13 +3533,15 @@ test "parseConfigFromJson: --config-overrides deep-merges a nested block without
     try testing.expectEqual([3]u32{ 11, 11, 10 }, c.mrope_section);
     try testing.expectEqual(@as(u32, 262_144), c.yarn_orig_max_pos);
     // The result is indistinguishable from the hand-written extended config.
-    const written = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    const written = try parseConfigFromJson(testing.allocator, fx.yarn);
     try testing.expectApproxEqAbs(written.yarn_factor, c.yarn_factor, 1e-9);
     try testing.expectEqual(written.contextCap(), c.contextCap());
     try testing.expectApproxEqAbs(written.yarn_attention_factor, c.yarn_attention_factor, 1e-9);
 }
 
 test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creates new keys, rejects junk" {
+    const fx = arch_chat.Fixtures("qwen4");
+    if (!@hasDecl(fx, "yarn")) return error.SkipZigTest;
     if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     defer setConfigOverrides(null);
     // Scalars and arrays replace wholesale (vLLM's base case); an array nested
@@ -3594,7 +3550,7 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
         \\{"text_config":{"num_hidden_layers":8,"head_dim":128,
         \\  "rope_parameters":{"mrope_section":[9,9,9]}}}
     );
-    const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    const c = try parseConfigFromJson(testing.allocator, fx.yarn);
     try testing.expectEqual(@as(u32, 8), c.num_hidden_layers);
     try testing.expectEqual(@as(u32, 128), c.head_dim);
     try testing.expectEqual([3]u32{ 9, 9, 9 }, c.mrope_section);
@@ -3606,7 +3562,7 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
     setConfigOverrides(
         \\{"text_config":{"ngram_size":5}}
     );
-    const n = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    const n = try parseConfigFromJson(testing.allocator, fx.shipped);
     try testing.expectEqual(@as(u32, 5), n.ngram_size);
 
     // Only an object is a document; a bare array must not half-apply.
@@ -3615,11 +3571,11 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
     );
     try expectError(
         error.ConfigOverridesMustBeObject,
-        parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
+        parseConfigFromJson(testing.allocator, fx.shipped),
     );
     // Clearing the seam restores the shipped document exactly.
     setConfigOverrides(null);
-    const clean = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    const clean = try parseConfigFromJson(testing.allocator, fx.shipped);
     try testing.expectEqual(@as(u32, 48), clean.num_hidden_layers);
     try testing.expectEqual(@as(u32, 256), clean.head_dim);
     try testing.expectEqual(@as(u32, 3), clean.ngram_size);
@@ -3639,21 +3595,6 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
         try t.expect(!cfg.ssdFirstCapable());
     }
 }
-
-/// One qwen4_exp config document with `extra` fields spliced in.
-pub fn qwen4CaseJson(comptime extra: []const u8) []const u8 {
-    return "{\"model_type\":\"qwen4_exp\",\"hidden_size\":2560,\"num_hidden_layers\":48," ++
-        "\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":2,\"head_dim\":256," ++
-        "\"hc_count\":4,\"hc_lowrank\":320,\"ple_embed_dim\":2560,\"ple_conv_kernel_size\":4," ++
-        "\"num_experts\":512,\"num_experts_per_tok\":10,\"moe_intermediate_size\":640," ++
-        "\"eos_token_id\":248044,\"vocab_size\":248320,\"rms_norm_eps\":1e-6," ++
-        extra ++ "}";
-}
-
-pub const QWEN4_GOOD_FIELDS =
-    "\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":8," ++
-    "\"ngram_vocab_size_base\":20000000,\"make_ngram_vocab_size_divisible_by\":128," ++
-    "\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048,\"indexer_compress_ratio\":4";
 
 test "isExpertStreamingArch admits only implemented streaming families" {
     const t = std.testing;
@@ -3724,20 +3665,25 @@ test "a non-ringing sliding arch keeps the uniform KV bill" {
     try testing.expectEqual(@as(u64, 48 * 8 * 2 * 256 * 2), g.kvBytesPerToken());
 
     // qwen4_exp: 12 caching layers of 48, uniform geometry, no ring.
-    const q = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
-    try testing.expectEqual(@as(u64, 0), q.swaRingTokens());
-    try testing.expectEqual(@as(u64, 24_576), q.kvBytesPerToken());
+    const fx = arch_chat.Fixtures("qwen4");
+    if (@hasDecl(fx, "yarn")) {
+        const q = try parseConfigFromJson(testing.allocator, fx.yarn);
+        try testing.expectEqual(@as(u64, 0), q.swaRingTokens());
+        try testing.expectEqual(@as(u64, 24_576), q.kvBytesPerToken());
+    }
 }
 
 test "the loader refuses a mixed-revision pack by name before reading any weight" {
+    const fx = arch_chat.Fixtures("qwen4");
+    if (!@hasDecl(fx, "yarn")) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model-1.safetensors", .data = "\x02\x00\x00\x00\x00\x00\x00\x00{}" });
     var path: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(std.testing.io, &path);
-    const legacy = try parseConfigFromJson(std.testing.allocator, QWEN4_YARN);
+    const legacy = try parseConfigFromJson(std.testing.allocator, fx.yarn);
     try std.testing.expect(legacy.pack_revision == null);
-    const stamped_json = try std.mem.concat(std.testing.allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\"},", QWEN4_YARN[1..] });
+    const stamped_json = try std.mem.concat(std.testing.allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\"},", fx.yarn[1..] });
     defer std.testing.allocator.free(stamped_json);
     var cfg = try parseConfigFromJson(std.testing.allocator, stamped_json);
     defer cfg.deinit(std.testing.allocator);
@@ -3761,11 +3707,13 @@ test "the loader refuses a model_type this build does not serve, by name, before
 }
 
 test "parseConfig releases owned paths when an EXL3 pack is refused" {
+    const fx = arch_chat.Fixtures("qwen4");
+    if (!@hasDecl(fx, "goodJson")) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = "config.json",
-        .data = qwen4CaseJson(QWEN4_GOOD_FIELDS),
+        .data = fx.goodJson(""),
     });
     var index: std.ArrayList(u8) = .empty;
     defer index.deinit(testing.allocator);
@@ -3819,18 +3767,26 @@ test "parseConfigFromJson: a wrong-typed or out-of-range field is a named error,
         "{\"model_type\":\"not_a_served_arch\",\"num_experts\":-1}",
         "{\"model_type\":\"not_a_served_arch\",\"bos_token_id\":4294967296}",
         "{\"model_type\":\"not_a_served_arch\",\"image_token_id\":-7}",
-        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"vision_config\":{\"depth\":-1}"),
-        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":-1}"),
-        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":262144,\"factor\":\"4\"}"),
     }) |doc| {
         try expectError(error.InvalidConfigField, parseConfigFromJson(t.allocator, doc));
+    }
+    const fx = arch_chat.Fixtures("qwen4");
+    if (@hasDecl(fx, "goodJson")) {
+        for ([_][]const u8{
+            fx.goodJson(",\"vision_config\":{\"depth\":-1}"),
+            fx.goodJson(",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":-1}"),
+            fx.goodJson(",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":262144,\"factor\":\"4\"}"),
+        }) |doc| {
+            try expectError(error.InvalidConfigField, parseConfigFromJson(t.allocator, doc));
+        }
     }
 }
 
 test "parseConfigFromJson: an optional field set to null keeps its default; sliding_window null still disables" {
+    const fx = arch_chat.Fixtures("qwen4");
+    if (!@hasDecl(fx, "goodJson")) return error.SkipZigTest;
     const t = testing;
-    const c = try parseConfigFromJson(t.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++
-        ",\"max_position_embeddings\":null,\"bos_token_id\":null,\"sliding_window\":null,\"image_token_id\":null"));
+    const c = try parseConfigFromJson(t.allocator, fx.goodJson(",\"max_position_embeddings\":null,\"bos_token_id\":null,\"sliding_window\":null,\"image_token_id\":null"));
     const d = ModelConfig{};
     try t.expectEqual(d.max_position_embeddings, c.max_position_embeddings);
     try t.expectEqual(@as(?u32, null), c.bos_token_id);
@@ -4335,10 +4291,12 @@ test "a text prompt's BOS comes from the release config, whose bos_token_id sits
 }
 
 test "a pair-major pack is refused by name by an architecture that reads only the pack order" {
+    const fx = arch_chat.Fixtures("qwen4");
+    if (!@hasDecl(fx, "goodJson")) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();
     const order = ",\"expert_quant\":{\"format\":\"exl3\",\"k\":4,\"codebook\":\"mcg\",\"tile_order\":\"pair_major\"}";
     for ([_]struct { config: []const u8, first: usize, layers: usize, prefix: []const u8 }{
-        .{ .config = qwen4CaseJson(QWEN4_GOOD_FIELDS ++ order), .first = 0, .layers = 48, .prefix = "language_model.model.layers." },
+        .{ .config = fx.goodJson(order), .first = 0, .layers = 48, .prefix = "language_model.model.layers." },
         .{ .config = "{\"model_type\":\"mimo_v2\",\"hidden_size\":384,\"vocab_size\":128,\"num_hidden_layers\":4,\"intermediate_size\":1536," ++
             "\"num_attention_heads\":4,\"num_key_value_heads\":2,\"head_dim\":192,\"v_head_dim\":128,\"hybrid_layer_pattern\":[0,1,1,0],\"sliding_window\":128," ++
             "\"n_routed_experts\":16,\"num_experts_per_tok\":4,\"moe_intermediate_size\":192,\"moe_layer_freq\":[0,1,1,1],\"eos_token_id\":17" ++ order ++ "}", .first = 1, .layers = 4, .prefix = "model.layers." },
@@ -4443,24 +4401,19 @@ fn pinConfig(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
 const PinCase = struct { name: []const u8, arch_type: []const u8, json: []const u8, swap: ?[2][]const u8 = null };
 
 const shared_pin_cases = [_]PinCase{
-    .{ .name = "model-configs/qwen4_exp.json", .arch_type = "qwen4_exp", .json = @embedFile("fixtures/model-configs/qwen4_exp.json") },
-    .{ .name = "glm5_config.json", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json") },
-    .{ .name = "qwen4 shipped", .arch_type = "qwen4_exp", .json = QWEN4_SHIPPED },
-    .{ .name = "qwen4 yarn", .arch_type = "qwen4_exp", .json = QWEN4_YARN },
-    .{ .name = "glm5 text alias", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json"), .swap = .{ "\n  \"model_type\": \"glm5_next\"", "\n  \"model_type\": \"glm5_next_text\"" } },
-    .{ .name = "glm5 raw fp8", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json"), .swap = .{ "{\n  \"architectures\"", "{\"quantization_config\":{\"quant_method\":\"fp8\",\"weight_block_size\":[128,128]},\n  \"architectures\"" } },
-    .{ .name = "qwen4 text alias", .arch_type = "qwen4_exp", .json = QWEN4_SHIPPED, .swap = .{ "  \"model_type\": \"qwen4_exp\",\n  \"text_config\"", "  \"model_type\": \"qwen4_exp_text\",\n  \"text_config\"" } },
-    .{ .name = "qwen4 trunk_quant", .arch_type = "qwen4_exp", .json = qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"trunk_quant\":{\"format\":\"stq\",\"k\":6,\"codebook\":\"spec1\",\"window\":15,\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"}") },
     .{ .name = "unserved", .arch_type = "", .json = "{\"model_type\":\"mistral\",\"hidden_size\":64,\"vocab_size\":32}" },
 };
 
-/// The configs each built arch's chat face lists for the pins (`fixtures.config_pins`).
+/// The configs each built arch's chat face lists for the pins (`fixtures.config_pins`, and `config_variants` with one spelling swapped).
 const arch_pin_cases = blk: {
     var out: []const PinCase = &.{};
     for (std.meta.tags(registry.Tag)) |t| {
         const face = registry.Chat(t);
         if (!@hasDecl(face, "fixtures") or !@hasDecl(face.fixtures, "config_pins")) continue;
         for (face.fixtures.config_pins) |c| out = out ++ &[_]PinCase{.{ .name = c[0], .arch_type = face.model_types[0], .json = c[1] }};
+        if (@hasDecl(face.fixtures, "config_variants")) {
+            for (face.fixtures.config_variants) |c| out = out ++ &[_]PinCase{.{ .name = c.name, .arch_type = face.model_types[0], .json = c.json, .swap = .{ c.from, c.to } }};
+        }
     }
     break :blk out;
 };
@@ -4505,9 +4458,12 @@ test "a parsed config carries its arch tag; a hand-built one resolves it from mo
     const glm = ModelConfig{ .model_type = "glm5_next" };
     try testing.expectEqual(registry.ofModelType("glm5_next") != null, glm.isGlm5());
     try testing.expect(!glm.isQwen4() and !glm.isDsv41() and !glm.isMimo());
-    var parsed = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
-    defer parsed.deinit(testing.allocator);
-    try testing.expectEqual(registry.ofModelType("qwen4_exp") != null, parsed.isQwen4());
-    try testing.expect(!parsed.isGlm5());
+    const fx = arch_chat.Fixtures("qwen4");
+    if (@hasDecl(fx, "shipped")) {
+        var parsed = try parseConfigFromJson(testing.allocator, fx.shipped);
+        defer parsed.deinit(testing.allocator);
+        try testing.expectEqual(registry.ofModelType("qwen4_exp") != null, parsed.isQwen4());
+        try testing.expect(!parsed.isGlm5());
+    }
     try testing.expect(!(ModelConfig{ .model_type = "mistral" }).isQwen4());
 }

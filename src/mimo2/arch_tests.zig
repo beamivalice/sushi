@@ -19,3 +19,8 @@ pub const tests = .{
     @import("mimo2_drafter.zig"),
     @import("mimo_bill.zig"),
 };
+
+/// The MLX-free test files `src/tests_host.zig` runs for this arch.
+pub const host_tests = .{
+    @import("mimo_template_test.zig"),
+};

@@ -969,8 +969,8 @@ test "fp8 block GEMV in f32 errs by no more than an f32 accumulation over the su
     }
 }
 
-/// bf16 activations at a MiMo trunk input's spread: a normed body with a few outlier channels.
-fn mimoX(alloc: std.mem.Allocator, rnd: std.Random, m: usize, k: usize) ![]f32 {
+/// bf16 activations at a trunk input's spread: a normed body with a few outlier channels.
+fn outlierX(alloc: std.mem.Allocator, rnd: std.Random, m: usize, k: usize) ![]f32 {
     const x = try randomX(alloc, rnd, m, k);
     for (x, 0..) |*v, i| {
         if ((i % k) % 97 == 5) v.* = bfToF32(bf16Rne(v.* * 48.0));
@@ -1023,7 +1023,7 @@ test "fp8 block serving tile stays within bf16 rounding plus an f32 sum over the
             defer tw.deinit(alloc);
             // A partial tile, one full row block, and three blocks of seven tiles.
             for ([_]usize{ 17, 40, 128, 300 }) |m| {
-                const x = try mimoX(alloc, rnd, m, tw.k);
+                const x = try outlierX(alloc, rnd, m, tw.k);
                 defer alloc.free(x);
                 const xb = try uploadX(s, x, m, tw.k, .bfloat16);
                 defer _ = mlx.mlx_array_free(xb);
@@ -1060,7 +1060,7 @@ test "fp8 block serving builds at every width when the scales array is small eno
         var tw = try TestWeight.init(alloc, rnd, RowSplit.dense(rows), 128);
         defer tw.deinit(alloc);
         for ([_]usize{ 1, 8, 9, 20, 64, 100, 128, 129 }) |m| {
-            const x = try mimoX(alloc, rnd, m, tw.k);
+            const x = try outlierX(alloc, rnd, m, tw.k);
             defer alloc.free(x);
             const xb = try uploadX(s, x, m, tw.k, .bfloat16);
             defer _ = mlx.mlx_array_free(xb);
@@ -1088,7 +1088,7 @@ test "fp8 block serving tile scales V as the composed multiply rounds it" {
     const rnd = prng.random();
     var tw = try TestWeight.init(alloc, rnd, PARITY_SPLITS[1], 512);
     defer tw.deinit(alloc);
-    const x = try mimoX(alloc, rnd, 33, tw.k);
+    const x = try outlierX(alloc, rnd, 33, tw.k);
     defer alloc.free(x);
     const xb = try uploadX(s, x, 33, tw.k, .bfloat16);
     defer _ = mlx.mlx_array_free(xb);
@@ -1136,7 +1136,7 @@ test "fp8 block serving widths outside the tile, and every width under the refer
     };
     for (cases) |c| {
         reference_route = c.reference;
-        const x = try mimoX(alloc, rnd, c.m, tw.k);
+        const x = try outlierX(alloc, rnd, c.m, tw.k);
         defer alloc.free(x);
         const xb = try uploadX(s, x, c.m, tw.k, .bfloat16);
         defer _ = mlx.mlx_array_free(xb);

@@ -1827,8 +1827,8 @@ test "mxfp4 individual source rejects missing and malformed weights or scales" {
     );
 }
 
-/// A synthetic MiMo index: dense layer 0, EXL3 routed banks from layer 1 on.
-fn mimoExl3IndexJson(allocator: std.mem.Allocator, layers: u16, first_moe: u16) ![]u8 {
+/// A synthetic index: dense layer 0, stacked EXL3 routed banks from `first_moe` on.
+fn stackedExl3IndexJson(allocator: std.mem.Allocator, layers: u16, first_moe: u16) ![]u8 {
     var b: std.ArrayList(u8) = .empty;
     errdefer b.deinit(allocator);
     try b.appendSlice(allocator, "{\"weight_map\":{\"model.layers.0.mlp.gate_proj.weight\":\"a\"");
@@ -1846,13 +1846,13 @@ fn mimoExl3IndexJson(allocator: std.mem.Allocator, layers: u16, first_moe: u16) 
 
 test "mimo_v2 EXL3 stacked experts resolve as a layout and keep the dense prefix" {
     const t = std.testing;
-    const index = try mimoExl3IndexJson(t.allocator, 3, 1);
+    const index = try stackedExl3IndexJson(t.allocator, 3, 1);
     defer t.allocator.free(index);
     try t.expectEqual(Layout.exl3_k4, layoutFromIndexJsonWithFirstMoe(t.allocator, "mimo_v2", index, 3, 1).?);
     try t.expect(isRoutedExpertKey(.exl3_k4, "model.layers.1.mlp.switch_mlp.gate_proj.trellis"));
     try t.expect(!isRoutedExpertKey(.exl3_k4, "model.layers.1.mlp.gate.weight"));
     // A MoE layer short of its bank is not a pack.
-    const short = try mimoExl3IndexJson(t.allocator, 3, 2);
+    const short = try stackedExl3IndexJson(t.allocator, 3, 2);
     defer t.allocator.free(short);
     try t.expect(layoutFromIndexJsonWithFirstMoe(t.allocator, "mimo_v2", short, 3, 1) == null);
     // The qwen4 nesting stays its own probe.
@@ -1861,7 +1861,7 @@ test "mimo_v2 EXL3 stacked experts resolve as a layout and keep the dense prefix
 
 test "mimo_v2 EXL3 beside an MXFP4 bank is a mixed pack and resolves to nothing" {
     const t = std.testing;
-    const index = try mimoExl3IndexJson(t.allocator, 2, 1);
+    const index = try stackedExl3IndexJson(t.allocator, 2, 1);
     defer t.allocator.free(index);
     var key_buf: [192]u8 = undefined;
     const mxfp4 = try mxfp4TensorKey(&key_buf, 1, .gate, .weight);

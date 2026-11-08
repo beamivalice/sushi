@@ -4,6 +4,9 @@
 /// The checkpoint's `config.json`.
 pub const config = @embedFile("fixtures/mimo_v2.json");
 
+/// `chat_template` of XiaomiMiMo/MiMo-V2.6-Flash-RL's tokenizer_config.json, verbatim.
+pub const template = @embedFile("../fixtures/mimo_v26_chat_template.jinja");
+
 pub const MIMO_V2_VISION_JSON =
     \\{
     \\  "model_type": "mimo_v2", "hidden_size": 384, "vocab_size": 128,

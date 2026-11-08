@@ -397,8 +397,8 @@ test "updateMtpEvRound: warmup and wider base rounds reset floor evidence" {
     try testing.expect(!g.spec_disabled_runtime);
 }
 
-fn mtpBoundsPlanFixture(xfm: *Trunk, prompt: []u32, depth: u32) Generator {
-    xfm.config.model_type = "qwen4_exp";
+fn mtpBoundsPlanFixture(xfm: *Trunk, model_type: []const u8, prompt: []u32, depth: u32) Generator {
+    xfm.config.model_type = model_type;
     xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
     for (0..round_cost.MIN_SAMPLES) |_| {
         _ = xfm.round_cost.observe(2, 1000, 29.0, 2.6, true, false);
@@ -442,16 +442,16 @@ test "MTP depth bounds: the planner reads min..max from its table-priced plan" {
     var prompt: [1000]u32 = @splat(0);
 
     depth_bounds.active = .{};
-    var gen = mtpBoundsPlanFixture(&xfm, &prompt, 6);
+    var gen = mtpBoundsPlanFixture(&xfm, "qwen4_exp", &prompt, 6);
     try testing.expectEqual(@as(u32, 3), gen.mtpRoundPlan().m_lo);
 
     depth_bounds.active = .{ .min = 5 };
-    gen = mtpBoundsPlanFixture(&xfm, &prompt, 6);
+    gen = mtpBoundsPlanFixture(&xfm, "qwen4_exp", &prompt, 6);
     var plan = gen.mtpRoundPlan();
     try testing.expect(plan.m_lo >= 5 and plan.m_hi >= plan.m_lo and plan.m_hi <= 6);
 
     depth_bounds.active = .{ .max = 2 };
-    gen = mtpBoundsPlanFixture(&xfm, &prompt, 2);
+    gen = mtpBoundsPlanFixture(&xfm, "qwen4_exp", &prompt, 2);
     plan = gen.mtpRoundPlan();
     try testing.expect(plan.m_lo <= 2 and plan.m_hi <= 2);
 }
@@ -463,7 +463,7 @@ test "MTP depth bounds: min == max drafts that depth every round" {
     var prompt: [1000]u32 = @splat(0);
     for ([_]u32{ 2, 4, 5 }) |depth| {
         depth_bounds.active = .{ .min = depth, .max = depth };
-        var gen = mtpBoundsPlanFixture(&xfm, &prompt, depth);
+        var gen = mtpBoundsPlanFixture(&xfm, "qwen4_exp", &prompt, depth);
         for (0..4) |_| {
             const plan = gen.mtpRoundPlan();
             try testing.expectEqual(depth, plan.m_lo);

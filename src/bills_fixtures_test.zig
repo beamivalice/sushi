@@ -4,6 +4,8 @@ const arch_config = @import("arch/config.zig");
 const model_mod = @import("model.zig");
 const nax_gate = @import("nax_gate.zig");
 const PinCfg = model_mod.ModelConfig;
+const bills = @import("bills.zig");
+const testing = std.testing;
 
 /// A stand-in for the deployed long-context pack: a GDN+MoE trunk with a QSA
 /// indexer. Declares `qwen4_exp`: every long-context mechanism is gated on it.
@@ -204,3 +206,68 @@ pub const PinFx = struct {
         return .{ &self.qwen, &self.mimo, &self.glm, &self.dsv };
     }
 };
+
+pub const LoadBillFixtures = struct {
+    qwen: model_mod.ModelConfig,
+    mimo: model_mod.ModelConfig,
+    glm: model_mod.ModelConfig,
+
+    pub fn init() !LoadBillFixtures {
+        const a = std.testing.allocator;
+        var qwen = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+        errdefer qwen.deinit(a);
+        var mimo = try model_mod.parseConfigFromJson(a, arch_config.fixtureConfig("mimo2") orelse arch_config.unbuilt_config);
+        errdefer mimo.deinit(a);
+        return .{ .qwen = qwen, .mimo = mimo, .glm = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/glm5_config.json")) };
+    }
+
+    pub fn deinit(self: *LoadBillFixtures) void {
+        self.qwen.deinit(std.testing.allocator);
+        self.mimo.deinit(std.testing.allocator);
+        self.glm.deinit(std.testing.allocator);
+    }
+};
+
+const pin_archs = [_][]const u8{ "qwen4", "mimo2", "glm5", "dsv41" };
+
+/// A pin lists one run of values per served pack, in `pin_archs` order, equal runs unless `lens` says otherwise. The runs
+/// of an arch `-Darchs` leaves out are not checked; a build with none of them skips.
+fn pinRows(comptime name: []const u8, want: []const u64, lens: ?[4]usize, cfgs: [4]*const PinCfg, comptime run: fn (*const PinCfg, *bills.PinGot) void) !void {
+    try testing.expect(lens != null or want.len % pin_archs.len == 0);
+    var start: usize = 0;
+    var checked: usize = 0;
+    inline for (pin_archs, 0..) |arch, i| {
+        const n = if (lens) |l| l[i] else want.len / pin_archs.len;
+        if (bills.archBuilt(arch)) {
+            var got = bills.PinGot{};
+            run(cfgs[i], &got);
+            try bills.pinEq(name, want[start..][0..n], got.slice());
+            checked += 1;
+        }
+        start += n;
+    }
+    try testing.expectEqual(want.len, start);
+    if (checked == 0) return error.SkipZigTest;
+}
+
+pub fn pinConfigs(comptime name: []const u8, want: []const u64, comptime run: fn (*const PinCfg, *bills.PinGot) void) !void {
+    var fx = try PinFx.init();
+    defer fx.deinit();
+    try pinRows(name, want, null, fx.all(), run);
+}
+
+/// `pinConfigs` for a bill whose run adds a different number of values per pack.
+pub fn pinConfigsRagged(comptime name: []const u8, want: []const u64, lens: [4]usize, comptime run: fn (*const PinCfg, *bills.PinGot) void) !void {
+    var fx = try PinFx.init();
+    defer fx.deinit();
+    try pinRows(name, want, lens, fx.all(), run);
+}
+
+
+pub fn pinLoadConfigs(comptime name: []const u8, want: []const u64, comptime run: fn (*const PinCfg, *bills.PinGot) void) !void {
+    var fx = try LoadBillFixtures.init();
+    defer fx.deinit();
+    var dsv = PinCfg{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    dsv.dsv41 = try arch_config.releaseOwn("dsv41");
+    try pinRows(name, want, null, .{ &fx.qwen, &fx.mimo, &fx.glm, &dsv }, run);
+}

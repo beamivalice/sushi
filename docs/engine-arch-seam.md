@@ -116,9 +116,12 @@ without it. An arch added later joins the list in the landing that adds it.
 - A trunk rule one arch keeps is a `Facts` flag on its config (`residual_from_embedding`, `moe_scores_f32`,
   `qkv_split_rows`, `bias_routed_moe`), read with `arch_config.fact`. Where a pack keeps its routed experts (key
   prefix, stamped shards, the head's layer, rate groups) is `pack_layout` (`arch_config.PackLayout`, read by
-  `pack_index`'s preflight), its trailing head layers the `trailingPackLayers` hook. An arch's committed test configs live in its chat face's `fixtures` (MLX-free): a shared test
-  reads one with `arch_config.fixtureConfig(name)` (null when the build left it out), and the config pins take each
-  arch's `fixtures.config_pins`. Its microbenches are `ubench` in its `arch.zig`, which `sushi-ubench` lists.
+  `pack_index`'s preflight), its trailing head layers the `trailingPackLayers` hook. An arch's committed test data (configs, its chat template) live in its chat face's `fixtures` (MLX-free): a shared test
+  reads the config with `arch_config.fixtureConfig(name)` (null when the build left it out) and any other decl through
+  `arch_chat.Fixtures(name)` (an empty struct when it did, so the test checks `@hasDecl` and skips), and the config
+  pins take each arch's `fixtures.config_pins` and `config_variants`. A helper or constant that builds a shared type
+  from an arch's data (a `ModelConfig`, a `ChatConfig`) sits in a `*_test.zig` beside the shared file that uses it
+  (`arch_fixtures_test.zig`, `bills_fixtures_test.zig`, `request_media_fixtures_test.zig`), never in the shared file. Its microbenches are `ubench` in its `arch.zig`, which `sushi-ubench` lists.
 - `-Darchs=<a,b,...>` (default: every registered arch) builds `Tag`, `Spec` and `Arch` from the listed archs. An
   excluded arch has no prong: its `arch.zig` is not analysed. A name the registry does not register fails the build.
   `registry.ofModelType` returns no tag for a `model_type` no enabled arch claims.

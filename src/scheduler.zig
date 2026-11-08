@@ -2127,7 +2127,7 @@ test "a loaded model's hot-cache budget is the resolver's clamp, never the raw l
 
 test "a load bills weights, then the larger of the measured warmup plus a 1 GiB net and the context bill" {
     const gib: u64 = 1 << 30;
-    var f = try model_load.LoadBillFixtures.init();
+    var f = try @import("bills_fixtures_test.zig").LoadBillFixtures.init();
     defer f.deinit();
     // Flash-Next's MTP head load peaks above its resident bytes, so only an MTP-on load pays for it.
     try testing.expectEqual(44 * gib + gib / 8 + gib, model_load.loadRequirementBytes(&f.qwen, 44 * gib, false, 0));

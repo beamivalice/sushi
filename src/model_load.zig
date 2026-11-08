@@ -1,5 +1,4 @@
 const std = @import("std");
-const arch_config = @import("arch/config.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const server_state = @import("server_state.zig");
 const arch_flags = @import("arch/flags.zig");
@@ -1312,27 +1311,6 @@ test "Sushi quant memory production pack CPU header audit" {
     try testing.expectEqual(loadRequirementBytes(&cfg, all, true, 0), try residentColdLoadBillBytes(io, a, &cfg, path, true, true, true, ""));
 }
 
-pub const LoadBillFixtures = struct {
-    qwen: ModelConfig,
-    mimo: ModelConfig,
-    glm: ModelConfig,
-
-    pub fn init() !LoadBillFixtures {
-        const a = testing.allocator;
-        var qwen = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/qwen4_exp.json"));
-        errdefer qwen.deinit(a);
-        var mimo = try model_mod.parseConfigFromJson(a, arch_config.fixtureConfig("mimo2") orelse arch_config.unbuilt_config);
-        errdefer mimo.deinit(a);
-        return .{ .qwen = qwen, .mimo = mimo, .glm = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/glm5_config.json")) };
-    }
-
-    pub fn deinit(self: *LoadBillFixtures) void {
-        self.qwen.deinit(testing.allocator);
-        self.mimo.deinit(testing.allocator);
-        self.glm.deinit(testing.allocator);
-    }
-};
-
 test "the drafter is billed at its quantized resident bytes and its load transient joins the warmup" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -1360,7 +1338,7 @@ test "the drafter is billed at its quantized resident bytes and its load transie
     try testing.expect(billed < stored);
     try testing.expectEqual((try dflash_mod.assistantLoadBytes(io, a, dir, dflash_mod.quantBitsFromEnv())).resident, billed);
 
-    var f = try LoadBillFixtures.init();
+    var f = try @import("bills_fixtures_test.zig").LoadBillFixtures.init();
     defer f.deinit();
     const bare = loadRequirementBytes(&f.qwen, 44 * gib, false, 0);
     f.qwen.dflash_load_transient_bytes = gib / 2;
@@ -1377,7 +1355,7 @@ test "a cold load reads the serving bill on the config the load stamps with the 
     const gib: u64 = 1 << 30;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var f = try LoadBillFixtures.init();
+    var f = try @import("bills_fixtures_test.zig").LoadBillFixtures.init();
     defer f.deinit();
     const Hook = struct {
         fn bill(config: *const ModelConfig, _: u64) ?LoadServingBill {

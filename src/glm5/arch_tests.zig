@@ -50,3 +50,8 @@ pub const tests = .{
     @import("glm5_layer_major.zig"),
     @import("glm5_rows_tick.zig"),
 };
+
+/// The MLX-free test files `src/tests_host.zig` runs for this arch.
+pub const host_tests = .{
+    @import("glm5_template_test.zig"),
+};

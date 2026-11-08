@@ -52,6 +52,8 @@ const gpu_clock_live = @import("gpu_clock_live.zig");
 const json_text = @import("json_text.zig");
 const settings_api = @import("settings_api.zig");
 const bills = @import("bills.zig");
+const arch_fx = @import("arch_fixtures_test.zig");
+const media_fx = @import("request_media_fixtures_test.zig");
 const fixtures = @import("bills_fixtures_test.zig");
 const gpu_mem = @import("gpu_mem.zig");
 
@@ -3403,19 +3405,18 @@ pub const MropeData = struct {
 // 8x8 solid PNGs: red and blue.
 pub const test_png_red = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEUlEQVR42mP4z8CAFTEMLQkAKP8/wc53yE8AAAAASUVORK5CYII=";
 pub const test_png_blue = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQVR42mNgYPiPAw0pCQCpcD/B/MtF/AAAAABJRU5ErkJggg==";
-const test_wire_vp: chat_mod.VisionPreproc = .{ .mode = arch_media.modeNamed("qwen") orelse .gemma, .patch = 16, .tps = 2, .merge = 2 };
 
 pub fn testWire(body: []const u8, vocab: WireVocab) !struct { parsed: std.json.Parsed(std.json.Value), wire: WireMessages } {
     // The processor is the arch's: a build without it cannot decode these images.
-    if (!arch_media.servesMode(test_wire_vp.mode)) return error.SkipZigTest;
+    if (!arch_media.servesMode(media_fx.wire_vp.mode)) return error.SkipZigTest;
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     errdefer parsed.deinit();
     var wire = WireMessages.init(std.testing.allocator);
     errdefer wire.deinit();
     const items = parsed.value.object.get("messages").?.array.items;
     switch (vocab) {
-        .openai => try readOpenAiMessages(&wire, items, test_wire_vp),
-        .anthropic => try anthropic.readAnthropicMessages(&wire, items, test_wire_vp),
+        .openai => try readOpenAiMessages(&wire, items, media_fx.wire_vp),
+        .anthropic => try anthropic.readAnthropicMessages(&wire, items, media_fx.wire_vp),
     }
     return .{ .parsed = parsed, .wire = wire };
 }
@@ -3504,13 +3505,7 @@ test "getTimeoutNs computes correctly" {
 }
 
 pub fn renderQwenForResponsesTest(a: std.mem.Allocator, messages: []const chat_mod.Message) ![]const u8 {
-    const config = chat_mod.ChatConfig{
-        .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
-        .bos_token = null,
-        .eos_token = "<|im_end|>",
-        .add_bos_token = false,
-        .allocator = a,
-    };
+    const config = arch_fx.qwenChatConfig(a) orelse return error.SkipZigTest;
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}]";
     return chat_mod.renderChatTemplate(a, messages, &config, tools, null, true, null, false);
 }
@@ -4101,11 +4096,8 @@ pub fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []con
     const instruction = try choice.instruction(a);
     defer if (instruction) |i| a.free(i);
 
-    const Family = struct { tpl: []const u8, head: []const u8, name_tail: []const u8, sep: []const u8 };
-    const families = [_]Family{
-        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .head = "<tool_call>\n<function=", .name_tail = ">\n", .sep = "\n\n" },
-        .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .head = "<tool_call><function=", .name_tail = ">", .sep = "" },
-    };
+    const families = arch_fx.forced_families;
+    if (families.len == 0) return error.SkipZigTest;
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = "What time is it?" }};
     for (families) |f| {
         var config = chat_mod.ChatConfig{ .chat_template = f.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };

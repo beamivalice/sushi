@@ -1523,71 +1523,7 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
 // ── Tests ──
 
 const testing = std.testing;
-
-/// src/fixtures/mimo_v26_chat_template.jinja is the `chat_template` of
-/// XiaomiMiMo/MiMo-V2.6-Flash-RL's tokenizer_config.json, verbatim.
-pub fn mimoTemplateConfig(allocator: std.mem.Allocator) ChatConfig {
-    return .{
-        .chat_template = @embedFile("fixtures/mimo_v26_chat_template.jinja"),
-        .bos_token = null,
-        .eos_token = "<|im_end|>",
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-}
-
-test "real mimo_v2 template is the committed fixture" {
-    const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
-    var config = try loadChatConfig(testing.io, testing.allocator, std.mem.span(raw));
-    defer config.deinit();
-    try testing.expectEqualStrings(@embedFile("fixtures/mimo_v26_chat_template.jinja"), config.chat_template);
-}
-
-test "mimo_v2 template renders a late system turn in place" {
-    const a = testing.allocator;
-    var config = mimoTemplateConfig(a);
-    const messages = [_]Message{
-        .{ .role = "system", .content = "S" },
-        .{ .role = "user", .content = "hi" },
-        .{ .role = "system", .content = "late" },
-        .{ .role = "user", .content = "again" },
-    };
-    const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
-    defer a.free(rendered);
-    try testing.expectEqualStrings("<|im_start|>system\nS<|im_end|><|im_start|>user\nhi<|im_end|>" ++
-        "<|im_start|>system\nlate<|im_end|><|im_start|>user\nagain<|im_end|><|im_start|>assistant\n", rendered);
-}
-
-test "mimo_v2 template renders a tools request as the reference does" {
-    // Expected bytes: transformers' apply_chat_template environment (jinja2, its
-    // json.dumps tojson) over the same template and request.
-    const a = testing.allocator;
-    var config = mimoTemplateConfig(a);
-    const tools_json =
-        \\[{"type":"function","function":{"name":"get_weather","description":"Current weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
-    ;
-    const calls = [_]ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
-    const messages = [_]Message{
-        .{ .role = "system", .content = "S" },
-        .{ .role = "user", .content = "Weather in Paris?" },
-        .{ .role = "assistant", .content = "", .reasoning_content = "Need weather.", .tool_calls = &calls },
-        .{ .role = "tool", .content = "18C", .tool_call_id = "call_1" },
-        .{ .role = "user", .content = "Thanks." },
-    };
-    const expected = "<|im_start|>system\nYou are provided with the following tools:\n\n<tools>\n" ++
-        "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather\", " ++
-        "\"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}" ++
-        "\n</tools><|im_end|><|im_start|>system\nS<|im_end|><|im_start|>user\nWeather in Paris?<|im_end|>" ++
-        "<|im_start|>assistant\n<think>Need weather.</think><tool_call><function=get_weather><parameter=city>Paris</parameter>" ++
-        "</function></tool_call><|im_end|><|im_start|>tool\n18C<|im_end|><|im_start|>user\nThanks.<|im_end|>" ++
-        "<|im_start|>assistant\n";
-    const thinking = try renderChatTemplate(a, &messages, &config, tools_json, null, true, null, false);
-    defer a.free(thinking);
-    try testing.expectEqualStrings(expected, thinking);
-    const plain = try renderChatTemplate(a, &messages, &config, tools_json, null, false, null, false);
-    defer a.free(plain);
-    try testing.expectEqualStrings(expected ++ "<think></think>", plain);
-}
+const arch_fx = @import("arch_fixtures_test.zig");
 
 test "collapseDoubledThinkTags collapses 2x → 1x" {
     const out = try collapseDoubledThinkTags(testing.allocator, "<|Assistant|></think></think>Hi!");
@@ -1802,11 +1738,8 @@ test "renderChatTemplate folds a late system turn only where the template refuse
     }
 }
 
-const qwen_late_templates = [_][]const u8{
-    @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
-};
-
 test "stock Qwen late system notes render in place and keep tool rounds a prefix" {
+    if (arch_fx.qwen_late_templates.len == 0) return error.SkipZigTest;
     const a = testing.allocator;
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"description\":\"Read a value\",\"parameters\":{\"type\":\"object\"}}}]";
     const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{\"index\":3}" }};
@@ -1820,7 +1753,7 @@ test "stock Qwen late system notes render in place and keep tool rounds a prefix
         .{ .role = "system", .content = "runtime note three" },
         .{ .role = "assistant", .content = "answer", .reasoning_content = "more reasoning" },
     };
-    for (qwen_late_templates) |tpl| {
+    for (arch_fx.qwen_late_templates) |tpl| {
         for ([_]?bool{ null, true, false }) |preserve| {
             const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .preserve_thinking = preserve };
             const first = try renderChatTemplate(a, messages[0..3], &config, tools, null, true, "low", false);
@@ -1843,13 +1776,14 @@ test "stock Qwen late system notes render in place and keep tool rounds a prefix
 }
 
 test "stock Qwen adapter: a second leading system turn stays a turn of its own" {
+    if (arch_fx.qwen_late_templates.len == 0) return error.SkipZigTest;
     const a = testing.allocator;
     const messages = [_]Message{
         .{ .role = "system", .content = "stable" },
         .{ .role = "system", .content = "second lead" },
         .{ .role = "user", .content = "question" },
     };
-    for (qwen_late_templates) |tpl| {
+    for (arch_fx.qwen_late_templates) |tpl| {
         const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
         const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, "low", false);
         defer a.free(rendered);
@@ -1858,11 +1792,12 @@ test "stock Qwen adapter: a second leading system turn stays a turn of its own" 
 }
 
 test "stock Qwen adapter leaves prompts without late notes byte-identical, tools, thinking and media included" {
+    if (arch_fx.qwen_late_templates.len == 0) return error.SkipZigTest;
     const a = testing.allocator;
     const parts = [_]MediaPart{ .{ .at = 0, .kind = .image }, .{ .at = 0, .kind = .video } };
     const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{\"index\":3}" }};
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}}]";
-    for (qwen_late_templates, 0..) |tpl, index| {
+    for (arch_fx.qwen_late_templates, 0..) |tpl, index| {
         const adapted = (try qwenLateSystemTemplate(a, tpl)).?;
         defer a.free(adapted);
         const messages = [_]Message{
@@ -1893,8 +1828,9 @@ test "stock Qwen adapter leaves prompts without late notes byte-identical, tools
 }
 
 test "stock Qwen adapter: a late note between media turns renders in place" {
+    if (arch_fx.qwen_late_templates.len == 0) return error.SkipZigTest;
     const a = testing.allocator;
-    const tpl = qwen_late_templates[0];
+    const tpl = arch_fx.qwen_late_templates[0];
     const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
     const parts = [_]MediaPart{.{ .at = 0, .kind = .image }};
     const messages = [_]Message{
@@ -1912,13 +1848,14 @@ test "stock Qwen adapter: a late note between media turns renders in place" {
 }
 
 test "stock Qwen adapter engages only on the byte-pinned revisions" {
+    if (arch_fx.qwen_late_templates.len == 0) return error.SkipZigTest;
     const a = testing.allocator;
     const messages = [_]Message{
         .{ .role = "system", .content = "stable" },
         .{ .role = "user", .content = "question" },
         .{ .role = "system", .content = "late note" },
     };
-    for (qwen_late_templates) |tpl| {
+    for (arch_fx.qwen_late_templates) |tpl| {
         const revised = try std.mem.concat(a, u8, &.{ tpl, "{{- 'revision marker' }}" });
         defer a.free(revised);
         const respelled = try std.mem.replaceOwned(u8, a, tpl, "message.role == \"system\"", "message.role == 'system'");
@@ -2196,7 +2133,7 @@ test "serializeExtraContext: a table's value reaches each family's template as t
         .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "75", .want = "\"reasoning_effort\":\"high\"" },
         .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "100", .want = "\"reasoning_effort\":\"max\"" },
         .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .value = "101", .want = "\"reasoning_effort\":\"high\"" },
-        .{ .tpl = glm53_template, .value = "low", .want = "\"reasoning_effort\":\"low\"" },
+        .{ .tpl = @embedFile("fixtures/glm53_chat_template.jinja"), .value = "low", .want = "\"reasoning_effort\":\"low\"" },
     }) |c| {
         var cfg = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
         const r = try serializeExtraContext(allocator, &cfg, true, c.value);
@@ -3033,12 +2970,6 @@ test "GLM serving template receives low high max without a derived reasoning bud
     }
 }
 
-const glm53_template = @embedFile("fixtures/glm53_chat_template.jinja");
-
-fn glm53Config(allocator: std.mem.Allocator) ChatConfig {
-    return .{ .chat_template = glm53_template, .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = allocator };
-}
-
 test "jinja: a number after a dot subscripts, as in Jinja2" {
     const tpl = "{{ x.0.y }}|{{ x.1.0 }}|{{ x.1.1 }}|{{ s.0 }}|{{ x[1].0 }}|{{ x.1.0 + 0.5 }}|{{ 'no' if x.5 is not defined else 'yes' }}|{{ 1.5 }}";
     const extra = "{\"x\":[{\"y\":\"a\"},[7,8]],\"s\":\"hey\"}";
@@ -3079,111 +3010,6 @@ test "jinja: a namespace mutated in a loop body accumulates across iterations" {
         "{% set ns = namespace(s='') %}{% for i in [1,2] %}{% for j in [3,4] %}{% set ns.s = ns.s ~ i ~ j ~ ',' %}{% endfor %}{% endfor %}{{ ns.s }}",
         "[]",
         "13,14,23,24,",
-    );
-}
-
-test "GLM-5.3 template renders a tool round-trip itself, never the generic fallback" {
-    const a = testing.allocator;
-    var config = glm53Config(a);
-    const tools =
-        \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
-    ;
-    const calls = [_]ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
-    const messages = [_]Message{
-        .{ .role = "system", .content = "You are helpful." },
-        .{ .role = "user", .content = "What is the weather in Paris?" },
-        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "Need the weather." },
-        .{ .role = "tool", .content = "Sunny, 21C", .tool_call_id = "call_1" },
-    };
-    const want = "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\n" ++
-        "You may call one or more functions to assist with the user query.\n\n" ++
-        "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n" ++
-        "{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n" ++
-        "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n" ++
-        "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>" ++
-        "<|system|>You are helpful.<|user|>What is the weather in Paris?" ++
-        "<|assistant|><think>Need the weather.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>" ++
-        "<|observation|><tool_response>Sunny, 21C</tool_response><|assistant|><think>";
-    const before = template_fallbacks.load(.monotonic);
-    const rendered = try renderChatTemplate(a, &messages, &config, tools, null, true, null, false);
-    defer a.free(rendered);
-    try testing.expectEqual(before, template_fallbacks.load(.monotonic));
-    try testing.expectEqualStrings(want, rendered);
-}
-
-/// Renders `messages_json` through GLM-5.3's own template; the text from the first user turn on.
-fn glm53RenderRaw(messages_json: [:0]const u8, tools_json: ?[:0]const u8, out: *std.ArrayList(u8)) !void {
-    const extra = "{\"enable_thinking\":true,\"reasoning_effort\":\"high\"}";
-    var len: usize = 0;
-    const ptr = jinja_c.jinja_render_chat(glm53_template, messages_json, if (tools_json) |t| t.ptr else null, extra, 1, &len) orelse {
-        std.debug.print("\njinja error: {s}\n", .{std.mem.span(jinja_c.jinja_last_error().?)});
-        return error.RenderFailed;
-    };
-    defer jinja_c.jinja_str_free(ptr);
-    const text = ptr[0..len];
-    try out.appendSlice(testing.allocator, text[std.mem.indexOf(u8, text, "<|user|>").?..]);
-}
-
-test "GLM-5.3 template: a tool result given as a list of outputs, text parts or tool references renders in place" {
-    const user = "{\"role\":\"user\",\"content\":\"Q\"}";
-    const call = "{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"R\",\"tool_calls\":[" ++
-        "{\"type\":\"function\",\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}}," ++
-        "{\"type\":\"function\",\"id\":\"call_2\",\"function\":{\"name\":\"get_time\",\"arguments\":{}}}]}";
-    const head = "<|user|>Q<|assistant|><think>R</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>" ++
-        "<tool_call>get_time</tool_call><|observation|>";
-    const tail = "<|assistant|><think>";
-    const tools =
-        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{}}}}]
-    ;
-    const cases = [_]struct { tool: [:0]const u8, tools: ?[:0]const u8, want: []const u8 }{
-        .{
-            .tool = "{\"role\":\"tool\",\"content\":[{\"tool_call_id\":\"call_2\",\"output\":\"12:00\"},{\"tool_call_id\":\"call_1\",\"output\":\"Sunny\"}]}",
-            .tools = null,
-            .want = head ++ "<tool_response>Sunny</tool_response><tool_response>12:00</tool_response>" ++ tail,
-        },
-        .{
-            .tool = "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"Sunny\"},{\"type\":\"image\"}]}",
-            .tools = null,
-            .want = head ++ "<tool_response>Sunny<|begin_of_image|><|image|><|end_of_image|></tool_response>" ++ tail,
-        },
-        .{
-            .tool = "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":[{\"type\":\"tool_reference\",\"name\":\"get_time\"}]}",
-            .tools = tools,
-            .want = head ++ "<tool_response><tools>\n{\"name\": \"get_time\", \"description\": \"Get time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools></tool_response>" ++ tail,
-        },
-    };
-    for (cases) |c| {
-        const json = try std.fmt.allocPrintSentinel(testing.allocator, "[{s},{s},{s}]", .{ user, call, c.tool }, 0);
-        defer testing.allocator.free(json);
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(testing.allocator);
-        try glm53RenderRaw(json, c.tools, &out);
-        try testing.expectEqualStrings(c.want, out.items);
-    }
-}
-
-test "GLM-5.3 template: parallel results come back in the order of the calls" {
-    const a = testing.allocator;
-    var config = glm53Config(a);
-    const calls = [_]ToolCall{
-        .{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" },
-        .{ .id = "call_2", .name = "get_time", .arguments = "{}" },
-    };
-    const messages = [_]Message{
-        .{ .role = "user", .content = "Q" },
-        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "R" },
-        .{ .role = "tool", .content = "12:00", .tool_call_id = "call_2" },
-        .{ .role = "tool", .content = "Sunny", .tool_call_id = "call_1" },
-    };
-    const before = template_fallbacks.load(.monotonic);
-    const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
-    defer a.free(rendered);
-    try testing.expectEqual(before, template_fallbacks.load(.monotonic));
-    const from = std.mem.indexOf(u8, rendered, "<|user|>").?;
-    try testing.expectEqualStrings(
-        "<|user|>Q<|assistant|><think>R</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>" ++
-            "<tool_call>get_time</tool_call><|observation|><tool_response>Sunny</tool_response><tool_response>12:00</tool_response><|assistant|><think>",
-        rendered[from..],
     );
 }
 
@@ -3339,22 +3165,6 @@ test "chat: the V4.1 effort words map onto the encoder's 1-100 ladder, medium at
     try testing.expectEqualStrings("87", scaleEffortFor("xhigh"));
     try testing.expectEqualStrings("\"max\"", scaleEffortFor("max"));
 }
-
-/// One DeepSeek-V4.1 turn replayed the way a client does: the model's tokens for `raw`, the server's split and parse of
-/// its text, and the next request's prompt tokens through the real template.
-pub const Dsv41Replay = struct {
-    gen: []u32,
-    /// Generated tokens the next prompt repeats, from the first one.
-    reused: usize,
-    /// The next prompt starts with the first prompt.
-    prefix_kept: bool,
-    think_close_at: ?usize,
-    markup_at: ?usize,
-
-    pub fn deinit(self: *Dsv41Replay, a: std.mem.Allocator) void {
-        a.free(self.gen);
-    }
-};
 
 /// One turn of a hybrid-state arch replayed the way a client does (the pack's own template and tokenizer): the
 /// generated tokens for `raw`, the server's split and parse of its text, and the next request's prompt.

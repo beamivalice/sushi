@@ -5224,7 +5224,7 @@ fn writeMimoExl3StreamFixture(dir: std.Io.Dir) !void {
     try dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
 }
 
-fn checkMimoExl3Streaming(runtime: bool) !void {
+fn checkMimoExl3Streaming(model_type: []const u8, runtime: bool) !void {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -5233,7 +5233,7 @@ fn checkMimoExl3Streaming(runtime: bool) !void {
     const len = try tmp.dir.realPath(t.io, &buf);
     const path = buf[0..len];
     const geometry: Geometry = .{ .layers = 3, .experts = 4, .hidden = 128, .intermediate = 128, .first_moe_layer = 1, .exl3_n = 64 };
-    try t.expectEqual(quant.Layout.exl3_k4, try quant.streamingLayoutOfDir(t.allocator, t.io, "mimo_v2", path, 3, 1));
+    try t.expectEqual(quant.Layout.exl3_k4, try quant.streamingLayoutOfDir(t.allocator, t.io, model_type, path, 3, 1));
     const per = try expertBytesFor(t.allocator, path, geometry, .exl3_k4);
     try t.expectEqual(try exl3ExpertBytes(geometry), per);
     const fixed = (1 << 20) + 4 * per + 2 * per + BOUNCE_BYTES;
@@ -5313,11 +5313,11 @@ fn checkMimoExl3Streaming(runtime: bool) !void {
 }
 
 test "MiMo EXL3 streaming CPU geometry ledger and slab ids cross the dense prefix" {
-    try checkMimoExl3Streaming(false);
+    try checkMimoExl3Streaming("mimo_v2", false);
 }
 
 test "MiMo EXL3 streaming imported slabs warm and reuse different layer rates" {
-    try checkMimoExl3Streaming(true);
+    try checkMimoExl3Streaming("mimo_v2", true);
 }
 
 test "expert pick tolerance accepts 0 through 0.6 and names a bad value" {

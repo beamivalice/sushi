@@ -1,4 +1,5 @@
 const std = @import("std");
+const fx = @import("request_media_fixtures_test.zig");
 const mlx = @import("mlx.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
@@ -86,14 +87,8 @@ fn testPngUrl(a: std.mem.Allocator, w: u32, h: u32) ![]u8 {
     return out;
 }
 
-const test_vision_modes = [_]chat_mod.VisionPreproc{
-    .{ .mode = arch_media.modeNamed("qwen") orelse .gemma, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 65536, .max_pixels = 1048576 },
-    .{ .mode = arch_media.modeNamed("mimo") orelse .gemma, .patch = 16, .tps = 2, .merge = 2, .min_pixels = 8192, .max_pixels = 8388608 },
-    .{ .mode = arch_media.modeNamed("glm5") orelse .gemma, .patch = 14, .tps = 2, .merge = 2, .min_tokens = 16, .max_tokens = 8000 },
-};
-
 /// The processor of the enabled arch serving `model_type`; a test of an arch the build left out passes unrun.
-fn testVp(model_type: []const u8) ?chat_mod.VisionPreproc {
+pub fn testVp(model_type: []const u8) ?chat_mod.VisionPreproc {
     const cfg = arch_media.testConfig(model_type) orelse return null;
     return visionPreprocFromConfig(&cfg);
 }
@@ -133,7 +128,7 @@ test "the plan read from an image's header is the grid and size its full decode 
     var modes = std.ArrayList(chat_mod.VisionPreproc).empty;
     defer modes.deinit(a);
     if (testVp("deepseek_v41")) |vp| try modes.append(a, vp);
-    for (test_vision_modes) |vp| if (arch_media.servesMode(vp.mode)) try modes.append(a, vp);
+    for (fx.vision_modes) |vp| if (arch_media.servesMode(vp.mode)) try modes.append(a, vp);
     const dsv_config = arch_media.testConfig("deepseek_v41");
     for (sizes) |size| {
         const url = try testPngUrl(a, size[0], size[1]);
@@ -166,7 +161,7 @@ test "decoding a held image later gives the patches an up-front decode gave" {
     var modes = std.ArrayList(chat_mod.VisionPreproc).empty;
     defer modes.deinit(a);
     if (testVp("deepseek_v41")) |vp| try modes.append(a, vp);
-    for (test_vision_modes) |vp| if (arch_media.servesMode(vp.mode)) try modes.append(a, vp);
+    for (fx.vision_modes) |vp| if (arch_media.servesMode(vp.mode)) try modes.append(a, vp);
     for ([_][]const u8{ test_png_0, test_png_1, test_png_2 }) |url| {
         for (modes.items) |mode| {
             const eager = parseImageUrlContent(a, url, mode) orelse return error.DecodeFailed;
@@ -1420,24 +1415,10 @@ test "an input_audio part sent to a vision-only model is refused by name" {
     try std.testing.expect(std.mem.indexOf(u8, mediaKindRefusal(&msgs, flat, false, false).?.text(), "audio") != null);
 }
 
-/// Hand-flagged tower configs; a row is null when its arch is not in the build.
-fn testTowerConfigs() [3]?model_mod.ModelConfig {
-    var rows: [3]?model_mod.ModelConfig = .{
-        // Qwen3.8 packs: no processor config, so the 1,003,520 px default.
-        .{ .has_vision = true, .qwen_vision = true, .qv_heads = 16, .qv_hidden = 1152, .qv_intermediate = 4304, .qv_out_hidden = 2560, .qv_patch = 16, .qv_temporal_patch = 2, .qv_merge = 2 },
-        .{ .has_vision = true, .mimo_vision = true, .qv_heads = 32, .mvit_kv_heads = 8, .qv_head_dim = 64, .qv_hidden = 1280, .qv_intermediate = 4608, .qv_out_hidden = 4096, .qv_patch = 16, .qv_temporal_patch = 2, .qv_merge = 2, .qv_min_pixels = 8192, .qv_max_pixels = 8388608 },
-        .{ .has_vision = true, .glm5_vision = true, .qv_heads = 16, .qv_head_dim = 64, .qv_hidden = 1024, .qv_intermediate = 4096, .qv_out_hidden = 4096, .glmv_projection_intermediate = 10240, .qv_patch = 14, .qv_temporal_patch = 2, .qv_merge = 2, .glmv_min_image_tokens = 16, .glmv_max_image_tokens = 8000 },
-    };
-    for (&rows) |*row| if (!arch_media.claimed(&row.*.?)) {
-        row.* = null;
-    };
-    return rows;
-}
-
 test "the largest-image encode bill covers any single image the tower's processor admits" {
     const t = std.testing;
     const sides = [_][2]u32{ .{ 1080, 1920 }, .{ 20000, 20000 }, .{ 30000, 64 }, .{ 64, 30000 }, .{ 4321, 3210 }, .{ 7, 9 } };
-    for (testTowerConfigs()) |row| {
+    for (fx.towerConfigs()) |row| {
         const config = row orelse continue;
         const reserve = largestImageEncodeBytes(&config);
         const vp = visionPreprocFromConfig(&config);
@@ -1456,7 +1437,7 @@ test "the largest-image encode bill covers any single image the tower's processo
 test "an image request bills its encode the same on a streamed load as on a resident one" {
     const t = std.testing;
     const img = [_]chat_mod.ImageData{testGridImage(46, 82, "")};
-    for (testTowerConfigs()) |row| {
+    for (fx.towerConfigs()) |row| {
         const resident = row orelse continue;
         var streamed = resident;
         streamed.expert_streaming = true;
@@ -1820,21 +1801,9 @@ fn pinOfImage(img: chat_mod.ImageData) [5]u64 {
     return .{ img.width, img.height, img.grid_h, img.grid_w, std.hash.Wyhash.hash(0, img.pixels) };
 }
 
-const TestProcessors = struct { qwen: ?chat_mod.VisionPreproc, mimo: ?chat_mod.VisionPreproc, glm5: ?chat_mod.VisionPreproc, dsv41: ?chat_mod.VisionPreproc };
-
-fn testProcessors() TestProcessors {
-    const cfgs = testTowerConfigs();
-    return .{
-        .qwen = if (cfgs[0]) |*c| visionPreprocFromConfig(c) else null,
-        .mimo = if (cfgs[1]) |*c| visionPreprocFromConfig(c) else null,
-        .glm5 = if (cfgs[2]) |*c| visionPreprocFromConfig(c) else null,
-        .dsv41 = testVp("deepseek_v41"),
-    };
-}
-
 test "an image decodes to the pixels, size and grid each processor has always made of it" {
     const a = std.testing.allocator;
-    const procs = testProcessors();
+    const procs = fx.processors();
     const rows = [_]struct { vp: ?chat_mod.VisionPreproc, url: []const u8, want: [5]u64 }{
         .{ .vp = procs.qwen, .url = test_png_0, .want = .{ 96, 64, 4, 6, 4149077796133081678 } },
         .{ .vp = procs.qwen, .url = test_png_1, .want = .{ 64, 64, 4, 4, 2194103195719558942 } },
@@ -1854,7 +1823,7 @@ test "an image decodes to the pixels, size and grid each processor has always ma
 
 test "a video decodes to the temporal groups its processor has always made, and a tower without video refuses it" {
     const a = std.testing.allocator;
-    const procs = testProcessors();
+    const procs = fx.processors();
     const frames = [_][]const u8{ test_png_0, test_png_0, test_png_0 };
     const rows = [_]struct { vp: ?chat_mod.VisionPreproc, want: ?[4]u64 }{
         .{ .vp = procs.qwen, .want = .{ 2, 4, 6, 9758287172417293698 } },
@@ -1876,7 +1845,7 @@ test "a video decodes to the temporal groups its processor has always made, and 
 
 test "M-RoPE positions of a prompt's blocks exist only for a tower that declares them" {
     const a = std.testing.allocator;
-    var cfgs = testTowerConfigs();
+    var cfgs = fx.towerConfigs();
     const ids = [_]u32{ 1, 7, 9, 9, 9, 9, 6, 2, 7, 8, 8, 6, 3 };
     const images = [_]chat_mod.ImageData{testGridImage(4, 4, "a")};
     const videos = [_]chat_mod.VideoData{.{ .pixels = "v", .grid_t = 2, .grid_h = 2, .grid_w = 2 }};
@@ -1898,7 +1867,7 @@ test "M-RoPE positions of a prompt's blocks exist only for a tower that declares
 }
 
 test "the reserve a streamed load keeps for the largest image is pinned per tower" {
-    const cfgs = testTowerConfigs();
+    const cfgs = fx.towerConfigs();
     const want = [_]u64{ 1770396672, 2256535552, 5814411264 };
     for (cfgs, want) |row, bytes| {
         const cfg = row orelse continue;

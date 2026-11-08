@@ -13,6 +13,7 @@
 //! plan and CLAUDE.md "M-RoPE" notes.
 
 const std = @import("std");
+const yarn_fx = @import("mrope_fixtures_test.zig");
 
 /// Full patch grid of one image BEFORE spatial merge: h = H/patch, w = W/patch,
 /// t = temporal frames (1 for a still image). The number of LLM image-pad tokens
@@ -527,59 +528,8 @@ test "mrope PositionContext maps suffix caches and generated text" {
 
 // ── YaRN rope scaling (the qwen4_exp 262144 → 1048576 extension) ──
 
-/// The shipped Qwen3.8-Flash-Next rope geometry, from the checkpoint's own
-/// config.json: head_dim 256 × partial_rotary_factor 0.25 → rotary_dim 64 (so
-/// 32 frequencies, which is what `mrope_section` [11,11,10] sums to), theta 1e7,
-/// pre-trained window 262144.
-const QWEN4_YARN = Yarn{
-    .theta = 10_000_000.0,
-    .factor = 4.0,
-    .orig_max = 262_144,
-    .rotary_dim = 64,
-};
-
-/// `_compute_yarn_parameters` output for QWEN4_YARN, produced by the reference
-/// (tests/qwen4/dump_qwen4_yarn_fixtures.py, transformers 5.9) — and independently by
-/// a transcription of vLLM's `YaRNScalingRotaryEmbedding._compute_inv_freq`,
-/// which agrees with HF bit-for-bit here. f64: the references compute in f32,
-/// which is 1e-7 sloppier than these.
-const QWEN4_YARN_GOLDEN = [_]f64{
-    1.0, // 0   extrapolated band (i < low): unscaled
-    0.6042963902381328, // 1
-    0.36517412725483767, // 2
-    0.220673406908459, // 3
-    0.1333521432163324, // 4
-    0.08058421877614819, // 5
-    0.04869675251658631, // 6
-    0.029427271762092817, // 7
-    0.01778279410038923, // 8
-    0.010746078283213174, // 9
-    0.006493816315762114, // 10
-    0.003924189758484536, // 11
-    0.002371373705661655, // 12
-    0.0014330125702369627, // 13
-    0.0008659643233600654, // 14  last ramp-free extrapolation
-    0.0004742398226801046, // 15  blended: 0.90625 of unscaled
-    0.00025693505988868084, // 16
-    0.0001373497450760004, // 17
-    0.00007217387404309113, // 18
-    0.0000370722498206804, // 19
-    0.000018449222025000475, // 20
-    0.000008759770071179004, // 21  blended: 0.34375 of unscaled
-    0.0000038498163151487305, // 22 interpolated band (i >= high): exactly /4
-    0.0000023264301023242476, // 23
-    0.0000014058533129758728, // 24
-    0.0000008495520822356398, // 25
-    0.0000005133812566142865, // 26
-    0.0000003102344401879299, // 27
-    0.00000018747355233311396, // 28
-    0.00000011328959094002045, // 29
-    0.00000006846049085660903, // 30
-    0.00000004137042749857954, // 31
-};
-
 test "yarn correction range for the qwen4_exp geometry" {
-    const r = QWEN4_YARN.correctionRange();
+    const r = yarn_fx.QWEN4_YARN.correctionRange();
     // low = floor(64·ln(262144/(32·2π))/(2·ln 1e7)) = floor(14.24) = 14
     try std.testing.expectEqual(@as(f64, 14.0), r.low);
     // high = ceil(64·ln(262144/(1·2π))/(2·ln 1e7)) = ceil(21.12) = 22
@@ -588,13 +538,13 @@ test "yarn correction range for the qwen4_exp geometry" {
     // neither band is empty: 15 dims extrapolated, 7 blended, 10 interpolated.
     try std.testing.expect(r.low < @as(f64, 16));
     try std.testing.expect(r.high < @as(f64, 32));
-    try std.testing.expectEqual(@as(u64, 1_048_576), QWEN4_YARN.contextLen());
+    try std.testing.expectEqual(@as(u64, 1_048_576), yarn_fx.QWEN4_YARN.contextLen());
 }
 
 test "yarn inv_freq matches HF _compute_yarn_parameters (qwen4_exp 262k -> 1M)" {
     var f: [32]f64 = undefined;
-    QWEN4_YARN.invFreq(&f);
-    for (QWEN4_YARN_GOLDEN, 0..) |want, i| {
+    yarn_fx.QWEN4_YARN.invFreq(&f);
+    for (yarn_fx.QWEN4_YARN_GOLDEN, 0..) |want, i| {
         try std.testing.expectApproxEqRel(want, f[i], 1e-12);
     }
     // HF's default mscale for factor 4: 0.1·ln 4 + 1.
@@ -607,8 +557,8 @@ test "yarn leaves the low-frequency band unscaled and divides the top band" {
     var plain: [32]f64 = undefined;
     computeInvFreq(&plain, 64, 10_000_000.0);
     var f: [32]f64 = undefined;
-    QWEN4_YARN.invFreq(&f);
-    const r = QWEN4_YARN.correctionRange();
+    yarn_fx.QWEN4_YARN.invFreq(&f);
+    const r = yarn_fx.QWEN4_YARN.correctionRange();
     for (0..32) |i| {
         const idx: f64 = @floatFromInt(i);
         if (idx <= r.low) {
@@ -654,7 +604,7 @@ test "yarn reads a 1M position as 262k in the interpolated band" {
     var plain: [32]f64 = undefined;
     computeInvFreq(&plain, 64, 10_000_000.0);
     var yarn_f: [32]f64 = undefined;
-    QWEN4_YARN.invFreq(&yarn_f);
+    yarn_fx.QWEN4_YARN.invFreq(&yarn_f);
     const p: usize = 1_048_572;
     const half: usize = 32;
     var sel: [half]u8 = undefined;
@@ -685,7 +635,7 @@ test "yarn reads a 1M position as 262k in the interpolated band" {
 
 test "fillCosSin mscale scales the rotated rows only" {
     var f: [32]f64 = undefined;
-    QWEN4_YARN.invFreq(&f);
+    yarn_fx.QWEN4_YARN.invFreq(&f);
     var sel: [32]u8 = undefined;
     interleavedSelector(&sel, .{ 11, 11, 10 });
     const ctx = PositionContext{ .pos = &.{}, .total = 0, .delta = 0 };

@@ -2684,40 +2684,9 @@ pub fn pinEq(comptime name: []const u8, want: []const u64, got: []const u64) !vo
     };
 }
 
-const pin_archs = [_][]const u8{ "qwen4", "mimo2", "glm5", "dsv41" };
-
-/// A pin lists one run of values per served pack, in `pin_archs` order, equal runs unless `lens` says otherwise. The runs
-/// of an arch `-Darchs` leaves out are not checked; a build with none of them skips.
-fn pinRows(comptime name: []const u8, want: []const u64, lens: ?[4]usize, cfgs: [4]*const model_mod.ModelConfig, comptime run: fn (*const model_mod.ModelConfig, *PinGot) void) !void {
-    try testing.expect(lens != null or want.len % pin_archs.len == 0);
-    var start: usize = 0;
-    var checked: usize = 0;
-    inline for (pin_archs, 0..) |arch, i| {
-        const n = if (lens) |l| l[i] else want.len / pin_archs.len;
-        if (archBuilt(arch)) {
-            var got = PinGot{};
-            run(cfgs[i], &got);
-            try pinEq(name, want[start..][0..n], got.slice());
-            checked += 1;
-        }
-        start += n;
-    }
-    try testing.expectEqual(want.len, start);
-    if (checked == 0) return error.SkipZigTest;
-}
-
-pub fn pinConfigs(comptime name: []const u8, want: []const u64, comptime run: fn (*const PinCfg, *PinGot) void) !void {
-    var fx = try fixtures.PinFx.init();
-    defer fx.deinit();
-    try pinRows(name, want, null, fx.all(), run);
-}
-
-/// `pinConfigs` for a bill whose run adds a different number of values per pack.
-pub fn pinConfigsRagged(comptime name: []const u8, want: []const u64, lens: [4]usize, comptime run: fn (*const PinCfg, *PinGot) void) !void {
-    var fx = try fixtures.PinFx.init();
-    defer fx.deinit();
-    try pinRows(name, want, lens, fx.all(), run);
-}
+pub const pinConfigs = fixtures.pinConfigs;
+pub const pinConfigsRagged = fixtures.pinConfigsRagged;
+pub const pinLoadConfigs = fixtures.pinLoadConfigs;
 
 pub const pin_bits = [_]u64{ 8, 16 };
 
@@ -6172,14 +6141,6 @@ pub fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64, required_byt
     return avail_bytes < required_bytes;
 }
 
-pub fn pinLoadConfigs(comptime name: []const u8, want: []const u64, comptime run: fn (*const model_mod.ModelConfig, *PinGot) void) !void {
-    var fx = try model_load.LoadBillFixtures.init();
-    defer fx.deinit();
-    var dsv = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    dsv.dsv41 = try arch_config.releaseOwn("dsv41");
-    try pinRows(name, want, null, .{ &fx.qwen, &fx.mimo, &fx.glm, &dsv }, run);
-}
-
 test "residentWeightBytes: a boot entry without a disk hint reports its measured shards" {
     const gib: u64 = 1 << 30;
     try testing.expectEqual(64 * gib, residentWeightBytes(null, null, 64 * gib, 48, 2560));
@@ -6275,7 +6236,7 @@ test "the exact load bill admits a MiMo load the flat 7 GiB headroom refused" {
     if (!archBuilt("qwen4") or !archBuilt("glm5")) return error.SkipZigTest;
     if (!archBuilt("mimo2")) return error.SkipZigTest;
     const gib: u64 = 1 << 30;
-    var f = try model_load.LoadBillFixtures.init();
+    var f = try fixtures.LoadBillFixtures.init();
     defer f.deinit();
     const weights = 90 * gib;
     const available = 92 * gib;

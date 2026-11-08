@@ -19,6 +19,7 @@ const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const model_settings = @import("model_settings.zig");
 const metrics = @import("status.zig");
+const arch_chat = @import("arch/chat.zig");
 const arch_serve = @import("arch/serve.zig");
 const arch_flags = @import("arch/flags.zig");
 const update_mod = @import("update.zig");
@@ -882,7 +883,9 @@ fn packRevisionJson(allocator: std.mem.Allocator, config: *const model_mod.Model
 }
 
 test "packRevisionJson is the id, or null for a legacy pack" {
-    const stamped_json = try std.mem.concat(testing.allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\"},", model_mod.QWEN4_YARN[1..] });
+    const fx = arch_chat.Fixtures("qwen4");
+    if (!@hasDecl(fx, "yarn")) return error.SkipZigTest;
+    const stamped_json = try std.mem.concat(testing.allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\"},", fx.yarn[1..] });
     defer testing.allocator.free(stamped_json);
     var cfg = try model_mod.parseConfigFromJson(testing.allocator, stamped_json);
     defer cfg.deinit(testing.allocator);
@@ -1404,7 +1407,7 @@ test "/props stays valid JSON when a settings label carries a quote, a backslash
     try t.expectEqualStrings(hostile, settings.get("vision").?.object.get("source").?.string);
 }
 
-fn testQuantizationModelRow(k: ?u8, expected: []const u8, loaded: bool) !void {
+fn testQuantizationModelRow(model_type: []const u8, k: ?u8, expected: []const u8, loaded: bool) !void {
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{});
@@ -1414,10 +1417,10 @@ fn testQuantizationModelRow(k: ?u8, expected: []const u8, loaded: bool) !void {
     const path = path_buf[0..path_len];
     const expert = if (k) |rate| try std.fmt.allocPrint(t.allocator, ",\"expert_quant\":{{\"format\":\"exl3\",\"codebook\":\"mcg\",\"k\":{d}}}", .{rate}) else try t.allocator.dupe(u8, "");
     defer t.allocator.free(expert);
-    const raw = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"qwen4_exp\",\"quantization\":{{\"bits\":8,\"group_size\":64}}{s}}}", .{expert});
+    const raw = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"{s}\",\"quantization\":{{\"bits\":8,\"group_size\":64}}{s}}}", .{ model_type, expert});
     defer t.allocator.free(raw);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = raw });
-    const cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .quant_bits = 8, .expert_layout = if (k != null) .exl3_k4 else .quantized_split, .expert_quant_rate = .{ .n = if (k) |rate| rate * 16 else 64 } };
+    const cfg = model_mod.ModelConfig{ .model_type = model_type, .quant_bits = 8, .expert_layout = if (k != null) .exl3_k4 else .quantized_split, .expert_quant_rate = .{ .n = if (k) |rate| rate * 16 else 64 } };
     if (loaded) {
         const label = try modelQuantizationLabel(t.allocator, &cfg);
         defer t.allocator.free(label);
@@ -1429,7 +1432,7 @@ fn testQuantizationModelRow(k: ?u8, expected: []const u8, loaded: bool) !void {
         .id = "test-pack",
         .path = path,
         .bytes_on_disk = 0,
-        .arch_hint = "qwen4_exp",
+        .arch_hint = model_type,
         .config = null,
         .weights = null,
         .handle = null,
@@ -1453,18 +1456,18 @@ fn testQuantizationModelRow(k: ?u8, expected: []const u8, loaded: bool) !void {
 }
 
 test "model quantization label K3 loaded and unloaded" {
-    try testQuantizationModelRow(3, "EXL3 3bpw experts, 8-bit dense", true);
-    try testQuantizationModelRow(3, "EXL3 3bpw experts, 8-bit dense", false);
+    try testQuantizationModelRow("qwen4_exp", 3, "EXL3 3bpw experts, 8-bit dense", true);
+    try testQuantizationModelRow("qwen4_exp", 3, "EXL3 3bpw experts, 8-bit dense", false);
 }
 
 test "model quantization label K4 loaded and unloaded" {
-    try testQuantizationModelRow(4, "EXL3 4bpw experts, 8-bit dense", true);
-    try testQuantizationModelRow(4, "EXL3 4bpw experts, 8-bit dense", false);
+    try testQuantizationModelRow("qwen4_exp", 4, "EXL3 4bpw experts, 8-bit dense", true);
+    try testQuantizationModelRow("qwen4_exp", 4, "EXL3 4bpw experts, 8-bit dense", false);
 }
 
 test "model quantization label affine unchanged" {
-    try testQuantizationModelRow(null, "8-bit", true);
-    try testQuantizationModelRow(null, "8-bit", false);
+    try testQuantizationModelRow("qwen4_exp", null, "8-bit", true);
+    try testQuantizationModelRow("qwen4_exp", null, "8-bit", false);
 }
 
 test "models row: meta.pack_update appears only for a pack with a newer published revision" {

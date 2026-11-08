@@ -14,6 +14,7 @@ const std = @import("std");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
 const effort_mod = @import("effort.zig");
+const fx = @import("launch_fixtures_test.zig");
 
 pub const Budget = struct { context: u64, output: u64 };
 
@@ -1251,35 +1252,15 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
     }
 }
 
-fn listedCount(comptime model_type: []const u8) usize {
-    var n: usize = 0;
-    for (effort_mod.effortArms(model_type) orelse &.{}) |a| n += @intFromBool(effort_mod.isListed(a));
-    return n;
-}
-
-/// A served arch's `/v1/models` `reasoning_efforts`, read from the engine's own table.
-fn advertised(comptime model_type: []const u8) [listedCount(model_type)][]const u8 {
-    var words: [listedCount(model_type)][]const u8 = undefined;
-    var i: usize = 0;
-    for (effort_mod.effortArms(model_type) orelse &.{}) |a| if (effort_mod.isListed(a)) {
-        words[i] = @tagName(a.effort);
-        i += 1;
-    };
-    return words;
-}
-const qwen4_efforts = advertised("qwen4_exp");
-const mimo_efforts = advertised("mimo_v2");
-const glm5_efforts = advertised("glm5_next");
-
 test "piEffortFor: every pi level lands on a word the model accepts" {
-    if (qwen4_efforts.len == 0 or mimo_efforts.len == 0 or glm5_efforts.len == 0) return;
+    if (fx.qwen4_efforts.len == 0 or fx.mimo_efforts.len == 0 or fx.glm5_efforts.len == 0) return;
     const want_qwen = [_][]const u8{ "off", "low", "low", "medium", "xhigh", "xhigh" };
     const want_mimo = [_][]const u8{ "off", "on", "on", "on", "on", "on" };
     const want_glm = [_]?[]const u8{ null, "low", "low", "high", "high", "max" };
     for (pi_levels, want_qwen, want_mimo, want_glm) |lvl, q, m, g| {
-        try t.expectEqualStrings(q, piEffortFor(lvl, &qwen4_efforts).?);
-        try t.expectEqualStrings(m, piEffortFor(lvl, &mimo_efforts).?);
-        if (g) |w| try t.expectEqualStrings(w, piEffortFor(lvl, &glm5_efforts).?) else try t.expect(piEffortFor(lvl, &glm5_efforts) == null);
+        try t.expectEqualStrings(q, piEffortFor(lvl, &fx.qwen4_efforts).?);
+        try t.expectEqualStrings(m, piEffortFor(lvl, &fx.mimo_efforts).?);
+        if (g) |w| try t.expectEqualStrings(w, piEffortFor(lvl, &fx.glm5_efforts).?) else try t.expect(piEffortFor(lvl, &fx.glm5_efforts) == null);
     }
     // Rounds up first, then down, and a thinking level never becomes off.
     const only_low = [_][]const u8{ "off", "low" };
@@ -1291,8 +1272,8 @@ test "piEffortFor: every pi level lands on a word the model accepts" {
 test "pi models.json sends each thinking level as reasoning_effort the model accepts" {
     // thinkingFormat "qwen" made pi send only enable_thinking, so low/medium never reached the server.
     const entries = [_]Entry{
-        .{ .id = "qwen", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &qwen4_efforts },
-        .{ .id = "mimo", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &mimo_efforts },
+        .{ .id = "qwen", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &fx.qwen4_efforts },
+        .{ .id = "mimo", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &fx.mimo_efforts },
         .{ .id = "old", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true },
     };
     const json = try piModelsJson(t.allocator, "http://127.0.0.1:12345", &entries);
@@ -1302,7 +1283,7 @@ test "pi models.json sends each thinking level as reasoning_effort the model acc
     const p = parsed.value.object.get("providers").?.object.get("sushi").?.object;
     try t.expect(p.get("compat").?.object.get("thinkingFormat") == null);
     const models = p.get("models").?.array.items;
-    for (models[0..2], [_][]const []const u8{ &qwen4_efforts, &mimo_efforts }) |m, accepted| {
+    for (models[0..2], [_][]const []const u8{ &fx.qwen4_efforts, &fx.mimo_efforts }) |m, accepted| {
         const map = m.object.get("thinkingLevelMap").?.object;
         for (pi_levels) |lvl| try t.expect(listed(accepted, map.get(lvl).?.string));
     }
@@ -1317,8 +1298,8 @@ test "omp models.yml: off rides enable_thinking, every other level an accepted r
     // The shape verified against omp 18.3.0: the qwen dialect sends off as enable_thinking false,
     // `whenThinking` switches a thinking request to reasoning_effort, remapped per model.
     const entries = [_]Entry{
-        .{ .id = "qwen", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &qwen4_efforts },
-        .{ .id = "mimo", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &mimo_efforts },
+        .{ .id = "qwen", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &fx.qwen4_efforts },
+        .{ .id = "mimo", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &fx.mimo_efforts },
         .{ .id = "old", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true },
     };
     const yml = try ompModelsYml(t.allocator, "http://127.0.0.1:12345", &entries);
@@ -1504,7 +1485,7 @@ test "zcode config escapes arbitrary model ids and declares server budgets and w
 }
 
 test "zcode starts MiMo thinking, its own default" {
-    const entries = [_]Entry{.{ .id = "mimo", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &mimo_efforts }};
+    const entries = [_]Entry{.{ .id = "mimo", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &fx.mimo_efforts }};
     const json = try zcodeConfigJson(t.allocator, "http://localhost:12345", entries[0].id, &entries);
     defer t.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
@@ -1526,12 +1507,8 @@ test "zcode exposes only a model's advertised reasoning efforts" {
     try t.expectEqualStrings("max", levels[1].string);
 }
 
-fn glmEntry() Entry {
-    return .{ .id = "GLM-5.3-Flash-Sushi-2.5bpw", .budget = budgetForContext(1048576), .vision = true, .loaded = true, .efforts = &glm5_efforts, .default_effort = "high" };
-}
-
 test "opencode config for GLM: tool calls on, reasoning_content round-trips, variants are only the words GLM accepts" {
-    const entries = [_]Entry{glmEntry()};
+    const entries = [_]Entry{fx.glmEntry()};
     const json = try opencodeJson(t.allocator, "http://127.0.0.1:12345", entries[0].id, &entries);
     defer t.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
@@ -1547,7 +1524,7 @@ test "opencode config for GLM: tool calls on, reasoning_content round-trips, var
     try t.expectEqual(@as(i64, 1048576), m.get("limit").?.object.get("context").?.integer);
     const variants = m.get("variants").?.object;
     try t.expectEqual(@as(usize, 3), variants.count());
-    for (glm5_efforts) |w| try t.expectEqualStrings(w, variants.get(w).?.object.get("reasoningEffort").?.string);
+    for (fx.glm5_efforts) |w| try t.expectEqualStrings(w, variants.get(w).?.object.get("reasoningEffort").?.string);
     // GLM refuses `medium`: a default effort option would fail every request.
     try t.expect(m.get("options") == null);
 }
@@ -1557,7 +1534,7 @@ test "opencode config: a row without efforts is not declared a reasoning model, 
     const a = try opencodeJson(t.allocator, "http://x:1", "old", &plain);
     defer t.allocator.free(a);
     try t.expect(std.mem.indexOf(u8, a, "\"reasoning\"") == null);
-    const mimo = [_]Entry{.{ .id = "mimo", .budget = budgetForContext(65536), .vision = false, .loaded = true, .efforts = &mimo_efforts }};
+    const mimo = [_]Entry{.{ .id = "mimo", .budget = budgetForContext(65536), .vision = false, .loaded = true, .efforts = &fx.mimo_efforts }};
     const b = try opencodeJson(t.allocator, "http://x:1", "mimo", &mimo);
     defer t.allocator.free(b);
     try t.expect(std.mem.indexOf(u8, b, "\"reasoning\": true") != null);
@@ -1659,7 +1636,7 @@ test "grok compaction threshold leaves the compaction reserve free" {
 }
 
 test "grok config.toml for GLM: chat completions at the server, advertised budgets, only accepted efforts" {
-    const entries = [_]Entry{glmEntry()};
+    const entries = [_]Entry{fx.glmEntry()};
     const toml = try grokConfigToml(t.allocator, "http://127.0.0.1:12345", entries[0].id, entries[0].budget, &entries);
     defer t.allocator.free(toml);
     for ([_][]const u8{
@@ -1695,7 +1672,7 @@ test "grok config.toml escapes ids, lists every row, and leaves effort off for a
 }
 
 test "grok script: its own GROK_HOME, the chosen model, extras quoted" {
-    const e = glmEntry();
+    const e = fx.glmEntry();
     const script = try scriptFor(t.allocator, .grok, "http://x:1", e.id, e.budget, null, &.{ "-p", "read README.md" });
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "export GROK_HOME=\"$HOME/.sushi/grok\"\n") != null);
@@ -1792,8 +1769,8 @@ test "config writers escape ids and urls so hostile ones stay data" {
 
 test "opencode --think applies only to selected model and uses SDK spelling" {
     const entries = [_]Entry{
-        .{ .id = "qwen", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &qwen4_efforts },
-        .{ .id = "glm", .budget = FALLBACK_BUDGET, .vision = false, .loaded = false, .efforts = &glm5_efforts },
+        .{ .id = "qwen", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &fx.qwen4_efforts },
+        .{ .id = "glm", .budget = FALLBACK_BUDGET, .vision = false, .loaded = false, .efforts = &fx.glm5_efforts },
     };
     for ([_][]const u8{ "off", "low", "medium", "xhigh" }) |effort| {
         const text = try opencodeJsonWithEffort(t.allocator, "http://localhost:12345", "qwen", &entries, effort);

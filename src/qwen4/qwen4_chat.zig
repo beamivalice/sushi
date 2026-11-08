@@ -3,6 +3,8 @@ const eff = @import("../effort.zig");
 
 pub const model_types = [_][]const u8{"qwen4_exp"};
 
+pub const fixtures = @import("qwen4_fixtures.zig");
+
 /// high and max are folds: the template has no such word, so they are served at xhigh, with a notice.
 pub const effort: eff.Offer = .{ .table = eff.makeSpec("qwen4_exp", "Qwen", &.{ .low, .medium, .xhigh }, &.{}, true, .{ .default = .medium, .rows = .{
     .{ .offered = true },

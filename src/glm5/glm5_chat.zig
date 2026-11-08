@@ -3,6 +3,8 @@ const eff = @import("../effort.zig");
 
 pub const model_types = [_][]const u8{"glm5_next"};
 
+pub const fixtures = @import("glm5_fixtures.zig");
+
 /// The template has no thinking-off switch. medium and xhigh are folds: served at high and max, with a notice.
 pub const effort: eff.Offer = .{ .table = eff.makeSpec("glm5_next", "GLM", &.{ .low, .high, .max }, &.{}, false, .{ .default = .high, .rows = .{
     .{ .offered = false },
