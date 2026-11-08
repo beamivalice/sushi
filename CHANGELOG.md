@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Each served architecture is a self-contained module**: Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4.1-Flash and
+  MiMo-V2.6-Flash each live behind one registry line, so `-Darchs` builds the engine with any of them left out, with
+  every model's output unchanged.
 - **The "architecture not supported" and "file format not supported" load refusals list every architecture this build
   serves**: the first now also names DeepSeek-V4.1-Flash, the second no longer stops at Qwen and MiMo.
 - **The `sushi_exl3` module names no architecture**: its files and public names now say what they do (the old names
