@@ -85,7 +85,7 @@ fn affineBank(ops: *Ops, n: c_int, k: c_int, bits: c_int, seed: u64) !Linear {
     const scales = try ops.slot();
     try mlx.check(mlx.mlx_random_uniform(scales, try ops.scalar(0.001, .bfloat16), try ops.scalar(0.02, .bfloat16), &[_]c_int{ n, @divExact(k, 128) }, 2, .bfloat16, key.*, ops.s));
     const biases = try ops.binary(.mul, scales.*, try ops.scalar(if (bits == 5) -15.5 else -31.5, .bfloat16));
-    const linear: Linear = .{ .w = codes.*, .scales = scales.*, .biases = biases, .input = k, .output = n };
+    const linear = Linear.of(codes.*, scales.*, biases, k, n);
     try evalAll(&.{ linear.w, linear.scales, linear.biases });
     return linear;
 }
@@ -431,16 +431,16 @@ fn runKdaPrefill(run: *report.Run) anyerror!void {
     const arr = glm.syntheticArray;
     const bank = struct {
         fn make(o: *Ops, n: c_int, k: c_int, seed: u64) !Linear {
-            return .{
-                .w = try glm.syntheticArray(o, &.{ n, @divExact(k * 3, 16) }, .uint32, seed, 0, 0),
-                .scales = try glm.syntheticArray(o, &.{ n, @divExact(k, 128) }, .bfloat16, seed + 1, 0.0005, 0.004),
-                .biases = try glm.syntheticArray(o, &.{ n, @divExact(k, 128) }, .bfloat16, seed + 2, -0.12, 0.04),
-                .input = k,
-                .output = n,
-            };
+            return Linear.of(
+                try glm.syntheticArray(o, &.{ n, @divExact(k * 3, 16) }, .uint32, seed, 0, 0),
+                try glm.syntheticArray(o, &.{ n, @divExact(k, 128) }, .bfloat16, seed + 1, 0.0005, 0.004),
+                try glm.syntheticArray(o, &.{ n, @divExact(k, 128) }, .bfloat16, seed + 2, -0.12, 0.04),
+                k,
+                n,
+            );
         }
         fn dense(o: *Ops, n: c_int, k: c_int, seed: u64) !Linear {
-            return .{ .w = try glm.syntheticArray(o, &.{ n, k }, .bfloat16, seed, -0.05, 0.05), .input = k, .output = n };
+            return Linear.of(try glm.syntheticArray(o, &.{ n, k }, .bfloat16, seed, -0.05, 0.05), .{ .ctx = null }, .{ .ctx = null }, k, n);
         }
     };
     var layer = glm.KdaLayer{
