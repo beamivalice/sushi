@@ -94,8 +94,8 @@ a test that skips only inside a helper counts as gpu or cpu.
 | `src/dsv41/` | dsv41 | 23 | 22 | 148 | 40 | 112 | 322 |
 | total | | 270 | 1099 | 655 | 324 | 2343 | 4421 |
 
-Two hermetic guards keep the folders honest. Both are checked by `python3 tests/test_suite_guards.py` (CI runs it) and
-read allowlists that `python3 tests/suite_guards.py --write` regenerates; run it after every landing that moves code,
+A hermetic guard keeps the folders honest. It is checked by `python3 tests/test_suite_guards.py` (CI runs it) and
+reads an allowlist that `python3 tests/suite_guards.py --write` regenerates; run it after every landing that moves code,
 and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone checks.
 
 - **Arch-test guard.** A test whose name mentions a model (`qwen`, `mimo`, `glm`, `dsv41`, `deepseek`) must sit in a
@@ -104,13 +104,8 @@ and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone che
   test moved into its folder, or renamed) only prints a note; `--write` drops it, and a renamed test needs the same
   `--write` to list its new name. To clear a failure, move the test into
   `src/<model>/`, or rename it for the shared code it tests.
-- **Model footprint guard.** Shared sources (`src/` root, `src/exl3`, `src/encoder`) may name a model only at
-  dispatch points. `tests/guards/model-footprint.allow` holds one count per model: its mentions (case-insensitive
-  `qwen`, `mimo`, `glm`, `dsv41`/`deepseek`) in those files, outside comments, test blocks and whole test files. A
-  count above its entry fails, naming the three files with the most; a count below prints the number to lower, and
-  `--write` takes it. The entry keys the model, so code moving between shared files keeps its count. The list only
-  shrinks: SWA, the ring cache and FP8 are engine features and never count, and a feature a model needs is written
-  in a shared file without the model's name.
+- **The seam is enforced by the type system, not a guard.** `tests/test_arch_drop.sh` compiles the engine without each
+  arch, so shared code that imports one fails to build ([engine-arch-seam](engine-arch-seam.md)).
 
 ## Lint
 

@@ -4,7 +4,9 @@ An architecture is a folder, `src/<arch>/`, plus one line in `src/arch/registry.
 the tagged unions that registry builds, so adding an arch is a folder and a line, and dropping one is deleting both.
 
 Every served arch is in `DROPPABLE`: `tests/test_arch_drop.sh` builds the engine without each one and runs the host
-tier, so no shared file imports a folder. An arch added later joins the list in the landing that adds it.
+tier, so no shared file imports a folder.
+The type system enforces the seam, with no source-scan guard: shared code that imports an arch folder does not compile
+without it. An arch added later joins the list in the landing that adds it.
 
 ## The rules
 
