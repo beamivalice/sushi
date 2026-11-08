@@ -91,6 +91,11 @@ pub const POINT_GRID: u32 = 8192;
 /// The tier's byte budget, not this count, bounds what a long conversation keeps (`DiskTier.pointBudget`).
 pub const SSM_DISK_MAX_PER_ENTRY: usize = 160;
 
+/// Rows per whole segment of a growing sidecar: the MTP history's rows go to `p<j>.safetensors` files of this many,
+/// written once and kept while their bytes hold, and the sidecar keeps the rows past the last one.
+pub const SIDE_SEG_SPAN: u32 = 8192;
+pub const SideSeg = disk_format.SideSeg;
+
 /// The cap every arch outside the long-context gate keeps.
 pub const SSM_DISK_MAX_PER_ENTRY_LEGACY: usize = 8;
 
@@ -284,6 +289,18 @@ fn safetensorsDtypeName(d: mlx.mlx_dtype) ?[]const u8 {
 }
 
 /// Raw contiguous bytes of an evaluated, contiguous array; null for a dtype with no accessor.
+/// Rows `[r0, r1)` of `src` along `axis`.
+fn sliceAxis(out: *mlx.mlx_array, src: mlx.mlx_array, axis: usize, r0: c_int, r1: c_int, s: mlx.mlx_stream) !void {
+    const shape = mlx.getShape(src);
+    var st: [8]c_int = @splat(0);
+    var sp: [8]c_int = undefined;
+    const sd: [8]c_int = @splat(1);
+    for (shape, 0..) |d, i| sp[i] = d;
+    st[axis] = r0;
+    sp[axis] = r1;
+    try mlx.check(mlx.mlx_slice(out, src, &st, shape.len, &sp, shape.len, &sd, shape.len, s));
+}
+
 fn rawBytes(a: mlx.mlx_array) ?[*]const u8 {
     return switch (mlx.mlx_array_dtype(a)) {
         .bool_ => @ptrCast(mlx.mlx_array_data_bool(a) orelse return null),
@@ -325,6 +342,8 @@ pub const DiskTier = struct {
     ssm_budget_drops: usize = 0,
     /// Bytes of restore-point and row-segment files staged so far, for the write-through log line.
     point_bytes_written: u64 = 0,
+    /// Rows per whole segment of a growing sidecar (`SIDE_SEG_SPAN`).
+    seg_span: u32 = SIDE_SEG_SPAN,
     /// What the last `persisted` line reports: every file the commit wrote but the manifest and the token record.
     last_persist_bytes: u64 = 0,
     /// Rows below this position are what the committing request took from a stored entry (a restore or a rollback);
@@ -642,6 +661,7 @@ pub const DiskTier = struct {
         self.allocator.free(e.ssm_bytes);
         self.allocator.free(e.rings);
         self.allocator.free(e.grown);
+        self.allocator.free(e.spec_segs);
     }
 
     /// Splits the restore points this tier writes from now on (`GrownSpec`); `divs` is copied.
@@ -1870,7 +1890,7 @@ pub const DiskTier = struct {
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
         // turn diverges inside the generated span and used to rewrite every chunk. SSD-first only.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
+        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media, null) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -1985,15 +2005,28 @@ pub const DiskTier = struct {
         // tier's supersede rule), by the piece that completes its rows; an
         // earlier piece keeps what the entry had. Best-effort DRAFT-side
         // state: a failed write costs the entry its spec, never the entry.
+        // An extended entry may hold fewer segments than the record it grew from: a prefill write-through stores
+        // none. A segment links only on an equal hash, so any entry sharing the prefix may lend.
+        const side_donor = donor orelse if (extend_idx) |x| self.chunkShareDonor(tokens, kv_target, has_tools, config, media, x) else null;
+        const spec_prev: SegPrev = .{
+            .id = id,
+            .own = if (extend_idx) |i| self.entries.items[i].spec_segs else &.{},
+            .own_inherited = if (extend_idx) |i| self.entries.items[i].spec_segs_inherited else 0,
+            .donor_id = if (side_donor) |d| d.id else null,
+            .donor = if (side_donor) |d| self.entries.items[d.idx].spec_segs else &.{},
+        };
         const spec_res: SpecSidecarResult = if (!chunk_complete) (if (extend_idx) |i| .{
             .bytes = self.entries.items[i].spec_bytes,
             .dflash = self.entries.items[i].spec_dflash,
             .mtp = self.entries.items[i].spec_mtp,
-        } else .{}) else self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s) catch |err| blk: {
+            .segs = try self.allocator.dupe(SideSeg, self.entries.items[i].spec_segs),
+            .segs_inherited = self.entries.items[i].spec_segs_inherited,
+        } else .{}) else self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s, spec_prev) catch |err| blk: {
             log.warn("  [disk-cache] spec persist failed: {s} — entry keeps no spec\n", .{@errorName(err)});
             break :blk .{};
         };
-        if (chunk_complete) written_bytes += spec_res.bytes;
+        errdefer self.allocator.free(spec_res.segs);
+        written_bytes += spec_res.written;
 
         // Token record — the LONGER of the existing record and this commit's
         // tokens (a resumed incremental flush must not shrink the record its
@@ -2023,6 +2056,7 @@ pub const DiskTier = struct {
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
         var non_chunk: u64 = @as(u64, record.len) * 4 + spec_res.bytes;
+        for (spec_res.segs[spec_res.segs_inherited..]) |sg| non_chunk += sg.bytes;
         for (ssm_res.bytes) |b| non_chunk += b;
         for (ssm_res.grown[inherited_grown..]) |b| non_chunk += b;
         for (rings) |r| non_chunk += r.bytes;
@@ -2047,6 +2081,8 @@ pub const DiskTier = struct {
             .spec_bytes = spec_res.bytes,
             .spec_dflash = spec_res.dflash,
             .spec_mtp = spec_res.mtp,
+            .spec_segs = spec_res.segs,
+            .spec_segs_inherited = spec_res.segs_inherited,
             .qsa_history_bytes = if (qsa_res.inherited) inherited_qsa_bytes else qsa_res.bytes,
             .qsa_history_rows = if (qsa_res.inherited) inherited_qsa_rows else qsa_res.rows,
             .inherited_qsa = qsa_res.inherited,
@@ -2079,6 +2115,7 @@ pub const DiskTier = struct {
             self.allocator.free(e.ssm_bytes);
             self.allocator.free(e.grown);
             self.allocator.free(e.rings);
+            self.allocator.free(e.spec_segs);
             e.* = new_entry;
         } else {
             // meta.json is the commit point: written last, atomically.
@@ -2185,14 +2222,19 @@ pub const DiskTier = struct {
         errdefer self.allocator.free(rings);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.qsa_history_bytes, e.kv_len, s);
 
+        var spec_rewritten = false;
         if (specWorkPending(e, dflash_snap, mtp_snap)) {
-            const spec_res: SpecSidecarResult = self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s) catch |err| blk: {
+            const prev: SegPrev = .{ .id = e.id, .own = e.spec_segs, .own_inherited = e.spec_segs_inherited };
+            if (self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s, prev)) |spec_res| {
+                e.spec_bytes = spec_res.bytes;
+                e.spec_dflash = spec_res.dflash;
+                e.spec_mtp = spec_res.mtp;
+                e.spec_segs = spec_res.segs;
+                e.spec_segs_inherited = spec_res.segs_inherited;
+                spec_rewritten = true;
+            } else |err| {
                 log.warn("  [disk-cache] spec persist failed: {s} — entry keeps its old spec\n", .{@errorName(err)});
-                break :blk .{ .bytes = e.spec_bytes, .dflash = e.spec_dflash, .mtp = e.spec_mtp };
-            };
-            e.spec_bytes = spec_res.bytes;
-            e.spec_dflash = spec_res.dflash;
-            e.spec_mtp = spec_res.mtp;
+            }
         }
 
         e.ssm_positions = ssm_res.positions;
@@ -2216,6 +2258,7 @@ pub const DiskTier = struct {
         self.allocator.free(live.ssm_bytes);
         self.allocator.free(live.grown);
         self.allocator.free(live.rings);
+        if (spec_rewritten) self.allocator.free(live.spec_segs);
         live.* = updated;
         self.total_bytes = clampAdd(self.total_bytes, delta);
         self.last_store_id = updated.id;
@@ -2229,6 +2272,10 @@ pub const DiskTier = struct {
         bytes: u64 = 0,
         dflash: ?SpecMeta = null,
         mtp: ?SpecMeta = null,
+        /// The MTP history's whole segments (owned) and how many lead as links; `written` is what this call wrote.
+        segs: []SideSeg = &.{},
+        segs_inherited: u32 = 0,
+        written: u64 = 0,
     };
 
     /// Does this commit carry a spec payload the entry lacks? Mirrors
@@ -2250,7 +2297,7 @@ pub const DiskTier = struct {
     /// snapshots. Tensors are sliced to `step` positions (the snapshot buffer
     /// can hold a stale draft tail past it) and keyed `d{layer}.*` /
     /// `m{layer}.*` with the trunk chunks' kind suffixes.
-    fn writeSpecSidecar(self: *DiskTier, dir_abs: []const u8, dflash: ?SpecCommit, mtp: ?SpecCommit, s: mlx.mlx_stream) !SpecSidecarResult {
+    fn writeSpecSidecar(self: *DiskTier, dir_abs: []const u8, dflash: ?SpecCommit, mtp: ?SpecCommit, s: mlx.mlx_stream, prev: SegPrev) !SpecSidecarResult {
         // Best-effort by contract: the callers log the failure and keep going. The
         // latch a raise plants is process-wide, so a write we already reported must
         // drop what it set — or the next decode tick fails an unrelated request.
@@ -2262,13 +2309,20 @@ pub const DiskTier = struct {
             // A staged copy of the old sidecar must not land after the delete.
             if (self.writer) |w| w.fence(path);
             std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
-            return .{};
+            // The entry is spec-less, as before; its segments stay spare for the next commit's to keep.
+            return .{ .segs = try self.allocator.dupe(SideSeg, prev.own), .segs_inherited = prev.own_inherited };
         }
         var list = std.ArrayList(NamedTensor).empty;
         defer self.freeNamed(&list);
         var res: SpecSidecarResult = .{};
+        errdefer self.allocator.free(res.segs);
         if (dflash) |dc| res.dflash = try self.appendSpecTensors(&list, "d", dc, s);
         if (mtp) |mc| res.mtp = try self.appendSpecTensors(&list, "m", mc, s);
+        const ratio: u32 = if (res.mtp) |m| if (m.head) |h| @intCast(@max(h.ratio, 1)) else 1 else 1;
+        const seg = try self.writeSegments(dir_abs, 'p', &list, if (res.mtp) |m| m.step else 0, specGrowth, ratio, prev, .spec, s);
+        res.segs = seg.segs;
+        res.segs_inherited = seg.inherited;
+        res.written = seg.written;
         // The file is replaced before the manifest commits; equal-shaped windows share a byte
         // size, so the load re-checks base/step from here.
         var stamp_buf: [2][48]u8 = undefined;
@@ -2281,7 +2335,149 @@ pub const DiskTier = struct {
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors", .{dir_abs});
         res.bytes = try self.saveNamed(path, list.items, meta[0..n_meta], .spec, s);
+        res.written += res.bytes;
         return res;
+    }
+
+    /// The segments a commit may keep or link instead of writing: the entry's own and a donor's.
+    pub const SegPrev = struct {
+        id: u64 = 0,
+        own: []const SideSeg = &.{},
+        own_inherited: u32 = 0,
+        donor_id: ?u64 = null,
+        donor: []const SideSeg = &.{},
+    };
+
+    const SegResult = struct { segs: []SideSeg = &.{}, inherited: u32 = 0, written: u64 = 0 };
+
+    /// How a growing sidecar tensor grows: along `axis`, one row per `div` history rows.
+    const Growth = struct { axis: usize, div: u32 };
+
+    /// The MTP history's KV rows and the head's pooled bank grow; the head's ring and leftovers do not.
+    fn specGrowth(key: []const u8, ratio: u32) ?Growth {
+        if (std.mem.eql(u8, key, "mh.pooled")) return .{ .axis = 1, .div = ratio };
+        if (key.len < 2 or key[0] != 'm' or !std.ascii.isDigit(key[1])) return null;
+        const kind = key[(std.mem.lastIndexOfScalar(u8, key, '.') orelse return null) + 1 ..];
+        inline for (.{ "k", "v", "ks", "kb", "vs", "vb" }) |k| if (std.mem.eql(u8, kind, k)) return .{ .axis = 2, .div = 1 };
+        return null;
+    }
+
+    /// Move the whole `seg_span`-row segments of `list`'s growing tensors into `{letter}{j}.safetensors`, leaving the
+    /// rows past them (at least one) in `list`. A segment whose file image the entry (`prev.own`) or, in a leading run,
+    /// the donor already holds is kept or hard-linked, so an extension writes only its new segments.
+    fn writeSegments(
+        self: *DiskTier,
+        dir_abs: []const u8,
+        letter: u8,
+        list: *std.ArrayList(NamedTensor),
+        rows: u32,
+        growthOf: *const fn ([]const u8, u32) ?Growth,
+        ratio: u32,
+        prev: SegPrev,
+        kind: write_stats.Kind,
+        s: mlx.mlx_stream,
+    ) !SegResult {
+        const span = self.seg_span;
+        var n: u32 = if (span > 0 and rows > 0) (rows - 1) / span else 0;
+        for (list.items) |*t| {
+            const g = growthOf(t.key, ratio) orelse continue;
+            if (span % g.div != 0 or mlx.getShape(t.arr)[g.axis] < @as(c_int, @intCast(@as(u64, n) * span / g.div))) n = 0;
+        }
+        var segs = std.ArrayList(SideSeg).empty;
+        errdefer segs.deinit(self.allocator);
+        var res: SegResult = .{};
+        var leading = true;
+        var j: u32 = 0;
+        while (j < n) : (j += 1) {
+            var part = std.ArrayList(NamedTensor).empty;
+            defer self.freeNamed(&part);
+            for (list.items) |*t| {
+                const g = growthOf(t.key, ratio) orelse continue;
+                const r0: c_int = @intCast(@as(u64, j) * span / g.div);
+                const r1: c_int = @intCast(@as(u64, j + 1) * span / g.div);
+                const key = try self.allocator.dupe(u8, t.key);
+                errdefer self.allocator.free(key);
+                var arr = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(arr);
+                try sliceAxis(&arr, t.arr, g.axis, r0, r1, s);
+                try part.append(self.allocator, .{ .key = key, .arr = arr });
+            }
+            try materializeContiguous(part.items, s);
+            const hash = try self.imageHash(part.items);
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/{c}{d:0>5}.safetensors", .{ dir_abs, letter, j });
+            var path_owned: ?[]u8 = path;
+            defer if (path_owned) |pp| self.allocator.free(pp);
+            if (j < prev.own.len and prev.own[j].hash == hash and fileSize(self.io, path) == prev.own[j].bytes) {
+                try segs.append(self.allocator, prev.own[j]);
+                if (leading and j < prev.own_inherited) res.inherited += 1 else leading = false;
+                continue;
+            }
+            if (leading and prev.donor_id != null and j < prev.donor.len and prev.donor[j].hash == hash and self.linkSeg(prev.donor_id.?, prev.id, letter, j)) {
+                try segs.append(self.allocator, prev.donor[j]);
+                res.inherited += 1;
+                continue;
+            }
+            leading = false;
+            // The synchronous arm writes in place: a link must go first, or the donor's file changes.
+            if (self.writer == null) std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+            path_owned = null;
+            const sz = try self.saveNamed(path, part.items, &.{}, kind, s);
+            res.written += sz;
+            try segs.append(self.allocator, .{ .bytes = sz, .hash = hash });
+        }
+        if (prev.own.len > n) self.deleteSegFiles(dir_abs, letter, n, prev.own.len);
+        if (n > 0) {
+            for (list.items) |*t| {
+                const g = growthOf(t.key, ratio) orelse continue;
+                var tail = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(tail);
+                try sliceAxis(&tail, t.arr, g.axis, @intCast(@as(u64, n) * span / g.div), mlx.getShape(t.arr)[g.axis], s);
+                _ = mlx.mlx_array_free(t.arr);
+                t.arr = tail;
+            }
+        }
+        res.segs = try segs.toOwnedSlice(self.allocator);
+        return res;
+    }
+
+    /// Wyhash of the file image `tensors` would be saved as (no metadata); `tensors` must be materialized.
+    fn imageHash(self: *DiskTier, tensors: []const NamedTensor) !u64 {
+        const head = try self.encodeHeader(tensors, &.{});
+        defer self.allocator.free(head);
+        var h = std.hash.Wyhash.init(0);
+        h.update(head);
+        for (tensors) |*t| {
+            const nb: usize = @intCast(nbytesOf(t.arr));
+            if (nb == 0) continue;
+            const p = rawBytes(t.arr) orelse return error.DiskCacheUnreadable;
+            h.update(p[0..nb]);
+        }
+        return h.final();
+    }
+
+    /// Hard-link segment `j` of entry `from` into entry `to`; false leaves `to` to write it.
+    fn linkSeg(self: *DiskTier, from: u64, to: u64, letter: u8, j: u32) bool {
+        var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{}) catch return false;
+        defer root_dir.close(self.io);
+        var ob: [64]u8 = undefined;
+        var nb: [64]u8 = undefined;
+        const old_sub = std.fmt.bufPrint(&ob, "e{d}/{c}{d:0>5}.safetensors", .{ from, letter, j }) catch return false;
+        const new_sub = std.fmt.bufPrint(&nb, "e{d}/{c}{d:0>5}.safetensors", .{ to, letter, j }) catch return false;
+        var ab: [std.fs.max_path_bytes]u8 = undefined;
+        const old_abs = std.fmt.bufPrint(&ab, "{s}/{s}", .{ self.root, old_sub }) catch return false;
+        if (self.writer) |w| if (w.isPending(old_abs)) return false;
+        root_dir.deleteFile(self.io, new_sub) catch {};
+        std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch return false;
+        return true;
+    }
+
+    fn deleteSegFiles(self: *DiskTier, dir_abs: []const u8, letter: u8, from: usize, to: usize) void {
+        for (from..to) |j| {
+            const path = std.fmt.allocPrint(self.allocator, "{s}/{c}{d:0>5}.safetensors", .{ dir_abs, letter, j }) catch continue;
+            defer self.allocator.free(path);
+            if (self.writer) |w| w.fence(path);
+            std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+        }
     }
 
     /// False for a sidecar whose stamp is absent (written before stamps) or names other rows.
@@ -2421,6 +2617,15 @@ pub const DiskTier = struct {
         var meta_map = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta_map);
         mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu)) catch return null;
+        if (which == .mtp and e.spec_segs.len > 0) {
+            const ratio: u32 = if (meta.head) |h| @intCast(@max(h.ratio, 1)) else 1;
+            const joined = self.joinSegments(tensor_map, e.id, 'p', e.spec_segs.len, specGrowth, ratio, cpu) orelse {
+                log.info("  [disk-cache] spec sidecar declined (a segment is unreadable)\n", .{});
+                return null;
+            };
+            _ = mlx.mlx_map_string_to_array_free(tensor_map);
+            tensor_map = joined;
+        }
 
         const prefix: []const u8 = switch (which) {
             .dflash => "d",
@@ -2567,6 +2772,80 @@ pub const DiskTier = struct {
     }
 
     /// One optional non-layer tensor out of the loaded sidecar map (+1 handle), or null.
+    /// `tail`'s tensors with each growing one's `n` segments of entry `id` put back in front of its rows, as a new map
+    /// the caller owns. Null when a segment is unreadable or lacks a tensor another holds.
+    fn joinSegments(
+        self: *DiskTier,
+        tail: mlx.mlx_map_string_to_array,
+        id: u64,
+        letter: u8,
+        n: usize,
+        growthOf: *const fn ([]const u8, u32) ?Growth,
+        ratio: u32,
+        cpu: mlx.mlx_stream,
+    ) ?mlx.mlx_map_string_to_array {
+        const segs = self.allocator.alloc(mlx.mlx_map_string_to_array, n) catch return null;
+        defer self.allocator.free(segs);
+        var loaded: usize = 0;
+        defer for (segs[0..loaded]) |m| {
+            _ = mlx.mlx_map_string_to_array_free(m);
+        };
+        for (segs, 0..) |*m, j| {
+            const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/{c}{d:0>5}.safetensors\x00", .{ self.root, id, letter, j }) catch return null;
+            defer self.allocator.free(path);
+            m.* = mlx.mlx_map_string_to_array_new();
+            loaded += 1;
+            var mm = mlx.mlx_map_string_to_string_new();
+            defer _ = mlx.mlx_map_string_to_string_free(mm);
+            mlx.check(mlx.mlx_load_safetensors(m, &mm, @ptrCast(path.ptr), cpu)) catch return null;
+        }
+        const out = mlx.mlx_map_string_to_array_new();
+        var ok = false;
+        defer if (!ok) {
+            _ = mlx.mlx_map_string_to_array_free(out);
+        };
+        {
+            const it = mlx.mlx_map_string_to_array_iterator_new(tail);
+            defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
+            var key: ?[*:0]const u8 = null;
+            var val = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(val);
+            while (mlx.mlx_map_string_to_array_iterator_next(&key, &val, it) == 0) {
+                const k = key orelse break;
+                if (growthOf(std.mem.span(k), ratio) != null) continue;
+                if (mlx.mlx_map_string_to_array_insert(out, k, val) != 0) return null;
+            }
+        }
+        if (n > 0) {
+            const it = mlx.mlx_map_string_to_array_iterator_new(segs[0]);
+            defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
+            var key: ?[*:0]const u8 = null;
+            var val = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(val);
+            while (mlx.mlx_map_string_to_array_iterator_next(&key, &val, it) == 0) {
+                const k = key orelse break;
+                const g = growthOf(std.mem.span(k), ratio) orelse continue;
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                for (segs) |m| {
+                    var part = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(part);
+                    if (mlx.mlx_map_string_to_array_get(&part, m, k) != 0) return null;
+                    _ = mlx.mlx_vector_array_append_value(vec, part);
+                }
+                var rest = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(rest);
+                if (mlx.mlx_map_string_to_array_get(&rest, tail, k) == 0) _ = mlx.mlx_vector_array_append_value(vec, rest);
+                var whole = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(whole);
+                mlx.check(mlx.mlx_concatenate_axis(&whole, vec, @intCast(g.axis), cpu)) catch return null;
+                if (mlx.mlx_map_string_to_array_insert(out, k, whole) != 0) return null;
+            }
+        }
+        ok = true;
+        return out;
+    }
+
     fn getSpecArray(map: mlx.mlx_map_string_to_array, allocator: std.mem.Allocator, prefix: []const u8, kind: []const u8) ?mlx.mlx_array {
         const key = std.fmt.allocPrint(allocator, "{s}{s}\x00", .{ prefix, kind }) catch return null;
         defer allocator.free(key);
@@ -3455,6 +3734,18 @@ pub const DiskTier = struct {
         defer self.allocator.free(dir_abs);
         if (self.writer) |w| w.fence(dir_abs);
         var freed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
+        for (e.spec_segs, 0..) |sg, j| {
+            const sp = std.fmt.allocPrint(self.allocator, "{s}p{d:0>5}.safetensors", .{ dir_abs, j }) catch {
+                freed += sg.bytes;
+                continue;
+            };
+            defer self.allocator.free(sp);
+            if (statFile(self.io, sp)) |st| {
+                if (st.nlink <= 1) freed += st.size;
+            } else if (j >= e.spec_segs_inherited) {
+                freed += sg.bytes;
+            }
+        }
         for (e.ssm_bytes) |b| freed += b;
         for (e.grown, 0..) |gb, i| {
             const gp = std.fmt.allocPrint(self.allocator, "{s}g{d:0>5}.safetensors", .{ dir_abs, i + 1 }) catch {
@@ -3499,11 +3790,11 @@ pub const DiskTier = struct {
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the prefix whose rows are the
     /// commit's (`commitShares`). Null on the synchronous legacy arm.
-    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: CommitMedia) ?ChunkDonor {
+    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: CommitMedia, skip: ?usize) ?ChunkDonor {
         if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
-            if (e.poisoned) continue; // never inherit from a dead entry
+            if (e.poisoned or i == skip) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
             const common: u32 = @min(@as(u32, @intCast(commonPrefixLen(e.tokens, tokens))), commitShares(e, media));
@@ -3777,6 +4068,14 @@ pub const DiskTier = struct {
     /// first entry to see an inode pays for it.
     fn billChunksOnce(self: *DiskTier, e: *IndexEntry, seen: *std.AutoHashMap(u64, void)) void {
         var billed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
+        for (e.spec_segs, 0..) |sg, j| {
+            const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/p{d:0>5}.safetensors", .{ self.root, e.id, j }) catch {
+                billed += sg.bytes;
+                continue;
+            };
+            defer self.allocator.free(sp);
+            billed += billSharedFile(self.io, sp, sg.bytes, seen);
+        }
         for (e.ssm_bytes) |b| billed += b;
         for (e.grown, 0..) |gb, i| {
             const gp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/g{d:0>5}.safetensors", .{ self.root, e.id, i + 1 }) catch {
@@ -4060,20 +4359,55 @@ pub const DiskTier = struct {
         var spec_bytes: u64 = 0;
         var spec_dflash: ?SpecMeta = null;
         var spec_mtp: ?SpecMeta = null;
+        var spec_segs: []SideSeg = &.{};
+        var spec_segs_inherited: u32 = 0;
         if (man.spec) |sc| parse_spec: {
             const rec_bytes = sc.bytes;
-            const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/spec.safetensors", .{ self.root, id }) catch break :parse_spec;
-            defer self.allocator.free(sp);
-            const have = fileSize(self.io, sp) orelse break :parse_spec;
-            if (have != rec_bytes) {
-                log.info("  [disk-cache] e{d}: spec sidecar size mismatch — dropping the spec\n", .{id});
+            // Spare segments a spec-less commit kept: no sidecar, no spec.
+            const spare = rec_bytes == 0;
+            if (!spare) {
+                const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/spec.safetensors", .{ self.root, id }) catch break :parse_spec;
+                defer self.allocator.free(sp);
+                const have = fileSize(self.io, sp) orelse break :parse_spec;
+                if (have != rec_bytes) {
+                    log.info("  [disk-cache] e{d}: spec sidecar size mismatch — dropping the spec\n", .{id});
+                    break :parse_spec;
+                }
+            }
+            // Every listed segment must be whole, or the history is not.
+            var seg_total: u64 = 0;
+            if (sc.segs) |sm| {
+                const list = self.allocator.alloc(SideSeg, sm.files.len) catch break :parse_spec;
+                for (sm.files, list, 0..) |fv, *dst, j| {
+                    const sg = disk_format.segItem(fv) orelse break;
+                    const pp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/p{d:0>5}.safetensors", .{ self.root, id, j }) catch break;
+                    defer self.allocator.free(pp);
+                    if (fileSize(self.io, pp) != sg.bytes) break;
+                    dst.* = sg;
+                    if (j >= sm.inherited) seg_total += sg.bytes;
+                } else {
+                    spec_segs = list;
+                    spec_segs_inherited = @min(sm.inherited, @as(u32, @intCast(list.len)));
+                }
+                if (spec_segs.len != sm.files.len) {
+                    self.allocator.free(list);
+                    log.info("  [disk-cache] e{d}: spec segment missing or short — dropping the spec\n", .{id});
+                    break :parse_spec;
+                }
+            }
+            if (spare) {
+                total += seg_total;
                 break :parse_spec;
             }
             spec_dflash = sc.dflash;
             spec_mtp = sc.mtp;
-            if (spec_dflash == null and spec_mtp == null) break :parse_spec;
+            if (spec_dflash == null and spec_mtp == null) {
+                self.allocator.free(spec_segs);
+                spec_segs = &.{};
+                break :parse_spec;
+            }
             spec_bytes = rec_bytes;
-            total += rec_bytes;
+            total += rec_bytes + seg_total;
         }
 
         const vision_key: u64 = if (man.media) |md| md.key else 0;
@@ -4085,6 +4419,7 @@ pub const DiskTier = struct {
             self.allocator.free(ssm_positions);
             self.allocator.free(ssm_bytes);
             self.allocator.free(rings);
+            self.allocator.free(spec_segs);
             return null;
         };
         for (grown, grown_recorded[0..grown_valid]) |*g, rec| g.* = disk_format.valueU64(rec).?;
@@ -4109,6 +4444,8 @@ pub const DiskTier = struct {
                 .spec_bytes = spec_bytes,
                 .spec_dflash = spec_dflash,
                 .spec_mtp = spec_mtp,
+                .spec_segs = spec_segs,
+                .spec_segs_inherited = spec_segs_inherited,
                 .qsa_history_bytes = qsa_history_bytes,
                 .qsa_history_rows = qsa_history_rows,
                 .inherited_qsa = inherited_qsa,
@@ -4141,6 +4478,7 @@ fn billSharedFile(io: std.Io, path: []const u8, missing: u64, seen: *std.AutoHas
 /// Bytes of an entry's files that are never shared: tokens.bin, the SSM checkpoints and the spec sidecar.
 fn nonChunkBytes(e: *const IndexEntry) u64 {
     var n: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
+    for (e.spec_segs[@min(e.spec_segs_inherited, e.spec_segs.len)..]) |sg| n += sg.bytes;
     for (e.ssm_bytes) |b| n += b;
     for (e.grown[@min(e.inherited_grown, e.grown.len)..]) |b| n += b;
     for (e.rings) |r| n += r.bytes;
@@ -5804,8 +6142,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     try testing.expect(tier2.loadSpecSnap(m.idx, .dflash, 2, kv_quant.KVQuantConfig.affine(8)) == null);
     try testing.expect(tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.affine(8)) == null);
 
-    // A commit WITHOUT spec payloads carries none (and, per the supersede
-    // rule, would delete a stale sidecar on its own entry).
+    // A new entry committed WITHOUT spec payloads carries none.
     var tokens_b: [600]u32 = undefined;
     for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
     _ = try tier2.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, null, s);
@@ -5849,6 +6186,187 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     try testing.expectEqual(@as(u32, 600), restored);
 }
 
+test "DiskTier: an extended spec sidecar writes only its new segments and the tail, and restores whole after a restart" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-segs", 0, 128);
+    tier.seg_span = 128;
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+    const first = wroteKind(&tier, .spec);
+    try testing.expectEqual(@as(usize, 4), tier.entries.items[0].spec_segs.len);
+
+    try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
+    try fillCache(&mtp, s, 1, 200, 8, 9.5 + 590 * 8, .float32);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(usize, 6), e.spec_segs.len);
+    // Segments 0..3 are kept: the extension wrote segments 4 and 5 and the tail file.
+    try testing.expectEqual(e.spec_segs[4].bytes + e.spec_segs[5].bytes + e.spec_bytes, wroteKind(&tier, .spec) - first);
+
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec-segs", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse return error.TestExpectedSpecSnap;
+    try testing.expectEqual(@as(usize, 790), loaded.snap.step);
+    var mtp2 = try KVCache.init(testing.allocator, 1);
+    defer mtp2.deinit();
+    try mtp2.restore(&loaded.snap);
+    loaded.snap.deinit();
+    inline for (.{ 0, 127, 128, 300, 640, 789 }) |pos| {
+        try testing.expectEqual(try cacheValueAt(&mtp, 0, pos, 3, s), try cacheValueAt(&mtp2, 0, pos, 3, s));
+        try testing.expectEqual(try cacheBufValueAt(&mtp, 0, pos, 5, s, true), try cacheBufValueAt(&mtp2, 0, pos, 5, s, true));
+    }
+}
+
+test "DiskTier: a diverging entry links the donor's spec segments, bills them once, and restores them after the donor goes" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-heir", 0, 128);
+    defer tier.deinit();
+    tier.seg_span = 128;
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    const spec: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    const toks = chunkShareTokens(520);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &toks.a, false, null, null, spec, s);
+    const donor_total = tier.total_bytes;
+    const before = wroteKind(&tier, .spec);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &toks.b, false, null, null, spec, s);
+    const heir = &tier.entries.items[1];
+    try testing.expectEqual(@as(u32, 4), heir.spec_segs_inherited);
+    try testing.expectEqual(heir.spec_bytes, wroteKind(&tier, .spec) - before);
+    try testing.expectEqual(donor_total + heir.bytes, tier.total_bytes);
+    tier.removeAt(0);
+    var loaded = tier.loadSpecSnap(0, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse return error.TestExpectedSpecSnap;
+    var mtp2 = try KVCache.init(testing.allocator, 1);
+    defer mtp2.deinit();
+    try mtp2.restore(&loaded.snap);
+    loaded.snap.deinit();
+    inline for (.{ 0, 300, 589 }) |pos| try testing.expectEqual(try cacheValueAt(&mtp, 0, pos, 3, s), try cacheValueAt(&mtp2, 0, pos, 3, s));
+}
+
+test "DiskTier: a prefill write-through without spec leaves the entry spec-less and its segments spare, so the turn's end writes only the new ones" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-keep", 0, 128);
+    defer tier.deinit();
+    tier.seg_span = 128;
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+    try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
+    _ = try tier.appendCommitWithSpec(cache.entries, 700, cache.config, tokens[0..700], false, null, null, null, s);
+    // A restore sees what it always saw after such a commit: no spec. The bill is the bytes on disk.
+    try testing.expectEqual(@as(usize, 4), tier.entries.items[0].spec_segs.len);
+    try testing.expect(tier.loadSpecSnap(0, .mtp, 1, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expectEqual(try uniqueDirBytes(io, &tier), tier.total_bytes);
+    const before = wroteKind(&tier, .spec);
+    try fillCache(&mtp, s, 1, 200, 8, 9.5 + 590 * 8, .float32);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(usize, 6), e.spec_segs.len);
+    try testing.expectEqual(e.spec_segs[4].bytes + e.spec_segs[5].bytes + e.spec_bytes, wroteKind(&tier, .spec) - before);
+}
+
+test "DiskTier: spare spec segments survive a restart, billed, with the entry still spec-less" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 700, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    var tokens: [700]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var total: u64 = 0;
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-spare", 0, 128);
+        defer tier.deinit();
+        tier.seg_span = 128;
+        _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, null, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+        _ = try tier.appendCommitWithSpec(cache.entries, 700, cache.config, &tokens, false, null, null, null, s);
+        total = tier.total_bytes;
+    }
+    var scanned = try DiskTier.init(testing.allocator, io, base, "fp-spec-spare", 0, 128);
+    defer scanned.deinit();
+    try testing.expectEqual(@as(usize, 1), scanned.entryCount());
+    try testing.expectEqual(@as(usize, 4), scanned.entries.items[0].spec_segs.len);
+    try testing.expect(scanned.loadSpecSnap(0, .mtp, 1, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expectEqual(total, scanned.total_bytes);
+    try testing.expectEqual(try uniqueDirBytes(io, &scanned), scanned.total_bytes);
+}
+
+test "DiskTier: an entry the prefill wrote without spec links the spec segments of the record it grew from when it completes" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-wt", 0, 128);
+    defer tier.deinit();
+    tier.seg_span = 128;
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    const spec: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    const toks = chunkShareTokens(520);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &toks.a, false, null, null, spec, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, 560, cache.config, toks.b[0..560], false, null, null, null, s);
+    try testing.expectEqual(@as(usize, 0), tier.entries.items[1].spec_segs.len);
+    const heir_id = tier.entries.items[1].id;
+    const before = wroteKind(&tier, .spec);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &toks.b, false, null, null, spec, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const heir = &tier.entries.items[1];
+    try testing.expectEqual(heir_id, heir.id);
+    try testing.expectEqual(@as(u32, 4), heir.spec_segs_inherited);
+    try testing.expectEqual(heir.spec_bytes, wroteKind(&tier, .spec) - before);
+}
+
 test "DiskTier: a spec sidecar replaced before its manifest commits is declined, never relabelled" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -5887,7 +6405,7 @@ test "DiskTier: a spec sidecar replaced before its manifest commits is declined,
     // The crash: the next commit's sidecar (same shape, later rows) landed, its manifest did not.
     const dir = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, e.id });
     defer testing.allocator.free(dir);
-    const res = try tier.writeSpecSidecar(dir, .{ .entries = new_win.entries, .step = new_win.step, .config = new_win.config, .base_pos = 200 }, null, s);
+    const res = try tier.writeSpecSidecar(dir, .{ .entries = new_win.entries, .step = new_win.step, .config = new_win.config, .base_pos = 200 }, null, s, .{});
     try testing.expectEqual(old_bytes, res.bytes);
 
     tier.deinit();

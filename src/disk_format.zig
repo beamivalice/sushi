@@ -26,6 +26,10 @@ pub const SpecMeta = struct {
     head: ?SpecHeadMeta = null,
 };
 
+/// v12: one whole segment of a growing sidecar's rows, as written: its size and a Wyhash of its file image,
+/// which lets a later commit holding the same bytes keep or link the file instead of writing it again.
+pub const SideSeg = struct { bytes: u64, hash: u64 };
+
 /// Marks a head sidecar records. The length is part of the record, so the format owns it and the arch that
 /// keeps the marks (`QSA_HEAD_MARKS_MAX`) takes it from here.
 pub const HEAD_MARKS_MAX: usize = 32;
@@ -79,6 +83,10 @@ pub const IndexEntry = struct {
     /// acceptance on the first reused turn, never a token.
     spec_dflash: ?SpecMeta = null,
     spec_mtp: ?SpecMeta = null,
+    /// v12: the MTP history's whole segments `p<j>.safetensors`, in order, ahead of the rows the sidecar keeps; the
+    /// first `spec_segs_inherited` are hard links into a donor entry's, which this entry never billed. Owned.
+    spec_segs: []SideSeg = &.{},
+    spec_segs_inherited: u32 = 0,
     /// A background write for this entry failed: never matched, never a donor, never reported
     /// complete; the next commit reclaims its directory. Not persisted (`scan` re-validates).
     poisoned: bool = false,
@@ -106,12 +114,14 @@ pub const IndexEntry = struct {
 };
 
 /// The newest manifest version this reader restores; an older one just carries none of the newer state.
-pub const META_VERSION_MAX: u64 = 11;
+pub const META_VERSION_MAX: u64 = 12;
 
 /// The lowest manifest version that describes this entry. The version is a compatibility
 /// claim: an older reader accepts only 2..4, so stamping v6 unconditionally made a binary
 /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
 pub fn metaVersionFor(e: IndexEntry) u8 {
+    // v12: an older reader would take the sidecar's tail rows for the whole history.
+    if (e.spec_segs.len > 0) return 12;
     // v11: an older reader would look for rows in the point files, which keep only the ones past the segments.
     if (e.grown.len > 0) return 11;
     // v10: an older reader knows no media identity, so it would hand a text prompt rows that
@@ -185,13 +195,44 @@ pub fn renderMeta(a: std.mem.Allocator, out: *std.ArrayList(u8), e: IndexEntry, 
         });
     }
     // v4: spec snapshots (dflash context / MTP history); a size mismatch drops only the spec.
-    if (e.spec_bytes > 0 and (e.spec_dflash != null or e.spec_mtp != null)) {
+    if ((e.spec_bytes > 0 and (e.spec_dflash != null or e.spec_mtp != null)) or e.spec_segs.len > 0) {
         try out.print(a, ",\"spec\":{{\"bytes\":{d}", .{e.spec_bytes});
+        if (e.spec_segs.len > 0) try writeSegsJson(a, out, e.spec_segs, e.spec_segs_inherited);
         if (e.spec_dflash) |sm| try writeSpecMetaJson(a, out, "dflash", sm);
         if (e.spec_mtp) |sm| try writeSpecMetaJson(a, out, "mtp", sm);
         try out.appendSlice(a, "}");
     }
     try out.appendSlice(a, "}");
+}
+
+/// `"segs":{"inherited":n,"files":[[bytes,"hash"],...]}`; the hash is hex, past JSON's i64.
+fn writeSegsJson(a: std.mem.Allocator, out: *std.ArrayList(u8), segs: []const SideSeg, inherited: u32) !void {
+    try out.print(a, ",\"segs\":{{\"inherited\":{d},\"files\":[", .{inherited});
+    for (segs, 0..) |sg, i| {
+        if (i > 0) try out.appendSlice(a, ",");
+        try out.print(a, "[{d},\"{x}\"]", .{ sg.bytes, sg.hash });
+    }
+    try out.appendSlice(a, "]}");
+}
+
+/// One `[bytes, "hash"]` item of a `segs` list; null for a malformed one, which ends the list's read there.
+pub fn segItem(v: std.json.Value) ?SideSeg {
+    if (v != .array or v.array.items.len != 2) return null;
+    const bytes = valueU64(v.array.items[0]) orelse return null;
+    const hv = v.array.items[1];
+    if (hv != .string) return null;
+    return .{ .bytes = bytes, .hash = std.fmt.parseInt(u64, hv.string, 16) catch return null };
+}
+
+/// A `segs` section: the files as listed and how many lead as hard links.
+pub const SegsMeta = struct { files: []const std.json.Value, inherited: u32 };
+
+fn parseSegs(obj: std.json.ObjectMap) ?SegsMeta {
+    const v = obj.get("segs") orelse return null;
+    if (v != .object) return null;
+    const files = v.object.get("files") orelse return null;
+    if (files != .array) return null;
+    return .{ .files = files.array.items, .inherited = jsonInt(u32, v.object, "inherited") orelse return null };
 }
 
 pub fn writeSpecMetaJson(a: std.mem.Allocator, w: *std.ArrayList(u8), name: []const u8, sm: SpecMeta) !void {
@@ -295,7 +336,7 @@ pub const GrownMeta = struct { span: u32, bytes: []const std.json.Value, inherit
 pub const QsaHistoryMeta = struct { bytes: u64, rows: u32, inherited: bool };
 
 /// The spec sidecar's recorded size and the two snapshots it holds; either may be null.
-pub const SpecSidecar = struct { bytes: u64, dflash: ?SpecMeta, mtp: ?SpecMeta };
+pub const SpecSidecar = struct { bytes: u64, dflash: ?SpecMeta, mtp: ?SpecMeta, segs: ?SegsMeta = null };
 
 pub const MediaMeta = struct { key: u64, start: u32 };
 
@@ -364,7 +405,7 @@ pub fn parseManifest(obj: std.json.ObjectMap) ?Manifest {
         if (spec_v != .object) break :spec_blk;
         const so = spec_v.object;
         const bytes = jsonU64(so, "bytes") orelse break :spec_blk;
-        spec = .{ .bytes = bytes, .dflash = parseSpecMeta(so, "dflash"), .mtp = parseSpecMeta(so, "mtp") };
+        spec = .{ .bytes = bytes, .dflash = parseSpecMeta(so, "dflash"), .mtp = parseSpecMeta(so, "mtp"), .segs = parseSegs(so) };
     }
 
     // A record claiming media must say where it starts: a key without a boundary would be matched by
@@ -570,6 +611,25 @@ test "manifest: the lowest version that describes an entry is stamped" {
     try testing.expectEqual(@as(u8, 11), metaVersionFor(e));
 }
 
+test "manifest: v12 spec segments render, stamp v12 and parse back with their hashes past i64" {
+    var e = testEntry();
+    e.spec_bytes = 30;
+    e.spec_mtp = .{ .base = 0, .step = 9000, .layers = 1, .quant = kv_quant.KVQuantConfig.dense };
+    e.spec_segs = @constCast(&[_]SideSeg{ .{ .bytes = 100, .hash = 0xffff_0000_aaaa_5555 }, .{ .bytes = 200, .hash = 7 } });
+    e.spec_segs_inherited = 1;
+    try testing.expectEqual(@as(u8, 12), metaVersionFor(e));
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(testing.allocator);
+    try renderMeta(testing.allocator, &out, e, 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
+    defer parsed.deinit();
+    const m = parseManifest(parsed.value.object) orelse return error.TestUnexpectedResult;
+    const segs = m.spec.?.segs orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 1), segs.inherited);
+    try testing.expectEqual(SideSeg{ .bytes = 100, .hash = 0xffff_0000_aaaa_5555 }, segItem(segs.files[0]).?);
+    try testing.expectEqual(SideSeg{ .bytes = 200, .hash = 7 }, segItem(segs.files[1]).?);
+}
+
 test "manifest: what renderMeta writes parseManifest reads back" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, full_manifest, .{});
     defer parsed.deinit();
@@ -602,7 +662,7 @@ test "manifest: what renderMeta writes parseManifest reads back" {
 test "manifest: a record this build cannot restore parses to null" {
     const base = "\"kv_len\":600,\"tokens\":3,\"has_tools\":false,\"scheme\":\"off\",\"chunk_tokens\":1024,\"chunk_bytes\":[]";
     const bad = [_][]const u8{
-        "{\"v\":12," ++ base ++ "}",
+        "{\"v\":13," ++ base ++ "}",
         "{\"v\":1," ++ base ++ "}",
         "{" ++ base ++ "}",
         "{\"v\":4,\"tokens\":3,\"has_tools\":false,\"scheme\":\"off\",\"chunk_tokens\":1024,\"chunk_bytes\":[]}",

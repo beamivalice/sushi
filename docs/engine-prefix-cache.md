@@ -610,7 +610,7 @@ They count what the filesystem accepted, never what was submitted, and run from 
 | `kv` | `c*.safetensors` KV chunks | `writeChunkFile` |
 | `ssm` | `s*.safetensors` restore points and `g*.safetensors` row segments (every arch's restore point, GLM's and DeepSeek's included) | `writePoint`, `writeGrownSegment` |
 | `qsa` | `qsa.safetensors` history | `writeQsaHistoryFile` (`persistQsaHistory`) |
-| `spec` | `spec.safetensors` draft state | `writeSpecSidecar` |
+| `spec` | `spec.safetensors` draft state and its `p*.safetensors` segments | `writeSpecSidecar`, `writeSegments` |
 | `ring` | `r*.safetensors` ring restore points | `writeRingFile` |
 | `meta` | `meta.json` manifests and `tokens.bin` records | `writeMeta`, the token record in `appendCommitWithSpecBounded` |
 
@@ -696,6 +696,19 @@ process start whatever turns `--metrics` on.
 `Entry.mtp` + `restoreSpecSnap`, adopt only on `base + step == matched`; MTP trims to `mtpCommittedLen`; survives the
 SSD tier (`spec.safetensors`). An adopted spec cache has ONE owner at a time (`runPrefill` clears its locals BEFORE
 `initWithOptions`).
+
+- **The MTP history is written in segments** (`SIDE_SEG_SPAN` = 8192 rows, `writeSegments`, manifest v12, which an older
+  reader drops): each whole segment's rows of the head's KV and pooled bank go to `p<j>.safetensors`, and
+  `spec.safetensors` keeps the head's ring, leftovers and the rows past the last segment. A segment is written only when
+  its file image (a Wyhash in the manifest's `spec.segs`) differs from the entry's own segment j or, in a leading run, the
+  donor's, which is hard-linked; so an extension writes its new segments and the tail, never the history again. A restore
+  concatenates the segments and the tail (`joinSegments`); a missing or short segment drops the spec (the head starts
+  blind), never the entry. The sidecar used to be rewritten whole per commit: 210-280 MB a Qwen turn at 100k-130k tokens.
+- **A commit with no spec payload leaves the entry spec-less and its segments spare** (a prefill write-through): it
+  deletes `spec.safetensors` as before, so a restore drafts blind, and the manifest lists the segments under
+  `"spec":{"bytes":0}`, billed, for the turn's end to keep on an equal hash. An extension holding fewer segments than
+  the record it grew from links that record's (`chunkShareDonor` minus itself). Deleting them made each turn's end
+  write the history whole again.
 
 ## GLM-5.3 (`glm5_next`)
 
