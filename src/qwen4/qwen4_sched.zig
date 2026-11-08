@@ -1,5 +1,6 @@
 //! Flash-Next as the scheduler sees it: what batches, which rounds group, the head it commits beside the KV.
 const std = @import("std");
+const sched_policy = @import("../sched_policy.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
@@ -84,7 +85,7 @@ pub fn mtpGroupable(slot: *const Slot) bool {
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
     const t = slot.model.transformer orelse return false;
     if (!qwen4_forward.supportsBatchedGdnDecode(t)) return false;
-    return scheduler.specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
+    return sched_policy.specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }
 
 pub fn tickClass(slot: *const Slot) sched.TickClass {

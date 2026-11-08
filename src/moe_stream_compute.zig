@@ -1,4 +1,6 @@
-const trf = @import("transformer.zig");
+const mlx_util = @import("mlx_util.zig");
+const trunk = @import("trunk.zig");
+const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const std = @import("std");
 const expert_stream_mod = @import("expert_stream.zig");
 const imatrix_capture = @import("imatrix.zig");
@@ -9,13 +11,13 @@ const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const QuantMode = model_mod.QuantMode;
 const testing = std.testing;
-const MoeMlpWeights = trf.MoeMlpWeights;
-const SeErr = trf.SeErr;
-const fusedSwiGLU = trf.fusedSwiGLU;
-const seBf16 = trf.seBf16;
-const seFillBf16 = trf.seFillBf16;
-const seHash = trf.seHash;
-const transposeBf16Weight = trf.transposeBf16Weight;
+const MoeMlpWeights = trunk.MoeMlpWeights;
+const SeErr = trunk_helpers_test.SeErr;
+const fusedSwiGLU = trunk.fusedSwiGLU;
+const seBf16 = trunk_helpers_test.seBf16;
+const seFillBf16 = trunk_helpers_test.seFillBf16;
+const seHash = trunk_helpers_test.seHash;
+const transposeBf16Weight = mlx_util.transposeBf16Weight;
 
 const expert_bf16 = @import("expert_bf16_kernels.zig");
 

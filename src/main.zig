@@ -12,8 +12,8 @@ pub const tokenizer = tokenizer_mod;
 pub const kld = kld_mod;
 pub const bench = bench_mod;
 pub const imatrix = @import("imatrix.zig");
-pub const transformer = transformer_mod;
-const transformer_mod = @import("transformer.zig");
+pub const model_handle = @import("model_handle.zig");
+const trunk = @import("trunk.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
@@ -274,7 +274,7 @@ pub fn main(init: std.process.Init) !void {
     var mtp_flag: ?bool = null;
     var mtp_typical_raw: ?[]const u8 = null;
     var mtp_tokenv3_raw: ?[]const u8 = null;
-    var kv_quant_flag: ?transformer_mod.KVQuantConfig = null;
+    var kv_quant_flag: ?trunk.KVQuantConfig = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running small models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -298,7 +298,7 @@ pub fn main(init: std.process.Init) !void {
                 .app = VERSION,
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
-                .nax = transformer_mod.naxStatus(),
+                .nax = trunk.naxStatus(),
             };
             var ver_buf: [512]u8 = undefined;
             var ver_w = std.Io.File.stdout().writerStreaming(io, &ver_buf);
@@ -608,7 +608,7 @@ pub fn main(init: std.process.Init) !void {
             idle_evict_secs = if (n > 0) n else null;
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
-            kv_quant_flag = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
+            kv_quant_flag = trunk.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
                 log.err("--kv-quant: expected one of {{16, 8, 6, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -1161,7 +1161,7 @@ pub fn main(init: std.process.Init) !void {
             .drafter_dir = drafter_dir orelse "",
             .no_drafter = no_drafter,
             .mtp = mtp_flag,
-            .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
+            .mtp_head_kv_quant = trunk.Transformer.mtp_head_kv_quant_flag,
             .mtp_depth = depth_bounds.active.max,
             .load_vision = load_vision,
             .kv_quant = kv_quant_flag,
@@ -1197,7 +1197,7 @@ pub fn main(init: std.process.Init) !void {
         defer weights.deinit();
         model_mod.resolveWeightPrefix(config, &weights);
 
-        var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
+        var xfm = try trunk.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
 
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);
@@ -1364,7 +1364,7 @@ fn runHeadlessServe(
     max_resident_models: u32,
     max_resident_mem_flag: ?u64,
     idle_evict_secs: ?u32,
-    kv_quant_flag: ?transformer_mod.KVQuantConfig,
+    kv_quant_flag: ?trunk.KVQuantConfig,
     mtp_flag: ?bool,
 ) !void {
     log.info("sushi {s} (headless — models load on demand)\n", .{VERSION});
@@ -1434,7 +1434,7 @@ fn runHeadlessServe(
         .warmup_eager = false,
         .kv_quant = kv_quant_flag,
         .mtp = mtp_flag,
-        .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
+        .mtp_head_kv_quant = trunk.Transformer.mtp_head_kv_quant_flag,
         // Seed the scheduler's prefix-cache config from the server globals so
         // on-demand (headless/discover-mode) loads get the SAME hot prefix
         // cache as a `--model` startup load. Previously hardcoded to 0, which

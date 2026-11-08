@@ -1,6 +1,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
@@ -680,7 +680,7 @@ test "a submit that fails before its slot exists hands the vision array to the i
             };
         }
         /// One connection-thread submit that must fail, then the inference thread's drain.
-        fn expectHandedOver(allocator: std.mem.Allocator, model: *LoadedModel, kv: transformer_mod.KVQuantConfig, want: ?anyerror) !void {
+        fn expectHandedOver(allocator: std.mem.Allocator, model: *LoadedModel, kv: trunk.KVQuantConfig, want: ?anyerror) !void {
             var sch: Scheduler = undefined;
             sch.allocator = allocator;
             sch.io = testing.io;

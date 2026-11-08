@@ -17,7 +17,7 @@ const registry = @import("registry.zig");
 const pc = @import("../prefix_cache.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const ssm_cache = @import("../ssm_cache.zig");
-const transformer = @import("../transformer.zig");
+const trunk = @import("../trunk.zig");
 
 const Tag = registry.Tag;
 const tags = std.enums.values(Tag);
@@ -128,7 +128,7 @@ pub const Rows = struct {
     }
 
     /// The checkpoints these rows can restore from: `cps` without those past the rows, the rest freed.
-    pub fn keepCheckpoints(self: *const Rows, allocator: std.mem.Allocator, cps: []transformer.SSMCheckpoint) []transformer.SSMCheckpoint {
+    pub fn keepCheckpoints(self: *const Rows, allocator: std.mem.Allocator, cps: []trunk.SSMCheckpoint) []trunk.SSMCheckpoint {
         switch (self.v) {
             inline else => |r, t| if (comptime isVoid(@TypeOf(r))) unreachable else return P(t).keepThrough(allocator, cps, r.len),
         }
@@ -141,7 +141,7 @@ pub const Rows = struct {
         tokens: []const u32,
         has_tools: bool,
         media: pc.MediaStamp,
-        cps: ?[]transformer.SSMCheckpoint,
+        cps: ?[]trunk.SSMCheckpoint,
         dflash: ?kv_disk_cache.SpecCommit,
         whole: bool,
         s: mlx.mlx_stream,
@@ -188,7 +188,7 @@ pub fn handover(hc: *pc.HotPrefixCache, s: State, st: mlx.mlx_stream) void {
 pub fn rollbackLive(
     hc: *pc.HotPrefixCache,
     s: State,
-    target_cache: *transformer.KVCache,
+    target_cache: *trunk.KVCache,
     target_moe_seq_offset: *usize,
     st: mlx.mlx_stream,
     prompt_ids: []const u32,
@@ -211,7 +211,7 @@ pub fn restoreDisk(
     hc: *pc.HotPrefixCache,
     d: *kv_disk_cache.DiskTier,
     s: State,
-    target_cache: *transformer.KVCache,
+    target_cache: *trunk.KVCache,
     ram_eff: usize,
     prompt_ids: []const u32,
     has_tools: bool,
@@ -247,7 +247,7 @@ pub fn checkpointsRequired(config: *const model.ModelConfig) bool {
 }
 
 /// The stored-state layout the SSD namespace is keyed by, when the loaded arch names more than the config's own tag.
-pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const model.ModelConfig, model_dir: []const u8, xfm: *transformer.Transformer) !?[]u8 {
+pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const model.ModelConfig, model_dir: []const u8, xfm: *trunk.Transformer) !?[]u8 {
     switch (registry.handleOf(xfm)) {
         inline else => |_, t| return if (comptime @hasDecl(P(t), "diskLayoutKey")) P(t).diskLayoutKey(allocator, config, model_dir, xfm) else null,
     }
@@ -255,7 +255,7 @@ pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const model.ModelCon
 
 /// A committed MTP head's snapshot adopted into the loaded model's own head, as `plan` decided. Null leaves the head
 /// blind: an arch with no in-checkpoint head declines every snapshot.
-pub fn adoptSpecHead(xfm: *transformer.Transformer, plan: pc.SpecAdopt, snap: *const pc.DflashSnap, base_pos: *usize) ?usize {
+pub fn adoptSpecHead(xfm: *trunk.Transformer, plan: pc.SpecAdopt, snap: *const pc.DflashSnap, base_pos: *usize) ?usize {
     switch (registry.handleOf(xfm)) {
         inline else => |m, t| return if (comptime @hasDecl(P(t), "adoptSpecHead")) P(t).adoptSpecHead(m, plan, snap, base_pos) else null,
     }
@@ -294,22 +294,22 @@ pub const aux = firstWith("aux") orelse struct {
 /// The QSA-history section of an SSD record: the same arch's, with the sidecar file it writes.
 pub const disk = firstWith("disk") orelse struct {
     const DiskTier = kv_disk_cache.DiskTier;
-    pub fn qsaHistoryRowsOf(_: *const transformer.SSMCheckpoint) c_int {
+    pub fn qsaHistoryRowsOf(_: *const trunk.SSMCheckpoint) c_int {
         return 0;
     }
-    pub fn newestQsaCheckpoint(_: []const transformer.SSMCheckpoint) ?*const transformer.SSMCheckpoint {
+    pub fn newestQsaCheckpoint(_: []const trunk.SSMCheckpoint) ?*const trunk.SSMCheckpoint {
         return null;
     }
-    pub fn writeQsaHistoryFile(_: *DiskTier, _: []const u8, _: *const transformer.SSMCheckpoint, _: mlx.mlx_stream) !u64 {
+    pub fn writeQsaHistoryFile(_: *DiskTier, _: []const u8, _: *const trunk.SSMCheckpoint, _: mlx.mlx_stream) !u64 {
         return 0;
     }
-    pub fn loadQsaHistoryFile(_: *DiskTier, _: u64, _: usize) !transformer.SSMCheckpoint {
+    pub fn loadQsaHistoryFile(_: *DiskTier, _: u64, _: usize) !trunk.SSMCheckpoint {
         return error.DiskCacheNoCheckpoint;
     }
     pub fn persistQsaHistory(
         _: *DiskTier,
         _: []const u8,
-        _: ?[]const transformer.SSMCheckpoint,
+        _: ?[]const trunk.SSMCheckpoint,
         inherited: bool,
         inherited_rows: u32,
         held_bytes: u64,

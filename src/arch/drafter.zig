@@ -10,9 +10,9 @@ const mlx = @import("../mlx.zig");
 const mtp_mod = @import("../mtp.zig");
 const registry = @import("registry.zig");
 const spec_types = @import("../spec_types.zig");
-const transformer_mod = @import("../transformer.zig");
-const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const trunk = @import("../trunk.zig");
+const Transformer = trunk.Transformer;
+const KVCache = trunk.KVCache;
 
 fn drafterOf(comptime name: []const u8) type {
     return registry.Mod(@field(registry.Tag, name)).drafter;
@@ -194,7 +194,7 @@ pub const Drafter = struct {
     /// Every G17/NAX cost surface is calibrated against one exact runtime geometry, so a head without a surface of
     /// its own plans under `generic`: an off-profile head served by a calibrated surface would plan depths the
     /// measurement never covered.
-    pub fn costProfile(self: Drafter, target: *const Transformer, kv: transformer_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
+    pub fn costProfile(self: Drafter, target: *const Transformer, kv: trunk.KVQuantConfig) mtp_mod.MtpCostProfile {
         return switch (self.u) {
             inline else => |h, t| if (comptime @hasDecl(D(t), "costProfile")) D(t).costProfile(h, target, kv) else .generic,
         };

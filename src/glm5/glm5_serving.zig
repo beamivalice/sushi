@@ -2,6 +2,7 @@ const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
 const glm5_mod = @import("glm5_forward.zig");
 const glm5_state = @import("glm5_state.zig");
+const glm5_flags = @import("glm5_flags.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
@@ -41,7 +42,7 @@ pub fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_ar
     const request = glm5_state.requestOf(ctx) orelse return error.GlmRequestMissing;
     if (ctx.cache.step == 0) {
         request.reset();
-        try request.setLatentBits(ctx.cache.config.glmLatentBits() orelse return error.GlmKvQuantUnsupported);
+        try request.setLatentBits(glm5_flags.latentBits(ctx.cache.config) orelse return error.GlmKvQuantUnsupported);
     }
     if (request.offset != ctx.cache.step) return error.GlmCachePositionMismatch;
     mdl.s = self.s;

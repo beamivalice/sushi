@@ -10,7 +10,7 @@ const log = @import("log.zig");
 const mtp_mod = @import("mtp.zig");
 const round_cost = @import("round_cost.zig");
 const sampler = @import("sampler.zig");
-const transformer_mod = @import("transformer.zig");
+const mimo_forward = @import("mimo2/mimo_forward.zig");
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Generator = generate_mod.Generator;
@@ -697,7 +697,7 @@ pub fn mtpPlanInBounds(plan: MtpRoundPlan, lo: u32, hi: u32) MtpRoundPlan {
 /// round never plans past the budget; another arch's rows are row-identical
 /// at any width up to `MAX_DEPTH`.
 pub fn mtpVerifyDraftsMax(is_mimo: bool) u32 {
-    return if (is_mimo) @intCast(transformer_mod.MIMO_VERIFY_ROWS_MAX - 1) else mtp_mod.MAX_DEPTH;
+    return if (is_mimo) @intCast(mimo_forward.MIMO_VERIFY_ROWS_MAX - 1) else mtp_mod.MAX_DEPTH;
 }
 
 /// The width a pinned round drafts: never past the verify row budget.

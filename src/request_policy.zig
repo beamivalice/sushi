@@ -2,7 +2,7 @@ const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const think_tags = @import("think_tags.zig");
@@ -912,7 +912,7 @@ test "the max_tokens squeeze warning is silent for the auto budget, loud for a r
 test "an omitted max_tokens reserves the LAUNCH default, not the whole window" {
     const t = std.testing;
     // The admission reservation reads the resolved budget, so the flag reaches it.
-    const KVCache = transformer_mod.KVCache;
+    const KVCache = trunk.KVCache;
     const ctx: u64 = 786_432;
     const seq: u64 = 400_000; // past RESERVE_MIN_TOKENS
     const chunk: u64 = 4096;
@@ -1253,7 +1253,7 @@ test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bi
     const t = std.testing;
     // An omitted `max_tokens` is maxInt(u32)/4; the memory guard used to run before
     // `clampMaxTokens`, so the reservation billed ~26 TB of KV and refused every long prompt.
-    const KVCache = transformer_mod.KVCache;
+    const KVCache = trunk.KVCache;
     const ctx: u64 = 262_144;
     const seq: u64 = 50_000;
     const sentinel: u64 = omittedMaxTokensDefaultWith(@intCast(ctx), 0, 0);

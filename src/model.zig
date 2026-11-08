@@ -719,7 +719,7 @@ pub const ModelConfig = struct {
         const hd = @as(u64, self.indexer_head_dim);
         // Native GLM retains only the incomplete pool's key/gate pairs.
         if (self.isGlm5()) return n * (@as(u64, self.indexer_compress_ratio) -| 1) * hd * 2 * 2;
-        const rows = @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS));
+        const rows = @as(u64, @intCast(@import("trunk.zig").QSA_RING_ROWS));
         return n * rows * hd * 2 * @as(u64, if (self.isGlm5()) 2 else 1);
     }
 

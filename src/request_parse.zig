@@ -6,7 +6,7 @@ const log = @import("log.zig");
 const model_registry_mod = @import("model_registry.zig");
 const std = @import("std");
 const jsonEscape = @import("http.zig").jsonEscape;
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
 
@@ -353,9 +353,9 @@ pub fn chatTemplateKwargBool(root: std.json.ObjectMap, key: []const u8) ?bool {
 /// `4`, `6`, `8`. Returns null when the field is absent or unrecognized (the
 /// caller falls back to the process-level `--kv-quant` default carried on
 /// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
-pub fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
+pub fn parseKvQuantOverride(root: std.json.ObjectMap) ?trunk.KVQuantConfig {
     const v = root.get("kv_quant") orelse return null;
-    const kq = transformer_mod.KVQuantConfig.fromJsonValue(v) orelse return null;
+    const kq = trunk.KVQuantConfig.fromJsonValue(v) orelse return null;
     switch (kq.scheme) {
         .off => log.info("  kv-quant override: off (per-request)\n", .{}),
         .affine => log.info("  kv-quant override: affine {d}-bit (per-request)\n", .{kq.bits}),

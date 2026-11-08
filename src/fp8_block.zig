@@ -1002,7 +1002,7 @@ fn expectTileWithinBar(tw: *const TestWeight, x: []const f32, m: usize, part: us
 }
 
 fn naxForTest() bool {
-    return mlx.streamIsGpu(mlx.gpuStream()) and @import("transformer.zig").verifyQmmNaxAvailable();
+    return mlx.streamIsGpu(mlx.gpuStream()) and @import("trunk.zig").verifyQmmNaxAvailable();
 }
 
 test "fp8 block serving tile stays within bf16 rounding plus an f32 sum over the dequant route's weights" {

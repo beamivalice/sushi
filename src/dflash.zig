@@ -30,7 +30,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 // The chunked row requantizer + its packed-triple handle are shared with the
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
@@ -38,8 +38,8 @@ const mtp_mod = @import("mtp.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
-const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const Transformer = trunk.Transformer;
+const KVCache = trunk.KVCache;
 
 pub const LayerType = enum {
     sliding_attention,
@@ -439,7 +439,7 @@ pub fn resolveBlockSize(config_block: u32, wide_verify_lane: bool, no_lane_cap: 
 /// True when this machine has a verify lane for widths past the split-K
 /// ceiling (the NAX m16 tile, M5-class + macOS >= 26.2).
 pub fn wideVerifyLaneAvailable() bool {
-    return transformer_mod.verifyQmmNaxAvailable();
+    return trunk.verifyQmmNaxAvailable();
 }
 
 // ── Weight precision ──
@@ -869,7 +869,7 @@ fn loadLinear(
             .biases = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.biases", .{prefix})),
         };
         errdefer out.deinit();
-        const qp = transformer_mod.affineParamsFromGeometry(out.w, out.scales, in_features) orelse {
+        const qp = trunk.affineParamsFromGeometry(out.w, out.scales, in_features) orelse {
             log.err("[dflash] {s}: packed geometry is not affine-servable (in={d})\n", .{ prefix, in_features });
             return error.UnsupportedDflashQuant;
         };
@@ -1964,7 +1964,7 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
             const entry = &ctx.cache.entries[li];
             const k = try tail_ops.slice(entry.keys, 2, @intCast(dropped), @intCast(ctx_len));
             const v = try tail_ops.slice(entry.values, 2, @intCast(dropped), @intCast(ctx_len));
-            break :blk transformer_mod.DenseKVView{ .k = try tail_ops.concat(&.{ k, bk }, 2), .v = try tail_ops.concat(&.{ v, bv }, 2), .owned = false };
+            break :blk trunk.DenseKVView{ .k = try tail_ops.concat(&.{ k, bk }, 2), .v = try tail_ops.concat(&.{ v, bv }, 2), .owned = false };
         } else try ctx.cache.update(@intCast(li), bk, bv, s, 0);
 
         const full_mask = if (lw.layer_type == .sliding_attention) sliding_mask else null;

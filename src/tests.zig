@@ -8,7 +8,7 @@ pub const io_util = @import("io_util.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const kld = @import("kld.zig");
 pub const imatrix = @import("imatrix.zig");
-pub const transformer = @import("transformer.zig");
+pub const model_handle = @import("model_handle.zig");
 
 const std = @import("std");
 const registry = @import("arch/registry.zig");

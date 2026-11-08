@@ -1,4 +1,4 @@
-const trf = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
@@ -6,7 +6,7 @@ const io_util_mod = @import("io_util.zig");
 const ModelConfig = model_mod.ModelConfig;
 const diagEnvOn = io_util_mod.diagEnvOn;
 const testing = std.testing;
-const decodeProfReport = trf.decodeProfReport;
+const decodeProfReport = trunk.decodeProfReport;
 
 const DecodeProf = struct {
     calls: u64 = 0,

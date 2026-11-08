@@ -14,6 +14,8 @@ const arch_config = @import("config.zig");
 const pc = @import("../prefix_cache.zig");
 const kv_quant = @import("../kv_quant.zig");
 const transformer = @import("../transformer.zig");
+const model_handle = @import("../model_handle.zig");
+const trunk = @import("../trunk.zig");
 const model_registry = @import("../model_registry.zig");
 const generate = @import("../generate.zig");
 const scheduler = @import("../scheduler.zig");
@@ -22,8 +24,8 @@ const Tag = registry.Tag;
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
 const Generator = generate.Generator;
-const Transformer = transformer.Transformer;
-const ForwardCtx = transformer.ForwardCtx;
+const Transformer = trunk.Transformer;
+const ForwardCtx = model_handle.ForwardCtx;
 const ModelConfig = model.ModelConfig;
 
 /// The request state a slot owns beside its KV cache (`arch_state.SlotRequest`).
@@ -91,7 +93,7 @@ pub const ColdLoad = struct {
 
 /// The committed MTP head of an arch whose head rides the trunk's own cache.
 pub const HeadParts = struct {
-    entry: ?*const transformer.SSMCacheEntry = null,
+    entry: ?*const trunk.SSMCacheEntry = null,
     pos_base: c_int = 0,
     marks: []const transformer.QsaHeadMark = &.{},
 };
@@ -304,7 +306,7 @@ pub fn commitOwn(
     slot: *Slot,
     gen: ?*Generator,
     tokens: []const u32,
-    cps: ?[]transformer.SSMCheckpoint,
+    cps: ?[]trunk.SSMCheckpoint,
     prompt_len: usize,
 ) bool {
     const tag = tagOfSlot(slot) orelse return false;
@@ -322,7 +324,7 @@ pub fn cancelledNeedsCheckpoints(slot: *const Slot) bool {
 }
 
 /// The newest checkpoint takes the slot's live indexer history as a view of its capacity buffer.
-pub fn handoffHistory(slot: *Slot, cps: []transformer.SSMCheckpoint) void {
+pub fn handoffHistory(slot: *Slot, cps: []trunk.SSMCheckpoint) void {
     const tag = tagOfSlot(slot) orelse return;
     switch (tag) {
         inline else => |t| if (comptime has(t, "handoffHistory")) S(t).handoffHistory(slot, cps),
@@ -352,7 +354,7 @@ pub fn writeThrough(
     entry_id: *?u64,
     prompt: []const u32,
     media: pc.MediaStamp,
-    cps: []transformer.SSMCheckpoint,
+    cps: []trunk.SSMCheckpoint,
     s: mlx.mlx_stream,
 ) bool {
     const tag = tagOfSlot(slot) orelse return false;

@@ -2,7 +2,8 @@
 //! live reading runs in the host tier.
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
-const transformer_mod = @import("transformer.zig");
+const mimo_forward = @import("mimo2/mimo_forward.zig");
+const trunk = @import("trunk.zig");
 const verify_moe = @import("verify_moe.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const nax_gate = @import("nax_gate.zig");
@@ -28,7 +29,7 @@ const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const metrics = @import("status.zig");
 const qwen4_mod = @import("qwen4/qwen4_exp.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const request_policy = @import("request_policy.zig");
 const glm5_generate = @import("glm5/glm5_generate.zig");
 const mtp_plan = @import("mtp_plan.zig");
@@ -80,18 +81,18 @@ pub fn mtpChoiceFor(config: *const model_mod.ModelConfig) model_settings.MtpChoi
 }
 
 /// THIS model's KV scheme and its source, the one answer the load log, `/props` and every bill read.
-pub fn kvCacheFor(config: *const model_mod.ModelConfig) transformer_mod.KvCacheChoice {
+pub fn kvCacheFor(config: *const model_mod.ModelConfig) trunk.KvCacheChoice {
     if (launch_state.global_scheduler) |sch| return kvCacheForLaunch(config, sch.kv_quant);
     return kvCacheForLaunch(config, launch_state.configured_kv_quant);
 }
 
 /// `kvCacheFor` under a given launch choice. deepseek_v41 keeps its own compressed state; `--kv-quant` has nothing to quantize.
-pub fn kvCacheForLaunch(config: *const model_mod.ModelConfig, flag: ?transformer_mod.KVQuantConfig) transformer_mod.KvCacheChoice {
+pub fn kvCacheForLaunch(config: *const model_mod.ModelConfig, flag: ?trunk.KVQuantConfig) trunk.KvCacheChoice {
     if (config.isDsv41()) return .{ .config = .dense, .source = .default };
-    return transformer_mod.KvCacheChoice.resolve(flag, config.kv_quant_override);
+    return trunk.KvCacheChoice.resolve(flag, config.kv_quant_override);
 }
 
-pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
+pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) trunk.KVQuantConfig {
     return kvCacheFor(config).config;
 }
 
@@ -697,7 +698,7 @@ fn safeContextForBudget(
 ///
 /// Through `configuredKvQuant`, so a load-time bill gets the boot's `--kv-quant`, not the dense fallback.
 pub fn defaultKvBits(config: *const model_mod.ModelConfig) u64 {
-    const cfg: transformer_mod.KVQuantConfig = configuredKvQuantFor(config);
+    const cfg: trunk.KVQuantConfig = configuredKvQuantFor(config);
     return if (cfg.scheme == .off) 16 else cfg.bits;
 }
 
@@ -765,7 +766,7 @@ pub fn prefillTransientReserveAtKv(
 /// exactly where the dispatch's own predicate (`slidingPrefillFused`) holds.
 pub fn slidingBandScoreBytes(config: *const model_mod.ModelConfig, fwd: u64) u64 {
     if (config.swaRingTokens() == 0) return 0;
-    if (transformer_mod.slidingPrefillFused(config, fwd)) return 0;
+    if (trunk.slidingPrefillFused(config, fwd)) return 0;
     const keys: u64 = @as(u64, config.sliding_window) +| fwd -| 1;
     return MOE_PREFILL_COEXIST *| @as(u64, config.num_attention_heads) *| fwd *| keys *| 2;
 }
@@ -792,7 +793,7 @@ pub fn trunkDecodeScratchBytes(config: *const model_mod.ModelConfig, fwd: u64) u
 pub fn kvDequantScratchBytes(config: *const model_mod.ModelConfig, seq: u64, fwd: u64) u64 {
     // A QSA layer rebuilds only what a forward of this width cannot gather in place.
     const qsa_rows: ?u64 = if (config.longCtxGated())
-        transformer_mod.qsaDenseRebuildRows(config.indexer_budget, config.indexer_compress_ratio, fwd)
+        qwen4_qsa_attn.qsaDenseRebuildRows(config.indexer_budget, config.indexer_compress_ratio, fwd)
     else
         null;
     if (config.swaRingTokens() == 0 and qsa_rows == null) return 0;
@@ -802,8 +803,8 @@ pub fn kvDequantScratchBytes(config: *const model_mod.ModelConfig, seq: u64, fwd
     // serially dependent through the softmax carry, so this is the ceiling.
     // The kill switch takes the width off `prefillHeadDimFused` and the whole
     // rebuild comes back with it. A decode rebuilds whole below the packed arms' floor.
-    const seq_rows: u64 = if (qsa_rows) |rows| rows else if (transformer_mod.prefillHeadDimFused(config.prefillScoreHeadDim()))
-        @max(MOE_PREFILL_COEXIST *| @as(u64, @intCast(transformer_mod.PACKED_KV_SLICE_MAX)), transformer_mod.mimoGlobalDecodeRebuildMaxKeys())
+    const seq_rows: u64 = if (qsa_rows) |rows| rows else if (trunk.prefillHeadDimFused(config.prefillScoreHeadDim()))
+        @max(MOE_PREFILL_COEXIST *| @as(u64, @intCast(trunk.PACKED_KV_SLICE_MAX)), mimo_forward.mimoGlobalDecodeRebuildMaxKeys())
     else
         seq;
     var widest: u64 = 0;
@@ -829,8 +830,8 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     if (config.indexer_budget == 0) return 0;
     // Prefill widths gather by block index (row-chunked score sheet, no
     // [S, kv] mask); decode/verify widths still build the dense mask.
-    if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled())
-        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
+    if (fwd >= trunk.FUSED256_MIN_Q_LEN and qwen4_qsa_gather.qsaGatherEnabled())
+        return qwen4_qsa_attn.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
@@ -1005,7 +1006,7 @@ pub fn maxSushiContextUpTo(config: *const model_mod.ModelConfig, upper: u32, kv_
     return low;
 }
 
-pub fn requestContextRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv: transformer_mod.KVQuantConfig, bill: AdmissionBill, warm: WarmPrefix) ?model_registry_mod.MemoryContextRefusal {
+pub fn requestContextRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv: trunk.KVQuantConfig, bill: AdmissionBill, warm: WarmPrefix) ?model_registry_mod.MemoryContextRefusal {
     if (!model_mod.usesSushiQuantMemoryBill(config)) return null;
     const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const budget = bill.available +| bill.evictionCredit();
@@ -1682,7 +1683,7 @@ fn billUplift16ths(config: *const model_mod.ModelConfig, seq: u64) u64 {
 /// How many MoE layers' gather-sort expansions coexist between eval points.
 /// Mirrors `Transformer.MOE_EVAL_EVERY_N_LAYERS` — the MoE prefill loop evals
 /// every 4th layer, so 4 layers' worth is what the peak holds.
-const MOE_PREFILL_COEXIST: u64 = transformer_mod.Transformer.PREFILL_EVAL_CADENCE_DEFAULT;
+const MOE_PREFILL_COEXIST: u64 = trunk.Transformer.PREFILL_EVAL_CADENCE_DEFAULT;
 
 /// What a warm turn already holds. A RAM hot-cache restore hands the slot the entry's KV
 /// buffers without allocating another copy, so `available` is already net of them and
@@ -1779,8 +1780,8 @@ fn oldBuffersInEvalWindow(config: *const model_mod.ModelConfig, tokens: u64, spa
     // ringed arch those are nine of forty-eight.
     const attn = config.kvPerTokenLayerCount();
     if (attn == 0) return 0;
-    const window: u32 = if (transformer_mod.Transformer.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
-        attnLayersPerEvalWindow(config, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS)
+    const window: u32 = if (trunk.Transformer.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
+        attnLayersPerEvalWindow(config, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS)
     else
         attn;
     if (window == 0) return 0;
@@ -1825,7 +1826,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // (live 2026-07-14). No-op for prompts >= one chunk.
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
-    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
+    const scores: u64 = if (!trunk.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
     const dequant: u64 = if (kv_bits >= 16) 0 else if (req.dequant_scratch_bytes > 0)
         req.dequant_scratch_bytes
     else
@@ -1842,7 +1843,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // a bf16 copy of the weight it is about to multiply plus its transpose,
     // and only at forwards wide enough to take that route. Measured against
     // the route off: ~0 at chunk 8192 where the envelope already dominates.
-    const dq_weights: u64 = if (fwd >= transformer_mod.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
+    const dq_weights: u64 = if (fwd >= trunk.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
         req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
@@ -1870,7 +1871,7 @@ pub fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     if (config.linear_num_value_heads > 0 and linear_layers > 0) {
         const qkv: u64 = 2 * @as(u64, config.linear_num_key_heads) * config.linear_key_head_dim +
             @as(u64, config.linear_num_value_heads) * config.linear_value_head_dim;
-        const cadence_window: u64 = @as(u64, transformer_mod.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1;
+        const cadence_window: u64 = @as(u64, trunk.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1;
         per_tok += @min(linear_layers, cadence_window) * qkv * 2;
     }
     if (config.isMoe()) {
@@ -1884,7 +1885,7 @@ pub fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     // the same eval-cadence window as the linear term above: older layers'
     // staging is released inside the loop, so five coexist, not thirty-nine.
     per_tok += config.swaStreamBytesPerToken(
-        @as(u64, transformer_mod.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1,
+        @as(u64, trunk.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1,
     );
     return per_tok;
 }
@@ -1898,7 +1899,7 @@ pub fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
 /// does not get billed for it.
 fn prefillDequantWeightBytes(config: *const model_mod.ModelConfig) u64 {
     if (config.quant_bits == 0 or config.quant_mode != .affine) return 0;
-    if (!transformer_mod.prefillDqGemmEnabled()) return 0;
+    if (!trunk.prefillDqGemmEnabled()) return 0;
     return 3 * prefillFfnWidth(config) * @as(u64, config.hidden_size) * 2;
 }
 
@@ -1932,7 +1933,7 @@ pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
 /// of slack); `KVCache.reserve_tokens` allocates it on the first grow so the prefill never
 /// runs a second grow. The guard and the allocator are the same number by construction.
 pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
-    return transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, ctx);
+    return trunk.KVCache.reservedTokens(seq, max_tokens, chunk, ctx);
 }
 
 /// Bytes of SSM checkpoints a prefill is still holding at its last chunk (~1.9 GB on a 36-layer
@@ -2217,7 +2218,7 @@ pub fn requestPrefillChunkNow(
     config: *const model_mod.ModelConfig,
     prompt_len: usize,
     max_tokens: u32,
-    kv_cfg: transformer_mod.KVQuantConfig,
+    kv_cfg: trunk.KVQuantConfig,
     unchunked_prefill: bool,
     warm_matched: u64,
     warm_capacity: u64,
@@ -2412,12 +2413,12 @@ pub fn admissionAvailable(total_limit: u64, active_mem: u64) u64 {
 }
 
 /// The hot cache is read once, as the published evictable atomic, never billed on top.
-pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
+pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?trunk.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
     const heads = config.num_attention_heads;
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
     const seq: u64 = @intCast(prompt_len);
 
-    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse configuredKvQuantFor(config);
+    const kv_cfg: trunk.KVQuantConfig = kv_override orelse configuredKvQuantFor(config);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     // Available = the lesser of Metal's static working-set max and what is physically reachable
     // now (#64). Read before the width is chosen: on a per-request arch the width is a function of it.
@@ -2543,7 +2544,7 @@ pub fn logAdmissionDecision(bill: AdmissionBill) void {
 /// Inference-thread predicate behind the scheduler's admission hook: does this request fit
 /// right now, with live memory re-read? Every input is forwarded, none defaulted (a hardcoded
 /// `kv_override = null` priced a `kv_quant: 4` request at fp16 and evicted a cache for nothing).
-pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) bool {
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) bool {
     return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
@@ -2556,7 +2557,7 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 }
 
 /// The cold bill, live memory re-read, for the scheduler's sibling hold.
-pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) slot_admission.MemoryBill {
+pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) slot_admission.MemoryBill {
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits) };
@@ -2570,7 +2571,7 @@ pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: us
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) ?model_registry_mod.MemoryContextRefusal {
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) ?model_registry_mod.MemoryContextRefusal {
     // The same warm inputs the probe was refused on, the checkout decision included.
     const warm = WarmPrefix{
         .matched_tokens = warm_matched,
@@ -2853,12 +2854,12 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
     try std.testing.expectEqual(@as(u32, 64000), mimo_bill.max_context);
     launch_state.server_config.max_context_size = 0;
     cfg.ctx_override = 4096;
-    cfg.kv_quant_override = transformer_mod.KVQuantConfig.affine(4);
+    cfg.kv_quant_override = trunk.KVQuantConfig.affine(4);
     const settings = loadServingBill(&cfg, budget).?;
     try std.testing.expectEqual(@as(u32, 4096), settings.requested_context);
     try std.testing.expectEqual(@as(u64, 4), settings.kv_bits);
     launch_state.server_config.max_context_size = 8192;
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     try std.testing.expectEqual(@as(u32, 8192), loadServingBill(&cfg, budget).?.requested_context);
     try std.testing.expectEqual(@as(u64, 8), loadServingBill(&cfg, budget).?.kv_bits);
     cfg.expert_layout = .mxfp4_individual;
@@ -3353,7 +3354,7 @@ test "bf16 expert load admission includes 65k KV and QSA serving terms" {
     launch_state.server_config.max_context_size = 65_536;
     const saved_kv = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_kv;
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     const serving = expertStreamingServingBytes(&config);
     try std.testing.expect(serving >= kvBytesPerTokenAtBits(config.kvBytesPerToken(), 8) * 65_536);
     const fixed: u64 = 10_000_000_000 + 16_000_000_000 + 60_000_000_000 + 536_870_912 + config.expert_fill_peak_bytes;
@@ -3374,7 +3375,7 @@ test "a streamed load bills the narrowest rung the per-request ladder can take" 
     launch_state.server_config.max_context_size = 32_768;
     const saved_kv = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_kv;
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     const saved_source = settings_resolve.prefill_chunk.source;
     const saved_chunk = settings_resolve.prefill_chunk.value;
     defer {
@@ -3842,14 +3843,14 @@ test "with no --kv-quant, the per-token KV bill and the auto-context follow the 
     try t.expectEqual(sessionBytesPerToken(&cfg, 8), sessionBytesPerToken(&cfg, defaultKvBits(&cfg)));
     const ctx_default = memoryContextAt(&cfg, ceiling, active);
 
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     try t.expectEqual(ctx_default, memoryContextAt(&cfg, ceiling, active));
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.dense;
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.dense;
     try t.expect(memoryContextAt(&cfg, ceiling, active) < ctx_default);
 
     // A per-model setting still outranks the default.
     launch_state.configured_kv_quant = null;
-    cfg.kv_quant_override = transformer_mod.KVQuantConfig.dense;
+    cfg.kv_quant_override = trunk.KVQuantConfig.dense;
     try t.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
 }
 
@@ -4647,12 +4648,12 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the sam
     const gathered_composed = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expect(gathered_composed > 0);
     try t.expect(gathered_composed < 4 * 4096 * 250_000);
-    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
+    try t.expectEqual(qwen4_qsa_attn.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
     nax_gate.vqmm_nax_probe_override = null;
     qwen4_qsa_select.qsa_score_fused_override = true;
     const gathered_fused = qsaMaskBytes(&q4, 4096, 250_000);
-    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
-    if (transformer_mod.qsaScoreFusedActive()) {
+    try t.expectEqual(qwen4_qsa_attn.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
+    if (qwen4_qsa_select.qsaScoreFusedActive()) {
         try t.expect(gathered_fused < gathered_composed);
     }
     qwen4_qsa_select.qsa_score_fused_override = false;
@@ -5684,15 +5685,15 @@ test "the 64 GB Sushi-STQ-2.75bpw recipe's bills at both GDN widths: 250000 cont
     var cfg = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
     defer cfg.deinit(t.allocator);
     cfg.expert_layout = .exl3_k4;
-    const saved_head = transformer_mod.Transformer.mtp_head_kv_quant_flag;
-    defer transformer_mod.Transformer.mtp_head_kv_quant_flag = saved_head;
-    transformer_mod.Transformer.mtp_head_kv_quant_flag = true;
+    const saved_head = trunk.Transformer.mtp_head_kv_quant_flag;
+    defer trunk.Transformer.mtp_head_kv_quant_flag = saved_head;
+    trunk.Transformer.mtp_head_kv_quant_flag = true;
     const saved_ctx = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved_ctx;
     launch_state.server_config.max_context_size = 250_000;
     const saved_kv = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_kv;
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     const saved_mtp = launch_state.configured_mtp;
     defer launch_state.configured_mtp = saved_mtp;
     launch_state.configured_mtp = true;
@@ -5899,7 +5900,7 @@ test "a MiMo slot bills the decode rebuilds the other rows of its batched decode
     const t = std.testing;
     var cfg = fixtures.mimoV2BillConfig();
     // One global layer's dense K/V below the packed arms' floor, for every other row of a full group.
-    const rebuild = transformer_mod.mimoGlobalDecodeRebuildMaxKeys() * cfg.layerKvBytes(0);
+    const rebuild = mimo_forward.mimoGlobalDecodeRebuildMaxKeys() * cfg.layerKvBytes(0);
     try t.expect(rebuild > 0);
     try t.expectEqual(@as(u64, @intCast(slot_admission.batchGroupCap(&cfg) - 1)) * rebuild, batchedDecodeRowsBytes(&cfg));
     try t.expectEqual(@as(usize, 4), slot_admission.batchGroupCap(&cfg));
@@ -5937,7 +5938,7 @@ test "the sliding ring is billed once per slot and staged per chunk token" {
     while (li < 48) : (li += 1) full.layer_is_global[li] = (li % 6) == 0;
     try t.expectEqual(
         @as(u64, 5 * 3 * (192 + 128) * 2),
-        full.swaStreamBytesPerToken(@as(u64, transformer_mod.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1),
+        full.swaStreamBytesPerToken(@as(u64, trunk.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1),
     );
     // The ring itself still holds every sliding layer.
     try t.expectEqual(full.swaRingTokens() * 40 * 3 * (192 + 128) * 2, full.swaRingBytes());
@@ -5954,8 +5955,8 @@ test "a QSA arch's kv-quant dequant scratch follows the widest forward that stil
     const cfg = fixtures.qwen4RequestTestConfig();
     const seq: u64 = 1024 * 1024;
     const layer_bytes: u64 = 2 * (256 + 256) * 2;
-    const span: u64 = 2048 + 4 - 1 + transformer_mod.FUSED256_MIN_Q_LEN - 1;
-    const split_k: u64 = @intCast(transformer_mod.QSA_ATTN_PACKED_MAX_S);
+    const span: u64 = 2048 + 4 - 1 + trunk.FUSED256_MIN_Q_LEN - 1;
+    const split_k: u64 = @intCast(qwen4_qsa_attn.QSA_ATTN_PACKED_MAX_S);
     // Split-K widths read the packed cache at every kv: only the dense span rebuilds.
     try t.expectEqual(span * layer_bytes, kvDequantScratchBytes(&cfg, seq, split_k));
     try t.expectEqual(span * layer_bytes, kvDequantScratchBytes(&cfg, 2 * seq, 16));
@@ -5994,7 +5995,7 @@ test "a ringed arch's kv-quant dequant scratch is one layer's rebuild, not the m
     attn_kernels.fused256_override = true;
     const fused = kvDequantScratchBytes(&cfg, seq, 1024);
     try t.expectEqual(
-        MOE_PREFILL_COEXIST * @as(u64, @intCast(transformer_mod.PACKED_KV_SLICE_MAX)) * 2 * (192 + 128) * 2,
+        MOE_PREFILL_COEXIST * @as(u64, @intCast(trunk.PACKED_KV_SLICE_MAX)) * 2 * (192 + 128) * 2,
         fused,
     );
     try t.expectEqual(fused, kvDequantScratchBytes(&cfg, 2 * seq, 1024));
@@ -6057,7 +6058,7 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
     try t.expect(grown.grow_coexist_bytes > 0);
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
     try t.expectEqual(
-        (seq / 2) * kv_per_tok / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS),
+        (seq / 2) * kv_per_tok / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS),
         grown.grow_coexist_bytes,
     );
 
@@ -6151,7 +6152,7 @@ test "mimo_v2 with an SSD tier bills a restored global layer beside its first gr
     launch_state.prefix_cache_disk_bytes = 0;
     try t.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, seq, 8192, kv_bits, 2048, .{}).grow_coexist_bytes);
     launch_state.prefix_cache_disk_bytes = 20 << 30;
-    const window = attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    const window = attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS);
     try t.expect(window >= 1);
     try t.expectEqual(one_layer * window, prefillRequestTerms(&cfg, seq, 8192, kv_bits, 2048, .{}).grow_coexist_bytes);
 }
@@ -6308,7 +6309,7 @@ test "mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the 
     for ([_]?bool{ null, false }) |ov| {
         attn_kernels.sliding_prefill_fused_override = ov;
         for ([_]u64{ 1, 8, 15, 16, 512, 2048, 4096 }) |fwd| {
-            try t.expectEqual(transformer_mod.slidingPrefillFused(&cfg, fwd), slidingBandScoreBytes(&cfg, fwd) == 0);
+            try t.expectEqual(trunk.slidingPrefillFused(&cfg, fwd), slidingBandScoreBytes(&cfg, fwd) == 0);
         }
     }
 }
@@ -6438,7 +6439,7 @@ test "a streamed Qwen plans its QSA history beside its KV for every planned toke
     cfg.expert_streaming = true;
     const saved = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved;
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     const state = statePerTokenBilled(&cfg);
     try std.testing.expect(state > 0);
     const per_token = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + state;
@@ -7271,7 +7272,7 @@ test "bill pin: requestContextRefusal" {
             var exl3 = c.*;
             exl3.expert_layout = .exl3_k4;
             const bill = AdmissionBill{ .needed = 30 * pin_gib, .available = 20 * pin_gib, .reclaimable = pin_gib, .chunk = 1024 };
-            const r = requestContextRefusal(&exl3, 90_000, 4096, transformer_mod.KVQuantConfig.affine(8), bill, .{});
+            const r = requestContextRefusal(&exl3, 90_000, 4096, trunk.KVQuantConfig.affine(8), bill, .{});
             g.add(r != null);
             if (r) |x| {
                 g.add(x.requested);
@@ -7564,14 +7565,14 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     defer launch_state.configured_kv_quant = saved_kv;
 
     // `--kv-quant 8`, no scheduler yet: the state the load runs in.
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     try t.expectEqual(@as(u64, 8), defaultKvBits(&cfg));
     try t.expectEqual(
         (13_056 + 2_304) * 786_432 + cfg.qsaRingBytes(),
         ssdFirstSessionKvBytes(&cfg, defaultKvBits(&cfg), ceiling, active, chunk),
     );
 
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.dense;
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.dense;
     try t.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
     try t.expectEqual(
         (24_576 + 2_304) * 786_432 + cfg.qsaRingBytes(),
@@ -7706,7 +7707,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(matched *| kv_per_tok, g.shared_resident_bytes);
     try t.expectEqual((reserved - matched) *| kv_per_tok, g.reserved_kv_bytes +| (seq - matched) *| kv_per_tok);
     // ...plus one eval window of old buffers: qwen4_exp caches 12 of 48 layers, one per window.
-    try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS));
+    try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS));
     try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
     // The bill at the narrowest and a wider width.
     try t.expectEqual(@as(u64, 5_057), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
@@ -7740,7 +7741,7 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
     // the inference thread: `clampMaxTokens` made the reservation cover the whole context
     // (~13 GB for a generation that would never run). The reservation exists to stop buffer
     // coexistence during prefill, not to pre-buy a generation.
-    const KVCache = transformer_mod.KVCache;
+    const KVCache = trunk.KVCache;
     const MB: u64 = 1024 * 1024;
     const cfg = fixtures.qwen4ExpOomConfig();
     const ctx: u64 = getEffectiveContextLength(&cfg);
@@ -7904,7 +7905,7 @@ test "a chain extension that OUTGROWS the resident entry is credited the rows it
     try t.expectEqual(@as(u64, 786_707), extend.creditedRows(reserved));
     const per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     const ext_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, extend);
-    const window = attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    const window = attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS);
     try t.expectEqual(capacity * per_tok / cfg.attnCacheLayerCount() * window, ext_terms.grow_coexist_bytes);
     try t.expectEqual(
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) -
@@ -7993,7 +7994,7 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
     // difference between the old bill and the new one.
     const wide = WarmPrefix{ .matched_tokens = 700_000, .capacity_tokens = 700_000, .will_donate = true };
     const wide_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, wide);
-    const window = attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    const window = attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS);
     try t.expect(window < cfg.attnCacheLayerCount());
     try t.expectEqual(700_000 * kv_per_tok / cfg.attnCacheLayerCount() * window, wide_terms.grow_coexist_bytes);
     try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, wide) < shared_same_span);
@@ -8007,12 +8008,12 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const saved_force = launch_state.server_config.default_force_mtp;
     defer launch_state.server_config.default_force_mtp = saved_force;
     launch_state.server_config.default_force_mtp = false;
-    const saved_ov = transformer_mod.Transformer.mtp_head_kv_quant_override;
-    defer transformer_mod.Transformer.mtp_head_kv_quant_override = saved_ov;
-    transformer_mod.Transformer.mtp_head_kv_quant_override = false;
+    const saved_ov = trunk.Transformer.mtp_head_kv_quant_override;
+    defer trunk.Transformer.mtp_head_kv_quant_override = saved_ov;
+    trunk.Transformer.mtp_head_kv_quant_override = false;
     const saved_boot = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_boot;
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     var cfg = fixtures.qwen4ExpOomConfig();
     cfg.mtp_override = null;
     try t.expect(!forceMtpFor(&cfg));
@@ -8021,9 +8022,9 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const max_tokens: u64 = 8192;
     const kv_bits: u64 = 8;
     try t.expectEqual(@as(u64, 2048), mtpHeadKvBytesPerToken(&cfg));
-    transformer_mod.Transformer.mtp_head_kv_quant_override = true;
+    trunk.Transformer.mtp_head_kv_quant_override = true;
     try t.expectEqual(@as(u64, 1088), mtpHeadKvBytesPerToken(&cfg));
-    transformer_mod.Transformer.mtp_head_kv_quant_override = false;
+    trunk.Transformer.mtp_head_kv_quant_override = false;
     const off = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
     try t.expectEqual(@as(u64, 0), off.mtp_head_kv_bytes);
     const on = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
@@ -8045,12 +8046,12 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
     const qsa_fused_off = fixtures.qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
     const t = std.testing;
-    const saved_ov = transformer_mod.Transformer.mtp_head_kv_quant_override;
-    defer transformer_mod.Transformer.mtp_head_kv_quant_override = saved_ov;
-    transformer_mod.Transformer.mtp_head_kv_quant_override = true;
+    const saved_ov = trunk.Transformer.mtp_head_kv_quant_override;
+    defer trunk.Transformer.mtp_head_kv_quant_override = saved_ov;
+    trunk.Transformer.mtp_head_kv_quant_override = true;
     const saved_boot = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_boot;
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
     var cfg = fixtures.qwen4ExpOomConfig();
     cfg.mtp_override = null;
     const seq: u64 = 200_000;
@@ -8111,7 +8112,7 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const turn_b_donating = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = true };
     const turn_b = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = false };
     const reserve_rows = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
-    try t.expectEqual(seq + transformer_mod.KVCache.RESERVE_GEN_HEADROOM + chunk, reserve_rows);
+    try t.expectEqual(seq + trunk.KVCache.RESERVE_GEN_HEADROOM + chunk, reserve_rows);
     try t.expect(reserve_rows > turn_b.capacity_tokens);
     try t.expectEqual(@as(u64, 0), turn_b.creditedRows(reserve_rows));
     try t.expectEqual(@as(u64, 364_478), turn_b_donating.creditedRows(reserve_rows));
@@ -8133,8 +8134,8 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
         PREFILL_RUNTIME_FLOOR_BYTES;
     // No score scratch (hd 256 is fused) and no dequant-GEMM weights (fwd 512
     // is below PREFILL_DQ_GEMM_MIN_M) at this width.
-    try t.expect(transformer_mod.prefillHeadDimFused(@intCast(cfg.prefillScoreHeadDim())));
-    try t.expect(chunk < transformer_mod.PREFILL_DQ_GEMM_MIN_M);
+    try t.expect(trunk.prefillHeadDimFused(@intCast(cfg.prefillScoreHeadDim())));
+    try t.expect(chunk < trunk.PREFILL_DQ_GEMM_MIN_M);
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
     try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq), needed);
 
@@ -8168,7 +8169,7 @@ test "a warm restore whose buffers hold the prompt but not the reservation bills
         const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
         const reserved = @max(reservedCacheTokens(seq, 32_000, chunk, getEffectiveContextLength(cfg)), seq);
         try t.expect(seq <= capacity and capacity < reserved);
-        const window = capacity * kv / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+        const window = capacity * kv / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS);
         try t.expect(window > 0 and window < capacity * kv);
         for ([_]bool{ true, false }) |donate| {
             const warm = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = donate };

@@ -1,13 +1,14 @@
 const std = @import("std");
+const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
 const generate_mod = @import("generate.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Generator = generate_mod.Generator;
@@ -16,8 +17,8 @@ const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const slot_admission = @import("slot_admission.zig");
-const MAX_BATCH_GROUP = slot_admission.MAX_BATCH_GROUP;
-const batchedKvKeepCount = slot_admission.batchedKvKeepCount;
+const MAX_BATCH_GROUP = sched_policy.MAX_BATCH_GROUP;
+const batchedKvKeepCount = sched_policy.batchedKvKeepCount;
 const sched = @import("arch/sched.zig");
 const slotMtpGroupable = sched.mtpGroupable;
 const Planner = @import("mtp_group_planner.zig");
@@ -32,7 +33,7 @@ const mtp_policy = @import("mtp_policy.zig");
 const LoopAction = scheduler_mod.LoopAction;
 const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
-const SpecTickMode = scheduler_mod.SpecTickMode;
+const SpecTickMode = sched_policy.SpecTickMode;
 const batchedTickRows = scheduler_mod.batchedTickRows;
 const capMtpRoundToThinkBound = scheduler_mod.capMtpRoundToThinkBound;
 const finishSlot = slot_outcome.finishSlot;
@@ -43,7 +44,7 @@ const publishSpeculativeBlock = scheduler_mod.publishSpeculativeBlock;
 const runBatchedDecodeTick = scheduler_mod.runBatchedDecodeTick;
 const runDecodeTick = scheduler_mod.runDecodeTick;
 const runSingleDecodeTick = scheduler_mod.runSingleDecodeTick;
-const specTickMode = scheduler_mod.specTickMode;
+const specTickMode = sched_policy.specTickMode;
 const thinkBoundDraftLimit = scheduler_mod.thinkBoundDraftLimit;
 const thinkBoundForcesPlain = scheduler_mod.thinkBoundForcesPlain;
 
@@ -602,7 +603,7 @@ fn groupCostSampleComplete(expected: usize, retained: []const u32, published: []
     return true;
 }
 
-fn cacheCostFormat(config: transformer_mod.KVQuantConfig) u64 {
+fn cacheCostFormat(config: trunk.KVQuantConfig) u64 {
     return (@as(u64, config.group_size) << 16) | (@as(u64, config.bits) << 8) | @backingInt(config.scheme);
 }
 
@@ -699,7 +700,7 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
 }
 
 test "only the models with per-slot head state are admitted to the MTP slot groups, whose rounds run solo" {
-    var t: transformer_mod.Transformer = undefined;
+    var t: trunk.Transformer = undefined;
     t.arch_state = .{};
     t.moe_layers = &.{};
     t.expert_stream = null;
@@ -712,7 +713,7 @@ test "only the models with per-slot head state are admitted to the MTP slot grou
 
 test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP ticks" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
-    var t: transformer_mod.Transformer = undefined;
+    var t: trunk.Transformer = undefined;
     var forced = [_]u32{7};
     var tb = mtp_plan.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
     var gen: Generator = undefined;
@@ -860,13 +861,13 @@ test "group cost geometry rejects partial rounds and keeps complete cache format
     try testing.expect(!groupCostSampleComplete(3, &.{ 1, 3 }, &.{ true, true }));
     try testing.expect(!groupCostSampleComplete(2, &.{ 1, 0 }, &.{ true, true }));
     try testing.expect(!groupCostSampleComplete(2, &.{ 1, 3 }, &.{ true, false }));
-    const a = transformer_mod.KVQuantConfig.affine(8);
+    const a = trunk.KVQuantConfig.affine(8);
     var b = a;
     b.group_size = 128;
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
-    try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)));
-    try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(6)));
-    try testing.expect(cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(6)));
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(trunk.KVQuantConfig.affine(4)));
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(trunk.KVQuantConfig.affine(6)));
+    try testing.expect(cacheCostFormat(trunk.KVQuantConfig.affine(4)) != cacheCostFormat(trunk.KVQuantConfig.affine(6)));
 }
 
 test "scheduler prices each shared execution once and preserves row sampling geometry" {

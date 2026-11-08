@@ -1,4 +1,4 @@
-const trf = @import("transformer.zig");
+const mlx_util = @import("mlx_util.zig");
 const trunk = @import("trunk.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
 const std = @import("std");
@@ -28,10 +28,10 @@ const mixedNaxShapeEnabled = verify_qmm.mixedNaxShapeEnabled;
 const mixedPlainEnabled = verify_qmm.mixedPlainEnabled;
 const verifyQmm = verify_qmm.verifyQmm;
 const verifyQmmEnabled = verify_qmm.verifyQmmEnabled;
-const gatherExpertMm = trf.gatherExpertMm;
-const lastDim = trf.lastDim;
-const msvQmvRows = trf.msvQmvRows;
-const transposeBf16Weight = trf.transposeBf16Weight;
+const gatherExpertMm = trunk.gatherExpertMm;
+const lastDim = mlx_util.lastDim;
+const msvQmvRows = trunk.msvQmvRows;
+const transposeBf16Weight = mlx_util.transposeBf16Weight;
 
 const bf16Trunc = test_support.bf16Trunc;
 const evalToF32 = test_support.evalToF32;

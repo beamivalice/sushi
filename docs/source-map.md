@@ -21,7 +21,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `arch/registry.zig` / `arch/*.zig` / `arch_host.zig` / `<arch>/arch.zig` | the only arch names outside a folder, `inline else` dispatch per area, the engine services an arch may import, each arch's public face | engine-arch-seam |
 | `trunk.zig` | `Trunk`: embeddings, lm head, rope/M-RoPE/YaRN tables, compiled closures, the MoE family, eval cadence, the warmup scaffold; `Transformer` is its alias | arch-*, engine-* |
 | `model_handle.zig` | `ForwardCtx`, `CaptureLayers`, the loaded-model operations that dispatch through the registry (`deinit`, `resetCache`, `warmup`, `forwardWith`, ...) | arch-* |
-| `transformer.zig` | compatibility re-exports of the names that moved to `trunk.zig` / `model_handle.zig`; shrinks as arch stages move their callers | arch-* |
+| `transformer.zig` | the qwen4 names shared files still reach with no arch hook; leaves with S4-qwen4 | arch-* |
 | `mlx_util.zig` / `trunk_helpers_test.zig` | MLX helpers with no model knowledge (scalars, owned copy, masks); test-only fixtures shared by the trunk, KV, attention and MoE tests | engine-mlx-gotchas |
 | `<arch>/<arch>_state.zig` | what an arch owns beyond the trunk: load, `deinit`, cache reset | arch-* |
 | `kv_cache.zig` / `ssm_cache.zig` / `layer_weights` / `forward_diag` / `test_support` | KV/SSM caches, quant resolution, layer weights, `diagEnvOn` | arch-*, engine-* |

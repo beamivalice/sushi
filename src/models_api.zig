@@ -1,9 +1,10 @@
 const std = @import("std");
+const sched_policy = @import("sched_policy.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const generate_mod = @import("generate.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const chat_mod = @import("chat.zig");
@@ -283,7 +284,7 @@ test "a quantized pack loaded resident advertises no streaming, the same pack st
     const default_row = try renderModelEntry(t.allocator, io, &entry);
     defer t.allocator.free(default_row);
     try t.expect(std.mem.indexOf(u8, default_row, "\"kv_quant\":\"8\",\"kv_cache\":{\"scheme\":\"kv8\",\"source\":\"default\"}") != null);
-    cfg.kv_quant_override = transformer_mod.KVQuantConfig.dense;
+    cfg.kv_quant_override = trunk.KVQuantConfig.dense;
     const setting_row = try renderModelEntry(t.allocator, io, &entry);
     defer t.allocator.free(setting_row);
     try t.expect(std.mem.indexOf(u8, setting_row, "\"kv_quant\":\"off\",\"kv_cache\":{\"scheme\":\"off\",\"source\":\"model-settings.json\"}") != null);
@@ -724,7 +725,7 @@ fn renderPropsBody(
 
 /// The /props "batching" object: whether the loaded model rides the batched
 /// decode kernel, and why not when it does not.
-fn batchingPropsJson(allocator: std.mem.Allocator, why: slot_admission.BatchVerdict, max_group: usize) ![]u8 {
+fn batchingPropsJson(allocator: std.mem.Allocator, why: sched_policy.BatchVerdict, max_group: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, ",\"batching\":{{\"supported\":{s},\"reason\":\"{s}\",\"max_group\":{d}}}", .{
         if (why == .ok) "true" else "false",
         @tagName(why),
@@ -748,7 +749,7 @@ fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) ![]u
 const PropsSettings = struct {
     engine: []const u8,
     kv_quant: []const u8,
-    kv_cache: transformer_mod.KvCacheChoice = .{ .config = transformer_mod.KVQuantConfig.engine_default, .source = .default },
+    kv_cache: trunk.KvCacheChoice = .{ .config = trunk.KVQuantConfig.engine_default, .source = .default },
     prefill_chunk: usize,
     prefill_decode_share: f32 = 0,
     mtp_loaded: bool,
@@ -934,7 +935,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     // whenever no table is warming, so the object is absent off qwen4_exp.
     const ngram_json = try ngramWarmPropsJson(allocator, arch_serve.warmBytes(.acquire), arch_serve.warmTotal(.acquire));
     defer allocator.free(ngram_json);
-    const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm), if (lm.config) |c| slot_admission.batchGroupCap(c) else slot_admission.MAX_BATCH_GROUP);
+    const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm), if (lm.config) |c| slot_admission.batchGroupCap(c) else sched_policy.MAX_BATCH_GROUP);
     defer allocator.free(batching_json);
     const volume = try disk_placement.cacheVolume(allocator);
     defer volume.deinit(allocator);
@@ -976,7 +977,7 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     defer allocator.free(update_json);
     const body = try std.fmt.allocPrint(allocator,
         \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}}}
-    , .{ active_mem, peak_mem, available_mem, metrics.getTotalMemBytes(), slot_admission.MAX_BATCH_GROUP, update_json });
+    , .{ active_mem, peak_mem, available_mem, metrics.getTotalMemBytes(), sched_policy.MAX_BATCH_GROUP, update_json });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -1140,7 +1141,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     const frag = try settingsPropsJson(testing.allocator, .{
         .engine = "mlx",
         .kv_quant = "4",
-        .kv_cache = transformer_mod.KvCacheChoice.resolve(null, transformer_mod.KVQuantConfig.affine(4)),
+        .kv_cache = trunk.KvCacheChoice.resolve(null, trunk.KVQuantConfig.affine(4)),
         .prefill_chunk = 8192,
         .mtp_loaded = true,
         .mtp_default_on = true,

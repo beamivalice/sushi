@@ -39,8 +39,10 @@ joins `DROPPABLE` when its drop passes.
   warmup scaffold) plus the arch's own state, which lives in `src/<arch>/<arch>_state.zig` (load, `deinit`, cache
   reset). `Trunk.deinit`, `resetCache` and `warmup` are `model_handle.zig` operations that dispatch to the arch, which
   frees or resets its own state and then calls the trunk's `deinitTrunk` / `resetTrunk` / `warmupTrunk`.
-  `Transformer` is an alias of `Trunk`, and `transformer.zig` re-exports the names that moved, until the arch stages
-  move their callers. No `Trunk` field names an arch, and `trunk.zig` re-exports no arch module's names; MiMo's three
+  `Transformer` is an alias of `Trunk`. `transformer.zig` is down to the qwen4 names that the prefix cache, the SSD
+  tier, the scheduler's admission, `generate.zig`, `model.zig`, `main.zig` and `arch/sched.zig` still reach with no
+  arch hook (the QSA history, the SSM member generation, the gather floor, the env warm-up); each leaves with its hook
+  in S4-qwen4, and the file with the last. No `Trunk` field names an arch, and `trunk.zig` re-exports no arch module's names; MiMo's three
   `ForwardCtx` fields (`verify_rows`, `batch_rows`, `batch_row_offsets`) are the last to move into `arch_ctx`.
 - **The trunk archs' hooks.** `initTrunk` fills the state last, through `arch_state.initState`: the config's arch's
   `State.init` gets `InitArgs` (allocator, config, weights, name prefix, stream, the trunk's owned arrays) and returns

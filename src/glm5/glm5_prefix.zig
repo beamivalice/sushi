@@ -18,6 +18,7 @@ const log = @import("../log.zig");
 const ssmCheckpointBytes = trunk_mod.ssmCheckpointBytes;
 const pc = @import("../prefix_cache.zig");
 const prefix_arch = @import("../arch/prefix.zig");
+const flags = @import("glm5_flags.zig");
 
 /// The live request a lookup restores into.
 pub const State = *forward.Request;
@@ -503,7 +504,7 @@ pub fn restoreDisk(
     dflash_target: ?pc.DflashTarget,
     s: mlx.mlx_stream,
 ) ?pc.LookupResult {
-    const bits = target_cache.config.glmLatentBits() orelse return null;
+    const bits = flags.latentBits(target_cache.config) orelse return null;
     const quant = diskQuant(bits);
     const hm = d.bestHybridMatch(prompt_ids, has_tools, quant, @intCast(prompt_ids.len), media_limits) orelse return null;
     if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) return null;

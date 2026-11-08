@@ -37,6 +37,8 @@ const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
 const arch_state = @import("arch/arch_state.zig");
 const transformer_mod = @import("transformer.zig");
+const model_handle = @import("model_handle.zig");
+const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const spec_stats = @import("spec_stats.zig");
@@ -63,10 +65,10 @@ const io_util = @import("io_util.zig");
 const status = @import("status.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 
-const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
-const SSMCacheEntry = transformer_mod.SSMCacheEntry;
-const ForwardCtx = transformer_mod.ForwardCtx;
+const Transformer = trunk.Transformer;
+const KVCache = trunk.KVCache;
+const SSMCacheEntry = trunk.SSMCacheEntry;
+const ForwardCtx = model_handle.ForwardCtx;
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
@@ -89,6 +91,7 @@ const slot_admission = @import("slot_admission.zig");
 const vision_queue = @import("vision_queue.zig");
 const model_load = @import("model_load.zig");
 const sched = @import("arch/sched.zig");
+const arch_prefix = @import("arch/prefix.zig");
 
 /// A session row with `request_id` 0 is a cached entry, not a request, so live ids start at 1.
 pub const first_request_id: u64 = 1;
@@ -147,7 +150,7 @@ pub const SubmitParams = struct {
     /// config instead of `Scheduler.kv_quant`. Lets one server host a
     /// single model and let clients trade accuracy for context length on a
     /// per-call basis (`{"kv_quant": "off"|4|8}` body field).
-    kv_quant_config: ?transformer_mod.KVQuantConfig = null,
+    kv_quant_config: ?trunk.KVQuantConfig = null,
     /// Plan 05 Phase D: the target model for this request. The conn thread
     /// resolves this via `scheduler.ensureLoaded(id)` BEFORE submitting and
     /// keeps a refcount on it for the slot's lifetime, so the model can't
@@ -172,18 +175,18 @@ pub const CheckpointPlan = struct {
 /// arguments are the restored rows, their capacity, and whether the restore checked the
 /// entry out (the only restore whose rows the request will not allocate); then MTP and the GLM
 /// checkpoints the request keeps (`server.WarmPrefix.checkpoints`).
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) bool = null;
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, trunk.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) bool = null;
 
 /// {needed, available, commit} of the same cold bill, live memory re-read (`server.prefillBillNumbersNow`).
 /// Null (unit tests) skips the inference thread's hold for an ungated arch.
-pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, bool) slot_admission.MemoryBill = null;
+pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usize, u32, trunk.KVQuantConfig, bool, bool) slot_admission.MemoryBill = null;
 
 /// The prefill width this request should run at, chosen against live post-eviction memory
 /// (`server.requestPrefillChunkNow`). Null keeps the model's load-time pin.
-pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
+pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, trunk.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
 /// The same chooser for the load-time prefill meter, installed before the load (the one above
 /// arrives after it); only the meter reads it.
-pub var prefill_ubench_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
+pub var prefill_ubench_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, trunk.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
 
 /// Asked by the prefill loop: the width of the next chunk, re-priced at every chunk boundary
 /// (`server.adaptivePrefillWidthNow`). Null keeps the admitted width.
@@ -211,7 +214,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) ?model_registry_mod.MemoryContextRefusal = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, trunk.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) ?model_registry_mod.MemoryContextRefusal = null;
 
 /// GPU bytes a vision encode may still take, read live (`request_media.visionEncodeAvailable`). Null skips the recheck.
 pub var vision_encode_available: ?*const fn (*const model_mod.ModelConfig) u64 = null;
@@ -474,7 +477,7 @@ pub const Slot = struct {
         io: std.Io,
         config: *const ModelConfig,
         params: SubmitParams,
-        kv_quant_config: transformer_mod.KVQuantConfig,
+        kv_quant_config: trunk.KVQuantConfig,
     ) !*Slot {
         const slot = try allocator.create(Slot);
         errdefer allocator.destroy(slot);
@@ -507,7 +510,7 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                transformer_mod.ssmFreeQsaState(e);
+                arch_prefix.aux.ssmFreeQsaState(e);
             }
             allocator.free(entries);
         };
@@ -633,7 +636,7 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                transformer_mod.ssmFreeQsaState(e);
+                arch_prefix.aux.ssmFreeQsaState(e);
             }
             self.allocator.free(entries);
         }
@@ -941,7 +944,7 @@ pub const LoadRequest = struct {
 
     load_vision: bool = false,
     warmup_eager: bool = true,
-    kv_quant: ?transformer_mod.KVQuantConfig = null,
+    kv_quant: ?trunk.KVQuantConfig = null,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_ram_enabled: bool = true,
     prefix_cache_mem_bytes: u64 = 0,
@@ -1037,7 +1040,7 @@ pub const Scheduler = struct {
     vision_encoder: ?*VisionEncoder,
     dflash: ?*DflashModel = null,
     drafter_block_size: u32,
-    kv_quant: ?transformer_mod.KVQuantConfig,
+    kv_quant: ?trunk.KVQuantConfig,
     /// `LoadParams.ctx_size`, retained so every load resolves its context
     /// against the launch flag (`model_settings.contextPick`).
     ctx_size_flag: u32,
@@ -1496,7 +1499,7 @@ pub const Scheduler = struct {
         if ((params.full_prompt orelse params.prompt_ids).len == 0) return error.EmptyPrompt;
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
         const eff_kv_quant = params.kv_quant_config orelse
-            transformer_mod.KvCacheChoice.resolve(self.kv_quant, slot_config.kv_quant_override).config;
+            trunk.KvCacheChoice.resolve(self.kv_quant, slot_config.kv_quant_override).config;
         try sched.checkKvQuant(slot_config, eff_kv_quant);
         return Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
     }
@@ -2036,7 +2039,7 @@ pub const Scheduler = struct {
         const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_drafter or slot.enable_mtp);
         // A runtime-disabled generator is already ticking regular, so batching it
         // dispatches what it was going to dispatch anyway.
-        return gen.spec_disabled_runtime or specTickMode(
+        return gen.spec_disabled_runtime or sched_policy.specTickMode(
             slot.enable_mtp,
             gen.mtp != null or gen.dspark,
             slot.enable_drafter,
@@ -2063,7 +2066,7 @@ pub const Scheduler = struct {
     /// Why a slot does or does not ride the batched kernel. `.ok` batches; every
     /// other arm decodes serial this tick and is what the `[batched] serial` line
     /// and `decode_serial_total{reason}` name.
-    pub fn batchVerdict(self: *const Scheduler, slot: *const Slot) slot_admission.BatchVerdict {
+    pub fn batchVerdict(self: *const Scheduler, slot: *const Slot) sched_policy.BatchVerdict {
         _ = self;
         return sched_policy.batchVerdictOf(.{
             .ticks_regular = slotTicksRegular(slot),
@@ -2390,9 +2393,9 @@ fn admitPendingLocked(sch: *Scheduler, to_prefill: *[TO_PREFILL_MAX]*Slot) usize
     // in `inferenceLoop` never blocks while `pending` is non-empty,
     // so a held slot admits on the first tick after the active one
     // is culled (step 5, same mutex).
-    var live_buf: [32]slot_admission.AdmitCand = undefined;
+    var live_buf: [32]sched_policy.AdmitCand = undefined;
     const n_live = slot_admission.heldExclusive(&live_buf, &.{ sch.decoding.items, sch.cleanup_queue.items }, slot_admission.slotExclusiveDecode);
-    var cand_buf: [32]slot_admission.AdmitCand = undefined;
+    var cand_buf: [32]sched_policy.AdmitCand = undefined;
     const n_cands = @min(sch.pending.items.len, cand_buf.len);
     for (sch.pending.items[0..n_cands], 0..) |s, i| {
         cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slot_admission.slotExclusiveDecode(s) };
@@ -2853,7 +2856,7 @@ pub fn slotStateBytes(s: *const Slot) u64 {
         if (gen.dflash_ctx) |*ctx| bytes += ctx.cache.residentBytes();
     }
     if (s.ssm_entries) |ents| for (ents) |*e| {
-        bytes += transformer_mod.ssmEntryBytes(e);
+        bytes += trunk.ssmEntryBytes(e);
     };
     return bytes + s.ring_cps.bytes() + sched.modelStateBytes(s);
 }
@@ -2971,7 +2974,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     }
     settleThoughtPoint(slot, gen_ptr);
     const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
-    const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
+    const ssm_cps_opt: ?[]trunk.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
         // Empty list — free the (zero-length) slice we got back so the
         // allocator's bookkeeping stays clean.
@@ -3084,7 +3087,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         log.debug("[hot-cache] cancelled prefill forwarded < {d} tokens — below the commit floor; not committed\n", .{prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS});
         return;
     };
-    const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
+    const cps: ?[]trunk.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
     sched.prepareCommit(slot) catch return;
     // Pass the media boundary RAW: when the cancelled prefill forwarded less
     // than the media position, the cache re-keys the pure-text entry to the
@@ -3184,7 +3187,7 @@ const InterleaveCtx = struct {
 /// SSD-first write-through: persist each completed prefill chunk as the prefill produces it,
 /// so a cancelled or killed prefill leaves a restorable chunk-aligned prefix. Armed only with
 /// a live background writer, so the inference thread never pays the file write.
-fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []transformer_mod.SSMCheckpoint) void {
+fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trunk.SSMCheckpoint) void {
     const wc: *WriteThroughCtx = @ptrCast(@alignCast(opaque_ctx));
     const slot = wc.slot;
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
@@ -3251,7 +3254,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
 /// A write-through request holds two whatever it lists (`HotPrefixCache.writeThroughHybrid`).
 fn qwenCheckpointCap(slot: *Slot, cp_max: u32, write_through: bool) u32 {
     if (!qwenCheckpointCapped(slot, write_through)) return cp_max;
-    const cap = transformer_mod.SSM_RESIDENT_MAX - 1;
+    const cap = trunk.SSM_RESIDENT_MAX - 1;
     return if (cp_max == 0) cap else @min(cp_max, cap);
 }
 
@@ -3652,7 +3655,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 cfg: *const model_mod.ModelConfig,
                 seq: usize,
                 max_tokens: u32,
-                kv_cfg: transformer_mod.KVQuantConfig,
+                kv_cfg: trunk.KVQuantConfig,
                 unchunked: bool,
                 /// The prefix the hot cache restored and the capacity its buffers hold: already
                 /// inside active memory, so billing them again invents a copy.
@@ -3663,7 +3666,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 enable_mtp: bool,
                 /// The KDA checkpoints a GLM request keeps: billed here only, and fewer where they do not fit.
                 checkpoints: CheckpointPlan,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) bool,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, trunk.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) bool,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
                     return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp, self.checkpoints);
@@ -4002,11 +4005,11 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // share a transformer. We partition `batchable` by `slot.model` and
     // emit one batched call per model. The non-batchable bucket doesn't
     // care — each slot runs against its own `slot.model.transformer.?`.
-    var batchable_buf: [slot_admission.MAX_BATCH_GROUP]*Slot = undefined;
+    var batchable_buf: [sched_policy.MAX_BATCH_GROUP]*Slot = undefined;
     var batchable_n: usize = 0;
-    var mtp_buf: [slot_admission.MAX_BATCH_GROUP]*Slot = undefined;
+    var mtp_buf: [sched_policy.MAX_BATCH_GROUP]*Slot = undefined;
     var mtp_n: usize = 0;
-    var rows_buf: [slot_admission.MAX_BATCH_GROUP]*Slot = undefined;
+    var rows_buf: [sched_policy.MAX_BATCH_GROUP]*Slot = undefined;
     var rows_n: usize = 0;
     for (active) |s| {
         const why = sch.batchVerdict(s);
@@ -4109,7 +4112,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
                     log.info("[batched] pad-waste cap: kept {d} of {d} slots (waste {d:.2}x, kv_len {d}..{d}), rest serial\n", .{
                         keep,
                         group.len,
-                        slot_admission.batchedPadWaste(kv_lens[0..group.len]),
+                        sched_policy.batchedPadWaste(kv_lens[0..group.len]),
                         kv_lens[0],
                         kv_lens[group.len - 1],
                     });
@@ -4133,8 +4136,6 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
 }
 
-pub const SpecTickMode = sched_policy.SpecTickMode;
-pub const specTickMode = sched_policy.specTickMode;
 
 /// Drive one Generator step (regular / DFlash / MTP) and push emitted
 /// tokens into the slot's output ring. Mirrors the existing
@@ -4459,7 +4460,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
     // generators handle the disabled fallback internally.
-    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundForcesPlain(gen)) .regular else specTickMode(
+    const tick_mode: sched_policy.SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundForcesPlain(gen)) .regular else sched_policy.specTickMode(
         slot.enable_mtp,
         gen.mtp != null or gen.dspark,
         slot.enable_drafter,
@@ -4821,19 +4822,19 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // already-emitted token, corrupting any stream whose slot joined a
     // batch mid-generation (tests/test_batched_transition.sh). Slots that
     // finish during the drain are excluded from the batch.
-    if (N > slot_admission.MAX_BATCH_GROUP) return error.BatchGroupTooWide;
-    var live_buf: [slot_admission.MAX_BATCH_GROUP]*Slot = undefined;
+    if (N > sched_policy.MAX_BATCH_GROUP) return error.BatchGroupTooWide;
+    var live_buf: [sched_policy.MAX_BATCH_GROUP]*Slot = undefined;
     const live = live_buf[0..N];
     const live_n = try batchedTickRows(sch, active, live);
     if (live_n == 0) return;
     var batch = live[0..live_n];
 
     // Build inputs.
-    var next_tokens_buf: [slot_admission.MAX_BATCH_GROUP]u32 = undefined;
+    var next_tokens_buf: [sched_policy.MAX_BATCH_GROUP]u32 = undefined;
     const next_tokens = next_tokens_buf[0..live_n];
-    var ctxs_buf: [slot_admission.MAX_BATCH_GROUP]*ForwardCtx = undefined;
+    var ctxs_buf: [sched_policy.MAX_BATCH_GROUP]*ForwardCtx = undefined;
     const ctxs = ctxs_buf[0..live_n];
-    var rope_offsets_buf: [slot_admission.MAX_BATCH_GROUP]u32 = undefined;
+    var rope_offsets_buf: [sched_policy.MAX_BATCH_GROUP]u32 = undefined;
     const rope_offsets = rope_offsets_buf[0..live_n];
 
     for (batch, 0..) |slot, i| {
@@ -4895,9 +4896,9 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // the initWithOptions chokepoint and carries the model's
     // reserved-token suppression mask; the slot's copy is the raw
     // request params.
-    var sample_params: [slot_admission.MAX_BATCH_GROUP]sampler.SamplingParams = undefined;
-    var sample_rows: [slot_admission.MAX_BATCH_GROUP]mlx.mlx_array = undefined;
-    var sample_ids: [slot_admission.MAX_BATCH_GROUP]i32 = undefined;
+    var sample_params: [sched_policy.MAX_BATCH_GROUP]sampler.SamplingParams = undefined;
+    var sample_rows: [sched_policy.MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var sample_ids: [sched_policy.MAX_BATCH_GROUP]i32 = undefined;
     std.debug.assert(batch.len == logits_arr.len);
     std.debug.assert(batch.len <= sample_params.len);
     var shifted_n: usize = 0;
@@ -4977,8 +4978,8 @@ const testing = std.testing;
 pub const expectError = @import("test_expect.zig").expectError;
 
 test "a live MTP slot never ticks regular, an unarmed one always does" {
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false));
+    try testing.expectEqual(sched_policy.SpecTickMode.mtp, sched_policy.specTickMode(true, true, false, false));
+    try testing.expectEqual(sched_policy.SpecTickMode.regular, sched_policy.specTickMode(true, false, false, false));
 }
 
 test "complete keeps a slot in decoding until its pass is out, so admission never misses it" {
@@ -5500,16 +5501,16 @@ test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitte
     model.transformer = null;
     model.prefix_cache = null;
 
-    const Case = struct { body: std.json.Value, want: transformer_mod.KVQuantConfig };
+    const Case = struct { body: std.json.Value, want: trunk.KVQuantConfig };
     for ([_]Case{
-        .{ .body = .{ .integer = 16 }, .want = transformer_mod.KVQuantConfig.dense },
-        .{ .body = .{ .string = "16" }, .want = transformer_mod.KVQuantConfig.dense },
-        .{ .body = .{ .integer = 8 }, .want = transformer_mod.KVQuantConfig.affine(8) },
-        .{ .body = .{ .integer = 6 }, .want = transformer_mod.KVQuantConfig.affine(6) },
-        .{ .body = .{ .string = "6" }, .want = transformer_mod.KVQuantConfig.affine(6) },
-        .{ .body = .{ .integer = 4 }, .want = transformer_mod.KVQuantConfig.affine(4) },
+        .{ .body = .{ .integer = 16 }, .want = trunk.KVQuantConfig.dense },
+        .{ .body = .{ .string = "16" }, .want = trunk.KVQuantConfig.dense },
+        .{ .body = .{ .integer = 8 }, .want = trunk.KVQuantConfig.affine(8) },
+        .{ .body = .{ .integer = 6 }, .want = trunk.KVQuantConfig.affine(6) },
+        .{ .body = .{ .string = "6" }, .want = trunk.KVQuantConfig.affine(6) },
+        .{ .body = .{ .integer = 4 }, .want = trunk.KVQuantConfig.affine(4) },
     }) |c| {
-        const override = transformer_mod.KVQuantConfig.fromJsonValue(c.body).?;
+        const override = trunk.KVQuantConfig.fromJsonValue(c.body).?;
         const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = override });
         try testing.expectEqual(c.want, slot.ctx.cache.config);
         sch.complete(slot);
@@ -5906,7 +5907,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     defer model.prefix_cache.?.entries.deinit(testing.allocator);
     sch.hot_prefix_cache = &model.prefix_cache.?;
 
-    var cp_entries = [_]transformer_mod.KVCacheEntry{transformer_mod.newEmptyKVEntry()};
+    var cp_entries = [_]trunk.KVCacheEntry{trunk.newEmptyKVEntry()};
     _ = mlx.mlx_zeros(&cp_entries[0].keys, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);
     defer _ = mlx.mlx_array_free(cp_entries[0].keys);
     _ = mlx.mlx_zeros(&cp_entries[0].values, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);

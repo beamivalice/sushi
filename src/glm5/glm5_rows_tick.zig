@@ -1,6 +1,8 @@
 const std = @import("std");
+const sched_policy = @import("../sched_policy.zig");
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
+const glm5_flags = @import("glm5_flags.zig");
 const glm5_state = @import("glm5_state.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const generate_mod = @import("../generate.zig");
@@ -40,7 +42,7 @@ const glmStreamedDrafterOff = model_load.glmStreamedDrafterOff;
 const postPrefillTerminal = scheduler_mod.postPrefillTerminal;
 const publishSpeculativeBlock = scheduler_mod.publishSpeculativeBlock;
 const recordSlotCleanup = slot_outcome.recordSlotCleanup;
-const specTickMode = scheduler_mod.specTickMode;
+const specTickMode = sched_policy.specTickMode;
 
 test "a streamed GLM load leaves a found assistant unloaded and refuses an asked-for one" {
     var glm = ModelConfig{ .model_type = "glm5_next" };
@@ -99,7 +101,8 @@ pub fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request:
 
 /// DIAGNOSTIC (SUSHI_GLM_ROWS_UBENCH=N): `glm5_rows_ubench.run` per `_CTX=<tokens>[,<tokens>...]`
 /// (default 1024) over `_TEXT=<abs path>`.
-pub fn glmRowsUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").Model, latent_bits: u8, tok: *Tokenizer) void {
+pub fn glmRowsUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").Model, kv: trunk_mod.KVQuantConfig, tok: *Tokenizer) void {
+    const latent_bits = glm5_flags.latentBits(kv) orelse 0;
     const tio = std.Io.Threaded.global_single_threaded.io();
     const rounds = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_GLM_ROWS_UBENCH").?, 0), 10) catch 8);
     const ctxs: []const u8 = if (std.c.getenv("SUSHI_GLM_ROWS_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "1024";
@@ -119,7 +122,8 @@ pub fn glmRowsUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zi
 
 /// DIAGNOSTIC (SUSHI_GLM_ROUND_UBENCH=N): `glm5_round_ubench.run` per `_CTX=<tokens>[,<tokens>...]`
 /// (default 8192) over `_TEXT=<abs path>`.
-pub fn glmRoundUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").Model, assistant: *DflashModel, latent_bits: u8, tok: *Tokenizer) void {
+pub fn glmRoundUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").Model, assistant: *DflashModel, kv: trunk_mod.KVQuantConfig, tok: *Tokenizer) void {
+    const latent_bits = glm5_flags.latentBits(kv) orelse 0;
     const tio = std.Io.Threaded.global_single_threaded.io();
     const rounds = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_GLM_ROUND_UBENCH").?, 0), 10) catch 64);
     const ctxs: []const u8 = if (std.c.getenv("SUSHI_GLM_ROUND_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "8192";

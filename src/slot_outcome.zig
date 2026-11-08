@@ -1,4 +1,5 @@
 const std = @import("std");
+const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
 const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -21,7 +22,7 @@ const commitSlotIfApplicable = scheduler_mod.commitSlotIfApplicable;
 const expectOutcomes = scheduler_mod.expectOutcomes;
 const publishHotCacheResidency = scheduler_mod.publishHotCacheResidency;
 const releaseNativeState = scheduler_mod.releaseNativeState;
-const specTickMode = scheduler_mod.specTickMode;
+const specTickMode = sched_policy.specTickMode;
 
 /// Phase A6: finalize a slot. Commits to hot prefix cache (if applicable)
 /// before signaling completion. The order matters: commit first while the

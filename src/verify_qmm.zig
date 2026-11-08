@@ -1,4 +1,4 @@
-const trf = @import("transformer.zig");
+const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const test_support = @import("test_support.zig");
@@ -11,8 +11,8 @@ const nax_gate = @import("nax_gate.zig");
 const naxMinMForBits = nax_gate.naxMinMForBits;
 const verifyQmmNaxAvailable = nax_gate.verifyQmmNaxAvailable;
 const verifyQmmNaxEnabled = nax_gate.verifyQmmNaxEnabled;
-const VerifyQmmParity = trf.VerifyQmmParity;
-const verifyQmmParityVerdict = trf.verifyQmmParityVerdict;
+const VerifyQmmParity = trunk_helpers_test.VerifyQmmParity;
+const verifyQmmParityVerdict = trunk_helpers_test.verifyQmmParityVerdict;
 
 /// Runtime codegen of the per-M split-K kernel body. The row loads, weight
 /// loads, and dequant+FMA chains are emitted as NAMED SCALARS with LITERAL

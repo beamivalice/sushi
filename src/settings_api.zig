@@ -1095,7 +1095,7 @@ test "settings api: each model lists the limits its arch and pack put on its key
     defer file.deinit();
     const locks: model_settings.LaunchLocks = .{};
     const rows = [_]ModelRow{
-        .{ .id = "latent", .path = "/m/a", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false, .context_cap = 131072 } },
+        .{ .id = "latent", .path = "/m/a", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .kv_choices = &.{ "off", "0", "16", "6", "8" }, .serves_mtp = false, .context_cap = 131072 } },
         .{ .id = "dropped", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "b", .streams_experts = true, .has_vision = false, .head_streams = false } },
         .{ .id = "plain", .path = "/m/c", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "c", .streams_experts = true, .has_vision = true } },
         .{ .id = "bare", .path = "/m/d", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true, .template_preserves_thinking = false } },
@@ -1135,7 +1135,7 @@ test "settings api: a save the model cannot honour is refused with its reason, a
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const latent: model_settings.Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false };
+    const latent: model_settings.Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .kv_choices = &.{ "off", "0", "16", "6", "8" }, .serves_mtp = false };
     const four = refusalMessage(arena, latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "4" } }}).?;
     try testing.expect(std.mem.indexOf(u8, four, "\"kv_quant\"") != null);
     try testing.expect(refusalMessage(arena, latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "off" } }}) == null);

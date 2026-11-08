@@ -4,7 +4,8 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const chat_mod = @import("chat.zig");
 const tokenizer_mod = @import("tokenizer.zig");
-const transformer_mod = @import("transformer.zig");
+const model_handle = @import("model_handle.zig");
+const trunk = @import("trunk.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const model_load = @import("model_load.zig");
 const model_settings_mod = @import("model_settings.zig");
@@ -35,7 +36,7 @@ pub const Options = struct {
     no_template: bool = false,
     ctx_size: u32 = 0,
     /// Dense, not the serving default: the teacher adds no quantization of its own.
-    kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
+    kv_quant_config: trunk.KVQuantConfig = trunk.KVQuantConfig.dense,
     /// `--qwen-gdn 16` stores the GDN state in bf16, so a student arm can be scored against the f32 teacher.
     qwen_gdn_f32: bool = true,
     /// DeepSeek only, compare only: the student drops this many routed experts a layer by the pack's usage list.
@@ -168,7 +169,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .top_k => o.top_k = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .limit => o.limit = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .ctx_size => o.ctx_size = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
-                .kv_quant => o.kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
+                .kv_quant => o.kv_quant_config = trunk.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
                 .qwen_gdn => o.qwen_gdn_f32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
                 .drop_expert => o.drop_expert = @import("dsv41/expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
@@ -248,7 +249,7 @@ pub const USAGE =
     \\
 ;
 
-pub fn kvCacheFormat(cfg: transformer_mod.KVQuantConfig) []const u8 {
+pub fn kvCacheFormat(cfg: trunk.KVQuantConfig) []const u8 {
     return switch (cfg.scheme) {
         .off => "bf16",
         .affine => switch (cfg.bits) {
@@ -267,7 +268,7 @@ pub const Loaded = struct {
     tok: tokenizer_mod.Tokenizer,
     chat_config: chat_mod.ChatConfig,
     weights: model_mod.Weights,
-    xfm: transformer_mod.Transformer,
+    xfm: trunk.Transformer,
 
     pub fn deinit(self: *Loaded) void {
         const allocator = self.allocator;
@@ -350,7 +351,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     errdefer self.weights.deinit();
     model_mod.resolveWeightPrefix(&self.config, &self.weights);
 
-    self.xfm = try transformer_mod.Transformer.init(io, allocator, self.config, &self.weights);
+    self.xfm = try trunk.Transformer.init(io, allocator, self.config, &self.weights);
     errdefer self.xfm.deinit();
     if (opts.kv_quant_config.scheme != .off) {
         try self.xfm.cache.reinit(self.config.num_hidden_layers, opts.kv_quant_config);
@@ -372,7 +373,7 @@ fn logitsVocab(logits: mlx.mlx_array) !usize {
     return @intCast(shape[2]);
 }
 
-pub fn readLastRow(xfm: *transformer_mod.Transformer, logits: mlx.mlx_array, dst: []f32) !void {
+pub fn readLastRow(xfm: *trunk.Transformer, logits: mlx.mlx_array, dst: []f32) !void {
     const shape = mlx.getShape(logits);
     if (shape.len != 3 or @as(usize, @intCast(shape[2])) != dst.len) return error.KldLogitsShape;
     var row = mlx.mlx_array_new();
@@ -430,11 +431,11 @@ pub fn promptChunk(config: *const model_mod.ModelConfig) usize {
     return config.prefillStartWidth();
 }
 
-pub fn forwardPrompt(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
+pub fn forwardPrompt(allocator: std.mem.Allocator, l: *Loaded, ctx: *model_handle.ForwardCtx, ids: []const u32) !mlx.mlx_array {
     return forwardPromptChunks(allocator, l, ctx, ids, promptChunk(&l.config));
 }
 
-pub fn forwardPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, chunk: usize) !mlx.mlx_array {
+pub fn forwardPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *model_handle.ForwardCtx, ids: []const u32, chunk: usize) !mlx.mlx_array {
     if (ids.len == 0 or chunk == 0) return error.EmptyPrompt;
     const prompt_i32 = try allocator.alloc(i32, ids.len);
     defer allocator.free(prompt_i32);
@@ -455,7 +456,7 @@ pub fn forwardPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *trans
 }
 
 /// The prompt forward; with `hidden`, every block boundary of it is appended there.
-fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, hidden: ?*hidden_capture.Writer) !mlx.mlx_array {
+fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *model_handle.ForwardCtx, ids: []const u32, hidden: ?*hidden_capture.Writer) !mlx.mlx_array {
     const w = hidden orelse return forwardPrompt(allocator, l, ctx, ids);
     if (try offline.capturePrompt(allocator, l, ctx, ids, w, promptChunk(&l.config))) |logits| return logits;
     const layers = l.config.num_hidden_layers;
@@ -468,7 +469,7 @@ fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *transfor
     defer for (rows) |r| {
         _ = mlx.mlx_array_free(r);
     };
-    var cl: transformer_mod.CaptureLayers = .{ .ids = layer_ids, .out = rows[1..], .input = &rows[0] };
+    var cl: model_handle.CaptureLayers = .{ .ids = layer_ids, .out = rows[1..], .input = &rows[0] };
     ctx.capture_layers = &cl;
     defer ctx.capture_layers = null;
     // Boundary rows are captured from one forward, so a hidden capture takes the prompt whole.
@@ -478,7 +479,7 @@ fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *transfor
     return logits;
 }
 
-fn forwardOne(l: *Loaded, ctx: *transformer_mod.ForwardCtx, token: u32) !mlx.mlx_array {
+fn forwardOne(l: *Loaded, ctx: *model_handle.ForwardCtx, token: u32) !mlx.mlx_array {
     const data = [_]i32{@intCast(token)};
     const input = mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 1 }, 2, .int32);
     defer _ = mlx.mlx_array_free(input);
@@ -1016,8 +1017,8 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
 
 test "kld: an unflagged capture keeps a full-width teacher KV, never the serving kv8 default" {
     const capture = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o" });
-    try testing.expectEqual(transformer_mod.KVQuantConfig.dense, capture.kv_quant_config);
-    try testing.expect(transformer_mod.KVQuantConfig.engine_default.isQuant());
+    try testing.expectEqual(trunk.KVQuantConfig.dense, capture.kv_quant_config);
+    try testing.expect(trunk.KVQuantConfig.engine_default.isQuant());
     try testing.expectEqualStrings("bf16", kvCacheFormat(capture.kv_quant_config));
     try testing.expect(capture.qwen_gdn_f32);
 }
@@ -1049,10 +1050,10 @@ test "kld: --drop-expert is a student-side multiple of 8, and a capture refuses 
 }
 
 test "kld: kvCacheFormat names the effective KV width" {
-    try testing.expectEqualStrings("bf16", kvCacheFormat(transformer_mod.KVQuantConfig.dense));
-    try testing.expectEqualStrings("affine4", kvCacheFormat(transformer_mod.KVQuantConfig.affine(4)));
-    try testing.expectEqualStrings("affine6", kvCacheFormat(transformer_mod.KVQuantConfig.affine(6)));
-    try testing.expectEqualStrings("affine8", kvCacheFormat(transformer_mod.KVQuantConfig.affine(8)));
+    try testing.expectEqualStrings("bf16", kvCacheFormat(trunk.KVQuantConfig.dense));
+    try testing.expectEqualStrings("affine4", kvCacheFormat(trunk.KVQuantConfig.affine(4)));
+    try testing.expectEqualStrings("affine6", kvCacheFormat(trunk.KVQuantConfig.affine(6)));
+    try testing.expectEqualStrings("affine8", kvCacheFormat(trunk.KVQuantConfig.affine(8)));
 }
 
 test "kld records the budget that shaped the load, never the raw flag" {

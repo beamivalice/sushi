@@ -3,7 +3,7 @@ const settings_resolve = @import("settings_resolve.zig");
 const server_state = @import("server_state.zig");
 const arch_flags = @import("arch/flags.zig");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const drafter_mod = @import("arch/drafter.zig");
@@ -30,7 +30,7 @@ const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const ModelConfig = model_mod.ModelConfig;
@@ -130,7 +130,7 @@ pub const LoadParams = struct {
     /// keeps the first user request fast.
     warmup_eager: bool = true,
     /// `--kv-quant`; null = not given. A flag outranks the per-model `kv_quant`, which outranks the kv8 engine default.
-    kv_quant: ?transformer_mod.KVQuantConfig = null,
+    kv_quant: ?trunk.KVQuantConfig = null,
     /// Per-model hot prefix cache capacity (count). 0 disables.
     prefix_cache_capacity: u32 = 1,
     prefix_cache_ram_enabled: bool = true,
@@ -239,7 +239,7 @@ pub fn mimoVerifyWarmWanted(config: *const ModelConfig) bool {
     return config.isMimo() and !config.expert_streaming;
 }
 
-fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: ?*mimo_mtp.Head, kv_config: transformer_mod.KVQuantConfig) void {
+fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: ?*mimo_mtp.Head, kv_config: trunk.KVQuantConfig) void {
     const start = std.Io.Timestamp.now(io, .awake);
     const rows = mimo_forward.warmupMimoVerify(xfm, kv_config) catch |err| {
         log.warn("[spec-warmup] MiMo verify failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
@@ -314,14 +314,14 @@ const LaunchPicks = struct {
     mtp: model_settings.MtpChoice,
     acceptance: settings_resolve.Setting(mtp_acceptance_mod.Mode),
     greedy_tail: settings_resolve.Setting(bool),
-    kv: transformer_mod.KvCacheChoice,
+    kv: trunk.KvCacheChoice,
 
-    fn of(mtp_flag: ?bool, kv_flag: ?transformer_mod.KVQuantConfig, config: *const ModelConfig) LaunchPicks {
+    fn of(mtp_flag: ?bool, kv_flag: ?trunk.KVQuantConfig, config: *const ModelConfig) LaunchPicks {
         return .{
             .mtp = mtpChoiceFor(mtp_flag, config),
             .acceptance = settings_resolve.acceptanceFor(config.mtp_acceptance_override),
             .greedy_tail = settings_resolve.greedyTailFor(config.mtp_greedy_tail_override),
-            .kv = transformer_mod.KvCacheChoice.resolve(kv_flag, config.kv_quant_override),
+            .kv = trunk.KvCacheChoice.resolve(kv_flag, config.kv_quant_override),
         };
     }
 };
@@ -344,7 +344,7 @@ test "an explicit launch flag outranks model-settings.json for MTP, acceptance, 
     try testing.expectEqualStrings("model-settings.json", unflagged.kv.sourceName());
 
     settings_resolve.launch = .{ .mtp_acceptance = .{ .typical = .{ .delta = 0.1 } }, .mtp_greedy_tail = true };
-    const flagged = LaunchPicks.of(true, transformer_mod.KVQuantConfig.affine(4), &file);
+    const flagged = LaunchPicks.of(true, trunk.KVQuantConfig.affine(4), &file);
     try testing.expect(flagged.mtp.on);
     try testing.expectEqualStrings("--mtp", flagged.mtp.sourceName());
     try testing.expectEqual(@as(f32, 0.1), flagged.acceptance.value.typical.delta);
@@ -356,20 +356,20 @@ test "an explicit launch flag outranks model-settings.json for MTP, acceptance, 
 
 test "the width a load warms its spec verify at is the one it resolved, a file kv_quant included" {
     var cfg = ModelConfig{ .model_type = "qwen4_exp" };
-    try testing.expectEqual(transformer_mod.KVQuantConfig.engine_default, bills.kvCacheForLaunch(&cfg, null).config);
-    cfg.kv_quant_override = transformer_mod.KVQuantConfig.affine(4);
-    try testing.expectEqual(transformer_mod.KVQuantConfig.affine(4), bills.kvCacheForLaunch(&cfg, null).config);
-    try testing.expectEqual(transformer_mod.KVQuantConfig.affine(6), bills.kvCacheForLaunch(&cfg, transformer_mod.KVQuantConfig.affine(6)).config);
+    try testing.expectEqual(trunk.KVQuantConfig.engine_default, bills.kvCacheForLaunch(&cfg, null).config);
+    cfg.kv_quant_override = trunk.KVQuantConfig.affine(4);
+    try testing.expectEqual(trunk.KVQuantConfig.affine(4), bills.kvCacheForLaunch(&cfg, null).config);
+    try testing.expectEqual(trunk.KVQuantConfig.affine(6), bills.kvCacheForLaunch(&cfg, trunk.KVQuantConfig.affine(6)).config);
 }
 
 test "a model-settings kv_quant the MLA latent cannot store is dropped at stamping, never a refused load" {
     var glm = ModelConfig{ .model_type = "glm5_next" };
-    applyModelSettings(&glm, .{ .kv_quant = transformer_mod.KVQuantConfig.affine(4) });
+    applyModelSettings(&glm, .{ .kv_quant = trunk.KVQuantConfig.affine(4) });
     try testing.expect(glm.kv_quant_override == null);
-    applyModelSettings(&glm, .{ .kv_quant = transformer_mod.KVQuantConfig.affine(6) });
+    applyModelSettings(&glm, .{ .kv_quant = trunk.KVQuantConfig.affine(6) });
     try testing.expectEqual(@as(u8, 6), glm.kv_quant_override.?.bits);
     var qwen = ModelConfig{ .model_type = "qwen4_exp" };
-    applyModelSettings(&qwen, .{ .kv_quant = transformer_mod.KVQuantConfig.affine(4) });
+    applyModelSettings(&qwen, .{ .kv_quant = trunk.KVQuantConfig.affine(4) });
     try testing.expectEqual(@as(u8, 4), qwen.kv_quant_override.?.bits);
 }
 
@@ -617,7 +617,7 @@ pub const VisionCost = struct {
 };
 
 /// The stored-state layout the SSD namespace is keyed by: the loaded arch's own key, else the config's tag.
-fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, xfm: *transformer_mod.Transformer) !?[]u8 {
+fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, xfm: *trunk.Transformer) !?[]u8 {
     if (try prefix_arch.diskLayoutKey(allocator, config, model_dir, xfm)) |key| return key;
     return if (config.cacheLayoutNamespace()) |tag| try allocator.dupe(u8, tag) else null;
 }
@@ -1500,7 +1500,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.free(params.config.expert_source_dir.?);
         params.config.expert_source_dir = null;
     };
-    const launch_kv = transformer_mod.KvCacheChoice.resolve(params.kv_quant, params.config.kv_quant_override);
+    const launch_kv = trunk.KvCacheChoice.resolve(params.kv_quant, params.config.kv_quant_override);
     if (arch_flags.kvQuantRequestRefusal(params.config, launch_kv.config)) |why| {
         log.err("[kv-cache] {s}\n", .{why});
         return error.GlmKvQuantUnsupported;
@@ -1508,7 +1508,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (arch_flags.archFlagRefusal(params.config, .{
         .kv_quant = params.kv_quant != null,
         .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
-        .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
+        .mtp_head_kv_quant = trunk.Transformer.mtp_head_kv_quant_flag,
         .drop_expert = params.config.drop_expert != 0,
         .ssd_prefetch = params.config.ssd_prefetch != null,
         .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
@@ -1832,8 +1832,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         arch_state.compile(xfm_ptr, .all);
     }
 
-    if (transformer_mod.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
-    if (transformer_mod.diagEnvOn("SUSHI_GLM_ROWS_UBENCH")) if (glm5_state.modelOf(xfm_ptr)) |target| glmRowsUbench(sch.allocator, target, kv_quant_config.glmLatentBits() orelse 0, params.tok);
+    if (trunk.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
+    if (trunk.diagEnvOn("SUSHI_GLM_ROWS_UBENCH")) if (glm5_state.modelOf(xfm_ptr)) |target| glmRowsUbench(sch.allocator, target, kv_quant_config, params.tok);
 
     // DIAGNOSTIC (SUSHI_DECODE_FWD_UBENCH=N): time N decode-width forward
     // passes back to back, with NO sampling, detokenization, stop-checking or
@@ -1865,7 +1865,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 }
                 n_widths = @max(n_widths, 1);
             }
-            const profile_pass = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_PROFILE");
+            const profile_pass = trunk.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_PROFILE");
             const kv_pre: usize = blk: {
                 const r = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
                 break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
@@ -1894,7 +1894,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const tok = tok_slice.ptr;
             const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
             ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
-            ctx.verify_rows = xfm_ptr.config.isMimo() and rows > 1 and rows <= transformer_mod.MIMO_VERIFY_ROWS_MAX;
+            ctx.verify_rows = xfm_ptr.config.isMimo() and rows > 1 and rows <= mimo_forward.MIMO_VERIFY_ROWS_MAX;
             log.info("[fwd-ubench] rows={d} capture={} verify_rows={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, ctx.verify_rows });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
@@ -1994,7 +1994,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             ctx.skip_lm_head = false;
             log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms\n", .{ ms_nolm, ms - ms_nolm });
             if (profile_pass) {
-                transformer_mod.decodeProfileSession(@intCast(rows));
+                trunk.decodeProfileSession(@intCast(rows));
                 for (0..n) |_| {
                     const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                     defer _ = mlx.mlx_array_free(ti);
@@ -2002,7 +2002,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     _ = mlx.mlx_array_eval(lg);
                     _ = mlx.mlx_array_free(lg);
                 }
-                transformer_mod.decodeProfileSession(0);
+                trunk.decodeProfileSession(0);
             }
             }
             log.info("[fwd-ubench] done\n", .{});
@@ -2042,7 +2042,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.quant_group_size,
         }) catch "q?";
         var os_buf: [64]u8 = undefined;
-        const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
+        const os_build = trunk.macosProductVersion(&os_buf) orelse "";
         // The measured round-cost table rides the same identity: restored
         // here, written at the end of any request that folded new samples.
         // The bucket grid and store version are the arch's (only qwen4_exp gets the long
@@ -2077,7 +2077,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.config.isGlm5()) {
             d.sliding_serving = true;
             log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
-            if (transformer_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, glm5_state.modelOf(xfm_ptr).?, d, kv_quant_config.glmLatentBits() orelse 0, params.tok);
+            if (trunk.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, glm5_state.modelOf(xfm_ptr).?, d, kv_quant_config, params.tok);
         } else if (params.config.isQwen4()) {
             d.sliding_serving = true;
             d.bind(xfm_ptr) catch |err| {

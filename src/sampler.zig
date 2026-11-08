@@ -1,6 +1,7 @@
 const std = @import("std");
+const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 const token_mask = @import("token_mask.zig");
@@ -11,7 +12,7 @@ const slot_admission = @import("slot_admission.zig");
 const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
 const ThinkPenalty = think_penalty.ThinkPenalty;
@@ -851,7 +852,7 @@ fn logitsAsNV(logits: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !mlx.mlx_array
 }
 
 fn sampleRowsLazyConcat(row_logits: []const mlx.mlx_array, params: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
-    var parts: [slot_admission.MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var parts: [sched_policy.MAX_BATCH_GROUP]mlx.mlx_array = undefined;
     const n = row_logits.len;
     if (n > parts.len) return error.BatchTooWide;
     var n_parts: usize = 0;

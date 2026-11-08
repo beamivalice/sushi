@@ -1,4 +1,5 @@
-const trf = @import("transformer.zig");
+const mlx_util = @import("mlx_util.zig");
+const trunk = @import("trunk.zig");
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const test_support = @import("test_support.zig");
@@ -7,8 +8,8 @@ const log = @import("log.zig");
 const testing = std.testing;
 const verify_moe = @import("verify_moe.zig");
 const qmatmulBits = verify_moe.qmatmulBits;
-const Transformer = trf.Transformer;
-const transposeBf16Weight = trf.transposeBf16Weight;
+const Transformer = trunk.Transformer;
+const transposeBf16Weight = mlx_util.transposeBf16Weight;
 
 const routerRefRow = test_support.routerRefRow;
 

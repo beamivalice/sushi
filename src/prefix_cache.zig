@@ -16,6 +16,8 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const trunk_mod = @import("trunk.zig");
+const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const model_mod = @import("model.zig");
 const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -27,11 +29,11 @@ const prefill_plan = @import("prefill_plan.zig");
 const prefix_policy = @import("prefix_policy.zig");
 const cache_stats = @import("cache_stats.zig");
 
-const KVCache = transformer_mod.KVCache;
-const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
-const SSMCacheEntry = transformer_mod.SSMCacheEntry;
-const SSMCheckpoint = transformer_mod.SSMCheckpoint;
-const restoreSsmCheckpoint = transformer_mod.restoreSsmCheckpoint;
+const KVCache = trunk_mod.KVCache;
+const KVCacheSnapshot = trunk_mod.KVCacheSnapshot;
+const SSMCacheEntry = trunk_mod.SSMCacheEntry;
+const SSMCheckpoint = trunk_mod.SSMCheckpoint;
+const restoreSsmCheckpoint = trunk_mod.restoreSsmCheckpoint;
 const applyQsaHistoryAt = transformer_mod.applyQsaHistoryAt;
 const checkpointHasQsaPooled = transformer_mod.checkpointHasQsaPooled;
 const checkpointListHasQsaPooled = transformer_mod.checkpointListHasQsaPooled;
@@ -39,7 +41,7 @@ const sliceQsaHistoryOntoCheckpoint = transformer_mod.sliceQsaHistoryOntoCheckpo
 const keepOnlyLatestQsaHistory = transformer_mod.keepOnlyLatestQsaHistory;
 const entriesHaveQsaHistory = transformer_mod.entriesHaveQsaHistory;
 const qsaRestoreSatisfiesForward = transformer_mod.qsaRestoreSatisfiesForward;
-const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
+const ssmCheckpointBytes = trunk_mod.ssmCheckpointBytes;
 
 /// Minimum forwarded-prefix length for committing a CANCELLED prefill
 /// (client disconnect mid-prefill). Below this an entry is LRU pollution —
@@ -226,9 +228,9 @@ pub const SlotRingCps = struct {
 
     pub fn bytes(self: *const SlotRingCps) u64 {
         var total: u64 = 0;
-        if (self.fork) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
-        if (self.prompt_end) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
-        for (self.marks[0..self.n_marks]) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
+        if (self.fork) |*c| total += trunk_mod.kvEntriesBytes(c.entries);
+        if (self.prompt_end) |*c| total += trunk_mod.kvEntriesBytes(c.entries);
+        for (self.marks[0..self.n_marks]) |*c| total += trunk_mod.kvEntriesBytes(c.entries);
         return total;
     }
 };
@@ -526,7 +528,7 @@ pub const DflashSnap = struct {
     base_pos: usize,
     /// In-checkpoint MTP head only: the head's QSA aux entry and the absolute position of its key
     /// row 0. A snap with one half and not the other is declined.
-    head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null,
+    head_aux: ?trunk_mod.SSMCacheEntrySnapshot = null,
     head_pos_base: c_int = 0,
     /// In-checkpoint MTP head only: the head's QSA leftovers at the trunk's checkpoint positions.
     /// A clamp to a restored trunk position lands far below the head's raw-key ring; this is
@@ -538,7 +540,7 @@ pub const DflashSnap = struct {
         return .{
             .snapshot = snapshot,
             .base_pos = c.base_pos,
-            .head_aux = if (c.head) |h| transformer_mod.ssmSnapshot(h) else null,
+            .head_aux = if (c.head) |h| trunk_mod.ssmSnapshot(h) else null,
             .head_pos_base = c.head_pos_base,
             .head_marks = transformer_mod.QsaHeadMarkSet.share(c.head_marks),
         };
@@ -546,7 +548,7 @@ pub const DflashSnap = struct {
 
     pub fn deinit(self: *DflashSnap) void {
         self.snapshot.deinit();
-        if (self.head_aux) |*a| transformer_mod.ssmSnapshotDeinit(a);
+        if (self.head_aux) |*a| trunk_mod.ssmSnapshotDeinit(a);
         self.head_aux = null;
         self.head_marks.deinit();
     }
@@ -567,7 +569,7 @@ pub const DflashCommit = struct {
 pub const DflashTarget = struct {
     cache: *KVCache,
     base_pos: *usize,
-    head: ?*transformer_mod.Transformer = null,
+    head: ?*trunk_mod.Transformer = null,
 };
 
 /// What `evictLruToAdmit` gave up, and whether it was enough.
@@ -635,7 +637,7 @@ pub const HotPrefixCache = struct {
     hybrid: bool = false,
     /// Checkpoint-retention policy, mirrored once at wiring from `ModelConfig.longCtxGated()`
     /// (this struct never sees a ModelConfig). The default is the previous behaviour.
-    cp_thin: transformer_mod.ThinPolicy = .min_span,
+    cp_thin: trunk_mod.ThinPolicy = .min_span,
     /// Whether completed requests retain reusable KV in RAM. The live slot still owns its
     /// working KV; false keeps reusable prefixes only on the SSD tier.
     ram_enabled: bool = true,
@@ -844,7 +846,7 @@ pub const HotPrefixCache = struct {
             ssm.conv_state = mlx.mlx_array_new();
             ssm.ssm_state = mlx.mlx_array_new();
             ssm.initialized = false;
-            transformer_mod.ssmFreeQsaState(ssm);
+            prefix_arch.aux.ssmFreeQsaState(ssm);
             ssm.ple_prev_valid = false;
         }
         transformer_mod.ssmDetachFromGroup(entries);
@@ -1083,7 +1085,7 @@ pub const HotPrefixCache = struct {
         row_bytes: u64,
         positions: []const usize,
         cp_bytes: []const u64,
-        policy: transformer_mod.ThinPolicy,
+        policy: trunk_mod.ThinPolicy,
         cps: ?[]const SSMCheckpoint,
     ) ?usize {
         var byte_buf: [SHED_SIM_MAX]u64 = undefined;
@@ -2880,7 +2882,7 @@ pub const HotPrefixCache = struct {
     /// write could not land is released too, since the admission bill counts on the bound.
     pub fn writeThroughHybrid(
         self: *HotPrefixCache,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk_mod.KVCacheEntry,
         config: kv_quant.KVQuantConfig,
         prompt: []const u32,
         has_tools: bool,
@@ -3071,7 +3073,7 @@ pub const HotPrefixCache = struct {
     /// i.e. the one whose removal widens the coverage gap least. Same count,
     /// spread over the whole prompt, LESS memory. `n` is at most
     /// `ssm_checkpoint_max`, so the quadratic scan is trivial. The selection is
-    /// `transformer.ssmCheckpointDropIndex`, shared with every other thinning site.
+    /// `trunk_mod.ssmCheckpointDropIndex`, shared with every other thinning site.
     fn mergeCheckpointLists(
         self: *HotPrefixCache,
         old: []SSMCheckpoint,
@@ -3123,7 +3125,7 @@ pub const HotPrefixCache = struct {
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
-            const drop = transformer_mod.ssmCheckpointDropIndex(merged.items, self.cp_thin, null);
+            const drop = trunk_mod.ssmCheckpointDropIndex(merged.items, self.cp_thin, null);
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
         }
@@ -3309,7 +3311,7 @@ pub const HotPrefixCache = struct {
         live.appendSliceAssumeCapacity(cps);
         var freed: u64 = 0;
         while (live.items.len > 0 and (live.items.len > max_len or freed < need_free)) {
-            const k = transformer_mod.spanPreservingDropIndex(KVCacheSnapshot, live.items, ringStepOf, .min_span_recency, null);
+            const k = trunk_mod.spanPreservingDropIndex(KVCacheSnapshot, live.items, ringStepOf, .min_span_recency, null);
             freed += snapshotBytes(&live.items[k]);
             _ = live.orderedRemove(k);
         }
@@ -3505,7 +3507,7 @@ pub const HotPrefixCache = struct {
             }
             spent += cost;
             try out.ensureUnusedCapacity(allocator, 1);
-            out.appendAssumeCapacity(try transformer_mod.shareSsmCheckpoint(allocator, cp));
+            out.appendAssumeCapacity(try trunk_mod.shareSsmCheckpoint(allocator, cp));
         }
         if (out.items.len == 0) {
             out.deinit(allocator);
@@ -3549,7 +3551,7 @@ pub const HotPrefixCache = struct {
         var n = cps.len;
         var shed: usize = 0;
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
-            const drop = transformer_mod.ssmCheckpointDropIndex(cps[0..n], self.cp_thin, null);
+            const drop = trunk_mod.ssmCheckpointDropIndex(cps[0..n], self.cp_thin, null);
             const freed = ssmCheckpointBytes(&cps[drop]);
             if (checkpointHasQsaPooled(&cps[drop])) {
                 if (drop > 0) {
@@ -4055,7 +4057,7 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
     try cache.entries.append(testing.allocator, .{
         .tokens = ids_a,
         .has_tools = false,
-        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
         .last_used = 1,
         .quant_config = kv_quant.KVQuantConfig.dense,
         .kv_bytes = 0,
@@ -4065,7 +4067,7 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
     try cache.entries.append(testing.allocator, .{
         .tokens = ids_b,
         .has_tools = false,
-        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
         .last_used = 2,
         .quant_config = kv_quant.KVQuantConfig.dense,
         .kv_bytes = 0,
@@ -4115,7 +4117,7 @@ test "HotPrefixCache: an entry holding the request's first images restores up to
             .has_tools = false,
             .vision_key = key,
             .media_start = 3,
-            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
             .last_used = i,
             .quant_config = kv_quant.KVQuantConfig.dense,
             .kv_bytes = 0,
@@ -4342,7 +4344,7 @@ pub fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: 
 
 /// One layer's chunk at absolute rows `[written, written+step)`, handed the
 /// `max_seq` its attention would ask for: non-zero IS the ring predicate.
-fn ringWriteLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, step: u32, window: u32) !transformer_mod.DenseKVView {
+fn ringWriteLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, step: u32, window: u32) !trunk_mod.DenseKVView {
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     const count: f64 = @floatFromInt(step * 8);
@@ -4352,7 +4354,7 @@ fn ringWriteLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, 
     defer _ = mlx.mlx_array_free(k);
     const shape = [_]c_int{ 1, 1, @intCast(step), 8 };
     try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s));
-    const span: u32 = if (layer == 0) 0 else transformer_mod.slidingTailSpan(window, step, transformer_mod.SLIDING_TRIM_UNBOUNDED);
+    const span: u32 = if (layer == 0) 0 else trunk_mod.slidingTailSpan(window, step, trunk_mod.SLIDING_TRIM_UNBOUNDED);
     return cache.update(layer, k, k, s, span);
 }
 
@@ -4435,8 +4437,8 @@ test "a hot entry holds a ringed layer's retained rows, not the ring buffer's ca
         defer rv.deinit();
         var sv = try ringWriteLayer(&restored, s, li, prompt_len + chunk, 1, window);
         defer sv.deinit();
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.v, sv.v, s));
         try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
     }
 }
@@ -4543,8 +4545,8 @@ test "a ringed entry restores at its prompt-end checkpoint when the next turn di
         defer rv.deinit();
         var sv = try ringWriteLayer(&restored, s, li, prompt + 40, 1, window);
         defer sv.deinit();
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.v, sv.v, s));
         try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
     }
 
@@ -4667,8 +4669,8 @@ test "ringed candidates rank by restorable position, not raw match" {
 
 /// A ring checkpoint with no rows; `mark` tells two at one position apart.
 fn stubRingCp(step: usize, mark: usize) !KVCacheSnapshot {
-    const entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 1);
-    entries[0] = transformer_mod.newEmptyKVEntry();
+    const entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 1);
+    entries[0] = trunk_mod.newEmptyKVEntry();
     entries[0].offset = mark;
     return .{ .entries = entries, .step = step, .allocator = testing.allocator, .config = kv_quant.KVQuantConfig.dense };
 }
@@ -4837,8 +4839,8 @@ test "a new session sharing only another's preamble restores at the message mark
         defer rv.deinit();
         var sv = try ringWriteLayer(&restored, s, li, prompt, 1, window);
         defer sv.deinit();
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.v, sv.v, s));
         try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
     }
 }
@@ -4918,7 +4920,7 @@ test "an entry extended in place keeps its older ring checkpoints" {
 }
 
 /// Bytes one row of `e`'s K and V bill, from their own shapes.
-fn ringEntryRowBytes(e: *const transformer_mod.KVCacheEntry) u64 {
+fn ringEntryRowBytes(e: *const trunk_mod.KVCacheEntry) u64 {
     return ringRowBytes(e.keys) + ringRowBytes(e.values);
 }
 
@@ -4930,8 +4932,8 @@ fn ringExpectSameNext(ref: *KVCache, restored: *KVCache, s: mlx.mlx_stream, n_la
         defer rv.deinit();
         var sv = try ringWriteLayer(restored, s, li, at, 1, window);
         defer sv.deinit();
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.v, sv.v, s));
         try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
     }
 }
@@ -5228,8 +5230,8 @@ fn expectRingContinuesCold(restored: *KVCache, s: mlx.mlx_stream, n_layers: u32,
         defer rv.deinit();
         var sv = try ringWriteLayer(restored, s, li, to, 1, window);
         defer sv.deinit();
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
-        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try trunk_helpers_test.maxAbsDiffF32(rv.v, sv.v, s));
         try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
     }
 }
@@ -5860,7 +5862,7 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     try cache.entries.append(testing.allocator, .{
         .tokens = ids,
         .has_tools = false,
-        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = kv_quant.KVQuantConfig.affine(4) },
+        .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = kv_quant.KVQuantConfig.affine(4) },
         .last_used = 1,
         .quant_config = kv_quant.KVQuantConfig.affine(4),
         .kv_bytes = 0,
@@ -5949,8 +5951,8 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
     var source_ssm = pcBuildHybrid(s, 123.0, 456.0);
     defer pcFreeHybrid(&source_ssm);
     const checkpoints = try testing.allocator.alloc(SSMCheckpoint, 2);
-    checkpoints[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source_ssm, media_start, s);
-    checkpoints[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source_ssm, media_start + 2, s);
+    checkpoints[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &source_ssm, media_start, s);
+    checkpoints[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &source_ssm, media_start + 2, s);
     _ = try hc.commitWithMediaState(
         &source_cache,
         &cached_tokens,
@@ -6013,7 +6015,7 @@ test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry"
     var older_ssm = pcBuildHybrid(s, 100.0, 500.0);
     defer pcFreeHybrid(&older_ssm);
     const older_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    older_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &older_ssm, 4, s);
+    older_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &older_ssm, 4, s);
     _ = try hc.commitWithState(&older_cache, &older_tokens, false, vision_key, older_cps, null, null);
 
     var newer_cache = try KVCache.init(testing.allocator, 3);
@@ -6023,7 +6025,7 @@ test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry"
     defer pcFreeHybrid(&newer_ssm);
     const newer_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     // The raw match with this entry is 7, so this checkpoint cannot restore it.
-    newer_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &newer_ssm, 8, s);
+    newer_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &newer_ssm, 8, s);
     _ = try hc.commitWithState(&newer_cache, &newer_tokens, false, vision_key, newer_cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -6076,9 +6078,9 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     var text_ssm = pcBuildHybrid(s, 100.0, 500.0);
     defer pcFreeHybrid(&text_ssm);
     const text_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    text_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 4, s);
-    text_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 8, s);
-    text_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 10, s);
+    text_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 4, s);
+    text_cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 8, s);
+    text_cps[2] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 10, s);
     _ = try hc.commitWithMediaState(&text_cache, &text_tokens, false, 0, 0, null, text_cps, null, null, text_tokens.len);
 
     // The image turn restores the pre-media text prefix (cross-key, capped
@@ -6112,8 +6114,8 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     var image_state = pcBuildHybrid(s, 300.0, 700.0);
     defer pcFreeHybrid(&image_state);
     const image_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    image_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &image_state, 16, s);
-    image_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &image_state, 18, s);
+    image_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &image_state, 16, s);
+    image_cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &image_state, 18, s);
     _ = try hc.commitWithMediaState(&image_cache, &image_tokens, false, image_key, 0, media_start, image_cps, null, null, image_tokens.len);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
 
@@ -6170,7 +6172,7 @@ test "HotPrefixCache: thinning spreads checkpoints across the whole record, medi
         defer c1.deinit();
         try testFillCache(&c1, s, 3, 16);
         const first = try testing.allocator.alloc(SSMCheckpoint, 3);
-        for (first, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 2 + i * 2, s);
+        for (first, 0..) |*c, i| c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &ssm, 2 + i * 2, s);
         _ = try hc.commitWithMediaState(&c1, tokens[0..16], false, if (media) 0xF00D else 0, 0, if (media) media_start else null, first, null, null, 16);
 
         // The next turn extends the same conversation, so the commit replaces the
@@ -6179,7 +6181,7 @@ test "HotPrefixCache: thinning spreads checkpoints across the whole record, medi
         defer c2.deinit();
         try testFillCache(&c2, s, 3, 24);
         const second = try testing.allocator.alloc(SSMCheckpoint, 4);
-        for (second, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 12 + i * 2, s);
+        for (second, 0..) |*c, i| c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &ssm, 12 + i * 2, s);
         _ = try hc.commitWithMediaState(&c2, &tokens, false, if (media) 0xF00D else 0, 0, if (media) media_start else null, second, null, null, tokens.len);
 
         try testing.expectEqual(@as(usize, 1), hc.entryCount());
@@ -6221,8 +6223,8 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         var src512 = pcBuildHybrid(s, 300.0, 700.0);
         defer pcFreeHybrid(&src512);
         const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
-        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+        cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
+        cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
         // commitWithSsm takes ownership of `cps`.
         _ = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
         try testing.expect(hc.disk_dirty);
@@ -6311,8 +6313,8 @@ test "HotPrefixCache: chunk-heavy hybrid flush still lands its SSM checkpoints" 
         var src = pcBuildHybrid(s, 100.0, 500.0);
         defer pcFreeHybrid(&src);
         const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s);
-        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s);
+        cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
         _ = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
         hc.flushPendingDisk(s);
     }
@@ -6397,7 +6399,7 @@ test "HotPrefixCache: with an SSD tier the RAM entry keeps only its newest two c
         defer c1.deinit();
         try testFillCache(&c1, s, 3, 700);
         const cps1 = try testing.allocator.alloc(SSMCheckpoint, 5);
-        for (cps1, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], 512 + 32 * i, s);
+        for (cps1, 0..) |*c, i| c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], 512 + 32 * i, s);
         _ = try hc.commitWithSsm(&c1, tokens[0..700], false, cps1, null, null);
         const kept1 = hc.entries.items[0].ssm_checkpoints.?;
         // Without a tier there is nowhere else to restore from: today's behaviour.
@@ -6410,7 +6412,7 @@ test "HotPrefixCache: with an SSD tier the RAM entry keeps only its newest two c
         defer c2.deinit();
         try testFillCache(&c2, s, 3, 900);
         const cps2 = try testing.allocator.alloc(SSMCheckpoint, 3);
-        for (cps2, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[5 + i], 704 + 32 * i, s);
+        for (cps2, 0..) |*c, i| c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[5 + i], 704 + 32 * i, s);
         _ = try hc.commitWithSsm(&c2, tokens[0..900], false, cps2, null, null);
         try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
         const kept2 = hc.entries.items[0].ssm_checkpoints.?;
@@ -6597,9 +6599,9 @@ test "HotPrefixCache: a fork's SSD entry keeps the checkpoints its donor holds i
     defer a_cache.deinit();
     try testFillCache(&a_cache, s, 3, a_tokens.len);
     const a_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    a_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[0], 256, s);
-    a_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[1], 512, s);
-    a_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[2], 601, s);
+    a_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[0], 256, s);
+    a_cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[1], 512, s);
+    a_cps[2] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[2], 601, s);
     _ = try hc.commitWithState(&a_cache, &a_tokens, false, 0, a_cps, null, null);
     hc.flushPendingDisk(s);
 
@@ -6608,7 +6610,7 @@ test "HotPrefixCache: a fork's SSD entry keeps the checkpoints its donor holds i
     defer b_cache.deinit();
     try testFillCache(&b_cache, s, 3, b_tokens.len);
     const b_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    b_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[3], 600, s);
+    b_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[3], 600, s);
     _ = try hc.commitWithState(&b_cache, &b_tokens, false, 0, b_cps, null, null);
     hc.flushPendingDisk(s);
     hc.disk.?.drainWriter();
@@ -7028,14 +7030,14 @@ test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint
         var src = pcBuildHybrid(s, 100.0, 500.0);
         defer pcFreeHybrid(&src);
         const cps_a = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps_a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s);
+        cps_a[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s);
         _ = try hc.commitWithSsm(&cache, &a_tokens, false, cps_a, null, null);
         hc.flushPendingDisk(s);
         var cache_b = try KVCache.init(testing.allocator, 3);
         defer cache_b.deinit();
         try testFillCache(&cache_b, s, 3, 600);
         const cps_b = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps_b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        cps_b[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
         _ = try hc.commitWithSsm(&cache_b, &b_tokens, false, cps_b, null, null);
         hc.flushPendingDisk(s);
     }
@@ -7083,7 +7085,7 @@ test "HotPrefixCache: a hybrid SSD restore hands the slot rows it owns, a RAM sh
         defer cache.deinit();
         try testFillCache(&cache, s, 3, 520);
         const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
         _ = try hc.commitWithSsm(&cache, &entry_tokens, false, cps, null, null);
         hc.flushPendingDisk(s);
 
@@ -7143,7 +7145,7 @@ test "HotPrefixCache: a hybrid disk restore adopts the spec sidecar of the entry
         defer hist_a.deinit();
         try testFillCache(&hist_a, s, 1, 600);
         const cps_a = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps_a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s);
+        cps_a[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s);
         _ = try hc.commitWithSsm(&cache_a, &a_tokens, false, cps_a, null, .{ .cache = &hist_a, .base_pos = 100 });
         hc.flushPendingDisk(s);
 
@@ -7154,7 +7156,7 @@ test "HotPrefixCache: a hybrid disk restore adopts the spec sidecar of the entry
         defer hist_b.deinit();
         try testFillCache(&hist_b, s, 1, 520);
         const cps_b = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps_b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        cps_b[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
         _ = try hc.commitWithSsm(&cache_b, &b_tokens, false, cps_b, null, .{ .cache = &hist_b, .base_pos = 0 });
         hc.flushPendingDisk(s);
     }
@@ -7201,7 +7203,7 @@ test "HotPrefixCache: hybrid RAM match at least as good as disk skips the SSD re
     var src512 = pcBuildHybrid(s, 300.0, 700.0);
     defer pcFreeHybrid(&src512);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
     _ = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
     hc.flushPendingDisk(s);
     const disk_uses_before = hc.disk.?.counter;
@@ -7259,7 +7261,7 @@ test "HotPrefixCache: replace path bounds SSM checkpoints and keeps them spread"
     try testFillCache(&c1, s, 3, 450);
     const cps1 = try testing.allocator.alloc(SSMCheckpoint, 4);
     for (cps1, 0..) |*c, i| {
-        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
+        c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
     }
     _ = try hc.commitWithSsm(&c1, tokens[0..450], false, cps1, null, null);
     try testing.expectEqual(@as(usize, 4), hc.entries.items[0].ssm_checkpoints.?.len);
@@ -7271,7 +7273,7 @@ test "HotPrefixCache: replace path bounds SSM checkpoints and keeps them spread"
     try testFillCache(&c2, s, 3, 900);
     const cps2 = try testing.allocator.alloc(SSMCheckpoint, 4);
     for (cps2, 0..) |*c, i| {
-        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i + 4], (i + 5) * 100, s);
+        c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i + 4], (i + 5) * 100, s);
     }
     _ = try hc.commitWithSsm(&c2, tokens[0..900], false, cps2, null, null);
 
@@ -7332,7 +7334,7 @@ fn pcCommitHybridAt(hc: *HotPrefixCache, s: mlx.mlx_stream, base: u32, n: u32, p
     for (cps, points, 0..) |*cp, pos, i| {
         var src = pcBuildHybrid(s, 100.0 * @as(f64, @floatFromInt(i + 1)), 500.0);
         defer pcFreeHybrid(&src);
-        cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, pos, s);
+        cp.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, pos, s);
     }
     _ = try hc.commitWithSsm(&cache, toks, false, cps, null, null);
 }
@@ -7530,7 +7532,7 @@ test "HotPrefixCache: byte budget rejects an oversized sole entry and preserves 
 // ── Issue #330: the oversized-entry decline is a cliff, not a cap ──
 
 /// Test-local: dense per-token KV bytes of a snapshot (k + v across layers).
-pub fn pcRowBytes(snap: *const transformer_mod.KVCacheSnapshot) u64 {
+pub fn pcRowBytes(snap: *const trunk_mod.KVCacheSnapshot) u64 {
     var total: u64 = 0;
     for (snap.entries) |e| {
         if (!e.initialized) continue;
@@ -7661,14 +7663,14 @@ test "HotPrefixCache: oversized hybrid entry trims to the highest checkpoint tha
     try testFillCache(&c1, s, 3, 900);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 8);
     for (cps, 0..) |*c, i| {
-        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
+        c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
     }
 
     var probe = try c1.snapshot();
     defer probe.deinit();
     const row = pcRowBytes(&probe);
     var cps_at_or_below_500: u64 = 0;
-    for (cps[0..5]) |*c| cps_at_or_below_500 += transformer_mod.ssmCheckpointBytes(c);
+    for (cps[0..5]) |*c| cps_at_or_below_500 += trunk_mod.ssmCheckpointBytes(c);
     // Exactly the cost of a 500-token prefix plus its five checkpoints: the
     // trim point must be a RESTORABLE position, so 500 is the answer even
     // though a few more raw tokens would fit.
@@ -7708,11 +7710,11 @@ test "HotPrefixCache: a trim priced after its checkpoint shed is retained, then 
     try testFillCache(&c1, s, 3, 900);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 8);
     for (cps, 0..) |*c, i| {
-        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
+        c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
     }
     var probe = try c1.snapshot();
     defer probe.deinit();
-    const cp_bytes = transformer_mod.ssmCheckpointBytes(&cps[0]);
+    const cp_bytes = trunk_mod.ssmCheckpointBytes(&cps[0]);
     // Room for a 500-token prefix and three of its five checkpoints.
     const budget = pcRowBytes(&probe) * 500 + 3 * cp_bytes;
 
@@ -7744,7 +7746,7 @@ test "HotPrefixCache: oversized hybrid entry with no checkpoint under budget dec
     defer c1.deinit();
     try testFillCache(&c1, s, 3, 900);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &hyb, 800, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &hyb, 800, s);
 
     var probe = try c1.snapshot();
     defer probe.deinit();
@@ -7790,8 +7792,8 @@ test "HotPrefixCache: replace path sheds inherited checkpoints instead of evicti
     const cps1 = try testing.allocator.alloc(SSMCheckpoint, 4);
     var cps1_bytes: u64 = 0;
     for (cps1, 0..) |*c, i| {
-        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
-        cps1_bytes += transformer_mod.ssmCheckpointBytes(c);
+        c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
+        cps1_bytes += trunk_mod.ssmCheckpointBytes(c);
     }
 
     // Turn 2 extends to 900 with checkpoints at 500..800.
@@ -7801,8 +7803,8 @@ test "HotPrefixCache: replace path sheds inherited checkpoints instead of evicti
     const cps2 = try testing.allocator.alloc(SSMCheckpoint, 4);
     var c2_bytes: u64 = 0;
     for (cps2, 0..) |*c, i| {
-        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i + 4], (i + 5) * 100, s);
-        c2_bytes += transformer_mod.ssmCheckpointBytes(c);
+        c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i + 4], (i + 5) * 100, s);
+        c2_bytes += trunk_mod.ssmCheckpointBytes(c);
     }
     var c2_snap = try c2.snapshot();
     c2_bytes += HotPrefixCache.snapshotBytes(&c2_snap);
@@ -7847,7 +7849,7 @@ test "HotPrefixCache: a failed commit still frees the checkpoints it was handed 
     defer hc.deinit();
 
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = .{ .pos = 4, .layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
+    cps[0] = .{ .pos = 4, .layers = try testing.allocator.alloc(trunk_mod.SSMCacheEntrySnapshot, 0) };
     var toks = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
     try testing.expectError(error.OutOfMemory, hc.commitWithMediaState(&src, &toks, false, 0, 0, null, cps, null, null, toks.len));
     // No frees here: the cache owns the checkpoints on every outcome.
@@ -7893,9 +7895,9 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     defer a_cache.deinit();
     try testFillCache(&a_cache, s, 3, a_tokens.len);
     const a_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    a_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[0], 8, s);
-    a_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[1], 16, s);
-    a_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[2], 21, s);
+    a_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[0], 8, s);
+    a_cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[1], 16, s);
+    a_cps[2] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[2], 21, s);
     _ = try hc.commitWithState(&a_cache, &a_tokens, false, 0, a_cps, null, null);
 
     // Entry B: the serial arm. It restored from A and prefilled a tail too
@@ -7904,7 +7906,7 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     defer b_cache.deinit();
     try testFillCache(&b_cache, s, 3, b_tokens.len);
     const b_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    b_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[3], 20, s);
+    b_cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[3], 20, s);
     _ = try hc.commitWithState(&b_cache, &b_tokens, false, 0, b_cps, null, null);
 
     try testing.expectEqual(@as(usize, 2), hc.entryCount());
@@ -8009,7 +8011,7 @@ pub fn pcQsaExpectViewEqual(s: mlx.mlx_stream, warm: *SSMCacheEntry, cold: *SSMC
     }
 }
 
-pub fn pcQsaFeed(xfm: *transformer_mod.Transformer, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
+pub fn pcQsaFeed(xfm: *trunk_mod.Transformer, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
     const chunk = try pcQsaSliceAxis1(s, keys, 0, n);
     defer _ = mlx.mlx_array_free(chunk);
     try transformer_mod.qsaTestAppendPool(xfm, entry, chunk, 0, s);
@@ -8054,8 +8056,8 @@ test "HotPrefixCache: dropping a disk hybrid restore poisons that disk entry" {
         var src512 = pcBuildHybrid(s, 300.0, 700.0);
         defer pcFreeHybrid(&src512);
         const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
-        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+        cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
+        cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
         _ = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
         hc.flushPendingDisk(s);
         try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
@@ -8123,9 +8125,9 @@ test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is bu
 
     const donor = try testing.allocator.alloc(SSMCheckpoint, 3);
     for (donor, 0..) |*c, i| {
-        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 8, s);
+        c.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 8, s);
     }
-    const one = transformer_mod.ssmCheckpointBytes(&donor[0]);
+    const one = trunk_mod.ssmCheckpointBytes(&donor[0]);
 
     // Unbounded, limit past everything: all three, ascending.
     {
@@ -8178,7 +8180,7 @@ test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is bu
 
     var dst = pcEmptySsm();
     defer pcFreeHybrid(&dst);
-    try transformer_mod.restoreSsmCheckpoint(&dst, &kept[1]);
+    try trunk_mod.restoreSsmCheckpoint(&dst, &kept[1]);
     try testing.expectEqual(@as(f32, 200.0), pcSsmVal(dst[0].conv_state, 0, s));
     try testing.expectEqual(@as(f32, 1000.0), pcSsmVal(dst[0].ssm_state, 0, s));
 }
@@ -8397,7 +8399,7 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     var src512 = pcBuildHybrid(s, 300.0, 700.0);
     defer pcFreeHybrid(&src512);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
     _ = try hc.commitWithSsm(&src, &tokens, false, cps, null, null);
     try t.expectEqual(@as(usize, 2), hc.entryCount());
     const hybrid_idx: usize = 1;
@@ -8452,7 +8454,7 @@ test "off SSD-first too, a 0-token hybrid outcome keeps its entry's recency: the
     var src512 = pcBuildHybrid(s, 300.0, 700.0);
     defer pcFreeHybrid(&src512);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
     _ = try hc.commitWithSsm(&src, &tokens, false, cps, null, null);
     // Another session's entry, committed after it.
     var other_ids: [600]u32 = undefined;
@@ -8493,7 +8495,7 @@ test "the lien weighs the share a restore DELIVERS, not the one it matched" {
     try t.expectEqual(@as(usize, 100_000), HotPrefixCache.deliverableShare(null, false, 100_000));
     // A hybrid delivers its checkpoint, and nothing without one. (One
     // null-handle layer: `highestCheckpointAtOrBelow` skips a zero-layer stub.)
-    var pure_layers = [_]transformer_mod.SSMCacheEntrySnapshot{.{
+    var pure_layers = [_]trunk_mod.SSMCacheEntrySnapshot{.{
         .conv_state = .{ .ctx = null },
         .ssm_state = .{ .ctx = null },
         .initialized = false,
@@ -8531,7 +8533,7 @@ test "the lien weighs the share a restore DELIVERS, not the one it matched" {
     var src8 = pcBuildHybrid(s, 300.0, 700.0);
     defer pcFreeHybrid(&src8);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src8, 8, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src8, 8, s);
     _ = try hc.commitWithSsm(&src, &tokens, false, cps, null, null);
     try t.expectEqual(@as(usize, 1), hc.entryCount());
     try t.expect(hc.entries.items[0].kv_bytes > hc.restore_pin_min_bytes);
@@ -8685,7 +8687,7 @@ test "SSD-first companion: a restore adopts the entry's buffer when its capacity
     // A grow is not in place, so a restore must land in the donor's buffer (which already
     // carries the previous turn's reservation) rather than allocate the entry's whole size.
     const s = mlx.gpuStream();
-    const Grows = &transformer_mod.KVCache.kv_cap_buf_grows;
+    const Grows = &trunk_mod.KVCache.kv_cap_buf_grows;
 
     // Turn 1: a reserved cache grows once, to the reservation.
     var donor = try KVCache.init(testing.allocator, 1);
@@ -9370,7 +9372,7 @@ test "prefix cache: a 383k oversized hybrid entry trims instead of flat-declinin
     var pos: [94]usize = all_pos;
     var n: usize = pos.len;
     while (n > 16) {
-        const drop = transformer_mod.positionDropIndexUsize(pos[0..n], .min_span_recency);
+        const drop = trunk_mod.positionDropIndexUsize(pos[0..n], .min_span_recency);
         var k = drop;
         while (k + 1 < n) : (k += 1) pos[k] = pos[k + 1];
         n -= 1;
@@ -9443,7 +9445,7 @@ test "prefix cache: the ungated retention + trim arms reproduce the previous pol
     // The cache's default is the ungated policy.
     var hc = HotPrefixCache.init(t.allocator, 4);
     defer hc.deinit();
-    try t.expectEqual(transformer_mod.ThinPolicy.min_span, hc.cp_thin);
+    try t.expectEqual(trunk_mod.ThinPolicy.min_span, hc.cp_thin);
 
     try t.expectEqualStrings("all_lower", HotPrefixCache.trimBillArm(4, false));
     try t.expectEqualStrings("all_lower", HotPrefixCache.trimBillArm(32, false));
@@ -10202,7 +10204,7 @@ fn pcAppendCheckedOut(hc: *HotPrefixCache, tokens: []const u32, kv_bytes: u64, u
     try hc.entries.append(testing.allocator, .{
         .tokens = try testing.allocator.dupe(u32, tokens),
         .has_tools = false,
-        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
         .last_used = used,
         .quant_config = kv_quant.KVQuantConfig.dense,
         .kv_bytes = kv_bytes,
@@ -10276,7 +10278,7 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
             .tokens = try testing.allocator.dupe(u32, &[_]u32{ 1, @intCast(used) }),
             .has_tools = false,
             .cache_key = k,
-            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
             .last_used = used,
             .quant_config = kv_quant.KVQuantConfig.dense,
             .kv_bytes = 0,
@@ -10305,7 +10307,7 @@ fn appendCounterStubs(cache: *HotPrefixCache) !void {
             .tokens = try testing.allocator.dupe(u32, &[_]u32{ 1, @intCast(used) }),
             .has_tools = false,
             .cache_key = 0,
-            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
             .last_used = used,
             .quant_config = kv_quant.KVQuantConfig.dense,
             .kv_bytes = used * 100,
@@ -10362,7 +10364,7 @@ test "HotPrefixCache: checkpoint clone allocation failure releases owned layers"
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var accounting = testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = 1 });
-    var layers = [_]transformer_mod.SSMCacheEntrySnapshot{.{
+    var layers = [_]trunk_mod.SSMCacheEntrySnapshot{.{
         .conv_state = .{ .ctx = null },
         .ssm_state = .{ .ctx = null },
         .initialized = false,
@@ -10388,7 +10390,7 @@ fn testCheckedOutRetentionCap(max_entries: u32, max_bytes: u64) !void {
     const retained = try hc.retainNewEntry(.{
         .tokens = try testing.allocator.dupe(u32, &.{ 90, 91, 92, 93 }),
         .has_tools = false,
-        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 4, .allocator = testing.allocator, .config = kv_quant.KVQuantConfig.dense },
+        .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 4, .allocator = testing.allocator, .config = kv_quant.KVQuantConfig.dense },
         .last_used = 2,
         .quant_config = kv_quant.KVQuantConfig.dense,
         .kv_bytes = 128,
@@ -10625,7 +10627,7 @@ test "an image turn persists its WHOLE turn to the SSD tier, image rows included
             var cps: ?[]SSMCheckpoint = null;
             if (arm.cps) |positions| {
                 cps = try testing.allocator.alloc(SSMCheckpoint, positions.len);
-                for (positions, cps.?) |p, *cp| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, p, s);
+                for (positions, cps.?) |p, *cp| cp.* = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, p, s);
             }
             _ = try hc.commitWithMediaState(&cache, &tokens, false, 0xABCD, 0, arm.ms, cps, null, null, tokens.len);
             hc.flushPendingDisk(s);
@@ -10890,8 +10892,8 @@ test "HotPrefixCache: a checkpoint taken inside the generated reply is where a p
     var thought = pcBuildHybrid(s, 300.0, 700.0);
     defer pcFreeHybrid(&thought);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &prompt_end, 10, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &thought, 19, s);
+    cps[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &prompt_end, 10, s);
+    cps[1] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &thought, 19, s);
     _ = try hc.commitWithMediaState(&cache, &entry, true, vision_key, 0, null, cps, null, null, 12);
 
     for ([_]struct { prompt: []const u32, at: usize, conv: f32 }{

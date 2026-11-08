@@ -1,10 +1,10 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const log = @import("log.zig");
 
-const KVCache = transformer_mod.KVCache;
-const SSMCacheEntry = transformer_mod.SSMCacheEntry;
+const KVCache = trunk.KVCache;
+const SSMCacheEntry = trunk.SSMCacheEntry;
 
 pub const RestoreDumpMeta = struct {
     kind: []const u8,

@@ -2,7 +2,7 @@
 //! scheduler read. Written before `serve` accepts a connection unless a field says otherwise.
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_registry_mod = @import("model_registry.zig");
 const vision_queue = @import("vision_queue.zig");
@@ -110,7 +110,7 @@ pub var global_scheduler: ?*scheduler_mod.Scheduler = null;
 /// The boot's explicit `--kv-quant`, published by `serve()` before `Scheduler.init` so a
 /// load-time bill sees it (the scheduler does not exist yet during the load; asking it billed
 /// the SSD-first session at bf16, ~8.6 GB of idle allowance lost at 786k). Null = unflagged.
-pub var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
+pub var configured_kv_quant: ?trunk.KVQuantConfig = null;
 
 /// Plan 05 — model registry. Always non-null in serve mode (set by
 /// `serve()`); handleConnection resolves `model` body fields against this

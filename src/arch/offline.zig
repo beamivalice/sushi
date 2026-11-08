@@ -12,7 +12,8 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const mlx = @import("../mlx.zig");
-const trf = @import("../transformer.zig");
+const model_handle = @import("../model_handle.zig");
+const trunk = @import("../trunk.zig");
 const hidden_capture = @import("../hidden_capture.zig");
 const imatrix = @import("../imatrix.zig");
 const kld = @import("../kld.zig");
@@ -52,7 +53,7 @@ pub fn tryRun(allocator: std.mem.Allocator, io: std.Io, opts: kld.Options, out: 
     return false;
 }
 
-pub fn afterLoad(xfm: *trf.Transformer, config: model.ModelConfig, kv: trf.KVQuantConfig) !void {
+pub fn afterLoad(xfm: *trunk.Transformer, config: model.ModelConfig, kv: trunk.KVQuantConfig) !void {
     switch (registry.handleOf(xfm)) {
         inline else => |m, t| {
             if (comptime hasOp(t, "afterLoad")) try registry.Mod(t).kld.afterLoad(m, config, kv);
@@ -63,7 +64,7 @@ pub fn afterLoad(xfm: *trf.Transformer, config: model.ModelConfig, kv: trf.KVQua
 pub fn capturePrompt(
     allocator: std.mem.Allocator,
     l: *kld.Loaded,
-    ctx: *trf.ForwardCtx,
+    ctx: *model_handle.ForwardCtx,
     ids: []const u32,
     writer: *hidden_capture.Writer,
     chunk: usize,

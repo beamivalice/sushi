@@ -5,7 +5,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const io_util = @import("io_util.zig");
 const report = @import("ubench_report.zig");
-const transformer = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const nax_gate = @import("nax_gate.zig");
 const model = @import("model.zig");
 const glm = @import("glm5/glm5_model.zig");
@@ -389,7 +389,7 @@ const KdaMeter = struct {
             12 => try eval(try ops.binary(.mm, self.x, try ops.transpose(self.wide, &.{ 1, 0 }))),
             13 => try eval(try ops.binary(.mm, self.big, try ops.transpose(self.big, &.{ 1, 0 }))),
             else => {
-                var cache = transformer.SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+                var cache = trunk.SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
                 defer _ = mlx.mlx_array_free(cache.conv_state);
                 defer _ = mlx.mlx_array_free(cache.ssm_state);
                 const out = try self.layer.applyReference(ops, self.x, &self.cfg, &cache);

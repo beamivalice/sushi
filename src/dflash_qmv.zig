@@ -48,7 +48,7 @@ var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
 var configs: [2]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 
 pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !@import("transformer.zig").verifySharedHardware()) return null;
+    if (!mlx.streamIsGpu(s) or !@import("trunk.zig").verifySharedHardware()) return null;
     if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return null;
     const xs = mlx.getShape(x);
@@ -160,7 +160,7 @@ var act_configs: [2]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 /// `silu(x·gateᵀ) · (x·upᵀ)` for the assistant's A4 g64 4096→12288 FFN at 8 or 3 rows, with the
 /// bits of two MLX quantized matmuls followed by sigmoid, multiply, multiply.
 pub fn gateUpAct(s: mlx.mlx_stream, x: mlx.mlx_array, gate: [3]mlx.mlx_array, up: [3]mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !@import("transformer.zig").verifySharedHardware()) return null;
+    if (!mlx.streamIsGpu(s) or !@import("trunk.zig").verifySharedHardware()) return null;
     for ([_]mlx.mlx_array{ x, gate[0], gate[1], gate[2], up[0], up[1], up[2] }) |a| if (a.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16) return null;
     const xs = mlx.getShape(x);
@@ -208,7 +208,7 @@ pub fn gateUpAct(s: mlx.mlx_stream, x: mlx.mlx_array, gate: [3]mlx.mlx_array, up
 }
 
 test "DFlash A4 fused gate, up and SiLU equal two MLX quantized matmuls and the staged activation" {
-    if (mlx.noGpuBackend() or !@import("transformer.zig").verifySharedHardware()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !@import("trunk.zig").verifySharedHardware()) return error.SkipZigTest;
     const Ops = @import("glm5/glm5_model.zig").Ops;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
@@ -253,7 +253,7 @@ test "DFlash A4 fused gate, up and SiLU equal two MLX quantized matmuls and the 
 }
 
 test "DFlash A4 eight-row FFN projection matches MLX exactly" {
-    if (mlx.noGpuBackend() or !@import("transformer.zig").verifySharedHardware()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !@import("trunk.zig").verifySharedHardware()) return error.SkipZigTest;
     const Ops = @import("glm5/glm5_model.zig").Ops;
     const fixture = @import("dflash.zig").TinyFix;
     for ([_][2]c_int{ .{ 4096, 12288 }, .{ 12288, 4096 } }) |nk| {

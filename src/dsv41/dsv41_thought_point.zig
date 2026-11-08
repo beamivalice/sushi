@@ -1,4 +1,5 @@
 const std = @import("std");
+const sched_policy = @import("../sched_policy.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const mlx = @import("../mlx.zig");
 const transformer_mod = @import("../trunk.zig");
@@ -20,7 +21,7 @@ const scheduler_mod = @import("../scheduler.zig");
 const model_load = @import("../model_load.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
-const SpecTickMode = scheduler_mod.SpecTickMode;
+const SpecTickMode = sched_policy.SpecTickMode;
 const billedFillPeakBytes = model_load.billedFillPeakBytes;
 const coldLoadVision = model_load.coldLoadVision;
 const commitCancelledAtCleanup = scheduler_mod.commitCancelledAtCleanup;
@@ -30,7 +31,7 @@ const planExpertStreaming = model_load.planExpertStreaming;
 const resolveExpertCache = model_load.resolveExpertCache;
 const resolveStreamedVision = model_load.resolveStreamedVision;
 const slotStateBytes = scheduler_mod.slotStateBytes;
-const specTickMode = scheduler_mod.specTickMode;
+const specTickMode = sched_policy.specTickMode;
 const thinkBoundForcesPlain = scheduler_mod.thinkBoundForcesPlain;
 const visionChoiceFor = model_load.visionChoiceFor;
 

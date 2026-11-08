@@ -1,4 +1,4 @@
-const trf = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const io_util_mod = @import("io_util.zig");
 const diagEnvOn = io_util_mod.diagEnvOn;
 const std = @import("std");
@@ -7,9 +7,9 @@ const expert_exl3 = sushi_exl3.format;
 const mlx = @import("mlx.zig");
 const mimo_forward = @import("mimo2/mimo_forward.zig");
 const testing = std.testing;
-const KVCacheSnapshot = trf.KVCacheSnapshot;
-const MoeMlpWeights = trf.MoeMlpWeights;
-const Transformer = trf.Transformer;
+const KVCacheSnapshot = trunk.KVCacheSnapshot;
+const MoeMlpWeights = trunk.MoeMlpWeights;
+const Transformer = trunk.Transformer;
 const bindLinears = @import("layer_weights.zig").bindLinears;
 
 

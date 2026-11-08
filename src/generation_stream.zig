@@ -1,6 +1,6 @@
 const std = @import("std");
 const http = @import("http.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
@@ -380,7 +380,7 @@ pub fn nonStreamingViaScheduler(
     mrope: MropeData,
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?trunk.KVQuantConfig,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -536,7 +536,7 @@ pub fn handleNonStreamingGeneration(
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?trunk.KVQuantConfig,
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
@@ -1117,7 +1117,7 @@ pub fn handleStreamingGeneration(
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?trunk.KVQuantConfig,
     /// Iteration 1: tokenize_ns measured by the request handler before
     /// dispatching here. Surfaced via `timings.tokenize_ms` on the final
     /// usage SSE chunk so streaming clients see the same metric as

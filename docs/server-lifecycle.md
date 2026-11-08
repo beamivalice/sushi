@@ -243,6 +243,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 <a id="scheduler-policy"></a>
 - `src/sched_policy.zig` (host tier, MLX-free, names no arch): the scheduler's decisions over flags, counts and lengths.
   Each has a host test; `scheduler.zig` and `slot_admission.zig` gather the facts from the slot and act on the answer.
+  Callers name `sched_policy` for them; neither file re-exports any of it.
   - which slots join a tick and where: `batchVerdictOf` (the first reason in the gate's order), `bucketOf` (batch,
     MTP group, rows-in-company or serial; a full bucket sends the slot serial), `crowdFits` (a crowded MTP group drops to
     one plain tick), `rowsKept` (the arch's row cap), `specTickMode`, `specInitWiring`;
@@ -252,9 +253,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   - the slot's end: `finishState`/`errorLands` (a slot ends once), `joinsTick`, `cancelOpen`;
   - the arithmetic: `runOwedDecodeTicks` and the decode-share budget, `gpuWarm*`, `idleEvictTickMs`.
   - **The GLM KV-scheme rule** has one list in the arch's flags (`glm5_flags.kvQuantRequestRefusal`): the request check,
-    the submit-time `checkKvQuant`, the load refusal and `applyModelSettings` read it. Two copies of the same predicate
-    remain, `KVQuantConfig.glmLatentBits` in `kv_quant.zig` (the flags read it) and `model_settings.choiceAllowed`;
-    S3z moves them.
+    the submit-time `checkKvQuant`, the load refusal and `applyModelSettings` read it. The settings page reads the
+    same rule as `glm5_flags.kv_quant_choices` through `Fit.kv_choices` (empty = every width); a test pins the list
+    to `latentBits`.
   - The inference loop's per-tick work is allocation-free: the active list is kept across ticks, a batched tick builds
     its inputs in stack arrays of `MAX_BATCH_GROUP`, and admission scans nothing while `pending` is empty.
 - **The scheduler names no arch.** What differs per arch is the `sched` decl of its `arch.zig` (`<arch>_sched.zig`),

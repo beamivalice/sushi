@@ -8,8 +8,9 @@
 //! - `command`: a subcommand (`name`, `runs_gpu`, `help`, `run`);
 //! - `refusal(use)`: a launch flag this arch cannot act on;
 //! - `drop_expert_elsewhere`: why `--drop-expert` has no effect on the other archs;
-//! - `mtp_off_line`, `kvQuantRequestRefusal(kv)`, `settings_kv_quant_ignored`, `settingsMtpIgnoredLine(config)`: the
-//!   arch's lines and refusals where it differs from the shared rule;
+//! - `mtp_off_line`, `kvQuantRequestRefusal(kv)`, `kv_quant_choices` (the spellings its cache stores),
+//!   `settings_kv_quant_ignored`, `settingsMtpIgnoredLine(config)`: the arch's lines and refusals where it differs
+//!   from the shared rule;
 //! - `serve` (`install`, `uninstall`) and `warm` (`bytes`, `total`): the MLX-side hooks `arch/serve.zig` reaches.
 const std = @import("std");
 const model = @import("../model.zig");
@@ -135,9 +136,17 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .head_streams = expert_stream.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), config.expert_layout),
         .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false,
         .prefetch = admission.expertStream(config).prefetch,
-        .latent_kv = latent,
+        .kv_choices = kvQuantChoices(config),
         .context_cap = config.contextCap(),
     };
+}
+
+/// The `kv_quant` spellings this arch's cache stores when it stores fewer than all of them; empty = every width.
+fn kvQuantChoices(config: *const model.ModelConfig) []const []const u8 {
+    const tag = arch_config.tagOf(config) orelse return &.{};
+    switch (tag) {
+        inline else => |t| return if (comptime hasDecl(t, "kv_quant_choices")) &flagsOf(t).kv_quant_choices else &.{},
+    }
 }
 
 /// A model-settings.json `ssd_prefetch` on an arch with no expert prefetcher is ignored with this one line, as `kv_quant` is.
@@ -342,12 +351,12 @@ test "settingsFit: a latent-cache arch stores only the latent widths and serves 
     if (!built("glm5_next") or !built("deepseek_v41")) return error.SkipZigTest;
     var glm = model.ModelConfig{ .model_type = "glm5_next", .max_position_embeddings = 131072 };
     const fit = settingsFit(&glm);
-    try testing.expect(fit.latent_kv and !fit.serves_mtp);
+    try testing.expect(fit.kv_choices.len != 0 and !fit.serves_mtp);
     try testing.expectEqual(@as(u32, 131072), fit.context_cap);
     try testing.expect(!model_settings.choiceAllowed("kv_quant", "4", fit));
     try testing.expect(model_settings.choiceAllowed("kv_quant", "6", fit));
     const qwen4 = model.ModelConfig{ .model_type = "qwen4_exp" };
-    try testing.expect(!settingsFit(&qwen4).latent_kv and settingsFit(&qwen4).serves_mtp);
+    try testing.expect(settingsFit(&qwen4).kv_choices.len == 0 and settingsFit(&qwen4).serves_mtp);
     // A DSpark pack without STQ experts has no prefetcher, and says so at its own load.
     var dsv41 = model.ModelConfig{ .model_type = "deepseek_v41", .ssd_prefetch_override = 30 };
     try testing.expect(!model_settings.applies("ssd_prefetch", settingsFit(&dsv41)));

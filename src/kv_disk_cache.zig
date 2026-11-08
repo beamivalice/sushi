@@ -54,6 +54,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const prefix_arch = @import("arch/prefix.zig");
 const model = @import("model.zig");
 const io_util = @import("io_util.zig");
@@ -64,7 +65,7 @@ const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
 const disk_format = @import("disk_format.zig");
 
-const KVCache = transformer_mod.KVCache;
+const KVCache = trunk.KVCache;
 
 /// Restoring from disk only happens when it beats the best RAM match by at
 /// least this many tokens — a disk read + rebuild is only worth it when it
@@ -87,7 +88,7 @@ pub const DECLINE_SPILL_FLUSH_FLOOR: u64 = 4 * 1024 * 1024 * 1024;
 pub const POINT_GRID: u32 = 8192;
 
 /// Max persisted SSM checkpoint positions per entry: the whole grid to 1M tokens plus the prompt-end points.
-/// Thinning past it is span-preserving (`transformer.positionDropIndex`): the lowest and the newest survive.
+/// Thinning past it is span-preserving (`trunk.positionDropIndex`): the lowest and the newest survive.
 /// The tier's byte budget, not this count, bounds what a long conversation keeps (`DiskTier.pointBudget`).
 pub const SSM_DISK_MAX_PER_ENTRY: usize = 160;
 
@@ -116,7 +117,7 @@ pub const RingFile = disk_format.RingFile;
 /// each checkpoint's `step`.
 pub const RingCommit = struct {
     window: u32,
-    cps: []const transformer_mod.KVCacheSnapshot = &.{},
+    cps: []const trunk.KVCacheSnapshot = &.{},
 };
 
 /// `bestRingMatch`'s result: the entry, the ring file, and the length it restores to.
@@ -128,12 +129,12 @@ pub const SpecHeadMeta = disk_format.SpecHeadMeta;
 /// What `appendCommitWithSpec` reads to persist one spec snapshot — the same
 /// snapshot-shaped parts the trunk flush takes, plus the base position.
 pub const SpecCommit = struct {
-    entries: []const transformer_mod.KVCacheEntry,
+    entries: []const trunk.KVCacheEntry,
     step: usize,
     config: kv_quant.KVQuantConfig,
     base_pos: usize,
     /// In-checkpoint MTP head: the QSA aux half, persisted alongside the KV.
-    head_aux: ?*const transformer_mod.SSMCacheEntrySnapshot = null,
+    head_aux: ?*const trunk.SSMCacheEntrySnapshot = null,
     head_pos_base: c_int = 0,
     head_marks: []const transformer_mod.QsaHeadMark = &.{},
 };
@@ -159,7 +160,7 @@ pub const PersistOutcome = enum {
 /// runs 1-2 positions ahead on EOS turns), from the initialized layers' offset, not `step`
 /// (0 on GDN hybrids). Shared by the commit and `holdsFullPrefix`.
 pub fn persistTargetLen(
-    kv_entries: []const transformer_mod.KVCacheEntry,
+    kv_entries: []const trunk.KVCacheEntry,
     step: usize,
     tokens_len: usize,
 ) usize {
@@ -225,7 +226,7 @@ fn mib(b: u64) f64 {
 }
 
 /// A KV layer's buffers: keys, values and, when quantized, their scales and biases.
-fn layerArrays(e: *const transformer_mod.KVCacheEntry) [6]mlx.mlx_array {
+fn layerArrays(e: *const trunk.KVCacheEntry) [6]mlx.mlx_array {
     return .{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
 }
 
@@ -237,7 +238,7 @@ fn rowBytes(a: mlx.mlx_array) u64 {
     return nbytesOf(a) / @as(u64, @intCast(sh[2]));
 }
 
-fn checkpointFileBytes(cp: *const transformer_mod.SSMCheckpoint) u64 {
+fn checkpointFileBytes(cp: *const trunk.SSMCheckpoint) u64 {
     var n: u64 = FILE_OVERHEAD_BYTES + cp.released_bytes;
     for (cp.layers) |*l| for ([_]mlx.mlx_array{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled }) |a| {
         if (a.ctx != null) n += nbytesOf(a) + TENSOR_OVERHEAD_BYTES;
@@ -310,7 +311,7 @@ pub const DiskTier = struct {
     ssd_first: bool = false,
     /// Checkpoint-retention policy for the persisted position set, mirrored from
     /// `HotPrefixCache.cp_thin`. The default is the previous behaviour (keep the highest N).
-    cp_thin: transformer_mod.ThinPolicy = .oldest,
+    cp_thin: trunk.ThinPolicy = .oldest,
     /// How many checkpoint positions one entry may keep on disk; the default is the previous cap.
     ssm_max_per_entry: usize = SSM_DISK_MAX_PER_ENTRY_LEGACY,
     /// Set by an arch whose restore points carry rows that grow with the prompt; null stores every point whole.
@@ -465,7 +466,7 @@ pub const DiskTier = struct {
     /// held, after waiting for its file to leave the writer: staged for entry `id`, the file is the
     /// restore point from then on. A checkpoint the tier did not take, or whose write failed, is not
     /// a restore point (the failure poisons the entry on the next commit) and its state is not kept.
-    pub fn settleCheckpoints(self: *DiskTier, id: ?u64, cps: []transformer_mod.SSMCheckpoint) void {
+    pub fn settleCheckpoints(self: *DiskTier, id: ?u64, cps: []trunk.SSMCheckpoint) void {
         var newest: ?usize = null;
         for (cps, 0..) |*cp, i| {
             if (!cp.isReleased()) newest = i;
@@ -832,7 +833,7 @@ pub const DiskTier = struct {
 
     /// Load ring file `pos` as a checkpoint snapshot (`KVCache.ringCheckpoint`'s shape): each
     /// ringed layer's rows `[pos - rows, pos)`, every other layer empty.
-    fn loadRingFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize, quant: kv_quant.KVQuantConfig, window: u32) !transformer_mod.KVCacheSnapshot {
+    fn loadRingFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize, quant: kv_quant.KVQuantConfig, window: u32) !trunk.KVCacheSnapshot {
         const cpu = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cpu);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/r{d:0>7}.safetensors\x00", .{ self.root, id, pos });
@@ -848,9 +849,9 @@ pub const DiskTier = struct {
         const recorded = std.fmt.parseInt(usize, std.mem.span(layers_c), 10) catch return error.DiskCacheCorruptRing;
         if (recorded != n_layers) return error.DiskCacheCorruptRing;
 
-        const entries = try self.allocator.alloc(transformer_mod.KVCacheEntry, n_layers);
-        for (entries) |*en| en.* = transformer_mod.newEmptyKVEntry();
-        var cp: transformer_mod.KVCacheSnapshot = .{ .entries = entries, .step = pos, .allocator = self.allocator, .config = quant, .swa_ring_window = window };
+        const entries = try self.allocator.alloc(trunk.KVCacheEntry, n_layers);
+        for (entries) |*en| en.* = trunk.newEmptyKVEntry();
+        var cp: trunk.KVCacheSnapshot = .{ .entries = entries, .step = pos, .allocator = self.allocator, .config = quant, .swa_ring_window = window };
         errdefer cp.deinit();
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
@@ -925,7 +926,7 @@ pub const DiskTier = struct {
     pub fn restoreIntoHybrid(
         self: *DiskTier,
         cache: *KVCache,
-        ssm_entries: []transformer_mod.SSMCacheEntry,
+        ssm_entries: []trunk.SSMCacheEntry,
         idx: usize,
         cp_pos: u32,
         s: mlx.mlx_stream,
@@ -945,7 +946,7 @@ pub const DiskTier = struct {
         // The overlay is owed unless the pooled bank is on THIS checkpoint: every checkpoint
         // carries its own raw leftover, and a mid-block one (backoff 30) is not the bank's home.
         const snap_has_pooled = transformer_mod.checkpointHasQsaPooled(&cp);
-        var qsa_overlay: ?transformer_mod.SSMCheckpoint = null;
+        var qsa_overlay: ?trunk.SSMCheckpoint = null;
         defer if (qsa_overlay) |*q| q.deinit(self.allocator);
         if ((want_rows > 0 or e.qsa_history_rows > 0) and !snap_has_pooled) {
             var hist = self.loadQsaHistoryFile(e.id, ssm_entries.len) catch return error.DiskCacheQsaHistoryGap;
@@ -973,11 +974,11 @@ pub const DiskTier = struct {
         }
         if (disk_placement.test_qsa_overlay_mismatch) {
             if (qsa_overlay) |*q| q.deinit(self.allocator);
-            qsa_overlay = .{ .pos = 0, .layers = try self.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
+            qsa_overlay = .{ .pos = 0, .layers = try self.allocator.alloc(trunk.SSMCacheEntrySnapshot, 0) };
         }
         try self.restoreKvInto(cache, e, cp_pos, s);
         errdefer cache.truncate(0, s) catch {};
-        try transformer_mod.restoreSsmCheckpoint(ssm_entries, &cp);
+        try trunk.restoreSsmCheckpoint(ssm_entries, &cp);
         errdefer {
             for (ssm_entries) |*ent| {
                 _ = mlx.mlx_array_free(ent.conv_state);
@@ -985,7 +986,7 @@ pub const DiskTier = struct {
                 ent.conv_state = mlx.mlx_array_new();
                 ent.ssm_state = mlx.mlx_array_new();
                 ent.initialized = false;
-                transformer_mod.ssmFreeQsaState(ent);
+                prefix_arch.aux.ssmFreeQsaState(ent);
                 ent.ple_prev_valid = false;
             }
         }
@@ -1002,7 +1003,7 @@ pub const DiskTier = struct {
     pub fn restoreIntoKda(
         self: *DiskTier,
         cache: *KVCache,
-        ssm_entries: []transformer_mod.SSMCacheEntry,
+        ssm_entries: []trunk.SSMCacheEntry,
         idx: usize,
         cp_pos: u32,
         s: mlx.mlx_stream,
@@ -1017,7 +1018,7 @@ pub const DiskTier = struct {
         defer cp.deinit(self.allocator);
         try self.restoreKvInto(cache, e, cp_pos, s);
         errdefer cache.truncate(0, s) catch {};
-        try transformer_mod.restoreSsmCheckpoint(ssm_entries, &cp);
+        try trunk.restoreSsmCheckpoint(ssm_entries, &cp);
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
         return cp_pos;
@@ -1032,7 +1033,7 @@ pub const DiskTier = struct {
         cp_pos: u32,
         n_layers: usize,
         s: mlx.mlx_stream,
-    ) !transformer_mod.SSMCheckpoint {
+    ) !trunk.SSMCheckpoint {
         const had_error = mlx.errorPending();
         errdefer mlx.dropLatchedErrorUnless(had_error);
         self.drainEntry(self.entries.items[idx].id);
@@ -1224,7 +1225,7 @@ pub const DiskTier = struct {
         // Install the filled buffers as the cache's storage. Mirrors `KVCache.restore`: views stay
         // empty, offset/initialized set, step = kv_len.
         for (cache.entries, 0..) |*dst, li| {
-            transformer_mod.resetKVEntry(dst);
+            trunk.resetKVEntry(dst);
             if (!present[li]) continue;
             const slots = [_]*mlx.mlx_array{ &dst.keys, &dst.values, &dst.keys_scales, &dst.keys_biases, &dst.values_scales, &dst.values_biases };
             for (slots[0..kinds.len], dsts[li * kinds.len ..][0..kinds.len]) |slot, *filled| {
@@ -1240,7 +1241,7 @@ pub const DiskTier = struct {
 
     /// Rebuilds a point's growing arrays: the entry's first `k` row segments in order, then the rows the point's own
     /// file kept. An array the segments do not hold is a fixed one and stays as loaded.
-    fn joinGrownSegments(self: *DiskTier, id: u64, k: u32, layers: []transformer_mod.SSMCacheEntrySnapshot) !void {
+    fn joinGrownSegments(self: *DiskTier, id: u64, k: u32, layers: []trunk.SSMCacheEntrySnapshot) !void {
         const cpu = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cpu);
         // pieces[2 * li + f]: layer li's conv (f = 0) or ssm (f = 1) rows from each segment.
@@ -1284,7 +1285,7 @@ pub const DiskTier = struct {
     /// (caller frees via `deinit`). The recorded layer count must match the
     /// target model's `ssm_entries` — a mismatch inside a fingerprint dir
     /// means corruption, never a different model.
-    pub fn loadSsmFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize) !transformer_mod.SSMCheckpoint {
+    pub fn loadSsmFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize) !trunk.SSMCheckpoint {
         const cpu = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cpu);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors\x00", .{ self.root, id, pos });
@@ -1304,13 +1305,13 @@ pub const DiskTier = struct {
         if (mlx.mlx_map_string_to_string_get(&init_c, meta_map, "init") != 0) return error.DiskCacheCorruptSsm;
         const init_str = std.mem.span(init_c);
 
-        const layers = try self.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, n_layers);
+        const layers = try self.allocator.alloc(trunk.SSMCacheEntrySnapshot, n_layers);
         for (layers) |*l| l.* = .{
             .conv_state = mlx.mlx_array_new(),
             .ssm_state = mlx.mlx_array_new(),
             .initialized = false,
         };
-        var cp: transformer_mod.SSMCheckpoint = .{ .pos = pos, .layers = layers };
+        var cp: trunk.SSMCheckpoint = .{ .pos = pos, .layers = layers };
         errdefer cp.deinit(self.allocator);
 
         // Absent key = null state (plain-attention layers in the hybrid have
@@ -1425,12 +1426,12 @@ pub const DiskTier = struct {
     /// silently; never fails the request.
     pub fn appendCommit(
         self: *DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         step: usize,
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        ssm_checkpoints: ?[]const trunk.SSMCheckpoint,
         s: mlx.mlx_stream,
     ) !PersistOutcome {
         return self.appendCommitWith(.{
@@ -1446,12 +1447,12 @@ pub const DiskTier = struct {
     /// Everything one commit persists. A struct, not twelve positional parameters: the v10 media
     /// identity would otherwise grow five signatures and every call site of each.
     pub const CommitParams = struct {
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         step: usize,
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint = null,
+        ssm_checkpoints: ?[]const trunk.SSMCheckpoint = null,
         dflash_snap: ?SpecCommit = null,
         mtp_snap: ?SpecCommit = null,
         ring: ?RingCommit = null,
@@ -1479,12 +1480,12 @@ pub const DiskTier = struct {
     /// first chunk that crosses it. The write-through hook passes one byte (one chunk per boundary).
     pub fn appendCommitBounded(
         self: *DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         step: usize,
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        ssm_checkpoints: ?[]const trunk.SSMCheckpoint,
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
@@ -1503,12 +1504,12 @@ pub const DiskTier = struct {
     /// RAM tier: the caller passes only what `commitWithState` was handed.
     pub fn appendCommitWithSpec(
         self: *DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         step: usize,
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        ssm_checkpoints: ?[]const trunk.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
@@ -1529,12 +1530,12 @@ pub const DiskTier = struct {
     /// cache is skipped, since its chunks alone restore nothing.
     pub fn appendCommitWithRing(
         self: *DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         step: usize,
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        ssm_checkpoints: ?[]const trunk.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         ring: ?RingCommit,
@@ -1557,12 +1558,12 @@ pub const DiskTier = struct {
     /// caller's source is gone when it returns, so nothing could resume a partial entry.
     pub fn appendCommitWhole(
         self: *DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         step: usize,
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        ssm_checkpoints: ?[]const trunk.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         ring: ?RingCommit,
@@ -1610,9 +1611,9 @@ pub const DiskTier = struct {
     /// length when the cache has neither). Null when nothing of `MIN_PERSIST_TOKENS` or more fits.
     fn budgetTarget(
         self: *const DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         kv_target: u32,
-        cps: ?[]const transformer_mod.SSMCheckpoint,
+        cps: ?[]const trunk.SSMCheckpoint,
         ring_srcs: []const RingSource,
         spec_bytes: u64,
     ) ?u32 {
@@ -1644,27 +1645,27 @@ pub const DiskTier = struct {
     /// (`budgetTarget` then cuts its tail).
     fn pointBudget(
         self: *const DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         kv_target: u32,
-        cps_opt: ?[]const transformer_mod.SSMCheckpoint,
+        cps_opt: ?[]const trunk.SSMCheckpoint,
         ring_srcs: []const RingSource,
         spec_bytes: u64,
     ) u64 {
         const cps = cps_opt orelse return 0;
         if (self.max_bytes == 0 or cps.len == 0 or ring_srcs.len > 0) return 0;
         if (self.entryBytesAt(kv_entries, kv_target, cps, ring_srcs, spec_bytes) <= self.max_bytes) return 0;
-        var newest: ?*const transformer_mod.SSMCheckpoint = null;
-        var grid: ?*const transformer_mod.SSMCheckpoint = null;
+        var newest: ?*const trunk.SSMCheckpoint = null;
+        var grid: ?*const trunk.SSMCheckpoint = null;
         for (cps) |*cp| {
             if (cp.pos == 0 or cp.pos > kv_target) continue;
             if (newest == null or cp.pos > newest.?.pos) newest = cp;
             if (cp.pos % POINT_GRID == 0 and (grid == null or cp.pos > grid.?.pos)) grid = cp;
         }
         const top = newest orelse return 0;
-        var kept: [2]transformer_mod.SSMCheckpoint = undefined;
+        var kept: [2]trunk.SSMCheckpoint = undefined;
         var n: usize = 0;
         var pts: u64 = 0;
-        for ([_]?*const transformer_mod.SSMCheckpoint{ grid, top }) |opt| {
+        for ([_]?*const trunk.SSMCheckpoint{ grid, top }) |opt| {
             const cp = opt orelse continue;
             if (n == 1 and kept[0].pos == cp.pos) continue;
             kept[n] = cp.*;
@@ -1677,7 +1678,7 @@ pub const DiskTier = struct {
     }
 
     /// What `cp`'s file occupies: whole, or with a split tier its fixed arrays and the rows past its last whole span.
-    fn pointFileBytes(self: *const DiskTier, cp: *const transformer_mod.SSMCheckpoint) u64 {
+    fn pointFileBytes(self: *const DiskTier, cp: *const trunk.SSMCheckpoint) u64 {
         const whole = checkpointFileBytes(cp);
         const g = self.grown orelse return whole;
         return whole -| g.row_bytes *| cp.pos +| g.row_bytes *| (cp.pos % g.span);
@@ -1688,9 +1689,9 @@ pub const DiskTier = struct {
     /// and `extra` (its spec sidecar). Headers are an allowance, not an exact count.
     fn entryBytesAt(
         self: *const DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         p: u32,
-        cps: ?[]const transformer_mod.SSMCheckpoint,
+        cps: ?[]const trunk.SSMCheckpoint,
         ring_srcs: []const RingSource,
         extra: u64,
     ) u64 {
@@ -2098,7 +2099,7 @@ pub const DiskTier = struct {
     /// per implied chunk.
     pub fn holdsFullPrefix(
         self: *const DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         step: usize,
         tokens: []const u32,
         has_tools: bool,
@@ -2110,7 +2111,7 @@ pub const DiskTier = struct {
     /// `holdsFullPrefix`, returning the entry's id so the caller can ask `entryWritesPending`.
     pub fn fullPrefixEntryId(
         self: *const DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         step: usize,
         tokens: []const u32,
         has_tools: bool,
@@ -2144,7 +2145,7 @@ pub const DiskTier = struct {
     fn appendSsmOnly(
         self: *DiskTier,
         idx: usize,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        ssm_checkpoints: ?[]const trunk.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         ring_srcs: []const RingSource,
@@ -2373,10 +2374,10 @@ pub const DiskTier = struct {
         expected_layers: usize,
         target_config: kv_quant.KVQuantConfig,
     ) ?struct {
-        snap: transformer_mod.KVCacheSnapshot,
+        snap: trunk.KVCacheSnapshot,
         base: usize,
         /// v5 in-checkpoint head half; null on every other entry.
-        head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null,
+        head_aux: ?trunk.SSMCacheEntrySnapshot = null,
         head_pos_base: c_int = 0,
         /// v8: the head's checkpoint-position leftovers. Empty on a v5..v7 sidecar, which
         /// clamps as it does today (a mid-block warm clamp declines, head starts blind).
@@ -2416,9 +2417,9 @@ pub const DiskTier = struct {
         else
             &.{ "k", "v", "ks", "kb", "vs", "vb" };
 
-        const entries = self.allocator.alloc(transformer_mod.KVCacheEntry, expected_layers) catch return null;
-        for (entries) |*en| en.* = transformer_mod.newEmptyKVEntry();
-        var snap: transformer_mod.KVCacheSnapshot = .{
+        const entries = self.allocator.alloc(trunk.KVCacheEntry, expected_layers) catch return null;
+        for (entries) |*en| en.* = trunk.newEmptyKVEntry();
+        var snap: trunk.KVCacheSnapshot = .{
             .entries = entries,
             .step = meta.step,
             .allocator = self.allocator,
@@ -2501,12 +2502,12 @@ pub const DiskTier = struct {
             }
         }
         // v5 head half, best-effort: a pre-v5 sidecar returns none and the head declines the adoption.
-        var head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null;
+        var head_aux: ?trunk.SSMCacheEntrySnapshot = null;
         var head_pos_base: c_int = 0;
         var head_marks: transformer_mod.QsaHeadMarkSet = .{};
         if (meta.head) |hm| head: {
             const aux = getSpecArray(tensor_map, self.allocator, prefix, "h.aux") orelse break :head;
-            var snap_aux: transformer_mod.SSMCacheEntrySnapshot = .{
+            var snap_aux: trunk.SSMCacheEntrySnapshot = .{
                 .conv_state = mlx.mlx_array_new(),
                 .ssm_state = mlx.mlx_array_new(),
                 .initialized = true,
@@ -2515,7 +2516,7 @@ pub const DiskTier = struct {
             };
             if (hm.pooled) {
                 snap_aux.qsa_pooled = getSpecArray(tensor_map, self.allocator, prefix, "h.pooled") orelse {
-                    transformer_mod.ssmSnapshotDeinit(&snap_aux);
+                    trunk.ssmSnapshotDeinit(&snap_aux);
                     break :head;
                 };
             }
@@ -2524,7 +2525,7 @@ pub const DiskTier = struct {
             _ = mlx.mlx_vector_array_append_value(vec, snap_aux.aux_state);
             if (snap_aux.qsa_pooled.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, snap_aux.qsa_pooled);
             mlx.check(mlx.mlx_eval(vec)) catch {
-                transformer_mod.ssmSnapshotDeinit(&snap_aux);
+                trunk.ssmSnapshotDeinit(&snap_aux);
                 break :head;
             };
             snap_aux.qsa_rows = hm.rows;
@@ -2573,7 +2574,7 @@ pub const DiskTier = struct {
     /// Write (or, under SSD-first, stage) one KV chunk. Returns the file's byte size.
     fn writeChunkFile(
         self: *DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_entries: []const trunk.KVCacheEntry,
         config: kv_quant.KVQuantConfig,
         dir_abs: []const u8,
         chunk_idx: u32,
@@ -2598,7 +2599,7 @@ pub const DiskTier = struct {
         self: *DiskTier,
         list: *std.ArrayList(NamedTensor),
         li: usize,
-        entry: *const transformer_mod.KVCacheEntry,
+        entry: *const trunk.KVCacheEntry,
         config: kv_quant.KVQuantConfig,
         r0: u32,
         r1: u32,
@@ -2845,7 +2846,7 @@ pub const DiskTier = struct {
     }
 
     /// Row segments a point of `cp` leans on: its whole spans, none when none of its arrays grow.
-    fn pointSegments(divs: []const u32, span: u32, cp: *const transformer_mod.SSMCheckpoint) u32 {
+    fn pointSegments(divs: []const u32, span: u32, cp: *const trunk.SSMCheckpoint) u32 {
         if (span == 0) return 0;
         for (cp.layers, 0..) |*l, li| {
             if (growable(divs, span, li, l.conv_state) or growable(divs, span, li, l.ssm_state)) return @intCast(cp.pos / span);
@@ -2859,7 +2860,7 @@ pub const DiskTier = struct {
     }
 
     /// Segment `j` (1-based) of an entry: the rows of tokens ((j-1)*span, j*span] of every growing array of `cp`.
-    fn writeGrownSegment(self: *DiskTier, dir_rel: []const u8, cp: *const transformer_mod.SSMCheckpoint, divs: []const u32, span: u32, j: u32, s: mlx.mlx_stream) !u64 {
+    fn writeGrownSegment(self: *DiskTier, dir_rel: []const u8, cp: *const trunk.SSMCheckpoint, divs: []const u32, span: u32, j: u32, s: mlx.mlx_stream) !u64 {
         var list = std.ArrayList(NamedTensor).empty;
         defer self.freeNamed(&list);
         for (cp.layers, 0..) |l, li| {
@@ -2880,7 +2881,7 @@ pub const DiskTier = struct {
     }
 
     /// Writes the row segments `cp`'s point leans on that the entry lacks, from `cp`'s own rows; returns how many it leans on.
-    fn growSegments(self: *DiskTier, dir_rel: []const u8, cp: *const transformer_mod.SSMCheckpoint, divs: []const u32, span: u32, grown: *std.ArrayList(u64), s: mlx.mlx_stream) !u32 {
+    fn growSegments(self: *DiskTier, dir_rel: []const u8, cp: *const trunk.SSMCheckpoint, divs: []const u32, span: u32, grown: *std.ArrayList(u64), s: mlx.mlx_stream) !u32 {
         const k = pointSegments(divs, span, cp);
         while (grown.items.len < k) {
             const sz = try self.writeGrownSegment(dir_rel, cp, divs, span, @intCast(grown.items.len + 1), s);
@@ -2890,7 +2891,7 @@ pub const DiskTier = struct {
         return k;
     }
 
-    fn findCp(cps: []const transformer_mod.SSMCheckpoint, pos: u32) ?*const transformer_mod.SSMCheckpoint {
+    fn findCp(cps: []const trunk.SSMCheckpoint, pos: u32) ?*const trunk.SSMCheckpoint {
         for (cps) |*cp| if (cp.pos == pos) return cp;
         return null;
     }
@@ -2900,7 +2901,7 @@ pub const DiskTier = struct {
     /// span-preservingly. Eligible = a RAM checkpoint at a position within the
     /// KV now on disk (a hybrid restore needs KV covering [0, cp_pos)).
     /// Sorted ascending; caller frees.
-    fn ssmTargetPositions(self: *DiskTier, old_positions: []const u32, cps: []const transformer_mod.SSMCheckpoint, kv_len: u32) ![]u32 {
+    fn ssmTargetPositions(self: *DiskTier, old_positions: []const u32, cps: []const trunk.SSMCheckpoint, kv_len: u32) ![]u32 {
         var set = std.ArrayList(u32).empty;
         errdefer set.deinit(self.allocator);
         try set.appendSlice(self.allocator, old_positions);
@@ -2912,7 +2913,7 @@ pub const DiskTier = struct {
         }
         std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
         while (set.items.len > self.ssm_max_per_entry) {
-            _ = set.orderedRemove(transformer_mod.positionDropIndex(set.items, self.cp_thin));
+            _ = set.orderedRemove(trunk.positionDropIndex(set.items, self.cp_thin));
         }
         self.ssm_budget_drops = 0;
         var unit: u64 = 0;
@@ -2956,7 +2957,7 @@ pub const DiskTier = struct {
         has_tools: bool,
         config: kv_quant.KVQuantConfig,
         media: CommitMedia,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        ssm_checkpoints: ?[]const trunk.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         ring_srcs: []const RingSource,
@@ -2999,7 +3000,7 @@ pub const DiskTier = struct {
     /// superseded no-op vs SSM-only-append decision. Conservative on alloc
     /// failure (returns false → the commit is a harmless no-op; the RAM tier
     /// still holds the checkpoints).
-    fn ssmWorkPending(self: *DiskTier, e: *const IndexEntry, cps_opt: ?[]const transformer_mod.SSMCheckpoint, kv_limit: u32) bool {
+    fn ssmWorkPending(self: *DiskTier, e: *const IndexEntry, cps_opt: ?[]const trunk.SSMCheckpoint, kv_limit: u32) bool {
         const cps = cps_opt orelse return false;
         if (cps.len == 0) return false;
         const target = self.ssmTargetPositions(e.ssm_positions, cps, kv_limit) catch return false;
@@ -3034,12 +3035,12 @@ pub const DiskTier = struct {
         old_bytes: []const u64,
         old_grown: []const u64,
         old_span: u32,
-        cps_opt: ?[]const transformer_mod.SSMCheckpoint,
+        cps_opt: ?[]const trunk.SSMCheckpoint,
         written_bytes: *u64,
         s: mlx.mlx_stream,
         max_spend: u64,
     ) !SsmPersistResult {
-        const cps: []const transformer_mod.SSMCheckpoint = cps_opt orelse &[_]transformer_mod.SSMCheckpoint{};
+        const cps: []const trunk.SSMCheckpoint = cps_opt orelse &[_]trunk.SSMCheckpoint{};
         var grown = std.ArrayList(u64).empty;
         errdefer grown.deinit(self.allocator);
         try grown.appendSlice(self.allocator, old_grown);
@@ -3122,7 +3123,7 @@ pub const DiskTier = struct {
     pub fn writeSsmFile(
         self: *DiskTier,
         dir_rel: []const u8,
-        cp: *const transformer_mod.SSMCheckpoint,
+        cp: *const trunk.SSMCheckpoint,
         s: mlx.mlx_stream,
     ) !u64 {
         return self.writePoint(dir_rel, cp, s, 0, 0);
@@ -3133,7 +3134,7 @@ pub const DiskTier = struct {
     fn writePoint(
         self: *DiskTier,
         dir_rel: []const u8,
-        cp: *const transformer_mod.SSMCheckpoint,
+        cp: *const trunk.SSMCheckpoint,
         s: mlx.mlx_stream,
         grown_k: u32,
         span: u32,
@@ -3238,7 +3239,7 @@ pub const DiskTier = struct {
     // ── Ring restore points (ringed sliding layers) ──
 
     /// Where a commit can write a ring file: `rows` below `pos` of `entries`' ringed layers.
-    const RingSource = struct { pos: u32, rows: u32, entries: []const transformer_mod.KVCacheEntry };
+    const RingSource = struct { pos: u32, rows: u32, entries: []const trunk.KVCacheEntry };
 
     fn ringFileBytes(src: RingSource) u64 {
         var n: u64 = FILE_OVERHEAD_BYTES;
@@ -3254,7 +3255,7 @@ pub const DiskTier = struct {
 
     /// Rows every ringed layer of `entries` can give a restore point at `pos`: window + backoff at
     /// most, at least the window (or every row from 0). Null when one cannot, or none rings.
-    fn ringRowsAt(entries: []const transformer_mod.KVCacheEntry, pos: usize, window: u32) ?u32 {
+    fn ringRowsAt(entries: []const trunk.KVCacheEntry, pos: usize, window: u32) ?u32 {
         const want: usize = @as(usize, window) + model.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF;
         var rows: ?usize = null;
         for (entries) |*e| {
@@ -3269,7 +3270,7 @@ pub const DiskTier = struct {
 
     /// The cache's own ring at the persisted length, then each checkpoint at its `step`; a
     /// restore below `MIN_DISK_ADVANTAGE_TOKENS` never beats the RAM tier. Caller frees.
-    fn ringSources(self: *DiskTier, kv_entries: []const transformer_mod.KVCacheEntry, kv_target: u32, ring: RingCommit) ![]RingSource {
+    fn ringSources(self: *DiskTier, kv_entries: []const trunk.KVCacheEntry, kv_target: u32, ring: RingCommit) ![]RingSource {
         var out = std.ArrayList(RingSource).empty;
         errdefer out.deinit(self.allocator);
         if (kv_target >= MIN_DISK_ADVANTAGE_TOKENS) {
@@ -3309,7 +3310,7 @@ pub const DiskTier = struct {
     fn thinRingPositions(positions: []u32) []u32 {
         var n = positions.len;
         while (n > RING_DISK_MAX_PER_ENTRY) : (n -= 1) {
-            const k = transformer_mod.positionDropIndex(positions[0..n], .min_span_recency);
+            const k = trunk.positionDropIndex(positions[0..n], .min_span_recency);
             for (k..n - 1) |i| positions[i] = positions[i + 1];
         }
         return positions[0..n];
@@ -3551,7 +3552,7 @@ pub const DiskTier = struct {
     /// Hard-link the donor's landed row segments that a point of this commit leans on and whose whole span lies inside
     /// the prefix donor and heir share: rows are append-only, so those bytes are the heir's own. Appends their sizes
     /// to `out`; a failure unwinds every link, leaving `out` empty.
-    fn linkInheritedSegments(self: *DiskTier, d: ChunkDonor, id: u64, cps: ?[]const transformer_mod.SSMCheckpoint, kv_target: u32, out: *std.ArrayList(u64)) !void {
+    fn linkInheritedSegments(self: *DiskTier, d: ChunkDonor, id: u64, cps: ?[]const trunk.SSMCheckpoint, kv_target: u32, out: *std.ArrayList(u64)) !void {
         const g = self.grown orelse return;
         const donor = &self.entries.items[d.idx];
         if (donor.grown_span != g.span) return;
@@ -4844,7 +4845,7 @@ test "DiskTier: cache ahead of the token record persists the clamped prefix (EOS
 
 // ── Phase 3: hybrid SSM checkpoint persistence ──
 
-const SSMCacheEntry = transformer_mod.SSMCacheEntry;
+const SSMCacheEntry = trunk.SSMCacheEntry;
 const conv_shape = [_]c_int{ 1, 3, 8 }; // [B, kernel-1, conv_dim]
 const ssm_shape = [_]c_int{ 1, 2, 4, 4 }; // [B, Hv, Dv, Dk]
 
@@ -4931,8 +4932,8 @@ test "DiskTier: SSM retention thins the interior, keeping both ends" {
     var srcs: [N][3]SSMCacheEntry = undefined;
     for (&srcs, 0..) |*src, i| src.* = buildHybridEntries(s, @floatFromInt((i + 1) * 1000), @floatFromInt((i + 1) * 2000));
     defer for (&srcs) |*src| freeHybridEntries(src);
-    var cps: [N]transformer_mod.SSMCheckpoint = undefined;
-    for (&cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
+    var cps: [N]trunk.SSMCheckpoint = undefined;
+    for (&cps, 0..) |*cp, i| cp.* = try trunk.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
@@ -4971,8 +4972,8 @@ test "DiskTier: a 130-point entry commits whole, with no count thinning" {
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     var src = buildHybridEntries(s, 1000, 2000);
     defer freeHybridEntries(&src);
-    var cps: [N]transformer_mod.SSMCheckpoint = undefined;
-    for (&cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, (i + 1) * 100, s);
+    var cps: [N]trunk.SSMCheckpoint = undefined;
+    for (&cps, 0..) |*cp, i| cp.* = try trunk.captureSsmCheckpoint(testing.allocator, &src, (i + 1) * 100, s);
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
@@ -5000,8 +5001,8 @@ test "DiskTier: one conversation over the byte budget drops its oldest restore p
     var src = buildHybridEntries(s, 1000, 2000);
     defer freeHybridEntries(&src);
     const positions = [_]usize{ 1000, 2000, 3000, POINT_GRID, 2 * POINT_GRID, 3 * POINT_GRID, 3 * POINT_GRID + 24 };
-    var cps: [positions.len]transformer_mod.SSMCheckpoint = undefined;
-    for (&cps, positions) |*cp, p| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, p, s);
+    var cps: [positions.len]trunk.SSMCheckpoint = undefined;
+    for (&cps, positions) |*cp, p| cp.* = try trunk.captureSsmCheckpoint(testing.allocator, &src, p, s);
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
     // Room for the rows and three of the seven points.
@@ -5047,9 +5048,9 @@ test "DiskTier: SSM salvage — one bad file drops that position, all bad drops 
         defer freeHybridEntries(&src128);
         var src256 = buildHybridEntries(s, 200.0, 600.0);
         defer freeHybridEntries(&src256);
-        var cps = [_]transformer_mod.SSMCheckpoint{
-            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
-            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
+        var cps = [_]trunk.SSMCheckpoint{
+            try trunk.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+            try trunk.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
         };
         defer for (&cps) |*cp| cp.deinit(testing.allocator);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
@@ -5089,8 +5090,8 @@ const grow_row_bytes: u64 = 18;
 
 /// A restore point at `pos` as an append-only store gives it: the rows are the same numbers in every point, so a
 /// shorter point's rows are a prefix of a longer one's; the fixed arrays differ per position.
-fn growCheckpoint(s: mlx.mlx_stream, pos: usize) !transformer_mod.SSMCheckpoint {
-    const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 4);
+fn growCheckpoint(s: mlx.mlx_stream, pos: usize) !trunk.SSMCheckpoint {
+    const layers = try testing.allocator.alloc(trunk.SSMCacheEntrySnapshot, 4);
     const r1: c_int = @intCast(pos / 2);
     const r2: c_int = @intCast(pos / 4);
     const base: f64 = @floatFromInt(pos * 100);
@@ -5128,7 +5129,7 @@ fn expectGrowPoint(tier: *DiskTier, id: u64, pos: u32, s: mlx.mlx_stream) !void 
 }
 
 fn commitGrowPoints(tier: *DiskTier, cache: *const KVCache, tokens: []const u32, positions: []const usize, s: mlx.mlx_stream) !void {
-    const cps = try testing.allocator.alloc(transformer_mod.SSMCheckpoint, positions.len);
+    const cps = try testing.allocator.alloc(trunk.SSMCheckpoint, positions.len);
     defer testing.allocator.free(cps);
     for (cps, positions) |*cp, p| cp.* = try growCheckpoint(s, p);
     defer for (cps) |*cp| cp.deinit(testing.allocator);
@@ -5633,9 +5634,9 @@ test "DiskTier: SSM checkpoints persist incrementally under the flush byte cap" 
     defer freeHybridEntries(&src128);
     var src512 = buildHybridEntries(s, 300.0, 700.0);
     defer freeHybridEntries(&src512);
-    var cps = [_]transformer_mod.SSMCheckpoint{
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s),
+    var cps = [_]trunk.SSMCheckpoint{
+        try trunk.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+        try trunk.captureSsmCheckpoint(testing.allocator, &src512, 512, s),
     };
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
@@ -5991,8 +5992,8 @@ test "DiskTier: a swallowed commit failure drops the latch it raised and keeps a
 
     var src = buildHybridEntries(s, 100.0, 500.0);
     defer freeHybridEntries(&src);
-    var cps = [_]transformer_mod.SSMCheckpoint{
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+    var cps = [_]trunk.SSMCheckpoint{
+        try trunk.captureSsmCheckpoint(testing.allocator, &src, 128, s),
     };
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
@@ -6048,8 +6049,8 @@ test "DiskTier: SSD-first writes a checkpoint beside the chunk that closes it" {
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     var src128 = buildHybridEntries(s, 100.0, 500.0);
     defer freeHybridEntries(&src128);
-    var cps = [_]transformer_mod.SSMCheckpoint{
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+    var cps = [_]trunk.SSMCheckpoint{
+        try trunk.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
     };
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
@@ -6161,9 +6162,9 @@ test "DiskTier: a writer-armed commit lands the whole entry in bounded pieces, i
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     var src = buildHybridEntries(s, 100.0, 500.0);
     defer freeHybridEntries(&src);
-    var cps = [_]transformer_mod.SSMCheckpoint{
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+    var cps = [_]trunk.SSMCheckpoint{
+        try trunk.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+        try trunk.captureSsmCheckpoint(testing.allocator, &src, 512, s),
     };
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
@@ -6214,9 +6215,9 @@ test "DiskTier: a sole entry over the byte budget is cut to a checkpoint that fi
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     var src = buildHybridEntries(s, 100.0, 500.0);
     defer freeHybridEntries(&src);
-    var cps = [_]transformer_mod.SSMCheckpoint{
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+    var cps = [_]trunk.SSMCheckpoint{
+        try trunk.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+        try trunk.captureSsmCheckpoint(testing.allocator, &src, 512, s),
     };
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
@@ -6374,8 +6375,8 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
     var src640 = buildHybridEntries(s, 11.0, 22.0);
     defer freeHybridEntries(&src640);
-    var cps640 = [_]transformer_mod.SSMCheckpoint{
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src640, 640, s),
+    var cps640 = [_]trunk.SSMCheckpoint{
+        try trunk.captureSsmCheckpoint(testing.allocator, &src640, 640, s),
     };
     defer for (&cps640) |*cp| cp.deinit(testing.allocator);
     _ = try tier.appendCommit(cache.entries, 640, cache.config, tokens[0..640], false, &cps640, s);
@@ -6541,7 +6542,7 @@ test "DiskTier: the per-entry cap holds the whole 8192 grid to 1M tokens, and pa
     const base = try tmpRoot(&tmp, io, &buf);
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-spacing", 0, 128);
     defer tier.deinit();
-    try testing.expectEqual(transformer_mod.ThinPolicy.oldest, tier.cp_thin);
+    try testing.expectEqual(trunk.ThinPolicy.oldest, tier.cp_thin);
     try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, tier.ssm_max_per_entry);
     tier.cp_thin = .min_span_recency;
     tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
@@ -6551,13 +6552,13 @@ test "DiskTier: the per-entry cap holds the whole 8192 grid to 1M tokens, and pa
     for (positions[0..128], 0..) |*p, i| p.* = @intCast((i + 1) * POINT_GRID);
     positions[128] = 128 * POINT_GRID + 24;
     const L: u32 = positions[128] + 8;
-    const whole = try tier.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const whole = try tier.ssmTargetPositions(&positions, &[_]trunk.SSMCheckpoint{}, L);
     defer testing.allocator.free(whole);
     try testing.expectEqualSlices(u32, &positions, whole);
 
     var more: [200]u32 = undefined;
     for (&more, 0..) |*p, i| p.* = @intCast((i + 1) * 1000);
-    const kept = try tier.ssmTargetPositions(&more, &[_]transformer_mod.SSMCheckpoint{}, 200_000);
+    const kept = try tier.ssmTargetPositions(&more, &[_]trunk.SSMCheckpoint{}, 200_000);
     defer testing.allocator.free(kept);
     try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY, kept.len);
     try testing.expectEqual(@as(u32, 1000), kept[0]);
@@ -6566,8 +6567,8 @@ test "DiskTier: the per-entry cap holds the whole 8192 grid to 1M tokens, and pa
     // The ungated arm: every other arch keeps the previous retention (the highest N).
     var legacy = try DiskTier.init(testing.allocator, io, base, "fp-spacing-legacy", 0, 128);
     defer legacy.deinit();
-    try testing.expectEqual(transformer_mod.ThinPolicy.oldest, legacy.cp_thin);
-    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    try testing.expectEqual(trunk.ThinPolicy.oldest, legacy.cp_thin);
+    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]trunk.SSMCheckpoint{}, L);
     defer testing.allocator.free(old_kept);
     try testing.expectEqualSlices(u32, positions[positions.len - SSM_DISK_MAX_PER_ENTRY_LEGACY ..], old_kept);
 }
@@ -7199,7 +7200,7 @@ test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps 8" {
     for (&positions, 0..) |*p, i| p.* = @intCast((i + 1) * 4096);
     const L: u32 = 40 * 4096;
 
-    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]trunk.SSMCheckpoint{}, L);
     defer testing.allocator.free(old_kept);
     try t.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, old_kept.len);
 
@@ -7207,7 +7208,7 @@ test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps 8" {
     defer gated.deinit();
     gated.cp_thin = .min_span_recency;
     gated.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
-    const new_kept = try gated.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const new_kept = try gated.ssmTargetPositions(&positions, &[_]trunk.SSMCheckpoint{}, L);
     defer testing.allocator.free(new_kept);
     try t.expectEqualSlices(u32, &positions, new_kept);
 }
@@ -7294,7 +7295,7 @@ test "DiskTier: a poisoned entry is invisible to the hybrid lookup too" {
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     var src = buildHybridEntries(s, 100.0, 500.0);
     defer freeHybridEntries(&src);
-    var cps: [1]transformer_mod.SSMCheckpoint = .{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s)};
+    var cps: [1]trunk.SSMCheckpoint = .{try trunk.captureSsmCheckpoint(testing.allocator, &src, 512, s)};
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
 
@@ -7476,8 +7477,8 @@ test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable 
         var srcs: [N][3]SSMCacheEntry = undefined;
         for (&srcs, 0..) |*src, i| src.* = buildHybridEntries(s, @floatFromInt((i + 1) * 1000), @floatFromInt((i + 1) * 2000));
         defer for (&srcs) |*src| freeHybridEntries(src);
-        var cps: [N]transformer_mod.SSMCheckpoint = undefined;
-        for (&cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 128, s);
+        var cps: [N]trunk.SSMCheckpoint = undefined;
+        for (&cps, 0..) |*cp, i| cp.* = try trunk.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 128, s);
         defer for (&cps) |*cp| cp.deinit(testing.allocator);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
         try testing.expectEqual(@as(usize, N), tier.entries.items[0].ssm_positions.len);
@@ -7679,7 +7680,7 @@ test "DiskTier: a commit holding no KV rows persists nothing, even with checkpoi
     cache.step = 2048;
     var entries = buildHybridEntries(s, 1, 100);
     defer freeHybridEntries(&entries);
-    var cp = try transformer_mod.captureSsmCheckpoint(std.testing.allocator, &entries, 2048, s);
+    var cp = try trunk.captureSsmCheckpoint(std.testing.allocator, &entries, 2048, s);
     defer cp.deinit(std.testing.allocator);
     var tokens: [2048]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i);
@@ -7708,8 +7709,8 @@ test "DiskTier: a thought point past the prompt end is the newest point and surv
     const prompt_end = 3 * POINT_GRID + 24;
     const thought = prompt_end + 100;
     const positions = [_]usize{ POINT_GRID, 2 * POINT_GRID, 3 * POINT_GRID, prompt_end, thought };
-    var cps: [positions.len]transformer_mod.SSMCheckpoint = undefined;
-    for (&cps, positions) |*cp, p| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, p, s);
+    var cps: [positions.len]trunk.SSMCheckpoint = undefined;
+    for (&cps, positions) |*cp, p| cp.* = try trunk.captureSsmCheckpoint(testing.allocator, &src, p, s);
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
 
     // Room for the rows and three points, then two: the oldest go first, the newest point and the grid point stay.
@@ -8216,9 +8217,9 @@ test "DiskTier: the bytes of a dense, a hybrid-with-QSA and a head-sidecar recor
         src256[2].qsa_ratio = 4;
         src256[1].ple_prev = .{ 42, 43, 0, 0, 0, 0, 0, 0 };
         src256[1].ple_prev_valid = true;
-        var cps = [_]transformer_mod.SSMCheckpoint{
-            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
-            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
+        var cps = [_]trunk.SSMCheckpoint{
+            try trunk.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+            try trunk.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
         };
         defer for (&cps) |*cp| cp.deinit(testing.allocator);
         try transformer_mod.attachQsaHistoryToLatest(&cps, &src256, s);
@@ -8237,13 +8238,13 @@ test "DiskTier: the bytes of a dense, a hybrid-with-QSA and a head-sidecar recor
         defer {
             _ = mlx.mlx_array_free(aux_src.conv_state);
             _ = mlx.mlx_array_free(aux_src.ssm_state);
-            transformer_mod.ssmFreeQsaState(&aux_src);
+            prefix_arch.aux.ssmFreeQsaState(&aux_src);
         }
         aux_src.aux_state = makeArange(s, &[_]c_int{ 1, 600, 8 }, 1.0);
         aux_src.qsa_pooled = makeArange(s, &[_]c_int{ 1, 150, 8 }, -9.0);
         aux_src.qsa_ratio = 4;
-        var head_snap = transformer_mod.ssmSnapshot(&aux_src);
-        defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+        var head_snap = trunk.ssmSnapshot(&aux_src);
+        defer trunk.ssmSnapshotDeinit(&head_snap);
         _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, null, .{
             .entries = mtp.entries,
             .step = mtp.step,

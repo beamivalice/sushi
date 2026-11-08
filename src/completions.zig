@@ -2,7 +2,7 @@ const std = @import("std");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const json_text = @import("json_text.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
 const expert_stream_mod = @import("expert_stream.zig");
@@ -409,7 +409,7 @@ fn handleNonStreamingCompletion(
     allow_batch_mtp: bool,
     logprobs_n: u32,
     cache_key: u64,
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?trunk.KVQuantConfig,
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
@@ -508,7 +508,7 @@ fn handleStreamingCompletion(
     allow_batch_mtp: bool,
     logprobs_n: u32,
     cache_key: u64,
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?trunk.KVQuantConfig,
 ) !void {
     const cmpl_id = nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io));
     const created_ts = nowSecs(stream.io);

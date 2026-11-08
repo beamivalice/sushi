@@ -235,7 +235,7 @@ pub const Capture = struct {
             var slot = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(slot);
             const ids = [_]u32{0};
-            var cl = host.transformer.CaptureLayers{ .ids = &ids, .out = (&slot)[0..1] };
+            var cl = host.model_handle.CaptureLayers{ .ids = &ids, .out = (&slot)[0..1] };
             if (out != null) ctx.capture_layers = &cl;
             const tokens = self.windowTokens(w);
             defer _ = mlx.mlx_array_free(tokens);
@@ -480,7 +480,7 @@ test "capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS
     defer for (outs) |o| {
         _ = mlx.mlx_array_free(o);
     };
-    var cl = host.transformer.CaptureLayers{ .ids = &layer_ids, .out = &outs };
+    var cl = host.model_handle.CaptureLayers{ .ids = &layer_ids, .out = &outs };
     ctx.capture_layers = &cl;
     const tokens = windowTokensOf(t.allocator, &windows, 0);
     defer _ = mlx.mlx_array_free(tokens);

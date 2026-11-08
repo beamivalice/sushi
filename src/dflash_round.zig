@@ -2,7 +2,8 @@
 //! `.dflash2` in its drafter `kinds` and has no native round (GLM has its own) runs it.
 const std = @import("std");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const model_handle = @import("model_handle.zig");
+const trunk = @import("trunk.zig");
 const spec_types = @import("spec_types.zig");
 const generate = @import("generate.zig");
 const dflash_mod = @import("dflash.zig");
@@ -200,7 +201,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         allocator.free(cap_out);
     }
     for (cap_out) |*a| a.* = mlx.mlx_array_new();
-    var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out, .hc_mean = xfm.config.hc_count };
+    var cl = model_handle.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out, .hc_mean = xfm.config.hc_count };
     self.ctx.capture_layers = &cl;
     defer self.ctx.capture_layers = null;
     // Per-position SSM capture on a GDN trunk so partial accept can roll
@@ -211,7 +212,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     _ = try self.thinkShiftRows(&verify_logits, verify_input);
     self.ctx.capture_ssm_seq = false;
     defer if (self.ctx.ssm_entries) |entries| {
-        for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        for (entries) |*entry| trunk.ssmFreeSpecCapture(entry);
     };
     self.dflash_attempted += 1;
     if (tracing) {
@@ -357,7 +358,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         // re-point moe_seq_offset at the committed length.
         self.ctx.cache.step = kv_step_snap;
         if (self.ctx.ssm_entries) |entries| {
-            const gdn_captured = entries.len > 0 and transformer_mod.ssmHasSpecCapture(&entries[0]);
+            const gdn_captured = entries.len > 0 and trunk.ssmHasSpecCapture(&entries[0]);
             if (!gdn_captured) return error.SpecRollbackUnavailable;
             try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
         }

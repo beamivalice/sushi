@@ -6,7 +6,7 @@ const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const report = @import("ubench_report.zig");
 const fp8_block = @import("fp8_block.zig");
-const transformer = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const kv_quant = @import("kv_quant.zig");
 const mimo_forward = @import("mimo2/mimo_forward.zig");
@@ -176,7 +176,7 @@ fn sampleGemv(smp: GemvSample, arm_index: usize) anyerror!f64 {
 fn runGemv(run: *report.Run) anyerror!void {
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
-    const nax = transformer.verifyQmmNaxAvailable();
+    const nax = trunk.verifyQmmNaxAvailable();
     if (run.hasArm("fp8_serving") and !nax) {
         run.invalid("fp8_serving is the matrix-unit tile and this GPU has none: pass --arms bf16,fp8,affine8");
         return;
@@ -322,7 +322,7 @@ pub const global_decode_attn: report.Bench = .{
 
 const DecodeCase = struct {
     s: mlx.mlx_stream,
-    views: []transformer.DenseKVView,
+    views: []trunk.DenseKVView,
     q0: mlx.mlx_array,
     bits: u8,
     /// Nanoseconds of the chain with no attention in it, taken off every sample.
@@ -406,7 +406,7 @@ fn uniformBf16(seed: u64, shape: []const c_int, lo: f32, hi: f32, s: mlx.mlx_str
     return out;
 }
 
-fn triples(view: *const transformer.DenseKVView) [6]mlx.mlx_array {
+fn triples(view: *const trunk.DenseKVView) [6]mlx.mlx_array {
     return .{ view.k_triple_q, view.k_triple_scales, view.k_triple_biases, view.v_triple_q, view.v_triple_scales, view.v_triple_biases };
 }
 
@@ -424,9 +424,9 @@ fn runGlobalDecode(run: *report.Run) anyerror!void {
     const layers = run.steps(9);
     if (layers > 64) return error.TooManyLayers;
     const a = std.heap.page_allocator;
-    const caches = try a.alloc(transformer.KVCache, layers);
+    const caches = try a.alloc(trunk.KVCache, layers);
     defer a.free(caches);
-    const views = try a.alloc(transformer.DenseKVView, layers);
+    const views = try a.alloc(trunk.DenseKVView, layers);
     defer a.free(views);
     for (run.axis("kv")) |kv_text| {
         const kv = try std.fmt.parseInt(c_int, kv_text, 10);
@@ -437,7 +437,7 @@ fn runGlobalDecode(run: *report.Run) anyerror!void {
         };
         for (0..layers) |i| {
             const seed = @as(u64, 0x3D2D_BE7C) + i * 4;
-            caches[i] = try transformer.KVCache.initWithConfig(a, 1, kv_quant.KVQuantConfig.affine(bits));
+            caches[i] = try trunk.KVCache.initWithConfig(a, 1, kv_quant.KVQuantConfig.affine(bits));
             {
                 const k = try uniformBf16(seed, &[_]c_int{ 1, decode_hkv, kv - 1, decode_dk }, -0.5, 0.5, s);
                 defer _ = mlx.mlx_array_free(k);
@@ -509,10 +509,10 @@ pub const prefill_attn: report.Bench = .{
 const GlobalCase = struct {
     s: mlx.mlx_stream,
     q: mlx.mlx_array,
-    view: *const transformer.DenseKVView,
+    view: *const trunk.DenseKVView,
     calls: usize,
     dispatches: *[2]u32,
-    engaged: *transformer.AttnPdArm,
+    engaged: *trunk.AttnPdArm,
 };
 
 fn sampleGlobal(c: GlobalCase, arm_index: usize) anyerror!f64 {
@@ -521,8 +521,8 @@ fn sampleGlobal(c: GlobalCase, arm_index: usize) anyerror!f64 {
     const sw = io_util.Stopwatch.init(benchIo());
     for (0..c.calls) |_| {
         const out = (switch (arm) {
-            .served => try transformer.fusedSdpaPrefillKv(c.s, c.q, c.view, scale, 0, .{ .ctx = null }),
-            else => try transformer.fusedSdpaPrefill(c.s, c.q, c.view.k, c.view.v, scale, 0),
+            .served => try trunk.fusedSdpaPrefillKv(c.s, c.q, c.view, scale, 0, .{ .ctx = null }),
+            else => try trunk.fusedSdpaPrefill(c.s, c.q, c.view.k, c.view.v, scale, 0),
         }) orelse return error.FusedDeclined;
         defer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_eval(out));
@@ -556,9 +556,9 @@ fn sampleSliding(c: SlidingCase, arm_index: usize) anyerror!f64 {
         var out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(out);
         if (arm == .band) {
-            const view = transformer.DenseKVView{ .k = kd, .v = vd, .owned = false };
+            const view = trunk.DenseKVView{ .k = kd, .v = vd, .owned = false };
             _ = mlx.mlx_array_free(out);
-            out = (try transformer.slidingPrefillAttn(c.s, c.cfg, c.q, &view, scale, c.sinks)) orelse return error.FusedDeclined;
+            out = (try trunk.slidingPrefillAttn(c.s, c.cfg, c.q, &view, scale, c.sinks)) orelse return error.FusedDeclined;
         } else {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, c.q, kd, vd, scale, "array", c.mask, c.sinks, false, c.s));
         }
@@ -571,7 +571,7 @@ fn sampleSliding(c: SlidingCase, arm_index: usize) anyerror!f64 {
 /// that skips the dequant.
 const PrefixView = struct {
     parts: [6]mlx.mlx_array,
-    view: transformer.DenseKVView,
+    view: trunk.DenseKVView,
 
     fn init(s: mlx.mlx_stream, trip: [6]mlx.mlx_array, kl: c_int) !PrefixView {
         var parts: [6]mlx.mlx_array = undefined;
@@ -678,7 +678,7 @@ fn runPrefill(run: *report.Run) anyerror!void {
     if (max_kl > max_keys) return error.TooManyKeys;
 
     // One global layer's kv8 cache, filled once; each rung reads the first kL rows of its views.
-    var cache = try transformer.KVCache.initWithConfig(a, 1, kv_quant.KVQuantConfig.affine(8));
+    var cache = try trunk.KVCache.initWithConfig(a, 1, kv_quant.KVQuantConfig.affine(8));
     defer cache.deinit();
     var full = blk: {
         const k = try uniformBf16(0xA77D, &[_]c_int{ 1, 4, max_kl, 192 }, -2.0, 2.0, s);
@@ -702,7 +702,7 @@ fn runPrefill(run: *report.Run) anyerror!void {
     cfg.head_dim = 192;
     cfg.v_head_dim = 128;
 
-    var engaged: ?transformer.AttnPdArm = null;
+    var engaged: ?trunk.AttnPdArm = null;
     for (run.axis("ql")) |ql_text| {
         const ql = try std.fmt.parseInt(c_int, ql_text, 10);
         const q = try chunkQuery(0xB001, ql, 1.0e7, s);
@@ -713,7 +713,7 @@ fn runPrefill(run: *report.Run) anyerror!void {
             var view = try PrefixView.init(s, trip, kl);
             defer view.deinit();
             var dispatches: [2]u32 = .{ 0, 0 };
-            var arm_seen: transformer.AttnPdArm = .simd;
+            var arm_seen: trunk.AttnPdArm = .simd;
             const label = try std.fmt.allocPrint(run.a, "global qL {d} kL {d}", .{ ql, kl });
             const case: GlobalCase = .{ .s = s, .q = q, .view = &view.view, .calls = run.steps(1), .dispatches = &dispatches, .engaged = &arm_seen };
             if (!try interleaveSome(run, label, case, sampleGlobal, &.{ "served", "dense" })) continue;

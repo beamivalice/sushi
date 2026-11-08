@@ -1,9 +1,9 @@
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const model_mod = @import("model.zig");
-const SSMCheckpoint = transformer_mod.SSMCheckpoint;
+const SSMCheckpoint = trunk.SSMCheckpoint;
 const testing = std.testing;
 const generate = @import("generate.zig");
 
@@ -59,7 +59,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // is the measured MoE lesson carried over as a ceiling only.
     // 2048 is the default (a 64k prompt prefills within noise of 4096); an
     // explicit `--prefill-chunk` may raise it to that ceiling.
-    if (head_dim == 192 and transformer_mod.prefillHeadDimFused(head_dim)) {
+    if (head_dim == 192 and trunk.prefillHeadDimFused(head_dim)) {
         return @min(base_chunk, @as(usize, if (settings_resolve.prefill_chunk.source == .flag) 4096 else 2048));
     }
     // Non-sliding hd-256 archs under FUSED causal (the default since the
@@ -73,7 +73,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // the per-chunk dequant sweeps: chunk 8192 measured +1.4% over 4096 at
     // the 8K rung, flat at 32K.
     // Never raises a caller-lowered base.
-    if (head_dim == 256 and !sliding_band_arch and transformer_mod.fused256CausalMode() == .all) {
+    if (head_dim == 256 and !sliding_band_arch and trunk.fused256CausalMode() == .all) {
         // A long-context-gated MoE prices the 8192 rung per request in `chooseRequestPrefillChunk`
         // (+8% prefill for +3 GB peak here); every other MoE keeps the measured 4096 cap.
         return @min(base_chunk, if (is_moe and !long_ctx_gated) @as(usize, 4096) else @as(usize, 8192));
@@ -140,13 +140,13 @@ pub fn requestPrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slidin
 /// whole, so a checkpoint past the first media row restores like any other and the generic
 /// span-preserving thinning decides; protecting the boundary's checkpoint instead dropped every
 /// one above it, which is exactly the state an image-bearing turn restores from next time.
-fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.ThinPolicy) usize {
-    return transformer_mod.ssmCheckpointDropIndex(items, policy, null);
+fn checkpointDropIndex(items: []const SSMCheckpoint, policy: trunk.ThinPolicy) usize {
+    return trunk.ssmCheckpointDropIndex(items, policy, null);
 }
 
 /// Drops checkpoints until at most `max` hold a state (`max` 0 = no cap). A released one is a restore point
 /// already on SSD and costs no memory, so it is never the one dropped nor counted.
-pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), max: u32, policy: transformer_mod.ThinPolicy) void {
+pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), max: u32, policy: trunk.ThinPolicy) void {
     if (max == 0) return;
     while (true) {
         var held: usize = 0;
@@ -170,9 +170,9 @@ test "a capped list thins span-preserving whether or not the prompt carries medi
         .{ .pos = 768, .layers = &.{} },
         .{ .pos = 1536, .layers = &.{} },
     };
-    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency));
+    try testing.expectEqual(trunk.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency));
     list = .{ .{ .pos = 768, .layers = &.{} }, .{ .pos = 1536, .layers = &.{} }, .{ .pos = 2048, .layers = &.{} } };
-    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency));
+    try testing.expectEqual(trunk.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency));
 }
 
 /// `ssm_checkpoint_stride`'s default guards.
@@ -300,7 +300,7 @@ pub fn reservedPrefillTokens(
     chunk: u64,
 ) u64 {
     if (!config.reservesKvCapacity()) return 0;
-    return transformer_mod.KVCache.reservedTokens(
+    return trunk.KVCache.reservedTokens(
         seq,
         max_tokens,
         chunk,

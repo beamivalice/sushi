@@ -1,7 +1,8 @@
 const std = @import("std");
+const sched_policy = @import("sched_policy.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const verify_moe = @import("verify_moe.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const nax_gate = @import("nax_gate.zig");
@@ -47,7 +48,7 @@ const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 const update_mod = @import("update.zig");
 
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const VisionEncoder = vision_mod.VisionEncoder;
@@ -1035,7 +1036,7 @@ pub fn serve(
     } else if (server_state.server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
-    const launch_use = arch_flags.LaunchFlagUse{ .qwen_gdn_16 = !model_mod.qwen_gdn_f32, .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag };
+    const launch_use = arch_flags.LaunchFlagUse{ .qwen_gdn_16 = !model_mod.qwen_gdn_f32, .mtp_head_kv_quant = trunk.Transformer.mtp_head_kv_quant_flag };
     var boot_lines: [arch_flags.options.len]?[]const u8 = undefined;
     for (arch_flags.bootLines(config, launch_use, &boot_lines)) |line| if (line) |l| log.info("{s}\n", .{l});
     if (generate_mod.max_mtp_ctx != 0) {
@@ -1733,11 +1734,11 @@ test "Sushi quant memory request refusal carries the actual KV width MTP and max
     const chunk: u64 = 1024;
     const budget = prefillNeededAtChunk(&cfg, 64000, 0, 4, chunk, .{});
     const bill = AdmissionBill{ .needed = prefillNeededAtChunk(&cfg, 128000, 32000, 4, chunk, .{}), .available = budget, .chunk = chunk };
-    const refusal = bills.requestContextRefusal(&cfg, 128000, 32000, transformer_mod.KVQuantConfig.affine(4), bill, .{}).?;
+    const refusal = bills.requestContextRefusal(&cfg, 128000, 32000, trunk.KVQuantConfig.affine(4), bill, .{}).?;
     try std.testing.expectEqual(@as(u64, 4), refusal.kv_bits);
     try std.testing.expectEqual(@as(u32, 64000), refusal.maximum);
     try std.testing.expectEqual(@as(u64, 160000), refusal.requested);
-    const mtp = bills.requestContextRefusal(&cfg, 128000, 32000, transformer_mod.KVQuantConfig.affine(4), bill, .{ .mtp_on = true }).?;
+    const mtp = bills.requestContextRefusal(&cfg, 128000, 32000, trunk.KVQuantConfig.affine(4), bill, .{ .mtp_on = true }).?;
     try std.testing.expect(mtp.maximum < refusal.maximum);
     var buf: [256]u8 = undefined;
     const message = memoryContextRefusalMessage(&buf, refusal);
@@ -1763,7 +1764,7 @@ const IdleUnloadFit = struct {
     config: *const model_mod.ModelConfig,
     prompt_ids: []const u32,
     max_tokens: u32,
-    kv_override: ?transformer_mod.KVQuantConfig,
+    kv_override: ?trunk.KVQuantConfig,
     unchunked_prefill: bool,
     enable_mtp: bool,
 
@@ -1779,7 +1780,7 @@ const IdleUnloadFit = struct {
     }
 };
 
-pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, keep_id: []const u8, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
+pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, keep_id: []const u8, is_anthropic: bool, kv_override: ?trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
     if (arch_flags.kvQuantRequestRefusal(config, kv_override orelse configuredKvQuantFor(config))) |msg| {
         if (is_anthropic) {
             try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -2116,19 +2117,19 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
 
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
-pub fn batchVerdictFor(entry: *const LoadedModel) slot_admission.BatchVerdict {
+pub fn batchVerdictFor(entry: *const LoadedModel) sched_policy.BatchVerdict {
     const exclusive = if (entry.transformer) |t| t.ownsModuleDecodeState() else false;
     return batchVerdictOf(entry.config, exclusive);
 }
 
-pub fn batchVerdictOf(cfg: ?*const model_mod.ModelConfig, exclusive: bool) slot_admission.BatchVerdict {
+pub fn batchVerdictOf(cfg: ?*const model_mod.ModelConfig, exclusive: bool) sched_policy.BatchVerdict {
     if (exclusive) return .exclusive;
     const c = cfg orelse return .arch;
     return if (slot_admission.configBatchesDecode(c)) .ok else .arch;
 }
 
 /// The boot line's account of concurrent requests, from the verdict `/props` reports.
-pub fn concurrencyClause(verdict: slot_admission.BatchVerdict) []const u8 {
+pub fn concurrencyClause(verdict: sched_policy.BatchVerdict) []const u8 {
     return switch (verdict) {
         .ok => "batched decode on",
         .exclusive => "batched decode off; concurrent requests queue, one at a time",
@@ -4338,11 +4339,11 @@ test "the concurrency verdict: a resident GLM and qwen4 batch, an exclusive mode
     const glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .full_attention_interval = 4, .num_experts = 8, .num_experts_per_tok = 2 };
     const moe = model_mod.ModelConfig{ .model_type = "qwen3_moe", .num_experts = 8, .num_experts_per_tok = 2 };
-    try std.testing.expectEqual(slot_admission.BatchVerdict.ok, batchVerdictOf(&glm, false));
-    try std.testing.expectEqual(slot_admission.BatchVerdict.arch, batchVerdictOf(&moe, false));
-    try std.testing.expectEqual(slot_admission.BatchVerdict.exclusive, batchVerdictOf(&glm, true));
-    try std.testing.expectEqual(slot_admission.BatchVerdict.ok, batchVerdictOf(&qwen4, false));
-    try std.testing.expectEqual(slot_admission.BatchVerdict.arch, batchVerdictOf(null, false));
+    try std.testing.expectEqual(sched_policy.BatchVerdict.ok, batchVerdictOf(&glm, false));
+    try std.testing.expectEqual(sched_policy.BatchVerdict.arch, batchVerdictOf(&moe, false));
+    try std.testing.expectEqual(sched_policy.BatchVerdict.exclusive, batchVerdictOf(&glm, true));
+    try std.testing.expectEqual(sched_policy.BatchVerdict.ok, batchVerdictOf(&qwen4, false));
+    try std.testing.expectEqual(sched_policy.BatchVerdict.arch, batchVerdictOf(null, false));
     try std.testing.expectEqualStrings("batched decode off; concurrent requests interleave serially", concurrencyClause(.arch));
     try std.testing.expectEqualStrings("batched decode off; concurrent requests queue, one at a time", concurrencyClause(.exclusive));
     try std.testing.expectEqualStrings("batched decode on", concurrencyClause(.ok));

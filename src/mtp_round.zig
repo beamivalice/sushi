@@ -16,10 +16,11 @@ const mtp_mod = @import("mtp.zig");
 const mtp_plan = @import("mtp_plan.zig");
 const round_cost = @import("round_cost.zig");
 const sampler = @import("sampler.zig");
-const transformer_mod = @import("transformer.zig");
+const model_handle = @import("model_handle.zig");
+const trunk = @import("trunk.zig");
 const CommittedArgmax = spec_types.CommittedArgmax;
 const DrafterStepResult = Generator.DrafterStepResult;
-const ForwardCtx = transformer_mod.ForwardCtx;
+const ForwardCtx = model_handle.ForwardCtx;
 const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
 const MtpCacheRef = generate_mod.MtpCacheRef;
@@ -27,7 +28,7 @@ const MTP_EV_WARMUP_ROUNDS = mtp_policy.MTP_EV_WARMUP_ROUNDS;
 const MtpCostSource = mtp_policy.MtpCostSource;
 const MtpRoundPlan = mtp_policy.MtpRoundPlan;
 const SubLap = mtp_policy.SubLap;
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const isEosId = spec_types.isEosId;
@@ -1538,7 +1539,7 @@ pub fn mtpRoundAfterChain(
     // (ssm_entries == null) keeps the proven snapshot + re-forward path.
     const kv_step_snap = self.ctx.cache.step;
     // MiMo is attention-only: a truncate IS its rollback, rings included.
-    var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null or self.xfm.config.isMimo()) null else try self.ctx.cache.snapshot();
+    var kv_snap: ?trunk.KVCacheSnapshot = if (self.ctx.ssm_entries != null or self.xfm.config.isMimo()) null else try self.ctx.cache.snapshot();
     errdefer if (kv_snap) |*snap| snap.deinit();
     const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
@@ -1600,7 +1601,7 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     // DIAGNOSTIC (SUSHI_MTP_TRACE_SYNC=1): drain the GPU before the
     // verify build so the `sync` lap shows the pending lazy work (draft
     // chain, rollback, commit) and `verify` the forward alone.
-    if (tracing and transformer_mod.diagEnvOnCached(&mtp_trace_sync_env, "SUSHI_MTP_TRACE_SYNC")) {
+    if (tracing and trunk.diagEnvOnCached(&mtp_trace_sync_env, "SUSHI_MTP_TRACE_SYNC")) {
         var sync_watch = io_util.Stopwatch.init(self.timer.io);
         try mlx.check(mlx.mlx_array_eval(st.verify_input));
         self.mtp_trace.add(.sync, sync_watch.read());
@@ -1876,7 +1877,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     // Always free the transient capture buffers before returning, however
     // we exit this round (full accept, partial accept, or error).
     defer if (self.ctx.ssm_entries) |entries| {
-        for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        for (entries) |*entry| trunk.ssmFreeSpecCapture(entry);
     };
     // A lookup round is no MTP width sample, nor is the MTP round after one:
     // its first head step consumes a wider history stash than MTP makes.
@@ -2186,7 +2187,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     new_hidden = .{ .ctx = null };
 
     const gdn_captured = if (self.ctx.ssm_entries) |entries|
-        entries.len > 0 and transformer_mod.ssmHasSpecCapture(&entries[0])
+        entries.len > 0 and trunk.ssmHasSpecCapture(&entries[0])
     else
         false;
 
@@ -2484,7 +2485,7 @@ pub const MtpRoundState = struct {
     ph: io_util.Stopwatch,
     round_watch: io_util.Stopwatch,
     kv_step_snap: usize,
-    kv_snap: ?transformer_mod.KVCacheSnapshot,
+    kv_snap: ?trunk.KVCacheSnapshot,
     moe_seq_offset_snap: usize,
     /// `[1, 1+m]` int32.
     verify_input: mlx.mlx_array,
@@ -2520,7 +2521,7 @@ pub const MtpRoundState = struct {
         if (self.new_hidden.ctx != null) _ = mlx.mlx_array_free(self.new_hidden);
         if (self.verify_hidden_all.ctx != null) _ = mlx.mlx_array_free(self.verify_hidden_all);
         if (self.verify_ctx) |ctx| {
-            if (ctx.ssm_entries) |entries| for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+            if (ctx.ssm_entries) |entries| for (entries) |*entry| trunk.ssmFreeSpecCapture(entry);
         }
         if (self.verify_rollback) |*saved| {
             saved.restore();

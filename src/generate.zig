@@ -2,6 +2,8 @@ const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const model_handle = @import("model_handle.zig");
+const trunk = @import("trunk.zig");
 const qwen4_forward = @import("qwen4/qwen4_forward.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
@@ -25,17 +27,17 @@ const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
 
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
-const ForwardCtx = transformer_mod.ForwardCtx;
-const SSMCacheEntrySnapshot = transformer_mod.SSMCacheEntrySnapshot;
-const ssmSnapshot = transformer_mod.ssmSnapshot;
-const ssmSnapshotDeinit = transformer_mod.ssmSnapshotDeinit;
-const ssmRestore = transformer_mod.ssmRestore;
-const SSMCheckpoint = transformer_mod.SSMCheckpoint;
-const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
+const ForwardCtx = model_handle.ForwardCtx;
+const SSMCacheEntrySnapshot = trunk.SSMCacheEntrySnapshot;
+const ssmSnapshot = trunk.ssmSnapshot;
+const ssmSnapshotDeinit = trunk.ssmSnapshotDeinit;
+const ssmRestore = trunk.ssmRestore;
+const SSMCheckpoint = trunk.SSMCheckpoint;
+const captureSsmCheckpoint = trunk.captureSsmCheckpoint;
 const glm5_forward = @import("glm5/glm5_forward.zig");
 const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
@@ -43,7 +45,7 @@ const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
 const dspark_rows = @import("dsv41/dspark_rows.zig");
 const DflashModel = dflash_mod.DflashModel;
-const KVCache = transformer_mod.KVCache;
+const KVCache = trunk.KVCache;
 const glm5_generate = @import("glm5/glm5_generate.zig");
 const glm5_state = @import("glm5/glm5_state.zig");
 const dsv41_state = @import("dsv41/dsv41_state.zig");
@@ -1154,7 +1156,7 @@ pub const Generator = struct {
         /// snapshot reflects a coherent state.
         ssm_checkpoint_stride: u32 = 0,
         /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
-        /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
+        /// (`trunk.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
         ssm_checkpoint_max: u32 = 16,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
@@ -1362,7 +1364,7 @@ pub const Generator = struct {
         );
         // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
         const trace_enabled = log.isDebug();
-        const chunk_peak = trace_enabled and transformer_mod.diagEnvOn("SUSHI_PREFILL_CHUNK_PEAK");
+        const chunk_peak = trace_enabled and trunk.diagEnvOn("SUSHI_PREFILL_CHUNK_PEAK");
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;
@@ -1476,7 +1478,7 @@ pub const Generator = struct {
         errdefer if (dflash_ctx) |*dc| dc.deinit();
         var dfl_out_buf: []mlx.mlx_array = &.{};
         defer if (dfl_out_buf.len > 0) allocator.free(dfl_out_buf);
-        var dfl_cl: transformer_mod.CaptureLayers = undefined;
+        var dfl_cl: model_handle.CaptureLayers = undefined;
         if (dflash_active) {
             dfl_out_buf = try allocator.alloc(mlx.mlx_array, options.dflash.?.config.target_layer_ids.len);
             dfl_cl = .{ .ids = options.dflash.?.config.target_layer_ids, .out = dfl_out_buf, .hc_mean = xfm.config.hc_count };
@@ -1538,7 +1540,7 @@ pub const Generator = struct {
             // far (~7.75 GB at 458k on qwen4_exp, #353). Same number the admission guard billed
             // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
             // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
-            const cp_thin: transformer_mod.ThinPolicy =
+            const cp_thin: trunk.ThinPolicy =
                 if (xfm.config.longCtxGated() or glm_request != null) .min_span_recency else .oldest;
 
             const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, s);
@@ -2930,7 +2932,7 @@ pub const Generator = struct {
         const a = self.ssm_checkpoint_alloc orelse return .failed;
         const entries = self.ctx.ssm_entries orelse return .failed;
         self.completeMtpHistory(pos, head_token);
-        var cp = transformer_mod.handOverSsmCheckpoint(a, entries, pos, self.xfm.s) catch |err| {
+        var cp = trunk.handOverSsmCheckpoint(a, entries, pos, self.xfm.s) catch |err| {
             log.warn("[prefix] decode-end restore point at {d} not taken: {s}\n", .{ pos, @errorName(err) });
             return .failed;
         };
@@ -2985,10 +2987,10 @@ pub const Generator = struct {
     /// The ONE place a partial accept rolls recurrent state back from the verify capture:
     /// the loop and the `partial_rounds` count travel together, so a caller cannot take the
     /// rollback without being counted.
-    pub fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
+    pub fn rollbackSsmFromCapture(self: *Generator, entries: []trunk.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
         self.partial_rounds += 1;
         for (entries) |*entry| {
-            try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
+            try trunk.ssmRollbackFromCapture(entry, accepted, verify_len, s);
         }
     }
 
@@ -4410,7 +4412,7 @@ test "a warm prefill grows its restored layers to the reservation before the fir
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    const KVC = transformer_mod.KVCache;
+    const KVC = trunk.KVCache;
     const seq: u64 = 40_000;
     const matched: c_int = 36_000;
     const capacity: usize = 40_960;
@@ -4427,7 +4429,7 @@ test "a warm prefill grows its restored layers to the reservation before the fir
     try mlx.check(mlx.mlx_zeros(&one, &[_]c_int{ 1, 2, 1, 64 }, 4, .bfloat16, s));
     for ([_]*const model_mod.ModelConfig{ &qwen4, &mimo }) |cfg| {
         const ring: u32 = if (cfg.swaRingTokens() > 0) cfg.sliding_window else 0;
-        for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8), .affine(6) }) |kvq| {
+        for ([_]trunk.KVQuantConfig{ .dense, .affine(8), .affine(6) }) |kvq| {
             for ([_]bool{ true, false }) |donate| {
                 // The previous turn's cache: it reserved C and holds the matched rows. Layer 1 rings on MiMo.
                 var donor = try KVC.initWithConfig(t.allocator, 2, kvq);
@@ -4496,7 +4498,7 @@ test "batched MTP state includes the last row activated by round begin" {
     xfm.arch_state = .{};
     const q4 = qwen4_state.stateOf(&xfm).?;
     const q4f = @import("qwen4/qwen4_forward.zig");
-    var head: transformer_mod.Qwen4Mtp = undefined;
+    var head: qwen4_forward.Qwen4Mtp = undefined;
     head.cache = try KVCache.init(allocator, 1);
     head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
     head.qsa_marks = .{};

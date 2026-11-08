@@ -19,7 +19,7 @@
 const std = @import("std");
 const model_mod = @import("model.zig");
 const expert_quant = @import("expert_quant.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const vision_mod = @import("vision.zig");
@@ -37,7 +37,7 @@ const pack_update = @import("pack_update.zig");
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
 
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;

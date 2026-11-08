@@ -1,5 +1,5 @@
-const transformer_mod = @import("transformer.zig");
-const KVCache = transformer_mod.KVCache;
+const trunk = @import("trunk.zig");
+const KVCache = trunk.KVCache;
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
 const mlx = @import("mlx.zig");

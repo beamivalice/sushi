@@ -1,9 +1,9 @@
-const trf = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const testing = std.testing;
-const verifyQmmEnabled = trf.verifyQmmEnabled;
+const verifyQmmEnabled = trunk.verifyQmmEnabled;
 
 /// Case-insensitive prefix match on the M5-class GPU family identifier.
 /// Prefix (not equality) is MTPLX's shipping behavior — device variants

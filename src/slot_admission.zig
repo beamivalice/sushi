@@ -1,10 +1,11 @@
 const std = @import("std");
 const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const model_mod = @import("model.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
-const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const Transformer = trunk.Transformer;
+const KVCache = trunk.KVCache;
 const ModelConfig = model_mod.ModelConfig;
 const LoadedModel = model_registry_mod.LoadedModel;
 const prefill_plan = @import("prefill_plan.zig");
@@ -62,11 +63,6 @@ pub fn adaptiveChunkWidthFor(cfg: ?*const model_mod.ModelConfig) bool {
 }
 
 // The pure decisions live in `sched_policy.zig`; these keep their old names for callers.
-pub const MAX_BATCH_GROUP = sched_policy.MAX_BATCH_GROUP;
-pub const BatchVerdict = sched_policy.BatchVerdict;
-pub const batchedKvKeepCount = sched_policy.batchedKvKeepCount;
-pub const batchedPadWaste = sched_policy.batchedPadWaste;
-pub const AdmitCand = sched_policy.AdmitCand;
 
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.
@@ -76,12 +72,12 @@ pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
 
 /// The rows one batched forward carries: the arch's bound, where it declares one (`sched.rowCap`).
 pub fn batchGroupCap(cfg: *const model_mod.ModelConfig) usize {
-    return sched.rowCap(cfg) orelse MAX_BATCH_GROUP;
+    return sched.rowCap(cfg) orelse sched_policy.MAX_BATCH_GROUP;
 }
 
 /// One line per slot the first time it decodes serial beside live company;
 /// the counter moves every tick so the rate is visible under `--metrics`.
-pub fn noteSerial(sch: *Scheduler, slot: *Slot, why: BatchVerdict) void {
+pub fn noteSerial(sch: *Scheduler, slot: *Slot, why: sched_policy.BatchVerdict) void {
     if (sch.metrics) |m| m.decode_serial_total[@backingInt(why)].inc();
     if (slot.serial_reason_logged) return;
     slot.serial_reason_logged = true;
@@ -93,7 +89,7 @@ pub fn padWasteKeepCount(group: []*Slot, gate_batch_kv_len: bool, kv_lens: *[32]
     // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
     // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
     if (gate_batch_kv_len) {
-        var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
+        var caches_buf: [sched_policy.MAX_BATCH_GROUP]*const KVCache = undefined;
         for (group, 0..) |g, i| {
             caches_buf[i] = &g.cache;
         }
@@ -176,7 +172,7 @@ fn slotHoldsAdmission(slot: *const Slot) bool {
 }
 
 /// Exclusive slots in `lists` (decoding, then queued for cleanup) that still hold admission.
-pub fn heldExclusive(out: []AdmitCand, lists: []const []const *Slot, exclusive: *const fn (*const Slot) bool) usize {
+pub fn heldExclusive(out: []sched_policy.AdmitCand, lists: []const []const *Slot, exclusive: *const fn (*const Slot) bool) usize {
     var n: usize = 0;
     for (lists) |list| for (list) |s| {
         if (n >= out.len) return n;
@@ -359,7 +355,7 @@ test "a resident MiMo batches decode in groups of the FP8 GEMV's row-identical w
     try testing.expectEqual(@as(usize, 4), batchGroupCap(&cfg));
     cfg.expert_streaming = true;
     try testing.expect(!configBatchesDecode(&cfg));
-    try testing.expectEqual(MAX_BATCH_GROUP, batchGroupCap(&cfg));
+    try testing.expectEqual(sched_policy.MAX_BATCH_GROUP, batchGroupCap(&cfg));
 }
 
 test "the batched group is capped by padding waste: the longest slot sorts last and falls out" {
@@ -402,11 +398,11 @@ test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.ste
     }
     for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, null));
 
-    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&kv_lens));
-    try testing.expect(batchedPadWaste(&kv_lens) > sched_policy.MAX_PAD_WASTE);
+    try testing.expectEqual(@as(usize, 2), sched_policy.batchedKvKeepCount(&kv_lens));
+    try testing.expect(sched_policy.batchedPadWaste(&kv_lens) > sched_policy.MAX_PAD_WASTE);
 
-    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
-    try testing.expectEqual(@as(f64, 1.0), batchedPadWaste(&[_]u32{ 0, 0, 0 }));
+    try testing.expectEqual(@as(usize, 3), sched_policy.batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
+    try testing.expectEqual(@as(f64, 1.0), sched_policy.batchedPadWaste(&[_]u32{ 0, 0, 0 }));
 }
 
 test "an attention-first trunk's batching lengths are unchanged by the fix" {
@@ -428,10 +424,10 @@ test "an attention-first trunk's batching lengths are unchanged by the fix" {
     try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 1_000, 100_000 }, &kv_lens);
     var q4b = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
     for (caches[0..], 0..) |*c, i| try testing.expectEqual(kv_lens[i], batchKvLenOf(c, &q4b));
-    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&kv_lens));
+    try testing.expectEqual(@as(usize, 3), sched_policy.batchedKvKeepCount(&kv_lens));
     try testing.expectEqual(
-        batchedKvKeepCount(&[_]u32{ 1_000, 1_000, 1_000, 100_000 }),
-        batchedKvKeepCount(&kv_lens),
+        sched_policy.batchedKvKeepCount(&[_]u32{ 1_000, 1_000, 1_000, 100_000 }),
+        sched_policy.batchedKvKeepCount(&kv_lens),
     );
 }
 
@@ -454,7 +450,7 @@ test "a cancelled or queued-for-cleanup slot still blocks exclusive admission un
     }
     cancelled.cancelled.store(true, .release);
     finished.finished = true;
-    var out: [8]AdmitCand = undefined;
+    var out: [8]sched_policy.AdmitCand = undefined;
     const decoding = [_]*Slot{ &live, &cancelled, &finished };
     const cleanup = [_]*Slot{&queued};
     try testing.expectEqual(@as(usize, 3), heldExclusive(&out, &.{ &decoding, &cleanup }, Fake.exclusive));
@@ -515,7 +511,7 @@ test "admitsWithinMemory: a live request's outstanding growth is not free headro
 test "a staggered admission waits for the growth an earlier request was admitted to allocate" {
     const gb: u64 = 1 << 30;
     const Probe = struct {
-        fn numbers(_: *const ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: bool, _: bool) MemoryBill {
+        fn numbers(_: *const ModelConfig, _: usize, _: u32, _: trunk.KVQuantConfig, _: bool, _: bool) MemoryBill {
             return .{ .needed = 9 * gb, .available = 10 * gb, .commit = 6 * gb };
         }
     };

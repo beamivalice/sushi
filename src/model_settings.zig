@@ -386,8 +386,8 @@ pub const Fit = struct {
     /// The arch has an expert prefetcher (`arch/admission.zig` `ExpertStreamTraits.prefetch`). It keeps no KV cache
     /// and runs no MTP tail either: its drafts accept by the exact rule only.
     prefetch: bool = false,
-    /// The cache stores only what the MLA latent holds (`KVQuantConfig.glmLatentBits`).
-    latent_kv: bool = false,
+    /// The `kv_quant` spellings the cache stores, when it stores fewer than all of them; empty = every width.
+    kv_choices: []const []const u8 = &.{},
     /// The model's context window; 0 = unknown.
     context_cap: u32 = 0,
     template_preserves_thinking: bool = true,
@@ -431,9 +431,9 @@ fn budgetDropsHead(fit: Fit) bool {
 
 /// Whether the model's cache stores `choice` of `key`.
 pub fn choiceAllowed(key: []const u8, choice: []const u8, fit: Fit) bool {
-    if (!fit.latent_kv or !std.mem.eql(u8, key, "kv_quant")) return true;
-    const stored = kv_quant.KVQuantConfig.fromJsonValue(.{ .string = choice }) orelse return false;
-    return stored.glmLatentBits() != null;
+    if (fit.kv_choices.len == 0 or !std.mem.eql(u8, key, "kv_quant")) return true;
+    for (fit.kv_choices) |c| if (std.mem.eql(u8, c, choice)) return true;
+    return false;
 }
 
 pub const Limit = struct {
@@ -1155,7 +1155,7 @@ test "model_settings: writeEdits keeps what it does not touch, round-trips throu
 
 test "model_settings: limits: each arch and pack variant is offered only what the loader honours" {
     const t = std.testing;
-    const latent: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false, .context_cap = 4096 };
+    const latent: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .kv_choices = &.{ "off", "0", "16", "6", "8" }, .serves_mtp = false, .context_cap = 4096 };
     try t.expect(choiceAllowed("kv_quant", "off", latent));
     try t.expect(choiceAllowed("kv_quant", "6", latent));
     try t.expect(choiceAllowed("kv_quant", "8", latent));
@@ -1195,7 +1195,7 @@ test "model_settings: limits: each arch and pack variant is offered only what th
 test "model_settings: refuseEdits: a value or pair the model cannot honour is refused, a removal or a kept file value never" {
     const t = std.testing;
     var buf: [128]u8 = undefined;
-    const latent: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false, .context_cap = 4096 };
+    const latent: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .kv_choices = &.{ "off", "0", "16", "6", "8" }, .serves_mtp = false, .context_cap = 4096 };
     try t.expectEqualStrings("kv_quant", refuseEdits(latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "4" } }}, &buf).?.key);
     try t.expect(refuseEdits(latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "6" } }}, &buf) == null);
     try t.expectEqualStrings("mtp", refuseEdits(latent, null, &.{.{ .key = "mtp", .value = .{ .bool = true } }}, &buf).?.key);

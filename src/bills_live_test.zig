@@ -1,5 +1,5 @@
 //! The bill tests that read the live GPU or need MLX. They run in the MLX tier; the rest of bills.zig runs in test-host.
-const Transformer = transformer_mod.Transformer;
+const Transformer = trunk.Transformer;
 const fixtures = @import("bills_fixtures_test.zig");
 const bills = @import("bills.zig");
 const dsv41_config = @import("dsv41/dsv41_config.zig");
@@ -20,7 +20,7 @@ const slot_admission = @import("slot_admission.zig");
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
 const testing = std.testing;
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 
 test "dsv41 bills: a prefill holds its restore points beside the state with a RAM tier, and only the writer's in-flight bytes SSD-first (DSV41_TINY)" {
     try mlx.requireGpu();
@@ -316,7 +316,7 @@ test "GLM serving memory bills one latent at the request's KV width and pooled i
     try std.testing.expectEqual(@as(u64, 11968), bills.sessionBytesPerToken(&cfg, 16));
     // kv8: 11 layers x (512 codes + 8 BF16 scale/bias pairs) beside the BF16 pooled index.
     try std.testing.expectEqual(@as(u64, 11 * 544 + 704), bills.sessionBytesPerToken(&cfg, 8));
-    launch_state.configured_kv_quant = transformer_mod.KVQuantConfig.dense;
+    launch_state.configured_kv_quant = trunk.KVQuantConfig.dense;
     try std.testing.expectEqual(@as(u64, 16), bills.defaultKvBits(&cfg));
     launch_state.configured_kv_quant = null;
     // kv8 retains 480 fewer growth bytes per token and adds the pending MLA layer's dequant and quantizer scratch.
@@ -335,7 +335,7 @@ test "a streamed GLM bills its fill peak per request and its latent at the KV wi
     const saved = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved;
     var planned: [2]u64 = undefined;
-    for ([_]transformer_mod.KVQuantConfig{ .dense, transformer_mod.KVQuantConfig.affine(8) }, [_]u64{ 16, 8 }, &planned) |kv, bits, *bytes| {
+    for ([_]trunk.KVQuantConfig{ .dense, trunk.KVQuantConfig.affine(8) }, [_]u64{ 16, 8 }, &planned) |kv, bits, *bytes| {
         launch_state.configured_kv_quant = kv;
         try std.testing.expectEqual(bits, bills.defaultKvBits(&cfg));
         cfg.expert_streaming = false;
@@ -649,11 +649,11 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
     const t = std.testing;
     const cfg = fixtures.qwen4ExpOomConfig();
     const seq: usize = 200_000;
-    const q4 = transformer_mod.KVQuantConfig.affine(4);
-    const q8 = transformer_mod.KVQuantConfig.affine(8);
+    const q4 = trunk.KVQuantConfig.affine(4);
+    const q8 = trunk.KVQuantConfig.affine(8);
     const bill4 = bills.prefillAdmissionBill(&cfg, seq, 2048, q4, false, null, .{});
     const bill8 = bills.prefillAdmissionBill(&cfg, seq, 2048, q8, false, null, .{});
-    const bill16 = bills.prefillAdmissionBill(&cfg, seq, 2048, transformer_mod.KVQuantConfig.dense, false, null, .{});
+    const bill16 = bills.prefillAdmissionBill(&cfg, seq, 2048, trunk.KVQuantConfig.dense, false, null, .{});
     try t.expect(bill4.needed < bill8.needed);
     try t.expect(bill8.needed < bill16.needed);
 }
@@ -665,8 +665,8 @@ test "a second GLM admission leaves free the cache growth the first was admitted
     const prompt: usize = 16;
     const max_tokens: u32 = 1_048_560;
     for ([_]u64{ 16, 8 }) |kv_bits| {
-        const bill = bills.prefillAdmissionBill(&cfg, prompt, max_tokens, if (kv_bits == 16) transformer_mod.KVQuantConfig.dense else transformer_mod.KVQuantConfig.affine(8), false, null, .{});
-        const nums = bills.prefillBillNumbersNow(&cfg, prompt, max_tokens, if (kv_bits == 16) transformer_mod.KVQuantConfig.dense else transformer_mod.KVQuantConfig.affine(8), false, false);
+        const bill = bills.prefillAdmissionBill(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, null, .{});
+        const nums = bills.prefillBillNumbersNow(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, false);
         const commit = bills.admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits);
         try std.testing.expectEqual(commit, nums.commit);
         // What the request retains is most of its bill, and it is not resident at admission.

@@ -2,7 +2,7 @@ const std = @import("std");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const json_text = @import("json_text.zig");
-const transformer_mod = @import("transformer.zig");
+const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
@@ -988,7 +988,7 @@ fn handleAnthropicNonStreaming(
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?trunk.KVQuantConfig,
     /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
     /// by the parent handleAnthropicMessages. Threaded through so the
     /// non-streaming response carries `timings.tokenize_ms`.
@@ -1245,7 +1245,7 @@ fn handleAnthropicStreaming(
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?trunk.KVQuantConfig,
     /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
     /// doesn't currently emit `timings` over SSE (spec doesn't model it),
     /// but plumbing the value through keeps the signature consistent with

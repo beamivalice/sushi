@@ -75,14 +75,6 @@ pub const KVQuantConfig = struct {
         }
     }
 
-    /// GLM's MLA latent bits for this scheme (`glm5_latent.zig`); null = no GLM backend (kv4).
-    pub fn glmLatentBits(self: KVQuantConfig) ?u8 {
-        return switch (self.scheme) {
-            .off => 0,
-            .affine => if ((self.bits == 8 or self.bits == 6) and self.group_size == 64) self.bits else null,
-        };
-    }
-
     /// The same vocabulary, for reporting (`/v1/models` `meta.kv_quant`).
     pub fn wireName(self: KVQuantConfig) []const u8 {
         return switch (self.scheme) {
@@ -349,7 +341,6 @@ test "kv6 is a first-class wire value: parsed, named and served by GLM's latent 
     try t.expectEqual(@as(?KVQuantConfig, null), KVQuantConfig.fromJsonValue(.{ .integer = 7 }));
     try t.expectEqualStrings("6", six.wireName());
     try t.expectEqualStrings("kv6", (KvCacheChoice{ .config = six, .source = .default }).label());
-    try t.expectEqual(@as(?u8, 6), six.glmLatentBits());
     // Every wire name parses back to its own config.
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(4), six, KVQuantConfig.affine(8) }) |c| {
         try t.expectEqual(c, KVQuantConfig.fromJsonValue(.{ .string = c.wireName() }).?);
@@ -434,12 +425,4 @@ test "every model, GLM included, defaults to kv8 and 16 selects BF16" {
     try std.testing.expectEqual(KVQuantConfig.dense, KVQuantConfig.fromJsonValue(.{ .string = "16" }).?);
     try std.testing.expectEqual(KVQuantConfig.dense, KVQuantConfig.fromJsonValue(.{ .integer = 16 }).?);
     try std.testing.expectEqual(KVQuantConfig.dense, KvCacheChoice.resolve(KVQuantConfig.fromJsonValue(.{ .string = "16" }).?, null).config);
-}
-
-test "GLM latent stores BF16, kv8 or kv6 and names kv4 unsupported" {
-    try std.testing.expectEqual(@as(?u8, 0), KVQuantConfig.dense.glmLatentBits());
-    try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.affine(8).glmLatentBits());
-    try std.testing.expectEqual(@as(?u8, null), KVQuantConfig.affine(4).glmLatentBits());
-    try std.testing.expectEqual(@as(?u8, 6), KVQuantConfig.affine(6).glmLatentBits());
-    try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.fromJsonValue(.{ .integer = 8 }).?.glmLatentBits());
 }
