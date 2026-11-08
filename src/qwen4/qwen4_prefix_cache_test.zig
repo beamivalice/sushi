@@ -29,7 +29,6 @@ const pcEmptySsm = pc.pcEmptySsm;
 const pcFreeHybrid = pc.pcFreeHybrid;
 const pcFreeQsaHybrid = pc.pcFreeQsaHybrid;
 const pcQsaExpectViewEqual = pc.pcQsaExpectViewEqual;
-const pcQsaFeed = pc.pcQsaFeed;
 const pcQsaSliceAxis1 = pc.pcQsaSliceAxis1;
 const pcRowBytes = pc.pcRowBytes;
 const pcSsmVal = pc.pcSsmVal;
@@ -176,6 +175,12 @@ fn pcCaptureFed(
     defer pcFreeQsaHybrid(&live);
     try pcQsaFeed(xfm, &live[0], keys, pos, s);
     return trunk_mod.captureSsmCheckpoint(allocator, &live, @intCast(pos), s);
+}
+
+fn pcQsaFeed(xfm: *trunk_mod.Trunk, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
+    const chunk = try pcQsaSliceAxis1(s, keys, 0, n);
+    defer _ = mlx.mlx_array_free(chunk);
+    try qwen4_qsa_state.qsaTestAppendPool(xfm, entry, chunk, 0, s);
 }
 
 test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every position, and any of them restores from SSD exactly" {

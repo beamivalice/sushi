@@ -1,4 +1,5 @@
 //! Flash-Next's drafters: the in-checkpoint MTP head (`Head`, `Cache`) behind `arch/drafter.zig`.
+const qwen4_cost_profile = @import("qwen4_cost_profile.zig");
 const std = @import("std");
 const qwen4_forward = @import("qwen4_forward.zig");
 const mlx = @import("../mlx.zig");
@@ -176,7 +177,7 @@ pub fn draftShortlist(t: Head, _: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.
 }
 
 pub fn costProfile(t: Head, _: *const Trunk, kv: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
-    return mtp_mod.qwen4G17CostProfileForKv(t, kv);
+    return qwen4_cost_profile.qwen4G17CostProfileForKv(t, kv);
 }
 
 pub fn evSeed(t: Head) ?spec_types.EvSeed {

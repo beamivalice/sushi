@@ -14,7 +14,6 @@ const registry = @import("registry.zig");
 const arch_config = @import("config.zig");
 const pc = @import("../prefix_cache.zig");
 const kv_quant = @import("../kv_quant.zig");
-const transformer = @import("../transformer.zig");
 const model_handle = @import("../model_handle.zig");
 const trunk = @import("../trunk.zig");
 const model_registry = @import("../model_registry.zig");
@@ -96,7 +95,7 @@ pub const ColdLoad = struct {
 pub const HeadParts = struct {
     entry: ?*const trunk.SSMCacheEntry = null,
     pos_base: c_int = 0,
-    marks: []const transformer.QsaHeadMark = &.{},
+    marks: []const trunk.QsaHeadMark = &.{},
 };
 
 fn S(comptime t: Tag) type {

@@ -11,7 +11,6 @@ const mtp_mod = @import("mtp.zig");
 const round_cost = @import("round_cost.zig");
 const sampler = @import("sampler.zig");
 const arch_state = @import("arch/arch_state.zig");
-const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
 const MtpWidthTrial = round_cost.TrialSchedule;
@@ -26,7 +25,7 @@ pub fn mtpAdaptiveModelEligible(model_has_mtp: bool, checkpoint_head: bool) bool
 }
 
 pub fn mtpAdaptiveModelOk(self: *const Generator) bool {
-    return mtpAdaptiveModelEligible(self.model_has_mtp, qwen4_state.mtpOfConst(self.xfm) != null or self.xfm.config.isMimo());
+    return mtpAdaptiveModelEligible(self.model_has_mtp, arch_state.headCache(&self.xfm.arch_state) != null or self.xfm.config.isMimo());
 }
 
 /// Will anyone read a serial cell for this model? Gated on the model, not the request: a

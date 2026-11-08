@@ -15,7 +15,6 @@ const qwen4_gdn = @import("qwen4_gdn.zig");
 const Trunk = trunk_mod.Trunk;
 const sliceBatchRows = Trunk.sliceBatchRows;
 const std = @import("std");
-const qwen4_state = @import("qwen4_state.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3_kernels = sushi_exl3.kernels;
 const mlx = @import("../mlx.zig");
@@ -170,9 +169,6 @@ pub var mtp_verify_moe_group_last_ops: u64 = 0;
 
 pub var mtp_head_force_batched_override: ?bool = null;
 
-pub var mtp_verify_shared_rows_calls: u64 = 0;
-
-pub var mtp_verify_shared_gate_rows_calls: u64 = 0;
 
 pub var mtp_verify_gdn_rows_calls: u64 = 0;
 
@@ -183,16 +179,6 @@ pub var mtp_verify_attn_rows_calls: u64 = 0;
 pub var mtp_verify_attn_output_calls: u64 = 0;
 
 pub var mtp_verify_lmhead_rows_calls: u64 = 0;
-
-pub fn sharedGateRowsEligible(widths: []const c_int) bool {
-    if (widths.len < 2 or widths.len > 8) return false;
-    var total: c_int = 0;
-    for (widths) |width| {
-        if (width < 1 or width > 7) return false;
-        total += width;
-    }
-    return total <= 24;
-}
 
 pub var mtp_verify_hc_prepared_active = false;
 
@@ -253,9 +239,6 @@ pub var qwen4_rows_logged: bool = false;
 
 pub var verify_fault_after_ple_row: ?usize = null;
 
-pub fn markPosOf(m: *const QsaHeadMark) usize {
-    return @intCast(@max(m.pos, 0));
-}
 
 /// qwen4_exp MTP head (vLLM #53896 / SGLang #36497 `residual_linear_shared`):
 ///   x = fc_hidden(rms_{4H}(stream)) per stream + fc_embedding(rms_H(embed))
@@ -608,8 +591,6 @@ pub fn qwen4MtpLiveModule(m: *Qwen4Mtp) Qwen4MtpLive {
 
 /// A fresh, empty per-request head state (what `qwen4MtpReset` leaves behind).
 pub fn qwen4MtpStateNew(self: *Trunk) !Qwen4MtpState {
-    // The shared spec warmup calls the head in every build; a build without qwen4 has no head state.
-    if (comptime !qwen4_state.built) return error.NoMtpHead;
     const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     var entry = m.entry;
     entry.conv_state = .{ .ctx = null };
@@ -922,8 +903,6 @@ pub fn qwen4MtpForward(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: m
 }
 
 pub fn qwen4MtpForwardOn(self: *Trunk, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
-    // The shared spec warmup calls the head in every build; a build without qwen4 has no head state.
-    if (comptime !qwen4_state.built) return error.NoMtpHead;
     const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveState(st);
     return qwen4MtpForwardLive(self, m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
@@ -3335,61 +3314,6 @@ pub fn splitMaskedSdpa256(
     return out;
 }
 
-/// This checkpoint's YaRN spectrum: the config's rope geometry (theta, the
-/// rotating slice, the pre-trained window) resolved into `mrope.Yarn`, the one
-/// implementation of HF's `_compute_yarn_parameters` in the engine. Only
-/// meaningful when `config.rope_yarn`.
-pub fn yarnSpec(config: *const ModelConfig) mrope.Yarn {
-    return .{
-        .theta = config.rope_theta,
-        .factor = config.yarn_factor,
-        .orig_max = config.yarn_orig_max_pos,
-        .rotary_dim = config.yarnRotaryDim(),
-        .beta_fast = config.yarn_beta_fast,
-        .beta_slow = config.yarn_beta_slow,
-        .truncate = config.yarn_truncate,
-    };
-}
-
-/// The mscale the host cos/sin tables are multiplied by: HF's `attention_factor`
-/// when the checkpoint scales its rope, 1.0 (a no-op) when it does not.
-pub fn yarnMscale(config: *const ModelConfig) f64 {
-    return if (config.rope_yarn) config.yarn_attention_factor else 1.0;
-}
-
-/// HF `_compute_yarn_parameters` → the per-dim RoPE DENOMINATOR array (`freqs`)
-/// that mlx_fast_rope consumes: mlx computes angle = position / freqs[i], so we
-/// return 1/inv_freq where inv_freq is the YaRN-corrected inverse frequency.
-/// `out.len` must equal the rotary half-dim (= int(head_dim * partial) / 2).
-/// Pure f64 math (no MLX) so it unit-tests directly against reference values.
-/// The spectrum itself lives in `mrope.Yarn` — shared with the host cos/sin
-/// tables, which need inv_freq and not the reciprocal — so the device and host
-/// rope paths can never drift apart. `truncate` is the HF flag (an omitted
-/// flag means true).
-pub fn computeYarnFreqs(
-    out: []f64,
-    head_dim: u32,
-    partial: f32,
-    base: f64,
-    factor: f64,
-    beta_fast: f64,
-    beta_slow: f64,
-    orig_max: u32,
-    truncate: bool,
-) void {
-    const spec = mrope.Yarn{
-        .theta = base,
-        .factor = factor,
-        .orig_max = orig_max,
-        .rotary_dim = @intFromFloat(@floor(@as(f64, @floatFromInt(head_dim)) * @as(f64, partial))),
-        .beta_fast = beta_fast,
-        .beta_slow = beta_slow,
-        .truncate = truncate,
-    };
-    spec.invFreq(out);
-    for (out) |*v| v.* = 1.0 / v.*;
-}
-
 var qk_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qk_fused_engaged: bool = false;
 
@@ -3778,7 +3702,6 @@ const Qwen4LadderHostFixture = struct {
     cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)),
 
     pub fn init(self: *Qwen4LadderHostFixture) !void {
-        if (comptime !qwen4_state.built) return error.SkipZigTest;
         const tag = arch_registry.ofModelType("qwen4_exp") orelse return error.SkipZigTest;
         const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
         const dim = 64;
@@ -4374,16 +4297,7 @@ pub fn qkAngleFor(self: *Trunk, family: usize, rd: c_int, base: mlx.mlx_optional
     return self.qkAngleRowsFor(family, rd, base, freqs, offset, 1, mscale);
 }
 
-test "shared expert gate tail admits the joined verifier envelope only" {
-    try testing.expect(sharedGateRowsEligible(&.{ 2, 2, 2, 2 }));
-    try testing.expect(sharedGateRowsEligible(&.{ 5, 5, 5, 5 }));
-    try testing.expect(sharedGateRowsEligible(&.{ 2, 3 }));
-    try testing.expect(!sharedGateRowsEligible(&.{ 7, 7, 7, 7 }));
-    try testing.expect(!sharedGateRowsEligible(&.{1}));
-}
-
 test "qwen4 MTP head: two explicit states with different origins and stash lengths round-trip" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     var xfm: Trunk = undefined;
@@ -4437,7 +4351,6 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
 }
 
 test "qwen4 MTP head: two requests keep their own state through activate/release" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     // Bar: after A appends and B activates, A's rows are not on the module; A re-activating
     // sees them again; releasing hands the module its own copy back.
     try mlx.requireGpu();
@@ -4856,7 +4769,6 @@ test "exl3 resident decode folds the shared-expert gate tail into the finish red
 }
 
 test "qwen4 PLE spec capture follows the verify flag, streamed or not" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     var state: qwen4_mod.Qwen4State = undefined;
     state.hash.ngram_size = 3;
     var xfm: Trunk = undefined;
@@ -4927,7 +4839,7 @@ test "ropeAtPositions YaRN: cos/sin carry mscale on the rotated slice" {
     const half: usize = 32;
     const inv = try testing.allocator.alloc(f64, half);
     defer testing.allocator.free(inv);
-    yarnSpec(&c).invFreq(inv);
+    trunk_mod.yarnSpec(&c).invFreq(inv);
 
     var den_f32: [half]f32 = undefined;
     for (inv, 0..) |v, i| den_f32[i] = @floatCast(1.0 / v);
@@ -4998,9 +4910,9 @@ test "qwen4_exp yarn: the device denominator and the host spectrum are one spect
     try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
 
     var inv: [32]f64 = undefined;
-    yarnSpec(&c).invFreq(&inv);
+    trunk_mod.yarnSpec(&c).invFreq(&inv);
     var den: [32]f64 = undefined;
-    computeYarnFreqs(
+    trunk_mod.computeYarnFreqs(
         &den,
         c.head_dim,
         c.yarnPartial(),
@@ -5024,33 +4936,6 @@ test "qwen4_exp yarn: the device denominator and the host spectrum are one spect
     try testing.expectEqual(@as(usize, rotary), inv.len * 2);
     try testing.expect(rotary < c.head_dim); // partial rotary ⇒ a real pass-through tail
     try testing.expect(c.yarn_attention_factor > 1.0); // factor 4 ⇒ mscale 1.1386…
-}
-
-test "computeYarnFreqs matches HF _compute_yarn_parameters (full-attn rope)" {
-    // Golden values from the reference YaRN math and the pure-Python
-    // cross-check: head_dim 128, partial 0.5 → dim 64 →
-    // 32 freqs; base 5e5, factor 32, beta_fast 32, beta_slow 1, orig_max 8192.
-    // low/high correction dims truncate to 9/18.
-    var freqs: [32]f64 = undefined;
-    computeYarnFreqs(&freqs, 128, 0.5, 500000.0, 32.0, 32.0, 1.0, 8192, true);
-    // Spot-check the denominator array mlx_fast_rope consumes (angle = pos/freqs).
-    const golden = [_]struct { idx: usize, val: f64 }{
-        .{ .idx = 0, .val = 1.000000000e+00 },
-        .{ .idx = 1, .val = 1.506929076e+00 },
-        .{ .idx = 2, .val = 2.270835240e+00 },
-        .{ .idx = 7, .val = 1.764613870e+01 },
-        .{ .idx = 15, .val = 1.324904288e+03 },
-        .{ .idx = 16, .val = 2.868264127e+03 },
-        .{ .idx = 23, .val = 3.992865387e+05 },
-        .{ .idx = 31, .val = 1.061761980e+07 },
-    };
-    for (golden) |g| {
-        try testing.expectApproxEqRel(g.val, freqs[g.idx], 1e-7);
-    }
-    // Below the low correction dim (9): pure extrapolation → freqs = base^(2i/64).
-    try testing.expectApproxEqRel(std.math.pow(f64, 500000.0, 0.0), freqs[0], 1e-9);
-    // Above the high correction dim (18): pure interpolation → freqs = factor·base^(2i/64).
-    try testing.expectApproxEqRel(32.0 * std.math.pow(f64, 500000.0, @as(f64, 2 * 31) / 64.0), freqs[31], 1e-6);
 }
 
 test "splitMaskedSdpa256: verify-width array-mask rows split through the vector kernel match one dispatch" {
@@ -5485,7 +5370,6 @@ test "sdpa force_fused: hd-256 causal blocks the gate admits match the unforced 
 }
 
 test "qwen4 MTP head KV stays dense under the engine-default trunk scheme unless opted in" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const t = std.testing;
     const saved = Trunk.mtp_head_kv_quant_override;
     defer Trunk.mtp_head_kv_quant_override = saved;
@@ -5523,7 +5407,6 @@ test "head row coverage declines virtual widths before any stacked dispatch" {
 }
 
 test "verify MoE rows preserve every value with fewer graph operations" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
     const allocator = testing.allocator;
@@ -5559,11 +5442,11 @@ test "verify MoE rows preserve every value with fewer graph operations" {
             const start_solo = mlx.op_count.load(.monotonic);
             for (0..n) |row| solo[row] = try xfm.moeMLP(inputs[row], mw);
             const solo_ops = mlx.op_count.load(.monotonic) - start_solo;
-            const shared_before = mtp_verify_shared_rows_calls;
+            const shared_before = trunk_mod.mtp_verify_shared_rows_calls;
             const start_group = mlx.op_count.load(.monotonic);
             const group = try xfm.moeVerifyRows(inputs[0..n], mw);
             const group_ops = mlx.op_count.load(.monotonic) - start_group;
-            try testing.expectEqual(shared_before + 1, mtp_verify_shared_rows_calls);
+            try testing.expectEqual(shared_before + 1, trunk_mod.mtp_verify_shared_rows_calls);
             defer {
                 for (group) |value| _ = mlx.mlx_array_free(value);
                 allocator.free(group);
@@ -5584,7 +5467,6 @@ test "verify MoE rows preserve every value with fewer graph operations" {
 }
 
 test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const allocator = testing.allocator;
     var source = try KVCache.init(allocator, 1);
     defer source.deinit();
@@ -5635,7 +5517,6 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
 }
 
 test "single-stream verify feature selection excludes prefill and ordinary decoding" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     var xfm: Trunk = undefined;
     var qwen4: qwen4_mod.Qwen4State = undefined;
     const old_features = trunk_mod.single_verify_test_features;
@@ -5680,7 +5561,6 @@ fn ladderAffine(rig: *Qwen4LadderRig, r: std.Random, rows: c_int, cols: c_int) !
 }
 
 test "qwen4 forward: the layer dispatch resolves an affine projection once, in the weights it stores" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     qwen4_standin_override = .{ .gdn = true, .mlp = true, .hc = true };
     defer qwen4_standin_override = null;
@@ -5736,7 +5616,6 @@ test "qwen4 decode ladder: stride resolution keeps an explicit off and leaves ot
 }
 
 test "qwen4 decode ladder: serial decode keeps the default off; an explicit stride fills host ids first, skips lazy ones" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
     defer qwen4_standin_override = null;
@@ -5788,7 +5667,6 @@ test "qwen4 decode ladder: serial decode keeps the default off; an explicit stri
 }
 
 test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits and per-slot history bit-identical to off" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
     defer qwen4_standin_override = null;
@@ -5878,7 +5756,6 @@ test "streamed deferred verification crosses only GDN MoE layers without PLE" {
 }
 
 test "streamed deferred verification preserves outputs states and accounting on hits misses and workspace" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -6022,7 +5899,6 @@ test "qsa indexer scalar rope applies yarn mscale to first rope_dims only" {
 }
 
 test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     var xfm: Trunk = undefined;
     xfm.s = mlx.gpuStream();
     xfm.allocator = testing.allocator;
@@ -6047,7 +5923,6 @@ test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
 }
 
 test "batched rows refuse a trunk that holds no Flash-Next state" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     var xfm: Trunk = undefined;
     xfm.arch_state = .{};
     xfm.moe_layers = &.{};

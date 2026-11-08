@@ -5,7 +5,6 @@
 const std = @import("std");
 const expert_quant = @import("expert_quant.zig");
 const model = @import("model.zig");
-const qwen4_config = @import("qwen4/qwen4_config.zig");
 const model_discovery = @import("model_discovery.zig");
 
 const TensorSpec = struct {
@@ -317,17 +316,17 @@ test "Sushi quant memory bills resident routed banks and enabled vision and MTP 
     const path = try createFixture(io, a, &tmp);
     defer a.free(path);
     // Text trunk (3136) plus all three resident expert projections (1152).
-    const text = try model.qwenResidentWeightBytes(io, a, path, false, false);
+    const text = try model.residentWeightBytes(io, a, path, false, false);
     try std.testing.expectEqual(@as(u64, 4288), text.trunk);
     try std.testing.expectEqual(@as(u64, 0), text.mtp);
-    const all = try model.qwenResidentWeightBytes(io, a, path, true, true);
+    const all = try model.residentWeightBytes(io, a, path, true, true);
     try std.testing.expectEqual(text.trunk + 4, all.trunk);
     try std.testing.expectEqual(@as(u64, 1408), all.mtp);
     // A duplicate of an indexed tensor in another indexed shard must not double its bill.
     var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
     defer dir.close(io);
     try writeSafetensors(io, a, dir, "model-vision.safetensors", &.{ VISION_SPEC, TRUNK_SPEC });
-    const duplicate = try model.qwenResidentWeightBytes(io, a, path, true, true);
+    const duplicate = try model.residentWeightBytes(io, a, path, true, true);
     try std.testing.expectEqual(all, duplicate);
 }
 
@@ -371,7 +370,7 @@ test "Sushi quant memory bills a rate-grouped layer's per-expert table" {
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     var stored: u64 = 0;
     for (specs.items) |spec| stored += spec.bytes;
-    const bill = try model.qwenResidentWeightBytes(io, a, path, false, false);
+    const bill = try model.residentWeightBytes(io, a, path, false, false);
     try std.testing.expectEqual(stored + 6 * @import("sushi_exl3").rate_groups.META_WORDS * 4, bill.trunk);
 }
 
@@ -379,16 +378,16 @@ test "flat EXL3 routed-key filtering is independent of shard filename" {
     var key_buf: [256]u8 = undefined;
     for (EXL3_SPECS) |spec| {
         try std.testing.expect(
-            qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, spec.key) == null,
+            model.streamingWeightKey(.exl3_k4, &key_buf, spec.key) == null,
         );
     }
     try std.testing.expectEqualStrings(
         EMBED_SPEC.key,
-        qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, EMBED_SPEC.key).?,
+        model.streamingWeightKey(.exl3_k4, &key_buf, EMBED_SPEC.key).?,
     );
     try std.testing.expectEqualStrings(
         "language_model.mtp.fc_hidden.weight",
-        qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, "language_model.mtp.fc_hidden.weight").?,
+        model.streamingWeightKey(.exl3_k4, &key_buf, "language_model.mtp.fc_hidden.weight").?,
     );
 }
 
@@ -1046,7 +1045,7 @@ test "Sushi quant memory bills a trellis trunk as stored and flags a trellis hea
     try writeIndex(io, a, tmp.dir, &entries);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const bill = try model.qwenResidentWeightBytes(io, a, path, false, false);
+    const bill = try model.residentWeightBytes(io, a, path, false, false);
     // The trellis, both scale vectors and the head are billed as stored, beside the affine k_proj.
     try std.testing.expectEqual(@as(u64, 256 + 64 + 64 + 256 + 1024), bill.trunk);
     try std.testing.expect(bill.stq_head);

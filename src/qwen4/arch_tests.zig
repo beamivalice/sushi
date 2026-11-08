@@ -28,4 +28,13 @@ pub const tests = .{
     @import("qwen4_shared.zig"),
     @import("qwen4_scheduler_test.zig"),
     @import("qwen4_drafter.zig"),
+    @import("qwen4_pack_test.zig"),
+    @import("qwen4_bill_live_test.zig"),
+    @import("qwen4_cost_profile.zig"),
+    @import("qwen4_hc_prefill_test.zig"),
+};
+
+/// The MLX-free test files `src/tests_host.zig` runs for this arch.
+pub const host_tests = .{
+    @import("qwen4_bill_test.zig"),
 };

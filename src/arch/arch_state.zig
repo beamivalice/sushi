@@ -174,6 +174,14 @@ pub fn mropeOf(c: *const Ctx) ?mrope.PositionContext {
     return null;
 }
 
+/// A layer-at-a-time capture forwards one layer from `input`, the stream entering it (null: the embedding);
+/// `skip_ple` when the layer is not the one that injects the PLE.
+pub fn setLayerCapture(c: *Ctx, input: ?mlx.mlx_array, skip_ple: bool) void {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "Ctx"), "setLayerCapture")) @field(c, @tagName(t)).setLayerCapture(input, skip_ple);
+    }
+}
+
 /// Points the forward at the request's M-RoPE table, borrowed from the slot.
 pub fn setMrope(c: *Ctx, pos: ?[]const i32, total: usize, delta: i32) void {
     inline for (tags) |t| {
@@ -212,6 +220,49 @@ pub fn specRollsBack(s: *const State) bool {
         if (comptime has(Decl(t, "State"), "specRollsBack")) if (@field(s, @tagName(t)).specRollsBack()) return true;
     }
     return false;
+}
+
+/// The loaded arch verifies several draft rows through the trunk's row kernels: the single-verify features, the
+/// grouped MoE rows and a rollback captured per row.
+pub fn rowVerify(s: *const State) bool {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), "rowVerify")) if (@field(s, @tagName(t)).rowVerify()) return true;
+    }
+    return false;
+}
+
+/// The KV cache of the loaded arch's MTP head when it rides the trunk; null without one.
+pub fn headCache(s: *const State) ?*const trunk.KVCache {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), "headCache")) if (@field(s, @tagName(t)).headCache()) |c| return c;
+    }
+    return null;
+}
+
+/// The SSM entry that head's own state rides; null without one.
+pub fn headEntry(s: *State) ?*trunk.SSMCacheEntry {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), "headEntry")) if (@field(s, @tagName(t)).headEntry()) |e| return e;
+    }
+    return null;
+}
+
+/// Whether one grouped forward verifies these rows; false leaves them to a forward each.
+pub fn verifyRowsGrouped(t: *Trunk, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx) bool {
+    inline for (tags) |tag| {
+        const S = Decl(tag, "State");
+        if (comptime has(S, "verifyRowsGrouped")) if (S.verifyRowsGrouped(t, token_rows, ctxs)) return true;
+    }
+    return false;
+}
+
+/// The grouped forward `verifyRowsGrouped` admitted.
+pub fn forwardVerifyRowsGrouped(t: *Trunk, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx, logits: []mlx.mlx_array, last: []mlx.mlx_array, all: []mlx.mlx_array) !void {
+    inline for (tags) |tag| {
+        const S = Decl(tag, "State");
+        if (comptime has(S, "forwardVerifyRowsGrouped")) return S.forwardVerifyRowsGrouped(t, token_rows, ctxs, logits, last, all);
+    }
+    return error.NoGroupedVerify;
 }
 
 /// The arch's own token embedding; null leaves the trunk's.

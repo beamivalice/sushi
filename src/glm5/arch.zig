@@ -51,6 +51,7 @@ pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .prefi
 pub fn trailingPackLayers(config: *const Config) u32 {
     return config.glm_mtp_layers;
 }
+pub const pack_layout: arch_config.PackLayout = .{ .prefix = "model.language_model", .stamped = true, .head = .trailing, .refuses_rate_groups = true };
 pub const parseConfig = config_file.parseFamily;
 
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {

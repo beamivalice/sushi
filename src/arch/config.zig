@@ -203,6 +203,28 @@ pub fn trailingPackLayers(config: *const model.ModelConfig) u32 {
     };
 }
 
+/// Where a pack's routed experts sit and what its preflight (`pack_index.validateExl3Source`) checks. An arch states it
+/// as `pack_layout` in its `arch.zig`; the defaults are the layout of an unclaimed pack.
+pub const PackLayout = struct {
+    /// Key prefix of the trunk's layers.
+    prefix: []const u8 = "language_model.model",
+    /// Every shard's codebook stamp must agree with the config.
+    stamped: bool = false,
+    /// The MTP head's routed layer: a key prefix of its own, the `trailingPackLayers` under `prefix`, or none.
+    head: union(enum) { none, layer: []const u8, trailing } = .{ .layer = "language_model.mtp.layers.0" },
+    /// A rate-grouped layer streams group by group.
+    streams_groups: bool = false,
+    /// A rate-grouped layer is refused.
+    refuses_rate_groups: bool = false,
+};
+
+pub fn packLayout(config: *const model.ModelConfig) PackLayout {
+    const tag = tagOf(config) orelse return .{};
+    return switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "pack_layout")) registry.Mod(t).pack_layout else .{},
+    };
+}
+
 /// The committed config of the arch registered as `name` (`fixtures.config` in its chat face), for a shared test;
 /// null when the build left the arch out.
 pub fn fixtureConfig(comptime name: []const u8) ?[]const u8 {
@@ -255,4 +277,13 @@ test "the arch gate text keeps the order its refusal has always listed" {
 test "a per-request-prefill arch states its start width and the others state none" {
     if (factsOfType("glm5_next")) |f| try std.testing.expectEqual(@as(u32, 2048), f.prefill_start_width);
     if (factsOfType("qwen4_exp")) |f| try std.testing.expectEqual(@as(u32, 0), f.prefill_start_width);
+}
+
+test "a config takes its arch's pack layout; an unclaimed one the default" {
+    inline for (comptime std.enums.values(Tag)) |t| {
+        const M = registry.Mod(t);
+        const c = model.ModelConfig{ .model_type = M.config_types[0] };
+        try std.testing.expectEqualDeep(if (@hasDecl(M, "pack_layout")) M.pack_layout else PackLayout{}, packLayout(&c));
+    }
+    try std.testing.expectEqualDeep(PackLayout{}, packLayout(&.{ .model_type = "mistral" }));
 }

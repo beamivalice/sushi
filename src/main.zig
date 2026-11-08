@@ -125,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
         server_mod.resolveMlxCadence();
     }
     // Resolve lazily-cached env reads on the main thread before other threads exist.
-    @import("transformer.zig").warmQsaEnvCaches();
+    @import("arch/kernels.zig").warmEnvCaches();
 
     // mlx-c's default handler exits the process; latch MLX failures instead (#353).
     mlx.installErrorHandler();

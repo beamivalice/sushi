@@ -1,10 +1,8 @@
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
 const model_handle = @import("model_handle.zig");
 const trunk = @import("trunk.zig");
-const qwen4_forward = @import("qwen4/qwen4_forward.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -29,7 +27,6 @@ const logit_bias = @import("logit_bias.zig");
 
 const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
-const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = model_handle.ForwardCtx;
 const SSMCacheEntrySnapshot = trunk.SSMCacheEntrySnapshot;
@@ -1541,9 +1538,9 @@ pub const Generator = struct {
             const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, s);
             // The arch's own per-request buffers reserve at the same length.
             if (mtp_cache) |*mc| mc.activate();
-            transformer_mod.reserveQsaHistoryWithHead(
+            prefix_arch.aux.reserveQsaHistoryWithHead(
                 ctx.ssm_entries,
-                if (qwen4_state.mtpOf(xfm)) |m| &m.entry else null,
+                arch_state.headEntry(&xfm.arch_state),
                 @intCast(reserved_tokens),
             );
             // Admission billed the request's top at `default_chunk`; the chunks before it start at
@@ -1580,7 +1577,7 @@ pub const Generator = struct {
                             sink.forwarded = ssm_cp_offset + pos;
                             if (ssm_checkpoints.items.len > 0) {
                                 if (ctx.ssm_entries) |ents| {
-                                    transformer_mod.handoffQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
+                                    prefix_arch.aux.handoffQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
                                 }
                                 if (ssm_checkpoints.toOwnedSlice(allocator)) |owned| {
                                     sink.checkpoints = owned;
@@ -4464,48 +4461,6 @@ test "a block decoder's entry token stops the round before it drafts" {
     try testing.expect(!tokenStops(0, &eos, &pad));
     try testing.expect(!tokenStops(9, &eos, &pad));
     try testing.expectEqual(@as(u32, 0), pad);
-}
-
-test "batched MTP state includes the last row activated by round begin" {
-    if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
-    const allocator = testing.allocator;
-    var xfm: Trunk = undefined;
-    xfm.arch_state = .{};
-    const q4 = qwen4_state.stateOf(&xfm).?;
-    const q4f = @import("qwen4/qwen4_forward.zig");
-    var head: qwen4_forward.Qwen4Mtp = undefined;
-    head.cache = try KVCache.init(allocator, 1);
-    head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
-    head.qsa_marks = .{};
-    head.seq_offset = 0;
-    head.pos_base = 0;
-    q4.mtp = head;
-    defer q4.mtp.?.cache.deinit();
-    var a: q4f.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
-    defer a.deinit();
-    var b: q4f.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
-    defer b.deinit();
-    q4f.qwen4MtpActivate(&xfm, &a);
-    q4.mtp.?.seq_offset = 7;
-    q4.mtp.?.cache.step = 7;
-    q4.mtp.?.pos_base = 3;
-    q4f.qwen4MtpActivate(&xfm, &b);
-    q4.mtp.?.seq_offset = 2;
-    q4.mtp.?.cache.step = 2;
-    q4.mtp.?.pos_base = 11;
-    const caches = [_]MtpCacheRef{
-        MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &a, .allocator = allocator }),
-        MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &b, .allocator = allocator }),
-    };
-    const want = [_]q4f.Qwen4MtpState.Meta{
-        .{ .stash_len = 7, .origin = 3, .cache_step = 7 },
-        .{ .stash_len = 2, .origin = 11, .cache_step = 2 },
-    };
-    for (caches, want) |cache, meta| {
-        const state = cache.as("qwen4").batchState();
-        try testing.expectEqual(meta, state.meta());
-    }
-    try testing.expect(q4.mtp_owner == null);
 }
 
 test "specTotals: the prompt-lookup rounds of an MTP request count beside its head rounds" {

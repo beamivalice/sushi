@@ -15,17 +15,15 @@ const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
 
-const qwen4_forward = @import("qwen4/qwen4_forward.zig");
-const qwen4_qsa_state = @import("qwen4/qwen4_qsa_state.zig");
-const qwen4_ssm_group = @import("qwen4/qwen4_ssm_group.zig");
+const arch_kernels = @import("arch/kernels.zig");
 const kv_cache = @import("kv_cache.zig");
-const qwen4_state = @import("qwen4/qwen4_state.zig");
 const model_handle = @import("model_handle.zig");
 pub const CaptureLayers = model_handle.CaptureLayers;
 pub const ForwardCtx = model_handle.ForwardCtx;
 const mlx_util = @import("mlx_util.zig");
 pub const slidingDecodeMask = mlx_util.slidingDecodeMask;
 const ssm_cache = @import("ssm_cache.zig");
+const prefix_arch = @import("arch/prefix.zig");
 const nax_gate = @import("nax_gate.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const verify_qmm = @import("verify_qmm.zig");
@@ -74,6 +72,10 @@ pub const MoeDecodeDispatchArm = moe_gqmv.MoeDecodeDispatchArm;
 pub const MoeLayerWeights = layer_weights.MoeLayerWeights;
 pub const MoeMlpWeights = layer_weights.MoeMlpWeights;
 pub const PersistentSsmGroup = ssm_cache.PersistentSsmGroup;
+pub const QsaHeadMark = ssm_cache.QsaHeadMark;
+pub const QsaHeadMarkSet = ssm_cache.QsaHeadMarkSet;
+pub const nextSsmMemberGen = ssm_cache.nextSsmMemberGen;
+pub const ssmDetachFromGroup = ssm_cache.ssmDetachFromGroup;
 pub const PACKED_KV_SLICE_MAX = attn_kernels.PACKED_KV_SLICE_MAX;
 pub const QSA_ATTN_BK = attn_kernels.QSA_ATTN_BK;
 pub const PREFILL_DQ_GEMM_MIN_M = verify_moe.PREFILL_DQ_GEMM_MIN_M;
@@ -81,6 +83,7 @@ pub const PleWeights = layer_weights.PleWeights;
 pub const ProfClock = forward_diag.ProfClock;
 pub const QSA_MAX_COMPRESS_RATIO = ssm_cache.QSA_MAX_COMPRESS_RATIO;
 pub const QSA_RING_ROWS = ssm_cache.QSA_RING_ROWS;
+pub const PLE_PREV_MAX = ssm_cache.PLE_PREV_MAX;
 pub const QSA_SCORE_KERNEL_HEADER = attn_kernels.QSA_SCORE_KERNEL_HEADER;
 pub const QsaAttnCfgKey = attn_kernels.QsaAttnCfgKey;
 pub const QsaCfgCache = attn_kernels.QsaCfgCache;
@@ -114,7 +117,6 @@ const cachedScalarInt = verify_qmm.cachedScalarInt;
 pub const bf16Scalar = mlx_util.bf16Scalar;
 pub const compactConvStateEnabled = ssm_cache.compactConvStateEnabled;
 pub const computeQuantParams = layer_weights.computeQuantParams;
-const computeYarnFreqs = qwen4_forward.computeYarnFreqs;
 pub const decodeRowsProjection = verify_moe.decodeRowsProjection;
 pub const constTableAs = forward_diag.constTableAs;
 pub const decodeProfileEnabled = forward_diag.decodeProfileEnabled;
@@ -204,7 +206,7 @@ pub const slidingPrefillAttn = attn_kernels.slidingPrefillAttn;
 pub const slidingPrefillFused = attn_kernels.slidingPrefillFused;
 pub const spanPreservingDropIndex = ssm_cache.spanPreservingDropIndex;
 pub const splitSpecCaptures = ssm_cache.splitSpecCaptures;
-const ssmConcatAxis0 = qwen4_ssm_group.ssmConcatAxis0;
+const ssmConcatAxis0 = mlx_util.concatAxis0;
 pub const ssmCheckpointBytes = ssm_cache.ssmCheckpointBytes;
 pub const ssmCheckpointDropIndex = ssm_cache.ssmCheckpointDropIndex;
 pub const ssmEntryBytes = ssm_cache.ssmEntryBytes;
@@ -223,7 +225,6 @@ pub const ssmSnapshot = ssm_cache.ssmSnapshot;
 pub const ssmSnapshotDeinit = ssm_cache.ssmSnapshotDeinit;
 pub const ssmUnbindAll = ssm_cache.ssmUnbindAll;
 pub const ssmUnbindEntries = ssm_cache.ssmUnbindEntries;
-const sharedGateRowsEligible = qwen4_forward.sharedGateRowsEligible;
 pub const truncatePooled = ssm_cache.truncatePooled;
 pub const verifyQmmNaxAvailable = nax_gate.verifyQmmNaxAvailable;
 const verifyQmmNaxEnabled = nax_gate.verifyQmmNaxEnabled;
@@ -245,7 +246,6 @@ pub const transposeBf16Weight = mlx_util.transposeBf16Weight;
 pub const standinOnes = forward_diag.standinOnes;
 pub const standinRef = forward_diag.standinRef;
 pub const weightTriple = layer_weights.weightTriple;
-const yarnMscale = qwen4_forward.yarnMscale;
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
 pub const KvCacheChoice = kv_quant.KvCacheChoice;
@@ -548,7 +548,7 @@ pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 
 
 const model_mod = @import("model.zig");
-const qwen4_config = @import("qwen4/qwen4_config.zig");
+const arch_load = @import("arch/load.zig");
 pub const log = @import("log.zig");
 const io_util_mod = @import("io_util.zig");
 const round_cost_mod = @import("round_cost.zig");
@@ -601,6 +601,7 @@ test "batched decode mask at verify width: row j of slot n sees its own causal p
     var xfm: Trunk = undefined;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
+    xfm.consts = null;
     // Two slots, three verify rows each; kv_len is the length AFTER the rows were appended.
     const kv_lens = [_]i32{ 5, 8 };
     const mask = try xfm.buildBatchedDecodeMask(&kv_lens, 8, 3);
@@ -705,6 +706,75 @@ const TrunkCells = struct {
         allocator.destroy(self.consts);
     }
 };
+
+pub var mtp_verify_shared_rows_calls: u64 = 0;
+
+pub var mtp_verify_shared_gate_rows_calls: u64 = 0;
+
+pub fn sharedGateRowsEligible(widths: []const c_int) bool {
+    if (widths.len < 2 or widths.len > 8) return false;
+    var total: c_int = 0;
+    for (widths) |width| {
+        if (width < 1 or width > 7) return false;
+        total += width;
+    }
+    return total <= 24;
+}
+
+/// This checkpoint's YaRN spectrum: the config's rope geometry (theta, the
+/// rotating slice, the pre-trained window) resolved into `mrope.Yarn`, the one
+/// implementation of HF's `_compute_yarn_parameters` in the engine. Only
+/// meaningful when `config.rope_yarn`.
+pub fn yarnSpec(config: *const ModelConfig) mrope.Yarn {
+    return .{
+        .theta = config.rope_theta,
+        .factor = config.yarn_factor,
+        .orig_max = config.yarn_orig_max_pos,
+        .rotary_dim = config.yarnRotaryDim(),
+        .beta_fast = config.yarn_beta_fast,
+        .beta_slow = config.yarn_beta_slow,
+        .truncate = config.yarn_truncate,
+    };
+}
+
+/// The mscale the host cos/sin tables are multiplied by: HF's `attention_factor`
+/// when the checkpoint scales its rope, 1.0 (a no-op) when it does not.
+pub fn yarnMscale(config: *const ModelConfig) f64 {
+    return if (config.rope_yarn) config.yarn_attention_factor else 1.0;
+}
+
+/// HF `_compute_yarn_parameters` → the per-dim RoPE DENOMINATOR array (`freqs`)
+/// that mlx_fast_rope consumes: mlx computes angle = position / freqs[i], so we
+/// return 1/inv_freq where inv_freq is the YaRN-corrected inverse frequency.
+/// `out.len` must equal the rotary half-dim (= int(head_dim * partial) / 2).
+/// Pure f64 math (no MLX) so it unit-tests directly against reference values.
+/// The spectrum itself lives in `mrope.Yarn` — shared with the host cos/sin
+/// tables, which need inv_freq and not the reciprocal — so the device and host
+/// rope paths can never drift apart. `truncate` is the HF flag (an omitted
+/// flag means true).
+pub fn computeYarnFreqs(
+    out: []f64,
+    head_dim: u32,
+    partial: f32,
+    base: f64,
+    factor: f64,
+    beta_fast: f64,
+    beta_slow: f64,
+    orig_max: u32,
+    truncate: bool,
+) void {
+    const spec = mrope.Yarn{
+        .theta = base,
+        .factor = factor,
+        .orig_max = orig_max,
+        .rotary_dim = @intFromFloat(@floor(@as(f64, @floatFromInt(head_dim)) * @as(f64, partial))),
+        .beta_fast = beta_fast,
+        .beta_slow = beta_slow,
+        .truncate = truncate,
+    };
+    spec.invFreq(out);
+    for (out) |*v| v.* = 1.0 / v.*;
+}
 
 pub const Trunk = struct {
     /// The arch this model was loaded as, stamped once by `life.init`; every dispatch reads it.
@@ -1021,7 +1091,7 @@ pub const Trunk = struct {
             for (loaded.ssm_entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                qwen4_qsa_state.ssmFreeQsaState(e);
+                prefix_arch.aux.ssmFreeQsaState(e);
             }
             allocator.free(loaded.ssm_entries);
         }
@@ -1047,7 +1117,7 @@ pub const Trunk = struct {
         var yarn_mscale: ?mlx.mlx_array = null;
         var yarn_inv_freq: ?[]const f64 = null;
         if (config.rope_yarn) {
-            const spec = qwen4_forward.yarnSpec(&config);
+            const spec = yarnSpec(&config);
             const rotary_dim: u32 = config.yarnRotaryDim();
             const half: usize = rotary_dim / 2;
             const freqs_f64 = try allocator.alloc(f64, half);
@@ -1206,7 +1276,7 @@ pub const Trunk = struct {
                 ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                qwen4_qsa_state.ssmFreeQsaState(e);
+                prefix_arch.aux.ssmFreeQsaState(e);
                 e.conv_state = mlx.mlx_array_new();
                 e.ssm_state = mlx.mlx_array_new();
                 e.ple_prev_valid = false;
@@ -1463,7 +1533,7 @@ pub const Trunk = struct {
                 ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                qwen4_qsa_state.ssmFreeQsaState(e);
+                prefix_arch.aux.ssmFreeQsaState(e);
             }
             self.allocator.free(entries);
         }
@@ -2201,7 +2271,7 @@ pub const Trunk = struct {
                 .cache = &sl.cache,
                 .moe_seq_offset = &sl.off,
                 .ssm_entries = sl.entries,
-                .ssm_member_gen = qwen4_ssm_group.nextSsmMemberGen(),
+                .ssm_member_gen = ssm_cache.nextSsmMemberGen(),
                 .capture_hidden = null,
                 .vision_embeddings = null,
             };
@@ -2213,7 +2283,7 @@ pub const Trunk = struct {
                 ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                qwen4_qsa_state.ssmFreeQsaState(e);
+                prefix_arch.aux.ssmFreeQsaState(e);
             }
             alloc.free(sl.entries);
             sl.cache.deinit();
@@ -2237,123 +2307,6 @@ pub const Trunk = struct {
         for (arrays) |a| {
             if (a.ctx != null) _ = mlx.mlx_array_free(a);
         }
-    }
-
-    fn specWarmVerify(self: *Trunk, slots: []const *SpecWarmSlot, seq: usize) !void {
-        var ids: [MAX_BATCH_ROWS][MAX_WARM_SEQ]i32 = undefined;
-        var rows: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-        var ctxs: [MAX_BATCH_ROWS]*ForwardCtx = undefined;
-        defer for (rows[0..slots.len]) |r| {
-            _ = mlx.mlx_array_free(r);
-        };
-        for (slots, 0..) |sl, i| {
-            rows[i] = specWarmIds(ids[i][0..seq]);
-            ctxs[i] = &sl.ctx;
-        }
-        var logits: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-        var last: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-        var all: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-        try self.forwardRowAxisVerify(rows[0..slots.len], ctxs[0..slots.len], logits[0..slots.len], last[0..slots.len], all[0..slots.len], null, null);
-        specWarmEvalFree(logits[0..slots.len]);
-        specWarmEvalFree(last[0..slots.len]);
-        specWarmEvalFree(all[0..slots.len]);
-    }
-
-    const MAX_WARM_SEQ: usize = MAX_WIDTH_WARM + 1;
-    const MAX_WIDTH_WARM: usize = 8;
-    /// Wider than the expert decode chain (16 rows) and the multi-row trunk kernel (8): a prefill forward.
-    pub const SPEC_WARM_PREFILL_ROWS: usize = 64;
-
-    // The verify at each draft width, the grouped verify at each row total and the head's own step
-    // each JIT their Metal pipelines on first dispatch; left to the first live request that compile
-    // lands inside a measured round and the table folds it as that width's price.
-    pub fn warmupSpecVerify(self: *Trunk, max_width: u32, kv_config: KVQuantConfig) !void {
-        forward_diag.moe_dump_warmup_depth += 1;
-        defer forward_diag.moe_dump_warmup_depth -= 1;
-        if (!qwen4_state.isLoaded(self) or qwen4_state.mtpOf(self) == null) return;
-        var lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-        const width_cap: usize = @min(@max(max_width, 1), MAX_WIDTH_WARM);
-        const group_cap: usize = if (verifyQmmNaxAvailable()) 16 else 7;
-        const max_rows: usize = @min(specWarmGroupRows(group_cap), MAX_BATCH_ROWS);
-
-        var slots: [MAX_BATCH_ROWS]*SpecWarmSlot = undefined;
-        var n_slots: usize = 0;
-        defer {
-            for (slots[0..n_slots]) |sl| {
-                arch_state_mod.releaseGroup(self, &sl.ctx) catch {};
-                sl.deinit(self.allocator);
-            }
-            _ = mlx.mlx_clear_cache();
-        }
-        var head_in = mlx.mlx_array_new();
-        defer if (head_in.ctx != null) {
-            _ = mlx.mlx_array_free(head_in);
-        };
-        while (n_slots < max_rows) : (n_slots += 1) {
-            slots[n_slots] = try SpecWarmSlot.init(self, kv_config);
-            var prompt_ids: [SPEC_WARM_PREFILL_ROWS]i32 = undefined;
-            // The first slot's prompt is prefill-shaped, so the first request does not pay the prefill kernels' first use.
-            const prompt = specWarmIds(prompt_ids[0..if (n_slots == 0) SPEC_WARM_PREFILL_ROWS else 8]);
-            defer _ = mlx.mlx_array_free(prompt);
-            var stream = mlx.mlx_array_new();
-            qwen4_state.ctxOf(&slots[n_slots].ctx).?.capture_stream_all = if (n_slots == 0) &stream else null;
-            const logits = try self.forwardWith(&slots[n_slots].ctx, prompt);
-            qwen4_state.ctxOf(&slots[n_slots].ctx).?.capture_stream_all = null;
-            if (n_slots == 0 and stream.ctx != null) {
-                const sh = mlx.getShape(stream);
-                try mlx.check(mlx.mlx_slice(&head_in, stream, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ sh[0], 1, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            }
-            specWarmEvalFree(&[_]mlx.mlx_array{ logits, stream });
-        }
-
-        var w: usize = 1;
-        while (w <= width_cap) : (w += 1) try self.specWarmVerify(slots[0..1], w + 1);
-
-        var n: usize = 2;
-        var group_seq_max: usize = 0;
-        while (n <= n_slots) : (n += 1) {
-            const per_row_cap = specWarmGroupSeq(group_cap, n, width_cap) - 1;
-            group_seq_max = @max(group_seq_max, per_row_cap + 1);
-            var seq: usize = 2;
-            while (seq <= per_row_cap + 1) : (seq += 1) try self.specWarmVerify(slots[0..n], seq);
-        }
-        if (head_in.ctx != null) try self.specWarmHead(head_in);
-        log.info("[spec-warmup] verify widths 1..{d} solo, group rows 2..{d} at up to {d} tokens each, head width 1 ({d} ms).\n", .{ width_cap, n_slots, group_seq_max, lap.read() / std.time.ns_per_ms });
-    }
-
-
-
-    // Mirror of `mtp_tick.mtpSubGroupSize`: the slots one row-axis tick can carry at this row
-    // budget (NAX wide lane 16, stock lane 7) and the drafts each slot gets.
-    pub fn specWarmGroupRows(group_cap: usize) usize {
-        return if (group_cap >= 16) 4 else 3;
-    }
-
-    pub fn specWarmGroupSeq(group_cap: usize, rows: usize, width_cap: usize) usize {
-        return @min(group_cap / rows - 1, width_cap) + 1;
-    }
-
-    fn specWarmHead(self: *Trunk, stream_row: mlx.mlx_array) !void {
-        var st = try qwen4_forward.qwen4MtpStateNew(self);
-        defer st.deinit();
-        var id_buf: [1]i32 = undefined;
-        const id_arr = specWarmIds(&id_buf);
-        defer _ = mlx.mlx_array_free(id_arr);
-        for ([_]qwen4_forward.Qwen4MtpProject{ .mixed_last_row, .none }, 0..) |project, i| {
-            const out = try qwen4_forward.qwen4MtpForwardOn(self, &st, stream_row, id_arr, @intCast(1 + i), null, project);
-            specWarmEvalFree(&[_]mlx.mlx_array{ out.logits, out.stream, out.mixed });
-        }
-    }
-
-    test "spec warm-up covers exactly the group shapes the scheduler can build" {
-        try testing.expectEqual(@as(usize, 4), specWarmGroupRows(16));
-        try testing.expectEqual(@as(usize, 3), specWarmGroupRows(7));
-        try testing.expectEqual(@as(usize, 7), specWarmGroupSeq(16, 2, 6));
-        try testing.expectEqual(@as(usize, 5), specWarmGroupSeq(16, 3, 6));
-        try testing.expectEqual(@as(usize, 4), specWarmGroupSeq(16, 4, 6));
-        try testing.expectEqual(@as(usize, 3), specWarmGroupSeq(7, 2, 6));
-        try testing.expectEqual(@as(usize, 2), specWarmGroupSeq(7, 3, 6));
-        try testing.expectEqual(@as(usize, 3), specWarmGroupSeq(16, 2, 2));
     }
 
     /// Variant of `forwardWith` that overrides `ctx.capture_hidden` for this
@@ -2443,7 +2396,7 @@ pub const Trunk = struct {
                     _ = mlx.mlx_array_free(entry.conv_state);
                     _ = mlx.mlx_array_free(entry.ssm_state);
                     ssmFreeSpecCapture(entry);
-                    qwen4_qsa_state.ssmFreeQsaState(entry);
+                    prefix_arch.aux.ssmFreeQsaState(entry);
                     entry.conv_state = saved.conv_state;
                     entry.ssm_state = saved.ssm_state;
                     entry.aux_state = saved.aux_state;
@@ -2461,7 +2414,7 @@ pub const Trunk = struct {
                     if (entry.qsa_pooled.ctx != null) entry.qsa_pooled_blocks = mlx.getShape(entry.qsa_pooled)[1];
                 }
             }
-            self.ctx.ssm_member_gen = qwen4_ssm_group.nextSsmMemberGen();
+            self.ctx.ssm_member_gen = ssm_cache.nextSsmMemberGen();
             self.xfm.fwd_gen +%= 1;
         }
 
@@ -2495,7 +2448,7 @@ pub const Trunk = struct {
         var n_rollback: usize = 0;
         defer for (rollback[0..n_rollback]) |*saved| saved.deinit();
         errdefer for (rollback[0..n_rollback]) |*saved| saved.restore();
-        if (qwen4_state.isLoaded(self) and token_rows.len > 1) {
+        if (arch_state_mod.rowVerify(&self.arch_state) and token_rows.len > 1) {
             if (token_rows.len > MAX_BATCH_ROWS) return error.MtpBatchTooWide;
             for (ctxs) |ctx| try arch_state_mod.releaseGroup(self, ctx);
             for (ctxs, 0..) |ctx, i| {
@@ -2519,7 +2472,7 @@ pub const Trunk = struct {
                 if (ctxs[i].ssm_entries) |entries| for (entries) |*e| ssmFreeSpecCapture(e);
             }
         }
-        if (qwen4_state.built and qwen4_forward.qwen4VerifyRowsEligible(self, token_rows, ctxs)) {
+        if (arch_state_mod.verifyRowsGrouped(self, token_rows, ctxs)) {
             const Once = struct {
                 var logged = false;
             };
@@ -2537,7 +2490,7 @@ pub const Trunk = struct {
                     ctx.lazy_ids = false;
                     ctx.capture_ssm_seq = false;
                 };
-                try qwen4_forward.forwardQwen4VerifyRows(self, token_rows, ctxs, out_logits, out_last, out_all);
+                try arch_state_mod.forwardVerifyRowsGrouped(self, token_rows, ctxs, out_logits, out_last, out_all);
             }
             built = token_rows.len;
             const group_ns = lap.read();
@@ -2727,7 +2680,7 @@ pub const Trunk = struct {
 
 
     pub fn verifyFeatureEnabled(self: *const Trunk, comptime feature: SingleVerifyFeature, grouped: bool, batch: c_int, width: c_int) bool {
-        if (!qwen4_state.isLoaded(self)) return false;
+        if (!arch_state_mod.rowVerify(&self.arch_state)) return false;
         if (grouped) return true;
         if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
         // Capture marks speculative verification. A short prefill tail has the
@@ -3321,7 +3274,7 @@ pub const Trunk = struct {
         const gate_logit = try self.qmatmul(joined_input, &mw.shared_expert_gate);
         defer _ = mlx.mlx_array_free(gate_logit);
         const result = try self.moeSharedGateTail(expert_sum, gate_logit, down);
-        qwen4_forward.mtp_verify_shared_gate_rows_calls +%= 1;
+        mtp_verify_shared_gate_rows_calls +%= 1;
         const Once = struct {
             var logged = false;
         };
@@ -3334,7 +3287,7 @@ pub const Trunk = struct {
 
     fn moeSharedDownRows(self: *Trunk, joined_input: mlx.mlx_array, widths: []const c_int, mw: *const MoeMlpWeights) !?mlx.mlx_array {
         const down = (try self.moeSharedDown(.verify_rows, joined_input, mw, widths)) orelse return null;
-        qwen4_forward.mtp_verify_shared_rows_calls +%= 1;
+        mtp_verify_shared_rows_calls +%= 1;
         const Once = struct {
             var logged = false;
         };
@@ -3360,9 +3313,9 @@ pub const Trunk = struct {
     }
 
     pub fn moeVerifyRows(self: *Trunk, inputs: []const mlx.mlx_array, mw: *const MoeMlpWeights) ![]mlx.mlx_array {
-        if (!qwen4_state.isLoaded(self) or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
+        if (!arch_state_mod.rowVerify(&self.arch_state) or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
             inputs.len < 2 or inputs.len > 8 or self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32 or
-            mw.shared_expert_gate_w == null or qwen4_forward.qwen4Standin().moe_shared or
+            mw.shared_expert_gate_w == null or arch_kernels.moeStandin().moe_shared or
             self.config.num_experts == 0 or self.config.num_experts_per_tok == 0 or
             mw.expert_bias != null)
         {
@@ -3545,7 +3498,7 @@ pub const Trunk = struct {
         defer if (shared_early) |value| {
             _ = mlx.mlx_array_free(value);
         };
-        const shared_eligible = streamSharedEarlyApplies(self.config.expert_layout == .exl3_k4 and mw.shared_expert_gate_w != null and !qwen4_forward.qwen4Standin().moe_shared, mlx.getShape(inds));
+        const shared_eligible = streamSharedEarlyApplies(self.config.expert_layout == .exl3_k4 and mw.shared_expert_gate_w != null and !arch_kernels.moeStandin().moe_shared, mlx.getShape(inds));
         const swap_tolerance = expert_stream_mod.pick_tolerance;
         var swap_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(swap_logits);
@@ -3764,7 +3717,7 @@ pub const Trunk = struct {
             _ = mlx.mlx_array_free(expert_sum);
             expert_sum = narrowed;
         }
-        if (mw.shared_expert_gate_w == null or qwen4_forward.qwen4Standin().moe_shared) {
+        if (mw.shared_expert_gate_w == null or arch_kernels.moeStandin().moe_shared) {
             engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
             try handOffStreamedResult(expert_sum, rows);
             return expert_sum;
@@ -3823,7 +3776,7 @@ pub const Trunk = struct {
         var act_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(act_2d);
         var inter: c_int = 0;
-        if (qwen4_forward.qwen4Standin().moe_gateup and self.config.moe_intermediate_size > 0) {
+        if (arch_kernels.moeStandin().moe_gateup and self.config.moe_intermediate_size > 0) {
             // Diagnostic: unit activations, the gate+up kernel drops out.
             const sh = [_]c_int{ K, @intCast(self.config.moe_intermediate_size) };
             _ = mlx.mlx_array_free(act_2d);
@@ -3880,7 +3833,7 @@ pub const Trunk = struct {
         // [K, hidden] intermediate never materializes. Declines (dtype
         // mismatch, geometry, kill switch) fall through to the split form
         // with `reduced` untouched.
-        if (qwen4_forward.qwen4Standin().moe_down and @rem(D, inter) == 0) {
+        if (arch_kernels.moeStandin().moe_down and @rem(D, inter) == 0) {
             // Diagnostic: the down kernel drops out; the activations are still
             // consumed (sum over K, tiled to hidden) so gate+up stays live.
             var summed = mlx.mlx_array_new();
@@ -4082,7 +4035,7 @@ pub const Trunk = struct {
         // At one decode row the shared-expert gate's logit rides the softmax router kernel.
         const gate_fold: ?RouterGate = blk: {
             if (routing_override != null or router_override != null or stream_ctx != null or skip_shared) break :blk null;
-            if (mw.expert_bias != null or mw.shared_gate_vec.ctx == null or qwen4_forward.qwen4Standin().moe_shared or qwen4_forward.qwen4Standin().moe_router) break :blk null;
+            if (mw.expert_bias != null or mw.shared_gate_vec.ctx == null or arch_kernels.moeStandin().moe_shared or arch_kernels.moeStandin().moe_router) break :blk null;
             if (mlx.mlx_array_size(expert_x) != mlx.mlx_array_size(mw.shared_gate_vec)) break :blk null;
             break :blk .{ .x = expert_x, .w = mw.shared_gate_vec };
         };
@@ -4104,7 +4057,7 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(inds);
         var norm_scores = routed.norm_scores;
         defer _ = mlx.mlx_array_free(norm_scores);
-        if (routing_override == null and qwen4_forward.qwen4Standin().moe_router) {
+        if (routing_override == null and arch_kernels.moeStandin().moe_router) {
             // Diagnostic: fixed experts 0..K-1, uniform scores (routing off the critical path).
             const ish = mlx.getShape(inds);
             const k: c_int = ish[ish.len - 1];
@@ -4157,7 +4110,7 @@ pub const Trunk = struct {
             };
             const shared = if (routing_override) |given| given.shared_gated else null;
             const fold_shared = shared != null and moeDumpDir() == null;
-            const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4_forward.qwen4Standin().moe_shared;
+            const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !arch_kernels.moeStandin().moe_shared;
             if (tail_shared and moeDumpDir() == null) {
                 // A dense gate (the packs' bf16 [1, hidden]) has no affine bank for the fold to read: its logit comes in.
                 const dense_gate = mw.shared_expert_gate_s.?.ctx == null;
@@ -4166,7 +4119,7 @@ pub const Trunk = struct {
                 defer if (made_logit) {
                     _ = mlx.mlx_array_free(fold_logit);
                 };
-                if (try @import("qwen4/qwen4_shared.zig").folded(self.s, expert_x, mw, inds, norm_scores, self.config.expertDecode(), self.config.trunk_quant, fold_logit)) |folded| return folded;
+                if (try @import("moe_shared_fold.zig").folded(self.s, expert_x, mw, inds, norm_scores, self.config.expertDecode(), self.config.trunk_quant, fold_logit)) |folded| return folded;
                 const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
                 defer _ = mlx.mlx_array_free(down);
                 const own_logit = fold_logit.ctx == null;
@@ -4188,7 +4141,7 @@ pub const Trunk = struct {
                 try mlx.check(mlx.mlx_add(&summed, y, shared_gated, self.s));
                 return summed;
             };
-            if (skip_shared or mw.shared_expert_gate_w == null or qwen4_forward.qwen4Standin().moe_shared) return y;
+            if (skip_shared or mw.shared_expert_gate_w == null or arch_kernels.moeStandin().moe_shared) return y;
             defer _ = mlx.mlx_array_free(y);
             return self.moeAddGatedShared(y, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
         }
@@ -4239,7 +4192,7 @@ pub const Trunk = struct {
         var moe_reduced = false;
         var cost_arm: u8 = 4;
 
-        const grouped_rows = skip_shared and router_override != null and B == 1 and S >= 2 and S <= 128 and moeRowsFusedEnabled() and !qwen4_forward.qwen4Standin().moe_gateup and !qwen4_forward.qwen4Standin().moe_down;
+        const grouped_rows = skip_shared and router_override != null and B == 1 and S >= 2 and S <= 128 and moeRowsFusedEnabled() and !arch_kernels.moeStandin().moe_gateup and !arch_kernels.moeStandin().moe_down;
         if (imx == null and (grouped_rows or moeDecodeDispatchArm(B, S, K) == .rows) and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
             try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
@@ -4473,7 +4426,7 @@ pub const Trunk = struct {
 
 
         // No shared-expert gate: the routed sum is the whole output.
-        if (mw.shared_expert_gate_w == null or qwen4_forward.qwen4Standin().moe_shared) return expert_sum;
+        if (mw.shared_expert_gate_w == null or arch_kernels.moeStandin().moe_shared) return expert_sum;
         defer _ = mlx.mlx_array_free(expert_sum);
         return self.moeAddGatedShared(expert_sum, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
     }
@@ -4961,16 +4914,11 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         };
     }
 
-    // The PLE is placed by exact equality inside the loop above and nothing downstream notices
-    // its absence; a silently PLE-less qwen4 emits plausible text.
     if (hyper_connected) {
         const has_ple = try allocator.alloc(bool, moe_layers.len);
         defer allocator.free(has_ple);
         for (moe_layers, 0..) |*lw, i| has_ple[i] = lw.ple != null;
-        if (!qwen4_config.qwen4PleInstalledAt(has_ple, config.ple_layer_idx)) {
-            log.err("[qwen4] the PLE was not installed at layer {d} ({d} layers carry PLE weights)\n", .{ config.ple_layer_idx, std.mem.count(bool, has_ple, &.{true}) });
-            return error.Qwen4PleNotInstalled;
-        }
+        try arch_load.checkPlePlacement(&config, has_ple);
     }
 
     return .{
@@ -6124,4 +6072,39 @@ test "sushi coder GPU grouped layer matches the original uniform bank" {
     try mlx.check(mlx.mlx_array_eval(a));
     try mlx.check(mlx.mlx_array_eval(b));
     try t.expectEqualSlices(f32, mlx.mlx_array_data_float32(a).?[0..128], mlx.mlx_array_data_float32(b).?[0..128]);
+}
+
+test "shared expert gate tail admits the joined verifier envelope only" {
+    try testing.expect(sharedGateRowsEligible(&.{ 2, 2, 2, 2 }));
+    try testing.expect(sharedGateRowsEligible(&.{ 5, 5, 5, 5 }));
+    try testing.expect(sharedGateRowsEligible(&.{ 2, 3 }));
+    try testing.expect(!sharedGateRowsEligible(&.{ 7, 7, 7, 7 }));
+    try testing.expect(!sharedGateRowsEligible(&.{1}));
+}
+
+test "computeYarnFreqs matches HF _compute_yarn_parameters (full-attn rope)" {
+    // Golden values from the reference YaRN math and the pure-Python
+    // cross-check: head_dim 128, partial 0.5 → dim 64 →
+    // 32 freqs; base 5e5, factor 32, beta_fast 32, beta_slow 1, orig_max 8192.
+    // low/high correction dims truncate to 9/18.
+    var freqs: [32]f64 = undefined;
+    computeYarnFreqs(&freqs, 128, 0.5, 500000.0, 32.0, 32.0, 1.0, 8192, true);
+    // Spot-check the denominator array mlx_fast_rope consumes (angle = pos/freqs).
+    const golden = [_]struct { idx: usize, val: f64 }{
+        .{ .idx = 0, .val = 1.000000000e+00 },
+        .{ .idx = 1, .val = 1.506929076e+00 },
+        .{ .idx = 2, .val = 2.270835240e+00 },
+        .{ .idx = 7, .val = 1.764613870e+01 },
+        .{ .idx = 15, .val = 1.324904288e+03 },
+        .{ .idx = 16, .val = 2.868264127e+03 },
+        .{ .idx = 23, .val = 3.992865387e+05 },
+        .{ .idx = 31, .val = 1.061761980e+07 },
+    };
+    for (golden) |g| {
+        try testing.expectApproxEqRel(g.val, freqs[g.idx], 1e-7);
+    }
+    // Below the low correction dim (9): pure extrapolation → freqs = base^(2i/64).
+    try testing.expectApproxEqRel(std.math.pow(f64, 500000.0, 0.0), freqs[0], 1e-9);
+    // Above the high correction dim (18): pure interpolation → freqs = factor·base^(2i/64).
+    try testing.expectApproxEqRel(32.0 * std.math.pow(f64, 500000.0, @as(f64, 2 * 31) / 64.0), freqs[31], 1e-6);
 }

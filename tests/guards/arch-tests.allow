@@ -10,8 +10,6 @@ DeepSeek's image-encode bill, which is also its transient cap, covers a quarter 
 DeepSeek-V4.1 serves medium and xhigh as their own words, without a re-route
 GLM BF16 individual index recognizes separate gate up down experts
 GLM EXL3 index uses native source nesting and refuses mixed expert formats
-GLM EXL3 preflight refuses a rate-grouped layer by name
-GLM EXL3 preflight refuses orphan MTP and out of range packed tensors
 GLM admission credits the hot cache, so an eviction lets a long prefill in
 GLM assistant bounded block tail preserves visible keys and masks
 GLM assistant cached sliding mask equals the mask built at any absolute position
@@ -52,22 +50,16 @@ MiMo MTP state bill is constant and follows retained storage
 MiMo honors the declared wired limit streamed or resident, without enabling long-context paths
 ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only
 Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and the checkpoint's own word
-Qwen4 mixed MTP profile requires its measured geometry and packs
-Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)
-Qwen4 mixed pack matcher pins actual quantization geometry
 Responses: a stored chain and an input replay render the same Qwen prompt
-SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp takes the RAM arm
 a GLM raw FP8 config with another block size is refused by name
 a MiMo slot bills the decode rebuilds the other rows of its batched decode hold
 a Qwen or MiMo request owes no growth after admission, its reserved capacity is taken at its first grow
 a freed MiMo slot returns its KV to the OS, not to MLX's pool
-a qwen4_exp SSD restore is credited: its first grow bills one eval window of the restored rows
 a qwen4_exp config refusal keeps its own name in the 503 text
 a resident MiMo batches decode in groups of the FP8 GEMV's row-identical width; a streamed one stays serial
 a second GLM admission leaves free the cache growth the first was admitted to allocate
 a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep theirs
 a streamed GLM bills its fill peak per request and its latent at the KV width plus the pooled index per planned token
-a streamed Qwen plans its QSA history beside its KV for every planned token
 an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths
 an unloaded qwen4 stub is text-only only when the checkpoint must stream
 applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config
@@ -178,9 +170,6 @@ parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma
 parseVisionProcessorDefaultsFromJson supports current and legacy Qwen layouts
 prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-only
 prefillRequestTerms: a loaded DFlash2 assistant bills its window and chunk rows on qwen4 only
-prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero when off
-prefillRequestTerms: the admission bill's new terms are qwen4_exp-only
-qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the same trunk without qwen4_exp keeps
 qwen bicubic RGB preprocessing preserves colors and interpolates
 qwen bicubic downscale matches Pillow anti-aliased RGB output
 qwen buildPixelValues merge-order + [C,tps,py,px] feature layout
@@ -197,8 +186,6 @@ qwen4 expert streaming targets only the trunk bank
 qwen4 replay: what the next prompt shares with a generated turn (Flash-Next tokenizer.json, real template)
 qwen4 streaming index completeness requires every target bank and PLE shard
 qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)
-qwen4ExpOomConfig does not leak qsa_score_fused_override
-qwen4RequestTestConfig does not leak qsa_score_fused_override
 qwen: a checkpoint's 16.7 Mpx bound is clamped to what the ViT can attend
 real Qwen pack loaded through ChatConfig keeps late notes in place
 real mimo_v2 original checkpoint discovers complete streamed expert headers
@@ -223,7 +210,6 @@ stock Qwen late system notes render in place and keep tool rounds a prefix
 streaming layout refusal explains MiMo repacking without assuming Qwen
 sushi coder GPU grouped binders cover qwen mimo and MTP
 sushi coder index recognizes grouped qwen4 and mimo layouts
-sushi coder qwen trunk and MTP preflight use each router width
 sushi coder uniform qwen4 and mimo banks preserve stored handles
 the GDN state checkpoint bills four bytes per element at f32 and two at bf16; GLM's KDA state is f32 always
 the GPU expert pick matches the host on a sigmoid router's log-sigmoid logits, MiMo's E and K

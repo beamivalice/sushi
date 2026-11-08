@@ -6,7 +6,6 @@ const expectError = @import("../test_expect.zig").expectError;
 const expert_quant = @import("../expert_quant.zig");
 const model_discovery = @import("../model_discovery.zig");
 const model_mod = @import("../model.zig");
-const qwen4_config = @import("../qwen4/qwen4_config.zig");
 const MAX_VISION_LAYERS = model_mod.MAX_VISION_LAYERS;
 const MimoVitAttn = model_mod.MimoVitAttn;
 const ModelConfig = model_mod.ModelConfig;
@@ -586,10 +585,10 @@ test "mimo_v2 original streaming retains resident names and excludes experts and
     try built();
     var buf: [256]u8 = undefined;
     const key = "model.layers.0.self_attn.qkv_proj.weight";
-    try testing.expectEqualStrings(key, qwen4_config.qwen4StreamingWeightKey(.mxfp4_individual, &buf, key).?);
-    try testing.expect(qwen4_config.qwen4StreamingWeightKey(.mxfp4_individual, &buf, "model.layers.1.mlp.experts.0.gate_proj.weight") == null);
-    try testing.expect(qwen4_config.qwen4StreamingWeightKey(.mxfp4_individual, &buf, "model.layers.1.mlp.experts.0.gate_proj.weight_scale") == null);
-    try testing.expect(qwen4_config.qwen4StreamingWeightKey(.mxfp4_individual, &buf, "model.mtp.layers.0.self_attn.qkv_proj.weight") == null);
+    try testing.expectEqualStrings(key, model_mod.streamingWeightKey(.mxfp4_individual, &buf, key).?);
+    try testing.expect(model_mod.streamingWeightKey(.mxfp4_individual, &buf, "model.layers.1.mlp.experts.0.gate_proj.weight") == null);
+    try testing.expect(model_mod.streamingWeightKey(.mxfp4_individual, &buf, "model.layers.1.mlp.experts.0.gate_proj.weight_scale") == null);
+    try testing.expect(model_mod.streamingWeightKey(.mxfp4_individual, &buf, "model.mtp.layers.0.self_attn.qkv_proj.weight") == null);
 }
 
 test "mimo_v2 streaming leaves trunk keys intact and excludes only routed banks" {
@@ -601,8 +600,8 @@ test "mimo_v2 streaming leaves trunk keys intact and excludes only routed banks"
         "model.layers.0.mlp.gate_proj.weight",
         "model.layers.1.mlp.gate.e_score_correction_bias",
     }) |key| {
-        try testing.expectEqualStrings(key, qwen4_config.qwen4StreamingWeightKey(.mxfp4_split, &buf, key).?);
+        try testing.expectEqualStrings(key, model_mod.streamingWeightKey(.mxfp4_split, &buf, key).?);
     }
-    try testing.expect(qwen4_config.qwen4StreamingWeightKey(.mxfp4_split, &buf, "model.layers.1.mlp.switch_mlp.gate_proj.weight") == null);
-    try testing.expect(qwen4_config.qwen4StreamingWeightKey(.mxfp4_split, &buf, "model.layers.1.mlp.switch_mlp.down_proj.scales") == null);
+    try testing.expect(model_mod.streamingWeightKey(.mxfp4_split, &buf, "model.layers.1.mlp.switch_mlp.gate_proj.weight") == null);
+    try testing.expect(model_mod.streamingWeightKey(.mxfp4_split, &buf, "model.layers.1.mlp.switch_mlp.down_proj.scales") == null);
 }

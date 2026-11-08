@@ -714,7 +714,7 @@ boot. The verify widths run unchanged kernels, so only the one-row forwards insi
 ## Flash-Next: the shared expert rides the routed launches
 
 `exl3/riders_gated.zig` (the shared kernels), `exl3/fold_gated.zig` (one-bank MCG layers: Sushi-4bpw, Sushi-2bpw),
-`rate_groups.moeGatedSharedFolded` (rate-grouped STQ layers: Sushi-STQ-2.75bpw), glue `qwen4_shared.folded`, called
+`rate_groups.moeGatedSharedFolded` (rate-grouped STQ layers: Sushi-STQ-2.75bpw), glue `moe_shared_fold.folded`, called
 from `moeMLP2WithRouter`'s tail-shared branch. The shared gate/up/SwiGLU kernel becomes extra threadgroups of the
 routed pair launch and the shared down those of the fused-mid down launch (`fuse.zig`); the finish reduce adds
 `sigmoid(gate) * shared` per row. The riders keep MLX's one-row affine8 qmv order (`qmv_fast` for K%256==0 and N%8==0,
@@ -760,7 +760,7 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
 - **The fold's geometry is bound at load.** `riders_gated.geometry` (the shared banks' shapes, dtypes and, for a trellis
   expert, the two NAX launch geometries) was read on every MoE layer of every token. `layer_weights.bindSharedGeometry`
   now fills `MoeMlpWeights.shared_geo[rows - 1]` for rows 1 to `NAX_ROWS_MAX` once the layer's arrays are final, and
-  `qwen4_shared.folded` calls `moeGatedSharedFoldedGeo` with it (an affine gate's logit is the fold's, a dense gate's is
+  `moe_shared_fold.folded` calls `moeGatedSharedFoldedGeo` with it (an affine gate's logit is the fold's, a dense gate's is
   handed in, and the geometry follows that; any other case reads the shapes as before). Bytes are unchanged. Shape,
   size and dtype queries (`mlx.query_count`) of a decode tick through `forwardQwen4With`, `qwen4_query_count_test.zig`,
   commit `73aab248`, ReleaseFast, M5 Max, ticks 3 to 6 after a 23-token prompt: STQ-2.75bpw 10690 -> 9290 (10980 -> 9580 on the QSA tick), 4bpw 12265 -> 10868. One layer's fold call

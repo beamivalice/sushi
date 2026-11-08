@@ -53,7 +53,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
-const transformer_mod = @import("transformer.zig");
 const trunk = @import("trunk.zig");
 const prefix_arch = @import("arch/prefix.zig");
 const model = @import("model.zig");
@@ -136,7 +135,7 @@ pub const SpecCommit = struct {
     /// In-checkpoint MTP head: the QSA aux half, persisted alongside the KV.
     head_aux: ?*const trunk.SSMCacheEntrySnapshot = null,
     head_pos_base: c_int = 0,
-    head_marks: []const transformer_mod.QsaHeadMark = &.{},
+    head_marks: []const trunk.QsaHeadMark = &.{},
 };
 
 /// What a commit actually achieved on disk. The old bool meant "nothing more to write", and
@@ -945,12 +944,12 @@ pub const DiskTier = struct {
         const want_rows = DiskTier.qsaHistoryRowsOf(&cp);
         // The overlay is owed unless the pooled bank is on THIS checkpoint: every checkpoint
         // carries its own raw leftover, and a mid-block one (backoff 30) is not the bank's home.
-        const snap_has_pooled = transformer_mod.checkpointHasQsaPooled(&cp);
+        const snap_has_pooled = prefix_arch.aux.checkpointHasQsaPooled(&cp);
         var qsa_overlay: ?trunk.SSMCheckpoint = null;
         defer if (qsa_overlay) |*q| q.deinit(self.allocator);
         if ((want_rows > 0 or e.qsa_history_rows > 0) and !snap_has_pooled) {
             var hist = self.loadQsaHistoryFile(e.id, ssm_entries.len) catch return error.DiskCacheQsaHistoryGap;
-            if (!transformer_mod.checkpointQsaCoversPos(&cp, &hist, cp_pos)) {
+            if (!prefix_arch.aux.checkpointQsaCoversPos(&cp, &hist, cp_pos)) {
                 hist.deinit(self.allocator);
                 return error.DiskCacheQsaHistoryGap;
             }
@@ -960,8 +959,8 @@ pub const DiskTier = struct {
             if (latest != cp_pos) {
                 if (self.loadSsmFile(e.id, latest, ssm_entries.len)) |latest_cp_val| {
                     var latest_cp = latest_cp_val;
-                    if (transformer_mod.checkpointHasQsaPooled(&latest_cp)) {
-                        if (!transformer_mod.checkpointQsaCoversPos(&cp, &latest_cp, cp_pos)) {
+                    if (prefix_arch.aux.checkpointHasQsaPooled(&latest_cp)) {
+                        if (!prefix_arch.aux.checkpointQsaCoversPos(&cp, &latest_cp, cp_pos)) {
                             latest_cp.deinit(self.allocator);
                             return error.DiskCacheQsaHistoryGap;
                         }
@@ -991,7 +990,7 @@ pub const DiskTier = struct {
             }
         }
         if (qsa_overlay) |*qsa_cp| {
-            try transformer_mod.applyQsaHistoryAt(ssm_entries, qsa_cp, cp_pos, s, true);
+            try prefix_arch.aux.applyQsaHistoryAt(ssm_entries, qsa_cp, cp_pos, s, true);
         }
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
@@ -1373,7 +1372,7 @@ pub const DiskTier = struct {
             for (layers) |*l| l.qsa_rows = rows;
         } else {
             for (layers) |*l| {
-                if (!transformer_mod.snapshotHasQsaHistory(l)) continue;
+                if (!prefix_arch.aux.snapshotHasQsaHistory(l)) continue;
                 if (l.aux_state.ctx != null) {
                     const sh = mlx.getShape(l.aux_state);
                     if (sh.len >= 2) l.qsa_rows = sh[1];
@@ -2381,7 +2380,7 @@ pub const DiskTier = struct {
         head_pos_base: c_int = 0,
         /// v8: the head's checkpoint-position leftovers. Empty on a v5..v7 sidecar, which
         /// clamps as it does today (a mid-block warm clamp declines, head starts blind).
-        head_marks: transformer_mod.QsaHeadMarkSet = .{},
+        head_marks: trunk.QsaHeadMarkSet = .{},
     } {
         const e = &self.entries.items[idx];
         const meta = (switch (which) {
@@ -2504,7 +2503,7 @@ pub const DiskTier = struct {
         // v5 head half, best-effort: a pre-v5 sidecar returns none and the head declines the adoption.
         var head_aux: ?trunk.SSMCacheEntrySnapshot = null;
         var head_pos_base: c_int = 0;
-        var head_marks: transformer_mod.QsaHeadMarkSet = .{};
+        var head_marks: trunk.QsaHeadMarkSet = .{};
         if (meta.head) |hm| head: {
             const aux = getSpecArray(tensor_map, self.allocator, prefix, "h.aux") orelse break :head;
             var snap_aux: trunk.SSMCacheEntrySnapshot = .{
@@ -3176,7 +3175,7 @@ pub const DiskTier = struct {
             try meta.append(self.allocator, .{ .key = "grown", .value = gs });
         }
         for (cp.layers, 0..) |l, li| {
-            const qsa_hist = transformer_mod.snapshotHasQsaHistory(&l);
+            const qsa_hist = prefix_arch.aux.snapshotHasQsaHistory(&l);
             const names = .{ "conv", "ssm", "aux", "pooled" };
             const arrs = .{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled };
             inline for (names, arrs) |name, arr| {
@@ -8222,7 +8221,7 @@ test "DiskTier: the bytes of a dense, a hybrid-with-QSA and a head-sidecar recor
             try trunk.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
         };
         defer for (&cps) |*cp| cp.deinit(testing.allocator);
-        try transformer_mod.attachQsaHistoryToLatest(&cps, &src256, s);
+        try prefix_arch.aux.attachQsaHistoryToLatest(&cps, &src256, s);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
     }
     {

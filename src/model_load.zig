@@ -33,7 +33,6 @@ const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
 const arch_handle = @import("arch/handle.zig");
 const arch_load = @import("arch/load.zig");
-const qwen4_state = @import("qwen4/qwen4_state.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
@@ -890,7 +889,7 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
 }
 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
-    const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
+    const split = try model_mod.residentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
     return split.trunk +| split.mtp +| bills.rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits());
 }
 
@@ -2066,13 +2065,22 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
-        if (mtp_enabled and qwen4_state.mtpOf(xfm_ptr) != null) {
+        if (mtp_enabled) {
             const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
-            xfm_ptr.warmupSpecVerify(cap, kv_quant_config) catch |err| {
+            arch_load.warmVerify(params.config, xfm_ptr, cap, kv_quant_config) catch |err| {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
         }
         arch_load.warmSpec(sch.io, params.config, xfm_ptr, aux_head, kv_quant_config);
+    }
+
+    // A MERGED drafter has no `--drafter` to echo, so the reported path comes
+    // from what was actually resolved — `drafter_loaded` and `drafter_path`
+    // must not disagree about the same sidecar.
+    if (drafter_path_owned.len == 0 and drafter_dir.len > 0 and
+        dflash_ptr != null)
+    {
+        drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
@@ -2106,14 +2114,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.mtp_depth,
         if (depth_bounds.active.explicit()) "--mtp-min-depth/--mtp-max-depth" else "default",
     });
-    // A MERGED drafter has no `--drafter` to echo, so the reported path comes
-    // from what was actually resolved — `drafter_loaded` and `drafter_path`
-    // must not disagree about the same sidecar.
-    if (drafter_path_owned.len == 0 and drafter_dir.len > 0 and
-        dflash_ptr != null)
-    {
-        drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
-    }
     entry.drafter_path = drafter_path_owned;
     drafter_path_owned = &[_]u8{}; // disarm the errdefer
     // Transfer ownership of the heap-allocated CPU state from `params` to

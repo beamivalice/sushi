@@ -3,7 +3,7 @@
 //! Faithful port of mlx-vlm's `rope_utils._interleaved_position_selector` and
 //! `Qwen3_5Model.get_rope_index` (mlx_vlm/models/qwen3_5/language.py). All math
 //! here is pure host integer/float work — no MLX — so it is hermetically
-//! testable. The text trunk (src/transformer.zig) consumes:
+//! testable. The text trunk (src/trunk.zig) consumes:
 //!   * `getRopeIndex` → per-token 3D position ids (t,h,w) + the decode delta, and
 //!   * `interleavedSelector` + `buildCosSin` → the prefill cos/sin tables that
 //!     replace the scalar `mlx_fast_rope` on image requests.

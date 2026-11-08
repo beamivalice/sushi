@@ -7,7 +7,6 @@ const nax_gate = @import("../nax_gate.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const std = @import("std");
-const qwen4_state = @import("qwen4_state.zig");
 const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
@@ -2007,7 +2006,6 @@ test "qsa arm meters: one-shot bits, width buckets, and the per-request tally" {
 }
 
 test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     // The `[qsa-arms]` line is a PER-REQUEST meter, so its tally belongs to
     // the seam that logs it (the Generator's own ForwardCtx), never to the
     // shared Trunk. qwen4 text slots batch-decode on ONE Trunk
@@ -2881,7 +2879,6 @@ test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95
 }
 
 test "qsa score fused: unsupported indexer geometry falls back to the composed chain" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;

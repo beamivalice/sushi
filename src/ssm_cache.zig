@@ -5,6 +5,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const testing = std.testing;
 const kv_cache = @import("kv_cache.zig");
+const disk_format = @import("disk_format.zig");
 const prefix_policy = @import("prefix_policy.zig");
 const KVCacheEntry = kv_cache.KVCacheEntry;
 const arch_aux = @import("arch/prefix.zig").aux;
@@ -46,7 +47,7 @@ pub const SSMCacheEntry = struct {
     aux_state: mlx.mlx_array = .{ .ctx = null },
     /// PLE: the (ngram_size-1) tokens preceding the next forward.
     /// The (ngram_size - 1) tokens preceding this entry.
-    ple_prev: [arch_aux.ple_prev_len]u32 = @splat(0),
+    ple_prev: [PLE_PREV_MAX]u32 = @splat(0),
     ple_prev_valid: bool = false,
     /// Spec-verify capture for the PLE layer: the dilated-conv input
     /// `[B, state_len + T, hc*hidden]` and the token history (prev ++ ids)
@@ -88,6 +89,9 @@ pub const SSMCacheEntry = struct {
 
 /// Raw indexer-key rows kept per layer (tokens): verify width plus one block.
 pub const QSA_RING_ROWS: c_int = 32;
+
+/// The PLE tokens an entry carries before its next forward; the SSD record stores this many.
+pub const PLE_PREV_MAX: usize = 8;
 
 /// Widest `indexer_compress_ratio` the ring serves; past it a checkpoint is refused at load.
 pub const QSA_MAX_COMPRESS_RATIO: c_int = 8;
@@ -215,6 +219,101 @@ pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array
 /// owns its own array handles and frees them on deinit. Used for
 /// speculative-decoding rollback (PLD) where we must be able to revert one
 /// decode step on a hybrid model.
+/// The `pos % ratio` raw indexer rows ending at MTP-head row `pos`, copied while the ring
+/// still held them. The trunk restores at one of its checkpoint positions and the head is
+/// clamped to that same row; by commit time the head's ring is a whole generated tail past
+/// it, so the rows the next append must re-pool are kept here instead.
+pub const QsaHeadMark = struct {
+    pos: c_int = 0,
+    rows: mlx.mlx_array = .{ .ctx = null },
+};
+
+/// Marks a head keeps. A prefill's checkpoints are capped at `ssm_checkpoint_max` (16) and a
+/// warm turn merges the donor's; past this the list thins like the checkpoints themselves.
+pub const QSA_HEAD_MARKS_MAX: usize = disk_format.HEAD_MARKS_MAX;
+
+/// One owner of a head's marks: the live head holds one, its committed snapshot a
+/// refcount-sharing copy. Positions ascend.
+pub const QsaHeadMarkSet = struct {
+    items: [QSA_HEAD_MARKS_MAX]QsaHeadMark = @splat(.{}),
+    len: usize = 0,
+
+    pub fn slice(self: *const QsaHeadMarkSet) []const QsaHeadMark {
+        return self.items[0..self.len];
+    }
+
+    /// A second owner for every mark; both sets then free independently.
+    pub fn share(src: []const QsaHeadMark) QsaHeadMarkSet {
+        var out: QsaHeadMarkSet = .{};
+        for (src) |m| {
+            if (m.rows.ctx == null or out.len == QSA_HEAD_MARKS_MAX) continue;
+            var arr = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&arr, m.rows);
+            out.items[out.len] = .{ .pos = m.pos, .rows = arr };
+            out.len += 1;
+        }
+        return out;
+    }
+
+    pub fn deinit(self: *QsaHeadMarkSet) void {
+        for (self.items[0..self.len]) |*m| {
+            if (m.rows.ctx != null) _ = mlx.mlx_array_free(m.rows);
+            m.* = .{};
+        }
+        self.len = 0;
+    }
+
+    pub fn bytes(self: *const QsaHeadMarkSet) u64 {
+        var total: u64 = 0;
+        for (self.items[0..self.len]) |m| {
+            if (m.rows.ctx == null) continue;
+            total += @as(u64, mlx.mlx_array_size(m.rows)) * @as(u64, mlx.mlx_array_itemsize(m.rows));
+        }
+        return total;
+    }
+
+    pub fn find(self: *const QsaHeadMarkSet, pos: c_int) ?mlx.mlx_array {
+        for (self.items[0..self.len]) |m| {
+            if (m.pos == pos and m.rows.ctx != null) return m.rows;
+        }
+        return null;
+    }
+
+    /// Marks above `pos` describe rows a clamp just discarded — the next append writes
+    /// different tokens there.
+    pub fn dropAbove(self: *QsaHeadMarkSet, pos: c_int) void {
+        var i = self.len;
+        while (i > 0 and self.items[i - 1].pos > pos) : (i -= 1) {
+            if (self.items[i - 1].rows.ctx != null) _ = mlx.mlx_array_free(self.items[i - 1].rows);
+            self.items[i - 1] = .{};
+        }
+        self.len = i;
+    }
+
+    pub fn dropAt(self: *QsaHeadMarkSet, idx: usize) void {
+        if (self.items[idx].rows.ctx != null) _ = mlx.mlx_array_free(self.items[idx].rows);
+        var i = idx;
+        while (i + 1 < self.len) : (i += 1) self.items[i] = self.items[i + 1];
+        self.items[self.len - 1] = .{};
+        self.len -= 1;
+    }
+
+    /// Takes ownership of `rows`. A repeat at `pos` replaces; a full set thins its interior.
+    pub fn put(self: *QsaHeadMarkSet, pos: c_int, rows: mlx.mlx_array) void {
+        self.dropAbove(pos);
+        if (self.len > 0 and self.items[self.len - 1].pos == pos) self.dropAt(self.len - 1);
+        if (self.len == QSA_HEAD_MARKS_MAX) {
+            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency, null));
+        }
+        self.items[self.len] = .{ .pos = pos, .rows = rows };
+        self.len += 1;
+    }
+};
+
+pub fn markPosOf(m: *const QsaHeadMark) usize {
+    return @intCast(@max(m.pos, 0));
+}
+
 pub const SSMCacheEntrySnapshot = struct {
     conv_state: mlx.mlx_array,
     ssm_state: mlx.mlx_array,
@@ -227,7 +326,7 @@ pub const SSMCacheEntrySnapshot = struct {
     qsa_ratio: c_int = 4,
     qsa_rows: c_int = 0,
     /// The (ngram_size - 1) tokens preceding this entry.
-    ple_prev: [arch_aux.ple_prev_len]u32 = @splat(0),
+    ple_prev: [PLE_PREV_MAX]u32 = @splat(0),
     ple_prev_valid: bool = false,
 };
 
@@ -571,6 +670,28 @@ pub const SsmMergeKind = packed struct {
     linear: bool = false,
     ple: bool = false,
 };
+
+var ssm_member_gen_src: std.atomic.Value(u64) = .init(1);
+
+pub fn nextSsmMemberGen() u64 {
+    return ssm_member_gen_src.fetchAdd(1, .monotonic);
+}
+
+pub fn ssmBumpMemberGenEntries(entries: []SSMCacheEntry) void {
+    const g = nextSsmMemberGen();
+    for (entries) |*e| e.member_gen = g;
+}
+
+/// A cold write to a slot's entries (prefix-cache reset) must also leave the group,
+/// or a repack would resurrect the pre-reset row from the merged buffer.
+pub fn ssmDetachFromGroup(entries: []SSMCacheEntry) void {
+    for (entries) |*e| {
+        e.group = null;
+        e.group_row = 0;
+        e.group_layer = 0;
+    }
+    ssmBumpMemberGenEntries(entries);
+}
 
 const SsmPatchFields = packed struct {
     conv: bool = false,

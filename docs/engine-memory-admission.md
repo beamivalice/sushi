@@ -131,7 +131,7 @@ bill function's output on the committed fixture configs of all served packs: a b
   wait until most of the freed bytes left the wired set (`waitForUnwire`, bounded at 3 s), or the next preflight reads
   them as taken (45 GB free where 95 GB was a moment later).
 - **An MTP head rides the checkpoint's shards**: the bill adds nothing for it beyond the coarse rerank copy.
-- **A Flash-Next trellis trunk is billed as stored**: `qwenResidentWeightBytes` sums the shard headers, so a trellis
+- **A Flash-Next trellis trunk is billed as stored**: `residentWeightBytes` sums the shard headers, so a trellis
   projection's `trellis`, `suh` and `svh` replace the affine triple's bytes; stacked banks are held once (the stored
   ones leave the weight map). A trellis lm_head (`ResidentSplit.stq_head`) builds no coarse rerank copy, so that term
   leaves the Sushi bill; drafts read the head whole. A chunk past eight rows runs the sorted GEMM, whose prepared input

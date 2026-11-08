@@ -4,7 +4,6 @@ const trunk_helpers_test = @import("../trunk_helpers_test.zig");
 const nax_gate = @import("../nax_gate.zig");
 const ssm_cache = @import("../ssm_cache.zig");
 const std = @import("std");
-const qwen4_state = @import("qwen4_state.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
@@ -1319,7 +1318,6 @@ fn gdnGateExpectClose(got: mlx.mlx_array, want: mlx.mlx_array, gate_dt: mlx.mlx_
 }
 
 fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const s = mlx.gpuStream();
     gdn_prefill_fused_override = true;
     defer gdn_prefill_fused_override = null;
@@ -2174,7 +2172,6 @@ fn gdnRecurArms(xfm: *Trunk, la: *const LinearAttnWeights, chain: *SSMCacheEntry
 
 /// The gate is f32 at either width; `wide` selects the f32 state, else the bf16 state of `--qwen-gdn 16`.
 fn gdnRecurLayerCase(wide: bool, proj: GdnProjections) !void {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     if (proj != .dense) try mlx.requireGpu();
     const s = mlx.gpuStream();
     gdn_prework_override = true;
@@ -2436,7 +2433,6 @@ fn gdnDecayRun(xfm: *Trunk, la: *const LinearAttnWeights, route: GdnDecayRoute, 
 /// The gate is f32 either way. An f32 state forgets at the exact rate; a bf16 state rounds a slow head's
 /// decay away (its step is under half a bf16 ulp), so only the routes' agreement is asserted there.
 fn gdnDecayCase(state_f32: bool) !void {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
@@ -3746,7 +3742,6 @@ test "gdnBlockedEligible: width floor + exact-128 Dk + Dv/head-group alignment" 
 }
 
 test "gdn packed prework: bit-identical to the composed chain at decode and prefill widths incl. gate/beta + folded layout" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     try gdnPreworkCase(.bfloat16);
     try gdnPreworkCase(.float32);
@@ -3883,14 +3878,12 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
 }
 
 test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and verify widths; rollback to every row is serial decode" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     try gdnRecurLayerCase(false, .dense);
     try gdnRecurLayerCase(true, .dense);
 }
 
 test "trunk STQ: a GDN layer on trellis projections verifies bit-identically to serial decode at every width" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try gdnRecurLayerCase(true, .trellis);
     try gdnRecurLayerCase(true, .stacked);
 }
@@ -3899,7 +3892,6 @@ test "trunk STQ: a GDN layer on trellis projections verifies bit-identically to 
 const GdnProjections = enum { dense, trellis, stacked };
 
 test "gdn state f32: prefill, decode, a restored bf16 state and verify capture all store f32; rollback is serial decode" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
@@ -4001,7 +3993,6 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
 }
 
 test "gdn decay: at an f32 state and gate every route forgets at the exact rate; at --qwen-gdn 16 the routes agree" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     try gdnDecayCase(true);
     try gdnDecayCase(false);
@@ -4064,7 +4055,6 @@ test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity 
 }
 
 test "gdn gate at f32: compiled closure, graph chain and prework kernel agree far inside a bf16 step and carry the f32 width" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);

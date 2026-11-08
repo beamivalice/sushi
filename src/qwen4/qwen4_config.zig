@@ -1,6 +1,5 @@
 const std = @import("std");
 const expectError = @import("../test_expect.zig").expectError;
-const expert_quant = @import("../expert_quant.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -18,11 +17,6 @@ const qwen4CaseJson = model_mod.qwen4CaseJson;
 const setConfigOverrides = model_mod.setConfigOverrides;
 const streamingResidentSplit = model_mod.streamingResidentSplit;
 const testing = std.testing;
-
-/// A test that parses this arch's config needs the arch built (`-Darchs`).
-fn built() !void {
-    if (@import("../arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
-}
 
 /// One qwen4_exp integer bound, read strictly: wrong-typed or negative refuses.
 pub fn qwen4ConfigU64(cfg_obj: std.json.ObjectMap, key: []const u8) !?u64 {
@@ -295,100 +289,19 @@ fn yarnMscale(factor: f32) f32 {
     return 0.1 * @log(@as(f32, factor)) + 1.0;
 }
 
-pub fn qwen4StreamingWeightKey(layout: expert_quant.Layout, buf: []u8, key: []const u8) ?[]const u8 {
-    if (expert_quant.isRoutedExpertKey(layout, key)) return null;
-    if (layout == .mxfp4_split or layout == .mxfp4_individual) {
-        if (std.mem.startsWith(u8, key, "mtp.") or std.mem.startsWith(u8, key, "model.mtp.")) return null;
-        return key;
-    }
-    if (layout == .quantized_split or layout == .exl3_k4) return key;
-    const trunk_prefix = "model.language_model.";
-    if (std.mem.indexOf(u8, key, ".ple.ple_embedding.ngram_embedding.shard_") != null) return null;
-    if (std.mem.startsWith(u8, key, trunk_prefix)) {
-        return std.fmt.bufPrint(buf, "language_model.model.{s}", .{key[trunk_prefix.len..]}) catch null;
-    }
-    if (std.mem.startsWith(u8, key, "mtp.")) {
-        return std.fmt.bufPrint(buf, "language_model.mtp.{s}", .{key[4..]}) catch null;
-    }
-    if (std.mem.eql(u8, key, "lm_head.weight")) return "language_model.lm_head.weight";
-    return key;
-}
-
-pub fn qwen4NormFold(key: []const u8) bool {
-    const suffixes = [_][]const u8{
-        "hc_norm.weight",
-        "q_norm.weight",
-        "k_norm.weight",
-        "q_layernorm.weight",
-        "k_layernorm.weight",
-        "ple.norm_key.weight",
-        "ple.norm_query.weight",
-        "ple.norm_conv.weight",
-        "pre_fc_norm_embedding.weight",
-        "pre_fc_norm_hidden.weight",
-    };
-    for (suffixes) |suffix| if (std.mem.endsWith(u8, key, suffix)) return true;
-    return false;
-}
-
-pub fn qwen4FoldNorm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const one_f32 = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one_f32);
-    var one = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(one);
-    try mlx.check(mlx.mlx_astype(&one, one_f32, mlx.mlx_array_dtype(value), s));
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&result, value, one, s));
-    return result;
-}
-
-fn qwen4ConvShape(shape: []const c_int) !void {
-    if (shape.len != 3 or shape[1] != 1) return error.InvalidQwen4ConvShape;
-}
-
-pub fn qwen4TransposeConv(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    try qwen4ConvShape(mlx.getShape(value));
-    const axes = [_]c_int{ 0, 2, 1 };
-    var view = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(view);
-    try mlx.check(mlx.mlx_transpose_axes(&view, value, &axes, 3, s));
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_contiguous(&result, view, false, s));
-    return result;
-}
-
-pub fn qwen4SplitGateUp(value: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
-    const shape = mlx.getShape(value);
-    if (shape.len != 3 or shape[1] == 0 or @mod(shape[1], 2) != 0) return error.BadPackedGateUpShape;
-    const half = @divExact(shape[1], 2);
-    const strides = [_]c_int{ 1, 1, 1 };
-    var result = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-    errdefer {
-        for (result) |arr| _ = mlx.mlx_array_free(arr);
-    }
-    for (0..2) |i| {
-        const start = [_]c_int{ 0, @intCast(i * @as(usize, @intCast(half))), 0 };
-        const stop = [_]c_int{ shape[0], @intCast((i + 1) * @as(usize, @intCast(half))), shape[2] };
-        var view = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(view);
-        try mlx.check(mlx.mlx_slice(&view, value, &start, 3, &stop, 3, &strides, 3, s));
-        try mlx.check(mlx.mlx_contiguous(&result[i], view, false, s));
-    }
-    return result;
-}
+const streamingWeightKey = model_mod.streamingWeightKey;
+const fusedConvShape = model_mod.fusedConvShape;
 
 test "qwen4 convolution transform rejects a non-unit channel axis" {
-    try built();
-    try std.testing.expectError(error.InvalidQwen4ConvShape, qwen4ConvShape(&.{ 4, 2, 8 }));
-    try qwen4ConvShape(&.{ 4, 1, 8 });
+    try std.testing.expectError(error.InvalidFusedConvShape, fusedConvShape(&.{ 4, 2, 8 }));
+    try fusedConvShape(&.{ 4, 1, 8 });
 }
 
 test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048576" {
-    try built();
     const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
     try testing.expect(c.isQwen4());
     // The scaling is recognised and lands where the engine reads it —
-    // transformer.yarnSpec() consumes exactly these fields.
+    // trunk.yarnSpec() consumes exactly these fields.
     try testing.expect(c.rope_yarn);
     try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-9);
     try testing.expectEqual(@as(u32, 262_144), c.yarn_orig_max_pos);
@@ -421,7 +334,6 @@ test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048
 }
 
 test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connection, PLE, QSA and text-config eos fields" {
-    try built();
     const json =
         \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
         \\ "text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
@@ -459,7 +371,6 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
 }
 
 test "parseConfigFromJson accepts dense qwen4 as an expert streaming architecture" {
-    try built();
     const json =
         \\{"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"full_attention_interval":4,"num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"ple_layer_ids":[2],"ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}
     ;
@@ -469,7 +380,6 @@ test "parseConfigFromJson accepts dense qwen4 as an expert streaming architectur
 }
 
 test "expert streaming is a capability of every qwen4 pack and required only by the dense one" {
-    try built();
     const t = std.testing;
     const dense =
         \\{"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"full_attention_interval":4,"num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"ple_layer_ids":[2],"ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}
@@ -489,42 +399,39 @@ test "expert streaming is a capability of every qwen4 pack and required only by 
 }
 
 test "qwen4 streaming loader canonicalizes resident keys and excludes disk tensors" {
-    try built();
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("language_model.model.layers.7.mlp.gate.weight", qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.gate.weight").?);
-    try std.testing.expectEqualStrings("language_model.mtp.fc_hidden.weight", qwen4StreamingWeightKey(.bf16_fused, &buf, "mtp.fc_hidden.weight").?);
-    try std.testing.expectEqualStrings("language_model.lm_head.weight", qwen4StreamingWeightKey(.bf16_fused, &buf, "lm_head.weight").?);
-    try std.testing.expect(qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.experts.gate_up_proj") == null);
-    try std.testing.expect(qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.experts.down_proj") == null);
-    try std.testing.expect(qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_12.weight") == null);
+    try std.testing.expectEqualStrings("language_model.model.layers.7.mlp.gate.weight", streamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.gate.weight").?);
+    try std.testing.expectEqualStrings("language_model.mtp.fc_hidden.weight", streamingWeightKey(.bf16_fused, &buf, "mtp.fc_hidden.weight").?);
+    try std.testing.expectEqualStrings("language_model.lm_head.weight", streamingWeightKey(.bf16_fused, &buf, "lm_head.weight").?);
+    try std.testing.expect(streamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.experts.gate_up_proj") == null);
+    try std.testing.expect(streamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.experts.down_proj") == null);
+    try std.testing.expect(streamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_12.weight") == null);
 }
 
 test "the quantized streaming loader drops the nine routed banks and keeps everything else" {
-    try built();
     var buf: [256]u8 = undefined;
     for ([_][]const u8{ "weight", "scales", "biases" }) |part| {
         for ([_][]const u8{ "gate", "up", "down" }) |proj| {
             var key_buf: [192]u8 = undefined;
             const key = try std.fmt.bufPrint(&key_buf, "language_model.model.layers.7.mlp.switch_mlp.{s}_proj.{s}", .{ proj, part });
-            try std.testing.expect(qwen4StreamingWeightKey(.quantized_split, &buf, key) == null);
+            try std.testing.expect(streamingWeightKey(.quantized_split, &buf, key) == null);
         }
     }
     try std.testing.expectEqualStrings(
         "language_model.model.layers.7.mlp.shared_expert.gate_proj.scales",
-        qwen4StreamingWeightKey(.quantized_split, &buf, "language_model.model.layers.7.mlp.shared_expert.gate_proj.scales").?,
+        streamingWeightKey(.quantized_split, &buf, "language_model.model.layers.7.mlp.shared_expert.gate_proj.scales").?,
     );
     try std.testing.expectEqualStrings(
         "language_model.model.layers.7.mlp.gate.weight",
-        qwen4StreamingWeightKey(.quantized_split, &buf, "language_model.model.layers.7.mlp.gate.weight").?,
+        streamingWeightKey(.quantized_split, &buf, "language_model.model.layers.7.mlp.gate.weight").?,
     );
     try std.testing.expectEqualStrings(
         "language_model.lm_head.weight",
-        qwen4StreamingWeightKey(.quantized_split, &buf, "language_model.lm_head.weight").?,
+        streamingWeightKey(.quantized_split, &buf, "language_model.lm_head.weight").?,
     );
 }
 
 test "qwen4 streaming loader materializes only transformed resident tensors" {
-    try built();
     const t = std.testing;
     const io = t.io;
     const allocator = t.allocator;
@@ -558,7 +465,6 @@ test "qwen4 streaming loader materializes only transformed resident tensors" {
 }
 
 test "qwen4 streaming resident byte estimate excludes experts PLE and vision" {
-    try built();
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{ .iterate = true });
@@ -579,7 +485,6 @@ test "qwen4 streaming resident byte estimate excludes experts PLE and vision" {
 }
 
 test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower, M-RoPE and vision token ids" {
-    try built();
     const json =
         \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
         \\ "image_token_id":248056,"video_token_id":248057,"vision_start_token_id":248053,"vision_end_token_id":248054,
@@ -614,7 +519,6 @@ test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower
 }
 
 test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched" {
-    try built();
     // The regression guard for every checkpoint that predates the extension:
     // no YaRN, and `contextCap` is just max_position_embeddings, so no server
     // sizing path can shift for a model that did not ask to be scaled.
@@ -634,7 +538,6 @@ test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched"
 }
 
 test "parseConfigFromJson: YaRN reads beta_fast/beta_slow/truncate and honours a pinned mscale" {
-    try built();
     defer setConfigOverrides(null);
     // HF's `attention_factor` REPLACES the computed 0.1·ln(factor)+1.
     setConfigOverrides(
@@ -681,7 +584,6 @@ test "parseConfigFromJson: YaRN reads beta_fast/beta_slow/truncate and honours a
 }
 
 test "parseConfigFromJson: YaRN derives factor from the window when the block omits it (HF)" {
-    try built();
     defer setConfigOverrides(null);
     // HF: `factor = max_position_embeddings / original_max_position_embeddings`
     // when the block names only the window. Here the override widens the
@@ -698,7 +600,6 @@ test "parseConfigFromJson: YaRN derives factor from the window when the block om
 }
 
 test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fails the load" {
-    try built();
     defer setConfigOverrides(null);
     // The ramp bounds come from `original_max_position_embeddings`. Without it
     // every blended frequency is a guess — refuse the load rather than serve a
@@ -722,7 +623,6 @@ test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fa
 }
 
 test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load error" {
-    try built();
     const good = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
     try testing.expectEqual(@as(u32, 3), good.ngram_size);
     try testing.expectEqual(@as(u32, 8), good.heads_per_ngram);
@@ -750,7 +650,6 @@ test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load er
 }
 
 test "qwen4_exp config: trunk_quant names the STQ codebook the stored trellis trunk decodes with" {
-    try built();
     const doc = qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"trunk_quant\":{\"format\":\"stq\",\"k\":6,\"codebook\":\"spec1\",\"window\":15," ++
         "\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"}");
     const c = try parseConfigFromJson(testing.allocator, doc);
@@ -769,7 +668,6 @@ test "qwen4_exp config: trunk_quant names the STQ codebook the stored trellis tr
 }
 
 test "n-gram head count overflow is refused by the config" {
-    try built();
     try expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":2147483656"),
@@ -777,7 +675,6 @@ test "n-gram head count overflow is refused by the config" {
 }
 
 test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a silent default" {
-    try built();
     try expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":-1"),
@@ -797,7 +694,6 @@ test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a si
 }
 
 test "qwen4_exp config: an armed QSA indexer must carry a usable budget and ratio" {
-    try built();
     try expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048"),
@@ -819,7 +715,6 @@ test "qwen4_exp config: an armed QSA indexer must carry a usable budget and rati
 }
 
 test "qwen4_exp config: the PLE layer id must name exactly one layer that exists" {
-    try built();
     try expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ngram_size\":3"),
@@ -849,7 +744,6 @@ test "qwen4_exp config: the PLE layer id must name exactly one layer that exists
 }
 
 test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the configured layer" {
-    try built();
     try testing.expect(qwen4PleInstalledAt(&.{ false, true, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ false, false, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ true, true, false, false }, 1));
@@ -866,7 +760,6 @@ test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the c
 }
 
 test "the n-gram table source: the bf16 override outranks streaming, streaming outranks the pack table" {
-    try built();
     var c = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "language_model.model" };
     try std.testing.expectEqual(ModelConfig.NgramTableSource.quantized, c.ngramTableSource());
     c.expert_streaming = true;
@@ -882,7 +775,6 @@ test "the n-gram table source: the bf16 override outranks streaming, streaming o
 }
 
 test "qwen4_exp config: a geometry the forward divides by or indexes with is a named error" {
-    try built();
     const t = testing;
     const base = "\"model_type\":\"qwen4_exp\",\"hidden_size\":2560,\"num_hidden_layers\":48,\"head_dim\":256," ++
         "\"hc_count\":4,\"hc_lowrank\":320,\"ple_embed_dim\":2560,\"moe_intermediate_size\":640," ++
@@ -898,7 +790,6 @@ test "qwen4_exp config: a geometry the forward divides by or indexes with is a n
 }
 
 test "qwen4PleInstalledAt accepts the MTP head's deliberate -1 and still refuses a stray PLE" {
-    try built();
     try testing.expect(qwen4PleInstalledAt(&.{false}, -1));
     try testing.expect(!qwen4PleInstalledAt(&.{true}, -1));
 }

@@ -39,10 +39,10 @@ joins `DROPPABLE` when its drop passes. `dsv41` is in the list.
   warmup scaffold) plus the arch's own state, which lives in `src/<arch>/<arch>_state.zig` (load, `deinit`, cache
   reset). `Trunk.deinit`, `resetCache` and `warmup` are `model_handle.zig` operations that dispatch to the arch, which
   frees or resets its own state and then calls the trunk's `deinitTrunk` / `resetTrunk` / `warmupTrunk`.
-  `Transformer` is an alias of `Trunk`. `transformer.zig` is down to the qwen4 names that the prefix cache, the SSD
-  tier, the scheduler's admission, `generate.zig`, `model.zig`, `main.zig` and `arch/sched.zig` still reach with no
-  arch hook (the QSA history, the SSM member generation, the gather floor, the env warm-up); each leaves with its hook
-  in S4-qwen4, and the file with the last. No `Trunk` field names an arch, and `trunk.zig` re-exports no arch module's names; MiMo's three
+  The QSA history the prefix cache and the SSD tier keep on SSM entries and checkpoints is `arch/prefix.zig`'s `aux`;
+  the kernel arms shared code sizes by (the batched gather admission caps a batch's KV by, a slot's score bank, the
+  env reads warmed at startup, the diagnostic MoE stand-ins) are `arch/kernels.zig`, asked by the config's arch (the
+  stand-ins and env reads by every built arch). No `Trunk` field names an arch, and `trunk.zig` re-exports no arch module's names; MiMo's three
   `ForwardCtx` fields (`verify_rows`, `batch_rows`, `batch_row_offsets`) are the last to move into `arch_ctx`.
 - **The trunk archs' hooks.** `initTrunk` fills the state last, through `arch_state.initState`: the config's arch's
   `State.init` gets `InitArgs` (allocator, config, weights, name prefix, stream, the trunk's owned arrays) and returns
@@ -54,20 +54,21 @@ joins `DROPPABLE` when its drop passes. `dsv41` is in the list.
   every trunk for every built arch, comptime-unrolled, each acting on that trunk's own state (empty state: nothing to
   do): `compile` (`.gates` for the offline tools, `.all` for the server), `applyHeadKvQuant`, `buildDraftRerank`,
   `draftShortlists`, `markHeadCheckpoint`, `markTablesStale` / `resetTables`, `releaseGroup` / `dropGroup`,
-  `flushDeferred` / `flushDeferredGroup` / `discardDeferred`. A `Ctx` may declare `mrope` / `setMrope` (the
-  request's M-RoPE table, `arch_state.mropeOf`) and `logMeters`. `ForwardCtx.lazy_ids` marks ids that are still a lazy
+  `flushDeferred` / `flushDeferredGroup` / `discardDeferred`, `verifyRowsGrouped` / `forwardVerifyRowsGrouped` (one
+  grouped forward over several verify rows). A `Ctx` may declare `mrope` / `setMrope` (the request's M-RoPE table,
+  `arch_state.mropeOf`), `setLayerCapture` (a layer-at-a-time capture's input stream) and `logMeters`. `ForwardCtx.lazy_ids` marks ids that are still a lazy
   sample: an arch's host-side lookup on them waits for `flushDeferred`. A config fact in `Facts` replaces an arch
   predicate in shared code (`hyper_connected`: no per-layer norms, hyper-connection and PLE weights per layer).
 - **An arch's own state rides two registry-built fields.** `Trunk.arch_state` and `ForwardCtx.arch_ctx`
   (`src/arch/arch_state.zig`) are structs with a field per enabled arch: the `State` and `Ctx` its `arch.zig` declares,
   void where it declares none, each default-initialised so a context built by hand needs no arch field. An arch's S3
   stage moves its `Trunk` and `ForwardCtx` fields into them; a build without the arch has none. A `State` may declare
-  `init`, `ctx` (the default context's part), `runsOwnModel`, `sharesReadonly`, `specRollsBack`, `rawEmbedding`,
-  `headShortlist` and `clearCompiled`, which `arch_state.zig` asks generically; shared code that needs one arch's
-  state goes through that arch's accessors (`glm5_state.modelOf`, `requestOf`, `dsv41_state.modelOf`,
-  `mimo2_state.coarseHead`, `qwen4_state.isLoaded`, `mtpOf`, `stateOf`, `ctxOf`), which are null in a build without
-  it. While shared files still import an arch's folder, a build without the arch analyses it: a folder test that
-  reaches the arch's state opens with `if (comptime !<arch>_state.built) return error.SkipZigTest;`. A `prefix` module may declare
+  `init`, `ctx` (the default context's part), `runsOwnModel`, `sharesReadonly`, `specRollsBack`, `rowVerify` (the
+  trunk's row-verify kernels and per-row rollback), `headCache` / `headEntry` (an MTP head riding the trunk),
+  `rawEmbedding`, `headShortlist` and `clearCompiled`, which `arch_state.zig` asks generically; shared code that needs
+  one arch's state goes through that arch's accessors (`glm5_state.modelOf`, `requestOf`, `dsv41_state.modelOf`,
+  `mimo2_state.coarseHead`). No shared file imports an arch's folder, so a build without the arch never analyses it
+  and a folder test needs no skip for it. A `prefix` module may declare
   `diskLayoutKey`, the arch's own SSD namespace key (DeepSeek names its drop list and arms there; `arch/prefix.zig` asks
   it, and the config's tag is the fallback). The request a slot owns beside its KV cache is `arch_state.SlotRequest`,
   the type of the one `Ctx.request` a built arch declares (`NoRequest` when none does). A moved field leaves `Trunk` in
@@ -104,7 +105,8 @@ joins `DROPPABLE` when its drop passes. `dsv41` is in the list.
   rows and disk sections: [engine-prefix-cache](engine-prefix-cache.md#arch-seam)), `sched` (what the scheduler asks of
   an arch: [server-lifecycle](server-lifecycle.md#scheduler-and-batching)), `moe` (the MoE family's routing hooks), `load` (an
   arch's own weights loader, what it keeps resident, a head allocated beside the trunk, the load-time build and spec
-  warmup), and `spec` (the config side: `Spec`, the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU
+  warmup, the verify warm-up, the PLE placement check, the key map and norm folds of a native fused BF16 checkpoint the
+  streamed loader reads), `kernels` (the kernel arms shared code sizes by), and `spec` (the config side: `Spec`, the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU
   graphs do not change.
 - **The engine holds a handle, not a trunk.** `LoadedModel.handle` is `arch/handle.zig`'s `Handle` (the registry's
   `Arch` union), and every read the engine makes of a loaded model goes through that file: `trunk(h)` (the engine state
@@ -112,8 +114,9 @@ joins `DROPPABLE` when its drop passes. `dsv41` is in the list.
   `stream`, `config`, `ownsModuleDecodeState`, `moduleSpecWiring`, `moduleStateSpecRollback`, `logitBias`,
   `flushImatrix`. Each is one switch on the tag; a test fixture stores `handleOf(&trunk)`.
 - A trunk rule one arch keeps is a `Facts` flag on its config (`residual_from_embedding`, `moe_scores_f32`,
-  `qkv_split_rows`, `bias_routed_moe`), read with `arch_config.fact`; a pack layout fact is a hook
-  (`trailingPackLayers`). An arch's committed test configs live in its chat face's `fixtures` (MLX-free): a shared test
+  `qkv_split_rows`, `bias_routed_moe`), read with `arch_config.fact`. Where a pack keeps its routed experts (key
+  prefix, stamped shards, the head's layer, rate groups) is `pack_layout` (`arch_config.PackLayout`, read by
+  `pack_index`'s preflight), its trailing head layers the `trailingPackLayers` hook. An arch's committed test configs live in its chat face's `fixtures` (MLX-free): a shared test
   reads one with `arch_config.fixtureConfig(name)` (null when the build left it out), and the config pins take each
   arch's `fixtures.config_pins`. Its microbenches are `ubench` in its `arch.zig`, which `sushi-ubench` lists.
 - `-Darchs=<a,b,...>` (default: every registered arch) builds `Tag`, `Spec` and `Arch` from the listed archs. An
@@ -207,7 +210,7 @@ folder. `DROP_TRY=<arch>` runs the same check for an arch not in the list (a str
 `DROP_KEEP=1` keeps the worktree.
 
 CI runs it on every PR as a step of the build-and-test job, after the test tier, on the runner and build that job
-already set up; the loop covers every arch in `DROPPABLE` (mimo2, dsv41 and glm5 today).
+already set up; the loop covers every arch in `DROPPABLE` (mimo2, dsv41, glm5 and qwen4 today).
 
 `zig build arch-slice -Dslice-arch=<name>` is the quick form of the same question, for the arch's own folder: it compiles
 `src/<name>/arch.zig` as a module of its own, with `build_options`, `sushi_exl3` and `arch_host` (here
@@ -226,6 +229,8 @@ A drop is one commit that removes:
 - what `build.zig` still names for the arch (`test_dirs`, `TestModel`) until
   those leave the shared files; its test lists leave with its `arch_tests.zig` and registry line, and `src/tests.zig` and `src/tests_host.zig`
   name no arch folder;
+- its sections of `src/fixtures/model-configs/parsed.pins`: the pins test skips a case whose arch is not built, so they
+  stay behind as dead entries;
 - `tests/<arch>/`, its rows in `tests/CLAUDE.md`, its pack-tier env in [testsuite](testsuite.md);
 - `docs/<arch>-*.md` and their rows in CLAUDE.md's docs index and [source-map](source-map.md); its rows in
   [usage](usage.md), [flags](flags.md), [envvar](envvar.md) and its [pack-format](pack-format.md) section

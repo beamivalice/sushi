@@ -1,6 +1,7 @@
 const trunk_mod = @import("../trunk.zig");
+const ssm_cache = @import("../ssm_cache.zig");
+const mlx_util = @import("../mlx_util.zig");
 const std = @import("std");
-const qwen4_state = @import("qwen4_state.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const arch_registry = @import("../arch/registry.zig");
@@ -33,11 +34,9 @@ const ssmUnbindAll = trunk_mod.ssmUnbindAll;
 const ssmUnbindEntries = trunk_mod.ssmUnbindEntries;
 
 
-var ssm_member_gen_src: std.atomic.Value(u64) = .init(1);
-
-pub fn nextSsmMemberGen() u64 {
-    return ssm_member_gen_src.fetchAdd(1, .monotonic);
-}
+pub const nextSsmMemberGen = ssm_cache.nextSsmMemberGen;
+const ssmBumpMemberGenEntries = ssm_cache.ssmBumpMemberGenEntries;
+const ssmDetachFromGroup = ssm_cache.ssmDetachFromGroup;
 
 const SsmGroupMember = struct {
     key: usize,
@@ -45,14 +44,7 @@ const SsmGroupMember = struct {
     entries: []SSMCacheEntry,
 };
 
-pub fn ssmConcatAxis0(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
-    const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
-    return out;
-}
+pub const ssmConcatAxis0 = mlx_util.concatAxis0;
 
 pub fn ssmMergeLayer(s: mlx.mlx_stream, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !SSMCacheEntry {
     // The qwen4 PLE layer's dilated-conv window is merged like the SSM state.
@@ -178,22 +170,6 @@ pub fn ssmBumpMemberGen(ctx: *ForwardCtx) void {
     if (ctx.ssm_entries) |entries| {
         for (entries) |*e| e.member_gen = g;
     }
-}
-
-pub fn ssmBumpMemberGenEntries(entries: []SSMCacheEntry) void {
-    const g = nextSsmMemberGen();
-    for (entries) |*e| e.member_gen = g;
-}
-
-/// A cold write to a slot's entries (prefix-cache reset) must also leave the group,
-/// or a repack would resurrect the pre-reset row from the merged buffer.
-pub fn ssmDetachFromGroup(entries: []SSMCacheEntry) void {
-    for (entries) |*e| {
-        e.group = null;
-        e.group_row = 0;
-        e.group_layer = 0;
-    }
-    ssmBumpMemberGenEntries(entries);
 }
 
 /// Hands a row back to its slot as an owned, evaluated array and bumps the
@@ -621,6 +597,8 @@ fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Tr
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.persistent_group_state_override = persist;
+    xfm.consts = null;
+    xfm.arch_state = .{};
     xfm.arch_state.qwen4.ssm_group = .{ .allocator = alloc };
     return xfm;
 }
@@ -726,7 +704,6 @@ pub fn ssmBindBatched(self: *Trunk, ctxs: []const *ForwardCtx, kinds: []const Ss
 }
 
 test "persistent group: N=4 stable ticks issue zero merge/split ops after the first" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -888,7 +865,6 @@ test "persistent group: join leave cancel capture snapshot rollback restore matc
 }
 
 test "persistent group: merge/split op counts at N=2/4/8 after the first tick are zero" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -927,7 +903,6 @@ test "persistent group: merge/split op counts at N=2/4/8 after the first tick ar
 }
 
 test "persistent group: drop a member does not free kinds the adopt still reads" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -957,7 +932,6 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
 }
 
 test "persistent group: a solo tick after N=2 batched ticks matches the old path" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1000,7 +974,6 @@ test "persistent group: a solo tick after N=2 batched ticks matches the old path
 }
 
 test "persistent group: PLE-only rollback patches the group window" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1044,7 +1017,6 @@ test "persistent group: PLE-only rollback patches the group window" {
 }
 
 test "persistent group: single-capture rollback does not write a stale sibling" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1094,7 +1066,6 @@ test "persistent group: single-capture rollback does not write a stale sibling" 
 }
 
 test "persistent group: snapshot is an owned row and survives departure" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1136,7 +1107,6 @@ test "persistent group: snapshot is an owned row and survives departure" {
 }
 
 test "persistent group: allocator failure before a replacement descriptor keeps the old group" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1165,7 +1135,6 @@ test "persistent group: allocator failure before a replacement descriptor keeps 
 }
 
 test "persistent group: cancel keeps the row until the next membership freeze" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1209,7 +1178,6 @@ test "persistent group: cancel keeps the row until the next membership freeze" {
 }
 
 test "persistent group: unload then slot-address reuse does not match the dead group" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1238,7 +1206,6 @@ test "persistent group: unload then slot-address reuse does not match the dead g
 }
 
 test "persistent group: resetSsmEntries departure is not resurrected from the merged buffer" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1276,7 +1243,6 @@ test "persistent group: resetSsmEntries departure is not resurrected from the me
 }
 
 test "persistent group: export then a failed repack invalidates matches" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1302,7 +1268,6 @@ test "persistent group: export then a failed repack invalidates matches" {
 }
 
 test "persistent group: drop failure exports survivor rows" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1332,7 +1297,6 @@ test "persistent group: drop failure exports survivor rows" {
 }
 
 test "persistent group: a full-width group repacks when a member leaves" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1356,7 +1320,6 @@ test "persistent group: a full-width group repacks when a member leaves" {
 }
 
 test "persistent group: a qwen4 forwardWith releases a bound member between batched ticks" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const tag = arch_registry.ofModelType("qwen4_exp") orelse return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -1412,7 +1375,6 @@ test "persistent group: a qwen4 forwardWith releases a bound member between batc
 }
 
 test "persistent group: a row remap between bind and rollback matches the old path" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();

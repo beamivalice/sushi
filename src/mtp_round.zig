@@ -1,6 +1,5 @@
 const std = @import("std");
 const depth_bounds = @import("mtp_depth_bounds.zig");
-const expectError = @import("test_expect.zig").expectError;
 const generate_mod = @import("generate.zig");
 const spec_types = @import("spec_types.zig");
 const mtp_policy = @import("mtp_policy.zig");
@@ -22,14 +21,12 @@ const DrafterStepResult = Generator.DrafterStepResult;
 const ForwardCtx = model_handle.ForwardCtx;
 const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
-const MtpCacheRef = generate_mod.MtpCacheRef;
 const MTP_EV_WARMUP_ROUNDS = mtp_policy.MTP_EV_WARMUP_ROUNDS;
 const MtpCostSource = mtp_policy.MtpCostSource;
 const MtpRoundPlan = mtp_policy.MtpRoundPlan;
 const SubLap = mtp_policy.SubLap;
 const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
-const qwen4_state = @import("qwen4/qwen4_state.zig");
 const isEosId = spec_types.isEosId;
 const mtpAdaptiveEnabled = Generator.mtpAdaptiveEnabled;
 const mtpAdaptiveSerialEnabled = Generator.mtpAdaptiveSerialEnabled;
@@ -1670,7 +1667,7 @@ pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) 
         ctxs[i] = &gen.ctx;
     }
     var rollback: [MTP_GROUP_ROWS_MAX]Trunk.VerifyRollback = undefined;
-    const retain_rollback = n > 1 and qwen4_state.isLoaded(xfm);
+    const retain_rollback = n > 1 and arch_state.rowVerify(&xfm.arch_state);
     for (gens, states) |gen, st| st.verify_ctx = &gen.ctx;
     var row_ns: [MTP_GROUP_ROWS_MAX]u64 = undefined;
     var tracing_any = false;
@@ -2908,47 +2905,6 @@ test "batched MTP draft rows stop without touching inactive generators" {
     try Generator.mtpChainBuildBatched(&ptrs, &chains, 4, 9);
     try testing.expectEqual(@as(u32, 4), chains[0].n_drafted);
     try testing.expectEqual(@as(u32, 1), chains[1].n_drafted);
-}
-
-test "MTP continuation releases its owned chain when drafting fails" {
-    if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
-    const allocator = testing.allocator;
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    var xfm: Trunk = undefined;
-    xfm.s = s;
-    xfm.arch_state = .{};
-    var state: @import("qwen4/qwen4_forward.zig").Qwen4MtpState = undefined;
-    var gen: Generator = undefined;
-    gen.xfm = &xfm;
-    gen.mtp = MtpHeadRef.of("qwen4", &xfm);
-    gen.mtp_cache = MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &state, .allocator = allocator });
-    gen.sampling = .{ .temperature = 0 };
-    gen.ctx.arch_ctx = .{};
-    gen.mtp_hist_stash = null;
-    gen.last_hidden = .{ .ctx = null };
-    const chain: MtpPreDraft = .{
-        .plan = .{ .m_lo = 1, .m_hi = 2, .tau_ln = 0 },
-        .off0 = 0,
-        .t1 = 1,
-        .t1_arr = mlx.mlx_array_new(),
-        .drafts = try allocator.alloc(u32, 2),
-        .draft_arrs = undefined,
-        .n_drafted = 0,
-        .conf_arrs = try allocator.alloc(mlx.mlx_array, 1),
-        .n_conf = 0,
-        .q_probs = try allocator.alloc(mlx.mlx_array, 2),
-        .n_qp = 0,
-        .h_chain = null,
-        .m = 1,
-    };
-    const open: MtpRoundOpen = .{
-        .chain = chain,
-        .tracing = false,
-        .ph = undefined,
-        .round_watch = undefined,
-    };
-    try expectError(error.NoMtpHead, gen.mtpRoundContinue(allocator, open));
 }
 
 test "MTP commit stops before an accepted EOS and keeps EOS pending" {

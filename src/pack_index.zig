@@ -55,12 +55,12 @@ pub fn readFileAlloc(
     limit: usize,
 ) ![]u8 {
     const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch
-        return error.MimoSourceFileMissing;
+        return error.PackSourceFileMissing;
     defer file.close(io);
     var read_buf: [8192]u8 = undefined;
     var reader = file.reader(io, &read_buf);
     return reader.interface.allocRemaining(allocator, .limited(limit)) catch
-        return error.MimoSourceRead;
+        return error.PackSourceRead;
 }
 
 pub fn preadExact(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
@@ -74,7 +74,7 @@ pub fn preadExact(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
         );
         if (got < 0) {
             if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
-            return error.MimoSourceRead;
+            return error.PackSourceRead;
         }
         if (got == 0) return error.SafetensorsUnexpectedEof;
         done += @intCast(got);
@@ -98,7 +98,7 @@ pub fn readShardHeader(
     const path = try shardPath(allocator, model_dir, file);
     defer allocator.free(path);
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.MissingMimoShard;
+    if (fd < 0) return error.MissingPackShard;
     defer _ = std.c.close(fd);
 
     var header_len_bytes: [8]u8 = undefined;
@@ -179,7 +179,7 @@ pub fn parseTensorMeta(
 
 pub fn loadSourceIndex(io: std.Io, allocator: Allocator, model_dir: []const u8) !SourceIndex {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir))
-        return error.InvalidMimoModelPath;
+        return error.InvalidPackModelPath;
 
     const index_path = try std.fmt.allocPrint(
         allocator,
@@ -301,12 +301,12 @@ pub fn shapeProduct(shape: []const u64) !u64 {
 }
 
 pub fn payloadBytes(meta: TensorMeta, expected_dtype: ?DType) !u64 {
-    if (expected_dtype) |want| if (meta.dtype != want) return error.MimoTensorDtypeMismatch;
+    if (expected_dtype) |want| if (meta.dtype != want) return error.PackTensorDtypeMismatch;
     const elem_size: u64 = switch (meta.dtype) {
         .bf16, .f16, .u16 => 2,
         .f32, .u32 => 4,
         .fp8_e4m3 => 1,
-        .unknown => return error.UnsupportedMimoTensorDtype,
+        .unknown => return error.UnsupportedPackTensorDtype,
     };
     const want = std.math.mul(u64, try shapeProduct(meta.shape), elem_size) catch
         return error.SafetensorsShapeOverflow;
@@ -317,9 +317,10 @@ pub fn payloadBytes(meta: TensorMeta, expected_dtype: ?DType) !u64 {
 pub fn validateExl3Layer(source: *const SourceIndex, allocator: Allocator, config: *const model.ModelConfig, layer_prefix: []const u8) !@import("sushi_exl3").GroupLayout {
     var plan = @import("sushi_exl3").GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
     plan.rates = config.expert_quant_rates;
-    plan.streams_groups = config.isQwen4();
+    const layout = arch_config.packLayout(config);
+    plan.streams_groups = layout.streams_groups;
     const prefix = try std.fmt.allocPrint(allocator, "{s}.mlp.switch_mlp.", .{layer_prefix});
-    const router = source.tensors.get(try std.fmt.allocPrint(allocator, "{s}.mlp.gate.weight", .{layer_prefix})) orelse return error.MissingMimoRequiredTensor;
+    const router = source.tensors.get(try std.fmt.allocPrint(allocator, "{s}.mlp.gate.weight", .{layer_prefix})) orelse return error.MissingPackRequiredTensor;
     if (router.shape.len != 2 or router.shape[0] > std.math.maxInt(u32)) return error.Exl3RouterWidthMismatch;
     var it = source.tensors.iterator();
     while (it.next()) |entry| {
@@ -334,7 +335,7 @@ pub fn validateExl3Layer(source: *const SourceIndex, allocator: Allocator, confi
     }
     try plan.finish(@intCast(router.shape[0]), config.num_experts_per_tok, config.expert_streaming, config.num_experts);
     if (config.moe_n_group > 1 and (plan.grouped.? or router.shape[0] != config.num_experts)) return error.Exl3RouterGroupsUnsupported;
-    if (plan.grouped.? and config.isGlm5()) return error.Exl3RateGroupsUnsupported;
+    if (plan.grouped.? and layout.refuses_rate_groups) return error.Exl3RateGroupsUnsupported;
     return plan;
 }
 
@@ -474,151 +475,47 @@ pub fn validateExl3Pack(io: std.Io, allocator: Allocator, model_dir: []const u8,
 }
 
 pub fn validateExl3Source(source: *const SourceIndex, alloc: Allocator, config: *const model.ModelConfig) !void {
-    const mimo = config.isMimo();
-    const language_model = config.isGlm5();
-    if (mimo or language_model) try validateShardStamps(source, config);
-    const prefix = if (language_model) "model.language_model" else if (mimo) "model" else "language_model.model";
+    const layout = arch_config.packLayout(config);
+    if (layout.stamped) try validateShardStamps(source, config);
+    const prefix = layout.prefix;
     for (config.first_k_dense_replace..config.num_hidden_layers) |layer| {
         const base = try std.fmt.allocPrint(alloc, "{s}.layers.{d}", .{ prefix, layer });
         _ = try validateExl3Layer(source, alloc, config, base);
     }
-    if (language_model) {
-        // Its MTP layers follow the trunk's under the same prefix.
-        const layer_end = @as(u64, config.num_hidden_layers) + arch_config.trailingPackLayers(config);
-        var keys = source.tensors.keyIterator();
-        const start = "model.language_model.layers.";
-        while (keys.next()) |key| {
-            if (!std.mem.startsWith(u8, key.*, start) or std.mem.indexOf(u8, key.*, ".mlp.switch_mlp.") == null) continue;
-            const rest = key.*[start.len..];
-            const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.MimoLayerOutOfRange;
-            const layer = std.fmt.parseInt(u32, rest[0..dot], 10) catch return error.MimoLayerOutOfRange;
-            if (layer < config.first_k_dense_replace or @as(u64, layer) >= layer_end) return error.MimoLayerOutOfRange;
-        }
-        for (config.num_hidden_layers..@intCast(layer_end)) |layer| {
-            const base = try std.fmt.allocPrint(alloc, "{s}.layers.{d}", .{ prefix, layer });
-            const probe = try std.fmt.allocPrint(alloc, "{s}.mlp.switch_mlp.", .{base});
-            var parts = source.tensors.keyIterator();
-            while (parts.next()) |key| {
+    switch (layout.head) {
+        .none => {},
+        .trailing => {
+            const layer_end = @as(u64, config.num_hidden_layers) + arch_config.trailingPackLayers(config);
+            var keys = source.tensors.keyIterator();
+            const start = try std.fmt.allocPrint(alloc, "{s}.layers.", .{prefix});
+            while (keys.next()) |key| {
+                if (!std.mem.startsWith(u8, key.*, start) or std.mem.indexOf(u8, key.*, ".mlp.switch_mlp.") == null) continue;
+                const rest = key.*[start.len..];
+                const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.PackLayerOutOfRange;
+                const layer = std.fmt.parseInt(u32, rest[0..dot], 10) catch return error.PackLayerOutOfRange;
+                if (layer < config.first_k_dense_replace or @as(u64, layer) >= layer_end) return error.PackLayerOutOfRange;
+            }
+            for (config.num_hidden_layers..@intCast(layer_end)) |layer| {
+                const base = try std.fmt.allocPrint(alloc, "{s}.layers.{d}", .{ prefix, layer });
+                const probe = try std.fmt.allocPrint(alloc, "{s}.mlp.switch_mlp.", .{base});
+                var parts = source.tensors.keyIterator();
+                while (parts.next()) |key| {
+                    if (std.mem.startsWith(u8, key.*, probe)) {
+                        _ = try validateExl3Layer(source, alloc, config, base);
+                        break;
+                    }
+                }
+            }
+        },
+        .layer => |head| {
+            const probe = try std.fmt.allocPrint(alloc, "{s}.", .{head});
+            var it = source.tensors.keyIterator();
+            while (it.next()) |key| {
                 if (std.mem.startsWith(u8, key.*, probe)) {
-                    _ = try validateExl3Layer(source, alloc, config, base);
+                    _ = try validateExl3Layer(source, alloc, config, head);
                     break;
                 }
             }
-        }
-    } else if (!mimo) {
-        var it = source.tensors.keyIterator();
-        while (it.next()) |key| {
-            if (std.mem.startsWith(u8, key.*, "language_model.mtp.layers.0.")) {
-                _ = try validateExl3Layer(source, alloc, config, "language_model.mtp.layers.0");
-                break;
-            }
-        }
+        },
     }
-}
-
-/// A two-group Flash-Next pack: trunk layers 0 and 1, then the MTP head, with a router `layer_experts[i]` wide each.
-pub fn writeRaggedQwenFixture(io: std.Io, alloc: Allocator, dir: std.Io.Dir, layer_experts: [3]u64) !void {
-    var tensors: std.ArrayList(TestTensor) = .empty;
-    var entries: std.ArrayList(TestIndexEntry) = .empty;
-    for ([_][]const u8{ "language_model.model.layers.0", "language_model.model.layers.1", "language_model.mtp.layers.0" }, 0..) |base, layer| {
-        const e = layer_experts[layer];
-        try tensors.append(alloc, .{
-            .key = try std.fmt.allocPrint(alloc, "{s}.mlp.gate.weight", .{base}),
-            .dtype = "BF16",
-            .shape = try alloc.dupe(u64, &.{ e, 128 }),
-            .bytes = try testBf16Bytes(alloc, @intCast(e * 128), 0x3f80),
-        });
-        for (0..2) |group| {
-            const count: u64 = if (group == 0) 1 else e - 1;
-            for ([_][]const u8{ "gate", "up", "down" }, 0..) |projection, p| {
-                for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
-                    const n: u64 = @intCast(32 + 16 * ((group + p) % 3));
-                    try tensors.append(alloc, .{
-                        .key = try std.fmt.allocPrint(alloc, "{s}.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ base, projection, group, part }),
-                        .dtype = if (i == 0) "U16" else "F16",
-                        .shape = if (i == 0) try alloc.dupe(u64, &.{ count, 8, 8, n }) else try alloc.dupe(u64, &.{ count, 128 }),
-                        .bytes = try testBf16Bytes(alloc, @intCast(if (i == 0) count * 8 * 8 * n else count * 128), 0),
-                    });
-                }
-            }
-        }
-    }
-    for (tensors.items) |tensor| try entries.append(alloc, .{ .key = tensor.key, .file = "ragged.safetensors" });
-    try writeTestShard(io, alloc, dir, "ragged.safetensors", tensors.items);
-    try writeTestIndex(io, alloc, dir, entries.items);
-}
-
-test "sushi coder qwen trunk and MTP preflight use each router width" {
-    const t = std.testing;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeRaggedQwenFixture(t.io, alloc, tmp.dir, .{ 3, 2, 3 });
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const len = try tmp.dir.realPath(t.io, &buf);
-    var cfg = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .num_hidden_layers = 2, .num_experts = 512, .num_experts_per_tok = 2, .hidden_size = 128, .moe_intermediate_size = 128 };
-    try validateExl3Pack(t.io, alloc, buf[0..len], &cfg);
-    cfg.num_experts_per_tok = 3;
-    try t.expectError(error.Exl3TopKExceedsExperts, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
-    cfg.num_experts_per_tok = 2;
-    cfg.expert_streaming = true;
-    try t.expectError(error.Exl3RaggedStreamingUnsupported, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
-}
-
-test "sushi coder a rate-grouped Flash-Next pack passes the streaming preflight, a pruned one does not" {
-    const t = std.testing;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeRaggedQwenFixture(t.io, alloc, tmp.dir, .{ 3, 3, 3 });
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const len = try tmp.dir.realPath(t.io, &buf);
-    var cfg = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .num_hidden_layers = 2, .num_experts = 3, .num_experts_per_tok = 2, .hidden_size = 128, .moe_intermediate_size = 128, .expert_streaming = true };
-    try validateExl3Pack(t.io, alloc, buf[0..len], &cfg);
-    cfg.num_experts = 512;
-    try t.expectError(error.Exl3RaggedStreamingUnsupported, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
-}
-
-test "GLM EXL3 preflight refuses orphan MTP and out of range packed tensors" {
-    const t = std.testing;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var source = SourceIndex{ .weight_map = std.StringHashMap([]const u8).init(a), .files = std.StringHashMap(void).init(a), .tensors = std.StringHashMap(TensorMeta).init(a), .stamps = std.StringHashMap(ShardStamp).init(a) };
-    const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .exl3_k4, .expert_quant_rate = .{ .n = 36 }, .num_hidden_layers = 2, .first_k_dense_replace = 1, .num_experts = 2, .num_experts_per_tok = 1, .hidden_size = 128, .moe_intermediate_size = 128, .glm_mtp_layers = 1 };
-    const code = TensorMeta{ .dtype = .u16, .shape = &.{ 2, 8, 8, 36 }, .data_start = 0, .data_end = 2 * 8 * 8 * 36 * 2, .data_base = 0, .file = "test.safetensors" };
-    const scale = TensorMeta{ .dtype = .f16, .shape = &.{ 2, 128 }, .data_start = 0, .data_end = 2 * 128 * 2, .data_base = 0, .file = "test.safetensors" };
-    for ([_][]const u8{ "gate", "up", "down" }) |p| for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
-        try source.tensors.put(try std.fmt.allocPrint(a, "model.language_model.layers.1.mlp.switch_mlp.{s}_proj.{s}", .{ p, part }), if (i == 0) code else scale);
-    };
-    try source.tensors.put("model.language_model.layers.1.mlp.gate.weight", .{ .dtype = .bf16, .shape = &.{ 2, 128 }, .data_start = 0, .data_end = 512, .data_base = 0, .file = "test.safetensors" });
-    try validateExl3Source(&source, a, &cfg);
-    for ([_]u32{ 2, 0, 3 }) |li| {
-        const key = try std.fmt.allocPrint(a, "model.language_model.layers.{d}.mlp.switch_mlp.up_proj.trellis", .{li});
-        try source.tensors.put(key, code);
-        defer _ = source.tensors.remove(key);
-        if (validateExl3Source(&source, a, &cfg)) |_| return error.ExpectedGlmPackRejection else |_| {}
-    }
-}
-
-test "GLM EXL3 preflight refuses a rate-grouped layer by name" {
-    const t = std.testing;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var source = SourceIndex{ .weight_map = std.StringHashMap([]const u8).init(a), .files = std.StringHashMap(void).init(a), .tensors = std.StringHashMap(TensorMeta).init(a), .stamps = std.StringHashMap(ShardStamp).init(a) };
-    const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .exl3_k4, .expert_quant_rate = .{ .n = 36 }, .num_hidden_layers = 2, .first_k_dense_replace = 1, .num_experts = 2, .num_experts_per_tok = 1, .hidden_size = 128, .moe_intermediate_size = 128 };
-    for ([_]u64{ 32, 36 }, 0..) |n, group| {
-        const code = TensorMeta{ .dtype = .u16, .shape = try a.dupe(u64, &.{ 1, 8, 8, n }), .data_start = 0, .data_end = 8 * 8 * n * 2, .data_base = 0, .file = "test.safetensors" };
-        const scale = TensorMeta{ .dtype = .f16, .shape = &.{ 1, 128 }, .data_start = 0, .data_end = 128 * 2, .data_base = 0, .file = "test.safetensors" };
-        for ([_][]const u8{ "gate", "up", "down" }) |p| for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
-            try source.tensors.put(try std.fmt.allocPrint(a, "model.language_model.layers.1.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ p, group, part }), if (i == 0) code else scale);
-        };
-    }
-    try source.tensors.put("model.language_model.layers.1.mlp.gate.weight", .{ .dtype = .bf16, .shape = &.{ 2, 128 }, .data_start = 0, .data_end = 512, .data_base = 0, .file = "test.safetensors" });
-    try t.expectError(error.Exl3RateGroupsUnsupported, validateExl3Source(&source, a, &cfg));
 }

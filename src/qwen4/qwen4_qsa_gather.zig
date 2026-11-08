@@ -1,7 +1,6 @@
 const trunk_mod = @import("../trunk.zig");
 const attn_kernels = @import("../attn_kernels.zig");
 const std = @import("std");
-const qwen4_state = @import("qwen4_state.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
@@ -1837,7 +1836,6 @@ test "qsa batched gather mixed group: a mask-only slot matches its solo masked S
 }
 
 test "qsaBatchedAttn: the kill switch refuses the gather arm" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     var xfm_bytes: [@sizeOf(Trunk)]u8 align(@alignOf(Trunk)) = @splat(0);
     const xfm: *Trunk = @ptrCast(&xfm_bytes);
@@ -1860,7 +1858,6 @@ test "qsaBatchedAttn: the kill switch refuses the gather arm" {
 }
 
 test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;

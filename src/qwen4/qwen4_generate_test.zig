@@ -34,6 +34,10 @@ const Generator = generate.Generator;
 const mtp_round = @import("../mtp_round.zig");
 const mtp_policy = @import("../mtp_policy.zig");
 const MtpHeadRef = generate.MtpHeadRef;
+const MtpCacheRef = MtpHeadRef.Cache;
+const qwen4_state = @import("qwen4_state.zig");
+const MtpPreDraft = mtp_round.MtpPreDraft;
+const MtpRoundOpen = mtp_round.MtpRoundOpen;
 
 test "a 40k Qwen prefill checkpoints every 8192 tokens at any chunk width the ladder takes" {
     for ([_]usize{ 8192, 4096, 2048, 512 }) |width| {
@@ -399,7 +403,7 @@ test "qwen4: the spec warm-up runs a prefill-shaped forward through the grouped 
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     const rate_groups = @import("sushi_exl3").rate_groups;
     const before = rate_groups.prefill_chains;
-    try xfm.warmupSpecVerify(1, @import("../kv_quant.zig").KVQuantConfig.engine_default);
+    try @import("qwen4_load.zig").warmVerify(&xfm.config, &xfm, 1, @import("../kv_quant.zig").KVQuantConfig.engine_default);
     try testing.expect(rate_groups.prefill_chains > before);
 }
 
@@ -1291,4 +1295,87 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     var holds = false;
     for (serial.entries) |*e| holds = holds or e.ssm_state.ctx != null;
     try testing.expect(holds);
+}
+
+test "batched MTP state includes the last row activated by round begin" {
+    if (comptime !@import("../arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var xfm: Trunk = undefined;
+    xfm.arch_state = .{};
+    const q4 = qwen4_state.stateOf(&xfm);
+    const q4f = @import("qwen4_forward.zig");
+    var head: qwen4_forward.Qwen4Mtp = undefined;
+    head.cache = try KVCache.init(allocator, 1);
+    head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    head.qsa_marks = .{};
+    head.seq_offset = 0;
+    head.pos_base = 0;
+    q4.mtp = head;
+    defer q4.mtp.?.cache.deinit();
+    var a: q4f.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
+    defer a.deinit();
+    var b: q4f.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
+    defer b.deinit();
+    q4f.qwen4MtpActivate(&xfm, &a);
+    q4.mtp.?.seq_offset = 7;
+    q4.mtp.?.cache.step = 7;
+    q4.mtp.?.pos_base = 3;
+    q4f.qwen4MtpActivate(&xfm, &b);
+    q4.mtp.?.seq_offset = 2;
+    q4.mtp.?.cache.step = 2;
+    q4.mtp.?.pos_base = 11;
+    const caches = [_]MtpCacheRef{
+        MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &a, .allocator = allocator }),
+        MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &b, .allocator = allocator }),
+    };
+    const want = [_]q4f.Qwen4MtpState.Meta{
+        .{ .stash_len = 7, .origin = 3, .cache_step = 7 },
+        .{ .stash_len = 2, .origin = 11, .cache_step = 2 },
+    };
+    for (caches, want) |cache, meta| {
+        const state = cache.as("qwen4").batchState();
+        try testing.expectEqual(meta, state.meta());
+    }
+    try testing.expect(q4.mtp_owner == null);
+}
+
+test "MTP continuation releases its owned chain when drafting fails" {
+    if (comptime !@import("../arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var xfm: Trunk = undefined;
+    xfm.s = s;
+    xfm.arch_state = .{};
+    var state: @import("qwen4_forward.zig").Qwen4MtpState = undefined;
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.mtp = MtpHeadRef.of("qwen4", &xfm);
+    gen.mtp_cache = MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &state, .allocator = allocator });
+    gen.sampling = .{ .temperature = 0 };
+    gen.ctx.arch_ctx = .{};
+    gen.mtp_hist_stash = null;
+    gen.last_hidden = .{ .ctx = null };
+    const chain: MtpPreDraft = .{
+        .plan = .{ .m_lo = 1, .m_hi = 2, .tau_ln = 0 },
+        .off0 = 0,
+        .t1 = 1,
+        .t1_arr = mlx.mlx_array_new(),
+        .drafts = try allocator.alloc(u32, 2),
+        .draft_arrs = undefined,
+        .n_drafted = 0,
+        .conf_arrs = try allocator.alloc(mlx.mlx_array, 1),
+        .n_conf = 0,
+        .q_probs = try allocator.alloc(mlx.mlx_array, 2),
+        .n_qp = 0,
+        .h_chain = null,
+        .m = 1,
+    };
+    const open: MtpRoundOpen = .{
+        .chain = chain,
+        .tracing = false,
+        .ph = undefined,
+        .round_watch = undefined,
+    };
+    try expectError(error.NoMtpHead, gen.mtpRoundContinue(allocator, open));
 }

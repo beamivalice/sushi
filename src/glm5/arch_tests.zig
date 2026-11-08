@@ -5,6 +5,7 @@
 pub const tests = .{
     @import("glm5_store_test.zig"),
     @import("glm5_bill_test.zig"),
+    @import("glm5_pack_test.zig"),
     @import("glm5_vision.zig"),
     @import("glm5_config.zig"),
     @import("glm5_serving.zig"),

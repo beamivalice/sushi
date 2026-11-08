@@ -11,7 +11,6 @@ const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
-const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
 const round_cost_mod = @import("round_cost.zig");
@@ -60,7 +59,7 @@ pub fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.Gro
         } else {
             const off = Generator.mtpRoundOff0(gen.mtp_hist_stash, gen.mtp_cache.?.step());
             const history = 1 + if (gen.mtp_hist_stash) |stash| stash.n else @as(usize, 0);
-            shape.head_format = cacheCostFormat(qwen4_state.mtpOf(xfm).?.cache.config);
+            shape.head_format = cacheCostFormat(arch_state.headCache(&xfm.arch_state).?.config);
             shape.rows[i] = group_cost_mod.GroupShape.row(width, width, width, kv, @intCast(xfm.round_cost.bucketOf(@intCast(off))), @intCast(@min(history, round_cost_mod.MAX_WIDTH + 2)), gen.mtpPlannerMode());
         }
     }
@@ -300,7 +299,7 @@ fn plannerRowCap(gen: *const Generator) u32 {
 pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
     const xfm = arch_handle.trunk(active[0].model.handle orelse return false);
-    if (!qwen4_state.isLoaded(xfm) or qwen4_state.mtpOfConst(xfm) == null) return false;
+    if (!arch_state.rowVerify(&xfm.arch_state) or arch_state.headCache(&xfm.arch_state) == null) return false;
     if (active.len == 1) {
         const gen = if (active[0].legacy_gen) |*g| g else return false;
         if (!gen.mtp_planner_owned) return false;
@@ -463,7 +462,7 @@ pub fn mtpCrowdThresholdFor(_: *const Slot) usize {
 
 fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     const cost_xfm = arch_handle.trunk(group[0].model.handle.?);
-    cost_xfm.cost_trace_active = qwen4_state.isLoaded(cost_xfm);
+    cost_xfm.cost_trace_active = arch_state.rowVerify(&cost_xfm.arch_state);
     cost_xfm.cost_attention = 0;
     cost_xfm.cost_moe = 0;
     const head_calls_before = moe_gqmv.mtp_head_row_dispatches;
@@ -631,7 +630,7 @@ fn observeGroupRound(live: []*Slot, states: []const mtp_round.MtpRoundState, exp
     var key = group_cost_mod.GroupShape{
         .n = @intCast(live.len),
         .kv_format = cacheCostFormat(live[0].cache.config),
-        .head_format = if (qwen4_state.mtpOfConst(xfm)) |head| cacheCostFormat(head.cache.config) else 0,
+        .head_format = if (arch_state.headCache(&xfm.arch_state)) |head| cacheCostFormat(head.config) else 0,
         .attention = xfm.cost_attention,
         .moe = xfm.cost_moe,
         .head_calls = @intCast(@min(std.math.maxInt(u16), moe_gqmv.mtp_head_row_dispatches -% head_calls_before)),

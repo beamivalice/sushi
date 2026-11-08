@@ -49,6 +49,40 @@ pub fn residentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []
     };
 }
 
+/// The resident key a streamed load keeps for `key` in a layout the loader does not map itself; null drops the tensor.
+/// The caller has only a layout, so this binds the first built arch declaring the hook; with none the key is kept.
+pub fn fusedStreamKey(buf: []u8, key: []const u8) ?[]const u8 {
+    inline for (comptime std.enums.values(registry.Tag)) |t| {
+        if (comptime has(t, "fusedStreamKey")) return L(t).fusedStreamKey(buf, key);
+    }
+    return key;
+}
+
+/// Whether the fused BF16 layout stores `key` as a delta from one, which the load adds back. Like `fusedStreamKey`,
+/// it binds the first built arch declaring the hook; with none no norm folds.
+pub fn fusedStreamFoldsNorm(key: []const u8) bool {
+    inline for (comptime std.enums.values(registry.Tag)) |t| {
+        if (comptime has(t, "fusedStreamFoldsNorm")) return L(t).fusedStreamFoldsNorm(key);
+    }
+    return false;
+}
+
+/// The verify at every draft width up to `max_width`, compiled before the first request so no round pays it.
+pub fn warmVerify(config: *const ModelConfig, xfm: *Trunk, max_width: u32, kv_config: trunk.KVQuantConfig) !void {
+    const tag = arch_config.tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime has(t, "warmVerify")) try L(t).warmVerify(config, xfm, max_width, kv_config),
+    }
+}
+
+/// The arch's check of the layers the trunk's binder installed the PLE on; an arch without one takes any placement.
+pub fn checkPlePlacement(config: *const ModelConfig, has_ple: []const bool) !void {
+    const tag = arch_config.tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime has(t, "checkPlePlacement")) try L(t).checkPlePlacement(config, has_ple),
+    }
+}
+
 /// Whether the pack in `model_dir` ships the head the arch drafts with; null leaves the question to the shared readers.
 pub fn shipsHead(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) ?bool {
     const tag = arch_config.tagOf(config) orelse return null;

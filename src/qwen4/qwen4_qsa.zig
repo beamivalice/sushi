@@ -7,8 +7,7 @@ const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const Trunk = trunk_mod.Trunk;
 const std = @import("std");
-const qwen4_state = @import("qwen4_state.zig");
-const disk_format = @import("../disk_format.zig");
+const ssm_cache = @import("../ssm_cache.zig");
 const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const testing = std.testing;
@@ -38,7 +37,6 @@ const getQsaSelectKernel = qwen4_forward.getQsaSelectKernel;
 const getQsaSelectSplitLocalKernel = qwen4_forward.getQsaSelectSplitLocalKernel;
 const getQsaSelectSplitMergeKernel = qwen4_forward.getQsaSelectSplitMergeKernel;
 const log = trunk_mod.log;
-const markPosOf = qwen4_forward.markPosOf;
 const QSA_RING_ROWS = trunk_mod.QSA_RING_ROWS;
 const qsaAttnKernelEnabled = qwen4_qsa_attn.qsaAttnKernelEnabled;
 const qsaBatchedGatherEnabled = qwen4_qsa_gather.qsaBatchedGatherEnabled;
@@ -70,7 +68,6 @@ const qsaWidthBucket = qwen4_qsa_attn.qsaWidthBucket;
 const seedCapBuf = trunk_mod.seedCapBuf;
 const qwen4Standin = qwen4_forward.qwen4Standin;
 const sliceAttentionSeq = trunk_mod.sliceAttentionSeq;
-const spanPreservingDropIndex = trunk_mod.spanPreservingDropIndex;
 const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
 const verifyQmmNaxAvailable = trunk_mod.verifyQmmNaxAvailable;
 
@@ -891,96 +888,8 @@ pub fn qsaBatchedGatherAttn(
     return stacked;
 }
 
-/// The `pos % ratio` raw indexer rows ending at MTP-head row `pos`, copied while the ring
-/// still held them. The trunk restores at one of its checkpoint positions and the head is
-/// clamped to that same row; by commit time the head's ring is a whole generated tail past
-/// it, so the rows the next append must re-pool are kept here instead.
-pub const QsaHeadMark = struct {
-    pos: c_int = 0,
-    rows: mlx.mlx_array = .{ .ctx = null },
-};
-
-/// Marks a head keeps. A prefill's checkpoints are capped at `ssm_checkpoint_max` (16) and a
-/// warm turn merges the donor's; past this the list thins like the checkpoints themselves.
-pub const QSA_HEAD_MARKS_MAX: usize = disk_format.HEAD_MARKS_MAX;
-
-/// One owner of a head's marks: the live head holds one, its committed snapshot a
-/// refcount-sharing copy. Positions ascend.
-pub const QsaHeadMarkSet = struct {
-    items: [QSA_HEAD_MARKS_MAX]QsaHeadMark = @splat(.{}),
-    len: usize = 0,
-
-    pub fn slice(self: *const QsaHeadMarkSet) []const QsaHeadMark {
-        return self.items[0..self.len];
-    }
-
-    /// A second owner for every mark; both sets then free independently.
-    pub fn share(src: []const QsaHeadMark) QsaHeadMarkSet {
-        var out: QsaHeadMarkSet = .{};
-        for (src) |m| {
-            if (m.rows.ctx == null or out.len == QSA_HEAD_MARKS_MAX) continue;
-            var arr = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&arr, m.rows);
-            out.items[out.len] = .{ .pos = m.pos, .rows = arr };
-            out.len += 1;
-        }
-        return out;
-    }
-
-    pub fn deinit(self: *QsaHeadMarkSet) void {
-        for (self.items[0..self.len]) |*m| {
-            if (m.rows.ctx != null) _ = mlx.mlx_array_free(m.rows);
-            m.* = .{};
-        }
-        self.len = 0;
-    }
-
-    pub fn bytes(self: *const QsaHeadMarkSet) u64 {
-        var total: u64 = 0;
-        for (self.items[0..self.len]) |m| {
-            if (m.rows.ctx == null) continue;
-            total += @as(u64, mlx.mlx_array_size(m.rows)) * @as(u64, mlx.mlx_array_itemsize(m.rows));
-        }
-        return total;
-    }
-
-    pub fn find(self: *const QsaHeadMarkSet, pos: c_int) ?mlx.mlx_array {
-        for (self.items[0..self.len]) |m| {
-            if (m.pos == pos and m.rows.ctx != null) return m.rows;
-        }
-        return null;
-    }
-
-    /// Marks above `pos` describe rows a clamp just discarded — the next append writes
-    /// different tokens there.
-    pub fn dropAbove(self: *QsaHeadMarkSet, pos: c_int) void {
-        var i = self.len;
-        while (i > 0 and self.items[i - 1].pos > pos) : (i -= 1) {
-            if (self.items[i - 1].rows.ctx != null) _ = mlx.mlx_array_free(self.items[i - 1].rows);
-            self.items[i - 1] = .{};
-        }
-        self.len = i;
-    }
-
-    pub fn dropAt(self: *QsaHeadMarkSet, idx: usize) void {
-        if (self.items[idx].rows.ctx != null) _ = mlx.mlx_array_free(self.items[idx].rows);
-        var i = idx;
-        while (i + 1 < self.len) : (i += 1) self.items[i] = self.items[i + 1];
-        self.items[self.len - 1] = .{};
-        self.len -= 1;
-    }
-
-    /// Takes ownership of `rows`. A repeat at `pos` replaces; a full set thins its interior.
-    pub fn put(self: *QsaHeadMarkSet, pos: c_int, rows: mlx.mlx_array) void {
-        self.dropAbove(pos);
-        if (self.len > 0 and self.items[self.len - 1].pos == pos) self.dropAt(self.len - 1);
-        if (self.len == QSA_HEAD_MARKS_MAX) {
-            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency, null));
-        }
-        self.items[self.len] = .{ .pos = pos, .rows = rows };
-        self.len += 1;
-    }
-};
+pub const QsaHeadMark = ssm_cache.QsaHeadMark;
+pub const QsaHeadMarkSet = ssm_cache.QsaHeadMarkSet;
 
 pub var qsa_score_incremental_appends: usize = 0;
 
@@ -1789,7 +1698,6 @@ pub fn qsaPooledRopeComposed(self: *Trunk, pn: mlx.mlx_array, rope_dims: c_int, 
 }
 
 test "qsa pooled rope: one cos/sin build per forward, not one per full-attention layer" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     // The tables are a property of the forward, not of the layer.
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -1805,6 +1713,7 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     t.rope_freqs_yarn = null;
     t.yarn_inv_freq = null;
     t.fwd_gen = 0;
+    t.consts = null;
     t.arch_state.qwen4.qsa_pooled_rope = .{};
     defer t.arch_state.qwen4.qsa_pooled_rope.deinit();
 
@@ -1865,7 +1774,6 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
 }
 
 test "qsa pooled rope: a mark from another thread is observed by the next lookup" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
@@ -1880,6 +1788,7 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     t.rope_freqs_yarn = null;
     t.yarn_inv_freq = null;
     t.fwd_gen = 0;
+    t.consts = null;
     t.arch_state.qwen4.qsa_pooled_rope = .{};
     defer t.arch_state.qwen4.qsa_pooled_rope.deinit();
 

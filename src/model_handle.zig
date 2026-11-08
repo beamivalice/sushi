@@ -129,6 +129,11 @@ pub fn defaultCtx(self: *Trunk) ForwardCtx {
 }
 
 
+/// `arch_state.setLayerCapture` on `ctx`, for a caller that reaches the engine only through this file.
+pub fn setLayerCapture(ctx: *ForwardCtx, input: ?mlx.mlx_array, skip_ple: bool) void {
+    arch_state.setLayerCapture(&ctx.arch_ctx, input, skip_ple);
+}
+
 /// Whether this model is single-flight at admission (`slot_admission.modelExclusiveDecode`).
 pub fn ownsModuleDecodeState(self: *const Trunk) bool {
     return arch_request.ownsModuleDecodeState(arch_registry.handleOf(@constCast(self)));

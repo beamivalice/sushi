@@ -5,8 +5,27 @@ const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
 const Trunk = trunk_mod.Trunk;
 const trunk_mod = @import("../trunk.zig");
+const qwen4_exp = @import("qwen4_exp.zig");
+const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
+const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 
 // Hooks: bills.zig reaches these through the arch's `bill` declaration; a hook returns null where it has no say.
+
+/// The mapped n-gram table's GPU bytes, billed as taken whichever model asks.
+pub fn pageCacheClaim() u64 {
+    return qwen4_exp.page_cache_claim.load(.acquire);
+}
+
+/// The keys one QSA layer rebuilds dense from a quantized cache: what a forward of `fwd` rows cannot gather in place.
+pub fn denseRebuildRows(config: *const model_mod.ModelConfig, fwd: u64) ?u64 {
+    return qwen4_qsa_attn.qsaDenseRebuildRows(config.indexer_budget, config.indexer_compress_ratio, fwd);
+}
+
+/// A prefill width that gathers by block index holds a row-chunked score sheet, never the `[S, kv]` mask.
+pub fn gatheredMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) ?u64 {
+    if (fwd < trunk_mod.FUSED256_MIN_Q_LEN or !qwen4_qsa_gather.qsaGatherEnabled()) return null;
+    return qwen4_qsa_attn.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
+}
 
 /// Per-token bytes of the MTP head's own KV at the scheme it was LOADED with, billed once per request when MTP is on.
 pub fn headKvPerToken(config: *const model_mod.ModelConfig) ?u64 {

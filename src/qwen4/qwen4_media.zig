@@ -11,6 +11,7 @@ const qwen_vision = @import("qwen_vision.zig");
 pub const mode = .qwen;
 pub const Tower = qwen_vision.QwenVision;
 pub const scratchBytes = qwen_vision.encodeScratchBytes;
+pub const quantGroupAtLoad = qwen_vision.quantGroupAtLoad;
 
 pub fn claims(config: *const model.ModelConfig) bool {
     return config.qwen_vision;

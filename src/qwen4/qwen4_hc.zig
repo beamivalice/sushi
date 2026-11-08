@@ -6,7 +6,6 @@ const kv_cache = @import("../kv_cache.zig");
 const io_util_mod = @import("../io_util.zig");
 const Trunk = trunk.Trunk;
 const std = @import("std");
-const qwen4_state = @import("qwen4_state.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3_kernels = sushi_exl3.kernels;
 const mlx = @import("../mlx.zig");
@@ -1778,7 +1777,6 @@ test "deferred PLE at N rows: every row's capacity is checked against its OWN wi
 }
 
 test "hc prefill: incompatible read writes immediately" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
@@ -1821,7 +1819,6 @@ test "hc prefill: incompatible read writes immediately" {
 }
 
 test "hc write compilation preserves the serial pending-write rounding" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;

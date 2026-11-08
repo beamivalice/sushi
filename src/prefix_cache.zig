@@ -15,7 +15,6 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
 const trunk_mod = @import("trunk.zig");
 const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const model_mod = @import("model.zig");
@@ -34,13 +33,13 @@ const KVCacheSnapshot = trunk_mod.KVCacheSnapshot;
 const SSMCacheEntry = trunk_mod.SSMCacheEntry;
 const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const restoreSsmCheckpoint = trunk_mod.restoreSsmCheckpoint;
-const applyQsaHistoryAt = transformer_mod.applyQsaHistoryAt;
-const checkpointHasQsaPooled = transformer_mod.checkpointHasQsaPooled;
-const checkpointListHasQsaPooled = transformer_mod.checkpointListHasQsaPooled;
-const sliceQsaHistoryOntoCheckpoint = transformer_mod.sliceQsaHistoryOntoCheckpoint;
-const keepOnlyLatestQsaHistory = transformer_mod.keepOnlyLatestQsaHistory;
-const entriesHaveQsaHistory = transformer_mod.entriesHaveQsaHistory;
-const qsaRestoreSatisfiesForward = transformer_mod.qsaRestoreSatisfiesForward;
+const applyQsaHistoryAt = prefix_arch.aux.applyQsaHistoryAt;
+const checkpointHasQsaPooled = prefix_arch.aux.checkpointHasQsaPooled;
+const checkpointListHasQsaPooled = prefix_arch.aux.checkpointListHasQsaPooled;
+const sliceQsaHistoryOntoCheckpoint = prefix_arch.aux.sliceQsaHistoryOntoCheckpoint;
+const keepOnlyLatestQsaHistory = prefix_arch.aux.keepOnlyLatestQsaHistory;
+const entriesHaveQsaHistory = prefix_arch.aux.entriesHaveQsaHistory;
+const qsaRestoreSatisfiesForward = prefix_arch.aux.qsaRestoreSatisfiesForward;
 const ssmCheckpointBytes = trunk_mod.ssmCheckpointBytes;
 
 /// Minimum forwarded-prefix length for committing a CANCELLED prefill
@@ -533,7 +532,7 @@ pub const DflashSnap = struct {
     /// In-checkpoint MTP head only: the head's QSA leftovers at the trunk's checkpoint positions.
     /// A clamp to a restored trunk position lands far below the head's raw-key ring; this is
     /// what makes it exact there.
-    head_marks: transformer_mod.QsaHeadMarkSet = .{},
+    head_marks: trunk_mod.QsaHeadMarkSet = .{},
 
     /// The MTP snapshot of a commit, over a snapshot of its cache.
     fn ofCommit(c: DflashCommit, snapshot: KVCacheSnapshot) DflashSnap {
@@ -542,7 +541,7 @@ pub const DflashSnap = struct {
             .base_pos = c.base_pos,
             .head_aux = if (c.head) |h| trunk_mod.ssmSnapshot(h) else null,
             .head_pos_base = c.head_pos_base,
-            .head_marks = transformer_mod.QsaHeadMarkSet.share(c.head_marks),
+            .head_marks = trunk_mod.QsaHeadMarkSet.share(c.head_marks),
         };
     }
 
@@ -560,7 +559,7 @@ pub const DflashCommit = struct {
     base_pos: usize,
     head: ?*const SSMCacheEntry = null,
     head_pos_base: c_int = 0,
-    head_marks: []const transformer_mod.QsaHeadMark = &.{},
+    head_marks: []const trunk_mod.QsaHeadMark = &.{},
 };
 
 /// Where `lookupAndRestore` puts a restored assistant context. `base_pos` is
@@ -805,7 +804,7 @@ pub const HotPrefixCache = struct {
         var cap = limit;
         while (highestCheckpointAtOrBelow(cps, cap)) |cp| {
             const src = qsaHistorySource(cps, cp) orelse cp;
-            if (transformer_mod.checkpointQsaCoversPos(cp, src, cp.pos)) return cp;
+            if (prefix_arch.aux.checkpointQsaCoversPos(cp, src, cp.pos)) return cp;
             if (cp.pos == 0) break;
             cap = cp.pos - 1;
         }
@@ -849,7 +848,7 @@ pub const HotPrefixCache = struct {
             prefix_arch.aux.ssmFreeQsaState(ssm);
             ssm.ple_prev_valid = false;
         }
-        transformer_mod.ssmDetachFromGroup(entries);
+        trunk_mod.ssmDetachFromGroup(entries);
     }
 
     /// Pure-attention archs are eligible by default. Hybrid recurrent-state
@@ -8009,12 +8008,6 @@ pub fn pcQsaExpectViewEqual(s: mlx.mlx_stream, warm: *SSMCacheEntry, cold: *SSMC
             return error.TestExpectedEqual;
         };
     }
-}
-
-pub fn pcQsaFeed(xfm: *trunk_mod.Trunk, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
-    const chunk = try pcQsaSliceAxis1(s, keys, 0, n);
-    defer _ = mlx.mlx_array_free(chunk);
-    try transformer_mod.qsaTestAppendPool(xfm, entry, chunk, 0, s);
 }
 
 pub fn pcArrEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {

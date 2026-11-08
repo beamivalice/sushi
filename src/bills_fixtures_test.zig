@@ -3,8 +3,6 @@ const std = @import("std");
 const arch_config = @import("arch/config.zig");
 const model_mod = @import("model.zig");
 const nax_gate = @import("nax_gate.zig");
-const qwen4_qsa_select = @import("qwen4/qwen4_qsa_select.zig");
-const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const bills = @import("bills.zig");
 const PinCfg = model_mod.ModelConfig;
 
@@ -27,27 +25,6 @@ pub fn longCtxTestConfig() model_mod.ModelConfig {
     cfg.indexer_head_dim = 128;
     cfg.indexer_compress_ratio = 4;
     return cfg;
-}
-
-/// The deployed long-context shape at the live per-token widths: 12 caching layers, hd 256,
-/// 2 KV heads (13,056 B/tok at 8-bit); a 128-wide QSA indexer at ratio 4.
-pub fn qsaScoreFusedOffGuard() struct {
-    pub fn deinit(_: @This()) void {
-        qwen4_qsa_select.qsa_score_fused_override = null;
-    }
-} {
-    qwen4_qsa_select.qsa_score_fused_override = false;
-    return .{};
-}
-
-/// The incidents these bills reproduce ran an engine that rebuilt the whole kv8 cache per layer.
-pub fn qsaWholeRebuildGuard() struct {
-    pub fn deinit(_: @This()) void {
-        qwen4_qsa_attn.qsa_attn_kernel_override = null;
-    }
-} {
-    qwen4_qsa_attn.qsa_attn_kernel_override = false;
-    return .{};
 }
 
 pub fn qwen4RequestTestConfig() model_mod.ModelConfig {

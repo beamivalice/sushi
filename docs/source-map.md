@@ -20,9 +20,9 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `arch/sched.zig` / `<arch>/<arch>_sched.zig` | the scheduler's dispatch to each arch: batching, request state, commit, restore, write-through, thought points; `glm5_rows_tick` and `dsv41_thought_point` hold the code those faces call | server-lifecycle, engine-arch-seam |
 | `arch/registry.zig` / `arch/*.zig` / `arch/handle.zig` / `arch_host.zig` / `<arch>/arch.zig` | the only arch names outside a folder, `inline else` dispatch per area, the loaded model's handle and every engine read of it, the engine services an arch may import, each arch's public face | engine-arch-seam |
 | `pack_index.zig` | a pack's safetensors index from its shard headers, and the EXL3 routed-bank checks every arch's pack takes at load (`validateExl3Pack`) | engine-exl3-experts |
-| `trunk.zig` | `Trunk`: embeddings, lm head, rope/M-RoPE/YaRN tables, compiled closures, the MoE family, eval cadence, the warmup scaffold; `Transformer` is its alias | arch-*, engine-* |
+| `trunk.zig` | `Trunk`: embeddings, lm head, rope/M-RoPE/YaRN tables, compiled closures, the MoE family, eval cadence, the warmup scaffold | arch-*, engine-* |
+| `moe_shared_fold.zig` | the gated shared expert folded into the routed EXL3 launches, for any trunk MoE layer that gates one | engine-exl3-experts, qwen4-perf |
 | `model_handle.zig` | `ForwardCtx`, `CaptureLayers`, the loaded-model operations that dispatch through the registry (`deinit`, `resetCache`, `warmup`, `forwardWith`, ...) | arch-* |
-| `transformer.zig` | the qwen4 names shared files still reach with no arch hook; leaves with S4-qwen4 | arch-* |
 | `mlx_util.zig` / `trunk_helpers_test.zig` | MLX helpers with no model knowledge (scalars, owned copy, masks); test-only fixtures shared by the trunk, KV, attention and MoE tests | engine-mlx-gotchas |
 | `<arch>/<arch>_state.zig` | what an arch owns beyond the trunk: load, `deinit`, cache reset | arch-* |
 | `kv_cache.zig` / `ssm_cache.zig` / `layer_weights` / `forward_diag` / `test_support` | KV/SSM caches, quant resolution, layer weights, `diagEnvOn` | arch-*, engine-* |
@@ -52,7 +52,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `vision.zig` / `vision_common.zig` / `arch/media.zig` / `<arch>/<arch>_media.zig` / `qwen4/qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: the tower holder, preprocessing, the media dispatch and each arch's processor, Qwen3-VL, M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` / `kld_fixture.zig` / `kld_capture_util.zig` / `arch/offline.zig` | `sushi kld capture|compare`; the MLX-free fixture reader and scoring; the per-arch hooks | quality-kld |
 | `bench.zig` / `bench_box.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power | process-measurement |
-| `ubench_main.zig` / `ubench_report.zig` / `exl3_ubench/ubench.zig` / `glm5/ubench_glm5.zig` | `sushi-ubench` (`zig build ubench`); each built arch's `ubench` decl is listed | process-ubench |
+| `ubench_main.zig` / `ubench_report.zig` / `exl3_ubench/ubench.zig` / `glm5/ubench_glm5.zig` / `qwen4/ubench_qwen4.zig` | `sushi-ubench` (`zig build ubench`); each built arch's `ubench` decl is listed | process-ubench |
 | `sushibar_main.zig` / `sushibar/` | `sushibar` menu bar app | server-lifecycle |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | format corpus, traffic replay | server-tool-calling |

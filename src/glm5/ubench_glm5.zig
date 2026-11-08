@@ -832,7 +832,7 @@ fn glmSample(r: *const GlmRung, arm: usize) anyerror!f64 {
 
 /// The GLM arm of `shared.shared_expert_fold`, run when the model axis lists glm5.
 pub fn sharedFold(run: *report.Run, s: mlx.mlx_stream, layouts: []const []const u8) !void {
-    if (!shared.listed(layouts, "bank")) return;
+    if (!shared.listed(layouts, "bank") or !shared.listed(run.axis("shared"), "affine")) return;
     const layers = @min(run.steps(shared.default_layers), shared.max_layers);
     var prng = std.Random.DefaultPrng.init(757);
     const rnd = prng.random();

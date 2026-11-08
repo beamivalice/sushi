@@ -41,7 +41,6 @@ const validateExl3Layer = pack_index.validateExl3Layer;
 const validateExl3Pack = pack_index.validateExl3Pack;
 const validateExl3Source = pack_index.validateExl3Source;
 const validateShardStamps = pack_index.validateShardStamps;
-const writeRaggedQwenFixture = pack_index.writeRaggedQwenFixture;
 const writeTestIndex = pack_index.writeTestIndex;
 const writeTestShard = pack_index.writeTestShard;
 const writeTestShardStamped = pack_index.writeTestShardStamped;

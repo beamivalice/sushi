@@ -53,6 +53,7 @@ pub const config_facts: arch_config.Facts = .{
     .qkv_split_rows = true,
     .bias_routed_moe = true,
 };
+pub const pack_layout: arch_config.PackLayout = .{ .prefix = "model", .stamped = true, .head = .none };
 pub const parseConfig = config_file.parseFamily;
 
 pub fn adoptLayout(config: *Config) void {

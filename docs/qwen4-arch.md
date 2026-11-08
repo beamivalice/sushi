@@ -20,12 +20,15 @@ hidden 2560, expert intermediate 640.
 | File | Role |
 |---|---|
 | `src/qwen4/qwen4_forward.zig` / `src/qwen4/qwen4_hc.zig` / `src/qwen4/qwen4_qsa.zig` | Flash Next trunk = `forwardQwen4With` (attention, GDN, native MTP, decode/verify rows) / hyper-connections + PLE / QSA mask and block selection |
-| `src/trunk.zig` / `src/model_handle.zig` | shared `Trunk` (alias `Transformer`), `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3`; `KVCache` is in `src/kv_cache.zig`, the SSM cache in `src/ssm_cache.zig` |
+| `src/trunk.zig` / `src/model_handle.zig` | shared `Trunk`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3`; `KVCache` is in `src/kv_cache.zig`, the SSM cache in `src/ssm_cache.zig` |
 | `src/qwen4/qwen4_state.zig` | What Flash-Next keeps beside the trunk: `State` in `Trunk.arch_state.qwen4` (n-gram model, mixer, MTP head, QSA consts and pooled rope, GDN constants, compiled closures, persistent SSM group; loaded by `State.init`) and `Ctx` in `ForwardCtx.arch_ctx.qwen4` (M-RoPE table, QSA mask/blocks/arms, head entry, pending PLE rows, stream capture); the trunk ops shared code calls are `State` functions (`arch/arch_state.zig`) |
 | `src/qwen4/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
 | `src/hc_prefill.zig` | Fused hyper-connection norm/mix prefill kernels (chunk width as a scalar INPUT, never a template) |
 | `src/trunk_stq.zig`, `src/exl3/trunk.zig` | Trunk projections stored as trellis banks: the loader (`load`, `trunk_stq`), the one-launch stacking (`fuse`, `sharedProject`) and the matmul (`exl3/trunk.zig`, re-exported by `trunk_stq`) |
-| `src/mtp.zig` | Shared MTP machinery (depth caps, cost profiles, draft rerank); the head itself is `Qwen4Mtp` in `qwen4_forward.zig`, see [engine-mtp](engine-mtp.md) |
+| `src/mtp.zig` | Shared MTP machinery (depth caps, cost profiles, draft rerank); the head itself is `Qwen4Mtp` in `qwen4_forward.zig`, its G17 cost profiles and pack fingerprint in `qwen4_cost_profile.zig`, see [engine-mtp](engine-mtp.md) |
+| `src/qwen4/qwen4_load.zig` | The load hooks (`arch/load.zig`): the PLE placement check, the verify warm-up at every draft width, the native fused BF16 checkpoint's key map and delta-norm list for the streamed loader |
+| `src/qwen4/arch.zig` `kernels` | The kernel arms shared code sizes by (`arch/kernels.zig`): the batched QSA gather and its KV floor, the fused score bank, the env warm-up, the `QWEN4_STANDIN` MoE stand-ins |
+| `src/qwen4/qwen4_bill_test.zig` / `qwen4_bill_live_test.zig` | The Flash-Next bill tests: host tier (QSA mask, sheet and history, MTP head, long-context admission) and the live-memory ones |
 
 ## Trunk rules
 

@@ -344,11 +344,15 @@ pub fn adoptSpecHead(xfm: *trunk.Trunk, plan: pc.SpecAdopt, snap: *const pc.Dfla
 
 /// SSM entry accelerators (the QSA history buffers, the GDN replay) belong to the arch that carries that state.
 pub const aux = firstWith("aux") orelse struct {
-    // The qwen4 sources still compile through transformer.zig in a build that leaves the arch out, and they
-    // read these two; S4-qwen4 removes those imports and with them these lines.
-    pub const ple_prev_len = @import("../qwen4/qwen4_exp.zig").MAX_NGRAM_SIZE;
-    pub const Replay = @import("../qwen4/gdn_decode.zig").Replay;
-    pub const replayState = @import("../qwen4/gdn_decode.zig").replayState;
+    pub const Replay = struct {
+        pub fn held(_: Replay) bool {
+            return false;
+        }
+        pub fn deinit(_: *Replay) void {}
+    };
+    pub fn replayState(_: Replay, _: mlx.mlx_array, _: c_int, _: mlx.mlx_stream) !mlx.mlx_array {
+        return .{ .ctx = null };
+    }
     pub fn noteHistorySeed() void {}
     pub fn noteCapBufAlloc() void {}
     pub fn qsaHistoryRows(_: *const ssm_cache.SSMCacheEntry) c_int {
@@ -368,6 +372,30 @@ pub const aux = firstWith("aux") orelse struct {
         return .{ .ctx = null };
     }
     pub fn qsaResliceToKeep(_: *ssm_cache.SSMCacheEntry, _: c_int, _: mlx.mlx_stream) !bool {
+        return false;
+    }
+    pub fn applyQsaHistoryAt(_: []ssm_cache.SSMCacheEntry, _: *const ssm_cache.SSMCheckpoint, _: usize, _: mlx.mlx_stream, _: bool) !void {}
+    pub fn attachQsaHistoryToLatest(_: []ssm_cache.SSMCheckpoint, _: []const ssm_cache.SSMCacheEntry, _: mlx.mlx_stream) !void {}
+    pub fn handoffQsaHistoryToLatest(_: []ssm_cache.SSMCheckpoint, _: []const ssm_cache.SSMCacheEntry, _: mlx.mlx_stream) !void {}
+    pub fn sliceQsaHistoryOntoCheckpoint(_: *ssm_cache.SSMCheckpoint, _: *const ssm_cache.SSMCheckpoint, _: usize, _: mlx.mlx_stream) !void {}
+    pub fn keepOnlyLatestQsaHistory(_: []ssm_cache.SSMCheckpoint) void {}
+    pub fn reserveQsaHistoryWithHead(_: ?[]ssm_cache.SSMCacheEntry, _: ?*ssm_cache.SSMCacheEntry, _: usize) void {}
+    pub fn checkpointHasQsaPooled(_: *const ssm_cache.SSMCheckpoint) bool {
+        return false;
+    }
+    pub fn checkpointListHasQsaPooled(_: []const ssm_cache.SSMCheckpoint) bool {
+        return false;
+    }
+    pub fn checkpointQsaCoversPos(_: *const ssm_cache.SSMCheckpoint, _: *const ssm_cache.SSMCheckpoint, _: usize) bool {
+        return true;
+    }
+    pub fn entriesHaveQsaHistory(_: []const ssm_cache.SSMCacheEntry) bool {
+        return false;
+    }
+    pub fn qsaRestoreSatisfiesForward(_: []const ssm_cache.SSMCacheEntry, _: usize) bool {
+        return true;
+    }
+    pub fn snapshotHasQsaHistory(_: *const ssm_cache.SSMCacheEntrySnapshot) bool {
         return false;
     }
 };

@@ -2848,7 +2848,7 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     const attn_before = qwen4_forward.mtp_verify_attn_rows_calls;
     const lmhead_before = qwen4_forward.mtp_verify_lmhead_rows_calls;
     const gdn_before = qwen4_forward.mtp_verify_gdn_rows_calls;
-    const shared_gate_before = qwen4_forward.mtp_verify_shared_gate_rows_calls;
+    const shared_gate_before = trunk.mtp_verify_shared_gate_rows_calls;
     const grouped_before = qwen4_forward.mtp_verify_moe_group_graphs;
 
     for ([_][2]usize{ .{ 2, 2 }, .{ 5, 5 }, .{ 2, 3 }, .{ 3, 2 }, .{ 9, 9 }, .{ 2, 9 }, .{ 9, 3 } }) |S_row| {
@@ -2903,7 +2903,7 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     try testing.expectEqual(expert_before, trunk.mtp_verify_expert_pairs_calls);
     try testing.expect(trunk.mtp_verify_expert_rows_calls > rows_before);
     try testing.expect(qwen4_forward.mtp_verify_gdn_rows_calls > gdn_before);
-    try testing.expect(qwen4_forward.mtp_verify_shared_gate_rows_calls > shared_gate_before);
+    try testing.expect(trunk.mtp_verify_shared_gate_rows_calls > shared_gate_before);
     try testing.expect(qwen4_forward.mtp_verify_attn_rows_calls > attn_before);
     try testing.expect(qwen4_forward.mtp_verify_lmhead_rows_calls > lmhead_before);
     try testing.expect(qwen4_forward.mtp_verify_moe_group_last_ops > 0);

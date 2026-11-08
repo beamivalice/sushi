@@ -86,7 +86,7 @@ pub const Info = struct {
     /// mlx-c C bindings, the pinned submodule revision (no runtime API).
     mlx_c: []const u8,
     /// M5 NAX (neural accelerator) status: "on (...)" / "off (<reason>)",
-    /// from `transformer.naxStatus()` (GPU gen + macOS floor; the bundled
+    /// from `nax_gate.naxStatus()` (GPU gen + macOS floor; the bundled
     /// MLX always ships the NAX kernels — asserted at build time).
     nax: []const u8,
 };

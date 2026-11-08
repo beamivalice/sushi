@@ -42,7 +42,6 @@ const tokenizer_mod = @import("tokenizer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const effort_mod = @import("effort.zig");
-const qwen4_config = @import("qwen4/qwen4_config.zig");
 const arch_config = @import("arch/config.zig");
 const registry = @import("arch/registry.zig");
 const arch_load = @import("arch/load.zig");
@@ -724,7 +723,7 @@ pub const ModelConfig = struct {
     pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
         if (self.isGlm5()) return 0;
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
-        if (@import("transformer.zig").qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
+        if (@import("arch/kernels.zig").scoreFusedFor(self, 1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
@@ -1779,6 +1778,62 @@ pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
     }
 }
 
+pub fn streamingWeightKey(layout: expert_quant.Layout, buf: []u8, key: []const u8) ?[]const u8 {
+    if (expert_quant.isRoutedExpertKey(layout, key)) return null;
+    if (layout == .mxfp4_split or layout == .mxfp4_individual) {
+        if (std.mem.startsWith(u8, key, "mtp.") or std.mem.startsWith(u8, key, "model.mtp.")) return null;
+        return key;
+    }
+    if (layout == .quantized_split or layout == .exl3_k4) return key;
+    return arch_load.fusedStreamKey(buf, key);
+}
+
+fn foldDeltaNorm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const one_f32 = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one_f32);
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    try mlx.check(mlx.mlx_astype(&one, one_f32, mlx.mlx_array_dtype(value), s));
+    var result = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&result, value, one, s));
+    return result;
+}
+
+pub fn fusedConvShape(shape: []const c_int) !void {
+    if (shape.len != 3 or shape[1] != 1) return error.InvalidFusedConvShape;
+}
+
+fn transposeFusedConv(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    try fusedConvShape(mlx.getShape(value));
+    const axes = [_]c_int{ 0, 2, 1 };
+    var view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_transpose_axes(&view, value, &axes, 3, s));
+    var result = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&result, view, false, s));
+    return result;
+}
+
+fn splitFusedGateUp(value: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
+    const shape = mlx.getShape(value);
+    if (shape.len != 3 or shape[1] == 0 or @mod(shape[1], 2) != 0) return error.BadPackedGateUpShape;
+    const half = @divExact(shape[1], 2);
+    const strides = [_]c_int{ 1, 1, 1 };
+    var result = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer {
+        for (result) |arr| _ = mlx.mlx_array_free(arr);
+    }
+    for (0..2) |i| {
+        const start = [_]c_int{ 0, @intCast(i * @as(usize, @intCast(half))), 0 };
+        const stop = [_]c_int{ shape[0], @intCast((i + 1) * @as(usize, @intCast(half))), shape[2] };
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, value, &start, 3, &stop, 3, &strides, 3, s));
+        try mlx.check(mlx.mlx_contiguous(&result[i], view, false, s));
+    }
+    return result;
+}
+
 pub fn streamingDropsWeightKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "language_model.mtp.");
 }
@@ -1789,7 +1844,7 @@ pub const StreamingLoad = struct { layout: expert_quant.Layout, keep_mtp: bool =
 /// experts: the stream engine serves only the trunk's MoE layers.
 pub fn streamedResidentKey(load: StreamingLoad, buf: []u8, key: []const u8) ?[]const u8 {
     if (load.keep_mtp and std.mem.startsWith(u8, key, "language_model.mtp.") and expert_quant.isRoutedExpertKey(load.layout, key)) return key;
-    return qwen4_config.qwen4StreamingWeightKey(load.layout, buf, key);
+    return streamingWeightKey(load.layout, buf, key);
 }
 
 /// `vision`: the tower's bytes, kept apart from `trunk` where a streamed load decides on it.
@@ -1802,8 +1857,17 @@ pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
         (config.isQwen4() or config.isMimo());
 }
 
-/// Flash-Next's resident tensor payloads, with the loader's vision filter and optional native head.
-pub fn qwenResidentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool, mtp_on: bool) !ResidentSplit {
+/// The quantization group a built arch's vision tower requantizes this matrix to at load; null keeps its stored bytes.
+fn towerQuantGroupAtLoad(key: []const u8, bf16: bool, dims: []const u64) ?u32 {
+    inline for (comptime std.enums.values(registry.Tag)) |t| {
+        const M = registry.Mod(t).media;
+        if (@hasDecl(M, "quantGroupAtLoad")) if (M.quantGroupAtLoad(key, bf16, dims)) |group| return group;
+    }
+    return null;
+}
+
+/// A pack's resident tensor payloads from its shard headers, with the loader's vision filter and optional native head.
+pub fn residentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool, mtp_on: bool) !ResidentSplit {
     const split = try indexedResidentSplit(io, allocator, model_dir, null, mtp_on);
     return .{ .trunk = split.trunk +| (if (vision) split.vision else 0), .mtp = split.mtp, .stq_head = split.stq_head };
 }
@@ -1869,9 +1933,9 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
             if (tensor.value_ptr.object.get("shape")) |shape| if (shape == .array and shape.array.items.len != 0 and shape.array.items[0] == .integer) {
                 size += expert_quant.rateGroupMetaBytes(canonical, std.math.cast(u64, shape.array.items[0].integer) orelse 0);
             };
-            // The Qwen tower's matrices are requantized at load (`qwen_vision.QwenVision.init`): billed as the codes.
+            // A tower its arch requantizes at load (`media.quantGroupAtLoad`) is billed as the codes.
             if (is_vision and !@import("vision_common.zig").vision_bf16) if (@import("vision_common.zig").headerMatrix(tensor.value_ptr.object)) |m| {
-                if (@import("qwen4/qwen_vision.zig").quantGroupAtLoad(canonical, m.bf16, &m.dims)) |group|
+                if (towerQuantGroupAtLoad(canonical, m.bf16, &m.dims)) |group|
                     size = @import("vision_common.zig").quantizedBytes(m.dims[0], m.dims[1], group);
             };
             if (std.mem.eql(u8, canonical, "language_model.lm_head.trellis")) stq_head = true;
@@ -2452,7 +2516,7 @@ fn loadSafetensorsFileMode(
         }
 
         if (fused_streaming and std.mem.endsWith(u8, key_str, ".mlp.experts.gate_up_proj")) {
-            var pair = try qwen4_config.qwen4SplitGateUp(final_value, s);
+            var pair = try splitFusedGateUp(final_value, s);
             errdefer {
                 if (pair[0].ctx != null) _ = mlx.mlx_array_free(pair[0]);
                 if (pair[1].ctx != null) _ = mlx.mlx_array_free(pair[1]);
@@ -2477,13 +2541,13 @@ fn loadSafetensorsFileMode(
             try putLoadedWeight(allocator, weights, down_key, final_value);
             continue;
         }
-        if (fused_streaming and qwen4_config.qwen4NormFold(key_str)) {
-            const folded = try qwen4_config.qwen4FoldNorm(final_value, s);
+        if (fused_streaming and arch_load.fusedStreamFoldsNorm(key_str)) {
+            const folded = try foldDeltaNorm(final_value, s);
             _ = mlx.mlx_array_free(final_value);
             final_value = folded;
         }
         if (fused_streaming and std.mem.endsWith(u8, key_str, "conv1d.weight") and mlx.mlx_array_ndim(final_value) == 3) {
-            const transposed = try qwen4_config.qwen4TransposeConv(final_value, s);
+            const transposed = try transposeFusedConv(final_value, s);
             _ = mlx.mlx_array_free(final_value);
             final_value = transposed;
         }
@@ -3092,6 +3156,14 @@ test "shouldKeepWeightKey gates the vision tower on load_vision" {
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
 }
 
+test "a streamed dense tensor of every layout the loader does not map itself keeps its key, whichever archs are built" {
+    var buf: [256]u8 = undefined;
+    const key = "model.layers.0.self_attn.q_proj.weight";
+    for ([_]expert_quant.Layout{ .bf16_individual, .bf16_fused, .mxfp4_w123, .fp8_individual }) |layout| {
+        try testing.expectEqualStrings(key, streamingWeightKey(layout, &buf, key) orelse return error.TensorDropped);
+    }
+}
+
 test "parseVisionProcessorDefaultsFromJson supports current and legacy Qwen layouts" {
     const current = parseVisionProcessorDefaultsFromJson(
         \\{"image_processor":{"min_pixels":65536,"max_pixels":16777216}}
@@ -3307,10 +3379,10 @@ test "a streamed load that fails mid-transform frees the tensor it was holding" 
             return n;
         }
     };
-    try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false, false));
+    try t.expectError(error.InvalidFusedConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false, false));
     const before = FdProbe.count(io);
     for (0..8) |_| {
-        try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false, false));
+        try t.expectError(error.InvalidFusedConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false, false));
     }
     const after = FdProbe.count(io);
     try t.expect(after <= before + 1);

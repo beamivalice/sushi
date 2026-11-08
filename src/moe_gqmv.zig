@@ -1,6 +1,6 @@
 const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const trunk = @import("trunk.zig");
-const qwen4Standin = @import("qwen4/qwen4_forward.zig").qwen4Standin;
+const arch_kernels = @import("arch/kernels.zig");
 const std = @import("std");
 const expert_stream_mod = @import("expert_stream.zig");
 const mlx = @import("mlx.zig");
@@ -438,7 +438,7 @@ pub fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int) MoeDecodeDispatchArm {
     const total_inds: c_int = B * S * K;
     const do_sort = B * S > 1 or total_inds >= 64;
     if (B >= 1 and B <= 8 and S >= 1 and B * S >= 2 and B * S <= 16 and moeRowsFusedEnabled() and
-        !qwen4Standin().moe_gateup and !qwen4Standin().moe_down)
+        !arch_kernels.moeStandin().moe_gateup and !arch_kernels.moeStandin().moe_down)
         return .rows;
     if (do_sort) return .sorted;
     return .gather_qmv;

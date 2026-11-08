@@ -68,6 +68,25 @@ pub const State = struct {
         return self.mtp != null;
     }
 
+    /// The single-verify features, the grouped MoE rows and the per-row rollback are this trunk's verify kernels.
+    pub fn rowVerify(self: *const State) bool {
+        return self.model != null;
+    }
+
+    pub fn headCache(self: *const State) ?*const trunk.KVCache {
+        return if (self.mtp) |*m| &m.cache else null;
+    }
+
+    pub fn headEntry(self: *State) ?*trunk.SSMCacheEntry {
+        return if (self.mtp) |*m| &m.entry else null;
+    }
+
+    pub fn verifyRowsGrouped(t: *Trunk, token_rows: []const mlx.mlx_array, ctxs: []const *trunk.ForwardCtx) bool {
+        return qwen4_forward.qwen4VerifyRowsEligible(t, token_rows, ctxs);
+    }
+
+    pub const forwardVerifyRowsGrouped = qwen4_forward.forwardQwen4VerifyRows;
+
     pub fn compile(t: *Trunk, set: arch_state.CompileSet) void {
         if (!isLoaded(t)) return;
         if (t.config.linear_num_key_heads > 0) qwen4_forward.compileGdnGate(t);
@@ -119,38 +138,32 @@ pub const State = struct {
     }
 };
 
-/// Whether this build serves Flash-Next.
-pub const built = @hasField(arch_state.State, "qwen4");
-
-/// Flash-Next's state on `t`; null in a build without qwen4.
-pub fn stateOf(t: *Trunk) ?*State {
-    return if (comptime built) &t.arch_state.qwen4 else null;
+/// Flash-Next's state on `t`.
+pub fn stateOf(t: *Trunk) *State {
+    return &t.arch_state.qwen4;
 }
 
-pub fn stateOfConst(t: *const Trunk) ?*const State {
-    return if (comptime built) &t.arch_state.qwen4 else null;
+pub fn stateOfConst(t: *const Trunk) *const State {
+    return &t.arch_state.qwen4;
 }
 
-/// Flash-Next's part of a forward context; null in a build without qwen4.
-pub fn ctxOf(c: *trunk.ForwardCtx) ?*Ctx {
-    return if (comptime built) &c.arch_ctx.qwen4 else null;
+/// Flash-Next's part of a forward context.
+pub fn ctxOf(c: *trunk.ForwardCtx) *Ctx {
+    return &c.arch_ctx.qwen4;
 }
 
 /// Whether `t` holds a loaded Flash-Next model.
 pub fn isLoaded(t: *const Trunk) bool {
-    const st = stateOfConst(t) orelse return false;
-    return st.model != null;
+    return stateOfConst(t).model != null;
 }
 
-/// The loaded MTP head; null without one, or in a build without qwen4.
+/// The loaded MTP head; null without one.
 pub fn mtpOf(t: *Trunk) ?*qwen4_forward.Qwen4Mtp {
-    const st = stateOf(t) orelse return null;
-    return if (st.mtp) |*m| m else null;
+    return if (stateOf(t).mtp) |*m| m else null;
 }
 
 pub fn mtpOfConst(t: *const Trunk) ?*const qwen4_forward.Qwen4Mtp {
-    const st = stateOfConst(t) orelse return null;
-    return if (st.mtp) |*m| m else null;
+    return if (stateOfConst(t).mtp) |*m| m else null;
 }
 
 /// What a forward context carries for Flash-Next (`ForwardCtx.arch_ctx.qwen4`).
@@ -190,6 +203,11 @@ pub const Ctx = struct {
     pub fn mrope(self: *const Ctx) ?mrope_mod.PositionContext {
         const pos = self.mrope_pos orelse return null;
         return .{ .pos = pos, .total = self.mrope_total, .delta = self.mrope_delta };
+    }
+
+    pub fn setLayerCapture(self: *Ctx, input: ?mlx.mlx_array, skip_ple: bool) void {
+        self.skip_ple = skip_ple;
+        if (input) |i| self.stream_in = i;
     }
 
     pub fn setMrope(self: *Ctx, pos: ?[]const i32, total: usize, delta: i32) void {

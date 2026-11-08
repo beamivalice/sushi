@@ -15,8 +15,8 @@ pub fn handleOf(t: *Trunk) Handle {
     return registry.handleOf(t);
 }
 
-/// The handle of a trunk a test built by hand, which carries no arch stamp: it takes the first built arch's prong, and
-/// every read the engine makes through `trunk` is the same on each prong.
+/// The handle of a trunk a test built by hand, which carries no arch stamp: it dispatches as the first built arch
+/// wherever the tag decides, whatever its config names; every read through `trunk` is the same on each prong.
 pub fn fixtureHandle(t: *Trunk) Handle {
     t.arch = std.enums.values(registry.Tag)[0];
     return handleOf(t);

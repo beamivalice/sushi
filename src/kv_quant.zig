@@ -1,7 +1,7 @@
 // KV-cache quantization backend.
 //
 // This module owns the storage / dispatch contract between the cache
-// (`KVCache` in `transformer.zig`) and the attention call sites. SDPA always
+// (`KVCache` in `kv_cache.zig`) and the attention call sites. SDPA always
 // reads dense `[B, H, T, head_dim]` tensors via `KVCache.denseView` — what the
 // cache buffers actually hold is decided here.
 //
@@ -13,7 +13,7 @@
 // Adding a scheme: one `Scheme` variant, a quantize/dequantize pair here,
 // one arm each in `KVCache.update` (write) and `KVCache.denseView` (read).
 // SDPA call sites never change; the cache contract holds. The fused
-// quantized-attention kernels key on the affine triple (`transformer.zig`).
+// quantized-attention kernels key on the affine triple (`trunk.zig`).
 
 const std = @import("std");
 const mlx = @import("mlx.zig");

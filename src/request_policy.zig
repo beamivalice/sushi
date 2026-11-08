@@ -35,11 +35,7 @@ const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseOnOff = server.parseOnOff;
 const parseRequestSeed = request_parse.parseRequestSeed;
 const pickStreamMode = generation_stream.pickStreamMode;
-const prefillRequestTerms = server.prefillRequestTerms;
 const promptOpensThink = server.promptOpensThink;
-const fixtures = @import("bills_fixtures_test.zig");
-const qsaScoreFusedOffGuard = fixtures.qsaScoreFusedOffGuard;
-const qwen4ExpOomConfig = fixtures.qwen4ExpOomConfig;
 const renderConfigFor = server.renderConfigFor;
 const requestSpecModes = generation_stream.requestSpecModes;
 const sendAnthropicError = @import("anthropic.zig").sendAnthropicError;
@@ -116,7 +112,7 @@ pub fn omittedMaxTokensDefault(config: *const model_mod.ModelConfig) u32 {
 
 /// Pure core of the above with the launch default (`--max-tokens N`, 0 = unset) passed in.
 /// The flag outranks both fallbacks.
-fn omittedMaxTokensDefaultWith(effective_ctx: u32, launch_default: u32, model_default: u32) u32 {
+pub fn omittedMaxTokensDefaultWith(effective_ctx: u32, launch_default: u32, model_default: u32) u32 {
     if (launch_default > 0) return launch_default;
     if (model_default > 0) return model_default;
     return if (effective_ctx > 0) AUTO_MAX_TOKENS_SENTINEL else 4096;
@@ -1249,38 +1245,6 @@ test "optSamplingRecJson emits number when present, null when absent" {
     const none = try optSamplingRecJson(a, u32, null);
     defer a.free(none);
     try std.testing.expectEqualStrings("null", none);
-}
-
-test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bill 26 TB" {
-    const qsa_fused_off = qsaScoreFusedOffGuard();
-    defer qsa_fused_off.deinit();
-    const t = std.testing;
-    // An omitted `max_tokens` is maxInt(u32)/4; the memory guard used to run before
-    // `clampMaxTokens`, so the reservation billed ~26 TB of KV and refused every long prompt.
-    const KVCache = trunk.KVCache;
-    const ctx: u64 = 262_144;
-    const seq: u64 = 50_000;
-    const sentinel: u64 = omittedMaxTokensDefaultWith(@intCast(ctx), 0, 0);
-    try t.expectEqual(@as(u64, std.math.maxInt(u32) / 4), sentinel);
-
-    // (1) The cache clamps: the reservation cannot exceed the context plus a chunk.
-    const reserved = KVCache.reservedTokens(seq, sentinel, 4096, ctx);
-    // Bounded twice: by the generation headroom first, by the context second.
-    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, reserved);
-    try t.expect(reserved < ctx);
-    // (2) The four surfaces clamp first and hand the guard the clamped value.
-    const clamped: u64 = clampMaxTokens(@intCast(sentinel), @intCast(seq), @intCast(ctx));
-    try t.expectEqual(ctx - seq, clamped);
-    try t.expectEqual(reserved, KVCache.reservedTokens(seq, clamped, 4096, ctx));
-
-    try t.expectEqual(seq + 2048 + 4096, KVCache.reservedTokens(seq, 2048, 4096, ctx));
-    // A caller that names no context is not context-clamped, but the headroom bound still applies.
-    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, KVCache.reservedTokens(seq, sentinel, 4096, 0));
-    try t.expectEqual(ctx + 4096, KVCache.reservedTokens(ctx, sentinel, 4096, ctx));
-
-    const cfg = qwen4ExpOomConfig();
-    const terms = prefillRequestTerms(&cfg, seq, clamped, 8, 4096, .{});
-    try t.expect(terms.reserved_kv_bytes < 4 * 1024 * 1024 * 1024);
 }
 
 test "a request integer from a client is clamped, never blindly @intCast" {

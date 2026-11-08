@@ -1,6 +1,6 @@
 const std = @import("std");
 const arch_handle = @import("arch/handle.zig");
-const transformer_mod = @import("transformer.zig");
+const arch_kernels = @import("arch/kernels.zig");
 const trunk = @import("trunk.zig");
 const model_mod = @import("model.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -128,8 +128,8 @@ pub fn batchKvLenOfWith(cache: *const KVCache, cfg: ?*const model_mod.ModelConfi
     const c = cfg orelse return @intCast(cache.step);
     if (!c.longCtxGated()) return @intCast(cache.step);
     const raw: u32 = @intCast(cache.kvLenForBatching());
-    const gather_on = transformer_mod.qsaBatchedGatherOn(seq_len);
-    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len, cache.config.scheme == .affine));
+    const gather_on = arch_kernels.batchedGatherOn(c, seq_len);
+    const min_kv: u32 = @intCast(arch_kernels.batchedGatherFloor(c, seq_len, cache.config.scheme == .affine));
     return c.batchedEffectiveKvLen(raw, gather_on, min_kv);
 }
 

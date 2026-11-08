@@ -1,6 +1,5 @@
 const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
-const qwen4_state = @import("qwen4_state.zig");
 const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
@@ -924,7 +923,6 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
 }
 
 test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to keep" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -1059,7 +1057,6 @@ test "qsa rollback: a rollback that reaches past the ring is a named error, not 
 }
 
 test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied history" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -1131,7 +1128,6 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
 }
 
 test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at the trunk's checkpoint" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -1233,7 +1229,6 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
 }
 
 test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept leftover is not resliced" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -2079,7 +2074,6 @@ test "qsa key history: capacity-buffer append equals the concatenated reference,
 }
 
 test "qsa pooled bank: capacity append equals the concat, and the f32 score operand is rebuilt only when a block completes" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     // The bf16 bank must stay byte-for-byte the old `concatenate`; 12 layers of one forward reuse one f32 build.
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -2158,7 +2152,6 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
 }
 
 test "qsa score bank: incremental column append matches a from-scratch rebuild" {
-    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 

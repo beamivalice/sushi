@@ -29,17 +29,34 @@ pub const flags = @import("qwen4_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("qwen4_drafter.zig");
 
+pub const load = @import("qwen4_load.zig");
+
+pub const ubench = @import("ubench_qwen4.zig");
+
 pub const sched = @import("qwen4_sched.zig"); // slot:sched (S2b)
 
 pub const prefix = @import("qwen4_prefix.zig"); // slot:prefix (S2c)
 
 pub const bill = @import("qwen4_bill.zig"); // slot:bill (S2d)
 
+pub const kernels = struct {
+    pub const batchedGatherOn = qwen4_qsa_gather.qsaBatchedGatherOn;
+    pub const batchedGatherFloor = qwen4_qsa_gather.qsaBatchedGatherFloor;
+    pub const scoreFusedFor = qwen4_qsa_select.qsaScoreFusedActiveFor;
+    pub const warmEnvCaches = @import("qwen4_qsa_attn.zig").warmQsaEnvCaches;
+
+    pub inline fn moeStandin() @import("../arch/kernels.zig").MoeStandin {
+        const s = qwen4_forward.qwen4Standin();
+        return .{ .moe_shared = s.moe_shared, .moe_router = s.moe_router, .moe_gateup = s.moe_gateup, .moe_down = s.moe_down };
+    }
+};
+
 const config_file = @import("qwen4_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "qwen4_exp", "qwen4_exp_text" };
 pub const discovery_types = config_types;
 pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .hyper_connected = true };
+pub const pack_layout: arch_config.PackLayout = .{ .prefix = "language_model.model", .head = .{ .layer = "language_model.mtp.layers.0" }, .streams_groups = true };
 pub const parseConfig = config_file.parseFamily;
 pub const parseDir = config_file.parseDir;
 pub const samplingDefaults = config_file.samplingDefaults;

@@ -1,5 +1,6 @@
 //! Flash-Next prefix-cache parts: the QSA-history section of an SSD record, the GDN/QSA accelerators on an SSM
 //! entry, and the adoption of a committed MTP head. Reached through `arch/prefix.zig`.
+const std = @import("std");
 const trunk_mod = @import("../trunk.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const pc = @import("../prefix_cache.zig");
@@ -14,7 +15,9 @@ pub const disk = @import("qwen4_disk_qsa.zig");
 /// What an SSM entry carries beside the GDN pair: the PLE token window, the QSA key history and its accelerators,
 /// and the replay record of a verify that kept only its final state.
 pub const aux = struct {
-    pub const ple_prev_len = qwen4_exp.MAX_NGRAM_SIZE;
+    comptime {
+        std.debug.assert(qwen4_exp.MAX_NGRAM_SIZE == trunk_mod.PLE_PREV_MAX);
+    }
     pub const Replay = gdn_decode.Replay;
     pub const replayState = gdn_decode.replayState;
     pub const qsaHistoryRows = qsa_state.qsaHistoryRows;
@@ -24,6 +27,18 @@ pub const aux = struct {
     pub const qsaKeyAppendPlan = qsa_state.qsaKeyAppendPlan;
     pub const qsaLeftoverAt = qsa_state.qsaLeftoverAt;
     pub const qsaResliceToKeep = qsa_state.qsaResliceToKeep;
+    pub const applyQsaHistoryAt = qsa_state.applyQsaHistoryAt;
+    pub const attachQsaHistoryToLatest = qsa_state.attachQsaHistoryToLatest;
+    pub const checkpointHasQsaPooled = qsa_state.checkpointHasQsaPooled;
+    pub const checkpointListHasQsaPooled = qsa_state.checkpointListHasQsaPooled;
+    pub const checkpointQsaCoversPos = qsa_state.checkpointQsaCoversPos;
+    pub const entriesHaveQsaHistory = qsa_state.entriesHaveQsaHistory;
+    pub const handoffQsaHistoryToLatest = qsa_state.handoffQsaHistoryToLatest;
+    pub const keepOnlyLatestQsaHistory = qsa_state.keepOnlyLatestQsaHistory;
+    pub const qsaRestoreSatisfiesForward = qsa_state.qsaRestoreSatisfiesForward;
+    pub const reserveQsaHistoryWithHead = qsa_state.reserveQsaHistoryWithHead;
+    pub const sliceQsaHistoryOntoCheckpoint = qsa_state.sliceQsaHistoryOntoCheckpoint;
+    pub const snapshotHasQsaHistory = qsa_state.snapshotHasQsaHistory;
 
     pub fn noteHistorySeed() void {
         qsa_state.qsa_history_seeds += 1;
