@@ -113,6 +113,8 @@ test {
     _ = @import("kv_disk_cache.zig");
     _ = @import("disk_placement.zig");
     _ = @import("kv_disk_writer.zig");
+    _ = @import("prefix_vfs_tensors.zig");
+    _ = @import("prefix_vfs_tensors_test.zig");
     _ = @import("prefix_cache_admin.zig");
     _ = @import("settings_api.zig");
     _ = @import("model_discovery.zig");
