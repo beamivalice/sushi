@@ -52,6 +52,7 @@ test {
     _ = @import("expert_usage.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");
+    _ = @import("prefix_vfs.zig");
     _ = @import("cache_stats.zig");
     _ = @import("spec_stats.zig");
     _ = @import("metrics_history.zig");
