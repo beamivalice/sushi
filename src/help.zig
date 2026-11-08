@@ -329,7 +329,7 @@ fn thinkParts(comptime field: []const u8, comptime sep: []const u8) []const u8 {
             order[n] = t;
             n += 1;
         };
-        for (1..n) |i| {
+        for (0..n) |i| {
             var j = i;
             while (j > 0 and flagsOf(order[j]).think_rank < flagsOf(order[j - 1]).think_rank) : (j -= 1) {
                 const a = order[j];

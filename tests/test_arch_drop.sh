@@ -11,9 +11,13 @@
 #   5. tests/test_doc_links.sh
 # A stray reference outside the folder fails step 2. `-Darchs` alone cannot catch one: the folder still exists.
 #
+# Then, for each registered arch, `zig build -Doptimize=ReleaseFast -Darchs=<it>` in the checkout, into a directory of
+# its own and without the host tier: a build with only one arch compiles every comptime branch an empty union or list
+# takes, which the drop (Debug, the other archs still present) does not.
+#
 # An arch joins DROPPABLE in its S4 stage. DROP_TRY=<arch> runs the same check for an arch not in the list (it is
 # expected to fail while shared code still names it); DROP_KEEP=1 keeps the worktree for a look. DROP_ONLY=<arch>
-# drops only that arch, for a local run; the registry check still covers every arch.
+# drops and builds only that arch, for a local run; the registry check still covers every arch.
 #
 # Usage: ./tests/test_arch_drop.sh
 
@@ -100,6 +104,31 @@ drop_one() {
 for arch in "${DROPPABLE[@]+"${DROPPABLE[@]}"}" ${DROP_TRY:-}; do
   [ -z "${DROP_ONLY:-}" ] || [ "$arch" = "$DROP_ONLY" ] || continue
   drop_one "$arch" || FAIL=1
+done
+
+only_one() {
+  local arch=$1 out start rc=0
+  if [ ! -x "$ZIG" ]; then
+    echo "  SKIP: no $ZIG (run ./scripts/fetch-zig.sh)"
+    return 0
+  fi
+  out=$(mktemp -d "${TMPDIR:-/tmp}/arch-only-$arch.XXXXXX")
+  while [ -e "$QUIET" ]; do sleep 5; done
+  start=$(date +%s)
+  taskpolicy -a "$ZIG" build -Doptimize=ReleaseFast -Darchs="$arch" -p "$out" > "$out/log" 2>&1 || rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "  FAIL: building only $arch ($(( $(date +%s) - start ))s); last lines of the log:"
+    tail -15 "$out/log" | sed 's/^/    | /'
+  else
+    echo "  PASS: building only $arch (ReleaseFast) ($(( $(date +%s) - start ))s)"
+  fi
+  rm -rf "$out"
+  return $rc
+}
+
+for arch in $registered; do
+  [ -z "${DROP_ONLY:-}" ] || [ "$arch" = "$DROP_ONLY" ] || continue
+  only_one "$arch" || FAIL=1
 done
 
 if [ $FAIL -eq 0 ]; then

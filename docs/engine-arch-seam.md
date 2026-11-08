@@ -246,6 +246,12 @@ folder. `DROP_TRY=<arch>` runs the same check for an arch not in the list (a str
 CI runs it on every PR as a step of the build-and-test job, after the test tier, on the runner and build that job
 already set up; the loop covers every arch in `DROPPABLE` (mimo2, dsv41, glm5 and qwen4 today).
 
+After the drops it builds each registered arch alone: `zig build -Doptimize=ReleaseFast -Darchs=<it> -p <a directory of
+its own>`, no host tier. A subset build takes comptime branches a full build never does (a union with no prong, a list
+with no entry), and a drop leaves the other archs in, so only this pass catches them. A union or enum built from the
+archs that declare something is empty in a build with none: `UnionOf` in `arch/drafter.zig` returns an empty
+`union(enum)` and the dispatch over it is `unreachable`, and a loop over such a list starts at 0, never at `1..n`.
+
 `zig build arch-slice -Dslice-arch=<name>` is the quick form of the same question, for the arch's own folder: it compiles
 `src/<name>/arch.zig` as a module of its own, with `build_options`, `sushi_exl3` and `arch_host` (here
 `arch_host_stub.zig`) as its only imports, and walks its public declarations (`src/arch/slice_check.zig`). Zig reads a
@@ -256,7 +262,8 @@ are in `arch_tests.zig`, outside the slice's module graph, so a test file may re
 
 A passing drop of one arch costs about 2.7 minutes on the M5 Max (cold `.zig-cache`, warm global cache,
 `taskpolicy -a`, Debug): 27 s for `zig build`, 41 s for `zig build test-build`, 92 s for `zig build test-host`, 1 s for
-the link check. A busy box roughly doubles it. Expect the same order on a CI runner.
+the link check. Each single-arch ReleaseFast build adds about 2 minutes (107 s qwen4, 129 s mimo2; cold `.zig-cache`
+for that arch set). A busy box roughly doubles it. Expect the same order on a CI runner.
 
 A drop is one commit that removes:
 - `src/<arch>/` (its fixtures go with it), its registry entry (its packs and flags go with the folder);

@@ -32,6 +32,7 @@ fn namesWith(comptime decl: []const u8) []const []const u8 {
 /// One prong per registered arch whose drafter declares `decl`, typed by it.
 fn UnionOf(comptime decl: []const u8) type {
     const names = comptime namesWith(decl);
+    if (names.len == 0) return union(enum) {};
     var values: [names.len]u8 = undefined;
     var types: [names.len]type = undefined;
     for (names, 0..) |n, i| {
@@ -44,6 +45,8 @@ fn UnionOf(comptime decl: []const u8) type {
 
 const HeadUnion = UnionOf("Head");
 const CacheUnion = UnionOf("Cache");
+/// With no built head cache the union is empty: no such value exists, so a dispatch over it is unreachable.
+const no_caches = std.meta.fieldNames(CacheUnion).len == 0;
 
 pub const Drafter = struct {
     u: HeadUnion,
@@ -231,13 +234,13 @@ pub const DraftCache = struct {
 
     /// Installs this request's state on the head; a no-op where the history is per-request already.
     pub fn activate(self: *const DraftCache) void {
-        switch (self.u) {
+        if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| c.activate(),
         }
     }
 
     pub fn step(self: *const DraftCache) usize {
-        return switch (self.u) {
+        return if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| c.step(),
         };
     }
@@ -245,26 +248,26 @@ pub const DraftCache = struct {
     /// The underlying KVCache the prefix cache's spec-snap machinery snapshots and restores. A head whose state is
     /// not KV-only also needs `head()`. Null when the head keeps nothing to snapshot.
     pub fn kv(self: *const DraftCache) ?*KVCache {
-        return switch (self.u) {
+        return if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| c.kv(),
         };
     }
 
     /// The Trunk owning an in-checkpoint head; null on the other arms and whenever `kv()` is null.
     pub fn head(self: *const DraftCache) ?*Trunk {
-        return switch (self.u) {
+        return if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| if (comptime @hasDecl(@TypeOf(c.*), "head")) c.head() else null,
         };
     }
 
     pub fn truncate(self: *DraftCache, len: usize, s: mlx.mlx_stream) !void {
-        switch (self.u) {
+        if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| try c.truncate(len, s),
         }
     }
 
     pub fn deinit(self: *DraftCache) void {
-        switch (self.u) {
+        if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| c.deinit(),
         }
     }
@@ -272,14 +275,14 @@ pub const DraftCache = struct {
     /// Appends this cache's storage to a prefill eval batch, so the chunk's activation graph can be freed with the
     /// chunk instead of accumulating across the whole prompt.
     pub fn appendEvalArrays(self: *const DraftCache, vec: mlx.mlx_vector_array) void {
-        switch (self.u) {
+        if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| c.appendEvalArrays(vec),
         }
     }
 
     /// Is the history rebuilt from the prompt's tail, so the final prefill chunk's storage need not be evaluated?
     pub fn rebuiltFromTail(self: *const DraftCache) bool {
-        return switch (self.u) {
+        return if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| @hasDecl(@TypeOf(c.*), "rebuilt_from_tail") and @TypeOf(c.*).rebuilt_from_tail,
         };
     }
@@ -287,7 +290,7 @@ pub const DraftCache = struct {
     /// How far the head's position drifted from where the round starting at head row `off0` would read it; 0 where
     /// the head keeps no position of its own.
     pub fn positionDrift(self: *const DraftCache, off0: usize) i64 {
-        return switch (self.u) {
+        return if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| if (comptime @hasDecl(@TypeOf(c.*), "positionDrift")) c.positionDrift(off0) else 0,
         };
     }
@@ -295,7 +298,7 @@ pub const DraftCache = struct {
     /// After a forced commit left a hole in the history: starts a head that refuses a gap over. True when it did,
     /// and the pending history stash is stale.
     pub fn reseedAfterForcedCommit(self: *const DraftCache) !bool {
-        return switch (self.u) {
+        return if (no_caches) unreachable else switch (self.u) {
             inline else => |*c| if (comptime @hasDecl(@TypeOf(c.*), "reseedAfterForcedCommit")) blk: {
                 try c.reseedAfterForcedCommit();
                 break :blk true;

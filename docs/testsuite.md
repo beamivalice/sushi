@@ -105,7 +105,7 @@ and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone che
   `--write` to list its new name. To clear a failure, move the test into
   `src/<model>/`, or rename it for the shared code it tests.
 - **The seam is enforced by the type system, not a guard.** `tests/test_arch_drop.sh` compiles the engine without each
-  arch, so shared code that imports one fails to build ([engine-arch-seam](engine-arch-seam.md)).
+  arch and with each arch alone, so shared code that imports one fails to build ([engine-arch-seam](engine-arch-seam.md)).
 
 ## Lint
 
