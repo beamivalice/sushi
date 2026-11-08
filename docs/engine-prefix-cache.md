@@ -217,6 +217,11 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   history decline): the entry keeps its recency and its admission protection drops, else the count cap's next
   victim is an entry that can serve.
 - Checkpoint retention thins the INTERIOR with a dense newest quarter (`spanPreservingDropIndex`, `ThinPolicy`).
+- **An evicted SSD record hands its highest point inside a survivor's shared prefix to that survivor**
+  (`bequeathPoint`, by hard link, its bytes moved to the survivor's bill): only when the survivor holds the same
+  chunk inodes and equal QSA segment hashes below it, and has no point as high there. An heir keeps points only past
+  where it diverged, so once the oldest record went, a client that changed an early image (the newest-24-images
+  window) found no point below it and prefilled about 300k tokens cold.
 - An oversized candidate is TRIMMED to the longest restorable prefix that fits (`trimLenForBudget`,
   `KVCacheSnapshot.trimmedCopy` is a REAL copy); a QSA trim bills the bank on the final retained checkpoint.
 - **A ringed candidate trims only where it restores** (`ringTrimLen`): its end, dropping the reservation's spare

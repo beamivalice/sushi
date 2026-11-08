@@ -3991,6 +3991,93 @@ pub const DiskTier = struct {
         root_dir.deleteTree(self.io, rel) catch {};
     }
 
+    /// Before `idx` is evicted: hard-link its highest point inside the prefix a resident entry provably holds
+    /// the same rows for into that entry, when it beats that entry's own. Heirs keep points only past where they
+    /// diverged, so once the oldest record of a conversation went a request that changed an early image restored
+    /// nothing. The point's bytes move to the heir's bill: the tier's total stays the bytes on disk.
+    fn bequeathPoint(self: *DiskTier, idx: usize) void {
+        if (self.grown != null) return;
+        const dead = &self.entries.items[idx];
+        if (dead.poisoned or dead.rings.len > 0) return;
+        var best: ?struct { heir: usize, pos: u32, bytes: u64 } = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (i == idx or e.poisoned or e.rings.len > 0 or e.has_tools != dead.has_tools or !std.meta.eql(e.quant, dead.quant)) continue;
+            const shared = @min(commonPrefixLen(e.tokens, dead.tokens), commitShares(e, .{ .key = dead.vision_key, .start = dead.media_start }), e.kv_len, dead.kv_len);
+            const own: u32 = self.highestSsmPosAtOrBelow(i, @intCast(shared)) orelse 0;
+            for (dead.ssm_positions, dead.ssm_bytes) |p, b| {
+                if (p > shared) break;
+                if (p <= own or (best != null and p <= best.?.pos)) continue;
+                if (!self.sameRowsBelow(dead, e, p)) continue;
+                best = .{ .heir = i, .pos = p, .bytes = b };
+            }
+        }
+        const pick = best orelse return;
+        self.linkPointInto(dead.id, pick.heir, pick.pos, pick.bytes) catch |err| {
+            log.warn("  [disk-cache] keeping e{d}'s point at {d} failed: {s}\n", .{ dead.id, pick.pos, @errorName(err) });
+            return;
+        };
+        log.info("  [disk-cache] e{d} keeps e{d}'s restore point at {d} by hard link\n", .{ self.entries.items[pick.heir].id, dead.id, pick.pos });
+    }
+
+    /// Do `a` and `b` hold the same bytes for every row a restore at `p` reads: the same KV chunk files and, on a
+    /// QSA record, the same history segments?
+    fn sameRowsBelow(self: *DiskTier, a: *const IndexEntry, b: *const IndexEntry, p: u32) bool {
+        const n_chunks = (p + self.chunk_tokens - 1) / self.chunk_tokens;
+        if (a.chunk_bytes.len < n_chunks or b.chunk_bytes.len < n_chunks) return false;
+        for (0..n_chunks) |i| {
+            var pa: [1024]u8 = undefined;
+            var pb: [1024]u8 = undefined;
+            const fa = std.fmt.bufPrint(&pa, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, a.id, i }) catch return false;
+            const fb = std.fmt.bufPrint(&pb, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, b.id, i }) catch return false;
+            const sa = statFile(self.io, fa) orelse return false;
+            const sb = statFile(self.io, fb) orelse return false;
+            if (sa.inode != sb.inode) return false;
+        }
+        if (a.qsa_history_rows == 0 and b.qsa_history_rows == 0) return true;
+        if (b.qsa_history_rows < p or self.seg_span == 0 or p % self.seg_span != 0) return false;
+        const k = p / self.seg_span;
+        if (a.qsa_segs.len < k or b.qsa_segs.len < k) return false;
+        for (a.qsa_segs[0..k], b.qsa_segs[0..k]) |x, y| if (x.hash != y.hash or x.bytes != y.bytes) return false;
+        return true;
+    }
+
+    /// Hard-link entry `from`'s point at `pos` into entry `heir_idx` and list it there, billed to it.
+    fn linkPointInto(self: *DiskTier, from: u64, heir_idx: usize, pos: u32, bytes: u64) !void {
+        const heir = &self.entries.items[heir_idx];
+        var root_dir = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
+        defer root_dir.close(self.io);
+        var ob: [256]u8 = undefined;
+        var nb: [256]u8 = undefined;
+        const old_sub = try std.fmt.bufPrint(&ob, "e{d}/s{d:0>7}.safetensors", .{ from, pos });
+        const new_sub = try std.fmt.bufPrint(&nb, "e{d}/s{d:0>7}.safetensors", .{ heir.id, pos });
+        var ab: [1024]u8 = undefined;
+        const old_abs = try std.fmt.bufPrint(&ab, "{s}/{s}", .{ self.root, old_sub });
+        if (fileSize(self.io, old_abs) != bytes) return error.PointNotLanded;
+        try std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{});
+        errdefer root_dir.deleteFile(self.io, new_sub) catch {};
+        var at: usize = 0;
+        while (at < heir.ssm_positions.len and heir.ssm_positions[at] < pos) at += 1;
+        const positions = try self.allocator.alloc(u32, heir.ssm_positions.len + 1);
+        errdefer self.allocator.free(positions);
+        const sizes = try self.allocator.alloc(u64, heir.ssm_bytes.len + 1);
+        errdefer self.allocator.free(sizes);
+        @memcpy(positions[0..at], heir.ssm_positions[0..at]);
+        positions[at] = pos;
+        @memcpy(positions[at + 1 ..], heir.ssm_positions[at..]);
+        @memcpy(sizes[0..at], heir.ssm_bytes[0..at]);
+        sizes[at] = bytes;
+        @memcpy(sizes[at + 1 ..], heir.ssm_bytes[at..]);
+        var next = heir.*;
+        next.ssm_positions = positions;
+        next.ssm_bytes = sizes;
+        next.bytes += bytes;
+        try self.writeMeta(next);
+        self.allocator.free(heir.ssm_positions);
+        self.allocator.free(heir.ssm_bytes);
+        heir.* = next;
+        self.total_bytes += bytes;
+    }
+
     fn gcToBudget(self: *DiskTier) void {
         if (self.max_bytes == 0) return;
         while (self.total_bytes > self.max_bytes and self.entries.items.len > 1) {
@@ -4005,6 +4092,7 @@ pub const DiskTier = struct {
             const mb = @as(f64, @floatFromInt(self.entries.items[lru_idx].bytes)) / (1024.0 * 1024.0);
             log.info("  [disk-cache] evicted LRU entry (byte budget; {d:.1} MB)\n", .{mb});
             cache_stats.process.recordEviction(.ssd, self.entries.items[lru_idx].bytes);
+            self.bequeathPoint(lru_idx);
             self.removeAt(lru_idx);
         }
     }
@@ -5868,6 +5956,57 @@ test "DiskTier row-segment share: an heir links the donor's whole segments insid
         for (kept.ssm_positions) |p| try expectGrowPoint(&tier, kept.id, p, s);
         try testing.expectEqual(try uniqueDirBytes(io, &tier), tier.total_bytes);
     }
+}
+
+test "DiskTier: an evicted record leaves its highest point inside the prefix a survivor shares to that survivor" {
+    // An heir keeps points only past where it diverged; once the oldest record went, a request that changed an
+    // early image found no point below the change and prefilled 300k tokens cold.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var probe: [600]u32 = undefined;
+    for (&probe, 0..) |*t, i| t.* = if (i < 400) @intCast(i + 7) else @intCast(20000 + i);
+    var heir_id: u64 = 0;
+    {
+        var tier = try growTier(io, base, "fp-bequeath", false, false);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+        try commitDonorAndHeir(&tier, s, 450, &.{577});
+        heir_id = tier.entries.items[1].id;
+        tier.max_bytes = tier.total_bytes - 1;
+        tier.gcToBudget();
+        try testing.expectEqual(@as(usize, 1), tier.entryCount());
+        const m = tier.bestHybridMatch(&probe, false, kv_quant.KVQuantConfig.dense, std.math.maxInt(u32), .{}) orelse return error.TestExpectedMatch;
+        try testing.expectEqual(heir_id, tier.entries.items[m.idx].id);
+        try testing.expectEqual(@as(u32, 384), m.cp);
+        try expectGrowPoint(&tier, heir_id, 384, s);
+        try testing.expectEqual(try uniqueDirBytes(io, &tier), tier.total_bytes);
+    }
+    var again = try growTier(io, base, "fp-bequeath", false, false);
+    defer again.deinit();
+    try testing.expectEqualSlices(u32, &.{ 384, 577 }, again.entries.items[0].ssm_positions);
+    try testing.expectEqual(try uniqueDirBytes(io, &again), again.total_bytes);
+}
+
+test "DiskTier: an evicted record leaves no point to an entry whose rows below it are its own" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try growTier(io, base, "fp-bequeath-own", false, false);
+    defer tier.deinit();
+    // The synchronous legacy arm shares no chunk: the second record wrote its own rows.
+    try commitDonorAndHeir(&tier, s, 450, &.{577});
+    try testing.expectEqual(@as(u32, 0), tier.entries.items[1].inherited_chunks);
+    tier.max_bytes = tier.total_bytes - 1;
+    tier.gcToBudget();
+    try testing.expectEqualSlices(u32, &.{577}, tier.entries.items[0].ssm_positions);
 }
 
 test "DiskTier row-segment share: a scan accepts linked segments and bills each once; removing the last owner frees them" {
