@@ -1601,7 +1601,7 @@ test "POST /v1/completions with a prompt that tokenizes to nothing answers 400 b
     var lm: LoadedModel = undefined;
     lm.config = &cfg;
     lm.tokenizer = &tok;
-    lm.transformer = null;
+    lm.handle = null;
     lm.dflash = null;
     lm.mtp = null;
 

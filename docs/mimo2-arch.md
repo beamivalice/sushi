@@ -52,9 +52,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   Q/K/V (`[Q_rank | K_rank | V_rank]` regrouped without dequantizing). Extra scale rows belong to partial
   rank-local tiles, not trailing padding on the full tensor. Tensor-parallel 4 is solved from geometry.
 - **A MiMo EXL3 pack serves RESIDENT**: see [engine-exl3-experts](engine-exl3-experts.md#mimo). The trunk takes
-  the source loader (`usesMimoSourceTrunk`), billed as stored by `mimoSourceResidentBytes`.
+  the source loader (`usesMimoSourceTrunk`, `mimo2_load.weights`), billed as stored by `mimo2_load.sourceResidentBytes`.
 - **A load holds ONE 2-bit coarse copy of the lm_head** (~0.19 GB, billed with or without MTP,
-  `model_load.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it, so a greedy
+  `bills.coarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it, so a greedy
   argmax is the same with MTP or without ([engine-mtp](engine-mtp.md#greedy-shortlist)). A streamed load keeps it too,
   billed as trunk in the SSD budget ledger. The copy and its one-time log line live in the shortlist cell of
   `Trunk.arch_state.mimo2` (`mimo2_state.zig`), a heap object the state points at because a readout holds
@@ -208,7 +208,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **Concurrent plain slots decode as rows of ONE forward** (`forwardMimoBatchedDecode`): the slots' next tokens
   go through the verify-row path, whose every op but attention already computes a row as its decode tick does;
   row i attends and appends on slot i's own cache at its own position through the solo core (`mimoAttnCore`,
-  `ForwardCtx.batch_rows`), so ring compaction and marks happen per slot as in a solo tick, and each row is read out
+  `mimo2_state.Ctx.batch_rows`), so ring compaction and marks happen per slot as in a solo tick, and each row is read out
   as its tick reads it (the shortlist under `argmax_only`). Byte-identical to the solo ticks (`mimo batched decode
   rows` on the real pack; `tests/mimo2/test_mimo_batched_equivalence.sh`).
 - A group holds at most four slots (`batchGroupCap`, independently of the MTP verify width); the rest decode serial by name
@@ -256,7 +256,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   | 68x120, a 1920x1080 screenshot (2040) | 383 ms | 498 ms | +30% |
   | 96x96, the 1536² cap (2304) | 502 ms | 570 ms | +14% |
 
-- **Bills**: `mimoSourceResidentBytes(dir, vision)` adds the tower as stored (1,457,188,864 bytes) when it loads.
+- **Bills**: `mimo2_load.sourceResidentBytes(dir, vision)` adds the tower as stored (1,457,188,864 bytes) when it loads.
   The encode's scratch is the media path's fit check (`server.towerFitFault` -> `visionScratchBytes`, which takes
   `mimo_vision.encodeScratchBytes` for this tower instead of the N² score-sheet formula): a request whose largest
   image does not fit is a named 400. The stream is evaluated per block so one block's buffers are the peak:

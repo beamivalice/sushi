@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
@@ -49,7 +50,7 @@ const thinkBoundDraftLimit = scheduler_mod.thinkBoundDraftLimit;
 const thinkBoundForcesPlain = scheduler_mod.thinkBoundForcesPlain;
 
 pub fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.GroupShape {
-    const xfm = slots[0].model.transformer.?;
+    const xfm = arch_handle.trunk(slots[0].model.handle.?);
     var shape = group_cost_mod.GroupShape{ .n = @intCast(slots.len), .kv_format = cacheCostFormat(slots[0].cache.config) };
     for (slots, widths, 0..) |slot, width, i| {
         const gen = &slot.legacy_gen.?;
@@ -134,7 +135,7 @@ const PlannerPrices = struct {
     fn sample(self: *const PlannerPrices, slots: []const *Slot, widths: []const u8, trusted: bool) ?Planner.Price {
         if (slots.len == 0) return .{ .ms = 0, .samples = std.math.maxInt(u32) };
         const key = self.keyFor(slots, widths);
-        const table = &slots[0].model.transformer.?.mtp_group_cost;
+        const table = &arch_handle.trunk(slots[0].model.handle.?).mtp_group_cost;
         var selected: ?Planner.Price = null;
         var score: f32 = 0;
         var max_gap: f32 = 0;
@@ -298,7 +299,7 @@ fn plannerRowCap(gen: *const Generator) u32 {
 
 pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
-    const xfm = active[0].model.transformer orelse return false;
+    const xfm = arch_handle.trunk(active[0].model.handle orelse return false);
     if (!qwen4_state.isLoaded(xfm) or qwen4_state.mtpOfConst(xfm) == null) return false;
     if (active.len == 1) {
         const gen = if (active[0].legacy_gen) |*g| g else return false;
@@ -461,7 +462,7 @@ pub fn mtpCrowdThresholdFor(_: *const Slot) usize {
 }
 
 fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
-    const cost_xfm = group[0].model.transformer.?;
+    const cost_xfm = arch_handle.trunk(group[0].model.handle.?);
     cost_xfm.cost_trace_active = qwen4_state.isLoaded(cost_xfm);
     cost_xfm.cost_attention = 0;
     cost_xfm.cost_moe = 0;
@@ -610,7 +611,7 @@ fn cacheCostFormat(config: trunk.KVQuantConfig) u64 {
 /// One wall for the group grid: from the tick's first round-begin to its last publish.
 /// Both group sites hand their tick stopwatch here rather than starting one of their own.
 fn observeGroupRound(live: []*Slot, states: []const mtp_round.MtpRoundState, expected: usize, tick_sw: *io_util.Stopwatch, head_calls_before: u64) void {
-    const xfm = live[0].model.transformer orelse return;
+    const xfm = arch_handle.trunk(live[0].model.handle orelse return);
     if (live.len > group_cost_mod.MAX_GROUP_ROWS) return;
     var price_transition = false;
     for (live) |slot| price_transition = price_transition or slot.planner_price_transition;
@@ -875,7 +876,7 @@ test "scheduler prices each shared execution once and preserves row sampling geo
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
-    model.transformer = &xfm;
+    model.handle = arch_handle.fixtureHandle(&xfm);
     var a: Slot = undefined;
     var b: Slot = undefined;
     a.model = &model;
@@ -910,7 +911,7 @@ test "planner pools recurring head histories without mixing the cold first histo
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
-    model.transformer = &xfm;
+    model.handle = arch_handle.fixtureHandle(&xfm);
     var slots_storage: [4]Slot = undefined;
     var slots: [4]*Slot = undefined;
     for (&slots_storage, 0..) |*slot, i| {
@@ -967,7 +968,7 @@ test "mean cost pooling retains differences between histories and both worst-cas
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
-    model.transformer = &xfm;
+    model.handle = arch_handle.fixtureHandle(&xfm);
     var storage: [2]Slot = undefined;
     var slots: [2]*Slot = undefined;
     for (&storage, 0..) |*slot, i| {

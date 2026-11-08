@@ -37,11 +37,25 @@ pub const State = struct {
     }
 };
 
-/// What a forward context carries for MiMo: the verify-rows flag and the batched decode's per-slot contexts.
+/// What a forward context carries for MiMo.
 pub const Ctx = struct {
+    /// A spec verify: every row of this multi-row forward computes with its own decode tick's arithmetic
+    /// (`mimoVerifyRowsAttn`), so greedy MTP is serial.
     verify_rows: bool = false,
+    /// The batched decode (`forwardMimoBatchedDecode`): row i of this `[1, N]` forward is slot i's decode tick, its
+    /// attention and KV append on `batch_rows[i]`'s cache at `batch_row_offsets[i]`.
     batch_rows: ?[]const *trunk.ForwardCtx = null,
     batch_row_offsets: []const u32 = &.{},
+
+    /// Marks the forward a speculative verify block (`on`) or not.
+    pub fn setVerifyRows(self: *Ctx, on: bool) void {
+        self.verify_rows = on;
+    }
+
+    /// The widest verify block whose rows keep their decode tick's arithmetic.
+    pub fn verifyRowsMax() usize {
+        return @intCast(@import("mimo_forward.zig").MIMO_VERIFY_ROWS_MAX);
+    }
 };
 
 /// The coarse lm_head copy's slot in `t`'s shortlist cell; null on a trunk without one or a build without mimo2.
@@ -51,13 +65,13 @@ pub fn coarseHead(t: *const Trunk) ?*?mtp_mod.RerankCoarse {
     return &cell.coarse;
 }
 
-test "MiMo state: Ctx holds the types the forward context's MiMo fields hold today" {
-    const testing = std.testing;
-    const names = comptime std.meta.fieldNames(Ctx);
-    inline for (names) |name| try testing.expect(@FieldType(Ctx, name) == @FieldType(trunk.ForwardCtx, name));
-    try testing.expectEqual(@as(usize, 3), names.len);
-    const ctx: Ctx = .{};
-    try testing.expect(!ctx.verify_rows and ctx.batch_rows == null and ctx.batch_row_offsets.len == 0);
+test "MiMo state: a verify block is marked on the context and cleared" {
+    var ctx: Ctx = .{};
+    try std.testing.expect(!ctx.verify_rows and ctx.batch_rows == null and ctx.batch_row_offsets.len == 0);
+    ctx.setVerifyRows(true);
+    try std.testing.expect(ctx.verify_rows);
+    ctx.setVerifyRows(false);
+    try std.testing.expect(!ctx.verify_rows);
 }
 
 test "MiMo state: an empty state releases as a no-op, twice, and holds no coarse head" {

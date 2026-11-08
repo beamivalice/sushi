@@ -36,6 +36,11 @@ const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "glm5_next", "glm5_next_text" };
 pub const discovery_types = model_types;
 pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true };
+
+/// A pack stores the MTP layers after the trunk's, under the same prefix (`pack_index`'s range check).
+pub fn trailingPackLayers(config: *const Config) u32 {
+    return config.glm_mtp_layers;
+}
 pub const parseConfig = config_file.parseFamily;
 
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {

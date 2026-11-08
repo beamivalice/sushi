@@ -3,6 +3,7 @@
 //! stage windows), stored as an `SSMCheckpoint` whose layers are the model's slots, so the cache's
 //! checkpoint list, thinning, merge and byte bill serve it unchanged.
 const std = @import("std");
+const arch_handle = @import("../arch/handle.zig");
 const mlx = @import("../mlx.zig");
 const transformer = @import("../trunk.zig");
 const model = @import("dsv41_model.zig");
@@ -530,7 +531,7 @@ pub fn releaseLive(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_s
 /// `flushLiveDsv41` for a resident model, if it is a DeepSeek one. Inference thread.
 pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: []const u8) void {
     const hc = if (entry.prefix_cache) |*p| p else return;
-    const xfm = entry.transformer orelse return;
+    const xfm = arch_handle.trunk(entry.handle orelse return);
     flushLiveDsv41(hc, xfm.arch_state.dsv41.model orelse return, xfm.s, why);
 }
 

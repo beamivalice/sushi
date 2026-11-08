@@ -56,3 +56,6 @@ pub fn loadWarmup(config: *const model_mod.ModelConfig, mtp_on: bool) ?u64 {
     return (1 << 30) / 4;
 }
 
+test "the bill's dense-rebuild key count is the MiMo decode arms' floor" {
+    try std.testing.expectEqual(bills.DECODE_REBUILD_KEYS_MAX, mimo_forward.mimoGlobalDecodeRebuildMaxKeys());
+}

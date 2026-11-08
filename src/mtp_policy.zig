@@ -10,7 +10,6 @@ const log = @import("log.zig");
 const mtp_mod = @import("mtp.zig");
 const round_cost = @import("round_cost.zig");
 const sampler = @import("sampler.zig");
-const mimo_forward = @import("mimo2/mimo_forward.zig");
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Generator = generate_mod.Generator;
@@ -691,13 +690,11 @@ pub fn mtpPlanInBounds(plan: MtpRoundPlan, lo: u32, hi: u32) MtpRoundPlan {
     return p;
 }
 
-/// Drafts per round whose verify rows stay byte-identical to serial decode.
-/// MiMo's verify is decode-shaped row by row and the FP8 trunk GEMV keeps a
-/// decode row's arithmetic only to `MIMO_VERIFY_ROWS_MAX` rows, so a MiMo
-/// round never plans past the budget; another arch's rows are row-identical
-/// at any width up to `MAX_DEPTH`.
-pub fn mtpVerifyDraftsMax(is_mimo: bool) u32 {
-    return if (is_mimo) @intCast(mimo_forward.MIMO_VERIFY_ROWS_MAX - 1) else mtp_mod.MAX_DEPTH;
+/// Drafts per round whose verify rows stay byte-identical to serial decode: an arch whose verify keeps a decode row's
+/// arithmetic only to `arch_state.verifyRowsMax` rows never plans past it; another arch's rows are row-identical at any
+/// width up to `MAX_DEPTH`.
+pub fn mtpVerifyDraftsMax(config: *const @import("model.zig").ModelConfig) u32 {
+    return if (arch_state.verifyRowsMax(config)) |rows| @intCast(rows - 1) else mtp_mod.MAX_DEPTH;
 }
 
 /// The width a pinned round drafts: never past the verify row budget.
@@ -998,7 +995,7 @@ pub fn mtpRoundPlanTraced(self: *Generator) MtpRoundPlan {
 pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
     if (mtpPinnedDepth()) |d| {
-        const forced = mtpForcedWidth(@min(d, cap_row), mtpVerifyDraftsMax(self.xfm.config.isMimo()));
+        const forced = mtpForcedWidth(@min(d, cap_row), mtpVerifyDraftsMax(&self.xfm.config));
         self.mtp_ev_m_lo_prev = forced;
         return .{ .m_lo = forced, .m_hi = forced, .tau_ln = 0.0 };
     }

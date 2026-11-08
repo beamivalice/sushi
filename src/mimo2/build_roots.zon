@@ -1,3 +1,3 @@
 .{
-    .benches = .{"src/ubench_mimo2.zig"},
+    .benches = .{"src/mimo2/ubench.zig"},
 }

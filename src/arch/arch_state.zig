@@ -181,6 +181,24 @@ pub fn setMrope(c: *Ctx, pos: ?[]const i32, total: usize, delta: i32) void {
     }
 }
 
+/// Marks the forward a speculative verify block (`on`) for `config`'s arch, where its verify rows keep their decode
+/// tick's arithmetic; a no-op for an arch that needs no mark.
+pub fn setVerifyRows(config: *const model.ModelConfig, c: *Ctx, on: bool) void {
+    const tag = arch_config.tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime has(Decl(t, "Ctx"), "setVerifyRows")) @field(c, @tagName(t)).setVerifyRows(on),
+    }
+}
+
+/// The widest verify block whose rows keep their decode tick's arithmetic on `config`'s arch; null where every width
+/// does.
+pub fn verifyRowsMax(config: *const model.ModelConfig) ?usize {
+    const tag = arch_config.tagOf(config) orelse return null;
+    return switch (tag) {
+        inline else => |t| if (comptime has(Decl(t, "Ctx"), "verifyRowsMax")) Decl(t, "Ctx").verifyRowsMax() else null,
+    };
+}
+
 /// Logs the per-request meters the forward's context tallied, and resets them.
 pub fn logMeters(c: *Ctx) void {
     inline for (tags) |t| {

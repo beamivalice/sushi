@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("../arch/handle.zig");
 const sched_policy = @import("../sched_policy.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const mlx = @import("../mlx.zig");
@@ -116,7 +117,7 @@ test "a streamed DeepSeek load bills its union workspace and MLX pool and no fil
 /// DeepSeek's request state lives in the model, not in `slot.cache` (a one-byte-a-token row marker): its window
 /// rings, compressed and index rows, DSpark windows, and the live restore points the request keeps.
 pub fn dsv41StateBytes(s: *const Slot) u64 {
-    const dsv = (s.model.transformer orelse return 0).arch_state.dsv41.model orelse return 0;
+    const dsv = arch_handle.trunk(s.model.handle orelse return 0).arch_state.dsv41.model orelse return 0;
     var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41_model.zig").stateBytes(st) else 0;
     if (s.model.prefix_cache) |*hc| bytes += dsv41_prefix.liveBytes(hc);
     return bytes;
@@ -125,7 +126,7 @@ pub fn dsv41StateBytes(s: *const Slot) u64 {
 /// The request over a DeepSeek model's state finished with `tokens`: its record is published, and the idle flush armed
 /// when the record holds points that are not on SSD.
 pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, tokens: []const u32) void {
-    const dsv = (slot.model.transformer orelse return).arch_state.dsv41.model orelse return;
+    const dsv = arch_handle.trunk(slot.model.handle orelse return).arch_state.dsv41.model orelse return;
     const media = prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start);
     if (dsv41_prefix.publishLiveDsv41(hc, dsv, tokens, slot.has_tools, media, slot.cache.config)) sch.live_unflushed.store(true, .release);
 }
@@ -153,7 +154,7 @@ pub fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) 
     const generated = gen.generated_ids.items;
     const thought = generated.len - 1;
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
-    const xfm = slot.model.transformer orelse return;
+    const xfm = arch_handle.trunk(slot.model.handle orelse return);
     const tok = slot.model.tokenizer orelse return;
     const dsv = dsv41_state.modelOf(xfm) orelse return;
     if (thought < dsv41_prefix.min_thought_tokens) {
@@ -232,7 +233,7 @@ fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xf
     sch.decoding = .empty;
     model.id = "org/dsv41-cull";
     model.prefix_cache = null;
-    model.transformer = xfm;
+    model.handle = arch_handle.handleOf(xfm);
     slot.model = model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
@@ -352,7 +353,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     var model: model_registry_mod.LoadedModel = undefined;
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(a, 2);
     defer model.prefix_cache.?.deinit();
-    model.transformer = &xfm;
+    model.handle = arch_handle.fixtureHandle(&xfm);
     const hc = &model.prefix_cache.?;
     var cp = try dsv41_prefix.capture(a, m, 40);
     defer cp.deinit(a);

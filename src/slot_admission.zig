@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("arch/handle.zig");
 const transformer_mod = @import("transformer.zig");
 const trunk = @import("trunk.zig");
 const model_mod = @import("model.zig");
@@ -146,7 +147,7 @@ pub fn fillGroupPadWasteKvLens(
 /// transformer which archs own their decode state; never key on
 /// a batching verdict and never name one arch here.
 pub fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
-    const t = model.transformer orelse return false;
+    const t = arch_handle.trunk(model.handle orelse return false);
     return t.ownsModuleDecodeState();
 }
 
@@ -304,7 +305,7 @@ pub fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
         bills[i] = null;
         const s = sch.pending.items[idx];
         const cfg = s.model.config orelse continue;
-        if (s.model.transformer == null) continue;
+        if (s.model.handle == null) continue;
         bills[i] = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, prefill_plan.visionPrefillUnchunked(s.vision_embeddings != null or s.deferred_media != null), s.enable_mtp);
     }
     const admitted = admitsWithinMemory(bills[0..n], live, outstanding);
@@ -522,7 +523,7 @@ test "a staggered admission waits for the growth an earlier request was admitted
     var xfm: Trunk = undefined;
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = &xfm;
+    model.handle = arch_handle.fixtureHandle(&xfm);
     var a: Slot = undefined;
     a.model = &model;
     a.full_prompt = &.{};

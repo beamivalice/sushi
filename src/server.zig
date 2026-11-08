@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
@@ -216,7 +217,7 @@ pub fn defaultEnableMtpForStreaming(mtp_loaded: bool, is_moe: bool, force: bool,
 /// Does this model's MTP head carry the measured native-MoE exemption above?
 /// A NAMED per-arch capability read once here, so the call sites can never disagree.
 pub fn nativeMeasuredMoeHead(lm: *LoadedModel) bool {
-    const x = lm.transformer orelse return false;
+    const x = arch_handle.trunk(lm.handle orelse return false);
     return x.nativeMoeMtpHeadMeasured();
 }
 
@@ -429,7 +430,7 @@ pub fn loopCloseBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 }
 
 fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: u32, announce: bool) ?mtp_plan.ThinkBound {
-    if (!enable_thinking or lm.transformer == null) return null;
+    if (!enable_thinking or lm.handle == null) return null;
     const closer = atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER) orelse {
         if (announce) log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
         return null;
@@ -603,7 +604,7 @@ pub fn resolveReasoningProtocol(
     proto_out: *rp_mod.Protocol,
     allow_reasoning: bool,
 ) bool {
-    if (prompt_ids.len == 0 or lm.transformer == null) return false;
+    if (prompt_ids.len == 0 or lm.handle == null) return false;
     const tail_n = @min(prompt_ids.len, 64);
     const tail = tok.decode(allocator, prompt_ids[prompt_ids.len - tail_n ..]) catch return false;
     defer allocator.free(tail);
@@ -1868,7 +1869,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
 
 fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
     return .{
-        .has_text_lm = lm.state != .ready or lm.transformer != null,
+        .has_text_lm = lm.state != .ready or lm.handle != null,
     };
 }
 
@@ -2118,7 +2119,7 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
 pub fn batchVerdictFor(entry: *const LoadedModel) sched_policy.BatchVerdict {
-    const exclusive = if (entry.transformer) |t| t.ownsModuleDecodeState() else false;
+    const exclusive = if (entry.handle) |h| arch_handle.ownsModuleDecodeState(h) else false;
     return batchVerdictOf(entry.config, exclusive);
 }
 
@@ -2723,7 +2724,7 @@ pub fn handleChatCompletions(
         },
         .no_mask, .token_zero => schema_proto_active = false,
     }
-    if (grammar_schema_val != null and !has_tools and !enable_thinking and lm.transformer != null) {
+    if (grammar_schema_val != null and !has_tools and !enable_thinking and lm.handle != null) {
         if (!resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, false)) {
             schema_proto = rp_mod.Protocol.jsonOnly();
         }
@@ -2828,7 +2829,7 @@ pub fn handleChatCompletions(
         return;
     } else &.{};
     defer allocator.free(request_bias);
-    const none_ban = if (tool_choice == .none and lm.transformer != null) noneCallBan(allocator, tok, chat_config) else null;
+    const none_ban = if (tool_choice == .none and lm.handle != null) noneCallBan(allocator, tok, chat_config) else null;
     const biases = if (none_ban) |ban| try std.mem.concat(allocator, @import("logit_bias.zig").Bias, &.{ request_bias, &.{ban} }) else request_bias;
     defer if (none_ban != null) allocator.free(biases);
     sampling.think_penalty.biases = biases;
@@ -2836,7 +2837,7 @@ pub fn handleChatCompletions(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
-    var call_force = if (has_tools and lm.transformer != null and !continue_final)
+    var call_force = if (has_tools and lm.handle != null and !continue_final)
         armCallForce(allocator, tok, chat_config, prompt_ids, enable_thinking, tool_choice, tools_json)
     else
         null;

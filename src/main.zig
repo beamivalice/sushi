@@ -1399,7 +1399,7 @@ fn runHeadlessServe(
         .arch_hint = "",
         .config = null,
         .weights = null,
-        .transformer = null,
+        .handle = null,
         .tokenizer = null,
         .chat_config = null,
         .vision_encoder = null,

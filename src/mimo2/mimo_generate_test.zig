@@ -20,17 +20,20 @@ const generate = @import("../generate.zig");
 const mtp_policy = @import("../mtp_policy.zig");
 const Generator = generate.Generator;
 const MtpHeadRef = generate.MtpHeadRef;
+const MtpCacheRef = generate.MtpCacheRef;
+const mimo_config: model_mod.ModelConfig = .{ .model_type = "mimo_v2" };
+const other_config: model_mod.ModelConfig = .{ .model_type = "verify-cap-test" };
 
 test "mtpForcedWidth: a forced MiMo round never plans past the verify row budget" {
     // A 5..8 forced depth would hand the forward 6..9 rows, which the decode-shaped
     // verify cannot serve: the forward would silently take the prefill arm.
     for ([_]u32{ 1, 3, 5, 6, 8 }) |forced| {
-        const mimo_max = Generator.mtpVerifyDraftsMax(true);
+        const mimo_max = Generator.mtpVerifyDraftsMax(&mimo_config);
         try testing.expectEqual(@min(forced, mimo_max), Generator.mtpForcedWidth(forced, mimo_max));
     }
     // Another arch's rows are row-identical at any width the lever can name.
     for ([_]u32{ 1, 4, 5, 8 }) |forced| {
-        const max = Generator.mtpVerifyDraftsMax(false);
+        const max = Generator.mtpVerifyDraftsMax(&other_config);
         try testing.expectEqual(forced, Generator.mtpForcedWidth(forced, max));
     }
 }
@@ -201,12 +204,12 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     var xfm = try pldTestTransformer(io, config, &weights, kv);
     defer xfm.deinit();
     head.target = &xfm;
-    xfm.mtp_depth_free = Generator.mtpVerifyDraftsMax(true);
+    xfm.mtp_depth_free = Generator.mtpVerifyDraftsMax(&mimo_config);
     var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want + 16, greedy, &.{}, .{
         .mtp_enabled = true,
         .mtp = MtpHeadRef.of("mimo2", &head),
         .model_has_mtp = true,
-        .mtp_depth = Generator.mtpVerifyDraftsMax(true),
+        .mtp_depth = Generator.mtpVerifyDraftsMax(&mimo_config),
     });
     defer gen.deinit(a);
     // The index ends on the prompt, so the round opens on its tail: an earlier copy of that
@@ -251,8 +254,8 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
 }
 
 test "mtpLookupDraftCap: a MiMo lookup drafts no wider than its verify keeps decode rows" {
-    try testing.expectEqual(Generator.mtpVerifyDraftsMax(true), Generator.mtpLookupDraftCap(true));
-    try testing.expectEqual(mtp_lookup.MAX_DRAFT_STRONG, Generator.mtpLookupDraftCap(false));
+    try testing.expectEqual(Generator.mtpVerifyDraftsMax(&mimo_config), Generator.mtpLookupDraftCap(&mimo_config));
+    try testing.expectEqual(mtp_lookup.MAX_DRAFT_STRONG, Generator.mtpLookupDraftCap(&other_config));
     var idx = mtp_lookup.Index.init(testing.allocator);
     defer idx.deinit();
     const Lines = struct {
@@ -263,10 +266,10 @@ test "mtpLookupDraftCap: a MiMo lookup drafts no wider than its verify keeps dec
     var text: [80]u32 = undefined;
     for (&text, 0..) |*t, i| t.* = @intCast(1 + i % 40);
     try idx.extend(&text, Lines{});
-    const got = idx.match(1, Generator.mtpLookupDraftCap(true)) orelse return error.NoMatch;
+    const got = idx.match(1, Generator.mtpLookupDraftCap(&mimo_config)) orelse return error.NoMatch;
     var free = Generator.mtpLookupCostsFor(mtp_policy.MtpCostSource.init(mtp_policy.MTP_EV_DEFAULT_COSTS, 1000, null), 3);
     for (&free.lookup) |*c| c.* = 0.01;
-    try testing.expectEqual(Generator.mtpVerifyDraftsMax(true), mtp_lookup.gate(got, 1000, 8, 0, true, free));
+    try testing.expectEqual(Generator.mtpVerifyDraftsMax(&mimo_config), mtp_lookup.gate(got, 1000, 8, 0, true, free));
 }
 
 /// Records what `mimoStepOut` frees instead of freeing it, so a double free is a count, not a crash.
@@ -325,4 +328,47 @@ test "mimoStepOut: logits consume the row once; a rerank step hands it over" {
     defer _ = mlx.mlx_array_free(mixed.rerank_x);
     try testing.expectEqual(@as(usize, 0), StepOutFrees.count(row.ctx));
     try testing.expect(mixed.rerank_x.ctx == row.ctx and mixed.logits.ctx == null);
+}
+
+test "MTP detaching a pre-draft preserves the committed head boundary" {
+    const allocator = testing.allocator;
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    for ([_]bool{ false, true }) |owned| {
+        for ([_]bool{ false, true }) |apply_stash| {
+            var xfm: Trunk = undefined;
+            xfm.s = stream;
+            var gen: Generator = undefined;
+            gen.xfm = &xfm;
+            gen.mtp_planner_owned = owned;
+            const head_state = try allocator.create(mimo_mtp.State);
+            head_state.* = .{ .allocator = allocator, .hid_base = 9 };
+            gen.mtp_cache = MtpCacheRef.of("mimo2", .{ .st = head_state });
+            defer gen.mtp_cache.?.deinit();
+            gen.mtp_hist_stash = null;
+            var arrays: [mtp_mod.MAX_DEPTH]mlx.mlx_array = undefined;
+            for (arrays[0..3]) |*array| array.* = mlx.mlx_array_new();
+            gen.mtp_pre_draft = .{
+                .plan = .{ .m_lo = 3, .m_hi = 3, .tau_ln = 0 },
+                .off0 = 6,
+                .t1 = 1,
+                .t1_arr = mlx.mlx_array_new(),
+                .drafts = try allocator.alloc(u32, 3),
+                .draft_arrs = arrays,
+                .n_drafted = 3,
+                .conf_arrs = null,
+                .n_conf = 0,
+                .q_probs = null,
+                .n_qp = 0,
+                .h_chain = null,
+                .m = 3,
+            };
+            defer if (gen.mtp_pre_draft) |*draft| draft.deinit(allocator);
+            const committed = gen.mtpCommittedHistoryLen();
+            try gen.mtpDetachHead(allocator, apply_stash);
+            try testing.expect(gen.mtp_pre_draft == null);
+            try testing.expectEqual(@as(usize, 6), committed);
+            try testing.expectEqual(if (owned) committed else @as(usize, 9), gen.mtpCommittedHistoryLen());
+        }
+    }
 }

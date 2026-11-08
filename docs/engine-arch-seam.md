@@ -92,9 +92,20 @@ joins `DROPPABLE` when its drop passes.
   speculative head: [engine-mtp](engine-mtp.md#the-drafter-seam)), `media` (tower, processor, prompt rows, M-RoPE; the
   config picks the arch whose `media.claims` holds), `prefix` (the prefix cache's restore target, per-entry
   rows and disk sections: [engine-prefix-cache](engine-prefix-cache.md#arch-seam)), `sched` (what the scheduler asks of
-  an arch: [server-lifecycle](server-lifecycle.md#scheduler-and-batching)), `moe` (the MoE family's routing hooks), and `spec` (the config side: `Spec`,
-  the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU
+  an arch: [server-lifecycle](server-lifecycle.md#scheduler-and-batching)), `moe` (the MoE family's routing hooks), `load` (an
+  arch's own weights loader, what it keeps resident, a head allocated beside the trunk, the load-time build and spec
+  warmup), and `spec` (the config side: `Spec`, the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU
   graphs do not change.
+- **The engine holds a handle, not a trunk.** `LoadedModel.handle` is `arch/handle.zig`'s `Handle` (the registry's
+  `Arch` union), and every read the engine makes of a loaded model goes through that file: `trunk(h)` (the engine state
+  the generic paths run on: an arch's `host(m)` when its `Model` is not that state, else the `Model`), `destroy`,
+  `stream`, `config`, `ownsModuleDecodeState`, `moduleSpecWiring`, `moduleStateSpecRollback`, `logitBias`,
+  `flushImatrix`. Each is one switch on the tag; a test fixture stores `handleOf(&trunk)`.
+- A trunk rule one arch keeps is a `Facts` flag on its config (`residual_from_embedding`, `moe_scores_f32`,
+  `qkv_split_rows`, `bias_routed_moe`), read with `arch_config.fact`; a pack layout fact is a hook
+  (`trailingPackLayers`). An arch's committed test configs live in its chat face's `fixtures` (MLX-free): a shared test
+  reads one with `arch_config.fixtureConfig(name)` (null when the build left it out), and the config pins take each
+  arch's `fixtures.config_pins`. Its microbenches are `ubench` in its `arch.zig`, which `sushi-ubench` lists.
 - `-Darchs=<a,b,...>` (default: every registered arch) builds `Tag`, `Spec` and `Arch` from the listed archs. An
   excluded arch has no prong: its `arch.zig` is not analysed. A name the registry does not register fails the build.
   `registry.ofModelType` returns no tag for a `model_type` no enabled arch claims.
@@ -155,7 +166,7 @@ folder. `DROP_TRY=<arch>` runs the same check for an arch not in the list (a str
 `DROP_KEEP=1` keeps the worktree.
 
 CI runs it on every PR as a step of the build-and-test job, after the test tier, on the runner and build that job
-already set up; the loop covers every arch in `DROPPABLE` and passes at once while the list is empty.
+already set up; the loop covers every arch in `DROPPABLE` (mimo2 today).
 
 `zig build arch-slice -Dslice-arch=<name>` is the quick form of the same question, for the arch's own folder: it compiles
 `src/<name>/arch.zig` as a module of its own, with `build_options`, `sushi_exl3` and `arch_host` (here

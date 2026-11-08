@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("../arch/handle.zig");
 const trunk_mod = @import("../trunk.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
@@ -383,10 +384,10 @@ test "admission combines Qwen and MiMo reservations in either order" {
     var xfm: Trunk = undefined;
     var qwen: LoadedModel = undefined;
     qwen.config = &qwen_cfg;
-    qwen.transformer = &xfm;
+    qwen.handle = arch_handle.fixtureHandle(&xfm);
     var mimo: LoadedModel = undefined;
     mimo.config = &mimo_cfg;
-    mimo.transformer = &xfm;
+    mimo.handle = arch_handle.fixtureHandle(&xfm);
     var a: Slot = undefined;
     a.model = &qwen;
     a.full_prompt = &.{};

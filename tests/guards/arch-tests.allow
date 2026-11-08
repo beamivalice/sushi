@@ -74,7 +74,6 @@ a freed MiMo slot returns its KV to the OS, not to MLX's pool
 a qwen4_exp SSD restore is credited: its first grow bills one eval window of the restored rows
 a qwen4_exp config refusal keeps its own name in the 503 text
 a resident MiMo batches decode in groups of the FP8 GEMV's row-identical width; a streamed one stays serial
-a resident MiMo cold load reserves its load preflight's requirement
 a second GLM admission leaves free the cache growth the first was admitted to allocate
 a streamed DeepSeek bills its workspace at load and no fill peak at load or per request
 a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep theirs
@@ -149,14 +148,11 @@ list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recommended
 mimo v2 fused qkv split keeps asymmetric value rows
 mimo_v2 EXL3 arms stay finite where the SwiGLU product passes the f16 ceiling
 mimo_v2 EXL3 beside an MXFP4 bank is a mixed pack and resolves to nothing
-mimo_v2 EXL3 distinct routed experts match host with BF16 inputs
 mimo_v2 EXL3 prefill layers built lazily keep their own window count and rate
 mimo_v2 EXL3 prefill rows match the fused decode arm at E=256 top-8
 mimo_v2 EXL3 prefill rows match the fused decode arm at the served hidden and inter
 mimo_v2 EXL3 prefill rows match the fused decode arm on every GEMM arm
 mimo_v2 EXL3 prefill rows match the host SwiGLU oracle past one GEMM window
-mimo_v2 EXL3 resident MoE decode rows match the host SwiGLU oracle at K2.5 MCG
-mimo_v2 EXL3 resident MoE prefill rows match the host SwiGLU oracle at K2.5 MCG
 mimo_v2 EXL3 stacked experts resolve as a layout and keep the dense prefix
 mimo_v2 admission credits the hot cache: a gap the cache covers is an evict, not a refusal
 mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the band sheet

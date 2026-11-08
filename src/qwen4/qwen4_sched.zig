@@ -1,5 +1,6 @@
 //! Flash-Next as the scheduler sees it: what batches, which rounds group, the head it commits beside the KV.
 const std = @import("std");
+const arch_handle = @import("../arch/handle.zig");
 const sched_policy = @import("../sched_policy.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const mlx = @import("../mlx.zig");
@@ -83,7 +84,7 @@ pub fn mtpGroupable(slot: *const Slot) bool {
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
     if (gen.ctx.ssm_entries == null) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
-    const t = slot.model.transformer orelse return false;
+    const t = arch_handle.trunk(slot.model.handle orelse return false);
     if (!qwen4_forward.supportsBatchedGdnDecode(t)) return false;
     return sched_policy.specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }
@@ -97,7 +98,7 @@ pub fn tickClass(slot: *const Slot) sched.TickClass {
 pub fn handoffHistory(slot: *Slot, cps: []trunk_mod.SSMCheckpoint) void {
     if (qsa_state.checkpointHasQsaPooled(&cps[cps.len - 1])) return;
     const ents = slot.ssm_entries orelse return;
-    const xf = slot.model.transformer orelse return;
+    const xf = arch_handle.trunk(slot.model.handle orelse return);
     qsa_state.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
         log.warn("[hot-cache] QSA history handoff failed: {s} — committing without it\n", .{@errorName(err)});
     };

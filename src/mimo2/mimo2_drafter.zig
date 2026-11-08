@@ -5,6 +5,7 @@ const trunk_mod = @import("../trunk.zig");
 const mtp_mod = @import("../mtp.zig");
 const spec_types = @import("../spec_types.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
+const arch_handle = @import("../arch/handle.zig");
 const Trunk = trunk_mod.Trunk;
 const KVCache = trunk_mod.KVCache;
 
@@ -15,9 +16,11 @@ pub const nextDflash = @import("../dflash_round.zig").nextDflash;
 /// The trained heads; per-request rows live in `mimo_mtp.State`.
 pub const Head = *mimo_mtp.Head;
 
-/// The heads loaded beside the trunk travel as `aux`.
-pub fn headOf(_: *Trunk, _: bool, aux: ?*anyopaque) ?Head {
-    return if (aux) |p| @ptrCast(@alignCast(p)) else null;
+/// The heads loaded beside the trunk travel as `aux`, which is read as MiMo's only on a model built as MiMo.
+pub fn headOf(model: *Trunk, _: bool, aux: ?*anyopaque) ?Head {
+    const p = aux orelse return null;
+    if (std.meta.activeTag(arch_handle.handleOf(model)) != .mimo2) return null;
+    return @ptrCast(@alignCast(p));
 }
 
 /// A request's head rows, and the draft step its next forward runs.
@@ -133,4 +136,16 @@ pub fn evSeed(h: Head) ?spec_types.EvSeed {
 pub fn setEvSeed(h: Head, accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32) void {
     h.ev_seed_accept = accept;
     h.ev_seed_m_lo = m_lo;
+}
+
+test "an aux head is read as MiMo's only on a model built as MiMo" {
+    const registry = @import("../arch/registry.zig");
+    var head: mimo_mtp.Head = undefined;
+    inline for (comptime std.enums.values(registry.Tag)) |tag| {
+        var model: Trunk = undefined;
+        model.arch = tag;
+        const got = headOf(&model, true, &head);
+        if (tag == .mimo2) try std.testing.expectEqual(@as(?Head, &head), got) else try std.testing.expectEqual(@as(?Head, null), got);
+        try std.testing.expectEqual(@as(?Head, null), headOf(&model, true, null));
+    }
 }

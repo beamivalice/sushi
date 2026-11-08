@@ -790,7 +790,7 @@ fn tinyConfig() model_mod.ModelConfig {
 /// The committed tiny fixture's weights as a Weights map (tests/mimo2/dump_mimo_vision_fixtures.py tiny).
 fn loadTinyFixture(tmp: *std.testing.TmpDir) !Weights {
     const io = testing.io;
-    try tmp.dir.writeFile(io, .{ .sub_path = "tiny.safetensors", .data = @embedFile("../fixtures/mimo_vision_tiny.safetensors") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tiny.safetensors", .data = @embedFile("fixtures/mimo_vision_tiny.safetensors") });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(io, &buf);
     const path = try std.fmt.allocPrint(testing.allocator, "{s}/tiny.safetensors", .{buf[0..dir_len]});

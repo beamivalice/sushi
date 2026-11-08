@@ -73,7 +73,6 @@ const DtypeCastCache = forward_diag.DtypeCastCache;
 pub const MoeDecodeDispatchArm = moe_gqmv.MoeDecodeDispatchArm;
 pub const MoeLayerWeights = layer_weights.MoeLayerWeights;
 pub const MoeMlpWeights = layer_weights.MoeMlpWeights;
-pub const MimoExl3MoeHarness = test_support.MimoExl3MoeHarness;
 pub const PersistentSsmGroup = ssm_cache.PersistentSsmGroup;
 pub const PACKED_KV_SLICE_MAX = attn_kernels.PACKED_KV_SLICE_MAX;
 pub const QSA_ATTN_BK = attn_kernels.QSA_ATTN_BK;
@@ -126,7 +125,6 @@ const expertPickGpu = moe_stream_compute.expertPickGpu;
 const expertSpecApplies = moe_stream_compute.expertSpecApplies;
 const expertSwapKind = moe_stream_compute.expertSwapKind;
 const expert_exl3_kernels = layer_weights.expert_exl3_kernels;
-const exl3CodebookFollowsModel = test_support.exl3CodebookFollowsModel;
 const freeKVEntry = kv_cache.freeKVEntry;
 pub const fused256CausalMode = attn_kernels.fused256CausalMode;
 pub const fused256Enabled = attn_kernels.fused256Enabled;
@@ -161,8 +159,6 @@ const loadPleWeights = layer_weights.loadPleWeights;
 pub const loadSwitchMlpBank = layer_weights.loadSwitchMlpBank;
 const maybeTransposeForBf16 = layer_weights.maybeTransposeForBf16;
 pub const layerCap = forward_diag.layerCap;
-const mimoExl3DistinctRouting = test_support.mimoExl3DistinctRouting;
-const mimoExl3ForwardMatchesHost = test_support.mimoExl3ForwardMatchesHost;
 pub const newEmptyKVEntry = kv_cache.newEmptyKVEntry;
 pub const positionDropIndex = ssm_cache.positionDropIndex;
 pub const positionDropIndexUsize = ssm_cache.positionDropIndexUsize;
@@ -1604,7 +1600,7 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(emb);
         if (self.emb_s.ctx == null) {
             // MiMo's residual dtype follows its dense embedding table.
-            const dtype = if (std.mem.eql(u8, self.config.model_type, "mimo_v2"))
+            const dtype = if (arch_config.fact(&self.config, "residual_from_embedding"))
                 mlx.mlx_array_dtype(taken_w)
             else
                 mlx.mlx_dtype.bfloat16;
@@ -3760,7 +3756,7 @@ pub const Trunk = struct {
             _ = mlx.mlx_array_free(expert_sum);
         };
         try mlx.check(mlx.mlx_reshape(&expert_sum, row_out, &[_]c_int{ x_shape[0], x_shape[1], mlx.getShape(row_out)[1] }, 3, self.s));
-        if (std.mem.eql(u8, self.config.model_type, "mimo_v2") and
+        if (arch_config.fact(&self.config, "moe_scores_f32") and
             mlx.mlx_array_dtype(expert_sum) != mlx.mlx_array_dtype(expert_x))
         {
             var narrowed = mlx.mlx_array_new();
@@ -4140,7 +4136,7 @@ pub const Trunk = struct {
         // MoE layer, which then promotes every weight on read for the rest of
         // the forward — a whole-model slowdown that shows up only as a
         // `[dtype-trace] residual widened` line.
-        if (!std.mem.eql(u8, cfg.model_type, "mimo_v2") and mlx.mlx_array_dtype(norm_scores) != mlx.mlx_array_dtype(expert_x)) {
+        if (!arch_config.fact(cfg, "moe_scores_f32") and mlx.mlx_array_dtype(norm_scores) != mlx.mlx_array_dtype(expert_x)) {
             var cast_scores = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&cast_scores, norm_scores, mlx.mlx_array_dtype(expert_x), self.s));
             _ = mlx.mlx_array_free(norm_scores);
@@ -4461,7 +4457,7 @@ pub const Trunk = struct {
             try mlx.check(mlx.mlx_sum_axis(&expert_sum, weighted, -2, false, self.s)); // [B, S, hidden]
         }
 
-        if (std.mem.eql(u8, cfg.model_type, "mimo_v2") and
+        if (arch_config.fact(cfg, "moe_scores_f32") and
             mlx.mlx_array_dtype(expert_sum) != mlx.mlx_array_dtype(expert_x))
         {
             var narrowed = mlx.mlx_array_new();
@@ -4588,7 +4584,8 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         owned_bf16.deinit(allocator);
     }
     const hyper_connected = arch_config.hyperConnected(&config);
-    const is_mimo = std.mem.eql(u8, config.model_type, "mimo_v2");
+    const qkv_split_rows = arch_config.fact(&config, "qkv_split_rows");
+    const bias_routed_moe = arch_config.fact(&config, "bias_routed_moe");
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -4657,7 +4654,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
             try maybeTransposeForBf16(&la.a_w, la.a_s, &owned_bf16, allocator, s);
             try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
             try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
-        } else if (is_mimo) {
+        } else if (qkv_split_rows) {
             // MiMo V2 supports both converter-split projections and the HF
             // native fused QKV tensor. The latter is split by explicit row
             // counts because K and V use different per-head widths.
@@ -4789,7 +4786,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
 
         const layer_is_moe = config.isMoe() and li >= config.first_k_dense_replace;
 
-        if (layer_is_moe and is_mimo) {
+        if (layer_is_moe and bias_routed_moe) {
             // MiMo V2: sigmoid/noaux_tc routing with a selection-only
             // correction bias, no shared expert, and biasless mxfp4 banks.
             const stream_bank = shouldStreamExpertBank(&config, prefix);
@@ -5402,28 +5399,6 @@ pub fn decodeProfReport() void {
 // allocator cache recycles it; numerics differ from in-kernel dequant only
 // by the bf16 rounding of w = s*q + b (pinned no-worse-than-stock by test).
 // Decode (M=1) and spec-verify widths never route.
-
-test "exl3 decode rows follow their own model's codebook with two packs resident" {
-    try exl3CodebookFollowsModel(4);
-}
-
-test "exl3 prefill rows follow their own model's codebook with two packs resident" {
-    try exl3CodebookFollowsModel(expert_exl3_kernels.DECODE_ROWS_MAX * 2);
-}
-
-test "mimo_v2 EXL3 resident MoE decode rows match the host SwiGLU oracle at K2.5 MCG" {
-    try mimoExl3ForwardMatchesHost(.{ .n = 40 }, 4, 71);
-}
-
-test "mimo_v2 EXL3 resident MoE prefill rows match the host SwiGLU oracle at K2.5 MCG" {
-    try mimoExl3ForwardMatchesHost(.{ .n = 40 }, expert_exl3_kernels.DECODE_ROWS_MAX * 2, 73);
-}
-
-test "mimo_v2 EXL3 distinct routed experts match host with BF16 inputs" {
-    for ([_]usize{ 1, 4, 14, 17, 33 }) |rows| try mimoExl3DistinctRouting(rows);
-}
-
-// ── Tests ──
 
 const testing = std.testing;
 const expectError = @import("test_expect.zig").expectError;

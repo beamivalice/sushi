@@ -27,11 +27,24 @@ pub const Facts = struct {
     /// The residual is a set of hyper-connection streams: the layers carry no norms (the stream read normalizes),
     /// each loads its hyper-connection weights and the PLE, and the trunk keeps a weight-less RMS norm's ones.
     hyper_connected: bool = false,
+    /// A dense embedding table's dtype is the residual's, where others widen or narrow it to bf16.
+    residual_from_embedding: bool = false,
+    /// The MoE routing scores stay f32 into the expert sum, which is narrowed back to the activations' dtype.
+    moe_scores_f32: bool = false,
+    /// The attention binder takes a fused QKV split by per-head K and V widths (or the source FP8 QKV whole).
+    qkv_split_rows: bool = false,
+    /// The routed layers route by sigmoid with a selection-only bias, carry no shared expert, and bank biasless.
+    bias_routed_moe: bool = false,
 };
 
 /// `Facts.hyper_connected` of the config's arch; false for an unclaimed config.
 pub fn hyperConnected(config: *const model.ModelConfig) bool {
     return if (facts(config)) |f| f.hyper_connected else false;
+}
+
+/// One of the config's arch's `Facts`; false for an unclaimed config.
+pub fn fact(config: *const model.ModelConfig, comptime name: []const u8) bool {
+    return if (facts(config)) |f| @field(f, name) else false;
 }
 
 pub fn tagOf(config: *const model.ModelConfig) ?Tag {
@@ -122,6 +135,25 @@ pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir
             null,
     };
 }
+
+/// The layers a pack of `config`'s arch stores after the trunk's (its MTP layers under the trunk's key prefix); 0 when
+/// the arch declares none.
+pub fn trailingPackLayers(config: *const model.ModelConfig) u32 {
+    const tag = tagOf(config) orelse return 0;
+    return switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "trailingPackLayers")) registry.Mod(t).trailingPackLayers(config) else 0,
+    };
+}
+
+/// The committed config of the arch registered as `name` (`fixtures.config` in its chat face), for a shared test;
+/// null when the build left the arch out.
+pub fn fixtureConfig(comptime name: []const u8) ?[]const u8 {
+    if (comptime !@hasField(Tag, name)) return null;
+    return registry.Chat(@field(Tag, name)).fixtures.config;
+}
+
+/// A config no arch claims, which a shared fixture parses in place of an arch the build left out.
+pub const unbuilt_config = "{\"model_type\":\"unbuilt\",\"hidden_size\":64,\"vocab_size\":32}";
 
 /// The names the arch gate's refusal lists: the enabled archs, in the order they were first documented.
 pub const gate_text = blk: {

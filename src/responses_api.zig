@@ -410,7 +410,7 @@ fn handleResponsesInner(
     /// Owned by `handleResponses` so its error arm can number the terminal `error` event.
     seq_num: *u64,
 ) !void {
-    // No `lm.transformer.?` needed here.
+    // No `lm.handle` needed here.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -709,7 +709,7 @@ fn handleResponsesInner(
         },
         .no_mask, .token_zero => schema_proto_active = false,
     }
-    if (grammar_schema_val != null and !active_has_tools and !enable_thinking and lm.transformer != null) {
+    if (grammar_schema_val != null and !active_has_tools and !enable_thinking and lm.handle != null) {
         if (!resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, false)) {
             schema_proto = rp_mod.Protocol.jsonOnly();
         }
@@ -817,7 +817,7 @@ fn handleResponsesInner(
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     if (think_bound) |*tb| sampling.think_bound = tb;
-    var call_force = if (active_has_tools and lm.transformer != null)
+    var call_force = if (active_has_tools and lm.handle != null)
         armCallForce(allocator, tok, chat_config, prompt_ids, enable_thinking, tool_choice, active_tools_json)
     else
         null;

@@ -1576,7 +1576,7 @@ test "deepseek_v41: the image token spelled in a text-only prompt is text, with 
         .arch_hint = "deepseek_v41",
         .config = &cfg,
         .weights = null,
-        .transformer = null,
+        .handle = null,
         .tokenizer = null,
         .chat_config = null,
         .vision_encoder = null,

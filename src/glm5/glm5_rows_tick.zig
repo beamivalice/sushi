@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("../arch/handle.zig");
 const sched_policy = @import("../sched_policy.zig");
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
@@ -60,7 +61,7 @@ test "a streamed GLM load leaves a found assistant unloaded and refuses an asked
 /// Ownership of `cps` passes to the cache.
 pub fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request: *const glm5_forward_mod.Request, tokens: []const u32, cps_opt: ?[]trunk_mod.SSMCheckpoint, dflash: ?prefix_cache_mod.DflashCommit, prompt_len: usize) void {
     const cps_all = cps_opt orelse return;
-    const s = slot.model.transformer.?.s;
+    const s = arch_handle.trunk(slot.model.handle.?).s;
     // The rows are chosen before the copy: only what the RAM tier keeps, never a full copy followed by a trim.
     const window: u64 = if (dflash) |d| prefix_cache_mod.HotPrefixCache.liveCacheBytes(d.cache) else 0;
     const row_bytes = glm5_prefix.rowBytesOf(request);
@@ -187,7 +188,7 @@ pub fn slotGlmRowable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!gen.glm_dflash_native or gen.dflash_ctx == null or gen.done) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
-    const t = slot.model.transformer orelse return false;
+    const t = arch_handle.trunk(slot.model.handle orelse return false);
     return glm5_state.supportsBatchedRows(t);
 }
 
@@ -459,7 +460,7 @@ test "every GLM slot owns its native request and hands it to its forward context
     var cfg = try model_mod.parseConfigFromJson(allocator, @embedFile("../fixtures/glm5_config.json"));
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     model.prefix_cache = null;
     var slots: [2]*Slot = undefined;
     for (&slots) |*slot| slot.* = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
@@ -497,7 +498,7 @@ test "a GLM slot submitted with a kv4 override is refused by the same name admis
     var cfg = try model_mod.parseConfigFromJson(allocator, @embedFile("../fixtures/glm5_config.json"));
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     model.prefix_cache = null;
     const result = sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = trunk_mod.KVQuantConfig.affine(4) });
     try expectError(error.GlmKvQuantUnsupported, result);
@@ -518,7 +519,7 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/glm-cull";
     model.prefix_cache = null;
-    model.transformer = null;
+    model.handle = null;
     var cfg = ModelConfig{ .model_type = "glm5_next" };
     model.config = &cfg;
     var slots: [3]Slot = undefined;
@@ -578,7 +579,7 @@ test "a GLM cancel landing between the cull passes is committed once before its 
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/glm-cull-race";
     model.prefix_cache = null;
-    model.transformer = null;
+    model.handle = null;
     var cfg = ModelConfig{ .model_type = "glm5_next" };
     model.config = &cfg;
     var slots: [2]Slot = undefined;
@@ -622,7 +623,7 @@ test "postPrefillTerminal releases native GLM state for a cancelled slot but not
     if (comptime @import("../arch/arch_state.zig").SlotRequest != glm5_forward_mod.Request) return error.SkipZigTest;
     var cfg = ModelConfig{ .model_type = "glm5_next" };
     var model: LoadedModel = undefined;
-    model.transformer = null;
+    model.handle = null;
     model.config = &cfg;
     var cancelled_slot: Slot = undefined;
     cancelled_slot.model = &model;

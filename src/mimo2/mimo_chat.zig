@@ -3,6 +3,8 @@ const eff = @import("../effort.zig");
 
 pub const model_types = [_][]const u8{"mimo_v2"};
 
+pub const fixtures = @import("mimo_fixtures.zig");
+
 // The template has only on/off; no artificial effort levels are advertised.
 pub const effort: eff.Offer = .{ .fixed = &.{
     .{ .effort = .off },

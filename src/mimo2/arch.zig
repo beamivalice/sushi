@@ -12,6 +12,7 @@ pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
 pub const State = @import("mimo2_state.zig").State;
+pub const Ctx = @import("mimo2_state.zig").Ctx;
 
 /// A model type no arch claims runs the generic MoE trunk, which is this arch.
 pub const default_arch = true;
@@ -32,6 +33,11 @@ pub const prefix = @import("mimo2_prefix.zig"); // slot:prefix (S2c)
 
 pub const bill = @import("mimo_bill.zig"); // slot:bill (S2d)
 
+pub const load = @import("mimo2_load.zig");
+
+/// The arch's microbenches, which `sushi-ubench` lists; nothing else reads them.
+pub const ubench = @import("ubench.zig");
+
 const config_file = @import("mimo_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = model_types;
@@ -42,6 +48,10 @@ pub const config_facts: arch_config.Facts = .{
     .stub_first_moe = 1,
     .dense_prefix_in_layer_freq = true,
     .serves_video = false,
+    .residual_from_embedding = true,
+    .moe_scores_f32 = true,
+    .qkv_split_rows = true,
+    .bias_routed_moe = true,
 };
 pub const parseConfig = config_file.parseFamily;
 
@@ -126,7 +136,7 @@ test "a model stamped as mimo2 is dispatched to mimo2" {
 }
 
 test "a MiMo config leaves the QSA budget zero, so the QSA arming is qwen4's alone" {
-    var config = try @import("../model.zig").parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/model-configs/mimo_v2.json"));
+    var config = try @import("../model.zig").parseConfigFromJson(std.testing.allocator, chat.fixtures.config);
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 0), config.indexer_budget);
 }
@@ -137,4 +147,13 @@ test "a MiMo source trunk widens its dense router at load; a converted MiMo pack
     try std.testing.expect(arch_moe.widensRouter(&.{ .model_type = "mimo_v2", .expert_layout = .exl3_k4 }));
     try std.testing.expect(!arch_moe.widensRouter(&.{ .model_type = "mimo_v2" }));
     try std.testing.expect(!arch_moe.widensRouter(&.{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4 }));
+}
+
+test "a MiMo config states the trunk rules MiMo keeps, and another arch's config states none of them" {
+    const mimo: Config = .{ .model_type = model_types[0] };
+    const other: Config = .{ .model_type = "facts-test" };
+    inline for (.{ "residual_from_embedding", "moe_scores_f32", "qkv_split_rows", "bias_routed_moe" }) |name| {
+        try std.testing.expect(arch_config.fact(&mimo, name));
+        try std.testing.expect(!arch_config.fact(&other, name));
+    }
 }

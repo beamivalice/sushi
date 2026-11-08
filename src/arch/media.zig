@@ -6,6 +6,7 @@
 //! `normalizeChw` (patch-grid towers) or `planImage` and `decodeImage` (an arch that decodes on its own). It may add
 //! `maxImagePatches`, `imageRows`, `expandVideo`, `videoResize`, `mropePositions`; each has a default.
 const std = @import("std");
+const arch_config = @import("config.zig");
 const mlx = @import("../mlx.zig");
 const chat = @import("../chat.zig");
 const model = @import("../model.zig");
@@ -254,7 +255,7 @@ pub fn testConfig(model_type: []const u8) ?model.ModelConfig {
 test "at most one arch claims a parsed config, whatever the claim order" {
     const docs = [_][]const u8{
         @embedFile("../fixtures/model-configs/qwen4_exp.json"),
-        @embedFile("../fixtures/model-configs/mimo_v2.json"),
+        arch_config.fixtureConfig("mimo2") orelse arch_config.unbuilt_config,
         @embedFile("../fixtures/glm5_config.json"),
     };
     for (docs) |doc| {

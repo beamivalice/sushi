@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
 const generate_mod = @import("generate.zig");
@@ -339,7 +340,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     const hc_opt: ?*prefix_cache_mod.HotPrefixCache =
         if (slot.model.prefix_cache) |*p| p else null;
     const stream_opt: ?mlx.mlx_stream =
-        if (slot.model.transformer) |x| x.s else null;
+        if (slot.model.handle) |h| arch_handle.stream(h) else null;
     // Record per-request metrics while slot fields are still live (before markFinished broadcasts:
     // the conn thread may complete()+free the slot immediately after). real_ttft = first_token_ns
     // (queue+prefill, captured at prefill completion); recordRequest derives e2e = first_token_ns + decode_ns.

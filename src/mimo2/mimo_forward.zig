@@ -1,6 +1,7 @@
 //! MiMo-V2 forward: sliding/global attention arms, routed-MoE dispatch, batched decode and verify rows.
 
 const trunk_mod = @import("../trunk.zig");
+const arch_state = @import("../arch/arch_state.zig");
 const forward_diag = @import("../forward_diag.zig");
 const moe_router = @import("../moe_router.zig");
 const nax_gate = @import("../nax_gate.zig");
@@ -531,7 +532,7 @@ pub fn warmupMimoVerify(self: *Trunk, kv_config: KVQuantConfig) !MimoWarmRows {
     defer _ = mlx.mlx_array_free(prompt);
     Trunk.specWarmEvalFree(&[_]mlx.mlx_array{try self.forwardWith(&sl.ctx, prompt)});
     var warmed: MimoWarmRows = 0;
-    sl.ctx.verify_rows = true;
+    sl.ctx.arch_ctx.mimo2.verify_rows = true;
     var rows: usize = 2;
     while (rows <= MIMO_VERIFY_ROWS_MAX) : (rows += 1) {
         var ids: [@intCast(MIMO_VERIFY_ROWS_MAX)]i32 = undefined;
@@ -579,10 +580,12 @@ pub fn forwardMimoBatchedDecode(
         .ssm_entries = null,
         .capture_hidden = null,
         .vision_embeddings = null,
-        .verify_rows = true,
         .skip_lm_head = true,
-        .batch_rows = ctxs,
-        .batch_row_offsets = rope_offsets,
+        .arch_ctx = arch_ctx: {
+            var c: arch_state.Ctx = .{};
+            c.mimo2 = .{ .verify_rows = true, .batch_rows = ctxs, .batch_row_offsets = rope_offsets };
+            break :arch_ctx c;
+        },
     };
     const normed = try forwardMoeWith(self, &bctx, token_arr);
     defer _ = mlx.mlx_array_free(normed);
@@ -681,7 +684,7 @@ pub fn forwardMoeWith(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) 
         const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
         const sliding = slidingViewFor(cfg, total_kv, seq_len);
         // A MiMo spec verify attends row by row with the decode arithmetic.
-        const verify_rows = is_mimo and ctx.verify_rows;
+        const verify_rows = is_mimo and ctx.arch_ctx.mimo2.verify_rows;
         if (is_prefill and !verify_rows) {
             // Built at the TRIMMED length, which is what the attn fns hand SDPA.
             local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
@@ -831,10 +834,10 @@ pub fn forwardMoeWith(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) 
     // Caller frees the captured
     // array.
     if (ctx.capture_hidden) |target| {
-        try capturePrefillHiddenLast(self.s, target, final_normed, !ctx.verify_rows);
+        try capturePrefillHiddenLast(self.s, target, final_normed, !ctx.arch_ctx.mimo2.verify_rows);
     }
     if (ctx.capture_hidden_all) |target_all| {
-        try capturePrefillHidden(self.s, target_all, final_normed, !ctx.verify_rows);
+        try capturePrefillHidden(self.s, target_all, final_normed, !ctx.arch_ctx.mimo2.verify_rows);
     }
 
     if (ctx.skip_lm_head) return final_normed;
@@ -923,8 +926,8 @@ pub fn mimoAttnWith(
         proj[1] = try self.qmatmul(x, &fa.k);
         proj[2] = try self.qmatmul(x, &fa.v);
     }
-    const attn_out = if (ctx.batch_rows) |rows|
-        try mimoBatchRowsAttn(self, rows, ctx.batch_row_offsets, proj, fa, layer, local_decode_mask)
+    const attn_out = if (ctx.arch_ctx.mimo2.batch_rows) |rows|
+        try mimoBatchRowsAttn(self, rows, ctx.arch_ctx.mimo2.batch_row_offsets, proj, fa, layer, local_decode_mask)
     else
         try mimoAttnCore(self, ctx, proj, fa, layer, offset, batch, seq_len, is_prefill, local_prefill_mask, local_decode_mask);
     defer _ = mlx.mlx_array_free(attn_out);
@@ -1025,9 +1028,9 @@ pub fn mimoAttnCore(
 
     var attn_out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(attn_out);
-    switch (try mimoAttnArm(ctx.verify_rows, is_prefill, is_global, seq_len)) {
+    switch (try mimoAttnArm(ctx.arch_ctx.mimo2.verify_rows, is_prefill, is_global, seq_len)) {
         .verify_rows, .prefill_rows => {
-            if (!ctx.verify_rows and !mimo_prefill_rows_logged) {
+            if (!ctx.arch_ctx.mimo2.verify_rows and !mimo_prefill_rows_logged) {
                 mimo_prefill_rows_logged = true;
                 log.info("[mimo] short global prefill engaged: {d} rows read row by row over {d} keys\n", .{ seq_len, offset + seq_len });
             }

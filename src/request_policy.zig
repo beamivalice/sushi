@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("arch/handle.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
@@ -65,7 +66,7 @@ pub fn samplingTopK(config: *const model_mod.ModelConfig, request: ?u32) u32 {
 
 /// The in-stream thinking bound needs atomic think markers.
 fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
-    if (lm.transformer == null) return false;
+    if (lm.handle == null) return false;
     return atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER) != null;
 }
 
@@ -86,8 +87,8 @@ fn thinkPenaltyFor(lambda: f32, enable_thinking: bool, opener: ?u32, closer: ?u3
 }
 
 pub fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, lambda: f32) think_penalty.ThinkPenalty {
-    if (!enable_thinking or lm.transformer == null) return .{};
-    if (!@import("think_penalty.zig").needsSpan(lambda, lm.transformer.?.logit_bias)) return .{};
+    if (!enable_thinking or lm.handle == null) return .{};
+    if (!@import("think_penalty.zig").needsSpan(lambda, arch_handle.trunk(lm.handle.?).logit_bias)) return .{};
     const closer = atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER);
     var tp = thinkPenaltyFor(@max(lambda, 1), enable_thinking, atomicTokenId(allocator, tok, think_tags.BARE_THINK_OPENER), closer, promptOpensThink(allocator, tok, prompt_ids));
     tp.lambda = if (tp.lambda > 0) lambda else 0;

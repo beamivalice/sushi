@@ -9,9 +9,13 @@ pub const tests = .{
     @import("mimo_vision.zig"),
     @import("mimo_forward.zig"),
     @import("mimo_fixture_test.zig"),
+    @import("mimo_exl3_moe_test.zig"),
     @import("mimo2_state.zig"),
     @import("mimo2_shortlist.zig"),
     @import("mimo_mtp.zig"),
     @import("mimo_source.zig"),
     @import("mimo_scheduler_test.zig"),
+    @import("mimo2_load.zig"),
+    @import("mimo2_drafter.zig"),
+    @import("mimo_bill.zig"),
 };

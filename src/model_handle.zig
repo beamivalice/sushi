@@ -66,9 +66,6 @@ pub const ForwardCtx = struct {
     /// for the verify pass on a GDN model; the flag reaches the layers via
     /// `Trunk.spec_capture_ssm`.
     capture_ssm_seq: bool = false,
-    /// MiMo spec verify: every row of this multi-row forward computes with its
-    /// own decode tick's arithmetic (`mimoVerifyRowsAttn`), so greedy MTP is serial.
-    verify_rows: bool = false,
     vision_embeddings: ?mlx.mlx_array,
     /// Chunked vision prefill (issue #197): number of image/audio placeholder
     /// tokens already spliced by earlier chunks of this prefill. The splice's
@@ -111,11 +108,6 @@ pub const ForwardCtx = struct {
     /// so the attention layer never re-derives a per-slot offset.
     batch_slots: ?[]const *ForwardCtx = null,
     batch_rope_offsets: ?mlx.mlx_array = null,
-    /// MiMo batched decode (`forwardMimoBatchedDecode`): row i of this `[1, N]` forward is
-    /// slot i's decode tick, its attention and KV append on `batch_rows[i]`'s cache at
-    /// `batch_row_offsets[i]`; every other op already computes rows independently.
-    batch_rows: ?[]const *ForwardCtx = null,
-    batch_row_offsets: []const u32 = &.{},
     /// The ids are still a lazy sample: an arch's host-side lookup keyed on them waits for `arch_state.flushDeferred`.
     lazy_ids: bool = false,
 };

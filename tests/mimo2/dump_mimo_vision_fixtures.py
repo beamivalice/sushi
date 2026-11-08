@@ -13,7 +13,7 @@ CPU in f32 and writes what the Zig tests compare against.
       tower with the sink as an extra softmax column (SGLang's reading) instead
       of a bias on key 0's logit (the reference's and vLLM's), so the Zig test
       can prove which one it implements. Committed as
-      src/fixtures/mimo_vision_tiny.safetensors.
+      src/mimo2/fixtures/mimo_vision_tiny.safetensors.
 
   real OUT.safetensors --ref DIR
       The real tower (`visual.*` read from DIR's shards) on a synthetic

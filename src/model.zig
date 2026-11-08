@@ -46,6 +46,7 @@ const effort_mod = @import("effort.zig");
 const qwen4_config = @import("qwen4/qwen4_config.zig");
 const arch_config = @import("arch/config.zig");
 const registry = @import("arch/registry.zig");
+const arch_load = @import("arch/load.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -1895,40 +1896,6 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     return loadWeightsOpt(io, allocator, model_dir, false);
 }
 
-fn logMimoSourceLoad(config: *const ModelConfig, vision: bool) void {
-    log.info("[mimo-source] loading original shards: {s} experts, FP8 trunk in source bytes{s}\n", .{
-        if (config.expert_streaming) "SSD-streamed" else if (config.expert_layout == .exl3_k4) "resident EXL3" else "native MXFP4",
-        if (vision) ", bf16 vision tower" else "",
-    });
-}
-
-/// MiMo's trunk is FP8 on disk under either routed-expert layout, so both take
-/// the source loader; an EXL3 pack's routed banks come resident beside it.
-pub fn loadWeightsMimoSource(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool) !Weights {
-    const mimo_source = @import("mimo2/mimo_source.zig");
-    var config = try parseConfig(io, allocator, model_dir);
-    defer config.deinit(allocator);
-    logMimoSourceLoad(&config, vision);
-    var weights = try mimo_source.loadWeights(io, allocator, model_dir, &config);
-    errdefer weights.deinit();
-    if (vision) try mimo_source.loadVisionWeightsInto(&weights, io, allocator, model_dir);
-    return weights;
-}
-
-/// Resident bytes of a MiMo pack the source loader prepares: the trunk as
-/// served (FP8 codes + scale grids, bf16 rest) plus any resident routed banks,
-/// plus the vision tower as stored when it is loaded.
-pub fn mimoSourceResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool) !u64 {
-    const mimo_source = @import("mimo2/mimo_source.zig");
-    const trunk = try mimo_source.residentBytes(io, allocator, model_dir);
-    return if (vision) trunk + try mimo_source.visionResidentBytes(io, allocator, model_dir) else trunk;
-}
-
-/// Resident bytes of a MiMo checkpoint's MTP heads as `mimo_source` uploads them.
-pub fn mimoMtpResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !u64 {
-    return @import("mimo2/mimo_source.zig").mtpResidentBytes(io, allocator, model_dir);
-}
-
 /// The architectures this build serves. Every other `model_type` is refused
 /// by name at the loader, so the inherited forwards behind it are unreachable.
 pub const served_model_types = registry.registered_model_types;
@@ -2024,21 +1991,13 @@ pub fn loadWeightsForConfig(
     try archGate(config);
     if (config.pack_revision) |rev| try pack_revision_mod.verify(io, allocator, model_dir, rev);
     if (config.isDsv41()) return loadWeightsDsv41(io, allocator, model_dir, config, load_vision);
-    if (config.expert_layout == .exl3_k4) try @import("mimo2/mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
+    if (config.expert_layout == .exl3_k4) try @import("pack_index.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
         const glm = @import("glm5/glm5_diagnostic.zig");
         return glm.loadWeightsBoundedWithVision(io, allocator, model_dir, mlx.gpuStream(), config.expert_streaming, std.math.maxInt(u64), load_vision and config.glm5_vision);
     }
-    if (config.expert_streaming and config.usesMimoSourceTrunk()) {
-        const vision = load_vision and config.mimo_vision;
-        logMimoSourceLoad(config, vision);
-        var weights = try @import("mimo2/mimo_source.zig").loadWeights(io, allocator, model_dir, config);
-        errdefer weights.deinit();
-        if (vision) try @import("mimo2/mimo_source.zig").loadVisionWeightsInto(&weights, io, allocator, model_dir);
-        return weights;
-    }
+    if (try arch_load.weights(io, allocator, model_dir, config, load_vision)) |weights| return weights;
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, load_vision, config.stream_mtp_head);
-    if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     const mtp_off = config.isQwen4() and config.mtp_override == false;
@@ -2058,7 +2017,7 @@ fn loadWeightsDsv41(io: std.Io, allocator: std.mem.Allocator, model_dir: []const
 }
 
 pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout, vision: bool, keep_mtp: bool) !Weights {
-    if (layout == .mxfp4_individual) return loadWeightsMimoSource(io, allocator, model_dir, vision);
+    if (layout == .mxfp4_individual) return (try arch_load.individualExpertWeights(io, allocator, model_dir, vision)) orelse error.ExpertLayoutUnsupported;
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, vision, .{ .layout = layout, .keep_mtp = keep_mtp }, false);
@@ -3831,7 +3790,8 @@ test "parseConfigFromJson: an optional field set to null keeps its default; slid
 }
 
 test "the shipped packs' configs parse to the geometry they serve (src/fixtures/model-configs)" {
-    if (registry.ofModelType("qwen4_exp") == null or registry.ofModelType("mimo_v2") == null) return error.SkipZigTest;
+    if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    const mimo_doc = arch_config.fixtureConfig("mimo2") orelse return error.SkipZigTest;
     // Cut from Qwen3.8-Flash-Next-Sushi-3bpw and MiMo-V2.6-Flash-Sushi-2.3bpw. MiMo's `expert_quant.k` 4 is the
     // widest rate a layer packs, the one the engine bills: its last MoE layer is K4, the rest K2.25.
     const t = testing;
@@ -3873,7 +3833,7 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
     try t.expectEqual(@as(i32, 1), q.ple_layer_idx);
     try t.expectEqual(@as(u32, 248044), q.ngram_eos);
 
-    const m = try parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/mimo_v2.json"));
+    const m = try parseConfigFromJson(t.allocator, mimo_doc);
     try t.expectEqualStrings("mimo_v2", m.model_type);
     try t.expectEqual(@as(u32, 152576), m.vocab_size);
     try t.expectEqual(@as(u32, 4096), m.hidden_size);
@@ -3893,7 +3853,7 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
 
     for ([_]struct { doc: []const u8, rate_n: u32 }{
         .{ .doc = @embedFile("fixtures/model-configs/qwen4_exp.json"), .rate_n = 3 * 16 },
-        .{ .doc = @embedFile("fixtures/model-configs/mimo_v2.json"), .rate_n = 4 * 16 },
+        .{ .doc = mimo_doc, .rate_n = 4 * 16 },
     }) |c| {
         const meta = model_discovery.parseStubMeta(t.allocator, c.doc, true);
         try t.expect(meta.found and meta.quantized_experts);
@@ -4430,25 +4390,33 @@ fn pinConfig(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-const mimo_config = @import("mimo2/mimo_config.zig");
-
 const PinCase = struct { name: []const u8, arch_type: []const u8, json: []const u8, swap: ?[2][]const u8 = null };
 
-const config_pin_corpus = [_]PinCase{
+const shared_pin_cases = [_]PinCase{
     .{ .name = "model-configs/qwen4_exp.json", .arch_type = "qwen4_exp", .json = @embedFile("fixtures/model-configs/qwen4_exp.json") },
-    .{ .name = "model-configs/mimo_v2.json", .arch_type = "mimo_v2", .json = @embedFile("fixtures/model-configs/mimo_v2.json") },
     .{ .name = "glm5_config.json", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json") },
     .{ .name = "dsv41 release", .arch_type = "deepseek_v41", .json = dsv41_config.release_config },
     .{ .name = "qwen4 shipped", .arch_type = "qwen4_exp", .json = QWEN4_SHIPPED },
     .{ .name = "qwen4 yarn", .arch_type = "qwen4_exp", .json = QWEN4_YARN },
-    .{ .name = "mimo vision", .arch_type = "mimo_v2", .json = mimo_config.MIMO_V2_VISION_JSON },
-    .{ .name = "mimo bill", .arch_type = "mimo_v2", .json = mimo_config.MIMO_V2_BILL_JSON },
     .{ .name = "glm5 text alias", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json"), .swap = .{ "\n  \"model_type\": \"glm5_next\"", "\n  \"model_type\": \"glm5_next_text\"" } },
     .{ .name = "glm5 raw fp8", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json"), .swap = .{ "{\n  \"architectures\"", "{\"quantization_config\":{\"quant_method\":\"fp8\",\"weight_block_size\":[128,128]},\n  \"architectures\"" } },
     .{ .name = "qwen4 text alias", .arch_type = "qwen4_exp", .json = QWEN4_SHIPPED, .swap = .{ "  \"model_type\": \"qwen4_exp\",\n  \"text_config\"", "  \"model_type\": \"qwen4_exp_text\",\n  \"text_config\"" } },
     .{ .name = "qwen4 trunk_quant", .arch_type = "qwen4_exp", .json = qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"trunk_quant\":{\"format\":\"stq\",\"k\":6,\"codebook\":\"spec1\",\"window\":15,\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"}") },
     .{ .name = "unserved", .arch_type = "", .json = "{\"model_type\":\"mistral\",\"hidden_size\":64,\"vocab_size\":32}" },
 };
+
+/// The configs each built arch's chat face lists for the pins (`fixtures.config_pins`).
+const arch_pin_cases = blk: {
+    var out: []const PinCase = &.{};
+    for (std.meta.tags(registry.Tag)) |t| {
+        const face = registry.Chat(t);
+        if (!@hasDecl(face, "fixtures") or !@hasDecl(face.fixtures, "config_pins")) continue;
+        for (face.fixtures.config_pins) |c| out = out ++ &[_]PinCase{.{ .name = c[0], .arch_type = face.model_types[0], .json = c[1] }};
+    }
+    break :blk out;
+};
+
+const config_pin_corpus = shared_pin_cases ++ arch_pin_cases;
 
 /// A case's section of the pin file; null when its arch is left out of this build.
 fn pinSection(allocator: std.mem.Allocator, c: PinCase) !?[]u8 {

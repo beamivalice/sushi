@@ -1,6 +1,7 @@
 //! DeepSeek-V4.1 as the scheduler sees it: one request at a time over state the model holds, restore points that
 //! always go to SSD, and a thought point written behind a DSpark round.
 const std = @import("std");
+const arch_handle = @import("../arch/handle.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const transformer = @import("../trunk.zig");
@@ -32,13 +33,13 @@ pub fn modelStateBytes(slot: *const Slot) u64 {
 /// The next exclusive request is admitted as soon as the slot leaves `decoding` and takes the record over, so a
 /// commit at the cleanup drain would publish onto its state.
 pub fn commitsAtCull(slot: *const Slot) bool {
-    const xfm = slot.model.transformer orelse return false;
+    const xfm = arch_handle.trunk(slot.model.handle orelse return false);
     return xfm.arch_state.dsv41.model != null;
 }
 
 /// The cache holds a one-byte-a-token row marker for the model's rows.
 pub fn prepareCommit(slot: *Slot) !void {
-    const xfm = slot.model.transformer orelse return;
+    const xfm = arch_handle.trunk(slot.model.handle orelse return);
     if (xfm.arch_state.dsv41.model == null) return;
     try dsv41_prefix.markRows(&slot.cache);
 }
@@ -68,7 +69,7 @@ pub fn writeThrough(
     s: mlx.mlx_stream,
 ) bool {
     _ = entry_id;
-    const dsv = (slot.model.transformer orelse return false).arch_state.dsv41.model orelse return false;
+    const dsv = arch_handle.trunk(slot.model.handle orelse return false).arch_state.dsv41.model orelse return false;
     dsv41_prefix.writeThroughDsv41(hc, dsv, &slot.cache, prompt, slot.has_tools, media, cps, s, "prefill");
     return true;
 }

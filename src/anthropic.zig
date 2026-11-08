@@ -481,7 +481,7 @@ pub fn handleAnthropicMessages(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    // No `lm.transformer.?` needed here.
+    // No `lm.handle` needed here.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -662,7 +662,7 @@ pub fn handleAnthropicMessages(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
-    var call_force = if (has_tools and lm.transformer != null and !continue_final)
+    var call_force = if (has_tools and lm.handle != null and !continue_final)
         armCallForce(allocator, tok, chat_config, prompt_ids, enable_thinking, prompt.tool_choice, tools_json)
     else
         null;
@@ -916,7 +916,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         },
         .no_mask, .token_zero => p.schema_proto_active = false,
     }
-    if (output_cfg.schema != null and !p.has_tools and !enable_thinking and lm.transformer != null) {
+    if (output_cfg.schema != null and !p.has_tools and !enable_thinking and lm.handle != null) {
         if (!resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, p.ids, &p.schema_proto, false)) {
             p.schema_proto = rp_mod.Protocol.jsonOnly();
         }
@@ -2145,7 +2145,7 @@ const CountTokensFixture = struct {
         f.lm.config = &f.cfg;
         f.lm.tokenizer = &f.tok;
         f.lm.chat_config = &f.chat_cfg;
-        f.lm.transformer = null;
+        f.lm.handle = null;
         f.lm.vision_encoder = null;
         f.lm.dflash = null;
         f.lm.mtp = null;

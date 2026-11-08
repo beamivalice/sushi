@@ -108,7 +108,7 @@ kernel on supported hardware.
 
 A MiMo EXL3 pack serves RESIDENT: its banks nest under `model.layers.` (qwen4's under
 `language_model.model.layers.`), `expertStreamingRequired` excepts `.exl3_k4`, and the trunk still takes the
-source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceResidentBytes`. See
+source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimo2_load.sourceResidentBytes`. The pack checks every arch's EXL3 banks take at load are `pack_index.validateExl3Pack`. See
 [mimo2-arch](mimo2-arch.md).
 
 ## GLM clamped experts

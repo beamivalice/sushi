@@ -1,18 +1,18 @@
 //! MiMo-V2.6-Flash microbenches: global-layer decode and prefill attention, the FP8 trunk linears at the
 //! checkpoint's own shapes, and the MiMo-ViT encode on a real tower. Run by `sushi-ubench`, never by a test.
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const io_util = @import("io_util.zig");
-const log = @import("log.zig");
-const report = @import("ubench_report.zig");
-const fp8_block = @import("fp8_block.zig");
-const trunk = @import("trunk.zig");
-const attn_kernels = @import("attn_kernels.zig");
-const kv_quant = @import("kv_quant.zig");
-const mimo_forward = @import("mimo2/mimo_forward.zig");
-const model_mod = @import("model.zig");
-const mimo_source = @import("mimo2/mimo_source.zig");
-const mimo_vision = @import("mimo2/mimo_vision.zig");
+const mlx = @import("../mlx.zig");
+const io_util = @import("../io_util.zig");
+const log = @import("../log.zig");
+const report = @import("../ubench_report.zig");
+const fp8_block = @import("../fp8_block.zig");
+const trunk = @import("../trunk.zig");
+const attn_kernels = @import("../attn_kernels.zig");
+const kv_quant = @import("../kv_quant.zig");
+const mimo_forward = @import("mimo_forward.zig");
+const model_mod = @import("../model.zig");
+const mimo_source = @import("mimo_source.zig");
+const mimo_vision = @import("mimo_vision.zig");
 
 pub const benches = [_]report.Bench{ global_decode_attn, prefill_attn, fp8_gemv, vision_encode };
 

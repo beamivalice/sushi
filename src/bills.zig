@@ -1,8 +1,8 @@
 //! Bills, admission, context and chunk math. It reads the GPU only through gpu_mem.zig, so a test that reaches no
 //! live reading runs in the host tier.
 const std = @import("std");
+const arch_config = @import("arch/config.zig");
 const settings_resolve = @import("settings_resolve.zig");
-const mimo_forward = @import("mimo2/mimo_forward.zig");
 const trunk = @import("trunk.zig");
 const verify_moe = @import("verify_moe.zig");
 const attn_kernels = @import("attn_kernels.zig");
@@ -783,6 +783,10 @@ pub fn trunkDecodeScratchBytes(config: *const model_mod.ModelConfig, fwd: u64) u
     return sushi_exl3.trunk_gemm.DECODED_SCRATCH_BYTES;
 }
 
+/// The most keys a decode tick rebuilds dense, below the packed decode arms' floor; each arch whose decode kernels
+/// have such a floor pins its own against it.
+pub const DECODE_REBUILD_KEYS_MAX: u64 = 4095;
+
 /// Dense bytes ONE layer's `KVCache.denseView` rebuild costs at this prompt
 /// length — the quantized-KV prefill transient, which the eval cadence bounds
 /// to a layer at a time. Zero unless the generic `2 · seq · kv_heads · hdim ·
@@ -804,7 +808,7 @@ pub fn kvDequantScratchBytes(config: *const model_mod.ModelConfig, seq: u64, fwd
     // The kill switch takes the width off `prefillHeadDimFused` and the whole
     // rebuild comes back with it. A decode rebuilds whole below the packed arms' floor.
     const seq_rows: u64 = if (qsa_rows) |rows| rows else if (trunk.prefillHeadDimFused(config.prefillScoreHeadDim()))
-        @max(MOE_PREFILL_COEXIST *| @as(u64, @intCast(trunk.PACKED_KV_SLICE_MAX)), mimo_forward.mimoGlobalDecodeRebuildMaxKeys())
+        @max(MOE_PREFILL_COEXIST *| @as(u64, @intCast(trunk.PACKED_KV_SLICE_MAX)), DECODE_REBUILD_KEYS_MAX)
     else
         seq;
     var widest: u64 = 0;
@@ -2846,7 +2850,7 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
     try std.testing.expectEqual(@as(u32, 0), maxSushiContextForBudget(&cfg, 8, 0));
     launch_state.configured_mtp = true;
     try std.testing.expect(loadServingBill(&cfg, budget).?.max_context < bill.max_context);
-    var mimo = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/model-configs/mimo_v2.json"));
+    var mimo = try model_mod.parseConfigFromJson(std.testing.allocator, arch_config.fixtureConfig("mimo2") orelse return error.SkipZigTest);
     defer mimo.deinit(std.testing.allocator);
     mimo.expert_layout = .exl3_k4;
     const mimo_budget = sushiContextBytesAt(&mimo, 64000, 8).bytes;
@@ -4135,7 +4139,7 @@ test "every served model advertises 93% of the memory ceiling, capped at its own
     const t = testing;
     var qwen = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
     defer qwen.deinit(t.allocator);
-    var mimo = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/mimo_v2.json"));
+    var mimo = try model_mod.parseConfigFromJson(t.allocator, arch_config.fixtureConfig("mimo2") orelse return error.SkipZigTest);
     defer mimo.deinit(t.allocator);
     var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
     defer glm.deinit(t.allocator);
@@ -5900,7 +5904,7 @@ test "a MiMo slot bills the decode rebuilds the other rows of its batched decode
     const t = std.testing;
     var cfg = fixtures.mimoV2BillConfig();
     // One global layer's dense K/V below the packed arms' floor, for every other row of a full group.
-    const rebuild = mimo_forward.mimoGlobalDecodeRebuildMaxKeys() * cfg.layerKvBytes(0);
+    const rebuild = DECODE_REBUILD_KEYS_MAX * cfg.layerKvBytes(0);
     try t.expect(rebuild > 0);
     try t.expectEqual(@as(u64, @intCast(slot_admission.batchGroupCap(&cfg) - 1)) * rebuild, batchedDecodeRowsBytes(&cfg));
     try t.expectEqual(@as(usize, 4), slot_admission.batchGroupCap(&cfg));
@@ -8228,7 +8232,7 @@ pub fn loadStagingBytes(config: *const model_mod.ModelConfig, billed_fill_peak_b
 
 /// The 2-bit lm_head copy a MiMo source trunk keeps, resident or streamed: the heads draft on it
 /// and a greedy readout shortlists on it.
-pub fn mimoCoarseHeadBytes(config: *const model_mod.ModelConfig) u64 {
+pub fn coarseHeadBytes(config: *const model_mod.ModelConfig) u64 {
     return archHook("coarseHead", u64, config, .{}) orelse 0;
 }
 
@@ -8516,7 +8520,7 @@ test "bill pin: rerankCoarseBill and the coarse head bytes" {
                 g.add(rerankCoarseBill(affine, c, mtp, bits));
                 g.add(rerankCoarseBill(trellis, c, mtp, bits));
             };
-            g.add(mimoCoarseHeadBytes(c));
+            g.add(coarseHeadBytes(c));
         }
     }.run);
 }

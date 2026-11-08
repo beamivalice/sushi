@@ -24,6 +24,7 @@ test {
     _ = expert_bf16_kernels;
     _ = @import("arch/registry_test.zig");
     _ = @import("expert_io.zig");
+    _ = @import("pack_index.zig");
     _ = @import("imatrix.zig");
     _ = @import("hidden_capture.zig");
     _ = @import("expert_store.zig");
@@ -143,6 +144,7 @@ test {
     _ = @import("arch/sched.zig");
     _ = @import("arch/spec.zig");
     _ = @import("arch/life.zig");
+    _ = @import("arch/handle.zig");
     _ = @import("arch/forward.zig");
     _ = @import("arch/request.zig");
     _ = @import("arch/admission.zig");

@@ -1,5 +1,6 @@
 //! Fixtures the bill tests share: the served shapes as configs, and the pin fixture over all four archs.
 const std = @import("std");
+const arch_config = @import("arch/config.zig");
 const model_mod = @import("model.zig");
 const nax_gate = @import("nax_gate.zig");
 const dsv41_config = @import("dsv41/dsv41_config.zig");
@@ -200,7 +201,7 @@ pub const PinFx = struct {
         const a = std.testing.allocator;
         var qwen = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/qwen4_exp.json"));
         errdefer qwen.deinit(a);
-        var mimo = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/mimo_v2.json"));
+        var mimo = try model_mod.parseConfigFromJson(a, arch_config.fixtureConfig("mimo2") orelse arch_config.unbuilt_config);
         errdefer mimo.deinit(a);
         var glm = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/glm5_config.json"));
         errdefer glm.deinit(a);

@@ -1,6 +1,7 @@
 //! MiMo as the scheduler sees it: it batches plain slots as rows of one forward, and a crowded MTP slot may drop to
 //! plain ticks.
 const std = @import("std");
+const arch_handle = @import("../arch/handle.zig");
 const sched_policy = @import("../sched_policy.zig");
 const mimo_forward = @import("mimo_forward.zig");
 const mlx = @import("../mlx.zig");
@@ -62,7 +63,7 @@ fn mtpCrowdable(slot: *const Slot) bool {
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
-    const t = slot.model.transformer orelse return false;
+    const t = arch_handle.trunk(slot.model.handle orelse return false);
     if (!mimo_forward.supportsBatchedMimoDecode(t)) return false;
     return sched_policy.specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }

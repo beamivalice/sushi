@@ -65,7 +65,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
   (`loadWeightsFromOpenDirMode`'s `drop_mtp`), so a head stored as its own shard (`mtp-0.safetensors`, 1.18 GiB on Sushi-STQ-2.75bpw)
   costs no transient and the bill (`indexedResidentSplit`, `mtp_on`) matches. Nothing turns the head on afterwards: a request's
   `enable_mtp:true` is ignored without a loaded head, and the launch flag outranks `model-settings.json`. MiMo's heads
-  (`loadMimoHeads`) and DeepSeek's DSpark stages (`dsparkOn`) already load only when MTP is on.
+  (`mimo2_load.loadHead`, through `arch/load.zig`) and DeepSeek's DSpark stages (`dsparkOn`) already load only when MTP is on.
 
 ## MiMo's three heads
 
@@ -173,7 +173,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **A lookup round applies the pending history stash** (`mtpApplyStash`): left pending, it grows across lookup
   rounds into one oversized head forward.
 - **On MiMo a lookup drafts no wider than its verify keeps decode rows** (`mtpLookupDraftCap` =
-  `mtpVerifyDraftsMax(true)`); its stash append is the head-generic `mtpApplyStash`, and a lookup as round 1 leaves the
+  `mtpVerifyDraftsMax(config)`, from `arch_state.verifyRowsMax`); its stash append is the head-generic `mtpApplyStash`, and a lookup as round 1 leaves the
   prompt's lazy head catch-up to the next head forward, as an MTP round 1 does.
 - **Declined** for a batched head and in planner-owned rounds; a serial block (adaptive serial past 32k) runs none
   either. An explicit depth range holds it: at most `--mtp-max-depth` drafts, and a lookup shorter than

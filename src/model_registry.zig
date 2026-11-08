@@ -38,6 +38,7 @@ const pack_update = @import("pack_update.zig");
 pub var load_generation = std.atomic.Value(u64).init(0);
 
 const Trunk = trunk.Trunk;
+const arch_handle = @import("arch/handle.zig");
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -213,7 +214,7 @@ pub const LoadedModel = struct {
     /// pattern across config/tokenizer/chat_config).
     config: ?*ModelConfig,
     weights: ?*Weights,
-    transformer: ?*Trunk,
+    handle: ?arch_handle.Handle,
     /// Per-model tokenizer (different vocabularies across models). Phase 05
     /// moves ownership here from main.zig so the tokenizer's lifetime
     /// matches the model's residency.
@@ -369,10 +370,9 @@ pub const LoadedModel = struct {
             self.allocator.destroy(v);
             self.vision_encoder = null;
         }
-        if (self.transformer) |x| {
-            x.deinit();
-            self.allocator.destroy(x);
-            self.transformer = null;
+        if (self.handle) |h| {
+            arch_handle.destroy(h, self.allocator);
+            self.handle = null;
         }
         if (self.weights) |w| {
             w.deinit();
@@ -492,10 +492,9 @@ pub const LoadedModel = struct {
             self.allocator.destroy(v);
             self.vision_encoder = null;
         }
-        if (self.transformer) |x| {
-            x.deinit();
-            self.allocator.destroy(x);
-            self.transformer = null;
+        if (self.handle) |h| {
+            arch_handle.destroy(h, self.allocator);
+            self.handle = null;
         }
         if (self.weights) |w| {
             w.deinit();
@@ -743,7 +742,7 @@ pub const ModelRegistry = struct {
             .streaming_index_complete = streaming_index_complete,
             .config = null,
             .weights = null,
-            .transformer = null,
+            .handle = null,
             .tokenizer = null,
             .chat_config = null,
             .vision_encoder = null,

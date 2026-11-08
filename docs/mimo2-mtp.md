@@ -35,7 +35,7 @@ MiMo's three MTP heads, split out of [engine-mtp](engine-mtp.md); everything sha
   draft from the trunk's hidden at the current position; their own window adds nothing measurable.
 - **The load warms every verify row count and head** (`warmupMimoVerify`, `Head.warmup`, `[spec-warmup] MiMo …`): each
   row count JITs its own pipelines, and a new binary's first round at each width stalled 450-630 ms.
-- **Verify rows keep decode arithmetic** (`ForwardCtx.verify_rows`, up to `MIMO_VERIFY_ROWS_MAX` = 8 rows, the FP8
+- **Verify rows keep decode arithmetic** (`mimo2_state.Ctx.verify_rows`, set through `arch_state.setVerifyRows`, up to `MIMO_VERIFY_ROWS_MAX` = 8 rows, the FP8
   GEMV's direct-row limit; the three heads still draft at most 3, so only a lookup verify runs wider): every
   row's attention runs through `mimoDecodeAttn` on the keys its own decode tick saw (`mimoVerifyRowsAttn`; a
   sliding layer's rows in one dispatch, `mimoSlidingRowsAttn`), the rest of the forward is row-identical already

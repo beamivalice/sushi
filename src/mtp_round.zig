@@ -7,7 +7,6 @@ const mtp_policy = @import("mtp_policy.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
-const mimo_mtp = @import("mimo2/mimo_mtp.zig");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
@@ -216,8 +215,8 @@ pub fn mtpLookupPriceWidth(plan: MtpRoundPlan, drafted_ema: f32) u32 {
 }
 
 /// A lookup's drafts are verify rows too, so MiMo's stop at its decode-row budget.
-pub fn mtpLookupDraftCap(is_mimo: bool) u32 {
-    return @min(mtp_lookup.MAX_DRAFT_STRONG, mtpVerifyDraftsMax(is_mimo));
+pub fn mtpLookupDraftCap(config: *const trunk.ModelConfig) u32 {
+    return @min(mtp_lookup.MAX_DRAFT_STRONG, mtpVerifyDraftsMax(config));
 }
 
 /// End a round that stays out of the cost table. The regime clock runs from
@@ -285,7 +284,7 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
     if (!self.mtpLookupAllowed()) return null;
     const idx = try self.mtpLookupIndex(allocator);
     const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
-    const lookup_cap = depth_bounds.lookupCap(mtpLookupDraftCap(self.xfm.config.isMimo()), depth_bounds.active);
+    const lookup_cap = depth_bounds.lookupCap(mtpLookupDraftCap(&self.xfm.config), depth_bounds.active);
     const got = idx.match(t1, lookup_cap);
     const kv = self.mtpKvLen();
     const src = MtpCostSource.init(self.mtp_ev_costs, kv, if (mtpCostTableEnabled()) &self.xfm.round_cost else null);
@@ -1617,8 +1616,8 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
     // 4 evaluates anything. Other arches defer nothing.
     self.ctx.lazy_ids = true;
-    self.ctx.verify_rows = xfm.config.isMimo();
-    defer self.ctx.verify_rows = false;
+    arch_state.setVerifyRows(&xfm.config, &self.ctx.arch_ctx, true);
+    defer arch_state.setVerifyRows(&xfm.config, &self.ctx.arch_ctx, false);
     var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
         self.ctx.lazy_ids = false;
         self.ctx.capture_ssm_seq = false;
@@ -2974,50 +2973,6 @@ test "mtpPreDraftOpenAllows: a pre-draft needs a later round to read it" {
     try testing.expect(!G.mtpPreDraftOpenAllows(5, 10, true));
 }
 
-test "MTP detaching a pre-draft preserves the committed head boundary" {
-    if (comptime !@import("arch/drafter.zig").Drafter.has("mimo2")) return error.SkipZigTest;
-    const allocator = testing.allocator;
-    const stream = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(stream);
-    for ([_]bool{ false, true }) |owned| {
-        for ([_]bool{ false, true }) |apply_stash| {
-            var xfm: Trunk = undefined;
-            xfm.s = stream;
-            var gen: Generator = undefined;
-            gen.xfm = &xfm;
-            gen.mtp_planner_owned = owned;
-            const head_state = try allocator.create(mimo_mtp.State);
-            head_state.* = .{ .allocator = allocator, .hid_base = 9 };
-            gen.mtp_cache = MtpCacheRef.of("mimo2", .{ .st = head_state });
-            defer gen.mtp_cache.?.deinit();
-            gen.mtp_hist_stash = null;
-            var arrays: [mtp_mod.MAX_DEPTH]mlx.mlx_array = undefined;
-            for (arrays[0..3]) |*array| array.* = mlx.mlx_array_new();
-            gen.mtp_pre_draft = .{
-                .plan = .{ .m_lo = 3, .m_hi = 3, .tau_ln = 0 },
-                .off0 = 6,
-                .t1 = 1,
-                .t1_arr = mlx.mlx_array_new(),
-                .drafts = try allocator.alloc(u32, 3),
-                .draft_arrs = arrays,
-                .n_drafted = 3,
-                .conf_arrs = null,
-                .n_conf = 0,
-                .q_probs = null,
-                .n_qp = 0,
-                .h_chain = null,
-                .m = 3,
-            };
-            defer if (gen.mtp_pre_draft) |*draft| draft.deinit(allocator);
-            const committed = gen.mtpCommittedHistoryLen();
-            try gen.mtpDetachHead(allocator, apply_stash);
-            try testing.expect(gen.mtp_pre_draft == null);
-            try testing.expectEqual(@as(usize, 6), committed);
-            try testing.expectEqual(if (owned) committed else @as(usize, 9), gen.mtpCommittedHistoryLen());
-        }
-    }
-}
-
 test "cold grouped MTP head seeds the solo position and preserves valid origins" {
     try testing.expectEqual(@as(c_int, 1), Generator.mtpBatchHeadPosition(-1, 0));
     try testing.expectEqual(@as(c_int, 0), Generator.mtpBatchHeadPosition(0, 0));
@@ -3155,7 +3110,7 @@ test "MTP depth bounds: a lookup draft is never wider than an explicit max" {
     var text: [80]u32 = undefined;
     for (&text, 0..) |*t, i| t.* = @intCast(1 + i % 40);
     try idx.extend(&text, Lines{});
-    const cap = depth_bounds.lookupCap(Generator.mtpLookupDraftCap(false), .{ .max = 3 });
+    const cap = depth_bounds.lookupCap(Generator.mtpLookupDraftCap(&.{ .model_type = "lookup-cap-test" }), .{ .max = 3 });
     const got = idx.match(1, cap) orelse return error.NoMatch;
     try testing.expectEqual(@as(usize, 3), got.draft.len);
 }

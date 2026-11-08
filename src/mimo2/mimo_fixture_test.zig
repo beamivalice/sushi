@@ -16,13 +16,13 @@ const expectError = @import("../test_expect.zig").expectError;
 const QKV_MPP_DECODE_MIN_TK = mimo_forward.QKV_MPP_DECODE_MIN_TK;
 const stackMimoFixtureExperts = mimo_forward.stackMimoFixtureExperts;
 const test_support = @import("../test_support.zig");
-const mimoExpectClose = test_support.mimoExpectClose;
+const mimoExpectClose = @import("mimo_exl3_moe_test.zig").mimoExpectClose;
 const qwen4ReadF32 = test_support.qwen4ReadF32;
 const snapshotsBitEqual = test_support.snapshotsBitEqual;
 const CaptureLayers = trunk_mod.CaptureLayers;
 const ForwardCtx = trunk_mod.ForwardCtx;
 const KVCache = trunk_mod.KVCache;
-const MimoExl3MoeHarness = trunk_mod.MimoExl3MoeHarness;
+const MimoExl3MoeHarness = @import("mimo_exl3_moe_test.zig").MimoExl3MoeHarness;
 const Trunk = trunk_mod.Trunk;
 const loadSwitchMlpBank = trunk_mod.loadSwitchMlpBank;
 
@@ -43,7 +43,7 @@ fn mimoVerifyOrTicks(alloc: std.mem.Allocator, xfm: *Trunk, ids: []const i32, pr
     const out = try alloc.alloc(f32, rows * vocab);
     errdefer alloc.free(out);
     if (verify) {
-        ctx.verify_rows = true;
+        ctx.arch_ctx.mimo2.verify_rows = true;
         const block = mlx.mlx_array_new_data(ids[prefix..].ptr, &[_]c_int{ 1, @intCast(rows) }, 2, .int32);
         defer _ = mlx.mlx_array_free(block);
         const logits = try xfm.forwardWith(&ctx, block);

@@ -16,7 +16,16 @@ const dsv_benches = @import("dsv41/ubench.zig");
 const glm5 = @import("ubench_glm5.zig");
 const shared = @import("ubench_shared.zig");
 const encoder = @import("sushi_encoder");
-const ubench_mimo2 = @import("ubench_mimo2.zig");
+const arch_registry = @import("arch/registry.zig");
+
+/// The microbenches the built archs declare (`ubench` in their `arch.zig`).
+const arch_benches = blk: {
+    var out: []const report.Bench = &.{};
+    for (std.meta.tags(arch_registry.Tag)) |t| {
+        if (@hasDecl(arch_registry.Mod(t), "ubench")) out = out ++ arch_registry.Mod(t).ubench.benches;
+    }
+    break :blk out[0..out.len].*;
+};
 
 const registry = [_]report.Bench{
     exl3_ubench.dsv41_experts,
@@ -30,7 +39,7 @@ const registry = [_]report.Bench{
     exl3_ubench.trunk_rows,
     exl3_ubench.trunk_launches,
     exl3_ubench.routed_t1,
-} ++ ubench_mimo2.benches ++ [_]report.Bench{
+} ++ arch_benches ++ [_]report.Bench{
     exl3_ubench.exl3_rate_groups,
     exl3_ubench.exl3_rate_groups_rows,
     encoder.ubench.factor,

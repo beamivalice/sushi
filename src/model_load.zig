@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_config = @import("arch/config.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const server_state = @import("server_state.zig");
 const arch_flags = @import("arch/flags.zig");
@@ -10,8 +11,6 @@ const drafter_mod = @import("arch/drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const dspark_rows = @import("dsv41/dspark_rows.zig");
-const mimo_mtp = @import("mimo2/mimo_mtp.zig");
-const mimo_forward = @import("mimo2/mimo_forward.zig");
 const chip_mod = @import("chip.zig");
 const model_mod = @import("model.zig");
 const admission = @import("arch/admission.zig");
@@ -32,6 +31,8 @@ const io_util = @import("io_util.zig");
 const status = @import("status.zig");
 const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
+const arch_handle = @import("arch/handle.zig");
+const arch_load = @import("arch/load.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -60,7 +61,7 @@ const fp8ExpertScratchBytes = bills.fp8ExpertScratchBytes;
 pub const gateEstimateBytes = bills.gateEstimateBytes;
 pub const loadRequirementBytes = bills.loadRequirementBytes;
 pub const loadStagingBytes = bills.loadStagingBytes;
-pub const mimoCoarseHeadBytes = bills.mimoCoarseHeadBytes;
+pub const coarseHeadBytes = bills.coarseHeadBytes;
 const residentWeightBytes = bills.residentWeightBytes;
 pub const streamedLoadRequirementBytes = bills.streamedLoadRequirementBytes;
 const scheduler_mod = @import("scheduler.zig");
@@ -234,40 +235,6 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
 
-/// A resident MiMo warms its verify rows with or without its heads: a PLD request verifies on them too.
-pub fn mimoVerifyWarmWanted(config: *const ModelConfig) bool {
-    return config.isMimo() and !config.expert_streaming;
-}
-
-fn mimoSpecWarmup(io: std.Io, xfm: *Trunk, head: ?*mimo_mtp.Head, kv_config: trunk.KVQuantConfig) void {
-    const start = std.Io.Timestamp.now(io, .awake);
-    const rows = mimo_forward.warmupMimoVerify(xfm, kv_config) catch |err| {
-        log.warn("[spec-warmup] MiMo verify failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
-        return;
-    };
-    const steps = if (head) |h| h.warmup(xfm) catch |err| {
-        log.warn("[spec-warmup] MiMo heads failed ({s}); the first round pays their kernel compile inside the round.\n", .{@errorName(err)});
-        return;
-    } else 0;
-    const ms: u64 = @as(u64, @intCast(start.untilNow(io, .awake).nanoseconds)) / std.time.ns_per_ms;
-    log.info("[spec-warmup] MiMo verify rows 0x{x}, {d} head steps ({d} ms).\n", .{ rows, steps, ms });
-}
-
-/// MiMo's MTP heads from the checkpoint's own shard, bound to the trunk they share.
-fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelConfig, xfm: *Trunk) !?*mimo_mtp.Head {
-    var weights = try @import("mimo2/mimo_source.zig").loadMtpWeights(sch.io, sch.allocator, model_dir);
-    defer weights.deinit();
-    var head = (try mimo_mtp.Head.load(sch.allocator, mlx.gpuStream(), config, &weights)) orelse return null;
-    errdefer head.deinit();
-    head.target = xfm;
-    const ptr = try sch.allocator.create(mimo_mtp.Head);
-    ptr.* = head;
-    // The coarse lm_head copy is a load cost, never the first draft's.
-    const rerank = ptr.canRerankDrafts();
-    log.info("[mimo-mtp] {d} heads loaded ({d:.2} GB resident); draft rerank {s}\n", .{ head.heads, @as(f64, @floatFromInt(head.residentBytes())) / 1e9, if (rerank) "on" else "off" });
-    return ptr;
-}
-
 /// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
 pub fn mtpChoiceFor(flag: ?bool, config: *const ModelConfig) model_settings.MtpChoice {
     return model_settings.MtpChoice.resolve(flag, config.mtp_override, model_settings.default_mtp);
@@ -290,7 +257,7 @@ pub fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config:
 pub fn packShipsMtpHead(io: std.Io, allocator: std.mem.Allocator, model_type: []const u8, model_dir: []const u8) bool {
     const probe = ModelConfig{ .model_type = model_type };
     if (probe.isQwen4()) return model_discovery.readStubMeta(io, allocator, model_dir).has_mtp;
-    if (probe.isMimo()) return (model_mod.mimoMtpResidentBytes(io, allocator, model_dir) catch 0) > 0;
+    if (arch_load.shipsHead(io, allocator, &probe, model_dir)) |ships| return ships;
     if (probe.isDsv41()) return @import("dsv41/dsv41_source.zig").shipsDspark(io, allocator, model_dir);
     return false;
 }
@@ -645,7 +612,7 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
         return error.ExpertStreamingMtpUnsupported;
     }
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
-    split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry) +| assistant_bytes +|
+    split.trunk +|= coarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry) +| assistant_bytes +|
         (if (streamed.dsv41) |c| @import("dsv41/dsv41_engram.zig").cacheBytes(c.engram) else 0);
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
@@ -906,17 +873,8 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
 }
 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
-    if (config.isMimo()) return mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
     return split.trunk +| split.mtp +| bills.rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits());
-}
-
-/// The resident bytes a MiMo source-trunk load holds: trunk and vision tower as stored, the heads
-/// when MTP is on, and the coarse lm_head copy the heads and the greedy readout share.
-fn mimoResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
-    var bytes = try model_mod.mimoSourceResidentBytes(io, allocator, model_dir, load_vision and config.mimo_vision);
-    if (mtp_on) bytes += try model_mod.mimoMtpResidentBytes(io, allocator, model_dir);
-    return bytes + mimoCoarseHeadBytes(config);
 }
 
 /// A streamed GLM forward keeps no speculative state: a found assistant stays unloaded,
@@ -966,10 +924,8 @@ fn coldServingBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const
 /// What a resident cold load reserves in the registry: the requirement its load preflight
 /// compares with free memory, so the gate and the preflight read one bill.
 pub fn residentColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, load_vision: bool, mtp_on: bool, no_drafter: bool, drafter_dir: []const u8) !u64 {
-    var weights = if (model_mod.usesSushiQuantMemoryBill(config))
-        try sushiResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on)
-    else
-        try mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
+    var weights = (try arch_load.residentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on)) orelse
+        try sushiResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const drafter = LoadDrafterDir.resolve(io, allocator, config, no_drafter, drafter_dir, model_dir);
     defer drafter.deinit(allocator);
     var context: u64 = 0;
@@ -978,20 +934,6 @@ pub fn residentColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, confi
         context = coldServingBillBytes(io, allocator, config, drafter.dir);
     }
     return loadRequirementBytes(config, weights, mtp_on, context);
-}
-
-test "a resident MiMo cold load reserves its load preflight's requirement" {
-    const io = std.testing.io;
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var fixture = try @import("mimo2/mimo_source.zig").makeTinySourceFixture(io, a, &tmp);
-    defer fixture.deinit();
-    fixture.config.expert_layout = .mxfp4_individual;
-    const weights = try mimoResidentLoadBytes(io, a, fixture.path, &fixture.config, false, false);
-    const preflight = loadRequirementBytes(&fixture.config, weights, false, 0);
-    try testing.expectEqual(preflight, try residentColdLoadBillBytes(io, a, &fixture.config, fixture.path, false, false, false, ""));
-    try testing.expect(weights > 0);
 }
 
 /// Which drafter directory a COLD load should use.
@@ -1393,7 +1335,7 @@ pub const LoadBillFixtures = struct {
         const a = testing.allocator;
         var qwen = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/qwen4_exp.json"));
         errdefer qwen.deinit(a);
-        var mimo = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/mimo_v2.json"));
+        var mimo = try model_mod.parseConfigFromJson(a, arch_config.fixtureConfig("mimo2") orelse arch_config.unbuilt_config);
         errdefer mimo.deinit(a);
         return .{ .qwen = qwen, .mimo = mimo, .glm = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/glm5_config.json")) };
     }
@@ -1584,10 +1526,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
     } else if (params.config.isGlm5()) {
         streaming_resident_bytes = try @import("glm5/glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, load_vision and params.config.glm5_vision);
+    } else if (try arch_load.residentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on)) |bytes| {
+        streaming_resident_bytes = bytes;
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
         streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on);
-    } else if (params.config.usesMimoSourceTrunk()) {
-        streaming_resident_bytes = try mimoResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on);
     }
     if (params.config.has_vision) {
         var line_buf: [256]u8 = undefined;
@@ -1894,8 +1836,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const tok = tok_slice.ptr;
             const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
             ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
-            ctx.verify_rows = xfm_ptr.config.isMimo() and rows > 1 and rows <= mimo_forward.MIMO_VERIFY_ROWS_MAX;
-            log.info("[fwd-ubench] rows={d} capture={} verify_rows={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, ctx.verify_rows });
+            const verify_rows = rows > 1 and rows <= (arch_state.verifyRowsMax(&xfm_ptr.config) orelse 0);
+            arch_state.setVerifyRows(&xfm_ptr.config, &ctx.arch_ctx, verify_rows);
+            log.info("[fwd-ubench] rows={d} capture={} verify_rows={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, verify_rows });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
                 const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
@@ -2139,21 +2082,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     };
 
     const mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
-    // MiMo's trained heads, resident beside a resident trunk (streaming refuses MTP above).
-    var mimo_head: ?*mimo_mtp.Head = null;
-    if (mtp_enabled and params.config.isMimo() and !params.config.expert_streaming) {
-        mimo_head = loadMimoHeads(sch, params.model_dir, params.config, xfm_ptr) catch |err| blk: {
-            log.warn("[mimo-mtp] heads not loaded ({s}) — MTP off\n", .{@errorName(err)});
-            break :blk null;
-        };
-    }
-    errdefer if (mimo_head) |h| {
-        h.deinit();
-        sch.allocator.destroy(h);
-    };
-    // The heads built the coarse copy for their drafts; without them the trunk's greedy readout still takes one.
-    // Same predicate as the resident bill that prices this copy.
-    if (mimoCoarseHeadBytes(params.config) > 0) _ = mimo_mtp.buildCoarseHead(mlx.gpuStream(), xfm_ptr);
+    const aux_head = arch_load.loadHead(sch.io, sch.allocator, params.model_dir, params.config, xfm_ptr, mtp_enabled);
+    errdefer if (aux_head) |h| arch_load.freeHead(params.config, sch.allocator, h);
+    arch_load.prepare(params.config, xfm_ptr);
     // The qwen4_exp in-checkpoint head's coarse rerank build: a
     // `requantizeRows` of the whole
     // trunk lm_head plus a synchronous eval of ~240 MB. Lazily it ran inside
@@ -2195,7 +2126,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
         }
-        if (mimoVerifyWarmWanted(params.config)) mimoSpecWarmup(sch.io, xfm_ptr, mimo_head, kv_quant_config);
+        arch_load.warmSpec(sch.io, params.config, xfm_ptr, aux_head, kv_quant_config);
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
@@ -2211,23 +2142,19 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    init is a struct literal (no fallible alloc).
     const entry = params.entry;
     entry.weights = weights_ptr;
-    entry.transformer = xfm_ptr;
+    entry.handle = arch_handle.handleOf(xfm_ptr);
     entry.vision_encoder = vision_ptr;
     entry.dflash = dflash_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
-    entry.mtp = generate_mod.MtpHeadRef.fromModel(xfm_ptr, mtp_enabled, if (mimo_head) |h| @ptrCast(h) else null);
+    entry.mtp = generate_mod.MtpHeadRef.fromModel(xfm_ptr, mtp_enabled, aux_head);
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
     xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(params.mtp_depth);
-    if (mimo_head) |h| {
-        // The head count AND the widest verify whose rows stay byte-identical
-        // to serial decode: a deeper round would hand the forward more rows
-        // than the decode-shaped MiMo verify serves.
-        const rows_max: u32 = generate_mod.Generator.mtpVerifyDraftsMax(true);
-        entry.mtp_depth = @min(entry.mtp_depth, @min(@as(u32, @intCast(h.heads)), rows_max));
-        xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, @min(@as(u32, @intCast(h.heads)), rows_max));
-    }
+    if (aux_head) |h| if (arch_load.headDepthCap(params.config, h)) |cap| {
+        entry.mtp_depth = @min(entry.mtp_depth, cap);
+        xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, cap);
+    };
     if (entry.mtp != null and !params.config.isDsv41()) log.info("[mtp] depth range {d}..{d} ({s})\n", .{
         depth_bounds.floorFor(depth_bounds.active, entry.mtp_depth),
         entry.mtp_depth,

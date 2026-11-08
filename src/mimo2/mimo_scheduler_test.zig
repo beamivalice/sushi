@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_handle = @import("../arch/handle.zig");
 const trunk_mod = @import("../trunk.zig");
 const generate_mod = @import("../generate.zig");
 const mtp_mod = @import("../mtp.zig");
@@ -16,8 +17,8 @@ const mtp_tick = @import("../mtp_tick.zig");
 const model_load = @import("../model_load.zig");
 const Slot = scheduler_mod.Slot;
 const anyPenalised = mtp_tick.anyPenalised;
-const mimoCoarseHeadBytes = model_load.mimoCoarseHeadBytes;
-const mimoVerifyWarmWanted = model_load.mimoVerifyWarmWanted;
+const mimoCoarseHeadBytes = model_load.coarseHeadBytes;
+const mimoVerifyWarmWanted = @import("mimo2_load.zig").verifyWarmWanted;
 const resolveExpertCache = model_load.resolveExpertCache;
 const sched = @import("../arch/sched.zig");
 
@@ -71,7 +72,7 @@ test "MiMo crowded MTP takes an eligible slot" {
     xfm.moe_layers = &.{};
     xfm.expert_stream = null;
     var model: model_registry_mod.LoadedModel = undefined;
-    model.transformer = &xfm;
+    model.handle = arch_handle.fixtureHandle(&xfm);
     var gen: Generator = undefined;
     gen.mtp = MtpHeadRef.of("mimo2", undefined);
     gen.mtp_cache = MtpHeadRef.Cache.of("mimo2", undefined);
@@ -96,7 +97,7 @@ test "a penalised MTP slot never joins a plain batched tick, which samples no pe
     xfm.moe_layers = &.{};
     xfm.expert_stream = null;
     var model: model_registry_mod.LoadedModel = undefined;
-    model.transformer = &xfm;
+    model.handle = arch_handle.fixtureHandle(&xfm);
     var gen: Generator = undefined;
     gen.mtp = MtpHeadRef.of("mimo2", undefined);
     gen.mtp_cache = MtpHeadRef.Cache.of("mimo2", undefined);

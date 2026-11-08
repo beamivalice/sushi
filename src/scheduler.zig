@@ -32,6 +32,7 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
+const arch_handle = @import("arch/handle.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
@@ -155,7 +156,7 @@ pub const SubmitParams = struct {
     /// resolves this via `scheduler.ensureLoaded(id)` BEFORE submitting and
     /// keeps a refcount on it for the slot's lifetime, so the model can't
     /// be evicted mid-flight. The scheduler routes prefill/decode through
-    /// `slot.model.transformer.?` (and friends) instead of `sch.xfm`, so
+    /// `slot.model.handle` (and friends) instead of `sch.xfm`, so
     /// per-tick model switching is just a pointer hop. Required field
     /// post-Phase-D; tests using the legacy path pass the default model.
     model: *model_registry_mod.LoadedModel,
@@ -274,7 +275,7 @@ pub const Slot = struct {
     /// `SubmitParams.model` and borrowed for the slot's lifetime; the conn
     /// thread holds a refcount (via `scheduler.ensureLoaded`) so the
     /// pointer stays valid until `complete()`. Prefill/decode route forward
-    /// passes through `model.transformer.?` (and `model.vision_encoder`,
+    /// passes through `model.handle` (and `model.vision_encoder`,
     /// `model.drafter`, `model.prefix_cache`). Batched decode groups slots
     /// by this field so kernels never cross model boundaries.
     model: *model_registry_mod.LoadedModel,
@@ -622,7 +623,7 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
-        if (self.model.transformer) |xfm| arch_state.markTablesStale(xfm);
+        if (self.model.handle) |h| arch_state.markTablesStale(arch_handle.trunk(h));
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
@@ -632,7 +633,7 @@ pub const Slot = struct {
         self.cache.deinit();
         if (self.request) |*request| request.deinit();
         if (self.ssm_entries) |entries| {
-            if (self.model.transformer) |xfm| arch_state.dropGroup(xfm, entries);
+            if (self.model.handle) |h| arch_state.dropGroup(arch_handle.trunk(h), entries);
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
@@ -2075,7 +2076,7 @@ pub const Scheduler = struct {
             .forced_call_pending = if (slot.sampling.call_force) |cf| cf.pending() else false,
             .logprobs = slot.logprobs_n > 0,
             .penalty = sampler.penaltyActive(slot.sampling),
-            .model_batches = if (slot.model.transformer) |t| sched.modelBatches(t) else null,
+            .model_batches = if (slot.model.handle) |h| sched.modelBatches(arch_handle.trunk(h)) else null,
         });
     }
 };
@@ -2524,14 +2525,14 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
                 commitCancelledAtCleanup(sch, s, commitSlotIfApplicable);
                 if (s.model.prefix_cache) |*hc| {
-                    if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
+                    if (s.model.handle) |h| hc.flushPendingDisk(arch_handle.stream(h));
                 }
             }
             slot_outcome.finishSpecAtCleanup(s);
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
-            if (s.model.transformer) |xfm| arch_state.resetTables(xfm);
+            if (s.model.handle) |h| arch_state.resetTables(arch_handle.trunk(h));
             if (s.model.config) |c| sched.endRequest(c);
         }
         if (cleanup_n > 0) {
@@ -2649,7 +2650,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                         if (err == error.QsaHistoryGap and !qsa_gap_retried) {
                             if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
                             if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
-                            if (slot.model.transformer) |xf| {
+                            if (slot.model.handle) |h| {
+                                const xf = arch_handle.trunk(h);
                                 slot.cache.truncate(0, xf.s) catch {};
                                 arch_state.resetTables(xf);
                                 sched.resetForRetry(slot, xf);
@@ -2904,7 +2906,7 @@ fn flushImatrixCaptures(sch: *Scheduler) void {
     defer sch.registry.mutex.unlock(sch.io);
     var it = sch.registry.entries.valueIterator();
     while (it.next()) |entry_ptr| {
-        if (entry_ptr.*.transformer) |x| x.flushImatrix();
+        if (entry_ptr.*.handle) |h| arch_handle.flushImatrix(h);
     }
 }
 
@@ -3009,7 +3011,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         if (gen_ptr.mtpModuleHeadReleased()) break :blk null;
         const committed = gen_ptr.mtpCommittedHistoryLen();
         if (committed == 0) break :blk null;
-        mc.truncate(committed, slot.model.transformer.?.s) catch |err| {
+        mc.truncate(committed, arch_handle.trunk(slot.model.handle.?).s) catch |err| {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
         };
@@ -3195,7 +3197,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trunk
     const d = if (hc.disk) |*dd| dd else return;
     if (d.writer == null) return;
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
-    const s = if (slot.model.transformer) |x| x.s else return;
+    const s = if (slot.model.handle) |h| arch_handle.stream(h) else return;
     wc.chunks += 1;
     // A chunk record covers a prefix, so it may claim only the media blocks inside it.
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, abs_kv_pos);
@@ -3457,17 +3459,17 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.vision_embeddings = slot.vision_embeddings;
     arch_state.setMrope(&slot.ctx.arch_ctx, slot.mrope_pos, slot.mrope_total, slot.mrope_delta);
     slot.ctx.capture_hidden = null;
-    if (slot.model.transformer) |xfm| try arch_state.releaseGroup(xfm, &slot.ctx);
+    if (slot.model.handle) |h| try arch_state.releaseGroup(arch_handle.trunk(h), &slot.ctx);
 
     // A module-owned arch that CAN rewind (`moduleStateSpecRollback`) may run
     // its own MTP head; PLD/drafter stay off there for the reasons in
     // `specInitWiring`.
     // Module CLASS (owned or shared-readonly), not ownership alone: qwen4
     // batches its plain slots but its spec wiring stays the module one.
-    const owns_module_state = slot.model.transformer != null and
-        slot.model.transformer.?.moduleSpecWiring();
-    const module_spec_rollback = slot.model.transformer != null and
-        slot.model.transformer.?.moduleStateSpecRollback();
+    const owns_module_state = slot.model.handle != null and
+        arch_handle.trunk(slot.model.handle.?).moduleSpecWiring();
+    const module_spec_rollback = slot.model.handle != null and
+        arch_handle.trunk(slot.model.handle.?).moduleStateSpecRollback();
     const wiring = sched_policy.specInitWiring(
         owns_module_state,
         module_spec_rollback,
@@ -3515,7 +3517,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Phase D: per-slot model — pull transformer + prefix cache off the
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
-    const xfm_ptr: *Trunk = slot.model.transformer.?;
+    const xfm_ptr: *Trunk = arch_handle.trunk(slot.model.handle.?);
     if (slot.model.prefix_cache) |*hc| {
         {
             // Only build a restore target when this request will actually
@@ -4004,7 +4006,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // Plan 05 Phase D: batched decode requires all participating slots to
     // share a transformer. We partition `batchable` by `slot.model` and
     // emit one batched call per model. The non-batchable bucket doesn't
-    // care — each slot runs against its own `slot.model.transformer.?`.
+    // care — each slot runs against its own `slot.model.handle`.
     var batchable_buf: [sched_policy.MAX_BATCH_GROUP]*Slot = undefined;
     var batchable_n: usize = 0;
     var mtp_buf: [sched_policy.MAX_BATCH_GROUP]*Slot = undefined;
@@ -4456,7 +4458,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     if (Planner.enabled() and slot.planner_force_plain) {
         gen.mtp_hidden_stale = true;
     }
-    if (slot.model.transformer) |xfm| try arch_state.releaseGroup(xfm, &slot.ctx);
+    if (slot.model.handle) |h| try arch_state.releaseGroup(arch_handle.trunk(h), &slot.ctx);
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
     // generators handle the disabled fallback internally.
@@ -4612,7 +4614,7 @@ test "a cancelled prefill with no Generator commits its forwarded prefix, pad-on
     var model: model_registry_mod.LoadedModel = undefined;
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer model.prefix_cache.?.deinit();
-    model.transformer = null;
+    model.handle = null;
     model.config = null;
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -4786,9 +4788,9 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // (`runDecodeTick`) partitions by `slot.model` before dispatching here.
     // The first slot's transformer is authoritative; debug-assert the rest
     // match to surface partitioning bugs early.
-    const xfm_ptr: *Trunk = active[0].model.transformer.?;
+    const xfm_ptr: *Trunk = arch_handle.trunk(active[0].model.handle.?);
     if (std.debug.runtime_safety) {
-        for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
+        for (active) |s| std.debug.assert(arch_handle.trunk(s.model.handle.?) == xfm_ptr);
     }
 
     if (try serialFallback(sch, xfm_ptr, active, runSingleDecodeTick)) return;
@@ -5005,7 +5007,7 @@ test "complete keeps a slot in decoding until its pass is out, so admission neve
     var cfg = try model_mod.parseConfigFromJson(allocator, @embedFile("fixtures/glm5_config.json"));
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     model.prefix_cache = null;
     const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
     _ = sch.pending.orderedRemove(0);
@@ -5233,7 +5235,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     try mlx.requireGpu();
     var xfm: Trunk = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
-    model.transformer = null;
+    model.handle = null;
     var gen: Generator = undefined;
     gen.mtp_planner_owned = false;
     gen.generated_ids = .empty;
@@ -5426,7 +5428,7 @@ test "the first request after boot carries a non-zero request_id, so the dashboa
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     var sch = submitTestScheduler(testing.allocator, 2);
     defer sch.pending.deinit(testing.allocator);
     defer sch.cleanup_queue.deinit(testing.allocator);
@@ -5443,7 +5445,7 @@ test "a model load or unload waits for every queued slot to be destroyed" {
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     const allocator = testing.allocator;
     for ([_]bool{ false, true }) |evicting| {
         var sch = submitTestScheduler(allocator, 32);
@@ -5498,7 +5500,7 @@ test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitte
     var plain = ModelConfig{ .model_type = "not_a_served_arch", .num_hidden_layers = 1 };
     var model: LoadedModel = undefined;
     model.config = &plain;
-    model.transformer = null;
+    model.handle = null;
     model.prefix_cache = null;
 
     const Case = struct { body: std.json.Value, want: trunk.KVQuantConfig };
@@ -5541,7 +5543,7 @@ test "an empty prompt is refused at submit, before any slot reaches the inferenc
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     model.prefix_cache = null;
     const result = sch.submit(.{ .model = &model, .prompt_ids = &.{}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 4 });
     try expectError(error.EmptyPrompt, result);
@@ -5577,7 +5579,7 @@ test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
     for ([_]*ModelConfig{ &mimo, &plain }) |cfg| {
         var model: LoadedModel = undefined;
         model.config = cfg;
-        model.transformer = null;
+        model.handle = null;
         model.prefix_cache = null;
         _ = mlx.mlx_clear_cache();
         const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
@@ -5607,7 +5609,7 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     model.prefix_cache = null;
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
@@ -5679,7 +5681,7 @@ test "a shutdown drain ends a queued request with an error, a client disconnect 
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     model.prefix_cache = null;
     var sch = submitTestScheduler(testing.allocator, 2);
     defer sch.pending.deinit(testing.allocator);
@@ -5768,7 +5770,7 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/err-alloc";
     model.prefix_cache = null;
-    model.transformer = null;
+    model.handle = null;
     model.config = null;
     var slot: Slot = undefined;
     slot.io = testing.io;
@@ -5815,7 +5817,7 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/live-test";
     model.prefix_cache = null;
-    model.transformer = null;
+    model.handle = null;
     model.config = null;
     var slot: Slot = undefined;
     // Only the fields the publish path reads: rows are value copies.
@@ -5902,7 +5904,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/live-test";
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
-    model.transformer = null;
+    model.handle = null;
     model.config = null;
     defer model.prefix_cache.?.entries.deinit(testing.allocator);
     sch.hot_prefix_cache = &model.prefix_cache.?;

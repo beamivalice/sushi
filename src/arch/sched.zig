@@ -7,6 +7,7 @@
 //! Dispatch reads the arch tag of the slot's (or model's) config, never the loaded handle, so a slot built by a
 //! test needs only its config.
 const std = @import("std");
+const arch_handle = @import("handle.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const registry = @import("registry.zig");
@@ -111,7 +112,7 @@ fn tagOfConfig(config: ?*const ModelConfig) ?Tag {
 }
 
 fn tagOfSlot(slot: *const Slot) ?Tag {
-    if (slot.model.transformer) |xfm| return tagOfModel(xfm);
+    if (slot.model.handle) |h| return tagOfModel(arch_handle.trunk(h));
     return tagOfConfig(slot.model.config);
 }
 
@@ -494,7 +495,7 @@ test "only Flash-Next gates its long-context rules and caps its checkpoints; onl
 /// A slot of `config` over a transformer, for a face's own test.
 pub fn testSlot(xfm: *Trunk, lm: *model_registry.LoadedModel, config: ModelConfig) Slot {
     xfm.config = config;
-    lm.transformer = xfm;
+    lm.handle = arch_handle.fixtureHandle(xfm);
     lm.config = null;
     var slot: Slot = undefined;
     slot.model = lm;
@@ -521,7 +522,7 @@ test "an arch with no request state restores into the SSM entries and commits th
 test "a slot's own request state is billed, released and culled with no config to name its arch" {
     if (comptime !@hasField(Tag, "glm5")) return error.SkipZigTest;
     var lm: model_registry.LoadedModel = undefined;
-    lm.transformer = null;
+    lm.handle = null;
     lm.config = null;
     var slot: Slot = undefined;
     slot.model = &lm;

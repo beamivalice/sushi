@@ -508,7 +508,7 @@ test "a cleanup allocation failure never frees MLX on the connection thread" {
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
     sch.io = testing.io;
@@ -563,7 +563,7 @@ test "an image request keeps its drafter: verify carries the M-RoPE positions, t
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     var sch = submitTestScheduler(testing.allocator, 2);
     defer sch.pending.deinit(testing.allocator);
     defer sch.cleanup_queue.deinit(testing.allocator);
@@ -614,7 +614,7 @@ test "a submit that fails once its slot is built hands the slot to the inference
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    model.transformer = null;
+    model.handle = null;
     var handed_over: usize = 0;
     var fail_at: usize = 0;
     while (fail_at < 32) : (fail_at += 1) {
@@ -722,7 +722,7 @@ test "a submit that fails before its slot exists hands the vision array to the i
 
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
-    model.transformer = null;
+    model.handle = null;
 
     model.config = null;
     try Probe.expectHandedOver(testing.allocator, &model, .dense, error.ModelNotReady);
