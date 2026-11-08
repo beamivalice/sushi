@@ -169,6 +169,8 @@ pub const LookupResult = struct {
     slot_owned: bool = false,
     /// `Entry.id` of the RAM entry restored from; 0 = none.
     entry_id: u64 = 0,
+    /// The SSD entry and rows a disk restore read; null for every other source.
+    disk_restore: ?kv_disk_cache.RestoredRows = null,
 
     /// Are the restored rows the slot's own? Only those the admission bill credits (`WarmPrefix.will_donate`).
     pub fn ownsRestoredRows(self: LookupResult) bool {
@@ -502,6 +504,7 @@ const PendingDiskFlush = struct {
     dflash: ?DflashSnap = null,
     mtp: ?DflashSnap = null,
     rows: ?prefix_arch.Rows = null,
+    restored: ?kv_disk_cache.RestoredRows = null,
 
     fn deinit(self: *PendingDiskFlush, allocator: std.mem.Allocator) void {
         self.snapshot.deinit();
@@ -600,6 +603,8 @@ pub const HotPrefixCache = struct {
     ssm_checkpoint_max: u32 = 0,
     /// The next commit's `Entry.end_note`, set by the committer right before it; the commit consumes it.
     commit_end_note: []const u8 = "",
+    /// The next commit's SSD restore source (`LookupResult.disk_restore`); the commit consumes it.
+    commit_restored: ?kv_disk_cache.RestoredRows = null,
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
     current_kv_bytes: u64,
@@ -1518,6 +1523,7 @@ pub const HotPrefixCache = struct {
                     .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
                     .mtp_base = disk_mtp,
                     .slot_owned = true,
+                    .disk_restore = .{ .id = d.entries.items[hm.idx].id, .rows = @intCast(restored) },
                 };
             }
 
@@ -1552,6 +1558,7 @@ pub const HotPrefixCache = struct {
                 .full_match = full_match,
                 .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, final_len, s, .dflash),
                 .mtp_base = disk_mtp,
+                .disk_restore = .{ .id = d.entries.items[dm.idx].id, .rows = @intCast(final_len) },
             };
         }
 
@@ -1965,6 +1972,8 @@ pub const HotPrefixCache = struct {
     ) !CommitStatus {
         const end_note = self.commit_end_note;
         self.commit_end_note = "";
+        const restored = self.commit_restored;
+        self.commit_restored = null;
         // Freed on every path that does not move it into an entry.
         var new_rings = ownRingCps(self.allocator, ring_cps);
         defer if (new_rings) |r| freeRingCps(self.allocator, r);
@@ -2001,7 +2010,7 @@ pub const HotPrefixCache = struct {
         var record_taken = false;
         if (self.capturesLiveForDisk() and disk_len > 0) {
             const rows: ?*const prefix_arch.Rows = if (disk_rows) |*r| r else if (new_rows) |*r| r else null;
-            self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, eff_vision_key, eff_media_start, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
+            self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, eff_vision_key, eff_media_start, restored, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
             // Whatever the RAM tier then does with the candidate, the record is flushed.
             record_taken = self.pending_disk != null;
             if (record_taken) self.disk_dirty = true;
@@ -2658,6 +2667,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         vision_key: u64,
         media_start: ?usize,
+        restored: ?kv_disk_cache.RestoredRows,
         prompt_len: usize,
         ssm_cps: ?[]SSMCheckpoint,
         all_dflash: ?DflashCommit,
@@ -2686,6 +2696,7 @@ pub const HotPrefixCache = struct {
             },
             .has_tools = has_tools,
             .media = MediaStamp.of(vision_key, media_start),
+            .restored = restored,
         };
         if (ring_cps) |cps| rec.ring_cps = shareRingCpsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
         if (rows) |r| rec.rows = r.share() catch {
@@ -2885,6 +2896,7 @@ pub const HotPrefixCache = struct {
         prompt: []const u32,
         has_tools: bool,
         media: MediaStamp,
+        restored: ?kv_disk_cache.RestoredRows,
         cps: []SSMCheckpoint,
         flush_bound: u64,
         s: mlx.mlx_stream,
@@ -2901,6 +2913,7 @@ pub const HotPrefixCache = struct {
             .ssm_checkpoints = if (cps.len > 0) cps else null,
             .vision_key = media.key,
             .media_start = media.start,
+            .restored = restored,
         }, s, .{ .flush_bound = flush_bound }) catch |err| {
             log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
         };
@@ -2940,6 +2953,7 @@ pub const HotPrefixCache = struct {
             .ring = ringCommitOf(&pending.snapshot, pending.ring_cps),
             .vision_key = pending.media.key,
             .media_start = pending.media.start,
+            .restored = pending.restored,
         }, s, .{ .whole = true })) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
         };
@@ -10703,16 +10717,59 @@ test "the prefill write-through persists an image turn, keyed by the media it ha
     try testFillCache(&cache, s, 3, tokens.len);
 
     // The first chunk stops below the item: it holds no media row, so it claims none.
-    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..512], false, truncatedMediaKey(&.{}, k1, first_at, 512), &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..512], false, truncatedMediaKey(&.{}, k1, first_at, 512), null, &.{}, std.math.maxInt(u64), s);
     try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
     try testing.expectEqual(@as(u64, 0), hc.disk.?.entries.items[0].vision_key);
 
     // A later chunk covers the item, so the record names the pixels its rows were computed under.
-    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..2048], false, truncatedMediaKey(&.{}, k1, first_at, 2048), &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..2048], false, truncatedMediaKey(&.{}, k1, first_at, 2048), null, &.{}, std.math.maxInt(u64), s);
     const e = &hc.disk.?.entries.items[0];
     try testing.expectEqual(@as(u64, k1), e.vision_key);
     try testing.expectEqual(@as(?u32, @intCast(first_at)), e.media_start);
     try testing.expectEqual(@as(u32, 2048), e.kv_len);
+}
+
+test "SSD: an image turn's record links the chunks its prefix was restored from, through the commit" {
+    // An agent appends a screenshot per turn: the new record's key is another chain, so the donor rule lends only the
+    // text before the first image, and every turn rewrote the rows it had just restored.
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const tokens = mediaTurnTokens(1200);
+    const first_at: usize = 200;
+    const k1: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const chain = [_]MediaSpan{ .{ .start = first_at, .key = k1 }, .{ .start = 900, .key = 0xB2B2_B2B2_B2B2_B2B2 } };
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media-restored", 0, 128);
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    defer hc.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, tokens.len);
+    _ = try hc.commitWithMediaState(&cache, tokens[0..800], false, k1, 0, first_at, null, null, null, 800);
+    hc.flushPendingDisk(s);
+
+    var dst = try KVCache.init(testing.allocator, 3);
+    defer dst.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreWithMedia(&dst, &moe, null, s, tokens[0..1100], false, chainKey(&chain), first_at, &chain, null, null, null, false);
+    try testing.expectEqual(@as(usize, 800), res.matched);
+    const src = res.disk_restore orelse return error.TestExpectedDiskRestore;
+    try testing.expectEqual(hc.disk.?.entries.items[0].id, src.id);
+    try testing.expectEqual(@as(u32, 800), src.rows);
+
+    hc.commit_restored = src;
+    _ = try hc.commitWithMediaState(&cache, tokens[0..1100], false, chainKey(&chain), 0, first_at, null, null, null, 1100);
+    hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+    try testing.expectEqual(@as(u32, 800 / 128), hc.disk.?.entries.items[1].inherited_chunks);
+    try testing.expectEqual(@as(?kv_disk_cache.RestoredRows, null), hc.commit_restored);
 }
 
 test "SSD: a record holding the request's first image restores up to the new one" {
@@ -10929,8 +10986,8 @@ test "a write-through under other pixels never extends the record that holds the
     try kv_disk_cache.fillCache(&rows_b, s, 3, tokens.len, 8, 5_000_000.0, .float32);
 
     // Image A's prefill stops after its first chunk (a disconnect); image B's request has the same ids.
-    hc.writeThroughHybrid(rows_a.entries, rows_a.config, tokens[0..1024], false, truncatedMediaKey(&.{}, ka, at, 1024), &.{}, std.math.maxInt(u64), s);
-    hc.writeThroughHybrid(rows_b.entries, rows_b.config, tokens[0..2048], false, truncatedMediaKey(&.{}, kb, at, 2048), &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(rows_a.entries, rows_a.config, tokens[0..1024], false, truncatedMediaKey(&.{}, ka, at, 1024), null, &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(rows_b.entries, rows_b.config, tokens[0..2048], false, truncatedMediaKey(&.{}, kb, at, 2048), null, &.{}, std.math.maxInt(u64), s);
     hc.disk.?.drainWriter();
 
     const chain = [_]MediaSpan{.{ .start = at, .key = kb }};

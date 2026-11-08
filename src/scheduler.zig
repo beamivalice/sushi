@@ -299,6 +299,8 @@ pub const Slot = struct {
     cache_key: u64 = 0,
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
+    /// The SSD entry and rows this request's prefix was read from (`LookupResult.disk_restore`).
+    restored_disk: ?kv_disk_cache.RestoredRows = null,
     skip_prefix_cache: bool = false,
     /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
     /// state before this position is safe to share across media hashes.
@@ -3021,6 +3023,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Ownership transfers to the cache on every outcome, like the checkpoints.
     const ring_cps = slot.ring_cps;
     slot.ring_cps = .{};
+    hc.commit_restored = slot.restored_disk;
     const finish_st = hc.commitWithRing(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len, ring_cps) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
@@ -3095,6 +3098,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
     if (sched.commitOwn(hc, slot, null, slot.full_prompt[0..len], cps, len)) return;
+    hc.commit_restored = slot.restored_disk;
     const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, media.key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
@@ -3201,6 +3205,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trunk
         slot.full_prompt[0..abs_kv_pos],
         slot.has_tools,
         media,
+        slot.restored_disk,
         cps,
         if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
         s,
@@ -3568,6 +3573,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 prefill_tokens = slot.full_prompt[hot_matched..];
                 hot_checked_out = lookup.ownsRestoredRows();
                 slot.restored_entry = lookup.entry_id;
+                slot.restored_disk = lookup.disk_restore;
                 slot.restore_tier = hc.lastRestoredTier();
             }
             // The entry this request restored off may be evicted before it commits, so the fork
@@ -5770,6 +5776,7 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     slot.ssm_entries = null;
     slot.ring_cps = .{};
     slot.restored_entry = 0;
+    slot.restored_disk = null;
     slot.full_prompt = &.{};
     slot.prompt_tokens = 4;
     slot.completion_tokens = 0;
@@ -5818,6 +5825,7 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     slot.request = null;
     slot.ring_cps = .{};
     slot.restored_entry = 0;
+    slot.restored_disk = null;
     slot.full_prompt = &.{};
     slot.prompt_tokens = 1000;
     slot.completion_tokens = 7;

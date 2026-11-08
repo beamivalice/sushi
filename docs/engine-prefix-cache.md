@@ -97,6 +97,11 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   below both sides' first media row; a chunk-share donor lends only whole chunks below that bound. Two same-size images
   render the same placeholder ids, so a token-only match let image B's commit extend image A's record and restore A's
   state. A turn that appends a second image gets a fresh record (donor chunks below the first image), not an extend.
+- **Past the donor's share, a record links the whole chunks below its restored rows** (`CommitParams.restored`,
+  `LookupResult.disk_restore`, `restoredSource`): the slot read those rows from that entry's files, and re-serialized
+  they are the same bytes (the re-serialization test), so the record holds what it would have written. A row the
+  request recomputed (past its restore point) is written, never linked. An image turn used to rewrite its whole
+  restored prefix past the first image: 66 MB a turn of a 100k-token conversation with a screenshot every other turn.
 - **A record claims only the media blocks its rows cover** (`truncatedMediaKey`): a write-through chunk or a cancelled
   prefill that stops between two blocks claims the chain up to the last block inside it. Key 0 means no media row at
   all, which is what lets a text prompt share a record whole. Overclaiming is safe (an equal key is clamped by

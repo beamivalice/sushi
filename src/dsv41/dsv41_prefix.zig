@@ -517,7 +517,7 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     self.disk.?.rows_base = @intCast(liveOf(self).base);
     defer self.disk.?.rows_base = std.math.maxInt(u32);
-    self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
+    self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, null, cps, std.math.maxInt(u64), s);
     const bytes = self.disk.?.point_bytes_written - staged_before;
     for (cps) |*cp| cp.release();
     // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
@@ -594,7 +594,7 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.ml
     self.disk.?.rows_base = @intCast(live.base);
     defer self.disk.?.rows_base = std.math.maxInt(u32);
     const media = pc.truncatedMediaKey(&.{}, live.vision_key, if (live.media_start) |v| @as(usize, v) else null, top);
-    self.writeThroughHybrid(cache.entries, cache.config, live.tokens[0..top], live.has_tools, media, cps.items, std.math.maxInt(u64), s);
+    self.writeThroughHybrid(cache.entries, cache.config, live.tokens[0..top], live.has_tools, media, null, cps.items, std.math.maxInt(u64), s);
     for (cps.items) |*cp| live.markFlushed(cp.pos);
     const bytes = self.disk.?.point_bytes_written - staged_before;
     log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, cps.items.len, top, @as(f64, @floatFromInt(bytes)) / 1e9, sw.read() / std.time.ns_per_ms });

@@ -526,6 +526,7 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
         slot.ssm_entries = null;
         slot.ring_cps = .{};
         slot.restored_entry = 0;
+        slot.restored_disk = null;
         slot.full_prompt = &.{};
         slot.prompt_tokens = 4;
         slot.completion_tokens = 0;
@@ -586,6 +587,7 @@ test "a GLM cancel landing between the cull passes is committed once before its 
         slot.ssm_entries = null;
         slot.ring_cps = .{};
         slot.restored_entry = 0;
+        slot.restored_disk = null;
         slot.full_prompt = &.{};
         slot.prompt_tokens = 4;
         slot.completion_tokens = 0;

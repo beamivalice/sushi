@@ -201,6 +201,9 @@ pub const MediaLimits = struct {
     }
 };
 
+/// A request's prefix as an SSD restore left it: rows `[0, rows)` read from entry `id`'s chunk files.
+pub const RestoredRows = struct { id: u64, rows: u32 };
+
 pub const Match = struct {
     idx: usize,
     /// Shared-prefix length clamped to kv_len — the positions a restore can
@@ -1460,6 +1463,8 @@ pub const DiskTier = struct {
         /// (`prefix_cache.truncatedMediaKey`); 0 / null is a record with no media row.
         vision_key: u64 = 0,
         media_start: ?u32 = null,
+        /// The SSD entry and rows the request's prefix was restored from: those rows are that entry's chunk bytes.
+        restored: ?RestoredRows = null,
     };
 
     /// How much of the entry one call writes: by default a piece per call with the writer
@@ -1875,11 +1880,20 @@ pub const DiskTier = struct {
             try chunk_sizes.appendSlice(self.allocator, old_cb[0..@min(keep, old_cb.len)]);
         } else if (donor) |d| {
             // Only the donor's landed chunks are linked (a contiguous prefix); may be zero.
-            const linked = self.linkInheritedChunks(d, id, &chunk_sizes) catch 0;
+            const linked = self.linkInheritedChunks(d, id, 0, &chunk_sizes) catch 0;
             if (linked == 0) chunk_sizes.clearRetainingCapacity();
             inherited = linked;
             keep = linked;
         }
+        const donor_linked = inherited;
+        // Past the donor's share, a whole chunk below the restored rows holds the bytes this commit would write:
+        // the slot read them from that file. An image turn's donor lends only the text before the first image.
+        if (extend_idx == null) if (self.restoredSource(p.restored, tokens, kv_target, config)) |src| {
+            if (src.chunks > inherited) {
+                inherited += self.linkInheritedChunks(src, id, inherited, &chunk_sizes) catch 0;
+                keep = inherited;
+            }
+        };
         var inherited_qsa = if (extend_idx) |i| self.entries.items[i].inherited_qsa else false;
         var inherited_qsa_rows: u32 = if (extend_idx) |i| self.entries.items[i].qsa_history_rows else 0;
         var inherited_qsa_bytes: u64 = if (extend_idx) |i| self.entries.items[i].qsa_history_bytes else 0;
@@ -1893,7 +1907,7 @@ pub const DiskTier = struct {
             if (chunk_sizes.items.len > keep) chunk_sizes.shrinkRetainingCapacity(keep);
         }
         if (donor) |d| {
-            if (inherited > 0 and self.linkInheritedQsa(d, id)) {
+            if (donor_linked > 0 and self.linkInheritedQsa(d, id)) {
                 inherited_qsa = true;
                 inherited_qsa_rows = self.entries.items[d.idx].qsa_history_rows;
                 inherited_qsa_bytes = self.entries.items[d.idx].qsa_history_bytes;
@@ -3515,16 +3529,33 @@ pub const DiskTier = struct {
     /// `shared`: the leading tokens whose rows the donor and the heir provably agree on.
     pub const ChunkDonor = struct { idx: usize, id: u64, chunks: u32, shared: u32 };
 
-    /// Hard-link the donor's leading landed chunk files into `e<id>/`; returns how many. Stops
+    /// The entry a commit's rows were restored from, as a donor of the whole chunks below those rows.
+    fn restoredSource(self: *const DiskTier, restored: ?RestoredRows, tokens: []const u32, kv_target: u32, config: kv_quant.KVQuantConfig) ?ChunkDonor {
+        const r = restored orelse return null;
+        if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.id != r.id) continue;
+            if (e.poisoned or !std.meta.eql(e.quant, config)) return null;
+            const rows: u32 = @intCast(@min(@min(r.rows, kv_target), @min(e.kv_len, commonPrefixLen(e.tokens, tokens))));
+            const whole: u32 = @min(rows / self.chunk_tokens, @as(u32, @intCast(e.chunk_bytes.len)));
+            return .{ .idx = i, .id = e.id, .chunks = whole, .shared = rows };
+        }
+        return null;
+    }
+
+    /// Hard-link the donor's landed chunk files `[from, d.chunks)` into `e<id>/`; returns how many. Stops
     /// at the first chunk not landed and never touches the donor's queue (`Writer.fence` would
-    /// discard it). A link failure unwinds and the caller writes every chunk itself.
-    fn linkInheritedChunks(self: *DiskTier, d: ChunkDonor, id: u64, chunk_sizes: *std.ArrayList(u64)) !u32 {
+    /// discard it). A link failure unwinds this call's links and the caller writes those chunks itself.
+    fn linkInheritedChunks(self: *DiskTier, d: ChunkDonor, id: u64, from: u32, chunk_sizes: *std.ArrayList(u64)) !u32 {
         var root_dir = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
         defer root_dir.close(self.io);
         const donor_cb = self.entries.items[d.idx].chunk_bytes;
         var linked: u32 = 0;
-        errdefer self.unlinkChunkRange(root_dir, id, 0, linked);
-        var i: u32 = 0;
+        errdefer {
+            self.unlinkChunkRange(root_dir, id, from, from + linked);
+            chunk_sizes.shrinkRetainingCapacity(from);
+        }
+        var i: u32 = from;
         while (i < d.chunks) : (i += 1) {
             const old_abs = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, d.id, i });
             defer self.allocator.free(old_abs);
@@ -3542,7 +3573,7 @@ pub const DiskTier = struct {
         }
         if (linked == 0) return 0;
         var mb: f64 = 0;
-        for (donor_cb[0..linked]) |b| mb += @as(f64, @floatFromInt(b));
+        for (donor_cb[from..][0..linked]) |b| mb += @as(f64, @floatFromInt(b));
         mb /= 1024.0 * 1024.0;
         log.info("  [disk-cache] chunk share: e{d} inherits {d} chunks ({d:.1} MB) from e{d} by hard link\n", .{ id, linked, mb, d.id });
         return linked;
@@ -6749,6 +6780,87 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whol
     try testing.expectEqual(@as(usize, 600), out.step);
     inline for (.{ 0, 300, 599 }) |pos| {
         try testing.expectEqual(try cacheValueAt(&cache, 1, pos, 3, s), try cacheValueAt(&out, 1, pos, 3, s));
+    }
+}
+
+test "DiskTier: rows restored from an entry's chunks serialize back to those chunk files byte for byte" {
+    // Why a commit may link the chunks below its restored rows: they are the bytes it would write.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-reser", 0, 128);
+    defer tier.deinit();
+    const q8 = kv_quant.KVQuantConfig.affine(8);
+    var cache = try KVCache.initWithConfig(testing.allocator, 2, q8);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 64, 0.5, .bfloat16);
+    const toks = chunkShareTokens(600);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    var restored = try KVCache.initWithConfig(testing.allocator, 2, q8);
+    defer restored.deinit();
+    try tier.restorePrefixInto(&restored, 0, 512, s);
+    try fillCache(&restored, s, 2, 88, 64, 900.5, .bfloat16);
+    var other: [600]u32 = toks.a;
+    other[599] = 77;
+    // The synchronous legacy arm links nothing: the second entry writes every chunk itself.
+    _ = try tier.appendCommit(restored.entries, restored.step, restored.config, &other, false, null, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    try testing.expectEqual(@as(u32, 0), tier.entries.items[1].inherited_chunks);
+    for (0..4) |i| {
+        var pa: [1024]u8 = undefined;
+        var pb: [1024]u8 = undefined;
+        const a = readFileAlloc(testing.allocator, io, try std.fmt.bufPrint(&pa, "{s}/e{d}/c{d:0>6}.safetensors", .{ tier.root, tier.entries.items[0].id, i }), 1 << 24).?;
+        defer testing.allocator.free(a);
+        const b = readFileAlloc(testing.allocator, io, try std.fmt.bufPrint(&pb, "{s}/e{d}/c{d:0>6}.safetensors", .{ tier.root, tier.entries.items[1].id, i }), 1 << 24).?;
+        defer testing.allocator.free(b);
+        try testing.expectEqualSlices(u8, a, b);
+    }
+}
+
+test "DiskTier chunk share: an image turn links the chunks below its restored rows past the donor's text, and writes the rows it recomputed" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var a: [520]u32 = undefined;
+    for (&a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var b: [600]u32 = undefined;
+    for (&b, 0..) |*t, i| t.* = @intCast(i + 7);
+    // Restored at 520, the whole record: chunks 0..3. Restored at 300: the rows past it were recomputed.
+    for ([_]struct { rows: ?u32, linked: u32 }{ .{ .rows = null, .linked = 1 }, .{ .rows = 520, .linked = 4 }, .{ .rows = 300, .linked = 2 } }) |c| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-share-img", 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+        _ = try tier.appendCommitWith(.{ .kv_entries = cache.entries, .step = 520, .config = cache.config, .tokens = &a, .has_tools = false, .vision_key = 0xA1, .media_start = 200 }, s, .{});
+        const donor_id = tier.entries.items[0].id;
+        // The next turn's chain adds a screenshot: another key, so the donor rule lends the text before the first image.
+        _ = try tier.appendCommitWith(.{
+            .kv_entries = cache.entries,
+            .step = 600,
+            .config = cache.config,
+            .tokens = &b,
+            .has_tools = false,
+            .vision_key = 0xB2,
+            .media_start = 200,
+            .restored = if (c.rows) |r| .{ .id = donor_id, .rows = r } else null,
+        }, s, .{});
+        try testing.expectEqual(@as(usize, 2), tier.entryCount());
+        const heir = &tier.entries.items[1];
+        try testing.expectEqual(c.linked, heir.inherited_chunks);
+        for (0..5) |i| {
+            const st = chunkStat(io, base, "fp-share-img", heir.id, @intCast(i)).?;
+            try testing.expectEqual(@as(u64, if (i < c.linked) 2 else 1), @as(u64, @intCast(st.nlink)));
+        }
+        try testing.expectEqual(try uniqueDirBytes(io, &tier), tier.total_bytes);
     }
 }
 

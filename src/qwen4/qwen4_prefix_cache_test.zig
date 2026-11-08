@@ -222,7 +222,7 @@ test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every 
         const pos = 512 + 128 * i;
         try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], pos, s));
         peak = @max(peak, pcHeld(cps.items));
-        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, cps.items, std.math.maxInt(u64), s);
+        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, null, cps.items, std.math.maxInt(u64), s);
         try testing.expectEqual(@as(usize, 1), pcHeld(cps.items));
     }
     // The prompt-end snapshot is taken after the loop, past the hook.
@@ -1873,7 +1873,7 @@ test "Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD
             try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[cps.items.len], pos, s));
             peak = @max(peak, pcHeld(cps.items));
         }
-        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, cps.items, std.math.maxInt(u64), s);
+        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, null, cps.items, std.math.maxInt(u64), s);
     }
     try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[4], loop_end, s));
     try testing.expect(peak <= 2);

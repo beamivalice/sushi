@@ -239,6 +239,7 @@ fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xf
     slot.ssm_entries = null;
     slot.ring_cps = .{};
     slot.restored_entry = 0;
+    slot.restored_disk = null;
     slot.full_prompt = &.{};
     slot.prompt_tokens = 4;
     slot.completion_tokens = 0;
