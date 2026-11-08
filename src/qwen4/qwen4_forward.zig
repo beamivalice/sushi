@@ -608,6 +608,8 @@ pub fn qwen4MtpLiveModule(m: *Qwen4Mtp) Qwen4MtpLive {
 
 /// A fresh, empty per-request head state (what `qwen4MtpReset` leaves behind).
 pub fn qwen4MtpStateNew(self: *Trunk) !Qwen4MtpState {
+    // The shared spec warmup calls the head in every build; a build without qwen4 has no head state.
+    if (comptime !qwen4_state.built) return error.NoMtpHead;
     const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     var entry = m.entry;
     entry.conv_state = .{ .ctx = null };
@@ -920,6 +922,8 @@ pub fn qwen4MtpForward(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: m
 }
 
 pub fn qwen4MtpForwardOn(self: *Trunk, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
+    // The shared spec warmup calls the head in every build; a build without qwen4 has no head state.
+    if (comptime !qwen4_state.built) return error.NoMtpHead;
     const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveState(st);
     return qwen4MtpForwardLive(self, m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);

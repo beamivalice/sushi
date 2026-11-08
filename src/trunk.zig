@@ -2338,8 +2338,6 @@ pub const Trunk = struct {
     }
 
     fn specWarmHead(self: *Trunk, stream_row: mlx.mlx_array) !void {
-        // Only qwen4 has this MTP head; a build without it has no head to warm.
-        if (comptime !qwen4_state.built) return;
         var st = try qwen4_forward.qwen4MtpStateNew(self);
         defer st.deinit();
         var id_buf: [1]i32 = undefined;
