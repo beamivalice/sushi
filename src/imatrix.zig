@@ -41,12 +41,6 @@ pub const Naming = struct {
     layer_prefix: []const u8,
     /// What follows the layer index in the name of the layer's expert block.
     experts_infix: []const u8 = ".mlp.experts.",
-
-    // Transitional spellings for call sites that still name their arch; their owners switch to the arch's own
-    // `imatrix_naming`, and these go with the final cleanup.
-    pub const qwen4_exp: Naming = .{ .layer_prefix = "model.language_model.layers." };
-    pub const glm5_next: Naming = .{ .layer_prefix = "model.language_model.layers." };
-    pub const mimo_v2: Naming = .{ .layer_prefix = "model.layers." };
 };
 
 pub var rows_request: ?usize = null;

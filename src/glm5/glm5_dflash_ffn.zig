@@ -69,7 +69,7 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
             };
             const dec = target.cfg.expertDecode();
             const gs = mlx.getShape(layer.bank.gate.trellis);
-            const lane_rows = shape[1] >= 2 and shape[1] <= 8 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook.servesGlmFastPaths() and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]);
+            const lane_rows = shape[1] >= 2 and shape[1] <= 8 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook.servesLaneFastPaths() and gs.len == 4 and gs[2] == 128 and api.coop_rows2.servesRate(gs[3]);
             if (lane_rows) if (layer.shared) |shared| {
                 if (try shared.applyFolded(ops, x, layer.bank, routing.indices, routing.scores, dec, target.cfg.glm_swiglu_limit)) |joined| {
                     group2_batches += 1;
@@ -78,7 +78,7 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
                     break :blk try ops.own(joined);
                 }
                 const y = try dense(shared, ops, x, target.cfg.glm_swiglu_limit);
-                if (try api.glm_group2.moeLayoutShared(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane, y)) |joined| {
+                if (try api.coop_rows2.moeLayoutShared(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane, y)) |joined| {
                     group2_batches += 1;
                     routed_batches += 1;
                     logGroup2(dec, true);
@@ -86,7 +86,7 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
                 }
             };
             const candidate = if (lane_rows)
-                try api.glm_group2.moeLayout(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane)
+                try api.coop_rows2.moeLayout(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane)
             else
                 null;
             const routed = try ops.own(if (candidate) |value| reused: {

@@ -197,7 +197,7 @@ fn fusedPleShardsComplete(allocator: std.mem.Allocator, raw: []const u8, ple_sha
     return found == ple_shards;
 }
 
-pub fn qwen4StreamingIndexComplete(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?expert_quant.Layout {
+pub fn streamingIndexComplete(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?expert_quant.Layout {
     const meta = readStubMeta(io, allocator, model_dir);
     if (!expert_quant.isExpertStreamingArch(meta.modelType())) return null;
     if (!meta.found or meta.num_hidden_layers == 0 or meta.num_experts == 0 or
@@ -606,7 +606,7 @@ fn tryAddModel(
     else
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(model_dir), name });
     const streaming_index_complete = expert_quant.isExpertStreamingArch(model_type) and
-        qwen4StreamingIndexComplete(io, allocator, path) != null;
+        streamingIndexComplete(io, allocator, path) != null;
     try found.append(allocator, .{
         .id = id,
         .path = path,
@@ -1019,9 +1019,9 @@ test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candida
 
     try std.testing.expectEqual(
         expert_quant.Layout.quantized_split,
-        qwen4StreamingIndexComplete(io, allocator, q4_path).?,
+        streamingIndexComplete(io, allocator, q4_path).?,
     );
-    try std.testing.expect(qwen4StreamingIndexComplete(io, allocator, moe_path) == null);
+    try std.testing.expect(streamingIndexComplete(io, allocator, moe_path) == null);
 
     var result = try discoverModels(io, allocator, root_path);
     defer result.deinit();
@@ -1062,7 +1062,7 @@ test "the real quantized pack is a complete streaming discovery candidate" {
     const path = try @import("test_models.zig").packPath(&path_buf, "Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit");
     var dir = std.Io.Dir.openDirAbsolute(std.testing.io, path, .{}) catch return error.SkipZigTest;
     dir.close(std.testing.io);
-    try std.testing.expectEqual(expert_quant.Layout.quantized_split, qwen4StreamingIndexComplete(std.testing.io, std.testing.allocator, path).?);
+    try std.testing.expectEqual(expert_quant.Layout.quantized_split, streamingIndexComplete(std.testing.io, std.testing.allocator, path).?);
     const meta = readStubMeta(std.testing.io, std.testing.allocator, path);
     try std.testing.expect(meta.found and meta.quant_bits == 4 and meta.num_experts == 512);
 }
@@ -1072,7 +1072,7 @@ test "real qwen checkpoint is a complete streaming discovery candidate" {
     const path = try @import("test_models.zig").packPath(&path_buf, "Qwen/Qwen3.8-Flash-Next");
     var dir = std.Io.Dir.openDirAbsolute(std.testing.io, path, .{}) catch return error.SkipZigTest;
     dir.close(std.testing.io);
-    try std.testing.expectEqual(expert_quant.Layout.bf16_fused, qwen4StreamingIndexComplete(std.testing.io, std.testing.allocator, path).?);
+    try std.testing.expectEqual(expert_quant.Layout.bf16_fused, streamingIndexComplete(std.testing.io, std.testing.allocator, path).?);
     const meta = readStubMeta(std.testing.io, std.testing.allocator, path);
     try std.testing.expect(meta.found and meta.quant_bits == 0 and meta.hidden_size == 2560 and meta.num_hidden_layers == 48);
     try std.testing.expect(meta.num_experts == 512 and meta.num_experts_per_tok == 10 and meta.moe_intermediate_size == 640);
@@ -1386,14 +1386,14 @@ test "mimo_v2 streaming discovery validates MXFP4 headers without a PLE table" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(testing.io, &path_buf);
     const path = path_buf[0..n];
-    try testing.expectEqual(expert_quant.Layout.mxfp4_split, qwen4StreamingIndexComplete(testing.io, a, path).?);
+    try testing.expectEqual(expert_quant.Layout.mxfp4_split, streamingIndexComplete(testing.io, a, path).?);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "mxfp4.safetensors", .data = bytes[0..16] });
-    try testing.expect(qwen4StreamingIndexComplete(testing.io, a, path) == null);
+    try testing.expect(streamingIndexComplete(testing.io, a, path) == null);
 }
 
 test "real mimo_v2 original checkpoint discovers complete streamed expert headers" {
     const source = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
-    const layout = qwen4StreamingIndexComplete(testing.io, testing.allocator, std.mem.span(source)) orelse
+    const layout = streamingIndexComplete(testing.io, testing.allocator, std.mem.span(source)) orelse
         return error.IncompleteMimoSource;
     try testing.expectEqual(expert_quant.Layout.mxfp4_individual, layout);
 }
@@ -1414,7 +1414,7 @@ test "mimo_v2 original source discovery validates individual MXFP4 tensors" {
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(testing.io, &path_buf);
-    try testing.expectEqual(expert_quant.Layout.mxfp4_individual, qwen4StreamingIndexComplete(testing.io, a, path_buf[0..n]).?);
+    try testing.expectEqual(expert_quant.Layout.mxfp4_individual, streamingIndexComplete(testing.io, a, path_buf[0..n]).?);
 }
 
 test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {

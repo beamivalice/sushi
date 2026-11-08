@@ -6,7 +6,7 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 /// The sushi version this copy of the module was cut at; the sushi tests check it against build.zig.zon.
-pub const version: []const u8 = "1.6.0-dev";
+pub const version: []const u8 = "1.6.0-dev2";
 pub const format = @import("expert_exl3.zig");
 pub const pack = @import("pack.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
@@ -17,12 +17,6 @@ pub const riders_gated = @import("riders_gated.zig");
 pub const shared_trellis = @import("shared_trellis.zig");
 pub const fold_gated = @import("fold_gated.zig");
 pub const prefill_grid = @import("prefill_grid.zig");
-/// Deprecated names of the files above, kept for one release.
-pub const glm_group2 = coop_rows2;
-pub const glm_fold = fold_clamped;
-pub const qwen_riders = riders_gated;
-pub const qwen_fold = fold_gated;
-pub const glm_prefill_grid = prefill_grid;
 pub const codebook_tables = @import("codebook_tables.zig");
 /// Test-only: the f32-truth helpers the geometry and real-pack parity tests share.
 pub const f32_truth = @import("f32_truth.zig");

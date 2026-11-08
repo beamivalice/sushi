@@ -4663,7 +4663,7 @@ test "exl3 MoE taps the layer's input rows and routing for a calibration capture
     const prev_st = qwen4_standin_override;
     defer qwen4_standin_override = prev_st;
     qwen4_standin_override = .{};
-    const col = try imatrix_capture.Collector.init(t.allocator, s, "/dev/null", 1, Exl3MoeHarness.E, .qwen4_exp);
+    const col = try imatrix_capture.Collector.init(t.allocator, s, "/dev/null", 1, Exl3MoeHarness.E, @import("qwen4_kld.zig").imatrix_naming);
     defer col.deinit();
     col.armRows(0);
 

@@ -11,9 +11,11 @@ earlier history is mlx-serve's, in that project's changelog.
   every model's output unchanged.
 - **The "architecture not supported" and "file format not supported" load refusals list every architecture this build
   serves**: the first now also names DeepSeek-V4.1-Flash, the second no longer stops at Qwen and MiMo.
-- **The `sushi_exl3` module names no architecture**: its files and public names now say what they do (the old names
-  stay as deprecated aliases for one release), and its per-call modes are parameters instead of process globals, with
+- **The `sushi_exl3` module names no architecture**: its files and public names now say what they do, and its per-call modes are parameters instead of process globals, with
   output unchanged.
+- **The deprecated `sushi_exl3` aliases are removed**: `glm_group2`, `glm_fold`, `qwen_riders`, `qwen_fold`,
+  `glm_prefill_grid`, `rate_groups.qwenFoldedCount`, `qwenLaunchCount` and `Codebook.servesGlmFastPaths` are gone, so a
+  host that still used them takes the new names when it re-vendors.
 - **`sushi_exl3` has a written re-vendor contract** (`docs/mlx-serve-integration.md`): every public name, the
   `mlx_host` surface that `zig build exl3-host-check` enforces, and a new `version` constant.
 

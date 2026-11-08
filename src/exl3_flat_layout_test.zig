@@ -245,7 +245,7 @@ test "flat EXL3 semantic shards remain a complete discovery candidate" {
 
     try std.testing.expectEqual(
         expert_quant.Layout.exl3_k4,
-        model_discovery.qwen4StreamingIndexComplete(io, allocator, model_path).?,
+        model_discovery.streamingIndexComplete(io, allocator, model_path).?,
     );
 
     var model_dir = try std.Io.Dir.openDirAbsolute(io, model_path, .{});

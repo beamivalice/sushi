@@ -130,6 +130,10 @@ without it. An arch added later joins the list in the landing that adds it.
   and may declare `parseDir`, `adoptLayout`, `samplingDefaults` and `streamedResidentSplit`. `model.served_model_types`
   lists every registered type, enabled or not (`registry.registered_model_types`, from each registry line's own
   `model_types` and `gate_rank`, its place in the gate's refusal text, so a left-out arch's files are never read); a test of one arch skips when `registry.ofModelType` says the build left it out. Shared parse code calls those, never a type name.
+- **The guest line.** A registry line's `guest` says whether a host may route the arch's model types to this release
+  line (false for an unsupported arch such as MiMo, which is still served). `registry.guest_model_types`, the built archs
+  marked `guest` in `gate_rank` order, is the `model_types` of `sushi --guest-manifest`; a new arch decides its `guest`
+  on its registry line.
 - A shared file only one arch uses moves into that arch's folder. A shared file a shared engine path also reaches stays
   shared and is named by capability.
 

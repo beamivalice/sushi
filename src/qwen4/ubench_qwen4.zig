@@ -49,7 +49,7 @@ fn qwenSample(r: *const QwenRung, arm: usize) anyerror!f64 {
                 var sh = r.weights[l].shared;
                 sh.logit = r.weights[l].logit;
                 const got = switch (chain) {
-                    .bank => |b| try api.qwen_fold.moeGatedSharedFolded(r.s, x, b, r.ids[l], r.scores[l], r.dec, sh, null),
+                    .bank => |b| try api.fold_gated.moeGatedSharedFolded(r.s, x, b, r.ids[l], r.scores[l], r.dec, sh, null),
                     .ragged => |rb| try api.rate_groups.moeGatedSharedFolded(r.s, x, rb, r.ids[l], r.scores[l], r.dec, sh, null),
                 };
                 break :blk try scope.own(got orelse return error.FoldDeclined);

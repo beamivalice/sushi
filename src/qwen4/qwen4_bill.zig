@@ -55,7 +55,7 @@ pub fn thoughtPoint(config: *const model_mod.ModelConfig, warm: bills.WarmPrefix
 
 /// The most checkpoint states a request holds at once when its model runs an SSD tier: the write-through
 /// frees each one once its file is written, and a request it cannot serve is thinned to the same number
-/// (`scheduler.qwenCheckpointCap`). Null = every checkpoint stays in RAM.
+/// (`scheduler.ssmCheckpointCap`). Null = every checkpoint stays in RAM.
 pub fn residentCheckpointCap(config: *const model_mod.ModelConfig) ?u64 {
     if (!bills.diskTierOn(config)) return null;
     return trunk_mod.SSM_RESIDENT_MAX;

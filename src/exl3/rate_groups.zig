@@ -1414,10 +1414,6 @@ pub fn foldLaunchCount() usize {
     return fold_launches;
 }
 
-/// Deprecated names, kept for one release.
-pub const qwenFoldedCount = foldedCount;
-pub const qwenLaunchCount = foldLaunchCount;
-
 fn gatedStage(k: GatedFoldKey) !*const FusedStage {
     if (gated_stages.getPtr(k)) |f| return f;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

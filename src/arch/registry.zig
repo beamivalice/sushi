@@ -11,13 +11,14 @@ const opts = @import("build_options");
 // used: the host tier uses `chat` alone, and an arch left out of `-Darchs` is read by neither. The line's own
 // `model_types` and `gate_rank` are what the arch gate needs of an arch the build left out, without reading its files;
 // `seam_terms` are the concepts only that arch owns, which a shared handle field must not name (the seam guard).
+// `guest` is whether a host may route the arch's model types to this release line (false: served, but unsupported).
 // `tests` is its `arch_tests.zig`, the list of its test files that the two test roots walk; it stays out of `arch.zig`
 // so the arch-slice build compiles the arch's own module graph alone.
 const archs = struct {
-    pub const glm5 = struct { const name = "glm5"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"glm5_next"}; const gate_rank = 2; const mod = @import("../glm5/arch.zig"); const tests = @import("../glm5/arch_tests.zig"); const chat = @import("../glm5/glm5_chat.zig"); }; // arch:glm5
-    pub const dsv41 = struct { const name = "dsv41"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const tests = @import("../dsv41/arch_tests.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); }; // arch:dsv41
-    pub const qwen4 = struct { const name = "qwen4"; const seam_terms = [_][]const u8{ "qsa", "gdn", "ple", "compiled_hc" }; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const tests = @import("../qwen4/arch_tests.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); }; // arch:qwen4
-    pub const mimo2 = struct { const name = "mimo2"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"mimo_v2"}; const gate_rank = 1; const mod = @import("../mimo2/arch.zig"); const tests = @import("../mimo2/arch_tests.zig"); const chat = @import("../mimo2/mimo_chat.zig"); }; // arch:mimo2
+    pub const glm5 = struct { const name = "glm5"; const guest = true; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"glm5_next"}; const gate_rank = 2; const mod = @import("../glm5/arch.zig"); const tests = @import("../glm5/arch_tests.zig"); const chat = @import("../glm5/glm5_chat.zig"); }; // arch:glm5
+    pub const dsv41 = struct { const name = "dsv41"; const guest = true; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const tests = @import("../dsv41/arch_tests.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); }; // arch:dsv41
+    pub const qwen4 = struct { const name = "qwen4"; const guest = true; const seam_terms = [_][]const u8{ "qsa", "gdn", "ple", "compiled_hc" }; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const tests = @import("../qwen4/arch_tests.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); }; // arch:qwen4
+    pub const mimo2 = struct { const name = "mimo2"; const guest = false; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"mimo_v2"}; const gate_rank = 1; const mod = @import("../mimo2/arch.zig"); const tests = @import("../mimo2/arch_tests.zig"); const chat = @import("../mimo2/mimo_chat.zig"); }; // arch:mimo2
 };
 
 const all_names = blk: {
@@ -134,6 +135,17 @@ pub const served_model_types: []const []const u8 = blk: {
     var out: []const []const u8 = &.{};
     for (std.meta.tags(Tag)) |t| for (Chat(t).model_types) |m| {
         out = out ++ &[_][]const u8{m};
+    };
+    break :blk out;
+};
+
+/// The model types of the built archs marked `guest`, in `gate_rank` order: what `sushi --guest-manifest` lists.
+pub const guest_model_types: []const []const u8 = blk: {
+    var out: []const []const u8 = &.{};
+    for (0..all_names.len) |rank| for (std.meta.tags(Tag)) |t| {
+        if (gateRank(t) == rank and @field(archs, @tagName(t)).guest) for (lineModelTypes(t)) |m| {
+            out = out ++ &[_][]const u8{m};
+        };
     };
     break :blk out;
 };

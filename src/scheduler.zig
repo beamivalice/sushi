@@ -154,7 +154,7 @@ pub const SubmitParams = struct {
 };
 
 /// The KDA checkpoints a GLM request keeps for the prefix cache, as admission bills them: how many it
-/// keeps, and whether its prefill moves each to SSD and drops the RAM copy (`glmCheckpointsRelease`).
+/// keeps, and whether its prefill moves each to SSD and drops the RAM copy (`checkpointsRelease`).
 pub const CheckpointPlan = struct {
     keep: u32 = 0,
     released: bool = false,
@@ -3242,24 +3242,24 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     return true;
 }
 
-/// The checkpoints a Qwen request may list when no write-through frees them as they land: with an SSD tier
+/// The checkpoints a request may list when no write-through frees them as they land: with an SSD tier
 /// behind the cache it holds at most `SSM_RESIDENT_MAX` states, which is what `server.ssmResidentCap` bills.
 /// A write-through request holds two whatever it lists (`HotPrefixCache.writeThroughHybrid`).
-fn qwenCheckpointCap(slot: *Slot, cp_max: u32, write_through: bool) u32 {
-    if (!qwenCheckpointCapped(slot, write_through)) return cp_max;
+fn ssmCheckpointCap(slot: *Slot, cp_max: u32, write_through: bool) u32 {
+    if (!ssmCheckpointCapped(slot, write_through)) return cp_max;
     const cap = trunk.SSM_RESIDENT_MAX - 1;
     return if (cp_max == 0) cap else @min(cp_max, cap);
 }
 
-fn qwenCheckpointCapped(slot: *Slot, write_through: bool) bool {
+fn ssmCheckpointCapped(slot: *Slot, write_through: bool) bool {
     if (write_through or !slot.facts.caps_ssm_checkpoints) return false;
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
     return hc.disk != null;
 }
 
-/// Does this GLM request's prefill move each KDA checkpoint to SSD and free its RAM copy? Admission bills
+/// Does this request's prefill move each checkpoint to SSD and free its RAM copy? Admission bills
 /// from this answer and the prefill arms its hook from the same one.
-fn glmCheckpointsRelease(slot: *Slot, new_span: usize) bool {
+fn checkpointsRelease(slot: *Slot, new_span: usize) bool {
     return slot.facts.releases_checkpoints and writeThroughArmed(slot, new_span);
 }
 
@@ -3682,7 +3682,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .enable_mtp = slot.enable_mtp,
                 .checkpoints = .{
                     .keep = if (slot.facts.bills_checkpoints and cp_stride > 0) cp_max else 0,
-                    .released = glmCheckpointsRelease(slot, slot.full_prompt.len - hot_matched),
+                    .released = checkpointsRelease(slot, slot.full_prompt.len - hot_matched),
                     .thought = thoughtPointWanted(slot, cp_stride > 0),
                 },
                 .fits = fits_fn,
@@ -3764,7 +3764,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     const write_through_on = writeThroughArmed(slot, prefill_tokens.len);
-    cp_max = qwenCheckpointCap(slot, cp_max, write_through_on);
+    cp_max = ssmCheckpointCap(slot, cp_max, write_through_on);
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
         .sch = sch,

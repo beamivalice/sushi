@@ -822,7 +822,7 @@ fn glmSample(r: *const GlmRung, arm: usize) anyerror!f64 {
             .routed_only => if (r.rows == 1)
                 try scope.own(try api.moeClamped(r.s, x, r.routed[l], r.ids[l], r.scores[l], glm_shared.test_dec, glm_shared.test_limit))
             else
-                try scope.own((try api.glm_group2.moeLayout(r.s, x, r.routed[l], r.ids[l], r.scores[l], glm_shared.test_dec, .serial, .grouped, .lane)) orelse return error.FoldDeclined),
+                try scope.own((try api.coop_rows2.moeLayout(r.s, x, r.routed[l], r.ids[l], r.scores[l], glm_shared.test_dec, .serial, .grouped, .lane)) orelse return error.FoldDeclined),
             .fused => try scope.own((try glm_shared.folded(r.s, x, r.gate[l], r.up[l], r.down[l], r.routed[l], r.ids[l], r.scores[l], glm_shared.test_dec, 10, r.sigmoid)) orelse return error.FoldDeclined),
         };
     }

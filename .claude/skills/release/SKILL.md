@@ -74,6 +74,8 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
 **Release**:
 1. Set `build.zig.zon`'s `.version` to the next version and rename the top `## Unreleased` entry to
    `## v<version> — Headline` (check `gh release list --limit 1` first — never reuse an existing tag)
+   - Every bump, a `-dev` one too, also sets `src/exl3/root.zig`'s `version` (the vendorable module's own); run
+     `zig build test -Doptimize=ReleaseFast -Dtest-filter="version:"` before committing, which pins the two equal.
 2. Commit the version bump with the CHANGELOG heading, push it, and run `./release.sh` beside the local gates (Order
    above).
 3. The Release workflow leaves a DRAFT. Once the local gates are green too, check its tarball against the

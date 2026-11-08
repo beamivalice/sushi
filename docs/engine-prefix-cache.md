@@ -451,7 +451,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   released one is skipped as a source of state (`ssmTargetPositions`, `highestCheckpointAtOrBelow`) and priced at the
   bytes it held (`released_bytes`). A restore at any position reads its file.
 - **A request the write-through cannot serve** (a span under one disk chunk) releases nothing, so its list is thinned
-  to two (`scheduler.qwenCheckpointCap`) and it holds three states while one is captured. The thinning is
+  to two (`scheduler.ssmCheckpointCap`) and it holds three states while one is captured. The thinning is
   span-preserving whatever the prompt carries (`prefill_plan.checkpointDropIndex`): a media record persists whole, so
   there is no boundary to protect, and protecting one dropped every checkpoint ABOVE the image — exactly the state
   the next image-bearing turn restores from. The byte-budget trim never lands on a released checkpoint.

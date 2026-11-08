@@ -1137,7 +1137,7 @@ test "imatrix capture keys the streamed MoE statistics on GLOBAL expert ids, on 
     // rows 1 (unsorted composite) and 2 (sorted composite), each on the kernel arm too.
     for ([_]c_int{ 1, 2 }) |rows| {
         for ([_]bool{ false, true }) |kernels| {
-            const col = try imatrix_capture.Collector.init(alloc, s, "/dev/null", 3, experts, .qwen4_exp);
+            const col = try imatrix_capture.Collector.init(alloc, s, "/dev/null", 3, experts, .{ .layer_prefix = "model.language_model.layers." });
             defer col.deinit();
             const x_host = try alloc.alloc(u16, @intCast(rows * hidden));
             defer alloc.free(x_host);
@@ -1208,7 +1208,7 @@ test "a streamed layer's imatrix tap views the routing ids and is absent with no
     defer _ = mlx.mlx_array_free(ids);
     try std.testing.expect(try ImatrixTap.forLayer(null, 0, ids, 2, 2, s) == null);
 
-    const col = try imatrix_capture.Collector.init(alloc, s, "/dev/null", 2, 8, .mimo_v2);
+    const col = try imatrix_capture.Collector.init(alloc, s, "/dev/null", 2, 8, .{ .layer_prefix = "model.layers." });
     defer col.deinit();
     const tap = (try ImatrixTap.forLayer(col, 1, ids, 2, 2, s)).?;
     defer tap.deinit();

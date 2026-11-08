@@ -3096,7 +3096,7 @@ pub fn moeSwigluClampedWithShared(
             const gs = mlx.getShape(gate_t);
             const us = mlx.getShape(up_t);
             const ds = mlx.getShape(down_t);
-            if (out_dtype == .bfloat16 and active_decode.codebook.servesGlmFastPaths() and
+            if (out_dtype == .bfloat16 and active_decode.codebook.servesLaneFastPaths() and
                 gs[3] == us[3] and gs[3] == ds[3] and laneServesRate(gs[3]))
             {
                 const prepared = try downLanePrepare(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
@@ -7636,7 +7636,7 @@ fn laneChainBytesMatch(n: u32, dec: exl3.Decode, rows: usize, seed: u64) !void {
     const lanes = lane_decode_dispatches;
     const got = try moeSwigluClamped(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
     defer _ = mlx.mlx_array_free(got);
-    try std.testing.expectEqual(lanes + @as(usize, if (dec.codebook.servesGlmFastPaths()) 2 else 0), lane_decode_dispatches);
+    try std.testing.expectEqual(lanes + @as(usize, if (dec.codebook.servesLaneFastPaths()) 2 else 0), lane_decode_dispatches);
     var cs: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
     defer for (cs) |c| {
         _ = mlx.mlx_array_free(c);
@@ -9485,7 +9485,7 @@ pub fn laneServesRate(n: c_int) bool {
     return n >= 0 and exl3.kFromPackedDim(@intCast(n)) != null;
 }
 fn laneClampedPair(s: mlx.mlx_stream, x: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, sg: mlx.mlx_array, su: mlx.mlx_array, slots: mlx.mlx_array, hidden: c_int, rows: c_int, topk: c_int) !?[2]mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !active_decode.codebook.servesGlmFastPaths() or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
+    if (!mlx.streamIsGpu(s) or !active_decode.codebook.servesLaneFastPaths() or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
     const gs = mlx.getShape(tg);
     if (gs.len != 4 or !std.mem.eql(c_int, gs, mlx.getShape(tu)) or !laneServesRate(gs[3])) return null;
     const prepared = try lanePairPrepare(s, x, sg, su, slots, null, hidden, rows * topk, topk);

@@ -451,7 +451,7 @@ test "GLM stream imatrix tap keys the MLP input and the SwiGLU activation on the
     const geometry = stream.Geometry{ .layers = 4, .experts = 4, .hidden = 32, .intermediate = 16, .first_moe_layer = 3 };
     var engine = try stream.Engine.initWithOptions(t.allocator, path[0..n], geometry, 2 * 3072, s, .{ .layout = .bf16_individual, .bounce_size = 4096, .io_workers = 1 });
     defer engine.deinit();
-    const col = try imatrix_capture.Collector.init(t.allocator, s, "/dev/null", 4, 4, .glm5_next);
+    const col = try imatrix_capture.Collector.init(t.allocator, s, "/dev/null", 4, 4, @import("glm5_kld_capture.zig").imatrix_naming);
     defer col.deinit();
     var store = Stream{ .engine = &engine, .max_tokens = 16, .max_chunk = 3, .imatrix = col };
     const cfg = model.ModelConfig{ .glm_swiglu_limit = 10 };

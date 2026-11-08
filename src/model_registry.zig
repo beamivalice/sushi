@@ -785,7 +785,7 @@ pub const ModelRegistry = struct {
         const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
         defer self.allocator.free(probe.model_type);
         const streaming_index_complete = expert_quant.isExpertStreamingArch(probe.model_type) and
-            model_discovery.qwen4StreamingIndexComplete(io, self.allocator, trimmed) != null;
+            model_discovery.streamingIndexComplete(io, self.allocator, trimmed) != null;
 
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);

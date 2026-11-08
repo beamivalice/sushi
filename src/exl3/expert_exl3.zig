@@ -92,9 +92,6 @@ pub const Codebook = enum(u8) {
             .mul1 => false,
         };
     }
-
-    /// Deprecated name, kept for one release.
-    pub const servesGlmFastPaths = servesLaneFastPaths;
 };
 
 /// The codeword width a pack's Viterbi search hashed: a decoder takes the low

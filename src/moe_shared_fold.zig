@@ -1,4 +1,4 @@
-//! The shared expert, its gate logit and the sigmoid-gated add inside the routed EXL3 launches (`exl3/qwen_fold.zig`
+//! The shared expert, its gate logit and the sigmoid-gated add inside the routed EXL3 launches (`exl3/fold_gated.zig`
 //! for a one-bank layer, `exl3/rate_groups.zig` for a rate-grouped one), for any trunk whose MoE layer gates it.
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -31,9 +31,9 @@ pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const trunk_mod.MoeMlpWeights, ind
         (if (geo) |g| try api.rate_groups.moeGatedSharedFoldedGeo(s, x, rb, inds, scores, dec, shared, gate, g) else try api.rate_groups.moeGatedSharedFolded(s, x, rb, inds, scores, dec, shared, gate))
     else blk: {
         const bank = mw.routedBank();
-        const g = geo orelse break :blk try api.qwen_fold.moeGatedSharedFolded(s, x, bank, inds, scores, dec, shared, gate);
-        if (mw.routed_shape) |*shape| break :blk try api.qwen_fold.moeGatedSharedFoldedBound(s, x, bank, shape, inds, scores, dec, shared, gate, g);
-        break :blk try api.qwen_fold.moeGatedSharedFoldedGeo(s, x, bank, inds, scores, dec, shared, gate, g);
+        const g = geo orelse break :blk try api.fold_gated.moeGatedSharedFolded(s, x, bank, inds, scores, dec, shared, gate);
+        if (mw.routed_shape) |*shape| break :blk try api.fold_gated.moeGatedSharedFoldedBound(s, x, bank, shape, inds, scores, dec, shared, gate, g);
+        break :blk try api.fold_gated.moeGatedSharedFoldedGeo(s, x, bank, inds, scores, dec, shared, gate, g);
     };
     if (result != null and !logged) {
         logged = true;

@@ -1666,7 +1666,7 @@ test "imatrix capture on the streamed QUANTIZED MoE path keys the routing's glob
         .shared_down_b = none,
     };
 
-    const col = try imatrix_capture.Collector.init(alloc, s, "/dev/null", 2, experts, .mimo_v2);
+    const col = try imatrix_capture.Collector.init(alloc, s, "/dev/null", 2, experts, .{ .layer_prefix = "model.layers." });
     defer col.deinit();
     var xfm: Trunk = undefined;
     xfm.s = s;

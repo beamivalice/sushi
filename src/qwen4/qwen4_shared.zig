@@ -20,7 +20,7 @@ fn bf16(v: f32) u16 {
 }
 
 /// An affine8 bank at group `group`: random codes, positive scales and centred biases at `gain`.
-fn affineBank(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, rows: usize, k: usize, group: usize, gain: f32) !api.qwen_riders.Affine {
+fn affineBank(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, rows: usize, k: usize, group: usize, gain: f32) !api.riders_gated.Affine {
     const codes = try a.alloc(u32, rows * k / 4);
     defer a.free(codes);
     const scales = try a.alloc(u16, rows * k / group);
@@ -87,8 +87,8 @@ pub fn routing(ops: *Ops, rnd: std.Random, rows: usize, experts: usize) !struct 
 }
 
 pub const Weights = struct {
-    shared: api.qwen_riders.Shared,
-    logit: api.qwen_riders.Affine,
+    shared: api.riders_gated.Shared,
+    logit: api.riders_gated.Affine,
     group: usize,
     trellis: ?TrellisShared = null,
 
@@ -165,7 +165,7 @@ test "Qwen shared expert folded into the one-bank routed launches is bit exact t
     const rnd = random.random();
     var ops = Ops{ .s = s };
     defer ops.deinit();
-    defer api.qwen_fold.shared_first = false;
+    defer api.fold_gated.shared_first = false;
     const experts: c_int = 24;
     for (one_bank_cases) |kind| {
         const bank = try routedBank(&ops, experts, kind.rates[0], kind.rates[2], 40 + @as(u64, @intCast(kind.rates[0])));
@@ -181,18 +181,18 @@ test "Qwen shared expert folded into the one-bank routed launches is bit exact t
                 const want = try separate(&scope, x, w, .{ .bank = bank }, route.ids, route.scores, kind.dec);
                 // The router kernel's own logit rides in at one row, the rider's at every width.
                 for ([_]bool{ false, true }) |router_logit| for ([_]bool{ false, true }) |first| {
-                        api.qwen_fold.shared_first = first;
+                        api.fold_gated.shared_first = first;
                     var sh = w.shared;
                     var gate: ?Arr = null;
                     if (router_logit) {
                         gate = try scope.own(try trunk_mod.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
                     } else sh.logit = w.logit;
-                    const folded_before = api.qwen_fold.foldedCount();
-                    const launches_before = api.qwen_fold.launchCount();
+                    const folded_before = api.fold_gated.foldedCount();
+                    const launches_before = api.fold_gated.launchCount();
                     const dispatches_before = api.kernels.fusedDispatchCount();
-                    const got = try scope.own((try api.qwen_fold.moeGatedSharedFolded(s, x, bank, route.ids, route.scores, kind.dec, sh, gate)) orelse return error.TestExpectedFold);
-                    try std.testing.expectEqual(folded_before + 1, api.qwen_fold.foldedCount());
-                    try std.testing.expectEqual(launches_before + 3, api.qwen_fold.launchCount());
+                    const got = try scope.own((try api.fold_gated.moeGatedSharedFolded(s, x, bank, route.ids, route.scores, kind.dec, sh, gate)) orelse return error.TestExpectedFold);
+                    try std.testing.expectEqual(folded_before + 1, api.fold_gated.foldedCount());
+                    try std.testing.expectEqual(launches_before + 3, api.fold_gated.launchCount());
                     try std.testing.expectEqual(dispatches_before + 3, api.kernels.fusedDispatchCount());
                     try expectSameBits(want, got);
                 };
@@ -233,12 +233,12 @@ test "Qwen shared expert folded into the rate-grouped routed launches is bit exa
                 if (router_logit) {
                     gate = try ops.own(try trunk_mod.qmatmulBits(x, w.logit.weight, w.logit.scales, w.logit.biases, 8, 64, .affine, s));
                 } else sh.logit = w.logit;
-                const folded_before = api.rate_groups.qwenFoldedCount();
-                const launches_before = api.rate_groups.qwenLaunchCount();
+                const folded_before = api.rate_groups.foldedCount();
+                const launches_before = api.rate_groups.foldLaunchCount();
                 const dispatches_before = api.kernels.fusedDispatchCount();
                 const got = try ops.own((try api.rate_groups.moeGatedSharedFolded(s, x, &rb, route.ids, route.scores, dec, sh, gate)) orelse return error.TestExpectedFold);
-                try std.testing.expectEqual(folded_before + 1, api.rate_groups.qwenFoldedCount());
-                try std.testing.expectEqual(launches_before + 3, api.rate_groups.qwenLaunchCount());
+                try std.testing.expectEqual(folded_before + 1, api.rate_groups.foldedCount());
+                try std.testing.expectEqual(launches_before + 3, api.rate_groups.foldLaunchCount());
                 try std.testing.expectEqual(dispatches_before + 3, api.kernels.fusedDispatchCount());
                 try expectSameBits(want, got);
             };
@@ -261,9 +261,9 @@ test "Qwen shared expert fold declines what the separate chain must run" {
     with_logit.logit = w.logit;
     const four = try routing(&ops, rnd, 4, 24);
     const x4 = try randomBf16(&ops, std.testing.allocator, rnd, &.{ 1, 4, hidden }, 4);
-    const before = api.qwen_fold.foldedCount() + api.rate_groups.qwenFoldedCount();
+    const before = api.fold_gated.foldedCount() + api.rate_groups.foldedCount();
     const dispatches = api.kernels.fusedDispatchCount();
-    const fold = api.qwen_fold.moeGatedSharedFolded;
+    const fold = api.fold_gated.moeGatedSharedFolded;
     const rag = api.rate_groups.moeGatedSharedFolded;
     // Nine rows are past the verify width.
     const nine = try routing(&ops, rnd, 8, 24);
@@ -286,7 +286,7 @@ test "Qwen shared expert fold declines what the separate chain must run" {
     try std.testing.expect((try fold(s, x4, bank, four.ids, four.scores, test_dec, wide_scales, null)) == null);
     // A codebook whose table the decode does not carry.
     try std.testing.expect((try fold(s, x4, bank, four.ids, four.scores, .{ .codebook = .spec1, .window = .w15 }, with_logit, null)) == null);
-    try std.testing.expectEqual(before, api.qwen_fold.foldedCount() + api.rate_groups.qwenFoldedCount());
+    try std.testing.expectEqual(before, api.fold_gated.foldedCount() + api.rate_groups.foldedCount());
     try std.testing.expectEqual(dispatches, api.kernels.fusedDispatchCount());
 }
 
@@ -295,7 +295,7 @@ pub const TrellisShared = struct {
     held: std.ArrayList(Arr) = .empty,
     stack: trunk_stq.Shared,
     down: trunk_stq.Triple,
-    logit: api.qwen_riders.Affine,
+    logit: api.riders_gated.Affine,
     dec: api.format.Decode,
 
     /// `bytes` backs the host banks and must outlive the weights' build only; `a` holds the arrays' list.
@@ -322,7 +322,7 @@ pub const TrellisShared = struct {
         self.held.deinit(a);
     }
 
-    pub fn shared(self: *const TrellisShared, ops: *Ops) !api.qwen_riders.Shared {
+    pub fn shared(self: *const TrellisShared, ops: *Ops) !api.riders_gated.Shared {
         return .{
             .sigmoid = try trunk_mod.swigluSigTable(ops.s, .bfloat16, std.heap.c_allocator),
             .trellis = .{ .gate_up = self.stack.p, .down = .{ .trellis = self.down.w, .suh = self.down.s, .svh = self.down.b }, .dec = self.dec },
@@ -376,7 +376,7 @@ test "Qwen trellis shared expert folded into the routed launches is bit exact to
                 } else sh.logit = w.logit;
                 const dispatches_before = api.kernels.fusedDispatchCount();
                 const got = try ops.own((if (chain_kind == 0)
-                    try api.qwen_fold.moeGatedSharedFolded(s, x, bank, route.ids, route.scores, dec, sh, gate)
+                    try api.fold_gated.moeGatedSharedFolded(s, x, bank, route.ids, route.scores, dec, sh, gate)
                 else
                     try api.rate_groups.moeGatedSharedFolded(s, x, &rb, route.ids, route.scores, dec, sh, gate)) orelse return error.TestExpectedFold);
                 try std.testing.expectEqual(dispatches_before + 3, api.kernels.fusedDispatchCount());
@@ -402,19 +402,19 @@ test "Qwen trellis shared expert fold declines what the separate chain must run"
     sh.logit = w.logit;
     const four = try routing(&ops, rnd, 4, 24);
     const x4 = try randomBf16(&ops, std.testing.allocator, rnd, &.{ 1, 4, hidden }, 4);
-    const before = api.qwen_fold.foldedCount();
+    const before = api.fold_gated.foldedCount();
     const dispatches = api.kernels.fusedDispatchCount();
     // A trunk codebook whose table the decode does not carry.
     var no_table = sh;
     no_table.trellis.?.dec = .{ .codebook = .spec1, .window = .w15 };
-    try std.testing.expect((try api.qwen_fold.moeGatedSharedFolded(s, x4, bank, four.ids, four.scores, test_dec, no_table, null)) == null);
+    try std.testing.expect((try api.fold_gated.moeGatedSharedFolded(s, x4, bank, four.ids, four.scores, test_dec, no_table, null)) == null);
     // A down bank off the gate/up width, a gate/up bank off the hidden width.
     var wrong_down = sh;
     wrong_down.trellis.?.down = sh.trellis.?.gate_up;
-    try std.testing.expect((try api.qwen_fold.moeGatedSharedFolded(s, x4, bank, four.ids, four.scores, test_dec, wrong_down, null)) == null);
+    try std.testing.expect((try api.fold_gated.moeGatedSharedFolded(s, x4, bank, four.ids, four.scores, test_dec, wrong_down, null)) == null);
     const narrow = try randomBf16(&ops, std.testing.allocator, rnd, &.{ 1, 4, hidden / 2 }, 4);
-    try std.testing.expect((try api.qwen_fold.moeGatedSharedFolded(s, narrow, bank, four.ids, four.scores, test_dec, sh, null)) == null);
-    try std.testing.expectEqual(before, api.qwen_fold.foldedCount());
+    try std.testing.expect((try api.fold_gated.moeGatedSharedFolded(s, narrow, bank, four.ids, four.scores, test_dec, sh, null)) == null);
+    try std.testing.expectEqual(before, api.fold_gated.foldedCount());
     try std.testing.expectEqual(dispatches, api.kernels.fusedDispatchCount());
 }
 
@@ -480,7 +480,7 @@ const StoredLayer = struct {
     mw: MoeMlpWeights,
     geo_only: MoeMlpWeights,
     bare: MoeMlpWeights,
-    shared: api.qwen_riders.Shared,
+    shared: api.riders_gated.Shared,
     dec: api.format.Decode,
     trunk_dec: ?api.format.Decode,
 };
@@ -531,9 +531,9 @@ test "Qwen shared expert fold: the geometry bound at load is the one the shapes 
         var case_ops = Ops{ .s = s };
         defer case_ops.deinit();
         const layer = try storedLayer(&case_ops, arena.allocator(), rnd, s, c, &rb, bank);
-        try std.testing.expectEqual(if (c.ragged) null else api.qwen_fold.bankShape(bank, hidden), layer.mw.routed_shape);
+        try std.testing.expectEqual(if (c.ragged) null else api.fold_gated.bankShape(bank, hidden), layer.mw.routed_shape);
         for (layer.mw.shared_geo, 1..) |stored, rows| {
-            try std.testing.expectEqual(api.qwen_riders.geometry(layer.shared, hidden, @intCast(rows)), stored);
+            try std.testing.expectEqual(api.riders_gated.geometry(layer.shared, hidden, @intCast(rows)), stored);
             if (c.trellis_bits == 0) try std.testing.expect(stored != null);
         }
         var served: usize = 0;

@@ -286,7 +286,7 @@ fn isDecodeRow(x: Arr) bool {
 pub fn routedExl3(ops: *Ops, x: Arr, bank: exl3.Bank, ids: Arr, scores: Arr, cfg: *const model.ModelConfig) !Arr {
     const dec = cfg.expertDecode();
     const limit: c_int = @intFromFloat(cfg.glm_swiglu_limit);
-    if (cfg.glm_swiglu_limit == 10) if (try exl3.glm_prefill_grid.tryMoe(ops.s, x, bank, ids, scores, dec, limit)) |candidate| return ops.own(candidate);
+    if (cfg.glm_swiglu_limit == 10) if (try exl3.prefill_grid.tryMoe(ops.s, x, bank, ids, scores, dec, limit)) |candidate| return ops.own(candidate);
     return ops.own(try exl3.moeClamped(ops.s, x, bank, ids, scores, dec, limit));
 }
 

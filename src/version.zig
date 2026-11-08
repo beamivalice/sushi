@@ -9,11 +9,10 @@
 
 const std = @import("std");
 const expert_exl3 = @import("sushi_exl3").format;
+const registry = @import("arch/registry.zig");
 
 /// A host that runs sushi as an out-of-process engine refuses a `guest_api` it does not know.
 pub const guest_api = 1;
-/// The model types a host may route to this release line.
-pub const guest_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" };
 
 /// The build facts `sushi --guest-manifest` reports (shipped as `guest.json` in the release tarball).
 pub const GuestPins = struct {
@@ -46,7 +45,7 @@ pub fn writeGuestManifest(w: *std.Io.Writer, allocator: std.mem.Allocator, pins:
             try std.fmt.allocPrint(arena, "{d}.{d}", .{ v.major, v.minor })
         else
             try std.fmt.allocPrint(arena, "{d}.{d}.{d}", .{ v.major, v.minor, v.patch }),
-        .model_types = &guest_model_types,
+        .model_types = registry.guest_model_types,
         .expert_quant = .{
             .format = "exl3",
             .codebooks = exl3_codebooks,
@@ -163,6 +162,7 @@ fn guestManifestFor(pins: GuestPins) ![]u8 {
 }
 
 test "version: the guest manifest names the build's pins and the pack contract it serves" {
+    if (registry.served_model_types.len != 4) return error.SkipZigTest;
     const s = try guestManifestFor(.{
         .version = "1.0.0",
         .commit = "3ba7272a3c0d9e1f",
@@ -182,8 +182,8 @@ test "version: the guest manifest names the build's pins and the pack contract i
         \\  "min_macos": "26.2",
         \\  "model_types": [
         \\    "qwen4_exp",
-        \\    "mimo_v2",
-        \\    "glm5_next"
+        \\    "glm5_next",
+        \\    "deepseek_v41"
         \\  ],
         \\  "expert_quant": {
         \\    "format": "exl3",
@@ -220,14 +220,34 @@ test "version: a guest manifest from a non-release build says its commit is unkn
     try std.testing.expect(std.mem.indexOf(u8, s, "\"min_macos\": \"26.2.1\"") != null);
 }
 
-test "version: every guest model type is one the loader serves" {
-    const served = @import("model.zig").served_model_types;
-    for (guest_model_types) |t| {
-        const found = for (served) |s| {
-            if (std.mem.eql(u8, s, t)) break true;
+test "version: the guest manifest routes the supported architectures the build serves and never an unsupported one" {
+    const t = std.testing;
+    const s = try guestManifestFor(.{
+        .version = "1.0.0",
+        .commit = "",
+        .mlx = "0.32.2",
+        .mlx_sha = "1f8e74e3f12f",
+        .mlx_c_sha = "56b2d39fc831",
+        .min_macos = .{ .major = 26, .minor = 2, .patch = 0 },
+    });
+    defer t.allocator.free(s);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, s, .{});
+    defer parsed.deinit();
+    const listed = parsed.value.object.get("model_types").?.array.items;
+    const served = registry.served_model_types;
+    for (listed) |name| try t.expect(for (served) |m| {
+        if (std.mem.eql(u8, m, name.string)) break true;
+    } else false);
+    for ([_][]const u8{ "qwen4_exp", "glm5_next", "deepseek_v41" }) |supported| {
+        const built = for (served) |m| {
+            if (std.mem.eql(u8, m, supported)) break true;
         } else false;
-        try std.testing.expect(found);
+        const named = for (listed) |name| {
+            if (std.mem.eql(u8, name.string, supported)) break true;
+        } else false;
+        try t.expectEqual(built, named);
     }
+    for (listed) |name| try t.expect(!std.mem.eql(u8, name.string, "mimo_v2"));
 }
 
 test "version: the guest manifest lists exactly the (format, codebook) pairs the pack parser admits" {

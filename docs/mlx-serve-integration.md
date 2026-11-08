@@ -103,13 +103,12 @@ Sushi's weight-map binding of the trunk (`load`, `drop`, `view`) is `src/trunk_s
 Every `pub` inside a kernel file that the tables do not list (kernel sources, fixtures, `*_for_test`) is an internal
 the arch folders and tests use; it may change in any release.
 
-## Deprecated aliases
+## Renamed names
 
-The unit names no architecture: files and public names say what the code does or the geometry it serves. The old names
-stay as aliases for one release (`root.zig`, and the declaring file for a declaration inside one); the CHANGELOG
-announces them, and the aliases are removed after that release.
+The unit names no architecture: files and public names say what the code does or the geometry it serves. The old
+names are those of 1.5.1 and earlier; 1.6.0 keeps no alias for them, so a host renames them when it re-vendors.
 
-| old name | new name |
+| 1.5.1 name | name now |
 |---|---|
 | `glm_group2` | `coop_rows2` |
 | `glm_fold` | `fold_clamped` |
@@ -190,7 +189,9 @@ copy builds as module `sushi_exl3` with one import, `mlx_host`, which re-exports
 mlx-serve's own host root. It has diverged from `src/exl3` (Metal sources in `.metal` files, its own host env).
 
 Sushi 1.3.0 already had the STQ experts: `codebook_tables`, `rate_groups`, `layout` (`group_layout`), `glm_group2` and
-`glm_prefill_grid`. What the copy lacks is everything after 1.3.0:
+`glm_prefill_grid`. Those two root names, and `Codebook.servesGlmFastPaths` inside their files, are the only 1.5.1 names
+the copy uses (mlx-serve at v26.11.2, nothing outside the vendored folder names them); a re-vendor renames them to the
+table above. What the copy lacks is everything after 1.3.0:
 
 - the trunk contract: `linear`, `trunk_gemm`, `project_rows`, `trunk`, `fuse`, `pack`;
 - `kernel_source`, `sorted_windows`, `shared_trellis`, the folds and riders;

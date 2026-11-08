@@ -123,7 +123,7 @@ pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   `glm5_generate.glmChunkEnd` keeps the tail merge from absorbing a grid point, so the billed count is the captured count.
 - **Bills.** A GLM request holds up to 9 checkpoints during prefill (the cap plus the copy taken before each thin)
   and one assistant window; a prefill that writes through holds 2 (`WarmPrefix.released`, decided by the scheduler's
-  `glmCheckpointsRelease`, the same answer that arms the hook). The commit moment is billed beside the live cache (`glmCommitStateBytes`): the RAM
+  `checkpointsRelease`, the same answer that arms the hook). The commit moment is billed beside the live cache (`glmCommitStateBytes`): the RAM
   tier's row copy (at most its budget; the SSD tier copies none), the checkpoints and the window, whichever of that
   and the prefill's transient is larger. At 1M tokens it is the smaller, so it costs no checkpoints. The writer's
   permit (the previous request's staged flush) is not billed: it is pageable host memory outside the wired limit

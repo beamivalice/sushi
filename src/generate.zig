@@ -414,9 +414,9 @@ pub const SpecWindow = struct { snapshot: trunk.KVCacheSnapshot, base_pos: usize
 
 /// A prefill checkpoint at absolute `pos`: the slot's SSM entries, the GLM request's KDA state, or DeepSeek's whole request state.
 /// `to_ssd`: a write-through takes the point to the SSD tier before the next forward, so DeepSeek's shares its rows.
-fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *const ForwardCtx, glm: ?*arch_state.SlotRequest, pos: usize, to_ssd: bool) !SSMCheckpoint {
+fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *const ForwardCtx, arch_request: ?*arch_state.SlotRequest, pos: usize, to_ssd: bool) !SSMCheckpoint {
     if (try prefix_arch.captureCheckpoint(allocator, xfm, pos, to_ssd)) |cp| return cp;
-    if (glm) |request| return prefix_arch.captureRequest(allocator, request, pos, xfm.s);
+    if (arch_request) |request| return prefix_arch.captureRequest(allocator, request, pos, xfm.s);
     return captureSsmCheckpoint(allocator, ctx.ssm_entries.?, pos, xfm.s);
 }
 
@@ -1371,10 +1371,10 @@ pub const Generator = struct {
             ssm_checkpoints.deinit(allocator);
         }
         const has_vision = ctx.vision_embeddings != null;
-        const glm_request = arch_state.requestOf(&ctx);
+        const arch_request = arch_state.requestOf(&ctx);
         const want_ssm_cp = prefill_plan.shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
-            (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null or prefix_arch.restorePointModel(xfm),
+            (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or arch_request != null or prefix_arch.restorePointModel(xfm),
             has_vision,
         );
         // The snapshot backoff: a checkpoint AT the prompt end is
@@ -1393,13 +1393,13 @@ pub const Generator = struct {
         // on stride boundaries, so a capped chunk stays compatible.
         const ssm_cp_stride: usize = if (!want_ssm_cp)
             0
-        else if (glm_request != null)
+        else if (arch_request != null)
             prefix_arch.requestCheckpointStride()
         else
             prefill_plan.effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, settings_resolve.prefill_chunk.value));
         // Where a checkpoint is captured: GLM chunks on its chunk grid but keeps points only on the wider
         // restore-point grid.
-        const cp_grid: usize = if (glm_request != null and want_ssm_cp) prefix_arch.requestCaptureStride() else ssm_cp_stride;
+        const cp_grid: usize = if (arch_request != null and want_ssm_cp) prefix_arch.requestCaptureStride() else ssm_cp_stride;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
         // scheduler after restoring a checkpoint) pass the matched prefix
         // length so the snapshots stamp positions valid in the full original
@@ -1491,7 +1491,7 @@ pub const Generator = struct {
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
-            const snapshot_backoff = if (glm_request != null and want_state_cp)
+            const snapshot_backoff = if (arch_request != null and want_state_cp)
                 prefix_arch.requestCaptureBackoff(options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len)
             else
                 prefill_plan.ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
@@ -1527,7 +1527,7 @@ pub const Generator = struct {
             // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
             // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
             const cp_thin: trunk.ThinPolicy =
-                if (xfm.config.longCtxGated() or glm_request != null) .min_span_recency else .oldest;
+                if (xfm.config.longCtxGated() or arch_request != null) .min_span_recency else .oldest;
 
             const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, s);
             // The arch's own per-request buffers reserve at the same length.
@@ -1595,7 +1595,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = if (glm_request != null)
+                const end = if (arch_request != null)
                     prefix_arch.requestChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                 else
                     prefill_plan.nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
@@ -1747,8 +1747,8 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and cp_grid > 0 and abs_end_for_cp2 % cp_grid == 0 and prefix_arch.restorableCheckpoint(glm_request, abs_end_for_cp2)) {
-                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2, options.write_through_hook != null);
+                if (want_ssm_cp and cp_grid > 0 and abs_end_for_cp2 % cp_grid == 0 and prefix_arch.restorableCheckpoint(arch_request, abs_end_for_cp2)) {
+                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, arch_request, abs_end_for_cp2, options.write_through_hook != null);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
                         doomed.deinit(allocator);
@@ -1855,13 +1855,13 @@ pub const Generator = struct {
                 // to be a stride multiple).
                 const already_have = ssm_checkpoints.items.len > 0 and
                     ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos == final_abs;
-                if (!already_have and prefix_arch.restorableCheckpoint(glm_request, final_abs)) {
+                if (!already_have and prefix_arch.restorableCheckpoint(arch_request, final_abs)) {
                     // SSM state is already materialized — the chunked loop
                     // evaluated it at every chunk boundary. The final chunk
                     // may have been a stride-aligned one (already evaluated)
                     // or a partial tail (also evaluated). The snapshot is a
                     // cheap refcount-share.
-                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, final_abs, options.write_through_hook != null);
+                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, arch_request, final_abs, options.write_through_hook != null);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
                         doomed.deinit(allocator);
