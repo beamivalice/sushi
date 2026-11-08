@@ -717,6 +717,28 @@ fn writePart(path: []const u8, bytes: []const u8, part: Part) !void {
     final_buf[path.len] = 0;
     const final: [:0]const u8 = final_buf[0..path.len :0];
     if (std.c.rename(tmp.ptr, final.ptr) != 0) return error.RenameFailed;
+    noteLanding();
+}
+
+var landings: std.atomic.Value(u64) = .init(0);
+var crash_after_read: bool = false;
+var crash_after: ?u64 = null;
+
+pub fn parseCrashAfter(raw: ?[*:0]const u8) ?u64 {
+    const v = raw orelse return null;
+    const k = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return null;
+    return if (k == 0) null else k;
+}
+
+/// Test seam, `SUSHI_TEST_CRASH_AFTER_LANDINGS=k`: the process is killed once k files have landed, so a crash
+/// test can cut the writer between two renames.
+fn noteLanding() void {
+    if (!crash_after_read) {
+        crash_after = parseCrashAfter(std.c.getenv("SUSHI_TEST_CRASH_AFTER_LANDINGS"));
+        crash_after_read = true;
+    }
+    const k = crash_after orelse return;
+    if (landings.fetchAdd(1, .monotonic) + 1 == k) _ = std.c.kill(std.c.getpid(), .KILL);
 }
 
 // ── Tests ──
@@ -1457,4 +1479,12 @@ test "kv_disk_writer op: deinit lands what a started writer holds and releases w
     defer idle.deinit();
     try submitFakeOp(&idle, &fake, "c", 2, 64, .kv);
     try testing.expectEqualSlices(u64, &.{2}, fake.aborted.items);
+}
+
+test "parseCrashAfter: a positive count arms the seam, anything else leaves it off" {
+    try testing.expectEqual(@as(?u64, null), parseCrashAfter(null));
+    try testing.expectEqual(@as(?u64, null), parseCrashAfter(""));
+    try testing.expectEqual(@as(?u64, null), parseCrashAfter("0"));
+    try testing.expectEqual(@as(?u64, null), parseCrashAfter("x3"));
+    try testing.expectEqual(@as(?u64, 17), parseCrashAfter("17"));
 }

@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 147 vars. By kind: tradeoff levers 14, diagnostics 52, microbenches 19, test-only seams 52, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 149 vars. By kind: tradeoff levers 14, diagnostics 53, microbenches 19, test-only seams 53, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (52)
+## Diagnostics (53)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -56,6 +56,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DSV41_HEAD_ROWS` | `kld_capture.zig` | `1` the layer-major capture also writes `calib/head-in.bf16`, the head's input for every row | once | yes: quality-kld |
 | `SUSHI_DFLASH_TRACE` | `generate.zig:4016` | `1` per-phase DFlash round wall-time trace | once | no |
 | `SUSHI_DISPATCH_PROBE` | `trunk.zig:4334` | `<n>` injects n small dependent dispatches per MoE layer to price a dispatch | once | yes: mimo2-perf, tests/CLAUDE |
+| `SUSHI_RESTORE_TAPE` | `restore_tape.zig` | `<abs file>` appends a JSONL row per lookup (what was restored, a SHA-256 per state family), per SSD flush (the tier's records) and per finished request (generated ids); the proof two builds restore the same bytes (`tests/diff_restore_tape.py`, `tests/replay_ssd_writes.py`) | once | yes: engine-prefix-cache, tests/CLAUDE |
 | `SUSHI_DUMP_RESTORE` | `restore_dump.zig:31` | `<dir>` dumps prefix-restore tensors | once | no |
 | `SUSHI_EXL3_STAGE_PROFILE` | `exl3/expert_exl3_kernels.zig:108` | syncs and times each stage of a routed MoE layer (pair GEMV, down, reduce, sort, token prepare, GEMMs), logged as `[exl3-stage]` | once | yes: engine-exl3-experts |
 | `SUSHI_EXL3_SWIGLU_MAXABS` | `exl3/expert_exl3_kernels.zig:130` | dumps SwiGLU activation maxima (f16 overflow hunt) | once | yes: engine-exl3-experts |
@@ -97,7 +98,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_LEVER`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `model_load.zig` | `<n>` cold one-chunk prefills per arm at load, the untimed first one logged; arm list; `decoded`: arm 0 keeps the trunk on the sorted GEMM instead of the NAX reference body; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `qwen4_qsa_gather.zig` | QSA prefill/wide meters | test | no |
 
-## Test-only seams (52)
+## Test-only seams (53)
 
 Inputs and hooks that real-pack tests and scripts use.
 
@@ -113,6 +114,7 @@ Inputs and hooks that real-pack tests and scripts use.
 | `SUSHI_FORCE_BATCHED` | `scheduler.zig:1209` | `1` routes single-slot ticks through the batched kernel (`tests/test_batched_equivalence.sh`) | boot | yes: tests/CLAUDE |
 | `SUSHI_MEMORY_AUDIT_MODEL`, `SUSHI_TOKENIZER_PARITY_FIXTURE` | `bills.zig`, `model_load.zig`, `tokenizer.zig` | memory-bill audit pack and tokenizer parity fixture | test | no |
 | `SUSHI_MLX_FAULT_CHUNK`, `SUSHI_MLX_FAULT_STEP` | `mlx.zig` | `<n>` latches a synthetic Metal OOM at the n-th prefill-chunk check / decode step (`tests/test_mlx_error_recovery.sh`) | once | yes: tests/CLAUDE |
+| `SUSHI_TEST_CRASH_AFTER_LANDINGS` | `kv_disk_writer.zig` (`noteLanding`) | `<k>` kills the process (SIGKILL) once the SSD writer has renamed k files into place, so a crash test cuts the writer between two landings (`tests/replay_ssd_writes.py` flow `crash`) | once | yes: engine-prefix-cache, tests/CLAUDE |
 | `SUSHI_TEST_LOAD_DELAY_MS` | `model_load.zig` (`startupLoadDelayMs`) | `<ms>` holds the `--model` startup load after its refusals, before the weights, so a test can observe the server listening during the load (`tests/test_early_listener.sh`) | load | yes: server-lifecycle, tests/CLAUDE |
 | `SUSHI_MODELS_DIR` | `test_models.zig:7` | root for real-pack tests (`${SUSHI_MODELS_DIR:-~/.sushi/models}`); the engine itself does not read it | test | yes: tests/CLAUDE |
 | `SUSHI_NO_SUCH_DIAG_SWITCH_PROBE` | `trunk.zig` | unit probe that `diagEnvOnCached` honors `0`/empty/set | test | no |

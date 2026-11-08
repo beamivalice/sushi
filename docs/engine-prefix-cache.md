@@ -640,6 +640,27 @@ They count what the filesystem accepted, never what was submitted, and run from 
   kind`, `a failed, dropped or fenced blob`, `a file staged in parts`), `DiskTier write counters:` in `kv_disk_cache.zig`
   and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache write counters` in `metrics.zig`.
 
+## Restore tape and write replay
+
+`SUSHI_RESTORE_TAPE=<abs file>` (`src/restore_tape.zig`, `src/restore_dump.zig`) appends one JSON line per event; off, nothing runs and the engine's output is the
+same bytes. Two tapes of the same flow on equal code are equal, and `tests/diff_restore_tape.py A B` names the first row
+and field that differ, so a change to the cache's storage is proved against a baseline tape.
+
+| row | written | holds |
+|---|---|---|
+| `lookup` | in the scheduler, after the restore and the speculative adoption | request, prompt length and SHA-256, `matched`, tier (`none`, `ram`, `ssd`, `live`), source record id and its token count, the DFlash and MTP bases and whether the request adopted them, a SHA-256 per KV layer over rows `[0, matched)`, one per SSM entry, the DFlash context, the MTP head's KV and aux half, and the arch state (`prefix_arch.stateDigest`: GLM's request, DeepSeek's model state) |
+| `tier` | after the flush of each finished request | every `IndexEntry` (tokens length and SHA-256, `kv_len`, points, rings, QSA rows, spec meta, inherited chunks, `bytes`), `total_bytes`, and the ids in eviction order |
+| `gen` | at each finish | SHA-256 of the generated ids |
+
+- A digest covers an array's dtype, shape and bytes, only the logical rows of a buffer that holds spare capacity, and none
+  of the accelerators a restore rebuilds. A digest that cannot be computed is null or zero, never a failed request.
+- `tests/replay_ssd_writes.py FLOW` drives one flow (agent loop, retry, fork, far divergence, image chain, restart, crash,
+  budget, RAM tier, four GLM conversations, DeepSeek live state, MiMo ring) against private servers, greedy with a fixed
+  seed and one request in flight, and prints the bytes written by kind per request. `--twice` fails unless two runs write
+  one tape; `--max-later-turn-mb` fails when a later turn writes more. The `crash` flow kills the server with `kill -9`
+  once the writer is idle and after the k-th landing (`SUSHI_TEST_CRASH_AFTER_LANDINGS`, counted at the writer's rename).
+- Baselines live in `~/.sushi/runs/pcr-tapes/<commit>/<flow>.tape`, recorded on the tree whose behaviour is the reference.
+
 ## Tier counters
 
 Beside the write counters, `src/cache_stats.zig` keeps process-wide relaxed atomics for the two tiers, rendered by

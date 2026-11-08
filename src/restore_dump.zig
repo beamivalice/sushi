@@ -2,6 +2,13 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
 const log = @import("log.zig");
+const tape = @import("restore_tape.zig");
+const pc = @import("prefix_cache.zig");
+const prefix_arch = @import("arch/prefix.zig");
+const dflash_mod = @import("dflash.zig");
+const generate_mod = @import("generate.zig");
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const KVCache = trunk.KVCache;
 const SSMCacheEntry = trunk.SSMCacheEntry;
@@ -208,6 +215,192 @@ fn putKvTail(map: mlx.mlx_map_string_to_array, key: [:0]const u8, arr: mlx.mlx_a
     try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, tail));
 }
 
+// ── restore tape ─────────────────────────────────────────────────────────
+
+fn feedInt(h: *Sha256, v: anytype) void {
+    h.update(&std.mem.toBytes(std.mem.nativeToLittle(i64, @as(i64, @intCast(v)))));
+}
+
+/// The array's dtype, shape and row-major bytes; an absent array adds a marker so presence is part of the digest.
+pub fn feedArray(h: *Sha256, arr: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    if (arr.ctx == null) return h.update("nil");
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, arr, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    feedInt(h, @intFromEnum(mlx.mlx_array_dtype(c)));
+    const shape = mlx.getShape(c);
+    feedInt(h, shape.len);
+    for (shape) |d| feedInt(h, d);
+    const n = @as(usize, mlx.mlx_array_size(c)) * mlx.mlx_array_itemsize(c);
+    if (n == 0) return;
+    const p = mlx.mlx_array_data_uint8(c) orelse return error.NoArrayData;
+    h.update(p[0..n]);
+}
+
+/// `feedArray` of the first `rows` entries along `axis` (all of them when the array holds fewer).
+pub fn feedRows(h: *Sha256, arr: mlx.mlx_array, axis: usize, rows: usize, s: mlx.mlx_stream) !void {
+    if (arr.ctx == null) return h.update("nil");
+    const shape = mlx.getShape(arr);
+    if (axis >= shape.len or shape.len > 8 or rows >= @as(usize, @intCast(shape[axis]))) return feedArray(h, arr, s);
+    const start: [8]c_int = @splat(0);
+    var stop: [8]c_int = undefined;
+    const strides: [8]c_int = @splat(1);
+    @memcpy(stop[0..shape.len], shape);
+    stop[axis] = @intCast(rows);
+    var cut = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cut);
+    try mlx.check(mlx.mlx_slice(&cut, arr, &start, shape.len, &stop, shape.len, &strides, shape.len, s));
+    try feedArray(h, cut, s);
+}
+
+/// One KV layer over the rows `[0, matched)` of the prompt; `matched` counts from absolute position 0, so a ringed
+/// layer's first `base` rows are absent from its storage.
+fn feedKvEntry(h: *Sha256, e: *const trunk.KVCacheEntry, matched: usize, s: mlx.mlx_stream) !void {
+    if (!e.initialized) return h.update("uninit");
+    feedInt(h, e.offset);
+    feedInt(h, e.base);
+    // The storage buffers, not the views: a restore fills the buffers and a view exists only after the next append.
+    const rows = @min(matched -| e.base, e.offset);
+    inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |a| {
+        try feedRows(h, a, 2, rows, s);
+    }
+}
+
+fn kvLayerHex(cache: *const KVCache, layer: usize, matched: usize, s: mlx.mlx_stream) !tape.Hex {
+    var h = Sha256.init(.{});
+    try feedKvEntry(&h, &cache.entries[layer], matched, s);
+    return tape.hex(h.finalResult());
+}
+
+fn kvWholeHex(cache: *const KVCache, matched: usize, s: mlx.mlx_stream) !tape.Hex {
+    var h = Sha256.init(.{});
+    feedInt(&h, cache.step);
+    for (cache.entries) |*e| try feedKvEntry(&h, e, matched, s);
+    return tape.hex(h.finalResult());
+}
+
+/// One SSM entry: the recurrent pair, the aux state, the pooled bank to its logical rows, and the PLE tail.
+pub fn feedSsmEntry(h: *Sha256, e: *const SSMCacheEntry, s: mlx.mlx_stream) !void {
+    feedInt(h, @intFromBool(e.initialized));
+    try feedArray(h, e.conv_state, s);
+    try feedArray(h, e.ssm_state, s);
+    try feedArray(h, e.aux_state, s);
+    const ratio = @max(e.qsa_ratio, 1);
+    const hist: c_int = @max(e.qsa_hist_rows, 0);
+    feedInt(h, hist);
+    feedInt(h, ratio);
+    try feedRows(h, e.qsa_pooled, 1, @intCast(@divTrunc(hist, ratio)), s);
+    feedInt(h, @intFromBool(e.ple_prev_valid));
+    h.update(std.mem.sliceAsBytes(e.ple_prev[0..]));
+}
+
+fn ssmLayerHex(e: *const SSMCacheEntry, s: mlx.mlx_stream) !tape.Hex {
+    var h = Sha256.init(.{});
+    try feedSsmEntry(&h, e, s);
+    return tape.hex(h.finalResult());
+}
+
+pub const TapeLookup = struct {
+    hc: *const pc.HotPrefixCache,
+    request: u64,
+    prompt: []const u32,
+    matched: usize,
+    cache: *const KVCache,
+    rec: pc.Recurrent,
+    dflash: ?*const dflash_mod.DflashCtx,
+    dflash_base: ?usize,
+    mtp: ?*const generate_mod.MtpCacheRef,
+    mtp_base: ?usize,
+    entry_id: u64,
+    s: mlx.mlx_stream,
+};
+
+pub fn tapeOn() bool {
+    return tape.on();
+}
+
+fn tapeWrite(comptime emit: anytype, args: anytype) void {
+    var out: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer out.deinit();
+    @call(.auto, emit, .{&out.writer} ++ args) catch return;
+    tape.append(out.written());
+}
+
+/// Appends the `lookup` row; a digest that cannot be computed is a null or zero field, never a failed request.
+pub fn tapeLookup(a: TapeLookup) void {
+    const gpa = std.heap.page_allocator;
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    const hc = a.hc;
+    const tier: []const u8 = if (a.matched == 0) "none" else if (hc.last_restored_live) "live" else if (hc.last_restored_disk_id != null) "ssd" else "ram";
+    var source_id: u64 = 0;
+    var source_tokens: ?usize = null;
+    if (a.matched > 0 and !hc.last_restored_live) {
+        if (hc.last_restored_disk_id) |id| {
+            source_id = id;
+            if (hc.disk) |*d| for (d.entries.items) |e| if (e.id == id) {
+                source_tokens = e.tokens.len;
+            };
+        } else if (a.entry_id != 0) {
+            source_id = a.entry_id;
+            for (hc.entries.items) |e| if (e.id == a.entry_id) {
+                source_tokens = e.tokens.len;
+            };
+        }
+    }
+    var row: tape.Lookup = .{
+        .seq = tape.nextSeq(),
+        .request = a.request,
+        .prompt_len = a.prompt.len,
+        .prompt_sha = tape.idsHex(a.prompt),
+        .matched = a.matched,
+        .tier = tier,
+        .source_id = source_id,
+        .source_tokens = source_tokens,
+        .dflash = .{ .base = a.dflash_base, .adopted = a.dflash != null },
+        .mtp = .{ .base = a.mtp_base, .adopted = a.mtp != null },
+    };
+    const kv = gpa.alloc(tape.Hex, a.cache.entries.len) catch return;
+    defer gpa.free(kv);
+    var ssm: []tape.Hex = &.{};
+    defer if (ssm.len > 0) gpa.free(ssm);
+    if (a.matched > 0) {
+        for (kv, 0..) |*slot, i| slot.* = kvLayerHex(a.cache, i, a.matched, a.s) catch std.mem.zeroes(tape.Hex);
+        row.kv = kv;
+        if (a.rec == .ssm) {
+            ssm = gpa.alloc(tape.Hex, a.rec.ssm.len) catch &.{};
+            for (ssm, a.rec.ssm) |*slot, *e| slot.* = ssmLayerHex(e, a.s) catch std.mem.zeroes(tape.Hex);
+            row.ssm = ssm;
+        }
+        if (a.rec == .arch) {
+            var h = Sha256.init(.{});
+            if (prefix_arch.stateDigest(a.rec.arch, &h, a.s)) |_| row.arch = tape.hex(h.finalResult()) else |_| {}
+        }
+        if (a.dflash) |d| row.dflash_ctx = kvWholeHex(&d.cache, std.math.maxInt(usize), a.s) catch null;
+        if (a.mtp) |m| {
+            if (m.kv()) |k| row.mtp_kv = kvWholeHex(k, std.math.maxInt(usize), a.s) catch null;
+            if (m.head()) |head| {
+                var h = Sha256.init(.{});
+                if (prefix_arch.headDigest(head, &h, a.s)) |done| {
+                    if (done) row.mtp_head = tape.hex(h.finalResult());
+                } else |_| {}
+            }
+        }
+    }
+    tapeWrite(tape.writeLookup, .{row});
+}
+
+/// Appends the `tier` row: the SSD records after a flush.
+pub fn tapeTier(hc: *const pc.HotPrefixCache, request: u64) void {
+    const d = hc.disk orelse return;
+    tapeWrite(tape.writeTier, .{ std.heap.page_allocator, request, d.entries.items, d.total_bytes });
+}
+
+pub fn tapeGen(request: u64, ids: []const u32, finish: []const u8) void {
+    tapeWrite(tape.writeGen, .{ request, ids, finish });
+}
+
 test "dumpRestoreDirFromEnv: absent or 0 is off" {
     try std.testing.expect(dumpRestoreDirFromEnv(null) == null);
     try std.testing.expect(dumpRestoreDirFromEnv("0") == null);
@@ -215,4 +408,34 @@ test "dumpRestoreDirFromEnv: absent or 0 is off" {
     const on = dumpRestoreDirFromEnv("/tmp/restore-dump");
     try std.testing.expect(on != null);
     try std.testing.expectEqualStrings("/tmp/restore-dump", on.?);
+}
+
+test "tape digest: a layer's hash is stable, per layer, and moves with the rows and the stored length" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var short = try KVCache.init(std.testing.allocator, 3);
+    defer short.deinit();
+    var long = try KVCache.init(std.testing.allocator, 3);
+    defer long.deinit();
+    try pc.testFillCache(&short, s, 3, 8);
+    try pc.testFillCache(&long, s, 3, 12);
+    var layer_hex: [3]tape.Hex = undefined;
+    for (&layer_hex, 0..) |*slot, i| {
+        slot.* = try kvLayerHex(&short, i, 8, s);
+        try std.testing.expect(!std.mem.eql(u8, slot, &(try kvLayerHex(&long, i, 8, s))));
+    }
+    try std.testing.expect(!std.mem.eql(u8, &layer_hex[0], &layer_hex[1]));
+    try std.testing.expect(!std.mem.eql(u8, &layer_hex[0], &(try kvLayerHex(&short, 0, 7, s))));
+    var again = try KVCache.init(std.testing.allocator, 3);
+    defer again.deinit();
+    try pc.testFillCache(&again, s, 3, 8);
+    for (layer_hex, 0..) |want, i| try std.testing.expectEqualSlices(u8, &want, &(try kvLayerHex(&again, i, 8, s)));
+    // A restore fills the storage buffers and leaves the views empty until the next append.
+    for (again.entries) |*e| {
+        inline for (.{ &e.key_view, &e.value_view, &e.key_scales_view, &e.key_biases_view, &e.value_scales_view, &e.value_biases_view }) |v| {
+            _ = mlx.mlx_array_free(v.*);
+            v.* = mlx.mlx_array_new();
+        }
+    }
+    for (layer_hex, 0..) |want, i| try std.testing.expectEqualSlices(u8, &want, &(try kvLayerHex(&again, i, 8, s)));
 }

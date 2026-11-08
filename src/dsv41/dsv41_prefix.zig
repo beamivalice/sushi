@@ -18,6 +18,7 @@ const log = @import("../log.zig");
 const pc = @import("../prefix_cache.zig");
 const kv_quant = @import("../kv_quant.zig");
 const prefix_arch = @import("../arch/prefix.zig");
+const restore_dump = @import("../restore_dump.zig");
 const dsv41_state = @import("dsv41_state.zig");
 
 /// The model whose request state a lookup restores into.
@@ -38,6 +39,18 @@ pub fn liveBytes(hc: *pc.HotPrefixCache) u64 {
 
 pub fn reset(m: State) void {
     dsv41_model.resetState(m);
+}
+
+/// The model's state at its position as a restore tape digests it: the arrays a restore point holds.
+pub fn stateDigest(m: State, h: *std.crypto.hash.sha2.Sha256, _: mlx.mlx_stream) !void {
+    const st = try model.ensureState(m);
+    h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, st.n)));
+    const slots = try m.gpa.alloc(model.Slot, model.slotCount(m));
+    defer m.gpa.free(slots);
+    @memset(slots, model.nil_slot);
+    try model.captureStateShared(m, slots);
+    defer for (slots) |*sl| model.freeSlot(sl);
+    for (slots) |sl| for (sl) |a| try restore_dump.feedArray(h, a, m.s);
 }
 
 /// The request state is a checkpoint: without checkpoints nothing restores.

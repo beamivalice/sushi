@@ -178,6 +178,24 @@ pub fn reset(s: State) void {
     }
 }
 
+/// Feeds the restored request state into a restore-tape digest; an arch without the hook adds nothing.
+pub fn stateDigest(s: State, h: *std.crypto.hash.sha2.Sha256, st: mlx.mlx_stream) !void {
+    switch (s) {
+        inline else => |p, t| if (comptime isVoid(@TypeOf(p))) unreachable else if (comptime @hasDecl(P(t), "stateDigest")) try P(t).stateDigest(p, h, st),
+    }
+}
+
+/// Feeds the in-checkpoint MTP head's restored state into a restore-tape digest; false when the arch keeps none.
+pub fn headDigest(xfm: *trunk.Trunk, h: *std.crypto.hash.sha2.Sha256, st: mlx.mlx_stream) !bool {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| {
+            if (comptime !@hasDecl(P(t), "headDigest")) return false;
+            try P(t).headDigest(m, h, st);
+            return true;
+        },
+    }
+}
+
 /// The request's state is about to be replaced: what the arch keeps of the last one reaches SSD first.
 pub fn handover(hc: *pc.HotPrefixCache, s: State, st: mlx.mlx_stream) void {
     switch (s) {

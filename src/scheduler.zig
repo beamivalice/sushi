@@ -3607,6 +3607,20 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 }
                 mtp_target = null;
             }
+            if (restore_dump.tapeOn()) restore_dump.tapeLookup(.{
+                .hc = hc,
+                .request = slot.request_id,
+                .prompt = slot.full_prompt,
+                .matched = hot_matched,
+                .cache = &slot.cache,
+                .rec = rec,
+                .dflash = if (dflash_restored) |*d| d else null,
+                .dflash_base = lookup.dflash_base,
+                .mtp = if (mtp_restored) |*m| &m.cache else null,
+                .mtp_base = lookup.mtp_base,
+                .entry_id = lookup.entry_id,
+                .s = xfm_ptr.s,
+            });
         }
     }
 

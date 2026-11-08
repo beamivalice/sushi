@@ -1,6 +1,8 @@
 //! Flash-Next prefix-cache parts: the QSA-history section of an SSD record, the GDN/QSA accelerators on an SSM
 //! entry, and the adoption of a committed MTP head. Reached through `arch/prefix.zig`.
 const std = @import("std");
+const mlx = @import("../mlx.zig");
+const restore_dump = @import("../restore_dump.zig");
 const trunk_mod = @import("../trunk.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const pc = @import("../prefix_cache.zig");
@@ -68,4 +70,16 @@ pub fn adoptSpecHead(xfm: *trunk_mod.Trunk, plan: pc.SpecAdopt, snap: *const pc.
     base_pos.* = snap.base_pos;
     log.info("  [qwen4] MTP head restored ({d} tokens from base {d})\n", .{ want, snap.base_pos });
     return snap.base_pos;
+}
+
+/// The restored head state a restore tape digests: its QSA aux half, its position bookkeeping and its marks.
+pub fn headDigest(xfm: *trunk_mod.Trunk, h: *std.crypto.hash.sha2.Sha256, s: mlx.mlx_stream) !void {
+    const m = &(xfm.arch_state.qwen4.mtp orelse return);
+    h.update(std.mem.asBytes(&std.mem.nativeToLittle(i64, @intCast(m.seq_offset))));
+    h.update(std.mem.asBytes(&std.mem.nativeToLittle(i64, m.pos_base)));
+    try restore_dump.feedSsmEntry(h, &m.entry, s);
+    for (m.qsa_marks.slice()) |mark| {
+        h.update(std.mem.asBytes(&std.mem.nativeToLittle(i64, mark.pos)));
+        try restore_dump.feedArray(h, mark.rows, s);
+    }
 }

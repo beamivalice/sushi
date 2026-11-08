@@ -11,6 +11,7 @@ const io_util = @import("io_util.zig");
 const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
+const restore_dump = @import("restore_dump.zig");
 const Generator = generate_mod.Generator;
 const LoadedModel = model_registry_mod.LoadedModel;
 const degenerate = @import("degenerate.zig");
@@ -309,6 +310,7 @@ pub fn finishSpecAtCleanup(slot: anytype) void {
 }
 
 pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+    if (restore_dump.tapeOn()) restore_dump.tapeGen(slot.request_id, if (slot.legacy_gen) |*g| g.generated_ids.items else &.{}, reason);
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
@@ -348,6 +350,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
             hc.flushPendingDisk(s);
+            if (restore_dump.tapeOn()) restore_dump.tapeTier(hc, slot.request_id);
             // After the flush, so this turn's entry is the MRU one and any entry spilled
             // already has a complete copy to spill into.
             hc.spillIdleEntries(s);

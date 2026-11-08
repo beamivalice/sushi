@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const forward = @import("glm5_forward.zig");
+const restore_dump = @import("../restore_dump.zig");
 const trunk_mod = @import("../trunk.zig");
 const Arr = mlx.mlx_array;
 const KVQuantConfig = @import("../kv_quant.zig").KVQuantConfig;
@@ -26,6 +27,21 @@ pub const State = *forward.Request;
 
 pub fn reset(request: State) void {
     request.reset();
+}
+
+/// The request as a restore tape digests it: the KDA pair of every layer and the MLA rows below `processed`.
+pub fn stateDigest(request: State, h: *std.crypto.hash.sha2.Sha256, s: mlx.mlx_stream) !void {
+    h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, request.offset)));
+    h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, request.latent_bits)));
+    for (request.layers) |*layer| {
+        const a = &layer.attention;
+        h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, a.processed)));
+        try restore_dump.feedArray(h, layer.recurrent.conv_state, s);
+        try restore_dump.feedArray(h, layer.recurrent.ssm_state, s);
+        for ([_]Arr{ a.latent, a.latent_scales, a.latent_biases }) |rows| try restore_dump.feedRows(h, rows, 0, a.processed, s);
+        try restore_dump.feedRows(h, a.pooled, 0, a.processed / pool_size, s);
+        for ([_]Arr{ a.tail_keys, a.tail_gates, a.pool_tail }) |tail| try restore_dump.feedArray(h, tail, s);
+    }
 }
 
 pub const pool_size: usize = 4;
