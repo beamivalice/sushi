@@ -53,10 +53,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   rank-local tiles, not trailing padding on the full tensor. Tensor-parallel 4 is solved from geometry.
 - **A MiMo EXL3 pack serves RESIDENT**: see [engine-exl3-experts](engine-exl3-experts.md#mimo). The trunk takes
   the source loader (`usesMimoSourceTrunk`), billed as stored by `mimoSourceResidentBytes`.
-- **A load holds ONE 2-bit coarse copy of the lm_head** (`Transformer.lm_head_coarse`, ~0.19 GB, billed with or
-  without MTP, `model_load.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it,
-  so a greedy argmax is the same with MTP or without ([engine-mtp](engine-mtp.md#greedy-shortlist)). A streamed load
-  keeps it too, billed as trunk in the SSD budget ledger.
+- **A load holds ONE 2-bit coarse copy of the lm_head** (~0.19 GB, billed with or without MTP,
+  `model_load.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it, so a greedy
+  argmax is the same with MTP or without ([engine-mtp](engine-mtp.md#greedy-shortlist)). A streamed load keeps it too,
+  billed as trunk in the SSD budget ledger. The copy and its one-time log line live in the shortlist cell of
+  `Trunk.arch_state.mimo2` (`mimo2_state.zig`), a heap object the state points at because a readout holds
+  `*const Trunk`; `mimo_mtp.buildCoarseHead` fills it, at load or at the heads' first draft.
+- **What MiMo keeps off the trunk**: `mimo2_state.State` (the shortlist cell; `State.init` also starts a streamed
+  load's expert engine) and the readout itself (`mimo2_shortlist.zig`, reached through `arch_state.headShortlist`).
+  Its routing rules are the `moe` struct of `arch.zig`, which the trunk's MoE family asks through `arch/moe.zig`:
+  the f32 router (`mimoRouterLogits`), the bias routing (`computeMimoRouting`) and the source trunk's router widened
+  to f32 at load (`widensRouter`). `trunk.zig` imports no `src/mimo2/` file.
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`): a MiMo pack read without its source trunk
   binds the raw FP8 fused QKV and its logits stop following the routed experts (two packs sharing a hard-linked
   trunk produced bit-identical logits until `kld` took the served loader).

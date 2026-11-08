@@ -27,7 +27,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `kv_cache.zig` / `ssm_cache.zig` / `layer_weights` / `forward_diag` / `test_support` | KV/SSM caches, quant resolution, layer weights, `diagEnvOn` | arch-*, engine-* |
 | `nax_gate` / `attn_kernels` / `verify_qmm` / `verify_moe` / `moe_router` / `moe_gqmv` / `moe_stream_compute` | NAX/OS gates; shared attention; verify QMM and MoE; router; gather-QMV; streamed-expert compute | engine-kernels |
 | `qwen4/qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections, PLE / QSA | qwen4-arch, engine-mtp |
-| `mimo2/mimo_forward.zig` | MiMo forward, attention arms, MoE dispatch, batched decode | mimo2-arch |
+| `mimo2/mimo_forward.zig` / `mimo2_shortlist.zig` | MiMo forward, attention arms, MoE dispatch, batched decode; the greedy lm-head shortlist | mimo2-arch, engine-mtp |
 | `glm5/glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, kernels, prefix state, vision | glm5-* |
 | `dsv41/dsv41_*.zig` / `dspark_rows.zig` / `expert_usage.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1 loader, forward, QAT, Engram, stream hooks, prefill borrow, prefix state, vision; DSpark width; `--drop-expert` list, pre-tokenizer | dsv41-arch, dsv41-memory |
 | `qwen4/qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side, fused HC prefill | qwen4-arch |

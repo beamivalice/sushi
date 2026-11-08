@@ -17,7 +17,6 @@ const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
 
-const mimo_forward = @import("mimo2/mimo_forward.zig");
 const qwen4_forward = @import("qwen4/qwen4_forward.zig");
 const qwen4_qsa = @import("qwen4/qwen4_qsa.zig");
 const qwen4_hc = @import("qwen4/qwen4_hc.zig");
@@ -30,7 +29,6 @@ const qwen4_fixture_test = @import("qwen4/qwen4_fixture_test.zig");
 const qwen4_gdn = @import("qwen4/qwen4_gdn.zig");
 const kv_cache = @import("kv_cache.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
-const mimo2_state = @import("mimo2/mimo2_state.zig");
 const model_handle = @import("model_handle.zig");
 pub const CaptureLayers = model_handle.CaptureLayers;
 pub const ForwardCtx = model_handle.ForwardCtx;
@@ -80,6 +78,7 @@ const arch_request = @import("arch/request.zig");
 const arch_admission = @import("arch/admission.zig");
 const arch_registry = @import("arch/registry.zig");
 const arch_state_mod = @import("arch/arch_state.zig");
+const arch_moe = @import("arch/moe.zig");
 pub const DenseKVView = kv_cache.DenseKVView;
 pub const KVCache = kv_cache.KVCache;
 pub const KVCacheEntry = kv_cache.KVCacheEntry;
@@ -98,7 +97,6 @@ pub const FullAttnWeights = layer_weights.FullAttnWeights;
 pub const HcWeights = layer_weights.HcWeights;
 pub const LinearAttnWeights = layer_weights.LinearAttnWeights;
 const DtypeCastCache = forward_diag.DtypeCastCache;
-pub const MIMO_VERIFY_ROWS_MAX = mimo_forward.MIMO_VERIFY_ROWS_MAX;
 pub const MoeDecodeDispatchArm = moe_gqmv.MoeDecodeDispatchArm;
 pub const MoeLayerWeights = layer_weights.MoeLayerWeights;
 pub const MoeMlpWeights = layer_weights.MoeMlpWeights;
@@ -222,7 +220,6 @@ const maybeTransposeForBf16 = layer_weights.maybeTransposeForBf16;
 pub const layerCap = forward_diag.layerCap;
 const mimoExl3DistinctRouting = test_support.mimoExl3DistinctRouting;
 const mimoExl3ForwardMatchesHost = test_support.mimoExl3ForwardMatchesHost;
-pub const mimoGlobalDecodeRebuildMaxKeys = mimo_forward.mimoGlobalDecodeRebuildMaxKeys;
 pub const nextSsmMemberGen = qwen4_ssm_group.nextSsmMemberGen;
 pub const newEmptyKVEntry = kv_cache.newEmptyKVEntry;
 pub const positionDropIndex = ssm_cache.positionDropIndex;
@@ -338,7 +335,6 @@ pub const ssmSnapshot = ssm_cache.ssmSnapshot;
 pub const ssmSnapshotDeinit = ssm_cache.ssmSnapshotDeinit;
 pub const ssmUnbindAll = ssm_cache.ssmUnbindAll;
 pub const ssmUnbindEntries = ssm_cache.ssmUnbindEntries;
-pub const stackMimoFixtureExperts = mimo_forward.stackMimoFixtureExperts;
 pub const qwen4Standin = qwen4_forward.qwen4Standin;
 const sharedGateRowsEligible = qwen4_forward.sharedGateRowsEligible;
 pub const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
@@ -803,10 +799,6 @@ const TrunkConsts = struct {
     }
 };
 
-/// The greedy shortlist's one-time log and the coarse head it reads: the head's one owner, so a failed shortlist retires
-/// it (`mtp_mod.retireCoarse`) for every reader.
-const ShortlistState = struct { logged: bool = false, coarse: ?mtp_mod.RerankCoarse = null };
-
 /// What a first use fills or a readout retires, behind pointers the trunk owns: a lookup holds `*const Trunk`, which the
 /// compiler may assume is never written, and a pointee is not const. Per trunk, never a module global: several trunks
 /// live at once (a drafter beside its target, resident models). A hand-built trunk has none (null cells): every call
@@ -814,26 +806,20 @@ const ShortlistState = struct { logged: bool = false, coarse: ?mtp_mod.RerankCoa
 const TrunkCells = struct {
     bits_cache: *BitsCache,
     consts: *TrunkConsts,
-    shortlist: *ShortlistState,
 
     fn create(allocator: std.mem.Allocator) !TrunkCells {
         const bits_cache = try allocator.create(BitsCache);
         errdefer allocator.destroy(bits_cache);
         const consts = try allocator.create(TrunkConsts);
-        errdefer allocator.destroy(consts);
-        const shortlist = try allocator.create(ShortlistState);
         bits_cache.* = .{};
         consts.* = .{};
-        shortlist.* = .{};
-        return .{ .bits_cache = bits_cache, .consts = consts, .shortlist = shortlist };
+        return .{ .bits_cache = bits_cache, .consts = consts };
     }
 
     fn destroy(self: TrunkCells, allocator: std.mem.Allocator) void {
         self.consts.deinit();
-        mtp_mod.retireCoarse(&self.shortlist.coarse);
         allocator.destroy(self.bits_cache);
         allocator.destroy(self.consts);
-        allocator.destroy(self.shortlist);
     }
 };
 
@@ -914,9 +900,6 @@ pub const Trunk = struct {
     /// `mtp_depth` through server -> slot -> Generator and reads there like
     /// an explicit flag, so the row-less value needs its own carrier.
     mtp_depth_free: u32 = 0,
-    /// A coarse copy of this lm_head (MiMo, resident): an argmax-only forward shortlists its top-32
-    /// on it and re-scores them through the full head. The MTP heads draft on the same copy, so a
-    /// load with MTP and one without read the same greedy argmax.
     /// Per-token cos|sin rows for the fused QK-norm+RoPE kernel, one slot per
     /// rope family (0 = default/sliding base, 1 = YaRN freqs). Keyed by
     /// offset: every layer of one decode step shares the row, the next token
@@ -1025,7 +1008,6 @@ pub const Trunk = struct {
     // Held by pointer because a lookup holds `*const Trunk` and fills it; null (a hand-built trunk) resolves every call.
     bits_cache: ?*BitsCache = null,
     consts: ?*TrunkConsts = null,
-    shortlist: ?*ShortlistState = null,
 
     // The loaded-model operations live in model_handle.zig; they keep their method names.
     pub const defaultCtx = model_handle.defaultCtx;
@@ -1320,23 +1302,26 @@ pub const Trunk = struct {
 
         // The arch's own state loads after the trunk's weights; nothing below can fail.
         var qwen4_loaded: ?qwen4_state.Loaded = null;
-        var expert_stream: ?*expert_stream_mod.Engine = null;
-        var imatrix: ?*imatrix_capture.Collector = null;
+        var state: arch_state_mod.State = .{};
+        var stream_parts: ?ExpertStreamParts = null;
         if (config.isQwen4()) {
             const q = try qwen4_state.load(allocator, config, weights, prefix, &name_buf, s, &moe_owned_bf16);
             qwen4_loaded = q;
-            if (q.stream) |parts| {
-                expert_stream = parts.engine;
-                imatrix = parts.imatrix;
-            }
-        } else if (config.isMimo()) {
-            if (try mimo2_state.streamParts(allocator, &config, s)) |parts| {
-                expert_stream = parts.engine;
-                imatrix = parts.imatrix;
-            }
+            stream_parts = q.stream;
+        } else {
+            stream_parts = try arch_state_mod.initState(&state, .{
+                .allocator = allocator,
+                .config = &config,
+                .weights = weights,
+                .prefix = prefix,
+                .name_buf = &name_buf,
+                .s = s,
+                .owned_bf16 = &moe_owned_bf16,
+            });
         }
 
         return .{
+            .arch_state = state,
             .config = config,
             .cache = cache,
             .s = s,
@@ -1349,8 +1334,8 @@ pub const Trunk = struct {
             .qwen4 = if (qwen4_loaded) |q| q.state else null,
             .qwen4_mixer = if (qwen4_loaded) |q| q.mixer else null,
             .qwen4_mtp = if (qwen4_loaded) |q| q.mtp else null,
-            .expert_stream = expert_stream,
-            .imatrix = imatrix,
+            .expert_stream = if (stream_parts) |p| p.engine else null,
+            .imatrix = if (stream_parts) |p| p.imatrix else null,
             .lm_head_w = lm_head_w,
             .lm_head_s = lm_head_s,
             .lm_head_b = lm_head_b,
@@ -1380,7 +1365,6 @@ pub const Trunk = struct {
             .moe_owned_bf16 = moe_owned_bf16,
             .bits_cache = cells.bits_cache,
             .consts = cells.consts,
-            .shortlist = cells.shortlist,
             .lm_head_wt = lm_head_wt,
         };
     }
@@ -1552,27 +1536,20 @@ pub const Trunk = struct {
         c.deinit();
     }
 
-    /// The coarse lm_head copy's slot (the shortlist cell's), or null for a trunk without cells.
-    pub fn coarseHead(self: *const Trunk) ?*?mtp_mod.RerankCoarse {
-        return if (self.shortlist) |l| &l.coarse else null;
-    }
-
     /// Gives the trunk its cells, as `initTrunk` does; for a hand-built trunk that needs the lookups cached.
     pub fn attachCells(self: *Trunk) !void {
         std.debug.assert(self.bits_cache == null);
         const cells = try TrunkCells.create(self.allocator);
         self.bits_cache = cells.bits_cache;
         self.consts = cells.consts;
-        self.shortlist = cells.shortlist;
     }
 
     pub fn releaseCells(self: *Trunk) void {
-        if (self.bits_cache) |b| if (self.consts) |c| if (self.shortlist) |l| {
-            (TrunkCells{ .bits_cache = b, .consts = c, .shortlist = l }).destroy(self.allocator);
+        if (self.bits_cache) |b| if (self.consts) |c| {
+            (TrunkCells{ .bits_cache = b, .consts = c }).destroy(self.allocator);
         };
         self.bits_cache = null;
         self.consts = null;
-        self.shortlist = null;
     }
 
     /// The arch-neutral part of `deinit`; the arch frees its own state first (`life.deinit`).
@@ -1651,7 +1628,7 @@ pub const Trunk = struct {
     /// [vocab, hidden] for the embedding lookup), so we project via a lazy transposed
     /// view. Quantized models fall through to the standard gather/qmm path unchanged.
     /// `argmax_only` (the Generator's request-level gate, via ForwardCtx) permits
-    /// MiMo's coarse shortlist (quantized); false = the full head.
+    /// the arch's shortlist readout (`arch_state.headShortlist`); false = the full head.
     pub inline fn lmHeadProject(self: *const Trunk, x: mlx.mlx_array, argmax_only: bool) !mlx.mlx_array {
         if (self.lm_head_s.ctx == null) {
             // Load built the view; a hand-built trunk has none and transposes per call.
@@ -1663,47 +1640,9 @@ pub const Trunk = struct {
             return qmatmulBits(x, if (own.ctx != null) own else self.lm_head_wt, .{}, .{}, 0, 64, .affine, self.s);
         }
         if (argmax_only) {
-            if (try self.lmHeadShortlistFor(x)) |sparse| return sparse;
+            if (try arch_state_mod.headShortlist(self, x)) |sparse| return sparse;
         }
         return self.qmatmul(x, &self.lm_head);
-    }
-
-    /// Argmax-only readout on MiMo: the coarse head's top-32 per row, re-scored through the full head
-    /// (a 32-row slice of the same qmv, so each value is the full readout's), every other id -inf.
-    /// Serial ticks and verify rows take it alike; null keeps the full head.
-    fn lmHeadShortlistFor(self: *const Trunk, x: mlx.mlx_array) !?mlx.mlx_array {
-        const state = self.shortlist orelse return null;
-        const head = state.coarse orelse return null;
-        const bits = head.bits;
-        if (!self.config.isMimo() or !lmHeadShortlistOn()) return null;
-        const xsh = mlx.getShape(x);
-        if (xsh.len != 3 or mlx.mlx_array_dtype(x) != .bfloat16) return null;
-        const n: usize = @intCast(xsh[0] * xsh[1]);
-        if (n < 1 or n > LMHEAD_SHORTLIST_MAX_ROWS) return null;
-        const vocab = head.rows;
-        var x3 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x3);
-        try mlx.check(mlx.mlx_reshape(&x3, x, &[_]c_int{ @intCast(n), 1, xsh[2] }, 3, self.s));
-        var logged = true;
-        var lists: [LMHEAD_SHORTLIST_MAX_ROWS]mtp_mod.Shortlist = undefined;
-        if (!try mtp_mod.rerankShortlistsBatched(self.s, self, &state.coarse, &logged, x3, self.suppress_mask, lists[0..n])) return null;
-        defer for (lists[0..n]) |*sl| sl.deinit();
-        const sparse = try shortlistSparseLogits(self.s, lists[0..n], vocab);
-        defer _ = mlx.mlx_array_free(sparse.idx);
-        defer _ = mlx.mlx_array_free(sparse.logits);
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_reshape(&out, sparse.logits, &[_]c_int{ xsh[0], xsh[1], vocab }, 3, self.s));
-        if (diagEnvOnCached(&lmhead_shortlist_audit_env, "SUSHI_LMHEAD_SHORTLIST_AUDIT")) {
-            const full = try self.qmatmul(x3, &self.lm_head);
-            defer _ = mlx.mlx_array_free(full);
-            try shortlistAudit(self.s, full, sparse.logits, sparse.idx, n, vocab);
-        }
-        if (!state.logged) {
-            state.logged = true;
-            log.info("[lm_head] greedy shortlist engaged: {d}-bit coarse top-32 + full-head re-score (SUSHI_LMHEAD_FULL=1 reads the full head)\n", .{bits});
-        }
-        return out;
     }
 
     /// The trunk's full vocabulary projection of `x` (an MTP head's draft logits).
@@ -2295,7 +2234,6 @@ pub const Trunk = struct {
     pub const AttnVerifyInputs = qwen4_forward.AttnVerifyInputs;
     pub const DeferredQwenMoe = qwen4_forward.DeferredQwenMoe;
     pub const HcRead = qwen4_hc.HcRead;
-    pub const MimoWarmRows = mimo_forward.MimoWarmRows;
     pub const Qwen4MtpBatchRow = qwen4_forward.Qwen4MtpBatchRow;
     pub const Qwen4MtpLive = qwen4_forward.Qwen4MtpLive;
     pub const Qwen4MtpOut = qwen4_forward.Qwen4MtpOut;
@@ -2316,16 +2254,13 @@ pub const Trunk = struct {
     pub const compileMoeRouting = qwen4_forward.compileMoeRouting;
     pub const compileQwen4Hc = qwen4_forward.compileQwen4Hc;
     pub const computeGdnGate = qwen4_gdn.computeGdnGate;
-    pub const computeMimoRouting = mimo_forward.computeMimoRouting;
     pub const conv1dWithCache = qwen4_gdn.conv1dWithCache;
     pub const discardDeferredPle = qwen4_hc.discardDeferredPle;
     pub const flushDeferredPle = qwen4_hc.flushDeferredPle;
     pub const flushDeferredPleGroup = qwen4_hc.flushDeferredPleGroup;
-    pub const forwardMimoBatchedDecode = mimo_forward.forwardMimoBatchedDecode;
     pub const forwardMoeBatchedDecode = qwen4_forward.forwardMoeBatchedDecode;
     pub const forwardMoeBatchedRows = qwen4_forward.forwardMoeBatchedRows;
     pub const forwardMoeBatchedVerify = qwen4_forward.forwardMoeBatchedVerify;
-    pub const forwardMoeWith = mimo_forward.forwardMoeWith;
     pub const forwardQwen4DecodeRows = qwen4_forward.forwardQwen4DecodeRows;
     pub const forwardQwen4VerifyRows = qwen4_forward.forwardQwen4VerifyRows;
     pub const forwardQwen4With = qwen4_forward.forwardQwen4With;
@@ -2356,11 +2291,6 @@ pub const Trunk = struct {
     pub const loadQwen4Mtp = qwen4_forward.loadQwen4Mtp;
     pub const markQsaPooledRopeStale = qwen4_qsa.markQsaPooledRopeStale;
     pub const mergeSsmAcrossSlots = qwen4_ssm_group.mergeSsmAcrossSlots;
-    pub const mimoAttnCore = mimo_forward.mimoAttnCore;
-    pub const mimoAttnWith = mimo_forward.mimoAttnWith;
-    pub const mimoBatchRowsAttn = mimo_forward.mimoBatchRowsAttn;
-    pub const mimoDecodePrep = mimo_forward.mimoDecodePrep;
-    pub const mimoRouterLogits = mimo_forward.mimoRouterLogits;
     pub const moeRoutingClosureCallback = qwen4_forward.moeRoutingClosureCallback;
     pub const mtpHeadForceBatched = qwen4_forward.mtpHeadForceBatched;
     pub const mtpHeadKvQuantEnabled = qwen4_forward.mtpHeadKvQuantEnabled;
@@ -2434,11 +2364,9 @@ pub const Trunk = struct {
     pub const ssmGroupDrop = qwen4_ssm_group.ssmGroupDrop;
     pub const ssmGroupRelease = qwen4_ssm_group.ssmGroupRelease;
     pub const supportsBatchedGdnDecode = qwen4_forward.supportsBatchedGdnDecode;
-    pub const supportsBatchedMimoDecode = mimo_forward.supportsBatchedMimoDecode;
     pub const supportsBatchedQwen4Rows = qwen4_forward.supportsBatchedQwen4Rows;
     pub const verifyQwenMoe = qwen4_forward.verifyQwenMoe;
     pub const verifyRowsJoined = qwen4_forward.verifyRowsJoined;
-    pub const warmupMimoVerify = mimo_forward.warmupMimoVerify;
     pub const yarnScaleQK = qwen4_forward.yarnScaleQK;
     pub const yarnScaleRotated = qwen4_forward.yarnScaleRotated;
 
@@ -3635,8 +3563,7 @@ pub const Trunk = struct {
 
 
     fn moeRouterLogits(self: *Trunk, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
-        const cfg = &self.config;
-        if (std.mem.eql(u8, cfg.model_type, "mimo_v2")) return self.mimoRouterLogits(router_x, mw);
+        if (try arch_moe.routerLogits(self, router_x, mw)) |logits| return logits;
         return mw.router.apply(self.linearCtx(), router_x);
     }
 
@@ -4487,7 +4414,7 @@ pub const Trunk = struct {
             try mlx.check(mlx.mlx_array_set(&weights, given.norm_scores));
             break :blk .{ .inds = ids, .norm_scores = weights };
         } else if (mw.expert_bias) |bias|
-            try self.computeMimoRouting(router_logits, bias)
+            try arch_moe.biasRouting(self, router_logits, bias)
         else
             try self.computeMoeRouting(router_logits, gate_fold);
         defer if (routed.gate_logit.ctx != null) {
@@ -5225,9 +5152,8 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
-                // Routing is f32 (`mimoRouterLogits`): widen once here rather than per
-                // forward. Billed by `mimo_source.countResidentBytes`.
-                if (config.usesMimoSourceTrunk() and mw.router_s.ctx == null and mlx.mlx_array_dtype(mw.router_w) != .float32) {
+                // Routing is f32 (`arch_moe.routerLogits`): widen once here rather than per forward.
+                if (arch_moe.widensRouter(&config) and mw.router_s.ctx == null and mlx.mlx_array_dtype(mw.router_w) != .float32) {
                     var w32 = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_astype(&w32, mw.router_w, .float32, s));
                     try owned_bf16.append(allocator, w32);
@@ -5523,125 +5449,6 @@ pub const GDN_KERNEL_HEADER =
 
 // ── Fused QSA pooled-key upkeep ──
 
-/// `[n, 1, vocab]` bf16 rows holding each shortlist's exact logits at its ids and -inf elsewhere, so
-/// an argmax over a row picks the lowest id among the shortlist's maxima. That is the full row's
-/// argmax whenever the full row's lowest-id maximum is in the shortlist; one outside is the miss the
-/// audit counts. Also returns the `[n, 1, 32]` int32 ids.
-fn shortlistSparseLogits(s: mlx.mlx_stream, lists: []const mtp_mod.Shortlist, vocab: c_int) !struct { logits: mlx.mlx_array, idx: mlx.mlx_array } {
-    const n = lists.len;
-    if (n == 0 or n > LMHEAD_SHORTLIST_MAX_ROWS) return error.ShortlistRowsOutOfRange;
-    var idx_parts: [LMHEAD_SHORTLIST_MAX_ROWS]mlx.mlx_array = @splat(.{ .ctx = null });
-    var val_parts: [LMHEAD_SHORTLIST_MAX_ROWS]mlx.mlx_array = @splat(.{ .ctx = null });
-    defer for (idx_parts[0..n], val_parts[0..n]) |a, b| {
-        if (a.ctx != null) _ = mlx.mlx_array_free(a);
-        if (b.ctx != null) _ = mlx.mlx_array_free(b);
-    };
-    for (lists, 0..) |sl, i| {
-        var ids = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ids);
-        try mlx.check(mlx.mlx_astype(&ids, sl.cands, .int32, s));
-        idx_parts[i] = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&idx_parts[i], ids, &[_]c_int{ 1, 1, 32 }, 3, s));
-        var v = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(v);
-        try mlx.check(mlx.mlx_astype(&v, sl.exact, .bfloat16, s));
-        val_parts[i] = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&val_parts[i], v, &[_]c_int{ 1, 1, 32 }, 3, s));
-    }
-    const iv = mlx.mlx_vector_array_new_data(&idx_parts, n);
-    defer _ = mlx.mlx_vector_array_free(iv);
-    const vv = mlx.mlx_vector_array_new_data(&val_parts, n);
-    defer _ = mlx.mlx_vector_array_free(vv);
-    var idx = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(idx);
-    try mlx.check(mlx.mlx_concatenate_axis(&idx, iv, 0, s));
-    var vals = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(vals);
-    try mlx.check(mlx.mlx_concatenate_axis(&vals, vv, 0, s));
-    const neg_inf = try scalarOf(-std.math.inf(f32), .bfloat16, s);
-    defer _ = mlx.mlx_array_free(neg_inf);
-    var base = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(base);
-    try mlx.check(mlx.mlx_full(&base, &[_]c_int{ @intCast(n), 1, vocab }, 3, neg_inf, .bfloat16, s));
-    var filled = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(filled);
-    try mlx.check(mlx.mlx_put_along_axis(&filled, base, idx, vals, -1, s));
-    return .{ .logits = filled, .idx = idx };
-}
-
-/// Rows an argmax-only shortlist readout serves: a decode tick and every verify width.
-const LMHEAD_SHORTLIST_MAX_ROWS: usize = 16;
-var lmhead_full_env: ?bool = null;
-var lmhead_shortlist_audit_env: ?bool = null;
-
-fn lmHeadShortlistOn() bool {
-    return !diagEnvOnCached(&lmhead_full_env, "SUSHI_LMHEAD_FULL");
-}
-
-/// DIAGNOSTIC (SUSHI_LMHEAD_SHORTLIST_AUDIT=1): every shortlist row also reads the full head and
-/// counts rows whose full argmax is outside the shortlist or differs from the served one.
-const ShortlistAudit = struct {
-    rows: u64 = 0,
-    outside: u64 = 0,
-    differ: u64 = 0,
-    /// Rows where a shortlist logit is not bit-equal to the full head's at that id.
-    inexact: u64 = 0,
-};
-var lmhead_shortlist_audit: ShortlistAudit = .{};
-
-fn shortlistAudit(s: mlx.mlx_stream, full: mlx.mlx_array, sparse: mlx.mlx_array, idx: mlx.mlx_array, n: usize, vocab: c_int) !void {
-    var fa = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(fa);
-    try mlx.check(mlx.mlx_argmax_axis(&fa, full, -1, false, s));
-    var sa = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sa);
-    try mlx.check(mlx.mlx_argmax_axis(&sa, sparse, -1, false, s));
-    var fa32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(fa32);
-    try mlx.check(mlx.mlx_astype(&fa32, fa, .int32, s));
-    var sa32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sa32);
-    try mlx.check(mlx.mlx_astype(&sa32, sa, .int32, s));
-    var f32full = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f32full);
-    try mlx.check(mlx.mlx_astype(&f32full, full, .float32, s));
-    var f32sparse = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f32sparse);
-    try mlx.check(mlx.mlx_astype(&f32sparse, sparse, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(fa32));
-    try mlx.check(mlx.mlx_array_eval(sa32));
-    try mlx.check(mlx.mlx_array_eval(idx));
-    try mlx.check(mlx.mlx_array_eval(f32full));
-    try mlx.check(mlx.mlx_array_eval(f32sparse));
-    const fp = mlx.mlx_array_data_int32(fa32) orelse return;
-    const sp = mlx.mlx_array_data_int32(sa32) orelse return;
-    const ip = mlx.mlx_array_data_int32(idx) orelse return;
-    const lp = mlx.mlx_array_data_float32(f32full) orelse return;
-    const vp = mlx.mlx_array_data_float32(f32sparse) orelse return;
-    const v: usize = @intCast(vocab);
-    for (0..n) |r| {
-        lmhead_shortlist_audit.rows += 1;
-        var inside = false;
-        var exact = true;
-        for (ip[r * 32 ..][0..32]) |c| {
-            inside = inside or c == fp[r];
-            const at = r * v + @as(usize, @intCast(c));
-            exact = exact and vp[at] == lp[at];
-        }
-        if (!inside) lmhead_shortlist_audit.outside += 1;
-        if (!exact) lmhead_shortlist_audit.inexact += 1;
-        if (fp[r] != sp[r]) {
-            lmhead_shortlist_audit.differ += 1;
-            const row = lp[r * v ..][0..v];
-            var second: f32 = -std.math.inf(f32);
-            for (row, 0..) |val, j| if (j != @as(usize, @intCast(fp[r])) and val > second) {
-                second = val;
-            };
-            log.info("[lm_head-audit] argmax differs: full {d} ({d:.4}) served {d}, full top-2 gap {d:.5}, in shortlist {}\n", .{ fp[r], row[@intCast(fp[r])], sp[r], row[@intCast(fp[r])] - second, inside });
-        }
-    }
-    if (lmhead_shortlist_audit.rows % 256 < n) log.info("[lm_head-audit] rows {d}, full argmax outside the shortlist {d}, served argmax differs {d}, shortlist logits not bit-equal {d}\n", .{ lmhead_shortlist_audit.rows, lmhead_shortlist_audit.outside, lmhead_shortlist_audit.differ, lmhead_shortlist_audit.inexact });
-}
 // ── Fused residual add + RMSNorm ──
 //
 // `h = h + branch; normed = rms_norm(h, w)` is two dispatches, and unlike the
@@ -6658,141 +6465,4 @@ test "sushi coder GPU grouped layer matches the original uniform bank" {
     try mlx.check(mlx.mlx_array_eval(a));
     try mlx.check(mlx.mlx_array_eval(b));
     try t.expectEqualSlices(f32, mlx.mlx_array_data_float32(a).?[0..128], mlx.mlx_array_data_float32(b).?[0..128]);
-}
-
-test "argmax-only shortlist rows hold the exact logits at their ids and argmax to the lowest tied id" {
-    const s = mlx.gpuStream();
-    const vocab: c_int = 256;
-    var cand_ids: [2][32]u32 = undefined;
-    var vals: [2][32]u16 = undefined;
-    for (0..32) |j| {
-        cand_ids[0][j] = @intCast(200 - 5 * j);
-        cand_ids[1][j] = @intCast(3 + 7 * j);
-        // Integers and quarters are exact in bf16: the top half of the f32 bits.
-        vals[0][j] = @truncate(@as(u32, @bitCast(-@as(f32, @floatFromInt(j)))) >> 16);
-        vals[1][j] = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(j)) * 0.25)) >> 16);
-    }
-    // Row 0: ids 200 (slot 0) and 45 (slot 31) tie at the max; the lower id wins.
-    vals[0][31] = vals[0][0];
-    var lists: [2]mtp_mod.Shortlist = undefined;
-    for (0..2) |r| {
-        lists[r] = .{
-            .cands = mlx.mlx_array_new_data(&cand_ids[r], &[_]c_int{32}, 1, .uint32),
-            .exact = mlx.mlx_array_new_data(&vals[r], &[_]c_int{ 1, 1, 32 }, 3, .bfloat16),
-            .rows = vocab,
-        };
-    }
-    defer for (&lists) |*sl| sl.deinit();
-    const sparse = try shortlistSparseLogits(s, &lists, vocab);
-    defer _ = mlx.mlx_array_free(sparse.idx);
-    defer _ = mlx.mlx_array_free(sparse.logits);
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, sparse.logits, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(f));
-    const got = (mlx.mlx_array_data_float32(f) orelse return error.Unreadable)[0 .. 2 * 256];
-    for (0..2) |r| {
-        var expect: [256]f32 = @splat(-std.math.inf(f32));
-        for (0..32) |j| expect[cand_ids[r][j]] = @bitCast(@as(u32, vals[r][j]) << 16);
-        try std.testing.expectEqualSlices(f32, &expect, got[r * 256 ..][0..256]);
-    }
-    var am = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(am);
-    try mlx.check(mlx.mlx_argmax_axis(&am, sparse.logits, -1, false, s));
-    var am32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(am32);
-    try mlx.check(mlx.mlx_astype(&am32, am, .int32, s));
-    try mlx.check(mlx.mlx_array_eval(am32));
-    const ids = mlx.mlx_array_data_int32(am32) orelse return error.Unreadable;
-    try std.testing.expectEqual(@as(i32, 45), ids[0]);
-    try std.testing.expectEqual(@as(i32, 3 + 7 * 31), ids[1]);
-}
-
-test "a retired coarse head is gone for every reader and is not freed twice, and another trunk's stays" {
-    try mlx.requireGpu();
-    const s = mlx.gpuStream();
-    var a = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 512, 8, 64, 0x1A4D);
-    defer a.deinit();
-    var b = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 512, 8, 64, 0x1A4E);
-    defer b.deinit();
-    var cells: [2]ShortlistState = .{ .{ .logged = true }, .{ .logged = true } };
-    for ([_]*mtp_mod.RerankFixture{ &a, &b }, &cells) |fx, *cell| {
-        fx.xfm.config.model_type = "mimo_v2";
-        fx.xfm.suppress_mask = null;
-        fx.xfm.bits_cache = null;
-        fx.xfm.shortlist = cell;
-        cell.coarse = mtp_mod.buildRerankCoarse(s, &fx.xfm, 2) orelse return error.CoarseBuildDeclined;
-    }
-    defer for (&cells) |*cell| mtp_mod.retireCoarse(&cell.coarse);
-
-    // What a failed shortlist does: the MiMo readers go through `coarseHead`, which now reads null.
-    mtp_mod.retireCoarse(a.xfm.coarseHead().?);
-    try std.testing.expect(a.xfm.coarseHead().?.* == null);
-    try std.testing.expect(b.xfm.coarseHead().?.* != null);
-    // Retiring again, as the deinit does, frees nothing twice.
-    mtp_mod.retireCoarse(a.xfm.coarseHead().?);
-    // The readout falls back to the full head on A and keeps its shortlist on B.
-    var buf: [512]f32 = undefined;
-    for (&buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.03125;
-    const xf = mlx.mlx_array_new_data(&buf, &[_]c_int{ 1, 1, 512 }, 3, .float32);
-    defer _ = mlx.mlx_array_free(xf);
-    var x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
-    const full = try a.xfm.lmHeadProject(x, true);
-    defer _ = mlx.mlx_array_free(full);
-    const sparse = try b.xfm.lmHeadProject(x, true);
-    defer _ = mlx.mlx_array_free(sparse);
-    try mlx.check(mlx.mlx_array_eval(full));
-    try mlx.check(mlx.mlx_array_eval(sparse));
-}
-
-test "a MiMo argmax-only readout holds the full head's bit-exact logits at its top-32, one row or four" {
-    try mlx.requireGpu();
-    const s = mlx.gpuStream();
-    // K 512 and a vocab that is a multiple of 8 keep both reads on the served head's qmv kernel.
-    var fx = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 512, 8, 64, 0x1A4D);
-    defer fx.deinit();
-    fx.xfm.config.model_type = "mimo_v2";
-    fx.xfm.suppress_mask = null;
-    fx.xfm.bits_cache = null;
-    var shortlist: ShortlistState = .{ .logged = true };
-    fx.xfm.shortlist = &shortlist;
-    shortlist.coarse = mtp_mod.buildRerankCoarse(s, &fx.xfm, 2) orelse return error.CoarseBuildDeclined;
-    defer mtp_mod.retireCoarse(&shortlist.coarse);
-    const vocab: usize = @intCast(fx.vocab);
-    var prng = std.Random.DefaultPrng.init(0x7E57);
-    for ([_]c_int{ 1, 4 }) |rows| {
-        const n: usize = @intCast(rows);
-        var buf: [4 * 512]f32 = undefined;
-        for (buf[0 .. n * 512]) |*v| v.* = @as(f32, @floatFromInt(prng.random().intRangeAtMost(i32, -64, 63))) * 0.015625;
-        const xf = mlx.mlx_array_new_data(&buf, &[_]c_int{ 1, rows, 512 }, 3, .float32);
-        defer _ = mlx.mlx_array_free(xf);
-        var x = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x);
-        try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
-        const sparse = try fx.xfm.lmHeadProject(x, true);
-        defer _ = mlx.mlx_array_free(sparse);
-        const full = try fx.xfm.lmHeadProject(x, false);
-        defer _ = mlx.mlx_array_free(full);
-        var sf = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sf);
-        try mlx.check(mlx.mlx_astype(&sf, sparse, .float32, s));
-        var ff = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ff);
-        try mlx.check(mlx.mlx_astype(&ff, full, .float32, s));
-        try mlx.check(mlx.mlx_array_eval(sf));
-        try mlx.check(mlx.mlx_array_eval(ff));
-        const sp = mlx.mlx_array_data_float32(sf) orelse return error.Unreadable;
-        const fp = mlx.mlx_array_data_float32(ff) orelse return error.Unreadable;
-        for (0..n) |r| {
-            var kept: usize = 0;
-            for (sp[r * vocab ..][0..vocab], fp[r * vocab ..][0..vocab]) |a, b| {
-                if (a == -std.math.inf(f32)) continue;
-                kept += 1;
-                try std.testing.expectEqual(b, a);
-            }
-            try std.testing.expectEqual(@as(usize, 32), kept);
-        }
-    }
 }

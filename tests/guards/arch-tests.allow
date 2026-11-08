@@ -69,7 +69,6 @@ Qwen4 mixed pack matcher pins actual quantization geometry
 Responses: a stored chain and an input replay render the same Qwen prompt
 SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp takes the RAM arm
 a GLM raw FP8 config with another block size is refused by name
-a MiMo argmax-only readout holds the full head's bit-exact logits at its top-32, one row or four
 a MiMo slot bills the decode rebuilds the other rows of its batched decode hold
 a Qwen or MiMo request owes no growth after admission, its reserved capacity is taken at its first grow
 a freed MiMo slot returns its KV to the OS, not to MLX's pool

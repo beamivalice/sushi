@@ -4304,7 +4304,7 @@ pub fn forwardMoeBatchedRows(
 
     // qwen4_exp rides the same driver: GDN + PLE window merged here, QSA
     // key histories reached per slot through `batch_slots` (kv differs).
-    const logits = (if (self.qwen4 != null) forwardQwen4With(self, &bctx, token_arr) else self.forwardMoeWith(&bctx, token_arr)) catch |e| {
+    const logits = (if (self.qwen4 != null) forwardQwen4With(self, &bctx, token_arr) else self.forwardWith(&bctx, token_arr)) catch |e| {
         qwen4_hc.discardDeferredPle(self, &bctx);
         return e;
     };

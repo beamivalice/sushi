@@ -1,6 +1,7 @@
 //! Compatibility name for the trunk: `Transformer` is `Trunk`, and every name other files reached here is re-exported
 //! from the file that now holds it. A consumer moves to `trunk.zig` / `model_handle.zig` with its own stage.
 const trunk = @import("trunk.zig");
+const mimo_forward = @import("mimo2/mimo_forward.zig");
 const trunk_helpers_test = @import("trunk_helpers_test.zig");
 
 pub const Transformer = trunk.Transformer;
@@ -23,7 +24,7 @@ pub const KvCacheChoice = trunk.KvCacheChoice;
 pub const KvPrefixView = trunk.KvPrefixView;
 pub const LinearAttnWeights = trunk.LinearAttnWeights;
 pub const MAX_BATCH_ROWS = trunk.MAX_BATCH_ROWS;
-pub const MIMO_VERIFY_ROWS_MAX = trunk.MIMO_VERIFY_ROWS_MAX;
+pub const MIMO_VERIFY_ROWS_MAX = mimo_forward.MIMO_VERIFY_ROWS_MAX;
 pub const MimoExl3MoeHarness = trunk.MimoExl3MoeHarness;
 pub const ModelConfig = trunk.ModelConfig;
 pub const MoeDecodeDispatchArm = trunk.MoeDecodeDispatchArm;
@@ -138,7 +139,7 @@ pub const log = trunk.log;
 pub const macosProductVersion = trunk.macosProductVersion;
 pub const materializedOwnedCopy = trunk.materializedOwnedCopy;
 pub const maxAbsDiffF32 = trunk_helpers_test.maxAbsDiffF32;
-pub const mimoGlobalDecodeRebuildMaxKeys = trunk.mimoGlobalDecodeRebuildMaxKeys;
+pub const mimoGlobalDecodeRebuildMaxKeys = mimo_forward.mimoGlobalDecodeRebuildMaxKeys;
 pub const moeDecodeDispatchArm = trunk.moeDecodeDispatchArm;
 pub const moeDumpBeginForward = trunk.moeDumpBeginForward;
 pub const moeDumpForwardDone = trunk.moeDumpForwardDone;
@@ -248,7 +249,6 @@ pub const ssmSnapshotDeinit = trunk.ssmSnapshotDeinit;
 pub const ssmSplitAll = trunk.ssmSplitAll;
 pub const ssmUnbindAll = trunk.ssmUnbindAll;
 pub const ssmUnbindEntries = trunk.ssmUnbindEntries;
-pub const stackMimoFixtureExperts = trunk.stackMimoFixtureExperts;
 pub const standinOnes = trunk.standinOnes;
 pub const standinRef = trunk.standinRef;
 pub const swaBandMask = trunk_helpers_test.swaBandMask;

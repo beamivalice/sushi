@@ -41,14 +41,21 @@ joins `DROPPABLE` when its drop passes.
   frees or resets its own state and then calls the trunk's `deinitTrunk` / `resetTrunk` / `warmupTrunk`.
   `Transformer` is an alias of `Trunk`, and `transformer.zig` re-exports the names that moved, until the arch stages
   move their callers. The arch handle fields still on `Trunk` (`qwen4`, ...) are reached by name until each arch's
-  S3 stage moves its own; GLM's and DeepSeek's have moved.
+  S3 stage moves its own; GLM's, DeepSeek's and MiMo's have moved (MiMo's `ForwardCtx` fields have not).
+- **The trunk archs' hooks.** `initTrunk` fills the state last, through `arch_state.initState`: the config's arch's
+  `State.init` gets `InitArgs` (allocator, config, weights, name prefix, stream, the trunk's owned arrays) and returns
+  a streamed load's expert engine; nothing after it can fail. The lm head's argmax-only readout asks
+  `arch_state.headShortlist`. The MoE family asks `arch/moe.zig`, keyed by the config's arch, for an arch's own router
+  logits, its routing over a selection bias, and whether the loader widens a dense router to f32 (`moe.routerLogits`,
+  `moe.biasRouting`, `moe.widensRouter` in the arch's `arch.zig`).
 - **An arch's own state rides two registry-built fields.** `Trunk.arch_state` and `ForwardCtx.arch_ctx`
   (`src/arch/arch_state.zig`) are structs with a field per enabled arch: the `State` and `Ctx` its `arch.zig` declares,
   void where it declares none, each default-initialised so a context built by hand needs no arch field. An arch's S3
   stage moves its `Trunk` and `ForwardCtx` fields into them; a build without the arch has none. A `State` may declare
-  `ctx` (the default context's part), `runsOwnModel`, `sharesReadonly` and `rawEmbedding`, which `arch_state.zig` asks
-  generically; shared code that needs one arch's state goes through that arch's accessors (`glm5_state.modelOf`,
-  `requestOf`, `dsv41_state.modelOf`), which are null in a build without it. A `prefix` module may declare
+  `init`, `ctx` (the default context's part), `runsOwnModel`, `sharesReadonly`, `rawEmbedding` and `headShortlist`,
+  which `arch_state.zig` asks generically; shared code that needs one arch's state goes through that arch's accessors
+  (`glm5_state.modelOf`, `requestOf`, `dsv41_state.modelOf`, `mimo2_state.coarseHead`), which are null in a build
+  without it. A `prefix` module may declare
   `diskLayoutKey`, the arch's own SSD namespace key (DeepSeek names its drop list and arms there; `arch/prefix.zig` asks
   it, and the config's tag is the fallback). The request a slot owns beside its KV cache is `arch_state.SlotRequest`,
   the type of the one `Ctx.request` a built arch declares (`NoRequest` when none does). A moved field leaves `Trunk` in
@@ -73,7 +80,7 @@ joins `DROPPABLE` when its drop passes.
   speculative head: [engine-mtp](engine-mtp.md#the-drafter-seam)), `media` (tower, processor, prompt rows, M-RoPE; the
   config picks the arch whose `media.claims` holds), `prefix` (the prefix cache's restore target, per-entry
   rows and disk sections: [engine-prefix-cache](engine-prefix-cache.md#arch-seam)), `sched` (what the scheduler asks of
-  an arch: [server-lifecycle](server-lifecycle.md#scheduler-and-batching)), and `spec` (the config side: `Spec`,
+  an arch: [server-lifecycle](server-lifecycle.md#scheduler-and-batching)), `moe` (the MoE family's routing hooks), and `spec` (the config side: `Spec`,
   the arch of a `model_type`). No vtables, no function pointers, and no layer loop crosses the seam, so the GPU
   graphs do not change.
 - `-Darchs=<a,b,...>` (default: every registered arch) builds `Tag`, `Spec` and `Arch` from the listed archs. An

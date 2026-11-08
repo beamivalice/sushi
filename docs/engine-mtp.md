@@ -120,7 +120,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   aggregate ~85 tok/s; a linear model of the measured verify-row cost predicts ~95-125 with merged verify at depth
   2-3. Measure before any code.
 - <a id="greedy-shortlist"></a>**A greedy MiMo forward reads the trunk head through the drafts' shortlist**
-  (`lmHeadShortlistFor`, up to 16 argmax-only rows, serial ticks and verify rows alike): the coarse top-32 per row,
+  (`mimo2_shortlist.readout` through `arch_state.headShortlist`, up to 16 argmax-only rows, serial ticks and verify rows alike): the coarse top-32 per row,
   re-scored through the full head (the same qmv, so each value is the full readout's), every other id -inf. The copy
   exists with MTP or without, so MTP == serial holds by construction. Gate `sampler.argmaxOnlyRequest` (greedy or
   top-1; no penalty, logprobs, grammar, forced call); `kld` reads the full head. Not certified: a full argmax

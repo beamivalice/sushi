@@ -11,6 +11,7 @@ const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const dspark_rows = @import("dsv41/dspark_rows.zig");
 const mimo_mtp = @import("mimo2/mimo_mtp.zig");
+const mimo_forward = @import("mimo2/mimo_forward.zig");
 const chip_mod = @import("chip.zig");
 const model_mod = @import("model.zig");
 const admission = @import("arch/admission.zig");
@@ -238,7 +239,7 @@ pub fn mimoVerifyWarmWanted(config: *const ModelConfig) bool {
 
 fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: ?*mimo_mtp.Head, kv_config: transformer_mod.KVQuantConfig) void {
     const start = std.Io.Timestamp.now(io, .awake);
-    const rows = xfm.warmupMimoVerify(kv_config) catch |err| {
+    const rows = mimo_forward.warmupMimoVerify(xfm, kv_config) catch |err| {
         log.warn("[spec-warmup] MiMo verify failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
         return;
     };
@@ -2155,9 +2156,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     };
     // The heads built the coarse copy for their drafts; without them the trunk's greedy readout still takes one.
     // Same predicate as the resident bill that prices this copy.
-    if (mimoCoarseHeadBytes(params.config) > 0) if (xfm_ptr.coarseHead()) |slot| {
-        if (slot.* == null) slot.* = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
-    };
+    if (mimoCoarseHeadBytes(params.config) > 0) _ = mimo_mtp.buildCoarseHead(mlx.gpuStream(), xfm_ptr);
     // The qwen4_exp in-checkpoint head's coarse rerank build: a
     // `requantizeRows` of the whole
     // trunk lm_head plus a synchronous eval of ~240 MB. Lazily it ran inside

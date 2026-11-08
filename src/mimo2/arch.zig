@@ -11,6 +11,7 @@ const Trunk = trunk.Trunk;
 pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
+pub const State = @import("mimo2_state.zig").State;
 
 /// A model type no arch claims runs the generic MoE trunk, which is this arch.
 pub const default_arch = true;
@@ -61,6 +62,18 @@ pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir
     };
 }
 
+/// MiMo routes in f32: its router reads f32 activations and weights, and a layer's selection bias picks the experts
+/// (sigmoid, noaux_tc) while the unbiased scores weight them.
+pub const moe = struct {
+    pub const routerLogits = mimo_forward.mimoRouterLogits;
+    pub const biasRouting = mimo_forward.computeMimoRouting;
+
+    /// A source trunk's dense router is widened once at load, which `mimo_source.countResidentBytes` bills.
+    pub fn widensRouter(config: *const Config) bool {
+        return config.usesMimoSourceTrunk();
+    }
+};
+
 pub const media = @import("mimo2_media.zig"); // slot:media (S2f)
 
 pub const chat = @import("mimo_chat.zig"); // slot:chat (S2g)
@@ -75,6 +88,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
 }
 
 pub fn deinit(xfm: Model) void {
+    xfm.arch_state.mimo2.deinit(xfm.allocator);
     xfm.deinitTrunk();
 }
 
@@ -115,4 +129,12 @@ test "a MiMo config leaves the QSA budget zero, so the QSA arming is qwen4's alo
     var config = try @import("../model.zig").parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/model-configs/mimo_v2.json"));
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 0), config.indexer_budget);
+}
+
+test "a MiMo source trunk widens its dense router at load; a converted MiMo pack and another arch's config do not" {
+    const arch_moe = @import("../arch/moe.zig");
+    try std.testing.expect(arch_moe.widensRouter(&.{ .model_type = "mimo_v2", .expert_layout = .mxfp4_individual }));
+    try std.testing.expect(arch_moe.widensRouter(&.{ .model_type = "mimo_v2", .expert_layout = .exl3_k4 }));
+    try std.testing.expect(!arch_moe.widensRouter(&.{ .model_type = "mimo_v2" }));
+    try std.testing.expect(!arch_moe.widensRouter(&.{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4 }));
 }

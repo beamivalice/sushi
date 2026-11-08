@@ -2,12 +2,16 @@
 //! the `State` its `arch.zig` declares; `ForwardCtx.arch_ctx` the same over `Ctx`. An arch that declares neither has
 //! a void field, and every field is default-initialised, so a context built by hand carries each arch's empty state.
 //!
-//! A `State` may declare `ctx(*State) Ctx` (what the default context carries), `runsOwnModel` (its own model, not the
-//! trunk's layers, runs the forward), `sharesReadonly` (weights every slot reads) and `rawEmbedding`. A `Ctx` with a
-//! `request` field points at the request a slot owns beside its KV cache (`SlotRequest`).
+//! A `State` may declare `init` (filled after the trunk's weights, from `InitArgs`), `ctx(*State) Ctx` (what the
+//! default context carries), `runsOwnModel` (its own model, not the trunk's layers, runs the forward), `sharesReadonly`
+//! (weights every slot reads), `rawEmbedding` and `headShortlist` (an argmax-only readout of the lm head). A `Ctx` with
+//! a `request` field points at the request a slot owns beside its KV cache (`SlotRequest`).
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const model = @import("../model.zig");
 const registry = @import("registry.zig");
+const arch_config = @import("config.zig");
+const Trunk = @import("../trunk.zig").Trunk;
 
 const tags = std.enums.values(registry.Tag);
 
@@ -68,6 +72,35 @@ pub fn sharesReadonly(s: *const State) bool {
 pub fn rawEmbedding(s: *const State, ids: mlx.mlx_array) !?mlx.mlx_array {
     inline for (tags) |t| {
         if (comptime has(Decl(t, "State"), "rawEmbedding")) if (try @field(s, @tagName(t)).rawEmbedding(ids)) |e| return e;
+    }
+    return null;
+}
+
+/// What a trunk arch's `State.init` reads once the trunk's weights are evaluated.
+pub const InitArgs = struct {
+    allocator: std.mem.Allocator,
+    config: *const model.ModelConfig,
+    weights: *model.Weights,
+    prefix: []const u8,
+    name_buf: *[256]u8,
+    s: mlx.mlx_stream,
+    /// Arrays the load made that the trunk frees with its own.
+    owned_bf16: *?[]mlx.mlx_array,
+};
+
+/// Fills the state of the arch `args.config` names, last in the trunk's construction: nothing after it can fail, so a
+/// `State.init` that fails releases what it made. Returns the expert engine of a streamed load.
+pub fn initState(s: *State, args: InitArgs) !?Trunk.ExpertStreamParts {
+    const tag = arch_config.tagOf(args.config) orelse return null;
+    return switch (tag) {
+        inline else => |t| if (comptime has(Decl(t, "State"), "init")) try @field(s, @tagName(t)).init(args) else null,
+    };
+}
+
+/// The arch's argmax-only readout of `x` through `t`'s head; null reads the full head.
+pub fn headShortlist(t: *const Trunk, x: mlx.mlx_array) !?mlx.mlx_array {
+    inline for (tags) |tg| {
+        if (comptime has(Decl(tg, "State"), "headShortlist")) if (try @field(t.arch_state, @tagName(tg)).headShortlist(t, x)) |out| return out;
     }
     return null;
 }

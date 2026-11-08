@@ -703,7 +703,7 @@ test "only the models with per-slot head state are admitted to the MTP slot grou
     t.expert_stream = null;
     for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41", "qwen3_moe", "" }) |model_type| {
         t.config = .{ .model_type = model_type, .full_attention_interval = 4 };
-        const admitted = t.supportsBatchedGdnDecode() or t.supportsBatchedMimoDecode();
+        const admitted = sched.modelBatches(&t);
         try testing.expectEqual(t.config.isQwen4() or t.config.isMimo(), admitted);
     }
 }

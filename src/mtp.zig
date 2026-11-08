@@ -1516,6 +1516,7 @@ pub const RerankFixture = struct {
             s,
         ));
         var xfm: Transformer = undefined;
+        xfm.arch_state = .{};
         xfm.config = .{};
         xfm.config.hidden_size = @intCast(hidden);
         xfm.config.quant_mode = .affine;

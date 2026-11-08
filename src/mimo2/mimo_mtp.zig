@@ -18,6 +18,7 @@ const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const trunk_mod = @import("../trunk.zig");
 const mimo_forward = @import("mimo_forward.zig");
+const mimo2_state = @import("mimo2_state.zig");
 const mtp_mod = @import("../mtp.zig");
 const fp8_block = @import("../fp8_block.zig");
 const linear = @import("../linear.zig");
@@ -33,6 +34,13 @@ pub const MAX_HEADS: usize = 3;
 
 /// The coarse draft readout's width. At 2 bits its top-32 shortlist still holds the drafts the
 /// 3-bit copy picks on MiMo.
+/// Builds `t`'s coarse lm_head copy if its shortlist cell holds none; whether the cell holds one after.
+pub fn buildCoarseHead(s: mlx.mlx_stream, t: *Transformer) bool {
+    const slot = mimo2_state.coarseHead(t) orelse return false;
+    if (slot.* == null) slot.* = mtp_mod.buildRerankCoarse(s, t, rerankBits());
+    return slot.* != null;
+}
+
 pub fn rerankBits() u32 {
     const p = std.c.getenv("SUSHI_MTP_DRAFT_HEAD_BITS");
     return rerankBitsFrom(if (p) |v| std.mem.span(v) else null);
@@ -760,29 +768,27 @@ pub const Head = struct {
         return steps;
     }
 
-    /// Drafts shortlist on the trunk's coarse lm_head copy (`Transformer.coarseHead`), built at
+    /// Drafts shortlist on the trunk's coarse lm_head copy (`mimo2_state.coarseHead`), built at
     /// the first ask when the trunk has none yet.
     pub fn canRerankDrafts(self: *Head) bool {
         const t = self.target orelse return false;
         if (!self.rerank_tried) {
             self.rerank_tried = true;
-            if (t.coarseHead()) |slot| if (slot.* == null) {
-                slot.* = mtp_mod.buildRerankCoarse(self.s, t, rerankBits());
-            };
+            return buildCoarseHead(self.s, t);
         }
-        return if (t.coarseHead()) |slot| slot.* != null else false;
+        return if (mimo2_state.coarseHead(t)) |slot| slot.* != null else false;
     }
 
     pub fn draftSelect(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         if (self.canRerankDrafts()) {
-            if (try mtp_mod.rerankSelect(self.s, target, target.coarseHead().?, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+            if (try mtp_mod.rerankSelect(self.s, target, mimo2_state.coarseHead(target).?, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
         }
         return mtp_mod.fullReadoutArgmax(self.s, target, x, suppress_mask);
     }
 
     pub fn draftShortlist(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
         if (!self.canRerankDrafts()) return null;
-        return mtp_mod.rerankShortlist(self.s, target, target.coarseHead().?, &self.rerank_logged, x, suppress_mask);
+        return mtp_mod.rerankShortlist(self.s, target, mimo2_state.coarseHead(target).?, &self.rerank_logged, x, suppress_mask);
     }
 };
 
