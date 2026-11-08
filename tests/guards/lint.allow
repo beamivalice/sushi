@@ -1,0 +1,3 @@
+# <rule> <file>:<fn> <reason>. An entry that matches no finding is stale and fails. Rules: scripts/lint/.
+const-write src/model_handle.zig:ownsModuleDecodeState handleOf only tags the handle; the dispatched fns read it
+const-write src/model_handle.zig:lmHeadForDraft handleOf only tags the handle; the dispatched head projection takes *const and writes nothing

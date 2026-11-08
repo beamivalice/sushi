@@ -115,8 +115,10 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
   hangs the runner.
 - **A PASSING test prints NOTHING, on either stream**: Zig renders any test stderr as a failure. Diagnostics ride an env
   switch (`SUSHI_EXL3_PARITY_TRACE`). Guard: `tests/test_test_runner_quiet.sh`.
-- **No source-scan tests** (`@embedFile` + "this string appears in that function"): test the behaviour or state the
-  rule in a comment.
+- **A test checks behaviour, never source text** (no `@embedFile` + "this string appears in that function").
+- **A source pattern we never want is a lint rule**, as clippy does: one file in `scripts/lint/` on `std.zig.Ast`
+  (never a regex), a red probe in `tests/test_lint.sh`, a reason per allowlist entry. `zig build lint` runs in every
+  test step.
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
 - A first `zig build test` run sometimes fails and a re-run is green (Metal contention, benign).

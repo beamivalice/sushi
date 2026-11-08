@@ -170,6 +170,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     // The host root links no MLX: a file in it that reaches MLX fails the link, so this tier can run beside a live server.
     const test_host_step = b.step("test-host", "Run the unit tests that link no MLX");
+    const lint_step = addLint(b, target);
+    test_step.dependOn(lint_step);
+    test_host_step.dependOn(lint_step);
     const host_mod = b.createModule(.{
         .root_source_file = b.path("src/tests_host.zig"),
         .target = target,
@@ -833,6 +836,23 @@ fn addExl3HostCheck(b: *std.Build, target: std.Build.ResolvedTarget) [2]*std.Bui
         b.addTest(.{ .name = "exl3-host-check-tests", .root_module = exl3, .emit_object = true }),
         b.addTest(.{ .name = "exl3-host-check-decls", .root_module = host, .emit_object = true }),
     };
+}
+
+/// `zig build lint`: scripts/lint/ over src/, every rule on every file. It always runs, so a new or edited file is read.
+/// ReleaseFast: the Debug walk of src/ alone costs over half a second.
+fn addLint(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step {
+    const exe = b.addExecutable(.{ .name = "lint", .root_module = b.createModule(.{
+        .root_source_file = b.path("scripts/lint/main.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) });
+    const run = b.addRunArtifact(exe);
+    run.setCwd(b.path("."));
+    run.addArgs(&.{ "src", "tests/guards/lint.allow" });
+    run.has_side_effects = true;
+    const step = b.step("lint", "Run the source lint rules (scripts/lint/) over src/");
+    step.dependOn(&run.step);
+    return step;
 }
 
 /// Zig reports a test binary whose filters select nothing as a pass. This helper fails such a binary, naming it.

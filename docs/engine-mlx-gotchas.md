@@ -120,8 +120,12 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - A struct inside a generic fn that captures NO comptime param is memoized to ONE type.
 - `openDirAbsolute` on an empty/relative path is ReleaseFast UB — guard every site.
 - `.string` on unchecked `std.json.Value` panics.
-- Never write through `*const` or `@constCast` a const object: ReleaseFast marks `*const` params readonly and drops the
-  store.
+- **Never write through `*const` or `@constCast` a const object.** ReleaseFast marks a `*const T` param readonly, so LLVM
+  may drop a store through `@constCast` of it, and state a first use fills (a lazy cell, an error flag set from a helper
+  thread) then never sticks. No behavioural test sees it: it fails only when the optimizer exploits it. State a first
+  use fills lives behind a mutable pointer or in a module global. The `const-write` rule of `zig build lint`
+  ([testsuite](testsuite.md#lint)) fails on an `@constCast` rooted at a pointer-to-const param or a `const` local; a
+  cast that only dispatches is allowlisted with its reason.
 - `clearRetainingCapacity` poisons the cleared bytes (0xAA) in safe builds: never return `list.items` and clear it in a `defer`; drop the length with `items.len = 0`.
 - A test that aliases embedded bytes through an alignment cast is a coin flip per binary: copy fixtures to aligned
   storage (Debug builds catch what ReleaseFast hides).

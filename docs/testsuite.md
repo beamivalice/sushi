@@ -22,6 +22,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 ## What a test may not be
 
 - A source scan (`@embedFile` + "this text appears"). Test the behaviour, or state the rule in a comment.
+  A lint rule ([Lint](#lint)) is a build step over the AST, not a test and not an `@embedFile` scan.
 - A struct literal read back, a compile-shape check, a "does not crash" or "is finite" smoke with no oracle.
 - A wall-clock assertion. Timing is a microbench in `sushi-ubench` ([process-ubench](process-ubench.md)); a test that
   timed something keeps its exactness half.
@@ -110,6 +111,20 @@ and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone che
   `--write` takes it. The entry keys the model, so code moving between shared files keeps its count. The list only
   shrinks: SWA, the ring cache and FP8 are engine features and never count, and a feature a model needs is written
   in a shared file without the model's name.
+
+## Lint
+
+`zig build lint` runs `scripts/lint/` over every `.zig` file under `src/`: `main.zig` parses each file once with
+`std.zig.Ast` (no Sema) and runs every rule on the tree. It is a build step that `zig build test` and `test-host` depend
+on, and it runs every time, so a new or edited file is always read. A report reads `file:line:col [rule] fn: message`.
+
+- A rule is one file in `scripts/lint/` that exports `name`, `reason` and `check(arena, tree, report)`, plus one line in
+  `rules` in `main.zig`. It flags a pattern we never want; `const-write` is the first
+  ([engine-mlx-gotchas](engine-mlx-gotchas.md#zig)).
+- `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
+  that matches nothing is stale and fails, so the list only shrinks.
+- A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its
+  allowlist entries.
 
 ## Characterization tapes
 
