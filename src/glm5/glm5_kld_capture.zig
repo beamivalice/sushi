@@ -1,5 +1,6 @@
 //! Native streamed GLM capture; standard KLD files, independent engine provenance.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const model = @import("../model.zig");
 const kld = @import("../kld.zig");
 const fixture_mod = @import("../kld_fixture.zig");
@@ -17,7 +18,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Arr = mlx.mlx_array;
 const testing = std.testing;
 pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
-    if (!cfg.isGlm5() or opts.command != .capture) return false;
+    if (!arch_config.isOf(cfg, "glm5") or opts.command != .capture) return false;
     // GLM's recurrent state is KDA and always f32; the Qwen GDN arm's flag has
     // nothing to switch here, so name it rather than take it and do nothing.
     if (!opts.qwen_gdn_f32) return error.GlmTeacherHasNoQwenGdnState;

@@ -176,6 +176,8 @@ pub fn draftShortlist(t: Head, _: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.
     return qwen4_forward.qwen4DraftShortlist(t, x, suppress_mask);
 }
 
+pub const evCosts = qwen4_cost_profile.evCosts;
+
 pub fn costProfile(t: Head, _: *const Trunk, kv: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
     return qwen4_cost_profile.qwen4G17CostProfileForKv(t, kv);
 }

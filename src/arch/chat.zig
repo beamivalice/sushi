@@ -51,6 +51,25 @@ pub fn Fixtures(comptime name: []const u8) type {
     return if (@hasDecl(face, "fixtures")) face.fixtures else struct {};
 }
 
+/// The 400 body for thinking off on an arch whose template has no off switch; null where the arch can think off.
+pub fn thinkOffRefusal(model_type: []const u8) ?[]const u8 {
+    const tag = registry.ofModelType(model_type) orelse return null;
+    switch (tag) {
+        inline else => |t| return if (@hasDecl(faceOf(t), "think_off_refusal")) faceOf(t).think_off_refusal else null,
+    }
+}
+
+/// The template with a late system turn rendered in place, when a built arch recognises it as its stock template
+/// (`lateSystemTemplate` of its chat face); null leaves the template and the fold to the caller. The caller frees it.
+pub fn lateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]const u8 {
+    inline for (comptime std.meta.tags(registry.Tag)) |t| {
+        if (comptime @hasDecl(faceOf(t), "lateSystemTemplate")) {
+            if (try faceOf(t).lateSystemTemplate(allocator, tpl)) |adapted| return adapted;
+        }
+    }
+    return null;
+}
+
 pub fn pinOf(model_type: []const u8) ?Pin {
     const tag = registry.ofModelType(model_type) orelse return null;
     switch (tag) {

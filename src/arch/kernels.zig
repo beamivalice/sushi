@@ -51,6 +51,21 @@ pub inline fn moeStandin() MoeStandin {
     return .{};
 }
 
+/// The shared-expert fold ran for the first time: the arch that folds says so in the log.
+pub fn sharedFoldEngaged() void {
+    inline for (comptime std.enums.values(registry.Tag)) |t| {
+        if (comptime has(t, "sharedFoldEngaged")) K(t).sharedFoldEngaged();
+    }
+}
+
+/// A diagnostic env switch of a built arch is armed: the round-cost table is not persisted from such a run.
+pub fn diagArmed() bool {
+    inline for (comptime std.enums.values(registry.Tag)) |t| {
+        if (comptime has(t, "diagArmed")) if (K(t).diagArmed()) return true;
+    }
+    return false;
+}
+
 /// Every built arch's lazily cached env reads, resolved on the main thread before other threads exist.
 pub fn warmEnvCaches() void {
     inline for (comptime std.enums.values(registry.Tag)) |t| {

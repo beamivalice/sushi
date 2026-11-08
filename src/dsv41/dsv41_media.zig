@@ -1,6 +1,7 @@
 //! DeepSeek-V4.1-Flash media: the aligner tower, its letterboxing processor and the image span a prompt holds.
 //! Images only, no M-RoPE. The rows are spliced inside the model's own pass.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const chat = @import("../chat.zig");
 const log = @import("../log.zig");
 const model = @import("../model.zig");
@@ -12,7 +13,7 @@ pub const Tower = dsv41_vision.Dsv41Vision;
 pub const scratchBytes = dsv41_vision.encodeScratchBytes;
 
 pub fn claims(config: *const model.ModelConfig) bool {
-    return config.isDsv41() or config.dsv41 != null;
+    return arch_config.isOf(config, "dsv41") or config.dsv41 != null;
 }
 
 pub fn preproc(config: *const model.ModelConfig) chat.VisionPreproc {

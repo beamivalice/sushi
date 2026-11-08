@@ -7,6 +7,7 @@
 //! quantization step of its own.
 
 const std = @import("std");
+const mimo_config = @import("mimo_config.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const expert_exl3 = @import("sushi_exl3").format;
@@ -1087,7 +1088,7 @@ test "mimo source loads and bills EXL3 routed banks beside the prepared trunk" {
     try t.expectEqual(expert_quant.Layout.exl3_k4, config.expert_layout);
     try t.expectEqual(@as(u32, 40), config.expert_quant_rate.n);
     try t.expect(!config.expertStreamingRequired());
-    try t.expect(config.usesMimoSourceTrunk());
+    try t.expect(mimo_config.usesSourceTrunk(config));
 
     // Nine banks: three projections of [2,8,8,40] u16 plus two [2,128] f16 axes.
     const bank_bytes: u64 = 3 * (2 * 8 * 8 * 40 * 2 + 2 * 2 * 128 * 2);

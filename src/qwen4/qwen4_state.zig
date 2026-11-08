@@ -97,6 +97,10 @@ pub const State = struct {
     pub const buildDraftRerank = qwen4_forward.qwen4BuildDraftRerank;
     pub const draftShortlists = qwen4_forward.qwen4DraftShortlistsBatched;
     pub const markHeadCheckpoint = qwen4_forward.qwen4MtpMarkQsaLeftover;
+
+    pub fn logHeadCheckpointFailure(e: anyerror) void {
+        log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
+    }
     pub const markTablesStale = qwen4_qsa.markQsaPooledRopeStale;
     pub const resetTables = qwen4_qsa.resetQsaPooledRope;
     pub const releaseGroup = qwen4_ssm_group.ssmGroupRelease;

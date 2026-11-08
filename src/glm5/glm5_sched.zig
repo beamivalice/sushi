@@ -1,6 +1,8 @@
 //! GLM as the scheduler sees it: slots share a model and each owns its native request; a drafting slot rides a plain
 //! grouped row when its model has company; commits and restores go through the MLA rows and KDA checkpoints.
 const std = @import("std");
+const glm5_config = @import("glm5_config.zig");
+const log = @import("../log.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const model_registry = @import("../model_registry.zig");
@@ -25,17 +27,21 @@ const ForwardCtx = trunk_mod.ForwardCtx;
 const Generator = generate.Generator;
 const ModelConfig = model.ModelConfig;
 
+pub fn logCheckpointsKept(kept: u32, max: u32, prompt_tokens: usize) void {
+    log.info("[hot-cache] GLM request keeps {d} of {d} KDA checkpoints: the rest do not fit beside its {d}-token prefill\n", .{ kept, max, prompt_tokens });
+}
+
 pub fn facts(config: *const ModelConfig) sched.Facts {
     _ = config;
     return .{ .thought_point = .always, .bills_checkpoints = true, .releases_checkpoints = true };
 }
 
 pub fn batches(config: *const ModelConfig) bool {
-    return config.supportsBatchedGlmRows();
+    return glm5_config.supportsBatchedRows(config);
 }
 
 pub fn rowCap(config: *const ModelConfig) ?usize {
-    return if (config.supportsBatchedGlmRows()) 4 else null;
+    return if (glm5_config.supportsBatchedRows(config)) 4 else null;
 }
 
 pub fn modelBatches(xfm: *const Trunk) bool {
@@ -44,7 +50,7 @@ pub fn modelBatches(xfm: *const Trunk) bool {
 
 /// Per-row attention reads each slot's own cache: nothing pads.
 pub fn padsBatch(config: *const ModelConfig) bool {
-    return !config.supportsBatchedGlmRows();
+    return !glm5_config.supportsBatchedRows(config);
 }
 
 pub fn batchArm(xfm: *Trunk, ctxs: []const *ForwardCtx) ?sched.BatchArm {
@@ -94,11 +100,11 @@ pub fn commitOwn(
     prompt_len: usize,
 ) bool {
     const request = if (slot.request) |*r| r else return false;
-    const window: ?trunk_mod.KVCache = if (gen) |g| if (g.glm_prefill_window) |*w|
+    const window: ?trunk_mod.KVCache = if (gen) |g| if (g.native_prefill_window) |*w|
         .{ .entries = w.snapshot.entries, .step = w.snapshot.step, .allocator = w.snapshot.allocator, .config = w.snapshot.config }
     else
         null else null;
-    const dflash: ?prefix_cache.DflashCommit = if (window) |*w| .{ .cache = w, .base_pos = gen.?.glm_prefill_window.?.base_pos } else null;
+    const dflash: ?prefix_cache.DflashCommit = if (window) |*w| .{ .cache = w, .base_pos = gen.?.native_prefill_window.?.base_pos } else null;
     rows_tick.commitGlmSlot(hc, slot, request, tokens, cps, dflash, prompt_len);
     return true;
 }

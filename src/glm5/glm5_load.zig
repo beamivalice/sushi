@@ -58,7 +58,7 @@ pub fn stageDrafter(io: std.Io, allocator: std.mem.Allocator, config: *ModelConf
     const assistant_bytes = try dflashLoadBytes(io, allocator, config, model_dir, drafter_dir);
     if (assistant_bytes > 0) log.info("[glm-dflash] resident assistant {d:.3} GiB; window {d} MiB; BF16 context; verification scratch billed per request\n", .{ @as(f64, @floatFromInt(assistant_bytes)) / (1024 * 1024 * 1024), config.dflash_window_bytes >> 20 });
     if (drafter_dir.len == 0 and !no_drafter and !config.expert_streaming)
-        log.warn("[glm-dflash] off: no assistant found (expected {s}/{s}, or an intact {s}/{s} cache); re-run `sushi pull` to fetch it\n", .{ model_dir, dflash_mod.SHIPPED_GLM_SUBDIR, model_dir, dflash_mod.DFLASH2_IN_DIR_SUBDIR });
+        log.warn("[glm-dflash] off: no assistant found (expected {s}/{s}, or an intact {s}/{s} cache); re-run `sushi pull` to fetch it\n", .{ model_dir, dflash_cache.shipped_subdir, model_dir, dflash_mod.DFLASH2_IN_DIR_SUBDIR });
     return assistant_bytes;
 }
 
@@ -91,18 +91,22 @@ pub fn prepareDrafter(io: std.Io, allocator: std.mem.Allocator, config: *const M
     return .{ .path = prepared.path, .resident_bytes = bytes };
 }
 
+pub const refusals = struct {
+    pub const Exl3RateGroupsUnsupported = "GLM-5.3-Flash packs serve one rate per layer; a rate-grouped layer loads on Qwen3.8-Flash-Next and MiMo-V2.6-Flash only.";
+};
+
 pub fn loadDflash(io: std.Io, allocator: std.mem.Allocator, xfm: *Trunk, dir: []const u8) !dflash_mod.DflashModel {
     return dflash_native.loadAssistantStored(io, allocator, dir, glm5_state.modelOf(xfm).?);
 }
 
-pub fn bindDflash(allocator: std.mem.Allocator, xfm: *Trunk, d: *dflash_mod.DflashModel, kv: trunk_mod.KVQuantConfig, tok: *tokenizer_mod.Tokenizer) bool {
+pub fn bindDflash(allocator: std.mem.Allocator, xfm: *Trunk, d: *dflash_mod.DflashModel, kv: trunk_mod.KVQuantConfig, tok: *tokenizer_mod.Tokenizer) !bool {
     d.sliding_serving = true;
     log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
     if (trunk_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) rows_tick.glmRoundUbench(allocator, glm5_state.modelOf(xfm).?, d, kv, tok);
     return true;
 }
 
-pub fn dflashRowBounds(min: ?u32, max: ?u32) !?u32 {
+pub fn dflashRowBounds(min: ?u32, max: ?u32, _: u32) !?u32 {
     const bounds = dflash_native.rowBounds(min, max) catch |err| {
         log.err("--drafter-min-depth/--drafter-max-depth: GLM-5.3-Flash verifies {d}..{d} rows per round\n", .{ dflash_native.MIN_ROWS, dflash_native.MAX_ROWS });
         return err;

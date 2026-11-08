@@ -443,7 +443,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             const text: []const u8 = if (i < args.len) args[i] else "";
             const n = dflash_mod.parseDrafterDepth(text) catch {
-                log.err("{s}: expected an integer in {d}..{d}; got '{s}'\n", .{ args[i - 1], dflash_mod.QWEN_MIN_ROWS, dflash_mod.DRAFTER_DEPTH_MAX, text });
+                log.err("{s}: expected an integer in {d}..{d}; got '{s}'\n", .{ args[i - 1], dflash_mod.DRAFTER_DEPTH_MIN, dflash_mod.DRAFTER_DEPTH_MAX, text });
                 std.process.exit(1);
             };
             if (is_min) dflash_mod.drafter_min_depth = n else dflash_mod.drafter_max_depth = n;
@@ -996,7 +996,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     };
-    if (config.glm_fp8_trunk) {
+    if (config.fp8_block128_trunk) {
         log.info("Model: {s} ({d} layers, {d}-dim, raw FP8 E4M3FN block128 trunk)\n", .{ config.model_type, config.num_hidden_layers, config.hidden_size });
     } else {
         log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{

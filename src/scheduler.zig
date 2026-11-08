@@ -2945,7 +2945,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // forwarded each emitted token into slot.cache as it was sampled.
     const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
     sched.prepareCommit(slot) catch |err| {
-        log.warn("[hot-cache] DeepSeek row marker failed: {s} — not committed\n", .{@errorName(err)});
+        log.warn("[hot-cache] {s} failed: {s} — not committed\n", .{ sched.prepareCommitLabel(slot), @errorName(err) });
         return;
     };
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
@@ -3073,7 +3073,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         return;
     }
     if (sched.cancelledNeedsCheckpoints(slot) and salvage.checkpoints.len == 0) {
-        log.debug("[hot-cache] cancelled prefill carried no checkpoints — a DeepSeek entry would restore as a miss; not committed\n", .{});
+        log.debug("[hot-cache] cancelled prefill carried no checkpoints — {s} would restore as a miss; not committed\n", .{sched.cancelledEntryLabel(slot)});
         return;
     }
     // The sink's `forwarded` is the authoritative length — `cache.step`
@@ -3737,7 +3737,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 else
                     null;
                 if (kept) |n| {
-                    log.info("[hot-cache] GLM request keeps {d} of {d} KDA checkpoints: the rest do not fit beside its {d}-token prefill\n", .{ n, cp_max, slot.full_prompt.len });
+                    sched.logCheckpointsKept(slot, n, cp_max);
                     cp_max = n;
                     if (n == 0) cp_stride = 0;
                 }

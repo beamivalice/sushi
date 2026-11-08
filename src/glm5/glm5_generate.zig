@@ -217,8 +217,8 @@ pub fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
     defer schedule.restore();
     var timer = io_util.Stopwatch.init(self.timer.io);
     const tick = io_util.Stopwatch.init(self.timer.io);
-    const action = self.glm_gate.next();
-    const lookup = if (self.glm_gate.probing()) null else try glmLookupChain(self, allocator);
+    const action = self.native_gate.next();
+    const lookup = if (self.native_gate.probing()) null else try glmLookupChain(self, allocator);
     const proposal = lookup orelse switch (action) {
         .round => try glmProposeRound(self),
         .plain => glmPlainProposal(self),
@@ -237,12 +237,12 @@ pub fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
     const wall_ms = @as(f64, @floatFromInt(tick.read())) / @as(f64, std.time.ns_per_ms);
     const emitted: u32 = @intCast(result.tokens.len);
     if (lookup != null) {
-        self.glm_lookup.rounds += 1;
-        self.glm_lookup.landed += result.accepted_tokens;
-        self.glm_gate.observeLookup(emitted);
+        self.native_lookup.rounds += 1;
+        self.native_lookup.landed += result.accepted_tokens;
+        self.native_gate.observeLookup(emitted);
     } else if (proposal.count == 1) {
-        self.glm_gate.observePlain(wall_ms);
-    } else self.glm_gate.observeRound(wall_ms, emitted);
+        self.native_gate.observePlain(wall_ms);
+    } else self.native_gate.observeRound(wall_ms, emitted);
     return result;
 }
 
@@ -266,7 +266,7 @@ pub fn glmLookupChain(self: *Generator, allocator: std.mem.Allocator) !?@import(
     if (self.opts.lookup_disabled or isEosId(self.next_token_id, self.eos_token_ids)) return null;
     const got = (try self.mtpLookupIndex(allocator)).match(self.next_token_id, glm_lookup_drafts);
     const chain = glmLookupProposal(got, self.next_token_id, self.max_tokens -| self.completion_tokens) orelse return null;
-    if (self.glm_lookup.rounds == 0) log.info("[glm-dflash] lookup chain engaged: {d} drafts, suffix {d}\n", .{ glm_lookup_drafts, got.?.suffix });
+    if (self.native_lookup.rounds == 0) log.info("[glm-dflash] lookup chain engaged: {d} drafts, suffix {d}\n", .{ glm_lookup_drafts, got.?.suffix });
     return chain;
 }
 
@@ -332,7 +332,7 @@ pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *co
     }
     if (deepest > 0 and !lookup) {
         const rate: f32 = @as(f32, @floatFromInt(round.accepted_drafts)) / @as(f32, @floatFromInt(deepest));
-        self.glm_draft_rate = 0.7 * self.glm_draft_rate + 0.3 * rate;
+        self.native_draft_rate = 0.7 * self.native_draft_rate + 0.3 * rate;
     }
     var emitted = round.count;
     for (round.tokens[1..round.count], 1..) |token, i| {
@@ -354,11 +354,11 @@ pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *co
         self.dflash_attempted += 1;
         self.dflash_accepted_tokens += round.accepted_drafts;
         self.dflash_round_width = @intCast(round.verified_rows - 1);
-        self.glm_round.drafted += round.verified_rows - 1;
-        self.glm_round.draft_ns += round.draft_ns;
-        self.glm_round.verify_ns += round.verify_ns;
-        self.glm_round.replay_ns += round.replay_ns;
-        self.glm_round.commit_ns += round.commit_ns;
+        self.native_round.drafted += round.verified_rows - 1;
+        self.native_round.draft_ns += round.draft_ns;
+        self.native_round.verify_ns += round.verify_ns;
+        self.native_round.replay_ns += round.replay_ns;
+        self.native_round.commit_ns += round.commit_ns;
     } else if (!lookup) {
         self.dflash_plain.ticks += 1;
         self.dflash_plain.verify_ns += round.verify_ns;

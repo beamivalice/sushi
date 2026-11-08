@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const expectError = @import("../test_expect.zig").expectError;
 const model_mod = @import("../model.zig");
 const ModelConfig = model_mod.ModelConfig;
@@ -66,21 +67,21 @@ pub fn parseGlm5VisionFields(c: *ModelConfig, root: std.json.ObjectMap) !void {
     c.qv_temporal_patch = try glmU32(v, "temporal_patch_size");
     c.qv_merge = try glmU32(v, "spatial_merge_size");
     c.qv_out_hidden = try glmU32(v, "out_hidden_size");
-    c.glmv_projection_intermediate = try glmU32(v, "projection_intermediate_size");
-    c.glmv_eps = try glmF32(v, "rms_norm_eps");
-    c.glmv_swiglu_limit = try glmF32(v, "swiglu_limit");
+    c.vision_proj_intermediate = try glmU32(v, "projection_intermediate_size");
+    c.vision_eps = try glmF32(v, "rms_norm_eps");
+    c.vision_swiglu_limit = try glmF32(v, "swiglu_limit");
     if (c.qv_heads == 0 or c.qv_hidden % c.qv_heads != 0 or c.qv_out_hidden != c.hidden_size or
         c.qv_depth == 0 or c.qv_hidden == 0 or c.qv_intermediate == 0 or c.qv_patch == 0 or c.qv_patch > 64 or
         c.qv_temporal_patch == 0 or c.qv_temporal_patch > 8 or c.qv_merge != 2 or
-        c.glmv_projection_intermediate == 0 or !std.math.isFinite(c.glmv_eps) or c.glmv_eps <= 0 or
-        !std.math.isFinite(c.glmv_swiglu_limit) or c.glmv_swiglu_limit <= 0) return error.InvalidGlmVisionConfig;
+        c.vision_proj_intermediate == 0 or !std.math.isFinite(c.vision_eps) or c.vision_eps <= 0 or
+        !std.math.isFinite(c.vision_swiglu_limit) or c.vision_swiglu_limit <= 0) return error.InvalidGlmVisionConfig;
     c.qv_head_dim = c.qv_hidden / c.qv_heads;
     if (c.qv_head_dim % 4 != 0) return error.InvalidGlmVisionConfig;
     if (v.get("rope_parameters")) |rp| {
         if (rp == .object) {
             try glmRequireString(rp.object, "rope_type", "axial");
-            c.glmv_rope_theta = try glmF32(rp.object, "rope_theta");
-            if (!std.math.isFinite(c.glmv_rope_theta) or c.glmv_rope_theta <= 0) return error.InvalidGlmVisionConfig;
+            c.vision_rope_theta = try glmF32(rp.object, "rope_theta");
+            if (!std.math.isFinite(c.vision_rope_theta) or c.vision_rope_theta <= 0) return error.InvalidGlmVisionConfig;
         }
     }
     c.image_token_id = try glmU32(root, "image_token_id");
@@ -97,7 +98,7 @@ pub fn parseFamily(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.
     try parseGlm5Fields(config, cfg_obj);
     if (root.get("sushi_pack")) |pack| {
         if (pack == .object) if (pack.object.get("trunk_storage")) |storage| {
-            if (storage == .string) config.glm_fp8_trunk = std.mem.eql(u8, storage.string, "source-fp8-e4m3fn-block128");
+            if (storage == .string) config.fp8_block128_trunk = std.mem.eql(u8, storage.string, "source-fp8-e4m3fn-block128");
         };
     }
     if (root.get("quantization_config")) |q| if (q == .object) if (q.object.get("quant_method")) |method| {
@@ -105,7 +106,7 @@ pub fn parseFamily(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.
             const block = q.object.get("weight_block_size") orelse return error.UnsupportedGlmConfig;
             if (block != .array or block.array.items.len != 2) return error.UnsupportedGlmConfig;
             for (block.array.items) |side| if (side != .integer or side.integer != 128) return error.UnsupportedGlmConfig;
-            config.glm_fp8_trunk = true;
+            config.fp8_block128_trunk = true;
         }
     };
     try parseGlm5VisionFields(config, root);
@@ -177,17 +178,17 @@ pub fn parseGlm5Fields(c: *ModelConfig, obj: std.json.ObjectMap) !void {
     c.kda_sigmoid_out_gate = true;
     c.kda_gate_lower_bound = try glmF32(linear, "gate_lower_bound");
     c.hc_count = try glmU32(obj, "hc_mult");
-    c.glm_hc_sinkhorn_iters = try glmU32(obj, "hc_sinkhorn_iters");
-    c.glm_hc_eps = try glmF32(obj, "hc_eps");
-    c.glm_swiglu_limit = try glmF32(obj, "swiglu_limit");
+    c.hc_sinkhorn_iters = try glmU32(obj, "hc_sinkhorn_iters");
+    c.hc_eps = try glmF32(obj, "hc_eps");
+    c.swiglu_limit = try glmF32(obj, "swiglu_limit");
     c.indexer_n_heads = try glmU32(obj, "index_n_heads");
     c.indexer_head_dim = try glmU32(obj, "index_head_dim");
     c.indexer_budget = try glmU32(obj, "index_topk");
     c.indexer_compress_ratio = try glmU32(obj, "index_kpool");
     const tail = obj.get("index_kpool_always_select_tail") orelse return error.InvalidGlmConfig;
     if (tail != .bool) return error.InvalidGlmConfig;
-    c.glm_index_tail = tail.bool;
-    if (obj.get("num_nextn_predict_layers")) |v| c.glm_mtp_layers = try cfgInt(u32, v);
+    c.indexer_tail = tail.bool;
+    if (obj.get("num_nextn_predict_layers")) |v| c.mtp_layers = try cfgInt(u32, v);
     c.full_attention_interval = 4;
     if (c.hc_count != 4 or c.linear_key_head_dim != 128 or c.linear_conv_kernel_dim < 1 or
         c.num_experts == 0 or c.num_experts > 512 or c.num_experts_per_tok == 0 or c.num_experts_per_tok > 32 or
@@ -195,8 +196,8 @@ pub fn parseGlm5Fields(c: *ModelConfig, obj: std.json.ObjectMap) !void {
         c.num_hidden_layers > 128 or c.hidden_size == 0 or c.hidden_size % 128 != 0 or
         c.moe_intermediate_size == 0 or c.moe_intermediate_size % 128 != 0 or
         c.mla_kv_lora_rank == 0 or c.mla_q_lora_rank == 0 or c.mla_qk_nope_head_dim == 0 or
-        c.glm_hc_sinkhorn_iters == 0 or c.glm_hc_sinkhorn_iters > 100 or c.glm_hc_eps <= 0 or
-        c.glm_swiglu_limit != 10 or c.indexer_compress_ratio != 4 or c.indexer_budget < 4 or
+        c.hc_sinkhorn_iters == 0 or c.hc_sinkhorn_iters > 100 or c.hc_eps <= 0 or
+        c.swiglu_limit != 10 or c.indexer_compress_ratio != 4 or c.indexer_budget < 4 or
         c.indexer_budget % 4 != 0 or c.router_scaling_factor <= 0 or c.kda_gate_lower_bound >= 0)
         return error.UnsupportedGlmConfig;
     if (c.vocab_size == 0 or c.intermediate_size == 0 or c.num_attention_heads == 0 or
@@ -238,10 +239,15 @@ pub fn parseGlm5Fields(c: *ModelConfig, obj: std.json.ObjectMap) !void {
     }
 }
 
+/// GLM decodes concurrent slots as single-row groups of one verifier forward (`glm5_dflash_model.verifyGroups`); a streamed load stays serial.
+pub fn supportsBatchedRows(config: anytype) bool {
+    return @import("../arch/config.zig").isOf(config, "glm5") and !config.expert_streaming;
+}
+
 test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assumptions" {
     try built();
     const c = try parseConfigFromJson(testing.allocator, @embedFile("../fixtures/glm5_config.json"));
-    try testing.expect(c.isGlm5());
+    try testing.expect(arch_config.isOf(c, "glm5"));
     try testing.expect(c.has_vision and c.glm5_vision);
     try testing.expectEqual(@as(u32, 14), c.qv_patch);
     try testing.expectEqual(@as(u32, 154854), c.image_token_id);
@@ -256,7 +262,7 @@ test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assum
     try testing.expectEqual(@as(u32, 11), c.attnCacheLayerCount());
     try testing.expectEqual(@as(u32, 512), c.mla_kv_lora_rank);
     try testing.expectEqual(@as(u32, 0), c.mla_qk_rope_head_dim);
-    try testing.expectEqual(@as(u32, 20), c.glm_hc_sinkhorn_iters);
+    try testing.expectEqual(@as(u32, 20), c.hc_sinkhorn_iters);
     try testing.expectEqual(@as(u64, 11 * 512 * 2), c.kvBytesPerToken());
     try testing.expectEqual(@as(u64, 34 * (64 * 128 * 128 * 4 + 3 * 3 * 64 * 128 * 2)), c.ssmCheckpointBytes());
     try testing.expectEqual(@as(u64, 11 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
@@ -344,8 +350,8 @@ test "GLM vision config rejects unsupported tower geometry and accepts a text-on
     var cfg = try parseConfigFromJson(a, source);
     try testing.expect(cfg.has_vision and cfg.glm5_vision and !cfg.qwen_vision);
     try testing.expectEqual(@as(u32, 64), cfg.qv_head_dim);
-    try testing.expectEqual(@as(f32, 10000), cfg.glmv_rope_theta);
-    try testing.expectEqual(@as(u32, 10240), cfg.glmv_projection_intermediate);
+    try testing.expectEqual(@as(f32, 10000), cfg.vision_rope_theta);
+    try testing.expectEqual(@as(u32, 10240), cfg.vision_proj_intermediate);
     var invalid = vision;
     invalid.getPtr("num_heads").?.* = .{ .integer = 15 };
     cfg.glm5_vision = false;
@@ -367,13 +373,13 @@ test "GLM raw FP8 config identifies source storage without changing native KV" {
     const raw = try std.fmt.allocPrint(std.testing.allocator, "{{\"sushi_pack\":{{\"trunk_storage\":\"source-fp8-e4m3fn-block128\"}},{s}", .{source[1..]});
     defer std.testing.allocator.free(raw);
     const cfg = try parseConfigFromJson(std.testing.allocator, raw);
-    try std.testing.expect(cfg.glm_fp8_trunk);
+    try std.testing.expect(cfg.fp8_block128_trunk);
     try std.testing.expectEqual(@as(u64, 11 * 512 * 2), cfg.kvBytesPerToken());
     const affine = try parseConfigFromJson(std.testing.allocator, source);
-    try std.testing.expect(!affine.glm_fp8_trunk);
+    try std.testing.expect(!affine.fp8_block128_trunk);
     const release = try std.fmt.allocPrint(std.testing.allocator, "{{\"quantization_config\":{{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"activation_scheme\":\"dynamic\",\"weight_block_size\":[128,128]}},{s}", .{source[1..]});
     defer std.testing.allocator.free(release);
-    try std.testing.expect((try parseConfigFromJson(std.testing.allocator, release)).glm_fp8_trunk);
+    try std.testing.expect((try parseConfigFromJson(std.testing.allocator, release)).fp8_block128_trunk);
     const other_block = try std.fmt.allocPrint(std.testing.allocator, "{{\"quantization_config\":{{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"weight_block_size\":[64,64]}},{s}", .{source[1..]});
     defer std.testing.allocator.free(other_block);
     try expectError(error.UnsupportedGlmConfig, parseConfigFromJson(std.testing.allocator, other_block));

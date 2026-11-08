@@ -12,6 +12,13 @@ pub const ArchSpec = struct {
     tag: ?Tag = null,
 };
 
+/// Which context grid an arch's round-cost table is measured on (`round_cost.Layout`).
+pub const CostLayout = @import("../round_cost.zig").Layout;
+
+/// How a pack stores the routed experts the streamed loader reads; the layout probe of its weight map follows it. The
+/// first two are banks under the checkpoint's `language_model.model.layers.` and `model.layers.` nesting.
+pub const ExpertSource = enum { none, language_model_banks, flat_banks, individual_source, mxfp4_w123 };
+
 /// Constants an arch states about its config; the defaults are what an arch with nothing special says.
 pub const Facts = struct {
     /// A request that names no thinking preference renders with thinking on.
@@ -35,12 +42,69 @@ pub const Facts = struct {
     qkv_split_rows: bool = false,
     /// The routed layers route by sigmoid with a selection-only bias, carry no shared expert, and bank biasless.
     bias_routed_moe: bool = false,
+    /// Where its routed experts live in a pack that streams them; `none`: they cannot stream.
+    expert_source: ExpertSource = .none,
+    /// A streamed pack may group its EXL3 layers by rate.
+    streams_rate_groups: bool = false,
     /// The width its prefill starts at, resolved per request by the admission bill; 0 = not a per-request arch of this kind.
     prefill_start_width: u32 = 0,
     /// The MLX buffer pool its streamed decode holds, billed in the SSD-budget ledger.
     expert_pool_bytes: u64 = 0,
     /// Its routed experts always stream.
     streams_experts: bool = false,
+    /// Its MTP head draws its drafts at this temperature; null takes the shared sidecar head's.
+    mtp_draft_temp: ?f32 = null,
+    /// The adaptive MTP controller's cost surface was calibrated for its head, though the head is not one the trunk carries.
+    mtp_adaptive_calibrated: bool = false,
+    /// The quoted tensor key whose presence in `model.safetensors.index.json` says a pack carries the arch's MTP head.
+    mtp_head_marker: []const u8 = "",
+    /// The context length below which the adaptive switch does not exist; 0 takes the shared floor.
+    mtp_adaptive_min_kv: u32 = 0,
+    /// A speculative round rolls the cache back by truncating it: the layers keep no recurrent state to restore.
+    mtp_rollback_by_truncate: bool = false,
+    /// The round-cost grid its persisted table uses.
+    cost_layout: CostLayout = .legacy,
+    /// Its requests keep state beside the KV cache that a prefix entry restores whole: the cache is hybrid, and its
+    /// checkpoints thin by recency.
+    state_beside_kv: bool = false,
+    /// It runs no MTP head: the engine's `[mtp]` line and head default do not apply.
+    no_mtp_head: bool = false,
+    /// The MTP settings and flags do not reach it.
+    mtp_unserved: bool = false,
+    /// Its DFlash2 assistant loads only when `--drafter` names it, is billed by the shared assistant terms and stays
+    /// resident on a streamed load.
+    dflash_by_flag: bool = false,
+    /// A streamed load keeps images on: its vision tower is resident beside the streamed experts.
+    vision_on_streamed: bool = false,
+    /// The KV cache holds an MLA latent per layer, not per-head K and V; the pooled index keeps key/gate pairs and no QSA history.
+    latent_kv: bool = false,
+    /// A recurrent state of KDA's own: f32 whatever the GDN state width, owned by the request, not by SSM entries.
+    kda_state: bool = false,
+    /// Its sliding layers keep a ring of the window.
+    sliding_ring: bool = false,
+    /// Every long-context mechanism (KV reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) is on.
+    long_ctx_gated: bool = false,
+    /// Admission credits the hot cache and evicts it to admit a prefill though the arch is not long-context gated.
+    evicts_hot_cache: bool = false,
+    /// A resident EXL3 pack has the measured load envelope and component bills.
+    sushi_quant_memory_bill: bool = false,
+    /// A checkpoint can declare thinking off: the table keeps no default word, and a request's on switch alone leaves it off.
+    thinking_off_checkpoint: bool = false,
+    /// Its MTP tensors load only when the head will run.
+    skips_mtp_weights_when_off: bool = false,
+    /// `--kv-quant` has nothing to quantize: it keeps its own compressed state.
+    own_kv_state: bool = false,
+    /// Attention scores only each row's picked keys, billed in its own transient: no dense score sheet narrows its prefill chunk.
+    scores_picked_keys: bool = false,
+    /// Its resident pack fills the machine: the wired ceiling is the declared limit, not what other apps leave free.
+    declared_wired_ceiling: bool = false,
+    /// Its DFlash2 assistant is billed by the arch's own bill, not the shared sliding-assistant terms.
+    own_dflash_bill: bool = false,
+    /// Streamed experts fill preallocated slabs in place: the fill stages nothing beyond the workspace and bounce.
+    fills_slabs_in_place: bool = false,
+    /// The drafter's block size is capped by the chip's wide verify lane, and the load line names the cap; false where
+    /// the arch's `dflashRowBounds` decides the rows alone.
+    chip_capped_drafter_block: bool = true,
     /// Its weight loader reads and checks the pack itself; the shared EXL3 pack index check does not apply.
     reads_own_source: bool = false,
 };
@@ -81,8 +145,27 @@ pub fn fact(config: *const model.ModelConfig, comptime name: []const u8) bool {
     return if (facts(config)) |f| @field(f, name) else false;
 }
 
+/// The `mtp_head_marker` of every built arch that has one.
+pub const mtp_head_markers = blk: {
+    var out: []const []const u8 = &.{};
+    for (std.enums.values(Tag)) |t| {
+        const marker = registry.Mod(t).config_facts.mtp_head_marker;
+        if (marker.len != 0) out = out ++ &[_][]const u8{marker};
+    }
+    const final = out[0..out.len].*;
+    break :blk final;
+};
+
 pub fn tagOf(config: *const model.ModelConfig) ?Tag {
     return config.arch.tag orelse registry.ofModelType(config.model_type);
+}
+
+/// `is` for a config held by value or by pointer.
+pub fn isOf(config: anytype, comptime name: []const u8) bool {
+    return switch (@typeInfo(@TypeOf(config))) {
+        .pointer => is(config, name),
+        else => is(&config, name),
+    };
 }
 
 pub fn is(config: *const model.ModelConfig, comptime name: []const u8) bool {

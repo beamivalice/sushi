@@ -155,7 +155,12 @@ fn readConfigFile(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// sidecar goes with which checkpoint, and a mismatched pair is unbuildable.
 pub const IN_DIR_SUBDIR = "drafter";
 pub const DFLASH2_IN_DIR_SUBDIR = "dflash2";
-pub const SHIPPED_GLM_SUBDIR = "GLM-5.3-Flash-DFlash2";
+
+/// Whether `name` is the folder an arch's own pack ships its drafter in.
+pub fn isShippedSubdir(name: []const u8) bool {
+    for (arch_drafter.shipped_subdirs) |subdir| if (std.mem.eql(u8, name, subdir)) return true;
+    return false;
+}
 
 /// Prefer `<model_dir>/dflash2`, then the legacy `<model_dir>/drafter`,
 /// when the folder declares the DFlash contract; otherwise return null.
@@ -164,7 +169,7 @@ pub const SHIPPED_GLM_SUBDIR = "GLM-5.3-Flash-DFlash2";
 /// sidecar can still be pointed at a merged checkpoint.
 pub fn resolveInDirDrafter(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
-    for ([_][]const u8{ DFLASH2_IN_DIR_SUBDIR, IN_DIR_SUBDIR, SHIPPED_GLM_SUBDIR }) |subdir| {
+    for ([_][]const u8{ DFLASH2_IN_DIR_SUBDIR, IN_DIR_SUBDIR } ++ arch_drafter.shipped_subdirs) |subdir| {
         const path = std.fs.path.join(allocator, &.{ model_dir, subdir }) catch return null;
         if (probeIsDflash(io, allocator, path) and (!std.mem.eql(u8, subdir, DFLASH2_IN_DIR_SUBDIR) or arch_drafter.inDirCacheValid(io, allocator, model_dir, path))) return path;
         allocator.free(path);
@@ -352,12 +357,10 @@ pub fn blockCapForMachine(chip: []const u8) BlockCap {
 pub var drafter_min_depth: ?u32 = null;
 pub var drafter_max_depth: ?u32 = null;
 pub const DRAFTER_DEPTH_MAX: u32 = 16;
-/// Fewest rows a Flash-Next round verifies: a round with no draft is not a DFlash round.
-pub const QWEN_MIN_ROWS: u32 = 2;
-/// The widest verify whose rows are decode-tick identical on qwen4 (`mtp.MAX_DEPTH` drafts + t1).
-pub const QWEN_MAX_ROWS: u32 = 9;
-pub fn qwenMinRows() u32 {
-    return drafter_min_depth orelse QWEN_MIN_ROWS;
+/// Fewest rows a round verifies: a round with no draft is not a DFlash round.
+pub const DRAFTER_DEPTH_MIN: u32 = 2;
+pub fn minRows() u32 {
+    return drafter_min_depth orelse DRAFTER_DEPTH_MIN;
 }
 
 pub fn drafterDepthExplicit() bool {
@@ -366,41 +369,11 @@ pub fn drafterDepthExplicit() bool {
 
 pub fn parseDrafterDepth(text: []const u8) error{InvalidDrafterDepth}!u32 {
     const n = std.fmt.parseInt(u32, text, 10) catch return error.InvalidDrafterDepth;
-    if (n < QWEN_MIN_ROWS or n > DRAFTER_DEPTH_MAX) return error.InvalidDrafterDepth;
+    if (n < DRAFTER_DEPTH_MIN or n > DRAFTER_DEPTH_MAX) return error.InvalidDrafterDepth;
     return n;
 }
 
 pub const RowBounds = struct { min: u32, max: u32 };
-
-/// Qwen3.8-Flash-Next: the rows a round may verify, from the flags or the defaults; the drafter's own
-/// block and the verify path bound them.
-pub fn qwenRowBounds(min: ?u32, max: ?u32, config_block: u32) error{DrafterDepthUnsupported}!RowBounds {
-    const hi = max orelse @min(config_block, QWEN_MAX_ROWS);
-    const lo = min orelse @min(QWEN_MIN_ROWS, hi);
-    if (hi > @min(config_block, QWEN_MAX_ROWS) or lo > hi or lo < QWEN_MIN_ROWS) return error.DrafterDepthUnsupported;
-    return .{ .min = lo, .max = hi };
-}
-
-test "dflash: a drafter depth parses an integer in 2..16 and names everything else" {
-    try testing.expectEqual(@as(u32, 4), try parseDrafterDepth("4"));
-    try testing.expectEqual(@as(u32, 2), try parseDrafterDepth("2"));
-    try testing.expectEqual(@as(u32, 16), try parseDrafterDepth("16"));
-    for ([_][]const u8{ "", "1", "0", "17", "-3", "four", "4.5", " 4" }) |bad| {
-        try testing.expectError(error.InvalidDrafterDepth, parseDrafterDepth(bad));
-    }
-}
-
-test "dflash: Qwen rows default to 2..block and are bounded by the drafter block and the verify path" {
-    try testing.expectEqual(RowBounds{ .min = 2, .max = 8 }, try qwenRowBounds(null, null, 8));
-    try testing.expectEqual(RowBounds{ .min = 2, .max = 3 }, try qwenRowBounds(null, 3, 8));
-    try testing.expectEqual(RowBounds{ .min = 4, .max = 8 }, try qwenRowBounds(4, null, 8));
-    try testing.expectEqual(RowBounds{ .min = 4, .max = 4 }, try qwenRowBounds(4, 4, 8));
-    try testing.expectEqual(RowBounds{ .min = 2, .max = 3 }, try qwenRowBounds(null, null, 3));
-    try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(null, 10, 16));
-    try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(null, 6, 5));
-    try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(5, 3, 8));
-    try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(9, null, 8));
-}
 
 /// Resolve the effective block size: the config's value, capped by what the
 /// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`

@@ -1,5 +1,6 @@
 //! Offline GLM frozen-prefix extraction for verified independent-window boundaries.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const forward = @import("glm5_forward.zig");
@@ -50,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     if (iterator.next() != null or windows == 0 or length == 0 or length > 512) return error.InvalidReplayArguments;
     var cfg = try model.parseConfig(io, a, pack);
     defer cfg.deinit(a);
-    if (!cfg.isGlm5() or cfg.hc_count != 4 or index < cfg.first_k_dense_replace) return error.InvalidGlmConfig;
+    if (!arch_config.isOf(cfg, "glm5") or cfg.hc_count != 4 or index < cfg.first_k_dense_replace) return error.InvalidGlmConfig;
     const stream = mlx.gpuStream();
     if (cfg.expert_layout == .bf16_individual) base.enterTeacher();
     var weights = try native.loadWeightsBounded(io, a, pack, stream, true, 8 << 30);
@@ -93,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
         var ops = base.Ops{ .s = stream };
         defer ops.deinit();
         const routing = try replay.routing(&ops, prefix.input);
-        const shared = if (replay.shared) |mlp| try mlp.apply(&ops, prefix.input, cfg.glm_swiglu_limit) else try ops.zeros(&.{ 1, @intCast(length), @intCast(cfg.hidden_size) }, .bfloat16);
+        const shared = if (replay.shared) |mlp| try mlp.apply(&ops, prefix.input, cfg.swiglu_limit) else try ops.zeros(&.{ 1, @intCast(length), @intCast(cfg.hidden_size) }, .bfloat16);
         for ([_]mlx.mlx_array{ prefix.input, prefix.residual, prefix.post, prefix.comb, shared, routing.indices, routing.scores }, fds) |array, handle| try append(handle, array, stream);
         for (fds) |handle| if (std.c.fsync(handle) != 0) return error.PrefixSyncFailed;
         std.debug.print("layer {d}: prefix window {d}/{d}\n", .{ index, window + 1, windows });

@@ -130,6 +130,11 @@ pub fn markHeadCheckpoint(t: *Trunk, row: usize) !void {
     try trunkHookTry("markHeadCheckpoint", .{ t, row });
 }
 
+/// `markHeadCheckpoint`, logging the arch's own line when it fails.
+pub fn markHeadCheckpointLogged(t: *Trunk, row: usize) void {
+    markHeadCheckpoint(t, row) catch |e| trunkHook("logHeadCheckpointFailure", .{e});
+}
+
 /// The per-model tables a forward builds from its slot's positions are stale: another slot runs next.
 pub fn markTablesStale(t: *Trunk) void {
     trunkHook("markTablesStale", .{t});

@@ -15,6 +15,7 @@ pub const State = glm5_state.State;
 pub const Ctx = glm5_state.Ctx;
 
 pub const packs = struct { // slot:packs (S2h)
+    pub const dflash_target = true;
     pub const product = "GLM-5.3-Flash";
     pub const aliases = [_]@import("../arch/packs.zig").Alias{
         .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
@@ -45,11 +46,11 @@ const config_file = @import("glm5_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "glm5_next", "glm5_next_text" };
 pub const discovery_types = model_types;
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .prefill_start_width = @import("glm5_forward.zig").prefill_chunk };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .expert_source = .individual_source, .state_beside_kv = true, .no_mtp_head = true, .mtp_unserved = true, .latent_kv = true, .kda_state = true, .evicts_hot_cache = true, .declared_wired_ceiling = true, .own_dflash_bill = true, .prefill_start_width = @import("glm5_forward.zig").prefill_chunk };
 
 /// A pack stores the MTP layers after the trunk's, under the same prefix (`pack_index`'s range check).
 pub fn trailingPackLayers(config: *const Config) u32 {
-    return config.glm_mtp_layers;
+    return config.mtp_layers;
 }
 pub const pack_layout: arch_config.PackLayout = .{ .prefix = "model.language_model", .stamped = true, .head = .trailing, .refuses_rate_groups = true };
 pub const parseConfig = config_file.parseFamily;

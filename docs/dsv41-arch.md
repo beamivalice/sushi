@@ -557,7 +557,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   stage windows and the backbone slack (`Config.stateFixedBytes(true)`). The load is exact against the arrays the model holds
   (`dsparkHeldBytes` test), so the earlier "3.7 GB" figure of the audit was low by the experts' scales and half the experts.
 - **Wiring.** The checkpoint's DSpark is the model's MTP head: `MtpHeadRef.dsv41`, kept under streaming
-  (`expert_stream.streamedMtpHeadSupported`) when the pack ships the stages (`dsv41_source.shipsDspark`), so the engine-default MTP
+  (`admission.streamedMtpHead`, its `streamed_mtp_head`) when the pack ships the stages (`dsv41_source.shipsDspark`), so the engine-default MTP
   is on and `--no-mtp` / `mtp: false` drop it. `--mtp-min-depth` / `--mtp-max-depth` bound the verify width (below); the block is fixed at 5 drafts.
   The boot line reads `[spec] DeepSeek-V4.1-Flash decodes with DSpark (...)` or `... plain ticks (...)`, and a request that
   drafted logs `[spec-stats] mode=dspark` with acceptance, draft and verify ms.

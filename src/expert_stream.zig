@@ -154,7 +154,7 @@ fn workspaceBytes(experts: u16, expert_bytes: u64, shape: quant.StoreShape) !u64
     return std.math.add(u64, try std.math.mul(u64, one, shape.union_sets), shape.union_meta_bytes);
 }
 
-pub const MTP_UNSUPPORTED: []const u8 = "MTP under expert streaming needs --mtp on a Sushi EXL3 Qwen3.8-Flash-Next pack or DeepSeek-V4.1-Flash";
+pub const MTP_UNSUPPORTED: []const u8 = @import("arch/admission.zig").mtp_unsupported;
 
 /// A streamed load of a supported pack keeps the MTP head, with its own experts, resident and
 /// verifies on the streamed decode path.
@@ -168,12 +168,6 @@ pub fn mtpUnderStreaming(mtp_on: bool, from_settings: bool, from_default: bool, 
     if (head_supported) return .keep;
     if (from_default) return .drop_default;
     return if (from_settings) .drop_settings else .refuse;
-}
-
-/// The streamed layouts whose kept head is proven live: a Sushi EXL3 Qwen pack, whose resident tensors carry the
-/// canonical `language_model.mtp.` keys the loader keeps, and DeepSeek-V4.1-Flash's DSpark stages. Every other model refuses.
-pub fn streamedMtpHeadSupported(is_qwen4: bool, is_dsv41: bool, layout: quant.Layout) bool {
-    return (is_qwen4 and layout == .exl3_k4) or (is_dsv41 and (layout == .mxfp4_w123 or layout == .exl3_k4));
 }
 
 pub fn mtpRefusal(expert_streaming: bool, mtp_requested: bool, head_loaded: bool) ?[]const u8 {
@@ -3825,17 +3819,6 @@ test "exl3 expert bytes at the MiMo K2.5 geometry size the resident admission" {
     try t.expectEqual(@as(u64, 7_901_184), per_expert);
     const routed_layers: u64 = geometry.layers - geometry.first_moe_layer;
     try t.expectEqual(@as(u64, 95_067_045_888), per_expert * geometry.experts * routed_layers);
-}
-
-test "only a Qwen EXL3 pack or a DeepSeek-V4.1 checkpoint or STQ pack keeps its MTP head under streaming" {
-    const t = std.testing;
-    try t.expect(streamedMtpHeadSupported(true, false, .exl3_k4));
-    try t.expect(!streamedMtpHeadSupported(true, false, .bf16_fused));
-    try t.expect(!streamedMtpHeadSupported(false, false, .exl3_k4));
-    try t.expect(!streamedMtpHeadSupported(false, false, .mxfp4_individual));
-    try t.expect(streamedMtpHeadSupported(false, true, .mxfp4_w123));
-    try t.expect(streamedMtpHeadSupported(false, true, .exl3_k4));
-    try t.expect(!streamedMtpHeadSupported(false, true, .mxfp4_individual));
 }
 
 test "expert stream refuses MTP by name, at load and at request parse" {

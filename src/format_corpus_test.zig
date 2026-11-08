@@ -39,6 +39,7 @@
 const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
+const arch_chat = @import("arch/chat.zig");
 const think_tags = @import("think_tags.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const tool_schema = @import("tool_schema.zig");
@@ -72,8 +73,11 @@ test "format corpus: concurrent completion IDs stay distinct within one millisec
 test "format corpus: late system notes never vanish, and a template that places them keeps history a prefix" {
     // `in_place` templates render a late note where it was sent (the stock Qwen ones through the
     // adapter); the rest fold it into the leading turn, which rewrites earlier bytes by design.
+    const qwen_tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
+    const adapted = try arch_chat.lateSystemTemplate(testing.allocator, qwen_tpl);
+    defer if (adapted) |a| testing.allocator.free(a);
     const templates = [_]struct { source: []const u8, in_place: bool }{
-        .{ .source = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .in_place = true },
+        .{ .source = qwen_tpl, .in_place = adapted != null },
         .{ .source = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("fixtures/dsv41_chat_template.jinja"), .in_place = true },
         .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
@@ -2517,6 +2521,8 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
         .{ .role = "user", .content = "again" },
     };
     for (cases) |c| {
+        // The stock-template adapter belongs to the arch whose template it is: without that arch the turn folds.
+        if (try arch_chat.lateSystemTemplate(testing.allocator, c.tpl)) |adapted| testing.allocator.free(adapted) else if (std.mem.eql(u8, c.name, "qwen3.8-flash-next")) continue;
         var config = chat.ChatConfig{
             .chat_template = c.tpl,
             .bos_token = null,

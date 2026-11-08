@@ -1,5 +1,6 @@
 //! Native GLM routed experts over Sushi's shared expert cache: BF16 source experts or EXL3 pack banks.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const stream = @import("../expert_stream.zig");
@@ -192,7 +193,7 @@ test "GLM layer-major CPU budget bills every batch window's HC residual and refu
 
 /// A lossless teacher capture's BF16 expert budget: one request of `max_tokens`, chunks of at most 512.
 pub fn captureBudget(cfg: *const model.ModelConfig, total: u64, trunk: u64, reserve: u64, max_tokens: usize, max_chunk: usize) !Budget {
-    if (!cfg.isGlm5() or max_tokens == 0 or max_tokens > cfg.max_position_embeddings or max_chunk == 0 or max_chunk > max_tokens or max_chunk > 512) return error.InvalidGlmStreamBudget;
+    if (!arch_config.isOf(cfg, "glm5") or max_tokens == 0 or max_tokens > cfg.max_position_embeddings or max_chunk == 0 or max_chunk > max_tokens or max_chunk > 512) return error.InvalidGlmStreamBudget;
     if (reserve < try minimumReserve(cfg, max_tokens, max_chunk)) return error.GlmStreamReserveTooSmall;
     const g = cfg.expertGeometry();
     return plan(total, trunk, reserve, g, try bytesPerExpert(g));
@@ -246,7 +247,7 @@ pub const Stream = struct {
         const shape = mlx.getShape(x);
         const ish = mlx.getShape(ids);
         if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > self.max_chunk or shape[2] != self.engine.geometry.hidden or mlx.mlx_array_dtype(x) != .bfloat16 or
-            (mlx.mlx_array_dtype(ids) != .uint32 and mlx.mlx_array_dtype(ids) != .int32) or ish.len != 3 or ish[0] != 1 or ish[1] != shape[1] or ish[2] < 1 or ish[2] > self.engine.geometry.experts or !std.mem.eql(c_int, ish, mlx.getShape(scores)) or mlx.mlx_array_dtype(scores) != .float32 or cfg.glm_swiglu_limit != 10) return error.InvalidGlmStreamInput;
+            (mlx.mlx_array_dtype(ids) != .uint32 and mlx.mlx_array_dtype(ids) != .int32) or ish.len != 3 or ish[0] != 1 or ish[1] != shape[1] or ish[2] < 1 or ish[2] > self.engine.geometry.experts or !std.mem.eql(c_int, ish, mlx.getShape(scores)) or mlx.mlx_array_dtype(scores) != .float32 or cfg.swiglu_limit != 10) return error.InvalidGlmStreamInput;
         var scope = Ops{ .s = ops.s };
         defer scope.deinit();
         const raw_ids = try scope.contiguous(try scope.cast(ids, .uint32));
@@ -275,9 +276,9 @@ pub const Stream = struct {
         if (self.imatrix != null and layout != .bf16_individual) return error.GlmImatrixNeedsBf16Experts;
         const tap: ?Tap = if (self.imatrix) |col| .{ .collector = col, .layer = layer, .ids = try scope.reshape(try scope.cast(raw_ids, .int32), &.{ shape[1], ish[2] }) } else null;
         const out = switch (layout) {
-            .bf16_individual => try bf16RoutedTapped(&scope, x, prepared.gate, prepared.up, prepared.down, remapped, scores, cfg.glm_swiglu_limit, tap),
+            .bf16_individual => try bf16RoutedTapped(&scope, x, prepared.gate, prepared.up, prepared.down, remapped, scores, cfg.swiglu_limit, tap),
             .exl3_k4 => try @import("glm5_forward.zig").routedExl3(&scope, x, exl3Bank(&prepared.quant_raw), remapped, scores, cfg),
-            .fp8_individual => try fp8Routed(&scope, self.engine.allocator, x, &prepared.quant_raw, local, ish, scores, cfg.glm_swiglu_limit),
+            .fp8_individual => try fp8Routed(&scope, self.engine.allocator, x, &prepared.quant_raw, local, ish, scores, cfg.swiglu_limit),
             else => return error.GlmStreamLayoutUnsupported,
         };
         // Complete every slab reader before another layer can refill the union.
@@ -388,7 +389,7 @@ test "GLM stream GPU BF16 routed output matches resident through eviction union 
     var engine = try stream.Engine.initWithOptions(t.allocator, path[0..n], geometry, 2 * 3072, cpu, .{ .layout = .bf16_individual, .bounce_size = 4096, .io_workers = 1 });
     defer engine.deinit();
     var store = Stream{ .engine = &engine, .max_tokens = 16, .max_chunk = 3 };
-    const cfg = model.ModelConfig{ .glm_swiglu_limit = 10 };
+    const cfg = model.ModelConfig{ .swiglu_limit = 10 };
     var banks: [3]Arr = undefined;
     for (&banks, 0..) |*bank, pi| {
         var raw: [4 * 512]u16 = undefined;
@@ -454,7 +455,7 @@ test "GLM stream imatrix tap keys the MLP input and the SwiGLU activation on the
     const col = try imatrix_capture.Collector.init(t.allocator, s, "/dev/null", 4, 4, @import("glm5_kld_capture.zig").imatrix_naming);
     defer col.deinit();
     var store = Stream{ .engine = &engine, .max_tokens = 16, .max_chunk = 3, .imatrix = col };
-    const cfg = model.ModelConfig{ .glm_swiglu_limit = 10 };
+    const cfg = model.ModelConfig{ .swiglu_limit = 10 };
     const route_ids = [6]u32{ 3, 1, 3, 3, 0, 1 };
     var values: [96]f32 = undefined;
     for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 5)) / 4;
@@ -531,7 +532,7 @@ test "GLM stream GPU FP8 routed output matches the resident FP8 bank through evi
     var engine = try stream.Engine.initWithOptions(t.allocator, path[0..n], geometry, 2 * per_expert, s, .{ .layout = .fp8_individual, .bounce_size = 1 << 20, .io_workers = 1 });
     defer engine.deinit();
     var store = Stream{ .engine = &engine, .max_tokens = 16, .max_chunk = 3 };
-    const cfg = model.ModelConfig{ .glm_swiglu_limit = 10 };
+    const cfg = model.ModelConfig{ .swiglu_limit = 10 };
     var bank = fp8FixtureBank();
     defer for (bank) |b| if (b.ctx != null) {
         _ = mlx.mlx_array_free(b);
@@ -621,7 +622,7 @@ test "GLM stream CPU refuses unsupported BF16 gather before reading arrays" {
     var ops = Ops{ .s = cpu };
     defer ops.deinit();
     const nil = Arr{ .ctx = null };
-    try std.testing.expectError(error.GlmStreamRequiresGpu, store.apply(0, &ops, nil, nil, nil, &.{ .glm_swiglu_limit = 10 }));
+    try std.testing.expectError(error.GlmStreamRequiresGpu, store.apply(0, &ops, nil, nil, nil, &.{ .swiglu_limit = 10 }));
     try std.testing.expectError(error.GlmStreamRequiresGpu, bf16Routed(&ops, nil, nil, nil, nil, nil, nil, 10));
     try std.testing.expectEqual(@as(usize, 0), ops.count);
 }

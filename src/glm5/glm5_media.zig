@@ -20,9 +20,9 @@ pub fn preproc(config: *const model.ModelConfig) chat.VisionPreproc {
         .patch = config.qv_patch,
         .tps = config.qv_temporal_patch,
         .merge = config.qv_merge,
-        .min_tokens = config.glmv_min_image_tokens,
-        .max_tokens = config.glmv_max_image_tokens,
-        .max_video_tokens = config.glmv_max_video_tokens,
+        .min_tokens = config.vision_min_image_tokens,
+        .max_tokens = config.vision_max_image_tokens,
+        .max_video_tokens = config.vision_max_video_tokens,
     };
 }
 

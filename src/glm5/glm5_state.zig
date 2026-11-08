@@ -1,6 +1,7 @@
 //! What a GLM-5 model owns beyond the trunk shell: its native model and the default request's KDA/MLA state. They
 //! live in `Trunk.arch_state.glm5` and `ForwardCtx.arch_ctx.glm5` (`arch/arch_state.zig`).
 const std = @import("std");
+const glm5_config = @import("glm5_config.zig");
 const mlx = @import("../mlx.zig");
 const trunk = @import("../trunk.zig");
 const arch_state = @import("../arch/arch_state.zig");
@@ -79,7 +80,7 @@ pub fn ctxFor(request: *forward.Request) arch_state.Ctx {
 /// The batched row tick serves a resident GLM model whose config admits it; a streamed teacher runs one row.
 pub fn supportsBatchedRows(t: *const Trunk) bool {
     const glm = modelOf(t) orelse return false;
-    return t.config.supportsBatchedGlmRows() and glm.expert_stream == null;
+    return glm5_config.supportsBatchedRows(t.config) and glm.expert_stream == null;
 }
 
 /// The GLM request a forward context carries; null when it carries none or the build has no glm5.

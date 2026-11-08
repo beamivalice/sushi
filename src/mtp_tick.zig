@@ -1,4 +1,5 @@
 const std = @import("std");
+const registry = @import("arch/registry.zig");
 const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
 const trunk = @import("trunk.zig");
@@ -705,7 +706,8 @@ test "only the models with per-slot head state are admitted to the MTP slot grou
     for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41", "qwen3_moe", "" }) |model_type| {
         t.config = .{ .model_type = model_type, .full_attention_interval = 4 };
         const admitted = sched.modelBatches(&t);
-        try testing.expectEqual(t.config.isQwen4() or t.config.isMimo(), admitted);
+        const per_slot_head = std.mem.eql(u8, model_type, "qwen4_exp") or std.mem.eql(u8, model_type, "mimo_v2");
+        try testing.expectEqual(per_slot_head and registry.ofModelType(model_type) != null, admitted);
     }
 }
 

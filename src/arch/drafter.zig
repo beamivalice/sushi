@@ -8,6 +8,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const mtp_mod = @import("../mtp.zig");
+const mtp_policy = @import("../mtp_policy.zig");
 const registry = @import("registry.zig");
 const spec_types = @import("../spec_types.zig");
 const trunk = @import("../trunk.zig");
@@ -326,6 +327,33 @@ pub fn reserveNativeDflash(config: anytype, ctx: trunk.ForwardCtx, assistant: an
         if (comptime @hasDecl(drafterOf(name), "reserveNative")) return drafterOf(name).reserveNative(config, ctx, assistant, max_tokens, s);
     }
     return error.NoNativeDflash;
+}
+
+/// The `[spec-stats]` line of the native DFlash2 round the arch runs.
+pub fn logNativeRoundStats(gen: anytype) void {
+    inline for (comptime std.meta.fieldNames(registry.Tag)) |name| {
+        if (comptime @hasDecl(drafterOf(name), "logRoundStats")) return drafterOf(name).logRoundStats(gen);
+    }
+}
+
+/// The folders the built archs' packs ship a drafter in beside the model files (`shipped_subdir` of a drafter module).
+pub const shipped_subdirs = blk: {
+    var out: []const []const u8 = &.{};
+    for (std.meta.fieldNames(registry.Tag)) |name| {
+        if (@hasDecl(drafterOf(name), "shipped_subdir")) out = out ++ &[_][]const u8{drafterOf(name).shipped_subdir};
+    }
+    const final = out[0..out.len].*;
+    break :blk final;
+};
+
+/// The EV cost surface a built arch holds for `profile`; null when none does.
+pub fn evCosts(profile: mtp_mod.MtpCostProfile) ?mtp_policy.MtpEvCosts {
+    inline for (comptime std.meta.fieldNames(registry.Tag)) |name| {
+        if (comptime @hasDecl(drafterOf(name), "evCosts")) {
+            if (drafterOf(name).evCosts(profile)) |costs| return costs;
+        }
+    }
+    return null;
 }
 
 /// Whether `path`, a drafter folder the engine derived from `model_dir`, is intact. Only an arch that builds such a

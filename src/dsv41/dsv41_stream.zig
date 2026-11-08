@@ -1,6 +1,7 @@
 //! deepseek_v41 routed experts over the shared expert cache: the checkpoint's own e2m1 experts are read
 //! from their shards into slabs and gathered as MLX `mxfp4`, one layer at a time.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const mlx = @import("../mlx.zig");
 const stream = @import("../expert_stream.zig");
@@ -465,7 +466,7 @@ test "dsv41 shell: the transformer serves the streamed model's logits through fo
 
     var config = try model_mod.parseConfig(io, testing.allocator, dir);
     defer config.deinit(testing.allocator);
-    try testing.expect(config.isDsv41() and config.expertStreamingRequired());
+    try testing.expect(arch_config.isOf(config, "dsv41") and config.expertStreamingRequired());
     try testing.expectEqual(@import("../expert_quant.zig").Layout.mxfp4_w123, config.expert_layout);
     config.expert_streaming = true;
     config.expert_cache_bytes = 3 * config.num_hidden_layers * try expertBytes(&config.dsv41.?);
@@ -2234,7 +2235,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
 
     var config = try model_mod.parseConfig(io, testing.allocator, dir);
     defer config.deinit(testing.allocator);
-    try testing.expect(config.isDsv41() and config.expertStreamingRequired());
+    try testing.expect(arch_config.isOf(config, "dsv41") and config.expertStreamingRequired());
     try testing.expectEqual(@import("../expert_quant.zig").Layout.exl3_k4, config.expert_layout);
     config.expert_streaming = true;
     config.expert_cache_bytes = 64 << 20;

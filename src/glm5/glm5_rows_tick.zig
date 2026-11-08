@@ -158,7 +158,7 @@ const glm_tick_rows = 4;
 
 /// Draft nodes (0, 1 or 2) for the best drafter among `slots` single rows under the four-row cap:
 /// a tree pays while its expected accepted tokens, priced at the group's ms per token, beat its
-/// rows and draft. `rate` is that request's accepted share of drafts (`Generator.glm_draft_rate`).
+/// rows and draft. `rate` is that request's accepted share of drafts (`Generator.native_draft_rate`).
 pub fn glmTreeNodes(slots: usize, rate: f32, cost: GlmRowCost) usize {
     if (slots == 0) return 0;
     const n: f32 = @floatFromInt(slots);
@@ -211,12 +211,12 @@ pub fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Trunk
     for (batch.*, 0..) |slot, i| {
         const gen = &slot.legacy_gen.?;
         if (!gen.native_dflash or gen.dflash_ctx == null) continue;
-        if (tree_at) |best| if (batch.*[best].legacy_gen.?.glm_draft_rate >= gen.glm_draft_rate) continue;
+        if (tree_at) |best| if (batch.*[best].legacy_gen.?.native_draft_rate >= gen.native_draft_rate) continue;
         tree_at = i;
     }
     if (tree_at) |at| tree: {
         const gen = &batch.*[at].legacy_gen.?;
-        const nodes = glmTreeNodes(batch.len, gen.glm_draft_rate, .{});
+        const nodes = glmTreeNodes(batch.len, gen.native_draft_rate, .{});
         if (nodes == 0 or gen.done or gen.completion_tokens + 2 > gen.max_tokens) {
             tree_at = null;
             break :tree;

@@ -46,7 +46,7 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
     if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > 16 or shape[2] != target.cfg.hidden_size) return error.InvalidGlmDraftShape;
     if (shape[1] == 1) return target.feedForwardLayer(index, ops, x);
     return switch (target.layers[index].ffn) {
-        .dense => |layer| dense(layer, ops, x, target.cfg.glm_swiglu_limit),
+        .dense => |layer| dense(layer, ops, x, target.cfg.swiglu_limit),
         .moe => |layer| blk: {
             const routing: forward.Routed = if (try @import("glm5_router.zig").routeBatch(ops.s, x, layer.weight, layer.correction, @intCast(target.cfg.num_experts_per_tok), target.cfg.router_scaling_factor, target.cfg.moe_route_norm)) |candidate| blk_route: {
                 const ids = ops.own(candidate.indices) catch |err| {
@@ -69,15 +69,15 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
             };
             const dec = target.cfg.expertDecode();
             const gs = mlx.getShape(layer.bank.gate.trellis);
-            const lane_rows = shape[1] >= 2 and shape[1] <= 8 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook.servesLaneFastPaths() and gs.len == 4 and gs[2] == 128 and api.coop_rows2.servesRate(gs[3]);
+            const lane_rows = shape[1] >= 2 and shape[1] <= 8 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.swiglu_limit == 10 and dec.codebook.servesLaneFastPaths() and gs.len == 4 and gs[2] == 128 and api.coop_rows2.servesRate(gs[3]);
             if (lane_rows) if (layer.shared) |shared| {
-                if (try shared.applyFolded(ops, x, layer.bank, routing.indices, routing.scores, dec, target.cfg.glm_swiglu_limit)) |joined| {
+                if (try shared.applyFolded(ops, x, layer.bank, routing.indices, routing.scores, dec, target.cfg.swiglu_limit)) |joined| {
                     group2_batches += 1;
                     routed_batches += 1;
                     logGroup2(dec, true);
                     break :blk try ops.own(joined);
                 }
-                const y = try dense(shared, ops, x, target.cfg.glm_swiglu_limit);
+                const y = try dense(shared, ops, x, target.cfg.swiglu_limit);
                 if (try api.coop_rows2.moeLayoutShared(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane, y)) |joined| {
                     group2_batches += 1;
                     routed_batches += 1;
@@ -93,9 +93,9 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
                 group2_batches += 1;
                 logGroup2(dec, false);
                 break :reused value;
-            } else try api.moeClamped(ops.s, x, layer.bank, routing.indices, routing.scores, dec, @intFromFloat(target.cfg.glm_swiglu_limit)));
+            } else try api.moeClamped(ops.s, x, layer.bank, routing.indices, routing.scores, dec, @intFromFloat(target.cfg.swiglu_limit)));
             routed_batches += 1;
-            if (layer.shared) |shared| break :blk try ops.binary(.add, routed, try dense(shared, ops, x, target.cfg.glm_swiglu_limit));
+            if (layer.shared) |shared| break :blk try ops.binary(.add, routed, try dense(shared, ops, x, target.cfg.swiglu_limit));
             break :blk routed;
         },
     };
@@ -232,7 +232,7 @@ fn expectGroup2RowsAt(allocator: std.mem.Allocator, rate: c_int, down_rate: c_in
     target.cfg.expert_quant_codebook = dec.codebook;
     target.cfg.expert_quant_window = dec.window;
     target.cfg.expert_quant_table = dec.table;
-    target.cfg.glm_swiglu_limit = 10;
+    target.cfg.swiglu_limit = 10;
     target.layers[3].ffn.moe.shared = null;
     try mlx.check(mlx.mlx_array_eval(w));
     const full = try fixtures.own(try @import("../dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 8, 4096 }, 731, stream));

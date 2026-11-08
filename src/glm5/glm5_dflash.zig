@@ -1,5 +1,6 @@
 //! GLM DFlash2 target adapter and exact branch verification oracle.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const forward = @import("glm5_forward.zig");
 const draft = @import("../dflash.zig");
@@ -257,7 +258,7 @@ pub fn commitVerified(assistant: *const draft.DflashModel, context: *draft.Dflas
 pub fn validatePair(assistant: *const draft.DflashModel, target: *const forward.Model) !void {
     if (target.expert_stream != null) return error.GlmStreamingSpecUnsupported;
     const cfg = &assistant.config;
-    if (!target.cfg.isGlm5() or !cfg.isDflash2() or cfg.hidden_size != target.cfg.hidden_size or cfg.mask_token_id >= target.cfg.vocab_size or
+    if (!arch_config.isOf(target.cfg, "glm5") or !cfg.isDflash2() or cfg.hidden_size != target.cfg.hidden_size or cfg.mask_token_id >= target.cfg.vocab_size or
         assistant.selector == null or cfg.target_layer_ids.len == 0 or cfg.target_layer_ids.len > 16 or
         cfg.block_size < 2 or cfg.block_size > 16 or cfg.conv_kernel_size != 2) return error.GlmDraftTargetMismatch;
     try draft.validateTargetLayers(cfg.target_layer_ids, target.cfg.num_hidden_layers);

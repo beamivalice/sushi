@@ -249,7 +249,7 @@ pub const Hc = struct {
         if (self.rms_mix and mlx.getShape(x)[1] >= 128 and @import("glm5_hc_prefill.zig").enabled()) {
             if (try @import("glm5_hc_prefill.zig").experimentalRmsMixBound(ops.s, x, self.w, cfg.rms_norm_eps, 24)) |candidate| {
                 const mixes = try ops.own(candidate);
-                return primitive.hcCollapse(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
+                return primitive.hcCollapse(x, mixes, self.scale, self.base, @intCast(cfg.hc_sinkhorn_iters), cfg.hc_eps, ops.s);
             }
         }
         return self.collapseReference(ops, x, cfg);
@@ -261,8 +261,8 @@ pub const Hc = struct {
         var result = blk: {
             if (cooperative.enabled() and naxArms() and std.mem.eql(c_int, mlx.getShape(x), &.{ 1, 3, 4, 4096 })) {
                 const mixes = try self.mixReference(ops, x, cfg);
-                if (try cooperative.collapseNormalized(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s, .{ .weight = weight, .epsilon = cfg.rms_norm_eps })) |result| return result;
-                break :blk try primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
+                if (try cooperative.collapseNormalized(x, mixes, self.scale, self.base, @intCast(cfg.hc_sinkhorn_iters), cfg.hc_eps, ops.s, .{ .weight = weight, .epsilon = cfg.rms_norm_eps })) |result| return result;
+                break :blk try primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.hc_sinkhorn_iters), cfg.hc_eps, ops.s);
             }
             break :blk try self.collapse(ops, x, cfg);
         };
@@ -276,12 +276,12 @@ pub const Hc = struct {
     /// The expansion kernel already rounded the residual and normalized its FP32 view.
     pub fn collapseFromNormalized(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, weight: Arr, normalized: Arr) !primitive.HcResult {
         const mixes = try hcMixExact(ops, normalized, self.w);
-        return (try @import("glm5_hc_collapse_simd32.zig").collapseNormalized(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s, .{ .weight = weight, .epsilon = cfg.rms_norm_eps })) orelse error.InvalidGlmHc;
+        return (try @import("glm5_hc_collapse_simd32.zig").collapseNormalized(x, mixes, self.scale, self.base, @intCast(cfg.hc_sinkhorn_iters), cfg.hc_eps, ops.s, .{ .weight = weight, .epsilon = cfg.rms_norm_eps })) orelse error.InvalidGlmHc;
     }
 
     pub fn collapseReference(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
         const mixes = try self.mixReference(ops, x, cfg);
-        return primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
+        return primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.hc_sinkhorn_iters), cfg.hc_eps, ops.s);
     }
 
     pub fn mixReference(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !Arr {

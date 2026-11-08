@@ -156,7 +156,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
             s,
         );
         if (adaptiveRows(self)) {
-            m = dflash_policy.pickRows(&self.dflash_calib, sel_path.?.conf, dflash_mod.qwenMinRows(), self.dflash_block_size) - 1;
+            m = dflash_policy.pickRows(&self.dflash_calib, sel_path.?.conf, dflash_mod.minRows(), self.dflash_block_size) - 1;
             self.dflash_round_width = m;
         }
         const ids_i32 = try allocator.alloc(i32, m);
@@ -428,7 +428,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
 
 /// Rows are chosen per round where a verify row costs bytes; every other target verifies the whole block.
 fn adaptiveRows(self: *const Generator) bool {
-    return drafter.dflashAdaptiveRows(self.xfm) and self.dflash_block_size > dflash_mod.qwenMinRows();
+    return drafter.dflashAdaptiveRows(self.xfm) and self.dflash_block_size > dflash_mod.minRows();
 }
 
 /// DFlash runtime economics gate. Sticky within the request: once a

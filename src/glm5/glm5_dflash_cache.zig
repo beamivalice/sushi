@@ -5,13 +5,15 @@ const draft = @import("../dflash.zig");
 const model = @import("../model.zig");
 const log = @import("../log.zig");
 const schema = "sushi-glm-dflash-runtime-a4g64-v1";
+/// The folder of a GLM pack's own DFlash2 assistant, beside the model files.
+pub const shipped_subdir = "GLM-5.3-Flash-DFlash2";
 const cache_bits = 4;
 const cache_group = 64;
 var space_for_test: ?u64 = null;
 extern "c" fn sushi_available_disk_bytes(path: [*:0]const u8, out: *u64) c_int;
 
 pub fn isShippedSource(directory: []const u8, model_dir: []const u8) bool {
-    return std.mem.eql(u8, std.fs.path.basename(directory), draft.SHIPPED_GLM_SUBDIR) and
+    return std.mem.eql(u8, std.fs.path.basename(directory), shipped_subdir) and
         std.mem.eql(u8, std.fs.path.dirname(directory) orelse "", std.mem.trimEnd(u8, model_dir, "/"));
 }
 
@@ -99,7 +101,7 @@ pub fn cacheValid(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, direc
     const bytes = p.value.object.get("file_size") orelse return false;
     const mtime = p.value.object.get("file_mtime") orelse return false;
     if (format != .string or !std.mem.eql(u8, format.string, schema) or saved != .string or bytes != .integer or mtime != .integer) return false;
-    const source = std.fs.path.join(a, &.{ model_dir, draft.SHIPPED_GLM_SUBDIR }) catch return false;
+    const source = std.fs.path.join(a, &.{ model_dir, shipped_subdir }) catch return false;
     defer a.free(source);
     const stat = dir.statFile(io, "model.safetensors", .{}) catch return false;
     if (bytes.integer != stat.size or mtime.integer != stat.mtime.nanoseconds) return false;
@@ -282,12 +284,12 @@ fn build(io: std.Io, a: std.mem.Allocator, source: []const u8, stage: []const u8
 }
 
 fn tinySource(io: std.Io, a: std.mem.Allocator, parent: std.Io.Dir, path: []const u8, s: mlx.mlx_stream) ![]u8 {
-    try parent.createDirPath(io, draft.SHIPPED_GLM_SUBDIR);
-    var dir = try parent.openDir(io, draft.SHIPPED_GLM_SUBDIR, .{});
+    try parent.createDirPath(io, shipped_subdir);
+    var dir = try parent.openDir(io, shipped_subdir, .{});
     defer dir.close(io);
     try dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"architectures\":[\"DFlash2DraftModel\"],\"hidden_size\":128,\"dflash_config\":{\"block_size\":8,\"mask_token_id\":31,\"target_layer_ids\":[1,3]}}" });
     try dir.writeFile(io, .{ .sub_path = "README.md", .data = "license: cc-by-nc-nd-4.0\nOriginal untouched checkpoint\n" });
-    const source = try std.fs.path.join(a, &.{ path, draft.SHIPPED_GLM_SUBDIR });
+    const source = try std.fs.path.join(a, &.{ path, shipped_subdir });
     errdefer a.free(source);
     const file = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{source}, 0);
     defer a.free(file);
@@ -424,7 +426,7 @@ test "GLM runtime cache stays valid after the source folder is deleted" {
     defer a.free(source);
     const made = try prepare(io, a, source, s);
     defer a.free(made.path);
-    try tmp.dir.deleteTree(io, draft.SHIPPED_GLM_SUBDIR);
+    try tmp.dir.deleteTree(io, shipped_subdir);
     try std.testing.expect(cacheValid(io, a, parent, made.path));
     const found = draft.resolveInDirDrafter(io, a, parent) orelse return error.TestExpectedInDirDrafter;
     defer a.free(found);
@@ -463,7 +465,7 @@ test "GLM runtime cache with damaged weights is invalid even when the source is 
     defer a.free(source);
     const made = try prepare(io, a, source, s);
     defer a.free(made.path);
-    try tmp.dir.deleteTree(io, draft.SHIPPED_GLM_SUBDIR);
+    try tmp.dir.deleteTree(io, shipped_subdir);
     var cache = try std.Io.Dir.openDirAbsolute(io, made.path, .{});
     defer cache.close(io);
     try cache.writeFile(io, .{ .sub_path = "model.safetensors", .data = "truncated" });

@@ -1,6 +1,8 @@
 //! MiMo-V2 forward: sliding/global attention arms, routed-MoE dispatch, batched decode and verify rows.
 
 const trunk_mod = @import("../trunk.zig");
+const arch_config = @import("../arch/config.zig");
+const mimo_config = @import("mimo_config.zig");
 const arch_state = @import("../arch/arch_state.zig");
 const forward_diag = @import("../forward_diag.zig");
 const moe_router = @import("../moe_router.zig");
@@ -519,7 +521,7 @@ pub const MimoWarmRows = u32;
 pub fn warmupMimoVerify(self: *Trunk, kv_config: KVQuantConfig) !MimoWarmRows {
     forward_diag.moe_dump_warmup_depth += 1;
     defer forward_diag.moe_dump_warmup_depth -= 1;
-    if (!self.config.isMimo()) return 0;
+    if (!arch_config.isOf(self.config, "mimo2")) return 0;
     const sl = try Trunk.SpecWarmSlot.init(self, kv_config);
     defer {
         sl.deinit(self.allocator);
@@ -612,7 +614,7 @@ pub fn forwardMimoBatchedDecode(
 }
 
 pub fn supportsBatchedMimoDecode(self: *const Trunk) bool {
-    return self.config.supportsBatchedMimoDecode() and self.moe_layers != null and self.expert_stream == null;
+    return mimo_config.supportsBatchedDecode(self.config) and self.moe_layers != null and self.expert_stream == null;
 }
 
 pub fn forwardMoeWith(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {

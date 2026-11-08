@@ -2,6 +2,9 @@
 const std = @import("std");
 const log = @import("../log.zig");
 const model_mod = @import("../model.zig");
+const dflash_mod = @import("../dflash.zig");
+const model_load = @import("../model_load.zig");
+const tokenizer_mod = @import("../tokenizer.zig");
 const qwen4_config = @import("qwen4_config.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const qwen4_state = @import("qwen4_state.zig");
@@ -50,6 +53,55 @@ pub fn fusedStreamFoldsNorm(key: []const u8) bool {
     };
     for (suffixes) |suffix| if (std.mem.endsWith(u8, key, suffix)) return true;
     return false;
+}
+
+pub fn drafterChosen(io: std.Io, allocator: std.mem.Allocator, config: *model_mod.ModelConfig, drafter_dir: []const u8, no_drafter: bool, mtp_on: bool) !void {
+    if (drafter_dir.len > 0) return model_load.stampDflashRequestTerms(io, allocator, config, drafter_dir);
+    const why: []const u8 = if (no_drafter) "--no-drafter" else "DFlash2: --drafter <path>";
+    log.info("[spec] Qwen3.8-Flash-Next decodes with {s} ({s})\n", .{ if (mtp_on) "MTP" else "plain ticks", why });
+}
+
+/// The widest verify whose rows are decode-tick identical (`mtp.MAX_DEPTH` drafts + t1).
+const DFLASH_MAX_ROWS: u32 = 9;
+
+/// The rows a DFlash2 round may verify, from the flags or the defaults; the drafter's own block and the verify path
+/// bound them.
+pub fn dflashRowBoundsOf(min: ?u32, max: ?u32, config_block: u32) error{DrafterDepthUnsupported}!dflash_mod.RowBounds {
+    const hi = max orelse @min(config_block, DFLASH_MAX_ROWS);
+    const lo = min orelse @min(dflash_mod.DRAFTER_DEPTH_MIN, hi);
+    if (hi > @min(config_block, DFLASH_MAX_ROWS) or lo > hi or lo < dflash_mod.DRAFTER_DEPTH_MIN) return error.DrafterDepthUnsupported;
+    return .{ .min = lo, .max = hi };
+}
+
+pub fn dflashRowBounds(min: ?u32, max: ?u32, config_block: u32) !?u32 {
+    const bounds = dflashRowBoundsOf(min, max, config_block) catch |err| {
+        log.err("--drafter-min-depth/--drafter-max-depth: this drafter serves {d}..{d} rows per round on Qwen3.8-Flash-Next\n", .{ dflash_mod.DRAFTER_DEPTH_MIN, @min(config_block, DFLASH_MAX_ROWS) });
+        return err;
+    };
+    return bounds.max;
+}
+
+pub fn bindDflash(_: std.mem.Allocator, xfm: *Trunk, d: *dflash_mod.DflashModel, _: KVQuantConfig, _: *tokenizer_mod.Tokenizer) !bool {
+    d.sliding_serving = true;
+    try d.bind(xfm);
+    return true;
+}
+
+pub fn logDflashReady(block_size: u32) void {
+    log.info("[spec] Qwen3.8-Flash-Next decodes with DFlash2 ({d}..{d} rows per round; --drafter outranks MTP, --no-drafter selects it)\n", .{ dflash_mod.minRows(), block_size });
+}
+
+test "Flash-Next rows default to 2..block and are bounded by the drafter block and the verify path" {
+    const RowBounds = dflash_mod.RowBounds;
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 8 }, try dflashRowBoundsOf(null, null, 8));
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 3 }, try dflashRowBoundsOf(null, 3, 8));
+    try testing.expectEqual(RowBounds{ .min = 4, .max = 8 }, try dflashRowBoundsOf(4, null, 8));
+    try testing.expectEqual(RowBounds{ .min = 4, .max = 4 }, try dflashRowBoundsOf(4, 4, 8));
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 3 }, try dflashRowBoundsOf(null, null, 3));
+    try testing.expectError(error.DrafterDepthUnsupported, dflashRowBoundsOf(null, 10, 16));
+    try testing.expectError(error.DrafterDepthUnsupported, dflashRowBoundsOf(null, 6, 5));
+    try testing.expectError(error.DrafterDepthUnsupported, dflashRowBoundsOf(5, 3, 8));
+    try testing.expectError(error.DrafterDepthUnsupported, dflashRowBoundsOf(9, null, 8));
 }
 
 /// The binder places the PLE by exact equality and nothing downstream notices its absence: a PLE-less trunk emits

@@ -317,7 +317,7 @@ pub fn shouldDownload(full_path: []const u8) bool {
     var path = full_path;
     if (std.mem.indexOfScalar(u8, path, '/')) |slash| {
         if (std.mem.startsWith(u8, path, "mtp/")) return true;
-        if (!std.mem.eql(u8, path[0..slash], dflash.SHIPPED_GLM_SUBDIR)) return false;
+        if (!dflash.isShippedSubdir(path[0..slash])) return false;
         path = path[slash + 1 ..];
         if (path.len == 0 or path[0] == '.' or std.mem.indexOfScalar(u8, path, '/') != null) return false;
     }
@@ -1001,7 +1001,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     }
 
     var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch {
-        if (!online) try w.print("no models yet (looked in {s})\ntry: sushi pull qwen3.8-flash-next\n", .{root});
+        if (!online) try w.print("no models yet (looked in {s})\ntry: sushi pull {s}\n", .{ root, packs.aliases[0].name });
         return;
     };
     defer dir.close(io);
@@ -1035,7 +1035,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             count += 1;
         }
     }
-    if (count == 0 and !online) try w.print("(none) — try: sushi pull qwen3.8-flash-next\n", .{});
+    if (count == 0 and !online) try w.print("(none) — try: sushi pull {s}\n", .{packs.aliases[0].name});
 }
 
 fn printLocalHeader(w: *std.Io.Writer, count: usize) !void {

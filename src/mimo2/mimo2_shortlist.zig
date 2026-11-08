@@ -2,6 +2,7 @@
 //! same qmv, so each value is the full readout's), every other id -inf. Serial ticks and verify rows take it alike; the
 //! trunk asks it through `arch_state.headShortlist`.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
 const mtp_mod = @import("../mtp.zig");
@@ -28,7 +29,7 @@ fn shortlistOn() bool {
 pub fn readout(t: *const Trunk, cell: *Cell, x: mlx.mlx_array) !?mlx.mlx_array {
     const head = cell.coarse orelse return null;
     const bits = head.bits;
-    if (!t.config.isMimo() or !shortlistOn()) return null;
+    if (!arch_config.isOf(t.config, "mimo2") or !shortlistOn()) return null;
     const xsh = mlx.getShape(x);
     if (xsh.len != 3 or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     const n: usize = @intCast(xsh[0] * xsh[1]);

@@ -169,7 +169,7 @@ pub const GlmVision = struct {
             .merger_proj = try Projection.load(weights, "model.visual.merger.proj", cfg.qv_out_hidden, cfg.qv_out_hidden, false),
             .merger_norm_w = try tensor(weights, prefix, "merger.post_projection_norm.weight"),
             .merger_norm_b = try tensor(weights, prefix, "merger.post_projection_norm.bias"),
-            .merger_mlp = try Mlp.load(weights, "model.visual.merger", cfg.qv_out_hidden, cfg.glmv_projection_intermediate, false),
+            .merger_mlp = try Mlp.load(weights, "model.visual.merger", cfg.qv_out_hidden, cfg.vision_proj_intermediate, false),
         };
     }
     pub fn deinit(self: *GlmVision) void {
@@ -198,7 +198,7 @@ pub const GlmVision = struct {
         var row: usize = 0;
         for (0..gh / cfg.qv_merge) |by| for (0..gw / cfg.qv_merge) |bx| for (0..cfg.qv_merge) |dy| for (0..cfg.qv_merge) |dx| {
             for (0..d / 4) |j| {
-                const freq = std.math.pow(f32, cfg.glmv_rope_theta, -@as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(d / 2)));
+                const freq = std.math.pow(f32, cfg.vision_rope_theta, -@as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(d / 2)));
                 for (0..2) |axis| {
                     const pos = if (axis == 0) by * cfg.qv_merge + dy else bx * cfg.qv_merge + dx;
                     const angle = @as(f32, @floatFromInt(pos)) * freq;
@@ -225,8 +225,8 @@ pub const GlmVision = struct {
         const h: c_int = @intCast(self.config.qv_heads);
         const d: c_int = @intCast(self.config.qv_head_dim);
         const qkv = try ops.reshape(try block.qkv.apply(ops, x), &.{ n, 3, h, d });
-        const q0 = try ops.rms(try ops.reshape(try ops.slice(qkv, 1, 0, 1), &.{ n, h, d }), block.q_norm, self.config.glmv_eps);
-        const k0 = try ops.rms(try ops.reshape(try ops.slice(qkv, 1, 1, 2), &.{ n, h, d }), block.k_norm, self.config.glmv_eps);
+        const q0 = try ops.rms(try ops.reshape(try ops.slice(qkv, 1, 0, 1), &.{ n, h, d }), block.q_norm, self.config.vision_eps);
+        const k0 = try ops.rms(try ops.reshape(try ops.slice(qkv, 1, 1, 2), &.{ n, h, d }), block.k_norm, self.config.vision_eps);
         const q = try ops.reshape(try ops.transpose(try self.rotate(ops, q0, r, d), &.{ 1, 0, 2 }), &.{ 1, h, n, d });
         const k = try ops.reshape(try ops.transpose(try self.rotate(ops, k0, r, d), &.{ 1, 0, 2 }), &.{ 1, h, n, d });
         const v = try ops.transpose(try ops.reshape(try ops.slice(qkv, 1, 2, 3), &.{ 1, n, h, d }), &.{ 0, 2, 1, 3 });
@@ -270,8 +270,8 @@ pub const GlmVision = struct {
         for (self.blocks) |block| {
             var ops = Ops{ .s = self.s };
             defer ops.deinit();
-            const hidden = try ops.binary(.add, x, try self.attention(&ops, try ops.rms(x, block.norm1, cfg.glmv_eps), block, r, n));
-            const result = try ops.binary(.add, hidden, try block.mlp.apply(&ops, try ops.rms(hidden, block.norm2, cfg.glmv_eps), cfg.glmv_swiglu_limit));
+            const hidden = try ops.binary(.add, x, try self.attention(&ops, try ops.rms(x, block.norm1, cfg.vision_eps), block, r, n));
+            const result = try ops.binary(.add, hidden, try block.mlp.apply(&ops, try ops.rms(hidden, block.norm2, cfg.vision_eps), cfg.vision_swiglu_limit));
             try mlx.check(mlx.mlx_array_eval(result));
             _ = mlx.mlx_array_free(x);
             x = try ops.result(result);
@@ -279,7 +279,7 @@ pub const GlmVision = struct {
         var ops = Ops{ .s = self.s };
         defer ops.deinit();
         const merged = @divExact(n, @as(c_int, @intCast(cfg.qv_merge * cfg.qv_merge)));
-        const normalized = try ops.rms(x, self.post_norm, cfg.glmv_eps);
+        const normalized = try ops.rms(x, self.post_norm, cfg.vision_eps);
         const grouped = try ops.reshape(normalized, &.{ merged, @intCast(cfg.qv_merge), @intCast(cfg.qv_merge), @intCast(cfg.qv_hidden) });
         const down = try self.downsample.apply(&ops, try ops.reshape(try ops.transpose(grouped, &.{ 0, 3, 1, 2 }), &.{ merged, @intCast(cfg.qv_hidden * cfg.qv_merge * cfg.qv_merge) }));
         const proj = try self.merger_proj.apply(&ops, down);
@@ -288,7 +288,7 @@ pub const GlmVision = struct {
         const erf = try ops.slot();
         try mlx.check(mlx.mlx_erf(erf, try ops.binary(.mul, f, try ops.scalar(1 / @sqrt(@as(f32, 2)), .float32)), self.s));
         const gelu = try ops.cast(try ops.binary(.mul, try ops.binary(.mul, f, try ops.scalar(0.5, .float32)), try ops.binary(.add, erf.*, try ops.scalar(1, .float32))), mlx.mlx_array_dtype(norm));
-        const out = try ops.reshape(try self.merger_mlp.apply(&ops, gelu, cfg.glmv_swiglu_limit), &.{ 1, merged, @intCast(cfg.qv_out_hidden) });
+        const out = try ops.reshape(try self.merger_mlp.apply(&ops, gelu, cfg.vision_swiglu_limit), &.{ 1, merged, @intCast(cfg.qv_out_hidden) });
         try mlx.check(mlx.mlx_array_eval(out));
         return ops.result(out);
     }
@@ -320,12 +320,12 @@ pub fn encodeScratchBytes(cfg: *const model.ModelConfig, patches: u64) u64 {
     const scores = 4 * @as(u64, cfg.qv_heads) * @min(patches, QUERY_CHUNK) * patches;
     const activations = 4 * patches * (12 * @as(u64, cfg.qv_hidden) + 6 * @as(u64, cfg.qv_intermediate));
     const merged = patches / @max(@as(u64, cfg.qv_merge) * cfg.qv_merge, 1);
-    const merger = 4 * merged * (8 * @as(u64, cfg.qv_out_hidden) + 6 * @as(u64, cfg.glmv_projection_intermediate));
+    const merger = 4 * merged * (8 * @as(u64, cfg.qv_out_hidden) + 6 * @as(u64, cfg.vision_proj_intermediate));
     return (64 << 20) + scores * 13 / 10 + @max(activations, merger);
 }
 
 fn tinyConfig() model.ModelConfig {
-    return .{ .glm5_vision = true, .has_vision = true, .hidden_size = 64, .qv_depth = 2, .qv_hidden = 32, .qv_heads = 4, .qv_head_dim = 8, .qv_intermediate = 48, .qv_patch = 4, .qv_temporal_patch = 2, .qv_merge = 2, .qv_out_hidden = 64, .glmv_projection_intermediate = 80, .glmv_swiglu_limit = 0.7 };
+    return .{ .glm5_vision = true, .has_vision = true, .hidden_size = 64, .qv_depth = 2, .qv_hidden = 32, .qv_heads = 4, .qv_head_dim = 8, .qv_intermediate = 48, .qv_patch = 4, .qv_temporal_patch = 2, .qv_merge = 2, .qv_out_hidden = 64, .vision_proj_intermediate = 80, .vision_swiglu_limit = 0.7 };
 }
 fn tinyWeights(tmp: *std.testing.TmpDir) !model.Weights {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tiny.safetensors", .data = @embedFile("../fixtures/glm5_vision_tiny.safetensors") });

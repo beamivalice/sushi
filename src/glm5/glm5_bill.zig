@@ -1,5 +1,6 @@
 //! GLM-5.3's own terms of the bill: the latent cache, the KDA checkpoints, the DFlash2 window and the native prefill's scratch.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const model_mod = @import("../model.zig");
 const fixtures = @import("../bills_fixtures_test.zig");
 const bills = @import("../bills.zig");
@@ -54,7 +55,7 @@ pub fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk:
 /// MiMo's raw-FP8 prefill route retains BF16 scratch for each projection until
 /// the pending layer graph is evaluated. Decode uses its direct GEMV, with none.
 pub fn glmFp8DequantScratchBytes(config: *const model_mod.ModelConfig, rows: u64, pending_layers: u64) u64 {
-    if (!config.glm_fp8_trunk or rows <= @as(u64, @intCast(fp8_block.gemv_max_rows))) return 0;
+    if (!config.fp8_block128_trunk or rows <= @as(u64, @intCast(fp8_block.gemv_max_rows))) return 0;
     const hidden: u64 = config.hidden_size;
     const dense = 3 *| hidden *| config.intermediate_size;
     const shared = 3 *| hidden *| config.moe_intermediate_size;
@@ -295,7 +296,7 @@ test "GLM prefill transient bill follows the latent width: kv6 sheds 128 bytes p
 test "GLM raw FP8 scratch bills all pending projections only beyond direct decode" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/glm5_config.json"));
     try std.testing.expectEqual(@as(u64, 0), glmFp8DequantScratchBytes(&cfg, 2048, 2));
-    cfg.glm_fp8_trunk = true;
+    cfg.fp8_block128_trunk = true;
     try std.testing.expectEqual(@as(u64, 0), glmFp8DequantScratchBytes(&cfg, @intCast(fp8_block.gemv_max_rows), 2));
     try std.testing.expectEqual(@as(u64, 576 * 1024 * 1024), glmFp8DequantScratchBytes(&cfg, 2048, 2));
     try std.testing.expectEqual(glmFp8DequantScratchBytes(&cfg, 17, 1) * 2, glmFp8DequantScratchBytes(&cfg, 2048, 2));
@@ -428,7 +429,7 @@ test "bill pin: the GLM terms" {
                 g.add(glmDflashRequestBytes(c, rows));
                 g.add(bills.dflashRequestBytes(c, rows));
             }
-            if (c.isGlm5()) {
+            if (arch_config.isOf(c, "glm5")) {
                 for (bills.pin_bits) |b| {
                     g.add(glm5TransientBytes(c, 5000, 2048, b));
                     g.add(glmCacheBytes(c, 5000, 4096, b));

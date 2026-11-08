@@ -18,6 +18,7 @@ pub const State = qwen4_state.State;
 pub const Ctx = qwen4_state.Ctx;
 
 pub const packs = struct { // slot:packs (S2h)
+    pub const dflash_target = true;
     pub const product = "Qwen3.8-Flash-Next";
     pub const aliases = [_]@import("../arch/packs.zig").Alias{
         .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 131072 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
@@ -25,6 +26,14 @@ pub const packs = struct { // slot:packs (S2h)
         .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 --prefill-chunk 2048 --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
     };
 };
+/// A streamed Sushi EXL3 pack keeps its MTP head, whose resident tensors carry the canonical `language_model.mtp.` keys.
+pub const streamed_mtp_head = struct {
+    pub const phrase = "a Sushi EXL3 Qwen3.8-Flash-Next pack";
+    pub fn supported(layout: @import("../expert_quant.zig").Layout) bool {
+        return layout == .exl3_k4;
+    }
+};
+
 pub const flags = @import("qwen4_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("qwen4_drafter.zig");
@@ -44,6 +53,11 @@ pub const kernels = struct {
     pub const batchedGatherFloor = qwen4_qsa_gather.qsaBatchedGatherFloor;
     pub const scoreFusedFor = qwen4_qsa_select.qsaScoreFusedActiveFor;
     pub const warmEnvCaches = @import("qwen4_qsa_attn.zig").warmQsaEnvCaches;
+    pub const diagArmed = @import("qwen4_profile_env.zig").profileArmed;
+
+    pub fn sharedFoldEngaged() void {
+        @import("../log.zig").info("[qwen] shared expert rides the routed launches engaged\n", .{});
+    }
 
     pub inline fn moeStandin() @import("../arch/kernels.zig").MoeStandin {
         const s = qwen4_forward.qwen4Standin();
@@ -55,7 +69,7 @@ const config_file = @import("qwen4_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "qwen4_exp", "qwen4_exp_text" };
 pub const discovery_types = config_types;
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .hyper_connected = true };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .hyper_connected = true, .chip_capped_drafter_block = false, .dflash_by_flag = true, .long_ctx_gated = true, .sushi_quant_memory_bill = true, .thinking_off_checkpoint = true, .skips_mtp_weights_when_off = true, .expert_source = .language_model_banks, .mtp_head_marker = "\"language_model.mtp.fc_hidden.weight\"", .streams_rate_groups = true, .mtp_draft_temp = 1.0, .cost_layout = .long };
 pub const pack_layout: arch_config.PackLayout = .{ .prefix = "language_model.model", .head = .{ .layer = "language_model.mtp.layers.0" }, .streams_groups = true };
 pub const parseConfig = config_file.parseFamily;
 pub const parseDir = config_file.parseDir;

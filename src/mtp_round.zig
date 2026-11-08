@@ -27,6 +27,7 @@ const MtpRoundPlan = mtp_policy.MtpRoundPlan;
 const SubLap = mtp_policy.SubLap;
 const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
+const arch_config = @import("arch/config.zig");
 const isEosId = spec_types.isEosId;
 const mtpAdaptiveEnabled = Generator.mtpAdaptiveEnabled;
 const mtpAdaptiveSerialEnabled = Generator.mtpAdaptiveSerialEnabled;
@@ -1535,7 +1536,7 @@ pub fn mtpRoundAfterChain(
     // (ssm_entries == null) keeps the proven snapshot + re-forward path.
     const kv_step_snap = self.ctx.cache.step;
     // MiMo is attention-only: a truncate IS its rollback, rings included.
-    var kv_snap: ?trunk.KVCacheSnapshot = if (self.ctx.ssm_entries != null or self.xfm.config.isMimo()) null else try self.ctx.cache.snapshot();
+    var kv_snap: ?trunk.KVCacheSnapshot = if (self.ctx.ssm_entries != null or arch_config.fact(&self.xfm.config, "mtp_rollback_by_truncate")) null else try self.ctx.cache.snapshot();
     errdefer if (kv_snap) |*snap| snap.deinit();
     const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
@@ -2189,7 +2190,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
 
     var re_new_hidden = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(re_new_hidden);
-    if (self.ctx.ssm_entries == null and xfm.config.isMimo()) {
+    if (self.ctx.ssm_entries == null and arch_config.fact(&xfm.config, "mtp_rollback_by_truncate")) {
         const accepted_len: usize = 1 + @as(usize, accepted);
         try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
         self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
@@ -2293,7 +2294,7 @@ pub fn mtpDraftGreedyFor(target: sampler.SamplingParams) bool {
 }
 
 pub fn mtpDraftTempFor(config: *const model_mod.ModelConfig) f32 {
-    return if (std.mem.eql(u8, config.model_type, "qwen4_exp")) MTP_DRAFT_TEMP_QWEN4 else MTP_DRAFT_TEMP;
+    return (arch_config.facts(config) orelse arch_config.Facts{}).mtp_draft_temp orelse MTP_DRAFT_TEMP;
 }
 
 /// Draft-proposal sampler for a round: greedy targets keep greedy drafts
@@ -2569,10 +2570,6 @@ pub const MTP_DRAFT_TEMP: f32 = 0.6;
 pub const MTP_DRAFT_TOP_P: f32 = 0.95;
 
 pub const MTP_DRAFT_TOP_K: u32 = 20;
-
-/// Draft temperature is per FAMILY: the sidecar head's 0.6 does not carry
-/// over, and Flash Next drafts best at the target's own temperature.
-pub const MTP_DRAFT_TEMP_QWEN4: f32 = 1.0;
 
 /// Where a serial block sits in its ramp back to `nextMtp`'s entry invariant.
 pub const MtpSerialExit = enum { none, drain, capture };
@@ -3045,7 +3042,7 @@ test "the lookup gate prices the MTP chain at the width its rounds draft, not th
     }
     _ = t.observeLookup(7, 1000, 500.0, 8.0, true);
     for (0..round_cost.MIN_SAMPLES) |_| _ = t.observeLookup(7, 1000, 71.0, 7.5, true);
-    const src = mtp_policy.MtpCostSource.init(mtp_policy.MTP_EV_MIMO_EXL3_COSTS, 1000, &t);
+    const src = mtp_policy.MtpCostSource.init(mtp_policy.mtpEvCostsForProfile(.mimo_exl3), 1000, &t);
     try testing.expect(src.fromTable());
     var d: [20]u32 = undefined;
     for (&d, 0..) |*x, i| x.* = @intCast(i);

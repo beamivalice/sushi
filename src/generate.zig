@@ -525,16 +525,16 @@ pub const Generator = struct {
     dflash_ctx: ?dflash_mod.DflashCtx = null,
     native_dflash: bool = false,
     /// Accepted share of a DFlash2 round's drafts, smoothed; the grouped tick prices draft rows with it.
-    glm_draft_rate: f32 = 0.8,
+    native_draft_rate: f32 = 0.8,
     /// Verbatim-copy rounds (`glmLookupChain`) and the drafts they landed, for `[spec-stats]`.
-    glm_lookup: struct { rounds: u64 = 0, landed: u64 = 0 } = .{},
+    native_lookup: struct { rounds: u64 = 0, landed: u64 = 0 } = .{},
     /// The GLM assistant window as prefill left it, committed with the prefix: every GLM restore
     /// point lies at or below the prompt end, which a window cropped at the reply's end can miss.
-    glm_prefill_window: ?SpecWindow = null,
+    native_prefill_window: ?SpecWindow = null,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
-    glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
+    native_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Whether a DFlash2 round pays against a plain one-row tick for this request, and the plain ticks it ran.
-    glm_gate: spec_cost_gate.Gate = .{},
+    native_gate: spec_cost_gate.Gate = .{},
     dflash_plain: struct { ticks: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, capped by the machine's verify lanes).
     /// Drafts per round = dflash_block_size - 1.
@@ -856,7 +856,7 @@ pub const Generator = struct {
             },
             .dflash => .{
                 .rounds = self.dflash_attempted,
-                .drafted = if (self.native_dflash) self.glm_round.drafted else spec_stats.proposed(self.dflash_drafts_verified, self.dflash_attempted, if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0),
+                .drafted = if (self.native_dflash) self.native_round.drafted else spec_stats.proposed(self.dflash_drafts_verified, self.dflash_attempted, if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0),
                 .accepted = self.dflash_accepted_tokens,
                 .plain = self.dflash_plain.ticks,
             },
@@ -998,24 +998,7 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_implausible,
                 },
             );
-            if (self.native_dflash) {
-                const rounds: f64 = @floatFromInt(self.dflash_attempted);
-                const r = self.glm_round;
-                const plain_ticks: f64 = @floatFromInt(@max(self.dflash_plain.ticks, 1));
-                log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2} lookup={d}/{d} plain={d} serial_ms={d:.2} plain_ms verify={d:.2} replay={d:.2} commit={d:.2}\n", .{
-                    @as(f64, @floatFromInt(r.draft_ns)) / rounds / 1e6,
-                    @as(f64, @floatFromInt(r.verify_ns)) / rounds / 1e6,
-                    @as(f64, @floatFromInt(r.replay_ns)) / rounds / 1e6,
-                    @as(f64, @floatFromInt(r.commit_ns)) / rounds / 1e6,
-                    self.glm_lookup.rounds,
-                    self.glm_lookup.landed,
-                    self.dflash_plain.ticks,
-                    self.glm_gate.serial_ms orelse 0.0,
-                    @as(f64, @floatFromInt(self.dflash_plain.verify_ns)) / plain_ticks / 1e6,
-                    @as(f64, @floatFromInt(self.dflash_plain.replay_ns)) / plain_ticks / 1e6,
-                    @as(f64, @floatFromInt(self.dflash_plain.commit_ns)) / plain_ticks / 1e6,
-                });
-            }
+            if (self.native_dflash) drafter.logNativeRoundStats(self);
             return;
         }
     }
@@ -1760,9 +1743,7 @@ pub const Generator = struct {
                     if (mtp_active) {
                         mtp_cache.?.activate();
                     }
-                    if (mtp_active) arch_state.markHeadCheckpoint(xfm, abs_end_for_cp2 -| mtp_position_base) catch |e| {
-                        log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
-                    };
+                    if (mtp_active) arch_state.markHeadCheckpointLogged(xfm, abs_end_for_cp2 -| mtp_position_base);
                     // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
                     // the last `max * stride` tokens and left no affordable trim point.
                     prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
@@ -1875,9 +1856,7 @@ pub const Generator = struct {
                     if (mtp_active) {
                         mtp_cache.?.activate();
                     }
-                    if (mtp_active) arch_state.markHeadCheckpoint(xfm, final_abs -| mtp_position_base) catch |e| {
-                        log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
-                    };
+                    if (mtp_active) arch_state.markHeadCheckpointLogged(xfm, final_abs -| mtp_position_base);
                     prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
                 }
             }
@@ -2095,8 +2074,8 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(sample_lazy);
 
             if (native_dflash) try drafter.reserveNativeDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
-            var glm_window: ?SpecWindow = if (native_dflash and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
-            errdefer if (glm_window) |*w| w.snapshot.deinit();
+            var native_window: ?SpecWindow = if (native_dflash and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
+            errdefer if (native_window) |*w| w.snapshot.deinit();
             const mtp_cost_profile: mtp_mod.MtpCostProfile = if (mtp_active)
                 options.mtp.?.costProfile(xfm, ctx.cache.config)
             else
@@ -2139,7 +2118,7 @@ pub const Generator = struct {
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
                 .native_dflash = native_dflash,
-                .glm_prefill_window = glm_window,
+                .native_prefill_window = native_window,
                 .dflash_block_size = dflash_bs,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_accept_graph = accept_route.graph,
@@ -2158,7 +2137,7 @@ pub const Generator = struct {
             };
             mtp_cache = null; // ownership transferred to the Generator
             dflash_ctx = null; // ownership transferred to the Generator
-            glm_window = null;
+            native_window = null;
             // pending_logits/pending_token left empty — the lazy pipeline is
             // skipped under drafter / MTP. The speculative `next*` paths
             // drive every subsequent step with predictable cache offset.
@@ -2487,9 +2466,9 @@ pub const Generator = struct {
             dc.deinit();
             self.dflash_ctx = null;
         }
-        if (self.glm_prefill_window) |*w| {
+        if (self.native_prefill_window) |*w| {
             w.snapshot.deinit();
-            self.glm_prefill_window = null;
+            self.native_prefill_window = null;
         }
         if (self.mtp_hist_stash) |*st| {
             st.deinit();
@@ -4489,7 +4468,7 @@ test "specTotals: a DFlash2 request reports the ticks it ran without a draft as 
     g.native_dflash = true;
     g.dflash_attempted = 6;
     g.dflash_accepted_tokens = 9;
-    g.glm_round = .{ .drafted = 24 };
+    g.native_round = .{ .drafted = 24 };
     g.dflash_plain = .{ .ticks = 3 };
     try testing.expectEqual(Generator.SpecMode.dflash, g.specMode());
     try testing.expectEqual(spec_stats.Totals{ .rounds = 6, .drafted = 24, .accepted = 9, .plain = 3 }, g.specTotals());

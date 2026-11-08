@@ -13,7 +13,7 @@ test "GLM EXL3 preflight refuses orphan MTP and out of range packed tensors" {
     defer arena.deinit();
     const a = arena.allocator();
     var source = SourceIndex{ .weight_map = std.StringHashMap([]const u8).init(a), .files = std.StringHashMap(void).init(a), .tensors = std.StringHashMap(TensorMeta).init(a), .stamps = std.StringHashMap(ShardStamp).init(a) };
-    const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .exl3_k4, .expert_quant_rate = .{ .n = 36 }, .num_hidden_layers = 2, .first_k_dense_replace = 1, .num_experts = 2, .num_experts_per_tok = 1, .hidden_size = 128, .moe_intermediate_size = 128, .glm_mtp_layers = 1 };
+    const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .exl3_k4, .expert_quant_rate = .{ .n = 36 }, .num_hidden_layers = 2, .first_k_dense_replace = 1, .num_experts = 2, .num_experts_per_tok = 1, .hidden_size = 128, .moe_intermediate_size = 128, .mtp_layers = 1 };
     const code = TensorMeta{ .dtype = .u16, .shape = &.{ 2, 8, 8, 36 }, .data_start = 0, .data_end = 2 * 8 * 8 * 36 * 2, .data_base = 0, .file = "test.safetensors" };
     const scale = TensorMeta{ .dtype = .f16, .shape = &.{ 2, 128 }, .data_start = 0, .data_end = 2 * 128 * 2, .data_base = 0, .file = "test.safetensors" };
     for ([_][]const u8{ "gate", "up", "down" }) |p| for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {

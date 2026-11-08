@@ -22,3 +22,7 @@ pub fn weights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, 
 pub fn shipsHead(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
     return source.shipsDspark(io, allocator, model_dir);
 }
+
+pub const refusals = struct {
+    pub const SsdBudgetBelowVision = "--ssd-budget-gb cannot hold the vision tower (--vision, or the default on DeepSeek-V4.1) beside the minimum expert cache. Raise the budget or pass --no-vision.";
+};

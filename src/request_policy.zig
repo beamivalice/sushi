@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_chat = @import("arch/chat.zig");
 const arch_handle = @import("arch/handle.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
@@ -455,8 +456,8 @@ pub fn responsesEnableThinking(root: std.json.ObjectMap, from_reasoning: bool, a
 pub fn checkThinkingSupport(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, snap: *const effort_mod.Snapshot, enabled: bool, anthropic: bool) !bool {
     const config = lm.config.?;
     if (!thinkingOffRefused(config, snap, enabled)) return true;
-    const message = if (config.isGlm5())
-        try allocator.dupe(u8, "GLM-5.3 supports thinking low, high, max; thinking off is not supported by its original template.")
+    const message = if (arch_chat.thinkOffRefusal(config.model_type)) |refusal|
+        try allocator.dupe(u8, refusal)
     else
         try effortRefusalFor(allocator, lm, "off", snap);
     defer allocator.free(message);
@@ -468,7 +469,7 @@ pub fn checkThinkingSupport(allocator: std.mem.Allocator, stream: *Conn, lm: *Lo
 /// request that thinks off only because the model does (a checkpoint declaring it) passes; GLM's template has no off.
 pub fn thinkingOffRefused(config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot, enabled: bool) bool {
     if (enabled) return false;
-    if (config.isGlm5()) return true;
+    if (arch_chat.thinkOffRefusal(config.model_type) != null) return true;
     const arms = effort_mod.servedArmsIn(snap, config.model_type) orelse return false;
     if (effort_mod.findEffortArm(arms.slice(), .off) != null) return false;
     return config.defaultEnableThinkingIn(snap);
@@ -486,7 +487,7 @@ pub const Thinking = struct { enable: bool, budget: i32, template: ?[]const u8 }
 /// Qwen under an `off` default (`--think off`, the table's): a request naming no effort word thinks only when it names a
 /// thinking budget, at the level silence renders (`chat.qwen38EffortFor`); its on switch alone leaves it off.
 fn holdOffDefault(t: *Thinking, config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot, names_effort: bool, names_budget: bool, explicit_off: bool) void {
-    if (names_effort or !config.isQwen4() or !model_mod.defaultEffortIsOff(config, snap)) return;
+    if (names_effort or !arch_config.fact(config, "thinking_off_checkpoint") or !model_mod.defaultEffortIsOff(config, snap)) return;
     t.enable = names_budget and !explicit_off;
     if (!t.enable) t.budget = -1;
     t.template = model_mod.defaultTemplateEffortIn(config, snap);

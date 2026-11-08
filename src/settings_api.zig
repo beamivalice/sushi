@@ -570,7 +570,7 @@ fn stubFit(io: std.Io, allocator: std.mem.Allocator, row: *const ModelRow) model
     var fit = arch_flags.settingsFit(&probe);
     fit.streams_experts = geometry and expert_quant.isExpertStreamingArch(arch);
     fit.has_vision = sm.has_vision;
-    fit.streaming_required = probe.isDsv41() or models_api.streamingRequiredMarker(arch, sm.quant_bits, sm.quantized_experts, geometry, row.index_complete);
+    fit.streaming_required = arch_config.fact(&probe, "streams_experts") or models_api.streamingRequiredMarker(arch, sm.quant_bits, sm.quantized_experts, geometry, row.index_complete);
     fit.stq_experts = sm.quantized_experts;
     fit.context_cap = sm.context_cap;
     return fit;

@@ -1,5 +1,6 @@
 //! Flash-Next as the scheduler sees it: what batches, which rounds group, the head it commits beside the KV.
 const std = @import("std");
+const qwen4_config = @import("qwen4_config.zig");
 const arch_handle = @import("../arch/handle.zig");
 const sched_policy = @import("../sched_policy.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
@@ -26,11 +27,11 @@ pub fn facts(config: *const ModelConfig) sched.Facts {
 }
 
 pub fn batches(config: *const ModelConfig) bool {
-    return config.supportsBatchedGdnDecode();
+    return qwen4_config.supportsBatchedGdnDecode(config);
 }
 
 pub fn rowCap(config: *const ModelConfig) ?usize {
-    return if (config.supportsBatchedQwen4Rows()) 8 else null;
+    return if (qwen4_config.supportsBatchedRows(config)) 8 else null;
 }
 
 pub fn modelBatches(xfm: *const Trunk) bool {
@@ -43,7 +44,7 @@ pub fn readyToBatch(xfm: *const Trunk, ctx: *ForwardCtx) bool {
 }
 
 pub fn padsBatch(config: *const ModelConfig) bool {
-    return !config.supportsBatchedQwen4Rows();
+    return !qwen4_config.supportsBatchedRows(config);
 }
 
 pub fn plannerObservesPlainRows(xfm: *const Trunk) bool {

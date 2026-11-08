@@ -373,7 +373,7 @@ test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
     const a = std.testing.allocator;
     var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
-    const cfg = @import("../model.zig").ModelConfig{ .rms_norm_eps = 1e-5, .glm_hc_eps = 1e-6, .glm_hc_sinkhorn_iters = 20 };
+    const cfg = @import("../model.zig").ModelConfig{ .rms_norm_eps = 1e-5, .hc_eps = 1e-6, .hc_sinkhorn_iters = 20 };
     const bits = try a.alloc(u16, 512 * 16384);
     defer a.free(bits);
     for (bits, 0..) |*v, i| {

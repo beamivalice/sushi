@@ -34,12 +34,27 @@ const config_file = @import("dsv41_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = model_types;
 pub const discovery_types = model_types;
+/// Its DSpark stages ride a streamed load on both of its layouts.
+pub const streamed_mtp_head = struct {
+    pub const phrase = "DeepSeek-V4.1-Flash";
+    pub fn supported(layout: @import("../expert_quant.zig").Layout) bool {
+        return layout == .mxfp4_w123 or layout == .exl3_k4;
+    }
+};
 pub const config_facts: arch_config.Facts = .{
     .thinks_by_default = true,
     .reads_pair_major = true,
     .prefill_start_width = config_file.prefill_width,
     .expert_pool_bytes = config_file.dsv41_pool_bytes,
     .streams_experts = true,
+    .expert_source = .mxfp4_w123,
+    .state_beside_kv = true,
+    .no_mtp_head = true,
+    .vision_on_streamed = true,
+    .own_kv_state = true,
+    .scores_picked_keys = true,
+    .fills_slabs_in_place = true,
+    .streams_rate_groups = true,
     .reads_own_source = true,
 };
 pub const OwnConfig = config_file.Config;

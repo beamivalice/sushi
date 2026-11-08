@@ -79,7 +79,7 @@ pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   - A fork's disk record inherits restore points only from RAM donors (`bestCheckpointDonor`), so a hot entry with two
     checkpoints gives it fewer; the same trade MiMo's ring restore points make.
 - **A restore shares the rows; the first append copies them.** A checkout releases them, so that append donates.
-- **The assistant window rides the entry as prefill left it** (`Generator.glm_prefill_window`). Every GLM restore
+- **The assistant window rides the entry as prefill left it** (`Generator.native_prefill_window`). Every GLM restore
   point is at or below the prompt end, and a window cropped at the reply's end misses it once the reply passes
   2,016 tokens.
 - **SSD tier**:

@@ -157,6 +157,22 @@ pub fn prepareDrafter(io: std.Io, allocator: std.mem.Allocator, config: *const M
     }
 }
 
+/// The HTTP text a built arch gives the load refusal named `name` (a decl of its `load.refusals`); null when none does.
+pub fn refusalText(comptime name: []const u8) ?[]const u8 {
+    inline for (comptime std.enums.values(registry.Tag)) |t| {
+        if (comptime has(t, "refusals") and @hasDecl(L(t).refusals, name)) return @field(L(t).refusals, name);
+    }
+    return null;
+}
+
+/// The load settled on `drafter_dir` (empty: none): the arch stamps what a drafter adds to a request and says what it decodes with.
+pub fn drafterChosen(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, drafter_dir: []const u8, no_drafter: bool, mtp_on: bool) !void {
+    const tag = arch_config.tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime has(t, "drafterChosen")) try L(t).drafterChosen(io, allocator, config, drafter_dir, no_drafter, mtp_on),
+    }
+}
+
 /// The drafter read from `dir`: the arch's own form when it has one, else the generic block drafter.
 pub fn loadDflash(io: std.Io, allocator: std.mem.Allocator, xfm: *Trunk, dir: []const u8) !dflash_mod.DflashModel {
     switch (xfm.arch) {
@@ -167,16 +183,16 @@ pub fn loadDflash(io: std.Io, allocator: std.mem.Allocator, xfm: *Trunk, dir: []
     return dflash_mod.loadDflash(io, allocator, mlx.gpuStream(), dir);
 }
 
-pub fn bindDflash(allocator: std.mem.Allocator, xfm: *Trunk, d: *dflash_mod.DflashModel, kv: trunk.KVQuantConfig, tok: *tokenizer_mod.Tokenizer) bool {
+pub fn bindDflash(allocator: std.mem.Allocator, xfm: *Trunk, d: *dflash_mod.DflashModel, kv: trunk.KVQuantConfig, tok: *tokenizer_mod.Tokenizer) !bool {
     switch (xfm.arch) {
-        inline else => |t| return if (comptime has(t, "bindDflash")) L(t).bindDflash(allocator, xfm, d, kv, tok) else false,
+        inline else => |t| return if (comptime has(t, "bindDflash")) try L(t).bindDflash(allocator, xfm, d, kv, tok) else false,
     }
 }
 
-pub fn dflashRowBounds(config: *const ModelConfig, min: ?u32, max: ?u32) !?u32 {
+pub fn dflashRowBounds(config: *const ModelConfig, min: ?u32, max: ?u32, drafter_block: u32) !?u32 {
     const tag = arch_config.tagOf(config) orelse return null;
     switch (tag) {
-        inline else => |t| return if (comptime has(t, "dflashRowBounds")) try L(t).dflashRowBounds(min, max) else null,
+        inline else => |t| return if (comptime has(t, "dflashRowBounds")) try L(t).dflashRowBounds(min, max, drafter_block) else null,
     }
 }
 
@@ -207,5 +223,5 @@ test "an arch that declares no load module takes every default" {
     try std.testing.expect(!try drafterOff(&config, ""));
     try std.testing.expect((try stageDrafter(std.testing.io, std.testing.allocator, &config, "", "", false)) == null);
     try std.testing.expect((try prepareDrafter(std.testing.io, std.testing.allocator, &config, "", "", null)) == null);
-    try std.testing.expect((try dflashRowBounds(&config, null, null)) == null);
+    try std.testing.expect((try dflashRowBounds(&config, null, null, 0)) == null);
 }

@@ -1,6 +1,7 @@
 //! MiMo as the scheduler sees it: it batches plain slots as rows of one forward, and a crowded MTP slot may drop to
 //! plain ticks.
 const std = @import("std");
+const mimo_config = @import("mimo_config.zig");
 const arch_handle = @import("../arch/handle.zig");
 const sched_policy = @import("../sched_policy.zig");
 const mimo_forward = @import("mimo_forward.zig");
@@ -19,11 +20,11 @@ const ForwardCtx = trunk_mod.ForwardCtx;
 const ModelConfig = model.ModelConfig;
 
 pub fn batches(config: *const ModelConfig) bool {
-    return config.supportsBatchedMimoDecode();
+    return mimo_config.supportsBatchedDecode(config);
 }
 
 pub fn rowCap(config: *const ModelConfig) ?usize {
-    return if (config.supportsBatchedMimoDecode()) 4 else null;
+    return if (mimo_config.supportsBatchedDecode(config)) 4 else null;
 }
 
 pub fn modelBatches(xfm: *const Trunk) bool {
@@ -32,7 +33,7 @@ pub fn modelBatches(xfm: *const Trunk) bool {
 
 /// Per-row attention reads each slot's own cache: nothing pads.
 pub fn padsBatch(config: *const ModelConfig) bool {
-    return !config.supportsBatchedMimoDecode();
+    return !mimo_config.supportsBatchedDecode(config);
 }
 
 pub fn batchArm(xfm: *Trunk, ctxs: []const *ForwardCtx) ?sched.BatchArm {
@@ -73,6 +74,6 @@ pub fn tickClass(slot: *const Slot) sched.TickClass {
 }
 
 pub fn coldLoadBill(load: sched.ColdLoad) !?u64 {
-    if (!load.config.usesMimoSourceTrunk()) return null;
+    if (!mimo_config.usesSourceTrunk(load.config)) return null;
     return try model_load.residentColdLoadBillBytes(load.io, load.allocator, load.config, load.path, load.load_vision, load.mtp_on, load.no_drafter, load.drafter_dir);
 }

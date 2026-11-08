@@ -11,6 +11,10 @@ const mtp_mod = @import("mtp.zig");
 const round_cost = @import("round_cost.zig");
 const sampler = @import("sampler.zig");
 const arch_state = @import("arch/arch_state.zig");
+const arch_config = @import("arch/config.zig");
+const arch_drafter = @import("arch/drafter.zig");
+const model_mod = @import("model.zig");
+const registry = @import("arch/registry.zig");
 const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
 const MtpWidthTrial = round_cost.TrialSchedule;
@@ -25,7 +29,7 @@ pub fn mtpAdaptiveModelEligible(model_has_mtp: bool, checkpoint_head: bool) bool
 }
 
 pub fn mtpAdaptiveModelOk(self: *const Generator) bool {
-    return mtpAdaptiveModelEligible(self.model_has_mtp, arch_state.headCache(&self.xfm.arch_state) != null or self.xfm.config.isMimo());
+    return mtpAdaptiveModelEligible(self.model_has_mtp, arch_state.headCache(&self.xfm.arch_state) != null or arch_config.fact(&self.xfm.config, "mtp_adaptive_calibrated"));
 }
 
 /// Will anyone read a serial cell for this model? Gated on the model, not the request: a
@@ -35,7 +39,7 @@ pub fn serialCellWanted(self: *const Generator) bool {
     if (!self.mtpAdaptiveModelOk()) return false;
     // Not whether the head is loaded: the weights load with the trunk even under `--no-mtp`.
     if (!self.model_has_mtp) return false;
-    return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKvFor(self.xfm.config.isMimo()));
+    return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKvFor(&self.xfm.config));
 }
 
 /// Drop the serial cell's pending interval: something ran between two decode ticks that
@@ -494,9 +498,7 @@ pub fn mtpTraceEnabled() bool {
 pub fn mtpEvCostsForProfile(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
     return switch (profile) {
         .generic => MTP_EV_DEFAULT_COSTS,
-        .g17_nax_qwen4_q4_gs64 => MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS,
-        .g17_nax_qwen4_mixed_4_8_gs64 => MTP_EV_G17_NAX_QWEN4_MIXED_4_8_GS64_COSTS,
-        .mimo_exl3 => MTP_EV_MIMO_EXL3_COSTS,
+        else => arch_drafter.evCosts(profile) orelse MTP_EV_DEFAULT_COSTS,
     };
 }
 
@@ -702,8 +704,9 @@ pub fn mtpForcedWidth(forced: u32, verify_max: u32) u32 {
 }
 
 /// The switch's floor for this arch.
-pub fn mtpAdaptiveMinKvFor(is_mimo: bool) u32 {
-    return if (is_mimo) MTP_ADAPTIVE_MIN_KV_MIMO else MTP_ADAPTIVE_MIN_KV;
+pub fn mtpAdaptiveMinKvFor(config: *const model_mod.ModelConfig) u32 {
+    const floor = (arch_config.facts(config) orelse arch_config.Facts{}).mtp_adaptive_min_kv;
+    return if (floor != 0) floor else MTP_ADAPTIVE_MIN_KV;
 }
 
 /// May the adaptive switch run at this context at all? Read before the vote and the probe.
@@ -882,7 +885,7 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
     // Read after the plan (m_lo is the width it prices) and before the width trial.
     if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled() and
         self.mtpAdaptiveArchEligible() and
-        mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKvFor(self.xfm.config.isMimo())))
+        mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKvFor(&self.xfm.config)))
     {
         const t = &self.xfm.round_cost;
         const b = self.mtpAdaptiveBucket(kv_len);
@@ -1385,69 +1388,7 @@ pub const MtpEvCosts = struct {
 /// T(1)=45.4, T(2)=53.3 → .10/.10/.24@3/.01 on a ~37.9 ms floor.
 /// Refit #2, 2026-07-13, post-verify-qmm: T(1)=44.6, T(3)=54.4,
 /// T(6)=89.9 → .06/.06/.24/.02 on a ~40 ms floor.)
-/// MiMo MCG K2.5 w12 on M5 Max (2026-09-24, kv8, 4k): a serial forward 24.2 ms, verify
-/// forwards 34.9 / 44.7 / 59.8 ms at 2 / 3 / 4 rows, three pre-drafted head steps ~2.5-3 ms.
-/// Each position's own routed experts make a verify row ~.45 of a forward, flat to depth 3.
-pub const MTP_EV_MIMO_EXL3_COSTS: MtpEvCosts = .{ .draft = 0.04, .per_pos_lo = 0.44, .per_pos_hi = 0.44, .flat_max = 3, .sync = 0.02 };
-
 pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.26, .flat_max = 4, .sync = 0.01, .nax_from = 7, .per_pos_nax = 0.52 };
-
-/// qwen4_exp (Qwen3.8-Flash-Next 125B-A6B) on G17, M5 Max 40-core refit
-/// (2026-08-27/28). Fitted at ~8.5k context like every prior surface
-/// (a short-context fit planned too shallow at 8.5k, measured -4% —
-/// every constant this controller ever shipped was fitted at ONE
-/// context length, and 8K is the house one). Forced-depth saturated
-/// echo (the test_mtp_equivalence echo appended to ~8.3k of neutral
-/// filler, temp 0, `--prefix-cache-entries 0`, round-cost persist off),
-/// depths {1,2,3,4,6} x two reversed passes x 3 reps, medians of
-/// per-request round_ms: T(1)=25.41, T(2)=31.18, T(3)=35.70,
-/// T(4)=41.33, T(6)=53.58 ms -> 20.34 ms floor, composite
-/// (draft + per-position) marginals .257/.303 (SSE 0.28), shipped
-/// house-style below as `.draft = 0.02` plus per-position .237/.283 —
-/// composite minus draft, the same split every calibrated surface
-/// carries. Short-context fit for the record: T(1..4,6,8)=
-/// 23.61/28.12/33.91/38.87/50.16/62.70 -> floor 18.24, composite
-/// .283/.310/.344 (the .344 ships as per-position `.325`).
-/// A verify row on this arch is BYTES — a second row reads its own
-/// experts — so the marginals sit 3-5x above the dense-sidecar surfaces
-/// and there is NO NAX flattening: routed expert banks never ride the
-/// vqmm NAX lane (that is the M5 plan's grouped-expert item, and this
-/// table is its before-number). `per_pos_nax` carries the short-context
-/// k>=7 STEEPENING (+11%/pos, a measurement not a discount) and is
-/// inert under this profile's default cap of 6. sync stays nominal per
-/// the dry-spell-gate doctrine (measured chunk-boundary sync ~1.7 ms is
-/// governed by the realized-rate gate, not the prior). draft/verify
-/// split arbitrary but positive; only the sums enter the controller.
-pub const MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS: MtpEvCosts = .{
-    .draft = 0.02,
-    .per_pos_lo = 0.237,
-    .per_pos_hi = 0.283,
-    .flat_max = 4,
-    .sync = 0.02,
-    .nax_from = 7,
-    .per_pos_nax = 0.325,
-};
-
-/// 2026-09-13 M5 Max mixed4/8 refit after the single-stream verifier
-/// fast paths. Affine8 target/head KV, 3-bit draft shortlist, ~8.6k
-/// context; forced depths {1,2,3,4,5,6,8}, three echo repetitions in
-/// each of two reversed boot orders. Median full-round EMAs (ms):
-/// 24.145/28.970/34.035/38.470/44.310/51.970/61.600.
-/// Fit floor=19.037 and position slopes=4.983/8.018/4.815 ms;
-/// max relative residual 1.30%. Depth6 verifies seven positions and
-/// leaves the optimized width2..6 envelope, hence flat_max=5.
-/// Only composite marginals are identifiable; retain draft=.02 and
-/// nominal sync=.02. Runtime fingerprint and KV guards live in mtp.zig.
-/// Evidence and reproduction: notes/MTP-SINGLE-VERIFY.md.
-pub const MTP_EV_G17_NAX_QWEN4_MIXED_4_8_GS64_COSTS: MtpEvCosts = .{
-    .draft = 0.02,
-    .per_pos_lo = 0.241753,
-    .per_pos_hi = 0.401180,
-    .flat_max = 5,
-    .sync = 0.02,
-    .nax_from = 7,
-    .per_pos_nax = 0.232929,
-};
 
 /// One round's draft plan. `m_hi > m_lo` means "pay the chunk-A sync and
 /// extend to m_hi when the chain log-confidence clears tau_ln".
@@ -1772,10 +1713,6 @@ pub const MTP_ADAPTIVE_PROBE_WARM: u32 = 2;
 /// the 32-64k bucket up; below that the probes cost more than a switch could buy.
 pub const MTP_ADAPTIVE_MIN_KV: u32 = 32768;
 
-/// MiMo's verify rows stay cheap until its global layers read many keys, so below this its
-/// rounds beat serial even on prose and a probe could only cost.
-pub const MTP_ADAPTIVE_MIN_KV_MIMO: u32 = 65536;
-
 /// Rounds in the realized price window. Full-window-only: a restore's warmup rounds must not vote.
 pub const MTP_PRICE_WINDOW: u32 = 16;
 
@@ -2074,15 +2011,6 @@ test "mtpEvRoundCost: piecewise marginals (flat verify region, then the GDN widt
     try testing.expectApproxEqAbs(@as(f32, 2.21), Generator.mtpEvRoundCost(costs, 5, false), 1e-5);
     try testing.expectApproxEqAbs(@as(f32, 0.19), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.32), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
-}
-
-test "mtpEvCostsForProfile: G17 profiles are explicit" {
-    const generic = Generator.mtpEvCostsForProfile(.generic);
-    try testing.expectEqual(MTP_EV_DEFAULT_COSTS, generic);
-
-    const qwen4 = Generator.mtpEvCostsForProfile(.g17_nax_qwen4_q4_gs64);
-    try testing.expectEqual(MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, qwen4);
-    try testing.expect(!std.meta.eql(generic, qwen4));
 }
 
 test "mtpEvPlanFor: mid-decay acceptance picks a shallow base and a confidence-gated extension" {
@@ -2973,10 +2901,10 @@ test "mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial,
     }
 }
 
-test "mtpAdaptiveMinKvFor: MiMo's switch starts at 64k, qwen4's at 32k" {
+test "mtpAdaptiveMinKvFor: an arch's own floor, else the shared one" {
     const G = Generator;
-    try testing.expectEqual(@as(u32, 65536), G.mtpAdaptiveMinKvFor(true));
-    try testing.expectEqual(MTP_ADAPTIVE_MIN_KV, G.mtpAdaptiveMinKvFor(false));
+    if (registry.ofModelType("mimo_v2") != null) try testing.expectEqual(@as(u32, 65536), G.mtpAdaptiveMinKvFor(&.{ .model_type = "mimo_v2" }));
+    try testing.expectEqual(MTP_ADAPTIVE_MIN_KV, G.mtpAdaptiveMinKvFor(&.{ .model_type = "not_a_served_arch" }));
 }
 
 test "mtpAdaptiveModelEligible: the serial row and its price window are the module head's, not every MTP model's" {

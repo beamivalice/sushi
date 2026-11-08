@@ -2399,6 +2399,8 @@ test "mtpDraftGreedyFor: the proposal mode is a property of the REQUEST" {
     try testing.expect(Generator.mtpDraftGreedyFor(one_way));
 }
 
+const qwen_draft_temp: f32 = 1.0;
+
 test "mtpDraftGreedyAt: the greedy tail samples depth 0 only; a greedy request drafts the same bytes either way" {
     const sampled = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
     for (0..4) |d| {
@@ -2416,8 +2418,8 @@ test "mtpDraftGreedyAt: the greedy tail samples depth 0 only; a greedy request d
         const target = SamplingParams{ .temperature = t, .top_p = 0.95, .top_k = 20, .seed = 7 };
         for (0..mtp_mod.MAX_DEPTH) |d| {
             const step: u32 = @intCast(d);
-            const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, true, step), mtp_round.MTP_DRAFT_TEMP_QWEN4);
-            const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, false, step), mtp_round.MTP_DRAFT_TEMP_QWEN4);
+            const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, true, step), qwen_draft_temp);
+            const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, false, step), qwen_draft_temp);
             try testing.expect(std.meta.eql(on, off));
             try testing.expect(isGreedyTemperature(on.temperature));
         }

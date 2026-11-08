@@ -1,4 +1,5 @@
 const std = @import("std");
+const mimo_config = @import("mimo_config.zig");
 const mimo_fixtures = @import("mimo_fixtures.zig");
 const MIMO_V2_VISION_JSON = mimo_fixtures.MIMO_V2_VISION_JSON;
 const MIMO_V2_BILL_JSON = mimo_fixtures.MIMO_V2_BILL_JSON;
@@ -204,6 +205,16 @@ pub fn parseMimoConfig(c: *ModelConfig, obj: std.json.ObjectMap) !void {
     // A pack stores its packed trunk linears (docs/pack-format.md); the engine
     // quantizes nothing at load, so a config asking it to is refused.
     if (obj.get("trunk_quant") != null) return error.UnsupportedMimoV2Config;
+}
+
+/// A MiMo checkpoint keeps its trunk in the source FP8 layout beside source MXFP4 or EXL3 experts, so both take the source loader.
+pub fn usesSourceTrunk(config: anytype) bool {
+    return @import("../arch/config.zig").isOf(config, "mimo2") and (config.expert_layout == .mxfp4_individual or config.expert_layout == .exl3_k4);
+}
+
+/// MiMo decodes concurrent slots as rows of one forward (`forwardMimoBatchedDecode`); a streamed load stays serial.
+pub fn supportsBatchedDecode(config: anytype) bool {
+    return @import("../arch/config.zig").isOf(config, "mimo2") and !config.expert_streaming;
 }
 
 test "defaultEnableThinking: mimo_v2 thinks by default, with and without tools" {
@@ -541,12 +552,12 @@ test "mimo_v2 EXL3 routed banks stream on request and take the source trunk load
     };
     try testing.expect(c.supportsExpertStreaming());
     try testing.expect(!c.expertStreamingRequired());
-    try testing.expect(c.usesMimoSourceTrunk());
+    try testing.expect(mimo_config.usesSourceTrunk(c));
     c.expert_layout = .mxfp4_individual;
     try testing.expect(c.expertStreamingRequired());
-    try testing.expect(c.usesMimoSourceTrunk());
+    try testing.expect(mimo_config.usesSourceTrunk(c));
     c.expert_layout = .mxfp4_split;
-    try testing.expect(!c.usesMimoSourceTrunk());
+    try testing.expect(!mimo_config.usesSourceTrunk(c));
     var q = ModelConfig{
         .model_type = "qwen4_exp",
         .num_hidden_layers = 2,
@@ -557,7 +568,7 @@ test "mimo_v2 EXL3 routed banks stream on request and take the source trunk load
         .quant_bits = 0,
         .expert_layout = .exl3_k4,
     };
-    try testing.expect(!q.usesMimoSourceTrunk());
+    try testing.expect(!mimo_config.usesSourceTrunk(q));
     try testing.expect(!q.expertStreamingRequired());
 }
 

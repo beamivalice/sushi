@@ -1,5 +1,6 @@
 //! MiMo's own terms of the bill: the batched decode rows, the FP8 dequant scratch and the load warmup.
 const std = @import("std");
+const mimo_config = @import("mimo_config.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
 const fp8_block = @import("../fp8_block.zig");
@@ -14,7 +15,7 @@ const mimo_forward = @import("mimo_forward.zig");
 
 /// The 2-bit lm_head copy a source trunk keeps, resident or streamed.
 pub fn coarseHead(config: *const model_mod.ModelConfig) ?u64 {
-    if (!config.usesMimoSourceTrunk() or mimo_mtp.rerankBits() == 0) return 0;
+    if (!mimo_config.usesSourceTrunk(config) or mimo_mtp.rerankBits() == 0) return 0;
     return mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mimo_mtp.rerankBits());
 }
 
@@ -26,7 +27,7 @@ pub fn headRings(config: *const model_mod.ModelConfig) ?u64 {
 /// What the other rows of a batched decode hold beside this slot's tick: each row rebuilds one global layer
 /// dense below the packed arms' floor, where a solo tick's rebuild was alone. Zero where decode does not batch.
 pub fn decodeRows(config: *const model_mod.ModelConfig) ?u64 {
-    if (!config.supportsBatchedMimoDecode()) return 0;
+    if (!mimo_config.supportsBatchedDecode(config)) return 0;
     const keys = mimo_forward.mimoGlobalDecodeRebuildMaxKeys();
     var widest: u64 = 0;
     var li: u32 = 0;
@@ -39,7 +40,7 @@ pub fn decodeRows(config: *const model_mod.ModelConfig) ?u64 {
 /// The bf16 copy `fp8_block.project` dequantizes a source FP8 linear into when a forward is wider than its GEMV:
 /// the widest linear's, and one more for the copy MLX's buffer cache still holds when the next linear dequantizes.
 pub fn fp8Scratch(config: *const model_mod.ModelConfig, fwd: u64) ?u64 {
-    if (!config.usesMimoSourceTrunk() or fwd <= @as(u64, @intCast(fp8_block.gemv_max_rows))) return 0;
+    if (!mimo_config.usesSourceTrunk(config) or fwd <= @as(u64, @intCast(fp8_block.gemv_max_rows))) return 0;
     var widest: u64 = config.intermediate_size;
     for (0..config.num_hidden_layers) |i| {
         const l: u32 = @intCast(i);

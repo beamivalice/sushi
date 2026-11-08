@@ -1,5 +1,6 @@
 //! GLM model forward: mHC-wrapped KDA/MLA layers, routed experts and per-request state.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const base = @import("glm5_model.zig");
@@ -260,11 +261,11 @@ const Moe = struct {
         const routing = try route(ops, x, self.weight, self.correction, @intCast(cfg.num_experts_per_tok), cfg.router_scaling_factor, cfg.moe_route_norm);
         // The shared expert is built first: the finish reduce lists it first, so MLX encodes its chain ahead of the routed one.
         if (self.shared) |shared| if (self.streamed == null and isDecodeRow(x)) {
-            if (try shared.applyFolded(ops, x, self.bank, routing.indices, routing.scores, cfg.expertDecode(), cfg.glm_swiglu_limit)) |y| return ops.own(y);
-            const mid = try shared.apply(ops, x, cfg.glm_swiglu_limit);
+            if (try shared.applyFolded(ops, x, self.bank, routing.indices, routing.scores, cfg.expertDecode(), cfg.swiglu_limit)) |y| return ops.own(y);
+            const mid = try shared.apply(ops, x, cfg.swiglu_limit);
             if (mlx.mlx_array_dtype(mid) == .bfloat16 and std.mem.eql(c_int, mlx.getShape(mid), mlx.getShape(x))) {
                 const dec = cfg.expertDecode();
-                return ops.own(try exl3.moeClampedWithShared(ops.s, x, self.bank, routing.indices, routing.scores, dec, @intFromFloat(cfg.glm_swiglu_limit), mid));
+                return ops.own(try exl3.moeClampedWithShared(ops.s, x, self.bank, routing.indices, routing.scores, dec, @intFromFloat(cfg.swiglu_limit), mid));
             }
             return ops.binary(.add, try routedExl3(ops, x, self.bank, routing.indices, routing.scores, cfg), mid);
         };
@@ -272,7 +273,7 @@ const Moe = struct {
             try store.apply(self.layer_index, ops, x, routing.indices, routing.scores, cfg)
         else
             try routedExl3(ops, x, self.bank, routing.indices, routing.scores, cfg);
-        if (self.shared) |shared| return ops.binary(.add, routed, try shared.apply(ops, x, cfg.glm_swiglu_limit));
+        if (self.shared) |shared| return ops.binary(.add, routed, try shared.apply(ops, x, cfg.swiglu_limit));
         return routed;
     }
 };
@@ -285,8 +286,8 @@ fn isDecodeRow(x: Arr) bool {
 /// The resident bank and a streamed slab bank run this one dispatch; slab ids are slot ids.
 pub fn routedExl3(ops: *Ops, x: Arr, bank: exl3.Bank, ids: Arr, scores: Arr, cfg: *const model.ModelConfig) !Arr {
     const dec = cfg.expertDecode();
-    const limit: c_int = @intFromFloat(cfg.glm_swiglu_limit);
-    if (cfg.glm_swiglu_limit == 10) if (try exl3.prefill_grid.tryMoe(ops.s, x, bank, ids, scores, dec, limit)) |candidate| return ops.own(candidate);
+    const limit: c_int = @intFromFloat(cfg.swiglu_limit);
+    if (cfg.swiglu_limit == 10) if (try exl3.prefill_grid.tryMoe(ops.s, x, bank, ids, scores, dec, limit)) |candidate| return ops.own(candidate);
     return ops.own(try exl3.moeClamped(ops.s, x, bank, ids, scores, dec, limit));
 }
 
@@ -364,7 +365,7 @@ pub const FfnPrefixReplay = struct {
     shared: ?base.DenseMlp,
 
     pub fn load(cfg: model.ModelConfig, weights: *const model.Weights, index: usize, stream: mlx.mlx_stream) !FfnPrefixReplay {
-        if (!cfg.isGlm5() or index >= cfg.num_hidden_layers) return error.InvalidGlmLayer;
+        if (!arch_config.isOf(cfg, "glm5") or index >= cfg.num_hidden_layers) return error.InvalidGlmLayer;
         const dense = index < cfg.first_k_dense_replace;
         var buf: [256]u8 = undefined;
         const prefix = try std.fmt.bufPrint(&buf, "{s}.layers.{d}", .{ cfg.weight_prefix, index });
@@ -545,7 +546,7 @@ pub const Model = struct {
 
     /// With a stream the routed banks come from its engine and `weights` holds only the trunk.
     pub fn loadStreamed(allocator: std.mem.Allocator, cfg: model.ModelConfig, weights: *const model.Weights, s: mlx.mlx_stream, stream_value: ?Stream) !Model {
-        if (!cfg.isGlm5()) return error.InvalidGlmConfig;
+        if (!arch_config.isOf(cfg, "glm5")) return error.InvalidGlmConfig;
         const streamed: ?*Stream = if (stream_value) |value| blk: {
             const g = value.engine.geometry;
             if (g.layers != cfg.num_hidden_layers or g.experts != cfg.num_experts or g.hidden != cfg.hidden_size or g.intermediate != cfg.moe_intermediate_size or g.first_moe_layer != cfg.first_k_dense_replace) return error.InvalidGlmStreamGeometry;
@@ -606,7 +607,7 @@ pub const Model = struct {
     pub fn feedForwardLayer(self: *const Model, index: usize, ops: *Ops, x: Arr) !Arr {
         if (index >= self.layers.len) return error.InvalidGlmLayer;
         return switch (self.layers[index].ffn) {
-            .dense => |dense| dense.apply(ops, x, self.cfg.glm_swiglu_limit),
+            .dense => |dense| dense.apply(ops, x, self.cfg.swiglu_limit),
             .moe => |moe| moe.apply(ops, x, &self.cfg),
         };
     }
@@ -764,7 +765,7 @@ pub const Model = struct {
 
     fn finishFfn(self: *const Model, ops: *Ops, layer: *const Layer, prefix: *const FfnPrefix) !Arr {
         const y = switch (layer.ffn) {
-            .dense => |dense| try dense.apply(ops, prefix.input, self.cfg.glm_swiglu_limit),
+            .dense => |dense| try dense.apply(ops, prefix.input, self.cfg.swiglu_limit),
             .moe => |moe| try moe.apply(ops, prefix.input, &self.cfg),
         };
         return ops.own(try primitive.hcExpand(prefix.residual, y, prefix.post, prefix.comb, self.s));
@@ -791,7 +792,7 @@ pub const Model = struct {
         const ff = try layer.hc_ffn.collapseFromNormalized(ops, joined.expanded, cfg, layer.norm_ffn, joined.normalized);
         defer ff.deinit();
         const y = switch (layer.ffn) {
-            .dense => |dense| try dense.apply(ops, ff.mixed, cfg.glm_swiglu_limit),
+            .dense => |dense| try dense.apply(ops, ff.mixed, cfg.swiglu_limit),
             .moe => |moe| try moe.apply(ops, ff.mixed, cfg),
         };
         if (!carry) return .{ .next = try ops.own(try primitive.hcExpand(joined.expanded, y, ff.post, ff.comb, self.s)), .norm = null };
@@ -891,9 +892,9 @@ pub fn completeFixture(weights: *model.Weights) !model.ModelConfig {
         .linear_conv_kernel_dim = 4,
         .kda_gate_lower_bound = -5,
         .hc_count = 4,
-        .glm_hc_sinkhorn_iters = 20,
-        .glm_hc_eps = 1e-6,
-        .glm_swiglu_limit = 10,
+        .hc_sinkhorn_iters = 20,
+        .hc_eps = 1e-6,
+        .swiglu_limit = 10,
         .mla_q_lora_rank = 128,
         .mla_kv_lora_rank = 128,
         .mla_qk_nope_head_dim = 128,

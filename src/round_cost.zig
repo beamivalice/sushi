@@ -62,8 +62,7 @@ pub const Layout = enum {
 /// The one resolver for a model's layout; the layout decides the store version and so
 /// which persisted file a model reads. `anytype`: this module imports nothing but std.
 pub fn layoutFor(config: anytype) Layout {
-    if (config.isQwen4()) return .long;
-    return if (config.isMimo()) .full_attention else .legacy;
+    return config.costLayout();
 }
 
 /// Buckets the layout uses; cells past it are never written and never active.
@@ -769,19 +768,8 @@ pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
     return false;
 }
 
-fn qwen4ProfileArmed() bool {
-    var i: usize = 0;
-    while (std.c.environ[i]) |entry| : (i += 1) {
-        const s = std.mem.span(entry);
-        if (!std.mem.startsWith(u8, s, "QWEN4_PROFILE_")) continue;
-        const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
-        if (io_util.diagEnvValueOn(@ptrCast(s[eq + 1 ..].ptr))) return true;
-    }
-    return false;
-}
-
 pub fn persistDiagArmed() bool {
-    return qwen4ProfileArmed() or depth_bounds.active.pinned() != null or
+    return @import("arch/kernels.zig").diagArmed() or depth_bounds.active.pinned() != null or
         persistDiagArmedFrom(&.{std.c.getenv("SUSHI_MTP_TRACE")});
 }
 
@@ -1454,17 +1442,13 @@ test "round_cost: the long layout warm-starts from a legacy file — no user boo
 
 test "layoutFor is THE round-cost layout resolver" {
     const Stub = struct {
-        qwen4: bool,
-        mimo: bool = false,
-        fn isQwen4(self: *const @This()) bool {
-            return self.qwen4;
-        }
-        fn isMimo(self: *const @This()) bool {
-            return self.mimo;
+        layout: Layout,
+        fn costLayout(self: *const @This()) Layout {
+            return self.layout;
         }
     };
-    const long = Stub{ .qwen4 = true };
-    const legacy = Stub{ .qwen4 = false };
+    const long = Stub{ .layout = .long };
+    const legacy = Stub{ .layout = .legacy };
     try testing.expectEqual(Layout.long, layoutFor(&long));
     try testing.expectEqual(Layout.legacy, layoutFor(&legacy));
     try testing.expect(storeVersion(layoutFor(&long)) != storeVersion(layoutFor(&legacy)));
@@ -1472,11 +1456,8 @@ test "layoutFor is THE round-cost layout resolver" {
 
 test "round_cost: a MiMo boot keeps each long-context rung's rounds in its own bucket" {
     const Stub = struct {
-        fn isQwen4(_: *const @This()) bool {
-            return false;
-        }
-        fn isMimo(_: *const @This()) bool {
-            return true;
+        fn costLayout(_: *const @This()) Layout {
+            return .full_attention;
         }
     };
     // Round walls from one MiMo Sushi-2.25bpw boot, kv8 (w1/w2/w3 = 1/2/3 drafts): the 32k

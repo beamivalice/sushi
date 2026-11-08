@@ -1,5 +1,6 @@
 //! Offline GLM trunk calibration: per-projection input covariance X^T X, replayed from verified block boundaries.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const forward = @import("glm5_forward.zig");
@@ -90,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
     if (iterator.next() != null or windows == 0 or length == 0 or length > 512) return error.InvalidReplayArguments;
     var cfg = try model.parseConfig(io, a, pack);
     defer cfg.deinit(a);
-    if (!cfg.isGlm5() or cfg.hc_count != 4 or cfg.expert_layout != .bf16_individual) return error.InvalidGlmConfig;
+    if (!arch_config.isOf(cfg, "glm5") or cfg.hc_count != 4 or cfg.expert_layout != .bf16_individual) return error.InvalidGlmConfig;
     const stream = mlx.gpuStream();
     base.enterTeacher();
     var weights = try native.loadWeightsBounded(io, a, pack, stream, true, 32 << 30);
@@ -126,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
         var ops = base.Ops{ .s = stream };
         defer ops.deinit();
         const mlp = replay.shared orelse return error.InvalidGlmLayer;
-        try mlx.check(mlx.mlx_array_eval(try mlp.apply(&ops, prefix.input, cfg.glm_swiglu_limit)));
+        try mlx.check(mlx.mlx_array_eval(try mlp.apply(&ops, prefix.input, cfg.swiglu_limit)));
         if ((window + 1) % 100 == 0 or window + 1 == windows) std.debug.print("layer {d}: cov window {d}/{d}\n", .{ index, window + 1, windows });
     }
     var buf: [256]u8 = undefined;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("expert_io.zig");
+const arch_config = @import("arch/config.zig");
 const expert_drop = @import("expert_drop.zig");
 pub const expert_exl3 = @import("sushi_exl3").format;
 const pack = @import("sushi_exl3").pack;
@@ -106,11 +107,12 @@ pub fn mxfp4GeomFromShapes(
     return geom;
 }
 
+fn expertSourceOf(model_type: []const u8) arch_config.ExpertSource {
+    return (arch_config.factsOfType(model_type) orelse return .none).expert_source;
+}
+
 pub fn isExpertStreamingArch(model_type: []const u8) bool {
-    return std.mem.eql(u8, model_type, "glm5_next") or
-        std.mem.eql(u8, model_type, "qwen4_exp") or
-        std.mem.eql(u8, model_type, "mimo_v2") or
-        std.mem.eql(u8, model_type, "deepseek_v41");
+    return expertSourceOf(model_type) != .none;
 }
 
 /// Routed experts are leading-index banks or individual source tensors.
@@ -168,7 +170,7 @@ pub fn streamingLayoutOfDir(allocator: std.mem.Allocator, io: std.Io, model_type
     if (parsed.value != .object) return error.InvalidSafetensorsIndex;
     const map = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
     if (map != .object) return error.InvalidSafetensorsIndex;
-    if (!std.mem.eql(u8, model_type, "qwen4_exp") and !std.mem.eql(u8, model_type, "deepseek_v41")) try rejectExl3RateGroups(map.object);
+    if (!(arch_config.factsOfType(model_type) orelse arch_config.Facts{}).streams_rate_groups) try rejectExl3RateGroups(map.object);
     return layoutOfWeightMap(model_type, map.object, layers, first_moe_layer) orelse error.ExpertStreamingUnsupportedLayout;
 }
 
@@ -696,7 +698,8 @@ pub fn layoutFromIndexJsonWithFirstMoe(
 
 fn layoutOfWeightMap(model_type: []const u8, map: std.json.ObjectMap, layers: u16, first_moe_layer: u16) ?Layout {
     if (!isExpertStreamingArch(model_type)) return null;
-    if (std.mem.eql(u8, model_type, "glm5_next")) {
+    const source = expertSourceOf(model_type);
+    if (source == .individual_source) {
         if (exl3BankComplete(map, EXL3_PREFIXES[2], first_moe_layer, layers)) {
             for (map.keys()) |key| {
                 if (parseBf16IndividualKey(key) != .not_family) return null;
@@ -714,14 +717,14 @@ fn layoutOfWeightMap(model_type: []const u8, map: std.json.ObjectMap, layers: u1
         validateBf16IndividualMap(map, layers, first_moe_layer, null, fp8) catch return null;
         return if (fp8) .fp8_individual else .bf16_individual;
     }
-    if (std.mem.eql(u8, model_type, "deepseek_v41")) {
+    if (source == .mxfp4_w123) {
         // An STQ pack's trellis banks under the routed nesting, or the release's own e2m1 experts in every layer, and
         // no other routed bank beside them.
         if (exl3BankComplete(map, EXL3_PREFIXES[1], first_moe_layer, layers)) return .exl3_k4;
         if (!mxfp4IndividualBankCompleteFromFirst(.mxfp4_w123, map, layers, null, first_moe_layer)) return null;
         return .mxfp4_w123;
     }
-    const mimo = std.mem.eql(u8, model_type, "mimo_v2");
+    const mimo = source == .flat_banks;
     const layout = layoutFromWeightMapWithFirstMoe(map, layers, first_moe_layer, mimo) orelse return null;
     if (layout == .mxfp4_split or layout == .mxfp4_individual) {
         return if (mimo) layout else null;

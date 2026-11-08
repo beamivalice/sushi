@@ -1,4 +1,6 @@
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
+const qwen4_config = @import("qwen4_config.zig");
 const expectError = @import("../test_expect.zig").expectError;
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
@@ -293,6 +295,17 @@ fn yarnMscale(factor: f32) f32 {
 const streamingWeightKey = model_mod.streamingWeightKey;
 const fusedConvShape = model_mod.fusedConvShape;
 
+/// Flash-Next decodes concurrent slots as per-row decode ticks of one forward (`forwardQwen4DecodeRows`); a streamed load keeps the padded batch.
+pub fn supportsBatchedRows(config: anytype) bool {
+    return @import("../arch/config.zig").isOf(config, "qwen4") and !config.expert_streaming;
+}
+
+/// Pure-config half of "can this arch ride the batched GatedDeltaNet decode kernel?" (`Trunk.forwardMoeBatchedDecode`):
+/// a dense GDN trunk with periodic full attention. The server and the scheduler both read it.
+pub fn supportsBatchedGdnDecode(config: anytype) bool {
+    return @import("../arch/config.zig").isOf(config, "qwen4") and config.full_attention_interval > 0;
+}
+
 test "qwen4 convolution transform rejects a non-unit channel axis" {
     try std.testing.expectError(error.InvalidFusedConvShape, fusedConvShape(&.{ 4, 2, 8 }));
     try fusedConvShape(&.{ 4, 1, 8 });
@@ -300,7 +313,7 @@ test "qwen4 convolution transform rejects a non-unit channel axis" {
 
 test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048576" {
     const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
-    try testing.expect(c.isQwen4());
+    try testing.expect(arch_config.isOf(c, "qwen4"));
     // The scaling is recognised and lands where the engine reads it —
     // trunk.yarnSpec() consumes exactly these fields.
     try testing.expect(c.rope_yarn);
@@ -349,7 +362,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
         \\ "quantization":{"group_size":64,"bits":4,"mode":"affine"}}
     ;
     const c = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(c.isQwen4());
+    try testing.expect(arch_config.isOf(c, "qwen4"));
     try testing.expectEqualStrings("language_model.model", c.weight_prefix);
     try testing.expectEqual(@as(u32, 4), c.hc_count);
     try testing.expectEqual(@as(u32, 320), c.hc_lowrank);
@@ -365,7 +378,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expectEqual(@as(u64, 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
     try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("../trunk.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
-    try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
+    try testing.expect(c.isMoe() and qwen4_config.supportsBatchedGdnDecode(c)); // per-slot state on the SSMCacheEntry: batches
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
     try testing.expectEqual(@as(f32, 10000000.0), c.rope_theta);
     try testing.expect(!c.qwen_vision and !c.has_vision);
@@ -500,7 +513,7 @@ test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower
         \\ "quantization":{"group_size":64,"bits":4,"mode":"affine"}}
     ;
     const c = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(c.isQwen4() and c.has_vision and c.qwen_vision);
+    try testing.expect(arch_config.isOf(c, "qwen4") and c.has_vision and c.qwen_vision);
     try testing.expectEqual(@as(u32, 27), c.qv_depth);
     try testing.expectEqual(@as(u32, 1152), c.qv_hidden);
     try testing.expectEqual(@as(u32, 16), c.qv_heads);
@@ -524,7 +537,7 @@ test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched"
     // no YaRN, and `contextCap` is just max_position_embeddings, so no server
     // sizing path can shift for a model that did not ask to be scaled.
     const c = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
-    try testing.expect(c.isQwen4());
+    try testing.expect(arch_config.isOf(c, "qwen4"));
     try testing.expect(!c.rope_yarn);
     try testing.expectEqual(@as(f32, 1.0), c.yarn_factor);
     try testing.expectEqual(@as(u32, 262_144), c.max_position_embeddings);

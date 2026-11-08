@@ -1854,7 +1854,7 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
 pub fn modelQuantizationLabel(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
     if (config.expert_layout == .exl3_k4) {
         var rate_buf: [8]u8 = undefined;
-        if (config.glm_fp8_trunk) return std.fmt.allocPrint(allocator, "EXL3 {s}bpw experts, raw FP8 E4M3FN block128 trunk", .{config.expert_quant_rate.kText(&rate_buf)});
+        if (config.fp8_block128_trunk) return std.fmt.allocPrint(allocator, "EXL3 {s}bpw experts, raw FP8 E4M3FN block128 trunk", .{config.expert_quant_rate.kText(&rate_buf)});
         return std.fmt.allocPrint(allocator, "EXL3 {s}bpw experts, {d}-bit dense", .{ config.expert_quant_rate.kText(&rate_buf), config.quant_bits });
     }
     return std.fmt.allocPrint(allocator, "{d}-bit", .{config.quant_bits});

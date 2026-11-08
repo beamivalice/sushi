@@ -15,7 +15,6 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const model_settings = @import("../model_settings.zig");
-const expert_stream = @import("../expert_stream.zig");
 const kv_quant = @import("../kv_quant.zig");
 const registry = @import("registry.zig");
 const arch_config = @import("config.zig");
@@ -126,14 +125,14 @@ fn dropExpertElsewhere() []const u8 {
 
 /// The facts `model_settings.applies` decides a key's reach from, so the settings API and the loader's ignored-key lines agree.
 pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
-    const latent = config.isGlm5();
+    const unserved = arch_config.fact(config, "mtp_unserved");
     return .{
         .arch = config.model_type,
         .streams_experts = config.supportsExpertStreaming(),
         .has_vision = config.has_vision,
-        .serves_mtp = !latent,
+        .serves_mtp = !unserved,
         .streaming_required = config.expertStreamingRequired(),
-        .head_streams = expert_stream.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), config.expert_layout),
+        .head_streams = admission.streamedMtpHead(config, config.expert_layout),
         .stq_experts = admission.expertStream(config).stq_experts,
         .prefetch = admission.expertStream(config).prefetch,
         .kv_choices = kvQuantChoices(config),

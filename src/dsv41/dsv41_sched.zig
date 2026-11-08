@@ -37,6 +37,9 @@ pub fn commitsAtCull(slot: *const Slot) bool {
     return xfm.arch_state.dsv41.model != null;
 }
 
+pub const prepare_commit_label = "DeepSeek row marker";
+pub const cancelled_entry_label = "a DeepSeek entry";
+
 /// The cache holds a one-byte-a-token row marker for the model's rows.
 pub fn prepareCommit(slot: *Slot) !void {
     const xfm = arch_handle.trunk(slot.model.handle orelse return);

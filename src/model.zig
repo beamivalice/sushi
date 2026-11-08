@@ -232,12 +232,12 @@ pub const ModelConfig = struct {
     kda_vector_gate: bool = false,
     kda_gate_lower_bound: f32 = 0.0, // 0 = plain -exp(A_log)·softplus form
     kda_sigmoid_out_gate: bool = false,
-    glm_hc_sinkhorn_iters: u32 = 20,
-    glm_hc_eps: f32 = 1e-6,
-    glm_swiglu_limit: f32 = 10,
-    glm_index_tail: bool = true,
-    glm_mtp_layers: u32 = 0,
-    glm_fp8_trunk: bool = false,
+    hc_sinkhorn_iters: u32 = 20,
+    hc_eps: f32 = 1e-6,
+    swiglu_limit: f32 = 10,
+    indexer_tail: bool = true,
+    mtp_layers: u32 = 0,
+    fp8_block128_trunk: bool = false,
     /// deepseek_v41's own geometry, parsed once from config.json.
     dsv41: ?arch_config.OwnConfig("dsv41") = null,
     serve_defaults: ServeDefaults = .{},
@@ -425,13 +425,13 @@ pub const ModelConfig = struct {
     qv_max_pixels: u32 = 0,
     // GLM-5.3 shares patch-grid geometry, with a separate RMSNorm ViT and padded CLIP processor.
     glm5_vision: bool = false,
-    glmv_projection_intermediate: u32 = 10240,
-    glmv_eps: f32 = 1e-5,
-    glmv_swiglu_limit: f32 = 10,
-    glmv_rope_theta: f32 = 10000,
-    glmv_min_image_tokens: u32 = 16,
-    glmv_max_image_tokens: u32 = 8000,
-    glmv_max_video_tokens: u32 = 240000,
+    vision_proj_intermediate: u32 = 10240,
+    vision_eps: f32 = 1e-5,
+    vision_swiglu_limit: f32 = 10,
+    vision_rope_theta: f32 = 10000,
+    vision_min_image_tokens: u32 = 16,
+    vision_max_image_tokens: u32 = 8000,
+    vision_max_video_tokens: u32 = 240000,
     // MiMo-ViT (src/mimo_vision.zig). Shares the qv_* geometry; attention is
     // GQA, and every block is full, or a ±window band over row-major or
     // column-major merge-unit order, with a per-head sink on the band blocks.
@@ -583,7 +583,7 @@ pub const ModelConfig = struct {
     /// global/sliding split); `kvBytesPerToken` keeps the uniform formula
     /// everywhere else so no arch's number moves without its bytes moving.
     pub fn layerKvBytes(self: *const ModelConfig, li: u32) u64 {
-        if (self.isGlm5()) return if (self.isKvPerTokenLayer(li)) @as(u64, self.mla_kv_lora_rank) * 2 else 0;
+        if (self.fact("latent_kv")) return if (self.isKvPerTokenLayer(li)) @as(u64, self.mla_kv_lora_rank) * 2 else 0;
         return @as(u64, self.layerKVHeads(li)) *
             (@as(u64, self.layerHeadDim(li)) + @as(u64, self.layerVHeadDim(li))) * 2;
     }
@@ -600,7 +600,7 @@ pub const ModelConfig = struct {
     /// no in-kernel band reads absolute positions (the fused hd-256 kernel
     /// does, so an arch at that width never rings).
     pub fn swaRingTokens(self: *const ModelConfig) u64 {
-        if (!self.isMimo()) return 0;
+        if (!self.fact("sliding_ring")) return 0;
         if (!self.has_sliding_window or self.sliding_window == 0) return 0;
         if (self.head_dim == 256) return 0;
         return @as(u64, self.sliding_window) + SWA_RING_SLACK;
@@ -661,7 +661,7 @@ pub const ModelConfig = struct {
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
         if (arch_config.kvBytesPerToken(self)) |bytes| return bytes;
-        if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * self.mla_kv_lora_rank * 2;
+        if (self.fact("latent_kv")) return @as(u64, self.attnCacheLayerCount()) * self.mla_kv_lora_rank * 2;
         // A ringed arch pays per token only on its global layers; the sliding
         // half is `swaRingBytes`, a constant. Both halves land in the same
         // commit — billing the ring before the storage rings is an under-bill,
@@ -713,15 +713,15 @@ pub const ModelConfig = struct {
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         // Native GLM retains only the incomplete pool's key/gate pairs.
-        if (self.isGlm5()) return n * (@as(u64, self.indexer_compress_ratio) -| 1) * hd * 2 * 2;
+        if (self.fact("latent_kv")) return n * (@as(u64, self.indexer_compress_ratio) -| 1) * hd * 2 * 2;
         const rows = @as(u64, @intCast(@import("trunk.zig").QSA_RING_ROWS));
-        return n * rows * hd * 2 * @as(u64, if (self.isGlm5()) 2 else 1);
+        return n * rows * hd * 2 * @as(u64, if (self.fact("latent_kv")) 2 else 1);
     }
 
     /// f32 bytes per token of the QSA block-score operand a live slot holds
     /// (`SSMCacheEntry.qsa_score_bank`). Never in an entry. Zero without an indexer.
     pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
-        if (self.isGlm5()) return 0;
+        if (self.fact("latent_kv")) return 0;
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         if (@import("arch/kernels.zig").scoreFusedFor(self, 1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
@@ -756,7 +756,7 @@ pub const ModelConfig = struct {
     /// gate continues differently, so neither is restored.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
         if (arch_config.cacheLayoutNamespace(self)) |ns| return ns;
-        if (self.linear_num_value_heads == 0 or self.isGlm5()) return null;
+        if (self.linear_num_value_heads == 0 or self.fact("kda_state")) return null;
         return if (self.gdnStateDtype() == .float32) "gdn-f32-state-v1" else "gdn-gate-f32-v1";
     }
 
@@ -764,13 +764,13 @@ pub const ModelConfig = struct {
     /// exactly 1.0 and that head never forgets. GLM's gate is KDA's own and never reaches the GDN
     /// producers this speaks for.
     pub fn gdnGateDtype(self: *const ModelConfig) mlx.mlx_dtype {
-        return if (self.isGlm5()) .bfloat16 else .float32;
+        return if (self.fact("kda_state")) .bfloat16 else .float32;
     }
 
     /// Bytes one recurrent-state element holds on this arch. GLM's KDA state is f32 whatever
     /// `--qwen-gdn` says; every other linear arch follows it.
     fn recurrentStateBytes(self: *const ModelConfig) u64 {
-        return if (self.isGlm5() or self.gdnStateDtype() == .float32) 4 else 2;
+        return if (self.fact("kda_state") or self.gdnStateDtype() == .float32) 4 else 2;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -797,12 +797,13 @@ pub const ModelConfig = struct {
     /// Which of fla's two KDA gate arms this checkpoint declares. A non-zero
     /// Qwen3.8-Flash-Next (`qwen4_exp`): a GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
-    pub fn isQwen4(self: *const ModelConfig) bool {
-        return arch_config.is(self, "qwen4");
+    /// The context grid its round-cost table is measured on.
+    pub fn costLayout(self: *const ModelConfig) arch_config.CostLayout {
+        return (arch_config.facts(self) orelse arch_config.Facts{}).cost_layout;
     }
 
-    pub fn isGlm5(self: *const ModelConfig) bool {
-        return arch_config.is(self, "glm5");
+    fn fact(self: *const ModelConfig, comptime name: []const u8) bool {
+        return arch_config.fact(self, name);
     }
 
     /// The MLX buffer pool a streamed load is allowed to hold, billed in its ssd-budget ledger; 0 keeps the RAM-wide cap.
@@ -813,10 +814,6 @@ pub const ModelConfig = struct {
     /// Percent of the SSD read rate the expert prefetch may use: the launch flag, else the model setting, else the default.
     pub fn ssdPrefetchPct(self: *const ModelConfig) u8 {
         return self.ssd_prefetch orelse self.ssd_prefetch_override orelse default_ssd_prefetch;
-    }
-
-    pub fn isDsv41(self: *const ModelConfig) bool {
-        return arch_config.is(self, "dsv41");
     }
 
     /// The context an auto boot serves when memory admits it, ahead of the margined memory ceiling; 0 = none.
@@ -887,26 +884,17 @@ pub const ModelConfig = struct {
             (self.quant_bits == 0 or self.expert_layout == .mxfp4_individual or self.expert_layout == .mxfp4_w123);
     }
 
-    pub fn isMimo(self: *const ModelConfig) bool {
-        return arch_config.is(self, "mimo2");
-    }
-
     /// A MiMo checkpoint keeps its trunk in the source FP8 layout beside source
     /// MXFP4 or EXL3 experts, so both take the source loader.
     pub fn expertDecode(self: *const ModelConfig) expert_exl3.Decode {
         return .{ .codebook = self.expert_quant_codebook, .window = self.expert_quant_window, .table = self.expert_quant_table };
     }
 
-    pub fn usesMimoSourceTrunk(self: *const ModelConfig) bool {
-        return self.isMimo() and
-            (self.expert_layout == .mxfp4_individual or self.expert_layout == .exl3_k4);
-    }
-
     /// The long-context blast-radius predicate: every long-context mechanism (KV
     /// reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) was
     /// measured on qwen4_exp only, so they are opt-in by arch. Never hand-roll it at a site.
     pub fn longCtxGated(self: *const ModelConfig) bool {
-        return self.isQwen4();
+        return self.fact("long_ctx_gated");
     }
 
     /// Does admission credit the hot cache and evict it to admit a prefill? One predicate for the
@@ -914,7 +902,7 @@ pub const ModelConfig = struct {
     /// its warm credit is the global layers' rows alone, the ring is billed whole. GLM joins: its
     /// context is sized with no cache reserve.
     pub fn admissionEvictsHotCache(self: *const ModelConfig) bool {
-        return self.longCtxGated() or self.swaRingTokens() > 0 or self.isGlm5();
+        return self.longCtxGated() or self.swaRingTokens() > 0 or self.fact("evicts_hot_cache");
     }
 
     /// Does a request reserve its whole cache capacity up front instead of
@@ -948,7 +936,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn batchedEffectiveKvLen(self: *const ModelConfig, kv: u32, gather_on: bool, gather_min_kv: u32) u32 {
-        if (!self.isQwen4() or !gather_on) return kv;
+        if (!self.longCtxGated() or !gather_on) return kv;
         if (kv <= gather_min_kv) return kv;
         const cap = self.indexer_budget + self.indexer_compress_ratio;
         if (cap == 0) return kv;
@@ -965,45 +953,8 @@ pub const ModelConfig = struct {
     /// allocation — the two predicates MUST agree or slots crash on a null
     /// `ctx.ssm_entries`.
     pub fn needsSsmEntries(self: *const ModelConfig) bool {
-        if (self.isGlm5()) return false; // state belongs to glm5_forward.Request
+        if (self.fact("kda_state")) return false; // the state belongs to the request
         return self.full_attention_interval > 0;
-    }
-
-    /// Pure-config half of "can this arch ride the batched GatedDeltaNet
-    /// decode kernel?" (`Trunk.forwardMoeBatchedDecode`) — a dense
-    /// GDN trunk with periodic full attention.
-    ///
-    /// This exists because the answer is needed in TWO places that see
-    /// different things: `server.zig` decides whether `--max-concurrent`
-    /// clamps to 1 with only a ModelConfig in hand, while
-    /// `Trunk.supportsBatchedGdnDecode` also checks the built layer
-    /// set. Both MUST read this predicate — when they were hand-rolled
-    /// separately, the server kept clamping the GDN trunk to serial decode while
-    /// the scheduler was happily batching it, so `--max-concurrent 4` (the
-    /// obvious serving config) silently DISABLED the batched path.
-    ///
-    /// Says nothing about MoE/hybrid archs that merely share the same
-    /// forward — those stay serial, by name, in both callers.
-    /// MiMo decodes concurrent slots as rows of one forward (`forwardMimoBatchedDecode`);
-    /// a streamed load stays serial.
-    pub fn supportsBatchedMimoDecode(self: *const ModelConfig) bool {
-        return self.isMimo() and !self.expert_streaming;
-    }
-
-    /// GLM decodes concurrent slots as single-row groups of one verifier forward
-    /// (`glm5_dflash_model.verifyGroups`); a streamed load stays serial.
-    pub fn supportsBatchedGlmRows(self: *const ModelConfig) bool {
-        return self.isGlm5() and !self.expert_streaming;
-    }
-
-    /// Qwen3.8-Flash-Next decodes concurrent slots as per-row decode ticks of one forward
-    /// (`forwardQwen4DecodeRows`); a streamed load keeps the padded batch.
-    pub fn supportsBatchedQwen4Rows(self: *const ModelConfig) bool {
-        return self.isQwen4() and !self.expert_streaming;
-    }
-
-    pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
-        return self.isQwen4() and self.full_attention_interval > 0;
     }
 
     pub const NgramTableSource = enum { quantized, bf16_override, bf16_streamed };
@@ -1051,7 +1002,7 @@ pub const ModelConfig = struct {
     /// applies. A new arch scoring wider than it stores adds its arm here.
     pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
         // DeepSeek scores only each row's picked keys, billed in its own transient: no dense sheet narrows its chunk.
-        if (self.isDsv41()) return 0;
+        if (self.fact("scores_picked_keys")) return 0;
         if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }
@@ -1243,10 +1194,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.qv_min_pixels = vision_defaults.min_pixels orelse 0;
         config.qv_max_pixels = vision_defaults.max_pixels orelse 0;
         if (config.glm5_vision) {
-            config.glmv_min_image_tokens = vision_defaults.min_image_tokens orelse 16;
-            config.glmv_max_image_tokens = vision_defaults.max_image_tokens orelse 8000;
-            config.glmv_max_video_tokens = vision_defaults.max_video_tokens orelse 240000;
-            if (config.glmv_min_image_tokens > config.glmv_max_image_tokens) return error.InvalidGlmVisionConfig;
+            config.vision_min_image_tokens = vision_defaults.min_image_tokens orelse 16;
+            config.vision_max_image_tokens = vision_defaults.max_image_tokens orelse 8000;
+            config.vision_max_video_tokens = vision_defaults.max_video_tokens orelse 240000;
+            if (config.vision_min_image_tokens > config.vision_max_image_tokens) return error.InvalidGlmVisionConfig;
         }
     }
 
@@ -1854,7 +1805,7 @@ pub const ResidentSplit = struct { trunk: u64, mtp: u64, vision: u64 = 0, stq_he
 /// Resident Sushi EXL3 packs have a measured load envelope and exact component bills.
 pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
     return config.expert_layout == .exl3_k4 and !config.expert_streaming and
-        (config.isQwen4() or config.isMimo());
+        config.fact("sushi_quant_memory_bill");
 }
 
 /// The quantization group a built arch's vision tower requantizes this matrix to at load; null keeps its stored bytes.
@@ -1963,7 +1914,7 @@ pub const served_model_types = registry.registered_model_types;
 fn tableDefaultArm(config: *const ModelConfig, snap: *const effort_mod.Snapshot) ?effort_mod.EffortArm {
     const family = effort_mod.Family.of(config.model_type) orelse return null;
     const edits = snap[@intFromEnum(family)];
-    if (edits.default == null and config.isQwen4() and config.gen_enable_thinking == false) return null;
+    if (edits.default == null and config.fact("thinking_off_checkpoint") and config.gen_enable_thinking == false) return null;
     const t = effort_mod.merge(family, edits);
     const row = t.row(t.default);
     return .{ .effort = t.default, .budget = row.cap, .sends = row.sends };
@@ -2053,7 +2004,7 @@ pub fn loadWeightsForConfig(
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, load_vision, config.stream_mtp_head);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    const mtp_off = config.isQwen4() and config.mtp_override == false;
+    const mtp_off = config.fact("skips_mtp_weights_when_off") and config.mtp_override == false;
     return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null, mtp_off);
 }
 
@@ -4456,14 +4407,14 @@ test "a parsed config carries its arch tag; a hand-built one resolves it from mo
         try testing.expectEqual(registry.ofModelType(config.model_type), config.arch.tag);
     }
     const glm = ModelConfig{ .model_type = "glm5_next" };
-    try testing.expectEqual(registry.ofModelType("glm5_next") != null, glm.isGlm5());
-    try testing.expect(!glm.isQwen4() and !glm.isDsv41() and !glm.isMimo());
+    try testing.expectEqual(registry.ofModelType("glm5_next") != null, arch_config.isOf(glm, "glm5"));
+    try testing.expect(!arch_config.isOf(glm, "qwen4") and !arch_config.isOf(glm, "dsv41") and !arch_config.isOf(glm, "mimo2"));
     const fx = arch_chat.Fixtures("qwen4");
     if (@hasDecl(fx, "shipped")) {
         var parsed = try parseConfigFromJson(testing.allocator, fx.shipped);
         defer parsed.deinit(testing.allocator);
-        try testing.expectEqual(registry.ofModelType("qwen4_exp") != null, parsed.isQwen4());
-        try testing.expect(!parsed.isGlm5());
+        try testing.expectEqual(registry.ofModelType("qwen4_exp") != null, arch_config.isOf(parsed, "qwen4"));
+        try testing.expect(!arch_config.isOf(parsed, "glm5"));
     }
-    try testing.expect(!(ModelConfig{ .model_type = "mistral" }).isQwen4());
+    try testing.expect(!arch_config.isOf(ModelConfig{ .model_type = "mistral" }, "qwen4"));
 }

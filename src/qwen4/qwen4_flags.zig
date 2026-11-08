@@ -1,5 +1,6 @@
 //! Flash-Next's launch face (the `flags` slot of `arch.zig`): the flags only it takes, with their help and boot lines.
 const model = @import("../model.zig");
+const arch_config = @import("../arch/config.zig");
 const flags = @import("../arch/flags.zig");
 const trunk = @import("../trunk.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
@@ -54,7 +55,7 @@ fn setQwenGdn(value: []const u8) bool {
 /// What `--mtp-head-kv-quant` does on this arch, for the boot log; null when unset.
 fn mtpHeadKvLine(config: *const model.ModelConfig, use: flags.LaunchFlagUse) ?[]const u8 {
     if (!use.mtp_head_kv_quant) return null;
-    if (config.isMimo()) return "MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)";
+    if (arch_config.isOf(config, "mimo2")) return "MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)";
     return "MTP head KV: following --kv-quant (--mtp-head-kv-quant)";
 }
 
@@ -62,7 +63,7 @@ fn mtpHeadKvLine(config: *const model.ModelConfig, use: flags.LaunchFlagUse) ?[]
 /// GLM and MiMo have no GatedDeltaNet arm, so the flag has no effect there.
 fn qwenGdnLine(config: *const model.ModelConfig, use: flags.LaunchFlagUse) ?[]const u8 {
     if (!use.qwen_gdn_16) return null;
-    if (config.isGlm5()) return "GDN state: --qwen-gdn 16 has no effect on GLM (its KDA state is f32 already)";
-    if (config.isMimo()) return "GDN state: --qwen-gdn 16 has no effect on mimo_v2 (no GatedDeltaNet layers)";
+    if (arch_config.isOf(config, "glm5")) return "GDN state: --qwen-gdn 16 has no effect on GLM (its KDA state is f32 already)";
+    if (arch_config.isOf(config, "mimo2")) return "GDN state: --qwen-gdn 16 has no effect on mimo_v2 (no GatedDeltaNet layers)";
     return "GDN state: bf16 between tokens (--qwen-gdn 16; f32 is the default; the decay gate is f32 either way)";
 }

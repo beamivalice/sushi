@@ -1,5 +1,7 @@
 //! Flash-Next MTP cost profiles: the runtime fingerprint of the packs the G17 surfaces were measured on.
 const mtp_mod = @import("../mtp.zig");
+const mtp_policy = @import("../mtp_policy.zig");
+const MtpEvCosts = mtp_policy.MtpEvCosts;
 const MtpCostProfile = mtp_mod.MtpCostProfile;
 const trunk_mod = @import("../trunk.zig");
 const Trunk = trunk_mod.Trunk;
@@ -267,4 +269,79 @@ fn qwen4PackTripleMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, 
     if (ss[1] <= 0 or ss[1] != bs[1]) return false;
     const k = @as(u64, @intCast(ss[1])) * 64;
     return @as(u64, @intCast(ws[1])) * 32 == k * 4;
+}
+
+/// qwen4_exp (Qwen3.8-Flash-Next 125B-A6B) on G17, M5 Max 40-core refit
+/// (2026-08-27/28). Fitted at ~8.5k context like every prior surface
+/// (a short-context fit planned too shallow at 8.5k, measured -4% —
+/// every constant this controller ever shipped was fitted at ONE
+/// context length, and 8K is the house one). Forced-depth saturated
+/// echo (the test_mtp_equivalence echo appended to ~8.3k of neutral
+/// filler, temp 0, `--prefix-cache-entries 0`, round-cost persist off),
+/// depths {1,2,3,4,6} x two reversed passes x 3 reps, medians of
+/// per-request round_ms: T(1)=25.41, T(2)=31.18, T(3)=35.70,
+/// T(4)=41.33, T(6)=53.58 ms -> 20.34 ms floor, composite
+/// (draft + per-position) marginals .257/.303 (SSE 0.28), shipped
+/// house-style below as `.draft = 0.02` plus per-position .237/.283 —
+/// composite minus draft, the same split every calibrated surface
+/// carries. Short-context fit for the record: T(1..4,6,8)=
+/// 23.61/28.12/33.91/38.87/50.16/62.70 -> floor 18.24, composite
+/// .283/.310/.344 (the .344 ships as per-position `.325`).
+/// A verify row on this arch is BYTES — a second row reads its own
+/// experts — so the marginals sit 3-5x above the dense-sidecar surfaces
+/// and there is NO NAX flattening: routed expert banks never ride the
+/// vqmm NAX lane (that is the M5 plan's grouped-expert item, and this
+/// table is its before-number). `per_pos_nax` carries the short-context
+/// k>=7 STEEPENING (+11%/pos, a measurement not a discount) and is
+/// inert under this profile's default cap of 6. sync stays nominal per
+/// the dry-spell-gate doctrine (measured chunk-boundary sync ~1.7 ms is
+/// governed by the realized-rate gate, not the prior). draft/verify
+/// split arbitrary but positive; only the sums enter the controller.
+pub const MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS: MtpEvCosts = .{
+    .draft = 0.02,
+    .per_pos_lo = 0.237,
+    .per_pos_hi = 0.283,
+    .flat_max = 4,
+    .sync = 0.02,
+    .nax_from = 7,
+    .per_pos_nax = 0.325,
+};
+
+/// 2026-09-13 M5 Max mixed4/8 refit after the single-stream verifier
+/// fast paths. Affine8 target/head KV, 3-bit draft shortlist, ~8.6k
+/// context; forced depths {1,2,3,4,5,6,8}, three echo repetitions in
+/// each of two reversed boot orders. Median full-round EMAs (ms):
+/// 24.145/28.970/34.035/38.470/44.310/51.970/61.600.
+/// Fit floor=19.037 and position slopes=4.983/8.018/4.815 ms;
+/// max relative residual 1.30%. Depth6 verifies seven positions and
+/// leaves the optimized width2..6 envelope, hence flat_max=5.
+/// Only composite marginals are identifiable; retain draft=.02 and
+/// nominal sync=.02. Runtime fingerprint and KV guards live in mtp.zig.
+/// Evidence and reproduction: notes/MTP-SINGLE-VERIFY.md.
+pub const MTP_EV_G17_NAX_QWEN4_MIXED_4_8_GS64_COSTS: MtpEvCosts = .{
+    .draft = 0.02,
+    .per_pos_lo = 0.241753,
+    .per_pos_hi = 0.401180,
+    .flat_max = 5,
+    .sync = 0.02,
+    .nax_from = 7,
+    .per_pos_nax = 0.232929,
+};
+
+/// The EV cost surface of each Flash-Next profile.
+pub fn evCosts(profile: MtpCostProfile) ?MtpEvCosts {
+    return switch (profile) {
+        .g17_nax_qwen4_q4_gs64 => MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS,
+        .g17_nax_qwen4_mixed_4_8_gs64 => MTP_EV_G17_NAX_QWEN4_MIXED_4_8_GS64_COSTS,
+        else => null,
+    };
+}
+
+test "mtpEvCostsForProfile: G17 profiles are explicit" {
+    const generic = mtp_policy.mtpEvCostsForProfile(.generic);
+    try std.testing.expectEqual(mtp_policy.MTP_EV_DEFAULT_COSTS, generic);
+
+    const qwen4 = mtp_policy.mtpEvCostsForProfile(.g17_nax_qwen4_q4_gs64);
+    try std.testing.expectEqual(MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, qwen4);
+    try std.testing.expect(!std.meta.eql(generic, qwen4));
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const cost_profile = @import("qwen4_cost_profile.zig");
 const settings_resolve = @import("../settings_resolve.zig");
 const mlx = @import("../mlx.zig");
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
@@ -125,12 +126,12 @@ test "mtpEvPlanFor: realistic warmup EMAs stop the generic surface early and nev
     // qwen4_exp's measured surface has no NAX takeover — a verify row is
     // bytes at every width — so the same base depth stands but the same
     // evidence must NOT extend to depth 8.
-    const qwen4_plan = Generator.mtpEvPlanFor(&a, 8, mtp_policy.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 3);
+    const qwen4_plan = Generator.mtpEvPlanFor(&a, 8, cost_profile.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 3);
     try testing.expectEqual(@as(u32, 3), qwen4_plan.m_lo);
     try testing.expect(qwen4_plan.m_hi < 8);
 
     const cold = [_]f32{ 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 };
-    const cold_plan = Generator.mtpEvPlanFor(&cold, 8, mtp_policy.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 8);
+    const cold_plan = Generator.mtpEvPlanFor(&cold, 8, cost_profile.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, 8);
     try testing.expectEqual(@as(u32, 1), cold_plan.m_lo);
     try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
 }

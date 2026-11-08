@@ -67,7 +67,6 @@ deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
 deepseek_v41 thinks by default, at its native high effort
 deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check
-dflash: Qwen rows default to 2..block and are bounded by the drafter block and the verify path
 driver: a tiny Qwen source becomes a complete pack, and a second run into it is refused
 dsv41 geometry: the grouped chain at 5120x2304 over n24, n26, n32, n40 and a mixed class holds the f32-truth bar
 dsv41 geometry: the shared expert as a one-expert fused chain gives a row the same bytes at every decode width and holds the f32-truth bar
@@ -139,11 +138,9 @@ mimo_v2 warm bill credits only the restored global rows, never the ring
 mimo_v2 with an SSD tier bills a restored global layer beside its first grow
 mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has room
 mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, DSpark does not
-mtpAdaptiveMinKvFor: MiMo's switch starts at 64k, qwen4's at 32k
 mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never a batched head or a planner-owned round
 ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got
 oneSessionFor: a full MiMo cache leaves a cold full-context prompt its bill at the pinned width
-only a Qwen EXL3 pack or a DeepSeek-V4.1 checkpoint or STQ pack keeps its MTP head under streaming
 opencode config for GLM: tool calls on, reasoning_content round-trips, variants are only the words GLM accepts
 pack: the Qwen trunk is renamed, affine-quantized by rule, and the experts and n-gram shards are left out
 pack: the Qwen trunk stores norm weights as one plus the source, conv kernels as [C,K,1] and the patch embedding channels-last

@@ -1,4 +1,5 @@
 const std = @import("std");
+const qwen4_config = @import("qwen4_config.zig");
 const arch_handle = @import("../arch/handle.zig");
 const trunk_mod = @import("../trunk.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
@@ -102,10 +103,10 @@ test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the p
 test "a resident qwen4_exp decodes rows of one forward without padding; a streamed one keeps the padded batch" {
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     cfg.model_type = "qwen4_exp";
-    try testing.expect(cfg.supportsBatchedQwen4Rows());
+    try testing.expect(qwen4_config.supportsBatchedRows(cfg));
     try testing.expectEqual(@as(usize, 8), batchGroupCap(&cfg));
     cfg.expert_streaming = true;
-    try testing.expect(!cfg.supportsBatchedQwen4Rows());
+    try testing.expect(!qwen4_config.supportsBatchedRows(cfg));
     try testing.expectEqual(MAX_BATCH_GROUP, batchGroupCap(&cfg));
 }
 
@@ -314,7 +315,7 @@ test "a GDN trunk is batchable AND is not clamped by the server's concurrency ga
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     cfg.model_type = "qwen4_exp";
     cfg.full_attention_interval = 4;
-    try testing.expect(cfg.supportsBatchedGdnDecode());
+    try testing.expect(qwen4_config.supportsBatchedGdnDecode(cfg));
 
     // The server's startup line, /props and /v1/models read this one predicate.
     try testing.expect(configBatchesDecode(&cfg));
@@ -328,13 +329,13 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
         kda.model_type = "glm5_next";
         kda.full_attention_interval = 4;
         kda.kda_vector_gate = true;
-        try testing.expect(!kda.supportsBatchedGdnDecode());
+        try testing.expect(!qwen4_config.supportsBatchedGdnDecode(kda));
     }
     {
         // Pure attention: not a GDN trunk at all, rides the standard kernel.
         var dense = std.mem.zeroes(model_mod.ModelConfig);
         dense.model_type = "not_a_served_arch";
-        try testing.expect(!dense.supportsBatchedGdnDecode());
+        try testing.expect(!qwen4_config.supportsBatchedGdnDecode(dense));
     }
     {
         // qwen4_exp: MoE, but every per-slot piece is on the SSMCacheEntry.
@@ -343,7 +344,7 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
         q4.full_attention_interval = 4;
         q4.num_experts = 256;
         q4.num_experts_per_tok = 8;
-        try testing.expect(q4.supportsBatchedGdnDecode());
+        try testing.expect(qwen4_config.supportsBatchedGdnDecode(q4));
     }
 }
 

@@ -12,6 +12,7 @@
 //! On-demand load + LRU eviction live in plan 05 phases 2-5 and depend on
 //! plan 01 Phase 0 (detangling Trunk state).
 
+const arch_packs = @import("arch/packs.zig");
 const std = @import("std");
 const log = @import("log.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
@@ -296,7 +297,7 @@ pub const ModelKind = enum {
     pub fn describe(self: ModelKind) []const u8 {
         return switch (self) {
             .chat => "a chat model",
-            .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside its Qwen3.8-Flash-Next or GLM-5.3-Flash target)",
+            .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside its " ++ arch_packs.dflash_targets_or ++ " target)",
             .unsupported => "an architecture sushi does not support",
         };
     }

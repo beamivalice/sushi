@@ -17,6 +17,7 @@
 //! Rows are appended in window order; a window commits (windows.jsonl) only after every file of its batch is synced,
 //! and a rerun of the same command truncates to the committed windows and continues.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
@@ -73,7 +74,7 @@ fn checkedMode(head_rows: bool, lean: bool) !Mode {
 const ffn_naming = imatrix_capture.Naming{ .layer_prefix = "layers.", .experts_infix = ".ffn.experts." };
 
 pub fn refuse(config: *const model.ModelConfig, opts: kld.Options) !void {
-    if (!config.isDsv41()) return;
+    if (!arch_config.isOf(config, "dsv41")) return;
     if (opts.kv_quant_config.isQuant()) return error.Dsv41KvQuantUnsupported;
     if (!opts.qwen_gdn_f32) return error.Dsv41HasNoQwenGdnState;
     if (opts.hidden_out.len > 0) return error.Dsv41HiddenCaptureUnsupported;
@@ -81,7 +82,7 @@ pub fn refuse(config: *const model.ModelConfig, opts: kld.Options) !void {
 }
 
 pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
-    if (!cfg.isDsv41() or opts.command != .capture or !opts.layer_major) return false;
+    if (!arch_config.isOf(cfg, "dsv41") or opts.command != .capture or !opts.layer_major) return false;
     if (opts.kv_quant_config.isQuant()) return error.Dsv41KvQuantUnsupported;
     if (!opts.qwen_gdn_f32) return error.Dsv41HasNoQwenGdnState;
     if (opts.hidden_out.len > 0) return error.Dsv41HiddenCaptureUnsupported;

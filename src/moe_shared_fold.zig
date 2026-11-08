@@ -37,7 +37,7 @@ pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const trunk_mod.MoeMlpWeights, ind
     };
     if (result != null and !logged) {
         logged = true;
-        @import("log.zig").info("[qwen] shared expert rides the routed launches engaged\n", .{});
+        @import("arch/kernels.zig").sharedFoldEngaged();
     }
     return result;
 }

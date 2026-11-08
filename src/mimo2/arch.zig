@@ -1,6 +1,7 @@
 //! MiMo-V2.6-Flash (`mimo_v2`) as the registry sees it: its one public face. It runs the generic MoE trunk, so it
 //! is the registry's default arch (`default_arch`).
 const std = @import("std");
+const mimo_config = @import("mimo_config.zig");
 const mimo_forward = @import("mimo_forward.zig");
 const mlx = @import("../mlx.zig");
 const trunk = @import("../trunk.zig");
@@ -52,17 +53,27 @@ pub const config_facts: arch_config.Facts = .{
     .moe_scores_f32 = true,
     .qkv_split_rows = true,
     .bias_routed_moe = true,
+    .expert_source = .flat_banks,
+    .sliding_ring = true,
+    .sushi_quant_memory_bill = true,
+    .declared_wired_ceiling = true,
+    .mtp_adaptive_calibrated = true,
+    // Its verify rows stay cheap until its global layers read many keys, so below this its rounds beat serial even on
+    // prose and a probe could only cost.
+    .mtp_adaptive_min_kv = 65536,
+    .mtp_rollback_by_truncate = true,
+    .cost_layout = .full_attention,
 };
 pub const pack_layout: arch_config.PackLayout = .{ .prefix = "model", .stamped = true, .head = .none };
 pub const parseConfig = config_file.parseFamily;
 
 pub fn adoptLayout(config: *Config) void {
     // The MiMo binder reads the source QKV itself; the generic fused-QKV names never apply to it.
-    if (config.usesMimoSourceTrunk()) config.attn_fused_qkv = false;
+    if (mimo_config.usesSourceTrunk(config)) config.attn_fused_qkv = false;
 }
 
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {
-    if (!config.usesMimoSourceTrunk()) return null;
+    if (!mimo_config.usesSourceTrunk(config)) return null;
     var streamed = config.*;
     streamed.expert_streaming = true;
     const source = @import("mimo_source.zig");
@@ -81,7 +92,7 @@ pub const moe = struct {
 
     /// A source trunk's dense router is widened once at load, which `mimo_source.countResidentBytes` bills.
     pub fn widensRouter(config: *const Config) bool {
-        return config.usesMimoSourceTrunk();
+        return mimo_config.usesSourceTrunk(config);
     }
 };
 

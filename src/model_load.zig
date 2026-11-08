@@ -2,6 +2,7 @@ const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
 const server_state = @import("server_state.zig");
 const arch_flags = @import("arch/flags.zig");
+const arch_config = @import("arch/config.zig");
 const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -32,6 +33,7 @@ const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
 const arch_handle = @import("arch/handle.zig");
 const arch_load = @import("arch/load.zig");
+const arch_packs = @import("arch/packs.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
@@ -242,7 +244,7 @@ pub fn mtpStreamingVerdict(choice: model_settings.MtpChoice, head_supported: boo
 
 /// The layouts whose experts stream beside a resident drafting head; the pack's own head is read from disk only after this.
 fn headLayoutSupported(config: *const ModelConfig, layout: expert_stream_mod.quant.Layout) bool {
-    return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), layout);
+    return admission.streamedMtpHead(config, layout);
 }
 
 pub fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) bool {
@@ -272,7 +274,7 @@ test "a drafting head streams beside the experts only for the layouts its arch r
 /// Does the pack in `model_dir` ship the head its arch drafts with: Flash-Next's MTP head, MiMo's heads, DeepSeek's DSpark stages?
 pub fn packShipsMtpHead(io: std.Io, allocator: std.mem.Allocator, model_type: []const u8, model_dir: []const u8) bool {
     const probe = ModelConfig{ .model_type = model_type };
-    if (probe.isQwen4()) return model_discovery.readStubMeta(io, allocator, model_dir).has_mtp;
+    if (arch_config.fact(&probe, "dflash_by_flag")) return model_discovery.readStubMeta(io, allocator, model_dir).has_mtp;
     if (arch_load.shipsHead(io, allocator, &probe, model_dir)) |ships| return ships;
     return false;
 }
@@ -622,7 +624,7 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
     if (drop) |*d| geometry.drop = d;
     var streamed = config.*;
     streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
-    if (config.stream_mtp_head and !expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), streamed.expert_layout)) {
+    if (config.stream_mtp_head and !admission.streamedMtpHead(config, streamed.expert_layout)) {
         log.err("[expert-stream] {s}; drop --mtp\n", .{expert_stream_mod.MTP_UNSUPPORTED});
         return error.ExpertStreamingMtpUnsupported;
     }
@@ -901,7 +903,7 @@ pub const LoadDrafterDir = struct {
     pub fn resolve(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, no_drafter: bool, drafter_dir: []const u8, model_dir: []const u8) LoadDrafterDir {
         if (no_drafter) return .{ .dir = "" };
         if (drafter_dir.len > 0) return .{ .dir = drafter_dir };
-        if (config.isQwen4()) return .{ .dir = "" };
+        if (arch_config.fact(config, "dflash_by_flag")) return .{ .dir = "" };
         const in_dir = dflash_mod.resolveInDirDrafter(io, allocator, model_dir) orelse return .{ .dir = "" };
         return .{ .dir = in_dir, .owned = in_dir };
     }
@@ -913,7 +915,7 @@ pub const LoadDrafterDir = struct {
 
 /// A streamed Flash-Next load keeps the found DFlash2 drafter resident beside the trunk.
 pub fn streamedAssistantBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, no_drafter: bool, drafter_dir: []const u8, model_dir: []const u8) !u64 {
-    if (!config.isQwen4()) return 0;
+    if (!arch_config.fact(config, "dflash_by_flag")) return 0;
     const found = LoadDrafterDir.resolve(io, allocator, config, no_drafter, drafter_dir, model_dir);
     defer found.deinit(allocator);
     return sushiAssistantLoadBytes(io, allocator, found.dir);
@@ -923,7 +925,7 @@ pub fn streamedAssistantBytes(io: std.Io, allocator: std.mem.Allocator, config: 
 fn coldServingBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, drafter_dir: []const u8) u64 {
     const bill = scheduler_mod.load_serving_bill orelse return 0;
     var stamped = config.*;
-    if (config.isQwen4() and drafter_dir.len > 0) stampDflashRequestTerms(io, allocator, &stamped, drafter_dir) catch {};
+    if (arch_config.fact(config, "dflash_by_flag") and drafter_dir.len > 0) stampDflashRequestTerms(io, allocator, &stamped, drafter_dir) catch {};
     return if (bill(&stamped, std.math.maxInt(u64))) |b| b.needed else 0;
 }
 
@@ -971,7 +973,7 @@ pub fn visionChoiceFor(config: *const ModelConfig, streamed: bool) model_setting
 }
 
 pub fn visionDefaultOn(config: *const ModelConfig, streamed: bool) bool {
-    return !streamed or config.isDsv41();
+    return !streamed or arch_config.fact(config, "vision_on_streamed");
 }
 
 /// Should a cold load bring up the checkpoint's vision tower?
@@ -1288,7 +1290,7 @@ pub fn stampDflashRequestTerms(io: std.Io, allocator: std.mem.Allocator, config:
     if (!cfg.isDflash2() or cfg.hidden_size != config.hidden_size or cfg.sliding_window < 2) return error.DflashTargetMismatch;
     for (cfg.layer_types) |kind| if (kind != .sliding_attention) return error.DflashWindowUnsupported;
     config.dflash_loaded = true;
-    if (config.isQwen4()) config.dflash_load_transient_bytes = (try dflash_mod.assistantLoadBytes(io, allocator, directory, dflash_mod.quantBitsFromEnv())).transient;
+    if (arch_config.fact(config, "dflash_by_flag")) config.dflash_load_transient_bytes = (try dflash_mod.assistantLoadBytes(io, allocator, directory, dflash_mod.quantBitsFromEnv())).transient;
     const per_token = @as(u64, cfg.num_hidden_layers) * cfg.num_key_value_heads * cfg.head_dim * 4;
     // A draft block grows a 2047-row window to the next 256-row allocation.
     config.dflash_window_bytes = per_token * ((@as(u64, cfg.sliding_window) + cfg.block_size + 255) / 256 * 256);
@@ -1509,12 +1511,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (dflash_mod.drafterDepthExplicit() and drafter_dir.len == 0) log.warn("[dflash] --drafter-min-depth/--drafter-max-depth ignored: no drafter is loaded for this model\n", .{});
     if (model_mod.usesSushiQuantMemoryBill(params.config) and drafter_dir.len > 0 and !streamed)
         streaming_resident_bytes = streaming_resident_bytes.? +| try sushiAssistantLoadBytes(sch.io, sch.allocator, drafter_dir);
-    if (params.config.isQwen4() and drafter_dir.len > 0) try stampDflashRequestTerms(sch.io, sch.allocator, params.config, drafter_dir);
-    if (params.config.isQwen4() and drafter_dir.len == 0) {
-        const why: []const u8 = if (params.no_drafter) "--no-drafter" else "DFlash2: --drafter <path>";
-        const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
-        log.info("[spec] Qwen3.8-Flash-Next decodes with {s} ({s})\n", .{ if (mtp_on) "MTP" else "plain ticks", why });
-    }
+    try arch_load.drafterChosen(sch.io, sch.allocator, params.config, drafter_dir, params.no_drafter, mtpChoiceFor(params.mtp, params.config).on);
     if (try arch_load.stageDrafter(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, params.no_drafter)) |assistant_bytes|
         streaming_resident_bytes = streaming_resident_bytes.? +| assistant_bytes;
 
@@ -1659,12 +1656,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const acceptance = settings_resolve.acceptanceFor(params.config.mtp_acceptance_override);
     const greedy_tail = settings_resolve.greedyTailFor(params.config.mtp_greedy_tail_override);
     // GLM has no MTP head; the server's `MTP: off` line already says so.
-    if (!params.config.isGlm5() and !params.config.isDsv41()) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
+    if (!arch_config.fact(params.config, "no_mtp_head")) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
         if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
         mtp_acceptance_mod.name(acceptance.value),     settings_resolve.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
         if (greedy_tail.value) "on" else "off",        settings_resolve.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
     });
-    const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5() and !params.config.isDsv41();
+    const mtp_enabled = mtp.on and !mtp_streaming_off and !arch_config.fact(params.config, "no_mtp_head");
     arch_serve.loadLines(params.config, .{ .io = sch.io, .allocator = sch.allocator, .model_dir = params.model_dir, .mtp_source = mtp.sourceName() });
     arch_load.logLoad(params.config, kv_quant_config, mtp.on, params);
     if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config.chat_template)) {
@@ -1944,35 +1941,23 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
             return err;
         };
-        if (!arch_load.bindDflash(sch.allocator, xfm_ptr, d, kv_quant_config, params.tok)) {
-            if (params.config.isQwen4()) {
-                d.sliding_serving = true;
-                d.bind(xfm_ptr) catch |err| {
-                    d.deinit();
-                    sch.allocator.destroy(d);
-                    log.err("DFlash assistant at {s} is incompatible with target: {s}\n", .{ drafter_dir, @errorName(err) });
-                    return err;
-                };
-            } else {
-                d.deinit();
-                sch.allocator.destroy(d);
-                log.err("--drafter: a DFlash2 assistant serves Qwen3.8-Flash-Next and GLM-5.3-Flash only\n", .{});
-                return error.DflashTargetMismatch;
-            }
+        const bound = arch_load.bindDflash(sch.allocator, xfm_ptr, d, kv_quant_config, params.tok) catch |err| {
+            d.deinit();
+            sch.allocator.destroy(d);
+            log.err("DFlash assistant at {s} is incompatible with target: {s}\n", .{ drafter_dir, @errorName(err) });
+            return err;
+        };
+        if (!bound) {
+            d.deinit();
+            sch.allocator.destroy(d);
+            log.err("--drafter: a DFlash2 assistant serves {s} only\n", .{arch_packs.dflash_targets_and});
+            return error.DflashTargetMismatch;
         }
         dflash_ptr = d;
         const wide_lane = dflash_mod.wideVerifyLaneAvailable();
         const block_cap = dflash_mod.blockCapForMachine(chip_mod.chipBrand());
         sch.drafter_block_size = dflash_mod.resolveBlockSize(d.config.block_size, wide_lane, block_cap.cap);
-        if (params.config.isQwen4()) {
-            const bounds = dflash_mod.qwenRowBounds(dflash_mod.drafter_min_depth, dflash_mod.drafter_max_depth, d.config.block_size) catch |err| {
-                d.deinit();
-                sch.allocator.destroy(d);
-                log.err("--drafter-min-depth/--drafter-max-depth: this drafter serves {d}..{d} rows per round on Qwen3.8-Flash-Next\n", .{ dflash_mod.QWEN_MIN_ROWS, @min(d.config.block_size, dflash_mod.QWEN_MAX_ROWS) });
-                return err;
-            };
-            sch.drafter_block_size = bounds.max;
-        } else if (arch_load.dflashRowBounds(params.config, dflash_mod.drafter_min_depth, dflash_mod.drafter_max_depth) catch |err| {
+        if (arch_load.dflashRowBounds(params.config, dflash_mod.drafter_min_depth, dflash_mod.drafter_max_depth, d.config.block_size) catch |err| {
             d.deinit();
             sch.allocator.destroy(d);
             return err;
@@ -1980,7 +1965,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             sch.drafter_block_size = rows;
         }
         var cap_note_buf: [96]u8 = undefined;
-        const cap_note: []const u8 = if (!wide_lane and !params.config.isQwen4() and !dflash_mod.drafterDepthExplicit() and d.config.block_size > sch.drafter_block_size)
+        const cap_note: []const u8 = if (!wide_lane and arch_config.fact(params.config, "chip_capped_drafter_block") and !dflash_mod.drafterDepthExplicit() and d.config.block_size > sch.drafter_block_size)
             std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
                 block_cap.label,
                 block_cap.cap,
@@ -1993,7 +1978,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             wide_lane,
             d.config.target_layer_ids,
         });
-        if (params.config.isQwen4()) log.info("[spec] Qwen3.8-Flash-Next decodes with DFlash2 ({d}..{d} rows per round; --drafter outranks MTP, --no-drafter selects it)\n", .{ dflash_mod.qwenMinRows(), sch.drafter_block_size });
         arch_load.logDflashReady(params.config, sch.drafter_block_size);
     } else if (drafter_dir.len > 0) {
         log.err("Drafter at {s} is not a DFlash assistant (its config lacks block_size, mask_token_id and target_layer_ids)\n", .{drafter_dir});
@@ -2087,7 +2071,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.mtp_depth = @min(entry.mtp_depth, cap);
         xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, cap);
     };
-    if (entry.mtp != null and !params.config.isDsv41()) log.info("[mtp] depth range {d}..{d} ({s})\n", .{
+    if (entry.mtp != null and !arch_config.fact(params.config, "no_mtp_head")) log.info("[mtp] depth range {d}..{d} ({s})\n", .{
         depth_bounds.floorFor(depth_bounds.active, entry.mtp_depth),
         entry.mtp_depth,
         if (depth_bounds.active.explicit()) "--mtp-min-depth/--mtp-max-depth" else "default",
@@ -2173,19 +2157,19 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (ram_prefix_cache) params.prefix_cache_capacity else 0,
             clamped_prefix_mem,
         );
-        entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0 and !params.config.isGlm5();
+        entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0 and !arch_config.fact(params.config, "latent_kv");
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
-        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .min_span;
+        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or arch_config.fact(params.config, "state_beside_kv")) .min_span_recency else .min_span;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
-        entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5() or params.config.isDsv41();
+        entry.prefix_cache.?.hybrid = has_ssm_layers or arch_config.fact(params.config, "state_beside_kv");
         if (disk_tier) |tier| {
             entry.prefix_cache.?.disk = tier;
             entry.prefix_cache.?.disk.?.cp_thin =
-                if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .oldest;
+                if (params.config.longCtxGated() or !ram_prefix_cache or arch_config.fact(params.config, "state_beside_kv")) .min_span_recency else .oldest;
             entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (prefix_arch.diskCheckpointCap(params.config)) |cap|
                 cap
-            else if (params.config.isGlm5() or params.config.longCtxGated() or !ram_prefix_cache)
+            else if (arch_config.fact(params.config, "kda_state") or params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;

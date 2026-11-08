@@ -1,4 +1,5 @@
 const std = @import("std");
+const arch_load = @import("arch/load.zig");
 const http = @import("http.zig");
 const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -2060,7 +2061,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --ssd-budget-gb or free memory." },
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
         error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = model_load_mod.budget_required_message },
-        error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards. For MiMo, repack the checkpoint first; raw per-expert HF shards cannot be streamed directly." },
+        error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = arch_load.refusalText("ExpertStreamingUnsupportedLayout") orelse "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards." },
         error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
         error.ExpertLayoutUnsupported => .{ .type = "expert_layout_unsupported", .message = "This checkpoint's routed experts are not a pack layout this build can load. An EXL3 pack's expert_quant names format exl3, a k, and codebook mcg or mul1, or format stq and codebook std1, spec1 or pair1 (with their codebook_table and codebook_digest); re-convert the pack." },
         error.Exl3GroupMissing => .{ .type = "exl3_group_missing", .message = "An EXL3 rate group or projection tensor is missing." },
@@ -2071,7 +2072,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3RouterWidthMismatch => .{ .type = "exl3_router_width_mismatch", .message = "The router width must equal the sum of its layer expert group sizes." },
         error.Exl3TopKExceedsExperts => .{ .type = "exl3_topk_exceeds_experts", .message = "The routed top-k exceeds this layer expert count." },
         error.Exl3RaggedStreamingUnsupported => .{ .type = "exl3_ragged_streaming_unsupported", .message = "EXL3 rate groups and pruned expert layers require resident loading." },
-        error.Exl3RateGroupsUnsupported => .{ .type = "exl3_rate_groups_unsupported", .message = "GLM-5.3-Flash packs serve one rate per layer; a rate-grouped layer loads on Qwen3.8-Flash-Next and MiMo-V2.6-Flash only." },
+        error.Exl3RateGroupsUnsupported => .{ .type = "exl3_rate_groups_unsupported", .message = arch_load.refusalText("Exl3RateGroupsUnsupported") orelse "This model serves one rate per layer; a rate-grouped layer needs a model that reads rate groups." },
         error.Exl3RouterGroupsUnsupported => .{ .type = "exl3_router_groups_unsupported", .message = "Reordered or pruned EXL3 experts require n_group=1 routing." },
         error.Exl3TopKExceedsReduceBank => .{ .type = "exl3_topk_exceeds_reduce_bank", .message = "This EXL3 pack's num_experts_per_tok exceeds the decode reduce-bank (32). Re-convert with top-k <= 32." },
         error.Exl3RateGroupsStreamingUnsupported => .{ .type = "exl3_rate_groups_streaming_unsupported", .message = "SSD streaming does not support EXL3 rate-group (.gN) packs. Use uniform leading-index expert banks." },
@@ -2092,7 +2093,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3CodebookTableLegacyConfig => .{ .type = "exl3_codebook_table_legacy_config", .message = "This pack's expert_quant names a codebook table by a digest from before the table grew (spec1-w15 2ac2594d, now 37f72431). Re-convert the pack." },
         error.Exl3CodebookTableUndecodable => .{ .type = "exl3_codebook_table_undecodable", .message = "This STQ pack's codebook table holds PAIR1 constants this build's kernels have not compiled." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
-        error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = "--ssd-budget-gb cannot hold the vision tower (--vision, or the default on DeepSeek-V4.1) beside the minimum expert cache. Raise the budget or pass --no-vision." },
+        error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = arch_load.refusalText("SsdBudgetBelowVision") orelse "--ssd-budget-gb cannot hold the vision tower (--vision) beside the minimum expert cache. Raise the budget or pass --no-vision." },
         error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache (and, under --vision, the largest image encode) exceeds the machine's residency limit. Raise iogpu.wired_limit_mb together with vm.global_user_wire_limit and vm.user_wire_limit (the server log prints the command) or lower the budget." },
         else => null,
     };

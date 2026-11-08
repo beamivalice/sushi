@@ -2,6 +2,8 @@
 //! either routed-expert layout, what that load keeps resident, the MTP heads it allocates beside the trunk, and the
 //! verify warmup.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
+const mimo_config = @import("mimo_config.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
 const model = @import("../model.zig");
@@ -34,9 +36,13 @@ pub fn individualExpertWeights(io: std.Io, allocator: std.mem.Allocator, model_d
     return weights_out;
 }
 
+pub const refusals = struct {
+    pub const ExpertStreamingUnsupportedLayout = "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards. For MiMo, repack the checkpoint first; raw per-expert HF shards cannot be streamed directly.";
+};
+
 /// A source trunk's weights; null for a pack the generic loaders read.
 pub fn weights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !?Weights {
-    if (!config.usesMimoSourceTrunk()) return null;
+    if (!mimo_config.usesSourceTrunk(config)) return null;
     const vision = load_vision and config.mimo_vision;
     if (!config.expert_streaming) return try individualExpertWeights(io, allocator, model_dir, vision);
     logSourceLoad(config, vision);
@@ -65,7 +71,7 @@ pub fn shipsHead(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8
 /// The resident bytes a MiMo source-trunk load holds: trunk and vision tower as stored, the heads when MTP is on, and
 /// the coarse lm_head copy the heads and the greedy readout share. Null for a pack the indexed scan bills.
 pub fn residentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !?u64 {
-    if (!config.usesMimoSourceTrunk()) return null;
+    if (!mimo_config.usesSourceTrunk(config)) return null;
     var bytes = try sourceResidentBytes(io, allocator, model_dir, load_vision and config.mimo_vision);
     if (mtp_on) bytes += try headResidentBytes(io, allocator, model_dir);
     return bytes + bills.coarseHeadBytes(config);
@@ -120,7 +126,7 @@ pub fn prepare(config: *const ModelConfig, xfm: *Trunk) void {
 
 /// A resident MiMo warms its verify rows with or without its heads: a PLD request verifies on them too.
 pub fn verifyWarmWanted(config: *const ModelConfig) bool {
-    return config.isMimo() and !config.expert_streaming;
+    return arch_config.isOf(config, "mimo2") and !config.expert_streaming;
 }
 
 pub fn warmSpec(io: std.Io, config: *const ModelConfig, xfm: *Trunk, head: ?*anyopaque, kv_config: trunk.KVQuantConfig) void {

@@ -4,6 +4,7 @@
 //! prefill reads the pools back. Every forward runs under a transient cap (`Config.forwardCap`), which is what admission
 //! bills: a request's state, a decode forward's cap and the part of a prefill's the pools cannot cover.
 const std = @import("std");
+const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
 const status = @import("../status.zig");
@@ -75,27 +76,27 @@ fn setTransient(bytes: u64, ops: PoolOps) void {
 /// Moves the pool cap to the one `rows` takes and caps the forward's allocations at what it bills, on the inference
 /// thread. True when the pool cap moved.
 pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
-    if (pool_ram_cap == 0 or !config.isDsv41()) return false;
+    if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41")) return false;
     setTransient(phaseLimit(c.forwardCap(rows, seq), config), ops);
     return moveCap(rowsCap(rows, config), config, ops);
 }
 
 /// An image encode of `bill` bytes (`request_media.visionEncodeBill`) starts: its allocations are capped at it. No bill, no cap.
 pub fn enterVision(bill: u64, config: *const ModelConfig, ops: PoolOps) void {
-    if (pool_ram_cap == 0 or bill == 0 or !config.isDsv41()) return;
+    if (pool_ram_cap == 0 or bill == 0 or !arch_config.isOf(config, "dsv41")) return;
     setTransient(phaseLimit(bill, config), ops);
 }
 
 /// The encode is over; the next forward installs its own cap.
 pub fn leaveVision(config: *const ModelConfig, ops: PoolOps) void {
-    if (pool_ram_cap == 0 or !config.isDsv41() or !transient_now) return;
+    if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41") or !transient_now) return;
     setTransient(0, ops);
 }
 
 /// A request is over: whatever forward ran last, the transient cap is lifted (a restore allocates the next request's
 /// state before its first forward) and the pool cap drops back to the decode cap.
 pub fn endRequest(config: *const ModelConfig, ops: PoolOps) bool {
-    if (pool_ram_cap == 0 or !config.isDsv41()) return false;
+    if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41")) return false;
     const was_on = transient_now;
     if (was_on) setTransient(0, ops);
     return moveCap(config.expertPoolBytes(), config, ops) or was_on;
@@ -108,7 +109,7 @@ pub fn poolCapped(prev: u64) void {
 
 /// A DeepSeek model is unloaded: the next model gets the process-wide cap back, and the raised cap is forgotten.
 pub fn unloadModel(config: *const ModelConfig, ops: PoolOps) bool {
-    if (!config.isDsv41()) return false;
+    if (!arch_config.isOf(config, "dsv41")) return false;
     pool_now = null;
     if (transient_now) setTransient(0, ops);
     const prev = ram_limit orelse return false;

@@ -8,6 +8,7 @@
 //! the dsv41 modules. `Generator` (src/generate.zig) drives them through
 //! `MtpHeadRef`.
 
+const arch_config = @import("arch/config.zig");
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
@@ -578,19 +579,15 @@ fn readDirFileAlloc(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, s
     return rs.interface.allocRemaining(allocator, .limited(limit)) catch null;
 }
 
-/// Qwen3.8-Flash-Next's head is the checkpoint's own layer, loaded by the
-/// trunk (`loadQwen4Mtp`).
-const qwen4_mtp_marker = "\"language_model.mtp.fc_hidden.weight\"";
-
-fn indexJsonHasQwen4Mtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
+/// Advertisement probe: does the checkpoint carry a head some built arch ships in its index.
+pub fn dirAdvertisesMtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
+    if (arch_config.mtp_head_markers.len == 0) return false;
     const bytes = readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit) orelse return false;
     defer allocator.free(bytes);
-    return std.mem.indexOf(u8, bytes, qwen4_mtp_marker) != null;
-}
-
-/// Advertisement probe: does the checkpoint carry the qwen4_exp head.
-pub fn dirAdvertisesMtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
-    return indexJsonHasQwen4Mtp(io, allocator, dir);
+    inline for (arch_config.mtp_head_markers) |marker| {
+        if (std.mem.indexOf(u8, bytes, marker) != null) return true;
+    }
+    return false;
 }
 
 /// Requantize a row-quantized affine weight `(w, scales, biases)` from

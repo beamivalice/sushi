@@ -1,6 +1,7 @@
 //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
 
 const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
+const qwen4_config = @import("qwen4_config.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const qwen4_ssm_group = @import("qwen4_ssm_group.zig");
@@ -426,7 +427,7 @@ pub fn qwen4DecodeLadderStride(raw: ?[]const u8) u32 {
 
 /// Plain decode rows of one forward, each byte-identical to its solo tick (`forwardQwen4DecodeRows`).
 pub fn supportsBatchedQwen4Rows(self: *const Trunk) bool {
-    return self.arch_state.qwen4.model != null and self.moe_layers != null and self.expert_stream == null and self.config.supportsBatchedQwen4Rows();
+    return self.arch_state.qwen4.model != null and self.moe_layers != null and self.expert_stream == null and qwen4_config.supportsBatchedRows(self.config);
 }
 
 /// Full-attention layer with the QSA mask threaded through
@@ -4237,7 +4238,7 @@ pub fn batchedGdnReady(self: *const Trunk, ctxs: []const *ForwardCtx) bool {
 
 pub fn supportsBatchedGdnDecode(self: *const Trunk) bool {
     // Share the architecture gate with the server's concurrency clamp.
-    if (!self.config.supportsBatchedGdnDecode()) return false;
+    if (!qwen4_config.supportsBatchedGdnDecode(self.config)) return false;
     // The loaded trunk must supply MoE layers and per-slot GDN state.
     if (self.moe_layers == null) return false;
     if (arch_state_mod.runsOwnModel(&self.arch_state)) return false;

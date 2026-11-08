@@ -39,7 +39,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `QWEN4_GDN_CHECK` | `qwen4_gdn.zig:2703, 2849` | runs the composed GDN prework beside the fused kernel and compares | once | no |
 | `QWEN4_NO_POOLED` | `qwen4_qsa.zig:1242` | forces `QsaPooledRequired` to exercise the pooled-key fallback | once | no |
 | `QWEN4_OPCOUNT` | `qwen4_forward.zig:2940` | FFI op counts per block of the Qwen4 forward | once | no |
-| `QWEN4_PROFILE_FWD` | `qwen4_forward.zig:1454, 2936; qwen4_exp.zig:783; qwen4_hc.zig:1350; qwen4_fixture_test.zig:1600, 3481` | `1` times S 2..16 forwards per block with a sync each, `all` every S; also logs PLE reads and keeps verify off the grouped-rows path | once | no |
+| `QWEN4_PROFILE_FWD` | `qwen4_profile_env.zig` (arms the persist guard); `qwen4_forward.zig:1454, 2936; qwen4_exp.zig:783; qwen4_hc.zig:1350; qwen4_fixture_test.zig:1600, 3481` | `1` times S 2..16 forwards per block with a sync each, `all` every S; also logs PLE reads and keeps verify off the grouped-rows path | once | no |
 | `QWEN4_PROFILE_QSA` | `qwen4_qsa.zig:1359, qwen4_forward.zig:2521` | logs synced QSA indexer/gather laps | once | no |
 | `QWEN4_STANDIN` | `qwen4_forward.zig:2898` | comma list (`gdn,attn,mlp,hc,moe_*,...`) replaces blocks with free stand-ins for ablation under the decode meter | once | yes: engine-kernels, qwen4-perf |
 | `QWEN4_STREAM_F32` | `qwen4_forward.zig:1518, 1780, 1968` | runs the Qwen4 residual streams in f32 (math oracle) | once | yes: qwen4-arch |

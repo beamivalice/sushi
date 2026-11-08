@@ -323,6 +323,30 @@ pub fn cancelledNeedsCheckpoints(slot: *const Slot) bool {
     };
 }
 
+/// What the arch's `prepareCommit` readies, for the line that says it failed.
+pub fn prepareCommitLabel(slot: *const Slot) []const u8 {
+    const tag = tagOfSlot(slot) orelse return "commit preparation";
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "prepare_commit_label")) S(t).prepare_commit_label else "commit preparation",
+    };
+}
+
+/// Who the cancelled-prefill line says would restore as a miss.
+pub fn cancelledEntryLabel(slot: *const Slot) []const u8 {
+    const tag = tagOfSlot(slot) orelse return "an entry";
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "cancelled_entry_label")) S(t).cancelled_entry_label else "an entry",
+    };
+}
+
+/// A request keeps `kept` of the `max` checkpoints its admission would bill: the arch says so in the log.
+pub fn logCheckpointsKept(slot: *const Slot, kept: u32, max: u32) void {
+    const tag = tagOfSlot(slot) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime has(t, "logCheckpointsKept")) S(t).logCheckpointsKept(kept, max, slot.full_prompt.len),
+    }
+}
+
 /// The newest checkpoint takes the slot's live indexer history as a view of its capacity buffer.
 pub fn handoffHistory(slot: *Slot, cps: []trunk.SSMCheckpoint) void {
     const tag = tagOfSlot(slot) orelse return;
@@ -427,6 +451,7 @@ const known_hooks = [_][]const u8{
     "prepareCommit",   "publishLive",   "commitOwn",      "cancelledNeedsCheckpoints", "handoffHistory",  "mtpHeadCommit",
     "restoreTarget",   "writeThrough",  "nativeDflashArmed",                          "thoughtGrid",     "armThoughtPoint",
     "afterSpecBlock",  "endRequest",    "resetForRetry",  "flushResident",
+    "logCheckpointsKept", "prepare_commit_label", "cancelled_entry_label",
 };
 
 fn isHook(comptime name: []const u8) bool {

@@ -120,7 +120,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 - `GroupCache`: plain per-layer LRU, prefill misses at MRU, every HIT of a route touched before any admit, surplus
   misses fall to the union workspace. Batched decode rides the union path.
-- **MTP is on by default on a Sushi EXL3 Qwen pack** (`streamedMtpHeadSupported`): the head and its own routed experts
+- **MTP is on by default on a Sushi EXL3 Qwen pack** (`admission.streamedMtpHead`, the arch's `streamed_mtp_head`): the head and its own routed experts
   load resident (`ModelConfig.stream_mtp_head`, billed in the ledger and its KV in the session bill), verify rows take
   the streamed decode path, and the PLE window rolls back like a resident verify. `--no-mtp` or `"mtp": false` loads
   without it (`[mtp] off`). Any other streamed model or layout refuses an explicit `--mtp`

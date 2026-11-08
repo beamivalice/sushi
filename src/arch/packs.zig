@@ -66,6 +66,27 @@ pub const served_types_or = blk: {
     break :blk text;
 };
 
+fn dflashTargets(comptime word: []const u8) []const u8 {
+    comptime {
+        var n = 0;
+        for (gate_order) |t| {
+            if (@hasDecl(registry.Mod(t).packs, "dflash_target")) n += 1;
+        }
+        var text: []const u8 = "";
+        var i = 0;
+        for (gate_order) |t| {
+            if (!@hasDecl(registry.Mod(t).packs, "dflash_target")) continue;
+            text = text ++ (if (i == 0) "" else if (n == 2) " " ++ word ++ " " else if (i + 1 == n) ", " ++ word ++ " " else ", ") ++ registry.Mod(t).packs.product;
+            i += 1;
+        }
+        return text;
+    }
+}
+
+/// "Qwen3.8-Flash-Next and GLM-5.3-Flash": the products of the built archs that bind a DFlash2 drafter (`dflash_target`).
+pub const dflash_targets_and = dflashTargets("and");
+pub const dflash_targets_or = dflashTargets("or");
+
 test "the alias table lists every arch's packs, in the arch gate's order, with their tiers and serve flags" {
     if (registry.served_model_types.len != 4) return error.SkipZigTest;
     const Row = struct { name: []const u8, tag: []const u8, repo: []const u8, is_default: bool, tier_gb: u32, recommend_gb: u32, streams: bool, flags: []const u8 };

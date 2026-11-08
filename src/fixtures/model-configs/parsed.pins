@@ -235,7 +235,7 @@ linear_num_value_heads=64
 kda_vector_gate=true
 kda_gate_lower_bound=-5 bits=0xc0a00000
 kda_sigmoid_out_gate=true
-glm_mtp_layers=1
+mtp_layers=1
 mla_q_lora_rank=1536
 mla_kv_lora_rank=512
 mla_qk_nope_head_dim=256
@@ -643,7 +643,7 @@ linear_num_value_heads=64
 kda_vector_gate=true
 kda_gate_lower_bound=-5 bits=0xc0a00000
 kda_sigmoid_out_gate=true
-glm_mtp_layers=1
+mtp_layers=1
 mla_q_lora_rank=1536
 mla_kv_lora_rank=512
 mla_qk_nope_head_dim=256
@@ -702,8 +702,8 @@ linear_num_value_heads=64
 kda_vector_gate=true
 kda_gate_lower_bound=-5 bits=0xc0a00000
 kda_sigmoid_out_gate=true
-glm_mtp_layers=1
-glm_fp8_trunk=true
+mtp_layers=1
+fp8_block128_trunk=true
 mla_q_lora_rank=1536
 mla_kv_lora_rank=512
 mla_qk_nope_head_dim=256

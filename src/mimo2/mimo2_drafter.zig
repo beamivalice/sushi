@@ -3,6 +3,8 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
 const mtp_mod = @import("../mtp.zig");
+const mtp_policy = @import("../mtp_policy.zig");
+const MtpEvCosts = mtp_policy.MtpEvCosts;
 const spec_types = @import("../spec_types.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const arch_handle = @import("../arch/handle.zig");
@@ -124,6 +126,15 @@ pub fn draftShortlist(h: Head, target: *Trunk, x: mlx.mlx_array, suppress_mask: 
 
 /// Every G17/NAX cost surface is calibrated against the qwen4_exp in-checkpoint head, so every other head plans
 /// under `generic` unless it has a surface of its own.
+/// MiMo MCG K2.5 w12 on M5 Max (2026-09-24, kv8, 4k): a serial forward 24.2 ms, verify
+/// forwards 34.9 / 44.7 / 59.8 ms at 2 / 3 / 4 rows, three pre-drafted head steps ~2.5-3 ms.
+/// Each position's own routed experts make a verify row ~.45 of a forward, flat to depth 3.
+const MTP_EV_MIMO_EXL3_COSTS: MtpEvCosts = .{ .draft = 0.04, .per_pos_lo = 0.44, .per_pos_hi = 0.44, .flat_max = 3, .sync = 0.02 };
+
+pub fn evCosts(profile: mtp_mod.MtpCostProfile) ?mtp_policy.MtpEvCosts {
+    return if (profile == .mimo_exl3) MTP_EV_MIMO_EXL3_COSTS else null;
+}
+
 pub fn costProfile(_: Head, target: *const Trunk, _: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
     return if (target.config.expert_layout == .exl3_k4) .mimo_exl3 else .generic;
 }

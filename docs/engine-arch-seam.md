@@ -76,7 +76,9 @@ without it. An arch added later joins the list in the landing that adds it.
 - **Load, prefill and bill hooks an arch may declare** (every one optional; the default is stated where it is called).
   `arch.zig`: the `prefill_start_width` fact, `ubench`, `tools`. The `load` slot (`arch/load.zig`) beside its
   `weights` and `residentLoadBytes`: `drafterOff`, `stageDrafter`, `prepareDrafter`, `loadDflash`, `bindDflash`,
-  `dflashRowBounds`, `logLoad`, `logDflashReady`, `warmUbench`, which `model_load.zig` calls by the config's arch. The `prefix` module (`arch/prefix.zig`):
+  `dflashRowBounds(min, max, drafter_block)`, `logLoad`, `logDflashReady`, `warmUbench`, which `model_load.zig` calls by the
+  config's arch; `bindDflash` returns whether the arch takes the drafter (an error is a bind that failed), and the refusal that
+  names the archs which do is `packs.dflash_targets_and`. The `prefix` module (`arch/prefix.zig`):
   `checkpointMax` (the restore points a request keeps in memory) and, for the arch whose slots keep a request beside the
   KV, `captureRequest`, `restorableAt` and the prefill grid (`requestCheckpointStride`, `requestCaptureStride`,
   `requestCaptureBackoff`, `requestChunkEnd`), which `generate.zig` reaches through `arch_state.requestOf`. The `drafter`
@@ -92,8 +94,9 @@ without it. An arch added later joins the list in the landing that adds it.
 - **The chat face.** `src/<arch>/<arch>_chat.zig` is the arch's MLX-free face for the host tier (chat templates, tool
   calls, tokenizer: no MLX, so `test-host` runs beside a server). It holds `model_types` (`arch.zig` re-exports them),
   `effort` (an editable table or fixed arms), and, where the arch has them, `pin` (a template it serves instead of the
-  checkpoint's, plus its image atom) and `pretokenizer` (a tokenizer.json spelling it claims and the grammar that
-  splits it). `src/arch/chat.zig` reads the faces through `registry.Chat`; `effort.zig`, `chat.zig` and `tokenizer.zig`
+  checkpoint's, plus its image atom) `pretokenizer` (a tokenizer.json spelling it claims and the grammar that
+  splits it) and `lateSystemTemplate(allocator, tpl)` (its stock template with a late system turn rendered in place, null for any
+  other revision; `chat.zig` asks `arch_chat.lateSystemTemplate`). `src/arch/chat.zig` reads the faces through `registry.Chat`; `effort.zig`, `chat.zig` and `tokenizer.zig`
   call it. A host file never imports `registry.zig`'s `Mod` or an `arch.zig`: naming one pulls its tests, and with them
   MLX, into the host binary. That is also why `registry.zig` holds no test (`registry_test.zig` does) and lists each arch's
   `mod` and `chat` as separate decls on the one marked line. A new editable effort table also adds its `effort:<family>`
@@ -113,6 +116,25 @@ without it. An arch added later joins the list in the landing that adds it.
   the generic paths run on: an arch's `host(m)` when its `Model` is not that state, else the `Model`), `destroy`,
   `stream`, `config`, `ownsModuleDecodeState`, `moduleSpecWiring`, `moduleStateSpecRollback`, `logitBias`,
   `flushImatrix`. Each is one switch on the tag; a test fixture stores `handleOf(&trunk)`.
+- **Numbers and tables an arch owns are `Facts` or hooks.** The MTP numbers are `Facts` (`mtp_draft_temp`,
+  `mtp_adaptive_min_kv`, `mtp_adaptive_calibrated`, `mtp_rollback_by_truncate`, `cost_layout`); the EV cost surface of a
+  `MtpCostProfile` is the `evCosts(profile)` of the arch's drafter module (the enum stays in `mtp.zig`, its names are profile
+  ids); a drafter folder a pack ships beside the model files is its drafter module's `shipped_subdir`
+  (`dflash.isShippedSubdir`); the DFlash2 row bounds, bind and ready line are its `load` hooks. How a pack keeps its
+  routed experts for the streamed loader is `Facts.expert_source` (`isExpertStreamingArch` is "not `none`") and
+  `streams_rate_groups`; whether a streamed pack keeps its MTP head resident is the arch's `streamed_mtp_head`
+  (`supported(layout)`, `phrase`), from which `admission.mtp_unsupported` builds the refusal text. The key that says a
+  pack carries an arch's MTP head is `Facts.mtp_head_marker`.
+- **Text an arch's branch prints or sends is the arch's.** The bytes never change when a line moves. An arch declares
+  the load refusals it words in `load.refusals` (a decl per error name, read by `arch_load.refusalText`; the HTTP mapping in
+  `generation_stream.zig` keeps a neutral fallback for a build without the arch), the 400 body of a thinking-off request its
+  template cannot honour as `think_off_refusal` in its chat face, the hot-cache lines as `sched` labels
+  (`prepare_commit_label`, `cancelled_entry_label`) or hooks (`logCheckpointsKept`), the `[spec]` line of a load as
+  `load.drafterChosen`, its `[spec-stats]` round line as `drafter.logRoundStats`, the first-engagement line of the shared-expert fold
+  as `kernels.sharedFoldEngaged` and an env switch that disarms round-cost persistence as `kernels.diagArmed`
+  (`QWEN4_PROFILE_*`, read in `qwen4_profile_env.zig`). The archs a refusal names are `packs.dflash_targets_and` / `_or`, from
+  each `packs.dflash_target`; the pull hint names `packs.aliases[0]`. The DFlash2 round state a `Generator` keeps for an arch's
+  native round is `native_*` (`native_draft_rate`, `native_lookup`, `native_prefill_window`, `native_round`, `native_gate`).
 - A trunk rule one arch keeps is a `Facts` flag on its config (`residual_from_embedding`, `moe_scores_f32`,
   `qkv_split_rows`, `bias_routed_moe`), read with `arch_config.fact`. Where a pack keeps its routed experts (key
   prefix, stamped shards, the head's layer, rate groups) is `pack_layout` (`arch_config.PackLayout`, read by
@@ -127,8 +149,13 @@ without it. An arch added later joins the list in the landing that adds it.
   `registry.ofModelType` returns no tag for a `model_type` no enabled arch claims.
 - `src/arch_host.zig` lists the engine services an arch's model files may reach; `src/arch_host_stub.zig` declares the
   same names for a host that carries less, and a test keeps the two name lists equal.
-- The config side lives in `src/arch/config.zig`. The parse stores the arch tag in `ModelConfig.arch`, and `isQwen4`,
-  `isGlm5`, `isDsv41` and `isMimo` read it (a config built by hand falls back to `model_type`). An arch declares
+- The config side lives in `src/arch/config.zig`. The parse stores the arch tag in `ModelConfig.arch`; shared code asks the config's `Facts` and never an arch tag
+  (`arch_config.fact`), and an arch's own folder asks `arch_config.isOf(config, "<arch>")` (a config built by hand falls back to
+  `model_type`). The facts that replace a predicate are named by the capability: `state_beside_kv`, `no_mtp_head`, `mtp_unserved`,
+  `latent_kv`, `kda_state`, `long_ctx_gated`, `evicts_hot_cache`, `sliding_ring`, `dflash_by_flag`, `vision_on_streamed`,
+  `sushi_quant_memory_bill`, `thinking_off_checkpoint`, `skips_mtp_weights_when_off`, `own_kv_state`, `scores_picked_keys`,
+  `declared_wired_ceiling`, `own_dflash_bill` and `fills_slabs_in_place`. A predicate only one arch's folder reads (batched decode,
+  the source trunk) is a function of that arch's config file. An arch declares
   `config_types` (what its parse reads, text twins included), `discovery_types`, `config_facts` and `parseConfig`,
   and may declare `parseDir`, `adoptLayout`, `samplingDefaults` and `streamedResidentSplit`. `model.served_model_types`
   lists every registered type, enabled or not (`registry.registered_model_types`, from each registry line's own

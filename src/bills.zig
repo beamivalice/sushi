@@ -62,7 +62,7 @@ pub fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
 /// Will a request that omits `enable_mtp` run the head on this model? The load-time bills
 /// (`sessionBytesPerToken`) price its KV whenever it does, the request-time bill per request.
 fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
-    if (config.isGlm5() or config.isDsv41()) return false;
+    if (arch_config.fact(config, "no_mtp_head")) return false;
     // A loaded DFlash2 drafter outranks the head: the default round never builds its cache.
     if (config.dflash_loaded) return false;
     const choice = mtpChoiceFor(config);
@@ -85,7 +85,7 @@ pub fn kvCacheFor(config: *const model_mod.ModelConfig) trunk.KvCacheChoice {
 
 /// `kvCacheFor` under a given launch choice. deepseek_v41 keeps its own compressed state; `--kv-quant` has nothing to quantize.
 pub fn kvCacheForLaunch(config: *const model_mod.ModelConfig, flag: ?trunk.KVQuantConfig) trunk.KvCacheChoice {
-    if (config.isDsv41()) return .{ .config = .dense, .source = .default };
+    if (arch_config.fact(config, "own_kv_state")) return .{ .config = .dense, .source = .default };
     return trunk.KvCacheChoice.resolve(flag, config.kv_quant_override);
 }
 
@@ -497,7 +497,7 @@ pub fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
 pub fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
     const c = config orelse return 0;
     // Resident MiMo fills a 128 GB Mac, so its ceiling is the declared limit, not what other apps leave free.
-    if (!c.longCtxGated() and !c.expert_streaming and !c.isMimo() and !c.isGlm5()) return 0;
+    if (!c.longCtxGated() and !c.expert_streaming and !arch_config.fact(c, "declared_wired_ceiling")) return 0;
     const unplanned = wiredUnplannedBytes(launch_state.wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic));
     const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, unplanned);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
@@ -1484,7 +1484,7 @@ pub fn diskBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64
     if (archHook("diskTokenBytes", u64, config, .{kv_bits})) |bytes| return bytes;
     const points = (config.ssmCheckpointBytes() +| kv_disk_cache.POINT_GRID - 1) / kv_disk_cache.POINT_GRID;
     const rows = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken() +| points;
-    if (config.isGlm5() or !config.longCtxGated() or !mtpHeadDefaultOn(config)) return rows;
+    if (arch_config.fact(config, "kda_state") or !config.longCtxGated() or !mtpHeadDefaultOn(config)) return rows;
     const layers = config.attnCacheLayerCount();
     if (layers == 0) return rows;
     return rows +| mtpHeadKvBytesPerToken(config) +| config.qsaHistoryBytesPerToken() / layers;
@@ -1985,7 +1985,7 @@ pub fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) 
 /// The sliding DFlash2 assistant's per-request bytes on a non-GLM target: the physical window and
 /// its trim copies, plus the tap and encoder rows of one prefill chunk.
 pub fn dflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u64 {
-    if (!config.dflash_loaded or config.isGlm5()) return 0;
+    if (!config.dflash_loaded or arch_config.fact(config, "own_dflash_bill")) return 0;
     return config.dflash_window_bytes *| 4 +| config.dflash_capture_bytes_per_token *| chunk +| 64 * 1024 * 1024;
 }
 
@@ -4733,7 +4733,7 @@ test "mimo_v2 prefill bill carries the FP8 trunk's dequant scratch past the GEMV
     var cfg = fixtures.mimoV2BillConfig();
     cfg.intermediate_size = 1536;
     cfg.expert_layout = .exl3_k4;
-    try t.expect(cfg.usesMimoSourceTrunk());
+    try t.expect(model_mod.usesSushiQuantMemoryBill(&cfg));
     // The widest source FP8 linear is a sliding layer's QKV: 4*192 + 3*192 + 3*128 rows.
     const scratch: u64 = 2 * 1728 * 384 * 2;
     try t.expectEqual(scratch, fp8DequantScratchBytes(&cfg, 512));
@@ -6007,13 +6007,13 @@ pub fn fp8ExpertScratchBytes(layout: expert_stream_mod.quant.Layout, geometry: e
 /// its resident one, the union workspace and bounce already inside the budget (engine-expert-streaming.md#budget).
 /// DeepSeek fills preallocated slabs in place: its fill stages nothing beyond the workspace and bounce the budget holds.
 pub fn billedFillPeakBytes(config: *const model_mod.ModelConfig, prefill_peak_bytes: u64) u64 {
-    return if (config.longCtxGated() or config.isDsv41()) 0 else prefill_peak_bytes;
+    return if (config.longCtxGated() or arch_config.fact(config, "fills_slabs_in_place")) 0 else prefill_peak_bytes;
 }
 
 /// What a streamed load holds beside its cache and bounce buffers while it fills. A request bill never carries the
 /// workspace: it is allocated at boot and already counted in the active memory a request reads.
 pub fn loadStagingBytes(config: *const model_mod.ModelConfig, billed_fill_peak_bytes: u64, workspace_bytes: u64) u64 {
-    return billed_fill_peak_bytes +| (if (config.isDsv41()) workspace_bytes else 0) +| config.expertPoolBytes();
+    return billed_fill_peak_bytes +| (if (arch_config.fact(config, "fills_slabs_in_place")) workspace_bytes else 0) +| config.expertPoolBytes();
 }
 
 /// The 2-bit lm_head copy a MiMo source trunk keeps, resident or streamed: the heads draft on it

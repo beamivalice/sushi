@@ -445,7 +445,7 @@ pub fn renderChatTemplate(
     // form so the model still sees the tool context.
     // A byte-pinned stock Qwen template renders a late system note in place; the fold below would
     // rewrite every earlier byte of the prompt. Only the render and its probe see the adapted text.
-    const adapted = if (hasLateSystem(msgs)) try qwenLateSystemTemplate(allocator, chat_config.chat_template) else null;
+    const adapted = if (hasLateSystem(msgs)) try arch_chat.lateSystemTemplate(allocator, chat_config.chat_template) else null;
     defer if (adapted) |a| allocator.free(a);
     const render_tpl = adapted orelse chat_config.chat_template;
     const tpl = chat_config.chat_template;
@@ -692,28 +692,6 @@ fn hasLateSystem(messages: []const Message) bool {
         if (std.mem.eql(u8, m.role, "system")) return true;
     }
     return false;
-}
-
-/// The stock Flash-Next template raises on a system turn that is not first. Replace only that
-/// branch so the turn renders in place; any other revision keeps its native contract and the fold.
-fn qwenLateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]const u8 {
-    const source = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
-    const content = "render_content(message.content, false, true)|trim";
-    const branch =
-        \\{%- if message.role == "system" %}
-        \\        {%- if not loop.first %}
-        \\            {{- raise_exception('System message must be at the beginning.') }}
-        \\        {%- endif %}
-    ;
-    if (!std.mem.eql(u8, tpl, source)) return null;
-    if (std.mem.count(u8, tpl, branch) != 1) return null;
-    const replacement = try std.mem.concat(allocator, u8, &.{
-        "{%- if message.role == \"system\" %}{%- if not loop.first %}{{- '<|im_start|>system\\n' + (",
-        content,
-        ") + '<|im_end|>\\n' }}{%- endif %}",
-    });
-    defer allocator.free(replacement);
-    return try std.mem.replaceOwned(u8, allocator, tpl, branch, replacement);
 }
 
 /// False when the template raises on a system turn that is not first, or drops it.
@@ -1798,7 +1776,7 @@ test "stock Qwen adapter leaves prompts without late notes byte-identical, tools
     const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{\"index\":3}" }};
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}}]";
     for (arch_fx.qwen_late_templates, 0..) |tpl, index| {
-        const adapted = (try qwenLateSystemTemplate(a, tpl)).?;
+        const adapted = (try arch_chat.lateSystemTemplate(a, tpl)).?;
         defer a.free(adapted);
         const messages = [_]Message{
             .{ .role = "system", .content = "stable" },
@@ -1861,7 +1839,7 @@ test "stock Qwen adapter engages only on the byte-pinned revisions" {
         const respelled = try std.mem.replaceOwned(u8, a, tpl, "message.role == \"system\"", "message.role == 'system'");
         defer a.free(respelled);
         for ([_][]const u8{ revised, respelled }) |unknown| {
-            try testing.expect((try qwenLateSystemTemplate(a, unknown)) == null);
+            try testing.expect((try arch_chat.lateSystemTemplate(a, unknown)) == null);
             const config = ChatConfig{ .chat_template = unknown, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
             const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, "low", false);
             defer a.free(rendered);
@@ -1876,7 +1854,7 @@ test "real Qwen pack loaded through ChatConfig keeps late notes in place" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try loadChatConfig(io, a, std.mem.span(dir));
     defer config.deinit();
-    const adapted = try qwenLateSystemTemplate(a, config.chat_template);
+    const adapted = try arch_chat.lateSystemTemplate(a, config.chat_template);
     defer if (adapted) |t| a.free(t);
     try testing.expect(adapted != null);
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}}]";
