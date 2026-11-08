@@ -757,6 +757,17 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
   `--no-mtp` decode 63.2 / 63.4 and 62.3 / 62.0 tok/s: a tie that drops 192 launches a serial token. The
   `[qwen] shared expert rides the routed launches engaged` log line shows the fold is on.
 
+- **The fold's geometry is bound at load.** `riders_gated.geometry` (the shared banks' shapes, dtypes and, for a trellis
+  expert, the two NAX launch geometries) was read on every MoE layer of every token. `layer_weights.bindSharedGeometry`
+  now fills `MoeMlpWeights.shared_geo[rows - 1]` for rows 1 to `NAX_ROWS_MAX` once the layer's arrays are final, and
+  `qwen4_shared.folded` calls `moeGatedSharedFoldedGeo` with it (an affine gate's logit is the fold's, a dense gate's is
+  handed in, and the geometry follows that; any other case reads the shapes as before). Bytes are unchanged. Shape,
+  size and dtype queries (`mlx.query_count`) of a decode tick through `forwardQwen4With`, `qwen4_query_count_test.zig`,
+  commit `73aab248`, ReleaseFast, M5 Max, ticks 3 to 6 after a 23-token prompt: STQ-2.75bpw 10690 -> 9290 (10980 -> 9580 on the QSA tick), 4bpw 12265 -> 10868. One layer's fold call
+  drops from 49-91 queries to 16-51 (`qwen4_shared.zig`); the one-bank layers (4bpw, 2bpw) still read the routed bank's
+  four shapes and validate its projections per call. The pack counts vary by a few dozen between processes (the
+  quantization-parameter cache hashes pointers), so the test pins them within 40.
+
 <a id="shared-fold-trellis"></a>
 ## Flash-Next: a trellis shared expert rides the routed launches too
 

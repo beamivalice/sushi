@@ -331,9 +331,10 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
 or from 1024 rows the decoded path below.
 `decodeDense` is the host twin a test multiplies beside it.
 
-- **A trunk bank carries its launch (`linear.Geo`).** `Geo.get(trellis, bounds)` reads a one-bank (or stacked) trellis's
-  shape and rate once, and for each row count 1 to 16 the exact-mode launch geometry and its kernel configs, pinned for
-  good (`project_rows.pinCfg`); banks of one shape share one geo, kept for the process. `trunk.matmulGeo` and
+- **A trunk bank carries its launch (`linear.Geo`).** `Geo.get(trellis, bounds, mode)` reads a one-bank (or stacked)
+  trellis's shape and rate once, and for each row count 1 to 16 the launch geometry of `mode.exact` (the trunk binds the
+  exact mode; the non-exact one-row launch is the SIMD arm, and `linearGeo` declines a launch of the other mode) and its
+  kernel configs, pinned for good (`project_rows.pinCfg`); banks of one shape share one geo, kept for the process. `trunk.matmulGeo` and
   `linear.linearSharedGeo` launch from it for bf16 inputs up to the multi-row arm's rows and cost the activation's
   shape and dtype; `trunk.fuse` fills a stack's `Shared.geo`. Anything else (another dtype, wider rows, the `force_arm`
   seam, an empty geo, a NAX launch once `gemm_nax_failed` is set) runs `matmul` / `linearSharedWith` as before, with the

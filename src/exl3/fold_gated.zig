@@ -126,9 +126,24 @@ fn get(v: mlx.mlx_vector_array, i: usize) !mlx.mlx_array {
 pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
     const route = riders.Routing.of(x, inds, scores) orelse return null;
+    const geo = riders.geometry(sh, mlx.getShape(x)[2], route.rows) orelse return null;
+    return fold(s, x, bank, inds, scores, dec, sh, gate, route, geo);
+}
+
+/// `moeGatedSharedFolded` with the shared expert's geometry given: `geo` is `riders_gated.geometry(sh, hidden, rows)`
+/// for this `sh`, hidden width and row count, read once at load. One that does not fit `x` or `sh` gives null.
+pub fn moeGatedSharedFoldedGeo(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array, geo: *const riders.Geometry) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const route = riders.Routing.of(x, inds, scores) orelse return null;
+    if (!riders.geometryFits(geo.*, sh)) return null;
+    return fold(s, x, bank, inds, scores, dec, sh, gate, route, geo.*);
+}
+
+fn fold(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array, route: riders.Routing, geo: riders.Geometry) !?mlx.mlx_array {
     const rows = route.rows;
     const topk = route.topk;
     const hidden = mlx.getShape(x)[2];
+    if (geo.hidden != hidden) return null;
     const gs = mlx.getShape(bank.gate.trellis);
     const us = mlx.getShape(bank.up.trellis);
     const ds = mlx.getShape(bank.down.trellis);
@@ -140,7 +155,6 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, bank: root.Bank
     if (gs[3] != us[3]) return null;
     const rate = exl3.kFromPackedDim(@intCast(gs[3])) orelse return null;
     const down_rate = exl3.kFromPackedDim(@intCast(ds[3])) orelse return null;
-    const geo = riders.geometry(sh, hidden, rows) orelse return null;
     const want_logit = sh.logit != null;
     if (!want_logit) {
         const g = gate orelse return null;

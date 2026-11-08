@@ -120,7 +120,7 @@ pub fn fuse(parts: []const *Triple, owned: *std.ArrayList(mlx.mlx_array), alloca
     try mlx.check(mlx.mlx_eval(ev));
     var bounds: [3]c_int = @splat(cols[parts.len]);
     for (1..parts.len) |i| bounds[i - 1] = cols[i];
-    const geo = try linear.Geo.get(cat[0], bounds);
+    const geo = try linear.Geo.get(cat[0], bounds, .{ .exact = true });
     // Views first, so a failure leaves the parts as they were.
     var views: [linear.SHARED_MAX]Triple = undefined;
     var viewed: usize = 0;
@@ -560,7 +560,7 @@ test "exl3 trunk: a launch from the weight's geo gives the bytes of the launch t
         };
         const sh = (try fuse(&.{ &parts[0], &parts[1] }, &owned, testing.allocator, s)).?;
         try testing.expect(sh.geo != null);
-        const geo = try linear.Geo.init(t.w, null);
+        const geo = try linear.Geo.init(t.w, null, .{ .exact = true });
         try testing.expectEqual(@as(c_int, 2560), geo.in);
         try testing.expectEqual(@as(c_int, 1024), geo.out);
         const max: usize = if (kernels.gemmNaxOn()) @intCast(project_rows.NAX_ROWS_MAX) else @intCast(project_rows.PROJECT_ROWS_MAX);
@@ -617,7 +617,7 @@ test "exl3 trunk: a geo bound with NAX on runs the SIMD arm once the NAX latch i
         owned.deinit(testing.allocator);
     }
     const sh = (try fuse(&.{ &parts[0], &parts[1] }, &owned, testing.allocator, s)).?;
-    const geo = try linear.Geo.init(t.w, null);
+    const geo = try linear.Geo.init(t.w, null, .{ .exact = true });
     const xb = try alloc.alloc(u16, 8 * 2560);
     for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
 
@@ -660,15 +660,51 @@ test "exl3 trunk: banks of one shape share one geo, and a geo made after the NAX
     defer for (t) |x| for ([_]mlx.mlx_array{ x.w, x.s, x.b }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    try testing.expectEqual(try linear.Geo.get(t[0].w, null), try linear.Geo.get(t[1].w, null));
-    try testing.expect(try linear.Geo.get(t[0].w, null) != try linear.Geo.get(t[0].w, .{ 512, 1024, 1152 }));
-    const before = try linear.Geo.get(t[0].w, null);
+    try testing.expectEqual(try linear.Geo.get(t[0].w, null, .{ .exact = true }), try linear.Geo.get(t[1].w, null, .{ .exact = true }));
+    try testing.expect(try linear.Geo.get(t[0].w, null, .{ .exact = true }) != try linear.Geo.get(t[0].w, .{ 512, 1024, 1152 }, .{ .exact = true }));
+    const before = try linear.Geo.get(t[0].w, null, .{ .exact = true });
     const previous = kernels.gemm_nax_failed;
     defer kernels.gemm_nax_failed = previous;
     kernels.gemm_nax_failed = true;
-    const after = try linear.Geo.get(t[0].w, null);
+    const after = try linear.Geo.get(t[0].w, null, .{ .exact = true });
     try testing.expect(before != after);
     for (after.rows) |r| if (r) |row| try testing.expect(!row.g.nax);
+}
+
+test "exl3 trunk: a geo made for the non-exact mode binds the SIMD one-row launch and serves only that mode" {
+    try mlx.requireGpu();
+    if (!kernels.gemmNaxOn()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x57b5);
+    const rnd = prng.random();
+    const dec = format.Decode.tabled(.spec1, .w15);
+    const t = try (try TestBank.init(alloc, rnd, 2560, 1024, 48)).triple(s);
+    defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const p: @import("root.zig").Proj = .{ .trellis = t.w, .suh = t.s, .svh = t.b };
+    const simd = try linear.Geo.init(t.w, null, .{});
+    const exact = try linear.Geo.init(t.w, null, .{ .exact = true });
+    try testing.expect(!simd.row(1).?.g.nax and simd.row(2).?.g.nax);
+    try testing.expect(exact.row(1).?.g.nax);
+    try testing.expect(try linear.Geo.get(t.w, null, .{}) != try linear.Geo.get(t.w, null, .{ .exact = true }));
+    try testing.expectEqual(try linear.Geo.get(t.w, null, .{}), try linear.Geo.get(t.w, null, .{ .wide = true }));
+    const xb = try alloc.alloc(u16, 8 * 2560);
+    for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
+    for (1..9) |rows| {
+        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(rows), 2560 }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(x);
+        const want = try linear.linearWith(s, x, p, dec, .{});
+        defer _ = mlx.mlx_array_free(want);
+        const got = (try linear.linearGeo(s, x, @intCast(rows), p, &simd, dec, .{})) orelse return error.TestExpectedLaunch;
+        defer _ = mlx.mlx_array_free(got);
+        try testing.expect(try bitsEqual(s, got, want));
+        try testing.expect((try linear.linearGeo(s, x, @intCast(rows), p, &simd, dec, .{ .rows = .{ .exact = true } })) == null);
+        try testing.expect((try linear.linearGeo(s, x, @intCast(rows), p, &exact, dec, .{})) == null);
+    }
 }
 
 test "exl3 trunk: a launch of another dtype runs as it did, whatever the geo holds" {
@@ -684,7 +720,7 @@ test "exl3 trunk: a launch of another dtype runs as it did, whatever the geo hol
     defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    const geo = try linear.Geo.init(t.w, null);
+    const geo = try linear.Geo.init(t.w, null, .{ .exact = true });
     const xb = try alloc.alloc(u16, 3 * 256);
     for (xb) |*b| b.* = format.f32ToF16Bits(rnd.float(f32) * 2 - 1);
     const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, 3, 256 }, 3, .float16);

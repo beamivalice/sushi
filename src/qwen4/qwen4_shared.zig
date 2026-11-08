@@ -9,42 +9,34 @@ const Arr = mlx.mlx_array;
 
 var logged = false;
 
-fn affine(w: Arr, s: ?Arr, b: ?Arr) api.qwen_riders.Affine {
-    return .{ .weight = w, .scales = s orelse .{ .ctx = null }, .biases = b orelse .{ .ctx = null } };
+/// The stored geometry of the layer for `x`'s row count, or null where none was bound: the gate's logit must be handed
+/// in or computed by the fold as the load assumed.
+fn storedGeo(mw: *const trunk_mod.MoeMlpWeights, x: Arr, own_logit: bool) ?*const api.riders_gated.Geometry {
+    const gate_s = mw.shared_expert_gate_s orelse return null;
+    if (own_logit != (gate_s.ctx != null)) return null;
+    const shape = mlx.getShape(x);
+    if (shape.len != 3 or shape[1] < 1 or shape[1] > mw.shared_geo.len) return null;
+    return if (mw.shared_geo[@intCast(shape[1] - 1)]) |*geo| geo else null;
 }
 
 /// The layer output with the shared expert folded into the routed launches, for one to eight rows of `x` [1, rows, hidden];
 /// null where the separate chain runs. `router_logit` is the shared-expert gate logit when the router kernel already
 /// computed it (null ctx otherwise: the fold computes it). `trunk_dec` decodes a trellis shared expert.
 pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const trunk_mod.MoeMlpWeights, inds: Arr, scores: Arr, dec: api.format.Decode, trunk_dec: ?api.format.Decode, router_logit: Arr) !?Arr {
-    const gate_w = mw.shared_expert_gate_w orelse return null;
+    if (mw.shared_expert_gate_w == null) return null;
     const own_logit = router_logit.ctx == null;
-    const trellis: ?api.shared_trellis.Banks = if (mw.shared_gate_up_stack) |stack| blk: {
-        if (stack.count != 2 or !trunk_stq.isStq(mw.shared_down_w)) break :blk null;
-        break :blk .{
-            .gate_up = stack.p,
-            .down = .{ .trellis = mw.shared_down_w, .suh = mw.shared_down_s, .svh = mw.shared_down_b },
-            .dec = trunk_dec orelse return null,
-        };
-    } else null;
-    const shared: api.qwen_riders.Shared = .{
-        .gate = affine(mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b),
-        .up = affine(mw.shared_up_w, mw.shared_up_s, mw.shared_up_b),
-        .down = affine(mw.shared_down_w, mw.shared_down_s, mw.shared_down_b),
-        .trellis = trellis,
-        .sigmoid = try trunk_mod.swigluSigTable(s, .bfloat16, std.heap.c_allocator),
-        .logit = if (own_logit) affine(gate_w, mw.shared_expert_gate_s, mw.shared_expert_gate_b) else null,
-    };
+    const geo = storedGeo(mw, x, own_logit);
+    const shared = mw.foldShared(try trunk_mod.swigluSigTable(s, .bfloat16, std.heap.c_allocator), trunk_dec, own_logit, geo != null) orelse return null;
     const gate: ?Arr = if (own_logit) null else router_logit;
     const result = if (mw.exl3_ragged) |*rb|
-        try api.rate_groups.moeGatedSharedFolded(s, x, rb, inds, scores, dec, shared, gate)
+        (if (geo) |g| try api.rate_groups.moeGatedSharedFoldedGeo(s, x, rb, inds, scores, dec, shared, gate, g) else try api.rate_groups.moeGatedSharedFolded(s, x, rb, inds, scores, dec, shared, gate))
     else blk: {
         const bank = api.Bank{
             .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
             .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
             .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
         };
-        break :blk try api.qwen_fold.moeGatedSharedFolded(s, x, bank, inds, scores, dec, shared, gate);
+        break :blk if (geo) |g| try api.qwen_fold.moeGatedSharedFoldedGeo(s, x, bank, inds, scores, dec, shared, gate, g) else try api.qwen_fold.moeGatedSharedFolded(s, x, bank, inds, scores, dec, shared, gate);
     };
     if (result != null and !logged) {
         logged = true;
@@ -460,4 +452,183 @@ test "Qwen trellis shared expert fold declines what the separate chain must run"
     try std.testing.expect((try api.qwen_fold.moeGatedSharedFolded(s, narrow, bank, four.ids, four.scores, test_dec, sh, null)) == null);
     try std.testing.expectEqual(before, api.qwen_fold.foldedCount());
     try std.testing.expectEqual(dispatches, api.kernels.fusedDispatchCount());
+}
+
+const MoeMlpWeights = trunk_mod.MoeMlpWeights;
+const layer_weights = @import("../layer_weights.zig");
+const ModelConfig = @import("../model.zig").ModelConfig;
+
+/// A layer's weights as the loader holds them for the test's shared expert and routed chain; a dense gate keeps no
+/// scales, and its logit is handed to the fold.
+fn layerOf(w: Weights, chain: Chain, dense_gate: bool) MoeMlpWeights {
+    const none: Arr = .{ .ctx = null };
+    var mw = std.mem.zeroInit(MoeMlpWeights, .{
+        .shared_expert_gate_w = w.logit.weight,
+        .shared_expert_gate_s = if (dense_gate) none else w.logit.scales,
+        .shared_expert_gate_b = if (dense_gate) none else w.logit.biases,
+    });
+    if (w.trellis) |t| {
+        mw.shared_gate_up_stack = t.stack;
+        mw.shared_down_w = t.down.w;
+        mw.shared_down_s = t.down.s;
+        mw.shared_down_b = t.down.b;
+    } else {
+        mw.shared_gate_w = w.shared.gate.weight;
+        mw.shared_gate_s = w.shared.gate.scales;
+        mw.shared_gate_b = w.shared.gate.biases;
+        mw.shared_up_w = w.shared.up.weight;
+        mw.shared_up_s = w.shared.up.scales;
+        mw.shared_up_b = w.shared.up.biases;
+        mw.shared_down_w = w.shared.down.weight;
+        mw.shared_down_s = w.shared.down.scales;
+        mw.shared_down_b = w.shared.down.biases;
+    }
+    switch (chain) {
+        .ragged => |rb| mw.exl3_ragged = rb.*,
+        .bank => |b| {
+            mw.switch_gate_w = b.gate.trellis;
+            mw.switch_gate_s = b.gate.suh;
+            mw.switch_gate_b = b.gate.svh;
+            mw.switch_up_w = b.up.trellis;
+            mw.switch_up_s = b.up.suh;
+            mw.switch_up_b = b.up.svh;
+            mw.switch_down_w = b.down.trellis;
+            mw.switch_down_s = b.down.suh;
+            mw.switch_down_b = b.down.svh;
+        },
+    }
+    return mw;
+}
+
+const StoredCase = struct { trellis_bits: u32, ragged: bool, dense_gate: bool };
+const stored_cases = [_]StoredCase{
+    .{ .trellis_bits = 0, .ragged = true, .dense_gate = false },
+    .{ .trellis_bits = 0, .ragged = false, .dense_gate = false },
+    .{ .trellis_bits = 0, .ragged = true, .dense_gate = true },
+    .{ .trellis_bits = 96, .ragged = true, .dense_gate = false },
+    .{ .trellis_bits = 64, .ragged = false, .dense_gate = false },
+    .{ .trellis_bits = 96, .ragged = false, .dense_gate = true },
+};
+
+/// A layer of the case, its geometry bound as the loader does, and the same layer with none.
+const StoredLayer = struct {
+    mw: MoeMlpWeights,
+    bare: MoeMlpWeights,
+    shared: api.qwen_riders.Shared,
+    dec: api.format.Decode,
+    trunk_dec: ?api.format.Decode,
+};
+
+fn storedLayer(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, s: mlx.mlx_stream, c: StoredCase, rb: *const api.Ragged, bank: api.Bank) !StoredLayer {
+    const w = try weights(ops, a, rnd, s, hidden, inter, 128, 1, c.trellis_bits);
+    const trunk_dec: ?api.format.Decode = if (c.trellis_bits != 0) api.format.Decode.tabled(.spec1, .w15) else null;
+    var cfg: ModelConfig = .{ .hidden_size = hidden, .trunk_quant = trunk_dec, .expert_layout = .exl3_k4 };
+    var mw = layerOf(w, if (c.ragged) .{ .ragged = rb } else .{ .bank = bank }, c.dense_gate);
+    try layer_weights.bindSharedGeometry(&mw, &cfg);
+    var bare = mw;
+    bare.shared_geo = @splat(null);
+    const sigmoid = try trunk_mod.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+    return .{
+        .mw = mw,
+        .bare = bare,
+        .shared = mw.foldShared(sigmoid, trunk_dec, !c.dense_gate, false) orelse return error.TestExpectedShared,
+        .dec = if (c.ragged) api.format.Decode.tabled(.spec1, .w15) else test_dec,
+        .trunk_dec = trunk_dec,
+    };
+}
+
+/// The gate logit a dense gate's router hands the fold; none for an affine gate, which the fold computes.
+fn handedLogit(ops: *Ops, c: StoredCase, x: Arr) !Arr {
+    if (!c.dense_gate) return .{ .ctx = null };
+    var prng = std.Random.DefaultPrng.init(5);
+    const gate_bank = try affineBank(ops, std.heap.c_allocator, prng.random(), 1, hidden, 64, 1);
+    return ops.own(try trunk_mod.qmatmulBits(x, gate_bank.weight, gate_bank.scales, gate_bank.biases, 8, 64, .affine, ops.s));
+}
+
+test "Qwen shared expert fold: the geometry bound at load is the one the shapes give, and the fold keeps its bytes at every row count" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var random = std.Random.DefaultPrng.init(919);
+    const rnd = random.random();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    var rb = try raggedLayer(&ops, s);
+    defer rb.deinit();
+    const bank = try routedBank(&ops, 24, 44, 64, 53);
+    for (stored_cases) |c| {
+        if (c.trellis_bits != 0 and !api.kernels.gemmNaxOn()) continue;
+        var case_ops = Ops{ .s = s };
+        defer case_ops.deinit();
+        const layer = try storedLayer(&case_ops, arena.allocator(), rnd, s, c, &rb, bank);
+        for (layer.mw.shared_geo, 1..) |stored, rows| {
+            try std.testing.expectEqual(api.qwen_riders.geometry(layer.shared, hidden, @intCast(rows)), stored);
+            if (c.trellis_bits == 0) try std.testing.expect(stored != null);
+        }
+        var served: usize = 0;
+        for (1..9) |rows| {
+            var scope = Ops{ .s = s };
+            defer scope.deinit();
+            const route = try routing(&scope, rnd, rows, 24);
+            const x = try randomBf16(&scope, std.testing.allocator, rnd, &.{ 1, @intCast(rows), hidden }, 4);
+            const given = try handedLogit(&scope, c, x);
+            const want = try folded(s, x, &layer.bare, route.ids, route.scores, layer.dec, layer.trunk_dec, given);
+            const got = try folded(s, x, &layer.mw, route.ids, route.scores, layer.dec, layer.trunk_dec, given);
+            try std.testing.expectEqual(want == null, got == null);
+            if (want) |wv| {
+                try expectSameBits(try scope.own(wv), try scope.own(got.?));
+                served += 1;
+            }
+        }
+        try std.testing.expect(served > 0);
+        if (c.trellis_bits == 0) continue;
+        // Once the NAX latch is set the shapes give no trellis geometry, and the stored one is not run either.
+        const previous = api.kernels.gemm_nax_failed;
+        defer api.kernels.gemm_nax_failed = previous;
+        api.kernels.gemm_nax_failed = true;
+        var scope = Ops{ .s = s };
+        defer scope.deinit();
+        const route = try routing(&scope, rnd, 2, 24);
+        const x = try randomBf16(&scope, std.testing.allocator, rnd, &.{ 1, 2, hidden }, 4);
+        const given = try handedLogit(&scope, c, x);
+        try std.testing.expect((try folded(s, x, &layer.bare, route.ids, route.scores, layer.dec, layer.trunk_dec, given)) == null);
+        try std.testing.expect((try folded(s, x, &layer.mw, route.ids, route.scores, layer.dec, layer.trunk_dec, given)) == null);
+    }
+}
+
+test "Qwen shared expert fold: a stored geometry saves the shape reads of the shared banks on every call" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var random = std.Random.DefaultPrng.init(923);
+    const rnd = random.random();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    var rb = try raggedLayer(&ops, s);
+    defer rb.deinit();
+    const bank = try routedBank(&ops, 24, 44, 64, 53);
+    var got: [stored_cases.len][2]u64 = @splat(.{ 0, 0 });
+    for (stored_cases, &got) |c, *counts| {
+        if (c.trellis_bits != 0 and !api.kernels.gemmNaxOn()) continue;
+        var scope = Ops{ .s = s };
+        defer scope.deinit();
+        const layer = try storedLayer(&scope, arena.allocator(), rnd, s, c, &rb, bank);
+        const route = try routing(&scope, rnd, 1, 24);
+        const x = try randomBf16(&scope, std.testing.allocator, rnd, &.{ 1, 1, hidden }, 4);
+        const given = try handedLogit(&scope, c, x);
+        for ([_]*const MoeMlpWeights{ &layer.bare, &layer.mw }, counts) |mw, *n| {
+            for (0..2) |_| {
+                const before = mlx.query_count;
+                _ = try scope.own((try folded(s, x, mw, route.ids, route.scores, layer.dec, layer.trunk_dec, given)) orelse return error.TestExpectedFold);
+                n.* = mlx.query_count - before;
+            }
+        }
+    }
+    // Per case, the queries of one call with the shapes read and with the geometry stored (the trellis cases need NAX).
+    const nax = api.kernels.gemmNaxOn();
+    const none: [2]u64 = .{ 0, 0 };
+    const want = [stored_cases.len][2]u64{ .{ 56, 16 }, .{ 91, 49 }, .{ 49, 18 }, if (nax) .{ 42, 16 } else none, if (nax) .{ 77, 49 } else none, if (nax) .{ 70, 51 } else none };
+    try std.testing.expectEqual(want, got);
 }

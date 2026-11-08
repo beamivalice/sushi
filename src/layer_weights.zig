@@ -218,6 +218,29 @@ pub const MoeMlpWeights = struct {
     shared_up: Linear = .absent,
     shared_down: Linear = .absent,
     shared_expert_gate: Linear = .absent,
+
+    /// The shared expert as the fold's riders read it. `own_logit`: the fold computes the gate logit from an affine gate
+    /// bank rather than being handed it. `down_known_stq` skips the dtype read of a down weight already bound as trellis.
+    /// Null where there is no fold to run: no gate, or a trellis stack with no trunk decode.
+    pub fn foldShared(self: *const MoeMlpWeights, sigmoid: mlx.mlx_array, trunk_dec: ?expert_exl3.Decode, own_logit: bool, down_known_stq: bool) ?sushi_exl3.riders_gated.Shared {
+        const gate_w = self.shared_expert_gate_w orelse return null;
+        const trellis: ?sushi_exl3.shared_trellis.Banks = if (self.shared_gate_up_stack) |stack| blk: {
+            if (stack.count != 2 or !(down_known_stq or trunk_stq.isStq(self.shared_down_w))) break :blk null;
+            break :blk .{
+                .gate_up = stack.p,
+                .down = .{ .trellis = self.shared_down_w, .suh = self.shared_down_s, .svh = self.shared_down_b },
+                .dec = trunk_dec orelse return null,
+            };
+        } else null;
+        return .{
+            .gate = foldAffine(self.shared_gate_w, self.shared_gate_s, self.shared_gate_b),
+            .up = foldAffine(self.shared_up_w, self.shared_up_s, self.shared_up_b),
+            .down = foldAffine(self.shared_down_w, self.shared_down_s, self.shared_down_b),
+            .trellis = trellis,
+            .sigmoid = sigmoid,
+            .logit = if (own_logit) foldAffine(gate_w, self.shared_expert_gate_s, self.shared_expert_gate_b) else null,
+        };
+    }
 };
 
 const HybridMlpWeights = union(enum) {
@@ -261,6 +284,23 @@ pub fn bindLayer(lw: *MoeLayerWeights, config: *const ModelConfig) !void {
     switch (lw.mlp) {
         inline else => |*w| try bindLinears(w, config),
     }
+    if (lw.mlp == .moe) try bindSharedGeometry(&lw.mlp.moe, config);
+}
+
+fn foldAffine(w: mlx.mlx_array, s: ?mlx.mlx_array, b: ?mlx.mlx_array) sushi_exl3.riders_gated.Affine {
+    return .{ .weight = w, .scales = s orelse .{ .ctx = null }, .biases = b orelse .{ .ctx = null } };
+}
+
+/// Reads the folded shared expert's launch geometry for each row count its launches serve, once its arrays are final.
+/// A dense gate's logit is handed to the fold, an affine gate's computed by it, and the geometry follows that.
+pub fn bindSharedGeometry(mw: *MoeMlpWeights, config: *const ModelConfig) !void {
+    const gate_s = mw.shared_expert_gate_s orelse return;
+    if (config.expert_layout != .exl3_k4) return;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return;
+    const sigmoid = try trunk.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+    const sh = mw.foldShared(sigmoid, config.trunk_quant, gate_s.ctx != null, false) orelse return;
+    for (&mw.shared_geo, 1..) |*slot, rows| slot.* = sushi_exl3.riders_gated.geometry(sh, @intCast(config.hidden_size), @intCast(rows));
 }
 
 

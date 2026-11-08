@@ -75,7 +75,7 @@ pub const Linear = union(enum) {
                 .suh = s,
                 .svh = b,
                 .dec = config.trunk_quant orelse return error.TrunkQuantMissing,
-                .geo = try sushi_exl3.linear.Geo.get(w, null),
+                .geo = try sushi_exl3.linear.Geo.get(w, null, .{ .exact = true }),
             } },
             else => {},
         }

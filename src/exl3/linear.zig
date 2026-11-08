@@ -69,16 +69,17 @@ pub const Geo = struct {
     /// What `init` was asked, which names the geo in `get`.
     key: Key = .{},
 
-    const Key = struct { shape: [4]c_int = @splat(0), dtype: mlx.mlx_dtype = .uint16, bounds: ?[3]c_int = null, nax: bool = false };
+    const Key = struct { shape: [4]c_int = @splat(0), dtype: mlx.mlx_dtype = .uint16, bounds: ?[3]c_int = null, nax: bool = false, exact: bool = true };
 
     pub const Row = struct { g: project_rows.RowsGeom, pin: project_rows.PinnedCfg };
 
-    /// `trellis` is `[1, in/16, out/16, n]`; `bounds` are the segment bounds of a stacked bank. A weight the multi-row
-    /// kernels do not take gets an empty geo.
-    pub fn init(trellis: mlx.mlx_array, bounds: ?[3]c_int) !Geo {
+    /// `trellis` is `[1, in/16, out/16, n]`; `bounds` are the segment bounds of a stacked bank. `mode.exact` picks the
+    /// arm a row count runs on, so the geo serves only launches of that `exact` (`linearGeo` declines the others). A
+    /// weight the multi-row kernels do not take gets an empty geo.
+    pub fn init(trellis: mlx.mlx_array, bounds: ?[3]c_int, mode: project_rows.Mode) !Geo {
         var geo: Geo = .{ .in = 0, .out = 0, .n = 0 };
         const ts = mlx.getShape(trellis);
-        if (ts.len == 4) geo.key = .{ .shape = ts[0..4].*, .dtype = mlx.mlx_array_dtype(trellis), .bounds = bounds, .nax = kernels.gemmNaxOn() };
+        if (ts.len == 4) geo.key = .{ .shape = ts[0..4].*, .dtype = mlx.mlx_array_dtype(trellis), .bounds = bounds, .nax = kernels.gemmNaxOn(), .exact = mode.exact };
         if (ts.len != 4 or ts[0] != 1 or mlx.mlx_array_dtype(trellis) != .uint16) return geo;
         const in = ts[1] * 16;
         const out = ts[2] * 16;
@@ -88,7 +89,7 @@ pub const Geo = struct {
         geo.out = out;
         geo.n = rate.n;
         for (&geo.rows, 1..) |*slot, rows| {
-            const g = project_rows.rowsGeometry(in, out, @intCast(rows), 1, .{ .exact = true });
+            const g = project_rows.rowsGeometry(in, out, @intCast(rows), 1, .{ .exact = mode.exact });
             if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) continue;
             slot.* = .{ .g = g, .pin = try project_rows.pinCfg(.{ .in_dim = in, .out_dim = out, .rows = @intCast(rows), .groups = 1, .n = rate.n, .out_dt = .bfloat16 }, g, bounds) };
         }
@@ -97,14 +98,14 @@ pub const Geo = struct {
 
     /// The geo of a bank of `trellis`'s shape, made on first ask and kept for the process beside the configs it pins
     /// (banks of one shape share it), so a `Linear` holds a pointer. Not locked: ask on the MLX-owning thread.
-    pub fn get(trellis: mlx.mlx_array, bounds: ?[3]c_int) !*const Geo {
+    pub fn get(trellis: mlx.mlx_array, bounds: ?[3]c_int, mode: project_rows.Mode) !*const Geo {
         const ts = mlx.getShape(trellis);
         if (ts.len != 4) return &empty_geo;
-        const key: Key = .{ .shape = ts[0..4].*, .dtype = mlx.mlx_array_dtype(trellis), .bounds = bounds, .nax = kernels.gemmNaxOn() };
+        const key: Key = .{ .shape = ts[0..4].*, .dtype = mlx.mlx_array_dtype(trellis), .bounds = bounds, .nax = kernels.gemmNaxOn(), .exact = mode.exact };
         for (geos.items) |g| if (std.meta.eql(g.key, key)) return g;
         const made = try std.heap.smp_allocator.create(Geo);
         errdefer std.heap.smp_allocator.destroy(made);
-        made.* = try init(trellis, bounds);
+        made.* = try init(trellis, bounds, mode);
         try geos.append(std.heap.smp_allocator, made);
         return made;
     }
@@ -127,7 +128,7 @@ const empty_geo: Geo = .{ .in = 0, .out = 0, .n = 0 };
 /// the rows past the multi-row arm, a `force_arm` seam, a weight `geo` is empty for, a NAX launch after the NAX latch
 /// set (the shape-reading path then picks the SIMD arm). [rows, out] otherwise, as `linearWith`.
 pub fn linearGeo(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, p: root.Proj, geo: *const Geo, dec: exl3.Decode, opts: Opts) !?mlx.mlx_array {
-    if (force_arm != null or rows > project_rows.rowsMax(opts.rows)) return null;
+    if (force_arm != null or opts.rows.exact != geo.key.exact or rows > project_rows.rowsMax(opts.rows)) return null;
     const r = geo.row(rows) orelse return null;
     if (r.g.nax and !kernels.gemmNaxOn()) return null;
     try dec.requireTable();
@@ -158,7 +159,7 @@ pub fn linearSharedWith(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: ex
 /// `linearSharedWith` for bf16 `x` [rows, in] whose `sh.geo` holds the launch; false, with nothing made, when it does not.
 pub fn linearSharedGeo(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, sh: Shared, dec: exl3.Decode, outs: []mlx.mlx_array, opts: Opts) !bool {
     const geo = sh.geo orelse return false;
-    if (rows > project_rows.rowsMax(opts.rows)) return false;
+    if (opts.rows.exact != geo.key.exact or rows > project_rows.rowsMax(opts.rows)) return false;
     const r = geo.row(rows) orelse return false;
     if (r.g.nax and !kernels.gemmNaxOn()) return false;
     if (outs.len != sh.count) return error.BadExl3Shape;

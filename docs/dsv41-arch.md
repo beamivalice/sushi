@@ -836,8 +836,9 @@ the tiny pack the test covers the rounds before the first tie.
   on every call; `rb.hidden` and `rb.inter` are stored.
 - Not bound. `linear.Geo` holds the launch geometry of the exact mode (`project_rows.Mode.exact`), and a plain decode and
   prefill here run the non-exact mode (`Model.rows`; only `verify` sets `exact`), whose one-row launch is the SIMD arm, not NAX.
-  A `Geo` would change the bytes there; only a verify's exact rows could take one today. Binding all of it takes a mode in `Geo` (`exl3/linear.zig`) and a stored shared-bank shape in
-  `rate_groups.sharedRate`, neither a DeepSeek file. At 43 layers the whole of it is a few thousand queries a token,
+  A `Geo` bound in the exact mode would change the bytes there; only a verify's exact rows could take one today. The module now has both pieces: `Geo.get(trellis, bounds, mode)` binds the non-exact
+  one-row launch, and `rate_groups.SharedLane.read` / `SharedExpert.lane` keep the shared bank's shapes from load. DeepSeek's `Stq.apply` and
+  shared-expert chain adopt them in a few lines each, with byte tests. At 43 layers the whole of it is a few thousand queries a token,
   an estimate of tens of microseconds against a GPU-bound token ([engine-kernels](engine-kernels.md)).
 
 <a id="drop-expert"></a>

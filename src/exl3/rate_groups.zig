@@ -782,8 +782,29 @@ fn downPreparedMixed(s: mlx.mlx_stream, middle: mlx.mlx_array, rb: *const Ragged
 
 // ---- The shared expert inside the routed decode launches ----
 
-/// A one-expert trellis bank run beside the routed experts (DeepSeek's shared expert, SPEC1 at its own n).
-pub const SharedExpert = struct { bank: root.Bank, dec: exl3.Decode };
+/// A one-expert trellis bank run beside the routed experts (DeepSeek's shared expert, SPEC1 at its own n). `lane`, when
+/// the owner read it at load (`SharedLane.read` against the `Ragged` it rides), saves the launch the bank's shapes.
+pub const SharedExpert = struct { bank: root.Bank, dec: exl3.Decode, lane: ?*const SharedLane = null };
+
+/// What the lane arms need of a shared bank's shapes: its rate and which of its projections the one-row cooperative
+/// launch serves.
+pub const SharedLane = struct {
+    n: u32,
+    pair_coop: bool,
+    down_coop: bool,
+
+    /// Null where the bank is not one the lane arms serve beside `rb`.
+    pub fn read(bank: root.Bank, rb: *const Ragged) ?SharedLane {
+        const g = mlx.getShape(bank.gate.trellis);
+        const u = mlx.getShape(bank.up.trellis);
+        const d = mlx.getShape(bank.down.trellis);
+        if (g.len != 4 or u.len != 4 or d.len != 4 or g[0] != 1 or u[0] != 1 or d[0] != 1) return null;
+        if (g[1] * 16 != rb.hidden or g[2] * 16 != rb.inter or d[1] * 16 != rb.inter or d[2] * 16 != rb.hidden) return null;
+        if (g[3] != u[3] or g[3] != d[3] or !kernels.laneServesRate(g[3])) return null;
+        const rate = exl3.kFromPackedDim(@intCast(g[3])) orelse return null;
+        return .{ .n = rate.n, .pair_coop = kernels.oneRowCoopServes(g[1], g[2]), .down_coop = kernels.oneRowCoopServes(d[1], d[2]) };
+    }
+};
 
 const FuseStage = enum { prep, pair, mid, down };
 
@@ -1164,14 +1185,8 @@ fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots:
 /// The shared expert's lane-arm shapes at this bank, or null where its own chain would run another arm.
 fn sharedRate(se: SharedExpert, rb: *const Ragged, rows: usize) ?struct { n: u32, one_row_pair: bool, one_row_down: bool } {
     if (!se.dec.codebook.servesLaneFastPaths() or rows < 1 or rows > kernels.DECODE_ROWS_MAX) return null;
-    const g = mlx.getShape(se.bank.gate.trellis);
-    const u = mlx.getShape(se.bank.up.trellis);
-    const d = mlx.getShape(se.bank.down.trellis);
-    if (g.len != 4 or u.len != 4 or d.len != 4 or g[0] != 1 or u[0] != 1 or d[0] != 1) return null;
-    if (g[1] * 16 != rb.hidden or g[2] * 16 != rb.inter or d[1] * 16 != rb.inter or d[2] * 16 != rb.hidden) return null;
-    if (g[3] != u[3] or g[3] != d[3] or !kernels.laneServesRate(g[3])) return null;
-    const rate = exl3.kFromPackedDim(@intCast(g[3])) orelse return null;
-    return .{ .n = rate.n, .one_row_pair = rows == 1 and kernels.oneRowCoopServes(g[1], g[2]), .one_row_down = rows == 1 and kernels.oneRowCoopServes(d[1], d[2]) };
+    const lane = if (se.lane) |l| l.* else SharedLane.read(se.bank, rb) orelse return null;
+    return .{ .n = lane.n, .one_row_pair = rows == 1 and lane.pair_coop, .one_row_down = rows == 1 and lane.down_coop };
 }
 
 /// `moeDecodeClamped` over the prepared chain with the shared expert `se` (bf16 `x`) riding its launches: the routed
@@ -1442,11 +1457,26 @@ pub fn moeGatedSharedFolded(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragg
     if (!mlx.streamIsGpu(s) or rb.prefill_only or preparedOn(rb)) return null;
     if (rb.tile_major and !kernels.gemvLayout(1).funnel) return null;
     const route = riders.Routing.of(x, inds, scores) orelse return null;
-    const rows = route.rows;
-    const topk = route.topk;
     const hidden = mlx.getShape(x)[2];
     if (hidden != rb.hidden) return null;
-    const geo = riders.geometry(sh, hidden, rows) orelse return null;
+    const geo = riders.geometry(sh, hidden, route.rows) orelse return null;
+    return gatedFold(s, x, rb, inds, scores, dec, sh, gate, route, geo);
+}
+
+/// `moeGatedSharedFolded` with the shared expert's geometry given: `geo` is `riders_gated.geometry(sh, hidden, rows)`
+/// for this `sh`, hidden width and row count, read once at load. One that does not fit `x` or `sh` gives null.
+pub fn moeGatedSharedFoldedGeo(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array, geo: *const riders.Geometry) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s) or rb.prefill_only or preparedOn(rb)) return null;
+    if (rb.tile_major and !kernels.gemvLayout(1).funnel) return null;
+    const route = riders.Routing.of(x, inds, scores) orelse return null;
+    if (geo.hidden != rb.hidden or mlx.getShape(x)[2] != rb.hidden or !riders.geometryFits(geo.*, sh)) return null;
+    return gatedFold(s, x, rb, inds, scores, dec, sh, gate, route, geo.*);
+}
+
+fn gatedFold(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: exl3.Decode, sh: riders.Shared, gate: ?mlx.mlx_array, route: riders.Routing, geo: riders.Geometry) !?mlx.mlx_array {
+    const rows = route.rows;
+    const topk = route.topk;
+    const hidden = rb.hidden;
     const want_logit = sh.logit != null;
     if (!want_logit) {
         const g = gate orelse return null;
@@ -2877,11 +2907,15 @@ fn sharedFusedCase(t: std.mem.Allocator, s: mlx.mlx_stream, hidden: usize, inter
         if (v != 0) live += 1;
     }
     try std.testing.expect(live > want_bytes.len / 8);
-    for ([_]bool{ false, true }) |first| {
+    const lane = SharedLane.read(sb, &f.rb) orelse return error.TestUnexpectedResult;
+    var bound = se;
+    bound.lane = &lane;
+    for (1..kernels.DECODE_ROWS_MAX + 1) |r| try std.testing.expectEqual(sharedRate(se, &f.rb, r), sharedRate(bound, &f.rb, r));
+    for ([_]bool{ false, true, false, true }, [_]SharedExpert{ se, se, bound, bound }) |first, expert| {
         fused_shared_first = first;
         kernels.setDecodeParams(dec);
         const before = kernels.fusedDispatchCount();
-        const got = (try moeDecodeClampedSharedFused(s, xb, &f.rb, f.slots, f.scores, f.topk(), .float32, se, limit)) orelse return error.TestUnexpectedResult;
+        const got = (try moeDecodeClampedSharedFused(s, xb, &f.rb, f.slots, f.scores, f.topk(), .float32, expert, limit)) orelse return error.TestUnexpectedResult;
         defer _ = mlx.mlx_array_free(got);
         var cg = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cg);

@@ -187,6 +187,12 @@ pub fn geometry(sh: Shared, hidden: c_int, rows: c_int) ?Geometry {
     return .{ .hidden = hidden, .width = width, .group = g, .logit_group = logit_group };
 }
 
+/// Whether `geo` was read for a shared expert of `sh`'s kind (the riders and the trellis banks each run only on their
+/// own), and for trellis banks whether the NAX arm it was read for is still on.
+pub fn geometryFits(geo: Geometry, sh: Shared) bool {
+    return (geo.tr != null) == (sh.trellis != null) and (geo.tr == null or kernels.gemmNaxOn());
+}
+
 /// The same logit as one more threadgroup along the trellis gate/up grid, past its `TILES` columns of blocks: row
 /// `x - TILES`.
 const LOGIT_ROW: [:0]const u8 = "if (threadgroup_position_in_grid.x >= uint(TILES)) {\n  if (threadgroup_position_in_grid.y == 0u && simdgroup_index_in_threadgroup == 0u) {\n" ++
