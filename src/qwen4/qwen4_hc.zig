@@ -143,6 +143,25 @@ pub fn hcReadPending(self: *Transformer, h: *mlx.mlx_array, w: *const HcWeights,
     return hcRead(self, h.*, w, batch, seq_len);
 }
 
+/// The (bits, group size) the fused hyper-connection kernels run `w` at: down and up affine at one shape, else null.
+pub fn fusedQuant(self: *const Transformer, w: *const HcWeights) ?trunk.QuantParams {
+    const dqp, const uqp = solvedAtLoad(w) orelse probe: {
+        // A read built by hand solves its banks per call.
+        const hc: u32 = @intCast(self.config.hc_count);
+        break :probe .{
+            self.quantParamsHinted(w.down_w, w.down_s, hc * @as(u32, @intCast(self.config.hidden_size))),
+            self.quantParamsFor(w.up_w, w.up_s),
+        };
+    };
+    if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
+    return dqp;
+}
+
+fn solvedAtLoad(w: *const HcWeights) ?struct { trunk.QuantParams, trunk.QuantParams } {
+    if (w.down != .affine or w.up != .affine) return null;
+    return .{ w.down.affine.solvedParams() orelse return null, w.up.affine.solvedParams() orelse return null };
+}
+
 pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pend: ?HcPending) !?HcFusedOut {
     const hc: c_int = @intCast(self.config.hc_count);
     const hidden: c_int = @intCast(self.config.hidden_size);
@@ -156,9 +175,7 @@ pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWei
         }
     }
     if (trunk.linear_tap != null or batch * seq_len > HC_FUSED_MAX_ROWS or w.down_s.ctx == null or w.up_s.ctx == null or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
-    const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
-    const uqp = self.quantParamsFor(w.up_w, w.up_s);
-    if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
+    const dqp = fusedQuant(self, w) orelse return null;
     if (self.verifyFeatureEnabled(.hc_graph, qwen4_forward.mtp_verify_hc_prepared_active, batch, seq_len) and batch == 1 and hc == 4 and hidden == 2560 and dqp.bits == 8 and dqp.group_size == 64) {
         if (try hcReadPrepared(self.s, stream, w.*, seq_len, self.config.rms_norm_eps, pend)) |result| {
             qwen4_forward.mtp_verify_hc_prepared_calls +%= 1;
@@ -200,9 +217,8 @@ pub fn hcReadVerifyRows(self: *Transformer, rows: anytype, w: *const HcWeights) 
         inputs[i] = row.h;
         if (row.pending) |p| pending[i] = p;
     }
-    const dqp = self.quantParamsHinted(w.down_w, w.down_s, 10240);
-    const uqp = self.quantParamsFor(w.up_w, w.up_s);
-    if (dqp.bits != 8 or uqp.bits != 8 or dqp.group_size != 64 or uqp.group_size != 64 or dqp.mode != .affine or uqp.mode != .affine) return null;
+    const qp = fusedQuant(self, w) orelse return null;
+    if (qp.bits != 8 or qp.group_size != 64) return null;
     const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, if (has_pending) pending[0..rows.len] else null)) orelse return null;
     defer self.allocator.free(joined);
     errdefer for (joined) |value| inline for (.{ "mixed", "inj", "stream" }) |name| {
@@ -1839,5 +1855,45 @@ test "hc write compilation preserves the serial pending-write rounding" {
         const together = try hcWrite(&xfm, try standinRef(stream), out, inj, 1, rows);
         defer _ = mlx.mlx_array_free(together);
         try qkvExpectBitsEqual(s, separate, together);
+    }
+}
+
+fn quantizedHc(s: mlx.mlx_stream, rnd: std.Random, rows: c_int, cols: c_int, bits: u32) ![3]mlx.mlx_array {
+    const dense = try @import("../test_support.zig").attn256RandBf16(rnd, &.{ rows, cols }, s);
+    defer _ = mlx.mlx_array_free(dense);
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_quantize(&parts, dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
+    var out: [3]mlx.mlx_array = undefined;
+    for (&out, 0..) |*a, i| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(a, parts, i));
+    }
+    return out;
+}
+
+test "fused hyper-connection gate: banks solved at load decide as the per-call solve does, with no query" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x4C0A7E);
+    const rnd = prng.random();
+    var xfm: Transformer = undefined;
+    xfm.config = .{ .hc_count = 4, .hidden_size = 512, .quant_bits = 4, .quant_group_size = 64 };
+    xfm.bits_cache = null;
+    for ([_][2]u32{ .{ 8, 8 }, .{ 4, 4 }, .{ 8, 4 } }) |b| {
+        const down = try quantizedHc(s, rnd, 128, 4 * 512, b[0]);
+        const up = try quantizedHc(s, rnd, 4 * 512, 128, b[1]);
+        defer for ([_][3]mlx.mlx_array{ down, up }) |t| for (t) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const none = mlx.mlx_array{ .ctx = null };
+        var w: HcWeights = .{ .norm_w = none, .down_w = down[0], .down_s = down[1], .down_b = down[2], .up_w = up[0], .up_s = up[1], .up_b = up[2] };
+        const probed = fusedQuant(&xfm, &w);
+        try @import("../layer_weights.zig").bindHcLinears(&w, &xfm.config);
+        const before = mlx.query_count;
+        const bound = fusedQuant(&xfm, &w);
+        try testing.expectEqual(@as(u64, 0), mlx.query_count - before);
+        try testing.expectEqual(probed, bound);
+        try testing.expectEqual(b[0] == b[1], bound != null);
     }
 }

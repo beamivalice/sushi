@@ -31,12 +31,10 @@ pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const trunk_mod.MoeMlpWeights, ind
     const result = if (mw.exl3_ragged) |*rb|
         (if (geo) |g| try api.rate_groups.moeGatedSharedFoldedGeo(s, x, rb, inds, scores, dec, shared, gate, g) else try api.rate_groups.moeGatedSharedFolded(s, x, rb, inds, scores, dec, shared, gate))
     else blk: {
-        const bank = api.Bank{
-            .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
-            .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
-            .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
-        };
-        break :blk if (geo) |g| try api.qwen_fold.moeGatedSharedFoldedGeo(s, x, bank, inds, scores, dec, shared, gate, g) else try api.qwen_fold.moeGatedSharedFolded(s, x, bank, inds, scores, dec, shared, gate);
+        const bank = mw.routedBank();
+        const g = geo orelse break :blk try api.qwen_fold.moeGatedSharedFolded(s, x, bank, inds, scores, dec, shared, gate);
+        if (mw.routed_shape) |*shape| break :blk try api.qwen_fold.moeGatedSharedFoldedBound(s, x, bank, shape, inds, scores, dec, shared, gate, g);
+        break :blk try api.qwen_fold.moeGatedSharedFoldedGeo(s, x, bank, inds, scores, dec, shared, gate, g);
     };
     if (result != null and !logged) {
         logged = true;
@@ -510,9 +508,11 @@ const stored_cases = [_]StoredCase{
     .{ .trellis_bits = 96, .ragged = false, .dense_gate = true },
 };
 
-/// A layer of the case, its geometry bound as the loader does, and the same layer with none.
+/// A layer of the case, its geometry and routed shape bound as the loader does, the layer with only its geometry bound,
+/// and the layer with neither.
 const StoredLayer = struct {
     mw: MoeMlpWeights,
+    geo_only: MoeMlpWeights,
     bare: MoeMlpWeights,
     shared: api.qwen_riders.Shared,
     dec: api.format.Decode,
@@ -525,11 +525,14 @@ fn storedLayer(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, s: mlx.mlx_stre
     var cfg: ModelConfig = .{ .hidden_size = hidden, .trunk_quant = trunk_dec, .expert_layout = .exl3_k4 };
     var mw = layerOf(w, if (c.ragged) .{ .ragged = rb } else .{ .bank = bank }, c.dense_gate);
     try layer_weights.bindSharedGeometry(&mw, &cfg);
-    var bare = mw;
+    var geo_only = mw;
+    geo_only.routed_shape = null;
+    var bare = geo_only;
     bare.shared_geo = @splat(null);
     const sigmoid = try trunk_mod.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
     return .{
         .mw = mw,
+        .geo_only = geo_only,
         .bare = bare,
         .shared = mw.foldShared(sigmoid, trunk_dec, !c.dense_gate, false) orelse return error.TestExpectedShared,
         .dec = if (c.ragged) api.format.Decode.tabled(.spec1, .w15) else test_dec,
@@ -562,6 +565,7 @@ test "Qwen shared expert fold: the geometry bound at load is the one the shapes 
         var case_ops = Ops{ .s = s };
         defer case_ops.deinit();
         const layer = try storedLayer(&case_ops, arena.allocator(), rnd, s, c, &rb, bank);
+        try std.testing.expectEqual(if (c.ragged) null else api.qwen_fold.bankShape(bank, hidden), layer.mw.routed_shape);
         for (layer.mw.shared_geo, 1..) |stored, rows| {
             try std.testing.expectEqual(api.qwen_riders.geometry(layer.shared, hidden, @intCast(rows)), stored);
             if (c.trellis_bits == 0) try std.testing.expect(stored != null);
@@ -574,12 +578,13 @@ test "Qwen shared expert fold: the geometry bound at load is the one the shapes 
             const x = try randomBf16(&scope, std.testing.allocator, rnd, &.{ 1, @intCast(rows), hidden }, 4);
             const given = try handedLogit(&scope, c, x);
             const want = try folded(s, x, &layer.bare, route.ids, route.scores, layer.dec, layer.trunk_dec, given);
-            const got = try folded(s, x, &layer.mw, route.ids, route.scores, layer.dec, layer.trunk_dec, given);
-            try std.testing.expectEqual(want == null, got == null);
-            if (want) |wv| {
-                try expectSameBits(try scope.own(wv), try scope.own(got.?));
-                served += 1;
+            const want_owned: ?Arr = if (want) |wv| try scope.own(wv) else null;
+            for ([_]*const MoeMlpWeights{ &layer.geo_only, &layer.mw }) |mw| {
+                const got = try folded(s, x, mw, route.ids, route.scores, layer.dec, layer.trunk_dec, given);
+                try std.testing.expectEqual(want == null, got == null);
+                if (want_owned) |wv| try expectSameBits(wv, try scope.own(got.?));
             }
+            if (want != null) served += 1;
         }
         try std.testing.expect(served > 0);
         if (c.trellis_bits == 0) continue;
@@ -597,7 +602,7 @@ test "Qwen shared expert fold: the geometry bound at load is the one the shapes 
     }
 }
 
-test "Qwen shared expert fold: a stored geometry saves the shape reads of the shared banks on every call" {
+test "Qwen shared expert fold: a stored geometry and routed shape save the shape reads of the banks on every call" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -626,9 +631,10 @@ test "Qwen shared expert fold: a stored geometry saves the shape reads of the sh
             }
         }
     }
-    // Per case, the queries of one call with the shapes read and with the geometry stored (the trellis cases need NAX).
+    // Per case, the queries of one call with the shapes read and with the geometry and the one-bank routed shape stored
+    // (the trellis cases need NAX).
     const nax = api.kernels.gemmNaxOn();
     const none: [2]u64 = .{ 0, 0 };
-    const want = [stored_cases.len][2]u64{ .{ 56, 16 }, .{ 91, 49 }, .{ 49, 18 }, if (nax) .{ 42, 16 } else none, if (nax) .{ 77, 49 } else none, if (nax) .{ 70, 51 } else none };
+    const want = [stored_cases.len][2]u64{ .{ 56, 16 }, .{ 91, 16 }, .{ 49, 18 }, if (nax) .{ 42, 16 } else none, if (nax) .{ 77, 16 } else none, if (nax) .{ 70, 18 } else none };
     try std.testing.expectEqual(want, got);
 }

@@ -8,7 +8,8 @@ const trunk_mod = @import("../trunk.zig");
 const forward_diag = @import("../forward_diag.zig");
 const linear_mod = @import("../linear.zig");
 const Linear = linear_mod.Linear;
-const bindLinears = @import("../layer_weights.zig").bindLinears;
+const layer_weights = @import("../layer_weights.zig");
+const bindLinears = layer_weights.bindLinears;
 const moe_gqmv = @import("../moe_gqmv.zig");
 const qwen4_gdn = @import("qwen4_gdn.zig");
 const Transformer = trunk_mod.Transformer;
@@ -514,7 +515,7 @@ pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: 
     const fe = try weightTriple(weights, mtp_prefix ++ ".fc_embedding", &owned, allocator, s);
     const fh = try weightTriple(weights, mtp_prefix ++ ".fc_hidden", &owned, allocator, s);
     var mixer = try loadHcWeights(weights, mtp_prefix ++ ".hyper_connection_mixer", false, config.hc_count, config.hidden_size, &owned, allocator, s);
-    try bindLinears(&mixer, &config);
+    try layer_weights.bindHcLinears(&mixer, &config);
     const pne = weights.get(mtp_prefix ++ ".pre_fc_norm_embedding.weight") orelse return error.MissingWeight;
     const pnh = weights.get(mtp_prefix ++ ".pre_fc_norm_hidden.weight") orelse return error.MissingWeight;
     var cache = try KVCache.init(allocator, config.num_hidden_layers + 1);

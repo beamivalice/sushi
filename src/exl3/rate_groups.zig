@@ -783,26 +783,39 @@ fn downPreparedMixed(s: mlx.mlx_stream, middle: mlx.mlx_array, rb: *const Ragged
 // ---- The shared expert inside the routed decode launches ----
 
 /// A one-expert trellis bank run beside the routed experts (DeepSeek's shared expert, SPEC1 at its own n). `lane`, when
-/// the owner read it at load (`SharedLane.read` against the `Ragged` it rides), saves the launch the bank's shapes.
+/// the owner read it at load (`SharedLane.of` the bank, or `read` against the `Ragged` it rides), saves the launch the
+/// bank's shapes.
 pub const SharedExpert = struct { bank: root.Bank, dec: exl3.Decode, lane: ?*const SharedLane = null };
 
-/// What the lane arms need of a shared bank's shapes: its rate and which of its projections the one-row cooperative
-/// launch serves.
+/// What the lane arms need of a shared bank's shapes: its rate, its widths and which of its projections the one-row
+/// cooperative launch serves.
 pub const SharedLane = struct {
     n: u32,
     pair_coop: bool,
     down_coop: bool,
+    hidden: c_int,
+    inter: c_int,
 
-    /// Null where the bank is not one the lane arms serve beside `rb`.
-    pub fn read(bank: root.Bank, rb: *const Ragged) ?SharedLane {
+    /// Null where the lane arms serve the bank beside no `Ragged`.
+    pub fn of(bank: root.Bank) ?SharedLane {
         const g = mlx.getShape(bank.gate.trellis);
         const u = mlx.getShape(bank.up.trellis);
         const d = mlx.getShape(bank.down.trellis);
         if (g.len != 4 or u.len != 4 or d.len != 4 or g[0] != 1 or u[0] != 1 or d[0] != 1) return null;
-        if (g[1] * 16 != rb.hidden or g[2] * 16 != rb.inter or d[1] * 16 != rb.inter or d[2] * 16 != rb.hidden) return null;
+        if (d[1] != g[2] or d[2] != g[1]) return null;
         if (g[3] != u[3] or g[3] != d[3] or !kernels.laneServesRate(g[3])) return null;
         const rate = exl3.kFromPackedDim(@intCast(g[3])) orelse return null;
-        return .{ .n = rate.n, .pair_coop = kernels.oneRowCoopServes(g[1], g[2]), .down_coop = kernels.oneRowCoopServes(d[1], d[2]) };
+        return .{ .n = rate.n, .pair_coop = kernels.oneRowCoopServes(g[1], g[2]), .down_coop = kernels.oneRowCoopServes(d[1], d[2]), .hidden = g[1] * 16, .inter = g[2] * 16 };
+    }
+
+    pub fn fits(self: *const SharedLane, rb: *const Ragged) bool {
+        return self.hidden == rb.hidden and self.inter == rb.inter;
+    }
+
+    /// Null where the bank is not one the lane arms serve beside `rb`.
+    pub fn read(bank: root.Bank, rb: *const Ragged) ?SharedLane {
+        const lane = of(bank) orelse return null;
+        return if (lane.fits(rb)) lane else null;
     }
 };
 
@@ -1185,7 +1198,7 @@ fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots:
 /// The shared expert's lane-arm shapes at this bank, or null where its own chain would run another arm.
 fn sharedRate(se: SharedExpert, rb: *const Ragged, rows: usize) ?struct { n: u32, one_row_pair: bool, one_row_down: bool } {
     if (!se.dec.codebook.servesLaneFastPaths() or rows < 1 or rows > kernels.DECODE_ROWS_MAX) return null;
-    const lane = if (se.lane) |l| l.* else SharedLane.read(se.bank, rb) orelse return null;
+    const lane = if (se.lane) |l| (if (l.fits(rb)) l.* else return null) else SharedLane.read(se.bank, rb) orelse return null;
     return .{ .n = lane.n, .one_row_pair = rows == 1 and lane.pair_coop, .one_row_down = rows == 1 and lane.down_coop };
 }
 

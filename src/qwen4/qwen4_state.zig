@@ -222,7 +222,7 @@ fn load(self: *State, args: arch_state.InitArgs) !?Trunk.ExpertStreamParts {
     defer extra.deinit(allocator);
     var mb: [160]u8 = undefined;
     var mixer = try layer_weights.loadHcWeights(weights, std.fmt.bufPrint(&mb, "{s}.hyper_connection_mixer", .{prefix}) catch unreachable, false, config.hc_count, config.hidden_size, &extra, allocator, s);
-    try layer_weights.bindLinears(&mixer, &config);
+    try layer_weights.bindHcLinears(&mixer, &config);
     if (extra.items.len > 0) {
         const old = owned_bf16.* orelse &[_]mlx.mlx_array{};
         const merged = try std.mem.concat(allocator, mlx.mlx_array, &.{ old, extra.items });

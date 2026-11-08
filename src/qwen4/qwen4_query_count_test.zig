@@ -17,8 +17,8 @@ const Pinned = struct { pack: []const u8, ticks: [4]u64 };
 const slack: u64 = 40;
 
 const pinned = [_]Pinned{
-    .{ .pack = "Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .ticks = .{ 9290, 9290, 9580, 9290 } },
-    .{ .pack = "Qwen3.8-Flash-Next-Sushi-4bpw", .ticks = .{ 10868, 10868, 11158, 10868 } },
+    .{ .pack = "Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .ticks = .{ 9083, 9083, 9373, 9083 } },
+    .{ .pack = "Qwen3.8-Flash-Next-Sushi-4bpw", .ticks = .{ 9083, 9083, 9373, 9083 } },
 };
 
 fn tick(xfm: *Transformer, slot: *Qwen4TestSlot, token: i32) !u64 {

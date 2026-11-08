@@ -77,6 +77,8 @@ pub const Lin = struct {
 pub const Stq = struct {
     p: exl3.Proj,
     dec: exl3.format.Decode,
+    /// A one-bank weight's non-exact launches (a plain decode's), read once at load.
+    geo: ?*const exl3.linear.Geo = null,
 
     pub fn outDim(self: Stq) usize {
         return dim(self.p.trellis, 2) * 16;
@@ -86,12 +88,16 @@ pub const Stq = struct {
     pub fn apply(self: Stq, sc: *Scope, x: A) !A {
         const sh = mlx.getShape(x);
         const in = sh[sh.len - 1];
+        const dt = mlx.mlx_array_dtype(x);
         const rows: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(in))));
-        const y = try sc.keep(try exl3.linear.linearWith(sc.s, try sc.reshape(x, &.{ rows, in }), self.p, self.dec, .{ .rows = sc.rows }));
+        const x2 = try sc.reshape(x, &.{ rows, in });
+        // The geo pins bf16 launches.
+        const bound = if (self.geo != null and dt == .bfloat16) try exl3.linear.linearGeo(sc.s, x2, rows, self.p, self.geo.?, self.dec, .{ .rows = sc.rows }) else null;
+        const y = try sc.keep(bound orelse try exl3.linear.linearWith(sc.s, x2, self.p, self.dec, .{ .rows = sc.rows }));
         var shape: [8]c_int = undefined;
         @memcpy(shape[0..sh.len], sh);
         shape[sh.len - 1] = @intCast(self.outDim());
-        return sc.astype(try sc.reshape(y, shape[0..sh.len]), mlx.mlx_array_dtype(x));
+        return sc.astype(try sc.reshape(y, shape[0..sh.len]), dt);
     }
 
     /// `x` `[G, rows, in]`, bank g serving `x[g]`.
@@ -254,6 +260,8 @@ const Layer = struct {
     /// The bias an image span's rows pick experts by (`noaux_tc_for_vl`); none on a pack without a tower.
     gate_bias_vl: A = none,
     shared: [3]Lin, // w1 (gate), w3 (up), w2 (down)
+    /// The trellis shared bank's lane shapes, read once at load.
+    shared_lane: ?exl3.rate_groups.SharedLane = null,
     top_k: usize,
     /// wq_a and wkv (and a ratio-1 compressor's wkv) stacked into one bank: they all project the attention input.
     in_shared: ?exl3.linear.Shared = null,
@@ -972,8 +980,9 @@ fn loadStq(m: *Model, w: *model_mod.Weights, base: []const u8) !?Stq {
         log.err("deepseek_v41: {s} is not a trellis bank with f16 scales\n", .{base});
         return error.Dsv41WeightLayout;
     }
-    return .{ .dec = dec, .p = .{
-        .trellis = try m.ownReshape(tr, &t4),
+    const trellis = try m.ownReshape(tr, &t4);
+    return .{ .dec = dec, .geo = if (one) try exl3.linear.Geo.get(trellis, null, .{}) else null, .p = .{
+        .trellis = trellis,
         .suh = try m.ownReshape(su, &.{ g, in }),
         .svh = try m.ownReshape(sv, &.{ g, out }),
     } };
@@ -1138,6 +1147,7 @@ fn loadLayer(m: *Model, w: *model_mod.Weights, pfx: []const u8, id: usize, li: u
     if (ly.comp) |*cw| if (cw.wgate) |*g| {
         cw.shared = try fuseShared(m, &.{ &cw.wkv, g });
     };
+    if (sharedBank(&ly)) |se| ly.shared_lane = exl3.rate_groups.SharedLane.of(se.bank);
     return ly;
 }
 
@@ -2290,7 +2300,7 @@ pub const SharedOp = union(enum) {
 
 fn sharedBank(ly: *const Layer) ?exl3.rate_groups.SharedExpert {
     const q = [3]Stq{ ly.shared[0].stq orelse return null, ly.shared[1].stq orelse return null, ly.shared[2].stq orelse return null };
-    return .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
+    return .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec, .lane = if (ly.shared_lane) |*l| l else null };
 }
 
 fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int, expand: ?Expand, keep: ?*exl3.rate_groups.Kept) !?A {

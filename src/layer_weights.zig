@@ -213,11 +213,25 @@ pub const MoeMlpWeights = struct {
     /// The folded shared expert's launch geometry per row count (index rows - 1). L-qwen4 fills it once at load, so the
     /// launches take it instead of reading the arrays again on every token; null until then.
     shared_geo: [@intCast(sushi_exl3.project_rows.NAX_ROWS_MAX)]?sushi_exl3.riders_gated.Geometry = @splat(null),
+    /// A one-bank EXL3 layer's routed launch shape, read at load for the shared-expert fold.
+    routed_shape: ?sushi_exl3.fold_gated.BankShape = null,
+    /// The routed gate, up and down banks' (bits, group size, mode), solved at load from the arrays above. Null for a
+    /// bank built by hand or a streamed slab's copy, which solve per call.
+    switch_qp: ?[3]QuantParams = null,
     router: Linear = .absent,
     shared_gate: Linear = .absent,
     shared_up: Linear = .absent,
     shared_down: Linear = .absent,
     shared_expert_gate: Linear = .absent,
+
+    /// The routed gate, up and down banks as one EXL3 bank.
+    pub fn routedBank(self: *const MoeMlpWeights) sushi_exl3.Bank {
+        return .{
+            .gate = .{ .trellis = self.switch_gate_w, .suh = self.switch_gate_s, .svh = self.switch_gate_b },
+            .up = .{ .trellis = self.switch_up_w, .suh = self.switch_up_s, .svh = self.switch_up_b },
+            .down = .{ .trellis = self.switch_down_w, .suh = self.switch_down_s, .svh = self.switch_down_b },
+        };
+    }
 
     /// The shared expert as the fold's riders read it. `own_logit`: the fold computes the gate logit from an affine gate
     /// bank rather than being handed it. `down_known_stq` skips the dtype read of a down weight already bound as trellis.
@@ -274,9 +288,17 @@ pub fn bindLinears(w: anytype, config: *const ModelConfig) !void {
     }
 }
 
+/// Binds a hyper-connection read's banks and solves the affine ones at their activations' widths, which the fused read
+/// needs before any projection runs: `down` reads the `hc * hidden` streams, `up` what `down` writes.
+pub fn bindHcLinears(w: *HcWeights, config: *const ModelConfig) !void {
+    try bindLinears(w, config);
+    if (w.down == .affine) _ = w.down.affine.solve(config, config.hc_count * config.hidden_size);
+    if (w.up == .affine) _ = w.up.affine.solve(config, @intCast(mlx.getShape(w.down_w)[0]));
+}
+
 pub fn bindLayer(lw: *MoeLayerWeights, config: *const ModelConfig) !void {
-    if (lw.hc_attn) |*hc| try bindLinears(hc, config);
-    if (lw.hc_mlp) |*hc| try bindLinears(hc, config);
+    if (lw.hc_attn) |*hc| try bindHcLinears(hc, config);
+    if (lw.hc_mlp) |*hc| try bindHcLinears(hc, config);
     if (lw.ple) |*ple| try bindLinears(ple, config);
     switch (lw.attn) {
         inline else => |*w| try bindLinears(w, config),
@@ -284,7 +306,26 @@ pub fn bindLayer(lw: *MoeLayerWeights, config: *const ModelConfig) !void {
     switch (lw.mlp) {
         inline else => |*w| try bindLinears(w, config),
     }
-    if (lw.mlp == .moe) try bindSharedGeometry(&lw.mlp.moe, config);
+    if (lw.mlp == .moe) {
+        bindSwitchParams(&lw.mlp.moe, config);
+        try bindSharedGeometry(&lw.mlp.moe, config);
+    }
+}
+
+/// The parameters `quantParamsHinted` solves for a bank: the model's own for one with no scales.
+fn solveQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
+    if (sc.ctx == null) return .{ .bits = config.quant_bits, .group_size = config.quant_group_size, .mode = config.quant_mode };
+    return computeQuantParams(config, w, sc, in_dim);
+}
+
+/// Solves the routed banks' parameters once: gate and up read the `hidden`-wide rows, down the expert intermediate.
+pub fn bindSwitchParams(mw: *MoeMlpWeights, config: *const ModelConfig) void {
+    const inter: ?u32 = if (config.moe_intermediate_size > 0) config.moe_intermediate_size else null;
+    mw.switch_qp = .{
+        solveQuantParams(config, mw.switch_gate_w, mw.switch_gate_s, config.hidden_size),
+        solveQuantParams(config, mw.switch_up_w, mw.switch_up_s, config.hidden_size),
+        solveQuantParams(config, mw.switch_down_w, mw.switch_down_s, inter),
+    };
 }
 
 fn foldAffine(w: mlx.mlx_array, s: ?mlx.mlx_array, b: ?mlx.mlx_array) sushi_exl3.riders_gated.Affine {
@@ -301,6 +342,7 @@ pub fn bindSharedGeometry(mw: *MoeMlpWeights, config: *const ModelConfig) !void 
     const sigmoid = try trunk.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
     const sh = mw.foldShared(sigmoid, config.trunk_quant, gate_s.ctx != null, false) orelse return;
     for (&mw.shared_geo, 1..) |*slot, rows| slot.* = sushi_exl3.riders_gated.geometry(sh, @intCast(config.hidden_size), @intCast(rows));
+    if (mw.exl3_ragged == null) mw.routed_shape = sushi_exl3.fold_gated.bankShape(mw.routedBank(), @intCast(config.hidden_size));
 }
 
 
@@ -2043,4 +2085,86 @@ test "the trellis count of a layer set is its banks outside the routed experts a
     const counts = TrunkCounts.of(&layers);
     try testing.expectEqual(@as(usize, 6), counts.banks);
     try testing.expectEqual(@as(usize, 2), counts.stacks);
+}
+
+fn quantizedExperts(s: mlx.mlx_stream, rnd: std.Random, experts: c_int, out_dim: c_int, in_dim: c_int, bits: u32, group: u32) ![3]mlx.mlx_array {
+    const dense = try attn256RandBf16(rnd, &.{ experts, out_dim, in_dim }, s);
+    defer _ = mlx.mlx_array_free(dense);
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_quantize(&parts, dense, .{ .value = @intCast(group), .has_value = true }, .{ .value = @intCast(bits), .has_value = true }, "affine", .{ .ctx = null }, s));
+    var out: [3]mlx.mlx_array = undefined;
+    for (&out, 0..) |*a, i| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(a, parts, i));
+        try mlx.check(mlx.mlx_array_eval(a.*));
+    }
+    return out;
+}
+
+fn routedParamsCase(bits: u32, group: u32, rows: c_int) !void {
+    const s = mlx.gpuStream();
+    const hidden: c_int = 256;
+    const inter: c_int = 128;
+    const experts: c_int = 4;
+    var rng = std.Random.DefaultPrng.init(0x5017 + bits * 31 + @as(u64, @intCast(rows)));
+    const rnd = rng.random();
+    var xfm: Transformer = undefined;
+    xfm.config = .{ .hidden_size = hidden, .moe_intermediate_size = inter, .quant_bits = 4, .quant_group_size = 64, .hidden_act = .silu, .num_experts = experts, .num_experts_per_tok = 2 };
+    xfm.bits_cache = null;
+    xfm.compiled_geglu = null;
+    xfm.compiled_moe_routing = null;
+    xfm.allocator = testing.allocator;
+    xfm.s = s;
+    xfm.expert_stream = null;
+    xfm.imatrix = null;
+    xfm.cost_trace_active = false;
+    const gate = try quantizedExperts(s, rnd, experts, inter, hidden, bits, group);
+    const up = try quantizedExperts(s, rnd, experts, inter, hidden, bits, group);
+    const down = try quantizedExperts(s, rnd, experts, hidden, inter, bits, group);
+    defer for ([_][3]mlx.mlx_array{ gate, up, down }) |t| for (t) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const none = mlx.mlx_array{ .ctx = null };
+    var mw = std.mem.zeroInit(MoeMlpWeights, .{});
+    mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b = gate;
+    mw.switch_up_w, mw.switch_up_s, mw.switch_up_b = up;
+    mw.switch_down_w, mw.switch_down_s, mw.switch_down_b = down;
+    inline for (.{ "shared_gate", "shared_up", "shared_down" }) |p| inline for (.{ "_w", "_s", "_b" }) |k| {
+        @field(mw, p ++ k) = none;
+    };
+    try bindLinears(&mw, &xfm.config);
+    const x = try attn256RandBf16(rnd, &.{ 1, rows, hidden }, s);
+    defer _ = mlx.mlx_array_free(x);
+    var ids: [16]u32 = undefined;
+    var probs: [16]u16 = undefined;
+    for (0..@intCast(rows)) |r| {
+        ids[2 * r] = @intCast(r % 4);
+        ids[2 * r + 1] = @intCast((r + 2) % 4);
+        probs[2 * r] = 0x3f00;
+        probs[2 * r + 1] = 0x3e80;
+    }
+    const inds = mlx.mlx_array_new_data(&ids, &.{ 1, rows, 2 }, 3, .uint32);
+    defer _ = mlx.mlx_array_free(inds);
+    const scores = mlx.mlx_array_new_data(&probs, &.{ 1, rows, 2 }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(scores);
+
+    const probed = try xfm.moeMLP2WithRouter(x, x, &mw, null, false, null, .{ .inds = inds, .norm_scores = scores });
+    defer _ = mlx.mlx_array_free(probed);
+    bindSwitchParams(&mw, &xfm.config);
+    const qps = mw.switch_qp.?;
+    for (qps) |qp| try testing.expectEqual(QuantParams{ .bits = bits, .group_size = group, .mode = .affine }, qp);
+    const bound = try xfm.moeMLP2WithRouter(x, x, &mw, null, false, null, .{ .inds = inds, .norm_scores = scores });
+    defer _ = mlx.mlx_array_free(bound);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, probed, bound, false, s));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try testing.expect(same);
+}
+
+test "routed bank parameters solved at load give the bytes of the per-call solve, and the same parameters" {
+    if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    for ([_][2]u32{ .{ 4, 64 }, .{ 8, 64 }, .{ 4, 32 } }) |p| for ([_]c_int{ 1, 3, 8 }) |rows| try routedParamsCase(p[0], p[1], rows);
 }

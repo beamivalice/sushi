@@ -764,9 +764,17 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
   handed in, and the geometry follows that; any other case reads the shapes as before). Bytes are unchanged. Shape,
   size and dtype queries (`mlx.query_count`) of a decode tick through `forwardQwen4With`, `qwen4_query_count_test.zig`,
   commit `73aab248`, ReleaseFast, M5 Max, ticks 3 to 6 after a 23-token prompt: STQ-2.75bpw 10690 -> 9290 (10980 -> 9580 on the QSA tick), 4bpw 12265 -> 10868. One layer's fold call
-  drops from 49-91 queries to 16-51 (`qwen4_shared.zig`); the one-bank layers (4bpw, 2bpw) still read the routed bank's
-  four shapes and validate its projections per call. The pack counts vary by a few dozen between processes (the
+  drops from 49-91 queries to 16-51 (`qwen4_shared.zig`); the next bullet binds the one-bank layers' routed bank (4bpw, 2bpw)
+  too. The pack counts vary by a few dozen between processes (the
   quantization-parameter cache hashes pointers), so the test pins them within 40.
+
+- **The routed bank and the hyper-connection gate are bound at load too.** `layer_weights.bindSwitchParams` stores the
+  routed bank's solved `QuantParams` (`MoeMlpWeights.switch_qp`), which `trunk.moeMLP2WithRouter` used to probe per
+  layer per call; `bindSharedGeometry` stores the one-bank layer's `fold_gated.BankShape`, which the fold read and
+  validated per call; `bindHcLinears` solves the hc banks so `qwen4_hc.fusedQuant` reads them with no query. Bytes are
+  unchanged and the gate decides as before (`qwen4_hc_gate_test.zig`: 100 reads fused at 8/64 on both packs). Same
+  method, over `1740116e`: STQ-2.75bpw 9290 -> 9083 (9580 -> 9373 on the QSA tick), 4bpw 10868 -> 9083; a one-bank
+  fold call drops from 49-51 queries to 16-18.
 
 <a id="shared-fold-trellis"></a>
 ## Flash-Next: a trellis shared expert rides the routed launches too

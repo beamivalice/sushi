@@ -4067,9 +4067,11 @@ pub const Trunk = struct {
         // (and, with non-affine modes, group size + mode) per weight — resolve
         // each individually. gate/up consume the hidden dim; down consumes the
         // expert intermediate dim.
-        const gate_qp = self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x));
-        const up_qp = self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x));
-        const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
+        const gate_qp, const up_qp, const down_qp = mw.switch_qp orelse .{
+            self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x)),
+            self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x)),
+            self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null),
+        };
 
         const router_logits = if (routing_override != null)
             mlx.mlx_array{ .ctx = null }

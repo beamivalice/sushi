@@ -6,7 +6,8 @@ const exl3 = @import("sushi_exl3");
 const trunk_mod = @import("../trunk.zig");
 const model_mod = @import("../model.zig");
 const dsv41_model = @import("dsv41_model.zig");
-const Scope = @import("dsv41_scope.zig").Scope;
+const scope_mod = @import("dsv41_scope.zig");
+const Scope = scope_mod.Scope;
 const Transformer = trunk_mod.Transformer;
 const testing = std.testing;
 
@@ -57,8 +58,9 @@ test "dsv41 queries: a trellis trunk linear and a grouped one (DSV41_STQ_TINY)" 
             got[i] = mlx.query_count - before;
         }
     }
-    // A plain decode launches in the non-exact mode, whose geometry `linear.Geo` (exact) does not hold, so no call is bound.
-    try testing.expectEqual([4]u64{ 22, 22, 19, 19 }, got);
+    // A plain decode's one-bank launch is bound at load (`Stq.geo`, non-exact); the exact five rows and the grouped
+    // bank read their shapes.
+    try testing.expectEqual([4]u64{ 7, 22, 19, 19 }, got);
 }
 
 test "dsv41 queries: an mxfp8 trunk linear reads nothing off its weight (DSV41_TINY)" {
@@ -107,9 +109,71 @@ test "dsv41 queries: the shared expert riding the routed chain (DSV41_STQ_TINY)"
             got[i] = mlx.query_count - before;
         }
     }
-    // The whole chain of a layer: the routed picks with the shared expert riding its launches. Six of these are
-    // the shared bank's three shapes, read by `rate_groups.sharedRate` on every call.
-    try testing.expectEqual([2]u64{ 18, 18 }, got);
+    // The whole chain of a layer: the routed picks with the shared expert riding its launches, whose lane shapes the
+    // layer read at load.
+    try testing.expectEqual([2]u64{ 12, 12 }, got);
+}
+
+fn sameBits(a: mlx.mlx_array, b: mlx.mlx_array, sc: *Scope) !void {
+    const ha = try scope_mod.hostF32(try sc.astype(a, .float32));
+    const hb = try scope_mod.hostF32(try sc.astype(b, .float32));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(hb), std.mem.sliceAsBytes(ha));
+}
+
+test "dsv41 stq: a one-bank trunk linear's launches bound at load give the shape-reading launch's bytes (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const m = try dsv41_model.tinyModel(try stqDir(), .{ .act = .bfloat16, .experts = false }, mlx.gpuStream());
+    defer m.deinit();
+    const ly = &m.layers[0];
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    for ([_]dsv41_model.Stq{ ly.wq_a.stq.?, ly.wq_b.stq.?, ly.shared[2].stq.? }) |q| {
+        try testing.expect(q.geo != null);
+        var bare = q;
+        bare.geo = null;
+        const in = mlx.getShape(q.p.trellis)[1] * 16;
+        for ([_]bool{ false, true }) |exact| for (1..10) |rows| {
+            sc.rows = .{ .exact = exact };
+            const x = try activations(&sc, &.{ @intCast(rows), in });
+            try sameBits(try q.apply(&sc, x), try bare.apply(&sc, x), &sc);
+        };
+    }
+}
+
+test "dsv41 stq: the shared bank's lane read at load gives the bytes of the lane read per call (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    exl3.rate_groups.prepared_force = true;
+    defer exl3.rate_groups.prepared_force = null;
+    const m = try dsv41_model.tinyModel(try stqDir(), .{ .act = .bfloat16, .experts = false, .dspark = true }, mlx.gpuStream());
+    defer m.deinit();
+    const c = &m.cfg;
+    const li = c.layers;
+    const ly = &m.layers[li];
+    const rb = &m.dspark.?.stq[0];
+    const lane = ly.shared_lane orelse return error.TestExpectedLane;
+    const sq = [3]dsv41_model.Stq{ ly.shared[0].stq.?, ly.shared[1].stq.?, ly.shared[2].stq.? };
+    try testing.expectEqual(exl3.rate_groups.SharedLane.read(.{ .gate = sq[0].p, .up = sq[1].p, .down = sq[2].p }, rb), lane);
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const k: c_int = @intCast(ly.top_k);
+    for ([_]c_int{ 1, 2, 3 }) |rows| {
+        const x = try activations(&sc, &.{ rows, @intCast(c.dim) });
+        var ids: [3 * 8]i32 = undefined;
+        var wts: [3 * 8]f32 = undefined;
+        const n: usize = @intCast(rows * k);
+        for (0..n) |j| {
+            ids[j] = @intCast((j * 3) % 4);
+            wts[j] = 0.25 + 0.125 * @as(f32, @floatFromInt(j % 3));
+        }
+        const slots = try sc.ints(ids[0..n], &.{ rows, k });
+        const w = try sc.floats(wts[0..n], &.{ rows, k });
+        const op: dsv41_model.SharedOp = .{ .layer = .{ .m = m, .li = li } };
+        const bound = try dsv41_model.stqRouted(&sc, c.expert_dec.?, @intFromFloat(c.swiglu_limit), rb, x, slots, w, op);
+        m.layers[li].shared_lane = null;
+        const read = try dsv41_model.stqRouted(&sc, c.expert_dec.?, @intFromFloat(c.swiglu_limit), rb, x, slots, w, op);
+        m.layers[li].shared_lane = lane;
+        try sameBits(bound, read, &sc);
+    }
 }
 
 fn forwardIds(xfm: *Transformer, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
@@ -159,7 +223,7 @@ test "dsv41 queries: a decode token (DSV41_TINY, DSV41_STQ_TINY)" {
         const got = (try decodeTokens(env)) orelse continue;
         ran = true;
         // The two counts alternate with the compressed-attention cycle.
-        const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1169, 1218, 1169, 1218, 1169, 1218 } else .{ 2703, 2774, 2703, 2774, 2703, 2774 };
+        const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1169, 1218, 1169, 1218, 1169, 1218 } else .{ 2373, 2429, 2373, 2429, 2373, 2429 };
         try testing.expectEqual(want, got);
     }
     if (!ran) return error.SkipZigTest;

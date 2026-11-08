@@ -11,6 +11,7 @@ pub const tests = .{
     @import("qwen4_fixture_test.zig"),
     @import("qwen4_trunk_stq_test.zig"),
     @import("qwen4_query_count_test.zig"),
+    @import("qwen4_hc_gate_test.zig"),
     @import("qwen4_hc.zig"),
     @import("gdn_decode.zig"),
     @import("qwen4_qsa.zig"),

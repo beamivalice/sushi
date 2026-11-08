@@ -29,11 +29,20 @@ pub const Affine = struct {
 
     /// The bank's (bits, group size, mode), solved on the first call from the activation `x` it is applied to.
     pub fn params(self: *const Affine, ctx: Ctx, x: mlx.mlx_array) layer_weights.QuantParams {
+        return self.solvedParams() orelse self.solve(ctx.config, mlx_util.lastDim(x));
+    }
+
+    /// The parameters for an activation `in_dim` wide, solved now unless a projection already did.
+    pub fn solve(self: *const Affine, config: *const ModelConfig, in_dim: ?u32) layer_weights.QuantParams {
+        if (self.solvedParams()) |qp| return qp;
+        const qp = layer_weights.computeQuantParams(config, self.w, self.s, in_dim);
+        self.solved.* = .{ .bits = qp.bits, .group = qp.group_size, .mode = qp.mode };
+        return qp;
+    }
+
+    pub fn solvedParams(self: *const Affine) ?layer_weights.QuantParams {
         const cell = self.solved;
-        if (cell.bits == 0) {
-            const qp = layer_weights.computeQuantParams(ctx.config, self.w, self.s, mlx_util.lastDim(x));
-            cell.* = .{ .bits = qp.bits, .group = qp.group_size, .mode = qp.mode };
-        }
+        if (cell.bits == 0) return null;
         return .{ .bits = cell.bits, .group_size = cell.group, .mode = cell.mode };
     }
 };

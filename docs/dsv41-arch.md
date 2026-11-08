@@ -818,28 +818,26 @@ the tiny pack the test covers the rounds before the first tie.
 
 <a id="host-queries"></a>
 **Host queries a decode token** (`mlx.query_count`: shape, size and dtype reads, each an FFI call; test builds only;
-`dsv41_query_count_test.zig`, 0d621106 on the tiny fixtures, ReleaseFast, one decode row, every expert resident):
+`dsv41_query_count_test.zig`, ReleaseFast on the tiny fixtures, one decode row, every expert resident; 0d621106, and
+the bound counts on the l-qwen4b tree over `3d4b4277`):
 
-| path | queries |
-|---|---|
-| a token, `DSV41_TINY` (mxfp8 trunk, FP4 experts, 8 layers) | 1169 / 1218, alternating |
-| a token, `DSV41_STQ_TINY` (trellis trunk, 8 layers) | 2703 / 2774, alternating |
-| mxfp8 trunk linear (`Lin.apply`) | 0 |
-| trellis trunk linear (`Stq.apply`), 1 row (plain decode) / 5 rows (verify, exact mode) | 22 / 22 |
-| grouped trellis `wo_a` (`applyGrouped`), 1 / 5 rows | 19 / 19 |
-| one layer's routed chain with the shared expert riding it (`stqRouted`, `rate_groups` forced to DeepSeek's prepared geometry) | 18 |
+| path | 0d621106 | bound |
+|---|---|---|
+| a token, `DSV41_TINY` (mxfp8 trunk, FP4 experts, 8 layers) | 1169 / 1218, alternating | 1169 / 1218 |
+| a token, `DSV41_STQ_TINY` (trellis trunk, 8 layers) | 2703 / 2774, alternating | 2373 / 2429 |
+| mxfp8 trunk linear (`Lin.apply`) | 0 | 0 |
+| trellis trunk linear (`Stq.apply`), 1 row (plain decode) / 5 rows (verify, exact mode) | 22 / 22 | 7 / 22 |
+| grouped trellis `wo_a` (`applyGrouped`), 1 / 5 rows | 19 / 19 | 19 / 19 |
+| one layer's routed chain with the shared expert riding it (`stqRouted`, `rate_groups` forced to DeepSeek's prepared geometry) | 18 | 12 |
 
-- The mxfp8 trunk reads nothing off its weight: `Lin` is the kind and `mlx_quantized_matmul` takes its constants. A
-  trellis linear re-reads its operands' shapes on every call (`linearWith`, `projectRows`): 23 calls and 506 of the 2703
-  queries in a token (a one-off count).
-- The shared chain (`moeDecodeClampedSharedFusedKeep`) re-reads the shared bank's three trellis shapes in `sharedRate`
-  on every call; `rb.hidden` and `rb.inter` are stored.
-- Not bound. `linear.Geo` holds the launch geometry of the exact mode (`project_rows.Mode.exact`), and a plain decode and
-  prefill here run the non-exact mode (`Model.rows`; only `verify` sets `exact`), whose one-row launch is the SIMD arm, not NAX.
-  A `Geo` bound in the exact mode would change the bytes there; only a verify's exact rows could take one today. The module now has both pieces: `Geo.get(trellis, bounds, mode)` binds the non-exact
-  one-row launch, and `rate_groups.SharedLane.read` / `SharedExpert.lane` keep the shared bank's shapes from load. DeepSeek's `Stq.apply` and
-  shared-expert chain adopt them in a few lines each, with byte tests. At 43 layers the whole of it is a few thousand queries a token,
-  an estimate of tens of microseconds against a GPU-bound token ([engine-kernels](engine-kernels.md)).
+- The mxfp8 trunk reads nothing off its weight: `Lin` is the kind and `mlx_quantized_matmul` takes its constants.
+- A one-bank trellis linear holds `Stq.geo` (`linear.Geo.get(trellis, null, .{})`, the non-exact mode a plain decode
+  and prefill run) and launches a bf16 input through `linearGeo`; a verify's exact rows, a grouped bank and any other
+  dtype read their operands' shapes per call (`linearWith`, `projectRows`). Bytes are unchanged.
+- A layer holds its trellis shared bank's lane shapes (`Layer.shared_lane`, `rate_groups.SharedLane.of` at load), which
+  `sharedBank` hands the chain; `sharedRate` checks them against `rb.hidden` and `rb.inter`. Bytes are unchanged.
+- At 43 layers what is left is a few thousand queries a token, an estimate of tens of microseconds against a GPU-bound
+  token ([engine-kernels](engine-kernels.md)).
 
 <a id="drop-expert"></a>
 ## Expert drop (`--drop-expert n`)

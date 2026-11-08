@@ -212,6 +212,8 @@ pub fn slabMoeWeights(mw: *const MoeMlpWeights, raw: *const [expert_stream_mod.q
     out.switch_down_w = raw[@backingInt(C.down_w)];
     out.switch_down_s = raw[@backingInt(C.down_s)];
     out.switch_down_b = raw[@backingInt(C.down_b)];
+    out.switch_qp = null;
+    out.routed_shape = null;
     return out;
 }
 
