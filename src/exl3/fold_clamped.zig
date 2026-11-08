@@ -135,7 +135,7 @@ fn stageFor(k: Key, sh: Shared) !*const Built {
     const src = try fuse.source(alloc, p.a, p.b);
     const head = try fuse.header(alloc, p.a, p.b);
     var name: std.ArrayList(u8) = .empty;
-    try name.print(alloc, "sushi_glm_fold_{s}_{s}_w{d}", .{ @tagName(k.stage), @tagName(k.dec.codebook), k.dec.window.bits() });
+    try name.print(alloc, "sushi_clamped_fold_{s}_{s}_w{d}", .{ @tagName(k.stage), @tagName(k.dec.codebook), k.dec.window.bits() });
     if (k.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[k.dec.table.?].digest});
     try name.print(alloc, "_a{d}", .{k.bits});
     if (k.rows > 1) try name.print(alloc, "_rows{s}", .{if (k.rows == 3) "3" else "2"});

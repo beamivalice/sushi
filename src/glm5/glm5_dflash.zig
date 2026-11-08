@@ -8,6 +8,59 @@ const policy = @import("../dflash_policy.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 
+/// Fewest rows a round verifies: a round with no draft is not a DFlash round.
+pub const MIN_ROWS: u32 = 2;
+/// The widest tree a round verifies (`glm5_attention_decode_batch.max_tail`).
+pub const MAX_ROWS: u32 = 8;
+/// The widest tree a round drafts unless the flags ask otherwise; the ladder and the calibrated confidences decide
+/// how much of it a round uses.
+pub const USEFUL_ROWS: u32 = 8;
+
+/// The rows a round may verify, from the flags or the defaults; the verify path bounds them.
+pub fn rowBounds(min: ?u32, max: ?u32) error{DrafterDepthUnsupported}!draft.RowBounds {
+    const hi = max orelse MAX_ROWS;
+    const lo = min orelse MIN_ROWS;
+    if (hi > MAX_ROWS or lo < MIN_ROWS or lo > hi) return error.DrafterDepthUnsupported;
+    return .{ .min = lo, .max = hi };
+}
+
+/// GLM-5.3-Flash-Sushi-2.4bpw on an M5 Max, ms of a round by verify rows: the verify of one chain, the mean of 1K and
+/// 8K history (33-35, 38-41, 45-48, 54-59, 61-68, 76-86, 79-91 ms at 2..8 rows), plus about 7.4 ms of draft, replay
+/// and commit; one row is the plain tick, 30 ms. Past eight rows the cost grows 13 ms a row.
+pub fn ladder() policy.Costs {
+    var out: policy.Costs = undefined;
+    const ms = [_]f32{ 0, 30, 41.3, 46.9, 53.6, 63.6, 72.0, 88.1, 92.6 };
+    for (0..policy.MAX_ROWS + 1) |r| out[r] = if (r < ms.len) ms[r] else ms[ms.len - 1] + 13 * @as(f32, @floatFromInt(r - ms.len + 1));
+    return out;
+}
+
+test "GLM rows default to 2..8 and the flags move either end inside them" {
+    try std.testing.expectEqual(draft.RowBounds{ .min = 2, .max = 8 }, try rowBounds(null, null));
+    try std.testing.expectEqual(draft.RowBounds{ .min = 2, .max = 4 }, try rowBounds(null, 4));
+    try std.testing.expectEqual(draft.RowBounds{ .min = 3, .max = 8 }, try rowBounds(3, null));
+    try std.testing.expectEqual(draft.RowBounds{ .min = 5, .max = 5 }, try rowBounds(5, 5));
+    try std.testing.expectError(error.DrafterDepthUnsupported, rowBounds(null, 9));
+    try std.testing.expectError(error.DrafterDepthUnsupported, rowBounds(4, 3));
+    try std.testing.expectError(error.DrafterDepthUnsupported, rowBounds(1, null));
+}
+
+test "GLM ladder: certain drafts take four rows or more, weak ones two, and the cost never falls" {
+    const costs = ladder();
+    var r: u32 = 2;
+    while (r <= policy.MAX_ROWS) : (r += 1) try std.testing.expect(costs[r] > costs[r - 1]);
+    var calib = policy.Calibration{};
+    var guess: f32 = 0;
+    while (guess < 1) : (guess += 0.01) for (0..40) |_| calib.observe(guess, true);
+    const sure_parents = [_]i32{ -1, 0, 1, 2, 3, 4, 5 };
+    const sure_conf: [7]f32 = @splat(0.99);
+    try std.testing.expect(policy.pickTreeRows(&calib, &sure_parents, &sure_conf, 2, 8, &costs) >= 4);
+    const fresh = policy.Calibration{};
+    try std.testing.expectEqual(@as(u32, 2), policy.pickTreeRows(&fresh, &.{ -1, 0, 1 }, &[_]f32{ 0.5, 0.4, 0.3 }, 2, 8, &costs));
+    // Two rows cost nearly what three do, so a middling draft pair still takes the third row.
+    try std.testing.expectEqual(@as(u32, 3), policy.pickTreeRows(&fresh, &.{ -1, 0 }, &[_]f32{ 0.85, 0.8 }, 2, 8, &costs));
+    try std.testing.expectEqual(@as(u32, 3), policy.pickTreeRows(&calib, &sure_parents, &sure_conf, 3, 3, &costs));
+}
+
 test "GLM DFlash request fork keeps rejected pool and recurrence state isolated" {
     var source = try forward.Request.init(std.testing.allocator, 1);
     defer source.deinit();

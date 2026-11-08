@@ -29,7 +29,7 @@ pub const HEADER: [:0]const u8 =
     \\#include <metal_stdlib>
     \\using namespace metal;
     \\template <int K, int GS, int FST, int RPS>
-    \\inline void qwen_qmv_rows(const device uint8_t* w, const device bfloat16_t* sc, const device bfloat16_t* bi, const device bfloat16_t* x, uint lane, thread float* result) {
+    \\inline void qmv_rows(const device uint8_t* w, const device bfloat16_t* sc, const device bfloat16_t* bi, const device bfloat16_t* x, uint lane, thread float* result) {
     \\  constexpr int VPT = FST != 0 ? 8 : 4;
     \\  constexpr int BLOCK = VPT * 32;
     \\  constexpr int GROUPS = K / GS;
@@ -87,7 +87,7 @@ const GATE_UP_OPEN: [:0]const u8 =
 
 const LOGIT_CALC: [:0]const u8 =
     \\float result[1] = {0.0f};
-    \\qwen_qmv_rows<K, LGS, 0, 1>((const device uint8_t*)lw, ls, lb, xr, lane, result);
+    \\qmv_rows<K, LGS, 0, 1>((const device uint8_t*)lw, ls, lb, xr, lane, result);
     \\const float v = simd_sum(result[0]);
     \\if (lane == 0) gl[row] = bfloat16_t(v);
     \\
@@ -107,7 +107,7 @@ const GATE_UP_BLOCK: [:0]const u8 =
     \\  const device bfloat16_t* sp = which == 0 ? sg : su;
     \\  const device bfloat16_t* bp = which == 0 ? bg : bu;
     \\  float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\  qwen_qmv_rows<K, GS, FAST, 4>(wp + size_t(r0) * K, sp + r0 * (K / GS), bp + r0 * (K / GS), xr, lane, result);
+    \\  qmv_rows<K, GS, FAST, 4>(wp + size_t(r0) * K, sp + r0 * (K / GS), bp + r0 * (K / GS), xr, lane, result);
     \\  threadgroup float parts[16];
     \\  for (int r = 0; r < 4; ++r) {
     \\    const float v = simd_sum(result[r]);
@@ -132,7 +132,7 @@ const DOWN: [:0]const u8 =
     \\const int row = int(threadgroup_position_in_grid.y);
     \\const int r0 = int(threadgroup_position_in_grid.x) * 16 + int(simdgroup_index_in_threadgroup) * 4;
     \\float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\qwen_qmv_rows<K, GS, FAST, 4>((const device uint8_t*)w + size_t(r0) * K, sc + r0 * (K / GS), bi + r0 * (K / GS), x + size_t(row) * K, lane, result);
+    \\qmv_rows<K, GS, FAST, 4>((const device uint8_t*)w + size_t(r0) * K, sc + r0 * (K / GS), bi + r0 * (K / GS), x + size_t(row) * K, lane, result);
     \\for (int r = 0; r < 4; ++r) {
     \\  const float v = simd_sum(result[r]);
     \\  if (lane == 0) y[row * N + r0 + r] = bfloat16_t(v);

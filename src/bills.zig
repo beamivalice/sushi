@@ -1341,11 +1341,7 @@ pub fn defaultPrefixCacheAsk(requested: u64, explicit: bool, session: u64) u64 {
     return @max(requested, session);
 }
 
-/// GLM's unnamed RAM tier: the last few turns, given back to a long prefill by admission.
-/// Long reuse belongs on the SSD tier (`--prefix-cache-disk`).
-pub const GLM_PREFIX_CACHE_MEM_DEFAULT: u64 = 1 << 30;
-
-/// `defaultPrefixCacheAsk`, with GLM's unnamed ask pinned at `GLM_PREFIX_CACHE_MEM_DEFAULT`.
+/// `defaultPrefixCacheAsk`, unless the arch pins its own unnamed ask (`unnamedCacheAsk`).
 pub fn defaultPrefixCacheAskFor(config: *const model_mod.ModelConfig, requested: u64, explicit: bool, session: u64) u64 {
     if (archHook("unnamedCacheAsk", u64, config, .{ requested, explicit })) |ask| return ask;
     return defaultPrefixCacheAsk(requested, explicit, session);
@@ -1991,15 +1987,6 @@ pub fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) 
 pub fn dflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u64 {
     if (!config.dflash_loaded or config.isGlm5()) return 0;
     return config.dflash_window_bytes *| 4 +| config.dflash_capture_bytes_per_token *| chunk +| 64 * 1024 * 1024;
-}
-
-/// What a GLM DFlash2 request may still allocate when it reserves its verifier capacity right after
-/// prefill: its admission bill at the narrowest width (no width bills less) less what it holds.
-pub fn glmDflashReserveBudget(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, held: u64) u64 {
-    // `max_tokens` is already clamped to admission's context; the caller's config copy is not pinned to it.
-    var sized = config.*;
-    sized.pinned_context = @intCast(@min(seq +| max_tokens, std.math.maxInt(u32)));
-    return prefillNeededAtChunk(&sized, seq, max_tokens, kv_bits, 1, .{}) -| held;
 }
 
 /// The per-request terms of the admission bill, in one place.
@@ -4986,7 +4973,6 @@ test "resolvedPrefixCacheMem: RAM-off bills zero despite a configured disk tier"
 
 test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
-    if (!archBuilt("glm5")) return error.SkipZigTest;
     const saved_capacity = launch_state.prefix_cache_capacity;
     const saved_ask = launch_state.prefix_cache_mem_bytes;
     defer launch_state.prefix_cache_capacity = saved_capacity;
@@ -5018,13 +5004,6 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(launch_state.prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(launch_state.prefix_cache_mem_bytes, legacyPrefixCacheAsk(&other));
-    // GLM's context is sized with no cache reserve (its admission evicts); its unnamed ask is
-    // its 1 GiB tier and a named one stands.
-    const glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&glm));
-    try testing.expectEqual(GLM_PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAskFor(&glm, launch_state.PREFIX_CACHE_MEM_DEFAULT, false, 8 << 30));
-    try testing.expectEqual(launch_state.PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAskFor(&glm, launch_state.PREFIX_CACHE_MEM_DEFAULT, true, 8 << 30));
-    try testing.expectEqual(@as(u64, 6 << 30), defaultPrefixCacheAskFor(&glm, 6 << 30, true, 8 << 30));
     try testing.expectEqual(@as(u64, 8 << 30), defaultPrefixCacheAskFor(&other, launch_state.PREFIX_CACHE_MEM_DEFAULT, false, 8 << 30));
     // `--prefix-cache-mem off --prefix-cache-disk 12GB` keeps no idle RAM.
     const saved_disk = launch_state.prefix_cache_disk_bytes;

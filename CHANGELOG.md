@@ -11,7 +11,7 @@ earlier history is mlx-serve's, in that project's changelog.
   every model's output unchanged.
 - **The "architecture not supported" and "file format not supported" load refusals list every architecture this build
   serves**: the first now also names DeepSeek-V4.1-Flash, the second no longer stops at Qwen and MiMo.
-- **The `sushi_exl3` module names no architecture**: its files and public names now say what they do, and its per-call modes are parameters instead of process globals, with
+- **The `sushi_exl3` module names no architecture**: its files, public names and Metal kernel names now say what they do, and its per-call modes are parameters instead of process globals, with
   output unchanged.
 - **The deprecated `sushi_exl3` aliases are removed**: `glm_group2`, `glm_fold`, `qwen_riders`, `qwen_fold`,
   `glm_prefill_grid`, `rate_groups.qwenFoldedCount`, `qwenLaunchCount` and `Codebook.servesGlmFastPaths` are gone, so a

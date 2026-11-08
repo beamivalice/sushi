@@ -7,6 +7,7 @@ const model_mod = @import("../model.zig");
 const mtp_lookup = @import("../mtp_lookup.zig");
 const round_cost = @import("../round_cost.zig");
 const dflash_policy = @import("../dflash_policy.zig");
+const dflash_native = @import("glm5_dflash.zig");
 const logit_bias = @import("../logit_bias.zig");
 const Trunk = trunk_mod.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -134,7 +135,7 @@ pub fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, a
     const kv = ctx.cache.config;
     const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const held = request.residentBytes() +| assistant.cache.residentBytes();
-    const budget = @import("../server.zig").glmDflashReserveBudget(config, request.offset, max_tokens, kv_bits, held);
+    const budget = @import("glm5_bill.zig").dflashReserveBudget(config, request.offset, max_tokens, kv_bits, held);
     _ = try @import("glm5_dflash_reserve.zig").reserve(request, request.offset + max_tokens + 3, budget, s);
 }
 
@@ -292,9 +293,9 @@ pub fn glmRoundReady(self: *Generator) !bool {
 
 /// This request's round draft: as many rows as the policy finds worth their verify, within the flags' bounds.
 pub fn glmProposeRound(self: *Generator) !@import("glm5_dflash.zig").Proposal {
-    const costs = dflash_policy.glmLadder();
-    const min = dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS;
-    return @import("glm5_dflash.zig").proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, glm5_state.modelOf(self.xfm).?, glm5_state.requestOf(&self.ctx).?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_policy.GLM_USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
+    const costs = dflash_native.ladder();
+    const min = dflash_mod.drafter_min_depth orelse dflash_native.MIN_ROWS;
+    return dflash_native.proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, glm5_state.modelOf(self.xfm).?, glm5_state.requestOf(&self.ctx).?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_native.USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
 }
 
 /// This request's round draft of at most `max_nodes` nodes.

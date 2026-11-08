@@ -108,11 +108,11 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
   `UnsupportedGlmDraftStorage`). A4 g64 is the first-load default (774.5 MB vs A6's 1013.1 MB; drafts ~11% faster, decode within drift, target
   output exact); an A6 cache from the earlier policy is regenerated.
 - **Rows**: a round verifies 2..8 rows (root plus draft nodes), chosen by `dflash_policy.zig` (`chooseTreeRows`) from the
-  assistant's own probabilities under GLM's measured cost ladder (`glmLadder`); `--drafter-min-depth` /
+  assistant's own probabilities under GLM's measured cost ladder (`glm5_dflash.ladder`); `--drafter-min-depth` /
   `--drafter-max-depth` bound the choice and equal values pin it. A draft node adds the probability that the accepted
   path runs through it (siblings exclude each other), calibrated online per confidence bin (`Calibration.observeTree`).
   The verify is bit-exact at every width and each row past the second costs 5-10 ms ([ladder](glm5-perf.md#glm-eight-row-verify));
-  the assistant drafts no wider than `GLM_USEFUL_ROWS` (8) unless `--drafter-max-depth` says less.
+  the assistant drafts no wider than `glm5_dflash.USEFUL_ROWS` (8) unless `--drafter-max-depth` says less.
 - **Tree**: the assistant's best-first nodes (up to four children per node, `bestFirstNodes`: node n is the n-th likeliest,
   so a round keeps a prefix and renumbers it depth-first); the verifier runs all rows layerwise.
   KDA replays only the accepted path from a prework tape; IndexPool builds branch-local pools from the committed prefix

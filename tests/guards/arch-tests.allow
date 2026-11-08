@@ -34,7 +34,6 @@ GLM serves PAIR1 on the prefill grid with the unfolded sorted chain's bytes
 GLM serves spec1 and std1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included
 GLM serves spec1 and std1 on the prefill grid with the unfolded sorted chain's bytes
 GLM serves std1 on the prefill grid and probes a failing kernel once per codebook and window
-GLM serving DFlash2 trims physical window and preserves absolute append positions
 GLM serving accepts native effort levels and thinks by default
 GLM serving memory bills one latent at the request's KV width and pooled index per token
 GLM serving template receives low high max without a derived reasoning budget
@@ -68,7 +67,6 @@ deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
 deepseek_v41 thinks by default, at its native high effort
 deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check
-dflash: GLM rows default to 2..8 and the flags move either end inside them
 dflash: Qwen rows default to 2..block and are bounded by the drafter block and the verify path
 driver: a tiny Qwen source becomes a complete pack, and a second run into it is refused
 dsv41 geometry: the grouped chain at 5120x2304 over n24, n26, n32, n40 and a mixed class holds the f32-truth bar
@@ -115,7 +113,6 @@ fp8 block direct GEMV keeps each row's one-row arithmetic up to 8 rows at MiMo's
 fusedSdpaPrefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64-row tile)
 fusedSdpaPrefill: qk 192 / v 128 causal parity vs fp32 truth (MiMo global geometry)
 glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 tokenizer.json, real template)
-glmLadder: certain drafts take four rows or more, weak ones two, and the cost never falls
 grok config.toml for GLM: chat completions at the server, advertised budgets, only accepted efforts
 kld: --qwen-gdn 16 stores the GDN state in bf16, 32 is the default width
 kv6 is a first-class wire value: parsed, named and served by GLM's latent backend

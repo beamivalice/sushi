@@ -58,7 +58,7 @@ pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
 - **Checkpoint state is copied bit for bit** (`bitsOwnedCopy`: an integer view plus an integer zero).
   `materializedOwnedCopy` adds a float zero, which turns -0.0 into +0.0, and the restored KDA state carried that
   into the next chunk.
-- **The RAM tier is opt-in; named without a size it is 1 GiB** (`GLM_PREFIX_CACHE_MEM_DEFAULT`, reachable only below
+- **The RAM tier is opt-in; named without a size it is 1 GiB** (`glm5_bill.PREFIX_CACHE_MEM_DEFAULT`, reachable only below
   the CLI, which always names a size). The advertised context reserves nothing for it: admission evicts it to admit a
   long prefill.
   - At kv8 it keeps a 30K session at its prompt end with 5 of 8 checkpoints, a 60K one with 4, and trims a 140K one

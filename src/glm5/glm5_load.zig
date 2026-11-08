@@ -103,15 +103,15 @@ pub fn bindDflash(allocator: std.mem.Allocator, xfm: *Trunk, d: *dflash_mod.Dfla
 }
 
 pub fn dflashRowBounds(min: ?u32, max: ?u32) !?u32 {
-    const bounds = dflash_mod.glmRowBounds(min, max) catch |err| {
-        log.err("--drafter-min-depth/--drafter-max-depth: GLM-5.3-Flash verifies {d}..{d} rows per round\n", .{ dflash_mod.GLM_MIN_ROWS, dflash_mod.GLM_MAX_ROWS });
+    const bounds = dflash_native.rowBounds(min, max) catch |err| {
+        log.err("--drafter-min-depth/--drafter-max-depth: GLM-5.3-Flash verifies {d}..{d} rows per round\n", .{ dflash_native.MIN_ROWS, dflash_native.MAX_ROWS });
         return err;
     };
     return bounds.max;
 }
 
 pub fn logDflashReady(block_size: u32) void {
-    log.info("[spec] GLM-5.3-Flash decodes with DFlash2 ({d}..{d} rows per round)\n", .{ dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS, block_size });
+    log.info("[spec] GLM-5.3-Flash decodes with DFlash2 ({d}..{d} rows per round)\n", .{ dflash_mod.drafter_min_depth orelse dflash_native.MIN_ROWS, block_size });
 }
 
 pub fn logLoad(config: *const ModelConfig, kv: trunk_mod.KVQuantConfig, mtp_on: bool, params: anytype) void {

@@ -356,10 +356,6 @@ pub const DRAFTER_DEPTH_MAX: u32 = 16;
 pub const QWEN_MIN_ROWS: u32 = 2;
 /// The widest verify whose rows are decode-tick identical on qwen4 (`mtp.MAX_DEPTH` drafts + t1).
 pub const QWEN_MAX_ROWS: u32 = 9;
-pub const GLM_MIN_ROWS: u32 = 2;
-/// The widest tree a GLM round verifies (`glm5_attention_decode_batch.max_tail`).
-pub const GLM_MAX_ROWS: u32 = 8;
-
 pub fn qwenMinRows() u32 {
     return drafter_min_depth orelse QWEN_MIN_ROWS;
 }
@@ -385,14 +381,6 @@ pub fn qwenRowBounds(min: ?u32, max: ?u32, config_block: u32) error{DrafterDepth
     return .{ .min = lo, .max = hi };
 }
 
-/// GLM-5.3-Flash: the rows a round may verify, from the flags or the defaults; the verify path bounds them.
-pub fn glmRowBounds(min: ?u32, max: ?u32) error{DrafterDepthUnsupported}!RowBounds {
-    const hi = max orelse GLM_MAX_ROWS;
-    const lo = min orelse GLM_MIN_ROWS;
-    if (hi > GLM_MAX_ROWS or lo < GLM_MIN_ROWS or lo > hi) return error.DrafterDepthUnsupported;
-    return .{ .min = lo, .max = hi };
-}
-
 test "dflash: a drafter depth parses an integer in 2..16 and names everything else" {
     try testing.expectEqual(@as(u32, 4), try parseDrafterDepth("4"));
     try testing.expectEqual(@as(u32, 2), try parseDrafterDepth("2"));
@@ -412,16 +400,6 @@ test "dflash: Qwen rows default to 2..block and are bounded by the drafter block
     try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(null, 6, 5));
     try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(5, 3, 8));
     try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(9, null, 8));
-}
-
-test "dflash: GLM rows default to 2..8 and the flags move either end inside them" {
-    try testing.expectEqual(RowBounds{ .min = 2, .max = 8 }, try glmRowBounds(null, null));
-    try testing.expectEqual(RowBounds{ .min = 2, .max = 4 }, try glmRowBounds(null, 4));
-    try testing.expectEqual(RowBounds{ .min = 3, .max = 8 }, try glmRowBounds(3, null));
-    try testing.expectEqual(RowBounds{ .min = 5, .max = 5 }, try glmRowBounds(5, 5));
-    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(null, 9));
-    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(4, 3));
-    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(1, null));
 }
 
 /// Resolve the effective block size: the config's value, capped by what the
@@ -1775,15 +1753,15 @@ pub fn appendContext(
         defer _ = mlx.mlx_array_free(v);
         _ = try ctx.cache.update(@intCast(li), k, v, s, 0);
     }
-    if (model.sliding_serving) try trimGlmServingContext(model, ctx);
+    if (model.sliding_serving) try trimSlidingContext(model, ctx);
 }
 
 /// A sliding-serving assistant is entirely sliding attention. Materialize the
 /// retained window after every prefill chunk, so an old view cannot pin the
 /// complete prompt allocation. Absolute RoPE positions live in base_pos.
-pub fn trimGlmServingContext(model: *const DflashModel, ctx: *DflashCtx) !void {
-    if (model.config.sliding_window < 2) return error.GlmDflashWindowUnsupported;
-    for (model.layers) |layer| if (layer.layer_type != .sliding_attention) return error.GlmDflashWindowUnsupported;
+pub fn trimSlidingContext(model: *const DflashModel, ctx: *DflashCtx) !void {
+    if (model.config.sliding_window < 2) return error.DflashWindowUnsupported;
+    for (model.layers) |layer| if (layer.layer_type != .sliding_attention) return error.DflashWindowUnsupported;
     const keep = @as(usize, model.config.sliding_window) - 1;
     if (ctx.cache.step <= keep) return;
     const drop = ctx.cache.step - keep;
@@ -3482,7 +3460,7 @@ test "GLM assistant cached sliding mask equals the mask built at any absolute po
     };
 }
 
-test "GLM serving DFlash2 trims physical window and preserves absolute append positions" {
+test "sliding-serving DFlash2 trims physical window and preserves absolute append positions" {
     try mlx.requireGpu();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -3502,7 +3480,7 @@ test "GLM serving DFlash2 trims physical window and preserves absolute append po
     const raw = try ops.own(mlx.mlx_array_new_data(&values, &[_]c_int{ 1, 2, 10, 4 }, 4, .float32));
     const keys = try ops.cast(raw, .bfloat16);
     _ = try ctx.cache.update(0, keys, keys, s, 0);
-    try trimGlmServingContext(&model, &ctx);
+    try trimSlidingContext(&model, &ctx);
     try std.testing.expectEqual(@as(usize, 10), ctx.absLen());
     try std.testing.expectEqual(@as(usize, 3), ctx.base_pos);
     try std.testing.expectEqual(@as(u64, 224), ctx.cache.residentBytes());
@@ -3513,7 +3491,7 @@ test "GLM serving DFlash2 trims physical window and preserves absolute append po
     try std.testing.expectEqual(@as(f32, 52), mlx.mlx_array_data_float32(view).?[28]);
     const next = try ops.slice(keys, 2, 0, 1);
     _ = try ctx.cache.update(0, next, next, s, 0);
-    try trimGlmServingContext(&model, &ctx);
+    try trimSlidingContext(&model, &ctx);
     try std.testing.expectEqual(@as(usize, 11), ctx.absLen());
     try std.testing.expectEqual(@as(usize, 4), ctx.base_pos);
     try std.testing.expectEqual(@as(u64, 224), ctx.cache.residentBytes());

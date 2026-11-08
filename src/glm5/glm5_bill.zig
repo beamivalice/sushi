@@ -184,10 +184,32 @@ pub fn cacheReserve(config: *const model_mod.ModelConfig) ?u64 {
     return 0;
 }
 
+/// GLM's unnamed RAM tier: the last few turns, given back to a long prefill by admission.
+/// Long reuse belongs on the SSD tier (`--prefix-cache-disk`).
+pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 1 << 30;
+
 pub fn unnamedCacheAsk(config: *const model_mod.ModelConfig, requested: u64, explicit: bool) ?u64 {
     _ = config;
-    if (!explicit and requested == bills.launch_state.PREFIX_CACHE_MEM_DEFAULT) return bills.GLM_PREFIX_CACHE_MEM_DEFAULT;
+    if (!explicit and requested == bills.launch_state.PREFIX_CACHE_MEM_DEFAULT) return PREFIX_CACHE_MEM_DEFAULT;
     return null;
+}
+
+/// What a DFlash2 request may still allocate when it reserves its verifier capacity right after
+/// prefill: its admission bill at the narrowest width (no width bills less) less what it holds.
+pub fn dflashReserveBudget(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, held: u64) u64 {
+    // `max_tokens` is already clamped to admission's context; the caller's config copy is not pinned to it.
+    var sized = config.*;
+    sized.pinned_context = @intCast(@min(seq +| max_tokens, std.math.maxInt(u32)));
+    return bills.prefillNeededAtChunk(&sized, seq, max_tokens, kv_bits, 1, .{}) -| held;
+}
+
+test "GLM sizes its context with no cache reserve; its unnamed ask is its 1 GiB tier and a named one stands" {
+    var glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/glm5_config.json"));
+    defer glm.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 0), bills.ctxSizingCacheReserve(&glm));
+    try std.testing.expectEqual(PREFIX_CACHE_MEM_DEFAULT, bills.defaultPrefixCacheAskFor(&glm, bills.launch_state.PREFIX_CACHE_MEM_DEFAULT, false, 8 << 30));
+    try std.testing.expectEqual(bills.launch_state.PREFIX_CACHE_MEM_DEFAULT, bills.defaultPrefixCacheAskFor(&glm, bills.launch_state.PREFIX_CACHE_MEM_DEFAULT, true, 8 << 30));
+    try std.testing.expectEqual(@as(u64, 6 << 30), bills.defaultPrefixCacheAskFor(&glm, 6 << 30, true, 8 << 30));
 }
 
 
@@ -410,7 +432,7 @@ test "bill pin: the GLM terms" {
                 for (bills.pin_bits) |b| {
                     g.add(glm5TransientBytes(c, 5000, 2048, b));
                     g.add(glmCacheBytes(c, 5000, 4096, b));
-                    g.add(bills.glmDflashReserveBudget(c, 5000, 4096, b, 1 << 20));
+                    g.add(dflashReserveBudget(c, 5000, 4096, b, 1 << 20));
                 }
             }
         }

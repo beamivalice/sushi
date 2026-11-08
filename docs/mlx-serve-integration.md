@@ -118,6 +118,23 @@ names are those of 1.5.1 and earlier; 1.6.0 keeps no alias for them, so a host r
 | `rate_groups.qwenFoldedCount`, `qwenLaunchCount` | `rate_groups.foldedCount`, `foldLaunchCount` |
 | `format.Codebook.servesGlmFastPaths` | `format.Codebook.servesLaneFastPaths` |
 
+**Kernel names.** The Metal kernels the unit builds name no architecture either. A kernel name is an in-process MLX
+JIT key and nothing persists it (no cache file, no pipeline archive, no log line a doc or test quotes), so a host that
+re-vendors changes nothing but the strings. 1.6.0 names:
+
+| 1.5.1 kernel name | name now |
+|---|---|
+| `sushi_glm_lane_prepare`, `sushi_glm_lane_unsorted`, `sushi_glm_lane_pair`, `sushi_glm_lane_pair_one` | `sushi_lane_prepare`, `sushi_lane_unsorted`, `sushi_lane_pair`, `sushi_lane_pair_one` |
+| `sushi_glm_down_lane_coop`, `sushi_glm_down_lane_prepare`, `sushi_glm_down_one` | `sushi_down_lane_coop`, `sushi_down_lane_prepare`, `sushi_down_one` |
+| `sushi_glm_prefill_grid_transpose` (+ codebook and window suffix) | `sushi_prefill_grid_transpose` |
+| `sushi_glm_exl3_group2`, `..._group2_tile2_lane`, `..._group3_tile2_lane`, `..._pair_group2`, `..._pair_group2_tile2_lane`, `..._pair_group3_tile2_lane` | `sushi_exl3_group2`, `sushi_exl3_group2_tile2_lane`, `sushi_exl3_group3_tile2_lane`, `sushi_exl3_pair_group2`, `sushi_exl3_pair_group2_tile2_lane`, `sushi_exl3_pair_group3_tile2_lane` |
+| `sushi_glm_fold_*` (`fold_clamped`) | `sushi_clamped_fold_*` |
+| `sushi_qwen_fold_*` (`fold_gated`) | `sushi_gated_fold_*` |
+| `sushi_qwen_rg_fold_*` (`rate_groups`) | `sushi_rg_fold_*` |
+| MSL function `qwen_qmv_rows` (inside `riders_gated`'s source) | `qmv_rows` |
+
+The kernel sources and dispatch are byte for byte the same; only the strings differ.
+
 Test fixtures renamed without an alias (not host API): `kernels.MimoMoeCase`, `MimoMoeFixture`, `mimoMoeFixture`,
 `mimoPrefillArm`, `MIMO_BANKS` are `MoeCase`, `MoeFixture`, `moeFixture`, `moePrefillArm`, `SERVED_W12_BANKS`.
 
@@ -189,9 +206,13 @@ copy builds as module `sushi_exl3` with one import, `mlx_host`, which re-exports
 mlx-serve's own host root. It has diverged from `src/exl3` (Metal sources in `.metal` files, its own host env).
 
 Sushi 1.3.0 already had the STQ experts: `codebook_tables`, `rate_groups`, `layout` (`group_layout`), `glm_group2` and
-`glm_prefill_grid`. Those two root names, and `Codebook.servesGlmFastPaths` inside their files, are the only 1.5.1 names
-the copy uses (mlx-serve at v26.11.2, nothing outside the vendored folder names them); a re-vendor renames them to the
-table above. What the copy lacks is everything after 1.3.0:
+`glm_prefill_grid`. Those two root names, and `Codebook.servesGlmFastPaths` inside their files, are the only 1.5.1
+Zig names the copy uses (mlx-serve at v26.11.2, nothing outside the vendored folder names them); a re-vendor renames
+them to the table above. The copy also builds fourteen kernels under 1.5.1 names (`sushi_glm_lane_prepare`,
+`_lane_unsorted`, `_lane_pair`, `_lane_pair_one`, `_down_lane_coop`, `_down_lane_prepare`, `_down_one`,
+`_prefill_grid_transpose` and six `sushi_glm_exl3_*`, two of them 1.3.0 spellings, `_group2_lane` and
+`_pair_group2_lane`); the kernel table above has the new names, and a 1.3.0 spelling takes the same prefix change
+(`sushi_exl3_group2_lane`). What the copy lacks is everything after 1.3.0:
 
 - the trunk contract: `linear`, `trunk_gemm`, `project_rows`, `trunk`, `fuse`, `pack`;
 - `kernel_source`, `sorted_windows`, `shared_trellis`, the folds and riders;
@@ -204,8 +225,9 @@ up and down may differ from each other), and refuses the rest.
 
 A re-vendor takes the whole `src/exl3` (without `host_min.zig`) and keeps the names above at the same paths.
 mlx-serve's extracted Metal files named after a Zig file (`glm_group2_*.metal`) are renamed to the new file names
-(`coop_rows2_*.metal`, ...); the kernel names inside them are unchanged, so the MLX kernel keys and the JIT cache stay
-valid.
+(`coop_rows2_*.metal`, ...), and the kernel names inside them take the table above. mlx-serve's own
+`sdk/quant/exl3/contract.zig` labels its one-row launch `sushi_glm_down_one`: that string only names the contract's
+own test kernel, so it needs no change to build, but it should read `sushi_down_one`.
 
 ## MLX pins
 

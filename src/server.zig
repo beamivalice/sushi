@@ -84,7 +84,6 @@ const loadServingBill = bills.loadServingBill;
 pub const prefixCacheMemForLoad = bills.prefixCacheMemForLoad;
 pub const prefixCacheDiskForLoad = bills.prefixCacheDiskForLoad;
 pub const computeMemoryContext = bills.computeMemoryContext;
-pub const glmDflashReserveBudget = bills.glmDflashReserveBudget;
 pub const prefillRequestTerms = bills.prefillRequestTerms;
 const AdmissionBill = bills.AdmissionBill;
 const fitAfterUnloadingIdle = bills.fitAfterUnloadingIdle;

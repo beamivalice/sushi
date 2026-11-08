@@ -146,7 +146,7 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
     }
     bills.launch_state.ssm_checkpoint_stride = 256;
     bills.launch_state.prefix_cache_capacity = 32;
-    bills.launch_state.prefix_cache_mem_bytes = bills.GLM_PREFIX_CACHE_MEM_DEFAULT;
+    bills.launch_state.prefix_cache_mem_bytes = glm_bill.PREFIX_CACHE_MEM_DEFAULT;
     const per_cp = cfg.ssmCheckpointBytes();
     const row_bytes = bills.sessionBytesPerToken(&cfg, 8);
     const cap = glm5_prefix.checkpointMax(16);
@@ -228,7 +228,7 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
                 const pc = try reserve.capacity(seq / 4);
                 const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
                 const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
-                try std.testing.expect(try reserve.statesPeak(mla_layers, p) <= bills.glmDflashReserveBudget(&cfg, seq, max_tokens, kv_bits, held));
+                try std.testing.expect(try reserve.statesPeak(mla_layers, p) <= glm_bill.dflashReserveBudget(&cfg, seq, max_tokens, kv_bits, held));
             }
         }
     }
@@ -254,7 +254,7 @@ test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the adve
             // The generator's config copy is never pinned: it resolves its own, smaller context.
             var unpinned = cfg;
             unpinned.pinned_context = arm.ctx / 4;
-            try std.testing.expect(peak <= bills.glmDflashReserveBudget(&unpinned, seq, max_tokens, arm.bits, held));
+            try std.testing.expect(peak <= glm_bill.dflashReserveBudget(&unpinned, seq, max_tokens, arm.bits, held));
         }
     }
 }

@@ -212,7 +212,7 @@ pub fn projectLayout(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: 
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.value);
     };
-    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_lane_kernels, "sushi_glm_exl3_group3_tile2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_THREE_SOURCE) else if (layout == .lane) try support.makeKernel(&tiled_lane_kernels, "sushi_glm_exl3_group2_tile2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_TILED_SOURCE) else try support.makeKernel(&single_kernels, "sushi_glm_exl3_group2", &.{ "x", "trellis", "slots" }, &.{"y"}, SOURCE);
+    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_lane_kernels, "sushi_exl3_group3_tile2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_THREE_SOURCE) else if (layout == .lane) try support.makeKernel(&tiled_lane_kernels, "sushi_exl3_group2_tile2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_TILED_SOURCE) else try support.makeKernel(&single_kernels, "sushi_exl3_group2", &.{ "x", "trellis", "slots" }, &.{"y"}, SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ x, bank, ids }, 3);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -234,7 +234,7 @@ pub fn pairLayout(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Ar
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.value);
     };
-    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_pair_lane_kernels, "sushi_glm_exl3_pair_group3_tile2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_THREE_PAIR_SOURCE) else if (layout == .lane) try support.makeKernel(&tiled_pair_lane_kernels, "sushi_glm_exl3_pair_group2_tile2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_TILED_PAIR_SOURCE) else try support.makeKernel(&pair_kernels, "sushi_glm_exl3_pair_group2", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_SOURCE);
+    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_pair_lane_kernels, "sushi_exl3_pair_group3_tile2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_THREE_PAIR_SOURCE) else if (layout == .lane) try support.makeKernel(&tiled_pair_lane_kernels, "sushi_exl3_pair_group2_tile2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_TILED_PAIR_SOURCE) else try support.makeKernel(&pair_kernels, "sushi_exl3_pair_group2", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ xg, xu, tg, tu, ids }, 5);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();

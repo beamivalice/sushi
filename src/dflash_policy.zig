@@ -88,20 +88,6 @@ pub fn linearLadder(first: f32, step: f32) Costs {
     return out;
 }
 
-/// GLM-5.3-Flash-Sushi-2.4bpw on an M5 Max, ms of a round by verify rows: the verify of one chain, the mean of 1K and
-/// 8K history (33-35, 38-41, 45-48, 54-59, 61-68, 76-86, 79-91 ms at 2..8 rows), plus about 7.4 ms of draft, replay
-/// and commit; one row is the plain tick, 30 ms. Past eight rows the cost grows 13 ms a row.
-pub fn glmLadder() Costs {
-    var out: Costs = undefined;
-    const ms = [_]f32{ 0, 30, 41.3, 46.9, 53.6, 63.6, 72.0, 88.1, 92.6 };
-    for (0..MAX_ROWS + 1) |r| out[r] = if (r < ms.len) ms[r] else ms[ms.len - 1] + 13 * @as(f32, @floatFromInt(r - ms.len + 1));
-    return out;
-}
-
-/// The widest tree a round drafts unless the flags ask otherwise; the ladder and the calibrated confidences decide
-/// how much of it a round uses.
-pub const GLM_USEFUL_ROWS: u32 = 8;
-
 /// Rows for a tree of drafts in the order taken (`parents[k]` is a draft index before k, or -1 under t1; `conf[k]`
 /// the drafter's probability of draft k among its siblings): a draft adds the probability that the accepted path
 /// runs through it, since at most one sibling does.
@@ -370,21 +356,4 @@ test "Calibration.observeTree: only drafts whose parent was accepted are reached
     try testing.expect(c.probability(0.5) < prior_miss);
     try testing.expectEqual(@as(f32, 0), c.seen[Calibration.bin(0.2)]);
     try testing.expect(c.probability(0.99) < Calibration.prior(0.99));
-}
-
-test "glmLadder: certain drafts take four rows or more, weak ones two, and the cost never falls" {
-    const costs = glmLadder();
-    var r: u32 = 2;
-    while (r <= MAX_ROWS) : (r += 1) try testing.expect(costs[r] > costs[r - 1]);
-    var calib = Calibration{};
-    var guess: f32 = 0;
-    while (guess < 1) : (guess += 0.01) for (0..40) |_| calib.observe(guess, true);
-    const sure_parents = [_]i32{ -1, 0, 1, 2, 3, 4, 5 };
-    const sure_conf: [7]f32 = @splat(0.99);
-    try testing.expect(pickTreeRows(&calib, &sure_parents, &sure_conf, 2, 8, &costs) >= 4);
-    const fresh = Calibration{};
-    try testing.expectEqual(@as(u32, 2), pickTreeRows(&fresh, &.{ -1, 0, 1 }, &[_]f32{ 0.5, 0.4, 0.3 }, 2, 8, &costs));
-    // Two rows cost nearly what three do, so a middling draft pair still takes the third row.
-    try testing.expectEqual(@as(u32, 3), pickTreeRows(&fresh, &.{ -1, 0 }, &[_]f32{ 0.85, 0.8 }, 2, 8, &costs));
-    try testing.expectEqual(@as(u32, 3), pickTreeRows(&calib, &sure_parents, &sure_conf, 3, 3, &costs));
 }

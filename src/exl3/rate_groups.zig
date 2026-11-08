@@ -1441,7 +1441,7 @@ fn gatedStage(k: GatedFoldKey) !*const FusedStage {
     const src = try fuse.source(alloc, a, b);
     const header_text = try fuse.header(alloc, a, b);
     var name: std.ArrayList(u8) = .empty;
-    try name.print(alloc, "sushi_qwen_rg_fold_{s}_{s}_w{d}", .{ if (k.down) "down" else "pair", @tagName(k.dec.codebook), k.dec.window.bits() });
+    try name.print(alloc, "sushi_rg_fold_{s}_{s}_w{d}", .{ if (k.down) "down" else "pair", @tagName(k.dec.codebook), k.dec.window.bits() });
     if (k.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[k.dec.table.?].digest});
     for (classes) |c| try name.print(alloc, "_{d}x{d}", .{ c.gate, c.up });
     if (k.logit) try name.appendSlice(alloc, "_logit");

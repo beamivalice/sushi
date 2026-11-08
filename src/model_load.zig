@@ -1286,7 +1286,7 @@ pub fn stampDflashRequestTerms(io: std.Io, allocator: std.mem.Allocator, config:
     var cfg = try dflash_mod.parseConfig(io, allocator, directory);
     defer cfg.deinit(allocator);
     if (!cfg.isDflash2() or cfg.hidden_size != config.hidden_size or cfg.sliding_window < 2) return error.DflashTargetMismatch;
-    for (cfg.layer_types) |kind| if (kind != .sliding_attention) return error.GlmDflashWindowUnsupported;
+    for (cfg.layer_types) |kind| if (kind != .sliding_attention) return error.DflashWindowUnsupported;
     config.dflash_loaded = true;
     if (config.isQwen4()) config.dflash_load_transient_bytes = (try dflash_mod.assistantLoadBytes(io, allocator, directory, dflash_mod.quantBitsFromEnv())).transient;
     const per_token = @as(u64, cfg.num_hidden_layers) * cfg.num_key_value_heads * cfg.head_dim * 4;

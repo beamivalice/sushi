@@ -57,8 +57,8 @@ bytes equal everywhere; DFlash/serial ms per token, below 1 wins; no fans, a box
 | 6 | 122-129 | 1.23 | 0.98 | 0.80 | 0.71 | 0.69 | 1.19 | 3.50 / 4.71 |
 | 8 | 145-151 | 1.26 | 0.86 | 0.64 | 0.60 | 0.60 | 1.24 | 4.62 / 6.62 |
 
-`glmLadder` is the mean of the 1K and 8K chain verify plus about 7.4 ms of draft, replay and commit (2..8 rows: 41.3 /
-46.9 / 53.6 / 63.6 / 72.0 / 88.1 / 92.6 ms), and the assistant may draft up to `GLM_USEFUL_ROWS` (8); the calibrated
+`glm5_dflash.ladder` is the mean of the 1K and 8K chain verify plus about 7.4 ms of draft, replay and commit (2..8 rows: 41.3 /
+46.9 / 53.6 / 63.6 / 72.0 / 88.1 / 92.6 ms), and the assistant may draft up to `glm5_dflash.USEFUL_ROWS` (8); the calibrated
 confidences decide how many rows a round uses. Pin the ladder only from a cool box: the pinned runs above read the
 verify high while the box heated, which priced two rows below three and made the policy pick two rows on weak text.
 

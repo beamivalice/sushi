@@ -97,7 +97,7 @@ fn stageFor(k: Key) !*const Built {
     const src = try fuse.source(alloc, a, b);
     const head = try fuse.header(alloc, a, b);
     var name: std.ArrayList(u8) = .empty;
-    try name.print(alloc, "sushi_qwen_fold_{s}_{s}_w{d}", .{ @tagName(k.stage), @tagName(k.dec.codebook), k.dec.window.bits() });
+    try name.print(alloc, "sushi_gated_fold_{s}_{s}_w{d}", .{ @tagName(k.stage), @tagName(k.dec.codebook), k.dec.window.bits() });
     if (k.dec.codebook.tabledHashMask()) try name.print(alloc, "_t{s}", .{codebook_tables.tables[k.dec.table.?].digest});
     if (k.logit) try name.appendSlice(alloc, "_logit");
     if (k.tr) |t| {
