@@ -222,7 +222,7 @@ test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every 
         const pos = 512 + 128 * i;
         try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], pos, s));
         peak = @max(peak, pcHeld(cps.items));
-        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, null, cps.items, std.math.maxInt(u64), s);
+        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, null, cps.items, &.{}, std.math.maxInt(u64), s);
         try testing.expectEqual(@as(usize, 1), pcHeld(cps.items));
     }
     // The prompt-end snapshot is taken after the loop, past the hook.
@@ -255,6 +255,54 @@ test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every 
         try testing.expectEqual(w.conv, pcSsmVal(dst[0].conv_state, 0, s));
         try testing.expectEqual(w.ssm, pcSsmVal(dst[0].ssm_state, 0, s));
     }
+}
+
+test "Qwen SSD write-through: a chunk whose points carry no QSA bank still extends the entry's history to its newest point" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var tokens: [1024]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, 1024);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-qwen-wt-qsa", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+
+    var cps = std.ArrayList(SSMCheckpoint).empty;
+    defer {
+        for (cps.items) |*cp| cp.deinit(testing.allocator);
+        cps.deinit(testing.allocator);
+    }
+    var live = pcBuildQsaHybrid(s, 1024, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    for ([_]usize{ 512, 1024 }, 0..) |pos, i| {
+        var at = pcBuildQsaHybrid(s, @intCast(pos), 100.0);
+        defer pcFreeQsaHybrid(&at);
+        try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &at, pos, s));
+        // The first chunk lands a bank; the second chunk's point, like every prefill point, carries none.
+        if (i == 0) try qwen4_qsa_state.attachQsaHistoryToLatest(cps.items, &at, s);
+        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, null, cps.items, &at, std.math.maxInt(u64), s);
+    }
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+    const e = &hc.disk.?.entries.items[0];
+    try testing.expectEqualSlices(u32, &.{ 512, 1024 }, e.ssm_positions);
+    try testing.expectEqual(@as(u32, 1024), e.qsa_history_rows);
+    var hist = try hc.disk.?.loadQsaHistoryFile(e.id, 3);
+    defer hist.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_int, 256), mlx.getShape(hist.layers[0].qsa_pooled)[1]);
+    try pcArrEqual(s, live[0].qsa_pooled, hist.layers[0].qsa_pooled);
+    try testing.expect(!checkpointHasQsaPooled(&cps.items[1]));
 }
 
 test "HotPrefixCache: a trim that cannot carry the QSA history over declines instead of committing" {
@@ -1873,7 +1921,7 @@ test "Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD
             try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[cps.items.len], pos, s));
             peak = @max(peak, pcHeld(cps.items));
         }
-        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, null, cps.items, std.math.maxInt(u64), s);
+        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, null, cps.items, &.{}, std.math.maxInt(u64), s);
     }
     try cps.append(testing.allocator, try trunk_mod.captureSsmCheckpoint(testing.allocator, &srcs[4], loop_end, s));
     try testing.expect(peak <= 2);

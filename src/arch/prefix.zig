@@ -379,6 +379,7 @@ pub const aux = firstWith("aux") orelse struct {
     pub fn handoffQsaHistoryToLatest(_: []ssm_cache.SSMCheckpoint, _: []const ssm_cache.SSMCacheEntry, _: mlx.mlx_stream) !void {}
     pub fn sliceQsaHistoryOntoCheckpoint(_: *ssm_cache.SSMCheckpoint, _: *const ssm_cache.SSMCheckpoint, _: usize, _: mlx.mlx_stream) !void {}
     pub fn keepOnlyLatestQsaHistory(_: []ssm_cache.SSMCheckpoint) void {}
+    pub fn dropQsaHistory(_: *ssm_cache.SSMCheckpoint) void {}
     pub fn reserveQsaHistoryWithHead(_: ?[]ssm_cache.SSMCacheEntry, _: ?*ssm_cache.SSMCacheEntry, _: usize) void {}
     pub fn checkpointHasQsaPooled(_: *const ssm_cache.SSMCheckpoint) bool {
         return false;

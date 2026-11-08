@@ -2898,10 +2898,18 @@ pub const HotPrefixCache = struct {
         media: MediaStamp,
         restored: ?kv_disk_cache.RestoredRows,
         cps: []SSMCheckpoint,
+        live_ssm: []const SSMCacheEntry,
         flush_bound: u64,
         s: mlx.mlx_stream,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
+        // A prefill point carries no QSA bank: the newest one borrows the live history for this write, so the SSD
+        // history reaches every point the chunk lands.
+        const lent = cps.len > 0 and live_ssm.len > 0 and !checkpointHasQsaPooled(&cps[cps.len - 1]);
+        if (lent) prefix_arch.aux.handoffQsaHistoryToLatest(cps, live_ssm, s) catch |err| {
+            log.warn("  [disk-cache] prefill write-through: QSA history not lent: {s}\n", .{@errorName(err)});
+        };
+        defer if (lent) prefix_arch.aux.dropQsaHistory(&cps[cps.len - 1]);
         // Below the tier's floor nothing is written yet, so no state may be freed.
         const floor = prompt.len >= kv_disk_cache.MIN_PERSIST_TOKENS;
         _ = d.appendCommitWith(.{
@@ -10717,12 +10725,12 @@ test "the prefill write-through persists an image turn, keyed by the media it ha
     try testFillCache(&cache, s, 3, tokens.len);
 
     // The first chunk stops below the item: it holds no media row, so it claims none.
-    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..512], false, truncatedMediaKey(&.{}, k1, first_at, 512), null, &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..512], false, truncatedMediaKey(&.{}, k1, first_at, 512), null, &.{}, &.{}, std.math.maxInt(u64), s);
     try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
     try testing.expectEqual(@as(u64, 0), hc.disk.?.entries.items[0].vision_key);
 
     // A later chunk covers the item, so the record names the pixels its rows were computed under.
-    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..2048], false, truncatedMediaKey(&.{}, k1, first_at, 2048), null, &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..2048], false, truncatedMediaKey(&.{}, k1, first_at, 2048), null, &.{}, &.{}, std.math.maxInt(u64), s);
     const e = &hc.disk.?.entries.items[0];
     try testing.expectEqual(@as(u64, k1), e.vision_key);
     try testing.expectEqual(@as(?u32, @intCast(first_at)), e.media_start);
@@ -10986,8 +10994,8 @@ test "a write-through under other pixels never extends the record that holds the
     try kv_disk_cache.fillCache(&rows_b, s, 3, tokens.len, 8, 5_000_000.0, .float32);
 
     // Image A's prefill stops after its first chunk (a disconnect); image B's request has the same ids.
-    hc.writeThroughHybrid(rows_a.entries, rows_a.config, tokens[0..1024], false, truncatedMediaKey(&.{}, ka, at, 1024), null, &.{}, std.math.maxInt(u64), s);
-    hc.writeThroughHybrid(rows_b.entries, rows_b.config, tokens[0..2048], false, truncatedMediaKey(&.{}, kb, at, 2048), null, &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(rows_a.entries, rows_a.config, tokens[0..1024], false, truncatedMediaKey(&.{}, ka, at, 1024), null, &.{}, &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(rows_b.entries, rows_b.config, tokens[0..2048], false, truncatedMediaKey(&.{}, kb, at, 2048), null, &.{}, &.{}, std.math.maxInt(u64), s);
     hc.disk.?.drainWriter();
 
     const chain = [_]MediaSpan{.{ .start = at, .key = kb }};

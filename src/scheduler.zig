@@ -3207,6 +3207,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trunk
         media,
         slot.restored_disk,
         cps,
+        slot.ssm_entries orelse &.{},
         if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
         s,
     );

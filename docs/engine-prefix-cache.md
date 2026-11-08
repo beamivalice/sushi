@@ -713,6 +713,10 @@ SSD tier (`spec.safetensors`). An adopted spec cache has ONE owner at a time (`r
   `qsa_history.segs`): the pooled banks' whole segments go once, `qsa.safetensors` keeps the raw leftovers and the rows
   past the last segment, and an heir that links the donor's history (`linkInheritedQsa`) links its segments too. It
   used to be rewritten whole per commit: 80-100 MB a Qwen turn at 100k-130k tokens.
+- **A prefill write-through lends the live QSA history to its newest point** (`writeThroughHybrid`'s `live_ssm`,
+  `handoffQsaHistoryToLatest`, dropped after the write): a prefill point carries no bank, and the history then stayed
+  at the record's donor while its points ran past it, so every restore from them failed `DiskCacheQsaHistoryGap` and
+  prefilled cold (a 315,747-token prompt over a 108,285-row history).
 
 ## GLM-5.3 (`glm5_next`)
 

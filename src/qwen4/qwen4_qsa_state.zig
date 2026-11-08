@@ -547,10 +547,15 @@ pub fn keepOnlyLatestQsaHistory(cps: []SSMCheckpoint) void {
             kept = true;
             continue;
         }
-        for (cps[i].layers) |*l| {
-            if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
-            l.qsa_pooled = .{ .ctx = null };
-        }
+        dropQsaHistory(&cps[i]);
+    }
+}
+
+/// Free the pooled QSA banks `cp` carries.
+pub fn dropQsaHistory(cp: *SSMCheckpoint) void {
+    for (cp.layers) |*l| {
+        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
+        l.qsa_pooled = .{ .ctx = null };
     }
 }
 

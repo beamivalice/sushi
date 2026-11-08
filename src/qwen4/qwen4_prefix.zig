@@ -35,6 +35,7 @@ pub const aux = struct {
     pub const entriesHaveQsaHistory = qsa_state.entriesHaveQsaHistory;
     pub const handoffQsaHistoryToLatest = qsa_state.handoffQsaHistoryToLatest;
     pub const keepOnlyLatestQsaHistory = qsa_state.keepOnlyLatestQsaHistory;
+    pub const dropQsaHistory = qsa_state.dropQsaHistory;
     pub const qsaRestoreSatisfiesForward = qsa_state.qsaRestoreSatisfiesForward;
     pub const reserveQsaHistoryWithHead = qsa_state.reserveQsaHistoryWithHead;
     pub const sliceQsaHistoryOntoCheckpoint = qsa_state.sliceQsaHistoryOntoCheckpoint;
