@@ -96,6 +96,13 @@ joins `DROPPABLE` when its drop passes.
    forward, config parse and refusals, bills, drafter, prefix/SSD codec parts, media, kernels only it uses, its tests
    and fixtures.
 2. One entry in `src/arch/registry.zig`, marked `// arch:<arch>`. Its `arch.zig` tests run with the registry's.
+   The test files of its folder are listed in `src/<arch>/arch_tests.zig`, which the registry line reaches as `tests`,
+   one `@import("<file>.zig"),` a line: `pub const tests = .{ ... }` for the MLX root `src/tests.zig`, and `pub const
+   host_tests = .{ ... }` for the MLX-free files of `src/tests_host.zig` (leave it out when there are none). Both roots
+   walk the registry's enabled archs, so no shared file names the folder; `build.zig` reads `host_tests` as text,
+   hence the one-import-a-line form, and a host file sits in the arch's folder (no `/` in its import). A host file must
+   stay out of `tests`. The lists are not in `arch.zig`: a test file reaches engine helpers by path, which the
+   arch-slice build refuses.
 3. Its packs: the `packs` rows in its `arch.zig`, the tier table and recommended launch in [usage](usage.md), the
    README pack line (the CLAUDE.md "Adding a pack" rule).
 4. Its docs, prefixed `<arch>-`: at least `<arch>-arch.md`; their rows in CLAUDE.md's docs index and in
@@ -136,7 +143,8 @@ already set up; the loop covers every arch in `DROPPABLE` and passes at once whi
 `arch_host_stub.zig`) as its only imports, and walks its public declarations (`src/arch/slice_check.zig`). Zig reads a
 module only inside its root folder, so every `../` import of an engine file is an error; what the folder needs of the
 engine goes through `arch_host`. Nothing links or runs. Until an arch's S4 stage lands the step fails on the first stray
-import (one error is shown at a time); `tests/test_arch_slice.sh` pins both outcomes on probe folders.
+import (one error is shown at a time); `tests/test_arch_slice.sh` pins both outcomes on probe folders. The test lists
+are in `arch_tests.zig`, outside the slice's module graph, so a test file may reach the engine by path.
 
 A passing drop of one arch costs about 2.7 minutes on the M5 Max (cold `.zig-cache`, warm global cache,
 `taskpolicy -a`, Debug): 27 s for `zig build`, 41 s for `zig build test-build`, 92 s for `zig build test-host`, 1 s for
@@ -144,8 +152,9 @@ the link check. A busy box roughly doubles it. Expect the same order on a CI run
 
 A drop is one commit that removes:
 - `src/<arch>/` (its fixtures go with it), its registry entry (its packs and flags go with the folder);
-- the arch's files from the `src/tests.zig` import list, and what `build.zig` still names for it (`test_dirs`,
-  `TestModel`, the bench imports of `ubench_main.zig`), until those leave the shared files;
+- what `build.zig` still names for the arch (`test_dirs`, `TestModel`, the bench imports of `ubench_main.zig`), until
+  those leave the shared files; its test lists leave with its `arch_tests.zig` and registry line, and `src/tests.zig` and `src/tests_host.zig`
+  name no arch folder;
 - `tests/<arch>/`, its rows in `tests/CLAUDE.md`, its pack-tier env in [testsuite](testsuite.md);
 - `docs/<arch>-*.md` and their rows in CLAUDE.md's docs index and [source-map](source-map.md); its rows in
   [usage](usage.md), [flags](flags.md), [envvar](envvar.md) and its [pack-format](pack-format.md) section

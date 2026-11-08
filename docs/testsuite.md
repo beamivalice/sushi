@@ -38,7 +38,10 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 | pack | needs a fixture or pack named by an env var; skips when it is unset | `zig build test` with the env set |
 
 - `zig build test-host` builds `src/tests_host.zig`, a root that links no MLX: a file in it that reaches MLX fails the
-  link. The build reads that root's imports as the host list, and no MLX bucket may also select a host file's tests.
+  link. The build reads that root's imports, and each arch folder's `pub const host_tests` in its `arch_tests.zig`, as the
+  host list, and no MLX bucket may also select a host file's tests. An arch's other test files are its `pub const
+  tests` ([placement](engine-arch-seam.md#adding-an-architecture)): `src/tests.zig` walks the enabled archs' lists, so
+  a test file is added to its arch's `arch_tests.zig`, never to a root.
   The host binary is filtered to the tests of those files (`hostFilters` in build.zig); its module is built with
   `build_options.host_tier`, under which a live GPU read (`gpu_mem.zig`) panics and the NAX probe answers false.
   Every `<arch>/<arch>_bill.zig` is a host file too, by its `_bill` stem; `bills.zig` reaches the enabled archs' through the registry.
@@ -75,7 +78,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 ## Folder map and scope guards
 
 A test's model is its file's folder. Counts at the time of writing; `python3 tests/suite_guards.py --map` reprints the
-table. A test's tier is read from its body: a `tests_host.zig` import is host, a body that reads an env var or skips
+table. A test's tier is read from its body: a `tests_host.zig` import or an `arch_tests.zig` `host_tests` entry is host, a body that reads an env var or skips
 (`SkipZigTest`, `getenv`, `packPath`) is pack, `requireGpu` is gpu, the rest is cpu (an MLX binary, no Metal gate);
 a test that skips only inside a helper counts as gpu or cpu.
 
@@ -122,7 +125,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 
 - Beside the code it tests, at the bottom of that file. Tests move with their code.
 - A test's model is its file's folder (`src/qwen4/`, `src/mimo2/`, `src/glm5/`, `src/dsv41/`); the `src/` root is shared.
-  `-Dmodel=<arch>` runs one folder's tests plus the shared ones.
+  `-Dmodel=<arch>` runs one folder's tests plus the shared ones. A new test file of an arch is listed in that
+  arch's `arch_tests.zig` (`pub const tests`, or `host_tests` for an MLX-free file), never in `src/tests.zig`.
 - A shared file (`trunk.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
   holds only `shared` tests. Code for one arch lives in that arch's files, and so do its tests.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.

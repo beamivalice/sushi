@@ -325,8 +325,8 @@ fn parseBuildRoots(arena: std.mem.Allocator, source: [:0]const u8, diag: *std.zo
     return std.zon.parse.fromSlice(BuildRoots, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = diag });
 }
 
-/// Every `src/<folder>/build_roots.zon`, in folder order.
-fn archBuildRoots(b: *std.Build) []const BuildRoots {
+/// The folders of `src/`, in name order.
+fn srcFolders(b: *std.Build) []const []const u8 {
     const io = b.graph.io;
     var src = buildRootHandle(b).openDir(io, "src", .{ .iterate = true }) catch |e| std.debug.panic("src: {t}", .{e});
     defer src.close(io);
@@ -341,8 +341,14 @@ fn archBuildRoots(b: *std.Build) []const BuildRoots {
             return std.mem.lessThan(u8, x, y);
         }
     }.lt);
+    return folders.items;
+}
+
+/// Every `src/<folder>/build_roots.zon`, in folder order.
+fn archBuildRoots(b: *std.Build) []const BuildRoots {
+    const io = b.graph.io;
     var out: std.ArrayList(BuildRoots) = .empty;
-    for (folders.items) |folder| {
+    for (srcFolders(b)) |folder| {
         b.dependOnDirectoryContents(b.path(b.fmt("src/{s}", .{folder})));
         const path = b.fmt("src/{s}/build_roots.zon", .{folder});
         const source = buildRootHandle(b).readFileAllocOptions(io, path, b.allocator, .limited(1 << 16), .of(u8), 0) catch |e| switch (e) {
@@ -560,19 +566,60 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
     return out.items;
 }
 
-/// The host tier's files are the imports of src/tests_host.zig, the one list.
-fn hostStems(b: *std.Build) []const []const u8 {
+/// The host tier's files, as `src/`-relative paths without `.zig`: the imports of src/tests_host.zig, and each arch
+/// folder's `host_tests` in its `arch_tests.zig`.
+fn hostPaths(b: *std.Build) []const []const u8 {
     b.dependOnFileContents(b.path("src/tests_host.zig"));
     const source = buildRootHandle(b).readFileAlloc(b.graph.io, "src/tests_host.zig", b.allocator, .limited(1 << 20)) catch |e| std.debug.panic("src/tests_host.zig: {t}", .{e});
-    var stems: std.ArrayList([]const u8) = .empty;
+    var paths: std.ArrayList([]const u8) = .empty;
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |line| {
         const head = "    _ = @import(\"";
         const tail = ".zig\");";
         if (!std.mem.startsWith(u8, line, head) or !std.mem.endsWith(u8, line, tail)) continue;
-        const path = line[head.len .. line.len - tail.len];
-        stems.append(b.allocator, path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0..]) catch @panic("OOM");
+        paths.append(b.allocator, line[head.len .. line.len - tail.len]) catch @panic("OOM");
     }
+    // A folder left out of -Darchs is listed too: its host files stay out of the MLX buckets whichever arch is built.
+    for (srcFolders(b)) |folder| {
+        const arch_zig = b.fmt("src/{s}/arch_tests.zig", .{folder});
+        const arch_source = buildRootHandle(b).readFileAlloc(b.graph.io, arch_zig, b.allocator, .limited(1 << 20)) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => continue,
+            else => std.debug.panic("{s}: {t}", .{ arch_zig, e }),
+        };
+        b.dependOnFileContents(b.path(arch_zig));
+        appendArchList(b.allocator, &paths, folder, arch_source, "host_tests") catch |e|
+            std.debug.panic("{s}: `pub const host_tests = .{{` takes one `@import(\"<file>.zig\"),` a line: {t}", .{ arch_zig, e });
+    }
+    return paths.items;
+}
+
+/// Appends `<folder>/<file>` for each `@import("<file>.zig"),` line of `pub const <decl> = .{ ... };` in an arch_tests.zig. The
+/// files sit in the arch's folder; a comment or blank line is skipped, any other line is an error.
+fn appendArchList(gpa: std.mem.Allocator, out: *std.ArrayList([]const u8), folder: []const u8, source: []const u8, decl: []const u8) !void {
+    const open = try std.fmt.allocPrint(gpa, "pub const {s} = .{{", .{decl});
+    var inside = false;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (!inside) {
+            inside = std.mem.eql(u8, line, open);
+            continue;
+        }
+        if (std.mem.eql(u8, line, "};")) return;
+        if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
+        const head = "@import(\"";
+        const tail = ".zig\"),";
+        if (!std.mem.startsWith(u8, line, head) or !std.mem.endsWith(u8, line, tail)) return error.UnreadableTestList;
+        const file = line[head.len .. line.len - tail.len];
+        if (std.mem.indexOfScalar(u8, file, '/') != null) return error.UnreadableTestList;
+        try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}/{s}", .{ folder, file }));
+    }
+    if (inside) return error.UnreadableTestList;
+}
+
+fn hostStems(b: *std.Build) []const []const u8 {
+    var stems: std.ArrayList([]const u8) = .empty;
+    for (hostPaths(b)) |path| stems.append(b.allocator, path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0..]) catch @panic("OOM");
     return stems.items;
 }
 
@@ -582,16 +629,9 @@ const arch_bill_suffix = "_bill";
 /// The host tier's tests by name. Zig keeps a test by its name and collects the tests of every file the root reaches:
 /// bills.zig reaches the transformer and the model, whose own tests need MLX and must not join this binary.
 fn hostFilters(b: *std.Build) []const []const u8 {
-    b.dependOnFileContents(b.path("src/tests_host.zig"));
     const io = b.graph.io;
-    const source = buildRootHandle(b).readFileAlloc(io, "src/tests_host.zig", b.allocator, .limited(1 << 20)) catch |e| std.debug.panic("src/tests_host.zig: {t}", .{e});
     var out: std.ArrayList([]const u8) = .empty;
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    while (lines.next()) |line| {
-        const head = "    _ = @import(\"";
-        const tail = ".zig\");";
-        if (!std.mem.startsWith(u8, line, head) or !std.mem.endsWith(u8, line, tail)) continue;
-        const path = line[head.len .. line.len - tail.len];
+    for (hostPaths(b)) |path| {
         const stem = path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0..];
         // A dropped arch's file is missing: the import then fails the compile, naming it, instead of the configure.
         const file = buildRootHandle(b).readFileAlloc(io, b.fmt("src/{s}.zig", .{path}), b.allocator, .limited(16 << 20)) catch |e| switch (e) {
@@ -994,4 +1034,37 @@ test "a build_roots.zon declares tools and benches, and a misspelt key is refuse
     try std.testing.expectEqual(@as(usize, 2), roots.benches.len);
     try std.testing.expectEqual(@as(usize, 0), (try parseBuildRoots(arena.allocator(), ".{}", &diag)).benches.len);
     try std.testing.expectError(error.ParseZon, parseBuildRoots(arena.allocator(), ".{ .bench = .{} }", &diag));
+}
+
+test "an arch_tests.zig lists its host tests one import a line, and a stray line is refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var out: std.ArrayList([]const u8) = .empty;
+    try appendArchList(arena.allocator(), &out, "zz",
+        \\pub const tests = .{
+        \\    @import("not_host.zig"),
+        \\};
+        \\pub const host_tests = .{
+        \\    @import("a_rows.zig"),
+        \\    // a note
+        \\
+        \\    @import("b_tokens.zig"),
+        \\};
+        \\pub const after = 1;
+    , "host_tests");
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("zz/a_rows", out.items[0]);
+    try std.testing.expectEqualStrings("zz/b_tokens", out.items[1]);
+    try appendArchList(arena.allocator(), &out, "zz", "pub const tests = .{};\n", "host_tests");
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectError(error.UnreadableTestList, appendArchList(arena.allocator(), &out, "zz",
+        \\pub const host_tests = .{
+        \\    @import("../up.zig"),
+        \\};
+    , "host_tests"));
+    try std.testing.expectError(error.UnreadableTestList, appendArchList(arena.allocator(), &out, "zz",
+        \\pub const host_tests = .{
+        \\    @import("a.zig")
+        \\};
+    , "host_tests"));
 }

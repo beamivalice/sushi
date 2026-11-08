@@ -11,11 +11,13 @@ const opts = @import("build_options");
 // used: the host tier uses `chat` alone, and an arch left out of `-Darchs` is read by neither. The line's own
 // `model_types` and `gate_rank` are what the arch gate needs of an arch the build left out, without reading its files;
 // `seam_terms` are the concepts only that arch owns, which a shared handle field must not name (the seam guard).
+// `tests` is its `arch_tests.zig`, the list of its test files that the two test roots walk; it stays out of `arch.zig`
+// so the arch-slice build compiles the arch's own module graph alone.
 const archs = struct {
-    pub const glm5 = struct { const name = "glm5"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"glm5_next"}; const gate_rank = 2; const mod = @import("../glm5/arch.zig"); const chat = @import("../glm5/glm5_chat.zig"); }; // arch:glm5
-    pub const dsv41 = struct { const name = "dsv41"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); }; // arch:dsv41
-    pub const qwen4 = struct { const name = "qwen4"; const seam_terms = [_][]const u8{ "qsa", "gdn", "ple", "compiled_hc" }; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); }; // arch:qwen4
-    pub const mimo2 = struct { const name = "mimo2"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"mimo_v2"}; const gate_rank = 1; const mod = @import("../mimo2/arch.zig"); const chat = @import("../mimo2/mimo_chat.zig"); }; // arch:mimo2
+    pub const glm5 = struct { const name = "glm5"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"glm5_next"}; const gate_rank = 2; const mod = @import("../glm5/arch.zig"); const tests = @import("../glm5/arch_tests.zig"); const chat = @import("../glm5/glm5_chat.zig"); }; // arch:glm5
+    pub const dsv41 = struct { const name = "dsv41"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const tests = @import("../dsv41/arch_tests.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); }; // arch:dsv41
+    pub const qwen4 = struct { const name = "qwen4"; const seam_terms = [_][]const u8{ "qsa", "gdn", "ple", "compiled_hc" }; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const tests = @import("../qwen4/arch_tests.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); }; // arch:qwen4
+    pub const mimo2 = struct { const name = "mimo2"; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"mimo_v2"}; const gate_rank = 1; const mod = @import("../mimo2/arch.zig"); const tests = @import("../mimo2/arch_tests.zig"); const chat = @import("../mimo2/mimo_chat.zig"); }; // arch:mimo2
 };
 
 const all_names = blk: {
@@ -95,6 +97,11 @@ pub fn Mod(comptime tag: Tag) type {
 /// Where the arch gate lists the arch: the `gate_rank` of its registry line.
 pub fn gateRank(comptime tag: Tag) u8 {
     return @field(archs, @tagName(tag)).gate_rank;
+}
+
+/// The arch's `arch_tests.zig`: `tests` for the MLX root, `host_tests` (optional) for the host root.
+pub fn Tests(comptime tag: Tag) type {
+    return @field(archs, @tagName(tag)).tests;
 }
 
 /// The arch's MLX-free chat face (`<arch>_chat.zig`): effort offer, pinned template, pre-tokenizer.

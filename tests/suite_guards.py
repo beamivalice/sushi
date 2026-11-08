@@ -17,6 +17,7 @@ between shared files keeps its count. Comments, test blocks, whole test files an
 engine features (SWA, ring cache, FP8) are not model names.
 """
 import argparse
+import glob
 import os
 import re
 import sys
@@ -226,6 +227,12 @@ def host_files(root):
     with open(path) as f:
         text = f.read()
     listed = {"src/" + p for p in re.findall(r'_ = @import\("([^"]+\.zig)"\);', text)}
+    # An arch_tests.zig lists its own host files in `pub const host_tests = .{ @import("<file>.zig"), ... };`.
+    for arch_zig in glob.glob(os.path.join(root, "src/*/arch_tests.zig")):
+        with open(arch_zig) as f:
+            block = re.search(r"pub const host_tests = \.\{(.*?)\n\};", f.read(), re.S)
+        folder = os.path.basename(os.path.dirname(arch_zig))
+        listed |= {f"src/{folder}/{p}" for p in re.findall(r'@import\("([^"/]+\.zig)"\)', block.group(1) if block else "")}
     # build.zig runs every <arch>/<arch>_bill.zig in the host tier too.
     bills = {os.path.relpath(os.path.join(d, f), root) for d, _, fs in os.walk(os.path.join(root, "src")) for f in fs if f.endswith("_bill.zig")}
     return listed | bills

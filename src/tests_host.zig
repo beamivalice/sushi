@@ -7,7 +7,16 @@ pub const kld = @import("kld.zig");
 pub const imatrix = @import("imatrix.zig");
 pub const transformer = @import("transformer.zig");
 
+const std = @import("std");
+const registry = @import("arch/registry.zig");
+
 test {
+    // The arch's `host_tests` read nothing of MLX; its `tests` stay unanalysed.
+    inline for (comptime std.meta.tags(registry.Tag)) |tag| {
+        if (comptime @hasDecl(registry.Tests(tag), "host_tests")) {
+            inline for (registry.Tests(tag).host_tests) |file| _ = file;
+        }
+    }
     _ = @import("chat.zig");
     _ = @import("tool_schema.zig");
     _ = @import("tool_calls.zig");
@@ -32,7 +41,6 @@ test {
     _ = @import("request_parse.zig");
     _ = @import("server_state.zig");
     _ = @import("settings_resolve.zig");
-    _ = @import("dsv41/tokenizer_deepseek.zig");
     _ = @import("stop_sequences.zig");
     _ = @import("row_grammar.zig");
     _ = @import("logit_bias.zig");
@@ -41,9 +49,7 @@ test {
     _ = @import("test_expect.zig");
     _ = @import("kld_fixture.zig");
     _ = @import("io_util.zig");
-    _ = @import("dsv41/dspark_rows.zig");
     _ = @import("expert_drop.zig");
-    _ = @import("dsv41/expert_usage.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");
     _ = @import("cache_stats.zig");
