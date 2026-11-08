@@ -622,6 +622,9 @@ They count what the filesystem accepted, never what was submitted, and run from 
   history, a replaced `spec.safetensors` and every `meta.json` rewrite (including the LRU re-index after a restore).
   A hard-linked chunk or QSA history (`linkInheritedChunks`, `linkInheritedQsa`) is not a write, and a commit
   that finds its prefix already stored writes nothing.
+- **The `[disk-cache] persisted ... MB` line is the commit's own writes** (`DiskTier.last_persist_bytes`): its chunks,
+  points, QSA history and spec sidecar, all but `meta.json` and `tokens.bin`. It used to leave out the history and the
+  sidecar, which at 100k+ tokens were most of a Qwen turn's write.
 - **`failed` is apart from `written`**: a blob the writer could not write (a failed `open`/`write`/`rename`), dropped for
   a broken multi-part file or a stale epoch, discarded by a fence (the entry was deleted before it landed), or refused
   at `submit`; a synchronous write that raised counts its tensor payload. A part that landed before its file broke stays

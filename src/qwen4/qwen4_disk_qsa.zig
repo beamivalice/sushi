@@ -277,7 +277,7 @@ pub fn persistQsaHistory(
         std.Io.Dir.deleteFileAbsolute(self.io, qpath) catch {};
     }
     const bytes = try self.writeQsaHistoryFile(dir_rel, src, s);
-    return .{ .bytes = bytes, .rows = rows, .inherited = false };
+    return .{ .bytes = bytes, .rows = rows, .inherited = false, .written = bytes };
 }
 
 pub fn linkInheritedQsa(self: *DiskTier, d: ChunkDonor, id: u64) bool {
@@ -1856,6 +1856,38 @@ test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to
     try testing.expect(e.qsa_history_bytes > 0);
     try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
     try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
+test "DiskTier: the persisted line counts every byte a commit writes but the manifest and token record" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wline", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 1024, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 1000, 8, 9.5, .float32);
+    var tokens: [1024]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &[_]c_int{ 1, 256, 8 }, 700.0);
+    src[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 256, 8 }, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]trunk_mod.SSMCheckpoint{try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 1024, s)};
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(&cps, &src, s);
+    const spec: kd.SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &cps, null, spec, s);
+    const snap = tier.stats.snapshot();
+    try testing.expect(snap.written[@intFromEnum(write_stats.Kind.qsa)] > 0 and snap.written[@intFromEnum(write_stats.Kind.spec)] > 0);
+    try testing.expectEqual(snap.totalWritten() - snap.written[@intFromEnum(write_stats.Kind.meta)], tier.last_persist_bytes);
 }
 
 test "DiskTier write counters: a QSA history rewritten for a longer checkpoint counts its full bytes again, beside the checkpoint files" {

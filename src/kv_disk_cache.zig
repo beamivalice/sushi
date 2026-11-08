@@ -325,6 +325,8 @@ pub const DiskTier = struct {
     ssm_budget_drops: usize = 0,
     /// Bytes of restore-point and row-segment files staged so far, for the write-through log line.
     point_bytes_written: u64 = 0,
+    /// What the last `persisted` line reports: every file the commit wrote but the manifest and the token record.
+    last_persist_bytes: u64 = 0,
     /// Rows below this position are what the committing request took from a stored entry (a restore or a rollback);
     /// the rows past it it computed itself. A row segment is linked from another entry only when its span ends at or
     /// before it, so a restore of the heir is its own state's bytes.
@@ -1975,6 +1977,7 @@ pub const DiskTier = struct {
         const prefix_rows: u32 = if (donor) |d| @min(d.shared, kv_len) else kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, inherited_qsa_bytes, prefix_rows, s);
+        written_bytes += qsa_res.written;
         const complete = chunk_complete and ssm_res.complete;
 
         // v4 spec snapshots — one sidecar file, REPLACED wholesale by every
@@ -1990,6 +1993,7 @@ pub const DiskTier = struct {
             log.warn("  [disk-cache] spec persist failed: {s} — entry keeps no spec\n", .{@errorName(err)});
             break :blk .{};
         };
+        if (chunk_complete) written_bytes += spec_res.bytes;
 
         // Token record — the LONGER of the existing record and this commit's
         // tokens (a resumed incremental flush must not shrink the record its
@@ -2085,6 +2089,7 @@ pub const DiskTier = struct {
         self.last_store_id = id;
         self.gcToBudget();
 
+        self.last_persist_bytes = written_bytes;
         const wrote_mb = @as(f64, @floatFromInt(written_bytes)) / (1024.0 * 1024.0);
         const ms: u64 = sw.read() / std.time.ns_per_ms;
         const waited_ms: u64 = if (self.writer) |w| (w.waitedNs() -| waited_before) / std.time.ns_per_ms else 0;
@@ -3238,7 +3243,8 @@ pub const DiskTier = struct {
         return self.saveNamed(path, list.items, meta.items, .ssm, s);
     }
 
-    pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false };
+    /// `written`: the bytes this call put on disk (0 when the file was kept or linked).
+    pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false, written: u64 = 0 };
 
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
         const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
