@@ -38,7 +38,7 @@ const mtp_mod = @import("mtp.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const KVCache = trunk.KVCache;
 
 pub const LayerType = enum {
@@ -738,7 +738,7 @@ pub const DflashModel = struct {
     /// space must line up; the capture seam lives in the STANDARD forward
     /// path only (v1), so module-owned / MoE / hybrid trunks are refused by
     /// name at load rather than silently drafting from empty captures.
-    pub fn bind(self: *DflashModel, target: *Transformer) !void {
+    pub fn bind(self: *DflashModel, target: *Trunk) !void {
         if (self.config.hidden_size != target.config.hidden_size) {
             log.err("[dflash] hidden_size mismatch: assistant={d}, target={d}\n", .{
                 self.config.hidden_size, target.config.hidden_size,
@@ -775,7 +775,7 @@ pub const DflashModel = struct {
     /// applied here — argmax drafts are invariant (monotone), but the
     /// selector sums these logits with codebook edges and the sampled arm
     /// softmaxes them, neither of which survives a scale change.
-    pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+    pub fn draftLogits(self: *const DflashModel, target: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
         const out = try target.lmHeadForDraft(x);
         if (self.config.output_multiplier == 1.0 and self.config.logit_softcap <= 0) return out;
         defer _ = mlx.mlx_array_free(out);

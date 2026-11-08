@@ -8,12 +8,12 @@ const log = @import("log.zig");
 const testing = std.testing;
 const verify_moe = @import("verify_moe.zig");
 const qmatmulBits = verify_moe.qmatmulBits;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const transposeBf16Weight = mlx_util.transposeBf16Weight;
 
 const routerRefRow = test_support.routerRefRow;
 
-pub fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Transformer.MoeRouting {
+pub fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Trunk.MoeRouting {
     var neg_logits = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(neg_logits);
     try mlx.check(mlx.mlx_negative(&neg_logits, router_logits, s));
@@ -437,7 +437,7 @@ pub fn moeRouterTopK(
     out_dtype: mlx.mlx_dtype,
     n_group: c_int,
     topk_group: c_int,
-) !?Transformer.MoeRouting {
+) !?Trunk.MoeRouting {
     return moeRouterTopKGate(s, logits, bias, k, mode, route_norm, route_scale, out_dtype, n_group, topk_group, null);
 }
 
@@ -453,7 +453,7 @@ pub fn moeRouterTopKGate(
     n_group: c_int,
     topk_group: c_int,
     gate: ?RouterGate,
-) !?Transformer.MoeRouting {
+) !?Trunk.MoeRouting {
     if (!moeRouterFusedEnabled()) return null;
     const mode: RouterMode = if (gate != null and mode_in == .softmax) .softmax_gate else mode_in;
     const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;

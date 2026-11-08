@@ -5,7 +5,7 @@ const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
 const mtp_mod = @import("../mtp.zig");
 const spec_types = @import("../spec_types.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const KVCache = trunk_mod.KVCache;
 /// DFlash2 is opt-in on a Qwen pack that ships a block drafter.
 pub const kinds = [_]spec_types.Kind{ .mtp, .dflash2 };
@@ -18,12 +18,12 @@ pub const dflash_adaptive_rows = true;
 pub const batches_head_rows = true;
 pub const nextDflash = @import("../dflash_round.zig").nextDflash;
 
-/// The head and its history live on the Transformer (`qwen4_mtp`, module-owned, so single-flight); row r of the
+/// The head and its history live on the Trunk (`qwen4_mtp`, module-owned, so single-flight); row r of the
 /// history is (pre-mixer stream at position r, token r+1), query position r+1.
-pub const Head = *Transformer;
+pub const Head = *Trunk;
 
 /// This arch's head for a loaded model: the in-checkpoint head, when MTP is on and the pack ships one.
-pub fn headOf(xfm: *Transformer, mtp_enabled: bool, _: ?*anyopaque) ?Head {
+pub fn headOf(xfm: *Trunk, mtp_enabled: bool, _: ?*anyopaque) ?Head {
     return if (mtp_enabled and xfm.arch_state.qwen4.mtp != null) xfm else null;
 }
 
@@ -31,7 +31,7 @@ pub const buildBatchedChains = @import("qwen4_mtp_batch.zig").build;
 
 /// The in-checkpoint head plus this request's own half of it.
 pub const Cache = struct {
-    t: *Transformer,
+    t: *Trunk,
     st: *qwen4_forward.Qwen4MtpState,
     allocator: std.mem.Allocator,
 
@@ -57,8 +57,8 @@ pub const Cache = struct {
         return if (persistEnabled()) &self.t.arch_state.qwen4.mtp.?.cache else null;
     }
 
-    /// The Transformer owning the head; null whenever `kv()` is null.
-    pub fn head(self: *const Cache) ?*Transformer {
+    /// The Trunk owning the head; null whenever `kv()` is null.
+    pub fn head(self: *const Cache) ?*Trunk {
         self.activate();
         return if (persistEnabled()) self.t else null;
     }
@@ -129,7 +129,7 @@ pub fn makeCache(t: Head, allocator: std.mem.Allocator) !Cache {
 
 /// The head projects only what the caller consumes: this step wants the LAST row (`want_logits`) or no logits at
 /// all, never the S-row block.
-pub fn forward(t: Head, _: *Transformer, cache: *Cache, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want: mtp_mod.StepWant, mrope_ctx: ?mtp_mod.MropeContext, _: ?[]const u32) !mtp_mod.StepOut {
+pub fn forward(t: Head, _: *Trunk, cache: *Cache, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want: mtp_mod.StepWant, mrope_ctx: ?mtp_mod.MropeContext, _: ?[]const u32) !mtp_mod.StepOut {
     cache.activate();
     return step(t, id_arr, hidden, rope_offset, want, mrope_ctx);
 }
@@ -146,7 +146,7 @@ fn step(t: Head, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_in
     return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
 }
 
-pub fn appendHistory(t: Head, _: *Transformer, cache: *Cache, token_ids: []const u32, hidden: mlx.mlx_array, rope_offset: c_int, mrope_ctx: ?mtp_mod.MropeContext, allocator: std.mem.Allocator) !void {
+pub fn appendHistory(t: Head, _: *Trunk, cache: *Cache, token_ids: []const u32, hidden: mlx.mlx_array, rope_offset: c_int, mrope_ctx: ?mtp_mod.MropeContext, allocator: std.mem.Allocator) !void {
     var ids_buf: [mtp_mod.MAX_DEPTH + 1]i32 = undefined;
     const on_heap = token_ids.len > ids_buf.len;
     const ids_i32 = if (on_heap) try allocator.alloc(i32, token_ids.len) else ids_buf[0..token_ids.len];
@@ -160,22 +160,22 @@ pub fn appendHistory(t: Head, _: *Transformer, cache: *Cache, token_ids: []const
     _ = mlx.mlx_array_free(out.hidden_next);
 }
 
-/// Built lazily on the first ask: `loadQwen4Mtp` runs while the Transformer is still under construction and its
+/// Built lazily on the first ask: `loadQwen4Mtp` runs while the Trunk is still under construction and its
 /// lm_head, which the coarse head is a copy of, is not assigned yet.
 pub fn canRerankDrafts(t: Head) bool {
     return qwen4_forward.qwen4DraftRerankReady(t);
 }
 
 /// `x` is the MIXER output the target's lm_head consumes, never the pre-mixer `[B,S,hc*H]` stream.
-pub fn draftSelect(t: Head, _: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+pub fn draftSelect(t: Head, _: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
     return qwen4_forward.qwen4DraftSelect(t, x, suppress_mask);
 }
 
-pub fn draftShortlist(t: Head, _: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
+pub fn draftShortlist(t: Head, _: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
     return qwen4_forward.qwen4DraftShortlist(t, x, suppress_mask);
 }
 
-pub fn costProfile(t: Head, _: *const Transformer, kv: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
+pub fn costProfile(t: Head, _: *const Trunk, kv: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
     return mtp_mod.qwen4G17CostProfileForKv(t, kv);
 }
 

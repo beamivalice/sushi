@@ -247,7 +247,7 @@ pub fn checkpointsRequired(config: *const model.ModelConfig) bool {
 }
 
 /// The stored-state layout the SSD namespace is keyed by, when the loaded arch names more than the config's own tag.
-pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const model.ModelConfig, model_dir: []const u8, xfm: *trunk.Transformer) !?[]u8 {
+pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const model.ModelConfig, model_dir: []const u8, xfm: *trunk.Trunk) !?[]u8 {
     switch (registry.handleOf(xfm)) {
         inline else => |_, t| return if (comptime @hasDecl(P(t), "diskLayoutKey")) P(t).diskLayoutKey(allocator, config, model_dir, xfm) else null,
     }
@@ -255,7 +255,7 @@ pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const model.ModelCon
 
 /// A committed MTP head's snapshot adopted into the loaded model's own head, as `plan` decided. Null leaves the head
 /// blind: an arch with no in-checkpoint head declines every snapshot.
-pub fn adoptSpecHead(xfm: *trunk.Transformer, plan: pc.SpecAdopt, snap: *const pc.DflashSnap, base_pos: *usize) ?usize {
+pub fn adoptSpecHead(xfm: *trunk.Trunk, plan: pc.SpecAdopt, snap: *const pc.DflashSnap, base_pos: *usize) ?usize {
     switch (registry.handleOf(xfm)) {
         inline else => |m, t| return if (comptime @hasDecl(P(t), "adoptSpecHead")) P(t).adoptSpecHead(m, plan, snap, base_pos) else null,
     }

@@ -20,7 +20,7 @@ const QSA_RING_ROWS = trunk_mod.QSA_RING_ROWS;
 const SSMCacheEntry = trunk_mod.SSMCacheEntry;
 const SSMCacheEntrySnapshot = trunk_mod.SSMCacheEntrySnapshot;
 const SSMCheckpoint = trunk_mod.SSMCheckpoint;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const arrayBytes = trunk_mod.arrayBytes;
 const captureSsmCheckpoint = trunk_mod.captureSsmCheckpoint;
 const materializedOwnedCopy = trunk_mod.materializedOwnedCopy;
@@ -228,7 +228,7 @@ fn qsaTestMeanBlocks(keys: mlx.mlx_array, row0: c_int, n_blocks: c_int, ratio: c
     return out;
 }
 
-pub fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
+pub fn qsaTestAppendPool(xfm: *Trunk, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
     const ratio = @max(entry.qsa_ratio, 1);
     const add = mlx.getShape(chunk)[1];
     const kv = offset + add;
@@ -756,7 +756,7 @@ test "QSA key history advances by S not 1" {
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
     var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
@@ -810,7 +810,7 @@ test "qsa raw-key ring is O(RING_ROWS) at N rows" {
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -839,7 +839,7 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -928,7 +928,7 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
     xfm.arch_state.qwen4.qsa_score_bank_builds = 0;
@@ -1063,7 +1063,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1135,7 +1135,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1237,7 +1237,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1487,7 +1487,7 @@ test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {
     try testing.expectEqual(@as(c_int, 11), dest[0].qsa_pooled_blocks);
     try testing.expectEqual(@as(c_int, 46), dest[0].qsa_hist_rows);
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     const extra_shape = [_]c_int{ 1, 1, hd };
@@ -1699,7 +1699,7 @@ test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer
     // The handoff hands the dying slot's buffer to the entry: same rows, same bytes, no allocation.
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     const hd: c_int = 16;
@@ -1752,7 +1752,7 @@ test "handoffQsaHistoryToLatest materializes when the buffer's slack past the sn
     // Past the slack bar the handoff pays the copy.
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     const hd: c_int = 16;
@@ -1812,7 +1812,7 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
     const src_ptr = mlx.mlx_array_data_float32(cps[0].layers[0].qsa_pooled) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(src_ptr, dest_ptr);
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     var extra = mlx.mlx_array_new();
@@ -1946,7 +1946,7 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
     const chunk_rows: c_int = 4096;
     const total: usize = 409_600;
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = ta;
     var entries = [_]SSMCacheEntry{.{ .ssm_state = mlx.mlx_array_new(), .conv_state = mlx.mlx_array_new(), .initialized = false }};
@@ -1985,7 +1985,7 @@ test "qsa key history: capacity-buffer append equals the concatenated reference,
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
 
@@ -2084,7 +2084,7 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     t.arch_state.qwen4.qsa_score_bank_builds = 0;
@@ -2162,7 +2162,7 @@ test "qsa score bank: incremental column append matches a from-scratch rebuild" 
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     t.arch_state.qwen4.qsa_score_bank_builds = 0;
@@ -2223,7 +2223,7 @@ test "qsa history: a restore-shaped re-seed lands AT the reservation, so the app
     const held: c_int = 4096;
     const reserve: usize = 8192;
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = ta;
     var entries = [_]SSMCacheEntry{.{ .ssm_state = mlx.mlx_array_new(), .conv_state = mlx.mlx_array_new(), .initialized = false }};

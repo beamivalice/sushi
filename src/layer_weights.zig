@@ -22,7 +22,7 @@ const QuantMode = model_mod.QuantMode;
 const Weights = model_mod.Weights;
 const testing = std.testing;
 const KVCache = trunk.KVCache;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const seFillBf16 = trunk_helpers_test.seFillBf16;
 
 pub const expert_exl3_kernels = sushi_exl3.kernels;
@@ -395,7 +395,7 @@ pub const BitsCache = QuantParamsCache;
 
 /// In-place: if `*sc` is null-ctx, we treat the matching `*w` as plain bf16.
 /// Replace `*w` with its pre-transposed `[in, out]` form and record the new
-/// array in `owned` so we can free it on Transformer.deinit.
+/// array in `owned` so we can free it on Trunk.deinit.
 pub fn maybeTransposeForBf16(
     w: *mlx.mlx_array,
     sc: mlx.mlx_array,
@@ -1070,9 +1070,9 @@ pub fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, 
     return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
 }
 
-pub fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
+pub fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Trunk {
     const cache = try KVCache.init(allocator, 0);
-    var shell: Transformer = .{
+    var shell: Trunk = .{
         .config = config,
         .cache = cache,
         .s = s,
@@ -1437,8 +1437,8 @@ test "QuantParamsCache put/lookup round-trip" {
     try testing.expect(cache.put(b.ctx.?, .{ .bits = 4, .group_size = 64, .mode = .mxfp4 }));
     try testing.expect(cache.put(c.ctx.?, .{ .bits = 8, .group_size = 128, .mode = .affine }));
 
-    // Build a Transformer-like view over the cache via quantParamsFor — we
-    // need a real Transformer to call the method, so verify by direct slot
+    // Build a Trunk-like view over the cache via quantParamsFor — we
+    // need a real Trunk to call the method, so verify by direct slot
     // lookup instead. (The forward path goes through quantParamsFor, which is
     // exercised by integration tests; this test pins the data structure.)
     {
@@ -1671,7 +1671,7 @@ test "imatrix capture on the streamed QUANTIZED MoE path keys the routing's glob
 
     const col = try imatrix_capture.Collector.init(alloc, s, "/dev/null", 2, experts, .mimo_v2);
     defer col.deinit();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.config = .{
         .model_type = "mimo_v2",
@@ -1763,7 +1763,7 @@ test "imatrix capture on the streamed QUANTIZED MoE path keys the routing's glob
 test "exl3 shared add releases routed output study3" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.config = .{};
     xfm.bits_cache = null;
     xfm.compiled_geglu = null;
@@ -2109,7 +2109,7 @@ fn routedParamsCase(bits: u32, group: u32, rows: c_int) !void {
     const experts: c_int = 4;
     var rng = std.Random.DefaultPrng.init(0x5017 + bits * 31 + @as(u64, @intCast(rows)));
     const rnd = rng.random();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.config = .{ .hidden_size = hidden, .moe_intermediate_size = inter, .quant_bits = 4, .quant_group_size = 64, .hidden_act = .silu, .num_experts = experts, .num_experts_per_tok = 2 };
     xfm.bits_cache = null;
     xfm.compiled_geglu = null;

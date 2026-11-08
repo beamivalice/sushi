@@ -28,7 +28,7 @@ const MTP_EV_WARMUP_ROUNDS = mtp_policy.MTP_EV_WARMUP_ROUNDS;
 const MtpCostSource = mtp_policy.MtpCostSource;
 const MtpRoundPlan = mtp_policy.MtpRoundPlan;
 const SubLap = mtp_policy.SubLap;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const isEosId = spec_types.isEosId;
@@ -1670,7 +1670,7 @@ pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) 
         rows[i] = st.verify_input;
         ctxs[i] = &gen.ctx;
     }
-    var rollback: [MTP_GROUP_ROWS_MAX]Transformer.VerifyRollback = undefined;
+    var rollback: [MTP_GROUP_ROWS_MAX]Trunk.VerifyRollback = undefined;
     const retain_rollback = n > 1 and qwen4_state.isLoaded(xfm);
     for (gens, states) |gen, st| st.verify_ctx = &gen.ctx;
     var row_ns: [MTP_GROUP_ROWS_MAX]u64 = undefined;
@@ -2493,7 +2493,7 @@ pub const MtpRoundState = struct {
     verify_len: u32,
     /// `c_n`: the positions this row committed, stamped by the finish.
     retained: u32 = 0,
-    verify_rollback: ?Transformer.VerifyRollback = null,
+    verify_rollback: ?Trunk.VerifyRollback = null,
     verify_ctx: ?*ForwardCtx = null,
     verify_argmax: CommittedArgmax = .{},
     verify_logits: mlx.mlx_array = .{ .ctx = null },
@@ -2916,7 +2916,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
     const allocator = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.arch_state = .{};
     var state: @import("qwen4/qwen4_forward.zig").Qwen4MtpState = undefined;
@@ -2981,7 +2981,7 @@ test "MTP detaching a pre-draft preserves the committed head boundary" {
     defer _ = mlx.mlx_stream_free(stream);
     for ([_]bool{ false, true }) |owned| {
         for ([_]bool{ false, true }) |apply_stash| {
-            var xfm: Transformer = undefined;
+            var xfm: Trunk = undefined;
             xfm.s = stream;
             var gen: Generator = undefined;
             gen.xfm = &xfm;

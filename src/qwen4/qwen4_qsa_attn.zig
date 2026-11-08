@@ -42,7 +42,7 @@ const QsaAttnCfgKey = trunk_mod.QsaAttnCfgKey;
 const QsaBlockFixture = qwen4_qsa_gather.QsaBlockFixture;
 const SSMCacheEntry = trunk_mod.SSMCacheEntry;
 const ShapeKey = trunk_mod.ShapeKey;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const bf16Scalar = trunk_mod.bf16Scalar;
 const gatherQsa256 = qwen4_qsa_gather.gatherQsa256;
 const maxAbsDiffF32 = trunk_helpers_test.maxAbsDiffF32;
@@ -298,9 +298,9 @@ pub const QsaDecline = struct {
 /// Per-request tally of which arm served each full-attention call. One
 /// increment per attention layer; read and reset where the request's
 /// `[qsa-arms]` line is emitted. It lives on the REQUEST's `ForwardCtx`
-/// (the Generator's own), never on the shared Transformer: qwen4 text slots
-/// batch-decode on one Transformer and a cold prefill interleaves with other
-/// slots' decode ticks, so a Transformer-level tally prints the union of
+/// (the Generator's own), never on the shared Trunk: qwen4 text slots
+/// batch-decode on one Trunk and a cold prefill interleaves with other
+/// slots' decode ticks, so a Trunk-level tally prints the union of
 /// every concurrent slot and leaves the next finisher an empty one.
 pub const QsaArmCounts = struct {
     mask: u32 = 0,
@@ -2010,10 +2010,10 @@ test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
     if (comptime !qwen4_state.built) return error.SkipZigTest;
     // The `[qsa-arms]` line is a PER-REQUEST meter, so its tally belongs to
     // the seam that logs it (the Generator's own ForwardCtx), never to the
-    // shared Transformer. qwen4 text slots batch-decode on ONE Transformer
+    // shared Trunk. qwen4 text slots batch-decode on ONE Trunk
     // (`forwardMoeBatchedDecode`) and a cold prefill interleaves with other
     // slots' decode ticks (`scheduler.interleaveDecodeTick`), so a
-    // Transformer-level counter printed the union of every concurrent slot
+    // Trunk-level counter printed the union of every concurrent slot
     // since the last reset and left the next finisher a near-empty tally — a
     // short chat claimed `qsa=verify_gather` while the 40k chat later logged
     // `qsa=mask`. Two owners here stand in for two concurrent slots.
@@ -2884,7 +2884,7 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
     if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     xfm.arch_state.qwen4.qsa_score_bank_builds = 0;

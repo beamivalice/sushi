@@ -23,12 +23,12 @@ const CaptureLayers = trunk_mod.CaptureLayers;
 const ForwardCtx = trunk_mod.ForwardCtx;
 const KVCache = trunk_mod.KVCache;
 const MimoExl3MoeHarness = trunk_mod.MimoExl3MoeHarness;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const loadSwitchMlpBank = trunk_mod.loadSwitchMlpBank;
 
 /// Prefill `prefix`, then either decode `rows` ids one tick at a time or verify them in
 /// one `verify_rows` forward; the logits rows, `[rows, vocab]` f32.
-fn mimoVerifyOrTicks(alloc: std.mem.Allocator, xfm: *Transformer, ids: []const i32, prefix: usize, rows: usize, verify: bool, kv: KVQuantConfig) ![]f32 {
+fn mimoVerifyOrTicks(alloc: std.mem.Allocator, xfm: *Trunk, ids: []const i32, prefix: usize, rows: usize, verify: bool, kv: KVQuantConfig) ![]f32 {
     const s = xfm.s;
     try xfm.cache.reinit(xfm.config.num_hidden_layers, kv);
     xfm.cache.setSwaRing(xfm.config.sliding_window);
@@ -75,7 +75,7 @@ const MimoBatchTestSlot = struct {
     }
 };
 
-fn mimoBatchTestPrefill(xfm: *Transformer, slot: *MimoBatchTestSlot, ids: []const i32, kv: KVQuantConfig) !void {
+fn mimoBatchTestPrefill(xfm: *Trunk, slot: *MimoBatchTestSlot, ids: []const i32, kv: KVQuantConfig) !void {
     const cache = try KVCache.initWithConfig(testing.allocator, xfm.config.num_hidden_layers, kv);
     slot.* = .{ .cache = cache };
     errdefer slot.cache.deinit();
@@ -271,7 +271,7 @@ test "mimo v2 raw per-expert load failure releases partial construction" {
 
     // The fixture's dense layer 0 binds before the first MoE layer asks for
     // packed switch_mlp banks that are absent from the raw HF layout.
-    try expectError(error.MissingWeight, Transformer.init(io, allocator, config, &weights));
+    try expectError(error.MissingWeight, Trunk.init(io, allocator, config, &weights));
 }
 
 test "mimo v2 fixture full and cached forwards track the HF reference (MIMO_V2_MODEL + MIMO_V2_FIXTURE)" {
@@ -289,7 +289,7 @@ test "mimo v2 fixture full and cached forwards track the HF reference (MIMO_V2_M
     defer weights.deinit();
     try stackMimoFixtureExperts(&weights, config, s);
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
 
     var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
@@ -341,7 +341,7 @@ test "mimo v2 fixture full and cached forwards track the HF reference (MIMO_V2_M
     try mimoExpectClose("embeddings", ours_embed, ref_embed, 0);
 
     {
-        var component_xfm = try Transformer.init(io, allocator, config, &weights);
+        var component_xfm = try Trunk.init(io, allocator, config, &weights);
         defer component_xfm.deinit();
         var component_ctx = component_xfm.defaultCtx();
         const lw = &component_xfm.moe_layers.?[0];
@@ -387,7 +387,7 @@ test "mimo v2 fixture full and cached forwards track the HF reference (MIMO_V2_M
     }
     try mimoExpectClose("full logits", ours_full, ref_full, 5e-3);
 
-    var cache_xfm = try Transformer.init(io, allocator, config, &weights);
+    var cache_xfm = try Trunk.init(io, allocator, config, &weights);
     defer cache_xfm.deinit();
     const t_prefill: usize = token_count - 6;
     const pre_shape = [_]c_int{ 1, @intCast(t_prefill) };
@@ -429,7 +429,7 @@ test "mimo v2 verify rows equal serial decode ticks bit for bit across the slidi
     defer weights.deinit();
     try stackMimoFixtureExperts(&weights, config, s);
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     // Past the packed floor the global rows read the kv8 cache through matmul2d; a repeated
     // token makes the verify rows share experts, which takes the grouped expert GEMVs.
@@ -469,7 +469,7 @@ test "mimo batched decode rows equal each slot's own decode tick bit for bit (MI
     defer weights.deinit();
     try stackMimoFixtureExperts(&weights, config, s);
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const window: usize = config.sliding_window;
     const ring_cap: usize = window + @as(usize, @intCast(ModelConfig.SWA_RING_SLACK));
@@ -569,7 +569,7 @@ test "mimo spec warm-up runs every verify row count on its own slot (MIMO_V2_MOD
     defer weights.deinit();
     try stackMimoFixtureExperts(&weights, config, s);
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var want: mimo_forward.MimoWarmRows = 0;
     var rows: usize = 2;
@@ -599,9 +599,9 @@ test "mimo v2 mixed-precision streamed and resident forwards agree" {
     defer a.free(stream_config.expert_source_dir.?);
     stream_config.expert_cache_bytes = 8 * config.expertLayerCount() * per_expert;
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |kv| {
-        var resident = try Transformer.init(io, a, config, &resident_weights);
+        var resident = try Trunk.init(io, a, config, &resident_weights);
         defer resident.deinit();
-        var streamed = try Transformer.init(io, a, stream_config, &streamed_weights);
+        var streamed = try Trunk.init(io, a, stream_config, &streamed_weights);
         defer streamed.deinit();
         try resident.cache.reinit(config.num_hidden_layers, kv);
         try streamed.cache.reinit(config.num_hidden_layers, kv);

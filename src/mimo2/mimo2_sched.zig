@@ -13,7 +13,7 @@ const model_load = @import("../model_load.zig");
 
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const ForwardCtx = trunk_mod.ForwardCtx;
 const ModelConfig = model.ModelConfig;
 
@@ -25,7 +25,7 @@ pub fn rowCap(config: *const ModelConfig) ?usize {
     return if (config.supportsBatchedMimoDecode()) 4 else null;
 }
 
-pub fn modelBatches(xfm: *const Transformer) bool {
+pub fn modelBatches(xfm: *const Trunk) bool {
     return mimo_forward.supportsBatchedMimoDecode(xfm);
 }
 
@@ -34,7 +34,7 @@ pub fn padsBatch(config: *const ModelConfig) bool {
     return !config.supportsBatchedMimoDecode();
 }
 
-pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?sched.BatchArm {
+pub fn batchArm(xfm: *Trunk, ctxs: []const *ForwardCtx) ?sched.BatchArm {
     _ = ctxs;
     if (!mimo_forward.supportsBatchedMimoDecode(xfm)) return null;
     return .{ .moe_positions = true, .advances_offset = true };
@@ -43,7 +43,7 @@ pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?sched.BatchArm {
 pub fn batchedForward(
     sch: *Scheduler,
     allocator: std.mem.Allocator,
-    xfm: *Transformer,
+    xfm: *Trunk,
     batch: *[]*Slot,
     next_tokens: []const u32,
     ctxs: []const *ForwardCtx,

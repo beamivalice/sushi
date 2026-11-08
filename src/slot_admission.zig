@@ -4,7 +4,7 @@ const trunk = @import("trunk.zig");
 const model_mod = @import("model.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const KVCache = trunk.KVCache;
 const ModelConfig = model_mod.ModelConfig;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -519,7 +519,7 @@ test "a staggered admission waits for the growth an earlier request was admitted
     scheduler_mod.prefill_admission_numbers = Probe.numbers;
     defer scheduler_mod.prefill_admission_numbers = saved;
     var cfg = ModelConfig{ .model_type = "glm5_next" };
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     var model: LoadedModel = undefined;
     model.config = &cfg;
     model.transformer = &xfm;

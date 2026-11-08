@@ -29,7 +29,7 @@ const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const metrics = @import("status.zig");
 const qwen4_mod = @import("qwen4/qwen4_exp.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const request_policy = @import("request_policy.zig");
 const glm5_generate = @import("glm5/glm5_generate.zig");
 const mtp_plan = @import("mtp_plan.zig");
@@ -1681,9 +1681,9 @@ fn billUplift16ths(config: *const model_mod.ModelConfig, seq: u64) u64 {
 }
 
 /// How many MoE layers' gather-sort expansions coexist between eval points.
-/// Mirrors `Transformer.MOE_EVAL_EVERY_N_LAYERS` — the MoE prefill loop evals
+/// Mirrors `Trunk.MOE_EVAL_EVERY_N_LAYERS` — the MoE prefill loop evals
 /// every 4th layer, so 4 layers' worth is what the peak holds.
-const MOE_PREFILL_COEXIST: u64 = trunk.Transformer.PREFILL_EVAL_CADENCE_DEFAULT;
+const MOE_PREFILL_COEXIST: u64 = trunk.Trunk.PREFILL_EVAL_CADENCE_DEFAULT;
 
 /// What a warm turn already holds. A RAM hot-cache restore hands the slot the entry's KV
 /// buffers without allocating another copy, so `available` is already net of them and
@@ -1780,8 +1780,8 @@ fn oldBuffersInEvalWindow(config: *const model_mod.ModelConfig, tokens: u64, spa
     // ringed arch those are nine of forty-eight.
     const attn = config.kvPerTokenLayerCount();
     if (attn == 0) return 0;
-    const window: u32 = if (trunk.Transformer.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
-        attnLayersPerEvalWindow(config, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS)
+    const window: u32 = if (trunk.Trunk.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
+        attnLayersPerEvalWindow(config, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS)
     else
         attn;
     if (window == 0) return 0;
@@ -1871,7 +1871,7 @@ pub fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     if (config.linear_num_value_heads > 0 and linear_layers > 0) {
         const qkv: u64 = 2 * @as(u64, config.linear_num_key_heads) * config.linear_key_head_dim +
             @as(u64, config.linear_num_value_heads) * config.linear_value_head_dim;
-        const cadence_window: u64 = @as(u64, trunk.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1;
+        const cadence_window: u64 = @as(u64, trunk.Trunk.PREFILL_EVAL_CADENCE_DEFAULT) + 1;
         per_tok += @min(linear_layers, cadence_window) * qkv * 2;
     }
     if (config.isMoe()) {
@@ -1885,7 +1885,7 @@ pub fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     // the same eval-cadence window as the linear term above: older layers'
     // staging is released inside the loop, so five coexist, not thirty-nine.
     per_tok += config.swaStreamBytesPerToken(
-        @as(u64, trunk.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1,
+        @as(u64, trunk.Trunk.PREFILL_EVAL_CADENCE_DEFAULT) + 1,
     );
     return per_tok;
 }
@@ -5685,9 +5685,9 @@ test "the 64 GB Sushi-STQ-2.75bpw recipe's bills at both GDN widths: 250000 cont
     var cfg = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
     defer cfg.deinit(t.allocator);
     cfg.expert_layout = .exl3_k4;
-    const saved_head = trunk.Transformer.mtp_head_kv_quant_flag;
-    defer trunk.Transformer.mtp_head_kv_quant_flag = saved_head;
-    trunk.Transformer.mtp_head_kv_quant_flag = true;
+    const saved_head = trunk.Trunk.mtp_head_kv_quant_flag;
+    defer trunk.Trunk.mtp_head_kv_quant_flag = saved_head;
+    trunk.Trunk.mtp_head_kv_quant_flag = true;
     const saved_ctx = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved_ctx;
     launch_state.server_config.max_context_size = 250_000;
@@ -5938,7 +5938,7 @@ test "the sliding ring is billed once per slot and staged per chunk token" {
     while (li < 48) : (li += 1) full.layer_is_global[li] = (li % 6) == 0;
     try t.expectEqual(
         @as(u64, 5 * 3 * (192 + 128) * 2),
-        full.swaStreamBytesPerToken(@as(u64, trunk.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1),
+        full.swaStreamBytesPerToken(@as(u64, trunk.Trunk.PREFILL_EVAL_CADENCE_DEFAULT) + 1),
     );
     // The ring itself still holds every sliding layer.
     try t.expectEqual(full.swaRingTokens() * 40 * 3 * (192 + 128) * 2, full.swaRingBytes());
@@ -6058,7 +6058,7 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
     try t.expect(grown.grow_coexist_bytes > 0);
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
     try t.expectEqual(
-        (seq / 2) * kv_per_tok / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS),
+        (seq / 2) * kv_per_tok / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(&cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS),
         grown.grow_coexist_bytes,
     );
 
@@ -6152,7 +6152,7 @@ test "mimo_v2 with an SSD tier bills a restored global layer beside its first gr
     launch_state.prefix_cache_disk_bytes = 0;
     try t.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, seq, 8192, kv_bits, 2048, .{}).grow_coexist_bytes);
     launch_state.prefix_cache_disk_bytes = 20 << 30;
-    const window = attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    const window = attnLayersPerEvalWindow(&cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS);
     try t.expect(window >= 1);
     try t.expectEqual(one_layer * window, prefillRequestTerms(&cfg, seq, 8192, kv_bits, 2048, .{}).grow_coexist_bytes);
 }
@@ -7707,7 +7707,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(matched *| kv_per_tok, g.shared_resident_bytes);
     try t.expectEqual((reserved - matched) *| kv_per_tok, g.reserved_kv_bytes +| (seq - matched) *| kv_per_tok);
     // ...plus one eval window of old buffers: qwen4_exp caches 12 of 48 layers, one per window.
-    try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS));
+    try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS));
     try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
     // The bill at the narrowest and a wider width.
     try t.expectEqual(@as(u64, 5_057), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
@@ -7905,7 +7905,7 @@ test "a chain extension that OUTGROWS the resident entry is credited the rows it
     try t.expectEqual(@as(u64, 786_707), extend.creditedRows(reserved));
     const per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     const ext_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, extend);
-    const window = attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    const window = attnLayersPerEvalWindow(&cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS);
     try t.expectEqual(capacity * per_tok / cfg.attnCacheLayerCount() * window, ext_terms.grow_coexist_bytes);
     try t.expectEqual(
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) -
@@ -7994,7 +7994,7 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
     // difference between the old bill and the new one.
     const wide = WarmPrefix{ .matched_tokens = 700_000, .capacity_tokens = 700_000, .will_donate = true };
     const wide_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, wide);
-    const window = attnLayersPerEvalWindow(&cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    const window = attnLayersPerEvalWindow(&cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS);
     try t.expect(window < cfg.attnCacheLayerCount());
     try t.expectEqual(700_000 * kv_per_tok / cfg.attnCacheLayerCount() * window, wide_terms.grow_coexist_bytes);
     try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, wide) < shared_same_span);
@@ -8008,9 +8008,9 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const saved_force = launch_state.server_config.default_force_mtp;
     defer launch_state.server_config.default_force_mtp = saved_force;
     launch_state.server_config.default_force_mtp = false;
-    const saved_ov = trunk.Transformer.mtp_head_kv_quant_override;
-    defer trunk.Transformer.mtp_head_kv_quant_override = saved_ov;
-    trunk.Transformer.mtp_head_kv_quant_override = false;
+    const saved_ov = trunk.Trunk.mtp_head_kv_quant_override;
+    defer trunk.Trunk.mtp_head_kv_quant_override = saved_ov;
+    trunk.Trunk.mtp_head_kv_quant_override = false;
     const saved_boot = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_boot;
     launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
@@ -8022,9 +8022,9 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const max_tokens: u64 = 8192;
     const kv_bits: u64 = 8;
     try t.expectEqual(@as(u64, 2048), mtpHeadKvBytesPerToken(&cfg));
-    trunk.Transformer.mtp_head_kv_quant_override = true;
+    trunk.Trunk.mtp_head_kv_quant_override = true;
     try t.expectEqual(@as(u64, 1088), mtpHeadKvBytesPerToken(&cfg));
-    trunk.Transformer.mtp_head_kv_quant_override = false;
+    trunk.Trunk.mtp_head_kv_quant_override = false;
     const off = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
     try t.expectEqual(@as(u64, 0), off.mtp_head_kv_bytes);
     const on = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
@@ -8046,9 +8046,9 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
     const qsa_fused_off = fixtures.qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
     const t = std.testing;
-    const saved_ov = trunk.Transformer.mtp_head_kv_quant_override;
-    defer trunk.Transformer.mtp_head_kv_quant_override = saved_ov;
-    trunk.Transformer.mtp_head_kv_quant_override = true;
+    const saved_ov = trunk.Trunk.mtp_head_kv_quant_override;
+    defer trunk.Trunk.mtp_head_kv_quant_override = saved_ov;
+    trunk.Trunk.mtp_head_kv_quant_override = true;
     const saved_boot = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_boot;
     launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
@@ -8169,7 +8169,7 @@ test "a warm restore whose buffers hold the prompt but not the reservation bills
         const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
         const reserved = @max(reservedCacheTokens(seq, 32_000, chunk, getEffectiveContextLength(cfg)), seq);
         try t.expect(seq <= capacity and capacity < reserved);
-        const window = capacity * kv / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(cfg, trunk.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+        const window = capacity * kv / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS);
         try t.expect(window > 0 and window < capacity * kv);
         for ([_]bool{ true, false }) |donate| {
             const warm = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = donate };

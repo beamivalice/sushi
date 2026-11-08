@@ -5,7 +5,7 @@ const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const std = @import("std");
 const qwen4_state = @import("qwen4_state.zig");
 const disk_format = @import("../disk_format.zig");
@@ -999,7 +999,7 @@ pub fn qsaAllBlocksVisible(offset: c_int, nb: c_int, ratio: c_int) bool {
 
 /// `n` columns of the block-score matmul's key operand: `[B, 1, hd, n]` f32, the pooled
 /// bank transposed and up-cast.
-pub fn qsaScoreCols(self: *Transformer, pooled: mlx.mlx_array, batch: c_int, n: c_int, idx_hd: c_int) !mlx.mlx_array {
+pub fn qsaScoreCols(self: *Trunk, pooled: mlx.mlx_array, batch: c_int, n: c_int, idx_hd: c_int) !mlx.mlx_array {
     var k_rope = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k_rope);
     try mlx.check(mlx.mlx_reshape(&k_rope, pooled, &[_]c_int{ batch, 1, n, idx_hd }, 4, self.s));
@@ -1016,7 +1016,7 @@ pub fn qsaScoreCols(self: *Transformer, pooled: mlx.mlx_array, batch: c_int, n: 
 /// The score operand for `nb` blocks, borrowed. Built only on the composed arm.
 /// A completed block appends columns; from-scratch rebuilds after restore, a cold
 /// entry, or rollback.
-pub fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int) !mlx.mlx_array {
+pub fn qsaScoreBank(self: *Trunk, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int) !mlx.mlx_array {
     if (entry.qsa_score_bank.ctx != null and entry.qsa_score_blocks == nb) return entry.qsa_score_bank;
     const old_nb = entry.qsa_score_blocks;
     const ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
@@ -1058,13 +1058,13 @@ pub fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb:
     return entry.qsa_score_bank;
 }
 
-pub fn qsaScoreOperand(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int, fused: bool) !mlx.mlx_array {
+pub fn qsaScoreOperand(self: *Trunk, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int, fused: bool) !mlx.mlx_array {
     if (fused) return .{ .ctx = null };
     return qsaScoreBank(self, entry, batch, nb, idx_hd);
 }
 
 /// The pooled-block cos/sin for this forward, built on first ask. Borrowed handles.
-pub fn qsaPooledCosSin(self: *Transformer, ctx: *ForwardCtx, rope_dims: c_int, base: c_int, step: c_int, n: c_int, dt: mlx.mlx_dtype) !Transformer.MropeCosSin {
+pub fn qsaPooledCosSin(self: *Trunk, ctx: *ForwardCtx, rope_dims: c_int, base: c_int, step: c_int, n: c_int, dt: mlx.mlx_dtype) !Trunk.MropeCosSin {
     const is_mrope = ctx.arch_ctx.qwen4.mrope_pos != null;
     const c = &self.arch_state.qwen4.qsa_pooled_rope;
     if (c.stale.load(.acquire)) c.deinit();
@@ -1096,7 +1096,7 @@ pub fn qsaPooledCosSin(self: *Transformer, ctx: *ForwardCtx, rope_dims: c_int, b
 /// Pooled block keys `[B, nb, D]` from raw index keys `kb4 [B, nb, ratio, D]`: f32 block mean,
 /// bf16, idx_k_norm, then partial RoPE at the block starts `base + i*ratio`. Text turns take
 /// one fused kernel, bit-identical to the chain; M-RoPE and other shapes keep the chain.
-pub fn qsaPooledKeys(self: *Transformer, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, rope_dims: c_int, base: c_int) !mlx.mlx_array {
+pub fn qsaPooledKeys(self: *Trunk, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, rope_dims: c_int, base: c_int) !mlx.mlx_array {
     const sh = mlx.getShape(kb4);
     if (ctx.arch_ctx.qwen4.mrope_pos == null and qsaPoolRopeFusedEnabled() and mlx.mlx_array_dtype(norm_w) == .bfloat16) {
         const cs = try qsaPooledCosSin(self, ctx, rope_dims, base, sh[2], sh[1], .bfloat16);
@@ -1130,7 +1130,7 @@ pub fn qsaSlotEntry(sc: *ForwardCtx, layer: u32) *SSMCacheEntry {
     return &sc.ssm_entries.?[layer];
 }
 
-pub fn qsaMask(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+pub fn qsaMask(self: *Trunk, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
     const qk = try self.qmatmul(x, &fa.idx_qk); // [B,S,(n+1)*hd]
     defer _ = mlx.mlx_array_free(qk);
     if (ctx.batch_slots) |slots| return qsaMaskBatched(self, slots, qk, fa, layer);
@@ -1142,7 +1142,7 @@ pub fn qsaMask(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *cons
 /// position, and the per-slot masks are false-padded to the group's
 /// longest kv and stacked to `[N,1,1,kv_max]`. Null-ctx when no slot is
 /// past the budget (dense group — the plain batched mask suffices).
-pub fn qsaMaskBatched(self: *Transformer, slots: []const *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, layer: u32) !mlx.mlx_array {
+pub fn qsaMaskBatched(self: *Trunk, slots: []const *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, layer: u32) !mlx.mlx_array {
     const N = slots.len;
     // The per-slot ctxs have no other net: without this one throw orphaned a slot's selection.
     errdefer for (slots) |sc| {
@@ -1222,11 +1222,11 @@ pub fn qsaMaskBatched(self: *Transformer, slots: []const *ForwardCtx, qk: mlx.ml
         const high = [_]c_int{kv_max - kv_lens[i]};
         try mlx.check(mlx.mlx_pad(&padded[i], row, &pad_axes, 1, &low, 1, &high, 1, false_v, "constant", self.s));
     }
-    return Transformer.concatAxis0(self.s, padded);
+    return Trunk.concatAxis0(self.s, padded);
 }
 
 /// Serial per-slot body of `qsaMask` over the projected `qk` rows.
-pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32) !mlx.mlx_array {
+pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32) !mlx.mlx_array {
     const offset = cache_len;
     const cfg = &self.config;
     const n_idx: c_int = @intCast(cfg.indexer_n_heads);
@@ -1290,8 +1290,8 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
 
     if (kv <= budget + ratio - 1) return mlx.mlx_array_new();
     std.debug.assert(batch == 1);
-    if (!Transformer.qsa_engaged_logged) {
-        Transformer.qsa_engaged_logged = true;
+    if (!Trunk.qsa_engaged_logged) {
+        Trunk.qsa_engaged_logged = true;
         log.info("[qsa] sparse attention engaged: kv={d} blocks={d} top-{d} (budget {d}, ratio {d})\n", .{ kv, @divTrunc(kv, ratio), block_topk, budget, ratio });
     }
 
@@ -1411,7 +1411,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
 
 /// Block selection -> dense `[B,1,S,kv]` QSA mask, as pure ops. `vis3` may be null-ctx
 /// (every block complete); every consumer must then skip its own op, since mlx-c aborts
-/// on a null handle. Split out so the all-visible claim is testable without a Transformer.
+/// on a null handle. Split out so the all-visible claim is testable without a Trunk.
 pub fn qsaSelectMaskOps(
     alloc: std.mem.Allocator,
     s: mlx.mlx_stream,
@@ -1491,7 +1491,7 @@ pub fn qsaSelectMaskOps(
 
 /// Block visibility [1,S,nb]: block blk is complete for the query at
 /// cache position p iff blk*ratio + ratio - 1 <= p. The block-end column comes from `qsa_consts`.
-pub fn qsaBlockVisibility(self: *Transformer, offset: c_int, seq_len: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
+pub fn qsaBlockVisibility(self: *Trunk, offset: c_int, seq_len: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
     const s = self.s;
     try self.arch_state.qwen4.qsa_consts.ensure(s, nb, ratio);
     var pos_col = mlx.mlx_array_new();
@@ -1511,7 +1511,7 @@ pub fn qsaBlockVisibility(self: *Transformer, offset: c_int, seq_len: c_int, nb:
 /// One row-chunk of the block selection: the top-`kb` visible blocks per row, ascending,
 /// INT_MAX past the row's count. Under `all_vis` the visibility sheet and both `where`s are
 /// identities and are skipped; the fused arm reads the same claim through `qsaVisibleBoundsHost`.
-pub fn qsaChunkSelect(self: *Transformer, scores: mlx.mlx_array, canonical: mlx.mlx_array, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
+pub fn qsaChunkSelect(self: *Trunk, scores: mlx.mlx_array, canonical: mlx.mlx_array, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
     if (canonical.ctx == null and qsaSelectKernelEnabled() and mlx.streamIsGpu(self.s)) {
         // The whole composed tail in one dispatch; bounds are host arithmetic.
         const bounds_host = try self.allocator.alloc(i32, @intCast(rows));
@@ -1542,7 +1542,7 @@ pub fn qsaChunkSelect(self: *Transformer, scores: mlx.mlx_array, canonical: mlx.
 /// int32). Row-chunked so the [n_idx, rows, nb] f32 score sheet stays
 /// under `qsaScoreSheetBudget()`. `k32t` is the pooled key bank
 /// [1,1,hd,nb] f32.
-pub fn qsaSelectBlocks(self: *Transformer, q_rope: mlx.mlx_array, k32t: mlx.mlx_array, pooled: mlx.mlx_array, offset: c_int, seq_len: c_int, nb: c_int, block_topk: c_int, fused: bool) !mlx.mlx_array {
+pub fn qsaSelectBlocks(self: *Trunk, q_rope: mlx.mlx_array, k32t: mlx.mlx_array, pooled: mlx.mlx_array, offset: c_int, seq_len: c_int, nb: c_int, block_topk: c_int, fused: bool) !mlx.mlx_array {
     const n_idx: c_int = @intCast(self.config.indexer_n_heads);
     const idx_hd: c_int = @intCast(self.config.indexer_head_dim);
     const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
@@ -1589,7 +1589,7 @@ pub fn qsaSelectBlocks(self: *Transformer, q_rope: mlx.mlx_array, k32t: mlx.mlx_
 }
 
 pub fn qsaBatchedAttn(
-    self: *Transformer,
+    self: *Trunk,
     ctx: *ForwardCtx,
     slots: []const *ForwardCtx,
     q_rope: mlx.mlx_array,
@@ -1646,15 +1646,15 @@ pub fn qsaPoolRopeFusedEnabled() bool {
     return qsa_pool_rope_fused_override orelse true;
 }
 
-pub fn resetQsaPooledRope(self: *Transformer) void {
+pub fn resetQsaPooledRope(self: *Trunk) void {
     self.arch_state.qwen4.qsa_pooled_rope.deinit();
 }
 
-pub fn markQsaPooledRopeStale(self: *Transformer) void {
+pub fn markQsaPooledRopeStale(self: *Trunk) void {
     self.arch_state.qwen4.qsa_pooled_rope.stale.store(true, .release);
 }
 
-pub fn qsaInstallRing(_: *Transformer, entry: *SSMCacheEntry, src: mlx.mlx_array, s: mlx.mlx_stream) !void {
+pub fn qsaInstallRing(_: *Trunk, entry: *SSMCacheEntry, src: mlx.mlx_array, s: mlx.mlx_stream) !void {
     const sh = mlx.getShape(src);
     const rows = sh[1];
     const n: c_int = @min(rows, QSA_RING_ROWS);
@@ -1694,7 +1694,7 @@ pub fn qsaInstallRing(_: *Transformer, entry: *SSMCacheEntry, src: mlx.mlx_array
 
 /// Append this forward's raw indexer keys `[B, S, hd]` to the layer's QSA ring and
 /// republish `entry.aux_state` as the tight view. `offset` is the authority the accelerator is checked against.
-pub fn qsaAppendKeys(self: *Transformer, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, offset: c_int) !void {
+pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, offset: c_int) !void {
     const s = self.s;
     const add = mlx.getShape(k_raw)[1];
     const held: c_int = if (entry.aux_state.ctx != null) mlx.getShape(entry.aux_state)[1] else 0;
@@ -1744,7 +1744,7 @@ pub fn qsaAppendKeys(self: *Transformer, entry: *SSMCacheEntry, k_raw: mlx.mlx_a
 
 /// Extend the pooled block-key bank by `new3` and republish `entry.qsa_pooled` as the tight
 /// view, byte-identical to the old `concatenate`. A `nb_cached` mismatch re-seeds.
-pub fn qsaAppendPooled(self: *Transformer, entry: *SSMCacheEntry, new3: mlx.mlx_array, nb_cached: c_int) !void {
+pub fn qsaAppendPooled(self: *Trunk, entry: *SSMCacheEntry, new3: mlx.mlx_array, nb_cached: c_int) !void {
     const s = self.s;
     if (!(entry.qsa_pooled_buf.ctx != null and entry.qsa_pooled_blocks == nb_cached)) {
         if (entry.qsa_pooled_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_pooled_buf);
@@ -1762,7 +1762,7 @@ pub fn qsaAppendPooled(self: *Transformer, entry: *SSMCacheEntry, new3: mlx.mlx_
 }
 
 /// `rms_norm(bf16(mean_f32(kb4, axis 2)), w)` → `[B, nb, D]`.
-pub fn qsaPoolNorm(self: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array) !mlx.mlx_array {
+pub fn qsaPoolNorm(self: *Trunk, kb4: mlx.mlx_array, norm_w: mlx.mlx_array) !mlx.mlx_array {
     var kb_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(kb_f32);
     try mlx.check(mlx.mlx_astype(&kb_f32, kb4, .float32, self.s));
@@ -1776,7 +1776,7 @@ pub fn qsaPoolNorm(self: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array
 }
 
 /// Scalar partial RoPE of the normed pooled keys `pn [B, nb, D]`, row i at cos/sin row i.
-pub fn qsaPooledRopeComposed(self: *Transformer, pn: mlx.mlx_array, rope_dims: c_int, cosv: mlx.mlx_array, sinv: mlx.mlx_array) !mlx.mlx_array {
+pub fn qsaPooledRopeComposed(self: *Trunk, pn: mlx.mlx_array, rope_dims: c_int, cosv: mlx.mlx_array, sinv: mlx.mlx_array) !mlx.mlx_array {
     const sh = mlx.getShape(pn);
     var pn4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pn4);
@@ -1794,7 +1794,7 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     t.config = .{};
@@ -1869,7 +1869,7 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     t.config = .{};
@@ -1897,7 +1897,7 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     try testing.expectEqual(@as(usize, 1), t.arch_state.qwen4.qsa_pooled_rope.builds);
 
     const Worker = struct {
-        fn run(xfm: *Transformer) void {
+        fn run(xfm: *Trunk) void {
             markQsaPooledRopeStale(xfm);
         }
     };

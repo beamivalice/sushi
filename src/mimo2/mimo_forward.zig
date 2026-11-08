@@ -4,7 +4,7 @@ const trunk_mod = @import("../trunk.zig");
 const forward_diag = @import("../forward_diag.zig");
 const moe_router = @import("../moe_router.zig");
 const nax_gate = @import("../nax_gate.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const std = @import("std");
 const fp8_block = @import("../fp8_block.zig");
 const mlx = @import("../mlx.zig");
@@ -474,7 +474,7 @@ pub fn mimoAttnArm(verify_rows: bool, is_prefill: bool, is_global: bool, seq_len
     return if (seq_len < FUSED256_MIN_Q_LEN) .prefill_rows else .prefill_global;
 }
 
-pub fn computeMimoRouting(self: *const Transformer, router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array) !Transformer.MoeRouting {
+pub fn computeMimoRouting(self: *const Trunk, router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array) !Trunk.MoeRouting {
     const k: c_int = @intCast(self.config.num_experts_per_tok);
     if (self.config.moe_n_group > 1) {
         return groupLimitedRouting(
@@ -516,31 +516,31 @@ pub const MimoWarmRows = u32;
 // A MiMo verify row keeps its decode tick's arithmetic, so each row count JITs its own FP8,
 // EXL3 and qmv pipelines, and the packed global attention its matmul2d set past the key
 // floor; left to the first request, each compile stalled a round 450-630 ms on a new binary.
-pub fn warmupMimoVerify(self: *Transformer, kv_config: KVQuantConfig) !MimoWarmRows {
+pub fn warmupMimoVerify(self: *Trunk, kv_config: KVQuantConfig) !MimoWarmRows {
     forward_diag.moe_dump_warmup_depth += 1;
     defer forward_diag.moe_dump_warmup_depth -= 1;
     if (!self.config.isMimo()) return 0;
-    const sl = try Transformer.SpecWarmSlot.init(self, kv_config);
+    const sl = try Trunk.SpecWarmSlot.init(self, kv_config);
     defer {
         sl.deinit(self.allocator);
         _ = mlx.mlx_clear_cache();
     }
     if (self.config.swaRingTokens() > 0) sl.cache.setSwaRing(self.config.sliding_window);
     var prompt_ids: [8]i32 = undefined;
-    const prompt = Transformer.specWarmIds(&prompt_ids);
+    const prompt = Trunk.specWarmIds(&prompt_ids);
     defer _ = mlx.mlx_array_free(prompt);
-    Transformer.specWarmEvalFree(&[_]mlx.mlx_array{try self.forwardWith(&sl.ctx, prompt)});
+    Trunk.specWarmEvalFree(&[_]mlx.mlx_array{try self.forwardWith(&sl.ctx, prompt)});
     var warmed: MimoWarmRows = 0;
     sl.ctx.verify_rows = true;
     var rows: usize = 2;
     while (rows <= MIMO_VERIFY_ROWS_MAX) : (rows += 1) {
         var ids: [@intCast(MIMO_VERIFY_ROWS_MAX)]i32 = undefined;
-        const block = Transformer.specWarmIds(ids[0..rows]);
+        const block = Trunk.specWarmIds(ids[0..rows]);
         defer _ = mlx.mlx_array_free(block);
         var last = mlx.mlx_array_new();
         var all = mlx.mlx_array_new();
         const logits = try self.forwardWithCaptureAll(&sl.ctx, block, &last, &all);
-        Transformer.specWarmEvalFree(&[_]mlx.mlx_array{ logits, last, all });
+        Trunk.specWarmEvalFree(&[_]mlx.mlx_array{ logits, last, all });
         warmed |= @as(MimoWarmRows, 1) << @intCast(rows);
     }
     if (kv_config.isQuant() and mimoDecodeUsesNax()) mimoWarmPackedDecode(&self.config, kv_config);
@@ -554,7 +554,7 @@ pub fn warmupMimoVerify(self: *Transformer, kv_config: KVQuantConfig) !MimoWarmR
 /// logits `[1, 1, V]`; caller owns each and the slice. `hidden_rows`, when given, receives
 /// every row's final-normed hidden `[1, 1, H]` (what a solo tick captures for the MTP heads).
 pub fn forwardMimoBatchedDecode(
-    self: *Transformer,
+    self: *Trunk,
     next_tokens: []const u32,
     ctxs: []const *ForwardCtx,
     rope_offsets: []const u32,
@@ -604,16 +604,16 @@ pub fn forwardMimoBatchedDecode(
         var as_rows = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(as_rows);
         try mlx.check(mlx.mlx_reshape(&as_rows, normed, &[_]c_int{ @intCast(n), 1, hidden }, 3, self.s));
-        dst.* = try Transformer.sliceBatchRows(self.allocator, self.s, as_rows, n);
+        dst.* = try Trunk.sliceBatchRows(self.allocator, self.s, as_rows, n);
     }
     return out;
 }
 
-pub fn supportsBatchedMimoDecode(self: *const Transformer) bool {
+pub fn supportsBatchedMimoDecode(self: *const Trunk) bool {
     return self.config.supportsBatchedMimoDecode() and self.moe_layers != null and self.expert_stream == null;
 }
 
-pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+pub fn forwardMoeWith(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
     const dumping = moeDumpBeginForward();
     defer if (dumping) moeDumpForwardDone();
     self.fwd_gen +%= 1; // per-forward QSA scratch key
@@ -695,8 +695,8 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     // Eval cadence: drop to per-layer when this chunk's score/dequant
     // transients are large (unfused head_dim > 128 at long ctx, or a
     // quantized cache's dense rebuild) — see prefillEvalCadence.
-    const moe_eval_cadence = Transformer.prefillEvalCadence(
-        Transformer.PREFILL_EVAL_CADENCE_DEFAULT,
+    const moe_eval_cadence = Trunk.prefillEvalCadence(
+        Trunk.PREFILL_EVAL_CADENCE_DEFAULT,
         cfg.head_dim,
         cfg.num_attention_heads,
         cfg.num_key_value_heads,
@@ -806,8 +806,8 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
             }
         }
 
-        if (is_prefill and Transformer.prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
-            try Transformer.evalCadencePoint(h, ctx.ssm_entries);
+        if (is_prefill and Trunk.prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
+            try Trunk.evalCadencePoint(h, ctx.ssm_entries);
         }
         self.ladderStep(h, layer_idx, seq_len);
         dt.layer(h, layer_idx);
@@ -854,7 +854,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 /// MiMo decode or verify rows whose FP8 QKV left V scaled, on a kv8 or kv6 g64 cache: Q/K rope and
 /// the K/V quantize run as one dispatch and K/V append already quantized. Null = composed path.
 pub fn mimoDecodePrep(
-    self: *Transformer,
+    self: *Trunk,
     ctx: *ForwardCtx,
     proj: [3]mlx.mlx_array,
     is_global: bool,
@@ -889,7 +889,7 @@ pub fn mimoDecodePrep(
 /// layers with their sinks, sink-free global layers), a packed global decode
 /// `sushi_qkv_mpp`; the rest is native SDPA.
 pub fn mimoAttnWith(
-    self: *Transformer,
+    self: *Trunk,
     ctx: *ForwardCtx,
     x: mlx.mlx_array,
     fa: *const FullAttnWeights,
@@ -942,7 +942,7 @@ pub fn mimoAttnWith(
 /// Rope, KV append and attention of one MiMo layer over the QKV projection `proj`, on
 /// `ctx`'s cache at `offset`: `[batch, heads, seq_len, v_dim]`.
 pub fn mimoAttnCore(
-    self: *Transformer,
+    self: *Trunk,
     ctx: *ForwardCtx,
     proj: [3]mlx.mlx_array,
     fa: *const FullAttnWeights,
@@ -1076,7 +1076,7 @@ pub fn mimoAttnCore(
 /// Row i of a batched decode attends as slot i's own decode tick: row i of the QKV
 /// projection through `mimoAttnCore` on that slot's cache at its offset. `[1, heads, N, v_dim]`.
 pub fn mimoBatchRowsAttn(
-    self: *Transformer,
+    self: *Trunk,
     rows: []const *ForwardCtx,
     offsets: []const u32,
     proj: [3]mlx.mlx_array,
@@ -1113,7 +1113,7 @@ pub fn mimoBatchRowsAttn(
     return out;
 }
 
-pub fn mimoRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+pub fn mimoRouterLogits(self: *Trunk, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
     // MiMo routing is defined over f32 activations and f32 router weights,
     // independently of the residual/expert storage dtype.
     var x32 = mlx.mlx_array_new();
@@ -1129,7 +1129,7 @@ pub fn mimoRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const 
 /// MiMo keeps the normalized sigmoid weights in f32 until the expert sum. The
 /// reference only narrows the final residual, so bf16 routing weights change
 /// near-tied expert contributions even when selection is unchanged.
-pub fn mimoRoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: c_int, route_norm: bool, route_scale: f32, s: mlx.mlx_stream) !Transformer.MoeRouting {
+pub fn mimoRoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: c_int, route_norm: bool, route_scale: f32, s: mlx.mlx_stream) !Trunk.MoeRouting {
     return sigmoidBiasRoutingChain(router_logits, expert_bias, k, route_norm, route_scale, .float32, s);
 }
 
@@ -2542,7 +2542,7 @@ pub fn groupLimitedRouting(
     route_norm: bool,
     route_scale: f32,
     s: mlx.mlx_stream,
-) !Transformer.MoeRouting {
+) !Trunk.MoeRouting {
     // One dispatch instead of ~28. Weights stay f32 for the reason the comment
     // at the tail of this function gives, so the fused kernel is asked for f32
     // too. A decline (geometry outside the kernel's set, kill switch) falls
@@ -2647,7 +2647,7 @@ pub fn sigmoidBiasRoutingChain(
     route_scale: f32,
     output_dtype: mlx.mlx_dtype,
     s: mlx.mlx_stream,
-) !Transformer.MoeRouting {
+) !Trunk.MoeRouting {
     var logits_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(logits_f32);
     try mlx.check(mlx.mlx_astype(&logits_f32, router_logits, .float32, s));
@@ -2850,7 +2850,7 @@ fn addRmsNormKernel(
     eps_arr: mlx.mlx_array,
     f32_copy: bool,
 ) !?AddNormResult {
-    // A Transformer built by a construction site that predates `rms_eps_arr`
+    // A Trunk built by a construction site that predates `rms_eps_arr`
     // would hand us a null handle; decline rather than pass it to mlx.
     if (w.ctx == null or eps_arr.ctx == null) return null;
     const dt = mlx.mlx_array_dtype(a);

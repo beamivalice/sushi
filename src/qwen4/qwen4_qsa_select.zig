@@ -45,7 +45,7 @@ const MoeDecodeDispatchArm = trunk_mod.MoeDecodeDispatchArm;
 const QSA_SCORE_KERNEL_HEADER = trunk_mod.QSA_SCORE_KERNEL_HEADER;
 const QsaCfgCache = trunk_mod.QsaCfgCache;
 const SSMCacheEntry = trunk_mod.SSMCacheEntry;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const VqmmLane = trunk_mod.VqmmLane;
 const moeDecodeDispatchArm = trunk_mod.moeDecodeDispatchArm;
 const qsaProbeAllFinite = trunk_mod.qsaProbeAllFinite;
@@ -780,7 +780,7 @@ fn qsaPoolCancelKeys(rnd: std.Random, nb: c_int, ratio: c_int, s: mlx.mlx_stream
 /// The served Flash-Next indexer: 4 x 128 index heads, ratio 4, rope theta 1e7 on 64 of 256 dims,
 /// and (`yarn`) the packs' YaRN x4 over 262144 with its bf16 mscale on the cos/sin table.
 const QsaPoolTestTrunk = struct {
-    t: Transformer,
+    t: Trunk,
     inv: [32]f64,
     freqs: mlx.mlx_array,
 
@@ -823,7 +823,7 @@ const QsaPoolTestTrunk = struct {
     }
 
     /// The indexer's table for `nb` blocks from `base`, as `qsaPooledCosSin` builds it on a text turn.
-    fn cosSin(self: *QsaPoolTestTrunk, base: c_int, ratio: c_int, nb: c_int) !Transformer.MropeCosSin {
+    fn cosSin(self: *QsaPoolTestTrunk, base: c_int, ratio: c_int, nb: c_int) !Trunk.MropeCosSin {
         const t = &self.t;
         return t.ropeCosSinFromFreqs(64, try t.ropeInvFreq(64, t.config.rope_theta), @floatFromInt(base), @floatFromInt(ratio), nb, .bfloat16);
     }
@@ -860,7 +860,7 @@ fn qsaRandScoresF32(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
     return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
 }
 
-/// The `[1, rows, nb]` bool visibility sheet the composed arm masks with, free of a Transformer.
+/// The `[1, rows, nb]` bool visibility sheet the composed arm masks with, free of a Trunk.
 fn qsaVisSheetForTest(s: mlx.mlx_stream, row0: c_int, rows: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
     var blk_end = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(blk_end);
@@ -1367,7 +1367,7 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     t.config = .{};
@@ -2502,7 +2502,7 @@ test "qsa score fused: no bank is built under the fused arm" {
     if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     xfm.arch_state.qwen4.qsa_score_bank_builds = 0;

@@ -12,7 +12,7 @@
 //! lives on `Slot` itself; each slot's `ForwardCtx` points at those fields,
 //! and the `Generator` constructed for the slot stores the ctx so
 //! `xfm.forwardWith(&self.ctx, ...)` routes through slot-local state. The
-//! shared Transformer holds the weights only — single-writer-per-tick on
+//! shared Trunk holds the weights only — single-writer-per-tick on
 //! the inference thread guards correctness while many slots can be in
 //! flight at once.
 //!
@@ -65,7 +65,7 @@ const io_util = @import("io_util.zig");
 const status = @import("status.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const KVCache = trunk.KVCache;
 const SSMCacheEntry = trunk.SSMCacheEntry;
 const ForwardCtx = model_handle.ForwardCtx;
@@ -908,7 +908,7 @@ pub const Slot = struct {
 /// inference thread drains the queue between ticks. The conn thread parses
 /// `config.json` / tokenizer / chat_config on its own thread (CPU only,
 /// no mlx ops) and hands the pre-parsed CPU state to the inference thread,
-/// which does the mlx-allocating work (weights + Transformer + vision +
+/// which does the mlx-allocating work (weights + Trunk + vision +
 /// drafter + JIT + warmup) and installs everything on `entry`.
 ///
 /// Eviction: when set, `evict_entry` is unloaded on the inference thread
@@ -1016,7 +1016,7 @@ threadlocal var last_load_context_refusal: ?model_registry_mod.MemoryContextRefu
 
 /// Continuous-batching scheduler. One per server. Owns the inference
 /// thread, the queue of in-flight slots, AND (post-A1) the loaded model
-/// state — Transformer + weights + vision encoder + drafter all live here,
+/// state — Trunk + weights + vision encoder + drafter all live here,
 /// allocated on the inference thread so mlx's thread-local GPU stream is
 /// bound on the right thread from the start.
 pub const Scheduler = struct {
@@ -1035,7 +1035,7 @@ pub const Scheduler = struct {
     // ── Borrowed views (non-owning). Cleared on shutdown via
     //    `clearCurrentModelViews`. Null only before load completes or after
     //    an eviction in Phase D.
-    xfm: ?*Transformer,
+    xfm: ?*Trunk,
     weights: ?*Weights,
     vision_encoder: ?*VisionEncoder,
     dflash: ?*DflashModel = null,
@@ -3515,7 +3515,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Phase D: per-slot model — pull transformer + prefix cache off the
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
-    const xfm_ptr: *Transformer = slot.model.transformer.?;
+    const xfm_ptr: *Trunk = slot.model.transformer.?;
     if (slot.model.prefix_cache) |*hc| {
         {
             // Only build a restore target when this request will actually
@@ -3535,7 +3535,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             var mtp_base: usize = 0;
             const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
             // qwen4_exp: the head's QSA half travels with its KV; adoption is all-or-nothing.
-            const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
+            const mtp_head: ?*Trunk = if (mtp_target) |*mc| mc.head() else null;
             // Restore by move: the slot names itself, opting into the checkout; `finishSlot`
             // releases it on every path that ends the slot.
             const dfl_restore: ?prefix_cache_mod.DflashTarget = if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null;
@@ -4767,7 +4767,7 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
 /// A GDN group with a slot that has no recurrent state yet cannot merge: it decodes serially this
 /// tick (skipping would advance nothing, so a group that never becomes ready would spin). Decided
 /// before `batchedTickRows` so a slot's pending token is stop-checked on exactly one path.
-fn serialFallback(sch: *Scheduler, xfm: *const Transformer, active: []*Slot, comptime serial: anytype) !bool {
+fn serialFallback(sch: *Scheduler, xfm: *const Trunk, active: []*Slot, comptime serial: anytype) !bool {
     const all_ready = for (active) |s| {
         const gen = if (s.legacy_gen) |*g| g else continue;
         if (!sched.readyToBatch(xfm, &gen.ctx)) break false;
@@ -4786,7 +4786,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // (`runDecodeTick`) partitions by `slot.model` before dispatching here.
     // The first slot's transformer is authoritative; debug-assert the rest
     // match to surface partitioning bugs early.
-    const xfm_ptr: *Transformer = active[0].model.transformer.?;
+    const xfm_ptr: *Trunk = active[0].model.transformer.?;
     if (std.debug.runtime_safety) {
         for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
     }
@@ -5231,7 +5231,7 @@ test "retained position: a padded row can never take the full-accept arm" {
 test "single MTP slot reaches the round entry through runDecodeTick" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("mimo2") or !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     try mlx.requireGpu();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
     model.transformer = null;
     var gen: Generator = undefined;
@@ -5353,7 +5353,7 @@ test "a slot the batched tick hands back to the serial path counts its pending p
             _ = try slot.legacy_gen.?.checkStop();
         }
     };
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.config.model_type = "qwen4_exp";
     xfm.config.full_attention_interval = 4;
     xfm.arch_state = .{};

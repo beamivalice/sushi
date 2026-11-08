@@ -268,7 +268,7 @@ pub const Loaded = struct {
     tok: tokenizer_mod.Tokenizer,
     chat_config: chat_mod.ChatConfig,
     weights: model_mod.Weights,
-    xfm: trunk.Transformer,
+    xfm: trunk.Trunk,
 
     pub fn deinit(self: *Loaded) void {
         const allocator = self.allocator;
@@ -351,7 +351,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     errdefer self.weights.deinit();
     model_mod.resolveWeightPrefix(&self.config, &self.weights);
 
-    self.xfm = try trunk.Transformer.init(io, allocator, self.config, &self.weights);
+    self.xfm = try trunk.Trunk.init(io, allocator, self.config, &self.weights);
     errdefer self.xfm.deinit();
     if (opts.kv_quant_config.scheme != .off) {
         try self.xfm.cache.reinit(self.config.num_hidden_layers, opts.kv_quant_config);
@@ -373,7 +373,7 @@ fn logitsVocab(logits: mlx.mlx_array) !usize {
     return @intCast(shape[2]);
 }
 
-pub fn readLastRow(xfm: *trunk.Transformer, logits: mlx.mlx_array, dst: []f32) !void {
+pub fn readLastRow(xfm: *trunk.Trunk, logits: mlx.mlx_array, dst: []f32) !void {
     const shape = mlx.getShape(logits);
     if (shape.len != 3 or @as(usize, @intCast(shape[2])) != dst.len) return error.KldLogitsShape;
     var row = mlx.mlx_array_new();

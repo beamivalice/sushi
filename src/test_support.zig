@@ -9,12 +9,12 @@ const mimo_forward = @import("mimo2/mimo_forward.zig");
 const testing = std.testing;
 const KVCacheSnapshot = trunk.KVCacheSnapshot;
 const MoeMlpWeights = trunk.MoeMlpWeights;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const bindLinears = @import("layer_weights.zig").bindLinears;
 
 
 pub const Exl3MoeHarness = struct {
-    xfm: Transformer,
+    xfm: Trunk,
     x: mlx.mlx_array,
     mw: MoeMlpWeights,
     owned: [10]mlx.mlx_array,
@@ -454,7 +454,7 @@ pub fn mimoExpectClose(label: []const u8, actual: []const f32, expected: []const
 /// router is flat, so the normalized routed sum is one expert's own output
 /// whichever top-k the GPU picks — that is the host oracle.
 pub const MimoExl3MoeHarness = struct {
-    xfm: Transformer,
+    xfm: Trunk,
     x: mlx.mlx_array,
     mw: MoeMlpWeights,
     owned: [10]mlx.mlx_array,

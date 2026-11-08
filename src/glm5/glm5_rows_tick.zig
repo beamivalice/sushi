@@ -14,7 +14,7 @@ const metrics_mod = @import("../metrics.zig");
 const model_registry_mod = @import("../model_registry.zig");
 const log = @import("../log.zig");
 const io_util = @import("../io_util.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const SamplingParams = sampler.SamplingParams;
@@ -199,7 +199,7 @@ var glm_tree_logged = false;
 /// decodes one plain row, committed by its own generator, unless `glmTreeNodes` hands the spare
 /// rows to the best drafter's DFlash2 tree: that slot's round is published here and it leaves
 /// `batch`. Returns the plain rows' logits in the order of the shortened `batch`.
-pub fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transformer, batch: *[]*Slot, tokens: []const u32) ![]mlx.mlx_array {
+pub fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Trunk, batch: *[]*Slot, tokens: []const u32) ![]mlx.mlx_array {
     const verifier = @import("glm5_dflash_model.zig");
     const target = glm5_state.modelOf(xfm).?;
     target.s = xfm.s;

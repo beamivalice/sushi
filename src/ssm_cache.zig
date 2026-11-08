@@ -24,7 +24,7 @@ pub const SSMCacheEntry = struct {
     ssm_state: mlx.mlx_array, // [B, Hv, Dv, Dk]
     initialized: bool,
     /// PLD spec-decode capture: per-position SSM states recorded by the GDN
-    /// verify forward (`Transformer.spec_capture_ssm`). Shape [T, B, Hv, Dv, Dk]
+    /// verify forward (`Trunk.spec_capture_ssm`). Shape [T, B, Hv, Dv, Dk]
     /// where T = verify length. Lets partial-accept rollback pick the
     /// accepted-position state WITHOUT a re-forward — the verify already ran the
     /// (sequential, expensive on a 48-layer GatedDeltaNet trunk) recurrence, so

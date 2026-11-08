@@ -36,7 +36,7 @@ pub const aux = struct {
 
 /// The in-checkpoint MTP head's snapshot (KV and QSA aux together) adopted into the model's own head. Null leaves
 /// the head blind, which costs acceptance and never a token.
-pub fn adoptSpecHead(xfm: *trunk_mod.Transformer, plan: pc.SpecAdopt, snap: *const pc.DflashSnap, base_pos: *usize) ?usize {
+pub fn adoptSpecHead(xfm: *trunk_mod.Trunk, plan: pc.SpecAdopt, snap: *const pc.DflashSnap, base_pos: *usize) ?usize {
     const want = switch (plan) {
         .head => |w| w,
         .decline_head_no_history => {

@@ -14,7 +14,7 @@ const qwen4ReadF32 = test_support.qwen4ReadF32;
 const ForwardCtx = trunk_mod.ForwardCtx;
 const KVCache = trunk_mod.KVCache;
 const SSMCacheEntry = trunk_mod.SSMCacheEntry;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const nextSsmMemberGen = qwen4_ssm_group.nextSsmMemberGen;
 const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
 const ssmFreeSpecCapture = trunk_mod.ssmFreeSpecCapture;
@@ -93,7 +93,7 @@ pub const Qwen4TestSlot = struct {
         sl.cache.deinit();
         alloc.destroy(sl);
     }
-    pub fn forward(sl: *Qwen4TestSlot, xfm: *Transformer, ids: []const i32) !mlx.mlx_array {
+    pub fn forward(sl: *Qwen4TestSlot, xfm: *Trunk, ids: []const i32) !mlx.mlx_array {
         const shape = [_]c_int{ 1, @intCast(ids.len) };
         const arr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &shape, 2, .int32);
         defer _ = mlx.mlx_array_free(arr);
@@ -107,7 +107,7 @@ const Qwen4BatchedPleRun = struct {
 };
 
 pub fn qwen4BatchedPleForward(
-    xfm: *Transformer,
+    xfm: *Trunk,
     slots: []const *Qwen4TestSlot,
     ids: []const i32,
     seq_len: c_int,
@@ -216,7 +216,7 @@ pub fn logicalSsmCapture(s: mlx.mlx_stream, entry: *const SSMCacheEntry) !mlx.ml
         parts[built] = mlx.mlx_array_new();
         built += 1;
         try mlx.check(mlx.mlx_expand_dims(&parts[built - 1], entry.ssm_state, 0, s));
-        return Transformer.concatAxis0(s, parts[0..built]);
+        return Trunk.concatAxis0(s, parts[0..built]);
     }
     const shape = mlx.getShape(entry.spec_state_seq);
     if (shape.len != 5 or shape[0] < 1) return error.SpecCaptureShape;
@@ -233,7 +233,7 @@ pub fn logicalSsmCapture(s: mlx.mlx_stream, entry: *const SSMCacheEntry) !mlx.ml
     const start: [5]c_int = @splat(0);
     const stride: [5]c_int = @splat(1);
     try mlx.check(mlx.mlx_slice(&prefix, entry.spec_state_seq, &start, 5, &stop, 5, &stride, 5, s));
-    return Transformer.concatAxis0(s, &.{ prefix, final });
+    return Trunk.concatAxis0(s, &.{ prefix, final });
 }
 
 pub fn rollbackRowToAccepted(sl: *Qwen4TestSlot, accepted: u32, verify_len: u32, off_snap: usize, step_snap: usize, s: mlx.mlx_stream) !void {

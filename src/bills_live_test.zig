@@ -1,5 +1,5 @@
 //! The bill tests that read the live GPU or need MLX. They run in the MLX tier; the rest of bills.zig runs in test-host.
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const fixtures = @import("bills_fixtures_test.zig");
 const bills = @import("bills.zig");
 const dsv41_config = @import("dsv41/dsv41_config.zig");

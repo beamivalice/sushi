@@ -4,7 +4,7 @@ const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
 const round_cost = @import("round_cost.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const testing = std.testing;
 const generate = @import("generate.zig");
 const dsv41_dspark = @import("dsv41/dsv41_dspark.zig");
@@ -397,7 +397,7 @@ test "updateMtpEvRound: warmup and wider base rounds reset floor evidence" {
     try testing.expect(!g.spec_disabled_runtime);
 }
 
-fn mtpBoundsPlanFixture(xfm: *Transformer, prompt: []u32, depth: u32) Generator {
+fn mtpBoundsPlanFixture(xfm: *Trunk, prompt: []u32, depth: u32) Generator {
     xfm.config.model_type = "qwen4_exp";
     xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
     for (0..round_cost.MIN_SAMPLES) |_| {
@@ -438,7 +438,7 @@ fn mtpBoundsPlanFixture(xfm: *Transformer, prompt: []u32, depth: u32) Generator 
 test "MTP depth bounds: the planner reads min..max from its table-priced plan" {
     const before = depth_bounds.active;
     defer depth_bounds.active = before;
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     var prompt: [1000]u32 = @splat(0);
 
     depth_bounds.active = .{};
@@ -459,7 +459,7 @@ test "MTP depth bounds: the planner reads min..max from its table-priced plan" {
 test "MTP depth bounds: min == max drafts that depth every round" {
     const before = depth_bounds.active;
     defer depth_bounds.active = before;
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     var prompt: [1000]u32 = @splat(0);
     for ([_]u32{ 2, 4, 5 }) |depth| {
         depth_bounds.active = .{ .min = depth, .max = depth };

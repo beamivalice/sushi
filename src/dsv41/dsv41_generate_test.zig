@@ -8,7 +8,7 @@ const model_mod = @import("../model.zig");
 const token_mask = @import("../token_mask.zig");
 const rp_mod = @import("../reasoning_protocol.zig");
 const depth_bounds = @import("../mtp_depth_bounds.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const glm5_forward = @import("../glm5/glm5_forward.zig");
@@ -64,7 +64,7 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null and xfm.moduleStateSpecRollback());
     var tok = Tokenizer.initEmptyForTests(a);
@@ -245,7 +245,7 @@ test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole o
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -324,7 +324,7 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null);
     var tok = Tokenizer.initEmptyForTests(a);
@@ -388,7 +388,7 @@ test "dsv41 generator: a seeded sampled request verifies at one width whatever t
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -466,7 +466,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -536,7 +536,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -695,7 +695,7 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -733,7 +733,7 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -780,7 +780,7 @@ const LazyHeadRun = struct {
     }
 };
 
-fn forwardIds(xfm: *Transformer, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
+fn forwardIds(xfm: *Trunk, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
     const a = testing.allocator;
     const ids32 = try a.alloc(i32, ids.len);
     defer a.free(ids32);
@@ -791,7 +791,7 @@ fn forwardIds(xfm: *Transformer, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !
     return xfm.forwardWith(ctx, arr);
 }
 
-fn argmaxHost(xfm: *Transformer, logits: mlx.mlx_array) !u32 {
+fn argmaxHost(xfm: *Trunk, logits: mlx.mlx_array) !u32 {
     var am = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am);
     try mlx.check(mlx.mlx_argmax_axis(&am, logits, -1, false, xfm.s));
@@ -803,7 +803,7 @@ fn argmaxHost(xfm: *Transformer, logits: mlx.mlx_array) !u32 {
 
 /// Greedy decode by hand: each step's token is evaluated from the logits before anything reads their bytes, as the
 /// Generator does; with `lazy` the forward may hand the logits back unevaluated.
-fn lazyHeadSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, steps: usize, lazy: bool) !LazyHeadRun {
+fn lazyHeadSteps(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, steps: usize, lazy: bool) !LazyHeadRun {
     var run: LazyHeadRun = .{};
     errdefer run.deinit(a);
     try xfm.resetCache();
@@ -828,7 +828,7 @@ fn lazyHeadSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, s
 
 /// `lazyHeadSteps` with each step's token handed to the forward as the argmax array itself, read back after the forward
 /// returns; `queue` lets the forward queue layer 0 ahead of it.
-fn lazyIdSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, steps: usize, queue: bool) !LazyHeadRun {
+fn lazyIdSteps(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, steps: usize, queue: bool) !LazyHeadRun {
     var run: LazyHeadRun = .{};
     errdefer run.deinit(a);
     const m = dsv41_state.modelOf(xfm).?;
@@ -865,7 +865,7 @@ fn lazyIdSteps(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, ste
 }
 
 /// A lazy pass whose token the model refuses (an image id with no image rows) is dropped from the state it was queued on.
-fn droppedStartLeavesNothing(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, token: u32) !void {
+fn droppedStartLeavesNothing(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, token: u32) !void {
     const m = dsv41_state.modelOf(xfm).?;
     const vocab = m.cfg.vocab;
     var logits: [2]std.ArrayList(f32) = @splat(.empty);
@@ -921,7 +921,7 @@ fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expectEqual(dspark, m.dspark != null);
@@ -1025,7 +1025,7 @@ test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -1112,7 +1112,7 @@ const ThinkBoundOutcome = struct {
 fn thinkBoundRun(
     a: std.mem.Allocator,
     io: std.Io,
-    xfm: *Transformer,
+    xfm: *Trunk,
     tok: *Tokenizer,
     prompt: []const u32,
     want: u32,
@@ -1194,7 +1194,7 @@ fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -1299,7 +1299,7 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
     for (next[80..], 80..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
     const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .ssm_checkpoint_stride = 16, .ssm_checkpoint_max = 4 };
 
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &first, 4, greedy, &.{}, opts);
     defer gen.deinit(a);
@@ -1367,7 +1367,7 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
         // The load takes each tensor out of the map, so each model reads its own.
         var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
         defer weights.deinit();
-        var xfm = try Transformer.init(io, a, config, &weights);
+        var xfm = try Trunk.init(io, a, config, &weights);
         defer xfm.deinit();
         var kept = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 6, greedy, &.{}, base);
         defer kept.deinit(a);
@@ -1392,7 +1392,7 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     opts.write_through_hook = .{ .ctx = &tier, .call = Tier.call };
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 6, greedy, &.{}, opts);
     defer gen.deinit(a);
@@ -1411,7 +1411,7 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
 /// model so its restore points can be continued.
 const TailArm = struct {
     weights: model_mod.Weights,
-    xfm: Transformer,
+    xfm: Trunk,
     gen: Generator,
     tokens: std.ArrayList(u32) = .empty,
 
@@ -1423,7 +1423,7 @@ const TailArm = struct {
         var cfg = config;
         self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &cfg, false);
         errdefer self.weights.deinit();
-        self.xfm = try Transformer.init(io, a, config, &self.weights);
+        self.xfm = try Trunk.init(io, a, config, &self.weights);
         errdefer self.xfm.deinit();
         const m = dsv41_state.modelOf(&self.xfm).?;
         // Wider than a decode-width pass, as the release's window is: a narrower replay reads the ring below its floor.
@@ -1567,7 +1567,7 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 256, .adaptive_chunk_width = false, .ssm_checkpoint_stride = 256, .ssm_checkpoint_max = 4, .write_through_hook = .{ .ctx = &count, .call = Count.call } };
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 6, greedy, &.{}, opts);
     defer gen.deinit(a);
@@ -1597,11 +1597,11 @@ test "dsv41 generator: after a DSpark request the slot cache marks its rows and 
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
-    // The scheduler's slot owns a cache with one entry per layer; the Transformer's own is a shell.
+    // The scheduler's slot owns a cache with one entry per layer; the Trunk's own is a shell.
     // `initSlot` hands every slot the engine's default KV scheme, whatever the pack reports.
     var slot_cache = try KVCache.initWithConfig(a, config.num_hidden_layers, trunk_mod.KVQuantConfig.engine_default);
     defer slot_cache.deinit();
@@ -1680,7 +1680,7 @@ test "dsv41 DSpark: --max-mtp-ctx ends drafting once the context passes it (DSV4
     const io = std.Io.Threaded.global_single_threaded.io();
     var st = try TinyDsparkNet.init(a, io);
     defer st.deinit(a);
-    var xfm = try Transformer.init(io, a, st.config, &st.weights);
+    var xfm = try Trunk.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -1713,7 +1713,7 @@ test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since
     const io = std.Io.Threaded.global_single_threaded.io();
     var st = try TinyDsparkNet.init(a, io);
     defer st.deinit(a);
-    var xfm = try Transformer.init(io, a, st.config, &st.weights);
+    var xfm = try Trunk.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -1778,7 +1778,7 @@ const GrammarOutcome = struct {
 fn grammarRun(
     a: std.mem.Allocator,
     io: std.Io,
-    xfm: *Transformer,
+    xfm: *Trunk,
     tok: *Tokenizer,
     prompt: []const u32,
     want: u32,
@@ -1874,7 +1874,7 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null);
     var tok = Tokenizer.initEmptyForTests(a);
@@ -1969,7 +1969,7 @@ const WidthProbe = struct {
     const A = mlx.mlx_array;
 
     /// One forward of `ids` as the server runs it: a verify round, or a plain chunk when `plain`.
-    fn forward(xfm: *Transformer, ids: []const u32, plain: bool) !A {
+    fn forward(xfm: *Trunk, ids: []const u32, plain: bool) !A {
         const m = dsv41_state.modelOf(xfm).?;
         const engine = xfm.expert_stream.?;
         const st = try dsv41_model.ensureState(m);
@@ -2055,7 +2055,7 @@ const WidthProbe = struct {
         return differing;
     }
 
-    fn at(a: std.mem.Allocator, xfm: *Transformer, prompt: []const u32, cont: []const u32, W: usize, verbose: bool) !usize {
+    fn at(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, cont: []const u32, W: usize, verbose: bool) !usize {
         const m = dsv41_state.modelOf(xfm).?;
         // One-row rounds, each traced.
         dsv41_model.resetState(m);
@@ -2158,7 +2158,7 @@ test "dsv41 DSpark: on the real pack each row of a wide verify is the bits of it
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expect(m.dspark != null);
@@ -2197,7 +2197,7 @@ fn prefetchAt(dir: []const u8, budget_gb: u64, pct: ?u8, cache_bytes: u64) !bool
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const on = xfm.expert_stream.?.prefetcher != null;
     try testing.expectEqual(on, dsv41_state.modelOf(&xfm).?.prefetch_lead_rows != 0);
@@ -2222,7 +2222,7 @@ test "every generator start path copies the launch round options (DSV41_TINY)" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var st = try TinyDsparkNet.init(a, io);
     defer st.deinit(a);
-    var xfm = try Transformer.init(io, a, st.config, &st.weights);
+    var xfm = try Trunk.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -2249,7 +2249,7 @@ test "dsv41 generator: a DFlash round is refused by name, not asserted (DSV41_TI
     const io = std.Io.Threaded.global_single_threaded.io();
     var st = try TinyDsparkNet.init(a, io);
     defer st.deinit(a);
-    var xfm = try Transformer.init(io, a, st.config, &st.weights);
+    var xfm = try Trunk.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();

@@ -16,7 +16,7 @@ const thought_point = @import("dsv41_thought_point.zig");
 
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
-const Transformer = transformer.Transformer;
+const Trunk = transformer.Trunk;
 const Generator = generate.Generator;
 const ModelConfig = model.ModelConfig;
 
@@ -52,7 +52,7 @@ pub fn cancelledNeedsCheckpoints() bool {
     return true;
 }
 
-pub fn restoreTarget(slot: *Slot, xfm: *Transformer) ?sched.RestoreTarget {
+pub fn restoreTarget(slot: *Slot, xfm: *Trunk) ?sched.RestoreTarget {
     _ = slot;
     const dsv = xfm.arch_state.dsv41.model orelse return null;
     return .{ .rec = prefix_arch.recurrent("dsv41", dsv), .log_tag = "[dsv41-prefix]" };
@@ -90,7 +90,7 @@ pub fn flushResident(entry: *model_registry.LoadedModel, why: []const u8) void {
 }
 
 test "an arch whose request state lives in the model restores into it under its own log tag and needs checkpoints from a cancelled prefill" {
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     var lm: model_registry.LoadedModel = undefined;
     var slot = sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" });
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));

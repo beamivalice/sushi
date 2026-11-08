@@ -967,7 +967,7 @@ pub const ModelConfig = struct {
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
-    /// recurrence (GDN). Shared by Transformer.init and the scheduler's per-slot
+    /// recurrence (GDN). Shared by Trunk.init and the scheduler's per-slot
     /// allocation — the two predicates MUST agree or slots crash on a null
     /// `ctx.ssm_entries`.
     pub fn needsSsmEntries(self: *const ModelConfig) bool {
@@ -976,13 +976,13 @@ pub const ModelConfig = struct {
     }
 
     /// Pure-config half of "can this arch ride the batched GatedDeltaNet
-    /// decode kernel?" (`Transformer.forwardMoeBatchedDecode`) — a dense
+    /// decode kernel?" (`Trunk.forwardMoeBatchedDecode`) — a dense
     /// GDN trunk with periodic full attention.
     ///
     /// This exists because the answer is needed in TWO places that see
     /// different things: `server.zig` decides whether `--max-concurrent`
     /// clamps to 1 with only a ModelConfig in hand, while
-    /// `Transformer.supportsBatchedGdnDecode` also checks the built layer
+    /// `Trunk.supportsBatchedGdnDecode` also checks the built layer
     /// set. Both MUST read this predicate — when they were hand-rolled
     /// separately, the server kept clamping the GDN trunk to serial decode while
     /// the scheduler was happily batching it, so `--max-concurrent 4` (the

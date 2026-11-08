@@ -181,7 +181,7 @@ pub fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool
     self.specObserveRound(m, wall, tok, ev_planned and !two_chunk, shape_changed);
 }
 
-/// Feed the model's round-cost table (`Transformer.round_cost`, shared
+/// Feed the model's round-cost table (`Trunk.round_cost`, shared
 /// by every request and both block decoders). Width = drafts this round
 /// (0 = serial). The previous width is tracked on EVERY round so the
 /// first observed one is not a transition by accident; a rejected

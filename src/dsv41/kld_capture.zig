@@ -1193,7 +1193,7 @@ fn layout(dc: *const dsv_cfg.Config, mode: Mode) Layout {
 // ── tests: a tiny seeded DeepSeek pack (DSV41_TINY, tests/dsv41/dump_dsv41_fixtures.py) ──────────────────
 
 const testing = std.testing;
-const Transformer = @import("../trunk.zig").Transformer;
+const Trunk = @import("../trunk.zig").Trunk;
 
 const tiny_tokenizer =
     \\{"pre_tokenizer":{"type":"ByteLevel"},"model":{"type":"BPE",
@@ -1256,7 +1256,7 @@ const TinyLoaded = struct {
         errdefer self.loaded.tok.deinit();
         self.loaded.weights = try model.loadWeightsForConfig(io, a, root, &self.loaded.config, false);
         errdefer self.loaded.weights.deinit();
-        self.loaded.xfm = try Transformer.init(io, a, self.loaded.config, &self.loaded.weights);
+        self.loaded.xfm = try Trunk.init(io, a, self.loaded.config, &self.loaded.weights);
         return self;
     }
 
@@ -2017,7 +2017,7 @@ test "kld: a deepseek_v41 teacher captures and compare reads it back, fused agai
     defer loaded.tok.deinit();
     loaded.weights = try model.loadWeightsForConfig(io, allocator, dir, &loaded.config, false);
     defer loaded.weights.deinit();
-    loaded.xfm = try trunk_mod.Transformer.init(io, allocator, loaded.config, &loaded.weights);
+    loaded.xfm = try trunk_mod.Trunk.init(io, allocator, loaded.config, &loaded.weights);
     defer loaded.xfm.deinit();
     try testing.expectEqual(@as(u32, 1), loaded.config.eos_token_ids[0]);
 

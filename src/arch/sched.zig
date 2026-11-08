@@ -24,7 +24,7 @@ const Tag = registry.Tag;
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
 const Generator = generate.Generator;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const ForwardCtx = model_handle.ForwardCtx;
 const ModelConfig = model.ModelConfig;
 
@@ -115,7 +115,7 @@ fn tagOfSlot(slot: *const Slot) ?Tag {
     return tagOfConfig(slot.model.config);
 }
 
-fn tagOfModel(xfm: *const Transformer) ?Tag {
+fn tagOfModel(xfm: *const Trunk) ?Tag {
     return tagOfConfig(&xfm.config);
 }
 
@@ -146,7 +146,7 @@ pub fn rowCap(config: *const ModelConfig) ?usize {
 }
 
 /// The loaded model batches (the config's answer, and the layers it built).
-pub fn modelBatches(xfm: *const Transformer) bool {
+pub fn modelBatches(xfm: *const Trunk) bool {
     const tag = tagOfModel(xfm) orelse return false;
     return switch (tag) {
         inline else => |t| if (comptime has(t, "modelBatches")) S(t).modelBatches(xfm) else false,
@@ -154,7 +154,7 @@ pub fn modelBatches(xfm: *const Transformer) bool {
 }
 
 /// Whether the slot whose context this is can merge into this tick's batch; one that cannot yet decodes serially.
-pub fn readyToBatch(xfm: *const Transformer, ctx: *ForwardCtx) bool {
+pub fn readyToBatch(xfm: *const Trunk, ctx: *ForwardCtx) bool {
     const tag = tagOfModel(xfm) orelse return true;
     return switch (tag) {
         inline else => |t| if (comptime has(t, "readyToBatch")) S(t).readyToBatch(xfm, ctx) else true,
@@ -171,7 +171,7 @@ pub fn padsBatch(config: *const ModelConfig) bool {
 }
 
 /// The kernel the group takes this tick, null when the arch has none ready.
-pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?BatchArm {
+pub fn batchArm(xfm: *Trunk, ctxs: []const *ForwardCtx) ?BatchArm {
     const tag = tagOfModel(xfm) orelse return null;
     return switch (tag) {
         inline else => |t| if (comptime has(t, "batchArm")) S(t).batchArm(xfm, ctxs) else null,
@@ -183,7 +183,7 @@ pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?BatchArm {
 pub fn batchedForward(
     sch: *Scheduler,
     allocator: std.mem.Allocator,
-    xfm: *Transformer,
+    xfm: *Trunk,
     batch: *[]*Slot,
     next_tokens: []const u32,
     ctxs: []const *ForwardCtx,
@@ -201,7 +201,7 @@ pub fn batchedForward(
 }
 
 /// Plain decode rows are priced by the grouped-MTP planner as they run (its cost table learns from them).
-pub fn plannerObservesPlainRows(xfm: *const Transformer) bool {
+pub fn plannerObservesPlainRows(xfm: *const Trunk) bool {
     const tag = tagOfModel(xfm) orelse return false;
     return switch (tag) {
         inline else => |t| if (comptime has(t, "plannerObservesPlainRows")) S(t).plannerObservesPlainRows(xfm) else false,
@@ -332,7 +332,7 @@ pub fn handoffHistory(slot: *Slot, cps: []trunk.SSMCheckpoint) void {
 }
 
 /// The in-checkpoint head's rows a commit stores beside the KV; null refuses the head's history.
-pub fn mtpHeadCommit(slot: *const Slot, head: *const Transformer) ?HeadParts {
+pub fn mtpHeadCommit(slot: *const Slot, head: *const Trunk) ?HeadParts {
     const tag = tagOfSlot(slot) orelse return .{};
     return switch (tag) {
         inline else => |t| if (comptime has(t, "mtpHeadCommit")) S(t).mtpHeadCommit(head) else HeadParts{},
@@ -340,7 +340,7 @@ pub fn mtpHeadCommit(slot: *const Slot, head: *const Transformer) ?HeadParts {
 }
 
 /// Where the lookup restores this slot's state, when the arch keeps it outside the SSM entries.
-pub fn restoreTarget(slot: *Slot, xfm: *Transformer) ?RestoreTarget {
+pub fn restoreTarget(slot: *Slot, xfm: *Trunk) ?RestoreTarget {
     const tag = tagOfSlot(slot) orelse return null;
     return switch (tag) {
         inline else => |t| if (comptime has(t, "restoreTarget")) S(t).restoreTarget(slot, xfm) else null,
@@ -404,7 +404,7 @@ pub fn endRequest(config: *const ModelConfig) void {
 }
 
 /// A prefill is retried cold: what the arch holds across requests goes back to its start.
-pub fn resetForRetry(slot: *const Slot, xfm: *Transformer) void {
+pub fn resetForRetry(slot: *const Slot, xfm: *Trunk) void {
     const tag = tagOfSlot(slot) orelse return;
     switch (tag) {
         inline else => |t| if (comptime has(t, "resetForRetry")) S(t).resetForRetry(slot, xfm),
@@ -492,7 +492,7 @@ test "only Flash-Next gates its long-context rules and caps its checkpoints; onl
 }
 
 /// A slot of `config` over a transformer, for a face's own test.
-pub fn testSlot(xfm: *Transformer, lm: *model_registry.LoadedModel, config: ModelConfig) Slot {
+pub fn testSlot(xfm: *Trunk, lm: *model_registry.LoadedModel, config: ModelConfig) Slot {
     xfm.config = config;
     lm.transformer = xfm;
     lm.config = null;
@@ -506,7 +506,7 @@ pub fn testSlot(xfm: *Transformer, lm: *model_registry.LoadedModel, config: Mode
 test "an arch with no request state restores into the SSM entries and commits the generic way" {
     inline for (.{ "qwen4_exp", "mimo_v2" }) |model_type| {
         if (registry.ofModelType(model_type) != null) {
-            var xfm: Transformer = undefined;
+            var xfm: Trunk = undefined;
             var lm: model_registry.LoadedModel = undefined;
             var slot = testSlot(&xfm, &lm, .{ .model_type = model_type });
             try std.testing.expect(restoreTarget(&slot, &xfm) == null);

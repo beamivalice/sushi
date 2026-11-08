@@ -53,7 +53,7 @@ pub fn tryRun(allocator: std.mem.Allocator, io: std.Io, opts: kld.Options, out: 
     return false;
 }
 
-pub fn afterLoad(xfm: *trunk.Transformer, config: model.ModelConfig, kv: trunk.KVQuantConfig) !void {
+pub fn afterLoad(xfm: *trunk.Trunk, config: model.ModelConfig, kv: trunk.KVQuantConfig) !void {
     switch (registry.handleOf(xfm)) {
         inline else => |m, t| {
             if (comptime hasOp(t, "afterLoad")) try registry.Mod(t).kld.afterLoad(m, config, kv);

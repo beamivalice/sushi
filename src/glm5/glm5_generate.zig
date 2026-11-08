@@ -8,7 +8,7 @@ const mtp_lookup = @import("../mtp_lookup.zig");
 const round_cost = @import("../round_cost.zig");
 const dflash_policy = @import("../dflash_policy.zig");
 const logit_bias = @import("../logit_bias.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const glm5_forward = @import("glm5_forward.zig");
@@ -582,7 +582,7 @@ test "GLM short prompts and odd chunk widths still checkpoint only on pool bound
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
     defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
     for ([_]struct { len: usize, chunk: usize }{ .{ .len = 14, .chunk = 64 }, .{ .len = 150, .chunk = 37 } }) |case| {
-        var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        var xfm = try Trunk.init(testing.io, a, cfg, &weights);
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(testing.io, a, &xfm, &tok, prompt[0..case.len], 2, greedy, &.{}, .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = case.chunk, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = 16 });
         defer gen.deinit(a);
@@ -599,7 +599,7 @@ test "an empty prompt is a typed error at the generator, never an index" {
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
     const cfg = try glmGeneratorFixture(&weights);
-    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
     try expectError(error.EmptyPrompt, Generator.initWithOptions(testing.io, a, &xfm, &tok, &.{}, 4, .{ .temperature = 0.0 }, &.{}, .{}));
 }
@@ -630,7 +630,7 @@ test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefi
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
     const cfg = try glmGeneratorFixture(&weights);
-    var turn = try Transformer.init(testing.io, a, cfg, &weights);
+    var turn = try Trunk.init(testing.io, a, cfg, &weights);
     defer turn.deinit();
     var gen = try Generator.initWithOptions(testing.io, a, &turn, &tok, &first, 4, greedy, &.{}, opts);
     defer gen.deinit(a);
@@ -641,12 +641,12 @@ test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefi
     var rows = try glm5_prefix.MlaRows.capture(a, glm5_state.ownRequestOf(&turn).?, 268, turn.s);
     defer rows.deinit();
 
-    var cold_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var cold_xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer cold_xfm.deinit();
     var cold = try Generator.initWithOptions(testing.io, a, &cold_xfm, &tok, &next, 4, greedy, &.{}, opts);
     defer cold.deinit(a);
 
-    var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var warm_xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
     try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, &gen.ssm_checkpoints.items[3]);
     warm_xfm.cache.step = 256;
@@ -714,7 +714,7 @@ test "the GLM prefill holds as many checkpoints as its schedule says, and ends o
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
     defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
     for ([_]usize{ 14, 70, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
-        var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        var xfm = try Trunk.init(testing.io, a, cfg, &weights);
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(testing.io, a, &xfm, &tok, prompt[0..len], 2, greedy, &.{}, .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = cap });
         defer gen.deinit(a);
@@ -758,13 +758,13 @@ test "a GLM prefill whose hook releases landed checkpoints holds at most two sta
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
     defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
     for ([_]usize{ 14, 70, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
-        var kept_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        var kept_xfm = try Trunk.init(testing.io, a, cfg, &weights);
         defer kept_xfm.deinit();
         const base: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = cap };
         var kept = try Generator.initWithOptions(testing.io, a, &kept_xfm, &tok, prompt[0..len], 2, greedy, &.{}, base);
         defer kept.deinit(a);
 
-        var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        var xfm = try Trunk.init(testing.io, a, cfg, &weights);
         defer xfm.deinit();
         var releasing = GlmReleasing{};
         var opts = base;
@@ -816,7 +816,7 @@ test "GLM checkpoints stay on the grid when a request steps its chunk down, and 
     const hook: Generator.ChunkWidthHook = .{ .ctx = &dummy, .call = GlmStepDown.call, .confirm = GlmStepDown.confirm };
     const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .chunk_width_hook = hook, .ssm_checkpoint_stride = 64, .ssm_checkpoint_max = 16 };
 
-    var turn = try Transformer.init(testing.io, a, cfg, &weights);
+    var turn = try Trunk.init(testing.io, a, cfg, &weights);
     defer turn.deinit();
     var gen = try Generator.initWithOptions(testing.io, a, &turn, &tok, &first, 2, greedy, &.{}, opts);
     defer gen.deinit(a);
@@ -827,12 +827,12 @@ test "GLM checkpoints stay on the grid when a request steps its chunk down, and 
     var rows = try glm5_prefix.MlaRows.capture(a, glm5_state.ownRequestOf(&turn).?, 268, turn.s);
     defer rows.deinit();
 
-    var cold_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var cold_xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer cold_xfm.deinit();
     var cold = try Generator.initWithOptions(testing.io, a, &cold_xfm, &tok, &next, 2, greedy, &.{}, opts);
     defer cold.deinit(a);
 
-    var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var warm_xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
     try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, &gen.ssm_checkpoints.items[2]);
     warm_xfm.cache.step = 192;
@@ -877,7 +877,7 @@ test "GLM thought point: the round that carries the closer is cut to a pool boun
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
     const cfg = try glmGeneratorFixture(&weights);
-    var turn = try Transformer.init(testing.io, a, cfg, &weights);
+    var turn = try Trunk.init(testing.io, a, cfg, &weights);
     defer turn.deinit();
     var gen = try Generator.initWithOptions(testing.io, a, &turn, &tok, &prompt, 4, greedy, &.{}, opts);
     defer gen.deinit(a);
@@ -910,7 +910,7 @@ test "GLM thought point: the round that carries the closer is cut to a pool boun
     // A restore from it is the live state, and the next token from both leaves them the same.
     var rows = try glm5_prefix.MlaRows.capture(a, glm5_state.ownRequestOf(&turn).?, point.pos, turn.s);
     defer rows.deinit();
-    var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var warm_xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
     try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, point);
     warm_xfm.cache.step = point.pos;

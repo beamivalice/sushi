@@ -454,7 +454,7 @@ test "dsv41 shell: the transformer serves the streamed model's logits through fo
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try model.fixtureDir();
     const model_mod = @import("../model.zig");
-    const Transformer = @import("../trunk.zig").Transformer;
+    const Trunk = @import("../trunk.zig").Trunk;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
@@ -476,7 +476,7 @@ test "dsv41 shell: the transformer serves the streamed model's logits through fo
 
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, testing.allocator, config, &weights);
+    var xfm = try Trunk.init(io, testing.allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.ownsModuleDecodeState());
 
@@ -2122,7 +2122,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
     const model_load = @import("../model_load.zig");
-    const Transformer = @import("../trunk.zig").Transformer;
+    const Trunk = @import("../trunk.zig").Trunk;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
@@ -2161,7 +2161,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, testing.allocator, config, &weights);
+    var xfm = try Trunk.init(io, testing.allocator, config, &weights);
     defer xfm.deinit();
     const engine = xfm.expert_stream.?;
     try testing.expect(engine.geometry.drop != null and engine.geometry.drop_n == 3 and engine.droppedBytes() > 0);
@@ -2223,7 +2223,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
-    const Transformer = @import("../trunk.zig").Transformer;
+    const Trunk = @import("../trunk.zig").Trunk;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
@@ -2246,7 +2246,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
 
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, testing.allocator, config, &weights);
+    var xfm = try Trunk.init(io, testing.allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(dsv41_state.stqExpertsOf(&xfm) != null and dsv41_state.modelOf(&xfm).?.head.stq != null);
 
@@ -2360,7 +2360,7 @@ fn borrowCase(cache_bytes: u64) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
-    const Transformer = @import("../trunk.zig").Transformer;
+    const Trunk = @import("../trunk.zig").Trunk;
     const borrow = @import("dsv41_borrow.zig");
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -2380,7 +2380,7 @@ fn borrowCase(cache_bytes: u64) !void {
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, testing.allocator, config, &weights);
+    var xfm = try Trunk.init(io, testing.allocator, config, &weights);
     defer xfm.deinit();
     const engine = xfm.expert_stream.?;
     const last: u16 = @intCast(config.dsv41.?.layers - 1);
@@ -3126,7 +3126,7 @@ test "dsv41 pair-major: the transformer loads a pair-major pack through the one 
     var pm = try PmDir.make(dir, .none);
     defer pm.deinit();
     const model_mod = @import("../model.zig");
-    const Transformer = @import("../trunk.zig").Transformer;
+    const Trunk = @import("../trunk.zig").Trunk;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
     const s = mlx.gpuStream();
@@ -3147,7 +3147,7 @@ test "dsv41 pair-major: the transformer loads a pair-major pack through the one 
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, pm.path, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, testing.allocator, config, &weights);
+    var xfm = try Trunk.init(io, testing.allocator, config, &weights);
     defer xfm.deinit();
 
     var at: usize = 0;

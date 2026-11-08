@@ -19,7 +19,7 @@ const FullAttnWeights = trunk_mod.FullAttnWeights;
 const KVCache = trunk_mod.KVCache;
 const ModelConfig = model_mod.ModelConfig;
 const Qwen4TestSlot = qwen4_test_support.Qwen4TestSlot;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const Weights = model_mod.Weights;
 const Linear = @import("../linear.zig").Linear;
 const layer_weights = @import("../layer_weights.zig");
@@ -55,8 +55,8 @@ fn free(t: trunk_stq.Triple) void {
     inline for (.{ t.w, t.s, t.b }) |a| _ = mlx.mlx_array_free(a);
 }
 
-fn bareTransformer(s: mlx.mlx_stream, cache: KVCache) Transformer {
-    return std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+fn bareTransformer(s: mlx.mlx_stream, cache: KVCache) Trunk {
+    return std.mem.zeroInit(Trunk, .{ .s = s, .allocator = testing.allocator, .cache = cache });
 }
 
 test "trunk STQ: qmatmul serves a trellis triple as its decoded dense twin and refuses one without trunk_quant" {
@@ -635,7 +635,7 @@ test "trunk: a scales key resolved with an input-width hint keeps those paramete
     defer for (q) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    const view: *const Transformer = &xfm;
+    const view: *const Trunk = &xfm;
     const hinted = view.quantParamsHinted(q[0], q[1], 256);
     try testing.expectEqual(@as(u32, 8), hinted.bits);
     try testing.expectEqual(@as(u32, 32), hinted.group_size);

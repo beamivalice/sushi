@@ -10,7 +10,7 @@ const mimo_mtp = @import("mimo_mtp.zig");
 const mimo_drafter = @import("mimo2_drafter.zig");
 const think_penalty = @import("../think_penalty.zig");
 const logit_bias = @import("../logit_bias.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ThinkPenalty = think_penalty.ThinkPenalty;
 const testing = std.testing;
@@ -46,7 +46,7 @@ test "mtpEvPlanFor: MiMo's surface drafts one on prose and three on code, where 
 }
 
 test "the MiMo EXL3 round-cost surface serves every KV width, kv6 included, and other layouts stay generic" {
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     const head = MtpHeadRef.of("mimo2", undefined);
     const kv = trunk_mod.KVQuantConfig;
     xfm.config = .{ .expert_layout = .exl3_k4 };
@@ -58,7 +58,7 @@ test "the MiMo EXL3 round-cost surface serves every KV width, kv6 included, and 
 }
 
 /// Do two caches hold the same first `rows` rows in every stored buffer of `layer`?
-fn kvRowsEqual(x: *Transformer, y: *Transformer, layer: usize, rows: usize) !bool {
+fn kvRowsEqual(x: *Trunk, y: *Trunk, layer: usize, rows: usize) !bool {
     const ex = &x.cache.entries[layer];
     const ey = &y.cache.entries[layer];
     const pairs = [_][2]mlx.mlx_array{
@@ -89,8 +89,8 @@ fn kvRowsEqual(x: *Transformer, y: *Transformer, layer: usize, rows: usize) !boo
     return true;
 }
 
-fn pldTestTransformer(io: std.Io, config: model_mod.ModelConfig, weights: anytype, kv: trunk_mod.KVQuantConfig) !Transformer {
-    var xfm = try Transformer.init(io, testing.allocator, config, weights);
+fn pldTestTransformer(io: std.Io, config: model_mod.ModelConfig, weights: anytype, kv: trunk_mod.KVQuantConfig) !Trunk {
+    var xfm = try Trunk.init(io, testing.allocator, config, weights);
     errdefer xfm.deinit();
     try xfm.cache.reinit(config.num_hidden_layers, kv);
     xfm.cache.setSwaRing(config.sliding_window);

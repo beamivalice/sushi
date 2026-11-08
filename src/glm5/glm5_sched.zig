@@ -20,7 +20,7 @@ const rows_tick = @import("glm5_rows_tick.zig");
 
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const ForwardCtx = trunk_mod.ForwardCtx;
 const Generator = generate.Generator;
 const ModelConfig = model.ModelConfig;
@@ -38,7 +38,7 @@ pub fn rowCap(config: *const ModelConfig) ?usize {
     return if (config.supportsBatchedGlmRows()) 4 else null;
 }
 
-pub fn modelBatches(xfm: *const Transformer) bool {
+pub fn modelBatches(xfm: *const Trunk) bool {
     return glm5_state.supportsBatchedRows(xfm);
 }
 
@@ -47,7 +47,7 @@ pub fn padsBatch(config: *const ModelConfig) bool {
     return !config.supportsBatchedGlmRows();
 }
 
-pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?sched.BatchArm {
+pub fn batchArm(xfm: *Trunk, ctxs: []const *ForwardCtx) ?sched.BatchArm {
     _ = ctxs;
     if (!glm5_state.supportsBatchedRows(xfm)) return null;
     return .{ .moe_positions = false, .advances_offset = true };
@@ -56,7 +56,7 @@ pub fn batchArm(xfm: *Transformer, ctxs: []const *ForwardCtx) ?sched.BatchArm {
 pub fn batchedForward(
     sch: *Scheduler,
     allocator: std.mem.Allocator,
-    xfm: *Transformer,
+    xfm: *Trunk,
     batch: *[]*Slot,
     next_tokens: []const u32,
     ctxs: []const *ForwardCtx,
@@ -103,7 +103,7 @@ pub fn commitOwn(
     return true;
 }
 
-pub fn restoreTarget(slot: *Slot, xfm: *Transformer) ?sched.RestoreTarget {
+pub fn restoreTarget(slot: *Slot, xfm: *Trunk) ?sched.RestoreTarget {
     _ = xfm;
     const request = if (slot.request) |*r| r else return null;
     return .{ .rec = prefix_arch.recurrent("glm5", request), .takes_dflash = true };
@@ -132,7 +132,7 @@ pub fn thoughtGrid(gen: *const Generator) ?u32 {
 }
 
 test "an arch with a native request restores into it with the assistant context and releases it when the thread lets go" {
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     var lm: model_registry.LoadedModel = undefined;
     var slot = sched.testSlot(&xfm, &lm, .{ .model_type = "glm5_next", .num_hidden_layers = 2 });
     slot.request = (try initRequest(std.testing.allocator, &xfm.config)).?;

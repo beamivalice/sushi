@@ -30,7 +30,7 @@ const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const ModelConfig = model_mod.ModelConfig;
@@ -86,7 +86,7 @@ const request_media = @import("request_media.zig");
 ///
 /// CPU-only state (parsed config, tokenizer, chat config) is loaded by main
 /// and passed in by reference. The mlx-allocating pieces (weights tensors,
-/// Transformer, vision encoder, drafter, JIT compile, warmup) all run on the
+/// Trunk, vision encoder, drafter, JIT compile, warmup) all run on the
 /// inference thread before `init()` returns.
 pub const LoadParams = struct {
     /// Registry that owns the entry to populate + provides snapshot/eviction
@@ -239,7 +239,7 @@ pub fn mimoVerifyWarmWanted(config: *const ModelConfig) bool {
     return config.isMimo() and !config.expert_streaming;
 }
 
-fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: ?*mimo_mtp.Head, kv_config: trunk.KVQuantConfig) void {
+fn mimoSpecWarmup(io: std.Io, xfm: *Trunk, head: ?*mimo_mtp.Head, kv_config: trunk.KVQuantConfig) void {
     const start = std.Io.Timestamp.now(io, .awake);
     const rows = mimo_forward.warmupMimoVerify(xfm, kv_config) catch |err| {
         log.warn("[spec-warmup] MiMo verify failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
@@ -254,7 +254,7 @@ fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: ?*mimo_mtp.Head, kv_confi
 }
 
 /// MiMo's MTP heads from the checkpoint's own shard, bound to the trunk they share.
-fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelConfig, xfm: *Transformer) !?*mimo_mtp.Head {
+fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelConfig, xfm: *Trunk) !?*mimo_mtp.Head {
     var weights = try @import("mimo2/mimo_source.zig").loadMtpWeights(sch.io, sch.allocator, model_dir);
     defer weights.deinit();
     var head = (try mimo_mtp.Head.load(sch.allocator, mlx.gpuStream(), config, &weights)) orelse return null;
@@ -617,7 +617,7 @@ pub const VisionCost = struct {
 };
 
 /// The stored-state layout the SSD namespace is keyed by: the loaded arch's own key, else the config's tag.
-fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, xfm: *trunk.Transformer) !?[]u8 {
+fn diskLayoutKey(allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, xfm: *trunk.Trunk) !?[]u8 {
     if (try prefix_arch.diskLayoutKey(allocator, config, model_dir, xfm)) |key| return key;
     return if (config.cacheLayoutNamespace()) |tag| try allocator.dupe(u8, tag) else null;
 }
@@ -1508,7 +1508,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (arch_flags.archFlagRefusal(params.config, .{
         .kv_quant = params.kv_quant != null,
         .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
-        .mtp_head_kv_quant = trunk.Transformer.mtp_head_kv_quant_flag,
+        .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
         .drop_expert = params.config.drop_expert != 0,
         .ssd_prefetch = params.config.ssd_prefetch != null,
         .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
@@ -1730,16 +1730,16 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const weights_ptr = try sch.allocator.create(Weights);
     errdefer sch.allocator.destroy(weights_ptr);
     var load_config = params.config.*;
-    // The resolved launch choice gates lazy native-head tensors before Transformer.init binds them.
+    // The resolved launch choice gates lazy native-head tensors before Trunk.init binds them.
     load_config.mtp_override = mtpChoiceFor(params.mtp, params.config).on;
     weights_ptr.* = try model_mod.loadWeightsForConfig(sch.io, sch.allocator, params.model_dir, &load_config, load_vision);
     errdefer weights_ptr.deinit();
     model_mod.resolveWeightPrefix(params.config, weights_ptr);
 
-    // Transformer — owns the bulk of the GPU memory.
-    const xfm_ptr = try sch.allocator.create(Transformer);
+    // Trunk — owns the bulk of the GPU memory.
+    const xfm_ptr = try sch.allocator.create(Trunk);
     errdefer sch.allocator.destroy(xfm_ptr);
-    xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    xfm_ptr.* = try Trunk.init(sch.io, sch.allocator, params.config.*, weights_ptr);
     errdefer xfm_ptr.deinit();
     if (xfm_ptr.expert_stream) |engine| {
         engine.borrow_publish = &params.config.expert_borrow_bytes;
@@ -1753,7 +1753,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     generate_mod.installThinkMarkers(xfm_ptr, params.tok);
     try generate_mod.installLogitBias(sch.io, xfm_ptr, params.tok);
 
-    // Propagate the kv-quant config to the Transformer's own cache. Slot
+    // Propagate the kv-quant config to the Trunk's own cache. Slot
     // caches in serve mode honor this independently in `Slot.init`; this
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
@@ -1807,7 +1807,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
-    Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
+    Trunk.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
     try arch_state.applyHeadKvQuant(xfm_ptr, kv_quant_config);
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
@@ -2590,7 +2590,7 @@ test "unwireSettled: the unload waits until most of the freed bytes left the wir
 /// is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
 /// for real routing; `_ARMS=0,1,1,0` runs a pass per arm, 0 on the reference EXL3 NAX GEMM body, or with
 /// `_LEVER=decoded` 0 on the trunk's sorted GEMM instead of its decoded path.
-fn prefillUbench(alloc: std.mem.Allocator, xfm: *Transformer, cfg: *const ModelConfig, tok: *Tokenizer) void {
+fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig, tok: *Tokenizer) void {
     const tio = std.Io.Threaded.global_single_threaded.io();
     const n = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_PREFILL_UBENCH").?, 0), 10) catch 3);
     const asked: usize = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ROWS")) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 2025 else 2025;

@@ -39,7 +39,7 @@ const MoeMlpWeights = trunk.MoeMlpWeights;
 const QuantParams = trunk.QuantParams;
 const SSMCacheEntry = trunk.SSMCacheEntry;
 const SSMCacheEntrySnapshot = trunk.SSMCacheEntrySnapshot;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const affineParamsFromGeometry = trunk.affineParamsFromGeometry;
 const materializedOwnedCopy = trunk.materializedOwnedCopy;
 const qmatmulBits = trunk.qmatmulBits;
@@ -67,7 +67,7 @@ fn qwen4TransposeExpertBank(source: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_a
     return result;
 }
 
-fn qwen4StreamedResidentArm(xfm: *Transformer, resident_mw: *const MoeMlpWeights, source_dir: []const u8, cache_slots: u16, batch: c_int, seq: c_int) !void {
+fn qwen4StreamedResidentArm(xfm: *Trunk, resident_mw: *const MoeMlpWeights, source_dir: []const u8, cache_slots: u16, batch: c_int, seq: c_int) !void {
     const cfg = &xfm.config;
     const expert_bytes = (@as(u64, 2) * cfg.moe_intermediate_size * cfg.hidden_size + @as(u64, cfg.hidden_size) * cfg.moe_intermediate_size) * 2;
     const cache_bytes = expert_bytes * cache_slots * cfg.num_hidden_layers;
@@ -141,7 +141,7 @@ fn qwen4StreamedResidentFixtureParity(allocator: std.mem.Allocator, io: std.Io, 
     var weights = try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     xfm.expert_bf16_kernels = false;
     var source = try model_mod.loadWeights(io, allocator, source_dir);
@@ -310,7 +310,7 @@ fn captureMismatch(a: []const f32, b: []const f32, width: usize, label: []const 
     return true;
 }
 
-fn qwen4ReplayPrompt(xfm: *Transformer, slot: *Qwen4TestSlot, prompt: []const i32) !void {
+fn qwen4ReplayPrompt(xfm: *Trunk, slot: *Qwen4TestSlot, prompt: []const i32) !void {
     const prefill = try slot.forward(xfm, prompt[0 .. prompt.len - 1]);
     defer _ = mlx.mlx_array_free(prefill);
     try mlx.check(mlx.mlx_array_eval(prefill));
@@ -336,7 +336,7 @@ const L10VerifySlots = struct {
     solo: [2]*Qwen4TestSlot,
     group: [2]*Qwen4TestSlot,
 
-    pub fn init(alloc: std.mem.Allocator, xfm: *Transformer, n_layers: u32, prompts: [2][]const i32) !L10VerifySlots {
+    pub fn init(alloc: std.mem.Allocator, xfm: *Trunk, n_layers: u32, prompts: [2][]const i32) !L10VerifySlots {
         var out: L10VerifySlots = undefined;
         for (0..2) |i| {
             out.solo[i] = try Qwen4TestSlot.init(alloc, n_layers);
@@ -366,7 +366,7 @@ const SingleVerifyTestResult = struct {
     }
 };
 
-fn singleVerifyTestRound(xfm: *Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_array) !SingleVerifyTestResult {
+fn singleVerifyTestRound(xfm: *Trunk, slot: *Qwen4TestSlot, row: mlx.mlx_array) !SingleVerifyTestResult {
     const Gen = @import("../generate.zig").Generator;
     var gen: Gen = undefined;
     gen.xfm = xfm;
@@ -445,7 +445,7 @@ const DenseVerifyReplay = struct {
     }
 };
 
-fn denseVerifyReplay(xfm: *Transformer, slot: *Qwen4TestSlot, tokens: []const i32, io: std.Io) !DenseVerifyReplay {
+fn denseVerifyReplay(xfm: *Trunk, slot: *Qwen4TestSlot, tokens: []const i32, io: std.Io) !DenseVerifyReplay {
     const ids = mlx.mlx_array_new_data(tokens.ptr, &.{ 1, @intCast(tokens.len) }, 2, .int32);
     defer _ = mlx.mlx_array_free(ids);
     var last = mlx.mlx_array_new();
@@ -483,7 +483,7 @@ fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_i
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -654,7 +654,7 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try t.expect(xfm.arch_state.qwen4.mtp != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -767,7 +767,7 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try t.expect(xfm.arch_state.qwen4.mtp != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -1021,7 +1021,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
     var weights = try model_mod.loadWeightsWithVision(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     xfm.arch_state.qwen4.stream_f32 = true;
@@ -1247,7 +1247,7 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -1315,7 +1315,7 @@ test "qwen4 hc_mean capture is the mean of the four HC streams at the layer outp
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -1373,7 +1373,7 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(qwen4_forward.supportsBatchedGdnDecode(&xfm));
     xfm.arch_state.qwen4.stream_f32 = true;
@@ -1493,7 +1493,7 @@ test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/le
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(qwen4_forward.supportsBatchedQwen4Rows(&xfm));
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -1609,7 +1609,7 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -1771,7 +1771,7 @@ test "qwen4 deferred PLE: the captured hidden the MTP head reads matches the eag
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -1855,7 +1855,7 @@ test "qwen4 grow to the reservation before the prefill keeps greedy logits bit-i
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -1919,7 +1919,7 @@ test "qwen4 MTP verify token values equal serial ticks without near-tie acquitta
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -2003,7 +2003,7 @@ test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     xfm.arch_state.qwen4.stream_f32 = true;
@@ -2094,7 +2094,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     // A `build --yarn` pack carries `rope_type: "yarn"` in its config: the same
@@ -2552,7 +2552,7 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -2636,15 +2636,15 @@ test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids 
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
     xfm.compileMoeRouting();
 
-    const saved = Transformer.mtp_head_kv_quant_override;
-    defer Transformer.mtp_head_kv_quant_override = saved;
-    Transformer.mtp_head_kv_quant_override = true;
+    const saved = Trunk.mtp_head_kv_quant_override;
+    defer Trunk.mtp_head_kv_quant_override = saved;
+    Trunk.mtp_head_kv_quant_override = true;
 
     const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
     const dt = mlx.mlx_array_dtype(xfm.arch_state.qwen4.mtp.?.pre_norm_hidden);
@@ -2669,7 +2669,7 @@ test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids 
     defer _ = mlx.mlx_array_free(ids);
 
     const Run = struct {
-        fn lastLogits(xf: *Transformer, st: mlx.mlx_stream, alloc: std.mem.Allocator, stream: mlx.mlx_array, tok: mlx.mlx_array, kkeep: usize) ![]f32 {
+        fn lastLogits(xf: *Trunk, st: mlx.mlx_stream, alloc: std.mem.Allocator, stream: mlx.mlx_array, tok: mlx.mlx_array, kkeep: usize) ![]f32 {
             try qwen4_forward.qwen4MtpReset(xf);
             const full = try qwen4_forward.qwen4MtpForward(xf, stream, tok, 1, null, .all_rows);
             defer _ = mlx.mlx_array_free(full.logits);
@@ -2750,7 +2750,7 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -2830,7 +2830,7 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -2921,7 +2921,7 @@ test "per-row rollback: different accept counts across rows restore exactly the 
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -3023,7 +3023,7 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -3176,7 +3176,7 @@ test "group round: a row's own argmax and budget decide it, and nothing else doe
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -3280,7 +3280,7 @@ test "N=4 rollback: rejects, partial accepts and full accept restore solo states
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
@@ -3389,7 +3389,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -3497,7 +3497,7 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -3523,7 +3523,7 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
             const end = @min(prefix, at + 2048);
             const out = try seed.forward(&xfm, tokens[at..end]);
             defer _ = mlx.mlx_array_free(out);
-            try Transformer.evalCadencePoint(out, seed.entries);
+            try Trunk.evalCadencePoint(out, seed.entries);
             at = end;
             _ = mlx.mlx_clear_cache();
         }

@@ -4,7 +4,7 @@ const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const trunk = @import("../trunk.zig");
 const kv_cache = @import("../kv_cache.zig");
 const io_util_mod = @import("../io_util.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const std = @import("std");
 const qwen4_state = @import("qwen4_state.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -48,7 +48,7 @@ pub fn claimPleSpecCapture(entry: *SSMCacheEntry, n: usize, ctx_len: usize, capt
 }
 
 pub fn hcSiluCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
-    const self: *Transformer = @ptrCast(@alignCast(payload.?));
+    const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const x = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(x);
     const y = self.silu(x) catch return -1;
@@ -56,7 +56,7 @@ pub fn hcSiluCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, p
 }
 
 pub fn hcMixCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
-    const self: *Transformer = @ptrCast(@alignCast(payload.?));
+    const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const up4 = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(up4);
     const n4 = qwen4_forward.closureIn(input, 1) orelse return -1;
@@ -73,7 +73,7 @@ pub fn hcMixCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, pa
 }
 
 pub fn hcInjCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
-    const self: *Transformer = @ptrCast(@alignCast(payload.?));
+    const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const x = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(x);
     var sig = mlx.mlx_array_new();
@@ -87,7 +87,7 @@ pub fn hcInjCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, pa
 }
 
 pub fn hcWriteCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
-    const self: *Transformer = @ptrCast(@alignCast(payload.?));
+    const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const stream4 = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(stream4);
     const out4 = qwen4_forward.closureIn(input, 1) orelse return -1;
@@ -116,7 +116,7 @@ pub const HcRead = struct {
 /// replaced by the written stream either way.
 /// Diagnostic (`QWEN4_STANDIN=hc`): stream 0 as the block input, unit
 /// gates — the read kernels drop out, the writes stay live.
-pub fn hcReadStandin(self: *Transformer, h: mlx.mlx_array, batch: c_int, seq_len: c_int) !HcRead {
+pub fn hcReadStandin(self: *Trunk, h: mlx.mlx_array, batch: c_int, seq_len: c_int) !HcRead {
     const hc: c_int = @intCast(self.config.hc_count);
     const hidden: c_int = @intCast(self.config.hidden_size);
     const start = [_]c_int{ 0, 0, 0 };
@@ -129,7 +129,7 @@ pub fn hcReadStandin(self: *Transformer, h: mlx.mlx_array, batch: c_int, seq_len
     return .{ .mixed = mixed, .inj = try standinOnes(&inj_shape, self.s) };
 }
 
-pub fn hcReadPending(self: *Transformer, h: *mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pending: *?HcPending) !HcRead {
+pub fn hcReadPending(self: *Trunk, h: *mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pending: *?HcPending) !HcRead {
     if (pending.*) |*pd| {
         defer pending.* = null;
         defer pd.deinit();
@@ -144,7 +144,7 @@ pub fn hcReadPending(self: *Transformer, h: *mlx.mlx_array, w: *const HcWeights,
 }
 
 /// The (bits, group size) the fused hyper-connection kernels run `w` at: down and up affine at one shape, else null.
-pub fn fusedQuant(self: *const Transformer, w: *const HcWeights) ?trunk.QuantParams {
+pub fn fusedQuant(self: *const Trunk, w: *const HcWeights) ?trunk.QuantParams {
     const dqp, const uqp = solvedAtLoad(w) orelse probe: {
         // A read built by hand solves its banks per call.
         const hc: u32 = @intCast(self.config.hc_count);
@@ -162,7 +162,7 @@ fn solvedAtLoad(w: *const HcWeights) ?struct { trunk.QuantParams, trunk.QuantPar
     return .{ w.down.affine.solvedParams() orelse return null, w.up.affine.solvedParams() orelse return null };
 }
 
-pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pend: ?HcPending) !?HcFusedOut {
+pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pend: ?HcPending) !?HcFusedOut {
     const hc: c_int = @intCast(self.config.hc_count);
     const hidden: c_int = @intCast(self.config.hidden_size);
     const hp = @import("../hc_prefill.zig");
@@ -192,7 +192,7 @@ pub fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWei
     return hcReadFused(self.s, stream, batch, seq_len, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, self.config.rms_norm_eps, hc, hidden, dqp.bits, dqp.group_size, pend);
 }
 
-pub fn addVerifyPle(self: *Transformer, row: anytype, pw: *const PleWeights, layer: usize, index: usize) !void {
+pub fn addVerifyPle(self: *Trunk, row: anytype, pw: *const PleWeights, layer: usize, index: usize) !void {
     try hcFlush(self, &row.h, 1, row.seq, &row.pending);
     const add = try pleForward(self, row.ctx, row.h, row.tokens, pw, &row.entries[layer], layer, 1, row.seq);
     defer _ = mlx.mlx_array_free(add);
@@ -206,7 +206,7 @@ pub fn addVerifyPle(self: *Transformer, row: anytype, pw: *const PleWeights, lay
     row.h = with_ple;
 }
 
-pub fn hcReadVerifyRows(self: *Transformer, rows: anytype, w: *const HcWeights) !?[]HcRead {
+pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights) !?[]HcRead {
     if (self.arch_state.qwen4.model == null or self.config.hc_count != 4 or self.config.hidden_size != 2560 or rows.len < 2 or rows.len > 8) return null;
     const width = rows[0].seq;
     const has_pending = rows[0].pending != null;
@@ -247,7 +247,7 @@ pub fn hcReadVerifyRows(self: *Transformer, rows: anytype, w: *const HcWeights) 
 
 /// Defer `stream += out * inj` to the next read when the fused read will
 /// take it (decode/verify/batched widths); otherwise write now.
-pub fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, inject_flat: mlx.mlx_array, pending: *?HcPending) !void {
+pub fn hcWriteOrDefer(self: *Trunk, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, inject_flat: mlx.mlx_array, pending: *?HcPending) !void {
     std.debug.assert(pending.* == null);
     const prefill = @import("../hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, inject_flat, mlx.mlx_array_dtype(h.*)) and mlx.mlx_array_dtype(inj) == .bfloat16;
     if ((prefill or (batch * seq_len <= HC_FUSED_MAX_ROWS)) and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
@@ -264,7 +264,7 @@ pub fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array,
     h.* = try hcWrite(self, h.*, out, inj, batch, seq_len);
 }
 
-pub fn hcFlush(self: *Transformer, h: *mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
+pub fn hcFlush(self: *Trunk, h: *mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
     if (pending.*) |*pd| {
         defer pending.* = null;
         defer pd.deinit();
@@ -275,7 +275,7 @@ pub fn hcFlush(self: *Transformer, h: *mlx.mlx_array, batch: c_int, seq_len: c_i
 /// Grouped RMS norm over the last `hidden` of each of the `hc` streams:
 /// `x [B,S,hc*hidden]` → `[B,S,hc,hidden]`, weight `[hc,hidden]` (already
 /// carrying the reference's +1). Caller frees.
-pub fn hcGroupNorm(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+pub fn hcGroupNorm(self: *Trunk, x: mlx.mlx_array, w: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
     const hc: c_int = @intCast(self.config.hc_count);
     const hidden: c_int = @intCast(self.config.hidden_size);
     const shape4 = [_]c_int{ batch, seq_len, hc, hidden };
@@ -292,7 +292,7 @@ pub fn hcGroupNorm(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, batch
 
 /// Qwen4ExpTextGatedResidual.forward: the block input is a sigmoid-mixed
 /// mean of the normalized streams; the write gates are `2·σ(inject/hc)`.
-pub fn hcRead(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int) !HcRead {
+pub fn hcRead(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int) !HcRead {
     if (try hcReadFusedFor(self, stream, w, batch, seq_len, null)) |o| {
         if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
         return .{ .mixed = o.mixed, .inj = o.inj };
@@ -302,7 +302,7 @@ pub fn hcRead(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, ba
     return hcReadNormed(self, n4, w, batch, seq_len, null);
 }
 
-pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, raw_inject: ?mlx.mlx_array) !HcRead {
+pub fn hcReadNormed(self: *Trunk, n4: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, raw_inject: ?mlx.mlx_array) !HcRead {
     const hc: c_int = @intCast(self.config.hc_count);
     const hidden: c_int = @intCast(self.config.hidden_size);
     const flat_shape = [_]c_int{ batch, seq_len, hc * hidden };
@@ -361,7 +361,7 @@ pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, 
 }
 
 /// `stream + flatten(out[..., None, :] * inj)`. Consumes `stream`.
-pub fn hcWrite(self: *Transformer, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+pub fn hcWrite(self: *Trunk, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
     const hc: c_int = @intCast(self.config.hc_count);
     const hidden: c_int = @intCast(self.config.hidden_size);
     const out_shape = [_]c_int{ batch, seq_len, 1, hidden };
@@ -396,7 +396,7 @@ pub fn hcWrite(self: *Transformer, stream: mlx.mlx_array, out: mlx.mlx_array, in
 /// `[1, S]`. Batched (`ctx.batch_slots`): `[N, 1]`, each row hashed
 /// against ITS slot's history (`slots[i].ssm_entries[layer]`), ONE gather
 /// for all N·heads rows.
-pub fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int) !mlx.mlx_array {
+pub fn pleEmbedding(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int) !mlx.mlx_array {
     const st = self.arch_state.qwen4.model.?;
     const emb_dim: usize = st.table.dim * st.hash.n_heads;
     const n: usize = mlx.mlx_array_size(token_ids);
@@ -452,7 +452,7 @@ pub fn pleDeferrable(cfg: *const ModelConfig, rows: usize) bool {
 /// would set `spec_ple_len` runs AFTER the PLE layer's conv capture, which
 /// keys on it — so the length is claimed here, at build time, and the
 /// gather only fills the tokens.
-pub fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) bool {
+pub fn pleClaimSpecCapture(self: *Trunk, entry: *SSMCacheEntry, n: usize) bool {
     const ctx_len: usize = self.arch_state.qwen4.model.?.hash.ngram_size - 1;
     return claimPleSpecCapture(entry, n, ctx_len, self.spec_capture_ssm);
 }
@@ -461,14 +461,14 @@ pub fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) 
 /// an evaluated node is never recomputed when the leaf's buffer is filled:
 /// a capture the MTP head consumes, and anything a cadence or profiler eval
 /// freezes on the way to it, must be materialized on a FILLED leaf.
-pub fn plePreEval(self: *Transformer, ctx: *ForwardCtx) !void {
+pub fn plePreEval(self: *Trunk, ctx: *ForwardCtx) !void {
     if (ctx.arch_ctx.qwen4.ple_pending == null) return;
     try flushDeferredPle(self, ctx);
 }
 
 /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend. Batched
 /// decode hands in the MERGED conv window as `entry.aux_state`.
-pub fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
     const cfg = &self.config;
     const hc: c_int = @intCast(cfg.hc_count);
     const hidden: c_int = @intCast(cfg.hidden_size);
@@ -586,7 +586,7 @@ pub fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, t
 }
 
 /// `HcRead` for every row: one joined kernel pass when it serves, else each row's own read.
-pub fn hcReadRows(self: *Transformer, rows: anytype, w: *const HcWeights, out: []HcRead) !void {
+pub fn hcReadRows(self: *Trunk, rows: anytype, w: *const HcWeights, out: []HcRead) !void {
     if (try hcReadVerifyRows(self, rows, w)) |joined| {
         defer self.allocator.free(joined);
         @memcpy(out[0..rows.len], joined);
@@ -1233,7 +1233,7 @@ pub fn advancePlePrev(entry: *SSMCacheEntry, prev: [8]u32, ids: []const u32, ctx
 /// read NOW (this is the one host sync of a pipelined qwen4 step), the
 /// rows gathered straight into the leaf's buffer, and the per-entry
 /// n-gram history advanced. No-op without a pending leaf.
-pub fn flushDeferredPle(self: *Transformer, ctx: *ForwardCtx) !void {
+pub fn flushDeferredPle(self: *Trunk, ctx: *ForwardCtx) !void {
     const p = ctx.arch_ctx.qwen4.ple_pending orelse return;
     const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
     const out: [*]u16 = @constCast(dst);
@@ -1245,7 +1245,7 @@ pub fn flushDeferredPle(self: *Transformer, ctx: *ForwardCtx) !void {
 
 /// Fill every pending deferred-PLE leaf of a group in ONE pass. The caller retains
 /// rollback state until the whole round succeeds.
-pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !void {
+pub fn flushDeferredPleGroup(self: *Trunk, ctxs: []const *ForwardCtx) !void {
     var ids: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
     var n: usize = 0;
     defer for (ids[0..n]) |a| {
@@ -1284,7 +1284,7 @@ pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !voi
 /// Drop a pending leaf without filling it (the forward that built on it
 /// is being abandoned). The spec-PLE slot the build claimed is released
 /// too — no gather ever filled its tokens.
-pub fn discardDeferredPle(_: *Transformer, ctx: *ForwardCtx) void {
+pub fn discardDeferredPle(_: *Trunk, ctx: *ForwardCtx) void {
     const p = ctx.arch_ctx.qwen4.ple_pending orelse return;
     ctx.arch_ctx.qwen4.ple_pending = null;
     p.entry.spec_ple_len = 0;
@@ -1300,7 +1300,7 @@ pub fn discardDeferredPle(_: *Transformer, ctx: *ForwardCtx) void {
 /// entry's n-gram history. `capture` comes from `pleClaimSpecCapture` at
 /// BUILD time (never re-read off `spec_capture_ssm`, which a deferred
 /// flush sees already cleared).
-pub fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
+pub fn pleGatherBf16(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
     const ids_c = try plePrepareIds(self, token_ids);
     defer _ = mlx.mlx_array_free(ids_c);
     var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
@@ -1311,7 +1311,7 @@ pub fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_ar
 
 /// The gather ids as one contiguous int32 array, still LAZY: a group evaluates every
 /// row's ids together so the flush costs ONE host sync, not one per row.
-pub fn plePrepareIds(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+pub fn plePrepareIds(self: *Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
     var ids_i32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids_i32);
     try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
@@ -1323,7 +1323,7 @@ pub fn plePrepareIds(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_arra
 
 /// Host-only half of the gather: `ids_c` must already be evaluated. Everything that
 /// MOVES state (the spec token slot, the n-gram history) happens here.
-pub fn pleFillFromIds(self: *Transformer, ctx: *ForwardCtx, ids_c: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
+pub fn pleFillFromIds(self: *Trunk, ctx: *ForwardCtx, ids_c: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
     const st = self.arch_state.qwen4.model.?;
     const ctx_len: usize = st.hash.ngram_size - 1;
     const n: usize = mlx.mlx_array_size(ids_c);
@@ -1783,7 +1783,7 @@ test "hc prefill: incompatible read writes immediately" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
-    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = testing.allocator, .cache = cache });
     xfm.config.hc_count = 4;
     xfm.config.hidden_size = 128;
     for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
@@ -1824,7 +1824,7 @@ test "hc write compilation preserves the serial pending-write rounding" {
     if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.config.hc_count = 4;
     xfm.config.hidden_size = 2560;
@@ -1877,7 +1877,7 @@ test "fused hyper-connection gate: banks solved at load decide as the per-call s
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4C0A7E);
     const rnd = prng.random();
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.config = .{ .hc_count = 4, .hidden_size = 512, .quant_bits = 4, .quant_group_size = 64 };
     xfm.bits_cache = null;
     for ([_][2]u32{ .{ 8, 8 }, .{ 4, 4 }, .{ 8, 4 } }) |b| {

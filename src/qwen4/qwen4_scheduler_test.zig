@@ -4,7 +4,7 @@ const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
 const model_mod = @import("../model.zig");
 const model_registry_mod = @import("../model_registry.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const KVCache = trunk_mod.KVCache;
 const ModelConfig = model_mod.ModelConfig;
 const expert_stream_mod = @import("../expert_stream.zig");
@@ -380,7 +380,7 @@ test "admission combines Qwen and MiMo reservations in either order" {
     defer scheduler_mod.prefill_admission_numbers = saved;
     var qwen_cfg = ModelConfig{ .model_type = "qwen4_exp" };
     var mimo_cfg = ModelConfig{ .model_type = "mimo_v2" };
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     var qwen: LoadedModel = undefined;
     qwen.config = &qwen_cfg;
     qwen.transformer = &xfm;

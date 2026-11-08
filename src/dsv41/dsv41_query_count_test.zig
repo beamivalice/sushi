@@ -8,7 +8,7 @@ const model_mod = @import("../model.zig");
 const dsv41_model = @import("dsv41_model.zig");
 const scope_mod = @import("dsv41_scope.zig");
 const Scope = scope_mod.Scope;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const testing = std.testing;
 
 fn tinyDir() ![]const u8 {
@@ -176,7 +176,7 @@ test "dsv41 stq: the shared bank's lane read at load gives the bytes of the lane
     }
 }
 
-fn forwardIds(xfm: *Transformer, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
+fn forwardIds(xfm: *Trunk, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
     var ids32: [64]i32 = undefined;
     for (ids, ids32[0..ids.len]) |t, *o| o.* = @intCast(t);
     const shape = [_]c_int{ 1, @intCast(ids.len) };
@@ -203,7 +203,7 @@ fn decodeTokens(env: [:0]const u8) !?[6]u64 {
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var ctx = xfm.defaultCtx();
     _ = mlx.mlx_array_free(try forwardIds(&xfm, &ctx, ids[0..30]));

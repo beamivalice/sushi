@@ -662,7 +662,6 @@ pub const LinearTap = struct {
 };
 
 /// The old name of the trunk, kept until the arch stages move their callers to `Trunk`.
-pub const Transformer = Trunk;
 
 /// Scalars and tables a forward would rebuild on every call, made on first use and kept to `deinitTrunk` (`TrunkCells`).
 const TrunkConsts = struct {

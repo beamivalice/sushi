@@ -38,7 +38,7 @@ const testFillCache = pc.testFillCache;
 const testWriteCacheLayer = pc.testWriteCacheLayer;
 
 /// Fill a head-shaped cache: one layer at `layer` (the qwen4_exp MTP head's layer is never 0),
-/// driven through `Transformer.qwen4MtpAdvance` as `qwen4MtpForward` drives it.
+/// driven through `Trunk.qwen4MtpAdvance` as `qwen4MtpForward` drives it.
 fn testFillHeadCache(cache: *KVCache, s: mlx.mlx_stream, layer: u32, tokens: u32, seq_offset: *usize) !void {
     var written: u32 = 0;
     while (written < tokens) {
@@ -113,7 +113,7 @@ fn pcQsaArangeKeys(s: mlx.mlx_stream, rows: c_int, hd: c_int) !mlx.mlx_array {
 }
 
 fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: usize, hi: usize, s: mlx.mlx_stream) !void {
-    var xfm: trunk_mod.Transformer = undefined;
+    var xfm: trunk_mod.Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     var r = lo;
@@ -162,7 +162,7 @@ fn pcSsmDiffField(s: mlx.mlx_stream, a: []const SSMCacheEntry, b: []const SSMCac
 fn pcCaptureFed(
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
-    xfm: *trunk_mod.Transformer,
+    xfm: *trunk_mod.Trunk,
     keys: mlx.mlx_array,
     pos: c_int,
     conv_base: f64,
@@ -738,7 +738,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
     var toks: [P]u32 = undefined;
     for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
 
-    var xfm: trunk_mod.Transformer = undefined;
+    var xfm: trunk_mod.Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -1108,7 +1108,7 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
     const s = mlx.gpuStream();
     const P: usize = 20;
     const hd: c_int = 8;
-    var xfm: trunk_mod.Transformer = undefined;
+    var xfm: trunk_mod.Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 40, hd);
@@ -1188,7 +1188,7 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
     const P: usize = 48;
     const prompt_len: usize = P - 1;
     const hd: c_int = 8;
-    var xfm: trunk_mod.Transformer = undefined;
+    var xfm: trunk_mod.Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 80, hd);
@@ -1244,7 +1244,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
     const ratio: c_int = 4;
     const B: usize = 19;
     const H: usize = 80;
-    var xfm: trunk_mod.Transformer = undefined;
+    var xfm: trunk_mod.Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, @intCast(H), hd);
@@ -1339,7 +1339,7 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
     const donor_gen: usize = 16;
     const heir_gen: usize = 12;
     const a2_extra: usize = 8;
-    var xfm: trunk_mod.Transformer = undefined;
+    var xfm: trunk_mod.Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 

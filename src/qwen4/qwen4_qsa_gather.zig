@@ -44,7 +44,7 @@ const KVCache = trunk_mod.KVCache;
 const KV_UNPACK_HEADER = trunk_mod.KV_UNPACK_HEADER;
 const QsaCfgCache = trunk_mod.QsaCfgCache;
 const ShapeKey = trunk_mod.ShapeKey;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const attn256Base16Aligned = trunk_mod.attn256Base16Aligned;
 const fused256Enabled = trunk_mod.fused256Enabled;
 const fusedSdpaPrefillImpl = trunk_mod.fusedSdpaPrefillImpl;
@@ -1839,8 +1839,8 @@ test "qsa batched gather mixed group: a mask-only slot matches its solo masked S
 test "qsaBatchedAttn: the kill switch refuses the gather arm" {
     if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
-    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
-    const xfm: *Transformer = @ptrCast(&xfm_bytes);
+    var xfm_bytes: [@sizeOf(Trunk)]u8 align(@alignOf(Trunk)) = @splat(0);
+    const xfm: *Trunk = @ptrCast(&xfm_bytes);
     xfm.allocator = std.testing.allocator;
     var q4_bytes: [@sizeOf(qwen4_mod.Qwen4State)]u8 align(@alignOf(qwen4_mod.Qwen4State)) = @splat(0);
     xfm.arch_state.qwen4.model = @ptrCast(&q4_bytes);
@@ -1879,8 +1879,8 @@ test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the
     const hd: c_int = 64;
     const kls = [_]c_int{ 50, 36 };
 
-    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
-    const xfm: *Transformer = @ptrCast(&xfm_bytes);
+    var xfm_bytes: [@sizeOf(Trunk)]u8 align(@alignOf(Trunk)) = @splat(0);
+    const xfm: *Trunk = @ptrCast(&xfm_bytes);
     xfm.allocator = ta;
     xfm.s = s;
     xfm.config.indexer_compress_ratio = @intCast(ratio);

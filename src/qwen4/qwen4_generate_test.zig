@@ -12,7 +12,7 @@ const mtp_mod = @import("../mtp.zig");
 const round_cost = @import("../round_cost.zig");
 const group_planner = @import("../mtp_group_planner.zig");
 const depth_bounds = @import("../mtp_depth_bounds.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = trunk.ForwardCtx;
 const kv_disk_cache_mod = @import("../kv_disk_cache.zig");
@@ -57,8 +57,8 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     // Before this it was a
     // null/no-op stub, so every qwen4 request re-warmed the controller from
     // scratch. Only the two seed fields are touched here; the rest of the head
-    // (and of the Transformer) is never read on this path.
-    var t: Transformer = undefined;
+    // (and of the Trunk) is never read on this path.
+    var t: Trunk = undefined;
     t.arch_state.qwen4.mtp = null;
     const ref = MtpHeadRef.of("qwen4", &t);
 
@@ -297,7 +297,7 @@ const MtpChainTestSlot = struct {
     entries: []trunk.SSMCacheEntry,
     gen: ?Generator = null,
 
-    fn init(a: std.mem.Allocator, io: std.Io, xfm: *Transformer, tok: *Tokenizer, prompt: []const u32, depth: u32) !*@This() {
+    fn init(a: std.mem.Allocator, io: std.Io, xfm: *Trunk, tok: *Tokenizer, prompt: []const u32, depth: u32) !*@This() {
         const slot = try a.create(@This());
         errdefer a.destroy(slot);
         var cache = try KVCache.init(a, xfm.config.num_hidden_layers);
@@ -394,7 +394,7 @@ test "qwen4: the spec warm-up runs a prefill-shaped forward through the grouped 
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     const rate_groups = @import("sushi_exl3").rate_groups;
@@ -427,7 +427,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -569,7 +569,7 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -666,7 +666,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -787,7 +787,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
 }
 
 const L11PlainReplay = struct {
-    fn tick(xfm: *Transformer, slots: []const *MtpChainTestSlot, capture: bool) !void {
+    fn tick(xfm: *Trunk, slots: []const *MtpChainTestSlot, capture: bool) !void {
         const a = testing.allocator;
         var tokens: [4]u32 = undefined;
         var offsets: [4]u32 = undefined;
@@ -840,7 +840,7 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -930,7 +930,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -1033,7 +1033,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
 test "a Qwen round below 8192 KV prices widths by the table's realized tokens and keeps the confidence-gated chunk B" {
     // The acceptance EMAs promise deep rounds; the table measured that a wider round realizes fewer tokens per ms.
     // The base follows the table at every KV and only a confident round extends past it.
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.config.model_type = "qwen4_exp";
     xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
     for (0..round_cost.MIN_SAMPLES) |_| {
@@ -1086,7 +1086,7 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
@@ -1174,7 +1174,7 @@ fn decodeEndRowsAgree(want: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream
     }
 }
 
-fn decodeEndForward(xfm: *Transformer, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
+fn decodeEndForward(xfm: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
     var buf: [8]i32 = undefined;
     for (ids, 0..) |id, i| buf[i] = @intCast(id);
     const shape = [_]c_int{ 1, @intCast(ids.len) };
@@ -1193,7 +1193,7 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);

@@ -1161,7 +1161,7 @@ pub fn main(init: std.process.Init) !void {
             .drafter_dir = drafter_dir orelse "",
             .no_drafter = no_drafter,
             .mtp = mtp_flag,
-            .mtp_head_kv_quant = trunk.Transformer.mtp_head_kv_quant_flag,
+            .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
             .mtp_depth = depth_bounds.active.max,
             .load_vision = load_vision,
             .kv_quant = kv_quant_flag,
@@ -1197,7 +1197,7 @@ pub fn main(init: std.process.Init) !void {
         defer weights.deinit();
         model_mod.resolveWeightPrefix(config, &weights);
 
-        var xfm = try trunk.Transformer.init(io, allocator, config.*, &weights);
+        var xfm = try trunk.Trunk.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
 
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);
@@ -1210,7 +1210,7 @@ pub fn main(init: std.process.Init) !void {
 
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
-        // Transformer's own legacy cache to match.
+        // Trunk's own legacy cache to match.
         const kv_cache = server_mod.kvCacheForLaunch(config, kv_quant_flag);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
         const mtp_choice = model_load.mtpChoiceFor(mtp_flag, config);
@@ -1434,7 +1434,7 @@ fn runHeadlessServe(
         .warmup_eager = false,
         .kv_quant = kv_quant_flag,
         .mtp = mtp_flag,
-        .mtp_head_kv_quant = trunk.Transformer.mtp_head_kv_quant_flag,
+        .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
         // Seed the scheduler's prefix-cache config from the server globals so
         // on-demand (headless/discover-mode) loads get the SAME hot prefix
         // cache as a `--model` startup load. Previously hardcoded to 0, which

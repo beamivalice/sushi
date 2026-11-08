@@ -5,7 +5,7 @@ const mtp_mod = @import("../mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const model_mod = @import("../model.zig");
 const model_registry_mod = @import("../model_registry.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const ModelConfig = model_mod.ModelConfig;
 const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
@@ -66,7 +66,7 @@ test "mimo_v2 expert cache budget excludes the dense prefix" {
 }
 
 test "MiMo crowded MTP takes an eligible slot" {
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.config = .{ .model_type = "mimo_v2" };
     xfm.moe_layers = &.{};
     xfm.expert_stream = null;
@@ -91,7 +91,7 @@ test "MiMo crowded MTP takes an eligible slot" {
 }
 
 test "a penalised MTP slot never joins a plain batched tick, which samples no penalty" {
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.config = .{ .model_type = "mimo_v2" };
     xfm.moe_layers = &.{};
     xfm.expert_stream = null;

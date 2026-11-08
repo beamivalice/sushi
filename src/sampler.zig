@@ -12,7 +12,7 @@ const slot_admission = @import("slot_admission.zig");
 const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
 const ThinkPenalty = think_penalty.ThinkPenalty;
@@ -71,7 +71,7 @@ pub const SamplingParams = struct {
     /// must never draw this id (reserved specials like `<|fim_hole|>`, which
     /// a degenerate distribution can rank top-5 at a collapsed position — a
     /// reserved marker in chat output is always a bug). Model-lifetime,
-    /// OWNED by the Transformer (`suppress_mask`), non-owning here; wired by
+    /// OWNED by the Trunk (`suppress_mask`), non-owning here; wired by
     /// `Generator.initWithOptions` so every sampling path inherits it.
     /// Applied by both samplers and both stochastic-verify filters, fully
     /// lazy (`mlx_where` + -inf, no host sync); logprobs deliberately keep
@@ -132,12 +132,12 @@ pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) voi
 }
 
 /// Derive + install the reserved-token suppression mask on a freshly-built
-/// Transformer (both the serve load path and the CLI run path call this).
+/// Trunk (both the serve load path and the CLI run path call this).
 /// The id set is `tokenizer.reservedOutputIds`: `special: true` added tokens
 /// minus EOS/stop ids minus template-emitted markers. Never fails a load — any error logs and
 /// leaves the mask null (suppression off), and engagement is one-shot-logged
 /// so a silent no-op is visible (the silent-fallback class).
-pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_template: []const u8, eos_ids: []const u32) void {
+pub fn installSuppressMask(xfm: *Trunk, tok: *const Tokenizer, chat_template: []const u8, eos_ids: []const u32) void {
     const ids = tokenizer_mod.reservedOutputIds(xfm.allocator, tok.flagged_specials, chat_template, eos_ids) catch |err| {
         log.warn("[suppress] derivation failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
         return;
@@ -660,7 +660,7 @@ pub fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, 
 }
 
 /// Prefill's first token under the think penalty when the prompt leaves the span open.
-pub fn firstTokenSample(xfm: *Transformer, logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn firstTokenSample(xfm: *Trunk, logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     const tp = sampling.think_penalty;
     if (!tp.active()) return firstTokenLazy(logits, sampling, s);
     if (!tp.hasBias() and (xfm.think_marker_mask == null or tp.phase != .inside)) return firstTokenLazy(logits, sampling, s);
@@ -3505,7 +3505,7 @@ test "upstream bugfix: constrained logprobs describe the returned token before m
     const a = testing.allocator;
     const s = mlx.gpuStream();
     // Each call is the final allowed token, so no model forward is needed.
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     var bytes = try token_mask.TokenBytes.init(std.heap.ArenaAllocator.init(a), &.{ null, "true", "false", "invalid" }, null);
     defer bytes.deinit();

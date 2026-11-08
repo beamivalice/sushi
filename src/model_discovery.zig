@@ -10,7 +10,7 @@
 //! and surface the rest as `loaded:false` siblings.
 //!
 //! On-demand load + LRU eviction live in plan 05 phases 2-5 and depend on
-//! plan 01 Phase 0 (detangling Transformer state).
+//! plan 01 Phase 0 (detangling Trunk state).
 
 const std = @import("std");
 const log = @import("log.zig");

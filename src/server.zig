@@ -48,7 +48,7 @@ const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 const update_mod = @import("update.zig");
 
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const VisionEncoder = vision_mod.VisionEncoder;
@@ -196,7 +196,7 @@ pub fn requestShutdown() void {
 ///
 /// `native_measured`: same exemption, for an arch whose head ships inside the
 /// checkpoint AND has been measured no-worse-than-serial across the context
-/// ladder (`Transformer.nativeMoeMtpHeadMeasured`, which carries the bar). It
+/// ladder (`Trunk.nativeMoeMtpHeadMeasured`, which carries the bar). It
 /// still needs a head LOADED — the claim is about the head, not the arch.
 
 
@@ -861,7 +861,7 @@ pub fn serve(
     defer if (!boot_gate.process.opened.isSet()) boot_gate.process.fail(io);
 
     // ── Phase A1: spin up the scheduler. Its inference thread does the
-    //    Transformer/vision/drafter load, JIT compile, and warmup; mlx ops
+    //    Trunk/vision/drafter load, JIT compile, and warmup; mlx ops
     //    are bound to that thread's GPU stream. `init` returns once the load
     //    has passed its refusals, so a refusal still ends the boot unserved.
     var scheduler = scheduler_mod.Scheduler.init(
@@ -1036,7 +1036,7 @@ pub fn serve(
     } else if (server_state.server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
-    const launch_use = arch_flags.LaunchFlagUse{ .qwen_gdn_16 = !model_mod.qwen_gdn_f32, .mtp_head_kv_quant = trunk.Transformer.mtp_head_kv_quant_flag };
+    const launch_use = arch_flags.LaunchFlagUse{ .qwen_gdn_16 = !model_mod.qwen_gdn_f32, .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag };
     var boot_lines: [arch_flags.options.len]?[]const u8 = undefined;
     for (arch_flags.bootLines(config, launch_use, &boot_lines)) |line| if (line) |l| log.info("{s}\n", .{l});
     if (generate_mod.max_mtp_ctx != 0) {

@@ -8,7 +8,7 @@ const depth_bounds = @import("mtp_depth_bounds.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Generator = generate_mod.Generator;
@@ -700,7 +700,7 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
 }
 
 test "only the models with per-slot head state are admitted to the MTP slot groups, whose rounds run solo" {
-    var t: trunk.Transformer = undefined;
+    var t: trunk.Trunk = undefined;
     t.arch_state = .{};
     t.moe_layers = &.{};
     t.expert_stream = null;
@@ -713,7 +713,7 @@ test "only the models with per-slot head state are admitted to the MTP slot grou
 
 test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP ticks" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
-    var t: trunk.Transformer = undefined;
+    var t: trunk.Trunk = undefined;
     var forced = [_]u32{7};
     var tb = mtp_plan.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
     var gen: Generator = undefined;
@@ -871,7 +871,7 @@ test "group cost geometry rejects partial rounds and keeps complete cache format
 }
 
 test "scheduler prices each shared execution once and preserves row sampling geometry" {
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
@@ -906,7 +906,7 @@ test "scheduler prices each shared execution once and preserves row sampling geo
 }
 
 test "planner pools recurring head histories without mixing the cold first history" {
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
@@ -963,7 +963,7 @@ test "planner pools recurring head histories without mixing the cold first histo
 }
 
 test "mean cost pooling retains differences between histories and both worst-case bounds" {
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;

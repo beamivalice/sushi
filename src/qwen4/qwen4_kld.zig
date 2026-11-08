@@ -13,7 +13,7 @@ pub fn hiddenCaptureWidth(config: *const model.ModelConfig) usize {
     return @as(usize, config.hidden_size) * @max(config.hc_count, 1);
 }
 
-pub fn afterLoad(xfm: *trunk_mod.Transformer, config: model.ModelConfig, kv: trunk_mod.KVQuantConfig) !void {
+pub fn afterLoad(xfm: *trunk_mod.Trunk, config: model.ModelConfig, kv: trunk_mod.KVQuantConfig) !void {
     _ = config;
     try qwen4_forward.qwen4MtpApplyKvQuant(xfm, kv);
     qwen4_forward.compileQwen4Hc(xfm);

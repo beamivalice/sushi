@@ -2,7 +2,7 @@
 //! `arch/drafter.zig` answers every head operation with its default and the rounds run from `nextDspark`.
 const trunk_mod = @import("../trunk.zig");
 const spec_types = @import("../spec_types.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 
 pub const kinds = [_]spec_types.Kind{.dspark};
 pub const head_kind: spec_types.Kind = .dspark;
@@ -12,8 +12,8 @@ pub const nextDspark = rounds.nextDspark;
 
 /// The DSpark stages and their windows live on the model's own state, so a request that drafts with them holds the
 /// model exclusively (`ownsModuleDecodeState`).
-pub const Head = *Transformer;
+pub const Head = *Trunk;
 
-pub fn headOf(xfm: *Transformer, _: bool, _: ?*anyopaque) ?Head {
+pub fn headOf(xfm: *Trunk, _: bool, _: ?*anyopaque) ?Head {
     return if (xfm.arch_state.dsv41.model != null and xfm.arch_state.dsv41.model.?.dspark != null) xfm else null;
 }

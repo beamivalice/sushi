@@ -564,12 +564,12 @@ pub const DflashCommit = struct {
 };
 
 /// Where `lookupAndRestore` puts a restored assistant context. `base_pos` is
-/// written on every path so the caller can build `DflashCtx` from it. `head` is the Transformer
+/// written on every path so the caller can build `DflashCtx` from it. `head` is the Trunk
 /// owning an in-checkpoint MTP head; the adoption then goes through the arch (`prefix_arch.adoptSpecHead`).
 pub const DflashTarget = struct {
     cache: *KVCache,
     base_pos: *usize,
-    head: ?*trunk_mod.Transformer = null,
+    head: ?*trunk_mod.Trunk = null,
 };
 
 /// What `evictLruToAdmit` gave up, and whether it was enough.
@@ -8011,7 +8011,7 @@ pub fn pcQsaExpectViewEqual(s: mlx.mlx_stream, warm: *SSMCacheEntry, cold: *SSMC
     }
 }
 
-pub fn pcQsaFeed(xfm: *trunk_mod.Transformer, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
+pub fn pcQsaFeed(xfm: *trunk_mod.Trunk, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
     const chunk = try pcQsaSliceAxis1(s, keys, 0, n);
     defer _ = mlx.mlx_array_free(chunk);
     try transformer_mod.qsaTestAppendPool(xfm, entry, chunk, 0, s);

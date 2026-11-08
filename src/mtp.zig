@@ -17,7 +17,7 @@ const moe_gqmv = @import("moe_gqmv.zig");
 const log = @import("log.zig");
 const trunk_stq = @import("trunk_stq.zig");
 const Linear = @import("linear.zig").Linear;
-const Transformer = transformer_mod.Transformer;
+const Trunk = transformer_mod.Trunk;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const expert_quant = @import("expert_quant.zig");
@@ -201,11 +201,11 @@ test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" 
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    const old_kv_flag = Transformer.mtp_head_kv_quant_flag;
-    defer Transformer.mtp_head_kv_quant_flag = old_kv_flag;
-    Transformer.mtp_head_kv_quant_flag = true;
+    const old_kv_flag = Trunk.mtp_head_kv_quant_flag;
+    defer Trunk.mtp_head_kv_quant_flag = old_kv_flag;
+    Trunk.mtp_head_kv_quant_flag = true;
     try xfm.cache.reinit(config.num_hidden_layers, transformer_mod.KVQuantConfig.affine(8));
     try arch_state.applyHeadKvQuant(&xfm, transformer_mod.KVQuantConfig.affine(8));
     try testing.expect(arch_state.buildDraftRerank(&xfm));
@@ -258,7 +258,7 @@ fn qwen4MixedLayerMatches(layer: anytype) bool {
     };
 }
 
-fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
+fn qwen4MixedModelPacksMatch(target: *const Trunk) bool {
     const q4 = qwen4_state.stateOfConst(target) orelse return false;
     if (q4.model == null or q4.stream_f32 or target.config.quant_mode != .affine or target.config.quant_group_size != 64) return false;
     const cfg = &target.config;
@@ -284,13 +284,13 @@ fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
 /// head fc packs at that width (K derived from the scales, so no input-dim
 /// formula is assumed). Revoked without matrix units like the
 /// other profiles: auto depth never assumes a lane the hardware lacks.
-pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
+pub fn qwen4G17CostProfile(target: *const Trunk) MtpCostProfile {
     return qwen4G17CostProfileForKv(target, target.cache.config);
 }
 
 /// Mixed-pack prices use the request's actual KV format, including a slot
 /// override. The original all-4-bit classifier retains its existing scope.
-pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.KVQuantConfig) MtpCostProfile {
+pub fn qwen4G17CostProfileForKv(target: *const Trunk, kv: transformer_mod.KVQuantConfig) MtpCostProfile {
     if (target.config.expert_layout == .exl3_k4) return .generic;
     const head = qwen4_state.mtpOfConst(target) orelse return .generic;
     const cfg = &target.config;
@@ -410,7 +410,7 @@ pub const RerankCoarse = struct {
 /// The coarse readout head: a low-bit/gs64 requantized copy of the target's
 /// lm_head, materialized so the first draft does not pay for it. Infallible —
 /// every refusal returns null and the caller keeps its full-readout path.
-pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?RerankCoarse {
+pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Trunk, bits: u32) ?RerankCoarse {
     if (bits == 0) return null;
     if (target.lm_head_s.ctx == null) return null; // dense bf16 - row-gather rerank unbuilt/unmeasured
     const w_shape = mlx.getShape(target.lm_head_w);
@@ -483,7 +483,7 @@ pub fn maskAndArgmax(s: mlx.mlx_stream, logits_in: mlx.mlx_array, suppress_mask:
 /// low-bit draft head to prefer.
 pub fn fullReadoutArgmax(
     s: mlx.mlx_stream,
-    target: *Transformer,
+    target: *Trunk,
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
 ) !mlx.mlx_array {
@@ -559,7 +559,7 @@ pub fn retireCoarse(coarse: *?RerankCoarse) void {
 /// Null retires the coarse head, so every later step lands on the caller's fallback.
 fn rerankShortlistRow(
     s: mlx.mlx_stream,
-    target: *const Transformer,
+    target: *const Trunk,
     coarse: *?RerankCoarse,
     flat: mlx.mlx_array,
     rows: c_int,
@@ -657,7 +657,7 @@ fn rerankCoarseFlat(
 /// head is unavailable, exactly as in `rerankSelect`.
 pub fn rerankShortlist(
     s: mlx.mlx_stream,
-    target: *Transformer,
+    target: *Trunk,
     coarse: *?RerankCoarse,
     logged: *bool,
     x: mlx.mlx_array,
@@ -689,7 +689,7 @@ pub fn rerankShortlist(
 /// a coarse miss costs acceptance, never output.
 pub fn rerankSelect(
     s: mlx.mlx_stream,
-    target: *Transformer,
+    target: *Trunk,
     coarse: *?RerankCoarse,
     logged: *bool,
     x: mlx.mlx_array,
@@ -736,7 +736,7 @@ fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse
 /// False = the coarse head is unavailable (nothing is written to `out`).
 pub fn rerankShortlistsBatched(
     s: mlx.mlx_stream,
-    target: *const Transformer,
+    target: *const Trunk,
     coarse: *?RerankCoarse,
     logged: *bool,
     x: mlx.mlx_array,
@@ -792,7 +792,7 @@ pub fn rerankShortlistsBatched(
 /// `rerankSelect` per row; one coarse readout over N.
 pub fn rerankSelectBatched(
     s: mlx.mlx_stream,
-    target: *Transformer,
+    target: *Trunk,
     coarse: *?RerankCoarse,
     logged: *bool,
     x: mlx.mlx_array,
@@ -1481,14 +1481,14 @@ test "mtp: headQuantParams never mis-resolves a non-affine lm_head as affine (is
     try testing.expectEqual(@as(u32, 32), qpa.group_size);
 }
 
-/// A bare Transformer carrying nothing but a quantized lm_head + the config
+/// A bare Trunk carrying nothing but a quantized lm_head + the config
 /// fields `headQuantParams` reads. Every function under test touches exactly
 /// those, which is the property that let the qwen4_exp head reuse the scheme.
-/// A minimal target for the rerank scheme: a Transformer carrying nothing
+/// A minimal target for the rerank scheme: a Trunk carrying nothing
 /// but a quantized `lm_head`, which is all the scheme ever reads. `pub` so
 /// the qwen4 arm's tests in generate.zig build the same target.
 pub const RerankFixture = struct {
-    xfm: Transformer,
+    xfm: Trunk,
     dense: mlx.mlx_array,
     vocab: c_int,
     hidden: c_int,
@@ -1519,7 +1519,7 @@ pub const RerankFixture = struct {
             .{ .ctx = null },
             s,
         ));
-        var xfm: Transformer = undefined;
+        var xfm: Trunk = undefined;
         xfm.arch_state = .{};
         xfm.config = .{};
         xfm.config.hidden_size = @intCast(hidden);

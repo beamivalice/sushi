@@ -12,7 +12,7 @@ const kv_disk_cache = @import("../kv_disk_cache.zig");
 const model_registry_mod = @import("../model_registry.zig");
 const model_settings = @import("../model_settings.zig");
 const log = @import("../log.zig");
-const Transformer = transformer_mod.Transformer;
+const Trunk = transformer_mod.Trunk;
 const ModelConfig = model_mod.ModelConfig;
 const Generator = generate_mod.Generator;
 const mtp_plan = @import("../mtp_plan.zig");
@@ -223,7 +223,7 @@ test "a DeepSeek STQ pack's ssd budget bills its tower as the requantized 8-bit 
     }
 }
 
-fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xfm: *Transformer, slot: *Slot) void {
+fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xfm: *Trunk, slot: *Slot) void {
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     sch.queue_mu = .init;
@@ -262,7 +262,7 @@ test "a cancelled DeepSeek slot commits when it is culled and not again at the c
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var sch: Scheduler = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.arch_state = .{};
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
     xfm.config = .{ .model_type = "deepseek_v41" };
@@ -292,7 +292,7 @@ test "a finished DeepSeek slot is not committed again by the cull" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var sch: Scheduler = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.arch_state = .{};
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
     xfm.config = .{ .model_type = "deepseek_v41" };
@@ -346,7 +346,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     defer m.deinit();
     _ = mlx.mlx_array_free(try dsv41_model.extend(m, ids[0..40], .last));
 
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.arch_state.dsv41.model = m;
     xfm.config = .{ .model_type = "deepseek_v41" };
     var model: model_registry_mod.LoadedModel = undefined;

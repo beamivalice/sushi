@@ -5,7 +5,7 @@ const trunk_mod = @import("../trunk.zig");
 const mtp_mod = @import("../mtp.zig");
 const spec_types = @import("../spec_types.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const KVCache = trunk_mod.KVCache;
 
 pub const kinds = [_]spec_types.Kind{ .mtp, .dflash2 };
@@ -16,7 +16,7 @@ pub const nextDflash = @import("../dflash_round.zig").nextDflash;
 pub const Head = *mimo_mtp.Head;
 
 /// The heads loaded beside the trunk travel as `aux`.
-pub fn headOf(_: *Transformer, _: bool, aux: ?*anyopaque) ?Head {
+pub fn headOf(_: *Trunk, _: bool, aux: ?*anyopaque) ?Head {
     return if (aux) |p| @ptrCast(@alignCast(p)) else null;
 }
 
@@ -59,7 +59,7 @@ pub fn moduleOwned(_: Head) bool {
     return false;
 }
 
-/// MiMo's heads are a separately allocated object; an in-trunk head is owned by the Transformer.
+/// MiMo's heads are a separately allocated object; an in-trunk head is owned by the Trunk.
 pub fn destroyHead(h: Head, allocator: std.mem.Allocator) void {
     h.deinit();
     allocator.destroy(h);
@@ -75,7 +75,7 @@ fn freeArray(a: mlx.mlx_array) void {
 
 /// Draft steps chain no hidden: step 0 carries the round's committed rows (`hidden` the target's), each later step
 /// only its draft. The step index travels in `hidden_next`, a scalar the next call recognises by its rank.
-pub fn forward(h: Head, target: *Transformer, ref: *Cache, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset_in: c_int, want: mtp_mod.StepWant, _: ?mtp_mod.MropeContext, host_ids: ?[]const u32) !mtp_mod.StepOut {
+pub fn forward(h: Head, target: *Trunk, ref: *Cache, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset_in: c_int, want: mtp_mod.StepWant, _: ?mtp_mod.MropeContext, host_ids: ?[]const u32) !mtp_mod.StepOut {
     const rope_offset: usize = @intCast(rope_offset_in);
     const chained = mlx.mlx_array_ndim(hidden) != 3;
     if (want == .none) {
@@ -103,7 +103,7 @@ pub fn stepOut(target: anytype, comptime free: fn (mlx.mlx_array) void, last: ml
     return .{ .logits = logits, .hidden_next = hidden_next };
 }
 
-pub fn appendHistory(h: Head, target: *Transformer, cache: *Cache, token_ids: []const u32, hidden: mlx.mlx_array, rope_offset: c_int, _: ?mtp_mod.MropeContext, _: std.mem.Allocator) !void {
+pub fn appendHistory(h: Head, target: *Trunk, cache: *Cache, token_ids: []const u32, hidden: mlx.mlx_array, rope_offset: c_int, _: ?mtp_mod.MropeContext, _: std.mem.Allocator) !void {
     try h.appendHistory(target, cache.st, token_ids, hidden, @intCast(rope_offset));
 }
 
@@ -111,17 +111,17 @@ pub fn canRerankDrafts(h: Head) bool {
     return h.canRerankDrafts();
 }
 
-pub fn draftSelect(h: Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+pub fn draftSelect(h: Head, target: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
     return h.draftSelect(target, x, suppress_mask);
 }
 
-pub fn draftShortlist(h: Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
+pub fn draftShortlist(h: Head, target: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
     return h.draftShortlist(target, x, suppress_mask);
 }
 
 /// Every G17/NAX cost surface is calibrated against the qwen4_exp in-checkpoint head, so every other head plans
 /// under `generic` unless it has a surface of its own.
-pub fn costProfile(_: Head, target: *const Transformer, _: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
+pub fn costProfile(_: Head, target: *const Trunk, _: trunk_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
     return if (target.config.expert_layout == .exl3_k4) .mimo_exl3 else .generic;
 }
 

@@ -37,7 +37,7 @@ const pack_update = @import("pack_update.zig");
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
 
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -56,7 +56,7 @@ pub const LoadState = enum {
     /// Discovered but never loaded — no GPU memory committed. ensureLoaded
     /// promotes to `.loading` (Phase D).
     unloaded,
-    /// Inference thread is faulting weights / building the Transformer.
+    /// Inference thread is faulting weights / building the Trunk.
     /// ensureLoaded callers block on `state_cond`.
     loading,
     /// Live in GPU memory. Refcounted; safe to use for inference.
@@ -213,7 +213,7 @@ pub const LoadedModel = struct {
     /// pattern across config/tokenizer/chat_config).
     config: ?*ModelConfig,
     weights: ?*Weights,
-    transformer: ?*Transformer,
+    transformer: ?*Trunk,
     /// Per-model tokenizer (different vocabularies across models). Phase 05
     /// moves ownership here from main.zig so the tokenizer's lifetime
     /// matches the model's residency.
@@ -354,7 +354,7 @@ pub const LoadedModel = struct {
     pub fn deinit(self: *LoadedModel) void {
         if (self.mtp) |h| {
             // Only MiMo's heads are a separately allocated object; an
-            // in-trunk head would be owned by the Transformer and freed with
+            // in-trunk head would be owned by the Trunk and freed with
             // it — destroying it here would double-free the whole model.
             h.destroyHead(self.allocator);
             self.mtp = null;
@@ -477,7 +477,7 @@ pub const LoadedModel = struct {
     pub fn unloadResident(self: *LoadedModel) void {
         if (self.mtp) |h| {
             // Only MiMo's heads are a separately allocated object; an
-            // in-trunk head would be owned by the Transformer and freed with
+            // in-trunk head would be owned by the Trunk and freed with
             // it — destroying it here would double-free the whole model.
             h.destroyHead(self.allocator);
             self.mtp = null;

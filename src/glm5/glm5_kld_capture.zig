@@ -1413,7 +1413,7 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
     cfg.max_position_embeddings = 64;
     var loaded = kld.Loaded{ .allocator = allocator, .io = io, .config = cfg, .tok = try tokenizer_mod.loadTokenizer(io, allocator, root), .chat_config = undefined, .weights = undefined, .xfm = undefined };
     defer loaded.tok.deinit();
-    loaded.xfm = try trunk_mod.Transformer.init(io, allocator, cfg, &weights);
+    loaded.xfm = try trunk_mod.Trunk.init(io, allocator, cfg, &weights);
     defer loaded.xfm.deinit();
 
     // Chunked prompt forwards continue one request exactly as the native model run in the same chunks.
@@ -1478,7 +1478,7 @@ test "kld: GLM full-stream hidden capture retains chunked boundaries and native 
     defer weights.deinit();
     const cfg = try glm.routedFixture(&weights, 4);
     var loaded = kld.Loaded{ .allocator = a, .io = io, .config = cfg, .tok = undefined, .chat_config = undefined, .weights = undefined, .xfm = undefined };
-    loaded.xfm = try trunk_mod.Transformer.init(io, a, cfg, &weights);
+    loaded.xfm = try trunk_mod.Trunk.init(io, a, cfg, &weights);
     defer loaded.xfm.deinit();
     const ids = [_]u32{ 1, 3, 0, 2, 2, 1, 3 };
     var ctx = loaded.xfm.defaultCtx();

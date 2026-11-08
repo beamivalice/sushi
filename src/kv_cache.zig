@@ -18,7 +18,7 @@ const qsaArraysAllEqual = test_support.qsaArraysAllEqual;
 const snapshotsBitEqual = test_support.snapshotsBitEqual;
 const testKVWide = test_support.testKVWide;
 const ForwardCtx = model_handle.ForwardCtx;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const kvAppendDummyAttn = trunk_helpers_test.kvAppendDummyAttn;
 const kvAppendOperandsEqual = trunk_helpers_test.kvAppendOperandsEqual;
 const kvAppendPacked = trunk_helpers_test.kvAppendPacked;
@@ -324,7 +324,7 @@ pub const KVCache = struct {
     /// Swap this cache for a freshly-built one under `config`. BUILD FIRST,
     /// then free: `initWithConfig` is fallible, and a caller that reached it
     /// through `cache.deinit(); cache = try init(...)` left a FREED cache
-    /// installed on the Transformer on the error path, whose own `deinit`
+    /// installed on the Trunk on the error path, whose own `deinit`
     /// then freed every handle a second time. The class is "a fallible
     /// re-init behind a deinit"; keeping the order inside ONE helper is what
     /// stops it recurring: every live re-init goes through here, never `.cache = try init` behind a deinit.
@@ -1900,10 +1900,10 @@ fn verifyRollbackKvCase(config: KVQuantConfig, prefix_len: usize, force_growth: 
     defer _ = mlx.mlx_array_free(tail);
     var offset = prefix_len;
     var ctx = ForwardCtx{ .cache = &cache, .moe_seq_offset = &offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.allocator = allocator;
     xfm.fwd_gen = 0;
-    var rollback = try Transformer.VerifyRollback.capture(&xfm, &ctx);
+    var rollback = try Trunk.VerifyRollback.capture(&xfm, &ctx);
     defer rollback.deinit();
     var appended = try cache.update(0, tail, tail, stream, 0);
     appended.deinit();
@@ -2140,7 +2140,7 @@ test "KVCache affine quant carries an asymmetric K/V too (--kv-quant on MLA)" {
 
 test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
     // Every re-init site once read `cache.deinit(); cache = try init(...)`, so
-    // a failed init left a FREED cache installed on the Transformer and its
+    // a failed init left a FREED cache installed on the Trunk and its
     // owner's deinit freed every handle a second time — EXC_BAD_ACCESS in
     // `mlx_array_free`, several frames from the refusal that caused it. The
     // refusal here is the allocator's (the entries alloc of the second init);

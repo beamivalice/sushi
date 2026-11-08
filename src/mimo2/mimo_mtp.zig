@@ -26,7 +26,7 @@ const log = @import("../log.zig");
 
 const builtin = @import("builtin");
 
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 
@@ -35,7 +35,7 @@ pub const MAX_HEADS: usize = 3;
 /// The coarse draft readout's width. At 2 bits its top-32 shortlist still holds the drafts the
 /// 3-bit copy picks on MiMo.
 /// Builds `t`'s coarse lm_head copy if its shortlist cell holds none; whether the cell holds one after.
-pub fn buildCoarseHead(s: mlx.mlx_stream, t: *Transformer) bool {
+pub fn buildCoarseHead(s: mlx.mlx_stream, t: *Trunk) bool {
     const slot = mimo2_state.coarseHead(t) orelse return false;
     if (slot.* == null) slot.* = mtp_mod.buildRerankCoarse(s, t, rerankBits());
     return slot.* != null;
@@ -341,7 +341,7 @@ pub const Head = struct {
     ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
     /// The trunk whose embedding and lm_head the heads share.
-    target: ?*Transformer = null,
+    target: ?*Trunk = null,
 
     /// The heads present in `weights` (`model.mtp.layers.{0..}`), in the sliding
     /// layers' geometry. Null when the checkpoint carries none.
@@ -630,7 +630,7 @@ pub const Head = struct {
     /// Head `li`'s rows from wherever its rows end through `q`, the last `drafted`
     /// of them carrying this round's drafts; the rest carry committed tokens.
     /// Returns every forwarded row, final-normed.
-    fn forwardRows(self: *const Head, target: *Transformer, st: *State, li: usize, q: usize, drafted: usize) !mlx.mlx_array {
+    fn forwardRows(self: *const Head, target: *Trunk, st: *State, li: usize, q: usize, drafted: usize) !mlx.mlx_array {
         const s = self.s;
         const cache = &st.rows[li];
         // Rows before the last query's window never reach a later query either.
@@ -680,7 +680,7 @@ pub const Head = struct {
 
     /// Committed history `(hidden_p, x_{p+1})` for p in `[p0, p0 + n)`: every head
     /// appends the rows whose own tokens are committed.
-    pub fn appendHistory(self: *const Head, target: *Transformer, st: *State, token_ids: []const u32, hidden: mlx.mlx_array, p0: usize) !void {
+    pub fn appendHistory(self: *const Head, target: *Trunk, st: *State, token_ids: []const u32, hidden: mlx.mlx_array, p0: usize) !void {
         try st.record(self.s, p0, hidden, token_ids);
         const end = st.step();
         for (0..self.heads) |li| {
@@ -705,7 +705,7 @@ pub const Head = struct {
     /// their last position q; step i >= 1 (`hidden` null) runs head i at q on the
     /// drafts so far plus `draft` (d_i). Returns the lm_head's input for the next
     /// draft, `[1, 1, H]`.
-    pub fn draftStep(self: *const Head, target: *Transformer, st: *State, step_i: usize, draft: ?mlx.mlx_array, token_ids: []const u32, hidden: ?mlx.mlx_array, p0: usize) !mlx.mlx_array {
+    pub fn draftStep(self: *const Head, target: *Trunk, st: *State, step_i: usize, draft: ?mlx.mlx_array, token_ids: []const u32, hidden: ?mlx.mlx_array, p0: usize) !mlx.mlx_array {
         if (step_i == 0) {
             try st.record(self.s, p0, hidden orelse return error.MimoMtpStepZeroNeedsHidden, token_ids);
             st.round_q = st.step() - 1;
@@ -727,7 +727,7 @@ pub const Head = struct {
 
     /// One history append and one round of every head on a throwaway state, so their pipelines
     /// JIT at load instead of inside a request's first rounds. Returns the head steps it ran.
-    pub fn warmup(self: *Head, target: *Transformer) !usize {
+    pub fn warmup(self: *Head, target: *Trunk) !usize {
         const hist: usize = 8;
         var ids: [hist + 2]u32 = undefined;
         for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % 40000);
@@ -779,14 +779,14 @@ pub const Head = struct {
         return if (mimo2_state.coarseHead(t)) |slot| slot.* != null else false;
     }
 
-    pub fn draftSelect(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+    pub fn draftSelect(self: *Head, target: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         if (self.canRerankDrafts()) {
             if (try mtp_mod.rerankSelect(self.s, target, mimo2_state.coarseHead(target).?, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
         }
         return mtp_mod.fullReadoutArgmax(self.s, target, x, suppress_mask);
     }
 
-    pub fn draftShortlist(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
+    pub fn draftShortlist(self: *Head, target: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
         if (!self.canRerankDrafts()) return null;
         return mtp_mod.rerankShortlist(self.s, target, mimo2_state.coarseHead(target).?, &self.rerank_logged, x, suppress_mask);
     }
@@ -851,7 +851,7 @@ test "mimo mtp heads warm up every head on a throwaway state (MIMO_V2_MODEL)" {
     defer weights.deinit();
     try mimo_forward.stackMimoFixtureExperts(&weights, config, s);
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var mtp_weights = try @import("mimo_source.zig").loadMtpWeights(io, a, dir);
     defer mtp_weights.deinit();
@@ -915,7 +915,7 @@ test "mimo mtp heads track the torch rendering of the MiMo-V2 MTP layer across r
     defer weights.deinit();
     try mimo_forward.stackMimoFixtureExperts(&weights, config, s);
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     var head = (try Head.load(a, s, &config, &weights)) orelse return error.NoMtpHeads;
     defer head.deinit();

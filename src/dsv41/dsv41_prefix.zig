@@ -332,7 +332,7 @@ pub fn rowDivisors(allocator: std.mem.Allocator, c: *const @import("dsv41_config
 }
 
 /// The SSD namespace of a loaded DeepSeek model: `layoutKey` over the boot's arms and the expert drop list it names.
-pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, model_dir: []const u8, xfm: *transformer.Transformer) !?[]u8 {
+pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, model_dir: []const u8, xfm: *transformer.Trunk) !?[]u8 {
     var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
     defer if (drop) |*d| d.deinit();
     const m = xfm.arch_state.dsv41.model.?;

@@ -29,7 +29,7 @@ const SWA_TEST_WINDOW = trunk_helpers_test.SWA_TEST_WINDOW;
 const ShapeKey = trunk.ShapeKey;
 const SwaGeom = trunk_helpers_test.SwaGeom;
 const TestQuantView = trunk_helpers_test.TestQuantView;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const absMax = trunk_helpers_test.absMax;
 const attnPdCausalTruth = trunk_helpers_test.attnPdCausalTruth;
 const attnPdTestArms = trunk_helpers_test.attnPdTestArms;
@@ -1813,13 +1813,13 @@ test "prefillEvalCadence: small transients keep the coarse cadence" {
     defer fused256_override = null;
     // 26B geometry, short prompt: 16 heads x 2048 chunk x 2048 kv x 2B = 128 MB
     // of unfused scores — well inside the budget, keep today's cadence.
-    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 2048, 2048, false));
+    try t.expectEqual(@as(u32, 4), Trunk.prefillEvalCadence(4, 256, 16, 8, 2048, 2048, false));
     // The LIVE-measured no-regression point: a 5,140-token agent prompt
     // (845 MB scores) must keep cadence 4 — flipping it cost a measured 4.5%
     // prefill for zero memory benefit (peak 18.1 GB both ways).
-    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 5140, 5140, false));
+    try t.expectEqual(@as(u32, 4), Trunk.prefillEvalCadence(4, 256, 16, 8, 5140, 5140, false));
     // Fused head dim + dense KV: no transient at all, keep even the 48 default.
-    try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 500_000, false));
+    try t.expectEqual(@as(u32, 48), Trunk.prefillEvalCadence(48, 128, 8, 8, 8192, 500_000, false));
 }
 
 test "prefillEvalCadence: fused hd-256 kernel drops the score term" {
@@ -1829,8 +1829,8 @@ test "prefillEvalCadence: fused hd-256 kernel drops the score term" {
     // hd 128. The dequant term must still fire under --kv-quant.
     fused256_override = true;
     defer fused256_override = null;
-    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 102_448, false));
-    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 400_000, true));
+    try t.expectEqual(@as(u32, 4), Trunk.prefillEvalCadence(4, 256, 16, 8, 8192, 102_448, false));
+    try t.expectEqual(@as(u32, 1), Trunk.prefillEvalCadence(4, 256, 16, 8, 8192, 400_000, true));
 }
 
 test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
@@ -1840,12 +1840,12 @@ test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
     // 16 heads x 8192 chunk x 16384 kv x 2B = 4 GiB > 2 GiB budget: bounds a
     // ~13 GB windowed transient to ~4 GB. (8192 chunk x 8192 kv sits exactly
     // ON the 2 GiB budget and deliberately keeps the coarse cadence.)
-    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 16384, false));
-    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 8192, false));
+    try t.expectEqual(@as(u32, 1), Trunk.prefillEvalCadence(4, 256, 16, 8, 8192, 16384, false));
+    try t.expectEqual(@as(u32, 4), Trunk.prefillEvalCadence(4, 256, 16, 8, 8192, 8192, false));
     // The capped 1024 chunk at 102K ctx still materializes 3.4 GB — the chunk
     // cap (generate.zig) does NOT restore the coarse cadence at long context.
     // (Live: this cadence measured peak 27.0 GB and +14% prefill vs baseline.)
-    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 1024, 102_448, false));
+    try t.expectEqual(@as(u32, 1), Trunk.prefillEvalCadence(4, 256, 16, 8, 1024, 102_448, false));
 }
 
 test "fusedSdpaPrefill: causal parity vs composed SDPA (GQA, ragged shapes, chunk offset)" {

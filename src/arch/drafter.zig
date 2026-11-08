@@ -11,7 +11,7 @@ const mtp_mod = @import("../mtp.zig");
 const registry = @import("registry.zig");
 const spec_types = @import("../spec_types.zig");
 const trunk = @import("../trunk.zig");
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const KVCache = trunk.KVCache;
 
 fn drafterOf(comptime name: []const u8) type {
@@ -61,7 +61,7 @@ pub const Drafter = struct {
 
     /// The drafter a loaded model gets, from the first built arch that claims it: `mtp_enabled` says whether the
     /// request for MTP stands, `aux` is a head loaded beside the trunk (MiMo's), if any.
-    pub fn fromModel(model: *Transformer, mtp_enabled: bool, aux: ?*anyopaque) ?Drafter {
+    pub fn fromModel(model: *Trunk, mtp_enabled: bool, aux: ?*anyopaque) ?Drafter {
         inline for (comptime std.meta.fieldNames(Tag)) |name| {
             const M = drafterOf(name);
             if (comptime @hasDecl(M, "headOf")) {
@@ -129,7 +129,7 @@ pub const Drafter = struct {
     /// round's committed rows); the MiMo arm records them.
     pub fn forward(
         self: Drafter,
-        target: *Transformer,
+        target: *Trunk,
         cache: *Cache,
         id_arr: mlx.mlx_array,
         hidden: mlx.mlx_array,
@@ -149,7 +149,7 @@ pub const Drafter = struct {
     /// Appends committed history without projecting logits.
     pub fn appendHistory(
         self: Drafter,
-        target: *Transformer,
+        target: *Trunk,
         cache: *Cache,
         token_ids: []const u32,
         hidden: mlx.mlx_array,
@@ -174,7 +174,7 @@ pub const Drafter = struct {
     }
 
     /// `x` is whatever the TARGET's lm_head consumes for this arm.
-    pub fn draftSelect(self: Drafter, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+    pub fn draftSelect(self: Drafter, target: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         return switch (self.u) {
             inline else => |h, t| if (comptime @hasDecl(D(t), "draftSelect"))
                 D(t).draftSelect(h, target, x, suppress_mask)
@@ -185,7 +185,7 @@ pub const Drafter = struct {
 
     /// The exact re-scored top-32 shortlist a SAMPLED draft proposes from, or null when the coarse rerank head is
     /// unavailable. `x` is the same vector `draftSelect` takes.
-    pub fn draftShortlist(self: Drafter, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
+    pub fn draftShortlist(self: Drafter, target: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
         return switch (self.u) {
             inline else => |h, t| if (comptime @hasDecl(D(t), "draftShortlist")) D(t).draftShortlist(h, target, x, suppress_mask) else null,
         };
@@ -194,7 +194,7 @@ pub const Drafter = struct {
     /// Every G17/NAX cost surface is calibrated against one exact runtime geometry, so a head without a surface of
     /// its own plans under `generic`: an off-profile head served by a calibrated surface would plan depths the
     /// measurement never covered.
-    pub fn costProfile(self: Drafter, target: *const Transformer, kv: trunk.KVQuantConfig) mtp_mod.MtpCostProfile {
+    pub fn costProfile(self: Drafter, target: *const Trunk, kv: trunk.KVQuantConfig) mtp_mod.MtpCostProfile {
         return switch (self.u) {
             inline else => |h, t| if (comptime @hasDecl(D(t), "costProfile")) D(t).costProfile(h, target, kv) else .generic,
         };
@@ -249,8 +249,8 @@ pub const DraftCache = struct {
         };
     }
 
-    /// The Transformer owning an in-checkpoint head; null on the other arms and whenever `kv()` is null.
-    pub fn head(self: *const DraftCache) ?*Transformer {
+    /// The Trunk owning an in-checkpoint head; null on the other arms and whenever `kv()` is null.
+    pub fn head(self: *const DraftCache) ?*Trunk {
         return switch (self.u) {
             inline else => |*c| if (comptime @hasDecl(@TypeOf(c.*), "head")) c.head() else null,
         };
@@ -304,7 +304,7 @@ pub const DraftCache = struct {
 };
 
 /// Does the arch running `model` list DFlash2 among its drafters?
-pub fn supportsDflash(model: *Transformer) bool {
+pub fn supportsDflash(model: *Trunk) bool {
     return switch (registry.handleOf(model)) {
         inline else => |_, t| blk: {
             inline for (registry.Mod(t).drafter.kinds) |k| if (k == .dflash2) break :blk true;
@@ -314,7 +314,7 @@ pub fn supportsDflash(model: *Transformer) bool {
 }
 
 /// Do the arch's DFlash2 rounds choose their verify rows per round (a verify row costs bytes there)?
-pub fn dflashAdaptiveRows(model: *Transformer) bool {
+pub fn dflashAdaptiveRows(model: *Trunk) bool {
     return switch (registry.handleOf(model)) {
         inline else => |_, t| @hasDecl(registry.Mod(t).drafter, "dflash_adaptive_rows") and registry.Mod(t).drafter.dflash_adaptive_rows,
     };
@@ -353,7 +353,7 @@ test "every registered arch publishes a drafter, and only an arch listing dflash
 }
 
 test "the loaded arch decides whether a model takes a DFlash sidecar and how its rounds pick rows" {
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     // The default arch, MiMo, runs the generic round and verifies the whole block.
     if (comptime registry.default) |tag| {
         t.arch = tag;

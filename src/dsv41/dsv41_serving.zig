@@ -20,16 +20,16 @@ const Weights = model_mod.Weights;
 const diagEnvValueOn = io_util_mod.diagEnvValueOn;
 const diagEnvOn = io_util_mod.diagEnvOn;
 const ForwardCtx = trunk_mod.ForwardCtx;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const initModuleShell = trunk_mod.initModuleShell;
 
 /// Layers ahead of a layer whose picks its router input predicts.
 const prefetch_lead_rows: u8 = 3;
 
-pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
+pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Trunk {
     const stq = config.dsv41.?.expert_dec != null;
     if (!config.expert_streaming or config.expert_layout != (if (stq) expert_quant_mod.Layout.exl3_k4 else .mxfp4_w123)) return error.ExpertStreamingRequired;
-    const engine = try Transformer.newExpertEngine(allocator, &config, s);
+    const engine = try Trunk.newExpertEngine(allocator, &config, s);
     errdefer {
         engine.deinit();
         allocator.destroy(engine);
@@ -137,7 +137,7 @@ pub fn tailUnread(window: usize, rows: usize, ahead_min_rows: usize, holds_point
 }
 
 /// One request at a time: the model holds its state, which `cache.step` mirrors. Logits are the last row.
-pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *dsv41_model.Model) !mlx.mlx_array {
+pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *dsv41_model.Model) !mlx.mlx_array {
     if (ctx.cache.step == 0) dsv41_model.resetState(m);
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
@@ -182,7 +182,7 @@ pub fn forwardDsv41With(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array
 }
 
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
-pub fn dsv41DraftImpl(self: *Transformer, t1: u32) !dsv41_model.Draft {
+pub fn dsv41DraftImpl(self: *Trunk, t1: u32) !dsv41_model.Draft {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
     return dsv41_model.draftHeads(m, t1, .conf);
@@ -190,7 +190,7 @@ pub fn dsv41DraftImpl(self: *Transformer, t1: u32) !dsv41_model.Draft {
 
 /// Advances the request by `ids` (`[t1, drafts...]`) as a chunk `dsv41Finish` trims; the logits of every row,
 /// f32 `[1, L, vocab]`.
-pub fn dsv41VerifyImpl(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
+pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
     const st = try dsv41_model.ensureState(m);
@@ -209,7 +209,7 @@ pub fn dsv41VerifyImpl(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !
 }
 
 /// Keeps the first `accepted + 1` rows of the open verify chunk.
-pub fn dsv41FinishImpl(self: *Transformer, ctx: *ForwardCtx, accepted: usize) !void {
+pub fn dsv41FinishImpl(self: *Trunk, ctx: *ForwardCtx, accepted: usize) !void {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
     try dsv41_model.finishVerify(m, accepted);

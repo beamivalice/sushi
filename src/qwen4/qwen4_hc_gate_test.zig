@@ -5,7 +5,7 @@ const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const trunk_mod = @import("../trunk.zig");
 const qwen4_hc = @import("qwen4_hc.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const HcWeights = trunk_mod.HcWeights;
 const testing = std.testing;
 
@@ -18,7 +18,7 @@ const pinned = [_]Pinned{
     .{ .pack = "Qwen3.8-Flash-Next-Sushi-4bpw", .want = .{ .fused_8_64 = 100 } },
 };
 
-fn note(d: *Decisions, xfm: *const Transformer, w: *const HcWeights) void {
+fn note(d: *Decisions, xfm: *const Trunk, w: *const HcWeights) void {
     const qp = qwen4_hc.fusedQuant(xfm, w) orelse {
         d.declined += 1;
         return;
@@ -40,7 +40,7 @@ test "qwen4 hyper-connection gate: the fused kernels' decision on every read of 
     var weights = try model_mod.loadWeights(io, a, model_dir);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const q4 = &xfm.arch_state.qwen4;
     var got: Decisions = .{};

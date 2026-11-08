@@ -3,7 +3,7 @@ const std = @import("std");
 const qwen4_forward = @import("qwen4_forward.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const trunk_mod = @import("../trunk.zig");
 
 // Hooks: bills.zig reaches these through the arch's `bill` declaration; a hook returns null where it has no say.

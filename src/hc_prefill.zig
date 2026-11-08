@@ -8,7 +8,7 @@ const prefill_plan = @import("prefill_plan.zig");
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
 const KVCache = trunk.KVCache;
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const standinOnes = trunk.standinOnes;
 
@@ -157,7 +157,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
-    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = testing.allocator, .cache = cache });
     if (comptime !qwen4_state.built) return error.SkipZigTest;
     const q4 = qwen4_state.stateOf(&xfm).?;
     @import("qwen4/qwen4_forward.zig").compileQwen4Hc(&xfm);

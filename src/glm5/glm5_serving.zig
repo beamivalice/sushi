@@ -17,11 +17,11 @@ const testing = std.testing;
 const CaptureLayers = trunk_mod.CaptureLayers;
 const ForwardCtx = trunk_mod.ForwardCtx;
 const KVCache = trunk_mod.KVCache;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const initModuleShell = trunk_mod.initModuleShell;
 
-pub fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
-    const engine = if (config.expert_streaming) try Transformer.newExpertEngine(allocator, &config, s) else null;
+pub fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Trunk {
+    const engine = if (config.expert_streaming) try Trunk.newExpertEngine(allocator, &config, s) else null;
     errdefer if (engine) |e| {
         e.deinit();
         allocator.destroy(e);
@@ -38,7 +38,7 @@ pub fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *con
     return shell;
 }
 
-pub fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, mdl: *glm5_mod.Model) !mlx.mlx_array {
+pub fn forwardGlm5WithImpl(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, mdl: *glm5_mod.Model) !mlx.mlx_array {
     const request = glm5_state.requestOf(ctx) orelse return error.GlmRequestMissing;
     if (ctx.cache.step == 0) {
         request.reset();
@@ -137,15 +137,15 @@ fn glmStreamedExl3MatchesResident(dec: expert_exl3.Decode) !void {
     streamed_cfg.expert_layout = .exl3_k4;
     streamed_cfg.expert_source_dir = path;
     streamed_cfg.expert_cache_bytes = 2 * try expert_stream_mod.expertBytesFor(a, path, cfg.expertGeometry(), .exl3_k4);
-    var resident = try Transformer.init(testing.io, a, cfg, &weights);
+    var resident = try Trunk.init(testing.io, a, cfg, &weights);
     defer resident.deinit();
-    var streamed = try Transformer.init(testing.io, a, streamed_cfg, &trunk);
+    var streamed = try Trunk.init(testing.io, a, streamed_cfg, &trunk);
     defer streamed.deinit();
     const engine = streamed.expert_stream orelse return error.MissingExpertStream;
     try engine.warmCache();
     var union_seen = false;
     for ([_]KVQuantConfig{ .dense, KVQuantConfig.affine(8), KVQuantConfig.affine(6) }) |kv| {
-        for ([_]*Transformer{ &resident, &streamed }) |xfm| {
+        for ([_]*Trunk{ &resident, &streamed }) |xfm| {
             try xfm.cache.reinit(cfg.num_hidden_layers, kv);
             try xfm.resetCache();
         }
@@ -175,7 +175,7 @@ test "GLM serving dispatch matches native forward across prefill decode and rese
     var weights = Weights.init(a);
     defer weights.deinit();
     const cfg = try glm5_mod.completeFixture(&weights);
-    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
     try testing.expect(!xfm.ownsModuleDecodeState());
     var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
@@ -227,7 +227,7 @@ test "GLM forward contexts carry their own request: interleaved streams equal ea
     var weights = Weights.init(a);
     defer weights.deinit();
     const cfg = try glm5_mod.completeFixture(&weights);
-    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
     try testing.expect(!xfm.ownsModuleDecodeState());
     try testing.expect(xfm.moduleSpecWiring());
@@ -281,7 +281,7 @@ test "a GLM prefill interleaved with another stream's decode builds the solo pre
     var weights = Weights.init(a);
     defer weights.deinit();
     const cfg = try glm5_mod.completeFixture(&weights);
-    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
     var caches: [3]KVCache = undefined;
     var offsets: [3]usize = .{ 0, 0, 0 };
@@ -324,7 +324,7 @@ test "a GLM prefill interleaved with another stream's decode builds the solo pre
 }
 
 test "a streamed GLM load keeps its one teacher stream exclusive" {
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
     t.arch = arch_registry.ofModelType("glm5_next") orelse return error.SkipZigTest;
     t.expert_stream = null;
     var glm: glm5_mod.Model = undefined;
@@ -343,7 +343,7 @@ test "GLM serving stores the latent its slot cache names and refuses kv4 by name
     var weights = Weights.init(a);
     defer weights.deinit();
     const cfg = try glm5_mod.completeFixture(&weights);
-    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
     var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
     defer reference.deinit();
@@ -412,7 +412,7 @@ test "GLM serving streams BF16 source experts through the engine the native capt
     streamed_cfg.expert_layout = .bf16_individual;
     streamed_cfg.expert_source_dir = path;
     streamed_cfg.expert_cache_bytes = 2 * try expert_stream_mod.expertBytesFor(a, path, cfg.expertGeometry(), .bf16_individual);
-    var streamed = try Transformer.init(testing.io, a, streamed_cfg, &trunk);
+    var streamed = try Trunk.init(testing.io, a, streamed_cfg, &trunk);
     defer streamed.deinit();
     var engine = try expert_stream_mod.Engine.initWithOptions(a, path, cfg.expertGeometry(), streamed_cfg.expert_cache_bytes, streamed.s, .{ .layout = .bf16_individual });
     defer engine.deinit();
@@ -446,14 +446,14 @@ test "GLM serving streams FP8 source experts through eviction and the union, the
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
     const per_expert = try expert_stream_mod.expertBytesFor(a, path, cfg.expertGeometry(), .fp8_individual);
-    var streamed: [2]Transformer = undefined;
+    var streamed: [2]Trunk = undefined;
     for (&streamed, [_]u64{ 2, 4 }) |*xfm, slots| {
         var c = cfg;
         c.expert_streaming = true;
         c.expert_layout = .fp8_individual;
         c.expert_source_dir = path;
         c.expert_cache_bytes = slots * per_expert;
-        xfm.* = try Transformer.init(testing.io, a, c, &trunk);
+        xfm.* = try Trunk.init(testing.io, a, c, &trunk);
     }
     defer for (&streamed) |*xfm| xfm.deinit();
     var union_seen = false;
@@ -483,7 +483,7 @@ test "GLM vision native serving splices media before HC expansion and preserves 
     var cfg = try glm5_mod.completeFixture(&weights);
     cfg.image_token_id = 1;
     cfg.video_token_id = 2;
-    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    var xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
     var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
     defer reference.deinit();
@@ -508,7 +508,7 @@ test "GLM vision native serving splices media before HC expansion and preserves 
         ctx.capture_layers = &capture;
         const out = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(out);
-        const embedded = try Transformer.spliceVisionRows(try reference.rawEmbedding(ids), ids, media, cfg.image_token_id, cfg.video_token_id, offset, xfm.s);
+        const embedded = try Trunk.spliceVisionRows(try reference.rawEmbedding(ids), ids, media, cfg.image_token_id, cfg.video_token_id, offset, xfm.s);
         defer _ = mlx.mlx_array_free(embedded);
         const want = try reference.forwardLastWithEmbedding(&request, ids, true, embedded);
         defer _ = mlx.mlx_array_free(want);

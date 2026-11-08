@@ -27,7 +27,7 @@ const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
 
-const Transformer = trunk.Transformer;
+const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -355,7 +355,7 @@ pub const CallForce = struct {
 
 /// Map the overthinking markers onto this tokenizer once per load (`think_penalty.markerIds`).
 /// Never fails a load: an error leaves the mask null and the penalty inert.
-pub fn installThinkMarkers(xfm: *Transformer, tok: *const Tokenizer) void {
+pub fn installThinkMarkers(xfm: *Trunk, tok: *const Tokenizer) void {
     const ids = think_penalty.markerIds(xfm.allocator, &think_penalty.WORDS, tok) catch |err| {
         log.warn("[think-penalty] marker mapping failed ({s}); penalty off\n", .{@errorName(err)});
         return;
@@ -425,7 +425,7 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 
 /// A prefill checkpoint at absolute `pos`: the slot's SSM entries, the GLM request's KDA state, or DeepSeek's whole request state.
 /// `to_ssd`: a write-through takes the point to the SSD tier before the next forward, so DeepSeek's shares its rows.
-fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Transformer, ctx: *const ForwardCtx, glm: ?*glm5_forward.Request, pos: usize, to_ssd: bool) !SSMCheckpoint {
+fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *const ForwardCtx, glm: ?*glm5_forward.Request, pos: usize, to_ssd: bool) !SSMCheckpoint {
     if (dsv41_state.modelOf(xfm)) |m| return if (to_ssd and pos >= @import("kv_disk_cache.zig").MIN_PERSIST_TOKENS) dsv41_prefix.captureShared(allocator, m, pos) else dsv41_prefix.capture(allocator, m, pos);
     if (glm) |request| {
         if (request.offset != pos) return error.GlmCachePositionMismatch;
@@ -448,13 +448,13 @@ pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelCon
 /// built as a single lazy computation graph, async_eval'd together. The GPU
 /// never idles between token generation steps.
 pub const Generator = struct {
-    xfm: *Transformer,
+    xfm: *Trunk,
     /// Forward-pass context. Stores per-request KVCache pointer, moe_seq_offset
     /// pointer, ssm_entries slice, vision_embeddings handle, and capture_hidden
     /// override. The legacy single-slot path uses `xfm.defaultCtx()` (pointing at
-    /// the Transformer's own fields). Phase 2 concurrent batching constructs a
+    /// the Trunk's own fields). Phase 2 concurrent batching constructs a
     /// per-slot ForwardCtx pointing at the slot's own KVCache, etc., so multiple
-    /// generators can share one Transformer's weights without colliding on
+    /// generators can share one Trunk's weights without colliding on
     /// per-request state. Stored by value; `&self.ctx` is what we pass to
     /// `xfm.forwardWith` / `lazyForward` / drafter step.
     ctx: ForwardCtx,
@@ -1039,7 +1039,7 @@ pub const Generator = struct {
     pub fn init(
         io: std.Io,
         allocator: std.mem.Allocator,
-        xfm: *Transformer,
+        xfm: *Trunk,
         tok: *const Tokenizer,
         prompt_ids: []const u32,
         max_tokens: u32,
@@ -1082,7 +1082,7 @@ pub const Generator = struct {
         /// `server.resolvePrefillChunk`). 0 = unpinned, keep the launch width.
         ///
         /// It arrives per REQUEST rather than off `xfm.config` because the
-        /// Transformer holds a COPY of the config taken when it was built, and
+        /// Trunk holds a COPY of the config taken when it was built, and
         /// the pin is written to the registry's config after load — the copy
         /// never sees it. The scheduler reads `slot.model.config`, which IS the
         /// object the admission guard bills against, so bill and forward cannot
@@ -1271,7 +1271,7 @@ pub const Generator = struct {
     pub fn initWithOptions(
         io: std.Io,
         allocator: std.mem.Allocator,
-        xfm: *Transformer,
+        xfm: *Trunk,
         tok: *const Tokenizer,
         prompt_ids: []const u32,
         max_tokens: u32,
@@ -3960,7 +3960,7 @@ pub const Generator = struct {
 
 /// Build forward pass from a lazy sampled token array.
 /// Reshapes [1] -> [1, 1] and calls transformer forward. All lazy (no eval).
-fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array, lazy_logits: bool) !mlx.mlx_array {
+fn lazyForward(xfm: *Trunk, ctx: *ForwardCtx, lazy_token: mlx.mlx_array, lazy_logits: bool) !mlx.mlx_array {
     const tok_shape = [_]c_int{ 1, 1 };
     var reshaped = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(reshaped);
@@ -3997,7 +3997,7 @@ pub fn tokenArray(id: u32) mlx.mlx_array {
 pub fn generate(
     io: std.Io,
     allocator: std.mem.Allocator,
-    xfm: *Transformer,
+    xfm: *Trunk,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
@@ -4494,7 +4494,7 @@ test "a block decoder's entry token stops the round before it drafts" {
 test "batched MTP state includes the last row activated by round begin" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     const allocator = testing.allocator;
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.arch_state = .{};
     const q4 = qwen4_state.stateOf(&xfm).?;
     const q4f = @import("qwen4/qwen4_forward.zig");
@@ -4571,7 +4571,7 @@ test "specTotals: a DFlash2 request reports the ticks it ran without a draft as 
     try testing.expectEqual(spec_stats.Totals{ .rounds = 6, .drafted = 24, .accepted = 9, .plain = 3 }, g.specTotals());
 }
 
-pub fn installLogitBias(io: std.Io, xfm: *Transformer, tok: *const Tokenizer) !void {
+pub fn installLogitBias(io: std.Io, xfm: *Trunk, tok: *const Tokenizer) !void {
     const setting = if (xfm.config.logit_bias_file_override) |*p| p.slice() else null;
     const path = setting orelse return;
     const body = try std.Io.Dir.cwd().readFileAlloc(io, path, xfm.allocator, .limited(16 << 20));

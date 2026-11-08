@@ -7,7 +7,7 @@ const trunk_mod = @import("../trunk.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const Qwen4TestSlot = @import("qwen4_test_support.zig").Qwen4TestSlot;
 const KVQuantConfig = @import("../kv_quant.zig").KVQuantConfig;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const testing = std.testing;
 
 const Pinned = struct { pack: []const u8, ticks: [4]u64 };
@@ -21,7 +21,7 @@ const pinned = [_]Pinned{
     .{ .pack = "Qwen3.8-Flash-Next-Sushi-4bpw", .ticks = .{ 9083, 9083, 9373, 9083 } },
 };
 
-fn tick(xfm: *Transformer, slot: *Qwen4TestSlot, token: i32) !u64 {
+fn tick(xfm: *Trunk, slot: *Qwen4TestSlot, token: i32) !u64 {
     const before = mlx.query_count;
     const logits = try slot.forward(xfm, &.{token});
     const used = mlx.query_count - before;
@@ -44,7 +44,7 @@ test "qwen4 queries: a decode tick through forwardQwen4With (QWEN4_TEST_MODEL)" 
     var weights = try model_mod.loadWeights(io, a, model_dir);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);

@@ -527,7 +527,7 @@ fn appendCaptures(evals: mlx.mlx_vector_array, capture: ?*Capture, first: usize,
 }
 
 pub const Model = struct {
-    /// Serving's reserved-token policy, borrowed from Transformer.
+    /// Serving's reserved-token policy, borrowed from Trunk.
     suppress_mask: ?Arr = null,
     allocator: std.mem.Allocator,
     cfg: model.ModelConfig,

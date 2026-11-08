@@ -15,7 +15,7 @@ const MAX_BATCH_ROWS = trunk_mod.MAX_BATCH_ROWS;
 const PersistentSsmGroup = trunk_mod.PersistentSsmGroup;
 const SSMCacheEntry = trunk_mod.SSMCacheEntry;
 const SsmMergeKind = trunk_mod.SsmMergeKind;
-const Transformer = trunk_mod.Transformer;
+const Trunk = trunk_mod.Trunk;
 const captureSsmCheckpoint = trunk_mod.captureSsmCheckpoint;
 const materializedOwnedCopy = trunk_mod.materializedOwnedCopy;
 const restoreSsmCheckpoint = trunk_mod.restoreSsmCheckpoint;
@@ -616,8 +616,8 @@ fn ssmTickKinds(alloc: std.mem.Allocator, n_linear: usize) ![]SsmMergeKind {
     return kinds;
 }
 
-fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Transformer {
-    var xfm: Transformer = undefined;
+fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Trunk {
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.persistent_group_state_override = persist;
@@ -625,7 +625,7 @@ fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Tr
     return xfm;
 }
 
-fn ssmTickBindXfm(xfm: *Transformer, ctxs: []const *ForwardCtx, kinds: []const SsmMergeKind) !void {
+fn ssmTickBindXfm(xfm: *Trunk, ctxs: []const *ForwardCtx, kinds: []const SsmMergeKind) !void {
     try ssmBindBatched(xfm, ctxs, kinds);
 }
 
@@ -672,7 +672,7 @@ fn ssmTickResetLikePrefixCache(entries: []SSMCacheEntry, s: mlx.mlx_stream, seed
 /// Concatenate every slot's `[1, …]` GDN state for one layer into a single
 /// `[N, …]` entry. Both halves are concatenated on axis 0 — the batch axis
 /// the recurrence kernel already indexes with `b_idx`.
-pub fn mergeSsmAcrossSlots(self: *Transformer, ctxs: []const *ForwardCtx, layer: usize) !SSMCacheEntry {
+pub fn mergeSsmAcrossSlots(self: *Trunk, ctxs: []const *ForwardCtx, layer: usize) !SSMCacheEntry {
     const lw = &self.moe_layers.?[layer];
     return ssmMergeLayer(self.s, ctxs, layer, .{ .linear = lw.is_linear, .ple = lw.ple != null });
 }
@@ -697,23 +697,23 @@ pub fn mergeSsmAcrossSlots(self: *Transformer, ctxs: []const *ForwardCtx, layer:
 /// while these views are live pins the whole merged [N, …] parent until
 /// the rollback window closes. Bounded, but it is the same retention
 /// shape as the 3.4x hot-cache under-count.
-pub fn splitSsmToSlots(self: *Transformer, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize) !void {
+pub fn splitSsmToSlots(self: *Trunk, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize) !void {
     const lw = &self.moe_layers.?[layer];
     try ssmSplitLayer(self.s, m, ctxs, layer, .{ .linear = lw.is_linear, .ple = lw.ple != null });
 }
 
-pub fn ssmGroupDrop(self: *Transformer, entries: []SSMCacheEntry) void {
+pub fn ssmGroupDrop(self: *Trunk, entries: []SSMCacheEntry) void {
     ssmGroupDropMember(&self.arch_state.qwen4.ssm_group, self.s, entries) catch {};
 }
 
 /// Called at the entry of EVERY non-group forward (serial decode, prefill, the
 /// MTP solo arms): a member's live row goes back to its own entries before the
 /// solo path reads or writes them. A no-op for a slot that is not bound.
-pub fn ssmGroupRelease(self: *Transformer, ctx: *ForwardCtx) !void {
+pub fn ssmGroupRelease(self: *Trunk, ctx: *ForwardCtx) !void {
     try ssmGroupReleaseCtx(&self.arch_state.qwen4.ssm_group, self.s, ctx);
 }
 
-pub fn ssmBindBatched(self: *Transformer, ctxs: []const *ForwardCtx, kinds: []const SsmMergeKind) !void {
+pub fn ssmBindBatched(self: *Trunk, ctxs: []const *ForwardCtx, kinds: []const SsmMergeKind) !void {
     const persist = self.persistent_group_state_override orelse true;
     const bind = try ssmBindTickState(self.allocator, self.s, &self.arch_state.qwen4.ssm_group, ctxs, kinds, persist);
     if (bind.owned) {
@@ -942,7 +942,7 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
     }
     defer for (&slots) |*sl| sl.deinit(alloc);
     var ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.arch_state.qwen4.ssm_group = .{ .allocator = alloc };
