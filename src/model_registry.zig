@@ -19,7 +19,6 @@
 const std = @import("std");
 const model_mod = @import("model.zig");
 const expert_quant = @import("expert_quant.zig");
-const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const vision_mod = @import("vision.zig");
@@ -37,7 +36,6 @@ const pack_update = @import("pack_update.zig");
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
 
-const Trunk = trunk.Trunk;
 const arch_handle = @import("arch/handle.zig");
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;

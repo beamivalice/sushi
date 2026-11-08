@@ -1,8 +1,6 @@
 //! Offline GLM frozen-prefix extraction for verified independent-window boundaries.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const log = @import("../log.zig");
-const io_util = @import("../io_util.zig");
 const model = @import("../model.zig");
 const forward = @import("glm5_forward.zig");
 const base = @import("glm5_model.zig");

@@ -3,7 +3,6 @@ const std = @import("std");
 const arch_config = @import("arch/config.zig");
 const model_mod = @import("model.zig");
 const nax_gate = @import("nax_gate.zig");
-const bills = @import("bills.zig");
 const PinCfg = model_mod.ModelConfig;
 
 /// A stand-in for the deployed long-context pack: a GDN+MoE trunk with a QSA

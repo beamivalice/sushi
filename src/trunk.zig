@@ -3,7 +3,6 @@ const expert_stream_mod = @import("expert_stream.zig");
 const expert_usage = @import("expert_usage.zig");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
-const expert_exl3 = sushi_exl3.format;
 const fp8_block = @import("fp8_block.zig");
 const trunk_stq = @import("trunk_stq.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
@@ -37,14 +36,9 @@ const Linear = linear_mod.Linear;
 const forward_diag = @import("forward_diag.zig");
 const test_support = @import("test_support.zig");
 const Exl3MoeHarness = test_support.Exl3MoeHarness;
-const attn256Reference = test_support.attn256Reference;
 const mlxSettledActiveBytes = test_support.mlxSettledActiveBytes;
-const qsaArraysAllEqual = test_support.qsaArraysAllEqual;
-const testRandUniformBf16 = test_support.testRandUniformBf16;
 const testReadF32 = test_support.testReadF32;
-const arch_forward = @import("arch/forward.zig");
 const arch_life = @import("arch/life.zig");
-const arch_request = @import("arch/request.zig");
 const arch_admission = @import("arch/admission.zig");
 const arch_registry = @import("arch/registry.zig");
 const arch_state_mod = @import("arch/arch_state.zig");
@@ -126,7 +120,6 @@ pub const diagEnvValueOn = forward_diag.diagEnvValueOn;
 const expertPickGpu = moe_stream_compute.expertPickGpu;
 const expertSpecApplies = moe_stream_compute.expertSpecApplies;
 const expertSwapKind = moe_stream_compute.expertSwapKind;
-const expert_exl3_kernels = layer_weights.expert_exl3_kernels;
 const freeKVEntry = kv_cache.freeKVEntry;
 pub const fused256CausalMode = attn_kernels.fused256CausalMode;
 pub const fused256Enabled = attn_kernels.fused256Enabled;
@@ -142,7 +135,6 @@ pub const gatherQmvGateUp = moe_gqmv.gatherQmvGateUp;
 const gatherQmvGateUpEnabled = moe_gqmv.gatherQmvGateUpEnabled;
 const gatherQmvGateUpRows = moe_gqmv.gatherQmvGateUpRows;
 pub const gatherExpertMm = moe_stream_compute.gatherExpertMm;
-const gpuArchitecture = nax_gate.gpuArchitecture;
 const handOffStreamedResult = moe_stream_compute.handOffStreamedResult;
 const getLayerWeight = layer_weights.getLayerWeight;
 const layerProj = layer_weights.layerProj;
@@ -164,12 +156,9 @@ pub const layerCap = forward_diag.layerCap;
 pub const newEmptyKVEntry = kv_cache.newEmptyKVEntry;
 pub const positionDropIndex = ssm_cache.positionDropIndex;
 pub const positionDropIndexUsize = ssm_cache.positionDropIndexUsize;
-const naxMinMForBits = nax_gate.naxMinMForBits;
 pub const naxSdpaPreferred = nax_gate.naxSdpaPreferred;
 pub const naxStatus = nax_gate.naxStatus;
 pub const prefillHeadDimFused = attn_kernels.prefillHeadDimFused;
-const mixedNaxShapeEnabled = verify_qmm.mixedNaxShapeEnabled;
-const mixedPlainEnabled = verify_qmm.mixedPlainEnabled;
 pub const mtpCoarsePairs = verify_moe.mtpCoarsePairs;
 pub const prefillDqGemmEnabled = verify_moe.prefillDqGemmEnabled;
 pub const qmatmulBits = verify_moe.qmatmulBits;
@@ -227,8 +216,6 @@ pub const ssmUnbindAll = ssm_cache.ssmUnbindAll;
 pub const ssmUnbindEntries = ssm_cache.ssmUnbindEntries;
 pub const truncatePooled = ssm_cache.truncatePooled;
 pub const verifyQmmNaxAvailable = nax_gate.verifyQmmNaxAvailable;
-const verifyQmmNaxEnabled = nax_gate.verifyQmmNaxEnabled;
-const verifyQmm = verify_qmm.verifyQmm;
 pub const verifyQmmEnabled = verify_qmm.verifyQmmEnabled;
 pub const vqmmLaneFor = verify_qmm.vqmmLaneFor;
 const verifyExpertReduce = verify_moe.verifyExpertReduce;
@@ -555,7 +542,6 @@ const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 
 pub const ModelConfig = model_mod.ModelConfig;
-const QuantMode = model_mod.QuantMode;
 pub const Weights = model_mod.Weights;
 
 // ── KV Cache (standard attention) ──
@@ -5349,7 +5335,6 @@ pub fn decodeProfReport() void {
 // Decode (M=1) and spec-verify widths never route.
 
 const testing = std.testing;
-const expectError = @import("test_expect.zig").expectError;
 
 // Bar: after the conv, freeing the chunk input leaves only the tail resident.
 

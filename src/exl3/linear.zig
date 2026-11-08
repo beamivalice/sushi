@@ -4,7 +4,6 @@
 //! host from the known row order, so no GPU drain.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
-const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const project_rows = @import("project_rows.zig");

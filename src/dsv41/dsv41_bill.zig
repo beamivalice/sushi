@@ -7,7 +7,6 @@ const dsv41_borrow = @import("dsv41_borrow.zig");
 const gpu_mem = @import("../gpu_mem.zig");
 const dsv41_config = @import("dsv41_config.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
-const generate_mod = @import("../generate.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const prefill_plan = @import("../prefill_plan.zig");
 const prefix_cache_mod = @import("../prefix_cache.zig");

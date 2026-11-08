@@ -1,6 +1,5 @@
 //! The engine's handle on a loaded model: the per-request `ForwardCtx` and the operations that dispatch over the
 //! loaded arch through the registry. The trunk math lives in `trunk.zig`.
-const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_cache = @import("kv_cache.zig");
 const ssm_cache = @import("ssm_cache.zig");

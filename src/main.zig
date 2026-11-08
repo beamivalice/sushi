@@ -30,7 +30,6 @@ const arch_state = @import("arch/arch_state.zig");
 const model_load = @import("model_load.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const model_settings_mod = @import("model_settings.zig");
-const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
 const help = @import("help.zig");

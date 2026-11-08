@@ -1,13 +1,10 @@
 //! Reading a request: the model id out of a raw body or query, the sampling and budget fields, the cache key, the
 //! content parts and the tool definitions. Pure functions of the bytes, so the host tier tests them.
 const chat_mod = @import("chat.zig");
-const completions = @import("completions.zig");
 const log = @import("log.zig");
-const model_registry_mod = @import("model_registry.zig");
 const std = @import("std");
 const jsonEscape = @import("http.zig").jsonEscape;
 const trunk = @import("trunk.zig");
-const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)

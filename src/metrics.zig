@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const sched_policy = @import("sched_policy.zig");
-const slot_admission = @import("slot_admission.zig");
 const write_stats = @import("disk_write_stats.zig");
 const request_log = @import("request_log.zig");
 const spec_stats = @import("spec_stats.zig");

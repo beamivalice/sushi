@@ -91,7 +91,6 @@ const armThinkBound = server_mod.armThinkBound;
 const buildOpenAIToolsJson = request_parse.buildOpenAIToolsJson;
 const cachedFormatChat = server_mod.cachedFormatChat;
 const checkAttentionMemory = server_mod.checkAttentionMemory;
-const clampJsonI32 = request_parse.clampJsonI32;
 const countRejected = http.countRejected;
 const defaultEnableMtpForStreaming = server_mod.defaultEnableMtpForStreaming;
 const expectSurfaceForcesCall = server_mod.expectSurfaceForcesCall;

@@ -6,7 +6,6 @@ const convert = @import("convert.zig");
 const pack = @import("pack.zig");
 const shard = @import("shard.zig");
 const source = @import("source.zig");
-const st = @import("safetensors.zig");
 const stages_mod = @import("stages.zig");
 const gpu_factor = @import("gpu_factor.zig");
 

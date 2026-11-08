@@ -120,7 +120,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
 
 - A rule is one file in `scripts/lint/` that exports `name`, `reason` and `check(arena, tree, report)`, plus one line in
   `rules` in `main.zig`. It flags a pattern we never want; `const-write` is the first
-  ([engine-mlx-gotchas](engine-mlx-gotchas.md#zig)).
+  ([engine-mlx-gotchas](engine-mlx-gotchas.md#zig)); `unused-import` flags a non-`pub` file-scope `const` that only
+  renames (`@import`, `a.b.C`, `x`) and that no identifier token of the file names again.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its

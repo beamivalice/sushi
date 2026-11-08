@@ -31,14 +31,9 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const trunk = @import("trunk.zig");
-// The chunked row requantizer + its packed-triple handle are shared with the
-// MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
-// one requantizer with one chunking discipline is the point.
-const mtp_mod = @import("mtp.zig");
 const arch_drafter = @import("arch/drafter.zig");
 
 const Weights = model_mod.Weights;
-const ModelConfig = model_mod.ModelConfig;
 const Trunk = trunk.Trunk;
 const KVCache = trunk.KVCache;
 

@@ -1,6 +1,5 @@
 //! The Objective-C runtime from Zig, with no Objective-C source: `msg` types each `objc_msgSend` call, and a
 //! class whose methods are Zig `callconv(.c)` functions is registered at run time.
-const std = @import("std");
 
 pub const id = ?*anyopaque;
 pub const SEL = ?*anyopaque;

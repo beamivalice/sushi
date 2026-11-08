@@ -3,10 +3,8 @@
 An architecture is a folder, `src/<arch>/`, plus one line in `src/arch/registry.zig`. The engine reaches it only through
 the tagged unions that registry builds, so adding an arch is a folder and a line, and dropping one is deleting both.
 
-Status: this is the target. Today the dispatch files, the registry and `-Darchs` exist, but shared files still name
-archs and still import the folders, and a `-Darchs` build still links the other archs' serving code. The stray
-references `tests/test_arch_drop.sh` reports (run it with `DROP_TRY=<arch>`) are removed one stage at a time, and an arch
-joins `DROPPABLE` when its drop passes. `dsv41` is in the list.
+Every served arch is in `DROPPABLE`: `tests/test_arch_drop.sh` builds the engine without each one and runs the host
+tier, so no shared file imports a folder. An arch added later joins the list in the landing that adds it.
 
 ## The rules
 

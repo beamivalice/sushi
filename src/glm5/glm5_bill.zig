@@ -8,7 +8,6 @@ const fp8_block = @import("../fp8_block.zig");
 const glm5_generate = @import("glm5_generate.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
 const prefix_cache_mod = @import("../prefix_cache.zig");
-const testing = std.testing;
 
 /// Most MLA layers among any `pending` consecutive layers: MLA-only prefill scratch is held
 /// once per MLA layer in flight, not per pending layer.

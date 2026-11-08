@@ -1,6 +1,5 @@
 const std = @import("std");
 const arch_handle = @import("../arch/handle.zig");
-const sched_policy = @import("../sched_policy.zig");
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
 const glm5_flags = @import("glm5_flags.zig");
@@ -28,7 +27,6 @@ const sampler = @import("../sampler.zig");
 const testing = std.testing;
 const scheduler_mod = @import("../scheduler.zig");
 const slot_admission = @import("../slot_admission.zig");
-const model_load = @import("../model_load.zig");
 const slot_outcome = @import("../slot_outcome.zig");
 const sched = @import("../arch/sched.zig");
 const Scheduler = scheduler_mod.Scheduler;
@@ -43,7 +41,6 @@ const glmStreamedDrafterOff = @import("../arch/load.zig").drafterOff;
 const postPrefillTerminal = scheduler_mod.postPrefillTerminal;
 const publishSpeculativeBlock = scheduler_mod.publishSpeculativeBlock;
 const recordSlotCleanup = slot_outcome.recordSlotCleanup;
-const specTickMode = sched_policy.specTickMode;
 
 test "a streamed GLM load leaves a found assistant unloaded and refuses an asked-for one" {
     var glm = ModelConfig{ .model_type = "glm5_next" };

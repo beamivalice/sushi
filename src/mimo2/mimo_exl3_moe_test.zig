@@ -9,7 +9,6 @@ const expert_exl3_kernels = @import("../layer_weights.zig").expert_exl3_kernels;
 const mimo_forward = @import("mimo_forward.zig");
 const io_util_mod = @import("../io_util.zig");
 const diagEnvOn = io_util_mod.diagEnvOn;
-const testing = std.testing;
 const Trunk = trunk.Trunk;
 const MoeMlpWeights = trunk.MoeMlpWeights;
 const bindLinears = @import("../layer_weights.zig").bindLinears;

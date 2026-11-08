@@ -12,7 +12,6 @@ const prefix_arch = @import("../arch/prefix.zig");
 const scheduler = @import("../scheduler.zig");
 const generate = @import("../generate.zig");
 const sched = @import("../arch/sched.zig");
-const model_load = @import("../model_load.zig");
 const forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
 const flags = @import("glm5_flags.zig");

@@ -3,7 +3,6 @@ const std = @import("std");
 const chat = @import("../chat.zig");
 const model = @import("../model.zig");
 const vision_common = @import("../vision_common.zig");
-const arch_media = @import("../arch/media.zig");
 const mimo_vision = @import("mimo_vision.zig");
 
 pub const mode = .mimo;

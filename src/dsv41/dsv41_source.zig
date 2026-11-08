@@ -6,7 +6,6 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const expert_io = @import("../expert_io.zig");
-const log = @import("../log.zig");
 const vision = @import("dsv41_vision.zig");
 const exl3 = @import("sushi_exl3");
 const weights_where = @import("../weights_where.zig");

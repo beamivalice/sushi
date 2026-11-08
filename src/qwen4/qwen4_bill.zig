@@ -1,9 +1,7 @@
 //! Flash-Next's own terms of the bill: the MTP head's KV, ring and state, and the thought-point checkpoint.
-const std = @import("std");
 const qwen4_forward = @import("qwen4_forward.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
-const Trunk = trunk_mod.Trunk;
 const trunk_mod = @import("../trunk.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");

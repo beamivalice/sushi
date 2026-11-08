@@ -47,7 +47,6 @@ const decodeProfReport = trunk_mod.decodeProfReport;
 const decodeProfileEnabled = trunk_mod.decodeProfileEnabled;
 const decodeProfileRows = trunk_mod.decodeProfileRows;
 const fusedSdpaPrefillKv = trunk_mod.fusedSdpaPrefillKv;
-const lastDim = trunk_mod.lastDim;
 const layerCap = trunk_mod.layerCap;
 const log = trunk_mod.log;
 const moeDumpBeginForward = trunk_mod.moeDumpBeginForward;

@@ -7,7 +7,6 @@ const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
-const tool_schema = @import("tool_schema.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const think_tags = @import("think_tags.zig");
 

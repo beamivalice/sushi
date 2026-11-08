@@ -4,7 +4,6 @@ const chat_mod = @import("chat.zig");
 const http_conn = @import("http_conn.zig");
 const instr = @import("metrics.zig");
 const log = @import("log.zig");
-const metrics = @import("status.zig");
 const request_policy = @import("request_policy.zig");
 const responses_mod = @import("responses.zig");
 const server_state = @import("server_state.zig");

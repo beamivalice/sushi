@@ -44,9 +44,6 @@ const generate_mod = @import("generate.zig");
 const spec_stats = @import("spec_stats.zig");
 const cache_stats = @import("cache_stats.zig");
 const rp_mod = @import("reasoning_protocol.zig");
-const mtp_mod = @import("mtp.zig");
-const depth_bounds = @import("mtp_depth_bounds.zig");
-const chip_mod = @import("chip.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
@@ -55,14 +52,10 @@ const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const disk_placement = @import("disk_placement.zig");
-const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
-const mtp_acceptance_mod = @import("mtp_acceptance.zig");
-const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
-const status = @import("status.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 
 const Trunk = trunk.Trunk;
@@ -75,7 +68,6 @@ const Generator = generate_mod.Generator;
 const Drafter = @import("arch/drafter.zig").Drafter;
 const SamplingParams = sampler.SamplingParams;
 const dflash_mod = @import("dflash.zig");
-const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const DflashModel = dflash_mod.DflashModel;
@@ -4684,7 +4676,6 @@ fn batchedTickAction(cancelled: bool) BatchedTickAction {
 /// token we just committed to cache via the forward), and load the new
 /// sampled id back into next_token_id.
 const Planner = @import("mtp_group_planner.zig");
-const degenerate = @import("degenerate.zig");
 const mtp_plan = @import("mtp_plan.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const sampler = @import("sampler.zig");

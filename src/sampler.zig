@@ -8,7 +8,6 @@ const token_mask = @import("token_mask.zig");
 const io_util = @import("io_util.zig");
 const mtp_mod = @import("mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
-const slot_admission = @import("slot_admission.zig");
 const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");

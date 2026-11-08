@@ -12,7 +12,6 @@
 
 const std = @import("std");
 const log = @import("log.zig");
-const model_mod = @import("model.zig");
 const model_settings = @import("model_settings.zig");
 const effort_mod = @import("effort.zig");
 

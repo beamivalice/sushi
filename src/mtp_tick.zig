@@ -1,7 +1,6 @@
 const std = @import("std");
 const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
-const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
 const generate_mod = @import("generate.zig");
@@ -16,7 +15,6 @@ const MtpHeadRef = generate_mod.MtpHeadRef;
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
-const slot_admission = @import("slot_admission.zig");
 const MAX_BATCH_GROUP = sched_policy.MAX_BATCH_GROUP;
 const batchedKvKeepCount = sched_policy.batchedKvKeepCount;
 const sched = @import("arch/sched.zig");

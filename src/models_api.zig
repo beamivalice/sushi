@@ -26,7 +26,6 @@ const pack_update = @import("pack_update.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const io_util = @import("io_util.zig");
 const build_options = @import("build_options");
-const mtp_plan = @import("mtp_plan.zig");
 const nowSecs = io_util.nowSecs;
 const testing = std.testing;
 const server = @import("server.zig");

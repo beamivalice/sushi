@@ -19,7 +19,6 @@ const model_mod = @import("model.zig");
 const arch_config = @import("arch/config.zig");
 const model_load = @import("model_load.zig");
 const models_api = @import("models_api.zig");
-const expert_stream = @import("expert_stream.zig");
 const chat = @import("chat.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const update_mod = @import("update.zig");

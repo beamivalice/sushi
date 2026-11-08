@@ -2,7 +2,6 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
-const Arr = mlx.mlx_array;
 
 fn keepTextKey(name: []const u8, layers: usize) bool {
     const prefix = "model.language_model.layers.";

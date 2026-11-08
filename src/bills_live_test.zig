@@ -1,16 +1,10 @@
 //! The bill tests that read the live GPU or need MLX. They run in the MLX tier; the rest of bills.zig runs in test-host.
-const Trunk = trunk.Trunk;
 const fixtures = @import("bills_fixtures_test.zig");
 const arch_prefix = @import("arch/prefix.zig");
 const bills = @import("bills.zig");
-const generate_mod = @import("generate.zig");
 const launch_state = @import("server_state.zig");
-const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const mtp_plan = @import("mtp_plan.zig");
-const prefill_plan = @import("prefill_plan.zig");
-const request_policy = @import("request_policy.zig");
-const scheduler_mod = @import("scheduler.zig");
 const slot_admission = @import("slot_admission.zig");
 const std = @import("std");
 const testing = std.testing;

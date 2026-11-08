@@ -3,7 +3,6 @@ const host = @import("mlx_host");
 const mlx = host.mlx;
 const kld = host.kld;
 const imatrix = host.imatrix;
-const format = @import("sushi_exl3").format;
 const calib = @import("calib.zig");
 const convert = @import("convert.zig");
 const driver = @import("driver.zig");

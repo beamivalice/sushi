@@ -15,7 +15,6 @@ const status = @import("status.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const http_conn = @import("http_conn.zig");
-const server = @import("server.zig");
 const server_state = @import("server_state.zig");
 
 const Allocator = std.mem.Allocator;

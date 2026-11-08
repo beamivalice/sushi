@@ -9,6 +9,7 @@ const rule = @import("rule.zig");
 
 const rules = .{
     @import("const_write.zig"),
+    @import("unused_import.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

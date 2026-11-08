@@ -5,7 +5,6 @@ const attn_kernels = @import("attn_kernels.zig");
 const model_mod = @import("model.zig");
 const SSMCheckpoint = trunk.SSMCheckpoint;
 const testing = std.testing;
-const generate = @import("generate.zig");
 
 /// One layer's materialized-score budget for unfused-SDPA prefill (see
 /// boundedPrefillChunk). 4 GiB keeps the full 8K chunk for every context up

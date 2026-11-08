@@ -8,7 +8,6 @@ const metrics_mod = @import("metrics.zig");
 const request_log = @import("request_log.zig");
 const spec_stats = @import("spec_stats.zig");
 const io_util = @import("io_util.zig");
-const kv_disk_cache = @import("kv_disk_cache.zig");
 const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");

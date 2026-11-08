@@ -1,6 +1,4 @@
 const trunk = @import("trunk.zig");
-const io_util_mod = @import("io_util.zig");
-const diagEnvOn = io_util_mod.diagEnvOn;
 const std = @import("std");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;

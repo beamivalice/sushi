@@ -4,7 +4,6 @@ const chat = @import("../chat.zig");
 const model = @import("../model.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const vision_common = @import("../vision_common.zig");
-const arch_media = @import("../arch/media.zig");
 const glm5_vision = @import("glm5_vision.zig");
 
 pub const mode = .glm5;

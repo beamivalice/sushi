@@ -3,7 +3,6 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const primitive = @import("glm5_next.zig");
-const exl3 = @import("sushi_exl3");
 const Arr = mlx.mlx_array;
 const fp8_block = @import("../fp8_block.zig");
 

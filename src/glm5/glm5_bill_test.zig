@@ -5,8 +5,6 @@ const bills = @import("../bills.zig");
 const glm5_generate = @import("glm5_generate.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
 const glm_bill = @import("glm5_bill.zig");
-const prefix_cache_mod = @import("../prefix_cache.zig");
-const testing = std.testing;
 
 test "GLM admission bills the checkpoints and assistant window a request keeps; the context sizer reserves none of them" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/glm5_config.json"));

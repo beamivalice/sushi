@@ -9,7 +9,6 @@ const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const http_conn = @import("http_conn.zig");
-const server = @import("server.zig");
 const server_state = @import("server_state.zig");
 
 pub const ns_name_len = 16;

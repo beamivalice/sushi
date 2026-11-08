@@ -50,6 +50,27 @@ printf '%s\n' 'const S = struct { x: u32 };' 'fn m(self: *S, other: []const u8) 
   '    var job: S = .{ .x = 0 };' '    @constCast(&job).x = 2;' '    _ = other;' '}' > "$TMP/t/src/p.zig"
 expect_green "a cast of a mutable param, a var local and a name reused after its const scope"
 
+# rule unused-import
+tree
+printf '%s\n' 'const std = @import("std");' 'const dead = @import("dead.zig");' 'pub fn f() void { _ = std; }' > "$TMP/t/src/p.zig"
+expect_red "an unused import" "src/p.zig:2:7 \[unused-import\] dead: unused import 'dead'"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'const Foo = std.mem.Allocator;' 'const Bar = std;' 'pub fn f() void { _ = std; }' > "$TMP/t/src/p.zig"
+expect_red "an unused alias" "\[unused-import\] Foo: unused alias 'Foo'"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'const note = @import("note.zig");' 'pub fn f() void {' '    _ = std; // note' '    _ = "note";' \
+  '    _ = std.note;' '}' > "$TMP/t/src/p.zig"
+expect_red "a name only in a comment, a string and a field" "\[unused-import\] note:"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'const used = @import("used.zig");' 'const Alias = std.mem.Allocator;' \
+  'const only_test = @import("t.zig");' 'const @"odd name" = @import("odd.zig");' 'pub const exported = @import("e.zig");' \
+  'pub const Exported = std.mem.Allocator;' 'comptime { _ = @"odd name"; }' 'const _ = @import("side.zig");' \
+  'pub fn f(a: Alias) void { _ = used; _ = a; }' 'test "t" { _ = only_test; }' > "$TMP/t/src/p.zig"
+expect_green "used, pub, test-only, quoted and discard imports"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

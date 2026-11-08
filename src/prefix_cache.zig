@@ -24,7 +24,6 @@ const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
 const prefix_arch = @import("arch/prefix.zig");
-const prefill_plan = @import("prefill_plan.zig");
 const prefix_policy = @import("prefix_policy.zig");
 const cache_stats = @import("cache_stats.zig");
 

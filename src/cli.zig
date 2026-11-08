@@ -17,7 +17,6 @@
 
 const std = @import("std");
 const chat = @import("chat.zig");
-const model = @import("model.zig");
 const effort_mod = @import("effort.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");

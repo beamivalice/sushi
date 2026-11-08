@@ -2,7 +2,6 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const Arr = mlx.mlx_array;
-const Ops = @import("glm5_model.zig").Ops;
 const Linear = @import("glm5_model.zig").Linear;
 // The per-row dot/update order is inherited from glm5_decode's MLX-derived qmv_fast.
 // Each admitted width occupies one complete row tile, so its offset is constant.

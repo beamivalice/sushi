@@ -1,8 +1,6 @@
 //! Flash-Next's draft step for several requests' MTP chains in one head forward (`Drafter.buildBatchedChains`).
-const std = @import("std");
 const qwen4_forward = @import("qwen4_forward.zig");
 const mlx = @import("../mlx.zig");
-const trunk_mod = @import("../trunk.zig");
 const generate = @import("../generate.zig");
 const mtp_round = @import("../mtp_round.zig");
 const sampler = @import("../sampler.zig");
