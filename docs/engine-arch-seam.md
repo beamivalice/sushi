@@ -6,7 +6,7 @@ the tagged unions that registry builds, so adding an arch is a folder and a line
 Status: this is the target. Today the dispatch files, the registry and `-Darchs` exist, but shared files still name
 archs and still import the folders, and a `-Darchs` build still links the other archs' serving code. The stray
 references `tests/test_arch_drop.sh` reports (run it with `DROP_TRY=<arch>`) are removed one stage at a time, and an arch
-joins `DROPPABLE` when its drop passes.
+joins `DROPPABLE` when its drop passes. `dsv41` is in the list.
 
 ## The rules
 
@@ -142,6 +142,31 @@ joins `DROPPABLE` when its drop passes.
 6. `NOTICE` for any kernel it ports.
 7. The arch joins `DROPPABLE` in `tests/test_arch_drop.sh` in the same landing.
 
+## What an arch's `arch.zig` and slot modules offer shared code
+
+Each is optional; shared code asks through the dispatch file named, never the arch.
+- `OwnConfig` (`arch/config.zig`): the config data only that arch reads, parsed with the config (`ModelConfig.dsv41` is typed by it; an empty
+  struct in a build without the arch). `releaseOwn` and `serveDefaults` let a shared test build the arch's release geometry
+  (`arch_config.releaseOwn`, `releaseServeDefaults`; its config text is the chat face's `fixtures.config`, `arch_config.fixtureConfig`), and a
+  test that needs it skips where the arch is not built.
+- `Facts.prefill_start_width`, `.expert_pool_bytes`, `.streams_experts` and `.reads_own_source` (its weight loader checks the pack, so the
+  shared EXL3 pack index check does not apply); `kvBytesPerToken`, `cacheLayoutNamespace` and `dsparkOn`, `config`-keyed through
+  `arch/config.zig`. The arch's own weights and whether its pack ships its drafting head are the `load` slot's `weights` and `shipsHead`
+  (`arch/load.zig`).
+- `streamedResidentExtra(config)` (`arch/admission.zig`): bytes a streamed load keeps resident beside the trunk. `ExpertStreamTraits.stq_experts`
+  says the routed experts are STQ rate groups.
+- The `prefix` slot: `checkpointMax(global)`, `disk_checkpoint_cap`, `setDiskGrownSpec(allocator, config, tier)`, `restorePointModel(xfm)` (the
+  whole request state is checkpointed as restore points and the prefill reads the next chunk's rows ahead) and `captureCheckpoint`
+  (`arch/prefix.zig`).
+- The `bill` slot adds `prefillChunkLoadLine(config, buf, pinned, launch)`.
+- The `flags` slot's `serve` part adds `poolCapped(prev)`, `unloadModel`, `enterVision`/`leaveVision`, `plannedBorrowBytes` and
+  `loadLines(config, LoadLog)` (`arch/serve.zig`).
+- The `drafter` slot's `dspark_rounds` (`nextDspark`, `dsparkResumeAfterForced`, `dsparkEmitPending`, `dsparkDiag`, `stageBlock`):
+  `arch/dspark.zig` binds them for the generator and the scheduler, or a stand-in that refuses in a build without such an arch. The
+  generator's DSpark types are the shared `dspark_rows.zig`.
+- `ubench` in `arch.zig`: the arch's microbench module, whose `benches` `ubench_main.zig` lists.
+- A `State` may declare `specRollsBack` (`arch_state.zig`): its decode state rewinds across a speculative verify.
+
 ## Build roots an arch declares
 
 An arch folder may hold `build_roots.zon`; `build.zig` reads every `src/<folder>/build_roots.zon` at configure time, so
@@ -149,7 +174,8 @@ the shared build names no arch for these:
 - `.tools`: an offline tool built in place of the server by `-D<option>=true` (`option`, `help`, `root`). `glm5` declares
   `-Dglm-ffn-replay` and `-Dglm-trunk-cov`; the option name and what it builds are unchanged.
 - `.benches`: the arch's microbench files, which `build.zig` holds to the no-`test`-block rule (see
-  [testsuite](testsuite.md#microbenches)). The files are still imported by `ubench_main.zig`, until the arch's S4 stage.
+  [testsuite](testsuite.md#microbenches)). `ubench_main.zig` lists an arch's benches through its `ubench` module; GLM's are still
+  imported by `ubench_main.zig` until its S4 stage.
 
 Paths are from the repo root. Moving a root file edits its folder's list; dropping the folder drops its options.
 A key the file does not know, or a bench path that is missing, stops the configure.
@@ -191,6 +217,11 @@ A drop is one commit that removes:
   (`docs/bench/` stays as history);
 - the README pack lines and tables, and `NOTICE` entries for kernels ported only for it;
 - arch-specific strings in the web UI.
+
+What a DeepSeek drop leaves behind, by design: `src/expert_usage.zig` (the pack's `expert_usage.json` and the `--drop-expert` set; no arch
+declares the trait, so the flag is refused at load), `src/dspark_rows.zig` (DSpark is a drafting method, like DFlash) and
+`src/weights_where.zig`; `ModelConfig.dsv41` (an empty struct without the arch); and, in `src/fixtures/`, the DeepSeek chat template
+and its cases, which 30-odd shared template tests embed (a drop skips them through `arch_chat.pinOf`).
 
 It adds a CHANGELOG line ("<Arch> packs are no longer served"). The diff touches nothing else; if it must, the seam
 leaked and that leak is fixed first.

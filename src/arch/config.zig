@@ -35,7 +35,41 @@ pub const Facts = struct {
     qkv_split_rows: bool = false,
     /// The routed layers route by sigmoid with a selection-only bias, carry no shared expert, and bank biasless.
     bias_routed_moe: bool = false,
+    /// The width its prefill starts at, resolved per request by the admission bill; 0 = not a per-request arch of this kind.
+    prefill_start_width: u32 = 0,
+    /// The MLX buffer pool its streamed decode holds, billed in the SSD-budget ledger.
+    expert_pool_bytes: u64 = 0,
+    /// Its routed experts always stream.
+    streams_experts: bool = false,
+    /// Its weight loader reads and checks the pack itself; the shared EXL3 pack index check does not apply.
+    reads_own_source: bool = false,
 };
+
+/// The config data only `name`'s arch reads, parsed once with the config: its `OwnConfig`, or an empty struct where the
+/// arch is not built or declares none.
+pub fn OwnConfig(comptime name: []const u8) type {
+    if (@hasField(Tag, name)) {
+        const M = registry.Mod(@field(Tag, name));
+        if (@hasDecl(M, "OwnConfig")) return M.OwnConfig;
+    }
+    return struct {};
+}
+
+fn releaseMod(comptime name: []const u8) ?type {
+    if (!@hasField(Tag, name)) return null;
+    const M = registry.Mod(@field(Tag, name));
+    return if (@hasDecl(M, "releaseOwn")) M else null;
+}
+
+/// For tests of shared code at an arch's geometry: the `OwnConfig` of its release checkpoint; null where the arch is not built.
+pub fn releaseOwn(comptime name: []const u8) !?OwnConfig(name) {
+    return if (comptime releaseMod(name)) |M| try M.releaseOwn() else null;
+}
+
+/// For tests of shared code at an arch's geometry: what the arch serves with no flag or setting.
+pub fn releaseServeDefaults(comptime name: []const u8) model.ServeDefaults {
+    return if (comptime releaseMod(name)) |M| M.serveDefaults(model.ServeDefaults) else .{};
+}
 
 /// `Facts.hyper_connected` of the config's arch; false for an unclaimed config.
 pub fn hyperConnected(config: *const model.ModelConfig) bool {
@@ -123,6 +157,30 @@ pub fn samplingDefaults(config: *model.ModelConfig) void {
     switch (tag) {
         inline else => |t| if (@hasDecl(registry.Mod(t), "samplingDefaults")) registry.Mod(t).samplingDefaults(config),
     }
+}
+
+/// The stored-state layout name of the arch's disk cache namespace; null when the arch has none of its own.
+pub fn cacheLayoutNamespace(config: *const model.ModelConfig) ?[]const u8 {
+    const tag = tagOf(config) orelse return null;
+    return switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "cacheLayoutNamespace")) registry.Mod(t).cacheLayoutNamespace(config) else null,
+    };
+}
+
+/// The bytes of per-token state the arch keeps for one cached token; null when the arch bills it by other terms.
+pub fn kvBytesPerToken(config: *const model.ModelConfig) ?u64 {
+    const tag = tagOf(config) orelse return null;
+    return switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "kvBytesPerToken")) registry.Mod(t).kvBytesPerToken(config) else null,
+    };
+}
+
+/// Whether this load keeps the arch's DSpark drafter stages resident.
+pub fn dsparkOn(config: *const model.ModelConfig) bool {
+    const tag = tagOf(config) orelse return false;
+    return switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "dsparkOn")) registry.Mod(t).dsparkOn(config) else false,
+    };
 }
 
 /// What a streamed load keeps resident when the arch reads its own source layout; null takes the indexed scan.

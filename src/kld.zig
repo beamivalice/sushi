@@ -171,7 +171,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .ctx_size => o.ctx_size = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .kv_quant => o.kv_quant_config = trunk.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
                 .qwen_gdn => o.qwen_gdn_f32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
-                .drop_expert => o.drop_expert = @import("dsv41/expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
+                .drop_expert => o.drop_expert = @import("expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
                 .ssd_prefetch => o.ssd_prefetch = model_mod.parseSsdPrefetch(v) orelse return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,

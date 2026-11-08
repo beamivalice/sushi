@@ -3,6 +3,7 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const trunk = @import("../trunk.zig");
 const dsv41_state = @import("dsv41_state.zig");
+const dsv41_prefix = @import("dsv41_prefix.zig");
 const serving = @import("dsv41_serving.zig");
 const admission = @import("../arch/admission.zig");
 const registry = @import("../arch/registry.zig");
@@ -33,7 +34,37 @@ const config_file = @import("dsv41_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = model_types;
 pub const discovery_types = model_types;
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .reads_pair_major = true };
+pub const config_facts: arch_config.Facts = .{
+    .thinks_by_default = true,
+    .reads_pair_major = true,
+    .prefill_start_width = config_file.prefill_width,
+    .expert_pool_bytes = config_file.dsv41_pool_bytes,
+    .streams_experts = true,
+    .reads_own_source = true,
+};
+pub const OwnConfig = config_file.Config;
+pub const serveDefaults = config_file.Config.serveDefaults;
+
+pub fn releaseOwn() !OwnConfig {
+    return config_file.parseText(config_file.release_config);
+}
+
+pub fn kvBytesPerToken(config: *const Config) ?u64 {
+    const c = config.dsv41 orelse return null;
+    return c.stateBytesPerToken();
+}
+
+pub fn cacheLayoutNamespace(config: *const Config) ?[]const u8 {
+    return dsv41_prefix.namespaceTag(dsparkOn(config));
+}
+
+/// Does this load keep the DSpark stages resident? They are its MTP head: `--mtp` under streaming.
+pub fn dsparkOn(config: *const Config) bool {
+    const c = config.dsv41 orelse return false;
+    return config.stream_mtp_head and c.dspark.block > 0;
+}
+
+pub const load = @import("dsv41_load.zig");
 pub const parseConfig = config_file.parseFamily;
 
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {
@@ -45,11 +76,19 @@ pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir
     };
 }
 
+pub fn streamedResidentExtra(config: *const Config) u64 {
+    const c = config.dsv41 orelse return 0;
+    return @import("dsv41_engram.zig").cacheBytes(c.engram);
+}
+
 pub const media = @import("dsv41_media.zig"); // slot:media (S2f)
 
 pub const chat = @import("dsv41_chat.zig"); // slot:chat (S2g)
 
 pub const kld = @import("kld_capture.zig");
+
+/// The arch's microbenches, which `sushi-ubench` lists; nothing else reads them.
+pub const ubench = @import("ubench.zig");
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *trunk.Weights, s: mlx.mlx_stream) !Trunk {
     _ = io;
@@ -87,7 +126,7 @@ pub fn ownsModuleDecodeState(xfm: Model) bool {
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
-    return .{ .drop_expert = true, .prefetch = true, .tile_major = config.expert_layout == .exl3_k4 };
+    return .{ .drop_expert = true, .prefetch = true, .tile_major = config.expert_layout == .exl3_k4, .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false };
 }
 
 test "a model stamped as dsv41 is dispatched to dsv41" {

@@ -90,7 +90,6 @@ test {
     _ = @import("linear.zig");
     _ = @import("model_settings.zig");
     _ = @import("spec_cost_gate.zig");
-    _ = @import("row_grammar.zig");
     _ = @import("dflash.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("dflash_conv.zig");

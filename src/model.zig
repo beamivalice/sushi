@@ -34,7 +34,6 @@ pub fn parseSsdPrefetch(value: []const u8) ?u8 {
 
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
-const dsv41_config = @import("dsv41/dsv41_config.zig");
 const expert_io = @import("expert_io.zig");
 const pack_revision_mod = @import("pack_stamp.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -86,9 +85,6 @@ pub const QuantMode = enum {
     }
 };
 
-
-/// DeepSeek-V4.1's MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
-pub const dsv41_pool_bytes: u64 = 1 << 30;
 
 /// What an architecture serves with no flag and no setting; 0 and false = nothing of its own.
 pub const ServeDefaults = struct {
@@ -244,7 +240,7 @@ pub const ModelConfig = struct {
     glm_mtp_layers: u32 = 0,
     glm_fp8_trunk: bool = false,
     /// deepseek_v41's own geometry, parsed once from config.json.
-    dsv41: ?dsv41_config.Config = null,
+    dsv41: ?arch_config.OwnConfig("dsv41") = null,
     serve_defaults: ServeDefaults = .{},
 
     // Multi-head Latent Attention (GLM's full-attention layers,
@@ -571,14 +567,14 @@ pub const ModelConfig = struct {
     /// once at load: a long session's load-time reserve (and, ungated, the hot-cache ask) pins
     /// every ordinary prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
-        return self.longCtxGated() or self.swaRingTokens() > 0 or self.isGlm5() or self.isDsv41();
+        return self.longCtxGated() or self.swaRingTokens() > 0 or self.isGlm5() or (arch_config.facts(self) orelse arch_config.Facts{}).prefill_start_width != 0;
     }
 
     /// The width a per-request arch's prefill starts at; only a chunk that no longer fits beside its
     /// KV steps down. GLM's native prefill paths are built for 2048 rows.
     pub fn prefillStartWidth(self: *const ModelConfig) u32 {
         if (self.isGlm5()) return @import("glm5/glm5_forward.zig").prefill_chunk;
-        if (self.isDsv41()) return dsv41_config.prefill_width;
+        if (arch_config.facts(self)) |f| if (f.prefill_start_width != 0) return f.prefill_start_width;
         if (self.longCtxGated()) return 4096;
         if (self.swaRingTokens() > 0) return 2048;
         return std.math.maxInt(u32);
@@ -666,7 +662,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
-        if (self.dsv41) |c| return c.stateBytesPerToken();
+        if (arch_config.kvBytesPerToken(self)) |bytes| return bytes;
         if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * self.mla_kv_lora_rank * 2;
         // A ringed arch pays per token only on its global layers; the sliding
         // half is `swaRingBytes`, a constant. Both halves land in the same
@@ -761,7 +757,7 @@ pub const ModelConfig = struct {
     /// is no GDN state. A restored state of the other width would be cast, and one written under a bf16
     /// gate continues differently, so neither is restored.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
-        if (self.isDsv41()) return @import("dsv41/dsv41_prefix.zig").namespaceTag(self.dsparkOn());
+        if (arch_config.cacheLayoutNamespace(self)) |ns| return ns;
         if (self.linear_num_value_heads == 0 or self.isGlm5()) return null;
         return if (self.gdnStateDtype() == .float32) "gdn-f32-state-v1" else "gdn-gate-f32-v1";
     }
@@ -813,7 +809,7 @@ pub const ModelConfig = struct {
 
     /// The MLX buffer pool a streamed load is allowed to hold, billed in its ssd-budget ledger; 0 keeps the RAM-wide cap.
     pub fn expertPoolBytes(self: *const ModelConfig) u64 {
-        return if (self.isDsv41()) dsv41_pool_bytes else 0;
+        return (arch_config.facts(self) orelse arch_config.Facts{}).expert_pool_bytes;
     }
 
     /// Percent of the SSD read rate the expert prefetch may use: the launch flag, else the model setting, else the default.
@@ -840,8 +836,7 @@ pub const ModelConfig = struct {
 
     /// Does this load keep deepseek_v41's DSpark stages resident? They are its MTP head: `--mtp` under streaming.
     pub fn dsparkOn(self: *const ModelConfig) bool {
-        const c = self.dsv41 orelse return false;
-        return self.stream_mtp_head and c.dspark.block > 0;
+        return arch_config.dsparkOn(self);
     }
 
     /// Streaming is a CAPABILITY of the checkpoint's routed-expert banks, not of
@@ -874,7 +869,7 @@ pub const ModelConfig = struct {
     }
 
     /// What `--drop-expert` asks of this model's pack.
-    pub fn expertDropRequest(self: *const ModelConfig) @import("dsv41/expert_usage.zig").Request {
+    pub fn expertDropRequest(self: *const ModelConfig) @import("expert_usage.zig").Request {
         return .{
             .n = self.drop_expert,
             .layers = self.expertLayerCount(),
@@ -888,7 +883,7 @@ pub const ModelConfig = struct {
     /// An EXL3 bank is a self-describing quantized weight the resident kernels
     /// read as they are, whatever the trunk's own width says.
     pub fn expertStreamingRequired(self: *const ModelConfig) bool {
-        if (self.isDsv41()) return true;
+        if ((arch_config.facts(self) orelse arch_config.Facts{}).streams_experts) return true;
         if (self.expert_layout == .exl3_k4) return false;
         return self.supportsExpertStreaming() and
             (self.quant_bits == 0 or self.expert_layout == .mxfp4_individual or self.expert_layout == .mxfp4_w123);
@@ -1990,8 +1985,7 @@ pub fn loadWeightsForConfig(
 ) !Weights {
     try archGate(config);
     if (config.pack_revision) |rev| try pack_revision_mod.verify(io, allocator, model_dir, rev);
-    if (config.isDsv41()) return loadWeightsDsv41(io, allocator, model_dir, config, load_vision);
-    if (config.expert_layout == .exl3_k4) try @import("pack_index.zig").validateExl3Pack(io, allocator, model_dir, config);
+    if (config.expert_layout == .exl3_k4 and !(arch_config.facts(config) orelse arch_config.Facts{}).reads_own_source) try @import("pack_index.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
         const glm = @import("glm5/glm5_diagnostic.zig");
         return glm.loadWeightsBoundedWithVision(io, allocator, model_dir, mlx.gpuStream(), config.expert_streaming, std.math.maxInt(u64), load_vision and config.glm5_vision);
@@ -2002,18 +1996,6 @@ pub fn loadWeightsForConfig(
     defer dir.close(io);
     const mtp_off = config.isQwen4() and config.mtp_override == false;
     return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null, mtp_off);
-}
-
-/// deepseek_v41's resident trunk from the release's shards, and its vision tower when asked for; its routed experts stream.
-fn loadWeightsDsv41(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
-    const stq = config.dsv41.?.expert_dec != null;
-    if (config.expert_layout != (if (stq) expert_quant.Layout.exl3_k4 else .mxfp4_w123)) {
-        log.err("deepseek_v41: model.safetensors.index.json does not list every routed expert (layout {s}); the download is incomplete\n", .{@tagName(config.expert_layout)});
-        return error.ExpertLayoutUnsupported;
-    }
-    const source = @import("dsv41/dsv41_source.zig");
-    try source.validateTileOrder(io, allocator, model_dir, config.expert_tile_order, config.hidden_size, config.moe_intermediate_size);
-    return source.loadResident(io, allocator, model_dir, .{ .dspark = config.dsparkOn(), .vision = load_vision and config.has_vision });
 }
 
 pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout, vision: bool, keep_mtp: bool) !Weights {
@@ -4214,7 +4196,8 @@ test "deepseek_v41 thinks by default, at its native high effort" {
 }
 
 test "only an architecture with serve defaults carries its own default context and output budget" {
-    const defaults = dsv41_config.Config.serveDefaults(ServeDefaults);
+    if (registry.ofModelType("deepseek_v41") == null) return error.SkipZigTest;
+    const defaults = arch_config.releaseServeDefaults("dsv41");
     const dsv41 = ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 1_048_576, .serve_defaults = defaults };
     try testing.expectEqual(@as(u32, 1_000_000), dsv41.defaultContext());
     try testing.expectEqual(@as(u32, 256_000), dsv41.defaultMaxTokens());
@@ -4279,7 +4262,7 @@ test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned b
 
 test "a text prompt's BOS comes from the release config, whose bos_token_id sits outside text_config" {
     if (registry.ofModelType("deepseek_v41") == null) return error.SkipZigTest;
-    var config = try parseConfigFromJson(testing.allocator, dsv41_config.release_config);
+    var config = try parseConfigFromJson(testing.allocator, arch_config.fixtureConfig("dsv41") orelse return error.SkipZigTest);
     defer config.deinit(testing.allocator);
     try testing.expectEqual(@as(?u32, 0), config.text_prompt_bos);
 }
@@ -4395,7 +4378,6 @@ const PinCase = struct { name: []const u8, arch_type: []const u8, json: []const 
 const shared_pin_cases = [_]PinCase{
     .{ .name = "model-configs/qwen4_exp.json", .arch_type = "qwen4_exp", .json = @embedFile("fixtures/model-configs/qwen4_exp.json") },
     .{ .name = "glm5_config.json", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json") },
-    .{ .name = "dsv41 release", .arch_type = "deepseek_v41", .json = dsv41_config.release_config },
     .{ .name = "qwen4 shipped", .arch_type = "qwen4_exp", .json = QWEN4_SHIPPED },
     .{ .name = "qwen4 yarn", .arch_type = "qwen4_exp", .json = QWEN4_YARN },
     .{ .name = "glm5 text alias", .arch_type = "glm5_next", .json = @embedFile("fixtures/glm5_config.json"), .swap = .{ "\n  \"model_type\": \"glm5_next\"", "\n  \"model_type\": \"glm5_next_text\"" } },

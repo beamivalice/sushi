@@ -4,6 +4,7 @@
 /// The test files the MLX root `src/tests.zig` runs for this arch.
 pub const tests = .{
     @import("dsv41_vision.zig"),
+    @import("dsv41_bills_live_test.zig"),
     @import("dsv41_config.zig"),
     @import("dsv41_qat.zig"),
     @import("dsv41_engram.zig"),
@@ -29,7 +30,7 @@ pub const tests = .{
 
 /// The MLX-free test files `src/tests_host.zig` runs for this arch.
 pub const host_tests = .{
-    @import("expert_usage.zig"),
-    @import("dspark_rows.zig"),
     @import("tokenizer_deepseek.zig"),
+    @import("row_grammar.zig"),
+    @import("dsv41_bills_test.zig"),
 };

@@ -42,7 +42,6 @@ test {
     _ = @import("server_state.zig");
     _ = @import("settings_resolve.zig");
     _ = @import("stop_sequences.zig");
-    _ = @import("row_grammar.zig");
     _ = @import("logit_bias.zig");
     _ = @import("log.zig");
     _ = @import("test_models.zig");
@@ -50,6 +49,7 @@ test {
     _ = @import("kld_fixture.zig");
     _ = @import("io_util.zig");
     _ = @import("expert_drop.zig");
+    _ = @import("expert_usage.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");
     _ = @import("cache_stats.zig");
@@ -63,6 +63,7 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("mtp_lookup.zig");
     _ = @import("spec_cost_gate.zig");
+    _ = @import("dspark_rows.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("prefix_policy.zig");
     _ = @import("sched_policy.zig");

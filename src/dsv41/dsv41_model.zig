@@ -17,7 +17,7 @@ const source = @import("dsv41_source.zig");
 const owned_mod = @import("dsv41_owned.zig");
 const model_mod = @import("../model.zig");
 const exl3 = @import("sushi_exl3");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("../expert_usage.zig");
 const transient_peak = @import("transient_peak.zig");
 
 const A = sc_mod.A;

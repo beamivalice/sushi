@@ -1,6 +1,6 @@
 const std = @import("std");
 const expert_stream_mod = @import("expert_stream.zig");
-const expert_usage = @import("dsv41/expert_usage.zig");
+const expert_usage = @import("expert_usage.zig");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;

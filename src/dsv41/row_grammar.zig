@@ -6,11 +6,11 @@
 //! first draft its row's mask forbids. The live state is untouched; `advance` commits tokens to it.
 
 const std = @import("std");
-const json_grammar = @import("json_grammar.zig");
-const json_schema = @import("json_schema.zig");
-const token_mask = @import("token_mask.zig");
-const rp = @import("reasoning_protocol.zig");
-const log = @import("log.zig");
+const json_grammar = @import("../json_grammar.zig");
+const json_schema = @import("../json_schema.zig");
+const token_mask = @import("../token_mask.zig");
+const rp = @import("../reasoning_protocol.zig");
+const log = @import("../log.zig");
 
 pub const View = struct {
     grammar: *json_grammar.Grammar,

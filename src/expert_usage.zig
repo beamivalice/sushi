@@ -1,6 +1,6 @@
 //! A pack's per-layer routed-expert usage (`expert_usage.json`) and the drop `--drop-expert n` ranks from it.
 const std = @import("std");
-const drop_set = @import("../expert_drop.zig");
+const drop_set = @import("expert_drop.zig");
 
 pub const file_name = "expert_usage.json";
 

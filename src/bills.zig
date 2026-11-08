@@ -14,10 +14,7 @@ const generate_mod = @import("generate.zig");
 const fp8_block = @import("fp8_block.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const model_mod = @import("model.zig");
-const dsv41_config = @import("dsv41/dsv41_config.zig");
 const glm5_prefix = @import("glm5/glm5_prefix.zig");
-const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
-const dsv41_borrow = @import("dsv41/dsv41_borrow.zig");
 const log = @import("log.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -583,7 +580,7 @@ pub fn expertStreamingPlannedKvBytes(config: *const model_mod.ModelConfig) u64 {
     return sessionBytesPerToken(config, kv_bits) *| expertStreamingPlannedSeq(config) +| slotRingBytes(config, kv_bits);
 }
 
-fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
+pub fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
     const seq: u64 = expertStreamingPlannedSeq(config);
     const explicit = explicitPrefillChunk();
     // A request picks its own rung against free memory, and an unpinned arch's load-time pin is memory-sized after
@@ -632,7 +629,7 @@ pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_byte
     }
 }
 
-fn expertStreamingConfigFits(config: *const model_mod.ModelConfig, ceiling: u64, active_mem: u64, resident_bytes: u64) bool {
+pub fn expertStreamingConfigFits(config: *const model_mod.ModelConfig, ceiling: u64, active_mem: u64, resident_bytes: u64) bool {
     return expertStreamingLoadFits(
         ceiling,
         active_mem,
@@ -930,7 +927,7 @@ fn contextNeutralChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceili
     return narrowest;
 }
 
-fn advertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
+pub fn advertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
     return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap(), config.defaultContext());
 }
 
@@ -1105,11 +1102,7 @@ pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pin
         const widest = rungWidth(config, 1, cappedRung(PREFILL_CHUNK_LADDER[0], ladderTop(config, explicitPrefillChunk())), config.longCtxGated());
         return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d}\n", .{ widest, pinned }) catch null;
     }
-    if (config.isDsv41() and launch > dsv41_config.prefill_width) {
-        if (pinned == dsv41_config.prefill_width)
-            return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (DeepSeek's default width; --prefill-chunk overrides)\n", .{pinned}) catch null;
-        return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, dsv41_config.prefill_width }) catch null;
-    }
+    if (archHook("prefillChunkLoadLine", []const u8, config, .{ buf, pinned, launch })) |line| return line;
     if (pinned >= launch) return null;
     if (config.isGlm5() and pinned == @import("glm5/glm5_forward.zig").prefill_chunk)
         return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (GLM's numerics width; --prefill-chunk overrides)\n", .{pinned}) catch null;
@@ -2272,24 +2265,12 @@ pub fn prefillChunkCost(
 ) u64 {
     const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
         statePerTokenBilled(config);
-    return (prefillTransientReserveAtKv(config, kv_bits, width, kv_len) -| dsv41BorrowableBytes(config)) +| (width *| per_tok);
+    return (prefillTransientReserveAtKv(config, kv_bits, width, kv_len) -| borrowableBytes(config)) +| (width *| per_tok);
 }
 
-/// The decoder pools a DeepSeek prefill may still release for its working set (`dsv41_borrow`); 0 elsewhere.
-pub fn dsv41BorrowableBytes(config: *const model_mod.ModelConfig) u64 {
+/// The decoder pools a prefill may still release for its working set (`ModelConfig.expert_borrow_bytes`); 0 where the arch lends none.
+pub fn borrowableBytes(config: *const model_mod.ModelConfig) u64 {
     return @atomicLoad(u64, &config.expert_borrow_bytes, .monotonic);
-}
-
-/// `dsv41_borrow.headroom_fn`: what admission reads as available, live.
-pub fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
-    const active_mem: usize = gpu_mem.activeBytes();
-    return dsv41HeadroomOf(admissionAvailable(currentGpuMemoryCeiling(config, active_mem), active_mem), config);
-}
-
-/// The decode pool the ledger parks in MLX's cache is no part of its active bytes, so every live check (decode and
-/// prefill width) takes it off here once; `prefillNeededAtChunk` bills it once for the same reason.
-fn dsv41HeadroomOf(available: u64, config: *const model_mod.ModelConfig) u64 {
-    return available -| config.expertPoolBytes();
 }
 
 /// The width the next chunk runs at. Asymmetric because a Metal abort is uncatchable: HOLD
@@ -3105,168 +3086,6 @@ test "bf16 expert cache admission bills cache workspace bounce and resident trun
     try std.testing.expect(!expertStreamingLoadFits(needed - 1, 10 * gb, 16 * gb, 60 * gb, 536_870_912, fill_peak, serving));
 }
 
-test "DeepSeek: the streamed request bill brackets the prefill peaks measured on the M5 Max" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
-    // No decoder pool to lend: the bill is the working set's, as measured.
-    config.expert_borrow_bytes = 0;
-    try std.testing.expectEqual(prefill_plan.TAIL_MERGE_MAX - 1, dsv41_config.tail_merge_rows);
-    // Live per-chunk `peak_bytes - active_bytes` (`SUSHI_PREFILL_CHUNK_PEAK`), CED prefill, `--ssd-budget-gb 94`, the STQ d4
-    // pack, DSpark on: `chunk` is the configured width, `seq` where the chunk ended (a last chunk absorbs its tail).
-    const measured = [_]struct { seq: u64, chunk: u64, peak_mb: u64 }{
-        .{ .seq = 7168, .chunk = 1024, .peak_mb = 3_560 },
-        .{ .seq = 8675, .chunk = 1024, .peak_mb = 4_049 },
-        .{ .seq = 18432, .chunk = 512, .peak_mb = 2_635 },
-        .{ .seq = 34625, .chunk = 512, .peak_mb = 2_997 },
-        .{ .seq = 108032, .chunk = 512, .peak_mb = 2_600 },
-        .{ .seq = 108675, .chunk = 512, .peak_mb = 2_740 },
-        // Transient peaks of MLX's own bytes, state included, binary 26a28040, budget 108.
-        .{ .seq = 2048, .chunk = 2048, .peak_mb = 4_907 },
-        .{ .seq = 225_000, .chunk = 2048, .peak_mb = 5_124 },
-        // The two-layer prefill pipeline holds 0.25 GB more of a 2048-row chunk's transient.
-        .{ .seq = 2048, .chunk = 2048, .peak_mb = 4_907 + 250 },
-        .{ .seq = 225_000, .chunk = 2048, .peak_mb = 5_124 + 250 },
-    };
-    for (measured) |m| {
-        const bill = prefillNeededAtChunk(&config, m.seq, 16, 16, m.chunk, .{});
-        const peak = m.peak_mb * 1_000_000;
-        // Under-billing is a Metal OOM: at least a tenth over the peak. The upper bar keeps the net small.
-        try std.testing.expect(bill >= peak + peak / 10);
-        try std.testing.expect(bill <= peak * 4);
-    }
-}
-
-test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024, then 512, never wider" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    const t = std.testing;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    config.num_attention_heads = 64;
-    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
-    // No decoder pool to lend: the bill is the working set's, as measured.
-    config.expert_borrow_bytes = 0;
-    const MB: u64 = 1 << 20;
-    // What `--ssd-budget-gb 96` on the 128 GB M5 Max leaves to serve, as its pin measured it.
-    const at96: u64 = 110_100 * MB - 97_080 * MB;
-    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 0, .{}));
-    // Its attention scores only the picked keys, so a long prompt keeps the width while the bill fits.
-    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, 400_000, 2048, 16, at96, 512, 0, .{}));
-    const long: u64 = 524_288;
-    const at1024 = prefillNeededAtChunk(&config, long, 2048, 16, 1024, .{});
-    const only_narrow = prefillNeededAtChunk(&config, long, 2048, 16, 512, .{});
-    try t.expect(prefillNeededAtChunk(&config, long, 2048, 16, 2048, .{}) > at1024 and at1024 > only_narrow);
-    try t.expectEqual(@as(u32, 1024), chooseRequestPrefillChunk(&config, long, 2048, 16, at1024, 512, 0, .{}));
-    try t.expectEqual(@as(u32, 512), chooseRequestPrefillChunk(&config, long, 2048, 16, only_narrow, 512, 0, .{}));
-    try t.expectEqual(@as(u32, 512), chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 512, .{}));
-    var buf: [256]u8 = undefined;
-    try t.expectEqualStrings("Prefill chunk: per request, up to 2048 at a short prompt (the widest rung each request's bill admits); load-time fallback 512\n", prefillChunkLoadLine(&buf, &config, 512, 8192).?);
-    // The ladder never narrows the advertised context: it is priced at the 512 floor.
-    try t.expectEqual(@as(u32, 1_000_000), advertisedContextAt(&config, 16, 110_100 * MB, 97_080 * MB, 512));
-}
-
-test "DeepSeek advertises the longest context its own request bill admits" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    const t = std.testing;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    config.num_attention_heads = 64;
-    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
-    // No decoder pool to lend: the bill is the working set's, as measured.
-    config.expert_borrow_bytes = 0;
-    const GB: u64 = 1_000_000_000;
-    // The request bill grows with the prompt (the state and the rows' growth), so a serving budget of exactly one
-    // prompt's bill advertises that prompt and not one token less.
-    for ([_]u64{ 8192, 65_536, 131_072, 262_144, 524_288, 1_048_576 }) |seq| {
-        for ([_]u64{ 512, 1024 }) |chunk| {
-            const bill = prefillNeededAtChunk(&config, seq, 0, 16, chunk, .{});
-            try t.expect(memoryContextAtChunk(&config, 16, 100 * GB + bill, 100 * GB, chunk) >= seq);
-            try t.expect(memoryContextAtChunk(&config, 16, 100 * GB + bill - 1, 100 * GB, chunk) < seq);
-        }
-    }
-    // At 96 the whole 1M context fits the fallback width's bill, with the memory the margined default needs to spare.
-    const MB: u64 = 1 << 20;
-    try t.expect(memoryContextAtChunk(&config, 16, 110_100 * MB, 97_080 * MB, 512) >= memoryContextForMargined(1_000_000));
-}
-
-test "a streamed DeepSeek bills its workspace at load and no fill peak at load or per request" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    config.expert_cache_bytes = 93_993 << 20;
-    config.expert_bounce_bytes = 512 << 20;
-    config.expert_workspace_bytes = 3_525 << 20;
-    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
-    const mib: u64 = 1 << 20;
-    // No decoder pool to lend: the bill is the working set's, as measured.
-    config.expert_borrow_bytes = 0;
-    // A 100-token request pays its own transient, not the cache layer and a second workspace.
-    try std.testing.expect(prefillNeededAtChunk(&config, 100, 512, 16, 512, .{}) < 2048 * mib);
-    const resident: u64 = 8_295 * mib;
-    const held = resident + config.expert_cache_bytes + config.expert_bounce_bytes + config.expert_workspace_bytes + config.expertPoolBytes();
-    const serving = expertStreamingServingBytes(&config);
-    try std.testing.expect(expertStreamingConfigFits(&config, held + serving, 0, resident));
-    try std.testing.expect(!expertStreamingConfigFits(&config, held + serving - 1, 0, resident));
-}
-
-test "DeepSeek's live headroom and its load fit each count the decode pool the ledger parks once" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    const t = std.testing;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    // The parked pool is in MLX's cache, not its active bytes, so `ceiling - active` does not see it.
-    try t.expectEqual(@as(u64, 10 << 30) - config.expertPoolBytes(), dsv41HeadroomOf(10 << 30, &config));
-    try t.expectEqual(@as(u64, 0), dsv41HeadroomOf(1 << 20, &config));
-    // The load fit holds the pool in its staging term, so the serving term it adds is the bill without it.
-    config.expert_borrow_bytes = 60_000_000_000;
-    const bill = prefillNeededAtChunk(&config, expertStreamingPlannedSeq(&config), 2048, defaultKvBits(&config), 512, .{});
-    try t.expectEqual(bill - config.expertPoolBytes(), expertStreamingServingBytes(&config));
-}
-
-test "DeepSeek's request bill takes its prefill working set out of the decoder pools a prefill may release" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    const t = std.testing;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    const c = config.dsv41.?;
-    const seq: u64 = 524_288;
-    const state = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + checkpointReserve(&config, seq, 2048)) * 5 / 4;
-    const work = c.chunkCap(2048, seq) + config.expertPoolBytes();
-    const decode = c.forwardCap(dsv41_borrow.verify_rows, seq);
-    // No pool to lend: the whole working set is billed, as before.
-    try t.expectEqual(state + work, prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
-    // Pools that cover part of it: admission pays only the rest.
-    config.expert_borrow_bytes = work / 2;
-    try t.expectEqual(state + work - work / 2, prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
-    // Pools that cover all of it: the state, a decode forward and the decode pool it leaves parked, at any chunk.
-    config.expert_borrow_bytes = 60_000_000_000;
-    for ([_]u64{ 512, 1024, 2048 }) |chunk| {
-        const ck = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + checkpointReserve(&config, seq, chunk)) * 5 / 4;
-        try t.expectEqual(ck + decode + config.expertPoolBytes(), prefillNeededAtChunk(&config, seq, 2048, 16, chunk, .{}));
-    }
-    // The widest rung is then always affordable, and a chunk boundary never steps down for the working set.
-    const MB: u64 = 1 << 20;
-    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode + config.expertPoolBytes(), 512, 0, .{}));
-    var st: mtp_plan.AdaptiveWidthState = .{};
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st));
-    config.expert_borrow_bytes = 0;
-    var st0: mtp_plan.AdaptiveWidthState = .{};
-    try t.expect(adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st0) < 2048);
-}
-
 test "a default context is served when the margined bill admits it, else the margined memory ceiling" {
     const t = std.testing;
     const dflt: u32 = 1_000_000;
@@ -3291,59 +3110,6 @@ test "a default context is served when the margined bill admits it, else the mar
     // An explicit context, from the flag or the pin, outranks it.
     try t.expectEqual(@as(u32, 250_000), resolvedContextForLoad(250_000, 0, 4_000_000 * MiB, 0, 0, 0, 890, 1_048_576, dflt));
     try t.expectEqual(@as(u32, 300_000), resolvedContextForLoad(0, 300_000, 4_000_000 * MiB, 0, 0, 0, 890, 1_048_576, dflt));
-}
-
-test "the default request bill at 1M tokens is the borrowed bill plus the decode pool" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    const t = std.testing;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    config.num_attention_heads = 64;
-    const saved = .{ launch_state.prefix_cache_ram_enabled, launch_state.prefix_cache_disk_bytes };
-    defer {
-        launch_state.prefix_cache_ram_enabled = saved[0];
-        launch_state.prefix_cache_disk_bytes = saved[1];
-    }
-    launch_state.prefix_cache_ram_enabled = false;
-    launch_state.prefix_cache_disk_bytes = 20 << 30;
-    const bill = defaultRequestBill(&config);
-    // dsv41-memory: 3.4 GB at 1M with the prefill borrowed (state, writer in flight, rings, x5/4, the decode cap), plus the
-    // 1 GiB decode pool the ledger parks beside it.
-    try t.expectApproxEqAbs(@as(f64, 4_400_000_000), @as(f64, @floatFromInt(bill)), 300_000_000);
-    // The bill leaves the config's own streaming fields as they were.
-    try t.expect(config.expert_streaming);
-    try t.expectEqual(@as(u64, 0), config.expert_borrow_bytes);
-}
-
-test "with its decoder pools lendable, DeepSeek at --ssd-budget-gb 117 with DSpark on wired 124000 advertises its whole context" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    const t = std.testing;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    config.num_attention_heads = 64;
-    const saved = .{ launch_state.prefix_cache_ram_enabled, launch_state.prefix_cache_disk_bytes };
-    defer {
-        launch_state.prefix_cache_ram_enabled = saved[0];
-        launch_state.prefix_cache_disk_bytes = saved[1];
-    }
-    // The served default: no RAM tier, the SSD tier on, so restore points go to SSD as a prefill takes them.
-    launch_state.prefix_cache_ram_enabled = false;
-    launch_state.prefix_cache_disk_bytes = 20 << 30;
-    const MB: u64 = 1 << 20;
-    // The budget-100 boot on wired 124000 read a 122,170 MiB ceiling and 100,328 MiB active; 17 GiB more at 117.
-    const ceiling: u64 = 122_170 * MB;
-    // The budget now holds the decode pool, parked in MLX's cache: the same budget leaves active that much lower.
-    const active: u64 = (100_328 + 17 * 1024) * MB - (1 << 30);
-    // Its expert cache, 13.57 GB under the budget (94% of the experts), split evenly: the decoder half is lendable.
-    config.expert_borrow_bytes = (117 * (1 << 30) - 13_570_000_000) / 2;
-    try t.expectEqual(@as(u32, 1_000_000), advertisedContextAt(&config, 16, ceiling, active, 2048));
-    // Billing the working set to the request, with nothing to lend, advertises well under the whole context.
-    config.expert_borrow_bytes = 0;
-    try t.expectEqual(@as(u32, 390_144), advertisedContextAt(&config, 16, ceiling, active, 512));
 }
 
 test "bf16 expert load admission includes 65k KV and QSA serving terms" {
@@ -7387,24 +7153,6 @@ test "bill pin: the SSD ask and tier" {
     }.run);
 }
 
-test "a default context never exceeds the checkpoint's window, and --ctx-size or model-settings still win" {
-    if (!archBuilt("dsv41")) return error.SkipZigTest;
-    const t = std.testing;
-    const original = launch_state.server_config.max_context_size;
-    defer launch_state.server_config.max_context_size = original;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 262_144, .serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults) };
-    try t.expectEqual(@as(u32, 262_144), autoContextFrom(1_048_576, config.contextCap(), config.defaultContext()));
-
-    config.max_position_embeddings = 1_048_576;
-    config.pinned_context = 1_000_000;
-    launch_state.server_config.max_context_size = 0;
-    try t.expectEqual(@as(u32, 1_000_000), getEffectiveContextLength(&config));
-    config.ctx_override = 300_000;
-    try t.expectEqual(@as(u32, 300_000), getEffectiveContextLength(&config));
-    launch_state.server_config.max_context_size = 250_000;
-    try t.expectEqual(@as(u32, 250_000), getEffectiveContextLength(&config));
-}
-
 test "a 32 GB Mac's lean Flash-Next budget advertises and admits an 80k prompt" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const qsa_fused_off = fixtures.qsaScoreFusedOffGuard();
@@ -8338,7 +8086,7 @@ pub fn pinLoadConfigs(comptime name: []const u8, want: []const u64, comptime run
     var fx = try model_load.LoadBillFixtures.init();
     defer fx.deinit();
     var dsv = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    dsv.dsv41 = try @import("dsv41/dsv41_config.zig").parseText(@import("dsv41/dsv41_config.zig").release_config);
+    dsv.dsv41 = try arch_config.releaseOwn("dsv41");
     try pinRows(name, want, null, .{ &fx.qwen, &fx.mimo, &fx.glm, &dsv }, run);
 }
 

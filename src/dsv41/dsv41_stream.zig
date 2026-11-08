@@ -14,7 +14,7 @@ const A = sc_mod.A;
 const Scope = sc_mod.Scope;
 const Config = cfg_mod.Config;
 const exl3 = @import("sushi_exl3");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("../expert_usage.zig");
 const PrefetchCredit = @import("../prefetch_plan.zig").PrefetchCredit;
 
 pub fn geometry(cfg: *const Config) stream.Geometry {
@@ -2897,7 +2897,7 @@ test "dsv41 stq: a settle's scratch grows once and then serves every smaller or 
     try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
-const pm_pack = @import("../pair_major_pack_test.zig");
+const pm_pack = @import("pair_major_pack_test.zig");
 const io_mod = @import("../expert_io.zig");
 
 const PmDir = struct {

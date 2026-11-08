@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # sushi-test: tier=tool
 """DeepSeek-V4.1's Engram token map, built from the tokenizer exactly as DeepSeek's inference/engram.py
-(`build_compressed_token_map`) builds it, packed into src/fixtures/dsv41_engram_token_map.bin.
+(`build_compressed_token_map`) builds it, packed into src/dsv41/fixtures/dsv41_engram_token_map.bin.
 
 Format: one bit per token id (LSB first) set where the token opens a new compressed id (ids are handed out in
 token order), then every other token's compressed id as a little-endian u32.
@@ -59,7 +59,7 @@ def pack(lookup):
 
 lookup, n = build_compressed_token_map(Tokenizer.from_file(os.path.join(sys.argv[1], "tokenizer.json")))
 print(f"{len(lookup)} tokens -> {n} compressed ids")
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "fixtures", "dsv41_engram_token_map.bin")
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "dsv41", "fixtures", "dsv41_engram_token_map.bin")
 if "--check" in sys.argv:
     same = open(out, "rb").read() == pack(lookup)
     print("committed map " + ("matches" if same else "DIFFERS"))

@@ -1048,3 +1048,19 @@ test "dsv41 vision: the requantized tower stays within bf16's drift of the bf16 
     try testing.expect(gt.cos > 0.998);
     try testing.expect(gs.cos > 0.998);
 }
+
+const request_media = @import("../request_media.zig");
+const arch_media = @import("../arch/media.zig");
+const chat_mod = @import("../chat.zig");
+
+test "a tower config without a vision block reserves the pixel-cap image, not a token budget it does not have" {
+    var cfg = arch_media.testConfig("deepseek_v41") orelse return error.SkipZigTest;
+    cfg.dsv41.?.vision = null;
+    const vp = request_media.visionPreprocFromConfig(&cfg);
+    try std.testing.expectEqual(.gemma, vp.mode);
+    const patches: u64 = common.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / (@as(u64, vp.patch) * vp.patch);
+    const img = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
+    const want = request_media.visionEncodeBill(&cfg, &img, &.{}, @intCast(patches / (vp.merge * vp.merge))).bytes;
+    try std.testing.expectEqual(want, request_media.largestImageEncodeBytes(&cfg));
+}
+

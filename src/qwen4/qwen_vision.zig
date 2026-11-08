@@ -1599,10 +1599,10 @@ test "qwen vision: the requantized tower stays within bf16's drift of the bf16 t
     const patches = mlx.mlx_array_new_data(pv.ptr, &[_]c_int{ @intCast(n), @intCast(feat) }, 2, .float32);
     defer _ = mlx.mlx_array_free(patches);
 
-    const source = @import("../dsv41/dsv41_source.zig");
-    var wb = try source.loadWhere(io, a, dir, {}, qwenTowerKey);
+    const source = @import("../weights_where.zig");
+    var wb = try source.loadWhere("qwen", io, a, dir, {}, qwenTowerKey);
     defer wb.deinit();
-    var wq = try source.loadWhere(io, a, dir, {}, qwenTowerKey);
+    var wq = try source.loadWhere("qwen", io, a, dir, {}, qwenTowerKey);
     defer wq.deinit();
     var active: [2]usize = undefined;
     _ = mlx.mlx_get_active_memory(&active[0]);

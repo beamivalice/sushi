@@ -31,6 +31,11 @@ pub const State = struct {
         }
     }
 
+    /// DeepSeek cuts its own rows back to the accepted prefix (`dsv41_model.finishVerify`) when it drafts with DSpark.
+    pub fn specRollsBack(self: *const State) bool {
+        return if (self.model) |m| m.dspark != null else false;
+    }
+
     pub fn reset(self: *State) void {
         if (self.model) |m| dsv41_model.resetState(m);
     }

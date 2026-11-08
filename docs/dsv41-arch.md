@@ -65,7 +65,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   distinct row id once and copies it to every place it sits (`Table.read`). A prefill chunk's pass is told the prompt tokens after it
   (`ForwardCtx.ahead_ids`) and reads the next chunk's rows while it runs (`aheadEngram`, one chunk of host rows, ~13 KB a token, unbilled);
   the next pass takes them when its row ids are the same, else reads its own. The n-gram hash and the compressed-vocabulary map
-  are the reference's (`engram.py`); the map ships embedded (`src/fixtures/dsv41_engram_token_map.bin`) and a pack's own
+  are the reference's (`engram.py`); the map ships embedded (`src/dsv41/fixtures/dsv41_engram_token_map.bin`) and a pack's own
   `engram_token_map.json` outranks it. `tests/dsv41/dump_dsv41_token_map.py --check` re-derives it from `tokenizer.json`.
 - **Forward** (`src/dsv41/dsv41_model.zig`): bf16 activations, f32 where the reference is f32 (head, compressor, hyper-connection
   mixes, attention scores and sink, router). Prefill runs in spans of 256 rows; the window is a ring, the compressed and
@@ -562,7 +562,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   The boot line reads `[spec] DeepSeek-V4.1-Flash decodes with DSpark (...)` or `... plain ticks (...)`, and a request that
   drafted logs `[spec-stats] mode=dspark` with acceptance, draft and verify ms.
 
-- <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `Generator.dsparkConstrainedEntry`). Each verify row takes the mask serial decode builds
+- <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `dsv41_dspark.dsparkConstrainedEntry`). Each verify row takes the mask serial decode builds
   after the drafts before it (`row_grammar.plan` walks a scratch copy of the JSON grammar and reasoning state over the drafts), so the
   masked argmax of a row is the serial token and a greedy request emits serial's tokens; a sampled one draws from the masked, filtered
   row. A draft its row's mask forbids ends the chunk there, and so does one serial decode answers by forcing the boundary (EOS or pad
@@ -572,7 +572,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   boundary) first emits it (`dsparkEmitPending`). `[spec-stats]` adds the host `mask_ms` per round and the serial ticks. A channel-header
   protocol or an opener choice keeps the request serial (`Constraint.rowsDraftable`).
 
-- **Verify width** (`dspark_rows.zig`, `Generator.nextDspark`). A round verifies the first R rows of its 6-row block (t1 and R-1
+- **Verify width** (`src/dspark_rows.zig`, `Generator.nextDspark`, bound by `arch/dspark.zig` to the DeepSeek drafter's `dspark_rounds`). A round verifies the first R rows of its 6-row block (t1 and R-1
   drafts; the draft is greedy, so a shorter verify keeps exactly the tokens a longer one would have kept up to R) and R=1 is a plain
   step with no draft. R maximizes expected tokens per ms, `E[tokens(R)] = 1 + sum_i prod_{j<=i} p_j`, over the cost of the round
   (`dflash_policy.chooseRows`). `p_j` is the confidence head's logit through a sigmoid and the per-bin calibration of

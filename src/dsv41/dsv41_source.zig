@@ -9,6 +9,9 @@ const expert_io = @import("../expert_io.zig");
 const log = @import("../log.zig");
 const vision = @import("dsv41_vision.zig");
 const exl3 = @import("sushi_exl3");
+const weights_where = @import("../weights_where.zig");
+const shardNames = weights_where.shardNames;
+const freeShardNames = weights_where.freeShardNames;
 
 pub const Parts = struct {
     /// Routed experts as stacked-at-load banks (a checkpoint small enough to hold them); streamed ones are not read here.
@@ -43,32 +46,6 @@ pub fn keeps(key: []const u8, parts: Parts) bool {
     return true;
 }
 
-/// The checkpoint's weight shards in name order; the caller frees each name and the list.
-fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !std.ArrayList([]const u8) {
-    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
-    defer dir.close(io);
-    var shards: std.ArrayList([]const u8) = .empty;
-    errdefer freeShardNames(allocator, &shards);
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file and entry.kind != .sym_link) continue;
-        if (!std.mem.startsWith(u8, entry.name, "model") or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-        try shards.append(allocator, try allocator.dupe(u8, entry.name));
-    }
-    std.mem.sort([]const u8, shards.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
-    if (shards.items.len == 0) return error.NoWeightFiles;
-    return shards;
-}
-
-fn freeShardNames(allocator: std.mem.Allocator, shards: *std.ArrayList([]const u8)) void {
-    for (shards.items) |f| allocator.free(f);
-    shards.deinit(allocator);
-}
-
 /// A vision-tower tensor (not a routing bias): what a tower test loads without the trunk.
 pub fn isTowerKey(key: []const u8) bool {
     return isVisionKey(key) and !std.mem.endsWith(u8, key, ".bias_vl");
@@ -88,48 +65,8 @@ pub fn loadTower(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8)
     }.f);
 }
 
-pub fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, ctx: anytype, comptime keep: anytype) !model.Weights {
-    var weights = model.Weights.init(allocator);
-    errdefer weights.deinit();
-    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
-    defer reader.deinit();
-    var shards = try shardNames(io, allocator, dir_path);
-    defer freeShardNames(allocator, &shards);
-
-    for (shards.items) |name| {
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
-        defer allocator.free(path);
-        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
-        defer _ = std.c.close(fd);
-        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
-        defer header.deinit();
-        var tensors = header.parsed.value.object.iterator();
-        while (tensors.next()) |entry| {
-            const key = entry.key_ptr.*;
-            if (std.mem.eql(u8, key, "__metadata__") or !keep(key, ctx)) continue;
-            const read = try model.readSafetensorArray(&reader, fd, &header, entry.value_ptr.*);
-            const value = read.array;
-            var value_owned = true;
-            defer if (value_owned) {
-                _ = mlx.mlx_array_free(value);
-            };
-            // A copied import would put the weight back in MLX's allocator, outside the ledger.
-            if (read.bytes.len >= model.import_min_bytes and read.mapped == null) {
-                log.err("[dsv41-mem] {s}: MLX refused the no-copy import of its {d} bytes\n", .{ key, read.bytes.len });
-                return error.OwnedImportCopied;
-            }
-            const owned = try allocator.dupe(u8, key);
-            var key_owned = true;
-            defer if (key_owned) allocator.free(owned);
-            const gop = try weights.map.getOrPut(owned);
-            if (gop.found_existing) return error.DuplicateTensor;
-            gop.value_ptr.* = value;
-            value_owned = false;
-            key_owned = false;
-        }
-    }
-    log.info("[dsv41] loaded {d} resident tensors from {d} shards\n", .{ weights.count(), shards.items.len });
-    return weights;
+fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, ctx: anytype, comptime keep: anytype) !model.Weights {
+    return weights_where.loadWhere("dsv41", io, allocator, dir_path, ctx, keep);
 }
 
 /// The pack's routed trellis tensors against the `order` its config names, before any weight loads: each is stored

@@ -252,6 +252,9 @@ fn indexRowBytes(width: u64) u64 {
 /// The prefill chunk a load runs at when its bill fits (an explicit `--prefill-chunk` outranks it): with CED the bulk of a
 /// chunk is the encoder's 20 layers, whose experts a wider chunk reads once for more rows.
 pub const prefill_width: u32 = 2048;
+
+/// The MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
+pub const dsv41_pool_bytes: u64 = 1 << 30;
 /// Added to every cap: twice the 0.12 GiB of small tensors and tables a decode forward was measured to hold.
 const cap_slack_bytes: u64 = 256 << 20;
 const score_copies: u64 = 3;

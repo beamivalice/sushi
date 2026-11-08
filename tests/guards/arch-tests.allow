@@ -4,15 +4,10 @@
 --qwen-gdn is what parseConfig reads, on a loaded config; the f32 state is the default; GLM keeps its own gate
 --qwen-gdn takes 16 or 32 and nothing else
 DFlash block tail engages only for the native GLM drafter
-DeepSeek advertises the longest context its own request bill admits
 DeepSeek expert keys round trip and the layout claims only the trunk's experts
-DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024, then 512, never wider
 DeepSeek vision serving: the processor carries the release's budgets, a placeholder expands to the whole span, and its encode is billed
 DeepSeek's image-encode bill, which is also its transient cap, covers a quarter over the measured peak
-DeepSeek's live headroom and its load fit each count the decode pool the ledger parks once
-DeepSeek's request bill takes its prefill working set out of the decoder pools a prefill may release
 DeepSeek-V4.1 serves medium and xhigh as their own words, without a re-route
-DeepSeek: the streamed request bill brackets the prefill peaks measured on the M5 Max
 GLM BF16 individual index recognizes separate gate up down experts
 GLM BF16 stream imports split expert slabs and preserves bytes across cache and union
 GLM DFlash2 reserve at prefill end fits the admission bill at every request shape
@@ -75,7 +70,6 @@ a qwen4_exp SSD restore is credited: its first grow bills one eval window of the
 a qwen4_exp config refusal keeps its own name in the 503 text
 a resident MiMo batches decode in groups of the FP8 GEMV's row-identical width; a streamed one stays serial
 a second GLM admission leaves free the cache growth the first was admitted to allocate
-a streamed DeepSeek bills its workspace at load and no fill peak at load or per request
 a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep theirs
 a streamed GLM bills its fill peak per request and its latent at the KV width plus the pooled index per planned token
 a streamed Qwen plans its QSA history beside its KV for every planned token
@@ -93,7 +87,6 @@ deepseek_v41: the image token spelled in a text-only prompt is text, with no pla
 dflash: GLM rows default to 2..8 and the flags move either end inside them
 dflash: Qwen rows default to 2..block and are bounded by the drafter block and the verify path
 driver: a tiny Qwen source becomes a complete pack, and a second run into it is refused
-dsv41 bills: a prefill holds its restore points beside the state with a RAM tier, and only the writer's in-flight bytes SSD-first (DSV41_TINY)
 dsv41 geometry: the grouped chain at 5120x2304 over n24, n26, n32, n40 and a mixed class holds the f32-truth bar
 dsv41 geometry: the shared expert as a one-expert fused chain gives a row the same bytes at every decode width and holds the f32-truth bar
 dsv41 replay: what the next prompt shares with a generated turn (DeepSeek tokenizer.json)
@@ -246,7 +239,6 @@ thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only th
 thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo folds to on
 thinking policy launch defaults are model-specific and preserve GLM high
 towerFitFault bills a MiMo image by the MiMo-ViT's measured scratch, not score sheets
-with its decoder pools lendable, DeepSeek at --ssd-budget-gb 117 with DSpark on wired 124000 advertises its whole context
 yarn correction range for the qwen4_exp geometry
 yarn inv_freq matches HF _compute_yarn_parameters (qwen4_exp 262k -> 1M)
 zcode starts MiMo thinking, its own default

@@ -7,6 +7,7 @@ const chat_mod = @import("chat.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
+const arch_serve = @import("arch/serve.zig");
 const ModelConfig = model_mod.ModelConfig;
 const VisionEncoder = vision_mod.VisionEncoder;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -386,8 +387,8 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         }
     };
 
-    if (req.model.config) |cfg| @import("dsv41/dsv41_borrow.zig").enterVisionMlx(req.bill_bytes, cfg);
-    defer if (req.model.config) |cfg| @import("dsv41/dsv41_borrow.zig").leaveVisionMlx(cfg);
+    if (req.model.config) |cfg| arch_serve.enterVision(req.bill_bytes, cfg);
+    defer if (req.model.config) |cfg| arch_serve.leaveVision(cfg);
 
     // Encode all soft tokens into `emb_parts`: images and videos in prompt
     // `order`, then audio, so the single splice channel scatters them in the

@@ -8,6 +8,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const think_tags = @import("think_tags.zig");
 const model_mod = @import("model.zig");
+const arch_config = @import("arch/config.zig");
 const effort_mod = @import("effort.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
@@ -801,6 +802,7 @@ test "--max-tokens is the omitted-field default: unset is byte-identical, set wi
 }
 
 test "an omitted max_tokens: --max-tokens, else the architecture's own default, else the window" {
+    if (arch_config.ofConfigType("deepseek_v41") == null) return error.SkipZigTest;
     const t = std.testing;
     const sentinel = std.math.maxInt(u32) / 4;
     // DeepSeek with no flag: its own 256,000, in every arm that is not the flag's.
@@ -829,7 +831,7 @@ test "an omitted max_tokens: --max-tokens, else the architecture's own default, 
     const orig = slot.*;
     defer slot.* = orig;
     slot.* = 0;
-    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .pinned_context = 1_000_000, .serve_defaults = @import("dsv41/dsv41_config.zig").Config.serveDefaults(model_mod.ServeDefaults) };
+    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .pinned_context = 1_000_000, .serve_defaults = arch_config.releaseServeDefaults("dsv41") };
     var qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp", .pinned_context = 1_000_000 };
     try t.expectEqual(@as(u32, 256_000), omittedMaxTokensDefault(&dsv41));
     try t.expectEqual(@as(u32, sentinel), omittedMaxTokensDefault(&qwen));
@@ -841,12 +843,13 @@ test "an omitted max_tokens: --max-tokens, else the architecture's own default, 
 }
 
 test "an omitted max_tokens: --max-tokens, else the model's max_tokens setting, else the architecture's default, else the window" {
+    if (arch_config.ofConfigType("deepseek_v41") == null) return error.SkipZigTest;
     const t = std.testing;
     const slot = &@field(server_state.server_config, "default_max_tokens");
     const orig = slot.*;
     defer slot.* = orig;
     slot.* = 0;
-    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .pinned_context = 1_000_000, .serve_defaults = @import("dsv41/dsv41_config.zig").Config.serveDefaults(model_mod.ServeDefaults) };
+    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .pinned_context = 1_000_000, .serve_defaults = arch_config.releaseServeDefaults("dsv41") };
     var qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp", .pinned_context = 1_000_000 };
     dsv41.max_tokens_override = 50_000;
     qwen.max_tokens_override = 12_000;

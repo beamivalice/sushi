@@ -3,10 +3,15 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const flags = @import("../arch/flags.zig");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("../expert_usage.zig");
 const repack = @import("repack.zig");
 const borrow = @import("dsv41_borrow.zig");
-const bills = @import("../bills.zig");
+const dsv41_bill = @import("dsv41_bill.zig");
+const dspark_rows = @import("../dspark_rows.zig");
+const source = @import("dsv41_source.zig");
+const arch_serve = @import("../arch/serve.zig");
+const depth_bounds = @import("../mtp_depth_bounds.zig");
+const log = @import("../log.zig");
 
 pub const options = [_]flags.Option{
     .{ .name = "--drop-expert", .takes_value = true, .apply = setDropExpert, .expected = "expected a multiple of 8 routed experts per layer (0 = off)" },
@@ -56,12 +61,42 @@ pub const settings_kv_quant_ignored = "model-settings.json kv_quant is ignored o
 pub const serve = struct {
     /// The borrow pool sizes itself against the engine's headroom and the MLX pool cap.
     pub fn install(pool_ram_cap: u64) void {
-        borrow.headroom_fn = &bills.dsv41Headroom;
+        borrow.headroom_fn = &dsv41_bill.dsv41Headroom;
         borrow.pool_ram_cap = pool_ram_cap;
     }
     pub fn uninstall() void {
         borrow.headroom_fn = null;
         borrow.pool_ram_cap = 0;
+    }
+    pub fn poolCapped(prev: u64) void {
+        borrow.poolCapped(prev);
+    }
+    pub fn unloadModel(config: *const model.ModelConfig) void {
+        borrow.unloadModelMlx(config);
+    }
+    pub fn enterVision(bill: u64, config: *const model.ModelConfig) void {
+        borrow.enterVisionMlx(bill, config);
+    }
+    pub fn leaveVision(config: *const model.ModelConfig) void {
+        borrow.leaveVisionMlx(config);
+    }
+    pub fn plannedBorrowBytes(config: *const model.ModelConfig, exl3: bool, cache_bytes: u64) u64 {
+        const c = config.dsv41 orelse return 0;
+        return borrow.plannedBytes(&c, exl3, cache_bytes);
+    }
+    pub fn loadLines(config: *const model.ModelConfig, ctx: arch_serve.LoadLog) void {
+        const c = config.dsv41 orelse return;
+        log.info("[dsv41] {d} bytes/token of compressed state\n", .{config.kvBytesPerToken()});
+        if (config.dsparkOn()) {
+            log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s})\n", .{ c.n_mtp, c.dspark.block, ctx.mtp_source });
+            if (depth_bounds.active.explicit()) {
+                const range = dspark_rows.Range.of(depth_bounds.active, c.dspark.block);
+                log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth{s})\n", .{ range.min_rows, range.max_rows, if (range.clamped) "; a depth past the block clamps to it" else "" });
+            }
+        } else {
+            const why: []const u8 = if (c.dspark.block == 0 or !source.shipsDspark(ctx.io, ctx.allocator, ctx.model_dir)) "no DSpark stages in this checkpoint" else "--no-mtp or model-settings mtp:false";
+            log.info("[spec] DeepSeek-V4.1-Flash decodes with plain ticks ({s})\n", .{why});
+        }
     }
 };
 

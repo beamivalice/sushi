@@ -10,7 +10,6 @@ const generate_mod = @import("generate.zig");
 const drafter_mod = @import("arch/drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
-const dspark_rows = @import("dsv41/dspark_rows.zig");
 const chip_mod = @import("chip.zig");
 const model_mod = @import("model.zig");
 const admission = @import("arch/admission.zig");
@@ -18,6 +17,7 @@ const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const prefix_arch = @import("arch/prefix.zig");
+const arch_serve = @import("arch/serve.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const disk_placement = @import("disk_placement.zig");
@@ -39,7 +39,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
 const round_cost_mod = @import("round_cost.zig");
 const expert_stream_mod = @import("expert_stream.zig");
-const expert_usage = @import("dsv41/expert_usage.zig");
+const expert_usage = @import("expert_usage.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -246,11 +246,33 @@ pub fn mtpStreamingVerdict(choice: model_settings.MtpChoice, head_supported: boo
     return expert_stream_mod.mtpUnderStreaming(choice.on, choice.source == .model_settings, choice.source == .default, head_supported);
 }
 
+/// The layouts whose experts stream beside a resident drafting head; the pack's own head is read from disk only after this.
+fn headLayoutSupported(config: *const ModelConfig, layout: expert_stream_mod.quant.Layout) bool {
+    return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), layout);
+}
+
 pub fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) bool {
     const geometry = config.expertGeometry();
     const layout = expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer) catch return false;
-    if (config.isDsv41() and !@import("dsv41/dsv41_source.zig").shipsDspark(io, allocator, model_dir)) return false;
-    return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), layout);
+    if (!headLayoutSupported(config, layout)) return false;
+    return arch_load.shipsHead(io, allocator, config, model_dir) orelse true;
+}
+
+test "a drafting head streams beside the experts only for the layouts its arch reads" {
+    const rows = [_]struct { model_type: []const u8, exl3: bool, mxfp4_w123: bool }{
+        .{ .model_type = "qwen4_exp", .exl3 = true, .mxfp4_w123 = false },
+        .{ .model_type = "deepseek_v41", .exl3 = true, .mxfp4_w123 = true },
+        .{ .model_type = "mimo_v2", .exl3 = false, .mxfp4_w123 = false },
+        .{ .model_type = "glm5_next", .exl3 = false, .mxfp4_w123 = false },
+    };
+    for (rows) |r| {
+        if (@import("arch/registry.zig").ofModelType(r.model_type) == null) continue;
+        const config = ModelConfig{ .model_type = r.model_type };
+        for (std.enums.values(expert_stream_mod.quant.Layout)) |layout| {
+            const want = (layout == .exl3_k4 and r.exl3) or (layout == .mxfp4_w123 and r.mxfp4_w123);
+            try testing.expectEqual(want, headLayoutSupported(&config, layout));
+        }
+    }
 }
 
 /// Does the pack in `model_dir` ship the head its arch drafts with: Flash-Next's MTP head, MiMo's heads, DeepSeek's DSpark stages?
@@ -258,7 +280,6 @@ pub fn packShipsMtpHead(io: std.Io, allocator: std.mem.Allocator, model_type: []
     const probe = ModelConfig{ .model_type = model_type };
     if (probe.isQwen4()) return model_discovery.readStubMeta(io, allocator, model_dir).has_mtp;
     if (arch_load.shipsHead(io, allocator, &probe, model_dir)) |ships| return ships;
-    if (probe.isDsv41()) return @import("dsv41/dsv41_source.zig").shipsDspark(io, allocator, model_dir);
     return false;
 }
 
@@ -613,7 +634,7 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
     }
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
     split.trunk +|= coarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry) +| assistant_bytes +|
-        (if (streamed.dsv41) |c| @import("dsv41/dsv41_engram.zig").cacheBytes(c.engram) else 0);
+        admission.streamedResidentExtra(&streamed);
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
     const bill = expert_stream_mod.expertBillFor(allocator, model_dir, geometry, streamed.expert_layout) catch |err| {
@@ -686,7 +707,7 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
     config.expert_bounce_bytes = plan.cache.bounce_bytes;
     config.expert_fill_peak_bytes = billedFillPeakBytes(config, plan.cache.prefill_peak_bytes);
-    config.expert_borrow_bytes = if (config.dsv41) |c| @import("dsv41/dsv41_borrow.zig").plannedBytes(&c, plan.layout == .exl3_k4, plan.cache.cache_bytes) else 0;
+    config.expert_borrow_bytes = arch_serve.plannedBorrowBytes(config, plan.layout == .exl3_k4, plan.cache.cache_bytes);
     config.expert_vision_tower_bytes = plan.split.vision;
     config.expert_vision_encode_bytes = if (plan.vision.on) plan.vision.encode_bytes else 0;
 }
@@ -1719,20 +1740,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (greedy_tail.value) "on" else "off",        settings_resolve.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
     });
     const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5() and !params.config.isDsv41();
-    if (params.config.isDsv41()) {
-        const c = &params.config.dsv41.?;
-        log.info("[dsv41] {d} bytes/token of compressed state\n", .{params.config.kvBytesPerToken()});
-        if (params.config.dsparkOn()) {
-            log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s})\n", .{ c.n_mtp, c.dspark.block, mtp.sourceName() });
-            if (depth_bounds.active.explicit()) {
-                const range = dspark_rows.Range.of(depth_bounds.active, c.dspark.block);
-                log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth{s})\n", .{ range.min_rows, range.max_rows, if (range.clamped) "; a depth past the block clamps to it" else "" });
-            }
-        } else {
-            const why: []const u8 = if (c.dspark.block == 0 or !@import("dsv41/dsv41_source.zig").shipsDspark(sch.io, sch.allocator, params.model_dir)) "no DSpark stages in this checkpoint" else "--no-mtp or model-settings mtp:false";
-            log.info("[spec] DeepSeek-V4.1-Flash decodes with plain ticks ({s})\n", .{why});
-        }
-    }
+    arch_serve.loadLines(params.config, .{ .io = sch.io, .allocator = sch.allocator, .model_dir = params.model_dir, .mtp_source = mtp.sourceName() });
     if (params.config.isGlm5()) {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", bills.kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
@@ -2259,18 +2267,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk = tier;
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .oldest;
-            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isDsv41())
-                @import("dsv41/dsv41_prefix.zig").disk_checkpoint_cap
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (prefix_arch.diskCheckpointCap(params.config)) |cap|
+                cap
             else if (params.config.isGlm5() or params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
-            if (params.config.dsv41) |c| {
-                const dsv41_pfx = @import("dsv41/dsv41_prefix.zig");
-                const divs = try dsv41_pfx.rowDivisors(sch.allocator, &c, params.config.dsparkOn());
-                defer sch.allocator.free(divs);
-                try entry.prefix_cache.?.disk.?.setGrownSpec(dsv41_pfx.row_span, divs, c.stateBytesPerToken());
-            }
+            try prefix_arch.setDiskGrownSpec(sch.allocator, params.config, &entry.prefix_cache.?.disk.?);
         }
         // SSD-first: arch + env switch + a live disk tier (attached above); without one qwen4_exp takes the RAM arm.
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
@@ -2291,10 +2294,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         const cp_max = if (params.config.isGlm5())
             @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
-        else if (params.config.isDsv41())
-            @import("dsv41/dsv41_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
         else
-            params.ssm_checkpoint_max;
+            prefix_arch.checkpointMax(params.config, params.ssm_checkpoint_max);
         entry.ssm_checkpoint_max = cp_max;
         // The cache re-applies the cap after a replace-path merge; without this
         // it defaults to 0 (unlimited) and multi-turn entries grow unbounded.
@@ -2372,7 +2373,7 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
             @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
         victim.unloadResident();
-        if (victim.config) |c| @import("dsv41/dsv41_borrow.zig").unloadModelMlx(c);
+        if (victim.config) |c| arch_serve.unloadModel(c);
         evicted_bytes +|= victim_bytes;
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
@@ -2449,7 +2450,7 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     const wired_before = status.getWiredMemBytes();
     scheduler_mod.flushLiveState(entry, "unload");
     entry.unloadResident();
-    if (entry.config) |c| @import("dsv41/dsv41_borrow.zig").unloadModelMlx(c);
+    if (entry.config) |c| arch_serve.unloadModel(c);
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
     // of the load→generate→unload flow).

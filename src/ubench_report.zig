@@ -24,6 +24,14 @@ pub const Unit = enum {
 pub const Axis = struct { name: []const u8, values: []const []const u8, numeric: bool = true };
 pub const Opt = struct { name: []const u8, help: []const u8 };
 
+/// The first bench name a list carries twice, null when each is named once.
+pub fn duplicateName(benches: []const Bench) ?[]const u8 {
+    for (benches, 0..) |b, i| {
+        for (benches[i + 1 ..]) |other| if (std.mem.eql(u8, b.name, other.name)) return b.name;
+    }
+    return null;
+}
+
 pub const Bench = struct {
     /// `<scope>.<name>`.
     name: []const u8,
@@ -871,4 +879,10 @@ test "ubench time: the file stamp and the header stamp" {
     const human = try formatTime(a, 1793282520, true);
     defer a.free(human);
     try testing.expectEqualStrings("2026-10-29 14:02 UTC", human);
+}
+
+test "a bench list names each bench once" {
+    try std.testing.expectEqual(@as(?[]const u8, null), duplicateName(&fake_registry));
+    const twice = fake_registry ++ [_]Bench{fake_registry[0]};
+    try std.testing.expectEqualStrings("dsv41.experts", duplicateName(&twice).?);
 }

@@ -9,6 +9,7 @@ pub const head_kind: spec_types.Kind = .dspark;
 
 pub const rounds = @import("dsv41_dspark.zig");
 pub const nextDspark = rounds.nextDspark;
+pub const dspark_rounds = rounds;
 
 /// The DSpark stages and their windows live on the model's own state, so a request that drafts with them holds the
 /// model exclusively (`ownsModuleDecodeState`).

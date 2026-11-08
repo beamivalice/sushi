@@ -16,6 +16,7 @@ const arch_flags = @import("arch/flags.zig");
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
 const model_mod = @import("model.zig");
+const arch_config = @import("arch/config.zig");
 const model_load = @import("model_load.zig");
 const models_api = @import("models_api.zig");
 const expert_stream = @import("expert_stream.zig");
@@ -1177,10 +1178,11 @@ test "settings api: render reports the file's value, the pinning flag and the wi
 }
 
 test "settings api: a ready model reports the default each key resolves to; an unloaded one reports none" {
+    if (arch_config.ofConfigType("deepseek_v41") == null) return error.SkipZigTest;
     var file = try model_settings.parse(testing.allocator, "{}");
     defer file.deinit();
     const locks: model_settings.LaunchLocks = .{};
-    const dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 1_048_576, .serve_defaults = @import("dsv41/dsv41_config.zig").Config.serveDefaults(model_mod.ServeDefaults) };
+    const dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 1_048_576, .serve_defaults = arch_config.releaseServeDefaults("dsv41") };
     const rows = [_]ModelRow{
         .{ .id = "ready", .path = "/m/a", .state = "ready", .bytes = 5, .defaults = resolvedDefaults(&dsv41) },
         .{ .id = "cold", .path = "/m/b", .state = "unloaded", .bytes = 5 },

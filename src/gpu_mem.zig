@@ -1,6 +1,6 @@
 //! The live GPU readings behind the bill: MLX's own counters and Metal's working-set limit.
 const std = @import("std");
-const dsv41_borrow = @import("dsv41/dsv41_borrow.zig");
+const arch_serve = @import("arch/serve.zig");
 const log = @import("log.zig");
 const metrics = @import("status.zig");
 const mlx = @import("mlx.zig");
@@ -124,6 +124,6 @@ pub fn capMlxPool(bytes: u64) void {
         _ = mlx.mlx_set_cache_limit(&tmp, prev);
         return;
     }
-    dsv41_borrow.poolCapped(prev);
+    arch_serve.poolCapped(prev);
     log.info("[mem] MLX buffer-pool cap {d} MB from the ssd-budget ledger (was {d} MB)\n", .{ bytes >> 20, prev >> 20 });
 }

@@ -12,7 +12,6 @@ pub const log = @import("log.zig");
 pub const report = @import("ubench_report.zig");
 const box = @import("bench_box.zig");
 const exl3_ubench = @import("sushi_exl3_ubench").ubench;
-const dsv_benches = @import("dsv41/ubench.zig");
 const glm5 = @import("ubench_glm5.zig");
 const shared = @import("ubench_shared.zig");
 const encoder = @import("sushi_encoder");
@@ -31,7 +30,7 @@ const registry = [_]report.Bench{
     exl3_ubench.dsv41_experts,
     exl3_ubench.dsv41_tail_routed,
     exl3_ubench.dsv41_shared_prefill,
-} ++ dsv_benches.benches ++ [_]report.Bench{
+} ++ arch_benches ++ [_]report.Bench{
     exl3_ubench.decode_chain,
     exl3_ubench.grouped_decode,
     exl3_ubench.moe_layer,
@@ -39,12 +38,17 @@ const registry = [_]report.Bench{
     exl3_ubench.trunk_rows,
     exl3_ubench.trunk_launches,
     exl3_ubench.routed_t1,
-} ++ arch_benches ++ [_]report.Bench{
+} ++ [_]report.Bench{
     exl3_ubench.exl3_rate_groups,
     exl3_ubench.exl3_rate_groups_rows,
     encoder.ubench.factor,
     encoder.ubench.search,
 } ++ glm5.benches ++ shared.benches;
+
+comptime {
+    @setEvalBranchQuota(100_000);
+    if (report.duplicateName(&registry)) |name| @compileError("the bench registry lists " ++ name ++ " twice");
+}
 
 const exit_bad_args = 2;
 const exit_refused = 3;

@@ -11,7 +11,17 @@ pub const ExpertStreamTraits = struct {
     prefetch: bool = false,
     /// The expert slabs are read tile-major.
     tile_major: bool = false,
+    /// The routed experts are STQ rate groups, which the prefetcher reads.
+    stq_experts: bool = false,
 };
+
+/// Bytes a streamed load keeps resident beside the trunk that only the arch knows of; 0 where it has none.
+pub fn streamedResidentExtra(config: *const model.ModelConfig) u64 {
+    const s = spec.of(config) orelse return 0;
+    return switch (s) {
+        inline else => |c, t| if (@hasDecl(registry.Mod(t), "streamedResidentExtra")) registry.Mod(t).streamedResidentExtra(c) else 0,
+    };
+}
 
 /// A config no enabled arch claims streams plain, with no drop.
 pub fn expertStream(config: *const model.ModelConfig) ExpertStreamTraits {

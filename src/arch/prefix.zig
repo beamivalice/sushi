@@ -246,6 +246,46 @@ pub fn checkpointsRequired(config: *const model.ModelConfig) bool {
     }
 }
 
+/// Whether the loaded model's whole request state is checkpointed as restore points rather than SSM entries, and its
+/// prefill reads the next chunk's rows ahead.
+pub fn restorePointModel(xfm: *trunk.Trunk) bool {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| return if (comptime @hasDecl(P(t), "restorePointModel")) P(t).restorePointModel(m) else false,
+    }
+}
+
+/// A prefill checkpoint of a restore-point model at `pos`; `to_ssd` says a write-through takes it before the next
+/// forward, so the arch may share its rows. Null for a model that checkpoints by other means.
+pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *trunk.Trunk, pos: usize, to_ssd: bool) !?trunk.SSMCheckpoint {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| return if (comptime @hasDecl(P(t), "captureCheckpoint")) try P(t).captureCheckpoint(allocator, m, pos, to_ssd) else null,
+    }
+}
+
+/// Checkpoints one RAM entry or one prefill keeps in memory, when the arch caps them below the launch value `global`.
+pub fn checkpointMax(config: *const model.ModelConfig, global: u32) u32 {
+    const tag = registry.ofModelType(config.model_type) orelse return global;
+    switch (tag) {
+        inline else => |t| return if (comptime @hasDecl(P(t), "checkpointMax")) P(t).checkpointMax(global) else global,
+    }
+}
+
+/// The most restore points one SSD entry keeps, when the arch states a cap.
+pub fn diskCheckpointCap(config: *const model.ModelConfig) ?u32 {
+    const tag = registry.ofModelType(config.model_type) orelse return null;
+    switch (tag) {
+        inline else => |t| return if (comptime @hasDecl(P(t), "disk_checkpoint_cap")) P(t).disk_checkpoint_cap else null,
+    }
+}
+
+/// Tells the SSD tier how the arch's restore points split into rows that grow with the prompt and fixed arrays.
+pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const model.ModelConfig, tier: *kv_disk_cache.DiskTier) !void {
+    const tag = registry.ofModelType(config.model_type) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime @hasDecl(P(t), "setDiskGrownSpec")) try P(t).setDiskGrownSpec(allocator, config, tier),
+    }
+}
+
 /// The stored-state layout the SSD namespace is keyed by, when the loaded arch names more than the config's own tag.
 pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const model.ModelConfig, model_dir: []const u8, xfm: *trunk.Trunk) !?[]u8 {
     switch (registry.handleOf(xfm)) {

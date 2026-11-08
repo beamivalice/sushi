@@ -13,7 +13,6 @@ const arch_life = @import("arch/life.zig");
 const arch_request = @import("arch/request.zig");
 const arch_registry = @import("arch/registry.zig");
 const arch_state = @import("arch/arch_state.zig");
-const dsv41_state = @import("dsv41/dsv41_state.zig");
 
 // ── Forward context ──
 //
@@ -161,8 +160,6 @@ pub fn moduleSpecWiring(self: *const Trunk) bool {
 /// its rings and compressed caches have no per-position capture, and it
 /// has DSpark for drafting anyway.
 pub fn moduleStateSpecRollback(self: *const Trunk) bool {
-    // deepseek_v41 cuts its own rows back to the accepted prefix (`dsv41_model.finishVerify`).
-    if (dsv41_state.modelOf(self)) |m| return m.dspark != null;
     return arch_state.specRollsBack(&self.arch_state);
 }
 

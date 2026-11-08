@@ -134,7 +134,7 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .serves_mtp = !latent,
         .streaming_required = config.expertStreamingRequired(),
         .head_streams = expert_stream.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), config.expert_layout),
-        .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false,
+        .stq_experts = admission.expertStream(config).stq_experts,
         .prefetch = admission.expertStream(config).prefetch,
         .kv_choices = kvQuantChoices(config),
         .context_cap = config.contextCap(),

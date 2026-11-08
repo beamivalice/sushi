@@ -1909,17 +1909,6 @@ test "the reserve a streamed load keeps for the largest image is pinned per towe
     try std.testing.expectEqual(@as(u64, 123627508), largestImageEncodeBytes(&dsv));
 }
 
-test "a tower config without a vision block reserves the pixel-cap image, not a token budget it does not have" {
-    var cfg = arch_media.testConfig("deepseek_v41") orelse return;
-    cfg.dsv41.?.vision = null;
-    const vp = visionPreprocFromConfig(&cfg);
-    try std.testing.expectEqual(.gemma, vp.mode);
-    const patches: u64 = vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / (@as(u64, vp.patch) * vp.patch);
-    const img = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
-    const want = visionEncodeBill(&cfg, &img, &.{}, @intCast(patches / (vp.merge * vp.merge))).bytes;
-    try std.testing.expectEqual(want, largestImageEncodeBytes(&cfg));
-}
-
 test {
     _ = arch_media;
 }

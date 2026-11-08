@@ -233,7 +233,7 @@ fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xf
     sch.decoding = .empty;
     model.id = "org/dsv41-cull";
     model.prefix_cache = null;
-    model.handle = arch_handle.handleOf(xfm);
+    model.handle = arch_handle.fixtureHandle(xfm);
     slot.model = model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;

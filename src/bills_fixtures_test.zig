@@ -3,7 +3,6 @@ const std = @import("std");
 const arch_config = @import("arch/config.zig");
 const model_mod = @import("model.zig");
 const nax_gate = @import("nax_gate.zig");
-const dsv41_config = @import("dsv41/dsv41_config.zig");
 const qwen4_qsa_select = @import("qwen4/qwen4_qsa_select.zig");
 const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
 const bills = @import("bills.zig");
@@ -206,8 +205,8 @@ pub const PinFx = struct {
         var glm = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/glm5_config.json"));
         errdefer glm.deinit(a);
         var dsv = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-        dsv.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-        dsv.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+        dsv.dsv41 = try arch_config.releaseOwn("dsv41");
+        dsv.serve_defaults = arch_config.releaseServeDefaults("dsv41");
         dsv.max_position_embeddings = 1_048_576;
         // Pinned as a load pins them: unpinned, the bills read the live GPU.
         for ([_]*PinCfg{ &qwen, &mimo, &glm, &dsv }) |c| {

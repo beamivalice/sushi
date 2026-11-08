@@ -7,7 +7,7 @@ const arch_handle = @import("../arch/handle.zig");
 const mlx = @import("../mlx.zig");
 const transformer = @import("../trunk.zig");
 const model = @import("dsv41_model.zig");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("../expert_usage.zig");
 const testing = std.testing;
 const KVCache = transformer.KVCache;
 const SSMCheckpoint = transformer.SSMCheckpoint;
@@ -18,6 +18,7 @@ const log = @import("../log.zig");
 const pc = @import("../prefix_cache.zig");
 const kv_quant = @import("../kv_quant.zig");
 const prefix_arch = @import("../arch/prefix.zig");
+const dsv41_state = @import("dsv41_state.zig");
 
 /// The model whose request state a lookup restores into.
 pub const State = *dsv41_model.Model;
@@ -312,6 +313,23 @@ pub const row_span: u32 = 8192;
 /// Restore points one SSD entry keeps: the `row_span` grid out to a million tokens, with room for the prompt-end
 /// and thought points of earlier turns. A point holds only its fixed arrays, so the cap bills a few MB apiece.
 pub const disk_checkpoint_cap: u32 = 160;
+
+pub fn restorePointModel(xfm: *const transformer.Trunk) bool {
+    return dsv41_state.modelOf(xfm) != null;
+}
+
+pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *transformer.Trunk, pos: usize, to_ssd: bool) !?SSMCheckpoint {
+    const m = dsv41_state.modelOf(xfm) orelse return null;
+    return if (to_ssd and pos >= kv_disk_cache.MIN_PERSIST_TOKENS) try captureShared(allocator, m, pos) else try capture(allocator, m, pos);
+}
+
+/// Gives the SSD tier this model's split of its restore points.
+pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, disk: *kv_disk_cache.DiskTier) !void {
+    const c = config.dsv41 orelse return;
+    const divs = try rowDivisors(allocator, &c, config.dsparkOn());
+    defer allocator.free(divs);
+    try disk.setGrownSpec(row_span, divs, c.stateBytesPerToken());
+}
 
 /// SSD bytes one cached token adds to an entry: its rows once, and its share of the fixed arrays of the restore
 /// point on each `row_span`.

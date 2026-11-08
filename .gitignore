@@ -12,6 +12,7 @@ zig-out/
 # WEIGHTS out; src/fixtures holds a 1.8 MB toy-geometry parity fixture, and a
 # test that silently skips because its fixture is untracked protects nothing.
 !src/fixtures/*.safetensors
+!src/*/fixtures/*.safetensors
 
 # mlx + mlx-c, built from the pinned submodules by scripts/build-mlx.sh
 # (lib/mlx-src + lib/mlxc-src are the vendored sources; these are outputs)

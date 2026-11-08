@@ -4,6 +4,7 @@ const settings_resolve = @import("../settings_resolve.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
+const gpu_mem = @import("../gpu_mem.zig");
 const dsv41_config = @import("dsv41_config.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const generate_mod = @import("../generate.zig");
@@ -38,7 +39,7 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
     const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
     // The transient cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder
     // pools it may release (`dsv41_borrow`); a decode forward's never does. The decode pool is parked beside either.
-    const work = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCap(chunk, seq) -| bills.dsv41BorrowableBytes(config)) +| config.expertPoolBytes();
+    const work = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCap(chunk, seq) -| bills.borrowableBytes(config)) +| config.expertPoolBytes();
     return (held +| checkpointReserve(config, seq, chunk)) *| 5 / 4 +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
@@ -78,3 +79,24 @@ pub fn memoryContext(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling
     return bills.maxSushiContextUpTo(config, upper, kv_bits, bills.admissionAvailable(ceiling, active_mem) -| bills.ctxCacheShare(ceiling, active_mem, bills.ctxSizingCacheReserve(config)), chunk, .{});
 }
 
+
+/// The width line of the load log: DeepSeek starts at its own prefill width and says when memory sized it down.
+pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pinned: u32, launch: usize) ?[]const u8 {
+    _ = config;
+    if (launch <= dsv41_config.prefill_width) return null;
+    if (pinned == dsv41_config.prefill_width)
+        return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (DeepSeek's default width; --prefill-chunk overrides)\n", .{pinned}) catch null;
+    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, dsv41_config.prefill_width }) catch null;
+}
+
+/// `dsv41_borrow.headroom_fn`: what admission reads as available, live.
+pub fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
+    const active_mem: usize = gpu_mem.activeBytes();
+    return dsv41HeadroomOf(bills.admissionAvailable(bills.currentGpuMemoryCeiling(config, active_mem), active_mem), config);
+}
+
+/// The decode pool the ledger parks in MLX's cache is no part of its active bytes, so every live check (decode and
+/// prefill width) takes it off here once; `prefillNeededAtChunk` bills it once for the same reason.
+pub fn dsv41HeadroomOf(available: u64, config: *const model_mod.ModelConfig) u64 {
+    return available -| config.expertPoolBytes();
+}

@@ -1,15 +1,39 @@
-//! DeepSeek-V4.1 DSpark verify width: how many of a drafted block's rows a round verifies, and when a request
-//! stops drafting. Pure data, no MLX.
+//! DSpark verify width: how many of a drafted block's rows a round verifies, and when a request stops drafting. Pure
+//! data, no MLX; the generator's DSpark state is typed by it, the rounds themselves are the drafting arch's.
 //!
 //! The row choice and the confidence calibration are `dflash_policy`'s, the stop switch is `spec_cost_gate`'s.
 //! DSpark's own part is the price of a verify, which grows with context and with every added row (each row's routed
 //! experts are their own GEMVs), so it is fitted from the rounds the request runs.
 const std = @import("std");
-const dflash_policy = @import("../dflash_policy.zig");
-const spec_cost_gate = @import("../spec_cost_gate.zig");
-const depth_bounds = @import("../mtp_depth_bounds.zig");
+const dflash_policy = @import("dflash_policy.zig");
+const spec_cost_gate = @import("spec_cost_gate.zig");
+const depth_bounds = @import("mtp_depth_bounds.zig");
+const mtp_plan = @import("mtp_plan.zig");
+const sampler = @import("sampler.zig");
 
 const max_rows = dflash_policy.MAX_ROWS;
+
+/// Drafts a sampled DSpark round can verify, with room past a stage block.
+pub const max_drafts = 16;
+
+/// Forces the verify width of a request's rounds (the arch's diagnostic switch, and the tests).
+pub const Diag = union(enum) { off, log, sweep, rows: u8 };
+
+/// How a forced commit leaves a DSpark request.
+pub const Resume = union(enum) {
+    /// The slot decodes plain: not a DSpark slot, DSpark already off, or a grammar owns the ticks.
+    refused,
+    stopped,
+    /// The closer `commitForcedTokens` left pending, published now: DSpark rounds follow.
+    resumed: u32,
+};
+
+/// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the
+/// rows as in an MTP round, and a thinking bound fires between rounds (`thinkBoundTick`), after which the request
+/// decodes serially.
+pub fn eligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool {
+    return !mtp_plan.mtpUnsupported(sampling, logprobs_n);
+}
 
 /// Verify ms: `plain_ms` for the one-row step and `step_ms` for each row added to it (the decode kernels and the routed
 /// experts both scale with rows from one row up). Each estimate moves by a bounded share per sample, so a cold
@@ -98,7 +122,7 @@ pub const Policy = struct {
     const max_period: u32 = 16;
     const edge_start: f32 = 10;
     const edge_keep: f32 = 0.8;
-    /// The checkpoint's block (`dspark_block_size`) when a caller does not say.
+    /// The drafts a stage block holds when a caller does not say.
     const default_block: u32 = 5;
 
     pub fn init(bounds: depth_bounds.Bounds, block_drafts: u32) Policy {
@@ -279,7 +303,7 @@ test "dspark rows: a request whose drafts never pay is sent to plain steps, and 
 }
 
 // Verify ms by forced rows on the shipped STQ pack after the routed chain is queued from the GPU cache map
-// (median of a `SUSHI_DSV41_DSPARK_ROWS=sweep` run), and the draft ms of the same run.
+// (median of a forced-width sweep run), and the draft ms of the same run.
 const verify_table = [_]f32{ 0, 24.9, 36.4, 44.0, 53.5, 61.9, 68.2, 76.0, 84.9 };
 const table_draft_ms: f32 = 5.5;
 
