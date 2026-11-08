@@ -18,6 +18,8 @@ const log = @import("log.zig");
 const trunk_stq = @import("trunk_stq.zig");
 const Linear = @import("linear.zig").Linear;
 const Transformer = transformer_mod.Transformer;
+const arch_state = @import("arch/arch_state.zig");
+const qwen4_state = @import("qwen4/qwen4_state.zig");
 const expert_quant = @import("expert_quant.zig");
 
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
@@ -205,14 +207,15 @@ test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" 
     defer Transformer.mtp_head_kv_quant_flag = old_kv_flag;
     Transformer.mtp_head_kv_quant_flag = true;
     try xfm.cache.reinit(config.num_hidden_layers, transformer_mod.KVQuantConfig.affine(8));
-    try xfm.qwen4MtpApplyKvQuant(transformer_mod.KVQuantConfig.affine(8));
-    try testing.expect(xfm.qwen4BuildDraftRerank());
+    try arch_state.applyHeadKvQuant(&xfm, transformer_mod.KVQuantConfig.affine(8));
+    try testing.expect(arch_state.buildDraftRerank(&xfm));
     try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_mixed_4_8_gs64, qwen4G17CostProfile(&xfm));
     try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, transformer_mod.KVQuantConfig.dense));
     try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, transformer_mod.KVQuantConfig.affine(4)));
-    const old_bias = xfm.qwen4_mtp.?.fc_emb_b;
-    defer xfm.qwen4_mtp.?.fc_emb_b = old_bias;
-    xfm.qwen4_mtp.?.fc_emb_b = .{};
+    const head = qwen4_state.mtpOf(&xfm).?;
+    const old_bias = head.fc_emb_b;
+    defer head.fc_emb_b = old_bias;
+    head.fc_emb_b = .{};
     try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfile(&xfm));
 }
 
@@ -256,16 +259,17 @@ fn qwen4MixedLayerMatches(layer: anytype) bool {
 }
 
 fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
-    if (target.qwen4 == null or target.qwen4_stream_f32 or target.config.quant_mode != .affine or target.config.quant_group_size != 64) return false;
+    const q4 = qwen4_state.stateOfConst(target) orelse return false;
+    if (q4.model == null or q4.stream_f32 or target.config.quant_mode != .affine or target.config.quant_group_size != 64) return false;
     const cfg = &target.config;
     if (cfg.linear_key_head_dim != 128 or cfg.linear_value_head_dim != 128 or cfg.linear_num_key_heads != 16 or
         cfg.linear_num_value_heads != 48 or cfg.linear_conv_kernel_dim != 4 or cfg.ple_embed_dim != 2560) return false;
-    const head = target.qwen4_mtp orelse return false;
+    const head = if (q4.mtp) |*h| h else return false;
     if (!qwen4MixedPackMatches(target.emb_w, target.emb_s, target.emb_b, &.{ 248320, 2560 }, 4) or
         !qwen4MixedPackMatches(target.lm_head_w, target.lm_head_s, target.lm_head_b, &.{ 248320, 2560 }, 8) or
         !qwen4MixedPackMatches(head.fc_emb_w, head.fc_emb_s, head.fc_emb_b, &.{ 2560, 2560 }, 8) or
         !qwen4MixedPackMatches(head.fc_hid_w, head.fc_hid_s, head.fc_hid_b, &.{ 2560, 2560 }, 8)) return false;
-    if (!qwen4MixedHcMatches(target.qwen4_mixer orelse return false) or !qwen4MixedHcMatches(head.mixer) or
+    if (!qwen4MixedHcMatches(q4.mixer orelse return false) or !qwen4MixedHcMatches(head.mixer) or
         head.layer.is_linear or !qwen4MixedLayerMatches(&head.layer)) return false;
     const layers = target.moe_layers orelse return false;
     if (layers.len != 48) return false;
@@ -288,7 +292,7 @@ pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
 /// override. The original all-4-bit classifier retains its existing scope.
 pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.KVQuantConfig) MtpCostProfile {
     if (target.config.expert_layout == .exl3_k4) return .generic;
-    const head = if (target.qwen4_mtp) |*h| h else return .generic;
+    const head = qwen4_state.mtpOfConst(target) orelse return .generic;
     const cfg = &target.config;
     const geometry = Qwen4MixedGeometry{
         .hidden = cfg.hidden_size,

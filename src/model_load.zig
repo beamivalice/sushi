@@ -31,6 +31,8 @@ const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
 const Transformer = transformer_mod.Transformer;
+const arch_state = @import("arch/arch_state.zig");
+const qwen4_state = @import("qwen4/qwen4_state.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
@@ -1806,7 +1808,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
     Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
-    try xfm_ptr.qwen4MtpApplyKvQuant(kv_quant_config);
+    try arch_state.applyHeadKvQuant(xfm_ptr, kv_quant_config);
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
     // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
@@ -1827,12 +1829,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (xfm_ptr.moe_layers != null) {
             xfm_ptr.compileMoeRouting();
         }
-        if (params.config.linear_num_key_heads > 0) {
-            xfm_ptr.compileGdnGate();
-        }
-        if (params.config.isQwen4()) {
-            xfm_ptr.compileQwen4Hc();
-        }
+        arch_state.compile(xfm_ptr, .all);
     }
 
     if (transformer_mod.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
@@ -2165,7 +2162,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
     // drafts, so it never pays. One-shot, so the draft path's ask stays a
     // pure read; if this ever does not run, that ask still builds.
-    if (mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
+    if (mtp_enabled) _ = arch_state.buildDraftRerank(xfm_ptr);
 
     if (xfm_ptr.expert_stream) |engine| warm: {
         if (engine.plan.resident) break :warm;
@@ -2192,7 +2189,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
-        if (mtp_enabled and xfm_ptr.qwen4_mtp != null) {
+        if (mtp_enabled and qwen4_state.mtpOf(xfm_ptr) != null) {
             const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
             xfm_ptr.warmupSpecVerify(cap, kv_quant_config) catch |err| {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});

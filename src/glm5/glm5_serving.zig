@@ -325,7 +325,6 @@ test "a GLM prefill interleaved with another stream's decode builds the solo pre
 test "a streamed GLM load keeps its one teacher stream exclusive" {
     var t: Transformer = undefined;
     t.arch = arch_registry.ofModelType("glm5_next") orelse return error.SkipZigTest;
-    t.qwen4 = null;
     t.expert_stream = null;
     var glm: glm5_mod.Model = undefined;
     glm.expert_stream = null;

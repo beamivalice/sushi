@@ -1,5 +1,6 @@
 const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
+const qwen4_state = @import("qwen4_state.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const arch_registry = @import("../arch/registry.zig");
@@ -620,7 +621,7 @@ fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Tr
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.persistent_group_state_override = persist;
-    xfm.ssm_group = .{ .allocator = alloc };
+    xfm.arch_state.qwen4.ssm_group = .{ .allocator = alloc };
     return xfm;
 }
 
@@ -702,19 +703,19 @@ pub fn splitSsmToSlots(self: *Transformer, m: *const SSMCacheEntry, ctxs: []cons
 }
 
 pub fn ssmGroupDrop(self: *Transformer, entries: []SSMCacheEntry) void {
-    ssmGroupDropMember(&self.ssm_group, self.s, entries) catch {};
+    ssmGroupDropMember(&self.arch_state.qwen4.ssm_group, self.s, entries) catch {};
 }
 
 /// Called at the entry of EVERY non-group forward (serial decode, prefill, the
 /// MTP solo arms): a member's live row goes back to its own entries before the
 /// solo path reads or writes them. A no-op for a slot that is not bound.
 pub fn ssmGroupRelease(self: *Transformer, ctx: *ForwardCtx) !void {
-    try ssmGroupReleaseCtx(&self.ssm_group, self.s, ctx);
+    try ssmGroupReleaseCtx(&self.arch_state.qwen4.ssm_group, self.s, ctx);
 }
 
 pub fn ssmBindBatched(self: *Transformer, ctxs: []const *ForwardCtx, kinds: []const SsmMergeKind) !void {
     const persist = self.persistent_group_state_override orelse true;
-    const bind = try ssmBindTickState(self.allocator, self.s, &self.ssm_group, ctxs, kinds, persist);
+    const bind = try ssmBindTickState(self.allocator, self.s, &self.arch_state.qwen4.ssm_group, ctxs, kinds, persist);
     if (bind.owned) {
         defer {
             for (bind.merged) |*m| ssmFreeMergedLayer(m);
@@ -725,6 +726,7 @@ pub fn ssmBindBatched(self: *Transformer, ctxs: []const *ForwardCtx, kinds: []co
 }
 
 test "persistent group: N=4 stable ticks issue zero merge/split ops after the first" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -749,7 +751,7 @@ test "persistent group: N=4 stable ticks issue zero merge/split ops after the fi
     for (&slots, 0..) |*sl, i| ctxs[i] = &sl.ctx;
 
     var xfm = ssmTickStubXfm(alloc, s, true);
-    defer xfm.ssm_group.deinit();
+    defer xfm.arch_state.qwen4.ssm_group.deinit();
 
     const ticks: usize = 8;
     var after_first: u64 = 0;
@@ -886,6 +888,7 @@ test "persistent group: join leave cancel capture snapshot rollback restore matc
 }
 
 test "persistent group: merge/split op counts at N=2/4/8 after the first tick are zero" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -908,7 +911,7 @@ test "persistent group: merge/split op counts at N=2/4/8 after the first tick ar
         defer alloc.free(ctxs);
         for (slots, 0..) |*sl, i| ctxs[i] = &sl.ctx;
         var xfm = ssmTickStubXfm(alloc, s, true);
-        defer xfm.ssm_group.deinit();
+        defer xfm.arch_state.qwen4.ssm_group.deinit();
         var after: u64 = 0;
         var first: u64 = 0;
         var t_i: usize = 0;
@@ -924,6 +927,7 @@ test "persistent group: merge/split op counts at N=2/4/8 after the first tick ar
 }
 
 test "persistent group: drop a member does not free kinds the adopt still reads" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -941,18 +945,19 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.allocator = alloc;
-    xfm.ssm_group = .{ .allocator = alloc };
-    defer xfm.ssm_group.deinit();
-    try ssmTickBind(alloc, s, &xfm.ssm_group, &ctxs, kinds, true);
+    xfm.arch_state.qwen4.ssm_group = .{ .allocator = alloc };
+    defer xfm.arch_state.qwen4.ssm_group.deinit();
+    try ssmTickBind(alloc, s, &xfm.arch_state.qwen4.ssm_group, &ctxs, kinds, true);
     ssmGroupDrop(&xfm, slots[0].entries);
-    try std.testing.expect(xfm.ssm_group.live);
-    try std.testing.expectEqual(@as(usize, 1), xfm.ssm_group.n);
-    try std.testing.expect(xfm.ssm_group.kinds.len == kinds.len);
-    try std.testing.expect(xfm.ssm_group.kinds[0].linear);
-    try std.testing.expect(xfm.ssm_group.kinds[1].ple);
+    try std.testing.expect(xfm.arch_state.qwen4.ssm_group.live);
+    try std.testing.expectEqual(@as(usize, 1), xfm.arch_state.qwen4.ssm_group.n);
+    try std.testing.expect(xfm.arch_state.qwen4.ssm_group.kinds.len == kinds.len);
+    try std.testing.expect(xfm.arch_state.qwen4.ssm_group.kinds[0].linear);
+    try std.testing.expect(xfm.arch_state.qwen4.ssm_group.kinds[1].ple);
 }
 
 test "persistent group: a solo tick after N=2 batched ticks matches the old path" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -973,13 +978,13 @@ test "persistent group: a solo tick after N=2 batched ticks matches the old path
     var p_ctxs = [_]*ForwardCtx{ &p_slots[0].ctx, &p_slots[1].ctx };
     var o_ctxs = [_]*ForwardCtx{ &o_slots[0].ctx, &o_slots[1].ctx };
     var p_xfm = ssmTickStubXfm(alloc, s, true);
-    defer p_xfm.ssm_group.deinit();
+    defer p_xfm.arch_state.qwen4.ssm_group.deinit();
     var o_xfm = ssmTickStubXfm(alloc, s, false);
-    defer o_xfm.ssm_group.deinit();
+    defer o_xfm.arch_state.qwen4.ssm_group.deinit();
     var t_i: usize = 0;
     while (t_i < 2) : (t_i += 1) {
         try ssmTickBindXfm(&p_xfm, &p_ctxs, kinds);
-        try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, kinds);
+        try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, kinds);
         try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
         try ssmTickBumpSlots(s, &o_ctxs, kinds);
     }
@@ -995,6 +1000,7 @@ test "persistent group: a solo tick after N=2 batched ticks matches the old path
 }
 
 test "persistent group: PLE-only rollback patches the group window" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1014,9 +1020,9 @@ test "persistent group: PLE-only rollback patches the group window" {
     var p_ctxs = [_]*ForwardCtx{ &p_slots[0].ctx, &p_slots[1].ctx };
     var o_ctxs = [_]*ForwardCtx{ &o_slots[0].ctx, &o_slots[1].ctx };
     var p_xfm = ssmTickStubXfm(alloc, s, true);
-    defer p_xfm.ssm_group.deinit();
+    defer p_xfm.arch_state.qwen4.ssm_group.deinit();
     var o_xfm = ssmTickStubXfm(alloc, s, false);
-    defer o_xfm.ssm_group.deinit();
+    defer o_xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&p_xfm, &p_ctxs, &kinds);
     try ssmTickBindXfm(&o_xfm, &o_ctxs, &kinds);
     const state_len: c_int = 2;
@@ -1038,6 +1044,7 @@ test "persistent group: PLE-only rollback patches the group window" {
 }
 
 test "persistent group: single-capture rollback does not write a stale sibling" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1057,11 +1064,11 @@ test "persistent group: single-capture rollback does not write a stale sibling" 
     var p_ctxs = [_]*ForwardCtx{ &p_slots[0].ctx, &p_slots[1].ctx };
     var o_ctxs = [_]*ForwardCtx{ &o_slots[0].ctx, &o_slots[1].ctx };
     var p_xfm = ssmTickStubXfm(alloc, s, true);
-    defer p_xfm.ssm_group.deinit();
+    defer p_xfm.arch_state.qwen4.ssm_group.deinit();
     var o_xfm = ssmTickStubXfm(alloc, s, false);
-    defer o_xfm.ssm_group.deinit();
+    defer o_xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&p_xfm, &p_ctxs, &kinds);
-    try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, &kinds);
+    try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, &kinds);
     try ssmTickBindXfm(&o_xfm, &o_ctxs, &kinds);
     try ssmTickBumpSlots(s, &o_ctxs, &kinds);
     const t_len: c_int = 3;
@@ -1076,17 +1083,18 @@ test "persistent group: single-capture rollback does not write a stale sibling" 
         e.spec_conv_input = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_reshape(&e.spec_conv_input, flat, &shape, 3, s));
     }
-    const ssm_before = try ssmMaterializeLive(s, &p_slots[0].entries[0], p_xfm.ssm_group.layers[0].ssm_state);
+    const ssm_before = try ssmMaterializeLive(s, &p_slots[0].entries[0], p_xfm.arch_state.qwen4.ssm_group.layers[0].ssm_state);
     defer _ = mlx.mlx_array_free(ssm_before);
     try ssmRollbackFromCapture(&p_slots[0].entries[0], 1, @intCast(t_len), s);
     try ssmRollbackFromCapture(&o_slots[0].entries[0], 1, @intCast(t_len), s);
-    const ssm_after = try ssmMaterializeLive(s, &p_slots[0].entries[0], p_xfm.ssm_group.layers[0].ssm_state);
+    const ssm_after = try ssmMaterializeLive(s, &p_slots[0].entries[0], p_xfm.arch_state.qwen4.ssm_group.layers[0].ssm_state);
     defer _ = mlx.mlx_array_free(ssm_after);
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(ssm_after, o_slots[0].entries[0].ssm_state, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(ssm_after, ssm_before, s));
 }
 
 test "persistent group: snapshot is an owned row and survives departure" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1107,11 +1115,11 @@ test "persistent group: snapshot is an owned row and survives departure" {
     var p_ctxs = [_]*ForwardCtx{ &p_slots[0].ctx, &p_slots[1].ctx };
     var o_ctxs = [_]*ForwardCtx{ &o_slots[0].ctx, &o_slots[1].ctx };
     var p_xfm = ssmTickStubXfm(alloc, s, true);
-    defer p_xfm.ssm_group.deinit();
+    defer p_xfm.arch_state.qwen4.ssm_group.deinit();
     var o_xfm = ssmTickStubXfm(alloc, s, false);
-    defer o_xfm.ssm_group.deinit();
+    defer o_xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&p_xfm, &p_ctxs, kinds);
-    try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, kinds);
+    try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, kinds);
     try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
     try ssmTickBumpSlots(s, &o_ctxs, kinds);
     var snap = ssmSnapshot(&p_slots[0].entries[0]);
@@ -1120,7 +1128,7 @@ test "persistent group: snapshot is an owned row and survives departure" {
     defer ssmSnapshotDeinit(&snap_old);
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(snap.conv_state, snap_old.conv_state, s));
     const row_n = mlx.mlx_array_size(snap.conv_state);
-    const merged_n = mlx.mlx_array_size(p_xfm.ssm_group.layers[0].conv_state);
+    const merged_n = mlx.mlx_array_size(p_xfm.arch_state.qwen4.ssm_group.layers[0].conv_state);
     try std.testing.expect(row_n * 2 == merged_n);
     var p_leave = [_]*ForwardCtx{&p_slots[1].ctx};
     try ssmTickBindXfm(&p_xfm, &p_leave, kinds);
@@ -1128,6 +1136,7 @@ test "persistent group: snapshot is an owned row and survives departure" {
 }
 
 test "persistent group: allocator failure before a replacement descriptor keeps the old group" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1143,19 +1152,20 @@ test "persistent group: allocator failure before a replacement descriptor keeps 
     defer for (&slots) |*sl| sl.deinit(alloc);
     var ctxs2 = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
     var xfm = ssmTickStubXfm(alloc, s, true);
-    defer xfm.ssm_group.deinit();
+    defer xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&xfm, &ctxs2, kinds);
-    try std.testing.expectEqual(@as(usize, 2), xfm.ssm_group.n);
+    try std.testing.expectEqual(@as(usize, 2), xfm.arch_state.qwen4.ssm_group.n);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     var ctxs3 = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx, &slots[2].ctx };
     var buf: [MAX_BATCH_ROWS]SsmGroupMember = undefined;
-    const failed = ssmRepackMembers(failing.allocator(), s, &xfm.ssm_group, try ssmMembersFromCtxs(&ctxs3, &buf), kinds);
+    const failed = ssmRepackMembers(failing.allocator(), s, &xfm.arch_state.qwen4.ssm_group, try ssmMembersFromCtxs(&ctxs3, &buf), kinds);
     try std.testing.expect(failed == error.OutOfMemory);
-    try std.testing.expect(xfm.ssm_group.live);
-    try std.testing.expectEqual(@as(usize, 2), xfm.ssm_group.n);
+    try std.testing.expect(xfm.arch_state.qwen4.ssm_group.live);
+    try std.testing.expectEqual(@as(usize, 2), xfm.arch_state.qwen4.ssm_group.n);
 }
 
 test "persistent group: cancel keeps the row until the next membership freeze" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1176,22 +1186,22 @@ test "persistent group: cancel keeps the row until the next membership freeze" {
     var p_ctxs = [_]*ForwardCtx{ &p_slots[0].ctx, &p_slots[1].ctx };
     var o_ctxs = [_]*ForwardCtx{ &o_slots[0].ctx, &o_slots[1].ctx };
     var p_xfm = ssmTickStubXfm(alloc, s, true);
-    defer p_xfm.ssm_group.deinit();
+    defer p_xfm.arch_state.qwen4.ssm_group.deinit();
     var o_xfm = ssmTickStubXfm(alloc, s, false);
-    defer o_xfm.ssm_group.deinit();
+    defer o_xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&p_xfm, &p_ctxs, kinds);
-    try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, kinds);
+    try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, kinds);
     try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
     try ssmTickBumpSlots(s, &o_ctxs, kinds);
     try ssmTickBindXfm(&p_xfm, &p_ctxs, kinds);
-    try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, kinds);
+    try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, kinds);
     try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
     try ssmTickBumpSlots(s, &o_ctxs, kinds);
-    try std.testing.expectEqual(@as(usize, 2), p_xfm.ssm_group.n);
+    try std.testing.expectEqual(@as(usize, 2), p_xfm.arch_state.qwen4.ssm_group.n);
     var p_left = [_]*ForwardCtx{&p_slots[0].ctx};
     var o_left = [_]*ForwardCtx{&o_slots[0].ctx};
     try ssmTickBindXfm(&p_xfm, &p_left, kinds);
-    try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, kinds);
+    try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, kinds);
     try ssmTickBindXfm(&o_xfm, &o_left, kinds);
     try ssmTickBumpSlots(s, &o_left, kinds);
     try ssmTickCompareRow(s, &p_slots[0].entries[0], &o_slots[0].entries[0], kinds[0]);
@@ -1199,6 +1209,7 @@ test "persistent group: cancel keeps the row until the next membership freeze" {
 }
 
 test "persistent group: unload then slot-address reuse does not match the dead group" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1215,18 +1226,19 @@ test "persistent group: unload then slot-address reuse does not match the dead g
     var ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
     var xfm = ssmTickStubXfm(alloc, s, true);
     try ssmTickBindXfm(&xfm, &ctxs, kinds);
-    xfm.ssm_group.deinit();
-    xfm.ssm_group = .{ .allocator = alloc };
-    defer xfm.ssm_group.deinit();
+    xfm.arch_state.qwen4.ssm_group.deinit();
+    xfm.arch_state.qwen4.ssm_group = .{ .allocator = alloc };
+    defer xfm.arch_state.qwen4.ssm_group.deinit();
     ssmBumpMemberGen(&slots[0].ctx);
     ssmBumpMemberGen(&slots[1].ctx);
     try ssmTickBindXfm(&xfm, &ctxs, kinds);
-    try std.testing.expect(xfm.ssm_group.live);
-    try std.testing.expectEqual(@as(usize, 2), xfm.ssm_group.n);
-    try std.testing.expect(xfm.ssm_group.matches(&ctxs));
+    try std.testing.expect(xfm.arch_state.qwen4.ssm_group.live);
+    try std.testing.expectEqual(@as(usize, 2), xfm.arch_state.qwen4.ssm_group.n);
+    try std.testing.expect(xfm.arch_state.qwen4.ssm_group.matches(&ctxs));
 }
 
 test "persistent group: resetSsmEntries departure is not resurrected from the merged buffer" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1247,11 +1259,11 @@ test "persistent group: resetSsmEntries departure is not resurrected from the me
     var p_ctxs = [_]*ForwardCtx{ &p_slots[0].ctx, &p_slots[1].ctx };
     var o_ctxs = [_]*ForwardCtx{ &o_slots[0].ctx, &o_slots[1].ctx };
     var p_xfm = ssmTickStubXfm(alloc, s, true);
-    defer p_xfm.ssm_group.deinit();
+    defer p_xfm.arch_state.qwen4.ssm_group.deinit();
     var o_xfm = ssmTickStubXfm(alloc, s, false);
-    defer o_xfm.ssm_group.deinit();
+    defer o_xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&p_xfm, &p_ctxs, kinds);
-    try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, kinds);
+    try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, kinds);
     try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
     try ssmTickBumpSlots(s, &o_ctxs, kinds);
     try ssmTickResetLikePrefixCache(p_slots[0].entries, s, 99.0, kinds);
@@ -1264,6 +1276,7 @@ test "persistent group: resetSsmEntries departure is not resurrected from the me
 }
 
 test "persistent group: export then a failed repack invalidates matches" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1279,16 +1292,17 @@ test "persistent group: export then a failed repack invalidates matches" {
     defer for (&slots) |*sl| sl.deinit(alloc);
     var ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
     var xfm = ssmTickStubXfm(alloc, s, true);
-    defer xfm.ssm_group.deinit();
+    defer xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&xfm, &ctxs, kinds);
-    try ssmExportRow(s, &xfm.ssm_group, 0);
+    try ssmExportRow(s, &xfm.arch_state.qwen4.ssm_group, 0);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     var buf: [MAX_BATCH_ROWS]SsmGroupMember = undefined;
-    _ = ssmRepackMembers(failing.allocator(), s, &xfm.ssm_group, try ssmMembersFromCtxs(&ctxs, &buf), kinds) catch {};
-    try std.testing.expect(!xfm.ssm_group.matches(&ctxs));
+    _ = ssmRepackMembers(failing.allocator(), s, &xfm.arch_state.qwen4.ssm_group, try ssmMembersFromCtxs(&ctxs, &buf), kinds) catch {};
+    try std.testing.expect(!xfm.arch_state.qwen4.ssm_group.matches(&ctxs));
 }
 
 test "persistent group: drop failure exports survivor rows" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1304,20 +1318,21 @@ test "persistent group: drop failure exports survivor rows" {
     defer for (&slots) |*sl| sl.deinit(alloc);
     var ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
     var xfm = ssmTickStubXfm(alloc, s, true);
-    defer xfm.ssm_group.deinit();
+    defer xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&xfm, &ctxs, kinds);
-    try ssmTickBumpMerged(s, xfm.ssm_group.layers, kinds);
-    const want = try ssmMaterializeLive(s, &slots[1].entries[0], xfm.ssm_group.layers[0].conv_state);
+    try ssmTickBumpMerged(s, xfm.arch_state.qwen4.ssm_group.layers, kinds);
+    const want = try ssmMaterializeLive(s, &slots[1].entries[0], xfm.arch_state.qwen4.ssm_group.layers[0].conv_state);
     defer _ = mlx.mlx_array_free(want);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
-    const drop_alloc = xfm.ssm_group.allocator;
-    xfm.ssm_group.allocator = failing.allocator();
+    const drop_alloc = xfm.arch_state.qwen4.ssm_group.allocator;
+    xfm.arch_state.qwen4.ssm_group.allocator = failing.allocator();
     ssmGroupDrop(&xfm, slots[0].entries);
-    xfm.ssm_group.allocator = drop_alloc;
+    xfm.arch_state.qwen4.ssm_group.allocator = drop_alloc;
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(slots[1].entries[0].conv_state, want, s));
 }
 
 test "persistent group: a full-width group repacks when a member leaves" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1334,13 +1349,14 @@ test "persistent group: a full-width group repacks when a member leaves" {
     }
     defer for (&slots) |*sl| sl.deinit(alloc);
     var xfm = ssmTickStubXfm(alloc, s, true);
-    defer xfm.ssm_group.deinit();
+    defer xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&xfm, &ctxs, kinds);
     try ssmTickBindXfm(&xfm, ctxs[1..], kinds);
-    try std.testing.expect(xfm.ssm_group.matches(ctxs[1..]));
+    try std.testing.expect(xfm.arch_state.qwen4.ssm_group.matches(ctxs[1..]));
 }
 
 test "persistent group: a qwen4 forwardWith releases a bound member between batched ticks" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const tag = arch_registry.ofModelType("qwen4_exp") orelse return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -1362,20 +1378,20 @@ test "persistent group: a qwen4 forwardWith releases a bound member between batc
     var p_ctxs = [_]*ForwardCtx{ &p_slots[0].ctx, &p_slots[1].ctx };
     var o_ctxs = [_]*ForwardCtx{ &o_slots[0].ctx, &o_slots[1].ctx };
     var p_xfm = ssmTickStubXfm(alloc, s, true);
-    defer p_xfm.ssm_group.deinit();
+    defer p_xfm.arch_state.qwen4.ssm_group.deinit();
     var o_xfm = ssmTickStubXfm(alloc, s, false);
-    defer o_xfm.ssm_group.deinit();
+    defer o_xfm.arch_state.qwen4.ssm_group.deinit();
     var t_i: usize = 0;
     while (t_i < 2) : (t_i += 1) {
         try ssmTickBindXfm(&p_xfm, &p_ctxs, kinds);
-        try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, kinds);
+        try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, kinds);
         try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
         try ssmTickBumpSlots(s, &o_ctxs, kinds);
     }
     // Qwen's forward reaches its embedding before any layer; with no weights it stops there by name.
     p_xfm.arch = tag;
     p_xfm.arch_state = .{};
-    p_xfm.qwen4 = null;
+    p_xfm.arch_state.qwen4.model = null;
     p_xfm.expert_stream = null;
     p_xfm.moe_layers = &.{};
     p_xfm.emb_w = .{ .ctx = null };
@@ -1397,6 +1413,7 @@ test "persistent group: a qwen4 forwardWith releases a bound member between batc
 }
 
 test "persistent group: a row remap between bind and rollback matches the old path" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
@@ -1416,11 +1433,11 @@ test "persistent group: a row remap between bind and rollback matches the old pa
     var p_ctxs = [_]*ForwardCtx{ &p_slots[0].ctx, &p_slots[1].ctx };
     var o_ctxs = [_]*ForwardCtx{ &o_slots[0].ctx, &o_slots[1].ctx };
     var p_xfm = ssmTickStubXfm(alloc, s, true);
-    defer p_xfm.ssm_group.deinit();
+    defer p_xfm.arch_state.qwen4.ssm_group.deinit();
     var o_xfm = ssmTickStubXfm(alloc, s, false);
-    defer o_xfm.ssm_group.deinit();
+    defer o_xfm.arch_state.qwen4.ssm_group.deinit();
     try ssmTickBindXfm(&p_xfm, &p_ctxs, &kinds);
-    try ssmTickBumpMerged(s, p_xfm.ssm_group.layers, &kinds);
+    try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, &kinds);
     try ssmTickBindXfm(&o_xfm, &o_ctxs, &kinds);
     try ssmTickBumpSlots(s, &o_ctxs, &kinds);
     p_ctxs = [_]*ForwardCtx{ &p_slots[1].ctx, &p_slots[0].ctx };

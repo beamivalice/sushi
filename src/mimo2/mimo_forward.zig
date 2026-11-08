@@ -667,11 +667,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         else => null,
     });
 
-    // Qwen3-VL interleaved M-RoPE: the per-prefill-chunk cos/sin, shared
-    // by every full-attn layer this forward.
-    try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), .bfloat16);
-    defer Transformer.endMropeChunk(ctx);
-
     // Precompute the sliding-window masks MiMo's sliding layers read. An arch
     // whose attention arm reads these masks MUST appear in this gate — a
     // missing arm here hands that arm an empty mask handle, and its decode

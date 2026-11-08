@@ -1,6 +1,7 @@
 const trunk_mod = @import("../trunk.zig");
 const attn_kernels = @import("../attn_kernels.zig");
 const std = @import("std");
+const qwen4_state = @import("qwen4_state.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
@@ -1836,12 +1837,13 @@ test "qsa batched gather mixed group: a mask-only slot matches its solo masked S
 }
 
 test "qsaBatchedAttn: the kill switch refuses the gather arm" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
     const xfm: *Transformer = @ptrCast(&xfm_bytes);
     xfm.allocator = std.testing.allocator;
     var q4_bytes: [@sizeOf(qwen4_mod.Qwen4State)]u8 align(@alignOf(qwen4_mod.Qwen4State)) = @splat(0);
-    xfm.qwen4 = @ptrCast(&q4_bytes);
+    xfm.arch_state.qwen4.model = @ptrCast(&q4_bytes);
     var cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)) = @splat(0);
     const cache: *KVCache = @ptrCast(&cache_bytes);
     var off: usize = 0;
@@ -1858,6 +1860,7 @@ test "qsaBatchedAttn: the kill switch refuses the gather arm" {
 }
 
 test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -1882,7 +1885,7 @@ test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the
     xfm.s = s;
     xfm.config.indexer_compress_ratio = @intCast(ratio);
     var q4_bytes: [@sizeOf(qwen4_mod.Qwen4State)]u8 align(@alignOf(qwen4_mod.Qwen4State)) = @splat(0);
-    xfm.qwen4 = @ptrCast(&q4_bytes);
+    xfm.arch_state.qwen4.model = @ptrCast(&q4_bytes);
 
     var caches: [2]KVCache = undefined;
     var fxs: [2]QsaBlockFixture = undefined;
@@ -1900,7 +1903,7 @@ test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the
         fxs[i] = try QsaBlockFixture.build(rnd, 1, kls[i], kb, ratio);
         offs[i] = @intCast(kls[i]);
         ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offs[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-        ctxs[i].qsa_blocks = fxs[i].blocks;
+        ctxs[i].arch_ctx.qwen4.qsa_blocks = fxs[i].blocks;
         qs[i] = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, 1, hd }, s);
     }
     defer for (0..2) |i| {
@@ -1918,7 +1921,7 @@ test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the
     const plain = (try qwen4_qsa.qsaBatchedAttn(xfm, &ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(plain);
     const pos = [_]i32{ 0, 1, 2 };
-    ctxs[1].mrope_pos = &pos;
+    ctxs[1].arch_ctx.qwen4.mrope_pos = &pos;
     const with_pos = (try qwen4_qsa.qsaBatchedAttn(xfm, &ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(with_pos);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(with_pos, plain, s));

@@ -1604,7 +1604,7 @@ test "imatrix capture on the streamed QUANTIZED MoE path keys the routing's glob
     };
     xfm.one = one;
     xfm.bits_cache = null;
-    xfm.qwen4 = null;
+    xfm.arch_state = .{};
     xfm.compiled_moe_routing = null;
     xfm.compiled_gelu = null;
     xfm.compiled_geglu = null;

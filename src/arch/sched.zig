@@ -151,6 +151,14 @@ pub fn modelBatches(xfm: *const Transformer) bool {
     };
 }
 
+/// Whether the slot whose context this is can merge into this tick's batch; one that cannot yet decodes serially.
+pub fn readyToBatch(xfm: *const Transformer, ctx: *ForwardCtx) bool {
+    const tag = tagOfModel(xfm) orelse return true;
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "readyToBatch")) S(t).readyToBatch(xfm, ctx) else true,
+    };
+}
+
 /// A batched group's slots each carry their own length; the forward pads them to the longest unless the arch's
 /// rows read each slot's own cache.
 pub fn padsBatch(config: *const ModelConfig) bool {
@@ -411,6 +419,7 @@ pub fn flushResident(entry: *model_registry.LoadedModel, why: []const u8) void {
 
 const known_hooks = [_][]const u8{
     "facts",           "batches",       "rowCap",         "modelBatches",             "padsBatch",       "batchArm",
+    "readyToBatch",
     "batchedForward",  "plannerObservesPlainRows",        "tickClass",                "mtpGroupable",    "initRequest",
     "checkKvQuant",    "coldLoadBill",  "modelStateBytes",                          "commitsAtCull",
     "prepareCommit",   "publishLive",   "commitOwn",      "cancelledNeedsCheckpoints", "handoffHistory",  "mtpHeadCommit",

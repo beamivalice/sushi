@@ -14,6 +14,7 @@ const qwen4_gdn = @import("qwen4_gdn.zig");
 const Transformer = trunk_mod.Transformer;
 const sliceBatchRows = Transformer.sliceBatchRows;
 const std = @import("std");
+const qwen4_state = @import("qwen4_state.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3_kernels = sushi_exl3.kernels;
 const mlx = @import("../mlx.zig");
@@ -335,7 +336,7 @@ pub fn compileGdnGate(self: *Transformer) void {
     const rc = mlx.mlx_compile(&compiled, raw_closure, true);
     _ = mlx.mlx_closure_free(raw_closure);
     if (rc == 0 and compiled.ctx != null) {
-        self.compiled_gdn_gate = compiled;
+        self.arch_state.qwen4.compiled_gdn_gate = compiled;
         log.info("GDN gate compiled (kernel fusion enabled), g {s}\n", .{@tagName(self.config.gdnGateDtype())});
     }
 }
@@ -362,10 +363,10 @@ pub fn gdnGateClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_
 /// qwen4_exp: compile the four hyper-connection elementwise tails.
 pub fn compileQwen4Hc(self: *Transformer) void {
     const specs = .{
-        .{ &self.compiled_hc_silu, &qwen4_hc.hcSiluCallback, true },
-        .{ &self.compiled_hc_mix, &qwen4_hc.hcMixCallback, false },
-        .{ &self.compiled_hc_inj, &qwen4_hc.hcInjCallback, true },
-        .{ &self.compiled_hc_write, &qwen4_hc.hcWriteCallback, true },
+        .{ &self.arch_state.qwen4.compiled_hc_silu, &qwen4_hc.hcSiluCallback, true },
+        .{ &self.arch_state.qwen4.compiled_hc_mix, &qwen4_hc.hcMixCallback, false },
+        .{ &self.arch_state.qwen4.compiled_hc_inj, &qwen4_hc.hcInjCallback, true },
+        .{ &self.arch_state.qwen4.compiled_hc_write, &qwen4_hc.hcWriteCallback, true },
     };
     var n: usize = 0;
     inline for (specs) |sp| {
@@ -407,52 +408,24 @@ pub fn applyClosure(compiled: ?mlx.mlx_closure, inputs: []const mlx.mlx_array) !
     return out;
 }
 
-/// Compile MoE routing (negate→argpartition→slice→softmax→take_along_axis→sum→expand→divide)
-/// into a single fused kernel. Input: router_logits. Outputs: inds, norm_scores.
-/// shapeless=false: slice bounds derive from input ndim, so the closure must
-/// re-trace per input shape. MoE inference only sees two shapes in practice
-/// (decode seq_len=1, prefill seq_len=N), so the trace cost amortizes after
-/// the first prefill + first decode.
-pub fn compileMoeRouting(self: *Transformer) void {
-    // MiMo's sigmoid chain takes the per-layer expert_bias as a second input and runs uncompiled.
-    if (self.config.moe_sigmoid_router) return;
-    const raw_closure = mlx.mlx_closure_new_func_payload(
-        &moeRoutingClosureCallback,
-        @ptrCast(self),
-        null,
-    );
-    var compiled = mlx.mlx_closure{ .ctx = null };
-    const rc = mlx.mlx_compile(&compiled, raw_closure, false);
-    _ = mlx.mlx_closure_free(raw_closure);
-    if (rc == 0 and compiled.ctx != null) {
-        self.compiled_moe_routing = compiled;
-        log.info("MoE routing compiled (kernel fusion enabled)\n", .{});
-    }
+/// Per-prefill-chunk M-RoPE cos/sin on the ctx, built once per forward (freed by `endMropeChunk`). Forwards past
+/// the explicit position table (decode, multi-token spec verify) leave them null and take the scalar
+/// `offset + delta` path.
+pub fn beginMropeChunk(self: *Transformer, ctx: *ForwardCtx, offset: usize, seq_len: usize, dtype: mlx.mlx_dtype) !void {
+    const q = &ctx.arch_ctx.qwen4;
+    const positions = q.mrope() orelse return;
+    if (seq_len <= 1 or offset + seq_len > positions.total) return;
+    const cs = try self.mropeCosSinAt(positions, offset, 1, seq_len, dtype);
+    q.mrope_cos_cur = cs.cos;
+    q.mrope_sin_cur = cs.sin;
 }
 
-/// Pure subgraph for MoE routing. Inputs:
-///   [0] router_logits — shape [..., num_experts]
-/// Outputs:
-///   [0] inds         — shape [..., K], int32 expert indices (top-K)
-///   [1] norm_scores  — shape [..., K], renormalized top-K softmax weights
-///
-/// The sigma-MoE per-expert-scale path stays outside the closure because it
-/// branches on per-layer weights at model-load time.
-pub fn moeRoutingClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
-    const self: *Transformer = @ptrCast(@alignCast(payload.?));
-    const k: c_int = @intCast(self.config.num_experts_per_tok);
-
-    var router_logits = mlx.mlx_array_new();
-    if (mlx.mlx_vector_array_get(&router_logits, input, 0) != 0) return -1;
-    defer _ = mlx.mlx_array_free(router_logits);
-
-    const inds_norm = self.moeRoutingUncompiled(router_logits, k) catch return -1;
-    defer _ = mlx.mlx_array_free(inds_norm.inds);
-    defer _ = mlx.mlx_array_free(inds_norm.norm_scores);
-
-    const out_arr = [_]mlx.mlx_array{ inds_norm.inds, inds_norm.norm_scores };
-    res.* = mlx.mlx_vector_array_new_data(&out_arr, 2);
-    return 0;
+pub fn endMropeChunk(ctx: *ForwardCtx) void {
+    const q = &ctx.arch_ctx.qwen4;
+    if (q.mrope_cos_cur) |c| _ = mlx.mlx_array_free(c);
+    if (q.mrope_sin_cur) |sn| _ = mlx.mlx_array_free(sn);
+    q.mrope_cos_cur = null;
+    q.mrope_sin_cur = null;
 }
 
 /// Batched Qwen4 overlaps graph construction with execution; an explicit setting still wins.
@@ -469,7 +442,7 @@ pub fn qwen4DecodeLadderStride(raw: ?[]const u8) u32 {
 
 /// Plain decode rows of one forward, each byte-identical to its solo tick (`forwardQwen4DecodeRows`).
 pub fn supportsBatchedQwen4Rows(self: *const Transformer) bool {
-    return self.qwen4 != null and self.moe_layers != null and self.expert_stream == null and self.config.supportsBatchedQwen4Rows();
+    return self.arch_state.qwen4.model != null and self.moe_layers != null and self.expert_stream == null and self.config.supportsBatchedQwen4Rows();
 }
 
 /// Full-attention layer with the QSA mask threaded through
@@ -479,18 +452,18 @@ pub fn qwen4AttnWith(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa:
 }
 
 pub fn qwen4AttnProjected(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool, projected: ?*const AttnVerifyInputs, skip_output: bool) !mlx.mlx_array {
-    // Registered above the fallible builders: `qsaMask` can throw with `ctx.qsa_blocks` already written.
+    // Registered above the fallible builders: `qsaMask` can throw with `ctx.arch_ctx.qwen4.qsa_blocks` already written.
     defer {
-        if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
-        ctx.qsa_mask = .{ .ctx = null };
-        if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
-        ctx.qsa_blocks = .{ .ctx = null };
+        if (ctx.arch_ctx.qwen4.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.arch_ctx.qwen4.qsa_mask);
+        ctx.arch_ctx.qwen4.qsa_mask = .{ .ctx = null };
+        if (ctx.arch_ctx.qwen4.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.arch_ctx.qwen4.qsa_blocks);
+        ctx.arch_ctx.qwen4.qsa_blocks = .{ .ctx = null };
         if (ctx.batch_slots) |slots| {
             for (slots) |sc| {
-                if (sc.qsa_mask.ctx != null) _ = mlx.mlx_array_free(sc.qsa_mask);
-                sc.qsa_mask = .{ .ctx = null };
-                if (sc.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(sc.qsa_blocks);
-                sc.qsa_blocks = .{ .ctx = null };
+                if (sc.arch_ctx.qwen4.qsa_mask.ctx != null) _ = mlx.mlx_array_free(sc.arch_ctx.qwen4.qsa_mask);
+                sc.arch_ctx.qwen4.qsa_mask = .{ .ctx = null };
+                if (sc.arch_ctx.qwen4.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(sc.arch_ctx.qwen4.qsa_blocks);
+                sc.arch_ctx.qwen4.qsa_blocks = .{ .ctx = null };
             }
         }
     }
@@ -498,14 +471,14 @@ pub fn qwen4AttnProjected(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array
     defer Qwen4AttnProf.active = false;
     errdefer Qwen4AttnProf.reset();
     if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
-        ctx.qsa_mask = try qwen4_qsa.qsaMask(self, ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
+        ctx.arch_ctx.qwen4.qsa_mask = try qwen4_qsa.qsaMask(self, ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
     }
-    if (prof) Qwen4AttnProf.lap(if (ctx.qsa_blocks.ctx != null) ctx.qsa_blocks else ctx.qsa_mask, .indexer);
-    if (layer == 3) if (Transformer.qwen4_trace) |tr| {
-        if (ctx.qsa_mask.ctx != null) {
-            Qwen4Trace.set(&tr.qsa_mask, ctx.qsa_mask);
-        } else if (ctx.qsa_blocks.ctx != null) {
-            const m = try qsaMaskFromBlocks(self.s, ctx.qsa_blocks, cache_len + seq_len, @intCast(self.config.indexer_compress_ratio));
+    if (prof) Qwen4AttnProf.lap(if (ctx.arch_ctx.qwen4.qsa_blocks.ctx != null) ctx.arch_ctx.qwen4.qsa_blocks else ctx.arch_ctx.qwen4.qsa_mask, .indexer);
+    if (layer == 3) if (qwen4_trace) |tr| {
+        if (ctx.arch_ctx.qwen4.qsa_mask.ctx != null) {
+            Qwen4Trace.set(&tr.qsa_mask, ctx.arch_ctx.qwen4.qsa_mask);
+        } else if (ctx.arch_ctx.qwen4.qsa_blocks.ctx != null) {
+            const m = try qsaMaskFromBlocks(self.s, ctx.arch_ctx.qwen4.qsa_blocks, cache_len + seq_len, @intCast(self.config.indexer_compress_ratio));
             defer _ = mlx.mlx_array_free(m);
             Qwen4Trace.set(&tr.qsa_mask, m);
         }
@@ -634,7 +607,7 @@ pub fn qwen4MtpLiveModule(m: *Qwen4Mtp) Qwen4MtpLive {
 
 /// A fresh, empty per-request head state (what `qwen4MtpReset` leaves behind).
 pub fn qwen4MtpStateNew(self: *Transformer) !Qwen4MtpState {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     var entry = m.entry;
     entry.conv_state = .{ .ctx = null };
     entry.ssm_state = .{ .ctx = null };
@@ -667,24 +640,24 @@ pub fn qwen4MtpSwapState(m: *Qwen4Mtp, st: *Qwen4MtpState) void {
 
 /// Install `st` as the head's live state (swapping the previous owner's out). Idempotent.
 pub fn qwen4MtpActivate(self: *Transformer, st: *Qwen4MtpState) void {
-    const m = &(self.qwen4_mtp orelse return);
-    if (self.qwen4_mtp_owner == st) return;
-    if (self.qwen4_mtp_owner) |prev| qwen4MtpSwapState(m, prev);
+    const m = &(self.arch_state.qwen4.mtp orelse return);
+    if (self.arch_state.qwen4.mtp_owner == st) return;
+    if (self.arch_state.qwen4.mtp_owner) |prev| qwen4MtpSwapState(m, prev);
     qwen4MtpSwapState(m, st);
-    self.qwen4_mtp_owner = st;
+    self.arch_state.qwen4.mtp_owner = st;
 }
 
 /// Take `st` back off the module before it is freed.
 pub fn qwen4MtpRelease(self: *Transformer, st: *Qwen4MtpState) void {
-    const m = &(self.qwen4_mtp orelse return);
-    if (self.qwen4_mtp_owner != st) return;
+    const m = &(self.arch_state.qwen4.mtp orelse return);
+    if (self.arch_state.qwen4.mtp_owner != st) return;
     qwen4MtpSwapState(m, st);
-    self.qwen4_mtp_owner = null;
+    self.arch_state.qwen4.mtp_owner = null;
 }
 
 /// Reset the MTP head's per-request state (KV, indexer keys, position).
 pub fn qwen4MtpReset(self: *Transformer) !void {
-    const m = &(self.qwen4_mtp orelse return);
+    const m = &(self.arch_state.qwen4.mtp orelse return);
     try m.cache.reinit(self.config.num_hidden_layers + 1, m.cache.config);
     ssmFreeQsaState(&m.entry);
     m.qsa_marks.deinit();
@@ -713,7 +686,7 @@ pub fn qwen4MtpHeadKvConfig(trunk: KVQuantConfig) KVQuantConfig {
 /// (layers + 1, its key head dim). Acceptance measured within noise of dense at
 /// 4k-128k; 960 B/token saved with MTP on.
 pub fn qwen4MtpApplyKvQuant(self: *Transformer, trunk: KVQuantConfig) !void {
-    const m = &(self.qwen4_mtp orelse return);
+    const m = &(self.arch_state.qwen4.mtp orelse return);
     const cfg = qwen4MtpHeadKvConfig(trunk);
     const n_layers: u32 = self.config.num_hidden_layers + 1;
     if (std.meta.eql(m.cache.config, cfg) and m.cache.entries.len == n_layers) return;
@@ -726,7 +699,7 @@ pub fn qwen4MtpApplyKvQuant(self: *Transformer, trunk: KVQuantConfig) !void {
 /// `row` — one whose history window skipped these chunks — marks nothing. Best effort; a
 /// missing mark is a blind head, never a wrong one.
 pub fn qwen4MtpMarkQsaLeftover(self: *Transformer, row: usize) !void {
-    const m = &(self.qwen4_mtp orelse return);
+    const m = &(self.arch_state.qwen4.mtp orelse return);
     if (row != m.seq_offset) return;
     const pos: c_int = @intCast(m.seq_offset);
     const ratio = @max(m.entry.qsa_ratio, 1);
@@ -746,7 +719,7 @@ pub fn qwen4MtpMarkQsaLeftover(self: *Transformer, row: usize) !void {
 
 /// The marks a commit stores beside the head's QSA half.
 pub fn qwen4MtpMarks(self: *const Transformer) []const QsaHeadMark {
-    if (self.qwen4_mtp) |*m| return m.qsa_marks.slice();
+    if (self.arch_state.qwen4.mtp) |*m| return m.qsa_marks.slice();
     return &.{};
 }
 
@@ -814,7 +787,7 @@ pub const Qwen4MtpProject = enum {
 
 /// Truncate the head's committed history to `len` rows.
 pub fn qwen4MtpTruncate(self: *Transformer, len: usize) !void {
-    const m = &(self.qwen4_mtp orelse return);
+    const m = &(self.arch_state.qwen4.mtp orelse return);
     var live = qwen4MtpLiveModule(m);
     try qwen4MtpTruncateLive(self, &live, len);
 }
@@ -900,7 +873,7 @@ pub fn qwen4MtpAdopt(
     pos_base: c_int,
     want: usize,
 ) !void {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     if (kv_snap.step > 0 and pos_base < 0) return error.MtpHeadInvalidOrigin;
     // The head's row count IS its cache's step (`qwen4MtpAdvance`).
     if (m.cache.step != m.seq_offset) return error.MtpHeadStepGap;
@@ -940,13 +913,13 @@ pub fn qwen4MtpAdvance(cache: *KVCache, seq_offset: *usize, seq_len: c_int) void
 /// slot's 3-D table there (prompt rows spanning the image) and the
 /// scalar `offset + delta` past it — the same two arms as the trunk.
 pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveModule(m);
     return qwen4MtpForwardLive(self, m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
 }
 
 pub fn qwen4MtpForwardOn(self: *Transformer, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveState(st);
     return qwen4MtpForwardLive(self, m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
 }
@@ -1001,7 +974,7 @@ pub fn qwen4MtpForwardBatched(
     project: Qwen4MtpProject,
     depth: u32,
 ) ![]Qwen4MtpOut {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     if (rows.len == 0) return error.EmptyMtpBatch;
     if (rows.len > MAX_BATCH_ROWS) return error.MtpBatchTooWide;
     var any_mrope = false;
@@ -1106,8 +1079,7 @@ pub fn qwen4MtpForwardBatched(
             .ssm_entries = null,
             .capture_hidden = null,
             .vision_embeddings = null,
-            .qsa_entry = &r.st.entry,
-            .qsa_pos_base = r.st.pos_base,
+            .arch_ctx = .{ .qwen4 = .{ .qsa_entry = &r.st.entry, .qsa_pos_base = r.st.pos_base } },
         };
         slot_ptrs[i] = &slot_ctxs[i];
     }
@@ -1285,12 +1257,12 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
 
     var ctx: ForwardCtx = .{ .cache = live.cache, .moe_seq_offset = live.seq_offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
     if (mrope_ctx) |mc| {
-        ctx.mrope_pos = mc.pos;
-        ctx.mrope_total = mc.total;
-        ctx.mrope_delta = mc.delta;
+        ctx.arch_ctx.qwen4.mrope_pos = mc.pos;
+        ctx.arch_ctx.qwen4.mrope_total = mc.total;
+        ctx.arch_ctx.qwen4.mrope_delta = mc.delta;
     }
-    try self.beginMropeChunk(&ctx, @intCast(live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*))), @intCast(seq_len), mlx.mlx_array_dtype(h));
-    defer Transformer.endMropeChunk(&ctx);
+    try beginMropeChunk(self, &ctx, @intCast(live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*))), @intCast(seq_len), mlx.mlx_array_dtype(h));
+    defer endMropeChunk(&ctx);
     const li: u32 = cfg.num_hidden_layers;
     const lw = &m.layer;
     var pre = try qwen4_hc.hcRead(self, h, &lw.hc_attn.?, batch, seq_len);
@@ -1362,7 +1334,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
 /// cost, and inside the first request's draft chain it was first-token
 /// latency on the inference thread with the stream drained mid-round.
 pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
-    const m = &(self.qwen4_mtp orelse return false);
+    const m = &(self.arch_state.qwen4.mtp orelse return false);
     if (m.rerank_tried) return m.rerank != null;
     m.rerank_tried = true;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1384,7 +1356,7 @@ pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
 /// NOT (an offline path, a directly-constructed Transformer), and it is
 /// one-shot either way.
 pub fn qwen4DraftRerankReady(self: *Transformer) bool {
-    const m = &(self.qwen4_mtp orelse return false);
+    const m = &(self.arch_state.qwen4.mtp orelse return false);
     if (m.rerank_tried) return m.rerank != null;
     return qwen4BuildDraftRerank(self);
 }
@@ -1394,7 +1366,7 @@ pub fn qwen4DraftRerankReady(self: *Transformer) bool {
 /// failure falls through to the full trunk-head readout, which is exactly
 /// what this path replaced.
 pub fn qwen4DraftSelect(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     if (try mtp_mod.rerankSelect(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
     return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
 }
@@ -1402,7 +1374,7 @@ pub fn qwen4DraftSelect(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?ml
 /// The exact re-scored top-32 shortlist for a SAMPLED draft. Null = the
 /// coarse head is unavailable and the caller falls back to a greedy draft.
 pub fn qwen4DraftShortlist(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     return mtp_mod.rerankShortlist(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask);
 }
 
@@ -1414,17 +1386,20 @@ pub fn qwen4DraftShortlistsBatched(
     suppress_mask: ?mlx.mlx_array,
     out: []mtp_mod.Shortlist,
 ) !bool {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     return mtp_mod.rerankShortlistsBatched(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask, out);
 }
 
 pub fn qwen4DraftSelectBatched(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+    const m = &(self.arch_state.qwen4.mtp orelse return error.NoMtpHead);
     if (try mtp_mod.rerankSelectBatched(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
     return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
 }
 
 /// Test hook: layer-0 intermediates of the qwen4 forward (fixture bisect).
+/// The oracle test's per-layer tap of the forward's intermediates; null outside it.
+pub var qwen4_trace: ?*Qwen4Trace = null;
+
 pub const Qwen4Trace = struct {
     mixed_attn: mlx.mlx_array = .{ .ctx = null },
     inj_attn: mlx.mlx_array = .{ .ctx = null },
@@ -1460,13 +1435,13 @@ pub const Qwen4Trace = struct {
 };
 
 pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx) bool {
-    if (self.qwen4 == null or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
+    if (self.arch_state.qwen4.model == null or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
         token_rows.len < 2 or token_rows.len > 8 or token_rows.len != ctxs.len or
         self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32)
     {
         return false;
     }
-    if (Transformer.qwen4_trace != null or diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) return false;
+    if (qwen4_trace != null or diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) return false;
     // The grouped verify reads resident expert banks; a streamed trunk has none.
     if (self.expert_stream != null) return false;
     const si = qwen4Standin();
@@ -1478,8 +1453,8 @@ pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_a
     var total_tokens: u64 = 0;
     for (token_rows, ctxs) |tokens, ctx| {
         const shape = mlx.getShape(tokens);
-        if (shape.len != 2 or shape[0] != 1 or shape[1] < 1 or ctx.ssm_entries == null or ctx.mrope_pos != null or ctx.vision_embeddings != null or
-            ctx.capture_hidden != null or ctx.capture_hidden_all != null or ctx.capture_stream_all != null or ctx.capture_layers != null or ctx.batch_slots != null)
+        if (shape.len != 2 or shape[0] != 1 or shape[1] < 1 or ctx.ssm_entries == null or ctx.arch_ctx.qwen4.mrope_pos != null or ctx.vision_embeddings != null or
+            ctx.capture_hidden != null or ctx.capture_hidden_all != null or ctx.arch_ctx.qwen4.capture_stream_all != null or ctx.capture_layers != null or ctx.batch_slots != null)
         {
             return false;
         }
@@ -1530,7 +1505,7 @@ pub fn forwardQwen4VerifyRows(
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
-        if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+        if (self.arch_state.qwen4.stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
             _ = mlx.mlx_array_free(h);
@@ -1685,7 +1660,7 @@ pub fn forwardQwen4VerifyRows(
         var last = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_slice(&last, row.h, &.{ 0, shape[1] - 1, 0 }, 3, &.{ 1, shape[1], shape[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(last);
-        const mix = try qwen4_hc.hcReadPending(self, &row.h, &self.qwen4_mixer.?, 1, row.seq, &row.pending);
+        const mix = try qwen4_hc.hcReadPending(self, &row.h, &self.arch_state.qwen4.mixer.?, 1, row.seq, &row.pending);
         _ = mlx.mlx_array_free(row.h);
         row.h = .{ .ctx = null };
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
@@ -1773,9 +1748,9 @@ pub fn forwardQwen4DecodeRows(
         if (row.h.ctx != null) _ = mlx.mlx_array_free(row.h);
         _ = mlx.mlx_array_free(row.tokens);
     };
-    for (ctxs) |ctx| ctx.ple_defer = true;
+    for (ctxs) |ctx| ctx.lazy_ids = true;
     defer for (ctxs) |ctx| {
-        ctx.ple_defer = false;
+        ctx.lazy_ids = false;
     };
     errdefer for (ctxs) |ctx| qwen4_hc.discardDeferredPle(self, ctx);
     self.spec_capture_ssm = false;
@@ -1792,7 +1767,7 @@ pub fn forwardQwen4DecodeRows(
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
-        if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+        if (self.arch_state.qwen4.stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
             _ = mlx.mlx_array_free(h);
@@ -1897,7 +1872,7 @@ pub fn forwardQwen4DecodeRows(
         try qwen4_hc.hcFlush(self, &row.h, 1, 1, &row.pending);
         row.ctx.moe_seq_offset.* += 1;
         if (hidden_out) |values| values[i] = try materializedOwnedCopy(self.s, row.h);
-        const mix = try qwen4_hc.hcReadPending(self, &row.h, &self.qwen4_mixer.?, 1, 1, &row.pending);
+        const mix = try qwen4_hc.hcReadPending(self, &row.h, &self.arch_state.qwen4.mixer.?, 1, 1, &row.pending);
         _ = mlx.mlx_array_free(row.h);
         row.h = .{ .ctx = null };
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
@@ -1961,26 +1936,26 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
 
     // Vision rows splice into the `hidden`-wide embeddings BEFORE the
     // hyper-connection tile (the reference masked_scatters, then repeats).
-    var emb = if (ctx.stream_in == null) try self.embedding(token_ids) else mlx.mlx_array_new();
-    if (ctx.stream_in == null) {
+    var emb = if (ctx.arch_ctx.qwen4.stream_in == null) try self.embedding(token_ids) else mlx.mlx_array_new();
+    if (ctx.arch_ctx.qwen4.stream_in == null) {
         errdefer _ = mlx.mlx_array_free(emb);
         emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
     }
     defer _ = mlx.mlx_array_free(emb);
-    const x_shape = if (ctx.stream_in == null) mlx.getShape(emb) else mlx.getShape(token_ids);
+    const x_shape = if (ctx.arch_ctx.qwen4.stream_in == null) mlx.getShape(emb) else mlx.getShape(token_ids);
     const batch: c_int = x_shape[0];
     const seq_len: c_int = x_shape[1];
     const is_prefill = seq_len > 1;
 
     const reps = [_]c_int{ 1, 1, hc };
     var h = mlx.mlx_array_new();
-    if (ctx.stream_in) |stream| {
+    if (ctx.arch_ctx.qwen4.stream_in) |stream| {
         try mlx.check(mlx.mlx_array_set(&h, stream));
     } else {
         try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
     }
     errdefer _ = mlx.mlx_array_free(h);
-    if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+    if (self.arch_state.qwen4.stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
         var h32 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
         _ = mlx.mlx_array_free(h);
@@ -1992,8 +1967,8 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     };
     // M-RoPE chunk tables: read by every full-attn layer AND the QSA
     // indexer's queries (its pooled block keys take a strided build).
-    try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), mlx.mlx_array_dtype(h));
-    defer Transformer.endMropeChunk(ctx);
+    try beginMropeChunk(self, ctx, @intCast(offset), @intCast(seq_len), mlx.mlx_array_dtype(h));
+    defer endMropeChunk(ctx);
     var dt = mlx.DtypeTrace.begin("qwen4", h, switch (ml[0].attn) {
         .full => |f| f.q_w,
         .linear => |la| la.qkv_w,
@@ -2013,11 +1988,11 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     var pending: ?HcPending = null;
     defer if (pending) |*pd| pd.deinit();
 
-    const ladder = if (ctx.batch_slots != null) self.decode_async_ladder_qwen4 else self.decode_async_ladder;
+    const ladder = if (ctx.batch_slots != null) self.arch_state.qwen4.decode_async_ladder else self.decode_async_ladder;
     var ladder_blocked = false;
 
     const defer_moe = self.expert_stream != null and self.imatrix == null and batch == 1 and seq_len == 1 and
-        !prof.timing and !prof.ops and !dt.on and !dumping and Transformer.qwen4_trace == null and ctx.capture_layers == null and
+        !prof.timing and !prof.ops and !dt.on and !dumping and qwen4_trace == null and ctx.capture_layers == null and
         @as(u16, @bitCast(qwen4Standin())) == 0 and !decodeProfileEnabled() and
         !diagEnvOnCached(&expert_defer_sync_env, "SUSHI_EXPERT_DEFER_SYNC");
     var deferred: ?DeferredQwenMoe = null;
@@ -2036,7 +2011,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         var submitted: ?Transformer.StreamMoe = null;
         defer if (submitted) |*work| work.deinit();
 
-        if (lw.ple != null and !ctx.skip_ple) {
+        if (lw.ple != null and !ctx.arch_ctx.qwen4.skip_ple) {
             const pw = &lw.ple.?;
             try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
             const add = try qwen4_hc.pleForward(self, ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
@@ -2059,11 +2034,11 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         };
         defer _ = mlx.mlx_array_free(attn_out);
         try prof.lap(attn_out, if (lw.attn == .linear) .gdn else .attn);
-        if (layer_idx == 3) if (Transformer.qwen4_trace) |tr| {
+        if (layer_idx == 3) if (qwen4_trace) |tr| {
             Qwen4Trace.set(&tr.attn3_input, pre.mixed);
             Qwen4Trace.set(&tr.attn3_out, attn_out);
         };
-        if (layer_idx == 0) if (Transformer.qwen4_trace) |tr| {
+        if (layer_idx == 0) if (qwen4_trace) |tr| {
             Qwen4Trace.set(&tr.mixed_attn, pre.mixed);
             Qwen4Trace.set(&tr.inj_attn, pre.inj);
             Qwen4Trace.set(&tr.attn_out, attn_out);
@@ -2107,7 +2082,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             }
         }
         try prof.lap(mlp_out, .mlp);
-        if (layer_idx == 0) if (Transformer.qwen4_trace) |tr| {
+        if (layer_idx == 0) if (qwen4_trace) |tr| {
             Qwen4Trace.set(&tr.mixed_mlp, pre2.mixed);
             Qwen4Trace.set(&tr.inj_mlp, pre2.inj);
             Qwen4Trace.set(&tr.mlp_out, mlp_out);
@@ -2119,7 +2094,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         if (ladder != 0 and seq_len == 1 and (layer_idx + 1) % ladder == 0 and !ladder_blocked) {
             // The host-filled PLE leaf must be ready before early evaluation.
             // A lazy token sample keeps this forward on its normal terminal eval.
-            if (ctx.ple_pending) |pp| {
+            if (ctx.arch_ctx.qwen4.ple_pending) |pp| {
                 var ids_available = false;
                 if (mlx._mlx_array_is_available(&ids_available, pp.token_ids) == 0 and ids_available)
                     try qwen4_hc.flushDeferredPle(self, ctx)
@@ -2160,7 +2135,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     }
     std.debug.assert(deferred == null);
 
-    if (ctx.capture_stream_all != null or ctx.capture_hidden != null or ctx.capture_hidden_all != null) {
+    if (ctx.arch_ctx.qwen4.capture_stream_all != null or ctx.capture_hidden != null or ctx.capture_hidden_all != null) {
         try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
         try qwen4_hc.plePreEval(self, ctx);
     }
@@ -2168,7 +2143,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     dt.end(h);
     prof.report(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)), ctx.capture_ssm_seq, cfg.num_hidden_layers - cfg.attnCacheLayerCount(), cfg.attnCacheLayerCount());
     Qwen4AttnProf.flush(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)));
-    if (ctx.capture_stream_all) |target| try capturePrefillHidden(self.s, target, h, true);
+    if (ctx.arch_ctx.qwen4.capture_stream_all) |target| try capturePrefillHidden(self.s, target, h, true);
     // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
     // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
     if (ctx.capture_hidden) |target| {
@@ -2176,7 +2151,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     }
     if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, true);
 
-    const mix = try qwen4_hc.hcReadPending(self, &h, &self.qwen4_mixer.?, batch, seq_len, &pending);
+    const mix = try qwen4_hc.hcReadPending(self, &h, &self.arch_state.qwen4.mixer.?, batch, seq_len, &pending);
     // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
     _ = mlx.mlx_array_free(h);
     h = .{ .ctx = null };
@@ -2295,7 +2270,7 @@ pub fn gatedFullAttnProjected(
         _ = mlx.mlx_array_free(v_proj);
     };
 
-    if (layer == 3) if (Transformer.qwen4_trace) |tr| {
+    if (layer == 3) if (qwen4_trace) |tr| {
         Qwen4Trace.set(&tr.q3_raw, q_proj);
         Qwen4Trace.set(&tr.k3_raw, k_proj);
         Qwen4Trace.set(&tr.v3_raw, v_proj);
@@ -2344,11 +2319,11 @@ pub fn gatedFullAttnProjected(
     var k_rope = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k_rope);
     var fused_qk = false;
-    if (batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_cos_cur == null and
+    if (batch == 1 and seq_len == 1 and hd == 128 and ctx.arch_ctx.qwen4.mrope_cos_cur == null and
         fa.q_norm.ctx != null and fa.k_norm.ctx != null and
         self.rms_eps_arr.ctx != null)
     blk: {
-        const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+        const eff_off: c_int = offset + (if (ctx.arch_ctx.qwen4.mrope_pos != null) ctx.arch_ctx.qwen4.mrope_delta else 0);
         const angles = qkAngleFor(self, rope_family, rope_dims, rope_base, rope_freqs, eff_off, 1.0) catch break :blk;
         const ms: ?mlx.mlx_array = if (use_yarn)
             try constTableAs(self.yarn_mscale.?, mlx.mlx_array_dtype(queries), &self.yarn_mscale_cast, self.s)
@@ -2365,11 +2340,11 @@ pub fn gatedFullAttnProjected(
     // spec-verify widths (S 1..16) — the hd-128 gate above never fires
     // there, so those layers paid the composed chain on every step.
     if (!fused_qk and batch == 1 and hd == 256 and seq_len <= 32 and
-        ctx.mrope_cos_cur == null and
+        ctx.arch_ctx.qwen4.mrope_cos_cur == null and
         fa.q_norm.ctx != null and fa.k_norm.ctx != null and
         self.rms_eps_arr.ctx != null)
     blk: {
-        const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+        const eff_off: c_int = offset + (if (ctx.arch_ctx.qwen4.mrope_pos != null) ctx.arch_ctx.qwen4.mrope_delta else 0);
         // The kernel has no mscale slot: YaRN's factor is uniform across the
         // rotated slice, so folding it into the angle rows scales exactly the
         // rotation and nothing else (the pass-through dims never appear).
@@ -2403,8 +2378,8 @@ pub fn gatedFullAttnProjected(
         // text-only). YaRN needs nothing here: the M-RoPE tables are
         // filled from the scaled spectrum + mscale at the one choke point
         // (`mropeCosSinAt`), and the scalar arms take the freqs array below.
-        if (ctx.mrope_cos_cur) |cos| {
-            const sin = ctx.mrope_sin_cur.?;
+        if (ctx.arch_ctx.qwen4.mrope_cos_cur) |cos| {
+            const sin = ctx.arch_ctx.qwen4.mrope_sin_cur.?;
             _ = mlx.mlx_array_free(q_rope);
             _ = mlx.mlx_array_free(k_rope);
             q_rope = try self.applyMrope(q_t, cos, sin, rope_dims);
@@ -2417,7 +2392,7 @@ pub fn gatedFullAttnProjected(
             try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, rope_base, 1.0, off_arr, rope_freqs, self.s));
             if (use_yarn) try yarnScaleQK(self, &q_rope, &k_rope);
         } else {
-            const eff_offset: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+            const eff_offset: c_int = offset + (if (ctx.arch_ctx.qwen4.mrope_pos != null) ctx.arch_ctx.qwen4.mrope_delta else 0);
             try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, eff_offset, rope_freqs, self.s));
             try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, eff_offset, rope_freqs, self.s));
             if (use_yarn) try yarnScaleQK(self, &q_rope, &k_rope);
@@ -2471,7 +2446,7 @@ pub fn gatedFullAttnProjected(
                 defer _ = mlx.mlx_array_free(stacked_v);
                 var stacked_mask = try self.buildBatchedDecodeMask(kv_len_buf, kv_max, seq_len);
                 defer _ = mlx.mlx_array_free(stacked_mask);
-                if (ctx.qsa_mask.ctx != null) {
+                if (ctx.arch_ctx.qwen4.qsa_mask.ctx != null) {
                     // qwen4 QSA: the per-slot block selection (bool, false-
                     // padded to kv_max) narrows the additive pad mask. One
                     // dense-mask call serves the whole group, so it is billed
@@ -2481,7 +2456,7 @@ pub fn gatedFullAttnProjected(
                     const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
                     defer _ = mlx.mlx_array_free(neg_inf);
                     var narrowed = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_where(&narrowed, ctx.qsa_mask, stacked_mask, neg_inf, self.s));
+                    try mlx.check(mlx.mlx_where(&narrowed, ctx.arch_ctx.qwen4.qsa_mask, stacked_mask, neg_inf, self.s));
                     _ = mlx.mlx_array_free(stacked_mask);
                     stacked_mask = narrowed;
                 }
@@ -2496,7 +2471,7 @@ pub fn gatedFullAttnProjected(
     defer kv_view.deinit();
     const full_k = kv_view.k;
     const full_v = kv_view.v;
-    if (layer == 3) if (Transformer.qwen4_trace) |tr| {
+    if (layer == 3) if (qwen4_trace) |tr| {
         Qwen4Trace.set(&tr.q3_rope, q_rope);
         Qwen4Trace.set(&tr.k3_rope, k_rope);
         Qwen4Trace.set(&tr.v3_t, v_t);
@@ -2519,42 +2494,42 @@ pub fn gatedFullAttnProjected(
         }
         Qwen4AttnProf.lap(q_rope, .proj);
     }
-    if (ctx.qsa_blocks.ctx != null or ctx.qsa_mask.ctx != null) {
+    if (ctx.arch_ctx.qwen4.qsa_blocks.ctx != null or ctx.arch_ctx.qwen4.qsa_mask.ctx != null) {
         // qwen4_exp QSA: the indexer already chose the visible blocks
         // (causal folded in). Prefill gathers them by index; decode/
         // verify widths (and a declined gather) run under the bool mask.
         const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
         var gathered: ?mlx.mlx_array = null;
-        const qsa_ok = ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa;
+        const qsa_ok = ctx.arch_ctx.qwen4.qsa_blocks.ctx != null and ctx.arch_ctx.qwen4.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa;
         if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len)) {
             // One fused dispatch per layer: each row indexes its own selection + tail.
-            gathered = try qsaAlignedSparseAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale, @intCast(self.config.indexer_budget));
+            gathered = try qsaAlignedSparseAttn(self.s, q_rope, &kv_view, ctx.arch_ctx.qwen4.qsa_blocks, ratio, attn_scale, @intCast(self.config.indexer_budget));
             if (self.cost_trace_active and gathered != null) self.cost_attention |= 1;
         }
         if (gathered == null and qsa_ok and seq_len == 1) {
             // Decode width: subset triples (or dense rows) → subset
             // dequant -> dense SDPA over K'<<kv. Declines to the mask arm.
-            gathered = try qsaDecodeGatherAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
+            gathered = try qsaDecodeGatherAttn(self.s, q_rope, &kv_view, ctx.arch_ctx.qwen4.qsa_blocks, ratio, attn_scale);
             if (self.cost_trace_active and gathered != null) self.cost_attention |= 2;
         }
         if (gathered == null and qsa_ok and seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN) {
             // Verify widths 2..15: the union of the block's rows' selections + tail. The
             // fused kernel's fallback for any width it declines.
-            gathered = try qsaVerifyGatherAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale);
+            gathered = try qsaVerifyGatherAttn(self.s, q_rope, &kv_view, ctx.arch_ctx.qwen4.qsa_blocks, ratio, attn_scale);
             if (self.cost_trace_active and gathered != null) self.cost_attention |= 4;
         }
         // The prefill kernel has no q_len floor of its own; a verify-width
         // selection must never fall into it (it walks the WHOLE cache).
-        if (gathered == null and seq_len >= FUSED256_MIN_Q_LEN and ctx.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa) {
+        if (gathered == null and seq_len >= FUSED256_MIN_Q_LEN and ctx.arch_ctx.qwen4.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa) {
             const prof = diagEnvOnCached(&qwen4_profile_qsa_env, "QWEN4_PROFILE_QSA");
             var clk: ProfClock = undefined;
             if (prof) {
                 try mlx.check(mlx.mlx_array_eval(q_rope));
                 clk = ProfClock.init();
             }
-            if (kv_view.has_quant_triple and qsaPackedGatherServes(seq_len, mlx.getShape(full_k)[2], mlx.getShape(ctx.qsa_blocks)[2], ratio))
-                gathered = try gatherQsa256Packed(self.s, q_rope, &kv_view, attn_scale, ctx.qsa_blocks, ratio);
-            if (gathered == null) gathered = try gatherQsa256(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_blocks, ratio);
+            if (kv_view.has_quant_triple and qsaPackedGatherServes(seq_len, mlx.getShape(full_k)[2], mlx.getShape(ctx.arch_ctx.qwen4.qsa_blocks)[2], ratio))
+                gathered = try gatherQsa256Packed(self.s, q_rope, &kv_view, attn_scale, ctx.arch_ctx.qwen4.qsa_blocks, ratio);
+            if (gathered == null) gathered = try gatherQsa256(self.s, q_rope, full_k, full_v, attn_scale, ctx.arch_ctx.qwen4.qsa_blocks, ratio);
             if (self.cost_trace_active and gathered != null) self.cost_attention |= 8;
             if (prof) if (gathered) |g| {
                 try mlx.check(mlx.mlx_array_eval(g));
@@ -2562,27 +2537,27 @@ pub fn gatedFullAttnProjected(
             };
         }
         if (gathered) |g| {
-            ctx.qsa_arms.noteGather(seq_len);
+            ctx.arch_ctx.qwen4.qsa_arms.noteGather(seq_len);
             _ = mlx.mlx_array_free(attn_out);
             attn_out = g;
         } else {
             // The dense [S, kv] mask arm reads `full_k`/`full_v` — on a
             // quantized cache that is what EVALUATES the whole-range
             // dequant graph `updateAffine` built, per layer per forward.
-            ctx.qsa_arms.note(.mask);
+            ctx.arch_ctx.qwen4.qsa_arms.note(.mask);
             if (self.cost_trace_active) self.cost_attention |= 16;
-            if (ctx.qsa_mask.ctx == null) ctx.qsa_mask = try qsaMaskFromBlocks(self.s, ctx.qsa_blocks, mlx.getShape(full_k)[2], ratio);
+            if (ctx.arch_ctx.qwen4.qsa_mask.ctx == null) ctx.arch_ctx.qwen4.qsa_mask = try qsaMaskFromBlocks(self.s, ctx.arch_ctx.qwen4.qsa_blocks, mlx.getShape(full_k)[2], ratio);
             if (qwen4Standin().attn_sdpa) {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = try standinRef(q_rope);
-            } else if (try fusedSdpa256Masked(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_mask)) |fused| {
+            } else if (try fusedSdpa256Masked(self.s, q_rope, full_k, full_v, attn_scale, ctx.arch_ctx.qwen4.qsa_mask)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
-            } else if (try splitMaskedSdpa256(self.s, q_rope, full_k, full_v, attn_scale, ctx.qsa_mask)) |split_out| {
+            } else if (try splitMaskedSdpa256(self.s, q_rope, full_k, full_v, attn_scale, ctx.arch_ctx.qwen4.qsa_mask)) |split_out| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = split_out;
             } else {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", ctx.qsa_mask, .{ .ctx = null }, false, self.s));
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", ctx.arch_ctx.qwen4.qsa_mask, .{ .ctx = null }, false, self.s));
             }
         }
     } else if (is_prefill) {
@@ -2603,7 +2578,7 @@ pub fn gatedFullAttnProjected(
 
     if (Qwen4AttnProf.active) Qwen4AttnProf.lap(attn_out, .qsa);
 
-    if (layer == 3) if (Transformer.qwen4_trace) |tr| Qwen4Trace.set(&tr.attn3_pre_tail, attn_out);
+    if (layer == 3) if (qwen4_trace) |tr| Qwen4Trace.set(&tr.attn3_pre_tail, attn_out);
     return gatedAttnTail(self, attn_out, gate, fa, flat_shape, skip_output);
 }
 
@@ -3798,6 +3773,7 @@ const Qwen4LadderHostFixture = struct {
     cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)),
 
     pub fn init(self: *Qwen4LadderHostFixture) !void {
+        if (comptime !qwen4_state.built) return error.SkipZigTest;
         const tag = arch_registry.ofModelType("qwen4_exp") orelse return error.SkipZigTest;
         const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
         const dim = 64;
@@ -3815,7 +3791,7 @@ const Qwen4LadderHostFixture = struct {
         const x = self.xfm();
         x.allocator = testing.allocator;
         x.s = mlx.gpuStream();
-        x.qwen4 = &self.st;
+        x.arch_state.qwen4.model = &self.st;
         x.arch = tag;
     }
 
@@ -3879,7 +3855,7 @@ const Qwen4LadderRig = struct {
         try self.fx.init();
         self.n = 0;
         const x = self.fx.xfm();
-        const st = x.qwen4.?;
+        const st = x.arch_state.qwen4.model.?;
         const emb_dim: c_int = @intCast(st.table.dim * st.hash.n_heads);
         x.config = .{ .model_type = "qwen4_exp", .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
         var prng = std.Random.DefaultPrng.init(59);
@@ -3891,7 +3867,7 @@ const Qwen4LadderRig = struct {
         self.keep(ones);
         x.ones_hidden = ones;
         const none: mlx.mlx_array = .{ .ctx = null };
-        x.qwen4_mixer = .{
+        x.arch_state.qwen4.mixer = .{
             .norm_w = try self.weight(r, &.{ HC, HIDDEN }),
             .down_w = try self.weight(r, &.{ HC * HIDDEN, RANK }),
             .down_s = none,
@@ -3919,11 +3895,11 @@ const Qwen4LadderRig = struct {
             .norm_conv = try self.weight(r, &.{ HC, HIDDEN }),
             .conv_w = try self.weight(r, &.{ HC * HIDDEN, @intCast(x.config.ple_conv_kernel), 1 }),
         };
-        try bindLinears(&x.qwen4_mixer.?, &x.config);
+        try bindLinears(&x.arch_state.qwen4.mixer.?, &x.config);
         try bindLinears(&layers[0].ple.?, &x.config);
         x.moe_layers = layers[0..LAYERS];
         x.decode_async_ladder = 0;
-        x.decode_async_ladder_qwen4 = qwen4DecodeLadderStride(null);
+        x.arch_state.qwen4.decode_async_ladder = qwen4DecodeLadderStride(null);
     }
 
     pub fn deinit(self: *Qwen4LadderRig) void {
@@ -3948,10 +3924,10 @@ const Qwen4LadderRig = struct {
         const x = self.fx.xfm();
         x.decode_async_ladder = ladder;
         defer x.decode_async_ladder = 0;
-        var ctx: ForwardCtx = .{ .cache = @ptrCast(&self.fx.cache_bytes), .moe_seq_offset = &slot.off, .ssm_entries = &slot.entries, .capture_hidden = null, .vision_embeddings = null, .ple_defer = true };
+        var ctx: ForwardCtx = .{ .cache = @ptrCast(&self.fx.cache_bytes), .moe_seq_offset = &slot.off, .ssm_entries = &slot.entries, .capture_hidden = null, .vision_embeddings = null, .lazy_ids = true };
         const logits = try forwardQwen4With(x, &ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
-        const pending = ctx.ple_pending != null;
+        const pending = ctx.arch_ctx.qwen4.ple_pending != null;
         try qwen4_hc.flushDeferredPle(x, &ctx);
         return .{ .logits = try qwen4ReadF32(testing.allocator, logits, x.s), .pending = pending };
     }
@@ -3968,8 +3944,8 @@ const Qwen4LadderRig = struct {
     /// One batched decode step over `slots` at batched ladder stride `ladder`, filling (or discarding) the leaf.
     fn batchedStep(self: *Qwen4LadderRig, slots: []const *Qwen4TestSlot, ids: []const i32, ladder: u32, fill: bool) !Step {
         const x = self.fx.xfm();
-        x.decode_async_ladder_qwen4 = ladder;
-        defer x.decode_async_ladder_qwen4 = qwen4DecodeLadderStride(null);
+        x.arch_state.qwen4.decode_async_ladder = ladder;
+        defer x.arch_state.qwen4.decode_async_ladder = qwen4DecodeLadderStride(null);
         const run = try qwen4BatchedPleForward(x, slots, ids, 1, false, true, fill);
         defer _ = mlx.mlx_array_free(run.logits);
         return .{ .logits = try qwen4ReadF32(testing.allocator, run.logits, x.s), .pending = run.pending };
@@ -4069,7 +4045,7 @@ const StreamDeferredRig = struct {
             .inject_w = try self.weight(r, &.{ 256, 4 }), .inject_s = none, .inject_b = none,
         };
         try bindLinears(&hc_weights, &x.config);
-        x.qwen4_mixer = hc_weights;
+        x.arch_state.qwen4.mixer = hc_weights;
         var mw: MoeMlpWeights = std.mem.zeroInit(MoeMlpWeights, .{});
         mw.router_w = try self.weight(r, &.{ 64, 4 });
         mw.switch_gate_w = pack.residentBank(4, 0);
@@ -4108,8 +4084,9 @@ const StreamDeferredRig = struct {
     pub fn deinit(self: *StreamDeferredRig) void {
         const x = self.fx.xfm();
         for (self.arrays[0..self.count]) |a| _ = mlx.mlx_array_free(a);
-        inline for (.{ "gdn_q_scale", "gdn_k_scale", "gdn_eps", "gdn_ones_w", "ones_hidden" }) |name|
-            if (@field(x, name)) |a| { _ = mlx.mlx_array_free(a); };
+        inline for (.{ "gdn_q_scale", "gdn_k_scale", "gdn_eps", "gdn_ones_w" }) |name|
+            if (@field(x.arch_state.qwen4, name)) |a| { _ = mlx.mlx_array_free(a); };
+        if (x.ones_hidden) |a| _ = mlx.mlx_array_free(a);
         _ = mlx.mlx_array_free(x.one);
         self.fx.deinit();
     }
@@ -4214,25 +4191,6 @@ pub fn forwardMoeBatchedDecode(
     return sliceBatchRows(self.allocator, self.s, logits, next_tokens.len);
 }
 
-/// Batched spec VERIFY: `[N, S]` rows (every slot's `[t1, drafts…]`, padded to the
-/// group's widest), per-position SSM capture ON so each slot rolls back on its own,
-/// post-norm hidden captured at the last row (`hidden_last` `[N,1,H]`) and at every
-/// row (`hidden_all` `[N,S,H]`). Returns logits `[N, S, V]`; caller owns everything.
-pub fn forwardMoeBatchedVerify(
-    self: *Transformer,
-    token_arr: mlx.mlx_array,
-    ctxs: []const *ForwardCtx,
-    rope_offsets: []const u32,
-    hidden_last: *mlx.mlx_array,
-    hidden_all: *mlx.mlx_array,
-) !mlx.mlx_array {
-    if (!qwen4_gdn.gdn_batched_verify_logged) {
-        qwen4_gdn.gdn_batched_verify_logged = true;
-        log.info("[batched] gdn batched verify engaged (slots={d}, width={d})\n", .{ ctxs.len, mlx.getShape(token_arr)[1] });
-    }
-    return forwardMoeBatchedRows(self, token_arr, ctxs, rope_offsets, true, hidden_last, hidden_all);
-}
-
 pub fn forwardMoeBatchedRows(
     self: *Transformer,
     token_arr: mlx.mlx_array,
@@ -4247,12 +4205,13 @@ pub fn forwardMoeBatchedRows(
     std.debug.assert(ctxs.len == rope_offsets.len);
     std.debug.assert(N >= 1);
     const ml = self.moe_layers orelse return error.BatchedGdnRequiresMoeLayers;
+    if (self.arch_state.qwen4.model == null) return error.BatchedRowsNeedQwen4State;
 
     // Per-slot RoPE offsets, each already carrying its own M-RoPE delta.
     var off_buf = try self.allocator.alloc(i32, rope_offsets.len);
     defer self.allocator.free(off_buf);
     for (rope_offsets, 0..) |o, i| {
-        const d: i32 = if (ctxs[i].mrope_pos != null) ctxs[i].mrope_delta else 0;
+        const d: i32 = if (ctxs[i].arch_ctx.qwen4.mrope_pos != null) ctxs[i].arch_ctx.qwen4.mrope_delta else 0;
         off_buf[i] = @as(i32, @intCast(o)) + d;
     }
     const off_shape = [_]c_int{N};
@@ -4264,16 +4223,16 @@ pub fn forwardMoeBatchedRows(
     // merged (widths would disagree) — the caller gates on
     // `batchedGdnReady`.
     const persist = self.persistent_group_state_override orelse true;
-    self.ssm_group.allocator = self.allocator;
-    const stable = persist and self.ssm_group.live and self.ssm_group.matches(ctxs);
+    self.arch_state.qwen4.ssm_group.allocator = self.allocator;
+    const stable = persist and self.arch_state.qwen4.ssm_group.live and self.arch_state.qwen4.ssm_group.matches(ctxs);
     var kinds_buf: []SsmMergeKind = &.{};
     defer if (kinds_buf.len != 0) self.allocator.free(kinds_buf);
-    const kinds: []const SsmMergeKind = if (stable) self.ssm_group.kinds else blk: {
+    const kinds: []const SsmMergeKind = if (stable) self.arch_state.qwen4.ssm_group.kinds else blk: {
         kinds_buf = try self.allocator.alloc(SsmMergeKind, ml.len);
         for (ml, 0..) |*lw, l| kinds_buf[l] = .{ .linear = lw.is_linear, .ple = lw.ple != null };
         break :blk kinds_buf;
     };
-    const bind = try ssmBindTickState(self.allocator, self.s, &self.ssm_group, ctxs, kinds, persist);
+    const bind = try ssmBindTickState(self.allocator, self.s, &self.arch_state.qwen4.ssm_group, ctxs, kinds, persist);
     const merged = bind.merged;
     defer if (bind.owned) {
         for (merged) |*m| ssmFreeMergedLayer(m);
@@ -4295,16 +4254,15 @@ pub fn forwardMoeBatchedRows(
         .vision_embeddings = null,
         .batch_slots = ctxs,
         .batch_rope_offsets = rope_offset_arr,
-        .ple_defer = self.qwen4 != null,
+        .lazy_ids = self.arch_state.qwen4.model != null,
     };
     // A verify's captures live on the merged entries until split below.
     defer if (capture_ssm) {
         for (merged) |*m| ssmFreeSpecCapture(m);
     };
 
-    // qwen4_exp rides the same driver: GDN + PLE window merged here, QSA
-    // key histories reached per slot through `batch_slots` (kv differs).
-    const logits = (if (self.qwen4 != null) forwardQwen4With(self, &bctx, token_arr) else self.forwardWith(&bctx, token_arr)) catch |e| {
+    // GDN + PLE window merged here, QSA key histories reached per slot through `batch_slots` (kv differs).
+    const logits = forwardQwen4With(self, &bctx, token_arr) catch |e| {
         qwen4_hc.discardDeferredPle(self, &bctx);
         return e;
     };
@@ -4321,7 +4279,7 @@ pub fn forwardMoeBatchedRows(
                 for (ctxs, 0..) |c, i| try splitSpecCaptures(self.s, m, &c.ssm_entries.?[li], i);
             }
         }
-        if (!stable) ssmBindSlotRefs(&self.ssm_group, ctxs);
+        if (!stable) ssmBindSlotRefs(&self.arch_state.qwen4.ssm_group, ctxs);
     } else {
         try ssmSplitAll(self.s, merged, ctxs, kinds);
     }
@@ -4420,12 +4378,13 @@ test "shared expert gate tail admits the joined verifier envelope only" {
 }
 
 test "qwen4 MTP head: two explicit states with different origins and stash lengths round-trip" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     var xfm: Transformer = undefined;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
-    xfm.qwen4_mtp_owner = null;
+    xfm.arch_state.qwen4.mtp_owner = null;
     const head_cache = try KVCache.init(t.allocator, 1);
     var head: Qwen4Mtp = undefined;
     head.cache = head_cache;
@@ -4433,8 +4392,8 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
     head.qsa_marks = .{};
     head.seq_offset = 0;
     head.pos_base = 0;
-    xfm.qwen4_mtp = head;
-    const m = &xfm.qwen4_mtp.?;
+    xfm.arch_state.qwen4.mtp = head;
+    const m = &xfm.arch_state.qwen4.mtp.?;
     defer m.cache.deinit();
 
     const ca = try KVCache.init(t.allocator, 1);
@@ -4450,7 +4409,7 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
     const live_b = qwen4MtpLiveState(&b);
     try t.expect(live_a.cache == &a.cache);
     try t.expect(live_b.cache == &b.cache);
-    try t.expect(xfm.qwen4_mtp_owner == null);
+    try t.expect(xfm.arch_state.qwen4.mtp_owner == null);
     try t.expectEqual(@as(usize, 0), m.seq_offset);
 
     const sa = a.meta();
@@ -4469,10 +4428,11 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
     b.restoreMeta(sb);
     try t.expectEqual(sa, a.meta());
     try t.expectEqual(sb, b.meta());
-    try t.expect(xfm.qwen4_mtp_owner == null);
+    try t.expect(xfm.arch_state.qwen4.mtp_owner == null);
 }
 
 test "qwen4 MTP head: two requests keep their own state through activate/release" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     // Bar: after A appends and B activates, A's rows are not on the module; A re-activating
     // sees them again; releasing hands the module its own copy back.
     try mlx.requireGpu();
@@ -4480,7 +4440,7 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     var xfm: Transformer = undefined;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
-    xfm.qwen4_mtp_owner = null;
+    xfm.arch_state.qwen4.mtp_owner = null;
     const head_cache = try KVCache.init(t.allocator, 1);
     var head: Qwen4Mtp = undefined;
     head.cache = head_cache;
@@ -4488,8 +4448,8 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     head.qsa_marks = .{};
     head.seq_offset = 0;
     head.pos_base = 0;
-    xfm.qwen4_mtp = head;
-    const m = &xfm.qwen4_mtp.?;
+    xfm.arch_state.qwen4.mtp = head;
+    const m = &xfm.arch_state.qwen4.mtp.?;
     defer m.cache.deinit();
 
     const ca = try KVCache.init(t.allocator, 1);
@@ -4515,7 +4475,7 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     qwen4MtpRelease(&xfm, &a);
     try t.expectEqual(@as(usize, 0), m.seq_offset);
     try t.expectEqual(@as(usize, 7), a.seq_offset);
-    try t.expect(xfm.qwen4_mtp_owner == null);
+    try t.expect(xfm.arch_state.qwen4.mtp_owner == null);
 }
 
 test "exl3 MTP rows wider than the decode arm refuse by Exl3MtpRowsExceedDecode" {
@@ -4891,10 +4851,11 @@ test "exl3 resident decode folds the shared-expert gate tail into the finish red
 }
 
 test "qwen4 PLE spec capture follows the verify flag, streamed or not" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     var state: qwen4_mod.Qwen4State = undefined;
     state.hash.ngram_size = 3;
     var xfm: Transformer = undefined;
-    xfm.qwen4 = &state;
+    xfm.arch_state.qwen4.model = &state;
     xfm.expert_stream = null;
     xfm.spec_capture_ssm = false;
     var entry = SSMCacheEntry{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
@@ -5519,6 +5480,7 @@ test "sdpa force_fused: hd-256 causal blocks the gate admits match the unforced 
 }
 
 test "qwen4 MTP head KV stays dense under the engine-default trunk scheme unless opted in" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const t = std.testing;
     const saved = Transformer.mtp_head_kv_quant_override;
     defer Transformer.mtp_head_kv_quant_override = saved;
@@ -5531,17 +5493,17 @@ test "qwen4 MTP head KV stays dense under the engine-default trunk scheme unless
     var head: Qwen4Mtp = undefined;
     const head_cache = try KVCache.init(t.allocator, xfm.config.num_hidden_layers + 1);
     head.cache = head_cache;
-    xfm.qwen4_mtp = head;
-    defer xfm.qwen4_mtp.?.cache.deinit();
-    try t.expectEqual(kv_quant.Scheme.off, xfm.qwen4_mtp.?.cache.config.scheme);
+    xfm.arch_state.qwen4.mtp = head;
+    defer xfm.arch_state.qwen4.mtp.?.cache.deinit();
+    try t.expectEqual(kv_quant.Scheme.off, xfm.arch_state.qwen4.mtp.?.cache.config.scheme);
     const trunk = kv_quant.KVQuantConfig.engine_default;
     try t.expect(trunk.isQuant());
     try qwen4MtpApplyKvQuant(&xfm, trunk);
-    try t.expectEqual(kv_quant.Scheme.off, xfm.qwen4_mtp.?.cache.config.scheme);
+    try t.expectEqual(kv_quant.Scheme.off, xfm.arch_state.qwen4.mtp.?.cache.config.scheme);
     Transformer.mtp_head_kv_quant_override = true;
     try qwen4MtpApplyKvQuant(&xfm, trunk);
-    try t.expectEqual(trunk.scheme, xfm.qwen4_mtp.?.cache.config.scheme);
-    try t.expectEqual(trunk.bits, xfm.qwen4_mtp.?.cache.config.bits);
+    try t.expectEqual(trunk.scheme, xfm.arch_state.qwen4.mtp.?.cache.config.scheme);
+    try t.expectEqual(trunk.bits, xfm.arch_state.qwen4.mtp.?.cache.config.bits);
 }
 
 test "head row coverage declines virtual widths before any stacked dispatch" {
@@ -5556,6 +5518,7 @@ test "head row coverage declines virtual widths before any stacked dispatch" {
 }
 
 test "verify MoE rows preserve every value with fewer graph operations" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
     const allocator = testing.allocator;
@@ -5568,8 +5531,8 @@ test "verify MoE rows preserve every value with fewer graph operations" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    compileMoeRouting(&xfm);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
+    xfm.compileMoeRouting();
     var prng = std.Random.DefaultPrng.init(924);
     for ([_]usize{ 0, config.num_hidden_layers / 2, config.num_hidden_layers - 1 }) |layer| {
         const mw = &xfm.moe_layers.?[layer].mlp.moe;
@@ -5616,6 +5579,7 @@ test "verify MoE rows preserve every value with fewer graph operations" {
 }
 
 test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const allocator = testing.allocator;
     var source = try KVCache.init(allocator, 1);
     defer source.deinit();
@@ -5645,9 +5609,9 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
     head.seq_offset = 0;
     head.pos_base = 7;
     head.qsa_marks = .{};
-    xfm.qwen4_mtp = head;
+    xfm.arch_state.qwen4.mtp = head;
     defer {
-        const live = &xfm.qwen4_mtp.?;
+        const live = &xfm.arch_state.qwen4.mtp.?;
         live.cache.deinit();
         _ = mlx.mlx_array_free(live.entry.conv_state);
         _ = mlx.mlx_array_free(live.entry.ssm_state);
@@ -5656,16 +5620,17 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
     }
 
     try testing.expectError(error.MtpHeadInvalidOrigin, qwen4MtpAdopt(&xfm, &snapshot, &aux, &.{}, -1, 1));
-    try testing.expectEqual(@as(usize, 0), xfm.qwen4_mtp.?.cache.step);
-    try testing.expectEqual(@as(usize, 0), xfm.qwen4_mtp.?.seq_offset);
-    try testing.expectEqual(@as(c_int, 7), xfm.qwen4_mtp.?.pos_base);
+    try testing.expectEqual(@as(usize, 0), xfm.arch_state.qwen4.mtp.?.cache.step);
+    try testing.expectEqual(@as(usize, 0), xfm.arch_state.qwen4.mtp.?.seq_offset);
+    try testing.expectEqual(@as(c_int, 7), xfm.arch_state.qwen4.mtp.?.pos_base);
     try qwen4MtpAdopt(&xfm, &snapshot, &aux, &.{}, 8, 1);
-    try testing.expectEqual(@as(usize, 1), xfm.qwen4_mtp.?.cache.step);
-    try testing.expectEqual(@as(usize, 1), xfm.qwen4_mtp.?.seq_offset);
-    try testing.expectEqual(@as(c_int, 8), xfm.qwen4_mtp.?.pos_base);
+    try testing.expectEqual(@as(usize, 1), xfm.arch_state.qwen4.mtp.?.cache.step);
+    try testing.expectEqual(@as(usize, 1), xfm.arch_state.qwen4.mtp.?.seq_offset);
+    try testing.expectEqual(@as(c_int, 8), xfm.arch_state.qwen4.mtp.?.pos_base);
 }
 
 test "single-stream verify feature selection excludes prefill and ordinary decoding" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     var xfm: Transformer = undefined;
     var qwen4: qwen4_mod.Qwen4State = undefined;
     const old_features = trunk_mod.single_verify_test_features;
@@ -5673,7 +5638,7 @@ test "single-stream verify feature selection excludes prefill and ordinary decod
     trunk_mod.single_verify_test_features = @splat(true);
     inline for (.{ SingleVerifyFeature.routing, SingleVerifyFeature.down_reduce, SingleVerifyFeature.hc_graph }) |feature| {
         for ([_]bool{ false, true }) |is_qwen4| {
-            xfm.qwen4 = if (is_qwen4) &qwen4 else null;
+            xfm.arch_state.qwen4.model = if (is_qwen4) &qwen4 else null;
             for ([_]bool{ false, true }) |capture| {
                 xfm.spec_capture_ssm = capture;
                 for ([_]c_int{ 1, 2, 4 }) |batch| {
@@ -5684,7 +5649,7 @@ test "single-stream verify feature selection excludes prefill and ordinary decod
                 }
             }
         }
-        xfm.qwen4 = &qwen4;
+        xfm.arch_state.qwen4.model = &qwen4;
         xfm.spec_capture_ssm = true;
         trunk_mod.single_verify_test_features[@backingInt(feature)] = false;
         try testing.expect(!xfm.verifyFeatureEnabled(feature, false, 1, 5));
@@ -5710,6 +5675,7 @@ fn ladderAffine(rig: *Qwen4LadderRig, r: std.Random, rows: c_int, cols: c_int) !
 }
 
 test "qwen4 forward: the layer dispatch resolves an affine projection once, in the weights it stores" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     qwen4_standin_override = .{ .gdn = true, .mlp = true, .hc = true };
     defer qwen4_standin_override = null;
@@ -5765,6 +5731,7 @@ test "qwen4 decode ladder: stride resolution keeps an explicit off and leaves ot
 }
 
 test "qwen4 decode ladder: serial decode keeps the default off; an explicit stride fills host ids first, skips lazy ones" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
     defer qwen4_standin_override = null;
@@ -5816,6 +5783,7 @@ test "qwen4 decode ladder: serial decode keeps the default off; an explicit stri
 }
 
 test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits and per-slot history bit-identical to off" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
     defer qwen4_standin_override = null;
@@ -5905,6 +5873,7 @@ test "streamed deferred verification crosses only GDN MoE layers without PLE" {
 }
 
 test "streamed deferred verification preserves outputs states and accounting on hits misses and workspace" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -6045,4 +6014,40 @@ test "qsa indexer scalar rope applies yarn mscale to first rope_dims only" {
     const bv = mlx.mlx_array_data_float32(b).?;
     for (0..64) |i| try testing.expectEqual(bv[i] * 2.0, av[i]);
     for (64..128) |i| try testing.expectEqual(bv[i], av[i]);
+}
+
+test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
+    var xfm: Transformer = undefined;
+    xfm.s = mlx.gpuStream();
+    xfm.allocator = testing.allocator;
+    xfm.arch_state = .{};
+    const head_cache = try KVCache.init(testing.allocator, 1);
+    var head: Qwen4Mtp = undefined;
+    head.cache = head_cache;
+    head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    head.qsa_marks = .{};
+    head.seq_offset = 7;
+    head.pos_base = 3;
+    xfm.arch_state.qwen4.mtp = head;
+    const m = &xfm.arch_state.qwen4.mtp.?;
+    defer {
+        ssmFreeQsaState(&m.entry);
+        m.qsa_marks.deinit();
+        m.cache.deinit();
+    }
+    qwen4MtpResetOwned(&xfm, false);
+    try testing.expectEqual(@as(usize, 7), m.seq_offset);
+    try testing.expectEqual(@as(i32, 3), m.pos_base);
+}
+
+test "batched rows refuse a trunk that holds no Flash-Next state" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
+    var xfm: Transformer = undefined;
+    xfm.arch_state = .{};
+    xfm.moe_layers = &.{};
+    xfm.fwd_gen = 0;
+    var ctx: ForwardCtx = undefined;
+    const ctxs = [_]*ForwardCtx{&ctx};
+    try testing.expectError(error.BatchedRowsNeedQwen4State, forwardMoeBatchedRows(&xfm, .{ .ctx = null }, &ctxs, &.{0}, false, null, null));
 }

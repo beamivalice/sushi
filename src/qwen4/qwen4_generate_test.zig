@@ -59,7 +59,7 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     // scratch. Only the two seed fields are touched here; the rest of the head
     // (and of the Transformer) is never read on this path.
     var t: Transformer = undefined;
-    t.qwen4_mtp = null;
+    t.arch_state.qwen4.mtp = null;
     const ref = MtpHeadRef.of("qwen4", &t);
 
     // `--no-mtp`: no head to seed, and setting one must not fault.
@@ -71,7 +71,7 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     var head: qwen4_forward.Qwen4Mtp = undefined;
     head.ev_seed_accept = null;
     head.ev_seed_m_lo = 1;
-    t.qwen4_mtp = head;
+    t.arch_state.qwen4.mtp = head;
     // A head that has never published reads null — not a zeroed surface.
     try testing.expect(ref.evSeed() == null);
 
@@ -196,16 +196,16 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     head.rerank = null;
     head.rerank_logged = false;
     head.rerank_tried = false;
-    fx.xfm.qwen4_mtp = head;
-    defer if (fx.xfm.qwen4_mtp) |*m| {
+    fx.xfm.arch_state.qwen4.mtp = head;
+    defer if (fx.xfm.arch_state.qwen4.mtp) |*m| {
         if (m.rerank) |*rc| rc.deinit();
     };
 
     // Nothing is built by construction...
-    try testing.expect(fx.xfm.qwen4_mtp.?.rerank == null);
+    try testing.expect(fx.xfm.arch_state.qwen4.mtp.?.rerank == null);
     // ...the eager build stands on its own...
     try testing.expect(qwen4_forward.qwen4BuildDraftRerank(&fx.xfm));
-    const built = fx.xfm.qwen4_mtp.?.rerank orelse return error.NoCoarseHead;
+    const built = fx.xfm.arch_state.qwen4.mtp.?.rerank orelse return error.NoCoarseHead;
     try testing.expectEqual(fx.vocab, built.rows);
     try testing.expect(built.bits > 0 and built.bits < 8);
 
@@ -214,12 +214,12 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     const head_ctx = built.q.w.ctx;
     const ref = MtpHeadRef.of("qwen4", &fx.xfm);
     try testing.expect(ref.canRerankDrafts());
-    try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
+    try testing.expectEqual(head_ctx, fx.xfm.arch_state.qwen4.mtp.?.rerank.?.q.w.ctx);
 
     // One-shot: a second eager build (both load paths firing, a re-probe)
     // keeps the head it already has.
     try testing.expect(qwen4_forward.qwen4BuildDraftRerank(&fx.xfm));
-    try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
+    try testing.expectEqual(head_ctx, fx.xfm.arch_state.qwen4.mtp.?.rerank.?.q.w.ctx);
 }
 
 test "mtpAdaptiveVoteFor: four real switch events of the qwen4 A/B" {
@@ -396,7 +396,7 @@ test "qwen4: the spec warm-up runs a prefill-shaped forward through the grouped 
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     const rate_groups = @import("sushi_exl3").rate_groups;
     const before = rate_groups.prefill_chains;
     try xfm.warmupSpecVerify(1, @import("../kv_quant.zig").KVQuantConfig.engine_default);
@@ -431,7 +431,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -573,7 +573,7 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -670,7 +670,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -844,7 +844,7 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const previous = group_planner.enabled_override;
@@ -934,7 +934,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     const prior = group_planner.enabled_override;
@@ -1090,7 +1090,7 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -1197,7 +1197,7 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;

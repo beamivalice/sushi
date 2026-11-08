@@ -313,10 +313,10 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // finalize here instead.
     if (slot.legacy_gen) |*g| {
         finishSpec(slot, g);
-        // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
+        // The arch meters ride the same seam: the SERVE path finalizes here, so
         // wiring it only beside generate.zig's own logSpecStats() calls (the
         // legacy/CLI path) makes it dead on every served request.
-        g.logQsaArms();
+        g.logArchMeters();
         g.persistRoundCost();
     }
     const latched: ?[]const u8 = mlx.peekErrorName();

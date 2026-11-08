@@ -607,11 +607,9 @@ pub const Slot = struct {
             .ssm_member_gen = transformer_mod.nextSsmMemberGen(),
             .arch_ctx = arch_state.ctxForSlot(if (slot.request) |*request| request else null),
             .vision_embeddings = slot.vision_embeddings,
-            .mrope_pos = slot.mrope_pos,
-            .mrope_total = slot.mrope_total,
-            .mrope_delta = slot.mrope_delta,
             .capture_hidden = null,
         };
+        arch_state.setMrope(&slot.ctx.arch_ctx, slot.mrope_pos, slot.mrope_total, slot.mrope_delta);
 
         return slot;
     }
@@ -621,7 +619,7 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
-        if (self.model.transformer) |xfm| xfm.markQsaPooledRopeStale();
+        if (self.model.transformer) |xfm| arch_state.markTablesStale(xfm);
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
@@ -631,7 +629,7 @@ pub const Slot = struct {
         self.cache.deinit();
         if (self.request) |*request| request.deinit();
         if (self.ssm_entries) |entries| {
-            if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
+            if (self.model.transformer) |xfm| arch_state.dropGroup(xfm, entries);
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
@@ -2519,7 +2517,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 // Streams end this way on a stop sequence or a client that leaves: finishSlot's line is theirs too.
                 if (s.legacy_gen) |*g| {
                     slot_outcome.finishSpec(s, g);
-                    g.logQsaArms();
+                    g.logArchMeters();
                 }
                 commitCancelledAtCleanup(sch, s, commitSlotIfApplicable);
                 if (s.model.prefix_cache) |*hc| {
@@ -2530,7 +2528,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
-            if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
+            if (s.model.transformer) |xfm| arch_state.resetTables(xfm);
             if (s.model.config) |c| sched.endRequest(c);
         }
         if (cleanup_n > 0) {
@@ -2650,7 +2648,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
                             if (slot.model.transformer) |xf| {
                                 slot.cache.truncate(0, xf.s) catch {};
-                                xf.resetQsaPooledRope();
+                                arch_state.resetTables(xf);
                                 sched.resetForRetry(slot, xf);
                             }
                             if (slot.legacy_gen) |*g| {
@@ -3454,11 +3452,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.moe_seq_offset = &slot.moe_seq_offset;
     slot.ctx.ssm_entries = slot.ssm_entries;
     slot.ctx.vision_embeddings = slot.vision_embeddings;
-    slot.ctx.mrope_pos = slot.mrope_pos;
-    slot.ctx.mrope_total = slot.mrope_total;
-    slot.ctx.mrope_delta = slot.mrope_delta;
+    arch_state.setMrope(&slot.ctx.arch_ctx, slot.mrope_pos, slot.mrope_total, slot.mrope_delta);
     slot.ctx.capture_hidden = null;
-    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
+    if (slot.model.transformer) |xfm| try arch_state.releaseGroup(xfm, &slot.ctx);
 
     // A module-owned arch that CAN rewind (`moduleStateSpecRollback`) may run
     // its own MTP head; PLD/drafter stay off there for the reasons in
@@ -4459,7 +4455,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     if (Planner.enabled() and slot.planner_force_plain) {
         gen.mtp_hidden_stale = true;
     }
-    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
+    if (slot.model.transformer) |xfm| try arch_state.releaseGroup(xfm, &slot.ctx);
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
     // generators handle the disabled fallback internally.
@@ -4771,10 +4767,9 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
 /// tick (skipping would advance nothing, so a group that never becomes ready would spin). Decided
 /// before `batchedTickRows` so a slot's pending token is stop-checked on exactly one path.
 fn serialFallback(sch: *Scheduler, xfm: *const Transformer, active: []*Slot, comptime serial: anytype) !bool {
-    if (!xfm.supportsBatchedGdnDecode()) return false;
     const all_ready = for (active) |s| {
         const gen = if (s.legacy_gen) |*g| g else continue;
-        if (!xfm.batchedGdnReady(&.{&gen.ctx})) break false;
+        if (!sched.readyToBatch(xfm, &gen.ctx)) break false;
     } else true;
     if (all_ready) return false;
     for (active) |s| try serial(sch, s);

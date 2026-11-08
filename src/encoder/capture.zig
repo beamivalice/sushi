@@ -225,10 +225,13 @@ pub const Capture = struct {
             try loaded.xfm.resetCache();
             var ctx = loaded.xfm.defaultCtx();
             ctx.skip_lm_head = true;
-            ctx.skip_ple = layer != info.ple_layer;
             const input = if (layer > 0) self.hidden.?.array(w) else mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(input);
-            if (layer > 0) ctx.stream_in = input;
+            // The layer-at-a-time capture runs the Flash-Next forward from the layer's input stream.
+            if (comptime @hasField(@TypeOf(ctx.arch_ctx), "qwen4")) {
+                ctx.arch_ctx.qwen4.skip_ple = layer != info.ple_layer;
+                if (layer > 0) ctx.arch_ctx.qwen4.stream_in = input;
+            }
             var slot = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(slot);
             const ids = [_]u32{0};

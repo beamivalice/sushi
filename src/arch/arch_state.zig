@@ -4,14 +4,20 @@
 //!
 //! A `State` may declare `init` (filled after the trunk's weights, from `InitArgs`), `ctx(*State) Ctx` (what the
 //! default context carries), `runsOwnModel` (its own model, not the trunk's layers, runs the forward), `sharesReadonly`
-//! (weights every slot reads), `rawEmbedding` and `headShortlist` (an argmax-only readout of the lm head). A `Ctx` with
-//! a `request` field points at the request a slot owns beside its KV cache (`SlotRequest`).
+//! (weights every slot reads), `specRollsBack`, `rawEmbedding`, `headShortlist` (an argmax-only readout of the lm
+//! head), `clearCompiled` (closures bound to the compiling thread) and the trunk ops below that take the trunk. A `Ctx`
+//! with a `request` field points at the request a slot owns beside its KV cache (`SlotRequest`); one may declare
+//! `mrope`/`setMrope` (an M-RoPE position table) and `logMeters` (per-request meters).
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
+const mrope = @import("../mrope.zig");
+const mtp = @import("../mtp.zig");
 const registry = @import("registry.zig");
 const arch_config = @import("config.zig");
-const Trunk = @import("../trunk.zig").Trunk;
+const trunk = @import("../trunk.zig");
+const Trunk = trunk.Trunk;
+const ForwardCtx = trunk.ForwardCtx;
 
 const tags = std.enums.values(registry.Tag);
 
@@ -64,6 +70,128 @@ pub fn runsOwnModel(s: *const State) bool {
 pub fn sharesReadonly(s: *const State) bool {
     inline for (tags) |t| {
         if (comptime has(Decl(t, "State"), "sharesReadonly")) if (@field(s, @tagName(t)).sharesReadonly()) return true;
+    }
+    return false;
+}
+
+/// Frees the arch's compiled closures, bound to the thread that compiled them.
+pub fn clearCompiled(s: *State) void {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), "clearCompiled")) @field(s, @tagName(t)).clearCompiled();
+    }
+}
+
+/// Which of an arch's kernels a load compiles: a server compiles every one, the offline tools the decode-state gates.
+pub const CompileSet = enum { gates, all };
+
+/// The trunk ops below are functions a `State` declares over the trunk. Each built arch's runs on every trunk, and one
+/// whose state on `t` is empty finds nothing to do.
+fn trunkHook(comptime name: []const u8, args: anytype) void {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), name)) @call(.auto, @field(Decl(t, "State"), name), args);
+    }
+}
+
+fn trunkHookTry(comptime name: []const u8, args: anytype) !void {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), name)) try @call(.auto, @field(Decl(t, "State"), name), args);
+    }
+}
+
+pub fn compile(t: *Trunk, set: CompileSet) void {
+    trunkHook("compile", .{ t, set });
+}
+
+/// The arch's MTP head takes the trunk's KV scheme.
+pub fn applyHeadKvQuant(t: *Trunk, kv: trunk.KVQuantConfig) !void {
+    try trunkHookTry("applyHeadKvQuant", .{ t, kv });
+}
+
+/// Builds the MTP head's draft rerank; whether one is built.
+pub fn buildDraftRerank(t: *Trunk) bool {
+    inline for (tags) |tag| {
+        const S = Decl(tag, "State");
+        if (comptime has(S, "buildDraftRerank")) if (S.buildDraftRerank(t)) return true;
+    }
+    return false;
+}
+
+/// The MTP head's coarse-rerank shortlists for a group's stacked draft rows; false when the head built no rerank.
+pub fn draftShortlists(t: *Trunk, x: mlx.mlx_array, suppress: ?mlx.mlx_array, out: []mtp.Shortlist) !bool {
+    inline for (tags) |tag| {
+        const S = Decl(tag, "State");
+        if (comptime has(S, "draftShortlists")) return S.draftShortlists(t, x, suppress, out);
+    }
+    return error.NoMtpHead;
+}
+
+/// A checkpoint is taken at `row` of the MTP head's own rows.
+pub fn markHeadCheckpoint(t: *Trunk, row: usize) !void {
+    try trunkHookTry("markHeadCheckpoint", .{ t, row });
+}
+
+/// The per-model tables a forward builds from its slot's positions are stale: another slot runs next.
+pub fn markTablesStale(t: *Trunk) void {
+    trunkHook("markTablesStale", .{t});
+}
+
+/// Frees the per-model position tables.
+pub fn resetTables(t: *Trunk) void {
+    trunkHook("resetTables", .{t});
+}
+
+/// The slot's state leaves the batched decode group before a forward of its own.
+pub fn releaseGroup(t: *Trunk, ctx: *ForwardCtx) !void {
+    try trunkHookTry("releaseGroup", .{ t, ctx });
+}
+
+/// The slot whose `entries` these are leaves the batched decode group for good.
+pub fn dropGroup(t: *Trunk, entries: []trunk.SSMCacheEntry) void {
+    trunkHook("dropGroup", .{ t, entries });
+}
+
+/// Fills what a forward over lazy ids left for the host (`ForwardCtx.lazy_ids`), syncing on the ids.
+pub fn flushDeferred(t: *Trunk, ctx: *ForwardCtx) !void {
+    try trunkHookTry("flushDeferred", .{ t, ctx });
+}
+
+/// `flushDeferred` over the rows of one grouped forward, with one sync.
+pub fn flushDeferredGroup(t: *Trunk, ctxs: []const *ForwardCtx) !void {
+    try trunkHookTry("flushDeferredGroup", .{ t, ctxs });
+}
+
+/// Drops what a failed forward over lazy ids left for the host.
+pub fn discardDeferred(t: *Trunk, ctx: *ForwardCtx) void {
+    trunkHook("discardDeferred", .{ t, ctx });
+}
+
+/// The M-RoPE position table the forward's request carries; null for a text-only request or a build whose archs
+/// rotate without one.
+pub fn mropeOf(c: *const Ctx) ?mrope.PositionContext {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "Ctx"), "mrope")) if (@field(c, @tagName(t)).mrope()) |p| return p;
+    }
+    return null;
+}
+
+/// Points the forward at the request's M-RoPE table, borrowed from the slot.
+pub fn setMrope(c: *Ctx, pos: ?[]const i32, total: usize, delta: i32) void {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "Ctx"), "setMrope")) @field(c, @tagName(t)).setMrope(pos, total, delta);
+    }
+}
+
+/// Logs the per-request meters the forward's context tallied, and resets them.
+pub fn logMeters(c: *Ctx) void {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "Ctx"), "logMeters")) @field(c, @tagName(t)).logMeters();
+    }
+}
+
+/// The arch's state rewinds across a speculative verify, so its own MTP head may draft.
+pub fn specRollsBack(s: *const State) bool {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), "specRollsBack")) if (@field(s, @tagName(t)).specRollsBack()) return true;
     }
     return false;
 }
@@ -152,34 +280,7 @@ test "arch_state and arch_ctx have a field per enabled arch, its declared type o
 
 /// Fields of the engine handles that still name an arch: each arch's S3 stage moves its own into `arch_state` /
 /// `arch_ctx` and deletes its lines here. Empty means the seam is done.
-const arch_named_fields = [_][]const u8{
-    "Trunk.qwen4",
-    "Trunk.qwen4_stream_f32",
-    "Trunk.qwen4_mixer",
-    "Trunk.qwen4_mtp",
-    "Trunk.qwen4_mtp_owner",
-    "Trunk.decode_async_ladder_qwen4",
-    "Trunk.qsa_consts",
-    "Trunk.qsa_pooled_rope",
-    "Trunk.qsa_score_bank_builds",
-    "Trunk.compiled_gdn_gate",
-    "Trunk.compiled_hc_silu",
-    "Trunk.compiled_hc_mix",
-    "Trunk.compiled_hc_inj",
-    "Trunk.compiled_hc_write",
-    "Trunk.gdn_ones_w",
-    "Trunk.gdn_q_scale",
-    "Trunk.gdn_k_scale",
-    "Trunk.gdn_eps",
-    "ForwardCtx.qsa_mask",
-    "ForwardCtx.qsa_blocks",
-    "ForwardCtx.qsa_arms",
-    "ForwardCtx.skip_ple",
-    "ForwardCtx.qsa_entry",
-    "ForwardCtx.qsa_pos_base",
-    "ForwardCtx.ple_defer",
-    "ForwardCtx.ple_pending",
-};
+const arch_named_fields = [_][]const u8{};
 
 /// Whether `field`'s `_`-separated words hold `term`'s words in a row: `gdn` matches `compiled_gdn_gate`, not `agdn`.
 fn namesTerm(comptime field: []const u8, comptime term: []const u8) bool {

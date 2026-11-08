@@ -1,5 +1,6 @@
 const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
+const qwen4_state = @import("qwen4_state.zig");
 const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
@@ -923,13 +924,14 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
 }
 
 test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to keep" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
-    xfm.qsa_score_bank_builds = 0;
+    xfm.arch_state.qwen4.qsa_score_bank_builds = 0;
 
     var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
     defer ssmFreeQsaState(&entry);
@@ -1057,6 +1059,7 @@ test "qsa rollback: a rollback that reaches past the ring is a named error, not 
 }
 
 test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied history" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -1092,8 +1095,8 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     head.qsa_marks = .{};
     head.seq_offset = 0;
     head.pos_base = 0;
-    xfm.qwen4_mtp = head;
-    const m = &xfm.qwen4_mtp.?;
+    xfm.arch_state.qwen4.mtp = head;
+    const m = &xfm.arch_state.qwen4.mtp.?;
     defer {
         ssmFreeQsaState(&m.entry);
         m.qsa_marks.deinit();
@@ -1128,6 +1131,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
 }
 
 test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at the trunk's checkpoint" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -1159,8 +1163,8 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     head.qsa_marks = .{};
     head.seq_offset = 0;
     head.pos_base = 0;
-    xfm.qwen4_mtp = head;
-    const m = &xfm.qwen4_mtp.?;
+    xfm.arch_state.qwen4.mtp = head;
+    const m = &xfm.arch_state.qwen4.mtp.?;
     defer {
         ssmFreeQsaState(&m.entry);
         m.qsa_marks.deinit();
@@ -1229,6 +1233,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
 }
 
 test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept leftover is not resliced" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -1266,8 +1271,8 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
             head.qsa_marks = .{};
             head.seq_offset = 0;
             head.pos_base = 0;
-            xfm.qwen4_mtp = head;
-            const m = &xfm.qwen4_mtp.?;
+            xfm.arch_state.qwen4.mtp = head;
+            const m = &xfm.arch_state.qwen4.mtp.?;
             defer {
                 ssmFreeQsaState(&m.entry);
                 m.qsa_marks.deinit();
@@ -2074,6 +2079,7 @@ test "qsa key history: capacity-buffer append equals the concatenated reference,
 }
 
 test "qsa pooled bank: capacity append equals the concat, and the f32 score operand is rebuilt only when a block completes" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     // The bf16 bank must stay byte-for-byte the old `concatenate`; 12 layers of one forward reuse one f32 build.
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -2081,7 +2087,7 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     var t: Transformer = undefined;
     t.s = s;
     t.allocator = testing.allocator;
-    t.qsa_score_bank_builds = 0;
+    t.arch_state.qwen4.qsa_score_bank_builds = 0;
 
     const hd: c_int = 16;
     var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
@@ -2119,14 +2125,14 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     }
     try testing.expect(mlx.getShape(entry.qsa_pooled_buf)[1] > nb);
 
-    const before = t.qsa_score_bank_builds;
+    const before = t.arch_state.qwen4.qsa_score_bank_builds;
     const bank = try qwen4_qsa.qsaScoreBank(&t, &entry, 1, nb, hd);
-    try testing.expectEqual(before + 1, t.qsa_score_bank_builds);
+    try testing.expectEqual(before + 1, t.arch_state.qwen4.qsa_score_bank_builds);
     for (0..11) |_| {
         const again = try qwen4_qsa.qsaScoreBank(&t, &entry, 1, nb, hd);
         try testing.expect(again.ctx == bank.ctx);
     }
-    try testing.expectEqual(before + 1, t.qsa_score_bank_builds);
+    try testing.expectEqual(before + 1, t.arch_state.qwen4.qsa_score_bank_builds);
     try testing.expectEqual(@as(c_int, hd), mlx.getShape(bank)[2]);
     try testing.expectEqual(nb, mlx.getShape(bank)[3]);
 
@@ -2147,18 +2153,19 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     defer _ = mlx.mlx_array_free(one);
     try qwen4_qsa.qsaAppendPooled(&t, &entry, one, nb);
     _ = try qwen4_qsa.qsaScoreBank(&t, &entry, 1, nb + 1, hd);
-    try testing.expectEqual(before + 2, t.qsa_score_bank_builds);
+    try testing.expectEqual(before + 2, t.arch_state.qwen4.qsa_score_bank_builds);
     try testing.expectEqual(nb + 1, mlx.getShape(entry.qsa_score_bank)[3]);
 }
 
 test "qsa score bank: incremental column append matches a from-scratch rebuild" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
     var t: Transformer = undefined;
     t.s = s;
     t.allocator = testing.allocator;
-    t.qsa_score_bank_builds = 0;
+    t.arch_state.qwen4.qsa_score_bank_builds = 0;
 
     const hd: c_int = 16;
     const batch: c_int = 1;

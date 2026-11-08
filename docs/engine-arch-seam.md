@@ -40,22 +40,32 @@ joins `DROPPABLE` when its drop passes.
   reset). `Trunk.deinit`, `resetCache` and `warmup` are `model_handle.zig` operations that dispatch to the arch, which
   frees or resets its own state and then calls the trunk's `deinitTrunk` / `resetTrunk` / `warmupTrunk`.
   `Transformer` is an alias of `Trunk`, and `transformer.zig` re-exports the names that moved, until the arch stages
-  move their callers. The arch handle fields still on `Trunk` (`qwen4`, ...) are reached by name until each arch's
-  S3 stage moves its own; GLM's, DeepSeek's and MiMo's have moved (MiMo's `ForwardCtx` fields have not).
+  move their callers. No `Trunk` field names an arch, and `trunk.zig` re-exports no arch module's names; MiMo's three
+  `ForwardCtx` fields (`verify_rows`, `batch_rows`, `batch_row_offsets`) are the last to move into `arch_ctx`.
 - **The trunk archs' hooks.** `initTrunk` fills the state last, through `arch_state.initState`: the config's arch's
   `State.init` gets `InitArgs` (allocator, config, weights, name prefix, stream, the trunk's owned arrays) and returns
   a streamed load's expert engine; nothing after it can fail. The lm head's argmax-only readout asks
   `arch_state.headShortlist`. The MoE family asks `arch/moe.zig`, keyed by the config's arch, for an arch's own router
   logits, its routing over a selection bias, and whether the loader widens a dense router to f32 (`moe.routerLogits`,
   `moe.biasRouting`, `moe.widensRouter` in the arch's `arch.zig`).
+- **Trunk ops an arch's state answers.** A `State` may declare functions of the trunk that `arch_state.zig` runs on
+  every trunk for every built arch, comptime-unrolled, each acting on that trunk's own state (empty state: nothing to
+  do): `compile` (`.gates` for the offline tools, `.all` for the server), `applyHeadKvQuant`, `buildDraftRerank`,
+  `draftShortlists`, `markHeadCheckpoint`, `markTablesStale` / `resetTables`, `releaseGroup` / `dropGroup`,
+  `flushDeferred` / `flushDeferredGroup` / `discardDeferred`. A `Ctx` may declare `mrope` / `setMrope` (the
+  request's M-RoPE table, `arch_state.mropeOf`) and `logMeters`. `ForwardCtx.lazy_ids` marks ids that are still a lazy
+  sample: an arch's host-side lookup on them waits for `flushDeferred`. A config fact in `Facts` replaces an arch
+  predicate in shared code (`hyper_connected`: no per-layer norms, hyper-connection and PLE weights per layer).
 - **An arch's own state rides two registry-built fields.** `Trunk.arch_state` and `ForwardCtx.arch_ctx`
   (`src/arch/arch_state.zig`) are structs with a field per enabled arch: the `State` and `Ctx` its `arch.zig` declares,
   void where it declares none, each default-initialised so a context built by hand needs no arch field. An arch's S3
   stage moves its `Trunk` and `ForwardCtx` fields into them; a build without the arch has none. A `State` may declare
-  `init`, `ctx` (the default context's part), `runsOwnModel`, `sharesReadonly`, `rawEmbedding` and `headShortlist`,
-  which `arch_state.zig` asks generically; shared code that needs one arch's state goes through that arch's accessors
-  (`glm5_state.modelOf`, `requestOf`, `dsv41_state.modelOf`, `mimo2_state.coarseHead`), which are null in a build
-  without it. A `prefix` module may declare
+  `init`, `ctx` (the default context's part), `runsOwnModel`, `sharesReadonly`, `specRollsBack`, `rawEmbedding`,
+  `headShortlist` and `clearCompiled`, which `arch_state.zig` asks generically; shared code that needs one arch's
+  state goes through that arch's accessors (`glm5_state.modelOf`, `requestOf`, `dsv41_state.modelOf`,
+  `mimo2_state.coarseHead`, `qwen4_state.isLoaded`, `mtpOf`, `stateOf`, `ctxOf`), which are null in a build without
+  it. While shared files still import an arch's folder, a build without the arch analyses it: a folder test that
+  reaches the arch's state opens with `if (comptime !<arch>_state.built) return error.SkipZigTest;`. A `prefix` module may declare
   `diskLayoutKey`, the arch's own SSD namespace key (DeepSeek names its drop list and arms there; `arch/prefix.zig` asks
   it, and the config's tag is the fallback). The request a slot owns beside its KV cache is `arch_state.SlotRequest`,
   the type of the one `Ctx.request` a built arch declares (`NoRequest` when none does). A moved field leaves `Trunk` in
@@ -63,8 +73,8 @@ joins `DROPPABLE` when its drop passes.
 - **The seam guard** (`arch_state.zig`, at compile time) covers `Trunk`, `ForwardCtx` and `Slot` only, not `Generator`,
   `LoadedModel` or `ModelConfig`. A field there fails the build when it holds a registered arch's name stem (`glm`,
   `dsv`, `qwen`, `mimo`) or, as whole `_`-separated words, one of the `seam_terms` on that arch's registry line (qwen4:
-  `qsa`, `gdn`, `ple`, `compiled_hc`), and is not on the allowlist; a listed field that is gone fails too. Each S3 stage
-  deletes its lines, and an empty list means the seam is done. A term names a concept only that arch owns, never a
+  `qsa`, `gdn`, `ple`, `compiled_hc`), and is not on the allowlist; a listed field that is gone fails too. The list is
+  empty: the seam is done for these three handles. A term names a concept only that arch owns, never a
   shared one (`hc_mean`).
 - **The chat face.** `src/<arch>/<arch>_chat.zig` is the arch's MLX-free face for the host tier (chat templates, tool
   calls, tokenizer: no MLX, so `test-host` runs beside a server). It holds `model_types` (`arch.zig` re-exports them),

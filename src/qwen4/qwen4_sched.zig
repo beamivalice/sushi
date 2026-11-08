@@ -35,12 +35,17 @@ pub fn modelBatches(xfm: *const Transformer) bool {
     return qwen4_forward.supportsBatchedGdnDecode(xfm);
 }
 
+/// A GDN slot without recurrent state yet cannot merge.
+pub fn readyToBatch(xfm: *const Transformer, ctx: *ForwardCtx) bool {
+    return !qwen4_forward.supportsBatchedGdnDecode(xfm) or qwen4_forward.batchedGdnReady(xfm, &.{ctx});
+}
+
 pub fn padsBatch(config: *const ModelConfig) bool {
     return !config.supportsBatchedQwen4Rows();
 }
 
 pub fn plannerObservesPlainRows(xfm: *const Transformer) bool {
-    return xfm.qwen4 != null;
+    return xfm.arch_state.qwen4.model != null;
 }
 
 const arm_padded: u8 = 0;
@@ -100,7 +105,7 @@ pub fn handoffHistory(slot: *Slot, cps: []trunk_mod.SSMCheckpoint) void {
 /// The in-checkpoint head commits its QSA half beside the KV. Its row count IS its cache's step; a snapshot whose
 /// step disagrees is refused.
 pub fn mtpHeadCommit(head: *const Transformer) ?sched.HeadParts {
-    const hm = &head.qwen4_mtp.?;
+    const hm = &head.arch_state.qwen4.mtp.?;
     if (hm.cache.step != hm.seq_offset) {
         log.warn("[hot-cache] mtp head step gap (cache.step={d}, history={d} rows) — head history not committed\n", .{ hm.cache.step, hm.seq_offset });
         return null;

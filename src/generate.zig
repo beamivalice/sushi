@@ -26,6 +26,8 @@ const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
 
 const Transformer = transformer_mod.Transformer;
+const arch_state = @import("arch/arch_state.zig");
+const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
 const SSMCacheEntrySnapshot = transformer_mod.SSMCacheEntrySnapshot;
@@ -835,23 +837,11 @@ pub const Generator = struct {
     /// - `per_draft_pct` (drafter only) = accepts / (attempts × (block_size-1)),
     ///   the per-draft acceptance probability comparable to vLLM's reported
     ///   "62% acceptance rate" metric.
-    /// Which QSA arm served this request's attention (qwen4_exp only; no-op
-    /// elsewhere). The engaged/declined meters are one-shots for the whole
-    /// PROCESS, so they cannot say what ran on THIS request at THIS context
-    /// length — a gather that quietly hands every call back to the dense mask
-    /// (a full kv8 dequant per layer per forward) otherwise reads like a
-    /// healthy run. Emitted next to `[spec-stats]`; resets the tally.
-    pub fn logQsaArms(self: *Generator) void {
-        // The tally rides THIS request's ForwardCtx — the one every forward
-        // of this slot was handed. A Transformer-level counter printed the
-        // union of every slot that decoded or prefilled since the last
-        // finisher reset it.
-        const c = self.ctx.qsa_arms.take() orelse return;
-        const arm = c.majority() orelse return;
-        log.info(
-            "  [qsa-arms] qsa={s} calls={d} mask={d} decode={d} verify={d} prefill={d}\n",
-            .{ @tagName(arm), c.total(), c.mask, c.decode, c.verify, c.prefill },
-        );
+    /// The arch's per-request meters (`arch_state.logMeters`), emitted next to `[spec-stats]`. The process-wide
+    /// engaged/declined meters cannot say what ran on THIS request at THIS context length; the tally rides this
+    /// request's own ForwardCtx, so concurrent slots never merge into whichever finishes first.
+    pub fn logArchMeters(self: *Generator) void {
+        arch_state.logMeters(&self.ctx.arch_ctx);
     }
 
     pub const SpecMode = spec_stats.Mode;
@@ -1556,7 +1546,7 @@ pub const Generator = struct {
             if (mtp_cache) |*mc| mc.activate();
             transformer_mod.reserveQsaHistoryWithHead(
                 ctx.ssm_entries,
-                if (xfm.qwen4_mtp) |*m| &m.entry else null,
+                if (qwen4_state.mtpOf(xfm)) |m| &m.entry else null,
                 @intCast(reserved_tokens),
             );
             // Admission billed the request's top at `default_chunk`; the chunks before it start at
@@ -1685,10 +1675,10 @@ pub const Generator = struct {
                         mtp_position_base = ssm_cp_offset + pos;
                         mtp_history_started = true;
                     }
-                    const mtp_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
-                        .pos = positions,
-                        .total = ctx.mrope_total,
-                        .delta = ctx.mrope_delta,
+                    const mtp_mrope_ctx: ?mtp_mod.MropeContext = if (arch_state.mropeOf(&ctx.arch_ctx)) |positions| .{
+                        .pos = positions.pos,
+                        .total = positions.total,
+                        .delta = positions.delta,
                         .base = mtp_position_base,
                     } else null;
                     try options.mtp.?.appendHistory(
@@ -1782,7 +1772,7 @@ pub const Generator = struct {
                     if (mtp_active) {
                         mtp_cache.?.activate();
                     }
-                    if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
+                    if (mtp_active) arch_state.markHeadCheckpoint(xfm, abs_end_for_cp2 -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
                     // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
@@ -1897,7 +1887,7 @@ pub const Generator = struct {
                     if (mtp_active) {
                         mtp_cache.?.activate();
                     }
-                    if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
+                    if (mtp_active) arch_state.markHeadCheckpoint(xfm, final_abs -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
                     prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
@@ -1969,10 +1959,10 @@ pub const Generator = struct {
             const stop = [_]c_int{ all_shape[0], @intCast(tail_len - 1), all_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&tail_hist_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
-            const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
-                .pos = positions,
-                .total = ctx.mrope_total,
-                .delta = ctx.mrope_delta,
+            const tail_mrope_ctx: ?mtp_mod.MropeContext = if (arch_state.mropeOf(&ctx.arch_ctx)) |positions| .{
+                .pos = positions.pos,
+                .total = positions.total,
+                .delta = positions.delta,
                 .base = mtp_position_base,
             } else null;
             try options.mtp.?.appendHistory(
@@ -2500,7 +2490,7 @@ pub const Generator = struct {
             self.prompt_ids_owned = &.{};
             self.prompt_ids_alloc = null;
         }
-        self.xfm.markQsaPooledRopeStale();
+        arch_state.markTablesStale(self.xfm);
         if (self.mtp_cache) |*mc| {
             mc.deinit();
             self.mtp_cache = null;
@@ -2921,7 +2911,7 @@ pub const Generator = struct {
             log.warn("[prefix] thought restore point at {d} not taken: {s}\n", .{ pos, @errorName(err) });
             return;
         };
-        if (self.mtp_cache != null) self.xfm.qwen4MtpMarkQsaLeftover(pos -| self.mtp_position_base) catch {};
+        if (self.mtp_cache != null) arch_state.markHeadCheckpoint(self.xfm, pos -| self.mtp_position_base) catch {};
         self.ssm_checkpoints.append(a, cp) catch {
             cp.deinit(a);
             return;
@@ -3976,18 +3966,18 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array, l
     // The graph is built while the previous step still runs on the GPU; an
     // arch with a host-side token lookup (qwen4 n-gram PLE) fills its leaf
     // afterwards, so the one sync on the token comes AFTER the build.
-    ctx.ple_defer = true;
+    ctx.lazy_ids = true;
     ctx.lazy_logits = lazy_logits;
     defer {
-        ctx.ple_defer = false;
+        ctx.lazy_ids = false;
         ctx.lazy_logits = false;
     }
     const logits = xfm.forwardWith(ctx, reshaped) catch |e| {
-        xfm.discardDeferredPle(ctx);
+        arch_state.discardDeferred(xfm, ctx);
         return e;
     };
-    xfm.flushDeferredPle(ctx) catch |e| {
-        xfm.discardDeferredPle(ctx);
+    arch_state.flushDeferred(xfm, ctx) catch |e| {
+        arch_state.discardDeferred(xfm, ctx);
         _ = mlx.mlx_array_free(logits);
         return e;
     };
@@ -4503,32 +4493,34 @@ test "batched MTP state includes the last row activated by round begin" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     const allocator = testing.allocator;
     var xfm: Transformer = undefined;
-    xfm.qwen4_mtp_owner = null;
+    xfm.arch_state = .{};
+    const q4 = qwen4_state.stateOf(&xfm).?;
+    const q4f = @import("qwen4/qwen4_forward.zig");
     var head: transformer_mod.Qwen4Mtp = undefined;
     head.cache = try KVCache.init(allocator, 1);
     head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
     head.qsa_marks = .{};
     head.seq_offset = 0;
     head.pos_base = 0;
-    xfm.qwen4_mtp = head;
-    defer xfm.qwen4_mtp.?.cache.deinit();
-    var a: Transformer.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
+    q4.mtp = head;
+    defer q4.mtp.?.cache.deinit();
+    var a: q4f.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
     defer a.deinit();
-    var b: Transformer.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
+    var b: q4f.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
     defer b.deinit();
-    xfm.qwen4MtpActivate(&a);
-    xfm.qwen4_mtp.?.seq_offset = 7;
-    xfm.qwen4_mtp.?.cache.step = 7;
-    xfm.qwen4_mtp.?.pos_base = 3;
-    xfm.qwen4MtpActivate(&b);
-    xfm.qwen4_mtp.?.seq_offset = 2;
-    xfm.qwen4_mtp.?.cache.step = 2;
-    xfm.qwen4_mtp.?.pos_base = 11;
+    q4f.qwen4MtpActivate(&xfm, &a);
+    q4.mtp.?.seq_offset = 7;
+    q4.mtp.?.cache.step = 7;
+    q4.mtp.?.pos_base = 3;
+    q4f.qwen4MtpActivate(&xfm, &b);
+    q4.mtp.?.seq_offset = 2;
+    q4.mtp.?.cache.step = 2;
+    q4.mtp.?.pos_base = 11;
     const caches = [_]MtpCacheRef{
         MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &a, .allocator = allocator }),
         MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &b, .allocator = allocator }),
     };
-    const want = [_]Transformer.Qwen4MtpState.Meta{
+    const want = [_]q4f.Qwen4MtpState.Meta{
         .{ .stash_len = 7, .origin = 3, .cache_step = 7 },
         .{ .stash_len = 2, .origin = 11, .cache_step = 2 },
     };
@@ -4536,7 +4528,7 @@ test "batched MTP state includes the last row activated by round begin" {
         const state = cache.as("qwen4").batchState();
         try testing.expectEqual(meta, state.meta());
     }
-    try testing.expect(xfm.qwen4_mtp_owner == null);
+    try testing.expect(q4.mtp_owner == null);
 }
 
 test "specTotals: the prompt-lookup rounds of an MTP request count beside its head rounds" {

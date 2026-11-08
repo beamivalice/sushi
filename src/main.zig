@@ -26,6 +26,7 @@ const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const server_state = @import("server_state.zig");
 const scheduler_mod = @import("scheduler.zig");
+const arch_state = @import("arch/arch_state.zig");
 const model_load = @import("model_load.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const model_settings_mod = @import("model_settings.zig");
@@ -1217,7 +1218,7 @@ pub fn main(init: std.process.Init) !void {
         if (kv_cache.config.scheme != .off) {
             try xfm.cache.reinit(config.num_hidden_layers, kv_cache.config);
         }
-        try xfm.qwen4MtpApplyKvQuant(kv_cache.config);
+        try arch_state.applyHeadKvQuant(&xfm, kv_cache.config);
 
         // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
         {
@@ -1230,9 +1231,7 @@ pub fn main(init: std.process.Init) !void {
         if (xfm.moe_layers != null) {
             xfm.compileMoeRouting();
         }
-        if (config.linear_num_key_heads > 0) {
-            xfm.compileGdnGate();
-        }
+        arch_state.compile(&xfm, .gates);
         log.info("Model ready.\n", .{});
 
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";

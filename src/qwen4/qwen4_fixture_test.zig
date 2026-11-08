@@ -453,12 +453,12 @@ fn denseVerifyReplay(xfm: *Transformer, slot: *Qwen4TestSlot, tokens: []const i3
     var all = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(all);
     slot.ctx.capture_ssm_seq = true;
-    slot.ctx.ple_defer = true;
+    slot.ctx.lazy_ids = true;
     var watch = @import("../io_util.zig").Stopwatch.init(io);
     const logits = try xfm.forwardWithCaptureAll(&slot.ctx, ids, &last, &all);
     errdefer _ = mlx.mlx_array_free(logits);
     slot.ctx.capture_ssm_seq = false;
-    slot.ctx.ple_defer = false;
+    slot.ctx.lazy_ids = false;
     try qwen4_hc.flushDeferredPle(xfm, &slot.ctx);
     const evals = mlx.mlx_vector_array_new_data(&.{ logits, last, all }, 3);
     defer _ = mlx.mlx_vector_array_free(evals);
@@ -487,7 +487,7 @@ fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_i
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const serial = try Qwen4TestSlot.init(a, config.num_hidden_layers);
     defer serial.deinit(a);
     const verify = try Qwen4TestSlot.init(a, config.num_hidden_layers);
@@ -506,7 +506,7 @@ fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_i
             defer _ = mlx.mlx_array_free(hidden);
             var all = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(all);
-            slot.ctx.ple_defer = slot == verify;
+            slot.ctx.lazy_ids = slot == verify;
             slot.ctx.capture_ssm_seq = slot == verify;
             const out = if (slot == serial) try slot.forward(&xfm, history[begin..stop]) else try xfm.forwardWithCaptureAll(&slot.ctx, ids, &hidden, &all);
             defer _ = mlx.mlx_array_free(out);
@@ -546,14 +546,14 @@ fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_i
         defer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_eval(out));
     }
-    Transformer.qwen4_trace = &st;
-    defer Transformer.qwen4_trace = null;
+    qwen4_forward.qwen4_trace = &st;
+    defer qwen4_forward.qwen4_trace = null;
     const sr = try serial.forward(&xfm, &.{history[prefix + @as(usize, @intCast(row_index))]});
     defer _ = mlx.mlx_array_free(sr);
     try mlx.check(mlx.mlx_array_eval(sr));
-    Transformer.qwen4_trace = &vt;
+    qwen4_forward.qwen4_trace = &vt;
     verify.ctx.capture_ssm_seq = true;
-    verify.ctx.ple_defer = capture_hidden;
+    verify.ctx.lazy_ids = capture_hidden;
     var hidden = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(hidden);
     var all = mlx.mlx_array_new();
@@ -656,10 +656,10 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try t.expect(xfm.qwen4_mtp != null);
+    try t.expect(xfm.arch_state.qwen4.mtp != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     var host_ids: [16]i32 = undefined;
     for (&host_ids, 0..) |*v, i| v.* = @intCast(1 + i);
@@ -667,7 +667,7 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
     defer slot.deinit(allocator);
     var stream = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(stream);
-    slot.ctx.capture_stream_all = &stream;
+    slot.ctx.arch_ctx.qwen4.capture_stream_all = &stream;
     _ = mlx.mlx_array_free(try slot.forward(&xfm, host_ids[0..8]));
 
     const H = struct {
@@ -769,10 +769,10 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try t.expect(xfm.qwen4_mtp != null);
+    try t.expect(xfm.arch_state.qwen4.mtp != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     var host_ids: [32]i32 = undefined;
     for (&host_ids, 0..) |*v, i| v.* = @intCast(1 + i);
@@ -784,8 +784,8 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
     defer _ = mlx.mlx_array_free(stream_a);
     var stream_b = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(stream_b);
-    slot_a.ctx.capture_stream_all = &stream_a;
-    slot_b.ctx.capture_stream_all = &stream_b;
+    slot_a.ctx.arch_ctx.qwen4.capture_stream_all = &stream_a;
+    slot_b.ctx.arch_ctx.qwen4.capture_stream_all = &stream_b;
     _ = mlx.mlx_array_free(try slot_a.forward(&xfm, host_ids[0..8]));
     _ = mlx.mlx_array_free(try slot_b.forward(&xfm, host_ids[3..8]));
 
@@ -919,7 +919,7 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
                         const eq_logits = try qsaArraysAllEqual(solo_out[k].logits, bout[k].logits, s);
                         if (!eq_logits) {
                             const eq_stream = try qsaArraysAllEqual(solo_out[k].stream, bout[k].stream, s);
-                            var row_mix = try qwen4_hc.hcRead(&xfm, bout[k].stream, &xfm.qwen4_mtp.?.mixer, 1, 1);
+                            var row_mix = try qwen4_hc.hcRead(&xfm, bout[k].stream, &xfm.arch_state.qwen4.mtp.?.mixer, 1, 1);
                             defer row_mix.deinit();
                             const row_logits = try xfm.lmHeadProject(row_mix.mixed, false);
                             defer _ = mlx.mlx_array_free(row_logits);
@@ -1023,11 +1023,11 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.qwen4_stream_f32 = true;
+    try testing.expect(xfm.arch_state.qwen4.model != null);
+    xfm.arch_state.qwen4.stream_f32 = true;
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var qv = try qwen_vision.QwenVision.init(allocator, config, &weights);
     defer qv.deinit();
 
@@ -1106,13 +1106,13 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
         defer _ = mlx.mlx_array_free(ids);
         var ctx = xfm.defaultCtx();
         ctx.vision_embeddings = emb;
-        ctx.mrope_pos = pos_flat;
-        ctx.mrope_total = T;
-        ctx.mrope_delta = ri.delta;
+        ctx.arch_ctx.qwen4.mrope_pos = pos_flat;
+        ctx.arch_ctx.qwen4.mrope_total = T;
+        ctx.arch_ctx.qwen4.mrope_delta = ri.delta;
         var trace: qwen4_forward.Qwen4Trace = .{};
         defer trace.deinit();
-        Transformer.qwen4_trace = &trace;
-        defer Transformer.qwen4_trace = null;
+        qwen4_forward.qwen4_trace = &trace;
+        defer qwen4_forward.qwen4_trace = null;
         const logits = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
         // The reference's own cos/sin table [T, rope_dims] vs our chunk build.
@@ -1181,9 +1181,9 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
             ssmFreeQsaState(e);
         };
         var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &off, .ssm_entries = entries, .capture_hidden = null, .vision_embeddings = emb };
-        ctx.mrope_pos = pos_flat;
-        ctx.mrope_total = T;
-        ctx.mrope_delta = ri.delta;
+        ctx.arch_ctx.qwen4.mrope_pos = pos_flat;
+        ctx.arch_ctx.qwen4.mrope_total = T;
+        ctx.arch_ctx.qwen4.mrope_delta = ri.delta;
         var first_pad: usize = 0;
         while (first_pad < T and host_ids[first_pad] != config.image_token_id) first_pad += 1;
         const t1: usize = first_pad + n_img / 2;
@@ -1251,7 +1251,7 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
     defer fx.deinit();
     const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
@@ -1319,7 +1319,7 @@ test "qwen4 hc_mean capture is the mean of the four HC streams at the layer outp
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     const hc: usize = 4;
     const hidden: usize = @intCast(config.hidden_size);
@@ -1376,10 +1376,10 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(qwen4_forward.supportsBatchedGdnDecode(&xfm));
-    xfm.qwen4_stream_f32 = true;
+    xfm.arch_state.qwen4.stream_f32 = true;
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
     defer fx.deinit();
@@ -1498,7 +1498,7 @@ test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/le
     try testing.expect(qwen4_forward.supportsBatchedQwen4Rows(&xfm));
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const n_layers = config.num_hidden_layers;
 
     const lens = [_]usize{ 2300, 3100, 5200, 2100 };
@@ -1527,11 +1527,11 @@ test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/le
         made += 1;
         for ([_]*Qwen4TestSlot{ solo[slot], batch[slot] }) |sl| {
             if (slot == mrope_slot) {
-                sl.ctx.mrope_pos = &table;
-                sl.ctx.mrope_total = 2100;
+                sl.ctx.arch_ctx.qwen4.mrope_pos = &table;
+                sl.ctx.arch_ctx.qwen4.mrope_total = 2100;
             }
             _ = mlx.mlx_array_free(try sl.forward(&xfm, prompt[0..lens[slot]]));
-            if (slot == mrope_slot) sl.ctx.mrope_delta = delta;
+            if (slot == mrope_slot) sl.ctx.arch_ctx.qwen4.mrope_delta = delta;
         }
     }
 
@@ -1611,10 +1611,10 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     const State = struct {
         cache: KVCache,
@@ -1667,13 +1667,13 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
         const dl = try xfm.forwardWith(&dctx, did);
         defer _ = mlx.mlx_array_free(dl);
 
-        lctx.ple_defer = true;
+        lctx.lazy_ids = true;
         const ll = try xfm.forwardWith(&lctx, did);
         defer _ = mlx.mlx_array_free(ll);
-        lctx.ple_defer = false;
-        try testing.expect(lctx.ple_pending != null);
+        lctx.lazy_ids = false;
+        try testing.expect(lctx.arch_ctx.qwen4.ple_pending != null);
         try qwen4_hc.flushDeferredPle(&xfm, &lctx);
-        try testing.expect(lctx.ple_pending == null);
+        try testing.expect(lctx.arch_ctx.qwen4.ple_pending == null);
 
         const a = try qwen4ReadF32(allocator, dl, s);
         defer allocator.free(a);
@@ -1700,14 +1700,14 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
             dctx.capture_ssm_seq = false;
 
             lctx.capture_ssm_seq = true;
-            lctx.ple_defer = true;
+            lctx.lazy_ids = true;
             const ll = try xfm.forwardWith(&lctx, vids);
             defer _ = mlx.mlx_array_free(ll);
-            lctx.ple_defer = false;
+            lctx.lazy_ids = false;
             lctx.capture_ssm_seq = false;
-            try testing.expect(lctx.ple_pending != null);
+            try testing.expect(lctx.arch_ctx.qwen4.ple_pending != null);
             try qwen4_hc.flushDeferredPle(&xfm, &lctx);
-            try testing.expect(lctx.ple_pending == null);
+            try testing.expect(lctx.arch_ctx.qwen4.ple_pending == null);
 
             const a = try qwen4ReadF32(allocator, dl, s);
             defer allocator.free(a);
@@ -1746,10 +1746,10 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
         defer _ = mlx.mlx_array_free(did);
         const dl = try xfm.forwardWith(&dctx, did);
         defer _ = mlx.mlx_array_free(dl);
-        lctx.ple_defer = true;
+        lctx.lazy_ids = true;
         const ll = try xfm.forwardWith(&lctx, did);
         defer _ = mlx.mlx_array_free(ll);
-        lctx.ple_defer = false;
+        lctx.lazy_ids = false;
         const a = try qwen4ReadF32(allocator, dl, s);
         defer allocator.free(a);
         const b = try qwen4ReadF32(allocator, ll, s);
@@ -1773,10 +1773,10 @@ test "qwen4 deferred PLE: the captured hidden the MTP head reads matches the eag
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     const eager = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
     defer eager.deinit(allocator);
@@ -1809,22 +1809,22 @@ test "qwen4 deferred PLE: the captured hidden the MTP head reads matches the eag
         const e_logits = try xfm.forwardWithCaptureAll(&eager.ctx, ids, &e_last, &e_all);
         defer _ = mlx.mlx_array_free(e_logits);
         eager.ctx.capture_ssm_seq = false;
-        try testing.expect(eager.ctx.ple_pending == null);
+        try testing.expect(eager.ctx.arch_ctx.qwen4.ple_pending == null);
 
         var d_last = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(d_last);
         var d_all = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(d_all);
         lazy.ctx.capture_ssm_seq = arm.ssm;
-        lazy.ctx.ple_defer = true;
+        lazy.ctx.lazy_ids = true;
         const d_logits = try xfm.forwardWithCaptureAll(&lazy.ctx, ids, &d_last, &d_all);
         defer _ = mlx.mlx_array_free(d_logits);
-        lazy.ctx.ple_defer = false;
+        lazy.ctx.lazy_ids = false;
         lazy.ctx.capture_ssm_seq = false;
         // Filled by an eval inside the build or here: either way the capture
         // must not be holding the zero leaf.
         try qwen4_hc.flushDeferredPle(&xfm, &lazy.ctx);
-        try testing.expect(lazy.ctx.ple_pending == null);
+        try testing.expect(lazy.ctx.arch_ctx.qwen4.ple_pending == null);
 
         for ([_]struct { e: mlx.mlx_array, d: mlx.mlx_array, label: []const u8 }{
             .{ .e = e_logits, .d = d_logits, .label = "logits" },
@@ -1857,10 +1857,10 @@ test "qwen4 grow to the reservation before the prefill keeps greedy logits bit-i
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     const grown = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
     defer grown.deinit(allocator);
@@ -1921,10 +1921,10 @@ test "qwen4 MTP verify token values equal serial ticks without near-tie acquitta
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const prompt = [_]i32{ 248045, 846, 198, 7734, 264, 2716, 3255, 883, 264, 11952, 6618, 310, 5984, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 };
     const prefix_len = if (std.c.getenv("QWEN4_TEST_PREFIX_TOKENS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 0;
     const replay_prompt = try a.alloc(i32, prefix_len + prompt.len);
@@ -1965,7 +1965,7 @@ test "qwen4 MTP verify token values equal serial ticks without near-tie acquitta
                 defer _ = mlx.mlx_array_free(hidden);
                 var all = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(all);
-                verify.ctx.ple_defer = true;
+                verify.ctx.lazy_ids = true;
                 verify.ctx.capture_ssm_seq = true;
                 const out = try xfm.forwardWithCaptureAll(&verify.ctx, ids, &hidden, &all);
                 defer _ = mlx.mlx_array_free(out);
@@ -2005,11 +2005,11 @@ test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.qwen4_stream_f32 = true;
+    try testing.expect(xfm.arch_state.qwen4.model != null);
+    xfm.arch_state.qwen4.stream_f32 = true;
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     const n_layers = config.num_hidden_layers;
     const prompt_a = [_]i32{ 5, 17, 42, 9, 23, 8, 31, 2 };
@@ -2096,7 +2096,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     // A `build --yarn` pack carries `rope_type: "yarn"` in its config: the same
     // fixture then measures the context extension end to end (attention, QSA
     // indexer, M-RoPE table, MTP head) at positions past the trained window.
@@ -2107,10 +2107,10 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
     // the bar measures the math. The shipped bf16 path is pinned by the
     // `qwen4 fixture bf16` test below (streams vs a bf16 reference) — a tiny
     // random model's final logits are chaotic between any two bf16 renderings.
-    xfm.qwen4_stream_f32 = true;
+    xfm.arch_state.qwen4.stream_f32 = true;
     qwen4_forward.compileQwen4Hc(&xfm); // the served path: fused hyper-connection tails
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
     defer fx.deinit();
@@ -2138,9 +2138,9 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         var ctx = xfm.defaultCtx();
         var stream_all = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(stream_all);
-        ctx.capture_stream_all = &stream_all;
+        ctx.arch_ctx.qwen4.capture_stream_all = &stream_all;
         if (fx.get("l1_ngram_ids")) |ref_ids_arr| {
-            const st = xfm.qwen4.?;
+            const st = xfm.arch_state.qwen4.model.?;
             var f = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(f);
             try mlx.check(mlx.mlx_astype(&f, ref_ids_arr, .int32, s));
@@ -2159,7 +2159,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         const logits = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
         // MTP head: stream rows 0..T-2 + tokens 1..T-1 at positions 1.. → logits for 2..T.
-        if (fx.get("mtp_logits")) |ref_mtp_arr| if (xfm.qwen4_mtp != null) {
+        if (fx.get("mtp_logits")) |ref_mtp_arr| if (xfm.arch_state.qwen4.mtp != null) {
             const ref_mtp = try qwen4ReadF32(allocator, ref_mtp_arr, s);
             defer allocator.free(ref_mtp);
             const tm: c_int = @intCast(T - 1);
@@ -2320,7 +2320,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
     // third round's merged (stash ++ t1) head forward must match a fresh head
     // over the full committed rows. Head KV + aux keys + pooled blocks all
     // ride qwen4MtpTruncate.
-    if (xfm.qwen4_mtp != null) {
+    if (xfm.arch_state.qwen4.mtp != null) {
         const P: usize = 8;
         const M: usize = 2; // drafts per round
         const accs = [_]u32{ 1, 0 };
@@ -2409,7 +2409,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             _ = mlx.mlx_array_free(a);
         };
         var stash_off0: usize = 0;
-        var off0: usize = xfm.qwen4_mtp.?.seq_offset;
+        var off0: usize = xfm.arch_state.qwen4.mtp.?.seq_offset;
         var last_logits: mlx.mlx_array = .{ .ctx = null };
         defer if (last_logits.ctx != null) {
             _ = mlx.mlx_array_free(last_logits);
@@ -2554,12 +2554,12 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
-    const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
+    const dt = mlx.mlx_array_dtype(xfm.arch_state.qwen4.mtp.?.pre_norm_hidden);
 
     for ([_]usize{ 1, 5 }) |S| {
         // Distinct rows: identical rows cannot tell a last-row slice from a
@@ -2638,16 +2638,16 @@ test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids 
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     const saved = Transformer.mtp_head_kv_quant_override;
     defer Transformer.mtp_head_kv_quant_override = saved;
     Transformer.mtp_head_kv_quant_override = true;
 
     const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
-    const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
+    const dt = mlx.mlx_array_dtype(xfm.arch_state.qwen4.mtp.?.pre_norm_hidden);
     const S: usize = 4;
     const keep: usize = 2;
     const host = try allocator.alloc(f32, S * hcH);
@@ -2706,8 +2706,8 @@ test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids 
     const dense_l = try Run.lastLogits(&xfm, s, allocator, stream_prev, ids, keep);
     defer allocator.free(dense_l);
     try qwen4_forward.qwen4MtpApplyKvQuant(&xfm, kv_quant.KVQuantConfig.affine(8));
-    try testing.expectEqual(kv_quant.Scheme.affine, xfm.qwen4_mtp.?.cache.config.scheme);
-    try testing.expectEqual(@as(u8, 8), xfm.qwen4_mtp.?.cache.config.bits);
+    try testing.expectEqual(kv_quant.Scheme.affine, xfm.arch_state.qwen4.mtp.?.cache.config.scheme);
+    try testing.expectEqual(@as(u8, 8), xfm.arch_state.qwen4.mtp.?.cache.config.bits);
     const quant_l = try Run.lastLogits(&xfm, s, allocator, stream_prev, ids, keep);
     defer allocator.free(quant_l);
     try testing.expectEqual(dense_l.len, quant_l.len);
@@ -2752,13 +2752,13 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
 
     const S: usize = 5; // > 1: keeps the `.last_row` / `.mixed_last_row` slice live
     const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
-    const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
+    const dt = mlx.mlx_array_dtype(xfm.arch_state.qwen4.mtp.?.pre_norm_hidden);
     const host = try allocator.alloc(f32, S * hcH);
     defer allocator.free(host);
     var rs: u64 = 0x243F6A8885A308D3;
@@ -2832,10 +2832,10 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -2923,10 +2923,10 @@ test "per-row rollback: different accept counts across rows restore exactly the 
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -3025,10 +3025,10 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -3105,7 +3105,7 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
         try testing.expectEqual(offsets_before[row], c.moe_seq_offset.*);
         try testing.expectEqual(cache_steps_before[row], c.cache.step);
         for (c.cache.entries, 0..) |entry, layer| try testing.expectEqual(kv_offsets_before[row][layer], entry.offset);
-        try testing.expect(c.ple_pending == null);
+        try testing.expect(c.arch_ctx.qwen4.ple_pending == null);
         for (c.ssm_entries.?) |*e| {
             try testing.expectEqual(@as(u32, 0), e.spec_ple_len);
             try testing.expect(e.spec_state_seq.ctx == null);
@@ -3131,7 +3131,7 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
         const entry = &ctx.ssm_entries.?[ple_layer];
         try testing.expectEqualSlices(u32, &prev_before[row], &entry.ple_prev);
         try testing.expectEqual(prev_valid_before[row], entry.ple_prev_valid);
-        try testing.expect(ctx.ple_pending == null);
+        try testing.expect(ctx.arch_ctx.qwen4.ple_pending == null);
     }
 
     try xfm.forwardRowAxisVerify(&rows, &ctxs, &logits, &last, &all, null, null);
@@ -3178,10 +3178,10 @@ test "group round: a row's own argmax and budget decide it, and nothing else doe
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -3282,10 +3282,10 @@ test "N=4 rollback: rejects, partial accepts and full accept restore solo states
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
+    try testing.expect(xfm.arch_state.qwen4.model != null);
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -3393,7 +3393,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     const prefix_len = if (std.c.getenv("SINGLE_MTP_TEST_CONTEXT")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else 4101;
     const ids = try a.alloc(i32, prefix_len + 64);
     defer a.free(ids);
@@ -3501,7 +3501,7 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
     defer xfm.deinit();
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
-    qwen4_forward.compileMoeRouting(&xfm);
+    xfm.compileMoeRouting();
     for (cases.value.array.items) |case| {
         const name = case.object.get("name").?.string;
         const selected_width = if (case.object.get("width")) |v| v.integer else 0;

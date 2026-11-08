@@ -11,6 +11,8 @@ const mtp_mod = @import("mtp.zig");
 const round_cost = @import("round_cost.zig");
 const sampler = @import("sampler.zig");
 const transformer_mod = @import("transformer.zig");
+const arch_state = @import("arch/arch_state.zig");
+const qwen4_state = @import("qwen4/qwen4_state.zig");
 const Generator = generate_mod.Generator;
 const MtpHeadRef = generate_mod.MtpHeadRef;
 const MtpWidthTrial = round_cost.TrialSchedule;
@@ -25,7 +27,7 @@ pub fn mtpAdaptiveModelEligible(model_has_mtp: bool, checkpoint_head: bool) bool
 }
 
 pub fn mtpAdaptiveModelOk(self: *const Generator) bool {
-    return mtpAdaptiveModelEligible(self.model_has_mtp, self.xfm.qwen4_mtp != null or self.xfm.config.isMimo());
+    return mtpAdaptiveModelEligible(self.model_has_mtp, qwen4_state.mtpOfConst(self.xfm) != null or self.xfm.config.isMimo());
 }
 
 /// Will anyone read a serial cell for this model? Gated on the model, not the request: a
@@ -33,7 +35,7 @@ pub fn mtpAdaptiveModelOk(self: *const Generator) bool {
 pub fn serialCellWanted(self: *const Generator) bool {
     if (!mtpAdaptiveSerialEnabled() or !mtpCostTableEnabled()) return false;
     if (!self.mtpAdaptiveModelOk()) return false;
-    // Not `xfm.qwen4_mtp != null`: the weights load with the trunk even under `--no-mtp`.
+    // Not whether the head is loaded: the weights load with the trunk even under `--no-mtp`.
     if (!self.model_has_mtp) return false;
     return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKvFor(self.xfm.config.isMimo()));
 }
@@ -832,7 +834,7 @@ pub fn mtpHeadDriftNow(self: *const Generator) ?i64 {
 pub fn mtpAdaptiveHeadMayResume(self: *const Generator) bool {
     // The one predicate all three round-start doors ask (re-entry, `apply_stash`, the probe).
     if (self.mtp_adaptive.sticky_serial) return false;
-    return self.ctx.mrope_pos == null;
+    return arch_state.mropeOf(&self.ctx.arch_ctx) == null;
 }
 
 /// Does a `to_serial` on this head make the arm sticky? Only a module-owned head.

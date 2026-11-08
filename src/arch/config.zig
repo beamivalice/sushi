@@ -24,7 +24,15 @@ pub const Facts = struct {
     dense_prefix_in_layer_freq: bool = false,
     /// Video input is wired.
     serves_video: bool = true,
+    /// The residual is a set of hyper-connection streams: the layers carry no norms (the stream read normalizes),
+    /// each loads its hyper-connection weights and the PLE, and the trunk keeps a weight-less RMS norm's ones.
+    hyper_connected: bool = false,
 };
+
+/// `Facts.hyper_connected` of the config's arch; false for an unclaimed config.
+pub fn hyperConnected(config: *const model.ModelConfig) bool {
+    return if (facts(config)) |f| f.hyper_connected else false;
+}
 
 pub fn tagOf(config: *const model.ModelConfig) ?Tag {
     return config.arch.tag orelse registry.ofModelType(config.model_type);

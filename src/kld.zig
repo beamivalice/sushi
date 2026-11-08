@@ -10,6 +10,7 @@ const model_load = @import("model_load.zig");
 const model_settings_mod = @import("model_settings.zig");
 const server_mod = @import("server.zig");
 const arch_flags = @import("arch/flags.zig");
+const arch_state = @import("arch/arch_state.zig");
 const server_state = @import("server_state.zig");
 const hidden_capture = @import("hidden_capture.zig");
 const fp8_block = @import("fp8_block.zig");
@@ -360,7 +361,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         self.xfm.compileGeglu();
     }
     if (self.xfm.moe_layers != null) self.xfm.compileMoeRouting();
-    if (self.config.linear_num_key_heads > 0) self.xfm.compileGdnGate();
+    arch_state.compile(&self.xfm, .gates);
     try offline.afterLoad(&self.xfm, self.config, opts.kv_quant_config);
     return self;
 }

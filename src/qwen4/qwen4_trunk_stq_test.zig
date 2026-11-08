@@ -516,7 +516,7 @@ fn gdnTwinCase(stacked: bool) !void {
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = bareTransformer(s, cache);
-    defer inline for (.{ &xfm.gdn_q_scale, &xfm.gdn_k_scale, &xfm.gdn_eps }) |p| {
+    defer inline for (.{ &xfm.arch_state.qwen4.gdn_q_scale, &xfm.arch_state.qwen4.gdn_k_scale, &xfm.arch_state.qwen4.gdn_eps }) |p| {
         if (p.*) |arr| _ = mlx.mlx_array_free(arr);
     };
     const dec = expert_exl3.Decode.tabled(.spec1, .w15);

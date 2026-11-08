@@ -14,6 +14,8 @@ const Trunk = trunk.Trunk;
 pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
+pub const State = qwen4_state.State;
+pub const Ctx = qwen4_state.Ctx;
 
 pub const packs = struct { // slot:packs (S2h)
     pub const product = "Qwen3.8-Flash-Next";
@@ -37,7 +39,7 @@ const config_file = @import("qwen4_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "qwen4_exp", "qwen4_exp_text" };
 pub const discovery_types = config_types;
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .hyper_connected = true };
 pub const parseConfig = config_file.parseFamily;
 pub const parseDir = config_file.parseDir;
 pub const samplingDefaults = config_file.samplingDefaults;
@@ -60,7 +62,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
 }
 
 pub fn deinit(xfm: Model) void {
-    qwen4_state.deinit(xfm);
+    xfm.arch_state.qwen4.deinit(xfm.allocator);
     xfm.deinitTrunk();
 }
 
@@ -100,7 +102,7 @@ test "a model stamped as qwen4 is dispatched to qwen4" {
 }
 
 test "an unbound persistent group releases nothing, so a forward on another arch needs no release" {
-    var group: @TypeOf(@as(trunk.Trunk, undefined).ssm_group) = .{};
+    var group: trunk.PersistentSsmGroup = .{};
     var ctx: trunk.ForwardCtx = undefined;
     ctx.ssm_entries = &.{};
     try qwen4_ssm_group.ssmGroupReleaseCtx(&group, mlx.mlx_stream{ .ctx = null }, &ctx);

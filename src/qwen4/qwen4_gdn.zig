@@ -4,6 +4,7 @@ const trunk_helpers_test = @import("../trunk_helpers_test.zig");
 const nax_gate = @import("../nax_gate.zig");
 const ssm_cache = @import("../ssm_cache.zig");
 const std = @import("std");
+const qwen4_state = @import("qwen4_state.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
@@ -1318,6 +1319,7 @@ fn gdnGateExpectClose(got: mlx.mlx_array, want: mlx.mlx_array, gate_dt: mlx.mlx_
 }
 
 fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const s = mlx.gpuStream();
     gdn_prefill_fused_override = true;
     defer gdn_prefill_fused_override = null;
@@ -1329,10 +1331,10 @@ fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
     qwen4_forward.compileGdnGate(&xfm);
-    defer if (xfm.compiled_gdn_gate) |closure| {
+    defer if (xfm.arch_state.qwen4.compiled_gdn_gate) |closure| {
         _ = mlx.mlx_closure_free(closure);
     };
-    try testing.expect(xfm.compiled_gdn_gate != null);
+    try testing.expect(xfm.arch_state.qwen4.compiled_gdn_gate != null);
     var prng = std.Random.DefaultPrng.init(0x6D1);
     const rnd = prng.random();
 
@@ -2172,6 +2174,7 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
 
 /// The gate is f32 at either width; `wide` selects the f32 state, else the bf16 state of `--qwen-gdn 16`.
 fn gdnRecurLayerCase(wide: bool, proj: GdnProjections) !void {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     if (proj != .dense) try mlx.requireGpu();
     const s = mlx.gpuStream();
     gdn_prework_override = true;
@@ -2181,7 +2184,7 @@ fn gdnRecurLayerCase(wide: bool, proj: GdnProjections) !void {
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
-    defer inline for (.{ &xfm.gdn_q_scale, &xfm.gdn_k_scale, &xfm.gdn_eps }) |p| {
+    defer inline for (.{ &xfm.arch_state.qwen4.gdn_q_scale, &xfm.arch_state.qwen4.gdn_k_scale, &xfm.arch_state.qwen4.gdn_eps }) |p| {
         if (p.*) |arr| _ = mlx.mlx_array_free(arr);
     };
     // The served geometry (Hk 16, Hv 48, 128-wide heads, sigmoid out gate) over a narrow hidden.
@@ -2433,11 +2436,12 @@ fn gdnDecayRun(xfm: *Transformer, la: *const LinearAttnWeights, route: GdnDecayR
 /// The gate is f32 either way. An f32 state forgets at the exact rate; a bf16 state rounds a slow head's
 /// decay away (its step is under half a bf16 ulp), so only the routes' agreement is asserted there.
 fn gdnDecayCase(state_f32: bool) !void {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
-    defer inline for (.{ &xfm.gdn_q_scale, &xfm.gdn_k_scale, &xfm.gdn_eps, &xfm.gdn_ones_w }) |p| {
+    defer inline for (.{ &xfm.arch_state.qwen4.gdn_q_scale, &xfm.arch_state.qwen4.gdn_k_scale, &xfm.arch_state.qwen4.gdn_eps, &xfm.arch_state.qwen4.gdn_ones_w }) |p| {
         if (p.*) |arr| _ = mlx.mlx_array_free(arr);
     };
     const hk: c_int = 2;
@@ -2713,13 +2717,13 @@ pub fn gatedDeltaNetProjected(
     // Scale scalars + the parameter-free rms_norm ones-weight (mlx-c
     // requires a non-empty weight) are cached on the Transformer — they
     // used to be rebuilt every layer every decode step.
-    if (self.gdn_q_scale == null) {
+    if (self.arch_state.qwen4.gdn_q_scale == null) {
         const inv_scale = 1.0 / @as(f32, @floatFromInt(cfg.linear_key_head_dim));
-        self.gdn_q_scale = bf16Scalar(inv_scale, self.s);
-        self.gdn_k_scale = bf16Scalar(@sqrt(inv_scale), self.s);
+        self.arch_state.qwen4.gdn_q_scale = bf16Scalar(inv_scale, self.s);
+        self.arch_state.qwen4.gdn_k_scale = bf16Scalar(@sqrt(inv_scale), self.s);
     }
-    const inv_scale_sq = self.gdn_q_scale.?;
-    const inv_sqrt_sc = self.gdn_k_scale.?;
+    const inv_scale_sq = self.arch_state.qwen4.gdn_q_scale.?;
+    const inv_sqrt_sc = self.arch_state.qwen4.gdn_k_scale.?;
 
     // A restored state continues in the width this load stores.
     const state_dtype = cfg.gdnStateDtype();
@@ -2752,9 +2756,9 @@ pub fn gatedDeltaNetProjected(
             .k_scale = inv_sqrt_sc,
             .gate_dtype = cfg.gdnGateDtype(),
         };
-        if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
+        if (self.arch_state.qwen4.gdn_eps == null) self.arch_state.qwen4.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
         if (self.spec_capture_ssm and gdnVerifyFoldFor(seq_len)) {
-            if (try gdn_decode.stepFold(geo, seq_len, inputs, z_proj, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, self.s)) |result| {
+            if (try gdn_decode.stepFold(geo, seq_len, inputs, z_proj, la.norm_w, self.arch_state.qwen4.gdn_eps.?, !cfg.kda_sigmoid_out_gate, self.s)) |result| {
                 var f = result;
                 defer f.deinit();
                 if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
@@ -2779,8 +2783,8 @@ pub fn gatedDeltaNetProjected(
         }
         var r = (try gdn_decode.step(geo, seq_len, inputs, false, self.s)) orelse break :recur;
         defer r.deinit();
-        if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-        const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse break :recur;
+        if (self.arch_state.qwen4.gdn_eps == null) self.arch_state.qwen4.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
+        const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.arch_state.qwen4.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse break :recur;
         defer _ = mlx.mlx_array_free(flat);
         if (self.spec_capture_ssm) {
             // Rollback slices the conv INPUT, as the chain stashes it.
@@ -2951,13 +2955,13 @@ pub fn gatedDeltaNetProjected(
         try mlx.check(mlx.mlx_reshape(&v_heads, v_flat, &v_shape, 4, self.s));
 
         // Q/K normalization: q = (1/dk) * rms_norm(q, null), k = (1/sqrt(dk)) * rms_norm(k, null)
-        if (self.gdn_ones_w == null) {
+        if (self.arch_state.qwen4.gdn_ones_w == null) {
             const ones_shape = [_]c_int{dk};
             var w = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_ones(&w, &ones_shape, 1, .bfloat16, self.s));
-            self.gdn_ones_w = w;
+            self.arch_state.qwen4.gdn_ones_w = w;
         }
-        const ones_w = self.gdn_ones_w.?;
+        const ones_w = self.arch_state.qwen4.gdn_ones_w.?;
 
         var q_norm = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_norm);
@@ -3124,8 +3128,8 @@ pub fn gatedDeltaNetProjected(
     // Fused epilogue: rms_norm(y) * silu(z) straight to the flat
     // out_proj input (decode/verify widths, per-head swish gate archs).
     if (fused_prework) {
-        if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-        if (try gdnNormGateFused(self.s, y_bthd, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, batch, seq_len)) |flat| {
+        if (self.arch_state.qwen4.gdn_eps == null) self.arch_state.qwen4.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
+        if (try gdnNormGateFused(self.s, y_bthd, z_proj, 0, value_dim, la.norm_w, self.arch_state.qwen4.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, batch, seq_len)) |flat| {
             defer _ = mlx.mlx_array_free(flat);
             return if (skip_output) standinRef(flat) else self.qmatmul(flat, &la.out);
         }
@@ -3259,10 +3263,10 @@ pub fn gdnCheckFused(self: *Transformer, la: *const LinearAttnWeights, qkv: mlx.
     const key_dim = hk * dk;
     const value_dim = hv * dv;
     const c_dim = key_dim * 2 + value_dim;
-    if (self.gdn_ones_w == null) {
+    if (self.arch_state.qwen4.gdn_ones_w == null) {
         var w = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_ones(&w, &[_]c_int{dk}, 1, .bfloat16, s));
-        self.gdn_ones_w = w;
+        self.arch_state.qwen4.gdn_ones_w = w;
     }
     var conv_input = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(conv_input);
@@ -3290,7 +3294,7 @@ pub fn gdnCheckFused(self: *Transformer, la: *const LinearAttnWeights, qkv: mlx.
     const dv_ = try attn256MaxDiff(pre.v, v_heads, s);
     var dq: f32 = 0;
     var dk_: f32 = 0;
-    inline for (.{ .{ @as(c_int, 0), key_dim, self.gdn_q_scale.?, pre.q, &dq }, .{ key_dim, key_dim * 2, self.gdn_k_scale.?, pre.k, &dk_ } }) |case| {
+    inline for (.{ .{ @as(c_int, 0), key_dim, self.arch_state.qwen4.gdn_q_scale.?, pre.q, &dq }, .{ key_dim, key_dim * 2, self.arch_state.qwen4.gdn_k_scale.?, pre.k, &dk_ } }) |case| {
         var flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat);
         try mlx.check(mlx.mlx_slice(&flat, conv_out, &[_]c_int{ 0, 0, case[0] }, 3, &[_]c_int{ batch, seq, case[1] }, 3, &strides3, 3, s));
@@ -3299,7 +3303,7 @@ pub fn gdnCheckFused(self: *Transformer, la: *const LinearAttnWeights, qkv: mlx.
         try mlx.check(mlx.mlx_reshape(&heads, flat, &[_]c_int{ batch, seq, hk, dk }, 4, s));
         var nrm = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(nrm);
-        try mlx.check(mlx.mlx_fast_rms_norm(&nrm, heads, self.gdn_ones_w.?, 1e-6, s));
+        try mlx.check(mlx.mlx_fast_rms_norm(&nrm, heads, self.arch_state.qwen4.gdn_ones_w.?, 1e-6, s));
         var scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(scaled);
         try mlx.check(mlx.mlx_multiply(&scaled, nrm, case[2], s));
@@ -3319,7 +3323,7 @@ pub fn gdnCheckFused(self: *Transformer, la: *const LinearAttnWeights, qkv: mlx.
 /// Apply the compiled GDN gate closure if available, else the raw chain.
 /// Returns owned g (`config.gdnGateDtype()`, shape of `a`).
 pub fn computeGdnGate(self: *const Transformer, A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array) !mlx.mlx_array {
-    if (self.compiled_gdn_gate) |compiled| {
+    if (self.arch_state.qwen4.compiled_gdn_gate) |compiled| {
         const in_arr = [_]mlx.mlx_array{ A_log, a, dt_bias };
         const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 3);
         defer _ = mlx.mlx_vector_array_free(in_vec);
@@ -3742,6 +3746,7 @@ test "gdnBlockedEligible: width floor + exact-128 Dk + Dv/head-group alignment" 
 }
 
 test "gdn packed prework: bit-identical to the composed chain at decode and prefill widths incl. gate/beta + folded layout" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     try gdnPreworkCase(.bfloat16);
     try gdnPreworkCase(.float32);
@@ -3878,12 +3883,14 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
 }
 
 test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and verify widths; rollback to every row is serial decode" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     try gdnRecurLayerCase(false, .dense);
     try gdnRecurLayerCase(true, .dense);
 }
 
 test "trunk STQ: a GDN layer on trellis projections verifies bit-identically to serial decode at every width" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try gdnRecurLayerCase(true, .trellis);
     try gdnRecurLayerCase(true, .stacked);
 }
@@ -3892,12 +3899,13 @@ test "trunk STQ: a GDN layer on trellis projections verifies bit-identically to 
 const GdnProjections = enum { dense, trellis, stacked };
 
 test "gdn state f32: prefill, decode, a restored bf16 state and verify capture all store f32; rollback is serial decode" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
-    defer inline for (.{ &xfm.gdn_q_scale, &xfm.gdn_k_scale, &xfm.gdn_eps, &xfm.gdn_ones_w }) |p| {
+    defer inline for (.{ &xfm.arch_state.qwen4.gdn_q_scale, &xfm.arch_state.qwen4.gdn_k_scale, &xfm.arch_state.qwen4.gdn_eps, &xfm.arch_state.qwen4.gdn_ones_w }) |p| {
         if (p.*) |arr| _ = mlx.mlx_array_free(arr);
     };
     const hk: c_int = 2;
@@ -3993,6 +4001,7 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
 }
 
 test "gdn decay: at an f32 state and gate every route forgets at the exact rate; at --qwen-gdn 16 the routes agree" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     try gdnDecayCase(true);
     try gdnDecayCase(false);
@@ -4055,16 +4064,17 @@ test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity 
 }
 
 test "gdn gate at f32: compiled closure, graph chain and prework kernel agree far inside a bf16 step and carry the f32 width" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
     qwen4_forward.compileGdnGate(&xfm);
-    defer if (xfm.compiled_gdn_gate) |closure| {
+    defer if (xfm.arch_state.qwen4.compiled_gdn_gate) |closure| {
         _ = mlx.mlx_closure_free(closure);
     };
-    try testing.expect(xfm.compiled_gdn_gate != null);
+    try testing.expect(xfm.arch_state.qwen4.compiled_gdn_gate != null);
     var prng = std.Random.DefaultPrng.init(0x6A7F);
     const rnd = prng.random();
     const hk: c_int = 2;

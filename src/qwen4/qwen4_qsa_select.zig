@@ -4,6 +4,7 @@ const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const moe_gqmv = @import("../moe_gqmv.zig");
 const nax_gate = @import("../nax_gate.zig");
 const std = @import("std");
+const qwen4_state = @import("qwen4_state.zig");
 const mlx = @import("../mlx.zig");
 const mrope = @import("../mrope.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
@@ -801,7 +802,7 @@ const QsaPoolTestTrunk = struct {
         t.rope_freqs_yarn = null;
         t.yarn_inv_freq = null;
         t.fwd_gen = 0;
-        t.qsa_pooled_rope = .{};
+        t.arch_state.qwen4.qsa_pooled_rope = .{};
         self.freqs = .{ .ctx = null };
         if (!yarn) return;
         t.config.rope_yarn = true;
@@ -817,7 +818,7 @@ const QsaPoolTestTrunk = struct {
     }
 
     pub fn deinit(self: *QsaPoolTestTrunk) void {
-        self.t.qsa_pooled_rope.deinit();
+        self.t.arch_state.qwen4.qsa_pooled_rope.deinit();
         if (self.freqs.ctx != null) _ = mlx.mlx_array_free(self.freqs);
     }
 
@@ -1007,6 +1008,7 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
 }
 
 test "qsa pooled keys: the fused kernel is bit-identical to the composed chain at the served geometry" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x1D8_0BE5);
@@ -1038,6 +1040,7 @@ test "qsa pooled keys: the fused kernel is bit-identical to the composed chain a
 
 // Bar: a strided view of the indexer projection (the live k_raw slice) reads the same bits as a packed array.
 test "qsa pooled keys: the fused kernel reads a strided raw-key view bit-identically" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
@@ -1060,6 +1063,7 @@ test "qsa pooled keys: the fused kernel reads a strided raw-key view bit-identic
 
 // Bar: the kernel sums rows 0..R-1 in order, MLX's order while R <= 8; past 8 it declines.
 test "qsa pooled keys: order-sensitive block sums match at ratios 1..8, and larger ratios decline" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
@@ -1089,6 +1093,7 @@ test "qsa pooled keys: order-sensitive block sums match at ratios 1..8, and larg
 
 // Bar: only the shapes and dtypes the kernel mirrors engage; everything else keeps the chain.
 test "qsa pooled keys: f16 and f32 operands, other head and rope widths, and a CPU stream decline" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
@@ -1143,6 +1148,7 @@ test "qsa pooled keys: f16 and f32 operands, other head and rope widths, and a C
 
 // Bar: the block count is a runtime input, so decode (1), verify (2) and prefill (512) share ONE pipeline.
 test "qsa pooled keys: block counts 1, 2, 7 and 512 share one fused pipeline" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
@@ -1165,6 +1171,7 @@ test "qsa pooled keys: block counts 1, 2, 7 and 512 share one fused pipeline" {
 // Bar: the indexer's own upkeep (ring tails joined to the new rows, block-aligned strided views,
 // rope bases at `pos_base + nb_cached*ratio`) leaves the same pooled bank with the kernel on or off.
 test "qsa pooled keys: the pooled bank after prefill, decode and verify is bit-identical with the kernel on and off" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer qwen4_qsa.qsa_pool_rope_fused_override = null;
@@ -1354,6 +1361,7 @@ test "qsa visibility: decode width is ALWAYS all-visible; a prefill chunk's FIRS
 }
 
 test "qsa visibility skip: bit-identical selection where it is an identity, and a REAL difference where it is not" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     // Where every block is visible the two arms must agree bit for bit; where they are not,
     // the arms must differ (else a blanket "always skip" would pass).
     try mlx.requireGpu();
@@ -1363,8 +1371,8 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
     t.s = s;
     t.allocator = testing.allocator;
     t.config = .{};
-    t.qsa_consts = .{};
-    defer t.qsa_consts.deinit();
+    t.arch_state.qwen4.qsa_consts = .{};
+    defer t.arch_state.qwen4.qsa_consts.deinit();
 
     const ratio: c_int = 4;
     const nb: c_int = 24;
@@ -2491,12 +2499,13 @@ test "qsa score fused: the argpartition decline arm consumes the fused sheet" {
 }
 
 test "qsa score fused: no bank is built under the fused arm" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
-    xfm.qsa_score_bank_builds = 0;
+    xfm.arch_state.qwen4.qsa_score_bank_builds = 0;
     var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
     defer ssmFreeQsaState(&entry);
     entry.qsa_ratio = 4;

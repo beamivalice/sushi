@@ -1,5 +1,4 @@
 const std = @import("std");
-const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const expert_usage = @import("dsv41/expert_usage.zig");
 const imatrix_capture = @import("imatrix.zig");
@@ -7,7 +6,6 @@ const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
 const fp8_block = @import("fp8_block.zig");
 const trunk_stq = @import("trunk_stq.zig");
-const gdn_decode = @import("qwen4/gdn_decode.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
 // so has no head-shaped state of its own. mtp.zig imports this file back for
@@ -18,15 +16,8 @@ const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
 
 const qwen4_forward = @import("qwen4/qwen4_forward.zig");
-const qwen4_qsa = @import("qwen4/qwen4_qsa.zig");
-const qwen4_hc = @import("qwen4/qwen4_hc.zig");
-const qwen4_qsa_attn = @import("qwen4/qwen4_qsa_attn.zig");
-const qwen4_qsa_gather = @import("qwen4/qwen4_qsa_gather.zig");
-const qwen4_qsa_select = @import("qwen4/qwen4_qsa_select.zig");
 const qwen4_qsa_state = @import("qwen4/qwen4_qsa_state.zig");
 const qwen4_ssm_group = @import("qwen4/qwen4_ssm_group.zig");
-const qwen4_fixture_test = @import("qwen4/qwen4_fixture_test.zig");
-const qwen4_gdn = @import("qwen4/qwen4_gdn.zig");
 const kv_cache = @import("kv_cache.zig");
 const qwen4_state = @import("qwen4/qwen4_state.zig");
 const model_handle = @import("model_handle.zig");
@@ -46,19 +37,6 @@ const layer_weights = @import("layer_weights.zig");
 const linear_mod = @import("linear.zig");
 const Linear = linear_mod.Linear;
 const forward_diag = @import("forward_diag.zig");
-const GDN_FUSED_MAX_ROWS = qwen4_gdn.GDN_FUSED_MAX_ROWS;
-const GdnPrework = qwen4_gdn.GdnPrework;
-const gdnDecodeFusedEnabled = qwen4_gdn.gdnDecodeFusedEnabled;
-const gdnDecodeRecurEnabled = qwen4_gdn.gdnDecodeRecurEnabled;
-pub const gdnGateChain = qwen4_gdn.gdnGateChain;
-const gdnNormGateFused = qwen4_gdn.gdnNormGateFused;
-const gdnPrefillFusedFor = qwen4_gdn.gdnPrefillFusedFor;
-const gdnPrefillRoute = qwen4_gdn.gdnPrefillRoute;
-const gdnPreworkFused = qwen4_gdn.gdnPreworkFused;
-const gdnRouteKernel = qwen4_gdn.gdnRouteKernel;
-const gdnSetGrid = qwen4_gdn.gdnSetGrid;
-const gdnVerifyFoldFor = qwen4_gdn.gdnVerifyFoldFor;
-const getGdnKernelSeq = qwen4_gdn.getGdnKernelSeq;
 const test_support = @import("test_support.zig");
 const Exl3MoeHarness = test_support.Exl3MoeHarness;
 const attn256Reference = test_support.attn256Reference;
@@ -66,18 +44,13 @@ const mlxSettledActiveBytes = test_support.mlxSettledActiveBytes;
 const qsaArraysAllEqual = test_support.qsaArraysAllEqual;
 const testRandUniformBf16 = test_support.testRandUniformBf16;
 const testReadF32 = test_support.testReadF32;
-const qwen4_test_support = @import("qwen4/qwen4_test_support.zig");
-const expectRowsByteEqual = qwen4_test_support.expectRowsByteEqual;
-const expectSlotStateEqual = qwen4_test_support.expectSlotStateEqual;
-const logicalSsmCapture = qwen4_test_support.logicalSsmCapture;
-const qwen4BatchedPleForward = qwen4_test_support.qwen4BatchedPleForward;
-const qwen4ExpectMoeBitsEqual = qwen4_test_support.qwen4ExpectMoeBitsEqual;
 const arch_forward = @import("arch/forward.zig");
 const arch_life = @import("arch/life.zig");
 const arch_request = @import("arch/request.zig");
 const arch_admission = @import("arch/admission.zig");
 const arch_registry = @import("arch/registry.zig");
 const arch_state_mod = @import("arch/arch_state.zig");
+const arch_config = @import("arch/config.zig");
 const arch_moe = @import("arch/moe.zig");
 pub const DenseKVView = kv_cache.DenseKVView;
 pub const KVCache = kv_cache.KVCache;
@@ -101,33 +74,18 @@ pub const MoeDecodeDispatchArm = moe_gqmv.MoeDecodeDispatchArm;
 pub const MoeLayerWeights = layer_weights.MoeLayerWeights;
 pub const MoeMlpWeights = layer_weights.MoeMlpWeights;
 pub const MimoExl3MoeHarness = test_support.MimoExl3MoeHarness;
-pub const OneShotBits = qwen4_qsa_attn.OneShotBits;
 pub const PersistentSsmGroup = ssm_cache.PersistentSsmGroup;
 pub const PACKED_KV_SLICE_MAX = attn_kernels.PACKED_KV_SLICE_MAX;
 pub const QSA_ATTN_BK = attn_kernels.QSA_ATTN_BK;
 pub const PREFILL_DQ_GEMM_MIN_M = verify_moe.PREFILL_DQ_GEMM_MIN_M;
 pub const PleWeights = layer_weights.PleWeights;
 pub const ProfClock = forward_diag.ProfClock;
-pub const QSA_ATTN_PACKED_MAX_S = qwen4_qsa_attn.QSA_ATTN_PACKED_MAX_S;
-pub const QSA_HEAD_MARKS_MAX = qwen4_qsa.QSA_HEAD_MARKS_MAX;
 pub const QSA_MAX_COMPRESS_RATIO = ssm_cache.QSA_MAX_COMPRESS_RATIO;
-pub const QSA_PACKED_GATHER_MAX_REUSE = qwen4_qsa_attn.QSA_PACKED_GATHER_MAX_REUSE;
 pub const QSA_RING_ROWS = ssm_cache.QSA_RING_ROWS;
 pub const QSA_SCORE_KERNEL_HEADER = attn_kernels.QSA_SCORE_KERNEL_HEADER;
-pub const QsaArm = qwen4_qsa_attn.QsaArm;
-const QsaArmCounts = qwen4_qsa_attn.QsaArmCounts;
 pub const QsaAttnCfgKey = attn_kernels.QsaAttnCfgKey;
-const QsaBlockConsts = qwen4_qsa_select.QsaBlockConsts;
-pub const QsaBlockFixture = qwen4_qsa_gather.QsaBlockFixture;
 pub const QsaCfgCache = attn_kernels.QsaCfgCache;
-pub const QsaHeadMark = qwen4_qsa.QsaHeadMark;
-pub const QsaHeadMarkSet = qwen4_qsa.QsaHeadMarkSet;
-const QsaPooledRope = qwen4_qsa_select.QsaPooledRope;
-pub const QsaSelectCfgKey = qwen4_qsa_select.QsaSelectCfgKey;
-pub const QsaSelectSplitCfgKey = qwen4_qsa_select.QsaSelectSplitCfgKey;
 pub const QuantParams = layer_weights.QuantParams;
-pub const Qwen4Mtp = qwen4_forward.Qwen4Mtp;
-const PlePending = qwen4_hc.PlePending;
 pub const SLIDING_TRIM_UNBOUNDED = kv_cache.SLIDING_TRIM_UNBOUNDED;
 pub const SSMCacheEntry = ssm_cache.SSMCacheEntry;
 pub const SSMCacheEntrySnapshot = ssm_cache.SSMCacheEntrySnapshot;
@@ -146,9 +104,7 @@ pub const appendFullAttnWeights = layer_weights.appendFullAttnWeights;
 pub const appendHybridMlpWeights = layer_weights.appendHybridMlpWeights;
 pub const appendLinearAttnWeights = layer_weights.appendLinearAttnWeights;
 pub const appendStructArrays = layer_weights.appendStructArrays;
-pub const applyQsaHistoryAt = qwen4_qsa_state.applyQsaHistoryAt;
 pub const arrayBytes = ssm_cache.arrayBytes;
-pub const attachQsaHistoryToLatest = qwen4_qsa_state.attachQsaHistoryToLatest;
 pub const capBufAppend = ssm_cache.capBufAppend;
 pub const capturePrefillHidden = ssm_cache.capturePrefillHidden;
 pub const capturePrefillHiddenLast = ssm_cache.capturePrefillHiddenLast;
@@ -157,11 +113,6 @@ pub const handOverSsmCheckpoint = ssm_cache.handOverSsmCheckpoint;
 pub const attn256Base16Aligned = attn_kernels.attn256Base16Aligned;
 const cachedScalarInt = verify_qmm.cachedScalarInt;
 pub const bf16Scalar = mlx_util.bf16Scalar;
-const checkQsaCompressRatio = qwen4_qsa_state.checkQsaCompressRatio;
-pub const checkpointHasQsaHistory = qwen4_qsa_state.checkpointHasQsaHistory;
-pub const checkpointHasQsaPooled = qwen4_qsa_state.checkpointHasQsaPooled;
-pub const checkpointListHasQsaPooled = qwen4_qsa_state.checkpointListHasQsaPooled;
-pub const checkpointQsaCoversPos = qwen4_qsa_state.checkpointQsaCoversPos;
 pub const compactConvStateEnabled = ssm_cache.compactConvStateEnabled;
 pub const computeQuantParams = layer_weights.computeQuantParams;
 const computeYarnFreqs = qwen4_forward.computeYarnFreqs;
@@ -171,19 +122,15 @@ pub const decodeProfileEnabled = forward_diag.decodeProfileEnabled;
 pub const decodeProfileRows = forward_diag.decodeProfileRows;
 pub const decodeProfileSession = forward_diag.decodeProfileSession;
 pub const diagEnvValueOn = forward_diag.diagEnvValueOn;
-pub const entriesHaveQsaHistory = qwen4_qsa_state.entriesHaveQsaHistory;
-const evalQwen4MtpResident = qwen4_forward.evalQwen4MtpResident;
 const expertPickGpu = moe_stream_compute.expertPickGpu;
 const expertSpecApplies = moe_stream_compute.expertSpecApplies;
 const expertSwapKind = moe_stream_compute.expertSwapKind;
 const expert_exl3_kernels = layer_weights.expert_exl3_kernels;
 const exl3CodebookFollowsModel = test_support.exl3CodebookFollowsModel;
-const fillPleSpecTokens = qwen4_hc.fillPleSpecTokens;
 const freeKVEntry = kv_cache.freeKVEntry;
 pub const fused256CausalMode = attn_kernels.fused256CausalMode;
 pub const fused256Enabled = attn_kernels.fused256Enabled;
 const floatDtypeTable = layer_weights.floatDtypeTable;
-pub const fusedSdpa256Masked = qwen4_qsa_gather.fusedSdpa256Masked;
 pub const fusedSdpaPrefill = attn_kernels.fusedSdpaPrefill;
 pub const fusedSdpaPrefillImpl = attn_kernels.fusedSdpaPrefillImpl;
 pub const fusedSdpaPrefillKv = attn_kernels.fusedSdpaPrefillKv;
@@ -195,8 +142,6 @@ pub const gatherQmvGateUp = moe_gqmv.gatherQmvGateUp;
 const gatherQmvGateUpEnabled = moe_gqmv.gatherQmvGateUpEnabled;
 const gatherQmvGateUpRows = moe_gqmv.gatherQmvGateUpRows;
 pub const gatherExpertMm = moe_stream_compute.gatherExpertMm;
-pub const gatherQsa256 = qwen4_qsa_gather.gatherQsa256;
-pub const gatherQsa256Packed = qwen4_qsa_gather.gatherQsa256Packed;
 const gpuArchitecture = nax_gate.gpuArchitecture;
 const handOffStreamedResult = moe_stream_compute.handOffStreamedResult;
 const getLayerWeight = layer_weights.getLayerWeight;
@@ -206,9 +151,7 @@ const getLayerWeightOpt = layer_weights.getLayerWeightOpt;
 const getNamedWeight = layer_weights.getNamedWeight;
 const getWeightFmt = layer_weights.getWeightFmt;
 const getWeightFmtOpt = layer_weights.getWeightFmtOpt;
-pub const handoffQsaHistoryToLatest = qwen4_qsa_state.handoffQsaHistoryToLatest;
 pub const initModuleShell = layer_weights.initModuleShell;
-pub const keepOnlyLatestQsaHistory = qwen4_qsa_state.keepOnlyLatestQsaHistory;
 pub const kvEntriesBytes = ssm_cache.kvEntriesBytes;
 pub const materializedOwnedCopy = mlx_util.materializedOwnedCopy;
 pub const macosProductVersion = nax_gate.macosProductVersion;
@@ -220,7 +163,6 @@ const maybeTransposeForBf16 = layer_weights.maybeTransposeForBf16;
 pub const layerCap = forward_diag.layerCap;
 const mimoExl3DistinctRouting = test_support.mimoExl3DistinctRouting;
 const mimoExl3ForwardMatchesHost = test_support.mimoExl3ForwardMatchesHost;
-pub const nextSsmMemberGen = qwen4_ssm_group.nextSsmMemberGen;
 pub const newEmptyKVEntry = kv_cache.newEmptyKVEntry;
 pub const positionDropIndex = ssm_cache.positionDropIndex;
 pub const positionDropIndexUsize = ssm_cache.positionDropIndexUsize;
@@ -245,51 +187,12 @@ pub const moeDumpBeginForward = forward_diag.moeDumpBeginForward;
 const moeDumpDir = forward_diag.moeDumpDir;
 pub const moeDumpForwardDone = forward_diag.moeDumpForwardDone;
 pub const moeDumpTensor = forward_diag.moeDumpTensor;
-pub const qsaAttnKernelEnabled = qwen4_qsa_attn.qsaAttnKernelEnabled;
-pub const qsaBatchedGatherEnabled = qwen4_qsa_gather.qsaBatchedGatherEnabled;
-pub const qsaBatchedGatherFloor = qwen4_qsa_gather.qsaBatchedGatherFloor;
-pub const qsaBatchedGatherOn = qwen4_qsa_gather.qsaBatchedGatherOn;
-pub const qsaDecodeGatherAttn = qwen4_qsa_attn.qsaDecodeGatherAttn;
-pub const qsaDecodeGatherEnabled = qwen4_qsa_gather.qsaDecodeGatherEnabled;
-pub const qsaDecodeGatherIdsHost = qwen4_qsa_gather.qsaDecodeGatherIdsHost;
-pub const qsaDenseRebuildRows = qwen4_qsa_attn.qsaDenseRebuildRows;
-pub const qsaEntrySatisfiesForward = qwen4_qsa_state.qsaEntrySatisfiesForward;
-pub const qsaGatherEnabled = qwen4_qsa_gather.qsaGatherEnabled;
-pub const qsaGatherMinKv = qwen4_qsa_gather.qsaGatherMinKv;
-pub const qsaHistoryRows = qwen4_qsa_state.qsaHistoryRows;
-pub const qsaLeftoverAt = qwen4_qsa_state.qsaLeftoverAt;
-pub const qsaMaskFromBlockSel = qwen4_qsa_attn.qsaMaskFromBlockSel;
-pub const qsaMaskFromBlocks = qwen4_qsa_attn.qsaMaskFromBlocks;
-const qsaNaxArm = qwen4_qsa_gather.qsaNaxArm;
-pub const qsaNaxEnabled = qwen4_qsa_gather.qsaNaxEnabled;
 pub const qsaNaxOsOk = nax_gate.qsaNaxOsOk;
 pub const qsaNaxOsSupported = nax_gate.qsaNaxOsSupported;
-pub const qsaPoolNormRopeFused = qwen4_qsa_select.qsaPoolNormRopeFused;
-pub const qsaPrefillGatherMinKvFrom = qwen4_qsa_gather.qsaPrefillGatherMinKvFrom;
-pub const qsaPrefillTransientBytes = qwen4_qsa_attn.qsaPrefillTransientBytes;
 pub const qsaProbeAllFinite = nax_gate.qsaProbeAllFinite;
 pub const qsaProbeCorruptFirst = nax_gate.qsaProbeCorruptFirst;
 pub const qsaProbeLcgBf16 = nax_gate.qsaProbeLcgBf16;
 pub const qsaProbeMaxAbsDiff = nax_gate.qsaProbeMaxAbsDiff;
-pub const qsaResliceToKeep = qwen4_qsa_state.qsaResliceToKeep;
-pub const qsaRestoreSatisfiesForward = qwen4_qsa_state.qsaRestoreSatisfiesForward;
-pub const qsaScoreFusedActive = qwen4_qsa_select.qsaScoreFusedActive;
-pub const qsaScoreFusedActiveFor = qwen4_qsa_select.qsaScoreFusedActiveFor;
-pub const qsaScoreFusedArm = qwen4_qsa_select.qsaScoreFusedArm;
-pub const qsaScoreFusedDispatch = qwen4_qsa_select.qsaScoreFusedDispatch;
-pub const qsaScoreRowsPerChunk = qwen4_qsa_select.qsaScoreRowsPerChunk;
-pub const qsaScoreRowsPerChunkFused = qwen4_qsa_attn.qsaScoreRowsPerChunkFused;
-pub const qsaScoreSheetComposed = qwen4_qsa_select.qsaScoreSheetComposed;
-pub const qsaSelectKernelEnabled = qwen4_qsa_select.qsaSelectKernelEnabled;
-pub const qsaSelectSplitEnabled = qwen4_qsa_select.qsaSelectSplitEnabled;
-pub const qsaSparseAttn = qwen4_qsa_attn.qsaSparseAttn;
-pub const qsaSparseAttnServes = qwen4_qsa_attn.qsaSparseAttnServes;
-pub const qsaTestAppendPool = qwen4_qsa_state.qsaTestAppendPool;
-pub const qsaVerifyGatherAttn = qwen4_qsa_attn.qsaVerifyGatherAttn;
-pub const qsaVerifyGatherEnabled = qwen4_qsa_attn.qsaVerifyGatherEnabled;
-pub const qsaVerifyGatherMinKvFor = qwen4_qsa_attn.qsaVerifyGatherMinKvFor;
-pub const qsaWidthBucket = qwen4_qsa_attn.qsaWidthBucket;
-pub const reserveQsaHistoryWithHead = qwen4_qsa_state.reserveQsaHistoryWithHead;
 pub const resetKVEntry = kv_cache.resetKVEntry;
 pub const restoreSsmCheckpoint = ssm_cache.restoreSsmCheckpoint;
 pub const seedCapBuf = ssm_cache.seedCapBuf;
@@ -299,18 +202,13 @@ const routerSwapLogits = moe_stream_compute.routerSwapLogits;
 const slabMoeWeights = moe_stream_compute.slabMoeWeights;
 pub const scalarOf = mlx_util.scalarOf;
 const shouldStreamExpertBank = layer_weights.shouldStreamExpertBank;
-pub const sliceQsaHistoryOntoCheckpoint = qwen4_qsa_state.sliceQsaHistoryOntoCheckpoint;
 pub const slidingTailSpan = kv_cache.slidingTailSpan;
 pub const slidingViewFor = kv_cache.slidingViewFor;
 pub const slidingPrefillAttn = attn_kernels.slidingPrefillAttn;
 pub const slidingPrefillFused = attn_kernels.slidingPrefillFused;
-pub const snapshotHasQsaHistory = qwen4_qsa_state.snapshotHasQsaHistory;
 pub const spanPreservingDropIndex = ssm_cache.spanPreservingDropIndex;
 pub const splitSpecCaptures = ssm_cache.splitSpecCaptures;
-pub const ssmBindSlotRefs = qwen4_ssm_group.ssmBindSlotRefs;
-pub const ssmBindTickState = qwen4_ssm_group.ssmBindTickState;
 const ssmConcatAxis0 = qwen4_ssm_group.ssmConcatAxis0;
-pub const ssmDetachFromGroup = qwen4_ssm_group.ssmDetachFromGroup;
 pub const ssmCheckpointBytes = ssm_cache.ssmCheckpointBytes;
 pub const ssmCheckpointDropIndex = ssm_cache.ssmCheckpointDropIndex;
 pub const ssmEntryBytes = ssm_cache.ssmEntryBytes;
@@ -318,12 +216,6 @@ pub const ssmEvalHandles = ssm_cache.ssmEvalHandles;
 pub const ssmFreeMergedLayer = ssm_cache.ssmFreeMergedLayer;
 pub const splitKAttnDispatch = attn_kernels.splitKAttnDispatch;
 const splitFusedQkvAsymRows = layer_weights.splitFusedQkvAsymRows;
-pub const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
-const ssmGroupDropMember = qwen4_ssm_group.ssmGroupDropMember;
-const ssmGroupReleaseCtx = qwen4_ssm_group.ssmGroupReleaseCtx;
-const ssmMergeLayer = qwen4_ssm_group.ssmMergeLayer;
-pub const ssmSplitAll = qwen4_ssm_group.ssmSplitAll;
-const ssmSplitLayer = qwen4_ssm_group.ssmSplitLayer;
 pub const ssmFreeSpecCapture = ssm_cache.ssmFreeSpecCapture;
 pub const ssmHasSpecCapture = ssm_cache.ssmHasSpecCapture;
 pub const ssmLiveAux = ssm_cache.ssmLiveAux;
@@ -335,9 +227,7 @@ pub const ssmSnapshot = ssm_cache.ssmSnapshot;
 pub const ssmSnapshotDeinit = ssm_cache.ssmSnapshotDeinit;
 pub const ssmUnbindAll = ssm_cache.ssmUnbindAll;
 pub const ssmUnbindEntries = ssm_cache.ssmUnbindEntries;
-pub const qwen4Standin = qwen4_forward.qwen4Standin;
 const sharedGateRowsEligible = qwen4_forward.sharedGateRowsEligible;
-pub const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
 pub const truncatePooled = ssm_cache.truncatePooled;
 pub const verifyQmmNaxAvailable = nax_gate.verifyQmmNaxAvailable;
 const verifyQmmNaxEnabled = nax_gate.verifyQmmNaxEnabled;
@@ -358,10 +248,8 @@ const swapReportDue = moe_stream_compute.swapReportDue;
 pub const transposeBf16Weight = mlx_util.transposeBf16Weight;
 pub const standinOnes = forward_diag.standinOnes;
 pub const standinRef = forward_diag.standinRef;
-pub const warmQsaEnvCaches = qwen4_qsa_attn.warmQsaEnvCaches;
 pub const weightTriple = layer_weights.weightTriple;
 const yarnMscale = qwen4_forward.yarnMscale;
-pub const yarnSpec = qwen4_forward.yarnSpec;
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
 pub const KvCacheChoice = kv_quant.KvCacheChoice;
@@ -854,8 +742,6 @@ pub const Trunk = struct {
     /// at construction from `SUSHI_DECODE_ASYNC_LADDER` — a per-layer
     /// getenv would cost more than the overlap it buys.
     decode_async_ladder: u32 = 0,
-    /// Batched Qwen4 stride; serial decode uses decode_async_ladder.
-    decode_async_ladder_qwen4: u32 = 0,
 
     gelu_coeff: ?mlx.mlx_array,
     gelu_inner: ?mlx.mlx_array,
@@ -927,30 +813,8 @@ pub const Trunk = struct {
     // by directly.
     yarn_mscale_cast: DtypeCastCache = .{},
 
-    // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
-    // module-owned (serial, spec-off); the trunk itself rides moe_layers
-    // through forwardQwen4With. `qwen4_mixer` is the final hyper-connection
-    // read that replaces model.norm.
-    qwen4: ?*qwen4_mod.Qwen4State = null,
-    /// Run the qwen4 residual streams in f32 (QWEN4_STREAM_F32=1, or set by
-    /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
-    /// fixture is the tighter bar for the MATH.
-    qwen4_stream_f32: bool = false,
-    qwen4_mixer: ?HcWeights = null,
-    /// nb-keyed QSA block constants (`QsaBlockConsts`).
-    qsa_consts: QsaBlockConsts = .{},
-    /// QSA pooled-block cos/sin, built once per forward (`QsaPooledRope`).
-    qsa_pooled_rope: QsaPooledRope = .{},
     /// Bumped by every forward entry that can reach QSA; keys the per-forward QSA scratch.
     fwd_gen: u64 = 0,
-    /// Test meter: how many times `qsaScoreBank` built or extended the transposed f32 operand.
-    qsa_score_bank_builds: usize = 0,
-    /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
-    /// pre-mixer stream + next-token embedding). Loaded when the pack carries
-    /// `mtp.*`; served by `qwen4MtpForward`. Not yet wired into spec decode.
-    qwen4_mtp: ?Qwen4Mtp = null,
-    /// Whose per-request state the head currently holds (`qwen4MtpActivate`).
-    qwen4_mtp_owner: ?*Qwen4MtpState = null,
     expert_stream: ?*expert_stream_mod.Engine = null,
     expert_bf16_kernels: bool = true,
     imatrix: ?*imatrix_capture.Collector = null,
@@ -973,22 +837,7 @@ pub const Trunk = struct {
     compiled_gelu: ?mlx.mlx_closure = null,
     compiled_geglu: ?mlx.mlx_closure = null, // gelu(gate) * up → 1 kernel
     compiled_moe_routing: ?mlx.mlx_closure = null, // negate→argpartition→slice→softmax→take→sum→expand→divide → 1 kernel
-    compiled_gdn_gate: ?mlx.mlx_closure = null, // exp(-exp(A_log)·softplus(a+dt_bias)) → 1 kernel (mirrors mlx-lm compute_g)
-    // qwen4_exp hyper-connection elementwise tails, one kernel each (the
-    // `/hc` scalars are folded into the weights at load): silu(down),
-    // mean(σ(up)·normed), 2σ(inject), stream + out·inj.
-    compiled_hc_silu: ?mlx.mlx_closure = null,
-    compiled_hc_mix: ?mlx.mlx_closure = null,
-    compiled_hc_inj: ?mlx.mlx_closure = null,
-    compiled_hc_write: ?mlx.mlx_closure = null,
 
-    // GatedDeltaNet per-token decode used to rebuild these on EVERY layer/step
-    // (measured dispatch overhead on Qwen 3.6 hybrid). Built lazily on first
-    // use, freed in deinit.
-    gdn_ones_w: ?mlx.mlx_array = null, // ones([dk]) for parameter-free rms_norm
-    gdn_q_scale: ?mlx.mlx_array = null, // bf16 scalar 1/dk
-    gdn_k_scale: ?mlx.mlx_array = null, // bf16 scalar 1/sqrt(dk)
-    gdn_eps: ?mlx.mlx_array = null, // f32 scalar rms_norm_eps for the fused norm-gate kernel
     /// PLD spec-decode: mirrors `ForwardCtx.capture_ssm_seq` for the current
     /// forward so `gatedDeltaNet`/`conv1dWithCache` (which don't take the ctx)
     /// can capture per-position state. Set+reset only inside `forwardMoeWith`.
@@ -998,7 +847,6 @@ pub const Trunk = struct {
     persistent_group_state_override: ?bool = null,
     /// Test seam only (no env): `false` runs the old per-slot KV update for byte comparisons.
     batched_kv_append_override: ?bool = null,
-    ssm_group: PersistentSsmGroup = .{},
 
     // Per-weight quantization bit cache (see bitsFor). Populated lazily on first use.
     // Keyed by the scales array's ctx pointer (stable for the lifetime of a weight).
@@ -1011,7 +859,6 @@ pub const Trunk = struct {
 
     // The loaded-model operations live in model_handle.zig; they keep their method names.
     pub const defaultCtx = model_handle.defaultCtx;
-    pub const module_shared_readonly_fields = model_handle.module_shared_readonly_fields;
     pub const ownsModuleDecodeState = model_handle.ownsModuleDecodeState;
     pub const sharesModuleReadonlyState = model_handle.sharesModuleReadonlyState;
     pub const moduleSpecWiring = model_handle.moduleSpecWiring;
@@ -1179,7 +1026,7 @@ pub const Trunk = struct {
             for (loaded.ssm_entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                ssmFreeQsaState(e);
+                qwen4_qsa_state.ssmFreeQsaState(e);
             }
             allocator.free(loaded.ssm_entries);
         }
@@ -1187,9 +1034,9 @@ pub const Trunk = struct {
         const cells = try TrunkCells.create(allocator);
         errdefer cells.destroy(allocator);
 
-        // qwen4_exp: ones(hidden_size) for its weight-less RMS norm.
+        // A hyper-connected trunk: ones(hidden_size) for its weight-less RMS norm.
         var ones_hidden: ?mlx.mlx_array = null;
-        if (config.isQwen4()) {
+        if (arch_config.hyperConnected(&config)) {
             const one_val = bf16Scalar(1.0, s);
             defer _ = mlx.mlx_array_free(one_val);
             const h_shape = [_]c_int{@intCast(config.hidden_size)};
@@ -1205,7 +1052,7 @@ pub const Trunk = struct {
         var yarn_mscale: ?mlx.mlx_array = null;
         var yarn_inv_freq: ?[]const f64 = null;
         if (config.rope_yarn) {
-            const spec = yarnSpec(&config);
+            const spec = qwen4_forward.yarnSpec(&config);
             const rotary_dim: u32 = config.yarnRotaryDim();
             const half: usize = rotary_dim / 2;
             const freqs_f64 = try allocator.alloc(f64, half);
@@ -1301,24 +1148,16 @@ pub const Trunk = struct {
         }
 
         // The arch's own state loads after the trunk's weights; nothing below can fail.
-        var qwen4_loaded: ?qwen4_state.Loaded = null;
         var state: arch_state_mod.State = .{};
-        var stream_parts: ?ExpertStreamParts = null;
-        if (config.isQwen4()) {
-            const q = try qwen4_state.load(allocator, config, weights, prefix, &name_buf, s, &moe_owned_bf16);
-            qwen4_loaded = q;
-            stream_parts = q.stream;
-        } else {
-            stream_parts = try arch_state_mod.initState(&state, .{
-                .allocator = allocator,
-                .config = &config,
-                .weights = weights,
-                .prefix = prefix,
-                .name_buf = &name_buf,
-                .s = s,
-                .owned_bf16 = &moe_owned_bf16,
-            });
-        }
+        const stream_parts = try arch_state_mod.initState(&state, .{
+            .allocator = allocator,
+            .config = &config,
+            .weights = weights,
+            .prefix = prefix,
+            .name_buf = &name_buf,
+            .s = s,
+            .owned_bf16 = &moe_owned_bf16,
+        });
 
         return .{
             .arch_state = state,
@@ -1331,9 +1170,6 @@ pub const Trunk = struct {
             .emb_b = emb_b_arr,
             .emb_scale = emb_scale,
             .final_norm = final_norm,
-            .qwen4 = if (qwen4_loaded) |q| q.state else null,
-            .qwen4_mixer = if (qwen4_loaded) |q| q.mixer else null,
-            .qwen4_mtp = if (qwen4_loaded) |q| q.mtp else null,
             .expert_stream = if (stream_parts) |p| p.engine else null,
             .imatrix = if (stream_parts) |p| p.imatrix else null,
             .lm_head_w = lm_head_w,
@@ -1343,9 +1179,6 @@ pub const Trunk = struct {
             .owns_lm_head = owns_lm_head,
             .owns_norms = config.norm_has_offset,
             .decode_async_ladder = decodeAsyncLadderStride(
-                if (std.c.getenv("SUSHI_DECODE_ASYNC_LADDER")) |v| std.mem.span(v) else null,
-            ),
-            .decode_async_ladder_qwen4 = qwen4DecodeLadderStride(
                 if (std.c.getenv("SUSHI_DECODE_ASYNC_LADDER")) |v| std.mem.span(v) else null,
             ),
             .gelu_coeff = if (need_gelu) bf16Scalar(0.7978845608028654, s) else null,
@@ -1378,7 +1211,7 @@ pub const Trunk = struct {
                 ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                ssmFreeQsaState(e);
+                qwen4_qsa_state.ssmFreeQsaState(e);
                 e.conv_state = mlx.mlx_array_new();
                 e.ssm_state = mlx.mlx_array_new();
                 e.ple_prev_valid = false;
@@ -1386,6 +1219,54 @@ pub const Trunk = struct {
             }
         }
         self.moe_seq_offset = 0;
+    }
+
+    /// Compile MoE routing (negate→argpartition→slice→softmax→take_along_axis→sum→expand→divide)
+    /// into a single fused kernel. Input: router_logits. Outputs: inds, norm_scores.
+    /// shapeless=false: slice bounds derive from input ndim, so the closure must
+    /// re-trace per input shape. MoE inference only sees two shapes in practice
+    /// (decode seq_len=1, prefill seq_len=N), so the trace cost amortizes after
+    /// the first prefill + first decode.
+    pub fn compileMoeRouting(self: *Trunk) void {
+        // MiMo's sigmoid chain takes the per-layer expert_bias as a second input and runs uncompiled.
+        if (self.config.moe_sigmoid_router) return;
+        const raw_closure = mlx.mlx_closure_new_func_payload(
+            &moeRoutingClosureCallback,
+            @ptrCast(self),
+            null,
+        );
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw_closure, false);
+        _ = mlx.mlx_closure_free(raw_closure);
+        if (rc == 0 and compiled.ctx != null) {
+            self.compiled_moe_routing = compiled;
+            log.info("MoE routing compiled (kernel fusion enabled)\n", .{});
+        }
+    }
+
+    /// Pure subgraph for MoE routing. Inputs:
+    ///   [0] router_logits — shape [..., num_experts]
+    /// Outputs:
+    ///   [0] inds         — shape [..., K], int32 expert indices (top-K)
+    ///   [1] norm_scores  — shape [..., K], renormalized top-K softmax weights
+    ///
+    /// The sigma-MoE per-expert-scale path stays outside the closure because it
+    /// branches on per-layer weights at model-load time.
+    fn moeRoutingClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Trunk = @ptrCast(@alignCast(payload.?));
+        const k: c_int = @intCast(self.config.num_experts_per_tok);
+
+        var router_logits = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&router_logits, input, 0) != 0) return -1;
+        defer _ = mlx.mlx_array_free(router_logits);
+
+        const inds_norm = self.moeRoutingUncompiled(router_logits, k) catch return -1;
+        defer _ = mlx.mlx_array_free(inds_norm.inds);
+        defer _ = mlx.mlx_array_free(inds_norm.norm_scores);
+
+        const out_arr = [_]mlx.mlx_array{ inds_norm.inds, inds_norm.norm_scores };
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 2);
+        return 0;
     }
 
     /// Compile GELU activation for kernel fusion.
@@ -1560,11 +1441,6 @@ pub const Trunk = struct {
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_moe_routing) |cmr| _ = mlx.mlx_closure_free(cmr);
-        if (self.compiled_gdn_gate) |cgg| _ = mlx.mlx_closure_free(cgg);
-        if (self.gdn_ones_w) |w| _ = mlx.mlx_array_free(w);
-        if (self.gdn_q_scale) |q| _ = mlx.mlx_array_free(q);
-        if (self.gdn_eps) |e| _ = mlx.mlx_array_free(e);
-        if (self.gdn_k_scale) |k| _ = mlx.mlx_array_free(k);
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
@@ -1592,7 +1468,7 @@ pub const Trunk = struct {
                 ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                ssmFreeQsaState(e);
+                qwen4_qsa_state.ssmFreeQsaState(e);
             }
             self.allocator.free(entries);
         }
@@ -2231,144 +2107,6 @@ pub const Trunk = struct {
     }
 
     // Per-model forward code lives in the model files; these keep the method API.
-    pub const AttnVerifyInputs = qwen4_forward.AttnVerifyInputs;
-    pub const DeferredQwenMoe = qwen4_forward.DeferredQwenMoe;
-    pub const HcRead = qwen4_hc.HcRead;
-    pub const Qwen4MtpBatchRow = qwen4_forward.Qwen4MtpBatchRow;
-    pub const Qwen4MtpLive = qwen4_forward.Qwen4MtpLive;
-    pub const Qwen4MtpOut = qwen4_forward.Qwen4MtpOut;
-    pub const Qwen4MtpOutBuf = qwen4_forward.Qwen4MtpOutBuf;
-    pub const Qwen4MtpProject = qwen4_forward.Qwen4MtpProject;
-    pub const Qwen4MtpState = qwen4_forward.Qwen4MtpState;
-    pub const Qwen4Trace = qwen4_forward.Qwen4Trace;
-    pub const VerifyRowsKind = qwen4_forward.VerifyRowsKind;
-    pub const addVerifyPle = qwen4_hc.addVerifyPle;
-    pub const advancePlePrev = qwen4_hc.advancePlePrev;
-    pub const applyClosure = qwen4_forward.applyClosure;
-    pub const attnDecodeRows = qwen4_forward.attnDecodeRows;
-    pub const attnVerifyRows = qwen4_forward.attnVerifyRows;
-    pub const batchedGdnReady = qwen4_forward.batchedGdnReady;
-    pub const closureIn = qwen4_forward.closureIn;
-    pub const closureOut = qwen4_forward.closureOut;
-    pub const compileGdnGate = qwen4_forward.compileGdnGate;
-    pub const compileMoeRouting = qwen4_forward.compileMoeRouting;
-    pub const compileQwen4Hc = qwen4_forward.compileQwen4Hc;
-    pub const computeGdnGate = qwen4_gdn.computeGdnGate;
-    pub const conv1dWithCache = qwen4_gdn.conv1dWithCache;
-    pub const discardDeferredPle = qwen4_hc.discardDeferredPle;
-    pub const flushDeferredPle = qwen4_hc.flushDeferredPle;
-    pub const flushDeferredPleGroup = qwen4_hc.flushDeferredPleGroup;
-    pub const forwardMoeBatchedDecode = qwen4_forward.forwardMoeBatchedDecode;
-    pub const forwardMoeBatchedRows = qwen4_forward.forwardMoeBatchedRows;
-    pub const forwardMoeBatchedVerify = qwen4_forward.forwardMoeBatchedVerify;
-    pub const forwardQwen4DecodeRows = qwen4_forward.forwardQwen4DecodeRows;
-    pub const forwardQwen4VerifyRows = qwen4_forward.forwardQwen4VerifyRows;
-    pub const forwardQwen4With = qwen4_forward.forwardQwen4With;
-    pub const gatedAttnTail = qwen4_forward.gatedAttnTail;
-    pub const gatedDeltaNet = qwen4_forward.gatedDeltaNet;
-    pub const gatedDeltaNetProjected = qwen4_gdn.gatedDeltaNetProjected;
-    pub const gatedFullAttnProjected = qwen4_forward.gatedFullAttnProjected;
-    pub const gdnCheckFused = qwen4_gdn.gdnCheckFused;
-    pub const gdnDecodeRows = qwen4_forward.gdnDecodeRows;
-    pub const gdnGateClosureCallback = qwen4_forward.gdnGateClosureCallback;
-    pub const gdnProjGpu = qwen4_gdn.gdnProjGpu;
-    pub const gdnVerifyRows = qwen4_forward.gdnVerifyRows;
-    pub const hcFlush = qwen4_hc.hcFlush;
-    pub const hcGroupNorm = qwen4_hc.hcGroupNorm;
-    pub const hcInjCallback = qwen4_hc.hcInjCallback;
-    pub const hcMixCallback = qwen4_hc.hcMixCallback;
-    pub const hcRead = qwen4_hc.hcRead;
-    pub const hcReadFusedFor = qwen4_hc.hcReadFusedFor;
-    pub const hcReadNormed = qwen4_hc.hcReadNormed;
-    pub const hcReadPending = qwen4_hc.hcReadPending;
-    pub const hcReadRows = qwen4_hc.hcReadRows;
-    pub const hcReadStandin = qwen4_hc.hcReadStandin;
-    pub const hcReadVerifyRows = qwen4_hc.hcReadVerifyRows;
-    pub const hcSiluCallback = qwen4_hc.hcSiluCallback;
-    pub const hcWrite = qwen4_hc.hcWrite;
-    pub const hcWriteCallback = qwen4_hc.hcWriteCallback;
-    pub const hcWriteOrDefer = qwen4_hc.hcWriteOrDefer;
-    pub const loadQwen4Mtp = qwen4_forward.loadQwen4Mtp;
-    pub const markQsaPooledRopeStale = qwen4_qsa.markQsaPooledRopeStale;
-    pub const mergeSsmAcrossSlots = qwen4_ssm_group.mergeSsmAcrossSlots;
-    pub const moeRoutingClosureCallback = qwen4_forward.moeRoutingClosureCallback;
-    pub const mtpHeadForceBatched = qwen4_forward.mtpHeadForceBatched;
-    pub const mtpHeadKvQuantEnabled = qwen4_forward.mtpHeadKvQuantEnabled;
-    pub const mtpMoeRows = qwen4_forward.mtpMoeRows;
-    pub const mtpPadSeq = qwen4_forward.mtpPadSeq;
-    pub const pleClaimSpecCapture = qwen4_hc.pleClaimSpecCapture;
-    pub const pleDeferrable = qwen4_hc.pleDeferrable;
-    pub const pleEmbedding = qwen4_hc.pleEmbedding;
-    pub const pleFillFromIds = qwen4_hc.pleFillFromIds;
-    pub const pleForward = qwen4_hc.pleForward;
-    pub const pleGatherBf16 = qwen4_hc.pleGatherBf16;
-    pub const plePreEval = qwen4_hc.plePreEval;
-    pub const plePrepareIds = qwen4_hc.plePrepareIds;
-    pub const projectRows = qwen4_forward.projectRows;
-    pub const qkAngleFor = qwen4_forward.qkAngleFor;
-    pub const qsaAppendKeys = qwen4_qsa.qsaAppendKeys;
-    pub const qsaAppendPooled = qwen4_qsa.qsaAppendPooled;
-    pub const qsaBatchedAttn = qwen4_qsa.qsaBatchedAttn;
-    pub const qsaBlockVisibility = qwen4_qsa.qsaBlockVisibility;
-    pub const qsaChunkSelect = qwen4_qsa.qsaChunkSelect;
-    pub const qsaInstallRing = qwen4_qsa.qsaInstallRing;
-    pub const qsaMask = qwen4_qsa.qsaMask;
-    pub const qsaMaskBatched = qwen4_qsa.qsaMaskBatched;
-    pub const qsaMaskFromQk = qwen4_qsa.qsaMaskFromQk;
-    pub const qsaPoolNorm = qwen4_qsa.qsaPoolNorm;
-    pub const qsaPooledCosSin = qwen4_qsa.qsaPooledCosSin;
-    pub const qsaPooledKeys = qwen4_qsa.qsaPooledKeys;
-    pub const qsaPooledRopeComposed = qwen4_qsa.qsaPooledRopeComposed;
-    pub const qsaScoreBank = qwen4_qsa.qsaScoreBank;
-    pub const qsaScoreCols = qwen4_qsa.qsaScoreCols;
-    pub const qsaScoreOperand = qwen4_qsa.qsaScoreOperand;
-    pub const qsaSelectBlocks = qwen4_qsa.qsaSelectBlocks;
-    pub const qsaSelectMaskOps = qwen4_qsa.qsaSelectMaskOps;
-    pub const qsaSlotEntry = qwen4_qsa.qsaSlotEntry;
-    pub const qwen4AttnProjected = qwen4_forward.qwen4AttnProjected;
-    pub const qwen4AttnWith = qwen4_forward.qwen4AttnWith;
-    pub const qwen4BuildDraftRerank = qwen4_forward.qwen4BuildDraftRerank;
-    pub const qwen4DecodeLadderStride = qwen4_forward.qwen4DecodeLadderStride;
-    pub const qwen4DraftRerankReady = qwen4_forward.qwen4DraftRerankReady;
-    pub const qwen4DraftSelect = qwen4_forward.qwen4DraftSelect;
-    pub const qwen4DraftSelectBatched = qwen4_forward.qwen4DraftSelectBatched;
-    pub const qwen4DraftShortlist = qwen4_forward.qwen4DraftShortlist;
-    pub const qwen4DraftShortlistsBatched = qwen4_forward.qwen4DraftShortlistsBatched;
-    pub const qwen4MtpActivate = qwen4_forward.qwen4MtpActivate;
-    pub const qwen4MtpAdopt = qwen4_forward.qwen4MtpAdopt;
-    pub const qwen4MtpAdvance = qwen4_forward.qwen4MtpAdvance;
-    pub const qwen4MtpApplyKvQuant = qwen4_forward.qwen4MtpApplyKvQuant;
-    pub const qwen4MtpForward = qwen4_forward.qwen4MtpForward;
-    pub const qwen4MtpForwardBatched = qwen4_forward.qwen4MtpForwardBatched;
-    pub const qwen4MtpForwardLive = qwen4_forward.qwen4MtpForwardLive;
-    pub const qwen4MtpForwardOn = qwen4_forward.qwen4MtpForwardOn;
-    pub const qwen4MtpHeadKvConfig = qwen4_forward.qwen4MtpHeadKvConfig;
-    pub const qwen4MtpLiveModule = qwen4_forward.qwen4MtpLiveModule;
-    pub const qwen4MtpLiveState = qwen4_forward.qwen4MtpLiveState;
-    pub const qwen4MtpMarkQsaLeftover = qwen4_forward.qwen4MtpMarkQsaLeftover;
-    pub const qwen4MtpMarks = qwen4_forward.qwen4MtpMarks;
-    pub const qwen4MtpRelease = qwen4_forward.qwen4MtpRelease;
-    pub const qwen4MtpReset = qwen4_forward.qwen4MtpReset;
-    pub const qwen4MtpResetOwned = qwen4_forward.qwen4MtpResetOwned;
-    pub const qwen4MtpStateNew = qwen4_forward.qwen4MtpStateNew;
-    pub const qwen4MtpSwapState = qwen4_forward.qwen4MtpSwapState;
-    pub const qwen4MtpTruncate = qwen4_forward.qwen4MtpTruncate;
-    pub const qwen4MtpTruncateLive = qwen4_forward.qwen4MtpTruncateLive;
-    pub const qwen4MtpTruncateOn = qwen4_forward.qwen4MtpTruncateOn;
-    pub const qwen4MtpTruncateToMarkLive = qwen4_forward.qwen4MtpTruncateToMarkLive;
-    pub const qwen4VerifyRowsEligible = qwen4_forward.qwen4VerifyRowsEligible;
-    pub const resetQsaPooledRope = qwen4_qsa.resetQsaPooledRope;
-    pub const restoreStreamH = qwen4_forward.restoreStreamH;
-    pub const splitSsmToSlots = qwen4_ssm_group.splitSsmToSlots;
-    pub const ssmBindBatched = qwen4_ssm_group.ssmBindBatched;
-    pub const ssmGroupDrop = qwen4_ssm_group.ssmGroupDrop;
-    pub const ssmGroupRelease = qwen4_ssm_group.ssmGroupRelease;
-    pub const supportsBatchedGdnDecode = qwen4_forward.supportsBatchedGdnDecode;
-    pub const supportsBatchedQwen4Rows = qwen4_forward.supportsBatchedQwen4Rows;
-    pub const verifyQwenMoe = qwen4_forward.verifyQwenMoe;
-    pub const verifyRowsJoined = qwen4_forward.verifyRowsJoined;
-    pub const yarnScaleQK = qwen4_forward.yarnScaleQK;
-    pub const yarnScaleRotated = qwen4_forward.yarnScaleRotated;
 
     /// Free compiled JIT closures (compiled_gelu /
     /// compiled_geglu / compiled_softcap / compiled_moe_routing). They get
@@ -2391,16 +2129,7 @@ pub const Trunk = struct {
             _ = mlx.mlx_closure_free(c);
             self.compiled_moe_routing = null;
         }
-        if (self.compiled_gdn_gate) |c| {
-            _ = mlx.mlx_closure_free(c);
-            self.compiled_gdn_gate = null;
-        }
-        inline for (.{ &self.compiled_hc_silu, &self.compiled_hc_mix, &self.compiled_hc_inj, &self.compiled_hc_write }) |slot| {
-            if (slot.*) |c| {
-                _ = mlx.mlx_closure_free(c);
-                slot.* = null;
-            }
-        }
+        arch_state_mod.clearCompiled(&self.arch_state);
     }
 
     /// Pre-fault weight pages and trigger first-touch kernel compiles before
@@ -2477,7 +2206,7 @@ pub const Trunk = struct {
                 .cache = &sl.cache,
                 .moe_seq_offset = &sl.off,
                 .ssm_entries = sl.entries,
-                .ssm_member_gen = nextSsmMemberGen(),
+                .ssm_member_gen = qwen4_ssm_group.nextSsmMemberGen(),
                 .capture_hidden = null,
                 .vision_embeddings = null,
             };
@@ -2489,7 +2218,7 @@ pub const Trunk = struct {
                 ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                ssmFreeQsaState(e);
+                qwen4_qsa_state.ssmFreeQsaState(e);
             }
             alloc.free(sl.entries);
             sl.cache.deinit();
@@ -2546,7 +2275,7 @@ pub const Trunk = struct {
     pub fn warmupSpecVerify(self: *Trunk, max_width: u32, kv_config: KVQuantConfig) !void {
         forward_diag.moe_dump_warmup_depth += 1;
         defer forward_diag.moe_dump_warmup_depth -= 1;
-        if (self.qwen4 == null or self.qwen4_mtp == null) return;
+        if (!qwen4_state.isLoaded(self) or qwen4_state.mtpOf(self) == null) return;
         var lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         const width_cap: usize = @min(@max(max_width, 1), MAX_WIDTH_WARM);
         const group_cap: usize = if (verifyQmmNaxAvailable()) 16 else 7;
@@ -2556,7 +2285,7 @@ pub const Trunk = struct {
         var n_slots: usize = 0;
         defer {
             for (slots[0..n_slots]) |sl| {
-                self.ssmGroupRelease(&sl.ctx) catch {};
+                arch_state_mod.releaseGroup(self, &sl.ctx) catch {};
                 sl.deinit(self.allocator);
             }
             _ = mlx.mlx_clear_cache();
@@ -2572,9 +2301,9 @@ pub const Trunk = struct {
             const prompt = specWarmIds(prompt_ids[0..if (n_slots == 0) SPEC_WARM_PREFILL_ROWS else 8]);
             defer _ = mlx.mlx_array_free(prompt);
             var stream = mlx.mlx_array_new();
-            slots[n_slots].ctx.capture_stream_all = if (n_slots == 0) &stream else null;
+            qwen4_state.ctxOf(&slots[n_slots].ctx).?.capture_stream_all = if (n_slots == 0) &stream else null;
             const logits = try self.forwardWith(&slots[n_slots].ctx, prompt);
-            slots[n_slots].ctx.capture_stream_all = null;
+            qwen4_state.ctxOf(&slots[n_slots].ctx).?.capture_stream_all = null;
             if (n_slots == 0 and stream.ctx != null) {
                 const sh = mlx.getShape(stream);
                 try mlx.check(mlx.mlx_slice(&head_in, stream, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ sh[0], 1, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
@@ -2610,13 +2339,13 @@ pub const Trunk = struct {
     }
 
     fn specWarmHead(self: *Trunk, stream_row: mlx.mlx_array) !void {
-        var st = try self.qwen4MtpStateNew();
+        var st = try qwen4_forward.qwen4MtpStateNew(self);
         defer st.deinit();
         var id_buf: [1]i32 = undefined;
         const id_arr = specWarmIds(&id_buf);
         defer _ = mlx.mlx_array_free(id_arr);
-        for ([_]Qwen4MtpProject{ .mixed_last_row, .none }, 0..) |project, i| {
-            const out = try self.qwen4MtpForwardOn(&st, stream_row, id_arr, @intCast(1 + i), null, project);
+        for ([_]qwen4_forward.Qwen4MtpProject{ .mixed_last_row, .none }, 0..) |project, i| {
+            const out = try qwen4_forward.qwen4MtpForwardOn(self, &st, stream_row, id_arr, @intCast(1 + i), null, project);
             specWarmEvalFree(&[_]mlx.mlx_array{ out.logits, out.stream, out.mixed });
         }
     }
@@ -2719,7 +2448,7 @@ pub const Trunk = struct {
                     _ = mlx.mlx_array_free(entry.conv_state);
                     _ = mlx.mlx_array_free(entry.ssm_state);
                     ssmFreeSpecCapture(entry);
-                    ssmFreeQsaState(entry);
+                    qwen4_qsa_state.ssmFreeQsaState(entry);
                     entry.conv_state = saved.conv_state;
                     entry.ssm_state = saved.ssm_state;
                     entry.aux_state = saved.aux_state;
@@ -2737,7 +2466,7 @@ pub const Trunk = struct {
                     if (entry.qsa_pooled.ctx != null) entry.qsa_pooled_blocks = mlx.getShape(entry.qsa_pooled)[1];
                 }
             }
-            self.ctx.ssm_member_gen = nextSsmMemberGen();
+            self.ctx.ssm_member_gen = qwen4_ssm_group.nextSsmMemberGen();
             self.xfm.fwd_gen +%= 1;
         }
 
@@ -2771,9 +2500,9 @@ pub const Trunk = struct {
         var n_rollback: usize = 0;
         defer for (rollback[0..n_rollback]) |*saved| saved.deinit();
         errdefer for (rollback[0..n_rollback]) |*saved| saved.restore();
-        if (self.qwen4 != null and token_rows.len > 1) {
+        if (qwen4_state.isLoaded(self) and token_rows.len > 1) {
             if (token_rows.len > MAX_BATCH_ROWS) return error.MtpBatchTooWide;
-            for (ctxs) |ctx| try self.ssmGroupRelease(ctx);
+            for (ctxs) |ctx| try arch_state_mod.releaseGroup(self, ctx);
             for (ctxs, 0..) |ctx, i| {
                 var snapshot_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
                 rollback[i] = try VerifyRollback.capture(self, ctx);
@@ -2791,11 +2520,11 @@ pub const Trunk = struct {
                 _ = mlx.mlx_array_free(out_all[i]);
             }
             for (0..touched) |i| {
-                self.discardDeferredPle(ctxs[i]);
+                arch_state_mod.discardDeferred(self, ctxs[i]);
                 if (ctxs[i].ssm_entries) |entries| for (entries) |*e| ssmFreeSpecCapture(e);
             }
         }
-        if (self.qwen4VerifyRowsEligible(token_rows, ctxs)) {
+        if (qwen4_state.built and qwen4_forward.qwen4VerifyRowsEligible(self, token_rows, ctxs)) {
             const Once = struct {
                 var logged = false;
             };
@@ -2805,15 +2534,15 @@ pub const Trunk = struct {
             }
             for (ctxs) |ctx| {
                 ctx.capture_ssm_seq = true;
-                ctx.ple_defer = true;
+                ctx.lazy_ids = true;
             }
             touched = token_rows.len;
             {
                 defer for (ctxs) |ctx| {
-                    ctx.ple_defer = false;
+                    ctx.lazy_ids = false;
                     ctx.capture_ssm_seq = false;
                 };
-                try self.forwardQwen4VerifyRows(token_rows, ctxs, out_logits, out_last, out_all);
+                try qwen4_forward.forwardQwen4VerifyRows(self, token_rows, ctxs, out_logits, out_last, out_all);
             }
             built = token_rows.len;
             const group_ns = lap.read();
@@ -2830,15 +2559,15 @@ pub const Trunk = struct {
                 // Per-position SSM capture lets a partial accept roll back without a re-forward;
                 // the deferred PLE leaf keeps qwen4_exp's host gather out of the graph build.
                 ctx.capture_ssm_seq = ctx.ssm_entries != null;
-                ctx.ple_defer = true;
+                ctx.lazy_ids = true;
                 const logits = self.forwardWithCaptureAll(ctx, row, &last, &all) catch |e| {
-                    ctx.ple_defer = false;
+                    ctx.lazy_ids = false;
                     ctx.capture_ssm_seq = false;
                     _ = mlx.mlx_array_free(last);
                     _ = mlx.mlx_array_free(all);
                     return e;
                 };
-                ctx.ple_defer = false;
+                ctx.lazy_ids = false;
                 ctx.capture_ssm_seq = false;
                 out_logits[i] = logits;
                 out_last[i] = last;
@@ -2852,7 +2581,7 @@ pub const Trunk = struct {
         }
         // Fills the deferred PLE leaves and advances every row's n-gram history: after EVERY
         // row's build, before the first eval downstream of a leaf and before any rollback.
-        try self.flushDeferredPleGroup(ctxs[0..token_rows.len]);
+        try arch_state_mod.flushDeferredGroup(self, ctxs[0..token_rows.len]);
         const ple_ns = lap.read();
         self.verify_laps.ple_ns = ple_ns;
         if (row_ns) |ns| ns[0] += ple_ns;
@@ -3003,7 +2732,7 @@ pub const Trunk = struct {
 
 
     pub fn verifyFeatureEnabled(self: *const Trunk, comptime feature: SingleVerifyFeature, grouped: bool, batch: c_int, width: c_int) bool {
-        if (self.qwen4 == null) return false;
+        if (!qwen4_state.isLoaded(self)) return false;
         if (grouped) return true;
         if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
         // Capture marks speculative verification. A short prefill tail has the
@@ -3247,29 +2976,6 @@ pub const Trunk = struct {
 
 
 
-    test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
-        const t = std.testing;
-        var xfm: Trunk = undefined;
-        xfm.s = mlx.gpuStream();
-        xfm.allocator = t.allocator;
-        const head_cache = try KVCache.init(t.allocator, 1);
-        var head: Qwen4Mtp = undefined;
-        head.cache = head_cache;
-        head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
-        head.qsa_marks = .{};
-        head.seq_offset = 7;
-        head.pos_base = 3;
-        xfm.qwen4_mtp = head;
-        const m = &xfm.qwen4_mtp.?;
-        defer {
-            ssmFreeQsaState(&m.entry);
-            m.qsa_marks.deinit();
-            m.cache.deinit();
-        }
-        xfm.qwen4MtpResetOwned(false);
-        try t.expectEqual(@as(usize, 7), m.seq_offset);
-        try t.expectEqual(@as(i32, 3), m.pos_base);
-    }
 
 
 
@@ -3330,7 +3036,6 @@ pub const Trunk = struct {
 
 
 
-    pub var qwen4_trace: ?*Qwen4Trace = null;
 
 
 
@@ -3392,28 +3097,6 @@ pub const Trunk = struct {
         errdefer _ = mlx.mlx_array_free(sin);
         try mlx.check(mlx.mlx_astype(&sin, sf, dtype, self.s));
         return .{ .cos = cos, .sin = sin };
-    }
-
-    pub fn mropeContext(ctx: *const ForwardCtx) mrope.PositionContext {
-        return .{ .pos = ctx.mrope_pos.?, .total = ctx.mrope_total, .delta = ctx.mrope_delta };
-    }
-
-    /// Per-prefill-chunk M-RoPE cos/sin on `ctx.mrope_cos/sin_cur`, built once
-    /// per forward (freed by `endMropeChunk`). Forwards past the explicit
-    /// position table (decode, multi-token spec verify) leave them null and
-    /// take the scalar `offset + delta` path.
-    pub fn beginMropeChunk(self: *Trunk, ctx: *ForwardCtx, offset: usize, seq_len: usize, dtype: mlx.mlx_dtype) !void {
-        if (ctx.mrope_pos == null or seq_len <= 1 or offset + seq_len > ctx.mrope_total) return;
-        const cs = try self.mropeCosSinAt(mropeContext(ctx), offset, 1, seq_len, dtype);
-        ctx.mrope_cos_cur = cs.cos;
-        ctx.mrope_sin_cur = cs.sin;
-    }
-
-    pub fn endMropeChunk(ctx: *ForwardCtx) void {
-        if (ctx.mrope_cos_cur) |c| _ = mlx.mlx_array_free(c);
-        if (ctx.mrope_sin_cur) |sn| _ = mlx.mlx_array_free(sn);
-        ctx.mrope_cos_cur = null;
-        ctx.mrope_sin_cur = null;
     }
 
     /// Does this trunk rotate with a YaRN-scaled rope? The DECISION comes from
@@ -3682,9 +3365,9 @@ pub const Trunk = struct {
     }
 
     pub fn moeVerifyRows(self: *Trunk, inputs: []const mlx.mlx_array, mw: *const MoeMlpWeights) ![]mlx.mlx_array {
-        if (self.qwen4 == null or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
+        if (!qwen4_state.isLoaded(self) or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
             inputs.len < 2 or inputs.len > 8 or self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32 or
-            mw.shared_expert_gate_w == null or qwen4Standin().moe_shared or
+            mw.shared_expert_gate_w == null or qwen4_forward.qwen4Standin().moe_shared or
             self.config.num_experts == 0 or self.config.num_experts_per_tok == 0 or
             mw.expert_bias != null)
         {
@@ -3853,7 +3536,7 @@ pub const Trunk = struct {
     }
 
     fn streamedMoeResult(self: *Trunk, stream_ctx: MoeStreamCtx, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, router_logits: mlx.mlx_array, mw: *const MoeMlpWeights) anyerror!mlx.mlx_array {
-        try self.flushDeferredPle(stream_ctx.ctx);
+        try arch_state_mod.flushDeferred(self, stream_ctx.ctx);
         const engine = self.expert_stream orelse return error.MissingExpertStream;
         var detail = expert_stream_mod.RouteDetail{};
         var sync_clock = ProfClock.init();
@@ -3867,7 +3550,7 @@ pub const Trunk = struct {
         defer if (shared_early) |value| {
             _ = mlx.mlx_array_free(value);
         };
-        const shared_eligible = streamSharedEarlyApplies(self.config.expert_layout == .exl3_k4 and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared, mlx.getShape(inds));
+        const shared_eligible = streamSharedEarlyApplies(self.config.expert_layout == .exl3_k4 and mw.shared_expert_gate_w != null and !qwen4_forward.qwen4Standin().moe_shared, mlx.getShape(inds));
         const swap_tolerance = expert_stream_mod.pick_tolerance;
         var swap_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(swap_logits);
@@ -4086,7 +3769,7 @@ pub const Trunk = struct {
             _ = mlx.mlx_array_free(expert_sum);
             expert_sum = narrowed;
         }
-        if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) {
+        if (mw.shared_expert_gate_w == null or qwen4_forward.qwen4Standin().moe_shared) {
             engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
             try handOffStreamedResult(expert_sum, rows);
             return expert_sum;
@@ -4145,7 +3828,7 @@ pub const Trunk = struct {
         var act_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(act_2d);
         var inter: c_int = 0;
-        if (qwen4Standin().moe_gateup and self.config.moe_intermediate_size > 0) {
+        if (qwen4_forward.qwen4Standin().moe_gateup and self.config.moe_intermediate_size > 0) {
             // Diagnostic: unit activations, the gate+up kernel drops out.
             const sh = [_]c_int{ K, @intCast(self.config.moe_intermediate_size) };
             _ = mlx.mlx_array_free(act_2d);
@@ -4202,7 +3885,7 @@ pub const Trunk = struct {
         // [K, hidden] intermediate never materializes. Declines (dtype
         // mismatch, geometry, kill switch) fall through to the split form
         // with `reduced` untouched.
-        if (qwen4Standin().moe_down and @rem(D, inter) == 0) {
+        if (qwen4_forward.qwen4Standin().moe_down and @rem(D, inter) == 0) {
             // Diagnostic: the down kernel drops out; the activations are still
             // consumed (sum over K, tiled to hidden) so gate+up stays live.
             var summed = mlx.mlx_array_new();
@@ -4402,7 +4085,7 @@ pub const Trunk = struct {
         // At one decode row the shared-expert gate's logit rides the softmax router kernel.
         const gate_fold: ?RouterGate = blk: {
             if (routing_override != null or router_override != null or stream_ctx != null or skip_shared) break :blk null;
-            if (mw.expert_bias != null or mw.shared_gate_vec.ctx == null or qwen4Standin().moe_shared or qwen4Standin().moe_router) break :blk null;
+            if (mw.expert_bias != null or mw.shared_gate_vec.ctx == null or qwen4_forward.qwen4Standin().moe_shared or qwen4_forward.qwen4Standin().moe_router) break :blk null;
             if (mlx.mlx_array_size(expert_x) != mlx.mlx_array_size(mw.shared_gate_vec)) break :blk null;
             break :blk .{ .x = expert_x, .w = mw.shared_gate_vec };
         };
@@ -4424,7 +4107,7 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(inds);
         var norm_scores = routed.norm_scores;
         defer _ = mlx.mlx_array_free(norm_scores);
-        if (routing_override == null and qwen4Standin().moe_router) {
+        if (routing_override == null and qwen4_forward.qwen4Standin().moe_router) {
             // Diagnostic: fixed experts 0..K-1, uniform scores (routing off the critical path).
             const ish = mlx.getShape(inds);
             const k: c_int = ish[ish.len - 1];
@@ -4477,7 +4160,7 @@ pub const Trunk = struct {
             };
             const shared = if (routing_override) |given| given.shared_gated else null;
             const fold_shared = shared != null and moeDumpDir() == null;
-            const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
+            const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4_forward.qwen4Standin().moe_shared;
             if (tail_shared and moeDumpDir() == null) {
                 // A dense gate (the packs' bf16 [1, hidden]) has no affine bank for the fold to read: its logit comes in.
                 const dense_gate = mw.shared_expert_gate_s.?.ctx == null;
@@ -4508,7 +4191,7 @@ pub const Trunk = struct {
                 try mlx.check(mlx.mlx_add(&summed, y, shared_gated, self.s));
                 return summed;
             };
-            if (skip_shared or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
+            if (skip_shared or mw.shared_expert_gate_w == null or qwen4_forward.qwen4Standin().moe_shared) return y;
             defer _ = mlx.mlx_array_free(y);
             return self.moeAddGatedShared(y, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
         }
@@ -4559,7 +4242,7 @@ pub const Trunk = struct {
         var moe_reduced = false;
         var cost_arm: u8 = 4;
 
-        const grouped_rows = skip_shared and router_override != null and B == 1 and S >= 2 and S <= 128 and moeRowsFusedEnabled() and !qwen4Standin().moe_gateup and !qwen4Standin().moe_down;
+        const grouped_rows = skip_shared and router_override != null and B == 1 and S >= 2 and S <= 128 and moeRowsFusedEnabled() and !qwen4_forward.qwen4Standin().moe_gateup and !qwen4_forward.qwen4Standin().moe_down;
         if (imx == null and (grouped_rows or moeDecodeDispatchArm(B, S, K) == .rows) and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
             try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
@@ -4793,7 +4476,7 @@ pub const Trunk = struct {
 
 
         // No shared-expert gate: the routed sum is the whole output.
-        if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return expert_sum;
+        if (mw.shared_expert_gate_w == null or qwen4_forward.qwen4Standin().moe_shared) return expert_sum;
         defer _ = mlx.mlx_array_free(expert_sum);
         return self.moeAddGatedShared(expert_sum, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
     }
@@ -4903,7 +4586,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         for (owned_bf16.items) |a| _ = mlx.mlx_array_free(a);
         owned_bf16.deinit(allocator);
     }
-    const is_qwen4 = config.isQwen4();
+    const hyper_connected = arch_config.hyperConnected(&config);
     const is_mimo = std.mem.eql(u8, config.model_type, "mimo_v2");
 
     for (0..config.num_hidden_layers) |i| {
@@ -4911,12 +4594,12 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         const lw = &moe_layers[i];
         const is_linear = config.isLinearLayer(li);
 
-        // qwen4_exp has no per-layer norms: the hyper-connection read normalizes.
-        lw.input_norm = if (is_qwen4)
+        // A hyper-connected trunk has no per-layer norms: the stream read normalizes.
+        lw.input_norm = if (hyper_connected)
             mlx.mlx_array_new()
         else
             try getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
-        lw.post_attn_norm = if (is_qwen4)
+        lw.post_attn_norm = if (hyper_connected)
             mlx.mlx_array_new()
         else
             try getLayerWeight(weights, name_buf, prefix, li, "post_attention_layernorm.weight");
@@ -4928,7 +4611,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         lw.hc_attn = null;
         lw.hc_mlp = null;
         lw.ple = null;
-        if (is_qwen4) {
+        if (hyper_connected) {
             var hb: [96]u8 = undefined;
             lw.hc_attn = try loadHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.attn_hyper_connection", .{ prefix, li }) catch unreachable, true, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
             lw.hc_mlp = try loadHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.mlp_hyper_connection", .{ prefix, li }) catch unreachable, true, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
@@ -5091,7 +4774,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 try maybeTransposeForBf16(&fa.k_w, fa.k_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.o_w, fa.o_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.v_w, fa.v_s, &owned_bf16, allocator, s);
-                if (is_qwen4 and config.indexer_n_heads > 0) {
+                if (hyper_connected and config.indexer_n_heads > 0) {
                     const idx = try layerProj(weights, name_buf, &config, li, "self_attn.indexer.index_qk_proj", .optional, &owned_bf16, allocator, s);
                     fa.idx_qk_w = idx.w;
                     fa.idx_qk_s = idx.s;
@@ -5282,7 +4965,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
 
     // The PLE is placed by exact equality inside the loop above and nothing downstream notices
     // its absence; a silently PLE-less qwen4 emits plausible text.
-    if (config.isQwen4()) {
+    if (hyper_connected) {
         const has_ple = try allocator.alloc(bool, moe_layers.len);
         defer allocator.free(has_ple);
         for (moe_layers, 0..) |*lw, i| has_ple[i] = lw.ple != null;

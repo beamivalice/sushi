@@ -28,6 +28,8 @@ const MtpCostSource = mtp_policy.MtpCostSource;
 const MtpRoundPlan = mtp_policy.MtpRoundPlan;
 const SubLap = mtp_policy.SubLap;
 const Transformer = transformer_mod.Transformer;
+const arch_state = @import("arch/arch_state.zig");
+const qwen4_state = @import("qwen4/qwen4_state.zig");
 const isEosId = spec_types.isEosId;
 const mtpAdaptiveEnabled = Generator.mtpAdaptiveEnabled;
 const mtpAdaptiveSerialEnabled = Generator.mtpAdaptiveSerialEnabled;
@@ -135,11 +137,11 @@ pub fn mtpCommittedHistoryLen(self: *const Generator) usize {
 }
 
 pub fn mtpMropeContext(self: *const Generator) ?mtp_mod.MropeContext {
-    const positions = self.ctx.mrope_pos orelse return null;
+    const positions = arch_state.mropeOf(&self.ctx.arch_ctx) orelse return null;
     return .{
-        .pos = positions,
-        .total = self.ctx.mrope_total,
-        .delta = self.ctx.mrope_delta,
+        .pos = positions.pos,
+        .total = positions.total,
+        .delta = positions.delta,
         .base = self.mtp_position_base,
     };
 }
@@ -577,7 +579,7 @@ pub fn mtpGroupSampledDrafts(
     const s = xfm.s;
     const n = gens.len;
     var shortlists: [32]mtp_mod.Shortlist = undefined;
-    const have = try xfm.qwen4DraftShortlistsBatched(stacked_x, gens[0].sampling.suppress_mask, shortlists[0..n]);
+    const have = try arch_state.draftShortlists(xfm, stacked_x, gens[0].sampling.suppress_mask, shortlists[0..n]);
     if (!have) {
         // No coarse head: every row proposes greedily and hands the verify
         // the one-hot q that proposal really has.
@@ -1612,18 +1614,18 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     // eagerly parks the build of layers 2..N behind the whole draft chain
     // finishing on the GPU. Defer the leaf so the graph builds while the
     // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
-    // 4 evaluates anything. Other arches never set `ple_pending`.
-    self.ctx.ple_defer = true;
+    // 4 evaluates anything. Other arches defer nothing.
+    self.ctx.lazy_ids = true;
     self.ctx.verify_rows = xfm.config.isMimo();
     defer self.ctx.verify_rows = false;
     var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
-        self.ctx.ple_defer = false;
+        self.ctx.lazy_ids = false;
         self.ctx.capture_ssm_seq = false;
-        xfm.discardDeferredPle(&self.ctx);
+        arch_state.discardDeferred(xfm, &self.ctx);
         return e;
     };
     errdefer _ = mlx.mlx_array_free(verify_logits);
-    self.ctx.ple_defer = false;
+    self.ctx.lazy_ids = false;
     self.ctx.capture_ssm_seq = false;
     xfm.verify_laps.ple_sync_ns = 0;
     if (tracing) {
@@ -1641,8 +1643,8 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     // the point at which the entry's n-gram history + `spec_ple_tokens`
     // advance. Must precede BOTH the first eval of anything downstream of
     // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
-    errdefer xfm.discardDeferredPle(&self.ctx);
-    try xfm.flushDeferredPle(&self.ctx);
+    errdefer arch_state.discardDeferred(xfm, &self.ctx);
+    try arch_state.flushDeferred(xfm, &self.ctx);
     _ = try self.thinkShiftRows(&verify_logits, st.verify_input);
     _ = try self.penaltyShiftRows(&verify_logits, st.verify_input);
     st.verify_logits = verify_logits;
@@ -1668,7 +1670,7 @@ pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) 
         ctxs[i] = &gen.ctx;
     }
     var rollback: [MTP_GROUP_ROWS_MAX]Transformer.VerifyRollback = undefined;
-    const retain_rollback = n > 1 and xfm.qwen4 != null;
+    const retain_rollback = n > 1 and qwen4_state.isLoaded(xfm);
     for (gens, states) |gen, st| st.verify_ctx = &gen.ctx;
     var row_ns: [MTP_GROUP_ROWS_MAX]u64 = undefined;
     var tracing_any = false;
@@ -2915,14 +2917,14 @@ test "MTP continuation releases its owned chain when drafting fails" {
     defer _ = mlx.mlx_stream_free(s);
     var xfm: Transformer = undefined;
     xfm.s = s;
-    xfm.qwen4_mtp = null;
-    var state: Transformer.Qwen4MtpState = undefined;
+    xfm.arch_state = .{};
+    var state: @import("qwen4/qwen4_forward.zig").Qwen4MtpState = undefined;
     var gen: Generator = undefined;
     gen.xfm = &xfm;
     gen.mtp = MtpHeadRef.of("qwen4", &xfm);
     gen.mtp_cache = MtpCacheRef.of("qwen4", .{ .t = &xfm, .st = &state, .allocator = allocator });
     gen.sampling = .{ .temperature = 0 };
-    gen.ctx.mrope_pos = null;
+    gen.ctx.arch_ctx = .{};
     gen.mtp_hist_stash = null;
     gen.last_hidden = .{ .ctx = null };
     const chain: MtpPreDraft = .{

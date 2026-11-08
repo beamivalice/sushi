@@ -9,6 +9,7 @@ const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
 const KVCache = trunk.KVCache;
 const Transformer = trunk.Transformer;
+const qwen4_state = @import("qwen4/qwen4_state.zig");
 const standinOnes = trunk.standinOnes;
 
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
@@ -157,11 +158,11 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
     var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
-    xfm.compileQwen4Hc();
-    defer inline for (.{ xfm.compiled_hc_silu, xfm.compiled_hc_mix, xfm.compiled_hc_inj, xfm.compiled_hc_write }) |slot| {
-        if (slot) |closure| _ = mlx.mlx_closure_free(closure);
-    };
-    try testing.expect(xfm.compiled_hc_write != null and xfm.compiled_hc_mix != null);
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
+    const q4 = qwen4_state.stateOf(&xfm).?;
+    @import("qwen4/qwen4_forward.zig").compileQwen4Hc(&xfm);
+    defer q4.clearCompiled();
+    try testing.expect(q4.compiled_hc_write != null and q4.compiled_hc_mix != null);
     var prng = std.Random.DefaultPrng.init(0x91831);
     const rnd = prng.random();
     const eps = mlx.mlx_array_new_float(1e-6);
@@ -194,7 +195,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
         try mlx.check(mlx.mlx_astype(&f32_w, w, .float32, s));
         try testing.expect((try hp.norm(s, x, f32_w, iw, eps, b, seq, null)) == null);
         try testing.expect((try hp.mix(s, x, x, b, seq + 1)) == null);
-        const written = (try Transformer.applyClosure(xfm.compiled_hc_write, &.{ x, wo, wi })) orelse return error.MissingCompiledHc;
+        const written = (try @import("qwen4/qwen4_forward.zig").applyClosure(q4.compiled_hc_write, &.{ x, wo, wi })) orelse return error.MissingCompiledHc;
         defer _ = mlx.mlx_array_free(written);
         for ([_]bool{ false, true }) |pending| {
             const stream = if (pending) written else x;
@@ -218,7 +219,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
             defer _ = mlx.mlx_array_free(raw);
             try mlx.check(mlx.mlx_matmul(&raw, flat, iw, s));
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(n.raw_inject, raw, s));
-            const expected = (try Transformer.applyClosure(xfm.compiled_hc_mix, &.{ x, normed })) orelse return error.MissingCompiledHc;
+            const expected = (try @import("qwen4/qwen4_forward.zig").applyClosure(q4.compiled_hc_mix, &.{ x, normed })) orelse return error.MissingCompiledHc;
             defer _ = mlx.mlx_array_free(expected);
             const mixed = (try hp.mix(s, x, normed, b, seq)) orelse return error.HcFusedDeclined;
             defer _ = mlx.mlx_array_free(mixed);

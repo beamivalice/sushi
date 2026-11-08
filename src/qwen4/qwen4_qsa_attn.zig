@@ -7,6 +7,7 @@ const nax_gate = @import("../nax_gate.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const std = @import("std");
+const qwen4_state = @import("qwen4_state.zig");
 const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
@@ -2006,6 +2007,7 @@ test "qsa arm meters: one-shot bits, width buckets, and the per-request tally" {
 }
 
 test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     // The `[qsa-arms]` line is a PER-REQUEST meter, so its tally belongs to
     // the seam that logs it (the Generator's own ForwardCtx), never to the
     // shared Transformer. qwen4 text slots batch-decode on ONE Transformer
@@ -2027,34 +2029,34 @@ test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
 
     // A serves a decode-width gather and a prefill-width gather; B serves the
     // dense mask arm in between (the interleave the shared counter merged).
-    a.qsa_arms.noteGather(1);
-    b.qsa_arms.note(.mask);
-    a.qsa_arms.noteGather(FUSED256_MIN_Q_LEN);
-    b.qsa_arms.note(.mask);
-    a.qsa_arms.noteGather(4);
+    a.arch_ctx.qwen4.qsa_arms.noteGather(1);
+    b.arch_ctx.qwen4.qsa_arms.note(.mask);
+    a.arch_ctx.qwen4.qsa_arms.noteGather(FUSED256_MIN_Q_LEN);
+    b.arch_ctx.qwen4.qsa_arms.note(.mask);
+    a.arch_ctx.qwen4.qsa_arms.noteGather(4);
 
-    try std.testing.expectEqual(@as(u32, 3), a.qsa_arms.total());
-    try std.testing.expectEqual(@as(u32, 0), a.qsa_arms.mask);
-    try std.testing.expectEqual(@as(u32, 1), a.qsa_arms.decode);
-    try std.testing.expectEqual(@as(u32, 1), a.qsa_arms.verify);
-    try std.testing.expectEqual(@as(u32, 1), a.qsa_arms.prefill);
-    try std.testing.expectEqual(@as(u32, 2), b.qsa_arms.total());
-    try std.testing.expectEqual(@as(u32, 2), b.qsa_arms.mask);
+    try std.testing.expectEqual(@as(u32, 3), a.arch_ctx.qwen4.qsa_arms.total());
+    try std.testing.expectEqual(@as(u32, 0), a.arch_ctx.qwen4.qsa_arms.mask);
+    try std.testing.expectEqual(@as(u32, 1), a.arch_ctx.qwen4.qsa_arms.decode);
+    try std.testing.expectEqual(@as(u32, 1), a.arch_ctx.qwen4.qsa_arms.verify);
+    try std.testing.expectEqual(@as(u32, 1), a.arch_ctx.qwen4.qsa_arms.prefill);
+    try std.testing.expectEqual(@as(u32, 2), b.arch_ctx.qwen4.qsa_arms.total());
+    try std.testing.expectEqual(@as(u32, 2), b.arch_ctx.qwen4.qsa_arms.mask);
 
     // A finishing request takes its OWN tally; B's survives untouched (the
     // shared field reset whichever slot finished first).
-    const taken = a.qsa_arms.take().?;
+    const taken = a.arch_ctx.qwen4.qsa_arms.take().?;
     try std.testing.expectEqual(@as(u32, 3), taken.total());
-    try std.testing.expect(a.qsa_arms.take() == null);
-    try std.testing.expectEqual(@as(u32, 2), b.qsa_arms.total());
-    try std.testing.expectEqual(QsaArm.mask, b.qsa_arms.take().?.majority().?);
+    try std.testing.expect(a.arch_ctx.qwen4.qsa_arms.take() == null);
+    try std.testing.expectEqual(@as(u32, 2), b.arch_ctx.qwen4.qsa_arms.total());
+    try std.testing.expectEqual(QsaArm.mask, b.arch_ctx.qwen4.qsa_arms.take().?.majority().?);
 
     // One batched call serves the whole group with the SAME arm: it counts
     // once on every participating slot, not once on a shared counter.
     const slots = [_]*ForwardCtx{ &a, &b };
     noteQsaArmForSlots(&slots, .mask);
-    try std.testing.expectEqual(@as(u32, 1), a.qsa_arms.mask);
-    try std.testing.expectEqual(@as(u32, 1), b.qsa_arms.mask);
+    try std.testing.expectEqual(@as(u32, 1), a.arch_ctx.qwen4.qsa_arms.mask);
+    try std.testing.expectEqual(@as(u32, 1), b.arch_ctx.qwen4.qsa_arms.mask);
 }
 
 test "qsa verify gather geometry: rows, the union tail, and the no-win decline" {
@@ -2879,12 +2881,13 @@ test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95
 }
 
 test "qsa score fused: unsupported indexer geometry falls back to the composed chain" {
+    if (comptime !qwen4_state.built) return error.SkipZigTest;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
-    xfm.qsa_score_bank_builds = 0;
+    xfm.arch_state.qwen4.qsa_score_bank_builds = 0;
     const saved_fused = qwen4_qsa_select.qsa_score_fused_override;
     const saved_nax = nax_gate.vqmm_nax_probe_override;
     const saved_sheet = qsa_score_sheet_mb_override;

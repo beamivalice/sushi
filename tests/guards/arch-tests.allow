@@ -215,7 +215,6 @@ qwen4 replay: what the next prompt shares with a generated turn (Flash-Next toke
 qwen4 streaming index completeness requires every target bank and PLE shard
 qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)
 qwen4ExpOomConfig does not leak qsa_score_fused_override
-qwen4MtpResetOwned: a non-MTP request leaves the head untouched
 qwen4RequestTestConfig does not leak qsa_score_fused_override
 qwen: a checkpoint's 16.7 Mpx bound is clamped to what the ViT can attend
 real Qwen pack loaded through ChatConfig keeps late notes in place

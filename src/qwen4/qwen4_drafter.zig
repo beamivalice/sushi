@@ -24,7 +24,7 @@ pub const Head = *Transformer;
 
 /// This arch's head for a loaded model: the in-checkpoint head, when MTP is on and the pack ships one.
 pub fn headOf(xfm: *Transformer, mtp_enabled: bool, _: ?*anyopaque) ?Head {
-    return if (mtp_enabled and xfm.qwen4_mtp != null) xfm else null;
+    return if (mtp_enabled and xfm.arch_state.qwen4.mtp != null) xfm else null;
 }
 
 pub const buildBatchedChains = @import("qwen4_mtp_batch.zig").build;
@@ -47,14 +47,14 @@ pub const Cache = struct {
 
     pub fn step(self: *const Cache) usize {
         self.activate();
-        return self.t.qwen4_mtp.?.seq_offset;
+        return self.t.arch_state.qwen4.mtp.?.seq_offset;
     }
 
     /// The KVCache the prefix cache snapshots; the head's state is not KV-only, so a caller must also carry `head()`.
     /// Null when head persistence is off.
     pub fn kv(self: *const Cache) ?*KVCache {
         self.activate();
-        return if (persistEnabled()) &self.t.qwen4_mtp.?.cache else null;
+        return if (persistEnabled()) &self.t.arch_state.qwen4.mtp.?.cache else null;
     }
 
     /// The Transformer owning the head; null whenever `kv()` is null.
@@ -72,7 +72,7 @@ pub const Cache = struct {
     /// trunk while the head's `seq_offset` stays put. `off0` is the round's first head row.
     pub fn positionDrift(self: *const Cache, off0: usize) i64 {
         self.activate();
-        const m = &(self.t.qwen4_mtp orelse return 0);
+        const m = &(self.t.arch_state.qwen4.mtp orelse return 0);
         return spec_types.headPositionDrift(@intCast(m.pos_base), m.seq_offset, @intCast(off0 + 1));
     }
 
@@ -92,7 +92,7 @@ pub const Cache = struct {
     /// Adds this cache's storage to a prefill eval batch, so the chunk's graph is freed with the chunk.
     pub fn appendEvalArrays(self: *const Cache, vec: mlx.mlx_vector_array) void {
         self.activate();
-        self.t.qwen4_mtp.?.cache.appendEvalArrays(vec);
+        self.t.arch_state.qwen4.mtp.?.cache.appendEvalArrays(vec);
     }
 };
 
@@ -180,14 +180,14 @@ pub fn costProfile(t: Head, _: *const Transformer, kv: trunk_mod.KVQuantConfig) 
 }
 
 pub fn evSeed(t: Head) ?spec_types.EvSeed {
-    const m = if (t.qwen4_mtp) |*m| m else return null;
+    const m = if (t.arch_state.qwen4.mtp) |*m| m else return null;
     const a = m.ev_seed_accept orelse return null;
     return .{ .accept = a, .m_lo = m.ev_seed_m_lo };
 }
 
 /// A model served with `--no-mtp` has no head to seed.
 pub fn setEvSeed(t: Head, accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32) void {
-    if (t.qwen4_mtp) |*m| {
+    if (t.arch_state.qwen4.mtp) |*m| {
         m.ev_seed_accept = accept;
         m.ev_seed_m_lo = m_lo;
     }

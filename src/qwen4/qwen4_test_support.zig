@@ -151,15 +151,15 @@ pub fn qwen4BatchedPleForward(
         .vision_embeddings = null,
         .batch_slots = ctxs,
         .batch_rope_offsets = rope_offset_arr,
-        .ple_defer = defer_ple,
+        .lazy_ids = defer_ple,
     };
     const tshape = [_]c_int{ @intCast(N), seq_len };
     const tarr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &tshape, 2, .int32);
     defer _ = mlx.mlx_array_free(tarr);
     const logits = try qwen4_forward.forwardQwen4With(xfm, &bctx, tarr);
     errdefer _ = mlx.mlx_array_free(logits);
-    const pending = bctx.ple_pending != null;
-    if (do_flush) try qwen4_hc.flushDeferredPle(xfm, &bctx) else if (bctx.ple_pending != null) qwen4_hc.discardDeferredPle(xfm, &bctx);
+    const pending = bctx.arch_ctx.qwen4.ple_pending != null;
+    if (do_flush) try qwen4_hc.flushDeferredPle(xfm, &bctx) else if (bctx.arch_ctx.qwen4.ple_pending != null) qwen4_hc.discardDeferredPle(xfm, &bctx);
     for (merged, 0..) |*m, li| {
         if (!ml[li].is_linear and ml[li].ple == null) continue;
         try qwen4_ssm_group.splitSsmToSlots(xfm, m, ctxs, li);

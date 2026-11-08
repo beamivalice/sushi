@@ -1280,7 +1280,7 @@ test "ngram table row dequant reads the dense mx.quantize packing at every width
 }
 
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
-/// the mmapped table. Non-null on `Transformer.qwen4` ⇒ the arch is served
+/// the mmapped table. Non-null on `Trunk.arch_state.qwen4.model` ⇒ the arch is served
 /// serially with speculation off (`ownsModuleDecodeState`), which is what
 /// the per-request PLE/indexer state in `SSMCacheEntry.aux_state` needs
 /// until the snapshot machinery carries it.
