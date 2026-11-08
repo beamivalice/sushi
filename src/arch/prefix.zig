@@ -424,6 +424,7 @@ pub const disk = firstWith("disk") orelse struct {
         held_bytes: u64,
         _: u32,
         _: mlx.mlx_stream,
+        _: DiskTier.SegPrev,
     ) !DiskTier.QsaHistoryResult {
         return .{ .inherited = inherited, .rows = inherited_rows, .bytes = if (inherited) 0 else held_bytes };
     }

@@ -662,6 +662,7 @@ pub const DiskTier = struct {
         self.allocator.free(e.rings);
         self.allocator.free(e.grown);
         self.allocator.free(e.spec_segs);
+        self.allocator.free(e.qsa_segs);
     }
 
     /// Splits the restore points this tier writes from now on (`GrownSpec`); `divs` is copied.
@@ -1917,6 +1918,8 @@ pub const DiskTier = struct {
             }
         };
         var inherited_qsa = if (extend_idx) |i| self.entries.items[i].inherited_qsa else false;
+        var qsa_own: []const SideSeg = if (extend_idx) |i| self.entries.items[i].qsa_segs else &.{};
+        var qsa_own_inherited: u32 = if (extend_idx) |i| self.entries.items[i].qsa_segs_inherited else 0;
         var inherited_qsa_rows: u32 = if (extend_idx) |i| self.entries.items[i].qsa_history_rows else 0;
         var inherited_qsa_bytes: u64 = if (extend_idx) |i| self.entries.items[i].qsa_history_bytes else 0;
         // A real check: a rewrite must never land on a link (the sync arm truncates in place).
@@ -1933,6 +1936,8 @@ pub const DiskTier = struct {
                 inherited_qsa = true;
                 inherited_qsa_rows = self.entries.items[d.idx].qsa_history_rows;
                 inherited_qsa_bytes = self.entries.items[d.idx].qsa_history_bytes;
+                qsa_own = self.entries.items[d.idx].qsa_segs;
+                qsa_own_inherited = @intCast(qsa_own.len);
             }
         }
 
@@ -1996,7 +2001,18 @@ pub const DiskTier = struct {
 
         const prefix_rows: u32 = if (donor) |d| @min(d.shared, kv_len) else kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
-        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, inherited_qsa_bytes, prefix_rows, s);
+        // An extended entry may hold fewer sidecar segments than the record it grew from: a prefill write-through
+        // stores none. A segment links only on an equal hash, so any entry sharing the prefix may lend.
+        const side_donor = donor orelse if (extend_idx) |x| self.chunkShareDonor(tokens, kv_target, has_tools, config, media, x) else null;
+        const qsa_prev: SegPrev = .{
+            .id = id,
+            .own = qsa_own,
+            .own_inherited = qsa_own_inherited,
+            .donor_id = if (side_donor) |d| d.id else null,
+            .donor = if (side_donor) |d| self.entries.items[d.idx].qsa_segs else &.{},
+        };
+        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, inherited_qsa_bytes, prefix_rows, s, qsa_prev);
+        errdefer self.allocator.free(qsa_res.segs);
         written_bytes += qsa_res.written;
         const complete = chunk_complete and ssm_res.complete;
 
@@ -2005,9 +2021,6 @@ pub const DiskTier = struct {
         // tier's supersede rule), by the piece that completes its rows; an
         // earlier piece keeps what the entry had. Best-effort DRAFT-side
         // state: a failed write costs the entry its spec, never the entry.
-        // An extended entry may hold fewer segments than the record it grew from: a prefill write-through stores
-        // none. A segment links only on an equal hash, so any entry sharing the prefix may lend.
-        const side_donor = donor orelse if (extend_idx) |x| self.chunkShareDonor(tokens, kv_target, has_tools, config, media, x) else null;
         const spec_prev: SegPrev = .{
             .id = id,
             .own = if (extend_idx) |i| self.entries.items[i].spec_segs else &.{},
@@ -2057,6 +2070,7 @@ pub const DiskTier = struct {
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
         var non_chunk: u64 = @as(u64, record.len) * 4 + spec_res.bytes;
         for (spec_res.segs[spec_res.segs_inherited..]) |sg| non_chunk += sg.bytes;
+        for (qsa_res.segs[qsa_res.segs_inherited..]) |sg| non_chunk += sg.bytes;
         for (ssm_res.bytes) |b| non_chunk += b;
         for (ssm_res.grown[inherited_grown..]) |b| non_chunk += b;
         for (rings) |r| non_chunk += r.bytes;
@@ -2086,6 +2100,8 @@ pub const DiskTier = struct {
             .qsa_history_bytes = if (qsa_res.inherited) inherited_qsa_bytes else qsa_res.bytes,
             .qsa_history_rows = if (qsa_res.inherited) inherited_qsa_rows else qsa_res.rows,
             .inherited_qsa = qsa_res.inherited,
+            .qsa_segs = qsa_res.segs,
+            .qsa_segs_inherited = qsa_res.segs_inherited,
             .rings = rings,
             .vision_key = p.vision_key,
             .media_start = p.media_start,
@@ -2116,6 +2132,7 @@ pub const DiskTier = struct {
             self.allocator.free(e.grown);
             self.allocator.free(e.rings);
             self.allocator.free(e.spec_segs);
+            self.allocator.free(e.qsa_segs);
             e.* = new_entry;
         } else {
             // meta.json is the commit point: written last, atomically.
@@ -2220,7 +2237,9 @@ pub const DiskTier = struct {
         errdefer ssm_res.deinit(self.allocator);
         const rings = try self.persistRings(e.id, dir_rel, e.quant, e.rings, ring_srcs, &written_bytes, s);
         errdefer self.allocator.free(rings);
-        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.qsa_history_bytes, e.kv_len, s);
+        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.qsa_history_bytes, e.kv_len, s, .{ .id = e.id, .own = e.qsa_segs, .own_inherited = e.qsa_segs_inherited });
+        e.qsa_segs = qsa_res.segs;
+        e.qsa_segs_inherited = qsa_res.segs_inherited;
 
         var spec_rewritten = false;
         if (specWorkPending(e, dflash_snap, mtp_snap)) {
@@ -2259,6 +2278,7 @@ pub const DiskTier = struct {
         self.allocator.free(live.grown);
         self.allocator.free(live.rings);
         if (spec_rewritten) self.allocator.free(live.spec_segs);
+        self.allocator.free(live.qsa_segs);
         live.* = updated;
         self.total_bytes = clampAdd(self.total_bytes, delta);
         self.last_store_id = updated.id;
@@ -2351,7 +2371,7 @@ pub const DiskTier = struct {
     const SegResult = struct { segs: []SideSeg = &.{}, inherited: u32 = 0, written: u64 = 0 };
 
     /// How a growing sidecar tensor grows: along `axis`, one row per `div` history rows.
-    const Growth = struct { axis: usize, div: u32 };
+    pub const Growth = struct { axis: usize, div: u32 };
 
     /// The MTP history's KV rows and the head's pooled bank grow; the head's ring and leftovers do not.
     fn specGrowth(key: []const u8, ratio: u32) ?Growth {
@@ -2365,7 +2385,7 @@ pub const DiskTier = struct {
     /// Move the whole `seg_span`-row segments of `list`'s growing tensors into `{letter}{j}.safetensors`, leaving the
     /// rows past them (at least one) in `list`. A segment whose file image the entry (`prev.own`) or, in a leading run,
     /// the donor already holds is kept or hard-linked, so an extension writes only its new segments.
-    fn writeSegments(
+    pub fn writeSegments(
         self: *DiskTier,
         dir_abs: []const u8,
         letter: u8,
@@ -2469,6 +2489,26 @@ pub const DiskTier = struct {
         root_dir.deleteFile(self.io, new_sub) catch {};
         std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch return false;
         return true;
+    }
+
+    /// A manifest's segment list checked against the files: null unless every one is there at its size.
+    fn scanSegs(self: *DiskTier, id: u64, letter: u8, sm: disk_format.SegsMeta) ?struct { segs: []SideSeg, inherited: u32, own_bytes: u64 } {
+        const list = self.allocator.alloc(SideSeg, sm.files.len) catch return null;
+        var own: u64 = 0;
+        for (sm.files, list, 0..) |fv, *dst, j| {
+            const sg = disk_format.segItem(fv) orelse break;
+            const pp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/{c}{d:0>5}.safetensors", .{ self.root, id, letter, j }) catch break;
+            defer self.allocator.free(pp);
+            if (fileSize(self.io, pp) != sg.bytes) break;
+            dst.* = sg;
+            if (j >= sm.inherited) own += sg.bytes;
+        } else return .{ .segs = list, .inherited = @min(sm.inherited, @as(u32, @intCast(list.len))), .own_bytes = own };
+        self.allocator.free(list);
+        return null;
+    }
+
+    pub fn linkSegFile(self: *DiskTier, from: u64, to: u64, letter: u8, j: u32) bool {
+        return self.linkSeg(from, to, letter, j);
     }
 
     fn deleteSegFiles(self: *DiskTier, dir_abs: []const u8, letter: u8, from: usize, to: usize) void {
@@ -2774,7 +2814,7 @@ pub const DiskTier = struct {
     /// One optional non-layer tensor out of the loaded sidecar map (+1 handle), or null.
     /// `tail`'s tensors with each growing one's `n` segments of entry `id` put back in front of its rows, as a new map
     /// the caller owns. Null when a segment is unreadable or lacks a tensor another holds.
-    fn joinSegments(
+    pub fn joinSegments(
         self: *DiskTier,
         tail: mlx.mlx_map_string_to_array,
         id: u64,
@@ -3523,7 +3563,7 @@ pub const DiskTier = struct {
     }
 
     /// `written`: the bytes this call put on disk (0 when the file was kept or linked).
-    pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false, written: u64 = 0 };
+    pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false, written: u64 = 0, segs: []SideSeg = &.{}, segs_inherited: u32 = 0 };
 
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
         const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
@@ -3734,16 +3774,18 @@ pub const DiskTier = struct {
         defer self.allocator.free(dir_abs);
         if (self.writer) |w| w.fence(dir_abs);
         var freed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
-        for (e.spec_segs, 0..) |sg, j| {
-            const sp = std.fmt.allocPrint(self.allocator, "{s}p{d:0>5}.safetensors", .{ dir_abs, j }) catch {
-                freed += sg.bytes;
-                continue;
-            };
-            defer self.allocator.free(sp);
-            if (statFile(self.io, sp)) |st| {
-                if (st.nlink <= 1) freed += st.size;
-            } else if (j >= e.spec_segs_inherited) {
-                freed += sg.bytes;
+        for ([_][]const SideSeg{ e.spec_segs, e.qsa_segs }, [_]u32{ e.spec_segs_inherited, e.qsa_segs_inherited }, "pq") |segs, inh, letter| {
+            for (segs, 0..) |sg, j| {
+                const sp = std.fmt.allocPrint(self.allocator, "{s}{c}{d:0>5}.safetensors", .{ dir_abs, letter, j }) catch {
+                    freed += sg.bytes;
+                    continue;
+                };
+                defer self.allocator.free(sp);
+                if (statFile(self.io, sp)) |st| {
+                    if (st.nlink <= 1) freed += st.size;
+                } else if (j >= inh) {
+                    freed += sg.bytes;
+                }
             }
         }
         for (e.ssm_bytes) |b| freed += b;
@@ -4068,13 +4110,15 @@ pub const DiskTier = struct {
     /// first entry to see an inode pays for it.
     fn billChunksOnce(self: *DiskTier, e: *IndexEntry, seen: *std.AutoHashMap(u64, void)) void {
         var billed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
-        for (e.spec_segs, 0..) |sg, j| {
-            const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/p{d:0>5}.safetensors", .{ self.root, e.id, j }) catch {
-                billed += sg.bytes;
-                continue;
-            };
-            defer self.allocator.free(sp);
-            billed += billSharedFile(self.io, sp, sg.bytes, seen);
+        for ([_][]const SideSeg{ e.spec_segs, e.qsa_segs }, "pq") |segs, letter| {
+            for (segs, 0..) |sg, j| {
+                const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/{c}{d:0>5}.safetensors", .{ self.root, e.id, letter, j }) catch {
+                    billed += sg.bytes;
+                    continue;
+                };
+                defer self.allocator.free(sp);
+                billed += billSharedFile(self.io, sp, sg.bytes, seen);
+            }
         }
         for (e.ssm_bytes) |b| billed += b;
         for (e.grown, 0..) |gb, i| {
@@ -4337,6 +4381,8 @@ pub const DiskTier = struct {
         var qsa_history_bytes: u64 = 0;
         var qsa_history_rows: u32 = 0;
         var inherited_qsa = false;
+        var qsa_segs: []SideSeg = &.{};
+        var qsa_segs_inherited: u32 = 0;
         if (man.qsa_history) |qh| qh_blk: {
             const rec_bytes = qh.bytes;
             const rec_rows = qh.rows;
@@ -4347,6 +4393,15 @@ pub const DiskTier = struct {
             if (have != rec_bytes) {
                 log.info("  [disk-cache] e{d}: qsa history size mismatch — dropping the history\n", .{id});
                 break :qh_blk;
+            }
+            if (qh.segs) |sm| {
+                const got = self.scanSegs(id, 'q', sm) orelse {
+                    log.info("  [disk-cache] e{d}: qsa history segment missing or short — dropping the history\n", .{id});
+                    break :qh_blk;
+                };
+                qsa_segs = got.segs;
+                qsa_segs_inherited = got.inherited;
+                total += got.own_bytes;
             }
             qsa_history_bytes = rec_bytes;
             qsa_history_rows = rec_rows;
@@ -4377,23 +4432,13 @@ pub const DiskTier = struct {
             // Every listed segment must be whole, or the history is not.
             var seg_total: u64 = 0;
             if (sc.segs) |sm| {
-                const list = self.allocator.alloc(SideSeg, sm.files.len) catch break :parse_spec;
-                for (sm.files, list, 0..) |fv, *dst, j| {
-                    const sg = disk_format.segItem(fv) orelse break;
-                    const pp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/p{d:0>5}.safetensors", .{ self.root, id, j }) catch break;
-                    defer self.allocator.free(pp);
-                    if (fileSize(self.io, pp) != sg.bytes) break;
-                    dst.* = sg;
-                    if (j >= sm.inherited) seg_total += sg.bytes;
-                } else {
-                    spec_segs = list;
-                    spec_segs_inherited = @min(sm.inherited, @as(u32, @intCast(list.len)));
-                }
-                if (spec_segs.len != sm.files.len) {
-                    self.allocator.free(list);
+                const got = self.scanSegs(id, 'p', sm) orelse {
                     log.info("  [disk-cache] e{d}: spec segment missing or short — dropping the spec\n", .{id});
                     break :parse_spec;
-                }
+                };
+                spec_segs = got.segs;
+                spec_segs_inherited = got.inherited;
+                seg_total = got.own_bytes;
             }
             if (spare) {
                 total += seg_total;
@@ -4420,6 +4465,7 @@ pub const DiskTier = struct {
             self.allocator.free(ssm_bytes);
             self.allocator.free(rings);
             self.allocator.free(spec_segs);
+            self.allocator.free(qsa_segs);
             return null;
         };
         for (grown, grown_recorded[0..grown_valid]) |*g, rec| g.* = disk_format.valueU64(rec).?;
@@ -4449,6 +4495,8 @@ pub const DiskTier = struct {
                 .qsa_history_bytes = qsa_history_bytes,
                 .qsa_history_rows = qsa_history_rows,
                 .inherited_qsa = inherited_qsa,
+                .qsa_segs = qsa_segs,
+                .qsa_segs_inherited = qsa_segs_inherited,
                 .rings = rings,
                 .last_used = 0,
             },
@@ -4479,6 +4527,7 @@ fn billSharedFile(io: std.Io, path: []const u8, missing: u64, seen: *std.AutoHas
 fn nonChunkBytes(e: *const IndexEntry) u64 {
     var n: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
     for (e.spec_segs[@min(e.spec_segs_inherited, e.spec_segs.len)..]) |sg| n += sg.bytes;
+    for (e.qsa_segs[@min(e.qsa_segs_inherited, e.qsa_segs.len)..]) |sg| n += sg.bytes;
     for (e.ssm_bytes) |b| n += b;
     for (e.grown[@min(e.inherited_grown, e.grown.len)..]) |b| n += b;
     for (e.rings) |r| n += r.bytes;

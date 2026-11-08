@@ -138,6 +138,21 @@ pub fn writeQsaHistoryFile(
     cp: *const trunk_mod.SSMCheckpoint,
     s: mlx.mlx_stream,
 ) !u64 {
+    const w = try writeQsaHistory(self, dir_rel, cp, s, .{});
+    self.allocator.free(w.segs);
+    return w.bytes;
+}
+
+/// The pooled banks grow, a block per `ratio` rows; the raw leftovers do not.
+fn qsaGrowth(key: []const u8, ratio: u32) ?DiskTier.Growth {
+    return if (std.mem.endsWith(u8, key, ".pooled")) .{ .axis = 1, .div = ratio } else null;
+}
+
+const QsaWrite = struct { bytes: u64 = 0, segs: []kd.SideSeg = &.{}, inherited: u32 = 0, written: u64 = 0 };
+
+/// `qsa.safetensors` and its whole segments (`DiskTier.writeSegments`): a segment the entry or its donor holds
+/// byte for byte is kept or linked.
+fn writeQsaHistory(self: *DiskTier, dir_rel: []const u8, cp: *const trunk_mod.SSMCheckpoint, s: mlx.mlx_stream, prev: DiskTier.SegPrev) !QsaWrite {
     var list = std.ArrayList(NamedTensor).empty;
     defer self.freeNamed(&list);
     var meta = std.ArrayList(MetaPair).empty;
@@ -169,9 +184,16 @@ pub fn writeQsaHistoryFile(
             ratio_written = true;
         }
     }
-    if (list.items.len == 0) return 0;
+    if (list.items.len == 0) return .{};
+    var ratio: u32 = 1;
+    for (cp.layers) |*l| if (l.qsa_ratio > 0) {
+        ratio = @intCast(l.qsa_ratio);
+    };
+    const seg = try self.writeSegments(dir_rel, 'q', &list, @intCast(DiskTier.qsaHistoryRowsOf(cp)), qsaGrowth, ratio, prev, .qsa, s);
+    errdefer self.allocator.free(seg.segs);
     const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
-    return self.saveNamed(path, list.items, meta.items, .qsa, s);
+    const bytes = try self.saveNamed(path, list.items, meta.items, .qsa, s);
+    return .{ .bytes = bytes, .segs = seg.segs, .inherited = seg.inherited, .written = seg.written + bytes };
 }
 
 pub fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !trunk_mod.SSMCheckpoint {
@@ -185,6 +207,15 @@ pub fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !trunk_mod.
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
     try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+    for (self.entries.items) |*e| {
+        if (e.id != id or e.qsa_segs.len == 0) continue;
+        var ratio_s: [*:0]const u8 = undefined;
+        const ratio: u32 = if (mlx.mlx_map_string_to_string_get(&ratio_s, meta_map, "qsa_ratio") == 0) std.fmt.parseInt(u32, std.mem.span(ratio_s), 10) catch 4 else 4;
+        const joined = self.joinSegments(tensor_map, id, 'q', e.qsa_segs.len, qsaGrowth, ratio, cpu) orelse return error.DiskCacheQsaHistoryGap;
+        _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        tensor_map = joined;
+        break;
+    }
 
     const layers = try self.allocator.alloc(trunk_mod.SSMCacheEntrySnapshot, n_layers);
     for (layers) |*l| l.* = .{
@@ -259,25 +290,35 @@ pub fn persistQsaHistory(
     held_bytes: u64,
     prefix_rows: u32,
     s: mlx.mlx_stream,
+    prev: DiskTier.SegPrev,
 ) !QsaHistoryResult {
     // No new checkpoint leaves the owned QSA file, and its bill, intact.
-    const kept: QsaHistoryResult = .{ .inherited = inherited, .rows = inherited_rows, .bytes = if (inherited) 0 else held_bytes };
+    const kept: QsaHistoryResult = .{
+        .inherited = inherited,
+        .rows = inherited_rows,
+        .bytes = if (inherited) 0 else held_bytes,
+        .segs = try self.allocator.dupe(kd.SideSeg, prev.own),
+        .segs_inherited = prev.own_inherited,
+    };
     const cps = cps_opt orelse return kept;
     const src = DiskTier.newestQsaCheckpoint(cps) orelse return kept;
     const rows: u32 = @intCast(DiskTier.qsaHistoryRowsOf(src));
     // An owned bank already covering the newcomer stays: retained checkpoints may need its extra rows.
     if (!inherited and held_bytes > 0 and rows <= inherited_rows) return kept;
     if (inherited and rows > 0 and rows <= inherited_rows and rows <= prefix_rows) {
-        return .{ .inherited = true, .rows = @min(inherited_rows, prefix_rows), .bytes = 0 };
+        var r = kept;
+        r.rows = @min(inherited_rows, prefix_rows);
+        return r;
     }
+    self.allocator.free(kept.segs);
     if (inherited) {
         const qpath = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
         defer self.allocator.free(qpath);
         if (self.writer) |w| w.fence(qpath);
         std.Io.Dir.deleteFileAbsolute(self.io, qpath) catch {};
     }
-    const bytes = try self.writeQsaHistoryFile(dir_rel, src, s);
-    return .{ .bytes = bytes, .rows = rows, .inherited = false, .written = bytes };
+    const w = try writeQsaHistory(self, dir_rel, src, s, prev);
+    return .{ .bytes = w.bytes, .rows = rows, .inherited = false, .written = w.written, .segs = w.segs, .segs_inherited = w.inherited };
 }
 
 pub fn linkInheritedQsa(self: *DiskTier, d: ChunkDonor, id: u64) bool {
@@ -296,6 +337,12 @@ pub fn linkInheritedQsa(self: *DiskTier, d: ChunkDonor, id: u64) bool {
         log.warn("  [disk-cache] chunk share: link e{d}/qsa -> e{d} failed: {s} — writing the history instead\n", .{ d.id, id, @errorName(err) });
         return false;
     };
+    // The history is the donor's segments and its tail together.
+    for (0..donor.qsa_segs.len) |j| {
+        if (self.linkSegFile(d.id, id, 'q', @intCast(j))) continue;
+        root_dir.deleteFile(self.io, new_sub) catch {};
+        return false;
+    }
     log.info("  [disk-cache] chunk share: e{d} inherits qsa history from e{d} by hard link\n", .{ id, d.id });
     return true;
 }
@@ -1856,6 +1903,93 @@ test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to
     try testing.expect(e.qsa_history_bytes > 0);
     try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
     try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
+test "DiskTier: an extended QSA history writes only its new segments and the tail, and loads whole after a restart" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-segs", 0, 128);
+    tier.seg_span = 128;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 800, 8, 0.0, .float32);
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var first_qsa: u64 = 0;
+    for ([_]c_int{ 600, 800 }, 0..) |rows, turn| {
+        var src = buildHybridEntries(s, 200.0, 600.0);
+        defer freeHybridEntries(&src);
+        src[2].aux_state = makeArange(s, &[_]c_int{ 1, 2, 8 }, 700.0);
+        src[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, @divTrunc(rows, 4), 8 }, 800.0);
+        src[2].qsa_ratio = 4;
+        var cps = [_]trunk_mod.SSMCheckpoint{try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, @intCast(rows), s)};
+        defer for (&cps) |*cp| cp.deinit(testing.allocator);
+        try qwen4_qsa_state.attachQsaHistoryToLatest(&cps, &src, s);
+        _ = try tier.appendCommit(cache.entries, @intCast(rows), cache.config, tokens[0..@intCast(rows)], false, &cps, s);
+        if (turn == 0) first_qsa = tier.stats.snapshot().written[@intFromEnum(write_stats.Kind.qsa)];
+    }
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(usize, 6), e.qsa_segs.len);
+    const wrote = tier.stats.snapshot().written[@intFromEnum(write_stats.Kind.qsa)] - first_qsa;
+    try testing.expectEqual(e.qsa_segs[4].bytes + e.qsa_segs[5].bytes + e.qsa_history_bytes, wrote);
+    const id = e.id;
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-segs", 0, 128);
+    defer tier2.deinit();
+    var hist = try tier2.loadQsaHistoryFile(id, 3);
+    defer hist.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_int, 200), mlx.getShape(hist.layers[2].qsa_pooled)[1]);
+    const want = makeArange(s, &[_]c_int{ 1, 200, 8 }, 800.0);
+    defer _ = mlx.mlx_array_free(want);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, want, hist.layers[2].qsa_pooled, false, s));
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+    try testing.expect(ok);
+}
+
+test "DiskTier: a diverging entry keeps the donor's QSA history segments as links and loads them after the donor goes" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-heir", 0, 128);
+    defer tier.deinit();
+    tier.seg_span = 128;
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &[_]c_int{ 1, 2, 8 }, 700.0);
+    src[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 150, 8 }, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]trunk_mod.SSMCheckpoint{try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, 600, s)};
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(&cps, &src, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, &cps, s);
+    const before = tier.stats.snapshot().written[@intFromEnum(write_stats.Kind.qsa)];
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, &cps, s);
+    const heir = &tier.entries.items[1];
+    try testing.expectEqual(@as(usize, 4), heir.qsa_segs.len);
+    try testing.expectEqual(@as(u32, 4), heir.qsa_segs_inherited);
+    try testing.expectEqual(heir.qsa_history_bytes, tier.stats.snapshot().written[@intFromEnum(write_stats.Kind.qsa)] - before);
+    const id = heir.id;
+    tier.entries.items[0].last_used = heir.last_used + 1;
+    tier.invalidateNewest();
+    var hist = try tier.loadQsaHistoryFile(id, 3);
+    defer hist.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_int, 150), mlx.getShape(hist.layers[2].qsa_pooled)[1]);
 }
 
 test "DiskTier: the persisted line counts every byte a commit writes but the manifest and token record" {

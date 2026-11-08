@@ -609,7 +609,7 @@ They count what the filesystem accepted, never what was submitted, and run from 
 |---|---|---|
 | `kv` | `c*.safetensors` KV chunks | `writeChunkFile` |
 | `ssm` | `s*.safetensors` restore points and `g*.safetensors` row segments (every arch's restore point, GLM's and DeepSeek's included) | `writePoint`, `writeGrownSegment` |
-| `qsa` | `qsa.safetensors` history | `writeQsaHistoryFile` (`persistQsaHistory`) |
+| `qsa` | `qsa.safetensors` history and its `q*.safetensors` segments | `writeQsaHistoryFile` (`persistQsaHistory`), `writeSegments` |
 | `spec` | `spec.safetensors` draft state and its `p*.safetensors` segments | `writeSpecSidecar`, `writeSegments` |
 | `ring` | `r*.safetensors` ring restore points | `writeRingFile` |
 | `meta` | `meta.json` manifests and `tokens.bin` records | `writeMeta`, the token record in `appendCommitWithSpecBounded` |
@@ -709,6 +709,10 @@ SSD tier (`spec.safetensors`). An adopted spec cache has ONE owner at a time (`r
   `"spec":{"bytes":0}`, billed, for the turn's end to keep on an equal hash. An extension holding fewer segments than
   the record it grew from links that record's (`chunkShareDonor` minus itself). Deleting them made each turn's end
   write the history whole again.
+- **The QSA history is written in segments the same way** (`qsaGrowth`, `q<j>.safetensors`, the manifest's
+  `qsa_history.segs`): the pooled banks' whole segments go once, `qsa.safetensors` keeps the raw leftovers and the rows
+  past the last segment, and an heir that links the donor's history (`linkInheritedQsa`) links its segments too. It
+  used to be rewritten whole per commit: 80-100 MB a Qwen turn at 100k-130k tokens.
 
 ## GLM-5.3 (`glm5_next`)
 

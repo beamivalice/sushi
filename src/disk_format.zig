@@ -93,6 +93,10 @@ pub const IndexEntry = struct {
     qsa_history_bytes: u64 = 0,
     qsa_history_rows: u32 = 0,
     inherited_qsa: bool = false,
+    /// v12: the QSA history's whole segments `q<j>.safetensors` ahead of the rows `qsa.safetensors` keeps, as
+    /// `spec_segs`. Owned.
+    qsa_segs: []SideSeg = &.{},
+    qsa_segs_inherited: u32 = 0,
     /// v11: bytes of each row segment `g<n>.safetensors`, in order, and the tokens a segment spans. Empty for
     /// an entry whose restore points hold their own rows.
     grown: []u64 = &.{},
@@ -121,7 +125,7 @@ pub const META_VERSION_MAX: u64 = 12;
 /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
 pub fn metaVersionFor(e: IndexEntry) u8 {
     // v12: an older reader would take the sidecar's tail rows for the whole history.
-    if (e.spec_segs.len > 0) return 12;
+    if (e.spec_segs.len > 0 or e.qsa_segs.len > 0) return 12;
     // v11: an older reader would look for rows in the point files, which keep only the ones past the segments.
     if (e.grown.len > 0) return 11;
     // v10: an older reader knows no media identity, so it would hand a text prompt rows that
@@ -188,11 +192,13 @@ pub fn renderMeta(a: std.mem.Allocator, out: *std.ArrayList(u8), e: IndexEntry, 
         try out.appendSlice(a, "}");
     }
     if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) {
-        try out.print(a, ",\"qsa_history\":{{\"bytes\":{d},\"rows\":{d},\"inherited\":{}}}", .{
+        try out.print(a, ",\"qsa_history\":{{\"bytes\":{d},\"rows\":{d},\"inherited\":{}", .{
             e.qsa_history_bytes,
             e.qsa_history_rows,
             e.inherited_qsa,
         });
+        if (e.qsa_segs.len > 0) try writeSegsJson(a, out, e.qsa_segs, e.qsa_segs_inherited);
+        try out.appendSlice(a, "}");
     }
     // v4: spec snapshots (dflash context / MTP history); a size mismatch drops only the spec.
     if ((e.spec_bytes > 0 and (e.spec_dflash != null or e.spec_mtp != null)) or e.spec_segs.len > 0) {
@@ -333,7 +339,7 @@ pub fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
 /// ends the read of the section there: the segments are listed but none is validated.
 pub const GrownMeta = struct { span: u32, bytes: []const std.json.Value, inherited: ?u32 };
 
-pub const QsaHistoryMeta = struct { bytes: u64, rows: u32, inherited: bool };
+pub const QsaHistoryMeta = struct { bytes: u64, rows: u32, inherited: bool, segs: ?SegsMeta = null };
 
 /// The spec sidecar's recorded size and the two snapshots it holds; either may be null.
 pub const SpecSidecar = struct { bytes: u64, dflash: ?SpecMeta, mtp: ?SpecMeta, segs: ?SegsMeta = null };
@@ -397,7 +403,7 @@ pub fn parseManifest(obj: std.json.ObjectMap) ?Manifest {
         const bytes = jsonU64(qo, "bytes") orelse break :qh_blk;
         const rows = jsonInt(u32, qo, "rows") orelse break :qh_blk;
         const inh_v = qo.get("inherited");
-        qsa_history = .{ .bytes = bytes, .rows = rows, .inherited = inh_v != null and inh_v.? == .bool and inh_v.?.bool };
+        qsa_history = .{ .bytes = bytes, .rows = rows, .inherited = inh_v != null and inh_v.? == .bool and inh_v.?.bool, .segs = parseSegs(qo) };
     }
 
     var spec: ?SpecSidecar = null;
