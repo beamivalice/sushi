@@ -3,7 +3,7 @@ const KVCache = trunk_mod.KVCache;
 const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const dsv41_model = @import("dsv41_model.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
-const glm5_forward = @import("../glm5/glm5_forward.zig");
+const mlx_ops = @import("../mlx_ops.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const disk_placement = @import("../disk_placement.zig");
 const kv_quant = @import("../kv_quant.zig");
@@ -93,7 +93,7 @@ fn expectCheckpointBits(want: *const SSMCheckpoint, got: *const SSMCheckpoint) !
         for ([_][2]mlx.mlx_array{ .{ a.conv_state, b.conv_state }, .{ a.ssm_state, b.ssm_state } }) |pair| {
             try testing.expectEqualSlices(c_int, mlx.getShape(pair[0]), mlx.getShape(pair[1]));
             try testing.expectEqual(mlx.mlx_array_dtype(pair[0]), mlx.mlx_array_dtype(pair[1]));
-            try glm5_forward.expectArrayBits(pair[0], pair[1]);
+            try mlx_ops.expectArrayBits(pair[0], pair[1]);
         }
     }
 }
@@ -202,11 +202,11 @@ test "DeepSeek hot cache restores the highest checkpoint under the match and con
     defer _ = mlx.mlx_array_free(cold);
     var cold_cp = try dsv41_prefix.capture(testing.allocator, net.m, next.len);
     defer cold_cp.deinit(testing.allocator);
-    try glm5_forward.expectArrayBits(cold, warm);
+    try mlx_ops.expectArrayBits(cold, warm);
     for (cold_cp.layers, warm_cp.layers) |a, b| {
         for ([_][2]mlx.mlx_array{ .{ a.conv_state, b.conv_state }, .{ a.ssm_state, b.ssm_state }, .{ a.aux_state, b.aux_state }, .{ a.qsa_pooled, b.qsa_pooled } }) |pair| {
             try testing.expectEqual(pair[0].ctx == null, pair[1].ctx == null);
-            if (pair[0].ctx != null and mlx.mlx_array_size(pair[0]) > 0) try glm5_forward.expectArrayBits(pair[0], pair[1]);
+            if (pair[0].ctx != null and mlx.mlx_array_size(pair[0]) > 0) try mlx_ops.expectArrayBits(pair[0], pair[1]);
         }
     }
 
@@ -351,7 +351,7 @@ test "DeepSeek SSD tier: a checkpoint written to disk reads back as the same byt
     try net.prefill(next, &.{ 256, 256 }, 0, &.{}, &cold_cps);
     const cold = try dsv41_model.extend(net.m, next[512..], .all);
     defer _ = mlx.mlx_array_free(cold);
-    try glm5_forward.expectArrayBits(cold, warm);
+    try mlx_ops.expectArrayBits(cold, warm);
 }
 
 test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as they are taken and restore the same bytes (DSV41_TINY)" {
@@ -430,7 +430,7 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[0..512], .last));
     const cold = try dsv41_model.extend(net.m, next[512..], .all);
     defer _ = mlx.mlx_array_free(cold);
-    try glm5_forward.expectArrayBits(cold, warm);
+    try mlx_ops.expectArrayBits(cold, warm);
 }
 
 test "DeepSeek SSD tier split: the layers the tier treats as rows are the arrays a capture holds as rows (DSV41_TINY)" {
@@ -537,7 +537,7 @@ test "DeepSeek SSD tier split: every restore point on the grid reads back the by
     for (0..3) |c| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[c * 128 ..][0..128], .last));
     const cold = try dsv41_model.extend(net.m, next[384..], .all);
     defer _ = mlx.mlx_array_free(cold);
-    try glm5_forward.expectArrayBits(cold, warm);
+    try mlx_ops.expectArrayBits(cold, warm);
 }
 
 test "DeepSeek SSD tier split: a write-through prefill stages the points on the grid and keeps the others live, never copying rows past the store (DSV41_TINY)" {
@@ -847,7 +847,7 @@ test "DeepSeek decode point: a restore point taken mid-decode serves the next tu
     try testing.expectEqual(point, from_ram.matched);
     const ram_warm = try dsv41_model.extend(net.m, next[point..], .all);
     defer _ = mlx.mlx_array_free(ram_warm);
-    try glm5_forward.expectArrayBits(cold, ram_warm);
+    try mlx_ops.expectArrayBits(cold, ram_warm);
 
     // From the file, by a tier that never saw it written.
     var hc = try dsv41SsdOnlyCache(io, base, "dsv41-decode");
@@ -864,7 +864,7 @@ test "DeepSeek decode point: a restore point taken mid-decode serves the next tu
     try expectCheckpointBits(&want_point, &got_point);
     const warm = try dsv41_model.extend(net.m, next[point..], .all);
     defer _ = mlx.mlx_array_free(warm);
-    try glm5_forward.expectArrayBits(cold, warm);
+    try mlx_ops.expectArrayBits(cold, warm);
 }
 
 const flush_first_len = 600;
@@ -1007,7 +1007,7 @@ test "DeepSeek live flush: a clean shutdown flushes the same points, and a crash
         _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[0..512], .last));
         const cold = try dsv41_model.extend(net.m, next[512..], .all);
         defer _ = mlx.mlx_array_free(cold);
-        try glm5_forward.expectArrayBits(cold, warm);
+        try mlx_ops.expectArrayBits(cold, warm);
     }
 
     // A clean shutdown flushes first; the reboot restores the thought point.
@@ -1313,7 +1313,7 @@ test "DeepSeek live rollback: a turn that diverges inside the last turn's genera
     try expectCheckpointBits(&ssd_point, &live_point);
     const via_ssd = try dsv41_model.extend(net.m, next[prompt_end..], .all);
     defer _ = mlx.mlx_array_free(via_ssd);
-    try glm5_forward.expectArrayBits(via_ssd, via_live);
+    try mlx_ops.expectArrayBits(via_ssd, via_live);
     var ssd_end = try dsv41_prefix.capture(testing.allocator, net.m, next.len);
     defer ssd_end.deinit(testing.allocator);
     try expectCheckpointBits(&ssd_end, &live_end);

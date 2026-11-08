@@ -251,3 +251,8 @@ test "the arch gate text keeps the order its refusal has always listed" {
     if (registry.served_model_types.len != 4) return;
     try std.testing.expectEqualStrings("qwen4_exp, mimo_v2, glm5_next, deepseek_v41", gate_text);
 }
+
+test "a per-request-prefill arch states its start width and the others state none" {
+    if (factsOfType("glm5_next")) |f| try std.testing.expectEqual(@as(u32, 2048), f.prefill_start_width);
+    if (factsOfType("qwen4_exp")) |f| try std.testing.expectEqual(@as(u32, 0), f.prefill_start_width);
+}

@@ -72,6 +72,16 @@ joins `DROPPABLE` when its drop passes. `dsv41` is in the list.
   it, and the config's tag is the fallback). The request a slot owns beside its KV cache is `arch_state.SlotRequest`,
   the type of the one `Ctx.request` a built arch declares (`NoRequest` when none does). A moved field leaves `Trunk` in
   the commit that fills its `State`: two owners of one pointer release it twice.
+- **Load, prefill and bill hooks an arch may declare** (every one optional; the default is stated where it is called).
+  `arch.zig`: the `prefill_start_width` fact, `ubench`, `tools`. The `load` slot (`arch/load.zig`) beside its
+  `weights` and `residentLoadBytes`: `drafterOff`, `stageDrafter`, `prepareDrafter`, `loadDflash`, `bindDflash`,
+  `dflashRowBounds`, `logLoad`, `logDflashReady`, `warmUbench`, which `model_load.zig` calls by the config's arch. The `prefix` module (`arch/prefix.zig`):
+  `checkpointMax` (the restore points a request keeps in memory) and, for the arch whose slots keep a request beside the
+  KV, `captureRequest`, `restorableAt` and the prefill grid (`requestCheckpointStride`, `requestCaptureStride`,
+  `requestCaptureBackoff`, `requestChunkEnd`), which `generate.zig` reaches through `arch_state.requestOf`. The `drafter`
+  module: `nativeEligible(xfm, sampling, logprobs_n)` / `reserveNative` (rounds the arch runs on its own model) and
+  `inDirCacheValid` (a drafter folder the engine derived from the model directory is intact). A shared helper
+  that two archs once borrowed from one is named by capability and lives in `src/` (`mlx_ops.zig`: the eager-graph `Ops`).
 - **The seam guard** (`arch_state.zig`, at compile time) covers `Trunk`, `ForwardCtx` and `Slot` only, not `Generator`,
   `LoadedModel` or `ModelConfig`. A field there fails the build when it holds a registered arch's name stem (`glm`,
   `dsv`, `qwen`, `mimo`) or, as whole `_`-separated words, one of the `seam_terms` on that arch's registry line (qwen4:
@@ -164,20 +174,25 @@ Each is optional; shared code asks through the dispatch file named, never the ar
 - The `drafter` slot's `dspark_rounds` (`nextDspark`, `dsparkResumeAfterForced`, `dsparkEmitPending`, `dsparkDiag`, `stageBlock`):
   `arch/dspark.zig` binds them for the generator and the scheduler, or a stand-in that refuses in a build without such an arch. The
   generator's DSpark types are the shared `dspark_rows.zig`.
-- `ubench` in `arch.zig`: the arch's microbench module, whose `benches` `ubench_main.zig` lists.
+- `ubench` in `arch.zig`: the arch's microbench module, whose `benches` `ubench_main.zig` lists. It may also declare
+  `sharedFold(run, stream, layouts)`, the arch's arm of `shared.shared_expert_fold` (`glm5` does).
 - A `State` may declare `specRollsBack` (`arch_state.zig`): its decode state rewinds across a speculative verify.
 
 ## Build roots an arch declares
 
 An arch folder may hold `build_roots.zon`; `build.zig` reads every `src/<folder>/build_roots.zon` at configure time, so
 the shared build names no arch for these:
-- `.tools`: an offline tool built in place of the server by `-D<option>=true` (`option`, `help`, `root`). `glm5` declares
-  `-Dglm-ffn-replay` and `-Dglm-trunk-cov`; the option name and what it builds are unchanged.
+- `.tools`: an offline tool built in place of the server by `-D<option>=true` (`option`, `help`). The tool itself is
+  listed in the arch's `arch.zig` as `pub const tools = struct { pub const @"<option>" = @import("<file>.zig"); }`, and
+  `src/tool_root.zig` is the root the build compiles: Zig lets a file reach the engine by relative path only from a
+  root in `src/`, so a tool in an arch folder cannot be a root itself. `glm5` declares `-Dglm-ffn-replay` and
+  `-Dglm-trunk-cov`; the option name and what it builds are unchanged.
 - `.benches`: the arch's microbench files, which `build.zig` holds to the no-`test`-block rule (see
-  [testsuite](testsuite.md#microbenches)). `ubench_main.zig` lists an arch's benches through its `ubench` module; GLM's are still
-  imported by `ubench_main.zig` until its S4 stage.
+  [testsuite](testsuite.md#microbenches)). `sushi-ubench` lists the `ubench` decl of each built arch's `arch.zig`; the
+  bench file may also declare `sharedFold(run, stream, layouts)`, the arch's arm of `shared.shared_expert_fold`
+  (`glm5` does).
 
-Paths are from the repo root. Moving a root file edits its folder's list; dropping the folder drops its options.
+Bench paths are from the repo root. Dropping the folder drops its options.
 A key the file does not know, or a bench path that is missing, stops the configure.
 
 ## Dropping an architecture
@@ -192,7 +207,7 @@ folder. `DROP_TRY=<arch>` runs the same check for an arch not in the list (a str
 `DROP_KEEP=1` keeps the worktree.
 
 CI runs it on every PR as a step of the build-and-test job, after the test tier, on the runner and build that job
-already set up; the loop covers every arch in `DROPPABLE` (mimo2 today).
+already set up; the loop covers every arch in `DROPPABLE` (mimo2, dsv41 and glm5 today).
 
 `zig build arch-slice -Dslice-arch=<name>` is the quick form of the same question, for the arch's own folder: it compiles
 `src/<name>/arch.zig` as a module of its own, with `build_options`, `sushi_exl3` and `arch_host` (here
@@ -208,7 +223,7 @@ the link check. A busy box roughly doubles it. Expect the same order on a CI run
 
 A drop is one commit that removes:
 - `src/<arch>/` (its fixtures go with it), its registry entry (its packs and flags go with the folder);
-- what `build.zig` still names for the arch (`test_dirs`, `TestModel`, the bench imports of `ubench_main.zig`), until
+- what `build.zig` still names for the arch (`test_dirs`, `TestModel`) until
   those leave the shared files; its test lists leave with its `arch_tests.zig` and registry line, and `src/tests.zig` and `src/tests_host.zig`
   name no arch folder;
 - `tests/<arch>/`, its rows in `tests/CLAUDE.md`, its pack-tier env in [testsuite](testsuite.md);

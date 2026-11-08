@@ -1,10 +1,9 @@
 //! The bill tests that read the live GPU or need MLX. They run in the MLX tier; the rest of bills.zig runs in test-host.
 const Trunk = trunk.Trunk;
 const fixtures = @import("bills_fixtures_test.zig");
+const arch_prefix = @import("arch/prefix.zig");
 const bills = @import("bills.zig");
 const generate_mod = @import("generate.zig");
-const glm5_generate = @import("glm5/glm5_generate.zig");
-const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const launch_state = @import("server_state.zig");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
@@ -356,7 +355,7 @@ test "GLM near the top of its context keeps fewer checkpoints at the start width
         }
     };
     var probe = Fits{ .cfg = &cfg, .seq = seq, .width = width, .available = bills.prefillNeededAtChunk(&cfg, seq, 2048, 8, width, .{ .checkpoints = 1 }) };
-    const cap = glm5_prefix.checkpointMax(16);
+    const cap = arch_prefix.checkpointMax(&cfg, 16);
     try std.testing.expect(bills.prefillNeededAtChunk(&cfg, seq, 2048, 8, width, .{ .checkpoints = cap }) > probe.available);
     try std.testing.expectEqual(@as(?u32, 1), slot_admission.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
     // The checkpoints yield to the width: the prefill still starts at the start width.

@@ -56,7 +56,9 @@ pub fn build(b: *std.Build) void {
     const mlx_sha = readMlxPin(b, "mlx=") orelse "";
 
     const build_roots = archBuildRoots(b);
+    const tool = toolRoot(b, build_roots);
     const build_options = b.addOptions();
+    build_options.addOption([]const u8, "tool", tool orelse "");
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
     build_options.addOption([]const u8, "mlx_sha", mlx_sha);
@@ -75,7 +77,7 @@ pub fn build(b: *std.Build) void {
     host_options.addOption(bool, "host_tier", true);
 
     const mod = b.createModule(.{
-        .root_source_file = b.path(toolRoot(b, build_roots)),
+        .root_source_file = b.path(if (tool != null) "src/tool_root.zig" else "src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libcpp = true,
@@ -193,17 +195,21 @@ pub fn build(b: *std.Build) void {
     host_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     host_mod.addIncludePath(b.path("lib/jinja_cpp"));
     host_mod.linkSystemLibrary("c++", .{});
-    const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = test_filter orelse hostFilters(b) });
-    test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-    const run_host_tests = b.addRunArtifact(host_tests);
-    test_host_step.dependOn(&run_host_tests.step);
-    test_step.dependOn(&run_host_tests.step);
-    // A user's filter may select nothing in the host binary, which then rightly runs 0 tests.
+    // A user's filter narrows the host tier to its own tests that the filter selects: a bare substring would also select the
+    // MLX-tier tests of the files the host files reach, and those do not link. A filter that selects none builds no binary.
+    const host_filters = if (test_filter) |user| hostUserFilters(b, user) else hostFilters(b);
     const count_guard = addCountGuard(b, target);
-    if (test_filter == null) {
-        const host_count = countGuard(b, count_guard, host_tests);
-        test_host_step.dependOn(host_count);
-        test_step.dependOn(host_count);
+    if (host_filters.len > 0) {
+        const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters });
+        test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        const run_host_tests = b.addRunArtifact(host_tests);
+        test_host_step.dependOn(&run_host_tests.step);
+        test_step.dependOn(&run_host_tests.step);
+        if (test_filter == null) {
+            const host_count = countGuard(b, count_guard, host_tests);
+            test_host_step.dependOn(host_count);
+            test_step.dependOn(host_count);
+        }
     }
     const unit_tests: []const *std.Build.Step.Compile = if (test_model == .exl3 or test_model == .enc)
         &.{}
@@ -317,10 +323,10 @@ const stamp_script =
 ;
 
 /// What an arch folder declares to the build in `src/<arch>/build_roots.zon`, so the shared build names no arch: an
-/// offline tool built in place of the server by `-D<option>=true`, and the arch's microbench files. Paths are from the
-/// repo root, so moving a file edits its folder's list only; a dropped folder takes its options with it.
+/// offline tool built in place of the server by `-D<option>=true` (the tool itself is in the arch's `tools`), and the
+/// arch's microbench files, by path from the repo root. A dropped folder takes its options with it.
 const BuildRoots = struct {
-    tools: []const struct { option: []const u8, help: []const u8, root: []const u8 } = &.{},
+    tools: []const struct { option: []const u8, help: []const u8 } = &.{},
     benches: []const []const u8 = &.{},
 };
 
@@ -369,12 +375,14 @@ fn archBuildRoots(b: *std.Build) []const BuildRoots {
     return out.items;
 }
 
-/// The server, or the first declared offline tool whose `-D` option is on.
-fn toolRoot(b: *std.Build, roots: []const BuildRoots) []const u8 {
+/// The first declared offline tool whose `-D` option is on; null builds the server. A tool is run through
+/// `src/tool_root.zig`, which finds it by this name in the declaring arch's `tools`.
+fn toolRoot(b: *std.Build, roots: []const BuildRoots) ?[]const u8 {
+    var picked: ?[]const u8 = null;
     for (roots) |r| for (r.tools) |tool| {
-        if (b.option(bool, tool.option, tool.help) orelse false) return tool.root;
+        if (b.option(bool, tool.option, tool.help) orelse false) picked = picked orelse tool.option;
     };
-    return "src/main.zig";
+    return picked;
 }
 
 /// A microbench file holds no `test` block: a bench is timed by `sushi-ubench`, never run by the suite.
@@ -653,6 +661,54 @@ fn hostFilters(b: *std.Build) []const []const u8 {
         }
     }
     out.append(b.allocator, arch_bill_suffix ++ ".test.") catch @panic("OOM");
+    return out.items;
+}
+
+/// Appends the full name of each test in `source`, a file whose stem is `stem`: `<stem>.test.<name>`, or
+/// `<stem>.<Struct>.test.<name>` inside a struct opened at column 0 (the same reading the buckets' scan makes).
+fn appendTestNames(b: *std.Build, out: *std.ArrayList([]const u8), stem: []const u8, source: []const u8) void {
+    var owner: []const u8 = "";
+    var rows = std.mem.splitScalar(u8, source, '\n');
+    while (rows.next()) |row| {
+        if ((std.mem.startsWith(u8, row, "pub const ") or std.mem.startsWith(u8, row, "const ")) and std.mem.endsWith(u8, row, " = struct {"))
+            owner = row[std.mem.indexOf(u8, row, "const ").? + "const ".len .. row.len - " = struct {".len];
+        if (!std.mem.endsWith(u8, row, "\" {")) continue;
+        if (std.mem.startsWith(u8, row, "test \""))
+            out.append(b.allocator, b.fmt("{s}.test.{s}", .{ stem, row["test \"".len .. row.len - "\" {".len] })) catch @panic("OOM")
+        else if (std.mem.startsWith(u8, row, "    test \"") and owner.len != 0)
+            out.append(b.allocator, b.fmt("{s}.{s}.test.{s}", .{ stem, owner, row["    test \"".len .. row.len - "\" {".len] })) catch @panic("OOM");
+    }
+}
+
+/// The host tier's tests that a user's `-Dtest-filter` selects, each by its own name (`selectedByUser`, as the buckets do).
+fn hostUserFilters(b: *std.Build, user: []const []const u8) []const []const u8 {
+    const io = b.graph.io;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (hostPaths(b)) |path| {
+        const stem = path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0..];
+        const file = buildRootHandle(b).readFileAlloc(io, b.fmt("src/{s}.zig", .{path}), b.allocator, .limited(16 << 20)) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => std.debug.panic("src/{s}.zig: {t}", .{ path, e }),
+        };
+        b.dependOnFileContents(b.path(b.fmt("src/{s}.zig", .{path})));
+        appendTestNames(b, &names, stem, file);
+    }
+    for (test_dirs) |dir_path| {
+        var dir = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => std.debug.panic("{s}: {t}", .{ dir_path, e }),
+        };
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e })) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, arch_bill_suffix ++ ".zig")) continue;
+            const file = dir.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
+            b.dependOnFileContents(b.path(b.fmt("{s}/{s}", .{ dir_path, entry.name })));
+            appendTestNames(b, &names, entry.name[0 .. entry.name.len - ".zig".len], file);
+        }
+    }
+    var out: std.ArrayList([]const u8) = .empty;
+    for (names.items) |full| if (selectedByUser(user, full)) out.append(b.allocator, nameFilter(full, names.items, user)) catch @panic("OOM");
     return out.items;
 }
 
@@ -1044,13 +1100,13 @@ test "a build_roots.zon declares tools and benches, and a misspelt key is refuse
     var diag: std.zon.parse.Diagnostics = undefined;
     const roots = try parseBuildRoots(arena.allocator(),
         \\.{
-        \\    .tools = .{ .{ .option = "a-tool", .help = "Build a", .root = "src/a/tool.zig" } },
+        \\    .tools = .{ .{ .option = "a-tool", .help = "Build a" } },
         \\    .benches = .{ "src/a/ubench.zig", "src/b.zig" },
         \\}
     , &diag);
     try std.testing.expectEqual(@as(usize, 1), roots.tools.len);
     try std.testing.expectEqualStrings("a-tool", roots.tools[0].option);
-    try std.testing.expectEqualStrings("src/a/tool.zig", roots.tools[0].root);
+    try std.testing.expectEqualStrings("Build a", roots.tools[0].help);
     try std.testing.expectEqual(@as(usize, 2), roots.benches.len);
     try std.testing.expectEqual(@as(usize, 0), (try parseBuildRoots(arena.allocator(), ".{}", &diag)).benches.len);
     try std.testing.expectError(error.ParseZon, parseBuildRoots(arena.allocator(), ".{ .bench = .{} }", &diag));

@@ -567,13 +567,12 @@ pub const ModelConfig = struct {
     /// once at load: a long session's load-time reserve (and, ungated, the hot-cache ask) pins
     /// every ordinary prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
-        return self.longCtxGated() or self.swaRingTokens() > 0 or self.isGlm5() or (arch_config.facts(self) orelse arch_config.Facts{}).prefill_start_width != 0;
+        return self.longCtxGated() or self.swaRingTokens() > 0 or (arch_config.facts(self) orelse arch_config.Facts{}).prefill_start_width != 0;
     }
 
     /// The width a per-request arch's prefill starts at; only a chunk that no longer fits beside its
     /// KV steps down. GLM's native prefill paths are built for 2048 rows.
     pub fn prefillStartWidth(self: *const ModelConfig) u32 {
-        if (self.isGlm5()) return @import("glm5/glm5_forward.zig").prefill_chunk;
         if (arch_config.facts(self)) |f| if (f.prefill_start_width != 0) return f.prefill_start_width;
         if (self.longCtxGated()) return 4096;
         if (self.swaRingTokens() > 0) return 2048;
@@ -1986,10 +1985,6 @@ pub fn loadWeightsForConfig(
     try archGate(config);
     if (config.pack_revision) |rev| try pack_revision_mod.verify(io, allocator, model_dir, rev);
     if (config.expert_layout == .exl3_k4 and !(arch_config.facts(config) orelse arch_config.Facts{}).reads_own_source) try @import("pack_index.zig").validateExl3Pack(io, allocator, model_dir, config);
-    if (config.isGlm5()) {
-        const glm = @import("glm5/glm5_diagnostic.zig");
-        return glm.loadWeightsBoundedWithVision(io, allocator, model_dir, mlx.gpuStream(), config.expert_streaming, std.math.maxInt(u64), load_vision and config.glm5_vision);
-    }
     if (try arch_load.weights(io, allocator, model_dir, config, load_vision)) |weights| return weights;
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, load_vision, config.stream_mtp_head);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });

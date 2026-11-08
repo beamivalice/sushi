@@ -11,7 +11,7 @@ const depth_bounds = @import("../mtp_depth_bounds.zig");
 const Trunk = trunk_mod.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const SSMCheckpoint = trunk_mod.SSMCheckpoint;
-const glm5_forward = @import("../glm5/glm5_forward.zig");
+const mlx_ops = @import("../mlx_ops.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const dsv41_serving = @import("dsv41_serving.zig");
 const KVCache = trunk_mod.KVCache;
@@ -672,7 +672,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     try testing.expect(hc.last_restored_disk_id != null);
     const got = try dsv41_model.extend(dsv41_state.modelOf(&xfm).?, &suffix, .all);
     defer _ = mlx.mlx_array_free(got);
-    try glm5_forward.expectArrayBits(want_logits.?, got);
+    try mlx_ops.expectArrayBits(want_logits.?, got);
 }
 
 test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_TINY)" {

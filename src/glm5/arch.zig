@@ -25,6 +25,16 @@ pub const flags = @import("glm5_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("glm5_drafter.zig");
 
+pub const load = @import("glm5_load.zig");
+
+/// The offline tools this folder builds, by their `-D` option (`build_roots.zon`); `src/tool_root.zig` runs one.
+pub const ubench = @import("ubench_glm5.zig");
+
+pub const tools = struct {
+    pub const @"glm-ffn-replay" = @import("glm5_ffn_replay.zig");
+    pub const @"glm-trunk-cov" = @import("glm5_trunk_cov.zig");
+};
+
 pub const sched = @import("glm5_sched.zig"); // slot:sched (S2b)
 
 pub const prefix = @import("glm5_prefix.zig"); // slot:prefix (S2c)
@@ -35,7 +45,7 @@ const config_file = @import("glm5_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "glm5_next", "glm5_next_text" };
 pub const discovery_types = model_types;
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .prefill_start_width = @import("glm5_forward.zig").prefill_chunk };
 
 /// A pack stores the MTP layers after the trunk's, under the same prefix (`pack_index`'s range check).
 pub fn trailingPackLayers(config: *const Config) u32 {

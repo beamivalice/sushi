@@ -9,9 +9,6 @@ DeepSeek vision serving: the processor carries the release's budgets, a placehol
 DeepSeek's image-encode bill, which is also its transient cap, covers a quarter over the measured peak
 DeepSeek-V4.1 serves medium and xhigh as their own words, without a re-route
 GLM BF16 individual index recognizes separate gate up down experts
-GLM BF16 stream imports split expert slabs and preserves bytes across cache and union
-GLM DFlash2 reserve at prefill end fits the admission bill at every request shape
-GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised context
 GLM EXL3 index uses native source nesting and refuses mixed expert formats
 GLM EXL3 preflight refuses a rate-grouped layer by name
 GLM EXL3 preflight refuses orphan MTP and out of range packed tensors
@@ -27,7 +24,6 @@ GLM group2 serves every admitted rate, exact to the cooperative reader
 GLM group2 shared expert joined in the reduce equals the separate BF16 add
 GLM group2 singleton and all-shared routes preserve strided input bits
 GLM near the top of its context keeps fewer checkpoints at the start width instead of being refused
-GLM prefill bills the packed selection planes of its history
 GLM prefill chunk never widens past the width its numerics are built for
 GLM prefill grid declines guards before dispatch
 GLM prefill grid serves W14 packs with the sorted chain's bytes
@@ -44,7 +40,6 @@ GLM serving DFlash2 trims physical window and preserves absolute append position
 GLM serving accepts native effort levels and thinks by default
 GLM serving memory bills one latent at the request's KV width and pooled index per token
 GLM serving template receives low high max without a derived reasoning budget
-GLM trunk cov collector sums X^T X per projection across calls
 GLM vision serving processor carries image and video token budgets without M-RoPE
 GLM-5.3 template renders a tool round-trip itself, never the generic fallback
 GLM-5.3 template: a tool result given as a list of outputs, text parts or tool references renders in place

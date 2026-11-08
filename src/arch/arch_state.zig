@@ -263,6 +263,8 @@ const request_arch: ?registry.Tag = blk: {
 
 /// Stands in for the slot request in a build where no arch keeps one: there is never one to hold.
 pub const NoRequest = struct {
+    offset: usize = 0,
+
     pub fn deinit(_: *NoRequest) void {}
     pub fn reset(_: *NoRequest) void {}
     pub fn residentBytes(_: *const NoRequest) u64 {
@@ -275,6 +277,12 @@ pub const SlotRequest = if (request_arch) |t|
     @typeInfo(@typeInfo(@FieldType(Decl(t, "Ctx"), "request")).optional.child).pointer.child
 else
     NoRequest;
+
+/// The request a forward context carries; null when it carries none or no built arch keeps one.
+pub fn requestOf(ctx: *const ForwardCtx) ?*SlotRequest {
+    if (comptime request_arch) |t| return @field(ctx.arch_ctx, @tagName(t)).request;
+    return null;
+}
 
 /// The context a slot's forward carries: `request_arch` pointed at the slot's request.
 pub fn ctxForSlot(request: ?*SlotRequest) Ctx {

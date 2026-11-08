@@ -47,11 +47,12 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `sched_policy.zig` | the scheduler's decisions (tick buckets and caps, admission order, slot end states, interleave and idle arithmetic), host tier | server-lifecycle |
 | `prefix_policy.zig` / `disk_format.zig` | the prefix cache's rules (thinning, lookup winner, eviction victim, spec adoption) and the SSD record's wire format (safetensors header, `meta.json`), both host tier | engine-prefix-cache |
 | `mlx_kernel_keys.zig` | custom-kernel library keys for `mlx.zig` wrappers | engine-mlx-gotchas |
+| `mlx_ops.zig` / `tool_root.zig` | the eager-graph `Ops` (a bounded list of MLX arrays freed together) every arch building a short graph shares / the one root of the offline tools an arch folder builds (`-D<option>`), which finds the tool in the arch's `arch.zig` `tools` | engine-mlx-gotchas, engine-arch-seam |
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, `digit_group`; prompt LRU | engine-mlx-gotchas |
 | `vision.zig` / `vision_common.zig` / `arch/media.zig` / `<arch>/<arch>_media.zig` / `qwen4/qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: the tower holder, preprocessing, the media dispatch and each arch's processor, Qwen3-VL, M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` / `kld_fixture.zig` / `kld_capture_util.zig` / `arch/offline.zig` | `sushi kld capture|compare`; the MLX-free fixture reader and scoring; the per-arch hooks | quality-kld |
 | `bench.zig` / `bench_box.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power | process-measurement |
-| `ubench_main.zig` / `ubench_report.zig` / `exl3_ubench/ubench.zig` | `sushi-ubench` (`zig build ubench`) | process-ubench |
+| `ubench_main.zig` / `ubench_report.zig` / `exl3_ubench/ubench.zig` / `glm5/ubench_glm5.zig` | `sushi-ubench` (`zig build ubench`); each built arch's `ubench` decl is listed | process-ubench |
 | `sushibar_main.zig` / `sushibar/` | `sushibar` menu bar app | server-lifecycle |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | format corpus, traffic replay | server-tool-calling |

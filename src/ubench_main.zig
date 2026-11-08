@@ -12,7 +12,6 @@ pub const log = @import("log.zig");
 pub const report = @import("ubench_report.zig");
 const box = @import("bench_box.zig");
 const exl3_ubench = @import("sushi_exl3_ubench").ubench;
-const glm5 = @import("ubench_glm5.zig");
 const shared = @import("ubench_shared.zig");
 const encoder = @import("sushi_encoder");
 const arch_registry = @import("arch/registry.zig");
@@ -43,7 +42,7 @@ const registry = [_]report.Bench{
     exl3_ubench.exl3_rate_groups_rows,
     encoder.ubench.factor,
     encoder.ubench.search,
-} ++ glm5.benches ++ shared.benches;
+} ++ shared.benches;
 
 comptime {
     @setEvalBranchQuota(100_000);

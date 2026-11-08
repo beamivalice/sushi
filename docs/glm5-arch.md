@@ -55,6 +55,12 @@ trunk experiment (earlier "Sushi-2.4bpw") and a raw FP8 E4M3FN block-128 trunk (
 keep their source precision. The consumer contract is [pack-format](pack-format.md); how packs are made lives in the
 private converter repo.
 
+- GLM's load code lives in the folder and is reached through hooks, so `src/glm5/` can be deleted with its registry line:
+  `glm5_load.zig` (the `load` slot: weights, resident bill, assistant staging, the runtime cache of the shipped assistant,
+  the `[glm]` load lines), the `prefill_start_width` fact in `arch.zig`, and the DFlash2 face in
+  `glm5_drafter.zig` (`nativeEligible`, `reserveNative`, `inDirCacheValid`). The offline tools `-Dglm-ffn-replay` and
+  `-Dglm-trunk-cov` (`glm5_ffn_replay.zig`, `glm5_trunk_cov.zig`) and `sushi-ubench`'s `glm5.*` benches
+  (`ubench_glm5.zig`) are in the folder too.
 - `model.loadWeightsForConfig` reads only indexed text tensors, plus the tower when vision is on. It uploads one shard
   at a time (a 566-shard pack once exhausted the 256-descriptor limit) and preserves every stored dtype.
 - Affine 6/8-bit is inferred from the packed row width and the declared input width, never from a directory name.

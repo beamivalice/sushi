@@ -17,6 +17,7 @@ const forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
 const flags = @import("glm5_flags.zig");
 const rows_tick = @import("glm5_rows_tick.zig");
+const glm5_load = @import("glm5_load.zig");
 
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
@@ -82,7 +83,7 @@ pub fn checkKvQuant(kv: kv_quant.KVQuantConfig) !void {
 }
 
 pub fn coldLoadBill(load: sched.ColdLoad) !?u64 {
-    return try model_load.glmColdLoadBillBytes(load.io, load.allocator, load.config, load.path, load.load_vision, load.no_drafter, load.drafter_dir);
+    return try glm5_load.coldLoadBillBytes(load.io, load.allocator, load.config, load.path, load.load_vision, load.no_drafter, load.drafter_dir);
 }
 
 pub fn commitOwn(
@@ -128,7 +129,7 @@ pub fn nativeDflashArmed(slot: *const Slot) bool {
 }
 
 pub fn thoughtGrid(gen: *const Generator) ?u32 {
-    return if (gen.glm_dflash_native) @intCast(glm5_prefix.pool_size) else null;
+    return if (gen.native_dflash) @intCast(glm5_prefix.pool_size) else null;
 }
 
 test "an arch with a native request restores into it with the assistant context and releases it when the thread lets go" {

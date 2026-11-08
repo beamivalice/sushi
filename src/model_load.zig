@@ -46,10 +46,6 @@ const Weights = model_mod.Weights;
 const ChatConfig = chat_mod.ChatConfig;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
-const glm5_rows_tick = @import("glm5/glm5_rows_tick.zig");
-const glm5_state = @import("glm5/glm5_state.zig");
-const glmRowsUbench = glm5_rows_tick.glmRowsUbench;
-const glmRoundUbench = glm5_rows_tick.glmRoundUbench;
 const sampler = @import("sampler.zig");
 const testing = std.testing;
 const bills = @import("bills.zig");
@@ -898,15 +894,6 @@ fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: [
     return split.trunk +| split.mtp +| bills.rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits());
 }
 
-/// A streamed GLM forward keeps no speculative state: a found assistant stays unloaded,
-/// an asked-for one is refused by name.
-pub fn glmStreamedDrafterOff(config: *const ModelConfig, drafter_dir: []const u8) !bool {
-    if (!config.isGlm5() or !config.expert_streaming) return false;
-    if (drafter_dir.len > 0) return error.GlmStreamingSpecUnsupported;
-    log.info("[glm-dflash] off: unsupported under expert streaming\n", .{});
-    return true;
-}
-
 /// The drafter a load binds: `--no-drafter` wins, then an explicit dir, then one shipped in the model dir.
 /// Flash-Next keeps MTP unless `--drafter` asks for DFlash2, so a drafter beside its pack is never loaded.
 pub const LoadDrafterDir = struct {
@@ -1296,7 +1283,7 @@ test "coldLoadVision honors --no-vision, --vision and the per-model vision, resi
 }
 
 /// Stamp the per-request terms of a sliding DFlash2 assistant on the target's config.
-fn stampDflashRequestTerms(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, directory: []const u8) !void {
+pub fn stampDflashRequestTerms(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, directory: []const u8) !void {
     if (!dflash_mod.probeIsDflash(io, allocator, directory)) return error.DflashAssistantRequired;
     var cfg = try dflash_mod.parseConfig(io, allocator, directory);
     defer cfg.deinit(allocator);
@@ -1308,27 +1295,6 @@ fn stampDflashRequestTerms(io: std.Io, allocator: std.mem.Allocator, config: *Mo
     // A draft block grows a 2047-row window to the next 256-row allocation.
     config.dflash_window_bytes = per_token * ((@as(u64, cfg.sliding_window) + cfg.block_size + 255) / 256 * 256);
     config.dflash_capture_bytes_per_token = (@as(u64, cfg.target_layer_ids.len) * cfg.hidden_size + @as(u64, cfg.hidden_size) * 2) * 2 + per_token;
-}
-
-fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, directory: []const u8) !u64 {
-    if (directory.len == 0) return 0;
-    stampDflashRequestTerms(io, allocator, config, directory) catch |err| return switch (err) {
-        error.DflashAssistantRequired => error.GlmDflashAssistantRequired,
-        error.DflashTargetMismatch => error.GlmDraftTargetMismatch,
-        else => err,
-    };
-    const runtime_cache = @import("glm5/glm5_dflash_cache.zig");
-    return if (runtime_cache.isShippedSource(directory, model_dir))
-        try runtime_cache.plannedResidentBytes(io, allocator, directory)
-    else
-        try @import("glm5/glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
-}
-
-pub fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, load_vision: bool, no_drafter: bool, drafter_dir: []const u8) !u64 {
-    const drafter = LoadDrafterDir.resolve(io, allocator, config, no_drafter, drafter_dir, model_dir);
-    defer drafter.deinit(allocator);
-    const weights = try @import("glm5/glm5_diagnostic.zig").residentBytesWithVision(io, allocator, model_dir, config.num_hidden_layers, load_vision and config.glm5_vision);
-    return loadRequirementBytes(config, weights +| try glmDflashLoadBytes(io, allocator, config, model_dir, drafter.dir), false, 0);
 }
 
 test "Sushi quant memory production pack CPU header audit" {
@@ -1380,7 +1346,9 @@ test "the drafter is billed at its quantized resident bytes and its load transie
         \\"candidate_selector.predecessor_codebook":{"dtype":"BF16","shape":[256,128],"data_offsets":[4194304,4259840]},
         \\"norm.weight":{"dtype":"BF16","shape":[2048],"data_offsets":[4259840,4263936]}}
     ;
-    const body = try a.alloc(u8, 8 + header.len + 4263936);
+    // Data bytes the header declares: the fc matrix, the codebook and the norm, all bf16.
+    const stored: u64 = (1024 * 2048 + 256 * 128 + 2048) * 2;
+    const body = try a.alloc(u8, 8 + header.len + stored);
     defer a.free(body);
     @memset(body, 0);
     std.mem.writeInt(u64, body[0..8], header.len, .little);
@@ -1389,7 +1357,6 @@ test "the drafter is billed at its quantized resident bytes and its load transie
     var path_buf: [512]u8 = undefined;
     const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
 
-    const stored = try @import("glm5/glm5_diagnostic.zig").assistantResidentBytes(io, a, dir);
     const billed = try sushiAssistantLoadBytes(io, a, dir);
     try testing.expect(billed < stored);
     try testing.expectEqual((try dflash_mod.assistantLoadBytes(io, a, dir, dflash_mod.quantBitsFromEnv())).resident, billed);
@@ -1545,8 +1512,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         streaming_resident_bytes = plan.split.trunk +| plan.split.mtp +| plan.split.vision;
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
-    } else if (params.config.isGlm5()) {
-        streaming_resident_bytes = try @import("glm5/glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, load_vision and params.config.glm5_vision);
     } else if (try arch_load.residentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on)) |bytes| {
         streaming_resident_bytes = bytes;
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
@@ -1558,7 +1523,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     } else if (model_settings.vision_flag == true) log.warn("[vision] --vision ignored: this checkpoint has no vision tower\n", .{});
 
     // Resolve the sidecar before preflight so billing and loading see the same dependency.
-    const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.config, params.no_drafter or try glmStreamedDrafterOff(params.config, params.drafter_dir), params.drafter_dir, params.model_dir);
+    const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.config, params.no_drafter or try arch_load.drafterOff(params.config, params.drafter_dir), params.drafter_dir, params.model_dir);
     defer drafter.deinit(sch.allocator);
     var drafter_dir = drafter.dir;
     var prepared_drafter_path: ?[]u8 = null;
@@ -1573,13 +1538,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
         log.info("[spec] Qwen3.8-Flash-Next decodes with {s} ({s})\n", .{ if (mtp_on) "MTP" else "plain ticks", why });
     }
-    if (params.config.isGlm5()) {
-        const assistant_bytes = try glmDflashLoadBytes(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir);
+    if (try arch_load.stageDrafter(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, params.no_drafter)) |assistant_bytes|
         streaming_resident_bytes = streaming_resident_bytes.? +| assistant_bytes;
-        if (assistant_bytes > 0) log.info("[glm-dflash] resident assistant {d:.3} GiB; window {d} MiB; BF16 context; verification scratch billed per request\n", .{ @as(f64, @floatFromInt(assistant_bytes)) / (1024 * 1024 * 1024), params.config.dflash_window_bytes >> 20 });
-        if (drafter_dir.len == 0 and !params.no_drafter and !params.config.expert_streaming)
-            log.warn("[glm-dflash] off: no assistant found (expected {s}/{s}, or an intact {s}/{s} cache); re-run `sushi pull` to fetch it\n", .{ params.model_dir, dflash_mod.SHIPPED_GLM_SUBDIR, params.model_dir, dflash_mod.DFLASH2_IN_DIR_SUBDIR });
-    }
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
@@ -1652,22 +1612,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
-    if (params.config.isGlm5() and @import("glm5/glm5_dflash_cache.zig").isShippedSource(drafter_dir, params.model_dir)) {
-        const prepared = try @import("glm5/glm5_dflash_cache.zig").prepare(sch.io, sch.allocator, drafter_dir, mlx.gpuStream());
+    if (try arch_load.prepareDrafter(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, streaming_resident_bytes)) |prepared| {
         prepared_drafter_path = prepared.path;
-        if (prepared.fallback) {
-            const cached_bytes = try @import("glm5/glm5_dflash_cache.zig").plannedResidentBytes(sch.io, sch.allocator, drafter_dir);
-            const bf16_bytes = try @import("glm5/glm5_diagnostic.zig").assistantResidentBytes(sch.io, sch.allocator, prepared.path);
-            streaming_resident_bytes = streaming_resident_bytes.? -| cached_bytes +| bf16_bytes;
-            if (!scheduler_mod.skipMemPreflight()) {
-                const available = bills.effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
-                const needed = loadRequirementBytes(params.config, streaming_resident_bytes.?, false, 0);
-                log.info("[preflight] BF16 DFlash2 fallback: weights ~{d:.2} GiB, needs ~{d:.2} GiB, available {d:.2} GiB\n", .{ @as(f64, @floatFromInt(streaming_resident_bytes.?)) / (1 << 30), @as(f64, @floatFromInt(needed)) / (1 << 30), @as(f64, @floatFromInt(available)) / (1 << 30) });
-                if (available > 0 and needed > available) return error.InsufficientMemory;
-            }
-        }
+        streaming_resident_bytes = prepared.resident_bytes;
         drafter_dir = prepared.path;
-        _ = mlx.mlx_clear_cache();
     }
 
     // Allocate the drafter_path dupe up front so the post-publish step
@@ -1741,13 +1689,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     });
     const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5() and !params.config.isDsv41();
     arch_serve.loadLines(params.config, .{ .io = sch.io, .allocator = sch.allocator, .model_dir = params.model_dir, .mtp_source = mtp.sourceName() });
-    if (params.config.isGlm5()) {
-        const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
-        log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", bills.kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
-        log.info("[glm] NAX arms {s}\n", .{if (@import("glm5/glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
-        if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
-        if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
-    }
+    arch_load.logLoad(params.config, kv_quant_config, mtp.on, params);
     if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config.chat_template)) {
         const keep = settings_resolve.resolve(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, model_settings.default_preserve_thinking);
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", settings_resolve.sourceLabel(keep.source, "--preserve-thinking") });
@@ -1783,7 +1725,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     if (trunk.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
-    if (trunk.diagEnvOn("SUSHI_GLM_ROWS_UBENCH")) if (glm5_state.modelOf(xfm_ptr)) |target| glmRowsUbench(sch.allocator, target, kv_quant_config, params.tok);
+    arch_load.warmUbench(sch.allocator, xfm_ptr, kv_quant_config, params.tok);
 
     // DIAGNOSTIC (SUSHI_DECODE_FWD_UBENCH=N): time N decode-width forward
     // passes back to back, with NO sampling, detokenization, stop-checking or
@@ -2020,28 +1962,26 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             return error.DrafterUnsupported;
         }
         const d = try sch.allocator.create(DflashModel);
-        d.* = (if (params.config.isGlm5()) @import("glm5/glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, glm5_state.modelOf(xfm_ptr).?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
+        d.* = arch_load.loadDflash(sch.io, sch.allocator, xfm_ptr, drafter_dir) catch |err| {
             sch.allocator.destroy(d);
             log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
             return err;
         };
-        if (params.config.isGlm5()) {
-            d.sliding_serving = true;
-            log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
-            if (trunk.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, glm5_state.modelOf(xfm_ptr).?, d, kv_quant_config, params.tok);
-        } else if (params.config.isQwen4()) {
-            d.sliding_serving = true;
-            d.bind(xfm_ptr) catch |err| {
+        if (!arch_load.bindDflash(sch.allocator, xfm_ptr, d, kv_quant_config, params.tok)) {
+            if (params.config.isQwen4()) {
+                d.sliding_serving = true;
+                d.bind(xfm_ptr) catch |err| {
+                    d.deinit();
+                    sch.allocator.destroy(d);
+                    log.err("DFlash assistant at {s} is incompatible with target: {s}\n", .{ drafter_dir, @errorName(err) });
+                    return err;
+                };
+            } else {
                 d.deinit();
                 sch.allocator.destroy(d);
-                log.err("DFlash assistant at {s} is incompatible with target: {s}\n", .{ drafter_dir, @errorName(err) });
-                return err;
-            };
-        } else {
-            d.deinit();
-            sch.allocator.destroy(d);
-            log.err("--drafter: a DFlash2 assistant serves Qwen3.8-Flash-Next and GLM-5.3-Flash only\n", .{});
-            return error.DflashTargetMismatch;
+                log.err("--drafter: a DFlash2 assistant serves Qwen3.8-Flash-Next and GLM-5.3-Flash only\n", .{});
+                return error.DflashTargetMismatch;
+            }
         }
         dflash_ptr = d;
         const wide_lane = dflash_mod.wideVerifyLaneAvailable();
@@ -2055,14 +1995,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 return err;
             };
             sch.drafter_block_size = bounds.max;
-        } else if (params.config.isGlm5()) {
-            const bounds = dflash_mod.glmRowBounds(dflash_mod.drafter_min_depth, dflash_mod.drafter_max_depth) catch |err| {
-                d.deinit();
-                sch.allocator.destroy(d);
-                log.err("--drafter-min-depth/--drafter-max-depth: GLM-5.3-Flash verifies {d}..{d} rows per round\n", .{ dflash_mod.GLM_MIN_ROWS, dflash_mod.GLM_MAX_ROWS });
-                return err;
-            };
-            sch.drafter_block_size = bounds.max;
+        } else if (arch_load.dflashRowBounds(params.config, dflash_mod.drafter_min_depth, dflash_mod.drafter_max_depth) catch |err| {
+            d.deinit();
+            sch.allocator.destroy(d);
+            return err;
+        }) |rows| {
+            sch.drafter_block_size = rows;
         }
         var cap_note_buf: [96]u8 = undefined;
         const cap_note: []const u8 = if (!wide_lane and !params.config.isQwen4() and !dflash_mod.drafterDepthExplicit() and d.config.block_size > sch.drafter_block_size)
@@ -2079,7 +2017,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             d.config.target_layer_ids,
         });
         if (params.config.isQwen4()) log.info("[spec] Qwen3.8-Flash-Next decodes with DFlash2 ({d}..{d} rows per round; --drafter outranks MTP, --no-drafter selects it)\n", .{ dflash_mod.qwenMinRows(), sch.drafter_block_size });
-        if (params.config.isGlm5()) log.info("[spec] GLM-5.3-Flash decodes with DFlash2 ({d}..{d} rows per round)\n", .{ dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS, sch.drafter_block_size });
+        arch_load.logDflashReady(params.config, sch.drafter_block_size);
     } else if (drafter_dir.len > 0) {
         log.err("Drafter at {s} is not a DFlash assistant (its config lacks block_size, mask_token_id and target_layer_ids)\n", .{drafter_dir});
         return error.UnsupportedDrafter;
@@ -2292,10 +2230,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk.?.sweepSiblings();
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
-        const cp_max = if (params.config.isGlm5())
-            @import("glm5/glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max)
-        else
-            prefix_arch.checkpointMax(params.config, params.ssm_checkpoint_max);
+        const cp_max = prefix_arch.checkpointMax(params.config, params.ssm_checkpoint_max);
         entry.ssm_checkpoint_max = cp_max;
         // The cache re-applies the cap after a replace-path merge; without this
         // it defaults to 0 (unlimited) and multi-turn entries grow unbounded.

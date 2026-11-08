@@ -148,4 +148,5 @@ test {
     _ = @import("arch/request.zig");
     _ = @import("arch/admission.zig");
     _ = @import("arch/config.zig");
+    _ = @import("arch/load.zig");
 }

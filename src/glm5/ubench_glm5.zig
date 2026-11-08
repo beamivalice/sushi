@@ -2,18 +2,24 @@
 //! arms, one T2048 KDA layer, and MLA attention for a decode row and for a chunk. Run by `sushi-ubench`, never by a
 //! test; the exactness of every arm is asserted by the tests beside the kernels.
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const io_util = @import("io_util.zig");
-const report = @import("ubench_report.zig");
-const trunk = @import("trunk.zig");
-const nax_gate = @import("nax_gate.zig");
-const model = @import("model.zig");
-const glm = @import("glm5/glm5_model.zig");
-const attention = @import("glm5/glm5_attention.zig");
-const latent_store = @import("glm5/glm5_latent.zig");
-const a6 = @import("glm5/glm5_a6_dense_once.zig");
-const dflash_qmm = @import("glm5/glm5_dflash_qmm.zig");
-const kda_prework = @import("glm5/glm5_kda_prework.zig");
+const mlx = @import("../mlx.zig");
+const io_util = @import("../io_util.zig");
+const report = @import("../ubench_report.zig");
+const trunk = @import("../trunk.zig");
+const nax_gate = @import("../nax_gate.zig");
+const model = @import("../model.zig");
+const glm = @import("glm5_model.zig");
+const attention = @import("glm5_attention.zig");
+const latent_store = @import("glm5_latent.zig");
+const a6 = @import("glm5_a6_dense_once.zig");
+const dflash_qmm = @import("glm5_dflash_qmm.zig");
+const kda_prework = @import("glm5_kda_prework.zig");
+
+const shared = @import("../ubench_shared.zig");
+const api = @import("sushi_exl3");
+const glm_shared = @import("glm5_shared.zig");
+const hc_prefill = @import("../hc_prefill.zig");
+const Bank = @import("glm5_decode.zig").Bank;
 
 const Arr = mlx.mlx_array;
 const Ops = glm.Ops;
@@ -228,9 +234,9 @@ const NaxInputs = struct { x: Arr, a6: [3]Arr, head: [3]Arr, q: Arr, v: Arr, clu
 const NaxCase = struct { s: mlx.mlx_stream, in: *const NaxInputs, case: usize };
 
 fn naxOutput(ops: *Ops, in: *const NaxInputs, case: usize, nax: bool) !Arr {
-    const prefill_batch = @import("glm5/glm5_mla_prefill_batch.zig");
-    const verify_batch = @import("glm5/glm5_mla_verify_batch.zig");
-    const cluster = @import("glm5/glm5_kda_prefill_cluster.zig");
+    const prefill_batch = @import("glm5_mla_prefill_batch.zig");
+    const verify_batch = @import("glm5_mla_verify_batch.zig");
+    const cluster = @import("glm5_kda_prefill_cluster.zig");
     return switch (case) {
         0 => if (nax) (try a6.tryPrefill(ops, in.x, in.a6[0], in.a6[1], in.a6[2])).? else try ops.qmm(in.x, in.a6[0], in.a6[1], in.a6[2], true),
         1 => if (nax) (try prefill_batch.run(ops, .{ .x = in.q, .w = in.head[0], .scales = in.head[1], .biases = in.head[2] }, .query)).? else try ops.qmm(in.q, in.head[0], in.head[1], in.head[2], false),
@@ -380,11 +386,11 @@ const KdaMeter = struct {
                 try evalAll(&r.arrays());
             },
             8 => {
-                const r = (try @import("glm5/glm5_kda_value_rows.zig").run(.{ .q = self.prework.q, .k = self.prework.k, .v = self.prework.v, .decay = self.prework.decay, .beta = self.prework.beta, .state = self.state }, 4, ops.s)).?;
+                const r = (try @import("glm5_kda_value_rows.zig").run(.{ .q = self.prework.q, .k = self.prework.k, .v = self.prework.v, .decay = self.prework.decay, .beta = self.prework.beta, .state = self.state }, 4, ops.s)).?;
                 defer r.deinit();
                 try evalAll(&.{ r.y, r.state });
             },
-            9 => try eval((try @import("glm5/glm5_kda_fused.zig").post(ops.s, self.y, self.gate, self.layer.out_norm, self.cfg.rms_norm_eps)).?),
+            9 => try eval((try @import("glm5_kda_fused.zig").post(ops.s, self.y, self.gate, self.layer.out_norm, self.cfg.rms_norm_eps)).?),
             10 => try evalAll(&(try self.layer.projectQkvParts(ops, self.x))),
             12 => try eval(try ops.binary(.mm, self.x, try ops.transpose(self.wide, &.{ 1, 0 }))),
             13 => try eval(try ops.binary(.mm, self.big, try ops.transpose(self.big, &.{ 1, 0 }))),
@@ -484,10 +490,10 @@ fn runKdaPrefill(run: *report.Run) anyerror!void {
     m.state = try fx.zeros(&.{ 1, 64, 128, 128 }, .float32);
     m.prework = (try kda_prework.apply(s, .{ .qkv = m.joined, .a = m.raw_a, .beta = m.cluster_banks[2], .conv_weight = layer.prepared_conv, .exp_a = layer.prepared_decay, .dt_bias = layer.dt_bias, .heads = 64 })).?;
     defer m.prework.deinit();
-    const rec = (try @import("glm5/glm5_kda_value_rows.zig").run(.{ .q = m.prework.q, .k = m.prework.k, .v = m.prework.v, .decay = m.prework.decay, .beta = m.prework.beta, .state = m.state }, 4, s)).?;
+    const rec = (try @import("glm5_kda_value_rows.zig").run(.{ .q = m.prework.q, .k = m.prework.k, .v = m.prework.v, .decay = m.prework.decay, .beta = m.prework.beta, .state = m.state }, 4, s)).?;
     defer rec.deinit();
     m.y = rec.y;
-    m.gated = try fx.reshape((try @import("glm5/glm5_kda_fused.zig").post(s, m.y, m.gate, layer.out_norm, cfg.rms_norm_eps)).?, &.{ 1, 2048, 8192 });
+    m.gated = try fx.reshape((try @import("glm5_kda_fused.zig").post(s, m.y, m.gate, layer.out_norm, cfg.rms_norm_eps)).?, &.{ 1, 2048, 8192 });
     try evalAll(&.{ m.joined, m.dout, m.raw_a, m.gate, m.state, m.y, m.gated, m.cluster_banks[0], m.cluster_banks[1], m.cluster_banks[2], m.prework.q, m.prework.k, m.prework.v, m.prework.decay, m.prework.beta });
 
     for (run.axis("stage")) |name| try run.interleave(name, KdaStage{ .s = s, .m = &m, .id = indexOf(&kda_stage_names, name) }, sampleKda);
@@ -782,3 +788,82 @@ fn runMlaStages(run: *report.Run) anyerror!void {
         }
     }
 }
+
+// ── glm5: one routed layer at the real geometry (nine experts at n36, 4096 -> 2048 -> 4096), shared A6 ──
+
+const GlmRung = struct {
+    s: mlx.mlx_stream,
+    rows: usize,
+    layers: usize,
+    sigmoid: Arr,
+    routed: []const api.Bank,
+    gate: []const Bank,
+    up: []const Bank,
+    down: []const Bank,
+    ids: []const Arr,
+    scores: []const Arr,
+};
+
+/// Nanoseconds of one layer of a chain over distinct banks, on a fresh activation.
+fn glmSample(r: *const GlmRung, arm: usize) anyerror!f64 {
+    var scope = Ops{ .s = r.s };
+    defer scope.deinit();
+    var prng = std.Random.DefaultPrng.init(0x757);
+    const x0 = try scope.own(try glm_shared.randomRow(shared.alloc, prng.random(), r.rows * 4096, 4));
+    var x = try scope.reshape(x0, &.{ 1, @intCast(r.rows), 4096 });
+    try shared.eval(x);
+    const sw = io_util.Stopwatch.init(shared.io());
+    for (0..r.layers) |l| {
+        x = switch (@as(shared.FoldArm, @enumFromInt(arm))) {
+            .separate => if (r.rows == 1)
+                try glm_shared.separateChain(&scope, x, r.gate[l], r.up[l], r.down[l], 6, r.routed[l], r.ids[l], r.scores[l], r.sigmoid)
+            else
+                (try glm_shared.separateRows(&scope, x, r.gate[l], r.up[l], r.down[l], r.routed[l], r.ids[l], r.scores[l])) orelse return error.FoldDeclined,
+            .routed_only => if (r.rows == 1)
+                try scope.own(try api.moeClamped(r.s, x, r.routed[l], r.ids[l], r.scores[l], glm_shared.test_dec, glm_shared.test_limit))
+            else
+                try scope.own((try api.glm_group2.moeLayout(r.s, x, r.routed[l], r.ids[l], r.scores[l], glm_shared.test_dec, .serial, .grouped, .lane)) orelse return error.FoldDeclined),
+            .fused => try scope.own((try glm_shared.folded(r.s, x, r.gate[l], r.up[l], r.down[l], r.routed[l], r.ids[l], r.scores[l], glm_shared.test_dec, 10, r.sigmoid)) orelse return error.FoldDeclined),
+        };
+    }
+    try shared.eval(x);
+    return @as(f64, @floatFromInt(sw.read())) / @as(f64, @floatFromInt(r.layers));
+}
+
+/// The GLM arm of `shared.shared_expert_fold`, run when the model axis lists glm5.
+pub fn sharedFold(run: *report.Run, s: mlx.mlx_stream, layouts: []const []const u8) !void {
+    if (!shared.listed(layouts, "bank")) return;
+    const layers = @min(run.steps(shared.default_layers), shared.max_layers);
+    var prng = std.Random.DefaultPrng.init(757);
+    const rnd = prng.random();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const sigmoid = try hc_prefill.sigmoidTable(s);
+    var routed: [shared.max_layers]api.Bank = undefined;
+    var fixtures: [shared.max_layers]glm_shared.Fixture = @splat(.{});
+    defer for (&fixtures) |*f| f.deinit();
+    var gate: [shared.max_layers]Bank = undefined;
+    var up: [shared.max_layers]Bank = undefined;
+    var down: [shared.max_layers]Bank = undefined;
+    for (0..layers) |l| {
+        routed[l] = try glm_shared.routedBank(&ops, 36);
+        gate[l] = try fixtures[l].bank(shared.alloc, rnd, 2048, 4096, 6, 1);
+        up[l] = try fixtures[l].bank(shared.alloc, rnd, 2048, 4096, 6, 1);
+        down[l] = try fixtures[l].bank(shared.alloc, rnd, 4096, 2048, 6, 1);
+    }
+    for (routed[0..layers]) |b| for ([_]Arr{ b.gate.trellis, b.up.trellis, b.down.trellis }) |a| try shared.eval(a);
+    for (run.axis("rows")) |rows_text| {
+        const rows = try std.fmt.parseInt(usize, rows_text, 10);
+        var ids: [shared.max_layers]Arr = undefined;
+        var scores: [shared.max_layers]Arr = undefined;
+        for (0..layers) |l| {
+            const route = try glm_shared.routeInputs(&ops, rnd, rows);
+            ids[l] = route.ids;
+            scores[l] = route.scores;
+        }
+        const rung: GlmRung = .{ .s = s, .rows = rows, .layers = layers, .sigmoid = sigmoid, .routed = routed[0..layers], .gate = gate[0..layers], .up = up[0..layers], .down = down[0..layers], .ids = ids[0..layers], .scores = scores[0..layers] };
+        const label = try std.fmt.allocPrint(run.a, "glm5 bank rows {d}", .{rows});
+        try run.interleave(label, &rung, glmSample);
+    }
+}
+

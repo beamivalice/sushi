@@ -19,6 +19,7 @@ const ssmCheckpointBytes = trunk_mod.ssmCheckpointBytes;
 const pc = @import("../prefix_cache.zig");
 const prefix_arch = @import("../arch/prefix.zig");
 const flags = @import("glm5_flags.zig");
+const rounds = @import("glm5_generate.zig");
 
 /// The live request a lookup restores into.
 pub const State = *forward.Request;
@@ -28,6 +29,29 @@ pub fn reset(request: State) void {
 }
 
 pub const pool_size: usize = 4;
+
+pub fn captureRequest(allocator: std.mem.Allocator, request: *forward.Request, pos: usize, s: mlx.mlx_stream) !SSMCheckpoint {
+    if (request.offset != pos) return error.GlmCachePositionMismatch;
+    return captureKda(allocator, request, s);
+}
+
+pub fn restorableAt(pos: usize) bool {
+    return pos % pool_size == 0;
+}
+
+pub fn requestCheckpointStride() usize {
+    return rounds.glm_checkpoint_stride;
+}
+
+pub fn requestCaptureStride() usize {
+    return rounds.glm_capture_stride;
+}
+
+pub fn requestCaptureBackoff(cap: u32, offset: usize, prompt_len: usize) usize {
+    return rounds.glmCaptureSchedule(rounds.glm_capture_stride, cap, offset, prompt_len).backoff;
+}
+
+pub const requestChunkEnd = rounds.glmChunkEnd;
 
 /// KDA states one entry or one prefill holds in memory: each is 141 MiB of FP32 state. The SSD tier keeps
 /// every restore point beyond it.
@@ -900,4 +924,12 @@ test "a commit copies MLA rows only through its newest checkpoint" {
     try testing.expectEqual(@as(usize, 8192), commitRows(&.{ cp(2048), cp(8192), cp(4096) }, 9000));
     // A prefill cancelled below its newest checkpoint cannot copy rows it never forwarded.
     try testing.expectEqual(@as(usize, 100), commitRows(&.{cp(128)}, 103));
+}
+
+test "the request-grid hooks answer the generator's grid, and a slot without a request restores anywhere" {
+    try std.testing.expect(prefix_arch.restorableCheckpoint(null, 7));
+    try std.testing.expect(restorableAt(8) and !restorableAt(9));
+    try std.testing.expectEqual(rounds.glm_checkpoint_stride, requestCheckpointStride());
+    try std.testing.expectEqual(rounds.glmCaptureSchedule(rounds.glm_capture_stride, 16, 256, 5000).backoff, requestCaptureBackoff(16, 256, 5000));
+    try std.testing.expectEqual(rounds.glmChunkEnd(0, 5000, 2048, 2048, 0, true), requestChunkEnd(0, 5000, 2048, 2048, 0, true));
 }

@@ -11,7 +11,7 @@ pub const tests = .{
     @import("glm5_state.zig"),
     @import("glm5_next.zig"),
     @import("glm5_model.zig"),
-    @import("../glm5_trunk_cov.zig"),
+    @import("glm5_trunk_cov.zig"),
     @import("glm5_hc_prefill.zig"),
     @import("glm5_hc_collapse_simd32.zig"),
     @import("glm5_hc_expand_norm.zig"),

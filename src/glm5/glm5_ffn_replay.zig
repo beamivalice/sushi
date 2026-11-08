@@ -1,12 +1,12 @@
 //! Offline GLM frozen-prefix extraction for verified independent-window boundaries.
 const std = @import("std");
-pub const mlx = @import("mlx.zig");
-pub const log = @import("log.zig");
-pub const io_util = @import("io_util.zig");
-const model = @import("model.zig");
-const forward = @import("glm5/glm5_forward.zig");
-const base = @import("glm5/glm5_model.zig");
-const native = @import("glm5/glm5_diagnostic.zig");
+const mlx = @import("../mlx.zig");
+const log = @import("../log.zig");
+const io_util = @import("../io_util.zig");
+const model = @import("../model.zig");
+const forward = @import("glm5_forward.zig");
+const base = @import("glm5_model.zig");
+const native = @import("glm5_diagnostic.zig");
 
 fn append(fd: std.c.fd_t, array: mlx.mlx_array, stream: mlx.mlx_stream) !void {
     var contiguous = mlx.mlx_array_new();
@@ -86,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     defer a.free(raw);
     for (0..windows) |window| {
         request.reset();
-        try @import("expert_io.zig").readExact(fd, std.mem.sliceAsBytes(raw), window * window_bytes);
+        try @import("../expert_io.zig").readExact(fd, std.mem.sliceAsBytes(raw), window * window_bytes);
         for (raw) |v| if (v & 0x7f80 == 0x7f80) return error.NonfiniteBoundary;
         const h = mlx.mlx_array_new_data(raw.ptr, &[_]c_int{ 1, @intCast(length), 4, @intCast(cfg.hidden_size) }, 4, .bfloat16);
         defer _ = mlx.mlx_array_free(h);

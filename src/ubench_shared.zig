@@ -8,24 +8,22 @@ const mlx = @import("mlx.zig");
 const io_util = @import("io_util.zig");
 const report = @import("ubench_report.zig");
 const api = @import("sushi_exl3");
-const glm = @import("glm5/glm5_shared.zig");
 const qwen = @import("qwen4/qwen4_shared.zig");
-const hc_prefill = @import("hc_prefill.zig");
+const arch_registry = @import("arch/registry.zig");
 
 const Arr = mlx.mlx_array;
 const Ops = qwen.Ops;
-const Bank = @import("glm5/glm5_decode.zig").Bank;
 const kernels = api.kernels;
 const exl3_ubench = @import("sushi_exl3_ubench");
 const bench = exl3_ubench.bench_util;
 
 pub const benches = [_]report.Bench{ shared_expert_fold, kernel_launch, trunk_prefill };
 
-const alloc = std.heap.page_allocator;
-const max_layers = 32;
-const default_layers = 8;
+pub const alloc = std.heap.page_allocator;
+pub const max_layers = 32;
+pub const default_layers = 8;
 
-const FoldArm = enum { separate, fused, routed_only };
+pub const FoldArm = enum { separate, fused, routed_only };
 
 pub const shared_expert_fold: report.Bench = .{
     .name = "shared.shared_expert_fold",
@@ -44,16 +42,16 @@ pub const shared_expert_fold: report.Bench = .{
     .run = runFold,
 };
 
-fn listed(values: []const []const u8, v: []const u8) bool {
+pub fn listed(values: []const []const u8, v: []const u8) bool {
     for (values) |x| if (std.mem.eql(u8, x, v)) return true;
     return false;
 }
 
-fn io() std.Io {
+pub fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn eval(a: Arr) !void {
+pub fn eval(a: Arr) !void {
     try mlx.check(mlx.mlx_array_eval(a));
 }
 
@@ -64,84 +62,13 @@ fn runFold(run: *report.Run) anyerror!void {
     const kinds = run.axis("shared");
     if (listed(models, "qwen4")) for (kinds) |kind| for (layouts) |layout| try runQwen(run, s, std.mem.eql(u8, layout, "grouped"), std.mem.eql(u8, kind, "trellis"));
     if (!listed(kinds, "affine")) return;
-    if (listed(models, "glm5") and listed(layouts, "bank")) try runGlm(run, s);
-    if (listed(models, "dsv41") and listed(layouts, "grouped")) try exl3_ubench.ubench.sharedFoldDsv41(run);
-}
-
-// ── glm5: one routed layer at the real geometry (nine experts at n36, 4096 -> 2048 -> 4096), shared A6 ──
-
-const GlmRung = struct {
-    s: mlx.mlx_stream,
-    rows: usize,
-    layers: usize,
-    sigmoid: Arr,
-    routed: []const api.Bank,
-    gate: []const Bank,
-    up: []const Bank,
-    down: []const Bank,
-    ids: []const Arr,
-    scores: []const Arr,
-};
-
-/// Nanoseconds of one layer of a chain over distinct banks, on a fresh activation.
-fn glmSample(r: *const GlmRung, arm: usize) anyerror!f64 {
-    var scope = Ops{ .s = r.s };
-    defer scope.deinit();
-    var prng = std.Random.DefaultPrng.init(0x757);
-    const x0 = try scope.own(try glm.randomRow(alloc, prng.random(), r.rows * 4096, 4));
-    var x = try scope.reshape(x0, &.{ 1, @intCast(r.rows), 4096 });
-    try eval(x);
-    const sw = io_util.Stopwatch.init(io());
-    for (0..r.layers) |l| {
-        x = switch (@as(FoldArm, @enumFromInt(arm))) {
-            .separate => if (r.rows == 1)
-                try glm.separateChain(&scope, x, r.gate[l], r.up[l], r.down[l], 6, r.routed[l], r.ids[l], r.scores[l], r.sigmoid)
-            else
-                (try glm.separateRows(&scope, x, r.gate[l], r.up[l], r.down[l], r.routed[l], r.ids[l], r.scores[l])) orelse return error.FoldDeclined,
-            .routed_only => if (r.rows == 1)
-                try scope.own(try api.moeClamped(r.s, x, r.routed[l], r.ids[l], r.scores[l], glm.test_dec, glm.test_limit))
-            else
-                try scope.own((try api.glm_group2.moeLayout(r.s, x, r.routed[l], r.ids[l], r.scores[l], glm.test_dec, .serial, .grouped, .lane)) orelse return error.FoldDeclined),
-            .fused => try scope.own((try glm.folded(r.s, x, r.gate[l], r.up[l], r.down[l], r.routed[l], r.ids[l], r.scores[l], glm.test_dec, 10, r.sigmoid)) orelse return error.FoldDeclined),
-        };
-    }
-    try eval(x);
-    return @as(f64, @floatFromInt(sw.read())) / @as(f64, @floatFromInt(r.layers));
-}
-
-fn runGlm(run: *report.Run, s: mlx.mlx_stream) !void {
-    const layers = @min(run.steps(default_layers), max_layers);
-    var prng = std.Random.DefaultPrng.init(757);
-    const rnd = prng.random();
-    var ops = Ops{ .s = s };
-    defer ops.deinit();
-    const sigmoid = try hc_prefill.sigmoidTable(s);
-    var routed: [max_layers]api.Bank = undefined;
-    var fixtures: [max_layers]glm.Fixture = @splat(.{});
-    defer for (&fixtures) |*f| f.deinit();
-    var gate: [max_layers]Bank = undefined;
-    var up: [max_layers]Bank = undefined;
-    var down: [max_layers]Bank = undefined;
-    for (0..layers) |l| {
-        routed[l] = try glm.routedBank(&ops, 36);
-        gate[l] = try fixtures[l].bank(alloc, rnd, 2048, 4096, 6, 1);
-        up[l] = try fixtures[l].bank(alloc, rnd, 2048, 4096, 6, 1);
-        down[l] = try fixtures[l].bank(alloc, rnd, 4096, 2048, 6, 1);
-    }
-    for (routed[0..layers]) |b| for ([_]Arr{ b.gate.trellis, b.up.trellis, b.down.trellis }) |a| try eval(a);
-    for (run.axis("rows")) |rows_text| {
-        const rows = try std.fmt.parseInt(usize, rows_text, 10);
-        var ids: [max_layers]Arr = undefined;
-        var scores: [max_layers]Arr = undefined;
-        for (0..layers) |l| {
-            const route = try glm.routeInputs(&ops, rnd, rows);
-            ids[l] = route.ids;
-            scores[l] = route.scores;
+    inline for (comptime std.meta.tags(arch_registry.Tag)) |t| {
+        const M = arch_registry.Mod(t);
+        if (comptime @hasDecl(M, "ubench") and @hasDecl(M.ubench, "sharedFold")) {
+            if (listed(models, @tagName(t))) try M.ubench.sharedFold(run, s, layouts);
         }
-        const rung: GlmRung = .{ .s = s, .rows = rows, .layers = layers, .sigmoid = sigmoid, .routed = routed[0..layers], .gate = gate[0..layers], .up = up[0..layers], .down = down[0..layers], .ids = ids[0..layers], .scores = scores[0..layers] };
-        const label = try std.fmt.allocPrint(run.a, "glm5 bank rows {d}", .{rows});
-        try run.interleave(label, &rung, glmSample);
     }
+    if (listed(models, "dsv41") and listed(layouts, "grouped")) try exl3_ubench.ubench.sharedFoldDsv41(run);
 }
 
 // ── qwen4: a Flash-Next layer (2560 -> 640, top-10, 64 experts), the shared expert affine8 with its gate logit ──

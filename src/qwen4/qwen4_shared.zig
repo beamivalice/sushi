@@ -43,7 +43,7 @@ pub fn folded(s: mlx.mlx_stream, x: Arr, mw: *const trunk_mod.MoeMlpWeights, ind
     return result;
 }
 
-pub const Ops = @import("../glm5/glm5_model.zig").Ops;
+pub const Ops = @import("../mlx_ops.zig").Ops;
 pub const test_dec: api.format.Decode = .{ .codebook = .mcg, .window = .w15 };
 pub const hidden: usize = 2560;
 pub const inter: usize = 640;

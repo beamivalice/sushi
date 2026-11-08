@@ -1259,7 +1259,7 @@ const SlabOperand = struct {
         self.* = undefined;
     }
 
-    fn slotBytes(self: *const SlabOperand, slot: usize) []u8 {
+    pub fn slotBytes(self: *const SlabOperand, slot: usize) []u8 {
         if (!self.present) return &.{};
         const slab = self.slab orelse return &.{};
         return slab.bytes[slot * self.stride ..][0..self.stride];
@@ -5592,62 +5592,6 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
     const gpu = mlx.mlx_array_data_int32(layer.spec_slots).?;
     for (layer.spec_host, 0..) |host, e| try t.expectEqual(@max(host, 0), gpu[e]);
     try t.expectEqual(layer.cache.expert_to_slot[2], layer.spec_host[2]);
-}
-
-test "GLM BF16 stream imports split expert slabs and preserves bytes across cache and union" {
-    try mlx.requireGpu();
-    const t = std.testing;
-    const fixture = @import("glm5/glm_stream_fixture.zig");
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    try fixture.write(t.allocator, tmp.dir, .none);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(t.io, &path_buf);
-    const geometry = Geometry{ .layers = 4, .experts = 4, .hidden = 32, .intermediate = 16, .first_moe_layer = 3 };
-    const s = mlx.gpuStream();
-    var engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geometry, 2 * 3072, s, .{ .layout = .bf16_individual, .bounce_size = 1 << 20 });
-    defer engine.deinit();
-    try t.expectEqual(@as(u64, 6), engine.slab_imports);
-    try t.expectEqual(@as(u64, 0), engine.fallback_imports);
-    try t.expectEqual(@as(u64, 3072), engine.store.perExpertBytes());
-    try expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
-    try t.expect((try engine.specRoute(3)) == null);
-    const groups = [_][]const u16{ &.{ 3, 1 }, &.{ 1, 3, 1 }, &.{ 0, 1, 2, 3 }, &.{ 2, 0 } };
-    for (groups, 0..) |ids, group| {
-        var prepared = try engine.prepareHost(3, ids);
-        defer prepared.deinit();
-        try t.expect(!prepared.quantized);
-        try t.expectEqual(group == 2, prepared.workspace);
-        for ([_]mlx.mlx_array{ prepared.gate, prepared.up, prepared.down }, 0..) |array, pi| {
-            try t.expect(array.ctx != null);
-            try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(array));
-            const shape = mlx.getShape(array);
-            try t.expectEqual(@as(usize, 3), shape.len);
-            try t.expectEqual(@as(c_int, if (pi == 2) 16 else 32), shape[1]);
-            try t.expectEqual(@as(c_int, if (pi == 2) 32 else 16), shape[2]);
-            const input_dim: c_int = if (pi == 2) 16 else 32;
-            const input_data: [32]u16 = @splat(0x3f80);
-            const input = mlx.mlx_array_new_data(&input_data, &[_]c_int{ 1, 1, input_dim }, 3, .bfloat16);
-            defer _ = mlx.mlx_array_free(input);
-            const first_slot = [_]u32{prepared.remapped[0]};
-            const selected = mlx.mlx_array_new_data(&first_slot, &[_]c_int{1}, 1, .uint32);
-            defer _ = mlx.mlx_array_free(selected);
-            var result = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(result);
-            try mlx.check(mlx.mlx_gather_mm(&result, input, array, .{ .ctx = null }, selected, false, s));
-            try mlx.check(mlx.mlx_array_eval(result));
-            const result_data = mlx.mlx_array_data_bfloat16(result).?;
-            // Summing 16 or 32 identical powers-of-two-scaled BF16 values is exact.
-            const expected = fixture.value(ids[0], pi) + @as(u16, if (pi == 2) 4 else 5) * 128;
-            for (result_data[0..mlx.mlx_array_size(result)]) |v| try t.expectEqual(expected, v);
-            const ci = pi * 3;
-            for (ids, prepared.remapped) |expert, slot| {
-                const bytes = if (prepared.workspace) engine.union_slabs[ci].slotBytes(slot) else engine.cacheSlotBytesAt(3, slot, ci);
-                for (0..512) |i| try t.expectEqual(fixture.value(expert, pi), std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little));
-            }
-        }
-        if (group == 1) try t.expectEqual(@as(u64, 2), engine.fill_experts_total);
-    }
 }
 
 test "expert cache profile: the split spends the uniform bytes, gives the most reused layer more, and caps a layer at its experts" {

@@ -313,6 +313,32 @@ pub fn supportsDflash(model: *Trunk) bool {
     };
 }
 
+/// Whether the loaded arch runs DFlash2 rounds on its own model for this request's sampling; false for an arch with none.
+pub fn nativeDflashEligible(xfm: *const Trunk, sampling: anytype, logprobs_n: u32) bool {
+    switch (xfm.arch) {
+        inline else => |t| return if (comptime @hasDecl(registry.Mod(t).drafter, "nativeEligible")) registry.Mod(t).drafter.nativeEligible(xfm, sampling, logprobs_n) else false,
+    }
+}
+
+/// Takes the native verifier's capacity right after prefill, inside the request's admission bill.
+pub fn reserveNativeDflash(config: anytype, ctx: trunk.ForwardCtx, assistant: anytype, max_tokens: u32, s: mlx.mlx_stream) !void {
+    inline for (comptime std.meta.fieldNames(registry.Tag)) |name| {
+        if (comptime @hasDecl(drafterOf(name), "reserveNative")) return drafterOf(name).reserveNative(config, ctx, assistant, max_tokens, s);
+    }
+    return error.NoNativeDflash;
+}
+
+/// Whether `path`, a drafter folder the engine derived from `model_dir`, is intact. Only an arch that builds such a
+/// folder at load declares `inDirCacheValid`; with none built, none is.
+pub fn inDirCacheValid(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, path: []const u8) bool {
+    inline for (comptime std.meta.fieldNames(registry.Tag)) |name| {
+        if (comptime @hasDecl(drafterOf(name), "inDirCacheValid")) {
+            if (drafterOf(name).inDirCacheValid(io, allocator, model_dir, path)) return true;
+        }
+    }
+    return false;
+}
+
 /// Do the arch's DFlash2 rounds choose their verify rows per round (a verify row costs bytes there)?
 pub fn dflashAdaptiveRows(model: *Trunk) bool {
     return switch (registry.handleOf(model)) {

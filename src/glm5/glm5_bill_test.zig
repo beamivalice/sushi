@@ -199,3 +199,64 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
         }
     }
 }
+
+test "GLM prefill bills the packed selection planes of its history" {
+    const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/glm5_config.json"));
+    const attention = @import("glm5_attention.zig");
+    const short: u64 = 1 << 19;
+    const long: u64 = 1 << 20;
+    // Beyond selection planes, only the growing kv8 latent (544) and pooled index (64) scale with history.
+    const growth = (long - short) * (544 + 64);
+    const planes = try attention.selectionScratchBytes(long) - try attention.selectionScratchBytes(short);
+    try std.testing.expectEqual(growth + planes, bills.prefillTransientReserveAtKv(&cfg, 8, 2048, long) - bills.prefillTransientReserveAtKv(&cfg, 8, 2048, short));
+}
+
+test "GLM DFlash2 reserve at prefill end fits the admission bill at every request shape" {
+    const reserve = @import("glm5_dflash_reserve.zig");
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/glm5_config.json"));
+    cfg.dflash_loaded = true;
+    const mla_layers: usize = cfg.num_hidden_layers / cfg.full_attention_interval;
+    const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
+    const shapes = [_][2]u64{ .{ 16, std.math.maxInt(u32) }, .{ 18, 32 }, .{ 100, 920 }, .{ 1000, 24 }, .{ 1022, 2 }, .{ 2008, 2400 }, .{ 32768, 32768 }, .{ 131072, 4096 }, .{ 2008, std.math.maxInt(u32) }, .{ 500000, std.math.maxInt(u32) } };
+    for ([_]u32{ 1024, 8192, 65536, 1048576 }) |ctx| {
+        cfg.pinned_context = ctx;
+        for ([_]u64{ 16, 8, 6 }) |kv_bits| {
+            const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(kv_bits));
+            for (shapes) |shape| {
+                const seq: usize = @intCast(shape[0]);
+                if (seq >= ctx) continue;
+                const max_tokens: u32 = @intCast(@min(shape[1], ctx - seq));
+                const lc = try reserve.capacity(seq);
+                const pc = try reserve.capacity(seq / 4);
+                const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
+                const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
+                try std.testing.expect(try reserve.statesPeak(mla_layers, p) <= bills.glmDflashReserveBudget(&cfg, seq, max_tokens, kv_bits, held));
+            }
+        }
+    }
+}
+
+test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised context" {
+    const reserve = @import("glm5_dflash_reserve.zig");
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/glm5_config.json"));
+    cfg.dflash_loaded = true;
+    var mla_layers: usize = 0;
+    for (0..cfg.num_hidden_layers) |l| mla_layers += @intFromBool(!cfg.isLinearLayer(@intCast(l)));
+    const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
+    for ([_]struct { bits: u64, ctx: u32 }{ .{ .bits = 8, .ctx = 1048576 }, .{ .bits = 6, .ctx = 1048576 }, .{ .bits = 16, .ctx = 524288 } }) |arm| {
+        cfg.pinned_context = arm.ctx;
+        const latent_row: usize = if (arm.bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(arm.bits));
+        for ([_]usize{ 16, 2008, 100000 }) |seq| {
+            const max_tokens: u32 = @intCast(arm.ctx - seq);
+            const lc = try reserve.capacity(seq);
+            const pc = try reserve.capacity(seq / 4);
+            const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
+            const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
+            const peak = try reserve.statesPeak(mla_layers, p);
+            // The generator's config copy is never pinned: it resolves its own, smaller context.
+            var unpinned = cfg;
+            unpinned.pinned_context = arm.ctx / 4;
+            try std.testing.expect(peak <= bills.glmDflashReserveBudget(&unpinned, seq, max_tokens, arm.bits, held));
+        }
+    }
+}

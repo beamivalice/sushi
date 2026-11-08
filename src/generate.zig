@@ -38,8 +38,6 @@ const ssmSnapshotDeinit = trunk.ssmSnapshotDeinit;
 const ssmRestore = trunk.ssmRestore;
 const SSMCheckpoint = trunk.SSMCheckpoint;
 const captureSsmCheckpoint = trunk.captureSsmCheckpoint;
-const glm5_forward = @import("glm5/glm5_forward.zig");
-const glm5_prefix = @import("glm5/glm5_prefix.zig");
 const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
 const dspark_rows = @import("dspark_rows.zig");
@@ -47,8 +45,6 @@ const arch_dspark = @import("arch/dspark.zig");
 const prefix_arch = @import("arch/prefix.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = trunk.KVCache;
-const glm5_generate = @import("glm5/glm5_generate.zig");
-const glm5_state = @import("glm5/glm5_state.zig");
 const sampler = @import("sampler.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const mtp_plan = @import("mtp_plan.zig");
@@ -422,14 +418,14 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
     return tokensPerSec(uncached, prefill_ns);
 }
 
+/// The assistant window as prefill left it, committed with the prefix.
+pub const SpecWindow = struct { snapshot: trunk.KVCacheSnapshot, base_pos: usize };
+
 /// A prefill checkpoint at absolute `pos`: the slot's SSM entries, the GLM request's KDA state, or DeepSeek's whole request state.
 /// `to_ssd`: a write-through takes the point to the SSD tier before the next forward, so DeepSeek's shares its rows.
-fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *const ForwardCtx, glm: ?*glm5_forward.Request, pos: usize, to_ssd: bool) !SSMCheckpoint {
+fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *const ForwardCtx, glm: ?*arch_state.SlotRequest, pos: usize, to_ssd: bool) !SSMCheckpoint {
     if (try prefix_arch.captureCheckpoint(allocator, xfm, pos, to_ssd)) |cp| return cp;
-    if (glm) |request| {
-        if (request.offset != pos) return error.GlmCachePositionMismatch;
-        return glm5_prefix.captureKda(allocator, request, xfm.s);
-    }
+    if (glm) |request| return prefix_arch.captureRequest(allocator, request, pos, xfm.s);
     return captureSsmCheckpoint(allocator, ctx.ssm_entries.?, pos, xfm.s);
 }
 
@@ -536,14 +532,14 @@ pub const Generator = struct {
     // the trunk's capture_layers hiddens, freed in `deinit`.
     dflash: ?*DflashModel = null,
     dflash_ctx: ?dflash_mod.DflashCtx = null,
-    glm_dflash_native: bool = false,
+    native_dflash: bool = false,
     /// Accepted share of a DFlash2 round's drafts, smoothed; the grouped tick prices draft rows with it.
     glm_draft_rate: f32 = 0.8,
     /// Verbatim-copy rounds (`glmLookupChain`) and the drafts they landed, for `[spec-stats]`.
     glm_lookup: struct { rounds: u64 = 0, landed: u64 = 0 } = .{},
     /// The GLM assistant window as prefill left it, committed with the prefix: every GLM restore
     /// point lies at or below the prompt end, which a window cropped at the reply's end can miss.
-    glm_prefill_window: ?glm5_generate.GlmSpecWindow = null,
+    glm_prefill_window: ?SpecWindow = null,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Whether a DFlash2 round pays against a plain one-row tick for this request, and the plain ticks it ran.
@@ -869,7 +865,7 @@ pub const Generator = struct {
             },
             .dflash => .{
                 .rounds = self.dflash_attempted,
-                .drafted = if (self.glm_dflash_native) self.glm_round.drafted else spec_stats.proposed(self.dflash_drafts_verified, self.dflash_attempted, if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0),
+                .drafted = if (self.native_dflash) self.glm_round.drafted else spec_stats.proposed(self.dflash_drafts_verified, self.dflash_attempted, if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0),
                 .accepted = self.dflash_accepted_tokens,
                 .plain = self.dflash_plain.ticks,
             },
@@ -989,8 +985,8 @@ pub const Generator = struct {
             // GLM's native path keeps its historical line: it has no yield gate and prints the old generic bar.
             var gate_buf: [16]u8 = undefined;
             var serial_buf: [32]u8 = undefined;
-            const gate_txt = std.fmt.bufPrint(&gate_buf, "{d:.2}", .{if (self.glm_dflash_native) 1.80 else dflashBreakEvenAccepted(self.dflashMeanRows())}) catch "";
-            const serial_txt = if (self.glm_dflash_native) "" else std.fmt.bufPrint(&serial_buf, " serial_ms={d:.2}", .{dflashSerialPrice(&self.xfm.round_cost, table_bucket) orelse 0.0}) catch "";
+            const gate_txt = std.fmt.bufPrint(&gate_buf, "{d:.2}", .{if (self.native_dflash) 1.80 else dflashBreakEvenAccepted(self.dflashMeanRows())}) catch "";
+            const serial_txt = if (self.native_dflash) "" else std.fmt.bufPrint(&serial_buf, " serial_ms={d:.2}", .{dflashSerialPrice(&self.xfm.round_cost, table_bucket) orelse 0.0}) catch "";
             log.info(
                 "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={s}{s} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d}\n",
                 .{
@@ -1011,7 +1007,7 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_implausible,
                 },
             );
-            if (self.glm_dflash_native) {
+            if (self.native_dflash) {
                 const rounds: f64 = @floatFromInt(self.dflash_attempted);
                 const r = self.glm_round;
                 const plain_ticks: f64 = @floatFromInt(@max(self.dflash_plain.ticks, 1));
@@ -1293,10 +1289,10 @@ pub const Generator = struct {
         try sampling.think_penalty.prepare(allocator, bias_vocab, xfm.think_marker_mask, xfm.s);
         errdefer sampling.think_penalty.deinitPrepared();
         var options = options_in;
-        const glm_dflash_native = glm5_state.modelOf(xfm) != null and options.dflash_enabled and options.dflash != null and glm5_generate.glmDflashEligible(sampling, options.logprobs_n);
-        if (glm5_state.modelOf(xfm) != null) {
+        const native_dflash = options.dflash_enabled and options.dflash != null and drafter.nativeDflashEligible(xfm, sampling, options.logprobs_n);
+        if (arch_state.runsOwnModel(&xfm.arch_state)) {
             options.mtp_enabled = false;
-            options.dflash_enabled = glm_dflash_native;
+            options.dflash_enabled = native_dflash;
         }
         const s = xfm.s;
         // Per-slot ForwardCtx (Phase 2). Stored by value on the Generator;
@@ -1384,7 +1380,7 @@ pub const Generator = struct {
             ssm_checkpoints.deinit(allocator);
         }
         const has_vision = ctx.vision_embeddings != null;
-        const glm_request = glm5_state.requestOf(&ctx);
+        const glm_request = arch_state.requestOf(&ctx);
         const want_ssm_cp = prefill_plan.shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
             (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null or prefix_arch.restorePointModel(xfm),
@@ -1407,12 +1403,12 @@ pub const Generator = struct {
         const ssm_cp_stride: usize = if (!want_ssm_cp)
             0
         else if (glm_request != null)
-            glm5_generate.glm_checkpoint_stride
+            prefix_arch.requestCheckpointStride()
         else
             prefill_plan.effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, settings_resolve.prefill_chunk.value));
         // Where a checkpoint is captured: GLM chunks on its chunk grid but keeps points only on the wider
         // restore-point grid.
-        const cp_grid: usize = if (glm_request != null and want_ssm_cp) glm5_generate.glm_capture_stride else ssm_cp_stride;
+        const cp_grid: usize = if (glm_request != null and want_ssm_cp) prefix_arch.requestCaptureStride() else ssm_cp_stride;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
         // scheduler after restoring a checkpoint) pass the matched prefix
         // length so the snapshots stamp positions valid in the full original
@@ -1505,7 +1501,7 @@ pub const Generator = struct {
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = if (glm_request != null and want_state_cp)
-                glm5_generate.glmCaptureSchedule(glm5_generate.glm_capture_stride, options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len).backoff
+                prefix_arch.requestCaptureBackoff(options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len)
             else
                 prefill_plan.ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
@@ -1609,7 +1605,7 @@ pub const Generator = struct {
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
                 const end = if (glm_request != null)
-                    glm5_generate.glmChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                    prefix_arch.requestChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                 else
                     prefill_plan.nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
@@ -1760,7 +1756,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and cp_grid > 0 and abs_end_for_cp2 % cp_grid == 0 and glm5_generate.restorableCheckpoint(glm_request, abs_end_for_cp2)) {
+                if (want_ssm_cp and cp_grid > 0 and abs_end_for_cp2 % cp_grid == 0 and prefix_arch.restorableCheckpoint(glm_request, abs_end_for_cp2)) {
                     const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2, options.write_through_hook != null);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -1868,7 +1864,7 @@ pub const Generator = struct {
                 // to be a stride multiple).
                 const already_have = ssm_checkpoints.items.len > 0 and
                     ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos == final_abs;
-                if (!already_have and glm5_generate.restorableCheckpoint(glm_request, final_abs)) {
+                if (!already_have and prefix_arch.restorableCheckpoint(glm_request, final_abs)) {
                     // SSM state is already materialized — the chunked loop
                     // evaluated it at every chunk boundary. The final chunk
                     // may have been a stride-aligned one (already evaluated)
@@ -2107,8 +2103,8 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
             _ = mlx.mlx_array_free(sample_lazy);
 
-            if (glm_dflash_native) try glm5_generate.reserveGlmDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
-            var glm_window: ?glm5_generate.GlmSpecWindow = if (glm_dflash_native and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
+            if (native_dflash) try drafter.reserveNativeDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
+            var glm_window: ?SpecWindow = if (native_dflash and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
             errdefer if (glm_window) |*w| w.snapshot.deinit();
             const mtp_cost_profile: mtp_mod.MtpCostProfile = if (mtp_active)
                 options.mtp.?.costProfile(xfm, ctx.cache.config)
@@ -2151,7 +2147,7 @@ pub const Generator = struct {
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
-                .glm_dflash_native = glm_dflash_native,
+                .native_dflash = native_dflash,
                 .glm_prefill_window = glm_window,
                 .dflash_block_size = dflash_bs,
                 .mtp = if (mtp_active) options.mtp else null,
@@ -2867,7 +2863,7 @@ pub const Generator = struct {
 
     /// The absolute position the request's state stands at: GLM's request offset, else the model's position counter.
     fn thoughtStatePos(self: *const Generator) usize {
-        if (glm5_state.requestOf(&self.ctx)) |request| return request.offset;
+        if (arch_state.requestOf(&self.ctx)) |request| return request.offset;
         return self.ctx.moe_seq_offset.*;
     }
 
@@ -2908,7 +2904,7 @@ pub const Generator = struct {
             log.debug("[prefix] no thought restore point: the state stands at {d}, not {d}\n", .{ pos, tp.at });
             return;
         }
-        var cp = capturePrefillCheckpoint(a, self.xfm, &self.ctx, glm5_state.requestOf(&self.ctx), pos, false) catch |err| {
+        var cp = capturePrefillCheckpoint(a, self.xfm, &self.ctx, arch_state.requestOf(&self.ctx), pos, false) catch |err| {
             log.warn("[prefix] thought restore point at {d} not taken: {s}\n", .{ pos, @errorName(err) });
             return;
         };
@@ -3003,19 +2999,6 @@ pub const Generator = struct {
         /// Number of *drafted* tokens accepted (excludes always-accepted t1).
         accepted_tokens: u32,
     };
-
-    pub const glmLookupChain = glm5_generate.glmLookupChain;
-    pub const glmPenalty = glm5_generate.glmPenalty;
-    pub const glmPlainProposal = glm5_generate.glmPlainProposal;
-    pub const glmPropose = glm5_generate.glmPropose;
-    pub const glmProposeRound = glm5_generate.glmProposeRound;
-    pub const glmRoundEnd = glm5_generate.glmRoundEnd;
-    pub const glmRoundReady = glm5_generate.glmRoundReady;
-    pub const glmRowCommit = glm5_generate.glmRowCommit;
-    pub const glm_lookup_drafts = glm5_generate.glm_lookup_drafts;
-    pub const nextGlmDflash = glm5_generate.nextGlmDflash;
-    pub const sampleGlmNode = glm5_generate.sampleGlmNode;
-    pub const sampledGlmDecisions = glm5_generate.sampledGlmDecisions;
 
     pub const dsparkEmitPending = arch_dspark.dsparkEmitPending;
     pub const dsparkResumeAfterForced = arch_dspark.dsparkResumeAfterForced;
@@ -4554,7 +4537,7 @@ test "specTotals: a DFlash2 request reports the ticks it ran without a draft as 
     g.dspark = false;
     g.mtp = null;
     g.dflash = &model;
-    g.glm_dflash_native = true;
+    g.native_dflash = true;
     g.dflash_attempted = 6;
     g.dflash_accepted_tokens = 9;
     g.glm_round = .{ .drafted = 24 };

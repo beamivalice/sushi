@@ -39,7 +39,7 @@ const cullDecoding = scheduler_mod.cullDecoding;
 const cullDecodingWith = scheduler_mod.cullDecodingWith;
 const expectError = scheduler_mod.expectError;
 const expectOutcomes = scheduler_mod.expectOutcomes;
-const glmStreamedDrafterOff = model_load.glmStreamedDrafterOff;
+const glmStreamedDrafterOff = @import("../arch/load.zig").drafterOff;
 const postPrefillTerminal = scheduler_mod.postPrefillTerminal;
 const publishSpeculativeBlock = scheduler_mod.publishSpeculativeBlock;
 const recordSlotCleanup = slot_outcome.recordSlotCleanup;
@@ -186,7 +186,7 @@ pub fn glmTreeNodes(slots: usize, rate: f32, cost: GlmRowCost) usize {
 /// with the assistant's taps (`Generator.glmRowCommit`).
 pub fn slotGlmRowable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
-    if (!gen.glm_dflash_native or gen.dflash_ctx == null or gen.done) return false;
+    if (!gen.native_dflash or gen.dflash_ctx == null or gen.done) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
     const t = arch_handle.trunk(slot.model.handle orelse return false);
     return glm5_state.supportsBatchedRows(t);
@@ -213,7 +213,7 @@ pub fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Trunk
     var proposal: @import("glm5_dflash.zig").Proposal = undefined;
     for (batch.*, 0..) |slot, i| {
         const gen = &slot.legacy_gen.?;
-        if (!gen.glm_dflash_native or gen.dflash_ctx == null) continue;
+        if (!gen.native_dflash or gen.dflash_ctx == null) continue;
         if (tree_at) |best| if (batch.*[best].legacy_gen.?.glm_draft_rate >= gen.glm_draft_rate) continue;
         tree_at = i;
     }
@@ -225,7 +225,7 @@ pub fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Trunk
             break :tree;
         }
         gen.dflash.?.s = xfm.s;
-        proposal = try gen.glmPropose(nodes);
+        proposal = try glm5_generate.glmPropose(gen, nodes);
     }
     const draft_ns = timer.read();
     timer.reset();
@@ -234,11 +234,11 @@ pub fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Trunk
     var taps: []const u32 = &.{};
     for (batch.*, 0..) |slot, i| {
         const gen = &slot.legacy_gen.?;
-        if (gen.glm_dflash_native) taps = gen.dflash.?.config.target_layer_ids;
+        if (gen.native_dflash) taps = gen.dflash.?.config.target_layer_ids;
         const request = glm5_state.requestOf(&gen.ctx) orelse return error.GlmRequestMissing;
         // Plain rows take the policy when their slot samples them (`thinkShifted`).
         groups[i] = if (tree_at == i)
-            .{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = gen.glmPenalty() }
+            .{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = glm5_generate.glmPenalty(gen) }
         else
             .{ .request = request, .tokens = tokens[i .. i + 1], .parents = &.{-1} };
     }
@@ -271,12 +271,12 @@ const GlmRows = struct {
     }
 
     fn commitRow(_: *GlmRows, slot: *Slot, v: *const verifier.Verified) !mlx.mlx_array {
-        return slot.legacy_gen.?.glmRowCommit(v);
+        return glm5_generate.glmRowCommit(&slot.legacy_gen.?, v);
     }
 
     fn endTree(self: *GlmRows, slot: *Slot, v: *verifier.Verified) void {
         const gen = &slot.legacy_gen.?;
-        const result = gen.glmRoundEnd(slot.allocator, self.proposal, v, self.draft_ns, self.verify_ns, false) catch |err| {
+        const result = glm5_generate.glmRoundEnd(gen, slot.allocator, self.proposal, v, self.draft_ns, self.verify_ns, false) catch |err| {
             slot.markError(@errorName(err));
             return;
         };

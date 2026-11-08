@@ -4395,7 +4395,7 @@ fn settleThoughtPoint(slot: *Slot, gen: *Generator) void {
     defer slot.allocator.free(first);
     const tail = tok.decode(slot.allocator, generated[end - 2 .. end]) catch return gen.dropThoughtPoint();
     defer slot.allocator.free(tail);
-    const style: mtp_plan.CloserStyle = if (gen.glm_dflash_native) .bare_closer else .newline_before_closer;
+    const style: mtp_plan.CloserStyle = if (gen.native_dflash) .bare_closer else .newline_before_closer;
     if (!mtp_plan.thoughtEdgesSurvive(style, first, tail)) {
         log.info("[prefix] no thought restore point: the template re-renders the thought's edges\n", .{});
         gen.dropThoughtPoint();

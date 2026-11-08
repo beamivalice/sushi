@@ -18,6 +18,7 @@ const pc = @import("../prefix_cache.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const ssm_cache = @import("../ssm_cache.zig");
 const trunk = @import("../trunk.zig");
+const arch_state = @import("arch_state.zig");
 
 const Tag = registry.Tag;
 const tags = std.enums.values(Tag);
@@ -284,6 +285,46 @@ pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const model.Model
     switch (tag) {
         inline else => |t| if (comptime @hasDecl(P(t), "setDiskGrownSpec")) try P(t).setDiskGrownSpec(allocator, config, tier),
     }
+}
+
+// The hooks below serve the arch whose slots keep a request beside the KV (`arch_state.SlotRequest`); every call
+// sits behind a non-null request, so a build with no such arch never reaches one.
+fn requestHook(comptime name: []const u8, comptime R: type, args: anytype) R {
+    inline for (tags) |t| {
+        if (comptime @hasDecl(P(t), name)) return @call(.auto, @field(P(t), name), args);
+    }
+    @panic("no arch keeps a slot request");
+}
+
+/// A prefill checkpoint of the request at absolute `pos`.
+pub fn captureRequest(allocator: std.mem.Allocator, request: *arch_state.SlotRequest, pos: usize, s: mlx.mlx_stream) !trunk.SSMCheckpoint {
+    return requestHook("captureRequest", anyerror!trunk.SSMCheckpoint, .{ allocator, request, pos, s });
+}
+
+/// Whether a checkpoint may be kept at `pos`: any position without a request, the arch's own boundaries with one.
+pub fn restorableCheckpoint(request: ?*arch_state.SlotRequest, pos: usize) bool {
+    if (request == null) return true;
+    return requestHook("restorableAt", bool, .{pos});
+}
+
+/// The absolute-position grid a request's prefill chunks on.
+pub fn requestCheckpointStride() usize {
+    return requestHook("requestCheckpointStride", usize, .{});
+}
+
+/// The grid its checkpoints are kept on.
+pub fn requestCaptureStride() usize {
+    return requestHook("requestCaptureStride", usize, .{});
+}
+
+/// Tail tokens the chunk loop holds back for the final checkpoint, for a prompt of `prompt_len` starting at `offset`.
+pub fn requestCaptureBackoff(cap: u32, offset: usize, prompt_len: usize) usize {
+    return requestHook("requestCaptureBackoff", usize, .{ cap, offset, prompt_len });
+}
+
+/// The end of the next prefill chunk, which lands on every grid point.
+pub fn requestChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: usize, offset: usize, adaptive_width: bool) usize {
+    return requestHook("requestChunkEnd", usize, .{ pos, prefix_len, default_chunk, grid, offset, adaptive_width });
 }
 
 /// The stored-state layout the SSD namespace is keyed by, when the loaded arch names more than the config's own tag.

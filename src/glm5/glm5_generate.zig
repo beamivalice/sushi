@@ -112,7 +112,7 @@ pub fn glmDflashEligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool
 /// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
 /// agrees back `mtp_lookup.STRONG_SUFFIX` tokens and the budget holds the whole chain.
 pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@import("glm5_dflash.zig").Proposal {
-    const drafts = Generator.glm_lookup_drafts;
+    const drafts = glm_lookup_drafts;
     const m = got orelse return null;
     if (m.suffix < mtp_lookup.STRONG_SUFFIX or m.draft.len < drafts or budget <= drafts) return null;
     var chain = @import("glm5_dflash.zig").Proposal{ .count = drafts + 1 };
@@ -127,7 +127,7 @@ pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@im
 
 /// Takes the verifier's MLA capacity right after prefill, inside the request's admission bill: no
 /// round grows a buffer, and a later admission already sees the capacity as live memory.
-pub const GlmSpecWindow = struct { snapshot: trunk_mod.KVCacheSnapshot, base_pos: usize };
+pub const GlmSpecWindow = generate.SpecWindow;
 
 pub fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assistant: *const dflash_mod.DflashCtx, max_tokens: u32, s: mlx.mlx_stream) !void {
     const request = glm5_state.requestOf(&ctx) orelse return error.GlmRequestMissing;
@@ -195,7 +195,7 @@ pub fn sampledGlmDecisions(raw: *anyopaque, verified: *@import("glm5_dflash_mode
 pub fn glmRowCommit(self: *Generator, verified: *const @import("glm5_dflash_model.zig").Verified) !mlx.mlx_array {
     const request = glm5_state.requestOf(&self.ctx) orelse return error.GlmRequestMissing;
     const s = self.xfm.s;
-    if (self.glm_dflash_native) {
+    if (self.native_dflash) {
         var verification = try verified.prepareCommitConsuming(request, 1, self.eos_token_ids, s);
         defer verification.deinit();
         _ = @import("glm5_dflash.zig").commitVerified(self.dflash.?, &self.dflash_ctx.?, request, &verification, 1, self.eos_token_ids) catch |err| {
@@ -211,28 +211,28 @@ pub fn glmRowCommit(self: *Generator, verified: *const @import("glm5_dflash_mode
 }
 
 pub fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-    if (!try self.glmRoundReady()) return null;
+    if (!try glmRoundReady(self)) return null;
     const schedule = @import("glm5_dflash_model.zig").bindDefaultSchedule();
     defer schedule.restore();
     var timer = io_util.Stopwatch.init(self.timer.io);
     const tick = io_util.Stopwatch.init(self.timer.io);
     const action = self.glm_gate.next();
-    const lookup = if (self.glm_gate.probing()) null else try self.glmLookupChain(allocator);
+    const lookup = if (self.glm_gate.probing()) null else try glmLookupChain(self, allocator);
     const proposal = lookup orelse switch (action) {
-        .round => try self.glmProposeRound(),
-        .plain => self.glmPlainProposal(),
+        .round => try glmProposeRound(self),
+        .plain => glmPlainProposal(self),
     };
     const draft_ns = timer.read();
     timer.reset();
     const request = glm5_state.requestOf(&self.ctx).?;
     // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
-    const group = @import("glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = self.glmPenalty() };
+    const group = @import("glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = glmPenalty(self) };
     var verified: [1]@import("glm5_dflash_model.zig").Verified = undefined;
     try @import("glm5_dflash_model.zig").verifyGroups(glm5_state.modelOf(self.xfm).?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
     const layerwise = &verified[0];
     defer layerwise.deinit();
     const verify_ns = timer.read();
-    const result = try self.glmRoundEnd(allocator, &proposal, layerwise, draft_ns, verify_ns, lookup != null);
+    const result = try glmRoundEnd(self, allocator, &proposal, layerwise, draft_ns, verify_ns, lookup != null);
     const wall_ms = @as(f64, @floatFromInt(tick.read())) / @as(f64, std.time.ns_per_ms);
     const emitted: u32 = @intCast(result.tokens.len);
     if (lookup != null) {
@@ -525,7 +525,7 @@ pub fn glmCaptureOracle(chunk_grid: usize, grid: usize, cap: u32, offset: usize,
 test "--no-mtp-lookup: a GLM DFlash2 lookup chain is declined too" {
     var g: Generator = undefined;
     g.opts = .{ .lookup_disabled = true };
-    try testing.expect((try g.glmLookupChain(testing.allocator)) == null);
+    try testing.expect((try glmLookupChain(&g, testing.allocator)) == null);
 }
 
 test "a GLM lookup chain needs a long verbatim match and the budget for all four rows" {

@@ -3324,9 +3324,6 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(io, "pack", .default_dir);
-    var pack = try tmp.dir.openDir(io, "pack", .{});
-    defer pack.close(io);
-    try @import("glm5/glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
 
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);
@@ -3343,9 +3340,6 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     const want = try std.fs.path.join(a, &.{ tmp_buf[0..tmp_len], "pack" });
     defer a.free(want);
     try std.testing.expectEqualStrings(want, abs);
-    const expert_quant = @import("expert_quant.zig");
-    try std.testing.expect(expert_quant.layoutOfDirWithFirstMoe(a, io, "glm5_next", rel_pack, 4, 3) == null);
-    try std.testing.expectEqual(expert_quant.Layout.fp8_individual, expert_quant.layoutOfDirWithFirstMoe(a, io, "glm5_next", abs, 4, 3).?);
 
     try std.testing.expect(resolveRelativeDir(a, io, want) == null);
     try std.testing.expect(resolveRelativeDir(a, io, "qwen3.8-flash-next") == null);
