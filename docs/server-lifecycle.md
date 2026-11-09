@@ -178,6 +178,14 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `/v1/load-model` (the app's path) on a 128 GB Mac at default flags.
 - **A reload FREES the CPU state `unloadResident` retains** while the entry is `.loading` (`releaseRetainedCpuState`):
   a reader holding no refcount takes the mutex AND skips them while `.loading`.
+- **An eviction turns the entry `.unloaded` in ONE place, `finalizeEvictionLocked`, under the mutex, after the cache clear
+  and the unwire wait.** `unloadResident` frees without the mutex and leaves `state` alone: an `.unloaded` set before the
+  wait let a request claim the load, and the finalize then overwrote its `.loading` — a second claim loaded the model again
+  (44 GB leaked, the retained tokenizer freed under a live request: SIGSEGV). Guard: `an entry being unloaded cannot be
+  claimed for a load until its eviction is finalized` (model_registry.zig), `tests/test_cold_load.sh` boot 3.
+- **`loaded:false` in `/v1/models` is not "freed"**: the row turns false at `.evicting`, while the free, the MLX cache clear
+  and the unwire wait still run on the inference thread (RSS reads GBs high until then). A script that samples memory
+  after an unload waits for state `unloaded`.
 - **A cold load pins its model at the claim** (`tryBeginLoadLocked` takes the requester's reference), so the entry cannot be another load's eviction victim between `markReady` and the requester waking; an unload that wins that window is a 503 (`NotLoaded`). A failed load drops the MLX error it latched (`failLoadRequest`), or the next request fails on it.
 
 <a id="settings"></a>

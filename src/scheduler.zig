@@ -1457,6 +1457,7 @@ pub const Scheduler = struct {
                 const entry = entry_ptr.*;
                 if (entry.state == .ready or entry.state == .evicting) {
                     entry.unloadResident();
+                    self.registry.finalizeEvictionLocked(entry);
                 }
             }
         }

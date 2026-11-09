@@ -23,6 +23,7 @@ set -u
 PACK=$(sushi_pack qwen4) || exit $?
 STREAM_MODEL=$(sushi_pack qwen4-bf16 2> /dev/null) || STREAM_MODEL=""
 RSS_GROWTH_LIMIT_MB="${IDLE_EVICT_RSS_LIMIT_MB:-40}"
+ACTIVE_LIMIT_MB=1024
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0
@@ -74,6 +75,9 @@ print(next((m['id'] for m in json.load(sys.stdin)['data'] if want.endswith('/' +
 default_id() { models | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])"; }
 loaded_ids() { models | python3 -c "import sys,json; print(' '.join(sorted(m['id'] for m in json.load(sys.stdin)['data'] if m.get('loaded'))))"; }
 resident_count() { models | grep -o '"loaded":true' | wc -l | tr -d ' '; }
+# "loaded" turns false when the sweep marks the entry evicting; the memory is freed after that, on the inference
+# thread. Only the "unloaded" state means the free and the MLX cache clear are done.
+in_flight_count() { models | grep -o -E '"state":"(ready|loading|evicting)"' | wc -l | tr -d ' '; }
 props_mtp() { # <clone path> <source|default_on>
     curl -s "$SUSHI_URL/props?model=$(model_id "$1")" | python3 -c "import sys, json; print(json.load(sys.stdin)['settings']['mtp'][sys.argv[1]])" "$2"
 }
@@ -81,6 +85,7 @@ chat() { # model id -> http code
     curl -s -o /dev/null -w '%{http_code}' -m 900 -X POST "$SUSHI_URL/v1/chat/completions" -H 'Content-Type: application/json' \
         -d "{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"max_tokens\":4}"
 }
+active_mb() { curl -s "$SUSHI_URL/props" | python3 -c "import sys, json; print(json.load(sys.stdin)['memory']['active_bytes'] // 1048576)"; }
 server_rss_mb() { ps -o rss= -p "$SUSHI_PID" | awk '{printf "%d", $1/1024}'; }
 logline() { grep -q -- "$1" "$SUSHI_LOG" && echo 1 || echo 0; }
 
@@ -195,7 +200,7 @@ echo "== boot 3: --idle-evict-secs 2"
 # 2 s window: the sweep floors at 1 s, so eviction lands ~3 s after the last request.
 sushi_boot cold-3 "$A" --model-dir "$ROOT" --no-drafter --no-mtp --idle-evict-secs 2 || exit $?
 A_ID=$(model_id "$A")
-wait_unloaded() { local i; for i in $(seq 1 40); do [ "$(resident_count)" = 0 ] && return 0; sleep 0.5; done; return 1; }
+wait_unloaded() { local i; for i in $(seq 1 40); do [ "$(in_flight_count)" = 0 ] && return 0; sleep 0.5; done; return 1; }
 echo "  cycle 1: load, go idle, evict"
 check "a chat answers (200)" "$(is "$(chat "$A_ID")" 200)"
 check "the model is resident after a request" "$(is "$(resident_count)" 1)"
@@ -222,23 +227,31 @@ for _ in $(seq 1 40); do
 done
 check "polling /props did not pin the model for 20 s against a 2 s window" "$(is "$POLLED_OUT" 0)"
 # Each reload runs beside unrefcounted readers of the retained CPU state (/v1/models, the pre-load text-gen gate).
-BASE_RSS=""
-for i in 2 3; do
+# Cycles 2-3 reload under three concurrent chats and warm the heap; cycles 4-6 reload under one chat, a like-for-like
+# load each time, and the RSS they read must not climb.
+BASE_RSS=""; MAX_ACTIVE=0; CYCLES_DONE=0
+for i in 2 3 4 5 6; do
+    CHATS=1; [ "$i" -le 3 ] && CHATS=3
     PIDS=()
-    for _ in 1 2 3; do ( chat "$A_ID" > /dev/null ) & PIDS+=($!); done
+    for _ in $(seq 1 "$CHATS"); do ( [ "$(chat "$A_ID")" = 200 ] ) & PIDS+=($!); done
     for _ in 1 2 3 4 5 6; do ( curl -fs "$SUSHI_URL/v1/models" > /dev/null ) & PIDS+=($!); done
     OK=1
     for p in "${PIDS[@]}"; do wait "$p" || OK=0; done
-    check "cycle $i: every concurrent request succeeded" "$OK"
+    check "cycle $i: every request succeeded" "$OK"
     check "cycle $i: the server is alive" "$(curl -fs "$SUSHI_URL/health" > /dev/null && echo 1 || echo 0)"
     wait_unloaded || { check "cycle $i: went idle again" 0; break; }
-    # Cycle 2 is the warm baseline: the first concurrent cycle pays a one-time warm-up worth hundreds of MB.
-    [ -n "$BASE_RSS" ] || BASE_RSS=$(server_rss_mb)
-    echo "    cycle $i ok, RSS $(server_rss_mb) MB"
+    [ "$i" = 4 ] && BASE_RSS=$(server_rss_mb)
+    ACTIVE=$(active_mb 2> /dev/null); ACTIVE=${ACTIVE:-0}; [ "$ACTIVE" -le "$MAX_ACTIVE" ] || MAX_ACTIVE=$ACTIVE
+    CYCLES_DONE=$((CYCLES_DONE + 1))
+    echo "    cycle $i ok, RSS $(server_rss_mb) MB, MLX active $ACTIVE MB"
 done
+# One eviction, one load per request burst: a second claim of the entry loads the model again and leaks the first copy.
+LOADS=$(grep -c '^\[registry\] model id=.* ready (' "$SUSHI_LOG")
+check "the polling reload and each of the $CYCLES_DONE cycles loaded the model once (got $LOADS loads)" "$(is "$LOADS" $((CYCLES_DONE + 1)))"
+check "MLX held at most ${MAX_ACTIVE} MB with nothing resident (limit ${ACTIVE_LIMIT_MB})" "$([ "$MAX_ACTIVE" -le "$ACTIVE_LIMIT_MB" ] && echo 1 || echo 0)"
 if [ -n "$BASE_RSS" ]; then
     GROWTH=$(($(server_rss_mb) - BASE_RSS))
-    check "RSS with nothing resident grew +${GROWTH} MB across the last cycle (limit ${RSS_GROWTH_LIMIT_MB}): a reload frees what it replaces" "$([ "$GROWTH" -le "$RSS_GROWTH_LIMIT_MB" ] && echo 1 || echo 0)"
+    check "RSS with nothing resident grew +${GROWTH} MB over two like-for-like reloads (limit ${RSS_GROWTH_LIMIT_MB}): a reload frees what it replaces" "$([ "$GROWTH" -le "$RSS_GROWTH_LIMIT_MB" ] && echo 1 || echo 0)"
 fi
 sushi_stop 0
 

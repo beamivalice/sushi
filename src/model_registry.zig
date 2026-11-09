@@ -471,9 +471,10 @@ pub const LoadedModel = struct {
     /// Free only the mlx-allocating state (weights/transformer/vision/
     /// drafter/prefix_cache), leaving CPU-only fields (config/tokenizer/
     /// chat_config) AND the discovery stub (id/path/bytes_on_disk) intact.
-    /// Used by eviction so the registry keeps the entry around as
-    /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
-    /// mlx frees happen on the inference thread.
+    /// Used by eviction so the registry keeps the entry around for later
+    /// listing/reload, AND by `Scheduler.deinit` so mlx frees happen on the
+    /// inference thread. It leaves `state` alone: the entry turns `.unloaded`
+    /// only in `finalizeEvictionLocked`, under the mutex, once the memory is back.
     pub fn unloadResident(self: *LoadedModel) void {
         if (self.mtp) |h| {
             // Only MiMo's heads are a separately allocated object; an
@@ -519,7 +520,6 @@ pub const LoadedModel = struct {
         // re-pins from then-current memory. `pinned_context` stays — clients
         // budget against it for the whole session.
         if (self.config) |c| c.pinned_prefill_chunk = 0;
-        self.state = .unloaded;
     }
 };
 
@@ -1838,6 +1838,23 @@ test "unloadResident resets the prefill-chunk pin but never the context pin" {
     lm.unloadResident();
     try testing.expectEqual(@as(u32, 0), cfg.pinned_prefill_chunk);
     try testing.expectEqual(@as(u32, 8192), cfg.pinned_context);
+}
+
+test "an entry being unloaded cannot be claimed for a load until its eviction is finalized" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const lm = try makeReadyStub(reg, "foo", 1024);
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    reg.markEvictingLocked(lm);
+
+    // The inference thread frees the arrays without the registry mutex, then waits for the memory to unwire.
+    // A request that claims the entry in that gap loses its claim to the finalize below.
+    lm.unloadResident();
+    try testing.expect(!reg.tryBeginLoadLocked(lm));
+
+    reg.finalizeEvictionLocked(lm);
+    try testing.expect(reg.tryBeginLoadLocked(lm));
 }
 
 test "ModelRegistry: default routing on empty / sushi" {
