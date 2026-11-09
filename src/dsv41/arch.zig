@@ -47,6 +47,7 @@ pub const config_facts: arch_config.Facts = .{
     .prefill_start_width = config_file.prefill_width,
     .expert_pool_bytes = config_file.dsv41_pool_bytes,
     .streams_experts = true,
+    .renders_own_chat_template = true,
     .expert_source = .mxfp4_w123,
     .state_beside_kv = true,
     .no_mtp_head = true,

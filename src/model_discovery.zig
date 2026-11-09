@@ -810,7 +810,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
     // An arch that wires no video serves images only.
     meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0 and factsOf(mt).serves_video;
-    meta.has_chat = has_chat_template;
+    meta.has_chat = has_chat_template or factsOf(mt).renders_own_chat_template;
     return meta;
 }
 
@@ -1609,4 +1609,15 @@ test "a stub states what its arch wires: the dense prefix from moe_layer_freq, t
         try testing.expectEqual(@as(u16, 0), factsOf("qwen4_exp").stub_first_moe);
     }
     try testing.expectEqual(@as(u16, 0), factsOf("not_an_arch").stub_first_moe);
+}
+
+test "parseStubMeta: an arch that renders its own chat template is chat-capable without a template file" {
+    const dsv = parseStubMeta(testing.allocator,
+        \\{"model_type":"deepseek_v41", "num_hidden_layers":4, "hidden_size":384, "vision_config":{}}
+    , false);
+    try testing.expect(dsv.found and dsv.has_chat);
+    const qwen = parseStubMeta(testing.allocator,
+        \\{"model_type":"qwen4_exp", "num_hidden_layers":4, "hidden_size":384}
+    , false);
+    try testing.expect(qwen.found and !qwen.has_chat);
 }

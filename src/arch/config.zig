@@ -31,6 +31,8 @@ pub const Facts = struct {
     dense_prefix_in_layer_freq: bool = false,
     /// Video input is wired.
     serves_video: bool = true,
+    /// It renders its own chat template, so a pack with no template file still chats.
+    renders_own_chat_template: bool = false,
     /// The residual is a set of hyper-connection streams: the layers carry no norms (the stream read normalizes),
     /// each loads its hyper-connection weights and the PLE, and the trunk keeps a weight-less RMS norm's ones.
     hyper_connected: bool = false,
