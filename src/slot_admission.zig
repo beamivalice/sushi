@@ -528,8 +528,7 @@ test "a staggered admission waits for the growth an earlier request was admitted
     a.model = &model;
     a.full_prompt = &.{};
     a.max_tokens = 1;
-    a.cache.config = .dense;
-    a.cache.entries = &.{};
+    a.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     a.request = null;
     a.vision_embeddings = null;
     a.enable_mtp = false;

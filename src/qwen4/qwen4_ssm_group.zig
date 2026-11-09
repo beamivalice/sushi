@@ -9,6 +9,7 @@ const ModelConfig = model_mod.ModelConfig;
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
 const test_support = @import("../test_support.zig");
+const testTrunk = test_support.testTrunk;
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const ForwardCtx = trunk_mod.ForwardCtx;
 const KVCache = trunk_mod.KVCache;
@@ -917,7 +918,7 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
     }
     defer for (&slots) |*sl| sl.deinit(alloc);
     var ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.arch_state.qwen4.ssm_group = .{ .allocator = alloc };

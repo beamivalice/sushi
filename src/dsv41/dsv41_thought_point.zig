@@ -1,4 +1,5 @@
 const std = @import("std");
+const testTrunk = @import("../test_support.zig").testTrunk;
 const arch_handle = @import("../arch/handle.zig");
 const sched_policy = @import("../sched_policy.zig");
 const dsv41_state = @import("dsv41_state.zig");
@@ -264,10 +265,8 @@ test "a cancelled DeepSeek slot commits when it is culled and not again at the c
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var sch: Scheduler = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
-    var xfm: Trunk = undefined;
-    xfm.arch_state = .{};
+    var xfm = testTrunk("deepseek_v41");
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
-    xfm.config = .{ .model_type = "deepseek_v41" };
     var slot: Slot = undefined;
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
     defer sch.decoding.deinit(testing.allocator);
@@ -294,10 +293,8 @@ test "a finished DeepSeek slot is not committed again by the cull" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var sch: Scheduler = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
-    var xfm: Trunk = undefined;
-    xfm.arch_state = .{};
+    var xfm = testTrunk("deepseek_v41");
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
-    xfm.config = .{ .model_type = "deepseek_v41" };
     var slot: Slot = undefined;
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
     defer sch.decoding.deinit(testing.allocator);
@@ -348,9 +345,8 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     defer m.deinit();
     _ = mlx.mlx_array_free(try dsv41_model.extend(m, ids[0..40], .last));
 
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("deepseek_v41");
     xfm.arch_state.dsv41.model = m;
-    xfm.config = .{ .model_type = "deepseek_v41" };
     var model: model_registry_mod.LoadedModel = undefined;
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(a, 2);
     defer model.prefix_cache.?.deinit();

@@ -30,8 +30,10 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - An assertion that a model must think, answer or call a tool. Assert the invariant, branch on the model's choice.
 - A second copy of a check another test already makes on the same input with as strong an assertion.
 - A read of a field the test never set. A `= undefined` struct is garbage in ReleaseFast, and a field write into its
-  nested config (`xfm.config.model_type = ...`) leaves `config.arch.tag`, which the arch dispatch reads, garbage too:
-  assign the whole `config = .{ ... }`, then set what the test needs.
+  nested config (`xfm.config.model_type = ...`) leaves `config.arch.tag`, which the arch dispatch reads, garbage too.
+  A hand-built Trunk comes from `test_support.testTrunk(model_type)` (config and arch state defined), and the
+  `undefined-nested-write` lint rule ([Lint](#lint)) refuses a nested write into an undefined local with no whole
+  assignment first.
 
 ## Tiers
 
@@ -126,6 +128,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `rules` in `main.zig`. It flags a pattern we never want; `const-write` is the first
   ([engine-mlx-gotchas](engine-mlx-gotchas.md#zig)); `unused-import` flags a non-`pub` file-scope `const` that only
   renames (`@import`, `a.b.C`, `x`) and that no identifier token of the file names again.
+  `undefined-nested-write` flags, in a test block, `v.a.b = ...` on a `var v: T = undefined` before `v.a = ...`, `v = ...`
+  or a `v.method()` call; its allowlist key is the test name with every non-alphanumeric character as `_`.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its

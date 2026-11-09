@@ -149,6 +149,15 @@ pub const Exl3MoeHarness = struct {
     }
 };
 
+/// A hand-built Trunk with its config and arch state defined, which every arch dispatch reads; every other field is
+/// undefined, so a test sets what its code path reads. `arch_handle.fixtureHandle` stamps the arch.
+pub fn testTrunk(model_type: []const u8) Trunk {
+    var xfm: Trunk = undefined;
+    xfm.config = .{ .model_type = model_type };
+    xfm.arch_state = .{};
+    return xfm;
+}
+
 pub fn testKVWide(seq_len: usize, head_dim: c_int, s: mlx.mlx_stream) mlx.mlx_array {
     const sl: c_int = @intCast(seq_len);
     const shape = [_]c_int{ 1, 2, sl, head_dim };

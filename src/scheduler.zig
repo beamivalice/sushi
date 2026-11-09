@@ -32,6 +32,7 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
+const testTrunk = @import("test_support.zig").testTrunk;
 const arch_handle = @import("arch/handle.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const sched_policy = @import("sched_policy.zig");
@@ -5497,9 +5498,8 @@ test "a slot the batched tick hands back to the serial path counts its pending p
             _ = try slot.legacy_gen.?.checkStop();
         }
     };
-    var xfm: Trunk = undefined;
-    xfm.config = .{ .model_type = "qwen4_exp", .full_attention_interval = 4 };
-    xfm.arch_state = .{};
+    var xfm = testTrunk("qwen4_exp");
+    xfm.config.full_attention_interval = 4;
     xfm.moe_layers = &.{};
     var gen: Generator = undefined;
     gen.generated_ids = .empty;

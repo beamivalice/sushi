@@ -12,6 +12,7 @@ const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const testing = std.testing;
 const test_support = @import("../test_support.zig");
+const testTrunk = test_support.testTrunk;
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const qkvExpectBitsEqual = test_support.qkvExpectBitsEqual;
 const testReadF32 = test_support.testReadF32;
@@ -1821,7 +1822,7 @@ test "hc prefill: incompatible read writes immediately" {
 test "hc write compilation preserves the serial pending-write rounding" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
     xfm.config.hc_count = 4;
     xfm.config.hidden_size = 2560;

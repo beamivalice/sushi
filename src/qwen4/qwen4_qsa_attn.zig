@@ -23,6 +23,7 @@ const io_util_mod = @import("../io_util.zig");
 const diagEnvOn = io_util_mod.diagEnvOn;
 const testing = std.testing;
 const test_support = @import("../test_support.zig");
+const testTrunk = test_support.testTrunk;
 const attn256MaxAbs = test_support.attn256MaxAbs;
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
@@ -41,7 +42,6 @@ const QsaAttnCfgKey = trunk_mod.QsaAttnCfgKey;
 const QsaBlockFixture = qwen4_qsa_gather.QsaBlockFixture;
 const SSMCacheEntry = trunk_mod.SSMCacheEntry;
 const ShapeKey = trunk_mod.ShapeKey;
-const Trunk = trunk_mod.Trunk;
 const bf16Scalar = trunk_mod.bf16Scalar;
 const gatherQsa256 = qwen4_qsa_gather.gatherQsa256;
 const maxAbsDiffF32 = trunk_helpers_test.maxAbsDiffF32;
@@ -2881,7 +2881,7 @@ test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95
 test "qsa score fused: unsupported indexer geometry falls back to the composed chain" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
     xfm.allocator = testing.allocator;
     xfm.arch_state.qwen4.qsa_score_bank_builds = 0;

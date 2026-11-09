@@ -31,6 +31,7 @@ const qsaWidthBucket = qwen4_qsa_attn.qsaWidthBucket;
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const qsaProbeBitEqual = qwen4_qsa_gather.qsaProbeBitEqual;
 const test_support = @import("../test_support.zig");
+const testTrunk = test_support.testTrunk;
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
 const qsaArraysAllEqual = test_support.qsaArraysAllEqual;
@@ -1359,10 +1360,9 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Trunk = undefined;
+    var t = testTrunk("qwen4_exp");
     t.s = s;
     t.allocator = testing.allocator;
-    t.config = .{};
     t.arch_state.qwen4.qsa_consts = .{};
     defer t.arch_state.qwen4.qsa_consts.deinit();
 
@@ -2493,7 +2493,7 @@ test "qsa score fused: the argpartition decline arm consumes the fused sheet" {
 test "qsa score fused: no bank is built under the fused arm" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
     xfm.allocator = testing.allocator;
     xfm.arch_state.qwen4.qsa_score_bank_builds = 0;

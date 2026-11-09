@@ -1,6 +1,7 @@
 //! DeepSeek-V4.1 as the scheduler sees it: one request at a time over state the model holds, restore points that
 //! always go to SSD, and a thought point written behind a DSpark round.
 const std = @import("std");
+const testTrunk = @import("../test_support.zig").testTrunk;
 const arch_handle = @import("../arch/handle.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
@@ -94,7 +95,7 @@ pub fn flushResident(entry: *model_registry.LoadedModel, why: []const u8) void {
 }
 
 test "an arch whose request state lives in the model restores into it under its own log tag and needs checkpoints from a cancelled prefill" {
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("deepseek_v41");
     var lm: model_registry.LoadedModel = undefined;
     var slot = sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" });
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));

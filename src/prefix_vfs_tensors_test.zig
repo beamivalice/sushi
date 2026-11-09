@@ -807,3 +807,12 @@ test "tensor files on the vfs: the chunk files a real commit writes regenerate b
     try expectProductionChunks(kv_quant.KVQuantConfig.affine(6), .bfloat16);
     try expectProductionChunks(kv_quant.KVQuantConfig.affine(8), .bfloat16);
 }
+
+test "tensor files on the vfs: a file with no row maps is a whole-file write, not a shape error" {
+    try mlx.requireGpu();
+    const arr = makeArray(&.{ 1, 2, 3, 4 }, .float32, 7);
+    defer _ = mlx.mlx_array_free(arr);
+    var parts = try vt.Parts.init(ta, &.{.{ .key = "k", .arr = arr }}, &.{}, &.{}, mlx.gpuStream());
+    defer parts.deinit();
+    try testing.expect(parts.size > 0);
+}

@@ -1,3 +1,6 @@
 # <rule> <file>:<fn> <reason>. An entry that matches no finding is stale and fails. Rules: scripts/lint/.
 const-write src/model_handle.zig:ownsModuleDecodeState handleOf only tags the handle; the dispatched fns read it
 const-write src/model_handle.zig:lmHeadForDraft handleOf only tags the handle; the dispatched head projection takes *const and writes nothing
+undefined-nested-write src/qwen4/qwen4_forward.zig:qwen4_PLE_spec_capture_follows_the_verify_flag__streamed_or_not pleClaimSpecCapture reads only state.hash.ngram_size
+undefined-nested-write src/qwen4/qwen4_generate_test.zig:MTP_continuation_releases_its_owned_chain_when_drafting_fails mtpRoundContinue fails on the absent head after reading only gen.ctx.arch_ctx
+undefined-nested-write src/scheduler.zig:a_slot_the_batched_tick_hands_back_to_the_serial_path_counts_its_pending_pad_once serialFallback reads only gen.ctx.ssm_entries, through readyToBatch

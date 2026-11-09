@@ -11,6 +11,7 @@ const qwen4_test_support = @import("qwen4_test_support.zig");
 const Qwen4TestSlot = qwen4_test_support.Qwen4TestSlot;
 const rollbackRowToAccepted = qwen4_test_support.rollbackRowToAccepted;
 const test_support = @import("../test_support.zig");
+const testTrunk = test_support.testTrunk;
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
 const KVCache = trunk_mod.KVCache;
@@ -931,7 +932,7 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
     xfm.allocator = t.allocator;
     xfm.arch_state.qwen4.qsa_score_bank_builds = 0;
@@ -1065,7 +1066,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1136,7 +1137,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1237,7 +1238,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -2083,7 +2084,7 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Trunk = undefined;
+    var t = testTrunk("qwen4_exp");
     t.s = s;
     t.allocator = testing.allocator;
     t.arch_state.qwen4.qsa_score_bank_builds = 0;
@@ -2160,7 +2161,7 @@ test "qsa score bank: incremental column append matches a from-scratch rebuild" 
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Trunk = undefined;
+    var t = testTrunk("qwen4_exp");
     t.s = s;
     t.allocator = testing.allocator;
     t.arch_state.qwen4.qsa_score_bank_builds = 0;

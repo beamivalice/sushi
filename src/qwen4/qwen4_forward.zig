@@ -41,6 +41,7 @@ const expectSlotStateEqual = qwen4_test_support.expectSlotStateEqual;
 const qwen4BatchedPleForward = qwen4_test_support.qwen4BatchedPleForward;
 const qwen4ExpectMoeBitsEqual = qwen4_test_support.qwen4ExpectMoeBitsEqual;
 const test_support = @import("../test_support.zig");
+const testTrunk = test_support.testTrunk;
 const Exl3MoeHarness = test_support.Exl3MoeHarness;
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
@@ -4301,7 +4302,7 @@ pub fn qkAngleFor(self: *Trunk, family: usize, rd: c_int, base: mlx.mlx_optional
 test "qwen4 MTP head: two explicit states with different origins and stash lengths round-trip" {
     try mlx.requireGpu();
     const t = std.testing;
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.arch_state.qwen4.mtp_owner = null;
@@ -4356,7 +4357,7 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     // sees them again; releasing hands the module its own copy back.
     try mlx.requireGpu();
     const t = std.testing;
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.arch_state.qwen4.mtp_owner = null;
@@ -4772,7 +4773,7 @@ test "exl3 resident decode folds the shared-expert gate tail into the finish red
 test "qwen4 PLE spec capture follows the verify flag, streamed or not" {
     var state: qwen4_mod.Qwen4State = undefined;
     state.hash.ngram_size = 3;
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.arch_state.qwen4.model = &state;
     xfm.expert_stream = null;
     xfm.spec_capture_ssm = false;
@@ -5375,8 +5376,7 @@ test "qwen4 MTP head KV stays dense under the engine-default trunk scheme unless
     const saved = Trunk.mtp_head_kv_quant_override;
     defer Trunk.mtp_head_kv_quant_override = saved;
     Trunk.mtp_head_kv_quant_override = false;
-    var xfm: Trunk = undefined;
-    xfm.config = .{};
+    var xfm = testTrunk("qwen4_exp");
     xfm.config.num_hidden_layers = 4;
     xfm.config.head_dim = 64;
     xfm.allocator = t.allocator;
@@ -5486,7 +5486,7 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
     };
     defer ssmSnapshotDeinit(&aux);
 
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.allocator = allocator;
     xfm.s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(xfm.s);
@@ -5518,7 +5518,7 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
 }
 
 test "single-stream verify feature selection excludes prefill and ordinary decoding" {
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     var qwen4: qwen4_mod.Qwen4State = undefined;
     const old_features = trunk_mod.single_verify_test_features;
     defer trunk_mod.single_verify_test_features = old_features;

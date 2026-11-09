@@ -12,6 +12,7 @@ const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const testing = std.testing;
 const test_support = @import("../test_support.zig");
+const testTrunk = test_support.testTrunk;
 const attn256MaxDiff = test_support.attn256MaxDiff;
 
 const DenseKVView = trunk_mod.DenseKVView;
@@ -1702,10 +1703,9 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Trunk = undefined;
+    var t = testTrunk("qwen4_exp");
     t.s = s;
     t.allocator = testing.allocator;
-    t.config = .{};
     t.config.head_dim = 256;
     t.config.partial_rotary_factor = 0.5;
     t.config.rope_theta = 10_000_000.0;
@@ -1777,10 +1777,9 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     try mlx.requireGpu();
     const s = mlx.gpuStream();
 
-    var t: Trunk = undefined;
+    var t = testTrunk("qwen4_exp");
     t.s = s;
     t.allocator = testing.allocator;
-    t.config = .{};
     t.config.head_dim = 256;
     t.config.partial_rotary_factor = 0.5;
     t.config.rope_theta = 10_000_000.0;

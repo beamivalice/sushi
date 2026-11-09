@@ -393,7 +393,7 @@ test "admission combines Qwen and MiMo reservations in either order" {
     a.model = &qwen;
     a.full_prompt = &.{};
     a.max_tokens = 1;
-    a.cache.config = .dense;
+    a.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     a.vision_embeddings = null;
     a.enable_mtp = false;
     a.memory_hold_logged = true;

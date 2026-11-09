@@ -1,4 +1,5 @@
 const std = @import("std");
+const testTrunk = @import("../test_support.zig").testTrunk;
 const cost_profile = @import("qwen4_cost_profile.zig");
 const settings_resolve = @import("../settings_resolve.zig");
 const mlx = @import("../mlx.zig");
@@ -63,7 +64,7 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     // null/no-op stub, so every qwen4 request re-warmed the controller from
     // scratch. Only the two seed fields are touched here; the rest of the head
     // (and of the Trunk) is never read on this path.
-    var t: Trunk = undefined;
+    var t = testTrunk("qwen4_exp");
     t.arch_state.qwen4.mtp = null;
     const ref = MtpHeadRef.of("qwen4", &t);
 
@@ -1038,8 +1039,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
 test "a Qwen round below 8192 KV prices widths by the table's realized tokens and keeps the confidence-gated chunk B" {
     // The acceptance EMAs promise deep rounds; the table measured that a wider round realizes fewer tokens per ms.
     // The base follows the table at every KV and only a confident round extends past it.
-    var xfm: Trunk = undefined;
-    xfm.config = .{ .model_type = "qwen4_exp" };
+    var xfm = testTrunk("qwen4_exp");
     xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
     for (0..round_cost.MIN_SAMPLES) |_| {
         _ = xfm.round_cost.observe(2, 1000, 29.0, 2.6, true, false);
@@ -1345,10 +1345,8 @@ test "MTP continuation releases its owned chain when drafting fails" {
     const allocator = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var xfm: Trunk = undefined;
+    var xfm = testTrunk("qwen4_exp");
     xfm.s = s;
-    xfm.config = .{ .model_type = "qwen4_exp" };
-    xfm.arch_state = .{};
     var state: @import("qwen4_forward.zig").Qwen4MtpState = undefined;
     var gen: Generator = undefined;
     gen.xfm = &xfm;

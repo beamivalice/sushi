@@ -139,6 +139,7 @@ fn rowTag(ti: usize, axis: u8) u32 {
 fn validate(tensors: []const Tensor, row_maps: []const ?RowMap) !void {
     if (tensors.len >= MAX_TENSORS) return error.DiskCacheBadShape;
     if (row_maps.len != 0 and row_maps.len != tensors.len) return error.DiskCacheBadShape;
+    if (row_maps.len == 0) return;
     for (row_maps, tensors) |m_opt, t| {
         const m = m_opt orelse continue;
         if (m.per_row == 0 or m.axis >= MAX_AXIS or m.axis >= mlx.mlx_array_ndim(t.arr)) return error.DiskCacheBadShape;
