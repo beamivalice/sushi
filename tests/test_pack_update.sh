@@ -79,7 +79,7 @@ forget() { rm -f "$CACHE"; }
 serve v2
 out=$("$BIN" list 2>&1)
 check "a 2.0 remote against a legacy pack prints the update line" "$([ "$(grep -c -F "  $UPDATE_LINE" <<<"$out")" = 1 ] && echo 1 || echo 0)"
-check "the line sits directly under the pack's row" "$(grep -A1 "deepseek-v4.1-flash:1.75bpw" <<<"$out" | tail -1 | grep -qF "$UPDATE_LINE" && echo 1 || echo 0)"
+check "the line sits directly under the pack's row" "$(grep -A1 "deepseek-v4.1-flash:1.75bpw" <<<"$out" | tail -1 | grep -cF "$UPDATE_LINE" >/dev/null && echo 1 || echo 0)"
 check "only that pack is flagged" "$([ "$(count "$out")" = 1 ] && echo 1 || echo 0)"
 echo "  list output:"; sed 's/^/    /' <<<"$out"
 stop

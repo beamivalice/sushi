@@ -117,7 +117,7 @@ sushi_boot() {
             sushi_stop 1 > /dev/null 2>&1
             return 1
         fi
-        if curl -sf "$SUSHI_URL/health" > /dev/null 2>&1 && _sushi_tail_from "$SUSHI_LOG" "$off" | grep -q 'Model ready'; then
+        if curl -sf "$SUSHI_URL/health" > /dev/null 2>&1 && _sushi_tail_from "$SUSHI_LOG" "$off" | grep -c 'Model ready' > /dev/null; then
             return 0
         fi
         if [ $(($(date +%s) - t0)) -ge "$limit" ]; then

@@ -104,6 +104,12 @@ and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone che
   test moved into its folder, or renamed) only prints a note; `--write` drops it, and a renamed test needs the same
   `--write` to list its new name. To clear a failure, move the test into
   `src/<model>/`, or rename it for the shared code it tests.
+- **Shell guard.** `python3 tests/shell_guards.py` (checked by `python3 tests/test_shell_guards.py`) refuses a pipe into
+  a reader that can exit before its input ends (`grep -q`/`-m N`, `head`, `sed` with `q`, `awk` with `exit`) in every
+  `.sh` under `tests/` and `scripts/` that sets pipefail, and in `tests/lib/`: the writer's SIGPIPE makes the pipeline
+  fail with 141 although the reader succeeded. Read it all (`grep -c PAT >/dev/null`, `sed -n 1,3p`) or give it the
+  file. A deliberate hit (a finite, small writer) goes in `tests/guards/pipefail-early-exit.allow` as
+  `<file>:<line> <reason>`; an entry that matches nothing fails.
 - **The seam is enforced by the type system, not a guard.** `tests/test_arch_drop.sh` compiles the engine without each
   arch and with each arch alone, so shared code that imports one fails to build ([engine-arch-seam](engine-arch-seam.md)).
 

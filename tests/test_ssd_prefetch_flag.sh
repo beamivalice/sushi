@@ -24,7 +24,7 @@ for good in 0 65 100; do
     fi
 done
 
-"$BIN" --help 2>&1 | grep -q -- "--ssd-prefetch <n>" || { echo "FAIL: --help does not list --ssd-prefetch" >&2; FAILED=1; }
+"$BIN" --help 2>&1 | grep -c -- "--ssd-prefetch <n>" >/dev/null || { echo "FAIL: --help does not list --ssd-prefetch" >&2; FAILED=1; }
 
 [ -z "$FAILED" ] && echo "PASS: --ssd-prefetch parse"
 exit ${FAILED:+1}

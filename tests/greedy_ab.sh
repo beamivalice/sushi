@@ -20,7 +20,7 @@ BIN="${BIN:-./zig-out/bin/sushi}"
 
 run_arm() {
   local val="$1" out="$2"
-  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -c LISTEN >/dev/null; then
     echo "port $PORT is already in use; stop that server or set PORT" >&2
     exit 1
   fi
@@ -55,7 +55,7 @@ if diff -q /tmp/greedy-off.txt /tmp/greedy-on.txt >/dev/null; then
   echo "IDENTICAL ($(wc -c </tmp/greedy-on.txt) bytes)"
 else
   echo "DIVERGED"
-  diff /tmp/greedy-off.txt /tmp/greedy-on.txt | head -20
+  diff /tmp/greedy-off.txt /tmp/greedy-on.txt | sed -n 1,20p
   echo "--- first differing byte:"
   cmp /tmp/greedy-off.txt /tmp/greedy-on.txt
 fi

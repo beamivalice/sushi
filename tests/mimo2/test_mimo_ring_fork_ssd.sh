@@ -89,7 +89,7 @@ RING0=$(count '\[hot-cache\] ring checkpoint @')
 ask "$(after "$REMINDER" 48)" > /dev/null || { echo "fail: side request"; boot_log | tail -20; exit 1; }
 RING1=$(count '\[hot-cache\] ring checkpoint @')
 [ "$RING1" -gt "$RING0" ] || fail "the side request did not restore from the main entry's ring checkpoint"
-boot_log | grep -q '\[hot-cache\] inherited ring checkpoints' || fail "the side entry inherited no ring checkpoint"
+boot_log | grep -c '\[hot-cache\] inherited ring checkpoints' >/dev/null || fail "the side entry inherited no ring checkpoint"
 
 EVICT0=$(count 'evicted LRU entry (count cap')
 ask "$(title)" > /dev/null || { echo "fail: unrelated request"; boot_log | tail -20; exit 1; }
@@ -113,7 +113,7 @@ for _ in $(seq 1 120); do
 done
 sleep 2
 echo "boot 1 persisted $(count '\[disk-cache\] persisted') entries"
-boot_log | grep '\[hot-cache\]\|\[disk-cache\]' | head -40
+boot_log | grep '\[hot-cache\]\|\[disk-cache\]' | sed -n 1,40p
 stop
 
 RINGS=$(ls "$CACHE_ROOT"/*/e*/r*.safetensors 2>/dev/null | wc -l | tr -d ' ')
@@ -148,7 +148,7 @@ M3=$(ask "$(after "$Q3" 64)") || { echo "fail: main turn 3"; boot_log | tail -20
 [ "$(count '\[disk-cache\] restored .*ring@')" -gt "$DISK1" ] || [ "$(field "$M3" .timings.cached_n)" -gt 0 ] \
     || fail "a turn diverging at the reminder restored nothing after the restart"
 echo "main turn 3: cached_n=$(field "$M3" .timings.cached_n)"
-boot_log | grep '\[hot-cache\]\|\[disk-cache\]' | head -20
+boot_log | grep '\[hot-cache\]\|\[disk-cache\]' | sed -n 1,20p
 stop
 
 [ $EC = 0 ] && echo "PASS"

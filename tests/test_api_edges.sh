@@ -39,7 +39,7 @@ req() {
 }
 J() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)" 2>/dev/null; }
 expect_status() { # <want> <name>
-    if [[ "$R" == "$1" ]]; then ok "$2: $1"; else bad "$2: want $1 got $R" "$(echo "$BODY" | head -c 160)"; fi
+    if [[ "$R" == "$1" ]]; then ok "$2: $1"; else bad "$2: want $1 got $R" "${BODY:0:160}"; fi
 }
 CONTENT='d["choices"][0]["message"]["content"]'
 GENERATED='(d["choices"][0]["message"].get("reasoning_content") or "")+(d["choices"][0]["message"]["content"] or "")'
@@ -77,7 +77,7 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"top_k\":1,\"
 for f in '"temperature":-1' '"temperature":100' '"top_p":2' '"top_k":-3' '"seed":9223372036854775808' '"seed":"abc"' '"max_tokens":0' '"max_tokens":-5' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":2'; do
     [[ "$f" == '"max_tokens"'* ]] && cap="" || cap=',"max_tokens":5'
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$f$cap,$NT_CHAT}"
-    [[ "$R" == 200 && -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "out-of-range $f answers" || bad "out-of-range $f" "$R $(echo "$BODY" | head -c 120)"
+    [[ "$R" == 200 && -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "out-of-range $f answers" || bad "out-of-range $f" "$R ${BODY:0:120}"
 done
 
 echo "=== stop sequences ==="
@@ -86,11 +86,11 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$CNT],\"stop\":\"f
 C=$(echo "$BODY" | J "$CONTENT"); FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]')
 [[ "$C" != *four* && "$FR" == stop ]] && ok "stop string cuts before the match, finish stop" || bad "stop string" "fr=$FR c=${C:0:80}"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"stop\":\"\",\"max_tokens\":5,$NT_CHAT}"
-[[ -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "empty stop string is ignored" || bad "empty stop string is ignored" "$(echo "$BODY" | head -c 160)"
+[[ -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "empty stop string is ignored" || bad "empty stop string is ignored" "${BODY:0:160}"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"stop\":[\"\",\"zzz\"],\"max_tokens\":5,$NT_CHAT}"
-[[ -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "empty stop entry in an array is ignored" || bad "empty stop entry in an array" "$(echo "$BODY" | head -c 160)"
+[[ -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "empty stop entry in an array is ignored" || bad "empty stop entry in an array" "${BODY:0:160}"
 req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":90,\"stop_sequences\":[\"four\"],\"messages\":[$CNT],\"temperature\":0,$NT_MSG}"
-[[ "$(echo "$BODY" | J 'd["stop_reason"]')" == stop_sequence && "$(echo "$BODY" | J 'd["stop_sequence"]')" == four ]] && ok "/v1/messages echoes the matched stop_sequence" || bad "/v1/messages stop_sequence echo" "$(echo "$BODY" | head -c 160)"
+[[ "$(echo "$BODY" | J 'd["stop_reason"]')" == stop_sequence && "$(echo "$BODY" | J 'd["stop_sequence"]')" == four ]] && ok "/v1/messages echoes the matched stop_sequence" || bad "/v1/messages stop_sequence echo" "${BODY:0:160}"
 
 echo "=== structured output ==="
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"x\",\"schema\":\"notaschema\"}},\"max_tokens\":20}"
@@ -117,7 +117,7 @@ if (sushi_require vision) > /dev/null 2>&1; then
     expect_status 400 "chat: undecodable image_url refused"
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[$IMG_HTTP]}],\"max_tokens\":5}"
     expect_status 400 "chat: remote image URL refused by name"
-    [[ "$(echo "$BODY" | J 'd["error"]["message"]')" == *"remote URLs are not fetched"* ]] && ok "chat: refusal names the cause" || bad "chat: refusal names the cause" "$(echo "$BODY" | head -c 160)"
+    [[ "$(echo "$BODY" | J 'd["error"]["message"]')" == *"remote URLs are not fetched"* ]] && ok "chat: refusal names the cause" || bad "chat: refusal names the cause" "${BODY:0:160}"
     req POST /v1/messages '{"model":"m","max_tokens":5,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}'
     expect_status 400 "messages: undecodable image block refused"
     req POST /v1/responses '{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"http://127.0.0.1:1/x.png"}]}],"max_output_tokens":5}'
@@ -160,12 +160,12 @@ req POST /v1/responses '{"model":"m"}';                                expect_st
 req POST /v1/responses '{"model":"m","input":"hi","background":true}';  expect_status 400 "responses: background"
 req POST /v1/responses '{"model":"m","input":"hi","previous_response_id":"resp_nope"}'; expect_status 404 "responses: unknown previous_response_id"
 req POST /v1/responses '{"model":"m","input":"'"$N"' Give a person with name and age.","text":{"format":{"type":"json_schema","name":"p","schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}}},"max_output_tokens":120,"temperature":0,'"$NT_RESP"'}'
-echo "$BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=[c["text"] for o in d["output"] if o["type"]=="message" for c in o["content"]][0]; j=json.loads(t); assert isinstance(j["age"],int)' 2>/dev/null && ok "responses: text.format json_schema enforced" || bad "responses json_schema" "$(echo "$BODY" | head -c 160)"
+echo "$BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=[c["text"] for o in d["output"] if o["type"]=="message" for c in o["content"]][0]; j=json.loads(t); assert isinstance(j["age"],int)' 2>/dev/null && ok "responses: text.format json_schema enforced" || bad "responses json_schema" "${BODY:0:160}"
 req POST /v1/messages "{\"model\":\"m\",\"messages\":[$U]}";           expect_status 400 "messages: max_tokens required"
 
 echo "=== alive ==="
 req GET /health; expect_status 200 "server alive after every edge"
-sushi_log_since | grep -qE "\[mlx\] error|panic|Segmentation" && bad "no MLX error / crash line in the log" || ok "no MLX error / crash line in the log"
+sushi_log_since | grep -cE "\[mlx\] error|panic|Segmentation" >/dev/null && bad "no MLX error / crash line in the log" || ok "no MLX error / crash line in the log"
 
 echo
 echo "api-edges: $PASS passed, $FAIL failed  (log: $SUSHI_LOG)"

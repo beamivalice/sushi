@@ -17,7 +17,7 @@ BIN="${BIN:-./zig-out/bin/sushi}"
 LOG="${LOG:-/tmp/fwd-ubench-$PORT.log}"
 
 # Only the server this script starts is ever killed, by its PID.
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -c LISTEN >/dev/null; then
   echo "port $PORT is already in use; stop that server or set PORT" >&2
   exit 1
 fi

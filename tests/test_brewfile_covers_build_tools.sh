@@ -14,7 +14,7 @@ listed() { grep -qE "^[[:space:]]*brew[[:space:]]+\"$1\"" "$BREWFILE"; }
 # Tools macOS does not ship, named as the formula that provides them.
 for tool in cmake ninja pkg-config jq wget autoconf automake; do
     if grep -v -E '^[[:space:]]*#' scripts/*.sh build.zig compile.sh \
-        | grep -qE "(^|[^A-Za-z0-9_./-])$tool([[:space:]]|\$)" && ! listed "$tool"; then
+        | grep -cE "(^|[^A-Za-z0-9_./-])$tool([[:space:]]|\$)" >/dev/null && ! listed "$tool"; then
         echo "FAIL: scripts/ or build.zig invoke '$tool' but $BREWFILE has no brew \"$tool\"" >&2
         status=1
     fi

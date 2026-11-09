@@ -66,7 +66,7 @@ for line in sys.stdin:
     for tc in (d["choices"][0]["delta"].get("tool_calls") or []):
         f=tc.get("function",{}); name=f.get("name") or name; args+=f.get("arguments") or ""
 print(name or ""); print(args)')
-TNAME=$(echo "$ARGS" | head -1); TARGS=$(echo "$ARGS" | tail -n +2)
+TNAME=$(echo "$ARGS" | sed -n 1p); TARGS=$(echo "$ARGS" | tail -n +2)
 if [[ "$TNAME" == save_note ]]; then
     ok "tools: call names the declared tool"
     echo "$TARGS" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null && ok "tools: arguments valid JSON" || bad "tools: arguments valid JSON" "${TARGS:0:120}"

@@ -160,7 +160,7 @@ read -r AGREE TOTAL WORST <<< "$DRIFT"
 echo "session B cold vs warm: tokens agree for $AGREE of $TOTAL; max |dlogprob| over them $WORST nats"
 [ "$TOTAL" -gt 0 ] || fail "session B returned no logprobs to compare"
 python3 -c "import sys; sys.exit(0 if float('$WORST') <= 0.5 else 1)" || fail "session B's restored logprobs drift past 0.5 nats"
-sushi_log_since | grep '\[hot-cache\]' | head -30
+sushi_log_since | grep '\[hot-cache\]' | sed -n 1,30p
 
 [ $EC = 0 ] && echo "PASS"
 exit $EC

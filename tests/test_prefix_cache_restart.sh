@@ -135,7 +135,7 @@ settle_disk() {
     done
 }
 per_draft() { blog | grep -o 'per_draft_pct=[0-9.]*' | tail -1 | cut -d= -f2; }
-layer() { [ -n "$(find "$CACHE" -maxdepth 3 -type d -name v 2> /dev/null | head -1)" ]; }
+layer() { [ -n "$(find "$CACHE" -maxdepth 3 -type d -name v 2> /dev/null | sed -n 1p)" ]; }
 # The most chunks one entry holds: plain chunk files, or on the layer the largest `complete on disk` count logged.
 chunks_now() {
     if layer; then
@@ -358,7 +358,7 @@ print(f"  corrupted the {len(files[target])} blocks of {target}")
 PY
         boot
     else
-        chmod 000 "$(find "$CACHE" -name 'c000002.safetensors' | head -1)"
+        chmod 000 "$(find "$CACHE" -name 'c000002.safetensors' | sed -n 1p)"
     fi
     read -r CU _ <<< "$(ask "$WORK/long.json")"
     check "an unreadable chunk: the restore fails and the request still answers" "$([ "$CU" != ERR ] && echo 1 || echo 0)" "1"

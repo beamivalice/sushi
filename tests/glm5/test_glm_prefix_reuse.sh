@@ -131,6 +131,6 @@ python3 -c "import sys; sys.exit(0 if float('$WORST') <= $BOUND else 1)" || fail
 [ "$(field "$BF16" .timings.cached_n)" = 0 ] || fail "a BF16 request restored a kv8 entry"
 [ "$(field "$CANCELLED_AGAIN" .timings.cached_n)" -gt 2047 ] || fail "a stream cancelled mid-decode did not commit its prompt"
 
-sushi_log_since | grep -E '\[hot-cache\]|\[spec-stats\] (accept|glm)' | head -40
+sushi_log_since | grep -E '\[hot-cache\]|\[spec-stats\] (accept|glm)' | sed -n 1,40p
 [ $EC = 0 ] && echo "PASS"
 exit $EC

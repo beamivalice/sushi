@@ -25,16 +25,16 @@ ok()   { echo "PASS $1"; pass=$((pass+1)); }
 bad()  { echo "FAIL $1"; shift; for line in "$@"; do echo "  $line"; done; fail=$((fail+1)); }
 
 # [1] The probe classified the sidecar as DFlash at boot.
-if grep -q "DFlash drafter ready" "$LOG"; then ok "boot: DFlash sidecar detected"; else bad "boot: DFlash sidecar detected" "$(grep -i drafter "$LOG" | head -3)"; fi
+if grep -q "DFlash drafter ready" "$LOG"; then ok "boot: DFlash sidecar detected"; else bad "boot: DFlash sidecar detected" "$(grep -i drafter "$LOG" | sed -n 1,3p)"; fi
 
 # [1b] DFlash2 sidecars (config declares `dflash_config`) must load their
 # selector + dyn convs — the drafter still runs v1-style without them, so
 # only the load line can prove the trained modules are in the forward.
 if grep -q '"dflash_config"' "$DRAFTER/config.json" 2>/dev/null; then
     if grep -q "\[dflash\] dflash2: selector" "$LOG"; then
-        ok "dflash2: selector + dyn convs loaded ($(grep -o 'dflash2: selector[^\"]*' "$LOG" | head -1))"
+        ok "dflash2: selector + dyn convs loaded ($(grep -o 'dflash2: selector[^\"]*' "$LOG" | sed -n 1p))"
     else
-        bad "dflash2: selector + dyn convs loaded" "$(grep '\[dflash\]' "$LOG" | head -3)"
+        bad "dflash2: selector + dyn convs loaded" "$(grep '\[dflash\]' "$LOG" | sed -n 1,3p)"
     fi
 fi
 
@@ -151,16 +151,16 @@ case "$EQ_VERDICT" in
         DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
         OFF2=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
         if [ "$ON" != "$ON2" ]; then
-            bad "dflash-ON is reproducible at temp 0" "$(echo "$ON" | head -c 200)" "$(echo "$ON2" | head -c 200)"
+            bad "dflash-ON is reproducible at temp 0" "${ON:0:200}" "${ON2:0:200}"
         elif [ "$OFF" != "$OFF2" ]; then
-            bad "serial decode is reproducible at temp 0" "$(echo "$OFF" | head -c 200)" "$(echo "$OFF2" | head -c 200)"
+            bad "serial decode is reproducible at temp 0" "${OFF:0:200}" "${OFF2:0:200}"
         elif [ "$SHARED" -lt 40 ]; then
-            bad "dflash arms agree before the near-tie" "shared only $SHARED chars" "$(echo "$ON" | head -c 200)" "$(echo "$OFF" | head -c 200)"
+            bad "dflash arms agree before the near-tie" "shared only $SHARED chars" "${ON:0:200}" "${OFF:0:200}"
         else
             ok "greedy dflash arms reproducible + agree for $SHARED chars before a sanctioned ${QUANT_BITS}-bit near-tie"
         fi ;;
     *)
-        bad "greedy dflash-on == dflash-off" "$EQ_VERDICT" "--- on ---" "$(echo "$ON" | head -c 300)" "--- off ---" "$(echo "$OFF" | head -c 300)" ;;
+        bad "greedy dflash-on == dflash-off" "$EQ_VERDICT" "--- on ---" "${ON:0:300}" "--- off ---" "${OFF:0:300}" ;;
 esac
 
 # [6] The opt-out arms really ran serial: one `mode=dflash` line per request
@@ -192,7 +192,7 @@ assert r["choices"][0]["finish_reason"] == "length", r["choices"][0]
 ' 2>/dev/null; then
     ok "DFlash output clips exactly at max_tokens=17"
 else
-    bad "DFlash output clips exactly at max_tokens=17" "$(echo "$CAP" | head -c 500)"
+    bad "DFlash output clips exactly at max_tokens=17" "${CAP:0:500}"
 fi
 
 CAP_STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
@@ -254,17 +254,17 @@ assert "city" in args, args
 ' 2>/dev/null; then
     ok "tool call parses with dflash engaged"
 else
-    bad "tool call parses with dflash engaged" "$(echo "$TOOLS" | head -c 400)"
+    bad "tool call parses with dflash engaged" "${TOOLS:0:400}"
 fi
 
 # [9] Weight precision ENGAGED, read off the boot log — it is a
 # load-time decision, so there is no same-boot A/B for it; the numeric
 # guard is the hermetic greedy-equivalence test, which runs default-on.
-WLINE=$(grep -o "weights=[^ ]*-bit/gs[0-9]*" "$LOG" | head -1)
+WLINE=$(grep -o "weights=[^ ]*-bit/gs[0-9]*" "$LOG" | sed -n 1p)
 if [ -n "$WLINE" ]; then
     ok "assistant quantized at load ($WLINE)"
 else
-    bad "assistant quantized at load" "$(grep '\[dflash\] loaded' "$LOG" | head -1)"
+    bad "assistant quantized at load" "$(grep '\[dflash\] loaded' "$LOG" | sed -n 1p)"
 fi
 
 # [10] The block is capped to what this machine's verify lanes serve. The
@@ -277,10 +277,10 @@ cfg = json.load(open(sys.argv[1]))
 dc = cfg.get("dflash_config") or cfg
 print(dc.get("block_size", ""))
 ' "$DRAFTER/config.json")
-BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | head -1)
-if echo "$BLINE" | grep -q ", capped ("; then
+BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | sed -n 1p)
+if echo "$BLINE" | grep -c ", capped (" >/dev/null; then
     ok "block capped for this machine's verify lanes ($BLINE)"
-elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
+elif echo "$BLINE" | grep -c "wide_verify_lane=true" >/dev/null && echo "$BLINE" | grep -c "block_size=$DECLARED_BLOCK," >/dev/null; then
     ok "wide verify lane present, checkpoint block ($DECLARED_BLOCK) kept ($BLINE)"
 elif grep -q "decodes with DFlash2 (.* rows per round" "$LOG"; then
     ok "rows policy sets the block ($BLINE)"
@@ -312,7 +312,7 @@ if grep -q "GLM-5.3-Flash decodes with DFlash2" "$LOG"; then
     if grep -q "GLM-5.3-Flash decodes with DFlash2 (2\.\.8 rows per round)" "$LOG"; then
         ok "GLM adaptive rows default to 2..8"
     else
-        bad "GLM adaptive rows default to 2..8" "$(grep 'decodes with DFlash2' "$LOG" | head -2)"
+        bad "GLM adaptive rows default to 2..8" "$(grep 'decodes with DFlash2' "$LOG" | sed -n 1,2p)"
     fi
     GLM_COPY="Repeat this sentence exactly, word for word, three times: the keeper trimmed the wick and wrote three lines in the logbook about the wind and the sea."
     for GLM_PROMPT in "$GLM_COPY" "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two tests." "Count from 1 to 120, one number per line, with no other output."; do
@@ -320,9 +320,9 @@ if grep -q "GLM-5.3-Flash decodes with DFlash2" "$LOG"; then
         DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
         G_OFF=$(gen "$GLM_PROMPT" 200 ", \"enable_drafter\": false")
         if [ -n "$G_ON" ] && [ "$G_ON" = "$G_OFF" ]; then
-            ok "GLM greedy adaptive rows == serial ($(echo "$GLM_PROMPT" | head -c 30)...)"
+            ok "GLM greedy adaptive rows == serial (${GLM_PROMPT:0:30}...)"
         else
-            bad "GLM greedy adaptive rows == serial" "--- on ---" "$(echo "$G_ON" | head -c 300)" "--- off ---" "$(echo "$G_OFF" | head -c 300)"
+            bad "GLM greedy adaptive rows == serial" "--- on ---" "${G_ON:0:300}" "--- off ---" "${G_OFF:0:300}"
         fi
     done
     GLM_BODY='{"model":"sushi","messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Count from 1 to 120, one number per line, with no other output."}],"temperature":0.0,"max_tokens":200,"enable_drafter":true'

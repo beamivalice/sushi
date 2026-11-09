@@ -82,7 +82,7 @@ for _ in $(seq 1 600); do
     kill -0 "$SRV" 2>/dev/null || { echo "server exited during load" >&2; tail -20 "$LOG" >&2; exit 1; }
     sleep 1
 done
-grep -E "\[mtp\] (on|off)|\[kv-cache\]" "$LOG" | head -3
+grep -E "\[mtp\] (on|off)|\[kv-cache\]" "$LOG" | sed -n 1,3p
 
 python3 - "$PORT" "$LOG" "$OUT" "${REPS:-2}" "${MAX_TOKENS:-2048}" "${THINK:-0}" "${SAMPLED:-1}" "${LONG:-0}" <<'PYRUN'
 import glob, hashlib, json, os, re, sys, time, urllib.request

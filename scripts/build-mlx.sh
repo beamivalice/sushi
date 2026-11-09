@@ -122,7 +122,7 @@ NAX_COUNT="$(strings "$METALLIB" | grep -c "_nax" || true)"
 [ "$NAX_COUNT" -gt 0 ] \
   || die "built metallib contains ZERO *_nax kernels — the 26.2 gate failed silently (check SDK/deployment target/Metal Toolchain)"
 
-MINOS="$(otool -l "$STAGE/lib/libmlx.dylib" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')"
+MINOS="$(otool -l "$STAGE/lib/libmlx.dylib" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/ && !s++{print $2}')"
 case "$MINOS" in
   26.[2-9]*|2[7-9]*|[3-9]*) ;;
   *) die "libmlx.dylib minos '$MINOS' < 26.2 — deployment target did not take" ;;
