@@ -141,6 +141,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   set ([dsv41-memory](dsv41-memory.md#borrow)); the engine publishes the bytes still lendable to
   `ModelConfig.expert_borrow_bytes`. A resident pack has no union workspace: its first release makes one (sized for
   the lendable layers, paid out of the pools the plan releases) and the last restore drops it.
+- **A streamed layer's resident routed bank is empty, so a load-time read of it is a bug**: `routedShapeOf` returns null for it (a slab's copy already does), because reading the shape of an empty array latches an MLX error that the first request then fails on.
 - **Load-time cache warm**: preload the lowest expert IDs into `floor(0.8 * slots_per_layer)` slots per MoE layer
   before kernel warmup and readiness, within the existing budget. These are ordinary LRU entries, not predicted
   routes; dense prefix layers are skipped. A rate-grouped pack with an `expert_usage.json` (`--drop-expert`'s list)

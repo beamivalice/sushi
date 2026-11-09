@@ -339,7 +339,13 @@ pub fn bindSharedGeometry(mw: *MoeMlpWeights, config: *const ModelConfig) !void 
     const sigmoid = try trunk.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
     const sh = mw.foldShared(sigmoid, config.trunk_quant, gate_s.ctx != null, false) orelse return;
     for (&mw.shared_geo, 1..) |*slot, rows| slot.* = sushi_exl3.riders_gated.geometry(sh, @intCast(config.hidden_size), @intCast(rows));
-    if (mw.exl3_ragged == null) mw.routed_shape = sushi_exl3.fold_gated.bankShape(mw.routedBank(), @intCast(config.hidden_size));
+    mw.routed_shape = routedShapeOf(mw, config);
+}
+
+/// A one-bank EXL3 layer's routed launch shape; null for a ragged layer and for a streamed one, whose bank is empty.
+pub fn routedShapeOf(mw: *const MoeMlpWeights, config: *const ModelConfig) ?sushi_exl3.fold_gated.BankShape {
+    if (mw.exl3_ragged != null or mw.switch_gate_w.ctx == null) return null;
+    return sushi_exl3.fold_gated.bankShape(mw.routedBank(), @intCast(config.hidden_size));
 }
 
 
@@ -2164,4 +2170,19 @@ fn routedParamsCase(bits: u32, group: u32, rows: c_int) !void {
 test "routed bank parameters solved at load give the bytes of the per-call solve, and the same parameters" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     for ([_][2]u32{ .{ 4, 64 }, .{ 8, 64 }, .{ 4, 32 } }) |p| for ([_]c_int{ 1, 3, 8 }) |rows| try routedParamsCase(p[0], p[1], rows);
+}
+
+test "a streamed layer holds no routed bank, so it has no routed shape and raises no MLX error" {
+    mlx.installErrorHandler();
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    var mw = std.mem.zeroInit(MoeMlpWeights, .{});
+    const empty = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(empty);
+    inline for (.{ "switch_gate_w", "switch_gate_s", "switch_gate_b", "switch_up_w", "switch_up_s", "switch_up_b", "switch_down_w", "switch_down_s", "switch_down_b" }) |name| @field(mw, name) = empty;
+    var config = std.mem.zeroInit(ModelConfig, .{});
+    config.hidden_size = 2560;
+    try std.testing.expect(routedShapeOf(&mw, &config) == null);
+    const raised = mlx.takeError(&buf);
+    try std.testing.expect(raised == null);
 }

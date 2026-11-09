@@ -24,6 +24,8 @@ earlier history is mlx-serve's, in that project's changelog.
   again or edit the value, a load failure clears as soon as the model is listed loaded, saving a setting a load reads
   lets the next request retry a failed model, a finished download drops the pack's update notice at once, and a release
   check that finds nothing newer clears an earlier update failure.
+- **The first chat after loading a Flash-Next pack that streams its experts no longer fails**: the load read the shape of
+  the empty resident expert bank 144 times, and the first request answered "generation failed" until a retry.
 - **A request that fails inside the engine now logs why**: the server log names the error (`[slot] request N failed`)
   where the client only reads "generation failed".
 - **Each served architecture is a self-contained module**: Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4.1-Flash and
