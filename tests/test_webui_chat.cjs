@@ -340,6 +340,17 @@ const CASES = [
   ['a bullet inside a numbered inside a bullet', '- a\n  1. b\n     - c\n  2. d', { depth: 3, items: 1 }],
   ['triple stars are emphasis around strong', 'plain ***both*** and **bold** and *it*', { strongs: 2, ems: 2, nestedStrong: 1 }],
   ['triple stars with spaces are text', '2 *** 3 *** 4', { paras: ['2 *** 3 *** 4'], strongs: 0, ems: 0 }],
+  ['TeX in parentheses, brackets and dollars is shown as written', 'Inline \\( a^2+b^2=c^2 \\) and\n\n\\[ \\sum_{i=1}^n *x* \\]\n\n$$ \\frac{a}{b} $$', { paras: ['Inline \\( a^2+b^2=c^2 \\) and', '\\[ \\sum_{i=1}^n *x* \\]', '$$ \\frac{a}{b} $$'], ems: 0 }],
+  ['a lone backslash-paren keeps its backslash', 'a \\( b', { paras: ['a \\( b'] }],
+  ['strikethrough', 'a ~~gone~~ b and ~ alone ~', { paras: ['a gone b and ~ alone ~'], dels: ['gone'] }],
+  ['task list items carry a checkbox', '- [x] done\n- [ ] todo\n- plain', { items: 3, checks: [true, false], paras: [] }],
+  ['table alignment', '| a | b | c |\n|:---|---:|:---:|\n| 1 | 2 | 3 |', { aligns: ['left', 'right', 'center', 'left', 'right', 'center'] }],
+  ['a bare address is a link and its sentence punctuation is not', 'See https://example.org/x_y?a=1, or (https://example.org/p_(q)). Done.', { links: [['https://example.org/x_y?a=1', 'https://example.org/x_y?a=1'], ['https://example.org/p_(q)', 'https://example.org/p_(q)']], paras: ['See https://example.org/x_y?a=1, or (https://example.org/p_(q)). Done.'] }],
+  ['a bare address inside a code span stays code', 'run `curl https://example.org` now', { links: [] }],
+  ['an address in a link label is not linked twice', '[site https://a.example](https://b.example)', { links: [['https://b.example/', 'site https://a.example']] }],
+  ['a numbered list right after a bullet list is its own list', '- one\n- two\n1. first\n2. second', { topLists: ['UL', 'OL'] }],
+  ['setext headings', 'Title\n=====\n\nSub\n---\n\ntext', { headings: [['H1', 'Title'], ['H2', 'Sub']], paras: ['text'] }],
+  ['an underline under a two-line paragraph is not a heading', 'one\ntwo\n---\nthree', { paras: ['one\ntwo\n---\nthree'], headings: [] }],
 ];
 test('the markdown the models write: fences, links, tables and escapes', async ({ browser }) => {
   const stub = await startStub();
@@ -360,6 +371,11 @@ test('the markdown the models write: fences, links, tables and escapes', async (
         subStart: host.querySelector('li > ol')?.start ?? null,
         depth: Math.max(0, ...[...host.querySelectorAll('li')].map((li) => { let d = 0; for (let n = li; n && n !== host; n = n.parentElement) if (n.tagName === 'LI') d++; return d; })),
         nestedStrong: host.querySelectorAll('em > strong').length,
+        dels: [...host.querySelectorAll('del')].map((d) => d.textContent),
+        checks: [...host.querySelectorAll('li > input[type=checkbox]')].map((c) => c.checked),
+        aligns: [...host.querySelectorAll('th, td')].map((c) => c.style.textAlign),
+        topLists: [...host.querySelectorAll(':scope > ul, :scope > ol')].map((l) => l.tagName),
+        headings: [...host.querySelectorAll(':scope > h1, :scope > h2, :scope > h3, :scope > h4')].map((h) => [h.tagName, h.textContent]),
       };
     }, markdown);
     for (const [key, value] of Object.entries(want)) assert.deepEqual(got[key], value, `${name}: ${key}`);
@@ -371,6 +387,7 @@ test('a model that is loading, unloading or failed is not offered "loads on firs
   for (const [state, want, button] of [['loading', /loading/i, false], ['evicting', /unloading/i, false], ['error', /failed/i, true]]) {
     const stub = await startStub({ models: [model({ state, loaded: false })] });
     const { page, context } = await open(browser, stub);
+    await page.selectOption('#modelSelect', 'Chat-A');
     await page.waitForSelector('#modelStatus .badge');
     const text = await page.innerText('#modelStatus');
     assert.match(text, want, state);
@@ -451,24 +468,29 @@ test('attached images that a model switch drops are announced', async ({ browser
   await context.close(); await stub.close();
 });
 
-test('the chosen model comes back when it returns to the list', async ({ browser }) => {
-  const stub = await startStub({ models: [model({ id: 'A' }), model({ id: 'B' })] });
+test('the model picked in this session comes back when it returns to the list, and an old stored pick decides nothing', async ({ browser }) => {
+  const stub = await startStub({ models: [model({ id: 'A' }), model({ id: 'B', state: 'unloaded', loaded: false })] });
   const { page, context } = await open(browser, stub, { storage: { 'sushi-model': 'B' } });
-  assert.equal(await page.inputValue('#modelSelect'), 'B');
+  assert.equal(await page.inputValue('#modelSelect'), 'A', 'a pick stored by an older page decides nothing: the loaded model');
+  await page.selectOption('#modelSelect', 'B');
+  assert.equal(await page.evaluate(() => localStorage.getItem('sushi-model')), 'B', 'unchanged by this page');
   stub.models = [model({ id: 'A' })];
   await page.evaluate(() => modelStore.refresh());
   await page.waitForFunction(() => document.getElementById('modelSelect').value === 'A');
-  stub.models = [model({ id: 'A' }), model({ id: 'B' })];
+  stub.models = [model({ id: 'A' }), model({ id: 'B', state: 'unloaded', loaded: false })];
   await page.evaluate(() => modelStore.refresh());
   await page.waitForFunction(() => document.getElementById('modelSelect').value === 'B');
+  const cold = await startStub({ models: [model({ id: 'C', state: 'unloaded', loaded: false })] });
+  const other = await open(browser, cold, { storage: { 'sushi-model': 'C' } });
+  assert.equal(await other.page.inputValue('#modelSelect'), '', 'nothing loaded, none ever loaded: the stored pick is not used');
   await context.close(); await stub.close();
 });
 
 test('the picker follows the model that is loaded, until the user picks one in this session', async ({ browser }) => {
   const cold = (id) => model({ id, state: 'unloaded', loaded: false });
   const stub = await startStub({ models: [cold('A'), cold('B')] });
-  const { page, context } = await open(browser, stub, { storage: { 'sushi-model': 'A' } });
-  assert.equal(await page.inputValue('#modelSelect'), 'A');
+  const { page, context } = await open(browser, stub, { storage: { 'sushi-last-loaded': 'A' } });
+  assert.equal(await page.inputValue('#modelSelect'), 'A', 'nothing loaded: the one loaded last');
   stub.models = [cold('A'), model({ id: 'B' })];
   await page.evaluate(() => modelStore.refresh());
   await page.waitForFunction(() => document.getElementById('modelSelect').value === 'B');
@@ -525,6 +547,150 @@ test('a tool round follows the bottom only for a reader who is at the bottom', a
   await settled();
   assert.ok((await geometry()).gap < 24, 'at the bottom the view follows the tool result and the reply');
   assert.deepEqual(errors, []);
+  await context.close(); await stub.close();
+});
+
+test('a typed generation setting reaches the request as typed, and one out of range holds the send with a message on its field', async ({ browser }) => {
+  const stub = await startStub({ models: [model({ reasoning_efforts: ['low', 'high'], default_reasoning_effort: 'high' })] });
+  const { page, context } = await open(browser, stub);
+  const set = (id, value) => page.fill(`#${id}`, value);
+  await set('optMaxTokens', '1e9'); await set('optTemperature', '0.5');
+  await send(page, 'q'); await page.waitForSelector('.msg.assistant .content'); await idle(page);
+  const body = JSON.parse(stub.posts()[0].body);
+  assert.equal(body.max_tokens, 1e9, '1e9 is a billion, not 1');
+  assert.equal(body.temperature, 0.5);
+  const bad = [['optMaxTokens', '-5', /1 or more/], ['optMaxTokens', '1.7', /whole number/], ['optTemperature', '5', /0 to 2/], ['optTopP', '2', /0 to 1/], ['optTopK', '-3', /0 or more/], ['optThinkBudget', '0', /1 or more/]];
+  for (const [id, value, message] of bad) {
+    await page.reload(); await page.waitForSelector('#modelSelect option', { state: 'attached' });
+    await page.evaluate(() => { for (const id of ['optMaxTokens', 'optTemperature', 'optTopP', 'optTopK', 'optThinkBudget']) document.getElementById(id).value = ''; });
+    const before = stub.posts().length;
+    await set(id, value); await page.fill('#promptInput', 'q2'); await page.keyboard.press('Enter');
+    await page.waitForTimeout(150);
+    assert.equal(stub.posts().length, before, `${id}=${value}: nothing is sent`);
+    assert.equal(await page.inputValue('#promptInput'), 'q2', `${id}=${value}: the typed message stays`);
+    const view = await page.evaluate((id) => { const f = document.getElementById(id); return { invalid: f.getAttribute('aria-invalid'), message: f.closest('label').querySelector('[role=alert]')?.textContent ?? '' }; }, id);
+    assert.equal(view.invalid, 'true', `${id}=${value}: field flagged`);
+    assert.match(view.message, message, `${id}=${value}: message`);
+    await set(id, ''); 
+    assert.equal(await page.getAttribute(`#${id}`, 'aria-invalid'), 'false', `${id}: the flag goes when the value is cleared`);
+  }
+  await context.close(); await stub.close();
+});
+
+test('a send to a server that is gone says so in the page\'s words, and an interrupted request is not left as a running one', async ({ browser }) => {
+  const down = await startStub({ chat: (req, res) => res.socket.destroy() });
+  const a = await open(browser, down);
+  await send(a.page, 'question');
+  const text = await (await a.page.waitForSelector('.chat-error span')).textContent();
+  assert.match(text, /Can't reach the sushi server/);
+  assert.doesNotMatch(text, /Failed to fetch/);
+  const cut = await startStub({ chat: async (req, res) => { head(res); for (const word of ['one ', 'two ', 'three ']) { delta(res, word); await sleep(60); } res.socket.destroy(); } });
+  const b = await open(browser, cut);
+  await send(b.page, 'question');
+  await b.page.waitForSelector('.chat-error');
+  await idle(b.page);
+  const panel = await b.page.evaluate(() => ({ status: document.getElementById('perfStatus').textContent, tokens: document.getElementById('perfTokens').textContent }));
+  assert.equal(panel.status, 'interrupted', 'the last request panel says how the request ended');
+  assert.doesNotMatch(panel.tokens, /so far/, 'a request that is over is not "so far"');
+});
+
+test('the context size reads the same in the chat badge and on Models', async ({ browser }) => {
+  const stub = await startStub({ models: [model({ context_length: 974800 }), model({ id: 'Chat-B', context_length: 1048576 })] });
+  const { page } = await open(browser, stub);
+  assert.equal(await page.textContent('.badge[data-term^="ctx_size"]'), '974.8k-token context');
+  await page.selectOption('#modelSelect', 'Chat-B');
+  assert.equal(await page.textContent('.badge[data-term^="ctx_size"]'), '1M-token context');
+});
+
+test('on a phone a table keeps its words whole and scrolls sideways inside its frame', async ({ browser }) => {
+  const stub = await startStub();
+  const { page } = await open(browser, stub, { viewport: { width: 390, height: 844 } });
+  const seen = await page.evaluate(() => {
+    const msg = document.createElement('div');
+    msg.className = 'msg assistant';
+    const content = document.createElement('div');
+    content.className = 'content';
+    msg.appendChild(content);
+    document.getElementById('chatMessages').appendChild(msg);
+    content.appendChild(renderMarkdown('| alpha | beta | note |\n|---|---|---|\n| one | two | ' + 'a long explanation that goes on and on and on '.repeat(6) + ' |'));
+    const cells = [...content.querySelectorAll('th, td')].slice(0, 2);
+    const wrap = content.querySelector('.table-wrap');
+    return { short: cells.map((c) => c.getBoundingClientRect().height), line: parseFloat(getComputedStyle(cells[0]).lineHeight) || 24, wrapper: wrap.scrollWidth > wrap.clientWidth || cells.every((c) => c.getBoundingClientRect().width > 40) };
+  });
+  assert.ok(seen.short.every((h) => h < seen.line * 2.2 + 16), `short cells stay on one line (${JSON.stringify(seen)})`);
+  assert.equal(seen.wrapper, true);
+});
+
+test('the composer placeholder fits a phone and keeps its hint on a wide screen', async ({ browser }) => {
+  const stub = await startStub();
+  const { page: phone } = await open(browser, stub, { viewport: { width: 390, height: 844 } });
+  const fits = await phone.evaluate(() => { const p = document.getElementById('promptInput'), probe = document.createElement('span'); probe.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap;font:' + getComputedStyle(p).font; probe.textContent = p.placeholder; document.body.appendChild(probe); return probe.offsetWidth <= p.clientWidth; });
+  assert.equal(fits, true, 'the whole placeholder is visible at 390 px');
+  const { page: wide } = await open(browser, stub);
+  assert.match(await wide.getAttribute('#promptInput', 'placeholder'), /Shift\+Enter/);
+});
+
+test('the chat opens on the model loaded last, and on nothing when none ever was', async ({ browser }) => {
+  const cold = (id, extra = {}) => model({ id, state: 'unloaded', loaded: false, ...extra });
+  const never = await startStub({ models: [cold('Qwen/Source', { streaming_required: true }), cold('Pack-A')] });
+  const a = await open(browser, never);
+  assert.equal(await a.page.inputValue('#modelSelect'), '', 'no guess: the picker asks');
+  assert.match(await a.page.innerText('#modelStatus'), /choose a model/i);
+  await a.page.fill('#promptInput', 'hello');
+  await a.page.keyboard.press('Enter');
+  await a.page.waitForTimeout(200);
+  assert.equal(never.posts().length, 0, 'Send loads nothing the user did not pick');
+  assert.equal(await a.page.inputValue('#promptInput'), 'hello', 'the typed message stays');
+  assert.match(await a.page.textContent('#toastHost'), /Choose a model/);
+  await a.page.selectOption('#modelSelect', 'Pack-A');
+  await send(a.page, 'hello'); await a.page.waitForSelector('.msg.assistant .content');
+  assert.equal(JSON.parse(never.posts()[0].body).model, 'Pack-A', 'a picked model is sent');
+
+  const seen = await startStub({ models: [model({ id: 'Was-Loaded' }), cold('Other')] });
+  const b = await open(browser, seen);
+  assert.equal(await b.page.evaluate(() => localStorage.getItem('sushi-last-loaded')), 'Was-Loaded', 'what the server reports as loaded is remembered');
+  seen.models = [cold('Was-Loaded'), cold('Other')];
+  await b.page.reload();
+  await b.page.waitForSelector('#modelSelect option', { state: 'attached' });
+  assert.equal(await b.page.inputValue('#modelSelect'), 'Was-Loaded', 'unloaded since: still the one loaded last');
+  seen.models = [cold('Was-Loaded'), model({ id: 'Newer' })];
+  await b.page.evaluate(() => modelStore.refresh());
+  await b.page.waitForFunction(() => document.getElementById('modelSelect').value === 'Newer');
+  assert.equal(await b.page.evaluate(() => localStorage.getItem('sushi-last-loaded')), 'Newer');
+});
+
+test('a user message can be edited and resent: Send cuts the chat from it and regenerates, Cancel leaves everything as it was', async ({ browser }) => {
+  const stub = await startStub();
+  const history = [{ role: 'user', content: 'first question' }, { role: 'assistant', content: 'first answer' }, { role: 'user', content: 'second question' }, { role: 'assistant', content: 'second answer' }];
+  const { page, context } = await open(browser, stub, { storage: seedChats(chatOf('a', 'Edit me', history)) });
+  await page.click('.conv-item');
+  const edit = (n) => `.msg.user:nth-of-type(${n}) .msg-tools button[aria-label="Edit message"]`;
+  assert.equal(await page.locator('.msg.user .msg-tools button[aria-label="Edit message"]').count(), 2, 'every user message offers Edit');
+  await page.fill('#promptInput', 'a half-written draft');
+  await page.focus(edit(1));
+  await page.keyboard.press('Enter');
+  assert.equal(await page.inputValue('#promptInput'), 'first question', 'the composer takes the message');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'promptInput');
+  const banner = page.locator('#editBanner');
+  assert.match(await banner.textContent(), /Editing your message/);
+  assert.equal(await banner.getAttribute('role'), 'status');
+  assert.equal((await stored(page))[0].messages.length, 4, 'nothing is cut before Send');
+  await page.keyboard.press('Escape');
+  assert.equal(await banner.isHidden(), true, 'Escape cancels');
+  assert.equal(await page.inputValue('#promptInput'), 'a half-written draft', 'Cancel restores the draft');
+  assert.equal(await page.evaluate(() => document.activeElement.matches('button[aria-label="Edit message"]')), true, 'and the cursor returns to the Edit button');
+  await page.click(edit(1));
+  await page.click('#editCancel');
+  assert.equal(await banner.isHidden(), true);
+  assert.equal((await stored(page))[0].messages.length, 4);
+  await page.click(edit(1));
+  await page.fill('#promptInput', 'first question, reworded');
+  await page.keyboard.press('Enter');
+  await page.waitForSelector('.msg.assistant .content'); await idle(page);
+  const sent = JSON.parse(stub.posts().at(-1).body).messages;
+  assert.deepEqual(sent.map((m) => [m.role, m.content]), [['user', 'first question, reworded']], 'the request holds the edited message and nothing after it');
+  assert.deepEqual((await stored(page))[0].messages.map((m) => [m.role, m.content]), [['user', 'first question, reworded'], ['assistant', 'hello']]);
+  assert.equal(await banner.isHidden(), true);
   await context.close(); await stub.close();
 });
 

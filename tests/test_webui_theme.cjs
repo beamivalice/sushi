@@ -108,7 +108,8 @@ async function main() {
       await page.waitForSelector('#themeToggle');
       const pairs = [['--accent', '--surface'], ['--accent', '--surface-2'], ['--accent', '--bg'], ['--accent', '--accent-soft'],
         ['--on-accent-fill', '--accent-fill'], ['--on-accent-fill', '--accent-fill-hover'], ['--on-accent', '--accent'],
-        ['--text-2', '--surface-2'], ['--text-3', '--surface'], ['--text-3', '--surface-2'], ['--tip-muted', '--tip-bg']];
+        ['--text-2', '--surface-2'], ['--text-3', '--surface'], ['--text-3', '--surface-2'], ['--tip-muted', '--tip-bg'],
+        ['--info', '--info-soft'], ['--ok', '--ok-soft'], ['--warn', '--warn-soft'], ['--err', '--err-soft']];
       for (const [fg, bg, ratio] of await contrastIn(page, pairs)) assert.ok(ratio >= 4.5, `${scheme}: ${fg} on ${bg} is ${ratio.toFixed(2)}:1`);
       for (const [fg, bg, ratio] of await contrastIn(page, [['--focus', '--surface'], ['--focus', '--bg'], ['--c1', '--surface']])) {
         assert.ok(ratio >= 3, `${scheme}: ${fg} on ${bg} is ${ratio.toFixed(2)}:1, under the 3:1 a focus ring or chart line needs`);

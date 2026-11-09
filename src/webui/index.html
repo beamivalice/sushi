@@ -13,7 +13,7 @@
   --bg: light-dark(#f7f5f2, #0f1115); --surface: light-dark(#ffffff, #16191f); --surface-2: light-dark(#f1eeea, #1d2129); --surface-3: light-dark(#e8e4de, #262b35); --border: light-dark(#e6e1da, #272c36); --border-strong: light-dark(#d4cec5, #363d4a); --text: light-dark(#1d1b19, #eceef1); --text-2: light-dark(#5c5752, #a9b0bc); --text-3: light-dark(#6b645e, #8a93a1);
   /* salmon: --accent is the text-safe shade (AA on every surface), --accent-fill the light salmon behind dark ink */
   --accent: light-dark(#b3452a, #ffa286); --accent-hover: light-dark(#9c3b23, #ffb8a2); --accent-soft: light-dark(#fdeee8, #3a231c); --on-accent: light-dark(#ffffff, #2b1209); --accent-fill: light-dark(#f4896b, #ff9c7e); --accent-fill-hover: light-dark(#ef7656, #ffb39b); --on-accent-fill: light-dark(#3d1408, #2b1209); --accent-3: light-dark(#5f7a4a, #9cc27a); --focus: var(--accent);
-  --info: light-dark(#326fae, #6cb4d6); --info-soft: light-dark(#e3eef8, #16252f); --ok: light-dark(#177a3f, #4cc38a); --ok-soft: light-dark(#e2f3e9, #16281f); --warn: light-dark(#8a5b06, #e2b45b); --warn-soft: light-dark(#f8efd8, #2d2413); --err: light-dark(#b3261e, #f27b72); --err-soft: light-dark(#fbe9e7, #331c1a); --code-bg: light-dark(#f3f0ec, #1b1f27);
+  --info: light-dark(#2f6aa8, #6cb4d6); --info-soft: light-dark(#e3eef8, #16252f); --ok: light-dark(#177a3f, #4cc38a); --ok-soft: light-dark(#e2f3e9, #16281f); --warn: light-dark(#8a5b06, #e2b45b); --warn-soft: light-dark(#f8efd8, #2d2413); --err: light-dark(#b3261e, #f27b72); --err-soft: light-dark(#fbe9e7, #331c1a); --code-bg: light-dark(#f3f0ec, #1b1f27);
   /* charts: series, grid, axis text, reference lines; tooltips */
   --c1: light-dark(#dc5a36, #ff9c7e); --c2: light-dark(#1971c2, #5aa9f0); --c3: light-dark(#2f9e44, #63c27a); --c4: light-dark(#7048e8, #a08bf5); --chart-grid: var(--surface-2); --chart-axis: var(--text-2); --chart-ref: var(--warn); --tip-bg: var(--surface); --tip-border: var(--border-strong); --tip-text: var(--text); --tip-muted: var(--text-2);
   --sh-1: light-dark(rgb(20 22 25 / 5%), rgb(0 0 0 / 30%)); --sh-2: light-dark(rgb(20 22 25 / 6%), rgb(0 0 0 / 25%)); --sh-3: light-dark(rgb(20 22 25 / 10%), rgb(0 0 0 / 40%)); --sh-4: light-dark(rgb(20 22 25 / 14%), rgb(0 0 0 / 45%)); --shadow: 0 1px 2px var(--sh-1), 0 6px 24px var(--sh-2); --shadow-pop: 0 4px 12px var(--sh-3), 0 16px 48px var(--sh-4);
@@ -61,6 +61,9 @@ textarea { height: auto; padding: var(--s2) 10px; }
 input::placeholder, textarea::placeholder { color: var(--text-3); }
 select { appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--text-3) 50%), linear-gradient(135deg, var(--text-3) 50%, transparent 50%); background-position: calc(100% - 18px) 55%, calc(100% - 13px) 55%; background-size: 5px 5px; background-repeat: no-repeat; padding-right: 32px; }
 select:disabled { opacity: .6; }
+.field-bad { font-size: var(--fs-xs); font-weight: 450; color: var(--err); }
+.field-bad:empty { display: none; }
+label.field input[aria-invalid="true"] { border-color: var(--err); }
 label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sm); font-weight: 550; color: var(--text-2); }
 
 /* Pills, dots */
@@ -147,7 +150,11 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .msg.user .bubble { background: var(--surface-2); border: 1px solid var(--border); border-radius: 16px 16px 4px 16px; padding: 10px 16px; max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.assistant .content { font-size: var(--fs-base); overflow-wrap: anywhere; }
 .msg .msg-tools { display: flex; align-items: center; gap: 4px; margin-top: 4px; opacity: 0; transition: opacity var(--dur-2) var(--ease-out); }
-.msg:hover .msg-tools, .msg.last .msg-tools { opacity: 1; }
+.msg:hover .msg-tools, .msg.last .msg-tools, .msg:focus-within .msg-tools { opacity: 1; }
+.msg.editing .bubble { border-color: var(--accent); }
+.edit-banner { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: var(--fs-sm); color: var(--text-2); }
+.edit-banner[hidden] { display: none; }
+.edit-banner span { flex: 1; }
 .msg .msg-tools .icon-btn { width: 27px; height: 27px; }
 .msg .msg-tools .icon-btn svg { width: 14px; height: 14px; }
 .msg .msg-meta { font-size: var(--fs-sm); color: var(--text-3); font-variant-numeric: tabular-nums; margin-right: 4px; }
@@ -193,7 +200,9 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .svg-preview img { max-width: 100%; height: auto; background: #fff; border-radius: var(--r-sm); }
 .table-wrap { overflow-x: auto; margin: 0 0 12px; border: 1px solid var(--border); border-radius: var(--r-lg); }
 .content table { border-collapse: collapse; width: 100%; font-size: var(--fs-md); }
-.content th, .content td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.content th, .content td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); overflow-wrap: normal; }
+.content li.task { list-style: none; margin-left: -1.3em; }
+.content li.task > input { margin: 0 6px 0 0; vertical-align: -1px; }
 .content th { background: var(--surface-2); font-weight: 600; }
 .content tr:last-child td { border-bottom: 0; }
 
@@ -220,6 +229,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 #folderList { max-height: 36vh; overflow: auto; margin-top: 12px; }
 #folderList button { display: block; text-align: left; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 4px; }
 #folderError { color: var(--err); }
+#folderPicker #folderNote { margin: 8px 0 0; color: var(--text-2); }
 .drawer-head, #chatScrim { display: none; }
 #toolsButton { flex: none; white-space: nowrap; }
 #toolsButton[aria-pressed="true"] { color: var(--accent); border-color: currentColor; }
@@ -781,6 +791,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="composer-wrap">
       <div class="composer-column">
         <div id="composer">
+          <div id="editBanner" class="edit-banner" role="status" hidden><span id="editText"></span><button class="btn sm" id="editCancel" type="button">Cancel</button></div>
           <div id="composerAttachRow" class="composer-attach" hidden></div>
           <textarea id="promptInput" rows="1" placeholder="Message sushi (Enter to send, Shift+Enter for a new line)" aria-label="Message"></textarea>
           <div class="composer-row">
@@ -1032,6 +1043,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <button class="btn" type="submit">Go</button>
   </form>
   <div class="folder-row"><button class="btn sm" id="folderUp" type="button">Parent folder</button></div>
+  <p id="folderNote" hidden></p>
   <p id="folderError" role="alert" hidden></p>
   <div id="folderList" aria-label="Folders" aria-live="polite"></div>
   <div class="folder-row">
@@ -1220,7 +1232,12 @@ function showKeyOverlay(error) {
 $("keyForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const key = $("keyInput").value.trim();
-  if (!key) return;
+  if (!key) {
+    $("keyError").textContent = "Enter the API key.";
+    $("keyError").hidden = false;
+    $("keyInput").focus();
+    return;
+  }
   apiKey = key;
   dropStore("sushi-api-key");
   writeStore("sushi-api-key", key, !$("keyRemember").checked);
@@ -1230,6 +1247,7 @@ $("keyForm").addEventListener("submit", async (event) => {
   window.sushiAdmin?.refresh();
   await refreshModels();
   loadVersion();
+  if (location.pathname === "/chat" || location.pathname === "/") $("promptInput").focus();
 });
 for (const button of [$("forgetKeyButton"), $("forgetKeyMenu")]) {
   button.onclick = () => {
@@ -1256,8 +1274,23 @@ function forgetRecoveredLoads(failed, models) {
   for (const m of models) if ((m.state === "ready" || m.state === "loading") && failed.delete(m.id)) dropped = true;
   return dropped;
 }
+// The one reading of a token count, everywhere it is shown: thousands, not 1024s.
+function fmtTokens(n) {
+  n = Number(n);
+  if (n >= 1e6) return `${+(n / 1e6).toFixed(1)}M`;
+  return n >= 1e4 ? `${+(n / 1e3).toFixed(1)}k` : n.toLocaleString("en-US");
+}
+// The engine names a load failure by its Zig error tag; the user gets what to do about it.
+function loadFailureText(message) {
+  const tag = /^Failed to load model: (\w+)$/.exec(message)?.[1];
+  if (!tag) return message;
+  return {
+    ExpertCacheTooSmall: "This model needs more memory for SSD streaming. Set Memory for SSD streaming (GiB) in its settings, or start sushi with --ssd-budget-gb.",
+    OutOfMemory: "Not enough memory to load this model. Unload another model or close other apps, then try again.",
+  }[tag] ?? `The model could not be loaded (${tag}). The server log has the details.`;
+}
 const modelStore = {
-  list: [], text: "", online: null, view: "chat", seq: 0, applied: 0, timer: null,
+  list: [], text: "", online: null, error: "", view: "chat", seq: 0, applied: 0, timer: null,
   subs: new Set(), pending: new Map(), failed: new Map(),
   byId(id) { return this.list.find((model) => model.id === id); },
   subscribe(fn) { this.subs.add(fn); return () => this.subs.delete(fn); },
@@ -1265,18 +1298,20 @@ const modelStore = {
   async refresh() {
     clearTimeout(this.timer);
     const mine = ++this.seq;
-    let text = null, online = true;
+    let text = null, online = true, error = "";
     try {
       const response = await api("/v1/models");
       if (response.ok) text = await response.text();
-      else if (response.status !== 401) online = false;
+      else if (response.status !== 401) error = adminErrorText(new Error(`${response.status} ${await response.text()}`));
     } catch { online = false; }
     if (mine < this.applied) return;
     this.applied = mine;
     let changed = online !== this.online;
     if (text !== null && text !== this.text) {
-      try { this.list = JSON.parse(text).data ?? []; this.text = text; changed = true; } catch { /* keep the last list */ }
+      try { this.list = JSON.parse(text).data ?? []; this.text = text; changed = true; } catch { error = "The server sent a model list this page cannot read."; }
     }
+    if (error !== this.error) changed = true;
+    this.error = error;
     this.online = online;
     if (forgetRecoveredLoads(this.failed, this.list)) changed = true;
     if (changed) this.emit();
@@ -1304,7 +1339,7 @@ const modelStore = {
       if (kind !== "unload") await postJson("/v1/load-model", { model: id });
       done = true;
     } catch (error) {
-      const message = adminErrorText(error);
+      const message = loadFailureText(adminErrorText(error));
       this.failed.set(id, message);
       if (!window.sushiAdmin?.shows(id)) toast(`${verbs[1]} failed: ${message}`, "err");
     }
@@ -1324,12 +1359,13 @@ function renderServerStatus() {
   const ready = list.filter((model) => model.state === "ready"), loading = list.filter((model) => model.state === "loading");
   let tone = "", text = "Checking…";
   if (online === false) [tone, text] = ["err", "Offline"];
+  else if (modelStore.error) [tone, text] = ["err", "Server error"];
   else if (online && ready.length) [tone, text] = ["ok", ready[0].id + (ready.length > 1 ? ` +${ready.length - 1}` : "")];
   else if (online && loading.length) [tone, text] = ["busy", `Loading ${loading[0].id}…`];
   else if (online) [tone, text] = ["off", "No model loaded"];
   $("serverDotLight").className = `dot ${tone}`;
   $("serverDotLabel").textContent = text;
-  const full = online === false ? "Server unreachable" : `Server online. ${text}`;
+  const full = online === false ? "Server unreachable" : modelStore.error ? `Server error: ${modelStore.error}` : `Server online. ${text}`;
   $("serverDot").title = full;
   $("serverDot").setAttribute("aria-label", full);
 }
@@ -1447,17 +1483,36 @@ function inlineNodes(text) {
   const codes = [];
   const masked = String(text ?? "")
     .replace(/`([^`\n]+)`/g, (_, code) => `${codes.push(code) - 1}`)
-    .replace(/\\([\\*_\[\]()#+\-.!|>~])/g, (_, mark) => `${codes.push({ literal: mark }) - 1}`);
+    // TeX is shown as written: its backslashes and stars are not markdown.
+    .replace(/\$\$[\s\S]+?\$\$|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\]/g, (tex) => `${codes.push({ literal: tex }) - 1}`)
+    .replace(/\\([\\*_#+\-.!|>~])/g, (_, mark) => `${codes.push({ literal: mark }) - 1}`);
   inlineStyled(masked, fragment, codes);
   return fragment;
 }
-function inlineText(text, host, codes) {
+// A bare address becomes a link; sentence punctuation and an unmatched closing parenthesis stay outside it.
+function linkedText(text, host) {
+  let cursor = 0;
+  for (const match of text.matchAll(/https?:\/\/[^\s<>*]+/g)) {
+    let url = match[0];
+    while (/[.,;:!?'"_~]$/.test(url) || (url.endsWith(")") && url.split(")").length > url.split("(").length)) url = url.slice(0, -1);
+    if (url.length <= 8) continue;
+    if (match.index > cursor) host.appendChild(document.createTextNode(text.slice(cursor, match.index)));
+    const anchor = el("a", null, url);
+    anchor.href = url;
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+    host.appendChild(anchor);
+    cursor = match.index + url.length;
+  }
+  if (cursor < text.length) host.appendChild(document.createTextNode(text.slice(cursor)));
+}
+function inlineText(text, host, codes, linkify = true) {
   text.split(/(\d+)/).forEach((part, index) => {
     if (index % 2 === 1) {
       const code = codes[Number(part)];
       host.appendChild(typeof code === "string" ? el("code", null, code) : document.createTextNode(code.literal));
     }
-    else if (part) host.appendChild(document.createTextNode(part));
+    else if (part) linkify ? linkedText(part, host) : host.appendChild(document.createTextNode(part));
   });
 }
 function inlineStyled(text, host, codes) {
@@ -1465,16 +1520,29 @@ function inlineStyled(text, host, codes) {
   let cursor = 0;
   let match;
   while ((match = linkRe.exec(text)) !== null) {
-    if (match.index > cursor) inlineEmphasis(text.slice(cursor, match.index), host, codes);
+    if (match.index > cursor) inlineStrike(text.slice(cursor, match.index), host, codes);
     if (match[1]) host.appendChild(remoteImageNode(match[3], match[2]));
     else {
       const anchor = el("a");
-      inlineText(match[2], anchor, codes);
+      inlineText(match[2], anchor, codes, false);
       anchor.href = match[3];
       anchor.target = "_blank";
       anchor.rel = "noopener noreferrer";
       host.appendChild(anchor);
     }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) inlineStrike(text.slice(cursor), host, codes);
+}
+function inlineStrike(text, host, codes) {
+  const strikeRe = /~~(?=\S)([^~]*[^~\s])~~/g;
+  let cursor = 0;
+  let match;
+  while ((match = strikeRe.exec(text)) !== null) {
+    if (match.index > cursor) inlineEmphasis(text.slice(cursor, match.index), host, codes);
+    const del = el("del");
+    inlineEmphasis(match[1], del, codes);
+    host.appendChild(del);
     cursor = match.index + match[0].length;
   }
   if (cursor < text.length) inlineEmphasis(text.slice(cursor), host, codes);
@@ -1579,6 +1647,7 @@ function tableCells(line) {
   cells.push(cell.trim());
   return cells.length >= 2 ? cells : null;
 }
+const tableAlign = (cell) => (cell.startsWith(":") ? (cell.endsWith(":") ? "center" : "left") : cell.endsWith(":") ? "right" : "");
 function isTableSeparator(line) {
   const cells = tableCells(line);
   return Boolean(cells && cells.every((cell) => /^:?-{3,}:?$/.test(cell)));
@@ -1650,9 +1719,19 @@ function readList(lines, start, parentIndent) {
   while (index < lines.length) {
     const itemMatch = lines[index].match(LIST_ITEM);
     const indent = indentOf(lines[index]);
-    if (!itemMatch || indent <= parentIndent || indent >= base + 2) break;
+    if (!itemMatch || indent <= parentIndent || indent >= base + 2 || /\d/.test(itemMatch[2]) !== ordered) break;
     const item = el("li");
-    item.appendChild(inlineNodes(itemMatch[3]));
+    const task = itemMatch[3].match(/^\[([ xX])\]\s+(.*)$/);
+    if (task) {
+      const box = el("input");
+      box.type = "checkbox";
+      box.disabled = true;
+      box.checked = task[1] !== " ";
+      box.setAttribute("aria-label", box.checked ? "done" : "not done");
+      item.className = "task";
+      item.appendChild(box);
+    }
+    item.appendChild(inlineNodes(task ? task[2] : itemMatch[3]));
     index += 1;
     while (index < lines.length && indentOf(lines[index]) >= base + 2) {
       const next = lines[index];
@@ -1696,6 +1775,14 @@ function renderMarkdown(text) {
       index += 1;
       continue;
     }
+    const underline = lines[index + 1]?.match(/^ {0,3}(=+|-+)\s*$/);
+    if (underline && line.trim() && !LIST_ITEM.test(line) && !/^>/.test(line) && !tableCells(line)) {
+      const node = el(underline[1][0] === "=" ? "h1" : "h2");
+      node.appendChild(inlineNodes(line.trim()));
+      fragment.appendChild(node);
+      index += 2;
+      continue;
+    }
     if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line) && line.trim().length >= 3) {
       fragment.appendChild(el("hr"));
       index += 1;
@@ -1714,6 +1801,7 @@ function renderMarkdown(text) {
     }
     if (tableCells(line) && index + 1 < lines.length && isTableSeparator(lines[index + 1])) {
       const headerCells = tableCells(line);
+      const aligns = tableCells(lines[index + 1]).map(tableAlign);
       index += 2;
       const rows = [];
       while (index < lines.length && tableCells(lines[index])) {
@@ -1726,6 +1814,7 @@ function renderMarkdown(text) {
       const headRow = el("tr");
       for (const cell of headerCells) {
         const th = el("th");
+        th.style.textAlign = aligns[headRow.children.length];
         th.appendChild(inlineNodes(cell));
         headRow.appendChild(th);
       }
@@ -1735,6 +1824,7 @@ function renderMarkdown(text) {
         const tr = el("tr");
         for (let cellIndex = 0; cellIndex < headerCells.length; cellIndex += 1) {
           const td = el("td");
+          td.style.textAlign = aligns[cellIndex];
           td.appendChild(inlineNodes(cells[cellIndex] ?? ""));
           tr.appendChild(td);
         }
@@ -1922,6 +2012,32 @@ function persistChatOptions() {
   writeStore(OPTIONS_KEY, JSON.stringify(stored));
 }
 for (const id of optionFields) $(id).addEventListener("change", persistChatOptions);
+const chatNumberFields = ["optMaxTokens", "optTemperature", "optTopP", "optTopK", "optThinkBudget"];
+// Flags every setting field that cannot be sent; returns the first one.
+function checkChatNumbers() {
+  let first = null;
+  for (const id of chatNumberFields) {
+    const input = $(id), problem = input.disabled ? undefined : chatNumber(id).problem;
+    input.setAttribute("aria-invalid", String(!!problem));
+    input.parentElement.querySelector(".field-bad").textContent = problem ?? "";
+    if (problem) first ??= input;
+  }
+  return first;
+}
+function chatSettingsOk() {
+  const bad = checkChatNumbers();
+  if (!bad) return true;
+  if (isMobileViewport()) setChatAside("right", true);
+  bad.focus();
+  toast(`${bad.parentElement.firstChild.textContent.trim()}: ${bad.parentElement.querySelector(".field-bad").textContent}`, "err");
+  return false;
+}
+for (const id of chatNumberFields) {
+  const note = el("span", "field-bad");
+  note.setAttribute("role", "alert");
+  $(id).after(note);
+  $(id).addEventListener("input", checkChatNumbers);
+}
 $("chatOptionsReset").onclick = () => {
   for (const id of optionFields) $(id).value = "";
   persistChatOptions();
@@ -1985,11 +2101,28 @@ function selectedModel() {
 const refreshModels = () => modelStore.refresh();
 modelStore.subscribe(() => {
   modelCatalog = modelStore.list.filter(isChatModel);
+  noteLoaded(modelCatalog);
   renderModelOptions();
 });
+const LAST_LOADED_KEY = "sushi-last-loaded";
+let seenReady = null;
+// The model the server last reported loaded, remembered by this browser; the picker's fallback when nothing is loaded.
+function noteLoaded(list) {
+  const ready = list.filter((m) => m.state === "ready" || m.state === "loading").map((m) => m.id);
+  const fresh = seenReady ? ready.filter((id) => !seenReady.includes(id)) : ready.includes(readStore(LAST_LOADED_KEY)) ? [] : ready.slice(0, 1);
+  seenReady = ready;
+  if (fresh.length) writeStore(LAST_LOADED_KEY, fresh.at(-1));
+}
+function noChatModel() {
+  if (modelCatalog.length) {
+    if (isMobileViewport()) setChatAside("right", true);
+    $("modelSelect").focus();
+  }
+  toast(modelCatalog.length ? "Choose a model in Chat settings first." : "No chat model yet. Download or load one on Models.", "err");
+}
 function renderModelOptions() {
   const select = $("modelSelect");
-  const stored = readStore("sushi-model"), shown = select.value;
+  const shown = select.value;
   // Rebuild only when the set changed, so a poll does not snap an open dropdown shut.
   const signature = modelCatalog.map((model) => `${model.id}${model.loaded ? "*" : ""}`).join("|");
   if (select.dataset.signature !== signature) {
@@ -2002,10 +2135,18 @@ function renderModelOptions() {
     }
   }
   const ids = modelCatalog.map((model) => model.id);
-  const isLoaded = (id) => { const m = modelCatalog.find((x) => x.id === id); return Boolean(m && (m.state ? m.state === "ready" : m.loaded)); };
+  const isLoaded = (id) => { const m = modelCatalog.find((x) => x.id === id); return Boolean(m && (m.state ? m.state === "ready" || m.state === "loading" : m.loaded)); };
   // A send to a model that is not loaded cold-loads it and evicts the loaded one, so the loaded model wins unless this session picked another.
-  const wanted = [stored, shown].filter((id) => id && ids.includes(id));
-  select.value = ids.includes(pickedModel) ? pickedModel : wanted.find(isLoaded) ?? ids.find(isLoaded) ?? wanted[0] ?? ids[0] ?? "";
+  const wanted = [shown].filter((id) => id && ids.includes(id));
+  const last = readStore(LAST_LOADED_KEY);
+  select.value = ids.includes(pickedModel) ? pickedModel : wanted.find(isLoaded) ?? ids.find(isLoaded) ?? (ids.includes(last) ? last : "");
+  select.querySelector('option[value=""]')?.remove();
+  if (!select.value) {
+    const choose = el("option", null, "Choose a model");
+    choose.value = "";
+    select.prepend(choose);
+    select.value = "";
+  }
   renderEffortOptions();
   renderModelStatus();
 }
@@ -2075,7 +2216,7 @@ function renderModelStatus() {
   const host = $("modelStatus");
   host.textContent = "";
   if (!model) {
-    host.appendChild(el("span", "badge flag", "no chat model found"));
+    host.appendChild(el("span", "badge flag", modelCatalog.length ? "choose a model" : "no chat model found"));
     return;
   }
   const ready = model.state ? model.state === "ready" : Boolean(model.loaded);
@@ -2092,12 +2233,11 @@ function renderModelStatus() {
   }
   const context = Number(model.context_length ?? 0);
   const tipped = (node, tip, term) => { node.tabIndex = 0; node.dataset.tip = tip; node.dataset.term = term; return node; };
-  if (context > 0) host.appendChild(tipped(el("span", "badge", `${fmtInt(context)}-token context`), "The most text one conversation can hold: messages, replies and attachments together, in tokens.", "ctx_size (context window, input and output tokens)"));
+  if (context > 0) host.appendChild(tipped(el("span", "badge", `${fmtTokens(context)}-token context`), "The most text one conversation can hold: messages, replies and attachments together, in tokens.", "ctx_size (context window, input and output tokens)"));
   if (vision) host.appendChild(tipped(el("span", "badge", "sees images"), "This model can read images you attach.", "vision (input_modalities: image)"));
 }
 $("modelSelect").addEventListener("change", () => {
   pickedModel = $("modelSelect").value;
-  writeStore("sushi-model", pickedModel);
   renderEffortOptions();
   renderModelStatus();
 });
@@ -2354,6 +2494,50 @@ function messageTools(message, extras = []) {
   tools.appendChild(copy);
   return tools;
 }
+// Editing a user message refills the composer; Send then cuts the chat from that message and answers the new text.
+let editing = null;
+function editButton() {
+  const edit = el("button", "icon-btn");
+  edit.type = "button";
+  edit.setAttribute("aria-label", "Edit message");
+  edit.title = "Edit";
+  edit.appendChild(icon("pencil", 14));
+  edit.onclick = () => beginEdit(Number(edit.closest(".msg").dataset.mi), edit);
+  return edit;
+}
+function markEditing() {
+  for (const node of $("chatMessages").querySelectorAll(".msg.editing")) node.classList.remove("editing");
+  if (editing && editing.chat === currentChat) $("chatMessages").querySelector(`.msg[data-mi="${editing.index}"]`)?.classList.add("editing");
+}
+function beginEdit(index, button) {
+  const message = currentChat?.messages[index];
+  if (chatAbort || !message) return;
+  editing = { draft: editing?.draft ?? $("promptInput").value, images: editing?.images ?? pendingImages.slice(), chat: currentChat, index, button };
+  $("promptInput").value = message.content ?? "";
+  pendingImages = (message.images ?? []).slice();
+  renderComposerAttachments();
+  autosizePrompt();
+  $("editText").textContent = "Editing your message. Send replaces it and every message after it.";
+  $("editBanner").hidden = false;
+  markEditing();
+  $("promptInput").focus();
+}
+// `restore` puts the composer back as it was before Edit; a Send has already emptied it.
+function endEdit(restore) {
+  if (!editing) return;
+  const { draft, images, button } = editing;
+  editing = null;
+  $("editBanner").hidden = true;
+  $("editText").textContent = "";
+  markEditing();
+  if (!restore) return;
+  $("promptInput").value = draft;
+  pendingImages = images;
+  renderComposerAttachments();
+  autosizePrompt();
+  (button.isConnected ? button : $("promptInput")).focus();
+}
+$("editCancel").onclick = () => endEdit(true);
 function regenerateButton() {
   const regen = el("button", "icon-btn");
   regen.setAttribute("aria-label", "Regenerate the reply");
@@ -2412,7 +2596,7 @@ function appendMessageNode(message, { last = false, toolCall = null } = {}) {
       node.appendChild(el("div", "msg-note", `${count} image${count === 1 ? " was" : "s were"} not kept after reload`));
     }
     if (message.content) node.appendChild(el("div", "bubble", message.content));
-    node.appendChild(messageTools(message));
+    node.appendChild(messageTools(message, [editButton()]));
   } else {
     if (message.reasoning) {
       const thinking = el("details", "thinking");
@@ -2452,8 +2636,11 @@ function renderTranscript(toBottom = false) {
   const callsById = new Map();
   messages.forEach((message, index) => {
     for (const call of message.tool_calls ?? []) callsById.set(call.id, call);
-    appendMessageNode(message, { last: index === lastAssistantIndex, toolCall: callsById.get(message.tool_call_id) });
+    const node = appendMessageNode(message, { last: index === lastAssistantIndex, toolCall: callsById.get(message.tool_call_id) });
+    if (node) node.dataset.mi = String(index);
   });
+  if (editing && editing.chat !== currentChat) endEdit(true);
+  markEditing();
   if (lastTurnError) {
     const notice = el("div", "chat-error");
     notice.append(icon("x", 15), el("span", null, lastTurnError));
@@ -2511,13 +2698,13 @@ const perfMon = {
       this.set("perfTokens", fmtInt(this.deltas), "so far");
     }
   },
-  finish(usage, timings) {
+  finish(usage, timings, broken = false) {
     clearInterval(this.timer);
     this.timer = 0;
     if (!this.startedAt) return;
     const now = performance.now();
-    this.set("perfStatus", "idle");
-    $("perfStatus").style.color = "";
+    this.set("perfStatus", broken ? "interrupted" : "idle");
+    $("perfStatus").style.color = broken ? "var(--err)" : "";
     this.set("perfDuration", ((now - this.startedAt) / 1000).toFixed(1), "s");
     if (!this.firstAt) this.set("perfFirstToken", "—");
     const promptTokens = Number(usage?.prompt_tokens ?? 0);
@@ -2532,7 +2719,7 @@ const perfMon = {
     const decodeRate = Number(timings?.predicted_per_second ?? 0) || (outputTokens > 1 && clientSeconds > 0.05 ? outputTokens / clientSeconds : 0);
     if (decodeRate > 0) this.set("perfGeneration", decodeRate.toFixed(1), "tokens/s");
     else this.set("perfGeneration", "—");
-    this.set("perfTokens", fmtInt(outputTokens), usage?.completion_tokens ? "tokens" : "so far");
+    this.set("perfTokens", fmtInt(outputTokens), usage?.completion_tokens ? "tokens" : broken ? "received" : "so far");
     this.startedAt = 0;
   },
 };
@@ -2620,7 +2807,7 @@ async function callResearchTools(body, signal) {
     body: JSON.stringify(body), signal,
   });
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error?.message ?? `Tools: ${response.status}`);
+  if (!response.ok) throw Object.assign(new Error(result.error?.message ?? `Tools: ${response.status}`), { status: response.status });
   return result;
 }
 function chatDirectory() {
@@ -2680,17 +2867,23 @@ $("editButton").onclick = () => setChatEdit(!chatEdit());
 let folderSelection = null;
 let folderAbort = null;
 let folderOpts = null;
-async function browseFolder(directory) {
+// `opening`: the folder came from a setting, so one that is gone falls back to its nearest parent that exists.
+let folderMissing = "";
+async function browseFolder(directory, opening = false) {
   folderAbort?.abort();
   const controller = folderAbort = new AbortController();
   folderSelection = null;
   $("folderChoose").disabled = true;
   $("folderUp").disabled = true;
   $("folderError").hidden = true;
+  if (!opening) folderMissing = "";
   $("folderList").textContent = "Loading folders…";
   try {
     const listing = await callResearchTools({ browse: true, ...(directory ? { directory } : {}) }, controller.signal);
     if (controller.signal.aborted) return;
+    $("folderNote").textContent = folderMissing ? `${folderMissing} does not exist yet. Showing the nearest folder that does.` : "";
+    $("folderNote").hidden = !folderMissing;
+    folderMissing = "";
     folderSelection = listing;
     $("folderPath").value = listing.root;
     $("folderUp").disabled = listing.parent === listing.root;
@@ -2707,9 +2900,17 @@ async function browseFolder(directory) {
     if (listing.truncated) $("folderList").appendChild(el("p", null, "More folders exist. Enter a path above to go directly."));
   } catch (error) {
     if (controller.signal.aborted) return;
+    const cut = directory?.lastIndexOf("/") ?? -1;
+    if (opening && error.status === 400 && cut >= 0 && directory !== "/") {
+      folderMissing ||= directory;
+      return browseFolder(directory.slice(0, cut) || "/", true);
+    }
+    folderMissing = "";
+    $("folderNote").hidden = true;
     $("folderList").textContent = "";
-    folderError(folderOpts?.typed ? `${error.message}. Type the folder's full path above to use it.` : error.message);
-    typedChoice();
+    // Only a refused browse (403, a server beyond this Mac) leaves a typed path to try; a folder the server named bad is not offered.
+    folderError(folderOpts?.typed && error.status === 403 ? `${error.message}. Type the folder's full path above to use it.` : /[.!?]$/.test(error.message) ? error.message : `${error.message[0].toUpperCase()}${error.message.slice(1)}.`);
+    typedChoice(error.status === 403);
   }
 }
 function folderError(message) {
@@ -2717,9 +2918,11 @@ function folderError(message) {
   $("folderError").hidden = !message;
 }
 // Where browsing is refused (a server bound beyond loopback), a `typed` picker still takes an absolute path as typed.
-function typedChoice() {
-  if (folderOpts?.typed && !folderSelection) $("folderChoose").disabled = !$("folderPath").value.trim().startsWith("/");
+function typedChoice(refused = folderTypedOk) {
+  folderTypedOk = refused;
+  if (folderOpts?.typed && !folderSelection) $("folderChoose").disabled = !refused || !$("folderPath").value.trim().startsWith("/");
 }
+let folderTypedOk = false;
 function openFolderPicker(opts) {
   folderOpts = opts;
   $("folderTitle").textContent = opts.title;
@@ -2728,8 +2931,10 @@ function openFolderPicker(opts) {
   $("folderAlt").hidden = !opts.alt;
   if (opts.alt) $("folderAlt").textContent = opts.alt.label;
   $("folderPath").value = opts.start ?? "";
+  $("folderNote").hidden = true;
+  folderTypedOk = false;
   $("folderPicker").showModal();
-  browseFolder(opts.start);
+  browseFolder(opts.start, true);
 }
 async function finishFolder(pick) {
   const opts = folderOpts, buttons = [$("folderChoose"), $("folderAlt")];
@@ -2755,7 +2960,8 @@ $("directoryButton").onclick = () => {
 };
 $("folderForm").onsubmit = (event) => {
   event.preventDefault();
-  browseFolder($("folderPath").value.trim());
+  const path = $("folderPath").value.trim();
+  if (path) browseFolder(path);
 };
 $("folderPath").oninput = () => { folderSelection = null; $("folderChoose").disabled = true; typedChoice(); };
 $("folderUp").onclick = () => { if (folderSelection) browseFolder(folderSelection.parent); };
@@ -2793,6 +2999,16 @@ function wireMessages(history) {
   }
   return out;
 }
+// A numeric setting as typed: { value } (null when empty) or { problem } when the request could not carry it.
+function chatNumber(id) {
+  const input = $(id), raw = input.value.trim();
+  if (raw === "") return { value: null };
+  const n = Number(raw), whole = input.step === "1";
+  const min = input.min ? +input.min : -Infinity, max = input.max ? +input.max : Infinity;
+  if (Number.isFinite(n) && (!whole || Number.isInteger(n)) && n >= min && n <= max) return { value: n };
+  const noun = whole ? "a whole number" : "a number";
+  return { problem: max === Infinity ? `Enter ${noun} of ${min} or more` : `Enter ${noun} from ${min} to ${max}` };
+}
 function buildRequest(model, history, tools = null) {
   const body = { model, messages: wireMessages(history), stream: true, stream_options: { include_usage: true } };
   // With no tools offered, the server bans call markup, so earlier calls cannot leak as text.
@@ -2800,19 +3016,11 @@ function buildRequest(model, history, tools = null) {
   else body.tool_choice = "none";
   const effort = $("effortSelect").value;
   if (effort) body.reasoning_effort = effort;
-  const budget = parseInt($("optThinkBudget").value.trim(), 10);
+  const budget = chatNumber("optThinkBudget").value;
   if (effort !== "off" && budget > 0) body.reasoning_budget_tokens = budget;
-  const numeric = [
-    ["optMaxTokens", "max_tokens", parseInt],
-    ["optTemperature", "temperature", parseFloat],
-    ["optTopP", "top_p", parseFloat],
-    ["optTopK", "top_k", parseInt],
-  ];
-  for (const [fieldId, key, parse] of numeric) {
-    const raw = $(fieldId).value.trim();
-    if (raw === "") continue;
-    const value = parse(raw, 10);
-    if (Number.isFinite(value)) body[key] = value;
+  for (const [fieldId, key] of [["optMaxTokens", "max_tokens"], ["optTemperature", "temperature"], ["optTopP", "top_p"], ["optTopK", "top_k"]]) {
+    const { value } = chatNumber(fieldId);
+    if (value !== null && value !== undefined) body[key] = value;
   }
   return body;
 }
@@ -2899,7 +3107,7 @@ async function streamReply(model, history, signal, tools = null) {
       headers: { "content-type": "application/json" },
       signal,
       body: JSON.stringify(buildRequest(model, history, tools)),
-    });
+    }).catch((error) => { throw error.name === "AbortError" ? error : new Error("Can't reach the sushi server. Check that it is running, then Retry."); });
     if (!response.ok) {
       let detail = await response.text();
       try {
@@ -2961,11 +3169,11 @@ async function streamReply(model, history, signal, tools = null) {
   } catch (error) {
     if (!(signal.aborted && error.name === "AbortError")) {
       view.finalize();
-      perfMon.finish(null, null);
+      perfMon.finish(null, null, true);
       throw interrupted(error, view);
     }
   }
-  perfMon.finish(usage, timings);
+  perfMon.finish(usage, timings, !!streamError || (!completed && !signal.aborted));
   refreshPrefixCache();
   view.finalize();
   if (!streamError && !completed && !signal.aborted) streamError = "The connection closed before the reply was finished";
@@ -3032,7 +3240,7 @@ async function runResearchTurn(model, messages, signal, tools, vision, directory
 async function runTurn(chat) {
   const model = $("modelSelect").value;
   if (!model) {
-    toast("No chat model yet. Download or load one on Models.", "err");
+    noChatModel();
     return;
   }
   chatAbort = new AbortController();
@@ -3066,9 +3274,11 @@ async function sendChat(text) {
   const images = pendingImages.slice();
   if (!content && !images.length) return;
   if (!$("modelSelect").value) {
-    toast("No chat model yet. Download or load one on Models.", "err");
+    noChatModel();
     return;
   }
+  if (editing && editing.chat === currentChat) currentChat.messages.splice(editing.index);
+  endEdit(false);
   if (!currentChat) currentChat = { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`, title: "", messages: [], directory: draftDirectory, edit: draftEdit };
   pendingImages = [];
   renderComposerAttachments();
@@ -3077,7 +3287,7 @@ async function sendChat(text) {
   await runTurn(currentChat);
 }
 async function regenerateLast() {
-  if (chatAbort || !currentChat) return;
+  if (chatAbort || !currentChat || !chatSettingsOk()) return;
   const messages = currentChat.messages;
   const lastUser = messages.map((message) => message.role).lastIndexOf("user");
   if (lastUser === -1) return;
@@ -3102,9 +3312,10 @@ $("sendButton").onclick = () => {
   const text = $("promptInput").value;
   if ((!text.trim() && !pendingImages.length) || chatAbort) return;
   if (!$("modelSelect").value) {
-    toast("No chat model yet. Download or load one on Models.", "err");
+    noChatModel();
     return;
   }
+  if (!chatSettingsOk()) return;
   $("promptInput").value = "";
   autosizePrompt();
   $("promptInput").focus();
@@ -3134,6 +3345,11 @@ $("composer").addEventListener("drop", (event) => {
   addComposerFiles(event.dataTransfer?.files ?? []).catch(() => toast("Could not read that file", "err"));
 });
 $("promptInput").addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && editing) {
+    event.preventDefault();
+    endEdit(true);
+    return;
+  }
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     $("sendButton").click();
@@ -3154,7 +3370,12 @@ async function init() {
   $("favicon").href = LOGO;
   setupTips();
   setupThemeMode();
+  const phoneHint = matchMedia("(max-width: 880px)");
+  const setPromptHint = () => { $("promptInput").placeholder = phoneHint.matches ? "Message sushi" : "Message sushi (Enter to send, Shift+Enter for a new line)"; };
+  setPromptHint();
+  phoneHint.addEventListener("change", setPromptHint);
   loadChatOptions();
+  checkChatNumbers();
   applyChatAsideDefaults();
   renderForgetKey();
   // One damaged saved chat must not keep the models from loading.
@@ -3272,10 +3493,7 @@ function adminBytes(n) {
   return `${Math.round(n / 1024)} KiB`;
 }
 function adminTokens(n) {
-  n = Number(n);
-  if (!Number.isFinite(n) || n <= 0) return "";
-  if (n >= 1048576 && n % 1048576 === 0) return `${n / 1048576}M`;
-  return n >= 1024 && n % 1024 === 0 ? `${n / 1024}k` : String(n);
+  return Number(n) > 0 ? fmtTokens(n) : "";
 }
 function adminAgo(unixSec, nowMs) {
   if (!unixSec) return "-";
@@ -3292,9 +3510,10 @@ function adminControlValue(spec, text, badInput) {
   if (text === "") return { ok: true, value: null };
   if (spec.type === "bool") return text === "true" || text === "false" ? { ok: true, value: text === "true" } : { ok: false };
   if (spec.type === "choice") return !spec.choices || spec.choices.includes(text) ? { ok: true, value: text } : { ok: false };
+  // Plain digits only: Number() also takes 1e3, 0x10 and Infinity.
+  if (!(spec.type === "int" ? /^[+-]?\d+$/ : /^[+-]?(\d+\.?\d*|\.\d+)$/).test(text)) return { ok: false };
   const x = Number(text);
   if (!Number.isFinite(x) || x < spec.min || x > spec.max) return { ok: false };
-  if (spec.type === "int" && !Number.isInteger(x)) return { ok: false };
   return { ok: true, value: x };
 }
 // What is wrong with a typed value, or null.
@@ -3464,6 +3683,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     return [...byId.values()].map((m) => ({ ...m, settings: m.settings ?? {}, state: m.state === "error_state" ? "error" : m.state === "evicting" ? "unloaded" : m.state }));
   };
   const info = (id) => rowsOf().find((m) => m.id === id);
+  // A pack's two sizes: what loads into memory (the model row) and what the pack holds in full (the catalog row).
+  const samePath = (a, b) => !!a && !!b && a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+  const fullSizeOf = (m) => m.bytes_total ?? D.data?.packs.find((p) => p.installed && samePath(p.path, m.path))?.size_bytes ?? null;
+  const inMemorySizeOf = (p) => (p.installed ? rowsOf().find((m) => samePath(m.path, p.path))?.bytes_on_disk ?? null : null);
   const isLoaded = (m) => m.state === "ready" || m.state === "loading" || modelStore.pending.has(m.id);
   const selLoaded = () => info(A.sel)?.state === "ready";
   const needCache = () => A.view === "settings" || selLoaded();
@@ -3506,7 +3729,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const specsOf = (m) => (A.settings?.model_keys ?? []).filter((spec) => {
     const s = m.settings[spec.name];
     return s?.file != null || s?.flag != null || (m.keys ?? []).includes(spec.name) || (modeNow() === "advanced" && !!m.limits?.[spec.name]?.disabled);
-  }).map((spec) => { const max = m.limits?.[spec.name]?.max; return max < spec.max ? { ...spec, max } : spec; });
+  }).map((spec) => { const max = m.limits?.[spec.name]?.max, min = Math.max(spec.min, CONTEXT_FLOOR[spec.name] ?? 0); return max < spec.max || min > spec.min ? { ...spec, min, max: Math.min(max ?? Infinity, spec.max) } : spec; });
+  // A window smaller than this cannot hold a chat template and a question.
+  const CONTEXT_FLOOR = { ctx_size: 256 };
   // What a controlling bool key stands at: "true", "false", or "" for its default.
   const standing = (m, key) => {
     const s = m.settings[key];
@@ -3545,11 +3770,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const streamsExperts = (m) => !!(m.streaming_required || m.ssd_budget_gb);
 
   // Why the last load failed: this session's answer, else the one /v1/models keeps for a failed model.
-  const loadError = (m) => modelStore.failed.get(m.id) || (m.state === "error" ? m.error : "");
+  const loadError = (m) => modelStore.failed.get(m.id) || (m.state === "error" ? loadFailureText(m.error ?? "") : "");
   const evictNote = (m) => { const others = modelStore.list.filter((x) => x.state === "ready" && x.id !== m.id).map((x) => x.id); return others.length ? `May unload ${others.join(", ")} to make room` : ""; };
   function metaOf(m) {
     const failed = loadError(m), n = savedCount(m);
-    const phrase = modelStore.pending.has(m.id) || m.state === "loading" ? "Loading…" : m.state === "error" ? `Load failed${failed && m.id !== A.sel ? ` · ${failed.slice(0, 60)}` : ""}` : m.state === "ready" && m.bytes_resident ? `${adminBytes(m.bytes_resident)} in memory` : streamsExperts(m) ? "runs partly from SSD" : n ? `${n} saved` : "";
+    const phrase = modelStore.pending.has(m.id) || m.state === "loading" ? "Loading…" : m.state === "error" || (failed && m.state === "unloaded") ? `Load failed${failed && m.id !== A.sel ? ` · ${failed.slice(0, 60)}` : ""}` : m.state === "ready" && m.bytes_resident ? `${adminBytes(m.bytes_resident)} in memory` : streamsExperts(m) ? "runs partly from SSD" : n ? `${n} saved` : "";
     return [m.bytes_on_disk ? adminBytes(m.bytes_on_disk) : "", phrase].filter(Boolean).join(" · ");
   }
   function renderList(rows) {
@@ -3668,7 +3893,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       alt: d.file ? { label: "Use the default folder" } : null,
       choose: async (path) => {
         let r;
-        try { r = await postJson("/v1/settings", { server: { models_dir: path } }); } catch (e) { throw new Error(adminErrorText(e)); }
+        try { r = await postJson("/v1/settings", { server: { models_dir: path } }); } catch (e) { throw new Error(/models_dir does not exist or cannot be read/.test(String(e.message)) ? "That path is not a folder sushi can read." : adminErrorText(e)); }
         toast(typeof r.applied?.models_dir === "string" && r.applied.models_dir ? sentence(r.applied.models_dir) : path ? "Saved. Rescanning the folder." : "Back to the default folder.");
         await Promise.all([refresh(), modelStore.refresh()]);
       },
@@ -3691,12 +3916,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setHidden(q("modelsRescan"), phoneDetail);
     setHidden(q("modelsDirLine"), phoneDetail);
     setHidden(q("modelsTabs"), phoneDetail);
-    setText(q("modelsTitle"), phoneDetail && A.sel ? A.sel : "Models");
+    setText(q("modelsTitle"), "Models");
     renderList(rows);
-    const m = rows.find((x) => x.id === A.sel);
+    // A model the filter hides has no detail, unless it holds unsaved edits.
+    const filter = q("modelsFilter").value.trim().toLowerCase();
+    const m = rows.find((x) => x.id === A.sel && (!filter || x.id.toLowerCase().includes(filter) || isDirty(x.id)));
     if (!m) {
       A.form = null;
-      const gone = A.leaving ? "" : hashId();
+      const gone = A.leaving || rows.some((x) => x.id === hashId()) ? "" : hashId();
       fill(q("modelsDetail"), `gone:${gone}`, () => gone ? [h("div", { class: "empty" }, h("span", { text: `Model ${gone} was not found.` }), " ", h("button", { class: "btn sm", type: "button", text: "Back to Models", onclick: backToList }))] : []);
       return;
     }
@@ -3833,7 +4060,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const P = per(F.id), pend = modelStore.pending.get(m.id), why = loadError(m);
     setText(F.name, m.id);
     const words = pend ? (pend === "unload" ? "Unloading…" : "Loading…") : { ready: "Loaded", loading: "Loading…", error: "Load failed" }[m.state] ?? "Not loaded";
-    const facts = [m.bytes_on_disk && [`${adminBytes(m.bytes_on_disk)} on disk`, "Size of the pack's files on this disk.", "bytes_on_disk"], m.bytes_linked > 0 && [`${adminBytes(m.bytes_linked)} linked from elsewhere`, "Bytes the pack folder reaches through links to files kept elsewhere.", "bytes_linked"], m.state === "ready" && m.bytes_resident && [`${adminBytes(m.bytes_resident)} in memory`, "Memory the loaded model holds now: its weights and caches.", "bytes_resident (MLX weights + caches)"], m.context_length && [`${adminTokens(m.context_length)} max context`, "The most text one conversation can hold, prompt and generated tokens together.", "context_length (ctx_size)"], (m.input_modalities ?? []).includes("image") && ["sees images", "Takes images as input: the chat shows an attach button.", "vision (input_modalities: image)"], streamsExperts(m) ? ["runs partly from SSD", "Part of this model stays on the SSD and is read as it runs, so it needs less memory than its size, at some cost in speed.", "expert streaming (streams_experts, ssd_budget_gb)"] : m.streaming && ["can run partly from SSD", "When memory is short, part of this model can stay on the SSD. Set Memory for SSD streaming below.", "expert streaming (streams_experts, ssd_budget_gb)"]].filter(Boolean);
+    const facts = [m.bytes_on_disk && [`${adminBytes(m.bytes_on_disk)} in-memory size`, "The weight files (*.safetensors) the engine loads and bills against memory.", "bytes_on_disk"], fullSizeOf(m) && [`${adminBytes(fullSizeOf(m))} full weight size`, "Everything the pack holds, a lookup table such as ngram_table.bin included: what Hugging Face downloads.", "size_bytes (Hugging Face repo)"], m.bytes_linked > 0 && [`${adminBytes(m.bytes_linked)} linked from elsewhere`, "Bytes the pack folder reaches through links to files kept elsewhere.", "bytes_linked"], m.state === "ready" && m.bytes_resident && [`${adminBytes(m.bytes_resident)} in memory`, "Memory the loaded model holds now: its weights and caches.", "bytes_resident (MLX weights + caches)"], m.context_length && [`${adminTokens(m.context_length)} max context`, "The most text one conversation can hold, prompt and generated tokens together.", "context_length (ctx_size)"], (m.input_modalities ?? []).includes("image") && ["sees images", "Takes images as input: the chat shows an attach button.", "vision (input_modalities: image)"], streamsExperts(m) ? ["runs partly from SSD", "Part of this model stays on the SSD and is read as it runs, so it needs less memory than its size, at some cost in speed.", "expert streaming (streams_experts, ssd_budget_gb)"] : m.streaming && ["can run partly from SSD", "When memory is short, part of this model can stay on the SSD. Set Memory for SSD streaming below.", "expert streaming (streams_experts, ssd_budget_gb)"]].filter(Boolean);
     fill(F.facts, [dotOf(m), words, ...facts.map(([t]) => t), m.path].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map(([t, tip, term]) => h("span", { class: "tip-u", tabindex: "0", "data-tip": tip, "data-term": term, text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
     const think = effortSummary(modelStore.list.find((x) => x.id === m.id));
     setHidden(F.think, !think);
@@ -3996,17 +4223,22 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const v = adminControlValue(PORT_SPEC, portIn.value);
     if (v.ok) saveServer("port", v.value, v.value === null ? "Back to the default port." : "Saved.", portSave, "Saving…");
   } });
-  portRow.ctl.append(h("div", { class: "row-in" }, portIn, portSave), portRow.bad);
+  const portWarn = h("div", { class: "warn", role: "status", hidden: true });
+  portRow.ctl.append(h("div", { class: "row-in" }, portIn, portSave), portRow.bad, portWarn);
   q("portSet").replaceWith(portRow.row);
 
   // The on/off server keys: Default, On or Off. A file value of null is the default, shown as "Default (On)".
   const TOGGLE_KEYS = [
     ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops automatic checks; a check you start yourself still runs.", "When a newer sushi is out, a banner offers it. Nothing installs without you."],
-    ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. Off stops automatic checks, the Downloads list's included; Check again on Downloads still looks.", "A model with a newer version gets a note on Models. Nothing downloads without you."],
+    ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. Off stops automatic checks, the Available list's included; Check again on Available still looks.", "A model with a newer version gets a note on Models. Nothing downloads without you."],
     ["skip_mem_preflight", "memorySet", "Skip the memory check before loading", "Load a model even when sushi thinks there is not enough free memory. The check is cautious and can refuse a model that would fit. If the model really does not fit, the Mac can run out of memory: sushi may crash or the system may stall.", "Turn this on only if a model you know fits is refused with \"Not enough free memory\". If it does not fit, the Mac can run out of memory: sushi may crash or the whole system may stall. Applies to the next load."],
   ].map(([key, slot, label, help, tip]) => {
     const row = setRow(key, label, null, tip, keyTerm(key));
-    const btns = [[null, "Default"], [true, "On"], [false, "Off"]].map(([value, text]) => h("button", { type: "button", "data-value": String(value), text, onclick: (e) => saveServer(key, value, "Saved.", e.currentTarget, "Saving…") }));
+    const btns = [[null, "Default"], [true, "On"], [false, "Off"]].map(([value, text]) => h("button", { type: "button", "data-value": String(value), text, onclick: async (e) => {
+      const button = e.currentTarget;
+      if (key === "skip_mem_preflight" && value === true && !(await confirmAction({ title: "Skip the memory check?", body: "A model that does not fit can make the Mac run out of memory: sushi may crash or the whole system may stall.", confirm: "Skip the check", cancel: "Cancel" }))) return;
+      saveServer(key, value, "Saved.", button, "Saving…");
+    } }));
     row.ctl.append(h("div", { class: "tri", role: "group", "aria-label": label }, ...btns), row.bad);
     q(slot).replaceWith(row.row);
     return { key, row, btns, help };
@@ -4289,10 +4521,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (!busy(portSave)) setText(portSave, text === "" ? "Use default" : "Save");
     setText(portRow.bad, (dirty && text && !parsed.ok ? "Enter a whole number from 1 to 65535." : "") || A.serr.port || "");
     portIn.setAttribute("aria-invalid", String(!!portRow.bad.textContent));
+    const low = dirty && parsed.ok && parsed.value !== null && parsed.value < 1024;
+    setText(portWarn, low ? "Ports below 1024 need administrator rights; sushi cannot listen there when started normally." : "");
+    setHidden(portWarn, !low);
   }
 
   function renderAll() {
-    const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : A.error ? `Couldn't load: ${A.error}` : "";
+    const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : modelStore.error ? `Couldn't load models: ${modelStore.error}` : A.error ? `Couldn't load: ${A.error}` : "";
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
     const off = !!msg && !!A.settings;
@@ -4372,7 +4607,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function packRow(p) {
     const j = jobOf(p.repo), live = isActive(j);
     // A running download's folder grows: its size on disk is no part of the row while it runs.
-    const sig = JSON.stringify([{ ...p, partial_bytes: live ? null : p.partial_bytes }, j && [j.phase, j.message, j.stopping]]);
+    const sig = JSON.stringify([{ ...p, partial_bytes: live ? null : p.partial_bytes }, j && [j.phase, j.message, j.stopping], inMemorySizeOf(p)]);
     const old = D.rows.get(p.repo);
     if (old?.sig === sig) return old;
     const badges = [
@@ -4381,7 +4616,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       p.update ? h("span", { class: "badge flag", text: `Update ${p.update.latest}` }) : null,
       p.fits === false ? h("span", { class: "badge", tabindex: "0", "data-tip": tierText(p), "data-term": tierTerm(p), text: `Needs ${p.tier_gb} GB` }) : null,
     ];
-    const meta = [p.size_bytes != null ? adminBytes(p.size_bytes) : "size unknown", p.partial_bytes ? `${adminBytes(p.partial_bytes)} on disk, not complete` : "", p.repo].filter(Boolean).join(" · ");
+    const memory = inMemorySizeOf(p);
+    const meta = [p.size_bytes != null ? `${adminBytes(p.size_bytes)} full weight size` : "size unknown", memory ? `${adminBytes(memory)} in-memory size` : "", p.partial_bytes ? `${adminBytes(p.partial_bytes)} on disk, not complete` : "", p.repo].filter(Boolean).join(" · ");
     const why = j?.phase === "failed" ? `Failed: ${j.message || "the download stopped"}. The downloaded part is kept; Resume tries again.` : j?.phase === "cancelled" ? "Stopped. The downloaded part is kept; Resume continues from it."
       : p.fits === false ? tierText(p) : "";
     const btn = (text, cls, fn, off) => { const b = h("button", { class: `btn sm ${cls}`, type: "button", text, "aria-label": `${text} ${label(p)}${fn === openInstalled ? " in Installed" : ""}`, disabled: !!off }); b.addEventListener("click", () => fn(p, b)); return b; };
@@ -4413,7 +4649,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const d = D.data;
     alertIn(q("dlAlert"), D.error ? `Couldn't load: ${D.error}` : "", false);
     if (!d) return;
-    const where = d.dest.locked ? "set by --model-dir" : d.dest.source === "file" ? "the Settings tab's models folder" : "the default models folder";
+    const where = d.dest.locked ? "set by --model-dir" : d.dest.source === "file" ? "the models folder chosen on Models" : "the default models folder";
     const space = d.dest.free_bytes != null ? `${adminBytes(d.dest.free_bytes)} free${d.dest.volume ? ` on ${d.dest.volume}` : ""}` : "unknown";
     const kv = [["This Mac", `${d.ram_gb} GB of memory`], ["Saves to", `${d.dest.path} (${where})`], ["Free space", space]];
     fill(q("dlMac"), JSON.stringify(kv), () => kvRows(kv, ["Saves to"]));
@@ -4445,6 +4681,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (D.data && (d || viewing)) markNew(D.data, viewing);
     } catch (e) { D.error = adminErrorText(e); }
     if (viewing) renderDownloads();
+    else if (A.view === "models" && A.sel) patchDetail(info(A.sel));
     tabProgress();
     const loading = D.data?.refreshing || D.data?.catalog === "loading";
     // Under --no-update-check another tab asks nothing: Hugging Face is read only while this list is open.

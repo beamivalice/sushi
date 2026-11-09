@@ -351,6 +351,8 @@ pub const DiscoveredModel = struct {
     bytes_on_disk: ?u64,
     /// Part of `bytes_on_disk` that comes through symlinked shards whose target is outside the pack folder.
     bytes_linked: u64 = 0,
+    /// Every regular file in the folder (the n-gram table included), symlinks at their target's size; null if empty.
+    bytes_total: ?u64 = null,
     /// `model_type` peeked from config.json (e.g. "qwen4_exp"), so registry stubs
     /// can advertise arch-derived capabilities before a cold load. Empty
     /// when unknown.
@@ -619,11 +621,13 @@ fn tryAddModel(
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(model_dir), name });
     const streaming_index_complete = expert_quant.isExpertStreamingArch(model_type) and
         streamingIndexComplete(io, allocator, path) != null;
+    const total = folderBytes(io, sub, 3);
     try found.append(allocator, .{
         .id = id,
         .path = path,
         .bytes_on_disk = if (bytes_ok) bytes else null,
         .bytes_linked = linked,
+        .bytes_total = if (total > 0) total else null,
         .model_type = model_type,
         .streaming_index_complete = streaming_index_complete,
     });
@@ -642,7 +646,29 @@ pub const ProbeResult = struct {
     /// Sum of *.safetensors bytes; null if the scan failed.
     bytes_on_disk: ?u64,
     bytes_linked: u64 = 0,
+    bytes_total: ?u64 = null,
 };
+
+/// Sum of every regular file under `dir`, a symlinked file at its target's size; folders are walked a few levels deep.
+fn folderBytes(io: std.Io, dir: std.Io.Dir, depth: u8) u64 {
+    var total: u64 = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .file, .sym_link => {
+                const st = dir.statFile(io, entry.name, .{}) catch continue;
+                if (st.kind == .file) total += @intCast(st.size);
+            },
+            .directory => if (depth > 0) {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                total += folderBytes(io, sub, depth - 1);
+            },
+            else => {},
+        }
+    }
+    return total;
+}
 
 /// A symlinked file's size when its target lies outside `dir`, else 0.
 fn linkedOutside(io: std.Io, dir: std.Io.Dir, entry: std.Io.Dir.Entry, size: u64) u64 {
@@ -688,10 +714,12 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
 
     var bytes: u64 = 0;
     var linked: u64 = 0;
+    var total: u64 = 0;
     var bytes_ok = false;
     var sub = dir.openDir(io, base, .{ .iterate = true }) catch null;
     if (sub) |*sd| {
         defer sd.close(io);
+        total = folderBytes(io, sd.*, 3);
         var it = sd.iterate();
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .file and entry.kind != .sym_link) continue;
@@ -703,7 +731,7 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
             bytes_ok = true;
         }
     }
-    return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null, .bytes_linked = linked };
+    return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null, .bytes_linked = linked, .bytes_total = if (total > 0) total else null };
 }
 
 /// Metadata an `unloaded` stub can advertise via `/v1/models` without faulting
@@ -1212,6 +1240,41 @@ test "discovery counts shard bytes that come through symlinks leaving the pack" 
     const probe = try probeModelDir(io, allocator, pack_buf[0..pack_len]);
     defer allocator.free(probe.model_type);
     try testing.expectEqual(@as(u64, 16), probe.bytes_linked);
+}
+
+test "bytes_total counts every regular file of the pack, a symlink at its target's size, and bytes_on_disk stays the weights" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const cfg = "{\"model_type\":\"mimo_v2\"}";
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/shared.bin", .data = "0123456789abcdef" });
+    try tmp.dir.createDirPath(io, "pack/sub");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/config.json", .data = cfg });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/own.safetensors", .data = "0123" });
+    var table: [100]u8 = undefined;
+    @memset(&table, 'x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/ngram_table.bin", .data = &table });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/sub/extra.bin", .data = "1234567" });
+    try tmp.dir.symLink(io, "../elsewhere/shared.bin", "pack/shared.bin", .{});
+
+    const want: u64 = cfg.len + 4 + 100 + 7 + 16;
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqual(@as(?u64, 4), result.models[0].bytes_on_disk);
+    try testing.expectEqual(@as(?u64, want), result.models[0].bytes_total);
+
+    var pack_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var pack_dir = try tmp.dir.openDir(io, "pack", .{});
+    defer pack_dir.close(io);
+    const pack_len = try pack_dir.realPath(io, &pack_buf);
+    const probe = try probeModelDir(io, allocator, pack_buf[0..pack_len]);
+    defer allocator.free(probe.model_type);
+    try testing.expectEqual(@as(?u64, 4), probe.bytes_on_disk);
+    try testing.expectEqual(@as(?u64, want), probe.bytes_total);
 }
 
 test "modelKindFromType labels every family (list TYPE column + run preflight)" {

@@ -196,6 +196,8 @@ pub const LoadedModel = struct {
     bytes_on_disk: ?u64,
     /// Part of `bytes_on_disk` read through symlinks to files outside the pack folder.
     bytes_linked: u64 = 0,
+    /// Every regular file in the pack folder; see `DiscoveredModel.bytes_total`.
+    bytes_total: ?u64 = null,
     /// `model_type` peeked from config.json at discovery time (allocator-
     /// owned dupe; empty when unknown). Lets /v1/models advertise
     /// arch-derived capabilities while the entry is still an `.unloaded` stub.
@@ -532,6 +534,7 @@ pub const ModelStatus = struct {
     bytes_resident: u64,
     bytes_on_disk: ?u64,
     bytes_linked: u64 = 0,
+    bytes_total: ?u64 = null,
     last_used_ns: i64,
     state: []const u8,
     error_name: ?[]const u8,
@@ -682,6 +685,7 @@ pub const ModelRegistry = struct {
             for (d.models) |m| {
                 const stub = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
                 stub.bytes_linked = m.bytes_linked;
+                stub.bytes_total = m.bytes_total;
             }
         }
 
@@ -797,6 +801,7 @@ pub const ModelRegistry = struct {
         if (self.entries.get(base)) |existing| return existing.id;
         const stub = try self.registerStubWithMeta(base, trimmed, probe.bytes_on_disk, probe.model_type, streaming_index_complete);
         stub.bytes_linked = probe.bytes_linked;
+        stub.bytes_total = probe.bytes_total;
         return stub.id;
     }
 
@@ -898,12 +903,14 @@ pub const ModelRegistry = struct {
                     self.markUnloadedLocked(e);
                     e.bytes_on_disk = m.bytes_on_disk;
                     e.bytes_linked = m.bytes_linked;
+                    e.bytes_total = m.bytes_total;
                 }
                 continue;
             }
             if (self.peekByPathLocked(m.path) != null) continue;
             const stub = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
             stub.bytes_linked = m.bytes_linked;
+            stub.bytes_total = m.bytes_total;
             added += 1;
         }
         return added;
@@ -1484,6 +1491,7 @@ pub const ModelRegistry = struct {
                 .bytes_resident = entry.bytes_resident,
                 .bytes_on_disk = entry.bytes_on_disk,
                 .bytes_linked = entry.bytes_linked,
+                .bytes_total = entry.bytes_total,
                 .last_used_ns = entry.last_used_ns,
                 .state = ModelStatus.stateName(entry.state),
                 .error_name = entry.error_name,

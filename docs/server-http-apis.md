@@ -94,6 +94,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - `/v1/models` `bytes_on_disk` is the bytes the pack reads, symlinked shards included; `bytes_linked` (0 when none) is the part
   that comes through symlinks to files outside the pack folder (a symlink inside it counts as the pack's own), so disk use is
   `bytes_on_disk - bytes_linked`. The Models tab details show it as "linked from elsewhere".
+- `/v1/models` `bytes_total` (absent when the folder holds nothing readable) is the sum of every regular file in the pack's
+  folder, subfolders to three levels, the n-gram table included, a symlink at its target's size. `bytes_on_disk` stays the
+  `*.safetensors` the engine loads and bills; the Models tab shows them as "in-memory size" and "full weight size".
 - An unloaded `/v1/models` row lists `chat` when the pack ships a `chat_template.jinja` or its arch renders its own (`Facts.renders_own_chat_template`, DeepSeek-V4.1), so the chat page offers the model before it is loaded.
 - `/v1/models` rows carry `context_length` + `max_model_len` at TOP level. Context-overflow 400s name BOTH counts.
 - A prompt that tokenizes to zero tokens is a 400 `invalid_request_error` and never reaches generate: completions
@@ -608,8 +611,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
 - **One reader of `/v1/models`**: `modelStore` (main script) polls it (30 s on Chat, 5 s on Dashboard and Models, 4 s
   while the server is unreachable, 2 s while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only
   when the answer changed; no timer runs while the tab is hidden, and loads and unloads go through its `act`. There is
-  no separate `/health` poll. `confirmAction` is the one confirmation dialog (destructive buttons name the bytes they free).
-- **The chat model picker follows the loaded model**: it keeps a model the user picked in this page session; else the stored `sushi-model` or the shown one if it is loaded; else the first loaded model. A send to an unloaded model cold-loads it and evicts the loaded one, so a stale stored choice must not win.
+  no separate `/health` poll. A non-OK answer other than 401 is a server error (the top bar reads Server error and Models names the message); only a failed fetch is Offline. `confirmAction` is the one confirmation dialog (destructive buttons name the bytes they free).
+- **The chat model picker follows the loaded model**: the model the user picked in this page session; else the shown one if it is loaded, else the first loaded model (a model still loading counts); else the model the server last reported loaded (`sushi-last-loaded`, kept by this browser); else none: the picker reads "Choose a model", the status says so, and Send asks for a pick instead of loading a guess. A pick is never stored across page loads, because a send to an unloaded model cold-loads it and evicts the loaded one.
 - The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
   `/v1/models` (through `modelStore`) and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
   charts need metrics: without them the page says so, shows a **Turn on live statistics** button (only while `/metrics.json` answers

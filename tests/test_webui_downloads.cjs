@@ -52,7 +52,7 @@ function makeServer() {
           state.jobs = [{ repo, dest: `/m/${repo}`, phase: 'queued', files: 0, file_index: 0, total_bytes: 0, done_bytes: 0, file: null, speed_bps: null, eta_s: null, message: null }];
           return route.fulfill(json({ ok: true, queued: true, dest: `/m/${repo}`, warning: null }, 202));
         }
-        return route.fulfill(json({ ram_bytes: 64 * GiB, ram_gb: 64, dest: { path: '/Users/me/.sushi/models', source: 'default', locked: false, volume: 'Macintosh HD', free_bytes: 500 * GiB, total_bytes: 2000 * GiB }, catalog: state.catalog, refreshing: false, update_check: state.updateCheck, packs: state.packs, jobs: state.jobs }));
+        return route.fulfill(json({ ram_bytes: 64 * GiB, ram_gb: 64, dest: { path: '/Users/me/.sushi/models', source: state.destSource ?? 'default', locked: false, volume: 'Macintosh HD', free_bytes: 500 * GiB, total_bytes: 2000 * GiB }, catalog: state.catalog, refreshing: false, update_check: state.updateCheck, packs: state.packs, jobs: state.jobs }));
       case '/v1/downloads/cancel': state.jobs = state.jobs.map((j) => (state.stopping ? { ...j, stopping: true } : { ...j, phase: 'cancelled' })); return route.fulfill(json({ ok: true }));
       default: return route.fulfill(json({}, 404));
     }
@@ -254,6 +254,26 @@ async function main() {
       assert.equal(await off.page.isVisible('#navModelsDot'), false);
       assert.equal(quiet.calls.filter((c) => c.path === '/v1/downloads').length, 1);
       await off.context.close();
+    }
+
+    {
+      // A folder chosen on Models is named as chosen there; no tab is named that no longer exists.
+      const server = makeServer();
+      server.state.destSource = 'file';
+      const { page, context } = await open(browser, server, '/downloads');
+      await page.waitForSelector('#dlMac');
+      const text = await page.textContent('#dlMac');
+      assert.match(text, /chosen on Models/);
+      assert.doesNotMatch(text, /Settings tab/);
+      await context.close();
+    }
+
+    {
+      // The catalog size is the whole repository (a pack's lookup table included), so the row calls it the full weight size.
+      const { page, context } = await open(browser, makeServer(), '/downloads');
+      await page.waitForSelector('.dl-row');
+      assert.match(await page.textContent(row(PACKS[0].repo) + ' .meta'), /40\.0 GiB full weight size/);
+      await context.close();
     }
 
     {

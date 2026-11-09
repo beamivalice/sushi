@@ -60,7 +60,7 @@ function makeServer(opts = {}) {
       ],
     },
   };
-  const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ...(m.error ? { error: m.error } : {}), ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit', ...(m.pack_update ? { pack_update: m.pack_update } : {}) } })) });
+  const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_total: m.bytes_total, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ...(m.error ? { error: m.error } : {}), ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit', ...(m.pack_update ? { pack_update: m.pack_update } : {}) } })) });
   const settingsBody = () => ({ file: '/h/.sushi/model-settings.json', applies: 'next load of the model', model_keys: KEYS, server: state.server, gpu_limit: state.gpuLimit,
     models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, defaults: m.defaults ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
   if (opts.limits) {
@@ -104,7 +104,7 @@ function makeServer(opts = {}) {
       case '/v1/load-model': {
         if (state.loadDelay) await state.loadDelay;
         const m = state.models.find((x) => x.id === body.model);
-        if (state.loadFails) return route.fulfill(json({ error: { message: 'out of memory: needs 61 GiB' } }, 503));
+        if (state.loadFails) return state.loadFails === 'tag' ? route.fulfill(json({ error: { message: 'Failed to load model: ExpertCacheTooSmall' } }, 500)) : route.fulfill(json({ error: { message: 'out of memory: needs 61 GiB' } }, 503));
         m.state = 'ready'; m.bytes_resident = m.bytes_on_disk;
         return route.fulfill(json({ ok: true }));
       }
@@ -323,6 +323,21 @@ async function main() {
     }
 
     {
+      // A Zig error name is turned into what to do about it, and the row keeps a failed marker after the load fails.
+      const server = makeServer();
+      server.state.loadFails = 'tag';
+      const { page, context } = await open(browser, server, '/models#GLM-B');
+      await page.waitForSelector('.d-actions button');
+      await page.click('.d-actions >> text=Load');
+      await page.waitForSelector('.detail .alert.err');
+      const shown = await page.textContent('.detail .alert.err');
+      assert.doesNotMatch(shown, /ExpertCacheTooSmall/);
+      assert.match(shown, /Memory for SSD streaming/);
+      assert.match(await page.textContent('.list [data-id="GLM-B"]'), /Load failed/);
+      await context.close();
+    }
+
+    {
       // The failed model's raw state word never reaches the screen.
       const server = makeServer();
       const { page, context } = await open(browser, server, '/models');
@@ -369,7 +384,7 @@ async function main() {
       assert.equal(await page.evaluate(() => location.hash), '#Deep-C');
       // `streaming` only says the pack can stream; with no budget it loads resident.
       assert.match(await page.textContent('.detail .facts'), /can run partly from SSD/);
-      assert.match(await page.textContent('.detail .facts'), /96\.0 GiB on disk.*40\.0 GiB linked from elsewhere/);
+      assert.match(await page.textContent('.detail .facts'), /96\.0 GiB in-memory size.*40\.0 GiB linked from elsewhere/);
       assert.doesNotMatch(await page.textContent('.detail .facts'), /sushi pull/, 'an update is never answered with sushi pull');
       await page.click('.list [data-id="Qwen-A"]');
       await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Qwen-A');
@@ -477,6 +492,7 @@ async function main() {
       await page.click('.list [data-id="Qwen-A"]');
       assert.equal(await page.isVisible('.list'), false, 'the detail takes the whole screen');
       assert.equal(await page.isVisible('.detail'), true);
+      assert.equal(await page.evaluate(() => [...document.querySelectorAll('#modelsPanel h1, #modelsPanel h2, #modelsTitle')].filter((n) => n.offsetParent && n.textContent.trim() === 'Qwen-A').length), 1, 'the model name is not shown twice');
       await page.click('[aria-label="Back to models"]');
       assert.equal(await page.isVisible('.list'), true);
       assert.equal(await page.evaluate(() => location.hash), '');
@@ -701,6 +717,24 @@ async function main() {
       await settle(page, 1000);
       assert.equal(await page.inputValue('#cacheGb'), '9', 'the size draft survives a port save');
     });
+    await scenario('a whole-number box refuses exponent notation, a context too small to answer, and a port that needs root says so', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#cacheGb');
+      await page.fill('#cacheGb', '1e3');
+      assert.equal(await page.getAttribute('#cacheGb', 'aria-invalid'), 'true', '1e3 is not a whole number');
+      assert.equal(await page.isDisabled('#cacheSave'), true);
+      await page.fill('#portNum', '1e3');
+      assert.equal(await page.getAttribute('#portNum', 'aria-invalid'), 'true');
+      await page.fill('#portNum', '80');
+      assert.match(await page.textContent('#portCard'), /below 1024.*administrator/i);
+    });
+    await scenario('a context length under 256 tokens is refused with its reason', { path: '/models#Qwen-A' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '100');
+      assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'aria-invalid'), 'true');
+      assert.match(await page.textContent(`${row('ctx_size')} .bad`), /256 or more/);
+      await page.fill(`${row('ctx_size')} input`, '256');
+      assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'aria-invalid'), 'false');
+    });
     await scenario('an auto-selected model stays under an edit', { path: '/models', setup: (s) => { s.state.models[0].state = 'unloaded'; } }, async ({ page }) => {
       await page.waitForSelector(`${row('ctx_size')} input`);
       assert.equal(await page.textContent('#modelsDetail h2'), 'Broke-D');
@@ -766,6 +800,18 @@ async function main() {
       await settle(page, 16_000);
       await settle(page, 16_000);
       assert.equal(await page.locator('#modelsList .row').count(), 3, 'the three left show');
+    });
+    await scenario('a filter that hides the open model hides its detail too, and clearing it brings the detail back', { path: '/models#A1', setup: (s) => {
+      s.state.models = ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'Zeta', 'Zulu'].map(plainModel);
+    } }, async ({ page }) => {
+      await page.waitForSelector('#modelsDetail h2');
+      await page.fill('#modelsFilter', 'zzzz');
+      assert.match(await page.textContent('#modelsList'), /No model matches the filter/);
+      assert.equal(await page.locator('#modelsDetail h2').count(), 0, 'no detail for a model the list does not show');
+      assert.doesNotMatch(await page.textContent('#modelsDetail'), /not found/, 'a hidden model is not a missing one');
+      await page.fill('#modelsFilter', '');
+      await page.waitForSelector('#modelsDetail h2');
+      assert.equal(await page.textContent('#modelsDetail h2'), 'A1');
     });
     await scenario('an invalid value in a closed fold opens it and says so', { path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
       await page.waitForSelector(`${row('think_penalty')} input`);
@@ -992,6 +1038,14 @@ async function main() {
       assert.match(await row.locator('.help').textContent(), /out of memory/i, 'the warning is visible, not only in the tip');
       assert.equal(await row.locator('button[data-value="null"]').textContent(), 'Default (Off)');
       await row.locator('button[data-value="true"]').click();
+      await page.waitForFunction(() => document.getElementById('confirmDialog').open);
+      assert.match(await page.textContent('#confirmDialog'), /crash|stall/);
+      await page.click('#confirmDialog >> text=Cancel');
+      await settle(page, 300);
+      assert.equal(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').length, 0, 'Cancel saves nothing');
+      await row.locator('button[data-value="true"]').click();
+      await page.waitForFunction(() => document.getElementById('confirmDialog').open);
+      await page.click('#confirmDialog >> text=Skip the check');
       await page.waitForFunction(() => document.querySelector('.set[data-key="skip_mem_preflight"] button[data-value="true"]').getAttribute('aria-pressed') === 'true');
       assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { skip_mem_preflight: true } });
       assert.match(await row.locator('.badges').textContent(), /Now/);
@@ -1120,7 +1174,7 @@ async function main() {
       await page.waitForSelector('.facts [data-tip]');
       const facts = await page.$$eval('.facts [data-tip]', (ns) => ns.map((n) => [n.textContent, n.dataset.term ?? '']));
       const term = (re) => facts.find(([t]) => re.test(t))?.[1];
-      assert.match(term(/on disk/), /bytes_on_disk/);
+      assert.match(term(/in-memory size/), /bytes_on_disk/);
       assert.match(term(/in memory/), /bytes_resident/);
       assert.match(term(/max context/), /context_length/);
       assert.match(term(/sees images/), /vision/);
@@ -1168,6 +1222,26 @@ async function main() {
       server.releaseProps();
       await page.waitForFunction(() => document.getElementById('aboutVersion').textContent === 'v9.9.9', null, { timeout: 2000 });
     });
+    await scenario('Models and Available each name both sizes: in-memory size and full weight size', { path: '/models#Deep-C', setup: (s) => {
+      const pack = { repo: 'beamster/Deep-Sushi', name: 'deep', tag: '', size_bytes: 150 * GiB, tier_gb: 64, fits: true, streams_experts: true, recommended: false, installed: true, path: '/models/Deep-C', partial_bytes: null, update: null, launch: null };
+      s.state.hooks['/v1/downloads'] = async () => ({ status: 200, contentType: 'application/json', body: JSON.stringify({ ram_bytes: 128 * GiB, ram_gb: 128, update_check: true, catalog: 'ready', refreshing: false, dest: { path: '/models', source: 'default', locked: false, free_bytes: 900 * GiB, volume: 'Data' }, jobs: [], packs: [pack] }) });
+    } }, async ({ page }) => {
+      await page.waitForFunction(() => /150 GiB full weight size/.test(document.querySelector('.detail .facts')?.textContent ?? ''), null, { timeout: 8000 });
+      const facts = await page.textContent('.detail .facts');
+      assert.match(facts, /96\.0 GiB in-memory size/);
+      assert.match(await page.getAttribute('.detail .facts >> text=full weight size', 'data-tip'), /ngram_table\.bin/);
+      await page.click('#modelsTabAvailable');
+      await page.waitForSelector('.dl-row');
+      const meta = await page.textContent('.dl-row[data-repo="beamster/Deep-Sushi"] .meta');
+      assert.match(meta, /150 GiB full weight size/);
+      assert.match(meta, /96\.0 GiB in-memory size/);
+    });
+    await scenario('Models shows the full weight size from the model row when the catalog does not list the pack', { path: '/models#Qwen-A', setup: (s) => { s.state.models[0].bytes_total = 150 * GiB; } }, async ({ page }) => {
+      await page.waitForSelector('.detail .facts');
+      const facts = await page.textContent('.detail .facts');
+      assert.match(facts, /38\.0 GiB in-memory size/);
+      assert.match(facts, /150 GiB full weight size/);
+    });
     await scenario('Load says what the server unloaded, and the button warns first', { path: '/models#GLM-B', setup: (s) => {
       s.state.hooks['/v1/load-model'] = async () => { s.state.models[0].state = 'unloaded'; return null; };
     } }, async ({ page }) => {
@@ -1189,7 +1263,7 @@ async function main() {
       const text = await page.textContent('#settingsPanel');
       assert.doesNotMatch(text, /Check for updates|sushi pull|`/);
       assert.match(await page.textContent('.set[data-key="update_check"] .help'), /Off stops automatic checks; a check you start yourself still runs\./);
-      assert.match(await page.textContent('.set[data-key="pack_update_check"] .help'), /Off stops automatic checks, the Downloads list's included; Check again on Downloads still looks\./);
+      assert.match(await page.textContent('.set[data-key="pack_update_check"] .help'), /Off stops automatic checks, the Available list's included; Check again on Available still looks\./);
     });
     await scenario('a failed load after a reload still says why', { path: '/models#Broke-D', setup: (s) => { s.state.models[3].error = 'OutOfMemory'; } }, async ({ page }) => {
       await page.waitForSelector('.detail .alert.err:not([hidden])');
@@ -1362,12 +1436,34 @@ async function main() {
       assert.equal(await page.isDisabled('#folderChoose'), true, 'only an absolute path is taken as typed');
       await page.fill('#folderPath', '/nowhere');
       await page.click('#folderChoose');
-      await page.waitForFunction(() => document.getElementById('folderError').textContent.includes('cannot be read'));
+      await page.waitForFunction(() => document.getElementById('folderError').textContent.includes('not a folder sushi can read'));
       assert.equal(await page.evaluate(() => document.getElementById('folderPicker').open), true);
       await page.fill('#folderPath', '/Volumes/ssd');
       await page.click('#folderChoose');
       await page.waitForSelector('#folderPicker:not([open])', { state: 'attached' });
       assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').map((c) => c.body).at(-1), { server: { models_dir: '/Volumes/ssd' } });
+    });
+    await scenario('the folder picker opens calmly on a default folder that does not exist yet', { path: '/models', setup: (s) => { delete s.state.folders['/h/.sushi/models']; } }, async ({ page }) => {
+      await page.click('#modelsDirChange');
+      await page.waitForSelector('#folderPicker[open] #folderList >> text=models');
+      assert.equal(await page.isVisible('#folderError'), false, 'no error on open');
+      assert.equal(await page.inputValue('#folderPath'), '/h/.sushi', 'it shows the nearest folder that exists');
+      assert.match(await page.textContent('#folderNote'), /\/h\/\.sushi\/models does not exist yet/);
+      assert.equal(await page.isEnabled('#folderChoose'), true);
+    });
+    await scenario('a typed path that is no folder gets a plain sentence and cannot be used', { path: '/models' }, async ({ page, server }) => {
+      await page.click('#modelsDirChange');
+      await page.waitForSelector('#folderPicker[open] #folderList >> text=beamster');
+      await page.fill('#folderPath', '/does/not/exist');
+      await page.press('#folderPath', 'Enter');
+      await page.waitForSelector('#folderError:not([hidden])');
+      assert.equal(await page.textContent('#folderError'), 'No such folder.');
+      assert.equal(await page.isDisabled('#folderChoose'), true, 'a path the server just refused is not offered');
+      const browses = server.calls.filter((c) => c.path === '/v1/tools').length;
+      await page.fill('#folderPath', '');
+      await page.press('#folderPath', 'Enter');
+      await page.waitForTimeout(150);
+      assert.equal(server.calls.filter((c) => c.path === '/v1/tools').length, browses, 'an empty path asks nothing');
     });
     await scenario('a chosen folder can go back to the default', { path: '/models', setup: (s) => { s.state.server.models_dir.file = '/Volumes/ssd/models'; s.state.server.models_dir.source = 'file'; } }, async ({ page, server }) => {
       await page.click('#modelsDirChange');

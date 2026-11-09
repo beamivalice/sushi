@@ -11,6 +11,7 @@ earlier history is mlx-serve's, in that project's changelog.
   is a 400 that states the range; a strict `json_schema` beside tools, or one the grammar cannot parse, is a 400 on chat,
   Responses and Messages; and `--mtp` with `--no-mtp`, an empty `--api-key`, `--max-concurrent 0` and a
   `--prefill-decode-share` above 0.9 exit with an error, while `--max-resident-mem auto` now means auto after a size too.
+- **The web page checks what it sends and says what went wrong**: a chat setting out of range (or `1e9`, which was sent as 1) is flagged and held, a server error answer is shown as one instead of Offline, a send to a stopped server and a failed load name their remedy, the models-folder picker no longer opens on an error, a model filter hides the detail of a model it hides, skipping the memory check asks first, context sizes read the same everywhere, the chat opens on the model loaded last (and asks you to choose when none ever was), a user message can be edited and resent, a pack's in-memory size and full weight size are both shown, and the markdown renderer shows TeX as written and draws strikethrough, task lists, table alignment, bare links and setext headings.
 - **A model whose SSD prefix cache was declined at load (volume too full, or a failed attach) gets it back by itself**: the
   engine looks once a minute, and at once when an SSD size setting is saved, and logs `[disk-cache] re-armed` when it
   attaches.

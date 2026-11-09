@@ -69,6 +69,12 @@ pub fn streamingRequiredMarker(architecture: []const u8, quant_bits: u32, quanti
     return streamingStubMarker(architecture, geometry_ok, index_complete) and quant_bits == 0 and !quantized_experts;
 }
 
+/// `,"bytes_total":N` for a row that knows the size of everything its folder holds, else nothing.
+fn bytesTotalPart(allocator: std.mem.Allocator, total: ?u64) ![]u8 {
+    if (total) |n| return std.fmt.allocPrint(allocator, ",\"bytes_total\":{d}", .{n});
+    return allocator.dupe(u8, "");
+}
+
 pub fn streamingRowPart(buf: []u8, candidate: bool, required: bool, ssd_budget_gb: u32) []const u8 {
     if (!candidate) return "";
     const head = if (required) ",\"streaming\":true,\"streaming_required\":true" else ",\"streaming\":true";
@@ -177,7 +183,7 @@ test "an unloaded qwen4 stub is text-only only when the checkpoint must stream" 
     try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, dense_row, "\"image\""));
 }
 
-test "a model row carries bytes_linked beside bytes_on_disk, loaded or not" {
+test "a model row carries bytes_linked and bytes_total beside bytes_on_disk, loaded or not" {
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{});
@@ -194,6 +200,7 @@ test "a model row carries bytes_linked beside bytes_on_disk, loaded or not" {
         .path = path_buf[0..path_len],
         .bytes_on_disk = 100,
         .bytes_linked = 40,
+        .bytes_total = 150,
         .arch_hint = "qwen4_exp",
         .config = null,
         .weights = null,
@@ -212,14 +219,14 @@ test "a model row carries bytes_linked beside bytes_on_disk, loaded or not" {
     };
     const stub_row = try renderModelEntry(t.allocator, io, &entry);
     defer t.allocator.free(stub_row);
-    try t.expect(std.mem.indexOf(u8, stub_row, "\"bytes_on_disk\":100,\"bytes_linked\":40") != null);
+    try t.expect(std.mem.indexOf(u8, stub_row, "\"bytes_on_disk\":100,\"bytes_linked\":40,\"bytes_total\":150") != null);
 
     entry.config = &cfg;
     entry.chat_config = &chat_cfg;
     entry.state = .ready;
     const ready_row = try renderModelEntry(t.allocator, io, &entry);
     defer t.allocator.free(ready_row);
-    try t.expect(std.mem.indexOf(u8, ready_row, "\"bytes_on_disk\":100,\"bytes_linked\":40") != null);
+    try t.expect(std.mem.indexOf(u8, ready_row, "\"bytes_on_disk\":100,\"bytes_linked\":40,\"bytes_total\":150") != null);
 }
 
 test "a quantized pack loaded resident advertises no streaming, the same pack streamed does" {
@@ -391,6 +398,11 @@ pub fn renderModelEntry(
         else
             try allocator.dupe(u8, "null");
         defer allocator.free(bytes_on_disk_str);
+        const total_part = try bytesTotalPart(allocator, entry.bytes_total);
+        defer allocator.free(total_part);
+        // The format call takes 32 arguments at most: the linked count and the total ride one.
+        const linked_part = try std.fmt.allocPrint(allocator, "{d}{s}", .{ entry.bytes_linked, total_part });
+        defer allocator.free(linked_part);
 
         // Model-author sampling recommendations from generation_config.json,
         // surfaced so the Swift Settings UI can show "model recommends" pills
@@ -426,13 +438,13 @@ pub fn renderModelEntry(
         );
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":{f},"object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"bytes_linked":{d},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":{f},"engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{f},"context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s},"pack_revision":{s}}}}}
+            \\{{"id":{f},"object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"bytes_linked":{s},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":{f},"engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{f},"context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s},"pack_revision":{s}}}}}
         , .{
             json_text.Str{ .s = model_id },
             nowSecs(io),
             entry.bytes_resident,
             bytes_on_disk_str,
-            entry.bytes_linked,
+            linked_part,
             // Top-level twins of meta.context_length: openai-models-list
             // discovery clients (oh-my-pi, vLLM-shaped readers) look for
             // row-level max_model_len/context_length and substitute their own
@@ -480,6 +492,8 @@ pub fn renderModelEntry(
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
+    const bytes_total_part = try bytesTotalPart(allocator, entry.bytes_total);
+    defer allocator.free(bytes_total_part);
     const err_part: []const u8 = if (entry.error_name) |name| blk: {
         break :blk try std.fmt.allocPrint(
             allocator,
@@ -599,8 +613,8 @@ pub fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":{f},"object":"model","created":0,"owned_by":"sushi","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s},"bytes_linked":{d}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ json_text.Str{ .s = entry.id }, state_str, bytes_on_disk_str, entry.bytes_linked, streaming_part, err_part, top_ctx_part, caps_part, efforts_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":{f},"object":"model","created":0,"owned_by":"sushi","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s},"bytes_linked":{d}{s}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ json_text.Str{ .s = entry.id }, state_str, bytes_on_disk_str, entry.bytes_linked, bytes_total_part, streaming_part, err_part, top_ctx_part, caps_part, efforts_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 pub fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {

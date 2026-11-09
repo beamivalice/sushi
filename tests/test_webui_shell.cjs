@@ -31,7 +31,7 @@ function makeServer({ metrics = 200, loaded = true, down = false, apiKey = null 
     if (apiKey && request.headers().authorization !== `Bearer ${apiKey}`) return route.fulfill(json({ error: { message: 'bad key' } }, 401));
     if (down) return route.abort();
     switch (p) {
-      case '/v1/models': return route.fulfill(json({ data: [{ id: 'Chat-A', state: state.loaded ? 'ready' : 'unloaded', loaded: state.loaded, capabilities: ['chat'], context_length: 8192, bytes_on_disk: 2 ** 30, input_modalities: ['text'] }] }));
+      case '/v1/models': if (state.modelsReply) return route.fulfill(state.modelsReply); return route.fulfill(json({ data: [{ id: 'Chat-A', state: state.loaded ? 'ready' : 'unloaded', loaded: state.loaded, capabilities: ['chat'], context_length: 8192, bytes_on_disk: 2 ** 30, input_modalities: ['text'] }] }));
       case '/v1/load-model': state.loaded = true; return route.fulfill(json({ ok: true }));
       case '/props': return route.fulfill(json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 128 * 2 ** 30 }, batching: {} }));
       case '/v1/tools': return route.fulfill(json({ edit_default: false }));
@@ -209,6 +209,8 @@ async function main() {
       // A model that is not loaded can be loaded from the chat, once.
       const server = makeServer({ loaded: false });
       const { page, context } = await open(browser, server, '/chat');
+      await page.waitForSelector('#modelSelect option', { state: 'attached' });
+      await page.selectOption('#modelSelect', 'Chat-A');
       await page.waitForSelector('#modelStatus button');
       await page.dblclick('#modelStatus button');
       await page.waitForFunction(() => /Loaded/.test(document.getElementById('toastHost').textContent));
@@ -282,10 +284,15 @@ async function main() {
         await page.keyboard.press('Tab');
         assert.equal(await page.evaluate(() => !!document.activeElement.closest('#appShell')), false, 'Tab stays out of the page behind the overlay');
       }
+      await page.fill('#keyInput', '');
+      await page.keyboard.press('Enter');
+      assert.match(await page.textContent('#keyError'), /Enter the API key/, 'an empty key is asked for, not sent');
+      assert.equal(await page.evaluate(() => document.activeElement.id), 'keyInput');
       await page.fill('#keyInput', 'sekret');
       await page.keyboard.press('Enter');
       await page.waitForSelector('#keyOverlay', { state: 'hidden' });
       await page.waitForFunction(() => document.getElementById('modelSelect').options.length === 1);
+      await page.waitForFunction(() => document.activeElement.id === 'promptInput', null, { timeout: 3000 });
       assert.equal(await page.evaluate(() => document.getElementById('appShell').inert), false, 'the page works again after unlocking');
       await context.close();
     }
@@ -366,6 +373,26 @@ async function main() {
           return { spill: parts.filter((n) => n.getBoundingClientRect().right > edge + 0.5).map((n) => n.id), clipped: parts.filter((n) => n.scrollWidth > n.clientWidth).map((n) => n.id) };
         });
         assert.deepEqual(fit, { spill: [], clipped: [] }, `composer row at ${width} px`);
+        await context.close();
+      }
+    }
+    {
+      // An error answer from /v1/models is the server answering: the page names the error, not an unreachable server.
+      const cases = [[{ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { message: 'boom' } }) }, /boom/], [{ status: 200, contentType: 'text/html', body: '<html>proxy</html>' }, /list/i]];
+      for (const [reply, message] of cases) {
+        const server = makeServer();
+        server.state.modelsReply = reply;
+        const { page, context, errors } = await open(browser, server, '/models');
+        await page.waitForSelector('#modelsAlert:not([hidden])');
+        const seen = await page.evaluate(() => ({ alert: document.getElementById('modelsAlert').textContent, dot: document.getElementById('serverDotLabel').textContent, title: document.getElementById('serverDot').title }));
+        assert.match(seen.alert, message, `the Models alert names the server's answer (${seen.alert})`);
+        assert.doesNotMatch(seen.alert + seen.dot + seen.title, /reach|unreachable|offline/i, `a server that answered is not unreachable (${JSON.stringify(seen)})`);
+        assert.match(seen.dot, /error/i, 'the top bar says the server answered with an error');
+        server.state.modelsReply = null;
+        await page.evaluate(() => modelStore.refresh());
+        await page.waitForFunction(() => document.getElementById('modelsAlert').hidden || !document.getElementById('modelsAlert').textContent);
+        assert.doesNotMatch(await page.textContent('#serverDotLabel'), /error/i, 'a good answer clears it');
+        assert.deepEqual(errors, []);
         await context.close();
       }
     }
