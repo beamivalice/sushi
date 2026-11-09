@@ -153,7 +153,7 @@ JSON
 unload "$A_ID" > /dev/null
 CODE=$(load "$A_ID")
 check "ssd_budget_gb on a Sushi pack: load -> 200 (got $CODE)" "$(is "$CODE" 200)"
-check "the load streams at the file's budget, never ignoring it" "$(logline "\[expert-stream\] ssd budget 60 GiB from model-settings.json")"
+check "the load streams at the file's budget, never ignoring it" "$(logline "\[expert-stream\] ssd budget 60 GiB (model-settings.json)")"
 check "ssd_budget_gb is not ignored" "$(grep -q "ssd_budget_gb ignored" "$SUSHI_LOG" && echo 0 || echo 1)"
 
 echo "[6] no --idle-evict-secs: the model stays resident"
