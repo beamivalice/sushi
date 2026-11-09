@@ -1643,7 +1643,8 @@ pub const Scheduler = struct {
     /// Errors:
     ///   error.UnknownModelId    — id isn't in the registry.
     ///   error.NoDefaultModel    — id empty AND no default set.
-    ///   error.NotEnoughMemory   — would exceed caps and no LRU victim.
+    ///   error.NotEnoughMemory   — would exceed --max-resident-mem and no LRU victim.
+    ///   error.ResidentModelsCapReached — --max-resident-models models are resident and none is evictable.
     ///   error.InsufficientMemory — memory preflight refused the load (free
     ///                             RAM can't hold weights + headroom).
     ///   error.LoadFailed        — inference thread reported a load failure.
@@ -1800,15 +1801,22 @@ pub const Scheduler = struct {
                 // idle server the cause is always the static cap (#126), and
                 // the flag that moves it is not otherwise discoverable.
                 const gb = 1024.0 * 1024.0 * 1024.0;
-                log.err("Refusing to load {s}: needs ~{d:.2} GB but --max-resident-mem is {d:.2} GB ({d:.2} GB already resident across {d} model(s), none evictable). Raise or disable the cap with --max-resident-mem <size>|0.\n", .{
-                    entry.id,
-                    @as(f64, @floatFromInt(estimated)) / gb,
-                    @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
-                    @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
-                    self.registry.countLoadedLocked(),
-                });
+                const count_cap = self.registry.countLoadedLocked() + 1 > self.registry.max_resident_models;
+                if (count_cap) {
+                    log.err("Refusing to load {s}: --max-resident-models is {d} and {d} model(s) are resident, none evictable (each is serving a request). Retry when one ends, or raise the cap.\n", .{
+                        entry.id, self.registry.max_resident_models, self.registry.countLoadedLocked(),
+                    });
+                } else {
+                    log.err("Refusing to load {s}: needs ~{d:.2} GB but --max-resident-mem is {d:.2} GB ({d:.2} GB already resident across {d} model(s), none evictable). Raise or disable the cap with --max-resident-mem <size>|0.\n", .{
+                        entry.id,
+                        @as(f64, @floatFromInt(estimated)) / gb,
+                        @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
+                        @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
+                        self.registry.countLoadedLocked(),
+                    });
+                }
                 self.registry.markUnloadedLocked(entry); // releases the reservation
-                return error.NotEnoughMemory;
+                return if (count_cap) error.ResidentModelsCapReached else error.NotEnoughMemory;
             };
             n_victims = n;
             // Drain readers on each victim before the inference thread frees it.
@@ -6123,7 +6131,7 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     sch.ssd_budget_bytes = 0;
     sch.mtp = null;
 
-    try testing.expectError(error.NotEnoughMemory, sch.ensureLoaded("b"));
+    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoaded("b"));
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
     // The failed claim unlocked once: a second unlock would leave this free or release another thread's hold.
@@ -6163,7 +6171,7 @@ test "ensureLoadedFresh: a model whose load failed is tried again, not answered 
     try testing.expectError(error.InsufficientMemory, sch.ensureLoaded("b"));
     try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
     // An explicit load runs the whole attempt again: here it reaches the eviction gate and its own verdict.
-    try testing.expectError(error.NotEnoughMemory, sch.ensureLoadedFresh("b"));
+    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoadedFresh("b"));
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     try testing.expect(target.error_name == null);
     try testing.expect(reg.mutex.tryLock());

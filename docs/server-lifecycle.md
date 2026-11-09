@@ -201,7 +201,11 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   (source); ctx N (source)`, `[mtp] on|off (source)`; `/props settings.mtp.source`). Guard: `tests/test_cold_load.sh`.
   The table test in `settings_resolve.zig` pins flag, file and default for every key (host tier).
 - MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
-  the file can only turn it off, or on for an SSD-streamed pack.
+  the file can only turn it off, or on for an SSD-streamed pack. `settings.mtp.source` is that on/off choice's;
+  `settings.mtp.depth_source` names `--mtp-min-depth/--mtp-max-depth` when they bound the depth, and `adaptive` is false
+  while equal values pin one depth.
+- A load refused by `--max-resident-models` (every resident model serving a request) is a 503 `resident_models_cap`
+  naming that flag, with `Retry-After`; `--max-resident-mem` is a 503 `out_of_memory` naming its own flag.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
   `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `ssd_prefetch` (0..100; ignored with a log line on an arch with no expert prefetcher, whereas the flag is refused there), `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`, `max_tokens`: the per-model twin of `--max-tokens`, a positive integer at most the model's context, the omitted-`max_tokens` budget of `ModelConfig.defaultMaxTokens`), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as

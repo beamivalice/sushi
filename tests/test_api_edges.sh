@@ -74,10 +74,15 @@ T0=$(echo "$BODY" | J "$GENERATED")
 [[ -n "$GREEDY" && "$GREEDY" == "$T0" ]] && ok "top_p 0 is greedy (== temperature 0)" || bad "top_p 0 is greedy" "top_p0='$GREEDY' temp0='$T0'"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"top_k\":1,\"temperature\":1.0,\"max_tokens\":8,\"enable_mtp\":false,$NT_CHAT}"
 [[ -n "$T0" && "$(echo "$BODY" | J "$GENERATED")" == "$T0" ]] && ok "top_k 1 is greedy" || bad "top_k 1 is greedy"
-for f in '"temperature":-1' '"temperature":100' '"top_p":2' '"top_k":-3' '"seed":9223372036854775808' '"seed":"abc"' '"max_tokens":0' '"max_tokens":-5' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":2'; do
+for f in '"temperature":-1' '"temperature":100' '"top_p":2' '"top_k":-3' '"seed":9223372036854775808' '"max_tokens":0' '"max_tokens":-5' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":2'; do
     [[ "$f" == '"max_tokens"'* ]] && cap="" || cap=',"max_tokens":5'
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$f$cap,$NT_CHAT}"
     [[ "$R" == 200 && -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "out-of-range $f answers" || bad "out-of-range $f" "$R ${BODY:0:120}"
+done
+
+for f in '"temperature":"hot"' '"top_p":true' '"seed":"abc"' '"stop":5' '"max_tokens":"7"' '"kv_quant":5' '"n":0'; do
+    req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$f,$NT_CHAT}"
+    expect_status 400 "wrong-typed $f is refused"
 done
 
 echo "=== stop sequences ==="

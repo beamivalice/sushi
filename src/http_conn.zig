@@ -206,6 +206,8 @@ pub const Conn = struct {
     /// True once this connection has written a `text/event-stream` head: past it a generation
     /// failure can only be an SSE `error` event. Set only in `sendSseHeaders`.
     sse_headers_sent: bool = false,
+    /// The request was HEAD: a response sends its head and never its body.
+    head_only: bool = false,
     /// A Content-Length response ends by length and can release its socket immediately.
     length_framed: bool = false,
     /// Set for one request when Qwen `high`/`max` was served as `xhigh`. The
@@ -220,6 +222,7 @@ pub const Conn = struct {
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.sse_headers_sent = false;
+        c.head_only = false;
         c.length_framed = false;
         c.effort_notice = null;
         c.effort_notice_json = null;
@@ -475,10 +478,55 @@ fn hostHeaderIp(headers: []const u8) ?[]const u8 {
     return if (parts == 4) name else null;
 }
 
+const ROUTES_GET = [_][]const u8{
+    "/",             "/chat",    "/dashboard", "/downloads", "/models",    "/settings", "/health",
+    "/metrics",      "/metrics.json", "/props", "/v1/models", "/v1/prefix-cache",
+};
+const ROUTES_POST = [_][]const u8{
+    "/detokenize",         "/tokenize",              "/metrics/enable",      "/v1/chat/completions", "/v1/completions",
+    "/v1/downloads/cancel", "/v1/load-model",        "/v1/messages",         "/v1/messages/count_tokens",
+    "/v1/models/rescan",   "/v1/prefix-cache/clear", "/v1/responses/compact", "/v1/slots/cancel",   "/v1/tools",
+    "/v1/unload-model",    "/v1/update",
+};
+
+/// The methods a known path answers (the `Allow` header of its 405), or null for a path that is no route.
+/// `/v1/models/{id}` is matched by prefix, as `/v1/responses/{id}`.
+pub fn allowedMethods(path: []const u8) ?[]const u8 {
+    for (ROUTES_GET) |p| if (std.mem.eql(u8, path, p)) return "GET, HEAD";
+    for (ROUTES_POST) |p| if (std.mem.eql(u8, path, p)) return "POST";
+    if (std.mem.eql(u8, path, "/v1/settings") or std.mem.eql(u8, path, "/v1/downloads")) return "GET, HEAD, POST";
+    if (std.mem.eql(u8, path, "/v1/responses")) return "GET, POST";
+    if (std.mem.startsWith(u8, path, "/v1/responses/")) return "GET, HEAD, DELETE";
+    if (std.mem.startsWith(u8, path, "/v1/models/")) return "GET, HEAD";
+    return null;
+}
+
+/// Whether `method` is one of the comma-separated `allow` list.
+pub fn methodAllowed(allow: []const u8, method: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, allow, ", ");
+    while (it.next()) |m| if (std.mem.eql(u8, m, method)) return true;
+    return false;
+}
+
+test "allowedMethods names each route's methods, and HEAD rides GET" {
+    const t = std.testing;
+    try t.expectEqualStrings("GET, HEAD", allowedMethods("/health").?);
+    try t.expectEqualStrings("POST", allowedMethods("/v1/chat/completions").?);
+    try t.expectEqualStrings("POST", allowedMethods("/v1/models/rescan").?);
+    try t.expectEqualStrings("GET, HEAD", allowedMethods("/v1/models/some-id").?);
+    try t.expectEqualStrings("GET, HEAD, DELETE", allowedMethods("/v1/responses/resp_1").?);
+    try t.expectEqualStrings("POST", allowedMethods("/v1/responses/compact").?);
+    try t.expect(allowedMethods("/nope") == null);
+    try t.expect(methodAllowed("GET, HEAD", "HEAD"));
+    try t.expect(!methodAllowed("POST", "GET"));
+    // Every served route has an Allow entry.
+    for (ROUTE_PATHS) |p| try t.expect(allowedMethods(p) != null);
+}
+
 /// Is `path` an endpoint this server serves at all (any method)?
 pub fn routeExists(path: []const u8) bool {
     // `/v1/responses/{id}` (GET/DELETE) is matched by prefix, not by a literal.
-    if (std.mem.startsWith(u8, path, "/v1/responses/")) return true;
+    if (std.mem.startsWith(u8, path, "/v1/responses/") or std.mem.startsWith(u8, path, "/v1/models/")) return true;
     for (ROUTE_PATHS) |p| if (std.mem.eql(u8, path, p)) return true;
     return false;
 }
@@ -855,9 +903,9 @@ fn basicAuthMatches(enc: []const u8, key: []const u8) bool {
 pub fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     const key = server_state.g_api_key orelse return true;
     if (findHeaderValueCI(raw_headers, "authorization")) |auth| {
-        if (std.mem.startsWith(u8, auth, "Bearer ")) {
+        if (std.ascii.startsWithIgnoreCase(auth, "Bearer ")) {
             if (constTimeEql(std.mem.trim(u8, auth["Bearer ".len..], " \t"), key)) return true;
-        } else if (std.mem.startsWith(u8, auth, "Basic ")) {
+        } else if (std.ascii.startsWithIgnoreCase(auth, "Basic ")) {
             if (basicAuthMatches(std.mem.trim(u8, auth["Basic ".len..], " \t"), key)) return true;
         }
     }
@@ -874,9 +922,12 @@ pub fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
 }
 
 /// Send a 401 with a Basic-auth challenge so browsers prompt for the key on the
-/// index + metrics pages; API clients read the JSON error body.
-pub fn sendUnauthorized(stream: *Conn) !void {
-    const body = "{\"error\":{\"message\":\"missing or invalid API key\",\"type\":\"authentication_error\"}}";
+/// index + metrics pages; API clients read the JSON error body, in Anthropic's envelope on `/v1/messages`.
+pub fn sendUnauthorized(stream: *Conn, anthropic_shape: bool) !void {
+    const body = if (anthropic_shape)
+        "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"missing or invalid API key\"}}"
+    else
+        "{\"error\":{\"message\":\"missing or invalid API key\",\"type\":\"authentication_error\"}}";
     logHttpResponse("401 Unauthorized", "application/json", body);
     if (stream.ws_mode) |bridge| {
         if (body.len > 0) try bridge.sendText(body);
@@ -907,6 +958,9 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     // Wrong / missing key is rejected
     try std.testing.expect(!apiKeyAuthorized("Authorization: Bearer wrong\r\n", "/"));
     try std.testing.expect(!apiKeyAuthorized("x-api-key: nope\r\n", "/"));
+    // RFC 7235: the auth scheme is case-insensitive.
+    try std.testing.expect(apiKeyAuthorized("authorization: bearer s3cret\r\n", "/v1/models"));
+    try std.testing.expect(apiKeyAuthorized("Authorization: BASIC dXNlcjpzM2NyZXQ=\r\n", "/"));
     try std.testing.expect(!apiKeyAuthorized("", "/v1/models"));
 
     // No key configured ⇒ always authorized (open mode)
@@ -1083,6 +1137,27 @@ test "metrics enable: --api-key binds the route, and a foreign Origin is refused
     try t.expect(instr.current() != null);
 }
 
+test "routes: a wrong method is a 405 with Allow, HEAD is a GET without its body, an unserved sub-path says so" {
+    const t = std.testing;
+    const Case = struct { request: []const u8, status: []const u8, has: []const u8 };
+    for ([_]Case{
+        .{ .request = "PUT /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 405 ", .has = "Allow: POST\r\n" },
+        .{ .request = "GET /v1/chat/completions HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .has = "Allow: POST\r\n" },
+        .{ .request = "POST /health HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 405 ", .has = "Allow: GET, HEAD\r\n" },
+        .{ .request = "HEAD /v1/chat/completions HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .has = "Allow: POST\r\n" },
+        .{ .request = "HEAD /health HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 200 OK\r\n", .has = "Content-Length: 15\r\n" },
+        .{ .request = "GET /v1/models/no-such HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 404 ", .has = "Unknown model id" },
+        .{ .request = "GET /v1/responses/resp_1/input_items HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 404 ", .has = "sub-resource is not supported" },
+    }) |c| {
+        const response = try serveOneForTest(c.request);
+        defer t.allocator.free(response);
+        errdefer std.debug.print("\n{s}\n", .{response});
+        try t.expect(std.mem.startsWith(u8, response, c.status));
+        try t.expect(std.mem.indexOf(u8, response, c.has) != null);
+        if (std.mem.startsWith(u8, c.request, "HEAD")) try t.expectEqual(@as(usize, 0), responseBody(response).len);
+    }
+}
+
 test "chat page: another method on the page paths is refused before any model resolves" {
     const t = std.testing;
     const response = try serveOneForTest("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}");
@@ -1133,6 +1208,13 @@ test "chat page: --api-key leaves the page open and keeps the API behind the key
         defer t.allocator.free(response);
         try t.expect(std.mem.startsWith(u8, response, c.status));
     }
+    // The key is refused in each API's own error envelope; the scheme word is any case.
+    const messages_401 = try serveOneForTest("POST /v1/messages HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
+    defer t.allocator.free(messages_401);
+    try t.expect(std.mem.startsWith(u8, responseBody(messages_401), "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\""));
+    const lower = try serveOneForTest("GET /v1/models HTTP/1.1\r\nAuthorization: bearer s3cret\r\n\r\n");
+    defer t.allocator.free(lower);
+    try t.expect(std.mem.startsWith(u8, lower, "HTTP/1.1 200 OK\r\n"));
 }
 
 test "self-update: /v1/update refuses by name over the wire and never shuts the server down" {
@@ -1990,7 +2072,7 @@ test "slots: cancel route validates request and method" {
     const t = std.testing;
     const Case = struct { request: []const u8, status: []const u8, says: []const u8 };
     for ([_]Case{
-        .{ .request = "GET /v1/slots/cancel HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "Use POST to cancel an in-flight slot" },
+        .{ .request = "GET /v1/slots/cancel HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "POST only" },
         .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 400 ", .says = "Send {\\\"id\\\": <request_id>}" },
         .{ .request = "POST /v1/slots/cancel HTTP/1.1\r\nContent-Length: 12\r\n\r\n{\"id\":\"bad\"}", .status = "HTTP/1.1 400 ", .says = "Send {\\\"id\\\": <request_id>}" },
     }) |c| {

@@ -31,6 +31,7 @@ const http_conn = @import("http_conn.zig");
 const Conn = http_conn.Conn;
 const sendSseHeaders = http_conn.sendSseHeaders;
 const request_policy = @import("request_policy.zig");
+const servedModelId = request_policy.servedModelId;
 const resolveThinkPenalty = request_policy.resolveThinkPenalty;
 const armThinkPenalty = request_policy.armThinkPenalty;
 const omittedMaxTokensDefault = request_policy.omittedMaxTokensDefault;
@@ -186,6 +187,12 @@ pub fn handleCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
     }
+    var fault_buf: [384]u8 = undefined;
+    if (request_parse.generationFieldFault(&fault_buf, root, .{})) |reason| {
+        log.warn("POST /v1/completions -> 400 ({s})\n", .{reason});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Legacy-completions `logprobs` is an INTEGER (how many alternatives per
     // token), not chat's bool + `top_logprobs`. It was parsed nowhere and the
@@ -215,7 +222,7 @@ pub fn handleCompletions(
         .text, .ids => {},
     }
 
-    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
+    const requested_max_tokens = request_parse.requestedMaxTokens(root);
     const max_tokens: u32 = resolveRequestMaxTokens(
         requested_max_tokens,
         omittedMaxTokensDefault(config),
@@ -243,9 +250,9 @@ pub fn handleCompletions(
     }
 
     const model_name_raw = if (root.get("model")) |v|
-        (if (v == .string) v.string else config.model_type)
+        (if (v == .string) v.string else servedModelId(lm, config))
     else
-        config.model_type;
+        servedModelId(lm, config);
     const model_name = try json_text.innerAlloc(allocator, model_name_raw);
     defer allocator.free(model_name);
 
@@ -637,7 +644,7 @@ fn handleStreamingCompletion(
     }
 
     // Final chunk with finish_reason
-    ts.finalize();
+    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize();
     const finish_reason = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
     const total_prompt = ts.prompt_tokens;
 

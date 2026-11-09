@@ -2852,7 +2852,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
     if (in_think) {
         try appendReasoning(allocator, &reasoning, &join, join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped, shipped)));
     } else {
-        try out.appendSlice(allocator, content.finish());
+        try out.appendSlice(allocator, content.finish(join.closed));
     }
     const r = try reasoning.toOwnedSlice(allocator);
     errdefer allocator.free(r);
@@ -2860,7 +2860,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
 }
 
 /// The non-stream (reasoning, content) of `raw` must equal the stream's for `tokens`; a stream may still
-/// ship the trailing whitespace the split trims.
+/// ship exactly the same bytes.
 fn expectStreamMatchesReply(allocator: std.mem.Allocator, raw: []const u8, tokens: []const []const u8, opened: bool) !void {
     const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, raw);
     defer if (norm) |n| allocator.free(n);
@@ -2870,7 +2870,7 @@ fn expectStreamMatchesReply(allocator: std.mem.Allocator, raw: []const u8, token
     const want_reasoning = split.reasoning_content orelse "";
     errdefer std.debug.print("\nraw: {s}\nnon-stream: {s} | {s}\nstream: {s} | {s}\n", .{ raw, want_reasoning, split.content, got[0], got[1] });
     try testing.expectEqualStrings(want_reasoning, got[0]);
-    try testing.expectEqualStrings(split.content, std.mem.trimEnd(u8, got[1], "\n "));
+    try testing.expectEqualStrings(split.content, got[1]);
 }
 
 test "format corpus: a closer in content after the thought is dropped on the stream and the non-stream reply alike" {
@@ -3232,5 +3232,61 @@ test "format corpus: a history call whose arguments are not an object still rend
             try testing.expectEqual(before, chat.template_fallbacks.load(.monotonic));
             try testing.expect(std.mem.indexOf(u8, rendered, "get_weather") != null);
         }
+    }
+}
+
+test "format corpus: a conversation with no user turn is refused by name when the template raises for it, never rendered by the generic fallback" {
+    const config = chat.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
+    const before = chat.template_fallbacks.load(.monotonic);
+    const system_only = [_]chat.Message{.{ .role = "system", .content = "You are terse." }};
+    const assistant_only = [_]chat.Message{.{ .role = "assistant", .content = "hi" }};
+    for ([_][]const chat.Message{ &system_only, &assistant_only }) |messages| {
+        try testing.expectError(error.ChatNeedsUserTurn, chat.renderChatTemplate(testing.allocator, messages, &config, null, null, true, null, false));
+    }
+    try testing.expectEqual(before, chat.template_fallbacks.load(.monotonic));
+    const with_user = [_]chat.Message{ .{ .role = "system", .content = "You are terse." }, .{ .role = "user", .content = "hi" } };
+    const rendered = try chat.renderChatTemplate(testing.allocator, &with_user, &config, null, null, true, null, false);
+    testing.allocator.free(rendered);
+}
+
+test "format corpus: a stream ends on the non-stream content's tail, trailing whitespace included" {
+    // The split trims a content tail after a closed thought; a thought-less reply keeps its tail.
+    // A token may carry the whitespace with its text.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, tokens: []const []const u8, opened: bool };
+    const cases = [_]Case{
+        .{ .raw = "<think>t</think>1, 2, 6, ", .tokens = &.{ "<think>", "t", "</think>", "1", ",", " ", "2", ",", " ", "6", ",", " " }, .opened = false },
+        .{ .raw = "<think>t</think>1, 2, 6, ", .tokens = &.{ "<think>", "t", "</think>", "1", ", ", "2", ", ", "6", ", " }, .opened = false },
+        .{ .raw = "t</think>Done.\n\n", .tokens = &.{ "t", "</think>", "Done", ".\n\n" }, .opened = true },
+        .{ .raw = "t</think>\n\nDone.\n \n", .tokens = &.{ "t", "</think>", "\n\n", "Done", ".", "\n ", "\n" }, .opened = true },
+        .{ .raw = "<think>t</think>A <think>u</think>B \n", .tokens = &.{ "<think>", "t", "</think>", "A", " ", "<think>", "u", "</think>", "B", " \n" }, .opened = false },
+        .{ .raw = "1, 2, 3, ", .tokens = &.{ "1", ", ", "2", ", ", "3", ", " }, .opened = false },
+        .{ .raw = "Done.\n\n", .tokens = &.{ "Done", ".\n\n" }, .opened = false },
+    };
+    for (cases) |c| try expectStreamMatchesReply(allocator, c.raw, c.tokens, c.opened);
+}
+
+test "format corpus: the text before a tool call streams as the non-stream preamble" {
+    // The whitespace between the preamble and the markup is cut by `trimLeakedToolMarkup`.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, tokens: []const []const u8 };
+    const cases = [_]Case{
+        .{ .raw = "I'll check both cities.\n\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call>", .tokens = &.{ "I'll check both cities", ".\n\n" } },
+        .{ .raw = "I'll check both cities.\n\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call>", .tokens = &.{ "I'll check both cities", ".", "\n\n" } },
+        .{ .raw = "\n\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call>", .tokens = &.{"\n\n"} },
+        .{ .raw = "Looking.  <tool_call>x</tool_call>", .tokens = &.{ "Looking", ".  " } },
+    };
+    for (cases) |c| {
+        const want = think_tags.visibleToolPreamble(think_tags.splitThinkBlock(c.raw, true, false).content);
+        var content = think_tags.ContentStream{};
+        defer content.deinit(allocator);
+        var got = std.ArrayList(u8).empty;
+        defer got.deinit(allocator);
+        for (c.tokens) |tt| switch (try content.deliver(allocator, tt)) {
+            .send => |bytes| try got.appendSlice(allocator, bytes),
+            else => {},
+        };
+        try got.appendSlice(allocator, content.finish(true));
+        try testing.expectEqualStrings(want, got.items);
     }
 }

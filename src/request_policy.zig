@@ -128,6 +128,11 @@ pub fn filledMaxTokens(config: *const model_mod.ModelConfig) u32 {
     return if (launch > 0) launch else config.defaultMaxTokens();
 }
 
+/// The `model` an answer echoes when the request names none: the id it is served under.
+pub fn servedModelId(lm: *const LoadedModel, config: *const model_mod.ModelConfig) []const u8 {
+    return if (lm.id.len > 0) lm.id else config.model_type;
+}
+
 /// The one read of `ServerConfig.default_max_tokens`. 0 = flag not given.
 pub fn launchMaxTokensDefault() u32 {
     return server_state.server_config.default_max_tokens;
@@ -140,11 +145,8 @@ pub fn launchMaxTokensDefault() u32 {
 /// setting sends 0 (or omits the field); both land on the context-pegged budget
 /// instead of a fixed ceiling. A positive integer is an explicit cap.
 pub fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
-    const val = v orelse return auto_default;
-    return switch (val) {
-        .integer => |i| if (i > 0) @intCast(@min(i, std.math.maxInt(u32))) else auto_default,
-        else => auto_default,
-    };
+    const i = request_parse.wholeNumber(v orelse return auto_default) orelse return auto_default;
+    return if (i > 0) @intCast(@min(i, std.math.maxInt(u32))) else auto_default;
 }
 
 /// Who decided the effective `max_tokens`: the client, the `--max-tokens` launch default, or nobody (auto).
@@ -152,9 +154,8 @@ const MaxTokensOrigin = enum { client, launch_default, model_default, auto };
 
 /// The origin of the number `resolveRequestMaxTokens` returns, from the same two inputs.
 pub fn maxTokensOrigin(requested: ?std.json.Value, launch_default: u32, model_default: u32) MaxTokensOrigin {
-    if (requested) |val| switch (val) {
-        .integer => |i| if (i > 0) return .client,
-        else => {},
+    if (requested) |val| if (request_parse.wholeNumber(val)) |i| {
+        if (i > 0) return .client;
     };
     if (launch_default > 0) return .launch_default;
     return if (model_default > 0) .model_default else .auto;
@@ -764,6 +765,9 @@ test "resolveRequestMaxTokens: absent / 0 / negative / non-int → auto; positiv
     try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .string = "999" }, auto));
     // A real positive cap is honored verbatim.
     try testing.expectEqual(@as(u32, 4096), resolveRequestMaxTokens(.{ .integer = 4096 }, auto));
+    // A whole float is the integer `json.dumps(7.0)` sends.
+    try testing.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .float = 7.0 }, auto));
+    try testing.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .float = 7.0 }, 0, 0));
 }
 
 test "--max-tokens is the omitted-field default: unset is byte-identical, set wins" {

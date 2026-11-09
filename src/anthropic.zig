@@ -53,6 +53,7 @@ const placeRequestMedia = request_media.placeRequestMedia;
 const prepareRequestMedia = request_media.prepareRequestMedia;
 const visionPreprocFromConfig = request_media.visionPreprocFromConfig;
 const request_policy = @import("request_policy.zig");
+const servedModelId = request_policy.servedModelId;
 const resolveThinkPenalty = request_policy.resolveThinkPenalty;
 const armThinkPenalty = request_policy.armThinkPenalty;
 const launchMaxTokensDefault = request_policy.launchMaxTokensDefault;
@@ -475,6 +476,20 @@ fn anthropicStopReason(finish_reason: []const u8, matched_stop_seq: ?[]const u8)
     return mapFinishToStopReason(finish_reason);
 }
 
+/// The answer's text block. A reply that already holds a block (its thinking) and has no text carries none,
+/// as the Messages API never emits an empty one.
+fn appendAnswerText(allocator: std.mem.Allocator, content: *std.ArrayList(u8), block_count: usize, text: []const u8) !void {
+    if (text.len == 0 and block_count > 0) return;
+    if (block_count > 0) try content.append(allocator, ',');
+    const esc_text = try jsonEscape(allocator, text);
+    defer allocator.free(esc_text);
+    const text_block = try std.fmt.allocPrint(allocator,
+        \\{{"type":"text","text":{s}}}
+    , .{esc_text});
+    defer allocator.free(text_block);
+    try content.appendSlice(allocator, text_block);
+}
+
 pub fn handleAnthropicMessages(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -488,6 +503,15 @@ pub fn handleAnthropicMessages(
     const parsed = (try parseAnthropicBody(allocator, stream, body, "/v1/messages")) orelse return;
     defer parsed.deinit();
     const root = parsed.value.object;
+
+    var fault_buf: [384]u8 = undefined;
+    const field_fault = request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &.{"max_tokens"}, .stop = "stop_sequences" }) orelse
+        if (root.get("tools")) |tv| request_parse.toolsFault(&fault_buf, tv, false) else null;
+    if (field_fault) |reason| {
+        log.warn("POST /v1/messages -> 400 ({s})\n", .{reason});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+        return;
+    }
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.
@@ -522,7 +546,7 @@ pub fn handleAnthropicMessages(
     }
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
-    const model_name_raw = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
+    const model_name_raw = if (root.get("model")) |v| (if (v == .string) v.string else servedModelId(lm, config)) else servedModelId(lm, config);
     const model_name = try json_text.innerAlloc(allocator, model_name_raw);
     defer allocator.free(model_name);
 
@@ -1148,25 +1172,10 @@ fn handleAnthropicNonStreaming(
         } else {
             // No tool calls — emit text block. Nothing parsed, so any tool
             // markup still in here is unparsed wreckage: cut it at emission.
-            if (block_count > 0) try content.append(allocator, ',');
-            const esc_text = try jsonEscape(allocator, if (routed != null) final_text else think_tags.trimLeakedToolMarkup(final_text));
-            defer allocator.free(esc_text);
-            const text_block = try std.fmt.allocPrint(allocator,
-                \\{{"type":"text","text":{s}}}
-            , .{esc_text});
-            defer allocator.free(text_block);
-            try content.appendSlice(allocator, text_block);
+            try appendAnswerText(allocator, &content, block_count, if (routed != null) final_text else think_tags.trimLeakedToolMarkup(final_text));
         }
     } else {
-        // No tools — emit text block
-        if (block_count > 0) try content.append(allocator, ',');
-        const esc_text = try jsonEscape(allocator, if (routed != null) final_text else think_tags.trimLeakedToolMarkup(final_text));
-        defer allocator.free(esc_text);
-        const text_block = try std.fmt.allocPrint(allocator,
-            \\{{"type":"text","text":{s}}}
-        , .{esc_text});
-        defer allocator.free(text_block);
-        try content.appendSlice(allocator, text_block);
+        try appendAnswerText(allocator, &content, block_count, if (routed != null) final_text else think_tags.trimLeakedToolMarkup(final_text));
     }
 
     try content.append(allocator, ']');
@@ -1662,9 +1671,10 @@ fn handleAnthropicStreaming(
         }
     }
 
-    // Whitespace the content arm withheld ships unless a thought followed it.
-    if (!client_gone) {
-        const held = content.finish();
+    // Whitespace the content arm withheld ships unless the non-stream reply trims it: after a closed
+    // thought, or before tool markup (a tools request decides below).
+    if (!client_gone and !gated_stream) {
+        const held = content.finish(join.closed);
         if (held.len > 0) try emitAnthropicText(allocator, stream, block_index, &text_block_open, held);
     }
 
@@ -1675,7 +1685,7 @@ fn handleAnthropicStreaming(
     }
 
     // Post-generation: snapshot stats from whichever source was active.
-    ts.finalize();
+    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize();
 
     // Handle tool calls
     var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
@@ -1761,6 +1771,8 @@ fn handleAnthropicStreaming(
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                const held = content.finish(join.closed and think_split.content.len == 0);
+                if (held.len > 0) try emitAnthropicText(allocator, stream, block_index, &text_block_open, held);
                 if (!budget_exhausted) if (think_split.reasoning_content) |reasoning| {
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                     defer if (capped.owned) allocator.free(capped.text);
@@ -1910,6 +1922,19 @@ fn emitAnthropicThinking(allocator: std.mem.Allocator, stream: *Conn, index: *u3
 fn emitAnthropicThinkingAfterText(allocator: std.mem.Allocator, stream: *Conn, index: *u32, text_open: *bool, thinking_open: *bool, thinking: []const u8) !void {
     if (text_open.*) try closeAnthropicBlock(allocator, stream, index, text_open, thinking_open);
     try emitAnthropicThinkingOpening(allocator, stream, index.*, thinking_open, thinking);
+}
+
+test "appendAnswerText: an empty answer after a thinking block is no text block" {
+    const a = std.testing.allocator;
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(a);
+    try appendAnswerText(a, &content, 1, "");
+    try std.testing.expectEqualStrings("", content.items);
+    try appendAnswerText(a, &content, 0, "");
+    try std.testing.expectEqualStrings("{\"type\":\"text\",\"text\":\"\"}", content.items);
+    content.clearRetainingCapacity();
+    try appendAnswerText(a, &content, 1, "hi");
+    try std.testing.expectEqualStrings(",{\"type\":\"text\",\"text\":\"hi\"}", content.items);
 }
 
 test "anthropicStopReason: a matched client stop sequence reports stop_sequence, truncation stays honest" {

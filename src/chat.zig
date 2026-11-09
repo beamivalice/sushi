@@ -579,6 +579,10 @@ pub fn renderChatTemplate(
         log.warn("jinja render failed ({s}), and this model has no fallback chat format\n", .{reason});
         return refuseTemplate(reason);
     }
+    // The template says the conversation has nothing to answer: a request defect, not a render fault.
+    if (jinja_c.jinja_last_error()) |e| {
+        if (std.mem.indexOf(u8, std.mem.span(e), NO_USER_QUERY_RAISE) != null) return error.ChatNeedsUserTurn;
+    }
     _ = template_fallbacks.fetchAdd(1, .monotonic);
     if (jinja_c.jinja_last_error()) |e| {
         log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
@@ -1345,6 +1349,9 @@ const SpecialEntry = struct {
     text: []const u8,
     id: u32,
 };
+
+/// What Qwen's template raises for a conversation with no user turn to answer (a system-only or assistant-only chat).
+const NO_USER_QUERY_RAISE = "No user query found";
 
 threadlocal var template_refusal_buf: [160]u8 = undefined;
 threadlocal var template_refusal_len: usize = 0;

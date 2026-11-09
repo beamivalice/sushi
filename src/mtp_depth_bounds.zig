@@ -15,6 +15,11 @@ pub const Bounds = struct {
     pub fn explicit(self: Bounds) bool {
         return self.min != 1 or self.max != 0;
     }
+
+    /// Whether the EV controller still picks the depth: a pinned depth leaves it nothing to choose.
+    pub fn adaptive(self: Bounds, enabled: bool) bool {
+        return enabled and self.pinned() == null;
+    }
 };
 
 /// Process-wide, set once from the launch flags before a model loads.
@@ -81,6 +86,13 @@ test "mtp depth bounds: only equal explicit flags pin a depth" {
     try std.testing.expect(!(Bounds{}).explicit());
     try std.testing.expect((Bounds{ .min = 2 }).explicit());
     try std.testing.expect((Bounds{ .max = 5 }).explicit());
+}
+
+test "mtp depth bounds: a pinned depth is not adaptive" {
+    try std.testing.expect((Bounds{}).adaptive(true));
+    try std.testing.expect((Bounds{ .min = 2, .max = 4 }).adaptive(true));
+    try std.testing.expect(!(Bounds{ .min = 3, .max = 3 }).adaptive(true));
+    try std.testing.expect(!(Bounds{}).adaptive(false));
 }
 
 test "mtp depth bounds: a floor above the planner's own cap lifts it, the default changes nothing" {

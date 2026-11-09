@@ -7,6 +7,7 @@ const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
 const generate_mod = @import("generate.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
+const mtp_depth_bounds = @import("mtp_depth_bounds.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
 const expert_quant = @import("expert_quant.zig");
@@ -654,6 +655,31 @@ pub fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
+/// `GET /v1/models/{id}` (OpenAI's retrieve): the one registry row `handleModels` lists, or a 404.
+pub fn handleModelGet(allocator: std.mem.Allocator, stream: *Conn, raw_id: []const u8) !void {
+    const registry = server_state.global_registry orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        return;
+    };
+    var id_buf: [512]u8 = undefined;
+    const id = if (raw_id.len <= id_buf.len) blk: {
+        @memcpy(id_buf[0..raw_id.len], raw_id);
+        break :blk std.Uri.percentDecodeInPlace(id_buf[0..raw_id.len]);
+    } else raw_id;
+    var json: ?[]const u8 = null;
+    {
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        if (registry.peekLocked(id)) |entry| json = try renderModelEntry(allocator, stream.io, entry);
+    }
+    if (json) |row| {
+        defer allocator.free(row);
+        try sendResponse(stream, "200 OK", "application/json", row);
+        return;
+    }
+    try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+}
+
 /// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
 /// new dirs and clear failed loads (`ModelRegistry.rescan`). Answers `{"added":N}`.
 pub fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
@@ -762,6 +788,9 @@ const PropsSettings = struct {
     mtp_acceptance_applies: bool = true,
     /// 0 = auto.
     mtp_depth: u32,
+    /// The launch flags when they bound the depth.
+    mtp_depth_source: []const u8 = "default",
+    /// False while `--mtp-min-depth` and `--mtp-max-depth` pin one depth.
     mtp_adaptive: bool,
     /// 0 = no ceiling.
     max_mtp_ctx: u32,
@@ -822,7 +851,8 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_greedy_tail = report.greedy_tail,
         .mtp_acceptance_applies = report.applies,
         .mtp_depth = lm.mtp_depth,
-        .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
+        .mtp_depth_source = if (mtp_depth_bounds.active.explicit()) "--mtp-min-depth/--mtp-max-depth" else "default",
+        .mtp_adaptive = mtp_depth_bounds.active.adaptive(generate_mod.Generator.mtpAdaptiveEnabled()),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else "none",
         .max_concurrent = server_state.max_concurrent,
@@ -855,7 +885,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
     };
     const vision = try std.fmt.allocPrint(allocator, "{{\"loaded\":{},\"source\":{f},\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, json_text.Str{ .s = st.vision.source }, st.vision.tower_bytes, st.vision.encode_bytes });
     defer allocator.free(vision);
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"acceptance_source\":{f},\"acceptance\":{f},\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":{f},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}{s}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"acceptance_source\":{f},\"acceptance\":{f},\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":{f},\"depth\":{d},\"depth_source\":{f},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}{s}}},\"vision\":{s}}}", .{
         js(build_options.version),                          js(st.engine),
         js(st.kv_quant),                                    js(st.kv_cache.label()),
         js(st.kv_cache.sourceName()),
@@ -865,7 +895,8 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         js(mtp_acceptance_mod.name(st.mtp_acceptance)),     param,
         st.mtp_acceptance_applies,
         st.mtp_greedy_tail.value,                           js(settings_resolve.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail")),
-        st.mtp_depth,                                       st.mtp_adaptive,
+        st.mtp_depth,                                       js(st.mtp_depth_source),
+        st.mtp_adaptive,
         st.max_mtp_ctx,                                     js(st.drafter),
         st.max_concurrent,                                  st.prefill_decode_share,
         st.prefix_cache_ram_enabled,                        st.prefix_cache_mem_bytes,
@@ -1150,8 +1181,9 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
         .mtp_choice = model_settings.MtpChoice.resolve(true, false, true),
         .mtp_acceptance = .{ .tokenv3 = 0.95 },
         .mtp_acceptance_source = "--mtp-tokenv3",
-        .mtp_depth = 0,
-        .mtp_adaptive = true,
+        .mtp_depth = 3,
+        .mtp_depth_source = "--mtp-min-depth/--mtp-max-depth",
+        .mtp_adaptive = false,
         .max_mtp_ctx = 32768,
         .drafter = "none",
         .max_concurrent = 4,
@@ -1180,6 +1212,9 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqualStrings("tokenv3", mtp.get("acceptance").?.string);
     try testing.expectApproxEqAbs(@as(f64, 0.95), mtp.get("acceptance_param").?.float, 1e-6);
     try testing.expectEqual(@as(i64, 32768), mtp.get("max_ctx").?.integer);
+    try testing.expectEqual(@as(i64, 3), mtp.get("depth").?.integer);
+    try testing.expectEqualStrings("--mtp-min-depth/--mtp-max-depth", mtp.get("depth_source").?.string);
+    try testing.expect(!mtp.get("adaptive").?.bool);
     try testing.expect(st.get("pld") == null);
     try testing.expectEqual(@as(i64, 4), st.get("max_concurrent").?.integer);
     try testing.expect(st.get("prefix_cache").?.object.get("ram_enabled").?.bool);

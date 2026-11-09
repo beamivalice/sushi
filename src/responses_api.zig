@@ -41,6 +41,7 @@ const PreparedMedia = request_media.PreparedMedia;
 const prepareRequestMedia = request_media.prepareRequestMedia;
 const visionPreprocFromConfig = request_media.visionPreprocFromConfig;
 const request_policy = @import("request_policy.zig");
+const servedModelId = request_policy.servedModelId;
 const resolveThinkPenalty = request_policy.resolveThinkPenalty;
 const armThinkPenalty = request_policy.armThinkPenalty;
 const omittedMaxTokensDefault = request_policy.omittedMaxTokensDefault;
@@ -425,6 +426,13 @@ fn handleResponsesInner(
     }
     const root = parsed.value.object;
 
+    var fault_buf: [384]u8 = undefined;
+    if (request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &.{ "max_output_tokens", "max_tokens" }, .stop = null })) |reason| {
+        log.warn("POST /v1/responses -> 400 ({s})\n", .{reason});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
+
     // ── input (required) ──
     const input_val = root.get("input") orelse {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
@@ -622,9 +630,9 @@ fn handleResponsesInner(
     }
     // ── model name ──
     const model_name = if (root.get("model")) |v|
-        (if (v == .string) v.string else config.model_type)
+        (if (v == .string) v.string else servedModelId(lm, config))
     else
-        config.model_type;
+        servedModelId(lm, config);
 
     // ── previous response — fetch stored history ──
     var prev_messages: ?[]const chat_mod.Message = null;
@@ -1180,7 +1188,7 @@ fn handleResponsesInner(
 
         // Whitespace the content arm withheld ships unless a thought followed it.
         if (!client_gone and !active_has_tools) {
-            const held = content.finish();
+            const held = content.finish(join.closed);
             if (held.len > 0) try emitResponsesMessage(allocator, stream, seq_num, &streamed_message_id, &streamed_message_index, &streamed_message_started, live_output_index, held);
         }
 
@@ -1190,7 +1198,7 @@ fn handleResponsesInner(
             try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, think_tail);
         }
 
-        ts.finalize();
+        if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize();
 
         if (client_gone) {
             // Peer disconnected mid-decode. We've already cancelled the slot;

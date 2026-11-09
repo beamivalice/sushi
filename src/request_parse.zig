@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const std = @import("std");
 const jsonEscape = @import("http.zig").jsonEscape;
 const trunk = @import("trunk.zig");
+const json_schema = @import("json_schema.zig");
 const testing = std.testing;
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
@@ -107,11 +108,8 @@ pub fn messageReasoningFromObj(obj: std.json.ObjectMap) ?[]const u8 {
 
 /// A request's `seed`; negative is the llama.cpp "random" convention and means unseeded.
 pub fn parseRequestSeed(v: ?std.json.Value) ?u64 {
-    const val = v orelse return null;
-    return switch (val) {
-        .integer => |i| if (i < 0) null else @as(u64, @intCast(i)),
-        else => null,
-    };
+    const i = wholeNumber(v orelse return null) orelse return null;
+    return if (i < 0) null else @as(u64, @intCast(i));
 }
 
 /// A client-supplied JSON integer narrowed to i32 by clamping, never by `@intCast`.
@@ -232,13 +230,306 @@ fn hashTextValue(v: std.json.Value) ?u64 {
 
 pub fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     const v = root.get("n") orelse return null;
-    switch (v) {
+    const n = wholeNumber(v) orelse switch (v) {
         .null => return null,
-        .integer => |i| if (i == 1) return null,
-        .float => |f| if (f == 1.0) return null,
-        else => {},
-    }
+        else => return "'n' must be the integer 1: this server returns a single choice per request",
+    };
+    if (n == 1) return null;
+    if (n < 1) return "'n' must be a positive integer, and this server returns a single choice per request: omit 'n' or set it to 1";
     return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
+}
+
+fn numberOf(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| if (std.math.isFinite(f)) f else null,
+        else => null,
+    };
+}
+
+/// A JSON integer, or a float with no fractional part (Python's `json.dumps(7.0)`), as an i64.
+pub fn wholeNumber(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |i| i,
+        .float => |f| if (std.math.isFinite(f) and f == @floor(f) and @abs(f) < 9.0e15) @intFromFloat(f) else null,
+        else => null,
+    };
+}
+
+/// The request value a token budget reads: OpenAI's `max_completion_tokens` supersedes `max_tokens`.
+pub fn requestedMaxTokens(root: std.json.ObjectMap) ?std.json.Value {
+    if (root.get("max_completion_tokens")) |v| if (v != .null) return v;
+    return root.get("max_tokens");
+}
+
+/// Where a surface spells the fields `generationFieldFault` checks.
+pub const GenerationKeys = struct {
+    max_tokens: []const []const u8 = &.{ "max_completion_tokens", "max_tokens" },
+    /// Null where the surface has no stop field.
+    stop: ?[]const u8 = "stop",
+};
+
+fn fieldFault(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.bufPrint(buf, fmt, args) catch "a request field has an invalid value";
+}
+
+/// A number field: a value of another type is refused. A number outside the range the sampler reads is clamped
+/// into it, not refused.
+fn numberFault(buf: []u8, root: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = root.get(key) orelse return null;
+    if (v == .null or numberOf(v) != null) return null;
+    return fieldFault(buf, "'{s}' must be a number", .{key});
+}
+
+/// The first bad value among the fields every generation surface reads the same way, as a message naming the
+/// field. A field that is absent or null is the default; a value of the wrong type or outside its range is
+/// refused, never silently read as absent. `max_tokens` of 0 or less is the documented "rest of the window".
+pub fn generationFieldFault(buf: []u8, root: std.json.ObjectMap, keys: GenerationKeys) ?[]const u8 {
+    for (keys.max_tokens) |k| {
+        const v = root.get(k) orelse continue;
+        if (v != .null and wholeNumber(v) == null) return fieldFault(buf, "'{s}' must be an integer", .{k});
+    }
+    for ([_][]const u8{ "temperature", "top_p", "presence_penalty", "frequency_penalty", "repeat_penalty", "repetition_penalty", "top_k" }) |k| {
+        if (numberFault(buf, root, k)) |m| return m;
+    }
+    // An integer wider than i64 reads as unseeded.
+    if (root.get("seed")) |v| if (v != .null and v != .number_string and wholeNumber(v) == null) return "'seed' must be an integer; a negative one means unseeded";
+    if (keys.stop) |sk| if (root.get(sk)) |v| switch (v) {
+        .null, .string => {},
+        .array => |arr| for (arr.items) |item| {
+            if (item != .string) return fieldFault(buf, "'{s}' must be a string or an array of strings", .{sk});
+        },
+        else => return fieldFault(buf, "'{s}' must be a string or an array of strings", .{sk}),
+    };
+    if (root.get("kv_quant")) |v| if (v != .null and trunk.KVQuantConfig.fromJsonValue(v) == null) {
+        return "'kv_quant' must be one of off, 4, 6 or 8 (0 and 16 also mean off)";
+    };
+    return null;
+}
+
+/// `strict: true` promises the output conforms: a schema the grammar cannot enforce is a message naming the
+/// construct (caller frees), where a non-strict one falls back to prompt-only guidance.
+pub fn strictSchemaFault(allocator: std.mem.Allocator, json_schema_obj: std.json.ObjectMap) ?[]u8 {
+    const strict = json_schema_obj.get("strict") orelse return null;
+    if (strict != .bool or !strict.bool) return null;
+    const schema = json_schema_obj.get("schema") orelse return null;
+    var detail: json_schema.Detail = .{};
+    var parsed = json_schema.parseExplained(allocator, schema, &detail) catch |err| {
+        const what = if (detail.len > 0) detail.text() else @errorName(err);
+        return std.fmt.allocPrint(allocator, "response_format.json_schema.schema cannot be enforced while strict is true: unsupported {s}", .{what}) catch null;
+    };
+    parsed.deinit();
+    return null;
+}
+
+/// The first entry of a `/detokenize` list that is no id of a `vocab`-sized vocabulary, as a message naming it.
+pub fn tokenIdFault(buf: []u8, items: []const std.json.Value, vocab: usize) ?[]const u8 {
+    for (items, 0..) |item, i| {
+        const id = wholeNumber(item) orelse -1;
+        if (id < 0 or id >= vocab) return fieldFault(buf, "'tokens[{d}]' must be a token id between 0 and {d}", .{ i, vocab -| 1 });
+    }
+    return null;
+}
+
+test "tokenIdFault names the first entry that is no token id" {
+    var buf: [128]u8 = undefined;
+    var ok = try std.json.parseFromSlice(std.json.Value, testing.allocator, "[0, 5.0, 99]", .{});
+    defer ok.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), tokenIdFault(&buf, ok.value.array.items, 100));
+    for ([_][]const u8{ "[1, -1]", "[1, 100]", "[1, \"2\"]", "[2.5]", "[9999999999]" }) |body| {
+        var bad = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer bad.deinit();
+        try testing.expect(std.mem.indexOf(u8, tokenIdFault(&buf, bad.value.array.items, 100).?, "'tokens[") != null);
+    }
+}
+
+const chat_roles = [_][]const u8{ "system", "developer", "user", "assistant", "tool", "function" };
+
+/// A tool name the call markup can carry: no whitespace, quote, angle bracket or control byte, at most 128 long.
+fn toolNameCarriable(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    for (name) |c| switch (c) {
+        0...0x20, 0x7f, '<', '>', '"' => return false,
+        else => {},
+    };
+    return true;
+}
+
+/// The first malformed entry of a `tools` array (OpenAI chat, flat Responses and Anthropic shapes alike), as a
+/// message naming it. `typed` also requires an OpenAI/Responses `type` of "function" where one is given.
+pub fn toolsFault(buf: []u8, tools: std.json.Value, typed: bool) ?[]const u8 {
+    if (tools == .null) return null;
+    if (tools != .array) return "'tools' must be an array";
+    for (tools.array.items, 0..) |tool, i| {
+        if (tool != .object) return fieldFault(buf, "'tools[{d}]' must be an object", .{i});
+        if (typed) if (tool.object.get("type")) |t| {
+            if (t != .string or !std.mem.eql(u8, t.string, "function")) return fieldFault(buf, "'tools[{d}].type' must be \"function\"", .{i});
+        };
+        const holder = if (tool.object.get("function")) |f| (if (f == .object) f.object else tool.object) else tool.object;
+        const name = holder.get("name") orelse return fieldFault(buf, "'tools[{d}]' has no function name", .{i});
+        if (name != .string or name.string.len == 0) return fieldFault(buf, "'tools[{d}]' needs a function name that is a non-empty string", .{i});
+        if (!toolNameCarriable(name.string)) return fieldFault(buf, "'tools[{d}]' names the function \"{s}\", which the model cannot call: a name holds no whitespace, quote or angle bracket and is at most 128 bytes", .{ i, name.string[0..@min(name.string.len, 64)] });
+        for (tools.array.items[0..i]) |prev| {
+            if (prev != .object) continue;
+            const ph = if (prev.object.get("function")) |f| (if (f == .object) f.object else prev.object) else prev.object;
+            const pn = ph.get("name") orelse continue;
+            if (pn == .string and std.mem.eql(u8, pn.string, name.string)) return fieldFault(buf, "'tools[{d}]' repeats the function name \"{s}\"", .{ i, name.string[0..@min(name.string.len, 64)] });
+        }
+        for ([_][]const u8{ "parameters", "input_schema" }) |pk| {
+            const p = holder.get(pk) orelse continue;
+            if (p != .object and p != .null) return fieldFault(buf, "'tools[{d}].{s}' must be a JSON schema object", .{ i, pk });
+        }
+    }
+    return null;
+}
+
+/// The first bad value among the chat-completions-only fields, as a message naming the field.
+pub fn chatFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    if (root.get("messages")) |mv| if (mv == .array) for (mv.array.items, 0..) |m, i| {
+        if (m != .object) continue;
+        const role = m.object.get("role") orelse continue;
+        if (role != .string) continue;
+        for (chat_roles) |r| {
+            if (std.mem.eql(u8, role.string, r)) break;
+        } else return fieldFault(buf, "'messages[{d}].role' must be one of system, developer, user, assistant, tool or function; got \"{s}\"", .{ i, role.string[0..@min(role.string.len, 32)] });
+    };
+    if (root.get("top_logprobs")) |v| if (v != .null) {
+        if (wholeNumber(v) == null) return "'top_logprobs' must be an integer";
+    };
+    if (root.get("response_format")) |rf| switch (rf) {
+        .null => {},
+        .object => |o| {
+            const t = o.get("type") orelse return "'response_format.type' is required: text, json_object or json_schema";
+            const ok = t == .string and (std.mem.eql(u8, t.string, "text") or std.mem.eql(u8, t.string, "json_object") or std.mem.eql(u8, t.string, "json_schema"));
+            if (!ok) return "'response_format.type' must be text, json_object or json_schema";
+        },
+        else => return "'response_format' must be an object",
+    };
+    if (root.get("tools")) |tv| if (toolsFault(buf, tv, true)) |m| return m;
+    if (root.get("tool_choice")) |tc| switch (tc) {
+        .null, .object => {},
+        .string => |s| {
+            const ok = std.mem.eql(u8, s, "auto") or std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "required") or std.mem.eql(u8, s, "any");
+            if (!ok) return "'tool_choice' must be auto, none, required or a function object";
+        },
+        else => return "'tool_choice' must be auto, none, required or a function object",
+    };
+    return null;
+}
+
+test "generationFieldFault names the field a bad value sits in" {
+    const Case = struct { body: []const u8, field: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{}", .field = null },
+        .{ .body = "{\"max_tokens\":7,\"temperature\":0,\"top_p\":1,\"top_k\":40,\"seed\":-1,\"stop\":[\"a\"],\"kv_quant\":\"off\"}", .field = null },
+        .{ .body = "{\"max_tokens\":7.0,\"seed\":5.0,\"top_k\":0,\"max_completion_tokens\":null,\"kv_quant\":16}", .field = null },
+        .{ .body = "{\"max_tokens\":0}", .field = null },
+        .{ .body = "{\"temperature\":-1,\"top_p\":2,\"top_k\":-5,\"presence_penalty\":3,\"top_logprobs\":50,\"seed\":9223372036854775808}", .field = null },
+        .{ .body = "{\"max_tokens\":-1}", .field = null },
+        .{ .body = "{\"stop\":null,\"temperature\":null,\"top_k\":-1}", .field = null },
+        .{ .body = "{\"max_tokens\":7.9}", .field = "max_tokens" },
+        .{ .body = "{\"max_tokens\":\"7\"}", .field = "max_tokens" },
+        .{ .body = "{\"max_tokens\":true}", .field = "max_tokens" },
+        .{ .body = "{\"max_completion_tokens\":\"7\"}", .field = "max_completion_tokens" },
+        .{ .body = "{\"temperature\":\"hot\"}", .field = "temperature" },
+        .{ .body = "{\"top_p\":true}", .field = "top_p" },
+        .{ .body = "{\"top_k\":\"5\"}", .field = "top_k" },
+        .{ .body = "{\"seed\":\"abc\"}", .field = "seed" },
+        .{ .body = "{\"seed\":1.5}", .field = "seed" },
+        .{ .body = "{\"stop\":5}", .field = "stop" },
+        .{ .body = "{\"stop\":[\"a\",3]}", .field = "stop" },
+        .{ .body = "{\"frequency_penalty\":\"x\"}", .field = "frequency_penalty" },
+        .{ .body = "{\"repeat_penalty\":\"x\"}", .field = "repeat_penalty" },
+        .{ .body = "{\"kv_quant\":5}", .field = "kv_quant" },
+        .{ .body = "{\"kv_quant\":\"5\"}", .field = "kv_quant" },
+        .{ .body = "{\"kv_quant\":true}", .field = "kv_quant" },
+    };
+    for (cases) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        var buf: [256]u8 = undefined;
+        const got = generationFieldFault(&buf, parsed.value.object, .{});
+        errdefer std.debug.print("\nbody: {s}\ngot: {?s}\n", .{ c.body, got });
+        if (c.field) |f| {
+            const quoted = try std.fmt.allocPrint(testing.allocator, "'{s}'", .{f});
+            defer testing.allocator.free(quoted);
+            try testing.expect(std.mem.indexOf(u8, got.?, quoted) != null);
+        } else try testing.expectEqual(@as(?[]const u8, null), got);
+    }
+}
+
+test "strictSchemaFault refuses only a strict schema the grammar cannot enforce, naming the construct" {
+    const a = testing.allocator;
+    const bad = "\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"nonsense\"}}}";
+    const Case = struct { body: []const u8, names: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{\"strict\":true," ++ bad ++ "}", .names = "type 'nonsense'" },
+        .{ .body = "{\"strict\":false," ++ bad ++ "}", .names = null },
+        .{ .body = "{" ++ bad ++ "}", .names = null },
+        .{ .body = "{\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}}", .names = null },
+    };
+    for (cases) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
+        defer parsed.deinit();
+        const got = strictSchemaFault(a, parsed.value.object);
+        defer if (got) |g| a.free(g);
+        if (c.names) |n| {
+            try testing.expect(std.mem.indexOf(u8, got.?, n) != null);
+        } else try testing.expectEqual(@as(?[]u8, null), got);
+    }
+}
+
+test "generationFieldFault reads each surface's own spelling" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"stop\":5,\"stop_sequences\":7,\"max_output_tokens\":\"1\"}", .{});
+    defer parsed.deinit();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), generationFieldFault(&buf, parsed.value.object, .{ .max_tokens = &.{"max_tokens"}, .stop = null }));
+    try testing.expect(std.mem.indexOf(u8, generationFieldFault(&buf, parsed.value.object, .{ .max_tokens = &.{"max_output_tokens"}, .stop = null }).?, "'max_output_tokens'") != null);
+    try testing.expect(std.mem.indexOf(u8, generationFieldFault(&buf, parsed.value.object, .{ .max_tokens = &.{}, .stop = "stop_sequences" }).?, "'stop_sequences'") != null);
+}
+
+test "a request's max_completion_tokens supersedes its max_tokens" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"max_tokens\":20,\"max_completion_tokens\":7}", .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 7), requestedMaxTokens(parsed.value.object).?.integer);
+    var only = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"max_tokens\":20,\"max_completion_tokens\":null}", .{});
+    defer only.deinit();
+    try testing.expectEqual(@as(i64, 20), requestedMaxTokens(only.value.object).?.integer);
+}
+
+test "chatFieldFault refuses an unknown role, response_format type, malformed tools and tool_choice" {
+    const Case = struct { body: []const u8, field: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"developer\"}],\"tool_choice\":\"required\"}", .field = null },
+        .{ .body = "{\"messages\":[{\"content\":\"no role\"},5],\"response_format\":null,\"tools\":null}", .field = null },
+        .{ .body = "{\"response_format\":{\"type\":\"json_schema\"},\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"a\"}}}", .field = null },
+        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a.b/c:d\",\"parameters\":{\"type\":\"object\"}}},{\"name\":\"flat\",\"parameters\":null}]}", .field = null },
+        .{ .body = "{\"messages\":[{\"role\":\"wizard\",\"content\":\"hi\"}]}", .field = "messages[0].role" },
+        .{ .body = "{\"response_format\":{\"type\":\"xml\"}}", .field = "response_format.type" },
+        .{ .body = "{\"response_format\":\"json\"}", .field = "response_format" },
+        .{ .body = "{\"tools\":\"x\"}", .field = "tools" },
+        .{ .body = "{\"tools\":[{\"type\":\"retrieval\"}]}", .field = "tools[0].type" },
+        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"description\":\"d\"}}]}", .field = "tools[0]" },
+        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a\",\"parameters\":\"bad\"}}]}", .field = "tools[0].parameters" },
+        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a\"}},{\"type\":\"function\",\"function\":{\"name\":\"a\"}}]}", .field = "tools[1]" },
+        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"my tool/v1.2\"}}]}", .field = "tools[0]" },
+        .{ .body = "{\"top_logprobs\":\"5\"}", .field = "top_logprobs" },
+        .{ .body = "{\"top_logprobs\":20,\"logprobs\":true}", .field = null },
+        .{ .body = "{\"tool_choice\":\"sometimes\"}", .field = "tool_choice" },
+        .{ .body = "{\"tool_choice\":7}", .field = "tool_choice" },
+    };
+    for (cases) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        var buf: [320]u8 = undefined;
+        const got = chatFieldFault(&buf, parsed.value.object);
+        errdefer std.debug.print("\nbody: {s}\ngot: {?s}\n", .{ c.body, got });
+        if (c.field) |f| {
+            const quoted = try std.fmt.allocPrint(testing.allocator, "'{s}'", .{f});
+            defer testing.allocator.free(quoted);
+            try testing.expect(std.mem.indexOf(u8, got.?, quoted) != null);
+        } else try testing.expectEqual(@as(?[]const u8, null), got);
+    }
 }
 
 /// Collapse JSON's optional `\/` escape to `/`. Swift's JSONSerialization
@@ -580,6 +871,12 @@ test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pas
         const reason = nChoicesRejectReason(parsed.value.object);
         try std.testing.expectEqual(case.rejected, reason != null);
     }
+    // n=0 and n=-1 are not "more than one".
+    for ([_][]const u8{ "{\"n\":0}", "{\"n\":-1}" }) |body| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, nChoicesRejectReason(parsed.value.object).?, "positive integer") != null);
+    }
 }
 
 test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback, empty dropped" {
@@ -627,6 +924,7 @@ test "?model= is percent-decoded out of a bodiless GET and a missing or empty on
 
 test "a seed is a non-negative integer, a wide client integer clamps to i32, a cancel id is a number or a numeric string" {
     try testing.expectEqual(@as(?u64, 7), parseRequestSeed(.{ .integer = 7 }));
+    try testing.expectEqual(@as(?u64, 7), parseRequestSeed(.{ .float = 7.0 }));
     try testing.expectEqual(@as(?u64, null), parseRequestSeed(.{ .integer = -1 }));
     try testing.expectEqual(@as(?u64, null), parseRequestSeed(.{ .string = "7" }));
     try testing.expectEqual(@as(?u64, null), parseRequestSeed(null));

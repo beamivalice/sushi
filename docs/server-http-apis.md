@@ -139,7 +139,9 @@ answers while the weights load:
 - Chat usage reports `completion_tokens_details.reasoning_tokens` by tokenizing concatenated delivered reasoning; streaming includes it only with `stream_options.include_usage`.
 
 - **A stream and a non-stream answer are the SAME BYTES**; whitespace is the one thing a stream may withhold: a
-  leading run (`streamContentLead`), and whole whitespace tokens until text follows (`ContentStream`). A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
+  leading run (`streamContentLead`), and a token's trailing whitespace until text follows (`ContentStream`). The held
+  tail ships at the end of the reply unless the non-stream reply trims it: after a closed thought, or before tool
+  markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
   carries the pre-markup text (`visibleToolPreamble`); a non-stream disconnect reports `client_disconnect`, never
   `length`, and is noticed after every decoded token as well as during prefill, so a client's timed-out retry never
   leaves a ghost decoding to `max_tokens`; request ints clamp (`parseRequestSeed`,
@@ -154,7 +156,7 @@ answers while the weights load:
   A non-stream surface also feeds the gate per token (`EarlyStop`) and cancels the slot when a stop completes, only if
   the whole decoded text holds it too, so the answer bytes stay `earliest`'s and generation ends within one token.
   The cancelled slot is quiesced (`Scheduler.quiesce`, waits out `in_pass`) BEFORE its statistics are read, and usage
-  counts the tokens returned, not the ones a speculative block decoded past the stop.
+  counts the tokens returned, not the ones a speculative block decoded past the stop (a stream: `finalizeStopped`).
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
@@ -192,6 +194,23 @@ before reading a completed stream and requires clean EOF.
 - Logprobs are `logits - logsumexp` in f32 (`sampler.computeLogprobs`): `log(softmax)` in bf16 lands on bf16's grid, 0.125
   apart between -16 and -32.
 - Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded.
+- A conversation the template says has no user turn (Qwen: system-only or assistant-only) is a 400, never rendered
+  through the generic ChatML fallback (`ChatNeedsUserTurn`). A reply echoes `model` as the request named it, else the id
+  it is served under (`servedModelId`). `/detokenize` takes only token ids of the vocabulary (a 400 names the entry).
+  A `/v1/messages` reply with a thinking block and no answer text carries no empty text block.
+- **Routing**: a known path asked with a method it does not answer is a 405 with `Allow` (`http_conn.allowedMethods`,
+  one gate ahead of every route); HEAD is the GET without its body (`Conn.head_only`); `GET /v1/models/{id}` retrieves a
+  row; the auth scheme word is any case, and `/v1/messages` refuses a key in Anthropic's `{"type":"error",...}` envelope.
+- **A field the server reads is used or refused by name, never read as absent** (`request_parse.generationFieldFault`,
+  one check for chat, completions, Messages and Responses; `chatFieldFault` adds roles, `response_format.type`, `tools`
+  and `tool_choice`): `max_tokens`/`max_completion_tokens` (the latter supersedes) and `seed` take an integer or a whole
+  float (`7.0`); `temperature`, `top_p`, `top_k`, the penalties and `top_logprobs` take a number; `stop` a string or
+  strings; `kv_quant` `off|0|4|6|8|16`; null is absent. A wrong type is a 400 naming the field. A number out of range
+  is CLAMPED, not refused (`tests/test_api_edges.sh`): `temperature` 100 runs at 2, and a token budget of 0 or less is
+  the "rest of the window" (the app's Auto sends 0). A tool name the call markup cannot carry (whitespace, quote, angle bracket) or a
+  repeated one is a 400, since the model's call to it would parse to nothing. `response_format` `strict: true` with a
+  schema the grammar cannot enforce is a 400 naming the construct (`request_parse.strictSchemaFault`); without `strict` it
+  falls back to the prompt, logged `[grammar]`.
 - Top-k and top-p are ONE pass (`sampler.filterTopKTopP`); a filter cuts by RANK, never by value (bf16 ties at the top
   constantly; `sampler.ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
   `top_p` 0 is GREEDY (`sampler.applyTopP` floors at `floatMin(f32)`).

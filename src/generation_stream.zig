@@ -66,6 +66,9 @@ const reasoningWithinBudget = server_mod.reasoningWithinBudget;
 const sendAnthropicError = anthropic.sendAnthropicError;
 const sendAnthropicEvent = anthropic.sendAnthropicEvent;
 const sendErrorResponse = http.sendErrorResponse;
+const sendErrorResponseWithHeaders = http.sendErrorResponseWithHeaders;
+const resident_models_cap_message = http.resident_models_cap_message;
+const BUSY_RETRY_AFTER_SECS = http.BUSY_RETRY_AFTER_SECS;
 const sendResponse = http.sendResponse;
 const sendResponsesEvent = responses_api.sendResponsesEvent;
 const shouldParseToolCalls = server_mod.shouldParseToolCalls;
@@ -186,6 +189,13 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .anthropic_type = "api_error",
             .message = "generation failed",
         },
+        error.ChatNeedsUserTurn => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "messages hold no user turn to answer: this model's chat template needs one",
+        },
         error.ChatTemplateUnusable => .{
             .status_line = "500 Internal Server Error",
             .code = 500,
@@ -263,10 +273,7 @@ fn nonStreamFinishReason(client_gone: bool, slot_reason: []const u8) []const u8 
     return if (client_gone) "client_disconnect" else slot_reason;
 }
 
-/// The text the model said before the tool markup, byte for byte as the stream flushes it.
-pub fn visibleToolPreamble(content: []const u8) []const u8 {
-    return if (std.mem.trim(u8, content, " \t\r\n").len > 0) content else "";
-}
+pub const visibleToolPreamble = think_tags.visibleToolPreamble;
 
 fn deliveredReasoning(capped: ?[]const u8, raw: ?[]const u8) ?[]const u8 {
     return capped orelse raw;
@@ -849,6 +856,8 @@ pub const StreamingTokenStream = struct {
     /// `timings` block from the usage chunk).
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
+    /// Tokens `nextOrIdle` has handed out: what a client stop sequence leaves as the completion count.
+    delivered: u32 = 0,
 
     /// Phase A2-streaming: build a token stream backed by a scheduler Slot.
     /// `mode` is recorded for telemetry but doesn't drive next()'s dispatch
@@ -864,6 +873,17 @@ pub const StreamingTokenStream = struct {
 
     pub fn deinit(self: *StreamingTokenStream, allocator: std.mem.Allocator) void {
         self.pending_buf.deinit(allocator);
+    }
+
+    /// `finalize` after the request's own stop sequence ended the stream: the slot is cancelled and waited
+    /// out, and usage counts the tokens delivered, not the ones a speculative block decoded past the stop.
+    pub fn finalizeStopped(self: *StreamingTokenStream, sch: *scheduler_mod.Scheduler) void {
+        if (self.slot) |s| {
+            s.cancelOnStop();
+            sch.quiesce(s);
+        }
+        self.finalize();
+        self.completion_tokens = self.delivered;
     }
 
     /// Snapshot prompt/completion tokens + finish reason from the underlying
@@ -896,7 +916,10 @@ pub const StreamingTokenStream = struct {
             if (self.finished) return .done;
             const nr = s.waitNextTimeout(timeout_ms) orelse return .idle;
             switch (nr) {
-                .token => |t| return .{ .token = t },
+                .token => |t| {
+                    self.delivered += 1;
+                    return .{ .token = t };
+                },
                 .done => {
                     self.finished = true;
                     return .done;
@@ -904,7 +927,10 @@ pub const StreamingTokenStream = struct {
                 .err => return slotFailure(s),
             }
         }
-        if (try self.next(allocator)) |t| return .{ .token = t };
+        if (try self.next(allocator)) |t| {
+            self.delivered += 1;
+            return .{ .token = t };
+        }
         return .done;
     }
 
@@ -1634,9 +1660,10 @@ pub fn handleStreamingGeneration(
         }
     }
 
-    // Whitespace the content arm withheld ships unless a thought followed it.
-    if (!client_gone) {
-        const held = content.finish();
+    // Whitespace the content arm withheld ships unless the non-stream reply trims it: after a closed
+    // thought, or before tool markup (a tools request decides below).
+    if (!client_gone and !gated_stream) {
+        const held = content.finish(join.closed);
         if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take() });
     }
 
@@ -1663,7 +1690,7 @@ pub fn handleStreamingGeneration(
 
     // After generation: capture stats from whichever source was active
     // (Generator on legacy, Slot on scheduler).
-    ts.finalize();
+    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize();
 
     // Check for tool calls in accumulated text
     var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
@@ -1740,6 +1767,8 @@ pub fn handleStreamingGeneration(
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                const held = content.finish(join.closed and think_split.content.len == 0);
+                if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take() });
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (think_tags.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
@@ -2030,7 +2059,7 @@ test "every load refusal the registry preserves answers under its own name" {
     try t.expect(loadRefusalFor(error.UnknownModelId) == null);
 }
 
-pub const LoadRefusal = struct { type: []const u8, message: []const u8 };
+pub const LoadRefusal = struct { type: []const u8, message: []const u8, retry_after: ?u32 = null };
 
 test "streaming layout refusal explains MiMo repacking without assuming Qwen" {
     const layout = loadRefusalFor(error.ExpertStreamingUnsupportedLayout).?;
@@ -2055,6 +2084,7 @@ test "the load refusals list the archs this build serves" {
 pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
     return switch (err) {
         error.NotEnoughMemory => .{ .type = "out_of_memory", .message = not_enough_memory_message },
+        error.ResidentModelsCapReached => .{ .type = "resident_models_cap", .message = resident_models_cap_message, .retry_after = BUSY_RETRY_AFTER_SECS },
         error.InsufficientMemory => .{ .type = "out_of_memory", .message = insufficient_free_memory_message },
         error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads " ++ arch_packs.served_list ++ "." },
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (" ++ arch_packs.served_types_or ++ ")." },
@@ -2114,7 +2144,9 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
         const context = scheduler.takeLoadContextRefusal(id) orelse break :blk refusal.message;
         break :blk memoryContextRefusalMessage(&buf, context);
     } else refusal.message;
-    try sendErrorResponse(allocator, stream, "503 Service Unavailable", refusal.type, message, 503);
+    var retry_buf: [40]u8 = undefined;
+    const retry = if (refusal.retry_after) |secs| std.fmt.bufPrint(&retry_buf, "Retry-After: {d}\r\n", .{secs}) catch "" else "";
+    try sendErrorResponseWithHeaders(allocator, stream, "503 Service Unavailable", refusal.type, message, 503, retry);
     return true;
 }
 
@@ -2578,6 +2610,50 @@ fn expectSettledAfterEarlyStop(published: u32) !void {
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqual(published, settled_tokens);
     try std.testing.expectEqual(@as(u64, 777), settled_ns);
+}
+
+test "a streamed stop reports the tokens it delivered, not the speculative block decoded past it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.io = io;
+    sch.queue_mu = .init;
+    var slot: scheduler_mod.Slot = undefined;
+    slot.io = io;
+    slot.allocator = a;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.out_buf = .empty;
+    defer slot.out_buf.deinit(a);
+    slot.logprobs_buf = .empty;
+    slot.out_idx = 0;
+    slot.handover_token = null;
+    slot.cancelled = .init(false);
+    slot.stop_hit = .init(false);
+    slot.shutdown_cancelled = .init(false);
+    slot.finished = false;
+    slot.error_code = null;
+    slot.completion_tokens = 0;
+    slot.prompt_tokens = 0;
+    slot.cached_tokens = 0;
+    slot.finish_reason = "stop";
+    slot.finish_details = null;
+    slot.prefill_ns = 0;
+    slot.decode_ns = 0;
+    slot.in_pass = .init(1);
+
+    var player = TickPlayer{ .slot = &slot, .n = 4, .gap_ms = 2 };
+    const t = try std.Thread.spawn(.{}, TickPlayer.run, .{&player});
+    var ts = StreamingTokenStream.initFromSlot(&slot, .regular, &.{});
+    switch (try ts.nextOrIdle(a, 1000)) {
+        .token => {},
+        else => return error.TestUnexpectedResult,
+    }
+    ts.finalizeStopped(&sch);
+    t.join();
+    try std.testing.expectEqual(@as(u32, 4), slot.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 1), ts.completion_tokens);
 }
 
 test "a non-stream early stop reads usage and timing only after the tick that published its token settles" {

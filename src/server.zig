@@ -44,6 +44,7 @@ const boot_gate = @import("boot_gate.zig");
 const request_media = @import("request_media.zig");
 const arch_media = @import("arch/media.zig");
 const request_policy = @import("request_policy.zig");
+const servedModelId = request_policy.servedModelId;
 const models_api = @import("models_api.zig");
 const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const downloads = @import("downloads.zig");
@@ -112,6 +113,7 @@ const not_enough_memory_message = http.not_enough_memory_message;
 const insufficient_free_memory_message = http.insufficient_free_memory_message;
 const countRejected = http.countRejected;
 const sendErrorResponse = http.sendErrorResponse;
+const sendMethodNotAllowed = http.sendMethodNotAllowed;
 pub const jsonEscape = http.jsonEscape;
 const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
@@ -1217,7 +1219,11 @@ pub fn handleConnection(
     const first_line = request[0..first_line_end];
 
     var line_iter = std.mem.splitScalar(u8, first_line, ' ');
-    const method = line_iter.next() orelse return;
+    const wire_method = line_iter.next() orelse return;
+    // HEAD is the GET without its body.
+    const is_head = std.mem.eql(u8, wire_method, "HEAD");
+    const method = if (is_head) "GET" else wire_method;
+    stream.head_only = is_head;
     const raw_path = line_iter.next() orelse return;
     // Strip query string for route matching (e.g. /v1/messages?beta=true -> /v1/messages)
     const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
@@ -1240,8 +1246,16 @@ pub fn handleConnection(
         !http_conn.apiKeyAuthorized(request[0..header_end_pos], raw_path))
     {
         log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-        try http_conn.sendUnauthorized(stream);
+        try http_conn.sendUnauthorized(stream, std.mem.eql(u8, path, "/v1/messages") or std.mem.startsWith(u8, path, "/v1/messages/"));
         return;
+    }
+
+    if (http_conn.allowedMethods(path)) |allow| {
+        if (!std.mem.eql(u8, method, "OPTIONS") and !http_conn.methodAllowed(allow, method)) {
+            log.debug("{s} {s} -> 405 (allow: {s})\n", .{ wire_method, path, allow });
+            try sendMethodNotAllowed(allocator, stream, path, allow);
+            return;
+        }
     }
 
     if (chat_mod.jsonNestingExceeds(request_body, chat_mod.max_json_nesting)) {
@@ -1250,10 +1264,6 @@ pub fn handleConnection(
     }
 
     if (std.mem.eql(u8, path, "/v1/tools")) {
-        if (!std.mem.eql(u8, method, "POST")) {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST for tools", 405);
-            return;
-        }
         try handleWebTools(allocator, stream, request[0..header_end_pos], request_body);
         return;
     }
@@ -1317,28 +1327,16 @@ pub fn handleConnection(
         return;
     }
     if (std.mem.eql(u8, path, "/metrics/enable")) {
-        if (!std.mem.eql(u8, method, "POST")) {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "/metrics/enable answers POST only", 405);
-            return;
-        }
         try handleMetricsEnable(stream);
         return;
     }
     if (std.mem.eql(u8, path, "/v1/update")) {
-        if (!std.mem.eql(u8, method, "POST")) {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "/v1/update answers POST only", 405);
-            return;
-        }
         try handleUpdate(allocator, stream, request[0..header_end_pos], raw_path);
         return;
     }
     // Every method is answered here: past this point a request resolves (and may cold-load) a model.
     if (isChatPagePath(path)) {
-        if (std.mem.eql(u8, method, "GET")) {
-            try sendResponseQuiet(stream, "200 OK", "text/html; charset=utf-8", chat_page_html);
-        } else {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "The chat page answers GET only", 405);
-        }
+        try sendResponseQuiet(stream, "200 OK", "text/html; charset=utf-8", chat_page_html);
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
@@ -1346,8 +1344,16 @@ pub fn handleConnection(
         try models_api.handleModels(allocator, stream);
         return;
     }
+    if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/models/")) {
+        try models_api.handleModelGet(allocator, stream, path["/v1/models/".len..]);
+        return;
+    }
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/responses/")) {
         const id = path["/v1/responses/".len..];
+        if (std.mem.indexOfScalar(u8, id, '/') != null) {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Only GET and DELETE /v1/responses/{id} are served: this sub-resource is not supported", 404);
+            return;
+        }
         try responses_api.handleResponsesGet(allocator, stream, id);
         return;
     }
@@ -1383,24 +1389,14 @@ pub fn handleConnection(
             try settings_api.handleGet(allocator, stream);
         } else if (std.mem.eql(u8, method, "POST")) {
             try settings_api.handlePost(allocator, stream, request_body);
-        } else {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use GET to read the settings and POST to change them", 405);
         }
         return;
     }
     if (std.mem.eql(u8, path, "/v1/prefix-cache")) {
-        if (!std.mem.eql(u8, method, "GET")) {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use GET for the prefix cache listing", 405);
-            return;
-        }
         try prefix_cache_admin.handleList(allocator, stream);
         return;
     }
     if (std.mem.eql(u8, path, "/v1/prefix-cache/clear")) {
-        if (!std.mem.eql(u8, method, "POST")) {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST to clear the prefix cache", 405);
-            return;
-        }
         try prefix_cache_admin.handleClear(allocator, stream, request_body);
         return;
     }
@@ -1413,24 +1409,14 @@ pub fn handleConnection(
                 return;
             }
             try downloads.handleStart(allocator, stream, request_body);
-        } else {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use GET for the packs and downloads and POST to start one", 405);
         }
         return;
     }
     if (std.mem.eql(u8, path, "/v1/downloads/cancel")) {
-        if (!std.mem.eql(u8, method, "POST")) {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST to cancel a download", 405);
-            return;
-        }
         try downloads.handleCancel(allocator, stream, request_body);
         return;
     }
     if (std.mem.eql(u8, path, "/v1/slots/cancel")) {
-        if (!std.mem.eql(u8, method, "POST")) {
-            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST to cancel an in-flight slot", 405);
-            return;
-        }
         try handleSlotCancel(allocator, stream, request_body);
         return;
     }
@@ -2183,7 +2169,7 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: 
     };
     if (update_mod.guard(ask)) |r| {
         log.info("[update] POST /v1/update -> {d}: {s}\n", .{ r.code, r.message });
-        if (r.code == 401) return http_conn.sendUnauthorized(stream);
+        if (r.code == 401) return http_conn.sendUnauthorized(stream, false);
         return sendErrorResponse(allocator, stream, r.status, r.kind, r.message, r.code);
     }
     const body = try std.fmt.allocPrint(allocator, "{{\"status\":\"updating\",\"from\":\"{s}\",\"to\":\"{s}\"}}", .{ update_mod.version, latest.? });
@@ -2265,9 +2251,12 @@ fn handleDetokenize(
 
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(allocator);
-    for (tokens_val.array.items) |item| {
-        if (item == .integer) try ids.append(allocator, @intCast(item.integer));
+    var fault_buf: [128]u8 = undefined;
+    if (request_parse.tokenIdFault(&fault_buf, tokens_val.array.items, @min(lm.config.?.vocab_size, tok.definedVocabSize()))) |msg| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
     }
+    for (tokens_val.array.items) |item| try ids.append(allocator, @intCast(request_parse.wholeNumber(item).?));
 
     const text = try tok.decode(allocator, ids.items);
     defer allocator.free(text);
@@ -2368,6 +2357,12 @@ pub fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
     }
+    var fault_buf: [384]u8 = undefined;
+    if (request_parse.generationFieldFault(&fault_buf, root, .{}) orelse request_parse.chatFieldFault(&fault_buf, root)) |reason| {
+        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{reason});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Extract messages
     const messages_val = root.get("messages") orelse {
@@ -2401,7 +2396,7 @@ pub fn handleChatCompletions(
 
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
     // or <= 0 → auto (peg to remaining context).
-    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
+    const requested_max_tokens = request_parse.requestedMaxTokens(root);
     const max_tokens: u32 = request_policy.resolveRequestMaxTokens(
         requested_max_tokens,
         request_policy.omittedMaxTokensDefault(config),
@@ -2478,9 +2473,9 @@ pub fn handleChatCompletions(
 
     // Parse model name from request (use for response, fallback to config)
     const model_name_raw = if (root.get("model")) |v|
-        (if (v == .string) v.string else config.model_type)
+        (if (v == .string) v.string else servedModelId(lm, config))
     else
-        config.model_type;
+        servedModelId(lm, config);
     const model_name = try json_text.innerAlloc(allocator, model_name_raw);
     defer allocator.free(model_name);
 
@@ -2506,6 +2501,12 @@ pub fn handleChatCompletions(
                 const declared: ?std.json.Value = if (rf.object.get("json_schema")) |js| (if (js == .object) js.object.get("schema") else null) else null;
                 if (declared == null or declared.? != .object) {
                     try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "response_format.json_schema.schema must be a JSON object (use {\"type\":\"json_object\"} for unconstrained JSON)", 400);
+                    return;
+                }
+                if (request_parse.strictSchemaFault(allocator, rf.object.get("json_schema").?.object)) |why| {
+                    defer allocator.free(why);
+                    log.warn("POST /v1/chat/completions -> 400 (strict schema not enforceable)\n", .{});
+                    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
                     return;
                 }
                 // Extract the schema JSON string from the raw body
@@ -4043,6 +4044,13 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     try testing.expectEqualStrings(not_enough_memory_message, generation_stream.loadRefusalFor(error.NotEnoughMemory).?.message);
     try testing.expectEqualStrings("out_of_memory", generation_stream.loadRefusalFor(error.InsufficientMemory).?.type);
     try testing.expectEqualStrings(insufficient_free_memory_message, generation_stream.loadRefusalFor(error.InsufficientMemory).?.message);
+
+    // The count cap names its own flag and clears when a request ends, so it says when to retry.
+    const cap = generation_stream.loadRefusalFor(error.ResidentModelsCapReached).?;
+    try testing.expect(std.mem.indexOf(u8, cap.message, "--max-resident-models") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.message, "--max-resident-mem") == null);
+    try testing.expect(cap.retry_after != null);
+    try testing.expect(generation_stream.loadRefusalFor(error.NotEnoughMemory).?.retry_after == null);
 }
 
 

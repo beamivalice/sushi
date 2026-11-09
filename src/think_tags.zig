@@ -148,8 +148,8 @@ pub const ContentStep = union(enum) {
 /// A stream's content arm, token by token, delivering the content the non-stream reply holds
 /// (`normalizeEmbeddedThinkBlocks` + `splitThinkBlock`): a think tag outside a code span is structure, a
 /// thought re-opened after content goes back to the thought arm, and the content parts around thoughts are
-/// trimmed of "\n " and joined by one "\n". Whitespace is withheld only as whole tokens (a logprobs entry
-/// describes a whole token), so a token mixing it with text ships whole, as `streamContentLead` does.
+/// trimmed of "\n " and joined by one "\n". A token's leading whitespace ships with its text, as
+/// `streamContentLead` does; its trailing whitespace waits for the next text or the end of the reply.
 pub const ContentStream = struct {
     span: CodeSpan = .{},
     /// A visible content byte was sent.
@@ -187,20 +187,23 @@ pub const ContentStream = struct {
             try self.held.appendSlice(allocator, tt);
             return .hold;
         }
+        const text = tt[0..std.mem.trimEnd(u8, tt, "\n ").len];
         self.out.clearRetainingCapacity();
         if (self.lead and self.started) try self.out.append(allocator, '\n');
         self.lead = false;
         self.started = true;
         try self.out.appendSlice(allocator, self.held.items);
         self.held.clearRetainingCapacity();
-        try self.out.appendSlice(allocator, tt);
+        try self.out.appendSlice(allocator, text);
+        try self.held.appendSlice(allocator, tt[text.len..]);
         return .{ .send = self.out.items };
     }
 
-    /// The reply ended outside a thought: the withheld whitespace ships, as every token's did before.
+    /// The reply ended outside a thought: the withheld whitespace ships, unless the non-stream reply trims
+    /// the content's tail (`trim_tail`: a thought closed, or tool markup follows the content).
     /// Valid until the next `deliver`: the length drops without `clearRetainingCapacity`, which poisons the bytes.
-    pub fn finish(self: *ContentStream) []const u8 {
-        const tail = self.held.items;
+    pub fn finish(self: *ContentStream, trim_tail: bool) []const u8 {
+        const tail = if (trim_tail) "" else self.held.items;
         self.held.items.len = 0;
         return tail;
     }
@@ -461,6 +464,11 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     }
     if (cut == text.len) return text;
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
+}
+
+/// The text the model said before the tool markup, byte for byte as the stream flushes it.
+pub fn visibleToolPreamble(content: []const u8) []const u8 {
+    return if (std.mem.trim(u8, content, " \t\r\n").len > 0) content else "";
 }
 
 // NOTE: there is deliberately NO strip-think helper anymore. Reasoning the
@@ -1589,7 +1597,20 @@ test "ContentStream: parts around a thought are trimmed and joined by one newlin
     try testing.expect((try content.deliver(allocator, " ")) == .hold);
     try testing.expectEqualStrings(" C", (try content.deliver(allocator, "C")).send);
     try testing.expect((try content.deliver(allocator, "\n")) == .hold);
-    try testing.expectEqualStrings("\n", content.finish());
+    try testing.expectEqualStrings("\n", content.finish(false));
+}
+
+test "ContentStream: a token's trailing whitespace waits, and a trimmed tail never ships" {
+    const allocator = testing.allocator;
+    var content = ContentStream{};
+    defer content.deinit(allocator);
+    try testing.expectEqualStrings("Checking.", (try content.deliver(allocator, "Checking.\n\n")).send);
+    try testing.expectEqualStrings("\n\nNext", (try content.deliver(allocator, "Next")).send);
+    try testing.expectEqualStrings("end", (try content.deliver(allocator, "end \n")).send);
+    try testing.expectEqualStrings("", content.finish(true));
+    try testing.expectEqualStrings("", content.finish(false));
+    try testing.expectEqualStrings("more", (try content.deliver(allocator, "more \n")).send);
+    try testing.expectEqualStrings(" \n", content.finish(false));
 }
 
 test "ThoughtJoin: a later thought's first delta follows one blank line" {

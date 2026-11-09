@@ -96,15 +96,34 @@ pub const ParseError = error{
     InvalidPattern,
 };
 
+/// What `parseExplained` could not enforce, in words a client can act on.
+pub const Detail = struct {
+    buf: [96]u8 = undefined,
+    len: usize = 0,
+
+    pub fn text(self: *const Detail) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn set(self: *Detail, comptime fmt: []const u8, args: anytype) void {
+        self.len = if (std.fmt.bufPrint(&self.buf, fmt, args)) |written| written.len else |_| self.buf.len;
+    }
+};
+
 /// Parse a `std.json.Value` into a `Schema`. The returned schema owns its memory.
 pub fn parse(gpa: std.mem.Allocator, value: std.json.Value) ParseError!Schema {
+    return parseExplained(gpa, value, null);
+}
+
+/// `parse`, naming in `detail` the construct that failed it.
+pub fn parseExplained(gpa: std.mem.Allocator, value: std.json.Value, detail: ?*Detail) ParseError!Schema {
     var schema: Schema = .{
         .arena = std.heap.ArenaAllocator.init(gpa),
         .root = undefined,
     };
     errdefer schema.arena.deinit();
 
-    var ctx: Ctx = .{ .arena = schema.arena.allocator(), .root = value };
+    var ctx: Ctx = .{ .arena = schema.arena.allocator(), .root = value, .detail = detail };
     // The root is the `#` ref, so a recursive ref back to it lands on this node.
     schema.root = try parseRef(&ctx, "#", 0);
     return schema;
@@ -114,6 +133,12 @@ const Ctx = struct {
     arena: std.mem.Allocator,
     root: std.json.Value,
     refs: std.StringHashMapUnmanaged(*Node) = .empty,
+    detail: ?*Detail = null,
+
+    fn unsupported(self: *Ctx, comptime fmt: []const u8, args: anytype) ParseError {
+        if (self.detail) |d| d.set(fmt, args);
+        return error.UnsupportedConstruct;
+    }
 };
 
 /// The slot is memoised before its target parses, so a recursive ref points back at it;
@@ -269,7 +294,10 @@ fn parseSingleType(ctx: *Ctx, obj: std.json.ObjectMap, t: []const u8, depth: usi
         var pattern_nfa: ?*const regex.Nfa = null;
         if (obj.get("pattern")) |pv| {
             if (pv != .string) return error.InvalidSchema;
-            pattern_nfa = regex.compile(arena, pv.string) catch return error.InvalidPattern;
+            pattern_nfa = regex.compile(arena, pv.string) catch {
+                if (ctx.detail) |d| d.set("string 'pattern' {s}", .{pv.string[0..@min(pv.string.len, 48)]});
+                return error.InvalidPattern;
+            };
         }
         node.* = .{
             .kind = .string,
@@ -281,7 +309,7 @@ fn parseSingleType(ctx: *Ctx, obj: std.json.ObjectMap, t: []const u8, depth: usi
         var items_node: ?*const Node = null;
         if (obj.get("items")) |iv| {
             // Tuple form (`items: [a, b]`) is not in our subset.
-            if (iv == .array) return error.UnsupportedConstruct;
+            if (iv == .array) return ctx.unsupported("array 'items' as a list of schemas (tuple form)", .{});
             items_node = try parseNode(ctx, iv, depth + 1);
         }
         node.* = .{
@@ -309,7 +337,7 @@ fn parseSingleType(ctx: *Ctx, obj: std.json.ObjectMap, t: []const u8, depth: usi
             .obj_additional = additional,
         };
     } else {
-        return error.UnsupportedConstruct;
+        return ctx.unsupported("type '{s}'", .{t[0..@min(t.len, 48)]});
     }
 
     return node;
@@ -629,6 +657,22 @@ test "unsupported tuple-form items returns error" {
         \\{"type":"array","items":[{"type":"string"},{"type":"number"}]}
     );
     try testing.expectError(error.UnsupportedConstruct, result);
+}
+
+test "a schema the parser refuses names the construct" {
+    const Case = struct { schema: []const u8, err: ParseError, names: []const u8 };
+    const cases = [_]Case{
+        .{ .schema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"nonsense\"}}}", .err = error.UnsupportedConstruct, .names = "type 'nonsense'" },
+        .{ .schema = "{\"type\":\"array\",\"items\":[{\"type\":\"string\"}]}", .err = error.UnsupportedConstruct, .names = "tuple" },
+        .{ .schema = "{\"type\":\"string\",\"pattern\":\"(\"}", .err = error.InvalidPattern, .names = "pattern" },
+    };
+    for (cases) |c| {
+        const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.schema, .{});
+        defer v.deinit();
+        var detail: Detail = .{};
+        try testing.expectError(c.err, parseExplained(testing.allocator, v.value, &detail));
+        try testing.expect(std.mem.indexOf(u8, detail.text(), c.names) != null);
+    }
 }
 
 test "schema nesting beyond the depth limit is refused, ordinary depth parses" {

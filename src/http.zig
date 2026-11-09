@@ -61,6 +61,45 @@ pub fn startupRefusal(err: anyerror, host: []const u8, port: u16, buf: []u8) ?[]
     }
 }
 
+/// A response whose head carries `extra_headers` (complete `Name: value\r\n` lines), then closes: the 405's
+/// `Allow` and a 503's `Retry-After`.
+pub fn sendResponseWithHeaders(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8, extra_headers: []const u8) !void {
+    logHttpResponse(status, content_type, body);
+    if (stream.ws_mode) |bridge| {
+        if (body.len > 0) try bridge.sendText(body);
+        return;
+    }
+    var hdr_buf: [768]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n{s}Connection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
+        status, content_type, body.len, extra_headers,
+    }) catch return error.Overflow;
+    try stream.writeAllNoFlush(hdr);
+    stream.length_framed = true;
+    if (body.len > 0 and !stream.head_only) try stream.writeAll(body) else try stream.flush();
+}
+
+/// A known path asked with a method it does not answer: 405 with the `Allow` list.
+pub fn sendMethodNotAllowed(allocator: std.mem.Allocator, stream: *http_conn.Conn, path: []const u8, allow: []const u8) !void {
+    const message = try std.fmt.allocPrint(allocator, "{s} answers {s} only", .{ path, allow });
+    defer allocator.free(message);
+    const escaped = try jsonEscape(allocator, message);
+    defer allocator.free(escaped);
+    const body = try std.fmt.allocPrint(allocator, "{{\"error\":{{\"message\":{s},\"type\":\"invalid_request_error\",\"param\":null,\"code\":405}}}}", .{escaped});
+    defer allocator.free(body);
+    var allow_line: [96]u8 = undefined;
+    const header = std.fmt.bufPrint(&allow_line, "Allow: {s}\r\n", .{allow}) catch "";
+    try sendResponseWithHeaders(stream, "405 Method Not Allowed", "application/json", body, header);
+}
+
+/// The body-less answer to a HEAD request: the head a GET would send, its Content-Length included.
+fn sendHeadOnly(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body_len: usize) !void {
+    var hdr_buf: [512]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{ status, content_type, body_len }) catch return error.Overflow;
+    try stream.writeAllNoFlush(hdr);
+    stream.length_framed = true;
+    try stream.flush();
+}
+
 pub fn sendResponse(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     logHttpResponse(status, content_type, body);
     try sendResponseFramed(stream, status, content_type, body);
@@ -76,6 +115,7 @@ pub fn sendResponseQuiet(stream: *http_conn.Conn, status: []const u8, content_ty
 }
 
 pub fn sendResponseFramed(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
+    if (stream.head_only) return sendHeadOnly(stream, status, content_type, body.len);
     const extra = stream.effort_notice_json orelse "";
     const inject = extra.len > 0 and body.len > 0 and body[body.len - 1] == '}' and std.mem.indexOf(u8, body, "\"effort_notice\":") == null;
     const out_len = body.len + if (inject) extra.len else 0;
@@ -267,6 +307,14 @@ pub const not_enough_memory_message =
     "or raise or disable the cap with --max-resident-mem <size>|0. " ++
     "The server log names the exact figures and the current cap.";
 
+/// The count cap: `--max-resident-models` models are resident and each is serving a request.
+pub const resident_models_cap_message =
+    "Cannot load another model: the --max-resident-models cap is reached and every loaded model is serving a request. " ++
+    "Retry when one finishes, or raise the cap with --max-resident-models <n>. The server log names the cap.";
+
+/// Seconds a client waits before retrying a refusal that clears when a running request ends.
+pub const BUSY_RETRY_AFTER_SECS: u32 = 5;
+
 /// #144: the memory PREFLIGHT refusal (free RAM can't hold weights + warmup
 /// headroom) is distinct from the resident-budget gate above and has a
 /// different knob. Counts go to the log (#126); the client gets the remedy.
@@ -280,6 +328,11 @@ pub fn countRejected() void {
 }
 
 pub fn sendErrorResponse(allocator: std.mem.Allocator, stream: *http_conn.Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
+    return sendErrorResponseWithHeaders(allocator, stream, status, err_type, message, code, "");
+}
+
+/// `sendErrorResponse` whose head also carries `extra_headers` (complete `Name: value\r\n` lines).
+pub fn sendErrorResponseWithHeaders(allocator: std.mem.Allocator, stream: *http_conn.Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32, extra_headers: []const u8) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
 
@@ -293,7 +346,8 @@ pub fn sendErrorResponse(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
         \\{{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}}}}}
     , .{ escaped_msg, err_type, code_str });
     defer allocator.free(body);
-    try sendResponse(stream, status, "application/json", body);
+    if (extra_headers.len == 0) return sendResponse(stream, status, "application/json", body);
+    try sendResponseWithHeaders(stream, status, "application/json", body, extra_headers);
 }
 
 /// THE JSON string escaper for every response body. Every string here is model bytes
