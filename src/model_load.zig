@@ -2307,7 +2307,7 @@ fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror, had_error:
     // The load's own MLX error is reported here; latched, it would fail the next request.
     mlx.dropLatchedErrorUnless(had_error);
     sch.registry.mutex.lockUncancelable(sch.io);
-    if (err == error.InsufficientMemory) {
+    if (err == error.InsufficientMemory or err == error.OutOfMemory) {
         // A memory-preflight refusal is transient, not a property of the
         // checkpoint: the 503 tells the user to free memory and retry, so
         // the entry must go back to .unloaded — stuck in .error_state the
@@ -2585,6 +2585,26 @@ test "a failed cold load drops the MLX error it latched and keeps one latched be
     failLoadRequest(&sch, &req, error.LoadFailed, true);
     try testing.expect(mlx.errorPending());
     mlx.dropLatchedErrorUnless(false);
+}
+
+test "a cold load refused for memory returns the entry to unloaded, any other failure keeps its name" {
+    try mlx.requireGpu();
+    mlx.installErrorHandler();
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("m", "/m", 1);
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "", .allocator = testing.allocator };
+    defer if (req.error_name) |name| testing.allocator.free(name);
+
+    for ([_]anyerror{ error.InsufficientMemory, error.OutOfMemory }) |memory| {
+        failLoadRequest(&sch, &req, memory, false);
+        try testing.expectEqual(model_registry_mod.LoadState.unloaded, entry.state);
+    }
+    failLoadRequest(&sch, &req, error.LoadFailed, false);
+    try testing.expectEqual(model_registry_mod.LoadState.error_state, entry.state);
 }
 
 // ── Bill pins ──

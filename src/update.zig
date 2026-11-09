@@ -293,6 +293,8 @@ pub fn applyFetch(c: *Cache, arena: Allocator, status: u16, body: []const u8, et
         else => return false,
     }
     c.checked_at = now;
+    // A failed update is moot once the release list has nothing newer than this install.
+    if (!isNewer(c.latest, version)) c.@"error" = "";
     return true;
 }
 
@@ -1212,7 +1214,7 @@ test "update: the daily cache is due after 24 h and folds 200, 304 and failures"
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var c: Cache = .{ .@"error" = "earlier failure" };
+    var c: Cache = .{};
     const body = comptime "[" ++ releaseJson("v1.1.0", "", both_assets) ++ "]";
     try testing.expect(try applyFetch(&c, arena, 200, body, "W/\"e1\"", 100));
     try testing.expectEqualStrings("1.1.0", c.latest);
@@ -1233,12 +1235,27 @@ test "update: the daily cache is due after 24 h and folds 200, 304 and failures"
     defer testing.allocator.free(root);
     const path = try std.fmt.allocPrint(arena, "{s}/.sushi/update-check.json", .{root});
     try testing.expectEqual(@as(i64, 0), readCache(arena, io, path).checked_at);
+    c.@"error" = "earlier failure";
     try writeCache(arena, io, path, c);
     const back = readCache(arena, io, path);
     try testing.expectEqual(@as(i64, 200), back.checked_at);
     try testing.expectEqualStrings("1.1.0", back.latest);
     try testing.expectEqualStrings("W/\"e1\"", back.etag);
     try testing.expectEqualStrings("earlier failure", back.@"error");
+}
+
+test "update: a successful check clears the failure of an update the install no longer needs" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const current = comptime "[" ++ releaseJson("v" ++ version, "", both_assets) ++ "]";
+    var c: Cache = .{ .@"error" = "SHA-256 mismatch" };
+    try testing.expect(try applyFetch(&c, arena, 200, current, "e", 100));
+    try testing.expectEqualStrings("", c.@"error");
+    const newer = comptime "[" ++ releaseJson("v999.0.0", "", both_assets) ++ "]";
+    c.@"error" = "SHA-256 mismatch";
+    try testing.expect(try applyFetch(&c, arena, 200, newer, "e", 200));
+    try testing.expectEqualStrings("SHA-256 mismatch", c.@"error");
 }
 
 test "update: /props carries null fields until a check answers, then the newer release" {

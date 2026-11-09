@@ -68,13 +68,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   renamed over, and reused while under a day old. `sushi list` honors the key too; `sushi pull` is never gated. The
   repo comes from
   the pull manifest's `repo` or the folder name's match to an alias. `/v1/models` carries the result as
-  `meta.pack_update`; a 401/403/404, a timeout or a bad body claims nothing.
+  `meta.pack_update`; a 401/403/404, a timeout or a bad body claims nothing. A finished pull of the pack drops the claim at once (`packPulled`, downloads.zig).
 - **Update and restart** (`/v1/update`, the REPL's `/update`): the server shuts down through its SIGTERM path, then
   main's last defer REPLACES the process (`posix_spawn` with `SETEXEC | CLOEXEC_DEFAULT`, fds 0-2 kept) with
   `sushi update --relaunch -- <argv>`, which in turn replaces itself with `<install>/sushi <argv>`, new or restored.
   Same pid, same argv, same terminal and parent: host, launchd and `nohup` supervision carry through, and no socket
   outlives the server. An exec that cannot happen logs `[update] cannot run …` and exits 1; the outcome lands in the
-  cache so `/props.update.error` names a failure after the relaunch.
+  cache so `/props.update.error` names a failure after the relaunch; a later check that finds nothing newer than this
+  install clears it.
 
 ## One-shot prompts
 
@@ -121,6 +122,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 
 ## What loads
 
+- A stored failure always has a way to start a fresh attempt without a restart; a new failure state ships with that way and a test (`whatever failure an entry holds`, model_registry.zig).
+- A model whose load failed (`error` in `/v1/models`) keeps that error and fails fast for inference requests, but every `POST /v1/load-model` runs a new attempt (`Scheduler.ensureLoadedFresh`): settings are read again, the preflight reruns, and the stored error is replaced in the same registry hold that claims the load. A memory refusal (`InsufficientMemory`, MLX `OutOfMemory`) is not stored at all: the model goes back to `unloaded`.
+- Saving a setting that a load reads (`reachesLoad` in settings_api.zig: context, KV, MTP, vision, SSD budget and read-ahead, models folder, prompt cache size, skip-memory-check) ends the stored failure of that model, or of every model for a server key, so the next request loads again; a request with nothing changed still fails fast.
 - A rescan makes a failed load retryable only when discovery finds the same ID at the same path; it clears the error and refreshes the on-disk byte count without disturbing live entries.
 - A qwen4_exp load that fails after the n-gram state or the MTP head exists frees both (`Qwen4Mtp.deinit`; the
   state's `deinit` joins the table's warm thread first). Guard: the `QWEN4_TEST_MODEL` FailingAllocator sweep over

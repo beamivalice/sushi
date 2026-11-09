@@ -351,12 +351,18 @@ fn workerLoop(io: std.Io) void {
         };
         const rescan = ok and !stopping;
         unlock();
+        if (ok) packPulled(dest);
         // `job` may be dropped from here on: a new start of the same pack replaces a finished one.
         if (rescan) if (server_state.global_registry) |r| {
             const added = r.absorbDownload(dest) catch 0;
             log.info("[download] {s} is ready; models rescanned, {d} added\n", .{ repo, added });
         };
     }
+}
+
+/// A finished pull leaves the pack at the published revision: its `/v1/models` row stops naming an update.
+fn packPulled(dest: []const u8) void {
+    pack_update.record(dest, .current);
 }
 
 /// Queues `repo` into the pack folder `dest` and starts the download thread when it is idle. False when it is
@@ -685,6 +691,19 @@ test "downloads: a pack row carries the tier verdict, the recommended pack and i
     const new = try row(arena, .{ .repo = "beamster/New-Sushi-3bpw", .size = 1, .installed = "/m/n" }, 128);
     try testing.expect(new.fits == null and new.tier_gb == null and !new.recommended and new.launch == null);
     try testing.expectEqualStrings("New-Sushi-3bpw", new.name);
+}
+
+test "downloads: a finished pull drops the update claim from the pack row" {
+    const dest = "/packs/Updated-Sushi-3bpw";
+    pack_update.record(dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "org/x" } });
+    defer pack_update.record(dest, .current);
+    const before = try pack_update.rowFragment(testing.allocator, dest);
+    defer testing.allocator.free(before);
+    try testing.expect(before.len > 0);
+    packPulled(dest);
+    const after = try pack_update.rowFragment(testing.allocator, dest);
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("", after);
 }
 
 test "downloads: progress follows the pull's events, and a stop is answered at the next one" {

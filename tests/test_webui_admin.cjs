@@ -9,6 +9,8 @@ const script = source.match(/<script id="adminScript">([\s\S]*?)<\/script>/)[1];
 const slice = script.slice(script.indexOf('function adminBytes('), script.indexOf('(() => {'));
 const page = vm.createContext({});
 vm.runInContext(slice, page);
+const main = source.match(/<script>([\s\S]*?)<\/script>/)[1];
+vm.runInContext(main.slice(main.indexOf('function forgetRecoveredLoads('), main.indexOf('const modelStore = {')), page);
 
 const GiB = 1024 ** 3;
 assert.equal(page.adminBytes(5 * GiB), '5.00 GiB');
@@ -95,6 +97,38 @@ assert.deepEqual(rates([1000, 50, 300], [3000, 50, 300]), { gen: 0, pre: 0 });
 assert.deepEqual(rates([1000, 10, 900], [3000, 10, 40]), { gen: 0, pre: 20 }, 'a prefill counter that fell is a new prefill');
 assert.deepEqual(rates([1000, 10, 100], [9000, 500, 900]), { gen: 0, pre: 0 }, 'a gap is not averaged into a rate');
 assert.deepEqual(rates([3000, 10, 100], [3000, 20, 200]), { gen: 0, pre: 0 });
+
+// A failure shown for an action goes when that action is tried again: one key of a Map or an object, or all of them.
+const failedMap = new Map([['a', 'x'], ['b', 'y']]);
+page.adminAttempt(failedMap, 'a');
+assert.deepEqual([...failedMap], [['b', 'y']]);
+page.adminAttempt(failedMap);
+assert.equal(failedMap.size, 0);
+const failedObj = { port: 'needs root', models_dir: 'not a folder' };
+page.adminAttempt(failedObj, 'port');
+assert.deepEqual(JSON.parse(JSON.stringify(failedObj)), { models_dir: 'not a folder' });
+page.adminAttempt(failedObj);
+assert.deepEqual(JSON.parse(JSON.stringify(failedObj)), {});
+// A load failure this session recorded goes once the server lists the model loaded or loading, wherever it was loaded.
+const loadFailures = new Map([['a', 'out of memory'], ['b', 'bad config'], ['c', 'x']]);
+assert.equal(page.forgetRecoveredLoads(loadFailures, [{ id: 'a', state: 'ready' }, { id: 'b', state: 'error' }, { id: 'c', state: 'loading' }]), true);
+assert.deepEqual([...loadFailures], [['b', 'bad config']], 'a model that is still failed keeps its message');
+assert.equal(page.forgetRecoveredLoads(loadFailures, [{ id: 'b', state: 'unloaded' }]), false);
+// A refused Save names a setting or the form; the next Save and an edit of that value answer it, and it blocks nothing.
+const form = () => ({ texts: {}, errors: {}, refused: {}, saveError: '' });
+const shown = (P) => JSON.parse(JSON.stringify({ refused: P.refused, saveError: P.saveError, errors: P.errors }));
+let P = form();
+page.adminSaveRefused(P, 'ctx_size', 'too large');
+page.adminSaveRefused(P, null, 'disk full');
+assert.deepEqual(shown(P), { refused: { ctx_size: 'too large' }, saveError: 'disk full', errors: {} }, 'a refusal is no input error');
+page.adminEdited(P, 'kv_quant');
+assert.deepEqual(shown(P), { refused: { ctx_size: 'too large' }, saveError: '', errors: {} }, 'editing another value clears the form message only');
+page.adminSaveRefused(P, null, 'disk full');
+page.adminSaveStarted(P);
+assert.deepEqual(shown(P), { refused: {}, saveError: '', errors: {} }, 'a new Save starts with no earlier refusal');
+page.adminSaveRefused(P, 'ctx_size', 'too large');
+page.adminEdited(P, 'ctx_size');
+assert.deepEqual(shown(P), { refused: {}, saveError: '', errors: {} }, 'editing the refused value answers it');
 
 // Compact is the default and the only other stored value that counts is "advanced".
 assert.equal(page.uiModeOf(null), 'compact');

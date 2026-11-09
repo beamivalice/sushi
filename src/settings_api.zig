@@ -726,6 +726,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     }
     write(allocator, stream.io, path, model_settings.server_section, plan.server_edits) catch |err| return writeFailed(allocator, stream, err);
     write(allocator, stream.io, path, model_path, plan.model_edits) catch |err| return writeFailed(allocator, stream, err);
+    forgetFailuresFor(sch.registry, plan, model_path);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -761,6 +762,40 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     }
     try w.print("}},\"model_loaded\":{}}}", .{model_loaded});
     try http.sendResponse(stream, "200 OK", "application/json", out.written());
+}
+
+/// A saved setting that a load reads ends the stored failure of the model it names, or of every model for a server one.
+fn forgetFailuresFor(registry: *model_registry_mod.ModelRegistry, plan: Plan, model_path: []const u8) void {
+    for (plan.server_edits) |e| if (reachesLoad(e.key)) return registry.forgetLoadFailures();
+    for (plan.model_edits) |e| if (reachesLoad(e.key)) {
+        if (registry.peekByPath(model_path)) |entry| registry.forgetLoadFailure(entry);
+        return;
+    };
+}
+
+/// Whether saving `key` changes what a load or its preflight reads, so a model that failed to load deserves another try.
+pub fn reachesLoad(key: []const u8) bool {
+    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
+    for (reads) |n| if (std.mem.eql(u8, n, key)) return true;
+    return false;
+}
+
+test "settings api: every saved key is classified, and the ones a load reads clear a stored load failure" {
+    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
+        try std.testing.expect(reachesLoad(key));
+    }
+    for ([_][]const u8{ "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" }) |key| {
+        try std.testing.expect(!reachesLoad(key));
+    }
+    // A new key must be classified above before it ships.
+    for (model_settings.model_keys) |k| try std.testing.expect(classified(k.name));
+    for (model_settings.server_keys) |k| try std.testing.expect(classified(k.name));
+}
+
+fn classified(key: []const u8) bool {
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" };
+    for (known) |n| if (std.mem.eql(u8, n, key)) return true;
+    return false;
 }
 
 fn writeFailed(allocator: std.mem.Allocator, stream: *http_conn.Conn, err: anyerror) !void {

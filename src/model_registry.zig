@@ -961,6 +961,15 @@ pub const ModelRegistry = struct {
     ///
     /// Caller MUST call `release(lm)` once done with the returned pointer.
     pub fn ensureLoaded(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
+        return self.ensureLoadedWith(id_or_empty, false);
+    }
+
+    /// `ensureLoaded` that treats a failed entry as `error.NotLoaded`, so the caller can start a new attempt.
+    pub fn ensureLoadedRetrying(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
+        return self.ensureLoadedWith(id_or_empty, true);
+    }
+
+    fn ensureLoadedWith(self: *ModelRegistry, id_or_empty: []const u8, retry_failed: bool) !*LoadedModel {
         const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "sushi"))
             self.default_id
         else
@@ -983,7 +992,7 @@ pub const ModelRegistry = struct {
                     self.state_cond.waitUncancelable(self.io, &self.mutex);
                     continue;
                 },
-                .error_state => return loadErrorFromName(entry.error_name),
+                .error_state => return if (retry_failed) error.NotLoaded else loadErrorFromName(entry.error_name),
                 .unloaded => return error.NotLoaded,
             }
         }
@@ -1398,6 +1407,22 @@ pub const ModelRegistry = struct {
         entry.error_name = self.allocator.dupe(u8, error_name) catch null;
         entry.state = .error_state;
         self.state_cond.broadcast(self.io);
+    }
+
+    /// A settings change that reaches loading invalidates the stored failure: the entry goes back to unloaded, so the next
+    /// request loads again with the new settings. A model that is loading, loaded or unloaded is left alone.
+    pub fn forgetLoadFailure(self: *ModelRegistry, entry: *LoadedModel) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (entry.state == .error_state) self.markUnloadedLocked(entry);
+    }
+
+    /// `forgetLoadFailure` for every model, after a server-wide setting changed.
+    pub fn forgetLoadFailures(self: *ModelRegistry) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry| if (entry.*.state == .error_state) self.markUnloadedLocked(entry.*);
     }
 
     /// Duped copy of the stored load-failure name for `id` (empty/"sushi"
@@ -1890,6 +1915,43 @@ test "ModelRegistry: a startup load that fails reaches the waiting request by na
     try expectError(error.InsufficientMemory, w.got.?);
     try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
     reg.releaseStatus(e);
+}
+
+test "ModelRegistry: whatever failure an entry holds, a retrying request sees it as not loaded and an ordinary one as the failure" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStub("m", "/path/to/m", 1024);
+    for ([_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetBelowResident", "ExpertCacheDoesNotFit", "FileNotFound", "LoadFailed" }) |name| {
+        reg.mutex.lockUncancelable(reg.io);
+        reg.markErrorLocked(stub, name);
+        reg.mutex.unlock(reg.io);
+        try expectError(error.NotLoaded, reg.ensureLoadedRetrying("m"));
+        try testing.expect(if (reg.ensureLoaded("m")) |_| false else |err| err != error.NotLoaded);
+        try testing.expectEqual(LoadState.error_state, stub.state);
+    }
+}
+
+test "ModelRegistry: a settings change that reaches loading forgets the stored failure, so the next request loads again" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const a = try reg.registerStub("a", "/path/to/a", 1024);
+    const b = try reg.registerStub("b", "/path/to/b", 1024);
+    const c = try reg.registerStub("c", "/path/to/c", 1024);
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markErrorLocked(a, "SsdBudgetBelowResident");
+    reg.markErrorLocked(b, "FileNotFound");
+    reg.markReadyLocked(c, 1);
+    reg.mutex.unlock(reg.io);
+
+    try expectError(error.SsdBudgetBelowResident, reg.ensureLoaded("a"));
+    reg.forgetLoadFailure(a);
+    try expectError(error.NotLoaded, reg.ensureLoaded("a"));
+    try expectError(error.LoadFailed, reg.ensureLoaded("b"));
+    reg.forgetLoadFailures();
+    try expectError(error.NotLoaded, reg.ensureLoaded("b"));
+    try testing.expectEqual(LoadState.ready, c.state);
+    reg.forgetLoadFailure(c);
+    try testing.expectEqual(LoadState.ready, c.state);
 }
 
 test "ModelRegistry: memory-refused loads keep their identity, other failures expose their name" {

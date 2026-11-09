@@ -9,6 +9,11 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The SSD prefix cache reports what it stored beside what it wrote**: `/metrics` adds
   `sushi:prefix_cache_store_bytes_total{kind}` and `/metrics.json` adds `prefix_cache_writes.stored_bytes`, the bytes the
   cache's storage layer put on the SSD, by file kind.
+- **A failure no longer outlives its cause**: pressing Load again on a model whose load failed (or ran out of memory)
+  tries the load again with the current settings and shows its own result, a refused Save clears when you press Save
+  again or edit the value, a load failure clears as soon as the model is listed loaded, saving a setting a load reads
+  lets the next request retry a failed model, a finished download drops the pack's update notice at once, and a release
+  check that finds nothing newer clears an earlier update failure.
 - **Each served architecture is a self-contained module**: Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4.1-Flash and
   MiMo-V2.6-Flash each live behind one registry line, so `-Darchs` builds the engine with any of them left out, with
   every model's output unchanged.

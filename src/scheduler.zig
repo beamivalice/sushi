@@ -1635,10 +1635,20 @@ pub const Scheduler = struct {
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
+        return self.ensureLoadedWith(id_or_empty, false);
+    }
+
+    /// `ensureLoaded` for an explicit load request: a model whose last load failed is tried again with the
+    /// current settings and memory instead of answering from the stored failure.
+    pub fn ensureLoadedFresh(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
+        return self.ensureLoadedWith(id_or_empty, true);
+    }
+
+    fn ensureLoadedWith(self: *Scheduler, id_or_empty: []const u8, retry_failed: bool) !*LoadedModel {
         last_load_context_refusal = null;
         // Fast path: ready entries. registry.ensureLoaded handles waiting
         // out .loading / .evicting transitions by other callers.
-        const fast_result = self.registry.ensureLoaded(id_or_empty);
+        const fast_result = if (retry_failed) self.registry.ensureLoadedRetrying(id_or_empty) else self.registry.ensureLoaded(id_or_empty);
         if (fast_result) |lm| return lm else |err| switch (err) {
             error.NotLoaded => {}, // fall through to slow path
             else => return err,
@@ -1741,8 +1751,10 @@ pub const Scheduler = struct {
                         continue :wait_loop;
                     },
                     .error_state => {
-                        const load_err = ModelRegistry.loadErrorFromName(entry.error_name);
-                        return load_err;
+                        if (!retry_failed) return ModelRegistry.loadErrorFromName(entry.error_name);
+                        // The stored failure stays until this attempt claims the slot, in the same hold.
+                        self.registry.markUnloadedLocked(entry);
+                        break :wait_loop;
                     },
                     .unloaded => break :wait_loop,
                 }
@@ -6005,6 +6017,45 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
     // The failed claim unlocked once: a second unlock would leave this free or release another thread's hold.
+    try testing.expect(reg.mutex.tryLock());
+    reg.mutex.unlock(io);
+    resident.refcount.store(0, .release);
+}
+
+test "ensureLoadedFresh: a model whose load failed is tried again, not answered from the failure" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"not_a_served_arch\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const resident = try reg.registerStub("a", "a", 10);
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(resident, 10);
+    reg.markErrorLocked(target, "OutOfMemory");
+    reg.mutex.unlock(io);
+    _ = resident.refcount.fetchAdd(1, .acq_rel);
+
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = testing.allocator;
+    sch.ssd_budget_bytes = 0;
+    sch.mtp = null;
+
+    // An ordinary request keeps failing fast, and the failure stays on /v1/models.
+    try testing.expectError(error.InsufficientMemory, sch.ensureLoaded("b"));
+    try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
+    // An explicit load runs the whole attempt again: here it reaches the eviction gate and its own verdict.
+    try testing.expectError(error.NotEnoughMemory, sch.ensureLoadedFresh("b"));
+    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+    try testing.expect(target.error_name == null);
     try testing.expect(reg.mutex.tryLock());
     reg.mutex.unlock(io);
     resident.refcount.store(0, .release);

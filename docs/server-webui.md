@@ -11,6 +11,7 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   through `light-dark()`; `data-theme` (`system`, `day`, `night`, stored as `sushi-theme`) only sets `color-scheme`.
 - Token names are a contract with the dashboard's charts and any branch that draws in the page: rename none; add new ones.
 - Text keeps WCAG AA (4.5:1) on every surface it sits on in both themes; a focus ring or a chart line keeps 3:1.
+- A failure message belongs to one attempt: the action clears it (`adminAttempt`) before it sends, so Load, Save and Retry show only what the new attempt returned, and a refused value never blocks the next Save (`adminSaveRefused`). Guard: `tests/test_webui_admin.cjs`.
 
 ## Palette
 

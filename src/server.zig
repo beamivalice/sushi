@@ -1924,7 +1924,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
             else => return err,
         };
     }
-    const lm = scheduler.ensureLoaded(requested_id) catch |err| switch (err) {
+    const lm = scheduler.ensureLoadedFresh(requested_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
             return;

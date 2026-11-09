@@ -1252,6 +1252,13 @@ const postJson = (path, body) => apiJson(path, { method: "POST", headers: { "Con
    Models: the one place /v1/models is read. The top bar, the chat picker, the Models tab and the dashboard
    strip subscribe; an identical answer notifies nobody, and loads and unloads run through `act`.
    ------------------------------------------------------------ */
+// Load failures this session recorded: a model the server lists loaded or loading is up, whoever loaded it, and its
+// failure is history. True when one was dropped.
+function forgetRecoveredLoads(failed, models) {
+  let dropped = false;
+  for (const m of models) if ((m.state === "ready" || m.state === "loading") && failed.delete(m.id)) dropped = true;
+  return dropped;
+}
 const modelStore = {
   list: [], text: "", online: null, view: "chat", seq: 0, applied: 0, timer: null,
   subs: new Set(), pending: new Map(), failed: new Map(),
@@ -1274,6 +1281,7 @@ const modelStore = {
       try { this.list = JSON.parse(text).data ?? []; this.text = text; changed = true; } catch { /* keep the last list */ }
     }
     this.online = online;
+    if (forgetRecoveredLoads(this.failed, this.list)) changed = true;
     if (changed) this.emit();
     this.schedule();
   },
@@ -3281,6 +3289,18 @@ function adminErrorText(e) {
   const status = m.match(/^(\d{3})\b/);
   return status ? `The server answered with error ${status[1]}. Try again; if it repeats, check the server log.` : m.slice(0, 120);
 }
+// The failures an action left, a message per key (a Map or an object): they go the moment that action is tried again,
+// so what shows afterwards belongs to the new attempt. No key clears every one.
+function adminAttempt(failed, key) {
+  if (key === undefined) { if (typeof failed.clear === "function") failed.clear(); else for (const k of Object.keys(failed)) delete failed[k]; }
+  else if (typeof failed.clear === "function") failed.delete(key);
+  else delete failed[key];
+}
+// A model form's Save: a refusal sits on the setting it names, else on the form, and blocks nothing; the next Save or
+// an edit of that value answers it.
+function adminSaveStarted(P) { adminAttempt(P.refused); P.saveError = ""; }
+function adminSaveRefused(P, key, text) { if (key) P.refused[key] = text; else P.saveError = text; }
+function adminEdited(P, key) { adminAttempt(P.refused, key); P.saveError = ""; }
 // Decode and prefill tok/s between two server samples ([t_ms, gen_tokens, prefill_tokens, ...]); 0 across a gap or on
 // the first sample. A prefill counter that fell started a new prefill, so its value is the tokens added.
 function historyRates(prev, row, gapMs) {
@@ -3383,7 +3403,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
     sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, serr: {}, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
-  const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
+  const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, refused: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
   // One fetch per kind: an older answer is dropped, an unchanged one returns undefined.
   async function pull(kind, path) {
@@ -3675,6 +3695,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const onChange = () => {
       const P = per(F.id), m = info(F.id), text = S.control.get();
       P.texts[key] = text;
+      adminEdited(P, key);
       const problem = spec.type === "choice" || spec.type === "bool" ? null : adminProblem(spec, text);
       P.errors[key] = problem ? (Number(text) > m.limits?.[key]?.max ? m.limits[key].why || `This model's maximum is ${spec.max}.` : problem) : "";
       if (S.control.node.tagName === "INPUT") S.control.node.setAttribute("aria-invalid", String(!!P.errors[key]));
@@ -3698,12 +3719,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setHidden(S.remove, locked || !why || s.file == null);
     const text = S.control.get(), saved = adminFileText(s.file), parsed = adminControlValue(S.spec, text);
     const changed = !locked && !why && key in P.texts && !(parsed.ok && adminSameAsFile(parsed, s.file));
-    S.row.classList.toggle("dirty", changed || !!(P.errors[key] && !why));
+    S.row.classList.toggle("dirty", changed || !!((P.errors[key] || P.refused[key]) && !why));
     const cut = lim?.choices && S.spec.choices?.filter((c) => !lim.choices.includes(c)).map((c) => choiceLabel(key, c));
     let hint = key === "ctx_size" && text && !P.errors[key] ? `${adminTokens(Number(text))} tokens` : cut?.length && !locked && !why ? lim.why || `${cut.join(", ")} not available for this model.` : "";
     if (changed) hint = [hint, `was ${saved || "Default"}`].filter(Boolean).join(" · ");
     setText(S.hint, hint);
-    setText(S.bad, why ? "" : P.errors[key] ?? "");
+    setText(S.bad, why ? "" : P.errors[key] || P.refused[key] || "");
   }
 
   function buildDetail(m) {
@@ -3721,7 +3742,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     F.cacheBtn = h("button", { class: "btn sm danger", type: "button", onclick: () => clearModel(F.id) });
     F.cacheSect = h("div", { class: "sect", hidden: true }, h("h3", { text: "Prompt cache" }), h("div", { class: "lead", text: "Saved conversations, so a follow-up skips re-reading its prompt." }), F.cacheKv, h("div", {}, F.cacheBtn));
     F.saveMsg = h("span", { class: "msg" });
-    F.discard = h("button", { class: "btn sm ghost", type: "button", text: "Discard", onclick: () => { Object.assign(per(F.id), { texts: {}, errors: {} }); for (const S of F.sets.values()) S.control.node.removeAttribute?.("aria-invalid"); patchDetail(info(F.id)); } });
+    F.discard = h("button", { class: "btn sm ghost", type: "button", text: "Discard", onclick: () => { Object.assign(per(F.id), { texts: {}, errors: {}, refused: {}, saveError: "" }); for (const S of F.sets.values()) S.control.node.removeAttribute?.("aria-invalid"); patchDetail(info(F.id)); } });
     F.save = h("button", { class: "btn sm primary", type: "button", text: "Save", onclick: () => saveModel(F) });
     F.savebar = h("div", { class: "savebar", hidden: true }, F.saveMsg, F.discard, F.save);
     const lead = h("div", { class: "lead", text: "Saved for this model. They apply the next time it loads. A value set when sushi was started wins over these." });
@@ -3822,16 +3843,16 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const m = info(F.id), P = per(F.id), { set } = adminChanges(F.specs, m.settings, sendable(m));
     if (!Object.keys(set).length) return;
     let shown = null;
+    adminSaveStarted(P);
     await withBusy(F.save, "Saving…", async () => {
       try {
         const r = await postJson("/v1/settings", { model: F.id, set });
         noteSaved(F, set);
-        P.saveError = "";
         toast(r.model_loaded ? `Saved. Reload ${F.id} to use them.` : `Saved. Applies the next time ${F.id} loads.`);
       } catch (e) {
         // A refusal that names a setting belongs on that setting's row; either way it is shown there, not as a toast.
         const raw = adminErrorText(e), key = F.specs.find((sp) => new RegExp(`\\b${sp.name}\\b`).test(raw))?.name, text = labelled(raw);
-        if (key) P.errors[key] = text; else P.saveError = text;
+        adminSaveRefused(P, key, text);
         shown = key ? F.sets.get(key).row : F.saveErr;
       }
     });
@@ -4046,6 +4067,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     effortPatch();
   }
   async function effortSave(body, btn, label, done) {
+    E.serr = "";
     await withBusy(btn, label, async () => {
       try {
         const r = await postJson("/v1/settings", body);
@@ -4074,6 +4096,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // The server's own words for when a server setting takes effect ("saved; applies at the next model load").
   const sentence = (note) => `${note[0].toUpperCase()}${note.slice(1)}.`;
   async function saveServer(key, value, text, btn, label) {
+    adminAttempt(A.serr, key);
     await withBusy(btn, label, async () => {
       try {
         const r = await postJson("/v1/settings", { server: { [key]: value } });
@@ -4217,8 +4240,6 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
 
   function renderAll() {
-    // A failure message belongs to the failed attempt; once the model is up or loading it is history.
-    for (const m of modelStore.list) if (m.state === "ready" || m.state === "loading") modelStore.failed.delete(m.id);
     const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : A.error ? `Couldn't load: ${A.error}` : "";
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);

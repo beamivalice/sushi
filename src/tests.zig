@@ -38,6 +38,7 @@ test {
     _ = @import("format_corpus_test.zig");
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("server.zig");
+    _ = @import("downloads.zig");
     _ = @import("bills_live_test.zig");
     _ = @import("anthropic.zig");
     _ = @import("completions.zig");
