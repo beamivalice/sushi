@@ -392,6 +392,13 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     return discoverModelsInDir(io, allocator, dir, model_dir);
 }
 
+/// The default models folder is scanned whether or not it exists; a user who never pulled a pack has none, and a
+/// warning would blame a `--model-dir` they did not pass.
+fn isUnusedDefaultRoot(root: []const u8, err: anyerror, home: []const u8) bool {
+    if (err != error.FileNotFound or home.len == 0) return false;
+    return std.mem.startsWith(u8, root, home) and std.mem.eql(u8, root[home.len..], "/.sushi/models");
+}
+
 /// Scan several roots and merge them into ONE result, first-root-wins on a
 /// repeated id.
 ///
@@ -439,7 +446,11 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
 
     for (roots) |root| {
         const one = discoverModels(io, allocator, root) catch |err| {
-            log.warn("--model-dir scan failed ({s}): {s}\n", .{ root, @errorName(err) });
+            if (isUnusedDefaultRoot(root, err, if (std.c.getenv("HOME")) |h| std.mem.span(h) else "")) {
+                log.debug("models folder {s} does not exist yet\n", .{root});
+            } else {
+                log.warn("--model-dir scan failed ({s}): {s}\n", .{ root, @errorName(err) });
+            }
             continue;
         };
         // Transfer ownership per model, freeing only the ones we drop — the
@@ -1620,4 +1631,11 @@ test "parseStubMeta: an arch that renders its own chat template is chat-capable 
         \\{"model_type":"qwen4_exp", "num_hidden_layers":4, "hidden_size":384}
     , false);
     try testing.expect(qwen.found and !qwen.has_chat);
+}
+
+test "a missing default models folder is quiet, a missing --model-dir is not" {
+    try std.testing.expect(isUnusedDefaultRoot("/h/.sushi/models", error.FileNotFound, "/h"));
+    try std.testing.expect(!isUnusedDefaultRoot("/h/.sushi/models", error.AccessDenied, "/h"));
+    try std.testing.expect(!isUnusedDefaultRoot("/elsewhere/models", error.FileNotFound, "/h"));
+    try std.testing.expect(!isUnusedDefaultRoot("/h/.sushi/models", error.FileNotFound, ""));
 }

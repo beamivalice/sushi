@@ -21,7 +21,7 @@ def main():
     if not old or not pack or not Path(pack).is_dir():
         print("SKIP: set SUSHI_OLD_BIN and SUSHI_PM_PACK (or DSV41_STQ_TINY with its -pm sibling)", file=sys.stderr)
         return 3
-    args = ["--model", pack, "--no-mtp", "--no-vision", "--ctx-size", "4096", "--serve", "--host", "127.0.0.1", "--port", "0"]
+    args = ["--model", pack, "--no-mtp", "--no-vision", "--ctx-size", "4096", "--serve", "--host", "127.0.0.1", "--port", "18990"]
     with tempfile.TemporaryDirectory(prefix="pm-refusal-") as home:
         env = dict(os.environ, HOME=home)
         # The old build finds no trellis tensors of any routed group, so it refuses the pack at the index: it never

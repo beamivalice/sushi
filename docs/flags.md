@@ -16,10 +16,10 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 |---|---|---|---|---|
 | `--serve` | off → HTTP server mode; the headless `--serve --model-dir` form is what the app launches (main.zig:620) | operator | help, server-lifecycle; 123 tests | keep: the app depends on it; overlaps the `serve` subcommand only in spelling |
 | `--host` | `127.0.0.1` → bind address, `0.0.0.0` opens the LAN (main.zig:617) | operator | help, server-lifecycle; 52 tests | keep |
-| `--port` | `12345`, or `server.port` of `model-settings.json` → bind port (main.zig:614); pins that key, reported locked | operator | help, server-lifecycle; 139 tests | keep |
+| `--port` | `12345`, or `server.port` of `model-settings.json` → bind port, 1..65535 (main.zig:614); pins that key, reported locked | operator | help, server-lifecycle; 139 tests | keep |
 | `--api-key` | none → required on every request, loopback exempt (main.zig:728) | operator | help, server-http-apis; 2 tests | keep |
 | `--api-key-strict` | off → also require the key from loopback (main.zig:732) | operator | help; 1 test | keep: embedders on shared machines |
-| `--api-key-env` | none → read the key from a named env var so argv does not carry it (main.zig:734) | operator | help, envvar; 0 tests | keep: the only way to keep the key out of the process table |
+| `--api-key-env` | none → read the key from a named env var so argv does not carry it; an unset or empty variable exits with an error before anything loads (main.zig:734) | operator | help, envvar; 0 tests | keep: the only way to keep the key out of the process table |
 | `--no-metrics` | off → turns off Prometheus `/metrics` and `/metrics.json`, which are ON by default; `POST /metrics/enable` turns them back on at runtime | operator | help, server-http-apis, usage | keep |
 | `--metrics` | accepted and does nothing (metrics are on by default); kept so existing launch lines still start | operator | help | keep as a no-op alias; cut at the next major version |
 | `--max-concurrent` | `1` → only sizes the submit queue (`n + 32`) and floors the prefix-cache capacity; slots batch at any value (main.zig:913) | dead | help; server-lifecycle; 21 tests, 2 scripts | cut: the queue depth is fixed, batching is the model's answer, not this number |
@@ -36,7 +36,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 |---|---|---|---|---|
 | `--model` | `~/.sushi/models` default → model directory (main.zig:611) | operator | help, usage; 135 tests | keep |
 | `--model-dir` | none → repeatable discovery root, up to 8 (main.zig:916) | operator | help, server-lifecycle; 27 tests | keep; the settings-file key `server.models_dir` is the default folder when no flag is given (a flag outranks it) |
-| `--max-resident-models` | `3` → cap on loaded models, bad value falls back to 3 (main.zig:933) | machine | help; 5 tests | keep |
+| `--max-resident-models` | `3` → cap on loaded models, at least 1 (main.zig:933) | machine | help; 5 tests | keep |
 | `--max-resident-mem` | `auto` = 80% of the wired limit → cap on summed resident bytes (main.zig:939) | machine | help, server-lifecycle; 0 tests | keep |
 | `--idle-evict-secs` | off → unload a model idle this long (main.zig:959) | machine | help; 1 test | keep |
 | `--ctx-size` | model max → context length (DeepSeek-V4.1: 1,000,000 when the bill admits it); also `ctx_size` in settings (main.zig:663) | machine | help, usage, README; 40 tests | keep |
@@ -73,14 +73,14 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--max-mtp-ctx` | `0` no ceiling → MTP off past n context tokens (main.zig:790) | machine | help, `/props`; 0 tests | owner call |
 | `--no-mtp-lookup` | off → drop prompt-lookup drafts inside MTP rounds and GLM DFlash2 chains (cli.zig:708) | dev | help, engine-mtp; 2 tests | cut: kill switch of an adopted default; one arm per boot is why a bench wants it |
 | `--drafter` | none → path of a DFlash2 assistant stored elsewhere (GLM, Qwen3.8-Flash-Next); on Qwen3.8-Flash-Next it is the only way to run DFlash2, a drafter beside the pack is ignored and MTP stays the default (main.zig:719) | operator | help, usage, glm5-arch, qwen4-arch; 7 tests | keep |
-| `--drafter-min-depth` / `--drafter-max-depth` | Qwen3.8-Flash-Next: `2` / `8` → the verifier rows (t1 plus drafts) a DFlash2 round may carry, the round choosing within them from the drafter's confidence; equal values pin one count. GLM-5.3-Flash: the same, `2` / `8`, chosen from the assistant's tree. Integers 2..16 (8 on Qwen and GLM); a bad value or a min above the max exits before any load, a model without a drafter logs that they are ignored (main.zig) | machine | help, qwen4-arch, glm5-arch; 3 tests | keep: the best row count is a property of the chip's verify cost; mirrors `--mtp-min-depth`/`--mtp-max-depth` |
+| `--drafter-min-depth` / `--drafter-max-depth` | Qwen3.8-Flash-Next: `2` / `8` → the verifier rows (t1 plus drafts) a DFlash2 round may carry, the round choosing within them from the drafter's confidence; equal values pin one count. GLM-5.3-Flash: the same, `2` / `8`, chosen from the assistant's tree. Integers 2..16 (the load refuses a value past the arch's limit: 8 on GLM, the assistant's block, at most 9, on Qwen); a bad value or a min above the max exits before any load, a model without a drafter logs that they are ignored (main.zig) | machine | help, qwen4-arch, glm5-arch; 3 tests | keep: the best row count is a property of the chip's verify cost; mirrors `--mtp-min-depth`/`--mtp-max-depth` |
 | `--no-drafter` | on when the assistant is found → never load it, saves its memory (main.zig:752) | machine | help; usage, glm5-arch; 9 tests | keep |
 
 ## Prefix cache
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `--prefix-cache-entries` | `32` → hot-cache capacity, `0` disables all reuse; a bad value silently becomes 1 (main.zig:840) | user | help, usage, engine-prefix-cache; 41 tests, 2 scripts | keep |
+| `--prefix-cache-entries` | `32` → hot-cache capacity, `0` disables all reuse (main.zig:840) | user | help, usage, engine-prefix-cache; 41 tests, 2 scripts | keep |
 | `--prefix-cache-mem` | off → RAM retention with this byte budget, `0` or `off` keeps it off (main.zig:843) | machine | help, usage, engine-prefix-cache; 19 tests, 2 scripts | keep |
 | `--prefix-cache-disk` | min(sized + 2 GiB, 20 GiB, free - 4 GiB) → SSD tier budget, `0` or `off` disables (main.zig:854) | machine | help, usage, engine-prefix-cache; 16 tests, 2 scripts | keep; also the settings-file key `server.prefix_cache_disk_gb`, edited from the web UI (a flag outranks it) |
 | `--ssm-checkpoint-max` | `16` → checkpoint states held in memory per entry (the SSD restore points are never thinned by it), `0` unlimited (main.zig:895) | dev | help; 2 tests, 2 scripts | cut: the scripts pass the default and the cache byte budget already bounds it |
@@ -89,9 +89,9 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `--max-tokens` | `100` offline; serve: default for requests that omit it, else the model's `max_tokens` setting, else the rest of the window (DeepSeek-V4.1: 256,000) (main.zig:649) | operator | help, usage; 9 tests | keep |
-| `--temp` | `0` offline; serve: default temperature before `generation_config.json` (main.zig:653) | operator | help, usage; 2 tests | keep |
-| `--top-p` | model config → serve default for requests that omit it (main.zig:657) | operator | help; 1 test | keep |
+| `--max-tokens` | at least 1; `100` offline; serve: default for requests that omit it, else the model's `max_tokens` setting, else the rest of the window (DeepSeek-V4.1: 256,000) (main.zig:649) | operator | help, usage; 9 tests | keep |
+| `--temp` | at least 0; `0` offline; serve: default temperature before `generation_config.json` (main.zig:653) | operator | help, usage; 2 tests | keep |
+| `--top-p` | above 0, at most 1; model config → serve default for requests that omit it (main.zig:657) | operator | help; 1 test | keep |
 | `--top-k` | model config → serve default for requests that omit it (main.zig:660) | operator | help; 1 test | keep |
 | `--preserve-thinking` | template default → keep every turn's thinking, `on` or `off`; also in settings (main.zig:876) | user | help, usage; 0 tests (settings test) | keep |
 | `--think-penalty` | `0` off → lower overthinking-marker logits inside the reasoning span; also in settings (main.zig:868) | user | help, server-http-apis; 2 tests | keep |
@@ -100,7 +100,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `--log-level` | `info` → error, warn, info or debug; a bad value is silently ignored (main.zig:802) | operator | help; 81 tests | keep |
+| `--log-level` | `info` → error, warn, info or debug (main.zig:802) | operator | help; 81 tests | keep |
 | `--log-file` | `~/.sushi/logs/sushi-<port>.log` → path, or `off` (main.zig:808) | operator | help; 16 tests | keep |
 | `--version` | prints app, MLX, mlx-c and NAX status and exits (main.zig:573) | operator | help; 2 tests, 1 script | keep: the app and `update` parse it |
 | `--guest-manifest` | prints the host-check JSON and exits (main.zig:592) | operator | help; 2 tests | keep: `update` and the release gate run it |
@@ -229,4 +229,4 @@ What would decide each.
 
 Every flag the parsers accept is in `--help` (the subcommand's for `kld`, `update`, `launch`), except `update --relaunch`, which the updater passes to itself to restart the server and which is internal on purpose (a comment in `update.zig` says so). `kld` keeps its value flags in one table (`kld.value_flags`) that a unit test checks against its usage text; `main.zig` parses with an if-chain, so its help is checked by reading, not by a test.
 
-A bad value for a numeric launch flag, an unknown `--log-level`, and `--tool` outside `sushi run` or `--stream` without `--prompt` exit with an error naming the flag and the value, before any model loads. `sushi pull` and `sushi list` reject extra arguments.
+A bad value for a numeric launch flag (`--port` outside 1..65535, `--temp` below 0, `--top-p` outside (0, 1], `--max-tokens` below 1 included), an unknown `--log-level`, an `--api-key-env` naming an unset or empty variable, and `--tool` outside `sushi run` or `--stream` without `--prompt` exit with an error naming the flag and the value, before any model loads. A value-taking flag never takes the next `--flag` as its value: it reports the flag as missing its value. A subcommand's parse failure is a sentence from `cli_error.describe`, never a raw Zig error name. `sushi pull`, `sushi list`, `sushi run`, `sushi launch` and `sushi repack` print their usage on `--help`/`-h` and reject extra arguments.

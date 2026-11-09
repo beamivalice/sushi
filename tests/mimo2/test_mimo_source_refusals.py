@@ -23,7 +23,7 @@ def main():
         ]
         cases = [
             (["--ssd-budget-gb", "100"], "requires expert streaming"),
-            (["--serve", "--host", "127.0.0.1", "--port", "0"], "ExpertStreamingRequired"),
+            (["--serve", "--host", "127.0.0.1", "--port", "18990"], "ExpertStreamingRequired"),
         ]
         for flags, message in cases:
             result = subprocess.run(

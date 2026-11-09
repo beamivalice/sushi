@@ -37,6 +37,8 @@ test {
     _ = @import("arch/packs.zig");
     _ = @import("arch/flags.zig");
     _ = @import("help.zig");
+    _ = @import("flag_value.zig");
+    _ = @import("cli_error.zig");
     _ = @import("http.zig");
     _ = @import("request_parse.zig");
     _ = @import("server_state.zig");

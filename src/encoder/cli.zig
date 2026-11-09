@@ -242,11 +242,25 @@ fn progress(_: ?*anyopaque, line: []const u8) void {
     host.log.info("[convert] {s}\n", .{line});
 }
 
+/// The sentence for an argument error. This module cannot import `src/cli_error.zig`, so it keeps its own.
+fn argMessage(err: ArgError) []const u8 {
+    return switch (err) {
+        error.MissingSubcommand => "a subcommand is required: `sushi convert exl3 ...`",
+        error.UnknownSubcommand => "unknown subcommand: only `exl3` converts (see `sushi convert --help`)",
+        error.UnknownFlag => "unrecognized flag",
+        error.MissingFlagValue => "the flag is missing its value",
+        error.BadFlagValue => "the flag has a value it cannot take",
+        error.MissingModel => "--model <source checkpoint folder> is required",
+        error.MissingOut => "--out <new pack folder> is required",
+        error.CalibFileMissing => "the --calib file does not exist",
+    };
+}
+
 pub fn cmdConvert(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var diag = Diag{};
     const opts = parseArgs(args, &diag) catch |err| {
-        if (diag.flag.len != 0) printOut("sushi convert: {s} ({s})\n\n{s}", .{ @errorName(err), diag.flag, USAGE }) else printOut("sushi convert: {s}\n\n{s}", .{ @errorName(err), USAGE });
-        return err;
+        if (diag.flag.len != 0) printOut("sushi convert: {s}: {s}\n\n{s}", .{ diag.flag, argMessage(err), USAGE }) else printOut("sushi convert: {s}\n\n{s}", .{ argMessage(err), USAGE });
+        std.process.exit(1);
     };
     if (opts.help) {
         printOut("{s}", .{USAGE});
@@ -254,12 +268,12 @@ pub fn cmdConvert(allocator: std.mem.Allocator, io: std.Io, args: []const []cons
     }
     const cwd = std.Io.Dir.cwd();
     if (opts.calib.len != 0) cwd.access(io, opts.calib, .{}) catch {
-        printOut("sushi convert: CalibFileMissing ({s})\n", .{opts.calib});
-        return error.CalibFileMissing;
+        printOut("sushi convert: --calib {s}: {s}\n", .{ opts.calib, argMessage(error.CalibFileMissing) });
+        std.process.exit(1);
     };
     var model_dir = cwd.openDir(io, opts.model, .{ .iterate = true }) catch |err| {
-        printOut("sushi convert: cannot open --model {s}: {s}\n", .{ opts.model, @errorName(err) });
-        return err;
+        printOut("sushi convert: cannot open --model {s}: {s}\n", .{ opts.model, if (err == error.FileNotFound) "no such folder" else @errorName(err) });
+        std.process.exit(1);
     };
     defer model_dir.close(io);
     const arch = source.identifySourceDir(allocator, io, model_dir) catch |err| {

@@ -17,6 +17,7 @@ const hidden_capture = @import("hidden_capture.zig");
 const fp8_block = @import("fp8_block.zig");
 const offline = @import("arch/offline.zig");
 const fixture_mod = @import("kld_fixture.zig");
+const cli_error = @import("cli_error.zig");
 const testing = std.testing;
 
 pub const Command = enum { capture, compare };
@@ -890,11 +891,28 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
     }
 }
 
+/// What a bad --fixture (compare) or --prompts (capture) says, found before the model loads; null when both read.
+fn inputRefusal(allocator: std.mem.Allocator, io: std.Io, opts: Options, buf: []u8) ?[]const u8 {
+    switch (opts.command) {
+        .compare => {
+            var base = fixture_mod.readBaseline(allocator, io, opts.fixture) catch |err|
+                return std.fmt.bufPrint(buf, "--fixture {s}: {s}", .{ opts.fixture, cli_error.describe(err) orelse @errorName(err) }) catch "--fixture: unreadable";
+            base.deinit();
+        },
+        .capture => {
+            var prompts = fixture_mod.loadPrompts(allocator, io, opts.prompts, opts.limit) catch |err|
+                return std.fmt.bufPrint(buf, "--prompts {s}: {s}", .{ opts.prompts, cli_error.describe(err) orelse @errorName(err) }) catch "--prompts: unreadable";
+            prompts.deinit();
+        },
+    }
+    return null;
+}
+
 pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var out: Out = .{};
     var opts = parseArgs(args) catch |err| {
-        out.print("sushi kld: {s}\n\n{s}", .{ @errorName(err), USAGE });
-        return err;
+        out.print("sushi kld: {s}\n\n{s}", .{ cli_error.describe(err) orelse @errorName(err), USAGE });
+        std.process.exit(1);
     };
     if (opts.help) {
         out.print("{s}", .{USAGE});
@@ -907,6 +925,11 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     if (opts.command == .capture) if (@import("imatrix.zig").envPath()) |path| {
         opts.imatrix_out = path;
     };
+    var refusal_buf: [1024]u8 = undefined;
+    if (inputRefusal(allocator, io, opts, &refusal_buf)) |why| {
+        log.err("sushi kld: {s}\n", .{why});
+        std.process.exit(1);
+    }
     if (try offline.tryRun(allocator, io, opts, &out)) return;
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
@@ -1072,4 +1095,18 @@ test "kld records the budget that shaped the load, never the raw flag" {
 
 test {
     _ = offline;
+}
+
+test "kld: a missing fixture or prompt source is found before any model loads" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [1024]u8 = undefined;
+    const compare = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/no/such/fixture" });
+    const why = inputRefusal(testing.allocator, io, compare, &buf).?;
+    try testing.expect(std.mem.indexOf(u8, why, "--fixture /no/such/fixture") != null);
+    try testing.expect(std.mem.indexOf(u8, why, "baseline.json") != null);
+    const capture = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/no/such/prompts", "--out", "/o" });
+    const why_prompts = inputRefusal(testing.allocator, io, capture, &buf).?;
+    try testing.expect(std.mem.indexOf(u8, why_prompts, "--prompts /no/such/prompts") != null);
+    const bundled = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "standard4", "--out", "/o" });
+    try testing.expect(inputRefusal(testing.allocator, io, bundled, &buf) == null);
 }

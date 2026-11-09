@@ -278,19 +278,21 @@ pub const Conn = struct {
     }
 
     const CLOSE_WAIT_MS: i64 = 5 * 60 * 1000;
+    /// How long a length-framed response waits for the client to close first: a client that sent bytes we never
+    /// read (a refused body, a reused socket) would otherwise get a reset that can destroy the response.
+    const LINGER_MS: i64 = 250;
 
     /// Keep close-delimited responses owned until the reader closes: orphaned FIN_WAIT_2
     /// sockets can expire with a reset while a slow client is still consuming the body.
     pub fn close(c: *Conn) void {
         c.flush() catch {};
-        if (c.length_framed) return c.stream.close(c.io);
         const fd = c.stream.socket.handle;
         _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
-        const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
+        const deadline = nowMsMonotonic(c.io) + if (c.length_framed) LINGER_MS else CLOSE_WAIT_MS;
         var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
         var sink: [256]u8 = undefined;
         while (nowMsMonotonic(c.io) < deadline and !server_state.shutdown_requested.load(.acquire)) {
-            const n = std.posix.poll(&fds, 500) catch break;
+            const n = std.posix.poll(&fds, @intCast(std.math.clamp(deadline - nowMsMonotonic(c.io), 0, 500))) catch break;
             if (n == 0) continue;
             // EOF or reset ends the wait; discard any pipelined request bytes.
             if (std.c.recv(fd, &sink, sink.len, std.posix.MSG.DONTWAIT) <= 0) break;
@@ -514,7 +516,134 @@ const RawRequest = struct {
     header_end: usize,
 };
 
-/// Reads one request: the head (up to 16 KB), then its `Content-Length` body. Null when no
+/// Decodes a `Transfer-Encoding: chunked` body one piece at a time, however the bytes arrive.
+const ChunkDecoder = struct {
+    state: enum { size, data, data_end, trailer, done } = .size,
+    remaining: usize = 0,
+    line: [80]u8 = undefined,
+    line_len: usize = 0,
+    trailer_bytes: usize = 0,
+
+    const max_trailer_bytes = 8 * 1024;
+
+    /// Appends the decoded bytes of `input` to `out` (never past `cap`); returns how much of `input` it used.
+    fn feed(d: *ChunkDecoder, a: std.mem.Allocator, out: *std.ArrayList(u8), input: []const u8, cap: usize) error{ BadChunk, TooLarge, OutOfMemory }!usize {
+        var i: usize = 0;
+        while (i < input.len and d.state != .done) {
+            if (d.state == .data) {
+                const n = @min(d.remaining, input.len - i);
+                if (out.items.len +| n > cap) return error.TooLarge;
+                try out.appendSlice(a, input[i..][0..n]);
+                i += n;
+                d.remaining -= n;
+                if (d.remaining == 0) d.state = .data_end;
+                continue;
+            }
+            const b = input[i];
+            i += 1;
+            if (b == '\r') continue;
+            if (b != '\n') {
+                switch (d.state) {
+                    .size => {
+                        if (d.line_len == d.line.len) return error.BadChunk;
+                        d.line[d.line_len] = b;
+                        d.line_len += 1;
+                    },
+                    .trailer => {
+                        d.trailer_bytes += 1;
+                        if (d.trailer_bytes > max_trailer_bytes) return error.BadChunk;
+                        d.line_len += 1;
+                    },
+                    else => return error.BadChunk,
+                }
+                continue;
+            }
+            switch (d.state) {
+                .size => {
+                    const text = d.line[0..d.line_len];
+                    const hex = std.mem.trim(u8, text[0 .. std.mem.indexOfScalar(u8, text, ';') orelse text.len], " \t");
+                    const size = std.fmt.parseInt(usize, hex, 16) catch return error.BadChunk;
+                    d.line_len = 0;
+                    d.remaining = size;
+                    d.state = if (size == 0) .trailer else .data;
+                },
+                .data_end => d.state = .size,
+                .trailer => {
+                    if (d.line_len == 0) d.state = .done;
+                    d.line_len = 0;
+                },
+                else => unreachable,
+            }
+        }
+        return i;
+    }
+};
+
+fn endsWithChunked(transfer_encoding: []const u8) bool {
+    const last = if (std.mem.lastIndexOfScalar(u8, transfer_encoding, ',')) |at| transfer_encoding[at + 1 ..] else transfer_encoding;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, last, " \t"), "chunked");
+}
+
+/// Answers `Expect: 100-continue` so a client holding its body back sends it; any other expectation is a 417.
+/// False when the request was refused.
+fn answerExpect(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !bool {
+    const expect = findHeaderValueCI(head, "expect") orelse return true;
+    if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
+        try stream.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+        return true;
+    }
+    try sendErrorResponse(allocator, stream, "417 Expectation Failed", "invalid_request_error", "Only Expect: 100-continue is supported", 417);
+    return false;
+}
+
+/// Reads a chunked body after `head` (the request line and headers through the blank line); `leftover` is what
+/// already arrived past it. The result holds the head followed by the decoded body.
+fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64, head: []const u8, leftover: []const u8) !?RawRequest {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, head);
+    var decoder: ChunkDecoder = .{};
+    var buf: [8 * 1024]u8 = undefined;
+    var pending = leftover;
+    var asked = false;
+    while (true) {
+        _ = decoder.feed(allocator, &out, pending, max_request_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.TooLarge => {
+                try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", "Request body too large", 413);
+                out.deinit(allocator);
+                return null;
+            },
+            error.BadChunk => {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid chunked request body", 400);
+                out.deinit(allocator);
+                return null;
+            },
+        };
+        if (decoder.state == .done) break;
+        if (!asked) {
+            asked = true;
+            if (!try answerExpect(allocator, stream, head)) {
+                out.deinit(allocator);
+                return null;
+            }
+        }
+        if (!stream.awaitReadable(limit_ms)) {
+            out.deinit(allocator);
+            return null;
+        }
+        const n = try stream.read(&buf);
+        if (n == 0) {
+            out.deinit(allocator);
+            return null;
+        }
+        pending = buf[0..n];
+    }
+    const owned = try out.toOwnedSlice(allocator);
+    return .{ .buf = owned, .len = owned.len, .header_end = head.len };
+}
+
+/// Reads one request: the head (up to 16 KB), then its `Content-Length` or chunked body. Null when no
 /// complete head arrived, the client stalled, or the body is over the cap (the 413 is already sent).
 pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64) !?RawRequest {
     const head_deadline = nowMsMonotonic(stream.io) + limit_ms;
@@ -540,6 +669,14 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
 
     if (header_end_pos == 0) return null;
 
+    if (findHeaderValueCI(hdr_buf[0..header_end_pos], "transfer-encoding")) |coding| {
+        if (!endsWithChunked(coding)) {
+            try sendErrorResponse(allocator, stream, "501 Not Implemented", "invalid_request_error", "Only Transfer-Encoding: chunked is supported", 501);
+            return null;
+        }
+        return readChunkedRequest(allocator, stream, limit_ms, hdr_buf[0..header_end_pos], hdr_buf[header_end_pos..total_read]);
+    }
+
     // Phase 2: Allocate buffer for full request and read remaining body
     const cl = content_length orelse 0;
     const total_size = header_end_pos +| cl;
@@ -554,6 +691,10 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
     const buf = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buf);
     total_read = seedRequestBuf(buf, hdr_buf[0..total_read]);
+    if (total_read < total_size and !try answerExpect(allocator, stream, hdr_buf[0..header_end_pos])) {
+        allocator.free(buf);
+        return null;
+    }
 
     while (total_read < total_size) {
         if (!stream.awaitReadable(limit_ms)) {
@@ -776,6 +917,12 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
 /// One raw request through `handleConnection` from a loopback peer, over a
 /// socketpair against an empty registry; returns the raw response (caller frees).
 pub fn serveOneForTest(request: []const u8) ![]u8 {
+    return serveSplitForTest(request, "");
+}
+
+/// `serveOneForTest` with the request sent in two parts: `rest` goes out once `head` has been answered with
+/// `100 Continue` (when it asks for one), as a client holding its body back does.
+pub fn serveSplitForTest(head: []const u8, rest: []const u8) ![]u8 {
     const a = std.testing.allocator;
     const reg = try ModelRegistry.init(a, std.testing.io, null, 1, 0, null);
     defer reg.deinit();
@@ -786,10 +933,13 @@ pub fn serveOneForTest(request: []const u8) ![]u8 {
 
     var sv: [2]std.posix.fd_t = undefined;
     if (std.c.socketpair(1, 1, 0, &sv) != 0) return error.SocketPairFailed; // AF_UNIX, SOCK_STREAM
-    defer _ = std.c.close(sv[1]);
+    var client_open = true;
+    defer if (client_open) {
+        _ = std.c.close(sv[1]);
+    };
     var conn: Conn = undefined;
     Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } }, std.testing.io);
-    if (std.c.write(sv[1], request.ptr, request.len) != @as(isize, @intCast(request.len))) return error.WriteFailed;
+    if (std.c.write(sv[1], head.ptr, head.len) != @as(isize, @intCast(head.len))) return error.WriteFailed;
     const server = try std.Thread.spawn(.{}, struct {
         fn run(c: *Conn) void {
             handleConnection(std.testing.allocator, c) catch {};
@@ -800,11 +950,22 @@ pub fn serveOneForTest(request: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(a);
     var buf: [16 * 1024]u8 = undefined;
+    const interim = "HTTP/1.1 100 Continue\r\n\r\n";
+    while (rest.len > 0) {
+        const n = std.c.read(sv[1], &buf, buf.len);
+        if (n <= 0) break;
+        try out.appendSlice(a, buf[0..@intCast(n)]);
+        if (std.mem.indexOf(u8, out.items, interim) != null or std.mem.startsWith(u8, out.items, "HTTP/1.1 4")) break;
+    }
+    if (rest.len > 0 and std.c.write(sv[1], rest.ptr, rest.len) != @as(isize, @intCast(rest.len))) return error.WriteFailed;
     while (true) {
         const n = std.c.read(sv[1], &buf, buf.len);
         if (n <= 0) break;
         try out.appendSlice(a, buf[0..@intCast(n)]);
     }
+    // The client closes first, as a finished one does, so the server's close need not linger.
+    _ = std.c.close(sv[1]);
+    client_open = false;
     server.join();
     return out.toOwnedSlice(a);
 }
@@ -1467,10 +1628,10 @@ fn expectCloseWaitsForPeer(close_delimited: bool, stop_server: bool) !void {
     }
     try testing.expect(std.mem.endsWith(u8, buf[0..got], tail));
 
-    // ... and only a close-delimited body keeps the server's end open, so the kernel cannot
-    // reset a lagging reader.
+    // ... a Content-Length body lingers only briefly, and only a close-delimited body keeps the server's end
+    // open, so the kernel cannot reset a lagging reader.
     var waited: u32 = 0;
-    while (!closed.load(.acquire) and waited < 50) : (waited += 1) {
+    while (!closed.load(.acquire) and waited < 2 * Conn.LINGER_MS) : (waited += 1) {
         std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch {};
     }
     try testing.expectEqual(!close_delimited, closed.load(.acquire));
@@ -1494,7 +1655,7 @@ test "Conn.close keeps the socket until the peer hangs up, after a close-delimit
     try expectCloseWaitsForPeer(true, false);
 }
 
-test "Conn.close does not wait for the peer after a Content-Length response" {
+test "Conn.close lingers only briefly for the peer after a Content-Length response" {
     try expectCloseWaitsForPeer(false, false);
 }
 
@@ -1965,4 +2126,82 @@ test "the debug log redacts api_key and key query values and keeps the rest" {
     try std.testing.expectEqualStrings("/m?api_key=***&key=***", redactQueryKeys(&buf, "/m?api_key=x&key=y"));
     try std.testing.expectEqualStrings("/m?apikey=1&flag", redactQueryKeys(&buf, "/m?apikey=1&flag"));
     try std.testing.expectEqualStrings("/m?", redactQueryKeys(&buf, "/m?" ++ "a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&" ++ "key=zzzz"));
+}
+
+test "chunked decoder: any split of the bytes decodes the same body" {
+    const t = std.testing;
+    const wire = "5\r\nhello\r\n6;ext=1\r\n world\r\nA\r\n0123456789\r\n0\r\nX-Trailer: 1\r\n\r\n";
+    var step: usize = 1;
+    while (step <= wire.len) : (step += 1) {
+        var d: ChunkDecoder = .{};
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(t.allocator);
+        var at: usize = 0;
+        while (at < wire.len) : (at += step) _ = try d.feed(t.allocator, &out, wire[at..@min(wire.len, at + step)], 1024);
+        try t.expectEqualStrings("hello world0123456789", out.items);
+        try t.expect(d.state == .done);
+    }
+}
+
+test "chunked decoder: a bad size, an over-cap body and a bare line are refused" {
+    const t = std.testing;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+    var bad: ChunkDecoder = .{};
+    try t.expectError(error.BadChunk, bad.feed(t.allocator, &out, "zz\r\nab\r\n", 1024));
+    var big: ChunkDecoder = .{};
+    try t.expectError(error.TooLarge, big.feed(t.allocator, &out, "20\r\n" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "\r\n", 8));
+    var stray: ChunkDecoder = .{};
+    try t.expectError(error.BadChunk, stray.feed(t.allocator, &out, "1\r\nab\r\n", 1024));
+}
+
+test "request framing: a chunked body is decoded and routed like its Content-Length twin" {
+    const t = std.testing;
+    const chunked = "POST /v1/downloads HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "6\r\n{\"repo\r\n8\r\n\":\"other\r\n7\r\n/Pack\"}\r\n0\r\n\r\n";
+    const response = try serveOneForTest(chunked);
+    defer t.allocator.free(response);
+    try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 "));
+    try t.expect(std.mem.indexOf(u8, responseBody(response), "org beamster only") != null);
+
+    const gzip = try serveOneForTest("POST /v1/downloads HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n");
+    defer t.allocator.free(gzip);
+    try t.expect(std.mem.startsWith(u8, gzip, "HTTP/1.1 501 "));
+    const garbled = try serveOneForTest("POST /v1/downloads HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nnot-hex\r\n");
+    defer t.allocator.free(garbled);
+    try t.expect(std.mem.startsWith(u8, garbled, "HTTP/1.1 400 "));
+}
+
+test "request framing: Expect 100-continue is answered before the body is read" {
+    const t = std.testing;
+    const body = "{\"repo\":\"other/Pack\"}";
+    const sized = try serveSplitForTest("POST /v1/downloads HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 21\r\n\r\n", body);
+    defer t.allocator.free(sized);
+    try t.expect(std.mem.startsWith(u8, sized, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 400 "));
+    try t.expect(std.mem.indexOf(u8, responseBody(sized["HTTP/1.1 100 Continue\r\n\r\n".len..]), "org beamster only") != null);
+
+    const chunked = try serveSplitForTest("POST /v1/downloads HTTP/1.1\r\nexpect: 100-Continue\r\nTransfer-Encoding: chunked\r\n\r\n", "15\r\n" ++ body ++ "\r\n0\r\n\r\n");
+    defer t.allocator.free(chunked);
+    try t.expect(std.mem.startsWith(u8, chunked, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 400 "));
+
+    const other = try serveSplitForTest("POST /v1/downloads HTTP/1.1\r\nExpect: 200-ok\r\nContent-Length: 21\r\n\r\n", body);
+    defer t.allocator.free(other);
+    try t.expect(std.mem.startsWith(u8, other, "HTTP/1.1 417 "));
+}
+
+test "every response says Connection: close, because the server closes after one request" {
+    const t = std.testing;
+    for ([_][]const u8{
+        "GET /health HTTP/1.1\r\n\r\n",
+        "GET /v1/models HTTP/1.1\r\n\r\n",
+        "GET /nope HTTP/1.1\r\n\r\n",
+        "POST /v1/downloads HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+        "OPTIONS /v1/models HTTP/1.1\r\n\r\n",
+        "POST /v1/downloads HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+    }) |request| {
+        const response = try serveOneForTest(request);
+        defer t.allocator.free(response);
+        const head = response[0 .. std.mem.indexOf(u8, response, "\r\n\r\n") orelse response.len];
+        try t.expect(std.mem.indexOf(u8, head, "\r\nConnection: close") != null);
+    }
 }

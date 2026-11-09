@@ -5,6 +5,7 @@
 const std = @import("std");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
+const cli_error = @import("cli_error.zig");
 const gpu_clock = @import("gpu_clock.zig");
 const box = @import("bench_box.zig");
 const completions = @import("completions.zig");
@@ -1122,8 +1123,8 @@ pub fn start(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !Laun
     var keep_arena = false;
     defer if (!keep_arena) arena_state.deinit();
     const opts = parseArgs(arena_state.allocator(), args) catch |err| {
-        log.err("sushi bench: {s}{s}{s}\n\n{s}", .{ @errorName(err), if (rejected_flag.len > 0) " " else "", rejected_flag, USAGE });
-        return err;
+        log.err("sushi bench: {s}{s}{s}\n\n{s}", .{ rejected_flag, if (rejected_flag.len > 0) ": " else "", cli_error.describe(err) orelse @errorName(err), USAGE });
+        std.process.exit(1);
     };
     if (opts.help) {
         try printOut(io, USAGE);

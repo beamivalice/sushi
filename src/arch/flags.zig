@@ -19,6 +19,7 @@ const kv_quant = @import("../kv_quant.zig");
 const registry = @import("registry.zig");
 const arch_config = @import("config.zig");
 const admission = @import("admission.zig");
+const flag_value = @import("../flag_value.zig");
 
 /// The launch flags a load can be refused for, as the process was started.
 pub const LaunchFlagUse = struct {
@@ -80,7 +81,7 @@ pub const Parsed = union(enum) {
 pub fn parseOption(args: []const []const u8, i: *usize) ?Parsed {
     inline for (options) |o| {
         if (std.mem.eql(u8, args[i.*], o.name)) {
-            if (o.takes_value and i.* + 1 >= args.len) return null;
+            if (o.takes_value and !flag_value.follows(args, i.*)) return null;
             const value: []const u8 = if (o.takes_value) args[i.* + 1] else "";
             if (o.takes_value) i.* += 1;
             if (o.apply(value)) return .applied;

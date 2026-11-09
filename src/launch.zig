@@ -15,6 +15,7 @@ const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
 const effort_mod = @import("effort.zig");
 const fx = @import("launch_fixtures_test.zig");
+const flag_value = @import("flag_value.zig");
 
 pub const Budget = struct { context: u64, output: u64 };
 
@@ -987,6 +988,7 @@ const LaunchArgs = struct {
 
 fn parseLaunchArgs(args: []const []const u8) !LaunchArgs {
     if (args.len == 0) return error.Usage;
+    if (flag_value.isHelp(args[0])) return error.Help;
     const kind = AgentKind.fromName(args[0]) orelse return error.UnknownAgent;
     var out = LaunchArgs{ .kind = kind };
     var i: usize = 1;
@@ -1006,7 +1008,7 @@ fn parseLaunchArgs(args: []const []const u8) !LaunchArgs {
         } else if (std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i >= args.len) return error.Usage;
-            out.port = std.fmt.parseInt(u16, args[i], 10) catch return error.Usage;
+            out.port = flag_value.parsePort(args[i]) orelse return error.Usage;
         } else if (std.mem.eql(u8, arg, "--think")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -1015,8 +1017,8 @@ fn parseLaunchArgs(args: []const []const u8) !LaunchArgs {
             out.persist = true;
         } else if (std.mem.eql(u8, arg, "--print")) {
             out.print_only = true;
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            return error.Usage;
+        } else if (flag_value.isHelp(arg)) {
+            return error.Help;
         } else {
             return error.Usage;
         }
@@ -1025,8 +1027,7 @@ fn parseLaunchArgs(args: []const []const u8) !LaunchArgs {
     return out;
 }
 
-fn printLaunchUsage() void {
-    log.err(
+const launch_usage = std.fmt.comptimePrint(
         \\usage: sushi launch <agent> [options] [-- <extra agent args>]
         \\
         \\agents: {s}
@@ -1046,15 +1047,21 @@ fn printLaunchUsage() void {
         \\  sushi launch codex -- resume
         \\
     , .{AgentKind.names});
-}
 
 pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const parsed = parseLaunchArgs(args) catch |err| {
+        if (err == error.Help) {
+            var stdout_buf: [2048]u8 = undefined;
+            var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
+            stdout_w.interface.writeAll(launch_usage) catch {};
+            stdout_w.interface.flush() catch {};
+            return;
+        }
         switch (err) {
             error.UnknownAgent => log.err("unknown agent '{s}' — supported: {s}\n", .{ args[0], AgentKind.names }),
             else => {},
         }
-        printLaunchUsage();
+        log.err("{s}", .{launch_usage});
         std.process.exit(1);
     };
 
@@ -1063,7 +1070,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
     if (!serverUp(allocator, io, base_url)) {
         log.err("no sushi server at {s}.\n", .{base_url});
-        log.err("start one first:  sushi serve   (or: sushi run <model>)\n", .{});
+        log.err("start one first:  sushi serve   (or: sushi run <model>), or point launch at another with --port <n> or --url <base>\n", .{});
         std.process.exit(1);
     }
 
@@ -1889,4 +1896,13 @@ test "launch args: dsh is a named agent and takes no opencode-only flag" {
     try t.expectEqual(AgentKind.dsh, AgentKind.fromName("dsh").?);
     try t.expect(std.mem.indexOf(u8, AgentKind.names, "dsh") != null);
     try t.expectError(error.Usage, parseLaunchArgs(&.{ "dsh", "--think", "high" }));
+}
+
+test "launch args: -h anywhere before -- asks for usage, and a port is 1..65535" {
+    try t.expectError(error.Help, parseLaunchArgs(&.{"-h"}));
+    try t.expectError(error.Help, parseLaunchArgs(&.{"--help"}));
+    try t.expectError(error.Help, parseLaunchArgs(&.{ "codex", "-h" }));
+    try t.expectEqual(@as(usize, 2), (try parseLaunchArgs(&.{ "codex", "--", "-h", "--help" })).extras.len);
+    try t.expectError(error.Usage, parseLaunchArgs(&.{ "codex", "--port", "0" }));
+    try t.expectError(error.Usage, parseLaunchArgs(&.{ "codex", "--port", "70000" }));
 }

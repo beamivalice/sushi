@@ -33,6 +33,8 @@ const model_settings_mod = @import("model_settings.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
 const help = @import("help.zig");
+const flag_value = @import("flag_value.zig");
+const cli_error = @import("cli_error.zig");
 const arch_flags = @import("arch/flags.zig");
 const arch_packs = @import("arch/packs.zig");
 const bench_mod = @import("bench.zig");
@@ -87,11 +89,15 @@ const PromptClient = struct {
 };
 var prompt_client: ?*PromptClient = null;
 
-fn printUsage(io: std.Io) void {
+fn printText(io: std.Io, text: []const u8) void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
-    stdout_w.interface.writeAll(help.text) catch {};
+    stdout_w.interface.writeAll(text) catch {};
     stdout_w.interface.flush() catch {};
+}
+
+fn printUsage(io: std.Io) void {
+    printText(io, help.text);
 }
 
 /// False for the commands and flags that never touch MLX, so they do not wake Metal.
@@ -109,7 +115,14 @@ fn commandUsesGpu(proc_args: std.process.Args) bool {
     return true;
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    runCli(init) catch |err| {
+        if (cli_error.describe(err)) |text| log.err("{s}\n", .{text});
+        std.process.exit(1);
+    };
+}
+
+fn runCli(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     metrics_history.process.markStarted(io, io_util.nowMs(io));
@@ -163,7 +176,17 @@ pub fn main(init: std.process.Init) !void {
     var run_opts: cli_mod.ReplOptions = .{};
     if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
         const cmd = args[1];
-        if (std.mem.eql(u8, cmd, "pull")) {
+        const asks_help = args.len > 2 and flag_value.isHelp(args[2]);
+        if (asks_help and std.mem.eql(u8, cmd, "pull")) {
+            printText(io, help.pull_usage);
+            return;
+        } else if (asks_help and std.mem.eql(u8, cmd, "list")) {
+            printText(io, help.list_usage);
+            return;
+        } else if (asks_help and (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "serve"))) {
+            printUsage(io);
+            return;
+        } else if (std.mem.eql(u8, cmd, "pull")) {
             const model = cli_mod.parsePullArgs(args[2..]) catch |err| {
                 switch (err) {
                     error.MissingModel => log.err("usage: sushi pull <model>\n", .{}),
@@ -323,13 +346,16 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             printUsage(io);
             return;
-        } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--model") and flag_value.follows(args, i)) {
             i += 1;
             model_dir = cli_mod.resolveRelativeDir(allocator, io, args[i]) orelse args[i];
-        } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--port") and flag_value.follows(args, i)) {
             i += 1;
-            port_flag = flagInt(u16, "--port", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
+            port_flag = flag_value.parsePort(args[i]) orelse {
+                log.err("--port: expected an integer in 1..65535; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--host") and flag_value.follows(args, i)) {
             i += 1;
             host_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--serve")) {
@@ -342,14 +368,14 @@ pub fn main(init: std.process.Init) !void {
             };
             run_opts.think = f.think;
             if (f.consumed) i += 1;
-        } else if (std.mem.eql(u8, args[i], "--tool") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--tool") and flag_value.follows(args, i)) {
             i += 1;
             run_opts.tools = cli_mod.parseToolSwitch(args[i]) orelse {
                 log.err("--tool takes on or off, not '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
             tool_flag_given = true;
-        } else if (std.mem.eql(u8, args[i], "--edit") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--edit") and flag_value.follows(args, i)) {
             i += 1;
             run_opts.edit = cli_mod.parseToolSwitch(args[i]) orelse {
                 log.err("--edit takes on or off, not '{s}'\n", .{args[i]});
@@ -358,26 +384,32 @@ pub fn main(init: std.process.Init) !void {
             server_state.g_web_edit = run_opts.edit;
         } else if (std.mem.eql(u8, args[i], "--stream")) {
             stream_mode = true;
-        } else if (cli_mod.isPromptFlag(args[i]) and i + 1 < args.len) {
+        } else if (cli_mod.isPromptFlag(args[i]) and flag_value.follows(args, i)) {
             i += 1;
             prompt = args[i];
-        } else if (std.mem.eql(u8, args[i], "--max-tokens") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--max-tokens") and flag_value.follows(args, i)) {
             i += 1;
-            max_tokens = flagInt(u32, "--max-tokens", args[i], 0);
+            max_tokens = flagInt(u32, "--max-tokens", args[i], 1);
             serve_default_max_tokens = max_tokens;
-        } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--temp") and flag_value.follows(args, i)) {
             i += 1;
-            temp_flag = flagFloat("--temp", args[i]);
-        } else if (std.mem.eql(u8, args[i], "--top-p") and i + 1 < args.len) {
+            temp_flag = flag_value.parseTemperature(args[i]) orelse {
+                log.err("--temp: expected a number of at least 0; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--top-p") and flag_value.follows(args, i)) {
             i += 1;
-            top_p_flag = flagFloat("--top-p", args[i]);
-        } else if (std.mem.eql(u8, args[i], "--top-k") and i + 1 < args.len) {
+            top_p_flag = flag_value.parseTopP(args[i]) orelse {
+                log.err("--top-p: expected a number above 0 and at most 1; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--top-k") and flag_value.follows(args, i)) {
             i += 1;
             top_k_flag = flagInt(u32, "--top-k", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--ctx-size") and flag_value.follows(args, i)) {
             i += 1;
             ctx_size = flagInt(u32, "--ctx-size", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--config-overrides") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--config-overrides") and flag_value.follows(args, i)) {
             // vLLM's `--hf-overrides` analogue. Applied the moment the flag is
             // seen, so no config.json is ever parsed without it — the loaded
             // model, the registry stubs and `/v1/models` all agree on the
@@ -390,7 +422,7 @@ pub fn main(init: std.process.Init) !void {
             }
             model_mod.setConfigOverrides(args[i]);
             log.info("[args] config-overrides: {s}\n", .{args[i]});
-        } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--timeout") and flag_value.follows(args, i)) {
             i += 1;
             timeout = flagInt(u32, "--timeout", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
@@ -407,37 +439,30 @@ pub fn main(init: std.process.Init) !void {
             server_state.g_tool_autocorrect = false;
         } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
             generate_mod.mtp_lookup_disabled = true;
-        } else if (std.mem.eql(u8, args[i], "--drafter") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--drafter") and flag_value.follows(args, i)) {
             i += 1;
             drafter_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--metrics")) {
             metrics_enabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-metrics")) {
             metrics_enabled = false;
-        } else if (std.mem.eql(u8, args[i], "--api-key") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--api-key") and flag_value.follows(args, i)) {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
             if (args[i].len > 0) server_state.g_api_key = args[i];
         } else if (std.mem.eql(u8, args[i], "--api-key-strict")) {
             server_state.g_api_key_strict = true;
-        } else if (std.mem.eql(u8, args[i], "--api-key-env") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--api-key-env") and flag_value.follows(args, i)) {
             i += 1;
-            // The key read from a named environment variable instead of argv:
-            // the process table is world-readable, argv with it. Same
-            // borrow-for-the-process lifetime as --api-key; empty/unset
-            // leaves the server open, exactly like an empty --api-key.
-            // getenv needs a null-terminated name; args[i] is a plain
-            // slice, so print a `:0` copy (process-lifetime, like the argv
-            // borrow --api-key uses). std.c.getenv is how every other env
-            // read in this codebase works. An unset var leaves the server
-            // open, exactly like an empty --api-key.
+            // The key comes from a named environment variable so argv does not carry it. getenv needs a
+            // null-terminated name; the copy lives for the process, like the argv borrow --api-key uses.
             const name = std.fmt.allocPrintSentinel(allocator, "{s}", .{args[i]}, 0) catch null;
-            if (name) |name_z| {
-                if (std.c.getenv(name_z.ptr)) |value| {
-                    const key = std.mem.span(value);
-                    if (key.len > 0) server_state.g_api_key = key;
-                }
+            const key: []const u8 = if (name) |name_z| (if (std.c.getenv(name_z.ptr)) |value| std.mem.span(value) else "") else "";
+            if (key.len == 0) {
+                log.err("--api-key-env: environment variable '{s}' is unset or empty, so the server would start without authentication\n", .{args[i]});
+                std.process.exit(1);
             }
+            server_state.g_api_key = key;
         } else if (std.mem.eql(u8, args[i], "--drafter-min-depth") or std.mem.eql(u8, args[i], "--drafter-max-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--drafter-min-depth");
             i += 1;
@@ -462,18 +487,18 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             if (is_min) depth_bounds.active.min = n else depth_bounds.active.max = n;
-        } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--mtp-typical") and flag_value.follows(args, i)) {
             i += 1;
             mtp_typical_raw = args[i];
-        } else if (std.mem.eql(u8, args[i], "--mtp-tokenv3") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--mtp-tokenv3") and flag_value.follows(args, i)) {
             i += 1;
             mtp_tokenv3_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--mtp-greedy-tail")) {
             settings_resolve.launch.mtp_greedy_tail = true;
-        } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and flag_value.follows(args, i)) {
             i += 1;
             generate_mod.max_mtp_ctx = flagInt(u32, "--max-mtp-ctx", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--log-level") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--log-level") and flag_value.follows(args, i)) {
             i += 1;
             const level = log.Level.fromString(args[i]) orelse {
                 log.err("--log-level: expected error, warn, info or debug; got '{s}'\n", .{args[i]});
@@ -481,10 +506,10 @@ pub fn main(init: std.process.Init) !void {
             };
             log.setLevel(level);
             log_level_flag = level;
-        } else if (std.mem.eql(u8, args[i], "--log-file") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--log-file") and flag_value.follows(args, i)) {
             i += 1;
             log_file_arg = args[i];
-        } else if (std.mem.eql(u8, args[i], "--parent-pid") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--parent-pid") and flag_value.follows(args, i)) {
             i += 1;
             parent_pid = parent_watch.parseArg(args[i]) catch {
                 log.err("--parent-pid: expected a process id above 1; got '{s}'\n", .{args[i]});
@@ -493,14 +518,14 @@ pub fn main(init: std.process.Init) !void {
             server_state.host_managed = true;
         } else if (std.mem.eql(u8, args[i], "--no-update-check")) {
             no_update_check = true;
-        } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and flag_value.follows(args, i)) {
             i += 1;
             // `explicit` disables the machine-sized pin, so only a real width earns it.
             settings_resolve.prefill_chunk = .{ .value = flagInt(usize, "--prefill-chunk", args[i], 1), .source = .flag };
-        } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and flag_value.follows(args, i)) {
             i += 1;
             server_state.prefix_cache_capacity = flagInt(u32, "--prefix-cache-entries", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and flag_value.follows(args, i)) {
             // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
             // bare numbers (bytes), a suffix of `MB`/`GB`/`KB` (case-
             // insensitive); `0`/`off` keeps RAM retention off.
@@ -511,7 +536,7 @@ pub fn main(init: std.process.Init) !void {
             };
             server_state.prefix_cache_mem_source = .flag;
             server_state.prefix_cache_ram_enabled = server_state.ramRetentionForMemArg(server_state.prefix_cache_mem_bytes);
-        } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and flag_value.follows(args, i)) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts
             // and RAM evictions instead of recomputed. Byte budget with the
@@ -522,7 +547,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             server_state.prefix_cache_disk_source = .flag;
-        } else if (std.mem.eql(u8, args[i], "--think-penalty") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--think-penalty") and flag_value.follows(args, i)) {
             i += 1;
             const lambda = std.fmt.parseFloat(f32, args[i]) catch -1;
             if (!(lambda >= 0 and lambda <= model_settings_mod.think_penalty_max)) {
@@ -530,34 +555,34 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             model_settings_mod.think_penalty_flag = lambda;
-        } else if (std.mem.eql(u8, args[i], "--preserve-thinking") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--preserve-thinking") and flag_value.follows(args, i)) {
             i += 1;
             model_settings_mod.preserve_thinking_flag = server_mod.parseOnOff(args[i]) orelse {
                 log.err("--preserve-thinking: expected on or off; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and flag_value.follows(args, i)) {
             i += 1;
             server_state.ssm_checkpoint_max = flagInt(u32, "--ssm-checkpoint-max", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and flag_value.follows(args, i)) {
             i += 1;
             server_state.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
                 log.err("--wired-margin-gib: expected an integer 1..32, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--expert-pick-tolerance") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--expert-pick-tolerance") and flag_value.follows(args, i)) {
             i += 1;
             expert_stream_mod.pick_tolerance = expert_stream_mod.parsePickTolerance(args[i]) catch {
                 log.err("--expert-pick-tolerance: expected a number from 0 to 0.6, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and flag_value.follows(args, i)) {
             i += 1;
             decode_share_flag = args[i];
-        } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--max-concurrent") and flag_value.follows(args, i)) {
             i += 1;
             server_state.max_concurrent = flagInt(u32, "--max-concurrent", args[i], 0);
-        } else if (std.mem.eql(u8, args[i], "--model-dir") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--model-dir") and flag_value.follows(args, i)) {
             // REPEATABLE. A user's library can live in more than one place (the
             // app's download folder, an external drive, an LM Studio tree), and
             // with one root the others are invisible to /v1/models even though
@@ -574,12 +599,12 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--model-dir: at most {d} folders (got one more: {s})\n", .{ extra_roots.len + 1, args[i] });
                 std.process.exit(1);
             }
-        } else if (std.mem.eql(u8, args[i], "--max-resident-models") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--max-resident-models") and flag_value.follows(args, i)) {
             // Plan 05 Phase D: cap on .ready entries in the registry.
             // ensureLoaded evicts LRU before loading when this would be exceeded.
             i += 1;
             max_resident_models = flagInt(u32, "--max-resident-models", args[i], 1);
-        } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and flag_value.follows(args, i)) {
             // Plan 05 Phase D: cap on summed resident bytes. Accepts the
             // same suffixes as --prefix-cache-mem. Special string "auto"
             // (or default 0) → 80% of mlx_set_wired_limit at server start.
@@ -592,32 +617,32 @@ pub fn main(init: std.process.Init) !void {
                     std.process.exit(1);
                 };
             }
-        } else if (std.mem.eql(u8, args[i], "--gpu-warm-secs") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--gpu-warm-secs") and flag_value.follows(args, i)) {
             i += 1;
             scheduler_mod.gpu_warm_secs = std.fmt.parseInt(u32, args[i], 10) catch {
                 log.err("--gpu-warm-secs: expected a whole number of seconds, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and flag_value.follows(args, i)) {
             // Idle eviction window. When set, `server.idleEvictLoop` unloads
             // .ready entries (refcount==0) whose last_used_ms is older than
             // this. Default off — eviction is on-demand only.
             i += 1;
             const n = flagInt(u32, "--idle-evict-secs", args[i], 0);
             idle_evict_secs = if (n > 0) n else null;
-        } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--kv-quant") and flag_value.follows(args, i)) {
             i += 1;
             kv_quant_flag = trunk.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
                 log.err("--kv-quant: expected one of {{16, 8, 6, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--ssd-budget-gb") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--ssd-budget-gb") and flag_value.follows(args, i)) {
             i += 1;
             ssd_budget_bytes = server_mod.parseSsdBudgetGb(args[i]) catch {
                 log.err("--ssd-budget-gb: expected an integer in 1..512; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--ssd-prefetch") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--ssd-prefetch") and flag_value.follows(args, i)) {
             i += 1;
             model_mod.ssd_prefetch = model_mod.parseSsdPrefetch(args[i]) orelse {
                 log.err("--ssd-prefetch: expected an integer in 0..100; got '{s}'\n", .{args[i]});
@@ -638,7 +663,7 @@ pub fn main(init: std.process.Init) !void {
             // booted a clean-looking headless server that then auto-picked
             // some other model. A launcher that ignores what it was asked for
             // is worse than one that refuses to start.
-            const reason = cli_mod.classifyUnparsedArg(args[i], i + 1 == args.len);
+            const reason = cli_mod.classifyUnparsedArg(args[i], !flag_value.follows(args, i));
             log.err("unrecognized argument '{s}' — {s}\n", .{ args[i], reason.hint() });
             std.process.exit(1);
         }
@@ -683,7 +708,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const acceptance_flag = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
-        log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-tokenv3 needs 0 <= a <= 1; choose one)\n", .{@errorName(err)});
+        if (err == error.ConflictingAcceptanceModes) log.err("--mtp-typical and --mtp-tokenv3 conflict; pass one\n", .{});
+        if (mtp_typical_raw) |raw| if (std.meta.isError(mtp_acceptance.parse(raw, null))) log.err("--mtp-typical: expected a number above 0; got '{s}'\n", .{raw});
+        if (mtp_tokenv3_raw) |raw| if (std.meta.isError(mtp_acceptance.parse(null, raw))) log.err("--mtp-tokenv3: expected a number from 0 to 1; got '{s}'\n", .{raw});
         std.process.exit(1);
     };
     if (mtp_typical_raw != null or mtp_tokenv3_raw != null) settings_resolve.launch.mtp_acceptance = acceptance_flag;
@@ -981,7 +1008,10 @@ pub fn main(init: std.process.Init) !void {
         config_storage.deinit(allocator);
         allocator.destroy(config_storage);
     };
-    config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
+    config_storage.* = model_mod.parseConfig(io, allocator, model_dir) catch |err| {
+        log.err("cannot read the model at {s}: {s}{s}\n", .{ model_dir, cli_error.describe(err) orelse @errorName(err), if (err == error.FileNotFound) " (a model is a folder holding config.json)" else "" });
+        std.process.exit(1);
+    };
     const config = config_storage;
     model_load.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
     if (effort_mod.think_effort_flag) |e| if (effort_mod.servedArms(config.model_type)) |served| {
@@ -1021,8 +1051,8 @@ pub fn main(init: std.process.Init) !void {
         // was a live SIGSEGV on a partially-downloaded model dir (the
         // preloadCpuState errdefer-after-init pattern applies here too).
         allocator.destroy(tok);
-        log.err("failed to load tokenizer from {s}: {s} (incomplete download? `sushi pull` the model again to resume, or delete the dir)\n", .{ model_dir, @errorName(err) });
-        return err;
+        log.err("failed to load tokenizer from {s}: {s} (incomplete download? `sushi pull` the model again to resume, or delete the dir)\n", .{ model_dir, cli_error.describe(err) orelse @errorName(err) });
+        std.process.exit(1);
     };
     // defer-only (see config note above): errdefer + defer with the same body
     // double-frees on the error-return path.
@@ -1505,13 +1535,6 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
 fn flagInt(comptime T: type, flag: []const u8, text: []const u8, min: T) T {
     return cli_mod.parseFlagInt(T, text, min) orelse {
         log.err("{s}: expected a whole number of at least {d}; got '{s}'\n", .{ flag, min, text });
-        std.process.exit(1);
-    };
-}
-
-fn flagFloat(flag: []const u8, text: []const u8) f32 {
-    return cli_mod.parseFlagFloat(text) orelse {
-        log.err("{s}: expected a number; got '{s}'\n", .{ flag, text });
         std.process.exit(1);
     };
 }

@@ -61,8 +61,8 @@ pub const ArgReject = enum {
 };
 
 /// Classify an argument the flag loop fell through on. `is_last` is true when
-/// it occupied the final argv slot — the only way a known value-taking flag
-/// can reach the else branch (every such arm is guarded on `i + 1 < args.len`).
+/// no value follows it (the final argv slot, or another flag next) — the only
+/// way a known value-taking flag reaches the else branch.
 pub fn classifyUnparsedArg(arg: []const u8, is_last: bool) ArgReject {
     const is_flag = std.mem.startsWith(u8, arg, "-");
     if (is_flag and std.mem.indexOfScalar(u8, arg, '=') != null) return .equals_form;
@@ -3010,7 +3010,7 @@ test "cli: an unparsed argument is classified, never silently ignored" {
     try testing.expectEqual(ArgReject.equals_form, classifyUnparsedArg("--model=/tmp/m", true));
 
     // A flag in the LAST position fell out because its value is missing —
-    // the loop's `i + 1 < args.len` guard is the only way to reach here.
+    // the loop's `flag_value.follows` guard is the only way to reach here.
     try testing.expectEqual(ArgReject.missing_value, classifyUnparsedArg("--model", true));
     try testing.expectEqual(ArgReject.missing_value, classifyUnparsedArg("-h", true));
 

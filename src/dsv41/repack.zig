@@ -10,6 +10,7 @@ const model = @import("../model.zig");
 const cli = @import("../cli.zig");
 const disk_placement = @import("../disk_placement.zig");
 const log = @import("../log.zig");
+const flag_value = @import("../flag_value.zig");
 const stamp = @import("repack_stamp.zig");
 
 pub const page: u64 = 16384;
@@ -746,12 +747,25 @@ fn explain(err: anyerror) []const u8 {
     };
 }
 
+const usage = "usage: sushi repack <pack> [--pack-revision <id> [--shards <name-or-glob>]... [--unstamped <shard>]...] | --check [--pack-revision <id>] [--shards <name-or-glob>]...";
+
 pub fn cmdRepack(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len > 0 and flag_value.isHelp(args[0])) {
+        var buf: [1024]u8 = undefined;
+        var w = std.Io.File.stdout().writerStreaming(io, &buf);
+        w.interface.writeAll(usage ++ "\n") catch {};
+        w.interface.flush() catch {};
+        return;
+    }
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const cli_args = stamp.parseArgs(a, args) catch {
-        log.err("sushi repack: unexpected argument '{s}' (usage: sushi repack <pack> [--pack-revision <id> [--shards <name-or-glob>]... [--unstamped <shard>]...] | --check [--pack-revision <id>] [--shards <name-or-glob>]...)\n", .{stamp.bad_arg});
+        if (std.mem.eql(u8, stamp.bad_arg, "<pack>")) {
+            log.err("sushi repack: a pack is required ({s})\n", .{usage});
+        } else {
+            log.err("sushi repack: unexpected argument '{s}' ({s})\n", .{ stamp.bad_arg, usage });
+        }
         std.process.exit(1);
     };
     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");

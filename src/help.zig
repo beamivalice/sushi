@@ -73,7 +73,7 @@ const shared =
     \\  --serve             Start HTTP server mode
     \\  --host <ip>         Bind address (default: 127.0.0.1 — this Mac only;
     \\                      0.0.0.0 opens it to the local network)
-    \\  --port <n>          Bind port (default: 12345, or `server.port` in
+    \\  --port <n>          Bind port, 1..65535 (default: 12345, or `server.port` in
     \\                        ~/.sushi/model-settings.json)
     \\  --ctx-size <n>      Maximum context length (default: model max)
     \\  --config-overrides <json>   JSON object deep-merged into EVERY
@@ -87,12 +87,12 @@ const shared =
     \\                      262144},"max_position_embeddings":1048576}}'
     \\  --prompt, -p <text> Run one prompt and exit (also with run <model>)
     \\  --stream            Stream tokens as they are generated (with --prompt)
-    \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
+    \\  --max-tokens <n>    Max tokens to generate, at least 1 (default: 100); in --serve
     \\                      mode, the default for requests that omit the field
-    \\  --temp <f>          Temperature. Offline: sampling temp (default 0.0).
+    \\  --temp <f>          Temperature, at least 0. Offline: sampling temp (default 0.0).
     \\                      Serve: default for requests that omit `temperature`
     \\                      (otherwise the model's generation_config.json, then 1.0)
-    \\  --top-p <f>         Serve-mode default top_p for requests that omit it
+    \\  --top-p <f>         Serve-mode default top_p (above 0, at most 1) for requests that omit it
     \\                      (otherwise generation_config.json, then 1.0 = off)
     \\  --top-k <n>         Serve-mode default top_k for requests that omit it
     \\                      (otherwise generation_config.json, then 0 = off)
@@ -142,8 +142,9 @@ const shared =
     \\                        from the drafter's confidence; equal values
     \\                        pin one count. GLM only checks it.
     \\  --drafter-max-depth <n> Most verifier rows a DFlash2 round carries
-    \\                        (default: 8 on Qwen3.8-Flash-Next, at most 8;
-    \\                        3 on GLM, at most 4).
+    \\                        (default: 8; at most 8 on GLM, and on
+    \\                        Qwen3.8-Flash-Next the assistant's block, at
+    \\                        most 9).
     \\  --no-drafter        Never load the DFlash2 assistant (saves its memory).
     \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
     \\                        (default 1). Every depth the planner picks
@@ -207,13 +208,13 @@ const shared =
     \\  --prefix-cache-entries <n>
     \\                      Hot prefix cache LRU capacity in entries
     \\                        (default: 32). 0 disables all prefix reuse.
-    \\  --prefix-cache-mem <n>{{KB,MB,GB}}
+    \\  --prefix-cache-mem <n>{KB,MB,GB}
     \\                      Turn on RAM retention of idle prefix-cache
     \\                        entries with this KV-bytes budget (default:
     \\                        off; prefixes live on the SSD tier).
     \\                      Evicts LRU entries until the budget fits.
     \\                      Pass 0 (or off) to keep RAM retention off.
-    \\  --prefix-cache-disk <n>{{KB,MB,GB}}
+    \\  --prefix-cache-disk <n>{KB,MB,GB}
     \\                      SSD tier byte budget for the prefix cache
     \\                        (default: on, min(entries x context x bytes
     \\                        per token + 2GB, 20GB, free disk - 4GB)).
@@ -265,7 +266,7 @@ const shared =
     \\  --max-resident-models <n>
     \\                      Maximum loaded models in memory (default: 3).
     \\                        ensureLoaded evicts LRU before exceeding.
-    \\  --max-resident-mem <n>{{KB,MB,GB}}|auto
+    \\  --max-resident-mem <n>{KB,MB,GB}|auto
     \\                      Summed resident-bytes cap across all loaded
     \\                        models. Default 'auto' = 80% of MLX wired
     \\                        limit at startup. Pass 0 to disable.
@@ -285,7 +286,8 @@ const shared =
     \\                        `false`). Args then pass through as the model
     \\                        emitted them (still valid JSON). Default: on.
     \\  --api-key <token>   Require this key on every request (OpenAI/
-    \\                        Anthropic/Ollama APIs + index page + metrics).
+    \\                        Anthropic/Ollama APIs + metrics; the chat page
+    \\                        is served open and asks for the key).
     \\                        Accepts Authorization: Bearer, x-api-key, HTTP
     \\                        Basic (key = password), or ?api_key=. /health
     \\                        stays open. Unset = no auth (default).
@@ -295,7 +297,8 @@ const shared =
     \\                        shared machine. No effect without --api-key.
     \\  --api-key-env <VAR> Read the key from environment variable VAR
     \\                        instead of argv (the process table is
-    \\                        world-readable). Unset/empty VAR = no auth.
+    \\                        world-readable). An unset or empty VAR exits
+    \\                        with an error rather than start open.
     \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
     \\  --log-file <path>   Persist the server log ("off" disables).
     \\                      Default: ~/.sushi/logs/sushi-<port>.log
@@ -351,6 +354,19 @@ fn indentLines(comptime paragraph: []const u8) []const u8 {
     }
 }
 
+/// What `sushi pull --help` and `sushi list --help` print; the rest of the text is `text`.
+pub const pull_usage =
+    \\usage: sushi pull <model>
+    \\  <model> is a short name (qwen3.8-flash-next[:tag], mimo-v2.6-flash, glm-5.3-flash[:tag])
+    \\  or beamster/<repo>; it downloads into the models folder. `sushi --help` lists the packs.
+    \\
+;
+pub const list_usage =
+    \\usage: sushi list
+    \\  Show the Sushi packs and the other models on disk. Takes no options.
+    \\
+;
+
 /// `--think`'s accepted words, for the refusal that names them.
 pub const think_values = thinkParts("think_refusal", ", ");
 
@@ -380,6 +396,10 @@ pub const text = blk: {
 test "--help is byte for byte what it has always printed, every arch built" {
     if (registry.served_model_types.len != 4) return error.SkipZigTest;
     try std.testing.expectEqualStrings(@embedFile("fixtures/help.txt"), text);
+}
+
+test "--help is raw text: no doubled opening brace survives into it" {
+    try std.testing.expect(std.mem.indexOf(u8, text, "{{") == null);
 }
 
 test "the --think words follow each arch's effort offer" {
