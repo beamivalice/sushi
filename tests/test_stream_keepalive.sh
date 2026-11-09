@@ -30,7 +30,7 @@
 # the buffer, so it SKIPs rather than passing vacuously; so does one where the
 # checkpoint chose not to call the tool. All three skipping makes the script a SKIP.
 #
-# Attaches to the shared api boot: tests/run.sh --only test_stream_keepalive.sh --model <m>.
+# Attaches to the shared api boot: tests/run.sh --tier live --only test_stream_keepalive.sh --model <m>.
 
 set -e
 

@@ -222,7 +222,8 @@ A script that stops its server on purpose (a SIGTERM test) sets `SUSHI_EXPECT_GO
 not reported as a crash. A Python `own` script uses `lib/sushi_boot.py` (`Server`, `gpu_lock`, `private_env`, `pack`).
 
 **Runner.** `tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|shared|all] [--only glob]
-[--list] [--check] [--keep-going] [--no-build] [--out dir]`. The default (`hermetic,host`, every pass) is what CI runs.
+[--list] [--check] [--keep-going] [--no-build] [--out dir]`. The default (`hermetic,host`, every pass) is what CI runs. A selection that holds no script exits 2: an `--only` that
+matches nothing, or names a script outside the selected `--tier` (it names the tier to pass), is refused, never a green empty run.
 `--list` prints the plan and boots nothing; `--check` refuses a missing or invalid header, a missing or stale matrix
 row and an attach script that launches `sushi` (`--no-matrix` waives the matrix rules for a tree under construction). A pass builds ReleaseFast, boots each profile once with the lock held
 for that boot only, reboots once after a crash, and stops at the end of the boot that failed unless `--keep-going`.

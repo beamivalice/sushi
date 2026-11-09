@@ -23,7 +23,7 @@ def url():
 def attach():
     """Top of every attach script: records the log offset and returns the nonce every prompt starts with."""
     if not os.environ.get("SUSHI_URL") or not os.environ.get("SUSHI_LOG"):
-        sys.exit(f"{os.path.basename(sys.argv[0])}: attach script: run it with tests/run.sh --only <file> "
+        sys.exit(f"{os.path.basename(sys.argv[0])}: attach script: run it with tests/run.sh --tier live --only <file> "
                  "--model <m>, or set SUSHI_URL and SUSHI_LOG")
     size = os.path.getsize(os.environ["SUSHI_LOG"]) if os.path.exists(os.environ["SUSHI_LOG"]) else 0
     os.environ["SUSHI_LOG_OFFSET"] = str(size)

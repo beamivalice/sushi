@@ -20,7 +20,7 @@
 # Whether the checkpoint calls the tool (or finds the planted string) is its choice, so a rung without a call
 # is a note and a run where no rung called is a SKIP. A forced call would skip the spec verify this guards.
 #
-# Attaches to the shared api boot: tests/run.sh --only test_tools_long_context.sh --model <m>.
+# Attaches to the shared api boot: tests/run.sh --tier live --only test_tools_long_context.sh --model <m>.
 #   LONGCTX_RUNGS=16000,32000,64000   — override the token rungs; a rung past the boot's context is a named 400
 
 set -u

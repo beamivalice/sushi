@@ -183,6 +183,31 @@ eq "a streamed DeepSeek serves one slot on a --ssd-budget-gb" "$got" "  boot api
 out=$(SUSHI_TESTS_DIR="$FX" "$RUN" --list --tier warm 2>&1)
 has "a bad --tier is refused" "$out" "--tier 'warm' is not"
 
+# refuses_sel <name> <message> <run.sh args...>: a selection run.sh cannot honour exits nonzero with the message
+refuses_sel() {
+    local name="$1" msg="$2" rc
+    shift 2
+    out=$(SUSHI_TESTS_DIR="$FX" "$RUN" "$@" 2>&1)
+    rc=$?
+    check "$name: exits nonzero" "$([ "$rc" -ne 0 ] && echo 1 || { echo "    exit $rc" >&2; echo 0; })"
+    has "  and says so" "$out" "$msg"
+}
+refuses_sel "--only naming no script" "--only 'test_nope.sh' matches no script" --list --only test_nope.sh
+refuses_sel "  in run mode, before any build or boot" "--only 'test_nope.sh' matches no script" --no-build --out "$WORK/out-nope" --only test_nope.sh
+refuses_sel "--only naming a live script under the default tiers" "test_api_a.sh is tier=live, which --tier hermetic,host did not select; pass --tier live" --list --only test_api_a.sh
+refuses_sel "  in run mode" "pass --tier live" --no-build --out "$WORK/out-tier" --only test_api_a.sh
+refuses_sel "--only naming a pack script under --tier live" "test_pack.sh is tier=pack, which --tier live did not select; pass --tier pack" --list --tier live --only test_pack.sh
+refuses_sel "--only naming a bench script" "bench_x.sh is tier=bench, which run.sh does not run" --list --tier all --only bench_x.sh
+refuses_sel "a glob reaching a tier the run did not select" "test_api_a.sh is tier=live" --list --only 'test_a*'
+refuses_sel "a selected tier with no script for the --model" "nothing selected (--tier hermetic --model qwen4)" --list --tier hermetic --model qwen4
+refuses_sel "--only outside the --model pass" "nothing selected (--tier host --model glm5 --only qwen4/test_q_host.sh)" --list --tier host --model glm5 --only qwen4/test_q_host.sh
+got=$(SUSHI_TESTS_DIR="$FX" "$RUN" --list --only test_hermetic.sh)
+eq "--only naming a selected-tier script lists it" "$got" "pass shared
+  hermetic test_hermetic.sh
+  boots: 0 shared + 0 own"
+SUSHI_TESTS_DIR="$FX" "$RUN" --check --only test_nope.sh > /dev/null 2>&1
+eq "--check does not take a selection" "$?" "0"
+
 echo "[3/4] the boot helper"
 STUB="$WORK/stub-sushi"
 cat > "$STUB" <<'PY'

@@ -13,7 +13,7 @@
 #
 # Streaming cases (3, 8) emit named SSE events.
 #
-# Attaches to the shared api boot: tests/run.sh --only test_responses_api.sh --model <m>.
+# Attaches to the shared api boot: tests/run.sh --tier live --only test_responses_api.sh --model <m>.
 
 . "$(dirname "$0")/lib/boot.sh"
 sushi_attach

@@ -30,7 +30,7 @@
 # On any FAIL the slice's raw-output dump lines ("raw generated text before tool parse") are echoed for harvesting
 # into src/format_corpus_test.zig.
 #
-# Usage: tests/run.sh --only test_format_matrix.sh --model <qwen4|mimo2|glm5|dsv41>
+# Usage: tests/run.sh --tier live --only test_format_matrix.sh --model <qwen4|mimo2|glm5|dsv41>
 
 set -u
 

@@ -11,7 +11,7 @@
 # than ~1 spec-block of extra tokens flags a regression. The kill point is a
 # token count, never a wall-clock moment, so a slow arch is cut at the same place.
 #
-# Attaches to the shared api boot: tests/run.sh --only test_stop_latency.sh --model <m>.
+# Attaches to the shared api boot: tests/run.sh --tier live --only test_stop_latency.sh --model <m>.
 
 set -e
 

@@ -11,7 +11,7 @@
 # Real streaming should emit many delta events — mirroring what
 # /v1/chat/completions and /v1/messages do.
 #
-# Attaches to the shared api boot: tests/run.sh --only test_responses_streaming.sh --model <m>.
+# Attaches to the shared api boot: tests/run.sh --tier live --only test_responses_streaming.sh --model <m>.
 
 set -u
 

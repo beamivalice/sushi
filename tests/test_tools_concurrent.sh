@@ -18,7 +18,7 @@
 # Whether a checkpoint calls the tool is its choice: a stream without a call is checked only for leaks, and
 # a round where no stream called it is a SKIP. Forcing the call would serialise its slot and defeat the test.
 #
-# Attaches to the shared api boot (4 slots): tests/run.sh --only test_tools_concurrent.sh --model <m>.
+# Attaches to the shared api boot (4 slots): tests/run.sh --tier live --only test_tools_concurrent.sh --model <m>.
 #   CONC_N=4  — number of concurrent agent loops
 
 set -u

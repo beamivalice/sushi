@@ -3,6 +3,7 @@
 # The test runner: reads each script's header and runs a tier, one model pass at a time, on shared boots.
 #   tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|shared|all]
 #                [--only <glob>] [--list] [--check] [--no-matrix] [--keep-going] [--no-build] [--out <dir>]
+#   --only needs a script in a selected --tier (a live script: --tier live); an empty selection exits 2.
 # Header, scope, boots and exit codes: docs/testsuite.md, "Integration scripts". Written for bash 3.2.
 # Every boot goes through lib/boot.sh, which gives it a private HOME and SUSHI_PREFIX_CACHE_DIR.
 set -u
@@ -22,7 +23,7 @@ NO_BUILD=0
 NO_MATRIX=0
 OUT=
 
-usage() { sed -n '4,5p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '4,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --tier) TIERS="${2:?--tier needs a value}"; shift ;;
@@ -195,16 +196,47 @@ entries_of() {
     }' "$ENTRIES" | sort -t"$(printf '\t')" -k1,1n -k2,2n -k3,3 | cut -f1,4-
 }
 
+# apply_only: keeps the scripts --only names; a name that matches nothing runnable, or sits in a tier the run did not
+# select, is an error rather than an empty run
 apply_only() {
-    local rel
+    local rel tier line named= unselected= unrun=
     [ -n "$ONLY" ] || return 0
     : > "$WORK/entries.only"
     while IFS= read -r line; do
         rel="${line%%$'\t'*}"
+        tier=$(printf '%s' "$line" | cut -f3)
         # shellcheck disable=SC2254
-        case "$rel" in $ONLY | */$ONLY) printf '%s\n' "$line" >> "$WORK/entries.only" ;; esac
+        case "$rel" in $ONLY | */$ONLY) ;; *) continue ;; esac
+        named=1
+        case "$tier" in hermetic | host | pack | live) ;; *) unrun="$unrun $rel is tier=$tier, which run.sh does not run;"; continue ;; esac
+        case ",$TIERS," in
+            *",$tier,"*) printf '%s\n' "$line" >> "$WORK/entries.only" ;;
+            *) unselected="$unselected $rel is tier=$tier, which --tier $TIERS did not select; pass --tier $tier;" ;;
+        esac
     done < "$ENTRIES"
+    if [ -z "$named" ]; then
+        echo "run.sh: --only '$ONLY' matches no script" >&2
+        exit 2
+    fi
+    if [ -n "$unselected" ]; then
+        echo "run.sh: --only '$ONLY':${unselected%;}" >&2
+        exit 2
+    fi
+    if [ ! -s "$WORK/entries.only" ]; then
+        echo "run.sh: --only '$ONLY':${unrun%;}" >&2
+        exit 2
+    fi
     cp "$WORK/entries.only" "$ENTRIES"
+}
+
+# require_selection: a run or a plan that holds no script is an error, never a green nothing
+require_selection() {
+    local pass
+    for pass in $PASSES; do
+        [ -z "$(entries_of "$pass")" ] || return 0
+    done
+    echo "run.sh: nothing selected (--tier $TIERS --model $MODELS${ONLY:+ --only $ONLY})" >&2
+    exit 2
 }
 
 pass_model() { if [ "$1" = shared ]; then echo qwen4; else echo "$1"; fi; }
@@ -393,6 +425,7 @@ if [ -s "$ERRORS" ]; then
     exit 1
 fi
 apply_only
+require_selection
 if [ "$MODE" = list ]; then
     print_plan
     exit 0

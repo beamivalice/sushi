@@ -24,7 +24,7 @@
 #
 # GLM cannot turn thinking off (the server answers 400), so its thinking-off arms are not sent.
 #
-# Attaches to the shared api boot: tests/run.sh --only test_tool_choice_forced.sh --model <m>.
+# Attaches to the shared api boot: tests/run.sh --tier live --only test_tool_choice_forced.sh --model <m>.
 
 set -uo pipefail
 . "$(dirname "$0")/lib/boot.sh"

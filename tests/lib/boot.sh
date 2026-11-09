@@ -199,7 +199,7 @@ sushi_cli() { "$SUSHI_BIN" "$@"; }
 # sushi_attach: top of every attach script. The nonce starts every prompt, so no script restores another's prefix.
 sushi_attach() {
     if [ -z "${SUSHI_URL:-}" ] || [ -z "${SUSHI_LOG:-}" ]; then
-        echo "$(basename "$0"): attach script: run it with tests/run.sh --only <file> --model <m>, or set SUSHI_URL and SUSHI_LOG" >&2
+        echo "$(basename "$0"): attach script: run it with tests/run.sh --tier live --only <file> --model <m>, or set SUSHI_URL and SUSHI_LOG" >&2
         exit 1
     fi
     SUSHI_LOG_OFFSET=$(_sushi_size "$SUSHI_LOG")
