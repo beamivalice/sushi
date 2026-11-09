@@ -225,6 +225,9 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
 **Coordinator.** Reports partial work to the owner every :00 and :30 while work runs; relays owner decisions and rule
 changes to ALL live workers at once; checks each landing updated its matching doc, and this index when a doc appears.
 
+**Remote CI.** `ci.yml` runs only when dispatched by hand at a version bump (no PR or push starts it); every other
+check, the arch drop test included, runs locally before a landing.
+
 **Workers.** Report progress and blockers to the coordinator; commit per step; don't push or merge unless told; put new
 knowledge in the matching doc in the branch.
 

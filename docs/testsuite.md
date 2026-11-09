@@ -39,7 +39,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
 | tier | means | where it runs |
 |---|---|---|
-| host | touches no MLX array; its file reaches no `mlx.zig` | `zig build test-host`: anywhere, beside a live server, no GPU lock, every PR in CI |
+| host | touches no MLX array; its file reaches no `mlx.zig` | `zig build test-host`: anywhere, beside a live server, no GPU lock, and in CI |
 | gpu | Metal kernels on small synthetic tensors; the first line is `try mlx.requireGpu();` | `zig build test` |
 | pack | needs a fixture or pack named by an env var; skips when it is unset | `zig build test` with the env set |
 
@@ -191,7 +191,8 @@ one area does not.
 A full-suite run compares its test total (`Build Summary` plus `test-host`) with the previous full run's: an
 unexplained drop means tests were not built, and blocks the push.
 
-CI runs `test-build` (every test compiles), `test-host` and the hermetic guards on every PR; the GPU tier is a
+CI runs only when dispatched by hand, at a version bump; no pull request or push starts it, and a landing runs
+its checks locally. It runs `test-build` (every test compiles), `test-host` and the hermetic guards; the GPU tier is a
 `workflow_dispatch` choice (`tier: all`), because a hosted runner's GPU flips rounding ties the M5 holds.
 The hermetic guards are one list, `tests/hermetic_guards.sh`, which CI calls and every landing runs locally; it fails
 on a skip, so a box without PyYAML (`python3 -m pip install pyyaml`) cannot pass it unseen.

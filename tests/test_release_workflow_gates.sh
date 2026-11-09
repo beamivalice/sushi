@@ -3,8 +3,8 @@
 # Static guard for .github/workflows/release.yml event gating.
 #
 # The release workflow doubles as (1) the tag/dispatch RELEASE pipeline and
-# (2) the dry-run packaging check. Pull requests run ci.yml alone, one macOS
-# job per PR. The class of bug this pins: someone edits a step's `if:` and a
+# (2) the dry-run packaging check. Neither workflow runs on a pull request; ci.yml is dispatched by hand, one macOS
+# job a run. The class of bug this pins: someone edits a step's `if:` and a
 # dry run creates a tag or a GitHub release.
 #
 # Hermetic — parses the YAML, no network, no runners.
@@ -209,6 +209,9 @@ for p in sorted(notice_paths):
 ci = yaml.safe_load(open(".github/workflows/ci.yml"))
 check(not any("test_arch_drop.sh" in str(st.get("run", "")) for j in ci["jobs"].values() for st in j.get("steps", [])),
       "no ci.yml job runs the arch drop test")
+# Remote CI runs only when dispatched (the owner dispatches it at a version bump): no pull request or push starts it.
+ci_on = ci.get("on", ci.get(True, {}))
+check(set(ci_on) == {"workflow_dispatch"}, f"ci.yml runs on workflow_dispatch only, not {sorted(set(ci_on) - {'workflow_dispatch'})}")
 
 sys.exit(FAIL)
 EOF

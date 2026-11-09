@@ -1,18 +1,15 @@
 name: CI
 
-# Build + test on every PR (the only workflow a PR runs), plus manual dispatch. A direct push to main does
-# NOT trigger it: that path gates nobody, and it is worth a 90-minute macOS
-# runner. Add `workflow_dispatch` runs from the Actions tab when a push needs
-# the suite. Mirrors the build/test portion of release.yml (same macos-26
-# runner, same steps, same mlx cache key — the two workflows share the
-# self-built mlx stage) without signing/notarize/packaging.
+# Build + test, run only when dispatched by hand: the owner dispatches it at a version bump. No pull request or push
+# starts it; a landing runs the suite locally. Mirrors the build/test portion of release.yml (same macos-26 runner,
+# same steps, same mlx cache key: the two workflows share the self-built mlx stage) without signing, notarizing or
+# packaging.
 #
 # This is also the macOS 26.2 compatibility gate: dev machines may run newer
 # macOS betas, but the shipped binaries must keep building and testing against
 # the 26.x SDK the runner provides (build.zig targets os_version_min 26.2).
 
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       tier:
