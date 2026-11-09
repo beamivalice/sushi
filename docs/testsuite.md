@@ -188,6 +188,8 @@ CI runs `test-build` (every test compiles), `test-host` and the hermetic guards 
 `workflow_dispatch` choice (`tier: all`), because a hosted runner's GPU flips rounding ties the M5 holds.
 The hermetic guards are one list, `tests/hermetic_guards.sh`, which CI calls and every landing runs locally; it fails
 on a skip, so a box without PyYAML (`python3 -m pip install pyyaml`) cannot pass it unseen.
+CI runs the arch drop test as one parallel job per `DROPPABLE` arch (`DROP_ONLY`); in series it outlasts the build
+job's timeout. `tests/test_release_workflow_gates.sh` holds the job's matrix to `DROPPABLE`.
 
 ## Integration scripts
 

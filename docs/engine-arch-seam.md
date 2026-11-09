@@ -187,7 +187,8 @@ without it. An arch added later joins the list in the landing that adds it.
    [flags](flags.md) and [envvar](envvar.md).
 5. Its live tests in `tests/<arch>/`, their rows in `tests/CLAUDE.md`, its pack-tier env in [testsuite](testsuite.md).
 6. `NOTICE` for any kernel it ports.
-7. The arch joins `DROPPABLE` in `tests/test_arch_drop.sh` in the same landing.
+7. The arch joins `DROPPABLE` in `tests/test_arch_drop.sh`, and the `arch-drop` matrix in `.github/workflows/ci.yml`, in
+   the same landing.
 
 ## What an arch's `arch.zig` and slot modules offer shared code
 

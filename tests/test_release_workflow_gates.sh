@@ -204,5 +204,19 @@ for p in sorted(notice_paths):
     for q in expand_braces(p):
         check(os.path.exists(q), f"NOTICE names an existing path: {q}")
 
+# ── ci.yml runs the arch drop test one arch per parallel job: in series it outlasts the build job's timeout. Every
+# DROPPABLE arch has a job, and the build job does not run the whole drop test again.
+ci = yaml.safe_load(open(".github/workflows/ci.yml"))
+droppable = re.search(r"^DROPPABLE=\(([^)]*)\)", open("tests/test_arch_drop.sh").read(), re.M)
+droppable = set(droppable.group(1).split()) if droppable else set()
+drop_job = ci["jobs"].get("arch-drop", {})
+matrix = set(drop_job.get("strategy", {}).get("matrix", {}).get("arch", []))
+check(droppable and matrix == droppable, f"ci.yml arch-drop matrix {sorted(matrix)} is DROPPABLE {sorted(droppable)}")
+drop_runs = [str(s.get("run", "")) for s in drop_job.get("steps", []) if "test_arch_drop.sh" in str(s.get("run", ""))]
+check(len(drop_runs) == 1 and "DROP_ONLY=${{ matrix.arch }}" in drop_runs[0],
+      "the arch-drop job runs test_arch_drop.sh with DROP_ONLY set to its matrix arch")
+check(not any("test_arch_drop.sh" in str(s.get("run", "")) for s in ci["jobs"]["build-test"]["steps"]),
+      "the build-test job does not run the whole drop test")
+
 sys.exit(FAIL)
 EOF

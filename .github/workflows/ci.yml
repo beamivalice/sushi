@@ -79,7 +79,31 @@ jobs:
           tier: ${{ inputs.tier || 'host' }}
           test_filter: ${{ inputs.test_filter }}
 
-      # Deleting a DROPPABLE arch's folder and registry line must still build and pass the host tier
-      # (engine-arch-seam.md). Debug compile in temporary worktrees, no GPU; passes at once while DROPPABLE is empty.
+  # Deleting a DROPPABLE arch's folder and registry line must still build and pass the host tier
+  # (engine-arch-seam.md). One job per arch: in series the drop test outlasts build-test's timeout.
+  arch-drop:
+    runs-on: macos-26
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [mimo2, dsv41, glm5, qwen4]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up the build
+        id: setup
+        uses: ./.github/actions/setup-build
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}
+
       - name: Arch drop test
-        run: bash tests/test_arch_drop.sh
+        run: DROP_ONLY=${{ matrix.arch }} bash tests/test_arch_drop.sh
