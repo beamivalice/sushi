@@ -34,7 +34,7 @@ const ARCH = { 'Qwen-A': 'qwen4_exp', 'Deep-C': 'deepseek_v41', 'GLM-B': 'glm5_n
 
 function makeServer(opts = {}) {
   const calls = [];
-  const state = { file: JSON.parse(JSON.stringify(opts.file ?? {})), think: opts.think ?? null, postError: null };
+  const state = { file: JSON.parse(JSON.stringify(opts.file ?? {})), think: opts.think ?? null, postError: null, getDelay: 0 };
   const merged = (fam) => {
     const b = BUILTIN[fam], f = state.file[fam] ?? {};
     const rows = Object.fromEntries(WORDS.map((w) => { const [offered, sends, cap, fold] = b.rows[w], e = f[w] ?? {}; return [w, { offered: e.offered ?? offered, sends: 'sends' in e ? e.sends : sends, cap: 'cap' in e ? e.cap : cap, fold_to: 'offered' in e ? null : fold ?? null }]; }));
@@ -97,6 +97,7 @@ function makeServer(opts = {}) {
           }
           return route.fulfill(json({ ok: true, applied: { effort: 'applies at once, from the next request' }, model_loaded: false }));
         }
+        if (state.getDelay) await new Promise((r) => setTimeout(r, state.getDelay));
         return route.fulfill(json(settingsBody()));
       case '/v1/prefix-cache': return route.fulfill(json({ root: '/h/.sushi/kv-cache', volume: { free_bytes: 900 * GiB, total_bytes: 2000 * GiB }, total_bytes: 0, namespaces: [] }));
       case '/props': return route.fulfill(json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 128 * GiB }, batching: {} }));
@@ -242,6 +243,15 @@ async function main() {
       await page.waitForSelector('#effortSelect option', { state: 'attached' });
       const options = await page.$$eval('#effortSelect option', (o) => o.map((x) => x.value));
       assert.ok(options.includes('high') && !options.includes('low'), `the chat menu lists the table's offered words (${options})`);
+    });
+
+    await scenario('a saved cap stays on screen when the model list answers before the settings do', { server: { file: QWEN_FILE } }, async ({ page, server }) => {
+      server.state.getDelay = 300;
+      await page.fill(`${tr('low')} input[id$="-cap"]`, '3500');
+      await page.click('#effortSave');
+      await page.waitForTimeout(900);
+      assert.equal(await page.inputValue(`${tr('low')} input[id$="-cap"]`), '3500');
+      assert.equal(await page.isVisible('#effortSave'), false, 'nothing left to save');
     });
 
     await scenario('a preset chip sets DeepSeek\'s number; the default radio moves the default', {}, async ({ page, server }) => {

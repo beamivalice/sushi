@@ -136,6 +136,8 @@ and the page tooltip share them.
   a small "changed" tag. A preview line under the table shows what a request for the selected word gets, and the exact
   template text. The card lists only the families with a table. A row's error stays in its word cell (`role="alert"`) and its box turns `aria-invalid`; Save stays
   disabled until every row is valid. Badges: Saved (the file holds a change) and Now.
+- A save drops the family's drafts only after the refreshed settings are in; a render between the POST and the answer (the
+  model list lands first) would rebuild them from the old settings and show the old cap with Save still offered.
 - Under `--think` the Default column is locked and checks the word the flag serves (a save still writes the file's own
   default), and that word must stay offered, as the server requires.
 

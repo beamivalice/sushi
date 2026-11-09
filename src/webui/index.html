@@ -4382,15 +4382,19 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   async function effortSave(body, btn, label, done) {
     E.serr = "";
+    const fam = E.fam;
+    let saved = false;
     await withBusy(btn, label, async () => {
       try {
         const r = await postJson("/v1/settings", body);
         E.serr = "";
-        delete E.drafts[E.fam];
+        saved = true;
         toast(typeof r.applied?.effort === "string" ? sentence(r.applied.effort) : done);
       } catch (e) { E.serr = adminErrorText(e).replace(/^effort [a-z0-9_]+\./, ""); }
     });
     await Promise.all([refresh(), modelStore.refresh()]);
+    // Drafts go only once the saved settings are in: a render before then would rebuild them from the old ones.
+    if (saved && !A.error) { delete E.drafts[fam]; renderEffort(A.settings.effort); }
     effortPatch();
   }
   q("effortSave").addEventListener("click", () => { const fam = effFam(); effortSave(effortPostBody(fam, E.drafts[fam.family], E.defaults[fam.family]), q("effortSave"), "Saving…", "Saved."); });
