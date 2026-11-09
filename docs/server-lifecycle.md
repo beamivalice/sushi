@@ -369,6 +369,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   model's transformer, and the inference thread drains 16 entries per pass.
 - **A slot's error is latched with a static name when the name cannot be copied** (`Slot.latchErrorLocked`):
   `error_code != null` is the terminal predicate for the consumers and the cull, so it must never be lost.
+- **Every slot failure logs `[slot] request <id> failed (<state>): <name>` once, at the latch** (`Slot.latchErrorLocked`, the one
+  site every `markError` reaches); the client's "generation failed" 500 hides the name, so grep `[slot]` first.
 - A `submit` that fails before a slot exists (`ModelNotReady`, `GlmKvQuantUnsupported`, `Slot.init`) parks the request's
   `vision_embeddings` in `Scheduler.orphan_vision` (fixed size, no allocation); the inference thread frees it.
 - A handler frees no embeddings array itself: a request refused after its media was encoded (`PreparedMedia.deinit`, the

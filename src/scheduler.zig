@@ -787,7 +787,11 @@ pub const Slot = struct {
     /// Caller holds `out_mu`. `error_code != null` is what the consumers and the cull read as
     /// terminal, so an uncopyable name falls back to a static one instead of leaving it null.
     fn latchErrorLocked(self: *Slot, name: []const u8) void {
-        if (self.error_code == null) self.error_code = self.allocator.dupe(u8, name) catch static_error_name;
+        if (self.error_code == null) {
+            self.error_code = self.allocator.dupe(u8, name) catch static_error_name;
+            // The client sees only "generation failed" for most names; this line is the one place the name is kept.
+            log.err("[slot] request {d} failed ({s}): {s}\n", .{ self.request_id, @tagName(self.state), name });
+        }
         self.state = .errored;
     }
 
@@ -6093,4 +6097,60 @@ test "tier hits: a restore a retry throws away is not counted, the one a prefill
     const after = cache_stats.process.snapshot();
     try testing.expectEqual(before.hits[0], after.hits[0]);
     try testing.expectEqual(before.hits[1] + 1, after.hits[1]);
+}
+
+fn readLogFileForTest(path: [*:0]const u8, buf: []u8) []const u8 {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return buf[0..0];
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, buf.ptr, buf.len);
+    return buf[0..if (n > 0) @intCast(n) else 0];
+}
+
+test "a slot that fails names its error in the log, whichever path latched it" {
+    const dir = "/tmp/sushi-slot-errlog";
+    const path = dir ++ "/s.log";
+    _ = std.c.mkdir(dir, @as(std.c.mode_t, 0o755));
+    _ = std.c.unlink(path);
+    try log.openFile(path, 0);
+    defer {
+        log.closeFile();
+        _ = std.c.unlink(path);
+    }
+
+    var slot: Slot = undefined;
+    slot.io = testing.io;
+    slot.allocator = testing.allocator;
+    slot.request_id = 77;
+    slot.state = .pending_prefill;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    defer if (slot.error_code) |code| testing.allocator.free(code);
+
+    slot.markError("GlmStreamRequestBusy");
+    slot.markError("SecondFailureIsIgnored");
+    slot.out_mu.lockUncancelable(testing.io);
+    slot.latchErrorLocked("NeverLands");
+    slot.out_mu.unlock(testing.io);
+
+    var other: Slot = slot;
+    other.error_code = null;
+    other.request_id = 78;
+    other.out_mu.lockUncancelable(testing.io);
+    other.latchErrorLocked("OutOfMemory");
+    other.out_mu.unlock(testing.io);
+    defer if (other.error_code) |code| if (code.ptr != static_error_name.ptr) testing.allocator.free(code);
+
+    log.closeFile();
+    var buf: [2048]u8 = undefined;
+    const text = readLogFileForTest(path, &buf);
+    try testing.expect(std.mem.indexOf(u8, text, "request 77") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "GlmStreamRequestBusy") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "SecondFailureIsIgnored") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "NeverLands") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "request 78") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "OutOfMemory") != null);
 }
