@@ -167,11 +167,13 @@ pub const Override = struct {
     vision: ?bool = null,
     /// The omitted-`max_tokens` budget. In a defaults row, 0 = the rest of the window.
     max_tokens: ?u32 = null,
+    /// The YaRN factor the config is parsed with; null = the config.json's own RoPE.
+    yarn_factor: ?u8 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
             o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
-            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.max_tokens == null;
+            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.max_tokens == null and o.yarn_factor == null;
     }
 };
 
@@ -251,6 +253,9 @@ fn fromValue(v: std.json.Value) Override {
     if (obj.get("max_tokens")) |g| if (accepts("max_tokens", g)) {
         o.max_tokens = @intCast(g.integer);
     };
+    if (obj.get("yarn_factor")) |g| if (accepts("yarn_factor", g)) {
+        o.yarn_factor = std.fmt.parseInt(u8, yarnChoice(g).?, 10) catch unreachable;
+    };
     if (obj.get("logit_bias_file")) |path_value| switch (path_value) {
         .string => |path| o.logit_bias_file = @import("logit_bias.zig").FilePath.from(path),
         else => {},
@@ -301,7 +306,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} max_tokens={d}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} max_tokens={d} yarn_factor={d}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -314,8 +319,22 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         o.think_penalty orelse 0,
         if (o.vision) |v| (if (v) "on" else "off") else "default",
         o.max_tokens orelse 0,
+        o.yarn_factor orelse 0,
     });
     return o;
+}
+
+/// The YaRN factor saved for the model at `model_path`, read quietly: every parse of a model's config.json (load,
+/// discovery, tools) asks it here, so none can disagree about the RoPE the model runs.
+pub fn yarnFactorOf(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) ?u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    return yarnFactorIn(alloc, io, defaultPath(&buf), model_path);
+}
+
+pub fn yarnFactorIn(alloc: std.mem.Allocator, io: std.Io, settings_path: []const u8, model_path: []const u8) ?u8 {
+    var s = load(alloc, io, settings_path);
+    defer s.deinit();
+    return s.lookup(model_path).yarn_factor;
 }
 
 // ── Editing ──
@@ -335,6 +354,14 @@ fn kvQuantChoice(v: std.json.Value) ?[]const u8 {
     return (kv_quant.KVQuantConfig.fromJsonValue(v) orelse return null).wireName();
 }
 
+fn yarnChoice(v: std.json.Value) ?[]const u8 {
+    return switch (v) {
+        .integer => |i| if (i == 2) "2" else if (i == 4) "4" else null,
+        .string => |t| if (std.mem.eql(u8, t, "2") or std.mem.eql(u8, t, "4")) t else null,
+        else => null,
+    };
+}
+
 pub const model_keys = [_]KeySpec{
     .{ .name = "ctx_size", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
     .{ .name = "kv_quant", .kind = .choice, .choices = &.{ "off", "4", "6", "8" }, .normalize = kvQuantChoice },
@@ -347,6 +374,7 @@ pub const model_keys = [_]KeySpec{
     .{ .name = "think_penalty", .kind = .number, .min = 0, .max = think_penalty_max },
     .{ .name = "vision", .kind = .bool },
     .{ .name = "max_tokens", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
+    .{ .name = "yarn_factor", .kind = .choice, .choices = &.{ "2", "4" }, .normalize = yarnChoice },
 };
 
 /// Server-wide keys, under the file's `"server"` object (a model's key is its absolute path, so the two never meet).
@@ -393,7 +421,51 @@ pub const Fit = struct {
     context_cap: u32 = 0,
     template_preserves_thinking: bool = true,
     template_thinks: bool = true,
+    /// The arch's RoPE reads YaRN (`arch/config.zig` `Facts.reads_yarn`).
+    reads_yarn: bool = true,
+    /// What the config.json declares by itself: the window a YaRN factor extends from, and the window with no `yarn_factor`.
+    /// 0 = unknown, which judges nothing.
+    window_native: u32 = 0,
+    window_default: u32 = 0,
 };
+
+/// The context window the model has once `yarn_factor` (null = unset) is applied; 0 = unknown.
+fn windowUnder(fit: Fit, yarn: ?u32) u32 {
+    if (yarn) |n| return if (fit.reads_yarn and fit.window_native > 0) std.math.mul(u32, fit.window_native, n) catch std.math.maxInt(u32) else fit.context_cap;
+    return if (fit.window_default > 0) fit.window_default else fit.context_cap;
+}
+
+fn yarnOf(v: ?std.json.Value) ?u32 {
+    const text = yarnChoice(v orelse return null) orelse return null;
+    return std.fmt.parseInt(u32, text, 10) catch null;
+}
+
+/// A `ctx_size` the settings the save leaves would load above the model's window under them; null when it fits or the
+/// save touches neither key.
+fn ctxAboveWindow(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u8) ?Refusal {
+    var touches = false;
+    for (edits) |e| touches = touches or std.mem.eql(u8, e.key, "ctx_size") or std.mem.eql(u8, e.key, "yarn_factor");
+    if (!touches) return null;
+    const ctx = stateOf(existing, edits, "ctx_size") orelse return null;
+    if (ctx != .integer or ctx.integer < 1) return null;
+    const yarn = yarnOf(stateOf(existing, edits, "yarn_factor"));
+    const window = windowUnder(fit, yarn);
+    if (window == 0 or ctx.integer <= window) return null;
+    const why = if (yarn) |n|
+        std.fmt.bufPrint(buf, "ctx_size {d} is above the {d}-token window this model has with yarn_factor {d}; lower ctx_size first", .{ ctx.integer, window, n })
+    else
+        std.fmt.bufPrint(buf, "ctx_size {d} is above the {d}-token window this model has without yarn_factor; lower ctx_size first", .{ ctx.integer, window });
+    return .{ .key = "ctx_size", .why = why catch "ctx_size is above the model's window" };
+}
+
+/// The same refusal for a file value a load meets: the window the loaded config has, no edits.
+pub fn ctxAboveWindowLine(buf: []u8, ctx: u32, window: u32, yarn: ?u8) ?[]const u8 {
+    if (ctx == 0 or window == 0 or ctx <= window) return null;
+    return (if (yarn) |n|
+        std.fmt.bufPrint(buf, "[model-settings] ctx_size {d} is above the {d}-token window this model has with yarn_factor {d}; lower ctx_size or yarn_factor", .{ ctx, window, n })
+    else
+        std.fmt.bufPrint(buf, "[model-settings] ctx_size {d} is above the {d}-token window this model has without yarn_factor; lower ctx_size or set yarn_factor", .{ ctx, window })) catch null;
+}
 
 /// Why the loader ignores `key` for this model, as a sentence for the person editing; null when it takes effect.
 pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
@@ -417,6 +489,7 @@ pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
         return unavailable("mtp", fit);
     }
     if (eql(u8, key, "preserve_thinking")) return if (fit.template_preserves_thinking) null else "This model's chat template has no preserve-thinking switch.";
+    if (eql(u8, key, "yarn_factor")) return if (fit.reads_yarn) null else "This model's RoPE has no YaRN context extension.";
     if (eql(u8, key, "think_penalty")) return if (fit.template_thinks) null else "This model's chat template has no thinking span to penalise.";
     return null;
 }
@@ -487,11 +560,11 @@ pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit,
         const lim = limit(e.key, fit);
         if (lim.disabled) return .{ .key = e.key, .why = lim.why };
         if (v == .string and !choiceAllowed(e.key, v.string, fit)) return .{ .key = e.key, .why = "This model's cache cannot store that width." };
-        if (lim.max > 0 and v == .integer and v.integer > lim.max) return .{ .key = e.key, .why = maxWhy(buf, lim.max) };
+        if (lim.max > 0 and v == .integer and v.integer > lim.max and !std.mem.eql(u8, e.key, "ctx_size")) return .{ .key = e.key, .why = maxWhy(buf, lim.max) };
         if (lim.requires_mtp) if (stateOf(existing, edits, "mtp")) |m| if (m == .bool and !m.bool) return .{ .key = e.key, .why = "Used only while MTP is on." };
         for (lim.unset) |other| if (stateOf(existing, edits, other) != null) return .{ .key = e.key, .why = lim.why };
     }
-    return null;
+    return ctxAboveWindow(fit, existing, edits, buf);
 }
 
 /// A key's value once `edits` land on `existing`; null = unset.
@@ -1258,4 +1331,76 @@ test "model_settings: server.port is a whole port from 1 to 65535, anything else
     const spec = findKey(&server_keys, "port").?;
     try t.expectEqual(@as(f64, 1), spec.min);
     try t.expectEqual(@as(f64, 65535), spec.max);
+}
+
+test "model_settings: yarn_factor is 2 or 4 in either spelling, offered and honoured only where the arch reads YaRN" {
+    const t = std.testing;
+    var s = try parse(t.allocator,
+        \\{"/m/a": {"yarn_factor": "4"}, "/m/b": {"yarn_factor": 2}, "/m/c": {"yarn_factor": "3"}, "/m/d": {"yarn_factor": 8}, "/m/e": {"yarn_factor": true}, "/m/f": {"yarn_factor": 2.5}}
+    );
+    defer s.deinit();
+    try t.expectEqual(@as(?u8, 4), s.lookup("/m/a").yarn_factor);
+    try t.expectEqual(@as(?u8, 2), s.lookup("/m/b").yarn_factor);
+    for ([_][]const u8{ "/m/c", "/m/d", "/m/e", "/m/f" }) |m| try t.expectEqual(@as(?u8, null), s.lookup(m).yarn_factor);
+    try t.expectEqualStrings("2", canonicalValue(findKey(&model_keys, "yarn_factor").?, .{ .integer = 2 }).string);
+
+    const qwen: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .reads_yarn = true };
+    const other: Fit = .{ .arch = "glm5_next", .streams_experts = false, .has_vision = false, .reads_yarn = false };
+    try t.expect(applies("yarn_factor", qwen));
+    try t.expect(!applies("yarn_factor", other));
+    try t.expect(limit("yarn_factor", other).disabled);
+    var buf: [128]u8 = undefined;
+    const edit: Edit = .{ .key = "yarn_factor", .value = .{ .string = "2" } };
+    try t.expect(refuseEdits(qwen, null, &.{edit}, &buf) == null);
+    const refused = refuseEdits(other, null, &.{edit}, &buf).?;
+    try t.expectEqualStrings("yarn_factor", refused.key);
+    try t.expect(std.mem.indexOf(u8, refused.why, "YaRN") != null);
+    try t.expect(refuseEdits(other, null, &.{.{ .key = "yarn_factor", .value = null }}, &buf) == null);
+    try t.expect((Override{ .yarn_factor = 2 }).isEmpty() == false);
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "model-settings.json", .data = "{\"/m/a\":{\"yarn_factor\":\"2\"}}" });
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/model-settings.json", .{dir_buf[0..try tmp.dir.realPath(t.io, &dir_buf)]});
+    try t.expectEqual(@as(?u8, 2), yarnFactorIn(t.allocator, t.io, path, "/m/a"));
+    try t.expectEqual(@as(?u8, null), yarnFactorIn(t.allocator, t.io, path, "/m/b"));
+}
+
+test "model_settings: a save that leaves ctx_size above the window the model would have under the resulting settings is refused, naming both" {
+    const t = std.testing;
+    const fit: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .reads_yarn = true, .context_cap = 262144, .window_native = 262144, .window_default = 262144 };
+    var buf: [160]u8 = undefined;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const file = struct {
+        fn obj(a: std.mem.Allocator, body: []const u8) std.json.ObjectMap {
+            return (std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch unreachable).object;
+        }
+    }.obj;
+    const arena = arena_state.allocator();
+    const wide = file(arena, "{\"ctx_size\":1048576,\"yarn_factor\":\"4\"}");
+
+    const dropped = refuseEdits(fit, wide, &.{.{ .key = "yarn_factor", .value = null }}, &buf).?;
+    try t.expectEqualStrings("ctx_size", dropped.key);
+    try t.expectEqualStrings("ctx_size 1048576 is above the 262144-token window this model has without yarn_factor; lower ctx_size first", dropped.why);
+
+    const halved = refuseEdits(fit, wide, &.{.{ .key = "yarn_factor", .value = .{ .string = "2" } }}, &buf).?;
+    try t.expectEqualStrings("ctx_size 1048576 is above the 524288-token window this model has with yarn_factor 2; lower ctx_size first", halved.why);
+
+    const bare = file(arena, "{}");
+    const over = refuseEdits(fit, bare, &.{.{ .key = "ctx_size", .value = .{ .integer = 300000 } }}, &buf).?;
+    try t.expectEqualStrings("ctx_size 300000 is above the 262144-token window this model has without yarn_factor; lower ctx_size first", over.why);
+
+    // Judged under the resulting settings, not the loaded ones: widening and raising in one save is fine.
+    try t.expect(refuseEdits(fit, bare, &.{ .{ .key = "yarn_factor", .value = .{ .string = "4" } }, .{ .key = "ctx_size", .value = .{ .integer = 1048576 } } }, &buf) == null);
+    try t.expect(refuseEdits(fit, file(arena, "{\"yarn_factor\":2}"), &.{.{ .key = "ctx_size", .value = .{ .integer = 524288 } }}, &buf) == null);
+    try t.expect(refuseEdits(fit, wide, &.{.{ .key = "yarn_factor", .value = .{ .string = "4" } }}, &buf) == null);
+    // Removing ctx_size, or saving a key that does not touch either, is never blocked by it.
+    try t.expect(refuseEdits(fit, wide, &.{.{ .key = "ctx_size", .value = null }}, &buf) == null);
+    try t.expect(refuseEdits(fit, wide, &.{.{ .key = "mtp", .value = .{ .bool = true } }}, &buf) == null);
+    // A window the editor cannot know judges nothing.
+    const unknown: Fit = .{ .arch = "x", .streams_experts = false, .has_vision = false };
+    try t.expect(refuseEdits(unknown, bare, &.{.{ .key = "ctx_size", .value = .{ .integer = 1 << 30 } }}, &buf) == null);
 }

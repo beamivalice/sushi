@@ -590,6 +590,12 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
 
 /// `layout` names a stored-state layout the model files do not tell apart; null keeps the historical fingerprint.
 pub fn modelFingerprintWithLayout(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, layout: ?[]const u8) ![]u8 {
+    return modelFingerprintFor(allocator, io, model_dir, layout, null);
+}
+
+/// `yarn_factor` is the per-model RoPE override the model's config was parsed with: stored KV is only valid under the
+/// RoPE that computed it, as with the global `--config-overrides`.
+pub fn modelFingerprintFor(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, layout: ?[]const u8, yarn_factor: ?u8) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
     h.update(model_dir);
@@ -634,6 +640,7 @@ pub fn modelFingerprintWithLayout(allocator: std.mem.Allocator, io: std.Io, mode
     for (names.items) |name| fingerprintFile(&h, io, dir, name);
     fingerprintFile(&h, io, dir, "ngram_table.bin");
     if (model.getConfigOverrides()) |raw| h.update(raw);
+    if (yarn_factor) |f| h.update(&[_]u8{ 'y', f });
     if (layout) |tag| h.update(tag);
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
@@ -868,6 +875,35 @@ test "modelFingerprint: rolls with --config-overrides" {
     const fp_ws = try modelFingerprint(testing.allocator, io, dir_a);
     defer testing.allocator.free(fp_ws);
     try testing.expect(!std.mem.eql(u8, fp_over, fp_ws));
+}
+
+test "modelFingerprint: a per-model YaRN factor gets its own namespace, and no factor leaves the fingerprint as it was" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+
+    try tmp.dir.createDirPath(io, "model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"x\"}" });
+    const dir_a = try std.fmt.allocPrint(testing.allocator, "{s}/model-a", .{base});
+    defer testing.allocator.free(dir_a);
+
+    const plain = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(plain);
+    const none = try modelFingerprintFor(testing.allocator, io, dir_a, null, null);
+    defer testing.allocator.free(none);
+    try testing.expectEqualStrings(plain, none);
+
+    const two = try modelFingerprintFor(testing.allocator, io, dir_a, null, 2);
+    defer testing.allocator.free(two);
+    const four = try modelFingerprintFor(testing.allocator, io, dir_a, null, 4);
+    defer testing.allocator.free(four);
+    const two_again = try modelFingerprintFor(testing.allocator, io, dir_a, null, 2);
+    defer testing.allocator.free(two_again);
+    try testing.expect(!std.mem.eql(u8, plain, two));
+    try testing.expect(!std.mem.eql(u8, two, four));
+    try testing.expectEqualStrings(two, two_again);
 }
 
 test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {

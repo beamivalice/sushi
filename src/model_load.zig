@@ -228,8 +228,23 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.logit_bias_file_override = o.logit_bias_file;
     config.vision_override = o.vision;
     config.max_tokens_override = o.max_tokens;
+    if (yarnFactorIgnoredLine(config, o.yarn_factor)) |line| log.warn("{s}\n", .{line});
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
+}
+
+/// A saved `yarn_factor` the parse did not apply is ignored with this one line, never a refusal: the file outlives the arch it was saved for.
+pub fn yarnFactorIgnoredLine(config: *const ModelConfig, saved: ?u8) ?[]const u8 {
+    if (saved == null or config.yarn_factor_override != null) return null;
+    return model_settings.unavailable("yarn_factor", arch_flags.settingsFit(config)) orelse "model-settings.json yarn_factor is ignored: the config.json was parsed without it";
+}
+
+/// The line that refuses a load whose model-settings.json `ctx_size` is above the window the config has under the settings
+/// (the launch flag outranks the file, so a flag is not judged here); null when it fits.
+pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32) ?[]const u8 {
+    const pick = model_settings.contextPick(ctx_flag, config.ctx_override);
+    if (pick.source != .model_settings) return null;
+    return model_settings.ctxAboveWindowLine(buf, pick.value, config.contextCap(), config.yarn_factor_override);
 }
 
 /// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
@@ -356,6 +371,14 @@ test "a model-settings kv_quant the MLA latent cannot store is dropped at stampi
     var qwen = ModelConfig{ .model_type = "qwen4_exp" };
     applyModelSettings(&qwen, .{ .kv_quant = trunk.KVQuantConfig.affine(4) });
     try testing.expectEqual(@as(u8, 4), qwen.kv_quant_override.?.bits);
+}
+
+test "a saved yarn_factor an arch cannot read is ignored with a line naming why; one the parse applied says nothing" {
+    var glm = ModelConfig{ .model_type = "glm5_next" };
+    try testing.expect(std.mem.indexOf(u8, yarnFactorIgnoredLine(&glm, 4).?, "YaRN") != null);
+    try testing.expect(yarnFactorIgnoredLine(&glm, null) == null);
+    var qwen = ModelConfig{ .model_type = "qwen4_exp", .yarn_factor_override = 4 };
+    try testing.expect(yarnFactorIgnoredLine(&qwen, 4) == null);
 }
 
 test "an explicit --mtp keeps the head on a streamed load, or refuses when it cannot" {
@@ -1449,7 +1472,7 @@ fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedMod
             break :attach;
         };
         defer if (layout) |l| allocator.free(l);
-        const fp = disk_placement.modelFingerprintWithLayout(allocator, io, entry.path, layout) catch |err| {
+        const fp = disk_placement.modelFingerprintFor(allocator, io, entry.path, layout, config.yarn_factor_override) catch |err| {
             log.atLevel(failed, "[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };
@@ -1617,6 +1640,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     })) |why| {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
+    }
+    var window_buf: [256]u8 = undefined;
+    if (contextWindowRefusal(&window_buf, params.config, sch.ctx_size_flag)) |line| {
+        log.err("{s}\n", .{line});
+        return error.ContextSizeAboveWindow;
     }
     if (arch_flags.settingsSsdPrefetchIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     if (arch_flags.settingsKvQuantIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
@@ -2938,4 +2966,26 @@ test "an MLX error latched during a load is named in the log and does not reach 
     var buf: [2048]u8 = undefined;
     const text = readLoadLogForTest(path, &buf);
     try testing.expect(std.mem.indexOf(u8, text, "expected a non-empty mlx_array") != null);
+}
+
+test "a saved ctx_size above the window the loaded config has is refused by name; a flag, an auto context and a fitting value are not" {
+    var buf: [256]u8 = undefined;
+    var c = ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 262144, .ctx_override = 1048576 };
+    const line = contextWindowRefusal(&buf, &c, 0).?;
+    try testing.expectEqualStrings("[model-settings] ctx_size 1048576 is above the 262144-token window this model has without yarn_factor; lower ctx_size or set yarn_factor", line);
+
+    c.rope_yarn = true;
+    c.yarn_factor = 2;
+    c.yarn_orig_max_pos = 262144;
+    c.max_position_embeddings = 524288;
+    c.yarn_factor_override = 2;
+    try testing.expectEqualStrings("[model-settings] ctx_size 1048576 is above the 524288-token window this model has with yarn_factor 2; lower ctx_size or yarn_factor", contextWindowRefusal(&buf, &c, 0).?);
+
+    c.ctx_override = 524288;
+    try testing.expect(contextWindowRefusal(&buf, &c, 0) == null);
+    c.ctx_override = 0;
+    try testing.expect(contextWindowRefusal(&buf, &c, 0) == null);
+    // An explicit launch flag outranks the file, so the file's value is not what loads.
+    c.ctx_override = 1048576;
+    try testing.expect(contextWindowRefusal(&buf, &c, 100000) == null);
 }

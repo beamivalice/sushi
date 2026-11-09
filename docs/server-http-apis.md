@@ -486,6 +486,10 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
   null while the model is not loaded and otherwise `{key: value|null}` for every key: the file value the load stamped
   (null: the file had none then), in the shape of `settings.<key>.file`, so a page tells "saved differs from loaded".
+  Each model row also carries `rope`, what its own `config.json` declares before any setting or flag (`method`
+  `native|yarn`, `factor`, `native` window, `window`; null when unreadable), which the page's Context extension control
+  uses to preview the window and RoPE a choice gives; `yarn_factor` (`"2"|"4"`, Qwen only) is locked, with the flag
+  `--config-overrides`, while that flag names the RoPE or the window.
   A ready model's row also carries `defaults`, `{key: value}` for the keys whose unset value the server can state (null while the model
   is not loaded): `settings_api.resolvedDefaults` reads it from the loader's own resolvers on the config with the file's values and the
   launch flags cleared, so it is never a flag's value. `ctx_size` and `ssd_budget_gb` are absent (measured at load); `max_tokens` is

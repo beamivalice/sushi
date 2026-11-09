@@ -3634,18 +3634,28 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Turn it off if you only chat in text and want the memory back.", ""],
     max_tokens: ["Max generated tokens", "The most tokens a request may generate, thinking included, when an app sets no limit of its own. An app's own limit wins.", "--max-tokens",
       "A token is about three quarters of a word. Empty uses the model's default.", ""],
+    yarn_factor: ["Context extension", "Stretches the model's context window with YaRN. It can lower quality on short prompts, and a longer context needs more memory.", "",
+      "Use it only when you need a conversation longer than the model's own window. Leave it on Model default otherwise.", "YaRN rope scaling"],
   };
-  const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "max_tokens"];
-  const CHOICE_LABEL = { kv_quant: { off: "16-bit (exact)", 4: "4-bit", 6: "6-bit", 8: "8-bit" }, mtp_acceptance: { exact: "Exact (same output)", typical: "Typical (faster)", tokenv3: "TokenV3 (faster)" } };
+  const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "max_tokens", "yarn_factor"];
+  const CHOICE_LABEL = { yarn_factor: { 2: "YaRN ×2", 4: "YaRN ×4" }, kv_quant: { off: "16-bit (exact)", 4: "4-bit", 6: "6-bit", 8: "8-bit" }, mtp_acceptance: { exact: "Exact (same output)", typical: "Typical (faster)", tokenv3: "TokenV3 (faster)" } };
   const choiceLabel = (key, v) => CHOICE_LABEL[key]?.[v] ?? v;
   // What the server would use with the key unset, as the label of the Default choice; a bare "Default" when it cannot say.
   const defaultLabel = (m, spec) => {
+    if (spec.name === "yarn_factor") return "Model default";
     const v = m.defaults?.[spec.name];
     if (v == null) return "Default";
     if (spec.type === "bool") return `Default (${v ? "On" : "Off"})`;
     if (spec.type === "choice") return `Default (${choiceLabel(spec.name, String(v)).replace(/ \(.*\)$/, "")})`;
     if (spec.name === "max_tokens" && v === 0) return "Default (rest of the context window)";
     return `Default (${Number(v).toLocaleString("en-US")})`;
+  };
+  // The RoPE and window a Context extension choice leaves the model with, from the config.json's own `rope` (native window first).
+  const ropeHint = (r, factor) => {
+    const n = (x) => Number(x).toLocaleString("en-US");
+    if (!r) return "";
+    if (factor) return `RoPE: yarn, factor ${factor}, original ${n(r.native)} · up to ${n(r.native * factor)} tokens`;
+    return r.method === "yarn" ? `Model default: yarn, factor ${r.factor}, original ${n(r.native)} · up to ${n(r.window)} tokens` : `Model default: no extension · up to ${n(r.window)} tokens`;
   };
   const isOff = (flag) => flag === "off" || flag === "false" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
@@ -4006,13 +4016,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     S.control.allow?.(lim?.choices);
     S.control.def(defaultLabel(m, S.spec));
     if (!locked && !(key in P.texts) && !S.control.focused()) { const want = adminFileText(s.file); if (S.control.get() !== want) S.control.set(want); }
-    setText(S.help, locked ? flagHelp(key, s.flag) : why || KEY[key][1]);
+    setText(S.help, locked ? (key === "yarn_factor" ? "The --config-overrides launch flag sets the RoPE or the window, and outranks this setting. Start sushi without it to change it here." : flagHelp(key, s.flag)) : why || KEY[key][1]);
     setHidden(S.remove, locked || !why || s.file == null);
     const text = S.control.get(), saved = adminFileText(s.file), parsed = adminControlValue(S.spec, text);
     const changed = !locked && !why && key in P.texts && !(parsed.ok && adminSameAsFile(parsed, s.file));
     S.row.classList.toggle("dirty", changed || !!((P.errors[key] || P.refused[key]) && !why));
     const cut = lim?.choices && S.spec.choices?.filter((c) => !lim.choices.includes(c)).map((c) => choiceLabel(key, c));
     let hint = key === "ctx_size" && text && !P.errors[key] ? `${adminTokens(Number(text))} tokens` : cut?.length && !locked && !why ? lim.why || `${cut.join(", ")} not available for this model.` : "";
+    if (key === "yarn_factor" && !locked && !why) hint = ropeHint(m.rope, Number(text));
     if (changed) hint = [hint, `was ${saved || "Default"}`].filter(Boolean).join(" · ");
     setText(S.hint, hint);
     setText(S.bad, why ? "" : P.errors[key] || P.refused[key] || "");

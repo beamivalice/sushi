@@ -263,7 +263,80 @@ pub const PromptRecord = struct {
     }
 };
 
+/// The RoPE a capture or a compare ran under, stamped so a YaRN teacher is never read as a native one.
+pub const Rope = struct {
+    pub const Source = enum {
+        none,
+        model_settings,
+        launch_flag,
+        both,
+
+        pub fn name(self: Source) []const u8 {
+            return switch (self) {
+                .none => "none",
+                .model_settings => "yarn_factor",
+                .launch_flag => "config-overrides",
+                .both => "yarn_factor+config-overrides",
+            };
+        }
+    };
+
+    yarn: bool,
+    /// 1 when the RoPE is not YaRN.
+    factor: f32,
+    /// The window a YaRN factor scales from; the model's window otherwise.
+    original: u32,
+    /// `max_position_embeddings` as parsed.
+    window: u32,
+    /// What changed the RoPE from the config.json's own.
+    source: Source = .none,
+
+    pub fn text(self: Rope, buf: []u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        const printed = if (self.yarn)
+            w.print("yarn x{d} over {d}, window {d}", .{ self.factor, self.original, self.window })
+        else
+            w.print("native, window {d}", .{self.window});
+        printed catch return "RoPE not printable";
+        if (self.source != .none) w.print(" [override: {s}]", .{self.source.name()}) catch {};
+        return buf[0..w.end];
+    }
+
+    pub fn writeJson(self: Rope, w: *std.Io.Writer) !void {
+        try w.print("{{\"method\": \"{s}\", \"factor\": {d}, \"original\": {d}, \"window\": {d}, \"override\": \"{s}\"}}", .{
+            if (self.yarn) "yarn" else "native", self.factor, self.original, self.window, self.source.name(),
+        });
+    }
+
+    fn fromJson(v: std.json.Value) ?Rope {
+        const o = switch (v) {
+            .object => |x| x,
+            else => return null,
+        };
+        const method = switch (o.get("method") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        const name = switch (o.get("override") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        const source: Source = for (std.enums.values(Source)) |s| {
+            if (std.mem.eql(u8, name, s.name())) break s;
+        } else return null;
+        return .{
+            .yarn = std.mem.eql(u8, method, "yarn"),
+            .factor = @floatCast(floatField(o, "factor")),
+            .original = @intCast(intField(o, "original")),
+            .window = @intCast(intField(o, "window")),
+            .source = source,
+        };
+    }
+};
+
 pub const BaselineMeta = struct {
+    /// Null stamps nothing: a path that cannot say what RoPE it ran.
+    rope: ?Rope = null,
     label: []const u8,
     model: []const u8,
     run: []const u8,
@@ -297,6 +370,8 @@ pub const Baseline = struct {
     tokens_per_prompt: u32 = 0,
     top_k: u32 = 0,
     ssd_budget_gb: u64 = 0,
+    /// The RoPE the teacher ran under; null for a fixture captured before it was stamped.
+    rope: ?Rope = null,
     prompts: []FixturePrompt = &.{},
 
     pub fn deinit(self: *Baseline) void {
@@ -367,6 +442,7 @@ pub fn readBaseline(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !
     b.tokens_per_prompt = @intCast(intField(root, "tokens_per_prompt"));
     b.top_k = @intCast(intField(root, "top_k"));
     b.ssd_budget_gb = intField(root, "ssd_budget_gb");
+    if (root.get("rope")) |r| b.rope = Rope.fromJson(r);
     const arr = switch (root.get("prompts") orelse return error.BadBaselineJson) {
         .array => |a| a,
         else => return error.BadBaselineJson,
@@ -457,6 +533,10 @@ pub fn writeBaseline(
     try w.print(",\n  \"tokens_per_prompt\": {d}", .{meta.tokens_per_prompt});
     try w.print(",\n  \"top_k\": {d}", .{meta.top_k});
     try w.print(",\n  \"elapsed_secs\": {d}", .{meta.elapsed_secs});
+    if (meta.rope) |r| {
+        try w.writeAll(",\n  \"rope\": ");
+        try r.writeJson(w);
+    }
     try w.writeAll(",\n  \"prompts\": [\n");
     for (records, 0..) |r, i| {
         try w.writeAll("    {\"id\": ");
@@ -1235,4 +1315,32 @@ test "kld fixture: a tiny fixture reads back through the sources, the token list
     }
     try testing.expectError(error.TeacherLogitsSizeMismatch, TeacherLogits.open(allocator, root, base.prompts[0].dir, 5));
     try testing.expectError(error.TeacherLogitsMissing, TeacherLogits.open(allocator, root, "prompts/99_none", 3));
+}
+
+test "kld fixture: the RoPE a teacher ran under is stamped in baseline.json and read back; an older fixture reads as unstamped" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const meta: BaselineMeta = .{ .label = "t", .model = "m", .run = "t", .kv_cache_format = "bf16", .inference_profile = "greedy", .prompt_set = "p", .ssd_budget_gb = 0, .tokens_per_prompt = 1, .top_k = 1, .elapsed_secs = 0 };
+
+    try writeBaseline(allocator, io, root, meta, &.{});
+    var plain = try readBaseline(allocator, io, root);
+    defer plain.deinit();
+    try testing.expectEqual(@as(?Rope, null), plain.rope);
+
+    const yarn: Rope = .{ .yarn = true, .factor = 2, .original = 262144, .window = 524288, .source = .model_settings };
+    var stamped = meta;
+    stamped.rope = yarn;
+    try writeBaseline(allocator, io, root, stamped, &.{});
+    var base = try readBaseline(allocator, io, root);
+    defer base.deinit();
+    try testing.expectEqual(yarn, base.rope.?);
+
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("yarn x2 over 262144, window 524288 [override: yarn_factor]", yarn.text(&buf));
+    const native: Rope = .{ .yarn = false, .factor = 1, .original = 262144, .window = 262144 };
+    try testing.expectEqualStrings("native, window 262144", native.text(&buf));
 }

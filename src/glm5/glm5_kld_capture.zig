@@ -770,7 +770,7 @@ fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kl
     if (imatrix) |c| _ = try c.flush();
     if (ledger) |*l| l.dropImatrixStatesExcept(io, std.math.maxInt(usize));
     const elapsed = @as(f64, @floatFromInt(started.untilNow(io, .awake).nanoseconds)) / 1e9;
-    try fixture_mod.writeBaseline(a, io, staging, .{ .label = opts.label, .model = opts.model_dir, .run = opts.label, .kv_cache_format = "bf16", .inference_profile = "greedy-native-glm-streamed", .prompt_set = opts.prompts, .ssd_budget_gb = opts.ssd_budget_bytes >> 30, .tokens_per_prompt = opts.tokens, .top_k = opts.top_k, .elapsed_secs = elapsed }, records.items);
+    try fixture_mod.writeBaseline(a, io, staging, .{ .rope = kld.ropeOf(cfg), .label = opts.label, .model = opts.model_dir, .run = opts.label, .kv_cache_format = "bf16", .inference_profile = "greedy-native-glm-streamed", .prompt_set = opts.prompts, .ssd_budget_gb = opts.ssd_budget_bytes >> 30, .tokens_per_prompt = opts.tokens, .top_k = opts.top_k, .elapsed_secs = elapsed }, records.items);
     var peak: usize = 0;
     var cached: usize = 0;
     try mlx.check(mlx.mlx_get_peak_memory(&peak));

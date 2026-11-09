@@ -162,6 +162,33 @@ native tree.
   adaptive rows won 6-20% on Sushi-2.6bpw at every rung and tie on Sushi-4bpw, where novel prose runs 11% under MTP
   (numbers and settings: [qwen4-perf](qwen4-perf.md#dflash2)). That is why MTP stays the default.
 
+## Context extension (YaRN)
+
+- The native window is 262,144. A config that declares `rope_parameters.rope_type: "yarn"` (`factor`,
+  `original_max_position_embeddings`) is read whole by `parseYarnRopeParameters`; the Sushi packs ship ×4 (1,048,576).
+  Qwen is the only served arch whose RoPE reads YaRN (`Facts.reads_yarn`).
+- **`yarn_factor` ("2" or "4") is the per-model setting** (`model-settings.json`, Models page "Context extension").
+  Unset, the model's own `config.json` rules. Set, the config is parsed with `{"text_config":{"max_position_embeddings":
+  native×N,"rope_parameters":{"rope_type":"yarn","factor":N,"original_max_position_embeddings":native}}}` merged in
+  (`model.yarnOverrideDoc`; a flat config gets the same keys without `text_config`). `native` is the config's
+  `original_max_position_embeddings` when it already declares YaRN, else its `max_position_embeddings`, so a factor
+  never stacks on a factor: ×2 on a Sushi pack gives 524,288, not 2,097,152. The use is the BF16 source (`rope_type:
+  default`) at 1M on a big machine, and custom packs that kept the native window.
+- **One parse decides it**: `model.parseConfig` (load) and `model.parseConfigText` (the discovery stub's advertised
+  `context_cap` and `context_length`) both read the saved factor through `model_settings.yarnFactorOf`, so they cannot
+  disagree. `--config-overrides` merges AFTER the per-model overlay and wins key by key; when it names `rope_parameters`
+  or `max_position_embeddings`, `/v1/settings` reports `yarn_factor` locked by `--config-overrides`.
+- `ctx_size` follows the window: a save that would leave it above the window under the resulting factor is refused, and
+  a file already there fails the load by name ([server-lifecycle](server-lifecycle.md#settings)).
+- A factor saved for an arch that does not read YaRN is refused by the settings API with the reason, and ignored with
+  one `[model-settings]` line if a hand-edited file holds it.
+- **The prefix cache is keyed by it**: `disk_placement.modelFingerprintFor` hashes the applied factor beside the global
+  `--config-overrides`, so cached KV from one RoPE is never restored under another; with no factor the fingerprint is
+  the old one.
+- `sushi kld` stamps the RoPE it ran with into `baseline.json` and prints it; `compare` prints the teacher's beside the
+  student's ([quality-kld](quality-kld.md#the-tool)).
+- Extension can lower quality on short prompts, and the longer window needs more KV memory; the page says both.
+
 ## Oracle and fixtures
 
 - `tests/qwen4/dump_qwen4_exp_fixtures.py` is the oracle dumper. HF `hidden_states[i]` is the INPUT of layer i: compare

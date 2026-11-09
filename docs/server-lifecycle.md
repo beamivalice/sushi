@@ -212,6 +212,15 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
+- **`yarn_factor` ("2" or "4", Qwen only) shapes the config PARSE, not a stamp on it**: `model.parseConfig` and the
+  discovery stub read it, so the load, the advertised context and the prefix-cache fingerprint agree
+  ([qwen4-arch](qwen4-arch.md#context-extension-yarn)). `--config-overrides` outranks it and the API reports the key
+  locked; another arch's file value is ignored with a log line and its save is refused.
+- **A `ctx_size` is never above the model's window**: a settings save is refused when the file it leaves would hold a
+  `ctx_size` above the window the model has under the resulting `yarn_factor` (removing or lowering `yarn_factor`
+  included), naming both numbers; a hand-edited file already in that state fails the load with `[model-settings] ctx_size N
+  is above the W-token window ...` and `ContextSizeAboveWindow` (`model_load.contextWindowRefusal`). An explicit
+  `--ctx-size` outranks the file and is not judged by it.
 - **Effort tables live under `"effort:<family>"`** (`qwen4_exp`, `deepseek_v41`, `glm5_next`): `default` and one
   object per effort word holding only the changed `offered`, `sends` and `cap` (shape, validation and precedence:
   [server-http-apis](server-http-apis.md#effort-tables)). Read once at start (`model_settings.loadEffortTables`, a bad

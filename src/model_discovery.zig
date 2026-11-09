@@ -738,7 +738,58 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
 /// in weights — all sourced from `config.json` (+ chat-template presence). Lets
 /// clients see context window, dims, MoE-ness, and capabilities (tools/vision)
 /// before a cold load. `found=false` means config.json couldn't be read/parsed.
+/// The RoPE a config.json declares by itself, before any setting or launch flag.
+pub const RopeFacts = struct {
+    /// The window a YaRN factor extends from: the declared original window of a YaRN config, else its own.
+    native: u32 = 0,
+    window: u32 = 0,
+    yarn: bool = false,
+    factor: f32 = 0,
+
+    /// The window the config serves by itself, as `ModelConfig.contextCap` derives it.
+    pub fn cap(self: RopeFacts) u32 {
+        if (!self.yarn or self.factor <= 0) return self.window;
+        const scaled: f64 = @floor(@as(f64, @floatFromInt(self.native)) * self.factor);
+        const widened: u32 = if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(u32)))) std.math.maxInt(u32) else @intFromFloat(scaled);
+        return if (self.window == 0) widened else @min(widened, self.window);
+    }
+};
+
+/// `cfg` is the text block (`text_config`, else the root).
+pub fn ropeFacts(cfg: std.json.ObjectMap) RopeFacts {
+    var out: RopeFacts = .{ .window = jsonU32(cfg, "max_position_embeddings") };
+    out.native = out.window;
+    const rp = cfg.get("rope_parameters") orelse return out;
+    if (rp != .object) return out;
+    const t = rp.object.get("rope_type") orelse return out;
+    if (t != .string or !std.mem.eql(u8, t.string, "yarn")) return out;
+    out.yarn = true;
+    if (rp.object.get("factor")) |f| out.factor = switch (f) {
+        .integer => |i| @floatFromInt(i),
+        .float => |x| @floatCast(x),
+        else => 0,
+    };
+    const orig = jsonU32(rp.object, "original_max_position_embeddings");
+    if (orig > 0) out.native = orig;
+    return out;
+}
+
+/// The RoPE of the config.json at `abs_path`; `native` 0 when it cannot be read.
+pub fn readRopeFacts(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) RopeFacts {
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{trimTrailingSlash(abs_path)}) catch return .{};
+    defer allocator.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024)) catch return .{};
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    const root = parsed.value.object;
+    const text = if (root.get("text_config")) |tc| (if (tc == .object) tc.object else root) else root;
+    return ropeFacts(text);
+}
+
 pub const StubMeta = struct {
+    rope: RopeFacts = .{},
     found: bool = false,
     vocab_size: u32 = 0,
     hidden_size: u32 = 0,
@@ -818,6 +869,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     meta.hidden_size = cfgU32(root, text_cfg, "hidden_size");
     meta.num_hidden_layers = cfgU32(root, text_cfg, "num_hidden_layers");
     meta.max_position_embeddings = cfgU32(root, text_cfg, "max_position_embeddings");
+    meta.rope = ropeFacts(text_cfg orelse root);
     if (root.get("quantization")) |q| {
         if (q == .object) meta.quant_bits = jsonU32(q.object, "bits");
     }
@@ -893,10 +945,11 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
 
     var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
-    if (@import("model.zig").parseConfigFromJson(allocator, bytes)) |parsed| {
+    if (@import("model.zig").parseConfigText(io, allocator, trimmed, bytes)) |parsed| {
         var cfg = parsed;
         defer cfg.deinit(allocator);
         meta.context_cap = cfg.contextCap();
+        if (cfg.max_position_embeddings > 0) meta.max_position_embeddings = cfg.max_position_embeddings;
     } else |_| {}
     if (dir.openFile(io, "generation_config.json", .{})) |gen| {
         defer gen.close(io);
@@ -1701,4 +1754,21 @@ test "a missing default models folder is quiet, a missing --model-dir is not" {
     try std.testing.expect(!isUnusedDefaultRoot("/h/.sushi/models", error.AccessDenied, "/h"));
     try std.testing.expect(!isUnusedDefaultRoot("/elsewhere/models", error.FileNotFound, "/h"));
     try std.testing.expect(!isUnusedDefaultRoot("/h/.sushi/models", error.FileNotFound, ""));
+}
+
+test "parseStubMeta: the RoPE the config.json itself declares, native window first, whatever a setting would change" {
+    const a = std.testing.allocator;
+    const native = parseStubMeta(a, "{\"model_type\":\"qwen4_exp\",\"text_config\":{\"max_position_embeddings\":262144,\"rope_parameters\":{\"rope_type\":\"default\",\"original_max_position_embeddings\":1}}}", true);
+    try std.testing.expect(!native.rope.yarn);
+    try std.testing.expectEqual(@as(u32, 262144), native.rope.native);
+    try std.testing.expectEqual(@as(u32, 262144), native.rope.window);
+
+    const yarn = parseStubMeta(a, "{\"model_type\":\"qwen4_exp\",\"text_config\":{\"max_position_embeddings\":1048576,\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":262144}}}", true);
+    try std.testing.expect(yarn.rope.yarn);
+    try std.testing.expectEqual(@as(f32, 4), yarn.rope.factor);
+    try std.testing.expectEqual(@as(u32, 262144), yarn.rope.native);
+    try std.testing.expectEqual(@as(u32, 1048576), yarn.rope.window);
+
+    const flat = parseStubMeta(a, "{\"model_type\":\"qwen4_exp\",\"max_position_embeddings\":32768}", true);
+    try std.testing.expectEqual(@as(u32, 32768), flat.rope.native);
 }

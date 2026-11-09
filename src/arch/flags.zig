@@ -138,6 +138,7 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .prefetch = admission.expertStream(config).prefetch,
         .kv_choices = kvQuantChoices(config),
         .context_cap = config.contextCap(),
+        .reads_yarn = arch_config.fact(config, "reads_yarn"),
     };
 }
 

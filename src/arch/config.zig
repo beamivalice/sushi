@@ -109,6 +109,8 @@ pub const Facts = struct {
     chip_capped_drafter_block: bool = true,
     /// Its weight loader reads and checks the pack itself; the shared EXL3 pack index check does not apply.
     reads_own_source: bool = false,
+    /// Its RoPE reads `rope_parameters` of type yarn, so a per-model `yarn_factor` reaches it.
+    reads_yarn: bool = false,
 };
 
 /// The config data only `name`'s arch reads, parsed once with the config: its `OwnConfig`, or an empty struct where the
@@ -186,6 +188,12 @@ pub fn ofConfigType(model_type: []const u8) ?Tag {
         if (claims(registry.Mod(tag).config_types, model_type)) return tag;
     }
     return null;
+}
+
+/// Whether the arch that parses `model_type` reads YaRN `rope_parameters`.
+pub fn readsYarn(model_type: []const u8) bool {
+    const tag = ofConfigType(model_type) orelse return false;
+    return factsOf(tag).reads_yarn;
 }
 
 /// Whether discovery lists a directory declaring `model_type`.

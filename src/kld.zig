@@ -490,6 +490,28 @@ fn forwardOne(l: *Loaded, ctx: *model_handle.ForwardCtx, token: u32) !mlx.mlx_ar
     return l.xfm.forwardWith(ctx, input);
 }
 
+/// The RoPE the loaded model runs under, as a capture stamps it and a compare reports it.
+pub fn ropeOf(config: *const model_mod.ModelConfig) fixture_mod.Rope {
+    const flag = model_mod.getConfigOverrides() != null;
+    return .{
+        .yarn = config.rope_yarn,
+        .factor = if (config.rope_yarn) config.yarn_factor else 1,
+        .original = if (config.rope_yarn) config.yarn_orig_max_pos else config.max_position_embeddings,
+        .window = config.max_position_embeddings,
+        .source = if (config.yarn_factor_override != null) (if (flag) .both else .model_settings) else if (flag) .launch_flag else .none,
+    };
+}
+
+fn ropeLine(out: *Out, who: []const u8, rope: ?fixture_mod.Rope) void {
+    var buf: [160]u8 = undefined;
+    out.print("[kld] RoPE {s}: {s}\n", .{ who, if (rope) |r| r.text(&buf) else "not recorded" });
+}
+
+fn writeRopeField(w: *std.Io.Writer, key: []const u8, rope: ?fixture_mod.Rope) !void {
+    try w.print(",\n  \"{s}\": ", .{key});
+    if (rope) |r| try r.writeJson(w) else try w.writeAll("null");
+}
+
 pub fn capturedSsdBudgetGb(config: *const model_mod.ModelConfig, flag_bytes: u64) u64 {
     if (!config.expert_streaming) return 0;
     if (config.expert_ssd_budget_bytes > 0) return config.expert_ssd_budget_bytes >> 30;
@@ -503,6 +525,7 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
     defer prompts.deinit();
     if (prompts.items.len == 0) return error.NoPromptsFound;
     try std.Io.Dir.cwd().createDirPath(io, opts.out_dir);
+    ropeLine(out, "capture", ropeOf(&l.config));
     const hidden = if (opts.hidden_out.len > 0)
         try hidden_capture.Writer.open(allocator, io, opts.hidden_out, l.config.num_hidden_layers, offline.hiddenCaptureWidth(&l.config))
     else
@@ -568,6 +591,7 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
     const mean_nll = nll_sum / @as(f64, @floatFromInt(records.items.len));
 
     try fixture_mod.writeBaseline(allocator, io, opts.out_dir, .{
+        .rope = ropeOf(&l.config),
         .label = opts.label,
         .model = opts.model_dir,
         .run = opts.label,
@@ -637,6 +661,9 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
     defer base.deinit();
     const count = if (opts.limit > 0 and opts.limit < base.prompts.len) opts.limit else base.prompts.len;
     if (count == 0) return error.NoPromptsFound;
+    const student_rope = ropeOf(&l.config);
+    ropeLine(out, "teacher", base.rope);
+    ropeLine(out, "student", student_rope);
 
     var scores: std.ArrayList(PromptScore) = .empty;
     defer scores.deinit(allocator);
@@ -828,6 +855,8 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         try w.writeAll(",\n  \"kv_cache_format\": ");
         try fixture_mod.writeJsonString(w, kvCacheFormat(opts.kv_quant_config));
         try w.print(",\n  \"expert_pick_tolerance\": {d}", .{opts.pick_tolerance});
+        try writeRopeField(w, "teacher_rope", base.rope);
+        try writeRopeField(w, "student_rope", student_rope);
         try w.writeAll(",\n  ");
         try writeMemoryReportFields(w, memory);
         try w.print(",\n  \"mean_kld\": {d},\n  \"mean_top1\": {d},\n  \"mean_nll\": {d},\n  \"mean_cosine_similarity\": {d},\n  \"mean_cosine_loss\": {d},\n  \"worst_cosine_loss\": {d},\n  \"positions\": {d}", .{
@@ -1114,4 +1143,27 @@ test "kld: a missing fixture or prompt source is found before any model loads" {
     try testing.expect(std.mem.indexOf(u8, why_prompts, "--prompts /no/such/prompts") != null);
     const bundled = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "standard4", "--out", "/o" });
     try testing.expect(inputRefusal(testing.allocator, io, bundled, &buf) == null);
+}
+
+test "kld: ropeOf names the RoPE a model runs under and what overrode it" {
+    defer model_mod.setConfigOverrides(null);
+    var yarn = model_mod.ModelConfig{ .max_position_embeddings = 524_288, .rope_yarn = true, .yarn_factor = 2, .yarn_orig_max_pos = 262_144, .yarn_factor_override = 2 };
+    const native = model_mod.ModelConfig{ .max_position_embeddings = 262_144 };
+
+    const stamped = ropeOf(&yarn);
+    try testing.expect(stamped.yarn);
+    try testing.expectEqual(@as(f32, 2), stamped.factor);
+    try testing.expectEqual(@as(u32, 262_144), stamped.original);
+    try testing.expectEqual(@as(u32, 524_288), stamped.window);
+    try testing.expectEqual(fixture_mod.Rope.Source.model_settings, stamped.source);
+
+    const plain = ropeOf(&native);
+    try testing.expect(!plain.yarn);
+    try testing.expectEqual(@as(f32, 1), plain.factor);
+    try testing.expectEqual(@as(u32, 262_144), plain.original);
+    try testing.expectEqual(fixture_mod.Rope.Source.none, plain.source);
+
+    model_mod.setConfigOverrides("{}");
+    try testing.expectEqual(fixture_mod.Rope.Source.both, ropeOf(&yarn).source);
+    try testing.expectEqual(fixture_mod.Rope.Source.launch_flag, ropeOf(&native).source);
 }

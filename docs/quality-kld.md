@@ -18,6 +18,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
   scores a fixture through it. What an arch adds to the tools lives in its folder (`<arch>/*_kld*.zig`, the `kld`
   declaration of its `arch.zig`) and is reached through `src/arch/offline.zig`: its hidden-capture width, launch
   refusals, own capture path, post-load setup and the imatrix names of its source checkpoint.
+- A capture stamps the RoPE it ran under (`baseline.json` `rope`: method `native|yarn`, factor, original, window, and
+  `override`: `none`, `yarn_factor`, `config-overrides` or both) and prints `[kld] RoPE capture: ...`; `compare` prints
+  the teacher's and the student's and writes `teacher_rope` and `student_rope` to `--json`. A YaRN teacher is allowed;
+  it is never unseen. A fixture captured before the stamp reads "not recorded".
 - `compare` prints two lines: "to-first-EOS" and all-positions. **Quote the first-EOS number** (the owner's tables);
   give the all-positions number beside it when comparing with older records.
 - `kld` takes the SERVED weight loader (`model.loadWeightsForConfig`); a second loader once bound a MiMo pack's raw FP8

@@ -1131,7 +1131,7 @@ pub fn runLoadedMode(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld
     if (collector) |c| _ = try c.flush();
     run.dropStale(prompts.items.len);
     const elapsed = @as(f64, @floatFromInt(started.untilNow(io, .awake).nanoseconds)) / 1e9;
-    try fixture_mod.writeBaseline(a, io, staging, .{ .label = opts.label, .model = opts.model_dir, .run = opts.label, .kv_cache_format = "bf16", .inference_profile = "greedy", .prompt_set = opts.prompts, .ssd_budget_gb = kld.capturedSsdBudgetGb(&l.config, opts.ssd_budget_bytes), .tokens_per_prompt = opts.tokens, .top_k = opts.top_k, .elapsed_secs = elapsed }, records.items);
+    try fixture_mod.writeBaseline(a, io, staging, .{ .rope = kld.ropeOf(&l.config), .label = opts.label, .model = opts.model_dir, .run = opts.label, .kv_cache_format = "bf16", .inference_profile = "greedy", .prompt_set = opts.prompts, .ssd_budget_gb = kld.capturedSsdBudgetGb(&l.config, opts.ssd_budget_bytes), .tokens_per_prompt = opts.tokens, .top_k = opts.top_k, .elapsed_secs = elapsed }, records.items);
     try util.completeBaseline(a, io, staging, records.items.len, opts.tokens);
     if (!std.mem.eql(u8, &config_sha, &try util.metadataHash(a, io, opts.model_dir, "config.json")) or !std.mem.eql(u8, &stat_sha, &try sourceStatSha(a, io, opts.model_dir))) return error.Dsv41CaptureSourceChanged;
     if (!mode.lean) try finalizeSums(a, io, calib, prompts.items.len, dc);

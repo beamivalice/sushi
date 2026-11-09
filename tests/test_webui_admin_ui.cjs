@@ -23,7 +23,7 @@ const KEYS = [
   { name: 'mtp', type: 'bool' }, { name: 'mtp_acceptance', type: 'choice', choices: ['exact', 'typical', 'tokenv3'] }, { name: 'mtp_greedy_tail', type: 'bool' },
   { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
   { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' },
-  { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 },
+  { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 }, { name: 'yarn_factor', type: 'choice', choices: ['2', '4'] },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
 const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'mtp_acceptance', 'mtp_greedy_tail', 'preserve_thinking', 'think_penalty', 'max_tokens'];
@@ -62,7 +62,7 @@ function makeServer(opts = {}) {
   };
   const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_total: m.bytes_total, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ...(m.error ? { error: m.error } : {}), ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit', ...(m.pack_update ? { pack_update: m.pack_update } : {}) } })) });
   const settingsBody = () => ({ file: '/h/.sushi/model-settings.json', applies: 'next load of the model', model_keys: KEYS, server: state.server, gpu_limit: state.gpuLimit,
-    models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, defaults: m.defaults ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
+    models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, rope: m.rope ?? null, defaults: m.defaults ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
   if (opts.limits) {
     state.models[0].limits = { ctx_size: { max: 131072, why: "This model's context window is 131072 tokens." }, kv_quant: { choices: ['off', '8'], why: '4-bit and 6-bit need a different cache layout.' },
       mtp_acceptance: { requires: { mtp: true }, why: 'Used only while MTP is on.' }, mtp_greedy_tail: { requires: { mtp: true }, why: 'Used only while MTP is on.' } };
@@ -1487,6 +1487,35 @@ async function main() {
       await page.waitForSelector('#folderPicker:not([open])', { state: 'attached' });
       assert.equal(await page.textContent('#directoryName'), 'models');
       assert.equal(server.count('/v1/settings', 'POST'), 0, 'a chat folder is not the models folder');
+    });
+
+    const withYarn = (rope, file) => (s) => { Object.assign(s.state.models[0], { keys: [...BASE_KEYS, 'yarn_factor'], rope }); if (file) s.state.models[0].settings.yarn_factor = keyState({ file, source: 'file' }); };
+    await scenario('Context extension offers Model default, YaRN x2 and x4, and previews the resulting window before a load', { path: '/models#Qwen-A', setup: withYarn({ method: 'native', factor: 0, native: 262144, window: 262144 }) }, async ({ page, server }) => {
+      server.state.models[0].state = 'unloaded';
+      await page.waitForSelector(`${row('yarn_factor')} select`);
+      assert.match(await page.textContent(`${row('yarn_factor')} .lab`), /Context extension/);
+      assert.deepEqual(await page.$$eval(`${row('yarn_factor')} select option`, (o) => o.map((n) => n.textContent)), ['Model default', 'YaRN ×2', 'YaRN ×4']);
+      assert.match(await page.textContent(`${row('yarn_factor')} .help`), /lower quality on short prompts.*more memory/);
+      assert.match(await page.textContent(`${row('yarn_factor')} .hint`), /Model default: no extension · up to 262,144 tokens/);
+      await page.selectOption(`${row('yarn_factor')} select`, '2');
+      assert.match(await page.textContent(`${row('yarn_factor')} .hint`), /RoPE: yarn, factor 2, original 262,144 · up to 524,288 tokens/);
+      await page.selectOption(`${row('yarn_factor')} select`, '4');
+      assert.match(await page.textContent(`${row('yarn_factor')} .hint`), /factor 4, original 262,144 · up to 1,048,576 tokens/);
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForFunction(() => document.querySelector('.set[data-key="yarn_factor"] .badges')?.textContent.includes('Saved'));
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').map((c) => c.body).at(-1), { model: 'Qwen-A', set: { yarn_factor: '4' } });
+    });
+    await scenario('a pack that already ships YaRN previews the same window and says what the model default is', { path: '/models#Qwen-A', setup: withYarn({ method: 'yarn', factor: 4, native: 262144, window: 1048576 }) }, async ({ page }) => {
+      await page.waitForSelector(`${row('yarn_factor')} select`);
+      assert.match(await page.textContent(`${row('yarn_factor')} .hint`), /Model default: yarn, factor 4, original 262,144 · up to 1,048,576 tokens/);
+      await page.selectOption(`${row('yarn_factor')} select`, '2');
+      assert.match(await page.textContent(`${row('yarn_factor')} .hint`), /factor 2, original 262,144 · up to 524,288 tokens/);
+    });
+    await scenario('--config-overrides on the RoPE locks Context extension and says the flag outranks it', { path: '/models#Qwen-A', setup: (s) => { withYarn({ method: 'native', factor: 0, native: 262144, window: 262144 }, '2')(s); Object.assign(s.state.models[0].settings.yarn_factor, { flag: '--config-overrides', source: 'flag', locked: true }); } }, async ({ page }) => {
+      await page.waitForSelector(`${row('yarn_factor')} select`);
+      assert.equal(await page.isDisabled(`${row('yarn_factor')} select`), true);
+      assert.match(await page.textContent(`${row('yarn_factor')} .help`), /--config-overrides.*outranks/);
+      assert.match(await page.textContent(row('yarn_factor')), /Set at launch/);
     });
 
     if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);

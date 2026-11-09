@@ -69,7 +69,7 @@ const config_file = @import("qwen4_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "qwen4_exp", "qwen4_exp_text" };
 pub const discovery_types = config_types;
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .hyper_connected = true, .chip_capped_drafter_block = false, .dflash_by_flag = true, .long_ctx_gated = true, .sushi_quant_memory_bill = true, .thinking_off_checkpoint = true, .skips_mtp_weights_when_off = true, .expert_source = .language_model_banks, .mtp_head_marker = "\"language_model.mtp.fc_hidden.weight\"", .streams_rate_groups = true, .mtp_draft_temp = 1.0, .cost_layout = .long };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .hyper_connected = true, .chip_capped_drafter_block = false, .dflash_by_flag = true, .long_ctx_gated = true, .sushi_quant_memory_bill = true, .thinking_off_checkpoint = true, .skips_mtp_weights_when_off = true, .expert_source = .language_model_banks, .mtp_head_marker = "\"language_model.mtp.fc_hidden.weight\"", .streams_rate_groups = true, .mtp_draft_temp = 1.0, .cost_layout = .long, .reads_yarn = true };
 pub const pack_layout: arch_config.PackLayout = .{ .prefix = "language_model.model", .head = .{ .layer = "language_model.mtp.layers.0" }, .streams_groups = true };
 pub const parseConfig = config_file.parseFamily;
 pub const parseDir = config_file.parseDir;

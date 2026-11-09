@@ -41,6 +41,7 @@ const expert_exl3 = sushi_exl3.format;
 const tokenizer_mod = @import("tokenizer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
+const model_settings_mod = @import("model_settings.zig");
 const effort_mod = @import("effort.zig");
 const arch_config = @import("arch/config.zig");
 const registry = @import("arch/registry.zig");
@@ -348,6 +349,8 @@ pub const ModelConfig = struct {
     logit_bias_file_override: ?@import("logit_bias.zig").FilePath = null,
     vision_override: ?bool = null,
     max_tokens_override: ?u32 = null,
+    /// The per-model `yarn_factor` the config was parsed with; null = none applied (unset, or an arch that ignores it).
+    yarn_factor_override: ?u8 = null,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -1078,6 +1081,12 @@ pub const ModelConfig = struct {
     }
 };
 
+/// The config.json bytes of `model_dir` parsed under the per-model settings: the YaRN factor saved for it shapes the
+/// parse here, so a load and the discovery stub (the advertised context) cannot read different RoPEs.
+pub fn parseConfigText(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, content: []const u8) !ModelConfig {
+    return parseConfigFromJsonFor(allocator, content, model_settings_mod.yarnFactorOf(allocator, io, model_dir));
+}
+
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
     const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
     defer allocator.free(path);
@@ -1090,7 +1099,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     const content = try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(content);
 
-    var config = try parseConfigFromJson(allocator, content);
+    var config = try parseConfigText(io, allocator, model_dir, content);
     errdefer config.deinit(allocator);
     config.gdn_state_f32 = qwen_gdn_f32;
     config.drop_expert = drop_expert;
@@ -1400,16 +1409,71 @@ fn mergeObjects(a: std.mem.Allocator, dst: *std.json.ObjectMap, src: std.json.Ob
     }
 }
 
+/// The overlay a per-model `yarn_factor` puts on a config.json: YaRN of `factor` over the model's native window, and the
+/// window scaled to match. A config that already declares YaRN is extended from its own `original_max_position_embeddings`,
+/// so a factor never stacks on a factor. Caller frees.
+pub fn yarnOverrideDoc(allocator: std.mem.Allocator, content: []const u8, factor: u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = try cfgObject(try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), content, .{}));
+    const nested = if (root.get("text_config")) |tc| tc == .object else false;
+    const cfg = if (nested) root.get("text_config").?.object else root;
+    const native = model_discovery.ropeFacts(cfg).native;
+    if (native == 0) return error.YarnNativeWindowUnknown;
+    const widened = std.math.mul(u32, native, factor) catch return error.YarnWindowTooLarge;
+    const body = try std.fmt.allocPrint(allocator, "\"max_position_embeddings\":{d},\"rope_parameters\":{{\"rope_type\":\"yarn\",\"factor\":{d}.0,\"original_max_position_embeddings\":{d}}}", .{ widened, factor, native });
+    defer allocator.free(body);
+    return if (nested)
+        std.fmt.allocPrint(allocator, "{{\"text_config\":{{{s}}}}}", .{body})
+    else
+        std.fmt.allocPrint(allocator, "{{{s}}}", .{body});
+}
+
+/// Whether `--config-overrides` names the RoPE or the window, which then outrank a per-model `yarn_factor`.
+pub fn configOverridesSetRope() bool {
+    const raw = config_overrides orelse return false;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{}) catch return false;
+    if (doc != .object) return false;
+    const names_rope = struct {
+        fn at(o: std.json.ObjectMap) bool {
+            return o.get("rope_parameters") != null or o.get("max_position_embeddings") != null;
+        }
+    }.at;
+    if (names_rope(doc.object)) return true;
+    return if (doc.object.get("text_config")) |tc| tc == .object and names_rope(tc.object) else false;
+}
+
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
+    return parseConfigFromJsonFor(allocator, content, null);
+}
+
+/// `parseConfigFromJson` under a per-model `yarn_factor`. The overlay layers under `--config-overrides`, so the launch flag wins.
+pub fn parseConfigFromJsonFor(allocator: std.mem.Allocator, content: []const u8, yarn_factor: ?u8) !ModelConfig {
+    var applied: ?u8 = null;
+    const per_model: ?[]const u8 = if (yarn_factor) |f| blk: {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const root = try cfgObject(try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), content, .{}));
+        const mt = if (cfgField(root, "model_type")) |v| try cfgString(v) else "";
+        if (!arch_config.readsYarn(mt)) break :blk null;
+        const doc = try yarnOverrideDoc(allocator, content, f);
+        defer allocator.free(doc);
+        applied = f;
+        break :blk try mergeConfigJson(allocator, content, doc);
+    } else null;
+    defer if (per_model) |m| allocator.free(m);
+
     // The launch-time overrides apply to EVERY parse (primary load, on-demand
     // load, discovery stubs), so the advertised context and the loaded model
     // can never disagree about what window the checkpoint has.
     const merged: ?[]const u8 = if (config_overrides) |ov| blk: {
-        break :blk try mergeConfigJson(allocator, content, ov);
+        break :blk try mergeConfigJson(allocator, per_model orelse content, ov);
     } else null;
     defer if (merged) |m| allocator.free(m);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged orelse content, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged orelse per_model orelse content, .{});
     defer parsed.deinit();
 
     const root = try cfgObject(parsed.value);
@@ -1587,6 +1651,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         } else "unsupported";
     }
 
+    config.yarn_factor_override = applied;
     return config;
 }
 
@@ -4417,4 +4482,81 @@ test "a parsed config carries its arch tag; a hand-built one resolves it from mo
         try testing.expect(!arch_config.isOf(parsed, "glm5"));
     }
     try testing.expect(!arch_config.isOf(ModelConfig{ .model_type = "mistral" }, "qwen4"));
+}
+
+fn nativeQwen4Doc(allocator: std.mem.Allocator) ![]const u8 {
+    return mergeConfigJson(allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"), "{\"text_config\":{\"max_position_embeddings\":262144,\"rope_parameters\":{\"rope_type\":\"default\"}}}");
+}
+
+test "yarn_factor: a native checkpoint is extended from its own window, and the window follows" {
+    if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    const doc = try nativeQwen4Doc(testing.allocator);
+    defer testing.allocator.free(doc);
+    var plain = try parseConfigFromJsonFor(testing.allocator, doc, null);
+    defer plain.deinit(testing.allocator);
+    try testing.expect(!plain.rope_yarn);
+    try testing.expectEqual(@as(u32, 262_144), plain.max_position_embeddings);
+    try testing.expectEqual(@as(?u8, null), plain.yarn_factor_override);
+    for ([_]u8{ 2, 4 }) |factor| {
+        var c = try parseConfigFromJsonFor(testing.allocator, doc, factor);
+        defer c.deinit(testing.allocator);
+        try testing.expect(c.rope_yarn);
+        try testing.expectEqual(@as(f32, @floatFromInt(factor)), c.yarn_factor);
+        try testing.expectEqual(@as(u32, 262_144), c.yarn_orig_max_pos);
+        try testing.expectEqual(@as(u32, 262_144) * factor, c.max_position_embeddings);
+        try testing.expectEqual(@as(?u8, factor), c.yarn_factor_override);
+        try testing.expectEqual(@as(f32, 10_000_000), c.rope_theta);
+    }
+}
+
+test "yarn_factor: a config that already declares YaRN is re-scaled from its original window, never stacked" {
+    if (registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    var c = try parseConfigFromJsonFor(testing.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"), 2);
+    defer c.deinit(testing.allocator);
+    try testing.expectEqual(@as(f32, 2), c.yarn_factor);
+    try testing.expectEqual(@as(u32, 262_144), c.yarn_orig_max_pos);
+    try testing.expectEqual(@as(u32, 524_288), c.max_position_embeddings);
+}
+
+test "yarn_factor: an arch whose RoPE does not read YaRN parses as if unset; --config-overrides outranks the setting" {
+    if (registry.ofModelType("qwen4_exp") == null or registry.ofModelType("glm5_next") == null) return error.SkipZigTest;
+    var glm = try parseConfigFromJsonFor(testing.allocator, @embedFile("fixtures/glm5_config.json"), 4);
+    defer glm.deinit(testing.allocator);
+    var glm_plain = try parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    defer glm_plain.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u8, null), glm.yarn_factor_override);
+    try testing.expectEqual(glm_plain.max_position_embeddings, glm.max_position_embeddings);
+
+    defer setConfigOverrides(null);
+    setConfigOverrides("{\"text_config\":{\"rope_parameters\":{\"factor\":4}}}");
+    const doc = try nativeQwen4Doc(testing.allocator);
+    defer testing.allocator.free(doc);
+    var c = try parseConfigFromJsonFor(testing.allocator, doc, 2);
+    defer c.deinit(testing.allocator);
+    try testing.expectEqual(@as(f32, 4), c.yarn_factor);
+}
+
+test "yarnOverrideDoc: the overlay nests under text_config only where the config does, and a window it cannot read is refused" {
+    const nested = try yarnOverrideDoc(testing.allocator, "{\"text_config\":{\"max_position_embeddings\":1000}}", 4);
+    defer testing.allocator.free(nested);
+    try testing.expectEqualStrings("{\"text_config\":{\"max_position_embeddings\":4000,\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":1000}}}", nested);
+    const flat = try yarnOverrideDoc(testing.allocator, "{\"max_position_embeddings\":1000}", 2);
+    defer testing.allocator.free(flat);
+    try testing.expectEqualStrings("{\"max_position_embeddings\":2000,\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"original_max_position_embeddings\":1000}}", flat);
+    try testing.expectError(error.YarnNativeWindowUnknown, yarnOverrideDoc(testing.allocator, "{\"model_type\":\"x\"}", 2));
+    try testing.expectError(error.YarnWindowTooLarge, yarnOverrideDoc(testing.allocator, "{\"max_position_embeddings\":4294967295}", 2));
+}
+
+test "configOverridesSetRope: only an override that names the RoPE or the window outranks the setting" {
+    defer setConfigOverrides(null);
+    setConfigOverrides(null);
+    try testing.expect(!configOverridesSetRope());
+    setConfigOverrides("{\"text_config\":{\"num_experts_per_tok\":4}}");
+    try testing.expect(!configOverridesSetRope());
+    setConfigOverrides("{\"text_config\":{\"rope_parameters\":{\"factor\":4}}}");
+    try testing.expect(configOverridesSetRope());
+    setConfigOverrides("{\"max_position_embeddings\":524288}");
+    try testing.expect(configOverridesSetRope());
+    setConfigOverrides("not json");
+    try testing.expect(!configOverridesSetRope());
 }

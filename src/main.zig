@@ -1529,6 +1529,7 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
+    if (model_mod.configOverridesSetRope()) locks.modelMut("yarn_factor").pin("--config-overrides", .{});
     if (server_state.prefix_cache_disk_source != .default) {
         var size_buf: [32]u8 = undefined;
         locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_state.prefix_cache_disk_bytes)});
@@ -1632,4 +1633,17 @@ test "launch flags: --skip-mem-preflight pins server.skip_mem_preflight, and no 
     try std.testing.expect(!model_settings_mod.launch_locks.skip_mem_preflight.set);
     pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .skip_mem_preflight = true });
     try std.testing.expectEqualStrings("--skip-mem-preflight", model_settings_mod.launch_locks.skip_mem_preflight.text());
+}
+
+test "launch flags: --config-overrides pins yarn_factor only when it names the RoPE or the window" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    defer model_mod.setConfigOverrides(null);
+    model_settings_mod.launch_locks = .{};
+    model_mod.setConfigOverrides("{\"text_config\":{\"num_experts_per_tok\":4}}");
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.model("yarn_factor").?.set);
+    model_mod.setConfigOverrides("{\"text_config\":{\"rope_parameters\":{\"factor\":4}}}");
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expectEqualStrings("--config-overrides", model_settings_mod.launch_locks.model("yarn_factor").?.text());
 }

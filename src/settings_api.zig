@@ -46,6 +46,8 @@ pub const ModelRow = struct {
     /// What each key resolves to with no flag and no file value, for a ready model; a null field = not knowable.
     defaults: ?model_settings.Override = null,
     tier: ?TierView = null,
+    /// The RoPE the pack's own config.json declares; `native` 0 = not read.
+    rope: model_discovery.RopeFacts = .{},
 };
 
 pub const ServerView = struct {
@@ -75,6 +77,7 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "think_penalty")) return if (o.think_penalty) |v| .{ .float = v } else null;
     if (eql(u8, name, "vision")) return if (o.vision) |v| .{ .bool = v } else null;
     if (eql(u8, name, "max_tokens")) return if (o.max_tokens) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "yarn_factor")) return if (o.yarn_factor) |v| .{ .string = if (v == 2) "2" else "4" } else null;
     return null;
 }
 
@@ -92,6 +95,7 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .think_penalty = config.think_penalty_override,
         .vision = config.vision_override,
         .max_tokens = config.max_tokens_override,
+        .yarn_factor = config.yarn_factor_override,
     };
 }
 
@@ -365,6 +369,12 @@ pub fn render(
         };
         try w.writeAll("],\"limits\":");
         try writeLimits(w, row.fit);
+        try w.writeAll(",\"rope\":");
+        if (row.rope.native == 0) {
+            try w.writeAll("null");
+        } else try w.print("{{\"method\":\"{s}\",\"factor\":{d},\"native\":{d},\"window\":{d}}}", .{
+            if (row.rope.yarn) "yarn" else "native", row.rope.factor, row.rope.native, row.rope.window,
+        });
         try w.writeAll(",\"loaded_with\":");
         if (row.loaded) |o| {
             try w.writeAll("{");
@@ -601,6 +611,9 @@ fn stubFit(io: std.Io, allocator: std.mem.Allocator, row: *const ModelRow) model
 fn readPackFacts(io: std.Io, allocator: std.mem.Allocator, row: *ModelRow) void {
     if (row.loaded == null) row.fit = stubFit(io, allocator, row);
     row.fit.mtp_head = model_load.packShipsMtpHead(io, allocator, row.fit.arch, row.path);
+    row.rope = model_discovery.readRopeFacts(io, allocator, row.path);
+    row.fit.window_native = row.rope.native;
+    row.fit.window_default = row.rope.cap();
     if (row.loaded != null) return;
     var chat_config = chat.loadChatConfig(io, allocator, row.path) catch return;
     defer chat_config.deinit();
@@ -681,7 +694,7 @@ fn dirReadable(io: std.Io, path: []const u8) bool {
 
 /// The 400 text for the first edit this model cannot honour, or null.
 fn refusalMessage(arena: std.mem.Allocator, fit: model_settings.Fit, existing: ?std.json.ObjectMap, edits: []const Edit) ?[]const u8 {
-    var why_buf: [128]u8 = undefined;
+    var why_buf: [192]u8 = undefined;
     const r = model_settings.refuseEdits(fit, existing, edits, &why_buf) orelse return null;
     return std.fmt.allocPrint(arena, "\"{s}\" cannot be set for this model: {s}", .{ r.key, r.why }) catch "a setting this model cannot honour";
 }
@@ -812,13 +825,13 @@ fn savesSsdTier(plan: Plan) bool {
 
 /// Whether saving `key` changes what a load or its preflight reads, so a model that failed to load deserves another try.
 pub fn reachesLoad(key: []const u8) bool {
-    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
+    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
     for (reads) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
 
 test "settings api: every saved key is classified, and the ones a load reads clear a stored load failure" {
-    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
+    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
     for ([_][]const u8{ "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" }) |key| {
@@ -838,7 +851,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
@@ -1588,4 +1601,49 @@ test "settings api: a start reads the file's tables, skipping each bad field wit
     try testing.expectEqual(effort_mod.Effort.high, effort_mod.table(.deepseek_v41).default);
     try testing.expect(!effort_mod.table(.deepseek_v41).row(.medium).offered);
     try testing.expectEqualDeep(effort_mod.builtin(.qwen4_exp), effort_mod.table(.qwen4_exp));
+}
+
+test "settings api: yarn_factor is offered where the arch reads YaRN, carries the config's own RoPE, and reports the launch flag that outranks it" {
+    var file = try model_settings.parse(testing.allocator, "{\"/m/a\":{\"yarn_factor\":2}}");
+    defer file.deinit();
+    var locks: model_settings.LaunchLocks = .{};
+    const rows = [_]ModelRow{
+        .{ .id = "qwen", .path = "/m/a", .state = "unloaded", .bytes = 5, .rope = .{ .native = 262144, .window = 262144 }, .fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .reads_yarn = true } },
+        .{ .id = "glm", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "glm5_next", .streams_experts = false, .has_vision = false, .reads_yarn = false } },
+    };
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    {
+        const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const models = parsed.value.object.get("models").?.array.items;
+        var offered = false;
+        for (models[0].object.get("keys").?.array.items) |k| offered = offered or std.mem.eql(u8, k.string, "yarn_factor");
+        try testing.expect(offered);
+        const rope = models[0].object.get("rope").?.object;
+        try testing.expectEqual(@as(i64, 262144), rope.get("native").?.integer);
+        try testing.expectEqualStrings("native", rope.get("method").?.string);
+        try testing.expectEqualStrings("2", models[0].object.get("settings").?.object.get("yarn_factor").?.object.get("file").?.string);
+        try testing.expect(!models[0].object.get("settings").?.object.get("yarn_factor").?.object.get("locked").?.bool);
+        try testing.expect(models[1].object.get("rope").? == .null);
+        try testing.expect(models[1].object.get("limits").?.object.get("yarn_factor").?.object.get("disabled").?.bool);
+    }
+    locks.modelMut("yarn_factor").pin("--config-overrides", .{});
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, view);
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const pinned = parsed.value.object.get("models").?.array.items[0].object.get("settings").?.object.get("yarn_factor").?.object;
+    try testing.expect(pinned.get("locked").?.bool);
+    try testing.expectEqualStrings("--config-overrides", pinned.get("flag").?.string);
+}
+
+test "settings api: a save of yarn_factor for an arch that does not read YaRN is refused with the reason" {
+    const other: model_settings.Fit = .{ .arch = "glm5_next", .streams_experts = false, .has_vision = false, .reads_yarn = false };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const text = refusalMessage(arena.allocator(), other, null, &.{.{ .key = "yarn_factor", .value = .{ .string = "4" } }}).?;
+    try testing.expectEqualStrings("\"yarn_factor\" cannot be set for this model: This model's RoPE has no YaRN context extension.", text);
+    try testing.expect(refusalMessage(arena.allocator(), other, null, &.{.{ .key = "yarn_factor", .value = null }}) == null);
 }
