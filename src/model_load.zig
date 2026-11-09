@@ -1400,7 +1400,23 @@ test "a cold load reads the serving bill on the config the load stamps with the 
 /// On any error the partial state has already been freed via errdefer; the
 /// caller decides how to surface (startup → recordLoadError + signal
 /// started; on-demand → req.error_name + done broadcast).
+/// The MLX message behind a failed load step, for its log line.
+fn latchedCause(buf: *[512]u8) []const u8 {
+    return mlx.peekErrorMessage(buf) orelse "no MLX message";
+}
+
+/// An MLX error the load raised and nothing handled is said once and cleared, so it cannot become the first request's
+/// `MlxFailure`. A step whose result matters returns `error.MlxError` through `mlx.check` and stops the load; what is
+/// latched here came from a call nobody checked, after the weights bound and the warmups ran.
+fn settleLoadLatch(had_error: bool) void {
+    if (had_error) return; // raised before the load began: it belongs to someone else
+    var buf: [512]u8 = undefined;
+    const msg = mlx.takeError(&buf) orelse return;
+    log.warn("[load] MLX raised an error nothing handled during the load; cleared so the first request does not fail on it: {s}\n", .{msg});
+}
+
 pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    const had_error_at_start = mlx.errorPending();
     try model_mod.archGate(params.config);
     if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});
     var streaming_resident_bytes: ?u64 = null;
@@ -2023,18 +2039,21 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.warmup_eager) {
         const warmup_start = std.Io.Timestamp.now(sch.io, .awake);
         xfm_ptr.warmup() catch |err| {
-            log.warn("Warmup failed ({s}); continuing without it — first request may be slow.\n", .{@errorName(err)});
+            var cause: [512]u8 = undefined;
+            log.warn("Warmup failed ({s}: {s}); continuing without it — first request may be slow.\n", .{ @errorName(err), latchedCause(&cause) });
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
         if (mtp_enabled) {
             const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
             arch_load.warmVerify(params.config, xfm_ptr, cap, kv_quant_config) catch |err| {
-                log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
+                var cause: [512]u8 = undefined;
+                log.warn("[spec-warmup] failed ({s}: {s}); the first round at each width pays its kernel compile inside the round.\n", .{ @errorName(err), latchedCause(&cause) });
             };
         }
         arch_load.warmSpec(sch.io, params.config, xfm_ptr, aux_head, kv_quant_config);
     }
+    settleLoadLatch(had_error_at_start);
 
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
@@ -2600,3 +2619,41 @@ test "a cold load refused for memory or a setting returns the entry to unloaded,
 // ── Bill pins ──
 // One test per load-time bill function, on the committed fixture config of every served pack.
 
+
+fn readLoadLogForTest(path: [*:0]const u8, buf: []u8) []const u8 {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return buf[0..0];
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, buf.ptr, buf.len);
+    return buf[0..if (n > 0) @intCast(n) else 0];
+}
+
+test "an MLX error latched during a load is named in the log and does not reach the first request" {
+    const dir = "/tmp/sushi-load-latch";
+    const path = dir ++ "/s.log";
+    _ = std.c.mkdir(dir, @as(std.c.mode_t, 0o755));
+    _ = std.c.unlink(path);
+    try log.openFile(path, 0);
+    defer {
+        log.closeFile();
+        _ = std.c.unlink(path);
+    }
+    mlx.installErrorHandler();
+    var scratch: [512]u8 = undefined;
+    _ = mlx.takeError(&scratch);
+
+    mlx.latchErrorForTest("[array] expected a non-empty mlx_array");
+    try testing.expect(mlx.errorPending());
+    settleLoadLatch(false);
+    try testing.expect(!mlx.errorPending());
+    try mlx.checkError();
+    mlx.latchErrorForTest("[decode] another request's failure");
+    settleLoadLatch(true);
+    try testing.expect(mlx.errorPending());
+    _ = mlx.takeError(&scratch);
+
+    log.closeFile();
+    var buf: [2048]u8 = undefined;
+    const text = readLoadLogForTest(path, &buf);
+    try testing.expect(std.mem.indexOf(u8, text, "expected a non-empty mlx_array") != null);
+}

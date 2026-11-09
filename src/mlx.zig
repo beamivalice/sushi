@@ -883,6 +883,16 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
+/// The latched message copied into `buf` without clearing it, for a log line that names the cause of a failure.
+pub fn peekErrorMessage(buf: []u8) ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    const n = @min(mlx_error_len, buf.len);
+    @memcpy(buf[0..n], mlx_error_buf[0..n]);
+    return buf[0..n];
+}
+
 /// The limit MLX names when it refuses a custom-kernel launch that asks for more threads per threadgroup than
 /// the compiled pipeline allows; it varies with the kernel's register and threadgroup-memory use.
 pub fn threadgroupLimit(msg: []const u8) ?u32 {
