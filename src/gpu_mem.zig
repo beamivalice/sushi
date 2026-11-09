@@ -27,6 +27,10 @@ pub fn cacheBytes() usize {
     return cache;
 }
 
+/// Read once on the main thread in `resolveMlxCadence`: the limit is static per device, and a
+/// connection thread asking for it must not call MLX.
+var working_set_at_start = std.atomic.Value(u64).init(0);
+
 /// Metal's recommended max working-set size for the default device — the real
 /// ceiling whose breach throws `[METAL] … Insufficient Memory` from the
 /// command-buffer completion handler (which terminates the process: ggml's
@@ -37,6 +41,8 @@ pub fn cacheBytes() usize {
 /// oversubscribe. Falls back to `getMetalBufferLimit()` when the device query
 /// is unavailable (CI / non-Metal hosts).
 pub fn getGpuWorkingSetLimit() u64 {
+    const cached = working_set_at_start.load(.monotonic);
+    if (cached > 0) return cached;
     if (host_tier) return liveRead();
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
@@ -71,6 +77,28 @@ pub fn measureGpuFloor() void {
     });
 }
 
+/// Inference thread, no model resident: other processes may have released GPU memory since
+/// startup. Lowers the floor, never raises it (`bills.idleGpuFloor`).
+pub fn refreshIdleGpuFloor() void {
+    var active: usize = 0;
+    var cache: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    const in_use = metrics.getGpuInUseSystemMemBytes();
+    const was = bills.gpu_floor_bytes.load(.monotonic);
+    const floor = bills.idleGpuFloor(was, in_use, active, cache);
+    if (floor == was) return;
+    bills.gpu_floor_bytes.store(floor, .monotonic);
+    bills.wired_floor_logged.store(false, .monotonic);
+    log.info("[mem] GPU floor {d} MB (was {d} MB): system GPU in use {d} MB, MLX active {d} MB + cache {d} MB\n", .{
+        floor >> 20,
+        was >> 20,
+        in_use >> 20,
+        active >> 20,
+        cache >> 20,
+    });
+}
+
 /// Main thread, before other threads: resolve MLX's command-buffer cadence the way MLX does
 /// and say what it is, since MLX reads the env once and reports nothing.
 pub fn resolveMlxCadence() void {
@@ -94,6 +122,7 @@ pub fn resolveMlxCadence() void {
         bills.cadenceInflightBytes(bills.mlx_mb_per_buffer) >> 20,
     });
     measureGpuFloor();
+    working_set_at_start.store(getGpuWorkingSetLimit(), .monotonic);
 }
 
 /// Impure wrapper: apply the cap to the live MLX allocator. Called ONCE from

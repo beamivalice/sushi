@@ -41,8 +41,9 @@ bill function's output on the committed fixture configs of all served packs: a b
   30+ cold prefills: a 0.62 GB floor idle, MLX peaks of 30.57 GB and below passed, 30.85 GB and above failed.
   - **Non-MLX GPU floor**: under a declared limit the ceiling is the limit less the larger of `--wired-margin-gib` and
     floor + 512 MiB slack (`wiredUnplannedBytes`). The floor is read once, at startup, before MLX holds a model
-    (`measureGpuFloor`): right after a load it read 0 and 407 MB (weights still being wired), and after an unload it
-    lags high while freed pages unwire.
+    (`measureGpuFloor`), and again at a load with no model resident, lowered only (`refreshIdleGpuFloor`): other
+    processes may have released their GPU memory since. Right after a load it read 0 and 407 MB (weights still being
+    wired), and after an unload it lags high while freed pages unwire, so a reading never raises it.
   - Above the floor the counter is elastic: 1-op/1-MB command buffers drove it to the limit itself, with 1.85 GB of
     non-MLX share, and the prefill passed.
   - Other processes' memory is not the trigger here. A ballast of 1-4 GB touched incompressible RAM was swapped out
@@ -75,7 +76,7 @@ bill function's output on the committed fixture configs of all served packs: a b
   however much RAM is free. It was the larger of that and the free-RAM term, whose working set is the limit itself: a
   streamed load on a quiet 32 GB box saw 27,936 MiB of ceiling where its requests saw 26,976, and proved an 86k context
   each request then refused.
-- **A declared `iogpu.wired_limit_mb` lifts the resident Sushi preflight's available figure to the same floor request admission reads** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib`, less resident buffers, still under the working set). Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load.
+- **A declared `iogpu.wired_limit_mb` is the resident Sushi preflight's available figure, as it is request admission's ceiling** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib` or the GPU floor, less resident buffers, still under the working set), however much RAM is free. Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load; free RAM above the ceiling passed a load whose every request was then refused, a 1-token context.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`). The client-facing preflight message also names the Settings switch "Skip the memory check

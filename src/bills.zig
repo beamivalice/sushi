@@ -151,6 +151,17 @@ pub fn diskTierOn(config: *const model_mod.ModelConfig) bool {
     return diskAsk().bytes > 0 and !config.prefix_cache_disk_declined;
 }
 
+/// PURE: the boot line for a requested hot prefix cache that did not engage, naming the cause that applies.
+pub fn hotCacheDisabledLine(buf: []u8, capacity: u32, ram_enabled: bool, disk_on: bool, full_attention: bool) []const u8 {
+    const text = if (!ram_enabled and !disk_on)
+        std.fmt.bufPrint(buf, "Prefix cache: OFF, no prompt-prefix reuse (RAM retention is off and the SSD tier is off; --prefix-cache-mem <n> turns on RAM retention)", .{})
+    else if (full_attention)
+        std.fmt.bufPrint(buf, "Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled", .{capacity})
+    else
+        std.fmt.bufPrint(buf, "Hot prefix cache: requested capacity={d} but disabled by scheduler", .{capacity});
+    return text catch "Hot prefix cache: disabled";
+}
+
 /// The disk bytes the SSD-tier-dependent policies read: the launch ask, or 0 for a model whose tier is off.
 pub fn diskBytesFor(config: *const model_mod.ModelConfig) u64 {
     return if (diskTierOn(config)) diskAsk().bytes else 0;
@@ -203,6 +214,9 @@ pub fn autoContextFrom(memory_ctx: u32, ctx_cap: u32, ctx_default: u32) u32 {
     return if (ctx_cap > 0) @min(with_headroom, ctx_cap) else with_headroom;
 }
 
+/// An auto context below this is a memory shortfall, not a choice.
+const MIN_USEFUL_AUTO_CONTEXT: u32 = 1024;
+
 pub fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
     if (billedAutoContext(config)) return billedAdvertisedContext(config, computeMemoryContext(config));
     return autoContextFrom(computeMemoryContext(config), config.contextCap(), config.defaultContext());
@@ -227,7 +241,9 @@ pub fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
         config.pinned_context = autoContextFor(config);
         const want = config.defaultContext();
         if (want > 0 and config.pinned_context < want)
-            log.warn("[context] this Mac's memory bill admits {d} tokens, below the {d} the model defaults to; serving {d}\n", .{ computeMemoryContext(config), want, config.pinned_context });
+            log.warn("[context] this Mac's memory bill admits {d} tokens, below the {d} the model defaults to; serving {d}\n", .{ computeMemoryContext(config), want, config.pinned_context })
+        else if (config.pinned_context < MIN_USEFUL_AUTO_CONTEXT)
+            log.warn("[context] this Mac's memory bill admits only {d} tokens; serving {d}. Free GPU memory or check iogpu.wired_limit_mb\n", .{ computeMemoryContext(config), config.pinned_context });
     }
     return config.pinned_context;
 }
@@ -304,7 +320,8 @@ pub fn wiredLimitMbForBudget(budget_bytes: u64, kv_bytes: u64) u64 {
 /// GPU memory the wired limit counts that MLX does not own: other processes' Metal allocations
 /// (WindowServer, every app with a layer) and the driver's. `AGXAccelerator` "In use system
 /// memory" is system-wide, so this is that counter less MLX's active + cache, read once at
-/// startup before MLX holds a model (`measureGpuFloor`). A command buffer fails once MLX's peak
+/// startup before MLX holds a model (`measureGpuFloor`), and lowered at a load with no model
+/// resident (`refreshIdleGpuFloor`). A command buffer fails once MLX's peak
 /// passes the wired limit less this floor; above it the counter is elastic.
 pub var gpu_floor_bytes = std.atomic.Value(u64).init(0);
 
@@ -323,6 +340,14 @@ pub fn wiredUnplannedBytes(margin: u64, gpu_floor: u64) u64 {
 pub fn gpuFloorFrom(in_use_system: u64, mlx_active: u64, mlx_cache: u64) u64 {
     if (in_use_system == 0) return 0;
     return in_use_system -| (mlx_active +| mlx_cache);
+}
+
+/// PURE: the stored floor after a reading with no model resident. It only lowers: a reading just
+/// after an unload runs high while freed pages unwire, and a higher floor would make contexts
+/// differ from boot to boot.
+pub fn idleGpuFloor(stored: u64, in_use_system: u64, mlx_active: u64, mlx_cache: u64) u64 {
+    if (in_use_system == 0) return stored;
+    return @min(stored, gpuFloorFrom(in_use_system, mlx_active, mlx_cache));
 }
 
 /// The MB-per-buffer the prefill terms were measured at (`prefillStreamBytesPerToken` on an
@@ -505,7 +530,7 @@ pub fn defaultRequestBill(config: *const model_mod.ModelConfig) u64 {
     return prefillNeededAtChunk(&probe, config.defaultContext(), 0, 16, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], .{});
 }
 
-var wired_floor_logged = std.atomic.Value(bool).init(false);
+pub var wired_floor_logged = std.atomic.Value(bool).init(false);
 
 /// Long-context models and engaged expert streams honor the operator's wired limit.
 /// `null` config (no model resolved yet) takes no floor.
@@ -2719,6 +2744,22 @@ test "effectiveSsmCheckpointStride: zero capacity disables both tiers, RAM-off p
     try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, false, 4 << 30));
     try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 32, false, 0));
     try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32, true, 0));
+}
+
+test "the hot-cache boot line names RAM retention and the SSD tier before the attention layout" {
+    const t = std.testing;
+    var buf: [192]u8 = undefined;
+    try t.expect(std.mem.startsWith(u8, hotCacheDisabledLine(&buf, 32, false, false, true), "Prefix cache: OFF"));
+    try t.expect(std.mem.indexOf(u8, hotCacheDisabledLine(&buf, 32, true, false, true), "full-attention-interval") != null);
+    try t.expect(std.mem.indexOf(u8, hotCacheDisabledLine(&buf, 32, false, true, false), "disabled by scheduler") != null);
+}
+
+test "a load with no model resident lowers a GPU floor other processes have released, never raises it" {
+    const t = std.testing;
+    const mb: u64 = 1 << 20;
+    try t.expectEqual(16 * mb, idleGpuFloor(98_355 * mb, 16 * mb, 0, 0));
+    try t.expectEqual(620 * mb, idleGpuFloor(620 * mb, 4_000 * mb, 0, 0));
+    try t.expectEqual(98_355 * mb, idleGpuFloor(98_355 * mb, 0, 0, 0));
 }
 
 test "the bill plans the non-MLX GPU floor and the command-buffer size" {
@@ -6113,10 +6154,10 @@ pub fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
 }
 
 /// A resident Sushi load shares the working-set cap with already active model buffers. A declared
-/// wired limit (`wired_floor`, 0 = none) lifts the free-RAM figure to what that limit leaves the
-/// GPU, the same floor request admission reads.
+/// wired limit (`wired_floor`, 0 = none) replaces the free-RAM figure with what that limit leaves the
+/// GPU: the same ceiling request admission reads, however much RAM is free.
 pub fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) u64 {
-    const host = if (wired_floor > 0) @max(host_avail, wired_floor -| active) else host_avail;
+    const host = if (wired_floor > 0) wired_floor -| active else host_avail;
     const available = effectiveAvailableBytes(host, proc_avail, gpu_limit);
     return if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
 }
@@ -6209,17 +6250,26 @@ test "Sushi quant memory subtracts existing resident buffers from the GPU limit"
     try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib, 0));
 }
 
-test "a declared wired limit lifts the load preflight's free-RAM figure, never past the working set" {
+test "a declared wired limit sets the load preflight's figure, never past the working set" {
     const gib: u64 = 1 << 30;
     // 32 GB box, iogpu.wired_limit_mb raised: file cache and other apps' pages read as gone,
     // but the declared limit says the GPU may claim the floor.
     try testing.expectEqual(@as(u64, 28 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
     // Resident buffers come off the floor, as they come off the working set.
     try testing.expectEqual(@as(u64, 18 * gib), effectiveSushiAvailableBytes(15 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
-    // More free RAM than the floor keeps the larger figure; the working set still caps it.
-    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 28 * gib));
+    // More free RAM than the floor does not raise it: the declared limit is the ceiling.
+    try testing.expectEqual(@as(u64, 28 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 28 * gib));
     // A floor above the working set never raises the cap.
     try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 31 * gib));
+}
+
+test "the load preflight never reads more than the wired-limit ceiling its requests are admitted under" {
+    const mb: u64 = 1 << 20;
+    // 128 GB box, iogpu.wired_limit_mb=125000, a 98,355 MB GPU floor: the ceiling is 26,133 MB.
+    // Free RAM above it is not GPU room, or a 46 GB load passes and pins a 1-token context.
+    const ceiling = wiredLimitFloor(125_000 * mb, 128 << 30, wiredUnplannedBytes(1 << 30, 98_355 * mb));
+    try testing.expectEqual(@as(u64, 26_133 * mb), ceiling);
+    try testing.expectEqual(ceiling, effectiveSushiAvailableBytes(118 << 30, 0, 125_000 * mb, 0, ceiling));
 }
 
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {

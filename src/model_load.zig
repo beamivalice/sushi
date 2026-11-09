@@ -27,6 +27,7 @@ const model_settings = @import("model_settings.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
+const gpu_mem = @import("gpu_mem.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
 const Trunk = trunk.Trunk;
@@ -503,9 +504,10 @@ pub const budget_required_message = "This checkpoint streams its experts from SS
 
 /// The budget a DeepSeek load takes from its Mac's RAM tier. The planner is asked what holding every routed expert
 /// resident needs (a budget no pack exhausts), and the limits then decide whether that, or a streamed budget, fits.
-fn ramDefaultChoice(sch: *Scheduler, params: anytype, tier: RamTier, load_vision: bool, assistant_bytes: u64) !SsdBudgetChoice {
+/// The registry gate and the load bill the same figure; it calls no MLX, so a connection thread may run it.
+pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, tier: RamTier, load_vision: bool, assistant_bytes: u64) RamDefault {
     const unbounded: u64 = 1 << 50;
-    const probe = planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, unbounded, load_vision, assistant_bytes) catch null;
+    const probe = planExpertStreamingWith(io, allocator, config, model_dir, unbounded, load_vision, assistant_bytes) catch null;
     var resident_need: u64 = 0;
     var encode: u64 = 0;
     if (probe) |p| {
@@ -514,7 +516,11 @@ fn ramDefaultChoice(sch: *Scheduler, params: anytype, tier: RamTier, load_vision
             resident_need = led.trunk_bytes +| led.mtp_bytes +| led.vision_bytes +| led.pool_bytes +| led.cache_bytes;
         };
     }
-    const d = ramDefaultBudget(tier, resident_need, bills.defaultRequestBill(params.config) +| encode, bills.defaultBudgetLimits());
+    return ramDefaultBudget(tier, resident_need, bills.defaultRequestBill(config) +| encode, bills.defaultBudgetLimits());
+}
+
+fn ramDefaultChoice(sch: *Scheduler, params: anytype, tier: RamTier, load_vision: bool, assistant_bytes: u64) !SsdBudgetChoice {
+    const d = ramDefaultFor(sch.io, sch.allocator, params.config, params.model_dir, tier, load_vision, assistant_bytes);
     var buf: [256]u8 = undefined;
     if (d.bound_by.len > 0) log.warn("{s}\n", .{stepDownLine(&buf, d)});
     return .{ .bytes = d.bytes, .origin = .ram_default, .setting_ignored = false, .wired_limit_mb = d.wired_limit_mb };
@@ -1669,7 +1675,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (led.resident) ", every routed expert resident" else "",
         });
         applyStreamingPlan(params.config, plan, budget.bytes);
-        if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) @import("gpu_mem.zig").capMlxPool(led.pool_bytes);
+        if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) gpu_mem.capMlxPool(led.pool_bytes);
         if (params.config.expert_source_dir == null) {
             params.config.expert_source_dir = try sch.allocator.dupe(u8, params.model_dir);
             expert_source_assigned = true;
@@ -1762,10 +1768,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 });
                 return error.InsufficientMemory;
             }
-            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available (free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets). Close other models/apps (or wait for a prior sushi to fully exit) and retry; pass --skip-mem-preflight (or turn on \"Skip the memory check before loading\" in Settings) to override.\n", .{
+            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available ({s}). Close other models/apps (or wait for a prior sushi to fully exit) and retry; pass --skip-mem-preflight (or turn on \"Skip the memory check before loading\" in Settings) to override.\n", .{
                 @as(f64, @floatFromInt(needed)) / gb,
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
                 @as(f64, @floatFromInt(avail_bytes)) / gb,
+                if (reader.sushi and reader.wired_floor > 0) "the iogpu.wired_limit_mb ceiling less what other processes hold on the GPU" else "free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets",
             });
             return error.InsufficientMemory;
         }
@@ -2366,6 +2373,10 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
         _ = mlx.mlx_clear_cache();
         waitForUnwire(sch.io, wired_before, evicted_bytes);
     }
+    sch.registry.mutex.lockUncancelable(sch.io);
+    const idle = sch.registry.countLoadedLocked() == 0;
+    sch.registry.mutex.unlock(sch.io);
+    if (idle) gpu_mem.refreshIdleGpuFloor();
 
     // Step 2: the actual load. On error, mark .error_state and signal done
     // (conn thread frees pre-parsed CPU state — ownership stays on req on

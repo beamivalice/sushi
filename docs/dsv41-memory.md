@@ -202,7 +202,7 @@ margined value and logs one warning naming both numbers. A request that omits
 `max_tokens` gets 256,000 (`defaultMaxTokens`); admission reserves 8192 of it, so the budget bills nothing more up front.
 `--ctx-size` and `--max-tokens` outrank both, and `model-settings.json` has no `max_tokens` key.
 
-With no `--ssd-budget-gb` and no `ssd_budget_gb` setting the load picks one from physical RAM (`ramDefaultBudget`): 80 GiB on 96 GB, 96 on 128 GB (108 with `iogpu.wired_limit_mb` at 120000 or more), resident on 192 and 256 GB. The step-down bound is the lower of the residency limit (the declared wired limit, else Metal's working set) and `vm.global_user_wire_limit` / `vm.user_wire_limit`, each less its margin, beside the 1M request bill (`dsv41DefaultRequestBill`) and the image encode.
+With no `--ssd-budget-gb` and no `ssd_budget_gb` setting the load picks one from physical RAM (`ramDefaultBudget`): 80 GiB on 96 GB, 96 on 128 GB (108 with `iogpu.wired_limit_mb` at 120000 or more), resident on 192 and 256 GB. The step-down bound is the lower of the residency limit (the declared wired limit, else Metal's working set) and `vm.global_user_wire_limit` / `vm.user_wire_limit`, each less its margin, beside the 1M request bill (`dsv41DefaultRequestBill`) and the image encode. The `/v1/load-model` registry gate bills the same default (`ramDefaultFor`), not a budget of 0.
 
 The state (0.93 GB at 1M) is billed per request in admission. The SSD budget is fixed at load, so the expert cache
 never squeezes the state.

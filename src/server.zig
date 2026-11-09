@@ -940,11 +940,8 @@ pub fn serve(
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited)\n", .{server_state.prefix_cache_capacity});
         }
     } else if (server_state.prefix_cache_capacity > 0) {
-        if (config.full_attention_interval > 0) {
-            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{server_state.prefix_cache_capacity});
-        } else {
-            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{server_state.prefix_cache_capacity});
-        }
+        var line_buf: [192]u8 = undefined;
+        log.info("{s}\n", .{bills.hotCacheDisabledLine(&line_buf, server_state.prefix_cache_capacity, server_state.prefix_cache_ram_enabled, diskTierOn(config), config.full_attention_interval > 0)});
     }
 
     // `--max-concurrent N` is honored when the model can ride the batched

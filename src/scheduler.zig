@@ -1721,7 +1721,8 @@ pub const Scheduler = struct {
                 .drop_default, .off => {},
             }
             const assistant_bytes = try model_load.streamedAssistantBytes(self.io, self.allocator, owned.config, self.no_drafter, model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path), entry.path);
-            const plan = try model_load.planExpertStreamingWith(self.io, self.allocator, owned.config, entry.path, settings_budget, model_load.coldLoadVision(owned.config, true), assistant_bytes);
+            const gate_budget = if (settings_budget > 0) settings_budget else model_load.ramDefaultFor(self.io, self.allocator, owned.config, entry.path, model_load.ramDefaultTierFor(owned.config).?, model_load.coldLoadVision(owned.config, true), assistant_bytes).bytes;
+            const plan = try model_load.planExpertStreamingWith(self.io, self.allocator, owned.config, entry.path, gate_budget, model_load.coldLoadVision(owned.config, true), assistant_bytes);
             break :blk model_load.streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, model_load.loadStagingBytes(owned.config, model_load.billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.workspace_bytes), plan.cache.bounce_bytes);
         } else if (try sched.coldLoadBill(.{
             .io = self.io,
@@ -6176,6 +6177,50 @@ test "ensureLoadedFresh: a model whose load failed is tried again, not answered 
     try testing.expect(target.error_name == null);
     try testing.expect(reg.mutex.tryLock());
     reg.mutex.unlock(io);
+    resident.refcount.store(0, .release);
+}
+
+test "ensureLoaded: a streamed pack with no ssd budget is gated at its RAM-tier default, not at 0" {
+    const fixture = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // The fixture ships weights only: link them beside a stub tokenizer, as a pack folder holds both.
+    for ([_][]const u8{ "config.json", "model.safetensors.index.json", "model-00001-of-00001.safetensors", "engram_token_map.json" }) |name| {
+        const target_path = try std.fs.path.join(testing.allocator, &.{ fixture, name });
+        defer testing.allocator.free(target_path);
+        try tmp.dir.symLink(io, target_path, name, .{});
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var cfg = try model_mod.parseConfig(io, testing.allocator, dir);
+    defer cfg.deinit(testing.allocator);
+    if (model_load.ramDefaultTierFor(&cfg) == null) return error.SkipZigTest;
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const resident = try reg.registerStub("a", "a", 10);
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(resident, 10);
+    reg.mutex.unlock(io);
+    _ = resident.refcount.fetchAdd(1, .acq_rel);
+
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = testing.allocator;
+    sch.ssd_budget_bytes = 0;
+    sch.mtp = null;
+    sch.no_drafter = true;
+    sch.drafter_dir = "";
+    sch.primary_model_dir = "";
+
+    // The plan the gate bills reaches the eviction verdict: the pinned resident model cannot go.
+    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoaded("b"));
+    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     resident.refcount.store(0, .release);
 }
 

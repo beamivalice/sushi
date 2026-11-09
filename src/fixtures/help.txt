@@ -226,8 +226,9 @@ Options:
                         request's prefill (0..0.9); never narrows
                         chunks. Default 0.25.
   --prefix-cache-entries <n>
-                      Hot prefix cache LRU capacity in entries
-                        (default: 32). 0 disables all prefix reuse.
+                      Prefix cache capacity in entries, for both the
+                        RAM and SSD tiers (default: 32). 0 disables
+                        all prefix reuse.
   --prefix-cache-mem <n>{KB,MB,GB}
                       Turn on RAM retention of idle prefix-cache
                         entries with this KV-bytes budget (default:
@@ -242,7 +243,8 @@ Options:
                       Seen prefixes persist under ~/.sushi/kv-cache
                         (SUSHI_PREFIX_CACHE_DIR) and are restored
                         across restarts instead of recomputed. 0/off
-                        disables.
+                        disables the tier; with RAM retention also off
+                        (the default) that ends all prefix reuse.
   --ssm-checkpoint-max <n>
                       Cap on SSM checkpoint states held in memory per
                         cache entry (default: 16). The first and the
