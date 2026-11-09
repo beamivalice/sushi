@@ -24,7 +24,7 @@ Order (owner, 2026-10-31):
 | # | Step | Command | Pass |
 |---|---|---|---|
 | 1 | Suite + binary | `zig build test -Doptimize=ReleaseFast`; `zig build -Doptimize=ReleaseFast`; `sushi --version` | 0 fail; names `build.zig.zon`'s version |
-| 2 | **Perf gate** | `tests/bench.sh --version <ver> <pack>` (below) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
+| 2 | **Perf gate** | `tests/bench.sh --version <ver> [--tokens 512] <pack>` (below; `--tokens 512` for Qwen and GLM) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on Qwen Sushi-STQ-2.75bpw and the DeepSeek STQ pack | within ~1% of its row in `docs/quality-kld.md` |
 | 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh` on the `qwen4`, `glm5` and `dsv41` passes, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |
 | 5 | CI | `./release.sh` beside steps 2-4 (never `ci.yml`): `release.yml` runs the full suite on the macOS 26.2 runner before it packages, and a failed test leaves no draft | green, a DRAFT exists |
