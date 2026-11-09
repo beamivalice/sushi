@@ -1039,7 +1039,7 @@ test "a Qwen round below 8192 KV prices widths by the table's realized tokens an
     // The acceptance EMAs promise deep rounds; the table measured that a wider round realizes fewer tokens per ms.
     // The base follows the table at every KV and only a confident round extends past it.
     var xfm: Trunk = undefined;
-    xfm.config.model_type = "qwen4_exp";
+    xfm.config = .{ .model_type = "qwen4_exp" };
     xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
     for (0..round_cost.MIN_SAMPLES) |_| {
         _ = xfm.round_cost.observe(2, 1000, 29.0, 2.6, true, false);
@@ -1347,6 +1347,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
     defer _ = mlx.mlx_stream_free(s);
     var xfm: Trunk = undefined;
     xfm.s = s;
+    xfm.config = .{ .model_type = "qwen4_exp" };
     xfm.arch_state = .{};
     var state: @import("qwen4_forward.zig").Qwen4MtpState = undefined;
     var gen: Generator = undefined;

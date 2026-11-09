@@ -398,7 +398,7 @@ test "updateMtpEvRound: warmup and wider base rounds reset floor evidence" {
 }
 
 fn mtpBoundsPlanFixture(xfm: *Trunk, model_type: []const u8, prompt: []u32, depth: u32) Generator {
-    xfm.config.model_type = model_type;
+    xfm.config = .{ .model_type = model_type };
     xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
     for (0..round_cost.MIN_SAMPLES) |_| {
         _ = xfm.round_cost.observe(2, 1000, 29.0, 2.6, true, false);

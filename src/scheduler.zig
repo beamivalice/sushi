@@ -5498,8 +5498,7 @@ test "a slot the batched tick hands back to the serial path counts its pending p
         }
     };
     var xfm: Trunk = undefined;
-    xfm.config.model_type = "qwen4_exp";
-    xfm.config.full_attention_interval = 4;
+    xfm.config = .{ .model_type = "qwen4_exp", .full_attention_interval = 4 };
     xfm.arch_state = .{};
     xfm.moe_layers = &.{};
     var gen: Generator = undefined;

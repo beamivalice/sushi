@@ -1842,6 +1842,7 @@ test "POST /v1/completions with a prompt that tokenizes to nothing answers 400 b
     defer tok.deinit();
     var cfg = model_mod.ModelConfig{ .num_hidden_layers = 0, .pinned_context = 4096 };
     var lm: LoadedModel = undefined;
+    lm.id = "";
     lm.config = &cfg;
     lm.tokenizer = &tok;
     lm.handle = null;

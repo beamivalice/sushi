@@ -29,6 +29,9 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - A test of code no served path reaches. Dead code goes with its tests in the same commit.
 - An assertion that a model must think, answer or call a tool. Assert the invariant, branch on the model's choice.
 - A second copy of a check another test already makes on the same input with as strong an assertion.
+- A read of a field the test never set. A `= undefined` struct is garbage in ReleaseFast, and a field write into its
+  nested config (`xfm.config.model_type = ...`) leaves `config.arch.tag`, which the arch dispatch reads, garbage too:
+  assign the whole `config = .{ ... }`, then set what the test needs.
 
 ## Tiers
 
