@@ -2307,17 +2307,7 @@ fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror, had_error:
     // The load's own MLX error is reported here; latched, it would fail the next request.
     mlx.dropLatchedErrorUnless(had_error);
     sch.registry.mutex.lockUncancelable(sch.io);
-    if (err == error.InsufficientMemory or err == error.OutOfMemory) {
-        // A memory-preflight refusal is transient, not a property of the
-        // checkpoint: the 503 tells the user to free memory and retry, so
-        // the entry must go back to .unloaded — stuck in .error_state the
-        // retry would fail fast until a server restart (#144).
-        sch.registry.markUnloadedLocked(req.entry);
-    } else {
-        // markErrorLocked dupes the error name onto the entry; the
-        // conn thread reads it back from the entry, not from req.
-        sch.registry.markErrorLocked(req.entry, @errorName(err));
-    }
+    sch.registry.markLoadFailedLocked(req.entry, @errorName(err));
     sch.registry.mutex.unlock(sch.io);
     finishLoadRequest(sch, req, @errorName(err));
 }
@@ -2587,7 +2577,7 @@ test "a failed cold load drops the MLX error it latched and keeps one latched be
     mlx.dropLatchedErrorUnless(false);
 }
 
-test "a cold load refused for memory returns the entry to unloaded, any other failure keeps its name" {
+test "a cold load refused for memory or a setting returns the entry to unloaded, any other failure keeps its name" {
     try mlx.requireGpu();
     mlx.installErrorHandler();
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
@@ -2599,7 +2589,7 @@ test "a cold load refused for memory returns the entry to unloaded, any other fa
     var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "", .allocator = testing.allocator };
     defer if (req.error_name) |name| testing.allocator.free(name);
 
-    for ([_]anyerror{ error.InsufficientMemory, error.OutOfMemory }) |memory| {
+    for ([_]anyerror{ error.InsufficientMemory, error.OutOfMemory, error.SsdBudgetBelowResident, error.ExpertCacheDoesNotFit }) |memory| {
         failLoadRequest(&sch, &req, memory, false);
         try testing.expectEqual(model_registry_mod.LoadState.unloaded, entry.state);
     }

@@ -336,7 +336,7 @@ dialog[open]::backdrop { animation: fade-in var(--dur-2) var(--ease-out); }
 #modelsTabs a:hover, #modelsTabs a[aria-current="page"] { color: var(--text); text-decoration: none; }
 #modelsTabPct { color: var(--accent); font-variant-numeric: tabular-nums; }
 #modelsTabPct:empty { display: none; }
-#modelsPanel[data-sub="available"] :is(#modelsBody, #modelsDir, #modelsRescan, #modelsBack),
+#modelsPanel[data-sub="available"] :is(#modelsBody, #modelsDirLine, #modelsRescan, #modelsBack),
 #modelsPanel:not([data-sub="available"]) :is(#downloadsPanel, #dlSub, #dlRefresh) { display: none; }
 /* Wide: the switch sits beside the title and the subtitle wraps below, so a longer subtitle never moves it. */
 @media (min-width: 641px) {
@@ -368,6 +368,7 @@ body[data-mode="advanced"] .cmp { display: none !important; }
 .page-head .in { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); min-height: 52px; }
 .page-head h1 { font-size: var(--fs-lg); line-height: 1.3; }
 .page-head .sub { color: var(--text-2); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+#modelsDirLine { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .page-head .titles { min-width: 0; padding: var(--s2) 0; }
 .page-head .controls { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; color: var(--text-2); font-size: var(--fs-md); }
 .page-head .controls label { display: inline-flex; align-items: center; gap: 6px; }
@@ -465,6 +466,8 @@ dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2);
 .sect:last-child { border-bottom: 0; }
 .callout { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3); border-radius: var(--r-md); background: var(--info-soft); font-size: var(--fs-sm); }
 .callout span { flex: 1; }
+.gpu-limit .cmd { display: flex; align-items: center; gap: var(--s2); padding: var(--s2) var(--s3); border-radius: var(--r-md); background: var(--code-bg); }
+.gpu-limit .cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var(--s3); color: var(--text-2); font-weight: 600; }
 .savebar { position: sticky; bottom: 0; display: flex; align-items: center; gap: var(--s2); padding: var(--s3) var(--s4); background: var(--surface); border-top: 1px solid var(--border); border-radius: 0 0 var(--r-lg) var(--r-lg); box-shadow: 0 -6px 16px var(--sh-2); }
 .savebar[hidden] { display: none; }
@@ -931,7 +934,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 <section id="modelsPanel" class="panel page" aria-label="Models" hidden>
   <div class="page-head"><div class="in">
     <button class="icon-btn" id="modelsBack" type="button" aria-label="Back to models" hidden><svg width="18" height="18"><use href="#i-back"/></svg></button>
-    <div class="titles"><h1 id="modelsTitle">Models</h1><div class="sub mono" id="modelsDir"></div><div class="sub" id="dlSub">Sushi packs on Hugging Face</div></div>
+    <div class="titles"><h1 id="modelsTitle">Models</h1><div class="sub" id="modelsDirLine"><span class="mono tip-u" id="modelsDir" tabindex="0" data-term="models_dir"></span><button class="btn sm ghost" id="modelsDirChange" type="button" data-tip="Choose the folder sushi reads models from and saves new downloads into." hidden>Change folder…</button></div><div class="sub" id="dlSub">Sushi packs on Hugging Face</div></div>
     <nav id="modelsTabs" aria-label="Models">
       <a id="modelsTabInstalled" href="/models" aria-current="page">Installed</a>
       <a id="modelsTabAvailable" href="/downloads">Available<span id="modelsTabPct"></span><span class="nav-dot" id="modelsTabDot" title="New model packs to download" hidden></span></a>
@@ -980,13 +983,6 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       </div>
       <div class="sub muted" id="clearNote" style="margin-top:8px;font-size:var(--fs-sm)">Unused: no loaded model uses it (an older sushi version, a changed model, or a model that is not loaded).</div></div>
     </section>
-    <section class="card" id="dirCard" hidden>
-      <div class="card-h">Models folder</div>
-      <div class="card-b">
-        <div id="dirSet"></div>
-        <div class="kv" id="dirKv" style="margin-top:8px"></div>
-      </div>
-    </section>
     <h2 class="sec-h" id="secInference" hidden>Inference</h2>
     <section class="card" id="effortCard" hidden>
       <div class="card-h"><span>Thinking effort</span><span class="badges" id="effortBadges"></span></div>
@@ -1029,8 +1025,8 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 </div>
 
 <dialog id="folderPicker" aria-labelledby="folderTitle">
-  <h2 id="folderTitle">Chat folder</h2>
-  <p>Choose the folder this chat's file tools work in. Editing stays off until you turn it on for this chat. Web search works independently of this folder.</p>
+  <h2 id="folderTitle"></h2>
+  <p id="folderText"></p>
   <form id="folderForm" class="folder-row">
     <input id="folderPath" type="text" aria-label="Folder path" placeholder="Absolute folder path" autocomplete="off">
     <button class="btn" type="submit">Go</button>
@@ -1039,6 +1035,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <p id="folderError" role="alert" hidden></p>
   <div id="folderList" aria-label="Folders" aria-live="polite"></div>
   <div class="folder-row">
+    <button class="btn sm ghost" id="folderAlt" type="button" hidden></button>
     <span class="spacer"></span>
     <button class="btn" id="folderCancel" type="button">Cancel</button>
     <button class="btn" id="folderChoose" type="button" disabled>Use this folder</button>
@@ -2673,9 +2670,12 @@ async function loadEditDefault() {
   renderEditButton();
 }
 $("editButton").onclick = () => setChatEdit(!chatEdit());
+// One folder picker for the chat's file tools and the models folder: the server lists subfolders (`/v1/tools` browse,
+// this Mac's page only), and `choose` saves the pick; a throw keeps the dialog open with its message.
 let folderSelection = null;
 let folderAbort = null;
-async function browseChatFolder(directory) {
+let folderOpts = null;
+async function browseFolder(directory) {
   folderAbort?.abort();
   const controller = folderAbort = new AbortController();
   folderSelection = null;
@@ -2695,7 +2695,7 @@ async function browseChatFolder(directory) {
       const button = el("button", "btn", name);
       button.type = "button";
       button.title = name;
-      button.onclick = () => browseChatFolder(`${listing.root.replace(/\/$/, "")}/${name}`);
+      button.onclick = () => browseFolder(`${listing.root.replace(/\/$/, "")}/${name}`);
       $("folderList").appendChild(button);
     }
     if (!listing.directories.length) $("folderList").textContent = "No subfolders";
@@ -2703,28 +2703,64 @@ async function browseChatFolder(directory) {
   } catch (error) {
     if (controller.signal.aborted) return;
     $("folderList").textContent = "";
-    $("folderError").textContent = error.message;
-    $("folderError").hidden = false;
+    folderError(folderOpts?.typed ? `${error.message}. Type the folder's full path above to use it.` : error.message);
+    typedChoice();
+  }
+}
+function folderError(message) {
+  $("folderError").textContent = message;
+  $("folderError").hidden = !message;
+}
+// Where browsing is refused (a server bound beyond loopback), a `typed` picker still takes an absolute path as typed.
+function typedChoice() {
+  if (folderOpts?.typed && !folderSelection) $("folderChoose").disabled = !$("folderPath").value.trim().startsWith("/");
+}
+function openFolderPicker(opts) {
+  folderOpts = opts;
+  $("folderTitle").textContent = opts.title;
+  $("folderText").textContent = opts.text;
+  $("folderChoose").textContent = opts.chooseLabel ?? "Use this folder";
+  $("folderAlt").hidden = !opts.alt;
+  if (opts.alt) $("folderAlt").textContent = opts.alt.label;
+  $("folderPath").value = opts.start ?? "";
+  $("folderPicker").showModal();
+  browseFolder(opts.start);
+}
+async function finishFolder(pick) {
+  const opts = folderOpts, buttons = [$("folderChoose"), $("folderAlt")];
+  if (buttons.some((b) => b.getAttribute("aria-busy"))) return;
+  for (const b of buttons) { b.disabled = true; b.setAttribute("aria-busy", "true"); }
+  try {
+    await opts.choose(pick);
+    if (folderOpts === opts) $("folderPicker").close();
+  } catch (error) {
+    folderError(error.message);
+  } finally {
+    for (const b of buttons) { b.disabled = false; b.removeAttribute("aria-busy"); }
   }
 }
 $("directoryButton").onclick = () => {
   if (chatAbort) return;
-  $("folderPicker").showModal();
-  browseChatFolder(chatDirectory());
+  openFolderPicker({
+    title: "Chat folder",
+    text: "Choose the folder this chat's file tools work in. Editing stays off until you turn it on for this chat. Web search works independently of this folder.",
+    start: chatDirectory(),
+    choose: (path) => { if (!chatAbort) setChatDirectory(path); },
+  });
 };
 $("folderForm").onsubmit = (event) => {
   event.preventDefault();
-  browseChatFolder($("folderPath").value.trim());
+  browseFolder($("folderPath").value.trim());
 };
-$("folderPath").oninput = () => { $("folderChoose").disabled = true; };
-$("folderUp").onclick = () => { if (folderSelection) browseChatFolder(folderSelection.parent); };
+$("folderPath").oninput = () => { folderSelection = null; $("folderChoose").disabled = true; typedChoice(); };
+$("folderUp").onclick = () => { if (folderSelection) browseFolder(folderSelection.parent); };
 $("folderCancel").onclick = () => $("folderPicker").close();
-$("folderPicker").addEventListener("close", () => { folderAbort?.abort(); });
+$("folderPicker").addEventListener("close", () => { folderAbort?.abort(); folderOpts = null; });
 $("folderChoose").onclick = () => {
-  if (!folderSelection || chatAbort) return;
-  setChatDirectory(folderSelection.root);
-  $("folderPicker").close();
+  const path = folderSelection?.root ?? $("folderPath").value.trim();
+  if (folderOpts && path) finishFolder(path);
 };
+$("folderAlt").onclick = () => { if (folderOpts?.alt) finishFolder(null); };
 function wireMessages(history) {
   const out = [];
   const system = $("optSystem").value.trim();
@@ -3534,7 +3570,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     fill(list, JSON.stringify([shown.map(state), both, rows.length, roots]), () => shown.length
       ? [...(both ? [group("Loaded")] : []), ...live.map(item), ...(both ? [group("On disk")] : []), ...shown.filter((m) => !live.includes(m)).map(item)]
       : [h("div", { class: "empty" }, h("span", { text: rows.length ? "No model matches the filter." : `No models in ${roots}. Download a pack, or put a pack folder there.` }),
-        ...(rows.length ? [] : [" ", h("button", { class: "btn sm primary", type: "button", text: "See available packs", onclick: () => q("modelsTabAvailable").click() }), " ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
+        ...(rows.length ? [] : [" ", h("button", { class: "btn sm primary", type: "button", text: "See available packs", onclick: () => q("modelsTabAvailable").click() }), " ", ...(A.settings?.server.models_dir.locked ? [] : [h("button", { class: "btn sm", type: "button", text: "Choose folder…", onclick: pickModelsDir })])]))]);
     if (held?.id && !list.contains(document.activeElement)) {
       const r = list.querySelector(`[data-id="${CSS.escape(held.id)}"]`);
       ((held.button ? r?.querySelector("button") : null) ?? r?.querySelector(".main"))?.focus();
@@ -3616,16 +3652,39 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     });
   }
 
+  // The models folder: picked from the server's folders, saved at once, then rescanned. "Use the default" clears it.
+  function pickModelsDir() {
+    const d = A.settings?.server.models_dir;
+    if (!d || d.locked) return;
+    openFolderPicker({
+      title: "Models folder",
+      text: "sushi reads models from this folder and saves new downloads into it. Choosing one rescans at once.",
+      start: d.file || d.default, typed: true,
+      alt: d.file ? { label: "Use the default folder" } : null,
+      choose: async (path) => {
+        let r;
+        try { r = await postJson("/v1/settings", { server: { models_dir: path } }); } catch (e) { throw new Error(adminErrorText(e)); }
+        toast(typeof r.applied?.models_dir === "string" && r.applied.models_dir ? sentence(r.applied.models_dir) : path ? "Saved. Rescanning the folder." : "Back to the default folder.");
+        await Promise.all([refresh(), modelStore.refresh()]);
+      },
+    });
+  }
+  q("modelsDirChange").addEventListener("click", pickModelsDir);
+
   function renderModels() {
     if (!A.settings && !modelStore.list.length) return;
     const rows = rowsOf(), sel = A.leaving ? A.sel : selectionNow(rows);
     if (sel !== A.sel) { A.sel = sel; A.form = null; }
-    setText(q("modelsDir"), A.settings ? rootsInUse(A.settings.server.models_dir).join(", ") : "");
+    const dir = A.settings?.server.models_dir;
+    setText(q("modelsDir"), dir ? rootsInUse(dir).join(", ") : "");
+    q("modelsDir").dataset.tip = !dir ? "" : dir.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : dir.file ? `Chosen here; the default is ${dir.default}.` : "The default models folder.";
+    setHidden(q("modelsDirChange"), !dir || dir.locked);
     const hasHash = A.leaving ? !!A.sel : !!hashId(), phoneDetail = hasHash && !wide();
     q("modelsMd").classList.toggle("detail-open", hasHash);
     q("modelsMd").classList.toggle("none", !rows.length);
     setHidden(q("modelsBack"), !phoneDetail);
     setHidden(q("modelsRescan"), phoneDetail);
+    setHidden(q("modelsDirLine"), phoneDetail);
     setHidden(q("modelsTabs"), phoneDetail);
     setText(q("modelsTitle"), phoneDetail && A.sel ? A.sel : "Models");
     renderList(rows);
@@ -3740,6 +3799,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     F.think = h("div", { class: "think-line", hidden: true });
     F.cacheKv = h("div", { class: "kv" });
     F.cacheBtn = h("button", { class: "btn sm danger", type: "button", onclick: () => clearModel(F.id) });
+    F.gpuKv = h("div", { class: "kv" }); F.gpuWarn = h("div", { class: "warn", role: "status", hidden: true }); F.gpuCmd = h("code", { class: "mono" });
+    F.gpu = h("div", { class: "sect gpu-limit", hidden: true }, h("h3", { text: "GPU memory limit" }), F.gpuKv, F.gpuWarn,
+      h("div", { class: "cmd" }, F.gpuCmd, h("button", { class: "icon-btn", type: "button", title: "Copy", "aria-label": "Copy command", onclick: () => copyText(F.gpuCmd.textContent) }, icon("copy", 14))),
+      h("div", { class: "lead", text: "This sets all three to the standard. Run it in Terminal, then restart sushi: the GPU limit is read when sushi starts, and macOS resets all three at reboot. A higher limit lets larger settings load; it does not promise every request fits." }));
     F.cacheSect = h("div", { class: "sect", hidden: true }, h("h3", { text: "Prompt cache" }), h("div", { class: "lead", text: "Saved conversations, so a follow-up skips re-reading its prompt." }), F.cacheKv, h("div", {}, F.cacheBtn));
     F.saveMsg = h("span", { class: "msg" });
     F.discard = h("button", { class: "btn sm ghost", type: "button", text: "Discard", onclick: () => { Object.assign(per(F.id), { texts: {}, errors: {}, refused: {}, saveError: "" }); for (const S of F.sets.values()) S.control.node.removeAttribute?.("aria-invalid"); patchDetail(info(F.id)); } });
@@ -3748,7 +3811,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const lead = h("div", { class: "lead", text: "Saved for this model. They apply the next time it loads. A value set when sushi was started wins over these." });
     delete q("modelsDetail").dataset.sig;
     q("modelsDetail").replaceChildren(h("div", { class: "d-head" }, h("div", { class: "grow" }, F.name, F.facts), F.actions), F.alert,
-      h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.think, F.callout, F.update, F.saveErr, F.rows), F.cacheSect, F.savebar);
+      h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.think, F.callout, F.update, F.saveErr, F.rows), F.gpu, F.cacheSect, F.savebar);
   }
   function buildRows(F, m) {
     const specs = F.specs = specsOf(m), P = per(F.id);
@@ -3799,6 +3862,17 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       setText(F.moreSum, `More settings (${F.moreList.length})${invalid ? ` · ${invalid} invalid` : changed ? ` · ${changed} changed` : saved ? ` · ${saved} saved` : ""}`);
       const open = invalid > 0 || (P.moreOpen ?? modeNow() === "advanced");
       if (F.more.open !== open) { F.moreProg = true; F.more.open = open; setTimeout(() => { F.moreProg = false; }); }
+    }
+    // The three wire limits as they read now, and the command that sets the standard (all but 4 GiB of RAM).
+    const g = A.settings?.gpu_limit, mb = (n) => n ? adminBytes(n * 2 ** 20) : "macOS default";
+    setHidden(F.gpu, !g);
+    if (g) {
+      const kv = [["iogpu.wired_limit_mb", mb(g.iogpu_mb)], ["vm.global_user_wire_limit", adminBytes(g.global_user_wire_bytes)], ["vm.user_wire_limit", adminBytes(g.user_wire_bytes)],
+        ["Standard", `${mb(g.standard_mb)} (${adminBytes(g.total_ram_bytes)} of RAM less 4 GiB)`]];
+      fill(F.gpuKv, JSON.stringify(kv), () => kvRows(kv, kv.slice(0, 3).map(([k]) => k)));
+      setHidden(F.gpuWarn, g.iogpu_mb === g.in_use_mb);
+      setText(F.gpuWarn, `sushi started with ${mb(g.in_use_mb)}. Restart sushi to use the new GPU limit.`);
+      setText(F.gpuCmd, g.command);
     }
     renderList(rowsOf());
     setHidden(F.cacheSect, m.state !== "ready");
@@ -3898,9 +3972,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   q("clearAll").addEventListener("click", () => clearScope("all"));
 
   const GB_SPEC = { type: "int", min: 0, max: 1048576 };
-  // The two server settings reuse the setting row: assigned space and the models folder.
-  const cacheRow = setRow("prefix_cache_disk_gb", "Assigned space", "cacheGb", "How much disk space saved conversations may take, in GiB. More space keeps more conversations ready to continue fast; 0 turns the cache off.", keyTerm("prefix_cache_disk_gb", "SSD prefix cache size")),
-    dirRow = setRow("models_dir", "Models folder", "dirPath", "The folder sushi reads models from and saves new downloads into.", keyTerm("models_dir"));
+  // Assigned space reuses the setting row; the models folder is chosen on the Models page.
+  const cacheRow = setRow("prefix_cache_disk_gb", "Assigned space", "cacheGb", "How much disk space saved conversations may take, in GiB. More space keeps more conversations ready to continue fast; 0 turns the cache off.", keyTerm("prefix_cache_disk_gb", "SSD prefix cache size"));
   const enterTo = (button) => (e) => { if (e.key === "Enter") { e.preventDefault(); if (!button.disabled && !button.hidden) button.click(); } };
   // Typing starts a new attempt: the last refusal of this setting goes.
   const typed = (key) => { delete A.serr[key]; };
@@ -3908,14 +3981,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const cacheUnit = h("span", { class: "muted", text: "GiB" }), cacheWarn = h("div", { class: "warn", role: "status", hidden: true });
   const cacheSave = h("button", { class: "btn sm primary", id: "cacheSave", type: "button", text: "Save", onclick: saveCache });
   cacheRow.ctl.append(h("div", { class: "row-in" }, cacheIn, cacheUnit, cacheSave), cacheRow.bad, cacheWarn);
-  const dirIn = h("input", { id: "dirPath", type: "text", autocomplete: "off", "aria-label": "Models folder", placeholder: "/absolute/path/to/models", oninput: () => { A.dirText = dirIn.value; typed("models_dir"); renderDir(A.settings.server.models_dir); }, onkeydown: (e) => enterTo(dirSave)(e) });
-  const dirSave = h("button", { class: "btn sm primary", id: "dirSave", type: "button", text: "Save and rescan", onclick: () => {
-    const path = dirIn.value.trim();
-    saveServer("models_dir", path || null, path ? "Saved. Rescanning the folder." : "Back to the default folder.", dirSave, "Saving…");
-  } });
-  const dirCtl = [dirIn, h("div", { class: "row-in" }, dirSave)];
   q("cacheSet").replaceWith(cacheRow.row);
-  q("dirSet").replaceWith(dirRow.row);
 
   // The default port: where `sushi --serve` binds without --port, and what sushibar and `sushi launch` target.
   const PORT_SPEC = { type: "int", min: 1, max: 65535 };
@@ -4102,10 +4168,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         const r = await postJson("/v1/settings", { server: { [key]: value } });
         typed(key);
         toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
-        if (key === "models_dir") A.dirText = null; else if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null;
+        if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null;
       } catch (e) { A.serr[key] = adminErrorText(e); }
     });
-    await Promise.all([refresh(), key === "models_dir" ? modelStore.refresh() : null]);
+    await refresh();
   }
   async function saveCache() {
     const v = adminControlValue(GB_SPEC, cacheIn.value);
@@ -4117,14 +4183,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const s = A.settings, c = A.cache;
     if (!s) return;
     setHidden(q("settingsSkel"), true);
-    for (const id of ["cacheCard", "dirCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
+    for (const id of ["cacheCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     for (const id of ["secStorage", "secServer"]) setHidden(q(id), false);
     setHidden(q("secInference"), !s.effort);
     setHidden(q("effortCard"), !s.effort);
     renderEffort(s.effort);
     setText(q("settingsFile"), `Saved in ${s.file}`);
     if (c) renderCache(c, s.server.prefix_cache_disk_gb);
-    renderDir(s.server.models_dir);
     if (s.server.port) renderPort(s.server.port);
     renderToggles(s.server);
   }
@@ -4220,31 +4285,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setText(portRow.bad, (dirty && text && !parsed.ok ? "Enter a whole number from 1 to 65535." : "") || A.serr.port || "");
     portIn.setAttribute("aria-invalid", String(!!portRow.bad.textContent));
   }
-  function renderDir(d) {
-    badges(dirRow.badge, d, d.applies);
-    fill(dirRow.ctl, String(!!d.locked), () => d.locked ? [] : [...dirCtl, dirRow.bad]);
-    if (!d.locked) {
-      const file = d.file || "";
-      if (A.dirText === file) A.dirText = null;
-      if (A.dirText === null && dirIn.value !== file) dirIn.value = file;
-      dirIn.placeholder = d.default;
-      const text = dirIn.value.trim(), dirty = text !== file, invalid = dirty && text && !text.startsWith("/");
-      setHidden(dirSave, !dirty);
-      dirSave.disabled = !!invalid || dirSave.getAttribute("aria-busy") === "true";
-      if (dirSave.getAttribute("aria-busy") !== "true") setText(dirSave, text === "" ? "Use default" : "Save and rescan");
-      setText(dirRow.bad, (invalid ? "Enter an absolute folder path." : "") || A.serr.models_dir || "");
-    }
-    setText(dirRow.help, d.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : "Where sushi looks for packs, and where new downloads are saved. Saving rescans at once.");
-    const kv = [["In use", rootsInUse(d).join(", ") || "(none)"], ["Default", d.default]];
-    fill(q("dirKv"), JSON.stringify(kv), () => kvRows(kv, ["In use", "Default"]));
-  }
 
   function renderAll() {
     const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : A.error ? `Couldn't load: ${A.error}` : "";
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
     const off = !!msg && !!A.settings;
-    for (const id of ["modelsMd", "cacheCard", "effortCard", "dirCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) {
+    for (const id of ["modelsMd", "cacheCard", "effortCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) {
       q(id).classList.toggle("stale-view", off);
       if (q(id).inert !== off) q(id).inert = off;
     }
@@ -4256,6 +4303,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   });
   window.addEventListener("sushi-mode", () => { if (A.view === "models" || A.view === "settings") renderAll(); });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+  // Back from Terminal after raising a limit: the model page reads the sysctls again.
+  window.addEventListener("focus", () => refresh());
 
   // Downloads: the packs on Hugging Face, this Mac's fit and the server's download queue (/v1/downloads).
   const D = { data: null, error: null, timer: null, rows: new Map(), order: "", seen: null, pick: null, scrolled: false };

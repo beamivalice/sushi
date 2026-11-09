@@ -9,11 +9,16 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The SSD prefix cache reports what it stored beside what it wrote**: `/metrics` adds
   `sushi:prefix_cache_store_bytes_total{kind}` and `/metrics.json` adds `prefix_cache_writes.stored_bytes`, the bytes the
   cache's storage layer put on the SSD, by file kind.
-- **A failure no longer outlives its cause**: pressing Load again on a model whose load failed (or ran out of memory)
-  tries the load again with the current settings and shows its own result, a refused Save clears when you press Save
-  again or edit the value, a load failure clears as soon as the model is listed loaded, saving a setting a load reads
-  lets the next request retry a failed model, a finished download drops the pack's update notice at once, and a release
-  check that finds nothing newer clears an earlier update failure.
+- **A failure no longer outlives its cause**: a model refused for its SSD budget or the memory limit (including a Metal
+  out-of-memory during the load) is unloaded rather than failed, so it loads again once the setting is lowered or memory
+  is free, with no server restart; pressing Load again on any other failed model tries the load again with the current
+  settings and shows its own result, a refused Save clears when you press Save again or edit the value, a load failure
+  clears as soon as the model is listed loaded, saving a setting a load reads lets the next request retry a failed
+  model, a finished download drops the pack's update notice at once, and a release check that finds nothing newer clears
+  an earlier update failure.
+- **The models folder moved from Settings to the Models page**, chosen with a folder picker instead of a typed path.
+- **A model's page in the dashboard shows `iogpu.wired_limit_mb` and both user-wire limits as they are now**, with one
+  copyable `sudo sysctl` command that sets all three to the standard (the Mac's RAM less 4 GiB).
 - **Each served architecture is a self-contained module**: Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4.1-Flash and
   MiMo-V2.6-Flash each live behind one registry line, so `-Darchs` builds the engine with any of them left out, with
   every model's output unchanged.

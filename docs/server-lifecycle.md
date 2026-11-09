@@ -122,8 +122,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 
 ## What loads
 
-- A stored failure always has a way to start a fresh attempt without a restart; a new failure state ships with that way and a test (`whatever failure an entry holds`, model_registry.zig).
-- A model whose load failed (`error` in `/v1/models`) keeps that error and fails fast for inference requests, but every `POST /v1/load-model` runs a new attempt (`Scheduler.ensureLoadedFresh`): settings are read again, the preflight reruns, and the stored error is replaced in the same registry hold that claims the load. A memory refusal (`InsufficientMemory`, MLX `OutOfMemory`) is not stored at all: the model goes back to `unloaded`.
+- A stored failure always has a way to start a fresh attempt without a restart; a new failure state ships with that way and a test (`a refused load is unloaded`, model_registry.zig).
+- A failed cold load ends in `ModelRegistry.markLoadFailedLocked`. A refusal that a setting or the memory limit decides (`ModelRegistry.refusals`: `InsufficientMemory`, MLX `OutOfMemory`, the three `SsdBudget*` refusals, `ExpertCacheDoesNotFit`) is not stored: the model goes back to `unloaded`, so the next load re-reads `model-settings.json`. Any other failure stays `error` in `/v1/models`, fails fast for inference requests, and keeps its name. A failed startup load stops the server.
+- Every `POST /v1/load-model` on a stored failure runs a new attempt (`Scheduler.ensureLoadedFresh`): settings are read again, the preflight reruns, and the stored error is replaced in the same registry hold that claims the load.
 - Saving a setting that a load reads (`reachesLoad` in settings_api.zig: context, KV, MTP, vision, SSD budget and read-ahead, models folder, prompt cache size, skip-memory-check) ends the stored failure of that model, or of every model for a server key, so the next request loads again; a request with nothing changed still fails fast.
 - A rescan makes a failed load retryable only when discovery finds the same ID at the same path; it clears the error and refreshes the on-disk byte count without disturbing live entries.
 - A qwen4_exp load that fails after the n-gram state or the MTP head exists frees both (`Qwen4Mtp.deinit`; the

@@ -417,6 +417,26 @@ pub fn wireLimitsCommand(buf: []u8, mb: u64) []const u8 {
     return std.fmt.bufPrint(buf, "sudo sysctl iogpu.wired_limit_mb={d} vm.global_user_wire_limit={d} vm.user_wire_limit={d}", .{ mb, bytes, bytes }) catch "";
 }
 
+/// The three limits `wireLimitsCommand` sets, as the sysctls read now (0 = unreadable, or the GPU limit undeclared).
+pub const WireLimits = struct { iogpu_mb: u64 = 0, global_user_bytes: u64 = 0, user_bytes: u64 = 0 };
+
+/// Read fresh on every call, unlike `wiredLimitBytes`: the model page shows a limit raised since sushi started.
+pub fn wireLimitsNow() WireLimits {
+    var mb: u32 = 0;
+    var len: usize = @sizeOf(u32);
+    return .{
+        .iogpu_mb = if (sysctlbyname("iogpu.wired_limit_mb", @ptrCast(&mb), &len, null, 0) == 0) mb else 0,
+        .global_user_bytes = readSysctlU64("vm.global_user_wire_limit"),
+        .user_bytes = readSysctlU64("vm.user_wire_limit"),
+    };
+}
+
+/// PURE: the standard `iogpu.wired_limit_mb` the model page offers: all of `total_ram` but 4 GiB for macOS and
+/// other apps. 0 when the RAM is unknown.
+pub fn standardWiredLimitMb(total_ram: u64) u64 {
+    return if (total_ram == 0) 0 else (total_ram >> 20) -| 4096;
+}
+
 /// The GPU limit, in MB, that holds `bytes`: rounded up to 100 so the command reads cleanly.
 pub fn wireLimitMbFor(bytes: u64) u64 {
     const step: u64 = 100 << 20;
@@ -2932,6 +2952,18 @@ test "a loaded streamed row reports its effective budget, an unloaded one the se
     try std.testing.expectEqual(@as(u32, 48), rowSsdBudgetGb(0, 48));
     try std.testing.expectEqual(@as(u32, 60), rowSsdBudgetGb(60 << 30, 48));
     try std.testing.expectEqual(@as(u32, 0), rowSsdBudgetGb(0, 0));
+}
+
+test "the wire limits read now from this Mac's sysctls" {
+    const now = wireLimitsNow();
+    // Every Apple-silicon Mac has both user-wire limits; the GPU limit reads 0 until declared.
+    try std.testing.expect(now.global_user_bytes > 0 and now.user_bytes > 0);
+}
+
+test "the standard GPU limit is the Mac's RAM less 4 GiB, in MiB" {
+    try std.testing.expectEqual(@as(u64, 45056), standardWiredLimitMb(48 << 30));
+    try std.testing.expectEqual(@as(u64, 126976), standardWiredLimitMb(128 << 30));
+    try std.testing.expectEqual(@as(u64, 0), standardWiredLimitMb(0));
 }
 
 test "raising the GPU limit always raises both user-wire limits to match, never below the need" {

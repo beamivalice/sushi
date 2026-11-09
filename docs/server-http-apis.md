@@ -444,7 +444,10 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   flag's own syntax such as `512MB`, `source` `flag|file|default`, `locked`; the size also carries `effective_bytes`, the
   largest running tier's cap or, with none running, the ask; `ask_bytes`, the number the next load starts from; `default_bytes`, the size an unset key asks for (a load may
   take less to fit its context or the free space); and
-  `running_tiers`, `[{model, cap_bytes, used_bytes}]`), the
+  `running_tiers`, `[{model, cap_bytes, used_bytes}]`), `gpu_limit` (null when the RAM is unknown: `total_ram_bytes`;
+  `iogpu_mb`, `global_user_wire_bytes`, `user_wire_bytes`, the three sysctls as they read on this request, `iogpu_mb` 0 =
+  the macOS default; `in_use_mb`, the GPU limit this process read at start; `standard_mb`, the RAM less 4 GiB; `command`,
+  the one `sudo sysctl` line that sets all three to it; `applies`), the
   `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
   `locked`. A pinned `mtp_acceptance` reports the flag as typed with its value (`--mtp-tokenv3 0.5`, `--mtp-typical 0.3`) and `mtp_greedy_tail` reports `--mtp-greedy-tail`; the other model keys report their value alone; and `effort`, the thinking-effort tables ([Effort tables](#effort-tables)). `POST /v1/settings` takes `{"server":{key:value|null}}`, `{"model":id,"set":{key:value|null}}` and/or `{"effort":{...}}`; null removes
   a key. Each model row also carries `keys`, the keys that apply to that model (`model_settings.applies`, the same gates
@@ -523,7 +526,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   destination folder that is there but not complete, null while that pack downloads. `launch` is `sushi serve --model
   '<path>'` plus the flags of the pack's recommended launch in [usage](usage.md#recommended-launch)
   (`Alias.serve_flags`), only for a downloaded pack in the table; the page does not show it.
-- `dest` is the Settings tab's models folder: the first `--model-dir` (locked), else `server.models_dir`, else
+- `dest` is the Models tab's models folder: the first `--model-dir` (locked), else `server.models_dir`, else
   `~/.sushi/models`; a new pack lands in `<dest>/beamster/<repo>`, an update in the folder it is installed in.
 - `POST /v1/downloads {"repo":"beamster/<repo>"}` takes only a pack the catalog lists, under the catalog's spelling
   (404 otherwise, 400 for another org or a name outside `[A-Za-z0-9._-]`, `.` or `..`), and answers 202 `{ok, queued,
@@ -775,8 +778,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   ellipsized to fit with the full label on hover (including saved conversations).
   Stop cancels browser requests and records cancelled results for
   remaining calls so the conversation stays valid. An already-running server tool may finish its bounded work.
-- The **Folder** button opens a folder picker: browse subfolders, move to the parent, or enter an absolute
-  path, then choose **Use this folder**. The selection is saved per chat; new chats start at the server's
+- The **Folder** button opens the folder picker (the Models page's **Change folder…** uses the same one): browse
+  subfolders, move to the parent, or enter an absolute path, then choose **Use this folder**. The selection is saved per chat; new chats start at the server's
   working folder. Selection is disabled during a turn. It never changes the server process's working directory.
 - `POST /v1/tools` with `{ "vision": false }` lists definitions and the file root. With `name`, JSON-string
   `arguments`, and `vision`, it executes one call and returns `text` plus optional `image` data URL.

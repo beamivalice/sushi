@@ -72,7 +72,7 @@ The web page's **Models** tab (Cmd+3) does the same in the browser: its **Availa
 Sushi pack published on Hugging Face (the ones this build knows, and any newer public `-Sushi-` repo of `beamster`) with
 its size, marks the pack `sushi list` recommends for this Mac's memory, says "Needs N GB" for one above it (still
 downloadable, after a confirm), and shows which are downloaded, partly downloaded or have an update. Download saves into
-the models folder of the Settings tab (`--model-dir` when given, else `server.models_dir`, else `~/.sushi/models`) under
+the models folder shown on the Models tab (`--model-dir` when given, else `server.models_dir`, else `~/.sushi/models`) under
 `beamster/<repo>`, after checking the free space: a pack that would leave less than a twentieth of the disk (at least 4
 GiB) is refused, one that leaves under a tenth free warns. Update replaces a downloaded pack in its own folder, after
 you unload it. A running download shows a progress bar, the file in flight, speed and time left. Stop keeps what is
@@ -91,6 +91,10 @@ three reset at reboot:
 ```bash
 sudo sysctl iogpu.wired_limit_mb=<N> vm.global_user_wire_limit=<N × 1048576> vm.user_wire_limit=<N × 1048576>
 ```
+
+The standard N is the Mac's RAM in MB less 4096 (45056 on a 48 GB Mac). A model's page in the dashboard shows the three
+limits as they are now and this command with that N, ready to copy. sushi reads the GPU limit when it starts, so restart
+it after running the command; the page says so while the two differ.
 
 **48 GB Mac, Qwen Sushi-2bpw** (limit 43000)
 
@@ -219,7 +223,7 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
   contexts. A conversation past the budget drops its oldest points first.
 - `--no-metrics` turns off `/metrics`, `/metrics.json` and the dashboard's charts (on by default; `--metrics` is still accepted and does nothing).
   The page at `/` has Chat, Dashboard, Models and Settings views: the SSD prefix cache's size, per-model disk use and
-  clear buttons, the models folder and each model's `model-settings.json` keys are edited in Settings and Models.
+  clear buttons are edited in Settings; the models folder and each model's `model-settings.json` keys in Models.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt.
 - `--prefill-chunk 2048` caps the prompt step per forward; a request that does not fit steps down.
 

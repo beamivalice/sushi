@@ -547,6 +547,10 @@ pub const ModelStatus = struct {
     }
 };
 
+/// Load failures a setting or the memory limit decides: the entry goes back to `.unloaded`, so the next load re-reads
+/// model-settings.json. Every other failure is the pack's and is stored.
+pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit" };
+
 /// The roots a rescan walks: the boot roots plus the settings file's models directory, unless a launch flag pins them.
 fn rootsWithFileDir(buf: *[9][]const u8, boot_roots: []const []const u8, pinned: bool, file_dir: ?[]const u8) []const []const u8 {
     if (pinned) return boot_roots;
@@ -1425,6 +1429,13 @@ pub const ModelRegistry = struct {
         while (it.next()) |entry| if (entry.*.state == .error_state) self.markUnloadedLocked(entry.*);
     }
 
+    /// A failed load's end state. A refusal that a setting or the memory limit decides goes back to `.unloaded`, so
+    /// the next load re-reads model-settings.json; any other failure is the pack's and fails fast as `.error_state`.
+    pub fn markLoadFailedLocked(self: *ModelRegistry, entry: *LoadedModel, error_name: []const u8) void {
+        for (refusals) |n| if (std.mem.eql(u8, n, error_name)) return self.markUnloadedLocked(entry);
+        self.markErrorLocked(entry, error_name);
+    }
+
     /// Duped copy of the stored load-failure name for `id` (empty/"sushi"
     /// route to the default), or null when the entry isn't in `.error_state`.
     /// Caller frees. Feeds the HTTP "Model load failed: <name>" message (#144).
@@ -1917,18 +1928,23 @@ test "ModelRegistry: a startup load that fails reaches the waiting request by na
     reg.releaseStatus(e);
 }
 
-test "ModelRegistry: whatever failure an entry holds, a retrying request sees it as not loaded and an ordinary one as the failure" {
+test "ModelRegistry: a refused load is unloaded, any other failure is stored, and a retrying request starts a new attempt after either" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
     const stub = try reg.registerStub("m", "/path/to/m", 1024);
-    for ([_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetBelowResident", "ExpertCacheDoesNotFit", "FileNotFound", "LoadFailed" }) |name| {
+    for (refusals ++ [_][]const u8{ "FileNotFound", "LoadFailed", "Exl3ShardStampMismatch" }) |name| {
         reg.mutex.lockUncancelable(reg.io);
-        reg.markErrorLocked(stub, name);
+        reg.markLoadFailedLocked(stub, name);
         reg.mutex.unlock(reg.io);
+        const refused = for (refusals) |r| {
+            if (std.mem.eql(u8, r, name)) break true;
+        } else false;
         try expectError(error.NotLoaded, reg.ensureLoadedRetrying("m"));
-        try testing.expect(if (reg.ensureLoaded("m")) |_| false else |err| err != error.NotLoaded);
-        try testing.expectEqual(LoadState.error_state, stub.state);
+        try testing.expect(if (reg.ensureLoaded("m")) |_| false else |err| (err == error.NotLoaded) == refused);
+        try testing.expectEqual(if (refused) LoadState.unloaded else LoadState.error_state, stub.state);
+        try testing.expectEqual(refused, stub.error_name == null);
     }
+    try expectError(error.Exl3ShardStampMismatch, reg.ensureLoaded("m"));
 }
 
 test "ModelRegistry: a settings change that reaches loading forgets the stored failure, so the next request loads again" {

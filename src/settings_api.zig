@@ -24,6 +24,8 @@ const kv_quant_mod = @import("kv_quant.zig");
 const update_mod = @import("update.zig");
 const pack_update = @import("pack_update.zig");
 const effort_mod = @import("effort.zig");
+const bills = @import("bills.zig");
+const status_mod = @import("status.zig");
 
 const Edit = model_settings.Edit;
 
@@ -53,6 +55,10 @@ pub const ServerView = struct {
     ask_bytes: u64,
     /// `--think <word>`, which pins each family's default word it binds.
     think: ?effort_mod.Effort = null,
+    /// This Mac's RAM and the `iogpu.wired_limit_mb` this process read at start, in bytes (0 = unknown / undeclared).
+    total_ram: u64 = 0,
+    wired_in_use: u64 = 0,
+    wire_now: bills.WireLimits = .{},
 };
 
 /// The file value of one key as a JSON value, or null when the file had none.
@@ -207,6 +213,20 @@ fn writeRow(w: *std.Io.Writer, r: effort_mod.Row) !void {
     try w.writeAll("}");
 }
 
+/// The three wire limits now, the GPU limit this process uses, and the one command that sets the standard one
+/// (all three limits, `bills.wireLimitsCommand`).
+fn writeGpuLimit(w: *std.Io.Writer, view: ServerView) !void {
+    const standard = bills.standardWiredLimitMb(view.total_ram);
+    if (standard == 0) return w.writeAll(",\"gpu_limit\":null");
+    var cmd: [192]u8 = undefined;
+    const now = view.wire_now;
+    try w.print(",\"gpu_limit\":{{\"total_ram_bytes\":{d},\"iogpu_mb\":{d},\"global_user_wire_bytes\":{d},\"user_wire_bytes\":{d},\"in_use_mb\":{d},\"standard_mb\":{d},\"command\":", .{
+        view.total_ram, now.iogpu_mb, now.global_user_bytes, now.user_bytes, view.wired_in_use >> 20, standard,
+    });
+    try writeJson(w, bills.wireLimitsCommand(&cmd, standard));
+    try w.writeAll(",\"applies\":\"run it in Terminal, then restart sushi: the limit is read at start, and macOS resets it at reboot\"}");
+}
+
 /// The effort tables as the page edits them: per family the built-in row, the stored fields and the served row, the
 /// default word and the `--think` that pins it. Read from the served tables, so a save shows at once.
 fn writeEffort(w: *std.Io.Writer, view: ServerView) !void {
@@ -325,6 +345,7 @@ pub fn render(
     });
     try w.writeAll("}");
     try writeEffort(w, view);
+    try writeGpuLimit(w, view);
 
     try w.writeAll(",\"models\":[");
     for (rows, 0..) |row, i| {
@@ -644,6 +665,9 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
         .boot_roots = roots,
         .ask_bytes = server.diskAsk().bytes,
         .think = effort_mod.think_effort_flag,
+        .total_ram = status_mod.getTotalMemBytes(),
+        .wired_in_use = bills.wiredLimitBytes(),
+        .wire_now = bills.wireLimitsNow(),
     });
     defer allocator.free(body);
     try http.sendResponse(stream, "200 OK", "application/json", body);
@@ -1011,6 +1035,36 @@ test "settings api: a toggle reaches the loops at once, and a pinning flag keeps
     locks.pack_update_check.pin("--no-update-check", .{});
     _ = applyUpdateCheck(&locks, "pack_update_check", .{ .bool = true });
     try testing.expect(!pack_update.autoOn());
+}
+
+test "settings api: render reports the three wire limits now, the GPU limit in use and the standard command" {
+    var locks: model_settings.LaunchLocks = .{};
+    var file = try model_settings.parse(testing.allocator, "{}");
+    defer file.deinit();
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30, .total_ram = 48 << 30, .wired_in_use = 40960 << 20, .wire_now = .{
+        .iogpu_mb = 41667,
+        .global_user_bytes = 38_000_000_000,
+        .user_bytes = 36_000_000_000,
+    } };
+    const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const g = parsed.value.object.get("gpu_limit").?.object;
+    try testing.expectEqual(@as(i64, 48 << 30), g.get("total_ram_bytes").?.integer);
+    // The sysctls as they read now; the in-use number differs until sushi restarts.
+    try testing.expectEqual(@as(i64, 41667), g.get("iogpu_mb").?.integer);
+    try testing.expectEqual(@as(i64, 38_000_000_000), g.get("global_user_wire_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 36_000_000_000), g.get("user_wire_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 40960), g.get("in_use_mb").?.integer);
+    try testing.expectEqual(@as(i64, 45056), g.get("standard_mb").?.integer);
+    try testing.expectEqualStrings("sudo sysctl iogpu.wired_limit_mb=45056 vm.global_user_wire_limit=47244640256 vm.user_wire_limit=47244640256", g.get("command").?.string);
+    // Unknown RAM: no limit to suggest.
+    const blind = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(blind);
+    const p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, blind, .{});
+    defer p2.deinit();
+    try testing.expect(p2.value.object.get("gpu_limit").? == .null);
 }
 
 test "settings api: render reports skip_mem_preflight off by default, with the file value and the flag that pins it" {

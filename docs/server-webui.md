@@ -111,8 +111,15 @@ and the page tooltip share them.
 
 ## Settings sections and the Thinking effort card
 
-- Settings groups its cards under small uppercase section labels (`.sec-h`): Storage (SSD cache, models folder),
+- Settings groups its cards under small uppercase section labels (`.sec-h`): Storage (SSD cache),
   Inference (Thinking effort), Server (port, update checks, about).
+- The models folder is chosen on the Models page: the header shows the folders in use, and **Change folder…** opens the
+  chat's folder picker (`/v1/tools` browse, so this Mac's page on a loopback bind; elsewhere a typed absolute path is
+  taken as is). A pick saves `server.models_dir` and rescans at once; **Use the default folder** clears it; a
+  `--model-dir` launch leaves no Change button.
+- Each model's page shows the three wire limits as they read now (refetched when the window regains focus, as after
+  Terminal) and the standard `sudo sysctl` line with a copy button; it says to restart while `iogpu` differs from the
+  limit sushi started with.
 - The Thinking effort card: a `.seg` tab row per family (arrow keys, Home and End move between tabs), then a `.tbl` of
   the six words with Offered (checkbox), Sends (a select of the family's values; DeepSeek a 1-100 box with 50/75/100
   chips), Cap (a box; blank keeps the default, `none` removes it) and Default (radio). Default values show in grey
