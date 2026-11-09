@@ -4,61 +4,35 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.6.0 — Stability, UI and Architecture Refactor
 
-- **On 64 GB Macs Qwen3.8-Flash-Next prefill no longer slows when macOS evicts the n-gram table**: the serial walk after the warm is taken only while the table is resident, with no environment variable needed.
-- **A value the engine will not honour as given is refused by name, never clamped or ignored**: a request `temperature`,
-  `top_p`, `top_k`, penalty, `top_logprobs`, `logprobs`, `think_penalty`, token budget (a negative `max_tokens`) or `seed` outside its range
-  is a 400 that states the range; a strict `json_schema` beside tools, or one the grammar cannot parse, is a 400 on chat,
-  Responses and Messages; and `--mtp` with `--no-mtp`, an empty `--api-key`, `--max-concurrent 0` and a
-  `--prefill-decode-share` above 0.9 exit with an error, while `--max-resident-mem auto` now means auto after a size too.
-- **The web page checks what it sends and says what went wrong**: a chat setting out of range (or `1e9`, which was sent as 1) is flagged and held, a server error answer is shown as one instead of Offline, a send to a stopped server and a failed load name their remedy, the models-folder picker no longer opens on an error, a model filter hides the detail of a model it hides, skipping the memory check asks first, context sizes read the same everywhere, the chat opens on the model loaded last (and asks you to choose when none ever was), a user message can be edited and resent, a pack's in-memory size and full weight size are both shown, and the markdown renderer shows TeX as written and draws strikethrough, task lists, table alignment, bare links and setext headings.
-- **Context extension is a per-model setting on the Models page**: Qwen3.8-Flash-Next can run with YaRN ×2 or ×4 over
-  its own native window, saved in `model-settings.json` as `yarn_factor`, with the resulting window and RoPE shown
-  before loading; the prefix cache keeps separate entries per setting, and `sushi kld` records the RoPE of a capture.
-- **A model whose SSD prefix cache was declined at load (volume too full, or a failed attach) gets it back by itself**: the
-  engine looks once a minute, and at once when an SSD size setting is saved, and logs `[disk-cache] re-armed` when it
-  attaches.
-- **The SSD prefix cache reports what it stored beside what it wrote**: `/metrics` adds
-  `sushi:prefix_cache_store_bytes_total{kind}` and `/metrics.json` adds `prefix_cache_writes.stored_bytes`, the bytes the
-  cache's storage layer put on the SSD, by file kind.
-- **A failure no longer outlives its cause**: a model refused for its SSD budget or the memory limit (including a Metal
-  out-of-memory during the load) is unloaded rather than failed, so it loads again once the setting is lowered or memory
-  is free, with no server restart; pressing Load again on any other failed model tries the load again with the current
-  settings and shows its own result, a refused Save clears when you press Save again or edit the value, a load failure
-  clears as soon as the model is listed loaded, saving a setting a load reads lets the next request retry a failed
-  model, a finished download drops the pack's update notice at once, and a release check that finds nothing newer clears
-  an earlier update failure.
-- **The models folder moved from Settings to the Models page**, chosen with a folder picker instead of a typed path.
-- **A model's page in the dashboard shows `iogpu.wired_limit_mb` and both user-wire limits as they are now**, with one
-  copyable `sudo sysctl` command that sets all three to the standard (the Mac's RAM less 4 GiB).
-- **A failure no longer outlives its cause**: pressing Load again on a model whose load failed (or ran out of memory)
-  tries the load again with the current settings and shows its own result, a refused Save clears when you press Save
-  again or edit the value, a load failure clears as soon as the model is listed loaded, saving a setting a load reads
-  lets the next request retry a failed model, a finished download drops the pack's update notice at once, and a release
-  check that finds nothing newer clears an earlier update failure.
-- **The chat page's model picker follows the model that is loaded**: after a model was loaded elsewhere, the page used to
-  keep a remembered, unloaded one, and the next message loaded that one in place of the loaded one.
-- **The chat page lists an unloaded DeepSeek-V4.1-Flash**: `/v1/models` reported it as unable to chat until it was
-  loaded, because its template is built in rather than a file in the pack.
-- **A load can no longer leave an unhandled MLX error for the first chat to trip on**: it is logged with its message and
-  cleared when the load ends, and the warmup failure lines now name the MLX message behind them.
-- **The first chat after loading a Flash-Next pack that streams its experts no longer fails**: the load read the shape of
-  the empty resident expert bank 144 times, and the first request answered "generation failed" until a retry.
-- **A request that fails inside the engine now logs why**: the server log names the error (`[slot] request N failed`)
-  where the client only reads "generation failed".
-- **Each served architecture is a self-contained module**: Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4.1-Flash and
-  MiMo-V2.6-Flash each live behind one registry line, so `-Darchs` builds the engine with any of them left out, with
-  every model's output unchanged.
-- **The "architecture not supported" and "file format not supported" load refusals list every architecture this build
-  serves**: the first now also names DeepSeek-V4.1-Flash, the second no longer stops at Qwen and MiMo.
-- **The `sushi_exl3` module names no architecture**: its files, public names and Metal kernel names now say what they do, and its per-call modes are parameters instead of process globals, with
-  output unchanged.
-- **The deprecated `sushi_exl3` aliases are removed**: `glm_group2`, `glm_fold`, `qwen_riders`, `qwen_fold`,
-  `glm_prefill_grid`, `rate_groups.qwenFoldedCount`, `qwenLaunchCount` and `Codebook.servesGlmFastPaths` are gone, so a
-  host that still used them takes the new names when it re-vendors.
-- **`sushi_exl3` has a written re-vendor contract** (`docs/mlx-serve-integration.md`): every public name, the
-  `mlx_host` surface that `zig build exl3-host-check` enforces, and a new `version` constant.
+- **Qwen3.8-Flash-Next prefill keeps its speed on 64 GB Macs**: when macOS pushes the n-gram table out of memory beside
+  the weights, prefill now keeps its parallel reads instead of walking the table from the SSD, which had halved its
+  speed since 1.5.1; `QWEN4_PLE_PREFETCH_PREFILL=1` is no longer needed. Thanks @wjjchen for the report.
+- **Context extension is a per-model setting**: the Models page runs Qwen3.8-Flash-Next with YaRN ×2 or ×4 over its
+  native window (`yarn_factor` in `model-settings.json`), shows the resulting window before loading, and keeps separate
+  prompt-cache entries per setting, so a 256 GB Mac can serve the BF16 pack or a custom pack at long context. A
+  `--ctx-size` above the window is refused. Thanks @Cianidos for the request.
+- **Nothing is silently clamped or ignored**: a request value out of range (`temperature`, `top_p`, `top_k`, penalties,
+  `logprobs`, `seed`, a negative `max_tokens`) or a strict `json_schema` the server cannot enforce is a 400 that says
+  why, and a launch flag that cannot work as given (`--mtp` with `--no-mtp`, an empty `--api-key`,
+  `--max-concurrent 0`) exits with an error instead of being overridden.
+- **A failure no longer outlives its cause**: a model refused for its SSD budget or memory limit loads again once the
+  setting is lowered, with no restart; Load retries a failed model with the current settings; a refused Save clears when
+  the value is fixed; and an SSD prompt cache declined at load (a full volume) re-attaches by itself. A model's page
+  shows the Mac's three wired-memory limits with one copyable `sudo sysctl` command (thanks @Cianidos).
+- **A sturdier web page**: settings are checked before they are sent, errors name their remedy instead of showing
+  Offline, the chat opens on the model loaded last and follows the loaded model, a message can be edited and resent,
+  each pack shows its in-memory and full weight size, the models folder is picked on the Models page, and the markdown
+  renderer draws task lists, strikethrough, table alignment and bare links.
+- **Fewer first-chat failures**: the first chat after loading a Flash-Next pack that streams its experts, an unloaded
+  DeepSeek-V4.1-Flash missing from the chat page, a burst of reloads that loaded one model twice, and an MLX error left
+  over from a load no longer fail a request; a request that fails inside the engine now logs why.
+- **For hosts that vendor the engine**: each architecture is a self-contained module (`-Darchs` builds without any of
+  them), `sushi_exl3` names no architecture, its deprecated aliases are gone, and its re-vendor contract is written down
+  with a `version` constant. Model output is unchanged.
+
+---
 
 ## v1.5.1 — Thinking effort settings, fuller prompt-cache reuse, faster Qwen trellis packs
 
