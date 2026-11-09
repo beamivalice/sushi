@@ -186,6 +186,8 @@ unexplained drop means tests were not built, and blocks the push.
 
 CI runs `test-build` (every test compiles), `test-host` and the hermetic guards on every PR; the GPU tier is a
 `workflow_dispatch` choice (`tier: all`), because a hosted runner's GPU flips rounding ties the M5 holds.
+The hermetic guards are one list, `tests/hermetic_guards.sh`, which CI calls and every landing runs locally; it fails
+on a skip, so a box without PyYAML (`python3 -m pip install pyyaml`) cannot pass it unseen.
 
 ## Integration scripts
 

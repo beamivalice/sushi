@@ -92,7 +92,7 @@ follow `inference/image_processor.py` and `inference/vision.py`. All are
 implemented in Zig against mlx-c with SSD-streamed expert banks.
 `src/fixtures/dsv41_chat_template.jinja` is a Jinja transcription of the
 release's `encoding/encoding.py`, and `src/fixtures/dsv41_template_cases.json`
-and `src/fixtures/dsv41_engram_token_map.bin` are generated from that encoder and
+and `src/dsv41/fixtures/dsv41_engram_token_map.bin` are generated from that encoder and
 the release's tokenizer. tests/dsv41/dump_dsv41_fixtures.py,
 tests/dsv41/dump_dsv41_template_cases.py, tests/dsv41/dump_dsv41_token_map.py and
 tests/dsv41/dump_dsv41_vision_fixtures.py run the unmodified reference externally to
@@ -403,7 +403,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     served packs' configs.
   * The DeepSeek-V4.1-Flash arm (`src/dsv41/dsv41_{borrow,config,engram,kernels,model,prefix,qat,scope,source,stream,vision}.zig`,
     `src/fixtures/dsv41_chat_template.jinja`,
-    `src/fixtures/dsv41_engram_token_map.bin`, the spaced DSML tags in `src/chat.zig`), from
+    `src/dsv41/fixtures/dsv41_engram_token_map.bin`, the spaced DSML tags in `src/chat.zig`), from
     mlx-serve's `deepseek_v41.zig`, `dsv41_engram.zig` and `src/chat.zig` at f1c3276f
     by David Dalcu. Modifications: the MLX-native path only (no embedded ds4 engine); the
     op scope, Engram lookup, attention and indexer formulation were rewritten against the
