@@ -590,6 +590,35 @@ chunk, which points at the per-layer host round trip of the host-built table rat
 save ~0.4 s of ~18.8 s (~2%), below the spread of the two-sample 32k run (one arm's samples ranged 17.9 to 20.1 s). The served path also drops the un-sort buffer
 (`[rows x 10, 2560]` f16: 210 MB at 4096 rows, 420 MB at 8192).
 
+<a id="cas-persist-stall"></a>
+## 1.6.0 prefill: the SSD tier's persists stalled the inference thread
+
+- 1.6.0 prefilled Qwen STQ-2.75bpw rev 2.0 2-6% slower than 1.5.1 from 4k to 40k (release bench, 16k window 2,113 /
+  2,096 against 2,232 / 2,237 tok/s). The cause is the content-addressed SSD layer (b6eb06c7, the default): the prefill
+  write-through persists twice per 8k window, and each persist waited for the writer. A fence before a delete waited
+  out every op in flight (40-117 ms, a cas op lasting as long as the paced plain write), and the manifest write waited
+  ~75 ms on `land_mutex` while the writer hashed a 115 MB checkpoint. The staging itself costs 1-2 ms per chunk. Taking
+  the persist ms out of 1.6.0's release-bench windows gives 1.5.1's rate at the same clock. Fix and rule:
+  [engine-prefix-cache](engine-prefix-cache.md#file-layer).
+- In-process `sushi bench --rungs 8k,48k --tokens 512 --code-only`, six 8k windows (45,242 new tokens), order fix,
+  1.6.0, 1.5.1, 1.5.1, 1.6.0, fix; GPU lock, `taskpolicy -a`, fans max, die under 50 C per load, AC, 2026-11-10.
+  Binaries: fix 8cb64449 (the landing before its squash), 1.6.0 ac3da7aa, 1.5.1 9f8801bd:
+
+  | arm | prefill ms (tok/s) | persists in prefill ms | restores ms | 8k window tok/s (MHz) |
+  |---|---|---|---|---|
+  | fix | 21,024 (2,152) / 20,952 (2,159) | 94 / 101 | 575 / 581 | 2,335 (1618) / 2,316 (1617) |
+  | 1.6.0 | 21,120 (2,142) / 21,016 (2,153) | 650 / 650 | 562 / 551 | 2,250 (1617) / 2,246 (1586) |
+  | 1.5.1 | 21,156 (2,139) / 21,094 (2,145) | 137 / 144 | 272 / 272 | 2,301 (1564) / 2,293 (1618) |
+
+  The totals are clock-bound: the middle windows of both fix and both 1.5.1 runs ran at 1460-1540 MHz, 1.6.0's at up to
+  1614 (its stalls idle the GPU), so read the persist column and the matched-clock 8k window. Code decode is level.
+  The restore is still twice 1.5.1's: the read path, not a wait.
+- The 4bpw pack (affine trunk) had the same stall: `--rungs 8k,32k`, 1.6.0 then fix, 28,796 new tokens, 12,479 ms
+  (2,308 tok/s, persists 423 ms) against 11,905 ms (2,419 tok/s, persists 52 ms), +4.8%, both 1488-1618 MHz.
+  DeepSeek STQ-1.75bpw (`--ssd-budget-gb 108`, `--tokens 256`) restores from its live state in this flow and persists
+  nothing that waits (0 ms both arms; `prefill held` 16-20 ms both): windows 1,550 / 1,575 / 1,532 / 1,504 against
+  1.6.0's 1,540 / 1,552 / 1,524 / 1,479 tok/s, so its release-bench gap is not this one.
+
 <a id="stq-prefill-profile"></a>
 ## Flash-Next STQ prefill: where a chunk's time goes, K6 trunk against affine 8
 

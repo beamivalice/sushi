@@ -8,6 +8,7 @@
 //! Nothing is fsynced: a crash of the process loses nothing that was journaled, a power loss may.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const write_stats = @import("disk_write_stats.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
@@ -58,6 +59,13 @@ pub const Options = struct {
 
 pub const Stat = struct { size: u64, nlink: u32, ino: u64, mtime_ns: i128, is_dir: bool };
 pub const DirEntry = struct { name: []u8, is_dir: bool };
+/// A test's hold on the next step `at` of a part's landing: `entered` once one reaches it, which then waits for
+/// `open`.
+pub const Gate = struct {
+    at: enum { hash, pack_write },
+    entered: std.atomic.Value(bool) = .init(false),
+    open: std.atomic.Value(bool) = .init(false),
+};
 /// A staged file: `data_bytes` are the new block bytes already in the pack, `size` the file's logical size.
 pub const Ticket = struct { id: u64, data_bytes: u64, size: u64 };
 pub const Landed = struct { size: u64, data_bytes: u64, journal_bytes: u64 };
@@ -81,7 +89,8 @@ const Ext = struct {
 };
 const Block = struct { pack: u32, off: u32, kind: Kind, refs: u32, verified: bool };
 const Ref = struct { ext: Ext, pack: u32, off: u32, kind: Kind };
-const Pack = struct { file: ?File = null, size: u64 = 0, live_blocks: u32 = 0, live_bytes: u64 = 0 };
+/// `unfilled` counts blocks placed in the pack that their `fillBlocks` has not written yet: the pack stays open.
+const Pack = struct { file: ?File = null, size: u64 = 0, live_blocks: u32 = 0, live_bytes: u64 = 0, unfilled: u32 = 0 };
 
 const Vnode = struct {
     ino: u64,
@@ -110,13 +119,15 @@ const Node = union(enum) {
 const Mode = enum { create, replace, overwrite, edit };
 /// `replace` lands as `tmp` + `rename` does (a new inode); `overwrite` as `open(O_TRUNC)` (an existing file keeps its).
 pub const HoldMode = enum { create, replace, overwrite };
-/// A staged file. `held` are its parts in order, each kept until an `appendBlocks` interns it; `exts` are pinned
-/// from then on.
+/// A staged file. `held` are its parts in order; a part moves to `hashed` (`hashBlocks`), to `fill` (`appendBlocks`
+/// placed it) and into `exts`, pinned, once `fillBlocks` wrote it.
 const Staged = struct {
     path: []u8,
     mode: Mode,
     kind: Kind,
     held: std.ArrayList(OwnedPayload) = .empty,
+    hashed: ?Hashed = null,
+    fill: ?Fill = null,
     exts: []Ext = &.{},
     /// Pack bytes a `stage*` appended that no `appendBlocks` has returned yet.
     unreported: u64 = 0,
@@ -124,6 +135,39 @@ const Staged = struct {
     fn freeHeld(self: *Staged, a: Allocator) void {
         for (self.held.items) |h| h.deinit(a);
         self.held.deinit(a);
+        if (self.hashed) |h| h.deinit(a);
+        self.hashed = null;
+        if (self.fill) |f| f.deinit(a);
+        self.fill = null;
+    }
+};
+
+const Hashed = struct {
+    payload: OwnedPayload,
+    addrs: []Addr,
+
+    fn deinit(self: Hashed, a: Allocator) void {
+        self.payload.deinit(a);
+        a.free(self.addrs);
+    }
+};
+
+/// A part `appendBlocks` placed: per segment, nothing (empty), a block already indexed (pinned then), the place its
+/// bytes take in a pack (`fillBlocks` writes them there, outside the lock), or a repeat of an earlier placed segment.
+const Fill = struct {
+    payload: OwnedPayload,
+    slots: []Slot,
+
+    const Slot = union(enum) {
+        empty,
+        shared: Ext,
+        at: struct { ext: Ext, pack: u32, off: u32, file: File },
+        repeat: usize,
+    };
+
+    fn deinit(self: Fill, a: Allocator) void {
+        self.payload.deinit(a);
+        a.free(self.slots);
     }
 };
 
@@ -372,6 +416,8 @@ pub const Vfs = struct {
     recovered: Recovery = .{},
     /// Blocks hashed on a first read; a block written by this process is never counted.
     verify_count: u64 = 0,
+    /// Test seam: the next step the gate names waits there until the test opens it.
+    gate: if (builtin.is_test) ?*Gate else void = if (builtin.is_test) null else {},
 
     pub fn open(allocator: Allocator, io: std.Io, root: []const u8, opts: Options) !*Vfs {
         const packs_path = try std.fmt.allocPrint(allocator, "{s}/v/packs", .{root});
@@ -456,7 +502,15 @@ pub const Vfs = struct {
     /// Appends the blocks, journals the record and makes the file visible, in one call. On an error the
     /// ticket is released.
     pub fn publish(self: *Vfs, t: Ticket) !Landed {
+        self.hashBlocks(t.id) catch |e| {
+            self.abortTicket(t.id);
+            return e;
+        };
         const appended = self.appendBlocks(t.id) catch |e| {
+            self.abortTicket(t.id);
+            return e;
+        };
+        self.fillBlocks(t.id) catch |e| {
             self.abortTicket(t.id);
             return e;
         };
@@ -473,10 +527,11 @@ pub const Vfs = struct {
         self.abortTicket(t.id);
     }
 
-    // The writer's four steps. A ticket is `hold` (or `stage*`), then `appendBlocks`, `journalRecord`, and
-    // `publishTicket`, or `abortTicket` at any point before the last. `journalRecord` returns with the Vfs lock
-    // held and `publishTicket` releases it, so no other mutation is journaled between the two and the
-    // record's view of the namespace is the one it is applied to. The caller sequences the four on one thread.
+    // The writer's six steps. A ticket is `hold` (or `stage*`), then per part `hashBlocks`, `appendBlocks` and
+    // `fillBlocks`, then `journalRecord` and `publishTicket`, or `abortTicket` at any point before the last.
+    // `journalRecord` returns with the Vfs lock held and `publishTicket` releases it, so no other mutation is
+    // journaled between the two and the record's view of the namespace is the one it is applied to. The caller
+    // sequences the six on one thread.
 
     /// Stages a file whose bytes the Vfs now owns (allocated with its allocator), also on an error. Nothing is
     /// hashed or written yet.
@@ -524,48 +579,207 @@ pub const Vfs = struct {
         return size;
     }
 
-    /// Hashes the first held part and appends the blocks the index lacks to the active pack. Returns the pack
-    /// bytes appended. The file stays invisible: the blocks are pinned, not yet part of any name.
-    pub fn appendBlocks(self: *Vfs, id: u64) !u64 {
+    /// Hashes the first held part with no lock held, so the layer answers other threads meanwhile.
+    pub fn hashBlocks(self: *Vfs, id: u64) !void {
         const a = self.allocator;
         self.lock();
         const st0 = self.tickets.getPtr(id) orelse {
             self.unlock();
             return error.UnknownTicket;
         };
-        // A ticket staged with its bytes (`stage*`) appended them then; they count where it lands.
-        const staged = st0.unreported;
-        st0.unreported = 0;
+        if (st0.hashed != null) {
+            self.unlock();
+            return error.NotAppended;
+        }
+        if (st0.fill != null) {
+            self.unlock();
+            return error.NotFilled;
+        }
         if (st0.held.items.len == 0) {
             self.unlock();
-            return staged;
+            return;
         }
         const payload = st0.held.orderedRemove(0);
         self.unlock();
-        defer payload.deinit(a);
+        errdefer payload.deinit(a);
         const addrs = try a.alloc(Addr, payload.segments.len);
-        defer a.free(addrs);
+        errdefer a.free(addrs);
+        self.passGate(.hash);
         for (payload.segments, addrs) |sg, *ad| ad.* = addrOf(sg.bytes);
-
         self.lock();
         defer self.unlock();
         const st = self.tickets.getPtr(id) orelse return error.UnknownTicket;
-        const fresh = try self.internLocked(payload.kind, payload.segments, addrs);
-        if (st.exts.len == 0) {
-            st.exts = fresh.exts;
-        } else {
-            const joined = a.alloc(Ext, st.exts.len + fresh.exts.len) catch |e| {
-                self.releaseAll(fresh.exts);
-                a.free(fresh.exts);
-                return e;
-            };
-            @memcpy(joined[0..st.exts.len], st.exts);
-            @memcpy(joined[st.exts.len..], fresh.exts);
-            a.free(st.exts);
-            a.free(fresh.exts);
-            st.exts = joined;
+        st.hashed = .{ .payload = payload, .addrs = addrs };
+    }
+
+    /// Places the blocks of the hashed part the index lacks at the end of the active pack, writing nothing:
+    /// `fillBlocks` writes them with no lock held. Returns the pack bytes placed. The file stays invisible: its
+    /// blocks are unreferenced until the journal record.
+    pub fn appendBlocks(self: *Vfs, id: u64) !u64 {
+        const a = self.allocator;
+        self.lock();
+        defer self.unlock();
+        const st = self.tickets.getPtr(id) orelse return error.UnknownTicket;
+        if (st.fill != null) return error.NotFilled;
+        // A ticket staged with its bytes (`stage*`) appended them then; they count where it lands.
+        const staged = st.unreported;
+        st.unreported = 0;
+        const h = st.hashed orelse {
+            if (st.held.items.len != 0) return error.NotHashed;
+            return staged;
+        };
+        const payload = h.payload;
+        const addrs = h.addrs;
+        const n = payload.segments.len;
+        const slots = try a.alloc(Fill.Slot, n);
+        errdefer a.free(slots);
+        var first: std.AutoHashMapUnmanaged(Key, usize) = .empty;
+        defer first.deinit(a);
+        try first.ensureTotalCapacity(a, @intCast(n));
+        var placed: u64 = 0;
+        var made: usize = 0;
+        errdefer self.unplace(slots[0..made]);
+        const ks = &self.kind_stats[@intFromEnum(payload.kind)];
+        for (payload.segments, addrs, slots, 0..) |sg, ad, *slot, i| {
+            if (sg.bytes.len == 0) {
+                slot.* = .empty;
+            } else {
+                if (sg.bytes.len > std.math.maxInt(u32)) return error.BlockTooLarge;
+                const e: Ext = .{ .addr = ad, .len = @intCast(sg.bytes.len), .tensor = sg.tensor, .group = sg.group };
+                if (self.blocks.contains(e.key())) {
+                    self.acquire(e) catch unreachable;
+                    ks.dedup_blocks += 1;
+                    ks.dedup_bytes += e.len;
+                    slot.* = .{ .shared = e };
+                } else if (first.get(e.key())) |j| {
+                    slot.* = .{ .repeat = j };
+                } else {
+                    const at = try self.place(e.len);
+                    slot.* = .{ .at = .{ .ext = e, .pack = at.pack, .off = at.off, .file = at.file } };
+                    first.putAssumeCapacity(e.key(), i);
+                    placed += e.len;
+                }
+            }
+            made += 1;
         }
-        return staged + fresh.data_bytes;
+        st.hashed = null;
+        a.free(addrs);
+        st.fill = .{ .payload = payload, .slots = slots };
+        return staged + placed;
+    }
+
+    /// Writes the blocks the last `appendBlocks` placed, holding no lock while it does, then indexes them and pins
+    /// the part's extents. A block another file indexed meanwhile is shared; its placed copy is dead bytes.
+    pub fn fillBlocks(self: *Vfs, id: u64) !void {
+        const a = self.allocator;
+        self.lock();
+        const st0 = self.tickets.getPtr(id) orelse {
+            self.unlock();
+            return error.UnknownTicket;
+        };
+        const fill = st0.fill orelse {
+            self.unlock();
+            return;
+        };
+        st0.fill = null;
+        self.unlock();
+        defer fill.deinit(a);
+
+        var failed: ?anyerror = null;
+        for (fill.slots, fill.payload.segments) |slot, sg| switch (slot) {
+            .at => |at| {
+                self.passGate(.pack_write);
+                at.file.writePositionalAll(self.io, sg.bytes, at.off) catch |e| {
+                    failed = e;
+                    break;
+                };
+            },
+            else => {},
+        };
+        const exts = a.alloc(Ext, fill.slots.len) catch |e| {
+            failed = failed orelse e;
+            self.lock();
+            defer self.unlock();
+            self.unplace(fill.slots);
+            return failed.?;
+        };
+        errdefer a.free(exts);
+
+        self.lock();
+        defer self.unlock();
+        if (failed) |e| {
+            self.unplace(fill.slots);
+            return e;
+        }
+        const st = self.tickets.getPtr(id) orelse {
+            self.unplace(fill.slots);
+            return error.UnknownTicket;
+        };
+        self.blocks.ensureUnusedCapacity(a, @intCast(fill.slots.len)) catch |e| {
+            self.unplace(fill.slots);
+            return e;
+        };
+        const ks = &self.kind_stats[@intFromEnum(fill.payload.kind)];
+        var k: usize = 0;
+        for (fill.slots, fill.payload.segments) |slot, sg| {
+            const e: Ext = switch (slot) {
+                .empty => continue,
+                .shared => |e| e,
+                .at => |at| blk: {
+                    const p = self.packs.getPtr(at.pack).?;
+                    p.unfilled -= 1;
+                    if (self.blocks.contains(at.ext.key())) {
+                        ks.dedup_blocks += 1;
+                        ks.dedup_bytes += at.ext.len;
+                    } else {
+                        self.blocks.putAssumeCapacity(at.ext.key(), .{ .pack = at.pack, .off = at.off, .kind = fill.payload.kind, .refs = 0, .verified = true });
+                        ks.blocks += 1;
+                        ks.data_bytes += at.ext.len;
+                    }
+                    self.acquire(at.ext) catch unreachable;
+                    break :blk at.ext;
+                },
+                .repeat => |j| blk: {
+                    const src = fill.slots[j].at.ext;
+                    const e: Ext = .{ .addr = src.addr, .len = src.len, .tensor = sg.tensor, .group = sg.group };
+                    self.acquire(e) catch unreachable;
+                    ks.dedup_blocks += 1;
+                    ks.dedup_bytes += e.len;
+                    break :blk e;
+                },
+            };
+            exts[k] = e;
+            k += 1;
+        }
+        self.dropDrainedPacks(fill.slots);
+        const joined = a.realloc(exts, st.exts.len + k) catch |e| {
+            self.releaseAll(exts[0..k]);
+            return e;
+        };
+        std.mem.copyBackwards(Ext, joined[st.exts.len..], joined[0..k]);
+        @memcpy(joined[0..st.exts.len], st.exts);
+        a.free(st.exts);
+        st.exts = joined;
+    }
+
+    /// Undoes `appendBlocks`' placing: unpins the shared blocks and leaves the placed bytes dead.
+    fn unplace(self: *Vfs, slots: []const Fill.Slot) void {
+        for (slots) |slot| switch (slot) {
+            .shared => |e| self.release(e),
+            .at => |at| self.packs.getPtr(at.pack).?.unfilled -= 1,
+            else => {},
+        };
+        self.dropDrainedPacks(slots);
+    }
+
+    /// Drops a pack the placed slots wrote into once nothing lives in it and no placed block is still unwritten.
+    fn dropDrainedPacks(self: *Vfs, slots: []const Fill.Slot) void {
+        for (slots) |slot| switch (slot) {
+            .at => |at| if (self.packs.get(at.pack)) |p| {
+                if (p.live_blocks == 0 and p.unfilled == 0 and !self.replaying) self.dropPack(at.pack);
+            },
+            else => {},
+        };
     }
 
     /// Appends the ticket's journal record and returns its bytes. On success the Vfs lock is still held until
@@ -574,7 +788,8 @@ pub const Vfs = struct {
         self.lock();
         errdefer self.unlock();
         const st = self.tickets.getPtr(id) orelse return error.UnknownTicket;
-        if (st.held.items.len != 0) return error.NotAppended;
+        if (st.held.items.len != 0 or st.hashed != null) return error.NotAppended;
+        if (st.fill != null) return error.NotFilled;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const rec = try self.buildRec(arena.allocator(), st.path, st.mode, st.kind, st.exts);
@@ -606,15 +821,22 @@ pub const Vfs = struct {
         self.lock();
         defer self.unlock();
         var kv = self.tickets.fetchRemove(id) orelse return;
+        if (kv.value.fill) |f| self.unplace(f.slots);
         self.releaseAll(kv.value.exts);
         self.allocator.free(kv.value.path);
         self.allocator.free(kv.value.exts);
         kv.value.freeHeld(self.allocator);
     }
 
-    /// The four steps as plain functions over `ctx: *Vfs`, the shape the writer's op sink takes.
+    /// The steps as plain functions over `ctx: *Vfs`, the shape the writer's op sink takes.
+    pub fn opHashBlocks(ctx: *anyopaque, ticket: u64) anyerror!void {
+        return @as(*Vfs, @ptrCast(@alignCast(ctx))).hashBlocks(ticket);
+    }
     pub fn opAppendBlocks(ctx: *anyopaque, ticket: u64) anyerror!u64 {
         return @as(*Vfs, @ptrCast(@alignCast(ctx))).appendBlocks(ticket);
+    }
+    pub fn opFillBlocks(ctx: *anyopaque, ticket: u64) anyerror!void {
+        return @as(*Vfs, @ptrCast(@alignCast(ctx))).fillBlocks(ticket);
     }
     pub fn opJournalRecord(ctx: *anyopaque, ticket: u64) anyerror!u64 {
         return @as(*Vfs, @ptrCast(@alignCast(ctx))).journalRecord(ticket);
@@ -988,9 +1210,35 @@ pub const Vfs = struct {
         const p = self.packs.getPtr(id).?;
         if (p.size + bytes.len > std.math.maxInt(u32)) return error.BlockTooLarge;
         try self.blocks.ensureUnusedCapacity(a, 1);
+        self.passGate(.pack_write);
         try p.file.?.writePositionalAll(self.io, bytes, p.size);
         self.blocks.putAssumeCapacity(e.key(), .{ .pack = id, .off = @intCast(p.size), .kind = kind, .refs = 0, .verified = true });
         p.size += bytes.len;
+    }
+
+    fn passGate(self: *Vfs, at: @FieldType(Gate, "at")) void {
+        if (!builtin.is_test) return;
+        const g = self.gate orelse return;
+        if (g.at != at) return;
+        self.gate = null;
+        g.entered.store(true, .release);
+        while (!g.open.load(.acquire)) std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
+    }
+
+    /// Room for a block of `len` bytes at the end of the active pack, counted in its size now and written later.
+    fn place(self: *Vfs, len: u32) !struct { pack: u32, off: u32, file: File } {
+        if (self.active) |id| {
+            const p = self.packs.getPtr(id).?;
+            if (p.size > 0 and p.size + len > self.opts.pack_limit) self.active = null;
+        }
+        if (self.active == null) try self.newPack();
+        const id = self.active.?;
+        const p = self.packs.getPtr(id).?;
+        if (p.size + len > std.math.maxInt(u32)) return error.BlockTooLarge;
+        const off: u32 = @intCast(p.size);
+        p.size += len;
+        p.unfilled += 1;
+        return .{ .pack = id, .off = off, .file = p.file.? };
     }
 
     fn newPack(self: *Vfs) !void {
@@ -1030,7 +1278,7 @@ pub const Vfs = struct {
         const p = self.packs.getPtr(id).?;
         p.live_blocks -= 1;
         p.live_bytes -= e.len;
-        if (p.live_blocks == 0 and !self.replaying) self.dropPack(id);
+        if (p.live_blocks == 0 and p.unfilled == 0 and !self.replaying) self.dropPack(id);
     }
 
     fn releaseAll(self: *Vfs, exts: []const Ext) void {
@@ -2734,14 +2982,22 @@ test "prefix_vfs: the journal compacts by itself once it outgrows the threshold"
 /// The shape the writer's op sink takes; assigning the Vfs functions to it checks the signatures.
 const SinkShape = struct {
     ctx: *anyopaque,
+    hashBlocks: *const fn (ctx: *anyopaque, ticket: u64) anyerror!void,
     appendBlocks: *const fn (ctx: *anyopaque, ticket: u64) anyerror!u64,
+    fillBlocks: *const fn (ctx: *anyopaque, ticket: u64) anyerror!void,
     journalRecord: *const fn (ctx: *anyopaque, ticket: u64) anyerror!u64,
     publish: *const fn (ctx: *anyopaque, ticket: u64) void,
     abort: *const fn (ctx: *anyopaque, ticket: u64) void,
 };
 
 fn sinkOf(v: *Vfs) SinkShape {
-    return .{ .ctx = v, .appendBlocks = Vfs.opAppendBlocks, .journalRecord = Vfs.opJournalRecord, .publish = Vfs.opPublish, .abort = Vfs.opAbort };
+    return .{ .ctx = v, .hashBlocks = Vfs.opHashBlocks, .appendBlocks = Vfs.opAppendBlocks, .fillBlocks = Vfs.opFillBlocks, .journalRecord = Vfs.opJournalRecord, .publish = Vfs.opPublish, .abort = Vfs.opAbort };
+}
+
+/// `hashBlocks` then `appendBlocks`, as the writer runs them.
+fn appendStep(sink: SinkShape, ticket: u64) !u64 {
+    try sink.hashBlocks(sink.ctx, ticket);
+    return sink.appendBlocks(sink.ctx, ticket);
 }
 
 /// A payload of one segment whose bytes the Vfs will own.
@@ -2765,7 +3021,8 @@ test "prefix_vfs: the writer's steps are separate and only the last shows the fi
     try testing.expectEqual(@as(u64, 5000), t.size);
     try testing.expect(v.stat("e1/a") == null);
     const phys = v.physicalBytes();
-    try testing.expectEqual(@as(u64, 5000), try sink.appendBlocks(sink.ctx, t.id));
+    try testing.expectEqual(@as(u64, 5000), try appendStep(sink, t.id));
+    try sink.fillBlocks(sink.ctx, t.id);
     try testing.expect(v.stat("e1/a") == null);
     try testing.expectEqual(@as(u64, 5000), v.physicalBytes() - phys);
     const journal = try sink.journalRecord(sink.ctx, t.id);
@@ -2778,7 +3035,8 @@ test "prefix_vfs: the writer's steps are separate and only the last shows the fi
 
     // The same bytes under another name append nothing.
     const t2 = try v.hold("e1/b", .create, try ownedOne(.kv, x));
-    try testing.expectEqual(@as(u64, 0), try sink.appendBlocks(sink.ctx, t2.id));
+    try testing.expectEqual(@as(u64, 0), try appendStep(sink, t2.id));
+    try sink.fillBlocks(sink.ctx, t2.id);
     _ = try sink.journalRecord(sink.ctx, t2.id);
     sink.publish(sink.ctx, t2.id);
     try testing.expectEqual(@as(u32, 1), v.stat("e1/b").?.nlink);
@@ -2799,11 +3057,11 @@ test "prefix_vfs: a ticket aborted at any step leaves no file, frees its payload
 
     const held = try v.hold("a", .create, try ownedOne(.kv, x));
     sink.abort(sink.ctx, held.id);
-    try testing.expectError(error.UnknownTicket, sink.appendBlocks(sink.ctx, held.id));
+    try testing.expectError(error.UnknownTicket, appendStep(sink, held.id));
     try testing.expectEqual(@as(u64, 0), v.deadBytes());
 
     const appended = try v.hold("a", .create, try ownedOne(.kv, x));
-    _ = try sink.appendBlocks(sink.ctx, appended.id);
+    _ = try appendStep(sink, appended.id);
     sink.abort(sink.ctx, appended.id);
     try testing.expect(v.stat("a") == null);
     try testing.expectEqual(@as(u64, 4000), v.deadBytes());
@@ -2812,7 +3070,8 @@ test "prefix_vfs: a ticket aborted at any step leaves no file, frees its payload
     const y = try blob(3000, 3);
     defer ta.free(y);
     const clash = try v.hold("live", .create, try ownedOne(.kv, y));
-    _ = try sink.appendBlocks(sink.ctx, clash.id);
+    _ = try appendStep(sink, clash.id);
+    try sink.fillBlocks(sink.ctx, clash.id);
     try testing.expectError(error.PathAlreadyExists, sink.journalRecord(sink.ctx, clash.id));
     try testing.expectEqual(@as(u64, 1000), v.stat("live").?.size);
     sink.abort(sink.ctx, clash.id);
@@ -2842,11 +3101,14 @@ test "prefix_vfs: a file held in parts lands as their bytes in order, journals o
     const phys = v.physicalBytes();
     try testing.expectEqual(@as(u64, 3000), try v.holdPart(t.id, try ownedOne(.kv, y)));
     // One part per call, in the order they were held.
-    try testing.expectEqual(@as(u64, 5000), try sink.appendBlocks(sink.ctx, t.id));
+    try testing.expectEqual(@as(u64, 5000), try appendStep(sink, t.id));
+    try sink.fillBlocks(sink.ctx, t.id);
     try testing.expectError(error.NotAppended, sink.journalRecord(sink.ctx, t.id));
     try testing.expectEqual(@as(u64, 700), try v.holdPart(t.id, try ownedOne(.kv, z)));
-    try testing.expectEqual(@as(u64, 3000), try sink.appendBlocks(sink.ctx, t.id));
-    try testing.expectEqual(@as(u64, 700), try sink.appendBlocks(sink.ctx, t.id));
+    try testing.expectEqual(@as(u64, 3000), try appendStep(sink, t.id));
+    try sink.fillBlocks(sink.ctx, t.id);
+    try testing.expectEqual(@as(u64, 700), try appendStep(sink, t.id));
+    try sink.fillBlocks(sink.ctx, t.id);
     try testing.expect(v.stat("a") == null);
     const journal = try sink.journalRecord(sink.ctx, t.id);
     sink.publish(sink.ctx, t.id);
@@ -2870,7 +3132,7 @@ test "prefix_vfs: a file held in parts lands as their bytes in order, journals o
     defer ta.free(c2);
     const cut = try v.hold("c", .replace, try ownedOne(.ssm, c1));
     _ = try v.holdPart(cut.id, try ownedOne(.ssm, c2));
-    _ = try sink.appendBlocks(sink.ctx, cut.id);
+    _ = try appendStep(sink, cut.id);
     sink.abort(sink.ctx, cut.id);
     try testing.expect(v.stat("c") == null);
     try testing.expectEqual(@as(u64, 4000), v.deadBytes());
@@ -2891,7 +3153,8 @@ test "prefix_vfs: a read-only open beside a writing one replays its namespace an
     _ = try v.create("e1/a", onePayload(.kv, x));
     // Blocks appended but not yet journaled: the tail a normal open trims.
     const t = try v.hold("e1/b", .create, try ownedOne(.kv, y));
-    _ = try sink.appendBlocks(sink.ctx, t.id);
+    _ = try appendStep(sink, t.id);
+    try sink.fillBlocks(sink.ctx, t.id);
     const before = try onDiskBytes(&env);
 
     const r = try openAt(&env, .{ .read_only = true });
@@ -2923,8 +3186,10 @@ test "prefix_vfs: tickets landed in order replay to the same namespace" {
         // Both are held and their blocks appended before either is journaled, as the writer's queue does.
         const t1 = try v.hold("f", .create, try ownedOne(.kv, a));
         const t2 = try v.hold("f", .replace, try ownedOne(.kv, b));
-        _ = try sink.appendBlocks(sink.ctx, t1.id);
-        _ = try sink.appendBlocks(sink.ctx, t2.id);
+        _ = try appendStep(sink, t1.id);
+        try sink.fillBlocks(sink.ctx, t1.id);
+        _ = try appendStep(sink, t2.id);
+        try sink.fillBlocks(sink.ctx, t2.id);
         for ([_]Ticket{ t1, t2 }) |t| {
             _ = try sink.journalRecord(sink.ctx, t.id);
             sink.publish(sink.ctx, t.id);

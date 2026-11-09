@@ -40,9 +40,13 @@ pub const MAX_LANDINGS: usize = 1024;
 /// the steps on its thread (or the caller's, `landNow`) and calls exactly one of `publish` and `abort`.
 pub const OpSink = struct {
     ctx: *anyopaque,
-    /// Hash the payload and append the blocks the index lacks to the active pack. Returns the pack bytes
-    /// appended. The blocks are unreferenced until `journalRecord`, so a stop here leaves no visible file.
+    /// Hash the next part of the payload; it holds no lock another thread's file operation waits on.
+    hashBlocks: *const fn (ctx: *anyopaque, ticket: u64) anyerror!void,
+    /// Place the hashed blocks the index lacks at the end of the active pack. Returns the pack bytes placed. The
+    /// blocks are unreferenced until `journalRecord`, so a stop here leaves no visible file.
     appendBlocks: *const fn (ctx: *anyopaque, ticket: u64) anyerror!u64,
+    /// Write the placed blocks; it holds no lock another thread's file operation waits on.
+    fillBlocks: *const fn (ctx: *anyopaque, ticket: u64) anyerror!void,
     /// Append the ticket's journal record. Returns the journal bytes appended.
     journalRecord: *const fn (ctx: *anyopaque, ticket: u64) anyerror!u64,
     /// Make the op visible to `stat`: the counterpart of a file's `rename`.
@@ -357,6 +361,13 @@ pub const Writer = struct {
         }
     }
 
+    /// Caller holds the mutex. Is the write in flight one for `path_prefix` (null = any)?
+    fn inflightUnder(self: *const Writer, path_prefix: ?[]const u8) bool {
+        const pre = path_prefix orelse return true;
+        const p = self.inflight_path orelse return true;
+        return std.mem.startsWith(u8, p, pre);
+    }
+
     /// Non-blocking twin of `drainPrefix`: is any blob for `path_prefix` still staged or in flight?
     pub fn pendingPrefix(self: *Writer, path_prefix: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
@@ -380,7 +391,8 @@ pub const Writer = struct {
     }
 
     /// Epoch fence: staged bytes for `path_prefix` (null = everything) are discarded rather than
-    /// written, and anything in flight is waited out, so the caller can remove the directory.
+    /// written, and a write in flight for it is waited out, so the caller can remove the directory. A write in
+    /// flight for another path is not waited for.
     pub fn fence(self: *Writer, path_prefix: ?[]const u8) void {
         self.mutex.lockUncancelable(self.io);
         if (path_prefix == null) self.epoch += 1;
@@ -404,7 +416,7 @@ pub const Writer = struct {
             self.files_dropped += 1;
         }
         self.done.broadcast(self.io);
-        while (self.running and self.inflight_bytes > 0) self.done.waitUncancelable(self.io, &self.mutex);
+        while (self.running and self.inflight_bytes > 0 and self.inflightUnder(path_prefix)) self.done.waitUncancelable(self.io, &self.mutex);
         self.mutex.unlock(self.io);
         if (cut) |c| unlinkTmp(c);
     }
@@ -558,10 +570,14 @@ pub const Writer = struct {
     /// namespace as the plain path's `tmp` does.
     fn landPaced(self: *Writer, op: QueuedOp, finish: bool) !u64 {
         const started = io_util.Stopwatch.init(self.io);
+        // Hashing and the pack write run outside `land_mutex`: a synchronous mutation of the inference thread waits
+        // only for the placing and the journal record.
+        try op.sink.hashBlocks(op.sink.ctx, op.ticket);
         self.land_mutex.lockUncancelable(self.io);
         const appended = op.sink.appendBlocks(op.sink.ctx, op.ticket);
         self.land_mutex.unlock(self.io);
         const pack = try appended;
+        try op.sink.fillBlocks(op.sink.ctx, op.ticket);
         self.padToFloor(started, op.logical_bytes);
         if (!finish) return pack;
         self.land_mutex.lockUncancelable(self.io);
@@ -690,7 +706,9 @@ fn finishSteps(sink: OpSink, ticket: u64) !u64 {
 
 /// All steps of a synchronous op.
 fn landSteps(sink: OpSink, ticket: u64) !u64 {
+    try sink.hashBlocks(sink.ctx, ticket);
     const pack = try sink.appendBlocks(sink.ctx, ticket);
+    try sink.fillBlocks(sink.ctx, ticket);
     return pack + try finishSteps(sink, ticket);
 }
 
@@ -1142,8 +1160,11 @@ const FakeSink = struct {
     }
 
     fn sink(self: *FakeSink) OpSink {
-        return .{ .ctx = self, .appendBlocks = appendBlocks, .journalRecord = journalRecord, .publish = publish, .abort = abort };
+        return .{ .ctx = self, .hashBlocks = hashBlocks, .appendBlocks = appendBlocks, .fillBlocks = fillBlocks, .journalRecord = journalRecord, .publish = publish, .abort = abort };
     }
+
+    fn hashBlocks(_: *anyopaque, _: u64) anyerror!void {}
+    fn fillBlocks(_: *anyopaque, _: u64) anyerror!void {}
 
     fn appendBlocks(ctx: *anyopaque, ticket: u64) anyerror!u64 {
         const self: *FakeSink = @ptrCast(@alignCast(ctx));
@@ -1457,6 +1478,25 @@ test "kv_disk_writer op: an op stays pending and unpublished for as long as the 
     w.drain();
     try testing.expect(fake.isVisible(1));
     try testing.expect(fake.published_ns.items[0] - t0 >= 250 * std.time.ns_per_ms);
+    try testing.expect(!w.isPending("v/e1/c000000"));
+}
+
+test "kv_disk_writer op: a fence waits out only the op in flight on its own path" {
+    var fake = FakeSink.init(testing.io);
+    defer fake.deinit();
+    var w = Writer.init(testing.allocator, testing.io);
+    // 8 MiB at 16 MiB/s: the op stays in flight for 500 ms.
+    w.pace_bytes_per_s = 16 << 20;
+    try w.start();
+    defer w.deinit();
+
+    w.submitOp(try opPath("c000000"), fake.sink(), .{ .ticket = 1, .host_bytes = 4096, .logical_bytes = 8 << 20 }, .kv);
+    std.Io.sleep(testing.io, .fromMilliseconds(60), .real) catch {};
+    w.fence("v/e2/");
+    try testing.expect(w.isPending("v/e1/c000000"));
+    try testing.expect(!fake.isVisible(1));
+    w.fence("v/e1/c000000");
+    try testing.expect(fake.isVisible(1));
     try testing.expect(!w.isPending("v/e1/c000000"));
 }
 

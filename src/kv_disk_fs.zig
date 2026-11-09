@@ -391,7 +391,7 @@ pub const Fs = struct {
     }
 
     fn sink(self: *const Fs) disk_writer.OpSink {
-        return .{ .ctx = self.vfs.?, .appendBlocks = Vfs.opAppendBlocks, .journalRecord = Vfs.opJournalRecord, .publish = Vfs.opPublish, .abort = Vfs.opAbort };
+        return .{ .ctx = self.vfs.?, .hashBlocks = Vfs.opHashBlocks, .appendBlocks = Vfs.opAppendBlocks, .fillBlocks = Vfs.opFillBlocks, .journalRecord = Vfs.opJournalRecord, .publish = Vfs.opPublish, .abort = Vfs.opAbort };
     }
 
     // ── accounting ──
@@ -611,4 +611,74 @@ test "kv_disk_fs: a file larger than half the writer's permit goes to the writer
     defer testing.allocator.free(image);
     const data: [*]const u8 = @ptrCast(mlx.mlx_array_data_float32(arr).?);
     try testing.expectEqualSlices(u8, data[0 .. 100_000 * 4], image[image.len - 100_000 * 4 ..]);
+}
+
+test "kv_disk_fs: while the writer hashes or writes a file's blocks, the inference thread reads and writes the layer without waiting" {
+    try landsBesideInference(.hash);
+    try landsBesideInference(.pack_write);
+}
+
+/// The writer held at step `at` of landing a staged file while another thread reads `tokens.bin` and appends to it
+/// synchronously, as the inference thread does in a persist.
+fn landsBesideInference(at: @FieldType(prefix_vfs.Gate, "at")) !void {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fs = try Fs.open(testing.allocator, io, root, .cas);
+    defer fs.close();
+    var w = disk_writer.Writer.init(testing.allocator, io);
+    try w.start();
+    defer w.deinit();
+    fs.land = &w.land_mutex;
+    var dir_buf: [600]u8 = undefined;
+    try fs.mkdirp(try std.fmt.bufPrint(&dir_buf, "{s}/e1", .{root}));
+    var tok_buf: [600]u8 = undefined;
+    const tokens = try std.fmt.bufPrint(&tok_buf, "{s}/e1/tokens.bin", .{root});
+    try fs.writeAt(tokens, true, 0, "abcd", 4);
+
+    var gate: prefix_vfs.Gate = .{ .at = at };
+    fs.vfs.?.gate = &gate;
+    const chunk = try std.fmt.allocPrint(testing.allocator, "{s}/e1/c000000.safetensors", .{root});
+    const bytes = try testing.allocator.alloc(u8, 1 << 20);
+    for (bytes, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 7);
+    var want: [1 << 10]u8 = undefined;
+    @memcpy(&want, bytes[0..want.len]);
+    try fs.stageBytes(&w, chunk, bytes, .kv);
+    var waited: usize = 0;
+    while (!gate.entered.load(.acquire) and waited < 5000) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(1), .real) catch {};
+    try testing.expect(gate.entered.load(.acquire));
+
+    // The inference thread's side: a read and a synchronous `tokens.bin` append while the writer is mid-append.
+    const Inference = struct {
+        read: std.atomic.Value(bool) = .init(false),
+        wrote: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This(), f: *const Fs, path: []const u8) void {
+            if (f.readAlloc(testing.allocator, path, 64)) |got| testing.allocator.free(got);
+            self.read.store(true, .release);
+            f.writeAt(path, false, 4, "efgh", 8) catch {};
+            self.wrote.store(true, .release);
+        }
+    };
+    var inf: Inference = .{};
+    const t = try std.Thread.spawn(.{}, Inference.run, .{ &inf, &fs, tokens });
+    waited = 0;
+    while (!inf.wrote.load(.acquire) and waited < 2000) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(1), .real) catch {};
+    const read_free = inf.read.load(.acquire);
+    const write_free = inf.wrote.load(.acquire);
+    gate.open.store(true, .release);
+    t.join();
+    w.drain();
+    try testing.expect(read_free);
+    try testing.expect(write_free);
+
+    const record = fs.readAlloc(testing.allocator, tokens, 64).?;
+    defer testing.allocator.free(record);
+    try testing.expectEqualStrings("abcdefgh", record);
+    var chunk_buf: [600]u8 = undefined;
+    const landed = fs.readAlloc(testing.allocator, try std.fmt.bufPrint(&chunk_buf, "{s}/e1/c000000.safetensors", .{root}), 2 << 20).?;
+    defer testing.allocator.free(landed);
+    try testing.expectEqual(@as(usize, 1 << 20), landed.len);
+    try testing.expectEqualSlices(u8, &want, landed[0..want.len]);
 }

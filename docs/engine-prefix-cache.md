@@ -546,6 +546,14 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   the plain file's parts do: parts of one ticket (`Vfs.holdPart`), each its own op that appends its blocks, the last
   journaling and publishing, so the inference thread only reads back and copies, as on plain files. A synchronous call (a delete, a link,
   `tokens.bin`, the synchronous save, a manifest without the writer) lands on the calling thread.
+- **The inference thread never waits behind a pack append.** The writer lands a part in steps: `hashBlocks` (no lock),
+  `appendBlocks` (places the new blocks at the pack end, under `land_mutex` and the Vfs lock), `fillBlocks` (writes
+  them, no lock; a block indexed meanwhile by another file is shared and the placed copy is dead bytes), then the journal
+  record and publish. A synchronous call waits only for a placing or a journal record. `Writer.fence(path)` waits for a
+  write in flight on `path` only, never another file's. Guards: `the inference thread reads and writes the layer
+  without waiting` (`kv_disk_fs.zig`, the writer held at each step), `a fence waits out only the op in flight on its own
+  path` (`kv_disk_writer.zig`). A paced cas op lasts as long as the plain write, so waiting for it in a persist cost
+  1.6.0 40-117 ms per fence and 75 ms per manifest ([qwen4-perf](qwen4-perf.md#cas-persist-stall)).
 - **The layer answers as the plain files do**: names, sizes, link counts, inode classes, mtime order, listings; a
   restore loads bitwise the same arrays (`prefix_vfs_tensors.loadTensors`; an unreadable file fails as
   `mlx_load_safetensors` does, `MlxError`). So every decision of the tier reads today's answers.

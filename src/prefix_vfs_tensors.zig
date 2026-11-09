@@ -354,7 +354,7 @@ fn freeConts(allocator: Allocator, conts: []mlx.mlx_array) void {
 }
 
 /// Reads `tensors` back from MLX on the caller's thread and holds the file's blocks in `vfs`. The VFS steps that follow
-/// (`appendBlocks`, `journalRecord`, `publishTicket`) never touch an array. `row_maps` is empty or parallel to `tensors`.
+/// (`appendBlocks`, `fillBlocks`, `journalRecord`, `publishTicket`) never touch an array. `row_maps` is empty or parallel to `tensors`.
 /// The ticket's `size` is the safetensors file's size. A refused input stages nothing.
 pub fn stageTensors(
     vfs: *Vfs,
