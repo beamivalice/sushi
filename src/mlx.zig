@@ -209,6 +209,21 @@ pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_m
 // IO
 pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
 pub extern "c" fn mlx_save_safetensors(file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) c_int;
+pub const mlx_io_reader = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_io_vtable = extern struct {
+    is_open: *const fn (?*anyopaque) callconv(.c) bool,
+    good: *const fn (?*anyopaque) callconv(.c) bool,
+    tell: *const fn (?*anyopaque) callconv(.c) usize,
+    seek: *const fn (?*anyopaque, i64, c_int) callconv(.c) void,
+    read: *const fn (?*anyopaque, [*]u8, usize) callconv(.c) void,
+    read_at_offset: *const fn (?*anyopaque, [*]u8, usize, usize) callconv(.c) void,
+    write: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+    label: *const fn (?*anyopaque) callconv(.c) [*:0]const u8,
+    free: *const fn (?*anyopaque) callconv(.c) void,
+};
+pub extern "c" fn mlx_io_reader_new(desc: ?*anyopaque, vtable: mlx_io_vtable) mlx_io_reader;
+pub extern "c" fn mlx_io_reader_free(io: mlx_io_reader) c_int;
+pub extern "c" fn mlx_load_safetensors_reader(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, in_stream: mlx_io_reader, s: mlx_stream) c_int;
 
 // ── Ops ──
 pub extern "c" fn mlx_add(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;

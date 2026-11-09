@@ -515,6 +515,23 @@ pub fn testMkdir(io: std.Io, path: []const u8) !void {
     try f.mkdirp(path);
 }
 
+/// Flips one byte inside the first tensor block of file `path` on the content-addressed layer: rot that only the
+/// block's hash can tell. The plain layer keeps no hash, so a test of it skips.
+pub fn testFlipTensorByte(fs: *const Fs, path: []const u8) !void {
+    const v = fs.vfs orelse return error.SkipZigTest;
+    const pf = try v.pinFile(fs.allocator, fs.rel(path) orelse return error.FileNotFound);
+    defer v.unpinFile(fs.allocator, pf, &.{});
+    for (pf.placed) |pl| {
+        if (pl.tensor == prefix_vfs.UNTAGGED) continue;
+        var one: [1]u8 = undefined;
+        const at = pl.off + pl.len / 2;
+        _ = try pl.file.readPositionalAll(fs.io, &one, at);
+        one[0] ^= 0x5a;
+        return pl.file.writePositionalAll(fs.io, &one, at);
+    }
+    return error.FileNotFound;
+}
+
 fn joined(buf: []u8, base: []const u8, sub: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ base, sub }) catch @panic("test path too long");
 }

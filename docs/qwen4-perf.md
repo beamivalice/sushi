@@ -619,6 +619,33 @@ save ~0.4 s of ~18.8 s (~2%), below the spread of the two-sample 32k run (one ar
   nothing that waits (0 ms both arms; `prefill held` 16-20 ms both): windows 1,550 / 1,575 / 1,532 / 1,504 against
   1.6.0's 1,540 / 1,552 / 1,524 / 1,479 tok/s, so its release-bench gap is not this one.
 
+<a id="cas-restore-read"></a>
+## The SSD tier's restore on the content-addressed layer
+
+- On the cas layer a restore cost about twice 1.5.1's on plain files. A timer build (same binary, `SUSHI_PREFIX_FS`
+  cas against real, 32,737 tokens) put the whole gap in the load: cas 155 ms = ssm file 21 + QSA overlay 15 + KV 120
+  (load 68, eval 41), real 65 ms = 9 + 8 + 48 (load 4, eval 43). The cas load read every block eagerly, serially,
+  on the inference thread, into fresh pages; MLX's lazy load of a plain file reads on its IO threads into buffers
+  from its own cache. A C probe on this box (768 MiB from the page cache in 24 MiB reads): fresh pages 50 ms serial,
+  27 ms on 4 threads; reused pages 22 ms serial, 10 ms on 4 threads. Reading into zero-copy arrays (no lock, no copy)
+  left the restore where it was. Fix and rule: [engine-prefix-cache](engine-prefix-cache.md#file-layer).
+- In-process `sushi bench --rungs 8k,48k --tokens 512 --code-only`, GPU lock per arm, `taskpolicy -a`, fans max, die
+  under 50 C per load, AC, 2026-11-10. Binaries: fix 304a6cbc (before its squash), 063d11e8, 1.5.1 9f8801bd. Disk
+  restore ms, two runs per arm:
+
+  | restored tokens | 4,065 | 8,161 | 8,161 | 8,161 | 16,353 | 24,545 | 32,737 | 40,929 | 49,121 | 49,121 | sum |
+  |---|---|---|---|---|---|---|---|---|---|---|---|
+  | fix | 11 / 11 | 31 / 22 | 31 / 25 | 32 / 31 | 28 / 27 | 39 / 38 | 129 / 143 | 81 / 69 | 71 / 70 | 78 / 71 | 381 / 380 |
+  | 063d11e8 | 28 / 29 | 66 / 58 | 64 / 68 | 63 / 66 | 55 / 49 | 80 / 82 | 154 / 109 | 119 / 168 | 121 / 137 | 131 / 125 | 575 / 581 |
+  | 1.5.1 | 15 / 14 | 32 / 26 | 31 / 30 | 24 / 30 | 49 / 33 | 42 / 47 | 50 / 54 | 73 / 75 | 89 / 85 | 88 / 87 | 272 / 272 |
+
+  Prefill is level (2,157 / 2,152 tok/s against 2,152 / 2,159 and 2,139 / 2,145). The 32,737 column is a wait, not a
+  read: in a timer build it is 26 ms in `drainEntry`, behind the writer landing the previous request's 168 MB end
+  persist, then 49 ms of reads.
+- Output: `sushi serve`, one 19,480-token prompt twice (cold, then restored from the SSD tier), greedy, 256 tokens,
+  one lock per binary: all six answers have the same md5 on fix, 063d11e8 and 1.5.1; that restore took 36, 64 and
+  35 ms.
+
 <a id="stq-prefill-profile"></a>
 ## Flash-Next STQ prefill: where a chunk's time goes, K6 trunk against affine 8
 

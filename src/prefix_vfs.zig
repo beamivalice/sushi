@@ -62,7 +62,7 @@ pub const DirEntry = struct { name: []u8, is_dir: bool };
 /// A test's hold on the next step `at` of a part's landing: `entered` once one reaches it, which then waits for
 /// `open`.
 pub const Gate = struct {
-    at: enum { hash, pack_write },
+    at: enum { hash, pack_write, read },
     entered: std.atomic.Value(bool) = .init(false),
     open: std.atomic.Value(bool) = .init(false),
 };
@@ -926,6 +926,58 @@ pub const Vfs = struct {
             made += 1;
         }
         return .{ .kind = vn.kind, .segments = segs };
+    }
+
+    // ------------------------------------------------------------ public: lock-free reads
+
+    /// One extent of a file where a reader finds it: its pack file and offset, its tags, its hash, and whether this
+    /// process has checked its bytes against the hash.
+    pub const Placed = struct { file: File, off: u64, len: u32, tensor: u32, group: u32, xxh: u64, verified: bool };
+
+    /// A file's extents in order, pinned: no pack under them goes until `unpinFile`, so a reader reads them
+    /// (`readPlaced`) with no lock held.
+    pub const PinnedFile = struct { exts: []Ext, placed: []Placed };
+
+    pub fn pinFile(self: *Vfs, allocator: Allocator, path: []const u8) !PinnedFile {
+        self.lock();
+        defer self.unlock();
+        const vn = try self.fileAt(path);
+        const exts = try allocator.dupe(Ext, vn.exts.items);
+        errdefer allocator.free(exts);
+        const placed = try allocator.alloc(Placed, exts.len);
+        errdefer allocator.free(placed);
+        for (exts, placed) |e, *pl| {
+            const b = self.blocks.get(e.key()) orelse return error.VfsCorrupt;
+            const p = self.packs.get(b.pack) orelse return error.VfsCorrupt;
+            pl.* = .{ .file = p.file orelse return error.VfsCorrupt, .off = b.off, .len = e.len, .tensor = e.tensor, .group = e.group, .xxh = e.addr.xxh, .verified = b.verified };
+        }
+        self.acquireAll(exts);
+        return .{ .exts = exts, .placed = placed };
+    }
+
+    /// Bytes `[from, from + dst.len)` of a pinned extent, read with no lock held.
+    pub fn readPlaced(self: *Vfs, pl: Placed, from: u64, dst: []u8) !void {
+        if (from + dst.len > pl.len) return error.VfsCorrupt;
+        self.passGate(.read);
+        const got = try pl.file.readPositionalAll(self.io, dst, pl.off + from);
+        if (got != dst.len) return error.VfsCorrupt;
+    }
+
+    /// Releases `pinFile`'s pins. `checked[i]` says the reader matched extent i's bytes to its hash, so later reads
+    /// skip the check, as `readBlock` does.
+    pub fn unpinFile(self: *Vfs, allocator: Allocator, pf: PinnedFile, checked: []const bool) void {
+        self.lock();
+        defer self.unlock();
+        for (pf.exts, 0..) |e, i| {
+            if (i >= checked.len or !checked[i]) continue;
+            const b = self.blocks.getPtr(e.key()) orelse continue;
+            if (b.verified) continue;
+            b.verified = true;
+            self.verify_count += 1;
+        }
+        self.releaseAll(pf.exts);
+        allocator.free(pf.exts);
+        allocator.free(pf.placed);
     }
 
     // ------------------------------------------------------------ public: namespace

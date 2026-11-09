@@ -816,3 +816,120 @@ test "tensor files on the vfs: a file with no row maps is a whole-file write, no
     defer parts.deinit();
     try testing.expect(parts.size > 0);
 }
+
+test "tensor files on the vfs: a load reads its blocks with no layer lock held" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const vroot = try env.path("vfs", .{});
+    defer ta.free(vroot);
+    var vfs = try Vfs.open(ta, tio, vroot, .{});
+    defer vfs.close();
+    const a = makeArray(&.{ 1, 2, 600, 16 }, .bfloat16, 1);
+    defer _ = mlx.mlx_array_free(a);
+    const maps = [_]?RowMap{.{ .axis = 2 }};
+    _ = try vt.saveTensors(vfs, "a", &.{.{ .key = "k", .arr = a }}, &.{}, &maps, .kv, s);
+    const want = try vt.regenerate(vfs, ta, "a");
+    defer ta.free(want);
+
+    var gate: prefix_vfs.Gate = .{ .at = .read };
+    vfs.gate = &gate;
+    // The writer's side: a layer mutation while the load is held mid-read. The watcher opens the gate either way.
+    const Writer = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        free: bool = false,
+        fn mutate(self: *@This(), v: *Vfs) void {
+            v.writeBytes("other", .meta, "xyz") catch {};
+            self.done.store(true, .release);
+        }
+        fn watch(self: *@This(), v: *Vfs, g: *prefix_vfs.Gate) void {
+            defer g.open.store(true, .release);
+            var waited: usize = 0;
+            while (!g.entered.load(.acquire) and waited < 5000) : (waited += 1) std.Io.sleep(tio, .fromMilliseconds(1), .real) catch {};
+            if (!g.entered.load(.acquire)) return;
+            const t = std.Thread.spawn(.{}, mutate, .{ self, v }) catch return;
+            waited = 0;
+            while (!self.done.load(.acquire) and waited < 2000) : (waited += 1) std.Io.sleep(tio, .fromMilliseconds(1), .real) catch {};
+            self.free = self.done.load(.acquire);
+            g.open.store(true, .release);
+            t.join();
+        }
+    };
+    var writer: Writer = .{};
+    const w = try std.Thread.spawn(.{}, Writer.watch, .{ &writer, vfs, &gate });
+    const loaded = vt.loadTensors(vfs, "a");
+    w.join();
+    const got = try loaded;
+    defer got.deinit();
+    try testing.expect(gate.entered.load(.acquire));
+    try testing.expect(writer.free);
+    try testing.expectEqual(@as(u64, 3), vfs.stat("other").?.size);
+    const again = try vt.regenerate(vfs, ta, "a");
+    defer ta.free(again);
+    try testing.expectEqualSlices(u8, want, again);
+}
+
+test "tensor files on the vfs: a flipped byte in any block of a file, header, fixed or row tensor, refuses its load" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const vroot = try env.path("vfs", .{});
+    defer ta.free(vroot);
+    const f = makeArray(&.{ 3, 4000 }, .float32, 5);
+    defer _ = mlx.mlx_array_free(f);
+    const k = makeArray(&.{ 1, 2, 600, 16 }, .bfloat16, 6);
+    defer _ = mlx.mlx_array_free(k);
+    const maps = [_]?RowMap{ null, .{ .axis = 2 } };
+    var n_blocks: usize = 0;
+    {
+        var vfs = try Vfs.open(ta, tio, vroot, .{});
+        defer vfs.close();
+        _ = try vt.saveTensors(vfs, "a", &.{ .{ .key = "f", .arr = f }, .{ .key = "k", .arr = k } }, &.{}, &maps, .kv, s);
+        const pf = try vfs.pinFile(ta, "a");
+        defer vfs.unpinFile(ta, pf, &.{});
+        n_blocks = pf.placed.len;
+        var fixed: usize = 0;
+        var rows: usize = 0;
+        for (pf.placed) |pl| {
+            if (pl.tensor == prefix_vfs.UNTAGGED) continue;
+            if (pl.tensor >> 24 == 0) fixed += 1 else rows += 1;
+        }
+        try testing.expect(fixed >= 1 and rows >= 2);
+    }
+
+    // A fresh open per block: a block this process wrote or already read whole is trusted.
+    for (0..n_blocks) |i| {
+        var vfs = try Vfs.open(ta, tio, vroot, .{});
+        defer vfs.close();
+        const pf = try vfs.pinFile(ta, "a");
+        const pl = pf.placed[i];
+        vfs.unpinFile(ta, pf, &.{});
+        var one: [1]u8 = undefined;
+        const at = pl.off + pl.len / 2;
+        _ = try pl.file.readPositionalAll(tio, &one, at);
+        one[0] ^= 0x5a;
+        try pl.file.writePositionalAll(tio, &one, at);
+        try testing.expectError(error.MlxError, vt.loadTensors(vfs, "a"));
+        one[0] ^= 0x5a;
+        try pl.file.writePositionalAll(tio, &one, at);
+    }
+
+    var vfs = try Vfs.open(ta, tio, vroot, .{});
+    defer vfs.close();
+    const got = try vt.loadTensors(vfs, "a");
+    defer got.deinit();
+    for ([_]struct { []const u8, mlx.mlx_array }{ .{ "f", f }, .{ "k", k } }) |want| {
+        const key_z = try cstr(want[0]);
+        defer ta.free(key_z);
+        var arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(arr);
+        try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_array_get(&arr, got.tensors, key_z.ptr));
+        try mlx.check(mlx.mlx_array_eval(arr));
+        try mlx.check(mlx.mlx_array_eval(want[1]));
+        try testing.expectEqualSlices(u8, vt.bytesOf(want[1]) orelse return error.NoBytes, vt.bytesOf(arr) orelse return error.NoBytes);
+    }
+}

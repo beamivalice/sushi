@@ -5808,6 +5808,47 @@ test "HotPrefixCache: an SSD entry that fails to restore is poisoned, not retrie
     mlx.dropLatchedErrorUnless(false);
 }
 
+test "HotPrefixCache: a rotted tensor block of an SSD chunk refuses the restore, poisons the entry and the request prefills" {
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-rot", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        _ = try hc.commit(&cache, &tokens, false);
+        hc.flushPendingDisk(s);
+    }
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-rot", 0, 128);
+    defer hc2.deinit();
+    const d = &hc2.disk.?;
+    const id = d.entries.items[0].id;
+    const chunk = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/c000000.safetensors", .{ d.root, id });
+    defer testing.allocator.free(chunk);
+    try kv_disk_fs.testFlipTensorByte(&d.fs, chunk);
+
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), res.matched);
+    try testing.expect(d.entryPoisoned(id));
+    mlx.dropLatchedErrorUnless(false);
+}
+
 test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {
     const io = std.testing.io;
     const s = mlx.gpuStream();

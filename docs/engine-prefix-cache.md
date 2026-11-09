@@ -554,6 +554,18 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   without waiting` (`kv_disk_fs.zig`, the writer held at each step), `a fence waits out only the op in flight on its own
   path` (`kv_disk_writer.zig`). A paced cas op lasts as long as the plain write, so waiting for it in a persist cost
   1.6.0 40-117 ms per fence and 75 ms per manifest ([qwen4-perf](qwen4-perf.md#cas-persist-stall)).
+- **A load reads as MLX reads a plain file.** `loadTensors` pins the file's extents (`Vfs.pinFile`) and hands
+  `mlx_load_safetensors_reader` a reader over them: MLX reads each tensor lazily on its IO threads into its own
+  buffers, the reader gathers the tensor's blocks with no layer lock held and checks each against its hash, and the
+  load evaluates every tensor before it returns, so a bad block fails that load with `MlxError` as a corrupt plain
+  file does. No restored array is an imported (no-copy) buffer, so the live state and its bill are those of the
+  plain path. An eager read on the inference thread into fresh pages cost twice 1.5.1's restore
+  ([qwen4-perf](qwen4-perf.md#cas-restore-read)). Guards: `a flipped byte in any block of a file ... refuses its load`,
+  `a load reads its blocks with no layer lock held` (`prefix_vfs_tensors_test.zig`), `a rotted tensor block of an SSD
+  chunk refuses the restore` (`prefix_cache.zig`).
+- **Open: a restore right after a large end persist waits for the writer.** `drainEntry` waits until the entry's
+  queued ops land, and a cas op lands later than the plain write: 26 ms of a 75 ms restore at 32,737 tokens, behind
+  a 168 MB persist ([qwen4-perf](qwen4-perf.md#cas-restore-read)).
 - **The layer answers as the plain files do**: names, sizes, link counts, inode classes, mtime order, listings; a
   restore loads bitwise the same arrays (`prefix_vfs_tensors.loadTensors`; an unreadable file fails as
   `mlx_load_safetensors` does, `MlxError`). So every decision of the tier reads today's answers.

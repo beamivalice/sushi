@@ -473,15 +473,29 @@ fn decode(vfs: *Vfs, allocator: Allocator, path: []const u8) !Decoded {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const aa = arena.allocator();
+    const tags = try aa.alloc(u32, payload.segments.len);
+    for (payload.segments, tags) |sg, *t| t.* = sg.tensor;
+    const hi = try headIndex(tags);
+    const lay = try parseLayout(aa, payload.segments[hi].bytes, tags, hi);
+    return .{ .arena = arena, .allocator = allocator, .payload = payload, .head_idx = hi, .entries = lay.entries, .meta = lay.meta };
+}
 
+/// The one block a file's header is: the only untagged one.
+fn headIndex(tags: []const u32) !usize {
     var head_idx: ?usize = null;
-    for (payload.segments, 0..) |sg, i| {
-        if (sg.tensor != prefix_vfs.UNTAGGED) continue;
+    for (tags, 0..) |t, i| {
+        if (t != prefix_vfs.UNTAGGED) continue;
         if (head_idx != null) return error.VfsCorrupt;
         head_idx = i;
     }
-    const hi = head_idx orelse return error.VfsCorrupt;
-    const head = payload.segments[hi].bytes;
+    return head_idx orelse error.VfsCorrupt;
+}
+
+const Layout = struct { entries: []Entry, meta: []MetaPair };
+
+/// The header `head` (block `hi` of a file whose blocks carry `tags`) parsed: its tensors, each with the blocks that
+/// hold it, and its metadata. Allocated in `aa`.
+fn parseLayout(aa: Allocator, head: []const u8, tags: []const u32, hi: usize) !Layout {
     if (head.len < 8 or std.mem.readInt(u64, head[0..8], .little) != head.len - 8) return error.VfsCorrupt;
     const root = std.json.parseFromSliceLeaky(std.json.Value, aa, head[8..], .{ .allocate = .alloc_always }) catch return error.VfsCorrupt;
     if (root != .object) return error.VfsCorrupt;
@@ -516,48 +530,237 @@ fn decode(vfs: *Vfs, allocator: Allocator, path: []const u8) !Decoded {
         try entries.append(aa, .{ .key = kv.key_ptr.*, .dtype = dtype, .shape = shape, .nbytes = nbytes });
     }
 
-    for (payload.segments, 0..) |sg, i| {
+    for (tags, 0..) |tag, i| {
         if (i == hi) continue;
-        const ti = sg.tensor & (MAX_TENSORS - 1);
-        const code = sg.tensor >> AXIS_SHIFT;
+        const ti = tag & (MAX_TENSORS - 1);
+        const code = tag >> AXIS_SHIFT;
         if (ti >= entries.items.len) return error.VfsCorrupt;
         const e = &entries.items[ti];
         if (e.blocks.items.len != 0 and e.code != code) return error.VfsCorrupt;
         e.code = code;
         try e.blocks.append(aa, @intCast(i));
     }
-    return .{ .arena = arena, .allocator = allocator, .payload = payload, .head_idx = hi, .entries = entries.items, .meta = meta.items };
+    return .{ .entries = entries.items, .meta = meta.items };
 }
 
 /// The file as `mlx_load_safetensors` would give it: same names, dtypes, shapes, bytes and metadata. A block whose
-/// checksum fails, or a file that does not parse, raises `error.MlxError`, the error a corrupt file raises today.
+/// checksum fails, or a file that does not parse, raises `error.MlxError`, the error a corrupt file raises today. The
+/// file's blocks are pinned and MLX reads them as it reads a plain file: lazily, on its IO threads, into its own
+/// buffers, with no layer lock held. Every tensor is evaluated before the load returns, so a bad block fails here.
 pub fn loadTensors(vfs: *Vfs, path: []const u8) !Loaded {
-    var dec = decode(vfs, vfs.allocator, path) catch |e| return loadError(path, e);
-    defer dec.deinit();
-    const tensors = mlx.mlx_map_string_to_array_new();
-    const meta = mlx.mlx_map_string_to_string_new();
-    const loaded: Loaded = .{ .tensors = tensors, .meta = meta };
-    errdefer loaded.deinit();
-    const a = vfs.allocator;
+    const src = Source.open(vfs, path) catch |e| return loadError(path, e);
+    const reader = mlx.mlx_io_reader_new(src, Source.vtable);
+    if (reader.ctx == null) {
+        src.close();
+        return error.MlxError;
+    }
+    // From here MLX owns `src`: it goes with the reader and the last tensor read from it.
+    defer _ = mlx.mlx_io_reader_free(reader);
+    return loadFrom(src, reader) catch |e| loadError(path, e);
+}
 
-    for (dec.meta) |m| {
-        const kz = try std.fmt.allocPrint(a, "{s}\x00", .{m.key});
-        defer a.free(kz);
-        const vz = try std.fmt.allocPrint(a, "{s}\x00", .{m.value});
-        defer a.free(vz);
-        try mlx.check(mlx.mlx_map_string_to_string_insert(meta, @ptrCast(kz.ptr), @ptrCast(vz.ptr)));
-    }
-    for (dec.entries) |*e| {
-        const bytes = dec.tensorBytes(e) catch |err| return loadError(path, err);
-        defer a.free(bytes);
-        const kz = try std.fmt.allocPrint(a, "{s}\x00", .{e.key});
-        defer a.free(kz);
-        var dummy: u8 = 0;
-        const arr = mlx.mlx_array_new_data(if (bytes.len == 0) &dummy else bytes.ptr, e.shape.ptr, @intCast(e.shape.len), e.dtype);
+fn loadFrom(src: *Source, reader: mlx.mlx_io_reader) !Loaded {
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var loaded: Loaded = .{ .tensors = mlx.mlx_map_string_to_array_new(), .meta = mlx.mlx_map_string_to_string_new() };
+    errdefer loaded.deinit();
+    try mlx.check(mlx.mlx_load_safetensors_reader(&loaded.tensors, &loaded.meta, reader, cpu));
+    const all = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(all);
+    const it = mlx.mlx_map_string_to_array_iterator_new(loaded.tensors);
+    defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
+    while (true) {
+        var key: ?[*:0]const u8 = null;
+        var arr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(arr);
-        try mlx.check(mlx.mlx_map_string_to_array_insert(tensors, @ptrCast(kz.ptr), arr));
+        if (mlx.mlx_map_string_to_array_iterator_next(&key, &arr, it) != 0 or key == null) break;
+        try mlx.check(mlx.mlx_vector_array_append_value(all, arr));
     }
+    try mlx.check(mlx.mlx_eval(all));
+    if (src.bad.load(.acquire)) return error.VfsCorrupt;
     return loaded;
+}
+
+/// A pinned file served to MLX as its safetensors bytes: the header from memory, each tensor gathered from its blocks
+/// when MLX reads it, each block checked against its hash unless this process already has. A read that fails, or that
+/// is not one whole tensor, sets `bad` and leaves its bytes unwritten.
+const Source = struct {
+    vfs: *Vfs,
+    arena: std.heap.ArenaAllocator,
+    pf: Vfs.PinnedFile,
+    checked: []bool,
+    head: []u8,
+    entries: []Entry,
+    starts: []u64,
+    size: u64,
+    pos: u64 = 0,
+    bad: std.atomic.Value(bool) = .init(false),
+
+    const vtable: mlx.mlx_io_vtable = .{
+        .is_open = isOpen,
+        .good = good,
+        .tell = tell,
+        .seek = seek,
+        .read = read,
+        .read_at_offset = readAtOffset,
+        .write = write,
+        .label = label,
+        .free = free,
+    };
+
+    fn open(vfs: *Vfs, path: []const u8) !*Source {
+        const a = vfs.allocator;
+        const pf = try vfs.pinFile(a, path);
+        var pinned = true;
+        errdefer if (pinned) vfs.unpinFile(a, pf, &.{});
+        const self = try a.create(Source);
+        errdefer a.destroy(self);
+        self.* = .{ .vfs = vfs, .arena = .init(a), .pf = pf, .checked = &.{}, .head = &.{}, .entries = &.{}, .starts = &.{}, .size = 0 };
+        errdefer self.arena.deinit();
+        const aa = self.arena.allocator();
+        self.checked = try aa.alloc(bool, pf.placed.len);
+        @memset(self.checked, false);
+        const tags = try aa.alloc(u32, pf.placed.len);
+        for (pf.placed, tags) |pl, *t| t.* = pl.tensor;
+        const hi = try headIndex(tags);
+        self.head = try aa.alloc(u8, pf.placed[hi].len);
+        try readChecked(vfs, pf.placed[hi], self.head, &self.checked[hi]);
+        const lay = try parseLayout(aa, self.head, tags, hi);
+        self.entries = lay.entries;
+        self.starts = try aa.alloc(u64, lay.entries.len);
+        var at: u64 = self.head.len;
+        for (lay.entries, self.starts) |e, *st| {
+            st.* = at;
+            at += e.nbytes;
+        }
+        self.size = at;
+        pinned = false;
+        return self;
+    }
+
+    fn close(self: *Source) void {
+        const a = self.vfs.allocator;
+        self.vfs.unpinFile(a, self.pf, self.checked);
+        self.arena.deinit();
+        a.destroy(self);
+    }
+
+    fn of(desc: ?*anyopaque) *Source {
+        return @ptrCast(@alignCast(desc.?));
+    }
+
+    fn readAt(self: *Source, dst: []u8, off: u64) void {
+        if (dst.len == 0) return;
+        if (off + dst.len <= self.head.len) {
+            @memcpy(dst, self.head[@intCast(off)..][0..dst.len]);
+            return;
+        }
+        for (self.entries, self.starts) |*e, st| {
+            if (st != off or e.nbytes != dst.len) continue;
+            fillEntry(self.vfs, self.pf, self.checked, e, dst) catch break;
+            return;
+        }
+        self.bad.store(true, .release);
+    }
+
+    fn isOpen(_: ?*anyopaque) callconv(.c) bool {
+        return true;
+    }
+    fn good(desc: ?*anyopaque) callconv(.c) bool {
+        return !of(desc).bad.load(.acquire);
+    }
+    fn tell(desc: ?*anyopaque) callconv(.c) usize {
+        return @intCast(of(desc).pos);
+    }
+    fn seek(desc: ?*anyopaque, off: i64, whence: c_int) callconv(.c) void {
+        const self = of(desc);
+        const base: i64 = switch (whence) {
+            std.c.SEEK.SET => 0,
+            std.c.SEEK.CUR => @intCast(self.pos),
+            std.c.SEEK.END => @intCast(self.size),
+            else => return self.bad.store(true, .release),
+        };
+        const to = base + off;
+        if (to < 0) return self.bad.store(true, .release);
+        self.pos = @intCast(to);
+    }
+    fn read(desc: ?*anyopaque, data: [*]u8, n: usize) callconv(.c) void {
+        const self = of(desc);
+        self.readAt(data[0..n], self.pos);
+        self.pos += n;
+    }
+    fn readAtOffset(desc: ?*anyopaque, data: [*]u8, n: usize, off: usize) callconv(.c) void {
+        of(desc).readAt(data[0..n], off);
+    }
+    fn write(desc: ?*anyopaque, _: [*]const u8, _: usize) callconv(.c) void {
+        of(desc).bad.store(true, .release);
+    }
+    fn label(_: ?*anyopaque) callconv(.c) [*:0]const u8 {
+        return "prefix-vfs";
+    }
+    fn free(desc: ?*anyopaque) callconv(.c) void {
+        of(desc).close();
+    }
+};
+
+/// Extent `pl` read whole into `dst`, checked against its hash unless this process already has.
+fn readChecked(vfs: *Vfs, pl: Vfs.Placed, dst: []u8, checked: *bool) !void {
+    if (dst.len != pl.len) return error.VfsCorrupt;
+    try vfs.readPlaced(pl, 0, dst);
+    if (pl.verified) return;
+    if (std.hash.XxHash3.hash(0, dst) != pl.xxh) return error.VfsCorrupt;
+    checked.* = true;
+}
+
+/// Entry `e`'s bytes gathered from its blocks into `out` in file order (a row tensor's runs scattered back per outer
+/// index, as `tensorBytes` does).
+fn fillEntry(vfs: *Vfs, pf: Vfs.PinnedFile, checked: []bool, e: *const Entry, out: []u8) !void {
+    if (out.len != e.nbytes) return error.VfsCorrupt;
+    if (e.code == 0) {
+        var off: usize = 0;
+        var prev: ?u32 = null;
+        for (e.blocks.items) |bi| {
+            const pl = pf.placed[bi];
+            if (prev != null and pl.group <= prev.?) return error.VfsCorrupt;
+            prev = pl.group;
+            if (pl.len > e.nbytes - off) return error.VfsCorrupt;
+            try readChecked(vfs, pl, out[off..][0..pl.len], &checked[bi]);
+            off += pl.len;
+        }
+        if (off != e.nbytes) return error.VfsCorrupt;
+        return;
+    }
+    const axis = e.code - 1;
+    if (axis >= e.shape.len) return error.VfsCorrupt;
+    const rows: usize = @intCast(e.shape[axis]);
+    var outer: usize = 1;
+    for (e.shape[0..axis]) |d| outer *= @intCast(d);
+    if (outer * rows == 0) return error.VfsCorrupt;
+    const inner_bytes = e.nbytes / (outer * rows);
+    const run_unit = outer * inner_bytes;
+    var at: usize = 0;
+    var prev: ?u32 = null;
+    for (e.blocks.items) |bi| {
+        const pl = pf.placed[bi];
+        if (prev != null and pl.group <= prev.?) return error.VfsCorrupt;
+        prev = pl.group;
+        if (pl.len == 0 or pl.len % run_unit != 0) return error.VfsCorrupt;
+        const n = pl.len / run_unit;
+        if (n > rows - at) return error.VfsCorrupt;
+        const run = n * inner_bytes;
+        var h = std.hash.XxHash3.init(0);
+        for (0..outer) |o| {
+            const d = out[(o * rows + at) * inner_bytes ..][0..run];
+            try vfs.readPlaced(pl, o * run, d);
+            if (!pl.verified) h.update(d);
+        }
+        if (!pl.verified) {
+            if (h.final() != pl.xxh) return error.VfsCorrupt;
+            checked[bi] = true;
+        }
+        at += n;
+    }
+    if (at != rows) return error.VfsCorrupt;
 }
 
 fn loadError(path: []const u8, err: anyerror) anyerror {
