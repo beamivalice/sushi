@@ -235,7 +235,14 @@ require_selection() {
     for pass in $PASSES; do
         [ -z "$(entries_of "$pass")" ] || return 0
     done
-    echo "run.sh: nothing selected (--tier $TIERS --model $MODELS${ONLY:+ --only $ONLY})" >&2
+    local hint= rel
+    if [ -n "$ONLY" ]; then
+        for pass in qwen4 mimo2 glm5 dsv41 shared; do
+            case " $PASSES " in *" $pass "*) continue ;; esac
+            for rel in $(entries_of "$pass" | cut -f2); do hint="$hint; $rel runs in the $pass pass: pass --model $pass"; done
+        done
+    fi
+    echo "run.sh: nothing selected (--tier $TIERS --model $MODELS${ONLY:+ --only $ONLY})$hint" >&2
     exit 2
 }
 

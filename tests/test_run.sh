@@ -201,6 +201,8 @@ refuses_sel "--only naming a bench script" "bench_x.sh is tier=bench, which run.
 refuses_sel "a glob reaching a tier the run did not select" "test_api_a.sh is tier=live" --list --only 'test_a*'
 refuses_sel "a selected tier with no script for the --model" "nothing selected (--tier hermetic --model qwen4)" --list --tier hermetic --model qwen4
 refuses_sel "--only outside the --model pass" "nothing selected (--tier host --model glm5 --only qwen4/test_q_host.sh)" --list --tier host --model glm5 --only qwen4/test_q_host.sh
+refuses_sel "  and names the pass that runs it" "qwen4/test_q_host.sh runs in the qwen4 pass: pass --model qwen4" --list --tier host --model glm5 --only qwen4/test_q_host.sh
+refuses_sel "a boot=own default-pack script under a model pass names the shared pass" "test_own_def.sh runs in the shared pass: pass --model shared" --list --tier live --model qwen4 --only test_own_def.sh
 got=$(SUSHI_TESTS_DIR="$FX" "$RUN" --list --only test_hermetic.sh)
 eq "--only naming a selected-tier script lists it" "$got" "pass shared
   hermetic test_hermetic.sh
