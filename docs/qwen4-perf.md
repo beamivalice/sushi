@@ -432,12 +432,55 @@ per arm, NOT a quiet box (no §4b fan protocol available). `SUSHI_FORCE_GPU_FAMI
   `WARM=0` skips the pread, it does not evict. A genuinely cold 3bpw end-to-end cell is still unmeasured, and this box
   cannot produce one (49 GB of weights + 30 GB of table fits inside 128 GB, so nothing is evicted) — a 64 GB box
   would.
-- **A pool chosen on a cold table yields to the serial walk once the warm has read the whole table** (`poolPreferred`).
-  The calibration runs before the warm, so a boot whose table was out of page cache used to keep the pool for the
-  server's life. Here that cost 277 ms of PLE per 4096-row chunk against 47 ms serial, about 12% of the chunk.
+- **A pool chosen on a cold table yields to the serial walk once the warm has read the whole table AND the table is still
+  resident** (`poolPreferred`, [issue 93 below](#ple-resident)). The calibration runs before the warm, so a boot whose
+  table was out of page cache used to keep the pool for the server's life. Here that cost 277 ms of PLE per 4096-row
+  chunk against 47 ms serial, about 12% of the chunk.
   Measured with `QWEN4_PROFILE_FWD=all` on 3eff69ed, `sushi bench --code-only --rungs 131072`, `taskpolicy -a`, GPU
   lock, fans max. The STQ 2.75bpw (affine-8 trunk) boot read the table cold (serial 36.3 ms, pool 2.0 ms, POOLED). The
   v2.0 boot read it warm (SERIAL). A table past the residency cap is never warmed and keeps the measured arm.
+
+<a id="ple-resident"></a>
+### A warmed table the OS evicted again keeps the pool (issue 93)
+
+- The report: on 64 GB Macs prefill halved from 1.5.0 to 1.5.1 (STQ 2.75bpw pp1156 220 -> 102 tok/s, pp15.7k 261 -> 171;
+  `QWEN4_PLE_PREFETCH_PREFILL=1` gave 228 / 256). The warm is allowed for any table under half of RAM, so a ~30 GB
+  table is read in beside ~48 GB of weights that leave it no room, the OS evicts it again, and the serial walk faults
+  rows off the SSD one by one. The arm now follows the sampled residency, not the warm's byte count alone.
+- **Ballast rig**: a 128 GB M5 Max made 64 GB-like by a program holding 42 GB of mlocked anonymous pages (wired
+  93 GB of 128 with the weights, swap unchanged at ~1.0-1.1 GB throughout, no cell void). The table's file-backed
+  pages fell from 32.5 GB (no ballast) to 19-21 GB of all files, and the sampled residency read 85.8% on the 15.7k
+  prefill. A 32 GB ballast leaves the table resident (file-backed 32 GB) and is not a reproduction.
+- **Prefill tok/s** (server `timings`, `Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw`, `--kv-quant 8 --mtp --prefix-cache-entries 0`,
+  distinct random-word prompts of ~1.15k and ~15.8k tokens, 2 requests per boot, one boot per cell, `taskpolicy -a`,
+  GPU lock per boot, fans max, cooled under 50 C before each boot, AC; binaries 4eb60e0e = main and the fix as of b8bf2376, before the squash that only renamed a local and added the past-cap guard):
+
+  | arm (order) | pp1.15k | pp15.8k |
+  |---|---|---|
+  | 42 GB ballast: main (A, A) | 857.6 / 974.3 / 911.6 / 917.2 | 988.8 / 1016.8 / 1022.3 / 902.3 |
+  | 42 GB ballast: `PREFETCH_PREFILL=1` (B, B) | 1228.9 / 1712.0 / 1616.7 / 1757.8 | 1978.4 / 1901.3 / 1889.9 / 1935.0 |
+  | 42 GB ballast: fix (C, C) | 1649.1 / 1794.7 / 1765.0 / 1787.6 | 1900.9 / 1960.0 / 1971.6 / 1998.1 |
+  | no ballast: main (A, A) | 2053.2 / 2112.8 / 1955.3 / 2167.6 | 2346.0 / 2400.7 / 2346.8 / 2431.6 |
+  | no ballast: fix (C, C) | 1934.7 / 2069.3 / 2033.8 / 2178.0 | 2243.6 / 2276.5 / 2421.1 / 2429.9 |
+
+  Order A B C C B A under the ballast, A C C A without. Means: under the ballast main 915 / 983, pool 1579 / 1926,
+  fix 1749 / 1958 tok/s (fix 1.91x and 1.99x of main, equal to the pool arm); without it main 2072 / 2381, fix
+  2054 / 2343 (-0.9% and -1.6%, inside the 4% spread between two boots of the same arm). The first request of a boot
+  reads lowest on most arms.
+- **The calibration is not the cause alone**: the 128-row read hit a table that was still in page cache in 3 of the 6
+  ballast boots and chose SERIAL (`serial 0.70 ms, pool 4.31 ms`), so main never pooled there; the fix pools on the
+  residency read after the warm either way. Engagement lines under the ballast:
+  `PLE prefill gather: POOLED (prefill width: 18384 rows, 288 batches of 64; the warm finished but the OS evicted the
+  table again, sampled residency 85.8%, ...)`; without it: `SERIAL mmap walk (prefill width: 1024 rows; the warm
+  finished and the table is resident, sampled residency 100.0%, ...)`. Main's lines are `SERIAL mmap walk (...; the
+  warm made the table resident, ...)` in both rigs.
+- **Threshold `RESIDENT_MIN` = 99%.** A resident table reads 100.0% and an evicted one 72.9-96%. A 32 GB ballast
+  (file-backed 32 GB, swap unchanged) sat between: sampled 91.0-99.7%, flipping between chunks, and main, pool and fix
+  all read 2090-2240 tok/s, so the arms tie there. The pool is the cheap side to err on: pooling a resident table costs
+  6-13% of prefill (v1.1.0 gate above), walking an evicted one serially cost 2x here.
+- **Cost of the sample**: 256 rows x 3 regions = 768 one-page `mincore` calls, 484 us mean (467 us best) per wide
+  gather on the real 29.8 GB table (C probe, `taskpolicy -a`, resident pages), once per chunk against 40-300 ms of
+  gather: under 1%. Only taken when the warm is done and the mode is the kv gate below the gate.
 
 <a id="qsa"></a>
 ## QSA wide verify (b89991a)

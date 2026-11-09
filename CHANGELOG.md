@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **On 64 GB Macs Qwen3.8-Flash-Next prefill no longer slows when macOS evicts the n-gram table**: the serial walk after the warm is taken only while the table is resident, with no environment variable needed.
 - **A value the engine will not honour as given is refused by name, never clamped or ignored**: a request `temperature`,
   `top_p`, `top_k`, penalty, `top_logprobs`, `logprobs`, `think_penalty`, token budget (a negative `max_tokens`) or `seed` outside its range
   is a 400 that states the range; a strict `json_schema` beside tools, or one the grammar cannot parse, is a 400 on chat,

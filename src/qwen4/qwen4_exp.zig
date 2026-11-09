@@ -467,10 +467,49 @@ pub const NgramTable = struct {
         });
     }
 
-    /// The calibration reads the table before the warm, so a pool it chose on a cold table stops paying once the warm
-    /// has read every byte: on a resident table the serial walk wins at prefill width.
-    fn poolPreferred(self: *const NgramTable) bool {
-        return self.prefer_pool and self.warm_bytes.load(.acquire) < self.map.len;
+    fn warmDone(self: *const NgramTable) bool {
+        return self.map.len > 0 and self.warm_bytes.load(.acquire) >= self.map.len;
+    }
+
+    /// Fraction of the table's pages the OS still holds, from the first page of each region of up to
+    /// `RESIDENT_SAMPLE_ROWS` rows spread over `row_ids`: the rows the gather is about to read.
+    fn residentFraction(self: *const NgramTable, row_ids: []const i64) f32 {
+        if (row_ids.len == 0) return 0;
+        const n = @min(row_ids.len, RESIDENT_SAMPLE_ROWS);
+        const wl: usize = self.wcols * 4;
+        const sl: usize = self.scols * 2;
+        var seen: usize = 0;
+        var resident: usize = 0;
+        for (0..n) |k| {
+            const r: usize = @intCast(row_ids[k * row_ids.len / n]);
+            if (self.bits == 16) {
+                seen += 1;
+                resident += @intFromBool(pageResident(self.map, self.w_off + r * self.dim * 2));
+            } else {
+                seen += 3;
+                resident += @intFromBool(pageResident(self.map, self.w_off + r * wl));
+                resident += @intFromBool(pageResident(self.map, self.s_off + r * sl));
+                resident += @intFromBool(pageResident(self.map, self.b_off + r * sl));
+            }
+        }
+        return @as(f32, @floatFromInt(resident)) / @as(f32, @floatFromInt(seen));
+    }
+
+    const WideArm = struct { wanted: bool, resident: ?f32, prefer_pool: bool };
+
+    /// Which arm a wide gather takes, and the residency it was decided on (null when not sampled).
+    /// A table the warm has read is trusted only while the OS still holds its pages.
+    fn wideArm(self: *const NgramTable, row_ids: []const i64, kv_len: u64, oversized: bool) WideArm {
+        const mode = plePrefillPrefetchMode();
+        const min_kv = plePrefillPrefetchMinKv();
+        const done = !oversized and self.warmDone();
+        const sampled = done and mode == .kv_gated and kv_len < min_kv;
+        const resident: f32 = if (sampled) self.residentFraction(row_ids) else 0;
+        return .{
+            .wanted = plePrefillPrefetchWanted(mode, kv_len, min_kv, oversized or self.prefer_pool, done, resident),
+            .resident = if (sampled) resident else null,
+            .prefer_pool = oversized or self.prefer_pool,
+        };
     }
 
     /// Sum a byte from each of the row's regions through the mmap, so the read cannot be
@@ -624,13 +663,13 @@ pub const NgramTable = struct {
         }
         const need: usize = self.rowBytes();
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
-        const oversized_bf16 = self.pastResidencyCap();
-        const prefer_pool = oversized_bf16 or self.poolPreferred();
-        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
+        const oversized = self.pastResidencyCap();
+        const arm = if (wide) self.wideArm(row_ids, kv_len, oversized) else null;
+        const wide_ok = arm == null or arm.?.wanted;
         // Announce the arm that actually runs, not the lever that permits it.
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
-        const whole_chunk = wide and oversized_bf16 and self.bits == 16;
-        if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool, self.prefer_pool));
+        const whole_chunk = wide and oversized and self.bits == 16;
+        if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, arm.?, self.prefer_pool), arm.?.resident);
         if (pooled and whole_chunk) {
             if (try self.pool.?.runBf16(self, row_ids, out)) return;
         } else if (pooled) {
@@ -661,11 +700,11 @@ pub const NgramTable = struct {
         const need = self.rowBytes();
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         const oversized = self.map.len > ngramCacheLimit();
-        const prefer_pool = oversized or self.poolPreferred();
-        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
+        const arm = if (wide) self.wideArm(row_ids, kv_len, oversized) else null;
+        const wide_ok = arm == null or arm.?.wanted;
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
         const whole_chunk = wide and oversized;
-        if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool, self.prefer_pool));
+        if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, arm.?, self.prefer_pool), arm.?.resident);
         if (pooled and whole_chunk) {
             if (try self.pool.?.runBf16Into(self, row_ids, .{ .words = out }, allocator)) return;
         } else if (pooled) {
@@ -865,7 +904,8 @@ const PrefetchPool = struct {
     }
 };
 
-/// One-shot engagement lines per arm; both arms say something.
+/// Engagement lines: each arm once at warmup width, and at prefill width once per CHANGE of arm,
+/// since the sampled residency can move the arm mid-life.
 /// Narrowest gather that is a genuine prefill chunk rather than a warmup forward.
 pub const PREFILL_SAY_MIN_ROWS: usize = 1024;
 
@@ -873,16 +913,24 @@ pub const PREFILL_SAY_MIN_ROWS: usize = 1024;
 pub var ple_prefill_arm_said: [2][2]std.atomic.Value(bool) =
     .{ .{ .init(false), .init(false) }, .{ .init(false), .init(false) } };
 
-fn notePrefillGatherArm(pooled: bool, rows: usize, batch_rows: usize, why: []const u8) void {
+/// The arm of the last prefill-width line: 0 none yet, 1 serial, 2 pooled.
+pub var ple_prefill_last_arm = std.atomic.Value(u8).init(0);
+
+fn notePrefillGatherArm(pooled: bool, rows: usize, batch_rows: usize, why: []const u8, resident: ?f32) void {
     const arm: usize = if (pooled) 1 else 0;
     const bucket: usize = if (rows >= PREFILL_SAY_MIN_ROWS) 1 else 0;
-    if (ple_prefill_arm_said[arm][bucket].swap(true, .monotonic)) return;
+    if (bucket == 1) {
+        if (ple_prefill_last_arm.swap(@intCast(arm + 1), .monotonic) == arm + 1) return;
+        ple_prefill_arm_said[arm][1].store(true, .monotonic);
+    } else if (ple_prefill_arm_said[arm][0].swap(true, .monotonic)) return;
     const width: []const u8 = if (bucket == 1) "prefill width" else "warmup width";
+    var sbuf: [48]u8 = undefined;
+    const seen: []const u8 = if (resident) |r| std.fmt.bufPrint(&sbuf, ", sampled residency {d:.1}%", .{r * 100}) catch "" else "";
     if (pooled) {
         const batches = (rows + batch_rows - 1) / batch_rows;
-        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; {s}, kv gate {d}; QWEN4_PLE_PREFETCH_PREFILL=0 forces the serial walk)\n", .{ width, rows, batches, batch_rows, why, plePrefillPrefetchMinKv() });
+        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; {s}{s}, kv gate {d}; QWEN4_PLE_PREFETCH_PREFILL=0 forces the serial walk)\n", .{ width, rows, batches, batch_rows, why, seen, plePrefillPrefetchMinKv() });
     } else {
-        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; {s}, kv gate {d}; QWEN4_PLE_PREFETCH_PREFILL=1 forces the pool)\n", .{ width, rows, why, plePrefillPrefetchMinKv() });
+        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; {s}{s}, kv gate {d}; QWEN4_PLE_PREFETCH_PREFILL=1 forces the pool)\n", .{ width, rows, why, seen, plePrefillPrefetchMinKv() });
     }
 }
 
@@ -934,14 +982,35 @@ pub fn plePrefillPrefetchArm(serial_ns: u64, pool_ns: u64) bool {
     return pool_ns * 100 < serial_ns * (100 - PLE_CALIBRATION_MARGIN_PCT);
 }
 
-/// A measured pool pools at any kv: the serial walk faults its rows from the SSD one by one.
-/// The kv gate still forces the pool past the threshold, whatever the calibration said.
-pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: u64, prefer_pool: bool) bool {
+/// Fraction of sampled table pages the OS must still hold for the serial walk to beat the pool: every miss
+/// is a serial SSD fault, so the walk loses to the pool well before the table is half evicted.
+pub const RESIDENT_MIN: f32 = 0.99;
+pub const RESIDENT_SAMPLE_ROWS: usize = 256;
+
+/// The calibration reads the table before the warm, so a pool it chose on a cold table stops paying once the warm
+/// has read every byte AND the OS still holds those pages; a warmed table the OS evicted again keeps the pool.
+pub fn poolPreferred(prefer_pool: bool, warm_done: bool, resident_fraction: f32) bool {
+    if (!warm_done) return prefer_pool;
+    return resident_fraction < RESIDENT_MIN;
+}
+
+/// The kv gate still forces the pool past the threshold, whatever the measurement said.
+pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: u64, prefer_pool: bool, warm_done: bool, resident_fraction: f32) bool {
     return switch (mode) {
         .off => false,
         .on => true,
-        .kv_gated => prefer_pool or kv_len >= min_kv,
+        .kv_gated => kv_len >= min_kv or poolPreferred(prefer_pool, warm_done, resident_fraction),
     };
+}
+
+/// True when the page holding `off` is in the OS page cache.
+fn pageResident(map: []align(std.heap.page_size_min) const u8, off: usize) bool {
+    if (off >= map.len) return false;
+    const page = std.mem.alignBackward(usize, off, std.heap.page_size_min);
+    var vec: [1]u8 = .{0};
+    const base: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(@intFromPtr(map.ptr) + page);
+    if (std.c.mincore(base, std.heap.page_size_min, &vec) != 0) return true; // unreadable: do not demote the arm
+    return vec[0] != 0;
 }
 
 fn plePrefillPrefetchMinKv() u64 {
@@ -960,15 +1029,12 @@ fn plePrefillPrefetchMode() PrefillPrefetchMode {
     return m;
 }
 
-fn plePrefillPrefetchEnabled(kv_len: u64, prefer_pool: bool) bool {
-    return plePrefillPrefetchWanted(plePrefillPrefetchMode(), kv_len, plePrefillPrefetchMinKv(), prefer_pool);
-}
-
 /// Why a wide gather took its arm, for the engagement line.
-fn prefillGatherWhy(wanted: bool, pooled: bool, prefer_pool: bool, measured_pool: bool) []const u8 {
+fn prefillGatherWhy(wanted: bool, pooled: bool, arm: NgramTable.WideArm, measured_pool: bool) []const u8 {
     if (wanted and !pooled) return "no pool";
     if (plePrefillPrefetchMode() != .kv_gated) return "QWEN4_PLE_PREFETCH_PREFILL";
-    if (prefer_pool) return "pool measured faster";
+    if (arm.resident != null) return if (wanted) "the warm finished but the OS evicted the table again" else "the warm finished and the table is resident";
+    if (arm.prefer_pool) return "pool measured faster";
     if (wanted) return "kv past the gate";
     return if (measured_pool) "the warm made the table resident, kv under the gate" else "serial measured faster, kv under the gate";
 }
@@ -1295,16 +1361,16 @@ pub const Qwen4State = struct {
 
 test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools" {
     const min = PREFILL_PREFETCH_MIN_KV;
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min, false));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min, false, false, 0));
     for ([_]u64{ 4096, 8192, 16_384, 65_536, 131_072, 262_143 }) |kv| {
-        try testing.expect(!plePrefillPrefetchWanted(.kv_gated, kv, min, false));
+        try testing.expect(!plePrefillPrefetchWanted(.kv_gated, kv, min, false, false, 0));
     }
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min, false));
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min, false));
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096, false));
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072, false));
-    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min, false));
-    try testing.expect(plePrefillPrefetchWanted(.on, 0, min, false));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min, false, false, 0));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min, false, false, 0));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096, false, false, 0));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072, false, false, 0));
+    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min, false, false, 0));
+    try testing.expect(plePrefillPrefetchWanted(.on, 0, min, false, false, 0));
 
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(null));
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(""));
@@ -1323,11 +1389,11 @@ test "ngram prefill prefetch pools at any kv when the calibration measured the p
     // An unreadable measurement (no timer) never claims the pool.
     try testing.expect(!plePrefillPrefetchArm(0, 0));
     try testing.expect(!plePrefillPrefetchArm(1_000_000, 0));
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 4096, min, slow_ssd));
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 4096, min, fast_ssd));
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min, fast_ssd));
-    try testing.expect(!plePrefillPrefetchWanted(.off, 4096, min, slow_ssd));
-    try testing.expect(plePrefillPrefetchWanted(.on, 4096, min, fast_ssd));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 4096, min, slow_ssd, false, 0));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 4096, min, fast_ssd, false, 0));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min, fast_ssd, false, 0));
+    try testing.expect(!plePrefillPrefetchWanted(.off, 4096, min, slow_ssd, false, 0));
+    try testing.expect(plePrefillPrefetchWanted(.on, 4096, min, fast_ssd, false, 0));
 }
 
 test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {
@@ -1371,6 +1437,7 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     const got = try testing.allocator.alloc(f32, ROWS * t.dim);
     defer testing.allocator.free(got);
 
+    ple_prefill_last_arm.store(0, .monotonic);
     ple_prefill_arm_said[0][0].store(false, .monotonic);
     ple_prefill_arm_said[0][1].store(false, .monotonic);
     ple_prefill_arm_said[1][0].store(false, .monotonic);
@@ -1504,6 +1571,185 @@ test "ngram prefill gather: a pool chosen on a cold table yields to the serial w
     // The kv gate still pools a long context.
     try t.gatherChecked(ids, out, 131_072);
     try testing.expectEqual(warm + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
+}
+
+/// Writes `data` with the page cache bypassed, so a fresh mapping of the file starts non-resident.
+fn writeUncached(path: [:0]const u8, data: []const u8) !void {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = std.c.close(fd);
+    _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = std.c.write(fd, data[off..].ptr, data.len - off);
+        if (n <= 0) return error.WriteFailed;
+        off += @intCast(n);
+    }
+}
+
+/// 4-bit, group 32, dim 256, 4096 rows: about forty pages, so residency has a resolution.
+const ResidencyImage = struct {
+    const ROWS: usize = 4096;
+    const HDR: usize = 512;
+    const W: usize = ROWS * 128;
+    const SB: usize = ROWS * 16;
+
+    fn build() ![]u8 {
+        const buf = try testing.allocator.alloc(u8, 8 + HDR + W + 2 * SB);
+        const header = "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4096,32],\"data_offsets\":[0,524288]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4096,8],\"data_offsets\":[524288,589824]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4096,8],\"data_offsets\":[589824,655360]}}";
+        std.mem.writeInt(u64, buf[0..8], HDR, .little);
+        @memset(buf[8 .. 8 + HDR], ' ');
+        @memcpy(buf[8..][0..header.len], header);
+        for (buf[8 + HDR ..], 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+        return buf;
+    }
+};
+
+test "ngram arm: the pool yields to the serial walk only for a warmed table the OS still holds" {
+    // Not warmed: the measured arm stands, whatever the residency reads.
+    try testing.expect(poolPreferred(true, false, 1.0));
+    try testing.expect(!poolPreferred(false, false, 0.0));
+    // Warmed and resident: serial, whichever way the calibration went.
+    try testing.expect(!poolPreferred(true, true, 1.0));
+    try testing.expect(!poolPreferred(true, true, RESIDENT_MIN));
+    // Warmed but evicted again: the pool, even when the calibration read it warm at boot.
+    try testing.expect(poolPreferred(true, true, 0.4));
+    try testing.expect(poolPreferred(false, true, 0.0));
+    try testing.expect(poolPreferred(true, true, RESIDENT_MIN - 0.01));
+    // The mode and the kv gate keep their meaning.
+    const min = PREFILL_PREFETCH_MIN_KV;
+    try testing.expect(!plePrefillPrefetchWanted(.off, 4096, min, true, true, 0.0));
+    try testing.expect(plePrefillPrefetchWanted(.on, 4096, min, false, true, 1.0));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min, false, true, 1.0));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 4096, min, false, true, 0.2));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 4096, min, true, true, 1.0));
+}
+
+test "ngram residency sampler: a file written around the page cache reads empty, read back it reads full" {
+    const buf = try ResidencyImage.build();
+    defer testing.allocator.free(buf);
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]}, 0);
+    try writeUncached(path, buf);
+
+    warm_override = false;
+    defer warm_override = null;
+    var t = try NgramTable.open(path);
+    defer t.close();
+    const ids = try testing.allocator.alloc(i64, ResidencyImage.ROWS);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*r, i| r.* = @intCast((i *% 1237) % ResidencyImage.ROWS);
+
+    try testing.expect(t.residentFraction(ids) < 0.1);
+    try testing.expectEqual(@as(f32, 0), t.residentFraction(ids[0..0]));
+    var scratch: [64 * 1024]u8 = undefined;
+    var off: usize = 0;
+    while (off < t.map.len) {
+        const n = std.c.pread(t.fd, &scratch, scratch.len, @intCast(off));
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    try testing.expectEqual(@as(f32, 1), t.residentFraction(ids));
+    try testing.expect(!pageResident(t.map, t.map.len + 1));
+}
+
+test "ngram prefill gather: a warmed table the OS evicted again keeps the pool, a resident one walks serially" {
+    const buf = try ResidencyImage.build();
+    defer testing.allocator.free(buf);
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]}, 0);
+    try writeUncached(path, buf);
+
+    warm_override = false;
+    defer warm_override = null;
+    ple_prefill_min_kv_override = 65_536;
+    defer ple_prefill_min_kv_override = null;
+    var t = try NgramTable.open(path);
+    defer t.close();
+    const pool = t.pool orelse return error.SkipZigTest;
+    const ids = try testing.allocator.alloc(i64, ResidencyImage.ROWS);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*r, i| r.* = @intCast((i *% 1237) % ResidencyImage.ROWS);
+    const ref = try testing.allocator.alloc(f32, ids.len * t.dim);
+    defer testing.allocator.free(ref);
+    const got = try testing.allocator.alloc(f32, ids.len * t.dim);
+    defer testing.allocator.free(got);
+
+    // The calibration chose the pool on the cold table and the warm has since read every byte.
+    t.prefer_pool = true;
+    t.warm_bytes.store(t.map.len, .release);
+    const batches = ids.len / PrefetchPool.MAX_ROWS;
+    const evicted = pool.runs.load(.monotonic);
+    try t.gatherChecked(ids, got, 8192);
+    try testing.expectEqual(evicted + batches, pool.runs.load(.monotonic));
+
+    // Reading the file back (what the warm does) makes it resident: the serial walk takes over.
+    var scratch: [64 * 1024]u8 = undefined;
+    var off: usize = 0;
+    while (off < t.map.len) {
+        const n = std.c.pread(t.fd, &scratch, scratch.len, @intCast(off));
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    const resident = pool.runs.load(.monotonic);
+    try t.gatherChecked(ids, ref, 8192);
+    try testing.expectEqual(resident, pool.runs.load(.monotonic));
+    try testing.expectEqualSlices(f32, ref, got);
+}
+
+test "ngram prefill gather: a table past the residency cap never samples residency and keeps the pool" {
+    const buf = try ResidencyImage.build();
+    defer testing.allocator.free(buf);
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]}, 0);
+    try td.dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = buf });
+
+    warm_override = false;
+    defer warm_override = null;
+    ple_prefill_min_kv_override = 65_536;
+    defer ple_prefill_min_kv_override = null;
+    var t = try NgramTable.open(path);
+    defer t.close();
+    const pool = t.pool orelse return error.SkipZigTest;
+    test_ngram_cache_limit = t.map.len - 1;
+    defer test_ngram_cache_limit = null;
+    const ids = try testing.allocator.alloc(i64, ResidencyImage.ROWS);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*r, i| r.* = @intCast((i *% 1237) % ResidencyImage.ROWS);
+    const out = try testing.allocator.alloc(f32, ids.len * t.dim);
+    defer testing.allocator.free(out);
+
+    // Every page is in the cache and a warm is claimed done, yet a table this box cannot hold pools.
+    var scratch: [64 * 1024]u8 = undefined;
+    var off: usize = 0;
+    while (off < t.map.len) {
+        const n = std.c.pread(t.fd, &scratch, scratch.len, @intCast(off));
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    t.warm_bytes.store(t.map.len, .release);
+    try testing.expectEqual(@as(?f32, null), t.wideArm(ids, 8192, true).resident);
+    const before = pool.runs.load(.monotonic);
+    try t.gatherChecked(ids, out, 8192);
+    try testing.expectEqual(before + ids.len / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
 }
 
 test "ngram table: a bf16 .bin gathers rows from the mmap and through the pool" {

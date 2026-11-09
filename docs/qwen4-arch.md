@@ -110,6 +110,11 @@ hidden 2560, expert intermediate 640.
 - Which arm a wide gather takes is MEASURED on the table, not predicted from RAM: `calibrateArm` reads 128 random rows
   both ways, on DISJOINT sets so neither arm warms the other's pages, before the warm thread faults the table in, and
   takes the pool only when it wins by 20%; SSD and page-cache state determine the choice on each load.
+- A pool chosen on a cold table yields to the serial walk only while the table is RESIDENT: once the warm has read every
+  byte, each wide gather below the kv gate samples the OS page cache with `mincore` over the first page of each region of
+  256 of its own rows (`residentFraction`) and walks serially at or above `RESIDENT_MIN` (99%), else keeps the pool. A
+  table the OS evicts again (a 64 GB Mac: ~30 GB of table beside ~48 GB of weights) therefore keeps the pool. The
+  `PLE prefill gather:` line names the sampled residency when it decided and is printed again whenever the arm changes.
 - `SUSHI_NGRAM_WARM` preads the whole table, and the residency cap (`ngramCacheLimit` = half of RAM) declines any
   table that cannot be held, bf16 or 4-bit (a 32 GB Mac reads the 4-bit table by row). Calibration and residency measurements: [perf-baselines](qwen4-perf.md#ngram-arm).
 - A table under the cap is a page-cache claim from `startWarm` to `close` (`page_cache_claim`), billed as GPU memory
