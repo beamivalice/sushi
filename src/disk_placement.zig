@@ -8,6 +8,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const prefix_vfs = @import("prefix_vfs.zig");
+const kv_disk_fs = @import("kv_disk_fs.zig");
 const model_discovery = @import("model_discovery.zig");
 
 /// One piece of a writer-armed commit: the bytes it stages before its manifest commits. The
@@ -255,7 +257,8 @@ pub fn sweepBase(
     var base = std.Io.Dir.openDirAbsolute(io, base_dir, .{ .iterate = true }) catch return;
     defer base.close(io);
 
-    const Victim = struct { path: []u8, bytes: u64, mtime: i128 };
+    // `layer` set: `path` is the entry's name inside that sibling's content-addressed layer.
+    const Victim = struct { path: []u8, bytes: u64, mtime: i128, layer: ?*prefix_vfs.Vfs = null };
     var victims = std.ArrayList(Victim).empty;
     defer {
         for (victims.items) |v| allocator.free(v.path);
@@ -272,6 +275,11 @@ pub fn sweepBase(
         for (held.items) |f| f.close(io);
         held.deinit(allocator);
     }
+    var layers = std.ArrayList(*prefix_vfs.Vfs).empty;
+    defer {
+        for (layers.items) |v| v.close();
+        layers.deinit(allocator);
+    }
 
     var fps = base.iterate();
     while (fps.next(io) catch null) |fp| {
@@ -285,6 +293,11 @@ pub fn sweepBase(
             continue;
         };
         reapPrivateRoots(allocator, io, fp_abs);
+        if (openLayer(allocator, io, fp_abs)) |v| {
+            if (layers.append(allocator, v)) |_| {
+                strays += sweepLayer(allocator, v, &victims, &total);
+            } else |_| v.close();
+        }
 
         var fpd = std.Io.Dir.openDirAbsolute(io, fp_abs, .{ .iterate = true }) catch continue;
         defer fpd.close(io);
@@ -331,7 +344,7 @@ pub fn sweepBase(
     var freed: u64 = 0;
     for (victims.items) |v| {
         if (total -| freed <= sibling_budget) break;
-        deleteTreeAbsolute(io, v.path);
+        if (v.layer) |l| l.deleteTree(v.path) catch {} else deleteTreeAbsolute(io, v.path);
         freed += v.bytes;
     }
     if (freed > 0) {
@@ -341,6 +354,57 @@ pub fn sweepBase(
             sibling_budget >> 20,
         });
     }
+}
+
+/// A sibling root's content-addressed layer (`<root>/v`), or null when it has none. The caller holds the root's lock.
+fn openLayer(allocator: std.mem.Allocator, io: std.Io, root_abs: []const u8) ?*prefix_vfs.Vfs {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const v_abs = std.fmt.bufPrint(&buf, "{s}/v", .{root_abs}) catch return null;
+    var d = std.Io.Dir.openDirAbsolute(io, v_abs, .{}) catch return null;
+    d.close(io);
+    return prefix_vfs.Vfs.open(allocator, io, root_abs, .{}) catch null;
+}
+
+/// The plain-file sweep of one root's entries, on its content-addressed layer: an index-less entry old enough is a
+/// stray and goes now; every other entry becomes a victim. Returns the strays removed.
+fn sweepLayer(allocator: std.mem.Allocator, v: *prefix_vfs.Vfs, victims: anytype, total: *u64) usize {
+    const ents = v.iterate(allocator, "") catch return 0;
+    defer prefix_vfs.Vfs.freeEntries(allocator, ents);
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+    const now = v.nowNs();
+    var strays: usize = 0;
+    for (ents) |dent| {
+        if (!dent.is_dir or dent.name.len < 2 or dent.name[0] != 'e') continue;
+        const files = v.iterate(allocator, dent.name) catch continue;
+        defer prefix_vfs.Vfs.freeEntries(allocator, files);
+        var bytes: u64 = 0;
+        var young = false;
+        var meta_mtime: ?i128 = null;
+        for (files) |f| {
+            if (f.is_dir) continue;
+            var pb: [std.fs.max_path_bytes]u8 = undefined;
+            const sub = std.fmt.bufPrint(&pb, "{s}/{s}", .{ dent.name, f.name }) catch continue;
+            const st = v.stat(sub) orelse continue;
+            if (std.mem.eql(u8, f.name, "meta.json")) meta_mtime = st.mtime_ns;
+            if (now -| st.mtime_ns < STRAY_MIN_AGE_NS) young = true;
+            if (st.nlink > 1 and (seen.fetchPut(st.ino, {}) catch null) != null) continue;
+            bytes += st.size;
+        }
+        const mtime = meta_mtime orelse {
+            if (young) continue;
+            v.deleteTree(dent.name) catch {};
+            strays += 1;
+            continue;
+        };
+        const name = allocator.dupe(u8, dent.name) catch continue;
+        victims.append(allocator, .{ .path = name, .bytes = bytes, .mtime = mtime, .layer = v }) catch {
+            allocator.free(name);
+            continue;
+        };
+        total.* += bytes;
+    }
+    return strays;
 }
 
 /// The flock that marks a tier root as owned by a live tier (`DiskTier.root_lock`).
@@ -451,7 +515,8 @@ fn reapStaleTmp(io: std.Io, dir_abs: []const u8) void {
     }
 }
 
-/// Bytes the tier `<base>/<fingerprint>` already holds on the volume: the files of every `e<id>` directory.
+/// Bytes the tier `<base>/<fingerprint>` already holds on the volume: the files of every `e<id>` directory, and
+/// the packs, journal and snapshot of a content-addressed layer (`v/`), which hold its files' bytes once.
 pub fn tierBytes(io: std.Io, base_dir: []const u8, fingerprint: []const u8) u64 {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = std.fmt.bufPrint(&root_buf, "{s}/{s}", .{ base_dir, fingerprint }) catch return 0;
@@ -464,8 +529,16 @@ pub fn tierBytes(io: std.Io, base_dir: []const u8, fingerprint: []const u8) u64 
     var total: u64 = 0;
     var it = d.iterate();
     while (it.next(io) catch null) |dent| {
-        if (dent.kind != .directory or dent.name.len < 2 or dent.name[0] != 'e') continue;
+        if (dent.kind != .directory) continue;
         var e_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.mem.eql(u8, dent.name, "v")) {
+            for ([_][]const u8{ "v", "v/packs" }) |sub| {
+                const v_abs = std.fmt.bufPrint(&e_buf, "{s}/{s}", .{ root, sub }) catch continue;
+                total +|= dirBytes(io, v_abs, &seen);
+            }
+            continue;
+        }
+        if (dent.name.len < 2 or dent.name[0] != 'e') continue;
         const e_abs = std.fmt.bufPrint(&e_buf, "{s}/{s}", .{ root, dent.name }) catch continue;
         total +|= dirBytes(io, e_abs, &seen);
     }
@@ -677,7 +750,7 @@ test "DiskTier: the root-wide sweep never deletes a root a live tier owns" {
     defer testing.allocator.free(other);
 
     sweepBase(testing.allocator, io, base, other, 0);
-    try testing.expect(tmp.dir.statFile(io, "fp-held/e1/meta.json", .{}) catch null != null);
+    try testing.expect(kv_disk_fs.testStatAt(io, base, "fp-held/e1/meta.json") != null);
     try testing.expect(rootIsLive(io, held.root));
     // A load beside the live tier keeps a private root: none of those bytes are its own.
     try testing.expectEqual(@as(u64, 0), tierBytes(io, base, "fp-held"));
@@ -1017,8 +1090,9 @@ test "DiskTier: a restart on a nearly full volume keeps what the tier already ho
     const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
     const total: u64 = 1024 * 1024 * 1024 * 1024;
 
+    // The arithmetic below models a volume of plain files; the layer's twin is the test after this one.
     {
-        var first = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-restart", 0, 128);
+        var first = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-restart", 0, 128, .real);
         defer first.deinit();
         first.ssd_first = true;
         first.armTestSpace(total / 2, total);
@@ -1045,7 +1119,7 @@ test "DiskTier: a restart on a nearly full volume keeps what the tier already ho
     try testing.expectEqual(DiskBound.free_disk, plan.bound);
     try testing.expectEqual(DEFAULT_DISK_CAP, plan.cap);
 
-    var second = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-restart", plan.bytes, 128);
+    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-restart", plan.bytes, 128, .real);
     defer second.deinit();
     second.operator_cap = plan.cap;
     try testing.expectEqual(@as(usize, 2), second.entryCount());
@@ -1063,6 +1137,153 @@ test "DiskTier: a restart on a nearly full volume keeps what the tier already ho
     try testing.expectEqual(3 * held, flag.bytes);
     try testing.expectEqual(DiskBound.flag, flag.bound);
     try testing.expectEqual(3 * held, flag.cap);
+}
+
+/// Two plain-file records under `<base>/<fp>`, written by a `real` tier as a build before the layer left them.
+fn writePlainRecords(io: std.Io, base: []const u8, fp: []const u8, cache: *KVCache) !void {
+    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, fp, 0, 128, .real);
+    defer tier.deinit();
+    for ([_]u32{ 7, 90_000 }) |off| {
+        var tokens: [640]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + off);
+        _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, mlx.gpuStream());
+    }
+}
+
+test "DiskTier: a content-addressed tier deletes the plain-file records under its root once at attach; a plain one keeps and restores them" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    try writePlainRecords(io, base, "fp-up", &cache);
+    // Foreign names beside the records: none is a plain record.
+    try tmp.dir.createDirPath(io, "fp-up/notes");
+    try tmp.dir.createDirPath(io, "fp-up/e1x");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-up/e7", .data = "a file, not a record" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-up/notes/keep.txt", .data = "keep" });
+
+    {
+        var plain = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-up", 0, 128, .real);
+        defer plain.deinit();
+        try testing.expectEqual(@as(usize, 2), plain.entryCount());
+        var out = try KVCache.init(testing.allocator, 2);
+        defer out.deinit();
+        try testing.expectEqual(@as(u32, 640), try plain.restoreInto(&out, 0, s));
+    }
+    try testing.expect(tmp.dir.statFile(io, "fp-up/e1/meta.json", .{}) catch null != null);
+
+    {
+        var layer = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-up", 0, 128, .cas);
+        defer layer.deinit();
+        try testing.expectEqual(@as(usize, 0), layer.entryCount());
+        var tokens: [640]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 300_000);
+        _ = try layer.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    }
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-up/e1/meta.json", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-up/e2/meta.json", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-up/notes/keep.txt", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-up/e7", .{}) catch null != null);
+    var e1x = try tmp.dir.openDir(io, "fp-up/e1x", .{});
+    e1x.close(io);
+
+    // The layer's own records and files survive its next attach.
+    const held = tierBytes(io, base, "fp-up");
+    {
+        var again = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-up", 0, 128, .cas);
+        defer again.deinit();
+        try testing.expectEqual(@as(usize, 1), again.entryCount());
+    }
+    try testing.expectEqual(held, tierBytes(io, base, "fp-up"));
+}
+
+test "DiskTier: after an attach that removed plain-file records, the refreshed budget is the one the attach resolved" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    try writePlainRecords(io, base, "fp-up", &cache);
+
+    // A volume tight enough that free space bounds the budget: the attach counts the old records as the tier's room.
+    const held = tierBytes(io, base, "fp-up");
+    try testing.expect(held > 0);
+    const free = DISK_FREE_RESERVE + held / 2;
+    const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free, held).?;
+    try testing.expectEqual(DiskBound.free_disk, plan.bound);
+    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-up", plan.bytes, 128, .cas);
+    defer tier.deinit();
+    // The live tier's root reads as 0 to `tierBytes`: count the records still on disk directly.
+    var seen = InodeSet.init(testing.allocator);
+    defer seen.deinit();
+    var left: u64 = 0;
+    for ([_][]const u8{ "e1", "e2" }) |e| {
+        var eb: [600]u8 = undefined;
+        left += dirBytes(io, try std.fmt.bufPrint(&eb, "{s}/fp-up/{s}", .{ base, e }), &seen);
+    }
+    const freed = held - left;
+    tier.operator_cap = plan.cap;
+    tier.armTestSpace(free + freed, 1 << 40);
+    tier.refreshDiskBudget();
+    try testing.expectEqual(plan.bytes, tier.max_bytes);
+}
+
+test "DiskTier: on one volume the content-addressed layer resolves and refreshes the budget the plain files do" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    const total: u64 = 1024 * 1024 * 1024 * 1024;
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var logical: [2]u64 = undefined;
+    for ([_]kv_disk_fs.Backend{ .real, .cas }, [_][]const u8{ "fp-vol-real", "fp-vol-cas" }, 0..) |b, fp, k| {
+        var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, fp, 0, 128, b);
+        defer tier.deinit();
+        tier.enableBackgroundWriter();
+        // Two records of the same rows: the layer stores those rows once.
+        for ([_]u32{ 7, 90_000 }) |off| {
+            var tokens: [640]u32 = undefined;
+            for (&tokens, 0..) |*t, i| t.* = @intCast(i + off);
+            _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+        }
+        tier.drainWriter();
+        logical[k] = tier.total_bytes;
+    }
+    try testing.expectEqual(logical[0], logical[1]);
+    const held_real = tierBytes(io, base, "fp-vol-real");
+    const held_cas = tierBytes(io, base, "fp-vol-cas");
+    try testing.expect(held_cas < held_real);
+    // The volume left the same files, so it has what the layer saved on top.
+    const free_real = DISK_FREE_RESERVE + held_real / 2;
+    const free_cas = free_real + held_real - held_cas;
+    const want = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free_real, held_real).?;
+    const got = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free_cas, held_cas).?;
+    try testing.expectEqual(want, got);
+
+    var budgets: [2]u64 = undefined;
+    for ([_]kv_disk_fs.Backend{ .real, .cas }, [_][]const u8{ "fp-vol-real", "fp-vol-cas" }, [_]u64{ free_real, free_cas }, 0..) |b, fp, free, k| {
+        var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, fp, want.bytes, 128, b);
+        defer tier.deinit();
+        tier.operator_cap = want.cap;
+        tier.armTestSpace(free, total);
+        tier.refreshDiskBudget();
+        try testing.expectEqual(@as(usize, 2), tier.entryCount());
+        budgets[k] = tier.max_bytes;
+    }
+    try testing.expectEqual(budgets[0], budgets[1]);
 }
 
 test "DiskTier: the free-space probe runs only before a store, never for a copy already on disk" {
@@ -1171,12 +1392,12 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
 
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stray/e9/c000000.safetensors", .{}));
     try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
-    try testing.expect(tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}) catch null != null);
+    try testing.expect(kv_disk_fs.testStatAt(io, base, "fp-sibling/e1/meta.json") != null);
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
 
     // With a budget of zero the siblings' real entries go too, and the live root is still untouched.
     sweepBase(testing.allocator, io, base, live.root, 0);
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}));
+    try testing.expect(kv_disk_fs.testStatAt(io, base, "fp-sibling/e1/meta.json") == null);
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
     try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
 }

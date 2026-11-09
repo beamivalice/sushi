@@ -203,22 +203,26 @@ fn freeSegments(allocator: Allocator, list: *std.ArrayList(Segment)) void {
     list.deinit(allocator);
 }
 
-fn buildPayload(
-    allocator: Allocator,
-    tensors: []const Tensor,
-    row_maps: []const ?RowMap,
-    conts: []const mlx.mlx_array,
-    head: []u8,
-    kind: prefix_vfs.Kind,
-) !prefix_vfs.OwnedPayload {
-    var head_live = true;
-    errdefer if (head_live) allocator.free(head);
-    var segs: std.ArrayList(Segment) = .empty;
-    errdefer freeSegments(allocator, &segs);
+/// One segment of a file before its bytes exist: rows `[from, to)` of a row-mapped tensor, bytes `[from, to)` of a
+/// fixed one, or the header.
+const Piece = struct {
+    what: enum { rows, fixed, head },
+    ti: u32 = 0,
+    tag: u32 = prefix_vfs.UNTAGGED,
+    group: u32 = prefix_vfs.UNTAGGED,
+    from: usize = 0,
+    to: usize = 0,
+    len: usize,
+};
+
+/// The file's segments in order: every tensor's row groups (by group, then tensor), the fixed tensors' parts, then
+/// the header.
+fn planPieces(allocator: Allocator, row_maps: []const ?RowMap, conts: []const mlx.mlx_array, head_len: usize) ![]Piece {
+    var pieces: std.ArrayList(Piece) = .empty;
+    errdefer pieces.deinit(allocator);
     var cuts: std.ArrayList(Cut) = .empty;
     defer cuts.deinit(allocator);
-
-    for (tensors, conts, 0..) |_, arr, ti| {
+    for (conts, 0..) |arr, ti| {
         const m = if (row_maps.len == 0) null else row_maps[ti];
         if (m) |map| {
             const shape = mlx.getShape(arr);
@@ -230,35 +234,122 @@ fn buildPayload(
     for (cuts.items) |c| {
         const arr = conts[c.tensor];
         const map = row_maps[c.tensor].?;
-        const shape = mlx.getShape(arr);
-        const rows: usize = @intCast(shape[map.axis]);
-        var outer: usize = 1;
-        for (shape[0..map.axis]) |d| outer *= @intCast(d);
-        const inner_bytes: usize = @intCast(nbytesOf(arr) / (outer * rows));
-        const src = bytesOf(arr) orelse return error.DiskCacheUnreadable;
-        const buf = try allocator.alloc(u8, outer * (c.to - c.from) * inner_bytes);
-        errdefer allocator.free(buf);
-        gather(buf, src, outer, rows, inner_bytes, c.from, c.to);
-        try segs.append(allocator, .{ .bytes = buf, .tensor = rowTag(c.tensor, map.axis), .group = c.group });
+        const rows: usize = @intCast(mlx.getShape(arr)[map.axis]);
+        const row_bytes: usize = @intCast(nbytesOf(arr) / rows);
+        try pieces.append(allocator, .{ .what = .rows, .ti = c.tensor, .tag = rowTag(c.tensor, map.axis), .group = c.group, .from = c.from, .to = c.to, .len = (c.to - c.from) * row_bytes });
     }
-
-    for (tensors, conts, 0..) |_, arr, ti| {
+    for (conts, 0..) |arr, ti| {
         if (row_maps.len != 0 and row_maps[ti] != null) continue;
-        const src = bytesOf(arr) orelse return error.DiskCacheUnreadable;
+        const n: usize = @intCast(nbytesOf(arr));
         var off: usize = 0;
         var part: u32 = 0;
-        while (off < src.len) : (part += 1) {
-            const n = @min(FIXED_PART, src.len - off);
-            const buf = try allocator.dupe(u8, src[off..][0..n]);
-            errdefer allocator.free(buf);
-            try segs.append(allocator, .{ .bytes = buf, .tensor = @intCast(ti), .group = part });
-            off += n;
+        while (off < n) : (part += 1) {
+            const len = @min(FIXED_PART, n - off);
+            try pieces.append(allocator, .{ .what = .fixed, .ti = @intCast(ti), .tag = @intCast(ti), .group = part, .from = off, .to = off + len, .len = len });
+            off += len;
         }
     }
+    try pieces.append(allocator, .{ .what = .head, .len = head_len });
+    return pieces.toOwnedSlice(allocator);
+}
 
-    try segs.append(allocator, .{ .bytes = head });
-    head_live = false;
-    return .{ .kind = kind, .segments = try segs.toOwnedSlice(allocator) };
+/// The bytes of a rows or fixed piece, into `dst` (`p.len` bytes).
+fn fillPiece(p: Piece, row_maps: []const ?RowMap, conts: []const mlx.mlx_array, dst: []u8) !void {
+    const arr = conts[p.ti];
+    const src = bytesOf(arr) orelse return error.DiskCacheUnreadable;
+    switch (p.what) {
+        .rows => {
+            const map = row_maps[p.ti].?;
+            const shape = mlx.getShape(arr);
+            const rows: usize = @intCast(shape[map.axis]);
+            var outer: usize = 1;
+            for (shape[0..map.axis]) |d| outer *= @intCast(d);
+            const inner_bytes: usize = @intCast(nbytesOf(arr) / (outer * rows));
+            gather(dst, src, outer, rows, inner_bytes, p.from, p.to);
+        },
+        .fixed => @memcpy(dst, src[p.from..p.to]),
+        .head => unreachable,
+    }
+}
+
+/// A tensor file read back once and handed out in order as payloads of at most `max` bytes (a piece larger than
+/// `max` is one of its own): the parts of a file held with `Vfs.holdPart`, each copied only when it is taken.
+pub const Parts = struct {
+    allocator: Allocator,
+    head: ?[]u8,
+    conts: []mlx.mlx_array,
+    row_maps: []const ?RowMap,
+    pieces: []Piece,
+    next: usize = 0,
+    /// The safetensors file's size.
+    size: u64,
+
+    /// `row_maps` is empty or parallel to `tensors`, and must outlive the `Parts`.
+    pub fn init(allocator: Allocator, tensors: []const Tensor, meta: []const MetaPair, row_maps: []const ?RowMap, s: mlx.mlx_stream) !Parts {
+        try validate(tensors, row_maps);
+        const head = try encodeHeader(allocator, tensors, meta);
+        errdefer allocator.free(head);
+        const conts = try materialize(allocator, tensors, s);
+        errdefer freeConts(allocator, conts);
+        const pieces = try planPieces(allocator, row_maps, conts, head.len);
+        var size: u64 = 0;
+        for (pieces) |p| size += p.len;
+        return .{ .allocator = allocator, .head = head, .conts = conts, .row_maps = row_maps, .pieces = pieces, .size = size };
+    }
+
+    pub fn deinit(self: *Parts) void {
+        if (self.head) |h| self.allocator.free(h);
+        freeConts(self.allocator, self.conts);
+        self.allocator.free(self.pieces);
+    }
+
+    pub fn done(self: *const Parts) bool {
+        return self.next == self.pieces.len;
+    }
+
+    fn end(self: *const Parts, max: u64) usize {
+        var n: u64 = 0;
+        var i = self.next;
+        while (i < self.pieces.len) : (i += 1) {
+            if (n > 0 and n + self.pieces[i].len > max) break;
+            n += self.pieces[i].len;
+        }
+        return i;
+    }
+
+    /// The byte size of the part `take(max, ...)` returns next.
+    pub fn nextLen(self: *const Parts, max: u64) u64 {
+        var n: u64 = 0;
+        for (self.pieces[self.next..self.end(max)]) |p| n += p.len;
+        return n;
+    }
+
+    /// The next part, its bytes allocated with the `Parts`' allocator.
+    pub fn take(self: *Parts, max: u64, kind: prefix_vfs.Kind) !prefix_vfs.OwnedPayload {
+        const a = self.allocator;
+        const stop = self.end(max);
+        var segs: std.ArrayList(Segment) = .empty;
+        errdefer freeSegments(a, &segs);
+        try segs.ensureTotalCapacity(a, stop - self.next);
+        for (self.pieces[self.next..stop]) |p| {
+            if (p.what == .head) {
+                segs.appendAssumeCapacity(.{ .bytes = self.head.? });
+                self.head = null;
+                continue;
+            }
+            const buf = try a.alloc(u8, p.len);
+            errdefer a.free(buf);
+            try fillPiece(p, self.row_maps, self.conts, buf);
+            segs.appendAssumeCapacity(.{ .bytes = buf, .tensor = p.tag, .group = p.group });
+        }
+        self.next = stop;
+        return .{ .kind = kind, .segments = try segs.toOwnedSlice(a) };
+    }
+};
+
+fn freeConts(allocator: Allocator, conts: []mlx.mlx_array) void {
+    for (conts) |c| _ = mlx.mlx_array_free(c);
+    allocator.free(conts);
 }
 
 /// Reads `tensors` back from MLX on the caller's thread and holds the file's blocks in `vfs`. The VFS steps that follow
@@ -274,19 +365,9 @@ pub fn stageTensors(
     kind: prefix_vfs.Kind,
     s: mlx.mlx_stream,
 ) !prefix_vfs.Ticket {
-    const a = vfs.allocator;
-    try validate(tensors, row_maps);
-    const head = try encodeHeader(a, tensors, meta);
-    const conts = materialize(a, tensors, s) catch |e| {
-        a.free(head);
-        return e;
-    };
-    defer {
-        for (conts) |c| _ = mlx.mlx_array_free(c);
-        a.free(conts);
-    }
-    const payload = try buildPayload(a, tensors, row_maps, conts, head, kind);
-    return vfs.hold(path, mode, payload);
+    var parts = try Parts.init(vfs.allocator, tensors, meta, row_maps, s);
+    defer parts.deinit();
+    return vfs.hold(path, mode, try parts.take(std.math.maxInt(u64), kind));
 }
 
 /// `stageTensors` and the four VFS steps in one call: the file is visible when it returns. Returns the file's size.

@@ -5,6 +5,7 @@ const dsv41_model = @import("dsv41_model.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const mlx_ops = @import("../mlx_ops.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
+const kv_disk_fs = @import("../kv_disk_fs.zig");
 const disk_placement = @import("../disk_placement.zig");
 const kv_quant = @import("../kv_quant.zig");
 const mlx = @import("../mlx.zig");
@@ -670,7 +671,7 @@ test "DeepSeek SSD tier split: an heir that restored from its donor links the do
         var hc = try dsv41SplitCache(io, base, "dsv41-heir", &net, 128);
         defer hc.deinit();
         const donor_dir = try std.fmt.bufPrint(&donor_dir_buf, "dsv41-heir/e{d}", .{hc.disk.?.entries.items[0].id});
-        try tmp.dir.deleteTree(io, donor_dir);
+        kv_disk_fs.testDeleteTreeAt(io, base, donor_dir);
     }
     var hc = try dsv41SplitCache(io, base, "dsv41-heir", &net, 128);
     defer hc.deinit();

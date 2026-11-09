@@ -24,7 +24,10 @@ const kind_names = @typeInfo(Kind).@"enum".field_names;
 pub const kind_count = kind_names.len;
 
 pub const Snapshot = struct {
+    /// The files' bytes, as the plain files hold them, whichever backend stores them.
     written: [kind_count]u64 = @splat(0),
+    /// What the content-addressed layer added to its packs and journal to store them; 0 on plain files.
+    stored: [kind_count]u64 = @splat(0),
     /// Bytes handed to a write that failed, or staged and then dropped; never part of `written`.
     failed: u64 = 0,
 
@@ -33,16 +36,28 @@ pub const Snapshot = struct {
         for (self.written) |b| n +|= b;
         return n;
     }
+
+    pub fn totalStored(self: Snapshot) u64 {
+        var n: u64 = 0;
+        for (self.stored) |b| n +|= b;
+        return n;
+    }
 };
 
 pub const Stats = struct {
     written: [kind_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    stored: [kind_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
     failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     parent: ?*Stats = null,
 
     pub fn recordWritten(self: *Stats, kind: Kind, bytes: u64) void {
         _ = self.written[@intFromEnum(kind)].fetchAdd(bytes, .monotonic);
         if (self.parent) |p| p.recordWritten(kind, bytes);
+    }
+
+    pub fn recordStored(self: *Stats, kind: Kind, bytes: u64) void {
+        _ = self.stored[@intFromEnum(kind)].fetchAdd(bytes, .monotonic);
+        if (self.parent) |p| p.recordStored(kind, bytes);
     }
 
     pub fn recordFailed(self: *Stats, bytes: u64) void {
@@ -53,6 +68,7 @@ pub const Stats = struct {
     pub fn snapshot(self: *const Stats) Snapshot {
         var s: Snapshot = .{ .failed = self.failed.load(.monotonic) };
         for (&s.written, &self.written) |*dst, *src| dst.* = src.load(.monotonic);
+        for (&s.stored, &self.stored) |*dst, *src| dst.* = src.load(.monotonic);
         return s;
     }
 };
@@ -65,6 +81,10 @@ pub fn writePrometheus(snap: Snapshot, w: *std.Io.Writer) !void {
     inline for (kind_names, 0..) |name, i| {
         try w.print("sushi:prefix_cache_write_bytes_total{{kind=\"{s}\"}} {d}\n", .{ name, snap.written[i] });
     }
+    try w.print("\n# HELP sushi:prefix_cache_store_bytes_total Bytes the SSD prefix cache's content-addressed layer added to its packs and journal since process start, by file kind\n# TYPE sushi:prefix_cache_store_bytes_total counter\n", .{});
+    inline for (kind_names, 0..) |name, i| {
+        try w.print("sushi:prefix_cache_store_bytes_total{{kind=\"{s}\"}} {d}\n", .{ name, snap.stored[i] });
+    }
     try w.print("\n# HELP sushi:prefix_cache_write_failed_bytes_total Bytes of SSD prefix cache writes that failed or were dropped before landing\n# TYPE sushi:prefix_cache_write_failed_bytes_total counter\nsushi:prefix_cache_write_failed_bytes_total {d}\n\n", .{snap.failed});
 }
 
@@ -74,28 +94,36 @@ pub fn writeJson(snap: Snapshot, w: *std.Io.Writer) !void {
     inline for (kind_names, 0..) |name, i| {
         try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", name, snap.written[i] });
     }
+    try w.print("}},\"stored_bytes\":{{", .{});
+    inline for (kind_names, 0..) |name, i| {
+        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", name, snap.stored[i] });
+    }
     try w.print("}},\"failed_bytes\":{d}}}", .{snap.failed});
 }
 
-test "Stats: a write lands in its kind and in the parent, a failure in failed only" {
+test "Stats: a write lands in its kind and in the parent, a failure in failed only, a store in stored only" {
     var total: Stats = .{};
     var tier: Stats = .{ .parent = &total };
     tier.recordWritten(.kv, 100);
     tier.recordWritten(.kv, 28);
     tier.recordWritten(.qsa, 7);
     tier.recordFailed(5);
+    tier.recordStored(.kv, 40);
     const s = tier.snapshot();
     try std.testing.expectEqual(@as(u64, 128), s.written[@intFromEnum(Kind.kv)]);
     try std.testing.expectEqual(@as(u64, 7), s.written[@intFromEnum(Kind.qsa)]);
     try std.testing.expectEqual(@as(u64, 0), s.written[@intFromEnum(Kind.ssm)]);
     try std.testing.expectEqual(@as(u64, 135), s.totalWritten());
     try std.testing.expectEqual(@as(u64, 5), s.failed);
+    try std.testing.expectEqual(@as(u64, 40), s.totalStored());
+    try std.testing.expectEqual(@as(u64, 40), s.stored[@intFromEnum(Kind.kv)]);
     try std.testing.expectEqual(s, total.snapshot());
 }
 
-test "the Prometheus and JSON renderings name every kind and the failed counter" {
+test "the Prometheus and JSON renderings name every kind, the stored and the failed counters" {
     var snap: Snapshot = .{ .failed = 9 };
     for (&snap.written, 0..) |*b, i| b.* = 1000 + i;
+    for (&snap.stored, 0..) |*b, i| b.* = 500 + i;
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writePrometheus(snap, &w);
@@ -113,6 +141,9 @@ test "the Prometheus and JSON renderings name every kind and the failed counter"
         const want = try std.fmt.bufPrint(&line, "sushi:prefix_cache_write_bytes_total{{kind=\"{s}\"}} {d}\n", .{ name, 1000 + i });
         try std.testing.expect(std.mem.indexOf(u8, prom, want) != null);
         try std.testing.expectEqual(@as(i64, 1000 + i), obj.get("written_bytes").?.object.get(name).?.integer);
+        const stored = try std.fmt.bufPrint(&line, "sushi:prefix_cache_store_bytes_total{{kind=\"{s}\"}} {d}\n", .{ name, 500 + i });
+        try std.testing.expect(std.mem.indexOf(u8, prom, stored) != null);
+        try std.testing.expectEqual(@as(i64, 500 + i), obj.get("stored_bytes").?.object.get(name).?.integer);
     }
     try std.testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_write_failed_bytes_total 9\n") != null);
     try std.testing.expectEqual(@as(i64, 9), obj.get("failed_bytes").?.integer);

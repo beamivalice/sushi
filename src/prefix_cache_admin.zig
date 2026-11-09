@@ -6,6 +6,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
+const prefix_vfs = @import("prefix_vfs.zig");
 const model_registry_mod = @import("model_registry.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const http_conn = @import("http_conn.zig");
@@ -47,14 +48,20 @@ pub const Namespace = struct {
     }
 };
 
-/// Bytes and entries under one tier root (`e<id>` directories), a hard-linked file counted once.
-fn scanRoot(io: std.Io, root_abs: []const u8, seen: *disk_placement.InodeSet, out: *Namespace) void {
+/// Bytes and entries under one tier root (`e<id>` directories), a hard-linked file counted once. A content-addressed
+/// layer (`v/`) lists the same way (`scanLayer`).
+fn scanRoot(allocator: std.mem.Allocator, io: std.Io, root_abs: []const u8, seen: *disk_placement.InodeSet, out: *Namespace) void {
     var d = std.Io.Dir.openDirAbsolute(io, root_abs, .{ .iterate = true }) catch return;
     defer d.close(io);
     var it = d.iterate();
     while (it.next(io) catch null) |dent| {
-        if (dent.kind != .directory or dent.name.len < 2) continue;
+        if (dent.kind != .directory) continue;
         var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.mem.eql(u8, dent.name, "v")) {
+            scanLayer(allocator, io, root_abs, out);
+            continue;
+        }
+        if (dent.name.len < 2) continue;
         const sub = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root_abs, dent.name }) catch continue;
         switch (dent.name[0]) {
             'e' => {
@@ -65,9 +72,35 @@ fn scanRoot(io: std.Io, root_abs: []const u8, seen: *disk_placement.InodeSet, ou
                 out.entries += 1;
                 out.newest_ns = @max(out.newest_ns, meta.mtime.nanoseconds);
             },
-            'p' => scanRoot(io, sub, seen, out),
+            'p' => scanRoot(allocator, io, sub, seen, out),
             else => {},
         }
+    }
+}
+
+/// A content-addressed layer's `e<id>` records as `scanRoot` lists plain ones: their files' sizes, a linked file
+/// once, and an entry per manifest. Read without opening the layer for writes, since a live tier may hold it.
+fn scanLayer(allocator: std.mem.Allocator, io: std.Io, root_abs: []const u8, out: *Namespace) void {
+    const v = prefix_vfs.Vfs.open(allocator, io, root_abs, .{ .read_only = true }) catch return;
+    defer v.close();
+    const top = v.iterate(allocator, "") catch return;
+    defer prefix_vfs.Vfs.freeEntries(allocator, top);
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(allocator);
+    for (top) |d| {
+        if (!d.is_dir or d.name.len < 2 or d.name[0] != 'e') continue;
+        const files = v.iterate(allocator, d.name) catch continue;
+        defer prefix_vfs.Vfs.freeEntries(allocator, files);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        for (files) |f| {
+            if (f.is_dir) continue;
+            const st = v.stat(std.fmt.bufPrint(&buf, "{s}/{s}", .{ d.name, f.name }) catch continue) orelse continue;
+            if (st.nlink > 1 and (seen.fetchPut(allocator, st.ino, {}) catch null) != null) continue;
+            out.bytes +|= st.size;
+        }
+        const meta = v.stat(std.fmt.bufPrint(&buf, "{s}/meta.json", .{d.name}) catch continue) orelse continue;
+        out.entries += 1;
+        out.newest_ns = @max(out.newest_ns, meta.mtime_ns);
     }
 }
 
@@ -77,7 +110,7 @@ pub fn scanNamespace(allocator: std.mem.Allocator, io: std.Io, base_abs: []const
     defer seen.deinit();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/{x:0>16}", .{ base_abs, id }) catch return ns;
-    scanRoot(io, path, &seen, &ns);
+    scanRoot(allocator, io, path, &seen, &ns);
     return ns;
 }
 
@@ -517,6 +550,54 @@ test "prefix cache admin: scan: sizes, entries and newest mtime per namespace; a
     try testing.expectEqual(@as(u32, 3), found[0].entries);
     try testing.expect(found[0].newest_ns > 0);
     try testing.expectEqual(@as(u32, 1), found[1].entries);
+}
+
+test "prefix cache admin: scan lists a namespace's entries, bytes and newest manifest alike on plain files and on the content-addressed layer, and leaves a live layer as it was" {
+    try @import("mlx.zig").requireGpu();
+    const io = testing.io;
+    const kv_disk_cache = @import("kv_disk_cache.zig");
+    const KVCache = @import("kv_cache.zig").KVCache;
+    const s = @import("mlx.zig").gpuStream();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+
+    var tiers: [2]kv_disk_cache.DiskTier = undefined;
+    const names = [_][]const u8{ "00000000000000a1", "00000000000000b2" };
+    for (&tiers, names, [_]@import("kv_disk_fs.zig").Backend{ .real, .cas }) |*t, name, b| {
+        t.* = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, name, 0, 128, b);
+        t.ssd_first = true;
+        t.armTestSpace(1 << 40, 1 << 41);
+        t.enableBackgroundWriter();
+        // Two records diverging at 520: the second hard-links the four whole chunks they share.
+        for (0..2) |k| {
+            var tokens: [600]u32 = undefined;
+            for (&tokens, 0..) |*tk, i| tk.* = @intCast(if (i < 520) i + 7 else i + 7 + 10_000 * k);
+            _ = try t.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+        }
+        t.drainWriter();
+    }
+    defer for (&tiers) |*t| t.deinit();
+    const plain = scanNamespace(testing.allocator, io, base, 0xa1);
+    const layer = scanNamespace(testing.allocator, io, base, 0xb2);
+    try testing.expectEqual(@as(u32, 2), plain.entries);
+    try testing.expectEqual(plain.entries, layer.entries);
+    try testing.expectEqual(plain.bytes, layer.bytes);
+    try testing.expect(layer.newest_ns > 0);
+
+    // The scan read the live layer without changing it: the tier keeps writing and reopens whole.
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*tk, i| tk.* = @intCast(i + 50_000);
+    _ = try tiers[1].appendCommit(cache.entries, 600, cache.config, &tokens, false, null, s);
+    tiers[1].drainWriter();
+    try testing.expectEqual(@as(u32, 3), scanNamespace(testing.allocator, io, base, 0xb2).entries);
+    tiers[1].deinit();
+    tiers[1] = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, names[1], 0, 128, .cas);
+    try testing.expectEqual(@as(usize, 3), tiers[1].entryCount());
 }
 
 test "prefix cache admin: deleteUnused: keeps the named namespaces and non-cache directories, refuses a symlink out of the root, skips a held root" {

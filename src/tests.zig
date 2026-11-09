@@ -111,6 +111,7 @@ test {
     _ = @import("parent_watch.zig");
     _ = @import("update.zig");
     _ = @import("kv_disk_cache.zig");
+    _ = @import("kv_disk_fs.zig");
     _ = @import("disk_placement.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("prefix_vfs_tensors.zig");

@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The SSD prefix cache reports what it stored beside what it wrote**: `/metrics` adds
+  `sushi:prefix_cache_store_bytes_total{kind}` and `/metrics.json` adds `prefix_cache_writes.stored_bytes`, the bytes the
+  cache's storage layer put on the SSD, by file kind.
 - **Each served architecture is a self-contained module**: Qwen3.8-Flash-Next, GLM-5.3-Flash, DeepSeek-V4.1-Flash and
   MiMo-V2.6-Flash each live behind one registry line, so `-Darchs` builds the engine with any of them left out, with
   every model's output unchanged.

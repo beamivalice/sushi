@@ -360,8 +360,10 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
   (a disconnect mid-decode; a request ended by its own stop sequence sets `Slot.stop_hit` first and counts as success), `sushi:request_failed_total` and a refusal before a slot
   (`sushi:request_rejected_total`: context overflow, memory preflight, `PrefillDoesNotFit`) move only their counter.
 - **SSD prefix-cache writes** ([engine-prefix-cache](engine-prefix-cache.md#write-counters)): `/metrics` carries
-  `sushi:prefix_cache_write_bytes_total{kind="kv|ssm|qsa|spec|ring|meta"}` and `sushi:prefix_cache_write_failed_bytes_total`;
-  `/metrics.json` carries `"prefix_cache_writes":{"written_bytes":{<kind>:n},"failed_bytes":n}` after `decode_serial`.
+  `sushi:prefix_cache_write_bytes_total{kind="kv|ssm|qsa|spec|ring|meta"}`, `sushi:prefix_cache_store_bytes_total{kind}`
+  (what the content-addressed layer stored; 0 on plain files) and `sushi:prefix_cache_write_failed_bytes_total`;
+  `/metrics.json` carries `"prefix_cache_writes":{"written_bytes":{<kind>:n},"stored_bytes":{<kind>:n},"failed_bytes":n}`
+  after `decode_serial`.
   Unlike the request counters they run from process start whatever turns metrics on, and the routes keep the 503-while-off
   rule. `/props settings.prefix_cache.disk_written_bytes` is that model's own total since its tier opened (`disk_stats`,
   the same sequence-locked publish as `disk_used_bytes`), so an unload and reload restarts it while the process total keeps it.

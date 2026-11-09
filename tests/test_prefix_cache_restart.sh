@@ -16,7 +16,11 @@
 #   [4] GLM (DFlash2 in the default boot): the assistant context restores beside the trunk (`dflash context
 #       restored`) and the per-draft rate stays within 5 points of the persist boot's.
 #   [5] qwen4 only: a restore wider than the fd limit (the restart boot runs under a lowered `ulimit -n`) succeeds,
-#       and an unreadable chunk falls back to a cold prefill that answers.
+#       and an unreadable chunk falls back to a cold prefill that answers. On the content-addressed layer (`v/` under
+#       the root) the chunk is its blocks: the packs are corrupted while the server is down and a third boot, which
+#       hashes each block on its first read, must fall back the same way.
+# The layout checks read plain files with `find`; on the layer, the restart's scan (it checks every chunk a manifest
+# names against its recorded size) and the persist boot's `complete on disk` chunk counts stand in for them.
 set -uo pipefail
 . "$(dirname "$0")/lib/boot.sh"
 
@@ -131,6 +135,15 @@ settle_disk() {
     done
 }
 per_draft() { blog | grep -o 'per_draft_pct=[0-9.]*' | tail -1 | cut -d= -f2; }
+layer() { [ -n "$(find "$CACHE" -maxdepth 3 -type d -name v 2> /dev/null | head -1)" ]; }
+# The most chunks one entry holds: plain chunk files, or on the layer the largest `complete on disk` count logged.
+chunks_now() {
+    if layer; then
+        blog | sed -n 's/.*complete on disk: [0-9]* tokens, \([0-9]*\) chunks.*/\1/p' | sort -n | tail -1 | grep . || echo 0
+    else
+        find "$CACHE" -name 'c*.safetensors' 2> /dev/null | wc -l | tr -d ' '
+    fi
+}
 
 echo "== boot 1: persist ($ARCH)"
 boot
@@ -169,15 +182,20 @@ if [ "$FD_ARM" = 1 ]; then
     for _ in 1 2 3 4 5 6; do
         ask "$WORK/long.json" > /dev/null
         settle_disk
-        [ "$(find "$CACHE" -name 'c*.safetensors' 2> /dev/null | wc -l)" -ge 30 ] && break
+        [ "$(chunks_now)" -ge 30 ] && break
     done
     TOP_FD=$(lsof -a -p "$SUSHI_PID" -d '0-65535' -F f 2> /dev/null | sed -n 's/^f//p' | sort -n | tail -1)
 fi
+CHUNKS=$(chunks_now)
 sushi_stop 0
 
-META=$(find "$CACHE" -name meta.json 2> /dev/null | wc -l | tr -d ' ')
-CHUNKS=$(find "$CACHE" -name 'c*.safetensors' 2> /dev/null | wc -l | tr -d ' ')
-check "on-disk layout: at least one meta.json and two chunks ($META meta, $CHUNKS chunks)" "$([ "$META" -ge 1 ] && [ "$CHUNKS" -ge 2 ] && echo 1 || echo 0)" "1"
+LAYER=0
+layer && LAYER=1
+if [ "$LAYER" = 0 ]; then
+    META=$(find "$CACHE" -name meta.json 2> /dev/null | wc -l | tr -d ' ')
+    CHUNKS=$(find "$CACHE" -name 'c*.safetensors' 2> /dev/null | wc -l | tr -d ' ')
+    check "on-disk layout: at least one meta.json and two chunks ($META meta, $CHUNKS chunks)" "$([ "$META" -ge 1 ] && [ "$CHUNKS" -ge 2 ] && echo 1 || echo 0)" "1"
+fi
 
 echo "== boot 2: restart"
 if [ "$FD_ARM" = 1 ]; then
@@ -190,6 +208,11 @@ if [ "$FD_ARM" = 1 ]; then
     ulimit -S -n "$FD_SOFT"
 else
     boot
+fi
+if [ "$LAYER" = 1 ]; then
+    SCANNED=$(blog | sed -n 's/.*\[disk-cache\] scanned \([0-9]*\) persisted entries.*/\1/p' | sort -n | tail -1)
+    check "on-disk layout (content-addressed): the restart's scan reads ${SCANNED:-0} entries, the largest $CHUNKS chunks" \
+        "$([ "${SCANNED:-0}" -ge 1 ] && [ "$CHUNKS" -ge 2 ] && echo 1 || echo 0)" "1"
 fi
 read -r CR PR <<< "$(ask "$WORK/main.json")"
 cp "$WORK/reply" "$WORK/main.restart"
@@ -220,10 +243,129 @@ if [ "$FD_ARM" = 1 ]; then
     read -r CL _ <<< "$(ask "$WORK/long.json")"
     check "a restore wider than the fd limit engages (cached $CL)" "$(ge "$CL" 30000)" "1"
     # The unreadable chunk: restore fails and a cold prefill still answers.
-    chmod 000 "$(find "$CACHE" -name 'c000002.safetensors' | head -1)"
+    if [ "$LAYER" = 1 ]; then
+        # A pack is held open from the attach and a block this process read is not hashed again: corrupt one
+        # chunk's blocks while the server is down, then a fresh boot's first read of them finds it.
+        sushi_stop 0
+        python3 -I - "$CACHE" <<'PY'
+# Replays the layer's snapshot and journal (prefix_vfs.zig frames) to the block refs of each file, then flips one
+# byte in every block of the longest record's c000002.safetensors.
+import struct
+import sys
+from pathlib import Path
+
+TAGS = {1: "mkdir", 2: "put", 3: "edit", 4: "link", 5: "unlink", 6: "rename", 7: "deltree", 8: "touch", 9: "state"}
+
+
+class Dec:
+    def __init__(self, b):
+        self.b, self.p = b, 0
+
+    def int(self, fmt):
+        v = struct.unpack_from("<" + fmt, self.b, self.p)[0]
+        self.p += struct.calcsize(fmt)
+        return v
+
+    def str(self):
+        n = self.int("H")
+        s = self.b[self.p:self.p + n].decode()
+        self.p += n
+        return s
+
+    def refs(self):
+        keep, n = self.int("I"), self.int("I")
+        out = []
+        for _ in range(n):
+            xxh, wy, pack, off, ln = self.int("Q"), self.int("Q"), self.int("I"), self.int("I"), self.int("I")
+            self.int("B")
+            self.int("I")
+            self.int("I")
+            out.append((pack, off, ln))
+        return keep, out
+
+
+def frames(data):
+    pos = 0
+    while pos + 12 <= len(data):
+        ln = struct.unpack_from("<I", data, pos)[0]
+        if ln > len(data) - pos - 12:
+            return
+        yield data[pos + 12:pos + 12 + ln]
+        pos += 12 + ln
+
+
+def replay(vdir):
+    files, applied = {}, 0
+
+    def apply(payload):
+        d = Dec(payload)
+        tag, seq = TAGS[d.int("B")], d.int("Q")
+        if tag in ("put", "edit"):
+            path = d.str()
+            if tag == "put":
+                d.int("Q")
+                d.int("q")
+                d.int("B")
+            else:
+                d.int("q")
+            keep, refs = d.refs()
+            files[path] = files.get(path, [])[:keep] + refs
+        elif tag == "link":
+            a, b = d.str(), d.str()
+            files[b] = list(files.get(a, []))
+        elif tag == "rename":
+            a, b = d.str(), d.str()
+            for k in [k for k in files if k == a or k.startswith(a + "/")]:
+                files[b + k[len(a):]] = files.pop(k)
+        elif tag in ("unlink", "deltree"):
+            p = d.str()
+            for k in [k for k in files if k == p or k.startswith(p + "/")]:
+                del files[k]
+        elif tag == "state":
+            d.int("Q")
+            d.int("q")
+            return d.int("Q")
+        return seq
+
+    snap = vdir / "snapshot"
+    if snap.exists():
+        for f in frames(snap.read_bytes()):
+            applied = max(applied, apply(f))
+    last = applied
+    for f in frames((vdir / "journal").read_bytes()):
+        d = Dec(f)
+        d.int("B")
+        if d.int("Q") > last:
+            apply(f)
+    return files
+
+
+vdir = next(Path(sys.argv[1]).glob("*/v"))
+files = replay(vdir)
+chunks = {}
+for k in files:
+    e, _, name = k.partition("/")
+    if name.startswith("c") and name.endswith(".safetensors"):
+        chunks[e] = chunks.get(e, 0) + 1
+target = max(chunks, key=chunks.get) + "/c000002.safetensors"
+for pack, off, ln in files[target]:
+    with open(vdir / "packs" / f"{pack}.pack", "r+b") as f:
+        f.seek(off + ln // 2)
+        b = f.read(1)
+        f.seek(off + ln // 2)
+        f.write(bytes([b[0] ^ 0xFF]))
+print(f"  corrupted the {len(files[target])} blocks of {target}")
+PY
+        boot
+    else
+        chmod 000 "$(find "$CACHE" -name 'c000002.safetensors' | head -1)"
+    fi
     read -r CU _ <<< "$(ask "$WORK/long.json")"
     check "an unreadable chunk: the restore fails and the request still answers" "$([ "$CU" != ERR ] && echo 1 || echo 0)" "1"
-    check "  with the fallback named and no failed prefill" "$(blog | grep -q 'restore failed: .* falling back' && ! blog | grep -q 'prefill failed' && echo 1 || echo 0)" "1"
+    # Counted, never `grep -q`: an early exit SIGPIPEs the reader, and pipefail turns a match into a miss.
+    FALLBACKS=$(blog | grep -c 'restore failed: .* falling back')
+    FAILED=$(blog | grep -c 'prefill failed')
+    check "  with the fallback named and no failed prefill ($FALLBACKS fallbacks, $FAILED failed)" "$([ "$FALLBACKS" -ge 1 ] && [ "$FAILED" = 0 ] && echo 1 || echo 0)" "1"
 fi
 sushi_stop 0
 chmod -R u+rw "$CACHE" 2> /dev/null

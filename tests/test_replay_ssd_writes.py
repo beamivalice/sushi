@@ -42,6 +42,15 @@ class ReplayTests(unittest.TestCase):
         self.assertIsNone(replay.ceiling_failure(rows, None))
         self.assertIsNone(replay.ceiling_failure([{"written_mb": 9.0, "later": False}], 1.0))
 
+    def test_ceiling_reads_what_the_layer_stored_when_it_reports_it(self):
+        rows = [{"written_mb": 400.0, "stored_mb": 0.0, "later": True}]
+        self.assertIn("passes the ceiling", replay.ceiling_failure(rows, 300.0))
+        rows = [{"written_mb": 400.0, "stored_mb": 90.0, "later": True}, {"written_mb": 400.0, "stored_mb": 110.0, "later": True}]
+        self.assertEqual(replay.later_mean(rows, "stored_mb"), 100.0)
+        self.assertIsNone(replay.ceiling_failure(rows, 300.0))
+        self.assertIn("stored", replay.ceiling_failure(rows, 50.0))
+        self.assertIn("passes the ceiling", replay.ceiling_failure([{"written_mb": 400.0, "later": True}], 300.0))
+
     def test_a_conversation_is_the_same_text_on_every_build(self):
         cfg = replay.PACKS["qwen-stq"]
         a = replay.Conv(0, cfg, 600)

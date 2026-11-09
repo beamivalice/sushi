@@ -20,6 +20,7 @@ const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const model_mod = @import("model.zig");
 const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const kv_disk_fs = @import("kv_disk_fs.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
@@ -5353,18 +5354,20 @@ test "a ringed SSD entry bills its ring files, and a truncated one is salvaged a
         try testing.expectEqual(@as(u32, prompt), e.rings[0].pos);
         try testing.expectEqual(@as(u32, toks.len), e.rings[1].pos);
         var on_disk: u64 = 0;
-        var dir = try tmp.dir.openDir(io, "fp-ring-salvage/e1", .{ .iterate = true });
-        defer dir.close(io);
-        var it = dir.iterate();
-        while (try it.next(io)) |f| {
+        var eb: [std.fs.max_path_bytes]u8 = undefined;
+        const edir = try std.fmt.bufPrint(&eb, "{s}/fp-ring-salvage/e1", .{base});
+        const names = try kv_disk_fs.testList(io, edir);
+        defer kv_disk_fs.Fs.freeEntries(testing.allocator, names);
+        for (names) |f| {
             if (std.mem.eql(u8, f.name, "meta.json")) continue;
-            on_disk += (try dir.statFile(io, f.name, .{})).size;
+            var fb: [std.fs.max_path_bytes]u8 = undefined;
+            on_disk += kv_disk_fs.testSize(io, try std.fmt.bufPrint(&fb, "{s}/{s}", .{ edir, f.name })) orelse return error.TestUnexpectedResult;
         }
         try testing.expectEqual(on_disk, d.total_bytes);
     }
 
     // kill -9 mid-write: the prompt-end file no longer matches its record.
-    try tmp.dir.writeFile(io, .{ .sub_path = "fp-ring-salvage/e1/r0000700.safetensors", .data = "trunc" });
+    try kv_disk_fs.testWriteAt(io, base, "fp-ring-salvage/e1/r0000700.safetensors", "trunc");
     {
         var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-salvage", 0, 128);
@@ -5385,7 +5388,7 @@ test "a ringed SSD entry bills its ring files, and a truncated one is salvaged a
     }
 
     // With no ring file left the chunks restore nothing: the entry goes.
-    try tmp.dir.writeFile(io, .{ .sub_path = "fp-ring-salvage/e1/r0001300.safetensors", .data = "trunc" });
+    try kv_disk_fs.testWriteAt(io, base, "fp-ring-salvage/e1/r0001300.safetensors", "trunc");
     var d = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-salvage", 0, 128);
     defer d.deinit();
     try testing.expectEqual(@as(usize, 0), d.entryCount());
@@ -5786,11 +5789,11 @@ test "HotPrefixCache: an SSD entry that fails to restore is poisoned, not retrie
     }
     // A chunk whose bytes rotted at the same size passes the scan's size check and fails the load.
     const chunk = "fp-bad/e1/c000000.safetensors";
-    const st = try tmp.dir.statFile(io, chunk, .{});
+    const st = kv_disk_fs.testStatAt(io, base, chunk) orelse return error.TestUnexpectedResult;
     const junk = try testing.allocator.alloc(u8, @intCast(st.size));
     defer testing.allocator.free(junk);
     @memset(junk, 0xff);
-    try tmp.dir.writeFile(io, .{ .sub_path = chunk, .data = junk });
+    try kv_disk_fs.testWriteAt(io, base, chunk, junk);
 
     var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-bad", 0, 128);
@@ -6693,7 +6696,7 @@ test "a fork's SSD entry keeps its donor's ring checkpoint, so a restart restore
         try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
     }
     // The donor's SSD entry goes; the fork's linked chunks outlive it.
-    try tmp.dir.deleteTree(io, "fp-ring-fork-disk/e1");
+    kv_disk_fs.testDeleteTreeAt(io, base, "fp-ring-fork-disk/e1");
 
     var hc2 = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
     defer hc2.deinit();
@@ -10206,7 +10209,7 @@ test "SSD-first: the durability check STATS the chunks — a truncated file is n
     const id = hc.disk.?.entries.items[0].id;
     var sub: [64]u8 = undefined;
     const rel = try std.fmt.bufPrint(&sub, "fp-stat/e{d}/c000002.safetensors", .{id});
-    try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = "short" });
+    try kv_disk_fs.testWriteAt(io, buf[0..root_len], rel, "short");
 
     hc.spillIdleEntries(s);
     try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);

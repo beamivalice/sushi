@@ -18,6 +18,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 | `src/disk_format.zig` | The SSD record's wire format, host tier: the safetensors header, `IndexEntry` and the `meta.json` manifest (render, version stamp, parse). [Policy and format](#policy-format) |
 | `src/disk_placement.zig` | The SSD tier's default budget (`resolveDiskBudget`), cache roots and model fingerprint, and the startup/usage lines |
 | `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
+| `src/kv_disk_fs.zig` | Every file operation of the SSD tier, on plain files or the content-addressed layer ([file layer](#file-layer)) |
+| `src/prefix_vfs.zig`, `src/prefix_vfs_tensors.zig` | The content-addressed layer: blocks, packs, journal, snapshot; tensor files as row-group blocks ([file layer](#file-layer)) |
 | `src/arch/prefix.zig` | The seam: dispatch over the arch's `prefix` module (restore target `State`, per-entry `Rows`, per-cache `CacheState`, the hooks below, the QSA-history `disk` section, the SSM-entry `aux` accelerators). The three files above name no arch. [Arch seam](#arch-seam) |
 | `src/disk_write_stats.zig` | Cumulative write bytes by file kind, per tier and per process ([write counters](#write-counters)) |
 | `src/restore_dump.zig` | Prefix-cache restore diagnostics (`tests/diff_restore_dump.py`) |
@@ -518,6 +520,45 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - A binary older than the lock takes none, so beside a newer one it still shares the root; only the token check
   covers that.
 
+<a id="file-layer"></a>
+## The file layer: plain files or content-addressed
+
+- **Every file operation of the tier goes through `DiskTier.fs`** (`src/kv_disk_fs.zig`), on one of two backends:
+  `cas` (the default), the content-addressed layer at `<root>/v/` (`prefix_vfs.zig`: packs, journal, snapshot), or
+  `real`, the plain files `<root>/e<id>/...`. `SUSHI_PREFIX_FS=real|cas` picks one when the tier starts, until the
+  `real` arm goes; the `background writer armed (fs=...)` line names it.
+- **One call is one filesystem operation of the plain path, at the same point, by the same path.** A staged file is
+  one writer op (same FIFO, permit, fence and `isPending`), made visible where the plain file's rename lands and no
+  sooner than the plain write would land (`Writer.calibratePace` at arm). A file past the writer's part size goes as
+  the plain file's parts do: parts of one ticket (`Vfs.holdPart`), each its own op that appends its blocks, the last
+  journaling and publishing, so the inference thread only reads back and copies, as on plain files. A synchronous call (a delete, a link,
+  `tokens.bin`, the synchronous save, a manifest without the writer) lands on the calling thread.
+- **The layer answers as the plain files do**: names, sizes, link counts, inode classes, mtime order, listings; a
+  restore loads bitwise the same arrays (`prefix_vfs_tensors.loadTensors`; an unreadable file fails as
+  `mlx_load_safetensors` does, `MlxError`). So every decision of the tier reads today's answers.
+- **A KV chunk is stored by absolute row** (axis 2 from `c0`, 256-token groups): an extended chunk keeps its full
+  groups, a rewrite of identical bytes stores nothing. Every other file is whole-file blocks (the growing sidecars come
+  next).
+- **Both save arms write one encoding** (`disk_format.encodeHeader`): the synchronous arm wrote
+  `mlx_save_safetensors`'s bytes, 2-18 bytes off the writer's for the same tensors, so the size the budget reads
+  followed the arm. Production reaches the synchronous arm only when its writer fails to start; the pin test arms the
+  writer as production does.
+- **The budget sees the volume as the plain files would leave it**: `refreshDiskBudget` reads free + physical -
+  logical (`Fs.freeAsFiles`); `tierBytes` counts a layer's pack, journal and snapshot bytes; the sibling sweep reads a
+  layer's entries (manifest mtime, a shared inode once) and deletes through it. The admin listing reads a layer
+  read-only (`Options.read_only`: it replays the journal and changes no file, so a live tier's layer is safe) and
+  lists its entries, file bytes and newest manifest as the plain files would.
+- **A `cas` attach deletes the plain-file `e<id>` records under its root** (`DiskTier.dropPlainRecords`), once, under
+  the root lock and before its scan, with one `removed N plain-file entries` line: the layer would neither restore
+  nor free them, so they would sit beside it, up to a second budget on disk. Nothing is converted. A `real` attach
+  keeps them as its entries; the root's `v/` and every other name are left alone.
+- `SUSHI_TEST_CRASH_AFTER_LANDINGS` counts an op's publish as a landing and never the pace probe's file (only a `cas`
+  tier writes one), so the crash flow cuts at the same file on both backends.
+- **Tests run on both backends**: `zig build test` runs the tier bucket (`test-kv_disk_cache`) a second time with
+  `SUSHI_PREFIX_FS=real`. A test reads or damages a record's files through `kv_disk_fs.test*` (a live tier's layer, or
+  one opened for the call); the SHA-256 pins hash each file's plain-file image (`regenerate`); `random commits,
+  restores, evictions and restarts answer alike` drives both backends with one sequence and compares every answer.
+
 <a id="ssd-flush"></a>
 ## The SSD flush
 
@@ -609,6 +650,8 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 Cumulative bytes the SSD tier wrote to the filesystem, by file kind (`src/disk_write_stats.zig`): one `Stats` per tier
 (`/props` per model) chained into the process total (`/metrics`, `/metrics.json`; [server-http-apis](server-http-apis.md)).
 They count what the filesystem accepted, never what was submitted, and run from process start whatever turns `--metrics` on.
+`written` is the files' bytes, the same on either [file layer](#file-layer); `stored` is what the content-addressed layer
+added to its packs and journal to hold them (0 on plain files), so on that layer `stored` is what the SSD took.
 
 | kind | counts | written by |
 |---|---|---|
@@ -620,8 +663,9 @@ They count what the filesystem accepted, never what was submitted, and run from 
 | `meta` | `meta.json` manifests and `tokens.bin` records | `writeMeta`, the token record in `appendCommitWithSpecBounded` |
 
 - **Every safetensors file goes through `DiskTier.saveNamed(..., kind, ...)`**, which takes the kind: staged through the
-  writer thread (`kv_disk_writer.zig` counts at the landing, per part of a file staged in parts) or written synchronously
-  (counted at the return, the file's size). `meta.json` and `tokens.bin` are the only other writers. A new file kind is a
+  writer thread (`kv_disk_writer.zig` counts at the landing, per part of a file staged in parts; an op of the
+  content-addressed layer counts its file's size as written and the pack and journal bytes it added as stored) or
+  written synchronously (counted at the return, the file's size). `meta.json` and `tokens.bin` are the only other writers. A new file kind is a
   new `Kind` variant and a column here, never a filename test.
 - **A rewrite counts its full bytes again**: the partial tail chunk of an extended entry, a longer `qsa.safetensors`
   history, a replaced `spec.safetensors` and every `meta.json` rewrite (including the LRU re-index after a restore).
@@ -638,7 +682,8 @@ They count what the filesystem accepted, never what was submitted, and run from 
   it while the process counters keep it.
 - Guards: `disk_write_stats.zig` (accounting and both renderings), `kv_disk_writer.zig` (`landed bytes count under their
   kind`, `a failed, dropped or fenced blob`, `a file staged in parts`), `DiskTier write counters:` in `kv_disk_cache.zig`
-  and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache write counters` in `metrics.zig`.
+  (on the layer, `stored` equals its physical growth) and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache
+  write counters` in `metrics.zig`.
 
 ## Restore tape and write replay
 
@@ -657,8 +702,10 @@ and field that differ, so a change to the cache's storage is proved against a ba
 - `tests/replay_ssd_writes.py FLOW` drives one flow (agent loop, retry, fork, far divergence, image chain, restart, crash,
   budget, RAM tier, four GLM conversations, DeepSeek live state, MiMo ring) against private servers, greedy with a fixed
   seed and one request in flight, and prints the bytes written by kind per request. `--twice` fails unless two runs write
-  one tape; `--max-later-turn-mb` fails when a later turn writes more. The `crash` flow kills the server with `kill -9`
-  once the writer is idle and after the k-th landing (`SUSHI_TEST_CRASH_AFTER_LANDINGS`, counted at the writer's rename).
+  one tape; `--max-later-turn-mb` fails when a later turn's mean writes more (on the content-addressed layer, its mean
+  `stored`). The `crash` flow kills the server with `kill -9`
+  once the writer is idle and after the k-th landing (`SUSHI_TEST_CRASH_AFTER_LANDINGS`, counted at the writer's rename
+  or an op's publish).
 - Baselines live in `~/.sushi/runs/pcr-tapes/<commit>/<flow>.tape`, recorded on the tree whose behaviour is the reference.
 
 ## Tier counters

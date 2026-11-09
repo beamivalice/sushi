@@ -186,6 +186,10 @@ pub const Writer = struct {
         if (self.stats) |st| st.recordWritten(kind, n);
     }
 
+    fn noteStored(self: *Writer, kind: write_stats.Kind, n: u64) void {
+        if (self.stats) |st| st.recordStored(kind, n);
+    }
+
     fn noteFailed(self: *Writer, n: usize) void {
         if (self.stats) |st| st.recordFailed(n);
     }
@@ -212,10 +216,17 @@ pub const Writer = struct {
     /// Stage one op of the content-addressed layer behind the files already queued. Takes ownership of
     /// `path` and of the ticket on every path, including errors (a dropped ticket is aborted).
     pub fn submitOp(self: *Writer, path: []u8, sink: OpSink, op: Op, kind: write_stats.Kind) void {
+        self.submitOpPart(path, sink, op, .whole, kind);
+    }
+
+    /// `submitOp` for one part of a ticket held in parts (`Vfs.holdPart`): each part appends its blocks, the
+    /// last also journals and publishes. A part that cannot land drops the rest of its file, as a file's does.
+    pub fn submitOpPart(self: *Writer, path: []u8, sink: OpSink, op: Op, part: Part, kind: write_stats.Kind) void {
         self.stage(.{
             .path = path,
             .bytes = @constCast(@as([]const u8, &.{})),
             .epoch = 0,
+            .part = part,
             .kind = kind,
             .op = .{ .sink = sink, .ticket = op.ticket, .host_bytes = op.host_bytes, .logical_bytes = op.logical_bytes },
         });
@@ -504,6 +515,10 @@ pub const Writer = struct {
 
     /// Caller holds the mutex.
     fn recordLandingLocked(self: *Writer, ticket: u64, bytes: u64) void {
+        for (self.landings.items) |*l| if (l.ticket == ticket) {
+            l.bytes += bytes;
+            return;
+        };
         if (self.landings.items.len >= MAX_LANDINGS) _ = self.landings.orderedRemove(0);
         self.landings.append(self.allocator, .{ .ticket = ticket, .bytes = bytes }) catch {};
     }
@@ -533,20 +548,22 @@ pub const Writer = struct {
         };
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.noteWritten(kind, n);
+        self.noteStored(kind, n);
         self.recordLandingLocked(ticket, n);
         return n;
     }
 
-    /// Append the blocks, wait out the file write's duration, then journal and publish. The blocks are
-    /// unreferenced until the journal record, so the wait leaves the namespace as the plain path's `tmp` does.
-    fn landPaced(self: *Writer, op: QueuedOp) !u64 {
+    /// Append the blocks, wait out the file write's duration, then (`finish`: a whole file or its last part)
+    /// journal and publish. The blocks are unreferenced until the journal record, so the wait leaves the
+    /// namespace as the plain path's `tmp` does.
+    fn landPaced(self: *Writer, op: QueuedOp, finish: bool) !u64 {
         const started = io_util.Stopwatch.init(self.io);
         self.land_mutex.lockUncancelable(self.io);
         const appended = op.sink.appendBlocks(op.sink.ctx, op.ticket);
         self.land_mutex.unlock(self.io);
         const pack = try appended;
         self.padToFloor(started, op.logical_bytes);
+        if (!finish) return pack;
         self.land_mutex.lockUncancelable(self.io);
         defer self.land_mutex.unlock(self.io);
         return pack + try finishSteps(op.sink, op.ticket);
@@ -609,6 +626,9 @@ pub const Writer = struct {
             var dropped = false;
             var landed: u64 = blob.bytes.len;
             var landed_ticket: ?u64 = null;
+            const logical: u64 = if (blob.op) |o| o.logical_bytes else blob.bytes.len;
+            const is_op = blob.op != null;
+            const finish = blob.part == .whole or blob.part == .last;
             if (broken or blob.epoch != live_epoch) {
                 dropped = true;
             } else if (inject) {
@@ -616,21 +636,24 @@ pub const Writer = struct {
                 self.noteFailure(blob.path, "InjectedWriteFailure");
                 dropped = true;
             } else if (blob.op) |op| {
-                if (self.landPaced(op)) |n| {
+                if (self.landPaced(op, finish)) |n| {
                     landed = n;
                     landed_ticket = op.ticket;
                     blob.op = null;
+                    if (finish) noteLanding();
                 } else |err| {
                     log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ @errorName(err), blob.path });
                     self.noteFailure(blob.path, @errorName(err));
                     dropped = true;
                 }
-            } else if (writePart(blob.path, blob.bytes, blob.part)) |_| {} else |err| {
+            } else if (writePart(blob.path, blob.bytes, blob.part)) |_| {
+                if (blob.part == .whole or blob.part == .last) noteLanding();
+            } else |err| {
                 log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ @errorName(err), blob.path });
                 self.noteFailure(blob.path, @errorName(err));
                 dropped = true;
             }
-            if (dropped and blob.part != .whole) unlinkTmp(blob.path);
+            if (dropped and blob.part != .whole and !is_op) unlinkTmp(blob.path);
 
             self.mutex.lockUncancelable(self.io);
             if (blob.part == .first or blob.part == .middle) {
@@ -642,8 +665,12 @@ pub const Writer = struct {
             } else {
                 if (blob.part == .whole or blob.part == .last) self.files_written += 1;
                 self.bytes_written += landed;
-                self.noteWritten(blob.kind, landed);
-                if (landed_ticket) |t| self.recordLandingLocked(t, landed);
+                // An op counts its file's bytes as written and what the layer added as stored.
+                self.noteWritten(blob.kind, logical);
+                if (landed_ticket) |t| {
+                    self.noteStored(blob.kind, landed);
+                    self.recordLandingLocked(t, landed);
+                }
             }
             self.inflight_bytes = 0;
             self.inflight_path = null;
@@ -717,10 +744,14 @@ fn writePart(path: []const u8, bytes: []const u8, part: Part) !void {
     final_buf[path.len] = 0;
     const final: [:0]const u8 = final_buf[0..path.len :0];
     if (std.c.rename(tmp.ptr, final.ptr) != 0) return error.RenameFailed;
-    noteLanding();
 }
 
 var landings: std.atomic.Value(u64) = .init(0);
+
+/// Files and ops landed in this process so far: what `SUSHI_TEST_CRASH_AFTER_LANDINGS` counts.
+pub fn landingCount() u64 {
+    return landings.load(.monotonic);
+}
 var crash_after_read: bool = false;
 var crash_after: ?u64 = null;
 
@@ -730,15 +761,15 @@ pub fn parseCrashAfter(raw: ?[*:0]const u8) ?u64 {
     return if (k == 0) null else k;
 }
 
-/// Test seam, `SUSHI_TEST_CRASH_AFTER_LANDINGS=k`: the process is killed once k files have landed, so a crash
-/// test can cut the writer between two renames.
+/// Test seam, `SUSHI_TEST_CRASH_AFTER_LANDINGS=k`: the process is killed once the writer has landed k of a tier's
+/// files (a rename, or an op's publish; never the pace probe), so a crash test can cut it between two landings.
 fn noteLanding() void {
     if (!crash_after_read) {
         crash_after = parseCrashAfter(std.c.getenv("SUSHI_TEST_CRASH_AFTER_LANDINGS"));
         crash_after_read = true;
     }
-    const k = crash_after orelse return;
-    if (landings.fetchAdd(1, .monotonic) + 1 == k) _ = std.c.kill(std.c.getpid(), .KILL);
+    const n = landings.fetchAdd(1, .monotonic) + 1;
+    if (crash_after == n) _ = std.c.kill(std.c.getpid(), .KILL);
 }
 
 // ── Tests ──
@@ -1348,7 +1379,7 @@ test "kv_disk_writer op: the permit bounds the host bytes staged ops hold" {
     try testing.expect(got.load(.acquire));
 }
 
-test "kv_disk_writer op: a ticket's landed bytes equal the pack and journal growth it caused" {
+test "kv_disk_writer op: a ticket's landed bytes equal the pack and journal growth it caused, counted as stored" {
     var fake = FakeSink.init(testing.io);
     defer fake.deinit();
     fake.blocks[1] = 5000;
@@ -1369,10 +1400,43 @@ test "kv_disk_writer op: a ticket's landed bytes equal the pack and journal grow
     try testing.expectEqual(@as(?u64, 877), w.takeLanding(3));
     try testing.expectEqual(@as(?u64, null), w.takeLanding(3));
     const s = stats.snapshot();
-    try testing.expectEqual(@as(u64, 5200), s.written[@backingInt(StatKind.qsa)]);
-    try testing.expectEqual(@as(u64, 877), s.written[@backingInt(StatKind.ssm)]);
-    try testing.expectEqual(fake.pack_bytes + fake.journal_bytes, s.totalWritten());
-    try testing.expectEqual(w.bytes_written, s.totalWritten());
+    try testing.expectEqual(@as(u64, 5200), s.stored[@backingInt(StatKind.qsa)]);
+    try testing.expectEqual(@as(u64, 877), s.stored[@backingInt(StatKind.ssm)]);
+    try testing.expectEqual(fake.pack_bytes + fake.journal_bytes, s.totalStored());
+    try testing.expectEqual(w.bytes_written, s.totalStored());
+    // `written` is each file's own size, as the plain files would have taken.
+    try testing.expectEqual(@as(u64, 18000), s.written[@backingInt(StatKind.qsa)]);
+    try testing.expectEqual(@as(u64, 2000), s.written[@backingInt(StatKind.ssm)]);
+}
+
+test "kv_disk_writer op: a file staged in parts appends each part, publishes at the last, and a dropped part drops the rest" {
+    var fake = FakeSink.init(testing.io);
+    defer fake.deinit();
+    fake.blocks[1] = 300;
+    var stats: write_stats.Stats = .{};
+    var w = Writer.init(testing.allocator, testing.io);
+    w.stats = &stats;
+    try w.start();
+    defer w.deinit();
+    for ([_]Part{ .first, .middle, .last }) |part| {
+        w.submitOpPart(try opPath("s0000128"), fake.sink(), .{ .ticket = 1, .host_bytes = 64, .logical_bytes = 64 }, part, .ssm);
+    }
+    w.drain();
+    try testing.expectEqualSlices(u64, &.{1}, fake.published.items);
+    try testing.expectEqual(@as(usize, 0), fake.aborted.items.len);
+    try testing.expectEqual(@as(?u64, 3 * 300 + 100), w.takeLanding(1));
+    try testing.expectEqual(@as(u64, 3 * 300 + 100), stats.snapshot().stored[@backingInt(StatKind.ssm)]);
+    try testing.expectEqual(@as(u64, 3 * 64), stats.snapshot().written[@backingInt(StatKind.ssm)]);
+
+    fake.fail_append = 2;
+    for ([_]Part{ .first, .middle, .last }) |part| {
+        w.submitOpPart(try opPath("s0000256"), fake.sink(), .{ .ticket = 2, .host_bytes = 64, .logical_bytes = 64 }, part, .ssm);
+    }
+    w.drain();
+    try testing.expect(!fake.isVisible(2));
+    try testing.expect(std.mem.indexOfScalar(u64, fake.aborted.items, 2) != null);
+    try testing.expectEqual(@as(u64, 3 * 64), stats.snapshot().failed);
+    try testing.expectEqual(@as(u64, 3 * 64), stats.snapshot().written[@backingInt(StatKind.ssm)]);
 }
 
 test "kv_disk_writer op: an op stays pending and unpublished for as long as the file write of its logical bytes takes" {
@@ -1453,7 +1517,8 @@ test "kv_disk_writer op: landNow lands on the caller, serialized with the writer
     try testing.expectEqual(@as(u64, 1100), n);
     try testing.expect(fake.isVisible(1));
     try testing.expectEqual(@as(?u64, 1100), w.takeLanding(1));
-    try testing.expectEqual(@as(u64, 1100), stats.snapshot().written[@backingInt(StatKind.meta)]);
+    try testing.expectEqual(@as(u64, 1100), stats.snapshot().stored[@backingInt(StatKind.meta)]);
+    try testing.expectEqual(@as(u64, 0), stats.snapshot().totalWritten());
 
     try w.start();
     defer w.deinit();
@@ -1479,6 +1544,26 @@ test "kv_disk_writer op: deinit lands what a started writer holds and releases w
     defer idle.deinit();
     try submitFakeOp(&idle, &fake, "c", 2, 64, .kv);
     try testing.expectEqualSlices(u64, &.{2}, fake.aborted.items);
+}
+
+test "kv_disk_writer: the crash seam counts the files and ops a tier lands, never the pace probe" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    var fake = FakeSink.init(testing.io);
+    defer fake.deinit();
+    var w = Writer.init(testing.allocator, testing.io);
+    defer w.deinit();
+    const before = landings.load(.monotonic);
+    try w.calibratePace(root);
+    try testing.expectEqual(before, landings.load(.monotonic));
+    w.pace_bytes_per_s = 0;
+    try w.start();
+    w.submit(try std.fmt.allocPrint(testing.allocator, "{s}/c000000.safetensors", .{root}), try testing.allocator.dupe(u8, "file"), .kv);
+    try submitFakeOp(&w, &fake, "c000001.safetensors", 1, 64, .kv);
+    w.drain();
+    try testing.expectEqual(before + 2, landings.load(.monotonic));
 }
 
 test "parseCrashAfter: a positive count arms the seam, anything else leaves it off" {

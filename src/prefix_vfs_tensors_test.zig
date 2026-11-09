@@ -187,8 +187,9 @@ fn readWhole(path: []const u8) ![]u8 {
     return kv_disk_cache.readFileAlloc(ta, tio, path, 1 << 30) orelse error.FileNotFound;
 }
 
-/// One kind of file written by the tier's two arms (the writer's staged encoder and `mlx_save_safetensors`) and by the
-/// VFS: the loads agree on every name, dtype, shape, byte and metadata value, and the VFS size is the writer arm's.
+/// One kind of file written by the plain-file tier's two arms (the writer's staged encoder and the synchronous save)
+/// and by the VFS: the loads agree on every name, dtype, shape, byte and metadata value, and the VFS size is the writer
+/// arm's.
 fn expectKindMatchesTier(spec: KindSpec, sliced: bool) !void {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -202,7 +203,7 @@ fn expectKindMatchesTier(spec: KindSpec, sliced: bool) !void {
     defer ta.free(staged_path);
 
     {
-        var tier = try DiskTier.init(ta, tio, env.root(), "fp-sync", 0, 128);
+        var tier = try DiskTier.initBackend(ta, tio, env.root(), "fp-sync", 0, 128, .real);
         defer tier.deinit();
         var b = try Built.init(spec, sliced);
         defer b.deinit();
@@ -210,7 +211,7 @@ fn expectKindMatchesTier(spec: KindSpec, sliced: bool) !void {
     }
     var staged_size: u64 = 0;
     {
-        var tier = try DiskTier.init(ta, tio, env.root(), "fp-staged", 0, 128);
+        var tier = try DiskTier.initBackend(ta, tio, env.root(), "fp-staged", 0, 128, .real);
         defer tier.deinit();
         tier.enableBackgroundWriter();
         var b = try Built.init(spec, sliced);
@@ -670,7 +671,7 @@ fn expectProductionChunks(config: kv_quant.KVQuantConfig, dtype: mlx.mlx_dtype) 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var tier = try DiskTier.init(ta, tio, env.root(), "fp-prod", 0, 0);
+    var tier = try DiskTier.initBackend(ta, tio, env.root(), "fp-prod", 0, 0, .real);
     defer tier.deinit();
     tier.enableBackgroundWriter();
     var cache = try trunk.KVCache.initWithConfig(ta, 3, config);

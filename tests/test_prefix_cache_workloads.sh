@@ -129,7 +129,7 @@ u_b2=$(hot_turn "$B1" "$B_ASSISTANT" "Now explain when each is preferred in prac
 hot_log=$(log_after "$mark")
 hits=$(echo "$hot_log" | grep -cE "\[(hot-cache|dsv41-prefix)\] (reused|full reuse)" || true)
 if [ "$hits" -ge 2 ]; then echo -e "${GREEN}PASS${NC} [6] the follow-ups reuse the hot cache ($hits reuse events)"; else echo -e "${RED}FAIL${NC} [6] expected >= 2 hot-cache reuse events, got $hits"; echo "$hot_log" | grep '\[hot-cache\]'; FAIL=1; fi
-if echo "$hot_log" | grep -qE "entry [0-9]+/[2-9][0-9]*\)"; then echo -e "${GREEN}PASS${NC} [6] the cache held two or more entries at once"; else echo -e "${RED}FAIL${NC} [6] no reuse saw two entries at once"; echo "$hot_log" | grep '\[hot-cache\]'; FAIL=1; fi
+if echo "$hot_log" | grep -qE "entry [0-9]+/([2-9]|[1-9][0-9]+)[;)]"; then echo -e "${GREEN}PASS${NC} [6] the cache held two or more entries at once"; else echo -e "${RED}FAIL${NC} [6] no reuse saw two entries at once"; echo "$hot_log" | grep '\[hot-cache\]'; FAIL=1; fi
 ok6=1
 for u in "$u_a1" "$u_b1" "$u_a2" "$u_b2"; do
     c=$(echo "$u" | jq '.prompt_tokens_details.cached_tokens'); n=$(echo "$u" | jq '.prompt_tokens')

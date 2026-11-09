@@ -49,6 +49,9 @@ pub const OwnedPayload = struct {
 
 pub const Options = struct {
     pack_limit: u64 = 1 << 30,
+    /// Replay the namespace and change no file: for a reader beside a layer another opener is writing. Such a
+    /// Vfs answers queries only.
+    read_only: bool = false,
     /// The journal compacts into the snapshot once it exceeds this and twice the snapshot.
     compact_min_bytes: u64 = 4 << 20,
 };
@@ -105,15 +108,23 @@ const Node = union(enum) {
 };
 
 const Mode = enum { create, replace, overwrite, edit };
-pub const HoldMode = enum { create, replace };
-/// A staged file. `held` is the payload until `appendBlocks` interns it; `exts` are pinned from then on.
+/// `replace` lands as `tmp` + `rename` does (a new inode); `overwrite` as `open(O_TRUNC)` (an existing file keeps its).
+pub const HoldMode = enum { create, replace, overwrite };
+/// A staged file. `held` are its parts in order, each kept until an `appendBlocks` interns it; `exts` are pinned
+/// from then on.
 const Staged = struct {
     path: []u8,
     mode: Mode,
     kind: Kind,
-    held: ?OwnedPayload = null,
+    held: std.ArrayList(OwnedPayload) = .empty,
     exts: []Ext = &.{},
-    data_bytes: u64 = 0,
+    /// Pack bytes a `stage*` appended that no `appendBlocks` has returned yet.
+    unreported: u64 = 0,
+
+    fn freeHeld(self: *Staged, a: Allocator) void {
+        for (self.held.items) |h| h.deinit(a);
+        self.held.deinit(a);
+    }
 };
 
 /// A journaled record waiting for its `publishTicket`; the Vfs lock stays held in between.
@@ -365,12 +376,15 @@ pub const Vfs = struct {
     pub fn open(allocator: Allocator, io: std.Io, root: []const u8, opts: Options) !*Vfs {
         const packs_path = try std.fmt.allocPrint(allocator, "{s}/v/packs", .{root});
         defer allocator.free(packs_path);
-        try Dir.cwd().createDirPath(io, packs_path);
+        if (!opts.read_only) try Dir.cwd().createDirPath(io, packs_path);
         const v_path = try std.fmt.allocPrint(allocator, "{s}/v", .{root});
         defer allocator.free(v_path);
         var vdir = try Dir.openDirAbsolute(io, v_path, .{ .iterate = true });
         errdefer vdir.close(io);
-        const journal = try vdir.createFile(io, "journal", .{ .read = true, .truncate = false });
+        const journal = if (opts.read_only)
+            try vdir.openFile(io, "journal", .{})
+        else
+            try vdir.createFile(io, "journal", .{ .read = true, .truncate = false });
         errdefer journal.close(io);
 
         const root_node = try allocator.create(DirNode);
@@ -407,7 +421,7 @@ pub const Vfs = struct {
         while (tit.next()) |t| {
             a.free(t.path);
             a.free(t.exts);
-            if (t.held) |h| h.deinit(a);
+            t.freeHeld(a);
         }
         self.tickets.deinit(a);
         self.seen_end.deinit(a);
@@ -451,7 +465,7 @@ pub const Vfs = struct {
             return e;
         };
         self.publishTicket(t.id);
-        return .{ .size = t.size, .data_bytes = t.data_bytes + appended, .journal_bytes = journal_bytes };
+        return .{ .size = t.size, .data_bytes = appended, .journal_bytes = journal_bytes };
     }
 
     /// Drops a staged file; its new blocks stay in the pack as dead bytes.
@@ -475,25 +489,60 @@ pub const Vfs = struct {
         errdefer a.free(owned);
         var size: u64 = 0;
         for (payload.segments) |sg| size += sg.bytes.len;
+        var held: std.ArrayList(OwnedPayload) = .empty;
+        try held.ensureTotalCapacity(a, 1);
+        errdefer held.deinit(a);
+        held.appendAssumeCapacity(payload);
         self.lock();
         defer self.unlock();
         const id = self.next_ticket;
-        try self.tickets.put(a, id, .{ .path = owned, .mode = if (mode == .create) .create else .replace, .kind = payload.kind, .held = payload });
+        try self.tickets.put(a, id, .{ .path = owned, .mode = switch (mode) {
+            .create => .create,
+            .replace => .replace,
+            .overwrite => .overwrite,
+        }, .kind = payload.kind, .held = held });
         self.next_ticket += 1;
         return .{ .id = id, .data_bytes = 0, .size = size };
     }
 
-    /// Hashes the held payload and appends the blocks the index lacks to the active pack. Returns the pack
+    /// Holds the next part of ticket `id`'s file: its bytes follow the parts held before. Returns the part's bytes,
+    /// or 0 when the ticket is gone (the writer dropped it), the payload then freed. Takes `payload`.
+    pub fn holdPart(self: *Vfs, id: u64, payload: OwnedPayload) !u64 {
+        const a = self.allocator;
+        var size: u64 = 0;
+        for (payload.segments) |sg| size += sg.bytes.len;
+        self.lock();
+        defer self.unlock();
+        const st = self.tickets.getPtr(id) orelse {
+            payload.deinit(a);
+            return 0;
+        };
+        st.held.append(a, payload) catch |e| {
+            payload.deinit(a);
+            return e;
+        };
+        return size;
+    }
+
+    /// Hashes the first held part and appends the blocks the index lacks to the active pack. Returns the pack
     /// bytes appended. The file stays invisible: the blocks are pinned, not yet part of any name.
     pub fn appendBlocks(self: *Vfs, id: u64) !u64 {
         const a = self.allocator;
         self.lock();
-        const held = (self.tickets.getPtr(id) orelse {
+        const st0 = self.tickets.getPtr(id) orelse {
             self.unlock();
             return error.UnknownTicket;
-        }).held;
+        };
+        // A ticket staged with its bytes (`stage*`) appended them then; they count where it lands.
+        const staged = st0.unreported;
+        st0.unreported = 0;
+        if (st0.held.items.len == 0) {
+            self.unlock();
+            return staged;
+        }
+        const payload = st0.held.orderedRemove(0);
         self.unlock();
-        const payload = held orelse return 0;
+        defer payload.deinit(a);
         const addrs = try a.alloc(Addr, payload.segments.len);
         defer a.free(addrs);
         for (payload.segments, addrs) |sg, *ad| ad.* = addrOf(sg.bytes);
@@ -502,11 +551,21 @@ pub const Vfs = struct {
         defer self.unlock();
         const st = self.tickets.getPtr(id) orelse return error.UnknownTicket;
         const fresh = try self.internLocked(payload.kind, payload.segments, addrs);
-        payload.deinit(a);
-        st.held = null;
-        st.exts = fresh.exts;
-        st.data_bytes = fresh.data_bytes;
-        return fresh.data_bytes;
+        if (st.exts.len == 0) {
+            st.exts = fresh.exts;
+        } else {
+            const joined = a.alloc(Ext, st.exts.len + fresh.exts.len) catch |e| {
+                self.releaseAll(fresh.exts);
+                a.free(fresh.exts);
+                return e;
+            };
+            @memcpy(joined[0..st.exts.len], st.exts);
+            @memcpy(joined[st.exts.len..], fresh.exts);
+            a.free(st.exts);
+            a.free(fresh.exts);
+            st.exts = joined;
+        }
+        return staged + fresh.data_bytes;
     }
 
     /// Appends the ticket's journal record and returns its bytes. On success the Vfs lock is still held until
@@ -515,7 +574,7 @@ pub const Vfs = struct {
         self.lock();
         errdefer self.unlock();
         const st = self.tickets.getPtr(id) orelse return error.UnknownTicket;
-        if (st.held != null) return error.NotAppended;
+        if (st.held.items.len != 0) return error.NotAppended;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const rec = try self.buildRec(arena.allocator(), st.path, st.mode, st.kind, st.exts);
@@ -532,11 +591,12 @@ pub const Vfs = struct {
         self.pending = null;
         var arena = p.arena;
         defer arena.deinit();
-        const st = self.tickets.fetchRemove(id).?.value;
+        var st = self.tickets.fetchRemove(id).?.value;
         self.settle(p.rec) catch |e| log.warn("  [prefix-vfs] a journaled record could not be applied: {s}\n", .{@errorName(e)});
         self.releaseAll(st.exts);
         self.allocator.free(st.path);
         self.allocator.free(st.exts);
+        st.freeHeld(self.allocator);
         self.unlock();
     }
 
@@ -545,11 +605,11 @@ pub const Vfs = struct {
     pub fn abortTicket(self: *Vfs, id: u64) void {
         self.lock();
         defer self.unlock();
-        const kv = self.tickets.fetchRemove(id) orelse return;
+        var kv = self.tickets.fetchRemove(id) orelse return;
         self.releaseAll(kv.value.exts);
         self.allocator.free(kv.value.path);
         self.allocator.free(kv.value.exts);
-        if (kv.value.held) |h| h.deinit(self.allocator);
+        kv.value.freeHeld(self.allocator);
     }
 
     /// The four steps as plain functions over `ctx: *Vfs`, the shape the writer's op sink takes.
@@ -867,7 +927,7 @@ pub const Vfs = struct {
         const owned = try a.dupe(u8, path);
         errdefer a.free(owned);
         const id = self.next_ticket;
-        try self.tickets.put(a, id, .{ .path = owned, .mode = mode, .kind = p.kind, .exts = fresh.exts, .data_bytes = fresh.data_bytes });
+        try self.tickets.put(a, id, .{ .path = owned, .mode = mode, .kind = p.kind, .exts = fresh.exts, .unreported = fresh.data_bytes });
         self.next_ticket += 1;
         var size: u64 = 0;
         for (fresh.exts) |e| size += e.len;
@@ -1418,7 +1478,8 @@ pub const Vfs = struct {
         const a = self.allocator;
         self.replaying = true;
         defer self.replaying = false;
-        self.vdir.deleteFile(self.io, "snapshot.tmp") catch {};
+        const ro = self.opts.read_only;
+        if (!ro) self.vdir.deleteFile(self.io, "snapshot.tmp") catch {};
         var applied: u64 = 0;
 
         if (self.vdir.readFileAlloc(self.io, "snapshot", a, .limited(1 << 32))) |bytes| {
@@ -1428,7 +1489,7 @@ pub const Vfs = struct {
                 applied = r.last_seq;
             } else |_| {
                 self.recovered.snapshot_dropped = true;
-                self.vdir.deleteFile(self.io, "snapshot") catch {};
+                if (!ro) self.vdir.deleteFile(self.io, "snapshot") catch {};
                 try self.resetNamespace();
             }
         } else |err| switch (err) {
@@ -1441,11 +1502,11 @@ pub const Vfs = struct {
         const r = try self.replayFramesLenient(jbytes, applied);
         if (r.valid < jbytes.len) {
             self.recovered.journal_torn_bytes = jbytes.len - r.valid;
-            try self.journal.setLength(self.io, r.valid);
+            if (!ro) try self.journal.setLength(self.io, r.valid);
         }
         self.journal_len = r.valid;
         self.seq = @max(applied, r.last_seq);
-        try self.attachPacks();
+        if (!ro) try self.attachPacks();
         self.seen_end.clearAndFree(a);
     }
 
@@ -2761,6 +2822,89 @@ test "prefix_vfs: a ticket aborted at any step leaves no file, frees its payload
     try testing.expectError(error.NotAppended, sink.journalRecord(sink.ctx, early.id));
     sink.abort(sink.ctx, early.id);
     try testing.expectEqual(try onDiskBytes(&env), v.physicalBytes());
+}
+
+test "prefix_vfs: a file held in parts lands as their bytes in order, journals once all are appended, and an abort frees every part" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const v = try openAt(&env, .{});
+    defer v.close();
+    const sink = sinkOf(v);
+    const x = try blob(5000, 1);
+    defer ta.free(x);
+    const y = try blob(3000, 2);
+    defer ta.free(y);
+    const z = try blob(700, 3);
+    defer ta.free(z);
+
+    const t = try v.hold("a", .replace, try ownedOne(.kv, x));
+    const phys = v.physicalBytes();
+    try testing.expectEqual(@as(u64, 3000), try v.holdPart(t.id, try ownedOne(.kv, y)));
+    // One part per call, in the order they were held.
+    try testing.expectEqual(@as(u64, 5000), try sink.appendBlocks(sink.ctx, t.id));
+    try testing.expectError(error.NotAppended, sink.journalRecord(sink.ctx, t.id));
+    try testing.expectEqual(@as(u64, 700), try v.holdPart(t.id, try ownedOne(.kv, z)));
+    try testing.expectEqual(@as(u64, 3000), try sink.appendBlocks(sink.ctx, t.id));
+    try testing.expectEqual(@as(u64, 700), try sink.appendBlocks(sink.ctx, t.id));
+    try testing.expect(v.stat("a") == null);
+    const journal = try sink.journalRecord(sink.ctx, t.id);
+    sink.publish(sink.ctx, t.id);
+    try testing.expectEqual(@as(u64, 8700), v.stat("a").?.size);
+    try testing.expectEqual(8700 + journal, v.physicalBytes() - phys);
+    const got = try v.readBytes(ta, "a");
+    defer ta.free(got);
+    try testing.expectEqualSlices(u8, x, got[0..5000]);
+    try testing.expectEqualSlices(u8, y, got[5000..8000]);
+    try testing.expectEqualSlices(u8, z, got[8000..]);
+
+    // A part held for a ticket the writer already dropped is freed, not kept.
+    const gone = try v.hold("b", .replace, try ownedOne(.kv, y));
+    sink.abort(sink.ctx, gone.id);
+    try testing.expectEqual(@as(u64, 0), try v.holdPart(gone.id, try ownedOne(.kv, z)));
+
+    // An abort between parts frees the parts still held and leaves the appended one dead.
+    const c1 = try blob(4000, 9);
+    defer ta.free(c1);
+    const c2 = try blob(2000, 8);
+    defer ta.free(c2);
+    const cut = try v.hold("c", .replace, try ownedOne(.ssm, c1));
+    _ = try v.holdPart(cut.id, try ownedOne(.ssm, c2));
+    _ = try sink.appendBlocks(sink.ctx, cut.id);
+    sink.abort(sink.ctx, cut.id);
+    try testing.expect(v.stat("c") == null);
+    try testing.expectEqual(@as(u64, 4000), v.deadBytes());
+}
+
+test "prefix_vfs: a read-only open beside a writing one replays its namespace and changes no file" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const v = try openAt(&env, .{});
+    defer v.close();
+    const sink = sinkOf(v);
+    const x = try blob(5000, 1);
+    defer ta.free(x);
+    const y = try blob(3000, 2);
+    defer ta.free(y);
+    try v.mkdirp("e1");
+    _ = try v.create("e1/a", onePayload(.kv, x));
+    // Blocks appended but not yet journaled: the tail a normal open trims.
+    const t = try v.hold("e1/b", .create, try ownedOne(.kv, y));
+    _ = try sink.appendBlocks(sink.ctx, t.id);
+    const before = try onDiskBytes(&env);
+
+    const r = try openAt(&env, .{ .read_only = true });
+    try testing.expectEqual(@as(u64, 5000), r.stat("e1/a").?.size);
+    try testing.expect(r.stat("e1/b") == null);
+    r.close();
+    try testing.expectEqual(before, try onDiskBytes(&env));
+
+    _ = try sink.journalRecord(sink.ctx, t.id);
+    sink.publish(sink.ctx, t.id);
+    const got = try v.readBytes(ta, "e1/b");
+    defer ta.free(got);
+    try testing.expectEqualSlices(u8, y, got);
 }
 
 test "prefix_vfs: tickets landed in order replay to the same namespace" {

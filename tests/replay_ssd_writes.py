@@ -98,16 +98,22 @@ def written_delta(after, before):
     return {k: after.get(k, 0) - before.get(k, 0) for k in after}
 
 
-def later_mean(rows):
-    """Mean MB written by the requests marked `later`; None when no request is."""
-    later = [r["written_mb"] for r in rows if r.get("later")]
+def later_mean(rows, key="written_mb"):
+    """Mean MB under `key` of the requests marked `later`; None when no request is."""
+    later = [r.get(key, 0.0) for r in rows if r.get("later")]
     return round(sum(later) / len(later), 1) if later else None
 
 
+def ceiling_key(rows):
+    """On the content-addressed layer the SSD takes what it stored, not the files' bytes."""
+    return "stored_mb" if any(r.get("stored_mb") for r in rows) else "written_mb"
+
+
 def ceiling_failure(rows, max_mb):
-    mean = later_mean(rows)
+    key = ceiling_key(rows)
+    mean = later_mean(rows, key)
     if max_mb is not None and mean is not None and mean > max_mb:
-        return f"later-turn mean {mean} MB passes the ceiling {max_mb} MB"
+        return f"later-turn mean {mean} MB {key.removesuffix('_mb')} passes the ceiling {max_mb} MB"
     return None
 
 
@@ -202,11 +208,14 @@ class Boot:
         return self.server.proc is not None and self.server.proc.poll() is None
 
     def written(self):
-        w = get(self.base, "/metrics.json").get("prefix_cache_writes", {}).get("written_bytes", {})
-        return {k: int(v) for k, v in w.items()}
+        """Per kind, the files' bytes written and (`stored:` keys) what the content-addressed layer stored."""
+        pw = get(self.base, "/metrics.json").get("prefix_cache_writes", {})
+        w = {k: int(v) for k, v in pw.get("written_bytes", {}).items()}
+        w.update({f"stored:{k}": int(v) for k, v in pw.get("stored_bytes", {}).items()})
+        return w
 
     def settle(self):
-        """Until the written counters hold still: the writer has landed everything this request staged."""
+        """Until the counters hold still: the writer has landed everything this request staged."""
         prev, same = None, 0
         while same < 4:
             time.sleep(0.5)
@@ -232,8 +241,10 @@ class Boot:
         wall = time.time() - ts
         after = self.settle() if settle else self.written()
         seg = self.log_since()
-        delta = written_delta(after, self.before)
+        both = written_delta(after, self.before)
         self.before = after
+        delta = {k: v for k, v in both.items() if not k.startswith("stored:")}
+        stored = {k.removeprefix("stored:"): v for k, v in both.items() if k.startswith("stored:")}
         msg = r["choices"][0]["message"]
         m = re.search(r"reused (\d+) of (\d+) prompt tokens from (\w+)(?:, prefilling \d+)?(?:; lookup and restore (\d+) ms)?", seg)
         props = get(self.base, "/props")
@@ -245,6 +256,7 @@ class Boot:
                "restore_ms": int(m.group(4)) if m and m.group(4) else None,
                "prompt_ms": r.get("timings", {}).get("prompt_ms"), "wall_s": round(wall, 2),
                "written": delta, "written_mb": round(sum(delta.values()) / 2**20, 1),
+               "stored": stored, "stored_mb": round(sum(stored.values()) / 2**20, 1),
                "disk_used_mb": round(pc.get("disk_used_bytes", 0) / 2**20, 1), "disk_entries": pc.get("disk_entries"),
                "persist": re.findall(r"\[disk-cache\] (?:persisted|chunk share|evicted|segment share)[^\n]*", seg),
                "reply_sha": hashlib.sha256(json.dumps([msg.get("content"), msg.get("tool_calls")], sort_keys=True).encode()).hexdigest()[:16]}
@@ -252,7 +264,8 @@ class Boot:
         with (self.run.dir / f"{self.run.flow}.turns.jsonl").open("a") as f:
             f.write(json.dumps(row) + "\n")
         print(f"[{self.run.flow}] {tag} prompt={row['prompt']} reused={row['reused']} {row['from']} "
-              f"restore={row['restore_ms']}ms prompt_ms={row['prompt_ms']} wrote={row['written_mb']}MB", flush=True)
+              f"restore={row['restore_ms']}ms prompt_ms={row['prompt_ms']} wrote={row['written_mb']}MB "
+              f"stored={row['stored_mb']}MB", flush=True)
         return msg
 
 
@@ -467,6 +480,8 @@ def run_flow(a, directory):
     FLOWS[a.flow][0](run)
     mean = later_mean(run.rows)
     summary = {"flow": a.flow, "pack": a.pack, "requests": len(run.rows), "later_mean_mb": mean,
+               "later_mean_stored_mb": later_mean(run.rows, "stored_mb"),
+               "total_stored_mb": round(sum(r["stored_mb"] for r in run.rows), 1),
                "first_mb": run.rows[0]["written_mb"] if run.rows else None,
                "total_mb": round(sum(r["written_mb"] for r in run.rows), 1),
                "by_kind_mb": {k: round(sum(r["written"].get(k, 0) for r in run.rows) / 2**20, 1) for k in KINDS}}

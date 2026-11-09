@@ -44,8 +44,9 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, cost table | engine-mtp |
 | `kv_quant.zig` | quantized KV contract | engine-kv-cache |
 | `prefix_cache.zig` / `kv_disk_cache.zig` / `disk_placement.zig` / `kv_disk_writer.zig` / `restore_dump.zig` / `arch/prefix.zig` | prefix cache, SSD tier, budget, roots; the dispatch to each arch's `<arch>_prefix.zig` | engine-prefix-cache |
-| `prefix_vfs.zig` | content-addressed virtual files under the SSD tier: block packs, journal, snapshot, POSIX-shaped `stat`/`link`/`rename`; host tier, not wired yet | engine-prefix-cache |
-| `prefix_vfs_tensors.zig` | tensor files on the VFS: arrays staged as row-group and fixed-part blocks, loaded back as `mlx_load_safetensors` maps, the safetensors bytes regenerated; MLX tier, not wired yet | engine-prefix-cache |
+| `kv_disk_fs.zig` | the SSD tier's file operations (`DiskTier.fs`) on its two backends, plain files or the content-addressed layer (`SUSHI_PREFIX_FS`), and the tests' file helpers | engine-prefix-cache |
+| `prefix_vfs.zig` | content-addressed virtual files under the SSD tier: block packs, journal, snapshot, POSIX-shaped `stat`/`link`/`rename`; host tier | engine-prefix-cache |
+| `prefix_vfs_tensors.zig` | tensor files on the VFS: arrays staged as row-group and fixed-part blocks, loaded back as `mlx_load_safetensors` maps, the safetensors bytes regenerated | engine-prefix-cache |
 | `sched_policy.zig` | the scheduler's decisions (tick buckets and caps, admission order, slot end states, interleave and idle arithmetic), host tier | server-lifecycle |
 | `prefix_policy.zig` / `disk_format.zig` | the prefix cache's rules (thinning, lookup winner, eviction victim, spec adoption) and the SSD record's wire format (safetensors header, `meta.json`), both host tier | engine-prefix-cache |
 | `mlx_kernel_keys.zig` | custom-kernel library keys for `mlx.zig` wrappers | engine-mlx-gotchas |

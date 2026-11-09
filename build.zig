@@ -225,6 +225,12 @@ pub fn build(b: *std.Build) void {
             run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
         }
         test_step.dependOn(&run_unit_tests.step);
+        if (std.mem.eql(u8, unit_test.name, "test-" ++ tier_bucket[0])) {
+            const on_files = b.addRunArtifact(unit_test);
+            on_files.setName("run test-" ++ tier_bucket[0] ++ " (SUSHI_PREFIX_FS=real)");
+            on_files.setEnvironmentVariable("SUSHI_PREFIX_FS", "real");
+            test_step.dependOn(&on_files.step);
+        }
         test_step.dependOn(countGuard(b, count_guard, unit_test));
     }
 
@@ -420,9 +426,13 @@ fn linkApple(module: *std.Build.Module, macos_sdk_frameworks: ?[]const u8) void 
 /// do not name.
 const test_buckets = [_][]const []const u8{
     &.{ "trunk", "gdn_decode", "cli", "launch" },
-    &.{ "generate", "mtp_policy", "mtp_round", "scheduler", "prefix_cache", "kv_disk_cache", "disk_placement", "restore_dump", "mtp", "dflash" },
+    &.{ "generate", "mtp_policy", "mtp_round", "scheduler", "restore_dump", "mtp", "dflash" },
     &.{ "server", "responses" },
+    tier_bucket,
 };
+
+/// The SSD tier's tests, which run once on each file backend (`SUSHI_PREFIX_FS`).
+const tier_bucket: []const []const u8 = &.{ "kv_disk_cache", "kv_disk_fs", "prefix_cache", "disk_placement", "prefix_cache_admin", "prefix_vfs_tensors_test", "qwen4_disk_qsa", "qwen4_prefix_cache_test", "glm5_prefix_cache_test", "dsv41_prefix_cache_test" };
 
 /// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
 const test_dirs = [_][]const u8{ "src", "src/arch", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };

@@ -1,4 +1,5 @@
 const kd = @import("../kv_disk_cache.zig");
+const kd_fs = @import("../kv_disk_fs.zig");
 const disk_placement = @import("../disk_placement.zig");
 const write_stats = @import("../disk_write_stats.zig");
 const log = @import("../log.zig");
@@ -22,13 +23,10 @@ const PersistOutcome = kd.PersistOutcome;
 const buildHybridEntries = kd.buildHybridEntries;
 const cacheValueAt = kd.cacheValueAt;
 const chunkShareTokens = kd.chunkShareTokens;
-const fileSize = kd.fileSize;
 const fillCache = kd.fillCache;
 const freeHybridEntries = kd.freeHybridEntries;
 const makeArange = kd.makeArange;
-const readFileAlloc = kd.readFileAlloc;
 const ssmArrVal = kd.ssmArrVal;
-const statFile = kd.statFile;
 const tmpRoot = kd.tmpRoot;
 
 
@@ -43,7 +41,7 @@ fn filledArray(shape: []const c_int, v: f32, s: mlx.mlx_stream) !mlx.mlx_array {
 }
 
 fn stAuxPooledBytes(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !struct { aux: u64, pooled: u64 } {
-    const raw = readFileAlloc(allocator, io, path, 4 * 1024 * 1024) orelse return error.TestUnexpectedResult;
+    const raw = kd_fs.testRead(io, path, 4 * 1024 * 1024) orelse return error.TestUnexpectedResult;
     defer allocator.free(raw);
     if (raw.len < 8) return error.TestUnexpectedResult;
     const hdr_len = std.mem.readInt(u64, raw[0..8], .little);
@@ -201,12 +199,12 @@ pub fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !trunk_mod.
     defer _ = mlx.mlx_stream_free(cpu);
     const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors\x00", .{ self.root, id });
     defer self.allocator.free(path);
-    if (fileSize(self.io, path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
+    if (self.fs.size(path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+    try self.fs.loadSafetensors(path, &tensor_map, &meta_map, cpu);
     for (self.entries.items) |*e| {
         if (e.id != id or e.qsa_segs.len == 0) continue;
         var ratio_s: [*:0]const u8 = undefined;
@@ -315,7 +313,7 @@ pub fn persistQsaHistory(
         const qpath = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
         defer self.allocator.free(qpath);
         if (self.writer) |w| w.fence(qpath);
-        std.Io.Dir.deleteFileAbsolute(self.io, qpath) catch {};
+        self.fs.deleteFile(qpath);
     }
     const w = try writeQsaHistory(self, dir_rel, src, s, prev);
     return .{ .bytes = w.bytes, .rows = rows, .inherited = false, .written = w.written, .segs = w.segs, .segs_inherited = w.inherited };
@@ -327,20 +325,16 @@ pub fn linkInheritedQsa(self: *DiskTier, d: ChunkDonor, id: u64) bool {
     const old_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, d.id }) catch return false;
     defer self.allocator.free(old_abs);
     if (!self.chunkLanded(old_abs, donor.qsa_history_bytes)) return false;
-    var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{}) catch return false;
-    defer root_dir.close(self.io);
-    const old_sub = std.fmt.allocPrint(self.allocator, "e{d}/qsa.safetensors", .{d.id}) catch return false;
-    defer self.allocator.free(old_sub);
-    const new_sub = std.fmt.allocPrint(self.allocator, "e{d}/qsa.safetensors", .{id}) catch return false;
-    defer self.allocator.free(new_sub);
-    std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
+    const new_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, id }) catch return false;
+    defer self.allocator.free(new_abs);
+    self.fs.hardLink(old_abs, new_abs) catch |err| {
         log.warn("  [disk-cache] chunk share: link e{d}/qsa -> e{d} failed: {s} — writing the history instead\n", .{ d.id, id, @errorName(err) });
         return false;
     };
     // The history is the donor's segments and its tail together.
     for (0..donor.qsa_segs.len) |j| {
         if (self.linkSegFile(d.id, id, 'q', @intCast(j))) continue;
-        root_dir.deleteFile(self.io, new_sub) catch {};
+        self.fs.deleteFile(new_abs);
         return false;
     }
     log.info("  [disk-cache] chunk share: e{d} inherits qsa history from e{d} by hard link\n", .{ id, d.id });
@@ -755,7 +749,7 @@ test "DiskTier: a pre-v7 interior restore overlays QSA history from the latest s
     _ = try tier.writeSsmFile(dir_rel, &latest, s);
     const qsa_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/qsa.safetensors", .{ tier.root, id });
     defer testing.allocator.free(qsa_path);
-    try std.Io.Dir.deleteFileAbsolute(io, qsa_path);
+    kd_fs.testDelete(io, qsa_path);
     tier.entries.items[0].qsa_history_bytes = 0;
     tier.entries.items[0].qsa_history_rows = 0;
     tier.entries.items[0].inherited_qsa = false;
@@ -836,10 +830,10 @@ test "DiskTier: a pre-v7 interior restore misses when the latest s* file is gone
     _ = try tier.writeSsmFile(dir_rel, &latest, s);
     const qsa_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/qsa.safetensors", .{ tier.root, id });
     defer testing.allocator.free(qsa_path);
-    try std.Io.Dir.deleteFileAbsolute(io, qsa_path);
+    kd_fs.testDelete(io, qsa_path);
     const latest_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/s0000256.safetensors", .{ tier.root, id });
     defer testing.allocator.free(latest_path);
-    try std.Io.Dir.deleteFileAbsolute(io, latest_path);
+    kd_fs.testDelete(io, latest_path);
     tier.entries.items[0].qsa_history_bytes = 0;
     tier.entries.items[0].qsa_history_rows = 0;
     tier.entries.items[0].inherited_qsa = false;
@@ -893,7 +887,7 @@ test "DiskTier: a v7 entry with missing or short qsa.safetensors misses before K
         const id = tier.entries.items[0].id;
         const qsa_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/qsa.safetensors", .{ tier.root, id });
         defer testing.allocator.free(qsa_path);
-        try std.Io.Dir.deleteFileAbsolute(io, qsa_path);
+        kd_fs.testDelete(io, qsa_path);
 
         var cache2 = try KVCache.init(testing.allocator, 3);
         defer cache2.deinit();
@@ -1106,10 +1100,10 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links qsa.safetensors"
 
     var pbuf: [1024]u8 = undefined;
     const dp = try std.fmt.bufPrint(&pbuf, "{s}/fp-qsa-share/e{d}/qsa.safetensors", .{ base, donor_id });
-    const dstat = statFile(io, dp).?;
+    const dstat = kd_fs.testStat(io, dp).?;
     var hbuf: [1024]u8 = undefined;
     const hp = try std.fmt.bufPrint(&hbuf, "{s}/fp-qsa-share/e{d}/qsa.safetensors", .{ base, heir.id });
-    const hstat = statFile(io, hp).?;
+    const hstat = kd_fs.testStat(io, hp).?;
     try testing.expectEqual(dstat.inode, hstat.inode);
     try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(hstat.nlink)));
 
@@ -1669,10 +1663,7 @@ test "DiskTier: an SSM checkpoint STAGES through the writer — no filesystem wr
     try testing.expectEqual(@as(u32, 128), tier.entries.items[0].ssm_positions[0]);
 
     // Bar 1: the checkpoint file is not on disk; the commit returned without writing it.
-    try testing.expectError(
-        error.FileNotFound,
-        tmp.dir.statFile(io, "fp-ssd-cpstage/e1/s0000128.safetensors", .{}),
-    );
+    try testing.expect(kd_fs.testStatAt(io, base, "fp-ssd-cpstage/e1/s0000128.safetensors") == null);
     try testing.expectEqual(@as(u64, 0), tier.writer.?.filesWritten());
     try testing.expect(tier.entries.items[0].ssm_bytes[0] > 0);
 
@@ -1693,7 +1684,7 @@ test "DiskTier: an SSM checkpoint STAGES through the writer — no filesystem wr
 
     tier.writer.?.setPaused(false);
     tier.drainWriter();
-    const st = try tmp.dir.statFile(io, "fp-ssd-cpstage/e1/s0000128.safetensors", .{});
+    const st = kd_fs.testStatAt(io, base, "fp-ssd-cpstage/e1/s0000128.safetensors") orelse return error.TestUnexpectedResult;
     try testing.expectEqual(tier.entries.items[0].ssm_bytes[0], st.size);
 
     // Bar 3: a fresh tier reads the hand-rolled image back, `__metadata__` included.
@@ -1805,11 +1796,8 @@ test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING
     try testing.expectEqual(@as(f32, 1052.0), ssmArrVal(dst[2].aux_state, 0, s));
     try testing.expectEqual(@as(f32, 1060.0), ssmArrVal(dst[2].aux_state, hd, s));
 
-    try tmp.dir.createDirPath(io, "fp-qsa-v8/e9");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "fp-qsa-v8/e9/meta.json",
-        .data = "{\"v\":9,\"kv_len\":1,\"tokens\":0,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":0,\"chunk_tokens\":128,\"inherited_chunks\":0,\"bytes\":0,\"chunk_bytes\":[],\"ssm\":[]}",
-    });
+    try kd_fs.testMkdirAt(io, base, "fp-qsa-v8/e9");
+    try kd_fs.testWriteAt(io, base, "fp-qsa-v8/e9/meta.json", "{\"v\":9,\"kv_len\":1,\"tokens\":0,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":0,\"chunk_tokens\":128,\"inherited_chunks\":0,\"bytes\":0,\"chunk_bytes\":[],\"ssm\":[]}");
     try testing.expect(tier2.loadEntry(9) == null);
 }
 
@@ -1872,12 +1860,16 @@ test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to
         fn bytes(t: *DiskTier, e: *const IndexEntry) !u64 {
             const dir = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ t.root, e.id });
             defer testing.allocator.free(dir);
-            var d = try std.Io.Dir.openDirAbsolute(t.io, dir, .{});
-            defer d.close(t.io);
-            const meta = try d.statFile(t.io, "meta.json", .{});
-            var seen = disk_placement.InodeSet.init(testing.allocator);
-            defer seen.deinit();
-            return disk_placement.dirBytes(t.io, dir, &seen) - meta.size;
+            const names = try kd_fs.testList(t.io, dir);
+            defer kd_fs.Fs.freeEntries(testing.allocator, names);
+            var sum: u64 = 0;
+            for (names) |n| {
+                if (n.is_dir or std.mem.eql(u8, n.name, "meta.json")) continue;
+                const p = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir, n.name });
+                defer testing.allocator.free(p);
+                sum += kd_fs.testSize(t.io, p) orelse return error.TestUnexpectedResult;
+            }
+            return sum;
         }
     };
 
