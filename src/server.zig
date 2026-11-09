@@ -2403,8 +2403,8 @@ pub fn handleChatCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature", 0.0, 2.0));
-    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p", 0.0, 1.0));
+    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature"));
+    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p"));
     const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
 
     const repeat_penalty = request_policy.parseRepeatPenalty(root);
@@ -2420,15 +2420,12 @@ pub fn handleChatCompletions(
         if (lp != .bool or !lp.bool) break :blk 0;
         // logprobs=true without top_logprobs defaults to 0 (just the chosen token's logprob)
         const tlp = root.get("top_logprobs") orelse break :blk 1;
-        break :blk switch (tlp) {
-            .integer => |i| @intCast(@min(@max(i, 0), 20)),
-            else => 1,
-        };
+        break :blk if (request_parse.wholeNumber(tlp)) |n| @intCast(n) else 1;
     };
 
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
-    var has_tools = root.get("tools") != null;
+    var has_tools = request_parse.toolsDeclared(root);
     const tool_choice = tool_calls_mod.parseToolChoice(root.get("tool_choice"));
     if (tool_choice == .none) has_tools = false;
     const tool_choice_instruction: ?[]const u8 = if (has_tools) try tool_choice.instruction(allocator) else null;
@@ -2500,7 +2497,7 @@ pub fn handleChatCompletions(
                     try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "response_format.json_schema.schema must be a JSON object (use {\"type\":\"json_object\"} for unconstrained JSON)", 400);
                     return;
                 }
-                if (request_parse.strictSchemaFault(allocator, rf.object.get("json_schema").?.object)) |why| {
+                if (request_parse.strictSchemaFault(allocator, .{ .obj = rf.object.get("json_schema").?.object, .path = "response_format.json_schema" }, has_tools)) |why| {
                     defer allocator.free(why);
                     log.warn("POST /v1/chat/completions -> 400 (strict schema not enforceable)\n", .{});
                     try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);

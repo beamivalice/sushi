@@ -75,7 +75,7 @@ const shared =
     \\                      0.0.0.0 opens it to the local network)
     \\  --port <n>          Bind port, 1..65535 (default: 12345, or `server.port` in
     \\                        ~/.sushi/model-settings.json)
-    \\  --ctx-size <n>      Maximum context length (default: model max)
+    \\  --ctx-size <n>      Maximum context length (default and 0: the model's max)
     \\  --config-overrides <json>   JSON object deep-merged into EVERY
     \\                      model's config.json this process loads or
     \\                      discovers. Generic keys
@@ -200,7 +200,7 @@ const shared =
     \\                        to 512) instead of being refused.
     \\  --max-concurrent <n>  Sizes the submit queue (n + 32) and floors the
     \\                        prefix-cache entry count. Requests batch at
-    \\                        any value (default: 1).
+    \\                        any value, at least 1 (default: 1).
     \\  --prefill-decode-share <s>
     \\                      Target decode wall-time share during another
     \\                        request's prefill (0..0.9); never narrows
@@ -292,7 +292,8 @@ const shared =
     \\                        is served open and asks for the key).
     \\                        Accepts Authorization: Bearer, x-api-key, HTTP
     \\                        Basic (key = password), or ?api_key=. /health
-    \\                        stays open. Unset = no auth (default).
+    \\                        stays open. Unset = no auth (default); an
+    \\                        empty key is refused.
     \\  --api-key-strict    Require the key from loopback too (localhost is
     \\                        exempt by default). For embedders that want
     \\                        "only the key holder drives inference" on a

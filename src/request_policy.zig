@@ -30,7 +30,6 @@ const StreamMode = generation_stream.StreamMode;
 const atomicTokenId = server.atomicTokenId;
 const autoBudgetWindowTight = server.autoBudgetWindowTight;
 const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
-const clampJsonI32 = request_parse.clampJsonI32;
 const jsonEscape = http.jsonEscape;
 const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseOnOff = server.parseOnOff;
@@ -71,7 +70,7 @@ fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 /// The think penalty's lambda: the request's `think_penalty` > `--think-penalty` >
 /// model-settings.json > off.
 pub fn resolveThinkPenalty(root: std.json.ObjectMap, flag: ?f32, setting: ?f32) f32 {
-    if (parseJsonFloatOpt(root, "think_penalty", 0, model_settings.think_penalty_max)) |v| return v;
+    if (parseJsonFloatOpt(root, "think_penalty")) |v| return v;
     return settings_resolve.resolve(f32, flag, setting, model_settings.default_think_penalty).value;
 }
 
@@ -146,7 +145,7 @@ pub fn launchMaxTokensDefault() u32 {
 /// instead of a fixed ceiling. A positive integer is an explicit cap.
 pub fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
     const i = request_parse.wholeNumber(v orelse return auto_default) orelse return auto_default;
-    return if (i > 0) @intCast(@min(i, std.math.maxInt(u32))) else auto_default;
+    return if (i > 0) std.math.cast(u32, i) orelse auto_default else auto_default;
 }
 
 /// Who decided the effective `max_tokens`: the client, the `--max-tokens` launch default, or nobody (auto).
@@ -282,7 +281,7 @@ pub fn reasoningEffortFromWord(word: []const u8, template_consumes_effort: bool,
 pub fn requestThinkBudget(root: std.json.ObjectMap, effort_budget: i32) i32 {
     const v = root.get("reasoning_budget_tokens") orelse return effort_budget;
     return switch (v) {
-        .integer => |i| clampJsonI32(i),
+        .integer => |i| std.math.cast(i32, i) orelse effort_budget,
         else => effort_budget,
     };
 }
@@ -528,7 +527,7 @@ pub fn anthropicThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
         if (std.mem.eql(u8, kind, "enabled") or std.mem.eql(u8, kind, "adaptive")) t.enable = true;
         disabled = std.mem.eql(u8, kind, "disabled");
         if (o.get("budget_tokens")) |bt| if (bt == .integer) {
-            t.budget = clampJsonI32(bt.integer);
+            t.budget = std.math.cast(i32, bt.integer) orelse t.budget;
             budget_explicit = true;
         };
     }
@@ -621,41 +620,36 @@ pub fn resolvePreserveThinking(request: ?bool, flag: ?bool, setting: ?bool) ?boo
 /// The multiplicative `repeat_penalty` (llama.cpp's, at most 10), else vLLM's `repetition_penalty`;
 /// 0 or absent is 1.0 (off). OpenAI's `frequency_penalty` is a separate additive penalty.
 pub fn parseRepeatPenalty(root: std.json.ObjectMap) f32 {
-    const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
+    const rp = parseJsonFloat(root, "repeat_penalty", 0.0);
     if (rp > 0.0) return rp;
-    const rep_p = parseJsonFloat(root, "repetition_penalty", 0.0, 0.0, 10.0);
+    const rep_p = parseJsonFloat(root, "repetition_penalty", 0.0);
     return if (rep_p > 0.0) rep_p else 1.0;
 }
 
 /// OpenAI's `presence_penalty` and `frequency_penalty`: -2 to 2, 0 = off.
 pub fn parseAdditivePenalty(root: std.json.ObjectMap, key: []const u8) f32 {
-    return parseJsonFloat(root, key, 0.0, -2.0, 2.0);
+    return parseJsonFloat(root, key, 0.0);
 }
 
-fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
-    const raw = if (root.get(key)) |v| switch (v) {
+fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32) f32 {
+    return if (root.get(key)) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
         .integer => |i| @as(f32, @floatFromInt(i)),
         else => default,
     } else default;
-    return std.math.clamp(raw, min, max);
 }
 
-test "repeat_penalty: 0 or below is unset, then off, on chat and completions alike" {
+test "repeat_penalty: 0 is unset, then off, on chat and completions alike" {
     const a = std.testing.allocator;
     const Case = struct { body: []const u8, want: f32 };
     const cases = [_]Case{
         .{ .body = "{}", .want = 1.0 },
         .{ .body = "{\"repeat_penalty\":1.3}", .want = 1.3 },
         .{ .body = "{\"repeat_penalty\":0}", .want = 1.0 },
-        .{ .body = "{\"repeat_penalty\":-2,\"frequency_penalty\":0.5}", .want = 1.0 },
         .{ .body = "{\"repeat_penalty\":\"x\",\"frequency_penalty\":0.1}", .want = 1.0 },
         .{ .body = "{\"frequency_penalty\":1}", .want = 1.0 },
-        .{ .body = "{\"repeat_penalty\":50}", .want = 10.0 },
         .{ .body = "{\"repetition_penalty\":1.3}", .want = 1.3 },
         .{ .body = "{\"repetition_penalty\":0}", .want = 1.0 },
-        .{ .body = "{\"repetition_penalty\":-2,\"frequency_penalty\":0.5}", .want = 1.0 },
-        .{ .body = "{\"repetition_penalty\":50}", .want = 10.0 },
         .{ .body = "{\"repeat_penalty\":1.2,\"repetition_penalty\":1.5}", .want = 1.2 },
     };
     for (cases) |c| {
@@ -672,7 +666,7 @@ test "OpenAI frequency and presence penalties are additive fields in -2..2, neve
         .{ .body = "{}", .frequency = 0, .presence = 0 },
         .{ .body = "{\"frequency_penalty\":1,\"presence_penalty\":0}", .frequency = 1, .presence = 0 },
         .{ .body = "{\"frequency_penalty\":0.5,\"presence_penalty\":-0.25}", .frequency = 0.5, .presence = -0.25 },
-        .{ .body = "{\"frequency_penalty\":-9,\"presence_penalty\":9}", .frequency = -2, .presence = 2 },
+        .{ .body = "{\"frequency_penalty\":-2,\"presence_penalty\":2}", .frequency = -2, .presence = 2 },
         .{ .body = "{\"frequency_penalty\":\"x\"}", .frequency = 0, .presence = 0 },
     };
     for (cases) |c| {
@@ -689,7 +683,7 @@ test "parseJsonFloat returns value when present" {
     const allocator = testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":0.7}", .{});
     defer parsed.deinit();
-    const result = parseJsonFloat(parsed.value.object, "temp", 1.0, 0.0, 2.0);
+    const result = parseJsonFloat(parsed.value.object, "temp", 1.0);
     try testing.expectApproxEqAbs(@as(f32, 0.7), result, 0.001);
 }
 
@@ -697,23 +691,15 @@ test "parseJsonFloat returns default when missing" {
     const allocator = testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
     defer parsed.deinit();
-    const result = parseJsonFloat(parsed.value.object, "temp", 1.0, 0.0, 2.0);
+    const result = parseJsonFloat(parsed.value.object, "temp", 1.0);
     try testing.expectApproxEqAbs(@as(f32, 1.0), result, 0.001);
-}
-
-test "parseJsonFloat clamps to range" {
-    const allocator = testing.allocator;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":5.0}", .{});
-    defer parsed.deinit();
-    const result = parseJsonFloat(parsed.value.object, "temp", 1.0, 0.0, 2.0);
-    try testing.expectApproxEqAbs(@as(f32, 2.0), result, 0.001);
 }
 
 test "parseJsonFloat handles integer value" {
     const allocator = testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":1}", .{});
     defer parsed.deinit();
-    const result = parseJsonFloat(parsed.value.object, "temp", 0.5, 0.0, 2.0);
+    const result = parseJsonFloat(parsed.value.object, "temp", 0.5);
     try testing.expectApproxEqAbs(@as(f32, 1.0), result, 0.001);
 }
 
@@ -1252,8 +1238,7 @@ test "optSamplingRecJson emits number when present, null when absent" {
     try std.testing.expectEqualStrings("null", none);
 }
 
-test "a request integer from a client is clamped, never blindly @intCast" {
-    // Bar: `seed: -1`, a 2^32 max_tokens and an out-of-range budget resolve without a cast.
+test "a request integer from a client is read without a blind cast" {
     const t = std.testing;
     try t.expectEqual(@as(?u64, null), parseRequestSeed(.{ .integer = -1 }));
     try t.expectEqual(@as(?u64, 0), parseRequestSeed(.{ .integer = 0 }));
@@ -1261,14 +1246,9 @@ test "a request integer from a client is clamped, never blindly @intCast" {
     try t.expectEqual(@as(?u64, null), parseRequestSeed(.{ .string = "42" }));
     try t.expectEqual(@as(?u64, null), parseRequestSeed(null));
 
-    try t.expectEqual(@as(u32, std.math.maxInt(u32)), resolveRequestMaxTokens(.{ .integer = 1 << 32 }, 7));
+    try t.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .integer = 1 << 32 }, 7));
     try t.expectEqual(@as(u32, 512), resolveRequestMaxTokens(.{ .integer = 512 }, 7));
     try t.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .integer = 0 }, 7));
-
-    try t.expectEqual(@as(i32, std.math.maxInt(i32)), clampJsonI32(1 << 40));
-    try t.expectEqual(@as(i32, std.math.minInt(i32)), clampJsonI32(-(1 << 40)));
-    try t.expectEqual(@as(i32, -1), clampJsonI32(-1));
-    try t.expectEqual(@as(i32, 1024), clampJsonI32(1024));
 }
 
 test "preserve_thinking: request > --preserve-thinking > model-settings.json > the template's default" {
@@ -1280,14 +1260,12 @@ test "preserve_thinking: request > --preserve-thinking > model-settings.json > t
     try t.expectEqual(@as(?bool, null), resolvePreserveThinking(null, null, null));
 }
 
-test "think penalty: request > --think-penalty > model-settings.json > off, clamped" {
+test "think penalty: request > --think-penalty > model-settings.json > off" {
     const a = std.testing.allocator;
     const Case = struct { body: []const u8, flag: ?f32, setting: ?f32, want: f32 };
     const cases = [_]Case{
         .{ .body = "{\"think_penalty\":0}", .flag = 2, .setting = 3, .want = 0 },
         .{ .body = "{\"think_penalty\":1.5}", .flag = null, .setting = null, .want = 1.5 },
-        .{ .body = "{\"think_penalty\":-4}", .flag = 2, .setting = null, .want = 0 },
-        .{ .body = "{\"think_penalty\":1e9}", .flag = null, .setting = null, .want = model_settings.think_penalty_max },
         .{ .body = "{\"think_penalty\":\"2\"}", .flag = 2, .setting = 3, .want = 2 },
         .{ .body = "{}", .flag = null, .setting = 3, .want = 3 },
         .{ .body = "{}", .flag = null, .setting = null, .want = 0 },

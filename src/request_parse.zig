@@ -6,28 +6,23 @@ const std = @import("std");
 const jsonEscape = @import("http.zig").jsonEscape;
 const trunk = @import("trunk.zig");
 const json_schema = @import("json_schema.zig");
+const model_settings = @import("model_settings.zig");
 const testing = std.testing;
 
-/// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
-/// from an explicit value, for fields whose default comes from the
-/// resolution chain above.
-pub fn parseJsonFloatOpt(root: std.json.ObjectMap, key: []const u8, min: f32, max: f32) ?f32 {
-    const v = root.get(key) orelse return null;
-    const raw: f32 = switch (v) {
+/// A float body field after `generationFieldFault`: null when omitted, so the resolution chain supplies the default.
+pub fn parseJsonFloatOpt(root: std.json.ObjectMap, key: []const u8) ?f32 {
+    return switch (root.get(key) orelse return null) {
         .float => |f| @floatCast(f),
         .integer => |i| @floatFromInt(i),
-        else => return null,
+        else => null,
     };
-    return std.math.clamp(raw, min, max);
 }
 
-/// Optional top_k body-field parse (positive integer, capped at 1000).
-/// null = omitted or unusable; explicit 0 means "disable top-k".
+/// Optional top_k body field after `generationFieldFault`; null = omitted, 0 disables top-k.
 pub fn parseJsonTopKOpt(root: std.json.ObjectMap, key: []const u8) ?u32 {
-    const v = root.get(key) orelse return null;
-    return switch (v) {
-        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
-        .float => |f| if (f > 0) @intFromFloat(@min(f, 1000)) else 0,
+    return switch (root.get(key) orelse return null) {
+        .integer => |i| @intCast(i),
+        .float => |f| @intFromFloat(f),
         else => null,
     };
 }
@@ -110,11 +105,6 @@ pub fn messageReasoningFromObj(obj: std.json.ObjectMap) ?[]const u8 {
 pub fn parseRequestSeed(v: ?std.json.Value) ?u64 {
     const i = wholeNumber(v orelse return null) orelse return null;
     return if (i < 0) null else @as(u64, @intCast(i));
-}
-
-/// A client-supplied JSON integer narrowed to i32 by clamping, never by `@intCast`.
-pub fn clampJsonI32(i: i64) i32 {
-    return @intCast(std.math.clamp(i, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
 /// Widest string `describeMaxTokens` writes: a 10-digit budget plus
@@ -273,27 +263,67 @@ fn fieldFault(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.bufPrint(buf, fmt, args) catch "a request field has an invalid value";
 }
 
-/// A number field: a value of another type is refused. A number outside the range the sampler reads is clamped
-/// into it, not refused.
-fn numberFault(buf: []u8, root: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+/// A number field: a value of another type or outside `min..max` is refused, never clamped.
+fn numberFault(buf: []u8, root: std.json.ObjectMap, key: []const u8, min: f64, max: f64) ?[]const u8 {
     const v = root.get(key) orelse return null;
-    if (v == .null or numberOf(v) != null) return null;
-    return fieldFault(buf, "'{s}' must be a number", .{key});
+    if (v == .null) return null;
+    const n = numberOf(v) orelse return fieldFault(buf, "'{s}' must be a number from {d} to {d}", .{ key, min, max });
+    if (n < min or n > max) return fieldFault(buf, "'{s}' must be a number from {d} to {d}", .{ key, min, max });
+    return null;
 }
+
+const NumberRange = struct { key: []const u8, min: f64, max: f64 };
+// OpenAI's ranges; `top_k` is capped by the sampler's rank search, and 0 turns a filter off.
+const sampling_ranges = [_]NumberRange{
+    .{ .key = "temperature", .min = 0, .max = 2 },
+    .{ .key = "top_p", .min = 0, .max = 1 },
+    .{ .key = "top_k", .min = 0, .max = 1000 },
+    .{ .key = "presence_penalty", .min = -2, .max = 2 },
+    .{ .key = "frequency_penalty", .min = -2, .max = 2 },
+    .{ .key = "repeat_penalty", .min = 0, .max = 10 },
+    .{ .key = "repetition_penalty", .min = 0, .max = 10 },
+    .{ .key = "think_penalty", .min = 0, .max = model_settings.think_penalty_max },
+};
+
+/// `reasoning_budget_tokens` and Anthropic's `thinking.budget_tokens` are 32-bit integers; -1 is no cap.
+fn reasoningBudgetFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    const thinking: ?std.json.ObjectMap = if (root.get("thinking")) |t| (if (t == .object) t.object else null) else null;
+    const sources = [_]struct { name: []const u8, obj: ?std.json.ObjectMap, key: []const u8 }{
+        .{ .name = "reasoning_budget_tokens", .obj = root, .key = "reasoning_budget_tokens" },
+        .{ .name = "thinking.budget_tokens", .obj = thinking, .key = "budget_tokens" },
+    };
+    for (sources) |src| {
+        const v = (src.obj orelse continue).get(src.key) orelse continue;
+        if (v == .null) continue;
+        if (v != .integer or v.integer < std.math.minInt(i32) or v.integer > std.math.maxInt(i32)) {
+            return fieldFault(buf, "'{s}' must be an integer that fits in 32 bits", .{src.name});
+        }
+    }
+    return null;
+}
+
+pub const MAX_TOP_LOGPROBS: i64 = 20;
 
 /// The first bad value among the fields every generation surface reads the same way, as a message naming the
 /// field. A field that is absent or null is the default; a value of the wrong type or outside its range is
-/// refused, never silently read as absent. `max_tokens` of 0 or less is the documented "rest of the window".
+/// refused, never clamped or read as absent. A `max_tokens` of 0 is the documented "rest of the window".
 pub fn generationFieldFault(buf: []u8, root: std.json.ObjectMap, keys: GenerationKeys) ?[]const u8 {
     for (keys.max_tokens) |k| {
         const v = root.get(k) orelse continue;
-        if (v != .null and wholeNumber(v) == null) return fieldFault(buf, "'{s}' must be an integer", .{k});
+        if (v == .null) continue;
+        const n = wholeNumber(v) orelse return fieldFault(buf, "'{s}' must be an integer", .{k});
+        if (n < 0 or n > std.math.maxInt(u32)) return fieldFault(buf, "'{s}' must be an integer from 0 (the rest of the window) to {d}", .{ k, std.math.maxInt(u32) });
     }
-    for ([_][]const u8{ "temperature", "top_p", "presence_penalty", "frequency_penalty", "repeat_penalty", "repetition_penalty", "top_k" }) |k| {
-        if (numberFault(buf, root, k)) |m| return m;
+    for (sampling_ranges) |r| {
+        if (numberFault(buf, root, r.key, r.min, r.max)) |m| return m;
     }
-    // An integer wider than i64 reads as unseeded.
-    if (root.get("seed")) |v| if (v != .null and v != .number_string and wholeNumber(v) == null) return "'seed' must be an integer; a negative one means unseeded";
+    if (root.get("top_logprobs")) |v| if (v != .null) {
+        const n = wholeNumber(v) orelse return "'top_logprobs' must be an integer from 0 to 20";
+        if (n < 0 or n > MAX_TOP_LOGPROBS) return "'top_logprobs' must be an integer from 0 to 20";
+    };
+    if (reasoningBudgetFault(buf, root)) |m| return m;
+    // A negative seed is the documented "unseeded"; an integer wider than i64 is no seed at all.
+    if (root.get("seed")) |v| if (v != .null and wholeNumber(v) == null) return "'seed' must be an integer that fits in 64 bits; a negative one means unseeded";
     if (keys.stop) |sk| if (root.get(sk)) |v| switch (v) {
         .null, .string => {},
         .array => |arr| for (arr.items) |item| {
@@ -307,16 +337,37 @@ pub fn generationFieldFault(buf: []u8, root: std.json.ObjectMap, keys: Generatio
     return null;
 }
 
-/// `strict: true` promises the output conforms: a schema the grammar cannot enforce is a message naming the
-/// construct (caller frees), where a non-strict one falls back to prompt-only guidance.
-pub fn strictSchemaFault(allocator: std.mem.Allocator, json_schema_obj: std.json.ObjectMap) ?[]u8 {
-    const strict = json_schema_obj.get("strict") orelse return null;
-    if (strict != .bool or !strict.bool) return null;
-    const schema = json_schema_obj.get("schema") orelse return null;
+/// Whether the request declares at least one tool: `tools` null or `[]` is no tools.
+pub fn toolsDeclared(root: std.json.ObjectMap) bool {
+    const t = root.get("tools") orelse return false;
+    return t == .array and t.array.items.len > 0;
+}
+
+/// Where a surface carries a structured-output schema: the object holding `schema` and `strict`, named for messages.
+pub const SchemaHolder = struct {
+    obj: std.json.ObjectMap,
+    path: []const u8,
+    /// Anthropic's `output_config.format` has no `strict`: its schema is always meant to be enforced.
+    implied_strict: bool = false,
+};
+
+/// `strict: true` promises the output conforms. A strict schema the grammar cannot enforce, or one that cannot be
+/// enforced because `has_tools` keeps the grammar off, is a message naming why (caller frees). A non-strict one falls
+/// back to prompt-only guidance.
+pub fn strictSchemaFault(allocator: std.mem.Allocator, holder: SchemaHolder, has_tools: bool) ?[]u8 {
+    const flag = holder.obj.get("strict");
+    const explicit = flag != null and flag.? == .bool;
+    const strict = if (explicit) flag.?.bool else holder.implied_strict;
+    if (!strict) return null;
+    if (has_tools) {
+        if (!explicit) return null;
+        return std.fmt.allocPrint(allocator, "{s}.strict is true, but the schema is not enforced while tools are present: remove strict or the tools", .{holder.path}) catch null;
+    }
+    const schema = holder.obj.get("schema") orelse return null;
     var detail: json_schema.Detail = .{};
     var parsed = json_schema.parseExplained(allocator, schema, &detail) catch |err| {
         const what = if (detail.len > 0) detail.text() else @errorName(err);
-        return std.fmt.allocPrint(allocator, "response_format.json_schema.schema cannot be enforced while strict is true: unsupported {s}", .{what}) catch null;
+        return std.fmt.allocPrint(allocator, "{s}.schema cannot be enforced as a strict schema: unsupported {s}", .{ holder.path, what }) catch null;
     };
     parsed.deinit();
     return null;
@@ -393,9 +444,6 @@ pub fn chatFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
             if (std.mem.eql(u8, role.string, r)) break;
         } else return fieldFault(buf, "'messages[{d}].role' must be one of system, developer, user, assistant, tool or function; got \"{s}\"", .{ i, role.string[0..@min(role.string.len, 32)] });
     };
-    if (root.get("top_logprobs")) |v| if (v != .null) {
-        if (wholeNumber(v) == null) return "'top_logprobs' must be an integer";
-    };
     if (root.get("response_format")) |rf| switch (rf) {
         .null => {},
         .object => |o| {
@@ -424,9 +472,32 @@ test "generationFieldFault names the field a bad value sits in" {
         .{ .body = "{\"max_tokens\":7,\"temperature\":0,\"top_p\":1,\"top_k\":40,\"seed\":-1,\"stop\":[\"a\"],\"kv_quant\":\"off\"}", .field = null },
         .{ .body = "{\"max_tokens\":7.0,\"seed\":5.0,\"top_k\":0,\"max_completion_tokens\":null,\"kv_quant\":16}", .field = null },
         .{ .body = "{\"max_tokens\":0}", .field = null },
-        .{ .body = "{\"temperature\":-1,\"top_p\":2,\"top_k\":-5,\"presence_penalty\":3,\"top_logprobs\":50,\"seed\":9223372036854775808}", .field = null },
-        .{ .body = "{\"max_tokens\":-1}", .field = null },
-        .{ .body = "{\"stop\":null,\"temperature\":null,\"top_k\":-1}", .field = null },
+        .{ .body = "{\"temperature\":2,\"top_p\":0,\"top_k\":1000,\"presence_penalty\":-2,\"frequency_penalty\":2,\"repeat_penalty\":10,\"top_logprobs\":20,\"seed\":-5,\"max_output_tokens\":0}", .field = null },
+        .{ .body = "{\"stop\":null,\"temperature\":null,\"top_k\":null,\"top_logprobs\":null}", .field = null },
+        .{ .body = "{\"temperature\":-1}", .field = "temperature" },
+        .{ .body = "{\"temperature\":100}", .field = "temperature" },
+        .{ .body = "{\"top_p\":2}", .field = "top_p" },
+        .{ .body = "{\"top_p\":-0.1}", .field = "top_p" },
+        .{ .body = "{\"top_k\":-3}", .field = "top_k" },
+        .{ .body = "{\"top_k\":1001}", .field = "top_k" },
+        .{ .body = "{\"presence_penalty\":3}", .field = "presence_penalty" },
+        .{ .body = "{\"frequency_penalty\":-2.5}", .field = "frequency_penalty" },
+        .{ .body = "{\"repeat_penalty\":11}", .field = "repeat_penalty" },
+        .{ .body = "{\"repetition_penalty\":-1}", .field = "repetition_penalty" },
+        .{ .body = "{\"top_logprobs\":50}", .field = "top_logprobs" },
+        .{ .body = "{\"top_logprobs\":-1}", .field = "top_logprobs" },
+        .{ .body = "{\"top_logprobs\":\"5\"}", .field = "top_logprobs" },
+        .{ .body = "{\"top_logprobs\":2.5}", .field = "top_logprobs" },
+        .{ .body = "{\"seed\":9223372036854775808}", .field = "seed" },
+        .{ .body = "{\"max_tokens\":-1}", .field = "max_tokens" },
+        .{ .body = "{\"max_completion_tokens\":-5}", .field = "max_completion_tokens" },
+        .{ .body = "{\"max_tokens\":4294967296}", .field = "max_tokens" },
+        .{ .body = "{\"think_penalty\":-4}", .field = "think_penalty" },
+        .{ .body = "{\"think_penalty\":1e9}", .field = "think_penalty" },
+        .{ .body = "{\"reasoning_budget_tokens\":-1,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048},\"think_penalty\":20}", .field = null },
+        .{ .body = "{\"reasoning_budget_tokens\":1099511627776}", .field = "reasoning_budget_tokens" },
+        .{ .body = "{\"reasoning_budget_tokens\":\"64\"}", .field = "reasoning_budget_tokens" },
+        .{ .body = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":99999999999}}", .field = "thinking.budget_tokens" },
         .{ .body = "{\"max_tokens\":7.9}", .field = "max_tokens" },
         .{ .body = "{\"max_tokens\":\"7\"}", .field = "max_tokens" },
         .{ .body = "{\"max_tokens\":true}", .field = "max_tokens" },
@@ -458,22 +529,31 @@ test "generationFieldFault names the field a bad value sits in" {
     }
 }
 
-test "strictSchemaFault refuses only a strict schema the grammar cannot enforce, naming the construct" {
+test "strictSchemaFault refuses a strict schema the grammar cannot enforce or tools would leave unenforced" {
     const a = testing.allocator;
     const bad = "\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"nonsense\"}}}";
-    const Case = struct { body: []const u8, names: ?[]const u8 };
+    const good = "\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}";
+    const Case = struct { body: []const u8, tools: bool, implied: bool = false, names: ?[]const u8 };
     const cases = [_]Case{
-        .{ .body = "{\"strict\":true," ++ bad ++ "}", .names = "type 'nonsense'" },
-        .{ .body = "{\"strict\":false," ++ bad ++ "}", .names = null },
-        .{ .body = "{" ++ bad ++ "}", .names = null },
-        .{ .body = "{\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}}", .names = null },
+        .{ .body = "{\"strict\":true," ++ bad ++ "}", .tools = false, .names = "type 'nonsense'" },
+        .{ .body = "{\"strict\":false," ++ bad ++ "}", .tools = false, .names = null },
+        .{ .body = "{" ++ bad ++ "}", .tools = false, .names = null },
+        .{ .body = "{\"strict\":true," ++ good ++ "}", .tools = false, .names = null },
+        .{ .body = "{\"strict\":true," ++ good ++ "}", .tools = true, .names = "not enforced while tools are present" },
+        .{ .body = "{\"strict\":false," ++ good ++ "}", .tools = true, .names = null },
+        .{ .body = "{" ++ good ++ "}", .tools = true, .names = null },
+        .{ .body = "{" ++ bad ++ "}", .tools = false, .implied = true, .names = "type 'nonsense'" },
+        .{ .body = "{" ++ good ++ "}", .tools = true, .implied = true, .names = null },
+        .{ .body = "{\"strict\":false," ++ bad ++ "}", .tools = false, .implied = true, .names = null },
     };
     for (cases) |c| {
         var parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
         defer parsed.deinit();
-        const got = strictSchemaFault(a, parsed.value.object);
+        const got = strictSchemaFault(a, .{ .obj = parsed.value.object, .path = "text.format", .implied_strict = c.implied }, c.tools);
         defer if (got) |g| a.free(g);
+        errdefer std.debug.print("\nbody: {s} tools: {}\ngot: {?s}\n", .{ c.body, c.tools, got });
         if (c.names) |n| {
+            try testing.expect(std.mem.startsWith(u8, got.?, "text.format."));
             try testing.expect(std.mem.indexOf(u8, got.?, n) != null);
         } else try testing.expectEqual(@as(?[]u8, null), got);
     }
@@ -513,8 +593,6 @@ test "chatFieldFault refuses an unknown role, response_format type, malformed to
         .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a\",\"parameters\":\"bad\"}}]}", .field = "tools[0].parameters" },
         .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a\"}},{\"type\":\"function\",\"function\":{\"name\":\"a\"}}]}", .field = "tools[1]" },
         .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"my tool/v1.2\"}}]}", .field = "tools[0]" },
-        .{ .body = "{\"top_logprobs\":\"5\"}", .field = "top_logprobs" },
-        .{ .body = "{\"top_logprobs\":20,\"logprobs\":true}", .field = null },
         .{ .body = "{\"tool_choice\":\"sometimes\"}", .field = "tool_choice" },
         .{ .body = "{\"tool_choice\":7}", .field = "tool_choice" },
     };
@@ -922,14 +1000,12 @@ test "?model= is percent-decoded out of a bodiless GET and a missing or empty on
     try testing.expect(queryModel(&buf, "/props?model=") == null);
 }
 
-test "a seed is a non-negative integer, a wide client integer clamps to i32, a cancel id is a number or a numeric string" {
+test "a seed is a non-negative integer, a cancel id is a number or a numeric string" {
     try testing.expectEqual(@as(?u64, 7), parseRequestSeed(.{ .integer = 7 }));
     try testing.expectEqual(@as(?u64, 7), parseRequestSeed(.{ .float = 7.0 }));
     try testing.expectEqual(@as(?u64, null), parseRequestSeed(.{ .integer = -1 }));
     try testing.expectEqual(@as(?u64, null), parseRequestSeed(.{ .string = "7" }));
     try testing.expectEqual(@as(?u64, null), parseRequestSeed(null));
-    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), clampJsonI32(1 << 40));
-    try testing.expectEqual(@as(i32, std.math.minInt(i32)), clampJsonI32(-(1 << 40)));
     const a = testing.allocator;
     try testing.expectEqual(@as(?u64, 12), parseCancelRequestId(a, "{\"id\":12}"));
     try testing.expectEqual(@as(?u64, 12), parseCancelRequestId(a, "{\"request_id\":\"12\"}"));

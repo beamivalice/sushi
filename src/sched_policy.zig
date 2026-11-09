@@ -318,8 +318,8 @@ pub fn specTickMode(
 pub const PREFILL_DECODE_SHARE_MAX: f32 = 0.9;
 pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
     const v = std.fmt.parseFloat(f32, text) catch return error.InvalidDecodeShare;
-    if (std.math.isNan(v) or v < 0) return error.InvalidDecodeShare;
-    return @min(v, PREFILL_DECODE_SHARE_MAX);
+    if (!(v >= 0 and v <= PREFILL_DECODE_SHARE_MAX)) return error.InvalidDecodeShare;
+    return v;
 }
 pub fn decodeShareBudgetNs(chunk_ns: u64, share: f32) u64 {
     if (std.math.isNan(share) or share <= 0) return 0;
@@ -802,12 +802,11 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, true));
 }
 
-test "decode share: parse clamps above 0.9 and rejects anything that is not a share" {
+test "decode share: parse takes 0 to 0.9 and rejects anything else" {
     try testing.expectEqual(@as(f32, 0), try parseDecodeShare("0"));
     try testing.expectEqual(@as(f32, 0.5), try parseDecodeShare("0.5"));
-    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("0.95"));
-    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("inf"));
-    for ([_][]const u8{ "", "abc", "nan", "-0.3", "0.5x" }) |bad| {
+    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("0.9"));
+    for ([_][]const u8{ "", "abc", "nan", "inf", "0.95", "1", "-0.3", "0.5x" }) |bad| {
         try testing.expectError(error.InvalidDecodeShare, parseDecodeShare(bad));
     }
 }

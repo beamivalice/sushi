@@ -62,9 +62,10 @@ pub const MtpChoice = struct {
 /// `--vision` (true) / `--no-vision` (false); null = neither given.
 pub var vision_flag: ?bool = null;
 
-pub fn visionFlagFrom(vision: bool, no_vision: bool) error{VisionFlagConflict}!?bool {
-    if (vision and no_vision) return error.VisionFlagConflict;
-    return if (vision) true else if (no_vision) false else null;
+/// A `--x` / `--no-x` pair: null when neither was given, an error when both were.
+pub fn onOffFlagFrom(on: bool, off: bool) error{FlagConflict}!?bool {
+    if (on and off) return error.FlagConflict;
+    return if (on) true else if (off) false else null;
 }
 
 /// Whether a load brings up the checkpoint's vision tower, when it has one.
@@ -1013,12 +1014,12 @@ test "vision: a streamed load leaves the tower off unless --vision or the per-mo
     try t.expect(!VisionChoice.resolve(null, false, true).on);
 }
 
-test "vision: --vision and --no-vision together are refused; either alone is the flag" {
+test "a --x / --no-x pair together is refused; either alone is the flag" {
     const t = std.testing;
-    try t.expectEqual(@as(?bool, null), try visionFlagFrom(false, false));
-    try t.expectEqual(@as(?bool, true), try visionFlagFrom(true, false));
-    try t.expectEqual(@as(?bool, false), try visionFlagFrom(false, true));
-    try t.expectError(error.VisionFlagConflict, visionFlagFrom(true, true));
+    try t.expectEqual(@as(?bool, null), try onOffFlagFrom(false, false));
+    try t.expectEqual(@as(?bool, true), try onOffFlagFrom(true, false));
+    try t.expectEqual(@as(?bool, false), try onOffFlagFrom(false, true));
+    try t.expectError(error.FlagConflict, onOffFlagFrom(true, true));
 }
 
 test "model_settings: vision is a bool, anything else is unset" {

@@ -144,6 +144,8 @@ pub const TextFormat = struct {
     kind: []const u8,
     /// When kind == "json_schema": the schema value to enforce.
     schema_value: ?std.json.Value,
+    /// The object that holds `schema` (and `strict`) on the wire.
+    holder: ?std.json.ObjectMap = null,
 };
 
 /// Decode the `text` field of a Responses request. Accepts both shapes:
@@ -161,12 +163,14 @@ pub fn parseTextFormat(text_val: ?std.json.Value) TextFormat {
     const t = if (t_val == .string) t_val.string else "text";
     // Prefer flat `schema`; fall back to nested `json_schema.schema`.
     var schema = fmt_val.object.get("schema");
+    var holder = fmt_val.object;
     if (schema == null) {
         if (fmt_val.object.get("json_schema")) |js| if (js == .object) {
             schema = js.object.get("schema");
+            holder = js.object;
         };
     }
-    return .{ .kind = t, .schema_value = schema };
+    return .{ .kind = t, .schema_value = schema, .holder = holder };
 }
 
 /// Decode a chat-completions-style `response_format` field as an alternative to
@@ -181,12 +185,14 @@ pub fn parseResponseFormatAlias(rf_val: ?std.json.Value) TextFormat {
     const t_val = v.object.get("type") orelse return .{ .kind = "text", .schema_value = null };
     const t = if (t_val == .string) t_val.string else "text";
     var schema = v.object.get("schema");
+    var holder = v.object;
     if (schema == null) {
         if (v.object.get("json_schema")) |js| if (js == .object) {
             schema = js.object.get("schema");
+            holder = js.object;
         };
     }
-    return .{ .kind = t, .schema_value = schema };
+    return .{ .kind = t, .schema_value = schema, .holder = holder };
 }
 
 pub fn inputContainsFunctionCallOutput(input_val: std.json.Value) bool {
@@ -919,6 +925,7 @@ test "parseTextFormat extracts schema from nested json_schema shape" {
     const tf = parseTextFormat(parsed.value);
     try testing.expectEqualStrings("json_schema", tf.kind);
     try testing.expect(tf.schema_value != null);
+    try testing.expect(tf.holder.?.get("strict").?.bool);
 }
 
 test "parseResponseFormatAlias accepts chat-style nested shape" {
@@ -930,6 +937,7 @@ test "parseResponseFormatAlias accepts chat-style nested shape" {
     const tf = parseResponseFormatAlias(parsed.value);
     try testing.expectEqualStrings("json_schema", tf.kind);
     try testing.expect(tf.schema_value != null);
+    try testing.expect(tf.holder.?.get("strict").?.bool);
 }
 
 test "parseResponseFormatAlias accepts flat shape too" {

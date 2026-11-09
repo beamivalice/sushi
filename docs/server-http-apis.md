@@ -144,8 +144,8 @@ answers while the weights load:
   markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
   carries the pre-markup text (`visibleToolPreamble`); a non-stream disconnect reports `client_disconnect`, never
   `length`, and is noticed after every decoded token as well as during prefill, so a client's timed-out retry never
-  leaves a ghost decoding to `max_tokens`; request ints clamp (`parseRequestSeed`,
-  `clampJsonI32`).
+  leaves a ghost decoding to `max_tokens`; a request integer outside the range its field takes is a 400, never narrowed
+  (`generationFieldFault`).
 - **A stop sequence cuts at the EARLIEST occurrence in the text** (shortest stop at the same start, never the first one
   listed): `stop_sequences.earliest` on every non-stream surface, `stop_sequences.Gate` on every stream, ahead of the
   reasoning/content/tool paths. The gate HOLDS back a tail that could still complete a stop (or an earlier match) and
@@ -205,12 +205,19 @@ before reading a completed stream and requires clean EOF.
   one check for chat, completions, Messages and Responses; `chatFieldFault` adds roles, `response_format.type`, `tools`
   and `tool_choice`): `max_tokens`/`max_completion_tokens` (the latter supersedes) and `seed` take an integer or a whole
   float (`7.0`); `temperature`, `top_p`, `top_k`, the penalties and `top_logprobs` take a number; `stop` a string or
-  strings; `kv_quant` `off|0|4|6|8|16`; null is absent. A wrong type is a 400 naming the field. A number out of range
-  is CLAMPED, not refused (`tests/test_api_edges.sh`): `temperature` 100 runs at 2, and a token budget of 0 or less is
-  the "rest of the window" (the app's Auto sends 0). A tool name the call markup cannot carry (whitespace, quote, angle bracket) or a
+  strings; `kv_quant` `off|0|4|6|8|16`; null is absent. A wrong type is a 400 naming the field, and so is a number out of
+  its range, with the range in the message (`tests/test_api_edges.sh`): `temperature` 0..2, `top_p` 0..1, `top_k` 0..1000
+  (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `think_penalty` 0..20, `top_logprobs`
+  and the legacy `logprobs` 0..20, `max_tokens` 0..4294967295 where 0 is the "rest of the window" (the app's Auto sends 0)
+  and a negative is refused, `seed` any 64-bit integer (a negative one means unseeded, a wider one is refused),
+  `reasoning_budget_tokens` and `thinking.budget_tokens` 32-bit integers. A budget past the context window is
+  still cut to what the window leaves (`clampMaxTokens`, a log line). A tool name the call markup cannot carry (whitespace, quote, angle bracket) or a
   repeated one is a 400, since the model's call to it would parse to nothing. `response_format` `strict: true` with a
-  schema the grammar cannot enforce is a 400 naming the construct (`request_parse.strictSchemaFault`); without `strict` it
-  falls back to the prompt, logged `[grammar]`.
+  schema the grammar cannot enforce is a 400 naming the construct, on chat, Responses `text.format` and Anthropic
+  `output_config.format` alike (`request_parse.strictSchemaFault`; Anthropic's format has no `strict` and counts as
+  strict); without `strict` it falls back to the prompt, logged `[grammar]`. While tools are declared (and `tool_choice`
+  is not `none`) the grammar is off so a tool call stays reachable: the schema is then NOT enforced, and an explicit
+  `strict: true` beside tools is a 400 saying so.
 - Top-k and top-p are ONE pass (`sampler.filterTopKTopP`); a filter cuts by RANK, never by value (bf16 ties at the top
   constantly; `sampler.ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
   `top_p` 0 is GREEDY (`sampler.applyTopP` floors at `floatMin(f32)`).

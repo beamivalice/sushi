@@ -500,8 +500,8 @@ fn handleResponsesInner(
     };
     const max_tokens: u32 = req_max_output_tokens orelse
         (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(config));
-    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature", 0.0, 2.0));
-    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p", 0.0, 1.0));
+    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature"));
+    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p"));
     const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
     const frequency_penalty = parseAdditivePenalty(root, "frequency_penalty");
     const repeat_penalty = parseRepeatPenalty(root);
@@ -509,10 +509,7 @@ fn handleResponsesInner(
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
-    const top_logprobs_echo: u32 = if (root.get("top_logprobs")) |v| switch (v) {
-        .integer => |i| if (i >= 0 and i <= 20) @intCast(i) else 0,
-        else => 0,
-    } else 0;
+    const top_logprobs_echo: u32 = if (root.get("top_logprobs")) |v| (if (request_parse.wholeNumber(v)) |n| @intCast(n) else 0) else 0;
     const max_tool_calls_echo: ?u32 = if (root.get("max_tool_calls")) |v| switch (v) {
         .integer => |i| if (i >= 0) @as(?u32, @intCast(i)) else null,
         else => null,
@@ -596,7 +593,7 @@ fn handleResponsesInner(
     defer if (tools_json_owned) {
         if (tools_json) |tj| allocator.free(tj);
     };
-    var has_tools = root.get("tools") != null;
+    var has_tools = request_parse.toolsDeclared(root);
 
     const tool_choice = tool_calls_mod.parseToolChoice(root.get("tool_choice"));
     const tool_choice_instruction = try tool_choice.instruction(allocator);
@@ -628,6 +625,14 @@ fn handleResponsesInner(
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
+    if (std.mem.eql(u8, text_format.kind, "json_schema")) if (text_format.holder) |holder| {
+        if (request_parse.strictSchemaFault(allocator, .{ .obj = holder, .path = "text.format" }, active_has_tools)) |why| {
+            defer allocator.free(why);
+            log.warn("POST /v1/responses -> 400 (strict schema not enforceable)\n", .{});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+            return;
+        }
+    };
     // ── model name ──
     const model_name = if (root.get("model")) |v|
         (if (v == .string) v.string else servedModelId(lm, config))

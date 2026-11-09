@@ -61,7 +61,7 @@ req POST /v1/chat/completions '{"model":"m","messages":"x"}';       expect_statu
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"n\":2}"; expect_status 400 "n>1"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"max_tokens\":5,$NT_CHAT,\"x\":$(python3 -c 'print("["*3000+"]"*3000)')}"
 expect_status 400 "3000-deep nesting is refused"
-req GET  /v1/chat/completions;                                      expect_status 404 "GET on a POST route"
+req GET  /v1/chat/completions;                                      expect_status 405 "GET on a POST route"
 req POST /v1/bogus '{"model":"m"}';                                 expect_status 404 "unknown route"
 req OPTIONS /v1/chat/completions;                                   expect_status 204 "CORS preflight"
 
@@ -74,11 +74,26 @@ T0=$(echo "$BODY" | J "$GENERATED")
 [[ -n "$GREEDY" && "$GREEDY" == "$T0" ]] && ok "top_p 0 is greedy (== temperature 0)" || bad "top_p 0 is greedy" "top_p0='$GREEDY' temp0='$T0'"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"top_k\":1,\"temperature\":1.0,\"max_tokens\":8,\"enable_mtp\":false,$NT_CHAT}"
 [[ -n "$T0" && "$(echo "$BODY" | J "$GENERATED")" == "$T0" ]] && ok "top_k 1 is greedy" || bad "top_k 1 is greedy"
-for f in '"temperature":-1' '"temperature":100' '"top_p":2' '"top_k":-3' '"seed":9223372036854775808' '"max_tokens":0' '"max_tokens":-5' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":2'; do
+# a value the sampler cannot honour as given is refused naming the field, never clamped
+for f in 'temperature|"temperature":-1' 'temperature|"temperature":100' 'top_p|"top_p":2' 'top_k|"top_k":-3' 'top_k|"top_k":5000' \
+         'seed|"seed":9223372036854775808' 'max_tokens|"max_tokens":-5' 'presence_penalty|"presence_penalty":3' \
+         'repeat_penalty|"repeat_penalty":-1' 'top_logprobs|"logprobs":true,"top_logprobs":50' 'think_penalty|"think_penalty":99'; do
+    key=${f%%|*}; field=${f#*|}
+    [[ "$key" == max_tokens ]] && cap="" || cap=',"max_tokens":5'
+    req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$field$cap,$NT_CHAT}"
+    [[ "$R" == 400 && "$(echo "$BODY" | J 'd["error"]["message"]')" == *"'$key'"* ]] && ok "out-of-range $field is refused naming $key" || bad "out-of-range $field" "$R ${BODY:0:120}"
+done
+for f in '"max_tokens":0' '"temperature":2,"top_p":0,"top_k":1000' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":-2' '"seed":-1'; do
     [[ "$f" == '"max_tokens"'* ]] && cap="" || cap=',"max_tokens":5'
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$f$cap,$NT_CHAT}"
-    [[ "$R" == 200 && -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "out-of-range $f answers" || bad "out-of-range $f" "$R ${BODY:0:120}"
+    [[ "$R" == 200 && -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "edge value $f answers" || bad "edge value $f" "$R ${BODY:0:120}"
 done
+req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":5,\"temperature\":5,\"messages\":[$U]}"
+expect_status 400 "messages: temperature 5 is refused"
+req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"$N hi\",\"max_tokens\":5,\"logprobs\":99}"
+expect_status 400 "completions: logprobs 99 is refused"
+req POST /v1/responses '{"model":"m","max_output_tokens":-3,"input":"hi"}'
+expect_status 400 "responses: negative max_output_tokens is refused"
 
 for f in '"temperature":"hot"' '"top_p":true' '"seed":"abc"' '"stop":5' '"max_tokens":"7"' '"kv_quant":5' '"n":0'; do
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$f,$NT_CHAT}"
@@ -106,6 +121,20 @@ req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":20,\"output_config\":{\"f
 expect_status 400 "messages: output_config json_schema without a schema"
 req POST /v1/responses '{"model":"m","max_output_tokens":20,"text":{"format":{"type":"json_schema","name":"x","schema":"nope"}},"input":"hi"}'
 expect_status 400 "responses: text.format json_schema with a non-object schema"
+BADSCHEMA='{"type":"object","properties":{"x":{"type":"nonsense"}}}'
+GOODSCHEMA='{"type":"object","properties":{"x":{"type":"string"}}}'
+TOOLS='[{"type":"function","function":{"name":"noop","parameters":{"type":"object","properties":{}}}}]'
+req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"x\",\"strict\":true,\"schema\":$GOODSCHEMA}},\"tools\":$TOOLS,\"max_tokens\":20}"
+expect_status 400 "chat: strict json_schema beside tools is refused"
+[[ "$(echo "$BODY" | J 'd["error"]["message"]')" == *"tools are present"* ]] && ok "chat: the refusal says why" || bad "chat: the refusal says why" "${BODY:0:160}"
+req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"x\",\"schema\":$GOODSCHEMA}},\"tools\":$TOOLS,\"max_tokens\":20,$NT_CHAT}"
+expect_status 200 "chat: non-strict json_schema beside tools answers"
+req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":20,\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":$BADSCHEMA}},\"messages\":[$U]}"
+expect_status 400 "messages: output_config schema the grammar cannot parse"
+req POST /v1/responses "{\"model\":\"m\",\"max_output_tokens\":20,\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"x\",\"strict\":true,\"schema\":$BADSCHEMA}},\"input\":\"hi\"}"
+expect_status 400 "responses: strict text.format schema the grammar cannot parse"
+req POST /v1/responses "{\"model\":\"m\",\"max_output_tokens\":20,\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"x\",\"strict\":true,\"schema\":$GOODSCHEMA}},\"tools\":[{\"type\":\"function\",\"name\":\"noop\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"input\":\"hi\"}"
+expect_status 400 "responses: strict text.format beside tools is refused"
 req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":"'"$N"' Describe a cat."}],"response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":{"type":"object","properties":{"kind":{"type":"string","enum":["cat","dog"]},"legs":{"type":"integer"},"tags":{"type":"array","items":{"type":"string"}},"meta":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}},"required":["kind","legs","tags","meta"],"additionalProperties":false}}},"max_tokens":160,"temperature":0,'"$NT_CHAT"'}'
 C=$(echo "$BODY" | J "$CONTENT")
 echo "$C" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["kind"] in ("cat","dog") and isinstance(d["legs"],int) and isinstance(d["tags"],list) and isinstance(d["meta"]["ok"],bool) and set(d)=={"kind","legs","tags","meta"}' 2>/dev/null \

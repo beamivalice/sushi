@@ -72,6 +72,7 @@ pub const ArgError = error{
     MissingPrompts,
     MissingOut,
     MissingFixture,
+    ConflictingFlags,
     TeacherMustBeLossless,
     LayerMajorFlagWithoutLayerMajor,
 };
@@ -150,8 +151,10 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
         } else if (std.mem.eql(u8, a, "--no-template")) {
             o.no_template = true;
         } else if (std.mem.eql(u8, a, "--no-mtp")) {
+            if (o.mtp == true) return error.ConflictingFlags;
             o.mtp = false;
         } else if (std.mem.eql(u8, a, "--mtp")) {
+            if (o.mtp == false) return error.ConflictingFlags;
             o.mtp = true;
         } else if (std.mem.eql(u8, a, "--layer-major")) {
             o.layer_major = true;
@@ -1012,6 +1015,8 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(@as(u32, 64), compare.tokens);
     const with_mtp = try parseArgs(&.{ "compare", "--model", "/models/pack", "--fixture", "/fixtures/teacher", "--mtp" });
     try testing.expect(with_mtp.mtp == true);
+    try testing.expectError(error.ConflictingFlags, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--mtp", "--no-mtp" }));
+    try testing.expectError(error.ConflictingFlags, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--no-mtp", "--mtp" }));
 
     const routed = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.3", "--wired-margin-gib", "5" });
     try testing.expectEqual(@as(f32, 0.3), routed.pick_tolerance);

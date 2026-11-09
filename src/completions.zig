@@ -200,7 +200,11 @@ pub fn handleCompletions(
     // silently ignored field, which reads to a client as "this model has no
     // opinion" rather than "this server never asked".
     const logprobs_n: u32 = if (root.get("logprobs")) |v| switch (v) {
-        .integer => |i| @intCast(@min(@max(i, 0), 20)),
+        .integer => |i| if (i >= 0 and i <= request_parse.MAX_TOP_LOGPROBS) @intCast(i) else {
+            log.warn("POST /v1/completions -> 400 (logprobs out of range)\n", .{});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'logprobs' must be an integer from 0 to 20", 400);
+            return;
+        },
         else => 0,
     } else 0;
 
@@ -345,8 +349,8 @@ pub fn handleCompletions(
 /// then the model's generation config.
 fn requestSampling(config: *const model_mod.ModelConfig, root: std.json.ObjectMap) sampler.SamplingParams {
     return .{
-        .temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature", 0.0, 2.0)),
-        .top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p", 0.0, 1.0)),
+        .temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature")),
+        .top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p")),
         .top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k")),
         .repeat_penalty = parseRepeatPenalty(root),
         .presence_penalty = parseAdditivePenalty(root, "presence_penalty"),

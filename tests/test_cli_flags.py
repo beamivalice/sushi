@@ -64,6 +64,12 @@ refusals = [
     (("serve", "--mtp-typical", "x"), "--mtp-typical: expected a number above 0; got 'x'"),
     (("serve", "--mtp-tokenv3", "2"), "--mtp-tokenv3: expected a number from 0 to 1; got '2'"),
     (("serve", "--mtp-typical", "0.2", "--mtp-tokenv3", "0.5"), "conflict; pass one"),
+    (("serve", "--mtp", "--no-mtp"), "--mtp and --no-mtp conflict; pass one"),
+    (("serve", "--no-mtp", "--mtp"), "--mtp and --no-mtp conflict; pass one"),
+    (("serve", "--api-key", ""), "--api-key: the key is empty"),
+    (("serve", "--max-concurrent", "0"), "--max-concurrent: expected a whole number of at least 1"),
+    (("serve", "--prefill-decode-share", "0.95"), "--prefill-decode-share: expected a number from 0 to 0.9"),
+    (("serve", "--prefill-decode-share", "inf"), "--prefill-decode-share: expected a number from 0 to 0.9"),
     (("repack",), "a pack is required"),
 ]
 for args, message in refusals:
@@ -75,6 +81,43 @@ for args, message in refusals:
 code, _, err = run("serve", "--api-key-env", "SUSHI_API_KEY_TEST_SET", "--temp", "-1")
 check(code != 0 and "--temp" in err and "--api-key-env" not in err, "a set --api-key-env is accepted", err[-300:])
 check(not (root / "--port 18901").exists(), "--log-file did not take --port as its path")
+
+
+
+def registry_cap(*flags):
+    """The `[registry] ... max_resident_mem=` field a model-less server logs at boot, then the server is stopped."""
+    port = free_port(18971)
+    log_path = root / f"registry-{port}.log"
+    with open(log_path, "wb") as sink:
+        proc = subprocess.Popen(
+            [binary, "serve", "--model-dir", str(home / "models"), "--port", str(port), "--no-update-check", *flags],
+            env=env, stdout=sink, stderr=sink,
+        )
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline and proc.poll() is None:
+            text = log_path.read_text(errors="replace")
+            if "max_resident_mem=" in text:
+                return text.split("max_resident_mem=", 1)[1].split()[0]
+            time.sleep(0.25)
+        return log_path.read_text(errors="replace")[-300:]
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)
+
+
+# `auto` means auto wherever it stands: after a size it must not become the 0 that disables the cap.
+for flags, want in [
+    (("--max-resident-mem", "auto"), "GB"),
+    (("--max-resident-mem", "1GB", "--max-resident-mem", "auto"), "GB"),
+    (("--max-resident-mem", "1GB"), "1.0"),
+    (("--max-resident-mem", "0"), "unlimited"),
+]:
+    got = registry_cap(*flags)
+    if want == "GB":
+        check(got.replace(".", "").isdigit() and got not in ("1.0", "0.0"), f"{flags} is the machine's auto cap", got)
+    else:
+        check(got.startswith(want), f"{flags} is {want}", got)
 
 # A subcommand's own errors are sentences, and its --help is usage on stdout.
 for args, message in [

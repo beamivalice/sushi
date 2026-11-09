@@ -6,6 +6,11 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A value the engine will not honour as given is refused by name, never clamped or ignored**: a request `temperature`,
+  `top_p`, `top_k`, penalty, `top_logprobs`, `logprobs`, `think_penalty`, token budget (a negative `max_tokens`) or `seed` outside its range
+  is a 400 that states the range; a strict `json_schema` beside tools, or one the grammar cannot parse, is a 400 on chat,
+  Responses and Messages; and `--mtp` with `--no-mtp`, an empty `--api-key`, `--max-concurrent 0` and a
+  `--prefill-decode-share` above 0.9 exit with an error, while `--max-resident-mem auto` now means auto after a size too.
 - **A model whose SSD prefix cache was declined at load (volume too full, or a failed attach) gets it back by itself**: the
   engine looks once a minute, and at once when an SSD size setting is saved, and logs `[disk-cache] re-armed` when it
   attaches.

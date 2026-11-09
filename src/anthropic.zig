@@ -154,6 +154,8 @@ const AnthropicOutputConfig = struct {
     effort: ?[]const u8 = null,
     /// `format.schema` when `format.type == "json_schema"`; null otherwise.
     schema: ?std.json.Value = null,
+    /// The `format` object that carries `schema`, for the strict-schema check.
+    format_obj: ?std.json.ObjectMap = null,
     /// `format.type == "json_schema"` with no object schema to enforce.
     schema_invalid: bool = false,
 };
@@ -170,8 +172,10 @@ fn parseAnthropicOutputConfig(root: std.json.ObjectMap) AnthropicOutputConfig {
             const ftype = if (f.object.get("type")) |t| (if (t == .string) t.string else "") else "";
             if (std.mem.eql(u8, ftype, "json_schema")) {
                 out.schema = f.object.get("schema");
+                out.format_obj = f.object;
                 if (out.schema == null or out.schema.? != .object) {
                     out.schema = null;
+                    out.format_obj = null;
                     out.schema_invalid = true;
                 }
             }
@@ -529,8 +533,8 @@ pub fn handleAnthropicMessages(
     // model's generation_config.json — Claude Code omits ALL of them, and the
     // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
     // intended envelope (model card wants top_k=20, top_p=0.95).
-    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature", 0.0, 2.0));
-    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p", 0.0, 1.0));
+    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature"));
+    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p"));
     const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -834,6 +838,14 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     if (output_cfg.schema_invalid) {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
         return false;
+    }
+    if (output_cfg.format_obj) |fmt| {
+        if (request_parse.strictSchemaFault(allocator, .{ .obj = fmt, .path = "output_config.format", .implied_strict = true }, p.has_tools)) |why| {
+            defer allocator.free(why);
+            log.warn("POST {s} -> 400 (strict schema not enforceable)\n", .{route.path()});
+            try sendAnthropicError(allocator, stream, "invalid_request_error", why, 400);
+            return false;
+        }
     }
     const effort_snap = effort_mod.snapshot();
     if (request_policy.nonWordEffort(root, .anthropic)) |v| {

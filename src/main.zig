@@ -294,6 +294,8 @@ fn runCli(init: std.process.Init) !void {
     // `--mtp` / `--no-mtp`, the last one given. `--mtp` also forces the head on where requests do not default to
     // it: an SSD-streamed pack and inherited MoE arches (server.defaultEnableMtp).
     var mtp_flag: ?bool = null;
+    var mtp_on = false;
+    var no_mtp = false;
     var mtp_typical_raw: ?[]const u8 = null;
     var mtp_tokenv3_raw: ?[]const u8 = null;
     var kv_quant_flag: ?trunk.KVQuantConfig = null;
@@ -448,8 +450,12 @@ fn runCli(init: std.process.Init) !void {
             metrics_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--api-key") and flag_value.follows(args, i)) {
             i += 1;
-            // Borrowed from argv (lives for the process). Empty ⇒ leave open.
-            if (args[i].len > 0) server_state.g_api_key = args[i];
+            if (args[i].len == 0) {
+                log.err("--api-key: the key is empty, so the server would start without authentication; leave the flag out to run open\n", .{});
+                std.process.exit(1);
+            }
+            // Borrowed from argv (lives for the process).
+            server_state.g_api_key = args[i];
         } else if (std.mem.eql(u8, args[i], "--api-key-strict")) {
             server_state.g_api_key_strict = true;
         } else if (std.mem.eql(u8, args[i], "--api-key-env") and flag_value.follows(args, i)) {
@@ -475,9 +481,9 @@ fn runCli(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-drafter")) {
             no_drafter = true;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
-            mtp_flag = false;
+            no_mtp = true;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
-            mtp_flag = true;
+            mtp_on = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             i += 1;
@@ -581,7 +587,7 @@ fn runCli(init: std.process.Init) !void {
             decode_share_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and flag_value.follows(args, i)) {
             i += 1;
-            server_state.max_concurrent = flagInt(u32, "--max-concurrent", args[i], 0);
+            server_state.max_concurrent = flagInt(u32, "--max-concurrent", args[i], 1);
         } else if (std.mem.eql(u8, args[i], "--model-dir") and flag_value.follows(args, i)) {
             // REPEATABLE. A user's library can live in more than one place (the
             // app's download folder, an external drive, an LM Studio tree), and
@@ -606,11 +612,11 @@ fn runCli(init: std.process.Init) !void {
             max_resident_models = flagInt(u32, "--max-resident-models", args[i], 1);
         } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and flag_value.follows(args, i)) {
             // Plan 05 Phase D: cap on summed resident bytes. Accepts the
-            // same suffixes as --prefix-cache-mem. Special string "auto"
-            // (or default 0) → 80% of mlx_set_wired_limit at server start.
+            // same suffixes as --prefix-cache-mem. "auto" (null, the default)
+            // → 80% of mlx_set_wired_limit at server start; 0 disables the cap.
             i += 1;
             if (std.mem.eql(u8, args[i], "auto")) {
-                if (max_resident_mem_flag != null) max_resident_mem_flag = 0;
+                max_resident_mem_flag = null;
             } else {
                 max_resident_mem_flag = parseSizeArg(args[i]) catch {
                     log.err("--max-resident-mem: expected '<n>{{MB,GB,KB}}' or 'auto'; got '{s}'\n", .{args[i]});
@@ -668,7 +674,11 @@ fn runCli(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
-    model_settings_mod.vision_flag = model_settings_mod.visionFlagFrom(vision, no_vision) catch {
+    mtp_flag = model_settings_mod.onOffFlagFrom(mtp_on, no_mtp) catch {
+        log.err("--mtp and --no-mtp conflict; pass one\n", .{});
+        std.process.exit(1);
+    };
+    model_settings_mod.vision_flag = model_settings_mod.onOffFlagFrom(vision, no_vision) catch {
         log.err("--vision and --no-vision conflict; pass one\n", .{});
         std.process.exit(1);
     };
@@ -699,7 +709,7 @@ fn runCli(init: std.process.Init) !void {
 
     if (decode_share_flag) |text| {
         scheduler_mod.prefill_decode_share = @import("sched_policy.zig").parseDecodeShare(text) catch {
-            log.err("--prefill-decode-share: expected a number >= 0 (above 0.9 clamps), got '{s}'\n", .{text});
+            log.err("--prefill-decode-share: expected a number from 0 to 0.9; got '{s}'\n", .{text});
             std.process.exit(1);
         };
         log.info("[prefill] decode share: configured={d}, effective={d} (--prefill-decode-share)\n", .{
@@ -1557,7 +1567,14 @@ fn parseSizeArg(s: []const u8) !u64 {
     }
     if (end == 0) return error.InvalidSize;
     const n = std.fmt.parseInt(u64, s[0..end], 10) catch return error.InvalidSize;
-    return n * mult;
+    return std.math.mul(u64, n, mult) catch error.InvalidSize;
+}
+
+test "parseSizeArg refuses a size that overflows 64 bits instead of wrapping it" {
+    try std.testing.expectEqual(@as(u64, 3 * 1024 * 1024 * 1024), try parseSizeArg("3GB"));
+    try std.testing.expectEqual(@as(u64, 0), try parseSizeArg("off"));
+    try std.testing.expectError(error.InvalidSize, parseSizeArg("99999999999999999GB"));
+    try std.testing.expectError(error.InvalidSize, parseSizeArg("x"));
 }
 
 test "both boot modes build their server defaults from the same launch flags" {
