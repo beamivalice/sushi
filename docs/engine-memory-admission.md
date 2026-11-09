@@ -286,7 +286,7 @@ request holds, not the ones it captures (`server.ssmResidentCap`, `ssm_cache.SSM
 | storage | held per request | why |
 |---|---:|---|
 | SSD tier up, with or without a RAM tier (the default) | 3 | a write-through prefill holds 2 (the previous newest until its file is written, and the one just taken); a request it cannot serve is thinned to 2 and holds a third while one is captured |
-| RAM only, or the tier declined | up to `--ssm-checkpoint-max` | nowhere else to restore from |
+| RAM only, or the tier declined (until it re-arms) | up to `--ssm-checkpoint-max` | nowhere else to restore from |
 
 The write-through frees the older state the way GLM's does (`DiskTier.settleCheckpoints`: wait out its file, then
 `release`), so the bound is hard, not "whatever has landed". The scheduler thins a request the write-through cannot

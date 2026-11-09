@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A model whose SSD prefix cache was declined at load (volume too full, or a failed attach) gets it back by itself**: the
+  engine looks once a minute, and at once when an SSD size setting is saved, and logs `[disk-cache] re-armed` when it
+  attaches.
 - **The SSD prefix cache reports what it stored beside what it wrote**: `/metrics` adds
   `sushi:prefix_cache_store_bytes_total{kind}` and `/metrics.json` adds `prefix_cache_writes.stored_bytes`, the bytes the
   cache's storage layer put on the SSD, by file kind.

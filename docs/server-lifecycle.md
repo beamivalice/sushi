@@ -357,6 +357,11 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `std.process.spawn` is `posix_spawn`, so the resident engine is never forked); the catalog builds on another detached
   thread. Neither touches MLX. `stopServing` SIGTERMs a running curl and refuses new starts (`downloads.stop`); the partial stays to resume.
 - Sleep inhibition follows the inference-thread wait.
+- **The inference loop re-arms a declined SSD tier between requests** (`rearmDeclinedTiers`): once a minute while a
+  ready model's tier is declined (the idle wait is then timed instead of unbounded), and at once when
+  `POST /v1/settings` saves `prefix_cache_disk_gb` or `ssd_budget_gb` (`Scheduler.requestDiskRearm`). It runs on this thread because the
+  attach builds MLX-adjacent state; it skips a model a request holds. Detail:
+  [engine-prefix-cache](engine-prefix-cache.md#defaults).
 - **The first GPU submission after about a second of idle waits 0.6-1.0 s before any work runs** (M5 Max, MiMo
   2.3bpw, ~90 GB resident, measured on e2d5be76; even a one-element op pays it, and a tick every 2 s does not prevent
   it; [perf-baselines](mimo2-perf.md#mimo-ttft-idle)). For `--gpu-warm-secs` (default 60, 0 = off) after its

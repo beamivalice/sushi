@@ -1518,10 +1518,10 @@ pub fn diskContextForLoad(config: *model_mod.ModelConfig) u64 {
 }
 
 /// The SSD budget the model gets at load, in bytes (0 = tier off); logs the `Allocating` line, or why
-/// there is none. Runs on the inference thread beside `prefixCacheMemForLoad`.
+/// there is none (`quiet`: neither). Runs on the inference thread beside `prefixCacheMemForLoad`.
 /// `held` is what this model's tier already occupies under `dir`: it counts as available, or a restart on a
 /// nearly full volume would evict what the last boot stored.
-pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, held: u64) ?disk_placement.DefaultDiskBudget {
+pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, held: u64, quiet: bool) ?disk_placement.DefaultDiskBudget {
     const kv_bits = defaultKvBits(config);
     const bpt = diskBytesPerToken(config, kv_bits);
     const ask = diskAsk();
@@ -1530,10 +1530,10 @@ pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, h
     const free: u64 = if (disk_placement.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
     var buf: [384]u8 = undefined;
     const plan = disk_placement.resolveDiskBudget(ask.explicit(), ask.bytes, launch_state.prefix_cache_capacity, ctx, bpt, free, held) orelse {
-        log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir, if (ask.explicit() and ask.bytes == 0) ask.sourceName() else null)});
+        if (!quiet) log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir, if (ask.explicit() and ask.bytes == 0) ask.sourceName() else null)});
         return null;
     };
-    log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, launch_state.prefix_cache_capacity, ctx, bpt, dir, ask.sourceName())});
+    if (!quiet) log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, launch_state.prefix_cache_capacity, ctx, bpt, dir, ask.sourceName())});
     return plan;
 }
 

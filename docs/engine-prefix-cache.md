@@ -301,6 +301,19 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
     `ModelConfig.prefix_cache_disk_declined`, and `server.diskTierOn(config)` then answers as `--prefix-cache-disk off`
     for the RAM sizing (`ssdFirstBudgetForLoad`, `reviseHotCacheBudgets`), GLM's writer and checkpoint bills, MiMo's
     restore coexistence and checkpoint capture. With no tier and no RAM the model gets no cache object at all.
+    `attachPrefixCache` (`src/model_load.zig`) is the one function that brings the tier and its cache up, with the
+    settings in `CacheAttach`; the load and the re-arm below call it alike.
+  - **A declined tier re-arms by itself** (`model_load.rearmDiskTier`, run by `scheduler.rearmDeclinedTiers` at the top
+    of the inference loop, between requests): when `statfs` of the cache volume shows free space above the reserve (a
+    non-explicit ask only; an explicit `--prefix-cache-disk` or `prefix_cache_disk_gb` is a size, not a bound by free
+    space), or the moment a `prefix_cache_disk_gb` or `ssd_budget_gb` save lands (`settings_api.reachesSsdTier`; the first changes the ask). The look happens at most once a minute while
+    some ready model is declined (`sched_policy.REARM_PROBE_NS`; the parked loop wakes for it), and never otherwise;
+    a model a request holds is looked at again after 5 s. A check that fails is silent (the resolver runs `quiet`, a
+    fingerprint or init failure logs at debug); one that succeeds logs `[disk-cache] re-armed (<why>): <n> GB at <dir>`
+    and clears `prefix_cache_disk_declined` in the same step as the tier and cache come up, so every bill (they read
+    the flag, `diskTierOn`) rises with the storage. A model whose load built a RAM cache keeps it and its entries and
+    gains the tier (SSD-first on an arch that takes it); one that built none gets the cache, writer, sweep and
+    checkpoint caps a load would give it. The context pinned at load is not re-derived.
 - **Startup prints one line per tier in use**, each starting `Allocating`: `Allocating 20.0 GB SSD for the prefix cache
   (32 entries x 1048576 tokens x 15.5 KB + 2 GB; bound: 20 GB cap) at <dir>` (bound: the formula, `20 GB cap`,
   `free disk - 4 GB` or `the flag`), and `Allocating 2.0 GB RAM for the prefix cache (--prefix-cache-mem)` only when RAM

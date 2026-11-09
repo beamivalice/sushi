@@ -51,7 +51,6 @@ const prefix_cache_mod = @import("prefix_cache.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
-const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const log = @import("log.zig");
@@ -949,7 +948,7 @@ pub const LoadRequest = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget = null,
+    prefix_cache_disk_resolver: ?model_load.DiskResolver = null,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1052,7 +1051,7 @@ pub const Scheduler = struct {
     prefix_cache_ram_enabled: bool,
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget,
+    prefix_cache_disk_resolver: ?model_load.DiskResolver,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
     ssm_checkpoint_stride: u32,
@@ -1151,6 +1150,13 @@ pub const Scheduler = struct {
     unload_queue: std.ArrayList(*UnloadRequest),
     /// SSD prefix-tier clears (`POST /v1/prefix-cache/clear`): the tier is the inference thread's.
     prefix_clear_queue: std.ArrayList(*prefix_cache_admin.ClearRequest),
+    /// A saved SSD-cache setting asks the loop to try again, at once, the tiers the loads declined.
+    rearm_forced: std.atomic.Value(bool),
+    /// Ready models whose SSD tier the load declined while an SSD size is asked (`publishDiskStats`).
+    tiers_declined: std.atomic.Value(u32),
+    /// Inference thread: when the declined tiers were last looked at, and how long until the next look.
+    rearm_sw: io_util.Stopwatch,
+    rearm_wait_ns: u64,
     /// Slots awaiting cleanup. The conn thread queues a slot here in
     /// `complete()` instead of calling `slot.deinit()` directly — `deinit`
     /// frees mlx_arrays via refcount-decrement, and the underlying GPU
@@ -1275,6 +1281,10 @@ pub const Scheduler = struct {
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .prefix_clear_queue = std.ArrayList(*prefix_cache_admin.ClearRequest).empty,
+            .rearm_forced = std.atomic.Value(bool).init(false),
+            .tiers_declined = std.atomic.Value(u32).init(0),
+            .rearm_sw = io_util.Stopwatch.init(io),
+            .rearm_wait_ns = sched_policy.REARM_PROBE_NS,
             .cleanup_queue = std.ArrayList(*Slot).empty,
             .abandoned = null,
             .orphan_vision = undefined,
@@ -1971,6 +1981,14 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
     }
 
+    /// A saved SSD-cache setting: the loop tries the declined tiers again at its next turn.
+    pub fn requestDiskRearm(self: *Scheduler) void {
+        self.rearm_forced.store(true, .release);
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        self.queue_cond.broadcast(self.io);
+    }
+
     /// Runs an SSD prefix-tier job (a clear, or a new byte ceiling) on the inference thread and waits for the answer.
     pub fn prefixAdmin(self: *Scheduler, req_in: prefix_cache_admin.ClearRequest) !prefix_cache_admin.ClearRequest {
         var req = req_in;
@@ -2362,7 +2380,64 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.orphan_vision_n > 0 or
         sch.load_queue.items.len > 0 or
         sch.unload_queue.items.len > 0 or
-        sch.prefix_clear_queue.items.len > 0;
+        sch.prefix_clear_queue.items.len > 0 or
+        sch.rearm_forced.load(.acquire);
+}
+
+fn rearmCheckDue(sch: *const Scheduler) bool {
+    const declined = sch.tiers_declined.load(.acquire);
+    return sched_policy.rearmDue(sch.rearm_forced.load(.acquire), declined, if (declined > 0) sch.rearm_sw.read() else 0, sch.rearm_wait_ns);
+}
+
+/// The settings a cold load runs on, for a tier the load declined to attach later.
+fn cacheAttach(sch: *const Scheduler) model_load.CacheAttach {
+    return .{
+        .capacity = sch.prefix_cache_capacity,
+        .ram_enabled = sch.prefix_cache_ram_enabled,
+        .mem_bytes = sch.prefix_cache_mem_bytes,
+        .mem_resolver = sch.prefix_cache_mem_resolver,
+        .disk_resolver = sch.prefix_cache_disk_resolver,
+        .ssm_checkpoint_stride = coldLoadDisk(sch.ssm_checkpoint_stride, sch.prefix_cache_capacity, sch.prefix_cache_ram_enabled).stride,
+        .ssm_checkpoint_max = sch.ssm_checkpoint_max,
+    };
+}
+
+/// Between requests: re-arms the SSD tiers loads declined, once the volume has room again or an SSD-cache setting
+/// was saved. A model a request holds waits for the next look. The check never blocks a request: the loop is its
+/// only caller, and it runs when no tick is pending.
+fn rearmDeclinedTiers(sch: *Scheduler) void {
+    if (!rearmCheckDue(sch)) return;
+    const forced = sch.rearm_forced.swap(false, .acq_rel);
+    var found: [16]*LoadedModel = undefined;
+    var n: usize = 0;
+    {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        defer sch.registry.mutex.unlock(sch.io);
+        var it = sch.registry.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            const config = entry.config orelse continue;
+            if (entry.state != .ready or !config.prefix_cache_disk_declined or n == found.len) continue;
+            found[n] = entry;
+            n += 1;
+        }
+    }
+    var busy = false;
+    var armed = false;
+    for (found[0..n]) |entry| {
+        if (entry.refcount.load(.acquire) > 0) {
+            busy = true;
+            continue;
+        }
+        if (!model_load.rearmDiskTier(sch.allocator, sch.io, entry, cacheAttach(sch), if (forced) "SSD-cache setting changed" else "free space returned")) continue;
+        armed = true;
+        if (entry == sch.current_model) sch.hot_prefix_cache = &entry.prefix_cache.?;
+    }
+    sch.rearm_wait_ns = sched_policy.rearmWaitNs(busy);
+    sch.rearm_sw.reset();
+    if (!armed) return;
+    reviseHotCacheBudgets(sch);
+    publishHotCacheResidency(sch);
 }
 
 /// `--gpu-warm-secs` (0 = off): how long after its last prefill or decode the idle inference
@@ -2559,6 +2634,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             prefix_cache_admin.runClear(sch.io, req);
             publishDiskStats(sch);
         }
+        rearmDeclinedTiers(sch);
         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
         switch (gpuWarmBeforePark(worked, unload_req != null)) {
             .keep => {},
@@ -2577,7 +2653,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
             const warm_ns: u64 = @as(u64, gpu_warm_secs) * std.time.ns_per_s;
-            while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
+            while (!hasWorkPendingLocked(sch) and !rearmCheckDue(sch) and !sch.shutdown.load(.acquire)) {
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(false);
                 if (gpuWarmParkNs(if (warm_since) |sw| sw.read() else null, warm_ns)) |park_ns| {
@@ -2606,6 +2682,12 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             flushLiveStates(sch, "idle");
                             sch.queue_mu.lockUncancelable(sch.io);
                         }
+                    } else if (sch.tiers_declined.load(.acquire) > 0) {
+                        const left = sch.rearm_wait_ns -| sch.rearm_sw.read();
+                        _ = sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{
+                            .raw = .fromNanoseconds(@intCast(left + std.time.ns_per_ms)),
+                            .clock = .awake,
+                        } }) catch {};
                     } else {
                         sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
                     }
@@ -3136,11 +3218,17 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
 pub fn publishDiskStats(sch: *Scheduler) void {
     sch.registry.mutex.lockUncancelable(sch.io);
     defer sch.registry.mutex.unlock(sch.io);
+    const asked = @import("server.zig").diskAsk().bytes > 0;
+    var declined: u32 = 0;
+    defer sch.tiers_declined.store(declined, .release);
     var it = sch.registry.entries.valueIterator();
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
+            if (asked) if (entry.config) |c| {
+                if (c.prefix_cache_disk_declined) declined += 1;
+            };
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
                 snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten(), .namespace = prefix_cache_admin.namespaceOfRoot(d.root, d.private_root) };
             };
@@ -5009,6 +5097,24 @@ pub const expectError = @import("test_expect.zig").expectError;
 test "a live MTP slot never ticks regular, an unarmed one always does" {
     try testing.expectEqual(sched_policy.SpecTickMode.mtp, sched_policy.specTickMode(true, true, false, false));
     try testing.expectEqual(sched_policy.SpecTickMode.regular, sched_policy.specTickMode(true, false, false, false));
+}
+
+test "a saved SSD-cache setting makes the re-arm check due at once, a declined tier otherwise waits its minute" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.rearm_forced = .init(false);
+    sch.tiers_declined = .init(1);
+    sch.rearm_sw = io_util.Stopwatch.init(testing.io);
+    sch.rearm_wait_ns = sched_policy.REARM_PROBE_NS;
+    try testing.expect(!rearmCheckDue(&sch));
+    sch.requestDiskRearm();
+    try testing.expect(rearmCheckDue(&sch));
+    sch.rearm_forced.store(false, .release);
+    sch.tiers_declined.store(0, .release);
+    sch.rearm_wait_ns = 0;
+    try testing.expect(!rearmCheckDue(&sch));
 }
 
 test "complete keeps a slot in decoding until its pass is out, so admission never misses it" {

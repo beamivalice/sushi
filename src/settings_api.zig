@@ -773,6 +773,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             try writeJson(w, applyModelsDir(sch, &message_buf));
         }
     }
+    if (savesSsdTier(plan)) sch.requestDiskRearm();
     if (plan.namesEffort()) {
         if (!first) try w.writeAll(",");
         first = false;
@@ -797,6 +798,18 @@ fn forgetFailuresFor(registry: *model_registry_mod.ModelRegistry, plan: Plan, mo
     };
 }
 
+/// A saved key that sizes an SSD tier: the SSD prefix cache's size, or the expert-streaming SSD budget.
+pub fn reachesSsdTier(key: []const u8) bool {
+    return std.mem.eql(u8, key, "prefix_cache_disk_gb") or std.mem.eql(u8, key, "ssd_budget_gb");
+}
+
+/// Runs after the save is applied, so the re-arm reads the new ask.
+fn savesSsdTier(plan: Plan) bool {
+    for (plan.server_edits) |e| if (reachesSsdTier(e.key)) return true;
+    for (plan.model_edits) |e| if (reachesSsdTier(e.key)) return true;
+    return false;
+}
+
 /// Whether saving `key` changes what a load or its preflight reads, so a model that failed to load deserves another try.
 pub fn reachesLoad(key: []const u8) bool {
     const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "ssd_prefetch", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
@@ -814,6 +827,14 @@ test "settings api: every saved key is classified, and the ones a load reads cle
     // A new key must be classified above before it ships.
     for (model_settings.model_keys) |k| try std.testing.expect(classified(k.name));
     for (model_settings.server_keys) |k| try std.testing.expect(classified(k.name));
+}
+
+test "settings api: only the two SSD size keys re-arm a declined SSD tier, and both reach a load" {
+    for ([_][]const u8{ "prefix_cache_disk_gb", "ssd_budget_gb" }) |key| {
+        try std.testing.expect(reachesSsdTier(key));
+        try std.testing.expect(reachesLoad(key));
+    }
+    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "models_dir", "skip_mem_preflight", "port" }) |key| try std.testing.expect(!reachesSsdTier(key));
 }
 
 fn classified(key: []const u8) bool {

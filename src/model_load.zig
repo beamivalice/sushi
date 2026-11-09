@@ -143,7 +143,7 @@ pub const LoadParams = struct {
     prefix_cache_disk_bytes: u64 = 0,
     /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
     /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget = null,
+    prefix_cache_disk_resolver: ?DiskResolver = null,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1387,22 +1387,33 @@ test "a cold load reads the serving bill on the config the load stamps with the 
     try testing.expect(!cfg.dflash_loaded);
 }
 
-/// What a model's prefix-cache attach is sized from: the launch's cache settings.
+/// Sizes the SSD budget for a model under a cache directory, null when the tier is off. `quiet` keeps the sizing
+/// and refusal lines for a load: a re-arm check logs only when it arms.
+pub const DiskResolver = *const fn (*model_mod.ModelConfig, []const u8, u64, bool) ?disk_placement.DefaultDiskBudget;
+
+/// What a model's prefix-cache attach is sized from: the launch's cache settings, read alike by the load and by a
+/// later re-arm of a tier the load declined.
 pub const CacheAttach = struct {
     capacity: u32,
     ram_enabled: bool,
     mem_bytes: u64,
     mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
-    disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget,
+    disk_resolver: ?DiskResolver,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
+    /// How a re-arm reads the cache volume's free space.
+    space_probe: disk_placement.SpaceProbeFn = disk_placement.volumeSpaceNear,
 };
 
+pub const AttachMode = enum { load, rearm };
+
 /// Brings up the model's SSD tier and the hot prefix cache hanging off it, and bills the tier on the config.
-/// `entry` has its config, path and handle; `disk_bytes` is the SSD ask.
-fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedModel, p: CacheAttach, disk_bytes: u64) !void {
+/// `entry` has its config, path and handle; `disk_bytes` is the SSD ask. A re-arm of a declined tier logs nothing
+/// when it fails and leaves the config declined; one that finds the cache built (a RAM tier) attaches the tier to it.
+fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedModel, p: CacheAttach, disk_bytes: u64, mode: AttachMode) !void {
     const config = entry.config.?;
     const xfm: ?*trunk.Trunk = if (entry.handle) |h| arch_handle.trunk(h) else null;
+    const failed: log.Level = if (mode == .rearm) .debug else .warn;
     // Per-model hot prefix cache (Plan 03 → Plan 05 move). Hybrid recurrent
     // archs are accepted iff `ssm_checkpoint_stride > 0` (Phase 1 of the
     // performance plan): with per-stride SSM checkpoints we can rewind both
@@ -1421,26 +1432,26 @@ fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedMod
     // and did not come up (no room, an unreadable fingerprint, a failed init) is recorded on the config,
     // so every bill reads the same answer as `--prefix-cache-disk off`.
     var disk_tier: ?kv_disk_cache.DiskTier = null;
-    if (p.capacity > 0 and disk_bytes == 0) {
+    if (mode == .load and p.capacity > 0 and disk_bytes == 0) {
         const ask = bills.diskAsk();
         var off_buf: [96]u8 = undefined;
         if (ask.explicit()) log.info("{s}\n", .{disk_placement.diskOffLine(&off_buf, 0, "", ask.sourceName())});
     }
     if (cache_applies and disk_bytes > 0 and disk_ok) attach: {
         const layout = diskLayoutKey(allocator, config, entry.path, xfm) catch |err| {
-            log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
+            log.atLevel(failed, "[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };
         defer if (layout) |l| allocator.free(l);
         const fp = disk_placement.modelFingerprintWithLayout(allocator, io, entry.path, layout) catch |err| {
-            log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
+            log.atLevel(failed, "[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };
         defer allocator.free(fp);
         const base = disk_placement.defaultBaseDir(allocator) catch break :attach;
         defer allocator.free(base);
         const plan: disk_placement.DefaultDiskBudget = if (p.disk_resolver) |resolve|
-            resolve(config, base, disk_placement.tierBytes(io, base, fp)) orelse break :attach
+            resolve(config, base, disk_placement.tierBytes(io, base, fp), mode == .rearm) orelse break :attach
         else
             .{ .bytes = disk_bytes, .bound = .flag, .cap = disk_bytes };
         disk_tier = kv_disk_cache.DiskTier.init(
@@ -1451,48 +1462,52 @@ fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedMod
             plan.bytes,
             kv_disk_cache.DEFAULT_CHUNK_TOKENS,
         ) catch |err| {
-            log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
+            log.atLevel(failed, "[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };
         disk_tier.?.operator_cap = plan.cap;
     }
+    if (mode == .rearm and disk_tier == null) return;
+    errdefer if (disk_tier) |*t| t.deinit();
+    if (disk_tier) |*tier| {
+        tier.cp_thin =
+            if (config.longCtxGated() or !ram_prefix_cache or arch_config.fact(config, "state_beside_kv")) .min_span_recency else .oldest;
+        tier.ssm_max_per_entry = if (prefix_arch.diskCheckpointCap(config)) |cap|
+            cap
+        else if (arch_config.fact(config, "kda_state") or config.longCtxGated() or !ram_prefix_cache)
+            kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
+        else
+            kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
+        try prefix_arch.setDiskGrownSpec(allocator, config, tier);
+    }
     config.prefix_cache_disk_declined = disk_bytes > 0 and disk_tier == null;
     const disk_prefix_cache = disk_tier != null;
     if (cache_applies and (ram_prefix_cache or disk_prefix_cache)) {
-        // The weights are resident here, so the resolver's active-memory read
-        // is honest; the raw launch budget never reaches initWithMem (a 40 GB
-        // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
-        // Disk-only mode retains no reusable KV in RAM, so it asks for no RAM budget.
-        var ssd_idle_mem: u64 = 0;
-        const clamped_prefix_mem = hotCacheMemForLoad(ram_prefix_cache, p.mem_resolver, config, p.mem_bytes, &ssd_idle_mem);
-        if (ram_prefix_cache) {
-            // On an SSD-first arch `--prefix-cache-mem` is the idle allowance beside the live session.
-            const ram_bytes = if (prefix_cache_mod.ssdFirstActive(config, disk_prefix_cache, ram_prefix_cache)) ssd_idle_mem else clamped_prefix_mem;
-            log.info("Allocating {d:.1} GB RAM for the prefix cache (--prefix-cache-mem)\n", .{@as(f64, @floatFromInt(ram_bytes)) / (1024.0 * 1024.0 * 1024.0)});
+        if (entry.prefix_cache == null) {
+            // The weights are resident here, so the resolver's active-memory read
+            // is honest; the raw launch budget never reaches initWithMem (a 40 GB
+            // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
+            // Disk-only mode retains no reusable KV in RAM, so it asks for no RAM budget.
+            var ssd_idle_mem: u64 = 0;
+            const clamped_prefix_mem = hotCacheMemForLoad(ram_prefix_cache, p.mem_resolver, config, p.mem_bytes, &ssd_idle_mem);
+            if (ram_prefix_cache) {
+                // On an SSD-first arch `--prefix-cache-mem` is the idle allowance beside the live session.
+                const ram_bytes = if (prefix_cache_mod.ssdFirstActive(config, disk_prefix_cache, ram_prefix_cache)) ssd_idle_mem else clamped_prefix_mem;
+                log.info("Allocating {d:.1} GB RAM for the prefix cache (--prefix-cache-mem)\n", .{@as(f64, @floatFromInt(ram_bytes)) / (1024.0 * 1024.0 * 1024.0)});
+            }
+            entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
+                allocator,
+                if (ram_prefix_cache) p.capacity else 0,
+                clamped_prefix_mem,
+            );
+            entry.prefix_cache.?.qsa_history_required = config.indexer_budget != 0 and !arch_config.fact(config, "latent_kv");
+            // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
+            // see a ModelConfig. The ungated value names the previous behaviour at each site.
+            entry.prefix_cache.?.cp_thin = if (config.longCtxGated() or arch_config.fact(config, "state_beside_kv")) .min_span_recency else .min_span;
+            entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
+            entry.prefix_cache.?.hybrid = has_ssm_layers or arch_config.fact(config, "state_beside_kv");
         }
-        entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
-            allocator,
-            if (ram_prefix_cache) p.capacity else 0,
-            clamped_prefix_mem,
-        );
-        entry.prefix_cache.?.qsa_history_required = config.indexer_budget != 0 and !arch_config.fact(config, "latent_kv");
-        // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
-        // see a ModelConfig. The ungated value names the previous behaviour at each site.
-        entry.prefix_cache.?.cp_thin = if (config.longCtxGated() or arch_config.fact(config, "state_beside_kv")) .min_span_recency else .min_span;
-        entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
-        entry.prefix_cache.?.hybrid = has_ssm_layers or arch_config.fact(config, "state_beside_kv");
-        if (disk_tier) |tier| {
-            entry.prefix_cache.?.disk = tier;
-            entry.prefix_cache.?.disk.?.cp_thin =
-                if (config.longCtxGated() or !ram_prefix_cache or arch_config.fact(config, "state_beside_kv")) .min_span_recency else .oldest;
-            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (prefix_arch.diskCheckpointCap(config)) |cap|
-                cap
-            else if (arch_config.fact(config, "kda_state") or config.longCtxGated() or !ram_prefix_cache)
-                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
-            else
-                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
-            try prefix_arch.setDiskGrownSpec(allocator, config, &entry.prefix_cache.?.disk.?);
-        }
+        if (disk_tier) |tier| entry.prefix_cache.?.disk = tier;
         // SSD-first: arch + env switch + a live disk tier (attached above); without one qwen4_exp takes the RAM arm.
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
             config,
@@ -1516,6 +1531,29 @@ fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedMod
         // it defaults to 0 (unlimited) and multi-turn entries grow unbounded.
         entry.prefix_cache.?.ssm_checkpoint_max = cp_max;
     }
+}
+
+/// Attaches the SSD tier a load declined, on the inference thread with no request holding the model: the tier, the
+/// cache that hangs off it if the load built none, and the bill, which reads `prefix_cache_disk_declined`. Quiet
+/// until it arms; true when it did. A non-explicit ask waits for the volume to leave room above the reserve.
+pub fn rearmDiskTier(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedModel, p: CacheAttach, why: []const u8) bool {
+    const config = entry.config orelse return false;
+    if (!config.prefix_cache_disk_declined) return false;
+    const ask = bills.diskAsk();
+    if (ask.bytes == 0) return false;
+    if (!ask.explicit()) {
+        const base = disk_placement.defaultBaseDir(allocator) catch return false;
+        defer allocator.free(base);
+        if (p.space_probe(base)) |v| if (disk_placement.freeDiskRoom(v.free) == 0) return false;
+    }
+    attachPrefixCache(allocator, io, entry, p, ask.bytes, .rearm) catch |err| {
+        log.debug("[disk-cache] re-arm failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    if (config.prefix_cache_disk_declined) return false;
+    const d = &entry.prefix_cache.?.disk.?;
+    log.info("[disk-cache] re-armed ({s}): {d:.1} GB at {s}\n", .{ why, @as(f64, @floatFromInt(d.max_bytes)) / (1024.0 * 1024.0 * 1024.0), d.root });
+    return true;
 }
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
@@ -2243,7 +2281,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         .disk_resolver = params.prefix_cache_disk_resolver,
         .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
         .ssm_checkpoint_max = params.ssm_checkpoint_max,
-    }, params.prefix_cache_disk_bytes);
+    }, params.prefix_cache_disk_bytes, .load);
     // Iteration 2 (perf-plan Phase 4 #3): tokenize cache for warm-path
     // chat-template renders (`chat_mod.formatChat` at the handler boundary).
     // Default capacity is small (4 entries) because chat conversations
@@ -2697,7 +2735,7 @@ test "attachPrefixCache: SSD-only builds a tier-only cache with the tier's polic
     var f: AttachFixture = undefined;
     try f.init();
     defer f.deinit();
-    try attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(false), 1 << 30);
+    try attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(false), 1 << 30, .load);
 
     try testing.expect(!f.config.prefix_cache_disk_declined);
     const hc = &f.entry.prefix_cache.?;
@@ -2720,7 +2758,7 @@ test "attachPrefixCache: RAM beside the tier keeps the RAM cache and the legacy 
     var f: AttachFixture = undefined;
     try f.init();
     defer f.deinit();
-    try attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 1 << 30);
+    try attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 1 << 30, .load);
 
     try testing.expect(!f.config.prefix_cache_disk_declined);
     const hc = &f.entry.prefix_cache.?;
@@ -2732,7 +2770,7 @@ test "attachPrefixCache: RAM beside the tier keeps the RAM cache and the legacy 
 
 test "attachPrefixCache: a tier the resolver refuses is recorded as declined, and SSD-only then builds no cache" {
     const Refuse = struct {
-        fn resolve(_: *model_mod.ModelConfig, _: []const u8, _: u64) ?disk_placement.DefaultDiskBudget {
+        fn resolve(_: *model_mod.ModelConfig, _: []const u8, _: u64, _: bool) ?disk_placement.DefaultDiskBudget {
             return null;
         }
     };
@@ -2741,12 +2779,12 @@ test "attachPrefixCache: a tier the resolver refuses is recorded as declined, an
     defer f.deinit();
     var s = AttachFixture.settings(false);
     s.disk_resolver = Refuse.resolve;
-    try attachPrefixCache(testing.allocator, testing.io, f.entry, s, 1 << 30);
+    try attachPrefixCache(testing.allocator, testing.io, f.entry, s, 1 << 30, .load);
     try testing.expect(f.config.prefix_cache_disk_declined);
     try testing.expect(f.entry.prefix_cache == null);
 
     s.ram_enabled = true;
-    try attachPrefixCache(testing.allocator, testing.io, f.entry, s, 1 << 30);
+    try attachPrefixCache(testing.allocator, testing.io, f.entry, s, 1 << 30, .load);
     try testing.expect(f.config.prefix_cache_disk_declined);
     try testing.expect(f.entry.prefix_cache.?.ram_enabled);
     try testing.expect(f.entry.prefix_cache.?.disk == null);
@@ -2757,9 +2795,96 @@ test "attachPrefixCache: an SSD ask of zero declines nothing and builds no SSD-o
     var f: AttachFixture = undefined;
     try f.init();
     defer f.deinit();
-    try attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(false), 0);
+    try attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(false), 0, .load);
     try testing.expect(!f.config.prefix_cache_disk_declined);
     try testing.expect(f.entry.prefix_cache == null);
+}
+
+const RoomProbe = struct {
+    var free: u64 = 0;
+    fn probe(_: []const u8) ?disk_placement.VolumeSpace {
+        return .{ .free = free, .total = 1 << 40 };
+    }
+    fn refuse(_: *model_mod.ModelConfig, _: []const u8, _: u64, _: bool) ?disk_placement.DefaultDiskBudget {
+        return null;
+    }
+};
+
+/// A load that declined its SSD tier (the resolver refused), with the ask `source` and a volume probe of `free`.
+fn declinedFixture(f: *AttachFixture, ram: bool, source: @import("settings_resolve.zig").Source, free: u64) !CacheAttach {
+    server_state.setDiskAsk(1 << 30, source);
+    var s = AttachFixture.settings(ram);
+    s.disk_resolver = RoomProbe.refuse;
+    try attachPrefixCache(testing.allocator, testing.io, f.entry, s, 1 << 30, .load);
+    try testing.expect(f.config.prefix_cache_disk_declined);
+    RoomProbe.free = free;
+    s.disk_resolver = null;
+    s.space_probe = RoomProbe.probe;
+    return s;
+}
+
+test "rearmDiskTier: a declined SSD tier stays off without room above the reserve and arms when it returns" {
+    const saved = bills.diskAsk();
+    defer server_state.setDiskAsk(saved.bytes, saved.source);
+    var f: AttachFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var s = try declinedFixture(&f, false, .default, disk_placement.DISK_FREE_RESERVE);
+
+    try testing.expect(!rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
+    try testing.expect(f.config.prefix_cache_disk_declined);
+    try testing.expect(f.entry.prefix_cache == null);
+
+    RoomProbe.free = disk_placement.DISK_FREE_RESERVE + (8 << 30);
+    s.disk_resolver = RoomProbe.refuse;
+    try testing.expect(!rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
+    try testing.expect(f.config.prefix_cache_disk_declined);
+    try testing.expect(f.entry.prefix_cache == null);
+
+    s.disk_resolver = null;
+    try testing.expect(rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
+    try testing.expect(!f.config.prefix_cache_disk_declined);
+    const disk = &f.entry.prefix_cache.?.disk.?;
+    try testing.expectEqual(@as(u64, 1 << 30), disk.max_bytes);
+    try testing.expect(disk.writer != null);
+    try testing.expectEqual(f.entry.prefix_cache.?.ssd_first, disk.ssd_first);
+    try testing.expect(!rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
+}
+
+test "rearmDiskTier: an SSD size named in settings arms a declined tier on a full volume, a size of zero does not" {
+    const saved = bills.diskAsk();
+    defer server_state.setDiskAsk(saved.bytes, saved.source);
+    var f: AttachFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try declinedFixture(&f, false, .default, 0);
+    try testing.expect(!rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
+
+    server_state.setDiskAsk(0, .model_settings);
+    try testing.expect(!rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
+    try testing.expect(f.config.prefix_cache_disk_declined);
+
+    server_state.setDiskAsk(2 << 30, .model_settings);
+    try testing.expect(rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
+    try testing.expect(!f.config.prefix_cache_disk_declined);
+    try testing.expectEqual(@as(u64, 2 << 30), f.entry.prefix_cache.?.disk.?.max_bytes);
+}
+
+test "rearmDiskTier: a RAM cache the load built keeps its object and entries when the tier joins it" {
+    const saved = bills.diskAsk();
+    defer server_state.setDiskAsk(saved.bytes, saved.source);
+    var f: AttachFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try declinedFixture(&f, true, .default, disk_placement.DISK_FREE_RESERVE + (8 << 30));
+    const before = &f.entry.prefix_cache.?;
+    try testing.expect(before.disk == null);
+
+    try testing.expect(rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
+    try testing.expectEqual(before, &f.entry.prefix_cache.?);
+    try testing.expect(before.ram_enabled);
+    try testing.expect(before.disk != null);
+    try testing.expectEqual(prefix_cache_mod.ssdFirstActive(&f.config, true, true), before.ssd_first);
 }
 
 // ── Bill pins ──

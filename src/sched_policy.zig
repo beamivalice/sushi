@@ -359,6 +359,22 @@ pub fn gpuWarmParkNs(idle_ns: ?u64, window_ns: u64) ?u64 {
     return @min(GPU_WARM_TICK_NS, window_ns - idle);
 }
 
+/// How often the idle or busy loop looks for room to re-arm a declined SSD tier, and how soon it looks again
+/// when a request held the model.
+pub const REARM_PROBE_NS: u64 = 60 * std.time.ns_per_s;
+pub const REARM_BUSY_RETRY_NS: u64 = 5 * std.time.ns_per_s;
+
+/// PURE: whether the re-arm check runs now. Only a declined tier is looked after, once per `wait_ns`; a settings
+/// save (`forced`) skips the wait.
+pub fn rearmDue(forced: bool, declined: u32, since_ns: u64, wait_ns: u64) bool {
+    return forced or (declined > 0 and since_ns >= wait_ns);
+}
+
+/// PURE: how long until the next check after one that found a model a request still held.
+pub fn rearmWaitNs(busy: bool) u64 {
+    return if (busy) REARM_BUSY_RETRY_NS else REARM_PROBE_NS;
+}
+
 pub const GpuWarmWindow = enum { keep, restart, close };
 
 /// PURE: the window as the thread is about to park. The last pass's prefill or decode restarts it;
@@ -656,6 +672,16 @@ test "idleEvictTickMs: sweeps well inside the window without spinning" {
     try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
     try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
     try testing.expect(idleEvictTickMs(0) >= 1000);
+}
+
+test "re-arm: a declined tier is looked at once a minute, a settings save at once, a tier that is up never" {
+    const s = std.time.ns_per_s;
+    try testing.expect(!rearmDue(false, 1, 59 * s, REARM_PROBE_NS));
+    try testing.expect(rearmDue(false, 1, 60 * s, REARM_PROBE_NS));
+    try testing.expect(!rearmDue(false, 0, 600 * s, REARM_PROBE_NS));
+    try testing.expect(rearmDue(true, 0, 0, REARM_PROBE_NS));
+    try testing.expectEqual(REARM_PROBE_NS, rearmWaitNs(false));
+    try testing.expect(rearmWaitNs(true) < rearmWaitNs(false));
 }
 
 test "gpu warm: ticks every half second inside the window after work, never past it or with work" {
