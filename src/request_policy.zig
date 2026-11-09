@@ -344,6 +344,24 @@ pub fn writeEffortNoticeHeader(stream: *Conn) !void {
     try stream.writeAllNoFlush("\r\nAccess-Control-Expose-Headers: X-Sushi-Effort-Notice\r\n");
 }
 
+/// `clampMaxTokens` for a request: a cut the window made also rides the response head, so a client sees it was not granted its ask.
+pub fn clampMaxTokensFor(stream: *Conn, max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
+    const granted = clampMaxTokens(max_tokens, prompt_len, effective_ctx);
+    stream.max_tokens_cut_len = 0;
+    if (max_tokens != AUTO_MAX_TOKENS_SENTINEL and granted < max_tokens) {
+        const text = std.fmt.bufPrint(&stream.max_tokens_cut, "{d} -> {d}", .{ max_tokens, granted }) catch return granted;
+        stream.max_tokens_cut_len = @intCast(text.len);
+    }
+    return granted;
+}
+
+pub fn writeMaxTokensCutHeader(stream: *Conn) !void {
+    if (stream.max_tokens_cut_len == 0) return;
+    try stream.writeAllNoFlush("X-Sushi-Max-Tokens-Cut: ");
+    try stream.writeAllNoFlush(stream.max_tokens_cut[0..stream.max_tokens_cut_len]);
+    try stream.writeAllNoFlush("\r\nAccess-Control-Expose-Headers: X-Sushi-Max-Tokens-Cut\r\n");
+}
+
 pub fn withEffortNoticeJson(allocator: std.mem.Allocator, json: []const u8, field: ?[]const u8) ![]u8 {
     const extra = field orelse return allocator.dupe(u8, json);
     if (extra.len == 0 or json.len == 0 or json[json.len - 1] != '}') return allocator.dupe(u8, json);

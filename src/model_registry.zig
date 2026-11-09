@@ -552,7 +552,7 @@ pub const ModelStatus = struct {
 
 /// Load failures a setting or the memory limit decides: the entry goes back to `.unloaded`, so the next load re-reads
 /// model-settings.json. Every other failure is the pack's and is stored.
-pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit" };
+pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit", "ContextSizeAboveWindow", "GlmKvQuantUnsupported" };
 
 /// The roots a rescan walks: the boot roots plus the settings file's models directory, unless a launch flag pins them.
 fn rootsWithFileDir(buf: *[9][]const u8, boot_roots: []const []const u8, pinned: bool, file_dir: ?[]const u8) []const []const u8 {
@@ -1313,9 +1313,12 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable, PackRevisionMixed } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ContextSizeAboveWindow, LaunchFlagUnsupported, GlmKvQuantUnsupported, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable, PackRevisionMixed } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
+            if (std.mem.eql(u8, n, "ContextSizeAboveWindow")) return error.ContextSizeAboveWindow;
+            if (std.mem.eql(u8, n, "LaunchFlagUnsupported")) return error.LaunchFlagUnsupported;
+            if (std.mem.eql(u8, n, "GlmKvQuantUnsupported")) return error.GlmKvQuantUnsupported;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
             if (std.mem.eql(u8, n, "ModelFormatUnsupported")) return error.ModelFormatUnsupported;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;

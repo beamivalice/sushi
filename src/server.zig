@@ -959,7 +959,6 @@ pub fn serve(
     const startup_entry = scheduler.registry.resolveEntry("") catch null;
     const verdict = if (startup_entry) |e| batchVerdictFor(e) else batchVerdictOf(config, false);
     log.info("Concurrency: --max-concurrent={d}, {s} (arch: {s})\n", .{ server_state.max_concurrent, concurrencyClause(verdict), config.model_type });
-    if (verdict == .ok and server_state.prefix_cache_capacity > 0 and server_state.prefix_cache_capacity < server_state.max_concurrent) server_state.prefix_cache_capacity = server_state.max_concurrent;
     // Installed only now: until the load ends, a signal's default action ends the process mid-load.
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -2739,7 +2738,7 @@ pub fn handleChatCompletions(
 
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
-    const effective_max_tokens = request_policy.clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);

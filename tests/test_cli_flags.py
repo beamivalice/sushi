@@ -68,6 +68,8 @@ refusals = [
     (("serve", "--no-mtp", "--mtp"), "--mtp and --no-mtp conflict; pass one"),
     (("serve", "--api-key", ""), "--api-key: the key is empty"),
     (("serve", "--max-concurrent", "0"), "--max-concurrent: expected a whole number of at least 1"),
+    (("serve", "--prefix-cache-entries", "2", "--max-concurrent", "4"), "--prefix-cache-entries 2 is below --max-concurrent 4"),
+    (("serve", "--max-concurrent", "4", "--prefix-cache-entries", "2"), "--prefix-cache-entries 2 is below --max-concurrent 4"),
     (("serve", "--prefill-decode-share", "0.95"), "--prefill-decode-share: expected a number from 0 to 0.9"),
     (("serve", "--prefill-decode-share", "inf"), "--prefill-decode-share: expected a number from 0 to 0.9"),
     (("repack",), "a pack is required"),
@@ -118,6 +120,17 @@ for flags, want in [
         check(got.replace(".", "").isdigit() and got not in ("1.0", "0.0"), f"{flags} is the machine's auto cap", got)
     else:
         check(got.startswith(want), f"{flags} is {want}", got)
+
+# The default hot-cache capacity follows --max-concurrent before any load copies it, and says so; a value typed is kept.
+for flags, line_expected in [
+    (("--max-concurrent", "64"), True),
+    (("--max-concurrent", "8"), False),
+    (("--max-concurrent", "64", "--prefix-cache-entries", "64"), False),
+]:
+    registry_cap(*flags)
+    port_log = max(root.glob("registry-*.log"), key=lambda p: p.stat().st_mtime).read_text(errors="replace")
+    has_line = "Hot prefix cache: capacity follows --max-concurrent (32 -> 64)" in port_log
+    check(has_line == line_expected, f"{flags} capacity line", port_log[-400:])
 
 # A subcommand's own errors are sentences, and its --help is usage on stdout.
 for args, message in [

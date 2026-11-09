@@ -239,12 +239,35 @@ pub fn yarnFactorIgnoredLine(config: *const ModelConfig, saved: ?u8) ?[]const u8
     return model_settings.unavailable("yarn_factor", arch_flags.settingsFit(config)) orelse "model-settings.json yarn_factor is ignored: the config.json was parsed without it";
 }
 
-/// The line that refuses a load whose model-settings.json `ctx_size` is above the window the config has under the settings
-/// (the launch flag outranks the file, so a flag is not judged here); null when it fits.
+/// The line that refuses a load whose `--ctx-size`, or else model-settings.json `ctx_size`, is above the window the config
+/// has under the settings and `--config-overrides`; null when it fits.
 pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32) ?[]const u8 {
     const pick = model_settings.contextPick(ctx_flag, config.ctx_override);
-    if (pick.source != .model_settings) return null;
-    return model_settings.ctxAboveWindowLine(buf, pick.value, config.contextCap(), config.yarn_factor_override);
+    return model_settings.ctxAboveWindowLine(buf, pick.value, config.contextCap(), config.yarn_factor_override, pick.source);
+}
+
+pub const LaunchRefusal = struct { err: error{ GlmKvQuantUnsupported, LaunchFlagUnsupported }, line: []const u8 };
+
+/// The launch flag, or the saved kv_quant, this model cannot act on; the cold-load pre-check and the load itself ask the same question.
+pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQuantConfig) ?LaunchRefusal {
+    const launch_kv = trunk.KvCacheChoice.resolve(kv_quant, config.kv_quant_override);
+    if (arch_flags.kvQuantRequestRefusal(config, launch_kv.config)) |why| {
+        const line = std.fmt.bufPrint(buf, "[kv-cache] {s}", .{why}) catch why;
+        return .{ .err = error.GlmKvQuantUnsupported, .line = line };
+    }
+    if (arch_flags.archFlagRefusal(config, .{
+        .kv_quant = kv_quant != null,
+        .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
+        .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
+        .drop_expert = config.drop_expert != 0,
+        .ssd_prefetch = config.ssd_prefetch != null,
+        .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
+        .mtp_tokenv3 = if (settings_resolve.launch.mtp_acceptance) |m| m == .tokenv3 else false,
+        .mtp_greedy_tail = settings_resolve.launch.mtp_greedy_tail != null,
+        .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
+        .mtp_max_depth = depth_bounds.active.max,
+    })) |why| return .{ .err = error.LaunchFlagUnsupported, .line = why };
+    return null;
 }
 
 /// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
@@ -1623,23 +1646,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.free(params.config.expert_source_dir.?);
         params.config.expert_source_dir = null;
     };
-    const launch_kv = trunk.KvCacheChoice.resolve(params.kv_quant, params.config.kv_quant_override);
-    if (arch_flags.kvQuantRequestRefusal(params.config, launch_kv.config)) |why| {
-        log.err("[kv-cache] {s}\n", .{why});
-        return error.GlmKvQuantUnsupported;
-    }
-    if (arch_flags.archFlagRefusal(params.config, .{
-        .kv_quant = params.kv_quant != null,
-        .qwen_gdn_16 = !model_mod.qwen_gdn_f32,
-        .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
-        .drop_expert = params.config.drop_expert != 0,
-        .ssd_prefetch = params.config.ssd_prefetch != null,
-        .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
-        .mtp_tokenv3 = if (settings_resolve.launch.mtp_acceptance) |m| m == .tokenv3 else false,
-        .mtp_greedy_tail = settings_resolve.launch.mtp_greedy_tail != null,
-    })) |why| {
-        log.err("{s}\n", .{why});
-        return error.LaunchFlagUnsupported;
+    var launch_buf: [384]u8 = undefined;
+    if (launchRefusal(&launch_buf, params.config, params.kv_quant)) |r| {
+        log.err("{s}\n", .{r.line});
+        return r.err;
     }
     var window_buf: [256]u8 = undefined;
     if (contextWindowRefusal(&window_buf, params.config, sch.ctx_size_flag)) |line| {
@@ -2988,4 +2998,35 @@ test "a saved ctx_size above the window the loaded config has is refused by name
     // An explicit launch flag outranks the file, so the file's value is not what loads.
     c.ctx_override = 1048576;
     try testing.expect(contextWindowRefusal(&buf, &c, 100000) == null);
+}
+
+test "an explicit --ctx-size above the window is refused by name, under the yarn_factor in force; 0 and a fitting value are not" {
+    var buf: [256]u8 = undefined;
+    var c = ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 262144 };
+    try testing.expectEqualStrings("--ctx-size 1048576 is above the 262144-token window this model has without yarn_factor; lower --ctx-size or set yarn_factor", contextWindowRefusal(&buf, &c, 1048576).?);
+    try testing.expect(contextWindowRefusal(&buf, &c, 262144) == null);
+    try testing.expect(contextWindowRefusal(&buf, &c, 0) == null);
+
+    c.rope_yarn = true;
+    c.yarn_factor = 2;
+    c.yarn_orig_max_pos = 262144;
+    c.max_position_embeddings = 524288;
+    c.yarn_factor_override = 2;
+    try testing.expectEqualStrings("--ctx-size 1048576 is above the 524288-token window this model has with yarn_factor 2; lower --ctx-size or yarn_factor", contextWindowRefusal(&buf, &c, 1048576).?);
+    try testing.expect(contextWindowRefusal(&buf, &c, 524288) == null);
+
+    // The flag outranks the file: a fitting flag loads whatever the file holds, a too-large one is the flag's refusal.
+    c.ctx_override = 1048576;
+    try testing.expect(contextWindowRefusal(&buf, &c, 100000) == null);
+    try testing.expect(std.mem.startsWith(u8, contextWindowRefusal(&buf, &c, 2000000).?, "--ctx-size 2000000 "));
+}
+
+test "a launch flag or saved kv_quant the arch cannot act on is refused with its line, the same answer for the pre-check and the load" {
+    if (@import("arch/registry.zig").ofModelType("deepseek_v41") == null) return error.SkipZigTest;
+    var buf: [384]u8 = undefined;
+    const dsv = ModelConfig{ .model_type = "deepseek_v41" };
+    const r = launchRefusal(&buf, &dsv, trunk.KVQuantConfig.affine(8)).?;
+    try testing.expect(r.err == error.LaunchFlagUnsupported);
+    try testing.expect(std.mem.startsWith(u8, r.line, "--kv-quant has no effect on "));
+    try testing.expect(launchRefusal(&buf, &dsv, null) == null);
 }

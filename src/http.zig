@@ -132,6 +132,7 @@ pub fn sendResponseFramed(stream: *http_conn.Conn, status: []const u8, content_t
     }) catch return error.Overflow;
     try stream.writeAllNoFlush(hdr);
     try request_policy.writeEffortNoticeHeader(stream);
+    try request_policy.writeMaxTokensCutHeader(stream);
     try stream.writeAllNoFlush("\r\n");
     stream.length_framed = true;
     if (inject) {

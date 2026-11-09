@@ -1011,6 +1011,28 @@ fn coldLoadDisk(raw_stride: u32, capacity: u32, ram_enabled: bool) ColdLoadDisk 
 
 // Connection-local transport preserves a load diagnostic across a concurrent retry.
 threadlocal var last_load_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
+threadlocal var last_load_window_refusal: [384]u8 = undefined;
+threadlocal var last_load_window_refusal_len: usize = 0;
+
+/// The line of the setting or launch-flag refusal the calling thread's last cold load raised, read once by the HTTP answer.
+pub fn takeLoadWindowRefusal() ?[]const u8 {
+    const len = last_load_window_refusal_len;
+    last_load_window_refusal_len = 0;
+    return if (len == 0) null else last_load_window_refusal[0..len];
+}
+
+fn recordLoadWindowRefusal(line: []const u8) void {
+    const n = @min(line.len, last_load_window_refusal.len);
+    @memcpy(last_load_window_refusal[0..n], line[0..n]);
+    last_load_window_refusal_len = n;
+}
+
+test "the window refusal a cold load records is read once" {
+    try std.testing.expect(takeLoadWindowRefusal() == null);
+    recordLoadWindowRefusal("--ctx-size 9 is above the 4-token window");
+    try std.testing.expectEqualStrings("--ctx-size 9 is above the 4-token window", takeLoadWindowRefusal().?);
+    try std.testing.expect(takeLoadWindowRefusal() == null);
+}
 
 /// Continuous-batching scheduler. One per server. Owns the inference
 /// thread, the queue of in-flight slots, AND (post-A1) the loaded model
@@ -1662,6 +1684,7 @@ pub const Scheduler = struct {
 
     fn ensureLoadedWith(self: *Scheduler, id_or_empty: []const u8, retry_failed: bool) !*LoadedModel {
         last_load_context_refusal = null;
+        last_load_window_refusal_len = 0;
         // Fast path: ready entries. registry.ensureLoaded handles waiting
         // out .loading / .evicting transitions by other callers.
         const fast_result = if (retry_failed) self.registry.ensureLoadedRetrying(id_or_empty) else self.registry.ensureLoaded(id_or_empty);
@@ -1697,6 +1720,18 @@ pub const Scheduler = struct {
         var owned_active: bool = true;
         defer if (owned_active) model_load.freeCpuState(self.allocator, &owned);
         model_load.applyModelSettings(owned.config, settings);
+        var launch_buf: [384]u8 = undefined;
+        if (model_load.launchRefusal(&launch_buf, owned.config, self.kv_quant)) |r| {
+            log.err("{s}\n", .{r.line});
+            recordLoadWindowRefusal(r.line);
+            return r.err;
+        }
+        var window_buf: [256]u8 = undefined;
+        if (model_load.contextWindowRefusal(&window_buf, owned.config, self.ctx_size_flag)) |line| {
+            log.err("{s}\n", .{line});
+            recordLoadWindowRefusal(line);
+            return error.ContextSizeAboveWindow;
+        }
 
         // Victims selected by the eviction planner (multi-victim: one load may
         // need to free several models to fit). Lives on this stack frame; the
@@ -6213,6 +6248,8 @@ test "ensureLoaded: a streamed pack with no ssd budget is gated at its RAM-tier 
     sch.allocator = testing.allocator;
     sch.ssd_budget_bytes = 0;
     sch.mtp = null;
+    sch.kv_quant = null;
+    sch.ctx_size_flag = 0;
     sch.no_drafter = true;
     sch.drafter_dir = "";
     sch.primary_model_dir = "";

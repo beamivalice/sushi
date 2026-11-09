@@ -97,6 +97,39 @@ test "launch flag values: a bad value is null, never a default" {
     try testing.expectEqual(@as(?f32, null), parseFlagFloat("inf"));
 }
 
+/// The refusal for an explicit `--prefix-cache-entries` below `--max-concurrent` (0 disables reuse and is not below it).
+pub fn prefixCacheEntriesRefusal(buf: []u8, entries: ?u32, max_concurrent: u32) ?[]const u8 {
+    const n = entries orelse return null;
+    if (n == 0 or n >= max_concurrent) return null;
+    return std.fmt.bufPrint(buf, "--prefix-cache-entries {d} is below --max-concurrent {d}; raise --prefix-cache-entries to at least {d}, or leave it out", .{ n, max_concurrent, max_concurrent }) catch "--prefix-cache-entries is below --max-concurrent";
+}
+
+/// The hot-cache capacity every load copies: an explicit `--prefix-cache-entries` as given (the refusal above keeps it at or
+/// over `--max-concurrent`), the default raised to `--max-concurrent` when that is higher; 0 stays off.
+pub fn prefixCacheCapacity(entries: ?u32, default: u32, max_concurrent: u32) u32 {
+    if (entries) |n| return n;
+    return if (default > 0 and default < max_concurrent) max_concurrent else default;
+}
+
+test "the prefix-cache capacity every load copies follows --max-concurrent only when --prefix-cache-entries is unset" {
+    try testing.expectEqual(@as(u32, 64), prefixCacheCapacity(null, 32, 64));
+    try testing.expectEqual(@as(u32, 32), prefixCacheCapacity(null, 32, 8));
+    try testing.expectEqual(@as(u32, 0), prefixCacheCapacity(0, 32, 64));
+    try testing.expectEqual(@as(u32, 100), prefixCacheCapacity(100, 32, 64));
+}
+
+test "--prefix-cache-entries below --max-concurrent is refused naming both; unset, zero and enough are not" {
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings(
+        "--prefix-cache-entries 2 is below --max-concurrent 4; raise --prefix-cache-entries to at least 4, or leave it out",
+        prefixCacheEntriesRefusal(&buf, 2, 4).?,
+    );
+    try testing.expect(prefixCacheEntriesRefusal(&buf, null, 64) == null);
+    try testing.expect(prefixCacheEntriesRefusal(&buf, 0, 64) == null);
+    try testing.expect(prefixCacheEntriesRefusal(&buf, 4, 4) == null);
+    try testing.expect(prefixCacheEntriesRefusal(&buf, 32, 1) == null);
+}
+
 test "--log-level: only the four levels parse" {
     try testing.expect(log.Level.fromString("debug") != null);
     try testing.expect(log.Level.fromString("verbose") == null);

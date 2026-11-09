@@ -213,8 +213,12 @@ before reading a completed stream and requires clean EOF.
   (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `think_penalty` 0..20, `top_logprobs`
   and the legacy `logprobs` 0..20, `max_tokens` 0..4294967295 where 0 is the "rest of the window" (the app's Auto sends 0)
   and a negative is refused, `seed` any 64-bit integer (a negative one means unseeded, a wider one is refused),
-  `reasoning_budget_tokens` and `thinking.budget_tokens` 32-bit integers. A budget past the context window is
-  still cut to what the window leaves (`clampMaxTokens`, a log line). A tool name the call markup cannot carry (whitespace, quote, angle bracket) or a
+  `reasoning_budget_tokens` and `thinking.budget_tokens` 32-bit integers. A `max_tokens` past what
+  the window leaves after the prompt is the one value that is cut, not refused (clients such as Claude Code send 64000 on
+  small windows): it is served at what the window leaves, ends with `finish_reason: length` when the model uses it all,
+  logs `max_tokens clamped` at debug, and rides back as `X-Sushi-Max-Tokens-Cut: <requested> -> <granted>` on every
+  generation surface, stream and not (`request_policy.clampMaxTokensFor`); an omitted `max_tokens` takes the window
+  and adds no header. A tool name the call markup cannot carry (whitespace, quote, angle bracket) or a
   repeated one is a 400, since the model's call to it would parse to nothing. `response_format` `strict: true` with a
   schema the grammar cannot enforce is a 400 naming the construct, on chat, Responses `text.format` and Anthropic
   `output_config.format` alike (`request_parse.strictSchemaFault`; Anthropic's format has no `strict` and counts as

@@ -46,7 +46,6 @@ const resolveThinkPenalty = request_policy.resolveThinkPenalty;
 const armThinkPenalty = request_policy.armThinkPenalty;
 const omittedMaxTokensDefault = request_policy.omittedMaxTokensDefault;
 const resolveRequestMaxTokens = request_policy.resolveRequestMaxTokens;
-const clampMaxTokens = request_policy.clampMaxTokens;
 const effortWordOnly = request_policy.effortWordOnly;
 const reasoningEffortFromWord = request_policy.reasoningEffortFromWord;
 const EffortNotice = request_policy.EffortNotice;
@@ -758,7 +757,7 @@ fn handleResponsesInner(
     const kv_quant_override = parseKvQuantOverride(root);
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
-    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, prompt_ids.len, effective_ctx);
 
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {

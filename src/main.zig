@@ -305,6 +305,7 @@ fn runCli(init: std.process.Init) !void {
     var max_resident_models: u32 = 3;
     var max_resident_mem_flag: ?u64 = null; // null = auto (80% of wired limit at startup)
     var idle_evict_secs: ?u32 = null;
+    var prefix_cache_entries_flag: ?u32 = null;
     var metrics_enabled = true;
     var log_level_flag: ?log.Level = null;
     var decode_share_flag: ?[]const u8 = null;
@@ -530,7 +531,8 @@ fn runCli(init: std.process.Init) !void {
             settings_resolve.prefill_chunk = .{ .value = flagInt(usize, "--prefill-chunk", args[i], 1), .source = .flag };
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and flag_value.follows(args, i)) {
             i += 1;
-            server_state.prefix_cache_capacity = flagInt(u32, "--prefix-cache-entries", args[i], 0);
+            prefix_cache_entries_flag = flagInt(u32, "--prefix-cache-entries", args[i], 0);
+            server_state.prefix_cache_capacity = prefix_cache_entries_flag.?;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and flag_value.follows(args, i)) {
             // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
             // bare numbers (bytes), a suffix of `MB`/`GB`/`KB` (case-
@@ -741,6 +743,16 @@ fn runCli(init: std.process.Init) !void {
         log.err("--drafter-min-depth {d} is above --drafter-max-depth {d}\n", .{ lo, hi });
         std.process.exit(1);
     };
+    var entries_buf: [160]u8 = undefined;
+    if (cli_mod.prefixCacheEntriesRefusal(&entries_buf, prefix_cache_entries_flag, server_state.max_concurrent)) |why| {
+        log.err("{s}\n", .{why});
+        std.process.exit(1);
+    }
+    const capacity = cli_mod.prefixCacheCapacity(prefix_cache_entries_flag, server_state.prefix_cache_capacity, server_state.max_concurrent);
+    if (capacity != server_state.prefix_cache_capacity) {
+        log.info("Hot prefix cache: capacity follows --max-concurrent ({d} -> {d}); the default of --prefix-cache-entries is below it\n", .{ server_state.prefix_cache_capacity, capacity });
+        server_state.prefix_cache_capacity = capacity;
+    }
     depth_bounds.validate(depth_bounds.active) catch {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);

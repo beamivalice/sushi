@@ -214,6 +214,9 @@ pub const Conn = struct {
     /// text is the log line; `effort_notice_json` is `,"effort_notice":"..."`.
     effort_notice: ?[]const u8 = null,
     effort_notice_json: ?[]const u8 = null,
+    /// `<requested> -> <granted>` when the window cut this request's `max_tokens`; empty otherwise.
+    max_tokens_cut: [40]u8 = undefined,
+    max_tokens_cut_len: u8 = 0,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
@@ -226,6 +229,7 @@ pub const Conn = struct {
         c.length_framed = false;
         c.effort_notice = null;
         c.effort_notice_json = null;
+        c.max_tokens_cut_len = 0;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
@@ -795,6 +799,7 @@ pub fn sendSseHeaders(stream: *Conn, kind: []const u8, allow_headers: []const u8
     try stream.writeAllNoFlush(allow_headers);
     try stream.writeAllNoFlush("\r\n");
     try writeEffortNoticeHeader(stream);
+    try request_policy.writeMaxTokensCutHeader(stream);
     try stream.writeAll("\r\n");
     stream.sse_headers_sent = true;
     logHttpStreamStart(kind);
@@ -1813,6 +1818,53 @@ test "effort notice rides the response header and does not replace the answer" {
     try std.testing.expect(std.mem.indexOf(u8, raw, "Access-Control-Expose-Headers: X-Sushi-Effort-Notice\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"content\":\"page summary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"effort_notice\":\"" ++ notice ++ "\"") != null);
+}
+
+fn rawResponseFor(conn: *Conn, peer: std.posix.fd_t, buf: []u8) ![]u8 {
+    conn.close();
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = std.c.recv(peer, buf[got..].ptr, buf.len - got, 0);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    return buf[0..got];
+}
+
+test "a max_tokens the window cuts rides the response head of a JSON and an SSE answer; an uncut or omitted one adds no header" {
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
+    try std.testing.expectEqual(@as(u32, 96), request_policy.clampMaxTokensFor(&conn, 64000, 4000, 4096));
+    try sendResponseFramed(&conn, "200 OK", "application/json", "{}");
+    var buf: [2048]u8 = undefined;
+    const json_raw = try rawResponseFor(&conn, sv[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, json_raw, "\r\nX-Sushi-Max-Tokens-Cut: 64000 -> 96\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_raw, "Access-Control-Expose-Headers: X-Sushi-Max-Tokens-Cut\r\n") != null);
+
+    var sv2: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv2) == 0);
+    defer _ = std.c.close(sv2[1]);
+    var sse: Conn = undefined;
+    Conn.init(&sse, .{ .socket = .{ .handle = sv2[0], .address = undefined } }, std.testing.io);
+    _ = request_policy.clampMaxTokensFor(&sse, 64000, 4000, 4096);
+    try sendSseHeaders(&sse, "chat", "Content-Type");
+    const sse_raw = try rawResponseFor(&sse, sv2[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, sse_raw, "\r\nX-Sushi-Max-Tokens-Cut: 64000 -> 96\r\n") != null);
+
+    for ([_]u32{ 50, request_policy.omittedMaxTokensDefaultWith(4096, 0, 0) }) |asked| {
+        var sv3: [2]std.posix.fd_t = undefined;
+        try std.testing.expect(std.c.socketpair(1, 1, 0, &sv3) == 0);
+        defer _ = std.c.close(sv3[1]);
+        var plain: Conn = undefined;
+        Conn.init(&plain, .{ .socket = .{ .handle = sv3[0], .address = undefined } }, std.testing.io);
+        _ = request_policy.clampMaxTokensFor(&plain, asked, 4000, 4096);
+        try sendResponseFramed(&plain, "200 OK", "application/json", "{}");
+        const raw = try rawResponseFor(&plain, sv3[1], &buf);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "X-Sushi-Max-Tokens-Cut") == null);
+    }
 }
 
 test "isTextGenRoute covers exactly the guarded surfaces" {

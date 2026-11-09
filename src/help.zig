@@ -75,7 +75,8 @@ const shared =
     \\                      0.0.0.0 opens it to the local network)
     \\  --port <n>          Bind port, 1..65535 (default: 12345, or `server.port` in
     \\                        ~/.sushi/model-settings.json)
-    \\  --ctx-size <n>      Maximum context length (default and 0: the model's max)
+    \\  --ctx-size <n>      Maximum context length (default and 0: the model's max).
+    \\                        A value above the model's window is refused.
     \\  --config-overrides <json>   JSON object deep-merged into EVERY
     \\                      model's config.json this process loads or
     \\                      discovers. Generic keys
@@ -198,9 +199,11 @@ const shared =
     \\                        When a request does not fit at <n>, it runs
     \\                        at the widest narrower width that fits (down
     \\                        to 512) instead of being refused.
-    \\  --max-concurrent <n>  Sizes the submit queue (n + 32) and floors the
-    \\                        prefix-cache entry count. Requests batch at
-    \\                        any value, at least 1 (default: 1).
+    \\  --max-concurrent <n>  Sizes the submit queue (n + 32). Requests batch at
+    \\                        any value, at least 1 (default: 1). Above the
+    \\                        default prefix-cache entry count it raises that
+    \\                        count to n; an explicit --prefix-cache-entries
+    \\                        below n is refused.
     \\  --prefill-decode-share <s>
     \\                      Target decode wall-time share during another
     \\                        request's prefill (0..0.9); never narrows
@@ -274,7 +277,7 @@ const shared =
     \\                        limit at startup. Pass 0 to disable.
     \\  --idle-evict-secs <n>
     \\                      Evict .ready entries with refcount==0 if
-    \\                        idle for this many seconds. Default: off.
+    \\                        idle for this many seconds. Default: off; 0 = off.
     \\  --gpu-warm-secs <n> Keep the GPU awake for this many seconds after
     \\                        the last request, so the next one starts
     \\                        without a wake-up delay (default: 60, 0 = off).

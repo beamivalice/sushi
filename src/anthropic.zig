@@ -60,7 +60,6 @@ const launchMaxTokensDefault = request_policy.launchMaxTokensDefault;
 const resolveRequestMaxTokens = request_policy.resolveRequestMaxTokens;
 const maxTokensOrigin = request_policy.maxTokensOrigin;
 const describeMaxTokens = request_policy.describeMaxTokens;
-const clampMaxTokens = request_policy.clampMaxTokens;
 const effortWordOnly = request_policy.effortWordOnly;
 const reasoningEffortFromWord = request_policy.reasoningEffortFromWord;
 const EffortNotice = request_policy.EffortNotice;
@@ -636,7 +635,7 @@ pub fn handleAnthropicMessages(
 
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
-    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);

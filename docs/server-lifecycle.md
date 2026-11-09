@@ -220,7 +220,13 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `ctx_size` above the window the model has under the resulting `yarn_factor` (removing or lowering `yarn_factor`
   included), naming both numbers; a hand-edited file already in that state fails the load with `[model-settings] ctx_size N
   is above the W-token window ...` and `ContextSizeAboveWindow` (`model_load.contextWindowRefusal`). An explicit
-  `--ctx-size` outranks the file and is not judged by it.
+  `--ctx-size` outranks the file and is judged the same way, under the `yarn_factor` and `--config-overrides` in force:
+  `--ctx-size N is above the W-token window ...` ends a boot load with a non-zero exit before any weight loads, and
+  answers an on-demand load with `503 context_size_above_window` carrying the same line.
+  A launch flag the model's arch cannot act on (`model_load.launchRefusal`) is checked at the same two points and
+  answers `503 launch_flag_unsupported` (a saved `kv_quant` the arch cannot store: `kv_quant_unsupported`) with the
+  flag's line. Only the kv_quant refusal is in `ModelRegistry.refusals` (a hand-edited file decides it, so the next
+  load re-reads the file); a flag against an arch is fixed until restart, so it is not a stored retry.
 - **Effort tables live under `"effort:<family>"`** (`qwen4_exp`, `deepseek_v41`, `glm5_next`): `default` and one
   object per effort word holding only the changed `offered`, `sends` and `cap` (shape, validation and precedence:
   [server-http-apis](server-http-apis.md#effort-tables)). Read once at start (`model_settings.loadEffortTables`, a bad

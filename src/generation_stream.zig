@@ -2003,6 +2003,9 @@ test "every load refusal the registry preserves answers under its own name" {
         "ArchitectureUnsupported",
         "ModelFormatUnsupported",
         "ExpertCacheDoesNotFit",
+        "ContextSizeAboveWindow",
+        "LaunchFlagUnsupported",
+        "GlmKvQuantUnsupported",
         "ExpertStreamingRequired",
         "SsdBudgetBelowResident",
         "SsdBudgetBelowVision",
@@ -2036,6 +2039,9 @@ test "every load refusal the registry preserves answers under its own name" {
         try t.expect(refusal.type.len > 0);
         try t.expect(refusal.message.len > 0);
     }
+    try t.expectEqualStrings("launch_flag_unsupported", loadRefusalFor(error.LaunchFlagUnsupported).?.type);
+    try t.expectEqualStrings("kv_quant_unsupported", loadRefusalFor(error.GlmKvQuantUnsupported).?.type);
+    try t.expectEqualStrings("context_size_above_window", loadRefusalFor(error.ContextSizeAboveWindow).?.type);
     try t.expectEqualStrings("architecture_unsupported", loadRefusalFor(error.ArchitectureUnsupported).?.type);
     try t.expectEqualStrings("model_format_unsupported", loadRefusalFor(error.ModelFormatUnsupported).?.type);
     try t.expectEqualStrings("expert_streaming_unsupported_layout", loadRefusalFor(error.ExpertStreamingUnsupportedLayout).?.type);
@@ -2086,6 +2092,9 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.NotEnoughMemory => .{ .type = "out_of_memory", .message = not_enough_memory_message },
         error.ResidentModelsCapReached => .{ .type = "resident_models_cap", .message = resident_models_cap_message, .retry_after = BUSY_RETRY_AFTER_SECS },
         error.InsufficientMemory => .{ .type = "out_of_memory", .message = insufficient_free_memory_message },
+        error.ContextSizeAboveWindow => .{ .type = "context_size_above_window", .message = "--ctx-size, or this model's saved ctx_size, is above the context window the model has under its yarn_factor and --config-overrides. Lower it, or raise yarn_factor." },
+        error.LaunchFlagUnsupported => .{ .type = "launch_flag_unsupported", .message = "A launch flag this server was started with has no effect on this model. The server log names the flag; restart without it." },
+        error.GlmKvQuantUnsupported => .{ .type = "kv_quant_unsupported", .message = "The KV-cache quantization in force (--kv-quant or the model's saved kv_quant) is not one this model stores. The server log names the accepted widths." },
         error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads " ++ arch_packs.served_list ++ "." },
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (" ++ arch_packs.served_types_or ++ ")." },
         error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --ssd-budget-gb or free memory." },
@@ -2143,7 +2152,10 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
     const message = if (err == error.InsufficientMemory) blk: {
         const context = scheduler.takeLoadContextRefusal(id) orelse break :blk refusal.message;
         break :blk memoryContextRefusalMessage(&buf, context);
-    } else refusal.message;
+    } else if (err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported)
+        scheduler_mod.takeLoadWindowRefusal() orelse refusal.message
+    else
+        refusal.message;
     var retry_buf: [40]u8 = undefined;
     const retry = if (refusal.retry_after) |secs| std.fmt.bufPrint(&retry_buf, "Retry-After: {d}\r\n", .{secs}) catch "" else "";
     try sendErrorResponseWithHeaders(allocator, stream, "503 Service Unavailable", refusal.type, message, 503, retry);

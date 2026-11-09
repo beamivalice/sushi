@@ -31,6 +31,9 @@ pub const LaunchFlagUse = struct {
     mtp_typical: bool = false,
     mtp_tokenv3: bool = false,
     mtp_greedy_tail: bool = false,
+    /// `--mtp-min-depth` / `--mtp-max-depth` as given; 0 = not given.
+    mtp_min_depth: u32 = 0,
+    mtp_max_depth: u32 = 0,
 };
 
 /// `--help` text for one arch-only flag, written as the lines it prints, inserted before the line of shared flag `before`.
@@ -113,7 +116,7 @@ pub fn archFlagRefusal(config: *const model.ModelConfig, use: LaunchFlagUse) ?[]
     if (use.ssd_prefetch and !traits.prefetch) return "--ssd-prefetch has no effect on this model: it has no expert prefetcher; drop the flag";
     const tag = arch_config.tagOf(config) orelse return null;
     switch (tag) {
-        inline else => |t| return if (comptime hasDecl(t, "refusal")) flagsOf(t).refusal(use) else null,
+        inline else => |t| return if (comptime hasDecl(t, "refusal")) flagsOf(t).refusal(config, use) else null,
     }
 }
 
@@ -323,6 +326,18 @@ test "deepseek_v41 refuses the launch flags it cannot act on, and ignores a mode
     dsv41.kv_quant_override = kv_quant.KVQuantConfig.affine(8);
     try testing.expectEqualStrings("model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)", settingsKvQuantIgnoredLine(&dsv41).?);
     try testing.expect(settingsKvQuantIgnoredLine(&qwen4) == null);
+}
+
+test "an MTP depth flag above the DSpark block is refused, naming the flag and the block" {
+    if (!built("deepseek_v41")) return error.SkipZigTest;
+    var dsv41 = model.ModelConfig{ .model_type = "deepseek_v41" };
+    dsv41.dsv41 = .{ .dspark = .{ .block = 5 } };
+    const qwen4 = model.ModelConfig{ .model_type = "qwen4_exp" };
+    try testing.expectEqualStrings("--mtp-max-depth 6 is above deepseek_v41's DSpark block of 5 drafts; use 5 or lower", archFlagRefusal(&dsv41, .{ .mtp_max_depth = 6 }).?);
+    try testing.expectEqualStrings("--mtp-min-depth 6 is above deepseek_v41's DSpark block of 5 drafts; use 5 or lower", archFlagRefusal(&dsv41, .{ .mtp_min_depth = 6 }).?);
+    try testing.expect(archFlagRefusal(&dsv41, .{ .mtp_max_depth = 5, .mtp_min_depth = 5 }) == null);
+    try testing.expect(archFlagRefusal(&dsv41, .{}) == null);
+    try testing.expect(archFlagRefusal(&qwen4, .{ .mtp_max_depth = 8 }) == null);
 }
 
 test "deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one line naming the keys set" {

@@ -91,7 +91,7 @@ pub const serve = struct {
             log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s})\n", .{ c.n_mtp, c.dspark.block, ctx.mtp_source });
             if (depth_bounds.active.explicit()) {
                 const range = dspark_rows.Range.of(depth_bounds.active, c.dspark.block);
-                log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth{s})\n", .{ range.min_rows, range.max_rows, if (range.clamped) "; a depth past the block clamps to it" else "" });
+                log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth)\n", .{ range.min_rows, range.max_rows });
             }
         } else {
             const why: []const u8 = if (c.dspark.block == 0 or !source.shipsDspark(ctx.io, ctx.allocator, ctx.model_dir)) "no DSpark stages in this checkpoint" else "--no-mtp or model-settings mtp:false";
@@ -106,14 +106,25 @@ fn setDropExpert(value: []const u8) bool {
 }
 
 /// A launch flag with nothing to act on here; null when every flag given applies.
-pub fn refusal(use: flags.LaunchFlagUse) ?[]const u8 {
+pub fn refusal(config: *const model.ModelConfig, use: flags.LaunchFlagUse) ?[]const u8 {
     if (use.kv_quant) return "--kv-quant has no effect on deepseek_v41: its compressed state is stored as the QAT round trips left it, so there is no KV cache to quantize; drop the flag";
     if (use.qwen_gdn_16) return "--qwen-gdn has no effect on deepseek_v41: it has no GatedDeltaNet layers; drop the flag";
     if (use.mtp_head_kv_quant) return "--mtp-head-kv-quant has no effect on deepseek_v41: its DSpark stages keep their own windows; drop the flag";
     if (use.mtp_typical) return "--mtp-typical has no effect on deepseek_v41: DSpark accepts drafts by the exact rule only; drop the flag";
     if (use.mtp_tokenv3) return "--mtp-tokenv3 has no effect on deepseek_v41: DSpark accepts drafts by the exact rule only; drop the flag";
     if (use.mtp_greedy_tail) return "--mtp-greedy-tail has no effect on deepseek_v41: DSpark drafts one block from the trunk's own state, with no MTP tail; drop the flag";
+    const block = if (config.dsv41) |c| c.dspark.block else 0;
+    if (block > 0) {
+        if (use.mtp_max_depth > block) return depthAboveBlock("--mtp-max-depth", use.mtp_max_depth, block);
+        if (use.mtp_min_depth > block) return depthAboveBlock("--mtp-min-depth", use.mtp_min_depth, block);
+    }
     return null;
+}
+
+var depth_refusal_buf: [160]u8 = undefined;
+
+fn depthAboveBlock(flag: []const u8, given: u32, block: u32) []const u8 {
+    return std.fmt.bufPrint(&depth_refusal_buf, "{s} {d} is above deepseek_v41's DSpark block of {d} drafts; use {d} or lower", .{ flag, given, block, block }) catch "an MTP depth flag is above deepseek_v41's DSpark block";
 }
 
 /// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` is ignored here with one line naming the keys set.

@@ -270,6 +270,50 @@ fn fromValue(v: std.json.Value) Override {
     return o;
 }
 
+/// What a key takes, as the clause after "expected" in a rejection line.
+fn expectedText(buf: []u8, spec: KeySpec) []const u8 {
+    return (switch (spec.kind) {
+        .bool => std.fmt.bufPrint(buf, "true or false", .{}),
+        .int => std.fmt.bufPrint(buf, "a whole number from {d} to {d}", .{ spec.min, spec.max }),
+        .number => std.fmt.bufPrint(buf, "a number from {d} to {d}", .{ spec.min, spec.max }),
+        .choice => if (spec.choices.len == 0)
+            std.fmt.bufPrint(buf, "an absolute path", .{})
+        else blk: {
+            var w = std.Io.Writer.fixed(buf);
+            w.writeAll("one of ") catch break :blk error.NoSpaceLeft;
+            for (spec.choices, 0..) |c, i| w.print("{s}{s}", .{ if (i > 0) ", " else "", c }) catch break :blk error.NoSpaceLeft;
+            break :blk w.buffered();
+        },
+    }) catch "a valid value";
+}
+
+/// The warning for a hand-edited value the loader ignores; null for a value it reads (null counts as unset).
+pub fn rejectionLine(buf: []u8, section: []const u8, spec: KeySpec, v: std.json.Value) ?[]const u8 {
+    if (v == .null) return null;
+    validate(spec, v) catch {
+        var value_buf: [96]u8 = undefined;
+        var vw = std.Io.Writer.fixed(&value_buf);
+        std.json.Stringify.value(v, .{}, &vw) catch {};
+        var expected_buf: [160]u8 = undefined;
+        return std.fmt.bufPrint(buf, "[model-settings] {s}: {s} {s} is ignored; expected {s}", .{ section, spec.name, vw.buffered(), expectedText(&expected_buf, spec) }) catch null;
+    };
+    return null;
+}
+
+/// One warning per ignored key of a settings section; returns how many. The file keeps loading.
+pub fn warnRejected(section: []const u8, obj: std.json.ObjectMap, specs: []const KeySpec) usize {
+    var n: usize = 0;
+    var buf: [512]u8 = undefined;
+    for (specs) |spec| {
+        const v = obj.get(spec.name) orelse continue;
+        if (rejectionLine(&buf, section, spec, v)) |line| {
+            log.warn("{s}\n", .{line});
+            n += 1;
+        }
+    }
+    return n;
+}
+
 pub fn parse(alloc: std.mem.Allocator, body: []const u8) !Settings {
     return .{ .parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{}) };
 }
@@ -306,6 +350,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
+    if (modelObject(&s, model_path)) |obj| _ = warnRejected(model_path, obj, &model_keys);
     if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} max_tokens={d} yarn_factor={d}\n", .{
         model_path,
         o.ctx_size orelse 0,
@@ -458,13 +503,15 @@ fn ctxAboveWindow(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit, 
     return .{ .key = "ctx_size", .why = why catch "ctx_size is above the model's window" };
 }
 
-/// The same refusal for a file value a load meets: the window the loaded config has, no edits.
-pub fn ctxAboveWindowLine(buf: []u8, ctx: u32, window: u32, yarn: ?u8) ?[]const u8 {
+/// The same refusal for a value a load meets, from the file or from `--ctx-size`: the window the loaded config has, no edits.
+pub fn ctxAboveWindowLine(buf: []u8, ctx: u32, window: u32, yarn: ?u8, source: settings_resolve.Source) ?[]const u8 {
     if (ctx == 0 or window == 0 or ctx <= window) return null;
+    const key = if (source == .flag) "--ctx-size" else "ctx_size";
+    const prefix = if (source == .flag) "" else "[model-settings] ";
     return (if (yarn) |n|
-        std.fmt.bufPrint(buf, "[model-settings] ctx_size {d} is above the {d}-token window this model has with yarn_factor {d}; lower ctx_size or yarn_factor", .{ ctx, window, n })
+        std.fmt.bufPrint(buf, "{s}{s} {d} is above the {d}-token window this model has with yarn_factor {d}; lower {s} or yarn_factor", .{ prefix, key, ctx, window, n, key })
     else
-        std.fmt.bufPrint(buf, "[model-settings] ctx_size {d} is above the {d}-token window this model has without yarn_factor; lower ctx_size or set yarn_factor", .{ ctx, window })) catch null;
+        std.fmt.bufPrint(buf, "{s}{s} {d} is above the {d}-token window this model has without yarn_factor; lower {s} or set yarn_factor", .{ prefix, key, ctx, window, key })) catch null;
 }
 
 /// Why the loader ignores `key` for this model, as a sentence for the person editing; null when it takes effect.
@@ -784,6 +831,9 @@ pub fn loadEffortTables(alloc: std.mem.Allocator, io: std.Io) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
+    if (s.parsed) |p| if (p.value == .object) if (p.value.object.get(server_section)) |sec| if (sec == .object) {
+        _ = warnRejected(server_section, sec.object, &server_keys);
+    };
     publishEffortTables(&s);
 }
 
@@ -1403,4 +1453,33 @@ test "model_settings: a save that leaves ctx_size above the window the model wou
     // A window the editor cannot know judges nothing.
     const unknown: Fit = .{ .arch = "x", .streams_experts = false, .has_vision = false };
     try t.expect(refuseEdits(unknown, bare, &.{.{ .key = "ctx_size", .value = .{ .integer = 1 << 30 } }}, &buf) == null);
+}
+
+test "a hand-edited value the loader ignores gets one warning naming the model, the key, the value and what it takes" {
+    const t = std.testing;
+    var buf: [512]u8 = undefined;
+    try t.expectEqualStrings(
+        "[model-settings] /m/a: mtp \"yes\" is ignored; expected true or false",
+        rejectionLine(&buf, "/m/a", findKey(&model_keys, "mtp").?, .{ .string = "yes" }).?,
+    );
+    try t.expectEqualStrings(
+        "[model-settings] /m/a: ctx_size 0 is ignored; expected a whole number from 1 to 4294967295",
+        rejectionLine(&buf, "/m/a", findKey(&model_keys, "ctx_size").?, .{ .integer = 0 }).?,
+    );
+    try t.expectEqualStrings(
+        "[model-settings] /m/a: kv_quant \"5\" is ignored; expected one of off, 4, 6, 8",
+        rejectionLine(&buf, "/m/a", findKey(&model_keys, "kv_quant").?, .{ .string = "5" }).?,
+    );
+    try t.expect(rejectionLine(&buf, "/m/a", findKey(&model_keys, "mtp").?, .{ .bool = true }) == null);
+    try t.expect(rejectionLine(&buf, "/m/a", findKey(&model_keys, "mtp").?, .null) == null);
+}
+
+test "warnRejected counts exactly the keys the loader ignores, in a model section and in the server section" {
+    const t = std.testing;
+    var s = try parse(t.allocator, "{\"/m/a\":{\"mtp\":\"yes\",\"ctx_size\":0,\"kv_quant\":\"8\",\"vision\":false},\"server\":{\"port\":0,\"update_check\":true}}");
+    defer s.deinit();
+    try t.expectEqual(@as(usize, 2), warnRejected("/m/a", modelObject(&s, "/m/a").?, &model_keys));
+    try t.expectEqual(@as(usize, 1), warnRejected(server_section, s.parsed.?.value.object.get(server_section).?.object, &server_keys));
+    try t.expect(s.lookup("/m/a").mtp == null);
+    try t.expectEqual(@as(?bool, false), s.lookup("/m/a").vision);
 }

@@ -317,7 +317,7 @@ pub fn handleCompletions(
 
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
-    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = sampling.repeat_penalty, .presence_penalty = sampling.presence_penalty, .frequency_penalty = sampling.frequency_penalty }, logprobs_n);
