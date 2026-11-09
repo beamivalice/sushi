@@ -329,11 +329,9 @@ pub const Fs = struct {
         meta.* = loaded.meta;
     }
 
-    /// Writes a tensor file in place on the calling thread. Returns its size.
-    pub fn saveTensorsNow(self: *const Fs, path: []const u8, tensors: []const vt.Tensor, meta: []const vt.MetaPair, rows: ?vt.RowMap, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
+    /// Writes a tensor file in place on the calling thread. Returns its size. `maps` is empty or parallel to `tensors`.
+    pub fn saveTensorsNow(self: *const Fs, path: []const u8, tensors: []const vt.Tensor, meta: []const vt.MetaPair, maps: []const ?vt.RowMap, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
         const v = self.vfs.?;
-        const maps = try rowMaps(self.allocator, tensors.len, rows);
-        defer self.allocator.free(maps);
         const r = self.rel(path) orelse return error.BadPathName;
         const t = try vt.stageTensors(v, r, .overwrite, tensors, meta, maps, kind, s);
         const before = self.begin();
@@ -343,14 +341,12 @@ pub const Fs = struct {
 
     /// Stages a tensor file behind the writer's queue; it lands as a `tmp` + `rename` does. A file past the writer's
     /// part size goes as parts of one ticket, each waiting for room as the plain path's parts do, and only the last
-    /// publishes; the caller writes no block. Takes `path`.
-    pub fn stageTensors(self: *const Fs, w: *disk_writer.Writer, path: []u8, tensors: []const vt.Tensor, meta: []const vt.MetaPair, rows: ?vt.RowMap, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
+    /// publishes; the caller writes no block. Takes `path`. `maps` is empty or parallel to `tensors`.
+    pub fn stageTensors(self: *const Fs, w: *disk_writer.Writer, path: []u8, tensors: []const vt.Tensor, meta: []const vt.MetaPair, maps: []const ?vt.RowMap, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
         var path_owned: ?[]u8 = path;
         defer if (path_owned) |p| self.allocator.free(p);
         const v = self.vfs.?;
         const r = self.rel(path) orelse return error.BadPathName;
-        const maps = try rowMaps(self.allocator, tensors.len, rows);
-        defer self.allocator.free(maps);
         // The readback stays here (mlx arrays are inference-thread-owned); the writer gets parts of bytes, as
         // `stageSafetensors` hands it a file's.
         var parts = try vt.Parts.init(self.allocator, tensors, meta, maps, s);
@@ -407,13 +403,6 @@ pub const Fs = struct {
         return (free +| v.physicalBytes()) -| v.logicalBytes();
     }
 };
-
-fn rowMaps(allocator: Allocator, n: usize, rows: ?vt.RowMap) ![]?vt.RowMap {
-    if (rows == null) return allocator.alloc(?vt.RowMap, 0);
-    const maps = try allocator.alloc(?vt.RowMap, n);
-    @memset(maps, rows);
-    return maps;
-}
 
 fn ownedBytes(a: Allocator, bytes: []const u8, kind: write_stats.Kind) !prefix_vfs.OwnedPayload {
     const views = try prefix_vfs.byteSegments(a, bytes);
@@ -610,7 +599,7 @@ test "kv_disk_fs: a file larger than half the writer's permit goes to the writer
 
     w.setPaused(true);
     const phys0 = fs.vfs.?.physicalBytes();
-    const n = try fs.stageTensors(&w, path, &.{.{ .key = "a", .arr = arr }}, &.{}, null, .ssm, s);
+    const n = try fs.stageTensors(&w, path, &.{.{ .key = "a", .arr = arr }}, &.{}, &.{}, .ssm, s);
     try testing.expectEqual(phys0, fs.vfs.?.physicalBytes());
     try testing.expect(fs.stat(probe) == null);
     try testing.expect(w.isPending(probe));

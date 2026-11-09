@@ -318,21 +318,35 @@ const segment = [_]TSpec{
 };
 const ring = kvLayer(0, 640, 2, 16, .bfloat16, .{ .axis = 2, .pos0 = 360 }) ++ affineLayer(1, 640, 2, 16, .{ .axis = 2, .pos0 = 360 });
 const ring_meta = [_]vt.MetaPair{.{ .key = "layers", .value = "3" }};
+// The row maps below are the ones each save site gives: `writeQsaHistoryFile` maps the pooled banks (a row per ratio
+// tokens, from the tail past the segments), never the raw leftovers.
 const history = [_]TSpec{
-    .{ .key = "l0.aux", .shape = &.{ 1, 1300, 64 }, .dtype = .bfloat16, .rows = .{ .axis = 1 } },
-    .{ .key = "l0.pooled", .shape = &.{ 1, 325, 64 }, .dtype = .bfloat16, .rows = .{ .axis = 1, .per_row = 4 } },
-    .{ .key = "l2.aux", .shape = &.{ 1, 1300, 64 }, .dtype = .float32, .rows = .{ .axis = 1 } },
+    .{ .key = "l0.aux", .shape = &.{ 1, 3, 64 }, .dtype = .bfloat16 },
+    .{ .key = "l0.pooled", .shape = &.{ 1, 325, 64 }, .dtype = .bfloat16, .rows = .{ .axis = 1, .pos0 = 8192, .per_row = 4 } },
+    .{ .key = "l2.aux", .shape = &.{ 1, 3, 64 }, .dtype = .float32 },
+    .{ .key = "l2.pooled", .shape = &.{ 1, 325, 64 }, .dtype = .float32, .rows = .{ .axis = 1, .pos0 = 8192, .per_row = 4 } },
 };
-const history_meta = [_]vt.MetaPair{ .{ .key = "qsa_rows", .value = "1300" }, .{ .key = "qsa_ratio", .value = "4" } };
+const history_meta = [_]vt.MetaPair{ .{ .key = "qsa_rows", .value = "9495" }, .{ .key = "qsa_ratio", .value = "4" } };
+const history_segment = [_]TSpec{
+    .{ .key = "l0.pooled", .shape = &.{ 1, 2048, 64 }, .dtype = .bfloat16, .rows = .{ .axis = 1, .pos0 = 8192, .per_row = 4 } },
+    .{ .key = "l2.pooled", .shape = &.{ 1, 2048, 64 }, .dtype = .float32, .rows = .{ .axis = 1, .pos0 = 8192, .per_row = 4 } },
+};
+// `writeSpecSidecar`: the DFlash KV from its base, the MTP KV and the head's pooled bank from the rows past the
+// segments; the head's ring and marks are fixed.
 const sidecar = kvLayer(0, 600, 2, 16, .bfloat16, .{ .axis = 2, .pos0 = 77 }) ++ kvLayer(1, 600, 2, 16, .bfloat16, .{ .axis = 2, .pos0 = 77 }) ++
     [_]TSpec{
-        .{ .key = "m0.k", .shape = &.{ 1, 1, 600, 16 }, .dtype = .float16, .rows = .{ .axis = 2, .pos0 = 77 } },
-        .{ .key = "m.h.aux", .shape = &.{ 1, 600, 64 }, .dtype = .bfloat16, .rows = .{ .axis = 1, .pos0 = 64 } },
-        .{ .key = "m.h.pooled", .shape = &.{ 1, 150, 64 }, .dtype = .bfloat16, .rows = .{ .axis = 1, .pos0 = 64, .per_row = 4 } },
-        .{ .key = "m.h.lv0", .shape = &.{ 3, 64 }, .dtype = .bfloat16 },
-        .{ .key = "m.h.lv1", .shape = &.{ 2, 64 }, .dtype = .bfloat16 },
+        .{ .key = "m0.k", .shape = &.{ 1, 1, 600, 16 }, .dtype = .float16, .rows = .{ .axis = 2, .pos0 = 8192 + 1 } },
+        .{ .key = "mh.aux", .shape = &.{ 1, 32, 64 }, .dtype = .bfloat16 },
+        .{ .key = "mh.pooled", .shape = &.{ 1, 150, 64 }, .dtype = .bfloat16, .rows = .{ .axis = 1, .pos0 = 8192, .per_row = 4 } },
+        .{ .key = "mh.lv0", .shape = &.{ 3, 64 }, .dtype = .bfloat16 },
+        .{ .key = "mh.lv1", .shape = &.{ 2, 64 }, .dtype = .bfloat16 },
     };
-const sidecar_meta = [_]vt.MetaPair{ .{ .key = "d.pos", .value = "77:600" }, .{ .key = "m.pos", .value = "77:600" } };
+const sidecar_meta = [_]vt.MetaPair{ .{ .key = "d.pos", .value = "77:600" }, .{ .key = "m.pos", .value = "1:8792" } };
+const sidecar_segment = [_]TSpec{
+    .{ .key = "m0.k", .shape = &.{ 1, 1, 2048, 16 }, .dtype = .float16, .rows = .{ .axis = 2, .pos0 = 4096 + 1 } },
+    .{ .key = "m0.v", .shape = &.{ 1, 1, 2048, 16 }, .dtype = .float16, .rows = .{ .axis = 2, .pos0 = 4096 + 1 } },
+    .{ .key = "mh.pooled", .shape = &.{ 1, 512, 64 }, .dtype = .bfloat16, .rows = .{ .axis = 1, .pos0 = 4096, .per_row = 4 } },
+};
 const odd_axes = [_]TSpec{
     .{ .key = "x", .shape = &.{ 2, 700, 8 }, .dtype = .int32, .rows = .{ .axis = 1, .pos0 = 5 } },
     .{ .key = "y", .shape = &.{ 700, 3 }, .dtype = .uint8, .rows = .{ .axis = 0, .pos0 = 5 } },
@@ -355,6 +369,8 @@ const other_kinds = [_]KindSpec{
     .{ .name = "sidecar file with the head half and marks", .kind = .spec, .tensors = &sidecar, .meta = &sidecar_meta },
     .{ .name = "rows on axes 0, 1 and 2 of other dtypes", .kind = .kv, .tensors = &odd_axes },
     .{ .name = "empty tensors", .kind = .kv, .tensors = &empties },
+    .{ .name = "history segment", .kind = .qsa, .tensors = &history_segment },
+    .{ .name = "sidecar segment", .kind = .spec, .tensors = &sidecar_segment },
 };
 
 test "tensor files on the vfs: every chunk kind equals what the tier's safetensors path writes and loads" {
@@ -477,6 +493,65 @@ test "tensor files on the vfs: an aligned chunk tail then the whole chunk writes
     const c: u64 = 1024;
     for ([_]u64{ 1, 255, 256, 257, 600, 1023 }) |l| {
         try testing.expectEqual(c - l / 256 * 256, newRows(.{ .axis = 2, .pos0 = 8192 }, l, c));
+    }
+}
+
+/// `spec`'s file without the last `drop` tokens of its row tensors, then the whole file at the same path: the rewrite
+/// stores its header and the rows of the groups the first file did not hold whole, and nothing of its fixed tensors.
+fn expectKindGrowth(spec: KindSpec, drop: u64) !void {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const vroot = try env.path("vfs", .{});
+    defer ta.free(vroot);
+    var vfs = try Vfs.open(ta, tio, vroot, .{});
+    defer vfs.close();
+
+    var b = try Built.init(spec, false);
+    defer b.deinit();
+    const short = try ta.alloc(vt.Tensor, spec.tensors.len);
+    defer ta.free(short);
+    const owned = try ta.alloc(?mlx.mlx_array, spec.tensors.len);
+    defer ta.free(owned);
+    @memset(owned, null);
+    defer for (owned) |o| if (o) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var data: u64 = 0;
+    var expect: u64 = 0;
+    var changed = false;
+    for (spec.tensors, b.views, short, owned) |t, v, *sh, *o| {
+        const nb = mlx.mlx_array_size(v.arr) * mlx.mlx_array_itemsize(v.arr);
+        data += nb;
+        sh.* = v;
+        const m = t.rows orelse continue;
+        const rows: u64 = @intCast(t.shape[m.axis]);
+        const old = rows - drop / m.per_row;
+        // A tensor that lost no row is the same blocks.
+        if (old == rows) continue;
+        changed = true;
+        o.* = try prefixRows(v.arr, m.axis, @intCast(old));
+        sh.arr = o.*.?;
+        expect += nb / rows * newRows(m, old, rows);
+    }
+    _ = try vt.saveTensors(vfs, "f", short, spec.meta, b.maps, spec.kind, s);
+    const before = vfs.stats(spec.kind).data_bytes;
+    const size = try vt.saveTensors(vfs, "f", b.views, spec.meta, b.maps, spec.kind, s);
+    try testing.expectEqual(if (changed) expect + size - data else 0, vfs.stats(spec.kind).data_bytes - before);
+}
+
+test "tensor files on the vfs: every row-mapped kind rewritten with more rows stores only the groups from the old partial one" {
+    for (other_kinds) |spec| {
+        const mapped = for (spec.tensors) |t| {
+            if (t.rows != null and t.shape[t.rows.?.axis] > 0) break true;
+        } else false;
+        if (!mapped) continue;
+        for ([_]u64{ 1, 200, 256, 300 }) |drop| expectKindGrowth(spec, drop) catch |e| {
+            std.debug.print("kind: {s}, drop {d}: {s}\n", .{ spec.name, drop, @errorName(e) });
+            return e;
+        };
     }
 }
 

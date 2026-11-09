@@ -187,6 +187,10 @@ fn writeQsaHistory(self: *DiskTier, dir_rel: []const u8, cp: *const trunk_mod.SS
     for (cp.layers) |*l| if (l.qsa_ratio > 0) {
         ratio = @intCast(l.qsa_ratio);
     };
+    // A pooled row covers `ratio` tokens from position 0.
+    for (list.items) |*t| if (qsaGrowth(t.key, ratio)) |g| {
+        t.rows = .{ .axis = @intCast(g.axis), .per_row = g.div };
+    };
     const seg = try self.writeSegments(dir_rel, 'q', &list, @intCast(DiskTier.qsaHistoryRowsOf(cp)), qsaGrowth, ratio, prev, .qsa, s);
     errdefer self.allocator.free(seg.segs);
     const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
@@ -1943,6 +1947,132 @@ test "DiskTier: an extended QSA history writes only its new segments and the tai
     var ok: bool = false;
     try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
     try testing.expect(ok);
+}
+
+/// Block bytes the content-addressed layer has stored for `kind`.
+fn storedData(tier: *DiskTier, kind: write_stats.Kind) u64 {
+    return tier.fs.vfs.?.stats(kind).data_bytes;
+}
+
+/// Commits a 3-layer hybrid entry of `rows` tokens (a multiple of 4: no leftover) whose layer 2 holds a pooled bank of one
+/// row per 4 tokens, the same numbers at every length.
+fn commitPooled(tier: *DiskTier, cache: *const KVCache, tokens: []const u32, rows: c_int, s: mlx.mlx_stream) !void {
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &[_]c_int{ 1, 2, 8 }, 700.0);
+    src[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, @divTrunc(rows, 4), 8 }, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]trunk_mod.SSMCheckpoint{try trunk_mod.captureSsmCheckpoint(testing.allocator, &src, @intCast(rows), s)};
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try qwen4_qsa_state.attachQsaHistoryToLatest(&cps, &src, s);
+    _ = try tier.appendCommit(cache.entries, @intCast(rows), cache.config, tokens[0..@intCast(rows)], false, &cps, s);
+}
+
+test "DiskTier row groups: a QSA history rewritten with more rows stores only the groups from the old partial one, a segment cut from its tail too" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    for ([_]bool{ false, true }) |writer| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-qsa-groups", 0, 128, .cas);
+        defer tier.deinit();
+        tier.seg_span = 512;
+        if (writer) tier.enableBackgroundWriter();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try fillCache(&cache, s, 3, 1700, 8, 0.0, .float32);
+        var tokens: [1700]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+        const row_bytes: u64 = 8 * 4;
+
+        try commitPooled(&tier, &cache, &tokens, 1300, s);
+        tier.drainWriter();
+        var before = storedData(&tier, .qsa);
+        // 1300 -> 1400 tokens, both past two segments: the old tail held tokens [1024, 1280) whole.
+        try commitPooled(&tier, &cache, &tokens, 1400, s);
+        tier.drainWriter();
+        var e = &tier.entries.items[0];
+        try testing.expectEqual(@as(usize, 2), e.qsa_segs.len);
+        try testing.expectEqual(e.qsa_history_bytes - 64 * row_bytes, storedData(&tier, .qsa) - before);
+
+        before = storedData(&tier, .qsa);
+        // 1400 -> 1700: segment 2 is tokens [1024, 1536), of which the old tail held [1024, 1280) whole; its header is
+        // the other segments' (equal shapes).
+        try commitPooled(&tier, &cache, &tokens, 1700, s);
+        tier.drainWriter();
+        e = &tier.entries.items[0];
+        try testing.expectEqual(@as(usize, 3), e.qsa_segs.len);
+        try testing.expectEqual((128 - 64) * row_bytes + e.qsa_history_bytes, storedData(&tier, .qsa) - before);
+        try testing.expectEqual(@as(u64, 0), tier.writeErrors());
+
+        var hist = try tier.loadQsaHistoryFile(e.id, 3);
+        defer hist.deinit(testing.allocator);
+        const want = makeArange(s, &[_]c_int{ 1, 425, 8 }, 800.0);
+        defer _ = mlx.mlx_array_free(want);
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, want, hist.layers[2].qsa_pooled, false, s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try testing.expect(same);
+    }
+}
+
+test "DiskTier row groups: the MTP head's pooled bank and history rewritten with more rows store only the groups from the old partial one" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-head-groups", 0, 128, .cas);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 800, 8, 0.0, .float32);
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 600, 8, 9.5, .float32);
+
+    var before: u64 = 0;
+    for ([_]c_int{ 600, 800 }) |rows| {
+        if (rows == 800) try fillCache(&mtp, s, 1, 200, 8, 9.5 + 600 * 8, .float32);
+        var head: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+        defer {
+            _ = mlx.mlx_array_free(head.conv_state);
+            _ = mlx.mlx_array_free(head.ssm_state);
+            qwen4_qsa_state.ssmFreeQsaState(&head);
+        }
+        head.aux_state = try filledArray(&[_]c_int{ 1, trunk_mod.QSA_RING_ROWS, 8 }, 4.25, s);
+        head.qsa_pooled = makeArange(s, &[_]c_int{ 1, @divTrunc(rows, 4), 8 }, -5000.0);
+        head.qsa_ratio = 4;
+        head.qsa_hist_rows = rows;
+        var snap = trunk_mod.ssmSnapshot(&head);
+        defer trunk_mod.ssmSnapshotDeinit(&snap);
+        before = storedData(&tier, .spec);
+        _ = try tier.appendCommitWithSpec(cache.entries, @intCast(rows), cache.config, tokens[0..@intCast(rows)], false, null, null, .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &snap,
+            .head_pos_base = 0,
+        }, s);
+        tier.drainWriter();
+    }
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(u32, 800), e.spec_mtp.?.step);
+    // The old sidecar held the head's KV positions [0, 512), its pooled rows [0, 128) and its ring whole.
+    const kv_rows: u64 = 512 * 2 * 8 * 4;
+    const pooled_rows: u64 = 128 * 8 * 4;
+    const ring: u64 = @as(u64, @intCast(trunk_mod.QSA_RING_ROWS)) * 8 * 4;
+    try testing.expectEqual(e.spec_bytes - kv_rows - pooled_rows - ring, storedData(&tier, .spec) - before);
+    try testing.expectEqual(@as(u64, 0), tier.writeErrors());
 }
 
 test "DiskTier: a diverging entry keeps the donor's QSA history segments as links and loads them after the donor goes" {

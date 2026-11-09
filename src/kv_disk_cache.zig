@@ -2469,7 +2469,7 @@ pub const DiskTier = struct {
                 var arr = mlx.mlx_array_new();
                 errdefer _ = mlx.mlx_array_free(arr);
                 try sliceAxis(&arr, t.arr, g.axis, r0, r1, s);
-                try part.append(self.allocator, .{ .key = key, .arr = arr });
+                try part.append(self.allocator, .{ .key = key, .arr = arr, .rows = rowsFrom(t.rows, @intCast(r0)) });
             }
             try materializeContiguous(part.items, s);
             const hash = try self.imageHash(part.items);
@@ -2498,15 +2498,24 @@ pub const DiskTier = struct {
         if (n > 0) {
             for (list.items) |*t| {
                 const g = growthOf(t.key, ratio) orelse continue;
+                const from: usize = @intCast(@as(u64, n) * span / g.div);
                 var tail = mlx.mlx_array_new();
                 errdefer _ = mlx.mlx_array_free(tail);
-                try sliceAxis(&tail, t.arr, g.axis, @intCast(@as(u64, n) * span / g.div), mlx.getShape(t.arr)[g.axis], s);
+                try sliceAxis(&tail, t.arr, g.axis, @intCast(from), mlx.getShape(t.arr)[g.axis], s);
                 _ = mlx.mlx_array_free(t.arr);
                 t.arr = tail;
+                t.rows = rowsFrom(t.rows, from);
             }
         }
         res.segs = try segs.toOwnedSlice(self.allocator);
         return res;
+    }
+
+    /// `rows` of a tensor for its slice from row `from` on.
+    fn rowsFrom(rows: ?vt.RowMap, from: usize) ?vt.RowMap {
+        var m = rows orelse return null;
+        m.pos0 += @as(u64, from) * m.per_row;
+        return m;
     }
 
     /// Wyhash of the file image `tensors` would be saved as (no metadata); `tensors` must be materialized.
@@ -2580,6 +2589,7 @@ pub const DiskTier = struct {
         if (sc.step == 0) return error.DiskCacheEmptyEntry;
         const limit: u32 = @intCast(sc.step);
         const affine = sc.config.scheme != .off;
+        const first = list.items.len;
         for (sc.entries, 0..) |*entry, li| {
             if (!entry.initialized) continue;
             try self.appendSpecSlice(list, prefix, li, "k", entry.keys, limit, s);
@@ -2591,6 +2601,7 @@ pub const DiskTier = struct {
                 try self.appendSpecSlice(list, prefix, li, "vb", entry.values_biases, limit, s);
             }
         }
+        for (list.items[first..]) |*t| t.rows = .{ .axis = 2, .pos0 = sc.base_pos };
         // v5 head half: the QSA raw-key history and pooled bank go in whole.
         var head: ?SpecHeadMeta = null;
         if (sc.head_aux) |a| {
@@ -2606,7 +2617,10 @@ pub const DiskTier = struct {
             const rows_ok = hist == @as(c_int, @intCast(limit)) and a.aux_state.ctx != null;
             if (rows_ok) {
                 try self.appendSpecArray(list, prefix, "h.aux", a.aux_state);
-                if (a.qsa_pooled.ctx != null) try self.appendSpecArray(list, prefix, "h.pooled", a.qsa_pooled);
+                if (a.qsa_pooled.ctx != null) {
+                    try self.appendSpecArray(list, prefix, "h.pooled", a.qsa_pooled);
+                    list.items[list.items.len - 1].rows = .{ .axis = 1, .pos0 = @intCast(@max(sc.head_pos_base, 0)), .per_row = @intCast(@max(a.qsa_ratio, 1)) };
+                }
                 var hm: SpecHeadMeta = .{
                     .pos_base = sc.head_pos_base,
                     .ratio = a.qsa_ratio,
@@ -2942,8 +2956,9 @@ pub const DiskTier = struct {
         return arr;
     }
 
-    /// One staged tensor on the way to a safetensors file.
-    pub const NamedTensor = struct { key: []u8, arr: mlx.mlx_array };
+    /// One staged tensor on the way to a safetensors file. `rows` names its token rows, which the content-addressed
+    /// layer stores by absolute position, so a rewrite shares the row groups it keeps; plain files ignore it.
+    pub const NamedTensor = struct { key: []u8, arr: mlx.mlx_array, rows: ?vt.RowMap = null };
 
     pub fn freeNamed(self: *DiskTier, list: *std.ArrayList(NamedTensor)) void {
         for (list.items) |*t| {
@@ -2972,8 +2987,9 @@ pub const DiskTier = struct {
             if (!entry.initialized or entry.ringed) continue;
             try self.appendLayerSlices(&list, li, entry, config, c0, c1, s);
         }
+        for (list.items) |*t| t.rows = .{ .axis = 2, .pos0 = c0 };
         const path = try std.fmt.allocPrint(self.allocator, "{s}/c{d:0>6}.safetensors", .{ dir_abs, chunk_idx });
-        return self.saveNamedRows(path, list.items, no_meta, .kv, .{ .axis = 2, .pos0 = c0 }, s);
+        return self.saveNamed(path, list.items, no_meta, .kv, s);
     }
 
     /// One layer's K/V rows `[r0, r1)` of its own buffers, every stored kind.
@@ -3000,22 +3016,16 @@ pub const DiskTier = struct {
     /// Write (or, with the writer, stage) one safetensors file at `path`, which it takes.
     /// Returns the file's byte size.
     pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
-        return self.saveNamedRows(path, list, meta, kind, null, s);
-    }
-
-    /// `saveNamed` for a file whose every tensor holds token rows on one axis (`rows`): the content-addressed layer
-    /// stores them by absolute position, so a rewrite shares the row groups it keeps.
-    fn saveNamedRows(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, rows: ?vt.RowMap, s: mlx.mlx_stream) !u64 {
         if (self.writer) |w| {
             if (self.fs.vfs == null) return self.stageSafetensors(w, path, list, meta, kind, s);
             const views = self.tensorViews(list) catch |err| {
                 self.allocator.free(path);
                 return err;
             };
-            defer self.allocator.free(views);
-            return self.fs.stageTensors(w, path, views, meta, rows, kind, s);
+            defer views.deinit(self.allocator);
+            return self.fs.stageTensors(w, path, views.tensors, meta, views.maps, kind, s);
         }
-        const size = self.saveSync(path, list, meta, rows, kind, s) catch |err| {
+        const size = self.saveSync(path, list, meta, kind, s) catch |err| {
             self.stats.recordFailed(dataLen(list));
             return err;
         };
@@ -3023,19 +3033,38 @@ pub const DiskTier = struct {
         return size;
     }
 
-    fn tensorViews(self: *DiskTier, list: []const NamedTensor) ![]vt.Tensor {
+    const TensorViews = struct {
+        tensors: []vt.Tensor,
+        /// Empty when no tensor has rows, else parallel to `tensors`.
+        maps: []?vt.RowMap,
+
+        fn deinit(self: TensorViews, allocator: std.mem.Allocator) void {
+            allocator.free(self.tensors);
+            allocator.free(self.maps);
+        }
+    };
+
+    fn tensorViews(self: *DiskTier, list: []const NamedTensor) !TensorViews {
         const views = try self.allocator.alloc(vt.Tensor, list.len);
+        errdefer self.allocator.free(views);
         for (list, views) |t, *v| v.* = .{ .key = t.key, .arr = t.arr };
-        return views;
+        const mapped = for (list) |t| {
+            if (t.rows != null) break true;
+        } else false;
+        const maps = try self.allocator.alloc(?vt.RowMap, if (mapped) list.len else 0);
+        if (mapped) for (list, maps) |t, *m| {
+            m.* = t.rows;
+        };
+        return .{ .tensors = views, .maps = maps };
     }
 
     /// The synchronous arm of `saveNamed`: the writer arm's bytes, written in place. Takes `path`.
-    fn saveSync(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, rows: ?vt.RowMap, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
+    fn saveSync(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
         defer self.allocator.free(path);
         if (self.fs.vfs != null) {
             const views = try self.tensorViews(list);
-            defer self.allocator.free(views);
-            return self.fs.saveTensorsNow(path, views, meta, rows, kind, s);
+            defer views.deinit(self.allocator);
+            return self.fs.saveTensorsNow(path, views.tensors, meta, views.maps, kind, s);
         }
         const bytes = try self.serializeSafetensors(list, meta, s);
         defer self.allocator.free(bytes);
@@ -3245,6 +3274,11 @@ pub const DiskTier = struct {
         return 0;
     }
 
+    /// A growing array's rows: row `i` holds tokens from `i * divs[li]`.
+    fn grownRows(divs: []const u32, li: usize) vt.RowMap {
+        return .{ .axis = 0, .per_row = divs[li] };
+    }
+
     fn sliceRows(out: *mlx.mlx_array, arr: mlx.mlx_array, from: usize, to: usize, s: mlx.mlx_stream) !void {
         const sh = mlx.getShape(arr);
         try mlx.check(mlx.mlx_slice(out, arr, &[_]c_int{ @intCast(from), 0 }, 2, &[_]c_int{ @intCast(to), sh[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
@@ -3258,12 +3292,13 @@ pub const DiskTier = struct {
             inline for (.{ "conv", "ssm" }, .{ l.conv_state, l.ssm_state }) |name, arr| {
                 if (growable(divs, span, li, arr)) {
                     if (@as(usize, @intCast(mlx.getShape(arr)[0])) < @as(usize, j) * span / divs[li]) return error.DiskCacheCorruptSsm;
+                    const from = (@as(usize, j) - 1) * span / divs[li];
                     var piece = mlx.mlx_array_new();
                     errdefer _ = mlx.mlx_array_free(piece);
-                    try sliceRows(&piece, arr, (@as(usize, j) - 1) * span / divs[li], @as(usize, j) * span / divs[li], s);
+                    try sliceRows(&piece, arr, from, @as(usize, j) * span / divs[li], s);
                     const key = try std.fmt.allocPrint(self.allocator, "l{d}." ++ name, .{li});
                     errdefer self.allocator.free(key);
-                    try list.append(self.allocator, .{ .key = key, .arr = piece });
+                    try list.append(self.allocator, .{ .key = key, .arr = piece, .rows = rowsFrom(grownRows(divs, li), from) });
                 }
             }
         }
@@ -3573,7 +3608,8 @@ pub const DiskTier = struct {
             inline for (names, arrs) |name, arr| {
                 const skip_qsa = qsa_hist and !disk_placement.test_ssm_write_qsa_aux and (comptime std.mem.eql(u8, name, "pooled"));
                 // A growing array keeps the rows its segments do not hold; nothing is written when none remain.
-                const cut = grown_k > 0 and growable(divs, span, li, arr);
+                const grows = growable(divs, span, li, arr);
+                const cut = grown_k > 0 and grows;
                 const from: usize = if (cut) @as(usize, grown_k) * span / divs[li] else 0;
                 if (arr.ctx != null and !skip_qsa and !(cut and from == @as(usize, @intCast(mlx.getShape(arr)[0])))) {
                     const key = try std.fmt.allocPrint(self.allocator, "l{d}." ++ name, .{li});
@@ -3586,7 +3622,7 @@ pub const DiskTier = struct {
                     } else {
                         try mlx.check(mlx.mlx_array_set(&owned, arr));
                     }
-                    try list.append(self.allocator, .{ .key = key, .arr = owned });
+                    try list.append(self.allocator, .{ .key = key, .arr = owned, .rows = if (grows) rowsFrom(grownRows(divs, li), from) else null });
                 }
             }
             if (l.ple_prev_valid) {
@@ -3770,6 +3806,7 @@ pub const DiskTier = struct {
             const hi: u32 = @intCast(src.pos - entry.base);
             try self.appendLayerSlices(&list, li, entry, config, hi - src.rows, hi, s);
         }
+        for (list.items) |*t| t.rows = .{ .axis = 2, .pos0 = src.pos - src.rows };
         var lc_buf: [24]u8 = undefined;
         const lc = try std.fmt.bufPrint(&lc_buf, "{d}", .{src.entries.len});
         const path = try std.fmt.allocPrint(self.allocator, "{s}/r{d:0>7}.safetensors", .{ dir_rel, src.pos });
@@ -8676,6 +8713,156 @@ test "DiskTier write counters: a spec sidecar replaced by an extension counts it
     const spec_two = tier.entries.items[0].spec_bytes;
     try testing.expect(spec_two > spec_one);
     try testing.expectEqual(spec_one + spec_two, wroteKind(&tier, .spec));
+}
+
+/// Block bytes the content-addressed layer has stored for `kind`.
+fn storedData(tier: *DiskTier, kind: write_stats.Kind) u64 {
+    return tier.fs.vfs.?.stats(kind).data_bytes;
+}
+
+/// Bytes a row adds across every array of `cache`'s initialized layers.
+fn cacheRowBytes(cache: *const KVCache) u64 {
+    var n: u64 = 0;
+    for (cache.entries) |*e| {
+        if (!e.initialized) continue;
+        for (layerArrays(e)) |a| n += rowBytes(a);
+    }
+    return n;
+}
+
+fn specOf(cache: *const KVCache, base: usize) SpecCommit {
+    return .{ .entries = cache.entries, .step = cache.step, .config = cache.config, .base_pos = base };
+}
+
+test "DiskTier row groups: a spec sidecar rewritten with more rows stores only the groups from the old partial one" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    for ([_]bool{ false, true }) |writer| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-spec-groups", 0, 128, .cas);
+        defer tier.deinit();
+        if (writer) tier.enableBackgroundWriter();
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+        var mtp = try KVCache.init(testing.allocator, 1);
+        defer mtp.deinit();
+        try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+        var dfl = try KVCache.init(testing.allocator, 2);
+        defer dfl.deinit();
+        try fillCache(&dfl, s, 2, 500, 8, 3.5, .float32);
+        var tokens: [800]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+        _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, specOf(&dfl, 100), specOf(&mtp, 0), s);
+        tier.drainWriter();
+        const before = storedData(&tier, .spec);
+
+        try fillCache(&cache, s, 2, 200, 8, 600.0 * 8, .float32);
+        try fillCache(&mtp, s, 1, 200, 8, 9.5 + 590 * 8, .float32);
+        try fillCache(&dfl, s, 2, 200, 8, 3.5 + 500 * 8, .float32);
+        _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, specOf(&dfl, 100), specOf(&mtp, 0), s);
+        tier.drainWriter();
+        const e = &tier.entries.items[0];
+        try testing.expectEqual(@as(u32, 790), e.spec_mtp.?.step);
+        // MTP positions [0, 512) were whole groups of the old sidecar; DFlash positions [100, 512) were too, or the same
+        // rows of its first group.
+        const kept = 512 * cacheRowBytes(&mtp) + 412 * cacheRowBytes(&dfl);
+        try testing.expectEqual(e.spec_bytes - kept, storedData(&tier, .spec) - before);
+        try testing.expectEqual(@as(u64, 0), tier.writeErrors());
+    }
+}
+
+/// `growCheckpoint`'s growing arrays add `grow_row_bytes` per 4 tokens over two layers: 24 bytes a row in each.
+const grow_layer_row_bytes: u64 = (4 + 2) * 4;
+
+test "DiskTier row groups: a point's growing rows and the segment cut from them store only the groups no earlier file held whole" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    for ([_]bool{ false, true }) |writer| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-grow-groups", 0, 128, .cas);
+        defer tier.deinit();
+        tier.cp_thin = .min_span_recency;
+        tier.ssm_max_per_entry = 160;
+        try tier.setGrownSpec(1024, &grow_divs, grow_row_bytes);
+        if (writer) tier.enableBackgroundWriter();
+        var tokens: [1300]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+        var short = try KVCache.init(testing.allocator, 3);
+        defer short.deinit();
+        try fillCache(&short, s, 3, 600, 8, 0.0, .float32);
+
+        try commitGrowPoints(&tier, &short, tokens[0..600], &.{300}, s);
+        tier.drainWriter();
+        var before = storedData(&tier, .ssm);
+        try commitGrowPoints(&tier, &short, tokens[0..600], &.{ 300, 577 }, s);
+        tier.drainWriter();
+        var e = &tier.entries.items[0];
+        try testing.expectEqualSlices(u32, &.{ 300, 577 }, e.ssm_positions);
+        // Point 300 held rows [0, 128) of layer 1 (a row per 2 tokens) and [0, 64) of layer 2 (per 4) whole.
+        try testing.expectEqual(e.ssm_bytes[1] - (128 + 64) * grow_layer_row_bytes, storedData(&tier, .ssm) - before);
+
+        var long = try KVCache.init(testing.allocator, 3);
+        defer long.deinit();
+        try fillCache(&long, s, 3, 1300, 8, 0.0, .float32);
+        before = storedData(&tier, .ssm);
+        try commitGrowPoints(&tier, &long, &tokens, &.{1200}, s);
+        tier.drainWriter();
+        e = &tier.entries.items[0];
+        try testing.expectEqual(@as(usize, 1), e.grown.len);
+        try testing.expectEqualSlices(u32, &.{ 300, 577, 1200 }, e.ssm_positions);
+        // Segment 1 holds tokens [0, 1024); point 577 held its first 256 rows of layer 1 and 128 of layer 2 whole.
+        try testing.expectEqual(e.grown[0] + e.ssm_bytes[2] - (256 + 128) * grow_layer_row_bytes, storedData(&tier, .ssm) - before);
+        for (e.ssm_positions) |p| try expectGrowPoint(&tier, e.id, p, s);
+        try testing.expectEqual(@as(u64, 0), tier.writeErrors());
+    }
+}
+
+test "DiskTier row groups: a ring file over rows an earlier one held stores only the groups that one did not hold whole" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-ring-groups", 0, 128, .cas);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1500, 8, 0.0, .float32);
+    for (cache.entries) |*en| en.ringed = true;
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/e1", .{tier.root});
+    defer testing.allocator.free(dir);
+    try tier.fs.mkdirp(dir);
+
+    _ = try tier.writeRingFile(dir, .{ .pos = 1000, .rows = 800, .entries = cache.entries }, cache.config, s);
+    const before = storedData(&tier, .ring);
+    const size = try tier.writeRingFile(dir, .{ .pos = 1300, .rows = 800, .entries = cache.entries }, cache.config, s);
+    // Rows [200, 1000), then [500, 1300): only positions [512, 768) are a whole group of both, and the two files'
+    // headers are one (equal shapes).
+    try testing.expectEqual((800 - 256) * cacheRowBytes(&cache), storedData(&tier, .ring) - before);
+    try testing.expect(size > 800 * cacheRowBytes(&cache));
+
+    var ring = try tier.loadRingFile(1, 1300, 2, cache.config, 128);
+    defer ring.deinit();
+    for (ring.entries, cache.entries) |*got, *want| {
+        var rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows);
+        try sliceAxis(&rows, want.keys, 2, 500, 1300, s);
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, rows, got.keys, false, s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try testing.expect(same);
+    }
 }
 
 test "DiskTier write counters: a failed background write lands in failed, never in written" {

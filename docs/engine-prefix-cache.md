@@ -549,9 +549,17 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - **The layer answers as the plain files do**: names, sizes, link counts, inode classes, mtime order, listings; a
   restore loads bitwise the same arrays (`prefix_vfs_tensors.loadTensors`; an unreadable file fails as
   `mlx_load_safetensors` does, `MlxError`). So every decision of the tier reads today's answers.
-- **A KV chunk is stored by absolute row** (axis 2 from `c0`, 256-token groups): an extended chunk keeps its full
-  groups, a rewrite of identical bytes stores nothing. Every other file is whole-file blocks (the growing sidecars come
-  next).
+- **A file's token rows are stored by absolute position** (`NamedTensor.rows`, 256-token groups): a rewrite stores its
+  header and the groups the old file did not hold whole, a rewrite of identical bytes stores nothing. The save sites:
+  - a KV chunk (and GLM's latent chunk): axis 2 from `c0`; a ring file: axis 2 from `pos - rows`;
+  - `spec.safetensors`: the DFlash and MTP KV from their bases, the head's pooled bank a row per ratio tokens from the
+    head's base; its ring and marks are fixed;
+  - `qsa.safetensors`: the pooled banks, a row per ratio tokens from 0; the raw leftovers are fixed;
+  - DeepSeek's `g*` segments and a point's growing arrays: axis 0, a row per `divs[layer]` tokens.
+- **A slice keeps its rows' positions** (`rowsFrom`): a `p*`/`q*` segment cut from the tail shares the groups the tail
+  held whole, and a DeepSeek point past a segment maps the rows past it. Every other tensor is whole-file blocks.
+  MiMo's ring files (window + 30 rows) hold no whole group, so they store as before. Guards: `DiskTier row groups:`
+  (`kv_disk_cache.zig`, `qwen4_disk_qsa.zig`) and `every row-mapped kind` (`prefix_vfs_tensors_test.zig`).
 - **Both save arms write one encoding** (`disk_format.encodeHeader`): the synchronous arm wrote
   `mlx_save_safetensors`'s bytes, 2-18 bytes off the writer's for the same tensors, so the size the budget reads
   followed the arm. Production reaches the synchronous arm only when its writer fails to start; the pin test arms the
