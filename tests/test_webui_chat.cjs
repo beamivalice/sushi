@@ -464,6 +464,25 @@ test('the chosen model comes back when it returns to the list', async ({ browser
   await context.close(); await stub.close();
 });
 
+test('the picker follows the model that is loaded, until the user picks one in this session', async ({ browser }) => {
+  const cold = (id) => model({ id, state: 'unloaded', loaded: false });
+  const stub = await startStub({ models: [cold('A'), cold('B')] });
+  const { page, context } = await open(browser, stub, { storage: { 'sushi-model': 'A' } });
+  assert.equal(await page.inputValue('#modelSelect'), 'A');
+  stub.models = [cold('A'), model({ id: 'B' })];
+  await page.evaluate(() => modelStore.refresh());
+  await page.waitForFunction(() => document.getElementById('modelSelect').value === 'B');
+  await send(page, 'hi');
+  await page.waitForFunction(() => /hello/.test(document.getElementById('chatMessages').textContent)); await idle(page);
+  assert.equal(JSON.parse(stub.posts().at(-1).body).model, 'B');
+  await page.selectOption('#modelSelect', 'A');
+  stub.models = [model({ id: 'A', state: 'unloaded', loaded: false }), model({ id: 'B' }), model({ id: 'C' })];
+  await page.evaluate(() => modelStore.refresh());
+  await page.waitForFunction(() => document.getElementById('modelSelect').options.length === 3);
+  assert.equal(await page.inputValue('#modelSelect'), 'A');
+  await context.close(); await stub.close();
+});
+
 test('a tool round follows the bottom only for a reader who is at the bottom', async ({ browser }) => {
   const filler = Array.from({ length: 30 }, (_, i) => [{ role: 'user', content: `question ${i}` }, { role: 'assistant', content: `answer ${i}\n\n` + 'line\n\n'.repeat(4) }]).flat();
   let release;

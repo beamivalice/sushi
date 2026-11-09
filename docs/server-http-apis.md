@@ -582,6 +582,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   while the server is unreachable, 2 s while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only
   when the answer changed; no timer runs while the tab is hidden, and loads and unloads go through its `act`. There is
   no separate `/health` poll. `confirmAction` is the one confirmation dialog (destructive buttons name the bytes they free).
+- **The chat model picker follows the loaded model**: it keeps a model the user picked in this page session; else the stored `sushi-model` or the shown one if it is loaded; else the first loaded model. A send to an unloaded model cold-loads it and evicts the loaded one, so a stale stored choice must not win.
 - The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
   `/v1/models` (through `modelStore`) and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
   charts need metrics: without them the page says so, shows a **Turn on live statistics** button (only while `/metrics.json` answers

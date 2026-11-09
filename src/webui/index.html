@@ -1972,6 +1972,7 @@ window.matchMedia("(max-width: 880px)").addEventListener("change", applyChatAsid
    Models and thinking effort (from GET /v1/models)
    ------------------------------------------------------------ */
 let modelCatalog = [];
+let pickedModel = "";
 function isChatModel(model) {
   return !Array.isArray(model.capabilities) || model.capabilities.includes("chat");
 }
@@ -2001,7 +2002,10 @@ function renderModelOptions() {
     }
   }
   const ids = modelCatalog.map((model) => model.id);
-  select.value = [stored, shown].find((id) => id && ids.includes(id)) || ids[0] || "";
+  const isLoaded = (id) => { const m = modelCatalog.find((x) => x.id === id); return Boolean(m && (m.state ? m.state === "ready" : m.loaded)); };
+  // A send to a model that is not loaded cold-loads it and evicts the loaded one, so the loaded model wins unless this session picked another.
+  const wanted = [stored, shown].filter((id) => id && ids.includes(id));
+  select.value = ids.includes(pickedModel) ? pickedModel : wanted.find(isLoaded) ?? ids.find(isLoaded) ?? wanted[0] ?? ids[0] ?? "";
   renderEffortOptions();
   renderModelStatus();
 }
@@ -2092,7 +2096,8 @@ function renderModelStatus() {
   if (vision) host.appendChild(tipped(el("span", "badge", "sees images"), "This model can read images you attach.", "vision (input_modalities: image)"));
 }
 $("modelSelect").addEventListener("change", () => {
-  writeStore("sushi-model", $("modelSelect").value);
+  pickedModel = $("modelSelect").value;
+  writeStore("sushi-model", pickedModel);
   renderEffortOptions();
   renderModelStatus();
 });

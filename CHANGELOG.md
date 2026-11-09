@@ -24,6 +24,8 @@ earlier history is mlx-serve's, in that project's changelog.
   again or edit the value, a load failure clears as soon as the model is listed loaded, saving a setting a load reads
   lets the next request retry a failed model, a finished download drops the pack's update notice at once, and a release
   check that finds nothing newer clears an earlier update failure.
+- **The chat page's model picker follows the model that is loaded**: after a model was loaded elsewhere, the page used to
+  keep a remembered, unloaded one, and the next message loaded that one in place of the loaded one.
 - **The chat page lists an unloaded DeepSeek-V4.1-Flash**: `/v1/models` reported it as unable to chat until it was
   loaded, because its template is built in rather than a file in the pack.
 - **A load can no longer leave an unhandled MLX error for the first chat to trip on**: it is logged with its message and
