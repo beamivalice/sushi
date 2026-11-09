@@ -328,18 +328,6 @@ test "deepseek_v41 refuses the launch flags it cannot act on, and ignores a mode
     try testing.expect(settingsKvQuantIgnoredLine(&qwen4) == null);
 }
 
-test "an MTP depth flag above the DSpark block is refused, naming the flag and the block" {
-    if (!built("deepseek_v41")) return error.SkipZigTest;
-    var dsv41 = model.ModelConfig{ .model_type = "deepseek_v41" };
-    dsv41.dsv41 = .{ .dspark = .{ .block = 5 } };
-    const qwen4 = model.ModelConfig{ .model_type = "qwen4_exp" };
-    try testing.expectEqualStrings("--mtp-max-depth 6 is above deepseek_v41's DSpark block of 5 drafts; use 5 or lower", archFlagRefusal(&dsv41, .{ .mtp_max_depth = 6 }).?);
-    try testing.expectEqualStrings("--mtp-min-depth 6 is above deepseek_v41's DSpark block of 5 drafts; use 5 or lower", archFlagRefusal(&dsv41, .{ .mtp_min_depth = 6 }).?);
-    try testing.expect(archFlagRefusal(&dsv41, .{ .mtp_max_depth = 5, .mtp_min_depth = 5 }) == null);
-    try testing.expect(archFlagRefusal(&dsv41, .{}) == null);
-    try testing.expect(archFlagRefusal(&qwen4, .{ .mtp_max_depth = 8 }) == null);
-}
-
 test "deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one line naming the keys set" {
     if (!built("deepseek_v41")) return error.SkipZigTest;
     var dsv41 = model.ModelConfig{ .model_type = "deepseek_v41" };

@@ -80,6 +80,8 @@ drop_one() {
   ln -s "$ROOT/lib/mlx" "$wt/wt/lib/mlx"
   rm -rf "$wt/wt/src/$arch"
   sed -i.bak "/\/\/ arch:$arch\$/d" "$wt/wt/$REGISTRY" && rm -f "$wt/wt/$REGISTRY.bak"
+  # lint fails an allowlist entry whose file is gone; arch-tests.allow names shared tests, which a drop leaves in place.
+  sed -i.bak "/^[a-z-]* src\/$arch\//d" "$wt/wt/tests/guards/lint.allow" && rm -f "$wt/wt/tests/guards/lint.allow.bak"
 
   while [ -e "$QUIET" ]; do sleep 5; done
   start=$(date +%s)

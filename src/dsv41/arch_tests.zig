@@ -33,5 +33,6 @@ pub const host_tests = .{
     @import("tokenizer_deepseek.zig"),
     @import("row_grammar.zig"),
     @import("dsv41_bills_test.zig"),
+    @import("dsv41_flags_test.zig"),
     @import("dsv41_replay_test.zig"),
 };

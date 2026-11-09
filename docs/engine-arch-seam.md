@@ -266,7 +266,9 @@ the link check. Each single-arch ReleaseFast build adds about 2 minutes (107 s q
 for that arch set). A busy box roughly doubles it. Expect the same order on a CI runner.
 
 A drop is one commit that removes:
-- `src/<arch>/` (its fixtures go with it), its registry entry (its packs and flags go with the folder);
+- `src/<arch>/` (its fixtures go with it), its registry entry (its packs and flags go with the folder), and its
+  `tests/guards/lint.allow` entries (lint fails an entry whose file is gone; the drop test removes them). A shared test
+  never names an arch's own types: one that does belongs in `src/<arch>/`;
 - what `build.zig` still names for the arch (`test_dirs`, `TestModel`) until
   those leave the shared files; its test lists leave with its `arch_tests.zig` and registry line, and `src/tests.zig` and `src/tests_host.zig`
   name no arch folder;
