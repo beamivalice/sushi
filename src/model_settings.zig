@@ -25,6 +25,8 @@ pub const think_penalty_max: f32 = 20;
 pub const default_mtp = true;
 pub const default_preserve_thinking = true;
 pub const default_think_penalty: f32 = 0;
+pub const default_max_request_mb: u32 = 128;
+pub const max_request_mb_limit: u32 = 4096;
 
 /// `--expert-cache-bias <n>`; null = not given. It outranks a model's `expert_cache_bias`.
 pub var expert_cache_bias_flag: ?f32 = null;
@@ -480,6 +482,7 @@ pub const server_keys = [_]KeySpec{
     .{ .name = "pack_update_check", .kind = .bool },
     .{ .name = "skip_mem_preflight", .kind = .bool },
     .{ .name = "port", .kind = .int, .min = 1, .max = 65535 },
+    .{ .name = "max_request_mb", .kind = .int, .min = 1, .max = max_request_mb_limit },
 };
 
 pub const server_section = "server";
@@ -791,6 +794,7 @@ pub const Server = struct {
     skip_mem_preflight: ?bool = null,
     /// The port a server binds and the clients target without `--port`.
     port: ?u16 = null,
+    max_request_mb: ?u32 = null,
 };
 
 /// An automatic network look is on unless `--no-update-check` or the file turns it off.
@@ -831,6 +835,9 @@ pub fn server(self: *const Settings) Server {
         out.skip_mem_preflight = v.bool;
     };
     if (sec.get("port")) |v| out.port = default_port.fromValue(v);
+    if (sec.get("max_request_mb")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_request_mb_limit) {
+        out.max_request_mb = @intCast(v.integer);
+    };
     return out;
 }
 
@@ -1232,6 +1239,23 @@ test "model_settings: the update-check keys are booleans, read from the file, an
     try t.expect(autoCheck(false, true).value);
     try t.expect(!autoCheck(true, true).value);
     try t.expectEqual(Source.flag, autoCheck(true, true).source);
+}
+
+test "model_settings: server request limit reads a bounded MiB value" {
+    const t = std.testing;
+    for ([_]struct { value: []const u8, want: ?u32 }{
+        .{ .value = "1", .want = 1 },
+        .{ .value = "4096", .want = 4096 },
+        .{ .value = "0", .want = null },
+        .{ .value = "4097", .want = null },
+        .{ .value = "\"5\"", .want = null },
+    }) |c| {
+        const text = try std.fmt.allocPrint(t.allocator, "{{\"server\":{{\"max_request_mb\":{s}}}}}", .{c.value});
+        defer t.allocator.free(text);
+        var file = try parse(t.allocator, text);
+        defer file.deinit();
+        try t.expectEqual(c.want, server(&file).max_request_mb);
+    }
 }
 
 test "model_settings: server.skip_mem_preflight is a boolean read from the file, off when absent or mistyped" {
