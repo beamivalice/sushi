@@ -2000,6 +2000,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const verify_rows = rows > 1 and rows <= (arch_state.verifyRowsMax(&xfm_ptr.config) orelse 0);
             arch_state.setVerifyRows(&xfm_ptr.config, &ctx.arch_ctx, verify_rows);
             log.info("[fwd-ubench] rows={d} capture={} verify_rows={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, verify_rows });
+            // Decode widths run as a decode tick does; a prefill width keeps the size budget.
+            const tick: ?mlx.DecodeBuffers = if (rows <= 16) mlx.DecodeBuffers.begin() else null;
+            defer if (tick) |k| k.end();
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
                 const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
@@ -2020,6 +2023,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var ops_total: u64 = 0;
             var done: usize = 0;
             const proc_cpu0 = processCpuNs();
+            var buffers0: usize = 0;
+            _ = mlx.mlx_metal_command_buffer_count(&buffers0);
+            var active0: usize = 0;
+            _ = mlx.mlx_reset_peak_memory();
+            _ = mlx.mlx_get_active_memory(&active0);
             for (0..n) |_| {
                 const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
@@ -2044,12 +2052,18 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 done += 1;
             }
             const proc_cpu_ns = processCpuNs() - proc_cpu0;
+            var buffers1: usize = 0;
+            _ = mlx.mlx_metal_command_buffer_count(&buffers1);
+            var peak1: usize = 0;
+            _ = mlx.mlx_get_peak_memory(&peak1);
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
-            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward, process CPU {d:.3} ms/forward on every thread (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward, process CPU {d:.3} ms/forward on every thread, {d:.0} command buffers/forward, MLX peak {d} MB over the start (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
                 done,
                 ms,
                 @as(f64, @floatFromInt(proc_cpu_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(buffers1 - buffers0)) / dn,
+                (peak1 -| active0) >> 20,
                 @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(submit_ns)) / 1.0e6 / dn,

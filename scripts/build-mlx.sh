@@ -49,9 +49,9 @@ done
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
-MLX_PATCH="$REPO_ROOT/patches/mlx-transient-cap.patch"
-MLXC_PATCHES=("$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch" "$REPO_ROOT/patches/mlxc-transient-cap.patch")
-PATCH_SHA="$(cat "$MLX_PATCH" "${MLXC_PATCHES[@]}" | shasum | cut -c1-12)"
+MLX_PATCHES=("$REPO_ROOT/patches/mlx-transient-cap.patch" "$REPO_ROOT/patches/mlx-host-overhead.patch")
+MLXC_PATCHES=("$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch" "$REPO_ROOT/patches/mlxc-transient-cap.patch" "$REPO_ROOT/patches/mlxc-host-overhead.patch")
+PATCH_SHA="$(cat "${MLX_PATCHES[@]}" "${MLXC_PATCHES[@]}" | shasum | cut -c1-12)"
 WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
@@ -86,8 +86,9 @@ apply_patch() {
 }
 
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
-# The transient-cap patch adds the allocator's external-bytes accounting and cap.
-apply_patch "$MLX_SRC" "$MLX_PATCH"
+# The transient-cap patch adds the allocator's external-bytes accounting and cap; the host-overhead
+# patch cuts the host work per GPU op.
+for patch in "${MLX_PATCHES[@]}"; do apply_patch "$MLX_SRC" "$patch"; done
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
@@ -99,7 +100,7 @@ cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
 # The pinned C wrapper needs the optional global-scale slot added by MLX 0.32.3, and the
-# allocator-cap calls the mlx patch added.
+# allocator-cap calls the mlx patch added; a kernel apply reads its config in place.
 for patch in "${MLXC_PATCHES[@]}"; do apply_patch "$MLXC_SRC" "$patch"; done
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────

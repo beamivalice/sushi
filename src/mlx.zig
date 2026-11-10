@@ -498,6 +498,28 @@ pub extern "c" fn mlx_reset_peak_memory() c_int;
 // Patched in by patches/mlx-transient-cap.patch (not upstream MLX).
 pub extern "c" fn mlx_set_transient_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_get_external_memory(res: *usize) c_int;
+/// Command buffers committed since the process started: each costs host time in Metal's submit and completion queues.
+pub extern "c" fn mlx_metal_command_buffer_count(res: *usize) c_int;
+pub extern "c" fn mlx_metal_set_max_mb_per_buffer(prev: *c_int, mb: c_int) c_int;
+
+/// A decode tick's command buffers commit on their op count alone. MLX also commits a buffer once the inputs of its
+/// ops pass a size budget, which bounds the memory a buffer keeps from being freed; at decode widths what passes it is
+/// a weight or the KV the engine holds anyway, so the budget only split the forward into more buffers, each one host
+/// time in Metal's submit and completion queues. Prefill keeps the budget: its memory bill is fitted to it.
+pub const DecodeBuffers = struct {
+    budget_mb: c_int,
+
+    pub fn begin() DecodeBuffers {
+        var prev: c_int = 0;
+        _ = mlx_metal_set_max_mb_per_buffer(&prev, std.math.maxInt(c_int));
+        return .{ .budget_mb = prev };
+    }
+
+    pub fn end(self: DecodeBuffers) void {
+        var lifted: c_int = 0;
+        _ = mlx_metal_set_max_mb_per_buffer(&lifted, self.budget_mb);
+    }
+};
 pub extern "c" fn mlx_get_transient_peak(res: *usize) c_int;
 pub extern "c" fn mlx_reset_transient_peak() c_int;
 
@@ -1560,4 +1582,51 @@ test "one kernel runs each instantiation on its own source: template values, inp
             try t.expectEqual(xv * @as(f32, @floatFromInt(c.scale)) + w[i % @as(usize, @intCast(c.wn))], g);
         }
     }
+}
+
+test "a decode tick's buffers commit on op count: an input past the size budget commits a buffer only outside it" {
+    const t = std.testing;
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    // 64M one-byte items: past MLX's per-buffer size budget on every chip, so an op that reads it commits its buffer.
+    var big = mlx_array_new();
+    defer _ = mlx_array_free(big);
+    try check(mlx_zeros(&big, &[_]c_int{64 << 20}, 1, .uint8, s));
+    try check(mlx_array_eval(big));
+    const picks = [_]i32{ 3, 1 << 20, 63 << 20 };
+    const idx = mlx_array_new_data(&picks, &[_]c_int{picks.len}, 1, .int32);
+    defer _ = mlx_array_free(idx);
+
+    const ops = 12;
+    const Run = struct {
+        fn buffers(big_: mlx_array, idx_: mlx_array, s_: mlx_stream) !usize {
+            var acc = mlx_array_new();
+            defer _ = mlx_array_free(acc);
+            try check(mlx_take(&acc, big_, idx_, s_));
+            for (1..ops) |_| {
+                var row = mlx_array_new();
+                defer _ = mlx_array_free(row);
+                try check(mlx_take(&row, big_, idx_, s_));
+                var sum = mlx_array_new();
+                try check(mlx_add(&sum, acc, row, s_));
+                _ = mlx_array_free(acc);
+                acc = sum;
+            }
+            var before: usize = 0;
+            try check(mlx_metal_command_buffer_count(&before));
+            try check(mlx_array_eval(acc));
+            var after: usize = 0;
+            try check(mlx_metal_command_buffer_count(&after));
+            const got = mlx_array_data_uint8(acc).?[0..3];
+            for (got) |v| if (v != 0) return error.TestUnexpectedResult;
+            return after - before;
+        }
+    };
+    try t.expect(try Run.buffers(big, idx, s) >= ops);
+    {
+        const tick = DecodeBuffers.begin();
+        defer tick.end();
+        try t.expect(try Run.buffers(big, idx, s) <= 2);
+    }
+    try t.expect(try Run.buffers(big, idx, s) >= ops);
 }

@@ -647,11 +647,11 @@ save ~0.4 s of ~18.8 s (~2%), below the spread of the two-sample 32k run (one ar
   35 ms.
 
 <a id="host-cpu"></a>
-## Host CPU per forward: what MLX's per-op work costs (experiment, not shipped)
+## Host CPU per forward: what MLX's per-op work costs, and the patch that cuts it
 
-Three changes inside MLX were measured as patches on the pin and then withdrawn: MLX takes no patch for host cost
-([engine-mlx-gotchas](engine-mlx-gotchas.md#host-overhead)). The numbers are the size of each cost, for a cut made in
-our own code. STQ-2.75bpw rev 2.0 (K6 trunk), M5 Max 128 GB on AC, ReleaseFast, `taskpolicy -a`, GPU lock per boot,
+Three changes inside MLX ship as the [host overhead patch](engine-mlx-gotchas.md#host-overhead). The patch is
+temporary: a decode forward of our own outside MLX replaces it, and these are the numbers that forward has to beat.
+STQ-2.75bpw rev 2.0 (K6 trunk), M5 Max 128 GB on AC, ReleaseFast, `taskpolicy -a`, GPU lock per boot,
 fans max and an idle under 50 C before each boot, 2026-11-10. Stock is 5755e311; each arm ran interleaved with its
 baseline in one session, on MLX builds from one toolchain.
 

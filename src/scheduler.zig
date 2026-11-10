@@ -4120,6 +4120,9 @@ fn recordDrained(metrics: ?*metrics_mod.Metrics, drained: anytype, decoding: any
 pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (active.len == 0) return;
 
+    const buffers = mlx.DecodeBuffers.begin();
+    defer buffers.end();
+
     // Publish the live-token gauge after the whole tick (all decode work + any finishSlot calls) on every
     // return path: O(active), never per token. Finished slots are excluded, so the last slot's completion
     // drives the gauge to the total (live == total at rest).

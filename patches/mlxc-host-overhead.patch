@@ -1,0 +1,72 @@
+A kernel apply reads its config in place: the copy cost a set of vectors and
+strings on every custom-kernel call. `mlx_metal_set_max_mb_per_buffer` and
+`mlx_metal_command_buffer_count` are the C names of the two calls the mlx
+host-overhead patch adds.
+
+diff --git a/mlx/c/fast.cpp b/mlx/c/fast.cpp
+index eb35d16..1d02a36 100644
+--- a/mlx/c/fast.cpp
++++ b/mlx/c/fast.cpp
+@@ -500,7 +500,7 @@ extern "C" int mlx_fast_metal_kernel_apply(
+     const mlx_fast_metal_kernel_config config,
+     const mlx_stream stream) {
+   try {
+-    auto config_ctx = mlx_fast_metal_kernel_config_get_(config);
++    auto& config_ctx = mlx_fast_metal_kernel_config_get_(config);
+     mlx_vector_array_set_(
+         *outputs,
+         mlx_fast_metal_kernel_get_(cls)(
+diff --git a/mlx/c/metal.cpp b/mlx/c/metal.cpp
+index 46d8034..f1b785a 100644
+--- a/mlx/c/metal.cpp
++++ b/mlx/c/metal.cpp
+@@ -35,3 +35,21 @@ extern "C" int mlx_metal_stop_capture(void) {
+   }
+   return 0;
+ }
++extern "C" int mlx_metal_command_buffer_count(size_t* res) {
++  try {
++    *res = mlx::core::metal::command_buffer_count();
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++extern "C" int mlx_metal_set_max_mb_per_buffer(int* prev, int mb) {
++  try {
++    *prev = mlx::core::metal::set_max_mb_per_buffer(mb);
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
+diff --git a/mlx/c/metal.h b/mlx/c/metal.h
+index 5877b22..8c08e90 100644
+--- a/mlx/c/metal.h
++++ b/mlx/c/metal.h
+@@ -6,6 +6,7 @@
+ #ifndef MLX_METAL_H
+ #define MLX_METAL_H
+ 
++#include <stddef.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -31,6 +32,15 @@ extern "C" {
+ int mlx_metal_is_available(bool* res);
+ int mlx_metal_start_capture(const char* path);
+ int mlx_metal_stop_capture(void);
++/**
++ * The number of command buffers committed since the process started.
++ */
++int mlx_metal_command_buffer_count(size_t* res);
++/**
++ * Replace the size budget of a command buffer (MLX_MAX_MB_PER_BUFFER) and
++ * return the previous one. Call it from the evaluating thread.
++ */
++int mlx_metal_set_max_mb_per_buffer(int* prev, int mb);
+ 
+ /**@}*/
+ 

@@ -12,6 +12,8 @@ earlier history is mlx-serve's, in that project's changelog.
   did, instead of taking about twice as long as in 1.6.0.
 - **Less CPU while saving to the SSD prompt cache**: the checksums of saved blocks are computed about 25 times
   faster, which takes about 6% off the server's CPU over a full benchmark run. Existing caches stay valid.
+- **Less CPU for the same work**: the server spends about 20% less CPU over a full benchmark run on
+  Qwen3.8-Flash-Next, decodes about 5% faster and prefills about 2% faster, with the same output.
 
 ## v1.6.0 — Stability, UI and Architecture Refactor
 

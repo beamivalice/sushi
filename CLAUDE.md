@@ -95,8 +95,8 @@ Box: M5 Max 128 GB, macOS 27. Bumping mlx or rebuilding jinja: [process-measurem
 
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
   `zig build test` does NOT refresh `zig-out/bin/sushi`: rebuild before any live A/B.
-- No new patch on mlx or mlx-c: the pin moves often. A host cost MLX imposes is cut in our own code
-  ([engine-mlx-gotchas](docs/engine-mlx-gotchas.md#host-overhead)).
+- The MLX host overhead patch is temporary, until a decode forward of our own beats it; no other new patch goes on
+  mlx or mlx-c ([engine-mlx-gotchas](docs/engine-mlx-gotchas.md#host-overhead)).
 - A git worktree lacks `.zig-toolchain/` and `lib/mlx/`: symlink both from the main checkout. After a toolchain/SDK
   change `rm -rf .zig-cache` (configure-time output is cached).
 
