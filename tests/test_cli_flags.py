@@ -5,16 +5,19 @@
 No weights load and nothing listens on a port the owner uses: every server here is headless over an empty
 --model-dir on a port above 18000, with a private HOME.
 """
+import base64
 import http.server
 import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import zlib
 
 binary = str(Path(os.environ.get("SUSHI_BIN", "zig-out/bin/sushi")).resolve())
 root = Path(tempfile.mkdtemp(prefix="sushi-cli-flags-"))
@@ -228,6 +231,7 @@ def read_response(sock):
 
 port = free_port(18931)
 assert port not in (11250, 12345)
+(home / ".sushi" / "model-settings.json").write_text(json.dumps({"server": {"max_request_mb": 5}}))
 server = subprocess.Popen(
     [binary, "serve", "--model-dir", str(home / "models"), "--port", str(port), "--log-file", "off", "--no-update-check"],
     env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -257,6 +261,61 @@ try:
             check(second == b"", "a reused socket ends with EOF", second[:100])
         except ConnectionResetError:
             failures.append("a reused socket was reset")
+
+    def exchange(payload, route="/v1/request-limit-test", chunked=False):
+        with connect() as s:
+            if chunked:
+                s.sendall(f"POST {route} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".encode())
+                for start in range(0, len(payload), 65536):
+                    part = payload[start:start + 65536]
+                    s.sendall(b"%x\r\n" % len(part) + part + b"\r\n")
+                s.sendall(b"0\r\n\r\n")
+            else:
+                s.sendall(f"POST {route} HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: {len(payload)}\r\n\r\n".encode())
+                interim = read_response(s)
+                if not interim.startswith(b"HTTP/1.1 100 "):
+                    return interim
+                s.sendall(payload)
+            return read_response(s)
+
+    def setting(value):
+        payload = json.dumps({"server": {"max_request_mb": value}}).encode()
+        reply = exchange(payload, "/v1/settings")
+        check(reply.startswith(b"HTTP/1.1 200"), f"save request limit {value}", reply[:300])
+
+    # A flat PNG stored without compression has real image bytes without needing an image library or model.
+    def png_chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    row = b"\x00" + b"\xff\x00\x00" * 1024
+    png = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1024, 1024, 8, 2, 0, 0, 0))
+    png += png_chunk(b"IDAT", zlib.compress(row * 1024, level=0)) + png_chunk(b"IEND", b"")
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64.b64encode(png).decode()}}
+    one = json.dumps({"messages": [{"role": "user", "content": [image]}]}).encode()
+    two = json.dumps({"messages": [{"role": "user", "content": [image, image]}]}).encode()
+    check((1 << 20) < len(one) < (5 << 20) < len(two), "image fixtures straddle the configured limits")
+    reply = exchange(two)
+    check(reply.startswith(b"HTTP/1.1 413") and b"5 MB limit" in reply, "startup reads the saved request limit", reply[:250])
+    setting(1)
+    reply = exchange(one)
+    check(reply.startswith(b"HTTP/1.1 413") and b"1 MB limit" in reply, "1 MiB rejects one image", reply[:250])
+    setting(5)
+    for chunked in (False, True):
+        reply = exchange(one, chunked=chunked)
+        check(reply.startswith(b"HTTP/1.1 404"), f"5 MiB admits one image to routing, chunked={chunked}", reply[:250])
+    reply = exchange(two)
+    check(reply.startswith(b"HTTP/1.1 413") and b"5 MB limit" in reply, "5 MiB rejects two images", reply[:250])
+    setting(None)
+    reply = exchange(two)
+    check(reply.startswith(b"HTTP/1.1 404"), "reset restores the default limit without restarting", reply[:250])
+    with connect() as s:
+        s.sendall(b"GET /v1/settings HTTP/1.1\r\nHost: x\r\n\r\n")
+        saved = json.loads(read_response(s).partition(b"\r\n\r\n")[2])["server"]["max_request_mb"]
+        check(saved["default"] == 128 and saved["file"] is None, "default is 128 MiB and reset removes the saved value", str(saved))
+    for size, status in ((70, b"HTTP/1.1 100"), (129, b"HTTP/1.1 413")):
+        with connect() as s:
+            s.sendall(f"POST /v1/request-limit-test HTTP/1.1\r\nContent-Length: {size << 20}\r\nExpect: 100-continue\r\n\r\n".encode())
+            check(read_response(s).startswith(status), f"default handles a {size} MiB request header")
 
     # A chunked body is decoded like its Content-Length twin.
     with connect() as s:

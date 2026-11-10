@@ -2,6 +2,7 @@
 //! scheduler read. Written before `serve` accepts a connection unless a field says otherwise.
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
+const model_settings = @import("model_settings.zig");
 const trunk = @import("trunk.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -15,6 +16,12 @@ const ModelRegistry = model_registry_mod.ModelRegistry;
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
 
 pub var completion_id_counter = std.atomic.Value(i64).init(0);
+
+pub var max_request_bytes = std.atomic.Value(usize).init(@as(usize, model_settings.default_max_request_mb) << 20);
+
+pub fn setMaxRequestMb(value: ?u32) void {
+    max_request_bytes.store(@as(usize, value orelse model_settings.default_max_request_mb) << 20, .monotonic);
+}
 
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
