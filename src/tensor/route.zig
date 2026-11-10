@@ -263,6 +263,9 @@ pub const stream = core.stream;
 pub const stats = core.stats;
 pub const budget = core.budget;
 pub const close = core.close;
+pub const kernelProfile = core.kernelProfile;
+pub const resetKernelProfile = core.resetKernelProfile;
+pub const logKernelProfile = core.logKernelProfile;
 
 /// Names what the host builds from here (0 other, 1 a forward, 2 a draft, 3 a verify, 4 a round's end): the debug
 /// line charges each GPU pause to the phase whose pass ended it.
@@ -1774,4 +1777,95 @@ test "the engine reads a strided MLX view through its strides" {
     };
     try expectSame(Build.doubled, &.{view});
     try expectSame(Build.rowSums, &.{view});
+}
+
+/// An add, a vector-matrix product and a sum over an axis on the engine, queued together and read once: their bytes.
+fn addMatmulSum() ![492]u8 {
+    const gpu_data = ramp(f32, 60, 6, -3);
+    const w_data = ramp(f32, 48 * 300, 0.2, -0.1);
+    const x_data = ramp(f32, 300, 2, -1);
+    const a = hostArray(f32, &gpu_data, &.{ 3, 4, 5 }, .float32);
+    defer _ = mlx.mlx_array_free(a);
+    const w = hostArray(f32, &w_data, &.{ 48, 300 }, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    const x = hostArray(f32, &x_data, &.{300}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const s = core.stream();
+    var results: [3]A = .{ .{}, .{}, .{} };
+    defer for (results) |r| {
+        if (r.ctx != null) _ = mlx.mlx_array_free(r);
+    };
+    try mlx.check(mlx.mlx_add(&results[0], a, a, s));
+    try mlx.check(mlx.mlx_matmul(&results[1], w, x, s));
+    try mlx.check(mlx.mlx_sum_axis(&results[2], a, 1, true, s));
+    var out: [492]u8 = undefined;
+    var at: usize = 0;
+    for (results) |r| {
+        try mlx.check(mlx.mlx_array_eval(r));
+        const n = mlx.mlx_array_size(r) * mlx.mlx_array_itemsize(r);
+        @memcpy(out[at..][0..n], mlx.mlx_array_data_uint8(r).?[0..n]);
+        at += n;
+    }
+    try t_std.expectEqual(out.len, at);
+    return out;
+}
+
+test "with the kernel profile on, each dispatch is its own command buffer and the profile names it" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    core.kernel_prof_hook = true;
+    defer core.kernel_prof_hook = null;
+    try core.sync();
+    core.resetKernelProfile();
+    const before = core.stats();
+    _ = try addMatmulSum();
+    const after = core.stats();
+    const dispatches = after.dispatches - before.dispatches;
+    try t_std.expectEqual(@as(u64, 3), dispatches);
+    try t_std.expectEqual(dispatches, after.submits - before.submits);
+    var counted: u64 = 0;
+    var saw_gemv = false;
+    var saw_reduce = false;
+    for (core.kernelProfile()) |k| {
+        counted += k.dispatches;
+        try t_std.expect(k.name.len > 0);
+        try t_std.expect(k.total_ns > 0 and k.max_ns > 0 and k.max_ns <= k.total_ns);
+        saw_gemv = saw_gemv or std.mem.indexOf(u8, k.name, "gemv") != null;
+        saw_reduce = saw_reduce or std.mem.indexOf(u8, k.name, "reduce") != null;
+    }
+    try t_std.expectEqual(dispatches, counted);
+    try t_std.expect(saw_gemv and saw_reduce);
+    core.resetKernelProfile();
+    try t_std.expectEqual(@as(usize, 0), core.kernelProfile().len);
+}
+
+test "the kernel profile leaves values as they were" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const plain = try addMatmulSum();
+    core.kernel_prof_hook = true;
+    defer core.kernel_prof_hook = null;
+    const profiled = try addMatmulSum();
+    try t_std.expectEqualSlices(u8, &plain, &profiled);
+}
+
+test "with the kernel profile off, the profile is empty and the three ops share one command buffer" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    core.kernel_prof_hook = false;
+    defer core.kernel_prof_hook = null;
+    try core.sync();
+    core.resetKernelProfile();
+    const before = core.stats();
+    _ = try addMatmulSum();
+    const after = core.stats();
+    try t_std.expectEqual(@as(u64, 3), after.dispatches - before.dispatches);
+    try t_std.expectEqual(@as(u64, 1), after.submits - before.submits);
+    try t_std.expectEqual(@as(usize, 0), core.kernelProfile().len);
 }

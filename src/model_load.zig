@@ -2024,6 +2024,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var done: usize = 0;
             const proc_cpu0 = processCpuNs();
             const engine0 = mlx.engine.stats();
+            mlx.engine.resetKernelProfile();
             var buffers0: usize = 0;
             _ = mlx.mlx_metal_command_buffer_count(&buffers0);
             var active0: usize = 0;
@@ -2097,6 +2098,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     @as(f64, @floatFromInt(e.gpu_gap_count[3] - engine0.gpu_gap_count[3])) / dn,
                     @as(f64, @floatFromInt(e.gpu_gap_sum[3] - engine0.gpu_gap_sum[3])) / 1.0e6 / dn,
                 });
+                mlx.engine.logKernelProfile(dn);
             }
             // SUSHI_DECODE_FWD_GRAPH=<abs path>: one forward's unevaluated tape, one primitive per
             // line; a primitive is at most one dispatch, so a histogram of it is the dispatch plan.

@@ -9,6 +9,7 @@
 const std = @import("std");
 const metal = @import("../metal.zig");
 const metal_mlx = @import("../metal_mlx.zig");
+const io_util = @import("../io_util.zig");
 const mlx = @import("../mlx.zig");
 
 pub const max_dims = 8;
@@ -107,12 +108,27 @@ const classes = steps * 22;
 const Stores = std.AutoHashMapUnmanaged(*Store, void);
 
 /// A submitted pass: its command buffer, the fence it reaches when it has run, and its number.
-const Flying = struct { cmd: metal.Committed, fence: metal.Fence, seq: u64, phase: u8 = 0 };
+const Flying = struct { cmd: metal.Committed, fence: metal.Fence, seq: u64, phase: u8 = 0, kernels: Kernels = .{} };
 
 /// What the host is building, set by the model: a pause is charged to the phase of the pass that ends it.
 pub var phase: u8 = 0;
 pub const phases = 6;
-const Finished = struct { cmd: metal.Committed, phase: u8 };
+const Finished = struct { cmd: metal.Committed, phase: u8, kernels: Kernels };
+
+/// The kernels a pass dispatched, by name; filled only while the kernel profile is on.
+const Kernels = struct {
+    n: u32 = 0,
+    named: u8 = 0,
+    names: [8][]const u8 = undefined,
+
+    fn add(k: *Kernels, name: []const u8) void {
+        if (k.named < k.names.len) {
+            k.names[k.named] = name;
+            k.named += 1;
+        }
+        k.n += 1;
+    }
+};
 
 const State = struct {
     dev: *const metal.Device,
@@ -152,6 +168,7 @@ const State = struct {
     /// Command buffers that have run and whose GPU times are still to read, oldest first: Metal sets them a moment
     /// after the event a wait returns on.
     untimed: std.ArrayList(Finished) = .empty,
+    pass_kernels: Kernels = .{},
     stats: Stats = .{},
 };
 
@@ -201,6 +218,114 @@ fn st() Error!*State {
 
 pub fn stats() Stats {
     return if (state) |s| s.stats else .{};
+}
+
+// ── Kernel profile ──
+
+/// Tests set this; otherwise `SUSHI_ENGINE_KERNEL_PROF` decides, read once.
+pub var kernel_prof_hook: ?bool = null;
+var kernel_prof_env: ?bool = null;
+
+/// With the profile on, every op's pass is handed over and waited for before the next op's begins, so the
+/// command buffer's GPU times are the op's. Timing changes; values do not.
+pub fn kernelProfOn() bool {
+    return kernel_prof_hook orelse io_util.diagEnvOnCached(&kernel_prof_env, "SUSHI_ENGINE_KERNEL_PROF");
+}
+
+pub const KernelStat = struct { name: []const u8, dispatches: u64, total_ns: u64, max_ns: u64 };
+
+/// Pipeline handle to the name it was made by.
+var pipeline_names: std.AutoHashMapUnmanaged(usize, []const u8) = .empty;
+var profile: std.StringHashMapUnmanaged(KernelStat) = .empty;
+var profile_view: std.ArrayList(KernelStat) = .empty;
+
+fn pipelineName(raw: metal.id) []const u8 {
+    return pipeline_names.get(@intFromPtr(raw)) orelse "(unnamed)";
+}
+
+/// One entry per distinct name; a pass of several dispatches is one entry named by all of them, joined by " + ".
+fn noteKernels(k: Kernels, ns: u64) void {
+    var buf: [1024]u8 = undefined;
+    var len: usize = 0;
+    for (k.names[0..k.named], 0..) |name, i| {
+        const sep = if (i > 0) " + " else "";
+        if (len + sep.len + name.len > buf.len) break;
+        @memcpy(buf[len..][0..sep.len], sep);
+        len += sep.len;
+        @memcpy(buf[len..][0..name.len], name);
+        len += name.len;
+    }
+    const key = buf[0..len];
+    if (profile.getPtr(key)) |e| {
+        e.dispatches += k.n;
+        e.total_ns += ns;
+        e.max_ns = @max(e.max_ns, ns);
+        return;
+    }
+    const owned = gpa.dupe(u8, key) catch return;
+    profile.put(gpa, owned, .{ .name = owned, .dispatches = k.n, .total_ns = ns, .max_ns = ns }) catch gpa.free(owned);
+}
+
+/// Reads the times of every finished command buffer, waiting a moment for the ones Metal has not timed yet.
+fn flushSpans(s: *State) void {
+    const nap: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_us };
+    var tries: u32 = 0;
+    while (true) {
+        readGpuSpans(s, 0);
+        if (s.untimed.items.len == 0 or tries >= 2000) return;
+        tries += 1;
+        _ = std.c.nanosleep(&nap, null);
+    }
+}
+
+/// The kernels dispatched since the last reset, longest total GPU time first. Valid until the next call; the
+/// caller has synced.
+pub fn kernelProfile() []const KernelStat {
+    if (state) |*s| flushSpans(s);
+    profile_view.clearRetainingCapacity();
+    var it = profile.valueIterator();
+    while (it.next()) |e| profile_view.append(gpa, e.*) catch break;
+    std.mem.sort(KernelStat, profile_view.items, {}, struct {
+        fn longer(_: void, a: KernelStat, b: KernelStat) bool {
+            return a.total_ns > b.total_ns;
+        }
+    }.longer);
+    return profile_view.items;
+}
+
+pub fn resetKernelProfile() void {
+    if (state) |*s| flushSpans(s);
+    var it = profile.keyIterator();
+    while (it.next()) |k| gpa.free(k.*);
+    profile.clearRetainingCapacity();
+}
+
+/// Debug lines for the profile, `per` forwards to the totals; nothing while the switch is off.
+pub fn logKernelProfile(per: f64) void {
+    if (!kernelProfOn()) return;
+    const top = 40;
+    var other: KernelStat = .{ .name = "", .dispatches = 0, .total_ns = 0, .max_ns = 0 };
+    var more: usize = 0;
+    for (kernelProfile(), 0..) |k, i| {
+        if (i >= top) {
+            other.dispatches += k.dispatches;
+            other.total_ns += k.total_ns;
+            more += 1;
+            continue;
+        }
+        logKernelLine(k.name, k, per);
+    }
+    if (more > 0) {
+        var buf: [48]u8 = undefined;
+        logKernelLine(std.fmt.bufPrint(&buf, "(other, {d} kernels)", .{more}) catch "(other)", other, per);
+    }
+}
+
+fn logKernelLine(name: []const u8, k: KernelStat, per: f64) void {
+    const log = @import("../log.zig");
+    const n: f64 = @floatFromInt(k.dispatches);
+    const ns: f64 = @floatFromInt(k.total_ns);
+    log.debug("[engine-prof] {s}: {d:.1} dispatches, {d:.3} ms total, {d:.2} us each\n", .{ name, n / per, ns / 1e6 / per, ns / 1e3 / @max(n, 1) });
 }
 
 // ── Handles ──
@@ -590,7 +715,12 @@ const kick_first = 4;
 pub fn pass() Error!metal.Pass {
     const s = try st();
     if (s.pass) |open| {
-        if (s.pass_dispatches >= s.kick_after and s.next_in.count() == 0 and s.next_out.count() == 0 and (s.burst or gpuIdle(s))) {
+        if (kernelProfOn() and s.pass_dispatches > 0) {
+            s.pass = null;
+            try commitPass(s, open);
+            try waitFor(s, s.seq - 1);
+            flushSpans(s);
+        } else if (s.pass_dispatches >= s.kick_after and s.next_in.count() == 0 and s.next_out.count() == 0 and (s.burst or gpuIdle(s))) {
             s.pass = null;
             try commitPass(s, open);
             s.kick_after *|= 2;
@@ -634,6 +764,7 @@ fn beforeDispatch() void {
     const s = &state.?;
     s.stats.dispatches += 1;
     s.pass_dispatches += 1;
+    if (kernelProfOn()) s.pass_kernels.add(pipelineName(metal.bound_pipeline));
     if (s.needs_barrier) {
         s.pass.?.barrier();
         s.stats.barriers += 1;
@@ -669,9 +800,10 @@ pub var pipeline_ns: u64 = 0;
 pub var pipelines_late: u64 = 0;
 pub var sealed: bool = false;
 
-/// A pipeline named `name` was made since `t0`.
-pub fn madePipeline(name: []const u8, t0: u64) void {
+/// The pipeline `pipeline`, named `name`, was made since `t0`.
+pub fn madePipeline(name: []const u8, t0: u64, pipeline: metal.Pipeline) void {
     const ns = nowNs() - t0;
+    if (gpa.dupe(u8, name)) |owned| pipeline_names.put(gpa, @intFromPtr(pipeline.raw), owned) catch gpa.free(owned) else |_| {}
     pipelines += 1;
     pipeline_ns += ns;
     const log = @import("../log.zig");
@@ -716,12 +848,14 @@ fn commitPass(s: *State, open: metal.Pass) Error!void {
     }
     const t0 = nowNs();
     const flying: Flying = .{ .cmd = undefined, .fence = fence, .seq = s.seq };
+    const kernels = s.pass_kernels;
+    s.pass_kernels = .{};
     var writes = s.pass_writes.keyIterator();
     while (writes.next()) |store| s.writers.put(gpa, store.*, flying) catch return error.OutOfMemory;
     open.updateFence(fence);
     s.pass_binds.clearRetainingCapacity();
     s.pass_writes.clearRetainingCapacity();
-    s.flying.append(gpa, .{ .cmd = open.commit(), .fence = fence, .seq = s.seq, .phase = phase }) catch return error.OutOfMemory;
+    s.flying.append(gpa, .{ .cmd = open.commit(), .fence = fence, .seq = s.seq, .phase = phase, .kernels = kernels }) catch return error.OutOfMemory;
     s.stats.commit_ns += nowNs() - t0;
     s.seq += 1;
     s.pass_dispatches = 0;
@@ -774,6 +908,7 @@ fn readGpuSpans(s: *State, backlog: usize) void {
         const span = done.cmd.gpuSpan();
         if ((span[0] <= 0 or span[1] < span[0]) and s.untimed.items.len - n <= backlog) break;
         noteGpuSpan(s, span, done.phase);
+        if (done.kernels.n > 0 and span[0] > 0 and span[1] >= span[0]) noteKernels(done.kernels, @intFromFloat((span[1] - span[0]) * 1e9));
         done.cmd.release();
         n += 1;
     }
@@ -844,7 +979,7 @@ fn waitFor(s: *State, upto_in: u64) Error!void {
             continue;
         }
         if (failed == null and f.cmd.failed()) failed = error.MetalCommand;
-        s.untimed.append(gpa, .{ .cmd = f.cmd, .phase = f.phase }) catch {
+        s.untimed.append(gpa, .{ .cmd = f.cmd, .phase = f.phase, .kernels = f.kernels }) catch {
             s.stats.gpu_untimed += 1;
             s.gpu_last_end = 0;
             f.cmd.release();

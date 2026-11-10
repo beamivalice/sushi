@@ -174,6 +174,11 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 - `[engine] since load:` (debug, at a request's end) and the decode meter's `[fwd-ubench] engine:` line carry
   dispatches, command buffers, waits, imports, the pool, and the GPU's own times: busy, idle between passes, and
   that idle by pause length and by what the host was building (forward, draft, verify, round end).
+- **`SUSHI_ENGINE_KERNEL_PROF=1` prices each kernel**: every op's pass is committed and waited for before the next op
+  begins, so its command buffer's GPU times are that kernel's (an op of several dispatches is one row, its kernel names
+  joined by ` + `). The `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each` lines (debug; the top 40
+  by total GPU time and one remainder line) follow `[engine] since load:` and the decode meter's `[fwd-ubench] engine:`
+  line, the latter per forward. The forward runs slower under it; read the table's shares, not the forward's wall time.
 - **GPU busy and idle are read from the command buffers** (`GPUStartTime`, `GPUEndTime`), which Metal fills after
   the completion signal: a finished buffer is read at a later prune, in order.
 - **The round's verdict stays on the engine** (`dsv41_serving.verdictStream`): the masked argmax over the verify's

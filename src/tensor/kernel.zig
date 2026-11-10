@@ -303,7 +303,7 @@ fn pipelineOf(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pip
     const text = try render(def, name_z, inputs, cfg);
     defer gpa.free(text);
     const pipeline = try (try metal.device()).compile(text, name_z);
-    core.madePipeline(name_z, t0);
+    core.madePipeline(name_z, t0, pipeline);
     try def.instances.put(gpa, try gpa.dupe(u8, key_buf.items), pipeline);
     return pipeline;
 }

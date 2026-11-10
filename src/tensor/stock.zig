@@ -41,7 +41,7 @@ pub fn kernel(name: []const u8) Error!metal.Pipeline {
     @memcpy(owned, name);
     const t0 = core.nowNs();
     const p = try dev.pipelineOf(try lib(dev), owned);
-    core.madePipeline(name, t0);
+    core.madePipeline(name, t0, p);
     pipelines.put(gpa, owned, p) catch return error.OutOfMemory;
     return p;
 }
@@ -54,7 +54,7 @@ pub fn kernelFlags(name: []const u8, hash: []const u8, flags: []const metal.Flag
     const function = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return error.TensorShape;
     const t0 = core.nowNs();
     const p = try dev.pipelineOfFlags(try lib(dev), function, flags);
-    core.madePipeline(hash, t0);
+    core.madePipeline(hash, t0, p);
     const owned = gpa.dupe(u8, hash) catch return error.OutOfMemory;
     pipelines.put(gpa, owned, p) catch return error.OutOfMemory;
     return p;

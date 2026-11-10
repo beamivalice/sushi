@@ -292,12 +292,16 @@ pub const Buffer = struct {
 /// A buffer and the byte in it where a tensor's data starts.
 pub const Bound = struct { buffer: Buffer, offset: usize };
 
+/// The pipeline the latest `Pass.pipeline` set, whichever pass: the one thread that encodes asks it at a dispatch.
+pub var bound_pipeline: id = null;
+
 pub const Pass = struct {
     pool: ?*anyopaque,
     cmd: id,
     encoder: id,
 
     pub fn pipeline(p: Pass, state: Pipeline) void {
+        bound_pipeline = state.raw;
         send(void, p.encoder, "setComputePipelineState:", .{state.raw});
     }
 

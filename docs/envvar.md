@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 153 vars. By kind: tradeoff levers 14, diagnostics 57, microbenches 19, test-only seams 53, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 154 vars. By kind: tradeoff levers 14, diagnostics 58, microbenches 19, test-only seams 53, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (57)
+## Diagnostics (58)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -49,6 +49,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DSV41_ENGRAM_REUSE` | `dsv41_engram.zig` (test) | `<u32 tokens file>`: the Engram row cache's hit rate by capacity over a token stream | test | yes: dsv41-arch |
 | `MLX_ENABLE_TF32`, `MLX_METAL_GPU_ARCH` | `tensor/matmul.zig` | MLX's own variables, read as MLX reads them so the engine's matmul takes the kernel MLX takes: f32 on the NAX tiles (default on), and a GPU architecture name in place of the device's | once | yes: engine-own-forward |
 | `SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD` | `dsv41_serving.zig` | TEMPORARY A/B: decode-width passes read their Engram rows at the layer; deleted after the live measurement | load | no |
+| `SUSHI_ENGINE_KERNEL_PROF` | `tensor/core.zig` (`kernelProfOn`) | `1` hands every engine op over as its own command buffer and waits for it, so the GPU times are per kernel; logs `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each` at debug level, top 40 kernels by GPU time, in `[engine] since load:` and the decode meter (the forward runs slower: one wait per op) | once | yes: engine-own-forward |
 | `SUSHI_DSV41_READ_DIAG` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` counts the blocking host reads of decode-width DeepSeek forwards by site (route-spec settle, settle before a successor, waiting-schedule picks, Engram rows, DSpark state, logits) and logs `[dsv41] reads/forward <site>` per 64 forwards at debug level | load | yes: engine-expert-streaming |
 | `SUSHI_DSV41_COMPOSED` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` runs deepseek_v41 on the op chains instead of the fused kernels (the KLD A/B's teacher arm; the load logs `[dsv41] fused kernels on\|off`) | load | yes: dsv41-arch |
 | `SUSHI_DSV41_DSPARK_ROWS` | `dsv41_dspark.zig` | deepseek_v41 DSpark diagnostic: `sweep` cycles the verify width 1..8 per round, `<n>` forces it, `log` keeps the policy; each round logs `[dspark-round]` (ctx, rows, draft and verify ms, confidence logits) | request | yes: dsv41-arch |
