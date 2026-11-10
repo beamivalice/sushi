@@ -554,6 +554,16 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   without waiting` (`kv_disk_fs.zig`, the writer held at each step), `a fence waits out only the op in flight on its own
   path` (`kv_disk_writer.zig`). A paced cas op lasts as long as the plain write, so waiting for it in a persist cost
   1.6.0 40-117 ms per fence and 75 ms per manifest ([qwen4-perf](qwen4-perf.md#cas-persist-stall)).
+- **A block's address is XXH3-64 plus Wyhash of its bytes, and the XXH3 is `src/xxh3.zig`.** The standard library's
+  `std.hash.XxHash3` gives the same values at 1.3 GB/s on an M5 Max (its long-input loop compiles to byte shuffles
+  through general registers on arm64); `xxh3.zig` runs at about 30 GB/s, so a block's two hashes cost 16 GB/s, not
+  1.3. Over the release bench (Qwen STQ-2.75bpw rev 2.0, `tests/bench.sh --tokens 512 --rungs 4k,8k,16k,32k,64k`, M5 Max,
+  base 5755e311 / new / new / base, 2026-11-10) the server's CPU fell from 72.1 / 71.6 s to 66.5 / 67.9 s, with
+  prefill, decode and restore times level. Guards: `the same value as the standard library at every length class`,
+  `pieces hash as their concatenation` (`xxh3.zig`), lint rule `std-xxhash3`.
+- **A persist hashes every file it rewrites.** Whole chunks below the restored rows are hard-linked and never read; the
+  open tail chunk, the ring, `spec.safetensors` and the checkpoint state are read back, copied and hashed whole, and
+  their 256-token row groups dedup only after the hash.
 - **A load reads as MLX reads a plain file.** `loadTensors` pins the file's extents (`Vfs.pinFile`) and hands
   `mlx_load_safetensors_reader` a reader over them: MLX reads each tensor lazily on its IO threads into its own
   buffers, the reader gathers the tensor's blocks with no layer lock held and checks each against its hash, and the

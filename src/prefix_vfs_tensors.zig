@@ -11,6 +11,7 @@
 //! thread; the VFS steps that follow a `stageTensors` touch bytes only.
 
 const std = @import("std");
+const xxh3 = @import("xxh3.zig");
 const mlx = @import("mlx.zig");
 const prefix_vfs = @import("prefix_vfs.zig");
 const disk_format = @import("disk_format.zig");
@@ -708,7 +709,7 @@ fn readChecked(vfs: *Vfs, pl: Vfs.Placed, dst: []u8, checked: *bool) !void {
     if (dst.len != pl.len) return error.VfsCorrupt;
     try vfs.readPlaced(pl, 0, dst);
     if (pl.verified) return;
-    if (std.hash.XxHash3.hash(0, dst) != pl.xxh) return error.VfsCorrupt;
+    if (xxh3.hash(dst) != pl.xxh) return error.VfsCorrupt;
     checked.* = true;
 }
 
@@ -748,7 +749,7 @@ fn fillEntry(vfs: *Vfs, pf: Vfs.PinnedFile, checked: []bool, e: *const Entry, ou
         const n = pl.len / run_unit;
         if (n > rows - at) return error.VfsCorrupt;
         const run = n * inner_bytes;
-        var h = std.hash.XxHash3.init(0);
+        var h: xxh3.Stream = .{};
         for (0..outer) |o| {
             const d = out[(o * rows + at) * inner_bytes ..][0..run];
             try vfs.readPlaced(pl, o * run, d);

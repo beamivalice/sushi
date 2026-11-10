@@ -9,6 +9,7 @@ const rule = @import("rule.zig");
 
 const rules = .{
     @import("const_write.zig"),
+    @import("std_xxhash3.zig"),
     @import("unused_import.zig"),
     @import("undefined_nested_write.zig"),
 };

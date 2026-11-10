@@ -8,6 +8,7 @@
 //! Nothing is fsynced: a crash of the process loses nothing that was journaled, a power loss may.
 
 const std = @import("std");
+const xxh3 = @import("xxh3.zig");
 const builtin = @import("builtin");
 const write_stats = @import("disk_write_stats.zig");
 const io_util = @import("io_util.zig");
@@ -201,7 +202,7 @@ fn joinPath(a: Allocator, comps: []const []const u8) ![]u8 {
 }
 
 fn addrOf(bytes: []const u8) Addr {
-    return .{ .xxh = std.hash.XxHash3.hash(0, bytes), .wy = std.hash.Wyhash.hash(0, bytes) };
+    return .{ .xxh = xxh3.hash(bytes), .wy = std.hash.Wyhash.hash(0, bytes) };
 }
 
 /// `bytes` cut into BYTE_BLOCK segments that point into it; the caller frees the list.
@@ -345,7 +346,7 @@ fn encodeRec(e: *Enc, seq: u64, rec: Rec) !void {
     }
     const payload = e.list.items[start + FRAME_HEAD ..];
     std.mem.writeInt(u32, e.list.items[start..][0..4], @intCast(payload.len), .little);
-    std.mem.writeInt(u64, e.list.items[start + 4 ..][0..8], std.hash.XxHash3.hash(0, payload), .little);
+    std.mem.writeInt(u64, e.list.items[start + 4 ..][0..8], xxh3.hash(payload), .little);
 }
 
 const Decoded = struct { seq: u64, rec: Rec };
@@ -1354,7 +1355,7 @@ pub const Vfs = struct {
         if (got != dst.len) return error.VfsCorrupt;
         if (b.verified) return;
         self.verify_count += 1;
-        if (std.hash.XxHash3.hash(0, dst) != e.addr.xxh) return error.VfsCorrupt;
+        if (xxh3.hash(dst) != e.addr.xxh) return error.VfsCorrupt;
         b.verified = true;
     }
 
@@ -1832,7 +1833,7 @@ pub const Vfs = struct {
             const want = std.mem.readInt(u64, bytes[pos + 4 ..][0..8], .little);
             if (len > bytes.len - pos - FRAME_HEAD) break;
             const payload = bytes[pos + FRAME_HEAD ..][0..len];
-            if (std.hash.XxHash3.hash(0, payload) != want) break;
+            if (xxh3.hash(payload) != want) break;
             _ = arena_state.reset(.retain_capacity);
             const d = decodeRec(arena_state.allocator(), payload) catch break;
             if (skip_upto == 0 or d.seq > skip_upto) {
@@ -2017,7 +2018,7 @@ fn dumpDir(v: *Vfs, path: []const u8, out: *std.ArrayList(u8)) !void {
         } else {
             const bytes = try v.readBytes(ta, child);
             defer ta.free(bytes);
-            try out.print(ta, "{s} F size={d} nlink={d} ino={d} mtime={d} h={x}\n", .{ child, st.size, st.nlink, st.ino, st.mtime_ns, std.hash.XxHash3.hash(0, bytes) });
+            try out.print(ta, "{s} F size={d} nlink={d} ino={d} mtime={d} h={x}\n", .{ child, st.size, st.nlink, st.ino, st.mtime_ns, xxh3.hash(bytes) });
         }
     }
 }
