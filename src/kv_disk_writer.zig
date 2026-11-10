@@ -1146,6 +1146,8 @@ const FakeSink = struct {
     fail_append: ?u64 = null,
     fail_journal: ?u64 = null,
     land_ns: u64 = 0,
+    fill_ns: u64 = 0,
+    filling: std.atomic.Value(bool) = .init(false),
     in_land: std.atomic.Value(bool) = .init(false),
     overlapped: std.atomic.Value(bool) = .init(false),
 
@@ -1163,12 +1165,24 @@ const FakeSink = struct {
         return .{ .ctx = self, .hashBlocks = hashBlocks, .appendBlocks = appendBlocks, .fillBlocks = fillBlocks, .journalRecord = journalRecord, .publish = publish, .abort = abort };
     }
 
+    /// The steps the writer's lock covers: placing the blocks, and the journal record with its publish.
+    fn enter(self: *FakeSink) void {
+        if (self.in_land.swap(true, .acq_rel)) self.overlapped.store(true, .release);
+    }
+
     fn hashBlocks(_: *anyopaque, _: u64) anyerror!void {}
-    fn fillBlocks(_: *anyopaque, _: u64) anyerror!void {}
+    fn fillBlocks(ctx: *anyopaque, _: u64) anyerror!void {
+        const self: *FakeSink = @ptrCast(@alignCast(ctx));
+        if (self.fill_ns == 0) return;
+        self.filling.store(true, .release);
+        std.Io.sleep(self.io, .fromNanoseconds(@intCast(self.fill_ns)), .real) catch {};
+        self.filling.store(false, .release);
+    }
 
     fn appendBlocks(ctx: *anyopaque, ticket: u64) anyerror!u64 {
         const self: *FakeSink = @ptrCast(@alignCast(ctx));
-        if (self.in_land.swap(true, .acq_rel)) self.overlapped.store(true, .release);
+        self.enter();
+        defer self.in_land.store(false, .release);
         if (self.land_ns > 0) std.Io.sleep(self.io, .fromNanoseconds(@intCast(self.land_ns)), .real) catch {};
         if (self.fail_append == ticket) return error.InjectedAppend;
         self.mu.lockUncancelable(self.io);
@@ -1179,6 +1193,8 @@ const FakeSink = struct {
 
     fn journalRecord(ctx: *anyopaque, ticket: u64) anyerror!u64 {
         const self: *FakeSink = @ptrCast(@alignCast(ctx));
+        self.enter();
+        errdefer self.in_land.store(false, .release);
         if (self.fail_journal == ticket) return error.InjectedJournal;
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
@@ -1200,7 +1216,6 @@ const FakeSink = struct {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         self.aborted.append(testing.allocator, ticket) catch unreachable;
-        self.in_land.store(false, .release);
     }
 
     fn isVisible(self: *FakeSink, ticket: u64) bool {
@@ -1548,6 +1563,8 @@ test "kv_disk_writer op: landNow lands on the caller, serialized with the writer
     var fake = FakeSink.init(testing.io);
     defer fake.deinit();
     fake.land_ns = 100_000;
+    // A queued op fills its blocks outside the lock, and a caller's op lands in that window.
+    fake.fill_ns = 2_000_000;
     var stats: write_stats.Stats = .{};
     var w = Writer.init(testing.allocator, testing.io);
     w.stats = &stats;
@@ -1563,6 +1580,7 @@ test "kv_disk_writer op: landNow lands on the caller, serialized with the writer
     try w.start();
     defer w.deinit();
     for (0..8) |i| try submitFakeOp(&w, &fake, "c", 2 + i, 64, .kv);
+    while (!fake.filling.load(.acquire)) std.atomic.spinLoopHint();
     for (0..4) |i| _ = try w.landNow(fake.sink(), 10 + i, .meta);
     w.drain();
     try testing.expect(!fake.overlapped.load(.acquire));
