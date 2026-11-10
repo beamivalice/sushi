@@ -10,8 +10,6 @@ earlier history is mlx-serve's, in that project's changelog.
   the next prefill chunk, which had cost 1.6.0 up to about 5% of prefill speed on Qwen3.8-Flash-Next.
 - **Follow-up turns restore from the SSD prompt cache faster**: a restore reads the cache in parallel again, as 1.5.1
   did, instead of taking about twice as long as in 1.6.0.
-- **Less CPU for the same work**: the server spends about 10% less CPU over a full benchmark run on
-  Qwen3.8-Flash-Next, decodes about 4% faster and prefills about 2% faster, with the same output.
 
 ## v1.6.0 — Stability, UI and Architecture Refactor
 

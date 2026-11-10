@@ -43,18 +43,20 @@ what MLX allocates itself (graph intermediates, custom-kernel outputs, the freed
   vision encode). Guards: the `transient cap` tests in `mlx.zig`.
 
 <a id="host-overhead"></a>
-## The host overhead patch
+## Host cost per op is cut in our code, never by a patch
 
-`patches/mlx-host-overhead.patch` (mlx) and `patches/mlxc-kernel-config-ref.patch` (mlx-c) cut the host work per GPU
-op. The GPU gets the same commands and writes the same bytes; numbers: [qwen4-perf](qwen4-perf.md#host-cpu).
-- Stock `gpu::eval` adds one completion handler (a block holding a hash set of the op's buffers) to the command buffer
-  for every evaluated array. The patch collects those buffers in the encoder (`CommandEncoder::hold`) and the commit's
-  one handler releases them; a buffer is still held until the command buffer that reads it completes.
-- Stock `metal_kernel` writes a kernel's whole source on every call and `CustomKernel::eval_gpu` hashes all of it to
-  name the library. The patch keeps one `Instance` (name, source, library name) per instantiation, keyed by the
-  template arguments, each input's dtype and how it is passed (scalar, under 8 elements, device), and the output dtypes.
-- mlx-c copied the kernel config (shapes, template arguments) on every apply; it now reads it in place.
-- Guard: the `one kernel runs each instantiation on its own source` test in `mlx.zig`.
+MLX and mlx-c take no patch for host cost: the pin moves often, and a patch on the eval loop has to be carried across
+every bump (owner, 2026-11-10). What stock MLX costs per op, and what a patch that was measured and withdrawn got
+back, is in [qwen4-perf](qwen4-perf.md#host-cpu). The three costs, for whoever cuts them from our side:
+- `gpu::eval` adds one completion handler (a block holding a hash set of the op's buffers) to the command buffer for
+  every evaluated array. Only fewer arrays per forward reduce it.
+- `metal_kernel` writes a kernel's whole source on every call and `CustomKernel::eval_gpu` hashes all of it to name
+  the library; mlx-c copies the kernel config on every apply. A primitive of our own, built on the headers the stage
+  installs (`mlx/backend/metal/device.h`), would keep one source per instantiation.
+- MLX commits a command buffer once the distinct inputs of its ops pass `MLX_MAX_MB_PER_BUFFER`. A weight counts, so
+  at decode an op that reads a bank past the budget commits a buffer of its own, and each buffer costs host time in
+  Metal's submit and completion queues. Prefill's memory bill is fitted to that cadence: leaving weights out of the
+  count process-wide took the first 4096-token chunk's MLX transient from 3.4 to 7.5 GB against a 3.6 GB reserve.
 - **`zig build test` does not see a rebuilt MLX**: a test run is cached on the test binary, and the dylib is not one
   of its inputs. After `build-mlx.sh` changes the stage, `rm -rf .zig-cache` before trusting a test run.
 
@@ -96,8 +98,7 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   template arg: read it from `threads_per_grid`, an input's `_shape`, or a small input buffer. DeepSeek's index top-k
   width and packed-KV row counts did, and decode below 512 tokens of context compiled a library every token (the
   "slow state"). `SUSHI_KERNEL_BUILD_LOG=1` logs each new key; guard: the `dsv41 kernels:` zero-new-library tests.
-- **Stock MLX rebuilds and hashes a kernel's whole source and header on every launch** (a host on its own MLX still
-  does; the [host overhead patch](#host-overhead) writes it once per instantiation): `mlx_fast_metal_kernel_new` minifies
+- **MLX rebuilds and hashes a kernel's whole source and header on every launch**: `mlx_fast_metal_kernel_new` minifies
   both once and drops the header's struct, alias and function definitions the source never reaches
   (`metal_minify.zig`). `SUSHI_KERNEL_RAW_SOURCE=1` passes the text as written. Guard: the `a minified kernel gives` test.
 

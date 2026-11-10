@@ -1,8 +1,8 @@
-//! Metal source minifier. Stock MLX rebuilds and hashes a custom kernel's whole source and header on every launch, so
-//! on a host without the host-overhead patch the bytes handed to `mlx_fast_metal_kernel_new` are a per-token cost.
-//! Minifying changes no token the compiler sees: it drops comments, indentation, blank lines and the spaces around
-//! `{ } ; , ( ) [ ]`, and keeps every preprocessor line on a line of its own with its spacing collapsed to single
-//! spaces (a macro's `F(x)` and `F (x)` differ). String and character literals are copied verbatim.
+//! Metal source minifier. MLX rebuilds and hashes a custom kernel's whole source and header on every launch, so the
+//! bytes handed to `mlx_fast_metal_kernel_new` are a per-token host cost. Minifying changes no token the compiler
+//! sees: it drops comments, indentation, blank lines and the spaces around `{ } ; , ( ) [ ]`, and keeps every
+//! preprocessor line on a line of its own with its spacing collapsed to single spaces (a macro's `F(x)` and `F (x)`
+//! differ). String and character literals are copied verbatim.
 const std = @import("std");
 
 /// The minified text of `src` as a NUL-terminated copy; ends in a newline unless empty. The caller frees it.

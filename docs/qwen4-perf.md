@@ -647,51 +647,58 @@ save ~0.4 s of ~18.8 s (~2%), below the spread of the two-sample 32k run (one ar
   35 ms.
 
 <a id="host-cpu"></a>
-## Host CPU per forward: MLX's per-op work (db081472)
+## Host CPU per forward: what MLX's per-op work costs (experiment, not shipped)
 
-The [host overhead patch](engine-mlx-gotchas.md#host-overhead) on the pinned MLX. STQ-2.75bpw rev 2.0 (K6 trunk),
-M5 Max 128 GB on AC, ReleaseFast, `taskpolicy -a`, GPU lock per boot, fans max and an idle under 50 C before each
-boot, 2026-11-10. Base is 5755e311 on the same MLX sources and toolchain without the two patches; base and patched
-run in one session, base / new / new / base.
+Three changes inside MLX were measured as patches on the pin and then withdrawn: MLX takes no patch for host cost
+([engine-mlx-gotchas](engine-mlx-gotchas.md#host-overhead)). The numbers are the size of each cost, for a cut made in
+our own code. STQ-2.75bpw rev 2.0 (K6 trunk), M5 Max 128 GB on AC, ReleaseFast, `taskpolicy -a`, GPU lock per boot,
+fans max and an idle under 50 C before each boot, 2026-11-10. Stock is 5755e311; each arm ran interleaved with its
+baseline in one session, on MLX builds from one toolchain.
 
-Where the CPU went (base, `sample` at 1 ms over the decode meter, one row, 4096 keys): one forward is 4524 ops and
-took 12.6 ms of CPU on every thread for 17.0 ms of wall. The inference thread spent 7.7 ms (2.0 building the graph,
+Where the CPU goes on stock (`sample` at 1 ms over the decode meter, one row, 4096 keys): one forward is 4524 ops and
+takes 12.6 ms of CPU on every thread for 17.0 ms of wall. The inference thread spends 7.7 ms (2.0 building the graph,
 5.7 encoding it); Metal's submit and completion queues the rest, mostly in the kernel. On the inference thread the
-largest single symbol was the hash of each kernel's source, then the copies and allocations around rewriting it.
+largest single symbol is the hash of each kernel's source, then the copies and allocations around rewriting it.
 
-Decode meter (`SUSHI_DECODE_FWD_UBENCH=400`, `_S=1,4`, `_KV=4096`), ms per forward, both boots of each arm:
+Decode meter (`SUSHI_DECODE_FWD_UBENCH=400`, `_S=1,4`, `_KV=4096`), per forward:
 
-| rows | | base | patched | change |
-|---|---|---|---|---|
-| 1 | forward | 16.980 / 16.947 | 15.424 / 15.445 | -9.0% |
-| 1 | process CPU | 12.611 / 12.587 | 9.770 / 9.799 | -22.3% |
-| 1 | graph build | 1.990 / 1.985 | 0.952 / 0.959 | -52% |
-| 4 | forward | 24.079 / 24.053 | 23.092 / 23.092 | -4.0% |
-| 4 | process CPU | 15.444 / 15.411 | 12.677 / 12.603 | -18.1% |
+| rows | | stock | A: one handler per buffer | A + B: kernel source kept | A + B + C: no size budget at decode |
+|---|---|---|---|---|---|
+| 1 | forward, ms | 16.980 / 16.947 | 16.404 / 16.328 | 15.424 / 15.445 | 15.483 |
+| 1 | process CPU, ms | 12.611 / 12.587 | 10.398 / 10.348 | 9.770 / 9.799 | 7.108 |
+| 1 | command buffers | | | 154 | 39 |
+| 4 | forward, ms | 24.079 / 24.053 | 23.554 / 23.524 | 23.092 / 23.092 | 23.101 |
+| 4 | process CPU, ms | 15.444 / 15.411 | 12.893 / 12.884 | 12.677 / 12.603 | 8.904 |
+| 4 | command buffers | | | 184 | 45 |
 
-The handler change alone read 16.404 / 16.328 ms and 10.398 / 10.348 ms of CPU at one row; the value-keyed kernel
-instance and the mlx-c config read took it the rest of the way.
+- A: `gpu::eval` adds a completion handler per evaluated array; one handler per command buffer held the same buffers.
+- B: a kernel instantiation kept its name, source and library name in place of writing and hashing the source on
+  every call, and mlx-c read the kernel config in place.
+- C: a decode tick lifted `MLX_MAX_MB_PER_BUFFER`, so a buffer committed on its op count. With the budget, every op
+  reading a weight bank past it commits a buffer of its own. MLX's transient peak over the meter's start read 65 MB
+  against 17 at one row and 138 against 72 at four.
+- C applied process-wide by leaving weights out of the count is not an option: the first 4096-token prefill chunk's
+  MLX transient went from 3.4 to 7.5 GB against the 3.6 GB the prefill bill reserves.
+- DeepSeek STQ-1.75bpw (`--ssd-budget-gb 108`, same meter, 300 forwards): process CPU 11.669 / 11.835 ms on stock,
+  9.889 / 9.944 with A + B and 8.107 with C (130 command buffers a forward to 46, one per layer's host read of the
+  picks); the forward stays 18.2 to 18.5 ms on every arm.
 
-Live, `tests/bench.sh --tokens 512 --rungs 4k,8k,16k,32k,64k` (MTP, kv8, private SSD cache per boot), base / new /
-new / base. Decode is every restored sample of an arm summed (14 a run); prefill is every window over 1000 new
-tokens; CPU is the server process, user and system, over the whole run:
+Live, `tests/bench.sh --tokens 512 --rungs 4k,8k,16k,32k,64k` (MTP, kv8, private SSD cache per boot), server process
+CPU over the whole run and every restored decode sample of the code arm summed (14 a run):
 
-| | base | patched | change |
+| | stock | A + B | A + B + C |
 |---|---|---|---|
-| code decode, ms per token | 6.391 / 6.407 | 6.167 / 6.172 | -3.6% |
-| code decode, tok/s | 156.5 / 156.1 | 162.1 / 162.0 | +3.7% |
-| prose decode, ms per token | 11.407 / 11.556 | 11.074 / 10.622 | -5.5% |
-| prefill, tok/s | 2,037 / 2,049 | 2,067 / 2,094 | +1.8% |
-| server CPU, load and code arm, s | 44.4 / 44.7 | 40.1 / 40.2 | -9.9% |
-| server CPU, prose arm, s | 27.5 / 27.3 | 24.6 / 24.8 | -9.9% |
-| server CPU, whole run, s | 72.0 / 72.2 | 64.8 / 65.2 | -9.9% |
+| server CPU, s | 72.0 / 72.2 | 64.8 / 65.2 | 57.3 / 56.7 (debug log; A + B reads 65.4 to 65.7 there) |
+| code decode, ms per token | 6.391 / 6.407 | 6.167 / 6.172 | 6.051 / 6.115 |
+| prefill, tok/s | 2,037 / 2,049 | 2,067 / 2,094 | 2,091 / 2,087 |
 
-- Output: the release KLD gate on the patched tree reads the recorded 0.061834377 over 7061 positions.
+- Output: the release KLD gate on A + B read the recorded 0.061834377 over 7061 positions; A, B and C change no
+  command the GPU runs. MLX's peak over the C bench equals the A + B bench's to the byte.
 - An idle server takes about 0.3% of a core: 0.3 s of process CPU through the 100 s cooldown between the arms.
-- `MLX_MAX_OPS_PER_BUFFER` at 25, 100 and 200 on the patched tree is slower and costs more CPU at both widths than
-  the default 50 (15.86 / 16.12 / 15.80 ms a forward against 15.43). It stays ruled out.
-- What is left on the inference thread is spread over the Metal encoder, the allocator and MLX's input tracking, a
-  few percent each; the next cut is fewer ops a forward, not cheaper ones.
+- `MLX_MAX_OPS_PER_BUFFER` at 25, 100 and 200 is slower and costs more CPU at both widths than the default 50
+  (15.86 / 16.12 / 15.80 ms a forward against 15.43 on A + B). It stays ruled out.
+- DeepSeek's server CPU over its bench is about 250 s (`--tokens 256`, one pair: 250.4 against 244.4 with C), so its
+  decode kernels are a small share of it; the expert fills and host reads are the place to look.
 
 <a id="stq-prefill-profile"></a>
 ## Flash-Next STQ prefill: where a chunk's time goes, K6 trunk against affine 8
