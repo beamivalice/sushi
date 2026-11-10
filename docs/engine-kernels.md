@@ -64,7 +64,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   simdgroups that only stage tiles cut it 40% with the output unchanged. They lose at verify widths, so the count is
   per grid size ([qwen4-perf](qwen4-perf.md#serial-decode-loaders)).
 - The decode meter splits eval into `mlx_async_eval` wall time and thread CPU. Wall far above CPU means the encoder is
-  blocked on in-flight buffers: the forward is GPU-bound, and cutting host work cannot help.
+  blocked on in-flight buffers. Host work still counts: the GPU starts each buffer when the host has encoded it, and
+  cutting 2 ms of host CPU from a 17 ms forward made it 1.5 ms faster ([qwen4-perf](qwen4-perf.md#host-cpu)).
+- The meter's `process CPU` is every thread of the process per forward: the inference thread and Metal's submit and
+  completion queues. It is the number to judge a host-side change by.
 
 ## Trunk linears
 

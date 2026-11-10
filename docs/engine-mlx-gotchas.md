@@ -24,7 +24,7 @@ permutation before comparing bytes; grouping by the other arm's IDs is invalid.
 ## The transient cap patch
 
 `patches/mlx-transient-cap.patch` (mlx) and `patches/mlxc-transient-cap.patch` (mlx-c C ABI) are applied by
-`build-mlx.sh`; the stamp's `patch=` hashes all three patches. Stock `MetalAllocator` counts an imported (no-copy)
+`build-mlx.sh`; the stamp's `patch=` hashes every patch. Stock `MetalAllocator` counts an imported (no-copy)
 buffer in `active_memory_`, `malloc` never refuses and `set_memory_limit` only throttles eval, so nothing could bound
 what MLX allocates itself (graph intermediates, custom-kernel outputs, the freed-buffer pool).
 - `external_memory_` is the imported bytes (`make_buffer` adds, `release` subtracts); transient = active - external.
@@ -41,6 +41,22 @@ what MLX allocates itself (graph intermediates, custom-kernel outputs, the freed
   (`dsv41_borrow`, [dsv41-memory](dsv41-memory.md#transient-caps)); a cap is judged against a peak less the state it started from.
 - `SUSHI_DSV41_TRANSIENT_PEAK=1` logs `[transient-peak]` per DeepSeek phase (decode, DSpark draft/verify, prefill chunk,
   vision encode). Guards: the `transient cap` tests in `mlx.zig`.
+
+<a id="host-overhead"></a>
+## The host overhead patch
+
+`patches/mlx-host-overhead.patch` (mlx) and `patches/mlxc-kernel-config-ref.patch` (mlx-c) cut the host work per GPU
+op. The GPU gets the same commands and writes the same bytes; numbers: [qwen4-perf](qwen4-perf.md#host-cpu).
+- Stock `gpu::eval` adds one completion handler (a block holding a hash set of the op's buffers) to the command buffer
+  for every evaluated array. The patch collects those buffers in the encoder (`CommandEncoder::hold`) and the commit's
+  one handler releases them; a buffer is still held until the command buffer that reads it completes.
+- Stock `metal_kernel` writes a kernel's whole source on every call and `CustomKernel::eval_gpu` hashes all of it to
+  name the library. The patch keeps one `Instance` (name, source, library name) per instantiation, keyed by the
+  template arguments, each input's dtype and how it is passed (scalar, under 8 elements, device), and the output dtypes.
+- mlx-c copied the kernel config (shapes, template arguments) on every apply; it now reads it in place.
+- Guard: the `one kernel runs each instantiation on its own source` test in `mlx.zig`.
+- **`zig build test` does not see a rebuilt MLX**: a test run is cached on the test binary, and the dylib is not one
+  of its inputs. After `build-mlx.sh` changes the stage, `rm -rf .zig-cache` before trusting a test run.
 
 ## The one MLX thread
 
@@ -80,7 +96,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   template arg: read it from `threads_per_grid`, an input's `_shape`, or a small input buffer. DeepSeek's index top-k
   width and packed-KV row counts did, and decode below 512 tokens of context compiled a library every token (the
   "slow state"). `SUSHI_KERNEL_BUILD_LOG=1` logs each new key; guard: the `dsv41 kernels:` zero-new-library tests.
-- **MLX rebuilds and hashes a kernel's whole source and header on every launch**: `mlx_fast_metal_kernel_new` minifies
+- **Stock MLX rebuilds and hashes a kernel's whole source and header on every launch** (a host on its own MLX still
+  does; the [host overhead patch](#host-overhead) writes it once per instantiation): `mlx_fast_metal_kernel_new` minifies
   both once and drops the header's struct, alias and function definitions the source never reaches
   (`metal_minify.zig`). `SUSHI_KERNEL_RAW_SOURCE=1` passes the text as written. Guard: the `a minified kernel gives` test.
 

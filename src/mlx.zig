@@ -1493,3 +1493,71 @@ test "a minified kernel gives the bytes of the same kernel as written" {
     try t.expectEqualSlices(u8, std.mem.sliceAsBytes(&results[0]), std.mem.sliceAsBytes(&results[1]));
     try t.expectApproxEqAbs(1.5 * data[5] + 0.25 - 1.0 + 3.0 + 0.5 * data[5], results[0][5], 1e-4);
 }
+
+test "one kernel runs each instantiation on its own source: template values, input dtype, how an input is passed" {
+    const source =
+        \\uint i = thread_position_in_grid.x;
+        \\out[i] = float(x[i]) * float(SCALE) + float(w[i % uint(WN)]);
+    ;
+    const t = std.testing;
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    const names = [_][*:0]const u8{ "x", "w" };
+    const outs = [_][*:0]const u8{"out"};
+    const iv = mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx_vector_string_free(iv);
+    const ov = mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx_vector_string_free(ov);
+    const kernel = mlx_fast_metal_kernel_new("sushi_instance_probe", iv, ov, source, "", true, false);
+    defer _ = mlx_fast_metal_kernel_free(kernel);
+    try t.expect(kernel.ctx != null);
+
+    var xf: [64]f32 = undefined;
+    var xi: [64]i32 = undefined;
+    var w: [16]f32 = undefined;
+    for (&xf, &xi, 0..) |*f, *n, i| {
+        n.* = @as(i32, @intCast(i)) - 20;
+        f.* = 0.25 * @as(f32, @floatFromInt(n.*));
+    }
+    for (&w, 0..) |*v, i| v.* = 100.0 * @as(f32, @floatFromInt(i + 1));
+
+    // A repeat of an earlier case must still run that case's source, whatever ran in between.
+    const Case = struct { scale: c_int, int_x: bool, wn: c_int };
+    const cases = [_]Case{
+        .{ .scale = 2, .int_x = false, .wn = 16 },
+        .{ .scale = 3, .int_x = false, .wn = 16 },
+        .{ .scale = 2, .int_x = false, .wn = 16 },
+        .{ .scale = 2, .int_x = true, .wn = 16 },
+        .{ .scale = 2, .int_x = false, .wn = 4 }, // under 8 elements: passed in the constant address space
+        .{ .scale = 3, .int_x = false, .wn = 16 },
+        .{ .scale = 2, .int_x = true, .wn = 4 },
+        .{ .scale = 2, .int_x = true, .wn = 16 },
+    };
+    for (cases) |c| {
+        const x = if (c.int_x) mlx_array_new_data(&xi, &[_]c_int{64}, 1, .int32) else mlx_array_new_data(&xf, &[_]c_int{64}, 1, .float32);
+        defer _ = mlx_array_free(x);
+        const wa = mlx_array_new_data(&w, &[_]c_int{c.wn}, 1, .float32);
+        defer _ = mlx_array_free(wa);
+        const inputs = mlx_vector_array_new_data(&[_]mlx_array{ x, wa }, 2);
+        defer _ = mlx_vector_array_free(inputs);
+        const cfg = mlx_fast_metal_kernel_config_new();
+        defer _ = mlx_fast_metal_kernel_config_free(cfg);
+        try check(mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{64}, 1, .float32));
+        try check(mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SCALE", c.scale));
+        try check(mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WN", c.wn));
+        try check(mlx_fast_metal_kernel_config_set_grid(cfg, 64, 1, 1));
+        try check(mlx_fast_metal_kernel_config_set_thread_group(cfg, 64, 1, 1));
+        var outs_vec = mlx_vector_array_new();
+        defer _ = mlx_vector_array_free(outs_vec);
+        try check(mlx_fast_metal_kernel_apply(&outs_vec, kernel, inputs, cfg, s));
+        var y = mlx_array_new();
+        defer _ = mlx_array_free(y);
+        try check(mlx_vector_array_get(&y, outs_vec, 0));
+        try check(mlx_array_eval(y));
+        const got = mlx_array_data_float32(y).?[0..64];
+        for (got, 0..) |g, i| {
+            const xv: f32 = if (c.int_x) @floatFromInt(xi[i]) else xf[i];
+            try t.expectEqual(xv * @as(f32, @floatFromInt(c.scale)) + w[i % @as(usize, @intCast(c.wn))], g);
+        }
+    }
+}

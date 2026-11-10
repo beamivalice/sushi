@@ -179,6 +179,13 @@ pub const LoadParams = struct {
 /// Signal to the parent waiting in `init()` that the inference thread is done
 /// with its load (or has failed). After `started` flips, the parent reads
 /// `load_failed` to decide whether to surface a startup error.
+/// CPU time of every thread of this process, user and system.
+fn processCpuNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.PROCESS_CPUTIME_ID, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 pub fn signalStarted(sch: *Scheduler) void {
     sch.started_mu.lockUncancelable(sch.io);
     defer sch.started_mu.unlock(sch.io);
@@ -2012,6 +2019,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var submit_cpu_ns: u64 = 0;
             var ops_total: u64 = 0;
             var done: usize = 0;
+            const proc_cpu0 = processCpuNs();
             for (0..n) |_| {
                 const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
@@ -2035,11 +2043,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 _ = mlx.mlx_array_free(lg);
                 done += 1;
             }
+            const proc_cpu_ns = processCpuNs() - proc_cpu0;
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
-            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward, process CPU {d:.3} ms/forward on every thread (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
                 done,
                 ms,
+                @as(f64, @floatFromInt(proc_cpu_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(submit_ns)) / 1.0e6 / dn,
