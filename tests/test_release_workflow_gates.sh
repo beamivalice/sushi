@@ -33,6 +33,8 @@ triggers = wf.get("on", wf.get(True, {}))
 check("pull_request" not in triggers, "no pull_request trigger: a PR runs ci.yml alone")
 check("push" in triggers and "workflow_dispatch" in triggers,
       "tag-push + workflow_dispatch triggers still present")
+check("!v*-dev*" in (triggers.get("push") or {}).get("tags", []),
+      "a dev tag (a hand-packaged pre-release) starts no release run")
 
 job = wf["jobs"]["build"]
 

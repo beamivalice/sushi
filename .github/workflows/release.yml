@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+      # A -dev tag names a pre-release packaged by hand; build.zig.zon then carries -devN, which this workflow refuses.
+      - '!v*-dev*'
   workflow_dispatch:
     inputs:
       dry_run:
