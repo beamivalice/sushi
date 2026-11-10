@@ -858,6 +858,7 @@ fn runCli(init: std.process.Init) !void {
         defer file.deinit();
         const srv = model_settings_mod.server(&file);
         scheduler_mod.setSkipMemPreflight(model_settings_mod.skipMemPreflight(skip_mem_preflight, srv.skip_mem_preflight).value);
+        server_state.setMaxRequestMb(srv.max_request_mb);
         const serving = serve_mode and prompt == null and bench_run == null;
         if (serving) update_mod.startDailyCheck(io, no_update_check, srv.update_check);
         cli_mod.configurePackUpdates(io, serving and !no_update_check, model_settings_mod.autoCheck(no_update_check, srv.pack_update_check).value);

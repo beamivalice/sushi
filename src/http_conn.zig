@@ -36,7 +36,6 @@ const isAnthropicRoute = anthropic.isAnthropicRoute;
 const jsonEscape = http.jsonEscape;
 const logHttpResponse = http.logHttpResponse;
 const mapGenerationError = generation_stream.mapGenerationError;
-const max_request_bytes = server_mod.max_request_bytes;
 const readAllFromPair = server_mod.readAllFromPair;
 const redactQueryKeys = http.redactQueryKeys;
 const responseBody = http.responseBody;
@@ -650,7 +649,7 @@ fn answerExpect(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !
 
 /// Reads a chunked body after `head` (the request line and headers through the blank line); `leftover` is what
 /// already arrived past it. The result holds the head followed by the decoded body.
-fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64, head: []const u8, leftover: []const u8) !?RawRequest {
+fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64, head: []const u8, leftover: []const u8, max_request_bytes: usize) !?RawRequest {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, head);
@@ -720,13 +719,14 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
     }
 
     if (header_end_pos == 0) return null;
+    const max_request_bytes = server_state.max_request_bytes.load(.monotonic);
 
     if (findHeaderValueCI(hdr_buf[0..header_end_pos], "transfer-encoding")) |coding| {
         if (!endsWithChunked(coding)) {
             try sendErrorResponse(allocator, stream, "501 Not Implemented", "invalid_request_error", "Only Transfer-Encoding: chunked is supported", 501);
             return null;
         }
-        return readChunkedRequest(allocator, stream, limit_ms, hdr_buf[0..header_end_pos], hdr_buf[header_end_pos..total_read]);
+        return readChunkedRequest(allocator, stream, limit_ms, hdr_buf[0..header_end_pos], hdr_buf[header_end_pos..total_read], max_request_bytes);
     }
 
     // Phase 2: Allocate buffer for full request and read remaining body
@@ -1027,6 +1027,29 @@ pub fn serveSplitForTest(head: []const u8, rest: []const u8) ![]u8 {
     client_open = false;
     server.join();
     return out.toOwnedSlice(a);
+}
+
+test "request size limit: content-length and chunked bodies use the current limit" {
+    const t = std.testing;
+    const previous = server_state.max_request_bytes.swap(256, .monotonic);
+    defer server_state.max_request_bytes.store(previous, .monotonic);
+    const body: [256]u8 = @splat(' ');
+    for ([_]bool{ false, true }) |chunked| {
+        const request = if (chunked)
+            try std.fmt.allocPrint(t.allocator, "GET /health HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n100\r\n{s}\r\n0\r\n\r\n", .{body})
+        else
+            try std.fmt.allocPrint(t.allocator, "GET /health HTTP/1.1\r\nContent-Length: 256\r\n\r\n{s}", .{body});
+        defer t.allocator.free(request);
+        const size = std.mem.indexOf(u8, request, "\r\n\r\n").? + 4 + body.len;
+        server_state.max_request_bytes.store(size - 1, .monotonic);
+        const rejected = try serveOneForTest(request);
+        defer t.allocator.free(rejected);
+        try t.expect(std.mem.startsWith(u8, rejected, "HTTP/1.1 413 "));
+        server_state.max_request_bytes.store(size, .monotonic);
+        const accepted = try serveOneForTest(request);
+        defer t.allocator.free(accepted);
+        try t.expect(std.mem.startsWith(u8, accepted, "HTTP/1.1 200 "));
+    }
 }
 
 test "chat page: GET / and GET /chat serve the embedded page as HTML" {

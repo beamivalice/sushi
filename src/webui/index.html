@@ -1023,6 +1023,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       <div class="card-h">Server port</div>
       <div class="card-b"><div id="portSet"></div></div>
     </section>
+    <section class="card" id="requestCard" hidden>
+      <div class="card-h">HTTP requests</div>
+      <div class="card-b"><div id="requestSet"></div></div>
+    </section>
     <section class="card" id="memoryCard" hidden>
       <div class="card-h">Memory</div>
       <div class="card-b"><div id="memorySet"></div></div>
@@ -3679,7 +3683,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
 
   const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
-    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, serr: {}, timer: null, retry: null, tbody: "",
+    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, requestText: null, serr: {}, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, refused: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
@@ -4263,6 +4267,16 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   portRow.ctl.append(h("div", { class: "row-in" }, portIn, portSave), portRow.bad, portWarn);
   q("portSet").replaceWith(portRow.row);
 
+  const REQUEST_SPEC = { type: "int", min: 1, max: 4096 };
+  const requestRow = setRow("max_request_mb", "Request size limit", "requestMb", "Maximum HTTP request size in MiB, including conversation history and base64 images. Larger limits allow more attachments but use more memory. Applies to new requests without a restart.", keyTerm("max_request_mb", "HTTP request size limit"));
+  const requestIn = h("input", { id: "requestMb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default (128)", "aria-label": "HTTP request size limit in MiB", oninput: () => { A.requestText = requestIn.value; typed("max_request_mb"); renderRequestLimit(A.settings.server.max_request_mb); }, onkeydown: (e) => enterTo(requestSave)(e) });
+  const requestSave = h("button", { class: "btn sm primary", id: "requestSave", type: "button", text: "Save", onclick: () => {
+    const v = adminControlValue(REQUEST_SPEC, requestIn.value);
+    if (v.ok) saveServer("max_request_mb", v.value, "Saved.", requestSave, "Saving…");
+  } });
+  requestRow.ctl.append(h("div", { class: "row-in" }, requestIn, h("span", { class: "muted", text: "MiB" }), requestSave), requestRow.bad);
+  q("requestSet").replaceWith(requestRow.row);
+
   // The on/off server keys: Default, On or Off. A file value of null is the default, shown as "Default (On)".
   const TOGGLE_KEYS = [
     ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops automatic checks; a check you start yourself still runs.", "When a newer sushi is out, a banner offers it. Nothing installs without you."],
@@ -4445,7 +4459,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         const r = await postJson("/v1/settings", { server: { [key]: value } });
         typed(key);
         toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
-        if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null;
+        if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null; else if (key === "max_request_mb") A.requestText = null;
       } catch (e) { A.serr[key] = adminErrorText(e); }
     });
     await refresh();
@@ -4460,7 +4474,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const s = A.settings, c = A.cache;
     if (!s) return;
     setHidden(q("settingsSkel"), true);
-    for (const id of ["cacheCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
+    for (const id of ["cacheCard", "portCard", "requestCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     for (const id of ["secStorage", "secServer"]) setHidden(q(id), false);
     setHidden(q("secInference"), !s.effort);
     setHidden(q("effortCard"), !s.effort);
@@ -4468,6 +4482,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setText(q("settingsFile"), `Saved in ${s.file}`);
     if (c) renderCache(c, s.server.prefix_cache_disk_gb);
     if (s.server.port) renderPort(s.server.port);
+    if (s.server.max_request_mb) renderRequestLimit(s.server.max_request_mb);
     renderToggles(s.server);
   }
   function renderCache(c, gb) {
@@ -4546,6 +4561,19 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       setText(row.bad, A.serr[key] || "");
     }
   }
+  function renderRequestLimit(p) {
+    const file = adminFileText(p.file);
+    badges(requestRow.badge, p, p.applies);
+    if (A.requestText === file) A.requestText = null;
+    if (A.requestText === null && requestIn.value !== file) requestIn.value = file;
+    requestIn.placeholder = `Default (${p.default})`;
+    const text = requestIn.value.trim(), parsed = adminControlValue(REQUEST_SPEC, text), dirty = text !== file, busy = requestSave.getAttribute("aria-busy") === "true";
+    setHidden(requestSave, !dirty);
+    requestSave.disabled = !dirty || !parsed.ok || busy;
+    if (!busy) setText(requestSave, text === "" ? "Use default" : "Save");
+    setText(requestRow.bad, (dirty && text && !parsed.ok ? "Enter a whole number from 1 to 4096 MiB." : "") || A.serr.max_request_mb || "");
+    requestIn.setAttribute("aria-invalid", String(!!requestRow.bad.textContent));
+  }
   function renderPort(p) {
     const locked = !!p.locked, file = adminFileText(p.file), shown = locked ? adminFileText(p.flag) : file;
     badges(portRow.badge, p, p.applies);
@@ -4571,7 +4599,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
     const off = !!msg && !!A.settings;
-    for (const id of ["modelsMd", "cacheCard", "effortCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) {
+    for (const id of ["modelsMd", "cacheCard", "effortCard", "portCard", "requestCard", "memoryCard", "updatesCard", "aboutCard"]) {
       q(id).classList.toggle("stale-view", off);
       if (q(id).inert !== off) q(id).inert = off;
     }
