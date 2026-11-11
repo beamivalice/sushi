@@ -66,6 +66,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/flags.md](docs/flags.md) | every launch flag: default, who it is for, keep/cut recommendation, cut list, owner calls |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, metadata stamp, window, loader rules |
 | [docs/perf-baselines.md](docs/perf-baselines.md) | method, roofline, shared EXL3 kernel timings, release ladders |
+| [docs/perf-gpu-power.md](docs/perf-gpu-power.md) | GPU efficiency against clock, the power ceiling macOS moves, a 60 W limit walk; sushi never limits the GPU |
 | [docs/bench/v1.4.0/summary.md](docs/bench/v1.4.0/summary.md) | release context ladder and per-model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule |
 | [docs/process-ubench.md](docs/process-ubench.md) | `sushi-ubench`: microbench registry, CLI, rungs x arms tables, JSON and compare, the quiet-box steps it takes |
@@ -208,7 +209,7 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
 - Judge a tweak on top of the change it builds on, not alone against the old code.
 - Less work at equal speed is a win: a change that lowers host CPU joules or work counts per token at the same bytes
   and tok/s lands like a speedup ([energy per token](docs/process-measurement.md#energy-per-token)). GPU joules per
-  token are a record, never a verdict: a higher GPU clock always costs more per token, so judging by them kills top speed.
+  token are a record, never a verdict: a higher clock always costs more per token ([gpu power](docs/perf-gpu-power.md)).
 
 **Measurement hygiene.**
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.

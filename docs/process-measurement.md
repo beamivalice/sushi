@@ -184,7 +184,8 @@ Rules for reading it:
   to 5% as the die heats.
 - **GPU joules per token never judge a change.** The GPU is always less efficient at a higher clock, so a path that
   keeps it busier, and so faster, reads worse per token; choosing by that number trades away top speed. Record it with
-  the GPU clock beside it (P-state residency), and judge the GPU side by counts: dispatches, command buffers, bytes read.
+  the GPU clock beside it (P-state residency), and judge the GPU side by counts: dispatches, command buffers, bytes read
+  ([perf-gpu-power](perf-gpu-power.md) has the curve).
 - One load per arm; a second load of an arm is a repeat check, not an average to chase.
 - A watt reading is a record, not a verdict: it moves with the GPU clock and with macOS's throttling, and a request must
   be long enough to separate watts from tok/s (256 tokens at long context is not). Record it with its caveats and move
