@@ -51,10 +51,25 @@ Greedy text and the seeded sampled text were the same bytes in both.
 One load a side: a greedy cell moves about 1% between loads with nothing changed, so the tok/s column is at the edge of
 what one load resolves. The watts column is not.
 
+## A limit well below the ceiling: 45 W
+
+A third load the same way, the 45 W limit written at idle before it; the driver read 45.0 W after every request, the
+prefill included. Same reply bytes again. Against the "no limit written" column above, same position:
+
+| request | 45 W: tok/s, GPU W, mean clock, GPU die | tok/s | GPU W |
+|---|---|---:|---:|
+| greedy 384 tokens, first | 64.0, 45.8 W, 1378 MHz, 71 °C | -8.3% | -31% |
+| greedy 384 tokens, second | 65.0, 45.0 W, 1368 MHz, 73 °C | -10.0% | -30% |
+| sampled 256 tokens, seed 7 | 49.3, 44.8 W, 1395 MHz, 75 °C | -7.2% | -30% |
+| cold prefill, 3893 tokens | 962, 40.7 W, 1358 MHz, 75 °C | -2.6% | -27% |
+
+The die ran 8 to 9 °C cooler than without a limit (80 to 83 °C). A second pass of the same requests in that load was
+disturbed (its first greedy read 56.5 tok/s at 1.4 times the instructions per token) and is not used.
+
 ## A limit is a ceiling, not a setting that holds
 
-- A limit written at idle landed and held through three decode requests. After the prefill request the driver read
-  30.6 W: macOS had rewritten it.
+- A 60 W limit written at idle landed and held through three decode requests; after the prefill request the driver read
+  30.6 W: macOS had rewritten it. A 45 W limit written the same way held for its whole load.
 - An 80 W limit written during decode, while the driver read 67.9 W, never read back. A 40 W limit written after macOS
   had rewritten the limit never read back either (60 s each). The same tool held every limit of its sweep on macOS 26.5.
 - So a written limit can lower the ceiling for a while, cannot raise it, cannot pin a clock, and lasts until macOS
@@ -68,4 +83,6 @@ what one load resolves. The watts column is not.
   state and macOS build ([cool the box](process-measurement.md#4b-cool-the-box-before-a-bench)).
 - What the engine controls is work: host CPU joules, instructions, dispatches, command buffers and bytes per token.
   Those are what a change is judged by.
+- Decode gives up tok/s slowly at first and then faster: a 60 W limit cost about 1% of tok/s for 7 to 9% of GPU watts,
+  a 45 W limit 7 to 10% for about 30%. Prefill lost 2.6% at 45 W.
 - Not measured: limits of 40 W and 25 W (they did not land), long context, other models.
