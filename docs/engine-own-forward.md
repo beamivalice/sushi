@@ -22,6 +22,9 @@ outranks the file. There is no fallback after a start: a forward of the engine t
 | DeepSeek-V4.1 with an FP8 trunk or MXFP4 experts | MLX: the engine has no `quantized_matmul` |
 | a forward that splices image rows, prefill wider than 16 rows, every other architecture | MLX |
 
+The vision tower of an image request (once per image, on a load that decodes on the engine) runs on the engine whole:
+the table's `quantized_matmul`, `fast::scaled_dot_product_attention` and `erf` rows, the weights imported.
+
 A forward of 16 rows or fewer on a request that holds image embeddings runs on the engine when its rows hold no image
 token (the splice reads the embeddings only for an image row); one that does, and one issued while a DSpark verify is
 open (only after a round failed), stay on MLX.
@@ -166,6 +169,9 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 | put along an axis, constant pad | ours (a copy, then the scatter or the border fill) | same bytes |
 | random bits | MLX's `rbitsc`, from `mlx.metallib` | same bytes |
 | uniform, categorical | MLX's bits, then `random.cpp`'s op chain op for op: inverse CDF (with MLX's searchsorted) for one row, Gumbel for a block | same bytes |
+| affine `quantized_matmul`, a transposed 2-D weight on the matrix-unit tiles (`qmm_t_nax`) | MLX's, from `mlx.metallib`, under MLX's plan | same bytes |
+| `fast::scaled_dot_product_attention`, head dimension 64, no mask: the full kernel (more than 8 query rows), the vector kernel and its two-pass form | MLX's, from `mlx.metallib`, under MLX's plan and strides | same bytes and strides |
+| erf | MLX's `Erf` kernel, from `mlx.metallib` | same bytes |
 | a model's custom kernel (`mlx_fast_metal_kernel`) | the model's source, MLX's signature | same bytes |
 
 - **A stock kernel** is fetched from `mlx.metallib` by the name MLX gives it and launched with MLX's buffers,
@@ -177,7 +183,8 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 - **A kernel of ours that walks an axis on one thread per output is a regression at vocabulary size**: the first
   argmax here took 7.7 ms a row over the vocabulary, 37 of a DSpark draft's 42 ms, against 1.6 ms for the whole
   Markov chain under MLX. An op over a long axis takes MLX's kernel.
-- **Not ported, refused by name**: `quantized_matmul` (a non-STQ DeepSeek pack's FP8 trunk), a matmul or a reduction
+- **Not ported, refused by name**: `quantized_matmul` but the case above (a non-STQ DeepSeek pack's FP8 trunk, the
+  vector and split-K plans, the SIMD tiles, a batch), attention with a mask, sinks or another head dimension, a matmul or a reduction
   with an empty operand, a reduction of more than 2^31 elements, a sort or a scan over an axis but the last,
   argpartition, top-k, logsumexp, a non-constant pad.
 - **Random: the engine makes its own keys and never asks MLX.** A sampled draw's key is `random.drawKey(root, position)`,
@@ -212,6 +219,11 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 - **With decode on the engine the load does not warm MLX's widths 1 to 16.** No forward of 16 rows or fewer is MLX's
   any more (see the table), so `warmKernels` skips MLX's decode widths and DSpark rounds and keeps MLX's prefill
   (256, 42 and 31 rows). An MLX-decode load warms as before.
+- **The vision tower warms itself on a first load only** (`Dsv41Vision.warmEngine`, from `VisionEncoder.init`, after the
+  model's seal): one block over five patch counts, the seal lifted for its span. Its recipes ride the manifest with a
+  `marker` recipe (`vision tower`, keyed by the tower's widths) that says the warm is whole; a same-key load makes the
+  recipes with the rest, trusts the marker, and runs no tower warm. A load that ran the warm writes the manifest again
+  (`dsv41_pipelines.rewriteLate`). A manifest whose recipes did not all make drops its markers.
 - **The NAX GEMM kernel is proven before the engine warm** (`kernels.prepareGemmNax`, called by `initDsv41` for the
   experts' and the trunk's decode). Its proof is MLX work of its own, which a forward of the engine refuses; first
   reached inside one, it was declined for the process (`[exl3-gemm] NAX arm declined`) and every GEMM, prefill
@@ -244,10 +256,13 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 
 A complete warm leaves `~/.sushi/cache/pipelines/<scope>-<build>/manifest.bin` (`src/pipeline_manifest.zig`): the recipe
 of each engine pipeline the process made (`tensor/pipeline_registry.zig`, recorded at the three places a pipeline is
-created: `stock.kernel`, `stock.kernelFlags`, `core.pipelineFromSource`). A recipe is the metallib function and its
-constants, or the exact source text and entry point; a source recipe is the identity of its pipeline, so a stale recipe
-cannot answer for another source. The file ends in a SHA-256 of itself; a short, changed or foreign file is refused by
-name and never read partly.
+created: `stock.kernel`, `stock.kernelFlags`, `stock.kernelConstants`, `core.pipelineFromSource`). A recipe is the
+metallib function and its boolean and int constants, or the exact source text and entry point; a source recipe is the
+identity of its pipeline, so a stale recipe cannot answer for another source. A `marker` recipe makes no pipeline: it
+says that a warm run after the load's own (the vision tower's) is whole in the file. The file ends in a SHA-256 of
+itself; a short, changed or foreign file is refused by name and never read partly. The format number is in the file
+and in the build key, so a manifest of an older format is never read: its directory is another key's, and the load
+rebuilds one.
 
 - **Key.** `scope` (16 hex) is the pack (its config.json, its index, the name and size of each shard: not their bytes) and
   what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order, expert-cache and SSD bytes,

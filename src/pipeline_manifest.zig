@@ -7,7 +7,7 @@
 const std = @import("std");
 const metal = @import("metal.zig");
 
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 const magic = "SUSHIPLM";
 pub const file_name = "manifest.bin";
 const temp_name = "manifest.bin.tmp";
@@ -15,10 +15,12 @@ const temp_name = "manifest.bin.tmp";
 pub const Kind = enum(u8) {
     /// A function of `mlx.metallib` made as it is: `function` is its name and `key` the engine's table key.
     stock = 1,
-    /// A metallib function specialised by boolean constants: `key` is MLX's name for the pair.
+    /// A metallib function specialised by boolean and int constants: `key` is MLX's name for the set.
     stock_flags = 2,
     /// A kernel compiled from `text`, whose entry point is `function`.
     source = 3,
+    /// No pipeline: `key` names a warm that the recipes before it make whole, so a load that made them all can skip it.
+    marker = 4,
 };
 
 pub const Recipe = struct {
@@ -27,11 +29,13 @@ pub const Recipe = struct {
     key: []const u8 = "",
     text: []const u8 = "",
     flags: []const metal.Flag = &.{},
+    ints: []const metal.IntConstant = &.{},
 
     pub fn eql(a: Recipe, b: Recipe) bool {
-        if (a.kind != b.kind or a.flags.len != b.flags.len) return false;
+        if (a.kind != b.kind or a.flags.len != b.flags.len or a.ints.len != b.ints.len) return false;
         if (!std.mem.eql(u8, a.function, b.function) or !std.mem.eql(u8, a.key, b.key) or !std.mem.eql(u8, a.text, b.text)) return false;
         for (a.flags, b.flags) |x, y| if (x.index != y.index or x.value != y.value) return false;
+        for (a.ints, b.ints) |x, y| if (x.index != y.index or x.value != y.value) return false;
         return true;
     }
 };
@@ -69,6 +73,11 @@ pub fn encode(a: std.mem.Allocator, key: []const u8, recipes: []const Recipe) ![
         for (r.flags) |f| {
             try putU32(&out, a, @intCast(f.index));
             try out.append(a, @intFromBool(f.value));
+        }
+        try putU32(&out, a, @intCast(r.ints.len));
+        for (r.ints) |c| {
+            try putU32(&out, a, @intCast(c.index));
+            try putU32(&out, a, @bitCast(c.value));
         }
     }
     var sum: [digest_len]u8 = undefined;
@@ -123,8 +132,8 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8) DecodeError!Loaded {
     if (try r.u32_() != version) return error.ManifestVersion;
     loaded.key = try r.slice();
     const n = try r.u32_();
-    // Every recipe is at least its kind byte and four lengths.
-    if (n > own.len / 17) return error.ManifestCorrupt;
+    // Every recipe is at least its kind byte and five lengths.
+    if (n > own.len / 21) return error.ManifestCorrupt;
     const recipes = try arena.alloc(Recipe, n);
     for (recipes) |*rec| {
         const kind = std.enums.fromInt(Kind, (try r.take(1))[0]) orelse return error.ManifestCorrupt;
@@ -137,6 +146,14 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8) DecodeError!Loaded {
             f.value = (try r.take(1))[0] != 0;
         }
         rec.flags = flags;
+        const ni = try r.u32_();
+        if (ni > (own.len - r.at) / 8) return error.ManifestCorrupt;
+        const ints = try arena.alloc(metal.IntConstant, ni);
+        for (ints) |*c| {
+            c.index = try r.u32_();
+            c.value = @bitCast(try r.u32_());
+        }
+        rec.ints = ints;
     }
     if (r.at != own.len) return error.ManifestCorrupt;
     loaded.recipes = recipes;
@@ -379,10 +396,13 @@ pub fn prune(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: Key, remov
 
 const testing = std.testing;
 
-fn sample(flags: []const metal.Flag) [3]Recipe {
+const sample_ints = [_]metal.IntConstant{.{ .index = 26, .value = 128 }};
+
+fn sample(flags: []const metal.Flag) [4]Recipe {
     return .{
         .{ .kind = .stock, .function = "rmsbfloat16", .key = "rmsbfloat16" },
         .{ .kind = .stock_flags, .function = "steel_gemm", .key = "steel_gemm_hash", .flags = flags },
+        .{ .kind = .stock_flags, .function = "sdpa_vector_2pass_1", .key = "sdpa_vector_2pass_1_128", .flags = flags, .ints = &sample_ints },
         .{ .kind = .source, .function = "custom_kernel_x", .text = "#include <metal_stdlib>\nkernel void custom_kernel_x() {}\n" },
     };
 }
@@ -397,6 +417,34 @@ test "pipeline manifest: recipes come back from the file's bytes as they went in
     try testing.expectEqualStrings("scope-build", loaded.key);
     try testing.expectEqual(recipes.len, loaded.recipes.len);
     for (recipes, loaded.recipes) |want, got| try testing.expect(want.eql(got));
+    // An int constant is part of a recipe's identity: another value is another pipeline.
+    var other = recipes[2];
+    other.ints = &.{.{ .index = 26, .value = 64 }};
+    try testing.expect(!recipes[2].eql(other));
+    try testing.expectEqual(@as(i32, 128), loaded.recipes[2].ints[0].value);
+}
+
+test "pipeline manifest: a marker recipe and a manifest of the format before int constants" {
+    const marker: Recipe = .{ .kind = .marker, .function = "vision tower", .key = "tower:1024:16" };
+    const bytes = try encode(testing.allocator, "k", &.{marker});
+    defer testing.allocator.free(bytes);
+    var loaded = try decode(testing.allocator, bytes);
+    defer loaded.deinit();
+    try testing.expect(loaded.recipes[0].eql(marker));
+    // The format number is in the file and in the build key: a file of the older format is refused, and its key differs.
+    try testing.expectEqual(@as(u32, 2), version);
+    const old = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(old);
+    std.mem.writeInt(u32, old[magic.len..][0..4], 1, .little);
+    var sum: [digest_len]u8 = undefined;
+    Sha256.hash(old[0 .. old.len - digest_len], &sum, .{});
+    @memcpy(old[old.len - digest_len ..], &sum);
+    try testing.expectError(error.ManifestVersion, decode(testing.allocator, old));
+    var now: Digest = .{};
+    now.addInt("manifest version", version);
+    var before: Digest = .{};
+    before.addInt("manifest version", version - 1);
+    try testing.expect(!std.mem.eql(u8, &now.hex(), &before.hex()));
 }
 
 test "pipeline manifest: a file cut short, changed in one byte or not a manifest is refused by name" {

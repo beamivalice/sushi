@@ -84,6 +84,27 @@ pub fn kernelFlags(name: []const u8, hash: []const u8, flags: []const metal.Flag
     return p;
 }
 
+/// The pipeline of the stock kernel `name` specialized by boolean and int function constants, built once per `hash`.
+pub fn kernelConstants(name: []const u8, hash: []const u8, flags: []const metal.Flag, ints: []const metal.IntConstant) Error!metal.Pipeline {
+    if (pipelines.get(hash)) |p| return p;
+    const dev = try metal.device();
+    var buf: [192]u8 = undefined;
+    const function = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return error.TensorShape;
+    if (registry.takeStock(hash)) |p| {
+        core.preloadedPipeline(hash, p);
+        const owned = gpa.dupe(u8, hash) catch return error.OutOfMemory;
+        pipelines.put(gpa, owned, p) catch return error.OutOfMemory;
+        return p;
+    }
+    const t0 = core.nowNs();
+    const p = try dev.pipelineOfConstants(try lib(dev), function, flags, ints);
+    core.madePipeline(hash, t0, p);
+    registry.record(.{ .kind = .stock_flags, .function = name, .key = hash, .flags = flags, .ints = ints });
+    const owned = gpa.dupe(u8, hash) catch return error.OutOfMemory;
+    pipelines.put(gpa, owned, p) catch return error.OutOfMemory;
+    return p;
+}
+
 /// MLX's name of a dtype in a kernel name.
 pub fn typeName(d: Dtype) Error![]const u8 {
     return switch (d) {
@@ -167,7 +188,7 @@ pub fn softmaxLast(x_in: *Tensor, precise: bool) Error!*Tensor {
 pub const QuantMode = enum { affine, mxfp4, mxfp8, nvfp4 };
 
 /// The C type MLX's quantized kernels are instantiated on.
-fn cType(d: Dtype) Error![]const u8 {
+pub fn cType(d: Dtype) Error![]const u8 {
     return switch (d) {
         .float32 => "float",
         .float16 => "float16_t",
@@ -220,4 +241,34 @@ pub fn dequantize(w_in: *Tensor, scales_in: *Tensor, biases_in: ?*Tensor, group:
     if (kernel_type == out_type) return out;
     defer core.release(out);
     return ops.astype(out, out_type);
+}
+
+/// `Erf::eval_gpu` (`unary_op_gpu_inplace`) over a row-contiguous float tensor: MLX's `erf`, not `metal::erf`.
+pub fn erf(x_in: *Tensor) Error!*Tensor {
+    switch (x_in.dtype) {
+        .float32, .float16, .bfloat16 => {},
+        else => return error.TensorDtype,
+    }
+    // MLX gives a contiguous input that is not row-major an output of its strides; this port makes row-major ones only.
+    if (!x_in.rowContiguous()) return error.TensorUnsupported;
+    const x = try core.share(x_in);
+    defer core.release(x);
+    const out = try core.fresh(x.dtype, x.dims());
+    errdefer core.release(out);
+    const size = x.size();
+    if (size == 0) return out;
+    if (size > std.math.maxInt(u32)) return error.TensorUnsupported;
+    const type_name = try typeName(x.dtype);
+    // `get_work_per_thread`: 8 bytes a thread from 65536 elements.
+    const per_thread: usize = if (size < 1 << 16) 1 else @max(1, 8 / core.itemSize(x.dtype));
+    var buf: [64]u8 = undefined;
+    const k = try kernel(try named(&buf, "{s}_Erf{s}{s}", .{ if (per_thread > 1) "vn" else "v", type_name, type_name }));
+    const threads = (size + per_thread - 1) / per_thread;
+    const p = try core.pass();
+    p.pipeline(k);
+    core.bind(p, x, 0);
+    core.bindOut(p, out, 1);
+    p.constant(@as(c_int, @intCast(size)), 2);
+    core.dispatch(p, .{ .x = threads }, .{ .x = @min(k.max_threads, threads) });
+    return out;
 }

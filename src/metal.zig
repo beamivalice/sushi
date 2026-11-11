@@ -84,6 +84,9 @@ var resident_dirty = false;
 /// A boolean function constant of a compiled kernel, by its index.
 pub const Flag = struct { index: usize, value: bool };
 
+/// An int function constant of a compiled kernel, by its index.
+pub const IntConstant = struct { index: usize, value: i32 };
+
 pub const Device = struct {
     raw: id,
     queue: id,
@@ -172,15 +175,25 @@ pub const Device = struct {
 
     /// `pipelineOf` for a function specialized by boolean function constants, as MLX builds its matmul kernels.
     pub fn pipelineOfFlags(dev: *const Device, lib: Library, function: [:0]const u8, flags: []const Flag) Error!Pipeline {
+        return dev.pipelineOfConstants(lib, function, flags, &.{});
+    }
+
+    /// `pipelineOfFlags` with int function constants as well.
+    pub fn pipelineOfConstants(dev: *const Device, lib: Library, function: [:0]const u8, flags: []const Flag, ints: []const IntConstant) Error!Pipeline {
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
         var ns_error: id = null;
         const values = send(id, send(id, objc_getClass("MTLFunctionConstantValues"), "alloc", .{}), "init", .{});
         defer send(void, values, "release", .{});
+        const mtl_data_type_int: usize = 29;
         const mtl_data_type_bool: usize = 53;
         for (flags) |f| {
             var v = f.value;
             send(void, values, "setConstantValue:type:atIndex:", .{ @as(*const anyopaque, &v), mtl_data_type_bool, f.index });
+        }
+        for (ints) |c| {
+            var v = c.value;
+            send(void, values, "setConstantValue:type:atIndex:", .{ @as(*const anyopaque, &v), mtl_data_type_int, c.index });
         }
         const name = send(id, objc_getClass("NSString"), "stringWithUTF8String:", .{function.ptr});
         const entry = send(id, lib.raw, "newFunctionWithName:constantValues:error:", .{ name, values, &ns_error }) orelse {

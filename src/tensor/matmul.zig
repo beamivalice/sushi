@@ -17,7 +17,7 @@ const max_batch = core.max_dims;
 
 /// The GPU as MLX's dispatch reads it: the last letter of its architecture name, its generation, and whether the
 /// NAX kernels run (macOS 26.2 is this engine's floor) and take f32.
-const Gpu = struct { class: u8, gen: u32, nax: bool, tf32: bool };
+pub const Gpu = struct { class: u8, gen: u32, nax: bool, tf32: bool };
 
 var gpu_known: ?Gpu = null;
 
@@ -27,7 +27,7 @@ fn atoi(text: []const u8) i64 {
     return std.fmt.parseInt(i64, text[0..end], 10) catch 0;
 }
 
-fn gpu() Error!Gpu {
+pub fn gpu() Error!Gpu {
     if (gpu_known) |g| return g;
     var buf: [64]u8 = undefined;
     var name: []const u8 = (try metal.device()).architecture(&buf);

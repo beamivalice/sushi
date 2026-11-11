@@ -1164,6 +1164,21 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   half of each rotate-half pair, column angles in the second, f32) and a SwiGLU MLP, then `Aligner`
   (zero-pad to multiples of 3, unfold channel-major, `w2(gelu(w1(x)))`). It returns the whole span including the three
   learned delimiter rows. Queries run in chunks of 512; `encodeScratchBytes` bills the worst block.
+  **On the engine**: a load that decodes on Sushi Cooler (`dsv41_borrow.ownDecode`) runs the whole tower there
+  (`Dsv41Vision.useEngine`), byte for byte what MLX's stream gives: the requantized linears, the fused attention and the
+  aligner's erf are MLX's own kernels launched by the engine (`quantized.zig`, `attention.zig`, `stock.erf`), and
+  a pass adds no MLX op and no lend (the weights are imported). `--ds41-mlx-engine` or `ds41_cooler: false` keeps the
+  tower on MLX. Only the shapes an image reaches are ported, and the load checks that (`engineGap`): the images the
+  release processor admits give the tower 1,084 to 9,198 patches and 164 to 1,022 aligner cells, against the 257 rows
+  (33 for the aligner) from which MLX's plan is the matrix-unit tile the engine runs, so MLX's vector kernels and
+  split-K plan are reached by no request. A pack whose vision config could reach them, a head dimension but 64 or a GPU
+  without matrix units keeps the tower on MLX with a `[vision] tower stays on MLX` line; a request never meets a
+  refusal MLX would not give. The pass runs under the pool budget of `encodeScratchBytes` and trims the pool at its
+  end. The load runs one block over five patch counts so that each pipeline an image reaches (query chunks whole or
+  short of a 64, keys whole 32s or not, a last chunk of 8 rows or fewer) is made then, `[vision] engine tower warmed`
+  reports them, and their recipes ride the pipeline manifest: a same-key load makes them with the rest and runs no
+  tower warm ([engine-own-forward](engine-own-forward.md#the-pipeline-manifest)). The span stays the engine's tensor; the
+  image queue joins several spans there too.
 - **Requantized at load** (`Dsv41Vision.init`, `quantizesAtLoad`): the pack keeps the tower bf16, and the load turns every
   block `wqkv`, `wo`, `w1`, `w2` and the aligner's `w1`, `w2` (322 matrices, 483M of the 485M parameters) into MLX
   affine 8-bit, group 128, run through `mlx_quantized_matmul`, and frees each bf16 copy as its codes exist. The patch

@@ -473,6 +473,12 @@ MLX's Metal backend (Copyright (c) 2023-2025 Apple Inc.):
   * `random.zig`: `RandomBits::eval_gpu` (`mlx/backend/metal/primitives.cpp`)
     and the op chains of `mlx/random.cpp` (`uniform`, `gumbel`,
     `categorical_inverse_cdf`, `categorical_impl`).
+  * `quantized.zig`: `quantized_matmul` (`mlx/ops.cpp`) and `QuantizedMatmul::eval_gpu`, `qmm_splitk`, `qmm` and
+    `qmm_nax` (`mlx/backend/metal/quantized.cpp`) with `get_qmv_batch_limit` and `ensure_row_contiguous_matrix`.
+  * `attention.zig`: `fast::scaled_dot_product_attention` (`mlx/fast.cpp`) and `ScaledDotProductAttention::eval_gpu`
+    with `sdpa_full_self_attention_nax`, `sdpa_vector` and `sdpa_vector_2pass`
+    (`mlx/backend/metal/scaled_dot_product_attention.cpp`), and the `AttnParams` layout.
+  * `stock.zig` also holds `Erf::eval_gpu` (`unary_op_gpu_inplace`, `mlx/backend/metal/unary.cpp`).
   * `kernel.zig`: the signature a custom kernel's source is wrapped in follows
     `fast::metal_kernel` (`mlx/backend/metal/custom_kernel.cpp`).
   * `ops.zig`: `sushi_sigmoid`, `sushi_maximum` and `sushi_minimum` are MLX's

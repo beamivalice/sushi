@@ -25,7 +25,9 @@ fn dupeRecipe(r: Recipe) !Recipe {
     const text = try gpa.dupe(u8, r.text);
     errdefer gpa.free(text);
     const flags = try gpa.dupe(metal.Flag, r.flags);
-    return .{ .kind = r.kind, .function = function, .key = key, .text = text, .flags = flags };
+    errdefer gpa.free(flags);
+    const ints = try gpa.dupe(metal.IntConstant, r.ints);
+    return .{ .kind = r.kind, .function = function, .key = key, .text = text, .flags = flags, .ints = ints };
 }
 
 fn has(r: Recipe) bool {
@@ -91,4 +93,43 @@ pub fn takeStock(key: []const u8) ?metal.Pipeline {
     const e = stock.get(key) orelse return null;
     record(e.recipe);
     return e.pipeline;
+}
+
+/// Markers a manifest held, not yet trusted: `Plan.settle` accepts them once every recipe of that manifest has made.
+var pending_markers: std.ArrayList(Recipe) = .empty;
+var accepted_markers: std.ArrayList(Recipe) = .empty;
+
+pub fn putMarker(r: Recipe) !void {
+    try pending_markers.append(gpa, try dupeRecipe(r));
+}
+
+/// The markers seen are trusted (the manifest's recipes all made), or dropped.
+pub fn settleMarkers(trusted: bool) void {
+    if (trusted) accepted_markers.appendSlice(gpa, pending_markers.items) catch {};
+    pending_markers.clearRetainingCapacity();
+    if (!trusted) accepted_markers.clearRetainingCapacity();
+}
+
+/// Whether a trusted manifest holds the marker `key`: the warm it names was made whole by recipes already made.
+/// The marker is then recorded, so a manifest written later keeps it.
+pub fn takeMarker(key: []const u8) bool {
+    for (accepted_markers.items) |m| if (std.mem.eql(u8, m.key, key)) {
+        record(m);
+        return true;
+    };
+    return false;
+}
+
+/// The warm named `key` has run in this process: its recipes are recorded, so this marks them whole.
+pub fn recordMarker(function: []const u8, key: []const u8) void {
+    record(.{ .kind = .marker, .function = function, .key = key });
+}
+
+/// TEST-ONLY: the process's recipes forgotten, as a new process has none; pipelines already made stay made.
+pub fn resetForTest() void {
+    comptime std.debug.assert(@import("builtin").is_test);
+    recorded.clearRetainingCapacity();
+    lost = 0;
+    pending_markers.clearRetainingCapacity();
+    accepted_markers.clearRetainingCapacity();
 }

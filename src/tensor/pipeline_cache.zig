@@ -59,6 +59,7 @@ pub const Job = struct {
         while (true) {
             const i = job.next.fetchAdd(1, .monotonic);
             if (i >= job.recipes.len) return;
+            if (job.recipes[i].kind == .marker) continue;
             job.pipelines[i] = job.make(dev, job.recipes[i]) catch {
                 job.fail(job.recipes[i].function);
                 continue;
@@ -76,7 +77,8 @@ pub const Job = struct {
                 return dev.compile(text, function);
             },
             .stock => return dev.pipelineOf(job.lib orelse return error.MetalUnavailable, function),
-            .stock_flags => return dev.pipelineOfFlags(job.lib orelse return error.MetalUnavailable, function, r.flags),
+            .stock_flags => return dev.pipelineOfConstants(job.lib orelse return error.MetalUnavailable, function, r.flags, r.ints),
+            .marker => unreachable,
         }
     }
 };
@@ -115,10 +117,16 @@ pub fn finish(job: *Job) Report {
     @memcpy(report.first_error[0..job.first_error_len], job.first_error[0..job.first_error_len]);
     report.first_error_len = job.first_error_len;
     for (job.recipes, job.pipelines) |r, made| {
-        const p = made orelse continue;
+        const p = made orelse {
+            if (r.kind == .marker) registry.putMarker(r) catch {
+                report.failed += 1;
+            };
+            continue;
+        };
         const kept = switch (r.kind) {
             .source => registry.putSource(r, p),
             .stock, .stock_flags => stock.preload(r, p),
+            .marker => unreachable,
         } catch {
             report.failed += 1;
             continue;
