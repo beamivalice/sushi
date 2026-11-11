@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash STQ loads faster on M5 Macs**: the load no longer warms kernels that generation does not use,
+  and a short follow-up turn generates on the same engine as the rest of decode.
 - **DeepSeek-V4.1-Flash STQ generates on sushi's own Metal engine on M5 Macs**: token generation for the STQ packs no
   longer runs through MLX there. It gives the same tokens with about a third less CPU while generating; prefill and
   every other model are unchanged. It is the first step of moving the engine off MLX.

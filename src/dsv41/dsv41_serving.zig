@@ -36,6 +36,11 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     // Decided before any kernel is made: the engine records each kernel as it is created.
     const own_decode = dsv41_borrow.ownDecode(&config.dsv41.?);
     if (own_decode) mlx.engine.enabled = true;
+    if (own_decode) {
+        const dsv41 = &config.dsv41.?;
+        if (dsv41.expert_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack);
+        if (dsv41.trunk_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, .pack);
+    }
     mlx.engine.seal(false);
     const engine = try Trunk.newExpertEngine(allocator, &config, s);
     errdefer {
@@ -232,9 +237,10 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const rows = mlx.getShape(ids);
     if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;
     const n: usize = @intCast(rows[1]);
-    // A one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
-    const own = m.engine_decode and n == 1 and ctx.vision_embeddings == null and st.verify == null;
-    const lazy = !own and n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
+    // A forward of up to a verify block's rows is a decode-width forward, on the engine; one that splices image rows
+    // stays on MLX. A one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
+    const decode_width = m.engine_decode and n <= expert_exl3_kernels.DECODE_ROWS_MAX and st.verify == null;
+    const lazy = !(decode_width and ctx.vision_embeddings == null) and n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_astype(&flat, ids, .uint32, self.s));
@@ -251,6 +257,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
     defer m.gpa.free(ahead);
     for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
+    const own = decode_width and (vision == null or dsv41_model.imageRows(m, host) == 0);
     if (m.ced_split != null and tailUnread(m.cfg.window, n, ctx.ahead_min_rows, ctx.holds_point) and st.verify == null) {
         try dsv41_model.extendState(m, host, dsv41_model.SPAN, vision, ahead);
         if (self.expert_stream) |engine| engine.finishForward(n);

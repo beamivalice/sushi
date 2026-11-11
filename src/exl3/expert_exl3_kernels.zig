@@ -1118,6 +1118,18 @@ pub fn gemmNaxOn() bool {
     return !gemm_nax_failed and gemmNaxAvailable();
 }
 
+/// Builds and proves the NAX GEMM kernel of `dec` and `order` now. The proof runs MLX work of its own, which a forward
+/// of the engine of our own refuses (and the arm would be declined for good), so a load that runs one calls this first.
+pub fn prepareGemmNax(dec: exl3.Decode, order: TileOrder) void {
+    if (!gemmNaxOn()) return;
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    const previous = active_decode;
+    defer active_decode = previous;
+    active_decode = dec;
+    _ = getGemmNaxKernelFor(order) catch {};
+}
+
 // Capability is independent of the dispatch failure latch: tests must still
 // probe the real kernel after an earlier dispatch fell back to SIMD.
 fn gemmNaxAvailable() bool {

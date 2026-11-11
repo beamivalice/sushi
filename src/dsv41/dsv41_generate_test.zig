@@ -1342,6 +1342,235 @@ test "dsv41 engine: the load clock times every phase of a load and the phases ad
     try testing.expect(p.otherNs() * 20 <= p.total_ns);
 }
 
+/// The tiny STQ fixture loaded as the engine tests load it: engine decode on, the DSpark stages and a 64 MB cache.
+const EngineFixture = struct {
+    config: model_mod.ModelConfig,
+    weights: model_mod.Weights,
+    xfm: Trunk,
+    ids: []u32,
+    was_enabled: bool,
+    was_own: ?bool,
+
+    fn open(self: *EngineFixture, dir: []const u8) !void {
+        const a = testing.allocator;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const dsv41_model = @import("dsv41_model.zig");
+        self.was_enabled = mlx.engine.enabled;
+        self.was_own = dsv41_borrow.own_override;
+        mlx.engine.enabled = true;
+        dsv41_borrow.own_override = true;
+        errdefer self.restore();
+        var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+        defer fx.deinit();
+        var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
+        defer sc.deinit();
+        self.ids = try dsv41_model.tokens(&sc, &fx);
+        errdefer a.free(self.ids);
+        self.config = try model_mod.parseConfig(io, a, dir);
+        errdefer self.config.deinit(a);
+        self.config.expert_streaming = true;
+        self.config.stream_mtp_head = true;
+        self.config.expert_cache_bytes = 64 << 20;
+        self.config.expert_source_dir = try a.dupe(u8, dir);
+        self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, false);
+        errdefer self.weights.deinit();
+        self.xfm = try Trunk.init(io, a, self.config, &self.weights);
+    }
+
+    fn restore(self: *EngineFixture) void {
+        mlx.engine.enabled = self.was_enabled;
+        dsv41_borrow.own_override = self.was_own;
+    }
+
+    fn deinit(self: *EngineFixture) void {
+        self.xfm.deinit();
+        self.weights.deinit();
+        self.config.deinit(testing.allocator);
+        testing.allocator.free(self.ids);
+        self.restore();
+    }
+
+    fn model(self: *EngineFixture) *@import("dsv41_model.zig").Model {
+        return dsv41_state.modelOf(&self.xfm).?;
+    }
+
+    /// `n` token ids, wrapping over the fixture's own.
+    fn prompt(self: *const EngineFixture, buf: []u32) []const u32 {
+        for (buf, 0..) |*t, i| t.* = self.ids[(i * 5 + 3) % self.ids.len];
+        return buf;
+    }
+};
+
+/// A prompt prefilled in one wide forward, then `k` more rows as the last prefill forward (a follow-up turn's tail), then
+/// `steps` greedy one-row steps: the bytes of the tail's logits and of every step's, and the tokens.
+fn shortPrefillBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, lead: usize, k: usize, steps: usize) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const vocab = dsv41_state.modelOf(xfm).?.cfg.vocab;
+    try xfm.resetCache();
+    var ctx = xfm.defaultCtx();
+    const first = try forwardIds(xfm, &ctx, prompt[0..lead]);
+    _ = mlx.mlx_array_free(first);
+    var lg = try forwardIds(xfm, &ctx, prompt[lead..][0..k]);
+    errdefer _ = mlx.mlx_array_free(lg);
+    for (0..steps + 1) |_| {
+        try mlx.check(mlx.mlx_array_eval(lg));
+        const data = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab];
+        try out.appendSlice(a, std.mem.sliceAsBytes(data));
+        const tok: u32 = @intCast(std.mem.indexOfMax(f32, data));
+        try out.appendSlice(a, std.mem.asBytes(&tok));
+        _ = mlx.mlx_array_free(lg);
+        lg = .{ .ctx = null };
+        lg = try forwardIds(xfm, &ctx, &.{tok});
+    }
+    _ = mlx.mlx_array_free(lg);
+    return out;
+}
+
+test "dsv41 engine: a prefill forward of 2 to 16 rows gives MLX's logits and the steps after it MLX's bytes (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    for (2..17) |k| {
+        m.engine_decode = false;
+        var want = try shortPrefillBytes(a, &fx.xfm, prompt, 30, k, 3);
+        defer want.deinit(a);
+        m.engine_decode = true;
+        defer m.engine_decode = false;
+        var got = try shortPrefillBytes(a, &fx.xfm, prompt, 30, k, 3);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u8, want.items, got.items);
+    }
+}
+
+test "dsv41 engine: a restored point followed by a prefill forward of 2, 7 or 16 rows decodes MLX's tokens (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dsv41_model = @import("dsv41_model.zig");
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    const lead: usize = 30;
+    const vocab = m.cfg.vocab;
+    try fx.xfm.resetCache();
+    const point = try a.alloc(dsv41_model.Slot, dsv41_model.slotCount(m));
+    defer a.free(point);
+    @memset(point, @splat(.{ .ctx = null }));
+    {
+        var ctx = fx.xfm.defaultCtx();
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..lead]));
+        try dsv41_model.captureState(m, point);
+    }
+    defer for (point) |*sl| dsv41_model.freeSlot(sl);
+    for ([_]usize{ 2, 7, 16 }) |k| {
+        var bytes: [2]std.ArrayList(u8) = .{ .empty, .empty };
+        defer for (&bytes) |*b| b.deinit(a);
+        for (&bytes, [_]bool{ false, true }) |*b, engine| {
+            m.engine_decode = engine;
+            defer m.engine_decode = false;
+            try fx.xfm.resetCache();
+            try dsv41_model.restoreState(m, point, lead, prompt);
+            var ctx = fx.xfm.defaultCtx();
+            ctx.cache.step = lead;
+            var lg = try forwardIds(&fx.xfm, &ctx, prompt[lead..][0..k]);
+            errdefer _ = mlx.mlx_array_free(lg);
+            for (0..4) |_| {
+                try mlx.check(mlx.mlx_array_eval(lg));
+                const data = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab];
+                try b.appendSlice(a, std.mem.sliceAsBytes(data));
+                const tok: u32 = @intCast(std.mem.indexOfMax(f32, data));
+                _ = mlx.mlx_array_free(lg);
+                lg = .{ .ctx = null };
+                lg = try forwardIds(&fx.xfm, &ctx, &.{tok});
+            }
+            _ = mlx.mlx_array_free(lg);
+        }
+        try testing.expectEqualSlices(u8, bytes[0].items, bytes[1].items);
+    }
+}
+
+test "dsv41 engine: a prefill forward of 2 to 16 rows costs MLX's queue what a one-row step does (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    var counts: [17]usize = undefined;
+    for ([_]usize{ 1, 2, 9, 16 }) |k| {
+        try fx.xfm.resetCache();
+        var ctx = fx.xfm.defaultCtx();
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..30]));
+        m.engine_decode = true;
+        defer m.engine_decode = false;
+        // A queue just used needs no keep-alive touch, so the count is the forward's own.
+        m.mlx_queue_used_ns = mlx.engine.nowNs();
+        var before: usize = 0;
+        try mlx.check(mlx.mlx_metal_command_buffer_count(&before));
+        const lg = try forwardIds(&fx.xfm, &ctx, prompt[30..][0..k]);
+        defer _ = mlx.mlx_array_free(lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        var after: usize = 0;
+        try mlx.check(mlx.mlx_metal_command_buffer_count(&after));
+        counts[k] = after - before;
+    }
+    for ([_]usize{ 2, 9, 16 }) |k| try testing.expectEqual(counts[1], counts[k]);
+}
+
+test "dsv41 engine: a load with decode on the engine keeps the NAX GEMM arm (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    try testing.expect(!@import("sushi_exl3").kernels.gemm_nax_failed);
+}
+
+test "dsv41 engine: after the load a forward of every width from 1 to 16 and a DSpark round compile nothing, on either side (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    try testing.expect(m.engine_decode);
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    const late = mlx.engine.latePipelines();
+    const keys = mlx.kernel_keys.trackForTest();
+    for (1..17) |k| {
+        try fx.xfm.resetCache();
+        var ctx = fx.xfm.defaultCtx();
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..30]));
+        const lg = try forwardIds(&fx.xfm, &ctx, prompt[30..][0..k]);
+        defer _ = mlx.mlx_array_free(lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        const tok = try argmaxHost(&fx.xfm, lg);
+        var d = try dsv41_serving.dsv41DraftImpl(&fx.xfm, tok);
+        defer d.deinit();
+        const rows = 1 + k % dsv41_max_verify_rows;
+        const logits = try dsv41_serving.dsv41VerifyImpl(&fx.xfm, &ctx, d.ids[0..@min(rows, d.ids.len)]);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+        try dsv41_serving.dsv41FinishImpl(&fx.xfm, &ctx, 0);
+    }
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+    try testing.expectEqual(keys, mlx.kernel_keys.count());
+}
+
 test "dsv41 engine: after the load's warm no step or round compiles a kernel, whatever its width (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");

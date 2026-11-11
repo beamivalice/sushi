@@ -2766,13 +2766,16 @@ pub fn warmKernels(m: *Model) !void {
     defer resetState(m);
     var ids: [exl3.kernels.DECODE_ROWS_MAX]u32 = undefined;
     for (&ids, 0..) |*t, i| t.* = @intCast(i % m.cfg.vocab);
-    // The first steps hold one compressed row a layer: an input under 8 elements binds as another library.
-    for ([_]usize{ 1, 1, 2 }) |w| try warmRun(try extend(m, ids[0..w], .last));
-    for (1..ids.len + 1) |w| try warmRun(try extend(m, ids[0..w], .last));
-    // A round of one row is the plain step between drafted rounds: it takes the rows' arm of the trunk linears, which
-    // a one-row forward outside a round does not. A copy round is wider than the block, up to the ring's slack.
-    if (m.dspark != null) for (1..cfg_mod.ring_slack + 1) |w| try warmRound(m, ids[0], w);
-    if (m.engine_decode) try warmOwn(m, ids[0], .both);
+    // With decode on the engine, MLX runs no forward of 16 rows or fewer (but one that splices image rows, which no
+    // warm covers), so only the engine's decode widths are warmed.
+    if (!m.engine_decode) {
+        // The first steps hold one compressed row a layer: an input under 8 elements binds as another library.
+        for ([_]usize{ 1, 1, 2 }) |w| try warmRun(try extend(m, ids[0..w], .last));
+        for (1..ids.len + 1) |w| try warmRun(try extend(m, ids[0..w], .last));
+        // A round of one row is the plain step between drafted rounds: it takes the rows' arm of the trunk linears, which
+        // a one-row forward outside a round does not. A copy round is wider than the block, up to the ring's slack.
+        if (m.dspark != null) for (1..cfg_mod.ring_slack + 1) |w| try warmRound(m, ids[0], w);
+    } else try warmOwn(m, ids[0], .both);
     // The prefill path: a chunk past the window runs CED and its 256 rows fill 8 GEMM windows (an input of 8 binds as a
     // device array), a narrower chunk runs every layer over 2 windows; at the context they leave a decode step's rows
     // span two attention splits.
@@ -2784,8 +2787,10 @@ pub fn warmKernels(m: *Model) !void {
     try warmRun(try extend(m, wide[0 .. n / 6], .last));
     // The held-back span a prompt's last forward runs (`prefill_plan.ssmSnapshotBackoff` + its last token).
     try warmRun(try extend(m, wide[0 .. @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1], .last));
-    for ([_]usize{ 1, 6 }) |w| try warmRun(try extend(m, ids[0..w], .last));
-    if (m.dspark != null) try warmRound(m, ids[0], m.cfg.dspark.block + 1);
+    if (!m.engine_decode) {
+        for ([_]usize{ 1, 6 }) |w| try warmRun(try extend(m, ids[0..w], .last));
+        if (m.dspark != null) try warmRound(m, ids[0], m.cfg.dspark.block + 1);
+    }
     // The engine's kernels have one signature each, so the widths it ran above are not other pipelines here.
     if (m.engine_decode) {
         try warmOwnFills(m, ids[0]);

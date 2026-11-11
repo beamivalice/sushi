@@ -197,6 +197,13 @@ nothing, is the forwards' own cost). R1 MLX decode widths and DSpark rounds, R2 
 | engine `newLibraryWithSource` (435 pipelines) | 65 | 15695 | 9382 |
 | engine pipeline state | 21 | 57 | 28 |
 
+Decode forwards of 16 rows or fewer run on the engine (a short prefill included), so with the engine on the load skips
+R1 and the 1-, 6- and block-wide forwards of R3. The same command on one pack, one load each, both the first run of a
+new binary (a cold system shader cache: 16.5 and 15.2 s of engine pipelines, so the gap is mostly MLX's cold compile of R1,
+not the warm-cache gain): 35383538 `kernels warmed ... in 74721 ms` (warm forwards 58264 ms, total 82417 ms); this change
+`in 40656 ms` (warm forwards 25409 ms, total 46933 ms); `compiled inside a request` 0 in both, 4k code decode 80 tok/s in both.
+The warm-cache gain is R1's 8.4 s from the table, not measured again.
+
 MLX's regions are 63% of the warm cache's 19.5 s; the engine's compile is 0.1 s there and 9 to 16 s with a cold system
 cache, all of it `newLibraryWithSource`.
 

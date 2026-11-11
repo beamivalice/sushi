@@ -9,12 +9,16 @@ the stream a call carries says which side runs it.
 One decision at the load, `dsv41_borrow.ownDecode`, which the bills ask too; the load line names the side and, on
 MLX, the reason. There is no flag and no fallback: a forward of the engine that fails is the request's error.
 
-| pack and GPU | decode forwards (one row, DSpark draft, verify rows) |
+| pack and GPU | forwards of 16 rows or fewer (decode, DSpark draft and verify, a short prefill) |
 |---|---|
 | DeepSeek-V4.1 STQ (experts and trunk), a GPU with matrix units (M5) | the engine |
 | DeepSeek-V4.1 STQ, a GPU without matrix units | MLX: the engine's other matmul tiles have not run on one |
 | DeepSeek-V4.1 with an FP8 trunk or MXFP4 experts | MLX: the engine has no `quantized_matmul` |
-| prefill of any width, every other architecture | MLX |
+| a forward that splices image rows, prefill wider than 16 rows, every other architecture | MLX |
+
+A forward of 16 rows or fewer on a request that holds image embeddings runs on the engine when its rows hold no image
+token (the splice reads the embeddings only for an image row); one that does, and one issued while a DSpark verify is
+open (only after a round failed), stay on MLX.
 
 A DSpark round's verdict, greedy or sampled, is decided on the engine wherever its verify ran there.
 
@@ -168,6 +172,13 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 - **A pipeline is compiled per side.** MLX's warm at load compiles MLX's; the engine's are its own, so the load runs
   the engine's decode widths too (`dsv41_model.warmOwn`). Without it the first verify of each width paid its compile
   inside a request (up to 2 s), and the round-cost policy stopped drafting for the rest of that request.
+- **With decode on the engine the load does not warm MLX's widths 1 to 16.** No forward of 16 rows or fewer is MLX's
+  any more (see the table), so `warmKernels` skips MLX's decode widths and DSpark rounds and keeps MLX's prefill
+  (256, 42 and 31 rows). An MLX-decode load warms as before.
+- **The NAX GEMM kernel is proven before the engine warm** (`kernels.prepareGemmNax`, called by `initDsv41` for the
+  experts' and the trunk's decode). Its proof is MLX work of its own, which a forward of the engine refuses; first
+  reached inside one, it was declined for the process (`[exl3-gemm] NAX arm declined`) and every GEMM, prefill
+  included, ran the SIMD arm at a third of the speed.
 - **Engine pipeline creation is 0.1 s with the system's shader cache warm and 9 to 16 s cold**, all of it
   `newLibraryWithSource` (435 pipelines, M5 Max); the pipeline state is 0.03 to 0.06 s. A binary archive replaces only
   that state step, so it buys nothing here.
