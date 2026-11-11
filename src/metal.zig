@@ -78,8 +78,105 @@ pub fn device() Error!*const Device {
     return &shared.?;
 }
 
-/// Buffers were added to or taken from the residency set since its last commit.
-var resident_dirty = false;
+/// Residency as MLX keeps it (mlx/backend/metal/resident.cpp, MIT): buffers are spread over sets of at most `set_cap`
+/// bytes, since macOS decides residency a set at a time and the first pass after a long idle wires a lost set again at
+/// its size. Each set holds a standing request and is attached to our queue when it is made: a set on no queue loses
+/// its residency.
+const max_sets = 32;
+const no_set: u8 = 255;
+/// What a set holds. The pool's buffers come and go with every forward and a wrapped mapping stays for a load: kept
+/// apart, a scratch buffer never changes a set that lists gigabytes of weights.
+const Kind = enum { pool, mapped };
+const Set = struct {
+    raw: id,
+    kind: Kind,
+    bytes: usize = 0,
+    /// Buffers were added to or taken from it since its last commit.
+    dirty: bool = false,
+};
+var sets: [max_sets]Set = undefined;
+var n_sets: u8 = 0;
+/// MLX's share of the working set for one set (`MLX_RESIDENCY_SET_MAX_PCT`'s default) and its floor.
+const set_percent = 5;
+const set_floor: usize = 64 << 20;
+var set_cap: usize = set_floor;
+var any_dirty = false;
+
+/// How many residency sets hold the engine's buffers, and the bytes in them.
+pub fn residentSets() struct { count: usize, bytes: usize } {
+    var bytes: usize = 0;
+    for (sets[0..n_sets]) |set| bytes += set.bytes;
+    return .{ .count = n_sets, .bytes = bytes };
+}
+
+/// TEST-ONLY: the cap of a set for the buffers added from now on; returns the cap it replaces.
+pub fn setResidentCapForTest(bytes: usize) usize {
+    defer set_cap = bytes;
+    return set_cap;
+}
+
+/// Tells the driver of every buffer added to or taken from a set since the last time. A pass does it as it is handed
+/// over; a release that no pass follows (an unload, a trim while idle) needs it said, or the set keeps the pages.
+pub fn commitResident() void {
+    commitSets();
+}
+
+/// Whether a set holds a change the driver has not been told of.
+pub fn residentDirty() bool {
+    return any_dirty;
+}
+
+fn commitSets() void {
+    if (!any_dirty) return;
+    any_dirty = false;
+    for (sets[0..n_sets]) |*set| if (set.dirty) {
+        set.dirty = false;
+        send(void, set.raw, "commit", .{});
+    };
+}
+
+var touch_scratch: ?Buffer = null;
+/// Passes `Device.touch` has handed over.
+pub var touches: u64 = 0;
+
+fn addSet(dev: *const Device, kind: Kind) ?u8 {
+    if (n_sets == max_sets) return null;
+    var ns_error: id = null;
+    const descriptor = send(id, send(id, objc_getClass("MTLResidencySetDescriptor"), "alloc", .{}), "init", .{});
+    defer send(void, descriptor, "release", .{});
+    const raw = send(id, dev.raw, "newResidencySetWithDescriptor:error:", .{ descriptor, &ns_error }) orelse {
+        noteError(ns_error, "Metal refused a residency set");
+        return null;
+    };
+    send(void, raw, "requestResidency", .{});
+    send(void, dev.queue, "addResidencySet:", .{raw});
+    sets[n_sets] = .{ .raw = raw, .kind = kind };
+    n_sets += 1;
+    return n_sets - 1;
+}
+
+/// The first set of `kind` that `bytes` fit in; else an emptied set, which takes the kind, or a new one (a buffer over
+/// the cap has a set of its own); else, at the most sets a queue takes, the emptiest of the kind, or of all when the
+/// kind has none. As MLX's `choose_set_locked`, by kind.
+fn chooseSet(dev: *const Device, kind: Kind, bytes: usize) u8 {
+    var empty: u8 = no_set;
+    var emptiest: u8 = no_set;
+    var emptiest_any: u8 = 0;
+    for (sets[0..n_sets], 0..) |set, i| {
+        if (set.bytes < sets[emptiest_any].bytes) emptiest_any = @intCast(i);
+        // The first set is the pool's for good: the device makes it before any buffer.
+        if (i != 0 and set.bytes == 0 and empty == no_set) empty = @intCast(i);
+        if (set.kind != kind) continue;
+        if (set.bytes + bytes <= set_cap) return @intCast(i);
+        if (emptiest == no_set or set.bytes < sets[emptiest].bytes) emptiest = @intCast(i);
+    }
+    if (empty != no_set) {
+        sets[empty].kind = kind;
+        return empty;
+    }
+    if (addSet(dev, kind)) |made| return made;
+    return if (emptiest != no_set) emptiest else emptiest_any;
+}
 
 /// A boolean function constant of a compiled kernel, by its index.
 pub const Flag = struct { index: usize, value: bool };
@@ -91,9 +188,6 @@ pub const Device = struct {
     raw: id,
     queue: id,
     options: id,
-    /// The residency set every buffer of ours is in, attached to the queue: a command buffer then finds its buffers
-    /// resident instead of making each one so at commit, which for a buffer over mapped weights costs its size.
-    resident: id,
 
     fn open() Error!Device {
         const raw = MTLCreateSystemDefaultDevice() orelse return error.MetalUnavailable;
@@ -105,16 +199,12 @@ pub const Device = struct {
         const OsVersion = extern struct { major: isize, minor: isize, patch: isize };
         const os = send(OsVersion, send(id, objc_getClass("NSProcessInfo"), "processInfo", .{}), "operatingSystemVersion", .{});
         send(void, options, "setLanguageVersion:", .{@as(usize, if (os.major >= 27) (4 << 16) + 1 else 4 << 16)});
-        var ns_error: id = null;
-        const descriptor = send(id, send(id, objc_getClass("MTLResidencySetDescriptor"), "alloc", .{}), "init", .{});
-        defer send(void, descriptor, "release", .{});
-        const resident = send(id, raw, "newResidencySetWithDescriptor:error:", .{ descriptor, &ns_error }) orelse {
-            noteError(ns_error, "Metal refused a residency set");
-            return error.MetalUnavailable;
-        };
-        send(void, resident, "requestResidency", .{});
-        send(void, queue, "addResidencySet:", .{resident});
-        return .{ .raw = raw, .queue = queue, .options = options, .resident = resident };
+        const dev: Device = .{ .raw = raw, .queue = queue, .options = options };
+        // Every buffer of ours is in a set: a command buffer then finds its buffers resident instead of making each
+        // one so at commit. The first set is made now, so a refusal is the open's.
+        set_cap = @max(send(usize, raw, "recommendedMaxWorkingSetSize", .{}) / 100 * set_percent, set_floor);
+        _ = addSet(&dev, .pool) orelse return error.MetalUnavailable;
+        return dev;
     }
 
     /// The compute pipeline of `function` in `source`, compiled now. `lastError` holds the compiler's text on failure.
@@ -225,17 +315,47 @@ pub const Device = struct {
             noteError(null, "Metal refused a buffer");
             return error.MetalBuffer;
         };
-        dev.keepResident(raw);
-        return .{ .raw = raw };
+        return .{ .raw = raw, .set = dev.keepResident(raw, .pool) };
+    }
+
+    /// A buffer over `len` bytes at the page-aligned `ptr`, which the caller keeps mapped until the buffer is released
+    /// and every pass that binds it has run. No copy: the pages are wired once, under this buffer.
+    pub fn wrap(dev: *const Device, ptr: [*]u8, len: usize) Error!Buffer {
+        const raw = send(id, dev.raw, "newBufferWithBytesNoCopy:length:options:deallocator:", .{ ptr, len, alias_options, @as(id, null) }) orelse {
+            noteError(null, "Metal refused a buffer over mapped memory");
+            return error.MetalBuffer;
+        };
+        return .{ .raw = raw, .set = dev.keepResident(raw, .mapped) };
+    }
+
+    /// A pass that writes four bytes of scratch, so the driver sees our queue in use: a queue left idle loses the
+    /// residency of the sets attached to it within half a minute. Not waited on.
+    pub fn touch(dev: *const Device) void {
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+        if (touch_scratch == null) touch_scratch = dev.alloc(4) catch return;
+        const Range = extern struct { location: usize, length: usize };
+        const cmd = send(id, dev.queue, "commandBuffer", .{});
+        const blit = send(id, cmd, "blitCommandEncoder", .{});
+        send(void, blit, "fillBuffer:range:value:", .{ touch_scratch.?.raw, Range{ .location = 0, .length = 4 }, @as(u8, 0) });
+        send(void, blit, "endEncoding", .{});
+        commitSets();
+        send(void, cmd, "commit", .{});
+        touches += 1;
     }
 
     pub fn fence(dev: *const Device) Error!Fence {
         return .{ .raw = send(id, dev.raw, "newFence", .{}) orelse return error.MetalUnavailable };
     }
 
-    fn keepResident(dev: *const Device, buffer: id) void {
-        send(void, dev.resident, "addAllocation:", .{buffer});
-        resident_dirty = true;
+    fn keepResident(dev: *const Device, buffer: id, kind: Kind) u8 {
+        const len = send(usize, buffer, "length", .{});
+        const at = chooseSet(dev, kind, len);
+        send(void, sets[at].raw, "addAllocation:", .{buffer});
+        sets[at].bytes += len;
+        sets[at].dirty = true;
+        any_dirty = true;
+        return at;
     }
 
     /// A command buffer with one compute encoder whose dispatches run in the order they are encoded.
@@ -277,16 +397,21 @@ pub const Pipeline = struct {
 
 pub const Buffer = struct {
     raw: id,
+    /// The residency set it is in; none for a buffer someone else made (an MLX array's).
+    set: u8 = no_set,
 
     pub fn bytes(b: Buffer) []u8 {
         return send([*]u8, b.raw, "contents", .{})[0..send(usize, b.raw, "length", .{})];
     }
 
-    /// The owner's release: the buffer leaves the residency set. The inference thread only.
+    /// The owner's release: the buffer leaves its residency set. The inference thread only.
     pub fn release(b: Buffer) void {
-        if (shared) |dev| {
-            send(void, dev.resident, "removeAllocation:", .{b.raw});
-            resident_dirty = true;
+        if (b.set != no_set) {
+            const set = &sets[b.set];
+            send(void, set.raw, "removeAllocation:", .{b.raw});
+            set.bytes -= send(usize, b.raw, "length", .{});
+            set.dirty = true;
+            any_dirty = true;
         }
         send(void, b.raw, "release", .{});
     }
@@ -367,10 +492,7 @@ pub const Pass = struct {
     /// `waitDone`). No shared event is signaled: one costs about 8 us of CPU per command buffer on Metal's threads.
     pub fn commit(p: Pass) Committed {
         send(void, p.encoder, "endEncoding", .{});
-        if (resident_dirty) {
-            resident_dirty = false;
-            send(void, shared.?.resident, "commit", .{});
-        }
+        commitSets();
         _ = send(id, p.cmd, "retain", .{});
         send(void, p.cmd, "commit", .{});
         objc_autoreleasePoolPop(p.pool);
@@ -432,6 +554,93 @@ const probe_source =
     \\  out[at.x] = x[at.x] * scale;
     \\}
 ;
+
+test "buffers are spread over residency sets of a capped size, a buffer over the cap takes a set of its own, and a release gives the bytes back" {
+    const dev = device() catch return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    const was = setResidentCapForTest(3 * page);
+    defer _ = setResidentCapForTest(was);
+    const before = residentSets();
+    var held: [5]Buffer = undefined;
+    for (held[0..4]) |*b| b.* = try dev.alloc(page);
+    held[4] = try dev.alloc(8 * page);
+    const filled = residentSets();
+    try std.testing.expectEqual(before.bytes + 12 * page, filled.bytes);
+    // Whatever the sets held before, none takes more than three of the four pages, and the buffer over the cap is
+    // alone in its set.
+    var beside_first: usize = 0;
+    for (held[1..4]) |b| beside_first += @intFromBool(b.set == held[0].set);
+    try std.testing.expect(beside_first < 3);
+    try std.testing.expectEqual(8 * page, sets[held[4].set].bytes);
+    for (held) |b| b.release();
+    try std.testing.expectEqual(before.bytes, residentSets().bytes);
+    // An emptied set is used again before another is made.
+    const again = try dev.alloc(8 * page);
+    defer again.release();
+    try std.testing.expectEqual(filled.count, residentSets().count);
+}
+
+test "past the most sets a queue takes, a buffer joins the emptiest set, and every release is still counted" {
+    const dev = device() catch return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    const was = setResidentCapForTest(page);
+    defer _ = setResidentCapForTest(was);
+    const before = residentSets();
+    var held: [max_sets + 8]Buffer = undefined;
+    for (&held) |*b| b.* = try dev.alloc(page);
+    try std.testing.expectEqual(@as(usize, max_sets), residentSets().count);
+    try std.testing.expectEqual(before.bytes + held.len * page, residentSets().bytes);
+    for (held) |b| b.release();
+    try std.testing.expectEqual(before.bytes, residentSets().bytes);
+    commitResident();
+    try std.testing.expect(!residentDirty());
+}
+
+test "a wrapped mapping never shares a residency set with a buffer of the pool" {
+    const dev = device() catch return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    const mapped = std.c.mmap(null, page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    try std.testing.expect(mapped != std.c.MAP_FAILED);
+    defer _ = std.c.munmap(@alignCast(mapped), page);
+    const scratch = try dev.alloc(page);
+    defer scratch.release();
+    const weight = try dev.wrap(@ptrCast(mapped), page);
+    defer weight.release();
+    const later = try dev.alloc(page);
+    defer later.release();
+    try std.testing.expect(weight.set != scratch.set);
+    try std.testing.expect(weight.set != later.set);
+}
+
+test "a buffer over mapped memory is the memory itself, and a kernel reads it" {
+    const dev = device() catch return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    const mapped = std.c.mmap(null, page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    try std.testing.expect(mapped != std.c.MAP_FAILED);
+    defer _ = std.c.munmap(@alignCast(mapped), page);
+    const ptr: [*]u8 = @ptrCast(mapped);
+    const values: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ptr[0 .. 16 * 4]));
+    for (values, 0..) |*v, k| v.* = @floatFromInt(k);
+    const dst = try dev.alloc(16 * 4);
+    defer dst.release();
+    const before = residentSets().bytes;
+    const src = try dev.wrap(ptr, 16 * 4);
+    try std.testing.expectEqual(@intFromPtr(ptr), @intFromPtr(src.bytes().ptr));
+    try std.testing.expectEqual(before + 16 * 4, residentSets().bytes);
+    const state = try dev.compile(probe_source, "sushi_metal_probe");
+    defer state.release();
+    const pass = dev.begin();
+    pass.pipeline(state);
+    pass.buffer(src, 0, 0);
+    pass.buffer(dst, 0, 1);
+    pass.constant(@as(f32, 2), 2);
+    pass.dispatch(.{ .x = 16 }, .{ .x = 16 });
+    try pass.commit().wait();
+    const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, dst.bytes()[0 .. 16 * 4]));
+    for (got, 0..) |v, k| try std.testing.expectEqual(@as(f32, @floatFromInt(2 * k)), v);
+    src.release();
+    try std.testing.expectEqual(before, residentSets().bytes);
+}
 
 test "a kernel compiled and dispatched from Zig reads one buffer and writes another" {
     const t = std.testing;

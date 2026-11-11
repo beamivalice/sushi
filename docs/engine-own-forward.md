@@ -196,7 +196,13 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   wrote, or writes what one read.
 - **A host read waits for the pass that wrote the bytes, not for the queue.** Waiting for everything in flight loses
   the layer the forward queued ahead (25.5 against 20.4 ms per forward).
-- The pool never hands out a store the open pass binds, and its buffers sit in a residency set of our own.
+- The pool never hands out a store the open pass binds.
+- **Residency is kept the way MLX keeps it** (`metal.zig`, after mlx/backend/metal/resident.cpp): every buffer of
+  ours sits in a residency set attached to our queue with a standing request, and the sets are capped at 5% of the
+  working set (floor 64 MiB, at most 32, first fit; a buffer over the cap has a set of its own). The cap bounds what
+  one lost set costs to wire again: macOS decides residency a set at a time. A set attached to no queue loses its
+  residency within half a minute even with a standing request, and so does a queue that runs nothing: while the
+  engine wraps mappings, the warm tick runs a four-byte pass on our queue too (`core.touch`, from `mlx.gpuTouch`).
 - **A slab is unmapped only after the engine has waited.** An import of a slab's array outlives the tensor that held it
   until the engine next waits (`retired`), and `SlabOperand.destroy` gives MLX 32 tries, then leaves the slab mapped for
   good. A borrow release now follows engine passes, so `destroy` closes the engine first (`mlx.engine.close()`, a no-op
@@ -207,84 +213,41 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   has not finished starts as that one ends.** So after a host wait the first four dispatches go at once and the
   rest follow in steps that double, without waiting for the GPU to run dry (`core.pass`): waiting for it cost each
   DSpark draft the start latency a second time (0.2 ms a round). Past ~5 ms of idle the latency is ~350 us.
-- **A residency set on a queue is paid at every commit, by what it holds.** MLX's sets attached to our queue took a
-  forward's CPU from 5.6 to 6.8 ms (its 20 sets) and 7.9 ms (one set). Left off, a bind of an MLX buffer costs
-  0.2 us of system CPU per command buffer. Our set holds the pool only.
-- **A command buffer costs CPU on two threads**: about 9 us where it is encoded and 15 us on Metal's submit thread,
-  more when the host waits for it. Close to half of a decode forward's CPU is those and the binds of MLX's
-  buffers, not our code.
-- **The host waits on the command buffer, not on a shared event** (`waitUntilCompleted`, oldest pass first so one
-  that failed is found before the passes behind it): an event signaled by every pass cost a forward 0.6 of its
-  5.6 ms of CPU, on Metal's threads.
-
-## Kernels: what runs, and whether it gives MLX's bytes
-
-Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expectSame`: same dtype, shape and bytes).
-
-| op | kernel | against MLX |
-|---|---|---|
-| reshape, transpose, slice, squeeze, expand, broadcast, view | none (a view) | same bytes |
-| astype, contiguous copy | ours | same bytes |
-| add, subtract, multiply, divide, comparisons, logical and, where | ours | same bytes |
-| maximum, minimum | ours, MLX's NaN rule | same bytes |
-| exp, sigmoid, sqrt, rsqrt, square, floor, negative | ours, MLX's precise math and sigmoid form | same bytes |
-| concatenate, take, take along an axis, repeat, stack, arange, zeros, slice update | ours | same bytes |
-| sum, max over an axis of floats; mean (f32); argmax | MLX's, from `mlx.metallib`, under MLX's reduction plan | same bytes |
-| sum, max over an axis of integers | ours | same bytes |
-| log, abs | ours, MLX's precise math (abs through float) | same bytes |
-| logaddexp (f32, f16, bf16; one flat run, a scalar beside a run) | MLX's binary kernel from `mlx.metallib` (a source of ours rounded the last bits differently) | same bytes |
-| floor divide (unsigned integers, floats) | ours: the quotient; the floor of the quotient | same bytes |
-| softmax over an inner axis | ours, MLX's op chain | same bytes |
-| softmax over the last axis, RMS norm, dequantize | MLX's, from `mlx.metallib` | same bytes |
-| matmul: vector, rows against a weight, two matrices, batches, dot product | MLX's, from `mlx.metallib` | same bytes |
-| sort, argsort over the last axis | MLX's, from `mlx.metallib`, one block or the multi-block merge under MLX's plan | same bytes, ties in MLX's order |
-| cumsum over the last axis (f32, f16, bf16) | MLX's scan kernel on MLX's grid | same bytes |
-| put along an axis, constant pad | ours (a copy, then the scatter or the border fill) | same bytes |
-| copy | a share of the input (MLX's `Copy` shares its buffer) | same bytes |
-| random bits | MLX's `rbitsc`, from `mlx.metallib` | same bytes |
-| uniform, categorical | MLX's bits, then `random.cpp`'s op chain op for op: inverse CDF (with MLX's searchsorted) for one row, Gumbel for a block | same bytes |
-| affine `quantized_matmul`, a transposed 2-D weight on the matrix-unit tiles (`qmm_t_nax`) | MLX's, from `mlx.metallib`, under MLX's plan | same bytes |
-| `fast::scaled_dot_product_attention`, head dimension 64, no mask: the full kernel (more than 8 query rows), the vector kernel and its two-pass form | MLX's, from `mlx.metallib`, under MLX's plan and strides | same bytes and strides |
-| erf | MLX's `Erf` kernel, from `mlx.metallib` | same bytes |
-| a model's custom kernel (`mlx_fast_metal_kernel`) | the model's source, MLX's signature | same bytes |
-
-- **A stock kernel** is fetched from `mlx.metallib` by the name MLX gives it and launched with MLX's buffers,
-  constants and grid (`stock.zig`, `matmul.zig`: ports of MLX's `eval_gpu`, MIT, see `NOTICE`). `matmul.zig` follows
-  `Matmul::eval_gpu` choice for choice: the wide gemv, the fused and the split-K tiles, NAX and SIMD, picked by the
-  GPU's architecture as MLX reads it.
-- **A float sum is MLX's kernel under MLX's plan** (`reduce.zig`): MLX sums a long row or column in parallel parts,
-  so a sum taken in order is other bytes (a 4096-element row differed in the last bits).
-- **A kernel of ours that walks an axis on one thread per output is a regression at vocabulary size**: the first
-  argmax here took 7.7 ms a row over the vocabulary, 37 of a DSpark draft's 42 ms, against 1.6 ms for the whole
-  Markov chain under MLX. An op over a long axis takes MLX's kernel.
-- **Not ported, refused by name**: `quantized_matmul` but the case above (a non-STQ DeepSeek pack's FP8 trunk, the
-  vector and split-K plans, the SIMD tiles, a batch), attention with a mask, sinks or another head dimension, a matmul or a reduction
-  with an empty operand, a reduction of more than 2^31 elements, a sort over an axis but the last, a scan of
-  floats over an axis but the last (a scan of 32-bit integers takes any axis: it turns the axis to the last, as its
-  sum is the same in any order), argpartition, top-k, logsumexp, a non-constant pad. Logprobs need those two, and are
-  made on the host (below).
-- **Random: the engine makes its own keys and never asks MLX.** A sampled draw's key is `random.drawKey(root, position)`,
-  a host integer mix of the request's seed (an unseeded request: one number from the OS, taken once) and the position
-  the draw predicts; a draw without a key is refused. The bar is a repeat on the engine, not MLX's bytes: the same seed
-  gives the same tokens, whatever the round widths, streamed or not, and a seed gives other tokens than on MLX. The root
-  rides `SamplingParams.draw_root`, set once at the generator's start on an engine load.
-- **After a forward, the sampler runs where the forward did** (`Trunk.outStream`, answered by the arch: the engine's stream
-  for a DeepSeek load whose decode is on the engine, else the forward's own). The first token, a serial tick, the
-  penalties, the thinking penalty and logit bias, the suppress, grammar and row masks, the token arrays and the
-  pipelined `async_eval` are the shared sampler's own code on that stream, so the MLX route's call sequence is untouched;
-  `engine.enter(s)` makes the host arrays and vectors they build the engine's while it runs (no MLX call). A draw is
-  `sampler.drawFromProbs` under `random.drawKey(root, sampling.draw)`, the same chain a DSpark row draws, so one position
-  has one key and one draw whoever makes it. A one-row decode and a one-row verify differ in the last bits of their
-  logits on the tiny fixture, so a serial and a round request of one seed are two texts; each repeats at every mix of its
-  own kind. **Logprobs** read the row back once and are ranked on the host (`sampler.hostLogprobs`: the values may
-  differ from MLX's in the last bits, the ids and their order do not, ties by the lower id).
-- **The one op a round still puts on MLX** is `keepMlxQueue`'s touch, one multiply per `GPU_WARM_TICK_NS` of MLX idle,
-  which keeps the driver from dropping MLX's resident set until the request's end commit (a prompt-cache write) is off MLX.
-- **Only one hardware path is proven on a given box.** On an M5 the tests take the NAX tiles; `MLX_ENABLE_TF32=0`
-  sends f32 through the SIMD tiles there. The half-precision SIMD tiles need a run on a pre-M5 machine.
-
-## Memory
-
+- **MLX's residency sets attached to a second queue cost every commit on it**: with them on our queue a forward's
+  CPU went from 5.6 to 6.8 ms (its 20 sets) and 7.9 ms (one set). Left off, a bind of an MLX buffer costs 0.2 us of
+  system CPU per command buffer. A set of our own on our own queue costs nothing per commit, whatever it holds: a
+  decode forward's process CPU read 5.181 ms with the weights and slabs in MLX's sets and 5.170 ms with all 111.6 GB
+  of them in one set on our queue (same binary, same reply).
+- **What a lost set costs** (exp branch `exp-e1-residency` 4aa24b0c on main aad856bc, M5 Max 128 GB, macOS 27.0, GPU
+  lock; DeepSeek-V4.1-Flash STQ 1.75bpw, `--ssd-budget-gb 108`, and a probe of 9.49 GB in 608 no-copy regions): a
+  set on no queue, or on a queue with no 500 ms tick, lost its residency within 30 s; wiring again takes 6 to 7 ms
+  a GB on the committing thread; after 120 s idle the next short request paid 0.75 s more with MLX's twenty-odd
+  sets of 5% and 1.61 s more with one set of everything, 2.1 times slower. Hence the cap.
+- **A Cooler load's weights are the engine's own buffers** (`core.wrapMapped`, `metal.Device.wrap`; decided with
+  the decode side, `dsv41_borrow.ownDecode`). Every large DeepSeek weight is a page-aligned mapping sushi fills and
+  hands over without a copy at one place, `model.wrapRegion`; there the engine wraps it (a no-copy Metal buffer of
+  the tensor's bytes, in our residency sets) instead of MLX, and the load binds, slices and casts the weights on the
+  engine's stream. The store gives the mapping back once the last pass that binds it has run, so an unload needs no
+  MLX wait; it is never written in place (`sole` is false). On the tiny STQ fixture a one-row step makes 1366 calls
+  into mlx-c (5497 with MLX's wraps) and a 12-token request 19,602 (94,508); live, STQ 1.75bpw, a request makes 3
+  to 4 times fewer, with the same dispatches, waits and imports of slabs.
+- **A lend of a wrapped weight lasts one call** (`core.lendsOnce`). MLX counts and wires every buffer it wraps for as
+  long as it holds it, and a tensor keeps the array a lend made (its twin): for a weight that was the whole load,
+  so one load-time op (the tower's requantization, a widening) left 4.6 GB billed and wired twice, and the first
+  request released expert cache to fit. A wrapped mapping keeps no twin; the seam frees the lend when the MLX call
+  that took it returns. `Stats.mapped_lends` counts them, a served load names each lending op once
+  (`mlx.noteWeightLend`), and no request makes one.
+- **Pool buffers and wrapped mappings never share a residency set** (`metal.Kind`): the pool's buffers come and go
+  with every forward's budget, and a set that also listed gigabytes of weights was dirtied by each of them.
+- **A load step moved to the engine's stream is checked by its decisions and its counts, never only by its bytes.**
+  The fused hyper-connection kernel's load probe built inputs with MLX's random; on the engine's stream that was
+  refused, the probe swallowed the refusal and read it as "this GPU's matmul differs": same text, 12 to 25% more
+  dispatches a request. The probe's inputs are host-made, and a probe that cannot run says why. Compare
+  `[dsv41] fused kernels ..., hc expand kernel ...` and a request's dispatch count with the MLX route's.
+- **A release is told to its set at once when no pass follows** (`metal.commitResident`, from the engine's sync, a
+  trim, `close` and the warm tick): a set that still lists a released buffer keeps its pages wired, and after an
+  unload no pass of ours may come. **MLX's wired limit gives up what the engine wires** (`mlx.applyWiredPolicy`
+  subtracts `mappedTotal`), so the two sets of residency together stay under the working set.
 - **The pool is the engine's allocator**: a tensor's bytes are a Metal buffer of whole pages, in sizes sixteen to an
   octave, so a buffer is under 1/16 larger than what was asked. A dropped buffer waits in the pool for the next tensor
   of its size.

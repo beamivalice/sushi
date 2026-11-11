@@ -2420,12 +2420,18 @@ pub fn destroyRegion(region: *MappedRegion) void {
 fn wrapRegion(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !struct { array: mlx.mlx_array, aliased: bool } {
     const ptr = region.ptr;
     trackRegion(region);
-    const array = mlx.mlx_array_new_data_managed_payload(ptr, shape.ptr, @intCast(shape.len), dtype, region, unmapRegion);
+    const array = if (mlx.engine.own_weights)
+        mlx.engine.wrapMapped(ptr, shape, dtype, region, unmapRegion)
+    else
+        mlx.mlx_array_new_data_managed_payload(ptr, shape.ptr, @intCast(shape.len), dtype, region, unmapRegion);
     if (array.ctx == null) {
-        // MLX throws from this constructor only before adopting the mapping (its copy
-        // branch runs the deleter last), so this is the region's only release.
+        // Neither maker has adopted the mapping when it fails (MLX throws before it does, and its copy branch runs
+        // the deleter last), so this is the region's only release.
         unmapRegion(region);
-        return error.OutOfMemory;
+        if (!mlx.engine.own_weights) return error.OutOfMemory;
+        var said: [256]u8 = undefined;
+        log.err("[load] the engine could not wrap a weight: {s}\n", .{mlx.takeError(&said) orelse "no reason given"});
+        return error.EngineWeightWrap;
     }
     errdefer _ = mlx.mlx_array_free(array);
     try mlx.check(mlx.mlx_array_eval(array));

@@ -530,7 +530,8 @@ a named 503. The pool is inside the cap, so a prefill's pool is no separate bill
 ### GPU memory readers
 
 `gpu_mem.activeBytes` is MLX's active bytes plus the engine's pool buffers bound to live tensors
-(`pool_bytes - pool_free`); `gpu_mem.cacheBytes` is MLX's cache plus the engine's free buffers (`pool_free`). Not
+(`pool_bytes - pool_free`) and the mappings it wraps as buffers of its own (`core.mappedTotal`: weights, which MLX
+then no longer counts); `gpu_mem.cacheBytes` is MLX's cache plus the engine's free buffers (`pool_free`). Not
 `pool_asked`, which leaves out the size-class rounding the Metal buffer holds. A free engine buffer is held by the
 process and reusable only by the engine, which gives it back under its budget (`core.budget`), as MLX gives back its
 cache. Both are safe off the inference thread: the engine publishes `pool_bytes` and `pool_free` as two atomics where

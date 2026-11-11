@@ -46,6 +46,20 @@ pub const Scope = struct {
     }
 };
 
+/// Whether a load's mapped weights are wrapped by the engine instead of MLX (`model.wrapRegion`). TEMPORARY, off until
+/// no forward of an engine load runs on MLX's side: a weight of the engine's lent to MLX is wired a second time.
+pub var own_weights: bool = false;
+
+/// The mapping at `ptr` as a tensor of the engine's (`core.wrapMapped`); a null handle, the reason latched, when it
+/// cannot be wrapped.
+pub fn wrapMapped(ptr: [*]u8, dims: []const c_int, dtype: mlx.mlx_dtype, payload: ?*anyopaque, release: core.MappedRelease) A {
+    const t = core.wrapMapped(ptr, dtype, dims, payload, release) catch |e| {
+        _ = fail("wrap_mapped", e);
+        return .{};
+    };
+    return core.handle(t);
+}
+
 /// Ops that went to MLX while the engine is on: what a request still builds there.
 pub var mlx_ops: u64 = 0;
 
@@ -99,6 +113,11 @@ pub fn lend(a: A) ?A {
     };
 }
 
+/// Whether the array `lend(a)` gives is the caller's to free after the MLX call that takes it (`core.lendsOnce`).
+pub fn lendsOnce(a: A) bool {
+    return core.lendsOnce(core.of(a));
+}
+
 fn lendOf(a: A) core.Error!A {
     const t = try core.ready(a);
     if (t.twin.ctx == null and (t.offset != 0 or !t.rowContiguous())) core.adopt(t, try ops.contiguousCopy(t));
@@ -111,7 +130,24 @@ pub fn lentVector(items: []const A) V {
     var stack: [16]A = undefined;
     const lent = if (items.len <= stack.len) stack[0..items.len] else gpa.alloc(A, items.len) catch return .{};
     defer if (items.len > stack.len) gpa.free(lent);
-    for (items, lent) |a, *out| out.* = if (core.isOurs(a)) lend(a) orelse return .{} else a;
+    var once_stack: [16]bool = undefined;
+    const once = if (items.len <= stack.len) once_stack[0..items.len] else gpa.alloc(bool, items.len) catch return .{};
+    defer if (items.len > stack.len) gpa.free(once);
+    @memset(once, false);
+    // The vector takes its own reference to each array: a lend made for it alone is freed once it has.
+    defer for (lent, once) |a, mine| {
+        if (mine) _ = mlx.raw.mlx_array_free(a);
+    };
+    for (items, lent, once) |a, *out, *mine| {
+        if (!core.isOurs(a)) {
+            out.* = a;
+            continue;
+        }
+        mlx.noteWeightLend("a vector for MLX", a);
+        const made_once = lendsOnce(a);
+        out.* = lend(a) orelse return .{};
+        mine.* = made_once;
+    }
     return mlx.raw.mlx_vector_array_new_data(lent.ptr, lent.len);
 }
 
@@ -288,6 +324,8 @@ pub fn mlx_array_data_uint8(a: A) ?[*]const u8 {
 }
 
 pub const isOurs = core.isOurs;
+pub const isMapped = core.isMapped;
+pub const storePointer = core.storePointer;
 pub const stream = core.stream;
 pub const stats = core.stats;
 pub const poolTotal = core.poolTotal;
@@ -297,6 +335,8 @@ pub const poolFree = core.poolFree;
 pub fn refusedBudget() @TypeOf(core.refused_budget) {
     return core.refused_budget;
 }
+pub const mappedTotal = core.mappedTotal;
+pub const touch = core.touch;
 pub const pin = core.pin;
 pub const unpin = core.unpin;
 pub const pinnedCount = core.pinnedCount;
@@ -1622,6 +1662,53 @@ test "a config made while the engine is on refuses by name an output it cannot h
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     for (0..kernel.max_outputs) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32));
     try t_std.expect(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32) != 0);
+}
+
+test "a mapped region the engine wraps is bound by a pass without a copy or a call into MLX, and is given back once, after that pass" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const Region = struct {
+        var given_back: usize = 0;
+        fn release(payload: ?*anyopaque) callconv(.c) void {
+            given_back += 1;
+            const span: *const [2]usize = @ptrCast(@alignCast(payload.?));
+            _ = std.c.munmap(@ptrFromInt(span[0]), span[1]);
+        }
+    };
+    Region.given_back = 0;
+    const n = 1000;
+    const len = std.mem.alignForward(usize, n * 4, std.heap.pageSize());
+    const mapped = std.c.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    try t_std.expect(mapped != std.c.MAP_FAILED);
+    const ptr: [*]u8 = @ptrCast(mapped);
+    const values: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ptr[0 .. n * 4]));
+    for (values, 0..) |*v, i| v.* = @floatFromInt(i);
+    var span = [2]usize{ @intFromPtr(ptr), len };
+    try core.sync();
+    const calls = mlx.calls.load(.monotonic);
+    const before = core.stats().mapped_bytes;
+
+    const t = try core.wrapMapped(ptr, .float32, &.{n}, &span, Region.release);
+    try t_std.expectEqual(@intFromPtr(ptr), @intFromPtr(t.store.ptr));
+    try t_std.expectEqual(before + n * 4, core.stats().mapped_bytes);
+    const x = core.handle(t);
+    var sum: A = .{};
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, x, x, core.stream()));
+    // The pass that binds it has not run: the mapping stays until it has.
+    _ = mlx.mlx_array_free(x);
+    try t_std.expectEqual(@as(usize, 0), Region.given_back);
+    try mlx.check(mlx.mlx_array_eval(sum));
+    const got = mlx.mlx_array_data_float32(sum).?[0..n];
+    for (got, 0..) |v, i| try t_std.expectEqual(@as(f32, @floatFromInt(2 * i)), v);
+    try core.sync();
+    try t_std.expectEqual(@as(usize, 1), Region.given_back);
+    try t_std.expectEqual(before, core.stats().mapped_bytes);
+    try t_std.expectEqual(calls, mlx.calls.load(.monotonic));
+    // Its residency set has been told: a set that still lists the buffer would keep the pages wired with no pass to come.
+    try t_std.expect(!@import("../metal.zig").residentDirty());
 }
 
 test "configs made and freed in turn launch the pipeline of their own template value" {

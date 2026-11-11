@@ -45,12 +45,17 @@ pub const Store = struct {
         pool: u16,
         /// The memory of an MLX array, which this handle keeps alive.
         mlx: mlx.mlx_array,
+        /// Memory its maker mapped and the engine wrapped (`wrapMapped`): `release(payload)` gives it back.
+        mapped: struct { payload: ?*anyopaque, release: MappedRelease },
     };
 };
 
 /// What the pool refused last for its budget: the buffer wanted, what Metal held for the pool, what the tensors in use
 /// asked for, and the limit on the first of those. For the refusal's message.
 pub var refused_budget: struct { wanted: u64 = 0, held: u64 = 0, asked: u64 = 0, limit: u64 = 0 } = .{};
+
+/// Gives back a mapping the engine wrapped. Called once, on the inference thread.
+pub const MappedRelease = *const fn (?*anyopaque) callconv(.c) void;
 
 pub const Tensor = struct {
     store: *Store,
@@ -205,11 +210,15 @@ pub const Stats = struct {
     gpu_gap_sum: [4]u64 = @splat(0),
     /// The pauses by the phase of the pass that ended them.
     gpu_gap_phase: [phases]u64 = @splat(0),
+    /// Bytes of the mappings the engine wraps as buffers of its own (`wrapMapped`).
+    mapped_bytes: u64 = 0,
     /// MLX arrays read by an op of ours, and the reads a held import answered (`pin`).
     imports: u64 = 0,
     imports_held: u64 = 0,
     /// Tensors handed to MLX as arrays over their own bytes.
     lends: u64 = 0,
+    /// The lends of a tensor over a wrapped mapping: MLX makes a second buffer over pages a buffer of ours wires.
+    mapped_lends: u64 = 0,
     /// Slice updates written into the base's bytes, and those that had to copy the base first.
     updates_in_place: u64 = 0,
     updates_copied: u64 = 0,
@@ -238,6 +247,21 @@ pub fn poolTotal() u64 {
 
 pub fn poolFree() u64 {
     return pool_unused.load(.monotonic);
+}
+
+var mapped_total: std.atomic.Value(u64) = .init(0);
+
+/// `Stats.mapped_bytes`, readable off the inference thread.
+pub fn mappedTotal() u64 {
+    return mapped_total.load(.monotonic);
+}
+
+/// A pass on our queue when it keeps mappings resident (`metal.Device.touch`); nothing otherwise.
+pub fn touch() void {
+    const s = &(state orelse return);
+    // With nothing wrapped there is no residency to keep, only a release since the last pass to tell the driver of.
+    if (s.stats.mapped_bytes == 0) return metal.commitResident();
+    (metal.device() catch return).touch();
 }
 
 fn publishPool(s: *const State) void {
@@ -371,6 +395,16 @@ pub fn isOurs(a: mlx.mlx_array) bool {
     return @intFromPtr(a.ctx) & 1 != 0;
 }
 
+/// Where the memory `a`, a tensor of ours, lies in begins: its store's first byte, whatever view `a` is of it.
+pub fn storePointer(a: mlx.mlx_array) [*]const u8 {
+    return of(a).store.ptr;
+}
+
+/// Whether `a`, a tensor of ours, lies over a mapping the engine wrapped (`wrapMapped`).
+pub fn isMapped(a: mlx.mlx_array) bool {
+    return of(a).store.origin == .mapped;
+}
+
 pub fn handle(t: *Tensor) mlx.mlx_array {
     return .{ .ctx = @ptrFromInt(@intFromPtr(t) | 1) };
 }
@@ -469,6 +503,7 @@ fn evict(s: *State, bytes: u64) bool {
             s.stats.pool_evictions += 1;
         }
     }
+    metal.commitResident();
     publishPool(s);
     return s.stats.pool_bytes <= bytes;
 }
@@ -507,18 +542,28 @@ fn dropStore(store: *Store) void {
             }
             publishPool(s);
         },
-        // The buffer aliases the array's pages: the last pass that binds it runs before the array may go.
-        .mlx => if (store.seq > s.done) {
+        // The buffer aliases pages someone else keeps: the last pass that binds it runs before they may go.
+        .mlx, .mapped => if (store.seq > s.done) {
             s.retired.append(gpa, store) catch {
                 syncState(s) catch {};
-                freeImport(store);
+                freeAlias(s, store);
             };
-        } else freeImport(store),
+        } else freeAlias(s, store),
     }
 }
 
-fn freeImport(store: *Store) void {
-    _ = mlx.mlx_array_free(store.origin.mlx);
+/// The end of a store over memory the pool does not own, once no pass binds it.
+fn freeAlias(s: *State, store: *Store) void {
+    switch (store.origin) {
+        .pool => unreachable,
+        .mlx => |kept| _ = mlx.mlx_array_free(kept),
+        .mapped => |m| {
+            store.buffer.release();
+            s.stats.mapped_bytes -= store.len;
+            mapped_total.store(s.stats.mapped_bytes, .monotonic);
+            m.release(m.payload);
+        },
+    }
     gpa.destroy(store);
 }
 
@@ -554,7 +599,8 @@ fn takeBack() void {
 
 /// `t` as an MLX array over the same bytes, for an op on MLX's queue: ours is waited on first. The array is `t`'s
 /// and goes with it; MLX holds the bytes until its last reference to the array goes. `t` is row-contiguous at
-/// offset 0.
+/// offset 0. A wrapped mapping keeps no such array (`lendsOnce`): the one returned is the caller's to free once MLX
+/// has taken it.
 pub fn lend(t: *Tensor) Error!mlx.mlx_array {
     if (t.twin.ctx != null) return t.twin;
     if (t.offset != 0 or !t.rowContiguous() or t.pending != null) return error.NotRowContiguous;
@@ -571,9 +617,19 @@ pub fn lend(t: *Tensor) Error!mlx.mlx_array {
         t.store.refs -= 1;
         return error.MlxError;
     }
-    t.twin = arr;
     s.stats.lends += 1;
+    if (t.store.origin == .mapped) {
+        s.stats.mapped_lends += 1;
+        return arr;
+    }
+    t.twin = arr;
     return arr;
+}
+
+/// Whether a lend of `t` is made for one call and freed after it. MLX bills and wires every buffer it wraps for as
+/// long as it holds it: a twin kept with a weight would stand, billed and wired twice, until the unload.
+pub fn lendsOnce(t: *const Tensor) bool {
+    return t.store.origin == .mapped and t.twin.ctx == null;
 }
 
 /// Whether `t` reads the whole of the MLX array `a` as `a` itself does.
@@ -627,6 +683,26 @@ pub fn fromHost(bytes: []const u8, dtype: Dtype, shape: []const c_int) Error!*Te
     errdefer release(t);
     if (t.nbytes() != bytes.len) return error.TensorShape;
     @memcpy(t.store.ptr[0..bytes.len], bytes);
+    return t;
+}
+
+/// A tensor over `ptr`, page-aligned memory its maker mapped and filled: no copy, and the pages are wired once, under
+/// a buffer of ours. `release(payload)` runs once the tensor is released and the last pass that binds it has run.
+pub fn wrapMapped(ptr: [*]u8, dtype: Dtype, shape: []const c_int, payload: ?*anyopaque, release_fn: MappedRelease) Error!*Tensor {
+    const s = try st();
+    const t = try box();
+    errdefer s.boxes.append(gpa, t) catch gpa.destroy(t);
+    try setShape(t, shape);
+    t.dtype = dtype;
+    t.offset = 0;
+    const len = @max(t.nbytes(), 1);
+    const store = gpa.create(Store) catch return error.OutOfMemory;
+    errdefer gpa.destroy(store);
+    const buffer = try (try metal.device()).wrap(ptr, len);
+    store.* = .{ .buffer = buffer, .at = 0, .ptr = ptr, .len = len, .origin = .{ .mapped = .{ .payload = payload, .release = release_fn } } };
+    t.store = store;
+    s.stats.mapped_bytes += len;
+    mapped_total.store(s.stats.mapped_bytes, .monotonic);
     return t;
 }
 
@@ -730,7 +806,9 @@ fn pinKey(a: mlx.mlx_array, ptr: [*]u8) ?PinKey {
 /// instead of building another. Only an array no one writes may be pinned: a held store has more than one holder,
 /// which makes every in-place append into it copy (`sole`). A weight is such an array; a state is not.
 pub fn pin(a: mlx.mlx_array) Error!void {
-    if (isOurs(a)) return error.TensorUnsupported;
+    // A tensor of ours is not imported, so there is nothing to hold: a mapping the engine wraps, or a weight the load
+    // made from one on the engine's stream.
+    if (isOurs(a)) return;
     const s = try st();
     var available = false;
     try mlx.check(mlx._mlx_array_is_available(&available, a));
@@ -746,6 +824,7 @@ pub fn pin(a: mlx.mlx_array) Error!void {
 /// Drops the hold `pin` made on `a`. It goes before the array is freed: the held import keeps the array, and with
 /// it the memory it lives in.
 pub fn unpin(a: mlx.mlx_array) void {
+    if (isOurs(a)) return;
     const s = &(state orelse return);
     const ptr: [*]u8 = @constCast(mlx.mlx_array_data_uint8(a) orelse return);
     const key = pinKey(a, ptr) orelse return;
@@ -793,6 +872,8 @@ pub fn sole(store: *const Store) Error!bool {
             try mlx.check(mlx._mlx_array_is_donatable(&only, kept));
             return only;
         },
+        // A wrapped mapping is its maker's (a weight): never written in place.
+        .mapped => return false,
     }
 }
 
@@ -1042,6 +1123,7 @@ pub fn sync() Error!void {
 pub fn close() void {
     const s = &(state orelse return);
     syncState(s) catch {};
+    metal.commitResident();
     readGpuSpans(s, 0);
 }
 
@@ -1148,9 +1230,10 @@ fn waitFor(s: *State, upto_in: u64) Error!void {
         if (store.seq > s.done) {
             s.retired.items[kept] = store;
             kept += 1;
-        } else freeImport(store);
+        } else freeAlias(s, store);
     }
     s.retired.shrinkRetainingCapacity(kept);
+    metal.commitResident();
     takeBack();
     if (failed) |e| return e;
 }

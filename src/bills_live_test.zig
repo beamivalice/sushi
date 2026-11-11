@@ -286,6 +286,87 @@ test "GPU memory readings are MLX's plus the engine's pool: tensors in use as ac
     try testing.expectEqual(cache + pool.pool_free, gpu_mem.cacheBytes());
 }
 
+test "GPU memory readings count a mapping the engine wraps as active, and a pass keeps its queue in use only while one is wrapped" {
+    const core = @import("tensor/core.zig");
+    const metal = @import("metal.zig");
+    const gpu_mem = @import("gpu_mem.zig");
+    const mlx = @import("mlx.zig");
+    _ = metal.device() catch return error.SkipZigTest;
+    const Region = struct {
+        fn release(payload: ?*anyopaque) callconv(.c) void {
+            const span: *const [2]usize = @ptrCast(@alignCast(payload.?));
+            _ = std.c.munmap(@ptrFromInt(span[0]), span[1]);
+        }
+    };
+    const len = 4 * std.heap.pageSize();
+    const mapped = std.c.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    try testing.expect(mapped != std.c.MAP_FAILED);
+    var span = [2]usize{ @intFromPtr(mapped), len };
+    try core.sync();
+    if (core.stats().mapped_bytes != 0) return error.SkipZigTest;
+    const idle = metal.touches;
+    core.touch();
+    try testing.expectEqual(idle, metal.touches);
+    const before = gpu_mem.activeBytes();
+    const t = try core.wrapMapped(@ptrCast(mapped), .uint8, &.{@intCast(len)}, &span, Region.release);
+    try testing.expectEqual(before + len, gpu_mem.activeBytes());
+    core.touch();
+    try testing.expectEqual(idle + 1, metal.touches);
+    // The engine wires the mapping itself, so MLX's own wired limit gives those bytes up while it stands.
+    const limit = mlx.maxRecommendedWorkingSet();
+    if (limit > 0) try testing.expectEqual(@as(?usize, limit - len), mlx.applyWiredPolicy());
+    core.release(t);
+    try core.sync();
+    try testing.expectEqual(before, gpu_mem.activeBytes());
+    if (limit > 0) try testing.expectEqual(@as(?usize, limit), mlx.applyWiredPolicy());
+}
+
+test "a wrapped mapping MLX takes for an op is MLX's only for that op: MLX's active memory gives its bytes back with the result" {
+    const core = @import("tensor/core.zig");
+    const metal = @import("metal.zig");
+    const mlx = @import("mlx.zig");
+    _ = metal.device() catch return error.SkipZigTest;
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const Region = struct {
+        fn release(payload: ?*anyopaque) callconv(.c) void {
+            const span: *const [2]usize = @ptrCast(@alignCast(payload.?));
+            _ = std.c.munmap(@ptrFromInt(span[0]), span[1]);
+        }
+    };
+    const len = 64 * std.heap.pageSize();
+    const mapped = std.c.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    try testing.expect(mapped != std.c.MAP_FAILED);
+    var span = [2]usize{ @intFromPtr(mapped), len };
+    const t = try core.wrapMapped(@ptrCast(mapped), .float32, &.{@intCast(len / 4)}, &span, Region.release);
+    const x = core.handle(t);
+    defer _ = mlx.mlx_array_free(x);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    const lends = core.stats().mapped_lends;
+    {
+        var sum = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sum);
+        try mlx.check(mlx.mlx_add(&sum, x, x, gpu));
+        try mlx.check(mlx.mlx_array_eval(sum));
+    }
+    // One lend an operand: the same mapping twice is two.
+    try testing.expectEqual(lends + 2, core.stats().mapped_lends);
+    // MLX lets a buffer go when the command buffer that read it has finished.
+    _ = mlx.mlx_synchronize(gpu);
+    var after: usize = 0;
+    for (0..400) |_| {
+        _ = mlx.mlx_get_active_memory(&after);
+        if (after == before) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try testing.expectEqual(before, after);
+}
+
 test "GPU memory readings are MLX's alone while the engine has made no pool buffer" {
     const mlx = @import("mlx.zig");
     const gpu_mem = @import("gpu_mem.zig");

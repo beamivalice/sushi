@@ -13,8 +13,9 @@ fn liveRead() noreturn {
     @panic("a host-tier test read the live GPU: it belongs in bills_live_test.zig");
 }
 
-/// Bytes MLX has in use plus the engine's pool buffers bound to live tensors. Safe off the inference thread: the
-/// engine's side is two atomics, and a tensor lent to MLX is in both counters, so the sum errs high, never low.
+/// Bytes MLX has in use plus the engine's: its pool buffers bound to live tensors and the mappings it wraps (weights).
+/// Safe off the inference thread: the engine's side is atomics, and a tensor lent to MLX is in both counters, so the
+/// sum errs high, never low.
 pub fn activeBytes() usize {
     if (host_tier) return liveRead();
     var active: usize = 0;
@@ -31,7 +32,7 @@ pub fn cacheBytes() usize {
 }
 
 fn engineInUse() usize {
-    return mlx.engine.poolTotal() -| mlx.engine.poolFree();
+    return (mlx.engine.poolTotal() -| mlx.engine.poolFree()) + mlx.engine.mappedTotal();
 }
 
 /// Read once on the main thread in `resolveMlxCadence`: the limit is static per device, and a

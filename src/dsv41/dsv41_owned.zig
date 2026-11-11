@@ -216,7 +216,8 @@ pub fn audit(gpa: std.mem.Allocator, arrays: []const A) !Audit {
         if (a.ctx == null) continue;
         try mlx.check(mlx.mlx_array_eval(a));
         const bytes: u64 = mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
-        const ptr = mlx.mlx_array_data_uint8(a);
+        // A weight the engine wraps may be a strided view, which has no host pointer of its own: its store's does.
+        const ptr: ?[*]const u8 = if (mlx.engine.isOurs(a)) mlx.engine.storePointer(a) else mlx.mlx_array_data_uint8(a);
         if (ptr != null and model.ownsPointer(ptr)) {
             out.owned_arrays += 1;
             out.owned_bytes += bytes;

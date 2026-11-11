@@ -122,7 +122,8 @@ MLX appends, the rest for the engine's pool), so the bill of a chunk is the one 
 
 The live headroom the borrow reads (`dsv41Headroom`) is the ceiling less `gpu_mem.activeBytes`, which holds the
 engine's pool buffers bound to live tensors (the state rows, window rings and rollback record) beside MLX's active
-bytes; the ceiling's footprint adds `gpu_mem.cacheBytes`, which holds the engine's free buffers. The headroom also
+bytes, and the weights, which a Cooler load's engine wraps itself; the ceiling's footprint adds
+`gpu_mem.cacheBytes`, which holds the engine's free buffers. The headroom also
 takes off the engine's free buffers (`engine.poolFree`): MLX makes what a borrow frees room for, and nothing on MLX's
 side can reclaim a buffer the engine holds. The cap bills the pool's growth over its tensors in use; the live read
 counts what it holds now. A tensor lent to MLX is in both counters, so the headroom errs low

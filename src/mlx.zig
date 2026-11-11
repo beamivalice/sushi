@@ -72,7 +72,8 @@ inline fn tally(comptime name: []const u8) void {
     if (comptime builtin.is_test) by_name.add(name);
 }
 
-/// TEST-ONLY tallies per entry point, to split a count by kind.
+/// TEST-ONLY tallies per entry point, to split a count by kind. An op that took a wrapped mapping of the engine's (a
+/// weight) on MLX's side is also counted under `lend <op>`, which is no call.
 const Tally = struct {
     const capacity = 512;
     names: [capacity][]const u8 = undefined,
@@ -102,6 +103,21 @@ const Tally = struct {
 };
 var by_name: Tally = .{};
 var ops_by_name: Tally = .{};
+
+/// TEST-ONLY: counts `a` under `lend <where>` when it is a wrapped mapping of the engine's taken on MLX's side.
+pub inline fn noteWeightLend(comptime where: []const u8, a: mlx_array) void {
+    if (!engine.isMapped(a)) return;
+    if (comptime builtin.is_test) return by_name.add("lend " ++ where);
+    const Said = struct {
+        // One flag per op name: `where` is comptime, so each caller has its own.
+        var once: bool = false;
+        const op = where;
+    };
+    log.debug("[engine] weight lend: {s}\n", .{Said.op});
+    if (Said.once) return;
+    Said.once = true;
+    log.warn("[engine] {s} took a weight the engine wraps onto MLX, which wires and bills it a second time for as long as it uses it; said once an op\n", .{Said.op});
+}
 
 pub const NameCount = struct { name: []const u8, count: u64 };
 
@@ -174,9 +190,17 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
                     // MLX takes a tensor of ours as an array over the same bytes; a result slot that still holds
                     // one is emptied before mlx-c assigns into it.
                     var lent = args;
+                    // Lends made for this call alone (`engine.lendsOnce`): mlx-c has its own reference once it returns.
+                    var once: [P.len]mlx_array = @splat(.{ .ctx = null });
+                    defer inline for (once) |a| {
+                        if (a.ctx != null) _ = raw.mlx_array_free(a);
+                    };
                     inline for (0..P.len) |i| switch (P[i].?) {
                         mlx_array => if (R == c_int and engine.isOurs(lent[i])) {
+                            noteWeightLend(name, lent[i]);
+                            const made_once = engine.lendsOnce(lent[i]);
                             lent[i] = engine.lend(lent[i]) orelse return 1;
+                            if (made_once) once[i] = lent[i];
                         },
                         *mlx_array => if (engine.isOurs(lent[i].*)) {
                             _ = engine.mlx_array_free(lent[i].*);
@@ -485,7 +509,14 @@ pub fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array {
 pub fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int {
     if (!engine.enabled) return raw.mlx_vector_array_append_value(vec, val);
     if (engine.isVec(vec)) return engine.mlx_vector_array_append_value(vec, val);
-    return raw.mlx_vector_array_append_value(vec, if (engine.isOurs(val)) engine.lend(val) orelse return 1 else val);
+    if (!engine.isOurs(val)) return raw.mlx_vector_array_append_value(vec, val);
+    noteWeightLend("mlx_vector_array_append_value", val);
+    const made_once = engine.lendsOnce(val);
+    const lent = engine.lend(val) orelse return 1;
+    defer if (made_once) {
+        _ = raw.mlx_array_free(lent);
+    };
+    return raw.mlx_vector_array_append_value(vec, lent);
 }
 
 // Graph utils (diagnostics)
@@ -1145,8 +1176,10 @@ pub fn gpuStream() mlx_stream {
     return if (noGpuBackend()) mlx_default_cpu_stream_new() else mlx_default_gpu_stream_new();
 }
 
-/// One synced element-op on the GPU stream: a queue the driver sees in use. A failure stays unlatched.
+/// One synced element-op on the GPU stream: a queue the driver sees in use. A failure stays unlatched. The engine's
+/// queue gets a pass too when it keeps weights resident.
 pub fn gpuTouch() void {
+    engine.touch();
     const had_error = errorPending();
     defer dropLatchedErrorUnless(had_error);
     const s = gpuStream();
@@ -1382,9 +1415,12 @@ pub fn applyWiredPolicy() ?usize {
     if (noGpuBackend()) return null;
     const max_rec = maxRecommendedWorkingSet();
     if (max_rec == 0) return null;
+    // A mapping the engine wraps is wired by the engine's sets: MLX's limit gives those bytes up, so the two together
+    // stay under the working set.
+    const limit = max_rec -| @as(usize, @intCast(engine.mappedTotal()));
     var prev: usize = 0;
-    _ = mlx_set_wired_limit(&prev, max_rec);
-    return max_rec;
+    _ = mlx_set_wired_limit(&prev, limit);
+    return limit;
 }
 
 // mlx-c error latch. mlx-c's default error handler calls exit(-1) after the C boundary

@@ -56,8 +56,21 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     var plan = beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
     // The load drops each tensor from the map once its arrays are bound.
-    const mdl = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
+    // Weights the engine wraps are bound, sliced and cast by the engine: an op of the load on MLX's stream would take
+    // one as a second buffer over its pages.
+    const own_load = dsv41_borrow.ownDecode(&config.dsv41.?);
+    mlx.engine.own_weights = own_load;
+    defer mlx.engine.own_weights = false;
+    if (own_load) mlx.engine.active = true;
+    const mdl = dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, if (own_load) mlx.engine.stream() else s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop }) catch |e| {
+        if (own_load) mlx.engine.active = false;
+        return e;
+    };
     errdefer mdl.deinit();
+    if (own_load) {
+        mlx.engine.active = false;
+        mdl.s = s;
+    }
     dsv41_model.logMemory(mdl);
     mdl.engine_decode = own_decode;
     if (own_decode) try dsv41_model.pinWeights(mdl);
@@ -118,7 +131,8 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         log.warn("[dsv41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
     }
     const made = mlx.engine.pipelinesMade();
-    load_clock.warmDone(warm_t0, made.ns - made_before.ns + plan.made_ns, made.count - made_before.count + plan.made_count);
+    const count_before = @import("dsv41_load.zig").takePipelinesBefore() orelse made_before.count;
+    load_clock.warmDone(warm_t0, made.ns - made_before.ns + plan.made_ns, made.count - count_before + plan.made_count);
     mlx.engine.seal(true);
     // The warm's transients leave the pool, so the load's memory reading is the model's.
     _ = mlx.mlx_clear_cache();
@@ -129,7 +143,8 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
 /// PURE: what a load's warm runs after the model's own forwards. The sampled verdict and the wide chunks are the
 /// engine's, so a manifest stands in for them; the spilled route's prefill chain is MLX's, which no manifest covers.
 pub fn warmAfter(scope: dsv41_model.WarmScope, engine_prefill: bool) struct { sampled_verdict: bool, split: bool, wide: bool } {
-    return .{ .sampled_verdict = scope == .all, .split = true, .wide = scope == .all and engine_prefill };
+    // The spilled route's chain on MLX is a prefill chunk's on MLX: a load that prefills on the engine never runs it.
+    return .{ .sampled_verdict = scope == .all, .split = !engine_prefill, .wide = scope == .all and engine_prefill };
 }
 
 /// The warm of a load: with `.mlx` only the forwards on MLX, the engine's pipelines having come from a manifest. Every
@@ -606,16 +621,16 @@ test "a non-STQ DeepSeek pack names an ssd_prefetch it ignores, from the flag or
     try std.testing.expect(std.mem.indexOf(u8, prefetchIgnoredLine(&config).?, "--ssd-prefetch is ignored") != null);
 }
 
-test "dsv41 warm: a manifest stands in for the engine's sampled verdict and wide chunks, never for MLX's spilled-route prefill chain" {
+test "dsv41 warm: a manifest stands in for the engine's sampled verdict and wide chunks; MLX's spilled-route prefill chain is warmed only where prefill is MLX's" {
     const full = warmAfter(.all, true);
-    try std.testing.expect(full.sampled_verdict and full.split and full.wide);
+    try std.testing.expect(full.sampled_verdict and full.wide and !full.split);
     const from_manifest = warmAfter(.mlx, true);
-    try std.testing.expect(!from_manifest.sampled_verdict and !from_manifest.wide);
-    try std.testing.expect(from_manifest.split);
-    // Prefill on MLX (the opt-out) leaves the engine no wide chunk to warm.
+    try std.testing.expect(!from_manifest.sampled_verdict and !from_manifest.wide and !from_manifest.split);
+    // Prefill on MLX (the opt-out) leaves the engine no wide chunk to warm, and MLX its chain, manifest or not.
     const prefill_on_mlx = warmAfter(.all, false);
     try std.testing.expect(prefill_on_mlx.sampled_verdict and prefill_on_mlx.split);
     try std.testing.expect(!prefill_on_mlx.wide);
+    try std.testing.expect(warmAfter(.mlx, false).split);
 }
 
 test "tailUnread: a chunk is state only when no point is taken and the next chunk replays a full window" {

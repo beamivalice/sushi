@@ -1234,54 +1234,6 @@ fn engineDecodeProof(dir: []const u8, stq: bool) !void {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(got.logits.items));
 }
 
-fn pinnedDecodeProof(dir: []const u8) !void {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dsv41_model = @import("dsv41_model.zig");
-    var fx: EngineFixture = undefined;
-    try fx.open(dir);
-    defer fx.deinit();
-    const xfm = &fx.xfm;
-    const m = dsv41_state.modelOf(xfm).?;
-    try testing.expect(m.engine_decode);
-    // A load whose decode is on the engine holds its weights' imports.
-    try testing.expect(mlx.engine.pinnedCount() > 0);
-    // The counts below are a one-row decode's: the prompt is prefilled on MLX.
-    m.engine_prefill = false;
-    const prompt = fx.ids[0..30];
-    const steps: usize = 12;
-    m.engine_decode = false;
-    var want = try lazyHeadSteps(a, xfm, prompt, steps, false);
-    defer want.deinit(a);
-    m.engine_decode = true;
-
-    dsv41_model.unpinWeights(m);
-    try testing.expectEqual(@as(usize, 0), mlx.engine.pinnedCount());
-    const b0 = mlx.engine.stats();
-    var loose = try lazyHeadSteps(a, xfm, prompt, steps, false);
-    defer loose.deinit(a);
-    const b1 = mlx.engine.stats();
-    try dsv41_model.pinWeights(m);
-    const b2 = mlx.engine.stats();
-    var held = try lazyHeadSteps(a, xfm, prompt, steps, false);
-    defer held.deinit(a);
-    const b3 = mlx.engine.stats();
-
-    try testing.expectEqualSlices(u32, want.tokens.items, held.tokens.items);
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(held.logits.items));
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(loose.logits.items), std.mem.sliceAsBytes(held.logits.items));
-    try testing.expectEqual(b1.dispatches - b0.dispatches, b3.dispatches - b2.dispatches);
-    try testing.expectEqual(b0.imports_held, b1.imports_held);
-    // What stays imported is not a weight: the streamed experts' slabs and the request's tokens.
-    try testing.expect((b3.imports - b2.imports) * 3 < b1.imports - b0.imports);
-    try testing.expectEqual(b1.imports - b0.imports, (b3.imports - b2.imports) + (b3.imports_held - b2.imports_held));
-}
-
-test "dsv41 engine: held weight imports give a one-row decode MLX's bytes with a fraction of its imports, and a freed model holds none (DSV41_STQ_TINY)" {
-    try pinnedDecodeProof(std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest));
-    try testing.expectEqual(@as(usize, 0), mlx.engine.pinnedCount());
-}
-
 /// Every byte `rounds` DSpark rounds hand the generator: each draft's ids and confidences, then the logits of its
 /// verify, whose width walks from one row to the widest verify and around.
 fn dsparkRoundBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, rounds: usize) !std.ArrayList(u8) {
@@ -1750,10 +1702,9 @@ const Census = struct {
     }
 };
 
-test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pinned so that it only goes down (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+/// One load, the phases of a request, the unload: what each asked of MLX. With `own_weights` the engine wraps the
+/// pack's weights itself.
+fn censusOf(dir: []const u8) ![9]Asked {
     const a = testing.allocator;
     var asked: [9]Asked = undefined;
     var fx: EngineFixture = undefined;
@@ -1835,21 +1786,29 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
     fx.deinit();
     asked[7] = try c.end("the unload");
 
+    return asked;
+}
+
+test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pinned so that it only goes down (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const asked = try censusOf(dir);
     // The target of every row is { 0, 0 }. What is left of a request is the engine importing arrays MLX owns (the
-    // weights, the experts' slabs and maps), one set of queries and a free each; a capture still builds on MLX.
+    // experts' slabs and their maps), one set of queries and a free each; a capture still builds on MLX.
     // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of: how many launches a request
-    // makes, and so how many weights it looks up, follows what the process ran before it (a load whose pipelines
-    // exist skips its warm forwards and starts with other experts in its cache). A real cut moves the ceiling.
+    // makes follows what the process ran before it (a load whose pipelines exist skips its warm forwards and starts
+    // with other experts in its cache). A real cut moves the ceiling.
     const ceilings = [_]Asked{
-        .{ .calls = 97474, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
-        .{ .calls = 97474, .ops = 0 }, // seeded rounds
-        .{ .calls = 78013, .ops = 0 }, // serial steps with logprobs
+        .{ .calls = 19700, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
+        .{ .calls = 19700, .ops = 0 }, // seeded rounds
+        .{ .calls = 19700, .ops = 0 }, // serial steps with logprobs
         .{ .calls = 253, .ops = 87 }, // a restore point captured
         .{ .calls = 149, .ops = 0 }, // the point restored
-        .{ .calls = 5923, .ops = 0 }, // a step on the restored state
-        .{ .calls = 40250, .ops = 0 }, // an image prompt
-        .{ .calls = 4373, .ops = 0 }, // the unload
-        .{ .calls = 444974, .ops = 1154 }, // the load
+        .{ .calls = 1700, .ops = 0 }, // a step on the restored state
+        .{ .calls = 10600, .ops = 0 }, // an image prompt
+        .{ .calls = 861, .ops = 0 }, // the unload
+        .{ .calls = 110500, .ops = 438 }, // the load
     };
     for (ceilings, asked) |ceiling, got| {
         try testing.expectEqual(ceiling.ops, got.ops);
@@ -1858,20 +1817,21 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
     }
 }
 
-test "dsv41 engine: a Cooler load runs no forward on MLX: its warm leaves MLX the load's own few kernel launches (DSV41_STQ_TINY)" {
+test "dsv41 engine: a Cooler load answers the fused hyper-connection kernel's probe as the MLX route does: the probe runs on the engine's stream (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    var before: std.ArrayList(mlx.NameCount) = .empty;
-    defer before.deinit(testing.allocator);
-    try mlx.callsByName(&before, testing.allocator);
-    var fx: EngineFixture = undefined;
-    try fx.open(dir);
-    defer fx.deinit();
-    try testing.expect(fx.model().engine_prefill);
-    // What is left is the load's own: probes of the GPU and conversions, some made once a process. Three prefill
-    // chunks on MLX launched 900 more.
-    try testing.expect(try namedSince(before.items, "mlx_fast_metal_kernel_apply") <= 15);
+    const kernels = @import("dsv41_kernels.zig");
+    var probed: [2]bool = undefined;
+    for ([_]dsv41_config.MlxAsk{ .flag, .none }, &probed) |ask, *on| {
+        var fx: EngineFixture = undefined;
+        try fx.openAsking(dir, ask);
+        defer fx.deinit();
+        on.* = kernels.hcExpandProbed();
+        mlx.engine.close();
+    }
+    // Whatever this GPU's answer is, it is one answer: a probe the engine could not run would read as "differs".
+    try testing.expectEqual(probed[0], probed[1]);
 }
 
 test "dsv41 engine: a prefill forward of 2 to 16 rows gives MLX's logits and the steps after it MLX's bytes (DSV41_STQ_TINY)" {
@@ -3944,9 +3904,26 @@ fn callsSince(before: []const mlx.NameCount) ![call_kinds]u64 {
         for (before) |b| if (std.mem.eql(u8, b.name, n.name)) {
             was = b.count;
         };
-        split[@intFromEnum(callKind(n.name))] += n.count - was;
+        if (!std.mem.startsWith(u8, n.name, "lend ")) split[@intFromEnum(callKind(n.name))] += n.count - was;
     }
     return split;
+}
+
+/// The ops that took a weight the engine wraps on MLX's side since `before`, as `op xN` joined by spaces.
+fn lentSince(before: []const mlx.NameCount, buf: []u8) ![]const u8 {
+    var now: std.ArrayList(mlx.NameCount) = .empty;
+    defer now.deinit(testing.allocator);
+    try mlx.callsByName(&now, testing.allocator);
+    var w: std.Io.Writer = .fixed(buf);
+    for (now.items) |n| {
+        if (!std.mem.startsWith(u8, n.name, "lend ")) continue;
+        var was: u64 = 0;
+        for (before) |b| if (std.mem.eql(u8, b.name, n.name)) {
+            was = b.count;
+        };
+        if (n.count > was) try w.print("{s} x{d} ", .{ n.name[5..], n.count - was });
+    }
+    return w.buffered();
 }
 
 const StepCalls = struct { total: u64, split: [call_kinds]u64 };
@@ -3989,8 +3966,8 @@ test "dsv41 engine: a one-row decode step in steady state makes a pinned number 
     const again = try stepCalls(&fx, prompt, 5);
     try testing.expectEqual(steady, again);
     // The stage-by-stage target is zero: kernel configs, array queries, host reads, evals, makers, frees, other ops.
-    try testing.expectEqual([_]u64{ 0, 3863, 489, 1, 2, 572, 570 }, steady.split);
-    try testing.expectEqual(@as(u64, 5497), steady.total);
+    try testing.expectEqual([_]u64{ 0, 875, 98, 1, 2, 196, 194 }, steady.split);
+    try testing.expectEqual(@as(u64, 1366), steady.total);
 }
 
 /// The ops a request puts on MLX in `want` serial ticks, MLX's keep-warm touch held off.
@@ -4327,4 +4304,67 @@ test "dsv41 engine: a request's rings are the engine's from its first forward: M
     _ = try stepCalls(&fx, prompt, 5);
     try testing.expectEqual(@as(u64, 0), try namedSince(before.items, "mlx_zeros"));
     try testing.expectEqual(@as(u64, 0), try namedSince(before.items, "_mlx_array_is_donatable"));
+}
+
+/// The first `n` greedy tokens after a prompt of 30.
+fn greedyRun(fx: *EngineFixture, prompt: []const u32, comptime n: usize) ![n]u32 {
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    var lg = try forwardIds(&fx.xfm, &ctx, prompt[0..30]);
+    var out: [n]u32 = undefined;
+    for (&out) |*tok| {
+        tok.* = try argmaxHost(&fx.xfm, lg);
+        _ = mlx.mlx_array_free(lg);
+        lg = try forwardIds(&fx.xfm, &ctx, &.{tok.*});
+    }
+    _ = mlx.mlx_array_free(lg);
+    return out;
+}
+
+test "dsv41 engine: a Cooler load wraps its weights itself: the MLX route's greedy tokens, steps that import no weight and lend none, and an unload that unmaps them (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var buf: [48]u32 = undefined;
+    var want: [8]u32 = undefined;
+    {
+        // The MLX route, whose weights MLX wraps.
+        var fx: EngineFixture = undefined;
+        try fx.openAsking(dir, .flag);
+        defer fx.deinit();
+        want = try greedyRun(&fx, fx.prompt(&buf), 8);
+    }
+    mlx.engine.close();
+    const regions = model_mod.ownedRegionCount();
+    const mapped = mlx.engine.stats().mapped_bytes;
+    var names: std.ArrayList(mlx.NameCount) = .empty;
+    defer names.deinit(testing.allocator);
+    try mlx.callsByName(&names, testing.allocator);
+    const weight_lends = mlx.engine.stats().mapped_lends;
+    {
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        defer fx.deinit();
+        try testing.expect(mlx.engine.stats().mapped_bytes > mapped);
+        const prompt = fx.prompt(&buf);
+        try testing.expectEqual(want, try greedyRun(&fx, prompt, 8));
+        _ = try stepCalls(&fx, prompt, 5);
+        const imports = mlx.engine.stats().imports;
+        const held = mlx.engine.stats().imports_held;
+        _ = try stepCalls(&fx, prompt, 5);
+        // From the load on: no op on MLX's side took a weight the engine wraps.
+        var lent: [1024]u8 = undefined;
+        try testing.expectEqualStrings("", try lentSince(names.items, &lent));
+        try testing.expectEqual(weight_lends, mlx.engine.stats().mapped_lends);
+        // What a prefill and five steps still import is not a weight (the expert slabs and their maps), and no pin
+        // answers for one.
+        try testing.expectEqual(@as(u64, 622), mlx.engine.stats().imports - imports);
+        try testing.expectEqual(held, mlx.engine.stats().imports_held);
+    }
+    mlx.engine.close();
+    try testing.expectEqual(regions, model_mod.ownedRegionCount());
+    try testing.expectEqual(mapped, mlx.engine.stats().mapped_bytes);
+    // Nothing the load, the steps or the unload refused was swallowed.
+    var said: [512]u8 = undefined;
+    try testing.expectEqualStrings("", mlx.takeError(&said) orelse "");
 }

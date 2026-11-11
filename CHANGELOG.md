@@ -14,9 +14,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1-Flash reads images on Sushi Cooler**: on an M5 Mac the image encoder and the model's pass over the
   image's rows run on sushi's own engine with the same result they had on MLX, so an image request no longer sends that
   work to MLX, and a repeat start keeps the encoder's kernel recipes beside the model's.
-- **DeepSeek-V4.1-Flash on Sushi Cooler does less host work per token**: the engine keeps hold of the model's weights
-  for the whole load, finds a kernel it has already used without rebuilding its key and sets up a kernel launch
-  without calling MLX, so the CPU has less to do between GPU passes.
+- **DeepSeek-V4.1-Flash on Sushi Cooler does less host work per token**: the engine holds the model's weights as
+  its own buffers, finds a kernel it has already used without rebuilding its key and sets up a kernel launch without
+  calling MLX, so the CPU has less to do between GPU passes; a repeat start of the same model is also faster.
 - **DeepSeek-V4.1-Flash sampled answers draw on Sushi Cooler without MLX**: a seed now gives a different text on Sushi
   Cooler than on MLX, and the same text on every repeat, streamed or not, the first token included; the sampler,
   penalties, logit bias, grammar masks and logprobs of a token no longer run on MLX there.

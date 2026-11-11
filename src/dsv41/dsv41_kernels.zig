@@ -2797,20 +2797,32 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
 fn probeHcExpand(gpa: std.mem.Allocator, s: mlx.mlx_stream, D: usize) bool {
     var sc = Scope.plain(gpa, s);
     defer sc.deinit();
-    return probeHcExpandIn(&sc, D) catch blk: {
+    return probeHcExpandIn(&sc, D) catch |e| blk: {
+        // A probe that could not run is not a GPU whose matmul differs: the reason is said, never swallowed.
         var buf: [512]u8 = undefined;
-        _ = mlx.takeError(&buf);
+        @import("../log.zig").warn("[dsv41] the hc expand probe did not run ({s}: {s}); the op chain serves\n", .{ @errorName(e), mlx.takeError(&buf) orelse "no reason given" });
         break :blk false;
     };
+}
+
+/// Normal values made on the host, so the probe runs on whichever stream the forwards do and asks MLX for no key.
+fn probeValues(sc: *Scope, shape: []const c_int, seed: u64, std_dev: f32) !A {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const values = try sc.a.alloc(f32, n);
+    defer sc.a.free(values);
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (values) |*v| v.* = prng.random().floatNorm(f32) * std_dev;
+    return sc.keep(mlx.mlx_array_new_data(values.ptr, shape.ptr, @intCast(shape.len), .float32));
 }
 
 fn probeHcExpandIn(sc: *Scope, D: usize) !bool {
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5, 48 }) |L| {
         const d: c_int = ci(D);
-        const x = try sc.astype(try randn(sc, &.{ L, 4, d }, .float32, 171, 1.5), dt);
-        const y = try sc.astype(try randn(sc, &.{ L, d }, .float32, 172, 1.0), dt);
-        const post = try randn(sc, &.{ L, 4 }, .float32, 173, 0.7);
-        const comb = try randn(sc, &.{ L, 4, 4 }, .float32, 174, 0.5);
+        const x = try sc.astype(try probeValues(sc, &.{ L, 4, d }, 171, 1.5), dt);
+        const y = try sc.astype(try probeValues(sc, &.{ L, d }, 172, 1.0), dt);
+        const post = try probeValues(sc, &.{ L, 4 }, 173, 0.7);
+        const comb = try probeValues(sc, &.{ L, 4, 4 }, 174, 0.5);
         const want = try sc_mod.hostF32(try sc.astype(try model.hcExpandOps(sc, x, y, post, comb), .float32));
         const got = try sc_mod.hostF32(try sc.astype(try hcExpandFused(sc, x, y, post, comb), .float32));
         if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) return false;
