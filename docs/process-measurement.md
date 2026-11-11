@@ -181,6 +181,9 @@ Rules for reading it:
   the same position repeats within 0.3% (fixed-row sampled rounds within 0.03%). Inside a load the same request drifts 4
   to 5% as the die heats.
 - One load per arm; a second load of an arm is a repeat check, not an average to chase.
+- A watt reading is a record, not a verdict: it moves with the GPU clock and with macOS's throttling, and a request must
+  be long enough to separate watts from tok/s (256 tokens at long context is not). Record it with its caveats and move
+  on; judge a change by counts heat cannot move (instructions per token, dispatches, command buffers, bytes read).
 - The lock's holder sets `QUIET` inside the locked command and waits for compiles and running test binaries to drain; a
   run whose idle window shows GPU watts is discarded.
 - State beside the numbers: binary commit, the requests, boot and end temperature, and the round mix of every greedy
