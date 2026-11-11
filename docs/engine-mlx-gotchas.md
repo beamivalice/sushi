@@ -72,6 +72,8 @@ mlx or mlx-c.
   so every op that read one took a buffer of its own (Qwen STQ: 154 buffers a forward, 39 on the op count alone), and
   each buffer costs host time in Metal's submit and completion queues. The patch adds the setter
   (`mlx_metal_set_max_mb_per_buffer`) and a commit counter (`mlx_metal_command_buffer_count`, printed by the meter).
+  - The budget's unit is elements, not bytes: MLX adds each distinct input's `data_size()` (items) and compares
+    the sum against the "MB" setting, so 50 cuts at 50 Mi elements: 100 MiB of bf16 inputs, 200 MiB of f32.
 - **Prefill keeps the budget.** Its memory bill is fitted to the cadence the budget gives: with weights left out of
   the count process-wide, the first 4096-token chunk's MLX transient went from 3.4 to 7.5 GB against a 3.6 GB reserve.
 - Guards in `mlx.zig`: `one kernel runs each instantiation on its own source`, `a decode tick's buffers commit on op

@@ -1821,6 +1821,8 @@ test "effort notice rides the response header and does not replace the answer" {
 }
 
 fn rawResponseFor(conn: *Conn, peer: std.posix.fd_t, buf: []u8) ![]u8 {
+    // The peer ends its side first, as a client does: `close` waits for it, minutes on a close-delimited answer.
+    _ = std.posix.system.shutdown(peer, std.posix.SHUT.WR);
     conn.close();
     var got: usize = 0;
     while (got < buf.len) {
