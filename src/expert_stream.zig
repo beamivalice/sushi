@@ -1189,16 +1189,16 @@ const SlabOperand = struct {
         return .{ .stride = 0, .count = 0 };
     }
 
-    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32) !SlabOperand {
-        return createTyped(allocator, count, d0, d1, .bfloat16, 2);
+    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, s: mlx.mlx_stream) !SlabOperand {
+        return createTyped(allocator, count, d0, d1, .bfloat16, 2, s);
     }
 
-    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
-        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes);
+    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
+        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes, s);
     }
 
     /// One flat axis of `elems` elements: a rate-grouped layer's trellis storage, pools back to back.
-    fn createFlat(allocator: std.mem.Allocator, elems: usize, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+    fn createFlat(allocator: std.mem.Allocator, elems: usize, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
         if (elems == 0 or elems > std.math.maxInt(c_int) or elem_bytes == 0) return error.InvalidExpertGeometry;
         const stride = elems * elem_bytes;
         const slab = try io_mod.PageSlab.create(allocator, stride);
@@ -1206,7 +1206,7 @@ const SlabOperand = struct {
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
         payload.* = .{};
-        const operand = try io_mod.importSlab(slab, &.{@intCast(elems)}, dtype, payload, .{});
+        const operand = try io_mod.importSlab(slab, &.{@intCast(elems)}, dtype, payload, .{ .engine = mlx.engine.isStream(s) });
         if (!operand.aliased) {
             _ = mlx.mlx_array_free(operand.array);
             return error.ExpertSlabImportCopied;
@@ -1214,7 +1214,7 @@ const SlabOperand = struct {
         return .{ .present = true, .slab = slab, .payload = payload, .array = operand.array, .stride = stride, .count = 1 };
     }
 
-    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
         if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
         var stride: usize = elem_bytes;
         var shape: [4]c_int = undefined;
@@ -1229,7 +1229,7 @@ const SlabOperand = struct {
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
         payload.* = .{};
-        const operand = try io_mod.importSlab(slab, shape[0 .. inner.len + 1], dtype, payload, .{});
+        const operand = try io_mod.importSlab(slab, shape[0 .. inner.len + 1], dtype, payload, .{ .engine = mlx.engine.isStream(s) });
         if (!operand.aliased) {
             _ = mlx.mlx_array_free(operand.array);
             return error.ExpertSlabImportCopied;
@@ -1656,7 +1656,7 @@ const LayerState = struct {
     /// Brings the host map and its GPU copy up to the cache. The pair only ever
     /// changes together: a failure leaves no GPU map and a host map that forces
     /// the next call to rebuild.
-    fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator) !void {
+    fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator, s: mlx.mlx_stream) !void {
         const experts = if (self.grouped) |gl| gl.expertCount() else self.cache.expert_to_slot.len;
         if (self.spec_host.len != experts) {
             if (self.spec_host.len != 0) allocator.free(self.spec_host);
@@ -1680,6 +1680,8 @@ const LayerState = struct {
             spec_alloc_fail_for_test = false;
             return error.ExpertSpecMapAlloc;
         }
+        const scope = mlx.engine.enter(s);
+        defer scope.end();
         const fresh = mlx.mlx_array_new_data(gpu.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
         if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
         errdefer _ = mlx.mlx_array_free(fresh);
@@ -1753,11 +1755,11 @@ fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, laye
         slabs[made] = if (!store.componentPresent(made) or spec.slot_bytes == 0)
             SlabOperand.absent()
         else if (spec.exl3 and spec.packed_n != 0)
-            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes, s)
         else if (spec.exl3)
-            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes, s)
         else
-            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes);
+            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes, s);
     }
     return slabs;
 }
@@ -1774,9 +1776,9 @@ fn createGroupedSlabs(allocator: std.mem.Allocator, layer: *const GroupedLayer, 
     while (made < n) : (made += 1) {
         const pi = made / 3;
         slabs[made] = if (made % 3 == 0)
-            try SlabOperand.createFlat(allocator, if (slots) |per_group| layer.trellisElems(pi, per_group) else elems.?[pi], .uint16, 2)
+            try SlabOperand.createFlat(allocator, if (slots) |per_group| layer.trellisElems(pi, per_group) else elems.?[pi], .uint16, 2, s)
         else
-            try SlabOperand.createShaped(allocator, rows, &.{@intCast(layer.pieceBytes(0, made) / 2)}, .float16, 2);
+            try SlabOperand.createShaped(allocator, rows, &.{@intCast(layer.pieceBytes(0, made) / 2)}, .float16, 2, s);
     }
     return slabs;
 }
@@ -2404,7 +2406,7 @@ pub const Engine = struct {
         if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
         const layer = &self.layers[layer_index];
         if (!layer.active or layer.grouped != null or layer.slabs.len != self.store.componentCount()) return null;
-        try layer.refreshSpec(self.allocator);
+        try layer.refreshSpec(self.allocator, self.s);
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
         return .{ .slots = layer.spec_slots, .raw = layer.spec_raw, .starved = layer.cache.swap_starved, .host = layer.spec_host, .operands = operands };
@@ -2427,7 +2429,7 @@ pub const Engine = struct {
         const layer = &self.layers[layer_index];
         const gl = layer.grouped orelse return null;
         if (!layer.active or layer.borrowed or layer.resident_map.ctx != null or layer.slabs.len != quant.component_count) return null;
-        try layer.refreshSpec(self.allocator);
+        try layer.refreshSpec(self.allocator, self.s);
         return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &gl.cache_ragged };
     }
 
@@ -2934,6 +2936,8 @@ pub const Engine = struct {
             slot.* = @as(i32, @intCast(gl.slot_base[g])) + local;
         }
         if (layer.resident_map.ctx != null) _ = mlx.mlx_array_free(layer.resident_map);
+        const scope = mlx.engine.enter(self.s);
+        defer scope.end();
         layer.resident_map = mlx.mlx_array_new_data(host.ptr, &[_]c_int{@intCast(host.len)}, 1, .int32);
     }
 
@@ -5659,14 +5663,16 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
     var first = try layer.cache.resolve(t.allocator, &.{ 0, 1 });
     defer first.deinit(t.allocator);
     markResolvedReady(&layer.cache, &first);
-    try layer.refreshSpec(t.allocator);
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    try layer.refreshSpec(t.allocator, s);
     var second = try layer.cache.resolve(t.allocator, &.{ 0, 2 });
     defer second.deinit(t.allocator);
     markResolvedReady(&layer.cache, &second);
     spec_alloc_fail_for_test = true;
-    try t.expectError(error.ExpertSpecMapAlloc, layer.refreshSpec(t.allocator));
+    try t.expectError(error.ExpertSpecMapAlloc, layer.refreshSpec(t.allocator, s));
     try t.expect(layer.spec_slots.ctx == null);
-    try layer.refreshSpec(t.allocator);
+    try layer.refreshSpec(t.allocator, s);
     const gpu = mlx.mlx_array_data_int32(layer.spec_slots).?;
     for (layer.spec_host, 0..) |host, e| try t.expectEqual(@max(host, 0), gpu[e]);
     try t.expectEqual(layer.cache.expert_to_slot[2], layer.spec_host[2]);
@@ -5725,11 +5731,36 @@ test "expert stream: a slab an engine pass bound is unmapped by its release, tho
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was;
-    var operand = try SlabOperand.createFlat(std.testing.allocator, 1 << 16, .float16, 2);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    var operand = try SlabOperand.createFlat(std.testing.allocator, 1 << 16, .float16, 2, gpu);
     const timeouts = slab_release_timeouts.load(.monotonic);
     var sum = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&sum, operand.array, operand.array, mlx.engine.stream()));
     _ = mlx.mlx_array_free(sum);
-    operand.destroy(std.testing.allocator, mlx.gpuStream());
+    operand.destroy(std.testing.allocator, gpu);
     try std.testing.expectEqual(timeouts, slab_release_timeouts.load(.monotonic));
+}
+
+test "expert stream: a slab made on the engine's stream is the engine's buffer over the slab's own bytes, and its release asks nothing of MLX" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const s = mlx.engine.stream();
+    const mapped = mlx.engine.mappedTotal();
+    var operand = try SlabOperand.createFlat(std.testing.allocator, 1 << 16, .float16, 2, s);
+    try std.testing.expectEqual(mapped + (2 << 16), mlx.engine.mappedTotal());
+    @memset(std.mem.bytesAsSlice(u16, operand.slotBytes(0)), 0x3c00);
+    var sum = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&sum, operand.array, operand.array, s));
+    try mlx.check(mlx.mlx_array_eval(sum));
+    try std.testing.expectEqual(@as(u16, 0x4000), mlx.mlx_array_data_uint16(sum).?[1]);
+    _ = mlx.mlx_array_free(sum);
+    const timeouts = slab_release_timeouts.load(.monotonic);
+    const calls = mlx.engine.mlxCalls();
+    operand.destroy(std.testing.allocator, s);
+    try std.testing.expectEqual(calls, mlx.engine.mlxCalls());
+    try std.testing.expectEqual(timeouts, slab_release_timeouts.load(.monotonic));
+    try std.testing.expectEqual(mapped, mlx.engine.mappedTotal());
 }

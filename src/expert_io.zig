@@ -973,6 +973,8 @@ fn dataPointerOf(array: mlx.mlx_array, dtype: mlx.mlx_dtype) ?*const anyopaque {
 
 pub const ImportOptions = struct {
     copy: bool = false,
+    /// The engine of our own wraps the bytes as its buffer, and MLX never sees them.
+    engine: bool = false,
 };
 
 pub fn importHostBytes(
@@ -989,6 +991,13 @@ pub fn importHostBytes(
         elements *= @intCast(d);
     }
     if (elements * try dtypeBytes(dtype) != bytes.len) return error.ImportShapeMismatch;
+    if (opts.engine) {
+        if (opts.copy) return error.ImportFailed;
+        const array = mlx.engine.wrapMapped(bytes.ptr, shape, dtype, @ptrCast(payload), payloadRelease);
+        if (array.ctx == null) return error.ImportFailed;
+        _ = aliased_imports.fetchAdd(1, .monotonic);
+        return .{ .array = array, .aliased = true, .data_ptr = @ptrCast(bytes.ptr), .host_ptr = @ptrCast(bytes.ptr) };
+    }
     const array = if (opts.copy)
         mlx.mlx_array_new_data(@ptrCast(bytes.ptr), shape.ptr, @intCast(shape.len), dtype)
     else

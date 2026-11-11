@@ -50,9 +50,15 @@ pub const Store = struct {
     };
 };
 
+/// What the engine refused last for a fill in flight: the bytes a dispatch of the pass binds, the range the fill is
+/// writing, and how many dispatches the dropped pass held. For the refusal's message.
+pub var refused_fill: struct { read: usize = 0, read_len: usize = 0, fill: usize = 0, fill_len: usize = 0, dispatches: u64 = 0 } = .{};
+
 /// What the pool refused last for its budget: the buffer wanted, what Metal held for the pool, what the tensors in use
 /// asked for, and the limit on the first of those. For the refusal's message.
 pub var refused_budget: struct { wanted: u64 = 0, held: u64 = 0, asked: u64 = 0, limit: u64 = 0 } = .{};
+
+const Range = struct { ptr: usize, len: usize };
 
 /// Gives back a mapping the engine wrapped. Called once, on the inference thread.
 pub const MappedRelease = *const fn (?*anyopaque) callconv(.c) void;
@@ -83,6 +89,16 @@ pub const Tensor = struct {
 
     pub fn nbytes(t: *const Tensor) usize {
         return t.size() * itemSize(t.dtype);
+    }
+
+    /// The bytes from the first element `t` reads to the end of the last, whatever its strides skip between them.
+    pub fn reach(t: *const Tensor) usize {
+        var last: usize = 0;
+        for (t.dims(), t.strides[0..t.ndim]) |n, stride| {
+            if (n == 0) return 0;
+            last += (@as(usize, @intCast(n)) - 1) * stride;
+        }
+        return (last + 1) * itemSize(t.dtype);
     }
 
     /// Whether an axis reads one element many times, as a broadcast does.
@@ -166,6 +182,9 @@ const State = struct {
     /// pass waits for the fence of each earlier pass, not yet run, that wrote a store it binds (MLX's rule).
     pass_binds: Stores = .empty,
     pass_writes: Stores = .empty,
+    /// The byte ranges the open pass binds of mappings the engine wraps: a slab's views share its one store, and a
+    /// host fill of one part of it must not refuse a pass that reads another (`refuseFillingReads`).
+    pass_mapped: std.ArrayList(Range) = .empty,
     writers: std.AutoHashMapUnmanaged(*Store, Flying) = .empty,
     /// The most `pool_bytes` may be (`budget`); null before the first budget.
     pool_limit: ?u64 = null,
@@ -868,6 +887,12 @@ pub fn bind(p: metal.Pass, t: *const Tensor, index: usize) void {
     };
     if (s.prev_out.contains(t.store)) s.needs_barrier = true;
     s.pass_binds.put(gpa, t.store, {}) catch @panic("engine: out of memory tracking a pass");
+    if (t.store.origin == .mapped) {
+        const range: Range = .{ .ptr = @intFromPtr(t.store.ptr) + t.offset, .len = t.reach() };
+        const n = s.pass_mapped.items.len;
+        if (n == 0 or !std.meta.eql(s.pass_mapped.items[n - 1], range))
+            s.pass_mapped.append(gpa, range) catch @panic("engine: out of memory tracking a pass");
+    }
     p.buffer(t.store.buffer, t.store.at + t.offset, index);
 }
 
@@ -1001,8 +1026,7 @@ fn commitPass(s: *State, open: metal.Pass) Error!void {
     var writes = s.pass_writes.keyIterator();
     while (writes.next()) |store| s.writers.put(gpa, store.*, flying) catch return error.OutOfMemory;
     open.updateFence(fence);
-    s.pass_binds.clearRetainingCapacity();
-    s.pass_writes.clearRetainingCapacity();
+    clearPassBinds(s);
     s.flying.append(gpa, .{ .cmd = open.commit(), .fence = fence, .seq = s.seq, .phase = phase, .kernels = kernels }) catch return error.OutOfMemory;
     s.stats.commit_ns += nowNs() - t0;
     s.seq += 1;
@@ -1014,16 +1038,34 @@ fn commitPass(s: *State, open: metal.Pass) Error!void {
 fn refuseFillingReads(s: *State, open: metal.Pass) Error!void {
     const marks = fill_marks.snapshot();
     var binds = s.pass_binds.keyIterator();
-    while (binds.next()) |store| {
-        if (!marks.meets(@intFromPtr(store.*.ptr), store.*.len)) continue;
-        open.discard();
-        clearHazards(s);
-        s.pass_binds.clearRetainingCapacity();
-        s.pass_writes.clearRetainingCapacity();
-        s.pass_kernels = .{};
-        s.pass_dispatches = 0;
-        return error.ReadsFillingSlab;
-    }
+    const read: Range, const mark: [2]usize = blk: {
+        for (s.pass_mapped.items) |range| if (marks.met(range.ptr, range.len)) |m| break :blk .{ range, m };
+        // An import is of one MLX array, so its store is the range it reads; a pool buffer is never a host fill's.
+        while (binds.next()) |store| if (store.*.origin == .mlx) {
+            const range: Range = .{ .ptr = @intFromPtr(store.*.ptr), .len = store.*.len };
+            if (marks.met(range.ptr, range.len)) |m| break :blk .{ range, m };
+        };
+        return;
+    };
+    refused_fill = .{ .read = read.ptr, .read_len = read.len, .fill = mark[0], .fill_len = mark[1] - mark[0], .dispatches = s.pass_dispatches };
+    open.discard();
+    clearHazards(s);
+    // The pass never runs, so nothing it bound waits for it: left at this pass, a freed buffer could not leave the pool
+    // until a later pass ran, and a request whose first buffer needs that room would be refused for good.
+    binds = s.pass_binds.keyIterator();
+    while (binds.next()) |store| if (store.*.seq == s.seq) {
+        store.*.seq = s.seq -| 1;
+    };
+    clearPassBinds(s);
+    s.pass_kernels = .{};
+    s.pass_dispatches = 0;
+    return error.ReadsFillingSlab;
+}
+
+fn clearPassBinds(s: *State) void {
+    s.pass_binds.clearRetainingCapacity();
+    s.pass_writes.clearRetainingCapacity();
+    s.pass_mapped.clearRetainingCapacity();
 }
 
 fn clearHazards(s: *State) void {

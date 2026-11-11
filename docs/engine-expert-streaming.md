@@ -14,7 +14,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 |---|---|
 | `src/expert_stream.zig` | `ExpertStore` spans, per-layer group-exact LRU + union bridge, zero-copy slabs, `GroupedLayer` (a rate-grouped layer's pools), `BudgetLedger` (`--ssd-budget-gb`), MTP refusal |
 | `src/expert_store.zig` | `QuantStore`: every routed bank of every layout as per-expert byte spans in the source shards, opened once per load from the safetensors index; `src/expert_quant.zig` re-exports it. EXL3/STQ key and span reading is `src/exl3/pack.zig`; the `--drop-expert` set it bills against is `src/expert_drop.zig` |
-| `src/expert_io.zig` | SSD→Metal I/O: F_NOCACHE positioned-read `FillPool`, `PageSlab` epoch leases, verified zero-copy `importSlab` |
+| `src/expert_io.zig` | SSD→Metal I/O: F_NOCACHE positioned-read `FillPool`, `PageSlab` epoch leases, verified zero-copy `importSlab` (MLX wraps the slab, or the engine of our own when the stream that asks is the engine's: [engine-own-forward](engine-own-forward.md)) |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab |
 | `src/glm5/glm5_stream.zig` | GLM's routed experts over the engine (BF16, FP8 or EXL3 slabs), the native teacher's capture budget |
 | `src/imatrix.zig` | imatrix capture on the streamed forward |
@@ -135,7 +135,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - **Dropped experts** (`--drop-expert n`, [dsv41-arch](dsv41-arch.md#drop-expert)): the plan, the ledger, the profile split, the per-group
   pools and the union bank count the kept experts only; a route that names a dropped id is `ExpertDropped`, and the warm skips them.
 - **Lending pools** (`Engine.borrowLayer`, `restoreLayer`, from `borrow_from` on): a whole rate-grouped layer's pool can be
-  released (its bank dropped, its slabs unmapped once MLX lets go; MLX's active bytes fall by the pool) and later
+  released (its bank dropped, its slabs unmapped once their holder lets go; the active bytes fall by the pool) and later
   rebuilt with the experts it held. A released layer's routes read every distinct pick into the union workspace and
   run on the union bank, the same bytes out. DeepSeek's STQ prefill borrows its decoder layers' pools for its working
   set ([dsv41-memory](dsv41-memory.md#borrow)); the engine publishes the bytes still lendable to

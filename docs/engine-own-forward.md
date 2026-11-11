@@ -33,9 +33,8 @@ open (only after a round failed): the MLX route's logits, byte for byte. An imag
 routing bias read row by row, the Engram write masked by row), whose pipelines a load with the image bias warms at
 every decode width and at a prefill width (`dsv41_model.warmOwnImages`).
 
-What a wide chunk still builds on MLX: the state rows it appends (`forwardCapMlx` bills them), the union workspace of a
-spilled route and the views of the slabs the engine imports (the slabs are MLX arrays over host pages), and the keep-alive
-op of MLX's queue.
+What a wide chunk still asks of MLX: the keep-alive op of MLX's queue. The slabs, their views and the union workspace
+of a spilled route are the engine's own on a Cooler load.
 
 A DSpark round's verdict, greedy or sampled, is decided on the engine wherever its verify ran there.
 
@@ -77,7 +76,11 @@ three-expert cache (`DSV41_STQ_TINY`) is the guard; a cache holding every expert
 The engine enforces the rule: a slab being filled is marked (`fill_marks`, set at `PageSlab.tryBeginFill`, cleared at
 `publish`), and `commitPass` drops a pass that binds any marked bytes and fails with `ReadsFillingSlab`. With no fill in
 flight the check is one atomic load per commit; with one (the prefetcher's) it is one lock and a compare per bound
-buffer.
+range. The bytes compared are the ones a bind reads: a slab the engine wraps is one store that all its views share, so
+a pass records the range of each view it binds (`pass_mapped`, `Tensor.reach`), and a fill of one part of a slab does
+not refuse a pass that reads another. A refused pass never runs, so the buffers it bound stop waiting for it
+(`refuseFillingReads` sets their last pass back by one): left waiting, a freed buffer could not leave the pool until a
+later pass ran, and a request whose first buffer needed that room was refused for good.
 
 The engine's wide chunk reads its experts group by group (`rate_groups.moePrefillSharedFusedStaged` and
 `moePrefillStaged`, beside the MLX arm's `...Early` functions, which are untouched; `StqStream.applyScored`):
@@ -100,8 +103,8 @@ gives every forward of the engine, decode-width or wide, the engine's share a re
 request with a Metal OOM, and the budget is lifted when the warm ends.
 
 A ranged route builds its bank on the engine once stage 0 has landed (`Engine.stageBank`, called through
-`FillStages.scales`): the union's slab views (`rate_groups.rowsView` slice and reshape) are engine ops over the MLX slab
-arrays, imported, and the scale concatenation (`concatAxis0`) is one dispatch that reads the landed scales. The old
+`FillStages.scales`): the union's slab views (`rate_groups.rowsView` slice and reshape) are engine ops over the slabs,
+and the scale concatenation (`concatAxis0`) is one dispatch that reads the landed scales. The old
 route and the MLX arm still build the bank at prepare time.
 
 ## The seam
@@ -137,14 +140,14 @@ route and the MLX arm still build the bank at prepare time.
   handle (`mlx_array_new`, `mlx_stream_new`, `mlx_device_new`, `mlx_string_new`, `mlx_device_info_new`) is a zero
   `ctx` made in Zig, no call. It cannot see MLX's own threads, work before the load, or the Metal objects MLX already
   made. Another file declaring an `mlx_*` extern fails the `mlx-extern` lint; an address of the library for `dladdr`
-  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 5497 calls,
+  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 22 calls,
   none of them for a kernel config (pinned in `dsv41_generate_test.zig`).
 - **What a Cooler request still asks of MLX is pinned phase by phase** (the census test in `dsv41_generate_test.zig`:
   the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore point captured and
   restored, a step after it, an image prompt, the unload). A change that adds a call fails it; a stage of the move off
   MLX lowers a row; the target of every row is zero. `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry
   point. A request puts no op on MLX, and a restore point is captured and restored with no call at all: a request's
-  calls are the engine importing arrays MLX owns.
+  calls are the token arrays its caller makes on MLX, imported once each, and frees of empty handles.
   A phase's ops are exact. Its calls are held under a ceiling and within a twentieth of it: the launches a request
   makes follow what the process ran before (a load whose pipelines exist skips its warm forwards and starts with
   other experts in its cache; a 12-token request read 7,336 dispatches as a process's only load and 7,017 after
@@ -198,10 +201,33 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   one lost set costs to wire again: macOS decides residency a set at a time. A set attached to no queue loses its
   residency within half a minute even with a standing request, and so does a queue that runs nothing: while the
   engine wraps mappings, the warm tick runs a four-byte pass on our queue too (`core.touch`, from `mlx.gpuTouch`).
-- **A slab is unmapped only after the engine has waited.** An import of a slab's array outlives the tensor that held it
-  until the engine next waits (`retired`), and `SlabOperand.destroy` gives MLX 32 tries, then leaves the slab mapped for
-  good. A borrow release now follows engine passes, so `destroy` closes the engine first (`mlx.engine.close()`, a no-op
-  while `enabled` is off, so no other architecture reaches it).
+- **A slab is unmapped only after the engine has waited.** A slab's buffer outlives the tensor that held it until the
+  last pass that binds it has run, and `SlabOperand.destroy` closes the engine first (`mlx.engine.close()`, a no-op
+  while `enabled` is off, so no other architecture reaches it). A slab MLX wraps gets 32 tries of MLX's wait, then
+  stays mapped for good; a slab the engine wraps is given back by the store's own release and asks MLX nothing.
+- **A Cooler load's expert slabs, slot maps and rate tables are the engine's** (`expert_io.importHostBytes` with
+  `ImportOptions.engine`, `SlabOperand.create*`, `LayerState.refreshSpec`, `rate_groups.metaTable`). The load gives the
+  expert stream the engine's stream, and what the stream makes follows the stream it holds: a slab is wrapped like a
+  weight (`core.wrapMapped`, counted in `mapped_bytes`, in our residency sets), its views are engine ops, and a map or
+  a table is a host array made under `engine.enter(s)`. On MLX's stream every one of them is MLX's, as before. On the
+  tiny STQ fixture a 12-token request fell from 19,532 calls into mlx-c to 146 and the load from 107,984 to 11,059,
+  with the same dispatches. Live (this change on 66f98656, STQ 1.75bpw, `--ssd-budget-gb 108`, M5 Max, fans at max,
+  GPU lock, one load a side against b5a0ee9b, same replies): a 20k-token prefill 697,799 calls to 42,877 at 126,611
+  dispatches against 125,610, and 1,335 tok/s against 650 to 855 on the earlier trees, because the host no longer
+  waits on an MLX evaluation of every slab view; decode tok/s unchanged; a new binary's load 30.9 s against 44.4 s.
+- **An array cached for the process belongs to one side** (`rate_groups.unitScore`): a constant made once and kept in
+  a global is MLX's or the engine's by whoever made it first, and the other side then imports or lends it at every
+  launch. A cached array is kept per side, chosen by the stream of the op that takes it.
+- **A route is a load's for its life**: no load mixes an MLX forward with the engine's weights or slabs. A test that
+  wants MLX's bytes loads the pack on the MLX route (`EngineFixture.openMlx`), takes them and closes it before the
+  Cooler load opens. One forward of the load's warm had stayed on MLX (the context chunk of `warmOwnBlocks`, 536 rows
+  on the 1.75bpw pack; the tiny fixture's geometry skips that step): with the slabs the engine's it built its bank on
+  the engine while its fill was in flight, the guard refused it and the whole warm was dropped, so every kernel
+  compiled inside the first requests. It runs on the engine now, and the order a wide route reads its fill in follows
+  the stream its chain is encoded on (`StqStream.applyScored`), not a scope flag a caller may not have set;
+  `StqStream.mlx_order_routes` counts the routes read in MLX's order, none on a Cooler load.
+- **A fill refusal names its bytes** (`core.refused_fill`): the message gives the pass's dispatches, the bytes one of
+  them binds and the range the fill is writing, which is what told a scale slab's first rows from a whole-slab fill.
 - **A thread never ends with a pass open** (`core.close`): Metal asserts when the thread's autorelease pool drains
   an encoder still open. A request's end, an unload and the inference loop's exit close it.
 - **A pass handed to an idle queue starts 60 to 70 us later, whatever the idle; one handed over behind a pass that
@@ -223,8 +249,8 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   hands over without a copy at one place, `model.wrapRegion`; there the engine wraps it (a no-copy Metal buffer of
   the tensor's bytes, in our residency sets) instead of MLX, and the load binds, slices and casts the weights on the
   engine's stream. The store gives the mapping back once the last pass that binds it has run, so an unload needs no
-  MLX wait; it is never written in place (`sole` is false). On the tiny STQ fixture a one-row step makes 1366 calls
-  into mlx-c (5497 with MLX's wraps) and a 12-token request 19,602 (94,508); live, STQ 1.75bpw, a request makes 3
+  MLX wait; it is never written in place (`sole` is false). On the tiny STQ fixture that took a one-row step from
+  5497 calls into mlx-c to 1366 and a 12-token request from 94,508 to 19,602; live, STQ 1.75bpw, a request made 3
   to 4 times fewer, with the same dispatches, waits and imports of slabs.
 - **A lend of a wrapped weight lasts one call** (`core.lendsOnce`). MLX counts and wires every buffer it wraps for as
   long as it holds it, and a tensor keeps the array a lend made (its twin): for a weight that was the whole load,

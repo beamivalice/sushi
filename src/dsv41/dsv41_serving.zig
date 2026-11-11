@@ -48,7 +48,10 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         if (dsv41.trunk_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, .pack);
     }
     mlx.engine.seal(false);
-    const engine = try Trunk.newExpertEngine(allocator, &config, s);
+    // A Cooler load's weights and expert slabs are the engine's own buffers, bound, sliced and cast by the engine: an op
+    // on MLX's stream would take one as a second buffer over its pages.
+    const own_load = dsv41_borrow.ownDecode(&config.dsv41.?);
+    const engine = try Trunk.newExpertEngine(allocator, &config, if (own_load) mlx.engine.stream() else s);
     errdefer {
         engine.deinit();
         allocator.destroy(engine);
@@ -56,9 +59,6 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     var plan = beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
     // The load drops each tensor from the map once its arrays are bound.
-    // Weights the engine wraps are bound, sliced and cast by the engine: an op of the load on MLX's stream would take
-    // one as a second buffer over its pages.
-    const own_load = dsv41_borrow.ownDecode(&config.dsv41.?);
     mlx.engine.own_weights = own_load;
     defer mlx.engine.own_weights = false;
     if (own_load) mlx.engine.active = true;

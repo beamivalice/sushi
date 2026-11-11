@@ -48,8 +48,13 @@ pub const Snapshot = struct {
     n: usize = 0,
 
     pub fn meets(self: *const Snapshot, ptr: usize, len: usize) bool {
-        for (self.begin[0..self.n], self.end[0..self.n]) |b, e| if (ptr < e and b < ptr + len) return true;
-        return false;
+        return self.met(ptr, len) != null;
+    }
+
+    /// The first marked range that `len` bytes at `ptr` touch: its first byte and the one past its last.
+    pub fn met(self: *const Snapshot, ptr: usize, len: usize) ?[2]usize {
+        for (self.begin[0..self.n], self.end[0..self.n]) |b, e| if (ptr < e and b < ptr + len) return .{ b, e };
+        return null;
     }
 };
 

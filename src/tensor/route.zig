@@ -46,8 +46,8 @@ pub const Scope = struct {
     }
 };
 
-/// Whether a load's mapped weights are wrapped by the engine instead of MLX (`model.wrapRegion`). TEMPORARY, off until
-/// no forward of an engine load runs on MLX's side: a weight of the engine's lent to MLX is wired a second time.
+/// Whether a load's mapped weights are wrapped by the engine instead of MLX (`model.wrapRegion`). Set for the span of
+/// a load that runs every forward on the engine: a weight of the engine's lent to MLX is wired a second time.
 pub var own_weights: bool = false;
 
 /// The mapping at `ptr` as a tensor of the engine's (`core.wrapMapped`); a null handle, the reason latched, when it
@@ -158,6 +158,7 @@ fn fail(comptime what: []const u8, e: anyerror) c_int {
         error.ThreadGroupTooLarge => std.fmt.bufPrintSentinel(&buf, "[engine] Thread group size ({d}) is greater than the maximum allowed threads per threadgroup ({d}).", .{ kernel.refused_threads, kernel.refused_limit }, 0),
         error.MetalCompile, error.MetalCommand, error.MetalBuffer => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: {s}: {s}", .{ what, @errorName(e), said[0..@min(said.len, 400)] }, 0),
         error.PoolOverBudget => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: PoolOverBudget: a buffer of {d} KB with {d} MB held for the pool, {d} MB of it asked by tensors in use, under a limit of {d} MB", .{ what, core.refused_budget.wanted >> 10, core.refused_budget.held >> 20, core.refused_budget.asked >> 20, core.refused_budget.limit >> 20 }, 0),
+        error.ReadsFillingSlab => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: ReadsFillingSlab: a pass of {d} dispatches binds {d} bytes at 0x{x} while a fill writes {d} bytes at 0x{x}", .{ what, core.refused_fill.dispatches, core.refused_fill.read_len, core.refused_fill.read, core.refused_fill.fill_len, core.refused_fill.fill }, 0),
         else => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: {s}", .{ what, @errorName(e) }, 0),
     } catch "[engine] error";
     mlx.latchError(msg);
@@ -1712,6 +1713,71 @@ test "a mapped region the engine wraps is bound by a pass without a copy or a ca
     try t_std.expectEqual(calls, mlx.calls.load(.monotonic));
     // Its residency set has been told: a set that still lists the buffer would keep the pages wired with no pass to come.
     try t_std.expect(!@import("../metal.zig").residentDirty());
+}
+
+test "a pass that binds the landed half of a wrapped slab runs while the other half fills; one that binds the filling half is refused and leaves the pool its buffers" {
+    try mlx.requireGpu();
+    const fill_marks = @import("../fill_marks.zig");
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const Region = struct {
+        fn release(payload: ?*anyopaque) callconv(.c) void {
+            const span: *const [2]usize = @ptrCast(@alignCast(payload.?));
+            _ = std.c.munmap(@ptrFromInt(span[0]), span[1]);
+        }
+    };
+    const len = 2 * std.heap.pageSize();
+    const n: c_int = @intCast(len / 4);
+    const mapped = std.c.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    try t_std.expect(mapped != std.c.MAP_FAILED);
+    const ptr: [*]u8 = @ptrCast(mapped);
+    const values: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ptr[0..len]));
+    for (values, 0..) |*v, i| v.* = @floatFromInt(i);
+    var span = [2]usize{ @intFromPtr(ptr), len };
+    const slab = core.handle(try core.wrapMapped(ptr, .float32, &.{n}, &span, Region.release));
+    defer _ = mlx.mlx_array_free(slab);
+    const s = core.stream();
+    const half = @divExact(n, 2);
+    var halves: [2]A = .{ .{}, .{} };
+    defer for (halves) |h| {
+        _ = mlx.mlx_array_free(h);
+    };
+    for (&halves, 0..) |*h, i| {
+        const from: c_int = @intCast(i * @as(usize, @intCast(half)));
+        try mlx.check(mlx.mlx_slice(h, slab, &[_]c_int{from}, 1, &[_]c_int{from + half}, 1, &[_]c_int{1}, 1, s));
+    }
+    fill_marks.add(@intFromPtr(ptr) + len / 2, len / 2);
+    {
+        var sum: A = .{};
+        defer _ = mlx.mlx_array_free(sum);
+        try mlx.check(mlx.mlx_add(&sum, halves[0], halves[0], s));
+        try mlx.check(mlx.mlx_array_eval(sum));
+        try t_std.expectEqual(@as(f32, 6), mlx.mlx_array_data_float32(sum).?[3]);
+    }
+    // A later test sees no limit.
+    defer core.budget(1 << 62) catch {};
+    try core.budget(0);
+    const held = core.stats().pool_bytes;
+    try core.budget(1 << 62);
+    {
+        var sum: A = .{};
+        defer _ = mlx.mlx_array_free(sum);
+        const built = mlx.mlx_add(&sum, halves[1], halves[1], s);
+        try t_std.expect(built != 0 or mlx.mlx_array_eval(sum) != 0);
+        var said: [256]u8 = undefined;
+        try t_std.expect(std.mem.indexOf(u8, mlx.takeError(&said) orelse "", "ReadsFillingSlab") != null);
+    }
+    // The refused pass never ran, so what it bound waits for no pass: a cap with nothing to spare gets its buffers back.
+    try core.budget(0);
+    try t_std.expectEqual(held, core.stats().pool_bytes);
+    try core.budget(1 << 62);
+    fill_marks.remove(@intFromPtr(ptr) + len / 2);
+    var sum: A = .{};
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, halves[1], halves[1], s));
+    try mlx.check(mlx.mlx_array_eval(sum));
+    try t_std.expectEqual(@as(f32, @floatFromInt(2 * (half + 3))), mlx.mlx_array_data_float32(sum).?[3]);
 }
 
 test "configs made and freed in turn launch the pipeline of their own template value" {

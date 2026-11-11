@@ -163,6 +163,8 @@ pub const StqStream = struct {
     stall_ns: u64 = 0,
     /// Test only: stage the fill on the engine too, which the engine refuses.
     stage_on_engine: bool = false,
+    /// Wide routes read in MLX's order, the whole fill behind one lazy chain: none on a load whose chain is the engine's.
+    mlx_order_routes: u64 = 0,
     /// A settle's picks as expert ids, and the slots they resolved to: kept between settles.
     picks: std.ArrayList(u16) = .empty,
     slots: std.ArrayList(i32) = .empty,
@@ -355,11 +357,14 @@ pub const StqStream = struct {
         // The engine encodes each op into its open pass as it is called, and a rate group's start hands over that whole
         // pass, groups not yet filled included; MLX evaluates only the planes it is asked for. So the engine's chain reads
         // the fill group by group (`ranged`), encoding a group's GEMMs only once it has landed.
-        const staged = wide and self.overlap and (!mlx.engine.active or self.stage_on_engine);
-        const ranged = wide and self.overlap and mlx.engine.active and !self.stage_on_engine;
-        // The union's slab views are MLX's own arrays, made on MLX's stream; the engine imports them when a kernel reads them.
+        // Which order follows the stream the chain is encoded on, whoever calls: a load's warm runs outside a request's scope.
+        const on_engine = mlx.engine.isStream(sc.s);
+        const staged = wide and self.overlap and (!on_engine or self.stage_on_engine);
+        const ranged = wide and self.overlap and on_engine and !self.stage_on_engine;
+        self.mlx_order_routes += @intFromBool(staged);
+        // Slab views an MLX-stream expert engine makes are MLX's own arrays; the engine imports them when a kernel reads them.
         const own = mlx.engine.active;
-        if (wide) mlx.engine.active = false;
+        if (wide and !mlx.engine.isStream(self.engine.s)) mlx.engine.active = false;
         var prepared = (if (ranged) self.engine.prepareHostStagedRanged(@intCast(layer), host) else if (staged) self.engine.prepareHostStaged(@intCast(layer), host) else if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host)) catch |e| {
             mlx.engine.active = own;
             return e;

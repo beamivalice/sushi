@@ -122,7 +122,7 @@ MLX appends, the rest for the engine's pool), so the bill of a chunk is the one 
 
 The live headroom the borrow reads (`dsv41Headroom`) is the ceiling less `gpu_mem.activeBytes`, which holds the
 engine's pool buffers bound to live tensors (the state rows, window rings and rollback record) beside MLX's active
-bytes, and the weights, which a Cooler load's engine wraps itself; the ceiling's footprint adds
+bytes, and the weights and expert slabs, which a Cooler load's engine wraps itself; the ceiling's footprint adds
 `gpu_mem.cacheBytes`, which holds the engine's free buffers. The headroom also
 takes off the engine's free buffers (`engine.poolFree`): MLX makes what a borrow frees room for, and nothing on MLX's
 side can reclaim a buffer the engine holds. The cap bills the pool's growth over its tensors in use; the live read
@@ -249,8 +249,8 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the
   pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released, and the live headroom is re-read after each
   release (a short count takes the next pool too).
-- A release drops the layer's bank, waits for MLX to let go of each slab and unmaps it: MLX's active count falls by
-  exactly the pool's bytes (tested), and the forward waits up to 1 s for 90% of them to leave the wired set.
+- A release drops the layer's bank, waits for the slabs' holder to let go of each (MLX, or on a Cooler load the
+  engine, whose own wait is enough) and unmaps it: the active count falls by exactly the pool's bytes (tested), and the forward waits up to 1 s for 90% of them to leave the wired set.
 - Under CED a decoder layer runs only the chunk's last 128 rows, so a released layer reads that chunk's picks (~130
   experts of ~8.1 MB, ~1.06 GB) into the union workspace, which stays resident, and the union bank serves them.
   Same bytes out as with a pool (tested on the tiny STQ pack, prefill and decode). Against a pool's ~30% misses that

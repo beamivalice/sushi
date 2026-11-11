@@ -2962,7 +2962,12 @@ fn warmOwnBlocks(m: *Model, t1: u32) !void {
     const ctx = try m.gpa.alloc(u32, rows);
     defer m.gpa.free(ctx);
     for (ctx, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % c.vocab);
-    try warmRun(try extend(m, ctx, .last));
+    // The context is a prefill chunk: the engine's where prefill is, as in a request.
+    const was = if (m.engine_prefill) ownBegin(m) else m.s;
+    warmBudget(m, rows);
+    const chunk = extend(m, ctx, .last);
+    if (m.engine_prefill) ownEnd(m, was);
+    try warmRun(try chunk);
     // The indexer's kernels are the same under either schedule of the routed chains.
     try warmOwn(m, t1, .queued);
 }
