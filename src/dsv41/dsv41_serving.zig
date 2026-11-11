@@ -56,6 +56,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     errdefer mdl.deinit();
     dsv41_model.logMemory(mdl);
     mdl.engine_decode = own_decode;
+    if (own_decode) try dsv41_model.pinWeights(mdl);
     const side: dsv41_borrow.DecodeSide = if (own_decode) .engine else dsv41_borrow.decodeSideOf(&config.dsv41.?);
     if (own_decode or side != .engine) log.info("{s}\n", .{dsv41_borrow.decodeLine(side)});
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));

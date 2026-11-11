@@ -65,6 +65,13 @@ patch in), two sessions on 90c83d71 and 537e8e91. Engine: two runs of this chang
 - A kernel config is always MLX's, mirrored for the engine as it is filled: a module keeps the configs it builds, and
   one made inside a forward of ours is launched on MLX's side later. A mirror that cannot hold a config refuses the
   launch by name.
+- **A launch finds its pipeline without building the instance key** (`[engine] since load:` counts the keys built;
+  a decode forward, a draft and a verify round build none once they have run). Two layers: a mirrored config that
+  outlives its launch remembers its last pipeline (`Config.last`; cleared by `addOutput` and `addTemplate`, checked
+  against the kernel's never-reused id and the inputs' dtypes and passing), and each kernel keeps its last 16
+  instantiations, compared field by field (template values, output dtypes, input signature), for the configs the
+  DeepSeek kernels make anew on every launch. A launch with more than 16 template arguments takes the key every
+  time. A new way to change a mirrored config must clear `last` too.
 
 ## Crossing between the two
 
@@ -78,6 +85,12 @@ patch in), two sessions on 90c83d71 and 537e8e91. Engine: two runs of this chang
   (`core.sole`), else into a copy. For bytes MLX made the test is MLX's own rule for writing in place
   (`_mlx_array_is_donatable`): the handle is the only holder of the array and of its buffer, a command buffer of
   MLX's still in flight counted. A write never goes through a broadcast axis.
+- **A weight's import is kept** (`core.pin`): a forward imports the same load-time arrays every time, so the load pins
+  them (`dsv41_model.pinWeights`: the arrays the model made or took, a named set, never a guess) and an import of an
+  array with the same bytes and layout shares that store (`imports_held` in `[engine] since load:`; `imports` counts
+  the builds). Only an array no one writes may be pinned: a held store has two holders, so every in-place append into
+  it copies (`sole`). A state (window ring, compressed or index rows, pending groups) and the streamed experts' slabs
+  are never pinned. The model unpins before it frees its arrays: the held import keeps the array, and its memory.
 - **MLX's queue is kept in use while decode runs on ours** (`dsv41_serving.keepMlxQueue`). The driver drops the
   resident set of a queue left unused for about a second, and the next MLX submission then waits before any work
   runs: a request's end (the commit's first MLX eval) took 0.56 to 0.77 s, a 2 s gap between MLX ops 0.55 s, a

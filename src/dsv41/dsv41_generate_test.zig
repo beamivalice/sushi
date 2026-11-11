@@ -1179,6 +1179,52 @@ fn engineDecodeProof(dir: []const u8, stq: bool) !void {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(got.logits.items));
 }
 
+fn pinnedDecodeProof(dir: []const u8) !void {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dsv41_model = @import("dsv41_model.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const xfm = &fx.xfm;
+    const m = dsv41_state.modelOf(xfm).?;
+    try testing.expect(m.engine_decode);
+    // A load whose decode is on the engine holds its weights' imports.
+    try testing.expect(mlx.engine.pinnedCount() > 0);
+    const prompt = fx.ids[0..30];
+    const steps: usize = 12;
+    m.engine_decode = false;
+    var want = try lazyHeadSteps(a, xfm, prompt, steps, false);
+    defer want.deinit(a);
+    m.engine_decode = true;
+
+    dsv41_model.unpinWeights(m);
+    try testing.expectEqual(@as(usize, 0), mlx.engine.pinnedCount());
+    const b0 = mlx.engine.stats();
+    var loose = try lazyHeadSteps(a, xfm, prompt, steps, false);
+    defer loose.deinit(a);
+    const b1 = mlx.engine.stats();
+    try dsv41_model.pinWeights(m);
+    const b2 = mlx.engine.stats();
+    var held = try lazyHeadSteps(a, xfm, prompt, steps, false);
+    defer held.deinit(a);
+    const b3 = mlx.engine.stats();
+
+    try testing.expectEqualSlices(u32, want.tokens.items, held.tokens.items);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(held.logits.items));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(loose.logits.items), std.mem.sliceAsBytes(held.logits.items));
+    try testing.expectEqual(b1.dispatches - b0.dispatches, b3.dispatches - b2.dispatches);
+    try testing.expectEqual(b0.imports_held, b1.imports_held);
+    // What stays imported is not a weight: the streamed experts' slabs and the request's tokens.
+    try testing.expect((b3.imports - b2.imports) * 3 < b1.imports - b0.imports);
+    try testing.expectEqual(b1.imports - b0.imports, (b3.imports - b2.imports) + (b3.imports_held - b2.imports_held));
+}
+
+test "dsv41 engine: held weight imports give a one-row decode MLX's bytes with a fraction of its imports, and a freed model holds none (DSV41_STQ_TINY)" {
+    try pinnedDecodeProof(std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest));
+    try testing.expectEqual(@as(usize, 0), mlx.engine.pinnedCount());
+}
+
 /// Every byte `rounds` DSpark rounds hand the generator: each draft's ids and confidences, then the logits of its
 /// verify, whose width walks from one row to the widest verify and around.
 fn dsparkRoundBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, rounds: usize) !std.ArrayList(u8) {
@@ -3103,4 +3149,41 @@ test "dsv41 generator: a DFlash round is refused by name, not asserted (DSV41_TI
     var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, .{});
     defer g.deinit(a);
     try testing.expectError(error.DrafterUnsupported, g.nextDflash(a));
+}
+
+test "dsv41 engine: a decode forward, a draft and a verify round of the same width build no kernel instance key once they have run (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const kn = @import("../tensor/kernel.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const xfm = &fx.xfm;
+    try xfm.resetCache();
+    var ctx = xfm.defaultCtx();
+    var lg = try forwardIds(xfm, &ctx, fx.ids[0..30]);
+    var tok = try argmaxHost(xfm, lg);
+    _ = mlx.mlx_array_free(lg);
+    var steady: [3]u64 = undefined;
+    // The first of each kind is the one that fills the kernels' memos; the key builds of the second are counted.
+    for (0..2) |round| {
+        const before = kn.key_builds;
+        lg = try forwardIds(xfm, &ctx, &.{tok});
+        tok = try argmaxHost(xfm, lg);
+        _ = mlx.mlx_array_free(lg);
+        steady[0] = kn.key_builds - before;
+        const draft_before = kn.key_builds;
+        var d = try dsv41_serving.dsv41DraftImpl(xfm, tok);
+        defer d.deinit();
+        steady[1] = kn.key_builds - draft_before;
+        const verify_before = kn.key_builds;
+        const logits = try dsv41_serving.dsv41VerifyImpl(xfm, &ctx, d.ids[0..4]);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+        steady[2] = kn.key_builds - verify_before;
+        try dsv41_serving.dsv41FinishImpl(xfm, &ctx, 1);
+        tok = d.ids[1];
+        _ = round;
+    }
+    try testing.expectEqual([3]u64{ 0, 0, 0 }, steady);
 }

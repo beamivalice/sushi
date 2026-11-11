@@ -43,6 +43,7 @@ pub fn typeName(d: Dtype) core.Error![]const u8 {
 }
 
 pub const max_outputs = 8;
+pub const max_inputs = 32;
 pub const max_template_args = 32;
 
 pub const TemplateValue = union(enum) { int: c_int, boolean: bool, dtype: Dtype };
@@ -65,8 +66,19 @@ pub const Config = struct {
     n_targs: usize = 0,
     /// A mirror that could not hold what its MLX config was given: a launch through it is refused.
     partial: bool = false,
+    /// The pipeline of the last launch, for a config that outlives its launch. The outputs and template values only
+    /// change through `addOutput` and `addTemplate`, which clear it; a launch checks the kernel and the inputs.
+    last: ?Last = null,
+
+    const Last = struct {
+        def: u64,
+        n_in: u8,
+        sig: [2 * max_inputs]u8,
+        pipeline: metal.Pipeline,
+    };
 
     pub fn addOutput(c: *Config, shape: []const c_int, dtype: Dtype) core.Error!void {
+        c.last = null;
         if (c.n_out == max_outputs or shape.len > core.max_dims) return error.TensorShape;
         @memcpy(c.out_shapes[c.n_out][0..shape.len], shape);
         c.out_ndims[c.n_out] = @intCast(shape.len);
@@ -75,6 +87,7 @@ pub const Config = struct {
     }
 
     pub fn addTemplate(c: *Config, name: []const u8, value: TemplateValue) core.Error!void {
+        c.last = null;
         if (c.n_targs == max_template_args or name.len > 48) return error.TensorShape;
         var arg: TemplateArg = .{ .value = value, .name_len = @intCast(name.len) };
         @memcpy(arg.name[0..name.len], name);
@@ -83,8 +96,46 @@ pub const Config = struct {
     }
 };
 
+const recent_slots = 16;
+/// A launch with more template arguments than a `Recent` holds takes the key every time.
+const recent_targs = 16;
+
+/// One instantiation as a launch states it, and its pipeline.
+const Recent = struct {
+    n_targs: u8,
+    targs: [recent_targs]TemplateArg,
+    n_out: u8,
+    out_dtypes: [max_outputs]Dtype,
+    n_in: u8,
+    /// Per input: its dtype and how it is passed.
+    sig: [2 * max_inputs]u8,
+    pipeline: metal.Pipeline,
+
+    fn answers(r: *const Recent, inputs: []const *Tensor, cfg: *const Config) bool {
+        if (r.n_targs != cfg.n_targs or r.n_out != cfg.n_out or r.n_in != inputs.len) return false;
+        for (r.targs[0..r.n_targs], cfg.targs[0..cfg.n_targs]) |a, b| {
+            if (a.name_len != b.name_len or !std.mem.eql(u8, a.name[0..a.name_len], b.name[0..b.name_len]) or !std.meta.eql(a.value, b.value)) return false;
+        }
+        if (!std.mem.eql(Dtype, r.out_dtypes[0..r.n_out], cfg.out_dtypes[0..cfg.n_out])) return false;
+        return sigMatches(&r.sig, inputs);
+    }
+
+    fn of(inputs: []const *Tensor, cfg: *const Config, pipeline: metal.Pipeline) Recent {
+        var r: Recent = .{ .n_targs = @intCast(cfg.n_targs), .targs = undefined, .n_out = @intCast(cfg.n_out), .out_dtypes = undefined, .n_in = @intCast(inputs.len), .sig = undefined, .pipeline = pipeline };
+        @memcpy(r.targs[0..cfg.n_targs], cfg.targs[0..cfg.n_targs]);
+        @memcpy(r.out_dtypes[0..cfg.n_out], cfg.out_dtypes[0..cfg.n_out]);
+        fillSig(&r.sig, inputs);
+        return r;
+    }
+};
+
+
+var next_def: u64 = 1;
+
 /// A kernel as its maker gave it.
 pub const Def = struct {
+    /// Never reused, so a config's `last` cannot answer for a kernel made at a freed one's address.
+    id: u64,
     name: []u8,
     inputs: [][]u8,
     outputs: [][]u8,
@@ -97,10 +148,15 @@ pub const Def = struct {
     /// The `[[attribute]]` parameters the source names, as signature lines.
     attributes: [][]const u8,
     instances: std.StringHashMapUnmanaged(metal.Pipeline) = .empty,
+    /// The instantiations launched last, compared field by field: a launch that finds its own skips the key.
+    recent: [recent_slots]Recent = undefined,
+    recent_count: u8 = 0,
+    recent_next: u8 = 0,
 
     pub fn create(name: []const u8, inputs: []const []const u8, outputs: []const []const u8, source: []const u8, header: []const u8, ensure_row_contiguous: bool, atomic_outputs: bool) !*Def {
         const d = try gpa.create(Def);
         d.* = .{
+            .id = next_def,
             .name = try gpa.dupe(u8, name),
             .inputs = try gpa.alloc([]u8, inputs.len),
             .outputs = try gpa.alloc([]u8, outputs.len),
@@ -126,6 +182,7 @@ pub const Def = struct {
             try attrs.append(gpa, try std.fmt.allocPrint(gpa, "  {s} {s} [[{s}]]", .{ a[1], a[0], a[0] }));
         }
         d.attributes = try attrs.toOwnedSlice(gpa);
+        next_def += 1;
         return d;
     }
 };
@@ -273,8 +330,48 @@ fn render(def: *const Def, name: []const u8, inputs: []const *Tensor, cfg: *cons
 
 threadlocal var key_buf: std.ArrayList(u8) = .empty;
 
+/// Instance keys built since the process began.
+pub var key_builds: u64 = 0;
+
 /// The pipeline of `def` at these inputs and this config, compiled at its first launch.
-fn pipelineOf(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pipeline {
+fn pipelineOf(def: *Def, inputs: []const *Tensor, cfg: *Config) !metal.Pipeline {
+    if (cfg.last) |*l| if (l.def == def.id and l.n_in == inputs.len and sigMatches(&l.sig, inputs)) return l.pipeline;
+    const pipeline = try pipelineByValue(def, inputs, cfg);
+    var last: Config.Last = .{ .def = def.id, .n_in = @intCast(inputs.len), .sig = undefined, .pipeline = pipeline };
+    fillSig(&last.sig, inputs);
+    cfg.last = last;
+    return pipeline;
+}
+
+fn sigMatches(sig: *const [2 * max_inputs]u8, inputs: []const *Tensor) bool {
+    for (inputs, 0..) |in, i| {
+        if (sig[2 * i] != @as(u8, @intCast(@intFromEnum(in.dtype))) or sig[2 * i + 1] != passing(in)) return false;
+    }
+    return true;
+}
+
+fn fillSig(sig: *[2 * max_inputs]u8, inputs: []const *Tensor) void {
+    for (inputs, 0..) |in, i| {
+        sig[2 * i] = @intCast(@intFromEnum(in.dtype));
+        sig[2 * i + 1] = passing(in);
+    }
+}
+
+/// `def`'s pipeline for a launch that no config remembers: one of the instantiations it launched last, else by key.
+fn pipelineByValue(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pipeline {
+    for (def.recent[0..def.recent_count]) |*r| if (r.answers(inputs, cfg)) return r.pipeline;
+    const pipeline = try instanceOf(def, inputs, cfg);
+    if (cfg.n_targs <= recent_targs) {
+        const slot = def.recent_next;
+        def.recent[slot] = Recent.of(inputs, cfg, pipeline);
+        def.recent_count = @max(def.recent_count, slot + 1);
+        def.recent_next = (slot + 1) % recent_slots;
+    }
+    return pipeline;
+}
+
+fn instanceOf(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pipeline {
+    key_builds += 1;
     key_buf.clearRetainingCapacity();
     for (cfg.targs[0..cfg.n_targs]) |arg| {
         try key_buf.appendSlice(gpa, arg.name[0..arg.name_len]);
@@ -313,12 +410,12 @@ pub var refused_limit: usize = 0;
 pub var refused_threads: usize = 0;
 
 /// Runs `def` on `inputs` into fresh tensors written to `outputs` (one per output of `cfg`), which the caller owns.
-pub fn launch(def: *Def, inputs: []const *Tensor, cfg: *const Config, outputs: []*Tensor) LaunchError!void {
+pub fn launch(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor) LaunchError!void {
     if (inputs.len != def.inputs.len or cfg.n_out != def.outputs.len or outputs.len != cfg.n_out) return error.TensorShape;
 
     // A kernel that asks for row-contiguous inputs gets a copy of each input that is not.
-    var bound: [32]*Tensor = undefined;
-    var copied: [32]bool = @splat(false);
+    var bound: [max_inputs]*Tensor = undefined;
+    var copied: [max_inputs]bool = @splat(false);
     if (inputs.len > bound.len) return error.TensorShape;
     var n_bound: usize = 0;
     defer for (bound[0..n_bound], copied[0..n_bound]) |t, c| {
@@ -382,4 +479,150 @@ pub fn launch(def: *Def, inputs: []const *Tensor, cfg: *const Config, outputs: [
         .y = @min(@as(usize, @intCast(cfg.group[1])), grid.y),
         .z = @min(@as(usize, @intCast(cfg.group[2])), grid.z),
     });
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+const mlx = @import("../mlx.zig");
+
+fn floats(vals: []const f32) !*Tensor {
+    return core.fromHost(std.mem.sliceAsBytes(vals), .float32, &.{@intCast(vals.len)});
+}
+
+fn ints(vals: []const i32) !*Tensor {
+    return core.fromHost(std.mem.sliceAsBytes(vals), .int32, &.{@intCast(vals.len)});
+}
+
+fn oneOutput(cfg: *Config, n: c_int) !void {
+    try cfg.addOutput(&.{n}, .float32);
+    cfg.grid = .{ n, 1, 1 };
+    cfg.group = .{ n, 1, 1 };
+}
+
+/// Launches `def` on `x` and returns the output's four floats.
+fn run(def: *Def, x: *Tensor, cfg: *Config) ![4]f32 {
+    var out: [1]*Tensor = undefined;
+    try launch(def, &.{x}, cfg, &out);
+    defer core.release(out[0]);
+    return std.mem.bytesAsSlice(f32, try core.hostBytes(out[0]))[0..4].*;
+}
+
+test "kernel: a repeated launch builds no instance key, whether its config is kept or made anew" {
+    try mlx.requireGpu();
+    const def = try Def.create("kn_memo_same", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f;", "", true, false);
+    const x = try floats(&.{ 1, 2, 3, 4 });
+    defer core.release(x);
+    var cfg: Config = .{};
+    try oneOutput(&cfg, 4);
+    const before = key_builds;
+    const made = core.pipelines;
+    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(def, x, &cfg));
+    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(def, x, &cfg));
+    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(def, x, &cfg));
+    try testing.expectEqual(before + 1, key_builds);
+    try testing.expectEqual(made + 1, core.pipelines);
+
+    // A config made anew for each launch, as the DeepSeek kernels do, answers the same way.
+    const fresh_before = key_builds;
+    for (0..3) |_| {
+        var again: Config = .{};
+        try oneOutput(&again, 4);
+        try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(def, x, &again));
+    }
+    try testing.expectEqual(fresh_before, key_builds);
+    try testing.expectEqual(made + 1, core.pipelines);
+}
+
+test "kernel: a changed input dtype launches the pipeline of that dtype" {
+    try mlx.requireGpu();
+    const def = try Def.create("kn_memo_dtype", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 3;", "", true, false);
+    const xf = try floats(&.{ 1, 2, 3, 4 });
+    defer core.release(xf);
+    const xi = try ints(&.{ 10, 20, 30, 40 });
+    defer core.release(xi);
+    var cfg: Config = .{};
+    try oneOutput(&cfg, 4);
+    try testing.expectEqual([4]f32{ 3, 6, 9, 12 }, try run(def, xf, &cfg));
+    const made = core.pipelines;
+    const keys = key_builds;
+    try testing.expectEqual([4]f32{ 30, 60, 90, 120 }, try run(def, xi, &cfg));
+    try testing.expectEqual(made + 1, core.pipelines);
+    try testing.expectEqual(keys + 1, key_builds);
+    try testing.expectEqual([4]f32{ 3, 6, 9, 12 }, try run(def, xf, &cfg));
+    try testing.expectEqual(made + 1, core.pipelines);
+    try testing.expectEqual(keys + 1, key_builds);
+}
+
+test "kernel: two kernels launched in turn through one config each take their own pipeline" {
+    try mlx.requireGpu();
+    const twice = try Def.create("kn_memo_twice", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f;", "", true, false);
+    const thrice = try Def.create("kn_memo_thrice", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 3.0f;", "", true, false);
+    const x = try floats(&.{ 1, 2, 3, 4 });
+    defer core.release(x);
+    var cfg: Config = .{};
+    try oneOutput(&cfg, 4);
+    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(twice, x, &cfg));
+    try testing.expectEqual([4]f32{ 3, 6, 9, 12 }, try run(thrice, x, &cfg));
+    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(twice, x, &cfg));
+}
+
+test "kernel: a template value added to a launched config changes the pipeline the next launch takes" {
+    try mlx.requireGpu();
+    const source = "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);";
+    const def = try Def.create("kn_memo_template", &.{"x"}, &.{"out"}, source, "", true, false);
+    const x = try floats(&.{ 1, 2, 3, 4 });
+    defer core.release(x);
+    var cfg: Config = .{};
+    try oneOutput(&cfg, 4);
+    try cfg.addTemplate("K", .{ .int = 5 });
+    try testing.expectEqual([4]f32{ 6, 7, 8, 9 }, try run(def, x, &cfg));
+    const made = core.pipelines;
+    try cfg.addTemplate("L", .{ .int = 1 });
+    try testing.expectEqual([4]f32{ 6, 7, 8, 9 }, try run(def, x, &cfg));
+    try testing.expectEqual(made + 1, core.pipelines);
+
+    // Two configs of one kernel at different values keep their own pipelines.
+    var other: Config = .{};
+    try oneOutput(&other, 4);
+    try other.addTemplate("K", .{ .int = 9 });
+    try testing.expectEqual([4]f32{ 10, 11, 12, 13 }, try run(def, x, &other));
+    try testing.expectEqual([4]f32{ 6, 7, 8, 9 }, try run(def, x, &cfg));
+    try testing.expectEqual([4]f32{ 10, 11, 12, 13 }, try run(def, x, &other));
+}
+
+test "kernel: more instantiations than a kernel remembers each launch their own pipeline" {
+    try mlx.requireGpu();
+    const def = try Def.create("kn_recent_many", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
+    const x = try floats(&.{ 1, 2, 3, 4 });
+    defer core.release(x);
+    for (0..2) |_| for (0..recent_slots + 4) |k| {
+        var cfg: Config = .{};
+        try oneOutput(&cfg, 4);
+        try cfg.addTemplate("K", .{ .int = @intCast(k) });
+        const add: f32 = @floatFromInt(k);
+        try testing.expectEqual([4]f32{ 1 + add, 2 + add, 3 + add, 4 + add }, try run(def, x, &cfg));
+    };
+}
+
+test "kernel: a launch with more template arguments than a kernel remembers builds its key each time and launches right" {
+    try mlx.requireGpu();
+    const wide = recent_targs + 1;
+    const sum = comptime blk: {
+        var text: []const u8 = "float(0";
+        for (0..wide) |i| text = text ++ std.fmt.comptimePrint(" + A{d}", .{i});
+        break :blk text ++ ")";
+    };
+    const def = try Def.create("kn_recent_wide", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + " ++ sum ++ ";", "", true, false);
+    const x = try floats(&.{ 1, 2, 3, 4 });
+    defer core.release(x);
+    const want: f32 = wide;
+    const before = key_builds;
+    for (0..2) |_| {
+        var cfg: Config = .{};
+        try oneOutput(&cfg, 4);
+        inline for (0..wide) |i| try cfg.addTemplate(std.fmt.comptimePrint("A{d}", .{i}), .{ .int = 1 });
+        try testing.expectEqual([4]f32{ 1 + want, 2 + want, 3 + want, 4 + want }, try run(def, x, &cfg));
+    }
+    try testing.expectEqual(before + 2, key_builds);
 }

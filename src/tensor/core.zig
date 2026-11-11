@@ -200,8 +200,9 @@ pub const Stats = struct {
     gpu_gap_sum: [4]u64 = @splat(0),
     /// The pauses by the phase of the pass that ended them.
     gpu_gap_phase: [phases]u64 = @splat(0),
-    /// MLX arrays read by an op of ours.
+    /// MLX arrays read by an op of ours, and the reads a held import answered (`pin`).
     imports: u64 = 0,
+    imports_held: u64 = 0,
     /// Tensors handed to MLX as arrays over their own bytes.
     lends: u64 = 0,
     /// Slice updates written into the base's bytes, and those that had to copy the base first.
@@ -620,16 +621,25 @@ pub fn release(t: *Tensor) void {
 
 /// A tensor over the memory of an MLX array, evaluated here if it was not; no copy. A pass of ours binds MLX's own
 /// Metal buffer, so the memory is wired once. A strided view keeps its strides. The store keeps the array, and
-/// with it the buffer, until every pass that binds it has run.
+/// with it the buffer, until every pass that binds it has run. An array held by `pin` answers with the store it
+/// was imported into.
 pub fn import(a: mlx.mlx_array) Error!*Tensor {
     const s = try st();
     var available = false;
     try mlx.check(mlx._mlx_array_is_available(&available, a));
     if (!available) try mlx.check(mlx.rawArrayEval(a));
+    const ptr: [*]u8 = @constCast(mlx.mlx_array_data_uint8(a) orelse return error.NotEvaluated);
+    if (pinned.count() > 0) if (pinKey(a, ptr)) |key| if (pinned.get(key)) |held| {
+        s.stats.imports_held += 1;
+        return share(held);
+    };
+    return importFresh(s, a, ptr);
+}
+
+fn importFresh(s: *State, a: mlx.mlx_array, ptr: [*]u8) Error!*Tensor {
     var raw: ?*anyopaque = null;
     var at: usize = 0;
     try mlx.check(mlx._mlx_array_metal_buffer(&raw, &at, a));
-    const ptr: [*]u8 = @constCast(mlx.mlx_array_data_uint8(a) orelse return error.NotEvaluated);
     const dtype = mlx.mlx_array_dtype(a);
     const t = try box();
     errdefer s.boxes.append(gpa, t) catch gpa.destroy(t);
@@ -646,6 +656,77 @@ pub fn import(a: mlx.mlx_array) Error!*Tensor {
     t.store = store;
     s.stats.imports += 1;
     return t;
+}
+
+// ── Held imports ──
+
+/// An array as a pass binds it: its bytes and the layout it reads them in.
+const PinKey = struct {
+    ptr: usize,
+    dtype: Dtype,
+    ndim: u8,
+    shape: [max_dims]c_int,
+    strides: [max_dims]usize,
+};
+
+const PinContext = struct {
+    pub fn hash(_: PinContext, k: PinKey) u64 {
+        return (k.ptr >> 4) *% 0x9E3779B97F4A7C15;
+    }
+
+    pub fn eql(_: PinContext, a: PinKey, b: PinKey) bool {
+        return a.ptr == b.ptr and a.dtype == b.dtype and a.ndim == b.ndim and
+            std.mem.eql(c_int, a.shape[0..a.ndim], b.shape[0..b.ndim]) and
+            std.mem.eql(usize, a.strides[0..a.ndim], b.strides[0..b.ndim]);
+    }
+};
+
+/// The import of each array the engine was told is immutable, kept until `unpin`.
+var pinned: std.HashMapUnmanaged(PinKey, *Tensor, PinContext, 80) = .empty;
+
+fn pinKey(a: mlx.mlx_array, ptr: [*]u8) ?PinKey {
+    const shape = mlx.getShape(a);
+    if (shape.len > max_dims) return null;
+    const strides = mlx.mlx_array_strides(a);
+    var key: PinKey = .{ .ptr = @intFromPtr(ptr), .dtype = mlx.mlx_array_dtype(a), .ndim = @intCast(shape.len), .shape = @splat(0), .strides = @splat(0) };
+    for (shape, 0..) |d, axis| {
+        key.shape[axis] = d;
+        key.strides[axis] = strides[axis];
+    }
+    return key;
+}
+
+/// Keeps the import of `a`, so that every later import of an array with the same bytes and layout shares its store
+/// instead of building another. Only an array no one writes may be pinned: a held store has more than one holder,
+/// which makes every in-place append into it copy (`sole`). A weight is such an array; a state is not.
+pub fn pin(a: mlx.mlx_array) Error!void {
+    if (isOurs(a)) return error.TensorUnsupported;
+    const s = try st();
+    var available = false;
+    try mlx.check(mlx._mlx_array_is_available(&available, a));
+    if (!available) try mlx.check(mlx.rawArrayEval(a));
+    const ptr: [*]u8 = @constCast(mlx.mlx_array_data_uint8(a) orelse return error.NotEvaluated);
+    const key = pinKey(a, ptr) orelse return error.TensorShape;
+    if (pinned.contains(key)) return;
+    const t = try importFresh(s, a, ptr);
+    errdefer release(t);
+    try pinned.put(gpa, key, t);
+}
+
+/// Drops the hold `pin` made on `a`. It goes before the array is freed: the held import keeps the array, and with
+/// it the memory it lives in.
+pub fn unpin(a: mlx.mlx_array) void {
+    const s = &(state orelse return);
+    const ptr: [*]u8 = @constCast(mlx.mlx_array_data_uint8(a) orelse return);
+    const key = pinKey(a, ptr) orelse return;
+    const held = (pinned.fetchRemove(key) orelse return).value;
+    const busy = held.store.seq > s.done;
+    release(held);
+    if (busy) syncState(s) catch {};
+}
+
+pub fn pinnedCount() usize {
+    return pinned.count();
 }
 
 /// `a` as a tensor the caller releases: ours with one more reference, or an import of an MLX array.
@@ -1161,4 +1242,67 @@ test "host bytes copied in are the tensor's bytes, and a view shares them" {
     try t.expectEqual(@as(u32, 2), a.store.refs);
     try t.expectEqualSlices(u8, std.mem.sliceAsBytes(&data), try hostBytes(v));
     try t.expectError(error.TensorShape, fromHost(std.mem.sliceAsBytes(&data), .float32, &.{ 2, 2 }));
+}
+
+fn mlxFloats(vals: []const f32) mlx.mlx_array {
+    return mlx.raw.mlx_array_new_data(vals.ptr, &[_]c_int{@intCast(vals.len)}, 1, .float32);
+}
+
+test "a pinned MLX array imports once, then answers every import with the same store, which no write may reuse" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const a = mlxFloats(&.{ 1, 2, 3, 4 });
+    defer _ = mlx.raw.mlx_array_free(a);
+    const before = stats();
+    try pin(a);
+    defer unpin(a);
+    const x = try import(a);
+    defer release(x);
+    const y = try take(a);
+    defer release(y);
+    try t.expectEqual(x.store, y.store);
+    try t.expectEqual(before.imports + 1, stats().imports);
+    try t.expectEqual(before.imports_held + 2, stats().imports_held);
+    try t.expect(!try sole(x.store));
+    try t.expectEqual(@as(f32, 3), std.mem.bytesAsSlice(f32, try hostBytes(x))[2]);
+}
+
+test "an MLX array that is not pinned imports fresh each time, and its store can still be written in place" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const a = mlxFloats(&.{ 1, 2, 3, 4 });
+    const before = stats();
+    const x = try import(a);
+    defer release(x);
+    const y = try import(a);
+    try t.expect(x.store != y.store);
+    try t.expectEqual(before.imports + 2, stats().imports);
+    try t.expectEqual(before.imports_held, stats().imports_held);
+    // Only x's store holds the array now: MLX's own rule lets a write go into it.
+    release(y);
+    _ = mlx.raw.mlx_array_free(a);
+    try t.expect(try sole(x.store));
+}
+
+test "a pin answers for the layout it was made at, and unpin ends it" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const a = mlxFloats(&.{ 1, 2, 3, 4 });
+    defer _ = mlx.raw.mlx_array_free(a);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    var square = mlx.raw.mlx_array_new();
+    defer _ = mlx.raw.mlx_array_free(square);
+    try mlx.check(mlx.mlx_reshape(&square, a, &[_]c_int{ 2, 2 }, 2, gpu));
+    try mlx.check(mlx.raw.mlx_array_eval(square));
+    try pin(a);
+    const before = stats();
+    const viewed = try import(square);
+    release(viewed);
+    try t.expectEqual(before.imports + 1, stats().imports);
+    unpin(a);
+    const again = try import(a);
+    release(again);
+    try t.expectEqual(before.imports + 2, stats().imports);
+    try t.expectEqual(before.imports_held, stats().imports_held);
 }

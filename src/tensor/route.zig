@@ -264,6 +264,14 @@ pub fn mlx_array_data_uint8(a: A) ?[*]const u8 {
 pub const isOurs = core.isOurs;
 pub const stream = core.stream;
 pub const stats = core.stats;
+pub const pin = core.pin;
+pub const unpin = core.unpin;
+pub const pinnedCount = core.pinnedCount;
+
+/// Custom-kernel launches that built their instance key since the process began.
+pub fn kernelKeyBuilds() u64 {
+    return kernel.key_builds;
+}
 pub const budget = core.budget;
 pub const close = core.close;
 pub const kernelProfile = core.kernelProfile;
@@ -1347,6 +1355,45 @@ test "a custom kernel launched on the engine writes what it writes under MLX" {
             }
         }
     };
+}
+
+test "configs made and freed in turn launch the pipeline of their own template value" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const names_in = [_][*:0]const u8{"x"};
+    const names_out = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names_in, names_in.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&names_out, names_out.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_config_reuse_probe", iv, ov, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const xs = ramp(f32, 4, 1, 0);
+    const x = hostArray(f32, &xs, &.{4}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const inputs = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    for ([_]c_int{ 5, 9, 9, 5 }) |value| {
+        active = true;
+        defer active = false;
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", value));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 4, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 4, 1, 1));
+        var outs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, k, inputs, cfg, core.stream()));
+        var y: A = .{};
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+        try mlx.check(mlx.mlx_array_eval(y));
+        const got = @as([*]const f32, @ptrCast(@alignCast(mlx.mlx_array_data_uint8(y).?)))[0..4];
+        for (got, xs) |g, want| try t_std.expectEqual(want + @as(f32, @floatFromInt(value)), g);
+    }
 }
 
 test "an op the engine lacks, and a threadgroup past the pipeline's limit, are refused by name" {

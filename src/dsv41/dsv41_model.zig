@@ -791,6 +791,7 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         pipeDrain(self) catch {};
+        unpinWeights(self);
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
@@ -1286,9 +1287,26 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
 pub fn memoryAudit(m: *const Model) !owned_mod.Audit {
     var arrays: std.ArrayList(A) = .empty;
     defer arrays.deinit(m.gpa);
-    try arrays.appendSlice(m.gpa, m.owned.items);
-    if (m.dspark) |ds| for (ds.stq) |rb| try arrays.appendSlice(m.gpa, rb.storage()[0..9]);
+    try weightArrays(m, &arrays);
     return owned_mod.audit(m.gpa, arrays.items);
+}
+
+/// Every array the load made or took: the weights, none of a request's state.
+fn weightArrays(m: *const Model, out: *std.ArrayList(A)) !void {
+    try out.appendSlice(m.gpa, m.owned.items);
+    if (m.dspark) |ds| for (ds.stq) |rb| try out.appendSlice(m.gpa, rb.storage()[0..9]);
+}
+
+/// The engine keeps one import of each weight array, so a forward on it does not import them again.
+pub fn pinWeights(m: *const Model) !void {
+    for (m.owned.items) |x| try mlx.engine.pin(x);
+    if (m.dspark) |ds| for (ds.stq) |rb| for (rb.storage()[0..9]) |x| try mlx.engine.pin(x);
+}
+
+/// Ends the holds of `pinWeights`; the weights are freed only after.
+pub fn unpinWeights(m: *const Model) void {
+    for (m.owned.items) |x| mlx.engine.unpin(x);
+    if (m.dspark) |ds| for (ds.stq) |rb| for (rb.storage()[0..9]) |x| mlx.engine.unpin(x);
 }
 
 pub fn logMemory(m: *const Model) void {
