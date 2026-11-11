@@ -51,6 +51,20 @@ pub const raw = struct {
     pub const mlx_async_eval = counted("mlx_async_eval", fn (outputs: mlx_vector_array) callconv(.c) c_int);
     pub const mlx_synchronize = counted("mlx_synchronize", fn (s: mlx_stream) callconv(.c) c_int);
     pub const mlx_matmul = counted("mlx_matmul", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+    pub const mlx_clear_cache = counted("mlx_clear_cache", fn () callconv(.c) c_int);
+    pub const mlx_set_memory_limit = counted("mlx_set_memory_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
+    pub const mlx_set_cache_limit = counted("mlx_set_cache_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
+    pub const mlx_set_wired_limit = counted("mlx_set_wired_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
+    pub const mlx_get_active_memory = counted("mlx_get_active_memory", fn (res: *usize) callconv(.c) c_int);
+    pub const mlx_get_cache_memory = counted("mlx_get_cache_memory", fn (res: *usize) callconv(.c) c_int);
+    pub const mlx_get_peak_memory = counted("mlx_get_peak_memory", fn (res: *usize) callconv(.c) c_int);
+    pub const mlx_reset_peak_memory = counted("mlx_reset_peak_memory", fn () callconv(.c) c_int);
+    // The transient cap and the external reading are patched in (patches/mlx-transient-cap.patch), not upstream MLX.
+    pub const mlx_set_transient_limit = counted("mlx_set_transient_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
+    pub const mlx_get_external_memory = counted("mlx_get_external_memory", fn (res: *usize) callconv(.c) c_int);
+    pub const mlx_metal_set_max_mb_per_buffer = counted("mlx_metal_set_max_mb_per_buffer", fn (prev: *c_int, mb: c_int) callconv(.c) c_int);
+    pub const mlx_get_transient_peak = counted("mlx_get_transient_peak", fn (res: *usize) callconv(.c) c_int);
+    pub const mlx_reset_transient_peak = counted("mlx_reset_transient_peak", fn () callconv(.c) c_int);
 };
 
 /// `name` of mlx-c with the engine's function of that name in front of it.
@@ -69,10 +83,17 @@ pub var calls: std.atomic.Value(u64) = .init(0);
 
 inline fn tally(comptime name: []const u8) void {
     _ = calls.fetchAdd(1, .monotonic);
-    if (comptime builtin.is_test) by_name.add(name);
+    if (comptime builtin.is_test) by_name.add(name) else if (callNamesTraced()) by_name.add(name);
 }
 
-/// TEST-ONLY tallies per entry point, to split a count by kind. An op that took a wrapped mapping of the engine's (a
+var call_names_env: ?bool = null;
+
+/// `SUSHI_MLX_CALLS_TRACE`: a served process tallies its calls by entry point too, for the request log.
+pub fn callNamesTraced() bool {
+    return io_util.diagEnvOnCached(&call_names_env, "SUSHI_MLX_CALLS_TRACE");
+}
+
+/// Tallies per entry point, to split a count by kind: in tests, and in a process that traces them. An op that took a wrapped mapping of the engine's (a
 /// weight) on MLX's side is also counted under `lend <op>`, which is no call.
 const Tally = struct {
     const capacity = 512;
@@ -1101,20 +1122,94 @@ const eval_raw = struct {
 };
 
 // ── Memory management ──
-pub const mlx_clear_cache = counted("mlx_clear_cache", fn () callconv(.c) c_int);
-pub const mlx_set_memory_limit = counted("mlx_set_memory_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
-pub const mlx_set_cache_limit = counted("mlx_set_cache_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
-pub const mlx_set_wired_limit = counted("mlx_set_wired_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
-pub const mlx_get_active_memory = counted("mlx_get_active_memory", fn (res: *usize) callconv(.c) c_int);
-pub const mlx_get_cache_memory = counted("mlx_get_cache_memory", fn (res: *usize) callconv(.c) c_int);
-pub const mlx_get_peak_memory = counted("mlx_get_peak_memory", fn (res: *usize) callconv(.c) c_int);
-pub const mlx_reset_peak_memory = counted("mlx_reset_peak_memory", fn () callconv(.c) c_int);
-// Patched in by patches/mlx-transient-cap.patch (not upstream MLX).
-pub const mlx_set_transient_limit = counted("mlx_set_transient_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
-pub const mlx_get_external_memory = counted("mlx_get_external_memory", fn (res: *usize) callconv(.c) c_int);
+// ── MLX's allocator ──
+// Under a held scope (`engine.hold`) none of these calls MLX: a reading is the one the hold began with, and a pool
+// clear, a peak reset and a limit do nothing, since MLX allocates nothing there. A limit hands back the value given.
+
+fn atRest() ?*engine.MlxAtRest {
+    return if (engine.mlx_at_rest.on.load(.acquire)) &engine.mlx_at_rest else null;
+}
+
+/// Empties MLX's pool and reads its allocator for the hold that begins. A process that never called MLX has nothing
+/// there to read.
+pub fn restAllocator(r: *engine.MlxAtRest) void {
+    var now: [4]usize = @splat(0);
+    if (calls.load(.monotonic) != 0) {
+        _ = raw.mlx_clear_cache();
+        _ = raw.mlx_get_active_memory(&now[0]);
+        _ = raw.mlx_get_cache_memory(&now[1]);
+        _ = raw.mlx_get_peak_memory(&now[2]);
+        _ = raw.mlx_get_external_memory(&now[3]);
+    }
+    r.active.store(now[0], .monotonic);
+    r.cache.store(now[1], .monotonic);
+    r.peak.store(now[2], .monotonic);
+    r.external.store(now[3], .monotonic);
+    r.on.store(true, .release);
+}
+
+pub fn mlx_clear_cache() c_int {
+    return if (atRest() != null) 0 else raw.mlx_clear_cache();
+}
+pub fn mlx_get_active_memory(res: *usize) c_int {
+    const r = atRest() orelse return raw.mlx_get_active_memory(res);
+    res.* = r.active.load(.monotonic);
+    return 0;
+}
+pub fn mlx_get_cache_memory(res: *usize) c_int {
+    const r = atRest() orelse return raw.mlx_get_cache_memory(res);
+    res.* = r.cache.load(.monotonic);
+    return 0;
+}
+pub fn mlx_get_peak_memory(res: *usize) c_int {
+    const r = atRest() orelse return raw.mlx_get_peak_memory(res);
+    res.* = r.peak.load(.monotonic);
+    return 0;
+}
+pub fn mlx_reset_peak_memory() c_int {
+    const r = atRest() orelse return raw.mlx_reset_peak_memory();
+    r.peak.store(r.active.load(.monotonic), .monotonic);
+    return 0;
+}
+pub fn mlx_get_external_memory(res: *usize) c_int {
+    const r = atRest() orelse return raw.mlx_get_external_memory(res);
+    res.* = r.external.load(.monotonic);
+    return 0;
+}
+/// High-water of MLX's own active bytes; at rest, what it holds.
+pub fn mlx_get_transient_peak(res: *usize) c_int {
+    const r = atRest() orelse return raw.mlx_get_transient_peak(res);
+    res.* = r.active.load(.monotonic) -| r.external.load(.monotonic);
+    return 0;
+}
+pub fn mlx_reset_transient_peak() c_int {
+    return if (atRest() != null) 0 else raw.mlx_reset_transient_peak();
+}
+fn limitAtRest(res: *usize, limit: usize) bool {
+    if (atRest() == null) return false;
+    res.* = limit;
+    return true;
+}
+pub fn mlx_set_memory_limit(res: *usize, limit: usize) c_int {
+    return if (limitAtRest(res, limit)) 0 else raw.mlx_set_memory_limit(res, limit);
+}
+pub fn mlx_set_cache_limit(res: *usize, limit: usize) c_int {
+    return if (limitAtRest(res, limit)) 0 else raw.mlx_set_cache_limit(res, limit);
+}
+pub fn mlx_set_wired_limit(res: *usize, limit: usize) c_int {
+    return if (limitAtRest(res, limit)) 0 else raw.mlx_set_wired_limit(res, limit);
+}
+pub fn mlx_set_transient_limit(res: *usize, limit: usize) c_int {
+    return if (limitAtRest(res, limit)) 0 else raw.mlx_set_transient_limit(res, limit);
+}
+pub fn mlx_metal_set_max_mb_per_buffer(prev: *c_int, mb: c_int) c_int {
+    if (atRest() == null) return raw.mlx_metal_set_max_mb_per_buffer(prev, mb);
+    prev.* = mb;
+    return 0;
+}
+
 /// Command buffers committed since the process started: each costs host time in Metal's submit and completion queues.
 pub const mlx_metal_command_buffer_count = counted("mlx_metal_command_buffer_count", fn (res: *usize) callconv(.c) c_int);
-pub const mlx_metal_set_max_mb_per_buffer = counted("mlx_metal_set_max_mb_per_buffer", fn (prev: *c_int, mb: c_int) callconv(.c) c_int);
 
 /// A decode tick's command buffers commit on their op count alone. MLX also commits a buffer once the inputs of its
 /// ops pass a size budget, which bounds the memory a buffer keeps from being freed; at decode widths what passes it is
@@ -1134,8 +1229,6 @@ pub const DecodeBuffers = struct {
         _ = mlx_metal_set_max_mb_per_buffer(&lifted, self.budget_mb);
     }
 };
-pub const mlx_get_transient_peak = counted("mlx_get_transient_peak", fn (res: *usize) callconv(.c) c_int);
-pub const mlx_reset_transient_peak = counted("mlx_reset_transient_peak", fn () callconv(.c) c_int);
 
 // ── Device info ──
 pub const mlx_device_info = extern struct { ctx: ?*anyopaque = null };

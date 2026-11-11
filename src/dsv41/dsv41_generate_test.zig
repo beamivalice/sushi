@@ -1785,8 +1785,10 @@ test "dsv41 engine: a Cooler load, its requests and its unload ask nothing of ML
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const asked = try censusOf(dir);
-    // A Cooler load holds the engine's scope from its first tensor to its unload: nothing is asked of MLX.
-    for (asked) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
+    // A Cooler load holds the engine's scope from its first tensor to its unload: nothing is asked of MLX. The hold
+    // begins, in a process that has called MLX before, by emptying its pool and reading its allocator once.
+    for (asked[0..8]) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
+    try testing.expectEqual(Asked{ .calls = 5, .ops = 0 }, asked[8]);
 }
 
 test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and restores it, byte for byte, with nothing asked of MLX (DSV41_STQ_TINY)" {

@@ -1656,6 +1656,9 @@ fn settleLoadLatch(had_error: bool) void {
 pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     load_clock.begin();
     defer load_clock.end();
+    // The tally at both ends of the load: what lies between is the load's own.
+    generate_mod.logMlxCalls();
+    defer generate_mod.logMlxCalls();
     const had_error_at_start = mlx.errorPending();
     try model_mod.archGate(params.config);
     if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});

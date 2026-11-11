@@ -48,16 +48,30 @@ pub const Scope = struct {
 
 var holds: u32 = 0;
 
+/// MLX's allocator as the first hold found it, its pool emptied. Nothing of MLX's is made or freed under a hold, so
+/// the readings stay true to the hold's end and the seam answers with them, on any thread, without a call.
+pub const MlxAtRest = struct {
+    on: std.atomic.Value(bool) = .init(false),
+    active: std.atomic.Value(usize) = .init(0),
+    cache: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+    external: std.atomic.Value(usize) = .init(0),
+};
+pub var mlx_at_rest: MlxAtRest = .{};
+
 /// A load that is the engine's alone holds the engine's scope open from its first tensor to its unload: every host
 /// array and vector made for it is the engine's, and an op on an MLX stream is refused by name.
 pub fn hold() void {
+    if (holds == 0) mlx.restAllocator(&mlx_at_rest);
     holds += 1;
     active = true;
 }
 
 pub fn unhold() void {
     holds -= 1;
-    if (holds == 0) active = false;
+    if (holds != 0) return;
+    active = false;
+    mlx_at_rest.on.store(false, .release);
 }
 
 pub fn holding() bool {
@@ -2350,6 +2364,56 @@ test "engine dequantize gives MLX's bytes: affine 4-bit bf16 and mxfp8 to f32" {
     const group_scales = hostArray(u8, &exps, &.{ 3, 10 }, .uint8);
     defer _ = mlx.mlx_array_free(group_scales);
     try expectSame(Build.mxfp8, &.{ w, group_scales });
+}
+
+test "under a hold MLX's allocator is not asked: its readings are the hold's first, and a clear, a reset and a limit are no call and change nothing" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    var orig: usize = 0;
+    try mlx.check(mlx.mlx_set_cache_limit(&orig, 1 << 30));
+    defer {
+        var unused: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&unused, orig);
+    }
+    // Something for MLX's pool to hold: the hold empties it as it begins.
+    {
+        var ones = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ones);
+        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1 << 20, 4 }, 2, .float32, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(ones));
+    }
+    hold();
+    var is_held = true;
+    defer if (is_held) unhold();
+    const calls = mlxCalls();
+    var now: [4]usize = @splat(1);
+    try mlx.check(mlx.mlx_get_active_memory(&now[0]));
+    try mlx.check(mlx.mlx_get_cache_memory(&now[1]));
+    try mlx.check(mlx.mlx_get_peak_memory(&now[2]));
+    try mlx.check(mlx.mlx_get_external_memory(&now[3]));
+    try std.testing.expectEqual(@as(usize, 0), now[1]);
+    try std.testing.expect(now[2] >= now[0] and now[0] >= now[3]);
+    try mlx.check(mlx.mlx_clear_cache());
+    try mlx.check(mlx.mlx_reset_peak_memory());
+    var peak: usize = 0;
+    try mlx.check(mlx.mlx_get_peak_memory(&peak));
+    try std.testing.expectEqual(now[0], peak);
+    try std.testing.expectEqual(now[0] - now[3], mlx.transientPeak());
+    var prev: usize = 0;
+    try mlx.check(mlx.mlx_set_cache_limit(&prev, 5));
+    try std.testing.expectEqual(@as(usize, 5), prev);
+    try std.testing.expectEqual(@as(usize, 7), mlx.setTransientLimit(7));
+    const tick = mlx.DecodeBuffers.begin();
+    tick.end();
+    try std.testing.expectEqual(calls, mlxCalls());
+    unhold();
+    is_held = false;
+    // The limit set under the hold never reached MLX.
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_set_cache_limit(&after, orig));
+    try std.testing.expectEqual(@as(usize, 1 << 30), after);
 }
 
 test "a map of the engine's holds arrays and strings by name, in the order they were put, and answers mlx-c's way for a name it lacks" {

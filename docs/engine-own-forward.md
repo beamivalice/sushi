@@ -147,11 +147,13 @@ route and the MLX arm still build the bank at prepare time.
 - **A Cooler load, its requests and its unload ask nothing of MLX, pinned phase by phase** (the census test in
   `dsv41_generate_test.zig`: the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore
   point captured and restored, a step after it, an image prompt, the unload; the SSD tier has its own test, with the
-  restored state compared byte for byte). Every row is zero calls, and a change that adds one fails it.
+  restored state compared byte for byte). Every row of a request and the unload are zero calls, and a change that
+  adds one fails it.
   `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry point. The free of an empty handle is no call
   (`mlx_array_free` in the seam): mlx-c holds nothing for one. The census counts a load that is not the process's
-  first (it opens and closes the pack once before): what a process asks once (the device's description, the memory
-  limits) is its first load's, and with that kept out a row reads the same alone and after other tests. Dispatches
+  first (it opens and closes the pack once before): what a process asks once (the device's description) is its first
+  load's, and with that kept out a row reads the same alone and after other tests. The load's row is the five calls
+  with which a hold begins in a process that has called MLX. Dispatches
   still follow what the process ran before (a 12-token request read 7,336 as a process's only load and 7,017 after
   other loads).
 - **A Cooler load holds the engine's scope from its first tensor to its unload** (`engine.hold`, `engine.unhold`,
@@ -163,6 +165,17 @@ route and the MLX arm still build the bank at prepare time.
   verify's reserved-token mask (`spec_types.verifyArgmax`), the warm-up's token arrays, the think-marker mask, an
   image's patch array, the trunk shell's scalar constants. The `[engine] since load` line counts the refusals; a
   served request counts none.
+- **MLX's allocator is not asked under a hold** (`mlx.zig`, "MLX's allocator"; `engine.MlxAtRest`). The first hold
+  empties MLX's pool and reads its allocator once (active, cache, peak, external; five calls, none in a process that
+  never called MLX). Nothing of MLX's is made or freed under a hold, so those readings stay true to its end and the
+  seam answers with them on any thread: the gauges, the bills, a request's headroom. A pool clear, a peak reset and a
+  limit (`mlx_set_cache_limit`, the transient cap, the command-buffer budget of `DecodeBuffers`) are no call and
+  change nothing, a limit handing back the value given; a hold spans whole jobs, so no set and restore straddle its
+  ends. These were the last calls of a request: 300 to 700 each on the real pack (the per-forward transient cap and
+  command-buffer budget, the headroom readings). A live Cooler process (STQ 1.75bpw, df1b2075 plus this change) makes
+  125 calls into mlx-c by the end of its first request, at boot and in the load before the hold, and none in the
+  requests after it. `SUSHI_MLX_CALLS_TRACE=1` prints the tally by entry point at both ends of a load and after a
+  request ([envvar](envvar.md)).
 - **A trial that picks a kernel arm runs on the load's stream.** The attention and index-scan matrix-unit trials
   (`kernels.attnNaxTrial`, `indexNaxTrials`) ran on MLX's stream with MLX's normal draw; inside a held scope both
   were refused, the refusal read as "the trial differs", the SIMD and scalar kernels served and four of five live
