@@ -3649,3 +3649,37 @@ test "dsv41 engine: a one-row decode step in steady state makes a pinned number 
     try testing.expectEqual([_]u64{ 0, 3850, 489, 2, 87, 658, 571 }, steady.split);
     try testing.expectEqual(@as(u64, 5657), steady.total);
 }
+
+/// The calls into MLX's `name` since `before`.
+fn namedSince(before: []const mlx.NameCount, name: []const u8) !u64 {
+    var now: std.ArrayList(mlx.NameCount) = .empty;
+    defer now.deinit(testing.allocator);
+    try mlx.callsByName(&now, testing.allocator);
+    var count: u64 = 0;
+    for (now.items) |n| {
+        if (std.mem.eql(u8, n.name, name)) count += n.count;
+    }
+    for (before) |b| {
+        if (std.mem.eql(u8, b.name, name)) count -= b.count;
+    }
+    return count;
+}
+
+test "dsv41 engine: a request's rings are the engine's from its first forward: MLX makes none, and no step asks MLX who holds one (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    _ = try stepCalls(&fx, prompt, 2);
+    var before: std.ArrayList(mlx.NameCount) = .empty;
+    defer before.deinit(testing.allocator);
+    try mlx.callsByName(&before, testing.allocator);
+    // A new request: its state, its prefill and five steps.
+    _ = try stepCalls(&fx, prompt, 5);
+    try testing.expectEqual(@as(u64, 0), try namedSince(before.items, "mlx_zeros"));
+    try testing.expectEqual(@as(u64, 0), try namedSince(before.items, "_mlx_array_is_donatable"));
+}

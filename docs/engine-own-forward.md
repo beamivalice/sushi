@@ -151,6 +151,10 @@ route and the MLX arm still build the bank at prepare time.
   (`core.sole`), else into a copy. For bytes MLX made the test is MLX's own rule for writing in place
   (`_mlx_array_is_donatable`): the handle is the only holder of the array and of its buffer, a command buffer of
   MLX's still in flight counted. A write never goes through a broadcast axis.
+- **A request's rings are made on the engine's stream on a Cooler load** (`dsv41_model.newState`). A ring of MLX's
+  zeros met the engine's first step while MLX's own command buffer could still be in flight, so that step copied the
+  ring into the pool or wrote it in place by timing, and an in-place one asked MLX who holds it at every later step.
+  A forward still on MLX (image rows, an open verify) takes the rings lent.
 - **A weight's import is kept** (`core.pin`): a forward imports the same load-time arrays every time, so the load pins
   them (`dsv41_model.pinWeights`: the arrays the model made or took, a named set, never a guess) and an import of an
   array with the same bytes and layout shares that store (`imports_held` in `[engine] since load:`; `imports` counts

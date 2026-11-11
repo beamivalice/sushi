@@ -1370,8 +1370,11 @@ pub fn newState(m: *const Model) !State {
     // With DSpark on, the rings hold the rows of a verify chunk beyond the window, so a rejected row never
     // overwrites a row a later query still reads.
     const slack: usize = if (m.dspark != null) cfg_mod.ring_slack else 0;
+    // The rings are made where the forwards write them: a ring of MLX's would be copied or written in place by the
+    // engine's first step, by whether MLX had finished making it.
+    const s = if (m.engine_decode) mlx.engine.stream() else m.s;
     for (layers, 0..) |*l, li| {
-        l.* = .{ .win = try Ring.init(c.window + slack, c.head_dim, m.act, m.s) };
+        l.* = .{ .win = try Ring.init(c.window + slack, c.head_dim, m.act, s) };
         made += 1;
         // With the round trips on, the rows are FP4 values and are kept in that format.
         const packed_kv = m.qat_on and m.pack_kv;
@@ -1387,7 +1390,7 @@ pub fn newState(m: *const Model) !State {
     if (m.dspark != null) {
         ds = try m.gpa.alloc(Ring, c.n_mtp);
         for (ds) |*r| {
-            r.* = try Ring.init(c.window, c.head_dim, m.act, m.s);
+            r.* = try Ring.init(c.window, c.head_dim, m.act, s);
             rings += 1;
         }
     }
