@@ -75,8 +75,17 @@ fn placeholder() mlx.mlx_array {
     return mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .uint8);
 }
 
-fn orPlaceholder(a: mlx.mlx_array) mlx.mlx_array {
-    return if (a.ctx != null) a else placeholder();
+/// `a`, or for an absent slot the checkpoint's one placeholder, shared: `first` is the handle that made it.
+fn orPlaceholder(a: mlx.mlx_array, first: *mlx.mlx_array) !mlx.mlx_array {
+    if (a.ctx != null) return a;
+    if (first.ctx == null) {
+        first.* = placeholder();
+        if (first.ctx == null) return error.Dsv41CheckpointPlaceholder;
+        return first.*;
+    }
+    var again = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&again, first.*));
+    return again;
 }
 
 /// The model's state at `pos`, which must be where the request stands, as an owned checkpoint.
@@ -96,6 +105,10 @@ fn captureWith(allocator: std.mem.Allocator, m: *model.Model, pos: usize, share:
     defer allocator.free(slots);
     @memset(slots, model.nil_slot);
     try if (share) model.captureStateShared(m, slots) else model.captureState(m, slots);
+    // The placeholder of the absent slots is made where the state is, and the pool is told of it like a copy.
+    const host = mlx.engine.enter(model.stateStream(m));
+    defer host.end();
+    mlx.engine.room(&.{1});
     return fromSlots(allocator, slots, pos);
 }
 
@@ -105,13 +118,26 @@ fn fromSlots(allocator: std.mem.Allocator, slots: []model.Slot, pos: usize) !tra
         for (slots) |*sl| model.freeSlot(sl);
         return err;
     };
-    for (slots, 0..) |sl, i| for (0..2) |h| {
-        layers[2 * i + h] = .{
-            .conv_state = orPlaceholder(sl[2 * h]),
-            .ssm_state = orPlaceholder(sl[2 * h + 1]),
-            .initialized = true,
-        };
-    };
+    // Filled in order, so a failure frees the snapshots made and the slots not yet taken.
+    var first: mlx.mlx_array = .{ .ctx = null };
+    for (0..2 * slots.len) |at| {
+        const sl = &slots[at / 2];
+        const h = at % 2;
+        errdefer {
+            for (layers[0..at]) |l| {
+                _ = mlx.mlx_array_free(l.conv_state);
+                _ = mlx.mlx_array_free(l.ssm_state);
+            }
+            for (slots[at / 2 ..]) |*rest| model.freeSlot(rest);
+            allocator.free(layers);
+        }
+        const conv = try orPlaceholder(sl[2 * h], &first);
+        sl[2 * h] = .{ .ctx = null };
+        errdefer _ = mlx.mlx_array_free(conv);
+        const ssm = try orPlaceholder(sl[2 * h + 1], &first);
+        sl[2 * h + 1] = .{ .ctx = null };
+        layers[at] = .{ .conv_state = conv, .ssm_state = ssm, .initialized = true };
+    }
     return .{ .pos = pos, .layers = layers };
 }
 
@@ -121,6 +147,9 @@ fn captureLive(allocator: std.mem.Allocator, m: *model.Model, p: *const LivePoin
     defer allocator.free(slots);
     @memset(slots, model.nil_slot);
     try model.captureLiveShared(m, p.slots, p.pos, slots);
+    const host = mlx.engine.enter(model.stateStream(m));
+    defer host.end();
+    mlx.engine.room(&.{1});
     return fromSlots(allocator, slots, p.pos);
 }
 

@@ -346,6 +346,7 @@ pub fn kernelKeyBuilds() u64 {
     return kernel.key_builds;
 }
 pub const budget = core.budget;
+pub const room = core.room;
 pub const close = core.close;
 pub const kernelProfile = core.kernelProfile;
 pub const resetKernelProfile = core.resetKernelProfile;
@@ -582,6 +583,11 @@ pub fn mlx_view(res: *A, a: A, dtype: mlx.mlx_dtype, _: S) c_int {
 /// MLX's `copy` primitive shares its input's buffer (`Copy::eval_gpu` is `copy_shared_buffer`): a share, not a pass.
 pub fn mlx_copy(res: *A, a: A, _: S) c_int {
     return op1("copy", res, a, core.share, .{});
+}
+
+/// A copy of `a` in a buffer of its own, where `mlx_copy` gives a share of `a`'s.
+pub fn copyOwned(res: *A, a: A) c_int {
+    return op1("copy_owned", res, a, ops.contiguousCopy, .{});
 }
 
 pub fn mlx_contiguous(res: *A, a: A, _: bool, _: S) c_int {

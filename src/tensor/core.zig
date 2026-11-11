@@ -526,6 +526,19 @@ pub fn budget(bytes: u64) Error!void {
     _ = try trimTo(s, s.pool_limit.?);
 }
 
+/// The cap rises by the buffers that tensors of these `lens` bytes take from the pool. For what is made between
+/// forwards and outlives them (a restore point's copies): a forward's cap covers a forward's scratch, and the next
+/// forward's cap starts from what is in use then.
+pub fn room(lens: []const usize) void {
+    const s = &(state orelse return);
+    const limit = s.pool_limit orelse return;
+    var bytes: u64 = 0;
+    for (lens) |len| {
+        if (len > 0) bytes += classBytes(classOf(len));
+    }
+    s.pool_limit = limit +| bytes;
+}
+
 fn dropStore(store: *Store) void {
     store.refs -= 1;
     if (store.refs > 0) return;

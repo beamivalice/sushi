@@ -1670,11 +1670,12 @@ const Census = struct {
     calls: u64,
     ops: u64,
     names: std.ArrayList(mlx.NameCount) = .empty,
+    stats: @TypeOf(mlx.engine.stats()) = undefined,
 
     /// Starts a phase; MLX's keep-warm touch (one per 500 ms of MLX idle) stays out of a phase this short.
     fn begin(model: ?*@import("dsv41_model.zig").Model) !Census {
         if (model) |m| m.mlx_queue_used_ns = mlx.engine.nowNs();
-        var self: Census = .{ .calls = mlx.engine.mlxCalls(), .ops = mlx.engine.mlx_ops };
+        var self: Census = .{ .calls = mlx.engine.mlxCalls(), .ops = mlx.engine.mlx_ops, .stats = mlx.engine.stats() };
         try mlx.callsByName(&self.names, testing.allocator);
         return self;
     }
@@ -1691,6 +1692,8 @@ const Census = struct {
         defer now.deinit(testing.allocator);
         try mlx.callsByName(&now, testing.allocator);
         std.debug.print("[census] {s}: {d} calls, {d} ops\n", .{ phase, asked.calls, asked.ops });
+        const now_stats = mlx.engine.stats();
+        std.debug.print("[census]   engine: {d} dispatches, {d} submits, imports {d} built and {d} held, lends {d}, appends in place {d}, copied {d}\n", .{ now_stats.dispatches - self.stats.dispatches, now_stats.submits - self.stats.submits, now_stats.imports - self.stats.imports, now_stats.imports_held - self.stats.imports_held, now_stats.lends - self.stats.lends, now_stats.updates_in_place - self.stats.updates_in_place, now_stats.updates_copied - self.stats.updates_copied });
         for (now.items) |n| {
             var was: u64 = 0;
             for (self.names.items) |b| if (std.mem.eql(u8, b.name, n.name)) {
@@ -1795,7 +1798,7 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const asked = try censusOf(dir);
     // The target of every row is { 0, 0 }. What is left of a request is the engine importing arrays MLX owns (the
-    // experts' slabs and their maps), one set of queries and a free each; a capture still builds on MLX.
+    // experts' slabs and their maps), one set of queries and a free each.
     // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of: how many launches a request
     // makes follows what the process ran before it (a load whose pipelines exist skips its warm forwards and starts
     // with other experts in its cache). A real cut moves the ceiling.
@@ -1803,9 +1806,9 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
         .{ .calls = 19700, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
         .{ .calls = 19700, .ops = 0 }, // seeded rounds
         .{ .calls = 19700, .ops = 0 }, // serial steps with logprobs
-        .{ .calls = 253, .ops = 87 }, // a restore point captured
-        .{ .calls = 149, .ops = 0 }, // the point restored
-        .{ .calls = 1700, .ops = 0 }, // a step on the restored state
+        .{ .calls = 0, .ops = 0 }, // a restore point captured
+        .{ .calls = 0, .ops = 0 }, // the point restored
+        .{ .calls = 1400, .ops = 0 }, // a step on the restored state
         .{ .calls = 10600, .ops = 0 }, // an image prompt
         .{ .calls = 861, .ops = 0 }, // the unload
         .{ .calls = 110500, .ops = 438 }, // the load
@@ -1832,6 +1835,42 @@ test "dsv41 engine: a Cooler load answers the fused hyper-connection kernel's pr
     }
     // Whatever this GPU's answer is, it is one answer: a probe the engine could not run would read as "differs".
     try testing.expectEqual(probed[0], probed[1]);
+}
+
+test "dsv41 engine: a restore point's copies take their own room in the pool, whatever cap the last forward left (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..40];
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt));
+    // A later test sees no limit.
+    defer mlx.engine.budget(1 << 62) catch {};
+    // A cap with nothing to spare: what the tensors in use hold, their buffers' rounding included.
+    const held = mlx.engine.stats();
+    try mlx.engine.budget(held.pool_bytes - held.pool_free - held.pool_asked);
+    const made = mlx.engine.pipelinesMade().count;
+    var cp = try dsv41_prefix.capture(a, m, prompt.len);
+    defer cp.deinit(a);
+    // The load warmed the copies' pipelines.
+    try testing.expectEqual(made, mlx.engine.pipelinesMade().count);
+    // Every row the point holds is a tensor of the engine's (an absent slot is a placeholder).
+    var held_rows: usize = 0;
+    for (cp.layers) |l| for ([_]mlx.mlx_array{ l.conv_state, l.ssm_state }) |x| {
+        if (!@import("dsv41_model.zig").present(x)) continue;
+        held_rows += 1;
+        try testing.expect(mlx.engine.isOurs(x));
+    };
+    try testing.expect(held_rows > 0);
+    var said: [256]u8 = undefined;
+    try testing.expectEqualStrings("", mlx.takeError(&said) orelse "");
 }
 
 test "dsv41 engine: a prefill forward of 2 to 16 rows gives MLX's logits and the steps after it MLX's bytes (DSV41_STQ_TINY)" {

@@ -1359,6 +1359,11 @@ fn closeEngram(e: *EngramLayer) void {
     e.table.close();
 }
 
+/// Where a request's state is made, copied and viewed: the engine's stream on a load whose forwards run there.
+pub fn stateStream(m: *const Model) S {
+    return if (m.engine_decode) mlx.engine.stream() else m.s;
+}
+
 pub fn newState(m: *const Model) !State {
     const c = &m.cfg;
     const layers = try m.gpa.alloc(LState, c.layers);
@@ -1372,7 +1377,7 @@ pub fn newState(m: *const Model) !State {
     const slack: usize = if (m.dspark != null) cfg_mod.ring_slack else 0;
     // The rings are made where the forwards write them: a ring of MLX's would be copied or written in place by the
     // engine's first step, by whether MLX had finished making it.
-    const s = if (m.engine_decode) mlx.engine.stream() else m.s;
+    const s = stateStream(m);
     for (layers, 0..) |*l, li| {
         l.* = .{ .win = try Ring.init(c.window + slack, c.head_dim, m.act, s) };
         made += 1;
@@ -2901,8 +2906,19 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
         try warmOwnFills(m, ids[0]);
         try warmOwnBlocks(m, ids[0]);
         try warmOwnLong(m, ids[0]);
+        try warmOwnCapture(m);
         try warmOwnImages(m);
     }
+}
+
+/// The engine's pipelines of a restore point's copies, one per dtype the state's rows have, on the state the warm
+/// forwards left.
+fn warmOwnCapture(m: *Model) !void {
+    const slots = try m.gpa.alloc(Slot, slotCount(m));
+    defer m.gpa.free(slots);
+    @memset(slots, nil_slot);
+    defer for (slots) |*sl| freeSlot(sl);
+    try captureState(m, slots);
 }
 
 /// The engine's kernels of a step over 131072 keys or more, a context the load cannot build: the one-row index scan
@@ -3072,7 +3088,6 @@ pub fn slotCountFor(c: *const cfg_mod.Config, dspark: bool) usize {
     return 2 * c.layers + (if (dspark) c.n_mtp else 0);
 }
 
-/// An owned copy of rows [0, n) that keeps every bit (a float add of zero would turn -0.0 into +0.0).
 /// The first `n` rows of `x` as a view.
 fn headRows(x: A, n: usize, s: S) !A {
     if (x.ctx == null or n == 0) return none;
@@ -3083,6 +3098,17 @@ fn headRows(x: A, n: usize, s: S) !A {
     return head;
 }
 
+fn rowsOf(x: A) usize {
+    return if (x.ctx != null) dim(x, 0) else 0;
+}
+
+/// The bytes of rows [0, n) of `x`.
+fn rowBytes(x: A, n: usize) usize {
+    if (x.ctx == null or n == 0) return 0;
+    return n * (mlx.mlx_array_size(x) / dim(x, 0)) * mlx.mlx_array_itemsize(x);
+}
+
+/// An owned copy of rows [0, n) that keeps every bit (a float add of zero would turn -0.0 into +0.0).
 fn ownedRows(x: A, n: usize, s: S) !A {
     if (x.ctx == null or n == 0) return none;
     const head = try headRows(x, n, s);
@@ -3096,11 +3122,16 @@ fn ownedRows(x: A, n: usize, s: S) !A {
     var raw = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(raw);
     try mlx.check(mlx.mlx_view(&raw, head, raw_dt, s));
-    var zero = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(zero);
-    try mlx.check(mlx.mlx_zeros(&zero, &[_]c_int{1}, 1, raw_dt, s));
     var copy = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&copy, raw, zero, s));
+    if (mlx.engine.isStream(s)) {
+        // The engine copies into one buffer of the pool; MLX's own copy shares, so there an add of zero makes one.
+        try mlx.check(mlx.engine.copyOwned(&copy, raw));
+    } else {
+        var zero = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zero);
+        try mlx.check(mlx.mlx_zeros(&zero, &[_]c_int{1}, 1, raw_dt, s));
+        try mlx.check(mlx.mlx_add(&copy, raw, zero, s));
+    }
     if (raw_dt == dt) return copy;
     defer _ = mlx.mlx_array_free(copy);
     var out = mlx.mlx_array_new();
@@ -3137,24 +3168,45 @@ fn captureInto(m: *Model, out: []Slot, share: bool) !void {
     if (st.verify != null) return error.Dsv41VerifyOpen;
     if (out.len != slotCount(m)) return error.Dsv41CheckpointMismatch;
     errdefer for (out) |*sl| freeSlot(sl);
+    const s = stateStream(m);
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    if (mlx.engine.isStream(s)) {
+        // The copies are the pool's and outlive the last forward's cap: the pool is told of each first.
+        const lens = try m.gpa.alloc(usize, 7 * st.layers.len + st.ds.len);
+        defer m.gpa.free(lens);
+        @memset(lens, 0);
+        for (st.layers, 0..) |*ls, li| {
+            const of = lens[7 * li ..][0..7];
+            of[0] = rowBytes(ls.win.buf, ls.win.cap);
+            of[1] = rowBytes(ls.pend_kv, rowsOf(ls.pend_kv));
+            of[2] = rowBytes(ls.pend_gate, rowsOf(ls.pend_gate));
+            if (!share) for ([_]?Rows{ ls.comp, ls.idx_k }, 0..) |rows, k| if (rows) |r| {
+                of[3 + 2 * k] = rowBytes(r.buf, r.used);
+                of[4 + 2 * k] = rowBytes(r.sbuf, r.used);
+            };
+        }
+        for (st.ds, 0..) |r, si| lens[7 * st.layers.len + si] = rowBytes(r.buf, r.cap);
+        mlx.engine.room(lens);
+    }
     const evals = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(evals);
     for (st.layers, 0..) |*ls, li| {
         const a = &out[2 * li];
-        a[0] = try ownedRows(ls.win.buf, ls.win.cap, m.s);
-        a[1] = try ownedRows(ls.pend_kv, if (ls.pend_kv.ctx != null) dim(ls.pend_kv, 0) else 0, m.s);
-        a[2] = try ownedRows(ls.pend_gate, if (ls.pend_gate.ctx != null) dim(ls.pend_gate, 0) else 0, m.s);
+        a[0] = try ownedRows(ls.win.buf, ls.win.cap, s);
+        a[1] = try ownedRows(ls.pend_kv, if (ls.pend_kv.ctx != null) dim(ls.pend_kv, 0) else 0, s);
+        a[2] = try ownedRows(ls.pend_gate, if (ls.pend_gate.ctx != null) dim(ls.pend_gate, 0) else 0, s);
         const b = &out[2 * li + 1];
         if (ls.comp) |r| {
-            b[0] = try if (share) headRows(r.buf, r.used, m.s) else ownedRows(r.buf, r.used, m.s);
-            b[1] = try if (share) headRows(r.sbuf, r.used, m.s) else ownedRows(r.sbuf, r.used, m.s);
+            b[0] = try if (share) headRows(r.buf, r.used, s) else ownedRows(r.buf, r.used, s);
+            b[1] = try if (share) headRows(r.sbuf, r.used, s) else ownedRows(r.sbuf, r.used, s);
         }
         if (ls.idx_k) |r| {
-            b[2] = try if (share) headRows(r.buf, r.used, m.s) else ownedRows(r.buf, r.used, m.s);
-            b[3] = try if (share) headRows(r.sbuf, r.used, m.s) else ownedRows(r.sbuf, r.used, m.s);
+            b[2] = try if (share) headRows(r.buf, r.used, s) else ownedRows(r.buf, r.used, s);
+            b[3] = try if (share) headRows(r.sbuf, r.used, s) else ownedRows(r.sbuf, r.used, s);
         }
     }
-    for (st.ds, 0..) |r, si| out[2 * st.layers.len + si][0] = try ownedRows(r.buf, r.cap, m.s);
+    for (st.ds, 0..) |r, si| out[2 * st.layers.len + si][0] = try ownedRows(r.buf, r.cap, s);
     for (out) |sl| for (sl) |x| if (x.ctx != null) try mlx.check(mlx.mlx_vector_array_append_value(evals, x));
     try mlx.check(mlx.mlx_eval(evals));
 }
@@ -3259,6 +3311,7 @@ pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) 
     if (st.verify != null or fixed.len != slotCount(m) or out.len != slotCount(m) or st.n < n) return error.Dsv41CheckpointMismatch;
     for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |rows| if (rows.used < n / m.ratio(li)) return error.Dsv41CheckpointMismatch;
     errdefer for (out) |*sl| freeSlot(sl);
+    const s = stateStream(m);
     for (st.layers, 0..) |*ls, li| {
         const a = &out[2 * li];
         for (0..3) |k| try shareInto(&a[k], fixed[2 * li][k]);
@@ -3266,12 +3319,12 @@ pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) 
         const r = n / m.ratio(li);
         const b = &out[2 * li + 1];
         if (ls.comp) |rows| {
-            b[0] = try headRows(rows.buf, r, m.s);
-            b[1] = try headRows(rows.sbuf, r, m.s);
+            b[0] = try headRows(rows.buf, r, s);
+            b[1] = try headRows(rows.sbuf, r, s);
         }
         if (ls.idx_k) |rows| {
-            b[2] = try headRows(rows.buf, r, m.s);
-            b[3] = try headRows(rows.sbuf, r, m.s);
+            b[2] = try headRows(rows.buf, r, s);
+            b[3] = try headRows(rows.sbuf, r, s);
         }
     }
     for (st.ds, 0..) |_, si| try shareInto(&out[2 * st.layers.len + si][0], fixed[2 * st.layers.len + si][0]);

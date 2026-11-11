@@ -143,7 +143,8 @@ route and the MLX arm still build the bank at prepare time.
   the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore point captured and
   restored, a step after it, an image prompt, the unload). A change that adds a call fails it; a stage of the move off
   MLX lowers a row; the target of every row is zero. `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry
-  point. Outside a capture a request puts no op on MLX: its calls are the engine importing arrays MLX owns.
+  point. A request puts no op on MLX, and a restore point is captured and restored with no call at all: a request's
+  calls are the engine importing arrays MLX owns.
   A phase's ops are exact. Its calls are held under a ceiling and within a twentieth of it: the launches a request
   makes follow what the process ran before (a load whose pipelines exist skips its warm forwards and starts with
   other experts in its cache; a 12-token request read 7,336 dispatches as a process's only load and 7,017 after
@@ -258,6 +259,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   tensors in use ask for, free buffers and size rounding included. A new buffer that would pass it first takes the
   room of free ones, the largest first (waiting for a pass that still binds them); with none left the op is refused
   (`PoolOverBudget`).
+- **What is made between forwards and outlives them asks for room** (`core.room`): a restore point's copies are taken
+  under the cap the last forward left, which covers a forward's scratch and not state that stays. The capture names
+  the sizes it is about to copy and the cap rises by their buffers; the next forward's cap starts from what is in use
+  then. A restore point's absent slots share one placeholder.
 - **DeepSeek installs and bills it** (`dsv41_borrow`, `dsv41_bill`): the budget is a decode forward's cap
   (`Config.forwardCap`), set as every forward begins, and the request bill carries that cap a second time, beside
   MLX's. A request's end leaves the pool what the shortest request bills; an unload leaves it nothing free.
