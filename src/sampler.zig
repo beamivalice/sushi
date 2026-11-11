@@ -113,7 +113,8 @@ pub fn argmaxOnlyRequest(sampling: SamplingParams, logprobs_n: u32) bool {
 /// nothing — a mask that suppressed the whole vocab is `-inf` everywhere,
 /// which argmaxes to id 0 (the all-false-mask class, from the other side).
 pub fn buildSuppressMask(ids: []const u32, defined_vocab: usize, vocab: usize, s: mlx.mlx_stream) !mlx.mlx_array {
-    _ = s;
+    const host = mlx.engine.enter(s);
+    defer host.end();
     const alloc = std.heap.page_allocator;
     const buf = try alloc.alloc(bool, vocab);
     defer alloc.free(buf);
@@ -154,7 +155,7 @@ pub fn installSuppressMask(xfm: *Trunk, tok: *const Tokenizer, chat_template: []
     else
         0;
     if (ids.len == 0 and pad_rows == 0) return;
-    xfm.suppress_mask = buildSuppressMask(ids, defined_vocab, logits_dim, xfm.s) catch |err| {
+    xfm.suppress_mask = buildSuppressMask(ids, defined_vocab, logits_dim, xfm.outStream()) catch |err| {
         log.warn("[suppress] mask build failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
         return;
     };
@@ -2926,6 +2927,21 @@ test "fillSuppressMask: padding rows past the tokenizer's last defined id are su
         fillSuppressMask(&buf, &[_]u32{3}, defined);
         for (buf, 0..) |v, i| try testing.expectEqual(i == 3, v);
     }
+}
+
+test "suppress_mask: the mask is an array of the stream it is built for, the engine's own on the engine's" {
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was_enabled);
+    const on_mlx = try buildSuppressMask(&[_]u32{1}, 6, 8, mlx.gpuStream());
+    defer _ = mlx.mlx_array_free(on_mlx);
+    const calls = mlx.engine.mlxCalls();
+    const ours = try buildSuppressMask(&[_]u32{1}, 6, 8, mlx.engine.stream());
+    defer _ = mlx.mlx_array_free(ours);
+    try std.testing.expectEqual(calls, mlx.engine.mlxCalls());
+    try std.testing.expect(mlx.engine.isOurs(ours) and !mlx.engine.isOurs(on_mlx));
+    try std.testing.expectEqualSlices(bool, mlx.mlx_array_data_bool(on_mlx).?[0..8], mlx.mlx_array_data_bool(ours).?[0..8]);
 }
 
 test "suppress_mask: a suppressed id is unreachable from both samplers, everything else stays" {

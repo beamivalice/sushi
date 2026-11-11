@@ -142,16 +142,20 @@ route and the MLX arm still build the bank at prepare time.
   handle (`mlx_array_new`, `mlx_stream_new`, `mlx_device_new`, `mlx_string_new`, `mlx_device_info_new`) is a zero
   `ctx` made in Zig, no call. It cannot see MLX's own threads, work before the load, or the Metal objects MLX already
   made. Another file declaring an `mlx_*` extern fails the `mlx-extern` lint; an address of the library for `dladdr`
-  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 22 calls,
-  none of them for a kernel config (pinned in `dsv41_generate_test.zig`).
+  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes no call
+  into mlx-c (pinned in `dsv41_generate_test.zig`).
 - **What a Cooler request still asks of MLX is pinned phase by phase** (the census test in `dsv41_generate_test.zig`:
   the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore point captured and
   restored, a step after it, an image prompt, the unload). A change that adds a call fails it; a stage of the move off
   MLX lowers a row; the target of every row is zero. `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry
-  point. A request puts no op on MLX, and a restore point is captured and restored with no call at all, in RAM and
-  through the SSD tier (its own test, with the restored state compared byte for byte): a request's calls are the
-  token arrays its caller makes on MLX, imported once each. The free of an empty handle is no call (`mlx_array_free`
-  in the seam): mlx-c holds nothing for one.
+  point. Every phase of a request makes no call at all: the rounds and the serial steps through the generator, a
+  restore point captured and restored, in RAM and through the SSD tier (its own test, with the restored state
+  compared byte for byte), a step after it and an image prompt. What a caller makes for a forward is of the side the
+  forward's output is on (`Trunk.outStream`): the generator's token arrays (`generate.idsArray`), the slice of the
+  prefill's last logits, the reserved-token mask the sampler applies every round (`sampler.installSuppressMask`; made
+  on MLX it was imported once a round, a vocabulary of bools each time). A model that forwards on the engine asks MLX
+  for no pool clear either (`generate.clearPool`). The free of an empty handle is no call (`mlx_array_free` in the
+  seam): mlx-c holds nothing for one.
   A phase's ops are exact. Its calls are held under a ceiling and within a twentieth of it, so a real cut moves the
   ceiling. The census counts a load that is not the process's first (it opens and closes the pack once before): what
   a process asks once (the device's description, a kernel probe) is its first load's, and with that kept out a row

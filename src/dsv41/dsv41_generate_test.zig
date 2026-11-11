@@ -976,7 +976,10 @@ fn forwardIds(xfm: *Trunk, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !mlx.ml
     defer a.free(ids32);
     for (ids, ids32) |t, *o| o.* = @intCast(t);
     const shape = [_]c_int{ 1, @intCast(ids.len) };
+    // On the side the forward's output is on, as the generator makes its token arrays.
+    const host = mlx.engine.enter(xfm.outStream());
     const arr = mlx.mlx_array_new_data(ids32.ptr, &shape, 2, .int32);
+    host.end();
     defer _ = mlx.mlx_array_free(arr);
     return xfm.forwardWith(ctx, arr);
 }
@@ -984,7 +987,7 @@ fn forwardIds(xfm: *Trunk, ctx: *trunk_mod.ForwardCtx, ids: []const u32) !mlx.ml
 fn argmaxHost(xfm: *Trunk, logits: mlx.mlx_array) !u32 {
     var am = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am);
-    try mlx.check(mlx.mlx_argmax_axis(&am, logits, -1, false, xfm.s));
+    try mlx.check(mlx.mlx_argmax_axis(&am, logits, -1, false, xfm.outStream()));
     try mlx.check(mlx.mlx_array_eval(am));
     var v: i32 = 0;
     try mlx.check(mlx.mlx_array_item_int32(&v, am));
@@ -1575,6 +1578,9 @@ const ImageStandIn = struct {
         var self: ImageStandIn = .{ .fx = fx, .image_was = m.cfg.image_token_id, .rows = mlx.mlx_array_new() };
         m.cfg.image_token_id = m.cfg.vocab - 1;
         errdefer self.drop();
+        // The image biases and the tower's rows are the load's own: of the side the model forwards on.
+        const host = mlx.engine.enter(fx.xfm.outStream());
+        defer host.end();
         for (m.layers[0..m.cfg.layers]) |*ly| {
             try mlx.check(mlx.mlx_array_eval(ly.gate_bias));
             const bias = (mlx.mlx_array_data_float32(ly.gate_bias) orelse return error.NoBias)[0..mlx.mlx_array_size(ly.gate_bias)];
@@ -1592,7 +1598,7 @@ const ImageStandIn = struct {
         }
         const wide = mlx.mlx_array_new_data(span.ptr, &[_]c_int{ 10, @intCast(m.cfg.dim) }, 2, .float32);
         defer _ = mlx.mlx_array_free(wide);
-        try mlx.check(mlx.mlx_astype(&self.rows, wide, .bfloat16, fx.xfm.s));
+        try mlx.check(mlx.mlx_astype(&self.rows, wide, .bfloat16, fx.xfm.outStream()));
         try mlx.check(mlx.mlx_array_eval(self.rows));
         return self;
     }
@@ -1820,17 +1826,17 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const asked = try censusOf(dir);
-    // The target of every row is { 0, 0 }. What is left of a request is the token arrays its caller makes on MLX; of a
-    // load, the host arrays its warm makes outside a forward's scope and a few conversions.
+    // The target of every row is { 0, 0 }, and every phase of a request is there: no call at all. A load is left the
+    // host arrays its warm makes outside a forward's scope and a few conversions.
     // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of, so a real cut moves it.
     const ceilings = [_]Asked{
-        .{ .calls = 36, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
-        .{ .calls = 36, .ops = 0 }, // seeded rounds
-        .{ .calls = 52, .ops = 0 }, // serial steps with logprobs
+        .{ .calls = 0, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
+        .{ .calls = 0, .ops = 0 }, // seeded rounds
+        .{ .calls = 0, .ops = 0 }, // serial steps with logprobs
         .{ .calls = 0, .ops = 0 }, // a restore point captured
         .{ .calls = 0, .ops = 0 }, // the point restored
-        .{ .calls = 16, .ops = 0 }, // a step on the restored state
-        .{ .calls = 332, .ops = 0 }, // an image prompt
+        .{ .calls = 0, .ops = 0 }, // a step on the restored state
+        .{ .calls = 0, .ops = 0 }, // an image prompt
         .{ .calls = 7, .ops = 0 }, // the unload
         .{ .calls = 684, .ops = 6 }, // the load
     };
@@ -4138,7 +4144,7 @@ fn stepCalls(fx: *EngineFixture, prompt: []const u32, steps: usize) !StepCalls {
     return last;
 }
 
-test "dsv41 engine: a one-row decode step in steady state makes a pinned number of calls into MLX (DSV41_STQ_TINY)" {
+test "dsv41 engine: a one-row decode step in steady state makes no call into MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
@@ -4154,9 +4160,9 @@ test "dsv41 engine: a one-row decode step in steady state makes a pinned number 
     const steady = try stepCalls(&fx, prompt, 5);
     const again = try stepCalls(&fx, prompt, 5);
     try testing.expectEqual(steady, again);
-    // The stage-by-stage target is zero: kernel configs, array queries, host reads, evals, makers, frees, other ops.
-    try testing.expectEqual([_]u64{ 0, 11, 2, 1, 2, 4, 2 }, steady.split);
-    try testing.expectEqual(@as(u64, 22), steady.total);
+    // Zero, stage by stage: kernel configs, array queries, host reads, evals, makers, frees, other ops.
+    try testing.expectEqual([_]u64{ 0, 0, 0, 0, 0, 0, 0 }, steady.split);
+    try testing.expectEqual(@as(u64, 0), steady.total);
 }
 
 /// The ops a request puts on MLX in `want` serial ticks, MLX's keep-warm touch held off.
@@ -4541,8 +4547,8 @@ test "dsv41 engine: a Cooler load wraps its weights itself: the MLX route's gree
         var lent: [1024]u8 = undefined;
         try testing.expectEqualStrings("", try lentSince(names.items, &lent));
         try testing.expectEqual(weight_lends, mlx.engine.stats().mapped_lends);
-        // What a prefill and five steps still import is the token arrays the test hands the forward.
-        try testing.expectEqual(@as(u64, 6), mlx.engine.stats().imports - imports);
+        // A prefill and five steps import nothing: the token arrays are the engine's own.
+        try testing.expectEqual(@as(u64, 0), mlx.engine.stats().imports - imports);
     }
     mlx.engine.close();
     try testing.expectEqual(regions, model_mod.ownedRegionCount());

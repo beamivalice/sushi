@@ -1607,7 +1607,7 @@ pub const Generator = struct {
                 defer ctx.holds_point = false;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
-                const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
+                const chunk_input = idsArray(xfm, @ptrCast(&ids_i32[pos]), &chunk_shape);
                 defer _ = mlx.mlx_array_free(chunk_input);
 
                 const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
@@ -1673,6 +1673,8 @@ pub const Generator = struct {
                 // Eval KV cache — materializes this chunk's K/V, frees activation graph
                 const eval_start_ns = if (trace_enabled) prefill_sw.read() else 0;
                 {
+                    const host = mlx.engine.enter(xfm.outStream());
+                    defer host.end();
                     const eval_vec = mlx.mlx_vector_array_new();
                     defer _ = mlx.mlx_vector_array_free(eval_vec);
                     for (ctx.cache.entries) |*entry| {
@@ -1713,10 +1715,11 @@ pub const Generator = struct {
                             }
                         }
                     };
-                    _ = mlx.mlx_eval(eval_vec);
+                    // A chunk that left nothing to materialize asks for no eval.
+                    if (mlx.mlx_vector_array_size(eval_vec) > 0) _ = mlx.mlx_eval(eval_vec);
                 }
                 // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
-                _ = mlx.mlx_clear_cache();
+                clearPool(xfm);
                 if (trace_enabled) {
                     const eval_dt = prefill_sw.read() - eval_start_ns;
                     eval_ns += eval_dt;
@@ -1884,7 +1887,7 @@ pub const Generator = struct {
         // position so every consumer sees the classic [1, 1, V] shape.
         const tail_len: usize = prompt_ids.len - final_start;
         const last_shape = [_]c_int{ 1, @as(c_int, @intCast(tail_len)) };
-        const last_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[final_start]), &last_shape, 2, .int32);
+        const last_input = idsArray(xfm, @ptrCast(&ids_i32[final_start]), &last_shape);
         defer _ = mlx.mlx_array_free(last_input);
 
         // The MTP head needs the post-final-norm hidden as its first-step h_prev.
@@ -1966,7 +1969,7 @@ pub const Generator = struct {
             const start = [_]c_int{ 0, lshape[1] - 1, 0 };
             const stop = [_]c_int{ lshape[0], lshape[1], lshape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
-            try mlx.check(mlx.mlx_slice(&sliced, raw_logits, &start, 3, &stop, 3, &strides, 3, xfm.s));
+            try mlx.check(mlx.mlx_slice(&sliced, raw_logits, &start, 3, &stop, 3, &strides, 3, xfm.outStream()));
             break :blk sliced;
         };
         if (trace_enabled) {
@@ -2274,7 +2277,7 @@ pub const Generator = struct {
     /// cadence measures its next interval from this point.
     pub fn clearPoolBeforeDecode(self: *Generator) void {
         if (!prefill_plan.clearsPoolAtPrefillEnd(&self.xfm.config)) return;
-        _ = mlx.mlx_clear_cache();
+        clearPool(self.xfm);
         self.last_cache_clear_step = self.step;
     }
 
@@ -2293,7 +2296,7 @@ pub const Generator = struct {
         self.completion_tokens += n;
         self.step += n;
         if (prefill_plan.shouldClearAllocatorCache(self.step, self.last_cache_clear_step, prefill_plan.CACHE_CLEAR_INTERVAL)) {
-            _ = mlx.mlx_clear_cache();
+            clearPool(self.xfm);
             self.last_cache_clear_step = self.step;
         }
     }
@@ -2413,7 +2416,7 @@ pub const Generator = struct {
 
         const tok_i32: i32 = @intCast(tok);
         const tok_shape = [_]c_int{ 1, 1 };
-        const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+        const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
         defer _ = mlx.mlx_array_free(tok_input);
         const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
         const arr = [_]mlx.mlx_array{next_logits};
@@ -2821,7 +2824,7 @@ pub const Generator = struct {
         defer allocator.free(ids_i32);
         for (input.items, 0..) |t, i| ids_i32[i] = @intCast(t);
         const shape = [_]c_int{ 1, @intCast(input.items.len) };
-        const tok_input = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 2, .int32);
+        const tok_input = idsArray(self.xfm, ids_i32.ptr, &shape);
         defer _ = mlx.mlx_array_free(tok_input);
         const all_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
         defer _ = mlx.mlx_array_free(all_logits);
@@ -3273,7 +3276,7 @@ pub const Generator = struct {
         {
             const tok_i32: i32 = @intCast(self.next_token_id);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const t_fwd = tick_prof.mark();
             self.pending_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
@@ -3369,7 +3372,7 @@ pub const Generator = struct {
         } else blk: {
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const t_fwd = tick_prof.mark();
             const out = try self.xfm.forwardWith(&self.ctx, tok_input);
@@ -3573,7 +3576,7 @@ pub const Generator = struct {
         if (self.step < self.max_tokens) {
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{next_logits};
@@ -3683,7 +3686,7 @@ pub const Generator = struct {
         if (self.step < self.max_tokens) {
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{next_logits};
@@ -3848,7 +3851,7 @@ pub const Generator = struct {
             // Pipeline miss: forward the realized token.
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{nl};
@@ -3908,7 +3911,7 @@ pub const Generator = struct {
     fn startAsyncForward(self: *Generator, token_id: u32) void {
         const tok_i32: i32 = @intCast(token_id);
         const tok_shape = [_]c_int{ 1, 1 };
-        const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+        const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
         defer _ = mlx.mlx_array_free(tok_input);
 
         const logits = self.xfm.forwardWith(&self.ctx, tok_input) catch return;
@@ -3958,6 +3961,20 @@ fn drawRoot(io: std.Io, seed: ?u64) !u64 {
     var bytes: [8]u8 = undefined;
     try io.randomSecure(&bytes);
     return std.mem.readInt(u64, &bytes, .little);
+}
+
+/// Returns the buffers a request's forwards freed into MLX's pool. A model that forwards on the engine parks none
+/// there: its own pool is held to a cap each forward installs (`engine.budget`).
+fn clearPool(xfm: *const Trunk) void {
+    if (!mlx.engine.isStream(xfm.outStream())) _ = mlx.mlx_clear_cache();
+}
+
+/// Token ids as the `[1, n]` int32 array a forward takes, made on the side its output is on (`Trunk.outStream`): the
+/// engine's own array for a model that forwards there, with no array of MLX's to take in.
+fn idsArray(xfm: *const Trunk, ids: [*]const i32, shape: *const [2]c_int) mlx.mlx_array {
+    const host = mlx.engine.enter(xfm.outStream());
+    defer host.end();
+    return mlx.mlx_array_new_data(ids, shape, 2, .int32);
 }
 
 /// A committed token as the `[1]` int32 array a sample would be.
