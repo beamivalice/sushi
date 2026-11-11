@@ -83,9 +83,13 @@ pub fn applyKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, inputs: []const A, 
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     // A Metal kernel runs on the GPU stream even when the scope's ops run on the CPU stream (the tests' exact one).
-    const gpu = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(gpu);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, if (mlx.streamIsGpu(sc.s)) sc.s else gpu));
+    if (mlx.streamIsGpu(sc.s)) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, sc.s));
+    } else {
+        const gpu = mlx.mlx_default_gpu_stream_new();
+        defer _ = mlx.mlx_stream_free(gpu);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, gpu));
+    }
     for (outs, 0..) |*o, i| {
         o.* = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(o, ov, i));

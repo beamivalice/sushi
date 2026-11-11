@@ -1838,16 +1838,21 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
     // The target of every row is { 0, 0 }. What is left of a request is the engine importing arrays MLX owns (the
     // weights, the experts' slabs and maps), one set of queries and a free each; a capture still builds on MLX.
     try testing.expectEqualSlices(Asked, &.{
-        .{ .calls = 97562, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
-        .{ .calls = 97562, .ops = 0 }, // seeded rounds
-        .{ .calls = 80429, .ops = 0 }, // serial steps with logprobs
+        .{ .calls = 94508, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
+        .{ .calls = 94508, .ops = 0 }, // seeded rounds
+        .{ .calls = 77955, .ops = 0 }, // serial steps with logprobs
         .{ .calls = 253, .ops = 87 }, // a restore point captured
         .{ .calls = 149, .ops = 0 }, // the point restored
-        .{ .calls = 6093, .ops = 0 }, // a step on the restored state
-        .{ .calls = 40738, .ops = 0 }, // an image prompt
+        .{ .calls = 5923, .ops = 0 }, // a step on the restored state
+        .{ .calls = 39478, .ops = 0 }, // an image prompt
         .{ .calls = 4373, .ops = 0 }, // the unload
-        .{ .calls = 490327, .ops = 3054 }, // the load
-    }, &asked);
+    }, asked[0..8]);
+    // The load: a process's first makes some 800 calls more than a later one (what the process keeps), so its calls
+    // are held under the first load's count and within 2000 of it; a real cut moves the ceiling.
+    const load_ceiling = 476279;
+    try testing.expectEqual(@as(u64, 3054), asked[8].ops);
+    try testing.expect(asked[8].calls <= load_ceiling);
+    try testing.expect(asked[8].calls + 2000 > load_ceiling);
 }
 
 test "dsv41 engine: a prefill forward of 2 to 16 rows gives MLX's logits and the steps after it MLX's bytes (DSV41_STQ_TINY)" {
@@ -3965,8 +3970,8 @@ test "dsv41 engine: a one-row decode step in steady state makes a pinned number 
     const again = try stepCalls(&fx, prompt, 5);
     try testing.expectEqual(steady, again);
     // The stage-by-stage target is zero: kernel configs, array queries, host reads, evals, makers, frees, other ops.
-    try testing.expectEqual([_]u64{ 0, 3863, 489, 1, 87, 657, 570 }, steady.split);
-    try testing.expectEqual(@as(u64, 5667), steady.total);
+    try testing.expectEqual([_]u64{ 0, 3863, 489, 1, 2, 572, 570 }, steady.split);
+    try testing.expectEqual(@as(u64, 5497), steady.total);
 }
 
 /// The ops a request puts on MLX in `want` serial ticks, MLX's keep-warm touch held off.
