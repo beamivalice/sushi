@@ -824,12 +824,12 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
             if (!armed or r.tokens[r.tokens.len - 1] != end_id) continue;
             gen.dspark_round_ends_at = null;
             try testing.expectEqual(point, prompt.len + gen.generated_ids.items.len);
-            try dsv41_prefix.writeDecodePointDsv41(&hc, &cache, dsv41_state.modelOf(&xfm).?, next[0..point], false, .{}, s);
+            try dsv41_prefix.writeDecodePointDsv41(&hc, &cache, dsv41_state.modelOf(&xfm).?, next[0..point], false, .{});
             written = true;
         }
         try testing.expect(written);
         // The end-of-request commit: the generator's own points (none here) and the whole token record.
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         var all = std.ArrayList(u32).empty;
         defer all.deinit(a);
         try all.appendSlice(a, &prompt);
@@ -1820,25 +1820,122 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const asked = try censusOf(dir);
-    // The target of every row is { 0, 0 }. What is left of a request is the token arrays its caller makes on MLX and
-    // frees of empty handles; of a load, the host arrays its warm makes outside a forward's scope and a few conversions.
+    // The target of every row is { 0, 0 }. What is left of a request is the token arrays its caller makes on MLX; of a
+    // load, the host arrays its warm makes outside a forward's scope and a few conversions.
     // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of, so a real cut moves it.
     const ceilings = [_]Asked{
-        .{ .calls = 150, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
-        .{ .calls = 150, .ops = 0 }, // seeded rounds
-        .{ .calls = 155, .ops = 0 }, // serial steps with logprobs
+        .{ .calls = 36, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
+        .{ .calls = 36, .ops = 0 }, // seeded rounds
+        .{ .calls = 52, .ops = 0 }, // serial steps with logprobs
         .{ .calls = 0, .ops = 0 }, // a restore point captured
         .{ .calls = 0, .ops = 0 }, // the point restored
         .{ .calls = 16, .ops = 0 }, // a step on the restored state
-        .{ .calls = 440, .ops = 0 }, // an image prompt
-        .{ .calls = 105, .ops = 0 }, // the unload
-        .{ .calls = 2520, .ops = 6 }, // the load
+        .{ .calls = 332, .ops = 0 }, // an image prompt
+        .{ .calls = 7, .ops = 0 }, // the unload
+        .{ .calls = 684, .ops = 6 }, // the load
     };
     for (ceilings, asked) |ceiling, got| {
         try testing.expectEqual(ceiling.ops, got.ops);
         try testing.expect(got.calls <= ceiling.calls);
         try testing.expect(got.calls + ceiling.calls / 20 >= ceiling.calls);
     }
+}
+
+test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and restores it, byte for byte, with nothing asked of MLX (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    const pc = @import("../prefix_cache.zig");
+    const kv_disk_cache = @import("../kv_disk_cache.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var buf: [600]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    const point = 512;
+
+    // The tier as the scheduler arms it, on a grid the point is on.
+    const Tier = struct {
+        fn open(f: *EngineFixture, at: []const u8) !pc.HotPrefixCache {
+            var hc = pc.HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+            errdefer hc.deinit();
+            hc.ssd_first = true;
+            hc.hybrid = true;
+            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, testing.io, at, "dsv41-census", 0, 128);
+            hc.disk.?.ssd_first = true;
+            hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+            hc.disk.?.enableBackgroundWriter();
+            const c = &f.config.dsv41.?;
+            const divs = try dsv41_prefix.rowDivisors(testing.allocator, c, true);
+            defer testing.allocator.free(divs);
+            hc.disk.?.ssm_max_per_entry = dsv41_prefix.disk_checkpoint_cap;
+            try hc.disk.?.setGrownSpec(256, divs, c.stateBytesPerToken());
+            hc.arrays_on = dsv41_prefix.arraysOn(&f.config);
+            hc.disk.?.arrays_on = hc.arrays_on;
+            return hc;
+        }
+    };
+    var asked: [2]Asked = undefined;
+    // The state at the point as an owned copy, for the bytes the restore must give back.
+    var want: trunk_mod.SSMCheckpoint = undefined;
+    var wanted = false;
+    defer if (wanted) want.deinit(a);
+    {
+        var hc = try Tier.open(&fx, base);
+        defer hc.deinit();
+        try fx.xfm.resetCache();
+        var ctx = fx.xfm.defaultCtx();
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..point]));
+        ctx.cache.step = point;
+        want = try dsv41_prefix.capture(a, m, point);
+        wanted = true;
+        var c = try Census.begin(m);
+        errdefer c.names.deinit(a);
+        const cps = try a.alloc(trunk_mod.SSMCheckpoint, 1);
+        cps[0] = (try dsv41_prefix.captureCheckpoint(a, &fx.xfm, point, true)).?;
+        dsv41_prefix.writeThroughDsv41(&hc, m, ctx.cache, prompt[0..point], false, .{}, cps, "prefill");
+        try testing.expect(cps[0].isReleased());
+        try dsv41_prefix.markRows(ctx.cache, @import("dsv41_model.zig").stateStream(m));
+        _ = try hc.commitWithState(ctx.cache, prompt[0..point], false, 0, cps, null, null);
+        hc.flushPendingDisk(fx.xfm.s);
+        hc.disk.?.drainWriter();
+        asked[0] = try c.end("a 512-row restore point written to the SSD tier");
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+    {
+        var hc = try Tier.open(&fx, base);
+        defer hc.deinit();
+        try fx.xfm.resetCache();
+        const ctx = fx.xfm.defaultCtx();
+        var moe: usize = 0;
+        var c = try Census.begin(m);
+        errdefer c.names.deinit(a);
+        const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, ctx.cache, &moe, m, fx.xfm.s, prompt, false, 0, null, &.{}, null, false);
+        asked[1] = try c.end("the point restored from the SSD tier");
+        try testing.expectEqual(@as(usize, point), res.matched);
+        var got = try dsv41_prefix.capture(a, m, point);
+        defer got.deinit(a);
+        try testing.expectEqual(want.layers.len, got.layers.len);
+        for (want.layers, got.layers) |w, g| {
+            for ([_][2]mlx.mlx_array{ .{ w.conv_state, g.conv_state }, .{ w.ssm_state, g.ssm_state } }) |pair| {
+                try testing.expect(mlx.engine.isOurs(pair[1]));
+                try testing.expectEqual(mlx.mlx_array_dtype(pair[0]), mlx.mlx_array_dtype(pair[1]));
+                try testing.expectEqualSlices(c_int, mlx.getShape(pair[0]), mlx.getShape(pair[1]));
+                const bytes = mlx.mlx_array_size(pair[0]) * mlx.mlx_array_itemsize(pair[0]);
+                if (bytes == 0) continue;
+                try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(pair[0]).?[0..bytes], mlx.mlx_array_data_uint8(pair[1]).?[0..bytes]);
+            }
+        }
+    }
+    for (asked) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
 }
 
 test "dsv41 engine: a Cooler load answers the fused hyper-connection kernel's probe as the MLX route does: the probe runs on the engine's stream (DSV41_STQ_TINY)" {
@@ -3251,7 +3348,7 @@ test "dsv41 generator: after a DSpark request the slot cache marks its rows and 
     defer total.deinit(a);
     try total.appendSlice(a, ids[0..30]);
     try total.appendSlice(a, gen.generated_ids.items);
-    try dsv41_prefix.markRows(&slot_cache);
+    try dsv41_prefix.markRows(&slot_cache, mlx.gpuStream());
     var snap = try slot_cache.snapshotRetained(xfm.s);
     defer snap.deinit();
     try testing.expectEqual(slot_cache.step, snap.step);

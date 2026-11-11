@@ -88,6 +88,13 @@ pub inline fn side(args: anytype) Side {
     inline for (args) |arg| {
         if (@TypeOf(arg) == S) return if (core.isStream(arg)) .engine else if (active) .leak else .mlx;
     }
+    // A map's call follows the map, whatever it is given to hold.
+    inline for (args) |arg| {
+        switch (@TypeOf(arg)) {
+            MA, MS, MI => return if (tagged(arg.ctx)) .engine else .mlx,
+            else => {},
+        }
+    }
     inline for (args) |arg| {
         switch (@TypeOf(arg)) {
             A => if (core.isOurs(arg)) return .engine,
@@ -219,6 +226,16 @@ pub fn mlx_array_new_data(host: ?*const anyopaque, dims: [*]const c_int, dim: c_
     return core.handle(t);
 }
 
+/// An array of ours over a buffer no pass binds, and its bytes for the caller to fill before any op reads it.
+pub fn hostFilled(dtype: mlx.mlx_dtype, dims: []const c_int, bytes: *[]u8) ?A {
+    const t = core.freshHost(dtype, dims) catch |e| {
+        _ = fail("host_array", e);
+        return null;
+    };
+    bytes.* = t.store.ptr[0..t.nbytes()];
+    return core.handle(t);
+}
+
 fn scalar(comptime T: type, value: T, dtype: mlx.mlx_dtype) A {
     const v = value;
     const t = core.fromHost(std.mem.asBytes(&v), dtype, &.{}) catch |e| {
@@ -345,6 +362,8 @@ pub fn kernelKeyBuilds() u64 {
 }
 pub const budget = core.budget;
 pub const room = core.room;
+pub const uncapped = core.uncapped;
+pub const capped = core.capped;
 pub const close = core.close;
 pub const kernelProfile = core.kernelProfile;
 pub const resetKernelProfile = core.resetKernelProfile;
@@ -426,6 +445,149 @@ fn vecAppend(v: *Vec, a: A) bool {
 
 pub fn mlx_vector_array_new() V {
     return vecHandle(newVec() orelse return .{});
+}
+
+// ── Maps: names to arrays and names to strings, in the order they were put ──
+
+const MA = mlx.mlx_map_string_to_array;
+const MS = mlx.mlx_map_string_to_string;
+const MI = mlx.mlx_map_string_to_array_iterator;
+
+/// mlx-c's answer for a name a map does not hold, and for an iterator at its end: no error is latched.
+const absent: c_int = 2;
+
+fn tagged(ctx: ?*anyopaque) bool {
+    return @intFromPtr(ctx) & 1 != 0;
+}
+
+/// Whether a map handle's `ctx` is a map of ours.
+pub const isMap = tagged;
+
+fn Map(comptime Value: type) type {
+    return struct {
+        names: std.ArrayList([:0]u8) = .empty,
+        values: std.ArrayList(Value) = .empty,
+
+        const Self = @This();
+
+        fn of(ctx: ?*anyopaque) *Self {
+            return @ptrFromInt(@intFromPtr(ctx) & ~@as(usize, 1));
+        }
+
+        fn create() ?*anyopaque {
+            const m = gpa.create(Self) catch return null;
+            m.* = .{};
+            return @ptrFromInt(@intFromPtr(m) | 1);
+        }
+
+        fn find(self: *const Self, key: [*:0]const u8) ?usize {
+            const want = std.mem.span(key);
+            for (self.names.items, 0..) |name, i| if (std.mem.eql(u8, name, want)) return i;
+            return null;
+        }
+
+        /// Takes `value`. A name already held gets it, and its old value is returned for the caller to drop.
+        fn put(self: *Self, key: [*:0]const u8, value: Value) error{OutOfMemory}!?Value {
+            if (self.find(key)) |i| {
+                const old = self.values.items[i];
+                self.values.items[i] = value;
+                return old;
+            }
+            const name = try gpa.dupeSentinel(u8, std.mem.span(key), 0);
+            errdefer gpa.free(name);
+            try self.names.append(gpa, name);
+            errdefer _ = self.names.pop();
+            try self.values.append(gpa, value);
+            return null;
+        }
+
+        fn destroy(self: *Self) void {
+            for (self.names.items) |name| gpa.free(name);
+            self.names.deinit(gpa);
+            self.values.deinit(gpa);
+            gpa.destroy(self);
+        }
+    };
+}
+
+const ArrayMap = Map(A);
+const StringMap = Map([:0]u8);
+
+pub fn mlx_map_string_to_array_new() MA {
+    return .{ .ctx = ArrayMap.create() };
+}
+
+pub fn mlx_map_string_to_array_free(map: MA) c_int {
+    const m = ArrayMap.of(map.ctx);
+    for (m.values.items) |a| _ = mlx_array_free(a);
+    m.destroy();
+    return 0;
+}
+
+pub fn mlx_map_string_to_array_insert(map: MA, key: [*:0]const u8, value: A) c_int {
+    var held: A = .{};
+    if (mlx_array_set(&held, value) != 0) return 1;
+    const old = ArrayMap.of(map.ctx).put(key, held) catch {
+        _ = mlx_array_free(held);
+        return fail("map_string_to_array_insert", error.OutOfMemory);
+    };
+    if (old) |a| _ = mlx_array_free(a);
+    return 0;
+}
+
+pub fn mlx_map_string_to_array_get(value: *A, map: MA, key: [*:0]const u8) c_int {
+    const m = ArrayMap.of(map.ctx);
+    return mlx_array_set(value, m.values.items[m.find(key) orelse return absent]);
+}
+
+const MapCursor = struct { map: *ArrayMap, at: usize = 0 };
+
+pub fn mlx_map_string_to_array_iterator_new(map: MA) MI {
+    const c = gpa.create(MapCursor) catch return .{};
+    c.* = .{ .map = ArrayMap.of(map.ctx) };
+    return .{ .ctx = @ptrFromInt(@intFromPtr(c) | 1), .map_ctx = map.ctx };
+}
+
+pub fn mlx_map_string_to_array_iterator_free(it: MI) c_int {
+    gpa.destroy(@as(*MapCursor, @ptrFromInt(@intFromPtr(it.ctx) & ~@as(usize, 1))));
+    return 0;
+}
+
+pub fn mlx_map_string_to_array_iterator_next(key: *?[*:0]const u8, value: *A, it: MI) c_int {
+    const c: *MapCursor = @ptrFromInt(@intFromPtr(it.ctx) & ~@as(usize, 1));
+    if (c.at >= c.map.names.items.len) return absent;
+    key.* = c.map.names.items[c.at].ptr;
+    const rc = mlx_array_set(value, c.map.values.items[c.at]);
+    c.at += 1;
+    return rc;
+}
+
+pub fn mlx_map_string_to_string_new() MS {
+    return .{ .ctx = StringMap.create() };
+}
+
+pub fn mlx_map_string_to_string_free(map: MS) c_int {
+    const m = StringMap.of(map.ctx);
+    for (m.values.items) |v| gpa.free(v);
+    m.destroy();
+    return 0;
+}
+
+pub fn mlx_map_string_to_string_insert(map: MS, key: [*:0]const u8, value: [*:0]const u8) c_int {
+    const held = gpa.dupeSentinel(u8, std.mem.span(value), 0) catch return fail("map_string_to_string_insert", error.OutOfMemory);
+    const old = StringMap.of(map.ctx).put(key, held) catch {
+        gpa.free(held);
+        return fail("map_string_to_string_insert", error.OutOfMemory);
+    };
+    if (old) |v| gpa.free(v);
+    return 0;
+}
+
+/// The string stays the map's: it lives until the name is put again or the map is freed.
+pub fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: MS, key: [*:0]const u8) c_int {
+    const m = StringMap.of(map.ctx);
+    value.* = m.values.items[m.find(key) orelse return absent].ptr;
+    return 0;
 }
 
 pub fn mlx_vector_array_new_data(items: [*]const A, n: usize) V {
@@ -2166,6 +2328,56 @@ test "engine dequantize gives MLX's bytes: affine 4-bit bf16 and mxfp8 to f32" {
     const group_scales = hostArray(u8, &exps, &.{ 3, 10 }, .uint8);
     defer _ = mlx.mlx_array_free(group_scales);
     try expectSame(Build.mxfp8, &.{ w, group_scales });
+}
+
+test "a map of the engine's holds arrays and strings by name, in the order they were put, and answers mlx-c's way for a name it lacks" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const one = [_]f32{ 1, 2 };
+    const a = mlx_array_new_data(&one, &[_]c_int{2}, 1, .float32);
+    defer _ = mlx_array_free(a);
+    const b = mlx_array_new_data(&one, &[_]c_int{ 1, 2 }, 2, .float32);
+    defer _ = mlx_array_free(b);
+
+    const map = mlx_map_string_to_array_new();
+    defer _ = mlx_map_string_to_array_free(map);
+    try t.expectEqual(@as(c_int, 0), mlx_map_string_to_array_insert(map, "second", b));
+    try t.expectEqual(@as(c_int, 0), mlx_map_string_to_array_insert(map, "first", a));
+    // A name put again takes the new array.
+    try t.expectEqual(@as(c_int, 0), mlx_map_string_to_array_insert(map, "second", a));
+    var got: A = .{};
+    defer _ = mlx_array_free(got);
+    try t.expectEqual(@as(c_int, 0), mlx_map_string_to_array_get(&got, map, "second"));
+    try t.expectEqual(core.of(a).store, core.of(got).store);
+    try t.expectEqual(@as(usize, 1), core.of(got).ndim);
+    try t.expectEqual(@as(c_int, 2), mlx_map_string_to_array_get(&got, map, "third"));
+
+    const it = mlx_map_string_to_array_iterator_new(map);
+    defer _ = mlx_map_string_to_array_iterator_free(it);
+    var key: ?[*:0]const u8 = null;
+    for ([_][]const u8{ "second", "first" }) |name| {
+        try t.expectEqual(@as(c_int, 0), mlx_map_string_to_array_iterator_next(&key, &got, it));
+        try t.expectEqualStrings(name, std.mem.span(key.?));
+    }
+    try t.expectEqual(@as(c_int, 2), mlx_map_string_to_array_iterator_next(&key, &got, it));
+
+    const meta = mlx_map_string_to_string_new();
+    defer _ = mlx_map_string_to_string_free(meta);
+    try t.expectEqual(@as(c_int, 0), mlx_map_string_to_string_insert(meta, "layers", "4"));
+    try t.expectEqual(@as(c_int, 0), mlx_map_string_to_string_insert(meta, "layers", "40"));
+    var value: [*:0]const u8 = undefined;
+    try t.expectEqual(@as(c_int, 0), mlx_map_string_to_string_get(&value, meta, "layers"));
+    try t.expectEqualStrings("40", std.mem.span(value));
+    try t.expectEqual(@as(c_int, 2), mlx_map_string_to_string_get(&value, meta, "init"));
+
+    // MLX's file writer never sees a map of ours: the call is refused by name.
+    const was_enabled = enabled;
+    enabled = true;
+    defer enabled = was_enabled;
+    var buf: [256]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    try t.expectEqual(@as(c_int, 1), mlx.mlx_save_safetensors("/dev/null", map, meta));
+    try t.expect(std.mem.indexOf(u8, mlx.takeError(&buf).?, "[engine] mlx_save_safetensors") != null);
 }
 
 test "engine quantize gives MLX's codes, scales and biases: affine 8-bit groups of 128 over bf16 and 4-bit groups of 64 over f32" {

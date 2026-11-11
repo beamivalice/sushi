@@ -385,6 +385,8 @@ pub const KVCache = struct {
     pub fn snapshotRetained(self: *const KVCache, s: mlx.mlx_stream) !KVCacheSnapshot {
         var snap = try self.snapshot();
         errdefer snap.deinit();
+        const scope = mlx.engine.enter(s);
+        defer scope.end();
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
         var copied: usize = 0;

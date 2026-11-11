@@ -59,8 +59,8 @@ pub fn checkpointsRequired(config: *const @import("../model.zig").ModelConfig) b
     return true;
 }
 
-pub fn handover(self: *pc.HotPrefixCache, m: State, s: mlx.mlx_stream) void {
-    releaseLive(self, m, s, "handover");
+pub fn handover(self: *pc.HotPrefixCache, m: State, _: mlx.mlx_stream) void {
+    releaseLive(self, m, "handover");
 }
 
 /// Snapshot layers a restore point holds: each model slot's four arrays ride two layers' conv and ssm fields
@@ -326,7 +326,7 @@ pub const Live = struct {
 
 /// The SSD tier indexes a prefix by its KV rows, and this cache holds none: layer 0 carries one byte per token
 /// so the tier's chunk files, sizes and scan cover the entry. Done before a commit; the forward never reads it.
-pub fn markRows(cache: *transformer.KVCache) !void {
+pub fn markRows(cache: *transformer.KVCache, s: mlx.mlx_stream) !void {
     const n = cache.step;
     if (n == 0 or cache.entries.len == 0) return;
     const e = &cache.entries[0];
@@ -336,7 +336,7 @@ pub fn markRows(cache: *transformer.KVCache) !void {
     for (slots[0 .. if (cache.config.scheme == .off) 2 else 6]) |slot| {
         _ = mlx.mlx_array_free(slot.*);
         slot.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_zeros(slot, &[_]c_int{ 1, 1, @intCast(n), 1 }, 4, .uint8, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_zeros(slot, &[_]c_int{ 1, 1, @intCast(n), 1 }, 4, .uint8, s));
         try mlx.check(mlx.mlx_array_eval(slot.*));
     }
     e.offset = n;
@@ -363,6 +363,12 @@ pub fn restorePointModel(xfm: *const transformer.Trunk) bool {
 pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *transformer.Trunk, pos: usize, to_ssd: bool) !?SSMCheckpoint {
     const m = dsv41_state.modelOf(xfm) orelse return null;
     return if (to_ssd and pos >= kv_disk_cache.MIN_PERSIST_TOKENS) try captureShared(allocator, m, pos) else try capture(allocator, m, pos);
+}
+
+/// A Cooler load's state is the engine's, and so is every array the caches make of it.
+pub fn arraysOn(config: *const @import("../model.zig").ModelConfig) ?mlx.mlx_stream {
+    const c = config.dsv41 orelse return null;
+    return if (@import("dsv41_borrow.zig").ownDecode(&c)) mlx.engine.stream() else null;
 }
 
 /// Gives the SSD tier this model's split of its restore points.
@@ -451,7 +457,7 @@ pub fn rollbackLive(
     ram_match: ?pc.RamMatch,
 ) ?pc.LookupResult {
     if (rollbackLiveInPlace(self, m, target_cache, target_moe_seq_offset, s, prompt_ids, has_tools, media_limits, ram_match)) |res| return res;
-    releaseLive(self, m, s, "handover");
+    releaseLive(self, m, "handover");
     return null;
 }
 
@@ -501,12 +507,16 @@ pub fn restoreDisk(
     has_tools: bool,
     media_limits: kv_disk_cache.MediaLimits,
     dflash_target: ?pc.DflashTarget,
-    s: mlx.mlx_stream,
+    _: mlx.mlx_stream,
 ) ?pc.LookupResult {
     _ = dflash_target;
+    const s = model.stateStream(m);
     const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @intCast(prompt_ids.len), media_limits) orelse return null;
     if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) return null;
     const sw = io_util.Stopwatch.init(d.io);
+    // The arrays read back are state: they take their own room in the engine's pool, whatever cap the last forward left.
+    const cap = mlx.engine.uncapped();
+    defer mlx.engine.capped(cap);
     var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, snapshotLayers(m), s) catch |err| {
         log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
         pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err);
@@ -539,12 +549,13 @@ pub fn restoreEntry(self: *pc.HotPrefixCache, m: State, e: *pc.Entry, restore_ca
 /// point leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
 /// commit returns. A point off the grid is kept live only (`Live`), whatever the tier does. Below the tier's floor nothing is written and the points stay for the commit.
 /// `held` names the phase that waited on the writer, for the log.
-pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream, held: []const u8) void {
+pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, held: []const u8) void {
+    const s = dsv41_model.stateStream(m);
     if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
     var pending = false;
     for (cps) |*cp| pending = pending or !cp.isReleased();
     if (!pending) return;
-    markRows(cache) catch |err| {
+    markRows(cache, s) catch |err| {
         log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
         return;
     };
@@ -568,10 +579,10 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
 
 /// The request's state at `tokens.len`, which must be where the model stands, as one restore point straight to the
 /// SSD tier: shared rows, staged and released before the next forward appends.
-pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCache, m: *dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, s: mlx.mlx_stream) !void {
+pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCache, m: *dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp) !void {
     var cps = [1]SSMCheckpoint{try captureShared(self.allocator, m, tokens.len)};
     defer cps[0].deinit(self.allocator);
-    writeThroughDsv41(self, m, cache, tokens, has_tools, media, &cps, s, "decode");
+    writeThroughDsv41(self, m, cache, tokens, has_tools, media, &cps, "decode");
 }
 
 /// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
@@ -583,8 +594,8 @@ pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, t
 }
 
 /// The state is about to be replaced: its record reaches SSD (`flushLiveDsv41`), then goes.
-pub fn releaseLive(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
-    flushLiveDsv41(self, m, s, why);
+pub fn releaseLive(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []const u8) void {
+    flushLiveDsv41(self, m, why);
     liveOf(self).clear(self.allocator);
 }
 
@@ -592,7 +603,7 @@ pub fn releaseLive(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_s
 pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: []const u8) void {
     const hc = if (entry.prefix_cache) |*p| p else return;
     const xfm = arch_handle.trunk(entry.handle orelse return);
-    flushLiveDsv41(hc, xfm.arch_state.dsv41.model orelse return, xfm.s, why);
+    flushLiveDsv41(hc, xfm.arch_state.dsv41.model orelse return, why);
 }
 
 /// Writes the live record's points that are not on SSD yet, while the rows they lean on are still the state's own: all
@@ -600,7 +611,8 @@ pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: 
 /// where the state is about to be lost (another conversation takes the slot, unload, shutdown, idle) and before anything
 /// appends to it; a point a later prefill overwrote is no longer in the record. A record with images is written under
 /// its vision key, which hashes the pixels, so only a prompt with the same images restores past the first image row.
-pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
+pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []const u8) void {
+    const s = dsv41_model.stateStream(m);
     const live = liveOf(self);
     if (self.disk == null or !self.ssd_first or !live.ready or live.epoch != m.state_epoch) return;
     // A pixel key with no boundary proves nothing about where its rows begin (`diskTextLen`).
@@ -627,7 +639,7 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.ml
     var cache = KVCache.initWithConfig(self.allocator, m.cfg.layers, live.quant) catch return;
     defer cache.deinit();
     cache.step = top;
-    markRows(&cache) catch |err| {
+    markRows(&cache, s) catch |err| {
         log.warn("  [dsv41-prefix] live points not flushed, rows not marked: {s}\n", .{@errorName(err)});
         return;
     };

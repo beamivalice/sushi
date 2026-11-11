@@ -314,7 +314,7 @@ test "DeepSeek SSD tier: a checkpoint written to disk reads back as the same byt
         var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
         defer cache.deinit();
         cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         const status = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
         try testing.expectEqual(pc.CommitStatus{ .disk_only = first.len }, status);
         try testing.expectEqual(@as(usize, 0), hc.entryCount());
@@ -393,7 +393,7 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
             _ = mlx.mlx_get_active_memory(&before);
             try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, at));
             cache.step = at;
-            dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..at], false, .{}, cps.items, s, "prefill");
+            dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..at], false, .{}, cps.items, "prefill");
             try testing.expect(cps.items[0].isReleased());
             _ = mlx.mlx_synchronize(s);
             var after: usize = 0;
@@ -404,7 +404,7 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
             try testing.expect(after <= before + 2 * at + 2 * dsv41_prefix.liveOf(&hc).bytes());
         }
         cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         try testing.expectEqual(pc.CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
@@ -502,7 +502,7 @@ test "DeepSeek SSD tier split: every restore point on the grid reads back the by
         var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
         defer cache.deinit();
         cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         try testing.expectEqual(pc.CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
@@ -545,7 +545,6 @@ test "DeepSeek SSD tier split: a write-through prefill stages the points on the 
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
-    const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -576,7 +575,7 @@ test "DeepSeek SSD tier split: a write-through prefill stages the points on the 
         try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, at));
         cache.step = at;
         const before = hc.disk.?.point_bytes_written;
-        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..at], false, .{}, cps.items, s, "prefill");
+        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..at], false, .{}, cps.items, "prefill");
         hc.disk.?.drainWriter();
         try testing.expect(cps.items[cps.items.len - 1].isReleased());
         // Every point is kept for the next turn's rollback, staged or not.
@@ -633,7 +632,7 @@ test "DeepSeek SSD tier split: an heir that restored from its donor links the do
         var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
         defer cache.deinit();
         cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
@@ -654,7 +653,7 @@ test "DeepSeek SSD tier split: an heir that restored from its donor links the do
             var one = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, at)};
             defer one[0].deinit(testing.allocator);
             cache.step = at;
-            dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, next[0..at], false, .{}, &one, s, "prefill");
+            dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, next[0..at], false, .{}, &one, "prefill");
         }
         hc.disk.?.drainWriter();
         try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
@@ -717,7 +716,7 @@ test "DeepSeek SSD tier split: an heir that restored mid-span and recomputed row
         var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
         defer cache.deinit();
         cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
@@ -737,7 +736,7 @@ test "DeepSeek SSD tier split: an heir that restored mid-span and recomputed row
             var one = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, at)};
             defer one[0].deinit(testing.allocator);
             cache.step = at;
-            dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, next[0..at], false, .{}, &one, s, "prefill");
+            dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, next[0..at], false, .{}, &one, "prefill");
         }
         hc.disk.?.drainWriter();
         try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
@@ -797,7 +796,7 @@ test "DeepSeek decode point: a restore point taken mid-decode serves the next tu
         _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[0..512], .last));
         try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, 512));
         cache.step = 512;
-        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..512], false, .{}, cps.items, s, "prefill");
+        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..512], false, .{}, cps.items, "prefill");
         try testing.expect(cps.items[0].isReleased());
         _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[512..], .last));
         for (gen[0..24]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
@@ -815,7 +814,7 @@ test "DeepSeek decode point: a restore point taken mid-decode serves the next tu
         ram_cps[0] = try dsv41_prefix.capture(testing.allocator, net.m, point);
         try testing.expectEqual(pc.CommitStatus{ .ok = point }, try ram.commitWithState(&ram_cache, &tokens, false, 0, ram_cps, null, null));
 
-        try dsv41_prefix.writeDecodePointDsv41(&hc, &cache, net.m, &tokens, false, .{}, s);
+        try dsv41_prefix.writeDecodePointDsv41(&hc, &cache, net.m, &tokens, false, .{});
         // The writer has the state; the request goes on decoding from where it stood.
         for (gen[24..]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
 
@@ -823,7 +822,7 @@ test "DeepSeek decode point: a restore point taken mid-decode serves the next tu
         var all: [first_len + 40]u32 = undefined;
         @memcpy(all[0..first_len], first);
         @memcpy(all[first_len..], &gen);
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         // The end-of-request commit hands over the prefill's released point and adds none of its own.
         try testing.expectEqual(pc.CommitStatus{ .disk_only = all.len }, try hc.commitWithState(&cache, &all, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
         hc.flushPendingDisk(s);
@@ -887,7 +886,7 @@ fn flushTurn(net: *Dsv41Net, hc: *pc.HotPrefixCache, first: []const u32, gen: []
         if (point == flush_prompt_end) want_end.* = try dsv41_prefix.capture(testing.allocator, net.m, point);
         try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, point));
         cache.step = point;
-        dsv41_prefix.writeThroughDsv41(hc, net.m, &cache, first[0..point], false, .{}, cps.items, s, "prefill");
+        dsv41_prefix.writeThroughDsv41(hc, net.m, &cache, first[0..point], false, .{}, cps.items, "prefill");
     }
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at..], .last));
     for (gen[0..24]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
@@ -896,13 +895,13 @@ fn flushTurn(net: *Dsv41Net, hc: *pc.HotPrefixCache, first: []const u32, gen: []
     @memcpy(tokens[flush_first_len..], gen[0..24]);
     cache.step = flush_thought;
     want_thought.* = try dsv41_prefix.capture(testing.allocator, net.m, flush_thought);
-    try dsv41_prefix.writeDecodePointDsv41(hc, &cache, net.m, &tokens, false, .{}, s);
+    try dsv41_prefix.writeDecodePointDsv41(hc, &cache, net.m, &tokens, false, .{});
     for (gen[24..]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
     var all: [flush_first_len + 40]u32 = undefined;
     @memcpy(all[0..flush_first_len], first);
     @memcpy(all[flush_first_len..], gen);
     cache.step = all.len;
-    try dsv41_prefix.markRows(&cache);
+    try dsv41_prefix.markRows(&cache, mlx.gpuStream());
     _ = try hc.commitWithState(&cache, &all, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
     _ = dsv41_prefix.publishLiveDsv41(hc, net.m, &all, false, .{}, cache.config);
     hc.flushPendingDisk(s);
@@ -968,7 +967,6 @@ test "DeepSeek live flush: a clean shutdown flushes the same points, and a crash
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
-    const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -1016,7 +1014,7 @@ test "DeepSeek live flush: a clean shutdown flushes the same points, and a crash
         var hc = try dsv41SplitCache(io, base, "dsv41-clean", &net, 128);
         defer hc.deinit();
         try flushTurn(&net, &hc, first, &gen, &want_end, &want_thought);
-        dsv41_prefix.flushLiveDsv41(&hc, net.m, s, "shutdown");
+        dsv41_prefix.flushLiveDsv41(&hc, net.m, "shutdown");
         hc.disk.?.drainWriter();
     }
     defer want_end.deinit(testing.allocator);
@@ -1071,7 +1069,7 @@ test "DeepSeek live flush: a point inside generated tokens a later turn overwrot
     // The turn ends having generated over the old rows.
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[flush_prompt_end..], .last));
     _ = dsv41_prefix.publishLiveDsv41(&hc, net.m, next, false, .{}, target.config);
-    dsv41_prefix.flushLiveDsv41(&hc, net.m, s, "shutdown");
+    dsv41_prefix.flushLiveDsv41(&hc, net.m, "shutdown");
     hc.disk.?.drainWriter();
     for (hc.disk.?.entries.items) |*e| try testing.expect(std.mem.indexOfScalar(u32, e.ssm_positions, flush_thought) == null);
     var found = false;
@@ -1081,7 +1079,7 @@ test "DeepSeek live flush: a point inside generated tokens a later turn overwrot
     // The state another conversation replaced has nothing to flush.
     const before = hc.disk.?.point_bytes_written;
     dsv41_model.resetState(net.m);
-    dsv41_prefix.flushLiveDsv41(&hc, net.m, s, "shutdown");
+    dsv41_prefix.flushLiveDsv41(&hc, net.m, "shutdown");
     try testing.expectEqual(before, hc.disk.?.point_bytes_written);
 }
 
@@ -1089,7 +1087,6 @@ test "DeepSeek live flush: an image conversation's live points reach SSD under i
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
-    const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -1115,10 +1112,10 @@ test "DeepSeek live flush: an image conversation's live points reach SSD under i
         var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, flush_prompt_end)};
         defer cps[0].deinit(testing.allocator);
         cache.step = flush_prompt_end;
-        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, ids[0..flush_prompt_end], false, image, &cps, s, "prefill");
+        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, ids[0..flush_prompt_end], false, image, &cps, "prefill");
         _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, ids[flush_prompt_end..], .last));
         _ = dsv41_prefix.publishLiveDsv41(&hc, net.m, ids, false, image, cache.config);
-        dsv41_prefix.flushLiveDsv41(&hc, net.m, s, "shutdown");
+        dsv41_prefix.flushLiveDsv41(&hc, net.m, "shutdown");
         hc.disk.?.drainWriter();
     }
     defer want.deinit(testing.allocator);
@@ -1264,12 +1261,12 @@ test "DeepSeek live rollback: a turn that diverges inside the last turn's genera
             at = point;
             try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, point));
             cache.step = point;
-            dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..point], false, .{}, cps.items, s, "prefill");
+            dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..point], false, .{}, cps.items, "prefill");
         }
         _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at..], .last));
         for (gen) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
         cache.step = all.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         _ = try hc.commitWithState(&cache, &all, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
         _ = dsv41_prefix.publishLiveDsv41(&hc, net.m, &all, false, .{}, cache.config);
         hc.flushPendingDisk(s);
@@ -1345,10 +1342,10 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
             _ = mlx.mlx_array_free(try dsv41_model.extend(n.m, tokens[0..512], .last));
             try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, n.m, 512));
             cache.step = 512;
-            dsv41_prefix.writeThroughDsv41(h, n.m, &cache, tokens[0..512], false, .{}, cps.items, mlx.gpuStream(), "prefill");
+            dsv41_prefix.writeThroughDsv41(h, n.m, &cache, tokens[0..512], false, .{}, cps.items, "prefill");
             _ = mlx.mlx_array_free(try dsv41_model.extend(n.m, tokens[512..], .last));
             cache.step = tokens.len;
-            try dsv41_prefix.markRows(&cache);
+            try dsv41_prefix.markRows(&cache, mlx.gpuStream());
             _ = try h.commitWithState(&cache, tokens, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
             _ = dsv41_prefix.publishLiveDsv41(h, n.m, tokens, false, .{}, kv_quant.KVQuantConfig.dense);
             h.flushPendingDisk(mlx.gpuStream());
@@ -1470,7 +1467,7 @@ test "DeepSeek SSD tier: the namespace names the layout, and another layout's en
         var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
         defer cache.deinit();
         cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
@@ -1495,7 +1492,7 @@ test "DeepSeek SSD tier: the namespace names the layout, and another layout's en
         var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
         defer cache.deinit();
         cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
@@ -1551,7 +1548,7 @@ test "DeepSeek with both tiers: the RAM entry serves the active session and, onc
     var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
     defer cache.deinit();
     cache.step = first.len;
-    try dsv41_prefix.markRows(&cache);
+    try dsv41_prefix.markRows(&cache, mlx.gpuStream());
     try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
     hc.flushPendingDisk(s);
     hc.disk.?.drainWriter();
@@ -1597,7 +1594,7 @@ test "DeepSeek SSD tier under the engine's default KV scheme, which every slot c
         var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
         defer cache.deinit();
         cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
+        try dsv41_prefix.markRows(&cache, mlx.gpuStream());
         try testing.expectEqual(pc.CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
@@ -1649,7 +1646,7 @@ test "DeepSeek SSD tier: an image's restore points never land in, or come from, 
         var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, 512)};
         defer cps[0].deinit(testing.allocator);
         cache.step = 512;
-        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, ids[0..512], false, .{ .key = ka, .start = image_at }, &cps, s, "prefill");
+        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, ids[0..512], false, .{ .key = ka, .start = image_at }, &cps, "prefill");
     }
 
     // Image B: a cold prefill (A's record holds other pixels), writing its points through at 512 and 640.
@@ -1661,7 +1658,7 @@ test "DeepSeek SSD tier: an image's restore points never land in, or come from, 
         var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, 512)};
         defer cps[0].deinit(testing.allocator);
         cache.step = 512;
-        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, ids[0..512], false, .{ .key = kb, .start = image_at }, &cps, s, "prefill");
+        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, ids[0..512], false, .{ .key = kb, .start = image_at }, &cps, "prefill");
     }
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, ids[512..640], .last));
     var b_640 = try dsv41_prefix.capture(testing.allocator, net.m, 640);
@@ -1670,7 +1667,7 @@ test "DeepSeek SSD tier: an image's restore points never land in, or come from, 
         var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, 640)};
         defer cps[0].deinit(testing.allocator);
         cache.step = 640;
-        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, ids[0..640], false, .{ .key = kb, .start = image_at }, &cps, s, "prefill");
+        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, ids[0..640], false, .{ .key = kb, .start = image_at }, &cps, "prefill");
     }
     hc.disk.?.drainWriter();
 

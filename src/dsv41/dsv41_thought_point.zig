@@ -177,7 +177,7 @@ pub fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) 
     @memcpy(tokens[0..slot.full_prompt.len], slot.full_prompt);
     @memcpy(tokens[slot.full_prompt.len..], generated);
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, pos);
-    dsv41_prefix.writeDecodePointDsv41(hc, &slot.cache, dsv, tokens, slot.has_tools, media, xfm.s) catch |err| {
+    dsv41_prefix.writeDecodePointDsv41(hc, &slot.cache, dsv, tokens, slot.has_tools, media) catch |err| {
         log.warn("[dsv41-prefix] decode restore point not written: {s}\n", .{@errorName(err)});
     };
 }

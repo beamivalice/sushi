@@ -557,6 +557,28 @@ pub fn room(lens: []const usize) void {
     s.pool_limit = limit +| bytes;
 }
 
+/// The cap as `uncapped` found it, and the pool buffers in use then.
+pub const Uncapped = struct { limit: ?u64 = null, in_use: u64 = 0 };
+
+/// For what is built between forwards and outlives them when its sizes are not known ahead (state read back from
+/// disk): no cap from here until `capped`.
+pub fn uncapped() Uncapped {
+    const s = &(state orelse return .{});
+    takeBack();
+    const was: Uncapped = .{ .limit = s.pool_limit, .in_use = s.stats.pool_bytes - s.stats.pool_free };
+    s.pool_limit = null;
+    return was;
+}
+
+/// The cap `uncapped` lifted, raised by the buffers that came into use since; free buffers past it go.
+pub fn capped(was: Uncapped) void {
+    const s = &(state orelse return);
+    const limit = was.limit orelse return;
+    takeBack();
+    s.pool_limit = limit +| ((s.stats.pool_bytes - s.stats.pool_free) -| was.in_use);
+    _ = evict(s, s.pool_limit.?);
+}
+
 fn dropStore(store: *Store) void {
     store.refs -= 1;
     if (store.refs > 0) return;
@@ -706,6 +728,11 @@ fn freshFor(dtype: Dtype, shape: []const c_int, for_host: bool) Error!*Tensor {
     t.offset = 0;
     t.store = try poolStore(@max(t.nbytes(), 1), for_host);
     return t;
+}
+
+/// `fresh` over a buffer no pass has yet to run over: the host may write it at once.
+pub fn freshHost(dtype: Dtype, shape: []const c_int) Error!*Tensor {
+    return freshFor(dtype, shape, true);
 }
 
 /// A tensor holding a copy of `bytes`.
@@ -1318,6 +1345,28 @@ test "under a budget the pool gives its free buffers up for a new one, and refus
     try t.expectError(error.PoolOverBudget, fresh(.uint8, &.{9 * mb}));
     try t.expectEqual(before, stats().pool_bytes);
     release(c);
+}
+
+test "what is built with the cap lifted stays, and the cap comes back raised by it" {
+    const t = std.testing;
+    const s = try st();
+    const was = s.pool_limit;
+    defer s.pool_limit = was;
+    const mb = 1 << 20;
+    try sync();
+    try budget(0);
+    try t.expectError(error.PoolOverBudget, fresh(.uint8, &.{3 * mb}));
+    const lifted = uncapped();
+    const kept = try fresh(.uint8, &.{3 * mb});
+    defer release(kept);
+    const scratch = try fresh(.uint8, &.{5 * mb});
+    release(scratch);
+    try sync();
+    capped(lifted);
+    // The cap is the old one and what stayed: the scratch's buffer went, and nothing more fits.
+    try t.expectEqual(lifted.limit.? + classBytes(classOf(3 * mb)), s.pool_limit.?);
+    try t.expectEqual(@as(usize, 0), s.free[classOf(5 * mb)].items.len);
+    try t.expectError(error.PoolOverBudget, fresh(.uint8, &.{3 * mb}));
 }
 
 test "GPU time is the union of the command buffers' spans, and a short pause between two is idle time" {

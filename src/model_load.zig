@@ -1571,6 +1571,12 @@ fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedMod
             entry.prefix_cache.?.hybrid = has_ssm_layers or arch_config.fact(config, "state_beside_kv");
         }
         if (disk_tier) |tier| entry.prefix_cache.?.disk = tier;
+        entry.prefix_cache.?.arrays_on = prefix_arch.arraysOn(config);
+        if (entry.prefix_cache.?.disk) |*d| {
+            // MLX reads and writes the plain-file backend's safetensors, so that tier's arrays stay MLX's.
+            if (d.fs.vfs != null) d.arrays_on = entry.prefix_cache.?.arrays_on else if (entry.prefix_cache.?.arrays_on != null)
+                log.warn("[disk-cache] SUSHI_PREFIX_FS=real: this model's state is not MLX's, and the tier's files pass through MLX arrays\n", .{});
+        }
         // SSD-first: arch + env switch + a live disk tier (attached above); without one qwen4_exp takes the RAM arm.
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
             config,

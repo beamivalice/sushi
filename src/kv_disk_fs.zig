@@ -319,7 +319,7 @@ pub const Fs = struct {
         };
         const r = self.rel(path) orelse return error.MlxError;
         // A missing or unreadable file fails as `mlx_load_safetensors` fails on it.
-        const loaded = vt.loadTensors(v, r) catch |e| return switch (e) {
+        const loaded = vt.loadTensors(v, r, cpu) catch |e| return switch (e) {
             error.OutOfMemory => e,
             else => error.MlxError,
         };

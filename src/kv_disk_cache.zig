@@ -318,6 +318,9 @@ fn rawBytes(a: mlx.mlx_array) ?[*]const u8 {
 pub const DiskTier = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    /// Where a read makes and joins its arrays when the model's state is not MLX's: the stream the model's arch names
+    /// as the tier is armed. Null is MLX's CPU stream.
+    arrays_on: ?mlx.mlx_stream = null,
     /// Absolute root for this model's entries (`<base>/<fingerprint>`). Owned.
     root: []u8,
     /// Byte budget across all entries. 0 = unbounded.
@@ -1190,8 +1193,9 @@ pub const DiskTier = struct {
         if (n_chunks == 0) return error.DiskCacheEmptyEntry;
         self.chunks_loaded_last = n_chunks;
 
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
+        const rd = self.reading();
+        defer rd.end();
+        const cpu = rd.s;
 
         const kinds: []const []const u8 = if (quant.scheme == .off)
             &.{ "k", "v" }
@@ -1325,8 +1329,9 @@ pub const DiskTier = struct {
     /// Rebuilds a point's growing arrays: the entry's first `k` row segments in order, then the rows the point's own
     /// file kept. An array the segments do not hold is a fixed one and stays as loaded.
     fn joinGrownSegments(self: *DiskTier, id: u64, k: u32, layers: []trunk.SSMCacheEntrySnapshot) !void {
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
+        const rd = self.reading();
+        defer rd.end();
+        const cpu = rd.s;
         // pieces[2 * li + f]: layer li's conv (f = 0) or ssm (f = 1) rows from each segment.
         const pieces = try self.allocator.alloc(mlx.mlx_vector_array, 2 * layers.len);
         defer self.allocator.free(pieces);
@@ -1364,13 +1369,30 @@ pub const DiskTier = struct {
         };
     }
 
+    /// A read's stream, and the handles a read makes without one (maps, vectors) on that stream's side until `end`.
+    const Reading = struct {
+        s: mlx.mlx_stream,
+        scope: mlx.engine.Scope,
+
+        fn end(r: Reading) void {
+            r.scope.end();
+            _ = mlx.mlx_stream_free(r.s);
+        }
+    };
+
+    fn reading(self: *const DiskTier) Reading {
+        const s = self.arrays_on orelse mlx.mlx_default_cpu_stream_new();
+        return .{ .s = s, .scope = mlx.engine.enter(s) };
+    }
+
     /// Load a persisted SSM checkpoint file into a transient `SSMCheckpoint`
     /// (caller frees via `deinit`). The recorded layer count must match the
     /// target model's `ssm_entries` — a mismatch inside a fingerprint dir
     /// means corruption, never a different model.
     pub fn loadSsmFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize) !trunk.SSMCheckpoint {
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
+        const rd = self.reading();
+        defer rd.end();
+        const cpu = rd.s;
         const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors\x00", .{ self.root, id, pos });
         defer self.allocator.free(path);
         if (self.fs.size(path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
@@ -3098,6 +3120,8 @@ pub const DiskTier = struct {
     /// Make every tensor contiguous in place and materialize the list with exactly one batched
     /// `mlx_eval`, as `mlx::core::save_safetensors` does. A per-tensor eval is a full GPU sync each.
     fn materializeContiguous(tensors: []NamedTensor, s: mlx.mlx_stream) !void {
+        const scope = mlx.engine.enter(s);
+        defer scope.end();
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
         for (tensors) |*t| {

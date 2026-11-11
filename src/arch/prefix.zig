@@ -297,6 +297,14 @@ pub fn diskCheckpointCap(config: *const model.ModelConfig) ?u32 {
     }
 }
 
+/// The stream the arch's cached state lives on when it is not MLX's; null for MLX's own.
+pub fn arraysOn(config: *const model.ModelConfig) ?mlx.mlx_stream {
+    const tag = registry.ofModelType(config.model_type) orelse return null;
+    switch (tag) {
+        inline else => |t| return if (comptime @hasDecl(P(t), "arraysOn")) P(t).arraysOn(config) else null,
+    }
+}
+
 /// Tells the SSD tier how the arch's restore points split into rows that grow with the prompt and fixed arrays.
 pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const model.ModelConfig, tier: *kv_disk_cache.DiskTier) !void {
     const tag = registry.ofModelType(config.model_type) orelse return;

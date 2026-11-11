@@ -15,6 +15,13 @@ const DiskTier = kv_disk_cache.DiskTier;
 const Vfs = prefix_vfs.Vfs;
 const RowMap = vt.RowMap;
 
+/// The file's tensors as MLX's arrays, on its CPU stream as the tier reads them.
+fn loadMlx(vfs: *Vfs, path: []const u8) !vt.Loaded {
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    return vt.loadTensors(vfs, path, cpu);
+}
+
 const TSpec = struct { key: []const u8, shape: []const c_int, dtype: mlx.mlx_dtype, rows: ?RowMap = null };
 const KindSpec = struct { name: []const u8, kind: prefix_vfs.Kind, tensors: []const TSpec, meta: []const vt.MetaPair = &.{} };
 
@@ -239,7 +246,7 @@ fn expectKindMatchesTier(spec: KindSpec, sliced: bool) !void {
     defer ta.free(regen);
     try testing.expectEqualSlices(u8, want_bytes, regen);
 
-    const loaded = try vt.loadTensors(vfs, "e1/file.safetensors");
+    const loaded = try loadMlx(vfs, "e1/file.safetensors");
     defer loaded.deinit();
     const from_staged = try cpuLoad(staged_path);
     defer from_staged.deinit();
@@ -247,6 +254,16 @@ fn expectKindMatchesTier(spec: KindSpec, sliced: bool) !void {
     defer from_sync.deinit();
     try expectSameLoads(spec, from_staged, loaded);
     try expectSameLoads(spec, from_sync, loaded);
+
+    // The engine's own load of the file: the same again, with nothing asked of MLX.
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was_enabled);
+    const calls_before = mlx.engine.mlxCalls();
+    const own = try vt.loadTensors(vfs, "e1/file.safetensors", mlx.engine.stream());
+    defer own.deinit();
+    try testing.expectEqual(calls_before, mlx.engine.mlxCalls());
+    try expectSameLoads(spec, from_staged, own);
 }
 
 const kv_rows_map = RowMap{ .axis = 2, .pos0 = 3 * 1024 };
@@ -655,11 +672,11 @@ test "tensor files on the vfs: a flipped pack byte refuses that file with the ti
     }
     var vfs = try Vfs.open(ta, tio, vroot, .{});
     defer vfs.close();
-    try testing.expectError(error.MlxError, vt.loadTensors(vfs, "a"));
-    try testing.expectError(error.MlxError, vt.loadTensors(vfs, "a"));
-    const ok = try vt.loadTensors(vfs, "b");
+    try testing.expectError(error.MlxError, loadMlx(vfs, "a"));
+    try testing.expectError(error.MlxError, loadMlx(vfs, "a"));
+    const ok = try loadMlx(vfs, "b");
     defer ok.deinit();
-    try testing.expectError(error.FileNotFound, vt.loadTensors(vfs, "missing"));
+    try testing.expectError(error.FileNotFound, loadMlx(vfs, "missing"));
 }
 
 test "tensor files on the vfs: a staged file lands from another thread after its arrays are gone" {
@@ -795,7 +812,7 @@ fn expectProductionChunks(config: kv_quant.KVQuantConfig, dtype: mlx.mlx_dtype) 
         const regen = try vt.regenerate(vfs, ta, "chunk");
         defer ta.free(regen);
         try testing.expectEqualSlices(u8, want, regen);
-        const loaded = try vt.loadTensors(vfs, "chunk");
+        const loaded = try loadMlx(vfs, "chunk");
         defer loaded.deinit();
         try expectSameLoads(.{ .name = "", .kind = .kv, .tensors = specs }, from_tier, loaded);
     }
@@ -859,7 +876,7 @@ test "tensor files on the vfs: a load reads its blocks with no layer lock held" 
     };
     var writer: Writer = .{};
     const w = try std.Thread.spawn(.{}, Writer.watch, .{ &writer, vfs, &gate });
-    const loaded = vt.loadTensors(vfs, "a");
+    const loaded = loadMlx(vfs, "a");
     w.join();
     const got = try loaded;
     defer got.deinit();
@@ -913,14 +930,14 @@ test "tensor files on the vfs: a flipped byte in any block of a file, header, fi
         _ = try pl.file.readPositionalAll(tio, &one, at);
         one[0] ^= 0x5a;
         try pl.file.writePositionalAll(tio, &one, at);
-        try testing.expectError(error.MlxError, vt.loadTensors(vfs, "a"));
+        try testing.expectError(error.MlxError, loadMlx(vfs, "a"));
         one[0] ^= 0x5a;
         try pl.file.writePositionalAll(tio, &one, at);
     }
 
     var vfs = try Vfs.open(ta, tio, vroot, .{});
     defer vfs.close();
-    const got = try vt.loadTensors(vfs, "a");
+    const got = try loadMlx(vfs, "a");
     defer got.deinit();
     for ([_]struct { []const u8, mlx.mlx_array }{ .{ "f", f }, .{ "k", k } }) |want| {
         const key_z = try cstr(want[0]);

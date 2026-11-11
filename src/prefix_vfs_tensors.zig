@@ -155,6 +155,8 @@ fn materialize(allocator: Allocator, tensors: []const Tensor, s: mlx.mlx_stream)
         for (out[0..made]) |a| _ = mlx.mlx_array_free(a);
         allocator.free(out);
     }
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);
     for (tensors, out) |t, *slot| {
@@ -548,8 +550,13 @@ fn parseLayout(aa: Allocator, head: []const u8, tags: []const u32, hi: usize) !L
 /// checksum fails, or a file that does not parse, raises `error.MlxError`, the error a corrupt file raises today. The
 /// file's blocks are pinned and MLX reads them as it reads a plain file: lazily, on its IO threads, into its own
 /// buffers, with no layer lock held. Every tensor is evaluated before the load returns, so a bad block fails here.
-pub fn loadTensors(vfs: *Vfs, path: []const u8) !Loaded {
+/// On the engine's stream the tensors and both maps are the engine's, filled from the blocks on this thread.
+pub fn loadTensors(vfs: *Vfs, path: []const u8, s: mlx.mlx_stream) !Loaded {
     const src = Source.open(vfs, path) catch |e| return loadError(path, e);
+    if (mlx.engine.isStream(s)) {
+        defer src.close();
+        return loadOwn(src, s) catch |e| loadError(path, e);
+    }
     const reader = mlx.mlx_io_reader_new(src, Source.vtable);
     if (reader.ctx == null) {
         src.close();
@@ -558,6 +565,24 @@ pub fn loadTensors(vfs: *Vfs, path: []const u8) !Loaded {
     // From here MLX owns `src`: it goes with the reader and the last tensor read from it.
     defer _ = mlx.mlx_io_reader_free(reader);
     return loadFrom(src, reader) catch |e| loadError(path, e);
+}
+
+fn loadOwn(src: *Source, s: mlx.mlx_stream) !Loaded {
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+    var loaded: Loaded = .{ .tensors = mlx.mlx_map_string_to_array_new(), .meta = mlx.mlx_map_string_to_string_new() };
+    errdefer loaded.deinit();
+    if (loaded.tensors.ctx == null or loaded.meta.ctx == null) return error.OutOfMemory;
+    const aa = src.arena.allocator();
+    for (src.entries) |*e| {
+        var bytes: []u8 = undefined;
+        const arr = mlx.engine.hostFilled(e.dtype, e.shape, &bytes) orelse return error.MlxError;
+        defer _ = mlx.mlx_array_free(arr);
+        try fillEntry(src.vfs, src.pf, src.checked, e, bytes);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(loaded.tensors, try aa.dupeSentinel(u8, e.key, 0), arr));
+    }
+    for (src.meta) |m| try mlx.check(mlx.mlx_map_string_to_string_insert(loaded.meta, try aa.dupeSentinel(u8, m.key, 0), try aa.dupeSentinel(u8, m.value, 0)));
+    return loaded;
 }
 
 fn loadFrom(src: *Source, reader: mlx.mlx_io_reader) !Loaded {
@@ -592,6 +617,7 @@ const Source = struct {
     checked: []bool,
     head: []u8,
     entries: []Entry,
+    meta: []MetaPair = &.{},
     starts: []u64,
     size: u64,
     pos: u64 = 0,
@@ -628,6 +654,7 @@ const Source = struct {
         try readChecked(vfs, pf.placed[hi], self.head, &self.checked[hi]);
         const lay = try parseLayout(aa, self.head, tags, hi);
         self.entries = lay.entries;
+        self.meta = lay.meta;
         self.starts = try aa.alloc(u64, lay.entries.len);
         var at: u64 = self.head.len;
         for (lay.entries, self.starts) |e, *st| {

@@ -17,7 +17,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1-Flash on Sushi Cooler does less host work per token**: the engine holds the model's weights and
   streamed experts as its own buffers, finds a kernel it has already used without rebuilding its key and sets up a
   kernel launch without calling MLX, so the CPU has less to do between GPU passes. Long prompts are read faster, a
-  start of the model is faster, and the prefix cache's restore points are taken by the engine.
+  start of the model is faster, and the prefix cache's restore points are taken, saved to SSD and read back by the
+  engine.
 - **DeepSeek-V4.1-Flash sampled answers draw on Sushi Cooler without MLX**: a seed now gives a different text on Sushi
   Cooler than on MLX, and the same text on every repeat, streamed or not, the first token included; the sampler,
   penalties, logit bias, grammar masks and logprobs of a token no longer run on MLX there.

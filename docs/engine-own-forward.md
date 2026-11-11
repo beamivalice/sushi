@@ -148,8 +148,10 @@ route and the MLX arm still build the bank at prepare time.
   the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore point captured and
   restored, a step after it, an image prompt, the unload). A change that adds a call fails it; a stage of the move off
   MLX lowers a row; the target of every row is zero. `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry
-  point. A request puts no op on MLX, and a restore point is captured and restored with no call at all: a request's
-  calls are the token arrays its caller makes on MLX, imported once each, and frees of empty handles.
+  point. A request puts no op on MLX, and a restore point is captured and restored with no call at all, in RAM and
+  through the SSD tier (its own test, with the restored state compared byte for byte): a request's calls are the
+  token arrays its caller makes on MLX, imported once each. The free of an empty handle is no call (`mlx_array_free`
+  in the seam): mlx-c holds nothing for one.
   A phase's ops are exact. Its calls are held under a ceiling and within a twentieth of it, so a real cut moves the
   ceiling. The census counts a load that is not the process's first (it opens and closes the pack once before): what
   a process asks once (the device's description, a kernel probe) is its first load's, and with that kept out a row
@@ -289,7 +291,12 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   under the cap the last forward left, which covers a forward's scratch and not state that stays. The capture names
   the sizes it is about to copy and the cap rises by their buffers; the next forward's cap starts from what is in use
   then. A restore point's absent slots share one placeholder. The vision tower's requantized codes, scales and biases
-  are made the same way, after the model's warm left its cap (`dsv41_vision.lin`).
+  are made the same way, after the model's warm left its cap (`dsv41_vision.lin`). State read back from the SSD tier
+  has no sizes to name ahead: the cap is lifted for the read and the install and comes back raised by the buffers
+  that came into use (`core.uncapped`, `core.capped`).
+- **Maps are the engine's inside its scope** (`route.zig`: names to arrays, names to strings, the iterator): a map
+  made under `engine.enter` is tagged like a vector, every call that takes one follows it, and a name it lacks
+  answers 2 with no error latched, as mlx-c does. The SSD tier's readers hand tensors around in them.
 - **DeepSeek installs and bills it** (`dsv41_borrow`, `dsv41_bill`): the budget is a decode forward's cap
   (`Config.forwardCap`), set as every forward begins, and the request bill carries that cap a second time, beside
   MLX's. A request's end leaves the pool what the shortest request bills; an unload leaves it nothing free.

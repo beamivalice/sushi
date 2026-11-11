@@ -44,8 +44,8 @@ pub const cancelled_entry_label = "a DeepSeek entry";
 /// The cache holds a one-byte-a-token row marker for the model's rows.
 pub fn prepareCommit(slot: *Slot) !void {
     const xfm = arch_handle.trunk(slot.model.handle orelse return);
-    if (xfm.arch_state.dsv41.model == null) return;
-    try dsv41_prefix.markRows(&slot.cache);
+    const dsv = xfm.arch_state.dsv41.model orelse return;
+    try dsv41_prefix.markRows(&slot.cache, @import("dsv41_model.zig").stateStream(dsv));
 }
 
 pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache.HotPrefixCache, tokens: []const u32) void {
@@ -70,11 +70,11 @@ pub fn writeThrough(
     prompt: []const u32,
     media: prefix_cache.MediaStamp,
     cps: []transformer.SSMCheckpoint,
-    s: mlx.mlx_stream,
+    _: mlx.mlx_stream,
 ) bool {
     _ = entry_id;
     const dsv = arch_handle.trunk(slot.model.handle orelse return false).arch_state.dsv41.model orelse return false;
-    dsv41_prefix.writeThroughDsv41(hc, dsv, &slot.cache, prompt, slot.has_tools, media, cps, s, "prefill");
+    dsv41_prefix.writeThroughDsv41(hc, dsv, &slot.cache, prompt, slot.has_tools, media, cps, "prefill");
     return true;
 }
 

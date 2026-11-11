@@ -65,6 +65,13 @@ over the enabled archs:
   its own (`TierRows`), trims and shares them through the wrapper, and the SSD flush writes them with the arch's own
   layout (`persistRows`); `keepThrough` drops the checkpoints past the rows.
 - **`CacheState`**: `HotPrefixCache.arch.<arch>` (DeepSeek's live-state record).
+- **`arraysOn(config)`**: the stream the arch's cached state lives on when it is not MLX's (DeepSeek on a Sushi Cooler
+  load: the engine's). The load sets it on the hot cache and the SSD tier as it arms them (`arrays_on`); from then it
+  outranks the stream a caller passes, the tier's reads build on it instead of MLX's CPU stream, and the maps and
+  vectors a read or a write makes are of its side (`engine.enter`). On the content-addressed layer a tensor file then
+  loads straight from its blocks into the engine's own tensors (`prefix_vfs_tensors.loadTensors`), the same names,
+  dtypes, shapes, bytes and metadata as MLX's load. The plain-file backend's safetensors pass through MLX, so that
+  tier keeps MLX's arrays and the load says so.
 - **`checkpointsRequired(config)`**: `shouldUse` is off without SSM checkpoints for an arch whose request state is one.
 - **`adoptSpecHead`**: the in-checkpoint MTP head's snapshot adopted by the model's own head (Flash-Next), with its log lines.
 - **`disk`** and **`aux`** (Flash-Next): the `qsa.safetensors` section of a hybrid record (`DiskTier.persistQsaHistory`

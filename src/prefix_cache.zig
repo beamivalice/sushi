@@ -621,6 +621,10 @@ pub const HotPrefixCache = struct {
     /// `disk_dirty` and the scheduler flushes AFTER the response finishes so
     /// the client never waits on the SSD write.
     disk: ?kv_disk_cache.DiskTier = null,
+    /// Where this cache's arrays are copied, trimmed, written and restored when the model's state is not MLX's: the
+    /// stream the model's arch names as the cache is armed, which then outranks a caller's. Null is the caller's
+    /// stream, or MLX's GPU stream where no caller gives one.
+    arrays_on: ?mlx.mlx_stream = null,
     /// A commit landed since the last `flushPendingDisk`.
     disk_dirty: bool = false,
     /// `last_used` of the entry the current request restored from; `evictLruToAdmit` refuses to evict it.
@@ -1367,7 +1371,7 @@ pub const HotPrefixCache = struct {
         target_cache: *KVCache,
         target_moe_seq_offset: *usize,
         rec: Recurrent,
-        s: mlx.mlx_stream,
+        caller_stream: mlx.mlx_stream,
         prompt_ids: []const u32,
         has_tools: bool,
         vision_key: u64,
@@ -1382,6 +1386,7 @@ pub const HotPrefixCache = struct {
         slot_id: ?usize,
         skip: bool,
     ) !LookupResult {
+        const s = self.arrays_on orelse caller_stream;
         self.last_restored_used = null;
         self.last_restored_disk_id = null;
         self.last_restored_live = false;
@@ -1903,6 +1908,10 @@ pub const HotPrefixCache = struct {
 
     /// Commit with SSM checkpoints; ownership of the payload transfers to
     /// the entry.
+    fn arraysStream(self: *const HotPrefixCache) mlx.mlx_stream {
+        return self.arrays_on orelse mlx.gpuStream();
+    }
+
     pub fn commitWithState(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
@@ -2061,7 +2070,7 @@ pub const HotPrefixCache = struct {
 
         // Ownership of `ssm_cps` is ours from entry; no cleanup is armed until here.
         // The record holds this cache's retained rows already: sharing them spares a ring's second copy.
-        var new_snap = (if (record_taken) self.pending_disk.?.snapshot.share() else source_cache.snapshotRetained(mlx.gpuStream())) catch |err| {
+        var new_snap = (if (record_taken) self.pending_disk.?.snapshot.share() else source_cache.snapshotRetained(self.arraysStream())) catch |err| {
             if (ssm_cps) |cps| {
                 for (cps) |*cp| cp.deinit(self.allocator);
                 self.allocator.free(cps);
@@ -2156,7 +2165,7 @@ pub const HotPrefixCache = struct {
                         return .{ .kept_resident = self.entries.items[idx].tokens.len };
                     }
                 }
-                const trimmed = new_snap.trimmedCopy(tl, ring_cp, mlx.gpuStream()) catch |err| {
+                const trimmed = new_snap.trimmedCopy(tl, ring_cp, self.arraysStream()) catch |err| {
                     // A copy that failed at this width is not a verdict on the entry: retry at the next-lower checkpoint.
                     decline = .snapshot_copy_failed;
                     decline_err = err;
@@ -2170,7 +2179,7 @@ pub const HotPrefixCache = struct {
                 new_snap.deinit();
                 new_snap = trimmed;
                 if (new_rows) |*rows| if (tl < rows.len()) {
-                    const short = rows.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
+                    const short = rows.trimmedCopy(tl, self.arraysStream()) catch |err| {
                         decline = .snapshot_copy_failed;
                         decline_err = err;
                         break :trim_blk;
@@ -2635,7 +2644,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = (if (rows) |r| r.persist(d, tokens, has_tools, media, cps, null, false, mlx.gpuStream()) else d.appendCommitWith(.{
+        const outcome = (if (rows) |r| r.persist(d, tokens, has_tools, media, cps, null, false, self.arraysStream()) else d.appendCommitWith(.{
             .kv_entries = snap.entries,
             .step = snap.step,
             .config = snap.config,
@@ -2645,7 +2654,7 @@ pub const HotPrefixCache = struct {
             .ring = ringCommitOf(snap, ring_cps),
             .vision_key = media.key,
             .media_start = media.start,
-        }, mlx.gpuStream(), .{})) catch |err| {
+        }, self.arraysStream(), .{})) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2683,9 +2692,9 @@ pub const HotPrefixCache = struct {
         const mtp = if (cut) null else all_mtp;
         // An earlier commit not flushed yet (two cancels culled in one pass) lands first.
         if (self.pending_disk != null) {
-            if (self.disk) |*d| self.flushPendingRecord(d, mlx.gpuStream());
+            if (self.disk) |*d| self.flushPendingRecord(d, self.arraysStream());
         }
-        var snap = source_cache.snapshotRetained(mlx.gpuStream()) catch |err| {
+        var snap = source_cache.snapshotRetained(self.arraysStream()) catch |err| {
             log.warn("  [disk-cache] live snapshot failed: {s} — flushing the RAM entry instead\n", .{@errorName(err)});
             return;
         };
@@ -2767,7 +2776,8 @@ pub const HotPrefixCache = struct {
     /// back to the active session plus the idle allowance. Writing is unconditional; the
     /// allowance is a hard cap shed in two tiers: entries with a proven durable copy first,
     /// then (naming the reason) the rest, oldest first.
-    pub fn spillIdleEntries(self: *HotPrefixCache, s: mlx.mlx_stream) void {
+    pub fn spillIdleEntries(self: *HotPrefixCache, caller_stream: mlx.mlx_stream) void {
+        const s = self.arrays_on orelse caller_stream;
         if (!self.ssd_first) return;
         if (self.entries.items.len <= 1) return;
         const d = if (self.disk) |*dd| dd else return;
@@ -3011,7 +3021,8 @@ pub const HotPrefixCache = struct {
         }
     }
 
-    pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
+    pub fn flushPendingDisk(self: *HotPrefixCache, caller_stream: mlx.mlx_stream) void {
+        const s = self.arrays_on orelse caller_stream;
         if (!self.disk_dirty) return;
         self.disk_dirty = false;
         const d = if (self.disk) |*dd| dd else return;
@@ -3695,7 +3706,7 @@ pub const HotPrefixCache = struct {
             tl = @min(allow / row_bytes, limit);
             if (tl < MIN_TRIMMED_VICTIM_TOKENS) return "no prefix fits";
         }
-        const stream = mlx.gpuStream();
+        const stream = self.arraysStream();
         const tokens = self.allocator.dupe(u32, e.tokens[0..tl]) catch return "token copy failed";
         var snap = e.snapshot.trimmedCopy(tl, null, stream) catch {
             self.allocator.free(tokens);
@@ -3937,7 +3948,7 @@ pub const HotPrefixCache = struct {
         var report = EvictionReport{};
         // A command buffer in flight keeps its inputs' buffers until it completes: drain the
         // stream so `fits` and every live delta below read settled memory.
-        _ = mlx.mlx_synchronize(mlx.gpuStream());
+        _ = mlx.mlx_synchronize(self.arraysStream());
         while (!fits(ctx)) {
             const idx = self.lruIndexExcluding(if (protect_restored) self.last_restored_used else null, null) orelse break;
             // Accounting bytes are what the entry was billed; live bytes are what the allocator got back.

@@ -424,7 +424,10 @@ pub const mlx_array_new_data_managed_payload = counted("mlx_array_new_data_manag
 pub const _mlx_array_metal_buffer = counted("_mlx_array_metal_buffer", fn (buffer: *?*anyopaque, offset: *usize, arr: mlx_array) callconv(.c) c_int);
 /// Whether this handle is the only holder of the array and of its buffer, as MLX asks before it writes in place.
 pub const _mlx_array_is_donatable = counted("_mlx_array_is_donatable", fn (res: *bool, arr: mlx_array) callconv(.c) c_int);
-pub const mlx_array_free = routed("mlx_array_free", fn (arr: mlx_array) callconv(.c) c_int);
+/// An empty handle holds nothing, so its free is no call into mlx-c.
+pub fn mlx_array_free(arr: mlx_array) c_int {
+    return if (arr.ctx == null) 0 else routed("mlx_array_free", fn (arr: mlx_array) callconv(.c) c_int)(arr);
+}
 pub fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int {
     if (engine.enabled and (engine.isOurs(src) or engine.isOurs(arr.*))) return engine.mlx_array_set(arr, src);
     return raw.mlx_array_set(arr, src);
@@ -537,25 +540,37 @@ pub const mlx_compile = counted("mlx_compile", fn (res: *mlx_closure, fun: mlx_c
 pub const mlx_detail_compile_clear_cache = counted("mlx_detail_compile_clear_cache", fn () callconv(.c) c_int);
 
 // Map string -> array
-pub const mlx_map_string_to_array_new = counted("mlx_map_string_to_array_new", fn () callconv(.c) mlx_map_string_to_array);
-pub const mlx_map_string_to_array_free = counted("mlx_map_string_to_array_free", fn (map: mlx_map_string_to_array) callconv(.c) c_int);
-pub const mlx_map_string_to_array_get = counted("mlx_map_string_to_array_get", fn (value: *mlx_array, map: mlx_map_string_to_array, key: [*:0]const u8) callconv(.c) c_int);
-pub const mlx_map_string_to_array_insert = counted("mlx_map_string_to_array_insert", fn (map: mlx_map_string_to_array, key: [*:0]const u8, value: mlx_array) callconv(.c) c_int);
+// A map made inside a scope of the engine's (`engine.enter`) is the engine's, and so is every call that takes it.
+pub fn mlx_map_string_to_array_new() mlx_map_string_to_array {
+    return if (engine.active) engine.mlx_map_string_to_array_new() else counted("mlx_map_string_to_array_new", fn () callconv(.c) mlx_map_string_to_array)();
+}
+pub const mlx_map_string_to_array_free = routed("mlx_map_string_to_array_free", fn (map: mlx_map_string_to_array) callconv(.c) c_int);
+pub const mlx_map_string_to_array_get = routed("mlx_map_string_to_array_get", fn (value: *mlx_array, map: mlx_map_string_to_array, key: [*:0]const u8) callconv(.c) c_int);
+pub const mlx_map_string_to_array_insert = routed("mlx_map_string_to_array_insert", fn (map: mlx_map_string_to_array, key: [*:0]const u8, value: mlx_array) callconv(.c) c_int);
 
 // Map iterator
-pub const mlx_map_string_to_array_iterator_new = counted("mlx_map_string_to_array_iterator_new", fn (map: mlx_map_string_to_array) callconv(.c) mlx_map_string_to_array_iterator);
-pub const mlx_map_string_to_array_iterator_free = counted("mlx_map_string_to_array_iterator_free", fn (it: mlx_map_string_to_array_iterator) callconv(.c) c_int);
-pub const mlx_map_string_to_array_iterator_next = counted("mlx_map_string_to_array_iterator_next", fn (key: *?[*:0]const u8, value: *mlx_array, it: mlx_map_string_to_array_iterator) callconv(.c) c_int);
+pub const mlx_map_string_to_array_iterator_new = routed("mlx_map_string_to_array_iterator_new", fn (map: mlx_map_string_to_array) callconv(.c) mlx_map_string_to_array_iterator);
+pub const mlx_map_string_to_array_iterator_free = routed("mlx_map_string_to_array_iterator_free", fn (it: mlx_map_string_to_array_iterator) callconv(.c) c_int);
+pub const mlx_map_string_to_array_iterator_next = routed("mlx_map_string_to_array_iterator_next", fn (key: *?[*:0]const u8, value: *mlx_array, it: mlx_map_string_to_array_iterator) callconv(.c) c_int);
 
 // Map string -> string
-pub const mlx_map_string_to_string_new = counted("mlx_map_string_to_string_new", fn () callconv(.c) mlx_map_string_to_string);
-pub const mlx_map_string_to_string_free = counted("mlx_map_string_to_string_free", fn (map: mlx_map_string_to_string) callconv(.c) c_int);
-pub const mlx_map_string_to_string_insert = counted("mlx_map_string_to_string_insert", fn (map: mlx_map_string_to_string, key: [*:0]const u8, value: [*:0]const u8) callconv(.c) c_int);
-pub const mlx_map_string_to_string_get = counted("mlx_map_string_to_string_get", fn (value: *[*:0]const u8, map: mlx_map_string_to_string, key: [*:0]const u8) callconv(.c) c_int);
+pub fn mlx_map_string_to_string_new() mlx_map_string_to_string {
+    return if (engine.active) engine.mlx_map_string_to_string_new() else counted("mlx_map_string_to_string_new", fn () callconv(.c) mlx_map_string_to_string)();
+}
+pub const mlx_map_string_to_string_free = routed("mlx_map_string_to_string_free", fn (map: mlx_map_string_to_string) callconv(.c) c_int);
+pub const mlx_map_string_to_string_insert = routed("mlx_map_string_to_string_insert", fn (map: mlx_map_string_to_string, key: [*:0]const u8, value: [*:0]const u8) callconv(.c) c_int);
+pub const mlx_map_string_to_string_get = routed("mlx_map_string_to_string_get", fn (value: *[*:0]const u8, map: mlx_map_string_to_string, key: [*:0]const u8) callconv(.c) c_int);
 
 // IO
-pub const mlx_load_safetensors = counted("mlx_load_safetensors", fn (res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) callconv(.c) c_int);
-pub const mlx_save_safetensors = counted("mlx_save_safetensors", fn (file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) callconv(.c) c_int);
+// MLX's own file reader and writer: a stream or a map of the engine's is refused by name, never handed to mlx-c.
+pub fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int {
+    if (engine.enabled and (engine.isStream(s) or engine.isMap(res_0.ctx) or engine.isMap(res_1.ctx))) return engine.refuse("mlx_load_safetensors", "MLX's file reader with a stream or a map of the engine");
+    return counted("mlx_load_safetensors", fn (res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) callconv(.c) c_int)(res_0, res_1, file, s);
+}
+pub fn mlx_save_safetensors(file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) c_int {
+    if (engine.enabled and (engine.isMap(param.ctx) or engine.isMap(metadata.ctx))) return engine.refuse("mlx_save_safetensors", "MLX's file writer with a map of the engine");
+    return counted("mlx_save_safetensors", fn (file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) callconv(.c) c_int)(file, param, metadata);
+}
 pub const mlx_io_reader = extern struct { ctx: ?*anyopaque = null };
 pub const mlx_io_vtable = extern struct {
     is_open: *const fn (?*anyopaque) callconv(.c) bool,
