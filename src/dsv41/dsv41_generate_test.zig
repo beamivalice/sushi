@@ -1693,7 +1693,7 @@ const Census = struct {
         try mlx.callsByName(&now, testing.allocator);
         std.debug.print("[census] {s}: {d} calls, {d} ops\n", .{ phase, asked.calls, asked.ops });
         const now_stats = mlx.engine.stats();
-        std.debug.print("[census]   engine: {d} dispatches, {d} submits, imports {d} built and {d} held, lends {d}, appends in place {d}, copied {d}\n", .{ now_stats.dispatches - self.stats.dispatches, now_stats.submits - self.stats.submits, now_stats.imports - self.stats.imports, now_stats.imports_held - self.stats.imports_held, now_stats.lends - self.stats.lends, now_stats.updates_in_place - self.stats.updates_in_place, now_stats.updates_copied - self.stats.updates_copied });
+        std.debug.print("[census]   engine: {d} dispatches, {d} submits, imports {d}, lends {d}, appends in place {d}, copied {d}\n", .{ now_stats.dispatches - self.stats.dispatches, now_stats.submits - self.stats.submits, now_stats.imports - self.stats.imports, now_stats.lends - self.stats.lends, now_stats.updates_in_place - self.stats.updates_in_place, now_stats.updates_copied - self.stats.updates_copied });
         for (now.items) |n| {
             var was: u64 = 0;
             for (self.names.items) |b| if (std.mem.eql(u8, b.name, n.name)) {
@@ -4389,16 +4389,13 @@ test "dsv41 engine: a Cooler load wraps its weights itself: the MLX route's gree
         try testing.expectEqual(want, try greedyRun(&fx, prompt, 8));
         _ = try stepCalls(&fx, prompt, 5);
         const imports = mlx.engine.stats().imports;
-        const held = mlx.engine.stats().imports_held;
         _ = try stepCalls(&fx, prompt, 5);
         // From the load on: no op on MLX's side took a weight the engine wraps.
         var lent: [1024]u8 = undefined;
         try testing.expectEqualStrings("", try lentSince(names.items, &lent));
         try testing.expectEqual(weight_lends, mlx.engine.stats().mapped_lends);
-        // What a prefill and five steps still import is not a weight (the expert slabs and their maps), and no pin
-        // answers for one.
+        // What a prefill and five steps still import is not a weight (the expert slabs and their maps).
         try testing.expectEqual(@as(u64, 622), mlx.engine.stats().imports - imports);
-        try testing.expectEqual(held, mlx.engine.stats().imports_held);
     }
     mlx.engine.close();
     try testing.expectEqual(regions, model_mod.ownedRegionCount());

@@ -169,12 +169,6 @@ route and the MLX arm still build the bank at prepare time.
   zeros met the engine's first step while MLX's own command buffer could still be in flight, so that step copied the
   ring into the pool or wrote it in place by timing, and an in-place one asked MLX who holds it at every later step.
   No forward of a Cooler load runs on MLX.
-- **A weight's import is kept** (`core.pin`): a forward imports the same load-time arrays every time, so the load pins
-  them (`dsv41_model.pinWeights`: the arrays the model made or took, a named set, never a guess) and an import of an
-  array with the same bytes and layout shares that store (`imports_held` in `[engine] since load:`; `imports` counts
-  the builds). Only an array no one writes may be pinned: a held store has two holders, so every in-place append into
-  it copies (`sole`). A state (window ring, compressed or index rows, pending groups) and the streamed experts' slabs
-  are never pinned. The model unpins before it frees its arrays: the held import keeps the array, and its memory.
 - **MLX's queue is kept in use while decode runs on ours** (`dsv41_serving.keepMlxQueue`). The driver drops the
   resident set of a queue left unused for about a second, and the next MLX submission then waits before any work
   runs: a request's end (the commit's first MLX eval) took 0.56 to 0.77 s, a 2 s gap between MLX ops 0.55 s, a

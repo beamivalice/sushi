@@ -337,9 +337,6 @@ pub fn refusedBudget() @TypeOf(core.refused_budget) {
 }
 pub const mappedTotal = core.mappedTotal;
 pub const touch = core.touch;
-pub const pin = core.pin;
-pub const unpin = core.unpin;
-pub const pinnedCount = core.pinnedCount;
 
 /// Custom-kernel launches that built their instance key since the process began.
 pub fn kernelKeyBuilds() u64 {
