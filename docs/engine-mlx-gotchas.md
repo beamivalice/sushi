@@ -123,6 +123,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   does; the [host overhead patch](#host-overhead) writes it once per instantiation): `mlx_fast_metal_kernel_new` minifies
   both once and drops the header's struct, alias and function definitions the source never reaches
   (`metal_minify.zig`). `SUSHI_KERNEL_RAW_SOURCE=1` passes the text as written. Guard: the `a minified kernel gives` test.
+- **`mlx_matmul` is not row-count invariant**: one row takes its vector kernel, two or more its matrix kernel, and the
+  two sum in another order. A linear whose row must keep its bytes at every width runs on a kernel of ours.
 
 ## Laziness and barriers
 

@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash greedy answers no longer depend on how tokens were drafted**: at long context a rare rounding
+  difference between a single-token step and a drafted round could change a greedy answer; a token now gets the same
+  result either way.
 - **DeepSeek-V4.1-Flash STQ loads skip the engine's warm-up on a repeat start**: the first load of a pack on a build
   keeps the engine's kernel recipes in `~/.sushi/cache/pipelines`, and the next load makes its kernels from them instead
   of running the engine's warm forwards.

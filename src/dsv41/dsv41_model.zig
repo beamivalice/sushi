@@ -1450,11 +1450,22 @@ fn ropeQ(sc: *Scope, m: *const Model, x: A, freqs: A, pos: A, inverse: bool, qat
     return if (out_dt) |dt| sc.astype(q, dt) else q;
 }
 
+/// Whether the f32 kernel sums `l` over the rows `x`: a dense weight at decode width.
+fn denseNarrow(fused: bool, l: *const Lin, x: A) bool {
+    return fused and l.stq == null and l.s.ctx == null and dim(x, 0) <= NARROW_ROWS and kernels.denseF32xFits(dim(l.w, 0), dim(l.w, 1));
+}
+
 /// `x` (f32) through `l`: a dense weight at decode width is summed in f32 by the kernel, as the reference does after
 /// widening it; MLX's f32 matmul carries noise of its own.
 fn denseLin(sc: *Scope, m: *const Model, l: *const Lin, x: A) !A {
-    if (fusedOn(sc, m) and l.stq == null and l.s.ctx == null and dim(x, 0) <= NARROW_ROWS and kernels.denseF32xFits(dim(l.w, 0), dim(l.w, 1)))
-        return kernels.denseF32x(sc, x, l.w);
+    if (denseNarrow(fusedOn(sc, m), l, x)) return kernels.denseF32x(sc, x, l.w);
+    return l.apply(sc, x);
+}
+
+/// The indexer's head weights of the rows `x`, in x's dtype. At decode width the kernel sums them: MLX's matmul runs
+/// one row on another kernel than several, so a row would not keep its bytes across widths.
+fn indexWeights(sc: *Scope, fused: bool, l: *const Lin, x: A) !A {
+    if (denseNarrow(fused, l, x)) return kernels.denseF32x(sc, x, l.w);
     return l.apply(sc, x);
 }
 
@@ -1713,7 +1724,7 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
     const pos = try sh.pos(sc, p0, Ls, 1);
     const q = try ropeQ(sc, m, try sc.reshape(try iw.wq_b.apply(sc, qr), &.{ ci(Ls), ci(ih), ci(ihd) }), m.rope_yarn.freqs, pos, false, .fp4_ue8m0, .float32);
     const wscale = 1.0 / @sqrt(@as(f32, @floatFromInt(ihd))) / @sqrt(@as(f32, @floatFromInt(ih)));
-    const wts = try iw.weights_proj.apply(sc, x);
+    const wts = try indexWeights(sc, fusedOn(sc, m), &iw.weights_proj, x);
     const lens = try sh.lens(sc, p0, Ls, r);
     const ninf = try sc.f(-std.math.inf(f32));
     const kk = @min(c.index_topk, nb);
@@ -6304,6 +6315,27 @@ test "dsv41 index stream: the streamed top-k is the whole scores' top-k, order a
 
 // A later index source's picks over the candidate blocks' keys alone are the masked whole scan's, ties included (the
 // keys repeat every 4096, so scores tie across blocks).
+test "dsv41 indexer: a row's head weights are the same bytes alone and beside other rows at decode width" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const K = 5120;
+    const H = 32;
+    var differing: usize = 0;
+    for (0..8) |trial| {
+        var ts = sc.child();
+        defer ts.deinit();
+        const lin: Lin = .{ .w = try ts.astype(try kernels.randn(&ts, &.{ H, K }, .float32, 300 + trial, 0.04), .bfloat16) };
+        const x = try ts.astype(try kernels.randn(&ts, &.{ ci(NARROW_ROWS), K }, .float32, 400 + trial, 2.0), .bfloat16);
+        const together = try sc_mod.hostF32(try ts.astype(try indexWeights(&ts, true, &lin, x), .float32));
+        for (0..NARROW_ROWS) |r| {
+            const alone = try sc_mod.hostF32(try ts.astype(try indexWeights(&ts, true, &lin, try ts.slice(x, 0, r, r + 1)), .float32));
+            for (alone, together[r * H ..][0..H]) |a, b| differing += @intFromBool(a != b);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), differing);
+}
+
 test "dsv41 index decode: scoring the candidate blocks' keys picks what the masked whole scan picks" {
     const gpu = mlx.gpuStream();
     if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;

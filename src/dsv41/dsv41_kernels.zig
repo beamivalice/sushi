@@ -417,17 +417,17 @@ const TOPK_HEADER =
     \\}
 ;
 
-/// `x` [L, K] f32 times dense rows `w` [N, K] (any float dtype) in f32, RPS rows a simdgroup: the product the
-/// reference computes after widening w.
+/// `x` [L, K] times dense rows `w` [N, K] (any float dtypes) in f32, RPS rows a simdgroup: the product the
+/// reference computes after widening w, rounded once to OT. A row's sum never depends on L.
 const DENSE_F32X_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const int n0 = thread_position_in_grid.y * RPS, l = thread_position_in_grid.z;
     \\const int K = x_shape[1], N = w_shape[0];
     \\float acc[RPS];
     \\for (int r = 0; r < RPS; ++r) acc[r] = 0.0f;
-    \\const device float* xr = x + size_t(l) * K;
+    \\const device auto* xr = x + size_t(l) * K;
     \\for (int k = int(lane) * 4; k < K; k += 128) {
-    \\  const float4 xv = *(const device float4*)(xr + k);
+    \\  const float4 xv = float4(float(xr[k]), float(xr[k + 1]), float(xr[k + 2]), float(xr[k + 3]));
     \\  for (int r = 0; r < RPS; ++r) {
     \\    const device auto* wr = w + size_t(n0 + r) * K + k;
     \\    acc[r] += xv.x * float(wr[0]) + xv.y * float(wr[1]) + xv.z * float(wr[2]) + xv.w * float(wr[3]);
@@ -435,7 +435,7 @@ const DENSE_F32X_SOURCE =
     \\}
     \\for (int r = 0; r < RPS; ++r) {
     \\  const float v = metal::simd_sum(acc[r]);
-    \\  if (lane == 0 && n0 + r < N) out[size_t(l) * N + n0 + r] = v;
+    \\  if (lane == 0 && n0 + r < N) out[size_t(l) * N + n0 + r] = OT(v);
     \\}
 ;
 
@@ -584,12 +584,13 @@ pub fn denseF32xFits(n: usize, k: usize) bool {
     return k % 128 == 0 and n % dense_f32x_rps == 0;
 }
 
-/// `x` `[L, K]` (f32) times the rows of `w` `[N, K]` widened to f32, summed in f32.
+/// `x` `[L, K]` times the rows of `w` `[N, K]`, both widened to f32 and summed in f32, in x's dtype.
 pub fn denseF32x(sc: *Scope, x: A, w: A) !A {
     const L = dim(x, 0);
     const N = dim(w, 0);
+    const dt = mlx.mlx_array_dtype(x);
     var o: [1]A = undefined;
-    try launch(sc, &dense_f32x_def, &.{ x, w }, &.{.{ .shape = &.{ ci(L), ci(N) }, .dt = .float32 }}, .{ 32, N / dense_f32x_rps, L }, .{ 32, 1, 1 }, &.{.{ .name = "RPS", .v = dense_f32x_rps }}, &.{}, &o);
+    try launch(sc, &dense_f32x_def, &.{ x, w }, &.{.{ .shape = &.{ ci(L), ci(N) }, .dt = dt }}, .{ 32, N / dense_f32x_rps, L }, .{ 32, 1, 1 }, &.{.{ .name = "RPS", .v = dense_f32x_rps }}, &.{.{ .name = "OT", .dt = dt }}, &o);
     return o[0];
 }
 

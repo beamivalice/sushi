@@ -522,7 +522,7 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_moe_gu`, `dsv41_moe_dn` | routed gate/up/SwiGLU/down, sum, shared expert, hyper-connection expand | one token (decode) | no further from an f64 truth than the chain; bf16 within 2 ulps of its peak |
 | `dsv41_moe_act`, `dsv41_moe_combine` | the SwiGLU x weight and the unsort/sum/shared add of the sorted-gather MoE | many rows (prefill) | bit for bit |
 | `dsv41_gate`, `dsv41_route`, `dsv41_topk`, `dsv41_topk_chunk`, `dsv41_topk_merge` | router logits (the router read as stored, bf16, and widened in the kernel), softplus scores/top-k/normalize, the indexer's top-k (a decode block over 131072+ scores splits each row over 8 chunks and merges their picks) | route: always; gate: <= 16 rows; topk: GPU | gate vs f64 truth; route experts equal, weights within 2e-6; topk the same set, ties to the lower index, the split the one-threadgroup picks in the same order |
-| `dsv41_dense_f32x` | the f32 matmul of the compressor projections | decode rows | vs f64 truth |
+| `dsv41_dense_f32x` | the f32 matmul of the compressor projections and of the indexer's head weights | decode rows | vs f64 truth; a row keeps its bytes at every width (`a row's head weights`) |
 | `dsv41_rope_tail`, `dsv41_kv_row` | `rotate` plus the QAT round trip (q, indexer q/k, compressed latent, inverse rotation of the heads); the window row's rms norm, rotation and fp8 round trip | every width | bit for bit (rms in MLX's accumulation order) |
 | `dsv41_rope_kv` | `dsv41_kv_row` and the query's `dsv41_rope_tail` as one launch (the window rows in the first threadgroups, the rotation after) | the attention sublayer when the query and the window row share a dtype and the profiler is off | bit for bit both kernels (`dsv41 rope kv`) |
 | `dsv41_route_split` | `dsv41_route` and the FFN stage's `dsv41_hc_split`: the grid's second threadgroup of a row is the split | a narrow FFN stage whose mixes are still unsplit (`HcMix.z`) | bit for bit both kernels (`dsv41 route split`) |
@@ -1120,7 +1120,9 @@ rows arm and 2 or more rows the NAX arm, whose k sums differ. A DSpark round now
 is the faster one up to 5 rows, so it takes the SIMD arm at every width. The rest is already width-invariant, by test: the shared
 expert's one-row coop chain against the lane chain (`STQ shared expert at DeepSeek's shape`), the expert-grouped routed chain
 (`verify rows that decode each distinct expert once`), the per-row commit, router and indexer rows (the indexer's
-top-k split changes no pick). The decode attention is not width-invariant by itself: it splits a row's window and picked columns
+top-k split changes no pick). The indexer's head weights were not: a dense `[32, 5120]` weight on MLX's matmul, which runs
+one row on its vector kernel and two or more on its matrix kernel, so a weight sometimes rounded to the other bf16 value and
+moved an index pick (seen at 25.8k context, layer 8). At decode width `indexWeights` sums them in `dsv41_dense_f32x`. The decode attention is not width-invariant by itself: it splits a row's window and picked columns
 across threadgroups, and a block's pick width is its last row's, so a row sat in a wider block would split elsewhere than its
 one-row step and sum in another order. Each row therefore splits its own `min(K, (pos + 1) / ratio)` picks (`DecodeArgs.ratio`) at
 its own `attnSplits` count, and the rows of a round that take different counts run as separate launches (only a round straddling a
