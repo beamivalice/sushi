@@ -6,6 +6,7 @@ const metal = @import("../metal.zig");
 const core = @import("core.zig");
 const stock_reduce = @import("reduce.zig");
 const kernel = @import("kernel.zig");
+const stock = @import("stock.zig");
 
 const Tensor = core.Tensor;
 const Dtype = core.Dtype;
@@ -375,11 +376,13 @@ fn broadcastShape(a: *const Tensor, b: *const Tensor, out: *[max_dims]c_int) Err
     return out[0..n];
 }
 
-pub const Binary = enum { add, subtract, multiply, divide, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and, logical_or };
+pub const Binary = enum { add, subtract, multiply, divide, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and, logical_or, logaddexp };
 
 /// An elementwise op of two tensors of one dtype, broadcast together. A comparison gives bool.
 pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
     if (a.dtype != b.dtype) return error.TensorDtype;
+    // Its arithmetic is MLX's compiled kernel's: a source of ours rounded differently in the last bits.
+    if (op == .logaddexp) return stock.binaryOf("LogAddExp", a, b);
     var shape_buf: [max_dims]c_int = undefined;
     const shape = try broadcastShape(a, b, &shape_buf);
     const compare = switch (op) {
@@ -400,17 +403,19 @@ pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
         .equal => "x == y",
         .logical_and => "x && y",
         .logical_or => "x || y",
+        .logaddexp => unreachable,
     };
     return elementwise("bin_" ++ @tagName(op), expr, &.{ a, b }, if (compare) .bool_ else a.dtype, shape);
 }
 
-pub const Unary = enum { exp, log, sigmoid, sqrt, rsqrt, square, floor, negative };
+pub const Unary = enum { exp, log, abs, sigmoid, sqrt, rsqrt, square, floor, negative };
 
 pub fn unary(comptime op: Unary, a: *Tensor) Error!*Tensor {
-    if (op == .log and a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return error.TensorDtype;
+    if ((op == .log or op == .abs) and a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return error.TensorDtype;
     const expr = switch (op) {
         .exp => "$O(metal::precise::exp(x))",
         .log => "$O(metal::precise::log(x))",
+        .abs => "$O(metal::abs(float(x)))",
         .sigmoid => "sushi_sigmoid(x)",
         .sqrt => "$O(metal::precise::sqrt(x))",
         .rsqrt => "$O(metal::precise::rsqrt(x))",

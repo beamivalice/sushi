@@ -272,3 +272,49 @@ pub fn erf(x_in: *Tensor) Error!*Tensor {
     core.dispatch(p, .{ .x = threads }, .{ .x = @min(k.max_threads, threads) });
     return out;
 }
+
+/// A binary op of `mlx.metallib` on floats, under `binary_op_gpu_inplace`: the scalar and vector kernels of one flat
+/// run. An operand pair MLX would run through its strided kernels is refused.
+pub fn binaryOf(comptime op: []const u8, a: *Tensor, b: *Tensor) Error!*Tensor {
+    switch (a.dtype) {
+        .float16, .bfloat16, .float32 => {},
+        else => return error.TensorDtype,
+    }
+    const lead = @max(a.ndim, b.ndim);
+    var shape: [core.max_dims]c_int = undefined;
+    for (0..lead) |i| {
+        const da: c_int = if (i + a.ndim >= lead) a.shape[i + a.ndim - lead] else 1;
+        const db: c_int = if (i + b.ndim >= lead) b.shape[i + b.ndim - lead] else 1;
+        if (da != db and da != 1 and db != 1) return error.TensorShape;
+        shape[i] = if (da == 1) db else da;
+    }
+    const out = try core.fresh(a.dtype, shape[0..lead]);
+    errdefer core.release(out);
+    const size = out.size();
+    if (size == 0) return out;
+    if (size > std.math.maxInt(u32)) return error.TensorUnsupported;
+    const kind: []const u8 = if (a.size() == 1 and b.size() == 1)
+        "ss"
+    else if (a.size() == 1 and b.rowContiguous() and b.size() == size)
+        "sv"
+    else if (b.size() == 1 and a.rowContiguous() and a.size() == size)
+        "vs"
+    else if (a.rowContiguous() and b.rowContiguous() and a.size() == size and b.size() == size)
+        "vv"
+    else
+        return error.TensorUnsupported;
+    const flat = !std.mem.eql(u8, kind, "ss");
+    // Eight bytes of a row per thread once it is wide, as `get_work_per_thread`.
+    const per_thread: usize = if (flat and size >= 1 << 16) @max(1, 8 / core.itemSize(a.dtype)) else 1;
+    var buf: [96]u8 = undefined;
+    const k = try kernel(try named(&buf, "{s}{s}_" ++ op ++ "{s}", .{ kind, if (flat and per_thread > 1) "n" else "", try typeName(a.dtype) }));
+    const threads = (size + per_thread - 1) / per_thread;
+    const p = try core.pass();
+    p.pipeline(k);
+    core.bind(p, a, 0);
+    core.bind(p, b, 1);
+    core.bindOut(p, out, 2);
+    if (!std.mem.eql(u8, kind, "ss")) p.constant(@as(u32, @intCast(size)), 3);
+    core.dispatch(p, .{ .x = threads }, .{ .x = @min(k.max_threads, threads) });
+    return out;
+}

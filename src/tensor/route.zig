@@ -103,6 +103,7 @@ fn fail(comptime what: []const u8, e: anyerror) c_int {
     const msg = switch (e) {
         error.ThreadGroupTooLarge => std.fmt.bufPrintSentinel(&buf, "[engine] Thread group size ({d}) is greater than the maximum allowed threads per threadgroup ({d}).", .{ kernel.refused_threads, kernel.refused_limit }, 0),
         error.MetalCompile, error.MetalCommand, error.MetalBuffer => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: {s}: {s}", .{ what, @errorName(e), said[0..@min(said.len, 400)] }, 0),
+        error.PoolOverBudget => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: PoolOverBudget: a buffer of {d} KB with {d} MB held for the pool, {d} MB of it asked by tensors in use, under a limit of {d} MB", .{ what, core.refused_budget.wanted >> 10, core.refused_budget.held >> 20, core.refused_budget.asked >> 20, core.refused_budget.limit >> 20 }, 0),
         else => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: {s}", .{ what, @errorName(e) }, 0),
     } catch "[engine] error";
     mlx.latchError(msg);
@@ -273,6 +274,11 @@ pub const stream = core.stream;
 pub const stats = core.stats;
 pub const poolTotal = core.poolTotal;
 pub const poolFree = core.poolFree;
+
+/// What the pool refused last for its budget (`core.refused_budget`).
+pub fn refusedBudget() @TypeOf(core.refused_budget) {
+    return core.refused_budget;
+}
 pub const pin = core.pin;
 pub const unpin = core.unpin;
 pub const pinnedCount = core.pinnedCount;
@@ -555,14 +561,34 @@ pub const mlx_greater = bin(.greater);
 pub const mlx_greater_equal = bin(.greater_equal);
 pub const mlx_equal = bin(.equal);
 pub const mlx_logical_and = bin(.logical_and);
+pub const mlx_logaddexp = bin(.logaddexp);
 pub const mlx_exp = un(.exp);
 pub const mlx_log = un(.log);
+pub const mlx_abs = un(.abs);
 pub const mlx_sigmoid = un(.sigmoid);
 pub const mlx_sqrt = un(.sqrt);
 pub const mlx_rsqrt = un(.rsqrt);
 pub const mlx_square = un(.square);
 pub const mlx_floor = un(.floor);
 pub const mlx_negative = un(.negative);
+
+/// MLX's integer floor divide of unsigned operands is their quotient (the remainder step cannot fire); of floats it is
+/// the floor of the quotient.
+pub fn mlx_floor_divide(res: *A, a: A, b: A, _: S) c_int {
+    return op2("floor_divide", res, a, b, floorDivideOf, .{});
+}
+
+fn floorDivideOf(x: *Tensor, y: *Tensor) core.Error!*Tensor {
+    switch (x.dtype) {
+        .uint8, .uint16, .uint32, .uint64 => return ops.binary(.divide, x, y),
+        .float32, .float16, .bfloat16 => {
+            const q = try ops.binary(.divide, x, y);
+            defer core.release(q);
+            return ops.unary(.floor, q);
+        },
+        else => return error.TensorDtype,
+    }
+}
 
 pub fn mlx_where(res: *A, cond: A, a: A, b: A, _: S) c_int {
     const c = core.take(cond) catch |e| return fail("where", e);
@@ -2858,4 +2884,62 @@ test "engine attention gives MLX's bytes and strides at the tower's query chunks
     const short = try bf16Array(520 * 3 * 16 * 64, &.{ 520, 3, 16, 64 }, 4, -2);
     defer _ = mlx.mlx_array_free(short);
     try expectSameLayout(Build.chunk(512, 1024), &.{short});
+}
+
+test "engine abs, logaddexp and floor divide give MLX's bytes: signed zeros and infinities, the router's softplus, unsigned quotients" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn binary(comptime f: anytype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try mlx.check(f(&o, in[0], in[1], s));
+                    return o;
+                }
+            }.build;
+        }
+        fn softplus(s: S, in: []const A) !A {
+            const zero = mlx.mlx_array_new_float(0);
+            defer _ = mlx.mlx_array_free(zero);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_logaddexp(&o, in[0], zero, s));
+            return o;
+        }
+    };
+    var values = ramp(f32, 64, 60, -30);
+    values[0] = 0;
+    values[1] = -0.0;
+    values[2] = std.math.inf(f32);
+    values[3] = -std.math.inf(f32);
+    values[4] = 1e-30;
+    values[5] = -1e-9;
+    values[6] = 100;
+    var others = ramp(f32, 64, 40, -20);
+    others[2] = -std.math.inf(f32);
+    others[3] = -std.math.inf(f32);
+    others[7] = std.math.inf(f32);
+    const x = hostArray(f32, &values, &.{ 8, 8 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const y = hostArray(f32, &others, &.{ 8, 8 }, .float32);
+    defer _ = mlx.mlx_array_free(y);
+    const x16 = try castByMlx(x, .bfloat16);
+    defer _ = mlx.mlx_array_free(x16);
+    try expectSame(build1(mlx.mlx_abs), &.{x});
+    try expectSame(build1(mlx.mlx_abs), &.{x16});
+    try expectSame(Build.binary(mlx.mlx_logaddexp), &.{ x, y });
+    try expectSame(Build.softplus, &.{x});
+    const wide_values = ramp(f32, 300 * 301, 80, -40);
+    const wide = hostArray(f32, &wide_values, &.{ 300, 301 }, .float32);
+    defer _ = mlx.mlx_array_free(wide);
+    try expectSame(Build.softplus, &.{wide});
+    var numer: [48]u32 = undefined;
+    for (&numer, 0..) |*v, i| v.* = @intCast(i * 7919 % 1000);
+    var denom: [48]u32 = undefined;
+    for (&denom, 0..) |*v, i| v.* = @intCast(1 + i % 6);
+    const n = hostArray(u32, &numer, &.{ 6, 8 }, .uint32);
+    defer _ = mlx.mlx_array_free(n);
+    const d = hostArray(u32, &denom, &.{ 6, 8 }, .uint32);
+    defer _ = mlx.mlx_array_free(d);
+    try expectSame(Build.binary(mlx.mlx_floor_divide), &.{ n, d });
+    try expectSame(Build.binary(mlx.mlx_floor_divide), &.{ x, y });
 }

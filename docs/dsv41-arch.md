@@ -200,7 +200,7 @@ nothing, is the forwards' own cost). R1 MLX decode widths and DSpark rounds, R2 
 | engine `newLibraryWithSource` (435 pipelines) | 65 | 15695 | 9382 |
 | engine pipeline state | 21 | 57 | 28 |
 
-Decode forwards of 16 rows or fewer run on the engine (a short prefill included), so with the engine on the load skips
+Decode forwards of 16 rows or fewer run on the engine (a short prefill included; the wide chunks have their own warm, `warmWide`), so with the engine on the load skips
 R1 and the 1-, 6- and block-wide forwards of R3. The same command on one pack, one load each, both the first run of a
 new binary (a cold system shader cache: 16.5 and 15.2 s of engine pipelines, so the gap is mostly MLX's cold compile of R1,
 not the warm-cache gain): 35383538 `kernels warmed ... in 74721 ms` (warm forwards 58264 ms, total 82417 ms); this change
@@ -214,7 +214,7 @@ cache, all of it `newLibraryWithSource`.
 
 The first load of a pack on a build leaves `~/.sushi/cache/pipelines/<scope>-<build>/manifest.bin` (key, format and cases:
 [engine-own-forward](engine-own-forward.md#the-pipeline-manifest)); the next load makes the engine's pipelines from it on 8
-threads and skips the engine's warm forwards (`warmOwn`, `Fills`, `Blocks`, `Long`, the sampled verdict). What runs on
+threads and skips the engine's warm forwards (`warmOwn`, `Fills`, `Blocks`, `Long`, the sampled verdict, the wide prefill chunks). What runs on
 MLX stays: its prefill warm and the spilled route's prefill chain (`warmSplit`), which no manifest covers. One `[pipelines]` line says which case ran: `made N pipelines from the manifest`, `manifest of
 another build, recompiled N on T threads`, `no manifest`, or `manifest unreadable (<reason>)`; the manifest is written only
 after a warm that returned without error, and the older builds of the scope are removed and named in the log. The key costs
@@ -288,6 +288,10 @@ DeepSeek-V4.1 is a causal encoder-decoder. Layers 0 to 19 encode every prompt ro
 source) compresses every row. Layers 20 to 39 decode only the last `window` (128) rows of each prefill chunk, and
 their attention band is floored at the tail's start. This is the architecture as defined, not an approximation;
 there is no full-forward arm. Port of mlx-serve's `cedSplit`/`cedTail`/`cedReplayIn`.
+
+A prefill chunk runs on Sushi Cooler, the engine of our own, wherever decode does ([engine-own-forward](engine-own-forward.md#a-prefill-chunk-on-the-engine)):
+the same state and logits as MLX's, the experts of a streaming chunk read group by group while the GPU runs the
+previous group. `--ds41-mlx-engine` and `ds41_cooler: false` put it on MLX.
 
 When it engages:
 - `Config.cedSplit` picks the split from the config, or returns null. The split must be an index source with ratio-1

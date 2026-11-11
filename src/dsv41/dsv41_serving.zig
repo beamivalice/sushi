@@ -60,6 +60,9 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     if (own_decode) try dsv41_model.pinWeights(mdl);
     const side: dsv41_borrow.DecodeSide = if (own_decode) .engine else dsv41_borrow.decodeSideOf(&config.dsv41.?);
     if (own_decode or side != .engine) log.info("{s}\n", .{dsv41_borrow.decodeLine(side)});
+    // Prefill follows decode: a chunk of any width runs where a decode step does.
+    mdl.engine_prefill = own_decode;
+    if (own_decode) log.info("{s}\n", .{dsv41_borrow.prefill_line});
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
     dsv41_model.setDsparkExact(mdl, if (std.c.getenv("SUSHI_DSV41_DSPARK_EXACT")) |v| diagEnvValueOn(v) else true);
@@ -102,11 +105,13 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const warm_t0 = load_clock.now();
     const made_before = mlx.engine.pipelinesMade();
     const scope = plan.settle();
-    if (warmAll(mdl, shell.arch_state.dsv41.stq_experts, scope)) {
+    if (warmAll(&shell, mdl, shell.arch_state.dsv41.stq_experts, scope)) {
         log.info("[dsv41] kernels warmed for 1..{d} rows{s}{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", if (scope == .mlx) " (the engine's from the manifest)" else "", clock.lap() / std.time.ns_per_ms });
         if (scope == .all and own_decode) plan.store();
     } else |e| {
         mlx.dropLatchedErrorUnless(had_error);
+        // A forward the bill does not cover would be a Metal OOM in a request.
+        if (e == error.PoolOverBudget) return e;
         log.warn("[dsv41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
     }
     const made = mlx.engine.pipelinesMade();
@@ -118,18 +123,46 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     return shell;
 }
 
-/// PURE: what a load's warm runs after the model's own forwards. The sampled verdict is the engine's, so a manifest
-/// stands in for it; the spilled route's prefill chain is MLX's, which no manifest covers.
-pub fn warmAfter(scope: dsv41_model.WarmScope) struct { sampled_verdict: bool, split: bool } {
-    return .{ .sampled_verdict = scope == .all, .split = true };
+/// PURE: what a load's warm runs after the model's own forwards. The sampled verdict and the wide chunks are the
+/// engine's, so a manifest stands in for them; the spilled route's prefill chain is MLX's, which no manifest covers.
+pub fn warmAfter(scope: dsv41_model.WarmScope, engine_prefill: bool) struct { sampled_verdict: bool, split: bool, wide: bool } {
+    return .{ .sampled_verdict = scope == .all, .split = true, .wide = scope == .all and engine_prefill };
 }
 
-/// The warm of a load: with `.mlx` only the forwards on MLX, the engine's pipelines having come from a manifest.
-pub fn warmAll(mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope) !void {
+/// The warm of a load: with `.mlx` only the forwards on MLX, the engine's pipelines having come from a manifest. Every
+/// forward of the engine runs under the budget a request's forward has (`dsv41_borrow.enterWarm`), and one the bill does
+/// not cover fails the load.
+pub fn warmAll(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope) !void {
+    return warmAllAt(self, mdl, stq, scope, dsv41_config.prefill_width);
+}
+
+/// `warmAll` with the widest wide chunk it runs.
+pub fn warmAllAt(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope, width: usize) !void {
+    dsv41_borrow.warm_budget = true;
+    defer dsv41_borrow.endWarmMlx();
+    warmForwards(self, mdl, stq, scope, width) catch |e| {
+        if (e == error.PoolOverBudget or mlx.takeErrorIf("PoolOverBudget")) {
+            const r = mlx.engine.refusedBudget();
+            log.err("[dsv41] a warm forward holds more than the bill it will have in a request: a buffer of {d} KB with {d} MB held for the pool, {d} MB of it asked by tensors in use, under a limit of {d} MB\n", .{ r.wanted >> 10, r.held >> 20, r.asked >> 20, r.limit >> 20 });
+            return error.PoolOverBudget;
+        }
+        return e;
+    };
+}
+
+fn warmForwards(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope, width: usize) !void {
     try dsv41_model.warmKernelsFor(mdl, scope);
-    const after = warmAfter(scope);
-    if (after.sampled_verdict) try warmSampledVerdict(mdl);
-    if (after.split) if (stq) |st| try st.warmSplit(mdl, dsv41_config.prefill_width);
+    const after = warmAfter(scope, mdl.engine_prefill);
+    if (after.sampled_verdict) {
+        dsv41_model.warmBudget(mdl, dsv41_config.verify_rows);
+        try warmSampledVerdict(mdl);
+    }
+    if (after.split) if (stq) |st| try st.warmSplit(mdl, dsv41_config.prefill_width, false);
+    if (after.wide) {
+        var clock = expert_stream_mod.Clock.init();
+        try warmWide(self, mdl, stq, width);
+        log.info("[dsv41] wide kernels warmed in {d} ms\n", .{clock.lap() / std.time.ns_per_ms});
+    }
 }
 
 /// The manifest to start the load from, its pipelines already being made. A load whose decode is on MLX makes none.
@@ -144,6 +177,79 @@ pub fn beginPipelines(allocator: std.mem.Allocator, config: *const ModelConfig, 
     var reason: []const u8 = "";
     const root = dsv41_pipelines.openRoot(io, &reason);
     return dsv41_pipelines.begin(allocator, io, root, reason, .{ .scope = scope, .build = build }, key_ms);
+}
+
+/// The wide forwards a prompt reaches, run once on the engine at the load so their kernels compile here: a full-width
+/// state-only chunk and a head chunk (CED), head chunks whose rows fill the GEMM tiles whole, in part and not at all, the
+/// held-back tail, and one chunk per pick-sort plan (`sort.planOf`: its block size follows the picks, a row's `top_k` of
+/// them). Chunks wider than `width` are left out. Leaves no state.
+pub fn warmWide(self: *Trunk, m: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, width: usize) !void {
+    // The split chain is a wide chunk's work but no forward: it takes the budget such a chunk has, not the one the
+    // decode-width forward before it left.
+    dsv41_borrow.enterWarmMlx(width, width, &m.cfg);
+    if (stq) |st| try st.warmSplit(m, width, true);
+    const tail = @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1;
+    const k: usize = m.layers[0].top_k;
+    var plans: [64][2]usize = undefined;
+    var n_plans: usize = 0;
+    const heads = [_]usize{ width, width * 17 / 32, width * 1100 / 2048 };
+    plans[0] = .{ width, width };
+    n_plans = 1;
+    for (heads[1..]) |w| {
+        plans[n_plans] = .{ w, tail };
+        n_plans += 1;
+    }
+    // Rows that fill the narrow GEMM tiles whole.
+    for ([_]usize{ 64, 128 }) |rows| {
+        plans[n_plans] = .{ rows, 0 };
+        n_plans += 1;
+    }
+    // A compressing layer's projection takes the chunk's compressed rows (`rows / ratio`), and a kernel of under 17 rows has
+    // that count in its name: one chunk per count.
+    var seen: [256]bool = @splat(false);
+    for (m.cfg.ratios[0..m.cfg.layers]) |ratio| {
+        if (ratio < 2 or ratio > 16 or seen[ratio]) continue;
+        seen[ratio] = true;
+        for (1..17) |c| {
+            const rows = @max(c * ratio, dsv41_borrow.verify_rows + 1);
+            if (rows >= (c + 1) * ratio or rows > width or n_plans == plans.len) continue;
+            plans[n_plans] = .{ rows, 0 };
+            n_plans += 1;
+        }
+    }
+    // The widest chunk of each single-block sort size, and one past them all.
+    for ([_]usize{ 128, 256, 512, 1024, 2048 }) |picks| {
+        plans[n_plans] = .{ picks / k, 0 };
+        n_plans += 1;
+    }
+    plans[n_plans] = .{ width, 0 };
+    n_plans += 1;
+    const ids = try m.gpa.alloc(i32, width);
+    defer m.gpa.free(ids);
+    for (ids, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % m.cfg.vocab);
+    for (plans[0..n_plans]) |plan| {
+        const chunks = if (plan[1] == 0) plan[0..1] else plan[0..2];
+        if (!planFits(chunks, width)) continue;
+        var plan_clock = expert_stream_mod.Clock.init();
+        try self.resetCache();
+        const reset_ms = plan_clock.lap() / std.time.ns_per_ms;
+        defer log.debug("[dsv41] wide warm {any}: reset {d} ms, forwards {d} ms\n", .{ chunks, reset_ms, plan_clock.lap() / std.time.ns_per_ms });
+        var ctx = self.defaultCtx();
+        for (chunks, 0..) |w, i| {
+            ctx.ahead_min_rows = if (i + 1 < chunks.len) chunks[i + 1] else 0;
+            const arr = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(w) }, 2, .int32);
+            defer _ = mlx.mlx_array_free(arr);
+            const out = try forwardDsv41With(self, &ctx, arr, m);
+            defer _ = mlx.mlx_array_free(out);
+            if (out.ctx != null) try mlx.check(mlx.mlx_array_eval(out));
+        }
+    }
+    try self.resetCache();
+}
+
+fn planFits(plan: []const usize, width: usize) bool {
+    for (plan) |w| if (w > width or w <= dsv41_borrow.verify_rows) return false;
+    return true;
 }
 
 /// The draws of a sampled round: `rows` verify rows of `logits` (`[1, >= rows, vocab]`) filtered by `sampling` and
@@ -278,7 +384,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const n: usize = @intCast(rows[1]);
     // A forward of up to a verify block's rows is a decode-width forward, on the engine; one that splices image rows
     // stays on MLX. A one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
-    const decode_width = m.engine_decode and n <= expert_exl3_kernels.DECODE_ROWS_MAX and st.verify == null;
+    const decode_width = m.engine_decode and (n <= expert_exl3_kernels.DECODE_ROWS_MAX or m.engine_prefill) and st.verify == null;
     const lazy = !(decode_width and ctx.vision_embeddings == null) and n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
@@ -296,10 +402,12 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
     defer m.gpa.free(ahead);
     for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
-    // The wide prefill arm joins this line when it becomes the path: `ds41_cooler` must cover it (it follows `m.engine_decode`).
     const own = decode_width and (vision == null or dsv41_model.imageRows(m, host) == 0);
     if (m.ced_split != null and tailUnread(m.cfg.window, n, ctx.ahead_min_rows, ctx.holds_point) and st.verify == null) {
-        try dsv41_model.extendState(m, host, dsv41_model.SPAN, vision, ahead);
+        if (own) _ = dsv41_model.ownBegin(m);
+        const state_only = dsv41_model.extendState(m, host, dsv41_model.SPAN, vision, ahead);
+        if (own) dsv41_model.ownEnd(m, self.s);
+        try state_only;
         if (self.expert_stream) |engine| engine.finishForward(n);
         ctx.cache.step = st.n;
         return mlx.mlx_array_new();
@@ -400,12 +508,16 @@ test "a non-STQ DeepSeek pack names an ssd_prefetch it ignores, from the flag or
     try std.testing.expect(std.mem.indexOf(u8, prefetchIgnoredLine(&config).?, "--ssd-prefetch is ignored") != null);
 }
 
-test "dsv41 warm: a manifest stands in for the engine's sampled verdict, never for MLX's spilled-route prefill chain" {
-    const full = warmAfter(.all);
-    try std.testing.expect(full.sampled_verdict and full.split);
-    const from_manifest = warmAfter(.mlx);
-    try std.testing.expect(!from_manifest.sampled_verdict);
+test "dsv41 warm: a manifest stands in for the engine's sampled verdict and wide chunks, never for MLX's spilled-route prefill chain" {
+    const full = warmAfter(.all, true);
+    try std.testing.expect(full.sampled_verdict and full.split and full.wide);
+    const from_manifest = warmAfter(.mlx, true);
+    try std.testing.expect(!from_manifest.sampled_verdict and !from_manifest.wide);
     try std.testing.expect(from_manifest.split);
+    // Prefill on MLX (the opt-out) leaves the engine no wide chunk to warm.
+    const prefill_on_mlx = warmAfter(.all, false);
+    try std.testing.expect(prefill_on_mlx.sampled_verdict and prefill_on_mlx.split);
+    try std.testing.expect(!prefill_on_mlx.wide);
 }
 
 test "tailUnread: a chunk is state only when no point is taken and the next chunk replays a full window" {

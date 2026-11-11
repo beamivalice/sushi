@@ -158,6 +158,11 @@ pub const StqStream = struct {
     /// A wide chunk starts each rate group's GEMMs as its experts land (`Engine.fillStaged`); false reads the whole fill
     /// first (the byte-identity test's reference).
     overlap: bool = true,
+    /// Test only: a pause after a rate group's GEMMs are started, before the next group's fill, long enough for a GPU
+    /// handed more than that group's work to read a slab still being filled.
+    stall_ns: u64 = 0,
+    /// Test only: stage the fill on the engine too, which the engine refuses.
+    stage_on_engine: bool = false,
     /// A settle's picks as expert ids, and the slots they resolved to: kept between settles.
     picks: std.ArrayList(u16) = .empty,
     slots: std.ArrayList(i32) = .empty,
@@ -173,7 +178,7 @@ pub const StqStream = struct {
     /// The prefill chain of a route that spills into the union workspace (more pools than the fused chain takes), run
     /// once at load over a layer's own pools on `rows` rows of zeros: it compiles what the first spilled route of a long
     /// prompt would, reads nothing and changes no cache. At the prefill width its picks sort as a wide chunk's do.
-    pub fn warmSplit(self: *StqStream, m: *const model.Model, rows: usize) !void {
+    pub fn warmSplit(self: *StqStream, m: *const model.Model, rows: usize, on_engine: bool) !void {
         const engine = self.engine;
         const li = for (engine.layers, 0..) |*layer, i| {
             if (layer.active and layer.grouped != null and layer.grouped.?.union_ragged.count == layer.grouped.?.cache_ragged.count) break i;
@@ -182,8 +187,13 @@ pub const StqStream = struct {
         var overflow: [stream.quant.rate_group_limit]u32 = @splat(1);
         var bank = try exl3.Ragged.initSplit(engine.s, &gl.cache_ragged, &gl.union_ragged, overflow[0..gl.cache_ragged.count]);
         defer bank.deinit();
-        var sc = Scope.plain(engine.allocator, engine.s);
+        // The slab views above are MLX's; the chain is the engine's when it is to serve the chunk.
+        var sc = Scope.plain(engine.allocator, if (on_engine) mlx.engine.stream() else engine.s);
         defer sc.deinit();
+        if (on_engine) mlx.engine.active = true;
+        defer if (on_engine) {
+            mlx.engine.active = false;
+        };
         const k: usize = self.cfg.top_k;
         const ids = try engine.allocator.alloc(i32, rows * k);
         defer engine.allocator.free(ids);
@@ -342,11 +352,21 @@ pub const StqStream = struct {
             h.* = @intCast(id);
         }
         if (scores) |sv| _ = try self.engine.swapGroupedMisses(@intCast(layer), host, try sc_mod.hostF32(sv), tolerance, @intCast(mlx.getShape(idx)[1]));
-        const staged = wide and self.overlap;
-        var prepared = try if (staged) self.engine.prepareHostStaged(@intCast(layer), host) else if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host);
+        // The engine encodes each op into its open pass as it is called, and a rate group's start hands over that whole
+        // pass, groups not yet filled included; MLX evaluates only the planes it is asked for. So the engine's chain reads
+        // the fill group by group (`ranged`), encoding a group's GEMMs only once it has landed.
+        const staged = wide and self.overlap and (!mlx.engine.active or self.stage_on_engine);
+        const ranged = wide and self.overlap and mlx.engine.active and !self.stage_on_engine;
+        // The union's slab views are MLX's own arrays, made on MLX's stream; the engine imports them when a kernel reads them.
+        const own = mlx.engine.active;
+        if (wide) mlx.engine.active = false;
+        var prepared = (if (ranged) self.engine.prepareHostStagedRanged(@intCast(layer), host) else if (staged) self.engine.prepareHostStaged(@intCast(layer), host) else if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host)) catch |e| {
+            mlx.engine.active = own;
+            return e;
+        };
+        mlx.engine.active = own;
         defer prepared.deinit();
         errdefer _ = mlx.mlx_synchronize(sc.s);
-        const rb = prepared.ragged orelse return error.Dsv41StqLayerNotGrouped;
         const slots = try gpa.alloc(i32, host.len);
         defer gpa.free(slots);
         for (slots, prepared.remapped) |*o, r| o.* = r;
@@ -356,17 +376,39 @@ pub const StqStream = struct {
         var early: exl3.rate_groups.EarlyPlanes = .{};
         defer early.deinit();
         // The caller evaluates the sum before a later layer can refill the union: the next layer's picks read it.
-        const out = try model.stqRoutedEarly(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared, if (staged) &early else null, null);
+        const Reads = struct {
+            engine: *stream.Engine,
+            prepared: *stream.Prepared,
+            stall_ns: u64,
+            fn scales(ctx: *anyopaque) anyerror!*const exl3.Ragged {
+                const r: *@This() = @ptrCast(@alignCast(ctx));
+                try r.engine.stageScales(r.prepared);
+                return r.engine.stageBank(r.prepared);
+            }
+            fn group(ctx: *anyopaque, g: usize) anyerror!void {
+                const r: *@This() = @ptrCast(@alignCast(ctx));
+                if (g > 0 and r.stall_ns != 0) _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(r.stall_ns) }, null);
+                try r.engine.stageGroup(r.prepared, g);
+            }
+        };
+        var reads = Reads{ .engine = self.engine, .prepared = &prepared, .stall_ns = self.stall_ns };
+        const out = if (ranged)
+            try model.stqRoutedStaged(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), x, local, wts, shared, .{ .ctx = &reads, .scales = Reads.scales, .group = Reads.group })
+        else
+            try model.stqRoutedEarly(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), prepared.ragged orelse return error.Dsv41StqLayerNotGrouped, x, local, wts, shared, if (staged) &early else null, null);
+        if (ranged) try self.engine.stageEnd(&prepared);
         if (staged) {
             const Start = struct {
                 early: *const exl3.rate_groups.EarlyPlanes,
                 rb: *const exl3.Ragged,
+                stall_ns: u64,
                 fn ready(ctx: *anyopaque, group: usize) anyerror!void {
                     const st: *@This() = @ptrCast(@alignCast(ctx));
                     try st.early.start(st.rb, group);
+                    if (st.stall_ns != 0) _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(st.stall_ns) }, null);
                 }
             };
-            var start = Start{ .early = &early, .rb = rb };
+            var start = Start{ .early = &early, .rb = prepared.ragged orelse return error.Dsv41StqLayerNotGrouped, .stall_ns = self.stall_ns };
             try self.engine.fillStaged(&prepared, &start, Start.ready);
         }
         // The staged fill runs inside this span; fill_ms already reports it.
@@ -2796,7 +2838,7 @@ test "dsv41 kernels: the spilled-route warm reads nothing, leaves every pool as 
             var before: std.ArrayList(i32) = .empty;
             defer before.deinit(testing.allocator);
             for (served.engine.layers) |*layer| if (layer.grouped) |gl| for (gl.caches[0..gl.groups.count]) |c| try before.appendSlice(testing.allocator, c.expert_to_slot);
-            try served.hook.warmSplit(served.m, 400);
+            try served.hook.warmSplit(served.m, 400, false);
             try testing.expectEqual(filled, served.engine.fill_experts_total);
             var after: std.ArrayList(i32) = .empty;
             defer after.deinit(testing.allocator);

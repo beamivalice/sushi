@@ -224,6 +224,18 @@ const gemm_cache_len = 8;
 var gemm_cache: [gemm_cache_len]?struct { key: GemmKey, inputs: GemmInputs } = @splat(null);
 var gemm_cache_next: usize = 0;
 
+/// Frees the cached inputs. Their handles are whichever side made them (the engine's while it ran): a process that turns
+/// the engine off must drop them first.
+pub fn dropGemmInputs() void {
+    for (&gemm_cache) |*e| {
+        if (e.*) |old| for ([_]mlx.mlx_array{ old.inputs.slots, old.inputs.tab.starts, old.inputs.tab.nlives }) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        e.* = null;
+    }
+    gemm_cache_next = 0;
+}
+
 /// The inputs depend on `(groups, rows, win)` alone, and a prefill chunk's trellis linears all share them, so they are
 /// built and uploaded once. The handles are the cache's: valid until a later call evicts them, never freed by the caller.
 pub fn gemmInputs(groups: usize, rows: usize, win: c_int) !GemmInputs {

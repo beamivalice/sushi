@@ -2,6 +2,7 @@ const std = @import("std");
 const io_util = @import("io_util.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const fill_marks = @import("fill_marks.zig");
 const layout = @import("sushi_exl3").group_layout;
 
 pub const align_bytes: usize = std.heap.page_size_max;
@@ -771,6 +772,7 @@ pub const PageSlab = struct {
 
     pub fn destroy(self: *PageSlab) void {
         const allocator = self.allocator;
+        fill_marks.remove(@intFromPtr(self.bytes.ptr));
         self.live.deinit(allocator);
         _ = slab_bytes.fetchSub(self.bytes.len, .monotonic);
         std.posix.munmap(self.bytes);
@@ -793,6 +795,7 @@ pub const PageSlab = struct {
 
     fn startFillLocked(self: *PageSlab) u64 {
         self.state = .filling;
+        fill_marks.add(@intFromPtr(self.bytes.ptr), self.bytes.len);
         self.epoch += 1;
         return self.epoch;
     }
@@ -807,6 +810,12 @@ pub const PageSlab = struct {
             .ready, .readers_complete => return error.SlabPublished,
             .leased => return error.SlabLeased,
         }
+    }
+
+    /// The fill goes on but the slab as a whole is no longer marked: the caller marks the ranges still being written, so a
+    /// pass may bind the rest.
+    pub fn dropMark(self: *PageSlab) void {
+        fill_marks.remove(@intFromPtr(self.bytes.ptr));
     }
 
     pub fn beginFillTimeout(self: *PageSlab, nanoseconds: u64) !u64 {
@@ -849,6 +858,7 @@ pub const PageSlab = struct {
         switch (self.state) {
             .filling => {
                 self.state = .ready;
+                fill_marks.remove(@intFromPtr(self.bytes.ptr));
                 self.cv.broadcast(io);
                 return self.epoch;
             },

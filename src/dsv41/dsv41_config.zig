@@ -232,8 +232,17 @@ pub const Config = struct {
     pub fn forwardCap(self: *const Config, rows: u64, seq: u64) u64 {
         const ctx = @max(seq, 1);
         const by_rows = if (rows > verify_rows) rows *| self.dim *| cap_row_bytes_per_dim else narrow_rows * ctx * 4 * score_copies;
-        const growth = ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
-        return (by_rows +| growth) *| 5 / 4 +| cap_slack_bytes;
+        return (by_rows +| self.growthBytes(ctx)) *| 5 / 4 +| cap_slack_bytes;
+    }
+
+    fn growthBytes(self: *const Config, ctx: u64) u64 {
+        return ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
+    }
+
+    /// The part of `forwardCap` that a wide chunk on the engine of our own leaves on MLX: the state rows it appends
+    /// and a slack for the few ops and views that stay there. The engine's pool takes the rest.
+    pub fn forwardCapMlx(self: *const Config, rows: u64, seq: u64) u64 {
+        return @min(self.forwardCap(rows, seq), self.growthBytes(@max(seq, 1)) *| 5 / 4 +| wide_mlx_slack_bytes);
     }
 
     /// `forwardCap` of a prefill chunk of `chunk` rows ending at `seq`: the last chunk of a prompt absorbs a tail of
@@ -262,6 +271,7 @@ pub const prefill_width: u32 = 2048;
 pub const dsv41_pool_bytes: u64 = 1 << 30;
 /// Added to every cap: twice the 0.12 GiB of small tensors and tables a decode forward was measured to hold.
 const cap_slack_bytes: u64 = 256 << 20;
+const wide_mlx_slack_bytes: u64 = 64 << 20;
 const score_copies: u64 = 3;
 /// `prefill_plan.TAIL_MERGE_MAX - 1`: the longest tail the last chunk of a prompt absorbs.
 pub const tail_merge_rows: u64 = 511;

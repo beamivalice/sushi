@@ -1,4 +1,5 @@
 const std = @import("std");
+const fill_marks = @import("fill_marks.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const io_mod = @import("expert_io.zig");
@@ -1241,6 +1242,8 @@ const SlabOperand = struct {
         const slab = self.slab orelse return;
         const payload = self.payload orelse return;
         _ = mlx.mlx_array_free(self.array);
+        // The engine's imports of the array end when its passes have run, which only its own wait lets it know.
+        if (mlx.engine.enabled) mlx.engine.close();
         var attempt: usize = 0;
         while (payload.released.load(.acquire) == 0 and attempt < 32) : (attempt += 1) {
             _ = mlx.mlx_synchronize(s);
@@ -1801,9 +1804,20 @@ pub const Staged = struct {
     /// Stages read so far.
     done: usize = 0,
     ended: bool = false,
+    /// The ranges each stage is still writing, marked in `fill_marks` (keyed by their start) when the route's caller reads
+    /// stage by stage on the engine; empty otherwise, where the slabs are marked whole.
+    marks: [1 + quant.rate_group_limit]std.ArrayList(usize) = @splat(.empty),
+    /// Each group's overflow into the union, kept for the bank a ranged route builds once the scales have landed.
+    overflow: [quant.rate_group_limit]u32 = @splat(0),
 
     pub fn stages(self: *const Staged) usize {
         return 1 + self.groups;
+    }
+
+    /// Stage `stage` has landed: its ranges may be read.
+    fn unmark(self: *Staged, stage: usize) void {
+        for (self.marks[stage].items) |begin| fill_marks.remove(begin);
+        self.marks[stage].clearRetainingCapacity();
     }
 
     fn slabSets(self: *const Staged, engine: *Engine) [2][]SlabOperand {
@@ -1814,10 +1828,13 @@ pub const Staged = struct {
     fn abort(self: *Staged, engine: *Engine) void {
         for (self.slabSets(engine)[0..self.sets], self.begun[0..self.sets]) |set, begun| for (set[0..begun]) |*operand| abortFill(operand);
         self.begun = @splat(0);
+        for (0..self.stages()) |stage| self.unmark(stage);
         for (self.gl.caches[0..self.groups]) |*cache| cache.invalidateUnready();
     }
 
     fn destroy(self: *Staged, allocator: std.mem.Allocator) void {
+        for (0..self.stages()) |stage| self.unmark(stage);
+        for (&self.marks) |*list| list.deinit(allocator);
         for (&self.spans) |*list| list.deinit(allocator);
         self.admitted.deinit(allocator);
         allocator.destroy(self);
@@ -1967,6 +1984,8 @@ pub const Engine = struct {
     copy_bytes_total: u64 = 0,
     /// Wide routes whose fill the caller staged (`prepareHostStaged`).
     staged_routes: u64 = 0,
+    /// The next staged route marks the ranges its stages write instead of the slabs whole (`prepareHostStagedRanged`).
+    range_marks: bool = false,
     forward_clock: Clock,
     last: Breakdown = .{},
     route_linear: RouteClass = .{},
@@ -3331,6 +3350,8 @@ pub const Engine = struct {
 
         const to_slot = try self.allocator.alloc(u16, experts);
         defer self.allocator.free(to_slot);
+        // What each stage writes in each slab, as one range: a group's pool is its own region of the slab.
+        var cover: [1 + quant.rate_group_limit][2][n]?[2]usize = @splat(@splat(@splat(null)));
         for (resolutions, 0..) |resolution, g| {
             var spilled: u32 = 0;
             for (resolution.bindings) |binding| {
@@ -3345,15 +3366,29 @@ pub const Engine = struct {
                     // The scales go first: every group's GEMM prepares its rows with all of them.
                     const stage = if (ci % 3 == 0) 1 + g else 0;
                     try st.spans[stage].append(self.allocator, gl.fillSpan(source, dst, g, ci));
+                    const at_dst = @intFromPtr(dst.ptr);
+                    const seen = &cover[stage][if (binding.slot != null) 0 else 1][ci];
+                    seen.* = if (seen.*) |r| .{ @min(r[0], at_dst), @max(r[1], at_dst + dst.len) } else .{ at_dst, at_dst + dst.len };
                 }
                 if (binding.slot == null) spilled += 1;
             }
         }
 
-        const bank = try self.allocator.create(Ragged);
-        errdefer self.allocator.destroy(bank);
-        bank.* = try Ragged.initSplit(self.s, &gl.cache_ragged, &gl.union_ragged, overflow[0..resolutions.len]);
-        errdefer bank.deinit();
+        if (self.range_marks) {
+            for (sets[0..st.sets]) |set| for (set[0..n]) |*operand| if (operand.slab) |slab| slab.dropMark();
+            for (0..st.stages()) |stage| for (cover[stage]) |per_set| for (per_set) |range| if (range) |r| {
+                fill_marks.add(r[0], r[1] - r[0]);
+                try st.marks[stage].append(self.allocator, r[0]);
+            };
+        }
+
+        st.overflow = overflow;
+        // A ranged route builds its bank on the engine once the scales have landed (`stageBank`): the bank concatenates them.
+        const bank: ?*Ragged = if (self.range_marks) null else try self.splitBank(gl, overflow[0..resolutions.len], self.s);
+        errdefer if (bank) |b| {
+            b.deinit();
+            self.allocator.destroy(b);
+        };
         const remapped = try self.allocator.alloc(u16, occurrences.len);
         for (occurrences, remapped) |expert, *slot| slot.* = to_slot[expert];
 
@@ -3376,6 +3411,13 @@ pub const Engine = struct {
         };
     }
 
+    fn splitBank(self: *Engine, gl: *GroupedLayer, overflow: []const u32, s: mlx.mlx_stream) !*Ragged {
+        const bank = try self.allocator.create(Ragged);
+        errdefer self.allocator.destroy(bank);
+        bank.* = try Ragged.initSplit(s, &gl.cache_ragged, &gl.union_ragged, overflow);
+        return bank;
+    }
+
     /// Whether `--drop-expert` left this layer's expert unloaded: it has no slot and no bytes are ever read for it.
     pub fn isDropped(self: *const Engine, layer: u16, expert: u16) bool {
         const d = self.geometry.drop orelse return false;
@@ -3395,15 +3437,56 @@ pub const Engine = struct {
     /// published and leased for the route.
     pub fn fillStaged(self: *Engine, p: *Prepared, ctx: *anyopaque, ready: *const fn (ctx: *anyopaque, group: usize) anyerror!void) !void {
         const st = p.staged orelse return;
-        try self.runFill(st.layer, st.spans[0].items);
-        st.done = 1;
+        try self.stageScales(p);
         for (0..st.groups) |g| if (st.spans[1 + g].items.len == 0) try ready(ctx, g);
         for (0..st.groups) |g| {
             if (st.spans[1 + g].items.len == 0) continue;
-            try self.runFill(st.layer, st.spans[1 + g].items);
-            st.done = 2 + g;
+            try self.stageGroup(p, g);
             try ready(ctx, g);
         }
+        try self.stageEnd(p);
+    }
+
+    /// `prepareHostStaged` for a caller on the engine of our own, which reads the route stage by stage (`stageScales`,
+    /// `stageGroup`, `stageEnd`) and encodes each group's GEMMs between them: the stages' ranges are marked, not the
+    /// slabs, so a pass that binds a group whose experts have landed may commit while the next group is read.
+    pub fn prepareHostStagedRanged(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
+        self.range_marks = true;
+        defer self.range_marks = false;
+        return self.prepareHostStaged(layer_index, occurrences);
+    }
+
+    /// Reads stage 0 of a staged route: the scales of every miss.
+    pub fn stageScales(self: *Engine, p: *Prepared) !void {
+        const st = p.staged orelse return;
+        if (st.done >= 1) return;
+        try self.runFill(st.layer, st.spans[0].items);
+        st.done = 1;
+        st.unmark(0);
+    }
+
+    /// The bank of a ranged route, made on the engine from the slab views and the scales that have landed: its slices and
+    /// reshapes are views of the engine's, its concatenation of the scales one dispatch. Once per route.
+    pub fn stageBank(self: *Engine, p: *Prepared) !*const Ragged {
+        if (p.ragged) |bank| return bank;
+        const st = p.staged orelse return error.Dsv41StqLayerNotGrouped;
+        const bank = try self.splitBank(st.gl, st.overflow[0..st.groups], mlx.engine.stream());
+        p.ragged = bank;
+        p.split = bank;
+        return bank;
+    }
+
+    /// Reads rate group `g`'s trellis of a staged route.
+    pub fn stageGroup(self: *Engine, p: *Prepared, g: usize) !void {
+        const st = p.staged orelse return;
+        if (st.spans[1 + g].items.len > 0) try self.runFill(st.layer, st.spans[1 + g].items);
+        st.done = 2 + g;
+        st.unmark(1 + g);
+    }
+
+    /// Every stage has landed: the admitted misses are ready, the slabs published and leased for the route.
+    pub fn stageEnd(self: *Engine, p: *Prepared) !void {
+        const st = p.staged orelse return;
         st.done = st.stages();
         for (st.admitted.items) |pair| st.gl.caches[pair[0]].markReady(pair[1]);
         const layer = &self.layers[st.layer];
@@ -5635,4 +5718,18 @@ test "expert cache profile: the load line names the split" {
     var buf: [128]u8 = undefined;
     try t.expectEqualStrings("[expert-stream] slots per layer: profile (212..374)\n", cacheSplitLine(&buf, true, 212, 374));
     try t.expectEqualStrings("[expert-stream] slots per layer: uniform (234)\n", cacheSplitLine(&buf, false, 234, 234));
+}
+
+test "expert stream: a slab an engine pass bound is unmapped by its release, though the engine has not waited since" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    var operand = try SlabOperand.createFlat(std.testing.allocator, 1 << 16, .float16, 2);
+    const timeouts = slab_release_timeouts.load(.monotonic);
+    var sum = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&sum, operand.array, operand.array, mlx.engine.stream()));
+    _ = mlx.mlx_array_free(sum);
+    operand.destroy(std.testing.allocator, mlx.gpuStream());
+    try std.testing.expectEqual(timeouts, slab_release_timeouts.load(.monotonic));
 }

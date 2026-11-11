@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash STQ prefill runs on Sushi Cooler on M5 Macs**: long prompts are processed on sushi's own Metal
+  engine beside generation, with the same answers; `--ds41-mlx-engine` and the "Use Sushi's Cooler Engine instead of
+  MLX" setting move prefill back to MLX with the rest.
 - **DeepSeek-V4.1-Flash on Sushi Cooler reports the engine's memory**: the memory figures in `/props` and the dashboard,
   and the admission checks, now count the bytes sushi's own engine holds beside MLX's.
 - **DeepSeek-V4.1-Flash reads images on Sushi Cooler**: on an M5 Mac the image encoder runs on sushi's own engine with the
@@ -32,8 +35,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1-Flash STQ loads faster on M5 Macs**: the load no longer warms kernels that generation does not use,
   and a short follow-up turn generates on the same engine as the rest of decode.
 - **DeepSeek-V4.1-Flash STQ generates on sushi's own Metal engine on M5 Macs**: token generation for the STQ packs no
-  longer runs through MLX there. It gives the same tokens with about a third less CPU while generating; prefill and
-  every other model are unchanged. It is the first step of moving the engine off MLX.
+  longer runs through MLX there. It gives the same tokens with about a third less CPU while generating; every other
+  model is unchanged. It is the first step of moving the engine off MLX.
 - **Prefill with the SSD prompt cache is back to full speed**: saving a long prompt to the SSD cache no longer stalls
   the next prefill chunk, which had cost 1.6.0 up to about 5% of prefill speed on Qwen3.8-Flash-Next.
 - **Follow-up turns restore from the SSD prompt cache faster**: a restore reads the cache in parallel again, as 1.5.1

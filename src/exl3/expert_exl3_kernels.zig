@@ -1047,6 +1047,9 @@ var gemm_simdmat_cfgs: kernel_src.CfgCache(GemmSortedKey, 8) = .{};
 var gemm_nax_cfgs: kernel_src.CfgCache(GemmSortedKey, 8) = .{};
 var gemm_nax_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 pub var gemm_nax_failed: bool = false;
+/// A NAX launch has worked in this process. A launch that fails after that is the launch's own failure (a pass the
+/// engine refuses by name, memory), not the arm's: it is returned, and the arm stays on.
+var gemm_nax_worked: bool = false;
 var gemm_nax_cached: ?bool = null;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
 const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, topk: c_int, n: u32, layout: GemvLayout, group: c_int };
@@ -1515,8 +1518,10 @@ pub fn innerGemmSortedTableOrdered(
                 errdefer _ = mlx.mlx_array_free(nout);
                 try mlx.check(mlx.mlx_vector_array_get(&nout, noutputs, 0));
                 logFunnel(funnelReads(rate.n), rate.n, .nax, mlx.mlx_array_dtype(x));
+                gemm_nax_worked = true;
                 return nout;
             }
+            if (gemm_nax_worked) return error.Exl3GemmLaunchFailed;
             gemm_nax_failed = true;
         } else |_| {
             gemm_nax_failed = true;

@@ -89,8 +89,21 @@ pub fn decodeLine(side: DecodeSide) []const u8 {
     };
 }
 
+/// Set while the load's warm runs. `serve` installs the caps after the load, so each engine forward of the warm takes the
+/// budget a request's forward of the same rows and position has (`enterWarm`), or it would hold any amount.
+pub var warm_budget: bool = false;
+
+/// A test names the engine budget a warm forward gets.
+pub var warm_budget_override: ?u64 = null;
+
+/// Whether a warm forward installed a budget, which `endWarm` lifts.
+var warm_budget_set: bool = false;
+
 /// A test names the side its model decodes on.
 pub var own_override: ?bool = null;
+
+/// The load line of a pack whose decode is on the engine: its prefill chunks run there too, at every width.
+pub const prefill_line = "[dsv41] prefill chunks wider than 16 rows: on Sushi Cooler, the engine of our own";
 
 pub fn decodeSideOf(c: *const Config) DecodeSide {
     return decodeSide(c.expert_dec != null and c.trunk_dec != null, mlx.engine.matrixUnits(), c.mlx_ask);
@@ -138,10 +151,48 @@ fn setTransient(bytes: u64, ops: PoolOps) void {
 /// Moves the pool cap to the one `rows` takes and caps the forward's allocations at what it bills, on the inference
 /// thread. True when the pool cap moved.
 pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
-    if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41")) return false;
-    setTransient(phaseLimit(c.forwardCap(rows, seq), config), ops);
-    ops.set_own(ownCap(c, seq));
+    if (!arch_config.isOf(config, "dsv41")) return false;
+    if (pool_ram_cap == 0) {
+        enterWarm(rows, seq, c, ops);
+        return false;
+    }
+    const split = splitOf(rows, seq, c);
+    setTransient(phaseLimit(split.mlx, config), ops);
+    ops.set_own(split.own);
     return moveCap(rowsCap(rows, config), config, ops);
+}
+
+/// A forward of the load's warm: the engine's share of the cap a request's forward of `rows` ending at `seq` has. Nothing
+/// outside the warm.
+pub fn enterWarm(rows: u64, seq: u64, c: *const Config, ops: PoolOps) void {
+    if (!warm_budget) return;
+    warm_budget_set = true;
+    ops.set_own(warm_budget_override orelse splitOf(rows, seq, c).own);
+}
+
+pub fn enterWarmMlx(rows: u64, seq: u64, c: *const Config) void {
+    enterWarm(rows, seq, c, mlx_ops);
+}
+
+/// The warm is over: the engine runs under no budget until a request's forward installs its own.
+pub fn endWarm(ops: PoolOps) void {
+    warm_budget = false;
+    if (!warm_budget_set) return;
+    warm_budget_set = false;
+    ops.set_own(std.math.maxInt(u64));
+}
+
+pub fn endWarmMlx() void {
+    endWarm(mlx_ops);
+}
+
+/// What a forward's cap leaves to MLX and to the engine of our own. A wide chunk on the engine splits the one cap its
+/// bill reserves: MLX keeps the state rows it appends, the engine's pool takes the rest.
+fn splitOf(rows: u64, seq: u64, c: *const Config) struct { mlx: u64, own: u64 } {
+    const cap = c.forwardCap(rows, seq);
+    const wide_own = rows > verify_rows and ownDecode(c);
+    const mlx_cap = if (wide_own) c.forwardCapMlx(rows, seq) else cap;
+    return .{ .mlx = mlx_cap, .own = if (wide_own) cap - mlx_cap else ownCap(c, seq) };
 }
 
 /// An image encode of `bill` bytes (`request_media.visionEncodeBill`) starts: its allocations are capped at it. No bill, no cap.
@@ -480,6 +531,81 @@ test "dsv41 borrow: a forward moves the pool cap to its rows' cap, and lowering 
     try testing.expectEqual(@as(usize, 0), PoolProbe.transient_sets);
 }
 
+test "dsv41 borrow: a wide chunk on the engine splits the cap it bills between MLX and the engine, which sum to it" {
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
+            own_override = true;
+            defer own_override = null;
+            for ([_][2]u64{ .{ 2048, 2048 }, .{ 1100, 1 << 20 }, .{ 31, 4096 } }) |chunk| {
+                _ = enterForward(chunk[0], chunk[1], &config, c, PoolProbe.ops);
+                const mlx_share = PoolProbe.transient - config.expertPoolBytes();
+                try testing.expect(mlx_share > 0 and PoolProbe.own > 0);
+                try testing.expectEqual(c.forwardCap(chunk[0], chunk[1]), mlx_share + PoolProbe.own);
+            }
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: a wide chunk of a pack that decodes on MLX keeps the whole cap on MLX" {
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
+            own_override = false;
+            defer own_override = null;
+            _ = enterForward(2048, 2048, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(2048, 2048), PoolProbe.transient - config.expertPoolBytes());
+            try testing.expectEqual(@as(u64, 0), PoolProbe.own);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: the load's warm gives each engine forward, of any width, the budget serve gives it, and nothing else" {
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
+            own_override = true;
+            defer {
+                own_override = null;
+                warm_budget = false;
+                warm_budget_set = false;
+            }
+            // Outside the warm a forward is not capped before `serve` installs the caps, as `sushi kld` and the tests are not.
+            _ = enterForward(2048, 2048, &config, c, PoolProbe.ops);
+            enterWarm(1, 4096, c, PoolProbe.ops);
+            try testing.expectEqual(@as(u64, 0), PoolProbe.own);
+            warm_budget = true;
+            // A wide chunk takes its share of the one cap; a decode-width forward, whatever its rows, the decode cap at its position.
+            try testing.expect(!enterForward(2048, 2048, &config, c, PoolProbe.ops));
+            try testing.expectEqual(c.forwardCap(2048, 2048) - c.forwardCapMlx(2048, 2048), PoolProbe.own);
+            for ([_]u64{ 1, 3, verify_rows }) |rows| {
+                enterWarm(rows, 4096 + rows, c, PoolProbe.ops);
+                try testing.expectEqual(ownCap(c, 4096 + rows), PoolProbe.own);
+            }
+            try testing.expectEqual(@as(usize, 0), PoolProbe.n);
+            try testing.expectEqual(@as(usize, 0), PoolProbe.transient_sets);
+            // The warm's end lifts what it set, once, and leaves another load's cap alone.
+            endWarm(PoolProbe.ops);
+            try testing.expect(!warm_budget);
+            try testing.expectEqual(@as(u64, std.math.maxInt(u64)), PoolProbe.own);
+            PoolProbe.reset();
+            endWarm(PoolProbe.ops);
+            try testing.expectEqual(@as(u64, 0), PoolProbe.own);
+            // Another architecture's forward is never capped.
+            warm_budget = true;
+            const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+            _ = enterForward(2048, 2048, &qwen, c, PoolProbe.ops);
+            try testing.expectEqual(@as(u64, 0), PoolProbe.own);
+        }
+    };
+    try withPoolState(0, &Body.run);
+}
+
 test "dsv41 borrow: every phase installs the cap it bills and the decode pool beside it" {
     const Body = struct {
         fn run() anyerror!void {
@@ -583,9 +709,9 @@ test "dsv41 borrow: with decode on the engine of our own every forward installs 
             own_override = true;
             _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
             try testing.expectEqual(c.forwardCap(verify_rows, 9_000), PoolProbe.own);
-            // A prefill chunk leaves the engine what the decode after it is billed.
+            // A prefill chunk takes the cap less MLX's share.
             _ = enterForward(2048, 225_000, &config, c, PoolProbe.ops);
-            try testing.expectEqual(c.forwardCap(verify_rows, 225_000), PoolProbe.own);
+            try testing.expectEqual(c.forwardCap(2048, 225_000) - c.forwardCapMlx(2048, 225_000), PoolProbe.own);
             _ = endRequest(&config, PoolProbe.ops);
             try testing.expectEqual(c.forwardCap(verify_rows, 1), PoolProbe.own);
             _ = unloadModel(&config, PoolProbe.ops);

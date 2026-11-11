@@ -117,7 +117,8 @@ state's 890 B a token is 204 B; the cap carries 603 B (x 5/4).
 With decode on the engine of our own (an STQ pack on a GPU with matrix units, [engine-own-forward](engine-own-forward.md#memory)) the
 request bill carries the decode cap a second time, for the engine's pool: 0.28 / 0.44 / 1.06 GB more at 9k / 225k /
 1M tokens. The engine's forward makes on its own queue what MLX's made on MLX's, and each allocator is held to the
-cap separately.
+cap separately. A prefill chunk on the engine splits its one cap between the two (`Config.forwardCapMlx` for the state rows
+MLX appends, the rest for the engine's pool), so the bill of a chunk is the one above.
 
 The live headroom the borrow reads (`dsv41Headroom`) is the ceiling less `gpu_mem.activeBytes`, which holds the
 engine's pool buffers bound to live tensors (the state rows, window rings and rollback record) beside MLX's active

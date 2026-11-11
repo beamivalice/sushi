@@ -12,11 +12,12 @@ const metal_mlx = @import("../metal_mlx.zig");
 const io_util = @import("../io_util.zig");
 const mlx = @import("../mlx.zig");
 const registry = @import("pipeline_registry.zig");
+const fill_marks = @import("../fill_marks.zig");
 
 pub const max_dims = 8;
 pub const Dtype = mlx.mlx_dtype;
 
-pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, PoolOverBudget };
+pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, PoolOverBudget, ReadsFillingSlab };
 
 pub fn itemSize(d: Dtype) usize {
     return switch (d) {
@@ -46,6 +47,10 @@ pub const Store = struct {
         mlx: mlx.mlx_array,
     };
 };
+
+/// What the pool refused last for its budget: the buffer wanted, what Metal held for the pool, what the tensors in use
+/// asked for, and the limit on the first of those. For the refusal's message.
+pub var refused_budget: struct { wanted: u64 = 0, held: u64 = 0, asked: u64 = 0, limit: u64 = 0 } = .{};
 
 pub const Tensor = struct {
     store: *Store,
@@ -421,7 +426,10 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
         return store;
     }
     if (s.pool_limit) |limit| {
-        if (!try trimTo(s, limit -| bytes)) return error.PoolOverBudget;
+        if (!try trimTo(s, limit -| bytes)) {
+            refused_budget = .{ .wanted = bytes, .held = s.stats.pool_bytes, .asked = s.stats.pool_asked, .limit = limit };
+            return error.PoolOverBudget;
+        }
     }
     const buffer = try s.dev.alloc(bytes);
     errdefer buffer.release();
@@ -950,6 +958,7 @@ pub fn nowNs() u64 {
 /// Ends the open pass's encoding rules and hands it to the GPU: it waits for the passes that wrote what it binds
 /// and marks what it writes.
 fn commitPass(s: *State, open: metal.Pass) Error!void {
+    if (fill_marks.live.load(.acquire) != 0) try refuseFillingReads(s, open);
     clearHazards(s);
     const fence = try s.dev.fence();
     errdefer fence.release();
@@ -989,6 +998,22 @@ fn commitPass(s: *State, open: metal.Pass) Error!void {
     s.seq += 1;
     s.pass_dispatches = 0;
     s.stats.submits += 1;
+}
+
+/// A pass that binds bytes a host fill is still writing is dropped unrun: the GPU would read them half written.
+fn refuseFillingReads(s: *State, open: metal.Pass) Error!void {
+    const marks = fill_marks.snapshot();
+    var binds = s.pass_binds.keyIterator();
+    while (binds.next()) |store| {
+        if (!marks.meets(@intFromPtr(store.*.ptr), store.*.len)) continue;
+        open.discard();
+        clearHazards(s);
+        s.pass_binds.clearRetainingCapacity();
+        s.pass_writes.clearRetainingCapacity();
+        s.pass_kernels = .{};
+        s.pass_dispatches = 0;
+        return error.ReadsFillingSlab;
+    }
 }
 
 fn clearHazards(s: *State) void {

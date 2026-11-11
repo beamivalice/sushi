@@ -15,19 +15,26 @@ MLX, the reason. A user opts out of the engine up front, never per forward: `--d
 every forward of the table below to MLX at the next load (`DecodeSide.mlx_by_flag` / `.mlx_by_setting`); the flag
 outranks the file. There is no fallback after a start: a forward of the engine that fails is the request's error.
 
-| pack and GPU | forwards of 16 rows or fewer (decode, DSpark draft and verify, a short prefill) |
+Prefill follows decode (`Model.engine_prefill`, set at the load): a pack that decodes on the engine prefills there, a
+chunk of any width included, and a pack that decodes on MLX prefills on MLX.
+
+| pack and GPU | forwards on the engine |
 |---|---|
-| DeepSeek-V4.1 STQ (experts and trunk), a GPU with matrix units (M5) | the engine |
-| DeepSeek-V4.1 STQ, a GPU without matrix units | MLX: the engine's other matmul tiles have not run on one |
-| DeepSeek-V4.1 with an FP8 trunk or MXFP4 experts | MLX: the engine has no `quantized_matmul` |
-| a forward that splices image rows, prefill wider than 16 rows, every other architecture | MLX |
+| DeepSeek-V4.1 STQ (experts and trunk), a GPU with matrix units (M5) | decode, DSpark draft and verify, and every prefill chunk, wider than 16 rows or not |
+| DeepSeek-V4.1 STQ, a GPU without matrix units | none: the engine's other matmul tiles have not run on one |
+| DeepSeek-V4.1 with an FP8 trunk or MXFP4 experts | none: the engine runs neither |
+| a forward that splices image rows, every other architecture | none: MLX |
 
 The vision tower of an image request (once per image, on a load that decodes on the engine) runs on the engine whole:
 the table's `quantized_matmul`, `fast::scaled_dot_product_attention` and `erf` rows, the weights imported.
 
-A forward of 16 rows or fewer on a request that holds image embeddings runs on the engine when its rows hold no image
-token (the splice reads the embeddings only for an image row); one that does, and one issued while a DSpark verify is
-open (only after a round failed), stay on MLX.
+A forward on a request that holds image embeddings runs on the engine when its rows hold no image token (the splice
+reads the embeddings only for an image row); one that does, and one issued while a DSpark verify is open (only after a
+round failed), stay on MLX.
+
+What a wide chunk still builds on MLX: the state rows it appends (`forwardCapMlx` bills them), the union workspace of a
+spilled route and the views of the slabs the engine imports (the slabs are MLX arrays over host pages), and the keep-alive
+op of MLX's queue.
 
 A DSpark round's verdict, greedy or sampled, is decided on the engine wherever its verify ran there.
 
@@ -48,10 +55,53 @@ patch in), two sessions on 90c83d71 and 537e8e91. Engine: two runs of this chang
 
 - The arms are from different sessions, so a gap under about 4% is not decided: the same MLX arm read 87.2 to
   101.2 at code 4k across sessions. Prose at 128k is behind by 8% in both runs.
-- A greedy request gives the same tokens on both sides, and prefill is MLX's on both.
+- A greedy request gives the same tokens on both sides, and prefill was MLX's on both in this bench.
 - While decoding, the server takes 19% of one core against 32% (prose) and 10% against 15% (code).
 - The round-cost policy picks row counts from measured times, so two runs of one request can take different
   rounds; compare `[spec-stats]` round mixes before reading a tok/s gap as a kernel's.
+
+## A prefill chunk on the engine
+
+A chunk of any width goes through the engine (`forwardDsv41With`), a state-only chunk (`extendState`) included. On the tiny STQ fixture a chunk of 17 to 513
+rows, a prompt cut in chunks with restore points between and state-only chunks, and the decode after it give MLX's
+restore-point digests, last-row logits and tokens. What the wide path reached that decode does not: `abs`, `logaddexp`
+(the router's softplus) and an unsigned `floor_divide` (the routed slots' rows). The pack's indexer `weights_proj` is
+dense, so `quantized_matmul` is not reached on an STQ pack; an FP8-trunk fixture stops there.
+
+A wide chunk whose experts stream (cache below the pack) cannot hand the GPU the engine's whole open pass at a rate
+group's start (`EarlyPlanes.start`, the MLX arm's way): the engine encodes each op into the pass as it is called, so the
+groups not yet filled would go with it, where MLX evaluates only the planes asked for. The test with a stalled fill on a
+three-expert cache (`DSV41_STQ_TINY`) is the guard; a cache holding every expert never reaches the route.
+
+The engine enforces the rule: a slab being filled is marked (`fill_marks`, set at `PageSlab.tryBeginFill`, cleared at
+`publish`), and `commitPass` drops a pass that binds any marked bytes and fails with `ReadsFillingSlab`. With no fill in
+flight the check is one atomic load per commit; with one (the prefetcher's) it is one lock and a compare per bound
+buffer.
+
+The engine's wide chunk reads its experts group by group (`rate_groups.moePrefillSharedFusedStaged` and
+`moePrefillStaged`, beside the MLX arm's `...Early` functions, which are untouched; `StqStream.applyScored`):
+`Engine.stageScales` first, then `stageGroup(g)` just before the chain encodes group g's gate and up planes, which it
+hands to the GPU at once, so the GPU runs group g while the host reads group g+1; `stageEnd` publishes and leases. The
+route marks the ranges each stage writes (`Staged.marks`, one covering range per stage and slab, in `fill_marks`)
+instead of the slabs whole, so the guard lets a pass bind a group that has landed and still refuses one that binds a
+group still being read. `StqStream.stage_on_engine` (test only) restores the old order, which the guard refuses.
+
+The load also runs the wide forwards a prompt reaches (`warmWide`: a full-width state-only and head chunk, head chunks
+whole, part and not at all on the GEMM tiles, the held-back tail, one chunk per pick-sort size and one per
+compressed-row count under 17), so a request compiles no kernel; MLX's own prefill warm stays beside it, for the image
+forwards.
+
+A wide chunk on the engine bills the one `Config.forwardCap` it always did, split between the two sides
+(`forwardCapMlx`: the state rows MLX appends and 64 MB; the engine's pool takes the rest), so MLX's peak above its
+start plus the pool's held peak stays under the bill. `serve` installs the caps after the load, so the load's warm
+gives every forward of the engine, decode-width or wide, the engine's share a request's forward has (`warm_budget`,
+`enterWarm`, the same `splitOf` as serve): a forward the bill does not cover fails the load with `PoolOverBudget`, not a
+request with a Metal OOM, and the budget is lifted when the warm ends.
+
+A ranged route builds its bank on the engine once stage 0 has landed (`Engine.stageBank`, called through
+`FillStages.scales`): the union's slab views (`rate_groups.rowsView` slice and reshape) are engine ops over the MLX slab
+arrays, imported, and the scale concatenation (`concatAxis0`) is one dispatch that reads the landed scales. The old
+route and the MLX arm still build the bank at prepare time.
 
 ## The seam
 
@@ -130,6 +180,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **A host read waits for the pass that wrote the bytes, not for the queue.** Waiting for everything in flight loses
   the layer the forward queued ahead (25.5 against 20.4 ms per forward).
 - The pool never hands out a store the open pass binds, and its buffers sit in a residency set of our own.
+- **A slab is unmapped only after the engine has waited.** An import of a slab's array outlives the tensor that held it
+  until the engine next waits (`retired`), and `SlabOperand.destroy` gives MLX 32 tries, then leaves the slab mapped for
+  good. A borrow release now follows engine passes, so `destroy` closes the engine first (`mlx.engine.close()`, a no-op
+  while `enabled` is off, so no other architecture reaches it).
 - **A thread never ends with a pass open** (`core.close`): Metal asserts when the thread's autorelease pool drains
   an encoder still open. A request's end, an unload and the inference loop's exit close it.
 - **A pass handed to an idle queue starts 60 to 70 us later, whatever the idle; one handed over behind a pass that
@@ -160,7 +214,9 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 | concatenate, take, take along an axis, repeat, stack, arange, zeros, slice update | ours | same bytes |
 | sum, max over an axis of floats; mean (f32); argmax | MLX's, from `mlx.metallib`, under MLX's reduction plan | same bytes |
 | sum, max over an axis of integers | ours | same bytes |
-| log | ours, MLX's precise math | same bytes |
+| log, abs | ours, MLX's precise math (abs through float) | same bytes |
+| logaddexp (f32, f16, bf16; one flat run, a scalar beside a run) | MLX's binary kernel from `mlx.metallib` (a source of ours rounded the last bits differently) | same bytes |
+| floor divide (unsigned integers, floats) | ours: the quotient; the floor of the quotient | same bytes |
 | softmax over an inner axis | ours, MLX's op chain | same bytes |
 | softmax over the last axis, RMS norm, dequantize | MLX's, from `mlx.metallib` | same bytes |
 | matmul: vector, rows against a weight, two matrices, batches, dot product | MLX's, from `mlx.metallib` | same bytes |
@@ -218,16 +274,22 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   inside a request (up to 2 s), and the round-cost policy stopped drafting for the rest of that request.
 - **With decode on the engine the load does not warm MLX's widths 1 to 16.** No forward of 16 rows or fewer is MLX's
   any more (see the table), so `warmKernels` skips MLX's decode widths and DSpark rounds and keeps MLX's prefill
-  (256, 42 and 31 rows). An MLX-decode load warms as before.
+  (256, 42 and 31 rows), which the image forwards still run. An MLX-decode load warms as before.
 - **The vision tower warms itself on a first load only** (`Dsv41Vision.warmEngine`, from `VisionEncoder.init`, after the
   model's seal): one block over five patch counts, the seal lifted for its span. Its recipes ride the manifest with a
   `marker` recipe (`vision tower`, keyed by the tower's widths) that says the warm is whole; a same-key load makes the
   recipes with the rest, trusts the marker, and runs no tower warm. A load that ran the warm writes the manifest again
   (`dsv41_pipelines.rewriteLate`). A manifest whose recipes did not all make drops its markers.
+- **Every warm forward of the engine runs under a request's budget** (`dsv41_model.warmBudget`, before each decode-width
+  forward; `warmWide` through `forwardDsv41With`). The decode cap follows the position the forward is at, so the
+  long-context steps of `warmOwnBlocks` and `warmOwnLong` are billed as a request there is.
 - **The NAX GEMM kernel is proven before the engine warm** (`kernels.prepareGemmNax`, called by `initDsv41` for the
   experts' and the trunk's decode). Its proof is MLX work of its own, which a forward of the engine refuses; first
   reached inside one, it was declined for the process (`[exl3-gemm] NAX arm declined`) and every GEMM, prefill
   included, ran the SIMD arm at a third of the speed.
+- **A failed launch declines a kernel arm only before that arm has ever worked** (`kernels.gemm_nax_worked`). After
+  one launch has run, a failure is the launch's own (a pass the engine refuses by name, memory) and is returned: taken
+  as "the arm is unavailable" it switched the whole process to another arm, with other bytes, without a word.
 - **Engine pipeline creation is 0.1 s with the system's shader cache warm and 9 to 16 s cold**, all of it
   `newLibraryWithSource` (435 pipelines, M5 Max); the pipeline state is 0.03 to 0.06 s. A binary archive replaces only
   that state step, so it buys nothing here. A binary the system has not run is cold again, and the
@@ -272,7 +334,7 @@ rebuilds one.
 - **Same key.** The recipes are made on up to 8 worker threads (our own Metal binding only, never MLX), after the model is built;
   the inference thread then installs them. A launch finds its pipeline
   by source or key, counts it as preloaded (`core.pipelines_preloaded`), not compiled and not late. The engine's warm
-  forwards are skipped (`WarmScope.mlx`: MLX's prefill warm and its spilled-route chain stay); the NAX proof and the NAX probes already run at init.
+  forwards, the wide chunks included, are skipped (`WarmScope.mlx`: MLX's prefill warm and its spilled-route chain stay); the NAX proof and the NAX probes already run at init.
   A recipe the manifest lacks compiles in the request and shows in `kernels compiled after the load`.
 - **Another build of the same scope.** The newest such manifest is made the same way, then the full warm runs as the
   complete enumeration and the manifest is rewritten; the older builds of the scope are removed and the log says so.

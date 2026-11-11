@@ -1877,23 +1877,26 @@ const GroupPlanes = struct {
     }
 };
 
-/// One projection's GEMM, once per group over the group's own window segment and bank view. `keep` takes a handle to
-/// each group's plane.
+/// One pool's GEMM plane of projection `pi`, over the pool's own window segment and bank view.
+fn gemmPlaneOf(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize, g: usize, w: *const GroupWindows, win: c_int) !mlx.mlx_array {
+    const lo: c_int = @as(c_int, @intCast(g)) * w.per_all + @as(c_int, @intCast(rb.base[g]));
+    const len = w.per_all + @as(c_int, @intCast(rb.experts_of[g]));
+    var starts = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(starts);
+    try mlx.check(mlx.mlx_slice(&starts, w.starts, &[_]c_int{lo}, 1, &[_]c_int{lo + len}, 1, &[_]c_int{1}, 1, s));
+    var nlives = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(nlives);
+    try mlx.check(mlx.mlx_slice(&nlives, w.nlives, &[_]c_int{lo}, 1, &[_]c_int{lo + len}, 1, &[_]c_int{1}, 1, s));
+    const trellis = projOf(rb.views[g], pi).trellis;
+    return kernels.innerGemmSortedTableOrdered(s, x, trellis, w.local, win, true, .{ .starts = starts, .nlives = nlives, .nwin = len }, if (rb.tile_major) .tile_major else .pack);
+}
+
+/// One projection's GEMM, once per group. `keep` takes a handle to each group's plane.
 fn gemmPlanes(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize, w: *const GroupWindows, win: c_int, keep: ?*[max_groups]mlx.mlx_array) !GroupPlanes {
     var planes: GroupPlanes = .{};
     errdefer planes.deinit();
     for (0..rb.count) |g| {
-        const lo: c_int = @as(c_int, @intCast(g)) * w.per_all + @as(c_int, @intCast(rb.base[g]));
-        const len = w.per_all + @as(c_int, @intCast(rb.experts_of[g]));
-        var starts = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(starts);
-        try mlx.check(mlx.mlx_slice(&starts, w.starts, &[_]c_int{lo}, 1, &[_]c_int{lo + len}, 1, &[_]c_int{1}, 1, s));
-        var nlives = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(nlives);
-        try mlx.check(mlx.mlx_slice(&nlives, w.nlives, &[_]c_int{lo}, 1, &[_]c_int{lo + len}, 1, &[_]c_int{1}, 1, s));
-        const bank = rb.views[g];
-        const trellis = projOf(bank, pi).trellis;
-        planes.arr[g] = try kernels.innerGemmSortedTableOrdered(s, x, trellis, w.local, win, true, .{ .starts = starts, .nlives = nlives, .nwin = len }, if (rb.tile_major) .tile_major else .pack);
+        planes.arr[g] = try gemmPlaneOf(s, x, rb, pi, g, w, win);
         planes.made += 1;
         if (keep) |k| {
             k[g] = mlx.mlx_array_new();
@@ -1907,12 +1910,64 @@ fn gemmPlanes(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize,
 fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize, sorted: mlx.mlx_array, w: *const GroupWindows, win: c_int, keep: ?*[max_groups]mlx.mlx_array) !mlx.mlx_array {
     var planes = try gemmPlanes(s, x, rb, pi, w, win, keep);
     defer planes.deinit();
+    return combinedPlane(s, &planes, sorted, rb);
+}
+
+/// The planes of `groupedGemm` combined into one, the single plane as it is.
+fn combinedPlane(s: mlx.mlx_stream, planes: *GroupPlanes, sorted: mlx.mlx_array, rb: *const Ragged) !mlx.mlx_array {
     if (planes.made == 1) {
         planes.made = 0;
         return planes.arr[0];
     }
     return combine(s, planes.arr[0..planes.made], sorted, rb.meta);
 }
+
+/// Where a prefill chain gets its bank and its gate and up planes: from a bank already filled, or read stage by stage
+/// as the chain asks (`FillStages`), each group's GEMMs handed to the GPU as its experts land.
+const PlaneSource = union(enum) {
+    filled: struct { rb: *const Ragged, early: ?*EarlyPlanes },
+    staged: FillStages,
+
+    fn bank(self: PlaneSource) !*const Ragged {
+        return switch (self) {
+            .filled => |f| f.rb,
+            .staged => |st| st.scales(st.ctx),
+        };
+    }
+
+    /// The gate and up planes of every pool, uncombined.
+    fn gateUp(self: PlaneSource, s: mlx.mlx_stream, rb: *const Ragged, xg: mlx.mlx_array, xu: mlx.mlx_array, w: *const GroupWindows, win: c_int) !GateUp {
+        switch (self) {
+            .filled => |f| {
+                var gate = try gemmPlanes(s, xg, rb, 0, w, win, if (f.early) |e| &e.gate else null);
+                errdefer gate.deinit();
+                return .{ .gate = gate, .up = try gemmPlanes(s, xu, rb, 1, w, win, if (f.early) |e| &e.up else null) };
+            },
+            .staged => |st| return gateUpStaged(s, xg, xu, rb, w, win, st),
+        }
+    }
+
+    /// The gate and up planes, each combined into one.
+    fn gateUpCombined(self: PlaneSource, s: mlx.mlx_stream, rb: *const Ragged, xg: mlx.mlx_array, xu: mlx.mlx_array, sorted: mlx.mlx_array, w: *const GroupWindows, win: c_int) !struct { gate: mlx.mlx_array, up: mlx.mlx_array } {
+        switch (self) {
+            .filled => |f| {
+                const g = try groupedGemm(s, xg, rb, 0, sorted, w, win, if (f.early) |e| &e.gate else null);
+                errdefer _ = mlx.mlx_array_free(g);
+                return .{ .gate = g, .up = try groupedGemm(s, xu, rb, 1, sorted, w, win, if (f.early) |e| &e.up else null) };
+            },
+            .staged => |st| {
+                var planes = try gateUpStaged(s, xg, xu, rb, w, win, st);
+                defer planes.gate.deinit();
+                defer planes.up.deinit();
+                const g = try combinedPlane(s, &planes.gate, sorted, rb);
+                errdefer _ = mlx.mlx_array_free(g);
+                return .{ .gate = g, .up = try combinedPlane(s, &planes.up, sorted, rb) };
+            },
+        }
+    }
+};
+
+const GateUp = struct { gate: GroupPlanes, up: GroupPlanes };
 
 /// Routed SwiGLU over prefill rows `x` [rows, hidden]: the served prefill chain (token prepare, gate
 /// and up GEMMs, SwiGLU mid, down GEMM, inverse-indexed finish) with each GEMM run once per group.
@@ -1927,6 +1982,16 @@ pub fn moePrefillClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged,
 
 /// `moePrefillClamped`, keeping each pool's gate and up planes in `early`.
 pub fn moePrefillEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, early: ?*EarlyPlanes) !mlx.mlx_array {
+    return moePrefillFrom(s, x, .{ .filled = .{ .rb = rb, .early = early } }, slots, scores, topk, limit);
+}
+
+/// `moePrefillEarly` with the fill read group by group (`FillStages`), as `moePrefillSharedFusedStaged`.
+pub fn moePrefillStaged(s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, stages: FillStages) !mlx.mlx_array {
+    return moePrefillFrom(s, x, .{ .staged = stages }, slots, scores, topk, limit);
+}
+
+fn moePrefillFrom(s: mlx.mlx_stream, x: mlx.mlx_array, src: PlaneSource, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int) !mlx.mlx_array {
+    const rb = try src.bank();
     const rows = mlx.getShape(x)[0];
     const n = rows * topk;
     logEngaged(.prefill, rb, 0, 0);
@@ -1947,11 +2012,10 @@ pub fn moePrefillEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, s
     defer for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    const g = try groupedGemm(s, prep[0], rb, 0, sorted, &w, win, if (early) |e| &e.gate else null);
-    defer _ = mlx.mlx_array_free(g);
-    const u = try groupedGemm(s, prep[1], rb, 1, sorted, &w, win, if (early) |e| &e.up else null);
-    defer _ = mlx.mlx_array_free(u);
-    const mid = try kernels.midSwigluPrepWithLimit(s, g, u, rb.svh[0], rb.svh[1], rb.suh[2], sorted, rb.inter, n, limit);
+    const gu = try src.gateUpCombined(s, rb, prep[0], prep[1], sorted, &w, win);
+    defer _ = mlx.mlx_array_free(gu.gate);
+    defer _ = mlx.mlx_array_free(gu.up);
+    const mid = try kernels.midSwigluPrepWithLimit(s, gu.gate, gu.up, rb.svh[0], rb.svh[1], rb.suh[2], sorted, rb.inter, n, limit);
     defer _ = mlx.mlx_array_free(mid);
     const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win, null);
     defer _ = mlx.mlx_array_free(d);
@@ -2145,7 +2209,18 @@ pub fn moePrefillClampedSharedFused(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *co
 /// `moePrefillClampedSharedFused`, keeping each pool's gate and up planes in `early` (null where the layer does not
 /// apply, with `early` untouched).
 pub fn moePrefillSharedFusedEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, se: SharedExpert, early: ?*EarlyPlanes) !?mlx.mlx_array {
+    return moePrefillSharedFusedFrom(s, x, .{ .filled = .{ .rb = rb, .early = early } }, slots, scores, topk, limit, se);
+}
+
+/// `moePrefillSharedFusedEarly` with the fill read group by group (`FillStages`) and each group's gate and up GEMMs
+/// handed over as it lands. The same kernels and the same bytes; null where the layer does not apply, with only the scales read.
+pub fn moePrefillSharedFusedStaged(s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, se: SharedExpert, stages: FillStages) !?mlx.mlx_array {
+    return moePrefillSharedFusedFrom(s, x, .{ .staged = stages }, slots, scores, topk, limit, se);
+}
+
+fn moePrefillSharedFusedFrom(s: mlx.mlx_stream, x: mlx.mlx_array, src: PlaneSource, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, se: SharedExpert) !?mlx.mlx_array {
     if (mlx.mlx_array_dtype(x) != .bfloat16 or topk + 1 > kernels.REDUCE_MAX_TOPK or limit < 0) return null;
+    const rb = try src.bank();
     if (@rem(rb.hidden, 128) != 0 or @rem(rb.inter, 128) != 0 or !sharedServed(se, rb) or rb.count > DIRECT_PLANES) return null;
     try se.dec.requireTable();
     const routed_dec = kernels.activeDecode();
@@ -2186,13 +2261,12 @@ pub fn moePrefillSharedFusedEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *cons
     defer for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    var gp = try gemmPlanes(s, prep_g, rb, 0, &w, win, if (early) |e| &e.gate else null);
-    defer gp.deinit();
-    var up = try gemmPlanes(s, prep_u, rb, 1, &w, win, if (early) |e| &e.up else null);
-    defer up.deinit();
+    var planes = try src.gateUp(s, rb, prep_g, prep_u, &w, win);
+    defer planes.gate.deinit();
+    defer planes.up.deinit();
 
-    const gb = gp.bound();
-    const ub = up.bound();
+    const gb = planes.gate.bound();
+    const ub = planes.up.bound();
     const mid_ov = try applyPrefillFused(s, try prefillFused(.mid, geo), &(gb ++ ub ++ [_]mlx.mlx_array{ rb.svh[0], rb.svh[1], rb.suh[2], sorted, rb.meta }), &.{ sg, su, se.bank.gate.svh, se.bank.up.svh, se.bank.down.suh }, 2);
     defer _ = mlx.mlx_vector_array_free(mid_ov);
     const mid = try getOut(mid_ov, 0);
@@ -2235,6 +2309,55 @@ fn prefillReduce(s: mlx.mlx_stream, down: [DIRECT_PLANES]mlx.mlx_array, inverse:
     const ov = try kernels.applyOuts(s, kernel, &(down ++ [_]mlx.mlx_array{ rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore(), inverse, rb.meta }), cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     return getOut(ov, 0);
+}
+
+// ---- Prefill with the fill read group by group (DeepSeek's engine arm) ----
+
+/// Where a wide chunk's experts are read from the SSD while its chain is built: `scales` reads every miss's scales and
+/// answers the chunk's bank, built once they have landed (asking again answers the same bank), then `group` for each
+/// rate group in turn, before the chain binds that group's trellis. A group's GEMMs are handed to the GPU as soon as it
+/// has landed, so the GPU runs one group while the host reads the next.
+pub const FillStages = struct {
+    ctx: *anyopaque,
+    scales: *const fn (ctx: *anyopaque) anyerror!*const Ragged,
+    group: *const fn (ctx: *anyopaque, group: usize) anyerror!void,
+};
+
+/// The gate and up planes of every pool, rate group by rate group: group `g` is read (`stages.group`), its pools'
+/// planes encoded, and the pass handed to the GPU. The planes are indexed by pool, as `gemmPlanes` returns them.
+fn gateUpStaged(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, rb: *const Ragged, w: *const GroupWindows, win: c_int, stages: FillStages) !GateUp {
+    var gate: GroupPlanes = .{};
+    var up: GroupPlanes = .{};
+    var made: [max_groups]bool = @splat(false);
+    errdefer {
+        for (0..rb.count) |p| if (made[p]) {
+            _ = mlx.mlx_array_free(gate.arr[p]);
+            _ = mlx.mlx_array_free(up.arr[p]);
+        };
+    }
+    var groups: usize = 0;
+    for (rb.origin[0..rb.count]) |o| groups = @max(groups, @as(usize, o) + 1);
+    for (0..groups) |group| {
+        try stages.group(stages.ctx, group);
+        var pick: [2 * max_groups]mlx.mlx_array = undefined;
+        var n: usize = 0;
+        for (0..rb.count) |p| {
+            if (rb.origin[p] != group) continue;
+            gate.arr[p] = try gemmPlaneOf(s, xg, rb, 0, p, w, win);
+            up.arr[p] = try gemmPlaneOf(s, xu, rb, 1, p, w, win);
+            made[p] = true;
+            pick[n] = gate.arr[p];
+            pick[n + 1] = up.arr[p];
+            n += 2;
+        }
+        if (n == 0) continue;
+        const vec = mlx.mlx_vector_array_new_data(&pick, n);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_async_eval(vec));
+    }
+    gate.made = rb.count;
+    up.made = rb.count;
+    return .{ .gate = gate, .up = up };
 }
 
 fn mlxOp2(s: mlx.mlx_stream, comptime func: anytype, a: mlx.mlx_array, b: mlx.mlx_array) !mlx.mlx_array {

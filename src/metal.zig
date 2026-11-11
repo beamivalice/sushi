@@ -357,6 +357,12 @@ pub const Pass = struct {
         send(void, p.encoder, "dispatchThreadgroups:threadsPerThreadgroup:", .{ grid, group });
     }
 
+    /// Ends the encoding and drops the command buffer without running it.
+    pub fn discard(p: Pass) void {
+        send(void, p.encoder, "endEncoding", .{});
+        objc_autoreleasePoolPop(p.pool);
+    }
+
     /// Hands the command buffer to the GPU. Every buffer it binds lives until the pass has run (`Committed.wait`,
     /// `waitDone`). No shared event is signaled: one costs about 8 us of CPU per command buffer on Metal's threads.
     pub fn commit(p: Pass) Committed {

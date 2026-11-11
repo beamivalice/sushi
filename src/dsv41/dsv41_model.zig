@@ -9,6 +9,7 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
 const cfg_mod = @import("dsv41_config.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
@@ -749,6 +750,8 @@ pub const Model = struct {
     /// Decode forwards (one row, DSpark draft, verify rows) run on the engine of our own (`src/tensor`), not on MLX:
     /// `dsv41_borrow.ownDecode` at the load.
     engine_decode: bool = false,
+    /// Prefill chunks wider than a verify block run there too: set with `engine_decode` at the load.
+    engine_prefill: bool = false,
     /// When MLX's queue last ran work that `dsv41_serving.keepMlxQueue` knows of (`engine.nowNs`).
     mlx_queue_used_ns: u64 = 0,
     /// Decode forwards that queued layer 0 ahead of their token.
@@ -2444,6 +2447,27 @@ pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *co
     return sc.add(y, try sc.astype(sy, .float32));
 }
 
+/// `stqRoutedEarly` for a wide chunk on the engine of our own, reading the route's experts group by group as the chain
+/// asks for them (`rate_groups.FillStages`), so each group's GEMMs run while the next is read.
+pub fn stqRoutedStaged(sc: *Scope, dec: exl3.format.Decode, limit: c_int, x: A, slots: A, wts: A, shared: SharedOp, stages: exl3.rate_groups.FillStages) !A {
+    const L = dim(x, 0);
+    std.debug.assert(L > exl3.kernels.DECODE_ROWS_MAX);
+    const k: c_int = @intCast(dim(slots, 1));
+    const flat = try sc.reshape(try sc.astype(slots, .uint32), &.{ci(L) * k});
+    const scores = try sc.reshape(try sc.astype(wts, .float32), &.{ci(L) * k});
+    try dec.requireTable();
+    exl3.kernels.setDecodeParams(dec);
+    if (shared == .layer) {
+        if (sharedBank(&shared.layer.m.layers[shared.layer.li])) |se| {
+            if (try exl3.rate_groups.moePrefillSharedFusedStaged(sc.s, x, flat, scores, k, limit, se, stages)) |y| return try sc.keep(y);
+        }
+    }
+    const sy = try shared.value(sc, x);
+    exl3.kernels.setDecodeParams(dec);
+    const y = try sc.astype(try sc.keep(try exl3.rate_groups.moePrefillStaged(sc.s, x, flat, scores, k, limit, stages)), .float32);
+    return sc.add(y, try sc.astype(sy, .float32));
+}
+
 /// The most layers `pipe_depth` keeps in flight.
 const pipe_max = 8;
 
@@ -2879,6 +2903,7 @@ fn warmOwnLong(m: *Model, t1: u32) !void {
     const keys = m.index_nax_keys;
     m.index_nax_keys = 0;
     defer m.index_nax_keys = keys;
+    warmBudget(m, 1);
     try warmRun(try extend(m, &.{t1}, .last));
     var sc = m.scope();
     defer sc.deinit();
@@ -2900,6 +2925,7 @@ fn warmOwnFills(m: *Model, t1: u32) !void {
     defer ownEnd(m, was);
     for (1..@min(full, m.cfg.window)) |fill| {
         st.n = fill;
+        warmBudget(m, 1);
         var d = try draftHeads(m, t1, .conf);
         d.deinit();
     }
@@ -2952,7 +2978,10 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
     const arms = [_]bool{ queued, false };
     for (arms[0..if (schedules == .both) 2 else 1]) |spec| {
         m.route_spec = spec;
-        for (0..2) |_| try warmRun(try extend(m, &.{t1}, .last));
+        for (0..2) |_| {
+            warmBudget(m, 1);
+            try warmRun(try extend(m, &.{t1}, .last));
+        }
         if (m.dspark != null) for (1..cfg_mod.ring_slack + 1) |w| try warmRound(m, t1, w);
     }
 }
@@ -2960,6 +2989,7 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
 /// A DSpark draft from `t1` and a verify of `w` rows, all kept: the draft's, and past the block its last one again,
 /// as a copy round's rows are whatever the context held.
 fn warmRound(m: *Model, t1: u32, w: usize) !void {
+    warmBudget(m, w);
     var d = try draftHeads(m, t1, .conf);
     defer d.deinit();
     var round: [cfg_mod.ring_slack]u32 = undefined;
@@ -2967,6 +2997,13 @@ fn warmRound(m: *Model, t1: u32, w: usize) !void {
     for (round[1..w], 0..) |*id, i| id.* = d.ids[@min(i, d.ids.len - 1)];
     try warmRun(try verify(m, round[0..w]));
     try finishVerify(m, w - 1);
+}
+
+/// While the load's warm runs, the engine budget a request's forward of `rows` at the state's position has.
+pub fn warmBudget(m: *const Model, rows: usize) void {
+    if (!m.engine_decode) return;
+    const at = if (m.dec_state) |st| st.n else 0;
+    dsv41_borrow.enterWarmMlx(rows, at + rows, &m.cfg);
 }
 
 fn warmRun(logits: A) !void {

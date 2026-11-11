@@ -226,7 +226,9 @@ const trunk_mod = @import("../trunk.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const generate = @import("../generate.zig");
 const dsv41_state = @import("dsv41_state.zig");
+const test_support = @import("../test_support.zig");
 const dsv41_serving = @import("dsv41_serving.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
 const dsv41_scope = @import("dsv41_scope.zig");
 
 /// A tiny STQ DeepSeek served on the engine of our own, as a load builds it, without the warm.
@@ -245,7 +247,7 @@ const Served = struct {
         self.a = a;
         self.was_enabled = mlx.engine.enabled;
         mlx.engine.enabled = true;
-        errdefer mlx.engine.enabled = self.was_enabled;
+        errdefer test_support.restoreEngine(self.was_enabled);
         var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
         defer fx.deinit();
         var sc = dsv41_scope.Scope.plain(a, mlx.gpuStream());
@@ -264,16 +266,20 @@ const Served = struct {
         errdefer self.xfm.deinit();
         self.tok = tokenizer_mod.Tokenizer.initEmptyForTests(a);
         dsv41_state.modelOf(&self.xfm).?.engine_decode = true;
+        dsv41_borrow.own_override = true;
     }
 
     fn deinit(self: *Served) void {
+        dsv41_borrow.own_override = null;
+        mlx.engine.budget(std.math.maxInt(u64)) catch {};
         dsv41_state.modelOf(&self.xfm).?.engine_decode = false;
+        dsv41_state.modelOf(&self.xfm).?.engine_prefill = false;
         self.tok.deinit();
         self.xfm.deinit();
         self.weights.deinit();
         self.config.deinit(self.a);
         self.a.free(self.ids);
-        mlx.engine.enabled = self.was_enabled;
+        test_support.restoreEngine(self.was_enabled);
     }
 
     fn model(self: *Served) *dsv41_model.Model {
@@ -283,9 +289,21 @@ const Served = struct {
     /// One load's warm as `initDsv41` runs it: settle the plan, warm what it says, store after a full warm.
     fn load(self: *Served, plan: *Plan) !dsv41_model.WarmScope {
         const scope = plan.settle();
-        try dsv41_serving.warmAll(self.model(), null, scope);
+        try dsv41_serving.warmAllAt(&self.xfm, self.model(), null, scope, 256);
         if (scope == .all) plan.store();
         return scope;
+    }
+
+    /// One wide chunk through the forward a request takes, from the start of the cache when `ids` is the first.
+    fn prefillChunk(self: *Served, ids: []const u32) !void {
+        var ctx = self.xfm.defaultCtx();
+        if (self.model().dec_state == null) try self.xfm.resetCache();
+        ctx.cache.step = if (self.model().dec_state) |st| st.n else 0;
+        const arr = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(ids.len) }, 2, .int32);
+        defer _ = mlx.mlx_array_free(arr);
+        const out = try dsv41_serving.forwardDsv41With(&self.xfm, &ctx, arr, self.model());
+        defer _ = mlx.mlx_array_free(out);
+        if (out.ctx != null) try mlx.check(mlx.mlx_array_eval(out));
     }
 
     /// 24 greedy tokens of the first prompt, through DSpark rounds.
@@ -354,6 +372,46 @@ test "dsv41 pipelines: a load with no manifest writes one, and a load from it sk
     defer testing.allocator.free(from_manifest);
     try testing.expectEqualSlices(u32, warmed, from_manifest);
     try testing.expectEqual(late, mlx.engine.latePipelines());
+}
+
+test "dsv41 pipelines: the wide chunks' recipes are in the manifest, and a load from it runs none of the wide forwards and compiles none inside a prompt (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    var served: Served = undefined;
+    try served.init(testing.allocator);
+    defer served.deinit();
+    const m = served.model();
+    m.engine_prefill = true;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const key = testKey("d1d1d1d1d1d1d1d1");
+
+    var first = plainBegin(tmp.dir, key);
+    defer first.deinit();
+    const state_only = m.state_only_used;
+    try testing.expectEqual(dsv41_model.WarmScope.all, try served.load(&first));
+    // The wide warm ran before the manifest was stored, so it holds the wide recipes.
+    try testing.expect(m.state_only_used > state_only);
+    var written = try manifest.lookup(testing.allocator, std.Io.Threaded.global_single_threaded.io(), tmp.dir, key);
+    defer written.deinit();
+    try testing.expect(written == .same);
+    const with_wide = written.same.recipes.len;
+
+    mlx.engine.seal(false);
+    var second = plainBegin(tmp.dir, key);
+    defer second.deinit();
+    try testing.expectEqual(Case.same, second.case);
+    const state_only_second = m.state_only_used;
+    try testing.expectEqual(dsv41_model.WarmScope.mlx, try served.load(&second));
+    try testing.expectEqual(state_only_second, m.state_only_used);
+    mlx.engine.seal(true);
+    defer mlx.engine.seal(false);
+    const late = mlx.engine.latePipelines();
+    var prompt: [97]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = served.ids[(i * 5 + 3) % served.ids.len];
+    try served.prefillChunk(prompt[0..64]);
+    try served.prefillChunk(prompt[64..97]);
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+    try testing.expect(with_wide > 0);
 }
 
 test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs in full, and the older build's directory goes (DSV41_STQ_TINY)" {
