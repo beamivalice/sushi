@@ -1466,6 +1466,36 @@ async function main() {
       assert.match(await page.textContent('#modelsDetail .gpu-limit .kv'), /^iogpu\.wired_limit_mbmacOS default/);
       assert.equal(await page.isVisible('#modelsDetail .gpu-limit .warn'), false);
     });
+    await scenario('Settings opens with a copyable wired-limit command, adjustable and saved in the browser', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#wiredCard:not([hidden])');
+      assert.equal(await page.evaluate(() => document.getElementById('wiredCard').compareDocumentPosition(document.getElementById('secStorage')) & 4), 4, 'it sits before Storage');
+      assert.equal(await page.inputValue('#wiredMb'), '44000', 'the default is the RAM in GB less 4');
+      assert.equal(await page.textContent('#wiredCmd'), 'sudo sysctl iogpu.wired_limit_mb=44000 vm.global_user_wire_limit=46137344000 vm.user_wire_limit=46137344000');
+      assert.equal(await page.isVisible('#wiredSave'), false, 'nothing to save yet');
+      await page.fill('#wiredMb', '125000');
+      assert.equal(await page.textContent('#wiredCmd'), 'sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000');
+      await page.evaluate(() => { window.__copied = null; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (t) => { window.__copied = t; } } }); });
+      await page.click('#wiredCard button[aria-label="Copy command"]');
+      await page.waitForFunction(() => window.__copied);
+      assert.equal(await page.evaluate(() => window.__copied), 'sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000');
+      await page.fill('#wiredMb', '12e3');
+      assert.equal(await page.isDisabled('#wiredSave'), true, 'a value that is not a whole number cannot be saved');
+      await page.fill('#wiredMb', '125000');
+      await page.click('#wiredSave');
+      await page.reload();
+      await page.waitForSelector('#wiredCard:not([hidden])');
+      assert.equal(await page.inputValue('#wiredMb'), '125000', 'the saved value survives a reload');
+      assert.match(await page.textContent('#wiredCmd'), /^sudo sysctl iogpu\.wired_limit_mb=125000 /);
+      await page.fill('#wiredMb', '');
+      await page.click('#wiredSave');
+      await page.reload();
+      await page.waitForSelector('#wiredCard:not([hidden])');
+      assert.equal(await page.inputValue('#wiredMb'), '44000', 'an empty box goes back to the default');
+    });
+    await scenario('unknown RAM hides the wired-limit command', { path: '/settings', setup: (s) => { s.state.gpuLimit = null; } }, async ({ page }) => {
+      await page.waitForSelector('#cacheCard:not([hidden])');
+      assert.equal(await page.isVisible('#wiredCard'), false);
+    });
     await scenario('unknown RAM shows no GPU limit section', { path: '/models#Deep-C', setup: (s) => { s.state.gpuLimit = null; } }, async ({ page }) => {
       await page.waitForSelector('#modelsDetail h2');
       await settle(page);

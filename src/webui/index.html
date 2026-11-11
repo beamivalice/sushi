@@ -981,6 +981,15 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <div class="page-body narrow">
     <div id="settingsAlert" class="alert err" role="alert" hidden></div>
     <div id="settingsSkel"><div class="card"><div class="skel"></div><div class="skel"></div></div></div>
+    <h2 class="sec-h" id="secWired" hidden>GPU memory</h2>
+    <section class="card" id="wiredCard" hidden>
+      <div class="card-h">GPU memory limit</div>
+      <div class="card-b gpu-limit">
+        <div id="wiredSet"></div>
+        <div class="cmd"><code class="mono" id="wiredCmd"></code><button class="icon-btn" id="wiredCopy" type="button" title="Copy" aria-label="Copy command"></button></div>
+        <div class="lead">Run it in Terminal, then restart sushi: the GPU limit is read when sushi starts, and macOS resets all three at reboot. All three limits move together.</div>
+      </div>
+    </section>
     <h2 class="sec-h" id="secStorage" hidden>Storage</h2>
     <section class="card" id="cacheCard" hidden>
       <div class="card-h">Prompt cache (SSD)</div>
@@ -3679,7 +3688,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
 
   const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
-    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, serr: {}, timer: null, retry: null, tbody: "",
+    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, wiredText: null, serr: {}, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, refused: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
@@ -4239,6 +4248,44 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   q("clearStale").addEventListener("click", () => clearScope("stale"));
   q("clearAll").addEventListener("click", () => clearScope("all"));
 
+  // The wired-limit command: the limit in MB is the box (default: RAM in GB less 4), kept in this browser.
+  const WIRED_KEY = "sushi-wired-limit-mb", WIRED_SPEC = { type: "int", min: 1, max: 4294967 };
+  const wiredDefault = () => { const g = A.settings?.gpu_limit; return g ? Math.max(1, Math.round(g.total_ram_bytes / 2 ** 30) * 1000 - 4000) : 0; };
+  const wiredSaved = () => { const v = readStore(WIRED_KEY); return v !== null && /^\d+$/.test(v) ? v : ""; };
+  const wiredRow = setRow("wired_limit_mb", "Limit (MB)", "wiredMb", "iogpu.wired_limit_mb: how much memory the GPU may wire. The two user-wire limits get the same amount in bytes. Empty uses the default: the Mac's memory in GB less 4.", "iogpu.wired_limit_mb");
+  const wiredIn = h("input", { id: "wiredMb", type: "text", inputmode: "numeric", autocomplete: "off", "aria-label": "GPU memory limit in MB", oninput: () => { A.wiredText = wiredIn.value; renderWired(); }, onkeydown: (e) => enterTo(wiredSave)(e) });
+  const wiredSave = h("button", { class: "btn sm primary", id: "wiredSave", type: "button", onclick: () => {
+    const text = wiredIn.value.trim();
+    if (text === "") dropStore(WIRED_KEY); else if (adminControlValue(WIRED_SPEC, text).ok) writeStore(WIRED_KEY, String(adminControlValue(WIRED_SPEC, text).value));
+    A.wiredText = null;
+    toast("Saved in this browser.", "ok");
+    renderWired();
+  } });
+  const wiredDefaultNote = h("span", { class: "muted" });
+  wiredRow.ctl.append(h("div", { class: "row-in" }, wiredIn, wiredSave, wiredDefaultNote), wiredRow.bad);
+  q("wiredSet").replaceWith(wiredRow.row);
+  q("wiredCopy").append(icon("copy", 14));
+  q("wiredCopy").addEventListener("click", () => copyText(q("wiredCmd").textContent));
+  function renderWired() {
+    const def = wiredDefault();
+    setHidden(q("secWired"), !def);
+    setHidden(q("wiredCard"), !def);
+    if (!def) return;
+    const saved = wiredSaved();
+    if (A.wiredText === saved) A.wiredText = null;
+    if (A.wiredText == null) wiredIn.value = saved || String(def);
+    const text = wiredIn.value.trim(), parsed = adminControlValue(WIRED_SPEC, text);
+    const shown = saved || String(def), dirty = text !== shown;
+    const mb = text === "" ? def : parsed.ok ? parsed.value : null;
+    setText(q("wiredCmd"), mb ? `sudo sysctl iogpu.wired_limit_mb=${mb} vm.global_user_wire_limit=${mb * 2 ** 20} vm.user_wire_limit=${mb * 2 ** 20}` : "");
+    q("wiredCopy").disabled = !mb;
+    setHidden(wiredSave, !dirty);
+    wiredSave.disabled = !dirty || (text !== "" && !parsed.ok);
+    setText(wiredSave, text === "" ? "Use default" : "Save");
+    setText(wiredRow.bad, text !== "" && !parsed.ok ? "Enter a whole number of MB." : "");
+    wiredIn.setAttribute("aria-invalid", String(!!wiredRow.bad.textContent));
+    setText(wiredDefaultNote, `Default ${def} (Mac memory ${Math.round(A.settings.gpu_limit.total_ram_bytes / 2 ** 30)} GB less 4)`);
+  }
   const GB_SPEC = { type: "int", min: 0, max: 1048576 };
   // Assigned space reuses the setting row; the models folder is chosen on the Models page.
   const cacheRow = setRow("prefix_cache_disk_gb", "Assigned space", "cacheGb", "How much disk space saved conversations may take, in GiB. More space keeps more conversations ready to continue fast; 0 turns the cache off.", keyTerm("prefix_cache_disk_gb", "SSD prefix cache size"));
@@ -4462,6 +4509,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setHidden(q("settingsSkel"), true);
     for (const id of ["cacheCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     for (const id of ["secStorage", "secServer"]) setHidden(q(id), false);
+    renderWired();
     setHidden(q("secInference"), !s.effort);
     setHidden(q("effortCard"), !s.effort);
     renderEffort(s.effort);
@@ -4571,7 +4619,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
     const off = !!msg && !!A.settings;
-    for (const id of ["modelsMd", "cacheCard", "effortCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) {
+    for (const id of ["modelsMd", "wiredCard", "cacheCard", "effortCard", "portCard", "memoryCard", "updatesCard", "aboutCard"]) {
       q(id).classList.toggle("stale-view", off);
       if (q(id).inert !== off) q(id).inert = off;
     }

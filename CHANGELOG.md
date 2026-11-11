@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Settings opens with a copyable GPU wired-limit command**: the `sudo sysctl iogpu.wired_limit_mb=…` line sets all
+  three wire limits from one adjustable, savable box that defaults to the Mac's memory less 4 GB.
 - **An agent turn tokenizes only the text it has not seen before**: each loaded model keeps the token ids of the
   prompt pieces it encoded, bounded in memory and reported on `/metrics`, so a long conversation's next turn no longer
   re-encodes its whole history.

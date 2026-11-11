@@ -125,7 +125,9 @@ and the page tooltip share them.
 
 ## Settings sections and the Thinking effort card
 
-- Settings groups its cards under small uppercase section labels (`.sec-h`): Storage (SSD cache),
+- Settings groups its cards under small uppercase section labels (`.sec-h`): GPU memory (the `sudo sysctl` wired-limit
+  command: copy button, a MB box that defaults to the Mac's memory in GB less 4 and is saved in the browser under
+  `sushi-wired-limit-mb`, never on the server; hidden when the RAM is unknown), Storage (SSD cache),
   Inference (Thinking effort), Server (port, update checks, about).
 - The models folder is chosen on the Models page: the header shows the folders in use, and **Change folder…** opens the
   chat's folder picker (`/v1/tools` browse, so this Mac's page on a loopback bind; elsewhere a typed absolute path is
