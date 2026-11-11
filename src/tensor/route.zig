@@ -287,6 +287,15 @@ pub fn seal(on: bool) void {
 /// Pipelines made while sealed: each was a stall inside a request.
 pub const matrixUnits = @import("matmul.zig").matrixUnits;
 
+pub const pipeline_cache = @import("pipeline_cache.zig");
+pub const pipeline_registry = @import("pipeline_registry.zig");
+pub const metallibPath = stock.metallibPath;
+
+/// Pipelines launches took from those a manifest made ahead.
+pub fn preloadedPipelines() u64 {
+    return core.pipelines_preloaded;
+}
+
 pub fn latePipelines() u64 {
     return core.pipelines_late;
 }
@@ -1257,6 +1266,22 @@ test "a slice update leaves its base as it was" {
     try mlx.check(mlx.mlx_array_eval(written));
     try t_std.expectEqualSlices(f32, &.{ 1, 2, 3, 9, 9, 9 }, mlx.mlx_array_data_float32(written).?[0..6]);
     try t_std.expectEqualSlices(f32, &base_data, mlx.mlx_array_data_float32(ours).?[0..6]);
+}
+
+test "a handle of the engine's is freed by the engine after the engine is switched off" {
+    try mlx.requireGpu();
+    const was = enabled;
+    const was_active = active;
+    enabled = true;
+    active = true;
+    const values = [_]f32{ 1, 2, 3 };
+    const a = mlx.mlx_array_new_data(&values, &[_]c_int{3}, 1, .float32);
+    active = was_active;
+    enabled = false;
+    defer enabled = was;
+    try std.testing.expect(isOurs(a));
+    // A cache may hold the handle past the switch; handing it to MLX's free would read memory MLX never made.
+    try std.testing.expectEqual(@as(c_int, 0), mlx.mlx_array_free(a));
 }
 
 test "a custom kernel launched on the engine writes what it writes under MLX" {

@@ -2797,6 +2797,13 @@ pub fn resetState(m: *Model) void {
 /// draft and a verify of every width from one row to the block, and the prefill paths, run once on a throwaway state: a row count is a
 /// template arg of the row kernels, so each variant compiles here instead of inside a request. Leaves no state.
 pub fn warmKernels(m: *Model) !void {
+    return warmKernelsFor(m, .all);
+}
+
+/// What a warm runs: everything, or only the forwards on MLX, when the engine's pipelines come from a manifest.
+pub const WarmScope = enum { all, mlx };
+
+pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
     resetState(m);
     defer resetState(m);
     var ids: [exl3.kernels.DECODE_ROWS_MAX]u32 = undefined;
@@ -2810,7 +2817,7 @@ pub fn warmKernels(m: *Model) !void {
         // A round of one row is the plain step between drafted rounds: it takes the rows' arm of the trunk linears, which
         // a one-row forward outside a round does not. A copy round is wider than the block, up to the ring's slack.
         if (m.dspark != null) for (1..cfg_mod.ring_slack + 1) |w| try warmRound(m, ids[0], w);
-    } else try warmOwn(m, ids[0], .both);
+    } else if (scope == .all) try warmOwn(m, ids[0], .both);
     // The prefill path: a chunk past the window runs CED and its 256 rows fill 8 GEMM windows (an input of 8 binds as a
     // device array), a narrower chunk runs every layer over 2 windows; at the context they leave a decode step's rows
     // span two attention splits.
@@ -2827,7 +2834,7 @@ pub fn warmKernels(m: *Model) !void {
         if (m.dspark != null) try warmRound(m, ids[0], m.cfg.dspark.block + 1);
     }
     // The engine's kernels have one signature each, so the widths it ran above are not other pipelines here.
-    if (m.engine_decode) {
+    if (m.engine_decode and scope == .all) {
         try warmOwnFills(m, ids[0]);
         try warmOwnBlocks(m, ids[0]);
         try warmOwnLong(m, ids[0]);

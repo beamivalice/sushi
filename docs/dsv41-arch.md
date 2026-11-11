@@ -207,6 +207,42 @@ The warm-cache gain is R1's 8.4 s from the table, not measured again.
 MLX's regions are 63% of the warm cache's 19.5 s; the engine's compile is 0.1 s there and 9 to 16 s with a cold system
 cache, all of it `newLibraryWithSource`.
 
+### The pipeline manifest (`[pipelines]`)
+
+The first load of a pack on a build leaves `~/.sushi/cache/pipelines/<scope>-<build>/manifest.bin` (key, format and cases:
+[engine-own-forward](engine-own-forward.md#the-pipeline-manifest)); the next load makes the engine's pipelines from it on 8
+threads and skips the engine's warm forwards (`warmOwn`, `Fills`, `Blocks`, `Long`, the sampled verdict). What runs on
+MLX stays: its prefill warm and the spilled route's prefill chain (`warmSplit`), which no manifest covers. One `[pipelines]` line says which case ran: `made N pipelines from the manifest`, `manifest of
+another build, recompiled N on T threads`, `no manifest`, or `manifest unreadable (<reason>)`; the manifest is written only
+after a warm that returned without error, and the older builds of the scope are removed and named in the log. The key costs
+8 ms (the binary's SHA-256 included).
+
+One load per case, M5 Max, STQ 1.75bpw, `--serve` with `--ssd-budget-gb 108 --ctx-size 1000000`, `taskpolicy -a`, GPU lock,
+QUIET set for the load, on this change over 76565aaa. The first load is the first run of the binary (a cold system shader
+cache) and writes the manifest; the second is the rerun that reads it:
+
+| case | pipelines | warm forwards | total |
+|---|---:|---:|---:|
+| no manifest, first run of a binary | 16224 ms (compiled 480) | 26392 ms | 50694 ms |
+| same key, rerun | 25 ms (480 from the manifest) | 5881 ms | 13602 ms |
+
+Up to the end of one 48-token greedy request the same-key load runs 56961 engine dispatches in 3570 command buffers, the
+no-manifest load 192341 in 13458: the engine's warm forwards are about 135000 dispatches and 9900 command buffers, and
+GPU busy time falls from 7100 ms to 1120 ms (the request included in both). The manifest holds 480 recipes, among them
+the three decode glue kernels (`dsv41_route_split_slots`, `dsv41_rope_kv_ring`, `dsv41_topk_below`).
+
+A manifest of another build recompiles its recipes on 8 threads first: 464 recipes in 2507 ms on a new binary's cold
+cache, against 17568 ms in one thread's order, and the full warm that follows then took 21.2 s (an earlier step of this
+change). Open: the expert cache phase is 3.5 s after a full warm and 5.1 s on a same-key load, the same 100.87 GB, cause
+not isolated.
+
+First request, one each, a 961-token greedy prompt after an earlier pair of loads of this change (before the spilled
+route's chain was put back on the same-key load, which costs the load 0.1 s): no manifest `prompt_ms` 1790, time to first
+token 1.87 s; same key 1142 and 1.23 s. Earlier pairs on this change (same key against a full-warm rerun: 2285 against
+1960, 2587 against 2518, 1926 against 2605) put the run-to-run spread above these differences, so the manifest costs the
+first request nothing measurable. Every run gave the same 48 tokens, and `kernels compiled after the load` was 0 in all
+of them.
+
 ### QAT round trips
 
 The reference fake-quantizes at five places and the forward applies each (`src/dsv41/dsv41_qat.zig`, Metal, round-half-even,

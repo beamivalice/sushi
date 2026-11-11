@@ -11,6 +11,7 @@ const metal = @import("../metal.zig");
 const metal_mlx = @import("../metal_mlx.zig");
 const io_util = @import("../io_util.zig");
 const mlx = @import("../mlx.zig");
+const registry = @import("pipeline_registry.zig");
 
 pub const max_dims = 8;
 pub const Dtype = mlx.mlx_dtype;
@@ -798,18 +799,43 @@ pub fn dispatchGroups(p: metal.Pass, grid: metal.Size, group: metal.Size) void {
 pub var pipelines: u64 = 0;
 pub var pipeline_ns: u64 = 0;
 pub var pipelines_late: u64 = 0;
+/// Pipelines a launch took from those a manifest made ahead: no compile, so neither counted above nor late.
+pub var pipelines_preloaded: u64 = 0;
 pub var sealed: bool = false;
 
 /// The pipeline `pipeline`, named `name`, was made since `t0`.
 pub fn madePipeline(name: []const u8, t0: u64, pipeline: metal.Pipeline) void {
     const ns = nowNs() - t0;
-    if (gpa.dupe(u8, name)) |owned| pipeline_names.put(gpa, @intFromPtr(pipeline.raw), owned) catch gpa.free(owned) else |_| {}
+    nameOf(name, pipeline);
     pipelines += 1;
     pipeline_ns += ns;
     const log = @import("../log.zig");
     if (!sealed) return log.debug("[engine] compiled {s}\n", .{name});
     pipelines_late += 1;
     log.warn("[engine] compiled inside a request ({d} ms): {s}\n", .{ ns / std.time.ns_per_ms, name });
+}
+
+fn nameOf(name: []const u8, pipeline: metal.Pipeline) void {
+    if (gpa.dupe(u8, name)) |owned| pipeline_names.put(gpa, @intFromPtr(pipeline.raw), owned) catch gpa.free(owned) else |_| {}
+}
+
+/// `pipeline`, which a manifest made ahead, is first used as `name`.
+pub fn preloadedPipeline(name: []const u8, pipeline: metal.Pipeline) void {
+    nameOf(name, pipeline);
+    pipelines_preloaded += 1;
+}
+
+/// The pipeline of the kernel source `text`, entry point `function`: the one a manifest made ahead, else compiled now.
+pub fn pipelineFromSource(function: [:0]const u8, text: [:0]const u8) Error!metal.Pipeline {
+    if (registry.takeSource(function, text)) |p| {
+        preloadedPipeline(function, p);
+        return p;
+    }
+    const t0 = nowNs();
+    const pipeline = try (try metal.device()).compile(text, function);
+    madePipeline(function, t0, pipeline);
+    registry.record(.{ .kind = .source, .function = function, .text = text });
+    return pipeline;
 }
 
 pub fn nowNs() u64 {

@@ -294,7 +294,6 @@ fn pipelineOf(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pip
     for (cfg.out_dtypes[0..cfg.n_out]) |d| try key_buf.append(gpa, @intCast(@intFromEnum(d)));
     if (def.instances.get(key_buf.items)) |p| return p;
 
-    const t0 = core.nowNs();
     var name: std.ArrayList(u8) = .empty;
     defer name.deinit(gpa);
     try kernelName(&name, def, inputs, cfg);
@@ -302,8 +301,7 @@ fn pipelineOf(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pip
     const name_z: [:0]const u8 = name.items[0 .. name.items.len - 1 :0];
     const text = try render(def, name_z, inputs, cfg);
     defer gpa.free(text);
-    const pipeline = try (try metal.device()).compile(text, name_z);
-    core.madePipeline(name_z, t0, pipeline);
+    const pipeline = try core.pipelineFromSource(name_z, text);
     try def.instances.put(gpa, try gpa.dupe(u8, key_buf.items), pipeline);
     return pipeline;
 }

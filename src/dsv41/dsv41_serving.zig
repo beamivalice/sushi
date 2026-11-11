@@ -5,6 +5,7 @@ const dsv41_state = @import("dsv41_state.zig");
 const dsv41_stream = @import("dsv41_stream.zig");
 const kernels = @import("dsv41_kernels.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
+const dsv41_pipelines = @import("dsv41_pipelines.zig");
 const dsv41_config = @import("dsv41_config.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
 const PrefetchCredit = @import("../prefetch_plan.zig").PrefetchCredit;
@@ -14,6 +15,7 @@ const expert_quant_mod = @import("../expert_quant.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const log = @import("../log.zig");
+const manifest_mod = @import("../pipeline_manifest.zig");
 const load_clock = @import("../load_clock.zig");
 const sampler = @import("../sampler.zig");
 const spec_types = @import("../spec_types.zig");
@@ -47,6 +49,8 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         engine.deinit();
         allocator.destroy(engine);
     }
+    var plan = beginPipelines(allocator, &config, engine, own_decode);
+    defer plan.deinit();
     // The load drops each tensor from the map once its arrays are bound.
     const mdl = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
     errdefer mdl.deinit();
@@ -100,14 +104,16 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const had_error = mlx.errorPending();
     const warm_t0 = load_clock.now();
     const made_before = mlx.engine.pipelinesMade();
-    if (warmAll(mdl, shell.arch_state.dsv41.stq_experts)) {
-        log.info("[dsv41] kernels warmed for 1..{d} rows{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", clock.lap() / std.time.ns_per_ms });
+    const scope = plan.settle();
+    if (warmAll(mdl, shell.arch_state.dsv41.stq_experts, scope)) {
+        log.info("[dsv41] kernels warmed for 1..{d} rows{s}{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", if (scope == .mlx) " (the engine's from the manifest)" else "", clock.lap() / std.time.ns_per_ms });
+        if (scope == .all and own_decode) plan.store();
     } else |e| {
         mlx.dropLatchedErrorUnless(had_error);
         log.warn("[dsv41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
     }
     const made = mlx.engine.pipelinesMade();
-    load_clock.warmDone(warm_t0, made.ns - made_before.ns, made.count - made_before.count);
+    load_clock.warmDone(warm_t0, made.ns - made_before.ns + plan.made_ns, made.count - made_before.count + plan.made_count);
     mlx.engine.seal(true);
     // The warm's transients leave the pool, so the load's memory reading is the model's.
     _ = mlx.mlx_clear_cache();
@@ -115,10 +121,32 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     return shell;
 }
 
-pub fn warmAll(mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream) !void {
-    try dsv41_model.warmKernels(mdl);
-    try warmSampledVerdict(mdl);
-    if (stq) |st| try st.warmSplit(mdl, dsv41_config.prefill_width);
+/// PURE: what a load's warm runs after the model's own forwards. The sampled verdict is the engine's, so a manifest
+/// stands in for it; the spilled route's prefill chain is MLX's, which no manifest covers.
+pub fn warmAfter(scope: dsv41_model.WarmScope) struct { sampled_verdict: bool, split: bool } {
+    return .{ .sampled_verdict = scope == .all, .split = true };
+}
+
+/// The warm of a load: with `.mlx` only the forwards on MLX, the engine's pipelines having come from a manifest.
+pub fn warmAll(mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope) !void {
+    try dsv41_model.warmKernelsFor(mdl, scope);
+    const after = warmAfter(scope);
+    if (after.sampled_verdict) try warmSampledVerdict(mdl);
+    if (after.split) if (stq) |st| try st.warmSplit(mdl, dsv41_config.prefill_width);
+}
+
+/// The manifest to start the load from, its pipelines already being made. A load whose decode is on MLX makes none.
+pub fn beginPipelines(allocator: std.mem.Allocator, config: *const ModelConfig, engine: *const expert_stream_mod.Engine, own_decode: bool) dsv41_pipelines.Plan {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const none: manifest_mod.Key = .{ .scope = @splat('0'), .build = @splat('0') };
+    if (!own_decode) return dsv41_pipelines.begin(allocator, io, null, "decode runs on MLX", none, 0);
+    const t0 = load_clock.now();
+    const scope = dsv41_pipelines.scopeKey(allocator, io, config, engine) catch |e| return dsv41_pipelines.begin(allocator, io, null, @errorName(e), none, 0);
+    const build = dsv41_pipelines.buildKey(allocator, io) catch |e| return dsv41_pipelines.begin(allocator, io, null, @errorName(e), none, 0);
+    const key_ms = (load_clock.now() - t0) / std.time.ns_per_ms;
+    var reason: []const u8 = "";
+    const root = dsv41_pipelines.openRoot(io, &reason);
+    return dsv41_pipelines.begin(allocator, io, root, reason, .{ .scope = scope, .build = build }, key_ms);
 }
 
 /// The draws of a sampled round: `rows` verify rows of `logits` (`[1, >= rows, vocab]`) filtered by `sampling` and
@@ -358,6 +386,14 @@ test "a non-STQ DeepSeek pack names an ssd_prefetch it ignores, from the flag or
     try std.testing.expect(std.mem.indexOf(u8, prefetchIgnoredLine(&config).?, "model-settings.json ssd_prefetch is ignored") != null);
     config.ssd_prefetch = 50;
     try std.testing.expect(std.mem.indexOf(u8, prefetchIgnoredLine(&config).?, "--ssd-prefetch is ignored") != null);
+}
+
+test "dsv41 warm: a manifest stands in for the engine's sampled verdict, never for MLX's spilled-route prefill chain" {
+    const full = warmAfter(.all);
+    try std.testing.expect(full.sampled_verdict and full.split);
+    const from_manifest = warmAfter(.mlx);
+    try std.testing.expect(!from_manifest.sampled_verdict);
+    try std.testing.expect(from_manifest.split);
 }
 
 test "tailUnread: a chunk is state only when no point is taken and the next chunk replays a full window" {

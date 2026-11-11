@@ -1749,7 +1749,7 @@ test "dsv41 engine: after the load's warm a seeded sampled DSpark request compil
     defer tok.deinit();
     m.engine_decode = true;
     defer m.engine_decode = false;
-    try dsv41_serving.warmAll(m, null);
+    try dsv41_serving.warmAll(m, null, .all);
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
     const late = mlx.engine.latePipelines();

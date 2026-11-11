@@ -51,6 +51,7 @@ test {
     _ = @import("kld_fixture.zig");
     _ = @import("io_util.zig");
     _ = @import("expert_drop.zig");
+    _ = @import("pipeline_manifest.zig");
     _ = @import("expert_usage.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");

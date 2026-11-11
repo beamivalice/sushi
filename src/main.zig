@@ -1,5 +1,6 @@
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
+const pipeline_manifest = @import("pipeline_manifest.zig");
 const http = @import("http.zig");
 const build_options = @import("build_options");
 // pub: src/exl3 reaches mlx, log and io_util through its host root.
@@ -126,6 +127,7 @@ fn runCli(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     metrics_history.process.markStarted(io, io_util.nowMs(io));
+    if (std.c.getenv("HOME")) |home| pipeline_manifest.setRootFromHome(std.mem.span(home)) catch |e| log.warn("no pipeline manifest root: {s}\n", .{@errorName(e)});
 
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
     // above every GPU subcommand branch — a per-serve-path call is how

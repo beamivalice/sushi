@@ -256,9 +256,7 @@ fn pipelineFor(comptime tag: []const u8, source: []const u8, in_types: []const D
         at += 1;
     }
     text.append(gpa, 0) catch return error.OutOfMemory;
-    const t0 = core.nowNs();
-    const pipeline = try (try metal.device()).compile(text.items[0 .. text.items.len - 1 :0], "sushi_" ++ tag);
-    core.madePipeline("sushi_" ++ tag, t0, pipeline);
+    const pipeline = try core.pipelineFromSource("sushi_" ++ tag, text.items[0 .. text.items.len - 1 :0]);
     pipelines.put(gpa, gpa.dupe(u8, key.items) catch return error.OutOfMemory, pipeline) catch return error.OutOfMemory;
     return pipeline;
 }

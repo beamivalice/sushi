@@ -72,7 +72,11 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
 
         inline fn go(args: Args) R {
             const direct = @extern(*const F, .{ .name = name });
-            if (!engine.enabled) return @call(.auto, direct, args);
+            if (!engine.enabled) {
+                // A handle of the engine's can outlive the switch in a cache; MLX's free would read memory MLX never made.
+                if (comptime std.mem.eql(u8, name, "mlx_array_free")) if (engine.isOurs(args[0])) return engine.mlx_array_free(args[0]);
+                return @call(.auto, direct, args);
+            }
             switch (engine.side(args)) {
                 .engine => {
                     if (@hasDecl(engine, name)) return @call(.auto, @field(engine, name), args);

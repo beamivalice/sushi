@@ -208,6 +208,11 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `server.prefix_cache_disk_gb`, or `.default`). Each load logs its resolved value and source (`[kv-cache] kv8
   (source); ctx N (source)`, `[mtp] on|off (source)`; `/props settings.mtp.source`). Guard: `tests/test_cold_load.sh`.
   The table test in `settings_resolve.zig` pins flag, file and default for every key (host tier).
+- The engine's pipeline manifests live in `~/.sushi/cache/pipelines/<scope>-<build>/manifest.bin`. `main.zig` gives the
+  process that root at start (`pipeline_manifest.setRootFromHome`); nothing else derives one, so a process that was not
+  given it (every test) reads and writes no manifest, and says so in its `[pipelines]` line. No flag, no env twin.
+  Written after a complete DeepSeek warm, read at the next load of the same pack:
+  [engine-own-forward](engine-own-forward.md#the-pipeline-manifest).
 - MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
   the file can only turn it off, or on for an SSD-streamed pack. `settings.mtp.source` is that on/off choice's;
   `settings.mtp.depth_source` names `--mtp-min-depth/--mtp-max-depth` when they bound the depth, and `adaptive` is false

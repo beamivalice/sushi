@@ -146,6 +146,7 @@ test {
     _ = @import("tensor/kernel.zig");
     _ = @import("tensor/route.zig");
     _ = @import("tensor/stock.zig");
+    _ = @import("tensor/pipeline_cache.zig");
     _ = @import("test_models.zig");
     _ = @import("arch_host.zig");
     _ = @import("arch_host_stub.zig");

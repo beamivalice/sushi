@@ -17,6 +17,8 @@ pub const tests = .{
     @import("dsv41_prefix.zig"),
     @import("dsv41_prefix_cache_test.zig"),
     @import("dsv41_generate_test.zig"),
+    @import("dsv41_serving.zig"),
+    @import("dsv41_pipelines.zig"),
     @import("dsv41_query_count_test.zig"),
     @import("dsv41_exl3_real_test.zig"),
     @import("dsv41_kernels.zig"),

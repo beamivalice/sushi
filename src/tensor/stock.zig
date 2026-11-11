@@ -7,6 +7,8 @@ const mlx = @import("../mlx.zig");
 const metal = @import("../metal.zig");
 const core = @import("core.zig");
 const ops = @import("ops.zig");
+const registry = @import("pipeline_registry.zig");
+const manifest = @import("../pipeline_manifest.zig");
 
 const Tensor = core.Tensor;
 const Dtype = core.Dtype;
@@ -20,16 +22,25 @@ var library: ?metal.Library = null;
 var pipelines: std.StringHashMapUnmanaged(metal.Pipeline) = .empty;
 
 /// `mlx.metallib` beside the MLX libraries this process loaded, as MLX finds it.
-fn lib(dev: *const metal.Device) Error!metal.Library {
-    if (library) |l| return l;
+pub fn metallibPath(buf: []u8) Error![:0]const u8 {
     var info: DlInfo = undefined;
     if (dladdr(@ptrCast(&mlx.raw.mlx_array_new), &info) == 0) return error.MetalUnavailable;
     const binary = std.mem.span(info.fname orelse return error.MetalUnavailable);
     const dir = std.fs.path.dirname(binary) orelse return error.MetalUnavailable;
+    return std.fmt.bufPrintSentinel(buf, "{s}/mlx.metallib", .{dir}, 0) catch return error.MetalUnavailable;
+}
+
+pub fn lib(dev: *const metal.Device) Error!metal.Library {
+    if (library) |l| return l;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&buf, "{s}/mlx.metallib", .{dir}, 0) catch return error.MetalUnavailable;
-    library = try dev.load(path);
+    library = try dev.load(try metallibPath(&buf));
     return library.?;
+}
+
+/// Keeps `pipeline`, made ahead from `recipe`, for the first `kernel` or `kernelFlags` that asks for its key.
+pub fn preload(recipe: manifest.Recipe, pipeline: metal.Pipeline) Error!bool {
+    if (pipelines.contains(recipe.key)) return false;
+    return registry.putStock(recipe, pipeline) catch error.OutOfMemory;
 }
 
 /// The pipeline of the stock kernel `name`, built once.
@@ -39,9 +50,15 @@ pub fn kernel(name: []const u8) Error!metal.Pipeline {
     const owned = gpa.allocSentinel(u8, name.len, 0) catch return error.OutOfMemory;
     errdefer gpa.free(owned);
     @memcpy(owned, name);
+    if (registry.takeStock(name)) |p| {
+        core.preloadedPipeline(name, p);
+        pipelines.put(gpa, owned, p) catch return error.OutOfMemory;
+        return p;
+    }
     const t0 = core.nowNs();
     const p = try dev.pipelineOf(try lib(dev), owned);
     core.madePipeline(name, t0, p);
+    registry.record(.{ .kind = .stock, .function = name, .key = name });
     pipelines.put(gpa, owned, p) catch return error.OutOfMemory;
     return p;
 }
@@ -52,9 +69,16 @@ pub fn kernelFlags(name: []const u8, hash: []const u8, flags: []const metal.Flag
     const dev = try metal.device();
     var buf: [192]u8 = undefined;
     const function = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return error.TensorShape;
+    if (registry.takeStock(hash)) |p| {
+        core.preloadedPipeline(hash, p);
+        const owned = gpa.dupe(u8, hash) catch return error.OutOfMemory;
+        pipelines.put(gpa, owned, p) catch return error.OutOfMemory;
+        return p;
+    }
     const t0 = core.nowNs();
     const p = try dev.pipelineOfFlags(try lib(dev), function, flags);
     core.madePipeline(hash, t0, p);
+    registry.record(.{ .kind = .stock_flags, .function = name, .key = hash, .flags = flags });
     const owned = gpa.dupe(u8, hash) catch return error.OutOfMemory;
     pipelines.put(gpa, owned, p) catch return error.OutOfMemory;
     return p;

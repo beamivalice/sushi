@@ -50,8 +50,8 @@ fn send(comptime R: type, target: id, comptime name: [:0]const u8, args: anytype
 
 pub const Error = error{ MetalUnavailable, MetalCompile, MetalBuffer, MetalCommand };
 
-var error_text: [2048]u8 = undefined;
-var error_len: usize = 0;
+threadlocal var error_text: [2048]u8 = undefined;
+threadlocal var error_len: usize = 0;
 
 /// What Metal said about the last `Error` on this thread's device calls; empty when it said nothing.
 pub fn lastError() []const u8 {

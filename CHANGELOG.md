@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash STQ loads skip the engine's warm-up on a repeat start**: the first load of a pack on a build
+  keeps the engine's kernel recipes in `~/.sushi/cache/pipelines`, and the next load makes its kernels from them instead
+  of running the engine's warm forwards.
 - **DeepSeek-V4.1-Flash STQ loads faster on M5 Macs**: the load no longer warms kernels that generation does not use,
   and a short follow-up turn generates on the same engine as the rest of decode.
 - **DeepSeek-V4.1-Flash STQ generates on sushi's own Metal engine on M5 Macs**: token generation for the STQ packs no

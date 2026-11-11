@@ -181,7 +181,8 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   included, ran the SIMD arm at a third of the speed.
 - **Engine pipeline creation is 0.1 s with the system's shader cache warm and 9 to 16 s cold**, all of it
   `newLibraryWithSource` (435 pipelines, M5 Max); the pipeline state is 0.03 to 0.06 s. A binary archive replaces only
-  that state step, so it buys nothing here.
+  that state step, so it buys nothing here. A binary the system has not run is cold again, and the
+  manifest's recipes then compile on 8 threads in about 2.5 s ([the manifest](#the-pipeline-manifest)).
 - **A kernel has one signature.** MLX binds an input under 8 elements as a `constant` reference and a longer one
   as a `device` pointer, so one source is two pipelines; ours binds every array as a `device` pointer.
 - **The warm runs every shape that names a pipeline** (`warmOwn`, `warmOwnFills`, `warmOwnBlocks`, `warmOwnLong`):
@@ -201,6 +202,32 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   fixture: the 128k rung showed three compiles (0.26 s) inside its first decode step.
 - **A pipeline made after the warm is logged** (`engine.seal`): `[engine] compiled inside a request (N ms): <name>`
   at warning level, and the request-end debug line counts them. The count is 0 on the release pack.
+
+### The pipeline manifest
+
+A complete warm leaves `~/.sushi/cache/pipelines/<scope>-<build>/manifest.bin` (`src/pipeline_manifest.zig`): the recipe
+of each engine pipeline the process made (`tensor/pipeline_registry.zig`, recorded at the three places a pipeline is
+created: `stock.kernel`, `stock.kernelFlags`, `core.pipelineFromSource`). A recipe is the metallib function and its
+constants, or the exact source text and entry point; a source recipe is the identity of its pipeline, so a stale recipe
+cannot answer for another source. The file ends in a SHA-256 of itself; a short, changed or foreign file is refused by
+name and never read partly.
+
+- **Key.** `scope` (16 hex) is the pack (its config.json, its index, the name and size of each shard: not their bytes) and
+  what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order, expert-cache and SSD bytes,
+  resident or streamed, dropped experts, and the `recipe_env` variables of `dsv41_pipelines.zig`). `build` (16 hex) is the
+  SHA-256 of the running binary, the size and mtime of `mlx.metallib`, the GPU architecture, the OS build and the manifest
+  version. A diagnostic that changes no recipe (the kernel profile, the report, probe and profile switches) is not in it.
+- **Same key.** The recipes are made on up to 8 worker threads (our own Metal binding only, never MLX), after the model is built;
+  the inference thread then installs them. A launch finds its pipeline
+  by source or key, counts it as preloaded (`core.pipelines_preloaded`), not compiled and not late. The engine's warm
+  forwards are skipped (`WarmScope.mlx`: MLX's prefill warm and its spilled-route chain stay); the NAX proof and the NAX probes already run at init.
+  A recipe the manifest lacks compiles in the request and shows in `kernels compiled after the load`.
+- **Another build of the same scope.** The newest such manifest is made the same way, then the full warm runs as the
+  complete enumeration and the manifest is rewritten; the older builds of the scope are removed and the log says so.
+- **No manifest, or one that cannot be read** (the reason is named): today's load, then a manifest is written. A recipe that
+  fails to make from a same-key manifest makes it untrusted: the full warm runs.
+- Written only after a warm that returned without error, through a temp file and a rename. One `[pipelines]` line says
+  which case ran.
 
 ## What a forward costs
 
