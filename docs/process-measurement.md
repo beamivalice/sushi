@@ -167,7 +167,9 @@ Cross-engine comparison is not this bench: start the other engine, run llmprobe 
 <a id="energy-per-token"></a>
 ## 4d. Energy per token
 
-Less work at equal speed is a win, and energy per token is how it is read. Three sources, none needing sudo:
+Less work at equal speed is a win. It is read by the host's CPU joules, CPU seconds and instructions per token and by
+the engine's own counts; GPU joules per token are recorded beside them and never decide. Three sources, none needing
+sudo:
 - **GPU joules**: IOReport's `Energy Model` group, channel `GPU Energy` (a nanojoule counter); a request is the
   difference of two reads. The CPU channels of that group read zero on the M5 Max.
 - **The server's own CPU joules, CPU seconds and instructions**: `proc_pid_rusage(pid, RUSAGE_INFO_V6)`
@@ -180,6 +182,9 @@ Rules for reading it:
   max, an idle window, the same requests in the same order) walks the same thermal path every load: the same request at
   the same position repeats within 0.3% (fixed-row sampled rounds within 0.03%). Inside a load the same request drifts 4
   to 5% as the die heats.
+- **GPU joules per token never judge a change.** The GPU is always less efficient at a higher clock, so a path that
+  keeps it busier, and so faster, reads worse per token; choosing by that number trades away top speed. Record it with
+  the GPU clock beside it (P-state residency), and judge the GPU side by counts: dispatches, command buffers, bytes read.
 - One load per arm; a second load of an arm is a repeat check, not an average to chase.
 - A watt reading is a record, not a verdict: it moves with the GPU clock and with macOS's throttling, and a request must
   be long enough to separate watts from tok/s (256 tokens at long context is not). Record it with its caveats and move

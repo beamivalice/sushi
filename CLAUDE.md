@@ -206,9 +206,9 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
   not an output change.
 - An output-changing tweak worth about 1% of a token or less is dropped, not queued.
 - Judge a tweak on top of the change it builds on, not alone against the old code.
-- Less work at equal speed is a win: a change that lowers energy per token at the same bytes and tok/s lands like a
-  speedup, read by position ([energy per token](docs/process-measurement.md#energy-per-token)). Host CPU joules weigh
-  most: CPU heat throttles a laptop before GPU heat does.
+- Less work at equal speed is a win: a change that lowers host CPU joules or work counts per token at the same bytes
+  and tok/s lands like a speedup ([energy per token](docs/process-measurement.md#energy-per-token)). GPU joules per
+  token are a record, never a verdict: a higher GPU clock always costs more per token, so judging by them kills top speed.
 
 **Measurement hygiene.**
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.
