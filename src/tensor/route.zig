@@ -7,7 +7,7 @@ const mlx = @import("../mlx.zig");
 const metal = @import("../metal.zig");
 const core = @import("core.zig");
 const ops = @import("ops.zig");
-const kernel = @import("kernel.zig");
+pub const kernel = @import("kernel.zig");
 const stock = @import("stock.zig");
 const sorting = @import("sort.zig");
 const scan = @import("scan.zig");
@@ -778,11 +778,105 @@ pub fn categoricalAt(res: *A, logits: A, key: [2]u32) c_int {
 
 // ── Custom kernels ──
 
+/// A kernel, a config or a list of names made while the engine is on is an object of the engine's, its handle the
+/// pointer with the low bit as a tensor's is: making and filling one calls nothing in MLX. MLX's own object (the twin,
+/// `mlx.zig`) is made when one first launches on MLX's side.
+pub fn isKernel(k: mlx.mlx_fast_metal_kernel) bool {
+    return @intFromPtr(k.ctx) & 1 != 0;
+}
+
+pub fn isConfig(c: mlx.mlx_fast_metal_kernel_config) bool {
+    return @intFromPtr(c.ctx) & 1 != 0;
+}
+
+pub fn isStrings(v: mlx.mlx_vector_string) bool {
+    return @intFromPtr(v.ctx) & 1 != 0;
+}
+
+pub fn kernelOf(k: mlx.mlx_fast_metal_kernel) *kernel.Def {
+    return @ptrFromInt(@intFromPtr(k.ctx) & ~@as(usize, 1));
+}
+
+pub fn configOf(c: mlx.mlx_fast_metal_kernel_config) *kernel.Config {
+    return @ptrFromInt(@intFromPtr(c.ctx) & ~@as(usize, 1));
+}
+
+const Strings = struct { items: [][:0]u8 };
+
+fn stringsOf(v: mlx.mlx_vector_string) *Strings {
+    return @ptrFromInt(@intFromPtr(v.ctx) & ~@as(usize, 1));
+}
+
+/// A list of `n` names of the engine's own, copied; a null handle when memory is short.
+pub fn stringsNew(texts: ?[*]const [*:0]const u8, n: usize) mlx.mlx_vector_string {
+    const v = gpa.create(Strings) catch return .{};
+    v.items = gpa.alloc([:0]u8, n) catch {
+        gpa.destroy(v);
+        return .{};
+    };
+    for (0..n) |i| v.items[i] = gpa.dupeSentinel(u8, std.mem.span(texts.?[i]), 0) catch {
+        for (v.items[0..i]) |held| gpa.free(held);
+        gpa.free(v.items);
+        gpa.destroy(v);
+        return .{};
+    };
+    return .{ .ctx = @ptrFromInt(@intFromPtr(v) | 1) };
+}
+
+pub fn stringsFree(v: mlx.mlx_vector_string) void {
+    const held = stringsOf(v);
+    for (held.items) |text| gpa.free(text);
+    gpa.free(held.items);
+    gpa.destroy(held);
+}
+
+pub fn stringsItems(v: mlx.mlx_vector_string) []const [:0]u8 {
+    return stringsOf(v).items;
+}
+
+/// A kernel of the engine's own, as its maker gave it; a null handle with the reason latched when it cannot be held.
+pub fn kernelNative(name: [*:0]const u8, input_names: mlx.mlx_vector_string, output_names: mlx.mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx.mlx_fast_metal_kernel {
+    var ins: [kernel.max_inputs][]const u8 = undefined;
+    var outs: [kernel.max_outputs][]const u8 = undefined;
+    const n_in = names(input_names, &ins) orelse return noKernel();
+    const n_out = names(output_names, &outs) orelse return noKernel();
+    const def = kernel.Def.create(std.mem.span(name), ins[0..n_in], outs[0..n_out], std.mem.span(source), std.mem.span(header), ensure_row_contiguous, atomic_outputs) catch return noKernel();
+    return .{ .ctx = @ptrFromInt(@intFromPtr(def) | 1) };
+}
+
+fn noKernel() mlx.mlx_fast_metal_kernel {
+    _ = refuse("mlx_fast_metal_kernel_new", "more inputs or outputs than a kernel of the engine holds, or no memory");
+    return .{};
+}
+
+/// A config of the engine's own, empty; a null handle when memory is short.
+pub fn configNew() mlx.mlx_fast_metal_kernel_config {
+    const c = spare_configs.pop() orelse (gpa.create(kernel.Config) catch return .{});
+    c.* = .{};
+    return .{ .ctx = @ptrFromInt(@intFromPtr(c) | 1) };
+}
+
+pub fn configFree(c: mlx.mlx_fast_metal_kernel_config) void {
+    const held = configOf(c);
+    spare_configs.append(gpa, held) catch gpa.destroy(held);
+}
+
+pub fn configOutput(c: mlx.mlx_fast_metal_kernel_config, dims: [*]const c_int, n: usize, dtype: mlx.mlx_dtype) c_int {
+    configOf(c).addOutput(dims[0..n], dtype) catch return refuse("mlx_fast_metal_kernel_config_add_output_arg", "more outputs or dimensions than a config of the engine holds");
+    return 0;
+}
+
+pub fn configTemplate(c: mlx.mlx_fast_metal_kernel_config, name: [*:0]const u8, value: kernel.TemplateValue) c_int {
+    configOf(c).addTemplate(std.mem.span(name), value) catch return refuse("mlx_fast_metal_kernel_config_add_template_arg", "more template arguments, or a longer name, than a config of the engine holds");
+    return 0;
+}
+
+/// The kernels and configs MLX made (the engine was off, or a test turned it on later), by their MLX object's address.
 var defs: std.AutoHashMapUnmanaged(usize, *kernel.Def) = .empty;
 
 /// Records a kernel as its maker gave it, under the MLX kernel object's address.
 pub fn kernelNew(k: mlx.mlx_fast_metal_kernel, name: [*:0]const u8, input_names: mlx.mlx_vector_string, output_names: mlx.mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) void {
-    var ins: [32][]const u8 = undefined;
+    var ins: [kernel.max_inputs][]const u8 = undefined;
     var outs: [kernel.max_outputs][]const u8 = undefined;
     const n_in = names(input_names, &ins) orelse return;
     const n_out = names(output_names, &outs) orelse return;
@@ -791,6 +885,12 @@ pub fn kernelNew(k: mlx.mlx_fast_metal_kernel, name: [*:0]const u8, input_names:
 }
 
 fn names(v: mlx.mlx_vector_string, out: [][]const u8) ?usize {
+    if (isStrings(v)) {
+        const items = stringsItems(v);
+        if (items.len > out.len) return null;
+        for (items, 0..) |text, i| out[i] = text;
+        return items.len;
+    }
     const n = mlx.mlx_vector_string_size(v);
     if (n > out.len) return null;
     for (0..n) |i| {
@@ -848,8 +948,8 @@ pub fn forgetConfig(c: mlx.mlx_fast_metal_kernel_config) void {
 }
 
 pub fn mlx_fast_metal_kernel_apply(outputs: *V, k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config, _: S) c_int {
-    const def = defs.get(@intFromPtr(k.ctx)) orelse return fail("kernel_apply: the kernel was made before the engine was on", error.TensorUnsupported);
-    const cfg = mirrors.get(@intFromPtr(c.ctx)) orelse return fail("kernel_apply: the config was made before the engine was on", error.TensorUnsupported);
+    const def = if (isKernel(k)) kernelOf(k) else defs.get(@intFromPtr(k.ctx)) orelse return fail("kernel_apply: the kernel was made before the engine was on", error.TensorUnsupported);
+    const cfg = if (isConfig(c)) configOf(c) else mirrors.get(@intFromPtr(c.ctx)) orelse return fail("kernel_apply: the config was made before the engine was on", error.TensorUnsupported);
     if (cfg.partial) return fail("kernel_apply: the config holds more outputs or template arguments than the engine mirrors", error.TensorUnsupported);
     var in_buf: [32]*Tensor = undefined;
     const ins = takeAll(inputs, &in_buf) catch |e| return fail("kernel_apply", e);
@@ -1367,6 +1467,77 @@ test "a custom kernel launched on the engine writes what it writes under MLX" {
             }
         }
     };
+}
+
+test "a kernel, its name lists and its config made while the engine is on call nothing in mlx-c, and launch on both sides" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const source =
+        \\uint i = thread_position_in_grid.x;
+        \\out[i] = x[i] * float(SCALE) + float(threads_per_threadgroup.x > 0);
+    ;
+    const names_in = [_][*:0]const u8{"x"};
+    const names_out = [_][*:0]const u8{"out"};
+    const before = mlx.calls.load(.monotonic);
+    const iv = mlx.mlx_vector_string_new_data(&names_in, 1);
+    const ov = mlx.mlx_vector_string_new_data(&names_out, 1);
+    try t_std.expectEqual(@as(usize, 1), mlx.mlx_vector_string_size(iv));
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_native_probe", iv, ov, source, "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    _ = mlx.mlx_vector_string_free(iv);
+    _ = mlx.mlx_vector_string_free(ov);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{16}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SCALE", 3));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 16, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 16, 1, 1));
+    {
+        const passing = mlx.mlx_fast_metal_kernel_config_new();
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(passing, &[_]c_int{4}, 1, .int32));
+        _ = mlx.mlx_fast_metal_kernel_config_free(passing);
+    }
+    try t_std.expectEqual(before, mlx.calls.load(.monotonic));
+
+    const xs = ramp(f32, 16, 4, -3);
+    const x = hostArray(f32, &xs, &.{16}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    var want: [16 * 4]u8 = undefined;
+    // The engine first, then MLX's side twice: the second after the config changed under its MLX twin.
+    for ([_]S{ core.stream(), gpu, gpu }, 0..) |s, round| {
+        active = round == 0;
+        defer active = false;
+        if (round == 2) try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 8, 1, 1));
+        const inputs = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+        defer _ = mlx.mlx_vector_array_free(inputs);
+        var outs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, k, inputs, cfg, s));
+        var y: A = .{};
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+        try mlx.check(mlx.mlx_array_eval(y));
+        const got = mlx.mlx_array_data_uint8(y).?[0..want.len];
+        if (round == 0) @memcpy(&want, got) else try t_std.expectEqualSlices(u8, &want, got);
+    }
+    const first: f32 = @bitCast(want[0..4].*);
+    try t_std.expectEqual(xs[0] * 3 + 1, first);
+}
+
+test "a config made while the engine is on refuses by name an output it cannot hold" {
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    for (0..kernel.max_outputs) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32));
+    try t_std.expect(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32) != 0);
 }
 
 test "configs made and freed in turn launch the pipeline of their own template value" {

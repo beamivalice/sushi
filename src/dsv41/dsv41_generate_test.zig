@@ -3311,6 +3311,6 @@ test "dsv41 engine: a one-row decode step in steady state makes a pinned number 
     const again = try stepCalls(&fx, prompt, 5);
     try testing.expectEqual(steady, again);
     // The stage-by-stage target is zero: kernel configs, array queries, host reads, evals, makers, frees, other ops.
-    try testing.expectEqual([_]u64{ 856, 3857, 489, 2, 87, 658, 571 }, steady.split);
-    try testing.expectEqual(@as(u64, 6520), steady.total);
+    try testing.expectEqual([_]u64{ 0, 3857, 489, 2, 87, 658, 571 }, steady.split);
+    try testing.expectEqual(@as(u64, 5664), steady.total);
 }

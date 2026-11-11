@@ -687,20 +687,107 @@ pub const mlx_fast_scaled_dot_product_attention = routed("mlx_fast_scaled_dot_pr
 
 // ── Vector of strings (for custom metal kernels) ──
 pub const mlx_vector_string = extern struct { ctx: ?*anyopaque = null };
-pub const mlx_vector_string_new = counted("mlx_vector_string_new", fn () callconv(.c) mlx_vector_string);
-pub const mlx_vector_string_new_data = counted("mlx_vector_string_new_data", fn (data: [*]const [*:0]const u8, size: usize) callconv(.c) mlx_vector_string);
-pub const mlx_vector_string_free = counted("mlx_vector_string_free", fn (vec: mlx_vector_string) callconv(.c) c_int);
-pub const mlx_vector_string_size = counted("mlx_vector_string_size", fn (vec: mlx_vector_string) callconv(.c) usize);
-pub const mlx_vector_string_get = counted("mlx_vector_string_get", fn (res: *[*:0]u8, vec: mlx_vector_string, idx: usize) callconv(.c) c_int);
+/// A list of names made while the engine is on is the engine's (`engine.isStrings`); only a kernel's maker reads one.
+pub fn mlx_vector_string_new() mlx_vector_string {
+    if (engine.enabled) return engine.stringsNew(null, 0);
+    return raw_kernel.mlx_vector_string_new();
+}
+pub fn mlx_vector_string_new_data(data: [*]const [*:0]const u8, size: usize) mlx_vector_string {
+    if (engine.enabled) return engine.stringsNew(data, size);
+    return raw_kernel.mlx_vector_string_new_data(data, size);
+}
+pub fn mlx_vector_string_free(vec: mlx_vector_string) c_int {
+    if (engine.isStrings(vec)) {
+        engine.stringsFree(vec);
+        return 0;
+    }
+    return raw_kernel.mlx_vector_string_free(vec);
+}
+pub fn mlx_vector_string_size(vec: mlx_vector_string) usize {
+    if (engine.isStrings(vec)) return engine.stringsItems(vec).len;
+    return raw_kernel.mlx_vector_string_size(vec);
+}
+pub fn mlx_vector_string_get(res: *[*:0]u8, vec: mlx_vector_string, idx: usize) c_int {
+    if (engine.isStrings(vec)) {
+        const items = engine.stringsItems(vec);
+        if (idx >= items.len) return engine.refuse("mlx_vector_string_get", "an index past the list's end");
+        res.* = items[idx].ptr;
+        return 0;
+    }
+    return raw_kernel.mlx_vector_string_get(res, vec, idx);
+}
 
 // ── Custom Metal kernels ──
 pub const mlx_fast_metal_kernel_config = extern struct { ctx: ?*anyopaque = null };
-/// Always MLX's config, mirrored for the engine as it is filled: a module keeps the configs it builds, and one made
-/// inside a forward of the engine is launched on MLX's side later.
+/// With the engine on, a config of the engine's own (`engine.isConfig`): filling it calls nothing in MLX, and MLX's
+/// config of the same contents (its twin) is made when it first launches on MLX's side. With the engine off, MLX's
+/// config; a test process mirrors that one for the engine as it is filled.
 pub fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config {
+    if (engine.enabled) return engine.configNew();
     return raw_kernel.mlx_fast_metal_kernel_config_new();
 }
+
+/// Frees the MLX twin of a config of the engine's own: its contents changed, or it is freed.
+fn dropConfigTwin(c: *engine.kernel.Config) void {
+    const twin: mlx_fast_metal_kernel_config = .{ .ctx = c.twin orelse return };
+    kernel_keys.configFree(twin);
+    _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
+    c.twin = null;
+}
+
+/// MLX's config for a launch on MLX's side: `cls` itself, or the twin of a config of the engine's own, filled in the
+/// order its maker filled it.
+fn mlxConfig(cls: mlx_fast_metal_kernel_config) ?mlx_fast_metal_kernel_config {
+    if (!engine.isConfig(cls)) return cls;
+    const c = engine.configOf(cls);
+    if (c.twin) |twin| return .{ .ctx = twin };
+    const twin = raw_kernel.mlx_fast_metal_kernel_config_new();
+    if (twin.ctx == null) return null;
+    var out: usize = 0;
+    var targ: usize = 0;
+    var failed = false;
+    for (c.order[0 .. c.n_out + c.n_targs]) |is_output| {
+        if (is_output) {
+            kernel_keys.configNote(twin, " ->{t}", .{c.out_dtypes[out]});
+            failed = failed or raw_kernel.mlx_fast_metal_kernel_config_add_output_arg(twin, &c.out_shapes[out], c.out_ndims[out], c.out_dtypes[out]) != 0;
+            out += 1;
+            continue;
+        }
+        const arg = &c.targs[targ];
+        targ += 1;
+        var name_buf: [arg.name.len + 1]u8 = undefined;
+        @memcpy(name_buf[0..arg.name_len], arg.name[0..arg.name_len]);
+        name_buf[arg.name_len] = 0;
+        const name: [*:0]const u8 = @ptrCast(&name_buf);
+        failed = failed or switch (arg.value) {
+            .int => |v| blk: {
+                kernel_keys.configNote(twin, " {s}={d}", .{ name, v });
+                break :blk raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_int(twin, name, v);
+            },
+            .dtype => |v| blk: {
+                kernel_keys.configNote(twin, " {s}={t}", .{ name, v });
+                break :blk raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_dtype(twin, name, v);
+            },
+            .boolean => |v| raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_bool(twin, name, v),
+        } != 0;
+    }
+    failed = failed or raw_kernel.mlx_fast_metal_kernel_config_set_grid(twin, c.grid[0], c.grid[1], c.grid[2]) != 0;
+    failed = failed or raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(twin, c.group[0], c.group[1], c.group[2]) != 0;
+    if (failed) {
+        kernel_keys.configFree(twin);
+        _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
+        return null;
+    }
+    c.twin = twin.ctx;
+    return twin;
+}
+
 pub fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int {
+    if (engine.isConfig(cls)) {
+        dropConfigTwin(engine.configOf(cls));
+        engine.configFree(cls);
+        return 0;
+    }
     if (engine.noting()) {
         engine.forgetConfig(cls);
     }
@@ -708,6 +795,10 @@ pub fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_in
     return raw_kernel.mlx_fast_metal_kernel_config_free(cls);
 }
 pub fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int {
+    if (engine.isConfig(cls)) {
+        dropConfigTwin(engine.configOf(cls));
+        return engine.configOutput(cls, shape, size, dtype);
+    }
     if (engine.noting()) {
         engine.noteOutput(cls, shape, size, dtype);
     }
@@ -715,18 +806,32 @@ pub fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_co
     return raw_kernel.mlx_fast_metal_kernel_config_add_output_arg(cls, shape, size, dtype);
 }
 pub fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int {
+    if (engine.isConfig(cls)) {
+        const c = engine.configOf(cls);
+        c.grid = .{ g1, g2, g3 };
+        return if (c.twin) |twin| raw_kernel.mlx_fast_metal_kernel_config_set_grid(.{ .ctx = twin }, g1, g2, g3) else 0;
+    }
     if (engine.noting()) {
         engine.noteGrid(cls, g1, g2, g3);
     }
     return raw_kernel.mlx_fast_metal_kernel_config_set_grid(cls, g1, g2, g3);
 }
 pub fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int {
+    if (engine.isConfig(cls)) {
+        const c = engine.configOf(cls);
+        c.group = .{ t1, t2, t3 };
+        return if (c.twin) |twin| raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(.{ .ctx = twin }, t1, t2, t3) else 0;
+    }
     if (engine.noting()) {
         engine.noteGroup(cls, t1, t2, t3);
     }
     return raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(cls, t1, t2, t3);
 }
 pub fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int {
+    if (engine.isConfig(cls)) {
+        dropConfigTwin(engine.configOf(cls));
+        return engine.configTemplate(cls, name, .{ .dtype = dtype });
+    }
     if (engine.noting()) {
         engine.noteTemplate(cls, name, .{ .dtype = dtype });
     }
@@ -735,15 +840,25 @@ pub fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_k
 }
 pub const mlx_any_axes = routed("mlx_any_axes", fn (res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
 pub fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int {
+    if (engine.isConfig(cls)) {
+        dropConfigTwin(engine.configOf(cls));
+        return engine.configTemplate(cls, name, .{ .int = value });
+    }
     if (engine.noting()) {
         engine.noteTemplate(cls, name, .{ .int = value });
     }
     kernel_keys.configNote(cls, " {s}={d}", .{ name, value });
     return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_int(cls, name, value);
 }
-/// No kernel of the engine's serving takes a bool template arg, so this one notes nothing for the engine or the keys.
-pub const mlx_fast_metal_kernel_config_add_template_arg_bool = raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_bool;
-pub const mlx_fast_metal_kernel_config_set_verbose = counted("mlx_fast_metal_kernel_config_set_verbose", fn (cls: mlx_fast_metal_kernel_config, verbose: bool) callconv(.c) c_int);
+/// No kernel of the engine's serving takes a bool template arg, so on MLX's config this one notes nothing for the
+/// engine's mirror or the keys.
+pub fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) c_int {
+    if (engine.isConfig(cls)) {
+        dropConfigTwin(engine.configOf(cls));
+        return engine.configTemplate(cls, name, .{ .boolean = value });
+    }
+    return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_bool(cls, name, value);
+}
 
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
 var raw_source_env: ?bool = null;
@@ -769,14 +884,86 @@ fn minifiedText(alloc: std.mem.Allocator, source: [*:0]const u8, header: [*:0]co
     return .{ .source = src, .header = try metal_minify.shake(alloc, whole, src) };
 }
 
-/// The kernel exactly as given; MLX copies both strings.
+/// The kernel exactly as given, its strings copied. With the engine on it is a kernel of the engine's own
+/// (`engine.isKernel`), and MLX's kernel of the same source (its twin) is made when it first launches on MLX's side.
 pub fn kernelNewSource(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel {
-    const k = raw_kernel.mlx_fast_metal_kernel_new(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
+    if (engine.enabled) return engine.kernelNative(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
+    const ins = MlxStrings.of(input_names) orelse return .{};
+    defer ins.deinit();
+    const outs = MlxStrings.of(output_names) orelse return .{};
+    defer outs.deinit();
+    const k = raw_kernel.mlx_fast_metal_kernel_new(name, ins.vec, outs.vec, source, header, ensure_row_contiguous, atomic_outputs);
     if (engine.noting()) engine.kernelNew(k, name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
     kernel_keys.kernelNew(k, name, source, header, ensure_row_contiguous, atomic_outputs);
     return k;
 }
+
+/// A list of names as MLX's own vector: the list itself, or a copy of one the engine holds.
+const MlxStrings = struct {
+    vec: mlx_vector_string,
+    copied: bool,
+
+    fn of(v: mlx_vector_string) ?MlxStrings {
+        if (!engine.isStrings(v)) return .{ .vec = v, .copied = false };
+        return ofItems(engine.stringsItems(v));
+    }
+
+    fn ofItems(items: anytype) ?MlxStrings {
+        var ptrs: [engine.kernel.max_inputs][*:0]const u8 = undefined;
+        if (items.len > ptrs.len) return null;
+        for (items, 0..) |text, i| ptrs[i] = text.ptr;
+        const vec = raw_kernel.mlx_vector_string_new_data(&ptrs, items.len);
+        return if (vec.ctx == null) null else .{ .vec = vec, .copied = true };
+    }
+
+    fn deinit(m: MlxStrings) void {
+        if (m.copied) _ = raw_kernel.mlx_vector_string_free(m.vec);
+    }
+};
+
+/// MLX's kernel for a launch on MLX's side: `cls` itself, or the twin of a kernel of the engine's own.
+fn mlxKernel(cls: mlx_fast_metal_kernel) ?mlx_fast_metal_kernel {
+    if (!engine.isKernel(cls)) return cls;
+    const def = engine.kernelOf(cls);
+    if (def.twin) |twin| return .{ .ctx = twin };
+    const alloc = std.heap.page_allocator;
+    var texts: [3][:0]u8 = undefined;
+    for ([_][]const u8{ def.name, def.source, def.header }, 0..) |text, i| {
+        texts[i] = alloc.dupeSentinel(u8, text, 0) catch {
+            for (texts[0..i]) |held| alloc.free(held);
+            return null;
+        };
+    }
+    defer for (texts) |held| alloc.free(held);
+    var names: [2][engine.kernel.max_inputs][:0]u8 = undefined;
+    var counts = [2]usize{ 0, 0 };
+    defer for (names, counts) |list, n| for (list[0..n]) |held| alloc.free(held);
+    for ([_][]const []u8{ def.inputs, def.outputs }, 0..) |list, which| {
+        if (list.len > names[which].len) return null;
+        for (list) |text| {
+            names[which][counts[which]] = alloc.dupeSentinel(u8, text, 0) catch return null;
+            counts[which] += 1;
+        }
+    }
+    const ins = MlxStrings.ofItems(names[0][0..counts[0]]) orelse return null;
+    defer ins.deinit();
+    const outs = MlxStrings.ofItems(names[1][0..counts[1]]) orelse return null;
+    defer outs.deinit();
+    const twin = raw_kernel.mlx_fast_metal_kernel_new(texts[0].ptr, ins.vec, outs.vec, texts[1].ptr, texts[2].ptr, def.ensure_row_contiguous, def.atomic_outputs);
+    if (twin.ctx == null) return null;
+    kernel_keys.kernelNew(twin, texts[0].ptr, texts[1].ptr, texts[2].ptr, def.ensure_row_contiguous, def.atomic_outputs);
+    def.twin = twin.ctx;
+    return twin;
+}
+
 pub fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int {
+    if (engine.isKernel(cls)) {
+        const def = engine.kernelOf(cls);
+        const twin: mlx_fast_metal_kernel = .{ .ctx = def.twin orelse return 0 };
+        def.twin = null;
+        kernel_keys.kernelFree(twin);
+        return raw_kernel.mlx_fast_metal_kernel_free(twin);
+    }
     if (engine.noting()) engine.kernelFree(cls);
     kernel_keys.kernelFree(cls);
     return raw_kernel.mlx_fast_metal_kernel_free(cls);
@@ -787,12 +974,19 @@ pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_met
         .leak => return engine.refuse("mlx_fast_metal_kernel_apply", "an MLX stream inside a forward of the engine"),
         .mlx => if (engine.isVec(inputs)) return engine.refuse("mlx_fast_metal_kernel_apply", "a vector of the engine on an MLX stream"),
     };
-    kernel_keys.apply(cls, inputs, config);
-    return raw_kernel.mlx_fast_metal_kernel_apply(outputs, cls, inputs, config, s);
+    const k = mlxKernel(cls) orelse return engine.refuse("mlx_fast_metal_kernel_apply", "MLX could not make the kernel");
+    const c = mlxConfig(config) orelse return engine.refuse("mlx_fast_metal_kernel_apply", "MLX could not make the config");
+    kernel_keys.apply(k, inputs, c);
+    return raw_kernel.mlx_fast_metal_kernel_apply(outputs, k, inputs, c, s);
 }
 
 /// The custom-kernel entry points under the wrappers above, which note each kernel's library key.
 const raw_kernel = struct {
+    const mlx_vector_string_new = counted("mlx_vector_string_new", fn () callconv(.c) mlx_vector_string);
+    const mlx_vector_string_new_data = counted("mlx_vector_string_new_data", fn (data: [*]const [*:0]const u8, size: usize) callconv(.c) mlx_vector_string);
+    const mlx_vector_string_free = counted("mlx_vector_string_free", fn (vec: mlx_vector_string) callconv(.c) c_int);
+    const mlx_vector_string_size = counted("mlx_vector_string_size", fn (vec: mlx_vector_string) callconv(.c) usize);
+    const mlx_vector_string_get = counted("mlx_vector_string_get", fn (res: *[*:0]u8, vec: mlx_vector_string, idx: usize) callconv(.c) c_int);
     const mlx_fast_metal_kernel_config_new = counted("mlx_fast_metal_kernel_config_new", fn () callconv(.c) mlx_fast_metal_kernel_config);
     const mlx_fast_metal_kernel_config_free = counted("mlx_fast_metal_kernel_config_free", fn (cls: mlx_fast_metal_kernel_config) callconv(.c) c_int);
     const mlx_fast_metal_kernel_config_set_grid = counted("mlx_fast_metal_kernel_config_set_grid", fn (cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) callconv(.c) c_int);

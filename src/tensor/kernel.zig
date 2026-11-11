@@ -69,6 +69,11 @@ pub const Config = struct {
     /// The pipeline of the last launch, for a config that outlives its launch. The outputs and template values only
     /// change through `addOutput` and `addTemplate`, which clear it; a launch checks the kernel and the inputs.
     last: ?Last = null,
+    /// Per `addOutput` and `addTemplate` call, in the order made: whether it was an output. MLX's config is filled
+    /// in this order.
+    order: [max_outputs + max_template_args]bool = undefined,
+    /// MLX's config of the same contents, made when a config of the engine's own first launches on MLX's side.
+    twin: ?*anyopaque = null,
 
     const Last = struct {
         def: u64,
@@ -80,6 +85,7 @@ pub const Config = struct {
     pub fn addOutput(c: *Config, shape: []const c_int, dtype: Dtype) core.Error!void {
         c.last = null;
         if (c.n_out == max_outputs or shape.len > core.max_dims) return error.TensorShape;
+        c.order[c.n_out + c.n_targs] = true;
         @memcpy(c.out_shapes[c.n_out][0..shape.len], shape);
         c.out_ndims[c.n_out] = @intCast(shape.len);
         c.out_dtypes[c.n_out] = dtype;
@@ -89,6 +95,7 @@ pub const Config = struct {
     pub fn addTemplate(c: *Config, name: []const u8, value: TemplateValue) core.Error!void {
         c.last = null;
         if (c.n_targs == max_template_args or name.len > 48) return error.TensorShape;
+        c.order[c.n_out + c.n_targs] = false;
         var arg: TemplateArg = .{ .value = value, .name_len = @intCast(name.len) };
         @memcpy(arg.name[0..name.len], name);
         c.targs[c.n_targs] = arg;
@@ -152,6 +159,8 @@ pub const Def = struct {
     recent: [recent_slots]Recent = undefined,
     recent_count: u8 = 0,
     recent_next: u8 = 0,
+    /// MLX's kernel of the same source, made when a kernel of the engine's own first launches on MLX's side.
+    twin: ?*anyopaque = null,
 
     pub fn create(name: []const u8, inputs: []const []const u8, outputs: []const []const u8, source: []const u8, header: []const u8, ensure_row_contiguous: bool, atomic_outputs: bool) !*Def {
         const d = try gpa.create(Def);

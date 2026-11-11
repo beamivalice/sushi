@@ -62,9 +62,12 @@ patch in), two sessions on 90c83d71 and 537e8e91. Engine: two runs of this chang
   arguments more on the way to mlx-c.
 - A handle of ours is a tagged pointer (low bit set); the makers that take no stream (a host array, a vector) make
   engine objects while `active` is on.
-- A kernel config is always MLX's, mirrored for the engine as it is filled: a module keeps the configs it builds, and
-  one made inside a forward of ours is launched on MLX's side later. A mirror that cannot hold a config refuses the
-  launch by name.
+- A kernel, its config and its lists of names made while the engine is on are objects of the engine's (tagged
+  handles), so making and filling them calls nothing in mlx-c. A module keeps the kernels and configs it builds and
+  may launch one on MLX's side later: MLX's kernel and config (the twins) are made at that first launch, the config
+  filled in the order its maker filled it, and a config's twin is dropped when its outputs or template values change
+  (a new grid or threadgroup is passed on to it). A config that cannot hold an output or a template argument refuses
+  it by name. A kernel or config MLX made (the engine was off; a test turned it on later) is still mirrored as filled.
 - **A launch finds its pipeline without building the instance key** (`[engine] since load:` counts the keys built;
   a decode forward, a draft and a verify round build none once they have run). Two layers: a mirrored config that
   outlives its launch remembers its last pipeline (`Config.last`; cleared by `addOutput` and `addTemplate`, checked
@@ -80,8 +83,8 @@ patch in), two sessions on 90c83d71 and 537e8e91. Engine: two runs of this chang
   handle (`mlx_array_new`, `mlx_stream_new`, `mlx_device_new`, `mlx_string_new`, `mlx_device_info_new`) is a zero
   `ctx` made in Zig, no call. It cannot see MLX's own threads, work before the load, or the Metal objects MLX already
   made. Another file declaring an `mlx_*` extern fails the `mlx-extern` lint; an address of the library for `dladdr`
-  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 6520 calls
-  (pinned in `dsv41_generate_test.zig`).
+  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 5664 calls,
+  none of them for a kernel config (pinned in `dsv41_generate_test.zig`).
 
 ## Crossing between the two
 
