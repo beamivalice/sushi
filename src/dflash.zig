@@ -842,6 +842,8 @@ fn loadLinear(
 /// Affine-quantize a dense `[out, in]` weight in place of a transpose — the
 /// packed layout is exactly what `mlx_quantized_matmul(transpose=true)` reads.
 pub fn quantizeDense(raw: mlx.mlx_array, bits: u32, group: u32, s: mlx.mlx_stream) !DflashLinear {
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
     try mlx.check(mlx.mlx_quantize(

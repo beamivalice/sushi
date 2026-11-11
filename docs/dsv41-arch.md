@@ -1189,7 +1189,8 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   image queue joins several spans there too.
 - **Requantized at load** (`Dsv41Vision.init`, `quantizesAtLoad`): the pack keeps the tower bf16, and the load turns every
   block `wqkv`, `wo`, `w1`, `w2` and the aligner's `w1`, `w2` (322 matrices, 483M of the 485M parameters) into MLX
-  affine 8-bit, group 128, run through `mlx_quantized_matmul`, and frees each bf16 copy as its codes exist. The patch
+  affine 8-bit, group 128, run through `mlx_quantized_matmul`, and frees each bf16 copy as its codes exist (on a Sushi
+  Cooler load the engine quantizes, with MLX's own kernel and so MLX's bytes: `stock.quantize`). The patch
   embedding (588 wide), norms, biases and delimiters stay bf16. One `[vision] tower requantized at load: ...` line
   reports it. Against the bf16 tower on house.jpeg at 642 tokens: cosine 0.99906 after the final norm, 0.99957 on the
   span; the tower runs ~3% slower (a quantized matmul over 5,394 rows is compute-bound, [measured](dsv41-memory.md#vision-requant)).

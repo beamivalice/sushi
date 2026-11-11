@@ -243,6 +243,43 @@ pub fn dequantize(w_in: *Tensor, scales_in: *Tensor, biases_in: ?*Tensor, group:
     return ops.astype(out, out_type);
 }
 
+/// `quantize` in affine mode (`quantize_impl`): the packed codes of `w` (uint32) and, per group of `group` values
+/// along the last axis, a scale and a bias in `w`'s dtype. The caller releases the three.
+pub fn quantize(w_in: *Tensor, group: usize, bits: usize) Error![3]*Tensor {
+    if (w_in.ndim == 0) return error.TensorShape;
+    if (group != 32 and group != 64 and group != 128) return error.TensorUnsupported;
+    if (bits < 2 or bits > 8 or bits == 7) return error.TensorUnsupported;
+    const last = w_in.ndim - 1;
+    const width: usize = @intCast(w_in.shape[last]);
+    if (width == 0 or width % group != 0 or (width * bits) % 32 != 0) return error.TensorShape;
+    const w = try ops.contiguous(w_in);
+    defer core.release(w);
+    var buf: [96]u8 = undefined;
+    const k = try kernel(try named(&buf, "affine_quantize_{s}_gs_{d}_b_{d}", .{ try cType(w.dtype), group, bits }));
+    var shape: [core.max_dims]c_int = undefined;
+    @memcpy(shape[0..w.ndim], w.dims());
+    shape[last] = @intCast(width * bits / 32);
+    const codes = try core.fresh(.uint32, shape[0..w.ndim]);
+    errdefer core.release(codes);
+    shape[last] = @intCast(width / group);
+    const scales = try core.fresh(w.dtype, shape[0..w.ndim]);
+    errdefer core.release(scales);
+    const biases = try core.fresh(w.dtype, shape[0..w.ndim]);
+    errdefer core.release(biases);
+    // A thread reduces `group / 32` values; the 32 threads of a SIMD group share a group's extremes.
+    const threads = w.size() / (group / 32);
+    if (threads == 0) return .{ codes, scales, biases };
+    if (threads > std.math.maxInt(u32)) return error.TensorShape;
+    const p = try core.pass();
+    p.pipeline(k);
+    core.bind(p, w, 0);
+    core.bindOut(p, codes, 1);
+    core.bindOut(p, scales, 2);
+    core.bindOut(p, biases, 3);
+    core.dispatch(p, .{ .x = threads }, .{ .x = @min(k.max_threads, threads) });
+    return .{ codes, scales, biases };
+}
+
 /// `Erf::eval_gpu` (`unary_op_gpu_inplace`) over a row-contiguous float tensor: MLX's `erf`, not `metal::erf`.
 pub fn erf(x_in: *Tensor) Error!*Tensor {
     switch (x_in.dtype) {

@@ -26,7 +26,9 @@ chunk of any width included, and a pack that decodes on MLX prefills on MLX.
 | every other architecture | none: MLX |
 
 The vision tower of an image request (once per image, on a load that decodes on the engine) runs on the engine whole:
-the table's `quantized_matmul`, `fast::scaled_dot_product_attention` and `erf` rows, the weights imported.
+the table's `quantized_matmul`, `fast::scaled_dot_product_attention` and `erf` rows. Its load-time requantization
+(bf16 to affine 8-bit in groups of 128) is the engine's too (`stock.quantize`: MLX's own `affine_quantize` kernel,
+so MLX's codes, scales and biases), and the weights it makes are the engine's tensors, not imports.
 
 A forward that splices image rows runs on the engine like any other, and so does one issued while a DSpark verify is
 open (only after a round failed): the MLX route's logits, byte for byte. An image row takes the non-queued route (a
@@ -286,7 +288,8 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **What is made between forwards and outlives them asks for room** (`core.room`): a restore point's copies are taken
   under the cap the last forward left, which covers a forward's scratch and not state that stays. The capture names
   the sizes it is about to copy and the cap rises by their buffers; the next forward's cap starts from what is in use
-  then. A restore point's absent slots share one placeholder.
+  then. A restore point's absent slots share one placeholder. The vision tower's requantized codes, scales and biases
+  are made the same way, after the model's warm left its cap (`dsv41_vision.lin`).
 - **DeepSeek installs and bills it** (`dsv41_borrow`, `dsv41_bill`): the budget is a decode forward's cap
   (`Config.forwardCap`), set as every forward begins, and the request bill carries that cap a second time, beside
   MLX's. A request's end leaves the pool what the shortest request bills; an unload leaves it nothing free.
@@ -303,7 +306,9 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   model's seal): one block over five patch counts, the seal lifted for its span. Its recipes ride the manifest with a
   `marker` recipe (`vision tower`, keyed by the tower's widths) that says the warm is whole; a same-key load makes the
   recipes with the rest, trusts the marker, and runs no tower warm. A load that ran the warm writes the manifest again
-  (`dsv41_pipelines.rewriteLate`). A manifest whose recipes did not all make drops its markers.
+  (`dsv41_pipelines.rewriteLate`). A manifest whose recipes did not all make drops its markers. The tower's load is
+  inside the lifted seal too (`Dsv41Vision.init`): its requantization makes one stock kernel, whose recipe rides the
+  manifest with the warm's.
 - **Every warm forward of the engine runs under a request's budget** (`dsv41_model.warmBudget`, before each decode-width
   forward; `warmWide` through `forwardDsv41With`). The decode cap follows the position the forward is at, so the
   long-context steps of `warmOwnBlocks` and `warmOwnLong` are billed as a request there is.

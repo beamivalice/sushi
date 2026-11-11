@@ -456,8 +456,9 @@ The engine of our own in `src/tensor/` launches MLX's compiled kernels from
 `mlx.metallib` and ports the host code that picks and dispatches them, from
 MLX's Metal backend (Copyright (c) 2023-2025 Apple Inc.):
   * `stock.zig`: the dispatch of RMS norm (`fast::RMSNorm::eval_gpu`), softmax
-    (`Softmax::eval_gpu`) and dequantize (`fast::Dequantize::eval_gpu`,
-    `fp_dequantize`), with the kernel names MLX gives them.
+    (`Softmax::eval_gpu`), dequantize (`fast::Dequantize::eval_gpu`,
+    `fp_dequantize`) and affine quantize (`fast::Quantize::eval_gpu`,
+    `quantize_impl`), with the kernel names MLX gives them.
   * `stock.zig` also launches the scalar and vector binary kernels
     (`binary_op_gpu_inplace`, `get_kernel_name` in `mlx/backend/metal/binary.cpp`)
     for LogAddExp.

@@ -357,11 +357,15 @@ pub fn phase(now: u8) void {
 }
 pub const trim = core.trim;
 
-/// A model's load has run every forward a request can (true), or a load begins (false).
 pub const nowNs = core.nowNs;
 
+/// A model's load has run every forward a request can (true), or a load begins (false).
 pub fn seal(on: bool) void {
     core.sealed = on;
+}
+
+pub fn sealed() bool {
+    return core.sealed;
 }
 
 /// Pipelines made while sealed: each was a stall inside a request.
@@ -784,6 +788,27 @@ pub fn mlx_dequantize(res: *A, w: A, scales: A, biases: A, group_size: mlx.mlx_o
     const width: usize = if (bits.has_value) @intCast(bits.value) else if (what == .mxfp8) 8 else 4;
     const out_type = if (dtype.has_value) dtype.value else if (what == .affine) ts.dtype else .float32;
     return put(res, stock.dequantize(tw, ts, tb, group, width, what, tg, out_type) catch |e| return fail("dequantize", e));
+}
+
+/// Affine only: the float modes' quantizers are not the engine's.
+pub fn mlx_quantize(res: *V, w: A, group_size: mlx.mlx_optional_int, bits: mlx.mlx_optional_int, mode: [*:0]const u8, global_scale: A, _: S) c_int {
+    const what = std.meta.stringToEnum(stock.QuantMode, std.mem.span(mode)) orelse return fail("quantize", error.TensorUnsupported);
+    if (what != .affine or global_scale.ctx != null) return fail("quantize", error.TensorUnsupported);
+    const tw = core.take(w) catch |e| return fail("quantize", e);
+    defer core.release(tw);
+    const group: usize = if (group_size.has_value) @intCast(group_size.value) else 64;
+    const width: usize = if (bits.has_value) @intCast(bits.value) else 4;
+    const parts = stock.quantize(tw, group, width) catch |e| return fail("quantize", e);
+    const v = newVec() orelse {
+        for (parts) |t| core.release(t);
+        return fail("quantize", error.OutOfMemory);
+    };
+    for (parts) |t| v.items.append(gpa, core.handle(t)) catch {
+        core.release(t);
+    };
+    if (res.ctx != null) _ = if (isVec(res.*)) mlx_vector_array_free(res.*) else mlx.raw.mlx_vector_array_free(res.*);
+    res.* = vecHandle(v);
+    return 0;
 }
 
 pub fn mlx_take_along_axis(res: *A, a: A, indices: A, axis: c_int, _: S) c_int {
@@ -2141,6 +2166,44 @@ test "engine dequantize gives MLX's bytes: affine 4-bit bf16 and mxfp8 to f32" {
     const group_scales = hostArray(u8, &exps, &.{ 3, 10 }, .uint8);
     defer _ = mlx.mlx_array_free(group_scales);
     try expectSame(Build.mxfp8, &.{ w, group_scales });
+}
+
+test "engine quantize gives MLX's codes, scales and biases: affine 8-bit groups of 128 over bf16 and 4-bit groups of 64 over f32" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn part(comptime group: c_int, comptime bits: c_int, comptime at: usize) fn (S, []const A) anyerror!A {
+            return struct {
+                fn f(s: S, in: []const A) !A {
+                    var v: V = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(v);
+                    try mlx.check(mlx.mlx_quantize(&v, in[0], mlx.mlx_optional_int.some(group), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_vector_array_get(&o, v, at));
+                    return o;
+                }
+            }.f;
+        }
+    };
+    // Groups that are all positive, all negative, mixed, and all zero: every arm of the scale and bias choice.
+    var values: [3 * 512]f32 = undefined;
+    for (&values, 0..) |*v, i| {
+        const g = i / 128;
+        const x = @as(f32, @floatFromInt((i * 37) % 251)) / 251.0;
+        v.* = switch (g % 4) {
+            0 => x + 0.25,
+            1 => -x - 0.5,
+            2 => x * 3 - 1.5,
+            else => 0,
+        };
+    }
+    const w32 = hostArray(f32, &values, &.{ 3, 512 }, .float32);
+    defer _ = mlx.mlx_array_free(w32);
+    const wbf = try castByMlx(w32, .bfloat16);
+    defer _ = mlx.mlx_array_free(wbf);
+    inline for (0..3) |at| {
+        try expectSame(Build.part(128, 8, at), &.{wbf});
+        try expectSame(Build.part(64, 4, at), &.{w32});
+    }
 }
 
 test "engine vector-matrix products give MLX's bytes: a row against a transposed weight, a short row against a wide matrix, a matrix against a column" {

@@ -155,8 +155,9 @@ The pack keeps the tower bf16 (266 tensors, 0.971 GB); the load requantizes the 
 affine 8-bit, group 128, and frees each bf16 copy as its codes exist ([dsv41-arch](dsv41-arch.md#image-input)); `--vision-bf16` skips it and the ledger bills the tower as stored (0.971 GB). The
 ledger's `vision` term is what the load holds: 501,303,296 B (codes at a byte a weight, a bf16 scale and bias per group,
 the 588-wide patch embedding, norms, biases and the 40 image biases bf16), from `dsv41_source.visionBytes`, which applies
-the load's own rule (`dsv41_vision.quantizesAtLoad`) to the shard headers. The codes are MLX's own allocations, not
-sushi-owned mappings: `[dsv41-mem]` does not count them and `active_bytes` does.
+the load's own rule (`dsv41_vision.quantizesAtLoad`) to the shard headers. The codes are allocations, not
+sushi-owned mappings: the engine's pool buffers on a Sushi Cooler load, MLX's on the MLX route. `[dsv41-mem]` does not
+count them and `active_bytes` does.
 
 | STQ-1.75bpw, `--ssd-budget-gb` | vision term | slots/layer without tower | with tower | stored bf16 tower would give |
 |---|---|---|---|---|
