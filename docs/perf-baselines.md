@@ -360,6 +360,42 @@ Cells are us per projection, fans on auto; no M1 to M4 timing exists yet. Output
 - Every row of a SIMD multi-row launch equals the one-row launch bit for bit (k split and sum order do not depend on
   the row count): a verify row on a machine without NAX equals its serial step.
 
+## DeepSeek-V4.1 STQ decode: energy per token (2026-11-11)
+
+The baseline for "the same tok/s for less power". Method: [process-measurement](process-measurement.md#energy-per-token).
+M5 Max 128 GB, AC, fans at max, STQ 1.75bpw, `--ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000`,
+`taskpolicy -a`, GPU lock, quiet box, every load booted at 49 °C and ended at 90 to 91 °C. One load runs four identical
+seeded sampled chat requests (256 tokens, temperature 0.8, top-k 40, top-p 0.95, seed 7, fixed three-row rounds) and three
+identical greedy completions (384 tokens), 53 and 22 prompt tokens: a short-context reading only. Rows compare **by
+position**; the cells are the mean of sampled positions 2 to 4 and of greedy positions 2 to 3, one value per load.
+
+| binary | decode side | sampled tok/s | sampled GPU mJ/token | greedy tok/s | greedy GPU mJ/token |
+|---|---|---:|---:|---:|---:|
+| v1.6.0 release (`ac3da7aa`) | MLX 0.32.3, no host-overhead patch | 57.1, 57.0 | 1262, 1261 | 70.8, 70.9 | 888, 888 |
+| `84f901ad` | MLX with the host-overhead patch | 57.3, 57.5 | 1266, 1257 | 72.1, 70.9 | 879, 894 |
+| `2146f69b` | the engine of our own | 56.8, 56.9 | 1271, 1271 | 70.4, 71.6 | 904, 889 |
+
+| binary | server CPU ms/token, sampled / greedy | server CPU mJ/token, sampled / greedy | system W, sampled 3 to 4 / greedy 2 to 3 |
+|---|---:|---:|---:|
+| v1.6.0 release | 6.9 / 5.1 | 32.6 / 21.5 | 147 / 134 |
+| `84f901ad` | 5.0 / 3.9 | 20.5 / 13.6 | 146 / 135 |
+| `2146f69b` | 3.5 / 2.6 | 12.6 / 8.4 | 144 / 133 |
+
+- **The three decode sides tie on speed and on GPU energy** (within 1%): the engine's sampled GPU energy is 0.7% above
+  1.6.0's. Sampled rounds are fixed work, so the engine's cells repeated to 0.03% between loads; a greedy cell moves about
+  1% with the round mix its policy takes.
+- **The engine's own CPU cost is 61% below 1.6.0's and 39% below patched MLX's** (CPU joules per token), but the server's
+  CPU is 1 to 3% of the GPU's energy here (0.7 to 1.9 W against 63 to 76 W), so the wall reads 1 to 3 W less.
+- **Decode is power-limited within one request**: over the three warm sampled positions of a load the GPU falls from 76 W
+  to 69 W and tok/s from 58.5 to 55.5 as the die heats, on every side. tok/s is GPU watts over joules per token, so
+  under that cap energy per token is speed.
+- Idle with the model loaded: 10 to 15 W at the wall, 0 W GPU. The first request after a load: 31, 32 to 33 and 36 tok/s
+  for the whole request (1.6.0, patched MLX, engine), 1448 to 1467 GPU mJ/token.
+- The first greedy request of a prompt (position 1, the prompt prefilled, its streamed experts cold): 1.6.0 and patched
+  MLX 58 to 59 tok/s at 1121 to 1127 GPU mJ/token with 3 plain steps; the engine either the same (59.6, 1089) or, in three
+  loads of four, 71 plain steps at 55.5 tok/s and 1158 to 1173 mJ/token (the DSpark stop switch judging against a stale
+  one-row price).
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.

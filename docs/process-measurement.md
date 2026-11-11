@@ -164,6 +164,30 @@ The protocol, fixed for every model and release:
 Cross-engine comparison is not this bench: start the other engine, run llmprobe by hand
 (`npx -y llmprobe@latest <host:port> -m <id> --bench-only`) and name the engine beside every number.
 
+<a id="energy-per-token"></a>
+## 4d. Energy per token
+
+Less work at equal speed is a win, and energy per token is how it is read. Three sources, none needing sudo:
+- **GPU joules**: IOReport's `Energy Model` group, channel `GPU Energy` (a nanojoule counter); a request is the
+  difference of two reads. The CPU channels of that group read zero on the M5 Max.
+- **The server's own CPU joules, CPU seconds and instructions**: `proc_pid_rusage(pid, RUSAGE_INFO_V6)`
+  (`ri_energy_nj`, `ri_user_time + ri_system_time` in mach units of 125/3 ns, `ri_instructions`).
+- **System watts**: the SMC key `PSTR` (float). It lags a request by a second or two: read it over a request's later
+  seconds, never over a first position.
+
+Rules for reading it:
+- **Compare by position across loads, never two positions of one load.** A fixed script (boot under 50 °C with fans at
+  max, an idle window, the same requests in the same order) walks the same thermal path every load: the same request at
+  the same position repeats within 0.3% (fixed-row sampled rounds within 0.03%). Inside a load the same request drifts 4
+  to 5% as the die heats.
+- One load per arm; a second load of an arm is a repeat check, not an average to chase.
+- The lock's holder sets `QUIET` inside the locked command and waits for compiles and running test binaries to drain; a
+  run whose idle window shows GPU watts is discarded.
+- State beside the numbers: binary commit, the requests, boot and end temperature, and the round mix of every greedy
+  request (`[spec-stats]`), since the mix moves a greedy cell by about 1%.
+- The reader is a script beside the run files, not yet part of `sushi bench`. Baseline:
+  [perf-baselines](perf-baselines.md#deepseek-v41-stq-decode-energy-per-token-2026-11-11).
+
 ## 5. Wait without hanging
 
 Never wait on `pgrep -f "<string>"`: every agent shell's own `zsh -c "<command>"` contains the string and matches

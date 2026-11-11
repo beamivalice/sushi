@@ -206,6 +206,8 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
   not an output change.
 - An output-changing tweak worth about 1% of a token or less is dropped, not queued.
 - Judge a tweak on top of the change it builds on, not alone against the old code.
+- Less work at equal speed is a win: a change that lowers energy per token at the same bytes and tok/s lands like a
+  speedup, read by position ([energy per token](docs/process-measurement.md#energy-per-token)).
 
 **Measurement hygiene.**
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.
