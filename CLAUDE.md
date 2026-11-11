@@ -105,8 +105,9 @@ Box: M5 Max 128 GB, macOS 27. Bumping mlx or rebuilding jinja: [process-measurem
 ## Testing — TDD is mandatory
 
 Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) the subset that
-[testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test. The full suite runs
-only for a wide stacked change (shared files, several areas) or a version bump.
+[testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test. A landing runs the
+tests its diff can break, once: never a run for ceremony, never a repeat after a rebase that touched none of its files.
+The full suite and the arch drop test run once at the end of a series of landings, and at a version bump.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a
@@ -239,7 +240,7 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
 changes to ALL live workers at once; checks each landing updated its matching doc, and this index when a doc appears.
 
 **Remote CI.** `ci.yml` runs only when dispatched by hand at a version bump (no PR or push starts it); every other
-check, the arch drop test included, runs locally before a landing.
+check runs locally: a landing's own subset before it lands, the full suite and the arch drop test at a series' end.
 
 **Workers.** Report progress and blockers to the coordinator; commit per step; don't push or merge unless told; put new
 knowledge in the matching doc in the branch.
