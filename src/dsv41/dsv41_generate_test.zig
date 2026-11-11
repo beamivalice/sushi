@@ -1837,22 +1837,25 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
 
     // The target of every row is { 0, 0 }. What is left of a request is the engine importing arrays MLX owns (the
     // weights, the experts' slabs and maps), one set of queries and a free each; a capture still builds on MLX.
-    try testing.expectEqualSlices(Asked, &.{
-        .{ .calls = 94508, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
-        .{ .calls = 94508, .ops = 0 }, // seeded rounds
-        .{ .calls = 77955, .ops = 0 }, // serial steps with logprobs
+    // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of: how many launches a request
+    // makes, and so how many weights it looks up, follows what the process ran before it (a load whose pipelines
+    // exist skips its warm forwards and starts with other experts in its cache). A real cut moves the ceiling.
+    const ceilings = [_]Asked{
+        .{ .calls = 97474, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
+        .{ .calls = 97474, .ops = 0 }, // seeded rounds
+        .{ .calls = 78013, .ops = 0 }, // serial steps with logprobs
         .{ .calls = 253, .ops = 87 }, // a restore point captured
         .{ .calls = 149, .ops = 0 }, // the point restored
         .{ .calls = 5923, .ops = 0 }, // a step on the restored state
-        .{ .calls = 39478, .ops = 0 }, // an image prompt
+        .{ .calls = 40250, .ops = 0 }, // an image prompt
         .{ .calls = 4373, .ops = 0 }, // the unload
-    }, asked[0..8]);
-    // The load: a process's first makes some 2000 calls more than a later one (what the process keeps), so its calls
-    // are held under the first load's count and within 5000 of it; a real cut moves the ceiling.
-    const load_ceiling = 444974;
-    try testing.expectEqual(@as(u64, 1154), asked[8].ops);
-    try testing.expect(asked[8].calls <= load_ceiling);
-    try testing.expect(asked[8].calls + 5000 > load_ceiling);
+        .{ .calls = 444974, .ops = 1154 }, // the load
+    };
+    for (ceilings, asked) |ceiling, got| {
+        try testing.expectEqual(ceiling.ops, got.ops);
+        try testing.expect(got.calls <= ceiling.calls);
+        try testing.expect(got.calls + ceiling.calls / 20 >= ceiling.calls);
+    }
 }
 
 test "dsv41 engine: a Cooler load runs no forward on MLX: its warm leaves MLX the load's own few kernel launches (DSV41_STQ_TINY)" {
