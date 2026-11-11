@@ -9,6 +9,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1-Flash on Sushi Cooler does less host work per token**: the engine keeps hold of the model's weights
   for the whole load and finds a kernel it has already used without rebuilding its key, so the CPU has less to do
   between GPU passes.
+- **DeepSeek-V4.1-Flash sampled answers draw on Sushi Cooler without MLX**: a seed now gives a different text on Sushi
+  Cooler than on MLX, and the same text on every repeat, streamed or not.
 - **DeepSeek-V4.1-Flash greedy answers no longer depend on how tokens were drafted**: at long context a rare rounding
   difference between a single-token step and a drafted round could change a greedy answer; a token now gets the same
   result either way.

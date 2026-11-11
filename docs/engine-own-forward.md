@@ -177,9 +177,11 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 - **Not ported, refused by name**: `quantized_matmul` (a non-STQ DeepSeek pack's FP8 trunk), a matmul or a reduction
   with an empty operand, a reduction of more than 2^31 elements, a sort or a scan over an axis but the last,
   argpartition, top-k, logsumexp, a non-constant pad.
-- **Random: no key sequence of our own.** A key made by `mlx_random_key` reaches the engine by import; an unseeded
-  draw takes the bits of MLX's next key from MLX (a tiny op on MLX's queue, read back), so a seeded
-  `mlx_random_seed` run draws the same numbers on both sides.
+- **Random: the engine makes its own keys and never asks MLX.** A sampled draw's key is `random.drawKey(root, position)`,
+  a host integer mix of the request's seed (an unseeded request: one number from the OS, taken once) and the position
+  the draw predicts; a draw without a key is refused. The bar is a repeat on the engine, not MLX's bytes: the same seed
+  gives the same tokens, whatever the round widths, streamed or not, and a seed gives other tokens than on MLX. The serial
+  sampler (a request's first token, a serial tick) still draws on MLX.
 - **Only one hardware path is proven on a given box.** On an M5 the tests take the NAX tiles; `MLX_ENABLE_TF32=0`
   sends f32 through the SIMD tiles there. The half-precision SIMD tiles need a run on a pre-M5 machine.
 
@@ -222,8 +224,8 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   matrix units by lowering `Model.index_nax_keys` for one step, the split top-k on scores of its own).
 - **The sampled verdict is warmed** (`dsv41_serving.warmSampledVerdict`, after `warmKernels`): its op chain
   (`sampledDraws`, the function a round calls) runs on the engine's stream over zero logits of `[1, w, vocab]` f32 for
-  every verify width, seeded, at the four filter settings (neither, top-k 40, top-p 0.95, both) with a suppress mask. An
-  unseeded draw reaches no other pipeline and is not run, since it would advance MLX's key sequence at the load. A
+  every verify width, unseeded, at the four filter settings (neither, top-k 40, top-p 0.95, both) with a suppress mask;
+  a seeded request runs the same chain and differs only in its root. A
   request's own top-k changes only the sorted widths: the single-block sort variant (`bn`, 32 to 512) of the shortlist,
   the multi-block sort when the chunk maxima or candidates pass 2048, whether the pad runs, and `block_softmax` against
   `looped_softmax` at a shortlist over 4096; a k other than 40 can compile one of those inside a request.
@@ -291,7 +293,8 @@ name and never read partly.
 - **The round's verdict stays on the engine** (`dsv41_serving.verdictStream`): the masked argmax over the verify's
   logits is our op, so the host waits once for the picks instead of lending the logits to MLX first. A sampled round
   (temperature, top-k, top-p, seeded or not) takes the same stream: `sampler.probsAllPositions` and the draws run on
-  the engine, the sampler's code unchanged, and a seeded request draws MLX's tokens.
+  the engine, the filters unchanged and the draws under keys of the engine's own (see Random above); a round puts no
+  op on MLX and lends nothing for its draws.
 
 ## Proving a change
 

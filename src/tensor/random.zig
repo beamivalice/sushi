@@ -2,11 +2,10 @@
 //! `rbits` kernels, and the op chains of mlx/random.cpp above it (uniform from bits, Gumbel, categorical), composed op
 //! for op so the bytes are MLX's for a key. Ported from MLX (MIT, see NOTICE).
 //!
-//! No key sequence is kept here: an unseeded draw asks MLX for the bits of its next key, so the two sides share one
-//! sequence.
+//! The engine keeps no key sequence and never asks MLX for a key or for bits: a draw takes the key it is given, and the
+//! engine's own keys are `drawKey`, a pure function of a request's root and the position a draw predicts.
 
 const std = @import("std");
-const mlx = @import("../mlx.zig");
 const core = @import("core.zig");
 const ops = @import("ops.zig");
 const scan = @import("scan.zig");
@@ -31,11 +30,9 @@ fn bitsType(width: c_int) Error!Dtype {
     };
 }
 
-/// `random::bits`: `shape` of unsigned integers of `width` bytes from `key` (uint32 `[2]`), or from MLX's next key
-/// when there is none.
-pub fn bits(shape: []const c_int, width: c_int, key: ?*Tensor) Error!*Tensor {
+/// `random::bits`: `shape` of unsigned integers of `width` bytes from `k` (uint32 `[2]`).
+pub fn bits(shape: []const c_int, width: c_int, k: *Tensor) Error!*Tensor {
     const dtype = try bitsType(width);
-    const k = key orelse return nextBits(shape, width, dtype);
     if (k.dtype != .uint32 or k.ndim != 1 or k.shape[0] != 2) return error.TensorShape;
     const out = try core.fresh(dtype, shape);
     errdefer core.release(out);
@@ -57,17 +54,30 @@ pub fn bits(shape: []const c_int, width: c_int, key: ?*Tensor) Error!*Tensor {
     return out;
 }
 
-/// The bits MLX draws from its own next key: MLX makes them, and they are read back into a tensor of ours.
-fn nextBits(shape: []const c_int, width: c_int, dtype: Dtype) Error!*Tensor {
-    const stream = mlx.gpuStream();
-    defer _ = mlx.raw.mlx_stream_free(stream);
-    var drawn = mlx.raw.mlx_array_new();
-    defer _ = mlx.raw.mlx_array_free(drawn);
-    try mlx.check(mlx.raw.mlx_random_bits(&drawn, shape.ptr, shape.len, width, .{}, stream));
-    try mlx.check(mlx.rawArrayEval(drawn));
-    const n = mlx.mlx_array_size(drawn) * mlx.mlx_array_itemsize(drawn);
-    const data = mlx.mlx_array_data_uint8(drawn) orelse return error.NotEvaluated;
-    return core.fromHost(data[0..n], dtype, shape);
+/// The key of the draw that predicts generated position `position` of a request whose root is `root` (its seed, or a
+/// number the OS gave it). For one root the map from position to key is one-to-one: `x * odd` and `x + c` are
+/// bijections of u64 and `mix`, splitmix64's finalizer, is one too. Two roots share a key only where
+/// `mix(r1) + p1 * g == mix(r2) + p2 * g`, which for distinct roots and positions below 2^32 is a chance of about 2^-31.
+pub fn drawKey(root: u64, position: u64) [2]u32 {
+    const k = mix(mix(root ^ root_domain) +% position *% position_step);
+    return .{ @truncate(k), @truncate(k >> 32) };
+}
+
+const root_domain: u64 = 0x5EED_D2A5_7DEC_0DE5;
+const position_step: u64 = 0x9E37_79B9_7F4A_7C15;
+
+fn mix(x: u64) u64 {
+    var z = x;
+    z = (z ^ (z >> 30)) *% 0xBF58_476D_1CE4_E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D0_49BB_1331_11EB;
+    return z ^ (z >> 31);
+}
+
+/// `categorical` over `axis` under the key `drawKey` made.
+pub fn categoricalAt(logits: *Tensor, axis: c_int, key: [2]u32) Error!*Tensor {
+    const k = try core.fromHost(std.mem.asBytes(&key), .uint32, &.{2});
+    defer core.release(k);
+    return categorical(logits, axis, k);
 }
 
 fn fill(value: f32, dtype: Dtype) Error!*Tensor {
@@ -87,7 +97,7 @@ fn upperBound(dtype: Dtype) Error!*Tensor {
 }
 
 /// `random::uniform`: values in `[low, high)` of `shape`, built from the bits as MLX builds them.
-pub fn uniform(low: *Tensor, high: *Tensor, shape: []const c_int, dtype: Dtype, key: ?*Tensor) Error!*Tensor {
+pub fn uniform(low: *Tensor, high: *Tensor, shape: []const c_int, dtype: Dtype, key: *Tensor) Error!*Tensor {
     const lo = try ops.astype(low, dtype);
     defer core.release(lo);
     const hi = try ops.astype(high, dtype);
@@ -114,7 +124,7 @@ pub fn uniform(low: *Tensor, high: *Tensor, shape: []const c_int, dtype: Dtype, 
     return ops.binary(.add, scaled, lo);
 }
 
-fn uniformUnit(shape: []const c_int, dtype: Dtype, key: ?*Tensor) Error!*Tensor {
+fn uniformUnit(shape: []const c_int, dtype: Dtype, key: *Tensor) Error!*Tensor {
     const zero = try fill(0, dtype);
     defer core.release(zero);
     const one = try fill(1, dtype);
@@ -123,7 +133,7 @@ fn uniformUnit(shape: []const c_int, dtype: Dtype, key: ?*Tensor) Error!*Tensor 
 }
 
 /// `-log(-log(uniform))`.
-fn gumbel(shape: []const c_int, key: ?*Tensor) Error!*Tensor {
+fn gumbel(shape: []const c_int, key: *Tensor) Error!*Tensor {
     const u = try uniformUnit(shape, .float32, key);
     defer core.release(u);
     const a = try ops.unary(.log, u);
@@ -137,7 +147,7 @@ fn gumbel(shape: []const c_int, key: ?*Tensor) Error!*Tensor {
 
 /// `random::categorical` over `axis`: one draw per row of the other axes. A single row is drawn by inverse CDF, as MLX
 /// does; a block of rows by the Gumbel-max trick.
-pub fn categorical(logits: *Tensor, axis_in: c_int, key: ?*Tensor) Error!*Tensor {
+pub fn categorical(logits: *Tensor, axis_in: c_int, key: *Tensor) Error!*Tensor {
     if (logits.ndim == 0) return error.TensorShape;
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, logits.ndim) else axis_in);
     if (axis >= logits.ndim) return error.TensorShape;
@@ -165,7 +175,7 @@ pub fn categorical(logits: *Tensor, axis_in: c_int, key: ?*Tensor) Error!*Tensor
 }
 
 /// `categorical_inverse_cdf`: `shape` draws from the one row `logits`.
-fn inverseCdf(logits: *Tensor, shape: []const c_int, key: ?*Tensor) Error!*Tensor {
+fn inverseCdf(logits: *Tensor, shape: []const c_int, key: *Tensor) Error!*Tensor {
     const n: c_int = @intCast(logits.size());
     const flat = try ops.reshape(logits, &.{n});
     defer core.release(flat);

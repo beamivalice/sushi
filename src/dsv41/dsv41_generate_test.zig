@@ -427,7 +427,48 @@ test "dsv41 engine: DSpark rounds on the engine of our own say MLX's tokens at e
     }
 }
 
-test "dsv41 engine: a sampled DSpark request on the engine of our own draws MLX's tokens at every round-width mix, seeded or from MLX's key sequence, and no round lends to MLX (DSV41_STQ_TINY)" {
+/// The first word of the bits MLX would draw from its next key.
+fn mlxNextWord() !u32 {
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    var bits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bits);
+    try mlx.check(mlx.mlx_random_bits(&bits, &[_]c_int{1}, 1, 4, .{}, s));
+    try mlx.check(mlx.mlx_array_eval(bits));
+    return (mlx.mlx_array_data_uint32(bits) orelse return error.MlxArrayDataNull)[0];
+}
+
+/// One sampled DSpark request over `prompt`, at `mode`; on the engine no round lends to MLX, and the request leaves
+/// MLX's key sequence where it was.
+fn sampledRun(a: std.mem.Allocator, io: std.Io, xfm: *Trunk, tok: *Tokenizer, prompt: []const u32, want: u32, sampled: SamplingParams, mode: ?DsparkDiag, mask: ?mlx.mlx_array, on_engine: bool) !std.ArrayList(u32) {
+    const m = dsv41_state.modelOf(xfm).?;
+    m.engine_decode = on_engine;
+    defer m.engine_decode = false;
+    try xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, want, sampled, &.{}, .{ .dspark_enabled = true });
+    defer gen.deinit(a);
+    gen.sampling.suppress_mask = mask;
+    if (mode) |d| gen.dspark_diag = d;
+    var got: std.ArrayList(u32) = .empty;
+    errdefer got.deinit(a);
+    _ = mlx.mlx_random_seed(99);
+    while (true) {
+        const before = mlx.engine.stats();
+        const r = (try gen.nextDspark(a)) orelse break;
+        defer a.free(r.tokens);
+        if (on_engine) try testing.expectEqual(before.lends, mlx.engine.stats().lends);
+        try got.appendSlice(a, r.tokens);
+    }
+    try testing.expectEqual(@as(usize, want), got.items.len);
+    if (on_engine) {
+        const after = try mlxNextWord();
+        _ = mlx.mlx_random_seed(99);
+        try testing.expectEqual(try mlxNextWord(), after);
+    }
+    return got;
+}
+
+test "dsv41 engine: a sampled DSpark request on the engine of our own repeats at every round-width mix, a seed or a root of its own gives other tokens, and no round touches MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
@@ -458,12 +499,6 @@ test "dsv41 engine: a sampled DSpark request on the engine of our own draws MLX'
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 60;
-    // A seeded draw is keyed by its position, so every round mix says the same tokens; an unseeded one takes MLX's next
-    // key, so MLX and the engine are compared at the same mix.
-    var seeded_ref: std.ArrayList(u32) = .empty;
-    defer seeded_ref.deinit(a);
-    var mlx_ref: std.ArrayList(u32) = .empty;
-    defer mlx_ref.deinit(a);
     const modes = [_]?DsparkDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep, null };
     // Every seventh id suppressed: the mask is the model's own array, which the engine imports.
     const vocab: usize = m.cfg.vocab;
@@ -472,35 +507,54 @@ test "dsv41 engine: a sampled DSpark request on the engine of our own draws MLX'
     for (flags, 0..) |*f, id| f.* = id % 7 == 0;
     const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(vocab)}, 1, .bool_);
     defer _ = mlx.mlx_array_free(mask);
-    for ([_]?u64{ 7, null }) |seed| for ([_]bool{ false, true }) |masked| for (modes) |mode| for ([_]bool{ false, true }) |on_engine| {
-        if (seed == null and mode == null) continue;
-        const sampled = SamplingParams{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = seed };
-        _ = mlx.mlx_random_seed(99);
-        m.engine_decode = on_engine;
-        defer m.engine_decode = false;
-        try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, sampled, &.{}, .{ .dspark_enabled = true });
-        defer gen.deinit(a);
-        if (masked) gen.sampling.suppress_mask = mask;
-        if (mode) |d| gen.dspark_diag = d;
-        var got: std.ArrayList(u32) = .empty;
+
+    // A seeded draw is keyed by its position, so every round mix says the same tokens, on each route by its own keys.
+    var engine_ref: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    var mlx_ref: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&engine_ref) |*r| r.deinit(a);
+    defer for (&mlx_ref) |*r| r.deinit(a);
+    const sampled = SamplingParams{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
+    for ([_]bool{ false, true }) |masked| for (modes) |mode| for ([_]bool{ true, false }) |on_engine| {
+        var got = try sampledRun(a, io, &xfm, &tok, prompt, want, sampled, mode, if (masked) mask else null, on_engine);
         defer got.deinit(a);
-        while (true) {
-            const lends = mlx.engine.stats().lends;
-            const r = (try gen.nextDspark(a)) orelse break;
-            defer a.free(r.tokens);
-            if (on_engine) try testing.expectEqual(lends, mlx.engine.stats().lends);
-            try got.appendSlice(a, r.tokens);
-        }
-        try testing.expectEqual(@as(usize, want), got.items.len);
-        if (!on_engine) {
-            mlx_ref.clearRetainingCapacity();
-            try mlx_ref.appendSlice(a, got.items);
-        } else try testing.expectEqualSlices(u32, mlx_ref.items, got.items);
-        if (seed != null and !masked) {
-            if (seeded_ref.items.len == 0) try seeded_ref.appendSlice(a, got.items) else try testing.expectEqualSlices(u32, seeded_ref.items, got.items);
-        }
+        const ref = &(if (on_engine) engine_ref else mlx_ref)[@intFromBool(masked)];
+        if (ref.items.len == 0) try ref.appendSlice(a, got.items) else try testing.expectEqualSlices(u32, ref.items, got.items);
     };
+    // A request that stops sooner is a prefix: how a stream ends moves no draw.
+    var short = try sampledRun(a, io, &xfm, &tok, prompt, 37, sampled, .sweep, null, true);
+    defer short.deinit(a);
+    try testing.expectEqualSlices(u32, engine_ref[0].items[0..37], short.items);
+
+    // Another seed, and two requests with none, draw other tokens (the first token is the serial sampler's, on MLX).
+    var other = try sampledRun(a, io, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 8 }, .{ .rows = 3 }, null, true);
+    defer other.deinit(a);
+    try testing.expect(!std.mem.eql(u32, engine_ref[0].items[1..], other.items[1..]));
+    var unseeded: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&unseeded) |*r| r.deinit(a);
+    for (&unseeded) |*r| r.* = try sampledRun(a, io, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95 }, .{ .rows = 3 }, null, true);
+    try testing.expect(!std.mem.eql(u32, unseeded[0].items[1..], unseeded[1].items[1..]));
+    try testing.expect(!std.mem.eql(u32, engine_ref[0].items[1..], unseeded[0].items[1..]));
+
+    // The verdict itself puts no op on MLX and lends nothing, seeded or not, with a mask or without.
+    m.engine_decode = true;
+    defer m.engine_decode = false;
+    const rows = 4;
+    var host: [rows * 64]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 2654435761) % 1000)) / 250.0;
+    const logits = mlx.mlx_array_new_data(&host, &[_]c_int{ 1, rows, 64 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const drafts = [_]u32{ 3, 9, 20 };
+    for ([_]?u64{ 7, null }) |seed| {
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = seed }, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        const before = mlx.engine.stats();
+        const ops = mlx.engine.mlx_ops;
+        const verdict = try dsv41_dspark.dsparkSampledVerdict(&gen, logits, &drafts);
+        try testing.expect(verdict.accepted <= drafts.len);
+        try testing.expectEqual(ops, mlx.engine.mlx_ops);
+        try testing.expectEqual(before.lends, mlx.engine.stats().lends);
+    }
 }
 
 test "dsv41 generator: a seeded sampled request verifies at one width whatever the cost model says (DSV41_STQ_TINY)" {
@@ -1797,7 +1851,7 @@ test "dsv41 engine: the load's warm makes the split top-k a one-row step takes o
     try testing.expectEqual(late, mlx.engine.latePipelines());
 }
 
-test "dsv41 engine: after the load's warm a seeded sampled DSpark request compiles no kernel, at any filter setting or with a suppress mask (DSV41_STQ_TINY)" {
+test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or not, compiles no kernel, at any filter setting or with a suppress mask (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
@@ -1837,8 +1891,8 @@ test "dsv41 engine: after the load's warm a seeded sampled DSpark request compil
     for (flags, 0..) |*f, id| f.* = id % 7 == 0;
     const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(m.cfg.vocab)}, 1, .bool_);
     defer _ = mlx.mlx_array_free(mask);
-    for ([_]bool{ false, true }) |masked| for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
-        const sampled = SamplingParams{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .seed = 7 };
+    for ([_]?u64{ 7, null }) |seed| for ([_]bool{ false, true }) |masked| for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
+        const sampled = SamplingParams{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .seed = seed };
         try xfm.resetCache();
         var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, sampled, &.{}, .{ .dspark_enabled = true });
         defer gen.deinit(a);

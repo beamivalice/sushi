@@ -556,6 +556,8 @@ pub const Generator = struct {
     /// Forces the verify width (the `SUSHI_DSV41_DSPARK_ROWS` diagnostic, and the tests).
     dspark_diag: dspark_rows.Diag = .off,
     dspark_policy: dspark_rows.Policy = .{},
+    /// The root of the engine's draw keys for a request with no seed, taken from the OS at its first sampled round.
+    dspark_root: ?u64 = null,
     /// A DSpark round commits through the first draft with this id and no further, so the request's state
     /// stands right behind it for the scheduler to checkpoint. The scheduler clears it once taken.
     dspark_round_ends_at: ?u32 = null,

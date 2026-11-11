@@ -396,11 +396,12 @@ pub fn dsparkEmitPending(self: *Generator, allocator: std.mem.Allocator) !?u32 {
 }
 
 /// The longest prefix of point-mass `drafts` that the verify rows' own draws reproduce, and the draw after it. Row
-/// j draws with the key of the generated position it predicts, so the tokens are the serial sampler's whatever the
-/// round mix. A point-mass draft survives a draw of the row's density with probability p(draft): the exact rule.
+/// j draws with the key of the generated position it predicts, so the tokens are the same whatever the round mix. A
+/// point-mass draft survives a draw of the row's density with probability p(draft): the exact rule.
 pub fn dsparkSampledVerdict(self: *Generator, logits: mlx.mlx_array, drafts: []const u32) !struct { accepted: u32, pending: u32 } {
     const s = dsv41_serving.verdictStream(self.xfm, self.xfm.s);
-    const flat = try dsv41_serving.sampledDraws(self.sampling, logits, drafts.len + 1, s);
+    const root: ?u64 = if (mlx.engine.isStream(s)) try dsparkDrawRoot(self) else null;
+    const flat = try dsv41_serving.sampledDraws(self.sampling, root, logits, drafts.len + 1, s);
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_array_eval(flat));
     const drawn = mlx.mlx_array_data_int32(flat) orelse return error.MlxArrayDataNull;
@@ -408,6 +409,17 @@ pub fn dsparkSampledVerdict(self: *Generator, logits: mlx.mlx_array, drafts: []c
     while (accepted < drafts.len and @as(u32, @intCast(drawn[accepted])) == drafts[accepted]) accepted += 1;
     self.sampling.draw +%= accepted + 1;
     return .{ .accepted = accepted, .pending = @intCast(drawn[accepted]) };
+}
+
+/// The root of the engine's draw keys: the request's seed, else one number from the OS, taken once per request.
+fn dsparkDrawRoot(self: *Generator) !u64 {
+    if (self.sampling.seed) |seed| return seed;
+    if (self.dspark_root == null) {
+        var bytes: [8]u8 = undefined;
+        try self.timer.io.randomSecure(&bytes);
+        self.dspark_root = std.mem.readInt(u64, &bytes, .little);
+    }
+    return self.dspark_root.?;
 }
 
 pub const DsparkResume = dspark_rows.Resume;

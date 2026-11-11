@@ -18,6 +18,7 @@ const log = @import("../log.zig");
 const manifest_mod = @import("../pipeline_manifest.zig");
 const load_clock = @import("../load_clock.zig");
 const sampler = @import("../sampler.zig");
+const random = @import("../tensor/random.zig");
 const spec_types = @import("../spec_types.zig");
 const io_util_mod = @import("../io_util.zig");
 const sched_policy = @import("../sched_policy.zig");
@@ -146,10 +147,11 @@ pub fn beginPipelines(allocator: std.mem.Allocator, config: *const ModelConfig, 
 }
 
 /// The draws of a sampled round: `rows` verify rows of `logits` (`[1, >= rows, vocab]`) filtered by `sampling` and
-/// drawn one per row, row j under the key of draw `sampling.draw + j`, gathered as one `[rows]` array not yet
+/// drawn one per row, row j for the generated position `sampling.draw + j`, gathered as one `[rows]` array not yet
 /// evaluated. On the engine's stream the gathering vector is an engine vector, which the engine makes only while it
-/// is active.
-pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+/// is active, and a row's key is `random.drawKey(root, position)`: `root` is the request's seed or its OS-given root,
+/// and MLX is not asked for a key or bits. On MLX's stream `root` is null and the sampler keys by `sampling.seed`.
+pub fn sampledDraws(sampling: sampler.SamplingParams, root: ?u64, logits: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const own = mlx.engine.isStream(s);
     if (own) mlx.engine.active = true;
     defer if (own) {
@@ -175,7 +177,7 @@ pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, row
         try mlx.check(mlx.mlx_slice(&row, rows2d, &.{ at, 0 }, 2, &.{ at + 1, vocab }, 2, &.{ 1, 1 }, 2, s));
         var keyed = sampling;
         keyed.draw +%= j;
-        draws[built] = try sampler.sampleFromProbsLazy(row, keyed, s);
+        draws[built] = if (own) try engineDraw(row, random.drawKey(root orelse return error.EngineDrawNeedsRoot, keyed.draw), s) else try sampler.sampleFromProbsLazy(row, keyed, s);
         built += 1;
         _ = mlx.mlx_vector_array_append_value(vec, draws[j]);
     }
@@ -185,10 +187,23 @@ pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, row
     return flat;
 }
 
+/// `sampler.sampleFromProbsLazy` on the engine under a key of its own.
+fn engineDraw(probs: mlx.mlx_array, key: [2]u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    var logp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logp);
+    try mlx.check(mlx.mlx_log(&logp, probs, s));
+    var drawn = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(drawn);
+    try mlx.check(mlx.engine.categoricalAt(&drawn, logp, key));
+    return drawn;
+}
+
+const warm_root: u64 = 1;
+
 /// The sampled verdict's chain on the engine, over every verify width and the four filter settings with a suppress
-/// mask, seeded: each stock pipeline it launches compiles here, not inside a request. The unseeded path reaches no
-/// pipeline this does not (its bits come from MLX's next key); it is left out so the load does not advance MLX's key
-/// sequence. A request's own top-k only changes the shapes the sorts run at, and so which block-sort variants.
+/// mask: each stock pipeline it launches compiles here, not inside a request. A seeded and an unseeded request run the
+/// same chain (they differ in the root only), so the warm runs it unseeded. A request's own top-k only changes the
+/// shapes the sorts run at, and so which block-sort variants.
 pub fn warmSampledVerdict(mdl: *dsv41_model.Model) !void {
     if (!mdl.engine_decode or mdl.dspark == null) return;
     const s = mlx.engine.stream();
@@ -201,8 +216,8 @@ pub fn warmSampledVerdict(mdl: *dsv41_model.Model) !void {
         defer _ = mlx.mlx_array_free(logits);
         try mlx.check(mlx.mlx_zeros(&logits, &[_]c_int{ 1, @intCast(rows), vocab }, 3, .float32, s));
         for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
-            const sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .seed = 1, .suppress_mask = mask };
-            const draws = try sampledDraws(sampling, logits, rows, s);
+            const sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .suppress_mask = mask };
+            const draws = try sampledDraws(sampling, warm_root, logits, rows, s);
             defer _ = mlx.mlx_array_free(draws);
             try mlx.check(mlx.mlx_array_eval(draws));
         }
