@@ -7,6 +7,8 @@ const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const cli_error = @import("cli_error.zig");
 const gpu_clock = @import("gpu_clock.zig");
+const gpu_live = @import("gpu_clock_live.zig");
+const energy = @import("energy.zig");
 const box = @import("bench_box.zig");
 const completions = @import("completions.zig");
 const server_mod = @import("server.zig");
@@ -42,6 +44,10 @@ pub const USAGE =
     \\prefix cache is a private directory under --out, removed at the end unless --out names the run. The run ends
     \\with a table of prefill, decode and mode by arm and rung.
     \\--url drives a server somebody else booted (tests/bench.sh boots it and takes the box rules) and reads its log.
+    \\
+    \\Beside the tok/s it reports energy per token: this process's CPU mJ, CPU ms and millions of instructions
+    \\(with --model only), and the whole machine's GPU mJ with its mean MHz as a record. A Mac without the library
+    \\behind the GPU reading still runs and says so.
     \\
     \\Either way it reads the GPU clock and thermal pressure beside every request, with no sudo, and
     \\stops with an error when the busy clock is throttled (at most 1100 MHz); the pressure level is recorded only.
@@ -385,6 +391,8 @@ pub const Sample = struct {
     gpu_pressure: ?gpu_clock.Pressure = null,
     /// The server ended the request through its repetition-loop stop, so fewer tokens than asked is expected.
     loop_stop: bool = false,
+    /// What the request spent, cut at the end of its prefill; null when the run did not measure energy.
+    energy: ?SampleEnergy = null,
 
     pub fn newTokens(s: Sample) u32 {
         return s.prompt_n -| s.cached_n;
@@ -407,6 +415,180 @@ pub const Sample = struct {
     /// Request wall time up to the first token: everything but the decode after it.
     pub fn ttftMs(s: Sample) f64 {
         return @max(s.wall_ms - s.predicted_ms, 0);
+    }
+};
+
+// ── Energy per token ────────────────────────────────────────────────────
+
+/// One phase's own-process CPU, raw and per token. Null is a reading that is not there, never 0.
+pub const Cut = struct {
+    tokens: u32 = 0,
+    cpu_nj: ?u64 = null,
+    cpu_ns: ?u64 = null,
+    instructions: ?u64 = null,
+    cpu_mj_per_token: ?f64 = null,
+    cpu_ms_per_token: ?f64 = null,
+    instructions_per_token: ?f64 = null,
+};
+
+/// The GPU's energy is the whole machine's, so it belongs to a phase only when the request had just that one.
+pub const GpuPhase = enum { prefill, decode, mixed };
+
+pub const SampleEnergy = struct {
+    prefill: Cut = .{},
+    decode: Cut = .{},
+    gpu_phase: GpuPhase = .mixed,
+    gpu_nj: ?u64 = null,
+    gpu_mj_per_token: ?f64 = null,
+    gpu_mean_mhz: ?f64 = null,
+};
+
+/// Why a reading is missing: once per run when it could not be opened (an empty reason means it was taken), and a count
+/// of the requests that lost it mid-run.
+pub const EnergyNote = struct {
+    measured: bool = false,
+    cpu_unavailable: []const u8 = "",
+    gpu_unavailable: []const u8 = "",
+    clock_unavailable: []const u8 = "",
+    requests: u32 = 0,
+    cpu_failed: u32 = 0,
+    gpu_failed: u32 = 0,
+    clock_failed: u32 = 0,
+};
+
+pub const Bounds = struct { prefill_from: u64, boundary: u64 };
+
+fn msToNs(ms: f64) u64 {
+    return if (ms > 0) @intFromFloat(@round(ms * 1e6)) else 0;
+}
+
+/// The request's phases, anchored on its end: decode is the scheduler's decode time, prefill the time before it.
+fn bounds(t0: u64, t_end: u64, prefill_ns: u64, predicted_ns: u64) Bounds {
+    const boundary = @max(t_end -| predicted_ns, t0);
+    return .{ .prefill_from = @max(boundary -| prefill_ns, t0), .boundary = boundary };
+}
+
+fn cutOf(win: ?energy.Cpu, tokens: u32) Cut {
+    const w = win orelse return .{ .tokens = tokens };
+    const per = energy.perToken(w, tokens);
+    return .{
+        .tokens = tokens,
+        .cpu_nj = w.nj,
+        .cpu_ns = w.ns,
+        .instructions = w.instructions,
+        .cpu_mj_per_token = if (per) |p| p.cpu_mj else null,
+        .cpu_ms_per_token = if (per) |p| p.cpu_ms else null,
+        .instructions_per_token = if (per) |p| p.instructions else null,
+    };
+}
+
+fn gpuPhase(s: Sample) GpuPhase {
+    if (s.max_tokens <= 1) return .prefill;
+    return if (s.kind == .repeat) .decode else .mixed;
+}
+
+/// The energy readers of a run. Each is optional on its own: a missing one leaves its reason in `note` and its cells
+/// n/a, and nothing else stops.
+const Meter = struct {
+    io: std.Io,
+    cpu: ?*energy.CpuTimeline = null,
+    gpu: energy.Gpu,
+    clock: ?gpu_live.Reader = null,
+    note: EnergyNote,
+    /// Which readings the request in flight lost.
+    lost: struct { cpu: bool = false, gpu: bool = false, clock: bool = false } = .{},
+
+    const Mark = struct { t_ns: u64, gpu_nj: ?u64 };
+    const End = struct { t0: u64, t_end: u64, gpu_nj: ?u64, mhz: ?f64 };
+
+    /// `in_process`: the model is loaded in this process, so its CPU is the one `proc_pid_rusage` reads.
+    fn start(gpa: std.mem.Allocator, io: std.Io, in_process: bool) Meter {
+        var m: Meter = .{ .io = io, .gpu = energy.openGpuLive(), .note = .{ .measured = true } };
+        switch (m.gpu) {
+            .unavailable => |why| m.note.gpu_unavailable = why,
+            .source => {},
+        }
+        m.clock = gpu_live.Reader.open();
+        if (m.clock == null) m.note.clock_unavailable = "the IOReport GPU clock could not be read";
+        if (!in_process) {
+            m.note.cpu_unavailable = "the server is another process; --model loads it in this one";
+        } else if (energy.CpuTimeline.start(gpa, io)) |tl| {
+            m.cpu = tl;
+        } else |_| {
+            m.note.cpu_unavailable = "proc_pid_rusage gave no energy or instruction counters";
+        }
+        return m;
+    }
+
+    fn stop(m: *Meter) void {
+        if (m.cpu) |c| c.stop();
+    }
+
+    fn readGpu(m: *Meter) ?u64 {
+        return switch (m.gpu) {
+            .source => |g| g.read(g.ctx),
+            .unavailable => null,
+        };
+    }
+
+    fn begin(m: *Meter) Mark {
+        m.lost = .{};
+        if (m.cpu) |c| {
+            if (!c.begin()) m.lost.cpu = true;
+        }
+        if (m.clock) |*r| {
+            if (r.sample() == null) m.lost.clock = true;
+        }
+        const gpu = m.readGpu();
+        return .{ .t_ns = energy.nowNs(m.io), .gpu_nj = gpu };
+    }
+
+    /// Called the moment the request returns.
+    fn end(m: *Meter, mark: Mark) End {
+        const t_end = energy.nowNs(m.io);
+        const after = m.readGpu();
+        var mhz: ?f64 = null;
+        if (m.clock) |*r| {
+            if (r.sample()) |v| {
+                if (v > 0) mhz = @floatFromInt(v);
+            } else m.lost.clock = true;
+        }
+        if (m.cpu) |c| {
+            if (!c.mark()) m.lost.cpu = true;
+        }
+        const spent: ?u64 = if (mark.gpu_nj != null and after != null and after.? >= mark.gpu_nj.?) after.? - mark.gpu_nj.? else null;
+        if (m.gpu == .source and spent == null) m.lost.gpu = true;
+        return .{ .t0 = mark.t_ns, .t_end = t_end, .gpu_nj = spent, .mhz = mhz };
+    }
+
+    /// The CPU spent in one phase of the request; null without a timeline, where it does not cover the phase, and
+    /// for a phase that spent tokens in no time.
+    fn phase(m: *Meter, from_ns: u64, to_ns: u64, tokens: u32) ?energy.Cpu {
+        const c = m.cpu orelse return null;
+        if (tokens > 0 and to_ns <= from_ns) return null;
+        return c.window(from_ns, to_ns) orelse {
+            m.lost.cpu = true;
+            return null;
+        };
+    }
+
+    /// The request's energy split by the scheduler's own phase times.
+    fn attribute(m: *Meter, e: End, s: Sample) SampleEnergy {
+        const b = bounds(e.t0, e.t_end, msToNs(s.prefillMs()), msToNs(s.predicted_ms));
+        var out: SampleEnergy = .{ .gpu_phase = gpuPhase(s), .gpu_nj = e.gpu_nj, .gpu_mean_mhz = e.mhz };
+        out.prefill = cutOf(m.phase(b.prefill_from, b.boundary, s.newTokens()), s.newTokens());
+        out.decode = cutOf(m.phase(b.boundary, e.t_end, s.completion_n), s.completion_n);
+        const tokens: u32 = switch (out.gpu_phase) {
+            .prefill => s.newTokens(),
+            .decode => s.completion_n,
+            .mixed => 0,
+        };
+        if (e.gpu_nj) |nj| out.gpu_mj_per_token = energy.gpuMjPerToken(nj, tokens);
+        m.note.requests += 1;
+        if (m.lost.cpu) m.note.cpu_failed += 1;
+        if (m.lost.gpu) m.note.gpu_failed += 1;
+        if (m.lost.clock) m.note.clock_failed += 1;
+        return out;
     }
 };
 
@@ -540,6 +722,7 @@ pub const Report = struct {
     cooldown: ?box.Cooldown = null,
     /// Requests went to the scheduler in this process, not over HTTP.
     in_process: bool = false,
+    energy: EnergyNote = .{},
 };
 
 fn writeThousands(w: *std.Io.Writer, v: f64) !void {
@@ -564,6 +747,7 @@ const RungRow = struct {
     modes: [samples_per_rung][]const u8 = @splat(""),
     mhz: [samples_per_rung]f64 = @splat(0),
     pressure: [samples_per_rung]?gpu_clock.Pressure = @splat(null),
+    energy: [samples_per_rung]?SampleEnergy = @splat(null),
 };
 
 /// The worst of the pressure levels, null when none was read.
@@ -608,9 +792,95 @@ fn rungRows(allocator: std.mem.Allocator, samples: []const Sample, arm: Arm) !st
         row.modes[row.n] = s.mode;
         row.mhz[row.n] = s.gpu_mhz;
         row.pressure[row.n] = s.gpu_pressure;
+        row.energy[row.n] = s.energy;
         row.n += 1;
     }
     return rows;
+}
+
+// ── Energy cells ────────────────────────────────────────────────────────
+
+fn medianOpt(vals: []const ?f64) ?f64 {
+    var seen: [samples_per_rung]f64 = undefined;
+    var n: usize = 0;
+    for (vals) |v| if (v) |x| {
+        if (n == seen.len) break;
+        seen[n] = x;
+        n += 1;
+    };
+    return if (n == 0) null else median(seen[0..n]);
+}
+
+fn cellText(buf: []u8, v: ?f64, scale: f64, comptime fmt: []const u8) []const u8 {
+    const x = v orelse return "n/a";
+    return std.fmt.bufPrint(buf, fmt, .{x / scale}) catch "n/a";
+}
+
+fn writePadded(w: *std.Io.Writer, text: []const u8, width: usize) !void {
+    var pad = width -| text.len;
+    while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+    try w.writeAll(text);
+}
+
+/// The three CPU cells of a phase, the ones a change is judged by: mJ, ms and millions of instructions per token.
+fn writeCpuCells(w: *std.Io.Writer, mj: ?f64, ms: ?f64, instr: ?f64, md: bool) !void {
+    var b: [3][32]u8 = undefined;
+    const t = [3][]const u8{ cellText(&b[0], mj, 1, "{d:.2}"), cellText(&b[1], ms, 1, "{d:.3}"), cellText(&b[2], instr, 1e6, "{d:.3}") };
+    for (t, [3]usize{ 8, 8, 9 }) |text, width| {
+        if (md) try w.print(" {s} |", .{text}) else try writePadded(w, text, width + 1);
+    }
+}
+
+/// The GPU record cells: energy per token and the mean clock over the same request.
+fn writeGpuRecord(w: *std.Io.Writer, mj: ?f64, mhz: ?f64, md: bool) !void {
+    var b: [2][32]u8 = undefined;
+    const t = [2][]const u8{ cellText(&b[0], mj, 1, "{d:.1}"), cellText(&b[1], mhz, 1, "{d:.0}") };
+    for (t, [2]usize{ 8, 5 }) |text, width| {
+        if (md) try w.print(" {s} |", .{text}) else try writePadded(w, text, width + 1);
+    }
+}
+
+fn prefillGpu(e: ?SampleEnergy) struct { mj: ?f64, mhz: ?f64 } {
+    const x = e orelse return .{ .mj = null, .mhz = null };
+    return if (x.gpu_phase == .prefill) .{ .mj = x.gpu_mj_per_token, .mhz = x.gpu_mean_mhz } else .{ .mj = null, .mhz = null };
+}
+
+/// A rung's decode energy: the median over its samples; the GPU record only from samples that were decode alone.
+const DecodeEnergy = struct { mj: ?f64, ms: ?f64, instr: ?f64, gpu_mj: ?f64, gpu_mhz: ?f64 };
+
+fn decodeEnergy(row: RungRow) DecodeEnergy {
+    var mj: [samples_per_rung]?f64 = @splat(null);
+    var ms = mj;
+    var instr = mj;
+    var gmj = mj;
+    var gmhz = mj;
+    for (row.energy[0..row.n], 0..) |maybe, i| {
+        const e = maybe orelse continue;
+        mj[i] = e.decode.cpu_mj_per_token;
+        ms[i] = e.decode.cpu_ms_per_token;
+        instr[i] = e.decode.instructions_per_token;
+        if (e.gpu_phase == .decode) {
+            gmj[i] = e.gpu_mj_per_token;
+            gmhz[i] = e.gpu_mean_mhz;
+        }
+    }
+    return .{ .mj = medianOpt(&mj), .ms = medianOpt(&ms), .instr = medianOpt(&instr), .gpu_mj = medianOpt(&gmj), .gpu_mhz = medianOpt(&gmhz) };
+}
+
+const energy_legend = "Energy per token (p = prefill, d = decode): CPU mJ, CPU ms and Minstr (millions of instructions) are this process's own work, " ++
+    "cut where the prefill ends; the GPU cells are the whole machine's GPU energy over a request that is only a prefill, or a decode repeat " ++
+    "(its restore and short prefill included), beside its mean GPU MHz. " ++
+    "GPU energy per token rises with the GPU clock and is a record, not a quality or efficiency score.";
+
+fn writeEnergyNotes(w: *std.Io.Writer, note: EnergyNote) !void {
+    try w.writeAll(energy_legend);
+    try w.writeAll("\n");
+    if (note.cpu_unavailable.len > 0) try w.print("CPU energy unavailable: {s}.\n", .{note.cpu_unavailable});
+    if (note.gpu_unavailable.len > 0) try w.print("GPU energy unavailable: {s}.\n", .{note.gpu_unavailable});
+    if (note.clock_unavailable.len > 0) try w.print("GPU clock unavailable: {s}.\n", .{note.clock_unavailable});
+    if (note.cpu_failed > 0) try w.print("CPU energy read failed on {d} of {d} requests.\n", .{ note.cpu_failed, note.requests });
+    if (note.gpu_failed > 0) try w.print("GPU energy read failed on {d} of {d} requests.\n", .{ note.gpu_failed, note.requests });
+    if (note.clock_failed > 0) try w.print("GPU clock read failed on {d} of {d} requests.\n", .{ note.clock_failed, note.requests });
 }
 
 fn writeDecodeCells(w: *std.Io.Writer, row: ?RungRow, gpu: bool) !void {
@@ -639,9 +909,15 @@ fn findRow(rows: []const RungRow, len: usize) ?RungRow {
     return null;
 }
 
-fn writeWindows(w: *std.Io.Writer, samples: []const Sample, arm: Arm) !void {
+fn writeWindows(w: *std.Io.Writer, samples: []const Sample, arm: Arm, measured: bool) !void {
     const gpu = armHasGpu(samples, arm);
-    try w.print("\n## Prefill by window, {s} (tok/s)\n\n| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s |{s}\n|---|---:|---:|---:|---:|---:|{s}\n", .{ @tagName(arm), if (gpu) " GPU MHz | Pressure |" else "", if (gpu) "---:|---|" else "" });
+    try w.print("\n## Prefill by window, {s} (tok/s)\n\n| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s |{s}{s}\n|---|---:|---:|---:|---:|---:|{s}{s}\n", .{
+        @tagName(arm),
+        if (gpu) " GPU MHz | Pressure |" else "",
+        if (measured) " CPU mJ/t | CPU ms/t | Minstr/t | GPU mJ/t | GPU mean MHz |" else "",
+        if (gpu) "---:|---|" else "",
+        if (measured) "---:|---:|---:|---:|---:|" else "",
+    });
     for (samples) |s| {
         if (s.arm != arm or s.kind != .ladder) continue;
         try w.writeAll("| ");
@@ -656,6 +932,26 @@ fn writeWindows(w: *std.Io.Writer, samples: []const Sample, arm: Arm) !void {
         try writeThousands(w, s.prefillTps());
         try w.print(" | {d:.0} | {d:.2} |", .{ s.restore_ms, s.ttftMs() / 1000.0 });
         if (gpu) try writeGpuCells(w, s.gpu_mhz, s.gpu_pressure);
+        if (measured) {
+            const e = s.energy;
+            const p = if (e) |x| x.prefill else Cut{};
+            try writeCpuCells(w, p.cpu_mj_per_token, p.cpu_ms_per_token, p.instructions_per_token, true);
+            const g = prefillGpu(e);
+            try writeGpuRecord(w, g.mj, g.mhz, true);
+        }
+        try w.writeAll("\n");
+    }
+}
+
+fn writeDecodeEnergy(w: *std.Io.Writer, name: []const u8, rows: []const RungRow) !void {
+    try w.print("\nDecode energy per token, {s} arm (median of the rung's samples):\n\n| Rung | CPU mJ/t | CPU ms/t | Minstr/t | GPU mJ/t | GPU mean MHz |\n|---|---:|---:|---:|---:|---:|\n", .{name});
+    for (rows) |row| {
+        const d = decodeEnergy(row);
+        try w.writeAll("| ");
+        try writeRungLabel(w, row.len);
+        try w.writeAll(" |");
+        try writeCpuCells(w, d.mj, d.ms, d.instr, true);
+        try writeGpuRecord(w, d.gpu_mj, d.gpu_mhz, true);
         try w.writeAll("\n");
     }
 }
@@ -684,10 +980,16 @@ fn problemText(p: Problem) []const u8 {
 /// The end-of-run table of an in-process bench: for each arm and decode rung, the window that ends at the rung
 /// (what it restored, its prefill rate and time to first token) beside the rung's median decode and its mode.
 pub fn renderTable(allocator: std.mem.Allocator, samples: []const Sample) ![]u8 {
+    return renderTableNote(allocator, samples, .{});
+}
+
+pub fn renderTableNote(allocator: std.mem.Allocator, samples: []const Sample, note: EnergyNote) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.writeAll("arm    rung   restored  prefill tok/s  ttft s  decode tok/s  mode\n");
+    try w.writeAll("arm    rung   restored  prefill tok/s  ttft s  decode tok/s  mode");
+    if (note.measured) try w.writeAll("   | p:CPU mJ/t CPU ms/t Minstr/t | d:CPU mJ/t CPU ms/t Minstr/t | p:GPU mJ/t   MHz | d:GPU mJ/t   MHz");
+    try w.writeAll("\n");
     for ([_]Arm{ .code, .prose }) |arm| {
         var rows = try rungRows(allocator, samples, arm);
         defer rows.deinit(allocator);
@@ -699,7 +1001,7 @@ pub fn renderTable(allocator: std.mem.Allocator, samples: []const Sample) ![]u8 
             var prefill: [24]u8 = undefined;
             var pw = std.Io.Writer.fixed(&prefill);
             try writeThousands(&pw, ladder.prefillTps());
-            try w.print("{s:<6} {s:<5}  {d:>8}  {s:>13}  {d:>6.2}  {d:>12.1}  {s}\n", .{
+            try w.print("{s:<6} {s:<5}  {d:>8}  {s:>13}  {d:>6.2}  {d:>12.1}  {s}", .{
                 @tagName(arm),
                 try std.fmt.bufPrint(&rung, "{d}k", .{row.len / 1024}),
                 ladder.cached_n,
@@ -708,7 +1010,25 @@ pub fn renderTable(allocator: std.mem.Allocator, samples: []const Sample) ![]u8 
                 median(row.tps[0..row.n]),
                 modeLabel(row),
             });
+            if (note.measured) {
+                const p = if (ladder.energy) |e| e.prefill else Cut{};
+                const d = decodeEnergy(row);
+                const g = prefillGpu(ladder.energy);
+                try w.writeAll("   |");
+                try writeCpuCells(w, p.cpu_mj_per_token, p.cpu_ms_per_token, p.instructions_per_token, false);
+                try w.writeAll(" |");
+                try writeCpuCells(w, d.mj, d.ms, d.instr, false);
+                try w.writeAll(" |");
+                try writeGpuRecord(w, g.mj, g.mhz, false);
+                try w.writeAll(" |");
+                try writeGpuRecord(w, d.gpu_mj, d.gpu_mhz, false);
+            }
+            try w.writeAll("\n");
         }
+    }
+    if (note.measured) {
+        try w.writeAll("\n");
+        try writeEnergyNotes(w, note);
     }
     var any = false;
     for (samples) |s| {
@@ -784,8 +1104,15 @@ pub fn render(allocator: std.mem.Allocator, rep: Report) ![]u8 {
         try w.writeAll("\n");
     }
 
-    try writeWindows(w, rep.samples, .code);
-    if (has_prose) try writeWindows(w, rep.samples, .prose);
+    const measured = rep.energy.measured;
+    try writeWindows(w, rep.samples, .code, measured);
+    if (has_prose) try writeWindows(w, rep.samples, .prose, measured);
+    if (measured) {
+        try w.writeAll("\n## Decode energy per token\n\n");
+        try writeEnergyNotes(w, rep.energy);
+        try writeDecodeEnergy(w, "code", code.items);
+        if (has_prose) try writeDecodeEnergy(w, "prose", prose.items);
+    }
 
     try w.writeAll("\n## Summary rows\n\nPrefill is the window that ends at the rung; decode is the median of the samples. The code rows are the ones to compare across releases.\n\n| Sushi |  |");
     for (code.items) |row| {
@@ -878,15 +1205,41 @@ fn printOut(io: std.Io, text: []const u8) !void {
     try w.interface.flush();
 }
 
+/// One timed request. Its times are read before the energy meter takes its end readings, so those never count as
+/// time to first token.
+const Span = struct {
+    io: std.Io,
+    meter: *Meter,
+    mark: Meter.Mark,
+    wall: io_util.Stopwatch,
+    started_ms: i64,
+
+    const Done = struct { started_ms: i64, ended_ms: i64, wall_ms: f64, spent: Meter.End };
+
+    fn open(io: std.Io, meter: *Meter) Span {
+        const mark = meter.begin();
+        return .{ .io = io, .meter = meter, .mark = mark, .wall = io_util.Stopwatch.init(io), .started_ms = io_util.nowMsMonotonic(io) };
+    }
+
+    fn close(self: *Span) Done {
+        const ended_ms = io_util.nowMsMonotonic(self.io);
+        const wall_ms = @as(f64, @floatFromInt(self.wall.read())) / std.time.ns_per_ms;
+        const spent = self.meter.end(self.mark);
+        return .{ .started_ms = self.started_ms, .ended_ms = ended_ms, .wall_ms = wall_ms, .spent = spent };
+    }
+};
+
 /// One request of the plan: send the prompt, then read what the server logged for it (the restore line always
 /// lands, the speculative mode only on a decode) a moment after the response.
-fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, model: []const u8, log_path: []const u8, ids: []const u32, req: Request, arm: Arm, log_len: *usize, sampler: ?*gpu_clock.Sampler) !Sample {
+fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: []const u8, model: []const u8, log_path: []const u8, ids: []const u32, req: Request, arm: Arm, log_len: *usize, sampler: ?*gpu_clock.Sampler, meter: *Meter) !Sample {
     const body = try promptBody(a, model, ids[0..req.prompt_len], req.max_tokens);
-    var wall = io_util.Stopwatch.init(io);
-    const started_ms = io_util.nowMsMonotonic(io);
+    var span = Span.open(io, meter);
     const resp = try post(a, client, url, body);
-    const ended_ms = io_util.nowMsMonotonic(io);
-    const wall_ms = @as(f64, @floatFromInt(wall.read())) / std.time.ns_per_ms;
+    const timed = span.close();
+    const started_ms = timed.started_ms;
+    const ended_ms = timed.ended_ms;
+    const wall_ms = timed.wall_ms;
+    const spent = timed.spent;
     const c = try parseCompletion(a, resp);
 
     var restore: ?Restore = null;
@@ -909,7 +1262,7 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
         gpu = try s.summarizeWindow(a, started_ms, ended_ms);
     }
 
-    return .{
+    var sample: Sample = .{
         .arm = arm,
         .prompt_len = req.prompt_len,
         .kind = req.kind,
@@ -928,6 +1281,8 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
         .gpu_pressure = gpu.pressure,
         .loop_stop = c.loop_stop,
     };
+    sample.energy = meter.attribute(spent, sample);
+    return sample;
 }
 
 fn startSampler(gpa: std.mem.Allocator, io: std.Io) ?*gpu_clock.Sampler {
@@ -952,7 +1307,7 @@ fn throttleMessage(a: std.mem.Allocator, s: Sample) ![]u8 {
 const Backend = struct {
     ptr: *anyopaque,
     tokenizeFn: *const fn (ptr: *anyopaque, a: std.mem.Allocator, text: []const u8, ids: *std.ArrayList(u32)) anyerror!void,
-    requestFn: *const fn (ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler) anyerror!Sample,
+    requestFn: *const fn (ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler, meter: *Meter) anyerror!Sample,
 };
 
 const Outcome = struct {
@@ -960,13 +1315,16 @@ const Outcome = struct {
     clock: gpu_clock.RunSummary,
     aborted: []const u8,
     cooldown: ?box.Cooldown,
+    energy: EnergyNote = .{},
 };
 
 /// The arms the options select, each with its whole schedule, through one backend.
-fn runArms(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, opts: Options, model: []const u8, backend: Backend) !Outcome {
+fn runArms(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, opts: Options, model: []const u8, backend: Backend, in_process: bool) !Outcome {
     var samples: std.ArrayList(Sample) = .empty;
     const sampler = startSampler(gpa, io);
     defer if (sampler) |s| s.stop();
+    var meter = Meter.start(gpa, io, in_process);
+    defer meter.stop();
     var aborted: []const u8 = "";
     var cooldown: ?box.Cooldown = null;
     var first = true;
@@ -999,7 +1357,7 @@ fn runArms(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, opts: Optio
         log.info("[bench] {s} corpus: {d} tokens, model {s}\n", .{ @tagName(arm), ids.items.len, model });
         const reqs = try plan(a, armDecodeTokens(arm, opts.decode_tokens), opts.rungs);
         for (reqs) |req| {
-            const s = try backend.requestFn(backend.ptr, a, ids.items, req, arm, sampler);
+            const s = try backend.requestFn(backend.ptr, a, ids.items, req, arm, sampler, &meter);
             try samples.append(a, s);
             log.info("[bench] {s} {d} {s}: restored {d}, new {d}, prefill {d:.0} tok/s, ttft {d:.2} s, decode {d:.1} tok/s, mode {s}, gpu {d:.0} MHz {s}{s}\n", .{
                 @tagName(arm),                     s.prompt_len,  @tagName(s.kind), s.cached_n, s.newTokens(), s.prefillTps(), s.ttftMs() / 1000.0, s.decodeTps(),
@@ -1011,7 +1369,7 @@ fn runArms(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, opts: Optio
             }
         }
     }
-    return .{ .samples = samples.items, .clock = if (sampler) |s| try s.summarizeAll(a) else .{}, .aborted = aborted, .cooldown = cooldown };
+    return .{ .samples = samples.items, .clock = if (sampler) |s| try s.summarizeAll(a) else .{}, .aborted = aborted, .cooldown = cooldown, .energy = meter.note };
 }
 
 const HttpBackend = struct {
@@ -1028,9 +1386,9 @@ const HttpBackend = struct {
         try tokenizeChunk(a, self.client, self.base, text, ids);
     }
 
-    fn request(ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler) anyerror!Sample {
+    fn request(ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler, meter: *Meter) anyerror!Sample {
         const self: *HttpBackend = @ptrCast(@alignCast(ptr));
-        return runRequest(a, self.io, self.client, self.url, self.model, self.log_path, ids, req, arm, &self.log_len, sampler);
+        return runRequest(a, self.io, self.client, self.url, self.model, self.log_path, ids, req, arm, &self.log_len, sampler, meter);
     }
 
     fn backend(self: *HttpBackend) Backend {
@@ -1051,17 +1409,19 @@ const LocalBackend = struct {
         try ids.appendSlice(a, piece);
     }
 
-    fn request(ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler) anyerror!Sample {
+    fn request(ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler, meter: *Meter) anyerror!Sample {
         const self: *LocalBackend = @ptrCast(@alignCast(ptr));
-        var wall = io_util.Stopwatch.init(self.io);
-        const started_ms = io_util.nowMsMonotonic(self.io);
+        var span = Span.open(self.io, meter);
         const r = completions.completeIds(a, self.lm, ids[0..req.prompt_len], req.max_tokens) catch |err| {
             log.err("sushi bench: the {s} {d}-token request failed: {s}\n", .{ @tagName(arm), req.prompt_len, @errorName(err) });
             if (err == error.PromptExceedsContext) log.err("sushi bench: the context is shorter than the ladder: pass --ctx-size, or fewer rungs\n", .{});
             return err;
         };
-        const ended_ms = io_util.nowMsMonotonic(self.io);
-        const wall_ms = @as(f64, @floatFromInt(wall.read())) / std.time.ns_per_ms;
+        const timed = span.close();
+        const started_ms = timed.started_ms;
+        const ended_ms = timed.ended_ms;
+        const wall_ms = timed.wall_ms;
+        const spent = timed.spent;
         defer a.free(r.text);
         defer a.free(r.token_ids);
 
@@ -1070,7 +1430,7 @@ const LocalBackend = struct {
             _ = s.waitPast(ended_ms, 2 * gpu_clock.interval_ms);
             gpu = try s.summarizeWindow(a, started_ms, ended_ms);
         }
-        return .{
+        var sample: Sample = .{
             .arm = arm,
             .prompt_len = req.prompt_len,
             .kind = req.kind,
@@ -1089,6 +1449,8 @@ const LocalBackend = struct {
             .gpu_pressure = gpu.pressure,
             .loop_stop = std.mem.eql(u8, r.finish_reason, "stop") and if (r.finish_details) |d| std.mem.eql(u8, d, "repetition_loop") else false,
         };
+        sample.energy = meter.attribute(spent, sample);
+        return sample;
     }
 
     fn backend(self: *LocalBackend) Backend {
@@ -1110,6 +1472,7 @@ fn rawJson(a: std.mem.Allocator, opts: Options, model: []const u8, url: ?[]const
         .corpus_seed = corpus_seed,
         .stamp = opts.stamp,
         .aborted = out.aborted,
+        .energy = out.energy,
         .samples = out.samples,
     }, .{ .whitespace = .indent_2 });
 }
@@ -1166,7 +1529,7 @@ fn runClient(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, opts: Opt
         .log_path = opts.log_path,
         .log_len = (try readLog(a, io, opts.log_path)).len,
     };
-    const out = try runArms(gpa, a, io, opts, model, http.backend());
+    const out = try runArms(gpa, a, io, opts, model, http.backend(), false);
 
     const rep: Report = .{
         .model = model,
@@ -1177,6 +1540,7 @@ fn runClient(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, opts: Opt
         .clock = out.clock,
         .aborted = out.aborted,
         .cooldown = out.cooldown,
+        .energy = out.energy,
     };
     try writeFile(io, try std.fs.path.join(a, &.{ opts.out_dir, "bench.json" }), try rawJson(a, opts, model, opts.url, out));
     const md = try render(a, rep);
@@ -1265,7 +1629,7 @@ fn runLocal(run: *InProcess) !void {
     const lm = try sch.ensureLoaded("");
     defer sch.release(lm);
     var local: LocalBackend = .{ .io = io, .lm = lm };
-    const out = try runArms(run.gpa, a, io, run.opts, lm.id, local.backend());
+    const out = try runArms(run.gpa, a, io, run.opts, lm.id, local.backend(), true);
 
     const rep: Report = .{
         .model = lm.id,
@@ -1277,9 +1641,10 @@ fn runLocal(run: *InProcess) !void {
         .aborted = out.aborted,
         .cooldown = out.cooldown,
         .in_process = true,
+        .energy = out.energy,
     };
     try writeFile(io, try std.fs.path.join(a, &.{ run.out_dir, "bench.json" }), try rawJson(a, run.opts, lm.id, null, out));
-    try printOut(io, try renderTable(a, out.samples));
+    try printOut(io, try renderTableNote(a, out.samples, out.energy));
     if (out.aborted.len > 0) {
         try writeFile(io, try std.fs.path.join(a, &.{ run.out_dir, "bench-aborted.md" }), try render(a, rep));
         log.err("sushi bench: aborted, {s}\n", .{out.aborted});
@@ -1770,4 +2135,210 @@ test "bench report: the protocol line names the cooldown between the arms" {
     const none = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &.{} });
     defer a.free(none);
     try testing.expect(std.mem.indexOf(u8, none, "between the arms") == null);
+}
+
+fn energySample(arm: Arm, len: usize, kind: Kind, base: usize, max: u32, cached: u32, e: SampleEnergy) Sample {
+    return .{ .arm = arm, .prompt_len = len, .kind = kind, .base = base, .max_tokens = max, .prompt_n = @intCast(len), .cached_n = cached, .completion_n = if (max > 1) 512 else 1, .prompt_ms = 2000, .predicted_ms = 10_000, .wall_ms = 12_000, .restore_ms = 0, .restore_logged = true, .mode = "dspark", .energy = e };
+}
+
+fn cut(mj: f64, ms: f64, instr: f64) Cut {
+    return .{ .tokens = 512, .cpu_nj = 1, .cpu_ns = 1, .instructions = 1, .cpu_mj_per_token = mj, .cpu_ms_per_token = ms, .instructions_per_token = instr };
+}
+
+fn energyLadder(a: std.mem.Allocator, note: EnergyNote) ![]u8 {
+    const samples = [_]Sample{
+        energySample(.code, 4096, .ladder, 0, 512, 0, .{ .prefill = cut(3.0, 0.5, 2_500_000), .decode = cut(12.6, 3.5, 40_000_000), .gpu_phase = .mixed }),
+        energySample(.code, 4096, .repeat, 4096, 512, 4065, .{ .decode = cut(12.0, 3.4, 39_000_000), .gpu_phase = .decode, .gpu_nj = 1, .gpu_mj_per_token = 1262, .gpu_mean_mhz = 1500 }),
+        energySample(.code, 4096, .repeat, 4096, 512, 4065, .{ .decode = cut(13.0, 3.6, 41_000_000), .gpu_phase = .decode, .gpu_nj = 1, .gpu_mj_per_token = 1270, .gpu_mean_mhz = 1520 }),
+    };
+    return renderTableNote(a, &samples, note);
+}
+
+test "bench energy: a request is cut at the end of its prefill, anchored on its end and clamped to its start" {
+    try testing.expectEqual(@as(u64, 4_000_000_000), msToNs(4000));
+    try testing.expectEqual(@as(u64, 0), msToNs(-5));
+    // 10 s request: decode the last 4 s, prefill the 5 s before that, 1 s of restore and queue ahead of both.
+    const b = bounds(100, 100 + 10_000_000_000, msToNs(5000), msToNs(4000));
+    try testing.expectEqual(@as(u64, 100 + 6_000_000_000), b.boundary);
+    try testing.expectEqual(@as(u64, 100 + 1_000_000_000), b.prefill_from);
+    const long = bounds(100, 100 + 10_000_000_000, msToNs(20_000), msToNs(4000));
+    try testing.expectEqual(@as(u64, 100), long.prefill_from);
+    const slow = bounds(100, 100 + 1_000_000_000, msToNs(500), msToNs(9000));
+    try testing.expectEqual(@as(u64, 100), slow.boundary);
+}
+
+test "bench energy: per-token cells divide the phase's CPU by its tokens, and a missing window is null, never 0" {
+    const win: energy.Cpu = .{ .nj = 12_600_000, .ns = 3_500_000, .instructions = 40_000_000 };
+    const c = cutOf(win, 4);
+    try testing.expectEqual(@as(?u64, 12_600_000), c.cpu_nj);
+    try testing.expectApproxEqAbs(@as(f64, 3.15), c.cpu_mj_per_token.?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.875), c.cpu_ms_per_token.?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 10_000_000), c.instructions_per_token.?, 1e-6);
+    const none = cutOf(null, 4);
+    try testing.expectEqual(@as(?u64, null), none.cpu_nj);
+    try testing.expectEqual(@as(?f64, null), none.cpu_mj_per_token);
+    const idle = cutOf(.{ .nj = 0, .ns = 0, .instructions = 0 }, 0);
+    try testing.expectEqual(@as(?u64, 0), idle.cpu_nj);
+    try testing.expectEqual(@as(?f64, null), idle.cpu_mj_per_token);
+}
+
+test "bench energy: the GPU belongs to a phase only when the request had just that one" {
+    const mk = energySample;
+    try testing.expectEqual(GpuPhase.prefill, gpuPhase(mk(.code, 8192, .ladder, 4096, 1, 4065, .{})));
+    try testing.expectEqual(GpuPhase.decode, gpuPhase(mk(.code, 4096, .repeat, 4096, 512, 4065, .{})));
+    try testing.expectEqual(GpuPhase.mixed, gpuPhase(mk(.code, 4096, .ladder, 0, 512, 0, .{})));
+}
+
+test "bench table: CPU columns first, the GPU as a record beside its clock, n/a where a phase is mixed, and the legend" {
+    const a = testing.allocator;
+    const t = try energyLadder(a, .{ .measured = true });
+    defer a.free(t);
+    var lines = std.mem.splitScalar(u8, t, '\n');
+    const head = lines.next().?;
+    for ([_][]const u8{ "prefill tok/s", "decode tok/s", "CPU mJ/t", "CPU ms/t", "Minstr/t", "GPU mJ/t", "MHz" }) |col| try testing.expect(std.mem.indexOf(u8, head, col) != null);
+    const row = lines.next().?;
+    for ([_][]const u8{ "3.00", "0.500", "2.500", "12.60", "3.500", "40.000", "1266.0", "1510", "n/a" }) |cell| try testing.expect(std.mem.indexOf(u8, row, cell) != null);
+    try testing.expect(std.mem.indexOf(u8, t, "rises with the GPU clock and is a record, not a quality or efficiency score") != null);
+    try testing.expect(std.mem.indexOf(u8, t, "a decode repeat (its restore and short prefill included)") != null);
+    try testing.expect(std.mem.indexOf(u8, t, "unavailable") == null);
+}
+
+test "bench table: a missing library or a server in another process reads n/a, with each reason said once" {
+    const a = testing.allocator;
+    const t = try energyLadder(a, .{ .measured = true, .gpu_unavailable = "libIOReport.dylib did not open", .clock_unavailable = "the IOReport GPU clock was unreadable", .cpu_unavailable = "the server is another process" });
+    defer a.free(t);
+    for ([_][]const u8{ "GPU energy unavailable: libIOReport.dylib did not open.", "GPU clock unavailable: the IOReport GPU clock was unreadable.", "CPU energy unavailable: the server is another process." }) |line| {
+        const at = std.mem.indexOf(u8, t, line) orelse return error.TestUnexpectedResult;
+        try testing.expect(std.mem.indexOfPos(u8, t, at + line.len, line) == null);
+    }
+}
+
+test "bench json: a sample carries its per-phase CPU and the GPU record, null where unread" {
+    const a = testing.allocator;
+    const samples = [_]Sample{energySample(.code, 4096, .repeat, 4096, 512, 4065, .{ .decode = cut(12.6, 3.5, 40_000_000), .gpu_phase = .decode })};
+    const opts = try parseTest(&.{ "--model", "/m" });
+    const json = try rawJson(a, opts, "m", null, .{ .samples = &samples, .clock = .{}, .aborted = "", .cooldown = null, .energy = .{ .measured = true, .gpu_unavailable = "libIOReport.dylib did not open" } });
+    defer a.free(json);
+    for ([_][]const u8{ "\"cpu_mj_per_token\": 12.6", "\"cpu_ms_per_token\": 3.5", "\"instructions_per_token\": 40000000", "\"gpu_phase\": \"decode\"", "\"gpu_mj_per_token\": null", "\"gpu_unavailable\": \"libIOReport.dylib did not open\"" }) |field| try testing.expect(std.mem.indexOf(u8, json, field) != null);
+}
+
+test "bench report: energy columns beside the prefill windows and a decode energy table, only when measured" {
+    const a = testing.allocator;
+    const samples = [_]Sample{
+        energySample(.code, 4096, .ladder, 0, 1, 0, .{ .prefill = cut(3.0, 0.5, 2_500_000), .gpu_phase = .prefill, .gpu_nj = 1, .gpu_mj_per_token = 410.5, .gpu_mean_mhz = 1330 }),
+        energySample(.code, 4096, .repeat, 4096, 512, 4065, .{ .decode = cut(12.6, 3.5, 40_000_000), .gpu_phase = .decode, .gpu_nj = 1, .gpu_mj_per_token = 1262, .gpu_mean_mhz = 1500 }),
+    };
+    const md = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &samples, .energy = .{ .measured = true } });
+    defer a.free(md);
+    try testing.expect(std.mem.indexOf(u8, md, "| Window | Restored | New | Prefill tok/s | Restore ms | TTFT s | CPU mJ/t | CPU ms/t | Minstr/t | GPU mJ/t | GPU mean MHz |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| 3.00 | 0.500 | 2.500 | 410.5 | 1330 |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "## Decode energy per token") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "| 4k | 12.60 | 3.500 | 40.000 | 1262.0 | 1500 |") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "rises with the GPU clock and is a record, not a quality or efficiency score") != null);
+    const plain = try render(a, .{ .model = "Pack-X", .version = "", .stamp = "", .decode_tokens = 512, .samples = &samples });
+    defer a.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "CPU mJ/t") == null);
+    try testing.expect(std.mem.indexOf(u8, plain, "Decode energy per token") == null);
+}
+
+var gpu_reads: []const ?u64 = &.{};
+var gpu_at: usize = 0;
+
+fn scriptedGpu(_: ?*anyopaque) ?u64 {
+    defer gpu_at += 1;
+    return gpu_reads[gpu_at];
+}
+
+fn slowGpu(_: ?*anyopaque) ?u64 {
+    std.Io.sleep(testing.io, .fromMilliseconds(40), .real) catch {};
+    return 1;
+}
+
+fn noCpu() ?energy.Cpu {
+    return null;
+}
+
+fn scriptedMeter(reads: []const ?u64) Meter {
+    gpu_reads = reads;
+    gpu_at = 0;
+    return .{ .io = testing.io, .gpu = .{ .source = .{ .read = scriptedGpu } }, .note = .{ .measured = true } };
+}
+
+fn requestOn(m: *Meter) SampleEnergy {
+    const mark = m.begin();
+    const e = m.end(mark);
+    return m.attribute(e, energySample(.code, 4096, .repeat, 4096, 512, 4065, .{}));
+}
+
+test "bench energy: the meter's end readings are not part of the request's wall time" {
+    var m: Meter = .{ .io = testing.io, .gpu = .{ .source = .{ .read = slowGpu } }, .note = .{ .measured = true } };
+    var span = Span.open(testing.io, &m);
+    const done = span.close();
+    try testing.expect(done.wall_ms < 20);
+}
+
+test "bench energy: a GPU counter that went backwards is n/a, never 0, and the run counts the request" {
+    var m = scriptedMeter(&.{ 500, 100 });
+    const e = requestOn(&m);
+    try testing.expectEqual(@as(?u64, null), e.gpu_nj);
+    try testing.expectEqual(@as(?f64, null), e.gpu_mj_per_token);
+    try testing.expectEqual(@as(u32, 1), m.note.gpu_failed);
+}
+
+test "bench energy: reads lost mid-run are counted per request, said in one line and kept in the json" {
+    const a = testing.allocator;
+    var m = scriptedMeter(&.{ 100, 200, 300, null, 400, 350 });
+    for (0..3) |_| _ = requestOn(&m);
+    try testing.expectEqual(@as(u32, 3), m.note.requests);
+    try testing.expectEqual(@as(u32, 2), m.note.gpu_failed);
+
+    const table = try renderTableNote(a, &.{}, m.note);
+    defer a.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "GPU energy read failed on 2 of 3 requests.") != null);
+
+    const opts = try parseTest(&.{ "--model", "/m" });
+    const json = try rawJson(a, opts, "m", null, .{ .samples = &.{}, .clock = .{}, .aborted = "", .cooldown = null, .energy = m.note });
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const note = parsed.value.object.get("energy") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 2), note.object.get("gpu_failed").?.integer);
+    try testing.expectEqual(@as(i64, 3), note.object.get("requests").?.integer);
+}
+
+test "bench energy: a timeline that cannot read is counted per request, and a clean run says nothing" {
+    const a = testing.allocator;
+    var tl: energy.CpuTimeline = .{ .gpa = a, .io = testing.io, .read = noCpu };
+    defer tl.points.deinit(a);
+    var m: Meter = .{ .io = testing.io, .cpu = &tl, .gpu = .{ .unavailable = "none" }, .note = .{ .measured = true } };
+    for (0..2) |_| _ = requestOn(&m);
+    try testing.expectEqual(@as(u32, 2), m.note.cpu_failed);
+    const table = try renderTableNote(a, &.{}, m.note);
+    defer a.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, "CPU energy read failed on 2 of 2 requests.") != null);
+
+    var clean = scriptedMeter(&.{ 1, 2 });
+    _ = requestOn(&clean);
+    const quiet = try renderTableNote(a, &.{}, clean.note);
+    defer a.free(quiet);
+    try testing.expect(std.mem.indexOf(u8, quiet, "read failed") == null);
+}
+
+test "bench energy: a prefill clamped to no time while it had tokens is n/a, not 0" {
+    const a = testing.allocator;
+    var tl: energy.CpuTimeline = .{ .gpa = a, .io = testing.io };
+    defer tl.points.deinit(a);
+    try tl.points.appendSlice(a, &.{
+        .{ .t_ns = 100, .cpu = .{ .nj = 1_000, .ns = 1_000, .instructions = 1_000 } },
+        .{ .t_ns = 100 + 10_000_000_000, .cpu = .{ .nj = 6_000_000, .ns = 6_000_000, .instructions = 6_000_000 } },
+    });
+    var m: Meter = .{ .io = testing.io, .cpu = &tl, .gpu = .{ .unavailable = "none" }, .note = .{ .measured = true } };
+    const end: Meter.End = .{ .t0 = 100, .t_end = 100 + 10_000_000_000, .gpu_nj = null, .mhz = null };
+    var s = energySample(.code, 4096, .ladder, 0, 512, 0, .{});
+    s.prompt_ms = 0;
+    const e = m.attribute(end, s);
+    try testing.expectEqual(@as(?u64, null), e.prefill.cpu_nj);
+    try testing.expectEqual(@as(?f64, null), e.prefill.cpu_mj_per_token);
+    try testing.expect(e.decode.cpu_mj_per_token != null);
+    try testing.expectEqual(@as(u32, 0), m.note.cpu_failed);
 }

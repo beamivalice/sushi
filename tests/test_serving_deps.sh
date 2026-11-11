@@ -49,6 +49,12 @@ else
   ok "no non-system dylib beyond libmlxc and libwebp"
 fi
 
+if echo "$LINKED" | grep -q "IOReport"; then
+  fail "libIOReport is linked: it is an undocumented library, bound at run time by energy.zig so a macOS without it still runs"
+else
+  ok "libIOReport is not linked (bound at run time)"
+fi
+
 if echo "$LINKED" | grep -q "libmlxc"; then
   ok "libmlxc still linked (self-built MLX)"
 else

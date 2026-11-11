@@ -58,7 +58,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, `digit_group`; prompt LRU | engine-mlx-gotchas |
 | `vision.zig` / `vision_common.zig` / `arch/media.zig` / `<arch>/<arch>_media.zig` / `qwen4/qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: the tower holder, preprocessing, the media dispatch and each arch's processor, Qwen3-VL, M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` / `kld_fixture.zig` / `kld_capture_util.zig` / `arch/offline.zig` | `sushi kld capture|compare`; the MLX-free fixture reader and scoring; the per-arch hooks | quality-kld |
-| `bench.zig` / `bench_box.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power | process-measurement |
+| `bench.zig` / `bench_box.zig` / `energy.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power; the own-process CPU counters, the CPU timeline and the GPU energy channel (IOReport bound at run time) behind its energy-per-token columns | process-measurement |
 | `ubench_main.zig` / `ubench_report.zig` / `exl3_ubench/ubench.zig` / `glm5/ubench_glm5.zig` / `qwen4/ubench_qwen4.zig` | `sushi-ubench` (`zig build ubench`); each built arch's `ubench` decl is listed | process-ubench |
 | `sushibar_main.zig` / `sushibar/` | `sushibar` menu bar app | server-lifecycle |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |

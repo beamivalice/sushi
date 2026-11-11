@@ -16,6 +16,9 @@ earlier history is mlx-serve's, in that project's changelog.
   Macs; start with `--ds41-mlx-engine`, or untick "Use Sushi's Cooler Engine instead of MLX" under DeepSeek 4.1
   Inference on the model's settings, to generate on MLX again, and please report a problem at
   <https://github.com/beamivalice/sushi/issues/new>.
+- **`sushi bench` reports energy per token**: beside tok/s, every prefill and decode cell now carries the CPU
+  millijoules, CPU milliseconds and instructions the process spent per token, and the GPU's millijoules per token as a
+  record beside its mean clock; a Mac without the system library behind the GPU reading still benches and says so.
 - **DeepSeek-V4.1-Flash STQ loads faster on M5 Macs**: the load no longer warms kernels that generation does not use,
   and a short follow-up turn generates on the same engine as the rest of decode.
 - **DeepSeek-V4.1-Flash STQ generates on sushi's own Metal engine on M5 Macs**: token generation for the STQ packs no

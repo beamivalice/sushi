@@ -87,6 +87,7 @@ test {
     _ = @import("ws.zig");
     _ = @import("gpu_clock.zig");
     _ = @import("gpu_clock_live.zig");
+    _ = @import("energy.zig");
     _ = @import("bench_box.zig");
     _ = @import("ubench_report.zig");
     _ = @import("mrope.zig");

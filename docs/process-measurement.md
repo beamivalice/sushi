@@ -194,7 +194,17 @@ Rules for reading it:
   run whose idle window shows GPU watts is discarded.
 - State beside the numbers: binary commit, the requests, boot and end temperature, and the round mix of every greedy
   request (`[spec-stats]`), since the mix moves a greedy cell by about 1%.
-- The reader is a script beside the run files, not yet part of `sushi bench`. Baseline:
+- **`sushi bench` reads it** (`src/energy.zig`): per prefill and decode cell, CPU mJ, CPU ms and Minstr per token first
+  (this process's own `proc_pid_rusage`, cut at the end of the prefill from a 5 ms timeline, so `--model` only; with
+  `--url` the server is another process and they read n/a), then the whole machine's GPU mJ per token and its mean GPU
+  MHz as a record. The GPU is the machine's, so it belongs to a phase only when the request had just that one: a
+  prefill-only window, or a decode repeat with its restore and short prefill included; a window that also decodes
+  reads n/a. GPU joules per token never judge a change. Both land in `bench.json` per sample.
+  GPU energy needs a library Apple does not document, bound at run time: without it, or without its group, channel or
+  unit, the bench reports the CPU cells, says so once in its legend, and nothing else changes. A reading never reads
+  0 for lack of data: a counter the OS does not give or that went backwards, or a phase clamped to no time, is n/a. A
+  reading lost mid-run is counted per request and printed beside the legend, and kept in `bench.json` under `energy`.
+  Baseline:
   [perf-baselines](perf-baselines.md#deepseek-v41-stq-decode-energy-per-token-2026-11-11).
 
 ## 5. Wait without hanging
