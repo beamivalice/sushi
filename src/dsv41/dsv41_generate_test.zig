@@ -1306,61 +1306,6 @@ test "dsv41 engine: a DSpark round on the engine gives MLX's draft, confidences 
     try testing.expectEqualSlices(u8, want.items, got.items);
 }
 
-test "dsv41 engine: a round that finds MLX's queue unused for a warm tick runs one MLX op on it first, and none sooner (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
-    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
-    defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
-    defer sc.deinit();
-    const ids = try dsv41_model.tokens(&sc, &fx);
-    defer a.free(ids);
-    var config = try model_mod.parseConfig(io, a, dir);
-    defer config.deinit(a);
-    config.expert_streaming = true;
-    config.stream_mtp_head = true;
-    config.expert_cache_bytes = 64 << 20;
-    config.expert_source_dir = try a.dupe(u8, dir);
-    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
-    defer weights.deinit();
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    const m = dsv41_state.modelOf(&xfm).?;
-
-    const tick = @import("../sched_policy.zig").GPU_WARM_TICK_NS;
-    var before: usize = 0;
-    var after: usize = 0;
-    const t0 = mlx.engine.nowNs();
-    m.mlx_queue_used_ns = t0 - tick;
-    try mlx.check(mlx.mlx_metal_command_buffer_count(&before));
-    dsv41_serving.keepMlxQueue(m);
-    try mlx.check(mlx.mlx_metal_command_buffer_count(&after));
-    try testing.expectEqual(before + 1, after);
-    try testing.expect(m.mlx_queue_used_ns >= t0);
-    const kept = m.mlx_queue_used_ns;
-    dsv41_serving.keepMlxQueue(m);
-    try mlx.check(mlx.mlx_metal_command_buffer_count(&before));
-    try testing.expectEqual(after, before);
-    try testing.expectEqual(kept, m.mlx_queue_used_ns);
-
-    // A round on the engine asks; a round on MLX uses the queue itself.
-    m.mlx_queue_used_ns = 0;
-    var on_mlx = try dsparkRoundBytes(a, &xfm, ids[0..30], 1);
-    defer on_mlx.deinit(a);
-    try testing.expectEqual(@as(u64, 0), m.mlx_queue_used_ns);
-    m.engine_decode = true;
-    defer m.engine_decode = false;
-    var on_engine = try dsparkRoundBytes(a, &xfm, ids[0..30], 1);
-    defer on_engine.deinit(a);
-    try testing.expect(m.mlx_queue_used_ns >= t0);
-}
-
 test "dsv41 engine: the load clock times every phase of a load and the phases add up to its total (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const load_clock = @import("../load_clock.zig");
@@ -1547,8 +1492,8 @@ test "dsv41 engine: the same greedy tokens come from a load with Sushi Cooler on
 }
 
 /// A prompt of 40 rows whose rows 5 to 14 are image tokens that take `rows`, fed in chunks ending at `cuts`, then
-/// `steps` greedy one-row steps: the bytes of every forward's logits. With `quiet`, MLX's keep-warm touch is held off.
-fn imagePromptBytes(a: std.mem.Allocator, fx: *EngineFixture, rows: mlx.mlx_array, cuts: []const usize, steps: usize, quiet: bool) !std.ArrayList(u8) {
+/// `steps` greedy one-row steps: the bytes of every forward's logits.
+fn imagePromptBytes(a: std.mem.Allocator, fx: *EngineFixture, rows: mlx.mlx_array, cuts: []const usize, steps: usize) !std.ArrayList(u8) {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     const m = fx.model();
@@ -1564,7 +1509,6 @@ fn imagePromptBytes(a: std.mem.Allocator, fx: *EngineFixture, rows: mlx.mlx_arra
     for (cuts) |end| {
         _ = mlx.mlx_array_free(lg);
         lg = .{ .ctx = null };
-        if (quiet) m.mlx_queue_used_ns = mlx.engine.nowNs();
         lg = try forwardIds(&fx.xfm, &ctx, ids[at..end]);
         ctx.vision_splice_offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
@@ -1576,7 +1520,6 @@ fn imagePromptBytes(a: std.mem.Allocator, fx: *EngineFixture, rows: mlx.mlx_arra
         const tok: u32 = @intCast(std.mem.indexOfMax(f32, data));
         _ = mlx.mlx_array_free(lg);
         lg = .{ .ctx = null };
-        if (quiet) m.mlx_queue_used_ns = mlx.engine.nowNs();
         lg = try forwardIds(&fx.xfm, &ctx, &.{tok});
     }
     _ = mlx.mlx_array_free(lg);
@@ -1646,7 +1589,7 @@ test "dsv41 engine: a forward that splices image rows runs on the engine at a pr
         defer ref.deinit();
         var image = try ImageStandIn.give(a, &ref);
         defer image.drop();
-        for (all_cuts, &want) |cuts, *w| w.* = try imagePromptBytes(a, &ref, image.rows, cuts, 3, false);
+        for (all_cuts, &want) |cuts, *w| w.* = try imagePromptBytes(a, &ref, image.rows, cuts, 3);
     }
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -1660,7 +1603,7 @@ test "dsv41 engine: a forward that splices image rows runs on the engine at a pr
     for (all_cuts, &want) |cuts, *w| {
         const ops = mlx.engine.mlx_ops;
         const made = mlx.engine.pipelinesMade().count;
-        var got = try imagePromptBytes(a, &fx, rows, cuts, 3, true);
+        var got = try imagePromptBytes(a, &fx, rows, cuts, 3);
         defer got.deinit(a);
         try testing.expectEqual(ops, mlx.engine.mlx_ops);
         try testing.expectEqual(made, mlx.engine.pipelinesMade().count);
@@ -1690,7 +1633,6 @@ test "dsv41 engine: a forward through the Trunk while a verify is open runs on t
         try mlx.check(mlx.mlx_array_eval(rows));
         _ = mlx.mlx_array_free(rows);
         ctx.cache.step = (try dsv41_model.ensureState(m)).n;
-        m.mlx_queue_used_ns = mlx.engine.nowNs();
         const ops = mlx.engine.mlx_ops;
         const lg = try forwardIds(&fx.xfm, &ctx, prompt[33..34]);
         defer _ = mlx.mlx_array_free(lg);
@@ -1711,9 +1653,7 @@ const Census = struct {
     names: std.ArrayList(mlx.NameCount) = .empty,
     stats: @TypeOf(mlx.engine.stats()) = undefined,
 
-    /// Starts a phase; MLX's keep-warm touch (one per 500 ms of MLX idle) stays out of a phase this short.
-    fn begin(model: ?*@import("dsv41_model.zig").Model) !Census {
-        if (model) |m| m.mlx_queue_used_ns = mlx.engine.nowNs();
+    fn begin() !Census {
         var self: Census = .{ .calls = mlx.engine.mlxCalls(), .ops = mlx.engine.mlx_ops, .stats = mlx.engine.stats() };
         try mlx.callsByName(&self.names, testing.allocator);
         return self;
@@ -1759,7 +1699,7 @@ fn censusOf(dir: []const u8) ![9]Asked {
     }
     // The fixture's own reads (its token ids, the config) are the test's, not the load's.
     try fx.prepare(dir, null, 64 << 20);
-    var c = try Census.begin(null);
+    var c = try Census.begin();
     errdefer c.names.deinit(a);
     try fx.load(dir);
     var open = true;
@@ -1794,45 +1734,45 @@ fn censusOf(dir: []const u8) ![9]Asked {
     try Request.run(&fx, &tok, prompt, seeded, .{ .dspark_enabled = true });
     try Request.run(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true, .logprobs_n = 3 });
 
-    c = try Census.begin(m);
+    c = try Census.begin();
     try Request.run(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true });
     asked[0] = try c.end("greedy rounds: a 40-row prefill and 12 tokens");
 
-    c = try Census.begin(m);
+    c = try Census.begin();
     try Request.run(&fx, &tok, prompt, seeded, .{ .dspark_enabled = true });
     asked[1] = try c.end("seeded rounds");
 
-    c = try Census.begin(m);
+    c = try Census.begin();
     try Request.run(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true, .logprobs_n = 3 });
     asked[2] = try c.end("serial steps with logprobs");
 
     try fx.xfm.resetCache();
     var ctx = fx.xfm.defaultCtx();
     _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt));
-    c = try Census.begin(m);
+    c = try Census.begin();
     var cp = try dsv41_prefix.capture(a, m, prompt.len);
     defer cp.deinit(a);
     asked[3] = try c.end("a restore point captured");
 
     try fx.xfm.resetCache();
-    c = try Census.begin(m);
+    c = try Census.begin();
     try dsv41_prefix.restore(m, &cp, prompt);
     asked[4] = try c.end("the point restored");
 
     ctx = fx.xfm.defaultCtx();
     ctx.cache.step = prompt.len;
-    c = try Census.begin(m);
+    c = try Census.begin();
     _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, &.{prompt[3]}));
     asked[5] = try c.end("a step on the restored state");
 
-    c = try Census.begin(m);
-    var bytes = try imagePromptBytes(a, &fx, image.rows, &.{ 8, 16, 40 }, 3, true);
+    c = try Census.begin();
+    var bytes = try imagePromptBytes(a, &fx, image.rows, &.{ 8, 16, 40 }, 3);
     bytes.deinit(a);
     asked[6] = try c.end("an image prompt in three chunks and 3 steps");
 
     image.drop();
     image_given = false;
-    c = try Census.begin(m);
+    c = try Census.begin();
     open = false;
     fx.deinit();
     asked[7] = try c.end("the unload");
@@ -1840,31 +1780,13 @@ fn censusOf(dir: []const u8) ![9]Asked {
     return asked;
 }
 
-test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pinned so that it only goes down (DSV41_STQ_TINY)" {
+test "dsv41 engine: a Cooler load, its requests and its unload ask nothing of MLX, phase by phase (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const asked = try censusOf(dir);
-    // The target of every row is { 0, 0 }, and every phase of a request is there: no call at all. A load is left the
-    // shared trunk shell's six scalar constants (made, cast and, at the unload, freed on MLX's stream) and one touch
-    // of MLX's queue.
-    // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of, so a real cut moves it.
-    const ceilings = [_]Asked{
-        .{ .calls = 0, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
-        .{ .calls = 0, .ops = 0 }, // seeded rounds
-        .{ .calls = 0, .ops = 0 }, // serial steps with logprobs
-        .{ .calls = 0, .ops = 0 }, // a restore point captured
-        .{ .calls = 0, .ops = 0 }, // the point restored
-        .{ .calls = 0, .ops = 0 }, // a step on the restored state
-        .{ .calls = 0, .ops = 0 }, // an image prompt
-        .{ .calls = 7, .ops = 0 }, // the unload
-        .{ .calls = 25, .ops = 6 }, // the load
-    };
-    for (ceilings, asked) |ceiling, got| {
-        try testing.expectEqual(ceiling.ops, got.ops);
-        try testing.expect(got.calls <= ceiling.calls);
-        try testing.expect(got.calls + ceiling.calls / 20 >= ceiling.calls);
-    }
+    // A Cooler load holds the engine's scope from its first tensor to its unload: nothing is asked of MLX.
+    for (asked) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
 }
 
 test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and restores it, byte for byte, with nothing asked of MLX (DSV41_STQ_TINY)" {
@@ -1922,7 +1844,7 @@ test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and res
         ctx.cache.step = point;
         want = try dsv41_prefix.capture(a, m, point);
         wanted = true;
-        var c = try Census.begin(m);
+        var c = try Census.begin();
         errdefer c.names.deinit(a);
         const cps = try a.alloc(trunk_mod.SSMCheckpoint, 1);
         cps[0] = (try dsv41_prefix.captureCheckpoint(a, &fx.xfm, point, true)).?;
@@ -1942,7 +1864,7 @@ test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and res
         try fx.xfm.resetCache();
         const ctx = fx.xfm.defaultCtx();
         var moe: usize = 0;
-        var c = try Census.begin(m);
+        var c = try Census.begin();
         errdefer c.names.deinit(a);
         const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, ctx.cache, &moe, m, fx.xfm.s, prompt, false, 0, null, &.{}, null, false);
         asked[1] = try c.end("the point restored from the SSD tier");
@@ -1964,36 +1886,54 @@ test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and res
     for (asked) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
 }
 
-test "dsv41 engine: a forward's scope and a sampled draw give the engine's scope back as they found it (DSV41_STQ_TINY)" {
+test "dsv41 engine: a Cooler load holds the engine's scope from its load to its unload, its trunk's stream the engine's (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const dsv41_model = @import("dsv41_model.zig");
-    var fx: EngineFixture = undefined;
-    try fx.open(dir);
-    defer fx.deinit();
-    const m = fx.model();
-    const s = mlx.engine.stream();
-    var logits = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(logits);
-    try mlx.check(mlx.mlx_zeros(&logits, &[_]c_int{ 1, 2, @intCast(m.cfg.vocab) }, 3, .float32, s));
-    const sampling: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .draw_root = 3 };
+    try testing.expect(!mlx.engine.active and !mlx.engine.holding());
+    {
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        defer fx.deinit();
+        const m = fx.model();
+        try testing.expect(mlx.engine.active and mlx.engine.holding());
+        try testing.expect(mlx.engine.isStream(fx.xfm.s) and mlx.engine.isStream(m.s));
+        var logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_zeros(&logits, &[_]c_int{ 1, 2, @intCast(m.cfg.vocab) }, 3, .float32, fx.xfm.s));
+        const sampling: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .draw_root = 3 };
 
-    // Outside any scope they leave none behind; inside one, whoever opened it still has it.
-    for ([_]bool{ false, true }) |outer| {
-        const host = mlx.engine.enter(if (outer) s else fx.xfm.s);
-        defer host.end();
-        try testing.expectEqual(outer, mlx.engine.active);
+        // A forward's scope and a sampled draw give it back as they found it.
         const was = dsv41_model.ownBegin(m);
         const again = dsv41_model.ownBegin(m);
-        try testing.expect(mlx.engine.active);
         dsv41_model.ownEnd(m, again);
         try testing.expect(mlx.engine.active);
         dsv41_model.ownEnd(m, was);
-        try testing.expectEqual(outer, mlx.engine.active);
-        _ = mlx.mlx_array_free(try dsv41_serving.sampledDraws(sampling, logits, 2, s));
-        try testing.expectEqual(outer, mlx.engine.active);
+        try testing.expect(mlx.engine.active);
+        _ = mlx.mlx_array_free(try dsv41_serving.sampledDraws(sampling, logits, 2, fx.xfm.s));
+        try testing.expect(mlx.engine.active);
+
+        // The idle tick keeps the engine's queue and asks nothing of MLX's.
+        const calls = mlx.engine.mlxCalls();
+        mlx.gpuTouch();
+        try testing.expectEqual(calls, mlx.engine.mlxCalls());
+
+        // A second load's unload leaves the first one's hold.
+        {
+            var other: EngineFixture = undefined;
+            try other.open(dir);
+            other.deinit();
+        }
+        try testing.expect(mlx.engine.active and mlx.engine.holding());
     }
+    try testing.expect(!mlx.engine.active and !mlx.engine.holding());
+
+    // The MLX route holds nothing.
+    var on_mlx: EngineFixture = undefined;
+    try on_mlx.openMlx(dir);
+    defer on_mlx.deinit();
+    try testing.expect(!mlx.engine.active and !mlx.engine.isStream(on_mlx.xfm.s));
 }
 
 test "dsv41 engine: a Cooler load answers the fused hyper-connection kernel's probe as the MLX route does: the probe runs on the engine's stream (DSV41_STQ_TINY)" {
@@ -2130,7 +2070,6 @@ test "dsv41 engine: a prefill forward of 2 to 16 rows costs MLX's queue what a o
     var fx: EngineFixture = undefined;
     try fx.open(dir);
     defer fx.deinit();
-    const m = fx.model();
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf);
     var counts: [17]usize = undefined;
@@ -2139,7 +2078,6 @@ test "dsv41 engine: a prefill forward of 2 to 16 rows costs MLX's queue what a o
         var ctx = fx.xfm.defaultCtx();
         _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..30]));
         // A queue just used needs no keep-alive touch, so the count is the forward's own.
-        m.mlx_queue_used_ns = mlx.engine.nowNs();
         var before: usize = 0;
         try mlx.check(mlx.mlx_metal_command_buffer_count(&before));
         const lg = try forwardIds(&fx.xfm, &ctx, prompt[30..][0..k]);
@@ -2557,7 +2495,7 @@ test "dsv41 engine: an image warm and an image prompt whose routes read experts 
         defer ref.deinit();
         var image = try ImageStandIn.give(a, &ref);
         defer image.drop();
-        want = try imagePromptBytes(a, &ref, image.rows, &.{40}, 3, false);
+        want = try imagePromptBytes(a, &ref, image.rows, &.{40}, 3);
     }
     var fx: EngineFixture = undefined;
     try fx.openSized(dir, null, small);
@@ -2568,7 +2506,7 @@ test "dsv41 engine: an image warm and an image prompt whose routes read experts 
     // routes take the engine's order, a group's kernels after that group has landed, never MLX's.
     try @import("dsv41_model.zig").warmOwnImages(fx.model());
     try testing.expectEqual(@as(u64, 0), dsv41_state.stqExpertsOf(&fx.xfm).?.mlx_order_routes);
-    var got = try imagePromptBytes(a, &fx, image.rows, &.{40}, 3, true);
+    var got = try imagePromptBytes(a, &fx, image.rows, &.{40}, 3);
     defer got.deinit(a);
     try testing.expectEqualSlices(u8, want.items, got.items);
     var said: [256]u8 = undefined;
@@ -4217,11 +4155,10 @@ test "dsv41 engine: a one-row decode step in steady state makes no call into MLX
     try testing.expectEqual(@as(u64, 0), steady.total);
 }
 
-/// The ops a request puts on MLX in `want` serial ticks, MLX's keep-warm touch held off.
-fn opsOver(m: *@import("dsv41_model.zig").Model, gen: *Generator, a: std.mem.Allocator, want: usize) !u64 {
+/// The ops a request puts on MLX in `want` serial ticks.
+fn opsOver(gen: *Generator, a: std.mem.Allocator, want: usize) !u64 {
     const before = mlx.engine.mlx_ops;
     for (0..want) |_| {
-        m.mlx_queue_used_ns = mlx.engine.nowNs();
         _ = try gen.next(a);
     }
     return mlx.engine.mlx_ops - before;
@@ -4289,8 +4226,8 @@ test "dsv41 engine: a request's first token and every serial step put no op on M
         defer gen.deinit(a);
         gen.logprobs_n = c.logprobs;
         if (c.masked) gen.sampling.suppress_mask = mask;
-        _ = try opsOver(m, &gen, a, 2);
-        try testing.expectEqual(@as(u64, 0), try opsOver(m, &gen, a, 8));
+        _ = try opsOver(&gen, a, 2);
+        try testing.expectEqual(@as(u64, 0), try opsOver(&gen, a, 8));
     }
 }
 
@@ -4333,7 +4270,6 @@ test "dsv41 engine: a DSpark round with penalties, a thinking penalty, a logit b
         const before = mlx.engine.mlx_ops;
         var rounds: usize = 0;
         while (rounds < 5) : (rounds += 1) {
-            m.mlx_queue_used_ns = mlx.engine.nowNs();
             const r = (try gen.nextDspark(a)) orelse break;
             a.free(r.tokens);
         }

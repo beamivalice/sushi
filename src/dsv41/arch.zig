@@ -116,9 +116,14 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
     return serving.initDsv41(allocator, config, weights, s);
 }
 
+/// A Cooler load runs on the engine's stream.
+pub const ownStream = dsv41_prefix.arraysOn;
+
 pub fn deinit(xfm: Model) void {
+    const held = if (xfm.arch_state.dsv41.model) |m| m.engine_decode else false;
     xfm.arch_state.dsv41.deinit(xfm.allocator);
     xfm.deinitTrunk();
+    if (held) mlx.engine.unhold();
 }
 
 pub fn resetCache(xfm: Model) !void {

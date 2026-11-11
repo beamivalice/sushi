@@ -1192,9 +1192,10 @@ pub fn gpuStream() mlx_stream {
 }
 
 /// One synced element-op on the GPU stream: a queue the driver sees in use. A failure stays unlatched. The engine's
-/// queue gets a pass too when it keeps weights resident.
+/// queue gets a pass too when it keeps weights resident, and it alone under a load that is the engine's.
 pub fn gpuTouch() void {
     engine.touch();
+    if (engine.holding()) return;
     const had_error = errorPending();
     defer dropLatchedErrorUnless(had_error);
     const s = gpuStream();

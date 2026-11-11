@@ -387,12 +387,13 @@ pub const Dsv41Vision = struct {
         const v = c.vision orelse return error.MissingVisionWeights;
         var own = false;
         if (dsv41_borrow.ownDecode(&c)) {
-            // Decided here, once: a request never meets a refusal that MLX's tower would not give.
+            // Decided here, once: a Cooler load runs nothing on MLX, so a tower the engine cannot run refuses the load.
             if (try engineGap(v, c.dim, quantize_at_load)) |g| {
-                log.warn("[vision] tower stays on MLX: an image of {d} rows can reach MLX's {s} for a {d} x {d} linear, which the engine does not port\n", .{ g.rows, g.what, g.out, g.in });
-            } else if (!mlx.engine.enabled) {
-                return error.EngineNotEnabled;
-            } else own = true;
+                log.err("[vision] the engine does not port this tower: an image of {d} rows reaches {s} for a {d} x {d} linear; --ds41-mlx-engine serves it\n", .{ g.rows, g.what, g.out, g.in });
+                return error.VisionTowerNotPorted;
+            }
+            if (!mlx.engine.enabled) return error.EngineNotEnabled;
+            own = true;
         }
         // The requantization's kernel is this load's to make, as the warm's are.
         const was_sealed = mlx.engine.sealed();
@@ -414,6 +415,11 @@ pub const Dsv41Vision = struct {
 
     fn stream(self: *const Dsv41Vision) mlx.mlx_stream {
         return if (self.own) mlx.engine.stream() else self.s;
+    }
+
+    /// The engine's stream when the tower runs there: where its caller makes patch arrays and joins spans.
+    pub fn ownStream(self: *const Dsv41Vision) ?mlx.mlx_stream {
+        return if (self.own) mlx.engine.stream() else null;
     }
 
     /// The engine runs this pass: its ops take over, an MLX stream among them is refused by name, and its pool may
@@ -1286,6 +1292,26 @@ test "dsv41 vision: every image the release processor admits gives the tower row
     var wide_head = v;
     wide_head.hidden = 2048;
     try testing.expect((try engineGap(wide_head, 5120, true)) != null);
+}
+
+test "dsv41 vision: a Cooler load refuses a tower the engine does not port by name; the MLX route loads it" {
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was_enabled;
+    // No pixel floor: a one-patch image is admissible, and no chunk of keys covers it.
+    var w = try towerOf(engine_vision, tiny_dim);
+    defer w.deinit();
+    try testing.expect(try engineGap(engine_vision, tiny_dim, true) != null);
+    dsv41_borrow.own_override = true;
+    defer dsv41_borrow.own_override = null;
+    const calls = mlx.engine.mlxCalls();
+    try testing.expectError(error.VisionTowerNotPorted, Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w));
+    try testing.expectEqual(calls, mlx.engine.mlxCalls());
+    dsv41_borrow.own_override = false;
+    var on_mlx = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w);
+    defer on_mlx.deinit();
+    try testing.expect(!on_mlx.own and on_mlx.ownStream() == null);
 }
 
 test "dsv41 vision: the fewest patches and aligner cells any image gives the release tower, over every thin size" {

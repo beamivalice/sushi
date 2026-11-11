@@ -1650,9 +1650,9 @@ pub const attn_nax_bar: f64 = 3e-5;
 /// One trial of the matrix-unit arm against the SIMD kernel at the model's head shape, over the plain kernel in f32 and
 /// the packed one with its epilogue store: false when a launch fails or the heads differ by more than `bar` of the peak
 /// (the epilogue's fp8 rounding may flip a value by a quantum, so its bar is 5000 x `bar`).
-pub fn attnNaxProbe(a: std.mem.Allocator, h: usize, d: usize, rd: usize, og: usize, bar: f64) bool {
+pub fn attnNaxProbe(a: std.mem.Allocator, s: mlx.mlx_stream, h: usize, d: usize, rd: usize, og: usize, bar: f64) bool {
     const had = mlx.errorPending();
-    const ok = attnNaxTrial(a, h, d, rd, og, bar) catch false;
+    const ok = attnNaxTrial(a, s, h, d, rd, og, bar) catch false;
     if (!ok) mlx.dropLatchedErrorUnless(had);
     return ok;
 }
@@ -1669,20 +1669,29 @@ fn maxRelDiff(got: []const f32, want: []const f32) f64 {
     return worst / peak;
 }
 
-fn attnNaxTrial(a: std.mem.Allocator, h: usize, d: usize, rd: usize, og: usize, bar: f64) !bool {
+/// A trial's normal inputs: MLX's own draw on MLX's stream, values made on the host on the engine's, where no key is
+/// asked of MLX.
+fn trialValues(sc: *Scope, shape: []const c_int, dt: mlx.mlx_dtype, seed: u64, std_dev: f32) !A {
+    if (!mlx.engine.isStream(sc.s)) return randn(sc, shape, dt, seed, std_dev);
+    return sc.astype(try probeValues(sc, shape, seed, std_dev), dt);
+}
+
+/// Whether the matrix-unit attention kernel stays within `bar` of the SIMD kernel on stream `s`, the one the forwards
+/// run on. An error is a trial that could not run.
+pub fn attnNaxTrial(a: std.mem.Allocator, s: mlx.mlx_stream, h: usize, d: usize, rd: usize, og: usize, bar: f64) !bool {
     if (!attnNaxFits(h, d)) return false;
     const L = 32;
     const wp = 40;
     const K = 48;
     const nc = 40;
     const window = 128;
-    var sc = Scope.plain(a, mlx.gpuStream());
+    var sc = Scope.plain(a, s);
     defer sc.deinit();
     const bf16 = mlx.mlx_dtype.bfloat16;
-    const q = try randn(&sc, &.{ L, ci(h), ci(d) }, bf16, 0x4a1, 1.5);
-    const keys = try randn(&sc, &.{ wp + L, ci(d) }, bf16, 0x4a2, 1.5);
-    const comp = try randn(&sc, &.{ nc, ci(d) }, bf16, 0x4a3, 1.5);
-    const sink = try randn(&sc, &.{ ci(h), 1 }, bf16, 0x4a4, 1.0);
+    const q = try trialValues(&sc, &.{ L, ci(h), ci(d) }, bf16, 0x4a1, 1.5);
+    const keys = try trialValues(&sc, &.{ wp + L, ci(d) }, bf16, 0x4a2, 1.5);
+    const comp = try trialValues(&sc, &.{ nc, ci(d) }, bf16, 0x4a3, 1.5);
+    const sink = try trialValues(&sc, &.{ ci(h), 1 }, bf16, 0x4a4, 1.0);
     var picks: [L * K]i32 = undefined;
     for (&picks, 0..) |*v, i| v.* = if (i % 5 == 3) -1 else @intCast((i * 7) % nc);
     const topk = try sc.ints(&picks, &.{ L, K });
@@ -2277,8 +2286,8 @@ fn bitsEqual(a: []const f32, b: []const f32) bool {
 
 /// Whether the integer matrix arm scores `spec`'s packed keys with the bits of the scalar kernel, over the whole scan
 /// and over a gather of candidate blocks.
-pub fn indexNaxTrial(a: std.mem.Allocator, spec: IndexNaxSpec) !bool {
-    var sc = Scope.plain(a, mlx.gpuStream());
+pub fn indexNaxTrial(a: std.mem.Allocator, s: mlx.mlx_stream, spec: IndexNaxSpec) !bool {
+    var sc = Scope.plain(a, s);
     defer sc.deinit();
     const L = spec.rows;
     const nb = spec.nb;
@@ -2294,8 +2303,8 @@ pub fn indexNaxTrial(a: std.mem.Allocator, spec: IndexNaxSpec) !bool {
             @memcpy(q_h[(L - 1) * 32 * 128 ..], wide);
         }
         break :blk try sc.floats(q_h, &.{ ci(L), 32, 128 });
-    } else try sc.astype(try sc.astype(try randn(&sc, &.{ ci(L), 32, 128 }, .float32, 0x4e4, 1.5), .bfloat16), .float32);
-    const w = try sc.astype(try randn(&sc, &.{ ci(L), 32 }, .float32, 0x4e5, 1.0), .bfloat16);
+    } else try sc.astype(try sc.astype(try trialValues(&sc, &.{ ci(L), 32, 128 }, .float32, 0x4e4, 1.5), .bfloat16), .float32);
+    const w = try sc.astype(try trialValues(&sc, &.{ ci(L), 32 }, .float32, 0x4e5, 1.0), .bfloat16);
     const wscale: f32 = 1.0 / @sqrt(128.0) / @sqrt(32.0);
     const p0 = spec.ratio * (nb -| 20) -| 1;
     const want = try sc_mod.hostF32(try indexScoresPacked(&sc, q, keys.codes, keys.scales, w, wscale, p0, spec.ratio, .fp4_ue8m0, 32));
@@ -2320,14 +2329,15 @@ pub fn indexNaxTrial(a: std.mem.Allocator, spec: IndexNaxSpec) !bool {
 /// bound, partials at the integer bound, a q off the FP4 grid) with the scalar kernel's bits on this GPU, over the whole
 /// scan and a gather: false when a launch fails or a bit differs. Its row counts take every tiling, so every kernel variant
 /// compiles at the load, not inside a request.
-pub fn indexNaxProbe(a: std.mem.Allocator) bool {
+pub fn indexNaxProbe(a: std.mem.Allocator, s: mlx.mlx_stream) bool {
     const had = mlx.errorPending();
-    const ok = indexNaxProbeRun(a) catch false;
+    const ok = indexNaxTrials(a, s) catch false;
     if (!ok) mlx.dropLatchedErrorUnless(had);
     return ok;
 }
 
-fn indexNaxProbeRun(a: std.mem.Allocator) !bool {
+/// Every trial of `indexNaxProbe` on stream `s`; an error is a trial that could not run.
+pub fn indexNaxTrials(a: std.mem.Allocator, s: mlx.mlx_stream) !bool {
     if (!indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return false;
     const specs = [_]IndexNaxSpec{
         .{ .rows = 1, .nb = 1537, .ratio = 1, .key_cycle = 7, .q_cycle = 4, .extreme_every = 13 },
@@ -2335,7 +2345,7 @@ fn indexNaxProbeRun(a: std.mem.Allocator) !bool {
         .{ .rows = 2, .nb = 700, .ratio = 1, .key_cycle = 12, .q_cycle = 4, .wide_row = true },
         .{ .rows = 3, .nb = 700, .ratio = 1, .key_cycle = 9, .q_cycle = 4 },
     };
-    for (specs) |spec| if (!try indexNaxTrial(a, spec)) return false;
+    for (specs) |spec| if (!try indexNaxTrial(a, s, spec)) return false;
     return true;
 }
 
@@ -2813,7 +2823,7 @@ fn probeValues(sc: *Scope, shape: []const c_int, seed: u64, std_dev: f32) !A {
     defer sc.a.free(values);
     var prng = std.Random.DefaultPrng.init(seed);
     for (values) |*v| v.* = prng.random().floatNorm(f32) * std_dev;
-    return sc.keep(mlx.mlx_array_new_data(values.ptr, shape.ptr, @intCast(shape.len), .float32));
+    return sc.floats(values, shape);
 }
 
 fn probeHcExpandIn(sc: *Scope, D: usize) !bool {
@@ -3888,11 +3898,11 @@ test "dsv41 index scores: the integer matrix kernel gives the packed scalar kern
     // key_cycle 7 keeps every key on the matrix path (spreads <= 6, q <= 3), 12 mixes in keys the scalar loop must take,
     // and a q without an FP4 grid or one 15 binades wide sends its row to the scalar loop whole.
     for ([_]usize{ 1, 4, 6, 16 }) |rows| for ([_]usize{ 1, 2 }) |ratio| for ([_]usize{ 7, 12 }) |key_cycle| {
-        try testing.expect(try indexNaxTrial(testing.allocator, .{ .rows = rows, .nb = 1537, .ratio = ratio, .key_cycle = key_cycle, .q_cycle = 4, .extreme_every = 13 }));
+        try testing.expect(try indexNaxTrial(testing.allocator, mlx.gpuStream(), .{ .rows = rows, .nb = 1537, .ratio = ratio, .key_cycle = key_cycle, .q_cycle = 4, .extreme_every = 13 }));
     };
-    for ([_]usize{ 1, 33, 4, 100 }) |nb| try testing.expect(try indexNaxTrial(testing.allocator, .{ .rows = 3, .nb = nb, .ratio = 1, .key_cycle = 10, .q_cycle = 4 }));
-    try testing.expect(try indexNaxTrial(testing.allocator, .{ .rows = 4, .nb = 1537, .ratio = 1, .key_cycle = 12, .q_cycle = 0 }));
-    try testing.expect(try indexNaxTrial(testing.allocator, .{ .rows = 4, .nb = 1537, .ratio = 2, .key_cycle = 12, .q_cycle = 4, .wide_row = true }));
+    for ([_]usize{ 1, 33, 4, 100 }) |nb| try testing.expect(try indexNaxTrial(testing.allocator, mlx.gpuStream(), .{ .rows = 3, .nb = nb, .ratio = 1, .key_cycle = 10, .q_cycle = 4 }));
+    try testing.expect(try indexNaxTrial(testing.allocator, mlx.gpuStream(), .{ .rows = 4, .nb = 1537, .ratio = 1, .key_cycle = 12, .q_cycle = 0 }));
+    try testing.expect(try indexNaxTrial(testing.allocator, mlx.gpuStream(), .{ .rows = 4, .nb = 1537, .ratio = 2, .key_cycle = 12, .q_cycle = 4, .wide_row = true }));
 }
 
 test "dsv41 index scores: the integer matrix kernel gives the bits the scalar kernel gave on scans saved from a long-context decode (DSV41_INDEX_SCANS)" {

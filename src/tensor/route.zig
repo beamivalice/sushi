@@ -46,6 +46,24 @@ pub const Scope = struct {
     }
 };
 
+var holds: u32 = 0;
+
+/// A load that is the engine's alone holds the engine's scope open from its first tensor to its unload: every host
+/// array and vector made for it is the engine's, and an op on an MLX stream is refused by name.
+pub fn hold() void {
+    holds += 1;
+    active = true;
+}
+
+pub fn unhold() void {
+    holds -= 1;
+    if (holds == 0) active = false;
+}
+
+pub fn holding() bool {
+    return holds > 0;
+}
+
 /// Whether a load's mapped weights are wrapped by the engine instead of MLX (`model.wrapRegion`). Set for the span of
 /// a load that runs every forward on the engine: a weight of the engine's lent to MLX is wired a second time.
 pub var own_weights: bool = false;
@@ -105,8 +123,12 @@ pub inline fn side(args: anytype) Side {
     return .mlx;
 }
 
+/// Calls refused by name since the process began: a served request counts none.
+pub var refusals: u64 = 0;
+
 /// A call the engine does not answer, by name.
 pub fn refuse(comptime name: []const u8, comptime why: []const u8) c_int {
+    refusals += 1;
     mlx.latchError("[engine] " ++ name ++ ": " ++ why);
     return 1;
 }

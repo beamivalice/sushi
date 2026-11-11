@@ -24,7 +24,6 @@ const logit_bias = @import("../logit_bias.zig");
 const random = @import("../tensor/random.zig");
 const spec_types = @import("../spec_types.zig");
 const io_util_mod = @import("../io_util.zig");
-const sched_policy = @import("../sched_policy.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const diagEnvValueOn = io_util_mod.diagEnvValueOn;
@@ -51,7 +50,10 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     // A Cooler load's weights and expert slabs are the engine's own buffers, bound, sliced and cast by the engine: an op
     // on MLX's stream would take one as a second buffer over its pages.
     const own_load = dsv41_borrow.ownDecode(&config.dsv41.?);
-    const engine = try Trunk.newExpertEngine(allocator, &config, if (own_load) mlx.engine.stream() else s);
+    if (own_load) mlx.engine.hold();
+    errdefer if (own_load) mlx.engine.unhold();
+    const model_stream = if (own_load) mlx.engine.stream() else s;
+    const engine = try Trunk.newExpertEngine(allocator, &config, model_stream);
     errdefer {
         engine.deinit();
         allocator.destroy(engine);
@@ -61,14 +63,8 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     // The load drops each tensor from the map once its arrays are bound.
     mlx.engine.own_weights = own_load;
     defer mlx.engine.own_weights = false;
-    const model_stream = if (own_load) mlx.engine.stream() else s;
-    const mdl = blk: {
-        const host = mlx.engine.enter(model_stream);
-        defer host.end();
-        break :blk try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
-    };
+    const mdl = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
     errdefer mdl.deinit();
-    if (own_load) mdl.s = s;
     dsv41_model.logMemory(mdl);
     mdl.engine_decode = own_decode;
     const side: dsv41_borrow.DecodeSide = if (own_decode) .engine else dsv41_borrow.decodeSideOf(&config.dsv41.?);
@@ -79,8 +75,8 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
     dsv41_model.setDsparkExact(mdl, if (std.c.getenv("SUSHI_DSV41_DSPARK_EXACT")) |v| diagEnvValueOn(v) else true);
-    dsv41_model.setAttnNax(mdl, kernels.attn_nax_bar);
-    dsv41_model.setIndexNax(mdl);
+    try dsv41_model.setAttnNax(mdl, kernels.attn_nax_bar);
+    try dsv41_model.setIndexNax(mdl);
     dsv41_model.setReadDiag(diagEnvOn("SUSHI_DSV41_READ_DIAG"));
     if (mdl.ced_split) |split|
         log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });
@@ -90,7 +86,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         mdl.profile = try allocator.create(dsv41_model.Profile);
         mdl.profile.?.* = .init(verify_profile);
     }
-    var shell = try initModuleShell(allocator, config, s);
+    var shell = try initModuleShell(allocator, config, model_stream);
     // Only the trunk half: `shell.arch_state` is filled last, so the model and engine have the errdefers above.
     errdefer shell.deinitTrunk();
     if (stq) {
@@ -132,7 +128,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     load_clock.warmDone(warm_t0, made.ns - made_before.ns + plan.made_ns, made.count - count_before + plan.made_count);
     mlx.engine.seal(true);
     // The warm's transients leave the pool, so the load's memory reading is the model's.
-    _ = mlx.mlx_clear_cache();
+    if (!own_load) _ = mlx.mlx_clear_cache();
     mlx.engine.trim();
     return shell;
 }
@@ -524,7 +520,6 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     }
     m.defer_head = m.lazy_head and ctx.lazy_logits and n == 1;
     defer m.defer_head = false;
-    if (own) keepMlxQueue(m);
     if (own) _ = dsv41_model.ownBegin(m);
     if (own) mlx.engine.phase(1);
     defer mlx.engine.phase(0);
@@ -538,16 +533,6 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(m.cfg.vocab) }, 3, if (own) mlx.engine.stream() else self.s));
     return out;
-}
-
-/// MLX's queue runs nothing while decode is on the engine's, and the driver drops the resident set of a queue left
-/// unused: the next MLX submission (a request's end, a prefill) then waits before any work runs. One MLX op per
-/// warm tick keeps it, as the parked inference thread does between requests.
-pub fn keepMlxQueue(m: *dsv41_model.Model) void {
-    const now = mlx.engine.nowNs();
-    if (now -| m.mlx_queue_used_ns < sched_policy.GPU_WARM_TICK_NS) return;
-    m.mlx_queue_used_ns = now;
-    mlx.gpuTouch();
 }
 
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
@@ -572,7 +557,6 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
         try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len);
         engine.beginForward();
     }
-    if (m.engine_decode) keepMlxQueue(m);
     if (m.engine_decode) _ = dsv41_model.ownBegin(m);
     mlx.engine.phase(3);
     defer mlx.engine.phase(0);

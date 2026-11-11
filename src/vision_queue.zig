@@ -344,7 +344,11 @@ fn encodeImageBlock(vision_enc: *VisionEncoder, img: VisionImagePixels) !mlx.mlx
         const n: usize = @as(usize, img.grid_h) * img.grid_w;
         const feat: usize = (img.pixels.len / 4) / n;
         const shape = [_]c_int{ @intCast(n), @intCast(feat) };
-        const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
+        const pixel_arr = blk: {
+            const host = mlx.engine.enter(vision_enc.s);
+            defer host.end();
+            break :blk mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
+        };
         defer _ = mlx.mlx_array_free(pixel_arr);
         return vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w);
     }
@@ -457,15 +461,12 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         combined = emb_parts.items[0];
         emb_parts.items[0] = mlx.mlx_array_new(); // sentinel so the deferred-free path is a no-op
     } else {
-        // Spans a tower made on the engine of our own are joined there: an MLX stream would lend each one.
-        const on_engine = mlx.engine.isOurs(emb_parts.items[0]);
-        const was_active = mlx.engine.active;
-        if (on_engine) mlx.engine.active = true;
-        defer mlx.engine.active = was_active;
+        const host = mlx.engine.enter(vision_enc.s);
+        defer host.end();
         const cat_vec = mlx.mlx_vector_array_new_data(emb_parts.items.ptr, emb_parts.items.len);
         defer _ = mlx.mlx_vector_array_free(cat_vec);
         combined = mlx.mlx_array_new();
-        if (mlx.mlx_concatenate_axis(&combined, cat_vec, 1, if (on_engine) mlx.engine.stream() else vision_enc.s) != 0) {
+        if (mlx.mlx_concatenate_axis(&combined, cat_vec, 1, vision_enc.s) != 0) {
             _ = mlx.mlx_array_free(combined);
             failParts(sch, req, emb_parts.items, "ConcatenateFailed");
             return;
@@ -930,13 +931,13 @@ test "a restored prefix lets the encode skip its images, and the rest match a fu
     try testing.expectEqual(@as(usize, 0), Probe.tower_runs);
 }
 
-test "spans a tower made on the engine are joined on the engine, with no MLX op and no lend" {
+test "an encoder on the engine's stream joins its tower's spans there, with no MLX call and no lend" {
     try mlx.requireGpu();
     const Probe = struct {
         fn tower(_: VisionImagePixels) anyerror!mlx.mlx_array {
             const data = [_]f32{ 1, 2, 3, 4 };
-            mlx.engine.active = true;
-            defer mlx.engine.active = false;
+            const host = mlx.engine.enter(mlx.engine.stream());
+            defer host.end();
             return mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 1, 4 }, 3, .float32);
         }
     };
@@ -949,8 +950,7 @@ test "spans a tower made on the engine are joined on the engine, with no MLX op 
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
-    var encoder: VisionEncoder = .{ .allocator = testing.allocator, .s = mlx.mlx_default_cpu_stream_new() };
-    defer _ = mlx.mlx_stream_free(encoder.s);
+    var encoder: VisionEncoder = .{ .allocator = testing.allocator, .s = mlx.engine.stream() };
     model.vision_encoder = &encoder;
     vision_block_test_hook = Probe.tower;
     defer vision_block_test_hook = null;
@@ -958,14 +958,14 @@ test "spans a tower made on the engine are joined on the engine, with no MLX op 
     const blocks = [_]MediaBlock{ .{ .kind = .image, .rows = 1 }, .{ .kind = .image, .rows = 1 } };
     const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &.{}, .blocks = &blocks };
     var refusal: ?MediaRefusal = null;
-    const ops_before = mlx.engine.mlx_ops;
+    const calls_before = mlx.engine.mlxCalls();
     const lends_before = mlx.engine.stats().lends;
     const joined = try encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal);
     defer _ = mlx.mlx_array_free(joined.embeddings.?);
-    try testing.expect(mlx.engine.isOurs(joined.embeddings.?));
-    try testing.expectEqualSlices(c_int, &.{ 1, 2, 4 }, mlx.getShape(joined.embeddings.?));
-    try testing.expectEqual(ops_before, mlx.engine.mlx_ops);
+    try testing.expectEqual(calls_before, mlx.engine.mlxCalls());
     try testing.expectEqual(lends_before, mlx.engine.stats().lends);
+    try testing.expect(mlx.engine.isOurs(joined.embeddings.?) and !mlx.engine.active);
+    try testing.expectEqualSlices(c_int, &.{ 1, 2, 4 }, mlx.getShape(joined.embeddings.?));
 }
 
 test "undecoded images are decoded a window at a time, freed after their tower call, and a restored prefix never decodes its own" {

@@ -755,8 +755,6 @@ pub const Model = struct {
     own_found_active: bool = false,
     /// Prefill chunks wider than a verify block run there too: set with `engine_decode` at the load.
     engine_prefill: bool = false,
-    /// When MLX's queue last ran work that `dsv41_serving.keepMlxQueue` knows of (`engine.nowNs`).
-    mlx_queue_used_ns: u64 = 0,
     /// Decode forwards that queued layer 0 ahead of their token.
     lazy_starts: u64 = 0,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
@@ -3337,23 +3335,27 @@ pub fn setFused(m: *Model, composed: bool) void {
 
 /// Keeps the matrix-unit attention arm only if its trial against the SIMD kernel at this model's head shape is within
 /// `bar` of the peak; a declined arm leaves the SIMD kernel serving.
-pub fn setAttnNax(m: *Model, bar: f64) void {
+pub fn setAttnNax(m: *Model, bar: f64) !void {
     if (!m.attn_nax or !kernels.attnNaxFits(m.cfg.heads, m.cfg.head_dim)) {
         m.attn_nax = false;
         return;
     }
-    m.attn_nax = kernels.attnNaxProbe(m.gpa, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar);
+    // On the engine a trial that cannot run fails the load: there a launch is never refused for the GPU's sake.
+    m.attn_nax = if (mlx.engine.isStream(m.s))
+        try kernels.attnNaxTrial(m.gpa, m.s, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar)
+    else
+        kernels.attnNaxProbe(m.gpa, m.s, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar);
     if (m.attn_nax) log.info("[dsv41] attention kernel on the matrix units\n", .{}) else log.debug("[dsv41] attention kernel: the matrix-unit trial differs from the SIMD kernel, SIMD serves\n", .{});
 }
 
 /// Keeps the matrix-unit index scan only if its trial gave the scalar kernel's bits on this GPU; a declined arm leaves the
 /// scalar kernel serving.
-pub fn setIndexNax(m: *Model) void {
+pub fn setIndexNax(m: *Model) !void {
     if (!m.index_nax or !kernels.indexNaxFits(.fp4_ue8m0, 32, m.cfg.index_heads, m.cfg.index_head_dim)) {
         m.index_nax = false;
         return;
     }
-    m.index_nax = kernels.indexNaxProbe(m.gpa);
+    m.index_nax = if (mlx.engine.isStream(m.s)) try kernels.indexNaxTrials(m.gpa, m.s) else kernels.indexNaxProbe(m.gpa, m.s);
     if (m.index_nax) log.info("[dsv41] index scan on the matrix units\n", .{}) else log.info("[dsv41] index scan: the matrix-unit trial differs from the scalar kernel, the scalar kernel serves\n", .{});
 }
 
@@ -6279,30 +6281,52 @@ test "dsv41 attention epilogue: the kernel's store gives attnOut's rotated, fp8-
 test "dsv41 attention NAX trial: the release head shape passes it, and a trial outside its bar declines the arm so the SIMD kernel serves" {
     try mlx.requireGpu();
     if (!mlx.streamIsGpu(mlx.gpuStream()) or !kernels.attnNaxFits(64, 512)) return error.SkipZigTest;
-    try testing.expect(kernels.attnNaxProbe(testing.allocator, 64, 512, 64, 8, kernels.attn_nax_bar));
-    try testing.expect(!kernels.attnNaxProbe(testing.allocator, 64, 512, 64, 8, 0));
+    try testing.expect(kernels.attnNaxProbe(testing.allocator, mlx.gpuStream(), 64, 512, 64, 8, kernels.attn_nax_bar));
+    try testing.expect(!kernels.attnNaxProbe(testing.allocator, mlx.gpuStream(), 64, 512, 64, 8, 0));
     // a head shape the kernel does not serve is declined without a launch
-    try testing.expect(!kernels.attnNaxProbe(testing.allocator, 8, 512, 64, 8, kernels.attn_nax_bar));
+    try testing.expect(!kernels.attnNaxProbe(testing.allocator, mlx.gpuStream(), 8, 512, 64, 8, kernels.attn_nax_bar));
 
     const dir = try epiFixtureDir();
     const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = true }, mlx.gpuStream());
     defer m.deinit();
     try testing.expect(m.attn_nax);
-    setAttnNax(m, 0);
+    try setAttnNax(m, 0);
     try testing.expect(!m.attn_nax);
     // a declined arm stays declined
-    setAttnNax(m, kernels.attn_nax_bar);
+    try setAttnNax(m, kernels.attn_nax_bar);
     try testing.expect(!m.attn_nax);
+}
+
+test "dsv41 NAX trials on the engine's stream: the release shapes pass with nothing asked of MLX, and a trial that cannot run is an error, never a declined arm" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits() or !kernels.attnNaxFits(64, 512) or !kernels.indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    const s = mlx.engine.stream();
+    // As a load that is the engine's runs them.
+    mlx.engine.hold();
+    defer mlx.engine.unhold();
+    const calls = mlx.engine.mlxCalls();
+    try testing.expect(try kernels.attnNaxTrial(testing.allocator, s, 64, 512, 64, 8, kernels.attn_nax_bar));
+    try testing.expect(!try kernels.attnNaxTrial(testing.allocator, s, 64, 512, 64, 8, 0));
+    try testing.expect(try kernels.indexNaxTrials(testing.allocator, s));
+    try testing.expectEqual(calls, mlx.engine.mlxCalls());
+
+    // A trial that meets an MLX stream there: the refusal comes back, the arm is not declined.
+    const had = mlx.errorPending();
+    try testing.expectError(error.MlxError, kernels.attnNaxTrial(testing.allocator, mlx.gpuStream(), 64, 512, 64, 8, kernels.attn_nax_bar));
+    mlx.dropLatchedErrorUnless(had);
 }
 
 test "dsv41 index NAX trial: the release shape passes it, and a model whose index heads the kernel does not serve keeps the scalar kernel" {
     try mlx.requireGpu();
     if (!mlx.streamIsGpu(mlx.gpuStream()) or !kernels.indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return error.SkipZigTest;
-    try testing.expect(kernels.indexNaxProbe(testing.allocator));
+    try testing.expect(kernels.indexNaxProbe(testing.allocator, mlx.gpuStream()));
     const m = try tinyModel(try epiFixtureDir(), .{ .act = .bfloat16, .qat = true }, mlx.gpuStream());
     defer m.deinit();
     try testing.expect(m.index_nax);
-    setIndexNax(m);
+    try setIndexNax(m);
     try testing.expect(!m.index_nax);
 }
 

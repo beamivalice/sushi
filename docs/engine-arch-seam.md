@@ -74,7 +74,9 @@ without it. An arch added later joins the list in the landing that adds it.
   the type of the one `Ctx.request` a built arch declares (`NoRequest` when none does). A moved field leaves `Trunk` in
   the commit that fills its `State`: two owners of one pointer release it twice.
 - **Load, prefill and bill hooks an arch may declare** (every one optional; the default is stated where it is called).
-  `arch.zig`: the `prefill_start_width` fact, `ubench`, `tools`. The `load` slot (`arch/load.zig`) beside its
+  `arch.zig`: the `prefill_start_width` fact, `ubench`, `tools`, `ownStream(config)` (the stream a load runs on
+  when the arch brings one: `Trunk.init` takes the thread's GPU stream otherwise; a tower's `ownStream()` says the same
+  to the image encoder). The `load` slot (`arch/load.zig`) beside its
   `weights` and `residentLoadBytes`: `drafterOff`, `stageDrafter`, `prepareDrafter`, `loadDflash`, `bindDflash`,
   `dflashRowBounds(min, max, drafter_block)`, `logLoad`, `logDflashReady`, `warmUbench`, which `model_load.zig` calls by the
   config's arch; `bindDflash` returns whether the arch takes the drafter (an error is a bind that failed), and the refusal that

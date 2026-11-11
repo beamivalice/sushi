@@ -10,13 +10,14 @@ const Weights = model_mod.Weights;
 /// owning its own weights and GPU stream.
 pub const VisionEncoder = struct {
     allocator: std.mem.Allocator,
-    /// Stream for the ops that join per-image embeddings.
+    /// Stream the patch arrays are made for and the per-image embeddings are joined on: the tower's own when it
+    /// brings one.
     s: mlx.mlx_stream,
     tower: ?arch_media.Tower = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights) !VisionEncoder {
         const tower = try arch_media.Tower.init(allocator, config, weights);
-        return .{ .allocator = allocator, .s = mlx.mlx_default_gpu_stream_new(), .tower = tower };
+        return .{ .allocator = allocator, .s = tower.ownStream() orelse mlx.mlx_default_gpu_stream_new(), .tower = tower };
     }
 
     pub fn deinit(self: *VisionEncoder) void {

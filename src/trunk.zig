@@ -925,7 +925,7 @@ pub const Trunk = struct {
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights) !Trunk {
         // The thread's default GPU stream, not a dedicated one: mlx streams are thread-local.
-        const s = mlx.gpuStream();
+        const s = arch_life.ownStream(&config) orelse mlx.gpuStream();
         fp8_block.tile_nax = verifyQmmNaxAvailable();
         return arch_life.init(io, allocator, config, weights, s);
     }

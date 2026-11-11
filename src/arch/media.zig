@@ -94,6 +94,13 @@ pub const Tower = struct {
         }
     }
 
+    /// The stream the tower runs on when it brings one; null for a stream of the caller's.
+    pub fn ownStream(self: *const Tower) ?mlx.mlx_stream {
+        switch (self.arch) {
+            inline else => |*t| return if (comptime @hasDecl(@TypeOf(t.*), "ownStream")) t.ownStream() else null,
+        }
+    }
+
     pub fn forward(self: *Tower, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         switch (self.arch) {
             inline else => |*t| return t.forward(patches, grid_h, grid_w),

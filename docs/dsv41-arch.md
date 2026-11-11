@@ -1179,9 +1179,8 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   tower on MLX. Only the shapes an image reaches are ported, and the load checks that (`engineGap`): the images the
   release processor admits give the tower 1,084 to 9,198 patches and 164 to 1,022 aligner cells, against the 257 rows
   (33 for the aligner) from which MLX's plan is the matrix-unit tile the engine runs, so MLX's vector kernels and
-  split-K plan are reached by no request. A pack whose vision config could reach them, a head dimension but 64 or a GPU
-  without matrix units keeps the tower on MLX with a `[vision] tower stays on MLX` line; a request never meets a
-  refusal MLX would not give. The pass runs under the pool budget of `encodeScratchBytes` and trims the pool at its
+  split-K plan are reached by no request. A pack whose vision config could reach them, or a head dimension but 64,
+  refuses a Cooler load by name (`VisionTowerNotPorted`, with the shape found); the MLX route serves it. The pass runs under the pool budget of `encodeScratchBytes` and trims the pool at its
   end. The load runs one block over five patch counts so that each pipeline an image reaches (query chunks whole or
   short of a 64, keys whole 32s or not, a last chunk of 8 rows or fewer) is made then, `[vision] engine tower warmed`
   reports them, and their recipes ride the pipeline manifest: a same-key load makes them with the rest and runs no

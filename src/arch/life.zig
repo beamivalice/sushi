@@ -25,6 +25,14 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: trunk.ModelConfig,
     };
 }
 
+/// The stream a load of `config` runs on when its arch brings one; null for the thread's GPU stream.
+pub fn ownStream(config: *const trunk.ModelConfig) ?mlx.mlx_stream {
+    const tag = registry.ofModelType(config.model_type) orelse return null;
+    switch (tag) {
+        inline else => |t| return if (comptime @hasDecl(registry.Mod(t), "ownStream")) registry.Mod(t).ownStream(config) else null,
+    }
+}
+
 /// Frees the arch's own state, then the trunk's.
 pub fn deinit(a: Arch) void {
     switch (a) {

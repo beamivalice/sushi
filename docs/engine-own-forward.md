@@ -35,8 +35,8 @@ open (only after a round failed): the MLX route's logits, byte for byte. An imag
 routing bias read row by row, the Engram write masked by row), whose pipelines a load with the image bias warms at
 every decode width and at a prefill width (`dsv41_model.warmOwnImages`).
 
-What a wide chunk still asks of MLX: the keep-alive op of MLX's queue. The slabs, their views and the union workspace
-of a spilled route are the engine's own on a Cooler load.
+A wide chunk asks nothing of MLX: the slabs, their views and the union workspace of a spilled route are the engine's
+own on a Cooler load.
 
 A DSpark round's verdict, greedy or sampled, is decided on the engine wherever its verify ran there.
 
@@ -144,25 +144,35 @@ route and the MLX arm still build the bank at prepare time.
   made. Another file declaring an `mlx_*` extern fails the `mlx-extern` lint; an address of the library for `dladdr`
   is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes no call
   into mlx-c (pinned in `dsv41_generate_test.zig`).
-- **What a Cooler request still asks of MLX is pinned phase by phase** (the census test in `dsv41_generate_test.zig`:
-  the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore point captured and
-  restored, a step after it, an image prompt, the unload). A change that adds a call fails it; a stage of the move off
-  MLX lowers a row; the target of every row is zero. `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry
-  point. Every phase of a request makes no call at all: the rounds and the serial steps through the generator, a
-  restore point captured and restored, in RAM and through the SSD tier (its own test, with the restored state
-  compared byte for byte), a step after it and an image prompt. What a caller makes for a forward is of the side the
-  forward's output is on (`Trunk.outStream`): the generator's token arrays (`generate.idsArray`), the slice of the
-  prefill's last logits, the reserved-token mask the sampler applies every round (`sampler.installSuppressMask`; made
-  on MLX it was imported once a round, a vocabulary of bools each time). A model that forwards on the engine asks MLX
-  for no pool clear either (`generate.clearPool`). The free of an empty handle is no call (`mlx_array_free` in the
-  seam): mlx-c holds nothing for one.
-  The load itself (the weights and the model over them, not the fixture's own reads) makes 25 calls: the shared trunk
-  shell's six scalar constants, cast on MLX's stream, and one touch of MLX's queue.
-  A phase's ops are exact. Its calls are held under a ceiling and within a twentieth of it, so a real cut moves the
-  ceiling. The census counts a load that is not the process's first (it opens and closes the pack once before): what
-  a process asks once (the device's description, a kernel probe) is its first load's, and with that kept out a row
-  reads the same alone and after other tests. Dispatches still follow what the process ran before (a 12-token request
-  read 7,336 as a process's only load and 7,017 after other loads).
+- **A Cooler load, its requests and its unload ask nothing of MLX, pinned phase by phase** (the census test in
+  `dsv41_generate_test.zig`: the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore
+  point captured and restored, a step after it, an image prompt, the unload; the SSD tier has its own test, with the
+  restored state compared byte for byte). Every row is zero calls, and a change that adds one fails it.
+  `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry point. The free of an empty handle is no call
+  (`mlx_array_free` in the seam): mlx-c holds nothing for one. The census counts a load that is not the process's
+  first (it opens and closes the pack once before): what a process asks once (the device's description, the memory
+  limits) is its first load's, and with that kept out a row reads the same alone and after other tests. Dispatches
+  still follow what the process ran before (a 12-token request read 7,336 as a process's only load and 7,017 after
+  other loads).
+- **A Cooler load holds the engine's scope from its first tensor to its unload** (`engine.hold`, `engine.unhold`,
+  counted, so a second load's unload leaves the first one's). Its trunk's stream is the engine's (`arch_life.ownStream`,
+  the arch hook `Trunk.init` asks before it would take the thread's GPU stream), so `xfm.s`, `m.s` and
+  `Trunk.outStream` are one stream, every host array, scalar and vector made for the load is the engine's wherever it
+  is made, and an op that reaches an MLX stream is refused by name instead of lending a tensor. What a held scope
+  turned up, each of which had been a call or an import per round or per request: the `-inf` scalar of the greedy
+  verify's reserved-token mask (`spec_types.verifyArgmax`), the warm-up's token arrays, the think-marker mask, an
+  image's patch array, the trunk shell's scalar constants. The `[engine] since load` line counts the refusals; a
+  served request counts none.
+- **A trial that picks a kernel arm runs on the load's stream.** The attention and index-scan matrix-unit trials
+  (`kernels.attnNaxTrial`, `indexNaxTrials`) ran on MLX's stream with MLX's normal draw; inside a held scope both
+  were refused, the refusal read as "the trial differs", the SIMD and scalar kernels served and four of five live
+  replies changed bytes. On the engine's stream the inputs are made on the host (`trialValues`) and a trial that
+  cannot run fails the load (`setAttnNax`, `setIndexNax`); on MLX's stream a failed launch still declines the arm,
+  as a GPU without matrix units needs.
+- **A tower the engine cannot run refuses a Cooler load** (`error.VisionTowerNotPorted`, with the shape that
+  `engineGap` found); it no longer stays on MLX beside the engine. The MLX route serves such a pack. The image
+  encoder's own stream is the tower's (`Tower.ownStream`): the patch arrays and the join of several images' spans are
+  the engine's there.
 - **A Cooler load runs no forward on MLX.** The load's warm used to run three prefill chunks through MLX whatever
   the decode side; they only built the state the engine's own warms start from. Where prefill is the engine's they
   run on the engine, and with the pipelines read from a manifest they do not run at all.
@@ -183,11 +193,10 @@ route and the MLX arm still build the bank at prepare time.
   zeros met the engine's first step while MLX's own command buffer could still be in flight, so that step copied the
   ring into the pool or wrote it in place by timing, and an in-place one asked MLX who holds it at every later step.
   No forward of a Cooler load runs on MLX.
-- **MLX's queue is kept in use while decode runs on ours** (`dsv41_serving.keepMlxQueue`). The driver drops the
-  resident set of a queue left unused for about a second, and the next MLX submission then waits before any work
-  runs: a request's end (the commit's first MLX eval) took 0.56 to 0.77 s, a 2 s gap between MLX ops 0.55 s, a
-  0.5 s gap 0.2 ms (M5 Max, STQ 1.75bpw, 53+256 tokens, this change on 90c83d71). One synced MLX op per
-  `GPU_WARM_TICK_NS` keeps it, the tick the parked inference thread runs between requests.
+- **Nothing keeps MLX's queue in use under a Cooler load.** While a request's end still ran on MLX, a queue left
+  unused for about a second made that end wait 0.56 to 0.77 s, and one MLX op per warm tick kept it
+  (`keepMlxQueue`, now deleted). No part of a request runs on MLX, so nothing waits on its queue: the idle tick
+  (`mlx.gpuTouch`) passes the engine's queue alone under a held scope.
 - The two accessors (`patches/mlxc-metal-buffer.patch`) are temporary aids of the transition; they go when decode no
   longer reads memory that MLX holds.
 
@@ -304,7 +313,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   `active = false` at the end of a callee closed its caller's scope, and every host array the caller made after it
   was MLX's (the wide warm's token arrays, a prefill chunk's scalars). A forward's scope counts its depth on the model
   (`ownBegin`, `ownEnd`), and DeepSeek's `Scope` makes a scalar or a host array on the side of its own stream,
-  whether or not a forward is open.
+  whether or not a forward is open. Under a Cooler load what they find, and give back, is the load's held scope.
 - **Maps are the engine's inside its scope** (`route.zig`: names to arrays, names to strings, the iterator): a map
   made under `engine.enter` is tagged like a vector, every call that takes one follows it, and a name it lacks
   answers 2 with no error latched, as mlx-c does. The SSD tier's readers hand tensors around in them.
