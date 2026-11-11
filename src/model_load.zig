@@ -1774,9 +1774,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             wired_floor: u64,
             pub fn read(r: *@This()) u64 {
                 if (!r.sushi) return bills.effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit);
-                var active: usize = 0;
-                _ = mlx.mlx_get_active_memory(&active);
-                return bills.effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, active, r.wired_floor);
+                return bills.effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, gpu_mem.activeBytes(), r.wired_floor);
             }
             pub fn sleep(r: *@This()) void {
                 std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
@@ -1796,8 +1794,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
             needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
-        var active: usize = 0;
-        if (reader.sushi) _ = mlx.mlx_get_active_memory(&active);
+        const active: usize = if (reader.sushi) gpu_mem.activeBytes() else 0;
         log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup + net or context ~{d:.2} GB)\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),

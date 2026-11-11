@@ -13,18 +13,25 @@ fn liveRead() noreturn {
     @panic("a host-tier test read the live GPU: it belongs in bills_live_test.zig");
 }
 
+/// Bytes MLX has in use plus the engine's pool buffers bound to live tensors. Safe off the inference thread: the
+/// engine's side is two atomics, and a tensor lent to MLX is in both counters, so the sum errs high, never low.
 pub fn activeBytes() usize {
     if (host_tier) return liveRead();
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
-    return active;
+    return active + engineInUse();
 }
 
+/// MLX's reclaimable pool plus the engine's free pool buffers: held by the process, reusable only by their owner.
 pub fn cacheBytes() usize {
     if (host_tier) return liveRead();
     var cache: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache);
-    return cache;
+    return cache + mlx.engine.poolFree();
+}
+
+fn engineInUse() usize {
+    return mlx.engine.poolTotal() -| mlx.engine.poolFree();
 }
 
 /// Read once on the main thread in `resolveMlxCadence`: the limit is static per device, and a
@@ -62,10 +69,8 @@ pub fn getGpuWorkingSetLimit() u64 {
 /// clean both ways: right after a load it lags low while the weights are still being wired, and
 /// after an unload it lags high while freed pages unwire.
 pub fn measureGpuFloor() void {
-    var active: usize = 0;
-    var cache: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active);
-    _ = mlx.mlx_get_cache_memory(&cache);
+    const active = activeBytes();
+    const cache = cacheBytes();
     const in_use = metrics.getGpuInUseSystemMemBytes();
     const floor = bills.gpuFloorFrom(in_use, active, cache);
     bills.gpu_floor_bytes.store(floor, .monotonic);
@@ -80,10 +85,8 @@ pub fn measureGpuFloor() void {
 /// Inference thread, no model resident: other processes may have released GPU memory since
 /// startup. Lowers the floor, never raises it (`bills.idleGpuFloor`).
 pub fn refreshIdleGpuFloor() void {
-    var active: usize = 0;
-    var cache: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active);
-    _ = mlx.mlx_get_cache_memory(&cache);
+    const active = activeBytes();
+    const cache = cacheBytes();
     const in_use = metrics.getGpuInUseSystemMemBytes();
     const was = bills.gpu_floor_bytes.load(.monotonic);
     const floor = bills.idleGpuFloor(was, in_use, active, cache);

@@ -1,6 +1,6 @@
 const std = @import("std");
 const fx = @import("request_media_fixtures_test.zig");
-const mlx = @import("mlx.zig");
+const gpu_mem = @import("gpu_mem.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
@@ -498,8 +498,7 @@ pub fn visionEncodeBillBytes(config: *const model_mod.ModelConfig, images: []con
 
 /// What `scheduler_mod.vision_encode_available` reads on the inference thread, right before an encode.
 pub fn visionEncodeAvailable(config: *const model_mod.ModelConfig) u64 {
-    var active_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
+    const active_mem = gpu_mem.activeBytes();
     return currentGpuMemoryCeiling(config, active_mem) -| active_mem;
 }
 

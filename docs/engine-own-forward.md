@@ -193,6 +193,9 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 - **The pool is the engine's allocator**: a tensor's bytes are a Metal buffer of whole pages, in sizes sixteen to an
   octave, so a buffer is under 1/16 larger than what was asked. A dropped buffer waits in the pool for the next tensor
   of its size.
+- **The pool's bytes are published for other threads**: `core.poolTotal` and `core.poolFree` mirror `Stats.pool_bytes` and
+  `pool_free` as atomics, stored where the pool changes; `gpu_mem` adds them to MLX's counters
+  ([engine-memory-admission](engine-memory-admission.md#gpu-memory-readers)).
 - **A forward runs under a budget** (`core.budget`): Metal holds for the pool at most the budget beyond what the
   tensors in use ask for, free buffers and size rounding included. A new buffer that would pass it first takes the
   room of free ones, the largest first (waiting for a pass that still binds them); with none left the op is refused

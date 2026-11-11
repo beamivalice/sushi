@@ -1,5 +1,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const gpu_mem = @import("gpu_mem.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const chat_mod = @import("chat.zig");
@@ -654,7 +655,7 @@ fn writeMemoryReportFields(w: *std.Io.Writer, report: MemoryReport) !void {
 
 pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Options, out: *Out) !void {
     var memory: MemoryReport = undefined;
-    try mlx.check(mlx.mlx_get_active_memory(&memory.model_active_bytes));
+    memory.model_active_bytes = gpu_mem.activeBytes();
     try mlx.check(mlx.mlx_reset_peak_memory());
 
     var base = try fixture_mod.readBaseline(allocator, io, opts.fixture);
@@ -810,8 +811,8 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
     const mean_cosine_loss_eos = total_cosine_loss_eos / positions_eos_f;
     const mean_top1_eos = @as(f64, @floatFromInt(total_top1_eos)) / positions_eos_f;
     try mlx.check(mlx.mlx_get_peak_memory(&memory.peak_active_bytes));
-    try mlx.check(mlx.mlx_get_active_memory(&memory.final_active_bytes));
-    try mlx.check(mlx.mlx_get_cache_memory(&memory.final_cache_bytes));
+    memory.final_active_bytes = gpu_mem.activeBytes();
+    memory.final_cache_bytes = gpu_mem.cacheBytes();
 
     out.print("{s:<48} {d:>14.9} {d:>6}/{d:<3} {d:>14.9}   to-eos {d:>12.9} {d:>3}/{d:<3} {d:>12.9}\n", .{ "mean", mean_kld, total_top1, total_positions, mean_nll, mean_kld_eos, total_top1_eos, total_positions_eos, mean_nll_eos });
     out.print("[kld] {s}: to-first-EOS mean KLD={d:.9} top1={d:.6} NLL={d:.9} cosine={d:.9} loss={d:.9} worst_loss={d:.9} over {d} positions\n", .{

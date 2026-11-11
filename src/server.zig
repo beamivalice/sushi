@@ -2,7 +2,6 @@ const std = @import("std");
 const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
 const settings_resolve = @import("settings_resolve.zig");
-const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -2920,11 +2919,9 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.metrics.gpu_clock_mhz.set(gpu_clock_live.sampleMhz());
     ctx.metrics.gpu_clock_max_mhz.set(gpu_clock_live.maxMhz());
     ctx.metrics.memory_mb.set(@as(u64, metrics.getAppMemFootprintMb()));
-    // The two halves of the MLX allocator, so `memory_mb`'s gap has a name.
-    var mlx_active: usize = 0;
-    var mlx_cache: usize = 0;
-    _ = mlx.mlx_get_active_memory(&mlx_active);
-    _ = mlx.mlx_get_cache_memory(&mlx_cache);
+    // The two halves of the GPU allocators (MLX's and the engine's), so `memory_mb`'s gap has a name.
+    const mlx_active = gpu_mem.activeBytes();
+    const mlx_cache = gpu_mem.cacheBytes();
     ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
     // qwen4 n-gram table warm (F8) — same lock-free published-atomic pattern.

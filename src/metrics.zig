@@ -118,9 +118,9 @@ pub const Metrics = struct {
     // Slots currently in prefill. Flips as soon as prefill starts, so the panel
     // can name the phase without waiting for the first chunk's token count.
     requests_prefilling: Gauge,
-    // MLX allocator split. `memory_mb` above is the whole process footprint;
+    // GPU allocator split (`gpu_mem`: MLX's plus the engine's). `memory_mb` above is the whole process footprint;
     // these two say where it went. `mlx_active_bytes` is memory in USE,
-    // `mlx_cache_bytes` is MLX's reclaimable buffer pool — memory the process
+    // `mlx_cache_bytes` is the reclaimable buffer pool — memory the process
     // HOLDS but is not using, which MLX only returns to the OS on a
     // `mlx_clear_cache()` or when its own (enormous) GC limit trips.
     // `memory_mb - active` staying flat while `cache` climbs is the #110
@@ -285,8 +285,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "sushi:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
     try writeGauge(w, "sushi:prefill_tokens_expected", "Total tokens the in-flight prefill will forward, post-cache tail on the same scale as prefill_tokens_live (0 when idle; the bar's real target)", m.prefill_tokens_expected.load());
     try writeGauge(w, "sushi:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
-    try writeGauge(w, "sushi:mlx_active_bytes", "Bytes MLX's allocator currently has in use", m.mlx_active_bytes.load());
-    try writeGauge(w, "sushi:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool (held by the process, not in use)", m.mlx_cache_bytes.load());
+    try writeGauge(w, "sushi:mlx_active_bytes", "Bytes MLX's allocator and the engine's pool currently have in use", m.mlx_active_bytes.load());
+    try writeGauge(w, "sushi:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool and the engine's free pool buffers (held by the process, not in use)", m.mlx_cache_bytes.load());
     try writeGauge(w, "sushi:ngram_warm_bytes", "Bytes of the qwen4 n-gram table read so far by the background page-cache warm (0 when off or done with no table resident)", m.ngram_warm_bytes.load());
     try writeGauge(w, "sushi:batched_group_size", "Slots in the last batched decode group (0 when the last tick batched nothing)", m.batched_group_size.load());
     try w.print("# HELP sushi:decode_serial_total Slot-ticks that decoded serial beside other live slots, by reason\n# TYPE sushi:decode_serial_total counter\n", .{});

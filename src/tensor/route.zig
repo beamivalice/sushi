@@ -269,6 +269,8 @@ pub fn mlx_array_data_uint8(a: A) ?[*]const u8 {
 pub const isOurs = core.isOurs;
 pub const stream = core.stream;
 pub const stats = core.stats;
+pub const poolTotal = core.poolTotal;
+pub const poolFree = core.poolFree;
 pub const pin = core.pin;
 pub const unpin = core.unpin;
 pub const pinnedCount = core.pinnedCount;

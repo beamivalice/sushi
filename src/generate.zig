@@ -1,6 +1,7 @@
 const std = @import("std");
 const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
+const gpu_mem = @import("gpu_mem.zig");
 const model_handle = @import("model_handle.zig");
 const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -1721,7 +1722,7 @@ pub const Generator = struct {
                     const eval_dt = prefill_sw.read() - eval_start_ns;
                     eval_ns += eval_dt;
                     var mem_buf: [256]u8 = undefined;
-                    const line = formatPrefillMemLine(&mem_buf, pos, end, eval_dt / std.time.ns_per_ms, mlxPrefillMem());
+                    const line = formatPrefillMemLine(&mem_buf, pos, end, eval_dt / std.time.ns_per_ms, prefillMem());
                     log.debug("{s}", .{line});
                     // The next line's peak is then its own chunk's: what a transient bill is fitted to.
                     if (chunk_peak) _ = mlx.mlx_reset_peak_memory();
@@ -4071,14 +4072,10 @@ test "tokensPerSec basic and zero-time" {
 
 const PrefillMem = struct { active: usize, cache: usize, peak: usize };
 
-fn mlxPrefillMem() PrefillMem {
-    var active: usize = 0;
-    var cache: usize = 0;
+fn prefillMem() PrefillMem {
     var peak: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active);
-    _ = mlx.mlx_get_cache_memory(&cache);
     _ = mlx.mlx_get_peak_memory(&peak);
-    return .{ .active = active, .cache = cache, .peak = peak };
+    return .{ .active = gpu_mem.activeBytes(), .cache = gpu_mem.cacheBytes(), .peak = peak };
 }
 
 fn formatPrefillMemLine(buf: []u8, pos: usize, end: usize, eval_ms: u64, mem: PrefillMem) []const u8 {

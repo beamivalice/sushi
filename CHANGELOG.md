@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash on Sushi Cooler reports the engine's memory**: the memory figures in `/props` and the dashboard,
+  and the admission checks, now count the bytes sushi's own engine holds beside MLX's.
 - **DeepSeek-V4.1-Flash on Sushi Cooler does less host work per token**: the engine keeps hold of the model's weights
   for the whole load, finds a kernel it has already used without rebuilding its key and sets up a kernel launch
   without calling MLX, so the CPU has less to do between GPU passes.

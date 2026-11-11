@@ -4,6 +4,7 @@ const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const mlx = @import("mlx.zig");
+const gpu_mem = @import("gpu_mem.zig");
 const trunk = @import("trunk.zig");
 const generate_mod = @import("generate.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
@@ -965,13 +966,10 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
 
     const safe_ctx = computeMaxSafeContext(config);
 
-    // Query memory usage from mlx's allocator counters, plus its reclaimable
-    // buffer pool.
-    var active_mem: usize = 0;
+    // The allocators' counters (MLX's and the engine's) and their reclaimable pools; the peak is MLX's alone.
+    const cache_mem = gpu_mem.cacheBytes();
+    const active_mem = gpu_mem.activeBytes();
     var peak_mem: usize = 0;
-    var cache_mem: usize = 0;
-    _ = mlx.mlx_get_cache_memory(&cache_mem);
-    _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
 
     // Free system RAM — same calc as the model-load pre-flight, so the app's
@@ -1015,9 +1013,8 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
 /// `MemoryInfo.parse` client-side reads only that key — with the model
 /// fields omitted (there is no model config to describe).
 pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
-    var active_mem: usize = 0;
+    const active_mem = gpu_mem.activeBytes();
     var peak_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
     const update_json = try update_mod.propsJson(allocator);

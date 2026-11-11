@@ -526,3 +526,24 @@ a named 503. The pool is inside the cap, so a prefill's pool is no separate bill
 ## Observing memory
 
 `/props` reports `active_bytes`, `memory.cache_bytes`, `batching`; RSS is blind to Metal.
+
+### GPU memory readers
+
+`gpu_mem.activeBytes` is MLX's active bytes plus the engine's pool buffers bound to live tensors
+(`pool_bytes - pool_free`); `gpu_mem.cacheBytes` is MLX's cache plus the engine's free buffers (`pool_free`). Not
+`pool_asked`, which leaves out the size-class rounding the Metal buffer holds. A free engine buffer is held by the
+process and reusable only by the engine, which gives it back under its budget (`core.budget`), as MLX gives back its
+cache. Both are safe off the inference thread: the engine publishes `pool_bytes` and `pool_free` as two atomics where
+the pool changes (`core.poolTotal`, `core.poolFree`), while `core.stats()` is a plain read of state the inference
+thread writes. GLM, MiMo, Qwen and DeepSeek on MLX never make an engine buffer, so their readings are MLX's own. A
+tensor lent to MLX is in both counters, so the sum errs high.
+
+- **Through `gpu_mem`** (count the engine): every bill and admission read in `bills.zig`, `dsv41Headroom` (it adds
+  nothing of its own), `visionEncodeAvailable`, the load preflight, the gauge sampler (`mlx_active_bytes`,
+  `mlx_cache_bytes`, the history ring), `/props` (`active_bytes`, `cache_bytes`), `sushi kld`'s memory report, the
+  `[prefill-trace]` line, and the GPU floor (`measureGpuFloor`, `refreshIdleGpuFloor`).
+- **MLX direct, on purpose**: every peak (`/props` `peak_bytes`, `[prefill-trace]` `peak_bytes`, the load's fwd-ubench,
+  `sushi chat`'s peak line, the encoder and the vision/ubench fits) because the engine keeps no peak; the DeepSeek
+  transient cap (`mlxSetTransient`), which limits MLX's own allocator; `[transient-peak]` pool_gb, MLX's pool; tests
+  that measure what an MLX op allocates.
+- A new reader of the GPU's bytes goes through `gpu_mem`; a raw `mlx_get_*_memory` is for MLX's own allocator only.

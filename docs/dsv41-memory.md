@@ -119,10 +119,13 @@ request bill carries the decode cap a second time, for the engine's pool: 0.28 /
 1M tokens. The engine's forward makes on its own queue what MLX's made on MLX's, and each allocator is held to the
 cap separately.
 
-The live headroom the borrow reads (`dsv41Headroom`) counts the engine's pool beside MLX's active bytes, which do not
-see it (`Stats.pool_bytes`: tensors in use and free buffers, so the state rows, window rings and rollback record the
-engine holds). The cap bills the pool's growth over its tensors in use; the live read counts what it holds now. A
-tensor lent to MLX is in both counters, so the headroom errs low.
+The live headroom the borrow reads (`dsv41Headroom`) is the ceiling less `gpu_mem.activeBytes`, which holds the
+engine's pool buffers bound to live tensors (the state rows, window rings and rollback record) beside MLX's active
+bytes; the ceiling's footprint adds `gpu_mem.cacheBytes`, which holds the engine's free buffers. The headroom also
+takes off the engine's free buffers (`engine.poolFree`): MLX makes what a borrow frees room for, and nothing on MLX's
+side can reclaim a buffer the engine holds. The cap bills the pool's growth over its tensors in use; the live read
+counts what it holds now. A tensor lent to MLX is in both counters, so the headroom errs low
+([engine-memory-admission](engine-memory-admission.md#gpu-memory-readers)).
 
 The pool growth (7.5 GB) was most of the old bill and the cap replaces it: a 2048-row chunk's need falls 8.3-8.7 GB,
 the rest being the measured per-row rate against the old formula. At wired 124000 with DSpark and the SSD tier on (the

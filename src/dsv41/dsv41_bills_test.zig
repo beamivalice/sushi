@@ -133,7 +133,7 @@ test "DeepSeek's live headroom and its load fit each count the decode pool the l
     try t.expectEqual(bill - config.expertPoolBytes(), bills.expertStreamingServingBytes(&config));
 }
 
-test "DeepSeek's live headroom is lower by every byte the engine of our own holds beside MLX's active bytes" {
+test "DeepSeek's live headroom is the ceiling less the active bytes and the engine's free buffers, each once, and zero when they pass it" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
@@ -141,8 +141,9 @@ test "DeepSeek's live headroom is lower by every byte the engine of our own hold
     const gb: u64 = 1 << 30;
     const without = dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, 0, &config);
     try t.expectEqual(dsv41_bill.dsv41HeadroomOf(40 * gb, &config), without);
+    try t.expectEqual(without - 3 * gb, dsv41_bill.dsv41HeadroomFrom(100 * gb, 63 * gb, 0, &config));
     try t.expectEqual(without - 3 * gb, dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, 3 * gb, &config));
-    // Held past the ceiling, the headroom is zero, never wrapped.
+    try t.expectEqual(@as(u64, 0), dsv41_bill.dsv41HeadroomFrom(100 * gb, 110 * gb, 0, &config));
     try t.expectEqual(@as(u64, 0), dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, 50 * gb, &config));
 }
 

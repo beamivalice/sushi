@@ -222,6 +222,24 @@ pub fn stats() Stats {
     return if (state) |s| s.stats else .{};
 }
 
+/// `Stats.pool_bytes` and `pool_free` for a thread that is not the inference thread (`stats` is a plain read of
+/// state it writes): stored where they change, a relaxed store each, so a launch takes no lock for them.
+var pool_total = std.atomic.Value(u64).init(0);
+var pool_unused = std.atomic.Value(u64).init(0);
+
+pub fn poolTotal() u64 {
+    return pool_total.load(.monotonic);
+}
+
+pub fn poolFree() u64 {
+    return pool_unused.load(.monotonic);
+}
+
+fn publishPool(s: *const State) void {
+    pool_total.store(s.stats.pool_bytes, .monotonic);
+    pool_unused.store(s.stats.pool_free, .monotonic);
+}
+
 // ── Kernel profile ──
 
 /// Tests set this; otherwise `SUSHI_ENGINE_KERNEL_PROF` decides, read once.
@@ -399,6 +417,7 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
         store.len = len;
         s.stats.pool_free -= bytes;
         s.stats.pool_asked += len;
+        publishPool(s);
         return store;
     }
     if (s.pool_limit) |limit| {
@@ -410,6 +429,7 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
     store.* = .{ .buffer = buffer, .at = 0, .ptr = buffer.bytes().ptr, .len = len, .origin = .{ .pool = @intCast(class) } };
     s.stats.pool_bytes += bytes;
     s.stats.pool_asked += len;
+    publishPool(s);
     return store;
 }
 
@@ -441,6 +461,7 @@ fn evict(s: *State, bytes: u64) bool {
             s.stats.pool_evictions += 1;
         }
     }
+    publishPool(s);
     return s.stats.pool_bytes <= bytes;
 }
 
@@ -476,6 +497,7 @@ fn dropStore(store: *Store) void {
                 s.stats.pool_bytes -= classBytes(class);
                 gpa.destroy(store);
             }
+            publishPool(s);
         },
         // The buffer aliases the array's pages: the last pass that binds it runs before the array may go.
         .mlx => if (store.seq > s.done) {
@@ -1141,6 +1163,30 @@ test "a fresh tensor comes from the pool and goes back to it" {
     defer release(b);
     try t.expectEqual(first, b.store);
     try t.expectEqual(pooled, stats().pool_bytes);
+}
+
+test "the pool's byte mirrors follow every allocation, return and release, and an emptied pool reads zero" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const mb = 1 << 20;
+    try sync();
+    trim();
+    try t.expectEqual(stats().pool_bytes, poolTotal());
+    try t.expectEqual(stats().pool_free, poolFree());
+    const in_use = poolTotal() - poolFree();
+    const a = try fresh(.uint8, &.{3 * mb + 5});
+    const b = try fresh(.uint8, &.{9 * mb + 5});
+    try t.expectEqual(stats().pool_bytes, poolTotal());
+    try t.expect(poolTotal() - poolFree() >= in_use + 12 * mb);
+    release(a);
+    release(b);
+    try sync();
+    try t.expectEqual(stats().pool_free, poolFree());
+    try t.expect(poolFree() >= 12 * mb);
+    trim();
+    try t.expectEqual(@as(u64, 0), poolFree());
+    try t.expectEqual(stats().pool_bytes, poolTotal());
+    try t.expectEqual(in_use, poolTotal());
 }
 
 test "a pool buffer is whole pages and under a sixteenth larger than what was asked" {

@@ -262,3 +262,40 @@ test "GLM raw FP8 honors the declared wired limit with the same reserve as MiMo"
     try std.testing.expectEqual(@as(u64, 0), bills.wiredCeilingFloorForRam(&cfg, 128 << 30));
 }
 
+
+test "GPU memory readings are MLX's plus the engine's pool: tensors in use as active, free buffers as cache" {
+    const core = @import("tensor/core.zig");
+    const mlx = @import("mlx.zig");
+    const gpu_mem = @import("gpu_mem.zig");
+    _ = @import("metal.zig").device() catch return error.SkipZigTest;
+    try core.sync();
+    const mb = 1 << 20;
+    const held = try core.fresh(.uint8, &.{24 * mb});
+    const idle = try core.fresh(.uint8, &.{16 * mb});
+    core.release(idle);
+    try core.sync();
+    defer core.release(held);
+    var active: usize = 0;
+    var cache: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    const pool = core.stats();
+    try testing.expect(pool.pool_free >= 16 * mb);
+    try testing.expect(pool.pool_bytes - pool.pool_free >= 24 * mb);
+    try testing.expectEqual(active + (pool.pool_bytes - pool.pool_free), gpu_mem.activeBytes());
+    try testing.expectEqual(cache + pool.pool_free, gpu_mem.cacheBytes());
+}
+
+test "GPU memory readings are MLX's alone while the engine has made no pool buffer" {
+    const mlx = @import("mlx.zig");
+    const gpu_mem = @import("gpu_mem.zig");
+    if (mlx.engine.stats().pool_bytes != 0) return error.SkipZigTest;
+    var active: usize = 0;
+    var cache: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    try testing.expectEqual(@as(u64, 0), mlx.engine.poolTotal());
+    try testing.expectEqual(@as(u64, 0), mlx.engine.poolFree());
+    try testing.expectEqual(active, gpu_mem.activeBytes());
+    try testing.expectEqual(cache, gpu_mem.cacheBytes());
+}
