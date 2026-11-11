@@ -1600,6 +1600,51 @@ fn imagePromptBytes(a: std.mem.Allocator, fx: *EngineFixture, rows: mlx.mlx_arra
     return out;
 }
 
+/// The fixture has no tower: its last id stands for the image token, every layer gets an image routing bias far from
+/// the text one (a row that took the wrong bias picks other experts), and ten bf16 rows stand for a tower's.
+const ImageStandIn = struct {
+    fx: *EngineFixture,
+    image_was: u32,
+    rows: mlx.mlx_array,
+
+    fn give(a: std.mem.Allocator, fx: *EngineFixture) !ImageStandIn {
+        const m = fx.model();
+        var self: ImageStandIn = .{ .fx = fx, .image_was = m.cfg.image_token_id, .rows = mlx.mlx_array_new() };
+        m.cfg.image_token_id = m.cfg.vocab - 1;
+        errdefer self.drop();
+        for (m.layers[0..m.cfg.layers]) |*ly| {
+            try mlx.check(mlx.mlx_array_eval(ly.gate_bias));
+            const bias = (mlx.mlx_array_data_float32(ly.gate_bias) orelse return error.NoBias)[0..mlx.mlx_array_size(ly.gate_bias)];
+            const shifted = try a.alloc(f32, bias.len);
+            defer a.free(shifted);
+            for (bias, shifted, 0..) |b, *o, e| o.* = b + (if (e % 2 == 0) @as(f32, 6) else -6);
+            ly.gate_bias_vl = mlx.mlx_array_new_data(shifted.ptr, &[_]c_int{ 1, @intCast(bias.len) }, 2, .float32);
+        }
+        const span = try a.alloc(f32, 10 * m.cfg.dim);
+        defer a.free(span);
+        var state: u32 = 0x1a6e;
+        for (span) |*v| {
+            state = state *% 1664525 +% 1013904223;
+            v.* = @as(f32, @floatFromInt(state >> 8)) / 16777216.0 - 0.5;
+        }
+        const wide = mlx.mlx_array_new_data(span.ptr, &[_]c_int{ 10, @intCast(m.cfg.dim) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(wide);
+        try mlx.check(mlx.mlx_astype(&self.rows, wide, .bfloat16, fx.xfm.s));
+        try mlx.check(mlx.mlx_array_eval(self.rows));
+        return self;
+    }
+
+    fn drop(self: *ImageStandIn) void {
+        const m = self.fx.model();
+        _ = mlx.mlx_array_free(self.rows);
+        for (m.layers[0..m.cfg.layers]) |*ly| {
+            if (ly.gate_bias_vl.ctx != null) _ = mlx.mlx_array_free(ly.gate_bias_vl);
+            ly.gate_bias_vl = .{ .ctx = null };
+        }
+        m.cfg.image_token_id = self.image_was;
+    }
+};
+
 test "dsv41 engine: a forward that splices image rows runs on the engine at a prefill width and at a decode width, with MLX's logits and no op on MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
@@ -1609,37 +1654,9 @@ test "dsv41 engine: a forward that splices image rows runs on the engine at a pr
     try fx.open(dir);
     defer fx.deinit();
     const m = fx.model();
-    // The fixture has no tower: its last id stands for the image token, and every layer gets an image routing bias far
-    // from the text one, so a row that took the wrong bias picks other experts.
-    const image_was = m.cfg.image_token_id;
-    m.cfg.image_token_id = m.cfg.vocab - 1;
-    defer m.cfg.image_token_id = image_was;
-    for (m.layers[0..m.cfg.layers]) |*ly| {
-        try mlx.check(mlx.mlx_array_eval(ly.gate_bias));
-        const bias = (mlx.mlx_array_data_float32(ly.gate_bias) orelse return error.NoBias)[0..mlx.mlx_array_size(ly.gate_bias)];
-        const shifted = try a.alloc(f32, bias.len);
-        defer a.free(shifted);
-        for (bias, shifted, 0..) |b, *o, e| o.* = b + (if (e % 2 == 0) @as(f32, 6) else -6);
-        ly.gate_bias_vl = mlx.mlx_array_new_data(shifted.ptr, &[_]c_int{ 1, @intCast(bias.len) }, 2, .float32);
-    }
-    defer for (m.layers[0..m.cfg.layers]) |*ly| {
-        _ = mlx.mlx_array_free(ly.gate_bias_vl);
-        ly.gate_bias_vl = .{ .ctx = null };
-    };
-    const span = try a.alloc(f32, 10 * m.cfg.dim);
-    defer a.free(span);
-    var state: u32 = 0x1a6e;
-    for (span) |*v| {
-        state = state *% 1664525 +% 1013904223;
-        v.* = @as(f32, @floatFromInt(state >> 8)) / 16777216.0 - 0.5;
-    }
-    const wide = mlx.mlx_array_new_data(span.ptr, &[_]c_int{ 10, @intCast(m.cfg.dim) }, 2, .float32);
-    defer _ = mlx.mlx_array_free(wide);
-    // The tower's rows are bf16.
-    var rows = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rows);
-    try mlx.check(mlx.mlx_astype(&rows, wide, .bfloat16, fx.xfm.s));
-    try mlx.check(mlx.mlx_array_eval(rows));
+    var image = try ImageStandIn.give(a, &fx);
+    defer image.drop();
+    const rows = image.rows;
     // The load warms these pipelines for a pack that has the image bias; the fixture got its bias after the load.
     try @import("dsv41_model.zig").warmOwnImages(m);
     // One chunk wider than a verify block with the whole span; and cuts through the span at decode widths.
@@ -1692,6 +1709,145 @@ test "dsv41 engine: a forward through the Trunk while a verify is open runs on t
         bytes[i] = try a.dupe(u8, std.mem.sliceAsBytes(data));
     }
     try testing.expectEqualSlices(u8, bytes[0], bytes[1]);
+}
+
+/// What one phase of a request asked of MLX: every call into mlx-c, and the ops among them.
+const Asked = struct { calls: u64, ops: u64 };
+
+const Census = struct {
+    calls: u64,
+    ops: u64,
+    names: std.ArrayList(mlx.NameCount) = .empty,
+
+    /// Starts a phase; MLX's keep-warm touch (one per 500 ms of MLX idle) stays out of a phase this short.
+    fn begin(model: ?*@import("dsv41_model.zig").Model) !Census {
+        if (model) |m| m.mlx_queue_used_ns = mlx.engine.nowNs();
+        var self: Census = .{ .calls = mlx.engine.mlxCalls(), .ops = mlx.engine.mlx_ops };
+        try mlx.callsByName(&self.names, testing.allocator);
+        return self;
+    }
+
+    /// Ends it. `SUSHI_DSV41_CENSUS_TRACE` prints the phase's calls by entry point.
+    fn end(self: *Census, comptime phase: []const u8) !Asked {
+        defer {
+            self.names.deinit(testing.allocator);
+            self.names = .empty;
+        }
+        const asked: Asked = .{ .calls = mlx.engine.mlxCalls() - self.calls, .ops = mlx.engine.mlx_ops - self.ops };
+        if (std.c.getenv("SUSHI_DSV41_CENSUS_TRACE") == null) return asked;
+        var now: std.ArrayList(mlx.NameCount) = .empty;
+        defer now.deinit(testing.allocator);
+        try mlx.callsByName(&now, testing.allocator);
+        std.debug.print("[census] {s}: {d} calls, {d} ops\n", .{ phase, asked.calls, asked.ops });
+        for (now.items) |n| {
+            var was: u64 = 0;
+            for (self.names.items) |b| if (std.mem.eql(u8, b.name, n.name)) {
+                was = b.count;
+            };
+            if (n.count != was) std.debug.print("[census]   {s} {d}\n", .{ n.name, n.count - was });
+        }
+        return asked;
+    }
+};
+
+test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pinned so that it only goes down (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var asked: [9]Asked = undefined;
+    var fx: EngineFixture = undefined;
+    var c = try Census.begin(null);
+    errdefer c.names.deinit(a);
+    try fx.open(dir);
+    var open = true;
+    defer if (open) fx.deinit();
+    asked[8] = try c.end("the load");
+    const m = fx.model();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..40];
+    var image = try ImageStandIn.give(a, &fx);
+    var image_given = true;
+    defer if (image_given) image.drop();
+    try @import("dsv41_model.zig").warmOwnImages(m);
+
+    const Request = struct {
+        fn run(f: *EngineFixture, t: *Tokenizer, ids: []const u32, sampling: SamplingParams, opts: Generator.InitOptions) !void {
+            const al = testing.allocator;
+            try f.xfm.resetCache();
+            var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), al, &f.xfm, t, ids, 12, sampling, &.{}, opts);
+            defer gen.deinit(al);
+            if (opts.dspark_enabled) {
+                gen.dspark_diag = .sweep;
+                while (try gen.nextDspark(al)) |r| al.free(r.tokens);
+            } else while (try gen.next(al)) |_| {}
+        }
+    };
+    // Once through everything first: the expert cache, the pools and the pipelines are a load's, not a request's.
+    const greedy: SamplingParams = .{ .temperature = 0.0 };
+    const seeded: SamplingParams = .{ .temperature = 0.8, .top_p = 0.95, .seed = 5 };
+    try Request.run(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true });
+    try Request.run(&fx, &tok, prompt, seeded, .{ .dspark_enabled = true });
+    try Request.run(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true, .logprobs_n = 3 });
+
+    c = try Census.begin(m);
+    try Request.run(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true });
+    asked[0] = try c.end("greedy rounds: a 40-row prefill and 12 tokens");
+
+    c = try Census.begin(m);
+    try Request.run(&fx, &tok, prompt, seeded, .{ .dspark_enabled = true });
+    asked[1] = try c.end("seeded rounds");
+
+    c = try Census.begin(m);
+    try Request.run(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true, .logprobs_n = 3 });
+    asked[2] = try c.end("serial steps with logprobs");
+
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt));
+    c = try Census.begin(m);
+    var cp = try dsv41_prefix.capture(a, m, prompt.len);
+    defer cp.deinit(a);
+    asked[3] = try c.end("a restore point captured");
+
+    try fx.xfm.resetCache();
+    c = try Census.begin(m);
+    try dsv41_prefix.restore(m, &cp, prompt);
+    asked[4] = try c.end("the point restored");
+
+    ctx = fx.xfm.defaultCtx();
+    ctx.cache.step = prompt.len;
+    c = try Census.begin(m);
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, &.{prompt[3]}));
+    asked[5] = try c.end("a step on the restored state");
+
+    c = try Census.begin(m);
+    var bytes = try imagePromptBytes(a, &fx, image.rows, &.{ 8, 16, 40 }, 3, true);
+    bytes.deinit(a);
+    asked[6] = try c.end("an image prompt in three chunks and 3 steps");
+
+    image.drop();
+    image_given = false;
+    c = try Census.begin(m);
+    open = false;
+    fx.deinit();
+    asked[7] = try c.end("the unload");
+
+    // The target of every row is { 0, 0 }. What is left of a request is the engine importing arrays MLX owns (the
+    // weights, the experts' slabs and maps), one set of queries and a free each; a capture still builds on MLX.
+    try testing.expectEqualSlices(Asked, &.{
+        .{ .calls = 97562, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
+        .{ .calls = 97562, .ops = 0 }, // seeded rounds
+        .{ .calls = 80429, .ops = 0 }, // serial steps with logprobs
+        .{ .calls = 253, .ops = 87 }, // a restore point captured
+        .{ .calls = 149, .ops = 0 }, // the point restored
+        .{ .calls = 6093, .ops = 0 }, // a step on the restored state
+        .{ .calls = 40738, .ops = 0 }, // an image prompt
+        .{ .calls = 4373, .ops = 0 }, // the unload
+        .{ .calls = 490327, .ops = 3054 }, // the load
+    }, &asked);
 }
 
 test "dsv41 engine: a prefill forward of 2 to 16 rows gives MLX's logits and the steps after it MLX's bytes (DSV41_STQ_TINY)" {

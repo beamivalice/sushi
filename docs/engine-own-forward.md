@@ -139,6 +139,11 @@ route and the MLX arm still build the bank at prepare time.
   made. Another file declaring an `mlx_*` extern fails the `mlx-extern` lint; an address of the library for `dladdr`
   is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 5667 calls,
   none of them for a kernel config (pinned in `dsv41_generate_test.zig`).
+- **What a Cooler request still asks of MLX is pinned phase by phase** (the census test in `dsv41_generate_test.zig`:
+  the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore point captured and
+  restored, a step after it, an image prompt, the unload). A change that adds a call fails it; a stage of the move off
+  MLX lowers a row; the target of every row is zero. `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry
+  point. Outside a capture a request puts no op on MLX: its calls are the engine importing arrays MLX owns.
 
 ## Crossing between the two
 
