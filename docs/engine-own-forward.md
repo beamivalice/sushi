@@ -16,6 +16,8 @@ MLX, the reason. There is no flag and no fallback: a forward of the engine that 
 | DeepSeek-V4.1 with an FP8 trunk or MXFP4 experts | MLX: the engine has no `quantized_matmul` |
 | prefill of any width, every other architecture | MLX |
 
+A DSpark round's verdict, greedy or sampled, is decided on the engine wherever its verify ran there.
+
 ## Speed against MLX
 
 Release bench (`tests/bench.sh --tokens 256`, `--ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000`), M5 Max,
@@ -119,9 +121,15 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 | concatenate, take, take along an axis, repeat, stack, arange, zeros, slice update | ours | same bytes |
 | sum, max over an axis of floats; mean (f32); argmax | MLX's, from `mlx.metallib`, under MLX's reduction plan | same bytes |
 | sum, max over an axis of integers | ours | same bytes |
+| log | ours, MLX's precise math | same bytes |
 | softmax over an inner axis | ours, MLX's op chain | same bytes |
 | softmax over the last axis, RMS norm, dequantize | MLX's, from `mlx.metallib` | same bytes |
 | matmul: vector, rows against a weight, two matrices, batches, dot product | MLX's, from `mlx.metallib` | same bytes |
+| sort, argsort over the last axis | MLX's, from `mlx.metallib`, one block or the multi-block merge under MLX's plan | same bytes, ties in MLX's order |
+| cumsum over the last axis (f32, f16, bf16) | MLX's scan kernel on MLX's grid | same bytes |
+| put along an axis, constant pad | ours (a copy, then the scatter or the border fill) | same bytes |
+| random bits | MLX's `rbitsc`, from `mlx.metallib` | same bytes |
+| uniform, categorical | MLX's bits, then `random.cpp`'s op chain op for op: inverse CDF (with MLX's searchsorted) for one row, Gumbel for a block | same bytes |
 | a model's custom kernel (`mlx_fast_metal_kernel`) | the model's source, MLX's signature | same bytes |
 
 - **A stock kernel** is fetched from `mlx.metallib` by the name MLX gives it and launched with MLX's buffers,
@@ -134,7 +142,11 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   argmax here took 7.7 ms a row over the vocabulary, 37 of a DSpark draft's 42 ms, against 1.6 ms for the whole
   Markov chain under MLX. An op over a long axis takes MLX's kernel.
 - **Not ported, refused by name**: `quantized_matmul` (a non-STQ DeepSeek pack's FP8 trunk), a matmul or a reduction
-  with an empty operand, a reduction of more than 2^31 elements.
+  with an empty operand, a reduction of more than 2^31 elements, a sort or a scan over an axis but the last,
+  argpartition, top-k, logsumexp, a non-constant pad.
+- **Random: no key sequence of our own.** A key made by `mlx_random_key` reaches the engine by import; an unseeded
+  draw takes the bits of MLX's next key from MLX (a tiny op on MLX's queue, read back), so a seeded
+  `mlx_random_seed` run draws the same numbers on both sides.
 - **Only one hardware path is proven on a given box.** On an M5 the tests take the NAX tiles; `MLX_ENABLE_TF32=0`
   sends f32 through the SIMD tiles there. The half-precision SIMD tiles need a run on a pre-M5 machine.
 
@@ -164,6 +176,13 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   fill of the stages' windows (MLX picks a matmul tile and a row reduction by the row count, so a prompt shorter
   than the window is other kernels), and the kernels a step takes from 131072 keys (the one-row index scan on the
   matrix units by lowering `Model.index_nax_keys` for one step, the split top-k on scores of its own).
+- **The sampled verdict is warmed** (`dsv41_serving.warmSampledVerdict`, after `warmKernels`): its op chain
+  (`sampledDraws`, the function a round calls) runs on the engine's stream over zero logits of `[1, w, vocab]` f32 for
+  every verify width, seeded, at the four filter settings (neither, top-k 40, top-p 0.95, both) with a suppress mask. An
+  unseeded draw reaches no other pipeline and is not run, since it would advance MLX's key sequence at the load. A
+  request's own top-k changes only the sorted widths: the single-block sort variant (`bn`, 32 to 512) of the shortlist,
+  the multi-block sort when the chunk maxima or candidates pass 2048, whether the pad runs, and `block_softmax` against
+  `looped_softmax` at a shortlist over 4096; a k other than 40 can compile one of those inside a request.
 - **A kernel reached only past a threshold of context is found by a bench at that context**, not by the tiny
   fixture: the 128k rung showed three compiles (0.26 s) inside its first decode step.
 - **A pipeline made after the warm is logged** (`engine.seal`): `[engine] compiled inside a request (N ms): <name>`
@@ -182,7 +201,9 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 - **GPU busy and idle are read from the command buffers** (`GPUStartTime`, `GPUEndTime`), which Metal fills after
   the completion signal: a finished buffer is read at a later prune, in order.
 - **The round's verdict stays on the engine** (`dsv41_serving.verdictStream`): the masked argmax over the verify's
-  logits is our op, so the host waits once for the picks instead of lending the logits to MLX first.
+  logits is our op, so the host waits once for the picks instead of lending the logits to MLX first. A sampled round
+  (temperature, top-k, top-p, seeded or not) takes the same stream: `sampler.probsAllPositions` and the draws run on
+  the engine, the sampler's code unchanged, and a seeded request draws MLX's tokens.
 
 ## Proving a change
 

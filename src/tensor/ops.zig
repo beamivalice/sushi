@@ -377,7 +377,7 @@ fn broadcastShape(a: *const Tensor, b: *const Tensor, out: *[max_dims]c_int) Err
     return out[0..n];
 }
 
-pub const Binary = enum { add, subtract, multiply, divide, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and };
+pub const Binary = enum { add, subtract, multiply, divide, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and, logical_or };
 
 /// An elementwise op of two tensors of one dtype, broadcast together. A comparison gives bool.
 pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
@@ -401,15 +401,18 @@ pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
         .greater_equal => "x >= y",
         .equal => "x == y",
         .logical_and => "x && y",
+        .logical_or => "x || y",
     };
     return elementwise("bin_" ++ @tagName(op), expr, &.{ a, b }, if (compare) .bool_ else a.dtype, shape);
 }
 
-pub const Unary = enum { exp, sigmoid, sqrt, rsqrt, square, floor, negative };
+pub const Unary = enum { exp, log, sigmoid, sqrt, rsqrt, square, floor, negative };
 
 pub fn unary(comptime op: Unary, a: *Tensor) Error!*Tensor {
+    if (op == .log and a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return error.TensorDtype;
     const expr = switch (op) {
         .exp => "$O(metal::precise::exp(x))",
+        .log => "$O(metal::precise::log(x))",
         .sigmoid => "sushi_sigmoid(x)",
         .sqrt => "$O(metal::precise::sqrt(x))",
         .rsqrt => "$O(metal::precise::rsqrt(x))",
@@ -767,6 +770,139 @@ pub fn takeAlong(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
     p.constant(@as(c_int, @intCast(g.ndim)), 6);
     p.constant(@as(i64, @intCast(t.strides[axis])), 7);
     p.constant(t.shape[axis], 8);
+    core.dispatch(p, g.size, g.group);
+    return out;
+}
+
+/// MLX's `put_along_axis`: a copy of `t` with `values` written at `indices` along `axis`. Two indices that meet
+/// write in no set order, as under MLX.
+pub fn putAlong(t: *Tensor, indices: *Tensor, values_in: *Tensor, axis_in: c_int) Error!*Tensor {
+    const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
+    if (axis >= t.ndim or indices.ndim != t.ndim) return error.TensorShape;
+    if (indices.dtype != .int32 and indices.dtype != .uint32) return error.TensorDtype;
+    for (0..t.ndim) |i| {
+        if (i != axis and t.shape[i] != indices.shape[i]) return error.TensorShape;
+    }
+    const typed = try astype(values_in, t.dtype);
+    defer core.release(typed);
+    const values = try broadcastTo(typed, indices.dims());
+    defer core.release(values);
+    const out = try contiguousCopy(t);
+    errdefer core.release(out);
+    if (indices.size() == 0) return out;
+    const source =
+        \\[[kernel]] void sushi_put_along(
+        \\  const device $0* upd [[buffer(0)]],
+        \\  const constant long* su [[buffer(1)]],
+        \\  const device $1* index [[buffer(2)]],
+        \\  const constant long* si [[buffer(3)]],
+        \\  device $O* out [[buffer(4)]],
+        \\  const constant long* so [[buffer(5)]],
+        \\  const constant int* shape [[buffer(6)]],
+        \\  const constant int& ndim [[buffer(7)]],
+        \\  const constant long& axis_stride [[buffer(8)]],
+        \\  const constant int& axis_len [[buffer(9)]],
+        \\  uint3 at [[thread_position_in_grid]]) {
+        \\  long pick = long(index[sushi_loc(at, shape, si, ndim)]);
+        \\  if (pick < 0) pick += axis_len;
+        \\  out[sushi_loc(at, shape, so, ndim) + pick * axis_stride] = upd[sushi_loc(at, shape, su, ndim)];
+        \\}
+        \\
+    ;
+    const pipeline = try pipelineFor("put_along", source, &.{ t.dtype, indices.dtype }, t.dtype);
+    const g = Grid.of(indices.dims());
+    const lead = g.ndim - t.ndim;
+    var so: [max_dims]i64 = @splat(0);
+    for (0..t.ndim) |i| {
+        if (i != axis) so[lead + i] = @intCast(out.strides[i]);
+    }
+    const su = g.strides(values);
+    const si = g.strides(indices);
+    const p = try core.pass();
+    p.pipeline(pipeline);
+    core.bind(p, values, 0);
+    p.bytes(std.mem.sliceAsBytes(su[0..g.ndim]), 1);
+    core.bind(p, indices, 2);
+    p.bytes(std.mem.sliceAsBytes(si[0..g.ndim]), 3);
+    core.bindOut(p, out, 4);
+    p.bytes(std.mem.sliceAsBytes(so[0..g.ndim]), 5);
+    p.bytes(std.mem.sliceAsBytes(g.shape[0..g.ndim]), 6);
+    p.constant(@as(c_int, @intCast(g.ndim)), 7);
+    p.constant(@as(i64, @intCast(out.strides[axis])), 8);
+    p.constant(t.shape[axis], 9);
+    core.dispatch(p, g.size, g.group);
+    return out;
+}
+
+/// MLX's constant `pad`: `t` with `low[i]` and `high[i]` elements of `value` added around `axes[i]`.
+pub fn pad(t: *Tensor, axes: []const c_int, low: []const c_int, high: []const c_int, value_in: *Tensor) Error!*Tensor {
+    if (axes.len != low.len or axes.len != high.len or value_in.size() != 1) return error.TensorShape;
+    var shape: [max_dims]c_int = undefined;
+    @memcpy(shape[0..t.ndim], t.dims());
+    var before: [max_dims]c_int = @splat(0);
+    for (axes, low, high) |a, lo, hi| {
+        const axis: usize = @intCast(if (a < 0) a + @as(c_int, t.ndim) else a);
+        if (axis >= t.ndim or lo < 0 or hi < 0) return error.TensorShape;
+        before[axis] += lo;
+        shape[axis] += lo + hi;
+    }
+    const value = try astype(value_in, t.dtype);
+    defer core.release(value);
+    const source =
+        \\[[kernel]] void sushi_pad(
+        \\  const device $0* in [[buffer(0)]],
+        \\  const constant long* ist [[buffer(1)]],
+        \\  const constant int* lo [[buffer(2)]],
+        \\  const constant int* extent [[buffer(3)]],
+        \\  const device $0* value [[buffer(4)]],
+        \\  device $O* out [[buffer(5)]],
+        \\  const constant int* shape [[buffer(6)]],
+        \\  const constant int& ndim [[buffer(7)]],
+        \\  uint3 at [[thread_position_in_grid]],
+        \\  uint3 grid [[threads_per_grid]]) {
+        \\  long loc = 0;
+        \\  bool inside = true;
+        \\  int c = int(at.x) - lo[ndim - 1];
+        \\  inside = inside && c >= 0 && c < extent[ndim - 1];
+        \\  loc += long(c) * ist[ndim - 1];
+        \\  c = int(at.y) - lo[ndim - 2];
+        \\  inside = inside && c >= 0 && c < extent[ndim - 2];
+        \\  loc += long(c) * ist[ndim - 2];
+        \\  uint z = at.z;
+        \\  for (int d = ndim - 3; d >= 0; --d) {
+        \\    c = int(z % uint(shape[d])) - lo[d];
+        \\    z /= uint(shape[d]);
+        \\    inside = inside && c >= 0 && c < extent[d];
+        \\    loc += long(c) * ist[d];
+        \\  }
+        \\  out[sushi_flat(at, grid)] = inside ? in[loc] : value[0];
+        \\}
+        \\
+    ;
+    const pipeline = try pipelineFor("pad", source, &.{t.dtype}, t.dtype);
+    const g = Grid.of(shape[0..t.ndim]);
+    const out = try core.fresh(t.dtype, shape[0..t.ndim]);
+    errdefer core.release(out);
+    if (out.size() == 0) return out;
+    const lead = g.ndim - t.ndim;
+    var lo: [max_dims]c_int = @splat(0);
+    var extent: [max_dims]c_int = @splat(1);
+    var strides: [max_dims]i64 = @splat(0);
+    for (0..t.ndim) |i| {
+        lo[lead + i] = before[i];
+        extent[lead + i] = t.shape[i];
+        strides[lead + i] = @intCast(t.strides[i]);
+    }
+    const p = try core.pass();
+    p.pipeline(pipeline);
+    core.bind(p, t, 0);
+    p.bytes(std.mem.sliceAsBytes(strides[0..g.ndim]), 1);
+    p.bytes(std.mem.sliceAsBytes(lo[0..g.ndim]), 2);
+    p.bytes(std.mem.sliceAsBytes(extent[0..g.ndim]), 3);
+    core.bind(p, value, 4);
+    core.bindOut(p, out, 5);
+    p.bytes(std.mem.sliceAsBytes(g.shape[0..g.ndim]), 6);
+    p.constant(@as(c_int, @intCast(g.ndim)), 7);
     core.dispatch(p, g.size, g.group);
     return out;
 }

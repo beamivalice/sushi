@@ -19,7 +19,6 @@ const DrafterStepResult = Generator.DrafterStepResult;
 const Generator = generate_mod.Generator;
 const isEosId = generate_mod.isEosId;
 const verifyArgmax = generate_mod.verifyArgmax;
-const verifyRows2d = generate_mod.verifyRows2d;
 
 /// Rows a DSpark round may verify so it emits at most `room` tokens and the bound fires at the
 /// token serial decode fires at. A round always verifies its t1 row.
@@ -400,35 +399,9 @@ pub fn dsparkEmitPending(self: *Generator, allocator: std.mem.Allocator) !?u32 {
 /// j draws with the key of the generated position it predicts, so the tokens are the serial sampler's whatever the
 /// round mix. A point-mass draft survives a draw of the row's density with probability p(draft): the exact rule.
 pub fn dsparkSampledVerdict(self: *Generator, logits: mlx.mlx_array, drafts: []const u32) !struct { accepted: u32, pending: u32 } {
-    const s = self.xfm.s;
-    const rows = drafts.len + 1;
-    const probs = try sampler.probsAllPositions(logits, self.sampling, s);
-    defer _ = mlx.mlx_array_free(probs);
-    const rows2d = try verifyRows2d(probs, @intCast(drafts.len), s);
-    defer _ = mlx.mlx_array_free(rows2d);
-    const vocab = mlx.getShape(rows2d)[1];
-    var draws: [dsv41_max_drafts + 1]mlx.mlx_array = undefined;
-    var built: usize = 0;
-    defer for (draws[0..built]) |d| {
-        _ = mlx.mlx_array_free(d);
-    };
-    if (rows > draws.len) return error.SpecDecodeUnsupported;
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    for (0..rows) |j| {
-        var row = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(row);
-        const at: c_int = @intCast(j);
-        try mlx.check(mlx.mlx_slice(&row, rows2d, &.{ at, 0 }, 2, &.{ at + 1, vocab }, 2, &.{ 1, 1 }, 2, s));
-        var keyed = self.sampling;
-        keyed.draw +%= j;
-        draws[built] = try sampler.sampleFromProbsLazy(row, keyed, s);
-        built += 1;
-        _ = mlx.mlx_vector_array_append_value(vec, draws[j]);
-    }
-    var flat = mlx.mlx_array_new();
+    const s = dsv41_serving.verdictStream(self.xfm, self.xfm.s);
+    const flat = try dsv41_serving.sampledDraws(self.sampling, logits, drafts.len + 1, s);
     defer _ = mlx.mlx_array_free(flat);
-    try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
     try mlx.check(mlx.mlx_array_eval(flat));
     const drawn = mlx.mlx_array_data_int32(flat) orelse return error.MlxArrayDataNull;
     var accepted: u32 = 0;

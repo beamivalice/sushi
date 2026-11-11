@@ -9,6 +9,9 @@ const core = @import("core.zig");
 const ops = @import("ops.zig");
 const kernel = @import("kernel.zig");
 const stock = @import("stock.zig");
+const sorting = @import("sort.zig");
+const scan = @import("scan.zig");
+const random = @import("random.zig");
 
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
@@ -521,6 +524,7 @@ pub const mlx_greater_equal = bin(.greater_equal);
 pub const mlx_equal = bin(.equal);
 pub const mlx_logical_and = bin(.logical_and);
 pub const mlx_exp = un(.exp);
+pub const mlx_log = un(.log);
 pub const mlx_sigmoid = un(.sigmoid);
 pub const mlx_sqrt = un(.sqrt);
 pub const mlx_rsqrt = un(.rsqrt);
@@ -631,6 +635,45 @@ pub fn mlx_take_along_axis(res: *A, a: A, indices: A, axis: c_int, _: S) c_int {
     return op2("take_along_axis", res, a, indices, ops.takeAlong, .{axis});
 }
 
+pub fn mlx_sort_axis(res: *A, a: A, axis: c_int, _: S) c_int {
+    return op1("sort", res, a, sortOf, .{axis});
+}
+
+fn sortOf(x: *Tensor, axis: c_int) core.Error!*Tensor {
+    return sorting.sort(x, axis, false);
+}
+
+pub fn mlx_argsort_axis(res: *A, a: A, axis: c_int, _: S) c_int {
+    return op1("argsort", res, a, argsortOf, .{axis});
+}
+
+fn argsortOf(x: *Tensor, axis: c_int) core.Error!*Tensor {
+    return sorting.sort(x, axis, true);
+}
+
+pub fn mlx_cumsum(res: *A, a: A, axis: c_int, reverse: bool, inclusive: bool, _: S) c_int {
+    return op1("cumsum", res, a, scan.cumsum, .{ axis, reverse, inclusive });
+}
+
+pub fn mlx_put_along_axis(res: *A, a: A, indices: A, values: A, axis: c_int, _: S) c_int {
+    const t = core.take(a) catch |e| return fail("put_along_axis", e);
+    defer core.release(t);
+    const idx = core.take(indices) catch |e| return fail("put_along_axis", e);
+    defer core.release(idx);
+    const v = core.take(values) catch |e| return fail("put_along_axis", e);
+    defer core.release(v);
+    return put(res, ops.putAlong(t, idx, v, axis) catch |e| return fail("put_along_axis", e));
+}
+
+pub fn mlx_pad(res: *A, a: A, axes: [*]const c_int, n_axes: usize, low: [*]const c_int, n_low: usize, high: [*]const c_int, n_high: usize, pad_value: A, mode: [*:0]const u8, _: S) c_int {
+    if (!std.mem.eql(u8, std.mem.span(mode), "constant")) return fail("pad", error.TensorUnsupported);
+    return op2("pad", res, a, pad_value, padOf, .{ axes[0..n_axes], low[0..n_low], high[0..n_high] });
+}
+
+fn padOf(x: *Tensor, value: *Tensor, axes: []const c_int, low: []const c_int, high: []const c_int) core.Error!*Tensor {
+    return ops.pad(x, axes, low, high, value);
+}
+
 pub fn mlx_repeat_axis(res: *A, a: A, repeats: c_int, axis: c_int, _: S) c_int {
     return op1("repeat", res, a, ops.repeat, .{ repeats, axis });
 }
@@ -666,6 +709,37 @@ pub fn mlx_arange(res: *A, start: f64, stop: f64, step: f64, dtype: mlx.mlx_dtyp
 
 pub fn mlx_zeros(res: *A, dims: [*]const c_int, n: usize, dtype: mlx.mlx_dtype, _: S) c_int {
     return put(res, ops.zeros(dims[0..n], dtype) catch |e| return fail("zeros", e));
+}
+
+// ── Random numbers ──
+
+/// A key is MLX's host array of two words, or none: MLX's own next key then supplies the bits.
+fn keyOf(key: A) core.Error!?*Tensor {
+    return if (key.ctx != null) try core.take(key) else null;
+}
+
+pub fn mlx_random_bits(res: *A, dims: [*]const c_int, n: usize, width: c_int, key: A, _: S) c_int {
+    const k = keyOf(key) catch |e| return fail("random_bits", e);
+    defer if (k) |t| core.release(t);
+    return put(res, random.bits(dims[0..n], width, k) catch |e| return fail("random_bits", e));
+}
+
+pub fn mlx_random_uniform(res: *A, low: A, high: A, dims: [*]const c_int, n: usize, dtype: mlx.mlx_dtype, key: A, _: S) c_int {
+    const k = keyOf(key) catch |e| return fail("random_uniform", e);
+    defer if (k) |t| core.release(t);
+    const lo = core.take(low) catch |e| return fail("random_uniform", e);
+    defer core.release(lo);
+    const hi = core.take(high) catch |e| return fail("random_uniform", e);
+    defer core.release(hi);
+    return put(res, random.uniform(lo, hi, dims[0..n], dtype, k) catch |e| return fail("random_uniform", e));
+}
+
+pub fn mlx_random_categorical(res: *A, logits: A, axis: c_int, key: A, _: S) c_int {
+    const k = keyOf(key) catch |e| return fail("random_categorical", e);
+    defer if (k) |t| core.release(t);
+    const x = core.take(logits) catch |e| return fail("random_categorical", e);
+    defer core.release(x);
+    return put(res, random.categorical(x, axis, k) catch |e| return fail("random_categorical", e));
 }
 
 // ── Custom kernels ──
@@ -1868,4 +1942,319 @@ test "with the kernel profile off, the profile is empty and the three ops share 
     try t_std.expectEqual(@as(u64, 3), after.dispatches - before.dispatches);
     try t_std.expectEqual(@as(u64, 1), after.submits - before.submits);
     try t_std.expectEqual(@as(usize, 0), core.kernelProfile().len);
+}
+
+// ── The sampled verdict's ops ──
+
+fn build1(comptime f: anytype) fn (S, []const A) anyerror!A {
+    return struct {
+        fn build(s: S, in: []const A) anyerror!A {
+            var o: A = .{};
+            try mlx.check(f(&o, in[0], s));
+            return o;
+        }
+    }.build;
+}
+
+fn buildAxis(comptime f: anytype, comptime axis: c_int) fn (S, []const A) anyerror!A {
+    return struct {
+        fn build(s: S, in: []const A) anyerror!A {
+            var o: A = .{};
+            try mlx.check(f(&o, in[0], axis, s));
+            return o;
+        }
+    }.build;
+}
+
+/// `ramp` rounded down to quarters, so a row holds many equal values.
+fn tied(comptime T: type, comptime n: usize) [n]T {
+    var out = ramp(T, n, 6, -3);
+    for (&out) |*v| v.* = @floatCast(@floor(@as(f32, @floatCast(v.*)) * 4) / 4);
+    return out;
+}
+
+test "engine log gives MLX's bytes: f32 and bf16, over a row with zeros" {
+    try mlx.requireGpu();
+    var values = ramp(f32, 130, 1, 0);
+    values[3] = 0;
+    values[77] = 0;
+    values[100] = 1;
+    const x = hostArray(f32, &values, &.{ 2, 65 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const x16 = try castByMlx(x, .bfloat16);
+    defer _ = mlx.mlx_array_free(x16);
+    try expectSame(build1(mlx.mlx_log), &.{x});
+    try expectSame(build1(mlx.mlx_log), &.{x16});
+}
+
+test "engine sort and argsort give MLX's bytes: ties, one block and many, a block of rows, a strided view" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn sliced(s: S, in: []const A) !A {
+            var order: A = .{};
+            defer _ = mlx.mlx_array_free(order);
+            try mlx.check(mlx.mlx_argsort_axis(&order, in[0], -1, s));
+            var head: A = .{};
+            defer _ = mlx.mlx_array_free(head);
+            const extent = mlx.getShape(order);
+            try mlx.check(mlx.mlx_slice(&head, order, &.{ 0, 0, 0 }, 3, &.{ extent[0], extent[1], 40 }, 3, &.{ 1, 1, 1 }, 3, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_sort_axis(&o, head, -1, s));
+            return o;
+        }
+        fn negated(s: S, in: []const A) !A {
+            var neg: A = .{};
+            defer _ = mlx.mlx_array_free(neg);
+            try mlx.check(mlx.mlx_negative(&neg, in[0], s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_argsort_axis(&o, neg, -1, s));
+            return o;
+        }
+    };
+    const vocab = 129280;
+    const shapes = [_][]const c_int{ &.{ 1, 1, 40 }, &.{ 1, 3, 200 }, &.{ 1, 2, 2309 }, &.{ 1, 1, vocab }, &.{ 7, 1024 } };
+    const row = tied(f32, vocab);
+    const rows = tied(f32, 2 * 2309);
+    const many = tied(f32, 3 * 200);
+    const short = tied(f32, 40);
+    const wide = tied(f32, 7 * 1024);
+    const sources = [_][]const f32{ &short, &many, &rows, &row, &wide };
+    for (shapes, sources) |extent, values| {
+        const x = hostArray(f32, values, extent, .float32);
+        defer _ = mlx.mlx_array_free(x);
+        const x16 = try castByMlx(x, .bfloat16);
+        defer _ = mlx.mlx_array_free(x16);
+        for ([_]A{ x, x16 }) |input| {
+            try expectSame(buildAxis(mlx.mlx_argsort_axis, -1), &.{input});
+            try expectSame(buildAxis(mlx.mlx_sort_axis, -1), &.{input});
+            try expectSame(Build.negated, &.{input});
+        }
+    }
+    const x = hostArray(f32, &rows, &.{ 1, 2, 2309 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    try expectSame(Build.sliced, &.{x});
+}
+
+test "engine cumsum gives MLX's bytes: exclusive and inclusive, short rows, a vocabulary row, a long row" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn scan(comptime reverse: bool, comptime inclusive: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_cumsum(&o, in[0], -1, reverse, inclusive, s));
+                    return o;
+                }
+            }.build;
+        }
+    };
+    const vocab = 129280;
+    const shapes = [_][]const c_int{ &.{ 1, 4, 40 }, &.{ 3, 6000 }, &.{ 2, 7000 }, &.{vocab}, &.{ 1, 2, vocab } };
+    const a = ramp(f32, 4 * 40, 0.02, 0);
+    const b = ramp(f32, 3 * 6000, 0.002, 0);
+    const c = ramp(f32, 2 * 7000, 0.002, 0);
+    const d = ramp(f32, vocab, 0.0002, 0);
+    const e = ramp(f32, 2 * vocab, 0.0002, 0);
+    const sources = [_][]const f32{ &a, &b, &c, &d, &e };
+    for (shapes, sources) |extent, values| {
+        const x = hostArray(f32, values, extent, .float32);
+        defer _ = mlx.mlx_array_free(x);
+        try expectSame(Build.scan(false, false), &.{x});
+        try expectSame(Build.scan(false, true), &.{x});
+        try expectSame(Build.scan(true, false), &.{x});
+    }
+}
+
+test "engine put_along_axis and pad give MLX's bytes: keep flags scattered along the last axis, a constant border" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn scatter(s: S, in: []const A) !A {
+            const extent = mlx.getShape(in[2]);
+            var zeros: A = .{};
+            defer _ = mlx.mlx_array_free(zeros);
+            try mlx.check(mlx.mlx_zeros(&zeros, extent.ptr, extent.len, .bool_, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_put_along_axis(&o, zeros, in[0], in[1], -1, s));
+            return o;
+        }
+        fn scatterTrue(s: S, in: []const A) !A {
+            const extent = mlx.getShape(in[2]);
+            var zeros: A = .{};
+            defer _ = mlx.mlx_array_free(zeros);
+            try mlx.check(mlx.mlx_zeros(&zeros, extent.ptr, extent.len, .bool_, s));
+            const yes = mlx.mlx_array_new_bool(true);
+            defer _ = mlx.mlx_array_free(yes);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_put_along_axis(&o, zeros, in[0], yes, -1, s));
+            return o;
+        }
+        fn border(s: S, in: []const A) !A {
+            const ninf = mlx.mlx_array_new_float(-std.math.inf(f32));
+            defer _ = mlx.mlx_array_free(ninf);
+            var fill: A = .{};
+            defer _ = mlx.mlx_array_free(fill);
+            try mlx.check(mlx.mlx_astype(&fill, ninf, mlx.mlx_array_dtype(in[0]), s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_pad(&o, in[0], &[_]c_int{2}, 1, &[_]c_int{0}, 1, &[_]c_int{17}, 1, fill, "constant", s));
+            return o;
+        }
+    };
+    const vocab = 300;
+    const picks_u = blk: {
+        var out: [4 * 40]u32 = undefined;
+        for (0..4) |r| for (0..40) |i| {
+            out[r * 40 + i] = @intCast((i * 7 + r * 13) % vocab);
+        };
+        break :blk out;
+    };
+    var picks_i: [4 * 40]i32 = undefined;
+    for (&picks_i, picks_u) |*o, v| o.* = @intCast(v);
+    var flags: [4 * 40]bool = undefined;
+    for (&flags, 0..) |*f, i| f.* = i % 3 != 0;
+    const base = ramp(f32, 4 * vocab, 4, -2);
+    const x = hostArray(f32, &base, &.{ 1, 4, vocab }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const x16 = try castByMlx(x, .bfloat16);
+    defer _ = mlx.mlx_array_free(x16);
+    const idx_u = hostArray(u32, &picks_u, &.{ 1, 4, 40 }, .uint32);
+    defer _ = mlx.mlx_array_free(idx_u);
+    const idx_i = hostArray(i32, &picks_i, &.{ 1, 4, 40 }, .int32);
+    defer _ = mlx.mlx_array_free(idx_i);
+    const keep = hostArray(bool, &flags, &.{ 1, 4, 40 }, .bool_);
+    defer _ = mlx.mlx_array_free(keep);
+    try expectSame(Build.scatter, &.{ idx_u, keep, x });
+    try expectSame(Build.scatter, &.{ idx_i, keep, x });
+    try expectSame(Build.scatterTrue, &.{ idx_i, keep, x });
+    try expectSame(Build.scatterTrue, &.{ idx_u, keep, x });
+    try expectSame(Build.border, &.{x});
+    try expectSame(Build.border, &.{x16});
+}
+
+test "engine random bits, uniform and categorical give MLX's bytes for each seed, and an unseeded draw follows MLX's key sequence" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn key(seed: u64) A {
+            var k: A = .{};
+            _ = mlx.mlx_random_key(&k, seed);
+            return k;
+        }
+        fn bits(comptime width: c_int, comptime extent: []const c_int) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_random_bits(&o, extent.ptr, extent.len, width, in[0], s));
+                    return o;
+                }
+            }.build;
+        }
+        fn uniform(comptime dtype: mlx.mlx_dtype, comptime extent: []const c_int) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    const lo = mlx.mlx_array_new_float(0);
+                    defer _ = mlx.mlx_array_free(lo);
+                    const hi = mlx.mlx_array_new_float(1);
+                    defer _ = mlx.mlx_array_free(hi);
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_random_uniform(&o, lo, hi, extent.ptr, extent.len, dtype, in[0], s));
+                    return o;
+                }
+            }.build;
+        }
+        fn categorical(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_random_categorical(&o, in[1], -1, in[0], s));
+            return o;
+        }
+        fn unseeded(s: S, in: []const A) !A {
+            _ = mlx.mlx_random_seed(11);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_random_categorical(&o, in[1], -1, .{}, s));
+            return o;
+        }
+        fn unseededBits(s: S, _: []const A) !A {
+            _ = mlx.mlx_random_seed(11);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_random_bits(&o, &[_]c_int{4}, 1, 4, .{}, s));
+            return o;
+        }
+        fn unseededSecond(s: S, in: []const A) !A {
+            _ = mlx.mlx_random_seed(11);
+            var skipped: A = .{};
+            defer _ = mlx.mlx_array_free(skipped);
+            try mlx.check(mlx.mlx_random_bits(&skipped, &[_]c_int{4}, 1, 4, .{}, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_random_categorical(&o, in[1], -1, .{}, s));
+            return o;
+        }
+    };
+    const vocab = 129280;
+    var row = ramp(f32, vocab, 8, -4);
+    for (row[0..1000]) |*v| v.* = -std.math.inf(f32);
+    var block = ramp(f32, 4 * 300, 8, -4);
+    block[5] = -std.math.inf(f32);
+    const logits = hostArray(f32, &row, &.{ 1, vocab }, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const logits16 = try castByMlx(logits, .bfloat16);
+    defer _ = mlx.mlx_array_free(logits16);
+    const rows = hostArray(f32, &block, &.{ 4, 300 }, .float32);
+    defer _ = mlx.mlx_array_free(rows);
+    const rows16 = try castByMlx(rows, .bfloat16);
+    defer _ = mlx.mlx_array_free(rows16);
+    for ([_]u64{ 0, 42, 0x9E3779B97F4A7C15 }) |seed| {
+        const k = Build.key(seed);
+        defer _ = mlx.mlx_array_free(k);
+        try expectSame(Build.bits(4, &.{1}), &.{k});
+        try expectSame(Build.bits(4, &.{1001}), &.{k});
+        try expectSame(Build.bits(4, &.{ 3, 5 }), &.{k});
+        try expectSame(Build.bits(2, &.{7}), &.{k});
+        try expectSame(Build.bits(1, &.{9}), &.{k});
+        try expectSame(Build.uniform(.float32, &.{1}), &.{k});
+        try expectSame(Build.uniform(.float32, &.{ 7, 3 }), &.{k});
+        try expectSame(Build.uniform(.bfloat16, &.{ 7, 3 }), &.{k});
+        try expectSame(Build.uniform(.float16, &.{5}), &.{k});
+        try expectSame(Build.categorical, &.{ k, logits });
+        try expectSame(Build.categorical, &.{ k, logits16 });
+        try expectSame(Build.categorical, &.{ k, rows });
+        try expectSame(Build.categorical, &.{ k, rows16 });
+    }
+    try expectSame(Build.unseeded, &.{ logits, logits });
+    try expectSame(Build.unseeded, &.{ rows, rows });
+    try expectSame(Build.unseededBits, &.{ logits, logits });
+    try expectSame(Build.unseededSecond, &.{ logits, logits });
+}
+
+test "the sampler's filters on the engine's stream give MLX's densities: top-k, top-p, both, neither, a suppress mask" {
+    try mlx.requireGpu();
+    const sampler = @import("../sampler.zig");
+    const vocab = 129280;
+    const Chain = struct {
+        fn of(comptime temperature: f32, comptime top_k: u32, comptime top_p: f32, comptime masked: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    const params: sampler.SamplingParams = .{ .temperature = temperature, .top_k = top_k, .top_p = top_p, .suppress_mask = if (masked) in[1] else null };
+                    return sampler.probsAllPositions(in[0], params, s);
+                }
+            }.build;
+        }
+    };
+    var values = ramp(f32, 3 * vocab, 12, -6);
+    // A cluster of equal maxima: the rank rule, not the value, decides which survive.
+    for (0..3) |r| for (0..64) |i| {
+        values[r * vocab + i * 1999] = 7.5;
+    };
+    const logits = hostArray(f32, &values, &.{ 1, 3, vocab }, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const one = hostArray(f32, values[0..vocab], &.{ 1, 1, vocab }, .float32);
+    defer _ = mlx.mlx_array_free(one);
+    var flags: [vocab]bool = @splat(false);
+    for (0..64) |i| flags[i * 1999] = i % 5 == 0;
+    const mask = hostArray(bool, &flags, &.{vocab}, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+    for ([_]A{ logits, one }) |input| {
+        try expectSame(Chain.of(0.8, 40, 1.0, false), &.{ input, mask });
+        try expectSame(Chain.of(0.8, 0, 0.95, false), &.{ input, mask });
+        try expectSame(Chain.of(0.8, 40, 0.95, false), &.{ input, mask });
+        try expectSame(Chain.of(0.8, 0, 1.0, false), &.{ input, mask });
+        try expectSame(Chain.of(0.8, 40, 0.95, true), &.{ input, mask });
+    }
 }

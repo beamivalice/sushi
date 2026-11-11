@@ -466,6 +466,13 @@ MLX's Metal backend (Copyright (c) 2023-2025 Apple Inc.):
   * `reduce.zig`: `Reduce::eval_gpu`, `get_reduction_plan`, the row, column
     and all-reduce dispatches, `collapse_contiguous_dims`, `get_2d_grid_dims`
     and `ArgReduce::eval_gpu`.
+  * `sort.zig`: `gpu_merge_sort` with its single-block and multi-block plans
+    and `SearchSorted::eval_gpu` (`mlx/backend/metal/sort.cpp`).
+  * `scan.zig`: `scan_gpu_inplace` for a scan along the last axis
+    (`mlx/backend/metal/scan.cpp`) and `get_2d_grid_dims` with a divisor.
+  * `random.zig`: `RandomBits::eval_gpu` (`mlx/backend/metal/primitives.cpp`)
+    and the op chains of `mlx/random.cpp` (`uniform`, `gumbel`,
+    `categorical_inverse_cdf`, `categorical_impl`).
   * `kernel.zig`: the signature a custom kernel's source is wrapped in follows
     `fast::metal_kernel` (`mlx/backend/metal/custom_kernel.cpp`).
   * `ops.zig`: `sushi_sigmoid`, `sushi_maximum` and `sushi_minimum` are MLX's

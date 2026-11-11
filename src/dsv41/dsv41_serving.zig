@@ -14,6 +14,8 @@ const expert_quant_mod = @import("../expert_quant.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const log = @import("../log.zig");
+const sampler = @import("../sampler.zig");
+const spec_types = @import("../spec_types.zig");
 const io_util_mod = @import("../io_util.zig");
 const sched_policy = @import("../sched_policy.zig");
 const ModelConfig = model_mod.ModelConfig;
@@ -103,9 +105,74 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     return shell;
 }
 
-fn warmAll(mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream) !void {
+pub fn warmAll(mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream) !void {
     try dsv41_model.warmKernels(mdl);
+    try warmSampledVerdict(mdl);
     if (stq) |st| try st.warmSplit(mdl, dsv41_config.prefill_width);
+}
+
+/// The draws of a sampled round: `rows` verify rows of `logits` (`[1, >= rows, vocab]`) filtered by `sampling` and
+/// drawn one per row, row j under the key of draw `sampling.draw + j`, gathered as one `[rows]` array not yet
+/// evaluated. On the engine's stream the gathering vector is an engine vector, which the engine makes only while it
+/// is active.
+pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    const own = mlx.engine.isStream(s);
+    if (own) mlx.engine.active = true;
+    defer if (own) {
+        mlx.engine.active = false;
+    };
+    var draws: [dsv41_config.ring_slack]mlx.mlx_array = undefined;
+    if (rows > draws.len) return error.SpecDecodeUnsupported;
+    const probs = try sampler.probsAllPositions(logits, sampling, s);
+    defer _ = mlx.mlx_array_free(probs);
+    const rows2d = try spec_types.verifyRows2d(probs, @intCast(rows - 1), s);
+    defer _ = mlx.mlx_array_free(rows2d);
+    const vocab = mlx.getShape(rows2d)[1];
+    var built: usize = 0;
+    defer for (draws[0..built]) |d| {
+        _ = mlx.mlx_array_free(d);
+    };
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (0..rows) |j| {
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        const at: c_int = @intCast(j);
+        try mlx.check(mlx.mlx_slice(&row, rows2d, &.{ at, 0 }, 2, &.{ at + 1, vocab }, 2, &.{ 1, 1 }, 2, s));
+        var keyed = sampling;
+        keyed.draw +%= j;
+        draws[built] = try sampler.sampleFromProbsLazy(row, keyed, s);
+        built += 1;
+        _ = mlx.mlx_vector_array_append_value(vec, draws[j]);
+    }
+    var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
+    return flat;
+}
+
+/// The sampled verdict's chain on the engine, over every verify width and the four filter settings with a suppress
+/// mask, seeded: each stock pipeline it launches compiles here, not inside a request. The unseeded path reaches no
+/// pipeline this does not (its bits come from MLX's next key); it is left out so the load does not advance MLX's key
+/// sequence. A request's own top-k only changes the shapes the sorts run at, and so which block-sort variants.
+pub fn warmSampledVerdict(mdl: *dsv41_model.Model) !void {
+    if (!mdl.engine_decode or mdl.dspark == null) return;
+    const s = mlx.engine.stream();
+    const vocab: c_int = @intCast(mdl.cfg.vocab);
+    var mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask);
+    try mlx.check(mlx.mlx_zeros(&mask, &[_]c_int{vocab}, 1, .bool_, s));
+    for (1..dsv41_config.ring_slack + 1) |rows| {
+        var logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_zeros(&logits, &[_]c_int{ 1, @intCast(rows), vocab }, 3, .float32, s));
+        for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
+            const sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .seed = 1, .suppress_mask = mask };
+            const draws = try sampledDraws(sampling, logits, rows, s);
+            defer _ = mlx.mlx_array_free(draws);
+            try mlx.check(mlx.mlx_array_eval(draws));
+        }
+    }
 }
 
 /// A pack without the STQ stream has no expert prefetcher: `--ssd-prefetch` or the file's `ssd_prefetch` does nothing there.

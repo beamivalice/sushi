@@ -46,6 +46,7 @@ pub const raw = struct {
     pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
     pub extern "c" fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int;
     pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
+    pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
     pub extern "c" fn mlx_array_new_data_managed_payload(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
     pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
     pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;

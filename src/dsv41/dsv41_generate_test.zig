@@ -425,6 +425,82 @@ test "dsv41 engine: DSpark rounds on the engine of our own say MLX's tokens at e
     }
 }
 
+test "dsv41 engine: a sampled DSpark request on the engine of our own draws MLX's tokens at every round-width mix, seeded or from MLX's key sequence, and no round lends to MLX (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Trunk.init(io, a, config, &weights);
+    defer xfm.deinit();
+    const m = dsv41_state.modelOf(&xfm).?;
+    try testing.expect(m.dspark != null);
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    const prompt = ids[0..30];
+    const want: u32 = 60;
+    // A seeded draw is keyed by its position, so every round mix says the same tokens; an unseeded one takes MLX's next
+    // key, so MLX and the engine are compared at the same mix.
+    var seeded_ref: std.ArrayList(u32) = .empty;
+    defer seeded_ref.deinit(a);
+    var mlx_ref: std.ArrayList(u32) = .empty;
+    defer mlx_ref.deinit(a);
+    const modes = [_]?DsparkDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep, null };
+    // Every seventh id suppressed: the mask is the model's own array, which the engine imports.
+    const vocab: usize = m.cfg.vocab;
+    const flags = try a.alloc(bool, vocab);
+    defer a.free(flags);
+    for (flags, 0..) |*f, id| f.* = id % 7 == 0;
+    const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(vocab)}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+    for ([_]?u64{ 7, null }) |seed| for ([_]bool{ false, true }) |masked| for (modes) |mode| for ([_]bool{ false, true }) |on_engine| {
+        if (seed == null and mode == null) continue;
+        const sampled = SamplingParams{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = seed };
+        _ = mlx.mlx_random_seed(99);
+        m.engine_decode = on_engine;
+        defer m.engine_decode = false;
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, sampled, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        if (masked) gen.sampling.suppress_mask = mask;
+        if (mode) |d| gen.dspark_diag = d;
+        var got: std.ArrayList(u32) = .empty;
+        defer got.deinit(a);
+        while (true) {
+            const lends = mlx.engine.stats().lends;
+            const r = (try gen.nextDspark(a)) orelse break;
+            defer a.free(r.tokens);
+            if (on_engine) try testing.expectEqual(lends, mlx.engine.stats().lends);
+            try got.appendSlice(a, r.tokens);
+        }
+        try testing.expectEqual(@as(usize, want), got.items.len);
+        if (!on_engine) {
+            mlx_ref.clearRetainingCapacity();
+            try mlx_ref.appendSlice(a, got.items);
+        } else try testing.expectEqualSlices(u32, mlx_ref.items, got.items);
+        if (seed != null and !masked) {
+            if (seeded_ref.items.len == 0) try seeded_ref.appendSlice(a, got.items) else try testing.expectEqualSlices(u32, seeded_ref.items, got.items);
+        }
+    };
+}
+
 test "dsv41 generator: a seeded sampled request verifies at one width whatever the cost model says (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
@@ -1370,6 +1446,58 @@ test "dsv41 engine: the load's warm makes the split top-k a one-row step takes o
     const picks = try kernels.topkIndicesSplit(&sc, try sc.zeros(&.{ 1, @intCast(kernels.topk_splits * k) }, .float32), k, kernels.topk_splits);
     try mlx.check(mlx.mlx_array_eval(picks));
     try testing.expectEqual(late, mlx.engine.latePipelines());
+}
+
+test "dsv41 engine: after the load's warm a seeded sampled DSpark request compiles no kernel, at any filter setting or with a suppress mask (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Trunk.init(io, a, config, &weights);
+    defer xfm.deinit();
+    const m = dsv41_state.modelOf(&xfm).?;
+    try testing.expect(m.dspark != null);
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    m.engine_decode = true;
+    defer m.engine_decode = false;
+    try dsv41_serving.warmAll(m, null);
+    mlx.engine.seal(true);
+    defer mlx.engine.seal(false);
+    const late = mlx.engine.latePipelines();
+    const flags = try a.alloc(bool, m.cfg.vocab);
+    defer a.free(flags);
+    for (flags, 0..) |*f, id| f.* = id % 7 == 0;
+    const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(m.cfg.vocab)}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+    for ([_]bool{ false, true }) |masked| for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
+        const sampled = SamplingParams{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .seed = 7 };
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, sampled, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        if (masked) gen.sampling.suppress_mask = mask;
+        gen.dspark_diag = .sweep;
+        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    };
 }
 
 test "dsv41 engine: a one-row decode on the engine of our own gives MLX's tokens and logits bit for bit (DSV41_STQ_TINY)" {

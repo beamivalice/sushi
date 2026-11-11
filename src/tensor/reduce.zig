@@ -99,7 +99,7 @@ const Walk = struct {
 };
 
 /// MLX's `get_2d_grid_dims`: the elements of a shape as a grid of two axes, broadcast axes left out.
-fn grid2d(shape: []const c_int, strides: []const usize) Error!metal.Size {
+pub fn grid2d(shape: []const c_int, strides: []const usize) Error!metal.Size {
     var x: usize = 1;
     var y: usize = 1;
     for (shape, strides) |d, st| {
