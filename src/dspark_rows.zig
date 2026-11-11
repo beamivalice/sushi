@@ -115,6 +115,8 @@ pub const Policy = struct {
     /// Plain steps owed before the next draft, and the stretch the next losing stretch of drafts will owe.
     owed: u32 = 0,
     period: u32 = 1,
+    /// The stretch's second plain step, until its third prices the serial step.
+    first_fresh: f32 = 0,
     /// Decayed ms a drafted round saved against the plain steps for its tokens; negative while drafts lose.
     edge: f32 = edge_start,
     range: Range = .{ .max_rows = default_block + 1 },
@@ -173,6 +175,24 @@ pub const Policy = struct {
     pub fn observePlain(self: *Policy, ms: f32) void {
         self.cost.observePlain(ms);
         self.gate.observePlain(ms);
+        self.reprice(ms);
+    }
+
+    /// A trip into the retrial stretch measures the plain step afresh: the probe that priced it was taken once, early,
+    /// and goes stale within a request (the experts of a new text load, the whole forward slows). The stretch's own
+    /// second and third plain steps (the first follows a round, as in the probe) become the serial price; if the window
+    /// that tripped pays against it, the stretch ends there and a trial of rounds follows, as it does after the full one.
+    fn reprice(self: *Policy, ms: f32) void {
+        if (self.gate.mode != .plain) return;
+        switch (self.gate.plain_tokens) {
+            2 => self.first_fresh = ms,
+            3 => {
+                const fresh: f64 = (self.first_fresh + ms) / 2;
+                self.gate.serial_ms = fresh;
+                if (!spec_cost_gate.roundLoses(self.gate.ms, self.gate.tokens, fresh)) self.gate.plain_tokens = self.gate.retrial;
+            },
+            else => {},
+        }
     }
 };
 
@@ -377,6 +397,73 @@ test "dspark rows: novel text, where drafts are worth what their rows cost, stay
     s.run(&p, 1.0, 0.3, -3, 3000);
     try testing.expect(s.plain_ticks * 2 > s.tokens);
     try testing.expect(s.tokPerS() >= 0.97 * 1000 / verify_table[1]);
+}
+
+/// One logged round of a greedy request (`SUSHI_DSV41_DSPARK_ROWS=log`): rows verified, drafts kept, draft ms, verify ms.
+/// A draft ms of 0 is a plain step.
+const Logged = struct { u32, u32, f32, f32 };
+
+/// The first 93 rounds of the first greedy request on a fresh prompt, after the last of which the gate went plain: its
+/// serial probe (three plain steps at rounds 8 to 10) read 18 ms, the verifies then ran 10 to 25 percent above the same
+/// text's next run (experts not yet cached), and the rounds still paid 16 to 20 ms a token against a plain step's 24.
+const fresh_prompt = [_]Logged{
+    .{ 3, 1, 4.8, 33.6 }, .{ 2, 0, 4.7, 25.7 }, .{ 2, 0, 4.6, 25.9 }, .{ 3, 0, 4.6, 31.9 },
+    .{ 3, 2, 4.6, 33.2 }, .{ 4, 0, 4.7, 39.9 }, .{ 3, 2, 4.6, 30.8 }, .{ 3, 2, 4.7, 32.5 },
+    .{ 1, 0, 0, 17.7 }, .{ 1, 0, 0, 18.8 }, .{ 1, 0, 0, 17.6 }, .{ 3, 2, 4.5, 31.4 },
+    .{ 3, 1, 4.8, 32.3 }, .{ 3, 0, 4.8, 34.0 }, .{ 2, 0, 4.8, 23.1 }, .{ 3, 2, 5.0, 39.4 },
+    .{ 4, 3, 4.7, 56.2 }, .{ 2, 0, 4.8, 25.0 }, .{ 2, 1, 4.8, 24.7 }, .{ 2, 1, 4.8, 26.7 },
+    .{ 3, 2, 4.7, 37.7 }, .{ 3, 2, 4.8, 31.4 }, .{ 3, 1, 4.9, 32.4 }, .{ 2, 0, 4.7, 23.3 },
+    .{ 2, 0, 4.8, 26.5 }, .{ 2, 1, 4.8, 27.0 }, .{ 3, 1, 4.7, 37.6 }, .{ 2, 0, 4.7, 33.2 },
+    .{ 2, 0, 4.7, 25.9 }, .{ 3, 2, 4.8, 31.8 }, .{ 3, 0, 5.0, 30.5 }, .{ 2, 1, 4.8, 25.1 },
+    .{ 3, 2, 5.1, 33.9 }, .{ 2, 1, 4.7, 29.8 }, .{ 5, 4, 5.0, 67.1 }, .{ 3, 1, 4.8, 36.6 },
+    .{ 5, 4, 4.8, 52.1 }, .{ 3, 1, 4.9, 33.0 }, .{ 3, 2, 5.0, 32.8 }, .{ 4, 1, 5.0, 48.8 },
+    .{ 3, 2, 5.0, 38.7 }, .{ 3, 2, 5.1, 35.4 }, .{ 4, 3, 5.0, 58.3 }, .{ 4, 2, 4.8, 47.7 },
+    .{ 5, 1, 4.7, 55.1 }, .{ 6, 5, 5.1, 74.6 }, .{ 6, 5, 5.0, 64.0 }, .{ 3, 0, 4.8, 29.1 },
+    .{ 3, 2, 5.0, 35.2 }, .{ 6, 0, 5.2, 66.9 }, .{ 6, 5, 4.8, 63.6 }, .{ 5, 4, 5.0, 48.5 },
+    .{ 2, 1, 4.9, 27.1 }, .{ 2, 1, 5.2, 33.7 }, .{ 2, 0, 4.9, 26.4 }, .{ 2, 1, 5.1, 27.2 },
+    .{ 2, 0, 4.9, 24.1 }, .{ 2, 0, 4.8, 24.6 }, .{ 2, 1, 5.1, 30.6 }, .{ 2, 0, 4.8, 24.2 },
+    .{ 2, 0, 5.1, 26.4 }, .{ 3, 2, 4.9, 36.1 }, .{ 6, 5, 4.9, 59.0 }, .{ 3, 0, 5.1, 34.2 },
+    .{ 6, 5, 5.0, 57.5 }, .{ 3, 2, 5.1, 39.9 }, .{ 3, 2, 5.0, 39.4 }, .{ 2, 0, 4.9, 30.1 },
+    .{ 2, 1, 5.0, 27.2 }, .{ 3, 1, 5.0, 33.3 }, .{ 2, 1, 5.0, 24.8 }, .{ 2, 0, 5.0, 23.8 },
+    .{ 2, 1, 4.8, 24.9 }, .{ 2, 0, 5.0, 27.0 }, .{ 2, 0, 5.0, 30.6 }, .{ 2, 0, 4.8, 23.9 },
+    .{ 3, 1, 5.2, 35.0 }, .{ 3, 0, 5.1, 32.2 }, .{ 3, 2, 5.0, 37.4 }, .{ 2, 1, 5.0, 26.3 },
+    .{ 2, 0, 4.7, 30.1 }, .{ 3, 2, 5.0, 39.3 }, .{ 4, 0, 5.0, 75.0 }, .{ 1, 0, 0, 19.4 },
+    .{ 4, 3, 4.7, 48.6 }, .{ 4, 0, 4.8, 57.6 }, .{ 1, 0, 0, 23.4 }, .{ 2, 1, 4.6, 29.1 },
+    .{ 3, 2, 4.8, 45.4 }, .{ 3, 2, 4.8, 35.3 }, .{ 2, 1, 4.8, 31.1 }, .{ 2, 0, 4.9, 25.8 }, .{ 2, 0, 4.7, 25.7 },
+};
+
+test "dspark rows: a stretch of plain steps ends after the three that price the step afresh when the tripping window pays against them" {
+    var p = Policy{};
+    const conf: [5]f32 = @splat(0);
+    for (fresh_prompt) |r| {
+        const want: spec_cost_gate.Action = if (r[2] == 0) .plain else .round;
+        try testing.expectEqual(want, p.next());
+        if (r[2] == 0) p.observePlain(r[3]) else p.observeRound(&conf, r[0], r[1], r[2], r[3]);
+    }
+    // The gate trips here on its early probe's 18 ms; the stretch's own plain steps (the log's next three) price the
+    // step at 22.5 ms, which the 20 ms a token the window paid beats, so the stretch ends after them.
+    for ([_]f32{ 18.5, 20.7, 24.3 }) |ms| {
+        try testing.expectEqual(spec_cost_gate.Action.plain, p.next());
+        p.observePlain(ms);
+    }
+    try testing.expectEqual(spec_cost_gate.Action.round, p.next());
+}
+
+test "dspark rows: rounds dearer per token than the plain step it measures stop drafting for the whole stretch" {
+    var p = Policy{};
+    const conf: [5]f32 = @splat(0);
+    // Rounds of 35.5 ms for one or two tokens (21.3 ms a token) against a measured plain step of 18.5 ms.
+    var n: usize = 0;
+    while (p.gate.mode != .plain) : (n += 1) {
+        try testing.expect(n < 40);
+        switch (p.next()) {
+            .plain => p.observePlain(18.5),
+            .round => p.observeRound(&conf, 3, if (n % 3 == 0) 0 else 1, 5, 30.5),
+        }
+    }
+    var plain: usize = 0;
+    while (p.next() == .plain) : (plain += 1) p.observePlain(18.5);
+    try testing.expect(plain >= 60);
 }
 
 test "dspark rows: the depth flags give a verify width of depth + 1, clamped to the block" {
