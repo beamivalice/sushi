@@ -230,6 +230,8 @@ pub const Table = struct {
     cache: ?*RowCache = null,
     /// A counter of the rows `pread` from the shard, for a test to point at its own cell.
     rows_read: ?*std.atomic.Value(u64) = null,
+    /// A counter of the `F_RDADVISE` calls, for a test to point at its own cell.
+    advised: ?*std.atomic.Value(u64) = null,
 
     pub fn close(self: *Table) void {
         _ = std.c.close(self.fd);
@@ -409,14 +411,17 @@ pub const Table = struct {
     /// Asks the kernel to read every `stride`-th of `ids` from `first` into the page cache now
     /// (`F_RDADVISE`: asynchronous, no copy), so the preads behind it find the rows cached or in
     /// flight and a batch of random rows costs about one SSD latency, not one per row. An
-    /// out-of-range id is left for `read` to refuse.
+    /// out-of-range id is left for `read` to refuse. A batch wide enough to keep every thread busy is not advised:
+    /// its preads queue deep enough, and the advise calls cost several times the CPU of the preads.
     fn advise(self: *const Table, ids: []const u32, only: ?[]const u32, first: usize, stride: usize) void {
         if (comptime !builtin.os.tag.isDarwin()) return;
         const n = if (only) |o| o.len else ids.len;
+        if (n >= ADVISE_BELOW) return;
         var j = first;
         while (j < n) : (j += stride) {
             const r: u64 = ids[if (only) |o| o[j] else j];
             if (r >= self.rows) continue;
+            if (self.advised) |c| _ = c.fetchAdd(2, .monotonic);
             rdadvise(self.fd, self.w_off + r * self.head_dim, self.head_dim);
             rdadvise(self.fd, self.s_off + r * self.sdim, self.sdim);
         }
@@ -731,6 +736,8 @@ pub const Prefetch = struct {
 
 const PAR_ROWS_PER_THREAD = 16;
 const PAR_THREADS = 16;
+/// Rows of one read from which every thread has `PAR_ROWS_PER_THREAD` of its own.
+const ADVISE_BELOW = PAR_ROWS_PER_THREAD * PAR_THREADS;
 
 fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
     expert_io.readExact(fd, dst, off) catch return false;
@@ -880,6 +887,101 @@ test "dsv41 engram: an id past the table is refused by a plain read and by one s
     }
     ids[100] = 7;
     try testing.expectError(error.EngramRead, t.read(testing.allocator, &ids));
+}
+
+/// Layer 1's table of `rows` rows of head_dim 64, every byte a function of its row and column.
+fn patternByte(plane: u8, row: u64, col: u64) u8 {
+    return @truncate(row *% 131 +% col *% 7 +% plane *% 91 +% (row >> 8));
+}
+
+fn writePatternShard(io: std.Io, dir: std.Io.Dir, rows: usize) !void {
+    var hdr_buf: [512]u8 = undefined;
+    const hdr = try std.fmt.bufPrint(&hdr_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},64],\"data_offsets\":[0,{d}]}}," ++
+        "\"layers.1.engram.embed.scale\":{{\"dtype\":\"F8_E8M0\",\"shape\":[{d},2],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 64, rows, rows * 64, rows * 66 });
+    const shard = try testing.allocator.alloc(u8, 8 + hdr.len + rows * 66);
+    defer testing.allocator.free(shard);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    const data = shard[8 + hdr.len ..];
+    for (0..rows) |r| {
+        for (0..64) |c| data[r * 64 + c] = patternByte(0, r, c);
+        for (0..2) |c| data[rows * 64 + r * 2 + c] = patternByte(1, r, c);
+    }
+    try dir.writeFile(io, .{ .sub_path = "model-00002-of-00002.safetensors", .data = shard });
+    try dir.writeFile(io, .{ .sub_path = "model-00001-of-00002.safetensors", .data = "\x02\x00\x00\x00\x00\x00\x00\x00{}" });
+}
+
+fn expectPatternRows(raw: Table.Raw, ids: []const u32) !void {
+    for (ids, 0..) |id, i| {
+        for (0..64) |c| try testing.expectEqual(patternByte(0, id, c), raw.w[i * 64 + c]);
+        for (0..2) |c| try testing.expectEqual(patternByte(1, id, c), raw.s[i * 2 + c]);
+    }
+}
+
+test "dsv41 engram: rows read together equal rows read one at a time, in any order, with repeats and at both ends" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    const rows = 1000;
+    try writePatternShard(io, td.dir, rows);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 1, rows, 64);
+    defer t.close();
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var ids: [900]u32 = undefined;
+    for (&ids) |*id| id.* = rnd.uintLessThan(u32, rows);
+    ids[0] = rows - 1;
+    ids[1] = 0;
+    ids[2] = rows - 1;
+    ids[899] = 0;
+    // A run of neighbours, in order and reversed, among the random ones.
+    for (300..340) |i| ids[i] = @intCast(500 + (i - 300));
+    for (340..380) |i| ids[i] = @intCast(539 - (i - 340));
+    for ([_][]const u32{ ids[0..1], ids[0..20], ids[290..390], &ids, &.{ 0, 1, 2, 3, 999, 998, 997 } }) |part| {
+        const together = try t.read(testing.allocator, part);
+        defer together.deinit(testing.allocator);
+        try expectPatternRows(together, part);
+        for (part, 0..) |id, i| {
+            const one = try t.read(testing.allocator, &.{id});
+            defer one.deinit(testing.allocator);
+            try testing.expectEqualSlices(u8, one.w, together.w[i * 64 ..][0..64]);
+            try testing.expectEqualSlices(u8, one.s, together.s[i * 2 ..][0..2]);
+        }
+    }
+    var bad = ids;
+    for ([_]u32{ rows, rows + 1, std.math.maxInt(u32) }) |id| {
+        bad[450] = id;
+        try testing.expectError(error.EngramRead, t.read(testing.allocator, &bad));
+        try testing.expectError(error.EngramRead, t.read(testing.allocator, &.{ 5, id }));
+    }
+}
+
+test "dsv41 engram: a batch that fills every thread is read without advise calls, a narrow one with two a row" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    const rows = 1000;
+    try writePatternShard(io, td.dir, rows);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 1, rows, 64);
+    defer t.close();
+    var advised: std.atomic.Value(u64) = .init(0);
+    t.advised = &advised;
+    var ids: [ADVISE_BELOW + 40]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast((i * 389) % rows);
+    for ([_]struct { n: usize, advises: u64 }{
+        .{ .n = 24, .advises = 48 },
+        .{ .n = ADVISE_BELOW - 1, .advises = 2 * (ADVISE_BELOW - 1) },
+        .{ .n = ADVISE_BELOW, .advises = 0 },
+        .{ .n = ids.len, .advises = 0 },
+    }) |c| {
+        const before = advised.load(.monotonic);
+        const raw = try t.read(testing.allocator, ids[0..c.n]);
+        defer raw.deinit(testing.allocator);
+        try testing.expectEqual(c.advises, advised.load(.monotonic) - before);
+        try expectPatternRows(raw, ids[0..c.n]);
+    }
 }
 
 test "dsv41 engram: a row cache serves repeats from RAM with the bytes a pread gives, through evictions" {

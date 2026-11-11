@@ -66,7 +66,8 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   `beginPass` (`prefetchEngram`): a decode token's layer-1 rows hide behind layer 0, its layer-14 rows behind layers 0-13. A batch reads each
   distinct row id once and copies it to every place it sits (`Table.read`). A prefill chunk's pass is told the prompt tokens after it
   (`ForwardCtx.ahead_ids`) and reads the next chunk's rows while it runs (`aheadEngram`, one chunk of host rows, ~13 KB a token, unbilled);
-  the next pass takes them when its row ids are the same, else reads its own. The n-gram hash and the compressed-vocabulary map
+  the next pass takes them when its row ids are the same, else reads its own. A batch of 256 rows or more (`ADVISE_BELOW`: every thread has 16 of its own) is
+  `pread` without `F_RDADVISE`; a narrower one (a decode token's 24 rows, a verify) is advised first. The n-gram hash and the compressed-vocabulary map
   are the reference's (`engram.py`); the map ships embedded (`src/dsv41/fixtures/dsv41_engram_token_map.bin`) and a pack's own
   `engram_token_map.json` outranks it. `tests/dsv41/dump_dsv41_token_map.py --check` re-derives it from `tokenizer.json`.
 - **Forward** (`src/dsv41/dsv41_model.zig`): bf16 activations, f32 where the reference is f32 (head, compressor, hyper-connection
@@ -312,6 +313,15 @@ Other pieces:
   Measured at bf21aa5e against 646ec552 (sushi bench, STQ 1.75bpw, `--ssd-budget-gb 108`, debug log, one A then one B): the prose
   arm's Engram wait per 2048-row chunk fell from 225 ms to 1.2 ms (median), its 0-128k cold prefill from 770 to 815 tok/s
   (8k windows +5-10%); code, whose n-grams hit the row cache, waited 1 ms before and is unchanged (911 vs 909 tok/s).
+- Engram reads in prose prefill: a 2048-token chunk misses the row cache for 38-45k of its 49k row ids a table (code: 5-15k),
+  and those rows are never neighbours (45,473 rows, 45,463 runs of adjacent ids; 45,306 distinct 16 KB pages), so
+  coalescing neighbours or sharing pages saves nothing. The cost was syscalls: `F_RDADVISE` took ~60 us of system CPU a row
+  against ~12 us for the two `pread`s, and 16 threads with the preads alone read the same 45k rows in the same wall time
+  (random rows of the real shard, C microbench). Measured at 84f901ad against the change (M5 Max, AC, STQ 1.75bpw,
+  `sushi bench --prose-only --rungs 4k,16k,32k --tokens 16 --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000`,
+  one A then one B, GPU lock): process system CPU 92.4 to 41.1 s (81.8 to 31.0 s from the first prefill to the exit), user CPU
+  6.2 to 5.3 s; prefill 1014/1214/1336/1392/1286 to 1136/1302/1469/1467/1403 tok/s at 4k/8k/16k/24k/32k; decode token
+  counts equal.
 - Attention runs each span and each attention or FFN block in its own scope, so MLX frees the f32 gathers and logits
   copies between spans.
 

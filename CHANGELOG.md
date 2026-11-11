@@ -17,6 +17,8 @@ earlier history is mlx-serve's, in that project's changelog.
   faster, which takes about 6% off the server's CPU over a full benchmark run. Existing caches stay valid.
 - **Less CPU for the same work**: the server spends about 20% less CPU over a full benchmark run on
   Qwen3.8-Flash-Next, decodes about 5% faster and prefills about 2% faster, with the same output.
+- **Less CPU while DeepSeek-V4.1-Flash prefills prose**: a long prose prompt takes less than half the system CPU it did,
+  with the same output and no slower prefill.
 
 ## v1.6.0 — Stability, UI and Architecture Refactor
 
