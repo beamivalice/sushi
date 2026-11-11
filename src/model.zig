@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const load_clock = @import("load_clock.zig");
 
 /// `--qwen-gdn`: whether the GatedDeltaNet recurrent state is stored f32 (the default) or bf16 between
 /// tokens. A launch decision, not a per-model one: `parseConfig` reads it so every load path (serve,
@@ -2459,7 +2460,10 @@ pub fn readSafetensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, he
     const lo = offsets.array.items[0];
     const hi = offsets.array.items[1];
     if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != bytes) return error.InvalidSafetensorsTensor;
-    return readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype);
+    const t0 = load_clock.now();
+    const array = try readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype);
+    load_clock.readDone(t0, bytes);
+    return array;
 }
 
 /// The resident key a shard tensor loads under, or null when it is skipped.
@@ -2502,8 +2506,10 @@ fn loadSafetensorsFileMode(
     // filtered tensors are never read, kept ones bypass the file cache (`readTensorArray`).
     const fd = try expert_io.openHinted(std.mem.span(path), .{ .readahead_off = false });
     defer _ = std.c.close(fd);
+    const header_t0 = load_clock.now();
     var header = try expert_io.SafetensorsHeader.read(allocator, fd);
     defer header.deinit();
+    load_clock.headersDone(header_t0);
     var tensors = header.parsed.value.object.iterator();
     var pending_announce = announce;
     while (tensors.next()) |entry| {

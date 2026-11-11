@@ -14,6 +14,7 @@ const expert_quant_mod = @import("../expert_quant.zig");
 const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const log = @import("../log.zig");
+const load_clock = @import("../load_clock.zig");
 const sampler = @import("../sampler.zig");
 const spec_types = @import("../spec_types.zig");
 const io_util_mod = @import("../io_util.zig");
@@ -92,12 +93,16 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     // A failed warm costs the first requests their compiles, not the load.
     var clock = expert_stream_mod.Clock.init();
     const had_error = mlx.errorPending();
+    const warm_t0 = load_clock.now();
+    const made_before = mlx.engine.pipelinesMade();
     if (warmAll(mdl, shell.arch_state.dsv41.stq_experts)) {
         log.info("[dsv41] kernels warmed for 1..{d} rows{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", clock.lap() / std.time.ns_per_ms });
     } else |e| {
         mlx.dropLatchedErrorUnless(had_error);
         log.warn("[dsv41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
     }
+    const made = mlx.engine.pipelinesMade();
+    load_clock.warmDone(warm_t0, made.ns - made_before.ns, made.count - made_before.count);
     mlx.engine.seal(true);
     // The warm's transients leave the pool, so the load's memory reading is the model's.
     _ = mlx.mlx_clear_cache();

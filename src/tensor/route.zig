@@ -290,6 +290,11 @@ pub const matrixUnits = @import("matmul.zig").matrixUnits;
 pub fn latePipelines() u64 {
     return core.pipelines_late;
 }
+
+/// Pipelines the engine has made in this process and the time they took.
+pub fn pipelinesMade() struct { count: u64, ns: u64 } {
+    return .{ .count = core.pipelines, .ns = core.pipeline_ns };
+}
 pub const isStream = core.isStream;
 
 // ── Vectors ──

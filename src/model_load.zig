@@ -27,6 +27,7 @@ const model_settings = @import("model_settings.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
+const load_clock = @import("load_clock.zig");
 const gpu_mem = @import("gpu_mem.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
@@ -1644,6 +1645,8 @@ fn settleLoadLatch(had_error: bool) void {
 }
 
 pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    load_clock.begin();
+    defer load_clock.end();
     const had_error_at_start = mlx.errorPending();
     try model_mod.archGate(params.config);
     if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});
@@ -1861,7 +1864,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Trunk — owns the bulk of the GPU memory.
     const xfm_ptr = try sch.allocator.create(Trunk);
     errdefer sch.allocator.destroy(xfm_ptr);
+    const build_t0 = load_clock.now();
     xfm_ptr.* = try Trunk.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    load_clock.buildDone(build_t0);
     errdefer xfm_ptr.deinit();
     if (xfm_ptr.expert_stream) |engine| {
         engine.borrow_publish = &params.config.expert_borrow_bytes;
@@ -1917,7 +1922,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
     // runUnloadRequest so `fit` capacity tracks the live set across
     // load/unload churn (this early call covers warmup's forwards).
+    const wired_t0 = load_clock.now();
     logWiredPolicy(mlx.applyWiredPolicy());
+    load_clock.wiredDone(wired_t0);
 
     // JIT-compile activation kernels. These are bound to THIS thread's mlx
     // stream — that's exactly the point of doing them here. Skipped entirely
@@ -2294,7 +2301,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const bytes = if (ranked) engine.plan.cache_bytes else @as(u64, slots) * layers * engine.plan.expert_bytes;
         log.info("[expert-stream] cache warm: preloading {d:.3} GB ({s})\n", .{ @as(f64, @floatFromInt(bytes)) / 1e9, if (ranked) "every pool, most used experts first" else "80% of cache slots, lowest expert IDs" });
         const start = std.Io.Timestamp.now(sch.io, .awake);
+        const cache_t0 = load_clock.now();
         try engine.warmCache();
+        load_clock.cacheDone(cache_t0);
         const elapsed_ns: u64 = @intCast(start.untilNow(sch.io, .awake).nanoseconds);
         log.info("[expert-stream] cache warm complete: slots={d}/{d} per layer, layers={d}, bytes={d}, elapsed_ms={d}\n", .{
             slots, engine.plan.slots_per_layer, layers, bytes, elapsed_ns / std.time.ns_per_ms,
@@ -2419,6 +2428,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.dflash = dflash_ptr;
     if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
     publishHotCacheResidency(sch);
+    load_clock.end();
+    if (params.config.dsv41 != null) {
+        var line_buf: [512]u8 = undefined;
+        log.info("{s}\n", .{load_clock.line(&line_buf, &load_clock.load)});
+    }
 }
 
 /// Plan 05 Phase D: service a cold-load work item on the inference thread.

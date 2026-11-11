@@ -14,6 +14,7 @@ const SSMCheckpoint = trunk_mod.SSMCheckpoint;
 const mlx_ops = @import("../mlx_ops.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const dsv41_serving = @import("dsv41_serving.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
 const KVCache = trunk_mod.KVCache;
 const testing = std.testing;
 const prefill_plan = @import("../prefill_plan.zig");
@@ -1299,6 +1300,46 @@ test "dsv41 engine: a round that finds MLX's queue unused for a warm tick runs o
     var on_engine = try dsparkRoundBytes(a, &xfm, ids[0..30], 1);
     defer on_engine.deinit(a);
     try testing.expect(m.mlx_queue_used_ns >= t0);
+}
+
+test "dsv41 engine: the load clock times every phase of a load and the phases add up to its total (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const load_clock = @import("../load_clock.zig");
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const own_was = dsv41_borrow.own_override;
+    dsv41_borrow.own_override = true;
+    defer dsv41_borrow.own_override = own_was;
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    const made_before = mlx.engine.pipelinesMade();
+    load_clock.begin();
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    const build_t0 = load_clock.now();
+    var xfm = try Trunk.init(io, a, config, &weights);
+    defer xfm.deinit();
+    load_clock.buildDone(build_t0);
+    const wired_t0 = load_clock.now();
+    _ = mlx.applyWiredPolicy();
+    load_clock.wiredDone(wired_t0);
+    const cache_t0 = load_clock.now();
+    try xfm.expert_stream.?.warmCache();
+    load_clock.cacheDone(cache_t0);
+    load_clock.end();
+    const p = load_clock.load;
+    try testing.expect(p.headers_ns > 0 and p.read_ns > 0 and p.read_bytes > 0);
+    try testing.expect(p.build_ns > 0 and p.warm_ns > 0 and p.wired_ns > 0 and p.cache_ns > 0);
+    try testing.expectEqual(mlx.engine.pipelinesMade().count - made_before.count, p.compiled);
+    try testing.expect(p.otherNs() * 20 <= p.total_ns);
 }
 
 test "dsv41 engine: after the load's warm no step or round compiles a kernel, whatever its width (DSV41_STQ_TINY)" {

@@ -168,6 +168,9 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 - **A pipeline is compiled per side.** MLX's warm at load compiles MLX's; the engine's are its own, so the load runs
   the engine's decode widths too (`dsv41_model.warmOwn`). Without it the first verify of each width paid its compile
   inside a request (up to 2 s), and the round-cost policy stopped drafting for the rest of that request.
+- **Engine pipeline creation is 0.1 s with the system's shader cache warm and 9 to 16 s cold**, all of it
+  `newLibraryWithSource` (435 pipelines, M5 Max); the pipeline state is 0.03 to 0.06 s. A binary archive replaces only
+  that state step, so it buys nothing here.
 - **A kernel has one signature.** MLX binds an input under 8 elements as a `constant` reference and a longer one
   as a `device` pointer, so one source is two pipelines; ours binds every array as a `device` pointer.
 - **The warm runs every shape that names a pipeline** (`warmOwn`, `warmOwnFills`, `warmOwnBlocks`, `warmOwnLong`):

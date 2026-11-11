@@ -168,6 +168,38 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   23 of 31 rounds), a chain of `x + 1` 7.76 us, so the kernel body above dispatch is about 1.4 us and the grid recovers
   0.24 of it: about 10 us a token over 40 layers, not the 0.2 ms the stage trace's 10.5 us a layer suggested.
 
+### Where a load goes (`[load]`)
+
+A DeepSeek load ends with one line from `src/load_clock.zig`, each phase timed where it runs:
+`[load] headers A ms, read B ms (X GB, Y GB/s), build C ms, pipelines D ms (compiled M), warm forwards E ms, wired F ms,
+expert cache G ms, other H ms, total T ms`. The build includes its view evals; the warm forwards include MLX's own
+kernel compiles (MLX's side cannot be timed from outside); `other` is what the phases leave uncounted.
+
+One run, M5 Max, AC, STQ 1.75bpw, `sushi bench --model <pack> --code-only --rungs 4k --tokens 64 --ssd-budget-gb 108
+--ctx-size 1000000 --max-tokens 128000 --log-level debug` under `taskpolicy -a` and the GPU lock, fans max, on 7c239177
+with a temporary second warm in-process (removed) to price the forwards alone. Warm system shader cache, single-warm
+values (the run's line minus the second warm's 7.6 s): headers 1 ms, read 1251 ms (9.4 GB, 7.5 GB/s), build 554 ms,
+pipelines 95 ms (compiled 435), warm forwards 19.4 s, wired 4 ms, expert cache 3222 ms, other 837 ms, total 25.4 s.
+
+Where the warm goes, by region of `warmKernels` (wall ms of the first pass; the second in-process pass, which compiles
+nothing, is the forwards' own cost). R1 MLX decode widths and DSpark rounds, R2 `warmOwn`, R3 MLX prefill path, R4
+`warmOwnFills`, R5 `warmOwnBlocks` (an MLX prefill of the context, then engine rounds), R6 `warmOwnLong`, R7 `warmSplit`:
+
+| region | warm cache, first / second pass | first run of a binary path, first pass | cold copy of the binary, first pass |
+|---|---:|---:|---:|
+| R1 (MLX) | 8446 / 2083 | 36309 | 8533 |
+| R2 (engine) | 3402 / 2415 | 24221 | 15054 |
+| R3 (MLX) | 3899 / 748 | 7297 | 7488 |
+| R4 (engine) | 581 / 579 | 590 | 597 |
+| R5 (mixed) | 3034 / 1712 | 3748 | 3608 |
+| R6 (engine) | 19 / 19 | 153 | 160 |
+| R7 | 95 / 64 | 217 | 216 |
+| engine `newLibraryWithSource` (435 pipelines) | 65 | 15695 | 9382 |
+| engine pipeline state | 21 | 57 | 28 |
+
+MLX's regions are 63% of the warm cache's 19.5 s; the engine's compile is 0.1 s there and 9 to 16 s with a cold system
+cache, all of it `newLibraryWithSource`.
+
 ### QAT round trips
 
 The reference fake-quantizes at five places and the forward applies each (`src/dsv41/dsv41_qat.zig`, Metal, round-half-even,

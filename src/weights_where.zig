@@ -5,6 +5,7 @@ const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const expert_io = @import("expert_io.zig");
 const log = @import("log.zig");
+const load_clock = @import("load_clock.zig");
 
 /// The checkpoint's weight shards in name order; the caller frees each name and the list.
 pub fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !std.ArrayList([]const u8) {
@@ -46,8 +47,10 @@ pub fn loadWhere(comptime tag: []const u8, io: std.Io, allocator: std.mem.Alloca
         defer allocator.free(path);
         const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
         defer _ = std.c.close(fd);
+        const header_t0 = load_clock.now();
         var header = try expert_io.SafetensorsHeader.read(allocator, fd);
         defer header.deinit();
+        load_clock.headersDone(header_t0);
         var tensors = header.parsed.value.object.iterator();
         while (tensors.next()) |entry| {
             const key = entry.key_ptr.*;
