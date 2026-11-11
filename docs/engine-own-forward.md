@@ -148,10 +148,11 @@ route and the MLX arm still build the bank at prepare time.
   MLX lowers a row; the target of every row is zero. `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry
   point. A request puts no op on MLX, and a restore point is captured and restored with no call at all: a request's
   calls are the token arrays its caller makes on MLX, imported once each, and frees of empty handles.
-  A phase's ops are exact. Its calls are held under a ceiling and within a twentieth of it: the launches a request
-  makes follow what the process ran before (a load whose pipelines exist skips its warm forwards and starts with
-  other experts in its cache; a 12-token request read 7,336 dispatches as a process's only load and 7,017 after
-  other loads).
+  A phase's ops are exact. Its calls are held under a ceiling and within a twentieth of it, so a real cut moves the
+  ceiling. The census counts a load that is not the process's first (it opens and closes the pack once before): what
+  a process asks once (the device's description, a kernel probe) is its first load's, and with that kept out a row
+  reads the same alone and after other tests. Dispatches still follow what the process ran before (a 12-token request
+  read 7,336 as a process's only load and 7,017 after other loads).
 - **A Cooler load runs no forward on MLX.** The load's warm used to run three prefill chunks through MLX whatever
   the decode side; they only built the state the engine's own warms start from. Where prefill is the engine's they
   run on the engine, and with the pipelines read from a manifest they do not run at all.
@@ -248,7 +249,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   the decode side, `dsv41_borrow.ownDecode`). Every large DeepSeek weight is a page-aligned mapping sushi fills and
   hands over without a copy at one place, `model.wrapRegion`; there the engine wraps it (a no-copy Metal buffer of
   the tensor's bytes, in our residency sets) instead of MLX, and the load binds, slices and casts the weights on the
-  engine's stream. The store gives the mapping back once the last pass that binds it has run, so an unload needs no
+  engine's stream. A tensor under the mapping size (`model.import_min_bytes`, 1 MiB) is a copy either way; on a
+  Cooler load the copy is a pool buffer of the engine's (`readTensorArray`), where an MLX array was imported at every
+  load-time use and freed through MLX at the unload (tiny STQ fixture: the load 11,059 calls into mlx-c to 2,517, the
+  unload 485 to 103). The store gives the mapping back once the last pass that binds it has run, so an unload needs no
   MLX wait; it is never written in place (`sole` is false). On the tiny STQ fixture that took a one-row step from
   5497 calls into mlx-c to 1366 and a 12-token request from 94,508 to 19,602; live, STQ 1.75bpw, a request made 3
   to 4 times fewer, with the same dispatches, waits and imports of slabs.

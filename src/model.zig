@@ -2338,8 +2338,12 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
         const host = try reader.allocator.alloc(u8, @max(len, 1));
         defer reader.allocator.free(host);
         try reader.fill(fd, host[0..len], offset);
-        const array = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype);
-        if (array.ctx == null) return error.OutOfMemory;
+        // A load whose weights are the engine's makes its small tensors there too: MLX's would be imported at every use.
+        const array = if (mlx.engine.own_weights)
+            mlx.engine.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype)
+        else
+            mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype);
+        if (array.ctx == null) return if (mlx.engine.own_weights) error.EngineWeightWrap else error.OutOfMemory;
         errdefer _ = mlx.mlx_array_free(array);
         try mlx.check(mlx.mlx_array_eval(array));
         return .{ .array = array, .bytes = if (len == 0) &.{} else mlx.mlx_array_data_uint8(array).?[0..len] };

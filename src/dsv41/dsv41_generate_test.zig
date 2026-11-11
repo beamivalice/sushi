@@ -1727,6 +1727,13 @@ fn censusOf(dir: []const u8) ![9]Asked {
     const a = testing.allocator;
     var asked: [9]Asked = undefined;
     var fx: EngineFixture = undefined;
+    {
+        // What a process asks once (the device's description, a kernel probe) is its first load's: the load counted
+        // is never that one, so a row reads the same alone and after other tests.
+        var first: EngineFixture = undefined;
+        try first.open(dir);
+        first.deinit();
+    }
     var c = try Census.begin(null);
     errdefer c.names.deinit(a);
     try fx.open(dir);
@@ -1814,10 +1821,8 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const asked = try censusOf(dir);
     // The target of every row is { 0, 0 }. What is left of a request is the token arrays its caller makes on MLX and
-    // frees of empty handles; of a load, the arrays its conversions make on MLX's side.
-    // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of: how many launches a request
-    // makes follows what the process ran before it (a load whose pipelines exist skips its warm forwards and starts
-    // with other experts in its cache). A real cut moves the ceiling.
+    // frees of empty handles; of a load, the host arrays its warm makes outside a forward's scope and a few conversions.
+    // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of, so a real cut moves it.
     const ceilings = [_]Asked{
         .{ .calls = 150, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
         .{ .calls = 150, .ops = 0 }, // seeded rounds
@@ -1826,8 +1831,8 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
         .{ .calls = 0, .ops = 0 }, // the point restored
         .{ .calls = 16, .ops = 0 }, // a step on the restored state
         .{ .calls = 440, .ops = 0 }, // an image prompt
-        .{ .calls = 490, .ops = 0 }, // the unload
-        .{ .calls = 11300, .ops = 6 }, // the load
+        .{ .calls = 105, .ops = 0 }, // the unload
+        .{ .calls = 2520, .ops = 6 }, // the load
     };
     for (ceilings, asked) |ceiling, got| {
         try testing.expectEqual(ceiling.ops, got.ops);
