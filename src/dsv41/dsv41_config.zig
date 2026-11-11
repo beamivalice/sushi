@@ -72,6 +72,9 @@ pub const Vision = struct {
     }
 };
 
+/// Who asked for decode on MLX instead of the engine of our own.
+pub const MlxAsk = enum { none, flag, setting };
+
 pub const Config = struct {
     /// DeepSeek's recommended serving for V4.1-Flash: a 1M window and a generation budget of at least 256K.
     pub fn serveDefaults(comptime D: type) D {
@@ -134,6 +137,8 @@ pub const Config = struct {
     /// FP4 experts and FP8 trunk.
     expert_dec: ?sushi_exl3.format.Decode = null,
     trunk_dec: ?sushi_exl3.format.Decode = null,
+    /// Stamped at the load from `--ds41-mlx-engine` and the model's `ds41_cooler`; config.json never carries it.
+    mlx_ask: MlxAsk = .none,
 
     pub fn isDsparkTarget(self: *const Config, l: usize) bool {
         for (self.dspark.targets[0..self.dspark.n_targets]) |t| if (t == l) return true;

@@ -231,6 +231,8 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
     config.ssd_prefetch_override = o.ssd_prefetch;
+    config.cooler_override = o.ds41_cooler;
+    config.stampCooler();
     config.preserve_thinking_override = o.preserve_thinking;
     config.think_penalty_override = o.think_penalty;
     config.logit_bias_file_override = o.logit_bias_file;
@@ -269,6 +271,7 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
         .drop_expert = config.drop_expert != 0,
         .ssd_prefetch = config.ssd_prefetch != null,
+        .cooler_off = config.cooler_flag != null,
         .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
         .mtp_tokenv3 = if (settings_resolve.launch.mtp_acceptance) |m| m == .tokenv3 else false,
         .mtp_greedy_tail = settings_resolve.launch.mtp_greedy_tail != null,
@@ -1667,6 +1670,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         return error.ContextSizeAboveWindow;
     }
     if (arch_flags.settingsSsdPrefetchIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
+    if (arch_flags.settingsCoolerIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     if (arch_flags.settingsKvQuantIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     if (arch_flags.settingsMtpIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
     const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());

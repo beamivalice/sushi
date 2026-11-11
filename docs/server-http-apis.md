@@ -486,7 +486,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
   `locked`. A pinned `mtp_acceptance` reports the flag as typed with its value (`--mtp-tokenv3 0.5`, `--mtp-typical 0.3`) and `mtp_greedy_tail` reports `--mtp-greedy-tail`; the other model keys report their value alone; and `effort`, the thinking-effort tables ([Effort tables](#effort-tables)). `POST /v1/settings` takes `{"server":{key:value|null}}`, `{"model":id,"set":{key:value|null}}` and/or `{"effort":{...}}`; null removes
   a key. Each model row also carries `keys`, the keys that apply to that model (`model_settings.applies`, the same gates
-  the loader's ignored-key log lines use: `ssd_budget_gb` needs expert streaming, `ssd_prefetch` is DeepSeek-V4.1's,
+  the loader's ignored-key log lines use: `ssd_budget_gb` needs expert streaming, `ssd_prefetch` and `ds41_cooler` (Sushi Cooler on or off; reports `--ds41-mlx-engine` when pinned) are DeepSeek-V4.1's,
   `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
   null while the model is not loaded and otherwise `{key: value|null}` for every key: the file value the load stamped
   (null: the file had none then), in the shape of `settings.<key>.file`, so a page tells "saved differs from loaded".

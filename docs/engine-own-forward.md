@@ -1,5 +1,8 @@
 # The engine of our own (`src/tensor/`)
 
+The engine of our own ships as **Sushi Cooler**: users read that name in the settings page, `--help`, the load line and
+the release notes; the code and these internal docs keep their names.
+
 A decode forward that runs on our own Metal queue instead of MLX's. The goal is an engine with no MLX in it, decode
 first; DeepSeek-V4.1 STQ is the pilot. It sits behind `src/mlx.zig`, so a model's code is the same on either side:
 the stream a call carries says which side runs it.
@@ -7,7 +10,10 @@ the stream a call carries says which side runs it.
 ## Where it serves
 
 One decision at the load, `dsv41_borrow.ownDecode`, which the bills ask too; the load line names the side and, on
-MLX, the reason. There is no flag and no fallback: a forward of the engine that fails is the request's error.
+MLX, the reason. A user opts out of the engine up front, never per forward: `--ds41-mlx-engine` or the model's
+`ds41_cooler: false` (the settings page's "Use Sushi's Cooler Engine instead of MLX" checkbox, ticked by default) moves
+every forward of the table below to MLX at the next load (`DecodeSide.mlx_by_flag` / `.mlx_by_setting`); the flag
+outranks the file. There is no fallback after a start: a forward of the engine that fails is the request's error.
 
 | pack and GPU | forwards of 16 rows or fewer (decode, DSpark draft and verify, a short prefill) |
 |---|---|

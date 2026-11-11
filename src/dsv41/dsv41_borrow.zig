@@ -13,6 +13,7 @@ const stream = @import("../expert_stream.zig");
 const cfg_mod = @import("dsv41_config.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const Config = cfg_mod.Config;
+const MlxAsk = cfg_mod.MlxAsk;
 
 /// The live headroom (the GPU ceiling less MLX's active bytes), installed by the server. Unset (tests, `sushi kld`),
 /// nothing is ever released.
@@ -59,19 +60,40 @@ pub const DecodeSide = enum {
     /// Every kernel of the engine is held to MLX's bytes on a GPU with matrix units; its other matmul tiles have
     /// not run on one without.
     mlx_no_matrix_units,
+    /// `--ds41-mlx-engine`.
+    mlx_by_flag,
+    /// The model's `ds41_cooler` is off.
+    mlx_by_setting,
 };
 
-/// PURE: the side for a pack that is or is not STQ throughout, on a GPU with or without matrix units.
-pub fn decodeSide(stq: bool, matrix_units: bool) DecodeSide {
+/// PURE: the side for a pack that is or is not STQ throughout, on a GPU with or without matrix units. A pack or
+/// Mac the engine cannot serve keeps its own reason; the user's ask only moves a decode the engine would have run.
+pub fn decodeSide(stq: bool, matrix_units: bool, ask: MlxAsk) DecodeSide {
     if (!stq) return .mlx_not_stq;
-    return if (matrix_units) .engine else .mlx_no_matrix_units;
+    if (!matrix_units) return .mlx_no_matrix_units;
+    return switch (ask) {
+        .none => .engine,
+        .flag => .mlx_by_flag,
+        .setting => .mlx_by_setting,
+    };
+}
+
+/// The load line for a side. The engine of our own ships as Sushi Cooler.
+pub fn decodeLine(side: DecodeSide) []const u8 {
+    return switch (side) {
+        .engine => "[dsv41] decode forwards (one row, DSpark draft and verify rows): on Sushi Cooler, the engine of our own",
+        .mlx_not_stq => "[dsv41] decode forwards: on MLX (Sushi Cooler has no quantized_matmul for an FP8 trunk or MXFP4 experts)",
+        .mlx_no_matrix_units => "[dsv41] decode forwards: on MLX (Sushi Cooler is proven on a GPU with matrix units only)",
+        .mlx_by_flag => "[dsv41] decode forwards: on MLX because --ds41-mlx-engine was given (Sushi Cooler is off)",
+        .mlx_by_setting => "[dsv41] decode forwards: on MLX because model-settings.json ds41_cooler is off (Sushi Cooler is off)",
+    };
 }
 
 /// A test names the side its model decodes on.
 pub var own_override: ?bool = null;
 
 pub fn decodeSideOf(c: *const Config) DecodeSide {
-    return decodeSide(c.expert_dec != null and c.trunk_dec != null, mlx.engine.matrixUnits());
+    return decodeSide(c.expert_dec != null and c.trunk_dec != null, mlx.engine.matrixUnits(), c.mlx_ask);
 }
 
 /// Whether this pack's decode forwards run on the engine of our own. The load and every bill ask here.
@@ -575,8 +597,26 @@ test "dsv41 borrow: with decode on the engine of our own every forward installs 
 }
 
 test "dsv41 borrow: decode runs on the engine for an STQ pack on a GPU with matrix units, and on MLX otherwise, by name" {
-    try testing.expectEqual(DecodeSide.engine, decodeSide(true, true));
-    try testing.expectEqual(DecodeSide.mlx_not_stq, decodeSide(false, true));
-    try testing.expectEqual(DecodeSide.mlx_not_stq, decodeSide(false, false));
-    try testing.expectEqual(DecodeSide.mlx_no_matrix_units, decodeSide(true, false));
+    try testing.expectEqual(DecodeSide.engine, decodeSide(true, true, .none));
+    try testing.expectEqual(DecodeSide.mlx_not_stq, decodeSide(false, true, .none));
+    try testing.expectEqual(DecodeSide.mlx_not_stq, decodeSide(false, false, .none));
+    try testing.expectEqual(DecodeSide.mlx_no_matrix_units, decodeSide(true, false, .none));
+}
+
+test "dsv41 borrow: the user's ask for MLX moves a pack the engine could serve, and a pack or Mac it cannot serve keeps its own reason" {
+    try testing.expectEqual(DecodeSide.mlx_by_flag, decodeSide(true, true, .flag));
+    try testing.expectEqual(DecodeSide.mlx_by_setting, decodeSide(true, true, .setting));
+    try testing.expectEqual(DecodeSide.mlx_not_stq, decodeSide(false, true, .flag));
+    try testing.expectEqual(DecodeSide.mlx_no_matrix_units, decodeSide(true, false, .setting));
+    var c: Config = .{};
+    c.mlx_ask = .setting;
+    try testing.expectEqual(DecodeSide.mlx_not_stq, decodeSideOf(&c));
+}
+
+test "dsv41 borrow: the load line names the side and why, with Sushi Cooler as the engine's name" {
+    try testing.expectEqualStrings("[dsv41] decode forwards (one row, DSpark draft and verify rows): on Sushi Cooler, the engine of our own", decodeLine(.engine));
+    try testing.expectEqualStrings("[dsv41] decode forwards: on MLX because --ds41-mlx-engine was given (Sushi Cooler is off)", decodeLine(.mlx_by_flag));
+    try testing.expectEqualStrings("[dsv41] decode forwards: on MLX because model-settings.json ds41_cooler is off (Sushi Cooler is off)", decodeLine(.mlx_by_setting));
+    try testing.expect(std.mem.indexOf(u8, decodeLine(.mlx_not_stq), "FP8 trunk or MXFP4 experts") != null);
+    try testing.expect(std.mem.indexOf(u8, decodeLine(.mlx_no_matrix_units), "matrix units") != null);
 }

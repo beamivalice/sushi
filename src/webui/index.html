@@ -444,6 +444,12 @@ dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2);
 .tri button { height: 26px; padding: 0 var(--s2); white-space: nowrap; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; cursor: pointer; }
 .tri button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border-strong); }
 .tri.locked button { cursor: default; }
+.chk { display: flex; align-items: center; gap: var(--s2); }
+.set .ctl .chk input { width: 16px; height: 16px; accent-color: var(--accent-fill); }
+.set .ctl a.report { font-size: var(--fs-xs); }
+.grp { margin-top: var(--s3); }
+.grp > h4 { margin: 0; padding: var(--s3) 0 var(--s1) var(--s3); border-top: 1px solid var(--border); font-size: var(--fs-sm); font-weight: 700; color: var(--text-2); }
+.grp > .set:first-of-type { border-top: 0; }
 @media (max-width: 640px) {
   .page-head .in, .page-body { padding-left: var(--s4); padding-right: var(--s4); }
   .set { grid-template-columns: 1fr; }
@@ -3632,6 +3638,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Use it when the model thinks for too long. Start low and raise it if thinking still runs long.", ""],
     vision: ["Vision (image input)", "Loads the part of the model that reads images. Off saves its memory.", "--vision",
       "Turn it off if you only chat in text and want the memory back.", ""],
+    ds41_cooler: ["Use Sushi's Cooler Engine instead of MLX", "Generates DeepSeek 4.1 text on Sushi Cooler, the engine built for this Mac, which uses less processor power than MLX. Untick it to go back to MLX if something breaks, and please report the problem.", "--ds41-mlx-engine",
+      "Ticked is the default and the better choice. Untick it only if DeepSeek 4.1 answers wrongly or crashes, then report the issue so it can be fixed. It takes effect the next time the model loads.", "Sushi Cooler engine"],
     max_tokens: ["Max generated tokens", "The most tokens a request may generate, thinking included, when an app sets no limit of its own. An app's own limit wins.", "--max-tokens",
       "A token is about three quarters of a word. Empty uses the model's default.", ""],
     yarn_factor: ["Context extension", "Stretches the model's context window with YaRN. It can lower quality on short prompts, and a longer context needs more memory.", "",
@@ -3657,7 +3665,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (factor) return `RoPE: yarn, factor ${factor}, original ${n(r.native)} · up to ${n(r.native * factor)} tokens`;
     return r.method === "yarn" ? `Model default: yarn, factor ${r.factor}, original ${n(r.native)} · up to ${n(r.window)} tokens` : `Model default: no extension · up to ${n(r.window)} tokens`;
   };
-  const isOff = (flag) => flag === "off" || flag === "false" || /^--no-/.test(flag);
+  const isOff = (flag) => flag === "off" || flag === "false" || flag === "--ds41-mlx-engine" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
   const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check", skip_mem_preflight: "--skip-mem-preflight" }[key] ?? "";
   // The model-settings.json key beside its launch flag, after any engineering name the plain label replaced.
@@ -3959,10 +3967,24 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const row = h("div", { class: "set", "data-key": key }, h("div", { class: "lab" }, forId ? h("label", { for: forId, ...name }) : h("span", name), badge), help, ctl);
     return { row, badge, help, ctl, hint, bad };
   }
+  // Keys whose bool control is a checkbox, ticked by default, rather than the Default/On/Off segments.
+  const CHECKBOX_KEYS = ["ds41_cooler"];
+  // The page that takes a report of a breaking bug.
+  const ISSUES_URL = "https://github.com/beamivalice/sushi/issues/new";
+  // A key's settings group: its rows sit under this heading, outside the "More settings" fold.
+  const GROUP_OF = { ds41_cooler: "DeepSeek 4.1 Inference" };
   // A control for one key: a segmented Default/On/Off, a select, or a text box. `lock` disables it (showing the launch flag's
   // value when it has one); `allow` limits a select to the choices this model supports.
   function control(spec, onChange) {
     const key = spec.name, label = KEY[key][0];
+    if (spec.type === "bool" && CHECKBOX_KEYS.includes(key)) {
+      // Ticked is the default: a tick saves nothing, or keeps an explicit true; unticked saves false.
+      let cur = "", base = "";
+      const box = h("input", { type: "checkbox", id: `set-${key}`, "aria-label": label, onchange: () => { cur = box.checked ? (base === "true" ? "true" : "") : "false"; onChange(); } });
+      return { node: h("div", { class: "chk" }, box), get: () => cur, set: (v) => { cur = v; base = v; box.checked = v !== "false"; }, focused: () => document.activeElement === box,
+        def: () => {},
+        lock: (on, flag) => { box.disabled = on; box.checked = on ? flag !== undefined && !isOff(flag) : cur !== "false"; } };
+    }
     if (spec.type === "bool") {
       const names = [["", "Default"], ["true", "On"], ["false", "Off"]];
       let cur = "";
@@ -4005,6 +4027,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     S.control = control(spec, onChange);
     S.remove = h("button", { class: "btn sm", type: "button", text: "Remove saved value", hidden: true, onclick: () => removeSaved(F, key) });
     S.ctl.append(S.control.node, S.hint, S.bad, S.remove);
+    if (key === "ds41_cooler") S.ctl.append(h("a", { class: "report", href: ISSUES_URL, target: "_blank", rel: "noopener noreferrer", text: "Report an issue on GitHub" }));
     return S;
   }
   function patchSet(F, S, m) {
@@ -4059,10 +4082,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function buildRows(F, m) {
     const specs = F.specs = specsOf(m), P = per(F.id);
     F.sets = new Map(specs.map((spec) => [spec.name, F.sets.get(spec.name) ?? makeSet(F, spec)]));
-    F.moreList = specs.filter((s) => !COMMON.includes(s.name));
+    F.moreList = specs.filter((s) => !COMMON.includes(s.name) && !GROUP_OF[s.name]);
     F.more = F.moreList.length ? h("details", { class: "more-set" }, F.moreSum = h("summary"), ...F.moreList.map((s) => F.sets.get(s.name).row)) : null;
     F.more?.addEventListener("toggle", () => { if (!F.moreProg) P.moreOpen = F.more.open; });
-    F.rows.replaceChildren(...specs.filter((s) => COMMON.includes(s.name)).map((s) => F.sets.get(s.name).row), ...(F.more ? [F.more] : []));
+    const groups = [...new Set(specs.filter((s) => GROUP_OF[s.name]).map((s) => GROUP_OF[s.name]))].map((name) =>
+      h("div", { class: "grp" }, h("h4", { text: name }), ...specs.filter((s) => GROUP_OF[s.name] === name).map((s) => F.sets.get(s.name).row)));
+    F.rows.replaceChildren(...specs.filter((s) => COMMON.includes(s.name)).map((s) => F.sets.get(s.name).row), ...(F.more ? [F.more] : []), ...groups);
     for (const S of F.sets.values()) if (S.spec.name in P.texts) S.control.set(P.texts[S.spec.name]);
   }
   function patchDetail(m) {

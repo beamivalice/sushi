@@ -25,6 +25,9 @@ pub var ssd_prefetch: ?u8 = null;
 
 pub const default_ssd_prefetch: u8 = 0;
 
+/// The launch flag that turns Sushi Cooler, the engine of our own, off for the arch that has it (`--ds41-mlx-engine`).
+pub var cooler_off_flag: bool = false;
+
 /// The `--ssd-prefetch` value: an integer 0..100, else null.
 pub fn parseSsdPrefetch(value: []const u8) ?u8 {
     if (value.len == 0 or value.len > 3) return null;
@@ -161,6 +164,10 @@ pub const ModelConfig = struct {
     /// `--ssd-prefetch` as given, and the model-settings.json `ssd_prefetch`; the flag wins (`ssdPrefetchPct`).
     ssd_prefetch: ?u8 = null,
     ssd_prefetch_override: ?u8 = null,
+    /// Sushi Cooler on or off: the launch flag as given (false = off, null = not given) and the model-settings.json
+    /// `ds41_cooler`; the flag wins (`coolerChoice`).
+    cooler_flag: ?bool = null,
+    cooler_override: ?bool = null,
     expert_ssd_budget_bytes: u64 = 0,
     expert_workspace_bytes: u64 = 0,
     /// What the streamed store bills beyond its mean expert, set by the streaming plan.
@@ -820,6 +827,17 @@ pub const ModelConfig = struct {
         return self.ssd_prefetch orelse self.ssd_prefetch_override orelse default_ssd_prefetch;
     }
 
+    /// Whether DeepSeek-V4.1 decodes on Sushi Cooler: the launch flag, else the model setting, else on.
+    pub fn coolerChoice(self: *const ModelConfig) model_settings_mod.CoolerChoice {
+        return model_settings_mod.CoolerChoice.resolve(self.cooler_flag != null, self.cooler_override);
+    }
+
+    /// Hands the Sushi Cooler choice to the arch config its decode side and bills read.
+    pub fn stampCooler(self: *ModelConfig) void {
+        const choice = self.coolerChoice();
+        arch_config.stampCooler(self, choice.on, choice.source == .flag);
+    }
+
     /// The context an auto boot serves when memory admits it, ahead of the margined memory ceiling; 0 = none.
     pub fn defaultContext(self: *const ModelConfig) u32 {
         const want = self.serve_defaults.context;
@@ -1105,6 +1123,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     config.gdn_state_f32 = qwen_gdn_f32;
     config.drop_expert = drop_expert;
     config.ssd_prefetch = ssd_prefetch;
+    config.cooler_flag = if (cooler_off_flag) false else null;
     try arch_config.parseDir(&config, allocator, model_dir);
     if (config.supportsExpertStreaming()) {
         const layers: u16 = std.math.cast(u16, config.num_hidden_layers) orelse return error.InvalidQwen4ConfigField;

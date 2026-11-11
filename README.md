@@ -9,7 +9,7 @@ A local AI server for low-bit, very high quality Sushi quants, using custom Sush
 Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 Which pack suits your Mac, and running a bigger one from the SSD: [Choosing a pack and streaming](docs/usage-streaming.md).
 
-* [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (pack revision 2.0, requires 96 GB+ and sushi 1.5.0 or later, experts [streamed](#streaming), text and image input)
+* [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (pack revision 2.0, requires 96 GB+ and sushi 1.5.0 or later, experts [streamed](#streaming), text and image input; on M5 Macs it generates on Sushi Cooler, sushi's own engine, and `--ds41-mlx-engine` or the model's settings page go back to MLX)
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming))
 * [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (pack revision 2.0, requires 64 GB+ and sushi 1.5.1 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+, or 64 GB [streamed](#streaming))

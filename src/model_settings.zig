@@ -84,6 +84,28 @@ pub const VisionChoice = struct {
     }
 };
 
+pub const cooler_why_not_stq = "This pack is not STQ: Sushi Cooler has no kernels for its FP8 trunk and MXFP4 experts, so decode runs on MLX.";
+pub const cooler_why_no_matrix_units = "This Mac's GPU has no matrix units, which Sushi Cooler needs, so decode runs on MLX.";
+
+/// Whether the arch decodes on Sushi Cooler: the launch flag that turns it off > the model's `ds41_cooler` > on.
+pub const CoolerChoice = struct {
+    on: bool,
+    source: Source,
+
+    pub fn resolve(flag_given: bool, setting: ?bool) CoolerChoice {
+        const p = settings_resolve.resolve(bool, if (flag_given) false else null, setting, true);
+        return .{ .on = p.value, .source = p.source };
+    }
+
+    pub fn sourceName(self: CoolerChoice) []const u8 {
+        return switch (self.source) {
+            .flag => "--ds41-mlx-engine",
+            .model_settings => "model-settings.json ds41_cooler",
+            .default => "default",
+        };
+    }
+};
+
 test "model_settings: writeEdits edits a section whose key the hand-edited file spelled with a trailing slash" {
     const t = std.testing;
     const io = t.io;
@@ -165,6 +187,8 @@ pub const Override = struct {
     think_penalty: ?f32 = null,
     logit_bias_file: ?@import("logit_bias.zig").FilePath = null,
     vision: ?bool = null,
+    /// Decode on Sushi Cooler (true, the default) or on MLX (false), for the arch that has the engine.
+    ds41_cooler: ?bool = null,
     /// The omitted-`max_tokens` budget. In a defaults row, 0 = the rest of the window.
     max_tokens: ?u32 = null,
     /// The YaRN factor the config is parsed with; null = the config.json's own RoPE.
@@ -173,7 +197,7 @@ pub const Override = struct {
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
             o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
-            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.max_tokens == null and o.yarn_factor == null;
+            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.ds41_cooler == null and o.max_tokens == null and o.yarn_factor == null;
     }
 };
 
@@ -248,6 +272,10 @@ fn fromValue(v: std.json.Value) Override {
     };
     if (obj.get("vision")) |p| switch (p) {
         .bool => |b| o.vision = b,
+        else => {},
+    };
+    if (obj.get("ds41_cooler")) |p| switch (p) {
+        .bool => |b| o.ds41_cooler = b,
         else => {},
     };
     if (obj.get("max_tokens")) |g| if (accepts("max_tokens", g)) {
@@ -351,7 +379,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     defer s.deinit();
     const o = s.lookup(model_path);
     if (modelObject(&s, model_path)) |obj| _ = warnRejected(model_path, obj, &model_keys);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} max_tokens={d} yarn_factor={d}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} ds41_cooler={s} max_tokens={d} yarn_factor={d}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -363,6 +391,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
         o.think_penalty orelse 0,
         if (o.vision) |v| (if (v) "on" else "off") else "default",
+        if (o.ds41_cooler) |v| (if (v) "on" else "off") else "default",
         o.max_tokens orelse 0,
         o.yarn_factor orelse 0,
     });
@@ -418,6 +447,7 @@ pub const model_keys = [_]KeySpec{
     .{ .name = "preserve_thinking", .kind = .bool },
     .{ .name = "think_penalty", .kind = .number, .min = 0, .max = think_penalty_max },
     .{ .name = "vision", .kind = .bool },
+    .{ .name = "ds41_cooler", .kind = .bool },
     .{ .name = "max_tokens", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
     .{ .name = "yarn_factor", .kind = .choice, .choices = &.{ "2", "4" }, .normalize = yarnChoice },
 };
@@ -472,6 +502,10 @@ pub const Fit = struct {
     /// 0 = unknown, which judges nothing.
     window_native: u32 = 0,
     window_default: u32 = 0,
+    /// The arch has Sushi Cooler to turn off (`ds41_cooler`).
+    cooler_offered: bool = true,
+    /// Why Sushi Cooler cannot serve this pack or Mac; empty = it can.
+    cooler_why: []const u8 = "",
 };
 
 /// The context window the model has once `yarn_factor` (null = unset) is applied; 0 = unknown.
@@ -524,6 +558,7 @@ pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
         return if (fit.stq_experts) null else "This pack has no STQ experts, so there is no expert prefetcher.";
     }
     if (eql(u8, key, "vision")) return if (fit.has_vision) null else "This checkpoint has no vision tower.";
+    if (eql(u8, key, "ds41_cooler")) return if (fit.cooler_offered) null else "This model has no Sushi Cooler engine to turn off.";
     if (eql(u8, key, "kv_quant")) return if (special) "This model keeps no KV cache to quantize." else null;
     if (eql(u8, key, "mtp")) {
         if (!fit.serves_mtp) return "This model serves without a speculative head.";
@@ -579,6 +614,7 @@ const unset_budget = [_][]const u8{"ssd_budget_gb"};
 pub fn limit(key: []const u8, fit: Fit) Limit {
     const eql = std.mem.eql;
     if (unavailable(key, fit)) |why| return .{ .disabled = true, .why = why };
+    if (eql(u8, key, "ds41_cooler") and fit.cooler_why.len > 0) return .{ .disabled = true, .why = fit.cooler_why };
     var l: Limit = .{};
     const tail = eql(u8, key, "mtp_acceptance") or eql(u8, key, "mtp_greedy_tail");
     if ((tail or eql(u8, key, "mtp")) and budgetDropsHead(fit)) {
@@ -1482,4 +1518,38 @@ test "warnRejected counts exactly the keys the loader ignores, in a model sectio
     try t.expectEqual(@as(usize, 1), warnRejected(server_section, s.parsed.?.value.object.get(server_section).?.object, &server_keys));
     try t.expect(s.lookup("/m/a").mtp == null);
     try t.expectEqual(@as(?bool, false), s.lookup("/m/a").vision);
+}
+
+test "model_settings: ds41_cooler is a bool, anything else is unset, and the page offers it only where the arch has the engine" {
+    const t = std.testing;
+    var s = try parse(t.allocator,
+        \\{"/m/a": {"ds41_cooler": true}, "/m/b": {"ds41_cooler": false}, "/m/c": {"ds41_cooler": "off"}}
+    );
+    defer s.deinit();
+    try t.expectEqual(@as(?bool, true), s.lookup("/m/a").ds41_cooler);
+    try t.expectEqual(@as(?bool, false), s.lookup("/m/b").ds41_cooler);
+    try t.expectEqual(@as(?bool, null), s.lookup("/m/c").ds41_cooler);
+    try t.expect(!(Override{ .ds41_cooler = false }).isEmpty());
+    try t.expect(findKey(&model_keys, "ds41_cooler").?.kind == .bool);
+    try t.expect(applies("ds41_cooler", .{ .arch = "deepseek_v41", .streams_experts = true, .has_vision = true, .cooler_offered = true }));
+    try t.expect(!applies("ds41_cooler", .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .cooler_offered = false }));
+    const blocked = limit("ds41_cooler", .{ .arch = "deepseek_v41", .streams_experts = true, .has_vision = true, .cooler_offered = true, .cooler_why = "This pack is not STQ." });
+    try t.expect(blocked.disabled);
+    try t.expectEqualStrings("This pack is not STQ.", blocked.why);
+}
+
+test "model_settings: Sushi Cooler is on unless the flag, else the model's ds41_cooler, turns it off" {
+    const t = std.testing;
+    const dflt = CoolerChoice.resolve(false, null);
+    try t.expect(dflt.on);
+    try t.expectEqual(settings_resolve.Source.default, dflt.source);
+    try t.expect(CoolerChoice.resolve(false, true).on);
+    const off = CoolerChoice.resolve(false, false);
+    try t.expect(!off.on);
+    try t.expectEqual(settings_resolve.Source.model_settings, off.source);
+    const flagged = CoolerChoice.resolve(true, true);
+    try t.expect(!flagged.on);
+    try t.expectEqual(settings_resolve.Source.flag, flagged.source);
+    try t.expectEqualStrings("--ds41-mlx-engine", flagged.sourceName());
+    try t.expectEqualStrings("model-settings.json ds41_cooler", off.sourceName());
 }

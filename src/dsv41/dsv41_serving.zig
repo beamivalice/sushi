@@ -56,13 +56,8 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     errdefer mdl.deinit();
     dsv41_model.logMemory(mdl);
     mdl.engine_decode = own_decode;
-    if (own_decode) {
-        log.info("[dsv41] decode forwards (one row, DSpark draft and verify rows): on the engine of our own\n", .{});
-    } else switch (dsv41_borrow.decodeSideOf(&config.dsv41.?)) {
-        .engine => {},
-        .mlx_not_stq => log.info("[dsv41] decode forwards: on MLX (the engine of our own has no quantized_matmul for an FP8 trunk or MXFP4 experts)\n", .{}),
-        .mlx_no_matrix_units => log.info("[dsv41] decode forwards: on MLX (the engine of our own is proven on a GPU with matrix units only)\n", .{}),
-    }
+    const side: dsv41_borrow.DecodeSide = if (own_decode) .engine else dsv41_borrow.decodeSideOf(&config.dsv41.?);
+    if (own_decode or side != .engine) log.info("{s}\n", .{dsv41_borrow.decodeLine(side)});
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
     dsv41_model.setDsparkExact(mdl, if (std.c.getenv("SUSHI_DSV41_DSPARK_EXACT")) |v| diagEnvValueOn(v) else true);
@@ -285,6 +280,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
     defer m.gpa.free(ahead);
     for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
+    // The wide prefill arm joins this line when it becomes the path: `ds41_cooler` must cover it (it follows `m.engine_decode`).
     const own = decode_width and (vision == null or dsv41_model.imageRows(m, host) == 0);
     if (m.ced_split != null and tailUnread(m.cfg.window, n, ctx.ahead_min_rows, ctx.holds_point) and st.verify == null) {
         try dsv41_model.extendState(m, host, dsv41_model.SPAN, vision, ahead);

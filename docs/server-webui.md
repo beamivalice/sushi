@@ -73,6 +73,14 @@ and the page tooltip share them.
   (top bar, empty chat, API-key card) and as the favicon. Theme 2.0 keeps it as it was; the server's state is the
   status dot's job, not the logo's.
 
+- DeepSeek 4.1 Inference: a model page whose server `keys` list `ds41_cooler` shows a heading `.grp > h4` with one
+  checkbox (`.chk`, outside the More settings fold): "Use Sushi's Cooler Engine instead of MLX", ticked by default,
+  with a "Report an issue on GitHub" link (`https://github.com/beamivalice/sushi/issues/new`). A tick saves nothing (or
+  keeps an explicit `true`), an untick saves `ds41_cooler: false`; like every model key it applies at the next load and
+  the Reload callout follows `loaded_with`. `--ds41-mlx-engine` locks it unticked and names the flag; a pack or Mac
+  Sushi Cooler cannot serve (not STQ, no matrix units) shows it unticked and disabled with the reason, listed in
+  Advanced only like any disabled key (`limits.ds41_cooler`). A key group is one entry in `GROUP_OF`.
+
 ## Tooltips
 
 - One component: any element with `data-tip="plain text"` shares the single `#tip` (`role="tooltip"`; the anchor gets

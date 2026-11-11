@@ -22,7 +22,7 @@ const KEYS = [
   { name: 'ctx_size', type: 'int', min: 1, max: 4294967295 }, { name: 'kv_quant', type: 'choice', choices: ['off', '4', '6', '8'] },
   { name: 'mtp', type: 'bool' }, { name: 'mtp_acceptance', type: 'choice', choices: ['exact', 'typical', 'tokenv3'] }, { name: 'mtp_greedy_tail', type: 'bool' },
   { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
-  { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' },
+  { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' }, { name: 'ds41_cooler', type: 'bool' },
   { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 }, { name: 'yarn_factor', type: 'choice', choices: ['2', '4'] },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
@@ -254,6 +254,65 @@ async function main() {
       await page.waitForSelector('.toast');
       assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'GLM-B', set: { mtp: true } });
       assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // DeepSeek 4.1's Sushi Cooler engine: a checkbox under its own heading, ticked by default, with the report link.
+      const server = makeServer();
+      server.state.models[2].keys = [...BASE_KEYS, 'ds41_cooler'];
+      const { page, context, errors } = await open(browser, server, '/models#Deep-C');
+      const box = `${row('ds41_cooler')} input[type="checkbox"]`;
+      await page.waitForSelector(box);
+      assert.equal(await page.textContent('.grp > h4'), 'DeepSeek 4.1 Inference');
+      assert.match(await page.textContent(`${row('ds41_cooler')} .lab`), /Use Sushi's Cooler Engine instead of MLX/);
+      assert.equal(await page.isChecked(box), true, 'ticked by default');
+      assert.equal(await page.getAttribute(`${row('ds41_cooler')} a.report`, 'href'), 'https://github.com/beamivalice/sushi/issues/new');
+      assert.equal(await page.locator(row('ds41_cooler')).evaluate((n) => !!n.closest('details')), false, 'not hidden in the More settings fold');
+      await page.click(box);
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForSelector('.toast');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Deep-C', set: { ds41_cooler: false } }, 'unticking saves false');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // A saved false shows unticked and ticking it again removes the key; the launch flag locks it unticked and is named.
+      const server = makeServer();
+      server.state.models[2].keys = [...BASE_KEYS, 'ds41_cooler'];
+      server.state.models[2].settings = allKeys({ ds41_cooler: keyState({ file: false, source: 'file' }) });
+      const { page, context } = await open(browser, server, '/models#Deep-C');
+      const box = `${row('ds41_cooler')} input[type="checkbox"]`;
+      await page.waitForSelector(box);
+      assert.equal(await page.isChecked(box), false);
+      await page.click(box);
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForSelector('.toast');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Deep-C', set: { ds41_cooler: null } }, 'ticking again removes the key');
+      await context.close();
+      const locked = makeServer();
+      locked.state.models[2].keys = [...BASE_KEYS, 'ds41_cooler'];
+      locked.state.models[2].settings = allKeys({ ds41_cooler: keyState({ flag: '--ds41-mlx-engine', source: 'flag', locked: true }) });
+      const second = await open(browser, locked, '/models#Deep-C');
+      await second.page.waitForSelector(box);
+      assert.equal(await second.page.isDisabled(box), true);
+      assert.equal(await second.page.isChecked(box), false, 'the flag means MLX');
+      assert.match(await second.page.textContent(row('ds41_cooler')), /--ds41-mlx-engine/);
+      await second.context.close();
+    }
+
+    {
+      // A pack the engine cannot serve shows the key disabled, unticked, with the reason (Advanced lists a disabled key).
+      const server = makeServer({ limits: true });
+      server.state.models[2].keys = BASE_KEYS;
+      server.state.models[2].limits = { ds41_cooler: { disabled: true, why: 'This pack is not STQ: Sushi Cooler has no kernels for its FP8 trunk and MXFP4 experts, so decode runs on MLX.' } };
+      const { page, context } = await open(browser, server, '/models#Deep-C', { mode: 'advanced' });
+      const box = `${row('ds41_cooler')} input[type="checkbox"]`;
+      await page.waitForSelector(box);
+      assert.equal(await page.isDisabled(box), true);
+      assert.equal(await page.isChecked(box), false, 'it does not pretend the engine is in use');
+      assert.match(await page.textContent(`${row('ds41_cooler')} .help`), /not STQ/);
       await context.close();
     }
 
@@ -1120,7 +1179,7 @@ async function main() {
       });
     // A plain-worded setting or badge keeps its engineering name in the tooltip: the model-settings.json key and the launch flag.
     const FLAGS = { ctx_size: '--ctx-size', kv_quant: '--kv-quant', mtp: '--mtp', mtp_acceptance: null, mtp_greedy_tail: '--mtp-greedy-tail', ssd_budget_gb: '--ssd-budget-gb', ssd_prefetch: '--ssd-prefetch',
-      preserve_thinking: '--preserve-thinking', think_penalty: '--think-penalty', vision: '--vision', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
+      preserve_thinking: '--preserve-thinking', think_penalty: '--think-penalty', vision: '--vision', ds41_cooler: '--ds41-mlx-engine', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
       update_check: '--no-update-check', pack_update_check: '--no-update-check', skip_mem_preflight: '--skip-mem-preflight' };
     const WORDS = { ssd_budget_gb: /expert/, ssd_prefetch: /prefetch/ };
     // A label that is already the common term keeps only the key and flag in its technical name.

@@ -1539,6 +1539,7 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
     if (settings_resolve.launch.mtp_greedy_tail != null) locks.modelMut("mtp_greedy_tail").pin("--mtp-greedy-tail", .{});
     if (ssd_budget_bytes != 0) locks.modelMut("ssd_budget_gb").pin("{d}", .{ssd_budget_bytes >> 30});
     if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
+    if (model_mod.cooler_off_flag) locks.modelMut("ds41_cooler").pin("--ds41-mlx-engine", .{});
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
@@ -1660,4 +1661,18 @@ test "launch flags: --config-overrides pins yarn_factor only when it names the R
     model_mod.setConfigOverrides("{\"text_config\":{\"rope_parameters\":{\"factor\":4}}}");
     pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expectEqualStrings("--config-overrides", model_settings_mod.launch_locks.model("yarn_factor").?.text());
+}
+
+test "launch flags: --ds41-mlx-engine pins the model's ds41_cooler, and no flag leaves it free" {
+    const saved_flag = model_mod.cooler_off_flag;
+    defer model_mod.cooler_off_flag = saved_flag;
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    model_mod.cooler_off_flag = false;
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.model("ds41_cooler").?.set);
+    model_mod.cooler_off_flag = true;
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expectEqualStrings("--ds41-mlx-engine", model_settings_mod.launch_locks.model("ds41_cooler").?.text());
 }

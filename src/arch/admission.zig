@@ -12,6 +12,8 @@ pub const ExpertStreamTraits = struct {
     drop_expert: bool = false,
     /// `--ssd-prefetch` is accepted: the arch has an expert prefetcher.
     prefetch: bool = false,
+    /// `--ds41-mlx-engine` is accepted: decode may run on Sushi Cooler, the engine of our own, or on MLX.
+    cooler: bool = false,
     /// The expert slabs are read tile-major.
     tile_major: bool = false,
     /// The routed experts are STQ rate groups, which the prefetcher reads.
@@ -77,8 +79,8 @@ test "a streamed MTP head is an arch's own declaration, and the refusal names th
 test "expert-stream traits per model type and layout" {
     const T = ExpertStreamTraits;
     const rows = [_]struct { model_type: []const u8, layout: @TypeOf(@as(model.ModelConfig, .{}).expert_layout), want: T }{
-        .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = true } },
-        .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = false } },
+        .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .prefetch = true, .cooler = true, .tile_major = true } },
+        .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .prefetch = true, .cooler = true, .tile_major = false } },
         .{ .model_type = "glm5_next", .layout = .exl3_k4, .want = .{} },
         .{ .model_type = "qwen4_exp", .layout = .exl3_k4, .want = .{} },
         .{ .model_type = "mimo_v2", .layout = .exl3_k4, .want = .{} },

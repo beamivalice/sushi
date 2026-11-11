@@ -15,6 +15,7 @@ const mlx_ops = @import("../mlx_ops.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const dsv41_serving = @import("dsv41_serving.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
+const dsv41_config = @import("dsv41_config.zig");
 const KVCache = trunk_mod.KVCache;
 const testing = std.testing;
 const prefill_plan = @import("../prefill_plan.zig");
@@ -1352,6 +1353,11 @@ const EngineFixture = struct {
     was_own: ?bool,
 
     fn open(self: *EngineFixture, dir: []const u8) !void {
+        return self.openAsking(dir, null);
+    }
+
+    /// With `ask` the model decodes on the side `decodeSideOf` gives that ask, the pack and the GPU; without, the engine is forced on.
+    fn openAsking(self: *EngineFixture, dir: []const u8, ask: ?dsv41_config.MlxAsk) !void {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const dsv41_model = @import("dsv41_model.zig");
@@ -1372,6 +1378,10 @@ const EngineFixture = struct {
         self.config.stream_mtp_head = true;
         self.config.expert_cache_bytes = 64 << 20;
         self.config.expert_source_dir = try a.dupe(u8, dir);
+        if (ask) |x| {
+            self.config.dsv41.?.mlx_ask = x;
+            dsv41_borrow.own_override = dsv41_borrow.decodeSideOf(&self.config.dsv41.?) == .engine;
+        }
         self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, false);
         errdefer self.weights.deinit();
         self.xfm = try Trunk.init(io, a, self.config, &self.weights);
@@ -1425,6 +1435,29 @@ fn shortPrefillBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, lea
     }
     _ = mlx.mlx_array_free(lg);
     return out;
+}
+
+test "dsv41 engine: the same greedy tokens come from a load with Sushi Cooler on and with the setting or the flag off, and an off load runs no engine dispatch (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var bytes: [3]std.ArrayList(u8) = @splat(.empty);
+    defer for (&bytes) |*b| b.deinit(a);
+    for ([_]dsv41_config.MlxAsk{ .none, .setting, .flag }, 0..) |ask, i| {
+        var fx: EngineFixture = undefined;
+        try fx.openAsking(dir, ask);
+        defer fx.deinit();
+        try testing.expectEqual(ask == .none, fx.model().engine_decode);
+        var buf: [48]u32 = undefined;
+        const prompt = fx.prompt(&buf);
+        const before = mlx.engine.stats().dispatches;
+        bytes[i] = try shortPrefillBytes(a, &fx.xfm, prompt, 30, 4, 6);
+        const ran = mlx.engine.stats().dispatches - before;
+        try testing.expectEqual(ask == .none, ran > 0);
+    }
+    try testing.expectEqualSlices(u8, bytes[0].items, bytes[1].items);
+    try testing.expectEqualSlices(u8, bytes[0].items, bytes[2].items);
 }
 
 test "dsv41 engine: a prefill forward of 2 to 16 rows gives MLX's logits and the steps after it MLX's bytes (DSV41_STQ_TINY)" {

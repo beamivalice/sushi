@@ -197,6 +197,12 @@ Options:
                       every cache checkpoint (about 54 MB each on
                       Flash-Next) to save memory on smaller machines.
                       No effect on GLM or MiMo, which have no GDN arm.
+  --ds41-mlx-engine   DeepSeek-V4.1 only: decode on MLX instead of Sushi Cooler,
+                      the engine of our own (the default on an STQ pack
+                      with a matrix-unit GPU). An opt-out if Sushi Cooler
+                      misbehaves; report it at
+                      https://github.com/beamivalice/sushi/issues/new.
+                      Outranks the model's ds41_cooler setting.
   --drop-expert <n>   DeepSeek-V4.1 only: never load or pick the n least-used
                       routed experts of every layer, ranked by the pack's
                       expert_usage.json (n a multiple of 8; default 0 =

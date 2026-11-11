@@ -74,6 +74,11 @@ pub fn cacheLayoutNamespace(config: *const Config) ?[]const u8 {
     return dsv41_prefix.namespaceTag(dsparkOn(config));
 }
 
+/// Records who asked for decode on MLX, which `dsv41_borrow.decodeSideOf` and the bills read.
+pub fn stampCooler(config: *Config, on: bool, by_flag: bool) void {
+    if (config.dsv41) |*c| c.mlx_ask = if (on) .none else if (by_flag) .flag else .setting;
+}
+
 /// Does this load keep the DSpark stages resident? They are its MTP head: `--mtp` under streaming.
 pub fn dsparkOn(config: *const Config) bool {
     const c = config.dsv41 orelse return false;
@@ -142,7 +147,7 @@ pub fn ownsModuleDecodeState(xfm: Model) bool {
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
-    return .{ .drop_expert = true, .prefetch = true, .tile_major = config.expert_layout == .exl3_k4, .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false };
+    return .{ .drop_expert = true, .prefetch = true, .cooler = true, .tile_major = config.expert_layout == .exl3_k4, .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false };
 }
 
 test "a model stamped as dsv41 is dispatched to dsv41" {

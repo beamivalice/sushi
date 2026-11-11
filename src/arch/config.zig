@@ -268,6 +268,15 @@ pub fn kvBytesPerToken(config: *const model.ModelConfig) ?u64 {
     };
 }
 
+/// Hands the Sushi Cooler choice (`on`; when off, `by_flag` says the launch flag asked, else the model setting) to an
+/// arch that has the engine; the other archs have nothing to stamp.
+pub fn stampCooler(config: *model.ModelConfig, on: bool, by_flag: bool) void {
+    const tag = tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "stampCooler")) registry.Mod(t).stampCooler(config, on, by_flag),
+    }
+}
+
 /// Whether this load keeps the arch's DSpark drafter stages resident.
 pub fn dsparkOn(config: *const model.ModelConfig) bool {
     const tag = tagOf(config) orelse return false;

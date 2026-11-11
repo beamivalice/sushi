@@ -3,6 +3,7 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const flags = @import("../arch/flags.zig");
+const model_settings = @import("../model_settings.zig");
 const expert_usage = @import("../expert_usage.zig");
 const repack = @import("repack.zig");
 const borrow = @import("dsv41_borrow.zig");
@@ -15,6 +16,7 @@ const log = @import("../log.zig");
 
 pub const options = [_]flags.Option{
     .{ .name = "--drop-expert", .takes_value = true, .apply = setDropExpert, .expected = "expected a multiple of 8 routed experts per layer (0 = off)" },
+    .{ .name = "--ds41-mlx-engine", .takes_value = false, .apply = setMlxEngine },
 };
 
 pub const help = [_]flags.HelpChunk{
@@ -36,6 +38,12 @@ pub const help = [_]flags.HelpChunk{
         \\
     },
     .{ .before = "  --kv-quant", .text =
+        \\  --ds41-mlx-engine   DeepSeek-V4.1 only: decode on MLX instead of Sushi Cooler,
+        \\                      the engine of our own (the default on an STQ pack
+        \\                      with a matrix-unit GPU). An opt-out if Sushi Cooler
+        \\                      misbehaves; report it at
+        \\                      https://github.com/beamivalice/sushi/issues/new.
+        \\                      Outranks the model's ds41_cooler setting.
         \\  --drop-expert <n>   DeepSeek-V4.1 only: never load or pick the n least-used
         \\                      routed experts of every layer, ranked by the pack's
         \\                      expert_usage.json (n a multiple of 8; default 0 =
@@ -55,6 +63,17 @@ pub const command = struct {
 };
 
 pub const drop_expert_elsewhere = "--drop-expert has no effect on this model: only deepseek_v41 packs carry an expert usage list; drop the flag";
+
+pub const cooler_setting_elsewhere = "model-settings.json ds41_cooler is ignored: only deepseek_v41 runs on Sushi Cooler";
+
+pub const mlx_engine_elsewhere = "--ds41-mlx-engine has no effect on this model: only deepseek_v41 runs on Sushi Cooler; drop the flag";
+
+/// Why decode cannot run on Sushi Cooler for this pack; null when its experts and trunk are STQ. The Mac's side of
+/// the answer needs MLX and is read where the settings page is served.
+pub fn coolerUnavailable(config: *const model.ModelConfig) ?[]const u8 {
+    const c = config.dsv41 orelse return null;
+    return if (c.expert_dec != null and c.trunk_dec != null) null else model_settings.cooler_why_not_stq;
+}
 
 pub const settings_kv_quant_ignored = "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 
@@ -99,6 +118,11 @@ pub const serve = struct {
         }
     }
 };
+
+fn setMlxEngine(_: []const u8) bool {
+    model.cooler_off_flag = true;
+    return true;
+}
 
 fn setDropExpert(value: []const u8) bool {
     model.drop_expert = expert_usage.parseCount(value) orelse return false;
