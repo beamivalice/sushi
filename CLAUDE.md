@@ -216,9 +216,12 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
   and baseline beside every number.
 - Quiet window: a timed run first touches `~/.sushi/runs/QUIET` and waits until no `zig`/`clang` runs; no worker
   starts a build or test while that file exists. The GPU lock does not stop compiles.
-- Whoever sets `QUIET` broadcasts it at once to the coordinator and every live worker (who, what for, how long), writes
-  the same notice into the marker file, and says so again when it clears; workers check the file before every build or
-  test, not once per session.
+- `QUIET` stalls every worker on the box, so it is requested from the coordinator first, who judges the run before
+  granting it: needed, redundant, too much or too little. A reading that load cannot move (bytes, counts, instructions)
+  takes the lock, not `QUIET`.
+- Once granted, whoever sets `QUIET` broadcasts it at once to the coordinator and every live worker (who, what for, how
+  long), writes the same notice into the marker file, and says so again when it clears; workers check the file before
+  every build or test, not once per session.
 - Measure only what the diff touches: no arm whose code path is unchanged, no metric the change cannot move.
 - Bench thermal: [cool the box](docs/process-measurement.md#4b-cool-the-box-before-a-bench) before each server and
   between arms; never slot a GPU job into a bench's cooldown idle.
