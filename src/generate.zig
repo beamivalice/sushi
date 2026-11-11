@@ -901,6 +901,10 @@ pub const Generator = struct {
                     rows_w.buffered(),
                 },
             );
+            if (mlx.engine.enabled) {
+                const e = mlx.engine.stats();
+                log.debug("  [engine] since load: {d} dispatches, {d} command buffers, {d} waits, {d} imports, {d} lends, {d} ops on MLX; slice updates {d} in place, {d} copied; pool {d} MB, {d} free, {d} asked by tensors in use, {d} buffers released for the budget; {d} kernels compiled after the load; GPU busy {d} ms, idle between passes {d} ms; pauses under 20 us / 100 us / 1 ms / longer: {d} ({d} ms) / {d} ({d} ms) / {d} ({d} ms) / {d} ({d} ms); before other / forward / draft / verify / round end: {d} / {d} / {d} / {d} / {d} ms\n", .{ e.dispatches, e.submits, e.waits, e.imports, e.lends, mlx.engine.mlx_ops, e.updates_in_place, e.updates_copied, e.pool_bytes >> 20, e.pool_free >> 20, e.pool_asked >> 20, e.pool_evictions, mlx.engine.latePipelines(), e.gpu_busy_ns / std.time.ns_per_ms, e.gpu_gap_ns / std.time.ns_per_ms, e.gpu_gap_count[0], e.gpu_gap_sum[0] / std.time.ns_per_ms, e.gpu_gap_count[1], e.gpu_gap_sum[1] / std.time.ns_per_ms, e.gpu_gap_count[2], e.gpu_gap_sum[2] / std.time.ns_per_ms, e.gpu_gap_count[3], e.gpu_gap_sum[3] / std.time.ns_per_ms, e.gpu_gap_phase[0] / std.time.ns_per_ms, e.gpu_gap_phase[1] / std.time.ns_per_ms, e.gpu_gap_phase[2] / std.time.ns_per_ms, e.gpu_gap_phase[3] / std.time.ns_per_ms, e.gpu_gap_phase[4] / std.time.ns_per_ms });
+            }
             if (st.copy_rounds > 0) log.info("  [spec-stats] mode=dspark copy_rounds={d} copy_drafted={d} copy_accepted={d}\n", .{ st.copy_rounds, st.copy_drafted, st.copy_accepted });
             if (self.sampling.constraint != null) log.info("  [spec-stats] mode=dspark grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
             return;

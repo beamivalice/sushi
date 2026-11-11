@@ -452,6 +452,31 @@ reducing in one dispatch. The batched coarse-head pair kernel
 (`MTP_COARSE_PAIRS_SOURCE`) adapts the 3-bit affine qmv-fast reduction from
 quantized.h, sharing each packed read across two input rows.
 
+The engine of our own in `src/tensor/` launches MLX's compiled kernels from
+`mlx.metallib` and ports the host code that picks and dispatches them, from
+MLX's Metal backend (Copyright (c) 2023-2025 Apple Inc.):
+  * `stock.zig`: the dispatch of RMS norm (`fast::RMSNorm::eval_gpu`), softmax
+    (`Softmax::eval_gpu`) and dequantize (`fast::Dequantize::eval_gpu`,
+    `fp_dequantize`), with the kernel names MLX gives them.
+  * `matmul.zig`: `mlx::core::matmul` and `Matmul::eval_gpu` with
+    `check_transpose`, `collapse_batches`, `gemv_wide`, `gemv`, `dot_product`,
+    `steel_matmul` and its tile choices (`GEMM_TPARAM_MACRO`), the fused and
+    split-K dispatches for NAX and SIMD, `get_block_dims` and the `GEMMParams`
+    and `GEMMSpiltKParams` layouts.
+  * `reduce.zig`: `Reduce::eval_gpu`, `get_reduction_plan`, the row, column
+    and all-reduce dispatches, `collapse_contiguous_dims`, `get_2d_grid_dims`
+    and `ArgReduce::eval_gpu`.
+  * `kernel.zig`: the signature a custom kernel's source is wrapped in follows
+    `fast::metal_kernel` (`mlx/backend/metal/custom_kernel.cpp`).
+  * `ops.zig`: `sushi_sigmoid`, `sushi_maximum` and `sushi_minimum` are MLX's
+    `Sigmoid`, `Maximum` and `Minimum` functors
+    (`backend/metal/kernels/unary_ops.h`, `binary_ops.h`).
+  * `core.zig`: the pass rules (a barrier between dispatches that share a
+    buffer, a fence between passes over untracked buffers) follow
+    `mlx/backend/metal/device.cpp`.
+Modifications: Zig, eager dispatch on a queue of the engine's own, one axis per
+reduction, no complex types.
+
 The row-identical 8-bit projection kernel in `src/mtp_qmv.zig` adapts
 `qmv_fast_impl`, `qmv_impl`, `load_vector` and `qdot` from MLX
 `backend/metal/kernels/quantized.h` (Copyright (c) 2023-2024 Apple Inc.).

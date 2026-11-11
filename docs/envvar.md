@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 150 vars. By kind: tradeoff levers 14, diagnostics 54, microbenches 19, test-only seams 53, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 153 vars. By kind: tradeoff levers 14, diagnostics 57, microbenches 19, test-only seams 53, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (54)
+## Diagnostics (57)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -47,6 +47,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DECODE_FWD_GRAPH` | `model_load.zig:1872` | `<path>` writes one decode forward's primitive list at the forward meter; inert without `SUSHI_DECODE_FWD_UBENCH` | load | yes: mimo2-arch |
 | `SUSHI_DECODE_PROFILE` | `forward_diag.zig:119, 127` | arms the decode sub-block profiler; `=<rows>` also times verify widths | once | no |
 | `SUSHI_DSV41_ENGRAM_REUSE` | `dsv41_engram.zig` (test) | `<u32 tokens file>`: the Engram row cache's hit rate by capacity over a token stream | test | yes: dsv41-arch |
+| `MLX_ENABLE_TF32`, `MLX_METAL_GPU_ARCH` | `tensor/matmul.zig` | MLX's own variables, read as MLX reads them so the engine's matmul takes the kernel MLX takes: f32 on the NAX tiles (default on), and a GPU architecture name in place of the device's | once | yes: engine-own-forward |
 | `SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD` | `dsv41_serving.zig` | TEMPORARY A/B: decode-width passes read their Engram rows at the layer; deleted after the live measurement | load | no |
 | `SUSHI_DSV41_READ_DIAG` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` counts the blocking host reads of decode-width DeepSeek forwards by site (route-spec settle, settle before a successor, waiting-schedule picks, Engram rows, DSpark state, logits) and logs `[dsv41] reads/forward <site>` per 64 forwards at debug level | load | yes: engine-expert-streaming |
 | `SUSHI_DSV41_COMPOSED` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` runs deepseek_v41 on the op chains instead of the fused kernels (the KLD A/B's teacher arm; the load logs `[dsv41] fused kernels on\|off`) | load | yes: dsv41-arch |
@@ -111,7 +112,7 @@ Inputs and hooks that real-pack tests and scripts use.
 | `QWEN4_FIXTURE`, `QWEN4_FIXTURE_BF16`, `QWEN4_FIXTURE_VISION`, `QWEN4_ROWS_OLD`, `QWEN4_TEST_HF_MODEL`, `QWEN4_TEST_PREFIX_TOKENS`, `QWEN4_VERIFY_BENCH`, `QWEN4_YARN_FIXTURES`, `QWEN4_BF16_STREAM_MODEL` | `qwen4_fixture_test.zig`, `mrope.zig`, `expert_io.zig` | oracle fixtures, HF source dir and probe switches for the Qwen4 oracle tests | test | yes: tests/CLAUDE |
 | `QWEN4_TEST_MODEL` | `qwen4_fixture_test.zig:474, 618, 641, +24`, `qwen4_generate_test.zig:387, 531, 640` | `<pack dir>` for the real-pack Qwen4 tests; they skip without it | test | yes: mlx-serve-sync, server-lifecycle, tests/CLAUDE |
 | `QWEN_VISION_TEST_MODEL`, `QWEN_VISION_FIXTURE`, `QWEN_PREPROCESS_FIXTURE`, `QV_GH`, `QV_GW`, `QWEN_MID_SYSTEM_MODEL_DIR` | `qwen_vision.zig`, `chat.zig` | Qwen vision/preprocess oracle inputs and a chat-template pack | test | yes: server-tool-calling, tests/CLAUDE |
-| `SUSHI_DSV41_REAL_PACK`, `SUSHI_DSV41_PROBE_AT`, `SUSHI_DSV41_PROBE_WIDTH`, `SUSHI_DSV41_PROBE_TEXT`, `SUSHI_DSV41_PROBE_VERBOSE` | `dsv41_generate_test.zig` | the real-pack width probe (skips without `SUSHI_DSV41_REAL_PACK=<pack dir>`): at each context in `PROBE_AT` (comma list, default 17) of `PROBE_TEXT` (a text file with more tokens than the largest context + width + 1) a `PROBE_WIDTH`-row verify (default 4) must give every row the bits of its own one-row round, layer by layer; `PROBE_VERBOSE` prints each differing tensor | test | yes: dsv41-arch, testsuite |
+| `SUSHI_DSV41_REAL_PACK`, `SUSHI_DSV41_PROBE_AT`, `SUSHI_DSV41_PROBE_WIDTH`, `SUSHI_DSV41_PROBE_TEXT`, `SUSHI_DSV41_PROBE_VERBOSE` | `dsv41_generate_test.zig` | the real-pack width probe (skips without `SUSHI_DSV41_REAL_PACK=<pack dir>`): at each context in `PROBE_AT` (comma list, default 17) of `PROBE_TEXT` (a text file with more tokens than the largest context + width + 1) a `PROBE_WIDTH`-row verify (default 4) must give every row the bits of its own one-row round, layer by layer; `PROBE_VERBOSE` prints each differing tensor. `SUSHI_DSV41_REAL_PACK` also runs the engine's real-pack proof (one-row steps and DSpark rounds on the engine give MLX's bytes) | test | yes: dsv41-arch, testsuite |
 | `SUSHI_FORCE_BATCHED` | `scheduler.zig:1209` | `1` routes single-slot ticks through the batched kernel (`tests/test_batched_equivalence.sh`) | boot | yes: tests/CLAUDE |
 | `SUSHI_MEMORY_AUDIT_MODEL`, `SUSHI_TOKENIZER_PARITY_FIXTURE` | `bills.zig`, `model_load.zig`, `tokenizer.zig` | memory-bill audit pack and tokenizer parity fixture | test | no |
 | `SUSHI_MLX_FAULT_CHUNK`, `SUSHI_MLX_FAULT_STEP` | `mlx.zig` | `<n>` latches a synthetic Metal OOM at the n-th prefill-chunk check / decode step (`tests/test_mlx_error_recovery.sh`) | once | yes: tests/CLAUDE |
@@ -147,6 +148,10 @@ Kept because the launch flag cannot express what the env does.
 ## Reads to fix
 
 - *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_QSA_NAX_PRECISION` is script-side only.
+
+## Removed 2026-11-11
+
+- *Measured, then adopted*: `SUSHI_DSV41_ENGINE` (DeepSeek STQ decode on the engine of our own; now the path on a GPU with matrix units, decided at the load: [engine-own-forward](engine-own-forward.md#where-it-serves)).
 
 ## Removed 2026-10-11
 

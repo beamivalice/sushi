@@ -1,0 +1,67 @@
+For the engine of our own: the Metal buffer of an evaluated array with the offset of its data in it, so that a
+pass of ours binds MLX's buffer itself and memory MLX holds is not wired a second time; and whether a handle is
+the buffer's only holder, so that an append to state MLX computed is written in place. Temporary: both go when
+decode no longer reads memory that MLX holds.
+
+diff --git a/mlx/c/array.cpp b/mlx/c/array.cpp
+--- a/mlx/c/array.cpp
++++ b/mlx/c/array.cpp
+@@ -622,6 +622,31 @@
+   return 0;
+ }
+ 
++extern "C" int _mlx_array_metal_buffer(
++    void** buffer,
++    size_t* offset,
++    const mlx_array arr) {
++  try {
++    const auto& a = mlx_array_get_(arr);
++    *buffer = const_cast<void*>(a.buffer().ptr());
++    *offset = a.offset();
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++
++extern "C" int _mlx_array_is_donatable(bool* res, const mlx_array arr) {
++  try {
++    *res = mlx_array_get_(arr).is_donatable();
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++
+ extern "C" int _mlx_array_wait(const mlx_array arr) {
+   try {
+     mlx_array_get_(arr).wait();
+diff --git a/mlx/c/array.h b/mlx/c/array.h
+--- a/mlx/c/array.h
++++ b/mlx/c/array.h
+@@ -394,6 +394,23 @@
+ int _mlx_array_wait(const mlx_array arr);
+ 
+ /**
++ * The Metal buffer (an `id<MTLBuffer>`, not retained) that holds the data of
++ * an evaluated array, and the byte offset of its first element in it.
++ * Internal function: use at your own risk.
++ */
++int _mlx_array_metal_buffer(
++    void** buffer,
++    size_t* offset,
++    const mlx_array arr);
++
++/**
++ * Whether this handle is the only holder of the array's buffer, so that the
++ * buffer may be written in place.
++ * Internal function: use at your own risk.
++ */
++int _mlx_array_is_donatable(bool* res, const mlx_array arr);
++
++/**
+  * Whether the array is contiguous in memory.
+  * Internal function: use at your own risk.
+  */

@@ -197,7 +197,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     var accepted: u32 = 0;
     var pending: u32 = 0;
     if (sampler.isGreedyTemperature(self.sampling.temperature)) {
-        var verified = try verifyArgmax(verdict_logits, self.sampling.suppress_mask, s);
+        var verified = try verifyArgmax(verdict_logits, self.sampling.suppress_mask, dsv41_serving.verdictStream(xfm, s));
         defer verified.deinit();
         try mlx.check(mlx.mlx_array_eval(verified.lazy()));
         const best = try verified.ids(rows);

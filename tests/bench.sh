@@ -78,7 +78,8 @@ for p in sushi sushi-repack sushi-grid; do
     pgrep -x "$p" >/dev/null && die "a $p process is running; the bench needs the box to itself"
 done
 pmset -g batt | grep -q "AC Power" || die "not on AC power: the release bench times on AC only"
-git -C "$ROOT" diff --quiet HEAD || die "the tree is dirty: commit first, the stamp names the commit"
+# The MLX submodules carry build-mlx.sh's patches in their working trees: their pins count, their edits do not.
+git -C "$ROOT" diff --quiet --ignore-submodules=dirty HEAD || die "the tree is dirty: commit first, the stamp names the commit"
 
 # ── Build, then the quiet window ──
 until [ ! -e "$QUIET" ]; do sleep 10; done

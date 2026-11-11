@@ -704,6 +704,8 @@ pub const Model = struct {
     /// The decode indexer's packed scans run on the matrix units (`kernels.indexScoresPackedNax`) where the GPU has them and
     /// the load's trial gave the scalar kernel's bits (`setIndexNax`); off, the scalar kernel serves. Same bytes either way.
     index_nax: bool = true,
+    /// Keys from which a one-row packed scan takes the matrix units; the load lowers it to make that pipeline.
+    index_nax_keys: usize = 131072,
     /// A wide span's attention kernel stores the heads as `wo_a` takes them; off, the op chain does (the tests' oracle).
     attn_epilogue: bool = true,
     /// A wide chunk's shared expert rides the routed prefill launches where the trellis chain takes it there; off, it runs
@@ -732,6 +734,11 @@ pub const Model = struct {
     /// A decode forward queues layer 0 behind the computation of its token before the host reads it (`extendLazy`);
     /// off, the token is read first (the tests' oracle).
     lazy_start: bool = true,
+    /// Decode forwards (one row, DSpark draft, verify rows) run on the engine of our own (`src/tensor`), not on MLX:
+    /// `dsv41_borrow.ownDecode` at the load.
+    engine_decode: bool = false,
+    /// When MLX's queue last ran work that `dsv41_serving.keepMlxQueue` knows of (`engine.nowNs`).
+    mlx_queue_used_ns: u64 = 0,
     /// Decode forwards that queued layer 0 ahead of their token.
     lazy_starts: u64 = 0,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
@@ -1767,7 +1774,7 @@ fn streamsIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize) bool {
 fn indexNaxOn(m: *const Model, pk: Rows.Pack, q: A, nb: usize, gather: bool) bool {
     const rows = dim(q, 0);
     // The extra launch for q does not pay back on one row of a short scan, or on a gather of the few candidate keys.
-    const big = if (gather) rows >= 5 else rows > 1 or nb >= 131072;
+    const big = if (gather) rows >= 5 else rows > 1 or nb >= m.index_nax_keys;
     return big and m.index_nax and m.qat_on and kernels.indexNaxFits(pk.mode, pk.group, dim(q, 1), dim(q, 2));
 }
 
@@ -2752,7 +2759,7 @@ pub fn resetState(m: *Model) void {
 }
 
 /// Every decode width a request can take (1..16 rows, after a short prefill so compressed rows exist), with DSpark a
-/// draft and a verify of every block width, and the prefill paths, run once on a throwaway state: a row count is a
+/// draft and a verify of every width from one row to the block, and the prefill paths, run once on a throwaway state: a row count is a
 /// template arg of the row kernels, so each variant compiles here instead of inside a request. Leaves no state.
 pub fn warmKernels(m: *Model) !void {
     resetState(m);
@@ -2762,7 +2769,10 @@ pub fn warmKernels(m: *Model) !void {
     // The first steps hold one compressed row a layer: an input under 8 elements binds as another library.
     for ([_]usize{ 1, 1, 2 }) |w| try warmRun(try extend(m, ids[0..w], .last));
     for (1..ids.len + 1) |w| try warmRun(try extend(m, ids[0..w], .last));
-    if (m.dspark != null) for (2..m.cfg.dspark.block + 2) |w| try warmRound(m, ids[0], w);
+    // A round of one row is the plain step between drafted rounds: it takes the rows' arm of the trunk linears, which
+    // a one-row forward outside a round does not. A copy round is wider than the block, up to the ring's slack.
+    if (m.dspark != null) for (1..cfg_mod.ring_slack + 1) |w| try warmRound(m, ids[0], w);
+    if (m.engine_decode) try warmOwn(m, ids[0], .both);
     // The prefill path: a chunk past the window runs CED and its 256 rows fill 8 GEMM windows (an input of 8 binds as a
     // device array), a narrower chunk runs every layer over 2 windows; at the context they leave a decode step's rows
     // span two attention splits.
@@ -2776,15 +2786,109 @@ pub fn warmKernels(m: *Model) !void {
     try warmRun(try extend(m, wide[0 .. @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1], .last));
     for ([_]usize{ 1, 6 }) |w| try warmRun(try extend(m, ids[0..w], .last));
     if (m.dspark != null) try warmRound(m, ids[0], m.cfg.dspark.block + 1);
+    // The engine's kernels have one signature each, so the widths it ran above are not other pipelines here.
+    if (m.engine_decode) {
+        try warmOwnFills(m, ids[0]);
+        try warmOwnBlocks(m, ids[0]);
+        try warmOwnLong(m, ids[0]);
+    }
 }
 
-/// A DSpark draft from `t1` and a verify of its first `w` rows, all kept.
+/// The engine's kernels of a step over 131072 keys or more, a context the load cannot build: the one-row index scan
+/// on the matrix units, by lowering the key count it starts at for one step, and the split top-k, launched on scores
+/// of its own (its pipelines take no row or key count).
+fn warmOwnLong(m: *Model, t1: u32) !void {
+    const was = ownBegin(m);
+    defer ownEnd(m, was);
+    const keys = m.index_nax_keys;
+    m.index_nax_keys = 0;
+    defer m.index_nax_keys = keys;
+    try warmRun(try extend(m, &.{t1}, .last));
+    var sc = m.scope();
+    defer sc.deinit();
+    const k: usize = m.cfg.index_topk;
+    if (k == 0) return;
+    const picks = try kernels.topkIndicesSplit(&sc, try sc.zeros(&.{ 1, ci(kernels.topk_splits * k) }, .float32), k, kernels.topk_splits);
+    try evalAll(&.{picks});
+}
+
+/// The engine's draft at every fill of the stages' windows under a full one, over the rows the state already holds.
+/// A stage's attention is MLX's matmul and sum over the rows its window holds, and MLX picks their kernels by that
+/// count: a prompt shorter than the window drafts at fills a longer one never shows.
+fn warmOwnFills(m: *Model, t1: u32) !void {
+    if (m.dspark == null) return;
+    const st = try ensureState(m);
+    const full = st.n;
+    defer st.n = full;
+    const was = ownBegin(m);
+    defer ownEnd(m, was);
+    for (1..@min(full, m.cfg.window)) |fill| {
+        st.n = fill;
+        var d = try draftHeads(m, t1, .conf);
+        d.deinit();
+    }
+}
+
+/// The engine's decode kernels of the block indexer, which a request reaches only where its context holds more
+/// candidate blocks than a query keeps (past 16k tokens on the release pack). The load runs them at a context it can
+/// afford by keeping fewer blocks: the count is no kernel's template value, so the pipelines are the request's.
+fn warmOwnBlocks(m: *Model, t1: u32) !void {
+    const c = &m.cfg;
+    if (c.cand_source < 0 or c.cand_block_size == 0) return;
+    const kept = c.cand_blocks;
+    // The fewest blocks that leave `candidateBlockIds` its arm.
+    const few = c.index_topk / c.cand_block_size + 1;
+    const rows = (@as(usize, few) + 2) * c.cand_block_size * m.ratio(@intCast(c.cand_source));
+    if (few >= kept or rows == 0 or rows + cfg_mod.ring_slack * 40 > c.max_pos) return;
+    c.cand_blocks = few;
+    defer c.cand_blocks = kept;
+    resetState(m);
+    const ctx = try m.gpa.alloc(u32, rows);
+    defer m.gpa.free(ctx);
+    for (ctx, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % c.vocab);
+    try warmRun(try extend(m, ctx, .last));
+    // The indexer's kernels are the same under either schedule of the routed chains.
+    try warmOwn(m, t1, .queued);
+}
+
+/// From here `m`'s ops go to the engine of our own, and an MLX stream among them is refused by name. Returns the
+/// stream `ownEnd` puts back.
+pub fn ownBegin(m: *Model) S {
+    const was = m.s;
+    m.s = mlx.engine.stream();
+    mlx.engine.active = true;
+    return was;
+}
+
+pub fn ownEnd(m: *Model, was: S) void {
+    mlx.engine.active = false;
+    m.s = was;
+}
+
+/// The forwards a request runs on the engine of our own, whose pipelines are its own to compile: a one-row step and,
+/// with DSpark, a draft and a verify of every block width.
+fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
+    const was = ownBegin(m);
+    defer ownEnd(m, was);
+    const queued = m.route_spec;
+    defer m.route_spec = queued;
+    // A pass that rebuilt too many layers stops queueing its routed chains and takes the waiting schedule's kernels.
+    const arms = [_]bool{ queued, false };
+    for (arms[0..if (schedules == .both) 2 else 1]) |spec| {
+        m.route_spec = spec;
+        for (0..2) |_| try warmRun(try extend(m, &.{t1}, .last));
+        if (m.dspark != null) for (1..cfg_mod.ring_slack + 1) |w| try warmRound(m, t1, w);
+    }
+}
+
+/// A DSpark draft from `t1` and a verify of `w` rows, all kept: the draft's, and past the block its last one again,
+/// as a copy round's rows are whatever the context held.
 fn warmRound(m: *Model, t1: u32, w: usize) !void {
     var d = try draftHeads(m, t1, .conf);
     defer d.deinit();
-    var round: [exl3.kernels.DECODE_ROWS_MAX]u32 = undefined;
+    var round: [cfg_mod.ring_slack]u32 = undefined;
     round[0] = t1;
-    @memcpy(round[1..w], d.ids[0 .. w - 1]);
+    for (round[1..w], 0..) |*id, i| id.* = d.ids[@min(i, d.ids.len - 1)];
     try warmRun(try verify(m, round[0..w]));
     try finishVerify(m, w - 1);
 }

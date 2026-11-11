@@ -502,7 +502,7 @@ const topk_split_rows = 16;
 const topk_split_max_k = 512;
 const topk_split_min_n_one_row: usize = 131072;
 const topk_split_min_n: usize = 262144;
-const topk_splits: usize = 8;
+pub const topk_splits: usize = 8;
 
 /// The indices of the `k` largest of each row of `x` `[L, n]` (f32), ascending, ties to the lower index.
 pub fn topkIndices(sc: *Scope, x: A, k: usize) !A {

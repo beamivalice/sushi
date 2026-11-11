@@ -18,6 +18,167 @@ pub const mlx_map_string_to_array = extern struct { ctx: ?*anyopaque = null };
 pub const mlx_map_string_to_string = extern struct { ctx: ?*anyopaque = null };
 pub const mlx_map_string_to_array_iterator = extern struct { ctx: ?*anyopaque = null, map_ctx: ?*anyopaque = null };
 pub const mlx_vector_array = extern struct { ctx: ?*anyopaque = null };
+
+/// The engine of our own (`src/tensor`): a call whose stream is its stream, or that takes a tensor of its, goes to
+/// the function of the same name there. Off (`engine.enabled`), every call is mlx-c's.
+pub const engine = @import("tensor/route.zig");
+
+/// mlx-c's own entry points, for the engine.
+/// mlx-c's eval of an MLX array, whatever is routed.
+pub fn rawArrayEval(arr: mlx_array) c_int {
+    return raw.mlx_array_eval(arr);
+}
+
+pub const raw = struct {
+    pub extern "c" fn mlx_array_new() mlx_array;
+    pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
+    pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
+    pub extern "c" fn mlx_array_eval(arr: mlx_array) c_int;
+    pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
+    pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
+    pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
+    pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
+    pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
+    pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array;
+    pub extern "c" fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array;
+    pub extern "c" fn mlx_vector_array_free(vec: mlx_vector_array) c_int;
+    pub extern "c" fn mlx_vector_array_size(vec: mlx_vector_array) usize;
+    pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
+    pub extern "c" fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int;
+    pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
+    pub extern "c" fn mlx_array_new_data_managed_payload(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
+    pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
+    pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
+};
+
+/// `name` of mlx-c with the engine's function of that name in front of it.
+fn routed(comptime name: [:0]const u8, comptime F: type) Routed(name, F).Fn {
+    return Routed(name, F).pick();
+}
+
+fn Routed(comptime name: [:0]const u8, comptime F: type) type {
+    const info = @typeInfo(F).@"fn";
+    const P = info.param_types;
+    const R = info.return_type.?;
+    return struct {
+        const Args = std.meta.ArgsTuple(F);
+        const Fn = @TypeOf(pick());
+
+        fn carriesStream() bool {
+            for (P) |T| if (T == mlx_stream) return true;
+            return false;
+        }
+
+        inline fn go(args: Args) R {
+            const direct = @extern(*const F, .{ .name = name });
+            if (!engine.enabled) return @call(.auto, direct, args);
+            switch (engine.side(args)) {
+                .engine => {
+                    if (@hasDecl(engine, name)) return @call(.auto, @field(engine, name), args);
+                    if (R != c_int) @compileError("routed: the engine has no " ++ name);
+                    return engine.refuse(name, "the engine has no such op");
+                },
+                .leak => return if (R == c_int) engine.refuse(name, "an MLX stream inside a forward of the engine") else unreachable,
+                .mlx => {
+                    // An op carries a stream; a free or a read of a handle does not.
+                    if (comptime carriesStream()) engine.mlx_ops += 1;
+                    // MLX takes a tensor of ours as an array over the same bytes; a result slot that still holds
+                    // one is emptied before mlx-c assigns into it.
+                    var lent = args;
+                    inline for (0..P.len) |i| switch (P[i].?) {
+                        mlx_array => if (R == c_int and engine.isOurs(lent[i])) {
+                            lent[i] = engine.lend(lent[i]) orelse return 1;
+                        },
+                        *mlx_array => if (engine.isOurs(lent[i].*)) {
+                            _ = engine.mlx_array_free(lent[i].*);
+                            lent[i].ctx = null;
+                        },
+                        mlx_vector_array => if (R == c_int and engine.isVec(lent[i])) return engine.refuse(name, "a vector of the engine on an MLX stream"),
+                        else => {},
+                    };
+                    return @call(.auto, direct, lent);
+                },
+            }
+        }
+        fn f1(a: P[0].?) R {
+            return go(.{a});
+        }
+        fn f2(a: P[0].?, b: P[1].?) R {
+            return go(.{ a, b });
+        }
+        fn f3(a: P[0].?, b: P[1].?, c: P[2].?) R {
+            return go(.{ a, b, c });
+        }
+        fn f4(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?) R {
+            return go(.{ a, b, c, d });
+        }
+        fn f5(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?) R {
+            return go(.{ a, b, c, d, e });
+        }
+        fn f6(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?) R {
+            return go(.{ a, b, c, d, e, f });
+        }
+        fn f7(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?, g: P[6].?) R {
+            return go(.{ a, b, c, d, e, f, g });
+        }
+        fn f8(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?, g: P[6].?, h: P[7].?) R {
+            return go(.{ a, b, c, d, e, f, g, h });
+        }
+        fn f11(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?, g: P[6].?, h: P[7].?, i: P[8].?, j: P[9].?, k: P[10].?) R {
+            return go(.{ a, b, c, d, e, f, g, h, i, j, k });
+        }
+        fn f13(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?, g: P[6].?, h: P[7].?, i: P[8].?, j: P[9].?, k: P[10].?, l: P[11].?, m: P[12].?) R {
+            return go(.{ a, b, c, d, e, f, g, h, i, j, k, l, m });
+        }
+        fn f14(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?, g: P[6].?, h: P[7].?, i: P[8].?, j: P[9].?, k: P[10].?, l: P[11].?, m: P[12].?, n: P[13].?) R {
+            return go(.{ a, b, c, d, e, f, g, h, i, j, k, l, m, n });
+        }
+        fn f17(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?, g: P[6].?, h: P[7].?, i: P[8].?, j: P[9].?, k: P[10].?, l: P[11].?, m: P[12].?, n: P[13].?, o: P[14].?, p: P[15].?, q: P[16].?) R {
+            return go(.{ a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q });
+        }
+        fn f9(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?, g: P[6].?, h: P[7].?, i: P[8].?) R {
+            return go(.{ a, b, c, d, e, f, g, h, i });
+        }
+        fn f10(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?, g: P[6].?, h: P[7].?, i: P[8].?, j: P[9].?) R {
+            return go(.{ a, b, c, d, e, f, g, h, i, j });
+        }
+        fn pick() switch (P.len) {
+            1 => @TypeOf(f1),
+            2 => @TypeOf(f2),
+            3 => @TypeOf(f3),
+            4 => @TypeOf(f4),
+            5 => @TypeOf(f5),
+            6 => @TypeOf(f6),
+            7 => @TypeOf(f7),
+            8 => @TypeOf(f8),
+            9 => @TypeOf(f9),
+            10 => @TypeOf(f10),
+            11 => @TypeOf(f11),
+            13 => @TypeOf(f13),
+            14 => @TypeOf(f14),
+            17 => @TypeOf(f17),
+            else => @compileError("routed: add an arity for " ++ name),
+        } {
+            return switch (P.len) {
+                1 => f1,
+                2 => f2,
+                3 => f3,
+                4 => f4,
+                5 => f5,
+                6 => f6,
+                7 => f7,
+                8 => f8,
+                9 => f9,
+                10 => f10,
+                11 => f11,
+                13 => f13,
+                14 => f14,
+                17 => f17,
+                else => unreachable,
+            };
+        }
+    };
+}
 pub const mlx_closure = extern struct { ctx: ?*anyopaque = null };
 
 // ── Enums ──
@@ -85,7 +246,10 @@ pub extern "c" fn mlx_stream_new() mlx_stream;
 pub extern "c" fn mlx_stream_set(stream: *mlx_stream, src: mlx_stream) c_int;
 pub extern "c" fn mlx_stream_equal(lhs: mlx_stream, rhs: mlx_stream) bool;
 pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
-pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
+pub fn mlx_stream_free(s: mlx_stream) c_int {
+    if (engine.enabled and engine.isStream(s)) return 0;
+    return raw.mlx_stream_free(s);
+}
 pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
 pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
 pub extern "c" fn mlx_stream_get_device(dev: *mlx_device, stream: mlx_stream) c_int;
@@ -93,6 +257,7 @@ pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) 
 
 /// True when the stream targets the GPU (custom Metal kernels require it).
 pub fn streamIsGpu(s: mlx_stream) bool {
+    if (engine.enabled and engine.isStream(s)) return true;
     var dev = mlx_device{ .ctx = null };
     if (mlx_stream_get_device(&dev, s) != 0) return false;
     defer _ = mlx_device_free(dev);
@@ -100,22 +265,40 @@ pub fn streamIsGpu(s: mlx_stream) bool {
     if (mlx_device_get_type(&dt, dev) != 0) return false;
     return dt == .gpu;
 }
-pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
+pub fn mlx_synchronize(s: mlx_stream) c_int {
+    if (engine.enabled and engine.isStream(s)) return engine.mlx_synchronize(s);
+    return raw.mlx_synchronize(s);
+}
 
 // Metal
 pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
-pub extern "c" fn _mlx_array_is_available(res: *bool, arr: mlx_array) c_int;
+pub const _mlx_array_is_available = routed("_mlx_array_is_available", fn (res: *bool, arr: mlx_array) callconv(.c) c_int);
 
 // Array creation
 pub extern "c" fn mlx_array_new() mlx_array;
-pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
-pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
-pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
-pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
+pub fn mlx_array_new_int(val: c_int) mlx_array {
+    return if (engine.active) engine.mlx_array_new_int(val) else raw.mlx_array_new_int(val);
+}
+pub fn mlx_array_new_float(val: f32) mlx_array {
+    return if (engine.active) engine.mlx_array_new_float(val) else raw.mlx_array_new_float(val);
+}
+pub fn mlx_array_new_bool(val: bool) mlx_array {
+    return if (engine.active) engine.mlx_array_new_bool(val) else raw.mlx_array_new_bool(val);
+}
+pub fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array {
+    return if (engine.active) engine.mlx_array_new_data(data, shape, dim, dtype) else raw.mlx_array_new_data(data, shape, dim, dtype);
+}
 pub extern "c" fn mlx_array_new_data_managed(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
 pub extern "c" fn mlx_array_new_data_managed_payload(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
-pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
-pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
+/// The Metal buffer (`id<MTLBuffer>`, not retained) of an evaluated array and the byte offset of its data in it.
+pub extern "c" fn _mlx_array_metal_buffer(buffer: *?*anyopaque, offset: *usize, arr: mlx_array) c_int;
+/// Whether this handle is the only holder of the array and of its buffer, as MLX asks before it writes in place.
+pub extern "c" fn _mlx_array_is_donatable(res: *bool, arr: mlx_array) c_int;
+pub const mlx_array_free = routed("mlx_array_free", fn (arr: mlx_array) callconv(.c) c_int);
+pub fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int {
+    if (engine.enabled and (engine.isOurs(src) or engine.isOurs(arr.*))) return engine.mlx_array_set(arr, src);
+    return raw.mlx_array_set(arr, src);
+}
 
 // Array info
 pub extern "c" fn mlx_array_tostring(str: *mlx_string, arr: mlx_array) c_int;
@@ -131,46 +314,73 @@ pub var query_count: u64 = 0;
 
 pub inline fn mlx_array_ndim(arr: mlx_array) usize {
     if (comptime builtin.is_test) query_count += 1;
+    if (engine.enabled and engine.isOurs(arr)) return engine.ndim(arr);
     return array_info.mlx_array_ndim(arr);
 }
 pub inline fn mlx_array_shape(arr: mlx_array) [*]const c_int {
     if (comptime builtin.is_test) query_count += 1;
+    if (engine.enabled and engine.isOurs(arr)) return engine.shape(arr);
     return array_info.mlx_array_shape(arr);
 }
 pub inline fn mlx_array_size(arr: mlx_array) usize {
     if (comptime builtin.is_test) query_count += 1;
+    if (engine.enabled and engine.isOurs(arr)) return engine.size(arr);
     return array_info.mlx_array_size(arr);
 }
 pub inline fn mlx_array_dtype(arr: mlx_array) mlx_dtype {
     if (comptime builtin.is_test) query_count += 1;
+    if (engine.enabled and engine.isOurs(arr)) return engine.dtypeOf(arr);
     return array_info.mlx_array_dtype(arr);
 }
-pub extern "c" fn mlx_array_strides(arr: mlx_array) [*]const usize;
-pub extern "c" fn mlx_array_eval(arr: mlx_array) c_int;
-pub extern "c" fn mlx_array_itemsize(arr: mlx_array) usize;
+pub const mlx_array_strides = routed("mlx_array_strides", fn (arr: mlx_array) callconv(.c) [*]const usize);
+pub fn mlx_array_eval(arr: mlx_array) c_int {
+    if (engine.enabled and engine.isOurs(arr)) return engine.mlx_array_eval(arr);
+    return eval_raw.mlx_array_eval(arr);
+}
+pub const mlx_array_itemsize = routed("mlx_array_itemsize", fn (arr: mlx_array) callconv(.c) usize);
 
 // Scalar access
-pub extern "c" fn mlx_array_item_float32(res: *f32, arr: mlx_array) c_int;
-pub extern "c" fn mlx_array_item_int32(res: *i32, arr: mlx_array) c_int;
+pub fn mlx_array_item_float32(res: *f32, arr: mlx_array) c_int {
+    if (engine.enabled and engine.isOurs(arr)) return engine.item(f32, res, arr);
+    return eval_raw.mlx_array_item_float32(res, arr);
+}
+pub fn mlx_array_item_int32(res: *i32, arr: mlx_array) c_int {
+    if (engine.enabled and engine.isOurs(arr)) return engine.item(i32, res, arr);
+    return eval_raw.mlx_array_item_int32(res, arr);
+}
 
 // Data access
-pub extern "c" fn mlx_array_data_bool(arr: mlx_array) ?[*]const bool;
-pub extern "c" fn mlx_array_data_float32(arr: mlx_array) ?[*]const f32;
-pub extern "c" fn mlx_array_data_float16(arr: mlx_array) ?[*]const f16;
-pub extern "c" fn mlx_array_data_bfloat16(arr: mlx_array) ?[*]const u16;
-pub extern "c" fn mlx_array_data_int32(arr: mlx_array) ?[*]const i32;
-pub extern "c" fn mlx_array_data_uint16(arr: mlx_array) ?[*]const u16;
-pub extern "c" fn mlx_array_data_uint32(arr: mlx_array) ?[*]const u32;
-pub extern "c" fn mlx_array_data_uint8(arr: mlx_array) ?[*]const u8;
+pub const mlx_array_data_bool = routed("mlx_array_data_bool", fn (arr: mlx_array) callconv(.c) ?[*]const bool);
+pub const mlx_array_data_float32 = routed("mlx_array_data_float32", fn (arr: mlx_array) callconv(.c) ?[*]const f32);
+pub const mlx_array_data_float16 = routed("mlx_array_data_float16", fn (arr: mlx_array) callconv(.c) ?[*]const f16);
+pub const mlx_array_data_bfloat16 = routed("mlx_array_data_bfloat16", fn (arr: mlx_array) callconv(.c) ?[*]const u16);
+pub const mlx_array_data_int32 = routed("mlx_array_data_int32", fn (arr: mlx_array) callconv(.c) ?[*]const i32);
+pub const mlx_array_data_uint16 = routed("mlx_array_data_uint16", fn (arr: mlx_array) callconv(.c) ?[*]const u16);
+pub const mlx_array_data_uint32 = routed("mlx_array_data_uint32", fn (arr: mlx_array) callconv(.c) ?[*]const u32);
+pub const mlx_array_data_uint8 = routed("mlx_array_data_uint8", fn (arr: mlx_array) callconv(.c) ?[*]const u8);
 
 // Vector array
-pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
-pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array;
-pub extern "c" fn mlx_vector_array_free(vec: mlx_vector_array) c_int;
-pub extern "c" fn mlx_vector_array_size(vec: mlx_vector_array) usize;
-pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
-pub extern "c" fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array;
-pub extern "c" fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int;
+pub fn mlx_vector_array_new() mlx_vector_array {
+    return if (engine.active) engine.mlx_vector_array_new() else raw.mlx_vector_array_new();
+}
+pub fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array {
+    if (engine.active) return engine.mlx_vector_array_new_data(data, size);
+    if (engine.enabled) return engine.lentVector(data[0..size]);
+    return raw.mlx_vector_array_new_data(data, size);
+}
+pub const mlx_vector_array_free = routed("mlx_vector_array_free", fn (vec: mlx_vector_array) callconv(.c) c_int);
+pub const mlx_vector_array_size = routed("mlx_vector_array_size", fn (vec: mlx_vector_array) callconv(.c) usize);
+pub const mlx_vector_array_get = routed("mlx_vector_array_get", fn (res: *mlx_array, vec: mlx_vector_array, idx: usize) callconv(.c) c_int);
+pub fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array {
+    if (engine.active) return engine.mlx_vector_array_new_value(val);
+    if (engine.enabled) return engine.lentVector(&.{val});
+    return raw.mlx_vector_array_new_value(val);
+}
+pub fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int {
+    if (!engine.enabled) return raw.mlx_vector_array_append_value(vec, val);
+    if (engine.isVec(vec)) return engine.mlx_vector_array_append_value(vec, val);
+    return raw.mlx_vector_array_append_value(vec, if (engine.isOurs(val)) engine.lend(val) orelse return 1 else val);
+}
 
 // Graph utils (diagnostics)
 pub const mlx_node_namer = extern struct { ctx: ?*anyopaque = null };
@@ -226,148 +436,148 @@ pub extern "c" fn mlx_io_reader_free(io: mlx_io_reader) c_int;
 pub extern "c" fn mlx_load_safetensors_reader(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, in_stream: mlx_io_reader, s: mlx_stream) c_int;
 
 // ── Ops ──
-pub extern "c" fn mlx_add(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_subtract(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_multiply(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_floor_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_negative(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_maximum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub const mlx_add = routed("mlx_add", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_subtract = routed("mlx_subtract", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_multiply = routed("mlx_multiply", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_divide = routed("mlx_divide", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_floor_divide = routed("mlx_floor_divide", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_negative = routed("mlx_negative", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_maximum = routed("mlx_maximum", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
 // Kokoro's SineGen takes the fractional part of a phase ramp (`x - floor(x)`).
-pub extern "c" fn mlx_floor(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_ceil(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_log2(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_round(res: *mlx_array, a: mlx_array, decimals: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_sign(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub const mlx_floor = routed("mlx_floor", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_ceil = routed("mlx_ceil", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_log2 = routed("mlx_log2", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_round = routed("mlx_round", fn (res: *mlx_array, a: mlx_array, decimals: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_sign = routed("mlx_sign", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
 // Complex plumbing for Kokoro's iSTFTNet head. mlx-c has NO "build a complex
 // array from two real ones" op, so the spectrum is assembled as `re + im·i`
 // using a complex SCALAR from `mlx_array_new_complex` (float ⊕ complex
 // promotes to complex).
-pub extern "c" fn mlx_real(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_imag(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_arctan2(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub const mlx_real = routed("mlx_real", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_imag = routed("mlx_imag", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_arctan2 = routed("mlx_arctan2", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
 pub extern "c" fn mlx_array_new_complex(real_val: f32, imag_val: f32) mlx_array;
-pub extern "c" fn mlx_minimum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_block_masked_mm(res: *mlx_array, a: mlx_array, b: mlx_array, block_size: c_int, mask_out: mlx_array, mask_lhs: mlx_array, mask_rhs: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_sqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_rsqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_exp(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_log(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_abs(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_tanh(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_cos(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_sin(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_erf(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub const mlx_minimum = routed("mlx_minimum", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_matmul = routed("mlx_matmul", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_block_masked_mm = routed("mlx_block_masked_mm", fn (res: *mlx_array, a: mlx_array, b: mlx_array, block_size: c_int, mask_out: mlx_array, mask_lhs: mlx_array, mask_rhs: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_square = routed("mlx_square", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_sqrt = routed("mlx_sqrt", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_rsqrt = routed("mlx_rsqrt", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_exp = routed("mlx_exp", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_log = routed("mlx_log", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_abs = routed("mlx_abs", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_tanh = routed("mlx_tanh", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_cos = routed("mlx_cos", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_sin = routed("mlx_sin", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_erf = routed("mlx_erf", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_reshape(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
-pub extern "c" fn mlx_transpose(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_transpose_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
-pub extern "c" fn mlx_expand_dims(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_squeeze(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_broadcast_to(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
+pub const mlx_reshape = routed("mlx_reshape", fn (res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_transpose = routed("mlx_transpose", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_transpose_axes = routed("mlx_transpose_axes", fn (res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_expand_dims = routed("mlx_expand_dims", fn (res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_squeeze = routed("mlx_squeeze", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_broadcast_to = routed("mlx_broadcast_to", fn (res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_take(res: *mlx_array, a: mlx_array, indices: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_take_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub const mlx_take = routed("mlx_take", fn (res: *mlx_array, a: mlx_array, indices: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_take_axis = routed("mlx_take_axis", fn (res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_concatenate_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_pad(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, low_pad: [*]const c_int, low_pad_num: usize, high_pad: [*]const c_int, high_pad_num: usize, pad_value: mlx_array, mode: [*:0]const u8, s: mlx_stream) c_int;
+pub const mlx_concatenate_axis = routed("mlx_concatenate_axis", fn (res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_pad = routed("mlx_pad", fn (res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, low_pad: [*]const c_int, low_pad_num: usize, high_pad: [*]const c_int, high_pad_num: usize, pad_value: mlx_array, mode: [*:0]const u8, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_softmax_axis(res: *mlx_array, a: mlx_array, axis: c_int, precise: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_argmax_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub const mlx_softmax_axis = routed("mlx_softmax_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, precise: bool, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_argmax_axis = routed("mlx_argmax_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_copy(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_view(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
-pub extern "c" fn mlx_sort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_argsort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_topk(res: *mlx_array, a: mlx_array, k: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_topk_axis(res: *mlx_array, a: mlx_array, k: c_int, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_cumsum(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+pub const mlx_copy = routed("mlx_copy", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_view = routed("mlx_view", fn (res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_sort_axis = routed("mlx_sort_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_argsort_axis = routed("mlx_argsort_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_topk = routed("mlx_topk", fn (res: *mlx_array, a: mlx_array, k: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_topk_axis = routed("mlx_topk_axis", fn (res: *mlx_array, a: mlx_array, k: c_int, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_cumsum = routed("mlx_cumsum", fn (res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_mean_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub const mlx_mean_axis = routed("mlx_mean_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
 // Variance along one axis — the InstanceNorm1d half of Kokoro's AdaIN1d
 // (`src/kokoro.zig`). `ddof` 0 = biased/population variance, which is what
 // torch's normalization layers use.
-pub extern "c" fn mlx_var_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub const mlx_var_axis = routed("mlx_var_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, ddof: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_min_axis = routed("mlx_min_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub const mlx_astype = routed("mlx_astype", fn (res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_array_equal(res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_remainder(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_where(res: *mlx_array, condition: mlx_array, x: mlx_array, y: mlx_array, s: mlx_stream) c_int;
+pub const mlx_equal = routed("mlx_equal", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_array_equal = routed("mlx_array_equal", fn (res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_remainder = routed("mlx_remainder", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_where = routed("mlx_where", fn (res: *mlx_array, condition: mlx_array, x: mlx_array, y: mlx_array, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_arange(res: *mlx_array, start: f64, stop: f64, step: f64, dtype: mlx_dtype, s: mlx_stream) c_int;
-pub extern "c" fn mlx_full(res: *mlx_array, shape: [*]const c_int, shape_num: usize, val: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
-pub extern "c" fn mlx_zeros(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
-pub extern "c" fn mlx_ones(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub const mlx_arange = routed("mlx_arange", fn (res: *mlx_array, start: f64, stop: f64, step: f64, dtype: mlx_dtype, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_full = routed("mlx_full", fn (res: *mlx_array, shape: [*]const c_int, shape_num: usize, val: mlx_array, dtype: mlx_dtype, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_zeros = routed("mlx_zeros", fn (res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_ones = routed("mlx_ones", fn (res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_slice(res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
-pub extern "c" fn mlx_slice_update(res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
-pub extern "c" fn mlx_scatter_single(res: *mlx_array, a: mlx_array, indices: mlx_array, updates: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub const mlx_slice = routed("mlx_slice", fn (res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_slice_update = routed("mlx_slice_update", fn (res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_scatter_single = routed("mlx_scatter_single", fn (res: *mlx_array, a: mlx_array, indices: mlx_array, updates: mlx_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_triu(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_tril(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
+pub const mlx_triu = routed("mlx_triu", fn (res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_tril = routed("mlx_tril", fn (res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) callconv(.c) c_int);
 
-pub extern "c" fn mlx_power(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_less(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_greater(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_greater_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_less_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub const mlx_power = routed("mlx_power", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_less = routed("mlx_less", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_greater = routed("mlx_greater", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_greater_equal = routed("mlx_greater_equal", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_less_equal = routed("mlx_less_equal", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
 
 // Quantized matmul
-pub extern "c" fn mlx_quantized_matmul(res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, s: mlx_stream) c_int;
+pub const mlx_quantized_matmul = routed("mlx_quantized_matmul", fn (res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, s: mlx_stream) callconv(.c) c_int);
 
 // Gathered quantized matmul (for MoE expert dispatch)
-pub extern "c" fn mlx_gather_qmm(res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, sorted_indices: bool, s: mlx_stream) c_int;
+pub const mlx_gather_qmm = routed("mlx_gather_qmm", fn (res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, sorted_indices: bool, s: mlx_stream) callconv(.c) c_int);
 // Dense gathered matmul — the unquantized analog of gather_qmm, used for bf16
 // MoE expert dispatch. No transpose flag: `b` must already be [..., in, out].
-pub extern "c" fn mlx_gather_mm(res: *mlx_array, a: mlx_array, b: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, sorted_indices: bool, s: mlx_stream) c_int;
+pub const mlx_gather_mm = routed("mlx_gather_mm", fn (res: *mlx_array, a: mlx_array, b: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, sorted_indices: bool, s: mlx_stream) callconv(.c) c_int);
 
 // Dequantize (fallback)
-pub extern "c" fn mlx_dequantize(res: *mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, dtype: mlx_optional_dtype, s: mlx_stream) c_int;
+pub const mlx_dequantize = routed("mlx_dequantize", fn (res: *mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, dtype: mlx_optional_dtype, s: mlx_stream) callconv(.c) c_int);
 
 // Quantize (affine group-wise). Returns a vector_array of [q, scales, biases].
 // Used by the KV cache quantization path; see src/kv_quant.zig.
-pub extern "c" fn mlx_quantize(res: *mlx_vector_array, w: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, s: mlx_stream) c_int;
+pub const mlx_quantize = routed("mlx_quantize", fn (res: *mlx_vector_array, w: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, s: mlx_stream) callconv(.c) c_int);
 
 // Additional ops for MoE / GatedDeltaNet
-pub extern "c" fn mlx_sigmoid(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_sum_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_max_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_sum(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, s: mlx_stream) c_int;
+pub const mlx_sigmoid = routed("mlx_sigmoid", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_sum_axis = routed("mlx_sum_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_max_axis = routed("mlx_max_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_sum = routed("mlx_sum", fn (res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_conv1d = routed("mlx_conv1d", fn (res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, s: mlx_stream) callconv(.c) c_int);
 // FFT — real-input forward transform for the TTS speaker-encoder mel/STFT.
 // `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
 pub const mlx_fft_norm = c_int;
 pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
-pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
+pub const mlx_fft_rfft = routed("mlx_fft_rfft", fn (res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) callconv(.c) c_int);
 // Real-output inverse transform — the iSTFT head of Kokoro's iSTFTNet generator
 // (`src/kokoro.zig`). `n` is the OUTPUT length in samples, so the caller states
 // the frame size (20) rather than inferring it from the 11-bin input.
-pub extern "c" fn mlx_fft_irfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
+pub const mlx_fft_irfft = routed("mlx_fft_irfft", fn (res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) callconv(.c) c_int);
 // 2D/3D conv + transposed conv for the media-generation decoders (VAE/vocoder).
 // MLX layout: input NHWC / NDHWC, weight OHWI / ODHWI (out-channels first, in-channels last).
-pub extern "c" fn mlx_conv2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, groups: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_conv3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, groups: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_conv_transpose1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, output_padding: c_int, groups: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_conv_transpose2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, output_padding_0: c_int, output_padding_1: c_int, groups: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_conv_transpose3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, output_padding_0: c_int, output_padding_1: c_int, output_padding_2: c_int, groups: c_int, s: mlx_stream) c_int;
+pub const mlx_conv2d = routed("mlx_conv2d", fn (res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, groups: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_conv3d = routed("mlx_conv3d", fn (res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, groups: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_conv_transpose1d = routed("mlx_conv_transpose1d", fn (res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, output_padding: c_int, groups: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_conv_transpose2d = routed("mlx_conv_transpose2d", fn (res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, output_padding_0: c_int, output_padding_1: c_int, groups: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_conv_transpose3d = routed("mlx_conv_transpose3d", fn (res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, output_padding_0: c_int, output_padding_1: c_int, output_padding_2: c_int, groups: c_int, s: mlx_stream) callconv(.c) c_int);
 // Seed-exact normal noise: pair with mlx_random_key(seed).
-pub extern "c" fn mlx_random_normal(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, loc: f32, scale: f32, key: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_argpartition_axis(res: *mlx_array, a: mlx_array, kth: c_int, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_take_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_put_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, values: mlx_array, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_logical_and(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_logical_or(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_repeat_axis(res: *mlx_array, arr: mlx_array, repeats: c_int, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_tile(res: *mlx_array, arr: mlx_array, reps: [*]const c_int, reps_num: usize, s: mlx_stream) c_int;
-pub extern "c" fn mlx_log1p(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_logaddexp(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_stack_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_split(res: *mlx_vector_array, a: mlx_array, num_splits: c_int, axis: c_int, s: mlx_stream) c_int;
+pub const mlx_random_normal = routed("mlx_random_normal", fn (res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, loc: f32, scale: f32, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_argpartition_axis = routed("mlx_argpartition_axis", fn (res: *mlx_array, a: mlx_array, kth: c_int, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_take_along_axis = routed("mlx_take_along_axis", fn (res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_put_along_axis = routed("mlx_put_along_axis", fn (res: *mlx_array, a: mlx_array, indices: mlx_array, values: mlx_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_logical_and = routed("mlx_logical_and", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_logical_or = routed("mlx_logical_or", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_repeat_axis = routed("mlx_repeat_axis", fn (res: *mlx_array, arr: mlx_array, repeats: c_int, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_tile = routed("mlx_tile", fn (res: *mlx_array, arr: mlx_array, reps: [*]const c_int, reps_num: usize, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_log1p = routed("mlx_log1p", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_logaddexp = routed("mlx_logaddexp", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_stack_axis = routed("mlx_stack_axis", fn (res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_split = routed("mlx_split", fn (res: *mlx_vector_array, a: mlx_array, num_splits: c_int, axis: c_int, s: mlx_stream) callconv(.c) c_int);
 
 pub const mlx_optional_dtype = extern struct {
     value: mlx_dtype = .float32,
@@ -375,39 +585,67 @@ pub const mlx_optional_dtype = extern struct {
 };
 
 // ── Fast ops ──
-pub extern "c" fn mlx_fast_rms_norm(res: *mlx_array, x: mlx_array, weight: mlx_array, eps: f32, s: mlx_stream) c_int;
-pub extern "c" fn mlx_fast_layer_norm(res: *mlx_array, x: mlx_array, weight: mlx_array, bias: mlx_array, eps: f32, s: mlx_stream) c_int;
-pub extern "c" fn mlx_fast_rope(res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: c_int, freqs: mlx_array, s: mlx_stream) c_int;
+pub const mlx_fast_rms_norm = routed("mlx_fast_rms_norm", fn (res: *mlx_array, x: mlx_array, weight: mlx_array, eps: f32, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_fast_layer_norm = routed("mlx_fast_layer_norm", fn (res: *mlx_array, x: mlx_array, weight: mlx_array, bias: mlx_array, eps: f32, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_fast_rope = routed("mlx_fast_rope", fn (res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: c_int, freqs: mlx_array, s: mlx_stream) callconv(.c) c_int);
 // `mlx_fast_rope_dynamic` accepts a per-row offset array (shape [B], int32) so a single
 // kernel launch handles N requests at different KV positions during batched decode.
-pub extern "c" fn mlx_fast_rope_dynamic(res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: mlx_array, freqs: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_fast_scaled_dot_product_attention(res: *mlx_array, queries: mlx_array, keys: mlx_array, values: mlx_array, scale: f32, mask_mode: [*:0]const u8, mask_arr: mlx_array, sinks: mlx_array, force_fused: bool, s: mlx_stream) c_int;
+pub const mlx_fast_rope_dynamic = routed("mlx_fast_rope_dynamic", fn (res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: mlx_array, freqs: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_fast_scaled_dot_product_attention = routed("mlx_fast_scaled_dot_product_attention", fn (res: *mlx_array, queries: mlx_array, keys: mlx_array, values: mlx_array, scale: f32, mask_mode: [*:0]const u8, mask_arr: mlx_array, sinks: mlx_array, force_fused: bool, s: mlx_stream) callconv(.c) c_int);
 
 // ── Vector of strings (for custom metal kernels) ──
 pub const mlx_vector_string = extern struct { ctx: ?*anyopaque = null };
 pub extern "c" fn mlx_vector_string_new() mlx_vector_string;
 pub extern "c" fn mlx_vector_string_new_data(data: [*]const [*:0]const u8, size: usize) mlx_vector_string;
 pub extern "c" fn mlx_vector_string_free(vec: mlx_vector_string) c_int;
+pub extern "c" fn mlx_vector_string_size(vec: mlx_vector_string) usize;
+pub extern "c" fn mlx_vector_string_get(res: *[*:0]u8, vec: mlx_vector_string, idx: usize) c_int;
 
 // ── Custom Metal kernels ──
 pub const mlx_fast_metal_kernel_config = extern struct { ctx: ?*anyopaque = null };
-pub extern "c" fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config;
+/// Always MLX's config, mirrored for the engine as it is filled: a module keeps the configs it builds, and one made
+/// inside a forward of the engine is launched on MLX's side later.
+pub fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config {
+    return raw_kernel.mlx_fast_metal_kernel_config_new();
+}
 pub fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int {
+    if (engine.noting()) {
+        engine.forgetConfig(cls);
+    }
     kernel_keys.configFree(cls);
     return raw_kernel.mlx_fast_metal_kernel_config_free(cls);
 }
 pub fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int {
+    if (engine.noting()) {
+        engine.noteOutput(cls, shape, size, dtype);
+    }
     kernel_keys.configNote(cls, " ->{t}", .{dtype});
     return raw_kernel.mlx_fast_metal_kernel_config_add_output_arg(cls, shape, size, dtype);
 }
-pub extern "c" fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
-pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
+pub fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int {
+    if (engine.noting()) {
+        engine.noteGrid(cls, g1, g2, g3);
+    }
+    return raw_kernel.mlx_fast_metal_kernel_config_set_grid(cls, g1, g2, g3);
+}
+pub fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int {
+    if (engine.noting()) {
+        engine.noteGroup(cls, t1, t2, t3);
+    }
+    return raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(cls, t1, t2, t3);
+}
 pub fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int {
+    if (engine.noting()) {
+        engine.noteTemplate(cls, name, .{ .dtype = dtype });
+    }
     kernel_keys.configNote(cls, " {s}={t}", .{ name, dtype });
     return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_dtype(cls, name, dtype);
 }
-pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
+pub const mlx_any_axes = routed("mlx_any_axes", fn (res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
 pub fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int {
+    if (engine.noting()) {
+        engine.noteTemplate(cls, name, .{ .int = value });
+    }
     kernel_keys.configNote(cls, " {s}={d}", .{ name, value });
     return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_int(cls, name, value);
 }
@@ -440,21 +678,31 @@ fn minifiedText(alloc: std.mem.Allocator, source: [*:0]const u8, header: [*:0]co
 /// The kernel exactly as given; MLX copies both strings.
 pub fn kernelNewSource(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel {
     const k = raw_kernel.mlx_fast_metal_kernel_new(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
+    if (engine.noting()) engine.kernelNew(k, name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
     kernel_keys.kernelNew(k, name, source, header, ensure_row_contiguous, atomic_outputs);
     return k;
 }
 pub fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int {
+    if (engine.noting()) engine.kernelFree(cls);
     kernel_keys.kernelFree(cls);
     return raw_kernel.mlx_fast_metal_kernel_free(cls);
 }
 pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int {
+    if (engine.enabled) switch (engine.side(.{ inputs, config, s })) {
+        .engine => return engine.mlx_fast_metal_kernel_apply(outputs, cls, inputs, config, s),
+        .leak => return engine.refuse("mlx_fast_metal_kernel_apply", "an MLX stream inside a forward of the engine"),
+        .mlx => if (engine.isVec(inputs)) return engine.refuse("mlx_fast_metal_kernel_apply", "a vector of the engine on an MLX stream"),
+    };
     kernel_keys.apply(cls, inputs, config);
     return raw_kernel.mlx_fast_metal_kernel_apply(outputs, cls, inputs, config, s);
 }
 
 /// The custom-kernel entry points under the wrappers above, which note each kernel's library key.
 const raw_kernel = struct {
+    extern "c" fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config;
     extern "c" fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int;
+    extern "c" fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
+    extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
     extern "c" fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
     extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
     extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
@@ -464,27 +712,44 @@ const raw_kernel = struct {
 };
 
 // ── Random ──
-pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;
+pub const mlx_random_categorical = routed("mlx_random_categorical", fn (res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
 pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
 // Uniform noise — Kokoro's SineGen draws a random initial phase per harmonic.
 // Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
-pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
+pub const mlx_random_uniform = routed("mlx_random_uniform", fn (res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
 pub extern "c" fn mlx_random_seed(seed: u64) c_int;
-pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
+pub const mlx_random_bits = routed("mlx_random_bits", fn (res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
 // Uniform random integers in [low, high).
-pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
+pub const mlx_random_randint = routed("mlx_random_randint", fn (res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
 
 // ── Reductions and elementwise ops ──
-pub extern "c" fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_all(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_isfinite(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_contiguous(res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_max(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int;
+pub const mlx_logsumexp_axis = routed("mlx_logsumexp_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_all = routed("mlx_all", fn (res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_isfinite = routed("mlx_isfinite", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_contiguous = routed("mlx_contiguous", fn (res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_max = routed("mlx_max", fn (res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
+pub fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int {
+    if (engine.enabled and engine.isOurs(arr)) return engine.item(bool, res, arr);
+    return eval_raw.mlx_array_item_bool(res, arr);
+}
 
 // ── Batch eval ──
-pub extern "c" fn mlx_eval(outputs: mlx_vector_array) c_int;
-pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
+pub fn mlx_eval(outputs: mlx_vector_array) c_int {
+    if (engine.enabled and engine.isVec(outputs)) return engine.mlx_eval(outputs);
+    return eval_raw.mlx_eval(outputs);
+}
+pub fn mlx_async_eval(outputs: mlx_vector_array) c_int {
+    if (engine.enabled and engine.isVec(outputs)) return engine.mlx_async_eval(outputs);
+    return eval_raw.mlx_async_eval(outputs);
+}
+const eval_raw = struct {
+    extern "c" fn mlx_array_eval(arr: mlx_array) c_int;
+    extern "c" fn mlx_array_item_float32(res: *f32, arr: mlx_array) c_int;
+    extern "c" fn mlx_array_item_int32(res: *i32, arr: mlx_array) c_int;
+    extern "c" fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int;
+    extern "c" fn mlx_eval(outputs: mlx_vector_array) c_int;
+    extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
+};
 
 // ── Memory management ──
 pub extern "c" fn mlx_clear_cache() c_int;
@@ -575,6 +840,20 @@ var test_error_handler_installed = std.atomic.Value(bool).init(false);
 pub fn gpuStream() mlx_stream {
     if (builtin.is_test and !test_error_handler_installed.swap(true, .acq_rel)) installErrorHandler();
     return if (noGpuBackend()) mlx_default_cpu_stream_new() else mlx_default_gpu_stream_new();
+}
+
+/// One synced element-op on the GPU stream: a queue the driver sees in use. A failure stays unlatched.
+pub fn gpuTouch() void {
+    const had_error = errorPending();
+    defer dropLatchedErrorUnless(had_error);
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    const one = mlx_array_new_float(1);
+    defer _ = mlx_array_free(one);
+    var out = mlx_array_new();
+    defer _ = mlx_array_free(out);
+    if (mlx_multiply(&out, one, one, s) != 0) return;
+    _ = mlx_array_eval(out);
 }
 
 /// Print an array for debugging
@@ -1047,6 +1326,11 @@ pub fn checkError() !void {
 pub fn checkErrorDecode() !void {
     fault_step.maybeFire();
     return consumeLatch();
+}
+
+/// Latches an error of the engine's own as an mlx-c error is latched.
+pub fn latchError(msg: [:0]const u8) void {
+    latchMlxError(msg.ptr, null);
 }
 
 pub fn latchErrorForTest(msg: [:0]const u8) void {

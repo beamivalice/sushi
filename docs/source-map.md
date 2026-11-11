@@ -23,6 +23,9 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `trunk.zig` | `Trunk`: embeddings, lm head, rope/M-RoPE/YaRN tables, compiled closures, the MoE family, eval cadence, the warmup scaffold | arch-*, engine-* |
 | `moe_shared_fold.zig` | the gated shared expert folded into the routed EXL3 launches, for any trunk MoE layer that gates one | engine-exl3-experts, qwen4-perf |
 | `model_handle.zig` | `ForwardCtx`, `CaptureLayers`, the loaded-model operations that dispatch through the registry (`deinit`, `resetCache`, `warmup`, `forwardWith`, ...) | arch-* |
+| `metal.zig` / `metal_mlx.zig` | Metal from Zig (device, pipelines, buffers, passes, fences); the Metal buffer behind an MLX array | engine-own-forward |
+| `tensor/core.zig` / `route.zig` / `ops.zig` / `kernel.zig` | the engine of our own behind `mlx.zig`: tensors, stores and the pool, passes, lending to and importing from MLX; the mlx-c names answered by the engine and the tests against MLX; views, elementwise and gather ops; a model's custom kernels | engine-own-forward |
+| `tensor/stock.zig` / `matmul.zig` / `reduce.zig` | MLX's compiled kernels launched by the engine with MLX's dispatch: RMS norm, softmax, dequantize; matmul; sum, max, argmax | engine-own-forward |
 | `mlx_util.zig` / `trunk_helpers_test.zig` | MLX helpers with no model knowledge (scalars, owned copy, masks); test-only fixtures shared by the trunk, KV, attention and MoE tests | engine-mlx-gotchas |
 | `<arch>/<arch>_state.zig` | what an arch owns beyond the trunk: load, `deinit`, cache reset | arch-* |
 | `kv_cache.zig` / `ssm_cache.zig` / `layer_weights` / `forward_diag` / `test_support` | KV/SSM caches, quant resolution, layer weights, `diagEnvOn` | arch-*, engine-* |

@@ -435,7 +435,7 @@ const test_buckets = [_][]const []const u8{
 const tier_bucket: []const []const u8 = &.{ "kv_disk_cache", "kv_disk_fs", "prefix_cache", "disk_placement", "prefix_cache_admin", "prefix_vfs_tensors_test", "qwen4_disk_qsa", "qwen4_prefix_cache_test", "glm5_prefix_cache_test", "dsv41_prefix_cache_test" };
 
 /// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
-const test_dirs = [_][]const u8{ "src", "src/arch", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
+const test_dirs = [_][]const u8{ "src", "src/arch", "src/tensor", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
 
 /// A test's model is its file's folder; the src root is shared.
 const TestModel = enum { qwen4, mimo2, glm5, dsv41, exl3, enc };
@@ -480,7 +480,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
     var all_names: std.ArrayList([]const u8) = .empty;
     var top: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
     for (test_dirs) |dir_path| {
-        const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path, "src/arch") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
+        const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path, "src/arch") and !std.mem.eql(u8, dir_path, "src/tensor") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
         // A dropped architecture has no folder.
         var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
             error.FileNotFound => continue,

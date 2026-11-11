@@ -139,6 +139,13 @@ test {
     _ = @import("main.zig");
     _ = @import("mlx.zig");
     _ = @import("mlx_kernel_keys.zig");
+    _ = @import("metal.zig");
+    _ = @import("metal_mlx.zig");
+    _ = @import("tensor/core.zig");
+    _ = @import("tensor/ops.zig");
+    _ = @import("tensor/kernel.zig");
+    _ = @import("tensor/route.zig");
+    _ = @import("tensor/stock.zig");
     _ = @import("test_models.zig");
     _ = @import("arch_host.zig");
     _ = @import("arch_host_stub.zig");

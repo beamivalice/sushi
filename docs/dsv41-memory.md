@@ -114,6 +114,11 @@ state's 890 B a token is 204 B; the cap carries 603 B (x 5/4).
 | decode or verify block | 9k / 225k / 1M | 0.55 / 0.71 / 1.33 | 0.28 / 0.44 / 1.06 |
 | image encode | any | unchanged: the bill already covered the measured peak by a quarter | |
 
+With decode on the engine of our own (an STQ pack on a GPU with matrix units, [engine-own-forward](engine-own-forward.md#memory)) the
+request bill carries the decode cap a second time, for the engine's pool: 0.28 / 0.44 / 1.06 GB more at 9k / 225k /
+1M tokens. The engine's forward makes on its own queue what MLX's made on MLX's, and each allocator is held to the
+cap separately.
+
 The pool growth (7.5 GB) was most of the old bill and the cap replaces it: a 2048-row chunk's need falls 8.3-8.7 GB,
 the rest being the measured per-row rate against the old formula. At wired 124000 with DSpark and the SSD tier on (the
 `with its decoder pools lendable` test), budget 117 and no decoder pool to lend, the advertised context is 390,144

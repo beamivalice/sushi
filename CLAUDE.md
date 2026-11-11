@@ -55,6 +55,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/engine-kv-cache.md](docs/engine-kv-cache.md) | kv8 default, kv-quant contract, growth, GDN step, byte-stability settings |
 | [docs/engine-prefix-cache.md](docs/engine-prefix-cache.md) | hot cache, hybrid restore, trimming, SSD tier, SSD-first, checkouts, spec state |
 | [docs/engine-kernels.md](docs/engine-kernels.md) | decode/MoE/prefill/verify kernels, NAX/MPP pitfalls, proving and timing a kernel |
+| [docs/engine-own-forward.md](docs/engine-own-forward.md) | the engine of our own (`src/tensor/`): the stream seam, lending and importing, in-place appends, Metal rules, the kernel table against MLX, load warm |
 | [docs/engine-mlx-gotchas.md](docs/engine-mlx-gotchas.md) | MLX errors, dtype promotion, barriers, views vs copies, allocator, Zig/tokenizer traps |
 | [docs/engine-memory-admission.md](docs/engine-memory-admission.md) | Metal OOM, preflight, auto-context, prefill chunk, admission |
 | [docs/server-http-apis.md](docs/server-http-apis.md) | API contracts, streaming, sampling, reasoning budget, constrained JSON, launcher |
@@ -95,8 +96,8 @@ Box: M5 Max 128 GB, macOS 27. Bumping mlx or rebuilding jinja: [process-measurem
 
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
   `zig build test` does NOT refresh `zig-out/bin/sushi`: rebuild before any live A/B.
-- The MLX host overhead patch is temporary, until a decode forward of our own beats it; no other new patch goes on
-  mlx or mlx-c ([engine-mlx-gotchas](docs/engine-mlx-gotchas.md#host-overhead)).
+- The MLX host overhead patch and the Metal-buffer accessor are temporary aids of the move off MLX, decode first;
+  no other new patch goes on mlx or mlx-c ([engine-mlx-gotchas](docs/engine-mlx-gotchas.md#host-overhead)).
 - A git worktree lacks `.zig-toolchain/` and `lib/mlx/`: symlink both from the main checkout. After a toolchain/SDK
   change `rm -rf .zig-cache` (configure-time output is cached).
 
@@ -171,7 +172,7 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 
 Server log `~/.sushi/logs/sushi-<port>.log` is THE post-mortem file (`--log-level debug`). Grep its tags: `jinja error:`,
 `<- N+M tokens`, `tool_msgs=`, `[cache]`, `[spec-stats]`, `[mtp-planner]`, `[loop-stop]`, `[admission]`, `[kv-cache]`,
-`[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[prefill-trace]`. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
+`[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[prefill-trace]`, `[engine]`. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
 `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; stop your own server by PID, never
 `pkill`. `/props` reports `active_bytes`,
 `memory.cache_bytes`, `batching`; RSS is blind to Metal.

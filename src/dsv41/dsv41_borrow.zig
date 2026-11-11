@@ -4,6 +4,7 @@
 //! prefill reads the pools back. Every forward runs under a transient cap (`Config.forwardCap`), which is what admission
 //! bills: a request's state, a decode forward's cap and the part of a prefill's the pools cannot cover.
 const std = @import("std");
+const builtin = @import("builtin");
 const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
@@ -46,7 +47,46 @@ pub const PoolOps = struct {
     clear: *const fn () void,
     /// Caps what MLX may allocate beyond what it holds now, its freed-buffer pool included; 0 lifts the cap.
     set_transient: *const fn (bytes: u64) void,
+    /// Caps what the engine of our own may hold beyond what its tensors in use ask for, its free buffers included.
+    set_own: *const fn (bytes: u64) void,
 };
+
+/// Where a pack's decode forwards (one row, DSpark draft, verify rows) run, and why not on the engine of our own.
+pub const DecodeSide = enum {
+    engine,
+    /// The engine has no `quantized_matmul`, which an FP8 trunk and MXFP4 experts launch.
+    mlx_not_stq,
+    /// Every kernel of the engine is held to MLX's bytes on a GPU with matrix units; its other matmul tiles have
+    /// not run on one without.
+    mlx_no_matrix_units,
+};
+
+/// PURE: the side for a pack that is or is not STQ throughout, on a GPU with or without matrix units.
+pub fn decodeSide(stq: bool, matrix_units: bool) DecodeSide {
+    if (!stq) return .mlx_not_stq;
+    return if (matrix_units) .engine else .mlx_no_matrix_units;
+}
+
+/// A test names the side its model decodes on.
+pub var own_override: ?bool = null;
+
+pub fn decodeSideOf(c: *const Config) DecodeSide {
+    return decodeSide(c.expert_dec != null and c.trunk_dec != null, mlx.engine.matrixUnits());
+}
+
+/// Whether this pack's decode forwards run on the engine of our own. The load and every bill ask here.
+pub fn ownDecode(c: *const Config) bool {
+    if (own_override) |own| return own;
+    // The tests written against MLX's decode say nothing and keep it; the engine's own tests turn it on.
+    if (comptime builtin.is_test) return false;
+    return decodeSideOf(c) == .engine;
+}
+
+/// What the engine of our own may hold during a request at `seq`, beside MLX's cap: a decode forward's cap again,
+/// since a forward of ours makes on its own queue what MLX's would have made on MLX's.
+pub fn ownCap(c: *const Config, seq: u64) u64 {
+    return if (ownDecode(c)) c.forwardCap(verify_rows, seq) else 0;
+}
 
 fn rowsCap(rows: u64, config: *const ModelConfig) u64 {
     return poolCap(rows, config.expertPoolBytes(), if (pool_ram_cap == 0) std.math.maxInt(u64) else pool_ram_cap);
@@ -78,6 +118,7 @@ fn setTransient(bytes: u64, ops: PoolOps) void {
 pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
     if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41")) return false;
     setTransient(phaseLimit(c.forwardCap(rows, seq), config), ops);
+    ops.set_own(ownCap(c, seq));
     return moveCap(rowsCap(rows, config), config, ops);
 }
 
@@ -99,6 +140,8 @@ pub fn endRequest(config: *const ModelConfig, ops: PoolOps) bool {
     if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41")) return false;
     const was_on = transient_now;
     if (was_on) setTransient(0, ops);
+    // The next request bills the engine's cap from its own length: the shortest one covers what stays.
+    if (config.dsv41) |*c| ops.set_own(ownCap(c, 1));
     return moveCap(config.expertPoolBytes(), config, ops) or was_on;
 }
 
@@ -112,6 +155,7 @@ pub fn unloadModel(config: *const ModelConfig, ops: PoolOps) bool {
     if (!arch_config.isOf(config, "dsv41")) return false;
     pool_now = null;
     if (transient_now) setTransient(0, ops);
+    ops.set_own(0);
     const prev = ram_limit orelse return false;
     ram_limit = null;
     ops.set_limit(prev);
@@ -120,11 +164,14 @@ pub fn unloadModel(config: *const ModelConfig, ops: PoolOps) bool {
 
 /// The unload hook on the real MLX pool.
 pub fn unloadModelMlx(config: *const ModelConfig) void {
+    mlx.engine.close();
     _ = unloadModel(config, mlx_ops);
 }
 
 /// The request-end hook on the real MLX pool.
 pub fn endRequestMlx(config: *const ModelConfig) void {
+    // An idle server holds no open pass, so a stop between requests ends its thread cleanly.
+    mlx.engine.close();
     _ = endRequest(config, mlx_ops);
 }
 
@@ -148,7 +195,11 @@ fn mlxSetTransient(bytes: u64) void {
     _ = mlx.setTransientLimit(@intCast(@as(u64, active) -| mlx.externalMemory() +| bytes));
 }
 
-const mlx_ops: PoolOps = .{ .set_limit = &mlxSetLimit, .clear = &mlxClear, .set_transient = &mlxSetTransient };
+fn ownSet(bytes: u64) void {
+    mlx.engine.budget(bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
+}
+
+const mlx_ops: PoolOps = .{ .set_limit = &mlxSetLimit, .clear = &mlxClear, .set_transient = &mlxSetTransient, .set_own = &ownSet };
 
 /// The image-encode hooks on the real MLX allocator.
 pub fn enterVisionMlx(bill: u64, config: *const ModelConfig) void {
@@ -331,11 +382,13 @@ const PoolProbe = struct {
     var cleared: usize = 0;
     var transient: u64 = 0;
     var transient_sets: usize = 0;
+    var own: u64 = 0;
     fn reset() void {
         n = 0;
         cleared = 0;
         transient = 0;
         transient_sets = 0;
+        own = 0;
     }
     fn capTransient(bytes: u64) void {
         transient = bytes;
@@ -348,7 +401,10 @@ const PoolProbe = struct {
     fn clear() void {
         cleared += 1;
     }
-    const ops: PoolOps = .{ .set_limit = &set, .clear = &clear, .set_transient = &capTransient };
+    fn capOwn(bytes: u64) void {
+        own = bytes;
+    }
+    const ops: PoolOps = .{ .set_limit = &set, .clear = &clear, .set_transient = &capTransient, .set_own = &capOwn };
 };
 
 fn withPoolState(ram_cap: u64, body: *const fn () anyerror!void) !void {
@@ -490,4 +546,37 @@ test "dsv41 borrow: unloading DeepSeek gives the next model the process-wide poo
         }
     };
     try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: with decode on the engine of our own every forward installs its cap there, and a request's end the shortest one" {
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
+            const was = own_override;
+            defer own_override = was;
+            own_override = false;
+            _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
+            try testing.expectEqual(@as(u64, 0), PoolProbe.own);
+            own_override = true;
+            _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(verify_rows, 9_000), PoolProbe.own);
+            // A prefill chunk leaves the engine what the decode after it is billed.
+            _ = enterForward(2048, 225_000, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(verify_rows, 225_000), PoolProbe.own);
+            _ = endRequest(&config, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(verify_rows, 1), PoolProbe.own);
+            _ = unloadModel(&config, PoolProbe.ops);
+            try testing.expectEqual(@as(u64, 0), PoolProbe.own);
+        }
+    };
+    PoolProbe.reset();
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: decode runs on the engine for an STQ pack on a GPU with matrix units, and on MLX otherwise, by name" {
+    try testing.expectEqual(DecodeSide.engine, decodeSide(true, true));
+    try testing.expectEqual(DecodeSide.mlx_not_stq, decodeSide(false, true));
+    try testing.expectEqual(DecodeSide.mlx_not_stq, decodeSide(false, false));
+    try testing.expectEqual(DecodeSide.mlx_no_matrix_units, decodeSide(true, false));
 }

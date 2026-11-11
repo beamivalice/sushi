@@ -37,8 +37,9 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
     const c = config.dsv41 orelse return null;
     const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
     // The transient cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder
-    // pools it may release (`dsv41_borrow`); a decode forward's never does. The decode pool is parked beside either.
-    const work = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCap(chunk, seq) -| bills.borrowableBytes(config)) +| config.expertPoolBytes();
+    // pools it may release (`dsv41_borrow`); a decode forward's never does. The decode pool is parked beside either,
+    // and so is the pool of the engine of our own.
+    const work = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCap(chunk, seq) -| bills.borrowableBytes(config)) +| config.expertPoolBytes() +| dsv41_borrow.ownCap(&c, seq);
     return (held +| checkpointReserve(config, seq, chunk)) *| 5 / 4 +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 

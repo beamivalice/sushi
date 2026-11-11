@@ -42,6 +42,15 @@ what MLX allocates itself (graph intermediates, custom-kernel outputs, the freed
 - `SUSHI_DSV41_TRANSIENT_PEAK=1` logs `[transient-peak]` per DeepSeek phase (decode, DSpark draft/verify, prefill chunk,
   vision encode). Guards: the `transient cap` tests in `mlx.zig`.
 
+<a id="metal-buffer"></a>
+## The Metal-buffer accessor patch (temporary)
+
+`patches/mlxc-metal-buffer.patch` adds two reads to mlx-c for the [engine of our own](engine-own-forward.md):
+`_mlx_array_metal_buffer` (an evaluated array's `MTLBuffer` and the offset of its data in it) and
+`_mlx_array_is_donatable` (whether a handle is the only holder of the array and its buffer). Neither changes what
+MLX computes. They exist while a decode forward of ours still reads state and weights that MLX holds, and go when it
+no longer does (owner, 2026-11-10: allowed as an aid of the move off MLX, decode first).
+
 <a id="host-overhead"></a>
 ## The host overhead patch (temporary)
 

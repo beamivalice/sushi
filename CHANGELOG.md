@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash STQ generates on sushi's own Metal engine on M5 Macs**: token generation for the STQ packs no
+  longer runs through MLX there. It gives the same tokens with about a third less CPU while generating; prefill and
+  every other model are unchanged. It is the first step of moving the engine off MLX.
 - **Prefill with the SSD prompt cache is back to full speed**: saving a long prompt to the SSD cache no longer stalls
   the next prefill chunk, which had cost 1.6.0 up to about 5% of prefill speed on Qwen3.8-Flash-Next.
 - **Follow-up turns restore from the SSD prompt cache faster**: a restore reads the cache in parallel again, as 1.5.1

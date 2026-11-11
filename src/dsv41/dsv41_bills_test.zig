@@ -232,3 +232,22 @@ test "a default context never exceeds the checkpoint's window, and --ctx-size or
     bills.launch_state.server_config.max_context_size = 250_000;
     try t.expectEqual(@as(u32, 250_000), bills.getEffectiveContextLength(&config));
 }
+
+test "DeepSeek's request bill adds a decode forward's cap for the pool of the engine of our own, only when decode runs on it" {
+    const t = std.testing;
+    const dsv41_borrow = @import("dsv41_borrow.zig");
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    const c = config.dsv41.?;
+    const was = dsv41_borrow.own_override;
+    defer dsv41_borrow.own_override = was;
+    for ([_]u64{ 9_000, 225_000, 1_000_000 }) |seq| {
+        dsv41_borrow.own_override = false;
+        const off = bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{});
+        dsv41_borrow.own_override = true;
+        try t.expectEqual(off + c.forwardCap(dsv41_config.verify_rows, seq), bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
+    }
+}
+

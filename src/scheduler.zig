@@ -2494,19 +2494,8 @@ const gpuWarmTickDue = sched_policy.gpuWarmTickDue;
 const gpuWarmParkNs = sched_policy.gpuWarmParkNs;
 const gpuWarmBeforePark = sched_policy.gpuWarmBeforePark;
 
-/// One synced element-op on the GPU stream. Inference thread only; a failure stays unlatched.
-fn gpuWarmTick() void {
-    const had_error = mlx.errorPending();
-    defer mlx.dropLatchedErrorUnless(had_error);
-    const s = mlx.gpuStream();
-    defer _ = mlx.mlx_stream_free(s);
-    const one = mlx.mlx_array_new_float(1);
-    defer _ = mlx.mlx_array_free(one);
-    var out = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out);
-    if (mlx.mlx_multiply(&out, one, one, s) != 0) return;
-    _ = mlx.mlx_array_eval(out);
-}
+/// Inference thread only.
+const gpuWarmTick = mlx.gpuTouch;
 
 const TO_PREFILL_MAX = 16;
 
@@ -2557,6 +2546,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     const params = ctx.params;
     // Covers shutdown and startup-load failure.
     defer sleep_inhibit.release();
+    defer mlx.engine.close();
 
     // ── Phase A1 → Plan 05: load runs on this thread (mlx GPU stream
     //    binding). On failure, mark the entry `.error_state` in the

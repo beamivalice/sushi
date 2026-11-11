@@ -2023,6 +2023,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var ops_total: u64 = 0;
             var done: usize = 0;
             const proc_cpu0 = processCpuNs();
+            const engine0 = mlx.engine.stats();
             var buffers0: usize = 0;
             _ = mlx.mlx_metal_command_buffer_count(&buffers0);
             var active0: usize = 0;
@@ -2070,6 +2071,33 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 @as(f64, @floatFromInt(submit_cpu_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(ops_total)) / dn,
             });
+            if (mlx.engine.enabled) {
+                const e = mlx.engine.stats();
+                log.info("[fwd-ubench] engine: {d:.0} dispatches behind {d:.0} barriers, {d:.1} command buffers, {d:.1} waits, {d:.0} imports, {d:.1} lends per forward; slice updates {d} in place, {d} copied; pool {d} MB; GPU waits {d:.3} ms, commits {d:.3} ms per forward; GPU busy {d:.3} ms and idle between passes {d:.3} ms per forward ({d} buffers untimed); pauses per forward under 20 us / 100 us / 1 ms / longer: {d:.1} ({d:.3} ms) / {d:.1} ({d:.3} ms) / {d:.1} ({d:.3} ms) / {d:.1} ({d:.3} ms)\n", .{
+                    @as(f64, @floatFromInt(e.dispatches - engine0.dispatches)) / dn,
+                    @as(f64, @floatFromInt(e.barriers - engine0.barriers)) / dn,
+                    @as(f64, @floatFromInt(e.submits - engine0.submits)) / dn,
+                    @as(f64, @floatFromInt(e.waits - engine0.waits)) / dn,
+                    @as(f64, @floatFromInt(e.imports - engine0.imports)) / dn,
+                    @as(f64, @floatFromInt(e.lends - engine0.lends)) / dn,
+                    e.updates_in_place - engine0.updates_in_place,
+                    e.updates_copied - engine0.updates_copied,
+                    e.pool_bytes >> 20,
+                    @as(f64, @floatFromInt(e.wait_ns - engine0.wait_ns)) / 1.0e6 / dn,
+                    @as(f64, @floatFromInt(e.commit_ns - engine0.commit_ns)) / 1.0e6 / dn,
+                    @as(f64, @floatFromInt(e.gpu_busy_ns - engine0.gpu_busy_ns)) / 1.0e6 / dn,
+                    @as(f64, @floatFromInt(e.gpu_gap_ns - engine0.gpu_gap_ns)) / 1.0e6 / dn,
+                    e.gpu_untimed - engine0.gpu_untimed,
+                    @as(f64, @floatFromInt(e.gpu_gap_count[0] - engine0.gpu_gap_count[0])) / dn,
+                    @as(f64, @floatFromInt(e.gpu_gap_sum[0] - engine0.gpu_gap_sum[0])) / 1.0e6 / dn,
+                    @as(f64, @floatFromInt(e.gpu_gap_count[1] - engine0.gpu_gap_count[1])) / dn,
+                    @as(f64, @floatFromInt(e.gpu_gap_sum[1] - engine0.gpu_gap_sum[1])) / 1.0e6 / dn,
+                    @as(f64, @floatFromInt(e.gpu_gap_count[2] - engine0.gpu_gap_count[2])) / dn,
+                    @as(f64, @floatFromInt(e.gpu_gap_sum[2] - engine0.gpu_gap_sum[2])) / 1.0e6 / dn,
+                    @as(f64, @floatFromInt(e.gpu_gap_count[3] - engine0.gpu_gap_count[3])) / dn,
+                    @as(f64, @floatFromInt(e.gpu_gap_sum[3] - engine0.gpu_gap_sum[3])) / 1.0e6 / dn,
+                });
+            }
             // SUSHI_DECODE_FWD_GRAPH=<abs path>: one forward's unevaluated tape, one primitive per
             // line; a primitive is at most one dispatch, so a histogram of it is the dispatch plan.
             if (std.c.getenv("SUSHI_DECODE_FWD_GRAPH")) |path| {

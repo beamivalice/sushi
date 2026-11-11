@@ -15,6 +15,7 @@ const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const log = @import("../log.zig");
 const io_util_mod = @import("../io_util.zig");
+const sched_policy = @import("../sched_policy.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const diagEnvValueOn = io_util_mod.diagEnvValueOn;
@@ -29,6 +30,10 @@ const prefetch_lead_rows: u8 = 3;
 pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Trunk {
     const stq = config.dsv41.?.expert_dec != null;
     if (!config.expert_streaming or config.expert_layout != (if (stq) expert_quant_mod.Layout.exl3_k4 else .mxfp4_w123)) return error.ExpertStreamingRequired;
+    // Decided before any kernel is made: the engine records each kernel as it is created.
+    const own_decode = dsv41_borrow.ownDecode(&config.dsv41.?);
+    if (own_decode) mlx.engine.enabled = true;
+    mlx.engine.seal(false);
     const engine = try Trunk.newExpertEngine(allocator, &config, s);
     errdefer {
         engine.deinit();
@@ -38,6 +43,14 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const mdl = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
     errdefer mdl.deinit();
     dsv41_model.logMemory(mdl);
+    mdl.engine_decode = own_decode;
+    if (own_decode) {
+        log.info("[dsv41] decode forwards (one row, DSpark draft and verify rows): on the engine of our own\n", .{});
+    } else switch (dsv41_borrow.decodeSideOf(&config.dsv41.?)) {
+        .engine => {},
+        .mlx_not_stq => log.info("[dsv41] decode forwards: on MLX (the engine of our own has no quantized_matmul for an FP8 trunk or MXFP4 experts)\n", .{}),
+        .mlx_no_matrix_units => log.info("[dsv41] decode forwards: on MLX (the engine of our own is proven on a GPU with matrix units only)\n", .{}),
+    }
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
     dsv41_model.setDsparkExact(mdl, if (std.c.getenv("SUSHI_DSV41_DSPARK_EXACT")) |v| diagEnvValueOn(v) else true);
@@ -83,8 +96,10 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         mlx.dropLatchedErrorUnless(had_error);
         log.warn("[dsv41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
     }
+    mlx.engine.seal(true);
     // The warm's transients leave the pool, so the load's memory reading is the model's.
     _ = mlx.mlx_clear_cache();
+    mlx.engine.trim();
     return shell;
 }
 
@@ -146,7 +161,8 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;
     const n: usize = @intCast(rows[1]);
     // A one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
-    const lazy = n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
+    const own = m.engine_decode and n == 1 and ctx.vision_embeddings == null and st.verify == null;
+    const lazy = !own and n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_astype(&flat, ids, .uint32, self.s));
@@ -171,7 +187,13 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     }
     m.defer_head = m.lazy_head and ctx.lazy_logits and n == 1;
     defer m.defer_head = false;
-    const last = if (lazy) try dsv41_model.extendLazy(m, flat, &one) else try dsv41_model.extendAhead(m, host, .last, dsv41_model.SPAN, vision, ahead);
+    if (own) keepMlxQueue(m);
+    if (own) _ = dsv41_model.ownBegin(m);
+    if (own) mlx.engine.phase(1);
+    defer mlx.engine.phase(0);
+    const forwarded = if (lazy) dsv41_model.extendLazy(m, flat, &one) else dsv41_model.extendAhead(m, host, .last, dsv41_model.SPAN, vision, ahead);
+    if (own) dsv41_model.ownEnd(m, self.s);
+    const last = try forwarded;
     defer _ = mlx.mlx_array_free(last);
     if (self.expert_stream) |engine| engine.finishForward(n);
     ctx.cache.step = st.n;
@@ -181,10 +203,24 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     return out;
 }
 
+/// MLX's queue runs nothing while decode is on the engine's, and the driver drops the resident set of a queue left
+/// unused: the next MLX submission (a request's end, a prefill) then waits before any work runs. One MLX op per
+/// warm tick keeps it, as the parked inference thread does between requests.
+pub fn keepMlxQueue(m: *dsv41_model.Model) void {
+    const now = mlx.engine.nowNs();
+    if (now -| m.mlx_queue_used_ns < sched_policy.GPU_WARM_TICK_NS) return;
+    m.mlx_queue_used_ns = now;
+    mlx.gpuTouch();
+}
+
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
 pub fn dsv41DraftImpl(self: *Trunk, t1: u32) !dsv41_model.Draft {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
+    if (m.engine_decode) _ = dsv41_model.ownBegin(m);
+    defer if (m.engine_decode) dsv41_model.ownEnd(m, self.s);
+    mlx.engine.phase(2);
+    defer mlx.engine.phase(0);
     return dsv41_model.draftHeads(m, t1, .conf);
 }
 
@@ -199,20 +235,40 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
         try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len);
         engine.beginForward();
     }
-    const all = try dsv41_model.verify(m, ids);
+    if (m.engine_decode) keepMlxQueue(m);
+    if (m.engine_decode) _ = dsv41_model.ownBegin(m);
+    mlx.engine.phase(3);
+    defer mlx.engine.phase(0);
+    const verified = dsv41_model.verify(m, ids);
+    if (m.engine_decode) dsv41_model.ownEnd(m, self.s);
+    const all = try verified;
     defer _ = mlx.mlx_array_free(all);
     if (self.expert_stream) |engine| engine.finishForward(ids.len);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_reshape(&out, all, &[_]c_int{ 1, @intCast(ids.len), @intCast(m.cfg.vocab) }, 3, self.s));
+    // On the stream that made the logits: MLX's would wait for the head here, ahead of the verdict built on them.
+    try mlx.check(mlx.mlx_reshape(&out, all, &[_]c_int{ 1, @intCast(ids.len), @intCast(m.cfg.vocab) }, 3, verdictStream(self, self.s)));
     return out;
+}
+
+/// The stream a round's verdict is taken on: the engine's while decode runs there, so the masked argmax rides the
+/// verify's own passes and its read is the round's one wait.
+pub fn verdictStream(self: *Trunk, s: mlx.mlx_stream) mlx.mlx_stream {
+    const m = dsv41_state.modelOf(self) orelse return s;
+    return if (m.engine_decode) mlx.engine.stream() else s;
 }
 
 /// Keeps the first `accepted + 1` rows of the open verify chunk.
 pub fn dsv41FinishImpl(self: *Trunk, ctx: *ForwardCtx, accepted: usize) !void {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
-    try dsv41_model.finishVerify(m, accepted);
+    {
+        if (m.engine_decode) _ = dsv41_model.ownBegin(m);
+        defer if (m.engine_decode) dsv41_model.ownEnd(m, self.s);
+        mlx.engine.phase(4);
+        defer mlx.engine.phase(0);
+        try dsv41_model.finishVerify(m, accepted);
+    }
     ctx.cache.step = (try dsv41_model.ensureState(m)).n;
 }
 

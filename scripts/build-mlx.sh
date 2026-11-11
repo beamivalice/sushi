@@ -50,7 +50,7 @@ done
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
 MLX_PATCHES=("$REPO_ROOT/patches/mlx-transient-cap.patch" "$REPO_ROOT/patches/mlx-host-overhead.patch")
-MLXC_PATCHES=("$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch" "$REPO_ROOT/patches/mlxc-transient-cap.patch" "$REPO_ROOT/patches/mlxc-host-overhead.patch")
+MLXC_PATCHES=("$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch" "$REPO_ROOT/patches/mlxc-transient-cap.patch" "$REPO_ROOT/patches/mlxc-host-overhead.patch" "$REPO_ROOT/patches/mlxc-metal-buffer.patch")
 PATCH_SHA="$(cat "${MLX_PATCHES[@]}" "${MLXC_PATCHES[@]}" | shasum | cut -c1-12)"
 WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
@@ -100,7 +100,8 @@ cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
 # The pinned C wrapper needs the optional global-scale slot added by MLX 0.32.3, and the
-# allocator-cap calls the mlx patch added; a kernel apply reads its config in place.
+# allocator-cap calls the mlx patch added; a kernel apply reads its config in place; the engine
+# of our own binds the Metal buffer of an MLX array.
 for patch in "${MLXC_PATCHES[@]}"; do apply_patch "$MLXC_SRC" "$patch"; done
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────
