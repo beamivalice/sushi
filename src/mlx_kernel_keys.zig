@@ -198,8 +198,6 @@ test "one kernel object across input dtypes and bindings: same outputs, one libr
     }
 }
 
-extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx.mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) c_int;
-
 test "template args of one value and different kinds each get their own source" {
     try mlx.requireGpu();
     const t = std.testing;
@@ -225,7 +223,7 @@ test "template args of one value and different kinds each get their own source" 
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 4, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 4, 1, 1));
-        try mlx.check(if (as_bool) mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "N", true) else mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", 1));
+        try mlx.check(if (as_bool) mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "N", true) else mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", 1));
         var outs_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(outs_vec);
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs_vec, k, inputs, cfg, s));

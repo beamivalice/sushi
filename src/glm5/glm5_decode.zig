@@ -172,12 +172,10 @@ fn getKernel(bits: c_int) !mlx.mlx_fast_metal_kernel {
     cached_kernels[index] = k;
     return k;
 }
-// Pinned mlx-c exposes this nonblocking availability query in array.h.
-extern "c" fn _mlx_array_is_available(result: *bool, array: Arr) c_int;
 fn materialized(a: Arr) !bool {
     if (a.ctx == null) return false;
     var ready = false;
-    try mlx.check(_mlx_array_is_available(&ready, a));
+    try mlx.check(mlx._mlx_array_is_available(&ready, a));
     return ready;
 }
 fn rowMajor(a: Arr) bool {

@@ -128,6 +128,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `rules` in `main.zig`. It flags a pattern we never want; `const-write` is the first
   ([engine-mlx-gotchas](engine-mlx-gotchas.md#zig)); `unused-import` flags a non-`pub` file-scope `const` that only
   renames (`@import`, `a.b.C`, `x`) and that no identifier token of the file names again.
+  `mlx-extern` flags an `extern` (or `@extern`) of an `mlx_*` or `_mlx_*` symbol outside `src/mlx.zig`, where the
+  call counter sits ([engine-own-forward](engine-own-forward.md#the-seam)).
   `undefined-nested-write` flags, in a test block, `v.a.b = ...` on a `var v: T = undefined` before `v.a = ...`, `v = ...`
   or a `v.method()` call; its allowlist key is the test name with every non-alphanumeric character as `_`.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry

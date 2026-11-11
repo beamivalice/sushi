@@ -61,9 +61,6 @@ pub fn matrixUnits() bool {
 /// process, so a test that changes the variable around an MLX product leaves MLX on a value the environment no
 /// longer shows, and every test after it that holds the engine to MLX's bytes would fail by the order they ran in.
 fn mlxTf32() !bool {
-    const c = struct {
-        extern "c" fn mlx_matmul(res: *mlx.mlx_array, a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) c_int;
-    };
     const n = 64;
     const values: [n * n]f32 = @splat(1.0 + 1.0 / 4096.0);
     const x = mlx.raw.mlx_array_new_data(&values, &[_]c_int{ n, n }, 2, .float32);
@@ -72,7 +69,7 @@ fn mlxTf32() !bool {
     defer _ = mlx.mlx_stream_free(gpu_stream);
     var squared = mlx.raw.mlx_array_new();
     defer _ = mlx.raw.mlx_array_free(squared);
-    try mlx.check(c.mlx_matmul(&squared, x, x, gpu_stream));
+    try mlx.check(mlx.raw.mlx_matmul(&squared, x, x, gpu_stream));
     try mlx.check(mlx.raw.mlx_array_eval(squared));
     const got = mlx.mlx_array_data_float32(squared) orelse return error.NotEvaluated;
     return got[0] == n;

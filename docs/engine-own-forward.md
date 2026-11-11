@@ -72,6 +72,16 @@ patch in), two sessions on 90c83d71 and 537e8e91. Engine: two runs of this chang
   instantiations, compared field by field (template values, output dtypes, input signature), for the configs the
   DeepSeek kernels make anew on every launch. A launch with more than 16 template arguments takes the key every
   time. A new way to change a mirrored config must clear `last` too.
+- **`mlx.calls` counts every entry into mlx-c from Zig**, the measure of the move off MLX: `mlx.engine.mlxCalls()`
+  is the `; N MLX calls` that ends the `[engine] since load:` line. Each mlx-c symbol is declared once in `src/mlx.zig`
+  through `counted` (or `routed`, on its MLX branch), which is one relaxed atomic add and the call; atomic because
+  the gauge sampler and request threads call MLX beside the inference thread. A call the seam answers on the engine
+  is not counted; a call the engine itself makes into MLX (an import, a retired import's free) is. An empty
+  handle (`mlx_array_new`, `mlx_stream_new`, `mlx_device_new`, `mlx_string_new`, `mlx_device_info_new`) is a zero
+  `ctx` made in Zig, no call. It cannot see MLX's own threads, work before the load, or the Metal objects MLX already
+  made. Another file declaring an `mlx_*` extern fails the `mlx-extern` lint; an address of the library for `dladdr`
+  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 6520 calls
+  (pinned in `dsv41_generate_test.zig`).
 
 ## Crossing between the two
 

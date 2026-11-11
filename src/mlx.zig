@@ -30,31 +30,101 @@ pub fn rawArrayEval(arr: mlx_array) c_int {
 }
 
 pub const raw = struct {
-    pub extern "c" fn mlx_array_new() mlx_array;
-    pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
-    pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
-    pub extern "c" fn mlx_array_eval(arr: mlx_array) c_int;
-    pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
-    pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
-    pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
-    pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
-    pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
-    pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array;
-    pub extern "c" fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array;
-    pub extern "c" fn mlx_vector_array_free(vec: mlx_vector_array) c_int;
-    pub extern "c" fn mlx_vector_array_size(vec: mlx_vector_array) usize;
-    pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
-    pub extern "c" fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int;
-    pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
-    pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
-    pub extern "c" fn mlx_array_new_data_managed_payload(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
-    pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
-    pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
+    pub const mlx_array_new = emptyHandle(mlx_array);
+    pub const mlx_array_free = counted("mlx_array_free", fn (arr: mlx_array) callconv(.c) c_int);
+    pub const mlx_array_set = counted("mlx_array_set", fn (arr: *mlx_array, src: mlx_array) callconv(.c) c_int);
+    pub const mlx_array_eval = counted("mlx_array_eval", fn (arr: mlx_array) callconv(.c) c_int);
+    pub const mlx_array_new_data = counted("mlx_array_new_data", fn (data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) callconv(.c) mlx_array);
+    pub const mlx_array_new_int = counted("mlx_array_new_int", fn (val: c_int) callconv(.c) mlx_array);
+    pub const mlx_array_new_float = counted("mlx_array_new_float", fn (val: f32) callconv(.c) mlx_array);
+    pub const mlx_array_new_bool = counted("mlx_array_new_bool", fn (val: bool) callconv(.c) mlx_array);
+    pub const mlx_vector_array_new = counted("mlx_vector_array_new", fn () callconv(.c) mlx_vector_array);
+    pub const mlx_vector_array_new_data = counted("mlx_vector_array_new_data", fn (data: [*]const mlx_array, size: usize) callconv(.c) mlx_vector_array);
+    pub const mlx_vector_array_new_value = counted("mlx_vector_array_new_value", fn (val: mlx_array) callconv(.c) mlx_vector_array);
+    pub const mlx_vector_array_free = counted("mlx_vector_array_free", fn (vec: mlx_vector_array) callconv(.c) c_int);
+    pub const mlx_vector_array_size = counted("mlx_vector_array_size", fn (vec: mlx_vector_array) callconv(.c) usize);
+    pub const mlx_vector_array_get = counted("mlx_vector_array_get", fn (res: *mlx_array, vec: mlx_vector_array, idx: usize) callconv(.c) c_int);
+    pub const mlx_vector_array_append_value = counted("mlx_vector_array_append_value", fn (vec: mlx_vector_array, val: mlx_array) callconv(.c) c_int);
+    pub const mlx_stream_free = counted("mlx_stream_free", fn (s: mlx_stream) callconv(.c) c_int);
+    pub const mlx_random_bits = counted("mlx_random_bits", fn (res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
+    pub const mlx_array_new_data_managed_payload = counted("mlx_array_new_data_managed_payload", fn (data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) mlx_array);
+    pub const mlx_async_eval = counted("mlx_async_eval", fn (outputs: mlx_vector_array) callconv(.c) c_int);
+    pub const mlx_synchronize = counted("mlx_synchronize", fn (s: mlx_stream) callconv(.c) c_int);
+    pub const mlx_matmul = counted("mlx_matmul", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
 };
 
 /// `name` of mlx-c with the engine's function of that name in front of it.
-fn routed(comptime name: [:0]const u8, comptime F: type) Routed(name, F).Fn {
-    return Routed(name, F).pick();
+fn routed(comptime name: [:0]const u8, comptime F: type) Spread(F, Routed(name, F).go).Fn {
+    return Spread(F, Routed(name, F).go).pick();
+}
+
+/// `name` of mlx-c, counted in `calls`.
+fn counted(comptime name: [:0]const u8, comptime F: type) Spread(F, Counted(name, F).go).Fn {
+    return Spread(F, Counted(name, F).go).pick();
+}
+
+/// Calls into mlx-c since the process started, from any thread (the gauge sampler and request threads call MLX
+/// beside the inference thread, hence atomic). A call the seam routes to the engine is not one.
+pub var calls: std.atomic.Value(u64) = .init(0);
+
+inline fn tally(comptime name: []const u8) void {
+    _ = calls.fetchAdd(1, .monotonic);
+    if (comptime builtin.is_test) by_name.add(name);
+}
+
+/// TEST-ONLY calls per entry point, to split a count by kind.
+const by_name = struct {
+    const capacity = 512;
+    var names: [capacity][]const u8 = undefined;
+    var counts: [capacity]u64 = @splat(0);
+    var used: usize = 0;
+    var busy: std.atomic.Value(bool) = .init(false);
+
+    fn add(name: []const u8) void {
+        while (busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer busy.store(false, .release);
+        for (names[0..used], counts[0..used]) |n, *c| {
+            if (std.mem.eql(u8, n, name)) {
+                c.* += 1;
+                return;
+            }
+        }
+        names[used] = name;
+        counts[used] = 1;
+        used += 1;
+    }
+};
+
+pub const NameCount = struct { name: []const u8, count: u64 };
+
+/// TEST-ONLY: the calls so far, per entry point.
+pub fn callsByName(out: *std.ArrayList(NameCount), gpa: std.mem.Allocator) !void {
+    while (by_name.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    defer by_name.busy.store(false, .release);
+    for (by_name.names[0..by_name.used], by_name.counts[0..by_name.used]) |n, c| try out.append(gpa, .{ .name = n, .count = c });
+}
+
+/// An address inside the mlx-c library, to find the files beside it. Naming a symbol is no call.
+pub fn libraryAnchor() *const anyopaque {
+    return @ptrCast(@extern(*const fn (*mlx_string) callconv(.c) c_int, .{ .name = "mlx_version" }));
+}
+
+/// The `_new()` of a handle that mlx-c makes as a zero `ctx` and allocates nothing for: no call into mlx-c.
+fn emptyHandle(comptime T: type) fn () T {
+    return struct {
+        fn f() T {
+            return .{};
+        }
+    }.f;
+}
+
+fn Counted(comptime name: [:0]const u8, comptime F: type) type {
+    return struct {
+        inline fn go(args: std.meta.ArgsTuple(F)) @typeInfo(F).@"fn".return_type.? {
+            tally(name);
+            return @call(.auto, @extern(*const F, .{ .name = name }), args);
+        }
+    };
 }
 
 fn Routed(comptime name: [:0]const u8, comptime F: type) type {
@@ -63,19 +133,19 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
     const R = info.return_type.?;
     return struct {
         const Args = std.meta.ArgsTuple(F);
-        const Fn = @TypeOf(pick());
 
         fn carriesStream() bool {
             for (P) |T| if (T == mlx_stream) return true;
             return false;
         }
 
+        const viaMlx = Counted(name, F).go;
+
         inline fn go(args: Args) R {
-            const direct = @extern(*const F, .{ .name = name });
             if (!engine.enabled) {
                 // A handle of the engine's can outlive the switch in a cache; MLX's free would read memory MLX never made.
                 if (comptime std.mem.eql(u8, name, "mlx_array_free")) if (engine.isOurs(args[0])) return engine.mlx_array_free(args[0]);
-                return @call(.auto, direct, args);
+                return viaMlx(args);
             }
             switch (engine.side(args)) {
                 .engine => {
@@ -101,9 +171,23 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
                         mlx_vector_array => if (R == c_int and engine.isVec(lent[i])) return engine.refuse(name, "a vector of the engine on an MLX stream"),
                         else => {},
                     };
-                    return @call(.auto, direct, lent);
+                    return viaMlx(lent);
                 },
             }
+        }
+    };
+}
+
+/// A function of F's parameters that hands them to `go` as a tuple.
+fn Spread(comptime F: type, comptime go: anytype) type {
+    const info = @typeInfo(F).@"fn";
+    const P = info.param_types;
+    const R = info.return_type.?;
+    return struct {
+        const Fn = @TypeOf(pick());
+
+        fn f0() R {
+            return go(.{});
         }
         fn f1(a: P[0].?) R {
             return go(.{a});
@@ -148,6 +232,7 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
             return go(.{ a, b, c, d, e, f, g, h, i, j });
         }
         fn pick() switch (P.len) {
+            0 => @TypeOf(f0),
             1 => @TypeOf(f1),
             2 => @TypeOf(f2),
             3 => @TypeOf(f3),
@@ -162,9 +247,10 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
             13 => @TypeOf(f13),
             14 => @TypeOf(f14),
             17 => @TypeOf(f17),
-            else => @compileError("routed: add an arity for " ++ name),
+            else => @compileError("add an arity of " ++ std.fmt.comptimePrint("{d}", .{P.len})),
         } {
             return switch (P.len) {
+                0 => f0,
                 1 => f1,
                 2 => f2,
                 3 => f3,
@@ -184,6 +270,7 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
         }
     };
 }
+
 pub const mlx_closure = extern struct { ctx: ?*anyopaque = null };
 
 // ── Enums ──
@@ -232,33 +319,33 @@ pub const mlx_optional_float = extern struct {
 };
 
 // ── Extern declarations ──
-pub extern "c" fn mlx_version(str: *mlx_string) c_int;
+pub const mlx_version = counted("mlx_version", fn (str: *mlx_string) callconv(.c) c_int);
 
 // String
-pub extern "c" fn mlx_string_new() mlx_string;
-pub extern "c" fn mlx_string_data(str: mlx_string) [*:0]const u8;
-pub extern "c" fn mlx_string_free(str: mlx_string) c_int;
+pub const mlx_string_new = emptyHandle(mlx_string);
+pub const mlx_string_data = counted("mlx_string_data", fn (str: mlx_string) callconv(.c) [*:0]const u8);
+pub const mlx_string_free = counted("mlx_string_free", fn (str: mlx_string) callconv(.c) c_int);
 
 // Device
-pub extern "c" fn mlx_device_new() mlx_device;
-pub extern "c" fn mlx_device_new_type(dtype: mlx_device_type, index: c_int) mlx_device;
-pub extern "c" fn mlx_device_free(dev: mlx_device) c_int;
-pub extern "c" fn mlx_get_default_device(dev: *mlx_device) c_int;
-pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
+pub const mlx_device_new = emptyHandle(mlx_device);
+pub const mlx_device_new_type = counted("mlx_device_new_type", fn (dtype: mlx_device_type, index: c_int) callconv(.c) mlx_device);
+pub const mlx_device_free = counted("mlx_device_free", fn (dev: mlx_device) callconv(.c) c_int);
+pub const mlx_get_default_device = counted("mlx_get_default_device", fn (dev: *mlx_device) callconv(.c) c_int);
+pub const mlx_set_default_device = counted("mlx_set_default_device", fn (dev: mlx_device) callconv(.c) c_int);
 
 // Stream
-pub extern "c" fn mlx_stream_new() mlx_stream;
-pub extern "c" fn mlx_stream_set(stream: *mlx_stream, src: mlx_stream) c_int;
-pub extern "c" fn mlx_stream_equal(lhs: mlx_stream, rhs: mlx_stream) bool;
-pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
+pub const mlx_stream_new = emptyHandle(mlx_stream);
+pub const mlx_stream_set = counted("mlx_stream_set", fn (stream: *mlx_stream, src: mlx_stream) callconv(.c) c_int);
+pub const mlx_stream_equal = counted("mlx_stream_equal", fn (lhs: mlx_stream, rhs: mlx_stream) callconv(.c) bool);
+pub const mlx_stream_new_device = counted("mlx_stream_new_device", fn (dev: mlx_device) callconv(.c) mlx_stream);
 pub fn mlx_stream_free(s: mlx_stream) c_int {
     if (engine.enabled and engine.isStream(s)) return 0;
     return raw.mlx_stream_free(s);
 }
-pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
-pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
-pub extern "c" fn mlx_stream_get_device(dev: *mlx_device, stream: mlx_stream) c_int;
-pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) c_int;
+pub const mlx_default_cpu_stream_new = counted("mlx_default_cpu_stream_new", fn () callconv(.c) mlx_stream);
+pub const mlx_default_gpu_stream_new = counted("mlx_default_gpu_stream_new", fn () callconv(.c) mlx_stream);
+pub const mlx_stream_get_device = counted("mlx_stream_get_device", fn (dev: *mlx_device, stream: mlx_stream) callconv(.c) c_int);
+pub const mlx_device_get_type = counted("mlx_device_get_type", fn (dtype: *mlx_device_type, dev: mlx_device) callconv(.c) c_int);
 
 /// True when the stream targets the GPU (custom Metal kernels require it).
 pub fn streamIsGpu(s: mlx_stream) bool {
@@ -276,11 +363,11 @@ pub fn mlx_synchronize(s: mlx_stream) c_int {
 }
 
 // Metal
-pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
+pub const mlx_metal_is_available = counted("mlx_metal_is_available", fn (res: *bool) callconv(.c) c_int);
 pub const _mlx_array_is_available = routed("_mlx_array_is_available", fn (res: *bool, arr: mlx_array) callconv(.c) c_int);
 
 // Array creation
-pub extern "c" fn mlx_array_new() mlx_array;
+pub const mlx_array_new = emptyHandle(mlx_array);
 pub fn mlx_array_new_int(val: c_int) mlx_array {
     return if (engine.active) engine.mlx_array_new_int(val) else raw.mlx_array_new_int(val);
 }
@@ -293,12 +380,12 @@ pub fn mlx_array_new_bool(val: bool) mlx_array {
 pub fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array {
     return if (engine.active) engine.mlx_array_new_data(data, shape, dim, dtype) else raw.mlx_array_new_data(data, shape, dim, dtype);
 }
-pub extern "c" fn mlx_array_new_data_managed(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
-pub extern "c" fn mlx_array_new_data_managed_payload(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
+pub const mlx_array_new_data_managed = counted("mlx_array_new_data_managed", fn (data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, dtor: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) mlx_array);
+pub const mlx_array_new_data_managed_payload = counted("mlx_array_new_data_managed_payload", fn (data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) mlx_array);
 /// The Metal buffer (`id<MTLBuffer>`, not retained) of an evaluated array and the byte offset of its data in it.
-pub extern "c" fn _mlx_array_metal_buffer(buffer: *?*anyopaque, offset: *usize, arr: mlx_array) c_int;
+pub const _mlx_array_metal_buffer = counted("_mlx_array_metal_buffer", fn (buffer: *?*anyopaque, offset: *usize, arr: mlx_array) callconv(.c) c_int);
 /// Whether this handle is the only holder of the array and of its buffer, as MLX asks before it writes in place.
-pub extern "c" fn _mlx_array_is_donatable(res: *bool, arr: mlx_array) c_int;
+pub const _mlx_array_is_donatable = counted("_mlx_array_is_donatable", fn (res: *bool, arr: mlx_array) callconv(.c) c_int);
 pub const mlx_array_free = routed("mlx_array_free", fn (arr: mlx_array) callconv(.c) c_int);
 pub fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int {
     if (engine.enabled and (engine.isOurs(src) or engine.isOurs(arr.*))) return engine.mlx_array_set(arr, src);
@@ -306,12 +393,12 @@ pub fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int {
 }
 
 // Array info
-pub extern "c" fn mlx_array_tostring(str: *mlx_string, arr: mlx_array) c_int;
+pub const mlx_array_tostring = counted("mlx_array_tostring", fn (str: *mlx_string, arr: mlx_array) callconv(.c) c_int);
 const array_info = struct {
-    extern "c" fn mlx_array_ndim(arr: mlx_array) usize;
-    extern "c" fn mlx_array_shape(arr: mlx_array) [*]const c_int;
-    extern "c" fn mlx_array_size(arr: mlx_array) usize;
-    extern "c" fn mlx_array_dtype(arr: mlx_array) mlx_dtype;
+    const mlx_array_ndim = counted("mlx_array_ndim", fn (arr: mlx_array) callconv(.c) usize);
+    const mlx_array_shape = counted("mlx_array_shape", fn (arr: mlx_array) callconv(.c) [*]const c_int);
+    const mlx_array_size = counted("mlx_array_size", fn (arr: mlx_array) callconv(.c) usize);
+    const mlx_array_dtype = counted("mlx_array_dtype", fn (arr: mlx_array) callconv(.c) mlx_dtype);
 };
 
 /// TEST-ONLY count of the array shape, size and dtype queries (each is an FFI call); a release build carries no counter.
@@ -389,41 +476,41 @@ pub fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_in
 
 // Graph utils (diagnostics)
 pub const mlx_node_namer = extern struct { ctx: ?*anyopaque = null };
-pub extern "c" fn mlx_node_namer_new() mlx_node_namer;
-pub extern "c" fn mlx_node_namer_free(namer: mlx_node_namer) c_int;
-pub extern "c" fn mlx_print_graph(os: *std.c.FILE, namer: mlx_node_namer, outputs: mlx_vector_array) c_int;
+pub const mlx_node_namer_new = counted("mlx_node_namer_new", fn () callconv(.c) mlx_node_namer);
+pub const mlx_node_namer_free = counted("mlx_node_namer_free", fn (namer: mlx_node_namer) callconv(.c) c_int);
+pub const mlx_print_graph = counted("mlx_print_graph", fn (os: *std.c.FILE, namer: mlx_node_namer, outputs: mlx_vector_array) callconv(.c) c_int);
 
 // Closure + compile
-pub extern "c" fn mlx_closure_new_func_payload(
+pub const mlx_closure_new_func_payload = counted("mlx_closure_new_func_payload", fn (
     fun: *const fn (*mlx_vector_array, mlx_vector_array, ?*anyopaque) callconv(.c) c_int,
     payload: ?*anyopaque,
     dtor: ?*const fn (?*anyopaque) callconv(.c) void,
-) mlx_closure;
-pub extern "c" fn mlx_closure_free(cls: mlx_closure) c_int;
-pub extern "c" fn mlx_closure_apply(res: *mlx_vector_array, cls: mlx_closure, input: mlx_vector_array) c_int;
-pub extern "c" fn mlx_compile(res: *mlx_closure, fun: mlx_closure, shapeless: bool) c_int;
-pub extern "c" fn mlx_detail_compile_clear_cache() c_int;
+) callconv(.c) mlx_closure);
+pub const mlx_closure_free = counted("mlx_closure_free", fn (cls: mlx_closure) callconv(.c) c_int);
+pub const mlx_closure_apply = counted("mlx_closure_apply", fn (res: *mlx_vector_array, cls: mlx_closure, input: mlx_vector_array) callconv(.c) c_int);
+pub const mlx_compile = counted("mlx_compile", fn (res: *mlx_closure, fun: mlx_closure, shapeless: bool) callconv(.c) c_int);
+pub const mlx_detail_compile_clear_cache = counted("mlx_detail_compile_clear_cache", fn () callconv(.c) c_int);
 
 // Map string -> array
-pub extern "c" fn mlx_map_string_to_array_new() mlx_map_string_to_array;
-pub extern "c" fn mlx_map_string_to_array_free(map: mlx_map_string_to_array) c_int;
-pub extern "c" fn mlx_map_string_to_array_get(value: *mlx_array, map: mlx_map_string_to_array, key: [*:0]const u8) c_int;
-pub extern "c" fn mlx_map_string_to_array_insert(map: mlx_map_string_to_array, key: [*:0]const u8, value: mlx_array) c_int;
+pub const mlx_map_string_to_array_new = counted("mlx_map_string_to_array_new", fn () callconv(.c) mlx_map_string_to_array);
+pub const mlx_map_string_to_array_free = counted("mlx_map_string_to_array_free", fn (map: mlx_map_string_to_array) callconv(.c) c_int);
+pub const mlx_map_string_to_array_get = counted("mlx_map_string_to_array_get", fn (value: *mlx_array, map: mlx_map_string_to_array, key: [*:0]const u8) callconv(.c) c_int);
+pub const mlx_map_string_to_array_insert = counted("mlx_map_string_to_array_insert", fn (map: mlx_map_string_to_array, key: [*:0]const u8, value: mlx_array) callconv(.c) c_int);
 
 // Map iterator
-pub extern "c" fn mlx_map_string_to_array_iterator_new(map: mlx_map_string_to_array) mlx_map_string_to_array_iterator;
-pub extern "c" fn mlx_map_string_to_array_iterator_free(it: mlx_map_string_to_array_iterator) c_int;
-pub extern "c" fn mlx_map_string_to_array_iterator_next(key: *?[*:0]const u8, value: *mlx_array, it: mlx_map_string_to_array_iterator) c_int;
+pub const mlx_map_string_to_array_iterator_new = counted("mlx_map_string_to_array_iterator_new", fn (map: mlx_map_string_to_array) callconv(.c) mlx_map_string_to_array_iterator);
+pub const mlx_map_string_to_array_iterator_free = counted("mlx_map_string_to_array_iterator_free", fn (it: mlx_map_string_to_array_iterator) callconv(.c) c_int);
+pub const mlx_map_string_to_array_iterator_next = counted("mlx_map_string_to_array_iterator_next", fn (key: *?[*:0]const u8, value: *mlx_array, it: mlx_map_string_to_array_iterator) callconv(.c) c_int);
 
 // Map string -> string
-pub extern "c" fn mlx_map_string_to_string_new() mlx_map_string_to_string;
-pub extern "c" fn mlx_map_string_to_string_free(map: mlx_map_string_to_string) c_int;
-pub extern "c" fn mlx_map_string_to_string_insert(map: mlx_map_string_to_string, key: [*:0]const u8, value: [*:0]const u8) c_int;
-pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_map_string_to_string, key: [*:0]const u8) c_int;
+pub const mlx_map_string_to_string_new = counted("mlx_map_string_to_string_new", fn () callconv(.c) mlx_map_string_to_string);
+pub const mlx_map_string_to_string_free = counted("mlx_map_string_to_string_free", fn (map: mlx_map_string_to_string) callconv(.c) c_int);
+pub const mlx_map_string_to_string_insert = counted("mlx_map_string_to_string_insert", fn (map: mlx_map_string_to_string, key: [*:0]const u8, value: [*:0]const u8) callconv(.c) c_int);
+pub const mlx_map_string_to_string_get = counted("mlx_map_string_to_string_get", fn (value: *[*:0]const u8, map: mlx_map_string_to_string, key: [*:0]const u8) callconv(.c) c_int);
 
 // IO
-pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
-pub extern "c" fn mlx_save_safetensors(file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) c_int;
+pub const mlx_load_safetensors = counted("mlx_load_safetensors", fn (res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_save_safetensors = counted("mlx_save_safetensors", fn (file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) callconv(.c) c_int);
 pub const mlx_io_reader = extern struct { ctx: ?*anyopaque = null };
 pub const mlx_io_vtable = extern struct {
     is_open: *const fn (?*anyopaque) callconv(.c) bool,
@@ -436,9 +523,9 @@ pub const mlx_io_vtable = extern struct {
     label: *const fn (?*anyopaque) callconv(.c) [*:0]const u8,
     free: *const fn (?*anyopaque) callconv(.c) void,
 };
-pub extern "c" fn mlx_io_reader_new(desc: ?*anyopaque, vtable: mlx_io_vtable) mlx_io_reader;
-pub extern "c" fn mlx_io_reader_free(io: mlx_io_reader) c_int;
-pub extern "c" fn mlx_load_safetensors_reader(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, in_stream: mlx_io_reader, s: mlx_stream) c_int;
+pub const mlx_io_reader_new = counted("mlx_io_reader_new", fn (desc: ?*anyopaque, vtable: mlx_io_vtable) callconv(.c) mlx_io_reader);
+pub const mlx_io_reader_free = counted("mlx_io_reader_free", fn (io: mlx_io_reader) callconv(.c) c_int);
+pub const mlx_load_safetensors_reader = counted("mlx_load_safetensors_reader", fn (res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, in_stream: mlx_io_reader, s: mlx_stream) callconv(.c) c_int);
 
 // ── Ops ──
 pub const mlx_add = routed("mlx_add", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
@@ -461,7 +548,7 @@ pub const mlx_sign = routed("mlx_sign", fn (res: *mlx_array, a: mlx_array, s: ml
 pub const mlx_real = routed("mlx_real", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
 pub const mlx_imag = routed("mlx_imag", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
 pub const mlx_arctan2 = routed("mlx_arctan2", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
-pub extern "c" fn mlx_array_new_complex(real_val: f32, imag_val: f32) mlx_array;
+pub const mlx_array_new_complex = counted("mlx_array_new_complex", fn (real_val: f32, imag_val: f32) callconv(.c) mlx_array);
 pub const mlx_minimum = routed("mlx_minimum", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
 pub const mlx_matmul = routed("mlx_matmul", fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int);
 pub const mlx_block_masked_mm = routed("mlx_block_masked_mm", fn (res: *mlx_array, a: mlx_array, b: mlx_array, block_size: c_int, mask_out: mlx_array, mask_lhs: mlx_array, mask_rhs: mlx_array, s: mlx_stream) callconv(.c) c_int);
@@ -600,11 +687,11 @@ pub const mlx_fast_scaled_dot_product_attention = routed("mlx_fast_scaled_dot_pr
 
 // ── Vector of strings (for custom metal kernels) ──
 pub const mlx_vector_string = extern struct { ctx: ?*anyopaque = null };
-pub extern "c" fn mlx_vector_string_new() mlx_vector_string;
-pub extern "c" fn mlx_vector_string_new_data(data: [*]const [*:0]const u8, size: usize) mlx_vector_string;
-pub extern "c" fn mlx_vector_string_free(vec: mlx_vector_string) c_int;
-pub extern "c" fn mlx_vector_string_size(vec: mlx_vector_string) usize;
-pub extern "c" fn mlx_vector_string_get(res: *[*:0]u8, vec: mlx_vector_string, idx: usize) c_int;
+pub const mlx_vector_string_new = counted("mlx_vector_string_new", fn () callconv(.c) mlx_vector_string);
+pub const mlx_vector_string_new_data = counted("mlx_vector_string_new_data", fn (data: [*]const [*:0]const u8, size: usize) callconv(.c) mlx_vector_string);
+pub const mlx_vector_string_free = counted("mlx_vector_string_free", fn (vec: mlx_vector_string) callconv(.c) c_int);
+pub const mlx_vector_string_size = counted("mlx_vector_string_size", fn (vec: mlx_vector_string) callconv(.c) usize);
+pub const mlx_vector_string_get = counted("mlx_vector_string_get", fn (res: *[*:0]u8, vec: mlx_vector_string, idx: usize) callconv(.c) c_int);
 
 // ── Custom Metal kernels ──
 pub const mlx_fast_metal_kernel_config = extern struct { ctx: ?*anyopaque = null };
@@ -654,7 +741,9 @@ pub fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_ker
     kernel_keys.configNote(cls, " {s}={d}", .{ name, value });
     return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_int(cls, name, value);
 }
-pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
+/// No kernel of the engine's serving takes a bool template arg, so this one notes nothing for the engine or the keys.
+pub const mlx_fast_metal_kernel_config_add_template_arg_bool = raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_bool;
+pub const mlx_fast_metal_kernel_config_set_verbose = counted("mlx_fast_metal_kernel_config_set_verbose", fn (cls: mlx_fast_metal_kernel_config, verbose: bool) callconv(.c) c_int);
 
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
 var raw_source_env: ?bool = null;
@@ -704,25 +793,26 @@ pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_met
 
 /// The custom-kernel entry points under the wrappers above, which note each kernel's library key.
 const raw_kernel = struct {
-    extern "c" fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config;
-    extern "c" fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int;
-    extern "c" fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
-    extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
-    extern "c" fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
-    extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
-    extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
-    extern "c" fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel;
-    extern "c" fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int;
-    extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int;
+    const mlx_fast_metal_kernel_config_new = counted("mlx_fast_metal_kernel_config_new", fn () callconv(.c) mlx_fast_metal_kernel_config);
+    const mlx_fast_metal_kernel_config_free = counted("mlx_fast_metal_kernel_config_free", fn (cls: mlx_fast_metal_kernel_config) callconv(.c) c_int);
+    const mlx_fast_metal_kernel_config_set_grid = counted("mlx_fast_metal_kernel_config_set_grid", fn (cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) callconv(.c) c_int);
+    const mlx_fast_metal_kernel_config_set_thread_group = counted("mlx_fast_metal_kernel_config_set_thread_group", fn (cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) callconv(.c) c_int);
+    const mlx_fast_metal_kernel_config_add_output_arg = counted("mlx_fast_metal_kernel_config_add_output_arg", fn (cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) callconv(.c) c_int);
+    const mlx_fast_metal_kernel_config_add_template_arg_dtype = counted("mlx_fast_metal_kernel_config_add_template_arg_dtype", fn (cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) callconv(.c) c_int);
+    const mlx_fast_metal_kernel_config_add_template_arg_int = counted("mlx_fast_metal_kernel_config_add_template_arg_int", fn (cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) callconv(.c) c_int);
+    const mlx_fast_metal_kernel_config_add_template_arg_bool = counted("mlx_fast_metal_kernel_config_add_template_arg_bool", fn (cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) callconv(.c) c_int);
+    const mlx_fast_metal_kernel_new = counted("mlx_fast_metal_kernel_new", fn (name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) callconv(.c) mlx_fast_metal_kernel);
+    const mlx_fast_metal_kernel_free = counted("mlx_fast_metal_kernel_free", fn (cls: mlx_fast_metal_kernel) callconv(.c) c_int);
+    const mlx_fast_metal_kernel_apply = counted("mlx_fast_metal_kernel_apply", fn (outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) callconv(.c) c_int);
 };
 
 // ── Random ──
 pub const mlx_random_categorical = routed("mlx_random_categorical", fn (res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
-pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
+pub const mlx_random_key = counted("mlx_random_key", fn (res: *mlx_array, seed: u64) callconv(.c) c_int);
 // Uniform noise — Kokoro's SineGen draws a random initial phase per harmonic.
 // Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
 pub const mlx_random_uniform = routed("mlx_random_uniform", fn (res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
-pub extern "c" fn mlx_random_seed(seed: u64) c_int;
+pub const mlx_random_seed = counted("mlx_random_seed", fn (seed: u64) callconv(.c) c_int);
 pub const mlx_random_bits = routed("mlx_random_bits", fn (res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
 // Uniform random integers in [low, high).
 pub const mlx_random_randint = routed("mlx_random_randint", fn (res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) callconv(.c) c_int);
@@ -748,29 +838,29 @@ pub fn mlx_async_eval(outputs: mlx_vector_array) c_int {
     return eval_raw.mlx_async_eval(outputs);
 }
 const eval_raw = struct {
-    extern "c" fn mlx_array_eval(arr: mlx_array) c_int;
-    extern "c" fn mlx_array_item_float32(res: *f32, arr: mlx_array) c_int;
-    extern "c" fn mlx_array_item_int32(res: *i32, arr: mlx_array) c_int;
-    extern "c" fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int;
-    extern "c" fn mlx_eval(outputs: mlx_vector_array) c_int;
-    extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
+    const mlx_array_eval = counted("mlx_array_eval", fn (arr: mlx_array) callconv(.c) c_int);
+    const mlx_array_item_float32 = counted("mlx_array_item_float32", fn (res: *f32, arr: mlx_array) callconv(.c) c_int);
+    const mlx_array_item_int32 = counted("mlx_array_item_int32", fn (res: *i32, arr: mlx_array) callconv(.c) c_int);
+    const mlx_array_item_bool = counted("mlx_array_item_bool", fn (res: *bool, arr: mlx_array) callconv(.c) c_int);
+    const mlx_eval = counted("mlx_eval", fn (outputs: mlx_vector_array) callconv(.c) c_int);
+    const mlx_async_eval = counted("mlx_async_eval", fn (outputs: mlx_vector_array) callconv(.c) c_int);
 };
 
 // ── Memory management ──
-pub extern "c" fn mlx_clear_cache() c_int;
-pub extern "c" fn mlx_set_memory_limit(res: *usize, limit: usize) c_int;
-pub extern "c" fn mlx_set_cache_limit(res: *usize, limit: usize) c_int;
-pub extern "c" fn mlx_set_wired_limit(res: *usize, limit: usize) c_int;
-pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;
-pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
-pub extern "c" fn mlx_get_peak_memory(res: *usize) c_int;
-pub extern "c" fn mlx_reset_peak_memory() c_int;
+pub const mlx_clear_cache = counted("mlx_clear_cache", fn () callconv(.c) c_int);
+pub const mlx_set_memory_limit = counted("mlx_set_memory_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
+pub const mlx_set_cache_limit = counted("mlx_set_cache_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
+pub const mlx_set_wired_limit = counted("mlx_set_wired_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
+pub const mlx_get_active_memory = counted("mlx_get_active_memory", fn (res: *usize) callconv(.c) c_int);
+pub const mlx_get_cache_memory = counted("mlx_get_cache_memory", fn (res: *usize) callconv(.c) c_int);
+pub const mlx_get_peak_memory = counted("mlx_get_peak_memory", fn (res: *usize) callconv(.c) c_int);
+pub const mlx_reset_peak_memory = counted("mlx_reset_peak_memory", fn () callconv(.c) c_int);
 // Patched in by patches/mlx-transient-cap.patch (not upstream MLX).
-pub extern "c" fn mlx_set_transient_limit(res: *usize, limit: usize) c_int;
-pub extern "c" fn mlx_get_external_memory(res: *usize) c_int;
+pub const mlx_set_transient_limit = counted("mlx_set_transient_limit", fn (res: *usize, limit: usize) callconv(.c) c_int);
+pub const mlx_get_external_memory = counted("mlx_get_external_memory", fn (res: *usize) callconv(.c) c_int);
 /// Command buffers committed since the process started: each costs host time in Metal's submit and completion queues.
-pub extern "c" fn mlx_metal_command_buffer_count(res: *usize) c_int;
-pub extern "c" fn mlx_metal_set_max_mb_per_buffer(prev: *c_int, mb: c_int) c_int;
+pub const mlx_metal_command_buffer_count = counted("mlx_metal_command_buffer_count", fn (res: *usize) callconv(.c) c_int);
+pub const mlx_metal_set_max_mb_per_buffer = counted("mlx_metal_set_max_mb_per_buffer", fn (prev: *c_int, mb: c_int) callconv(.c) c_int);
 
 /// A decode tick's command buffers commit on their op count alone. MLX also commits a buffer once the inputs of its
 /// ops pass a size budget, which bounds the memory a buffer keeps from being freed; at decode widths what passes it is
@@ -790,20 +880,20 @@ pub const DecodeBuffers = struct {
         _ = mlx_metal_set_max_mb_per_buffer(&lifted, self.budget_mb);
     }
 };
-pub extern "c" fn mlx_get_transient_peak(res: *usize) c_int;
-pub extern "c" fn mlx_reset_transient_peak() c_int;
+pub const mlx_get_transient_peak = counted("mlx_get_transient_peak", fn (res: *usize) callconv(.c) c_int);
+pub const mlx_reset_transient_peak = counted("mlx_reset_transient_peak", fn () callconv(.c) c_int);
 
 // ── Device info ──
 pub const mlx_device_info = extern struct { ctx: ?*anyopaque = null };
-pub extern "c" fn mlx_device_info_new() mlx_device_info;
-pub extern "c" fn mlx_device_info_get(info: *mlx_device_info, dev: mlx_device) c_int;
-pub extern "c" fn mlx_device_info_free(info: mlx_device_info) c_int;
-pub extern "c" fn mlx_device_info_get_size(res: *usize, info: mlx_device_info, key: [*:0]const u8) c_int;
-pub extern "c" fn mlx_device_info_get_string(res: *[*:0]const u8, info: mlx_device_info, key: [*:0]const u8) c_int;
+pub const mlx_device_info_new = emptyHandle(mlx_device_info);
+pub const mlx_device_info_get = counted("mlx_device_info_get", fn (info: *mlx_device_info, dev: mlx_device) callconv(.c) c_int);
+pub const mlx_device_info_free = counted("mlx_device_info_free", fn (info: mlx_device_info) callconv(.c) c_int);
+pub const mlx_device_info_get_size = counted("mlx_device_info_get_size", fn (res: *usize, info: mlx_device_info, key: [*:0]const u8) callconv(.c) c_int);
+pub const mlx_device_info_get_string = counted("mlx_device_info_get_string", fn (res: *[*:0]const u8, info: mlx_device_info, key: [*:0]const u8) callconv(.c) c_int);
 
 // ── Error handler ──
 pub const mlx_error_handler_func = ?*const fn ([*:0]const u8, ?*anyopaque) callconv(.c) void;
-pub extern "c" fn mlx_set_error_handler(handler: mlx_error_handler_func, data: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) void;
+pub const mlx_set_error_handler = counted("mlx_set_error_handler", fn (handler: mlx_error_handler_func, data: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) void);
 
 // ── Zig helper wrappers ──
 

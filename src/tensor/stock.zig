@@ -24,7 +24,7 @@ var pipelines: std.StringHashMapUnmanaged(metal.Pipeline) = .empty;
 /// `mlx.metallib` beside the MLX libraries this process loaded, as MLX finds it.
 pub fn metallibPath(buf: []u8) Error![:0]const u8 {
     var info: DlInfo = undefined;
-    if (dladdr(@ptrCast(&mlx.raw.mlx_array_new), &info) == 0) return error.MetalUnavailable;
+    if (dladdr(mlx.libraryAnchor(), &info) == 0) return error.MetalUnavailable;
     const binary = std.mem.span(info.fname orelse return error.MetalUnavailable);
     const dir = std.fs.path.dirname(binary) orelse return error.MetalUnavailable;
     return std.fmt.bufPrintSentinel(buf, "{s}/mlx.metallib", .{dir}, 0) catch return error.MetalUnavailable;

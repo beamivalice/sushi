@@ -3187,3 +3187,76 @@ test "dsv41 engine: a decode forward, a draft and a verify round of the same wid
     }
     try testing.expectEqual([3]u64{ 0, 0, 0 }, steady);
 }
+
+const CallKind = enum { config, query, read, eval, make, free, op };
+const call_kinds = @intFromEnum(CallKind.op) + 1;
+
+fn callKind(name: []const u8) CallKind {
+    const has = std.mem.startsWith;
+    if (has(u8, name, "mlx_fast_metal_kernel")) return .config;
+    for ([_][]const u8{ "mlx_array_data_", "mlx_array_item_" }) |p| if (has(u8, name, p)) return .read;
+    for ([_][]const u8{ "mlx_array_ndim", "mlx_array_shape", "mlx_array_size", "mlx_array_dtype", "mlx_array_strides", "mlx_array_itemsize", "_mlx_array_" }) |p| if (has(u8, name, p)) return .query;
+    if (std.mem.endsWith(u8, name, "_free")) return .free;
+    for ([_][]const u8{ "mlx_array_eval", "mlx_eval", "mlx_async_eval", "mlx_synchronize" }) |p| if (std.mem.eql(u8, name, p)) return .eval;
+    if (std.mem.indexOf(u8, name, "_new") != null) return .make;
+    return .op;
+}
+
+/// The calls into mlx-c made since `before`, by kind.
+fn callsSince(before: []const mlx.NameCount) ![call_kinds]u64 {
+    var now: std.ArrayList(mlx.NameCount) = .empty;
+    defer now.deinit(testing.allocator);
+    try mlx.callsByName(&now, testing.allocator);
+    var split: [call_kinds]u64 = @splat(0);
+    for (now.items) |n| {
+        var was: u64 = 0;
+        for (before) |b| if (std.mem.eql(u8, b.name, n.name)) {
+            was = b.count;
+        };
+        split[@intFromEnum(callKind(n.name))] += n.count - was;
+    }
+    return split;
+}
+
+const StepCalls = struct { total: u64, split: [call_kinds]u64 };
+
+/// The calls into MLX the `steps`-th one-row step makes after a prompt of 30 tokens, greedy: the step is the token
+/// array, the forward and the read of the argmax.
+fn stepCalls(fx: *EngineFixture, prompt: []const u32, steps: usize) !StepCalls {
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..30]));
+    var tok = prompt[30];
+    var last: StepCalls = undefined;
+    for (0..steps) |_| {
+        var before: std.ArrayList(mlx.NameCount) = .empty;
+        defer before.deinit(testing.allocator);
+        try mlx.callsByName(&before, testing.allocator);
+        const total = mlx.engine.mlxCalls();
+        const lg = try forwardIds(&fx.xfm, &ctx, &.{tok});
+        tok = try argmaxHost(&fx.xfm, lg);
+        _ = mlx.mlx_array_free(lg);
+        last = .{ .total = mlx.engine.mlxCalls() - total, .split = try callsSince(before.items) };
+    }
+    return last;
+}
+
+test "dsv41 engine: a one-row decode step in steady state makes a pinned number of calls into MLX (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    try testing.expect(fx.model().engine_decode);
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    // The first run fills the expert cache and the pools; the next two walk the same tokens and must agree.
+    _ = try stepCalls(&fx, prompt, 5);
+    const steady = try stepCalls(&fx, prompt, 5);
+    const again = try stepCalls(&fx, prompt, 5);
+    try testing.expectEqual(steady, again);
+    // The stage-by-stage target is zero: kernel configs, array queries, host reads, evals, makers, frees, other ops.
+    try testing.expectEqual([_]u64{ 856, 3857, 489, 2, 87, 658, 571 }, steady.split);
+    try testing.expectEqual(@as(u64, 6520), steady.total);
+}

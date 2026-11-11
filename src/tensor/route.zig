@@ -29,6 +29,11 @@ pub var active: bool = false;
 /// Ops that went to MLX while the engine is on: what a request still builds there.
 pub var mlx_ops: u64 = 0;
 
+/// Calls into mlx-c since the process started, whichever side asked (`mlx.calls`).
+pub fn mlxCalls() u64 {
+    return mlx.calls.load(.monotonic);
+}
+
 /// Whether kernels and their configs are noted for the engine as they are made. A module keeps both for the life of
 /// the process; a test process turns the engine on after other tests made theirs.
 pub fn noting() bool {
@@ -2334,4 +2339,75 @@ test "the sampler's filters on the engine's stream give MLX's densities: top-k, 
         try expectSame(Chain.of(0.8, 0, 1.0, false), &.{ input, mask });
         try expectSame(Chain.of(0.8, 40, 0.95, true), &.{ input, mask });
     }
+}
+
+test "a call into mlx-c raises the count by one through every kind of path, and a call the engine answers by none" {
+    try mlx.requireGpu();
+    const was = enabled;
+    defer enabled = was;
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    const values = [_]f32{ 1, 2, 3, 4 };
+    const a = hostArray(f32, &values, &.{4}, .float32);
+    defer _ = mlx.mlx_array_free(a);
+    var out: A = .{};
+    defer _ = mlx.raw.mlx_array_free(out);
+
+    // A routed op on an MLX stream, with the engine off and on.
+    for ([_]bool{ false, true }) |on| {
+        enabled = on;
+        const before = mlxCalls();
+        try mlx.check(mlx.mlx_add(&out, a, a, gpu));
+        try t_std.expectEqual(before + 1, mlxCalls());
+    }
+    enabled = false;
+
+    var before = mlxCalls();
+    try mlx.check(mlx.raw.mlx_array_eval(out));
+    try t_std.expectEqual(before + 1, mlxCalls());
+
+    // A declaration of mlx-c's own, a query of the array, a kernel config and a vector (which allocates).
+    var bytes: usize = 0;
+    before = mlxCalls();
+    try mlx.check(mlx.mlx_get_active_memory(&bytes));
+    try t_std.expectEqual(before + 1, mlxCalls());
+    before = mlxCalls();
+    _ = mlx.mlx_array_ndim(out);
+    try t_std.expectEqual(before + 1, mlxCalls());
+    before = mlxCalls();
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    try t_std.expectEqual(before + 1, mlxCalls());
+    before = mlxCalls();
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1, 1, 1));
+    try t_std.expectEqual(before + 1, mlxCalls());
+    before = mlxCalls();
+    _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try t_std.expectEqual(before + 1, mlxCalls());
+    before = mlxCalls();
+    const vec = mlx.mlx_vector_array_new();
+    _ = mlx.mlx_vector_array_free(vec);
+    try t_std.expectEqual(before + 2, mlxCalls());
+
+    // An empty handle is a zero `ctx` made here.
+    before = mlxCalls();
+    try t_std.expectEqual(@as(?*anyopaque, null), mlx.mlx_array_new().ctx);
+    try t_std.expectEqual(@as(?*anyopaque, null), mlx.mlx_stream_new().ctx);
+    try t_std.expectEqual(before, mlxCalls());
+
+    // The engine's stream: the same op, an eval and the free of a tensor of ours reach MLX not at all.
+    enabled = true;
+    active = true;
+    const ours = mlx.mlx_array_new_data(&values, &[_]c_int{4}, 1, .float32);
+    active = false;
+    try t_std.expect(isOurs(ours));
+    var mine: A = .{};
+    // Imports an earlier op retired are freed at the next sync, which is MLX's free then.
+    try core.sync();
+    before = mlxCalls();
+    try mlx.check(mlx.mlx_add(&mine, ours, ours, core.stream()));
+    try mlx.check(mlx.mlx_array_eval(mine));
+    try t_std.expect(isOurs(mine));
+    _ = mlx.mlx_array_free(mine);
+    _ = mlx.mlx_array_free(ours);
+    try t_std.expectEqual(before, mlxCalls());
 }
