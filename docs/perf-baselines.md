@@ -416,8 +416,10 @@ is the same on the three sides. About 160 of a request's 210 rounds are plain on
 
 - **Decode at long context: the engine ties on tok/s and spends 5 to 8% more GPU energy per token than patched MLX**
   (3 to 5 W more GPU power for the same tokens; against 1.6.0 more still at positions 3 and 4, where 1.6.0 fell to 51 W:
-  one load, not repeated). Its GPU is busy 94 to 95% of the decode wall. Recorded, not chased: watts read this way move
-  with the GPU clock and macOS's throttling, and 256 tokens a request is too few to separate watts from tok/s.
+  one load). Its GPU is busy 94 to 95% of the decode wall. A second load of each side an hour later read 1149 / 1094 /
+  1087 (1.6.0), 1179 / 1114 / 1103 (patched MLX) and 1184 / 1167 / 1156 (engine) GPU mJ/token at 47.8 to 49.0 tok/s: the
+  engine level at position 2 and 5% above patched MLX at 3 and 4. Recorded, not chased: watts read this way move with the
+  GPU clock and macOS's throttling, and 256 tokens a request is too few to separate watts from tok/s.
 - **Its CPU energy per token is 40% below patched MLX's and 65% below 1.6.0's.**
 - **Prefill is 6 to 7% faster on main at level GPU energy per prompt token, for 2.7 times less CPU** (108 CPU seconds
   against 296 to 302): a wide chunk's Engram rows are read without `F_RDADVISE` since `0d43d77d`.
