@@ -1427,6 +1427,12 @@ const EngineFixture = struct {
 
     /// `openAsking` with an expert cache of `cache_bytes`: a small one makes every forward read experts.
     fn openSized(self: *EngineFixture, dir: []const u8, ask: ?dsv41_config.MlxAsk, cache_bytes: u64) !void {
+        try self.prepare(dir, ask, cache_bytes);
+        try self.load(dir);
+    }
+
+    /// What the test reads before a load: the fixture's token ids and the pack's config, with the route chosen.
+    fn prepare(self: *EngineFixture, dir: []const u8, ask: ?dsv41_config.MlxAsk, cache_bytes: u64) !void {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const dsv41_model = @import("dsv41_model.zig");
@@ -1450,6 +1456,17 @@ const EngineFixture = struct {
         if (ask) |x| {
             self.config.dsv41.?.mlx_ask = x;
             dsv41_borrow.own_override = dsv41_borrow.decodeSideOf(&self.config.dsv41.?) == .engine;
+        }
+    }
+
+    /// The load itself: the weights and the model over them.
+    fn load(self: *EngineFixture, dir: []const u8) !void {
+        const a = testing.allocator;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        errdefer {
+            self.config.deinit(a);
+            a.free(self.ids);
+            self.restore();
         }
         self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, false);
         errdefer self.weights.deinit();
@@ -1740,9 +1757,11 @@ fn censusOf(dir: []const u8) ![9]Asked {
         try first.open(dir);
         first.deinit();
     }
+    // The fixture's own reads (its token ids, the config) are the test's, not the load's.
+    try fx.prepare(dir, null, 64 << 20);
     var c = try Census.begin(null);
     errdefer c.names.deinit(a);
-    try fx.open(dir);
+    try fx.load(dir);
     var open = true;
     defer if (open) fx.deinit();
     asked[8] = try c.end("the load");
@@ -1827,7 +1846,8 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const asked = try censusOf(dir);
     // The target of every row is { 0, 0 }, and every phase of a request is there: no call at all. A load is left the
-    // host arrays its warm makes outside a forward's scope and a few conversions.
+    // shared trunk shell's six scalar constants (made, cast and, at the unload, freed on MLX's stream) and one touch
+    // of MLX's queue.
     // Ops are exact. Calls are a ceiling a phase stays under and within a twentieth of, so a real cut moves it.
     const ceilings = [_]Asked{
         .{ .calls = 0, .ops = 0 }, // greedy rounds: a 40-row prefill and 12 tokens
@@ -1838,7 +1858,7 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
         .{ .calls = 0, .ops = 0 }, // a step on the restored state
         .{ .calls = 0, .ops = 0 }, // an image prompt
         .{ .calls = 7, .ops = 0 }, // the unload
-        .{ .calls = 684, .ops = 6 }, // the load
+        .{ .calls = 25, .ops = 6 }, // the load
     };
     for (ceilings, asked) |ceiling, got| {
         try testing.expectEqual(ceiling.ops, got.ops);
@@ -1942,6 +1962,38 @@ test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and res
         }
     }
     for (asked) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
+}
+
+test "dsv41 engine: a forward's scope and a sampled draw give the engine's scope back as they found it (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const dsv41_model = @import("dsv41_model.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    const s = mlx.engine.stream();
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_zeros(&logits, &[_]c_int{ 1, 2, @intCast(m.cfg.vocab) }, 3, .float32, s));
+    const sampling: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .draw_root = 3 };
+
+    // Outside any scope they leave none behind; inside one, whoever opened it still has it.
+    for ([_]bool{ false, true }) |outer| {
+        const host = mlx.engine.enter(if (outer) s else fx.xfm.s);
+        defer host.end();
+        try testing.expectEqual(outer, mlx.engine.active);
+        const was = dsv41_model.ownBegin(m);
+        const again = dsv41_model.ownBegin(m);
+        try testing.expect(mlx.engine.active);
+        dsv41_model.ownEnd(m, again);
+        try testing.expect(mlx.engine.active);
+        dsv41_model.ownEnd(m, was);
+        try testing.expectEqual(outer, mlx.engine.active);
+        _ = mlx.mlx_array_free(try dsv41_serving.sampledDraws(sampling, logits, 2, s));
+        try testing.expectEqual(outer, mlx.engine.active);
+    }
 }
 
 test "dsv41 engine: a Cooler load answers the fused hyper-connection kernel's probe as the MLX route does: the probe runs on the engine's stream (DSV41_STQ_TINY)" {

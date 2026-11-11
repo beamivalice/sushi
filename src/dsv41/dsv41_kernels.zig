@@ -4228,3 +4228,23 @@ test "dsv41 kernels: a new row count, pick count, split count or context width c
         }
     }
 }
+
+test "a scope on the engine's stream makes its scalars and host arrays there, outside any forward" {
+    try mlx.requireGpu();
+    const t = testing;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    var on_mlx = Scope.plain(t.allocator, mlx.gpuStream());
+    defer on_mlx.deinit();
+    try t.expect(!mlx.engine.isOurs(try on_mlx.f(1.5)));
+
+    var sc = Scope.plain(t.allocator, mlx.engine.stream());
+    defer sc.deinit();
+    const calls = mlx.engine.mlxCalls();
+    const made = [_]A{ try sc.f(1.5), try sc.i(3), try sc.ints(&.{ 1, 2, 3 }, &.{ 1, 3 }), try sc.floats(&.{ 0.5, 0.25 }, &.{2}) };
+    try t.expectEqual(calls, mlx.engine.mlxCalls());
+    for (made) |x| try t.expect(mlx.engine.isOurs(x));
+    try t.expectEqual(@as(f32, 0.25), (try sc_mod.hostF32(made[3]))[1]);
+    try t.expect(!mlx.engine.active);
+}

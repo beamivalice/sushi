@@ -61,16 +61,14 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     // The load drops each tensor from the map once its arrays are bound.
     mlx.engine.own_weights = own_load;
     defer mlx.engine.own_weights = false;
-    if (own_load) mlx.engine.active = true;
-    const mdl = dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, if (own_load) mlx.engine.stream() else s, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop }) catch |e| {
-        if (own_load) mlx.engine.active = false;
-        return e;
+    const model_stream = if (own_load) mlx.engine.stream() else s;
+    const mdl = blk: {
+        const host = mlx.engine.enter(model_stream);
+        defer host.end();
+        break :blk try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
     };
     errdefer mdl.deinit();
-    if (own_load) {
-        mlx.engine.active = false;
-        mdl.s = s;
-    }
+    if (own_load) mdl.s = s;
     dsv41_model.logMemory(mdl);
     mdl.engine_decode = own_decode;
     const side: dsv41_borrow.DecodeSide = if (own_decode) .engine else dsv41_borrow.decodeSideOf(&config.dsv41.?);
@@ -255,7 +253,10 @@ pub fn warmWide(self: *Trunk, m: *dsv41_model.Model, stq: ?*dsv41_stream.StqStre
         var ctx = self.defaultCtx();
         for (chunks, 0..) |w, i| {
             ctx.ahead_min_rows = if (i + 1 < chunks.len) chunks[i + 1] else 0;
+            // The chunk's token ids, on the side the forward runs on as a request's are.
+            const host = mlx.engine.enter(self.outStream());
             const arr = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(w) }, 2, .int32);
+            host.end();
             defer _ = mlx.mlx_array_free(arr);
             const out = try forwardDsv41With(self, &ctx, arr, m);
             defer _ = mlx.mlx_array_free(out);
@@ -276,11 +277,8 @@ fn planFits(plan: []const usize, width: usize) bool {
 /// is active, and a row's key is `random.drawKey(sampling.draw_root, position)`, the request's seed or its OS-given
 /// root, and MLX is not asked for a key or bits. On MLX's stream the sampler keys by `sampling.seed`.
 pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
-    const own = mlx.engine.isStream(s);
-    if (own) mlx.engine.active = true;
-    defer if (own) {
-        mlx.engine.active = false;
-    };
+    const host = mlx.engine.enter(s);
+    defer host.end();
     var draws: [dsv41_config.ring_slack]mlx.mlx_array = undefined;
     if (rows > draws.len) return error.SpecDecodeUnsupported;
     const probs = try sampler.probsAllPositions(logits, sampling, s);
@@ -301,7 +299,7 @@ pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, row
         try mlx.check(mlx.mlx_slice(&row, rows2d, &.{ at, 0 }, 2, &.{ at + 1, vocab }, 2, &.{ 1, 1 }, 2, s));
         var keyed = sampling;
         keyed.draw +%= j;
-        draws[built] = if (own) try engineDraw(row, random.drawKey(sampling.draw_root orelse return error.EngineDrawNeedsRoot, keyed.draw), s) else try sampler.sampleFromProbsLazy(row, keyed, s);
+        draws[built] = if (host.own) try engineDraw(row, random.drawKey(sampling.draw_root orelse return error.EngineDrawNeedsRoot, keyed.draw), s) else try sampler.sampleFromProbsLazy(row, keyed, s);
         built += 1;
         _ = mlx.mlx_vector_array_append_value(vec, draws[j]);
     }

@@ -750,6 +750,9 @@ pub const Model = struct {
     /// Decode forwards (one row, DSpark draft, verify rows) run on the engine of our own (`src/tensor`), not on MLX:
     /// `dsv41_borrow.ownDecode` at the load.
     engine_decode: bool = false,
+    /// `ownBegin`s open on this model, and whether the engine's scope was open before the first of them.
+    own_depth: u32 = 0,
+    own_found_active: bool = false,
     /// Prefill chunks wider than a verify block run there too: set with `engine_decode` at the load.
     engine_prefill: bool = false,
     /// When MLX's queue last ran work that `dsv41_serving.keepMlxQueue` knows of (`engine.nowNs`).
@@ -2977,12 +2980,16 @@ fn warmOwnBlocks(m: *Model, t1: u32) !void {
 pub fn ownBegin(m: *Model) S {
     const was = m.s;
     m.s = mlx.engine.stream();
+    if (m.own_depth == 0) m.own_found_active = mlx.engine.active;
+    m.own_depth += 1;
     mlx.engine.active = true;
     return was;
 }
 
+/// The outermost `ownEnd` gives the engine's scope back as the first `ownBegin` found it.
 pub fn ownEnd(m: *Model, was: S) void {
-    mlx.engine.active = false;
+    m.own_depth -= 1;
+    if (m.own_depth == 0) mlx.engine.active = m.own_found_active;
     m.s = was;
 }
 

@@ -102,8 +102,12 @@ pub const Scope = struct {
         return sc.op2(mlx.mlx_greater_equal, x, y);
     }
 
+    // A scalar or a host array has no stream of its own: it is made on the side of the scope's.
+
     /// An f32 scalar: it promotes bf16 operands, so use `fl` where the operand's dtype must survive.
     pub fn f(sc: *Scope, v: f32) !A {
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
         return sc.keep(mlx.mlx_array_new_float(v));
     }
     /// A scalar of `dt`.
@@ -111,12 +115,18 @@ pub const Scope = struct {
         return sc.astype(try sc.f(v), dt);
     }
     pub fn i(sc: *Scope, v: i32) !A {
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
         return sc.keep(mlx.mlx_array_new_int(v));
     }
     pub fn ints(sc: *Scope, data: []const i32, shape: []const c_int) !A {
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
         return sc.keep(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .int32));
     }
     pub fn floats(sc: *Scope, data: []const f32, shape: []const c_int) !A {
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
         return sc.keep(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32));
     }
 

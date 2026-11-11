@@ -192,10 +192,8 @@ pub const StqStream = struct {
         // The slab views above are MLX's; the chain is the engine's when it is to serve the chunk.
         var sc = Scope.plain(engine.allocator, if (on_engine) mlx.engine.stream() else engine.s);
         defer sc.deinit();
-        if (on_engine) mlx.engine.active = true;
-        defer if (on_engine) {
-            mlx.engine.active = false;
-        };
+        const host = mlx.engine.enter(sc.s);
+        defer host.end();
         const k: usize = self.cfg.top_k;
         const ids = try engine.allocator.alloc(i32, rows * k);
         defer engine.allocator.free(ids);

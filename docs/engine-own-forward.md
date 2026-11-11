@@ -156,6 +156,8 @@ route and the MLX arm still build the bank at prepare time.
   on MLX it was imported once a round, a vocabulary of bools each time). A model that forwards on the engine asks MLX
   for no pool clear either (`generate.clearPool`). The free of an empty handle is no call (`mlx_array_free` in the
   seam): mlx-c holds nothing for one.
+  The load itself (the weights and the model over them, not the fixture's own reads) makes 25 calls: the shared trunk
+  shell's six scalar constants, cast on MLX's stream, and one touch of MLX's queue.
   A phase's ops are exact. Its calls are held under a ceiling and within a twentieth of it, so a real cut moves the
   ceiling. The census counts a load that is not the process's first (it opens and closes the pack once before): what
   a process asks once (the device's description, a kernel probe) is its first load's, and with that kept out a row
@@ -298,6 +300,11 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   are made the same way, after the model's warm left its cap (`dsv41_vision.lin`). State read back from the SSD tier
   has no sizes to name ahead: the cap is lifted for the read and the install and comes back raised by the buffers
   that came into use (`core.uncapped`, `core.capped`).
+- **A scope of the engine's is given back as it was found.** `engine.enter(s)` and `Scope.end` nest; a hand-set
+  `active = false` at the end of a callee closed its caller's scope, and every host array the caller made after it
+  was MLX's (the wide warm's token arrays, a prefill chunk's scalars). A forward's scope counts its depth on the model
+  (`ownBegin`, `ownEnd`), and DeepSeek's `Scope` makes a scalar or a host array on the side of its own stream,
+  whether or not a forward is open.
 - **Maps are the engine's inside its scope** (`route.zig`: names to arrays, names to strings, the iterator): a map
   made under `engine.enter` is tagged like a vector, every call that takes one follows it, and a name it lacks
   answers 2 with no error latched, as mlx-c does. The SSD tier's readers hand tensors around in them.
