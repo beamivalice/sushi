@@ -148,7 +148,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   instead fills every pool of every layer with its most used experts, the most used last so they leave the LRU last
   (`rankedWarm`). DeepSeek STQ 1.75bpw, `--no-mtp` serial, reqC (5.4k prompt) twice after the warm request: the first
   600 tokens rebuilt 2062 layers before and 1106 after, 43.4 -> 46.5 tok/s (80% of each pool by usage: 1315 rebuilds,
-  45.6); the second pass, with no misses, is 50.2 either way. Greedy text byte-identical.
+  45.6); the second pass, with no misses, is 50.2 either way. Greedy text byte-identical. The `cache warm complete` line's `slots=` is what the warm filled: every slot ranked by usage, 80% by lowest id.
 
 <a id="rate-groups"></a>
 ## Rate groups under streaming (Flash-Next)

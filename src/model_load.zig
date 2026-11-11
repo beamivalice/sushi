@@ -2295,9 +2295,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     if (xfm_ptr.expert_stream) |engine| warm: {
         if (engine.plan.resident) break :warm;
-        const slots = engine.warmSlotsPerLayer();
         const layers = expert_stream_mod.moeLayerCount(engine.geometry);
         const ranked = engine.warm_usage != null;
+        const slots = expert_stream_mod.warmedSlots(engine.plan.slots_per_layer, ranked);
         const bytes = if (ranked) engine.plan.cache_bytes else @as(u64, slots) * layers * engine.plan.expert_bytes;
         log.info("[expert-stream] cache warm: preloading {d:.3} GB ({s})\n", .{ @as(f64, @floatFromInt(bytes)) / 1e9, if (ranked) "every pool, most used experts first" else "80% of cache slots, lowest expert IDs" });
         const start = std.Io.Timestamp.now(sch.io, .awake);

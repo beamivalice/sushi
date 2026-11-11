@@ -65,6 +65,11 @@ fn warmSlotCount(slots_per_layer: u16) u16 {
     return @intCast((@as(u32, slots_per_layer) * 4) / 5);
 }
 
+/// The slots per layer the load's warm fills: a usage-ranked warm fills every pool to its slots, the lowest-id one 80%.
+pub fn warmedSlots(slots_per_layer: u16, ranked: bool) u16 {
+    return if (ranked) slots_per_layer else warmSlotCount(slots_per_layer);
+}
+
 /// Native MXFP4 bytes per expert: two U32-packed gate/up weights, one U32
 /// down weight, and their U8 e8m0 scale banks. Bias slots are absent.
 pub fn mxfp4ExpertBytes(hidden: u32, intermediate: u32) !u64 {
@@ -4314,6 +4319,13 @@ const TinyLayersEngine = struct {
         self.tmp.cleanup();
     }
 };
+
+test "the warm line reports the slots it filled: all of them ranked by usage, 80 percent by lowest id" {
+    const t = std.testing;
+    try t.expectEqual(@as(u16, 262), warmedSlots(262, true));
+    try t.expectEqual(@as(u16, 209), warmedSlots(262, false));
+    try t.expectEqual(@as(u16, 0), warmedSlots(0, true));
+}
 
 test "expert stream warm cache floors 80 percent, including zero and one slot" {
     const t = std.testing;
