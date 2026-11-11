@@ -1,6 +1,7 @@
 //! DeepSeek-V4.1's own terms of the bill: the compressed state, the restore points and the forward cap.
 const std = @import("std");
 const settings_resolve = @import("../settings_resolve.zig");
+const mlx = @import("../mlx.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
@@ -91,8 +92,16 @@ pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pin
 
 /// `dsv41_borrow.headroom_fn`: what admission reads as available, live.
 pub fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
-    const active_mem: usize = gpu_mem.activeBytes();
-    return dsv41HeadroomOf(bills.admissionAvailable(bills.currentGpuMemoryCeiling(config, active_mem), active_mem), config);
+    const active_mem: u64 = gpu_mem.activeBytes();
+    const engine_held = mlx.engine.stats().pool_bytes;
+    return dsv41HeadroomFrom(bills.currentGpuMemoryCeiling(config, active_mem +| engine_held), active_mem, engine_held, config);
+}
+
+/// PURE: `dsv41HeadroomOf` over the readings. MLX's active bytes do not see the engine of our own: its pool (tensors in
+/// use and free buffers, `Stats.pool_bytes`) is Metal memory beside MLX's. A tensor lent to MLX is a second buffer over
+/// the same pages that MLX counts too, so it is counted twice here: the headroom errs low, never high.
+pub fn dsv41HeadroomFrom(ceiling: u64, mlx_active: u64, engine_held: u64, config: *const model_mod.ModelConfig) u64 {
+    return dsv41HeadroomOf(bills.admissionAvailable(ceiling, mlx_active +| engine_held), config);
 }
 
 /// The decode pool the ledger parks in MLX's cache is no part of its active bytes, so every live check (decode and
