@@ -397,6 +397,31 @@ position**; the cells are the mean of sampled positions 2 to 4 and of greedy pos
   loads of four, 71 plain steps at 55.5 tok/s and 1158 to 1173 mJ/token (the DSpark stop switch judging against a stale
   one-row price).
 
+**At 122k of context** (the same three decode sides, the engine at `356fc5b5`; one load each, boot 49 °C, end 94 to 96 °C).
+One prose prompt of 122,199 tokens (the first 527,954 bytes of the release bench's prose source), completions API,
+temperature 0, 256 tokens, four times: position 1 prefills, positions 2 to 4 restore the prompt and decode. The greedy text
+is the same on the three sides. About 160 of a request's 210 rounds are plain one-row steps on every side.
+
+| side | prefill tok/s | prefill GPU mJ / prompt token | prefill CPU s | prefill CPU mJ / prompt token |
+|---|---:|---:|---:|---:|
+| v1.6.0 release | 1253 | 44.6 | 302 | 5.6 |
+| patched MLX | 1266 | 44.3 | 296 | 5.8 |
+| engine | 1341 | 45.1 | 108 | 3.4 |
+
+| side | decode tok/s, positions 2 / 3 / 4 | GPU W | GPU mJ/token | server CPU mJ/token | system W |
+|---|---:|---:|---:|---:|---:|
+| v1.6.0 release | 48.1 / 48.9 / 48.3 | 57.7 / 50.7 / 51.5 | 1199 / 1036 / 1065 | 55.5 / 50.0 / 50.3 | 138 / 117 / 117 |
+| patched MLX | 48.9 / 48.1 / 48.8 | 57.4 / 55.1 / 55.0 | 1174 / 1146 / 1126 | 30.0 / 30.0 / 28.2 | 136 / 120 / 119 |
+| engine | 49.3 / 49.2 / 48.6 | 60.7 / 59.9 / 59.0 | 1232 / 1217 / 1215 | 18.7 / 18.2 / 17.5 | 127 / 128 / 124 |
+
+- **Decode at long context: the engine ties on tok/s and spends 5 to 8% more GPU energy per token than patched MLX**
+  (3 to 5 W more GPU power for the same tokens; against 1.6.0 more still at positions 3 and 4, where 1.6.0 fell to 51 W:
+  one load, not repeated). Its GPU is busy 94 to 95% of the decode wall. This is the open tuning target.
+- **Its CPU energy per token is 40% below patched MLX's and 65% below 1.6.0's.**
+- **Prefill is 6 to 7% faster on main at level GPU energy per prompt token, for 2.7 times less CPU** (108 CPU seconds
+  against 296 to 302): a wide chunk's Engram rows are read without `F_RDADVISE` since `0d43d77d`.
+- The decode right after the prefill (position 1): 39.3, 39.7 and 47.2 tok/s at 1399, 1404 and 1298 GPU mJ/token.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.
