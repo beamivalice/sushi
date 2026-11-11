@@ -1847,12 +1847,28 @@ test "dsv41 engine: what a Cooler request still asks of MLX, phase by phase, pin
         .{ .calls = 39478, .ops = 0 }, // an image prompt
         .{ .calls = 4373, .ops = 0 }, // the unload
     }, asked[0..8]);
-    // The load: a process's first makes some 800 calls more than a later one (what the process keeps), so its calls
-    // are held under the first load's count and within 2000 of it; a real cut moves the ceiling.
-    const load_ceiling = 476279;
-    try testing.expectEqual(@as(u64, 3054), asked[8].ops);
+    // The load: a process's first makes some 2000 calls more than a later one (what the process keeps), so its calls
+    // are held under the first load's count and within 5000 of it; a real cut moves the ceiling.
+    const load_ceiling = 444974;
+    try testing.expectEqual(@as(u64, 1154), asked[8].ops);
     try testing.expect(asked[8].calls <= load_ceiling);
-    try testing.expect(asked[8].calls + 2000 > load_ceiling);
+    try testing.expect(asked[8].calls + 5000 > load_ceiling);
+}
+
+test "dsv41 engine: a Cooler load runs no forward on MLX: its warm leaves MLX the load's own few kernel launches (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var before: std.ArrayList(mlx.NameCount) = .empty;
+    defer before.deinit(testing.allocator);
+    try mlx.callsByName(&before, testing.allocator);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    try testing.expect(fx.model().engine_prefill);
+    // What is left is the load's own: probes of the GPU and conversions, some made once a process. Three prefill
+    // chunks on MLX launched 900 more.
+    try testing.expect(try namedSince(before.items, "mlx_fast_metal_kernel_apply") <= 15);
 }
 
 test "dsv41 engine: a prefill forward of 2 to 16 rows gives MLX's logits and the steps after it MLX's bytes (DSV41_STQ_TINY)" {

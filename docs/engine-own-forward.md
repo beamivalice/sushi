@@ -144,8 +144,11 @@ route and the MLX arm still build the bank at prepare time.
   restored, a step after it, an image prompt, the unload). A change that adds a call fails it; a stage of the move off
   MLX lowers a row; the target of every row is zero. `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry
   point. Outside a capture a request puts no op on MLX: its calls are the engine importing arrays MLX owns.
-  The request rows are exact. The load's calls depend on what the process already made (a first load makes some 800
-  more than a later one), so the load is held under a ceiling and within 2000 of it.
+  The request rows are exact. The load's calls depend on what the process already made (a first load makes some
+  2000 more than a later one), so the load is held under a ceiling and within 5000 of it.
+- **A Cooler load runs no forward on MLX.** The load's warm used to run three prefill chunks through MLX whatever
+  the decode side; they only built the state the engine's own warms start from. Where prefill is the engine's they
+  run on the engine, and with the pipelines read from a manifest they do not run at all.
 
 ## Crossing between the two
 

@@ -2880,10 +2880,18 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
     var wide: [256]u32 = undefined;
     for (&wide, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % m.cfg.vocab);
     const n = @min(wide.len, m.cfg.max_pos / 4);
-    try warmRun(try extend(m, wide[0..n], .last));
-    try warmRun(try extend(m, wide[0 .. n / 6], .last));
-    // The held-back span a prompt's last forward runs (`prefill_plan.ssmSnapshotBackoff` + its last token).
-    try warmRun(try extend(m, wide[0 .. @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1], .last));
+    // Where prefill is the engine's, MLX runs no forward at all: with the engine's pipelines read from a manifest there
+    // is nothing left to warm, and without one these chunks run on the engine and leave the state its other warms
+    // start from.
+    if (m.engine_prefill and scope == .mlx) return;
+    // The last is the held-back span a prompt's last forward runs (`prefill_plan.ssmSnapshotBackoff` + its last token).
+    for ([_]usize{ n, n / 6, @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1 }) |w| {
+        const was = if (m.engine_prefill) ownBegin(m) else m.s;
+        warmBudget(m, w);
+        const chunk = extend(m, wide[0..w], .last);
+        if (m.engine_prefill) ownEnd(m, was);
+        try warmRun(try chunk);
+    }
     if (!m.engine_decode) {
         for ([_]usize{ 1, 6 }) |w| try warmRun(try extend(m, ids[0..w], .last));
         if (m.dspark != null) try warmRound(m, ids[0], m.cfg.dspark.block + 1);
