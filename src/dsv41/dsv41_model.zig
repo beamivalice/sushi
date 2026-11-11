@@ -2864,8 +2864,7 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
     defer resetState(m);
     var ids: [exl3.kernels.DECODE_ROWS_MAX]u32 = undefined;
     for (&ids, 0..) |*t, i| t.* = @intCast(i % m.cfg.vocab);
-    // With decode on the engine, MLX runs no forward of 16 rows or fewer (but one that splices image rows, which no
-    // warm covers), so only the engine's decode widths are warmed.
+    // With decode on the engine, MLX runs no forward, so only the engine's decode widths are warmed.
     if (!m.engine_decode) {
         // The first steps hold one compressed row a layer: an input under 8 elements binds as another library.
         for ([_]usize{ 1, 1, 2 }) |w| try warmRun(try extend(m, ids[0..w], .last));
@@ -2894,6 +2893,7 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
         try warmOwnFills(m, ids[0]);
         try warmOwnBlocks(m, ids[0]);
         try warmOwnLong(m, ids[0]);
+        try warmOwnImages(m);
     }
 }
 
@@ -3000,6 +3000,32 @@ fn warmRound(m: *Model, t1: u32, w: usize) !void {
     for (round[1..w], 0..) |*id, i| id.* = d.ids[@min(i, d.ids.len - 1)];
     try warmRun(try verify(m, round[0..w]));
     try finishVerify(m, w - 1);
+}
+
+/// The engine's pipelines of a forward that splices image rows (the splice, a routing bias read row by row, the
+/// Engram write's row mask): every decode width, where a row kernel carries its row count, and a prefill width. A
+/// load without the image bias takes no image and warms nothing.
+pub fn warmOwnImages(m: *Model) !void {
+    const c = &m.cfg;
+    if (!m.engine_decode or c.image_token_id == 0) return;
+    for (m.layers[0..c.layers]) |*ly| if (ly.gate_bias_vl.ctx == null) return;
+    resetState(m);
+    defer resetState(m);
+    const was = ownBegin(m);
+    defer ownEnd(m, was);
+    var ids: [64]u32 = @splat(c.image_token_id);
+    const wide = @min(ids.len, c.max_pos / 4);
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_zeros(&rows, &[_]c_int{ ci(wide), ci(c.dim) }, 2, m.act, m.s));
+    for (1..exl3.kernels.DECODE_ROWS_MAX + 1) |w| {
+        warmBudget(m, w);
+        try warmRun(try extendVision(m, ids[0..w], .last, SPAN, .{ .rows = rows, .offset = 0 }));
+    }
+    // A chunk whose first rows are text: the splice picks between the two.
+    ids[0] = 0;
+    warmBudget(m, wide);
+    try warmRun(try extendVision(m, ids[0..wide], .last, SPAN, .{ .rows = rows, .offset = 0 }));
 }
 
 /// While the load's warm runs, the engine budget a request's forward of `rows` at the state's position has.

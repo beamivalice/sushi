@@ -1563,6 +1563,137 @@ test "dsv41 engine: the same greedy tokens come from a load with Sushi Cooler on
     try testing.expectEqualSlices(u8, bytes[0].items, bytes[2].items);
 }
 
+/// A prompt of 40 rows whose rows 5 to 14 are image tokens that take `rows`, fed in chunks ending at `cuts`, then
+/// `steps` greedy one-row steps: the bytes of every forward's logits. With `quiet`, MLX's keep-warm touch is held off.
+fn imagePromptBytes(a: std.mem.Allocator, fx: *EngineFixture, rows: mlx.mlx_array, cuts: []const usize, steps: usize, quiet: bool) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const m = fx.model();
+    var buf: [40]u32 = undefined;
+    var ids = fx.prompt(&buf)[0..40].*;
+    for (ids[5..15]) |*id| id.* = m.cfg.image_token_id;
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    ctx.vision_embeddings = rows;
+    var at: usize = 0;
+    var lg: mlx.mlx_array = .{ .ctx = null };
+    errdefer _ = mlx.mlx_array_free(lg);
+    for (cuts) |end| {
+        _ = mlx.mlx_array_free(lg);
+        lg = .{ .ctx = null };
+        if (quiet) m.mlx_queue_used_ns = mlx.engine.nowNs();
+        lg = try forwardIds(&fx.xfm, &ctx, ids[at..end]);
+        ctx.vision_splice_offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
+        at = end;
+    }
+    for (0..steps + 1) |_| {
+        try mlx.check(mlx.mlx_array_eval(lg));
+        const data = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..m.cfg.vocab];
+        try out.appendSlice(a, std.mem.sliceAsBytes(data));
+        const tok: u32 = @intCast(std.mem.indexOfMax(f32, data));
+        _ = mlx.mlx_array_free(lg);
+        lg = .{ .ctx = null };
+        if (quiet) m.mlx_queue_used_ns = mlx.engine.nowNs();
+        lg = try forwardIds(&fx.xfm, &ctx, &.{tok});
+    }
+    _ = mlx.mlx_array_free(lg);
+    return out;
+}
+
+test "dsv41 engine: a forward that splices image rows runs on the engine at a prefill width and at a decode width, with MLX's logits and no op on MLX (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    // The fixture has no tower: its last id stands for the image token, and every layer gets an image routing bias far
+    // from the text one, so a row that took the wrong bias picks other experts.
+    const image_was = m.cfg.image_token_id;
+    m.cfg.image_token_id = m.cfg.vocab - 1;
+    defer m.cfg.image_token_id = image_was;
+    for (m.layers[0..m.cfg.layers]) |*ly| {
+        try mlx.check(mlx.mlx_array_eval(ly.gate_bias));
+        const bias = (mlx.mlx_array_data_float32(ly.gate_bias) orelse return error.NoBias)[0..mlx.mlx_array_size(ly.gate_bias)];
+        const shifted = try a.alloc(f32, bias.len);
+        defer a.free(shifted);
+        for (bias, shifted, 0..) |b, *o, e| o.* = b + (if (e % 2 == 0) @as(f32, 6) else -6);
+        ly.gate_bias_vl = mlx.mlx_array_new_data(shifted.ptr, &[_]c_int{ 1, @intCast(bias.len) }, 2, .float32);
+    }
+    defer for (m.layers[0..m.cfg.layers]) |*ly| {
+        _ = mlx.mlx_array_free(ly.gate_bias_vl);
+        ly.gate_bias_vl = .{ .ctx = null };
+    };
+    const span = try a.alloc(f32, 10 * m.cfg.dim);
+    defer a.free(span);
+    var state: u32 = 0x1a6e;
+    for (span) |*v| {
+        state = state *% 1664525 +% 1013904223;
+        v.* = @as(f32, @floatFromInt(state >> 8)) / 16777216.0 - 0.5;
+    }
+    const wide = mlx.mlx_array_new_data(span.ptr, &[_]c_int{ 10, @intCast(m.cfg.dim) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(wide);
+    // The tower's rows are bf16.
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_astype(&rows, wide, .bfloat16, fx.xfm.s));
+    try mlx.check(mlx.mlx_array_eval(rows));
+    // The load warms these pipelines for a pack that has the image bias; the fixture got its bias after the load.
+    try @import("dsv41_model.zig").warmOwnImages(m);
+    // One chunk wider than a verify block with the whole span; and cuts through the span at decode widths.
+    for ([_][]const usize{ &.{40}, &.{ 8, 16, 40 }, &.{ 4, 12, 13, 20, 40 } }) |cuts| {
+        m.engine_decode = false;
+        var want = try imagePromptBytes(a, &fx, rows, cuts, 3, false);
+        defer want.deinit(a);
+        m.engine_decode = true;
+        const ops = mlx.engine.mlx_ops;
+        const made = mlx.engine.pipelinesMade().count;
+        var got = try imagePromptBytes(a, &fx, rows, cuts, 3, true);
+        defer got.deinit(a);
+        try testing.expectEqual(ops, mlx.engine.mlx_ops);
+        try testing.expectEqual(made, mlx.engine.pipelinesMade().count);
+        try testing.expectEqualSlices(u8, want.items, got.items);
+    }
+}
+
+test "dsv41 engine: a forward through the Trunk while a verify is open runs on the engine, with the MLX route's logits and no op on MLX (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const dsv41_model = @import("dsv41_model.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    var bytes: [2][]u8 = .{ &.{}, &.{} };
+    defer for (bytes) |b| a.free(b);
+    for ([_]bool{ false, true }, 0..) |own, i| {
+        m.engine_decode = own;
+        defer m.engine_decode = true;
+        try fx.xfm.resetCache();
+        var ctx = fx.xfm.defaultCtx();
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..30]));
+        const rows = try dsv41_serving.dsv41VerifyImpl(&fx.xfm, &ctx, prompt[30..33]);
+        try mlx.check(mlx.mlx_array_eval(rows));
+        _ = mlx.mlx_array_free(rows);
+        ctx.cache.step = (try dsv41_model.ensureState(m)).n;
+        m.mlx_queue_used_ns = mlx.engine.nowNs();
+        const ops = mlx.engine.mlx_ops;
+        const lg = try forwardIds(&fx.xfm, &ctx, prompt[33..34]);
+        defer _ = mlx.mlx_array_free(lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        if (own) try testing.expectEqual(ops, mlx.engine.mlx_ops);
+        const data = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..m.cfg.vocab];
+        bytes[i] = try a.dupe(u8, std.mem.sliceAsBytes(data));
+    }
+    try testing.expectEqualSlices(u8, bytes[0], bytes[1]);
+}
+
 test "dsv41 engine: a prefill forward of 2 to 16 rows gives MLX's logits and the steps after it MLX's bytes (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);

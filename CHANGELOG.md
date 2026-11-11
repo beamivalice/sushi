@@ -11,9 +11,9 @@ earlier history is mlx-serve's, in that project's changelog.
   MLX" setting move prefill back to MLX with the rest.
 - **DeepSeek-V4.1-Flash on Sushi Cooler reports the engine's memory**: the memory figures in `/props` and the dashboard,
   and the admission checks, now count the bytes sushi's own engine holds beside MLX's.
-- **DeepSeek-V4.1-Flash reads images on Sushi Cooler**: on an M5 Mac the image encoder runs on sushi's own engine with the
-  same result it had on MLX, so an image request no longer sends the encoder's work to MLX, and a repeat start keeps
-  the encoder's kernel recipes beside the model's.
+- **DeepSeek-V4.1-Flash reads images on Sushi Cooler**: on an M5 Mac the image encoder and the model's pass over the
+  image's rows run on sushi's own engine with the same result they had on MLX, so an image request no longer sends that
+  work to MLX, and a repeat start keeps the encoder's kernel recipes beside the model's.
 - **DeepSeek-V4.1-Flash on Sushi Cooler does less host work per token**: the engine keeps hold of the model's weights
   for the whole load, finds a kernel it has already used without rebuilding its key and sets up a kernel launch
   without calling MLX, so the CPU has less to do between GPU passes.

@@ -20,17 +20,18 @@ chunk of any width included, and a pack that decodes on MLX prefills on MLX.
 
 | pack and GPU | forwards on the engine |
 |---|---|
-| DeepSeek-V4.1 STQ (experts and trunk), a GPU with matrix units (M5) | decode, DSpark draft and verify, and every prefill chunk, wider than 16 rows or not |
+| DeepSeek-V4.1 STQ (experts and trunk), a GPU with matrix units (M5) | every forward: decode, DSpark draft and verify, every prefill chunk, wider than 16 rows or not, with image rows or without |
 | DeepSeek-V4.1 STQ, a GPU without matrix units | none: the engine's other matmul tiles have not run on one |
 | DeepSeek-V4.1 with an FP8 trunk or MXFP4 experts | none: the engine runs neither |
-| a forward that splices image rows, every other architecture | none: MLX |
+| every other architecture | none: MLX |
 
 The vision tower of an image request (once per image, on a load that decodes on the engine) runs on the engine whole:
 the table's `quantized_matmul`, `fast::scaled_dot_product_attention` and `erf` rows, the weights imported.
 
-A forward on a request that holds image embeddings runs on the engine when its rows hold no image token (the splice
-reads the embeddings only for an image row); one that does, and one issued while a DSpark verify is open (only after a
-round failed), stay on MLX.
+A forward that splices image rows runs on the engine like any other, and so does one issued while a DSpark verify is
+open (only after a round failed): the MLX route's logits, byte for byte. An image row takes the non-queued route (a
+routing bias read row by row, the Engram write masked by row), whose pipelines a load with the image bias warms at
+every decode width and at a prefill width (`dsv41_model.warmOwnImages`).
 
 What a wide chunk still builds on MLX: the state rows it appends (`forwardCapMlx` bills them), the union workspace of a
 spilled route and the views of the slabs the engine imports (the slabs are MLX arrays over host pages), and the keep-alive
@@ -154,7 +155,7 @@ route and the MLX arm still build the bank at prepare time.
 - **A request's rings are made on the engine's stream on a Cooler load** (`dsv41_model.newState`). A ring of MLX's
   zeros met the engine's first step while MLX's own command buffer could still be in flight, so that step copied the
   ring into the pool or wrote it in place by timing, and an in-place one asked MLX who holds it at every later step.
-  A forward still on MLX (image rows, an open verify) takes the rings lent.
+  No forward of a Cooler load runs on MLX.
 - **A weight's import is kept** (`core.pin`): a forward imports the same load-time arrays every time, so the load pins
   them (`dsv41_model.pinWeights`: the arrays the model made or took, a named set, never a guess) and an import of an
   array with the same bytes and layout shares that store (`imports_held` in `[engine] since load:`; `imports` counts

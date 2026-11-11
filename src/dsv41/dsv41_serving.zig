@@ -480,9 +480,9 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const rows = mlx.getShape(ids);
     if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;
     const n: usize = @intCast(rows[1]);
-    // A forward of up to a verify block's rows is a decode-width forward, on the engine; one that splices image rows
-    // stays on MLX. A one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
-    const decode_width = m.engine_decode and (n <= expert_exl3_kernels.DECODE_ROWS_MAX or m.engine_prefill) and st.verify == null;
+    // Where decode runs on the engine every forward does, at a decode width or a prefill's, with image rows or without.
+    // On MLX a one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
+    const decode_width = m.engine_decode and (n <= expert_exl3_kernels.DECODE_ROWS_MAX or m.engine_prefill);
     const lazy = !(decode_width and ctx.vision_embeddings == null) and n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
@@ -500,7 +500,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
     defer m.gpa.free(ahead);
     for (ctx.ahead_ids, ahead) |t, *o| o.* = @intCast(t);
-    const own = decode_width and (vision == null or dsv41_model.imageRows(m, host) == 0);
+    const own = decode_width;
     if (m.ced_split != null and tailUnread(m.cfg.window, n, ctx.ahead_min_rows, ctx.holds_point) and st.verify == null) {
         if (own) _ = dsv41_model.ownBegin(m);
         const state_only = dsv41_model.extendState(m, host, dsv41_model.SPAN, vision, ahead);
