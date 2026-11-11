@@ -910,6 +910,7 @@ pub const Trunk = struct {
 
     // The loaded-model operations live in model_handle.zig; they keep their method names.
     pub const defaultCtx = model_handle.defaultCtx;
+    pub const outStream = model_handle.outStream;
     pub const ownsModuleDecodeState = model_handle.ownsModuleDecodeState;
     pub const sharesModuleReadonlyState = model_handle.sharesModuleReadonlyState;
     pub const moduleSpecWiring = model_handle.moduleSpecWiring;

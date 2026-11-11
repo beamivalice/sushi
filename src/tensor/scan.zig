@@ -33,15 +33,29 @@ fn rowGrid(shape: []const c_int, divisor_in: usize) Error![2]usize {
     return error.TensorUnsupported;
 }
 
-/// `t` summed cumulatively along its last axis, `inclusive` of each element or not, from the end with `reverse`.
+/// `t` summed cumulatively along `axis_in`, `inclusive` of each element or not, from the end with `reverse`. Floats
+/// scan along the last axis only. A sum of 32-bit integers is the same in any order, so another axis of those is
+/// scanned as the last one of a turned copy.
 pub fn cumsum(t_in: *Tensor, axis_in: c_int, reverse: bool, inclusive: bool) Error!*Tensor {
     if (t_in.ndim == 0) return error.TensorShape;
-    switch (t_in.dtype) {
-        .float16, .bfloat16, .float32 => {},
+    const any_order = switch (t_in.dtype) {
+        .float16, .bfloat16, .float32 => false,
+        .int32, .uint32 => true,
         else => return error.TensorDtype,
-    }
+    };
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t_in.ndim) else axis_in);
-    if (axis != t_in.ndim - 1) return error.TensorUnsupported;
+    if (axis >= t_in.ndim) return error.TensorShape;
+    if (axis != t_in.ndim - 1) {
+        if (!any_order) return error.TensorUnsupported;
+        var axes: [core.max_dims]c_int = undefined;
+        for (axes[0..t_in.ndim], 0..) |*a, i| a.* = @intCast(i);
+        std.mem.swap(c_int, &axes[axis], &axes[t_in.ndim - 1]);
+        const turned = try ops.transpose(t_in, axes[0..t_in.ndim]);
+        defer core.release(turned);
+        const scanned = try cumsum(turned, -1, reverse, inclusive);
+        defer core.release(scanned);
+        return ops.transpose(scanned, axes[0..t_in.ndim]);
+    }
     const t = try ops.contiguous(t_in);
     defer core.release(t);
     const out = try core.fresh(t.dtype, t.dims());

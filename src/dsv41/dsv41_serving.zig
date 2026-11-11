@@ -18,6 +18,9 @@ const log = @import("../log.zig");
 const manifest_mod = @import("../pipeline_manifest.zig");
 const load_clock = @import("../load_clock.zig");
 const sampler = @import("../sampler.zig");
+const seen_penalty = @import("../seen_penalty.zig");
+const think_penalty = @import("../think_penalty.zig");
+const logit_bias = @import("../logit_bias.zig");
 const random = @import("../tensor/random.zig");
 const spec_types = @import("../spec_types.zig");
 const io_util_mod = @import("../io_util.zig");
@@ -156,6 +159,7 @@ fn warmForwards(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqSt
     if (after.sampled_verdict) {
         dsv41_model.warmBudget(mdl, dsv41_config.verify_rows);
         try warmSampledVerdict(mdl);
+        try warmSerialSampler(mdl);
     }
     if (after.split) if (stq) |st| try st.warmSplit(mdl, dsv41_config.prefill_width, false);
     if (after.wide) {
@@ -255,9 +259,9 @@ fn planFits(plan: []const usize, width: usize) bool {
 /// The draws of a sampled round: `rows` verify rows of `logits` (`[1, >= rows, vocab]`) filtered by `sampling` and
 /// drawn one per row, row j for the generated position `sampling.draw + j`, gathered as one `[rows]` array not yet
 /// evaluated. On the engine's stream the gathering vector is an engine vector, which the engine makes only while it
-/// is active, and a row's key is `random.drawKey(root, position)`: `root` is the request's seed or its OS-given root,
-/// and MLX is not asked for a key or bits. On MLX's stream `root` is null and the sampler keys by `sampling.seed`.
-pub fn sampledDraws(sampling: sampler.SamplingParams, root: ?u64, logits: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+/// is active, and a row's key is `random.drawKey(sampling.draw_root, position)`, the request's seed or its OS-given
+/// root, and MLX is not asked for a key or bits. On MLX's stream the sampler keys by `sampling.seed`.
+pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const own = mlx.engine.isStream(s);
     if (own) mlx.engine.active = true;
     defer if (own) {
@@ -283,7 +287,7 @@ pub fn sampledDraws(sampling: sampler.SamplingParams, root: ?u64, logits: mlx.ml
         try mlx.check(mlx.mlx_slice(&row, rows2d, &.{ at, 0 }, 2, &.{ at + 1, vocab }, 2, &.{ 1, 1 }, 2, s));
         var keyed = sampling;
         keyed.draw +%= j;
-        draws[built] = if (own) try engineDraw(row, random.drawKey(root orelse return error.EngineDrawNeedsRoot, keyed.draw), s) else try sampler.sampleFromProbsLazy(row, keyed, s);
+        draws[built] = if (own) try engineDraw(row, random.drawKey(sampling.draw_root orelse return error.EngineDrawNeedsRoot, keyed.draw), s) else try sampler.sampleFromProbsLazy(row, keyed, s);
         built += 1;
         _ = mlx.mlx_vector_array_append_value(vec, draws[j]);
     }
@@ -295,12 +299,9 @@ pub fn sampledDraws(sampling: sampler.SamplingParams, root: ?u64, logits: mlx.ml
 
 /// `sampler.sampleFromProbsLazy` on the engine under a key of its own.
 fn engineDraw(probs: mlx.mlx_array, key: [2]u32, s: mlx.mlx_stream) !mlx.mlx_array {
-    var logp = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(logp);
-    try mlx.check(mlx.mlx_log(&logp, probs, s));
     var drawn = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(drawn);
-    try mlx.check(mlx.engine.categoricalAt(&drawn, logp, key));
+    try sampler.drawFromProbs(&drawn, probs, key, s);
     return drawn;
 }
 
@@ -322,12 +323,109 @@ pub fn warmSampledVerdict(mdl: *dsv41_model.Model) !void {
         defer _ = mlx.mlx_array_free(logits);
         try mlx.check(mlx.mlx_zeros(&logits, &[_]c_int{ 1, @intCast(rows), vocab }, 3, .float32, s));
         for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
-            const sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .suppress_mask = mask };
-            const draws = try sampledDraws(sampling, warm_root, logits, rows, s);
+            const sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .suppress_mask = mask, .draw_root = warm_root };
+            const draws = try sampledDraws(sampling, logits, rows, s);
             defer _ = mlx.mlx_array_free(draws);
             try mlx.check(mlx.mlx_array_eval(draws));
         }
     }
+}
+
+/// The serial sampler's chains on the engine over a forward's `[1, 1, vocab]` logits, and the penalty shifts of a verify
+/// block at every width: each pipeline a request's first token, a serial step or a round with penalties launches
+/// compiles here. The chains are the shared sampler's own functions, so what a request runs is what is warmed.
+pub fn warmSerialSampler(mdl: *dsv41_model.Model) !void {
+    if (!mdl.engine_decode) return;
+    const s = mlx.engine.stream();
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    const a = std.heap.page_allocator;
+    const vocab: c_int = @intCast(mdl.cfg.vocab);
+    var mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask);
+    try mlx.check(mlx.mlx_zeros(&mask, &[_]c_int{vocab}, 1, .bool_, s));
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_zeros(&logits, &[_]c_int{ 1, 1, vocab }, 3, .float32, s));
+    const seen = [_]u32{ 1, 2, 2, 7 };
+    const penalties = [_]sampler.SamplingParams{
+        .{ .temperature = 0.8, .repeat_penalty = 1.1 },
+        .{ .temperature = 0.8, .presence_penalty = 0.5, .frequency_penalty = 0.5 },
+        .{ .temperature = 0.8, .repeat_penalty = 1.1, .presence_penalty = 0.5, .frequency_penalty = 0.5 },
+    };
+    for ([_]bool{ false, true }) |masked| {
+        for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
+            var sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .draw_root = warm_root, .suppress_mask = if (masked) mask else null };
+            const drawn = sampler.sampleTokenLazy(logits, sampling, s);
+            defer _ = mlx.mlx_array_free(drawn);
+            try mlx.check(mlx.mlx_array_eval(drawn));
+            sampling.temperature = 0;
+            const best = sampler.sampleTokenLazy(logits, sampling, s);
+            defer _ = mlx.mlx_array_free(best);
+            try mlx.check(mlx.mlx_array_eval(best));
+        }
+        var sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .draw_root = warm_root, .suppress_mask = if (masked) mask else null };
+        for (penalties) |p| {
+            sampling.repeat_penalty = p.repeat_penalty;
+            sampling.presence_penalty = p.presence_penalty;
+            sampling.frequency_penalty = p.frequency_penalty;
+            const drawn = try sampler.penalizedSampleLazy(a, logits, sampling, &seen, s);
+            defer _ = mlx.mlx_array_free(drawn);
+            try mlx.check(mlx.mlx_array_eval(drawn));
+            const tick = try sampler.sampleToken(a, logits, sampling, &seen, 3, null, s);
+            a.free(tick.logprob_result.?.top_logprobs);
+        }
+    }
+    const grammar = try a.alloc(bool, mdl.cfg.vocab);
+    defer a.free(grammar);
+    @memset(grammar, true);
+    grammar[0] = false;
+    var masked_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked_logits);
+    try sampler.applyGrammarMask(a, &masked_logits, logits, grammar, s);
+    try mlx.check(mlx.mlx_array_eval(masked_logits));
+    for (1..dsv41_config.ring_slack + 1) |rows| try warmShiftRows(mdl, rows, mask);
+}
+
+/// A verify block of `rows` rows under the penalties, the thinking penalty and its logit bias, and a row mask.
+fn warmShiftRows(mdl: *dsv41_model.Model, rows: usize, marker_mask: mlx.mlx_array) !void {
+    const s = mlx.engine.stream();
+    const a = std.heap.page_allocator;
+    const vocab: c_int = @intCast(mdl.cfg.vocab);
+    var block = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(block);
+    try mlx.check(mlx.mlx_zeros(&block, &[_]c_int{ 1, @intCast(rows), vocab }, 3, .float32, s));
+    var ids_host: [dsv41_config.ring_slack]i32 = undefined;
+    for (ids_host[0..rows], 0..) |*id, i| id.* = @intCast(i + 1);
+    const ids = mlx.mlx_array_new_data(&ids_host, &[_]c_int{ 1, @intCast(rows) }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    const committed = try seen_penalty.buildCounts(a, &.{ 1, 2, 2 }, mdl.cfg.vocab);
+    defer _ = mlx.mlx_array_free(committed);
+    const bias = [_]logit_bias.Bias{.{ .id = 3, .delta = 1 }};
+    const pens = [_]seen_penalty.Penalties{ .{ .repeat = 1.1 }, .{ .presence = 0.5, .frequency = 0.5 }, .{ .repeat = 1.1, .presence = 0.5, .frequency = 0.5 } };
+    for (pens) |pen| {
+        var out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out);
+        try seen_penalty.shiftRows(&out, block, ids, committed, pen, s);
+        try mlx.check(mlx.mlx_array_eval(out));
+    }
+    for ([_]think_penalty.ThinkPenalty.Phase{ .before, .inside }) |phase| for ([_][]const logit_bias.Bias{ &.{}, &bias }) |biases| {
+        var p: think_penalty.ThinkPenalty = .{ .lambda = 1, .opener_id = 1, .closer_id = 2, .phase = phase, .biases = biases };
+        try p.prepare(a, mdl.cfg.vocab, marker_mask, s);
+        defer p.deinitPrepared();
+        var out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out);
+        try think_penalty.shiftScoped(&out, block, marker_mask, p, ids, s);
+        try mlx.check(mlx.mlx_array_eval(out));
+    };
+    const rows_mask = try a.alloc(bool, rows * mdl.cfg.vocab);
+    defer a.free(rows_mask);
+    @memset(rows_mask, true);
+    rows_mask[0] = false;
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    try sampler.applyRowMasks(&masked, block, rows_mask, rows, mdl.cfg.vocab, s);
+    try mlx.check(mlx.mlx_array_eval(masked));
 }
 
 /// A pack without the STQ stream has no expert prefetcher: `--ssd-prefetch` or the file's `ssd_prefetch` does nothing there.
@@ -388,7 +486,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const lazy = !(decode_width and ctx.vision_embeddings == null) and n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
-    try mlx.check(mlx.mlx_astype(&flat, ids, .uint32, self.s));
+    try mlx.check(mlx.mlx_astype(&flat, ids, .uint32, if (decode_width) mlx.engine.stream() else self.s));
     // Queued before any host work, so the token is ready as soon as the head is.
     if (lazy) try dsv41_model.submit(flat) else try mlx.check(mlx.mlx_array_eval(flat));
     var one: [1]u32 = undefined;
@@ -426,7 +524,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     ctx.cache.step = st.n;
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(m.cfg.vocab) }, 3, self.s));
+    try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(m.cfg.vocab) }, 3, if (own) mlx.engine.stream() else self.s));
     return out;
 }
 

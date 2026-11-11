@@ -72,36 +72,47 @@ inline fn tally(comptime name: []const u8) void {
     if (comptime builtin.is_test) by_name.add(name);
 }
 
-/// TEST-ONLY calls per entry point, to split a count by kind.
-const by_name = struct {
+/// TEST-ONLY tallies per entry point, to split a count by kind.
+const Tally = struct {
     const capacity = 512;
-    var names: [capacity][]const u8 = undefined;
-    var counts: [capacity]u64 = @splat(0);
-    var used: usize = 0;
-    var busy: std.atomic.Value(bool) = .init(false);
+    names: [capacity][]const u8 = undefined,
+    counts: [capacity]u64 = @splat(0),
+    used: usize = 0,
+    busy: std.atomic.Value(bool) = .init(false),
 
-    fn add(name: []const u8) void {
-        while (busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-        defer busy.store(false, .release);
-        for (names[0..used], counts[0..used]) |n, *c| {
+    fn add(self: *Tally, name: []const u8) void {
+        while (self.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer self.busy.store(false, .release);
+        for (self.names[0..self.used], self.counts[0..self.used]) |n, *c| {
             if (std.mem.eql(u8, n, name)) {
                 c.* += 1;
                 return;
             }
         }
-        names[used] = name;
-        counts[used] = 1;
-        used += 1;
+        self.names[self.used] = name;
+        self.counts[self.used] = 1;
+        self.used += 1;
+    }
+
+    fn list(self: *Tally, out: *std.ArrayList(NameCount), gpa: std.mem.Allocator) !void {
+        while (self.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer self.busy.store(false, .release);
+        for (self.names[0..self.used], self.counts[0..self.used]) |n, c| try out.append(gpa, .{ .name = n, .count = c });
     }
 };
+var by_name: Tally = .{};
+var ops_by_name: Tally = .{};
 
 pub const NameCount = struct { name: []const u8, count: u64 };
 
 /// TEST-ONLY: the calls so far, per entry point.
 pub fn callsByName(out: *std.ArrayList(NameCount), gpa: std.mem.Allocator) !void {
-    while (by_name.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-    defer by_name.busy.store(false, .release);
-    for (by_name.names[0..by_name.used], by_name.counts[0..by_name.used]) |n, c| try out.append(gpa, .{ .name = n, .count = c });
+    try by_name.list(out, gpa);
+}
+
+/// TEST-ONLY: the ops the seam sent to MLX so far (`engine.mlx_ops`), per entry point.
+pub fn opsByName(out: *std.ArrayList(NameCount), gpa: std.mem.Allocator) !void {
+    try ops_by_name.list(out, gpa);
 }
 
 /// An address inside the mlx-c library, to find the files beside it. Naming a symbol is no call.
@@ -156,7 +167,10 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
                 .leak => return if (R == c_int) engine.refuse(name, "an MLX stream inside a forward of the engine") else unreachable,
                 .mlx => {
                     // An op carries a stream; a free or a read of a handle does not.
-                    if (comptime carriesStream()) engine.mlx_ops += 1;
+                    if (comptime carriesStream()) {
+                        engine.mlx_ops += 1;
+                        if (comptime builtin.is_test) ops_by_name.add(name);
+                    }
                     // MLX takes a tensor of ours as an array over the same bytes; a result slot that still holds
                     // one is emptied before mlx-c assigns into it.
                     var lent = args;

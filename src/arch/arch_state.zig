@@ -170,6 +170,16 @@ pub fn discardDeferred(t: *Trunk, ctx: *ForwardCtx) void {
     trunkHook("discardDeferred", .{ t, ctx });
 }
 
+/// The stream the sampler and the token arrays run on after a forward of `t`: an arch whose forward runs on the engine
+/// of our own answers its stream (`State.outStream`); every other answers `s`, the stream it forwarded on.
+pub fn outStream(t: *const Trunk, s: mlx.mlx_stream) mlx.mlx_stream {
+    var out = s;
+    inline for (tags) |tg| {
+        if (comptime has(Decl(tg, "State"), "outStream")) out = @field(t.arch_state, @tagName(tg)).outStream(out);
+    }
+    return out;
+}
+
 /// The M-RoPE position table the forward's request carries; null for a text-only request or a build whose archs
 /// rotate without one.
 pub fn mropeOf(c: *const Ctx) ?mrope.PositionContext {

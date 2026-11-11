@@ -136,7 +136,7 @@ route and the MLX arm still build the bank at prepare time.
   handle (`mlx_array_new`, `mlx_stream_new`, `mlx_device_new`, `mlx_string_new`, `mlx_device_info_new`) is a zero
   `ctx` made in Zig, no call. It cannot see MLX's own threads, work before the load, or the Metal objects MLX already
   made. Another file declaring an `mlx_*` extern fails the `mlx-extern` lint; an address of the library for `dladdr`
-  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 5664 calls,
+  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes 5667 calls,
   none of them for a kernel config (pinned in `dsv41_generate_test.zig`).
 
 ## Crossing between the two
@@ -227,6 +227,7 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
 | sort, argsort over the last axis | MLX's, from `mlx.metallib`, one block or the multi-block merge under MLX's plan | same bytes, ties in MLX's order |
 | cumsum over the last axis (f32, f16, bf16) | MLX's scan kernel on MLX's grid | same bytes |
 | put along an axis, constant pad | ours (a copy, then the scatter or the border fill) | same bytes |
+| copy | a share of the input (MLX's `Copy` shares its buffer) | same bytes |
 | random bits | MLX's `rbitsc`, from `mlx.metallib` | same bytes |
 | uniform, categorical | MLX's bits, then `random.cpp`'s op chain op for op: inverse CDF (with MLX's searchsorted) for one row, Gumbel for a block | same bytes |
 | affine `quantized_matmul`, a transposed 2-D weight on the matrix-unit tiles (`qmm_t_nax`) | MLX's, from `mlx.metallib`, under MLX's plan | same bytes |
@@ -245,13 +246,27 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   Markov chain under MLX. An op over a long axis takes MLX's kernel.
 - **Not ported, refused by name**: `quantized_matmul` but the case above (a non-STQ DeepSeek pack's FP8 trunk, the
   vector and split-K plans, the SIMD tiles, a batch), attention with a mask, sinks or another head dimension, a matmul or a reduction
-  with an empty operand, a reduction of more than 2^31 elements, a sort or a scan over an axis but the last,
-  argpartition, top-k, logsumexp, a non-constant pad.
+  with an empty operand, a reduction of more than 2^31 elements, a sort over an axis but the last, a scan of
+  floats over an axis but the last (a scan of 32-bit integers takes any axis: it turns the axis to the last, as its
+  sum is the same in any order), argpartition, top-k, logsumexp, a non-constant pad. Logprobs need those two, and are
+  made on the host (below).
 - **Random: the engine makes its own keys and never asks MLX.** A sampled draw's key is `random.drawKey(root, position)`,
   a host integer mix of the request's seed (an unseeded request: one number from the OS, taken once) and the position
   the draw predicts; a draw without a key is refused. The bar is a repeat on the engine, not MLX's bytes: the same seed
-  gives the same tokens, whatever the round widths, streamed or not, and a seed gives other tokens than on MLX. The serial
-  sampler (a request's first token, a serial tick) still draws on MLX.
+  gives the same tokens, whatever the round widths, streamed or not, and a seed gives other tokens than on MLX. The root
+  rides `SamplingParams.draw_root`, set once at the generator's start on an engine load.
+- **After a forward, the sampler runs where the forward did** (`Trunk.outStream`, answered by the arch: the engine's stream
+  for a DeepSeek load whose decode is on the engine, else the forward's own). The first token, a serial tick, the
+  penalties, the thinking penalty and logit bias, the suppress, grammar and row masks, the token arrays and the
+  pipelined `async_eval` are the shared sampler's own code on that stream, so the MLX route's call sequence is untouched;
+  `engine.enter(s)` makes the host arrays and vectors they build the engine's while it runs (no MLX call). A draw is
+  `sampler.drawFromProbs` under `random.drawKey(root, sampling.draw)`, the same chain a DSpark row draws, so one position
+  has one key and one draw whoever makes it. A one-row decode and a one-row verify differ in the last bits of their
+  logits on the tiny fixture, so a serial and a round request of one seed are two texts; each repeats at every mix of its
+  own kind. **Logprobs** read the row back once and are ranked on the host (`sampler.hostLogprobs`: the values may
+  differ from MLX's in the last bits, the ids and their order do not, ties by the lower id).
+- **The one op a round still puts on MLX** is `keepMlxQueue`'s touch, one multiply per `GPU_WARM_TICK_NS` of MLX idle,
+  which keeps the driver from dropping MLX's resident set until the request's end commit (a prompt-cache write) is off MLX.
 - **Only one hardware path is proven on a given box.** On an M5 the tests take the NAX tiles; `MLX_ENABLE_TF32=0`
   sends f32 through the SIMD tiles there. The half-precision SIMD tiles need a run on a pre-M5 machine.
 
@@ -313,6 +328,9 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   request's own top-k changes only the sorted widths: the single-block sort variant (`bn`, 32 to 512) of the shortlist,
   the multi-block sort when the chunk maxima or candidates pass 2048, whether the pad runs, and `block_softmax` against
   `looped_softmax` at a shortlist over 4096; a k other than 40 can compile one of those inside a request.
+- **The serial sampler is warmed** (`warmSerialSampler`, with the sampled verdict): a first-token or serial draw at the
+  four filter settings, greedy, with and without the suppress mask, the three penalty mixes with logprobs, a grammar mask,
+  and a verify block of every width under the penalties, the thinking penalty with and without a bias, and a row mask.
 - **A kernel reached only past a threshold of context is found by a bench at that context**, not by the tiny
   fixture: the 128k rung showed three compiles (0.26 s) inside its first decode step.
 - **A pipeline made after the warm is logged** (`engine.seal`): `[engine] compiled inside a request (N ms): <name>`

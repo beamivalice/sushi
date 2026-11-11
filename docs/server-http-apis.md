@@ -195,7 +195,8 @@ before reading a completed stream and requires clean EOF.
   token (one-token delay); `logprobs.content` describes `message.content` (`contentTokenRange`); streaming logprobs
   are a SIBLING of `delta` shipped EXACTLY once against a high-water mark. logprobs>0 + grammar disable spec.
 - Logprobs are `logits - logsumexp` in f32 (`sampler.computeLogprobs`): `log(softmax)` in bf16 lands on bf16's grid, 0.125
-  apart between -16 and -32.
+  apart between -16 and -32. On DeepSeek on Sushi Cooler the engine has no logsumexp or argpartition, so the row is read
+  back once and ranked on the host (f64 sum): ids and order are MLX's (ties by the lower id), values may differ in the last bits.
 - Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded.
 - A conversation the template says has no user turn (Qwen: system-only or assistant-only) is a 400, never rendered
   through the generic ChatML fallback (`ChatNeedsUserTurn`). A reply echoes `model` as the request named it, else the id

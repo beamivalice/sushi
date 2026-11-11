@@ -697,7 +697,11 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   shipped pack's rows are not byte-exact at every width, so a seeded sampled request verifies at a fixed R=3 (clamped to the
   depth flags) and draws each row with the key of the position it predicts: its text is the same on every repeat and streamed or
   not. On Sushi Cooler the key is the engine's own (`random.drawKey`, a host mix of the seed and the position; an unseeded request
-  takes one root from the OS), so a seed gives another text than on the MLX route (`--ds41-mlx-engine`), which keeps MLX's keys (live, STQ 1.75bpw: three runs byte-identical with and without a reasoning budget; 52-60 tok/s against 52-63 adaptive,
+  takes one root from the OS, `SamplingParams.draw_root`), and the request's first token and every serial step draw it too, by
+  the same chain as a DSpark row (`sampler.drawFromProbs`), so a position has one key and one draw whoever makes it. A serial
+  request and a round request of one seed are two texts, because a one-row decode and a one-row verify differ in the last bits
+  of their logits on the tiny fixture; each repeats at every mix of its own kind. A seed gives another text than on the MLX
+  route (`--ds41-mlx-engine`), which keeps MLX's keys (live, STQ 1.75bpw: three runs byte-identical with and without a reasoning budget; 52-60 tok/s against 52-63 adaptive,
   which repeated nothing). Unseeded and greedy requests keep the adaptive R.
 - **Verify cost** (an STQ pack, M5 Max, `taskpolicy -a`, budget 88, one boot, attention arms interleaved, trimmed means, ms per
   verify): `v(R) = v(1) + step * (R-1)`, v(1) 37 / 42 / 53 and step 12.5 / 13 / 13.5 at 1k / 4k / 16k of context; the 6-row verify

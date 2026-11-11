@@ -2235,6 +2235,38 @@ test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or no
         while (try gen.nextDspark(a)) |r| a.free(r.tokens);
         try testing.expectEqual(late, mlx.engine.latePipelines());
     };
+    // The serial tick, the first token and a round with penalties launch no pipeline the warm did not make.
+    const serial = [_]struct { sampling: SamplingParams, logprobs: u32 = 0, masked: bool = false }{
+        .{ .sampling = .{ .temperature = 0.0 } },
+        .{ .sampling = .{ .temperature = 0.0 }, .masked = true },
+        .{ .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 }, .masked = true },
+        .{ .sampling = .{ .temperature = 0.8, .top_k = 40, .seed = 7 } },
+        .{ .sampling = .{ .temperature = 0.8, .top_p = 0.9 } },
+        .{ .sampling = .{ .temperature = 0.8, .repeat_penalty = 1.2, .seed = 7 } },
+        .{ .sampling = .{ .temperature = 0.0, .presence_penalty = 0.5, .frequency_penalty = 0.3 } },
+        .{ .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7, .repeat_penalty = 1.2, .presence_penalty = 0.5 }, .logprobs = 3 },
+        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 3 },
+    };
+    for (serial) |c| for ([_]bool{ true, false }) |skip_lazy| {
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 12, c.sampling, &.{}, .{ .skip_lazy_preforward = skip_lazy, .logprobs_n = c.logprobs });
+        defer gen.deinit(a);
+        gen.logprobs_n = c.logprobs;
+        if (c.masked) gen.sampling.suppress_mask = mask;
+        while (try gen.next(a)) |_| {}
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    };
+    for ([_]SamplingParams{
+        .{ .temperature = 0.8, .repeat_penalty = 1.2, .seed = 7 },
+        .{ .temperature = 0.0, .presence_penalty = 0.5, .frequency_penalty = 0.3 },
+    }) |c| {
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, c, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .sweep;
+        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    }
 }
 
 test "dsv41 engine: a one-row decode on the engine of our own gives MLX's tokens and logits bit for bit (DSV41_STQ_TINY)" {
@@ -3646,8 +3678,310 @@ test "dsv41 engine: a one-row decode step in steady state makes a pinned number 
     const again = try stepCalls(&fx, prompt, 5);
     try testing.expectEqual(steady, again);
     // The stage-by-stage target is zero: kernel configs, array queries, host reads, evals, makers, frees, other ops.
-    try testing.expectEqual([_]u64{ 0, 3850, 489, 2, 87, 658, 571 }, steady.split);
-    try testing.expectEqual(@as(u64, 5657), steady.total);
+    try testing.expectEqual([_]u64{ 0, 3863, 489, 1, 87, 657, 570 }, steady.split);
+    try testing.expectEqual(@as(u64, 5667), steady.total);
+}
+
+/// The ops a request puts on MLX in `want` serial ticks, MLX's keep-warm touch held off.
+fn opsOver(m: *@import("dsv41_model.zig").Model, gen: *Generator, a: std.mem.Allocator, want: usize) !u64 {
+    const before = mlx.engine.mlx_ops;
+    for (0..want) |_| {
+        m.mlx_queue_used_ns = mlx.engine.nowNs();
+        _ = try gen.next(a);
+    }
+    return mlx.engine.mlx_ops - before;
+}
+
+test "dsv41 engine: a request's first token and every serial step put no op on MLX, greedy, seeded, penalized, with logprobs or a mask (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..30];
+    const m = fx.model();
+    const flags = try a.alloc(bool, m.cfg.vocab);
+    defer a.free(flags);
+    for (flags, 0..) |*f, id| f.* = id % 7 == 0;
+    const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(m.cfg.vocab)}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+    const filtered: SamplingParams = .{ .temperature = 0.8, .top_p = 0.9, .top_k = 20, .seed = 5 };
+    const cases = [_]struct { sampling: SamplingParams, logprobs: u32 = 0, masked: bool = false, opts: Generator.InitOptions = .{} }{
+        .{ .sampling = .{ .temperature = 0.0 } },
+        .{ .sampling = .{ .temperature = 0.0 }, .opts = .{ .skip_lazy_preforward = true } },
+        .{ .sampling = .{ .temperature = 0.0 }, .masked = true },
+        .{ .sampling = filtered },
+        .{ .sampling = filtered, .opts = .{ .skip_lazy_preforward = true }, .masked = true },
+        .{ .sampling = .{ .temperature = 0.8 } },
+        .{ .sampling = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 5 }, .opts = .{ .skip_lazy_preforward = true } },
+        .{ .sampling = .{ .temperature = 0.0, .frequency_penalty = 0.4 }, .opts = .{ .skip_lazy_preforward = true } },
+        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 3, .opts = .{ .skip_lazy_preforward = true } },
+        .{ .sampling = filtered, .logprobs = 3, .opts = .{ .skip_lazy_preforward = true } },
+    };
+    for (cases) |c| {
+        var opts = c.opts;
+        opts.logprobs_n = c.logprobs;
+        // The first token: the prefill is MLX's, what it is sampled and read with is not.
+        {
+            try fx.xfm.resetCache();
+            var ctx = fx.xfm.defaultCtx();
+            const lg = try forwardIds(&fx.xfm, &ctx, prompt);
+            defer _ = mlx.mlx_array_free(lg);
+            try mlx.check(mlx.mlx_array_eval(lg));
+            var sampling = c.sampling;
+            sampling.draw_root = 5;
+            if (c.masked) sampling.suppress_mask = mask;
+            const before = mlx.engine.mlx_ops;
+            const lazy = try sampler.firstTokenSample(&fx.xfm, lg, sampling, fx.xfm.outStream());
+            defer _ = mlx.mlx_array_free(lazy);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var first: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&first, lazy));
+            if (c.logprobs > 0) {
+                const lp = (try sampler.firstTokenLogprobs(a, lg, @intCast(first), c.logprobs, fx.xfm.outStream())).?;
+                a.free(lp.top_logprobs);
+            }
+            try testing.expectEqual(before, mlx.engine.mlx_ops);
+        }
+        try fx.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 12, c.sampling, &.{}, opts);
+        defer gen.deinit(a);
+        gen.logprobs_n = c.logprobs;
+        if (c.masked) gen.sampling.suppress_mask = mask;
+        _ = try opsOver(m, &gen, a, 2);
+        try testing.expectEqual(@as(u64, 0), try opsOver(m, &gen, a, 8));
+    }
+}
+
+test "dsv41 engine: a DSpark round with penalties, a thinking penalty, a logit bias or a row mask puts no op on MLX (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..30];
+    const m = fx.model();
+    const think_ids = [_]u32{ 11, 12, 13 };
+    fx.xfm.think_marker_mask = try @import("../think_penalty.zig").buildMask(a, &think_ids, m.cfg.vocab);
+    defer {
+        _ = mlx.mlx_array_free(fx.xfm.think_marker_mask.?);
+        fx.xfm.think_marker_mask = null;
+    }
+    const bias = [_]@import("../logit_bias.zig").Bias{.{ .id = 14, .delta = 1.5, .scope = .reasoning }};
+    const think: SamplingParams = .{ .temperature = 0.8, .seed = 3, .think_penalty = .{ .lambda = 2, .opener_id = 5, .closer_id = 6, .phase = .inside } };
+    var biased = think;
+    biased.think_penalty.biases = &bias;
+    const cases = [_]SamplingParams{
+        .{ .temperature = 0.8, .repeat_penalty = 1.3, .seed = 5 },
+        .{ .temperature = 0.0, .frequency_penalty = 0.4, .presence_penalty = 0.2 },
+        think,
+        biased,
+    };
+    for (cases) |c| {
+        try fx.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 30, c, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .sweep;
+        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        const before = mlx.engine.mlx_ops;
+        var rounds: usize = 0;
+        while (rounds < 5) : (rounds += 1) {
+            m.mlx_queue_used_ns = mlx.engine.nowNs();
+            const r = (try gen.nextDspark(a)) orelse break;
+            a.free(r.tokens);
+        }
+        try testing.expect(rounds > 0);
+        try testing.expectEqual(before, mlx.engine.mlx_ops);
+    }
+}
+
+/// One request on the engine through `mode`, its ids.
+const Mode = enum { serial, serial_lazy, serial_logprobs, rows1, rows3, sweep, adaptive };
+
+fn engineIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32, sampling: SamplingParams, mode: Mode, out: *std.ArrayList(u32)) !void {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try fx.xfm.resetCache();
+    const opts: Generator.InitOptions = switch (mode) {
+        .serial => .{ .skip_lazy_preforward = true },
+        .serial_lazy => .{},
+        .serial_logprobs => .{ .skip_lazy_preforward = true, .logprobs_n = 3 },
+        else => .{ .dspark_enabled = true },
+    };
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, tok, prompt, want, sampling, &.{}, opts);
+    defer gen.deinit(a);
+    switch (mode) {
+        .serial, .serial_lazy => while (try gen.next(a)) |t| try out.append(a, t),
+        .serial_logprobs => {
+            gen.logprobs_n = 3;
+            while (try gen.next(a)) |t| try out.append(a, t);
+        },
+        else => {
+            gen.dspark_diag = switch (mode) {
+                .rows1 => .{ .rows = 1 },
+                .rows3 => .{ .rows = 3 },
+                .sweep => .sweep,
+                else => .off,
+            };
+            while (try gen.nextDspark(a)) |r| {
+                defer a.free(r.tokens);
+                try out.appendSlice(a, r.tokens);
+            }
+        },
+    }
+}
+
+test "dsv41 engine: a seeded request gives the same tokens, the first one included, at every serial mix and at every DSpark round-width mix, streamed or not, and twice (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..30];
+    const want: u32 = 40;
+    const seeded: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
+    const penalized: SamplingParams = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 7 };
+    // A one-row decode and a one-row verify differ in the last bits of their logits, so a serial request and a round
+    // request are two texts of one seed; each is the same at every mix of its own kind. The first token is one function's.
+    const groups = [_][]const Mode{ &.{ .serial, .serial_lazy, .serial_logprobs }, &.{ .rows1, .rows3, .sweep, .adaptive } };
+    for ([_]SamplingParams{ seeded, penalized }) |sampling| {
+        var first: ?u32 = null;
+        for (groups) |modes| {
+            var ref: std.ArrayList(u32) = .empty;
+            defer ref.deinit(a);
+            for (modes) |mode| for (0..2) |_| {
+                var got: std.ArrayList(u32) = .empty;
+                defer got.deinit(a);
+                try engineIds(&fx, &tok, prompt, want, sampling, mode, &got);
+                try testing.expectEqual(@as(usize, want), got.items.len);
+                if (ref.items.len == 0) try ref.appendSlice(a, got.items) else try testing.expectEqualSlices(u32, ref.items, got.items);
+            };
+            if (first) |f| try testing.expectEqual(f, ref.items[0]) else first = ref.items[0];
+            // A request that stops sooner is a prefix, first token and all.
+            var short: std.ArrayList(u32) = .empty;
+            defer short.deinit(a);
+            try engineIds(&fx, &tok, prompt, 17, sampling, modes[0], &short);
+            try testing.expectEqualSlices(u32, ref.items[0..17], short.items);
+            // Another seed, and requests with none, draw other tokens.
+            var other: std.ArrayList(u32) = .empty;
+            defer other.deinit(a);
+            var changed = sampling;
+            changed.seed = 8;
+            try engineIds(&fx, &tok, prompt, want, changed, modes[0], &other);
+            try testing.expect(!std.mem.eql(u32, ref.items, other.items));
+            var unseeded: [2]std.ArrayList(u32) = .{ .empty, .empty };
+            defer for (&unseeded) |*r| r.deinit(a);
+            changed.seed = null;
+            for (&unseeded) |*r| try engineIds(&fx, &tok, prompt, want, changed, modes[0], r);
+            try testing.expect(!std.mem.eql(u32, unseeded[0].items, unseeded[1].items));
+        }
+    }
+}
+
+test "dsv41 engine: the serial sampler and a DSpark row draw one token for one position, at every filter, with a mask and under a penalty (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const vocab = fx.model().cfg.vocab;
+    const flags = try testing.allocator.alloc(bool, vocab);
+    defer testing.allocator.free(flags);
+    for (flags, 0..) |*f, id| f.* = id % 7 == 0;
+    const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(vocab)}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+    const host = try testing.allocator.alloc(f32, vocab);
+    defer testing.allocator.free(host);
+    const s = mlx.engine.stream();
+    var distinct = std.AutoHashMap(i32, void).init(testing.allocator);
+    defer distinct.deinit();
+    for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| for ([_]bool{ false, true }) |masked| for (0..24) |position| {
+        for (host, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 2654435761 + position * 40503) % 1000)) / 250.0;
+        const logits = mlx.mlx_array_new_data(host.ptr, &[_]c_int{ 1, 1, @intCast(vocab) }, 3, .float32);
+        defer _ = mlx.mlx_array_free(logits);
+        const sampling = SamplingParams{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .draw = position, .draw_root = 11, .suppress_mask = if (masked) mask else null };
+        const serial = sampler.sampleTokenLazy(logits, sampling, s);
+        defer _ = mlx.mlx_array_free(serial);
+        const row = try dsv41_serving.sampledDraws(sampling, logits, 1, s);
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_array_eval(serial));
+        try mlx.check(mlx.mlx_array_eval(row));
+        var a: i32 = 0;
+        var b: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&a, serial));
+        try mlx.check(mlx.mlx_array_item_int32(&b, row));
+        try testing.expectEqual(a, b);
+        try distinct.put(a, {});
+    };
+    // The positions do not all draw one token.
+    try testing.expect(distinct.count() > 3);
+}
+
+/// The ids of a request on the MLX route of the tiny STQ load (`engine_decode` off): the serial tick, or DSpark rounds of three rows.
+fn mlxRouteIds(fx: *EngineFixture, sampling: SamplingParams, rounds: bool, out: *std.ArrayList(u32)) !void {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..30];
+    const m = fx.model();
+    m.engine_decode = false;
+    defer m.engine_decode = true;
+    try fx.xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 12, sampling, &.{}, if (rounds) .{ .dspark_enabled = true } else .{ .skip_lazy_preforward = true });
+    defer gen.deinit(a);
+    if (rounds) gen.dspark_diag = .{ .rows = 3 };
+    if (rounds) {
+        while (try gen.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try out.appendSlice(a, r.tokens);
+        }
+    } else {
+        while (try gen.next(a)) |t| try out.append(a, t);
+    }
+}
+
+test "dsv41 engine: the MLX route's seeded ids, serial and in DSpark rounds, are what they were before the engine took the sampler (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const seeded = SamplingParams{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
+    const penalized = SamplingParams{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 7 };
+    const Case = struct { sampling: SamplingParams, rounds: bool, ids: [12]u32 };
+    const cases = [_]Case{
+        .{ .sampling = seeded, .rounds = false, .ids = .{ 116, 250, 45, 163, 22, 139, 130, 76, 119, 34, 40, 71 } },
+        .{ .sampling = penalized, .rounds = false, .ids = .{ 116, 250, 45, 163, 22, 139, 130, 76, 16, 207, 237, 146 } },
+        .{ .sampling = seeded, .rounds = true, .ids = .{ 116, 250, 45, 163, 22, 139, 130, 76, 188, 93, 74, 185 } },
+        .{ .sampling = .{ .temperature = 0.0 }, .rounds = false, .ids = .{ 116, 250, 208, 47, 8, 159, 222, 227, 76, 78, 3, 57 } },
+    };
+    for (cases) |c| {
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(testing.allocator);
+        try mlxRouteIds(&fx, c.sampling, c.rounds, &ids);
+        try testing.expectEqualSlices(u32, &c.ids, ids.items);
+    }
 }
 
 /// The calls into MLX's `name` since `before`.

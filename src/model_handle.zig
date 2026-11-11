@@ -128,6 +128,12 @@ pub fn defaultCtx(self: *Trunk) ForwardCtx {
 }
 
 
+/// The stream the sampler and the token arrays run on after a forward: the engine's for a load whose decode runs
+/// there, else the stream the model forwards on.
+pub fn outStream(self: *const Trunk) mlx.mlx_stream {
+    return arch_state.outStream(self, self.s);
+}
+
 /// `arch_state.setLayerCapture` on `ctx`, for a caller that reaches the engine only through this file.
 pub fn setLayerCapture(ctx: *ForwardCtx, input: ?mlx.mlx_array, skip_ple: bool) void {
     arch_state.setLayerCapture(&ctx.arch_ctx, input, skip_ple);

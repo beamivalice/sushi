@@ -11,6 +11,7 @@ const mtp_acceptance = @import("mtp_acceptance.zig");
 const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
+const random = @import("tensor/random.zig");
 const Trunk = trunk.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
@@ -54,8 +55,11 @@ pub const SamplingParams = struct {
     /// OpenAI's: subtracted once per earlier occurrence of a token (0.0 = disabled).
     frequency_penalty: f32 = 0.0,
     seed: ?u64 = null,
-    /// Draw index under `seed`: every sample takes a fresh key.
+    /// Draw index under `seed`: every sample takes a fresh key. It is the generated position the draw predicts.
     draw: u64 = 0,
+    /// The root of the engine's draw keys (`random.drawKey(root, draw)`): the seed, else one number from the OS taken
+    /// once per request. Set by the generator on a load whose decode runs on the engine; MLX's draws never read it.
+    draw_root: ?u64 = null,
     /// When non-null, generation is constrained to outputs that satisfy the
     /// grammar at byte level. Forces a synchronous sampling path (no lazy
     /// pipeline) since grammar advancement requires the realized token id.
@@ -649,6 +653,8 @@ pub fn sampleFromProbsLazy(probs: mlx.mlx_array, sampling: SamplingParams, s: ml
 
 /// `sampleTokenLazy` under the request's penalties over `generated_ids`.
 pub fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const host = mlx.engine.enter(s);
+    defer host.end();
     if (penaltyActive(sampling) and generated_ids.len > 0) {
         var penalized = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(penalized);
@@ -660,6 +666,8 @@ pub fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, 
 
 /// Prefill's first token under the think penalty when the prompt leaves the span open.
 pub fn firstTokenSample(xfm: *Trunk, logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    const host = mlx.engine.enter(s);
+    defer host.end();
     const tp = sampling.think_penalty;
     if (!tp.active()) return firstTokenLazy(logits, sampling, s);
     if (!tp.hasBias() and (xfm.think_marker_mask == null or tp.phase != .inside)) return firstTokenLazy(logits, sampling, s);
@@ -679,6 +687,8 @@ fn firstTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_st
 }
 
 pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
+    const host = mlx.engine.enter(s);
+    defer host.end();
     // Reserved-token suppression first, so every path below (greedy fast
     // path included — the collapse drew `<|fim_hole|>` at temp 0) sees the
     // masked row. Lazy like everything else here. The handle starts null-ctx
@@ -756,9 +766,7 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
 
     // Sample from categorical distribution (lazy — no eval!)
     var sampled = mlx.mlx_array_new();
-    const key = seedKey(sampling);
-    defer _ = mlx.mlx_array_free(key);
-    _ = mlx.mlx_random_categorical(&sampled, current, -1, key, s);
+    categorical(&sampled, current, sampling, s) catch {};
     _ = mlx.mlx_array_free(current);
 
     return sampled; // Shape [1], lazy
@@ -949,6 +957,34 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
     return sampled;
 }
 
+/// One draw from the filtered logits `row`. MLX draws under `seedKey`. The engine draws the density's log under the key
+/// of the position the draw predicts, which is what a DSpark row does (`drawFromProbs`), and refuses a request that
+/// has no root for its keys.
+fn categorical(res: *mlx.mlx_array, row: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !void {
+    if (!mlx.engine.isStream(s)) {
+        const key = seedKey(sampling);
+        defer _ = mlx.mlx_array_free(key);
+        return mlx.check(mlx.mlx_random_categorical(res, row, -1, key, s));
+    }
+    const root = sampling.draw_root orelse {
+        _ = mlx.engine.refuse("sampler draw", "a draw on the engine needs the request's draw root for its key");
+        return error.EngineDrawNeedsRoot;
+    };
+    var probs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(probs);
+    try mlx.check(mlx.mlx_softmax_axis(&probs, row, -1, true, s));
+    return drawFromProbs(res, probs, random.drawKey(root, sampling.draw), s);
+}
+
+/// The engine's draw from a density `probs`: its log, drawn categorically under `key` (`random.drawKey`). A DSpark row
+/// and a serial step both draw this way, so one position gives one token whichever of them draws it.
+pub fn drawFromProbs(res: *mlx.mlx_array, probs: mlx.mlx_array, key: [2]u32, s: mlx.mlx_stream) !void {
+    var logp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logp);
+    try mlx.check(mlx.mlx_log(&logp, probs, s));
+    try mlx.check(mlx.engine.categoricalAt(res, logp, key));
+}
+
 /// PRNG key for one draw: `seed` mixed with the draw index, so a seeded
 /// request replays byte-for-byte and consecutive draws never share a key.
 /// Null-ctx (MLX global RNG) when the request set no seed.
@@ -971,6 +1007,8 @@ pub const MarkerShift = struct { mask: ?mlx.mlx_array, state: ThinkPenalty };
 /// temperature < 0.01 (`isGreedyTemperature`): greedy argmax. Otherwise: scale logits, apply top_p, and sample.
 /// If logprobs_n > 0, also computes logprobs for the sampled token and top N alternatives.
 pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: ?[]const u32, logprobs_n: u32, marker_shift: ?MarkerShift, s: mlx.mlx_stream) !SampleResult {
+    const host = mlx.engine.enter(s);
+    defer host.end();
     const shape = mlx.getShape(logits);
     const seq_len = shape[1];
 
@@ -1083,9 +1121,7 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
     var sampled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sampled);
 
-    const key = seedKey(sampling);
-    defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_categorical(&sampled, current, -1, key, s));
+    try categorical(&sampled, current, sampling, s);
 
     // Eval and extract
     try mlx.check(mlx.mlx_array_eval(sampled));
@@ -1110,6 +1146,8 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
 /// here would disagree with it at any temperature above 0).
 pub fn firstTokenLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen: u32, logprobs_n: u32, s: mlx.mlx_stream) !?LogprobResult {
     if (logprobs_n == 0) return null;
+    const host = mlx.engine.enter(s);
+    defer host.end();
     const shape = mlx.getShape(logits);
     if (shape.len != 3) return null;
     var last = mlx.mlx_array_new();
@@ -1144,6 +1182,7 @@ pub fn firstTokenLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, c
 /// saturation above is everywhere: rank 1 was measured to be the chosen token
 /// in 0 of 5 positions on a trivial greedy prompt.
 pub fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_token: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
+    if (mlx.engine.isStream(s)) return hostLogprobs(allocator, logits, chosen_token, top_n, s);
     // log_softmax in f32: `log(softmax(x))` in bf16 lands on bf16's grid (0.125 apart
     // between -16 and -32), and f16 underflows to -inf.
     var logits32 = mlx.mlx_array_new();
@@ -1239,10 +1278,52 @@ pub fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chos
     };
 }
 
+/// `computeLogprobs` on the engine's stream: the engine has no logsumexp or argpartition, and a row is one vocabulary
+/// of floats, so the row is read back once and ranked on the host. Values may differ from MLX's in the last bits;
+/// ranks break ties on the lower id.
+fn hostLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_token: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    var wide = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wide);
+    try mlx.check(mlx.mlx_astype(&wide, logits, .float32, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_contiguous(&flat, wide, false, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const shape = mlx.getShape(flat);
+    const vocab: usize = @intCast(shape[shape.len - 1]);
+    const all = mlx.mlx_array_data_float32(flat) orelse return error.MlxArrayDataNull;
+    const row = all[0..mlx.mlx_array_size(flat)][mlx.mlx_array_size(flat) - vocab ..];
+    var peak: f32 = -std.math.inf(f32);
+    for (row) |x| peak = @max(peak, x);
+    var total: f64 = 0;
+    for (row) |x| total += @exp(@as(f64, x) - peak);
+    const lse: f64 = @as(f64, peak) + @log(total);
+
+    const k: usize = @min(@as(usize, @min(top_n, 20)), vocab);
+    const top = try allocator.alloc(TokenLogprob, k);
+    errdefer allocator.free(top);
+    var filled: usize = 0;
+    if (k > 0) for (row, 0..) |x, id| {
+        // Ids arrive ascending, so a value equal to the last kept one ranks below it.
+        if (filled == k and x <= top[k - 1].logprob) continue;
+        var at = if (filled < k) filled else k - 1;
+        while (at > 0 and x > top[at - 1].logprob) : (at -= 1) top[at] = top[at - 1];
+        top[at] = .{ .token_id = @intCast(id), .logprob = x };
+        if (filled < k) filled += 1;
+    };
+    for (top[0..filled]) |*t| t.logprob = @floatCast(@as(f64, t.logprob) - lse);
+    const chosen: f32 = if (chosen_token < vocab) @floatCast(@as(f64, row[chosen_token]) - lse) else -100.0;
+    return .{ .token_logprob = chosen, .top_logprobs = if (filled < k) try allocator.realloc(top, filled) else top };
+}
+
 /// Apply a grammar token mask to logits. `mask[i]==true` keeps `logits[i]`,
 /// `false` replaces it with `-inf`. The mask is broadcast over leading dims so
 /// `logits` can be either `[1, vocab]` or `[1, 1, vocab]`.
 pub fn applyGrammarMask(allocator: std.mem.Allocator, res: *mlx.mlx_array, logits: mlx.mlx_array, mask: []const bool, s: mlx.mlx_stream) !void {
+    const host = mlx.engine.enter(s);
+    defer host.end();
     const shape = mlx.getShape(logits);
     const vocab_size: usize = @intCast(shape[shape.len - 1]);
     const logit_mask = try maskForLogitVocab(allocator, mask, vocab_size);
@@ -1261,6 +1342,8 @@ pub fn applyGrammarMask(allocator: std.mem.Allocator, res: *mlx.mlx_array, logit
 
 /// `logits` `[1, rows, vocab]` with each row's forbidden tokens at -inf; `masks` is `rows * vocab` bools.
 pub fn applyRowMasks(res: *mlx.mlx_array, logits: mlx.mlx_array, masks: []const bool, rows: usize, vocab: usize, s: mlx.mlx_stream) !void {
+    const host = mlx.engine.enter(s);
+    defer host.end();
     const shape = [_]c_int{ 1, @intCast(rows), @intCast(vocab) };
     const mask_arr = mlx.mlx_array_new_data(@ptrCast(masks.ptr), &shape, 3, .bool_);
     defer _ = mlx.mlx_array_free(mask_arr);

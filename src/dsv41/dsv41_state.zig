@@ -5,6 +5,7 @@ const trunk = @import("../trunk.zig");
 const arch_state = @import("../arch/arch_state.zig");
 const dsv41_model = @import("dsv41_model.zig");
 const dsv41_stream = @import("dsv41_stream.zig");
+const mlx = @import("../mlx.zig");
 const Trunk = trunk.Trunk;
 
 /// The model-lifetime state.
@@ -34,6 +35,12 @@ pub const State = struct {
     /// DeepSeek cuts its own rows back to the accepted prefix (`dsv41_model.finishVerify`) when it drafts with DSpark.
     pub fn specRollsBack(self: *const State) bool {
         return if (self.model) |m| m.dspark != null else false;
+    }
+
+    /// The stream the sampler and the token arrays run on after a forward: the engine's while decode runs there.
+    pub fn outStream(self: *const State, s: mlx.mlx_stream) mlx.mlx_stream {
+        const m = self.model orelse return s;
+        return if (m.engine_decode) mlx.engine.stream() else s;
     }
 
     pub fn reset(self: *State) void {

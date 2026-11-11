@@ -28,6 +28,24 @@ pub var enabled: bool = false;
 /// config) make engine objects.
 pub var active: bool = false;
 
+/// Host arrays and vectors made between `enter` and `Scope.end` are the engine's when `s` is its stream, and make no
+/// call into MLX. On any other stream it changes nothing.
+pub fn enter(s: S) Scope {
+    const own = core.isStream(s);
+    const was = active;
+    if (own) active = true;
+    return .{ .own = own, .was = was };
+}
+
+pub const Scope = struct {
+    own: bool,
+    was: bool,
+
+    pub fn end(self: Scope) void {
+        if (self.own) active = self.was;
+    }
+};
+
 /// Ops that went to MLX while the engine is on: what a request still builds there.
 pub var mlx_ops: u64 = 0;
 
@@ -519,6 +537,11 @@ pub fn mlx_astype(res: *A, a: A, dtype: mlx.mlx_dtype, _: S) c_int {
 
 pub fn mlx_view(res: *A, a: A, dtype: mlx.mlx_dtype, _: S) c_int {
     return op1("view", res, a, ops.reinterpret, .{dtype});
+}
+
+/// MLX's `copy` primitive shares its input's buffer (`Copy::eval_gpu` is `copy_shared_buffer`): a share, not a pass.
+pub fn mlx_copy(res: *A, a: A, _: S) c_int {
+    return op1("copy", res, a, core.share, .{});
 }
 
 pub fn mlx_contiguous(res: *A, a: A, _: bool, _: S) c_int {
@@ -2356,7 +2379,7 @@ test "engine sort and argsort give MLX's bytes: ties, one block and many, a bloc
     try expectSame(Build.sliced, &.{x});
 }
 
-test "engine cumsum gives MLX's bytes: exclusive and inclusive, short rows, a vocabulary row, a long row" {
+test "engine cumsum gives MLX's bytes: exclusive and inclusive, short rows, a vocabulary row, a long row, integers along any axis" {
     try mlx.requireGpu();
     const Build = struct {
         fn scan(comptime reverse: bool, comptime inclusive: bool) fn (S, []const A) anyerror!A {
@@ -2364,6 +2387,15 @@ test "engine cumsum gives MLX's bytes: exclusive and inclusive, short rows, a vo
                 fn build(s: S, in: []const A) anyerror!A {
                     var o: A = .{};
                     try mlx.check(mlx.mlx_cumsum(&o, in[0], -1, reverse, inclusive, s));
+                    return o;
+                }
+            }.build;
+        }
+        fn along(comptime axis: c_int, comptime reverse: bool, comptime inclusive: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_cumsum(&o, in[0], axis, reverse, inclusive, s));
                     return o;
                 }
             }.build;
@@ -2384,6 +2416,15 @@ test "engine cumsum gives MLX's bytes: exclusive and inclusive, short rows, a vo
         try expectSame(Build.scan(false, true), &.{x});
         try expectSame(Build.scan(true, false), &.{x});
     }
+    // Integers: the last axis, and a middle one, which MLX scans with another kernel.
+    var counts: [3 * 5 * 300]i32 = undefined;
+    for (&counts, 0..) |*v, i| v.* = @intCast(i * 7919 % 13);
+    const n = hostArray(i32, &counts, &.{ 3, 5, 300 }, .int32);
+    defer _ = mlx.mlx_array_free(n);
+    try expectSame(Build.scan(false, true), &.{n});
+    try expectSame(Build.scan(true, false), &.{n});
+    try expectSame(Build.along(1, false, true), &.{n});
+    try expectSame(Build.along(0, true, false), &.{n});
 }
 
 test "engine put_along_axis and pad give MLX's bytes: keep flags scattered along the last axis, a constant border" {
@@ -2942,4 +2983,149 @@ test "engine abs, logaddexp and floor divide give MLX's bytes: signed zeros and 
     defer _ = mlx.mlx_array_free(d);
     try expectSame(Build.binary(mlx.mlx_floor_divide), &.{ n, d });
     try expectSame(Build.binary(mlx.mlx_floor_divide), &.{ x, y });
+}
+
+test "engine copy shares its input, a view included, and gives MLX's bytes" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn viewCopy(s: S, in: []const A) !A {
+            var t: A = .{};
+            defer _ = mlx.mlx_array_free(t);
+            try mlx.check(mlx.mlx_transpose_axes(&t, in[0], &[_]c_int{ 1, 0 }, 2, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_copy(&o, t, s));
+            return o;
+        }
+    };
+    var values = ramp(f32, 6 * 7, 4, -2);
+    const x = hostArray(f32, &values, &.{ 6, 7 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const x16 = try castByMlx(x, .bfloat16);
+    defer _ = mlx.mlx_array_free(x16);
+    try expectSame(build1(mlx.mlx_copy), &.{x});
+    try expectSame(build1(mlx.mlx_copy), &.{x16});
+    try expectSame(Build.viewCopy, &.{x});
+}
+
+test "the penalties and the think penalty on the engine's stream give MLX's bytes: one row, verify rows, a bias" {
+    try mlx.requireGpu();
+    const seen_penalty = @import("../seen_penalty.zig");
+    const think_penalty = @import("../think_penalty.zig");
+    const vocab = 300;
+    const rows = 5;
+    const open: u32 = 20;
+    const closer: u32 = 21;
+    const Chain = struct {
+        fn one(comptime pen: seen_penalty.Penalties) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try seen_penalty.apply(&o, in[0], in[1], pen, s);
+                    return o;
+                }
+            }.build;
+        }
+        fn block(comptime pen: seen_penalty.Penalties) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try seen_penalty.shiftRows(&o, in[0], in[2], in[1], pen, s);
+                    return o;
+                }
+            }.build;
+        }
+        fn think(comptime span: think_penalty.ThinkPenalty.Phase, comptime biased: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    const file = [_]@import("../logit_bias.zig").Bias{ .{ .id = 2, .delta = 1, .scope = .reasoning }, .{ .id = 5, .delta = 3, .scope = .answer } };
+                    var p = think_penalty.ThinkPenalty{ .lambda = 2.5, .opener_id = open, .closer_id = closer, .phase = span, .file_biases = if (biased) &file else &.{} };
+                    try p.prepare(t_std.allocator, vocab, in[3], s);
+                    defer p.deinitPrepared();
+                    var o: A = .{};
+                    try think_penalty.shiftScoped(&o, in[0], in[3], p, in[2], s);
+                    return o;
+                }
+            }.build;
+        }
+    };
+    var values = ramp(f32, rows * vocab, 12, -6);
+    const logits = hostArray(f32, &values, &.{ 1, rows, vocab }, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const row = hostArray(f32, values[0..vocab], &.{ 1, vocab }, .float32);
+    defer _ = mlx.mlx_array_free(row);
+    var counts_host: [vocab]i32 = @splat(0);
+    for ([_]usize{ 3, 40, 41, 250 }, 0..) |id, i| counts_host[id] = @intCast(i + 1);
+    const counts = hostArray(i32, &counts_host, &.{vocab}, .int32);
+    defer _ = mlx.mlx_array_free(counts);
+    const ids_host = [rows]i32{ 40, 7, 3, 7, 250 };
+    const ids = hostArray(i32, &ids_host, &.{ 1, rows }, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    const think_ids_host = [rows]i32{ 7, open, 8, closer, 9 };
+    const think_ids = hostArray(i32, &think_ids_host, &.{ 1, rows }, .int32);
+    defer _ = mlx.mlx_array_free(think_ids);
+    var mask_host: [vocab]bool = @splat(false);
+    for ([_]usize{ 2, 5, 100, 299 }) |id| mask_host[id] = true;
+    const mask = hostArray(bool, &mask_host, &.{vocab}, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+
+    try expectSame(Chain.one(.{ .repeat = 1.3 }), &.{ row, counts });
+    try expectSame(Chain.one(.{ .repeat = 1.3, .presence = 0.5, .frequency = 0.25 }), &.{ row, counts });
+    try expectSame(Chain.one(.{ .presence = 0.5, .frequency = 0.25 }), &.{ row, counts });
+    try expectSame(Chain.block(.{ .repeat = 1.3 }), &.{ logits, counts, ids });
+    try expectSame(Chain.block(.{ .repeat = 1.3, .presence = 0.5, .frequency = 0.25 }), &.{ logits, counts, ids });
+    try expectSame(Chain.think(.inside, false), &.{ logits, counts, think_ids, mask });
+    try expectSame(Chain.think(.before, false), &.{ logits, counts, think_ids, mask });
+    try expectSame(Chain.think(.inside, true), &.{ logits, counts, think_ids, mask });
+    try expectSame(Chain.think(.before, true), &.{ logits, counts, think_ids, mask });
+}
+
+test "logprobs on the engine's stream rank as MLX's do and agree to the last bits: the chosen token, the top ids, a tie, a wide row" {
+    try mlx.requireGpu();
+    const sampler = @import("../sampler.zig");
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    const vocab = 129280;
+    var values = ramp(f32, vocab, 14, -7);
+    // Two equal leaders (the lower id ranks first), and a leader far above the rest.
+    values[900] = 9.5;
+    values[77] = 9.5;
+    values[128000] = 11;
+    const f32_row = hostArray(f32, &values, &.{ 1, vocab }, .float32);
+    defer _ = mlx.mlx_array_free(f32_row);
+    const f32_3d = hostArray(f32, &values, &.{ 1, 1, vocab }, .float32);
+    defer _ = mlx.mlx_array_free(f32_3d);
+    const bf16_row = try castByMlx(f32_row, .bfloat16);
+    defer _ = mlx.mlx_array_free(bf16_row);
+    for ([_]A{ f32_row, f32_3d, bf16_row }) |logits| for ([_]u32{ 128000, 900, 5, vocab + 3 }) |chosen| {
+        const want = try sampler.computeLogprobs(t_std.allocator, logits, chosen, 5, gpu);
+        defer t_std.allocator.free(want.top_logprobs);
+        const got = try sampler.computeLogprobs(t_std.allocator, logits, chosen, 5, core.stream());
+        defer t_std.allocator.free(got.top_logprobs);
+        try t_std.expectEqual(want.top_logprobs.len, got.top_logprobs.len);
+        try t_std.expectApproxEqAbs(want.token_logprob, got.token_logprob, 1e-4);
+        // A bf16 row ties wherever its fifth place is, and MLX's partition breaks that tie arbitrarily: the leaders only.
+        const compared = if (logits.ctx == bf16_row.ctx) 3 else want.top_logprobs.len;
+        for (want.top_logprobs[0..compared], got.top_logprobs[0..compared]) |w, g| {
+            try t_std.expectEqual(w.token_id, g.token_id);
+            try t_std.expectApproxEqAbs(w.logprob, g.logprob, 1e-4);
+        }
+    };
+    // Past twenty the list stops at twenty; a row of two ids gives two.
+    const big = try sampler.computeLogprobs(t_std.allocator, f32_row, 0, 99, core.stream());
+    defer t_std.allocator.free(big.top_logprobs);
+    try t_std.expectEqual(@as(usize, 20), big.top_logprobs.len);
+    const two = hostArray(f32, &[_]f32{ 1, 3 }, &.{ 1, 2 }, .float32);
+    defer _ = mlx.mlx_array_free(two);
+    const short = try sampler.computeLogprobs(t_std.allocator, two, 0, 5, core.stream());
+    defer t_std.allocator.free(short.top_logprobs);
+    try t_std.expectEqual(@as(usize, 2), short.top_logprobs.len);
+    try t_std.expectEqual(@as(u32, 1), short.top_logprobs[0].token_id);
+    // The engine's stream reads the row once and puts no op on MLX.
+    const before = mlx_ops;
+    const once = try sampler.computeLogprobs(t_std.allocator, f32_row, 128000, 5, core.stream());
+    defer t_std.allocator.free(once.top_logprobs);
+    try t_std.expectEqual(before, mlx_ops);
 }
