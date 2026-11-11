@@ -188,7 +188,11 @@ pub const Experts = union(enum) {
         ctx: *anyopaque,
         /// The routed sum (f32 `[L, dim]`) of normed `x` over router picks `idx` (`[L, k]`) weighted `wts`, plus `shared`
         /// (the shared expert's `[L, dim]`) added in f32 when given. `logits` are the router's (`Routes.logits`).
-        apply: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?SharedOp) anyerror!A,
+        /// `local` (none when the router made none): the picks' slots in a resident layer's bank, which `slot_map` gave it.
+        apply: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, local: A, shared: ?SharedOp) anyerror!A,
+        /// Layer `layer`'s map from expert id to bank slot (none where it has none), so the router can give the slots with
+        /// the picks: the cache map of a `queued` layer, else the map of a layer whose experts are all resident.
+        slot_map: ?*const fn (ctx: *anyopaque, layer: usize, queued: bool) A = null,
         /// The layer's picks `idx` (`[L, k]`) made readable as banks, with the ids as slots of those banks. The banks
         /// stay valid until `release`, which the caller calls once everything reading them is evaluated.
         lease: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!Lease,
@@ -210,7 +214,7 @@ pub const Experts = union(enum) {
         /// The routed sum plus `shared` (as `Hook.apply`) over the slots the map holds for the picks `idx`, with no host
         /// read; `map` is the host copy of that map, kept until the layer is settled.
         /// `ride` is submitted with the picks, in the same command buffer; null leaves the picks to the layer's own submit.
-        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, ride: ?[]const A) anyerror!Queued,
+        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, local: A, wts: A, shared: SharedOp, ride: ?[]const A) anyerror!Queued,
         /// The host's side of a queued layer: null when every pick sat in the slot the GPU read, else the exact sum.
         /// `kept` holds the queued chain's planes, which a settle may reuse for the picks that held.
         settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, map: []const i32, kept: exl3.rate_groups.Kept) anyerror!?A,
@@ -387,11 +391,13 @@ const Ring = struct {
     buf: A,
     cap: usize,
     width: usize,
+    /// The buffer's dtype, so a launch that takes the ring reads nothing off it.
+    dt: mlx.mlx_dtype,
 
     fn init(cap: usize, width: usize, dt: mlx.mlx_dtype, s: S) !Ring {
         var z = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ ci(cap), ci(width) }, 2, dt, s));
-        return .{ .buf = z, .cap = cap, .width = width };
+        return .{ .buf = z, .cap = cap, .width = width, .dt = dt };
     }
 
     fn deinit(self: *Ring) void {
@@ -419,6 +425,12 @@ const Ring = struct {
             self.buf = up;
             done += run;
         }
+    }
+
+    /// The ring as `write` of rows `x` at `p0` would leave it, made by another launch: `next` replaces the buffer.
+    fn replace(self: *Ring, next: A) void {
+        _ = mlx.mlx_array_free(self.buf);
+        self.buf = next;
     }
 
     /// Rows for positions [lo, hi) in order; `hi - lo <= cap`.
@@ -1711,6 +1723,8 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
     const masked = cs >= 0 and li > @as(usize, @intCast(cs)) and cand.ctx != null;
     const bs = if (cs >= 0) c.cand_block_size else 0;
     var idx: A = undefined;
+    // The scan's top-k launch gives the picks already masked to each query's groups.
+    var below = none;
     if (streamsIndex(sc, m, Ls, nb)) {
         _ = index_streams.fetchAdd(1, .monotonic);
         const kb = if (is_source and (nb + bs - 1) / bs > c.cand_blocks) c.cand_blocks else 0;
@@ -1755,10 +1769,14 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
             const rep = try sc.res(mlx.mlx_repeat_axis(&o, cand.*, ci(bs), -1, sc.s), &o);
             scores = try sc.where(try sc.slice(rep, -1, 0, nb), scores, ninf);
         }
-        idx = try topkRows(sc, m, scores, kk);
+        const ssh = mlx.getShape(scores);
+        if (fusedOn(sc, m) and ssh.len == 2 and kernels.topkSplits(@intCast(ssh[0]), @intCast(ssh[1]), kk) == 1)
+            below = try kernels.topkIndicesBelow(sc, try sc.astype(scores, .float32), @intCast(ssh[0]), kk, lens)
+        else
+            idx = try topkRows(sc, m, scores, kk);
         if (m.trace) |t| try t.put("index_scores_{d}", .{li}, scores);
     }
-    const picked = try sc.where(try sc.lt(idx, lens), idx, try sc.i(-1));
+    const picked = if (below.ctx != null) below else try sc.where(try sc.lt(idx, lens), idx, try sc.i(-1));
     if (m.trace) |t| try t.put("index_idx_{d}", .{li}, picked);
     return picked;
 }
@@ -1962,7 +1980,16 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     try tapInput(m, li, .q_lora, qr);
     const q_proj = try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(H), ci(hd) });
     const joint = fus and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_proj) == mlx.mlx_array_dtype(in[1]);
-    const rk = if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
+    const window = c.window;
+    // A decode block's heads read the ring after this step's write (below); that launch writes the row into it.
+    const decode_attn = fus and L <= NARROW_ROWS and rd > 0 and kernels.attnDecodeFits(hd) and ls.win.cap >= window + L - 1;
+    const ring_joint = joint and decode_attn and ls.win.dt == mlx.mlx_array_dtype(in[1]) and ls.win.width == hd and hd % 8 == 0;
+    var next_ring = none;
+    const rk: ?kernels.QKv = if (ring_joint) blk: {
+        const r = try kernels.ropeKvRing(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on, ls.win.buf, ls.win.cap, ls.win.width);
+        next_ring = r.ring;
+        break :blk .{ .q = r.q, .kv = none };
+    } else if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
     const q = if (rk) |r| r.q else try ropeQ(sc, m, q_proj, rope, pos, false, .none, null);
     if (pf) |p| try p.mark(.q, &.{ qr, q });
     const kv = if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
@@ -1976,11 +2003,10 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         try p.mark(.compress, ev.items);
     }
 
-    const window = c.window;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-    if (fus and L <= NARROW_ROWS and rd > 0 and kernels.attnDecodeFits(hd) and ls.win.cap >= window + L - 1) {
+    if (decode_attn) {
         // The ring holds this chunk's rows before the kernel reads them; the heads leave inverse-rotated.
-        try ls.win.write(kv, p0, sc.s);
+        if (ring_joint) ls.win.replace(sc.out(next_ring)) else try ls.win.write(kv, p0, sc.s);
         const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
         if (pf) |p| try p.mark(.indexer, &.{ ls.win.buf, picks.comp_rows, picks.topk });
         if (width_probe) |t| {
@@ -2151,7 +2177,8 @@ fn fusedOn(sc: *const Scope, m: *const Model) bool {
 
 /// The router's picks `idx` (`[L, k]` ids) and their weights `wts` (`[L, k]` f32): sqrt-softplus scores, the f32
 /// bias picks only, normalized, times the routed scale.
-fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix) !kernels.Routes {
+/// `queued`: the layer's routed chain is queued from the cache map (`Hook.Spec.queue`), whose slots the router then gives.
+fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix, queued: bool) !kernels.Routes {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const K = ly.top_k;
@@ -2165,8 +2192,16 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix) !k
             try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32)));
         var r = if (mix) |mx| blk: {
             if (mx.sp != null or mx.z.ctx == null) break :blk try kernels.route(sc, logits, bias, K, norm, c.route_scale);
-            // The FFN stage's mixes are split in the router's launch.
-            const rs = try kernels.routeSplit(sc, logits, bias, K, norm, c.route_scale, mx.z, c.hc_mult, c.hc_iters, try kernels.hcEps(sc, c.eps, c.hc_eps));
+            // The FFN stage's mixes are split in the router's launch, and a resident layer's slots are mapped in it.
+            const eps = try kernels.hcEps(sc, c.eps, c.hc_eps);
+            const map = if (li < c.layers) switch (m.experts) {
+                .hook => |hk| if (hk.slot_map) |f| f(hk.ctx, li, queued) else none,
+                .resident => none,
+            } else none;
+            const rs = if (map.ctx != null)
+                try kernels.routeSplitSlots(sc, logits, bias, K, norm, c.route_scale, mx.z, c.hc_mult, c.hc_iters, eps, map)
+            else
+                try kernels.routeSplit(sc, logits, bias, K, norm, c.route_scale, mx.z, c.hc_mult, c.hc_iters, eps);
             mx.sp = .{ .pre = rs.split.pre, .post = rs.split.post, .comb = rs.split.comb };
             break :blk rs.routes;
         } else try kernels.route(sc, logits, bias, K, norm, c.route_scale);
@@ -2232,7 +2267,7 @@ fn ffnDecode(sc: *Scope, m: *const Model, li: usize, h: A, x1: A, mix: *HcMix) !
     const c = &m.cfg;
     if (c.expert_dec != null or m.tap != null or !fusedOn(sc, m) or dim(h, 0) != 1 or !kernels.moeDecodeFits(c.dim, c.moe_inter)) return null;
     const sh = sharedQuant(&m.layers[li]) orelse return null;
-    const r = try router(sc, m, li, h, none, mix);
+    const r = try router(sc, m, li, h, none, mix, false);
     const sf = try mix.splitOnce(sc, m);
     const lease = try leaseBanks(sc, m, li, r.idx);
     defer releaseBanks(m, li);
@@ -2541,7 +2576,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
             @memcpy(rode[0..ride.len], ride);
             const rode_n = ride.len + @intFromBool(pred.ctx != null);
             if (pred.ctx != null) rode[ride.len] = pred;
-            var q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li, .expand = expand } }, if (pred.ctx != null) rode[0..rode_n] else null);
+            var q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.local, r.wts, .{ .layer = .{ .m = m, .li = li, .expand = expand } }, if (pred.ctx != null) rode[0..rode_n] else null);
             errdefer q.kept.deinit();
             const out = try sc.astype(q.out, m.act);
             sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts), .kept = q.kept };
@@ -2563,7 +2598,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
             if (pf) |p| try p.mark(.shared, &.{sy.array});
         }
         const host0 = if (pf != null and hk.host_ns != null) hk.host_ns.?(hk.ctx) else 0;
-        const out = try sc.astype(try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, sy), m.act);
+        const out = try sc.astype(try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, r.local, sy), m.act);
         if (pf) |p| {
             try p.mark(.routed, &.{out});
             if (hk.host_ns) |f| p.hostShare(f(hk.ctx) - host0);
@@ -2574,7 +2609,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
     if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, li, ly, h));
     const y = if (li >= c.layers) try routedSum(sc, c, m.act, h, m.dspark.?.banks[li - c.layers], r.idx, r.wts) else if (m.tap) |t| try routedTapped(sc, m, t, li, h, r) else switch (m.experts) {
         .resident => |banks| try routedSum(sc, c, m.act, h, banks[li], r.idx, r.wts),
-        .hook => |hk| try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, null),
+        .hook => |hk| try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, r.local, null),
     };
     const sy = try sharedExpert(sc, m, li, ly, h);
     return sc.astype(try sc.add(y, try sc.astype(sy, .float32)), m.act);
@@ -2705,7 +2740,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);
     if (width_probe) |t| try t.put("ffn_in_{d}", .{li}, h2);
     if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, &mix)) |x2| return .{ .x = sc.out(x2), .pre = sc.out(mix.sp.?.pre) };
-    const r = try router(sc, m, li, h2, sh.img, &mix);
+    const r = try router(sc, m, li, h2, sh.img, &mix, sh.spec_on);
     const sf = try mix.splitOnce(sc, m);
     const folded = foldsExpand(m, sh, li, x1);
     expands_folded += @intFromBool(folded);
@@ -3043,6 +3078,7 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
         const b = slots[2 * li + 1];
         if (!present(a[0]) or dim(a[0], 0) != ls.win.cap) return error.Dsv41CheckpointMismatch;
         try shareInto(&ls.win.buf, a[0]);
+        ls.win.dt = mlx.mlx_array_dtype(a[0]);
         try shareInto(&ls.pend_kv, a[1]);
         try shareInto(&ls.pend_gate, a[2]);
         const r = m.ratio(li);
@@ -3093,6 +3129,7 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
     for (st.layers, 0..) |*ls, li| {
         const a = slots[2 * li];
         try shareInto(&ls.win.buf, a[0]);
+        ls.win.dt = mlx.mlx_array_dtype(a[0]);
         try shareInto(&ls.pend_kv, a[1]);
         try shareInto(&ls.pend_gate, a[2]);
         if (ls.comp) |*rows| rows.used = n / m.ratio(li);
@@ -6317,7 +6354,7 @@ fn expectMaskedRoute(sc: *Scope, full: *Model, cut: *Model, d: *const expert_usa
     const c = &full.cfg;
     const k = c.top_k;
     const rows: usize = @intCast(dim(h, 0));
-    const r = try router(sc, cut, li, h, none, null);
+    const r = try router(sc, cut, li, h, none, null, false);
     const idx = try sc_mod.hostI32(try sc.astype(r.idx, .int32));
     const wts = try sc_mod.hostF32(r.wts);
 
@@ -6370,7 +6407,7 @@ fn expectStoredRouterExact(dir: []const u8) !void {
     const Bits = struct { logits: []const f32, idx: []const i32, wts: []const f32 };
     const bits = struct {
         fn of(sc_: *Scope, m_: *Model, li: usize, h: A) !Bits {
-            const r = try router(sc_, m_, li, h, none, null);
+            const r = try router(sc_, m_, li, h, none, null, false);
             return .{ .logits = try sc_mod.hostF32(r.logits), .idx = try sc_mod.hostI32(try sc_.astype(r.idx, .int32)), .wts = try sc_mod.hostF32(r.wts) };
         }
     }.of;
@@ -6570,11 +6607,11 @@ test "dsv41 vision: an image row picks its experts by the image bias, a text row
     for (0..m.cfg.layers) |li| {
         const ly = &m.layers[li];
         const k = ly.top_k;
-        const text = try router(&sc, m, li, h, none, null);
-        const mixed = try router(&sc, m, li, h, img, null);
+        const text = try router(&sc, m, li, h, none, null, false);
+        const mixed = try router(&sc, m, li, h, img, null, false);
         const saved = ly.gate_bias;
         ly.gate_bias = ly.gate_bias_vl;
-        const vl = try router(&sc, m, li, h, none, null);
+        const vl = try router(&sc, m, li, h, none, null, false);
         ly.gate_bias = saved;
         const mixed_idx = try sc_mod.hostI32(try sc.astype(mixed.idx, .int32));
         const text_idx = try sc_mod.hostI32(try sc.astype(text.idx, .int32));

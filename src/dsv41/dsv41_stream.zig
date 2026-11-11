@@ -66,7 +66,7 @@ pub const Stream = struct {
         return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque };
     }
 
-    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?model.SharedOp) anyerror!A {
+    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, _: A, shared: ?model.SharedOp) anyerror!A {
         const self: *Stream = @ptrCast(@alignCast(ctx));
         const y = try self.apply(sc, layer, x, idx, wts);
         return if (shared) |op| sc.add(y, try sc.astype(try op.value(sc, x), .float32)) else y;
@@ -196,7 +196,7 @@ pub const StqStream = struct {
     }
 
     pub fn hook(self: *StqStream) model.Experts.Hook {
-        return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque, .host_ns = hostNsOpaque, .prefetch = prefetchOpaque, .can_prefetch = canPrefetchOpaque, .spec = .{
+        return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque, .host_ns = hostNsOpaque, .slot_map = slotMapOpaque, .prefetch = prefetchOpaque, .can_prefetch = canPrefetchOpaque, .spec = .{
             .can = canQueue,
             .queue = queueOpaque,
             .settle = settleOpaque,
@@ -211,13 +211,13 @@ pub const StqStream = struct {
     }
 
     /// The chain over the slots the layer's GPU map holds for the picks, which the host checks in `settle`.
-    fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp, ride: ?[]const A) anyerror!model.Experts.Queued {
+    fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, local_in: A, wts: A, shared: model.SharedOp, ride: ?[]const A) anyerror!model.Experts.Queued {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         const spec = try self.engine.specGrouped(@intCast(layer)) orelse return error.Dsv41StqLayerNotGrouped;
         const idx32 = try sc.astype(idx, .int32);
         // Submitted before the chain, so the host's read of the picks waits for the router only, not for the chain.
         if (ride) |r| try model.submitWith(idx32, r);
-        const local = try sc.take(spec.slots, idx32, 0);
+        const local = if (local_in.ctx != null) local_in else try sc.take(spec.slots, idx32, 0);
         var kept: exl3.rate_groups.Kept = .{};
         errdefer kept.deinit();
         const out = try model.stqRoutedKept(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), spec.bank, x, local, wts, shared, &kept);
@@ -288,9 +288,15 @@ pub const StqStream = struct {
         return self.engine.fill_ns_total + self.engine.copy_ns_total;
     }
 
-    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?model.SharedOp) anyerror!A {
+    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, local: A, shared: ?model.SharedOp) anyerror!A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
-        return self.applyScored(sc, layer, x, idx, wts, logits, shared orelse return error.Dsv41StqNeedsSharedExpert);
+        return self.applyScored(sc, layer, x, idx, wts, logits, local, shared orelse return error.Dsv41StqNeedsSharedExpert);
+    }
+
+    fn slotMapOpaque(ctx: *anyopaque, layer: usize, queued: bool) A {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        if (queued) return if (self.engine.specGrouped(@intCast(layer)) catch null) |spec| spec.slots else .{ .ctx = null };
+        return if (self.engine.residentRoute(@intCast(layer))) |rr| rr.map else .{ .ctx = null };
     }
 
     /// The FP4 kernels lease banks; trellis experts never reach them.
@@ -302,15 +308,15 @@ pub const StqStream = struct {
 
     /// The routed sum plus the shared expert's `shared`, f32 `[L, dim]`.
     pub fn apply(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) !A {
-        return self.applyScored(sc, layer, x, idx, wts, .{ .ctx = null }, .{ .array = shared });
+        return self.applyScored(sc, layer, x, idx, wts, .{ .ctx = null }, .{ .ctx = null }, .{ .array = shared });
     }
 
     /// `apply` with the router's `logits`, which a decode-width route's lossy pick (`stream.pick_tolerance`) reads.
-    pub fn applyScored(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: model.SharedOp) !A {
+    pub fn applyScored(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, local_in: A, shared: model.SharedOp) !A {
         if (!mlx.streamIsGpu(sc.s)) return error.Dsv41StreamRequiresGpu;
         // A resident layer maps the picks to slots on the GPU: no host read, so the forward is never stalled on one.
         if (self.engine.residentRoute(@intCast(layer))) |rr| {
-            const local = try sc.take(rr.map, try sc.astype(idx, .int32), 0);
+            const local = if (local_in.ctx != null) local_in else try sc.take(rr.map, try sc.astype(idx, .int32), 0);
             return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, shared);
         }
         const gpa = self.engine.allocator;
@@ -1497,7 +1503,7 @@ test "dsv41 stq: a settle that recomputes only the picks off the map gives the w
         defer testing.allocator.free(none_map);
         @memset(none_map, -1);
         _ = try StqStream.settleOpaque(h, &sc, layer, x, idx, wts, shared, none_map, .{});
-        var q = try StqStream.queueOpaque(h, &sc, layer, x, idx, wts, shared, null);
+        var q = try StqStream.queueOpaque(h, &sc, layer, x, idx, .{ .ctx = null }, wts, shared, null);
         defer q.kept.deinit();
         try mlx.check(mlx.mlx_array_eval(q.out));
         // The picks the chain read from the map, taken off it: the settle sees them move.

@@ -212,6 +212,24 @@ Every op is tested against the MLX op it replaces (`src/tensor/route.zig`, `expe
   joined by ` + `). The `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each` lines (debug; the top 40
   by total GPU time and one remainder line) follow `[engine] since load:` and the decode meter's `[fwd-ubench] engine:`
   line, the latter per forward. The forward runs slower under it; read the table's shares, not the forward's wall time.
+- **Dispatches a forward, one row at 4096 keys, M5 Max, STQ 1.75bpw** (`SUSHI_DECODE_FWD_UBENCH` S=1 and S=3,
+  `SUSHI_ENGINE_KERNEL_PROF=1`, `--ssd-budget-gb 108`, 100 forwards, one load each): 1140 on 97995014, 1043 with three glue ops folded into the kernel before them
+  (slots of the picks in the router's launch, the window row's ring write in `dsv41_rope_kv_ring`, the index picks' mask in the
+  top-k); three rows 1292 and 1154. The profile's GPU ms differ 3.6 times between loads by the clock state the idle gaps leave the GPU in
+  (the untouched `fz_down` kernel read 207, 144 and 57 us in three loads), so compare kernels by their time scaled to an untouched
+  kernel's, not across loads: the glue removed at one row is `sushi_take` 0.39 ms, `sushi_copy_into` 0.32, `sushi_bin_less` +
+  `sushi_where` 0.16 in the base load's clock, and the three fused kernels cost what their first halves did (route 1.080 against 1.079 ms,
+  rope 0.632 against 0.669, top-k 0.253 against 0.256).
+- **At 131,072 keys the forward grows by the index scan alone** (the same tree with the three folds, same settings, `SUSHI_DECODE_FWD_UBENCH_KV=131072`,
+  S=1 and 3 in one load, 60 forwards): 1071 and 1172 dispatches against 1043 and 1154. The attention kernels (`attn_split`, `attn_merge`)
+  hold their share (7.7% to 6.2% at one row, 8.8% to 9.0% at three: window plus top-k rows, not keys); the index family
+  (`index_scores_*`, `topk*`, `cand_keys`, `pack_fp4`) goes from 2.1 to 5.2% at one row and 2.5 to 4.9% at three, a candidate source
+  scanning in full and four later layers scoring only its blocks through `index_scores_gather`. Shares are scaled to `fz_down` within a
+  load; the one-row 4096 and 131k loads sat at different clocks (144 and 55 us), so only the three-row ratios are steady.
+- **Fusing a dependent pair needs the consumer to read only what its own threadgroup wrote.** `gate` into `route_split` (48 threadgroups
+  into one), `attn_split` into `attn_merge` (the S partials), `rows` into `rows_finish` (the k-split partials) and each stage of the
+  routed chain fail that test; a last-arrival counter would pass it with bytes equal, but needs a zeroed, mutable, hazard-tracked
+  scratch the launch seam does not offer (outputs are fresh and unzeroed, inputs are const).
 - **GPU busy and idle are read from the command buffers** (`GPUStartTime`, `GPUEndTime`), which Metal fills after
   the completion signal: a finished buffer is read at a later prune, in order.
 - **The round's verdict stays on the engine** (`dsv41_serving.verdictStream`): the masked argmax over the verify's

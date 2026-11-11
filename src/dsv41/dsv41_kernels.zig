@@ -256,7 +256,12 @@ const GATE_SOURCE =
 
 /// One row a threadgroup, one expert a thread: sqrt-softplus scores, the bias-picked top K (lowest index on ties),
 /// their scores normalized (NORM) and scaled by scal[0].
-const ROUTE_SOURCE =
+const ROUTE_SOURCE = "\n#define ROUTE_SLOT(i, e)\n" ++ ROUTE_BODY;
+
+/// `ROUTE_SOURCE` that also writes `local[i] = map[pick]` beside each pick: a resident layer's slot of the expert.
+const ROUTE_SLOTS_SOURCE = "\n#define ROUTE_SLOT(i, e) local[i] = map[e]\n" ++ ROUTE_BODY;
+
+const ROUTE_BODY =
     \\const int e = thread_position_in_threadgroup.x, l = threadgroup_position_in_grid.y;
     \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int E = logits_shape[1];
@@ -291,6 +296,7 @@ const ROUTE_SOURCE =
     \\  const float div = NORM ? sum + 1e-20f : 1.0f;
     \\  for (int r = 0; r < K; ++r) {
     \\    idx[l * K + r] = uint(t_pick[r]);
+    \\    ROUTE_SLOT(l * K + r, t_pick[r]);
     \\    wts[l * K + r] = t_s[t_pick[r]] / div * scal[0];
     \\  }
     \\}
@@ -385,6 +391,15 @@ const TOPK_CHUNK_SOURCE = TOPK_PRE ++
     \\
 ++ TOPK_BODY;
 
+/// `TOPK_SOURCE` that writes -1 for a pick not under its row's length `lens[l]`.
+const TOPK_BELOW_SOURCE = TOPK_PRE ++
+    \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
+    \\const auto xr = x + size_t(l) * n;
+    \\#define ELEM(i) dsv41_key(xr[i])
+    \\#define EMIT(p, i) out[size_t(l) * K + (p)] = (int(i) < lens[l] ? int(i) : -1)
+    \\
+++ TOPK_BODY;
+
 /// The K largest of each row of `x` among its candidate indices `ids` `[L, C]` (ascending).
 const TOPK_MERGE_SOURCE = TOPK_PRE ++
     \\const int l = threadgroup_position_in_grid.y, n = ids_shape[1];
@@ -426,7 +441,7 @@ const DENSE_F32X_SOURCE =
 
 /// `ROUTE_SOURCE` beside the hc split of the row's mixes `z` (`HC_SPLIT_BODY`), which the router does not wait for or
 /// feed: the grid's second threadgroup of a row is the split, so the two run on different cores as two launches did.
-const ROUTE_SPLIT_SOURCE =
+const ROUTE_SPLIT_PRE =
     \\if (threadgroup_position_in_grid.x == 1u) {
     \\#pragma clang fp contract(off)
     \\  if (simdgroup_index_in_threadgroup != 0u) return;
@@ -434,12 +449,17 @@ const ROUTE_SPLIT_SOURCE =
 ++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
     \\  return;
     \\}
-++ ROUTE_SOURCE;
+;
+
+const ROUTE_SPLIT_SOURCE = ROUTE_SPLIT_PRE ++ ROUTE_SOURCE;
+const ROUTE_SPLIT_SLOTS_SOURCE = ROUTE_SPLIT_PRE ++ ROUTE_SLOTS_SOURCE;
 
 var gate_def = Def{ .name = "dsv41_gate", .ins = &.{ "x", "w" }, .outs = &.{"logits"}, .source = GATE_SOURCE };
 var route_def = Def{ .name = "dsv41_route", .ins = &.{ "logits", "bias", "scal" }, .outs = &.{ "idx", "wts" }, .source = ROUTE_SOURCE };
 var route_split_def = Def{ .name = "dsv41_route_split", .ins = &.{ "logits", "bias", "scal", "z", "eps" }, .outs = &.{ "idx", "wts", "pre", "post", "comb" }, .source = ROUTE_SPLIT_SOURCE };
+var route_split_slots_def = Def{ .name = "dsv41_route_split_slots", .ins = &.{ "logits", "bias", "scal", "z", "eps", "map" }, .outs = &.{ "idx", "wts", "pre", "post", "comb", "local" }, .source = ROUTE_SPLIT_SLOTS_SOURCE };
 var topk_def = Def{ .name = "dsv41_topk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_SOURCE, .header = TOPK_HEADER };
+var topk_below_def = Def{ .name = "dsv41_topk_below", .ins = &.{ "x", "kk", "lens" }, .outs = &.{"out"}, .source = TOPK_BELOW_SOURCE, .header = TOPK_HEADER };
 var topk_chunk_def = Def{ .name = "dsv41_topk_chunk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_CHUNK_SOURCE, .header = TOPK_HEADER };
 var topk_merge_def = Def{ .name = "dsv41_topk_merge", .ins = &.{ "x", "ids", "kk" }, .outs = &.{"out"}, .source = TOPK_MERGE_SOURCE, .header = TOPK_HEADER };
 var dense_f32x_def = Def{ .name = "dsv41_dense_f32x", .ins = &.{ "x", "w" }, .outs = &.{"out"}, .source = DENSE_F32X_SOURCE };
@@ -459,7 +479,13 @@ pub fn gateLogits(sc: *Scope, x: A, w: A) !A {
 }
 
 /// `logits` (f32 `[L, E]`, the router's pre-score output) rides along for a streamed layer's lossy pick.
-pub const Routes = struct { idx: A, wts: A, logits: A = .{ .ctx = null } };
+pub const Routes = struct {
+    idx: A,
+    wts: A,
+    logits: A = .{ .ctx = null },
+    /// The slots of a resident layer's bank for `idx` (int32 `[L, k]`), when the router made them.
+    local: A = .{ .ctx = null },
+};
 
 /// The `k` experts of each row of `logits` `[L, E]` (E <= 1024): picked by sqrt-softplus score plus `bias`
 /// (`[1, E]` or `[L, E]`, f32), weighted by the unbiased score, normalized when `norm`, times `scale`.
@@ -475,8 +501,10 @@ pub fn route(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32) !
     return .{ .idx = o[0], .wts = o[1] };
 }
 
+pub const RouteSplit = struct { routes: Routes, split: HcSplit };
+
 /// `route` and `hcSplitZ(z)` in one launch.
-pub fn routeSplit(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32, z: A, hc: usize, iters: usize, eps: A) !struct { routes: Routes, split: HcSplit } {
+pub fn routeSplit(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32, z: A, hc: usize, iters: usize, eps: A) !RouteSplit {
     const L = dim(logits, 0);
     const E = dim(logits, 1);
     const tg = (E + 31) / 32 * 32;
@@ -489,6 +517,23 @@ pub fn routeSplit(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f
         .{ .shape = &.{ ci(L), ci(hc), ci(hc) }, .dt = .float32 },
     }, .{ 2 * tg, L, 1 }, .{ tg, 1, 1 }, &.{ .{ .name = "K", .v = ci(k) }, .{ .name = "NORM", .v = @intFromBool(norm) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(iters) } }, &.{}, &o);
     return .{ .routes = .{ .idx = o[0], .wts = o[1] }, .split = .{ .pre = o[2], .post = o[3], .comb = o[4] } };
+}
+
+/// `routeSplit` that also gives each pick's slot in a resident layer's bank: `map` `[E]` int32, the slot of each expert.
+pub fn routeSplitSlots(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32, z: A, hc: usize, iters: usize, eps: A, map: A) !RouteSplit {
+    const L = dim(logits, 0);
+    const E = dim(logits, 1);
+    const tg = (E + 31) / 32 * 32;
+    var o: [6]A = undefined;
+    try launch(sc, &route_split_slots_def, &.{ logits, bias, try f32Const(sc, &.{scale}), z, eps, map }, &.{
+        .{ .shape = &.{ ci(L), ci(k) }, .dt = .uint32 },
+        .{ .shape = &.{ ci(L), ci(k) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(k) }, .dt = .int32 },
+    }, .{ 2 * tg, L, 1 }, .{ tg, 1, 1 }, &.{ .{ .name = "K", .v = ci(k) }, .{ .name = "NORM", .v = @intFromBool(norm) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(iters) } }, &.{}, &o);
+    return .{ .routes = .{ .idx = o[0], .wts = o[1], .local = o[5] }, .split = .{ .pre = o[2], .post = o[3], .comb = o[4] } };
 }
 
 /// Chunks a row of `n` scores splits into for its top-k. Past these sizes one threadgroup a row leaves the GPU idle;
@@ -507,6 +552,14 @@ pub const topk_splits: usize = 8;
 /// The indices of the `k` largest of each row of `x` `[L, n]` (f32), ascending, ties to the lower index.
 pub fn topkIndices(sc: *Scope, x: A, k: usize) !A {
     return topkIndicesSplit(sc, x, k, topkSplits(dim(x, 0), dim(x, 1), k));
+}
+
+/// `topkIndices` of `x` `[rows, n]`, which `topkSplits` leaves in one threadgroup a row, with every pick not under its
+/// row's `lens[row]` (int32 `[rows, 1]`) given as -1, in the one launch.
+pub fn topkIndicesBelow(sc: *Scope, x: A, rows: usize, k: usize, lens: A) !A {
+    var o: [1]A = undefined;
+    try launch(sc, &topk_below_def, &.{ x, try sc.ints(&.{ci(k)}, &.{1}), lens }, &.{.{ .shape = &.{ ci(rows), ci(k) }, .dt = .int32 }}, .{ topk_tg, rows, 1 }, .{ topk_tg, 1, 1 }, &.{.{ .name = "TG", .v = ci(topk_tg) }}, &.{}, &o);
+    return o[0];
 }
 
 /// `topkIndices` over `splits` chunks of each row (1: one threadgroup a row); each chunk holds at least `k` scores.
@@ -647,6 +700,35 @@ const ROPE_KV_SOURCE =
     \\}
 ;
 
+/// `ROPE_KV_SOURCE` that also gives the window ring after the row's write: the row lands in its slot, `pos[row]` modulo
+/// the ring's rows, and threadgroups past the queries' copy the other rows 16 bytes a thread. QTG is the queries'
+/// threadgroups.
+const ROPE_KV_RING_SOURCE =
+    \\#pragma clang fp contract(off)
+    \\threadgroup float local_sums[32], inv_s[1];
+    \\const uint tgid = threadgroup_position_in_grid.x, rows = kx_shape[0];
+    \\const int cap = ring_shape[0];
+    \\if (tgid < rows) {
+    \\  const int l = int(tgid);
+    \\  const device T* x = kx;
+    \\  device T* out = rout + ptrdiff_t(int(pos[l]) % cap - l) * D;
+++ KV_ROW_BODY ++
+    \\} else if (tgid < rows + QTG) {
+    \\  const uint i = (tgid - rows) * threads_per_threadgroup.x + thread_position_in_threadgroup.x;
+    \\  if (i >= rows * ROW) return;
+    \\  const device T* x = qx;
+    \\  device T* out = qout;
+++ ROPE_TAIL_BODY ++
+    \\} else {
+    \\  constexpr int U = D * sizeof(T) / 16;
+    \\  const uint u = (tgid - rows - QTG) * threads_per_threadgroup.x + thread_position_in_threadgroup.x;
+    \\  if (u >= uint(cap * U)) return;
+    \\  if ((int(u) / U + cap - int(pos[0]) % cap) % cap < int(rows)) return;
+    \\  ((device uint4*)rout)[u] = ((const device uint4*)ring)[u];
+    \\}
+;
+
+var rope_kv_ring_def = Def{ .name = "dsv41_rope_kv_ring", .ins = &.{ "qx", "kx", "w", "freqs", "pos", "eps", "ring" }, .outs = &.{ "qout", "rout" }, .source = ROPE_KV_RING_SOURCE, .header = qat_mod.QAT_HEADER };
 var rope_kv_def = Def{ .name = "dsv41_rope_kv", .ins = &.{ "qx", "kx", "w", "freqs", "pos", "eps" }, .outs = &.{ "qout", "kout" }, .source = ROPE_KV_SOURCE, .header = qat_mod.QAT_HEADER };
 var rope_tail_def = Def{ .name = "dsv41_rope_tail", .ins = &.{ "x", "freqs", "pos" }, .outs = &.{"out"}, .source = ROPE_TAIL_SOURCE, .header = qat_mod.QAT_HEADER };
 var kv_row_def = Def{ .name = "dsv41_kv_row", .ins = &.{ "x", "w", "freqs", "pos", "eps" }, .outs = &.{"out"}, .source = KV_ROW_SOURCE, .header = qat_mod.QAT_HEADER };
@@ -674,7 +756,9 @@ pub fn ropeTail(sc: *Scope, x: A, freqs: A, pos: A, rd: usize, inverse: bool, qa
 
 /// `ropeTail(q, .none)` of the queries `q` `[L, H, D]` and `kvRow(kv)` of the window rows `kv` `[L, D]`, in one launch; the
 /// two share the dtype and `D`.
-pub fn ropeKv(sc: *Scope, q: A, kv: A, w: A, freqs: A, pos: A, rd: usize, eps: f32, qat: bool) !struct { q: A, kv: A } {
+pub const QKv = struct { q: A, kv: A };
+
+pub fn ropeKv(sc: *Scope, q: A, kv: A, w: A, freqs: A, pos: A, rd: usize, eps: f32, qat: bool) !QKv {
     const n = mlx.mlx_array_size(q);
     const L = dim(kv, 0);
     const D = dim(kv, 1);
@@ -694,6 +778,34 @@ pub fn ropeKv(sc: *Scope, q: A, kv: A, w: A, freqs: A, pos: A, rd: usize, eps: f
         .{ .name = "QAT", .v = @intFromBool(qat) },
     }, &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = dt } }, &o);
     return .{ .q = o[0], .kv = o[1] };
+}
+
+/// `ropeKv` whose window rows are written into `ring` `[cap, width = D]` at slot `pos[row]` modulo `cap` (rows are consecutive
+/// positions, at most `cap` of them): the queries rotated, and the ring as `slice_update` would leave it. The ring
+/// has `kv`'s dtype, and a row of it is a multiple of 16 bytes.
+pub fn ropeKvRing(sc: *Scope, q: A, kv: A, w: A, freqs: A, pos: A, rd: usize, eps: f32, qat: bool, ring: A, cap: usize, width: usize) !struct { q: A, ring: A } {
+    const n = mlx.mlx_array_size(q);
+    const L = dim(kv, 0);
+    const D = dim(kv, 1);
+    const dt = mlx.mlx_array_dtype(kv);
+    const tg = ((D + 3) / 4 + 31) / 32 * 32;
+    const qtgs = (n + tg - 1) / tg;
+    const row_vecs = D * @as(usize, if (dt == .float32) 4 else 2) / 16;
+    const ctgs = (cap * row_vecs + tg - 1) / tg;
+    var o: [2]A = undefined;
+    try launch(sc, &rope_kv_ring_def, &.{ q, kv, w, freqs, pos, try f32Const(sc, &.{eps}), ring }, &.{
+        .{ .shape = mlx.getShape(q), .dt = dt },
+        .{ .shape = &.{ ci(cap), ci(width) }, .dt = dt },
+    }, .{ (L + qtgs + ctgs) * tg, 1, 1 }, .{ tg, 1, 1 }, &.{
+        .{ .name = "RD", .v = ci(rd) },
+        .{ .name = "D", .v = ci(D) },
+        .{ .name = "ROW", .v = ci(n / dim(q, 0)) },
+        .{ .name = "QK", .v = 0 },
+        .{ .name = "INV", .v = 0 },
+        .{ .name = "QAT", .v = @intFromBool(qat) },
+        .{ .name = "QTG", .v = ci(qtgs) },
+    }, &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = dt } }, &o);
+    return .{ .q = o[0], .ring = o[1] };
 }
 
 /// Whether `kvRow` serves rows of `D` channels.
@@ -3136,6 +3248,28 @@ test "dsv41 route split: the router and the hc split in one launch give the two 
     };
 }
 
+test "dsv41 route split: with a slot map the launch also gives the map's slot for each pick, as a take of it" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const eps = try hcEps(&sc, 1e-6, 1e-6);
+    for ([_]usize{ 384, 256 }) |E| for ([_]usize{ 1, 3, 16 }) |L| {
+        const logits = try randn(&sc, &.{ ci(L), ci(E) }, .float32, 61, 2.5);
+        const bias = try randn(&sc, &.{ 1, ci(E) }, .float32, 62, 0.3);
+        const z = try randn(&sc, &.{ ci(L), 24 }, .float32, 63, 1.0);
+        var slots: [384]i32 = undefined;
+        for (slots[0..E], 0..) |*o, i| o.* = @intCast((i * 7 + 3) % 389);
+        const map = try sc.ints(slots[0..E], &.{ci(E)});
+        const want = try routeSplit(&sc, logits, bias, 6, true, 1.5, z, 4, 20, eps);
+        const want_local = try sc.take(map, try sc.astype(want.routes.idx, .int32), 0);
+        const got = try routeSplitSlots(&sc, logits, bias, 6, true, 1.5, z, 4, 20, eps, map);
+        try testing.expectEqualSlices(i32, try sc_mod.hostI32(try sc.astype(want.routes.idx, .int32)), try sc_mod.hostI32(try sc.astype(got.routes.idx, .int32)));
+        try testing.expectEqualSlices(i32, try sc_mod.hostI32(want_local), try sc_mod.hostI32(got.routes.local));
+        try expectBitEqual("route wts", try sc_mod.hostF32(got.routes.wts), try sc_mod.hostF32(want.routes.wts));
+        try expectBitEqual("split comb", try sc_mod.hostF32(got.split.comb), try sc_mod.hostF32(want.split.comb));
+    };
+}
+
 test "dsv41 topk: the picks are the k largest in index order, ties to the lower index" {
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
@@ -3157,6 +3291,21 @@ test "dsv41 topk: the picks are the k largest in index order, ties to the lower 
     tie[7] = -std.math.inf(f32);
     const t = try sc_mod.hostI32(try topkIndices(&sc, try sc.floats(&tie, &.{ 1, n }), 10));
     try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 4, 5, n - 4, n - 3, n - 2, n - 1 }, t[0..10]);
+}
+
+test "dsv41 topk below: the picks under each row's length, -1 elsewhere, are the top-k and the compare-and-where chain's bytes" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    for ([_]struct { n: usize, k: usize }{ .{ .n = 1500, .k = 512 }, .{ .n = 300, .k = 64 }, .{ .n = 40, .k = 40 } }) |case| for ([_]usize{ 1, 3 }) |L| {
+        const x = try randn(&sc, &.{ ci(L), ci(case.n) }, .float32, 71, 1.0);
+        var lens: [3]i32 = .{ ci(case.n), ci(case.n / 2), 7 };
+        const lens_a = try sc.ints(lens[0..L], &.{ ci(L), 1 });
+        const idx = try topkIndices(&sc, x, case.k);
+        const want = try sc.where(try sc.lt(idx, lens_a), idx, try sc.i(-1));
+        const got = try topkIndicesBelow(&sc, x, dim(x, 0), case.k, lens_a);
+        try testing.expectEqualSlices(i32, try sc_mod.hostI32(want), try sc_mod.hostI32(got));
+    };
 }
 
 test "dsv41 topk: the picks do not depend on the threadgroup width" {
@@ -3357,6 +3506,33 @@ test "dsv41 rope kv: the query rotation and the window row in one launch give th
         const got = try ropeKv(&sc, q, kv, w, freqs, pos, 64, 1e-6, qat);
         try expectBitEqual("rope kv q", try hostOf(&sc, got.q), try hostOf(&sc, want_q));
         try expectBitEqual("rope kv row", try hostOf(&sc, got.kv), try hostOf(&sc, want_kv));
+    };
+}
+
+test "dsv41 rope kv ring: the window row lands in the ring as a slice update of it, wrapped, and the queries are the other launch's" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const freqs = try ropeFreqs(&sc);
+    const cap: c_int = 144;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]bool{ true, false }) |qat| for ([_]usize{ 1, 2, 9, 16 }) |L| for ([_]i32{ 4000, 137, 143 }) |p0| {
+        const li = ci(L);
+        const q = try sc.astype(try randn(&sc, &.{ li, 64, 512 }, .float32, 201, 3.0), dt);
+        const kv = try sc.astype(try randn(&sc, &.{ li, 512 }, .float32, 202, 5.0), dt);
+        const w = try sc.astype(try sc.add(try randn(&sc, &.{512}, .float32, 203, 0.3), try sc.f(1.0)), dt);
+        const ring = try sc.astype(try randn(&sc, &.{ cap, 512 }, .float32, 204, 2.0), dt);
+        const pos = try positions(&sc, p0, L, 1);
+        const want_q = try ropeTail(&sc, q, freqs, pos, 64, false, .none, null);
+        const row = try kvRow(&sc, kv, w, freqs, pos, 64, 1e-6, qat);
+        var want_ring = ring;
+        for (0..L) |r| {
+            const slot: c_int = @intCast(@mod(p0 + @as(i32, @intCast(r)), cap));
+            var up = mlx.mlx_array_new();
+            want_ring = try sc.res(mlx.mlx_slice_update(&up, want_ring, try sc.slice(row, 0, @intCast(r), @intCast(r + 1)), &[_]c_int{ slot, 0 }, 2, &[_]c_int{ slot + 1, 512 }, 2, &[_]c_int{ 1, 1 }, 2, sc.s), &up);
+        }
+        const got = try ropeKvRing(&sc, q, kv, w, freqs, pos, 64, 1e-6, qat, ring, dim(ring, 0), 512);
+        try expectBitEqual("rope kv ring q", try hostOf(&sc, got.q), try hostOf(&sc, want_q));
+        try expectBitEqual("rope kv ring", try hostOf(&sc, got.ring), try hostOf(&sc, want_ring));
     };
 }
 
