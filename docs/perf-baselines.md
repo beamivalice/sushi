@@ -385,7 +385,8 @@ position**; the cells are the mean of sampled positions 2 to 4 and of greedy pos
   1.6.0's. Sampled rounds are fixed work, so the engine's cells repeated to 0.03% between loads; a greedy cell moves about
   1% with the round mix its policy takes.
 - **The engine's own CPU cost is 61% below 1.6.0's and 39% below patched MLX's** (CPU joules per token), but the server's
-  CPU is 1 to 3% of the GPU's energy here (0.7 to 1.9 W against 63 to 76 W), so the wall reads 1 to 3 W less.
+  CPU is 1 to 3% of the GPU's energy here (0.7 to 1.9 W against 63 to 76 W), so the wall reads 1 to 3 W less. Those
+  watts are still the ones that count most on a laptop: CPU heat throttles before GPU heat does.
 - **Decode is power-limited within one request**: over the three warm sampled positions of a load the GPU falls from 76 W
   to 69 W and tok/s from 58.5 to 55.5 as the die heats, on every side. tok/s is GPU watts over joules per token, so
   under that cap energy per token is speed.
