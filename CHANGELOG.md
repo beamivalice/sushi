@@ -78,6 +78,8 @@ earlier history is mlx-serve's, in that project's changelog.
   load log read MLX's peak as at least what MLX holds, where it read nothing until MLX next allocated.
 - **A prompt-cache entry on the SSD survives a restore refused for memory**: on Qwen3.8-Flash-Next, GLM-5.3-Flash and
   MiMo, a restore that ran out of room no longer deletes a valid entry; the next request restores it.
+- **A replayed tool call that repeats an argument key keeps its arguments**: the chat template reads the key's last
+  value, as Python's `json.loads` does, where the call reached the prompt with no arguments at all.
 
 ## v1.6.0 — Stability, UI and Architecture Refactor
 

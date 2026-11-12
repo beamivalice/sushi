@@ -1087,9 +1087,10 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
                 try buf.appendSlice(allocator, ",\"arguments\":");
                 // Templates iterate `arguments|items`, so anything but a JSON object
                 // (empty, null, an array, scalar, malformed or over-nested text) would
-                // raise or recurse unbounded: embed `{}` instead.
+                // raise or recurse unbounded: embed `{}` instead. A repeated key is read
+                // as `json.loads` and the template input read it: its last value wins.
                 const is_object = !jsonNestingExceeds(tc.arguments, max_json_nesting) and
-                    if (std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{})) |parsed| blk: {
+                    if (std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{ .duplicate_field_behavior = .use_last })) |parsed| blk: {
                     defer parsed.deinit();
                     break :blk parsed.value == .object;
                 } else |_| false;

@@ -3235,6 +3235,34 @@ test "format corpus: a history call whose arguments are not an object still rend
     }
 }
 
+test "format corpus: a history call whose arguments repeat a key renders the last value, as json.loads reads it" {
+    const allocator = testing.allocator;
+    const templates = [_]struct { name: []const u8, tpl: []const u8 }{
+        .{ .name = "glm5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
+    };
+    const before = chat.template_fallbacks.load(.monotonic);
+    for (templates) |t| {
+        var config = chat.ChatConfig{ .chat_template = t.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        const calls = [_]chat.ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\",\"unit\":\"c\",\"city\":\"Rome\"}" }};
+        const messages = [_]chat.Message{
+            .{ .role = "user", .content = "Weather?" },
+            .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "r" },
+            .{ .role = "tool", .content = "Sunny", .tool_call_id = "call_1" },
+        };
+        const rendered = try chat.renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+        defer allocator.free(rendered);
+        errdefer std.debug.print("\n[{s}]\n{s}\n", .{ t.name, rendered });
+        try testing.expectEqual(before, chat.template_fallbacks.load(.monotonic));
+        try testing.expect(std.mem.indexOf(u8, rendered, "Rome") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Paris") == null);
+        // The repeated key keeps its first place, before `unit`.
+        try testing.expect(std.mem.indexOf(u8, rendered, "Rome").? < std.mem.indexOf(u8, rendered, "unit").?);
+    }
+}
+
 test "format corpus: a conversation with no user turn is refused by name when the template raises for it, never rendered by the generic fallback" {
     const config = chat.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
     const before = chat.template_fallbacks.load(.monotonic);

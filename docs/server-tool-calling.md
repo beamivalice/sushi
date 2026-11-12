@@ -96,7 +96,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
 - A template can raise on OUR extra-context values: `serializeExtraContext` sniffs the family; tool-call `arguments`
   stay OBJECTS (a history call whose arguments are empty, null, an array, a scalar or malformed text embeds `{}`:
-  `arguments|items` on anything else raises into the silent fallback); history tool_calls carry `"id"`; `noThinkTailSuffix` closes the block a template opens unconditionally (GLM-5.3's
+  `arguments|items` on anything else raises into the silent fallback; an object that repeats a key passes as sent, and
+  the template reads its last value at the first key's place, as `json.loads` does); history tool_calls carry `"id"`; `noThinkTailSuffix` closes the block a template opens unconditionally (GLM-5.3's
   `<|assistant|><think>`) when thinking is off.
 - **A system turn past index 0 renders where the template allows it**: a template that raises on it or drops it gets
   it folded into the leading system (`templateProbeRendersLateSystem`, every surface); MiMo's role loop keeps it in

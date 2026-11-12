@@ -1967,25 +1967,25 @@
 "python_error": null
 },
 {
-"id": "1f69119e1e98ddba6a9b894b",
+"id": "8e14676048d1199fcfc5c510",
 "label": "qwen38_flash_next | a call argument key sent twice | thinking=true effort=none preserve=null",
 "template": "qwen38_flash_next",
-"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
+"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"city\":\"Rome\"}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
 "tools": null,
 "extra": "{\"eos_token\":\"<|im_end|>\",\"enable_thinking\":true,\"reasoning_effort\":\"low\"}",
 "add_generation_prompt": true,
-"python": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nSunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+"python": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nSunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
 "python_error": null
 },
 {
-"id": "06b9e826240e793b7069007c",
+"id": "bf292b7f68c618267a6878aa",
 "label": "qwen38_flash_next | a call argument key sent twice | thinking=false effort=none preserve=null",
 "template": "qwen38_flash_next",
-"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
+"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"city\":\"Rome\"}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
 "tools": null,
 "extra": "{\"eos_token\":\"<|im_end|>\",\"enable_thinking\":false,\"reasoning_effort\":\"low\"}",
 "add_generation_prompt": true,
-"python": "<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nSunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+"python": "<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nSunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
 "python_error": null
 },
 {
@@ -4376,25 +4376,25 @@
 "python_error": null
 },
 {
-"id": "be7944c42e4597e05f7ff48e",
+"id": "c400ac782ada249da1b048ad",
 "label": "glm53 | a call argument key sent twice | thinking=true effort=none preserve=null",
 "template": "glm53",
-"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
+"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"city\":\"Rome\"}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
 "tools": null,
 "extra": "{\"eos_token\":\"<|endoftext|>\",\"enable_thinking\":true,\"reasoning_effort\":\"high\"}",
 "add_generation_prompt": true,
-"python": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Weather?<|assistant|><think>r</think><tool_call>get_weather</tool_call><|observation|><tool_response>Sunny</tool_response><|assistant|><think>",
+"python": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Weather?<|assistant|><think>r</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><|observation|><tool_response>Sunny</tool_response><|assistant|><think>",
 "python_error": null
 },
 {
-"id": "1845585382c55d634d5d450d",
+"id": "51c8781f98eb94091eddbeed",
 "label": "glm53 | a call argument key sent twice | thinking=false effort=none preserve=null",
 "template": "glm53",
-"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
+"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"city\":\"Rome\"}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
 "tools": null,
 "extra": "{\"eos_token\":\"<|endoftext|>\",\"enable_thinking\":false,\"reasoning_effort\":\"high\"}",
 "add_generation_prompt": true,
-"python": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Weather?<|assistant|><think>r</think><tool_call>get_weather</tool_call><|observation|><tool_response>Sunny</tool_response><|assistant|><think>",
+"python": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Weather?<|assistant|><think>r</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><|observation|><tool_response>Sunny</tool_response><|assistant|><think>",
 "python_error": null
 },
 {
@@ -6565,25 +6565,25 @@
 "python_error": null
 },
 {
-"id": "773e073018e0606179103023",
+"id": "f088b73ab1a4e57dbb8d8518",
 "label": "mimo_v26 | a call argument key sent twice | thinking=true effort=none preserve=null",
 "template": "mimo_v26",
-"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
+"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"city\":\"Rome\"}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
 "tools": null,
 "extra": "{\"eos_token\":\"<|im_end|>\",\"enable_thinking\":true,\"reasoning_effort\":\"high\"}",
 "add_generation_prompt": true,
-"python": "<|im_start|>user\nWeather?<|im_end|><|im_start|>assistant\n<think>r</think><tool_call><function=get_weather></function></tool_call><|im_end|><|im_start|>tool\nSunny<|im_end|><|im_start|>assistant\n",
+"python": "<|im_start|>user\nWeather?<|im_end|><|im_start|>assistant\n<think>r</think><tool_call><function=get_weather><parameter=city>Rome</parameter></function></tool_call><|im_end|><|im_start|>tool\nSunny<|im_end|><|im_start|>assistant\n",
 "python_error": null
 },
 {
-"id": "c14e54a52380341c432ab68e",
+"id": "2c35e1f36ac7304f8f971538",
 "label": "mimo_v26 | a call argument key sent twice | thinking=false effort=none preserve=null",
 "template": "mimo_v26",
-"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
+"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"city\":\"Rome\"}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
 "tools": null,
 "extra": "{\"eos_token\":\"<|im_end|>\",\"enable_thinking\":false,\"reasoning_effort\":\"no_think\"}",
 "add_generation_prompt": true,
-"python": "<|im_start|>user\nWeather?<|im_end|><|im_start|>assistant\n<think>r</think><tool_call><function=get_weather></function></tool_call><|im_end|><|im_start|>tool\nSunny<|im_end|><|im_start|>assistant\n<think></think>",
+"python": "<|im_start|>user\nWeather?<|im_end|><|im_start|>assistant\n<think>r</think><tool_call><function=get_weather><parameter=city>Rome</parameter></function></tool_call><|im_end|><|im_start|>tool\nSunny<|im_end|><|im_start|>assistant\n<think></think>",
 "python_error": null
 },
 {
@@ -8908,25 +8908,25 @@
 "python_error": null
 },
 {
-"id": "75331fbb381df0852b627087",
+"id": "f659415ee3fbd356d181c1ec",
 "label": "dsv41 | a call argument key sent twice | thinking=true effort=none preserve=null",
 "template": "dsv41",
-"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
+"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"city\":\"Rome\"}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
 "tools": null,
 "extra": "{\"enable_thinking\":true,\"reasoning_effort\":\"high\",\"thinking_mode\":\"thinking\"}",
 "add_generation_prompt": true,
-"python": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Weather?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Sunny</tool_result><｜Assistant｜><think>",
+"python": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Weather?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Sunny</tool_result><｜Assistant｜><think>",
 "python_error": null
 },
 {
-"id": "58a093d1293392bde36a89e0",
+"id": "2a5d5acd8c1373895ba5852e",
 "label": "dsv41 | a call argument key sent twice | thinking=false effort=none preserve=null",
 "template": "dsv41",
-"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
+"messages": "[{\"role\":\"user\",\"content\":\"Weather?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_d\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"city\":\"Rome\"}}}],\"reasoning_content\":\"r\"},{\"role\":\"tool\",\"content\":\"Sunny\",\"tool_call_id\":\"call_d\"}]",
 "tools": null,
 "extra": "{\"enable_thinking\":false,\"reasoning_effort\":\"high\",\"thinking_mode\":\"chat\"}",
 "add_generation_prompt": true,
-"python": "<｜begin▁of▁sentence｜><｜User｜>Weather?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Sunny</tool_result><｜Assistant｜></think>",
+"python": "<｜begin▁of▁sentence｜><｜User｜>Weather?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Sunny</tool_result><｜Assistant｜></think>",
 "python_error": null
 },
 {
