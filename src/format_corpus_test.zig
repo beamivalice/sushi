@@ -318,7 +318,7 @@ const shell_tool_schema =
     \\[{"type":"function","function":{"name":"shell","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
 ;
 
-const corpus = [_]Expect{
+pub const corpus = [_]Expect{
     .{
         .family = "qwen",
         .name = "explanation cannot become an XML function name",
@@ -2192,7 +2192,7 @@ const Dialect = struct {
     value: []const u8,
 };
 
-const dialects = [_]Dialect{
+pub const dialects = [_]Dialect{
     .{
         .family = "gemma4",
         .dialect = "channel tool_call",

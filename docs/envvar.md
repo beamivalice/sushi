@@ -103,7 +103,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_LEVER`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `model_load.zig` | `<n>` cold one-chunk prefills per arm at load, the untimed first one logged; arm list; `decoded`: arm 0 keeps the trunk on the sorted GEMM instead of the NAX reference body; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `qwen4_qsa_gather.zig` | QSA prefill/wide meters | test | no |
 
-## Test-only seams (53)
+## Test-only seams (54)
 
 Inputs and hooks that real-pack tests and scripts use.
 
@@ -116,6 +116,7 @@ Inputs and hooks that real-pack tests and scripts use.
 | `QWEN4_TEST_MODEL` | `qwen4_fixture_test.zig:474, 618, 641, +24`, `qwen4_generate_test.zig:387, 531, 640` | `<pack dir>` for the real-pack Qwen4 tests; they skip without it | test | yes: mlx-serve-sync, server-lifecycle, tests/CLAUDE |
 | `QWEN_VISION_TEST_MODEL`, `QWEN_VISION_FIXTURE`, `QWEN_PREPROCESS_FIXTURE`, `QV_GH`, `QV_GW`, `QWEN_MID_SYSTEM_MODEL_DIR` | `qwen_vision.zig`, `chat.zig` | Qwen vision/preprocess oracle inputs and a chat-template pack | test | yes: server-tool-calling, tests/CLAUDE |
 | `SUSHI_DSV41_REAL_PACK`, `SUSHI_DSV41_PROBE_AT`, `SUSHI_DSV41_PROBE_WIDTH`, `SUSHI_DSV41_PROBE_TEXT`, `SUSHI_DSV41_PROBE_VERBOSE` | `dsv41_generate_test.zig` | the real-pack width probe (skips without `SUSHI_DSV41_REAL_PACK=<pack dir>`): at each context in `PROBE_AT` (comma list, default 17) of `PROBE_TEXT` (a text file with more tokens than the largest context + width + 1) a `PROBE_WIDTH`-row verify (default 4) must give every row the bits of its own one-row round, layer by layer; `PROBE_VERBOSE` prints each differing tensor. `SUSHI_DSV41_REAL_PACK` also runs the engine's real-pack proof (one-row steps and DSpark rounds on the engine give MLX's bytes) | test | yes: dsv41-arch, testsuite |
+| `SUSHI_TEMPLATE_ORACLE_DUMP` | `template_oracle_test.zig` | `<abs path>`: the corpus test writes every engine call it captured there for `tests/dump_template_oracle.py render`, and compares nothing | test | yes: server-tool-calling |
 | `SUSHI_FORCE_BATCHED` | `scheduler.zig:1209` | `1` routes single-slot ticks through the batched kernel (`tests/test_batched_equivalence.sh`) | boot | yes: tests/CLAUDE |
 | `SUSHI_MEMORY_AUDIT_MODEL`, `SUSHI_TOKENIZER_PARITY_FIXTURE` | `bills.zig`, `model_load.zig`, `tokenizer.zig` | memory-bill audit pack and tokenizer parity fixture | test | no |
 | `SUSHI_MLX_FAULT_CHUNK`, `SUSHI_MLX_FAULT_STEP` | `mlx.zig` | `<n>` latches a synthetic Metal OOM at the n-th prefill-chunk check / decode step (`tests/test_mlx_error_recovery.sh`) | once | yes: tests/CLAUDE |

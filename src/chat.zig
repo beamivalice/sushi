@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const media_mode = @import("arch/media_mode.zig");
 const effort_mod = @import("effort.zig");
 const arch_chat = @import("arch/chat.zig");
@@ -540,20 +541,9 @@ pub fn renderChatTemplate(
         if (try renderContinuation(allocator, tmpl_z, extra_z, tools_z, effective_messages, turn, partial, chat_config)) |cont| return cont;
     }
 
-    // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
-    var rendered_len: usize = 0;
-    const result_ptr = jinja_c.jinja_render_chat(
-        tmpl_z.ptr,
-        msgs_z.ptr,
-        if (tools_z) |tz| tz.ptr else null,
-        extra_z.ptr,
-        1,
-        &rendered_len,
-    );
-
-    if (result_ptr) |ptr| {
-        defer jinja_c.jinja_str_free(ptr);
-        const collapsed = try collapseDoubledThinkTags(allocator, ptr[0..rendered_len]);
+    if (renderEngine(tmpl_z, msgs_z, tools_z, extra_z, true)) |engine_out| {
+        defer jinja_c.jinja_str_free(engine_out.ptr);
+        const collapsed = try collapseDoubledThinkTags(allocator, engine_out);
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
         // tail, never beside it — both append the same channel commit, and
@@ -618,10 +608,9 @@ fn renderContinuation(
     defer allocator.free(json);
     const json_z = try allocator.dupeSentinel(u8, json, 0);
     defer allocator.free(json_z);
-    var len: usize = 0;
-    const ptr = jinja_c.jinja_render_chat(tmpl_z.ptr, json_z.ptr, if (tools_z) |tz| tz.ptr else null, extra_z.ptr, 0, &len) orelse return null;
-    defer jinja_c.jinja_str_free(ptr);
-    const rendered = try collapseDoubledThinkTags(allocator, ptr[0..len]);
+    const engine_out = renderEngine(tmpl_z, json_z, tools_z, extra_z, false) orelse return null;
+    defer jinja_c.jinja_str_free(engine_out.ptr);
+    const rendered = try collapseDoubledThinkTags(allocator, engine_out);
     defer allocator.free(rendered);
     // A template may trim the text's leading whitespace, as transformers allows for.
     const text = std.mem.trimStart(u8, partial, " \t\r\n");
@@ -743,17 +732,42 @@ fn templateProbeRender(
     const extra_z = try allocator.dupeSentinel(u8, extra_json, 0);
     defer allocator.free(extra_z);
 
-    var rendered_len: usize = 0;
-    const result_ptr = jinja_c.jinja_render_chat(
-        tmpl_z.ptr,
-        msgs_z.ptr,
-        null,
-        extra_z.ptr,
-        0,
-        &rendered_len,
-    ) orelse return null;
-    defer jinja_c.jinja_str_free(result_ptr);
-    return try allocator.dupe(u8, result_ptr[0..rendered_len]);
+    const engine_out = renderEngine(tmpl_z, msgs_z, null, extra_z, false) orelse return null;
+    defer jinja_c.jinja_str_free(engine_out.ptr);
+    return try allocator.dupe(u8, engine_out);
+}
+
+/// One call into the template engine, its inputs exactly as the engine reads them (tests only, `engine_spy`).
+pub const EngineCall = struct {
+    template: []const u8,
+    messages: []const u8,
+    tools: ?[]const u8,
+    extra: []const u8,
+    add_generation_prompt: bool,
+    /// Null when the engine raised.
+    rendered: ?[]const u8,
+};
+
+pub const EngineSpy = struct { ctx: *anyopaque, see: *const fn (ctx: *anyopaque, call: EngineCall) void };
+
+/// Read only by a test build: the test that sets it sees every call `renderEngine` makes.
+pub var engine_spy: ?EngineSpy = null;
+
+/// The only call into the template engine. The caller frees the render with `jinja_c.jinja_str_free`.
+fn renderEngine(tmpl_z: [:0]const u8, msgs_z: [:0]const u8, tools_z: ?[:0]const u8, extra_z: [:0]const u8, add_generation_prompt: bool) ?[]u8 {
+    // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
+    var len: usize = 0;
+    const ptr = jinja_c.jinja_render_chat(tmpl_z.ptr, msgs_z.ptr, if (tools_z) |tz| tz.ptr else null, extra_z.ptr, @intFromBool(add_generation_prompt), &len);
+    const rendered: ?[]u8 = if (ptr) |p| p[0..len] else null;
+    if (builtin.is_test) if (engine_spy) |spy| spy.see(spy.ctx, .{
+        .template = tmpl_z,
+        .messages = msgs_z,
+        .tools = tools_z,
+        .extra = extra_z,
+        .add_generation_prompt = add_generation_prompt,
+        .rendered = rendered,
+    });
+    return rendered;
 }
 
 /// What a forced tool_choice commits once the thought is closed, spelled the

@@ -53,6 +53,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   counts into `/props.template_fallbacks`: nonzero on a model that ships a template means a broken prompt, so grep
   that line first. A new template ships its fixture and a no-fallback case in the `format corpus` tool-traffic test.
   Cross-check suspect templates against Python Jinja2 on the same JSON before blaming the model.
+- **The template oracle holds jinja.cpp to Python Jinja2**: `src/template_oracle_test.zig` captures every engine call
+  `formatChat` makes (probes too) over a request corpus through the four served templates, as each pack serves them,
+  and compares jinja.cpp with `src/fixtures/template_oracle.json` (transformers' chat-template environment, written by
+  `tests/dump_template_oracle.py`). A difference is listed in the test with its reason; on a served prompt today's
+  bytes stand until the owner decides. A change to what formatChat hands the engine fails the corpus test until the
+  fixture is regenerated (`SUSHI_TEMPLATE_ORACLE_DUMP`, then the dumper's `render`).
+- **jinja.cpp prints numbers its own way**: `tojson` writes a float with `%g` (six significant digits, `1.0` as `1`),
+  an integer past 2^64-1 as such a float and 2^64-1 as -1; Python prints both exactly. Listed in the oracle.
 - **A loop iteration is its own scope in jinja.cpp, as in Jinja2**: a body `set` (GLM-5.3's per-message `reasoning_content`)
   neither reaches the next iteration nor leaves the loop; only a `namespace` carries state across. One shared scope
   rendered an earlier turn's thought into a reasoning-less assistant turn instead of `<think></think>`.
