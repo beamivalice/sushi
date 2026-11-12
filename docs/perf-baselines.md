@@ -462,9 +462,9 @@ prefill, `ac3da7aa`), the same protocol. Medians of three decode samples; tok/s.
   hyper-connections 5%; every small glue dispatch together (finishes, copies, casts, norms) 5%. The GPU is busy 98%
   of the request. Prefill (25.8k tokens): the two GEMM families 62%, attention 16%.
 
-### Prefill after the kept scales (`39bbe103`, fast bench)
+### Prefill after the kept scales (`2c2b36cc`, fast bench)
 
-`tests/bench.sh --tag p2-scales --rungs 8k,32k`, the same pack and flags, commit `39bbe103` (on `404e8b38`: a ranged
+`tests/bench.sh --tag p2-scales --rungs 8k,32k`, the same pack and flags, the source tree of `2c2b36cc` (on `404e8b38`: a ranged
 route hands its pass over before each read, and an expert's scales are read from the SSD once), binary SHA-256
 `1ac58f779286f1b8`, M5 Max, AC, fans at max, `taskpolicy -a`, GPU lock, boot at 49 °C, Nominal. Baseline: the table above,
 recorded, not rerun.
