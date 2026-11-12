@@ -1,3 +1,5 @@
+The engine is your own code base and you will keep working on this, any defect you did not address today will resurface for you to maintain as debt in the future.
+
 # Sushi — project context for AI
 
 A native Zig inference engine for Apple Silicon serving Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`)
@@ -71,6 +73,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule |
 | [docs/process-ubench.md](docs/process-ubench.md) | `sushi-ubench`: microbench registry, CLI, rungs x arms tables, JSON and compare, the quiet-box steps it takes |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, cooling, waiting, baseline lookup, recording a number, the release bench, build environment |
+| [docs/process-bug-hunt.md](docs/process-bug-hunt.md) | the bug hunt: surfaces, hunters and their scratch tests, the report, synthesis (refactor or normal fix), closing a finding |
 | [docs/testsuite.md](docs/testsuite.md) | what a test may be, tiers (`test-host`, gpu, pack, bench), placement, how a test is built, what a change runs |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
 
@@ -244,6 +247,14 @@ check runs locally: a landing's own subset before it lands, the full suite and t
 
 **Workers.** Report progress and blockers to the coordinator; commit per step; don't push or merge unless told; put new
 knowledge in the matching doc in the branch.
+
+**Bug hunt** ([process-bug-hunt](docs/process-bug-hunt.md)). New code is closed by a hunt before its phase is called done.
+- Three hunters, one surface each, each in its own worktree at the head, write and run scratch tests on the tiny
+  fixtures; they report, never fix, and name the bug class and its sibling sites for every finding.
+- The coordinator synthesizes: per component, refactor when the class repeats, has siblings or is made possible by
+  the structure; a normal fix only for a one-off. The long-term codebase decides, not today's diff.
+- A finding closes by a fix with its regression test, or a test proving the contract: never by argument, never by
+  moving it to a later phase. A class a rule can name becomes a lint rule.
 
 **Clean up.** Once a branch lands, remove its worktree and branch (local and remote). When a job ends, stop by PID every
 process it started (servers, watchers, `tail -F`, samplers) and delete what it made under `~/.sushi/runs/` and
