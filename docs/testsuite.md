@@ -164,6 +164,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A test's model is its file's folder (`src/qwen4/`, `src/mimo2/`, `src/glm5/`, `src/dsv41/`); the `src/` root is shared.
   `-Dmodel=<arch>` runs one folder's tests plus the shared ones. A new test file of an arch is listed in that
   arch's `arch_tests.zig` (`pub const tests`, or `host_tests` for an MLX-free file), never in `src/tests.zig`.
+  A source file with tests at its bottom is listed too: the buckets select tests by listed file, so an unlisted
+  file's tests never run and nothing says so.
 - A shared file (`trunk.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
   holds only `shared` tests. Code for one arch lives in that arch's files, and so do its tests.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.

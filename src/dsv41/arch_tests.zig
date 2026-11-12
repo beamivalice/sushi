@@ -28,6 +28,9 @@ pub const tests = .{
     @import("repack_test.zig"),
     @import("repack_stamp.zig"),
     @import("repack_stamp_test.zig"),
+    @import("arch.zig"),
+    @import("dsv41_sched.zig"),
+    @import("transient_peak.zig"),
 };
 
 /// The MLX-free test files `src/tests_host.zig` runs for this arch.
@@ -37,4 +40,5 @@ pub const host_tests = .{
     @import("dsv41_bills_test.zig"),
     @import("dsv41_flags_test.zig"),
     @import("dsv41_replay_test.zig"),
+    @import("dsv41_chat.zig"),
 };
