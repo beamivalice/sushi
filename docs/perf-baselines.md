@@ -430,8 +430,9 @@ is the same on the three sides. About 160 of a request's 210 rounds are plain on
 The working baseline of the DeepSeek optimization rounds: `tests/bench.sh --tag cooler-p2c
 DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw -- --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000`, commit
 `2aa5ddaf`, binary SHA-256 `d9b45dce6682cb55`, M5 Max 128 GB, AC, fans at max, `taskpolicy -a`, GPU lock, no Warnings
-(no kernel compiled inside a request). The box had run no pack load for 15 minutes ([the release bench's tier](process-measurement.md#optimization-tiers)):
-boot at 49 °C, thermal pressure Nominal at every cell. Beside it the v1.6.0 release report's cells (MLX decode and
+(no kernel compiled inside a request). The box had run no pack load for the 15 minutes before it: boot at 49 °C,
+thermal pressure Nominal at every cell. That wait is not a rule ([tiers](process-measurement.md#optimization-tiers)): a
+cell is read with its pressure and clock, never against another run's thermal state. Beside it the v1.6.0 release report's cells (MLX decode and
 prefill, `ac3da7aa`), the same protocol. Medians of three decode samples; tok/s.
 
 | rung | code decode | v1.6.0 | prose decode | v1.6.0 | code prefill | v1.6.0 | prose prefill | v1.6.0 |
@@ -450,8 +451,8 @@ prefill, `ac3da7aa`), the same protocol. Medians of three decode samples; tok/s.
   at every pass width), so what is left is the round mix a run draws (the 4k cell ran 52 rounds in one run and 55 in
   another) and under 3% of clock.
 - **The run three hours of loads earlier (`7eb2da99`, tag `cooler-p2b`) read Moderate and Heavy pressure at the long
-  rungs** and 1 to 5% lower there (code 128k 74.2 at Heavy, prose 64k 50.1 at Moderate): the rest before the bench
-  is what moved those cells, not code. Since it: the draft's Markov kernel (`e27483db`).
+  rungs** and 1 to 5% lower there (code 128k 74.2 at Heavy, prose 64k 50.1 at Moderate): the box moved those
+  cells, not code. Since it: the draft's Markov kernel (`e27483db`).
 - The run before that (`f9cacade`, tag `cooler-p2a`) is not a measurement: one window compiled a kernel inside a
   request (fixed in `771cbaca`), and its copy rounds went to 16 rows after one whole round (`7eb2da99` changed the
   rule), which cost its code cells 88.7 at 8k, 78.3 at 64k and 67.6 at 128k.

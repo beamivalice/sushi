@@ -230,8 +230,9 @@ its own thermal state.
   tok/s gap under 3% between two loads is no verdict either way.
 - **A context-dependent path adds its rung, not the ladder.** A diff in the indexer, the compressed rows, state growth
   or restore runs the fast bench at the rung where that path engages (`--rungs 4k,64k`).
-- **Tier 3 needs a rested box**: no pack load in the 15 minutes before it and a boot under 50 °C. Its report carries
-  thermal pressure and the GPU clock beside every cell, and a 64k or 128k cell is compared only with them.
+- **No bench waits for the box to rest.** Cooling is the fans at max and the wrapper's idle under 50 °C, nothing
+  longer: two runs on this laptop never share a thermal state, so no wait buys parity. The report carries thermal
+  pressure and the GPU clock beside every cell, and a 64k or 128k cell is compared only with them.
 - **Heat budget.** A pack load outside tier 3 lasts at most 3 minutes and its server stops with its last request. No
   load repeats a number tier 1 already decided. A profiled load (`SUSHI_ENGINE_KERNEL_PROF`) runs the forward meter or
   one short request, never a ladder. Cooling is the wrapper's own step (fans at max, an idle under 50 °C), not a wait

@@ -214,7 +214,7 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
 - Judge a tweak on top of the change it builds on, not alone against the old code.
 - An optimization lever is decided by a micro indicator (bytes, a count, `sushi-ubench` arms in one process), confirmed
   by the fast bench (`tests/bench.sh --rungs 4k,8k`, once per landing) and recorded by the release bench (once per
-  series, rested box): [three tiers](docs/process-measurement.md#optimization-tiers).
+  series; fans at max, no wait for thermal parity): [three tiers](docs/process-measurement.md#optimization-tiers).
 - Less work at equal speed is a win: a change that lowers host CPU joules or work counts per token at the same bytes
   and tok/s lands like a speedup ([energy per token](docs/process-measurement.md#energy-per-token)). GPU joules per
   token are a record, never a verdict: a higher clock always costs more per token ([gpu power](docs/perf-gpu-power.md)).
