@@ -231,6 +231,8 @@ route and the MLX arm still build the bank at prepare time.
 - **The last Cooler unload leaves nothing of the engine's in use**: the pool is empty and the EXL3 module's arrays of
   the engine's side (its GEMM input ring, a unit scalar) go with it (`sushi_exl3.dropHostArrays`). Pinned from zero:
   `requests, repeated, leave the engine's pool as they found it, and an unload gives back everything`.
+  The last unload of a model on MLX gives back MLX's side the same way (`arch_handle.adopt` counts them, `destroy`
+  drops at zero), pinned from zero by `the last model on MLX's side gives back the arrays the EXL3 module cached`.
 
 ## Crossing between the two
 

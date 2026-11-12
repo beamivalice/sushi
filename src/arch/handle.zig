@@ -6,6 +6,7 @@ const trunk_mod = @import("../trunk.zig");
 const registry = @import("registry.zig");
 const arch_request = @import("request.zig");
 const arch_life = @import("life.zig");
+const sushi_exl3 = @import("sushi_exl3");
 const Trunk = trunk_mod.Trunk;
 
 pub const Handle = registry.Arch;
@@ -30,12 +31,36 @@ pub fn trunk(h: Handle) *Trunk {
     };
 }
 
-/// Frees the model, the arch's own state first, and the handle's allocation.
+/// Models on MLX's side the registry holds (inference thread). The EXL3 module caches arrays per side for the process;
+/// the last such model's unload gives MLX's back, as the last Cooler unload gives back the engine's.
+const MlxModels = struct {
+    n: usize = 0,
+
+    fn held(self: *MlxModels) void {
+        self.n += 1;
+    }
+
+    fn gone(self: *MlxModels) void {
+        self.n -= 1;
+        if (self.n == 0) sushi_exl3.dropHostArrays(0);
+    }
+};
+var on_mlx: MlxModels = .{};
+
+/// The handle the registry holds for the model built as `t`; `destroy` gives it back.
+pub fn adopt(t: *Trunk) Handle {
+    if (!mlx.engine.isStream(t.s)) on_mlx.held();
+    return handleOf(t);
+}
+
+/// Frees the model of a handle `adopt` made, the arch's own state first, and the handle's allocation.
 pub fn destroy(h: Handle, allocator: std.mem.Allocator) void {
+    const on_engine = mlx.engine.isStream(stream(h));
     arch_life.deinit(h);
     switch (h) {
         inline else => |m| allocator.destroy(m),
     }
+    if (!on_engine) on_mlx.gone();
 }
 
 pub fn stream(h: Handle) mlx.mlx_stream {
@@ -152,6 +177,29 @@ test "beside a held scope each side's items run in that side's turn, in their or
     // Back as the hold left it.
     try std.testing.expect(mlx.engine.active and mlx.engine.mlx_at_rest.on.load(.acquire));
     try std.testing.expectEqual(swallows, mlx.rest_swallows.load(.monotonic));
+}
+
+test "the last model on MLX's side gives back the arrays the EXL3 module cached for that side; one still held keeps them" {
+    try mlx.requireGpu();
+    sushi_exl3.dropHostArrays(0);
+    const active = struct {
+        fn read() usize {
+            var n: usize = 0;
+            _ = mlx.mlx_get_active_memory(&n);
+            return n;
+        }
+    }.read;
+    var models: MlxModels = .{};
+    const before = active();
+    models.held();
+    models.held();
+    _ = try sushi_exl3.linear.gemmInputs(3, 70, 32);
+    const cached = active();
+    try std.testing.expect(cached > before);
+    models.gone();
+    try std.testing.expectEqual(cached, active());
+    models.gone();
+    try std.testing.expectEqual(before, active());
 }
 
 test "a handle reads back the trunk it was made from, its stream, config and logit bias" {

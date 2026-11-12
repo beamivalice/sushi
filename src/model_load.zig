@@ -2378,7 +2378,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    init is a struct literal (no fallible alloc).
     const entry = params.entry;
     entry.weights = weights_ptr;
-    entry.handle = arch_handle.handleOf(xfm_ptr);
+    entry.handle = arch_handle.adopt(xfm_ptr);
     entry.vision_encoder = vision_ptr;
     entry.dflash = dflash_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
