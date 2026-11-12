@@ -186,12 +186,18 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 - **Verify rows share an expert's weight reads** (`pairGroupedSource`, `downGroupedSource`; prepared-mid geometry,
   2+ rows): among an expert's slots, each slot whose rank is a multiple of the bucket leads itself and the next
   bucket - 1, decodes each weight once and feeds every member in the single-slot order, so every row's bytes are its
-  one-row decode tick's. Served: buckets of 2 on MiMo only. Built and byte-tested at 2, 4, 8 and 16 members for any
+  one-row decode tick's. Served: buckets of 2, on MiMo and on DeepSeek's rate-grouped chain (`rate_groups.groupFor`;
+  the load logs `[exl3-decode] expert-grouped rows engaged group=2`). Built and byte-tested at 2, 4, 8 and 16 members for any
   slot count up to 512 (one ballot per 32 slots), on every codec: a bucket above 2 runs one output tile per
   threadgroup, a block of `m` members takes the smallest rung (1, 2, 3, 4, 6, 8, 12, 16) that holds it, and rungs
   above 8 decode a weight once and sweep the members over it. `sushi-ubench run shared.exl3_grouped_decode` times
   ungrouped, prepared, pairs and the member capacity sized to the rows in one process at 1-8 rows on Flash-Next and
   DeepSeek geometry.
+  DeepSeek geometry, `stq36`, `e27483db`, us a call (ungrouped fused / prepared / pairs / sized): 4 rows with half the
+  picks shared 555 / 476 / 458 / 455, 6 rows 813 / 692 / 641 / 622, 8 rows 1,076 / 912 / 823 / 1,014; with no pick
+  shared pairs lead sized at every width (683 against 720 at 6 rows, 891 against 932 at 8). Pairs stay: a wider bucket
+  wins 3% at one rung and loses 23% at the next. On the release bench's code rounds a pass applies 69% as many distinct
+  experts as picks at 5 to 6 rows and 49 to 60% at 8 to 15.
 - **A decode GEMV slot is bound by its own FMA and input path**, not the weight decode or DRAM, so deduplicating
   shared experts recovers only 4-7% of the expert kernels at 3-4 rows.
 - **GLM's one-row decode GEMVs are latency-bound, not ALU-bound**: two tiles per group and two k-tiles per iteration
