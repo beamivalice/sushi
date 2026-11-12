@@ -567,25 +567,25 @@ const Handled = struct {
 
 /// DeepSeek's write-through: the request's restore points on the tier's row-segment grid go to the SSD tier and every
 /// point leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
-/// commit returns. A point off the grid is kept live only (`Live`), whatever the tier does. Below the tier's floor nothing is written and the points stay for the commit.
+/// commit returns. A point off the grid is kept live only (`Live`), whatever the tier does. Below the tier's floor nothing
+/// is written: the points stay for the commit and are kept live, so the next turn rolls back to them as above it.
 /// `held` names the phase that waited on the writer, for the log.
 pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, held: []const u8) void {
     const s = dsv41_model.stateStream(m);
-    if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+    if (self.disk == null) return;
     const handled = Handled.begin();
     defer handled.drop();
     var pending = false;
     for (cps) |*cp| pending = pending or !cp.isReleased();
     if (!pending) return;
+    if (prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return keepLive(self, m, cps);
     // The points share the request's rows: one that outlived this call would make the next forward copy the store.
     defer for (cps) |*cp| cp.release();
     markRows(cache, s) catch |err| {
         log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
         return;
     };
-    for (cps) |*cp| if (!cp.isReleased()) liveOf(self).keep(self.allocator, m, cp, false) catch |err| {
-        log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
-    };
+    keepLive(self, m, cps);
     // A point off the row-segment grid would copy the rows past the last segment into its own file; it stays live.
     const span: usize = if (self.disk.?.grown) |g| g.span else 0;
     for (cps) |*cp| if (!cp.isReleased() and span != 0 and cp.pos % span != 0) cp.release();
@@ -598,6 +598,12 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
     const bytes = self.disk.?.point_bytes_written - staged_before;
     // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
     log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
+}
+
+fn keepLive(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cps: []SSMCheckpoint) void {
+    for (cps) |*cp| if (!cp.isReleased()) liveOf(self).keep(self.allocator, m, cp, false) catch |err| {
+        log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
+    };
 }
 
 /// The request's state at `tokens.len`, which must be where the model stands, as one restore point straight to the

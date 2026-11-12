@@ -1058,6 +1058,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   it would copy the rows past its last whole segment into its own file, again for every point, and a follow-up turn rolls
   back to it from RAM instead of reading it. Each logs `[dsv41-prefix] restore points to
   SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
+  A prompt under the floor stages nothing and keeps its points in `Live` too, so it rolls back as a longer one does.
 - **Namespace**: `dsv41_prefix.layoutKey` (through the `dsv41_prefix.diskLayoutKey` hook that `model_load.diskLayoutKey` asks) is `namespaceTag` (`dsv41-state-v4`, or
   `dsv41-state-v5-dspark` when the stages are resident: the per-row attention split moved the verify rows' bytes; the tags moved
   when segments became shared between entries and points started to be flushed lazily, and no reader of the old layout exists), then `-simd` when the SIMD attention kernel serves, `-composed` for a

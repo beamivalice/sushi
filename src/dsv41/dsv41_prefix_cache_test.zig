@@ -1215,6 +1215,43 @@ test "DeepSeek live rollback: the state rolled back to each kept point is a full
     }
 }
 
+test "DeepSeek live rollback: a prompt under the SSD tier's floor keeps its points live, and the same prompt sent again rolls back to them (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var turn_buf: [60]u32 = undefined;
+    const turn = dsv41LongPrompt(&net, &turn_buf, null, 0);
+
+    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-under-floor");
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache.deinit();
+    var cps: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (cps.items) |*cp| cp.deinit(testing.allocator);
+        cps.deinit(testing.allocator);
+    }
+    try net.prefill(turn, &.{ 30, 30 }, 0, &.{0}, &cps);
+    cache.step = turn.len;
+    dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, turn, false, .{}, cps.items, "prefill");
+    // Under the floor nothing reaches the tier: the point stays for the commit.
+    try testing.expect(!cps.items[0].isReleased());
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entries.items.len);
+    _ = dsv41_prefix.publishLiveDsv41(&hc, net.m, turn, false, .{}, cache.config);
+
+    const res = try dsv41Lookup(&hc, &net, turn);
+    try testing.expectEqual(@as(usize, 30), res.matched);
+    try testing.expect(hc.last_restored_live);
+}
+
 test "DeepSeek live rollback: only a state still standing for the same history serves, at a point the prompt shares (DSV41_TINY)" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
