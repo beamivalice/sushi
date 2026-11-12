@@ -305,6 +305,10 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   share of a 17.9k new-text prompt's reads from 26% to 34% (`reads_direct`/`reads`) and moved neither the fill rate nor prefill
   (new text 1,370 against ~1,359 tok/s at 17.9k, 1,403 against ~1,404 at 31.5k, two boots, `--ssd-budget-gb 108`):
   the reads are bound by the SSD at ~8.5 GB/s, not by the bounce copy.
+- **The fill rate is the SSD beside a working GPU, not the pool's width** (`256a6d4a`, pack revision 2.0, a 25.8k-token
+  prefill, one load an arm): 10.2 to 11.8 GB/s a chunk at 4 workers, 10.4 to 12.0 at 8, 10.8 to 12.0 at 16. Uncached
+  1 and 6 MiB reads on the same shards alone run 13.7 to 14.1 GB/s at 4, 8 and 16 threads, and the load's cache fill,
+  with the GPU idle, 13.1 GB/s. `FILL_WORKERS` stays 4.
 - The `[expert-stream] forward=` line ends with `bounced_gb` (bytes read through the bounce buffer since boot) and
   `reshuffled_gb` (tile bytes the CPU permuted); a pair-major pack on aligned shards shows both falling to the share
   of reads that cannot be direct, `reshuffled_gb` at 0.
