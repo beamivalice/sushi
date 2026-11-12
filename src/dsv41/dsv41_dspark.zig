@@ -43,12 +43,6 @@ pub const dsv41_max_drafts = dspark_rows.max_drafts;
 /// The widest verify `dsv41VerifyImpl` accepts, a ring slack's rows.
 pub const dsv41_max_verify_rows: u8 = @intCast(@import("dsv41_config.zig").ring_slack);
 
-/// The widest copy round. A verify's rows are their one-row step's bits at every width on a machine with matrix units
-/// (`Model.Forward.verify`); without them the trunk linears leave the multi-row arm past
-/// `project_rows.PROJECT_ROWS_MAX` for the sorted GEMM, which sums in another order, so a copy round stays inside it
-/// on every machine. Adaptive rounds stay inside the block (6).
-pub const dsv41_exact_verify_rows: u8 = 8;
-
 /// `SUSHI_DSV41_DSPARK_ROWS` (diagnostic): `sweep` cycles the verify width over `dspark_sweep_rows`, a number forces
 /// it (rows past the block repeat its last draft, so only their cost means anything), `log` keeps the policy; each
 /// round logs a `[dspark-round]` line.
@@ -80,9 +74,12 @@ pub fn stageBlock(xfm: *Trunk) u32 {
 /// The copy arm: the context's continuation after `t1` into `drafts`, as many as a copy round verifies, or 0 for a stage
 /// round. Adaptive rounds only; a forced or seeded width keeps its rows.
 fn dsparkCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []u32) !usize {
+    const m = dsv41_state.modelOf(self.xfm) orelse return 0;
     const remaining = self.max_tokens - self.completion_tokens;
-    const cap = @min(drafts.len, remaining -| 1, (self.dspark_copy_rows orelse dsv41_exact_verify_rows) - 1);
-    const block: usize = if (dsv41_state.modelOf(self.xfm)) |m| m.cfg.dspark.block else return 0;
+    // A copy round is as wide as a verify whose rows are the serial step's; adaptive rounds stay inside the block.
+    const rows = self.dspark_copy_rows orelse @min(dsv41_max_verify_rows, m.exactVerifyRows());
+    const cap = @min(drafts.len, remaining -| 1, rows - 1);
+    const block: usize = m.cfg.dspark.block;
     if (cap <= block) return 0;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, @intCast(self.dspark_copy_backoff.width(cap)));

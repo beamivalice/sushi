@@ -795,10 +795,15 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
 
 - **Copy rounds** (`nextDspark`, `mtp_lookup.matchBest` / `copyLen` / `CopyBackoff`, the MTP lookup's index): when the committed tail
   plus t1 matches 16 or more tokens earlier in the prompt or output (the best of the last 8 occurrences) and the continuation
-  outruns the stage block, the round verifies the copy (up to 7 drafts) and skips the stage draft. It is capped at 8 rows
-  (`dsv41_exact_verify_rows`), a cap that is now only the copy round's: a verify is the one-row step's bits at every width up to
-  16 on a machine with matrix units (`Model.arm(.verify)` takes the wide exact arm past `PROJECT_ROWS_MAX`; [a row alone](#prefill-width)),
-  so a wider copy round is open as a speed lever. A backoff skips copies that lose to the stage rounds on ms per token, a doubling stretch
+  outruns the stage block, the round verifies the copy and skips the stage draft. A copy round is as wide as the widest
+  verify whose rows are the one-row step's bits (`Model.exactVerifyRows`): 16 rows on a machine with matrix units
+  (`Model.arm(.verify)` takes the wide exact arm past `PROJECT_ROWS_MAX`; [a row alone](#prefill-width)), 8 without. A
+  round past 8 rows does not queue its routed chains (`route_spec_rows`, below): with them queued a 16-row round gained
+  nothing over two 8-row rounds. Release pack, `--ssd-budget-gb 108 --ctx-size 1000000`, greedy, no thinking, 800 tokens,
+  each load from a box under 50 C, main `148c4059` (8 rows) against this change: echo of a 2.4k-token doc 104.5 / 107.5 /
+  103.8 against 114.8 tok/s, an identifier rename over a 4.4k-token file 106.6 / 106.6 / 105.2 against 117.1; 48 of 55
+  rounds at 16 rows, every draft accepted, the text's hash equal. The greedy request after them keeps its round mix
+  (52.3 against 52.0 tok/s). A backoff skips copies that lose to the stage rounds on ms per token, a doubling stretch
   up to 16 matches, and sizes a copy to what copies have landed plus 2. Greedy text is byte-identical on and off. Design after
   CommunityServe/plugins #15 (@STRML, MIT). Pack `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`, `--ssd-budget-gb 108`, greedy, no
   thinking, 800 tokens, main + copy arm `aacdc607` ReleaseFast, GPU lock, fans max, `taskpolicy -a`, arm off by a temporary env knob
@@ -902,7 +907,13 @@ the position and group-count arrays they have in common (`Shared.index`, one bui
 are verified against the pool before any later layer's, so a DSpark target, a verify round's rows and the state arrays
 of a kept layer never come from a wrong sum. An Engram layer is rebuilt from the rows its pass read once
 (`Pass.engram_rows`). A layer the stream cannot queue (resident, released, lossy pick) settles its predecessor first; a
-pass that rebuilt 3 layers plus a third of those built (`Model.route_spec_rebuilds`) stops queueing. A decode pass does
+pass that rebuilt 3 layers plus a third of those built (`Model.route_spec_rebuilds`) stops queueing. A pass wider than
+`route_spec_rows` (8) queues none: each row brings six picks, and a layer's queue pays only when every pick is in the
+map. Verify ms by width (release pack, budget 108: 264 of 384 experts a layer cached; forced widths over the rename
+request, each load from a box under 50 C, A C C A, the repeats within 1%), queued against waiting: 20.4 / 26.8 at one
+row, 28.0 / 35.1 at two, 42.8 / 49.1 at four, 57.2 / 63.4 at six, 72.9 / 76.6 at eight; a 16-row copy round 134 to 141
+ms queued, 122 to 126 ms waiting. The gain is the wait a layer saves, about 6 ms a pass, and it is gone between 8 and
+16 rows; the crossing was not placed more finely. A decode pass does
 not wait for its embedding, and queues the head from the last layer's queued sum before settling it (a rebuild builds the
 head again), so the GPU's only idle points are the logits read and the host's sampling. A pipelined one-row greedy
 decode (`ForwardCtx.lazy_logits`, set by the Generator when the request reads only the argmax) takes the logits back

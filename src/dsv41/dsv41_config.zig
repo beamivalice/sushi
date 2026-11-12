@@ -14,6 +14,10 @@ pub const max_block = 16;
 /// still rolls back to any accepted prefix.
 pub const ring_slack: u32 = 16;
 
+/// The widest decode pass that queues its routed chains before their picks are read (`dsv41_model.specOn`). The queue
+/// saves a wait a layer and loses a layer's work when a pick is outside the cache map; each row brings `top_k` picks.
+pub const route_spec_rows: u32 = 8;
+
 pub const Engram = struct {
     n: u32 = 0,
     layers: [max_engram]u32 = @splat(0),

@@ -824,6 +824,12 @@ pub const Model = struct {
         };
     }
 
+    /// The widest verify whose rows are their one-row step's bits: 16 on a machine with matrix units, 8 without, where
+    /// the trunk linears leave the multi-row arm past `PROJECT_ROWS_MAX` for the sorted GEMM and its other sum order.
+    pub fn exactVerifyRows(self: *const Model) usize {
+        return @intCast(exl3.project_rows.rowsMax(self.rowsOf(.verify)));
+    }
+
     /// The model's forwards are `kind`'s from here to `Armed.end`, which puts back what it found. The one writer of
     /// `rows` and `defer_head`.
     pub fn arm(self: *Model, kind: Forward) Armed {
@@ -3750,7 +3756,7 @@ const Undo = struct {
 
 /// Whether layer `li` of the pass queues its routed chain from the stream's cache map.
 fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
-    if (!m.route_spec or m.sync_layers or p.ids.len > exl3.kernels.DECODE_ROWS_MAX or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
+    if (!m.route_spec or m.sync_layers or p.ids.len > cfg_mod.route_spec_rows or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
     if (m.trace != null or m.profile != null or p.tail != null or p.img.ctx != null) return false;
     const hk = switch (m.experts) {
         .resident => return false,

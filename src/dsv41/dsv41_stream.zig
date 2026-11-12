@@ -1616,6 +1616,37 @@ test "dsv41 stq: a queued decode layer is one command buffer, two where a prefet
     };
 }
 
+// A layer's queued chain pays when every pick of the pass is in the cache map; a pass of many rows has too many picks
+// for that, and waits for each layer's picks instead.
+test "dsv41 stq: a pass queues its routed chains up to the queue's row limit and waits for its picks past it (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const limit: usize = @intCast(cfg_mod.route_spec_rows);
+    const prompt: usize = 20;
+    try testing.expect(limit < exl3.kernels.DECODE_ROWS_MAX and ids.len >= prompt + 2 * limit + 3);
+    // Fewer slots than experts: a layer whose every expert is resident has no cache map to queue from.
+    var queued: StqServed = undefined;
+    try queued.init(dir, .bfloat16, true, false, 4, s);
+    defer queued.deinit();
+    _ = mlx.mlx_array_free(try model.extend(queued.m, ids[0..prompt], .last));
+    var at: usize = prompt;
+    for ([_]struct { rows: usize, queues: bool }{ .{ .rows = 1, .queues = true }, .{ .rows = limit, .queues = true }, .{ .rows = limit + 1, .queues = false }, .{ .rows = 1, .queues = true } }) |pass| {
+        const settled = model.spec_kept + model.spec_rebuilt;
+        const out = try model.extend(queued.m, ids[at..][0..pass.rows], .all);
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_array_eval(out));
+        at += pass.rows;
+        try testing.expectEqual(pass.queues, model.spec_kept + model.spec_rebuilt > settled);
+    }
+}
+
 test "dsv41 stq: queued routed chains leave a verify round's kept rows, the DSpark windows and the open groups as the drained schedule does (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();

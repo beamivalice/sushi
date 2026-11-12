@@ -271,7 +271,7 @@ test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole o
     }
     try testing.expectEqual(@as(usize, want), serial.items.len);
 
-    // Copy rounds keep to `dsv41_exact_verify_rows`, the widest verify this fixture matches serial decode at.
+    // Copy rounds keep to the widest verify whose rows are the serial step's (`Model.exactVerifyRows`).
     // The lookup context is the prompt, the output the model is about to write, and the prompt again: the generated
     // tail then matches the output's start, and the copy is the model's own continuation. `wrong_every` spoils drafts.
     for ([_]usize{ 0, 11 }) |wrong_every| {
@@ -302,6 +302,12 @@ test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole o
                 try testing.expect(st.copy_accepted <= st.copy_drafted);
                 try testing.expect(wrong_every > 0 or st.copy_accepted == st.copy_drafted);
                 try testing.expect(wrong_every == 0 or st.copy_accepted < st.copy_drafted);
+                // A copy that keeps landing whole widens to the widest verify whose rows are the serial step's.
+                const widest = dsv41_state.modelOf(&xfm).?.exactVerifyRows();
+                var at_widest: u32 = 0;
+                for (st.rows_hist[widest..]) |n| at_widest += n;
+                try testing.expect(wrong_every > 0 or at_widest > 0);
+                for (st.rows_hist[widest + 1 ..]) |n| try testing.expectEqual(@as(u32, 0), n);
             }
         }
     }

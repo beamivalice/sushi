@@ -26,6 +26,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1-Flash greedy answers no longer depend on how tokens were drafted**: at long context a rare rounding
   difference between a single-token step and a drafted round could change a greedy answer; a token now gets the same
   result either way, so a request that asks for logprobs gives the text one without them gives.
+- **DeepSeek-V4.1-Flash echoes and edits of text already in the conversation decode faster on M5 Macs**: when the
+  answer repeats a long stretch of the prompt or of earlier output, a round now checks up to 16 copied tokens at once
+  where it checked 8, with the same text.
 - **`sushi bench` rejects a row the engine compiled a kernel in**: such a request's time holds a compile, so it is
   listed under Warnings like a missed restore; a Sushi Cooler load whose kernel warm fails now stops with the error
   instead of serving.
