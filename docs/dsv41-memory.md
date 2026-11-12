@@ -26,6 +26,14 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
   steadiest (16, 25) about 215. On a 4k and a 16k prompt with a 1024-token decode at budget 96 the decode speed matched
   the uniform split (68.9 and 63.8 tok/s against 68.1 and 65.0), hits being ~99% in both; the profile matters for long
   decodes over changing documents, and the larger the cache the more of the remaining misses it removes.
+- **Making the encoder fully resident does not speed up prefill.** CED runs only layers 0-19 on three prefill chunks
+  of four, and the profile is tuned for decode, so those layers miss most in a prefill. With layers 0-19 at their full
+  bytes and the profile spending the rest on 20-39 (a throwaway knob on `42c364c6`, `--ssd-budget-gb 108`, same cache
+  bytes, replies byte-equal), a 25.8k-token prefill reads 16.2 GB from the SSD in place of 42.9, and its tok/s does
+  not move: cooled pair, one binary, `tests/bench.sh --rungs 32k`, code windows 4k to 32k 1,350 / 1,552 / 1,649 /
+  1,554 / 1,539 against 1,351 / 1,615 / 1,651 / 1,571 / 1,556 with the profile split, prose within 4% both ways,
+  decode at 32k equal. The reads a prefill still makes are hidden behind GPU work
+  ([engine-expert-streaming](engine-expert-streaming.md)); the prefill is bound by GPU work per token.
 - **The MLX buffer pool is a ledger term, in two phases.** `server.applyMlxCacheLimit` caps freed buffers at RAM/16
   (8 GiB here), and that pool sat outside the plan: a bench went 118 to 126 GB against a 125 GB wired limit. Measured
   (`--ssd-budget-gb 96`, 4k to 128k code and prose, 150 ms samples of `/props`): every 8k prefill window and the cold

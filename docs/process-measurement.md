@@ -227,7 +227,9 @@ its own thermal state.
 - **Tier 2 confirms, it never discovers.** One run of the new arm. The baseline is the series' first fast bench on its
   head, inherited until a landing moves it; that landing's run is then the baseline. Read in this order: bytes (for a
   byte-identical lever the text, or the `[spec-stats]` round mix), Warnings, verify ms at an equal round mix, tok/s. A
-  tok/s gap under 3% between two loads is no verdict either way.
+  tok/s gap under 3% between two loads is no verdict either way. A round mix that differs is not yet another text:
+  DeepSeek's width planner follows timings, so one request sent twice can log other `[spec-stats]` at one reply.
+  Compare the replies' hashes before reading a decode cell as a text change.
 - **A context-dependent path adds its rung, not the ladder.** A diff in the indexer, the compressed rows, state growth
   or restore runs the fast bench at the rung where that path engages (`--rungs 4k,64k`).
 - **No bench waits for the box to rest.** Cooling is the fans at max and the wrapper's idle under 50 °C, nothing
