@@ -71,6 +71,9 @@ pub fn stageBlock(xfm: *Trunk) u32 {
     return if (dsv41_state.modelOf(xfm)) |m| m.cfg.dspark.block else arch_dspark.default_block;
 }
 
+/// Drafts of the widest pass that still queues its routed chains: a copy round past them pays a wait a layer.
+const copy_narrow: usize = @import("dsv41_config.zig").route_spec_rows - 1;
+
 /// The copy arm: the context's continuation after `t1` into `drafts`, as many as a copy round verifies, or 0 for a stage
 /// round. Adaptive rounds only; a forced or seeded width keeps its rows.
 fn dsparkCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []u32) !usize {
@@ -82,7 +85,7 @@ fn dsparkCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, dra
     const block: usize = m.cfg.dspark.block;
     if (cap <= block) return 0;
     const idx = try self.mtpLookupIndex(allocator);
-    const found = idx.matchBest(t1, @intCast(self.dspark_copy_backoff.width(cap)));
+    const found = idx.matchBest(t1, @intCast(self.dspark_copy_backoff.width(cap, copy_narrow)));
     const n = mtp_lookup.copyLen(found, cap, block, mtp_lookup.COPY_SUFFIX);
     if (n == 0 or !self.dspark_copy_backoff.take()) return 0;
     @memcpy(drafts[0..n], found.?.draft[0..n]);
@@ -231,7 +234,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         }.of;
         if (copied > 0) {
             // The stage policy learns from stage blocks only: a wide copy verify would move its fitted row price.
-            self.dspark_copy_backoff.observeCopy(rows - 1, accepted, ms(draft_ns + verify_ns));
+            self.dspark_copy_backoff.observeCopy(rows - 1, accepted, ms(draft_ns + verify_ns), copy_narrow);
         } else {
             self.dspark_copy_backoff.observeStage(n_commit, ms(draft_ns + verify_ns));
             if (block == null) policy.observePlain(ms(verify_ns)) else policy.observeRound(conf_buf[0 .. block_len - 1], @intCast(rows), accepted, ms(draft_ns), ms(verify_ns));

@@ -155,18 +155,25 @@ pub const CopyBackoff = struct {
     /// Decayed ms a copy round saved against stage rounds for its tokens; negative while copies lose.
     edge: f32 = 0,
     stage_ms_per_token: f32 = 12,
-    /// Drafts kept per copy round, smoothed, and whether the last copy kept every draft.
+    /// Drafts kept per copy round, smoothed, and the copy rounds in a row that kept every draft.
     kept: f32 = 5,
-    streak: bool = false,
+    whole: u8 = 0,
+    /// Whole rounds in a row before one goes past the narrow width: doubled by a wide round that missed, back to 2 when
+    /// one lands whole.
+    wide_after: u8 = 2,
 
+    pub const max_wide_after: u8 = 16;
     pub const max_period: u32 = 16;
     const decay: f32 = 0.8;
 
-    /// Drafts the next copy round verifies, of `cap`: what copies have been landing plus 2, or the cap right after one
-    /// landed whole.
-    pub fn width(self: *const CopyBackoff, cap: usize) usize {
-        if (self.streak) return cap;
-        return @min(cap, @as(usize, @intFromFloat(@ceil(@max(self.kept, 0)))) + 2);
+    /// Drafts the next copy round verifies, of `cap`. Up to `narrow` (the widest pass at the cheapest schedule): what
+    /// copies have been landing plus 2, or all of them right after one landed whole. Past it only after `wide_after`
+    /// landed whole in a row: a wide pass saves one pass's fixed cost when it lands whole and loses about a narrow
+    /// pass when it misses.
+    pub fn width(self: *const CopyBackoff, cap: usize, narrow: usize) usize {
+        const near = @min(cap, narrow);
+        if (self.whole == 0) return @min(near, @as(usize, @intFromFloat(@ceil(@max(self.kept, 0)))) + 2);
+        return if (self.whole < self.wide_after) near else cap;
     }
 
     /// Whether to take a match worth copying.
@@ -182,10 +189,12 @@ pub const CopyBackoff = struct {
         self.stage_ms_per_token = decay * self.stage_ms_per_token + (1 - decay) * ms / @as(f32, @floatFromInt(tokens));
     }
 
-    /// A copy round that verified `drafted` copies, kept `kept` of them and took `ms`.
-    pub fn observeCopy(self: *CopyBackoff, drafted: usize, kept: usize, ms: f32) void {
+    /// A copy round that verified `drafted` copies, kept `kept` of them and took `ms`; `narrow` as `width` takes it.
+    pub fn observeCopy(self: *CopyBackoff, drafted: usize, kept: usize, ms: f32, narrow: usize) void {
         self.kept = emaStep(self.kept, @intCast(kept));
-        self.streak = kept == drafted;
+        const landed = kept == drafted;
+        self.whole = if (landed) self.whole +| 1 else 0;
+        if (drafted > narrow) self.wide_after = if (landed) 2 else @min(self.wide_after * 2, max_wide_after);
         if (!std.math.isFinite(ms) or ms <= 0) return;
         const saved = @as(f32, @floatFromInt(1 + kept)) * self.stage_ms_per_token - ms;
         self.edge = decay * self.edge + (1 - decay) * saved;
@@ -350,31 +359,58 @@ test "dspark copy backoff: copies that lose to stage rounds are skipped for a do
     var b = CopyBackoff{};
     for (0..10) |_| b.observeStage(3, 30);
     try testing.expect(b.take());
-    b.observeCopy(15, 2, 60);
+    b.observeCopy(15, 2, 60, 7);
     try testing.expectEqual(@as(u32, 1), b.owed);
     try testing.expect(!b.take());
     try testing.expect(b.take());
-    b.observeCopy(15, 2, 60);
+    b.observeCopy(15, 2, 60, 7);
     try testing.expectEqual(@as(u32, 2), b.owed);
     for (0..8) |_| {
         b.owed = 0;
-        b.observeCopy(15, 2, 60);
+        b.observeCopy(15, 2, 60, 7);
     }
     try testing.expectEqual(CopyBackoff.max_period, b.period);
     b.owed = 0;
-    for (0..4) |_| b.observeCopy(15, 15, 60);
+    for (0..4) |_| b.observeCopy(15, 15, 60, 7);
     try testing.expect(b.edge > 0);
     try testing.expectEqual(@as(u32, 1), b.period);
 }
 
-test "dspark copy backoff: a round verifies what copies have landed plus 2, the cap after one landed whole" {
+test "dspark copy backoff: a round verifies what copies have landed plus 2, a narrow pass after one landed whole, the cap after two" {
     var b = CopyBackoff{};
-    try testing.expectEqual(@as(usize, 7), b.width(15));
-    b.observeCopy(7, 7, 50);
-    try testing.expectEqual(@as(usize, 15), b.width(15));
-    b.observeCopy(15, 1, 50);
-    try testing.expectEqual(@as(usize, 7), b.width(15));
-    for (0..6) |_| b.observeCopy(7, 1, 50);
-    try testing.expect(b.width(15) <= 5);
-    try testing.expectEqual(@as(usize, 4), b.width(4));
+    try testing.expectEqual(@as(usize, 7), b.width(15, 7));
+    b.observeCopy(7, 7, 50, 7);
+    try testing.expectEqual(@as(usize, 7), b.width(15, 7));
+    b.observeCopy(7, 7, 50, 7);
+    try testing.expectEqual(@as(usize, 15), b.width(15, 7));
+    b.observeCopy(15, 1, 50, 7);
+    try testing.expectEqual(@as(usize, 7), b.width(15, 7));
+    for (0..6) |_| b.observeCopy(7, 1, 50, 7);
+    try testing.expect(b.width(15, 7) <= 5);
+    try testing.expectEqual(@as(usize, 4), b.width(4, 7));
+    // A cap inside the narrow pass is reached after one whole round, as before.
+    var c = CopyBackoff{};
+    c.observeCopy(5, 5, 40, 7);
+    try testing.expectEqual(@as(usize, 6), c.width(6, 7));
+}
+
+test "dspark copy backoff: a wide round that misses doubles the whole rounds the next one waits for, and one that lands whole takes them back to 2" {
+    var b = CopyBackoff{};
+    for (0..2) |_| b.observeCopy(7, 7, 60, 7);
+    try testing.expectEqual(@as(usize, 15), b.width(15, 7));
+    b.observeCopy(15, 6, 120, 7);
+    for (0..3) |_| {
+        b.observeCopy(7, 7, 60, 7);
+        try testing.expectEqual(@as(usize, 7), b.width(15, 7));
+    }
+    b.observeCopy(7, 7, 60, 7);
+    try testing.expectEqual(@as(usize, 15), b.width(15, 7));
+    // A wide round that lands whole keeps the next ones wide, and a narrow miss leaves the wait as it was.
+    b.observeCopy(15, 15, 120, 7);
+    try testing.expectEqual(@as(usize, 15), b.width(15, 7));
+    b.observeCopy(7, 3, 60, 7);
+    for (0..2) |_| b.observeCopy(7, 7, 60, 7);
+    try testing.expectEqual(@as(usize, 15), b.width(15, 7));
+    for (0..8) |_| b.observeCopy(15, 0, 120, 7);
+    try testing.expectEqual(CopyBackoff.max_wide_after, b.wide_after);
 }

@@ -804,7 +804,17 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   103.8 against 114.8 tok/s, an identifier rename over a 4.4k-token file 106.6 / 106.6 / 105.2 against 117.1; 48 of 55
   rounds at 16 rows, every draft accepted, the text's hash equal. The greedy request after them keeps its round mix
   (52.3 against 52.0 tok/s). A backoff skips copies that lose to the stage rounds on ms per token, a doubling stretch
-  up to 16 matches, and sizes a copy to what copies have landed plus 2. Greedy text is byte-identical on and off. Design after
+  up to 16 matches, and sizes a copy to what copies have landed plus 2.
+  A round goes past 8 rows only after copy rounds landed whole in a row (`CopyBackoff.wide_after`: 2, doubled to at
+  most 16 by a wide round that missed, back to 2 by one that landed whole). A row costs about the same in either
+  pass, so a wide round saves one pass's fixed cost when it lands whole and loses about a narrow pass when it misses:
+  on the release bench's code corpus a 16-row round landed whole one time in three even after two whole 8-row rounds
+  (114 to 132 ms a 16-row round against 59 to 64 ms an 8-row one), and "the cap after one whole round" cost its 8k
+  cell 86.4 / 89.4 tok/s against 95.5 / 94.7 under this rule (main `771cbaca` against the rule, each load cooled
+  under 50 C, `sushi bench --code-only --rungs 4k,8k`; 4k 91.9 / 92.4 against 92.3 / 92.4, one 16-row round a request
+  where there were five). The echo and the rename keep their 16-row rounds (47 of 55): 117.3 and 119.9 tok/s, the
+  text's hash equal. The rule reads acceptance only, never a clock, so a request's round mix repeats.
+  Greedy text is byte-identical on and off. Design after
   CommunityServe/plugins #15 (@STRML, MIT). Pack `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`, `--ssd-budget-gb 108`, greedy, no
   thinking, 800 tokens, main + copy arm `aacdc607` ReleaseFast, GPU lock, fans max, `taskpolicy -a`, arm off by a temporary env knob
   (since removed), decode tok/s off (two boots) vs on: echo a 2.0k-token file 64.0 / 68.1 vs 80.6 (+22%), rename an identifier in a
