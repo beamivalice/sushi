@@ -13,7 +13,7 @@ const kernels = @import("dsv41_kernels.zig");
 const model = @import("dsv41_model.zig");
 const exl3_ubench = @import("sushi_exl3_ubench").ubench;
 
-pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions, reduce_expand, settle_redo };
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions, markov_chain, reduce_expand, settle_redo };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -1034,6 +1034,72 @@ fn runHcStages(run: *report.Run) anyerror!void {
             const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ stage, L });
             try run.interleave(label, &s, sampleHcStages);
         }
+    }
+}
+
+// ── dsv41.markov_chain ──────────────────────────────────────────────────
+
+pub const markov_chain: report.Bench = .{
+    .name = "dsv41.markov_chain",
+    .scope = .dsv41,
+    .what = "a draft block's Markov chain at the release geometry (vocab 129280, rank 256, block 5, dim 5120): the op chain a token at a time over an f32 head (take, matmul, add, the confidence concat and matmul, argmax) against one kernel a token over the head as stored (bf16)",
+    .unit = .us,
+    .steps = 1,
+    .arms = &.{ "ops", "kernel" },
+    .ref = "ops",
+    .run = runMarkovChain,
+};
+
+const markov_block = 5;
+
+const MarkovSample = struct { gpu: mlx.mlx_stream, logits: A, head: A, head32: A, embed: A, hout: A, cw: A };
+
+fn sampleMarkov(c: *const MarkovSample, arm: usize) anyerror!f64 {
+    var t = Scope.plain(alloc, c.gpu);
+    defer t.deinit();
+    var outs: [2 * markov_block]A = undefined;
+    var sw = io_util.Stopwatch.init(io());
+    var cur = try t.ints(&.{11}, &.{1});
+    for (0..markov_block) |k| {
+        if (arm == 1) {
+            const step = try kernels.markovStep(&t, c.logits, c.head, c.embed, cur, c.hout, c.cw, k);
+            cur = step.pick;
+            outs[markov_block + k] = step.conf;
+        } else {
+            const me = try t.astype(try t.take(c.embed, cur, 0), .float32);
+            const row = try t.add(try t.slice(c.logits, 0, k, k + 1), try t.matmul(me, try t.t2(c.head32)));
+            outs[markov_block + k] = try t.matmul(try t.concat(&.{ try t.slice(try t.astype(c.hout, .float32), 0, k, k + 1), me }, -1), try t.t2(c.cw));
+            var am = mlx.mlx_array_new();
+            cur = try t.astype(try t.reshape(try t.res(mlx.mlx_argmax_axis(&am, row, -1, false, t.s), &am), &.{1}), .int32);
+        }
+        outs[k] = cur;
+    }
+    try evalAll(&outs);
+    return @floatFromInt(sw.read());
+}
+
+fn runMarkovChain(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    var sc = Scope.plain(alloc, gpu);
+    defer sc.deinit();
+    const vocab = 129280;
+    const rank = 256;
+    const width = 5120;
+    const head = try sc.astype(try kernels.randn(&sc, &.{ vocab, rank }, .float32, 171, 0.05), .bfloat16);
+    const c: MarkovSample = .{
+        .gpu = gpu,
+        .logits = try kernels.randn(&sc, &.{ markov_block, vocab }, .float32, 170, 2.0),
+        .head = head,
+        .head32 = try sc.astype(head, .float32),
+        .embed = try sc.astype(try kernels.randn(&sc, &.{ vocab, rank }, .float32, 172, 0.5), .bfloat16),
+        .hout = try sc.astype(try kernels.randn(&sc, &.{ markov_block, width }, .float32, 173, 1.0), .bfloat16),
+        .cw = try kernels.randn(&sc, &.{ 1, width + rank }, .float32, 174, 0.02),
+    };
+    try evalAll(&.{ c.logits, c.head, c.head32, c.embed, c.hout, c.cw });
+    try run.interleave("block of 5", &c, sampleMarkov);
+    for ([_][]const u8{ "ops", "kernel" }, [_]f64{ 4, 2 }) |arm, bytes_per| {
+        if (!listed(run.plan.bench.arms, arm)) continue;
+        try run.metric(arm, "head read", "MB", bytes_per * vocab * rank * markov_block / 1e6);
     }
 }
 

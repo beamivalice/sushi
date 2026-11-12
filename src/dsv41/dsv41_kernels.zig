@@ -2365,6 +2365,77 @@ pub fn indexScoresTile(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, 
     return o[0];
 }
 
+// ── DSpark draft ─────────────────────────────────────────────────────────
+
+/// One token of the draft's Markov chain, a thread a vocabulary row: row `step` of `logits` plus the bigram bias (the
+/// bias row of `prev` in `embed` against the row of `head`), the threadgroup's first maximum, and from threadgroup 0
+/// the confidence logit of the block row and the bias row against `cw`.
+const MARKOV_ROW_SOURCE =
+    \\const uint tid = thread_index_in_threadgroup, tgx = threadgroup_position_in_grid.x;
+    \\const int V = logits_shape[1], D = hout_shape[1], k = step[0];
+    \\const device T* me = embed + size_t(prev[0]) * R;
+    \\const int v = int(tgx) * TG + int(tid);
+    \\float val = -INFINITY;
+    \\if (v < V) {
+    \\  const device T* w = head + size_t(v) * R;
+    \\  float4 s = 0.0f;
+    \\  int j = 0;
+    \\  for (; j + 4 <= R; j += 4) s = metal::fma(float4(float(w[j]), float(w[j + 1]), float(w[j + 2]), float(w[j + 3])), float4(float(me[j]), float(me[j + 1]), float(me[j + 2]), float(me[j + 3])), s);
+    \\  for (; j < R; ++j) s.x = metal::fma(float(w[j]), float(me[j]), s.x);
+    \\  val = logits[size_t(k) * V + v] + ((s.x + s.y) + (s.z + s.w));
+    \\  row[v] = val;
+    \\}
+    \\threadgroup float tv[TG], tc[TG];
+    \\tv[tid] = val;
+    \\if (tgx == 0u) {
+    \\  float c = 0.0f;
+    \\  for (int i = tid; i < D + R; i += TG) c = metal::fma(i < D ? float(hout[size_t(k) * D + i]) : float(me[i - D]), cw[i], c);
+    \\  tc[tid] = c;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (tid != 0u) return;
+    \\int best = 0;
+    \\for (int i = 1; i < TG; ++i) if (tv[i] > tv[best]) best = i;
+    \\part_val[tgx] = tv[best];
+    \\part_idx[tgx] = int(tgx) * TG + best;
+    \\if (tgx != 0u) return;
+    \\float c = 0.0f;
+    \\for (int i = 0; i < TG; ++i) c += tc[i];
+    \\conf[0] = c;
+;
+
+/// The first maximum over the threadgroups' maxima, which arrive in vocabulary order.
+const MARKOV_PICK_SOURCE =
+    \\if (thread_position_in_grid.x != 0u) return;
+    \\const int n = part_val_shape[0];
+    \\int best = 0;
+    \\for (int i = 1; i < n; ++i) if (part_val[i] > part_val[best]) best = i;
+    \\pick[0] = part_idx[best];
+;
+
+var markov_row_def = Def{ .name = "dsv41_markov_row", .ins = &.{ "logits", "head", "embed", "prev", "hout", "cw", "step" }, .outs = &.{ "row", "part_val", "part_idx", "conf" }, .source = MARKOV_ROW_SOURCE };
+var markov_pick_def = Def{ .name = "dsv41_markov_pick", .ins = &.{ "part_val", "part_idx" }, .outs = &.{"pick"}, .source = MARKOV_PICK_SOURCE };
+
+/// A draft token's scores `[1, vocab]` (f32), its pick (int32 `[1]`, the first maximum) and its confidence logit (f32 `[1]`).
+pub const MarkovStep = struct { row: A, pick: A, conf: A };
+
+/// Token `k` of a draft block's Markov chain: row `k` of `logits` (`[B, vocab]` f32) plus the bigram bias of the token
+/// before it (`prev`, int32 `[1]`: row `prev` of `embed` against `head`, both `[vocab, rank]` in their stored dtype),
+/// and the confidence of row `k` of `hout` (`[B, dim]`) and that bias row against `cw` (`[1, dim + rank]` f32). `head` is
+/// read as stored: half the bytes of the f32 copy a matmul would take, and the chain is those bytes five times a draft.
+pub fn markovStep(sc: *Scope, logits: A, head: A, embed: A, prev: A, hout: A, cw: A, k: usize) !MarkovStep {
+    const tg: usize = 256;
+    const v = dim(logits, 1);
+    const groups = (v + tg - 1) / tg;
+    var o: [4]A = undefined;
+    try launch(sc, &markov_row_def, &.{ logits, head, embed, prev, hout, cw, try sc.ints(&.{ci(k)}, &.{1}) }, &.{
+        .{ .shape = &.{ 1, ci(v) }, .dt = .float32 }, .{ .shape = &.{ci(groups)}, .dt = .float32 }, .{ .shape = &.{ci(groups)}, .dt = .int32 }, .{ .shape = &.{1}, .dt = .float32 },
+    }, .{ groups * tg, 1, 1 }, .{ tg, 1, 1 }, &.{ .{ .name = "R", .v = ci(dim(head, 1)) }, .{ .name = "TG", .v = ci(tg) } }, &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(head) }, .{ .name = "HT", .dt = mlx.mlx_array_dtype(hout) } }, &o);
+    var pick: [1]A = undefined;
+    try launch(sc, &markov_pick_def, &.{ o[1], o[2] }, &.{.{ .shape = &.{1}, .dt = .int32 }}, .{ 1, 1, 1 }, .{ 1, 1, 1 }, &.{}, &.{}, &pick);
+    return .{ .row = o[0], .pick = pick[0], .conf = o[3] };
+}
+
 // ── hyper-connections ────────────────────────────────────────────────────
 
 /// A mix's index into the three scales (pre, post, comb) the checkpoint ships.
@@ -4198,6 +4269,53 @@ test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {
             try expectBitEqual("engram gate", try hostOf(&sc, got), try hostOf(&sc, want));
         }
     }
+}
+
+test "dsv41 draft: a Markov step's kernel gives the op chain's pick, and its scores and confidence to f32 rounding" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    for ([_]struct { v: c_int, r: c_int, d: c_int, b: usize }{ .{ .v = 1000, .r = 16, .d = 24, .b = 3 }, .{ .v = 4096, .r = 256, .d = 300, .b = 5 }, .{ .v = 300, .r = 8, .d = 5, .b = 2 } }) |c| {
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
+            const logits = try randn(&sc, &.{ ci(c.b), c.v }, .float32, 161, 2.0);
+            const head = try sc.astype(try randn(&sc, &.{ c.v, c.r }, .float32, 162, 0.5), dt);
+            const embed = try sc.astype(try randn(&sc, &.{ c.v, c.r }, .float32, 163, 0.5), dt);
+            const hout = try sc.astype(try randn(&sc, &.{ ci(c.b), c.d }, .float32, 164, 1.0), dt);
+            const cw = try randn(&sc, &.{ 1, c.d + c.r }, .float32, 165, 0.3);
+            var prev: i32 = 7;
+            for (0..c.b) |k| {
+                const at = try sc.ints(&.{prev}, &.{1});
+                const got = try markovStep(&sc, logits, head, embed, at, hout, cw, k);
+                const me = try sc.astype(try sc.take(embed, at, 0), .float32);
+                const want_row = try sc.add(try sc.slice(logits, 0, k, k + 1), try sc.matmul(me, try sc.t2(try sc.astype(head, .float32))));
+                const want_conf = try sc.matmul(try sc.concat(&.{ try sc.slice(try sc.astype(hout, .float32), 0, k, k + 1), me }, -1), try sc.t2(cw));
+                const row = try sc_mod.hostF32(got.row);
+                var first: usize = 0;
+                for (row, try sc_mod.hostF32(want_row), 0..) |g, w, i| {
+                    try testing.expectApproxEqAbs(w, g, 1e-4 * @max(1, @abs(w)));
+                    if (g > row[first]) first = i;
+                }
+                try testing.expectEqual(@as(usize, @intCast(c.v)), row.len);
+                const pick = (try sc_mod.hostI32(got.pick))[0];
+                try testing.expectEqual(@as(i32, @intCast(first)), pick);
+                const want_c = (try sc_mod.hostF32(want_conf))[0];
+                try testing.expectApproxEqAbs(want_c, (try sc_mod.hostF32(got.conf))[0], 1e-4 * @max(1, @abs(want_c)));
+                prev = pick;
+            }
+        }
+    }
+    // Equal scores go to the lower id, in one threadgroup and across two.
+    const v: c_int = 1000;
+    const zeros = try sc.zeros(&.{ v, 8 }, .bfloat16);
+    var flat: [1000]f32 = @splat(0);
+    const at = try sc.ints(&.{0}, &.{1});
+    const cw = try sc.zeros(&.{ 1, 12 }, .float32);
+    const hout = try sc.zeros(&.{ 1, 4 }, .bfloat16);
+    try testing.expectEqual(@as(i32, 0), (try sc_mod.hostI32((try markovStep(&sc, try sc.floats(&flat, &.{ 1, v }), zeros, zeros, at, hout, cw, 0)).pick))[0]);
+    flat[700] = 1;
+    flat[300] = 1;
+    flat[301] = 1;
+    try testing.expectEqual(@as(i32, 300), (try sc_mod.hostI32((try markovStep(&sc, try sc.floats(&flat, &.{ 1, v }), zeros, zeros, at, hout, cw, 0)).pick))[0]);
 }
 
 test "dsv41 kernels: a new row count, pick count, split count or context width compiles no new Metal library" {

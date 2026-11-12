@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash drafts cost less**: each drafted token reads its bigram table once, in the form the pack
+  stores it, so speculative rounds on code and prose finish sooner with the same text, and the load holds 66 MB less.
 - **DeepSeek-V4.1-Flash STQ prefill runs on Sushi Cooler on M5 Macs**: long prompts are processed on sushi's own Metal
   engine beside generation, with the same answers; `--ds41-mlx-engine` and the "Use Sushi's Cooler Engine instead of
   MLX" setting move prefill back to MLX with the rest.

@@ -665,6 +665,14 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   `[collapsed stream, markov embedding]`. `draft(m, t1, with_heads)` returns the picks, and the biased logits and
   confidence when asked; both are pinned to the reference (`ds_*` in the fixture, QAT off to 1e-4/2e-3 of the peak, QAT on
   to a cosine over the reference's own main rows).
+  On a GPU stream a position is one kernel and a small reduce (`kernels.markovStep`): a thread a vocabulary row reads
+  the head as stored (bf16, 66 MB a position where the f32 copy a matmul took was 132 MB), adds the trunk row, and
+  each threadgroup keeps its first maximum; threadgroup 0 also writes the confidence logit. The previous pick stays on
+  the GPU from position to position. `sushi-ubench run dsv41.markov_chain` (block of 5, release geometry, arms
+  interleaved in one process, `7f726d0d` plus this change): the op chain 1,505 us (1,421 to 3,128), the kernel 894 us (848 to 2,083). The
+  fast bench on the same tree against `7eb2da99`'s cells: code 8k, the same round mix, draft 2.9 to 3.1 ms a round
+  against 2.6, 96.6 / 97.0 against 99.4 / 99.5 tok/s; prose 4k 52.5 against 53.3, 8k 57.5 against 58.3. A draft is a
+  proposal: its scores differ from the op chain's in the last bits (another sum order), the text does not.
 - **State and entries.** The model and its expert streams are `dsv41_state.State`, `Trunk.arch_state.dsv41`; shared code
   reads them through `dsv41_state.modelOf` and `stqExpertsOf`. A round calls `dsv41_serving.dsv41DraftImpl`, `VerifyImpl`
   and `FinishImpl` directly: the trunk has no DeepSeek method. `State.deinit` calls `Model.deinit`, which frees the model
@@ -679,7 +687,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   pooling group is re-cut from the concatenation the verify saved; Engram history is truncated; the stage rings take the main rows of the
   kept positions only. The tests check every accepted count 0..block against serial decode, then a second round, then the next draft.
 - **Memory.** Resident, always (`dsv41_source.dsparkBytes`): 3 x 128 mxfp4 experts are 7.2 GB, the stages' trunk tensors
-  0.58 GB and the Markov tables 0.13 GB (f32 head), about 7.9 GB out of the SSD budget's expert cache. The state bill adds the
+  0.58 GB and the two Markov tables 0.13 GB (both as stored, bf16), about 7.9 GB out of the SSD budget's expert cache. The state bill adds the
   stage windows and the backbone slack (`Config.stateFixedBytes(true)`). The load is exact against the arrays the model holds
   (`dsparkHeldBytes` test), so the earlier "3.7 GB" figure of the audit was low by the experts' scales and half the experts.
 - **Wiring.** The checkpoint's DSpark is the model's MTP head: `MtpHeadRef.dsv41`, kept under streaming

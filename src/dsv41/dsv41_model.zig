@@ -301,7 +301,7 @@ const DsparkW = struct {
     norm: A,
     /// `[vocab, rank]`, the previous token's embedding.
     markov_embed: A,
-    /// f32 `[vocab, rank]`: the embedding's bigram bias over the vocabulary.
+    /// `[vocab, rank]` as stored: the embedding's bigram bias over the vocabulary.
     markov_head: A,
     /// f32 `[1, dim + rank]`: the confidence logit over `[collapsed stream, markov embedding]`.
     conf: A,
@@ -4438,9 +4438,18 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     var picks: [cfg_mod.max_block]A = undefined;
     var rows: [cfg_mod.max_block]A = undefined;
     var confs: [cfg_mod.max_block]A = undefined;
+    const fused = fusedOn(&sc, m);
     for (0..B) |k| {
+        if (fused) {
+            const step = try kernels.markovStep(&sc, logits, ds.markov_head, ds.markov_embed, cur, hout, ds.conf, k);
+            rows[k] = step.row;
+            if (with_conf) confs[k] = step.conf;
+            cur = step.pick;
+            picks[k] = cur;
+            continue;
+        }
         const me = try sc.astype(try sc.take(ds.markov_embed, cur, 0), .float32); // [1, rank]
-        const row = try sc.add(try sc.slice(logits, 0, k, k + 1), try sc.matmul(me, try sc.t2(ds.markov_head)));
+        const row = try sc.add(try sc.slice(logits, 0, k, k + 1), try sc.matmul(me, try sc.t2(try sc.astype(ds.markov_head, .float32))));
         rows[k] = row;
         if (with_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.slice(try sc.astype(hout, .float32), 0, k, k + 1), me }, -1), try sc.t2(ds.conf));
         var am = mlx.mlx_array_new();
@@ -4616,7 +4625,7 @@ fn initDspark(m: *Model, w: *model_mod.Weights) !void {
         .main_norm = try loadDense(m, w, try lkey(&b, "mtp", 0, "main_norm.weight"), m.act),
         .norm = try loadDense(m, w, try lkey(&b, "mtp", last, "norm.weight"), m.act),
         .markov_embed = try loadDense(m, w, try lkey(&b, "mtp", last, "markov_head.embed.weight"), m.act),
-        .markov_head = try loadDense(m, w, try lkey(&b, "mtp", last, "markov_head.head.weight"), .float32),
+        .markov_head = try loadDense(m, w, try lkey(&b, "mtp", last, "markov_head.head.weight"), m.act),
         .conf = conf,
         .banks = banks,
         .stq = stq,

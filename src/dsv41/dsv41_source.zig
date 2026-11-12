@@ -204,14 +204,13 @@ fn raggedSlot(key: []const u8) ?usize {
 }
 
 /// How many times the built tensor is as large as the stored one: an fp8 weight's block scale is repeated down its
-/// 32 rows, and the bf16 tensors the forward holds in f32 (the heads, the confidence head) double; an
-/// expert's per-row scales are stored as built.
+/// 32 rows, and the bf16 tensors the forward holds in f32 (the head, the confidence head) double; an
+/// expert's per-row scales and the Markov head are held as stored.
 fn widening(key: []const u8) u64 {
     if (std.mem.indexOf(u8, key, ".ffn.experts.") != null) return 1;
     if (std.mem.endsWith(u8, key, ".scale")) return 32;
     if (std.mem.eql(u8, key, "head.weight")) return 2;
-    for ([_][]const u8{ ".markov_head.head.weight", ".confidence_head.proj.weight" }) |tail|
-        if (std.mem.endsWith(u8, key, tail)) return 2;
+    if (std.mem.endsWith(u8, key, ".confidence_head.proj.weight")) return 2;
     return 1;
 }
 
